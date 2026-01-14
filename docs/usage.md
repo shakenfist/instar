@@ -1,8 +1,8 @@
 # qemu-img Usage Analysis
 
-Analysis of qemu-img usage patterns across oVirt and Proxmox codebases,
-identifying operations, parameters, and abstraction layers that imago would
-need to support.
+Analysis of qemu-img usage patterns across oVirt, Proxmox, and OpenStack
+codebases, identifying operations, parameters, and abstraction layers that
+imago would need to support.
 
 ## Overall Summary
 
@@ -10,6 +10,7 @@ need to support.
 |----------|------------|-------------------|
 | oVirt | VDSM, ovirt-engine, ovirt-imageio | info, create, convert, check, measure, commit, map, amend, bitmap |
 | Proxmox | pve-storage, qemu-server, pve-qemu | convert, create, info, measure, resize, snapshot, dd, rebase, commit |
+| OpenStack | Cinder, Nova, Glance, oslo.utils | info, convert, create, resize, rebase, commit (+ LUKS encryption) |
 
 ---
 
@@ -552,36 +553,354 @@ def compare_images(img1, img2):
 
 ---
 
+# OpenStack
+
+Analysis of qemu-img usage patterns across OpenStack components.
+
+## Summary Statistics
+
+| Component | Files | Operations |
+|-----------|-------|------------|
+| Cinder | 15+ | convert, info, create, resize, rebase, commit |
+| Nova | 10+ | info, convert, create, rebase |
+| Glance | 5+ | info (format inspection) |
+| oslo.utils | 2 | info parsing (QemuImgInfo class) |
+| os-brick | 0 | Uses cryptsetup instead |
+
+## Cinder - Volume Image Utilities
+
+### Wrapper Module: `cinder/image/image_utils.py`
+
+**Resource Limits:**
+```python
+QEMU_IMG_LIMITS = processutils.ProcessLimits(
+    cpu_time=CONF.image_conversion_cpu_limit,       # default 60 seconds
+    address_space=CONF.image_conversion_address_space_limit * units.Gi)  # default 1GB
+```
+
+**Image Info with Security:**
+```python
+cmd = ['env', 'LC_ALL=C', 'qemu-img', 'info',
+       '-f', format_name, '--output=json']
+if force_share:
+    cmd.append('--force-share')
+cmd.append(path)
+
+out, _err = utils.execute(*cmd, run_as_root=run_as_root,
+                          prlimit=QEMU_IMG_LIMITS)
+```
+
+**Version Detection:**
+```python
+info = utils.execute('qemu-img', '--version', check_exit_code=False)[0]
+pattern = r"qemu-img version ([0-9\.]*)"
+```
+
+**Image Conversion:**
+```python
+cmd = ['qemu-img', 'convert', '-O', out_format]
+# Cache modes
+cmd.extend(['-t', 'none'])        # Direct I/O
+# or
+cmd.extend(['-t', 'writeback'])   # Buffered
+
+# Sparse support
+cmd.extend(['-S', '0'])
+
+# Compression
+if compress:
+    cmd.append('-c')
+
+# VMDK subformat
+if out_subformat:
+    cmd.extend(['-o', 'subformat=%s' % out_subformat])
+```
+
+**LUKS Encryption Support:**
+```python
+cmd = ['qemu-img', 'convert']
+obj1 = ['--object',
+        'secret,id=sec1,format=raw,file=%s' % src_passphrase_file]
+obj2 = ['--object',
+        'secret,id=sec2,format=raw,file=%s' % passphrase_file]
+cmd.extend(['-O', 'luks',
+            '-o', 'cipher-alg=%s,cipher-mode=%s,ivgen-alg=%s' % cipher_spec])
+```
+
+**Format Mapping:**
+```python
+QEMU_IMG_FORMAT_MAP = {
+    'iso': 'raw',
+    'vhd': 'vpc',
+    'ploop': 'parallels',
+}
+```
+
+### Volume Drivers: `cinder/volume/drivers/remotefs.py`
+
+**Snapshot Creation:**
+```python
+# Unencrypted snapshot
+command = ['qemu-img', 'create', '-f', 'qcow2', '-o',
+           'backing_file=%s,backing_fmt=%s' %
+           (backing_path, backing_fmt),
+           new_snap_path,
+           "%dG" % snapshot.volume.size]
+
+# Encrypted snapshot with LUKS
+command = ['qemu-img', 'create', '-f', 'qcow2',
+           '-o', 'encrypt.format=luks,encrypt.key-secret=s1,'
+           'encrypt.cipher-alg=%(cipher_alg)s,'
+           'encrypt.cipher-mode=%(cipher_mode)s,'
+           'encrypt.ivgen-alg=%(ivgen_alg)s' % cipher_spec,
+           '-b', 'json:' + file_json,
+           '--object', 'secret,id=s0,file=' + tmp_key.name,
+           '--object', 'secret,id=s1,file=' + tmp_key.name,
+           new_snap_path]
+```
+
+**Snapshot Commit:**
+```python
+cmd = ['qemu-img', 'commit']
+if passphrase_file:
+    obj = ['--object',
+           'secret,id=s0,format=raw,file=%s' % passphrase_file]
+    image_opts = ['--image-opts']
+    src_opts = "file.filename=%(filename)s,encrypt.format=luks," \
+               "encrypt.key-secret=s0,backing.file.filename=%(backing)s," \
+               "backing.encrypt.key-secret=s0" % {...}
+    cmd += obj + image_opts + ['-d', src_opts]
+else:
+    cmd += ['-d', path]
+```
+
+**Snapshot Rebase:**
+```python
+command = ['qemu-img', 'rebase', '-u']
+if passphrase_file:
+    objectdef = "secret,id=s0,file=%s" % passphrase_file
+    command += ['--object', objectdef, '-b', backing_file,
+                '-F', volume_format, '--image-opts', filename]
+else:
+    command += ['-b', backing_file, image, '-F', volume_format]
+```
+
+### RBD Driver: `cinder/volume/drivers/rbd.py`
+
+**LUKS Volume Creation:**
+```python
+create_cmd = (
+    'qemu-img', 'create', '-f', 'luks',
+    '-o', 'cipher-alg=%(cipher_alg)s,'
+    'cipher-mode=%(cipher_mode)s,'
+    'ivgen-alg=%(ivgen_alg)s' % cipher_spec,
+    '--object', 'secret,id=luks_sec,'
+    'format=raw,file=%(passfile)s' % {'passfile': tmp_key.name},
+    '-o', 'key-secret=luks_sec',
+    tmp_image.name,
+    '%sM' % (volume.size * 1024))
+```
+
+### Configuration Options
+
+```python
+image_conversion_dir          # Temporary storage during conversion
+image_conversion_cpu_limit    # 60 seconds default
+image_conversion_address_space_limit  # 1 GB default
+image_conversion_disable      # Can disable conversion entirely
+image_compress_on_upload      # Enable compression for qcow2
+vmdk_allowed_types = ['streamOptimized', 'monolithicSparse']
+```
+
+## Nova - Compute Image Backend
+
+### Image Info Utility
+
+```python
+def qemu_img_info(path, format=None, run_as_root=True):
+    cmd = ['env', 'LC_ALL=C', 'qemu-img', 'info', path,
+           '--force-share', '--output=json']
+    if format:
+        cmd.extend(['-f', format])
+    out, err = processutils.execute(*cmd, run_as_root=run_as_root,
+                                    prlimit=QEMU_IMG_LIMITS)
+    return imageutils.QemuImgInfo(out, format='json')
+```
+
+### Disk Operations
+
+```python
+# Create COW overlay
+cmd = ['qemu-img', 'create', '-f', 'qcow2',
+       '-o', 'backing_file=%s,backing_fmt=%s' % (backing_file, backing_fmt),
+       path]
+
+# Resize disk
+cmd = ['qemu-img', 'resize', path, size]
+
+# Convert format
+cmd = ['qemu-img', 'convert', '-O', out_format, src_path, dst_path]
+```
+
+## oslo.utils - QemuImgInfo Parser
+
+### Class: `oslo_utils/imageutils/qemu.py`
+
+```python
+class QemuImgInfo:
+    """Parse qemu-img info output."""
+
+    def __init__(self, cmd_output=None, format='text'):
+        if format == 'json':
+            self._parse_json(cmd_output)
+        else:
+            self._parse_text(cmd_output)
+
+    @property
+    def image(self): pass
+
+    @property
+    def backing_file(self): pass
+
+    @property
+    def file_format(self): pass
+
+    @property
+    def virtual_size(self): pass
+
+    @property
+    def disk_size(self): pass
+
+    @property
+    def cluster_size(self): pass
+
+    @property
+    def encrypted(self): pass
+
+    @property
+    def snapshots(self): pass
+```
+
+**Regex Patterns for Human Format:**
+```python
+BACKING_FILE_RE = re.compile(r"^(.*?)\s*\(actual\s+path\s*:\s+(.*?)\)\s*$")
+TOP_LEVEL_RE = re.compile(r"^([\w\s]+):\s+(.*?)\s*$")
+SIZE_RE = re.compile(r"\(\s*(\d+)\s+bytes\s*\)")
+```
+
+## Glance - Format Inspector
+
+### Safe Image Format Detection
+
+```python
+class FormatInspector:
+    """Safely determine image format without full parsing."""
+
+    @staticmethod
+    def from_file(filename):
+        """Detect format from file magic bytes."""
+        with open(filename, 'rb') as f:
+            header = f.read(512)
+            if header[:4] == b'QFI\xfb':
+                return 'qcow2'
+            elif header[:4] == b'KDMV':
+                return 'vmdk'
+            # ... etc
+```
+
+**LUKS Detection as Container:**
+```python
+# LUKS volumes appear as 'raw' containers in qemu-img
+# Must detect LUKS signature separately
+if header[:6] == b'LUKS\xba\xbe':
+    return 'luks'
+```
+
+## os-brick - NO qemu-img Usage
+
+Os-brick uses **cryptsetup** for LUKS encryption, not qemu-img:
+
+```python
+class LuksEncryptor(base.VolumeEncryptor):
+    def _format_luks_volume(self, passphrase, version):
+        cmd = ["cryptsetup", "--batch-mode", "luksFormat",
+               "--type", version, "--key-file=-"]
+        self._execute(*cmd, process_input=passphrase, run_as_root=True)
+
+    def _open_volume(self, passphrase):
+        self._execute('cryptsetup', 'luksOpen', '--key-file=-',
+                      self.dev_path, self.dev_name, process_input=passphrase,
+                      run_as_root=True)
+```
+
+## Key Patterns for Imago (OpenStack)
+
+### Must Support
+
+1. **Operations**: info, convert, create, resize, rebase, commit
+2. **Formats**: raw, qcow2, vmdk (streamOptimized, monolithicSparse), vpc, luks
+3. **Encryption**: LUKS with cipher-alg, cipher-mode, ivgen-alg, secret objects
+4. **Progress**: Percentage parsing for long operations
+5. **Resource limits**: CPU time, address space limits (prlimit)
+6. **Force share**: `--force-share` for live image queries
+
+### LUKS Encryption Parameters
+
+| Parameter | Options |
+|-----------|---------|
+| cipher-alg | aes-128, aes-256 |
+| cipher-mode | xts, cbc-essiv |
+| ivgen-alg | plain64, essiv |
+| key-secret | Secret object reference |
+
+### Rootwrap Filters
+
+```
+qemu-img: EnvFilter, env, root, LC_ALL=C, qemu-img
+qemu-img_convert: CommandFilter, qemu-img, root
+```
+
+### Configuration Integration
+
+- CPU limit: 60 seconds default (configurable)
+- Memory limit: 1 GB default (configurable)
+- Conversion can be disabled entirely
+- Compression optional for qcow2 uploads
+
+---
+
 # Combined Requirements for Imago
 
 ## Operations Matrix
 
-| Operation | oVirt | Proxmox | Priority |
-|-----------|-------|---------|----------|
-| info | ✓ | ✓ | High |
-| create | ✓ | ✓ | High |
-| convert | ✓ | ✓ | High |
-| measure | ✓ | ✓ | High |
-| check | ✓ | - | Medium |
-| commit | ✓ | ✓ | Medium |
-| rebase | ✓ | ✓ | Medium |
-| snapshot | - | ✓ | Medium |
-| resize | - | ✓ | Medium |
-| dd | - | ✓ (extended) | Medium |
-| map | ✓ | - | Low |
-| amend | ✓ | - | Low |
-| bitmap | ✓ | - | Low |
-| compare | ✓ | ✓ (tests) | Low |
-| bench | - | ✓ (tests) | Low |
+| Operation | oVirt | Proxmox | OpenStack | Priority |
+|-----------|-------|---------|-----------|----------|
+| info | ✓ | ✓ | ✓ | High |
+| create | ✓ | ✓ | ✓ | High |
+| convert | ✓ | ✓ | ✓ | High |
+| measure | ✓ | ✓ | - | High |
+| check | ✓ | - | - | Medium |
+| commit | ✓ | ✓ | ✓ | Medium |
+| rebase | ✓ | ✓ | ✓ | Medium |
+| snapshot | - | ✓ | - | Medium |
+| resize | - | ✓ | ✓ | Medium |
+| dd | - | ✓ (extended) | - | Medium |
+| map | ✓ | - | - | Low |
+| amend | ✓ | - | - | Low |
+| bitmap | ✓ | - | - | Low |
+| compare | ✓ | ✓ (tests) | - | Low |
+| bench | - | ✓ (tests) | - | Low |
 
 ## Security Requirements
 
-1. **Resource limits**: Both platforms limit CPU/memory for untrusted images
+1. **Resource limits**: All platforms limit CPU/memory for untrusted images
 2. **Format validation**: Block data-file references, multiple extents
-3. **User context**: Run as specific user (vdsm:kvm, www-data)
+3. **User context**: Run as specific user (vdsm:kvm, www-data, root via rootwrap)
 4. **Timeout handling**: Support operation timeouts
+5. **LUKS encryption**: OpenStack requires secret object handling
 
 ## Output Formats
 
 - JSON output required for: info, measure, check, map
 - Progress output: `(XX.XX/100%)` format parsing
+- Human-readable parsing: oslo.utils QemuImgInfo for legacy support
