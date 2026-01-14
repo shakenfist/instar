@@ -29,6 +29,16 @@ Initial target formats:
 imago/
 ├── prototypes/     # Experimental implementations
 ├── docs/           # Design documents and research
+│   ├── index.md    # Documentation index
+│   ├── usage.md    # Platform usage analysis (oVirt, Proxmox, OpenStack)
+│   ├── security.md # CVE analysis for image handling
+│   ├── qcow2/      # QCOW2 format documentation
+│   ├── vmdk/       # VMDK format documentation
+│   └── raw/        # Raw format documentation
+├── testdata/       # Test images for security validation
+│   ├── benign/     # Safe test images (qcow2, raw, vmdk, vhdx, vpc)
+│   ├── malicious/  # CVE exploit images (DANGEROUS)
+│   └── downloaded/ # External test images (CirrOS, QEMU iotests, etc.)
 └── README.md
 ```
 
@@ -40,6 +50,30 @@ parsed or manipulated by code running with host privileges. Instead:
 1. A minimal KVM guest handles all image parsing and conversion
 2. The host only deals with opaque byte streams
 3. Any vulnerabilities in format parsing are contained within the sandbox
+
+## Test Data
+
+The `testdata/` directory contains 44 disk images for security validation:
+
+- **Benign images** - Basic valid images in various formats for functionality testing
+- **Malicious images** - Crafted to exploit known CVEs (CVE-2015-5163, CVE-2024-32498,
+  CVE-2022-47951, etc.) including backing file exploits, external data file exploits,
+  and VMDK descriptor attacks
+- **Edge cases** - Valid but unusual configurations (min/max cluster sizes, extended L2,
+  various refcount widths, backing file chains)
+- **AFL-discovered** - Malformed images from QEMU's fuzzing that trigger parser errors
+
+See `testdata/README.md` for full documentation.
+
+## Documentation
+
+The `docs/` directory contains:
+
+- Format specifications derived from QEMU source analysis (QCOW2, VMDK, raw)
+- Platform usage analysis showing how oVirt, Proxmox, and OpenStack use qemu-img
+- Security vulnerability analysis covering ~35 CVEs related to image handling
+
+See `docs/index.md` for the full documentation index.
 
 ## License
 
