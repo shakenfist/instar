@@ -1,0 +1,131 @@
+# Imago Architecture
+
+## Design Goals
+
+1. **Security first** - Untrusted image data never touches host-privileged code
+2. **Format fidelity** - Accurate conversion between qcow2, raw, and vmdk
+3. **Performance** - Minimize overhead from sandboxing
+4. **Simplicity** - Clean API that's easy to integrate
+
+## Security Model
+
+### The Problem with qemu-img
+
+`qemu-img` is a powerful tool but runs with full host privileges. When
+processing untrusted disk images, any vulnerability in format parsing code
+could lead to host compromise. Historical CVEs in qemu-img include buffer
+overflows, integer overflows, and other memory safety issues.
+
+### Imago's Approach
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        Host System                          │
+│                                                             │
+│  ┌─────────────┐     ┌─────────────────────────────────┐   │
+│  │   Imago     │     │        KVM Sandbox              │   │
+│  │   Client    │────▶│  ┌─────────────────────────┐    │   │
+│  │             │     │  │   Conversion Engine     │    │   │
+│  │ (handles    │◀────│  │   (parses formats,      │    │   │
+│  │  I/O only)  │     │  │    performs conversion) │    │   │
+│  └─────────────┘     │  └─────────────────────────┘    │   │
+│                      └─────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+The host-side client:
+- Opens source and destination files
+- Streams raw bytes to/from the sandbox
+- Never interprets image format structures
+
+The sandboxed conversion engine:
+- Runs inside a minimal KVM guest
+- Parses source format, writes destination format
+- Any exploit is contained within the sandbox
+
+## Communication Protocol
+
+TBD - Options to explore:
+- virtio-vsock for guest-host communication
+- Shared memory regions with explicit synchronization
+- Simple serial/console based protocol for prototyping
+
+## Prototype Approaches
+
+### Approach A: Minimal Linux Guest
+
+Use a tiny Linux distribution (like Alpine or a custom initramfs) running
+inside KVM. The guest runs a conversion daemon that communicates with the
+host via virtio-vsock.
+
+Pros:
+- Can reuse existing libraries (e.g., qemu-img inside the guest)
+- Familiar debugging environment
+- Flexible
+
+Cons:
+- Larger attack surface (full Linux kernel)
+- Higher memory/CPU overhead
+- Boot time latency
+
+### Approach B: Unikernel
+
+Build a unikernel that only contains the conversion logic. No separate
+kernel/userspace distinction.
+
+Pros:
+- Minimal attack surface
+- Fast boot times
+- Lower resource usage
+
+Cons:
+- More complex development
+- Limited library ecosystem
+- Harder to debug
+
+### Approach C: Custom Bare-Metal
+
+Write a minimal bare-metal program that runs directly under KVM with no OS.
+Just enough code to handle virtio communication and format conversion.
+
+Pros:
+- Absolute minimum attack surface
+- Fastest possible boot/execution
+- Complete control
+
+Cons:
+- Significant development effort
+- Must implement everything from scratch
+- No existing tooling
+
+## Format Support
+
+### qcow2
+
+QEMU Copy-On-Write version 2. Features:
+- Sparse allocation
+- Snapshots
+- Compression (zlib, zstd)
+- Encryption (LUKS)
+- Backing files
+
+### raw
+
+Simple byte-for-byte disk representation. No metadata, just data.
+
+### vmdk
+
+VMware Virtual Machine Disk. Multiple sub-formats:
+- monolithicSparse
+- monolithicFlat
+- twoGbMaxExtentSparse
+- twoGbMaxExtentFlat
+- streamOptimized
+
+## Open Questions
+
+1. How to handle backing files in qcow2? Flatten on conversion?
+2. Should we support in-place format conversion or always copy?
+3. What's the minimum viable protocol for host-guest communication?
+4. How to handle progress reporting and cancellation?
+5. Memory limits for the sandbox?
