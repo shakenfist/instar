@@ -35,3 +35,12 @@ Documentation for VMware Virtual Machine Disk format.
 | [Extent Types](vmdk/vmdk-extents.md) | Descriptor format, flat vs sparse, multi-extent |
 | [Grain Tables](vmdk/vmdk-grain-tables.md) | Address translation, GD/GT structure, COW |
 | [Compression](vmdk/vmdk-compression.md) | DEFLATE compression, streamOptimized format |
+
+## Platform Analysis
+
+Analysis of how major virtualization platforms use qemu-img and handle disk images.
+
+| Document | Description |
+|----------|-------------|
+| [Usage Analysis](usage.md) | How oVirt, Proxmox, and OpenStack use qemu-img |
+| [Security Vulnerabilities](security.md) | CVE analysis for image handling across platforms |
