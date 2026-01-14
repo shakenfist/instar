@@ -1,7 +1,21 @@
-# qemu-img Usage in oVirt
+# qemu-img Usage Analysis
 
-Analysis of qemu-img usage patterns across the oVirt codebase, identifying
-operations, parameters, and abstraction layers that imago would need to support.
+Analysis of qemu-img usage patterns across oVirt and Proxmox codebases,
+identifying operations, parameters, and abstraction layers that imago would
+need to support.
+
+## Overall Summary
+
+| Platform | Components | Primary Operations |
+|----------|------------|-------------------|
+| oVirt | VDSM, ovirt-engine, ovirt-imageio | info, create, convert, check, measure, commit, map, amend, bitmap |
+| Proxmox | pve-storage, qemu-server, pve-qemu | convert, create, info, measure, resize, snapshot, dd, rebase, commit |
+
+---
+
+# oVirt
+
+Analysis of qemu-img usage patterns across the oVirt codebase.
 
 ## Summary Statistics
 
@@ -238,3 +252,336 @@ qemu-img convert -n -O raw <src> <dst>
 2. **Target is zero**: `--target-is-zero` for preallocated targets
 3. **No create**: `-n` when destination already exists
 4. **Cache modes**: Direct I/O (`none`) for production workloads
+
+---
+
+# Proxmox
+
+Analysis of qemu-img usage patterns across the Proxmox VE codebase.
+
+## Summary Statistics
+
+| Component | Files | Operations |
+|-----------|-------|------------|
+| pve-storage | 6 | create, info, measure, resize, snapshot, commit, rebase |
+| qemu-server | 5 | convert, dd, snapshot |
+| pve-qemu | 12 patches | dd (extended), info, snapshot |
+| proxmox-backup | 0 | Uses custom PBS block driver instead |
+| Other (Ceph) | 10+ | create, convert, info, compare, bench, snapshot |
+
+## pve-qemu - QEMU Patches
+
+Proxmox extends qemu-img through patches rather than wrapper scripts.
+
+### Extended `qemu-img dd` Command
+
+**Location:** `debian/patches/pve/0009-PVE-Up-qemu-img-dd-add-osize-and-read-from-to-stdin-.patch`
+
+```bash
+qemu-img dd [--image-opts] [-U] [-f FMT] [-O OUTPUT_FMT] [-n] [-l SNAPSHOT]
+    [bs=BLOCK_SIZE] [count=BLOCKS] [skip=BLOCKS] [osize=OUTPUT_SIZE]
+    [isize=INPUT_SIZE] if=INPUT of=OUTPUT
+```
+
+**PVE-specific extensions:**
+- `osize`: Output size parameter for stdin/stdout piping
+- `isize`: Input size for writing small images to larger targets
+- `-n`: Skip target volume creation (for pre-created volumes)
+- `-l`: Load snapshot during dd operation
+- Stdin/stdout support for raw format streaming
+
+**Data structures:**
+```c
+struct DdInfo {
+    unsigned int flags;
+    int64_t count;
+    int64_t osize;  // PVE extension
+    int64_t isize;  // PVE extension
+};
+```
+
+### Snapshot Info Return Code
+
+**Location:** `debian/patches/pve/0008-PVE-Up-qemu-img-return-success-on-info-without-snaps.patch`
+
+Modified `qemu-img info` to return success (0) instead of failure (1)
+when no snapshots exist.
+
+## pve-storage - Perl Wrapper Module
+
+### Wrapper Module: `PVE/Storage/Common.pm`
+
+**qemu_img_create:**
+```perl
+sub qemu_img_create {
+    my ($fmt, $size, $path, $options) = @_;
+    my $cmd = ['/usr/bin/qemu-img', 'create'];
+    push @$cmd, '-o', "preallocation=$options->{preallocation}"
+        if defined($options->{preallocation});
+    push @$cmd, '-f', $fmt, $path, "${size}K";
+    run_command($cmd, errmsg => "unable to create image");
+}
+```
+
+**qemu_img_create_qcow2_backed:**
+```perl
+sub qemu_img_create_qcow2_backed {
+    my ($path, $backing_path, $backing_format, $options) = @_;
+    my $cmd = [
+        '/usr/bin/qemu-img', 'create',
+        '-F', $backing_format,
+        '-b', $backing_path,
+        '-f', 'qcow2',
+        $path,
+    ];
+    my $opts = ['extended_l2=on', 'cluster_size=128k'];
+    push @$opts, "preallocation=$options->{preallocation}"
+        if defined($options->{preallocation});
+    push @$cmd, '-o', join(',', @$opts) if @$opts > 0;
+    run_command($cmd, errmsg => "unable to create image");
+}
+```
+
+**Default QCOW2 options:**
+- `extended_l2=on`: Extended L2 table support
+- `cluster_size=128k`: 128KB clusters (vs default 64KB)
+
+**qemu_img_info:**
+```perl
+sub qemu_img_info {
+    my ($filename, $file_format, $timeout, $follow_backing_files) = @_;
+    my $cmd = ['/usr/bin/qemu-img', 'info', '--output=json', $filename];
+    push $cmd->@*, '-f', $file_format if $file_format;
+    push $cmd->@*, '--backing-chain' if $follow_backing_files;
+    return run_qemu_img_json($cmd, $timeout);
+}
+```
+
+**qemu_img_measure:**
+```perl
+sub qemu_img_measure {
+    my ($size, $fmt, $timeout, $options) = @_;
+    my $cmd = ['/usr/bin/qemu-img', 'measure', '--output=json',
+               '--size', "${size}K", '-O', $fmt];
+    return run_qemu_img_json($cmd, $timeout);
+}
+```
+
+**qemu_img_resize:**
+```perl
+sub qemu_img_resize {
+    my ($path, $format, $size, $preallocation, $timeout) = @_;
+    my $cmd = ['/usr/bin/qemu-img', 'resize'];
+    push $cmd->@*, "--preallocation=$preallocation" if $preallocation;
+    push $cmd->@*, '-f', $format, $path, $size;
+    $timeout = 10 if !$timeout;
+    run_command($cmd, timeout => $timeout);
+}
+```
+
+### Snapshot Operations: `PVE/Storage/Plugin.pm`
+
+```perl
+# Create snapshot
+my $cmd = ['/usr/bin/qemu-img', 'snapshot', '-c', $snap, $path];
+
+# Rollback to snapshot
+my $cmd = ['/usr/bin/qemu-img', 'snapshot', '-a', $snap, $path];
+
+# Delete snapshot
+$cmd = ['/usr/bin/qemu-img', 'snapshot', '-d', $snap, $path];
+
+# Commit changes to backing file
+$cmd = ['/usr/bin/qemu-img', 'commit', $childpath];
+
+# Rebase to new backing file
+$cmd = ['/usr/bin/qemu-img', 'rebase', '-b', $rel_parent_path,
+        '-F', 'qcow2', '-f', 'qcow2', $childpath];
+```
+
+### Supported Formats
+
+```perl
+my @checked_qemu_img_formats = qw(raw qcow qcow2 qed vmdk cloop);
+```
+
+**Format restrictions:**
+- Resize: raw, qcow2 only
+- Snapshots: qcow2, qed only
+
+### Security Validation for Untrusted Images
+
+```perl
+if ($untrusted) {
+    if (my $format_specific = $info->{'format-specific'}) {
+        if ($format_specific->{type} eq 'qcow2' &&
+            $format_specific->{data}->{"data-file"}) {
+            die "$filename: 'data-file' references are not allowed!\n";
+        } elsif ($format_specific->{type} eq 'vmdk') {
+            my $extents = $format_specific->{data}->{extents};
+            die "$filename: multiple extents are not allowed!\n"
+                if scalar($extents->@*) > 1;
+        }
+    }
+}
+```
+
+## qemu-server - VM Disk Operations
+
+### Image Conversion: `PVE/QemuServer/QemuImage.pm`
+
+```perl
+sub convert {
+    my ($src_volid, $dst_volid, $size, $opts) = @_;
+    my $cmd = [];
+    push @$cmd, '/usr/bin/qemu-img', 'convert', '-p', '-n';
+    push @$cmd, '-l', "snapshot.name=$snapname" if $snapname;
+    push @$cmd, '-t', 'none' if $dst_scfg->{type} eq 'zfspool';
+    push @$cmd, '-T', $cachemode if defined($cachemode);
+    push @$cmd, '-r', "${bwlimit}K" if defined($bwlimit);
+    # ...
+}
+```
+
+**Features:**
+- Progress reporting with `-p` and custom parser
+- Bandwidth limiting with `-r`
+- Snapshot support with `-l snapshot.name=`
+- Cache modes: `none` for ZFS, `unsafe` otherwise
+- Support for `--target-image-opts`
+
+### DD-based EFI Disk Copy: `PVE/QemuServer.pm`
+
+```perl
+my $cmd = ['qemu-img', 'dd', '-n', '-f', $src_format, '-O', $dst_format];
+push $cmd->@*, '-l', $snapname if $method eq 'qemu';
+push $cmd->@*, "bs=$bs", "osize=$size", "if=$src_path", "of=$dst_path";
+```
+
+- Block size: 1MB for better Ceph performance
+- Used specifically for EFI disk cloning
+
+### Use Cases
+
+1. **Disk cloning**: `clone_disk()` → `QemuImage::convert()`
+2. **Disk import**: `ImportDisk::do_import()` → `QemuImage::convert()`
+3. **EFI initialization**: `OVMF.pm` → `QemuImage::convert()`
+4. **Backup restore**: `restore_vm_volumes()` → `QemuImage::convert()`
+
+## proxmox-backup - Custom Block Driver
+
+Proxmox Backup Server does **not** use qemu-img. Instead, it implements
+a custom QEMU block driver (`pbs:` protocol) for direct archive access.
+
+**PBS block driver URI format:**
+```
+pbs:repository=<repo>,snapshot=<snap>,archive=<archive>,password=<pw>
+```
+
+**Reason:** Enables streaming from backup archives without intermediate
+image files or format conversion.
+
+## Other Components (Ceph Integration)
+
+### Test Scripts
+
+**RBD Migration Tests:** `ceph/qa/workunits/rbd/cli_migration.sh`
+```bash
+qemu-img convert -f raw -O qcow rbd:rbd/${image} ${TEMPDIR}/${image}.qcow
+qemu-img create -f qcow2 ${TEMPDIR}/${image}.qcow2 1G
+qemu-img bench -f qcow2 -w -c 65536 -d 16 --pattern 65 -s 4096 ${image}.qcow2
+qemu-img snapshot -c "snap1" ${image}.qcow2
+qemu-img compare ${TEMPDIR}/large.raw rbd:rbd/${dest_image}
+```
+
+### Python Test Framework
+
+**Location:** `qemu/tests/qemu-iotests/iotests.py`
+```python
+qemu_img_args = os.environ.get('QEMU_IMG', 'qemu-img').strip().split(' ')
+
+def qemu_img(*args):
+    '''Run qemu-img and return the exit code'''
+    return subprocess.call(qemu_img_args + list(args))
+
+def qemu_img_pipe(*args):
+    '''Run qemu-img and return its output'''
+    return subprocess.Popen(qemu_img_args + list(args),
+                           stdout=subprocess.PIPE).communicate()[0]
+
+def compare_images(img1, img2):
+    return qemu_img('compare', '-f', imgfmt, '-F', imgfmt, img1, img2) == 0
+```
+
+## Key Patterns for Imago (Proxmox)
+
+### Must Support
+
+1. **Operations**: convert, create, info, measure, resize, snapshot, dd, rebase, commit
+2. **Formats**: raw, qcow2, qcow, qed, vmdk, cloop
+3. **PVE dd extensions**: osize, isize, stdin/stdout, -n, -l snapshot
+4. **QCOW2 options**: extended_l2, cluster_size=128k, preallocation
+5. **Progress**: `-p` with percentage parsing
+6. **Bandwidth limiting**: `-r` option
+
+### Storage Backend Integration
+
+| Backend | Special Handling |
+|---------|-----------------|
+| ZFS | Cache mode: none |
+| RBD/Ceph | 1MB block size for dd |
+| iSCSI | Path conversion to QEMU format |
+| LVM | Supports qcow2 snapshots on LV |
+
+### Command-Line Options Summary
+
+| Option | Purpose | Used By |
+|--------|---------|---------|
+| `-p` | Progress reporting | convert |
+| `-n` | Skip target creation | convert, dd |
+| `-f` | Source format | all |
+| `-O` | Output format | convert, dd |
+| `-t`/`-T` | Cache mode | convert |
+| `-r` | Bandwidth limit | convert |
+| `-l` | Load snapshot | convert, dd |
+| `-b`/`-F` | Backing file | create, rebase |
+| `-o` | Format options | create |
+| `--output=json` | JSON output | info, measure |
+| `--backing-chain` | Follow backing | info |
+| `bs=`, `osize=`, `isize=` | DD parameters | dd |
+
+---
+
+# Combined Requirements for Imago
+
+## Operations Matrix
+
+| Operation | oVirt | Proxmox | Priority |
+|-----------|-------|---------|----------|
+| info | ✓ | ✓ | High |
+| create | ✓ | ✓ | High |
+| convert | ✓ | ✓ | High |
+| measure | ✓ | ✓ | High |
+| check | ✓ | - | Medium |
+| commit | ✓ | ✓ | Medium |
+| rebase | ✓ | ✓ | Medium |
+| snapshot | - | ✓ | Medium |
+| resize | - | ✓ | Medium |
+| dd | - | ✓ (extended) | Medium |
+| map | ✓ | - | Low |
+| amend | ✓ | - | Low |
+| bitmap | ✓ | - | Low |
+| compare | ✓ | ✓ (tests) | Low |
+| bench | - | ✓ (tests) | Low |
+
+## Security Requirements
+
+1. **Resource limits**: Both platforms limit CPU/memory for untrusted images
+2. **Format validation**: Block data-file references, multiple extents
+3. **User context**: Run as specific user (vdsm:kvm, www-data)
+4. **Timeout handling**: Support operation timeouts
+
+## Output Formats
+
+- JSON output required for: info, measure, check, map
+- Progress output: `(XX.XX/100%)` format parsing
