@@ -15,15 +15,15 @@ use std::fs::File;
 use std::io::Read;
 use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
-// Memory layout constants
+// Memory layout constants (matching the handoff document)
 const GDT_BASE: u64 = 0x1000;
-const PAGE_TABLE_BASE: u64 = 0x2000;
+const PAGE_TABLE_BASE: u64 = 0x2000; // PML4 at 0x2000
 const GUEST_CODE_BASE: u64 = 0x10000;
 const STACK_BASE: u64 = 0x20000;
-const STACK_SIZE: u64 = 0x10000;
-const STACK_TOP: u64 = STACK_BASE + STACK_SIZE - 8;
+const STACK_SIZE: u64 = 0x10000; // 64KB stack
+const STACK_TOP: u64 = STACK_BASE + STACK_SIZE - 8; // 16-byte aligned
 
-// Total guest memory: 2MB
+// Total guest memory: 2MB for simplicity
 const GUEST_MEM_SIZE: u64 = 0x200000;
 
 // Serial port
@@ -34,16 +34,18 @@ const CODE_SELECTOR: u16 = 0x08;
 const DATA_SELECTOR: u16 = 0x10;
 
 // Control register bits
-const CR0_PE: u64 = 1 << 0;
-const CR0_PG: u64 = 1 << 31;
-const CR4_PAE: u64 = 1 << 5;
-const EFER_LME: u64 = 1 << 8;
-const EFER_LMA: u64 = 1 << 10;
+const CR0_PE: u64 = 1 << 0; // Protected Mode Enable
+const CR0_PG: u64 = 1 << 31; // Paging Enable
+
+const CR4_PAE: u64 = 1 << 5; // Physical Address Extension
+
+const EFER_LME: u64 = 1 << 8; // Long Mode Enable
+const EFER_LMA: u64 = 1 << 10; // Long Mode Active
 
 // Page table entry flags
 const PTE_PRESENT: u64 = 1 << 0;
 const PTE_WRITABLE: u64 = 1 << 1;
-const PTE_PAGE_SIZE: u64 = 1 << 7;
+const PTE_PAGE_SIZE: u64 = 1 << 7; // For 2MB pages in PD
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let guest_path = std::env::args()
@@ -188,20 +190,34 @@ fn create_guest_memory(size: u64) -> Result<GuestMemoryMmap, Box<dyn std::error:
 }
 
 /// Set up GDT using vm-memory's write_obj for type-safe memory writes.
+///
+/// GDT structure (8 bytes per entry):
+/// - Entry 0: Null descriptor
+/// - Entry 1: 64-bit code segment (selector 0x08)
+/// - Entry 2: 64-bit data segment (selector 0x10)
 fn setup_gdt(guest_mem: &GuestMemoryMmap) -> Result<(), Box<dyn std::error::Error>> {
     // Null descriptor
     guest_mem.write_obj(0u64, GuestAddress(GDT_BASE))?;
 
-    // 64-bit code segment
+    // 64-bit code segment: executable, readable, long mode
+    // Flags: G=1, L=1, P=1, DPL=0, S=1, Type=0xA (execute/read)
+    // Limit and base are ignored in long mode
     guest_mem.write_obj(0x00AF_9A00_0000_FFFFu64, GuestAddress(GDT_BASE + 8))?;
 
-    // 64-bit data segment
+    // 64-bit data segment: readable, writable
+    // Flags: G=1, P=1, DPL=0, S=1, Type=0x2 (read/write)
     guest_mem.write_obj(0x00CF_9200_0000_FFFFu64, GuestAddress(GDT_BASE + 16))?;
 
     Ok(())
 }
 
 /// Set up identity-mapped page tables using vm-memory.
+///
+/// Page table structure for identity mapping with 2MB pages:
+/// PML4 (at PAGE_TABLE_BASE) -> PDPT (at +0x1000) -> PD (at +0x2000)
+///
+/// Each 2MB page in the PD covers 2MB of physical memory.
+/// 512 entries in PD = 1GB identity mapped.
 fn setup_page_tables(guest_mem: &GuestMemoryMmap) -> Result<(), Box<dyn std::error::Error>> {
     let pml4_addr = PAGE_TABLE_BASE;
     let pdpt_addr = PAGE_TABLE_BASE + 0x1000;
@@ -221,7 +237,7 @@ fn setup_page_tables(guest_mem: &GuestMemoryMmap) -> Result<(), Box<dyn std::err
 
     // PD entries: 512 x 2MB pages = 1GB identity mapped
     for i in 0..512u64 {
-        let phys_addr = i * 0x200000;
+        let phys_addr = i * 0x200000; // 2MB per entry
         let entry = phys_addr | PTE_PRESENT | PTE_WRITABLE | PTE_PAGE_SIZE;
         guest_mem.write_obj(entry, GuestAddress(pd_addr + i * 8))?;
     }
@@ -230,16 +246,28 @@ fn setup_page_tables(guest_mem: &GuestMemoryMmap) -> Result<(), Box<dyn std::err
 }
 
 fn setup_sregs(sregs: &mut kvm_sregs) {
+    // Configure control registers for long mode
+
+    // CR0: Protected mode + Paging
     sregs.cr0 = CR0_PE | CR0_PG;
+
+    // CR3: Physical address of PML4
     sregs.cr3 = PAGE_TABLE_BASE;
+
+    // CR4: PAE required for long mode
     sregs.cr4 = CR4_PAE;
+
+    // EFER: Long Mode Enable + Long Mode Active
     sregs.efer = EFER_LME | EFER_LMA;
 
+    // Configure GDT
     sregs.gdt.base = GDT_BASE;
-    sregs.gdt.limit = 23;
+    sregs.gdt.limit = 23; // 3 entries * 8 bytes - 1
 
+    // Configure code segment (selector 0x08)
     sregs.cs = make_segment(CODE_SELECTOR, 0, 0xFFFF_FFFF, 11, true);
 
+    // Configure data segments (selector 0x10)
     let data_seg = make_segment(DATA_SELECTOR, 0, 0xFFFF_FFFF, 3, false);
     sregs.ds = data_seg;
     sregs.es = data_seg;
@@ -247,6 +275,7 @@ fn setup_sregs(sregs: &mut kvm_sregs) {
     sregs.gs = data_seg;
     sregs.ss = data_seg;
 
+    // IDT: Leave empty (no interrupt handling)
     sregs.idt.base = 0;
     sregs.idt.limit = 0;
 }
@@ -259,10 +288,10 @@ fn make_segment(selector: u16, base: u64, limit: u32, seg_type: u8, code: bool) 
         type_: seg_type,
         present: 1,
         dpl: 0,
-        db: 0,
-        s: 1,
-        l: if code { 1 } else { 0 },
-        g: 1,
+        db: 0,                       // Must be 0 for 64-bit segments
+        s: 1,                        // Code/data segment (not system)
+        l: if code { 1 } else { 0 }, // Long mode for code segment
+        g: 1,                        // 4KB granularity
         avl: 0,
         unusable: 0,
         padding: 0,
@@ -270,9 +299,16 @@ fn make_segment(selector: u16, base: u64, limit: u32, seg_type: u8, code: bool) 
 }
 
 fn setup_regs(regs: &mut kvm_regs) {
+    // Entry point
     regs.rip = GUEST_CODE_BASE;
+
+    // Stack pointer (16-byte aligned)
     regs.rsp = STACK_TOP;
+
+    // Flags: bit 1 is always set
     regs.rflags = 0x2;
+
+    // Clear other registers
     regs.rax = 0;
     regs.rbx = 0;
     regs.rcx = 0;
