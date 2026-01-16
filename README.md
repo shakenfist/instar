@@ -34,13 +34,41 @@ Working prototypes exploring the KVM-based sandboxing approach:
 
 See [docs/index.md](docs/index.md) for full prototype documentation.
 
+## Development
+
+### Pre-commit Hooks
+
+This project uses pre-commit hooks for Rust code quality:
+
+```bash
+# Install pre-commit (if not already installed)
+pip install pre-commit
+
+# Install the hooks
+pre-commit install
+
+# Run manually on all files
+pre-commit run --all-files
+```
+
+The hooks run rustfmt (formatting) and clippy (linting) on all Rust code via
+Docker, ensuring consistent tooling regardless of local Rust installation.
+
+To auto-fix formatting issues:
+```bash
+./scripts/check-rust.sh fix
+```
+
 ## Directory Structure
 
 ```
 imago/
+├── .devcontainer/  # Development containers
+│   └── rust-lint/  # Stable Rust for linting
 ├── prototypes/     # Experimental implementations
 │   ├── helloworld/ # Minimal KVM VMM with bare-metal guest
 │   └── helloworld2/# Same, using rust-vmm vm-memory crate
+├── scripts/        # Build and check scripts
 ├── docs/           # Design documents and research
 │   ├── index.md    # Documentation index
 │   ├── usage.md    # Platform usage analysis (oVirt, Proxmox, OpenStack)

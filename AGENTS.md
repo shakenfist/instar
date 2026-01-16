@@ -53,6 +53,22 @@ Target formats: qcow2, raw, vmdk
 - Prioritize clarity over cleverness
 - Comment security-relevant decisions
 
+For Rust code specifically:
+- Run `rustfmt` for formatting (pre-commit hook enforces this)
+- Run `clippy` for linting (pre-commit hook enforces this)
+- Use `./scripts/check-rust.sh fix` to auto-fix formatting issues
+
+### Pre-commit Hooks
+
+Pre-commit hooks are configured for Rust code quality. Before committing:
+
+```bash
+pre-commit run --all-files
+```
+
+The hooks use a dedicated Docker container (`.devcontainer/rust-lint/`) with
+stable Rust to ensure consistent results across all development environments.
+
 ### Testing Considerations
 
 - Test with malformed/malicious input images
