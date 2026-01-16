@@ -23,11 +23,24 @@ Initial target formats:
 
 **Prototype phase** - Experimenting with different implementation approaches.
 
+## Prototypes
+
+Working prototypes exploring the KVM-based sandboxing approach:
+
+| Prototype | Description |
+|-----------|-------------|
+| [helloworld](prototypes/helloworld/) | Minimal bare-metal KVM guest proof-of-concept |
+| [helloworld2](prototypes/helloworld2/) | Uses vm-memory crate for safer memory management |
+
+See [docs/index.md](docs/index.md) for full prototype documentation.
+
 ## Directory Structure
 
 ```
 imago/
 ├── prototypes/     # Experimental implementations
+│   ├── helloworld/ # Minimal KVM VMM with bare-metal guest
+│   └── helloworld2/# Same, using rust-vmm vm-memory crate
 ├── docs/           # Design documents and research
 │   ├── index.md    # Documentation index
 │   ├── usage.md    # Platform usage analysis (oVirt, Proxmox, OpenStack)

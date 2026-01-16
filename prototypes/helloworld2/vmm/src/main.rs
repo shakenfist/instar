@@ -1,0 +1,278 @@
+//! Minimal KVM VMM using rust-vmm crates for simplified guest memory management.
+//!
+//! This version uses vm-memory crate instead of raw pointer arithmetic,
+//! demonstrating the rust-vmm ecosystem benefits.
+//!
+//! Key improvements over helloworld:
+//! - GuestMemoryMmap for safe memory region management
+//! - GuestAddress for type-safe address handling
+//! - write_obj/write_slice for bounds-checked memory writes
+//! - Automatic mmap allocation and cleanup
+
+use kvm_bindings::{kvm_regs, kvm_segment, kvm_sregs, kvm_userspace_memory_region};
+use kvm_ioctls::{Kvm, VcpuExit};
+use std::fs::File;
+use std::io::Read;
+use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
+
+// Memory layout constants
+const GDT_BASE: u64 = 0x1000;
+const PAGE_TABLE_BASE: u64 = 0x2000;
+const GUEST_CODE_BASE: u64 = 0x10000;
+const STACK_BASE: u64 = 0x20000;
+const STACK_SIZE: u64 = 0x10000;
+const STACK_TOP: u64 = STACK_BASE + STACK_SIZE - 8;
+
+// Total guest memory: 2MB
+const GUEST_MEM_SIZE: u64 = 0x200000;
+
+// Serial port
+const SERIAL_PORT: u16 = 0x3f8;
+
+// GDT segment selectors
+const CODE_SELECTOR: u16 = 0x08;
+const DATA_SELECTOR: u16 = 0x10;
+
+// Control register bits
+const CR0_PE: u64 = 1 << 0;
+const CR0_PG: u64 = 1 << 31;
+const CR4_PAE: u64 = 1 << 5;
+const EFER_LME: u64 = 1 << 8;
+const EFER_LMA: u64 = 1 << 10;
+
+// Page table entry flags
+const PTE_PRESENT: u64 = 1 << 0;
+const PTE_WRITABLE: u64 = 1 << 1;
+const PTE_PAGE_SIZE: u64 = 1 << 7;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let guest_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "guest.bin".to_string());
+
+    let guest_code = load_guest_binary(&guest_path)?;
+    println!("Loaded guest binary: {} bytes from {}", guest_code.len(), guest_path);
+
+    // Open KVM
+    let kvm = Kvm::new()?;
+    println!("KVM API version: {}", kvm.get_api_version());
+
+    // Create VM
+    let vm = kvm.create_vm()?;
+    println!("Created VM");
+
+    // Create guest memory using vm-memory crate
+    // This handles mmap allocation, page alignment, and cleanup automatically
+    let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
+    println!("Allocated {} bytes of guest memory via vm-memory", GUEST_MEM_SIZE);
+
+    // Get the memory region for KVM registration
+    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let host_addr = region.as_ptr() as u64;
+
+    // Set up KVM memory region
+    let mem_region = kvm_userspace_memory_region {
+        slot: 0,
+        guest_phys_addr: 0,
+        memory_size: GUEST_MEM_SIZE,
+        userspace_addr: host_addr,
+        flags: 0,
+    };
+    unsafe {
+        vm.set_user_memory_region(mem_region)?;
+    }
+    println!("Configured memory region");
+
+    // Set up GDT using vm-memory's type-safe writes
+    setup_gdt(&guest_mem)?;
+    println!("Set up GDT at 0x{:x}", GDT_BASE);
+
+    // Set up page tables
+    setup_page_tables(&guest_mem)?;
+    println!("Set up page tables at 0x{:x}", PAGE_TABLE_BASE);
+
+    // Load guest code
+    guest_mem.write_slice(&guest_code, GuestAddress(GUEST_CODE_BASE))?;
+    println!("Loaded guest code at 0x{:x}", GUEST_CODE_BASE);
+
+    // Create vCPU
+    let mut vcpu = vm.create_vcpu(0)?;
+    println!("Created vCPU");
+
+    // Set up registers
+    let mut sregs = vcpu.get_sregs()?;
+    setup_sregs(&mut sregs);
+    vcpu.set_sregs(&sregs)?;
+    println!("Configured special registers for long mode");
+
+    let mut regs = vcpu.get_regs()?;
+    setup_regs(&mut regs);
+    vcpu.set_regs(&regs)?;
+    println!(
+        "Configured general registers (RIP=0x{:x}, RSP=0x{:x})",
+        regs.rip, regs.rsp
+    );
+
+    // Run the vCPU loop
+    println!("\n--- Starting guest execution ---\n");
+
+    loop {
+        match vcpu.run()? {
+            VcpuExit::Hlt => {
+                println!("\n--- Guest executed HLT ---");
+                println!("Guest completed successfully!");
+                break;
+            }
+            VcpuExit::IoOut(port, data) => {
+                if port == SERIAL_PORT {
+                    for &byte in data {
+                        print!("{}", byte as char);
+                    }
+                    std::io::Write::flush(&mut std::io::stdout())?;
+                } else {
+                    println!("IO OUT: port=0x{:x}, data={:?}", port, data);
+                }
+            }
+            VcpuExit::IoIn(port, data) => {
+                println!("IO IN: port=0x{:x}, size={}", port, data.len());
+                for byte in data {
+                    *byte = 0;
+                }
+            }
+            VcpuExit::Shutdown => {
+                println!("\n--- VM Shutdown (triple fault?) ---");
+                let regs = vcpu.get_regs()?;
+                let sregs = vcpu.get_sregs()?;
+                println!("RIP=0x{:x}, RSP=0x{:x}", regs.rip, regs.rsp);
+                println!(
+                    "CR0=0x{:x}, CR3=0x{:x}, CR4=0x{:x}",
+                    sregs.cr0, sregs.cr3, sregs.cr4
+                );
+                break;
+            }
+            VcpuExit::FailEntry(reason, cpu) => {
+                println!("VM Entry Failed! reason=0x{:x}, cpu={}", reason, cpu);
+                break;
+            }
+            exit => {
+                println!("Unexpected VM exit: {:?}", exit);
+                break;
+            }
+        }
+    }
+
+    // guest_mem is automatically cleaned up when dropped
+    Ok(())
+}
+
+fn load_guest_binary(path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut file = File::open(path)?;
+    let mut code = Vec::new();
+    file.read_to_end(&mut code)?;
+    Ok(code)
+}
+
+/// Create guest memory using vm-memory's GuestMemoryMmap.
+/// This provides automatic mmap allocation, page alignment, and cleanup.
+fn create_guest_memory(size: u64) -> Result<GuestMemoryMmap, Box<dyn std::error::Error>> {
+    let regions = vec![(GuestAddress(0), size as usize)];
+    let guest_mem = GuestMemoryMmap::<()>::from_ranges(&regions)?;
+    Ok(guest_mem)
+}
+
+/// Set up GDT using vm-memory's write_obj for type-safe memory writes.
+fn setup_gdt(guest_mem: &GuestMemoryMmap) -> Result<(), Box<dyn std::error::Error>> {
+    // Null descriptor
+    guest_mem.write_obj(0u64, GuestAddress(GDT_BASE))?;
+
+    // 64-bit code segment
+    guest_mem.write_obj(0x00AF_9A00_0000_FFFFu64, GuestAddress(GDT_BASE + 8))?;
+
+    // 64-bit data segment
+    guest_mem.write_obj(0x00CF_9200_0000_FFFFu64, GuestAddress(GDT_BASE + 16))?;
+
+    Ok(())
+}
+
+/// Set up identity-mapped page tables using vm-memory.
+fn setup_page_tables(guest_mem: &GuestMemoryMmap) -> Result<(), Box<dyn std::error::Error>> {
+    let pml4_addr = PAGE_TABLE_BASE;
+    let pdpt_addr = PAGE_TABLE_BASE + 0x1000;
+    let pd_addr = PAGE_TABLE_BASE + 0x2000;
+
+    // PML4[0] -> PDPT
+    guest_mem.write_obj(pdpt_addr | PTE_PRESENT | PTE_WRITABLE, GuestAddress(pml4_addr))?;
+
+    // PDPT[0] -> PD
+    guest_mem.write_obj(pd_addr | PTE_PRESENT | PTE_WRITABLE, GuestAddress(pdpt_addr))?;
+
+    // PD entries: 512 x 2MB pages = 1GB identity mapped
+    for i in 0..512u64 {
+        let phys_addr = i * 0x200000;
+        let entry = phys_addr | PTE_PRESENT | PTE_WRITABLE | PTE_PAGE_SIZE;
+        guest_mem.write_obj(entry, GuestAddress(pd_addr + i * 8))?;
+    }
+
+    Ok(())
+}
+
+fn setup_sregs(sregs: &mut kvm_sregs) {
+    sregs.cr0 = CR0_PE | CR0_PG;
+    sregs.cr3 = PAGE_TABLE_BASE;
+    sregs.cr4 = CR4_PAE;
+    sregs.efer = EFER_LME | EFER_LMA;
+
+    sregs.gdt.base = GDT_BASE;
+    sregs.gdt.limit = 23;
+
+    sregs.cs = make_segment(CODE_SELECTOR, 0, 0xFFFF_FFFF, 11, true);
+
+    let data_seg = make_segment(DATA_SELECTOR, 0, 0xFFFF_FFFF, 3, false);
+    sregs.ds = data_seg;
+    sregs.es = data_seg;
+    sregs.fs = data_seg;
+    sregs.gs = data_seg;
+    sregs.ss = data_seg;
+
+    sregs.idt.base = 0;
+    sregs.idt.limit = 0;
+}
+
+fn make_segment(selector: u16, base: u64, limit: u32, seg_type: u8, code: bool) -> kvm_segment {
+    kvm_segment {
+        base,
+        limit,
+        selector,
+        type_: seg_type,
+        present: 1,
+        dpl: 0,
+        db: 0,
+        s: 1,
+        l: if code { 1 } else { 0 },
+        g: 1,
+        avl: 0,
+        unusable: 0,
+        padding: 0,
+    }
+}
+
+fn setup_regs(regs: &mut kvm_regs) {
+    regs.rip = GUEST_CODE_BASE;
+    regs.rsp = STACK_TOP;
+    regs.rflags = 0x2;
+    regs.rax = 0;
+    regs.rbx = 0;
+    regs.rcx = 0;
+    regs.rdx = 0;
+    regs.rsi = 0;
+    regs.rdi = 0;
+    regs.rbp = 0;
+    regs.r8 = 0;
+    regs.r9 = 0;
+    regs.r10 = 0;
+    regs.r11 = 0;
+    regs.r12 = 0;
+    regs.r13 = 0;
+    regs.r14 = 0;
+    regs.r15 = 0;
+}

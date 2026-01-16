@@ -1,0 +1,13 @@
+# Rust build artifacts
+**/target/
+**/*.bin
+**/Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store

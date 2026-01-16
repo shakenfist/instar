@@ -96,3 +96,4 @@ Experimental implementations exploring secure isolated execution.
 | Document | Description |
 |----------|-------------|
 | [KVM Hello World](prototypes/kvm-hello-world.md) | Minimal bare-metal KVM guest proof-of-concept |
+| [KVM Hello World 2](prototypes/kvm-hello-world2.md) | Using vm-memory crate for safer memory management |

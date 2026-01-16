@@ -83,10 +83,12 @@ Cons:
 - Limited library ecosystem
 - Harder to debug
 
-### Approach C: Custom Bare-Metal
+### Approach C: Custom Bare-Metal (Active)
 
 Write a minimal bare-metal program that runs directly under KVM with no OS.
 Just enough code to handle virtio communication and format conversion.
+
+**This is the approach being actively explored.**
 
 Pros:
 - Absolute minimum attack surface
@@ -97,6 +99,16 @@ Cons:
 - Significant development effort
 - Must implement everything from scratch
 - No existing tooling
+
+**Progress:**
+- [helloworld](../prototypes/helloworld/) - Minimal KVM VMM with serial output
+- [helloworld2](../prototypes/helloworld2/) - Uses vm-memory crate for safer memory
+
+The rust-vmm project provides crates that reduce implementation effort by 70%+:
+- `kvm-ioctls` - Safe KVM API wrappers
+- `vm-memory` - Guest memory abstraction
+- `virtio-queue` - Virtqueue implementation (future)
+- `virtio-drivers` - Guest-side virtio drivers (future)
 
 ## Format Support
 
