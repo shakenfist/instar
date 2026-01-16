@@ -116,6 +116,67 @@ sha256sum test.bin out.bin  # Should match
 - `vm-memory`: Guest memory management
 - `clap`: CLI argument parsing
 
+## Performance
+
+This prototype is obviously not performant, a straight copy of my test data is quite fast:
+
+```bash
+mikal@kasm:.../prototypes/virtio-block$ time cp input.bin output.bin
+
+real    0m5.015s
+user    0m0.005s
+sys     0m4.015s
+```
+
+But the KVM guest copy is not:
+
+```bash
+mikal@kasm:.../prototypes/virtio-block2$ dd if=/dev/urandom of=input.bin bs=512 count=10000000
+10000000+0 records in
+10000000+0 records out
+5120000000 bytes (5.1 GB, 4.8 GiB) copied, 25.0199 s, 205 MB/s
+
+mikal@kasm:.../prototypes/virtio-block2$ ls -lrth input.bin
+-rw-rw-r-- 1 mikal mikal 4.8G Jan 17 07:36 input.bin
+
+mikal@kasm:.../prototypes/virtio-block2$ time ./target/release/vmm --input input.bin --output output.bin guest.bin | grep -vi progress
+Loaded guest binary: 16512 bytes from guest.bin
+Input file: input.bin (5120000000 bytes, 10000000 sectors)
+Output file: output.bin (pre-allocated 5120000000 bytes)
+KVM API version: 12
+Created VM
+Allocated 8388608 bytes of guest memory
+Configured memory region
+Set up GDT at 0x1000
+Set up page tables at 0x2000
+Loaded guest code at 0x10000
+Created virtio-block devices at MMIO 0x10000000 and 0x10001000
+Created vCPU
+Configured special registers for long mode
+Configured general registers (RIP=0x10000, RSP=0x2fff8)
+
+--- Starting guest execution ---
+
+[INFO] init stage=probe device=input address=0x10000000
+[INFO] init stage=features device=input address=0x100000020
+[INFO] init stage=queue device=input address=0x100
+[INFO] capacity device=input sectors=10000000 bytes=5120000000
+[INFO] init stage=probe device=output address=0x10001000
+[INFO] init stage=features device=output address=0x100000000
+[INFO] init stage=queue device=output address=0x100
+[INFO] capacity device=output sectors=10000000 bytes=5120000000
+[COMPLETE] complete op=copy count=10000000 success=true
+
+--- Guest executed HLT ---
+Guest completed successfully!
+
+real    6m48.977s
+user    2m26.001s
+sys     4m27.520s
+```
+
+Its notable that this version using protobufs over the serial connection is slower than the previous simpler version, but protobufs are likely a more reliable solution long term.
+
 ## Related Documentation
 
 - [guest-protocol crate](../../crates/guest-protocol/)
