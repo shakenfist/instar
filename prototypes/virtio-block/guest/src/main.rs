@@ -266,7 +266,10 @@ impl VirtioBlock {
         }
 
         // Set up descriptors
-        let desc_idx = (self.avail_idx % QUEUE_SIZE) * 3;
+        // Each request uses 3 descriptors, so we can fit QUEUE_SIZE/3 requests
+        // before wrapping. Wrap avail_idx to the number of request slots, then
+        // multiply by 3 to get the actual descriptor index.
+        let desc_idx = (self.avail_idx % (QUEUE_SIZE / 3)) * 3;
 
         // Descriptor 0: header (device reads)
         self.write_desc(desc_idx, header_addr, 16, VIRTQ_DESC_F_NEXT, desc_idx + 1);
