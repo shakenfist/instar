@@ -132,6 +132,68 @@ The VMM processes requests and adds results to the used ring.
 - **File-backed storage**: Real file I/O through block device abstraction
 - **Complex guest logic**: Initialization, I/O operations, polling
 
+## Performance
+
+This prototype is obviously not performant, a straight copy of my test data is quite fast:
+
+```bash
+mikal@kasm:.../prototypes/virtio-block$ time cp input.bin output.bin
+
+real    0m5.015s
+user    0m0.005s
+sys     0m4.015s
+```
+
+But the KVM guest copy is not:
+
+```bash
+mikal@kasm:.../prototypes/virtio-block$ dd if=/dev/urandom of=input.bin bs=512 count=10000000
+10000000+0 records in
+10000000+0 records out
+5120000000 bytes (5.1 GB, 4.8 GiB) copied, 24.2875 s, 211 MB/s
+
+mikal@kasm:.../prototypes/virtio-block$ ls -lrth input.bin
+-rw-rw-r-- 1 mikal mikal 4.8G Jan 17 06:23 input.bin
+
+mikal@kasm:.../prototypes/virtio-block$ time ./target/release/vmm --input input.bin --output output.bin guest.bin | grep -v Progress
+Loaded guest binary: 4360 bytes from guest.bin
+Input file: input.bin (5120000000 bytes, 10000000 sectors)
+Output file: output.bin (pre-allocated 5120000000 bytes)
+KVM API version: 12
+Created VM
+Allocated 8388608 bytes of guest memory
+Configured memory region
+Set up GDT at 0x1000
+Set up page tables at 0x2000
+Loaded guest code at 0x10000
+Created virtio-block devices at MMIO 0x10000000 and 0x10001000
+Created vCPU
+Configured special registers for long mode
+Configured general registers (RIP=0x10000, RSP=0x2fff8)
+
+--- Starting guest execution ---
+
+Virtio-block copy starting...
+Initializing input device...
+Input device ready, capacity: 10000000 sectors
+Initializing output device...
+Output device ready
+Copying 10000000 sectors...
+       
+Copy complete!
+Copied: 10000000 sectors
+
+--- Guest executed HLT ---
+Guest completed successfully!
+
+real    5m43.946s
+user    1m56.380s
+sys     3m54.704s
+```
+
+However, this is a proof of concept prototype and has not been optimised or tuned in any
+way yet.
+
 ## Related Documentation
 
 - [Virtio-Block Data Transfer](../../docs/data-transfer-virtio-block.md)
