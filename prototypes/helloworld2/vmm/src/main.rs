@@ -51,7 +51,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "guest.bin".to_string());
 
     let guest_code = load_guest_binary(&guest_path)?;
-    println!("Loaded guest binary: {} bytes from {}", guest_code.len(), guest_path);
+    println!(
+        "Loaded guest binary: {} bytes from {}",
+        guest_code.len(),
+        guest_path
+    );
 
     // Open KVM
     let kvm = Kvm::new()?;
@@ -64,7 +68,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create guest memory using vm-memory crate
     // This handles mmap allocation, page alignment, and cleanup automatically
     let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
-    println!("Allocated {} bytes of guest memory via vm-memory", GUEST_MEM_SIZE);
+    println!(
+        "Allocated {} bytes of guest memory via vm-memory",
+        GUEST_MEM_SIZE
+    );
 
     // Get the memory region for KVM registration
     let region = guest_mem.find_region(GuestAddress(0)).unwrap();
@@ -201,10 +208,16 @@ fn setup_page_tables(guest_mem: &GuestMemoryMmap) -> Result<(), Box<dyn std::err
     let pd_addr = PAGE_TABLE_BASE + 0x2000;
 
     // PML4[0] -> PDPT
-    guest_mem.write_obj(pdpt_addr | PTE_PRESENT | PTE_WRITABLE, GuestAddress(pml4_addr))?;
+    guest_mem.write_obj(
+        pdpt_addr | PTE_PRESENT | PTE_WRITABLE,
+        GuestAddress(pml4_addr),
+    )?;
 
     // PDPT[0] -> PD
-    guest_mem.write_obj(pd_addr | PTE_PRESENT | PTE_WRITABLE, GuestAddress(pdpt_addr))?;
+    guest_mem.write_obj(
+        pd_addr | PTE_PRESENT | PTE_WRITABLE,
+        GuestAddress(pdpt_addr),
+    )?;
 
     // PD entries: 512 x 2MB pages = 1GB identity mapped
     for i in 0..512u64 {

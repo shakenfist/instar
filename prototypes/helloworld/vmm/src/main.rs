@@ -53,7 +53,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "guest.bin".to_string());
 
     let guest_code = load_guest_binary(&guest_path)?;
-    println!("Loaded guest binary: {} bytes from {}", guest_code.len(), guest_path);
+    println!(
+        "Loaded guest binary: {} bytes from {}",
+        guest_code.len(),
+        guest_path
+    );
 
     // Open KVM
     let kvm = Kvm::new()?;
@@ -106,7 +110,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut regs = vcpu.get_regs()?;
     setup_regs(&mut regs);
     vcpu.set_regs(&regs)?;
-    println!("Configured general registers (RIP=0x{:x}, RSP=0x{:x})", regs.rip, regs.rsp);
+    println!(
+        "Configured general registers (RIP=0x{:x}, RSP=0x{:x})",
+        regs.rip, regs.rsp
+    );
 
     // Run the vCPU loop
     println!("\n--- Starting guest execution ---\n");
@@ -143,7 +150,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let regs = vcpu.get_regs()?;
                 let sregs = vcpu.get_sregs()?;
                 println!("RIP=0x{:x}, RSP=0x{:x}", regs.rip, regs.rsp);
-                println!("CR0=0x{:x}, CR3=0x{:x}, CR4=0x{:x}", sregs.cr0, sregs.cr3, sregs.cr4);
+                println!(
+                    "CR0=0x{:x}, CR3=0x{:x}, CR4=0x{:x}",
+                    sregs.cr0, sregs.cr3, sregs.cr4
+                );
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
@@ -230,7 +240,10 @@ fn setup_page_tables(guest_mem: *mut u8) {
         // PD entries: 512 x 2MB pages = 1GB identity mapped
         for i in 0..512u64 {
             let phys_addr = i * 0x200000; // 2MB per entry
-            ptr::write(pd.add(i as usize), phys_addr | PTE_PRESENT | PTE_WRITABLE | PTE_PAGE_SIZE);
+            ptr::write(
+                pd.add(i as usize),
+                phys_addr | PTE_PRESENT | PTE_WRITABLE | PTE_PAGE_SIZE,
+            );
         }
     }
 }
@@ -285,10 +298,10 @@ fn make_segment(selector: u16, base: u64, limit: u32, seg_type: u8, code: bool) 
         type_: seg_type,
         present: 1,
         dpl: 0,
-        db: 0,        // Must be 0 for 64-bit segments
-        s: 1,         // Code/data segment (not system)
+        db: 0,                       // Must be 0 for 64-bit segments
+        s: 1,                        // Code/data segment (not system)
         l: if code { 1 } else { 0 }, // Long mode for code segment
-        g: 1,         // 4KB granularity
+        g: 1,                        // 4KB granularity
         avl: 0,
         unusable: 0,
         padding: 0,

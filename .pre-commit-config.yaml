@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: rust-check
+        name: rustfmt and clippy
+        entry: ./scripts/check-rust.sh check
+        language: script
+        pass_filenames: false
+        files: \.rs$
