@@ -1,0 +1,15 @@
+[package]
+name = "vmm"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal KVM VMM with virtio-block device support"
+license = "Apache-2.0"
+
+[dependencies]
+kvm-ioctls = "0.19"
+kvm-bindings = "0.10"
+vm-memory = { version = "0.15", features = ["backend-mmap"] }
+virtio-queue = "0.14"
+virtio-bindings = "0.2"
+clap = { version = "4.5", features = ["derive"] }
+guest-protocol = { path = "../../../crates/guest-protocol", features = ["std"] }
