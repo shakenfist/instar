@@ -31,6 +31,7 @@ Working prototypes exploring the KVM-based sandboxing approach:
 |-----------|-------------|
 | [helloworld](prototypes/helloworld/) | Minimal bare-metal KVM guest proof-of-concept |
 | [helloworld2](prototypes/helloworld2/) | Uses vm-memory crate for safer memory management |
+| [virtio-block](prototypes/virtio-block/) | Virtio-block device emulation with file copy |
 
 See [docs/index.md](docs/index.md) for full prototype documentation.
 
@@ -65,9 +66,12 @@ To auto-fix formatting issues:
 imago/
 ├── .devcontainer/  # Development containers
 │   └── rust-lint/  # Stable Rust for linting
+├── crates/         # Shared Rust crates
+│   └── guest-protocol/ # Protocol Buffers messaging for guests
 ├── prototypes/     # Experimental implementations
-│   ├── helloworld/ # Minimal KVM VMM with bare-metal guest
-│   └── helloworld2/# Same, using rust-vmm vm-memory crate
+│   ├── helloworld/     # Minimal KVM VMM with bare-metal guest
+│   ├── helloworld2/    # Same, using rust-vmm vm-memory crate
+│   └── virtio-block/   # Virtio-block device emulation
 ├── scripts/        # Build and check scripts
 ├── docs/           # Design documents and research
 │   ├── index.md    # Documentation index

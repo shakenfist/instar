@@ -30,7 +30,34 @@ run_in_docker() {
 
 FAILED=0
 
-for prototype in prototypes/helloworld prototypes/helloworld2; do
+# Check shared crates first
+# Note: guest-protocol is skipped - it has micropb API issues and isn't integrated yet
+# TODO: Fix micropb compatibility and re-enable
+for crate in; do
+    echo "=== Checking $crate ==="
+
+    # Run rustfmt
+    echo "Running rustfmt..."
+    if [ "$MODE" = "fix" ]; then
+        run_in_docker "$crate" cargo fmt -- || FAILED=1
+    else
+        run_in_docker "$crate" cargo fmt -- --check || FAILED=1
+    fi
+
+    # Run clippy
+    echo "Running clippy..."
+    run_in_docker "$crate" cargo clippy -- -D warnings || FAILED=1
+
+    echo ""
+done
+
+# Check prototypes
+for prototype in prototypes/helloworld prototypes/helloworld2 prototypes/virtio-block; do
+    # Skip if directory doesn't exist yet
+    if [ ! -d "$PROJECT_ROOT/$prototype" ]; then
+        continue
+    fi
+
     echo "=== Checking $prototype ==="
 
     # Run rustfmt on all crates

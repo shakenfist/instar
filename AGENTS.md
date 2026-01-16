@@ -69,6 +69,34 @@ pre-commit run --all-files
 The hooks use a dedicated Docker container (`.devcontainer/rust-lint/`) with
 stable Rust to ensure consistent results across all development environments.
 
+### Testing Prototypes
+
+Each prototype has its own devcontainer with the required toolchain. Agents can
+and should test prototypes by:
+
+1. Building the devcontainer image for the prototype
+2. Running the build script inside the container
+3. Executing the prototype to verify it works
+
+Example for testing a Rust KVM prototype:
+
+```bash
+cd prototypes/<prototype-name>
+
+# Build the devcontainer image
+docker build -t <prototype>-dev .devcontainer/
+
+# Run the build inside the container (with KVM access)
+docker run --rm -v "$(pwd):/workspace" -w /workspace \
+    --device=/dev/kvm --group-add=$(getent group kvm | cut -d: -f3) \
+    <prototype>-dev ./build.sh
+
+# Run the prototype (requires sudo for KVM)
+docker run --rm -it -v "$(pwd):/workspace" -w /workspace \
+    --device=/dev/kvm --group-add=$(getent group kvm | cut -d: -f3) \
+    <prototype>-dev sudo ./target/release/vmm <args>
+```
+
 ### Testing Considerations
 
 - Test with malformed/malicious input images

@@ -1,0 +1,60 @@
+syntax = "proto3";
+package guest;
+
+// Log level for messages
+enum Level {
+  DEBUG = 0;
+  INFO = 1;
+  PROGRESS = 2;
+  ERROR = 3;
+  COMPLETE = 4;
+}
+
+// Initialization stage message
+message InitMessage {
+  string stage = 1;      // "probe", "features", "queue"
+  string device = 2;     // "input", "output"
+  uint64 address = 3;    // MMIO address or feature bits
+}
+
+// Device capacity information
+message CapacityMessage {
+  string device = 1;
+  uint64 sectors = 2;
+  uint64 bytes = 3;
+}
+
+// Progress update during operations
+message ProgressMessage {
+  string operation = 1;  // "copy"
+  uint64 current = 2;
+  uint64 total = 3;
+  uint32 percent = 4;
+}
+
+// Error information
+message ErrorMessage {
+  string operation = 1;  // "read", "write"
+  string device = 2;
+  uint64 sector = 3;
+  uint32 status = 4;
+}
+
+// Operation completion
+message CompleteMessage {
+  string operation = 1;
+  uint64 count = 2;      // sectors copied
+  bool success = 3;
+}
+
+// Main message wrapper with level and payload
+message GuestMessage {
+  Level level = 1;
+  oneof payload {
+    InitMessage init = 2;
+    CapacityMessage capacity = 3;
+    ProgressMessage progress = 4;
+    ErrorMessage error = 5;
+    CompleteMessage complete = 6;
+  }
+}

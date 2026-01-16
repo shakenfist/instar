@@ -1,0 +1,17 @@
+[package]
+name = "guest-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "Protocol Buffers-based serial protocol for guest-to-VMM communication"
+license = "Apache-2.0"
+
+[features]
+default = []
+std = []  # Enable for VMM parsing support
+
+[dependencies]
+micropb = { version = "0.1", features = ["container-heapless"] }
+heapless = "0.8"
+
+[build-dependencies]
+micropb-gen = "0.1"

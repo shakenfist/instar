@@ -3,6 +3,9 @@
 
 FROM rust:1.83
 
+# Install protobuf compiler (required for micropb-gen in guest-protocol crate)
+RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/apt/lists/*
+
 # Install rustfmt and clippy components
 RUN rustup component add rustfmt clippy
 

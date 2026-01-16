@@ -1,0 +1,14 @@
+[package]
+name = "guest"
+version = "0.1.0"
+edition = "2021"
+description = "Bare-metal guest that copies data between virtio-block devices"
+license = "Apache-2.0"
+
+# No external dependencies - implements virtio protocol directly for simplicity
+[dependencies]
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true

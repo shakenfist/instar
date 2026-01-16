@@ -97,3 +97,12 @@ Experimental implementations exploring secure isolated execution.
 |----------|-------------|
 | [KVM Hello World](prototypes/kvm-hello-world.md) | Minimal bare-metal KVM guest proof-of-concept |
 | [KVM Hello World 2](prototypes/kvm-hello-world2.md) | Using vm-memory crate for safer memory management |
+| [Virtio-Block](prototypes/virtio-block.md) | Virtio-block device emulation with file copy |
+
+## Shared Crates
+
+Reusable Rust crates for the imago project.
+
+| Document | Description |
+|----------|-------------|
+| [guest-protocol](crates/guest-protocol.md) | Protocol Buffers messaging for guest-VMM communication |

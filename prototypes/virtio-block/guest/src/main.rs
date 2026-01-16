@@ -1,0 +1,481 @@
+//! Bare-metal guest that copies data between virtio-block devices.
+//!
+//! This guest initializes two virtio-block devices (input and output) and
+//! copies all sectors from input to output.
+
+#![no_std]
+#![no_main]
+
+mod serial;
+
+use core::arch::asm;
+use core::panic::PanicInfo;
+use core::ptr::{read_volatile, write_volatile};
+
+use serial::serial_print;
+
+// Memory layout (must match VMM)
+// MMIO addresses are outside guest memory (256MB) so KVM generates MMIO exits
+const INPUT_MMIO_BASE: usize = 0x10000000;
+const OUTPUT_MMIO_BASE: usize = 0x10001000;
+// Virtqueue and DMA regions are inside guest memory (8MB)
+const INPUT_VQ_BASE: usize = 0x100000;
+const OUTPUT_VQ_BASE: usize = 0x110000;
+const DMA_POOL_BASE: usize = 0x200000;
+
+// Virtio MMIO register offsets
+mod reg {
+    pub const MAGIC_VALUE: usize = 0x000;
+    pub const VERSION: usize = 0x004;
+    pub const DEVICE_ID: usize = 0x008;
+    pub const DEVICE_FEATURES: usize = 0x010;
+    pub const DEVICE_FEATURES_SEL: usize = 0x014;
+    pub const DRIVER_FEATURES: usize = 0x020;
+    pub const DRIVER_FEATURES_SEL: usize = 0x024;
+    pub const QUEUE_SEL: usize = 0x030;
+    pub const QUEUE_NUM_MAX: usize = 0x034;
+    pub const QUEUE_NUM: usize = 0x038;
+    pub const QUEUE_READY: usize = 0x044;
+    pub const QUEUE_NOTIFY: usize = 0x050;
+    pub const INTERRUPT_STATUS: usize = 0x060;
+    pub const INTERRUPT_ACK: usize = 0x064;
+    pub const STATUS: usize = 0x070;
+    pub const QUEUE_DESC_LOW: usize = 0x080;
+    pub const QUEUE_DESC_HIGH: usize = 0x084;
+    pub const QUEUE_DRIVER_LOW: usize = 0x090;
+    pub const QUEUE_DRIVER_HIGH: usize = 0x094;
+    pub const QUEUE_DEVICE_LOW: usize = 0x0A0;
+    pub const QUEUE_DEVICE_HIGH: usize = 0x0A4;
+    pub const CONFIG: usize = 0x100;
+}
+
+// Virtio status bits
+mod status {
+    pub const ACKNOWLEDGE: u32 = 1;
+    pub const DRIVER: u32 = 2;
+    pub const DRIVER_OK: u32 = 4;
+    pub const FEATURES_OK: u32 = 8;
+}
+
+// Block request types
+const VIRTIO_BLK_T_IN: u32 = 0; // Read
+const VIRTIO_BLK_T_OUT: u32 = 1; // Write
+
+// Block status
+const VIRTIO_BLK_S_OK: u8 = 0;
+
+// Descriptor flags
+const VIRTQ_DESC_F_NEXT: u16 = 1;
+const VIRTQ_DESC_F_WRITE: u16 = 2;
+
+// Queue size
+const QUEUE_SIZE: u16 = 256;
+const SECTOR_SIZE: usize = 512;
+
+/// Virtqueue descriptor
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct VirtqDesc {
+    addr: u64,
+    len: u32,
+    flags: u16,
+    next: u16,
+}
+
+/// Block request header
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VirtioBlkReqHeader {
+    type_: u32,
+    reserved: u32,
+    sector: u64,
+}
+
+/// Virtio block device handle
+struct VirtioBlock {
+    mmio_base: usize,
+    desc_base: usize,
+    avail_base: usize,
+    used_base: usize,
+    capacity: u64,
+    avail_idx: u16,
+}
+
+impl VirtioBlock {
+    /// Read MMIO register
+    fn read_reg(&self, offset: usize) -> u32 {
+        unsafe { read_volatile((self.mmio_base + offset) as *const u32) }
+    }
+
+    /// Write MMIO register
+    fn write_reg(&self, offset: usize, value: u32) {
+        unsafe { write_volatile((self.mmio_base + offset) as *mut u32, value) }
+    }
+
+    /// Initialize a virtio block device
+    fn init(mmio_base: usize, vq_base: usize) -> Option<Self> {
+        let dev = Self {
+            mmio_base,
+            desc_base: vq_base,
+            avail_base: vq_base + (QUEUE_SIZE as usize * 16), // After descriptors
+            used_base: vq_base + (QUEUE_SIZE as usize * 16) + 6 + (QUEUE_SIZE as usize * 2),
+            capacity: 0,
+            avail_idx: 0,
+        };
+
+        // Check magic
+        let magic = dev.read_reg(reg::MAGIC_VALUE);
+        if magic != 0x74726976 {
+            serial_print("Invalid virtio magic\n");
+            return None;
+        }
+
+        // Check version
+        let version = dev.read_reg(reg::VERSION);
+        if version != 2 {
+            serial_print("Unsupported virtio version\n");
+            return None;
+        }
+
+        // Check device ID (2 = block)
+        let device_id = dev.read_reg(reg::DEVICE_ID);
+        if device_id != 2 {
+            serial_print("Not a block device\n");
+            return None;
+        }
+
+        // Reset device
+        dev.write_reg(reg::STATUS, 0);
+
+        // Acknowledge
+        dev.write_reg(reg::STATUS, status::ACKNOWLEDGE);
+
+        // Driver
+        dev.write_reg(reg::STATUS, status::ACKNOWLEDGE | status::DRIVER);
+
+        // Read features
+        dev.write_reg(reg::DEVICE_FEATURES_SEL, 0);
+        let features_lo = dev.read_reg(reg::DEVICE_FEATURES);
+        dev.write_reg(reg::DEVICE_FEATURES_SEL, 1);
+        let features_hi = dev.read_reg(reg::DEVICE_FEATURES);
+
+        // Accept VIRTIO_F_VERSION_1 (bit 32)
+        dev.write_reg(reg::DRIVER_FEATURES_SEL, 0);
+        dev.write_reg(reg::DRIVER_FEATURES, 0);
+        dev.write_reg(reg::DRIVER_FEATURES_SEL, 1);
+        dev.write_reg(reg::DRIVER_FEATURES, 1); // VERSION_1
+
+        // Features OK
+        dev.write_reg(
+            reg::STATUS,
+            status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK,
+        );
+
+        // Check features accepted
+        let status = dev.read_reg(reg::STATUS);
+        if status & status::FEATURES_OK == 0 {
+            serial_print("Features not accepted\n");
+            return None;
+        }
+
+        // Configure queue
+        dev.write_reg(reg::QUEUE_SEL, 0);
+
+        let max_size = dev.read_reg(reg::QUEUE_NUM_MAX) as u16;
+        let queue_size = if max_size < QUEUE_SIZE {
+            max_size
+        } else {
+            QUEUE_SIZE
+        };
+
+        dev.write_reg(reg::QUEUE_NUM, queue_size as u32);
+
+        // Set queue addresses
+        let desc_addr = dev.desc_base as u64;
+        let avail_addr = dev.avail_base as u64;
+        let used_addr = dev.used_base as u64;
+
+        dev.write_reg(reg::QUEUE_DESC_LOW, desc_addr as u32);
+        dev.write_reg(reg::QUEUE_DESC_HIGH, (desc_addr >> 32) as u32);
+        dev.write_reg(reg::QUEUE_DRIVER_LOW, avail_addr as u32);
+        dev.write_reg(reg::QUEUE_DRIVER_HIGH, (avail_addr >> 32) as u32);
+        dev.write_reg(reg::QUEUE_DEVICE_LOW, used_addr as u32);
+        dev.write_reg(reg::QUEUE_DEVICE_HIGH, (used_addr >> 32) as u32);
+
+        // Queue ready
+        dev.write_reg(reg::QUEUE_READY, 1);
+
+        // Driver OK
+        dev.write_reg(
+            reg::STATUS,
+            status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK | status::DRIVER_OK,
+        );
+
+        // Read capacity from config
+        let cap_lo = dev.read_reg(reg::CONFIG);
+        let cap_hi = dev.read_reg(reg::CONFIG + 4);
+        let capacity = (cap_lo as u64) | ((cap_hi as u64) << 32);
+
+        Some(Self { capacity, ..dev })
+    }
+
+    /// Read a sector
+    fn read_sector(&mut self, sector: u64, buffer: &mut [u8; SECTOR_SIZE]) -> bool {
+        self.do_request(VIRTIO_BLK_T_IN, sector, buffer)
+    }
+
+    /// Write a sector
+    fn write_sector(&mut self, sector: u64, buffer: &[u8; SECTOR_SIZE]) -> bool {
+        // Need mutable reference for the request
+        let mut buf = *buffer;
+        self.do_request(VIRTIO_BLK_T_OUT, sector, &mut buf)
+    }
+
+    /// Perform a block request
+    fn do_request(&mut self, req_type: u32, sector: u64, buffer: &mut [u8; SECTOR_SIZE]) -> bool {
+        // Use DMA pool for request structures
+        // Layout: header (16 bytes), data (512 bytes), status (1 byte)
+        let header_addr = DMA_POOL_BASE as u64;
+        let data_addr = header_addr + 16;
+        let status_addr = data_addr + SECTOR_SIZE as u64;
+
+        // Write header
+        let header = VirtioBlkReqHeader {
+            type_: req_type,
+            reserved: 0,
+            sector,
+        };
+        unsafe {
+            let header_ptr = header_addr as *mut VirtioBlkReqHeader;
+            write_volatile(header_ptr, header);
+        }
+
+        // For write requests, copy data to DMA buffer
+        if req_type == VIRTIO_BLK_T_OUT {
+            unsafe {
+                let data_ptr = data_addr as *mut u8;
+                for (i, &byte) in buffer.iter().enumerate() {
+                    write_volatile(data_ptr.add(i), byte);
+                }
+            }
+        }
+
+        // Clear status
+        unsafe {
+            write_volatile(status_addr as *mut u8, 0xFF);
+        }
+
+        // Set up descriptors
+        let desc_idx = (self.avail_idx % QUEUE_SIZE) * 3;
+
+        // Descriptor 0: header (device reads)
+        self.write_desc(desc_idx, header_addr, 16, VIRTQ_DESC_F_NEXT, desc_idx + 1);
+
+        // Descriptor 1: data
+        let data_flags = if req_type == VIRTIO_BLK_T_IN {
+            VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE // Device writes (read operation)
+        } else {
+            VIRTQ_DESC_F_NEXT // Device reads (write operation)
+        };
+        self.write_desc(
+            desc_idx + 1,
+            data_addr,
+            SECTOR_SIZE as u32,
+            data_flags,
+            desc_idx + 2,
+        );
+
+        // Descriptor 2: status (device writes)
+        self.write_desc(desc_idx + 2, status_addr, 1, VIRTQ_DESC_F_WRITE, 0);
+
+        // Add to available ring
+        let avail_idx = self.avail_idx;
+        let ring_idx = avail_idx % QUEUE_SIZE;
+
+        // Write to avail ring
+        unsafe {
+            let avail_ring = (self.avail_base + 4 + (ring_idx as usize * 2)) as *mut u16;
+            write_volatile(avail_ring, desc_idx);
+
+            // Update avail idx (with memory barrier)
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            let avail_idx_ptr = (self.avail_base + 2) as *mut u16;
+            write_volatile(avail_idx_ptr, avail_idx.wrapping_add(1));
+        }
+
+        self.avail_idx = avail_idx.wrapping_add(1);
+
+        // Notify device
+        self.write_reg(reg::QUEUE_NOTIFY, 0);
+
+        // Wait for completion (poll used ring)
+        let expected_used_idx = avail_idx.wrapping_add(1);
+        loop {
+            unsafe {
+                let used_idx = read_volatile((self.used_base + 2) as *const u16);
+                if used_idx == expected_used_idx {
+                    break;
+                }
+            }
+            core::hint::spin_loop();
+        }
+
+        // Acknowledge interrupt
+        let int_status = self.read_reg(reg::INTERRUPT_STATUS);
+        if int_status != 0 {
+            self.write_reg(reg::INTERRUPT_ACK, int_status);
+        }
+
+        // Check status
+        let status = unsafe { read_volatile(status_addr as *const u8) };
+
+        // For read requests, copy data from DMA buffer
+        if req_type == VIRTIO_BLK_T_IN && status == VIRTIO_BLK_S_OK {
+            unsafe {
+                let data_ptr = data_addr as *const u8;
+                for (i, byte) in buffer.iter_mut().enumerate() {
+                    *byte = read_volatile(data_ptr.add(i));
+                }
+            }
+        }
+
+        status == VIRTIO_BLK_S_OK
+    }
+
+    /// Write a descriptor
+    fn write_desc(&self, idx: u16, addr: u64, len: u32, flags: u16, next: u16) {
+        let desc = VirtqDesc {
+            addr,
+            len,
+            flags,
+            next,
+        };
+        unsafe {
+            let desc_ptr = (self.desc_base + (idx as usize * 16)) as *mut VirtqDesc;
+            write_volatile(desc_ptr, desc);
+        }
+    }
+}
+
+/// Entry point
+#[no_mangle]
+pub extern "C" fn _start() -> ! {
+    serial_print("Virtio-block copy starting...\n");
+
+    // Initialize input device
+    serial_print("Initializing input device...\n");
+    let mut input = match VirtioBlock::init(INPUT_MMIO_BASE, INPUT_VQ_BASE) {
+        Some(dev) => dev,
+        None => {
+            serial_print("Failed to initialize input device\n");
+            halt();
+        }
+    };
+    serial_print("Input device ready, capacity: ");
+    print_u64(input.capacity);
+    serial_print(" sectors\n");
+
+    // Initialize output device
+    serial_print("Initializing output device...\n");
+    let mut output = match VirtioBlock::init(OUTPUT_MMIO_BASE, OUTPUT_VQ_BASE) {
+        Some(dev) => dev,
+        None => {
+            serial_print("Failed to initialize output device\n");
+            halt();
+        }
+    };
+    serial_print("Output device ready\n");
+
+    // Copy sectors
+    let total_sectors = input.capacity;
+    serial_print("Copying ");
+    print_u64(total_sectors);
+    serial_print(" sectors...\n");
+
+    let mut buffer = [0u8; SECTOR_SIZE];
+    let mut copied = 0u64;
+    let mut errors = 0u64;
+
+    for sector in 0..total_sectors {
+        // Read from input
+        if !input.read_sector(sector, &mut buffer) {
+            serial_print("Read error at sector ");
+            print_u64(sector);
+            serial_print("\n");
+            errors += 1;
+            continue;
+        }
+
+        // Write to output
+        if !output.write_sector(sector, &buffer) {
+            serial_print("Write error at sector ");
+            print_u64(sector);
+            serial_print("\n");
+            errors += 1;
+            continue;
+        }
+
+        copied += 1;
+
+        // Progress every 100 sectors
+        if sector % 100 == 0 && sector > 0 {
+            serial_print("Progress: ");
+            print_u64(sector);
+            serial_print("/");
+            print_u64(total_sectors);
+            serial_print("\n");
+        }
+    }
+
+    serial_print("\nCopy complete!\n");
+    serial_print("Copied: ");
+    print_u64(copied);
+    serial_print(" sectors\n");
+    if errors > 0 {
+        serial_print("Errors: ");
+        print_u64(errors);
+        serial_print("\n");
+    }
+
+    halt();
+}
+
+/// Print a u64 value
+fn print_u64(value: u64) {
+    if value == 0 {
+        serial_print("0");
+        return;
+    }
+
+    let mut buf = [0u8; 20];
+    let mut i = 20;
+    let mut v = value;
+
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+
+    for &b in &buf[i..] {
+        serial::serial_write(b);
+    }
+}
+
+/// Halt the CPU
+fn halt() -> ! {
+    unsafe {
+        asm!("hlt", options(nomem, nostack));
+    }
+    loop {
+        unsafe {
+            asm!("hlt", options(nomem, nostack));
+        }
+    }
+}
+
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    serial_print("PANIC!\n");
+    halt();
+}
