@@ -36,6 +36,14 @@ Documentation for VMware Virtual Machine Disk format.
 | [Grain Tables](vmdk/vmdk-grain-tables.md) | Address translation, GD/GT structure, COW |
 | [Compression](vmdk/vmdk-compression.md) | DEFLATE compression, streamOptimized format |
 
+## KVM Virtualization
+
+Documentation for building custom VMMs using the Linux KVM API.
+
+| Document | Description |
+|----------|-------------|
+| [KVM API Guide](kvm.md) | KVM ioctls, memory setup, x86-64 long mode, VM exits |
+
 ## Platform Analysis
 
 Analysis of how major virtualization platforms use qemu-img and handle disk images.
@@ -44,3 +52,11 @@ Analysis of how major virtualization platforms use qemu-img and handle disk imag
 |----------|-------------|
 | [Usage Analysis](usage.md) | How oVirt, Proxmox, and OpenStack use qemu-img |
 | [Security Vulnerabilities](security.md) | CVE analysis for image handling across platforms |
+
+## Prototypes
+
+Experimental implementations exploring secure isolated execution.
+
+| Document | Description |
+|----------|-------------|
+| [KVM Hello World](prototypes/kvm-hello-world.md) | Minimal bare-metal KVM guest proof-of-concept |
