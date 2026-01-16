@@ -44,6 +44,42 @@ Documentation for building custom VMMs using the Linux KVM API.
 |----------|-------------|
 | [KVM API Guide](kvm.md) | KVM ioctls, memory setup, x86-64 long mode, VM exits |
 
+## Guest Data Transfer
+
+Methods for transferring data into and out of bare-metal KVM guests.
+
+| Document | Description |
+|----------|-------------|
+| [Comparison](data-transfer-comparison.md) | Trade-offs, rust-vmm crates, and recommendations |
+| [Direct Memory](data-transfer-direct-memory.md) | Shared memory regions, coalesced I/O, completion signaling |
+| [Virtio-vsock](data-transfer-virtio-vsock.md) | Socket-based communication with CID addressing |
+| [Virtio-block](data-transfer-virtio-block.md) | Block device interface for sector-based transfers |
+| [Other Mechanisms](data-transfer-other.md) | Custom MMIO device, Port I/O, ioeventfd, virtio-fs, VFIO, hypercalls |
+
+## Design Decisions
+
+| Document | Description |
+|----------|-------------|
+| [Why Rust](rust-rationale.md) | Memory safety, bare-metal support, rust-vmm ecosystem |
+
+## Rust Crate Ecosystem
+
+The [rust-vmm](https://github.com/rust-vmm/community) project provides
+production-tested virtualization components used by Firecracker, crosvm, and
+Cloud Hypervisor. These crates reduce virtio implementation effort by 70%+.
+
+| Crate | Side | Purpose |
+|-------|------|---------|
+| [kvm-ioctls](https://crates.io/crates/kvm-ioctls) | VMM | Safe KVM API wrappers |
+| [vm-memory](https://crates.io/crates/vm-memory) | VMM | Guest memory abstraction |
+| [virtio-queue](https://crates.io/crates/virtio-queue) | VMM | Virtqueue implementation |
+| [virtio-blk](https://github.com/rust-vmm/vm-virtio) | VMM | Block device parsing |
+| [virtio-vsock](https://crates.io/crates/virtio-vsock) | VMM | Vsock packet handling |
+| [virtio-drivers](https://crates.io/crates/virtio-drivers) | Guest | `no_std` virtio drivers |
+
+See [Comparison](data-transfer-comparison.md#rust-crate-ecosystem) for details
+on how these crates affect implementation complexity.
+
 ## Platform Analysis
 
 Analysis of how major virtualization platforms use qemu-img and handle disk images.
