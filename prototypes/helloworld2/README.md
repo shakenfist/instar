@@ -86,8 +86,14 @@ rustup component add llvm-tools-preview
 
 ## Building
 
+From the prototype directory:
 ```bash
 ./build.sh
+```
+
+Or from the project root:
+```bash
+make build PROTOTYPE=helloworld2
 ```
 
 This will:

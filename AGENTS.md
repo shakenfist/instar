@@ -11,8 +11,13 @@ Imago is a safe, sandboxed disk image format converter. It replaces unsafe
 
 ```
 imago/
-├── prototypes/     # Experimental implementations in various languages
+├── .devcontainer/  # Development containers (rust-lint)
+├── crates/         # Shared Rust crates (guest-protocol)
+├── prototypes/     # Experimental implementations (7 KVM prototypes)
+├── scripts/        # Build and check scripts
 ├── docs/           # Design documents and research notes
+├── testdata/       # Test images for security validation
+├── Makefile        # Build and development automation
 ├── README.md       # Project overview
 ├── ARCHITECTURE.md # Technical design and security model
 ├── AGENTS.md       # This file
@@ -69,32 +74,58 @@ pre-commit run --all-files
 The hooks use a dedicated Docker container (`.devcontainer/rust-lint/`) with
 stable Rust to ensure consistent results across all development environments.
 
+### Using the Makefile
+
+The project includes a Makefile for common development tasks:
+
+```bash
+# Show all available commands
+make help
+
+# List available prototypes
+make list-prototypes
+
+# Build a specific prototype
+make build PROTOTYPE=virtio-block5
+
+# Build all prototypes
+make build-all
+
+# Run lint checks
+make lint
+
+# Auto-fix formatting
+make lint-fix
+
+# Clean a prototype's target directory
+make clean PROTOTYPE=virtio-block5
+
+# Clean everything (all targets + Docker images)
+make distclean
+```
+
 ### Testing Prototypes
 
-Each prototype has its own devcontainer with the required toolchain. Agents can
-and should test prototypes by:
+Each prototype has its own devcontainer with the required toolchain. Use the
+Makefile for building and testing:
 
-1. Building the devcontainer image for the prototype
-2. Running the build script inside the container
-3. Executing the prototype to verify it works
+```bash
+# Build a specific prototype
+make build PROTOTYPE=virtio-block5
 
-Example for testing a Rust KVM prototype:
+# Build the devcontainer for a prototype
+make build-devcontainer PROTOTYPE=virtio-block5
+
+# View run instructions
+make run PROTOTYPE=virtio-block5
+```
+
+For manual testing without the Makefile:
 
 ```bash
 cd prototypes/<prototype-name>
-
-# Build the devcontainer image
-docker build -t <prototype>-dev .devcontainer/
-
-# Run the build inside the container (with KVM access)
-docker run --rm -v "$(pwd):/workspace" -w /workspace \
-    --device=/dev/kvm --group-add=$(getent group kvm | cut -d: -f3) \
-    <prototype>-dev ./build.sh
-
-# Run the prototype (requires sudo for KVM)
-docker run --rm -it -v "$(pwd):/workspace" -w /workspace \
-    --device=/dev/kvm --group-add=$(getent group kvm | cut -d: -f3) \
-    <prototype>-dev sudo ./target/release/vmm <args>
+./build.sh                           # Build the prototype
+sudo ./target/release/vmm guest.bin  # Run (requires KVM)
 ```
 
 ### Testing Considerations

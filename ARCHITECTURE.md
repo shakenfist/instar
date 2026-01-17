@@ -101,14 +101,20 @@ Cons:
 - No existing tooling
 
 **Progress:**
-- [helloworld](../prototypes/helloworld/) - Minimal KVM VMM with serial output
-- [helloworld2](../prototypes/helloworld2/) - Uses vm-memory crate for safer memory
+- [helloworld](prototypes/helloworld/) - Minimal KVM VMM with serial output
+- [helloworld2](prototypes/helloworld2/) - Uses vm-memory crate for safer memory
+- [virtio-block](prototypes/virtio-block/) - Virtio-block device emulation with file copy
+- [virtio-block2](prototypes/virtio-block2/) - Adds guest-protocol (protobuf) integration
+- [virtio-block3](prototypes/virtio-block3/) - Adds configurable sector sizes
+- [virtio-block4](prototypes/virtio-block4/) - Adds performance statistics tracking
+- [virtio-block5](prototypes/virtio-block5/) - Adds ioeventfd optimization
 
 The rust-vmm project provides crates that reduce implementation effort by 70%+:
 - `kvm-ioctls` - Safe KVM API wrappers
+- `kvm-bindings` - KVM bindings
 - `vm-memory` - Guest memory abstraction
-- `virtio-queue` - Virtqueue implementation (future)
-- `virtio-drivers` - Guest-side virtio drivers (future)
+- `virtio-queue` - Virtqueue implementation
+- `virtio-bindings` - Virtio protocol bindings
 
 ## Format Support
 

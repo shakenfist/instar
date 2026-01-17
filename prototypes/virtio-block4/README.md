@@ -95,8 +95,14 @@ Requirements:
 - `cargo-binutils` for `rust-objcopy`
 - Protocol Buffers compiler (`protoc`)
 
+From the prototype directory:
 ```bash
 ./build.sh
+```
+
+Or from the project root:
+```bash
+make build PROTOTYPE=virtio-block4
 ```
 
 ## Running

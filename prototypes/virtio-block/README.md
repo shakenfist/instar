@@ -51,8 +51,14 @@ Requirements:
 - `rust-src` and `llvm-tools-preview` components
 - `cargo-binutils` for `rust-objcopy`
 
+From the prototype directory:
 ```bash
 ./build.sh
+```
+
+Or from the project root:
+```bash
+make build PROTOTYPE=virtio-block
 ```
 
 Or manually:

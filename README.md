@@ -32,6 +32,10 @@ Working prototypes exploring the KVM-based sandboxing approach:
 | [helloworld](prototypes/helloworld/) | Minimal bare-metal KVM guest proof-of-concept |
 | [helloworld2](prototypes/helloworld2/) | Uses vm-memory crate for safer memory management |
 | [virtio-block](prototypes/virtio-block/) | Virtio-block device emulation with file copy |
+| [virtio-block2](prototypes/virtio-block2/) | Adds guest-protocol (protobuf) integration |
+| [virtio-block3](prototypes/virtio-block3/) | Adds configurable sector sizes |
+| [virtio-block4](prototypes/virtio-block4/) | Adds performance statistics tracking |
+| [virtio-block5](prototypes/virtio-block5/) | Adds ioeventfd optimization |
 
 See [docs/index.md](docs/index.md) for full prototype documentation.
 
@@ -60,6 +64,72 @@ To auto-fix formatting issues:
 ./scripts/check-rust.sh fix
 ```
 
+### Makefile
+
+A Makefile is provided for common development tasks:
+
+```bash
+# Show all available targets
+make help
+
+# List available prototypes
+make list-prototypes
+```
+
+**Building:**
+```bash
+# Build a specific prototype
+make build PROTOTYPE=virtio-block5
+
+# Build all prototypes
+make build-all
+
+# Build the shared guest-protocol crate
+make guest-protocol
+
+# Build devcontainer for a prototype
+make build-devcontainer PROTOTYPE=virtio-block5
+
+# Build the rust-lint Docker container
+make build-lint-container
+```
+
+**Cleaning:**
+```bash
+# Clean a specific prototype's target directory
+make clean PROTOTYPE=virtio-block5
+
+# Clean all prototype target directories
+make clean-all
+
+# Remove all devcontainer Docker images
+make clean-devcontainers
+
+# Remove the rust-lint Docker image
+make clean-lint-container
+
+# Remove everything (all targets + all containers)
+make distclean
+```
+
+**Linting:**
+```bash
+# Run rustfmt and clippy checks
+make lint
+
+# Run with auto-fix
+make lint-fix
+
+# Install pre-commit hooks
+make install-hooks
+```
+
+**Running:**
+```bash
+# Show run instructions for a prototype
+make run PROTOTYPE=virtio-block5
+```
+
 ## Directory Structure
 
 ```
@@ -71,7 +141,11 @@ imago/
 ├── prototypes/     # Experimental implementations
 │   ├── helloworld/     # Minimal KVM VMM with bare-metal guest
 │   ├── helloworld2/    # Same, using rust-vmm vm-memory crate
-│   └── virtio-block/   # Virtio-block device emulation
+│   ├── virtio-block/   # Virtio-block device emulation
+│   ├── virtio-block2/  # With guest-protocol integration
+│   ├── virtio-block3/  # With configurable sector sizes
+│   ├── virtio-block4/  # With performance statistics
+│   └── virtio-block5/  # With ioeventfd optimization
 ├── scripts/        # Build and check scripts
 ├── docs/           # Design documents and research
 │   ├── index.md    # Documentation index
@@ -84,6 +158,7 @@ imago/
 │   ├── benign/     # Safe test images (qcow2, raw, vmdk, vhdx, vpc)
 │   ├── malicious/  # CVE exploit images (DANGEROUS)
 │   └── downloaded/ # External test images (CirrOS, QEMU iotests, etc.)
+├── Makefile        # Build and development automation
 └── README.md
 ```
 
