@@ -10,6 +10,26 @@ enum Level {
   COMPLETE = 4;
 }
 
+// =============================================================================
+// VMM -> Guest Messages (configuration sent at startup)
+// =============================================================================
+
+// Configuration for a single device
+message DeviceConfig {
+  string name = 1;           // "input" or "output"
+  uint32 sector_size = 2;    // Sector size in bytes (512, 1024, 2048, 4096)
+}
+
+// Configuration message sent from VMM to guest at startup
+message VmmConfig {
+  repeated DeviceConfig devices = 1;  // Configuration for each device
+  uint32 progress_percent = 2;        // Progress update interval (0=none, 1=every 1%, etc.)
+}
+
+// =============================================================================
+// Guest -> VMM Messages (status and progress)
+// =============================================================================
+
 // Initialization stage message
 message InitMessage {
   string stage = 1;      // "probe", "features", "queue"

@@ -99,6 +99,7 @@ Experimental implementations exploring secure isolated execution.
 | [KVM Hello World 2](prototypes/kvm-hello-world2.md) | Using vm-memory crate for safer memory management |
 | [Virtio-Block](prototypes/virtio-block.md) | Virtio-block device emulation with file copy |
 | [Virtio-Block2](prototypes/virtio-block2.md) | Virtio-block with protobuf messaging |
+| [Virtio-Block3](prototypes/virtio-block3.md) | Virtio-block with configurable sector sizes |
 
 ## Shared Crates
 
@@ -107,3 +108,9 @@ Reusable Rust crates for the imago project.
 | Document | Description |
 |----------|-------------|
 | [guest-protocol](crates/guest-protocol.md) | Protocol Buffers messaging for guest-VMM communication |
+
+## Development
+
+| Document | Description |
+|----------|-------------|
+| [Building with Docker](building-with-docker.md) | Build prototypes using Docker CLI without VSCode |

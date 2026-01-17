@@ -23,7 +23,7 @@ fn main() {
         ".",
         micropb_gen::Config::new()
             .max_bytes(32) // Max string length for stage/device/operation names
-            .max_len(1), // We don't use repeated fields
+            .max_len(4), // VmmConfig.devices needs at least 2 (input + output)
     );
 
     // Generate the Rust module

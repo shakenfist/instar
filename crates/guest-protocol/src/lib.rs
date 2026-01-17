@@ -177,6 +177,37 @@ pub fn complete_message(operation: &str, count: u64, success: bool) -> guest_::G
     msg
 }
 
+// =============================================================================
+// VMM -> Guest configuration message support
+// =============================================================================
+
+use micropb::{MessageDecode, PbDecoder};
+
+/// Decode a VmmConfig message from a framed buffer (for guest side).
+///
+/// Returns the decoded config and the number of bytes consumed,
+/// or None if decoding failed or buffer is incomplete.
+pub fn decode_vmm_config_framed(buf: &[u8]) -> Option<(guest_::VmmConfig, usize)> {
+    if buf.len() < FRAME_HEADER_SIZE {
+        return None;
+    }
+
+    let msg_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+    let total_len = FRAME_HEADER_SIZE + msg_len;
+
+    if buf.len() < total_len {
+        return None;
+    }
+
+    let msg_buf = &buf[FRAME_HEADER_SIZE..total_len];
+    let mut decoder = PbDecoder::new(msg_buf);
+    let mut config = guest_::VmmConfig::default();
+
+    config.decode(&mut decoder, msg_buf.len()).ok()?;
+
+    Some((config, total_len))
+}
+
 #[cfg(feature = "std")]
 mod decode {
     //! Decoding support for VMM side (requires std feature).
@@ -212,3 +243,77 @@ mod decode {
 
 #[cfg(feature = "std")]
 pub use decode::decode_framed;
+
+#[cfg(feature = "std")]
+extern crate alloc;
+
+#[cfg(feature = "std")]
+mod vmm_config_support {
+    //! VmmConfig encoding support for VMM side (requires std feature).
+
+    extern crate alloc;
+    use alloc::vec::Vec;
+
+    use super::guest_;
+    use super::MAX_MESSAGE_SIZE;
+    use micropb::{MessageEncode, PbEncoder};
+
+    /// Encode a VmmConfig message with length-prefix framing into a Vec.
+    ///
+    /// Returns the encoded bytes, or None if encoding failed.
+    pub fn encode_vmm_config_framed(config: &guest_::VmmConfig) -> Option<Vec<u8>> {
+        // Encode message into a heapless Vec first (micropb requires PbWrite trait)
+        let mut encode_buf: heapless::Vec<u8, MAX_MESSAGE_SIZE> = heapless::Vec::new();
+        let mut encoder = PbEncoder::new(&mut encode_buf);
+        config.encode(&mut encoder).ok()?;
+
+        let msg_len = encode_buf.len();
+        if msg_len > u16::MAX as usize {
+            return None;
+        }
+
+        // Build framed message with length prefix
+        let mut result = Vec::with_capacity(super::FRAME_HEADER_SIZE + msg_len);
+        let len_bytes = (msg_len as u16).to_le_bytes();
+        result.push(len_bytes[0]);
+        result.push(len_bytes[1]);
+        result.extend_from_slice(&encode_buf);
+
+        Some(result)
+    }
+
+    /// Helper to create a VmmConfig with device sector sizes and progress interval.
+    ///
+    /// # Arguments
+    ///
+    /// * `input_sector_size` - Sector size for input device in bytes
+    /// * `output_sector_size` - Sector size for output device in bytes
+    /// * `progress_percent` - Progress update interval (0=none, 1=every 1%, etc.)
+    pub fn vmm_config(
+        input_sector_size: u32,
+        output_sector_size: u32,
+        progress_percent: u32,
+    ) -> guest_::VmmConfig {
+        let mut config = guest_::VmmConfig::default();
+
+        // Add input device config
+        let mut input_dev = guest_::DeviceConfig::default();
+        super::push_str(&mut input_dev.name, "input");
+        input_dev.sector_size = input_sector_size;
+        let _ = config.devices.push(input_dev);
+
+        // Add output device config
+        let mut output_dev = guest_::DeviceConfig::default();
+        super::push_str(&mut output_dev.name, "output");
+        output_dev.sector_size = output_sector_size;
+        let _ = config.devices.push(output_dev);
+
+        // Set progress interval
+        config.progress_percent = progress_percent;
+
+        config
+    }
+}
+
+#[cfg(feature = "std")]
+pub use vmm_config_support::{encode_vmm_config_framed, vmm_config};

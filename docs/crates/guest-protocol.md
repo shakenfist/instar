@@ -1,15 +1,16 @@
 # Guest Protocol Crate
 
-The `guest-protocol` crate provides structured messaging for guest-to-VMM
-communication over the serial port.
+The `guest-protocol` crate provides structured bidirectional messaging between
+guests and VMMs over the serial port.
 
 ## Overview
 
-This crate uses Protocol Buffers (via `micropb`) to define a schema for
-guest status messages. It is designed for:
+This crate uses Protocol Buffers (via `micropb`) to define schemas for both
+guest status messages and VMM configuration messages. It is designed for:
 
 - **no_std environments**: Works in bare-metal guests without heap allocation
 - **Machine-parseable output**: VMM can extract structured status information
+- **Bidirectional communication**: VMM can send configuration to guest at startup
 - **Interoperability**: Protocol Buffers schema allows future tooling
 
 ## Location
@@ -51,6 +52,8 @@ message GuestMessage {
 
 ## Message Types
 
+### Guest → VMM Messages
+
 | Message | Purpose | Fields |
 |---------|---------|--------|
 | InitMessage | Device initialization stages | stage, device, address |
@@ -58,6 +61,13 @@ message GuestMessage {
 | ProgressMessage | Operation progress | operation, current, total, percent |
 | ErrorMessage | Error details | operation, device, sector, status |
 | CompleteMessage | Operation completion | operation, count, success |
+
+### VMM → Guest Messages
+
+| Message | Purpose | Fields |
+|---------|---------|--------|
+| DeviceConfig | Single device configuration | name, sector_size |
+| VmmConfig | Configuration for all devices | devices, progress_percent |
 
 ## Framing
 
@@ -116,6 +126,14 @@ compiler) to be installed on the system.
 
 ## Current Status
 
-The crate is implemented but not yet integrated into the virtio-block
-prototype. The prototype uses simple serial strings for debugging output
-instead. Future prototypes may use this crate for structured messaging.
+The crate is actively used by:
+
+- **virtio-block2**: Guest → VMM protobuf messages for status reporting
+- **virtio-block3**: Bidirectional communication with VMM → guest configuration
+
+## Prototypes Using This Crate
+
+| Prototype | Direction | Usage |
+|-----------|-----------|-------|
+| [virtio-block2](../prototypes/virtio-block2.md) | Guest → VMM | Status, progress, errors |
+| [virtio-block3](../prototypes/virtio-block3.md) | Bidirectional | Status + configuration |

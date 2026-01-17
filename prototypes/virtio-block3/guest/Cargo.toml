@@ -1,0 +1,15 @@
+[package]
+name = "guest"
+version = "0.1.0"
+edition = "2021"
+description = "Bare-metal guest that copies data between virtio-block devices with configurable sector sizes"
+license = "Apache-2.0"
+
+[dependencies]
+guest-protocol = { path = "../../../crates/guest-protocol" }
+heapless = "0.8"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true
