@@ -43,6 +43,7 @@ Documentation for building custom VMMs using the Linux KVM API.
 | Document | Description |
 |----------|-------------|
 | [KVM API Guide](kvm.md) | KVM ioctls, memory setup, x86-64 long mode, VM exits |
+| [Performance Counters](performance_counters.md) | KVM statistics, perf events, resource limiting |
 
 ## Guest Data Transfer
 
@@ -100,6 +101,7 @@ Experimental implementations exploring secure isolated execution.
 | [Virtio-Block](prototypes/virtio-block.md) | Virtio-block device emulation with file copy |
 | [Virtio-Block2](prototypes/virtio-block2.md) | Virtio-block with protobuf messaging |
 | [Virtio-Block3](prototypes/virtio-block3.md) | Virtio-block with configurable sector sizes |
+| [Virtio-Block4](prototypes/virtio-block4.md) | Virtio-block with performance statistics |
 
 ## Shared Crates
 
