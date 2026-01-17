@@ -52,7 +52,7 @@ for crate in; do
 done
 
 # Check prototypes
-for prototype in prototypes/helloworld prototypes/helloworld2 prototypes/virtio-block prototypes/virtio-block2 prototypes/virtio-block3 prototypes/virtio-block4; do
+for prototype in prototypes/helloworld prototypes/helloworld2 prototypes/virtio-block prototypes/virtio-block2 prototypes/virtio-block3 prototypes/virtio-block4 prototypes/virtio-block5; do
     # Skip if directory doesn't exist yet
     if [ ! -d "$PROJECT_ROOT/$prototype" ]; then
         continue

@@ -102,6 +102,7 @@ Experimental implementations exploring secure isolated execution.
 | [Virtio-Block2](prototypes/virtio-block2.md) | Virtio-block with protobuf messaging |
 | [Virtio-Block3](prototypes/virtio-block3.md) | Virtio-block with configurable sector sizes |
 | [Virtio-Block4](prototypes/virtio-block4.md) | Virtio-block with performance statistics |
+| [Virtio-Block5](prototypes/virtio-block5.md) | Virtio-block with ioeventfd/irqfd optimizations |
 
 ## Shared Crates
 
