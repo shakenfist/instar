@@ -10,7 +10,7 @@
 
 .PHONY: help list-prototypes build build-all clean clean-all \
         clean-devcontainers lint lint-fix build-lint-container \
-        install-hooks run guest-protocol
+        install-hooks run guest-protocol ensure-devcontainer
 
 # Default target
 help:
@@ -51,7 +51,7 @@ help:
 	@echo "  make lint"
 
 # List of all prototypes
-PROTOTYPES := helloworld helloworld2 virtio-block virtio-block2 virtio-block3 virtio-block4 virtio-block5
+PROTOTYPES := helloworld helloworld2 virtio-block virtio-block2 virtio-block3 virtio-block4 virtio-block5 virtio-block6
 
 # Docker image names
 LINT_IMAGE := imago-rust-lint
@@ -80,24 +80,38 @@ ifeq ($(filter $(PROTOTYPE),$(PROTOTYPES)),)
 	$(error Invalid PROTOTYPE '$(PROTOTYPE)'. Run 'make list-prototypes' to see available options)
 endif
 
-# Build a specific prototype
-build: check-prototype
+# Build a specific prototype (runs inside devcontainer)
+build: check-prototype ensure-devcontainer
 	@echo "Building prototype: $(PROTOTYPE)"
-	@if [ -f "$(PROTO_DIR)/$(PROTOTYPE)/build.sh" ]; then \
-		cd "$(PROTO_DIR)/$(PROTOTYPE)" && bash build.sh; \
-	else \
+	@if [ ! -f "$(PROTO_DIR)/$(PROTOTYPE)/build.sh" ]; then \
 		echo "Error: build.sh not found for $(PROTOTYPE)"; \
 		exit 1; \
 	fi
+	docker run --rm \
+		-u "$(shell id -u):$(shell id -g)" \
+		-e HOME=/home/vscode \
+		-e CARGO_HOME=/home/vscode/.cargo \
+		-e RUSTUP_HOME=/home/vscode/.rustup \
+		-v "$(CURDIR):/workspace" \
+		-w "/workspace/$(PROTO_DIR)/$(PROTOTYPE)" \
+		"imago-$(PROTOTYPE)" \
+		bash build.sh
 
-# Build all prototypes
+# Ensure devcontainer exists (builds if needed)
+ensure-devcontainer: check-prototype
+	@if ! docker image inspect "imago-$(PROTOTYPE)" >/dev/null 2>&1; then \
+		echo "Building devcontainer image for $(PROTOTYPE)..."; \
+		docker build -t "imago-$(PROTOTYPE)" "$(PROTO_DIR)/$(PROTOTYPE)/$(DEVCONTAINER_DIR)"; \
+	fi
+
+# Build all prototypes (each runs inside its devcontainer)
 build-all:
 	@echo "Building all prototypes..."
 	@for p in $(PROTOTYPES); do \
 		if [ -d "$(PROTO_DIR)/$$p" ] && [ -f "$(PROTO_DIR)/$$p/build.sh" ]; then \
 			echo ""; \
 			echo "=== Building $$p ==="; \
-			(cd "$(PROTO_DIR)/$$p" && bash build.sh) || exit 1; \
+			$(MAKE) build PROTOTYPE=$$p || exit 1; \
 		fi; \
 	done
 	@echo ""
