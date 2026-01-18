@@ -37,6 +37,7 @@ Working prototypes exploring the KVM-based sandboxing approach:
 | [virtio-block4](prototypes/virtio-block4/) | Adds performance statistics tracking |
 | [virtio-block5](prototypes/virtio-block5/) | Adds ioeventfd optimization |
 | [virtio-block6](prototypes/virtio-block6/) | Adds sparse/dynamic output file support, adopt recommended sector sizes and progress reporting intervals based on previous testing |
+| [pluggable](prototypes/pluggable/) | Modular architecture separating core infrastructure from pluggable operations |
 
 See [docs/index.md](docs/index.md) for full prototype documentation.
 
@@ -147,7 +148,8 @@ imago/
 │   ├── virtio-block3/  # With configurable sector sizes
 │   ├── virtio-block4/  # With performance statistics
 │   ├── virtio-block5/  # With ioeventfd optimization
-│   └── virtio-block6/  # With sparse/dynamic output support
+│   ├── virtio-block6/  # With sparse/dynamic output support
+│   └── pluggable/      # Modular operations architecture
 ├── scripts/        # Build and check scripts
 ├── docs/           # Design documents and research
 │   ├── index.md    # Documentation index

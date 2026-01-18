@@ -51,7 +51,16 @@ help:
 	@echo "  make lint"
 
 # List of all prototypes
-PROTOTYPES := helloworld helloworld2 virtio-block virtio-block2 virtio-block3 virtio-block4 virtio-block5 virtio-block6
+PROTOTYPES := \
+	helloworld \
+	helloworld2 \
+	virtio-block \
+	virtio-block2 \
+	virtio-block3 \
+	virtio-block4 \
+	virtio-block5 \
+	virtio-block6 \
+	pluggable
 
 # Docker image names
 LINT_IMAGE := imago-rust-lint
