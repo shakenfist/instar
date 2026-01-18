@@ -60,7 +60,8 @@ PROTOTYPES := \
 	virtio-block4 \
 	virtio-block5 \
 	virtio-block6 \
-	pluggable
+	pluggable \
+	pluggable2
 
 # Docker image names
 LINT_IMAGE := imago-rust-lint
@@ -148,30 +149,47 @@ build-lint-container:
 	docker build -t $(LINT_IMAGE) $(DEVCONTAINER_DIR)/rust-lint
 
 # Clean target directory for a specific prototype
+# Runs inside container if available (to handle root-owned files from builds)
 clean: check-prototype
 	@echo "Cleaning target directory for: $(PROTOTYPE)"
-	@if [ -d "$(PROTO_DIR)/$(PROTOTYPE)/target" ]; then \
-		rm -rf "$(PROTO_DIR)/$(PROTOTYPE)/target"; \
-		echo "Removed $(PROTO_DIR)/$(PROTOTYPE)/target"; \
+	@if docker image inspect "imago-$(PROTOTYPE)" >/dev/null 2>&1; then \
+		echo "Using container to clean (handles root-owned files)..."; \
+		docker run --rm \
+			-v "$(CURDIR):/workspace" \
+			-w "/workspace/$(PROTO_DIR)/$(PROTOTYPE)" \
+			"imago-$(PROTOTYPE)" \
+			sh -c "rm -rf target *.bin"; \
+		echo "Cleaned $(PROTO_DIR)/$(PROTOTYPE)"; \
 	else \
-		echo "No target directory found for $(PROTOTYPE)"; \
-	fi
-	@if [ -f "$(PROTO_DIR)/$(PROTOTYPE)/guest.bin" ]; then \
-		rm -f "$(PROTO_DIR)/$(PROTOTYPE)/guest.bin"; \
-		echo "Removed $(PROTO_DIR)/$(PROTOTYPE)/guest.bin"; \
+		if [ -d "$(PROTO_DIR)/$(PROTOTYPE)/target" ]; then \
+			rm -rf "$(PROTO_DIR)/$(PROTOTYPE)/target"; \
+			echo "Removed $(PROTO_DIR)/$(PROTOTYPE)/target"; \
+		else \
+			echo "No target directory found for $(PROTOTYPE)"; \
+		fi; \
+		find "$(PROTO_DIR)/$(PROTOTYPE)" -maxdepth 1 -name "*.bin" -delete 2>/dev/null || true; \
 	fi
 
 # Clean all prototype target directories
+# Uses containers when available to handle root-owned files
 clean-all:
 	@echo "Cleaning all prototype target directories..."
 	@for p in $(PROTOTYPES); do \
-		if [ -d "$(PROTO_DIR)/$$p/target" ]; then \
-			rm -rf "$(PROTO_DIR)/$$p/target"; \
-			echo "Removed $(PROTO_DIR)/$$p/target"; \
-		fi; \
-		if [ -f "$(PROTO_DIR)/$$p/guest.bin" ]; then \
-			rm -f "$(PROTO_DIR)/$$p/guest.bin"; \
-			echo "Removed $(PROTO_DIR)/$$p/guest.bin"; \
+		if [ -d "$(PROTO_DIR)/$$p" ]; then \
+			if docker image inspect "imago-$$p" >/dev/null 2>&1; then \
+				echo "Cleaning $$p (via container)..."; \
+				docker run --rm \
+					-v "$(CURDIR):/workspace" \
+					-w "/workspace/$(PROTO_DIR)/$$p" \
+					"imago-$$p" \
+					sh -c "rm -rf target *.bin" 2>/dev/null || true; \
+			else \
+				if [ -d "$(PROTO_DIR)/$$p/target" ]; then \
+					rm -rf "$(PROTO_DIR)/$$p/target" 2>/dev/null || \
+						echo "Warning: Could not remove $(PROTO_DIR)/$$p/target (try: sudo rm -rf)"; \
+				fi; \
+				find "$(PROTO_DIR)/$$p" -maxdepth 1 -name "*.bin" -delete 2>/dev/null || true; \
+			fi; \
 		fi; \
 	done
 	@echo "Clean complete."

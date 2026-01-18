@@ -1,0 +1,15 @@
+[package]
+name = "core"
+version = "0.1.0"
+edition = "2021"
+description = "Core guest binary: device initialization, call table, operation dispatch"
+license = "Apache-2.0"
+
+[dependencies]
+guest-protocol = { path = "../../../crates/guest-protocol" }
+shared = { path = "../shared" }
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true
