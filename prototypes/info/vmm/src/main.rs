@@ -12,10 +12,12 @@
 //! needed for the current task.
 //!
 //! Features:
-//! - Two virtio-block devices (input read-only, output writable)
+//! - Input virtio-block device (read-only)
+//! - Optional output virtio-block device (writable, for copy operations)
 //! - Configurable sector sizes
 //! - Sparse output files (grow on demand)
 //! - ioeventfd optimization for queue notifications
+//! - InfoResult reading for info operations
 
 mod backing;
 mod io_thread;
@@ -27,15 +29,17 @@ mod virtio;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use guest_protocol::{
-    decode_framed, encode_vmm_config_framed, guest_, vmm_config, FRAME_HEADER_SIZE,
+    decode_framed, encode_vmm_config_framed, guest_, vmm_config, vmm_config_input_only,
+    FRAME_HEADER_SIZE,
 };
 use kvm_bindings::{kvm_regs, kvm_segment, kvm_sregs, kvm_userspace_memory_region};
 use kvm_ioctls::{Kvm, VcpuExit};
 use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use backing::BackingStore;
+use io_thread::{DeviceRole, IoDevice};
 use ioevent::IoEvent;
 use stats::VmmStats;
 use virtio::VirtioBlockDevice;
@@ -51,6 +55,31 @@ const OPERATION_LOAD_ADDR: u64 = 0x20000;
 const COPY_CONFIG_MAGIC: u32 = 0x434F5059; // "COPY"
 const COPY_CONFIG_FLAG_VERIFY: u32 = 1 << 0;
 const COPY_CONFIG_FLAG_SKIP_ZEROS: u32 = 1 << 1;
+
+// InfoConfig constants (must match shared crate)
+const INFO_CONFIG_MAGIC: u32 = 0x494E464F; // "INFO"
+const INFO_CONFIG_FLAG_DETAILED: u32 = 1 << 0;
+const INFO_CONFIG_FLAG_SECURITY_CHECK: u32 = 1 << 1;
+
+// InfoResult constants (must match shared crate)
+const INFO_RESULT_MAGIC: u32 = 0x52455355; // "RESU"
+const INFO_RESULT_FLAG_HAS_BACKING_FILE: u32 = 1 << 0;
+const INFO_RESULT_FLAG_HAS_EXTERNAL_DATA: u32 = 1 << 1;
+const INFO_RESULT_FLAG_ENCRYPTED: u32 = 1 << 2;
+const INFO_RESULT_FLAG_COMPRESSED: u32 = 1 << 3;
+const INFO_RESULT_FLAG_HAS_SNAPSHOTS: u32 = 1 << 4;
+const INFO_RESULT_FLAG_DIRTY: u32 = 1 << 5;
+const INFO_RESULT_FLAG_CORRUPT: u32 = 1 << 6;
+
+// ImageFormat values (must match shared crate)
+const IMAGE_FORMAT_UNKNOWN: u32 = 0;
+const IMAGE_FORMAT_RAW: u32 = 1;
+const IMAGE_FORMAT_QCOW2: u32 = 2;
+const IMAGE_FORMAT_VMDK4: u32 = 3;
+const IMAGE_FORMAT_VMDK3: u32 = 4;
+const IMAGE_FORMAT_VHD: u32 = 5;
+const IMAGE_FORMAT_VHDX: u32 = 6;
+const IMAGE_FORMAT_QCOW1: u32 = 7;
 
 // Stack: generous allocation for complex operations like qemu-img info
 // Place at 16MB with 4MB size to handle deep call stacks
@@ -246,10 +275,17 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
             )
         }
         Some(guest_::GuestMessage_::Payload::InfoResult(info)) => {
-            format!(
+            let mut details = format!(
                 "info_result format={} version={} virtual_size={} actual_size={} cluster_size={} flags=0x{:x}",
                 info.format, info.version, info.virtual_size, info.actual_size, info.cluster_size, info.flags
-            )
+            );
+            if !info.backing_file.is_empty() {
+                details.push_str(&format!(" backing_file={}", info.backing_file));
+            }
+            if !info.external_data_file.is_empty() {
+                details.push_str(&format!(" external_data_file={}", info.external_data_file));
+            }
+            details
         }
         None => "empty payload".to_string(),
     };
@@ -257,16 +293,52 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
     format!("[{}] {}", level, payload_str)
 }
 
+/// Get the directory containing the imago executable
+fn get_binary_dir() -> std::path::PathBuf {
+    std::env::current_exe()
+        .expect("Failed to get executable path")
+        .parent()
+        .expect("Failed to get executable directory")
+        .to_path_buf()
+}
+
+/// Get the path to a binary in the same directory as imago
+fn get_binary_path(name: &str) -> std::path::PathBuf {
+    get_binary_dir().join(name)
+}
+
 #[derive(Parser, Debug)]
-#[command(name = "vmm")]
-#[command(about = "Virtio-block VMM with sparse output support")]
-struct Args {
-    /// Input file (source for copy)
-    #[arg(short, long)]
+#[command(name = "imago")]
+#[command(about = "Safe, sandboxed disk image operations")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Detect image format and display information
+    Info(InfoArgs),
+    /// Copy/convert disk images
+    Copy(CopyArgs),
+}
+
+#[derive(Args, Debug)]
+struct InfoArgs {
+    /// Input image file
     input: String,
 
-    /// Output file (destination for copy)
-    #[arg(short, long)]
+    /// Sector size for reading input (default: 65536)
+    #[arg(long, default_value = "65536")]
+    sector_size: u32,
+}
+
+#[derive(Args, Debug)]
+struct CopyArgs {
+    /// Input image file
+    input: String,
+
+    /// Output image file
     output: String,
 
     /// Sector size for input device in bytes (default: 65536)
@@ -290,19 +362,6 @@ struct Args {
     #[arg(long, default_value = "10")]
     progress_percent: u32,
 
-    /// Disable ioeventfd optimization
-    #[arg(long)]
-    no_ioeventfd: bool,
-
-    /// Core guest binary (device init, call table)
-    #[arg(long)]
-    core: String,
-
-    /// Operation binary to load (e.g., copy.bin)
-    #[arg(long)]
-    operation: String,
-
-    // Copy operation flags
     /// Verify data after copy (read back and compare)
     #[arg(long)]
     verify: bool,
@@ -321,39 +380,43 @@ struct Args {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+    let cli = Cli::parse();
 
-    // Validate sector sizes (must be powers of 2, 512 to 64KB)
-    for (name, size) in [
-        ("input", args.input_sector_size),
-        ("output", args.output_sector_size),
-    ] {
-        if !(512..=MAX_SECTOR_SIZE).contains(&size) || !size.is_power_of_two() {
-            eprintln!(
-                "Error: {} sector size must be a power of 2, 512 to {} (got {})",
-                name, MAX_SECTOR_SIZE, size
-            );
-            std::process::exit(1);
-        }
+    match cli.command {
+        Commands::Info(args) => run_info(args),
+        Commands::Copy(args) => run_copy(args),
+    }
+}
+
+/// Run the info operation (format detection)
+fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate sector size (must be power of 2, 512 to 64KB)
+    if !(512..=MAX_SECTOR_SIZE).contains(&args.sector_size) || !args.sector_size.is_power_of_two() {
+        eprintln!(
+            "Error: sector size must be a power of 2, 512 to {} (got {})",
+            MAX_SECTOR_SIZE, args.sector_size
+        );
+        std::process::exit(1);
     }
 
-    // Determine if output should be sparse (default) or pre-allocated
-    let sparse_output = !args.preallocate_output;
+    // Auto-discover binaries in same directory as executable
+    let core_path = get_binary_path("core.bin");
+    let operation_path = get_binary_path("info.bin");
 
     // Load core binary (device init, call table setup)
-    let core_code = load_guest_binary(&args.core)?;
+    let core_code = load_guest_binary(core_path.to_str().unwrap())?;
     println!(
         "Loaded core binary: {} bytes from {}",
         core_code.len(),
-        args.core
+        core_path.display()
     );
 
-    // Load operation binary (copy, info, etc.)
-    let operation_code = load_guest_binary(&args.operation)?;
+    // Load operation binary (info)
+    let operation_code = load_guest_binary(operation_path.to_str().unwrap())?;
     println!(
         "Loaded operation binary: {} bytes from {}",
         operation_code.len(),
-        args.operation
+        operation_path.display()
     );
 
     // Get input file size
@@ -362,38 +425,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Input file: {} ({} bytes, {} sectors @ {} bytes/sector)",
         args.input,
         input_size,
-        input_size / args.input_sector_size as u64,
-        args.input_sector_size
+        input_size / args.sector_size as u64,
+        args.sector_size
     );
 
-    // Determine output capacity (default to input size)
-    let output_capacity = args.max_output_size.unwrap_or(input_size);
-
-    // Open backing stores
-    // Input: read-only, not sparse
+    // Open backing store (input only, read-only)
     let input_backing = BackingStore::open(Path::new(&args.input), true, None, false)?;
-
-    // Output: writable, sparse by default (grows on demand)
-    let output_backing = BackingStore::open(
-        Path::new(&args.output),
-        false,
-        Some(output_capacity),
-        sparse_output,
-    )?;
-
-    let output_mode_desc = if sparse_output {
-        "sparse, grows on demand"
-    } else {
-        "pre-allocated"
-    };
-    println!(
-        "Output file: {} (capacity {} bytes, {} sectors @ {} bytes/sector, {})",
-        args.output,
-        output_capacity,
-        output_capacity / args.output_sector_size as u64,
-        args.output_sector_size,
-        output_mode_desc
-    );
 
     // Open KVM
     let kvm = Kvm::new()?;
@@ -432,7 +469,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_gdt(&guest_mem)?;
     println!("Set up GDT at 0x{:x}", GDT_BASE);
 
-    // Set up page tables (identity map 8MB)
+    // Set up page tables (identity map)
     setup_page_tables(&guest_mem)?;
     println!("Set up page tables at 0x{:x}", PAGE_TABLE_BASE);
 
@@ -442,100 +479,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load operation binary at OPERATION_LOAD_ADDR (0x20000)
     guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
+    println!("Loaded operation binary at 0x{:x}", OPERATION_LOAD_ADDR);
+
+    // Write InfoConfig at OPERATION_CONFIG_ADDR (0x19000)
+    // Layout: magic (u32), flags (u32)
+    let info_flags: u32 = INFO_CONFIG_FLAG_DETAILED | INFO_CONFIG_FLAG_SECURITY_CHECK;
+    guest_mem.write_obj(INFO_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
+    guest_mem.write_obj(info_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
     println!(
-        "Loaded operation binary at 0x{:x}",
-        OPERATION_LOAD_ADDR
+        "Wrote info config at 0x{:x} (flags=0x{:x})",
+        OPERATION_CONFIG_ADDR, info_flags
     );
 
-    // Write operation config at OPERATION_CONFIG_ADDR (0x19000)
-    // Build flags from CLI arguments
-    let mut copy_flags: u32 = 0;
-    if args.verify {
-        copy_flags |= COPY_CONFIG_FLAG_VERIFY;
-    }
-    if args.skip_zeros {
-        copy_flags |= COPY_CONFIG_FLAG_SKIP_ZEROS;
-    }
-
-    // Write CopyConfig struct (must match shared::CopyConfig layout)
-    // Layout: magic (u32), flags (u32), start_sector (u64), sector_count (u64)
-    guest_mem.write_obj(COPY_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
-    guest_mem.write_obj(copy_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
-    guest_mem.write_obj(args.start_sector, GuestAddress(OPERATION_CONFIG_ADDR + 8))?;
-    guest_mem.write_obj(args.sector_count, GuestAddress(OPERATION_CONFIG_ADDR + 16))?;
-    println!(
-        "Wrote operation config at 0x{:x} (flags=0x{:x}, start={}, count={})",
-        OPERATION_CONFIG_ADDR, copy_flags, args.start_sector, args.sector_count
-    );
-
-    // Create virtio-block devices with configurable sector sizes
+    // Create virtio-block device (input only for info operation)
     let input_device = VirtioBlockDevice::new(
         input_backing,
         input_size,
-        args.input_sector_size as u64,
+        args.sector_size as u64,
         true, // read-only
         INPUT_MMIO_BASE,
         INPUT_VQ_BASE,
     );
-    let output_device = VirtioBlockDevice::new(
-        output_backing,
-        output_capacity, // Use capacity, not input_size
-        args.output_sector_size as u64,
-        false, // read-write
-        OUTPUT_MMIO_BASE,
-        OUTPUT_VQ_BASE,
-    );
     println!(
-        "Created virtio-block devices at MMIO 0x{:x} and 0x{:x}",
-        INPUT_MMIO_BASE, OUTPUT_MMIO_BASE
+        "Created virtio-block device at MMIO 0x{:x}",
+        INPUT_MMIO_BASE
     );
-    println!(
-        "  Input sector size: {} bytes, Output sector size: {} bytes",
-        input_device.sector_size(),
-        output_device.sector_size()
-    );
+    println!("  Sector size: {} bytes", input_device.sector_size());
 
-    // Wrap devices in Arc<Mutex<>> for potential sharing with I/O thread
+    // Wrap device in Arc<Mutex<>> for potential sharing with I/O thread
     let input_device = Arc::new(Mutex::new(input_device));
-    let output_device = Arc::new(Mutex::new(output_device));
 
     // Wrap guest memory in Arc for sharing
     let guest_mem = Arc::new(guest_mem);
 
-    // Create shared statistics tracker (shared with I/O thread if enabled)
+    // Create shared statistics tracker
     let vmm_stats = Arc::new(Mutex::new(VmmStats::new()));
 
-    // Set up ioeventfd for queue notifications (if enabled)
-    let use_ioeventfd = !args.no_ioeventfd;
+    // Set up ioeventfd for queue notifications
+    // Info operation uses only one input device
     let mut io_thread: Option<io_thread::IoThread> = None;
+    let mut input_evt = IoEvent::new(INPUT_MMIO_BASE)?;
 
-    if use_ioeventfd {
-        let mut input_evt = IoEvent::new(INPUT_MMIO_BASE)?;
-        let mut output_evt = IoEvent::new(OUTPUT_MMIO_BASE)?;
+    match input_evt.register(&vm) {
+        Ok(()) => {
+            println!("ioeventfd: enabled for queue notifications (with I/O thread)");
 
-        match (input_evt.register(&vm), output_evt.register(&vm)) {
-            (Ok(()), Ok(())) => {
-                println!("ioeventfd: enabled for queue notifications (with I/O thread)");
+            // Configure devices for I/O thread (info: 1 input device only)
+            let devices = vec![IoDevice {
+                role: DeviceRole::Input,
+                device: Arc::clone(&input_device),
+                ioevent: input_evt,
+            }];
 
-                // Start the I/O thread with shared stats
-                io_thread = Some(io_thread::IoThread::new(
-                    Arc::clone(&input_device),
-                    Arc::clone(&output_device),
-                    input_evt,
-                    output_evt,
-                    Arc::clone(&guest_mem),
-                    Arc::clone(&vmm_stats),
-                ));
-            }
-            (Err(e), _) | (_, Err(e)) => {
-                println!(
-                    "ioeventfd: failed to register ({:?}), falling back to VM exits",
-                    e
-                );
-            }
+            // Start the I/O thread
+            io_thread = Some(io_thread::IoThread::new(
+                devices,
+                Arc::clone(&guest_mem),
+                Arc::clone(&vmm_stats),
+            ));
         }
-    } else {
-        println!("ioeventfd: disabled by user");
+        Err(e) => {
+            println!(
+                "ioeventfd: failed to register ({:?}), falling back to VM exits",
+                e
+            );
+        }
     }
 
     // Create vCPU
@@ -565,7 +573,363 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create debug buffer for COM2 output
     let mut debug_buffer = DebugBuffer::new();
 
-    // Queue the configuration message for transmission
+    // Queue the configuration message for transmission (info uses only input device)
+    let config = vmm_config_input_only(args.sector_size);
+    serial_transmitter.queue_config(&config);
+    println!(
+        "Queued configuration message ({} bytes) for guest",
+        serial_transmitter.buffer.len()
+    );
+
+    // Run the vCPU loop
+    println!("\n--- Starting guest execution ---\n");
+
+    loop {
+        match vcpu.run()? {
+            VcpuExit::Hlt => {
+                vmm_stats.lock().unwrap().record_hlt();
+                println!("\n--- Guest executed HLT ---");
+                println!("Info operation completed successfully!");
+                break;
+            }
+            VcpuExit::IoOut(port, data) => {
+                vmm_stats.lock().unwrap().record_io_out();
+                if port == SERIAL_PORT {
+                    for &byte in data {
+                        if let Some(msg) = serial_decoder.add_byte(byte) {
+                            println!("{}", format_message(&msg));
+                        }
+                    }
+                } else if port == DEBUG_PORT {
+                    for &byte in data {
+                        if let Some(line) = debug_buffer.add_byte(byte) {
+                            println!("[DEBUG] {}", line);
+                        }
+                    }
+                } else {
+                    println!("IO OUT: port=0x{:x}, data={:?}", port, data);
+                }
+            }
+            VcpuExit::IoIn(port, data) => {
+                vmm_stats.lock().unwrap().record_io_in();
+                if port == SERIAL_PORT {
+                    for byte in data.iter_mut() {
+                        *byte = serial_transmitter.next_byte().unwrap_or(0);
+                    }
+                } else if port == SERIAL_PORT + 5 {
+                    let mut lsr = 0x60u8;
+                    if serial_transmitter.has_data() {
+                        lsr |= 0x01;
+                    }
+                    data[0] = lsr;
+                } else {
+                    for byte in data {
+                        *byte = 0;
+                    }
+                }
+            }
+            VcpuExit::MmioRead(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_read();
+                let input_range = INPUT_MMIO_BASE..INPUT_MMIO_BASE + MMIO_SIZE;
+                let value = if input_range.contains(&addr) {
+                    input_device
+                        .lock()
+                        .unwrap()
+                        .mmio_read((addr - INPUT_MMIO_BASE) as u32)
+                } else {
+                    println!("Unknown MMIO read at 0x{:x}", addr);
+                    0
+                };
+                write_mmio_data(data, value);
+            }
+            VcpuExit::MmioWrite(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_write();
+                let value = read_mmio_data(data);
+                let input_range = INPUT_MMIO_BASE..INPUT_MMIO_BASE + MMIO_SIZE;
+                if input_range.contains(&addr) {
+                    let mut device = input_device.lock().unwrap();
+                    device.mmio_write((addr - INPUT_MMIO_BASE) as u32, value);
+                    if io_thread.is_none() && device.should_process_queue() {
+                        let io_stats = device.process_queue(&guest_mem)?;
+                        vmm_stats
+                            .lock()
+                            .unwrap()
+                            .record_read(io_stats.bytes_read, io_stats.sectors_read);
+                    }
+                } else {
+                    println!("Unknown MMIO write at 0x{:x}", addr);
+                }
+            }
+            VcpuExit::Shutdown => {
+                vmm_stats.lock().unwrap().record_shutdown();
+                println!("\n--- VM Shutdown (triple fault?) ---");
+                let regs = vcpu.get_regs()?;
+                let sregs = vcpu.get_sregs()?;
+                println!(
+                    "RIP=0x{:x}, RSP=0x{:x}, RBP=0x{:x}",
+                    regs.rip, regs.rsp, regs.rbp
+                );
+                println!(
+                    "CR0=0x{:x}, CR3=0x{:x}, CR4=0x{:x}",
+                    sregs.cr0, sregs.cr3, sregs.cr4
+                );
+                if regs.rsp < STACK_BASE || regs.rsp > STACK_TOP {
+                    println!();
+                    println!("*** LIKELY STACK OVERFLOW ***");
+                    println!("  RSP (0x{:x}) is outside stack region", regs.rsp);
+                    println!(
+                        "  Stack region: 0x{:x} - 0x{:x} ({} bytes)",
+                        STACK_BASE, STACK_TOP, STACK_SIZE
+                    );
+                }
+                break;
+            }
+            VcpuExit::FailEntry(reason, cpu) => {
+                vmm_stats.lock().unwrap().record_fail_entry();
+                println!("VM Entry Failed! reason=0x{:x}, cpu={}", reason, cpu);
+                break;
+            }
+            exit => {
+                vmm_stats.lock().unwrap().record_unknown();
+                println!("Unexpected VM exit: {:?}", exit);
+                break;
+            }
+        }
+    }
+
+    if let Some(mut thread) = io_thread {
+        thread.stop();
+    }
+
+    vmm_stats.lock().unwrap().display();
+
+    Ok(())
+}
+
+/// Run the copy operation
+fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate sector sizes (must be powers of 2, 512 to 64KB)
+    for (name, size) in [
+        ("input", args.input_sector_size),
+        ("output", args.output_sector_size),
+    ] {
+        if !(512..=MAX_SECTOR_SIZE).contains(&size) || !size.is_power_of_two() {
+            eprintln!(
+                "Error: {} sector size must be a power of 2, 512 to {} (got {})",
+                name, MAX_SECTOR_SIZE, size
+            );
+            std::process::exit(1);
+        }
+    }
+
+    // Determine if output should be sparse (default) or pre-allocated
+    let sparse_output = !args.preallocate_output;
+
+    // Auto-discover binaries in same directory as executable
+    let core_path = get_binary_path("core.bin");
+    let operation_path = get_binary_path("copy.bin");
+
+    // Load core binary (device init, call table setup)
+    let core_code = load_guest_binary(core_path.to_str().unwrap())?;
+    println!(
+        "Loaded core binary: {} bytes from {}",
+        core_code.len(),
+        core_path.display()
+    );
+
+    // Load operation binary (copy)
+    let operation_code = load_guest_binary(operation_path.to_str().unwrap())?;
+    println!(
+        "Loaded operation binary: {} bytes from {}",
+        operation_code.len(),
+        operation_path.display()
+    );
+
+    // Get input file size
+    let input_size = std::fs::metadata(&args.input)?.len();
+    println!(
+        "Input file: {} ({} bytes, {} sectors @ {} bytes/sector)",
+        args.input,
+        input_size,
+        input_size / args.input_sector_size as u64,
+        args.input_sector_size
+    );
+
+    // Determine output capacity (default to input size)
+    let output_capacity = args.max_output_size.unwrap_or(input_size);
+
+    // Open backing stores
+    let input_backing = BackingStore::open(Path::new(&args.input), true, None, false)?;
+    let output_backing = BackingStore::open(
+        Path::new(&args.output),
+        false,
+        Some(output_capacity),
+        sparse_output,
+    )?;
+
+    let output_mode_desc = if sparse_output {
+        "sparse, grows on demand"
+    } else {
+        "pre-allocated"
+    };
+    println!(
+        "Output file: {} (capacity {} bytes, {} sectors @ {} bytes/sector, {})",
+        args.output,
+        output_capacity,
+        output_capacity / args.output_sector_size as u64,
+        args.output_sector_size,
+        output_mode_desc
+    );
+
+    // Open KVM
+    let kvm = Kvm::new()?;
+    println!("KVM API version: {}", kvm.get_api_version());
+
+    let kvm_stats_checker = kvm_stats::KvmStatsChecker::new(&kvm);
+    kvm_stats_checker.display_status();
+
+    let vm = kvm.create_vm()?;
+    println!("Created VM");
+
+    let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
+    println!("Allocated {} bytes of guest memory", GUEST_MEM_SIZE);
+
+    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let host_addr = region.as_ptr() as u64;
+
+    let mem_region = kvm_userspace_memory_region {
+        slot: 0,
+        guest_phys_addr: 0,
+        memory_size: GUEST_MEM_SIZE,
+        userspace_addr: host_addr,
+        flags: 0,
+    };
+    unsafe {
+        vm.set_user_memory_region(mem_region)?;
+    }
+    println!("Configured memory region");
+
+    setup_gdt(&guest_mem)?;
+    println!("Set up GDT at 0x{:x}", GDT_BASE);
+
+    setup_page_tables(&guest_mem)?;
+    println!("Set up page tables at 0x{:x}", PAGE_TABLE_BASE);
+
+    guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
+    println!("Loaded core binary at 0x{:x}", GUEST_CODE_BASE);
+
+    guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
+    println!("Loaded operation binary at 0x{:x}", OPERATION_LOAD_ADDR);
+
+    // Write CopyConfig at OPERATION_CONFIG_ADDR
+    let mut copy_flags: u32 = 0;
+    if args.verify {
+        copy_flags |= COPY_CONFIG_FLAG_VERIFY;
+    }
+    if args.skip_zeros {
+        copy_flags |= COPY_CONFIG_FLAG_SKIP_ZEROS;
+    }
+
+    guest_mem.write_obj(COPY_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
+    guest_mem.write_obj(copy_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
+    guest_mem.write_obj(args.start_sector, GuestAddress(OPERATION_CONFIG_ADDR + 8))?;
+    guest_mem.write_obj(args.sector_count, GuestAddress(OPERATION_CONFIG_ADDR + 16))?;
+    println!(
+        "Wrote copy config at 0x{:x} (flags=0x{:x}, start={}, count={})",
+        OPERATION_CONFIG_ADDR, copy_flags, args.start_sector, args.sector_count
+    );
+
+    // Create virtio-block devices
+    let input_device = VirtioBlockDevice::new(
+        input_backing,
+        input_size,
+        args.input_sector_size as u64,
+        true,
+        INPUT_MMIO_BASE,
+        INPUT_VQ_BASE,
+    );
+    let output_device = VirtioBlockDevice::new(
+        output_backing,
+        output_capacity,
+        args.output_sector_size as u64,
+        false,
+        OUTPUT_MMIO_BASE,
+        OUTPUT_VQ_BASE,
+    );
+    println!(
+        "Created virtio-block devices at MMIO 0x{:x} and 0x{:x}",
+        INPUT_MMIO_BASE, OUTPUT_MMIO_BASE
+    );
+    println!(
+        "  Input sector size: {} bytes, Output sector size: {} bytes",
+        input_device.sector_size(),
+        output_device.sector_size()
+    );
+
+    let input_device = Arc::new(Mutex::new(input_device));
+    let output_device = Arc::new(Mutex::new(output_device));
+    let guest_mem = Arc::new(guest_mem);
+    let vmm_stats = Arc::new(Mutex::new(VmmStats::new()));
+
+    // Set up ioeventfd for queue notifications
+    // Copy operation uses 1 input device + 1 output device
+    let mut io_thread: Option<io_thread::IoThread> = None;
+    let mut input_evt = IoEvent::new(INPUT_MMIO_BASE)?;
+    let mut output_evt = IoEvent::new(OUTPUT_MMIO_BASE)?;
+
+    match (input_evt.register(&vm), output_evt.register(&vm)) {
+        (Ok(()), Ok(())) => {
+            println!("ioeventfd: enabled for queue notifications (with I/O thread)");
+
+            // Configure devices for I/O thread (copy: 1 input + 1 output)
+            let devices = vec![
+                IoDevice {
+                    role: DeviceRole::Input,
+                    device: Arc::clone(&input_device),
+                    ioevent: input_evt,
+                },
+                IoDevice {
+                    role: DeviceRole::Output,
+                    device: Arc::clone(&output_device),
+                    ioevent: output_evt,
+                },
+            ];
+
+            // Start the I/O thread
+            io_thread = Some(io_thread::IoThread::new(
+                devices,
+                Arc::clone(&guest_mem),
+                Arc::clone(&vmm_stats),
+            ));
+        }
+        (Err(e), _) | (_, Err(e)) => {
+            println!(
+                "ioeventfd: failed to register ({:?}), falling back to VM exits",
+                e
+            );
+        }
+    }
+
+    let mut vcpu = vm.create_vcpu(0)?;
+    println!("Created vCPU");
+
+    let mut sregs = vcpu.get_sregs()?;
+    setup_sregs(&mut sregs);
+    vcpu.set_sregs(&sregs)?;
+    println!("Configured special registers for long mode");
+
+    let mut regs = vcpu.get_regs()?;
+    setup_regs(&mut regs);
+    vcpu.set_regs(&regs)?;
+    println!(
+        "Configured general registers (RIP=0x{:x}, RSP=0x{:x})",
+        regs.rip, regs.rsp
+    );
+
+    let mut serial_decoder = SerialDecoder::new();
+    let mut serial_transmitter = SerialTransmitter::new();
+    let mut debug_buffer = DebugBuffer::new();
+
     let config = vmm_config(
         args.input_sector_size,
         args.output_sector_size,
@@ -583,17 +947,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         progress_desc
     );
 
-    // Run the vCPU loop
     println!("\n--- Starting guest execution ---\n");
 
     loop {
-        // When using the I/O thread, queue processing happens asynchronously.
-        // When not using ioeventfd, we process queues on MMIO writes below.
         match vcpu.run()? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().unwrap().record_hlt();
                 println!("\n--- Guest executed HLT ---");
-                println!("Guest completed successfully!");
+                println!("Copy operation completed successfully!");
                 break;
             }
             VcpuExit::IoOut(port, data) => {
@@ -605,7 +966,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 } else if port == DEBUG_PORT {
-                    // Debug output from guest (COM2) - buffer until newline
                     for &byte in data {
                         if let Some(line) = debug_buffer.add_byte(byte) {
                             println!("[DEBUG] {}", line);
@@ -618,18 +978,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             VcpuExit::IoIn(port, data) => {
                 vmm_stats.lock().unwrap().record_io_in();
                 if port == SERIAL_PORT {
-                    // Guest is reading from serial - send config bytes
                     for byte in data.iter_mut() {
                         *byte = serial_transmitter.next_byte().unwrap_or(0);
                     }
                 } else if port == SERIAL_PORT + 5 {
-                    // Line Status Register (LSR) - report data available
-                    // Bit 0: Data Ready (DR) - set if data available to read
-                    // Bit 5: Empty Transmitter Holding Register (ETHR)
-                    // Bit 6: Empty Data Holding Registers (EDHR)
-                    let mut lsr = 0x60u8; // Transmitter ready
+                    let mut lsr = 0x60u8;
                     if serial_transmitter.has_data() {
-                        lsr |= 0x01; // Data ready
+                        lsr |= 0x01;
                     }
                     data[0] = lsr;
                 } else {
@@ -666,7 +1021,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if input_range.contains(&addr) {
                     let mut device = input_device.lock().unwrap();
                     device.mmio_write((addr - INPUT_MMIO_BASE) as u32, value);
-                    // Only process queue directly if I/O thread is not handling it
                     if io_thread.is_none() && device.should_process_queue() {
                         let io_stats = device.process_queue(&guest_mem)?;
                         vmm_stats
@@ -677,7 +1031,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else if output_range.contains(&addr) {
                     let mut device = output_device.lock().unwrap();
                     device.mmio_write((addr - OUTPUT_MMIO_BASE) as u32, value);
-                    // Only process queue directly if I/O thread is not handling it
                     if io_thread.is_none() && device.should_process_queue() {
                         let io_stats = device.process_queue(&guest_mem)?;
                         vmm_stats
@@ -702,8 +1055,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "CR0=0x{:x}, CR3=0x{:x}, CR4=0x{:x}",
                     sregs.cr0, sregs.cr3, sregs.cr4
                 );
-
-                // Check for stack overflow
                 if regs.rsp < STACK_BASE || regs.rsp > STACK_TOP {
                     println!();
                     println!("*** LIKELY STACK OVERFLOW ***");
@@ -717,7 +1068,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("  Stack underflowed by {} bytes", underflow);
                     }
                 } else {
-                    // RSP is in range - show stack usage
                     let stack_used = STACK_TOP - regs.rsp;
                     let stack_percent = (stack_used * 100) / STACK_SIZE;
                     println!();
@@ -729,8 +1079,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("*** WARNING: Stack was nearly exhausted ***");
                     }
                 }
-
-                // Additional diagnostic info
                 println!();
                 println!(
                     "Guest memory: {} bytes (0x{:x})",
@@ -752,12 +1100,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Stop the I/O thread if running (this will also unregister ioeventfds)
     if let Some(mut thread) = io_thread {
         thread.stop();
     }
 
-    // Display statistics
     vmm_stats.lock().unwrap().display();
 
     Ok(())

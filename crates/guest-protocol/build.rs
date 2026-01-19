@@ -26,6 +26,17 @@ fn main() {
             .max_len(4), // VmmConfig.devices needs at least 2 (input + output)
     );
 
+    // Configure longer strings for file paths in InfoResultMessage
+    // Backing file and external data file paths can be longer (up to 256 chars)
+    generator.configure(
+        ".guest.InfoResultMessage.backing_file",
+        micropb_gen::Config::new().max_bytes(256),
+    );
+    generator.configure(
+        ".guest.InfoResultMessage.external_data_file",
+        micropb_gen::Config::new().max_bytes(256),
+    );
+
     // Generate the Rust module
     generator
         .compile_protos(&[proto_file], out_dir.join("guest.rs"))

@@ -67,6 +67,33 @@ message CompleteMessage {
   bool success = 3;
 }
 
+// Image format detection result (from info operation)
+message InfoResultMessage {
+  // Detected format: "unknown", "raw", "qcow2", "vmdk", "vmdk3", "vhd", "vhdx", "qcow1"
+  string format = 1;
+  // Format version (e.g., 2 or 3 for QCOW2)
+  uint32 version = 2;
+  // Virtual size in bytes (from image header)
+  uint64 virtual_size = 3;
+  // Actual file size in bytes
+  uint64 actual_size = 4;
+  // Cluster/grain size in bytes (format-specific)
+  uint32 cluster_size = 5;
+  // Feature flags (bitfield):
+  //   bit 0: has_backing_file
+  //   bit 1: has_external_data
+  //   bit 2: encrypted
+  //   bit 3: compressed
+  //   bit 4: has_snapshots
+  //   bit 5: dirty
+  //   bit 6: corrupt
+  uint32 flags = 6;
+  // Backing file path (if present in image header)
+  string backing_file = 7;
+  // External data file path (if present, QCOW2 v3)
+  string external_data_file = 8;
+}
+
 // Main message wrapper with level and payload
 message GuestMessage {
   Level level = 1;
@@ -76,5 +103,6 @@ message GuestMessage {
     ProgressMessage progress = 4;
     ErrorMessage error = 5;
     CompleteMessage complete = 6;
+    InfoResultMessage info_result = 7;
   }
 }

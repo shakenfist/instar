@@ -61,7 +61,8 @@ PROTOTYPES := \
 	virtio-block5 \
 	virtio-block6 \
 	pluggable \
-	pluggable2
+	pluggable2 \
+	info
 
 # Docker image names
 LINT_IMAGE := imago-rust-lint

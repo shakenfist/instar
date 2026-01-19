@@ -36,8 +36,14 @@ include!(concat!(env!("OUT_DIR"), "/guest.rs"));
 
 use micropb::{MessageEncode, PbEncoder};
 
-/// Maximum message size (excluding 2-byte length prefix)
-pub const MAX_MESSAGE_SIZE: usize = 256;
+/// Maximum message size (excluding 2-byte length prefix).
+///
+/// This is sized to accommodate InfoResultMessage with file paths up to 256
+/// characters each. This approach trades stack efficiency for simplicity.
+///
+/// TODO: Consider refactoring to caller-provided buffers if stack usage
+/// becomes a concern in deeply nested call stacks.
+pub const MAX_MESSAGE_SIZE: usize = 600;
 
 /// Frame header size (2-byte little-endian length)
 pub const FRAME_HEADER_SIZE: usize = 2;
@@ -177,6 +183,56 @@ pub fn complete_message(operation: &str, count: u64, success: bool) -> guest_::G
     msg
 }
 
+/// Helper to push a string into a heapless String of larger capacity (256).
+fn push_str_256(dest: &mut heapless::String<256>, src: &str) {
+    dest.clear();
+    for c in src.chars() {
+        if dest.push(c).is_err() {
+            break; // String is full, truncate
+        }
+    }
+}
+
+/// Helper to create an info result message.
+///
+/// # Arguments
+///
+/// * `format` - Detected format name ("raw", "qcow2", "vmdk", etc.)
+/// * `version` - Format version (e.g., 2 or 3 for QCOW2)
+/// * `virtual_size` - Virtual disk size in bytes
+/// * `actual_size` - Actual file size in bytes
+/// * `cluster_size` - Cluster/grain size in bytes
+/// * `flags` - Feature flags bitfield
+/// * `backing_file` - Backing file path (empty string if none)
+/// * `external_data_file` - External data file path (empty string if none)
+#[allow(clippy::too_many_arguments)]
+pub fn info_result_message(
+    format: &str,
+    version: u32,
+    virtual_size: u64,
+    actual_size: u64,
+    cluster_size: u32,
+    flags: u32,
+    backing_file: &str,
+    external_data_file: &str,
+) -> guest_::GuestMessage {
+    let mut msg = guest_::GuestMessage::default();
+    msg.level = guest_::Level::Info;
+
+    let mut info = guest_::InfoResultMessage::default();
+    push_str(&mut info.format, format);
+    info.version = version;
+    info.virtual_size = virtual_size;
+    info.actual_size = actual_size;
+    info.cluster_size = cluster_size;
+    info.flags = flags;
+    push_str_256(&mut info.backing_file, backing_file);
+    push_str_256(&mut info.external_data_file, external_data_file);
+
+    msg.payload = Some(guest_::GuestMessage_::Payload::InfoResult(info));
+    msg
+}
+
 // =============================================================================
 // VMM -> Guest configuration message support
 // =============================================================================
@@ -313,7 +369,29 @@ mod vmm_config_support {
 
         config
     }
+
+    /// Helper to create a VmmConfig with only an input device.
+    ///
+    /// Use this for operations that don't need an output device (e.g., info).
+    ///
+    /// # Arguments
+    ///
+    /// * `input_sector_size` - Sector size for input device in bytes
+    pub fn vmm_config_input_only(input_sector_size: u32) -> guest_::VmmConfig {
+        let mut config = guest_::VmmConfig::default();
+
+        // Add input device config only
+        let mut input_dev = guest_::DeviceConfig::default();
+        super::push_str(&mut input_dev.name, "input");
+        input_dev.sector_size = input_sector_size;
+        let _ = config.devices.push(input_dev);
+
+        // No progress reporting needed for info
+        config.progress_percent = 100;
+
+        config
+    }
 }
 
 #[cfg(feature = "std")]
-pub use vmm_config_support::{encode_vmm_config_framed, vmm_config};
+pub use vmm_config_support::{encode_vmm_config_framed, vmm_config, vmm_config_input_only};

@@ -109,6 +109,9 @@ Cons:
 - [virtio-block4](prototypes/virtio-block4/) - Adds performance statistics tracking
 - [virtio-block5](prototypes/virtio-block5/) - Adds ioeventfd optimization
 - [virtio-block6](prototypes/virtio-block6/) - Adds sparse/dynamic output file support
+- [pluggable](prototypes/pluggable/) - Modular operations architecture
+- [pluggable2](prototypes/pluggable2/) - Separate binary loading for operations
+- [info](prototypes/info/) - Image format detection (qemu-img info equivalent)
 
 The rust-vmm project provides crates that reduce implementation effort by 70%+:
 - `kvm-ioctls` - Safe KVM API wrappers

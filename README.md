@@ -39,6 +39,7 @@ Working prototypes exploring the KVM-based sandboxing approach:
 | [virtio-block6](prototypes/virtio-block6/) | Adds sparse/dynamic output file support, adopt recommended sector sizes and progress reporting intervals based on previous testing |
 | [pluggable](prototypes/pluggable/) | Modular architecture separating core infrastructure from pluggable operations |
 | [pluggable2](prototypes/pluggable2/) | Separate binary loading for operations (reduced attack surface) |
+| [info](prototypes/info/) | Image format detection (qemu-img info equivalent) |
 
 See [docs/index.md](docs/index.md) for full prototype documentation.
 
@@ -151,7 +152,8 @@ imago/
 │   ├── virtio-block5/  # With ioeventfd optimization
 │   ├── virtio-block6/  # With sparse/dynamic output support
 │   ├── pluggable/      # Modular operations architecture
-│   └── pluggable2/     # Separate binary loading for operations
+│   ├── pluggable2/     # Separate binary loading for operations
+│   └── info/           # Image format detection (qemu-img info)
 ├── scripts/        # Build and check scripts
 ├── docs/           # Design documents and research
 │   ├── index.md    # Documentation index

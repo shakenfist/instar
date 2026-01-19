@@ -233,6 +233,12 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
                 comp.operation, comp.count, comp.success
             )
         }
+        Some(guest_::GuestMessage_::Payload::InfoResult(info)) => {
+            format!(
+                "info_result format={} version={} virtual_size={} actual_size={} cluster_size={} flags=0x{:x}",
+                info.format, info.version, info.virtual_size, info.actual_size, info.cluster_size, info.flags
+            )
+        }
         None => "empty payload".to_string(),
     };
 

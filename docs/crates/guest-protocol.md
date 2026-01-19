@@ -46,6 +46,7 @@ message GuestMessage {
     ProgressMessage progress = 4;
     ErrorMessage error = 5;
     CompleteMessage complete = 6;
+    InfoResultMessage info_result = 7;
   }
 }
 ```
@@ -61,6 +62,7 @@ message GuestMessage {
 | ProgressMessage | Operation progress | operation, current, total, percent |
 | ErrorMessage | Error details | operation, device, sector, status |
 | CompleteMessage | Operation completion | operation, count, success |
+| InfoResultMessage | Image format detection results | format, version, virtual_size, actual_size, cluster_size, flags, backing_file, external_data_file |
 
 ### VMM → Guest Messages
 
@@ -130,6 +132,15 @@ The crate is actively used by:
 
 - **virtio-block2**: Guest → VMM protobuf messages for status reporting
 - **virtio-block3**: Bidirectional communication with VMM → guest configuration
+- **info**: InfoResultMessage for image format detection results
+
+## Limitations
+
+The `MAX_MESSAGE_SIZE` constant (currently 600 bytes) limits the maximum
+protobuf message payload. This is sized to accommodate `InfoResultMessage`
+with file paths up to 256 characters. If larger messages are needed in the
+future, consider refactoring to use caller-provided buffers instead of
+fixed-size stack allocations.
 
 ## Prototypes Using This Crate
 
@@ -137,3 +148,4 @@ The crate is actively used by:
 |-----------|-----------|-------|
 | [virtio-block2](../prototypes/virtio-block2.md) | Guest → VMM | Status, progress, errors |
 | [virtio-block3](../prototypes/virtio-block3.md) | Bidirectional | Status + configuration |
+| [info](../../prototypes/info/) | Bidirectional | Config + InfoResultMessage |

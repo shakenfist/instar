@@ -13,7 +13,7 @@ Imago is a safe, sandboxed disk image format converter. It replaces unsafe
 imago/
 ├── .devcontainer/  # Development containers (rust-lint)
 ├── crates/         # Shared Rust crates (guest-protocol)
-├── prototypes/     # Experimental implementations (8 KVM prototypes)
+├── prototypes/     # Experimental implementations (11 KVM prototypes)
 ├── scripts/        # Build and check scripts
 ├── docs/           # Design documents and research notes
 ├── testdata/       # Test images for security validation
