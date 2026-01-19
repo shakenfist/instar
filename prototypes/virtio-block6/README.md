@@ -252,4 +252,4 @@ while only allocating space for sectors that are actually written.
 ## Related Documentation
 
 - [virtio-block5 prototype](../virtio-block5/)
-- [Performance Counters](../../docs/performance_counters.md)
+- [Performance Counters](../../docs/performance-counters.md)

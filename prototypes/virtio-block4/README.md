@@ -190,7 +190,7 @@ Options:
 
 ## Related Documentation
 
-- [Performance Counters](../../docs/performance_counters.md)
+- [Performance Counters](../../docs/performance-counters.md)
 - [Security Vulnerabilities](../../docs/security.md)
 - [guest-protocol crate](../../crates/guest-protocol/)
 - [virtio-block3 prototype](../virtio-block3/)

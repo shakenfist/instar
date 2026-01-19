@@ -206,7 +206,7 @@ available, the infrastructure is ready to integrate kernel-level statistics.
 
 ## Related Documentation
 
-- [Performance Counters](../performance_counters.md)
+- [Performance Counters](../performance-counters.md)
 - [Security Vulnerabilities](../security.md)
 - [Virtio-Block Data Transfer](../data-transfer-virtio-block.md)
 - [Virtio-Block3 Prototype](virtio-block3.md)

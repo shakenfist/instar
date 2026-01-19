@@ -241,4 +241,4 @@ From virtio-block6:
 ## Related Documentation
 
 - [virtio-block6 prototype](../virtio-block6/) - Base for this prototype
-- [Performance Counters](../../docs/performance_counters.md)
+- [Performance Counters](../../docs/performance-counters.md)

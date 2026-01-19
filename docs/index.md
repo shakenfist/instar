@@ -43,7 +43,7 @@ Documentation for building custom VMMs using the Linux KVM API.
 | Document | Description |
 |----------|-------------|
 | [KVM API Guide](kvm.md) | KVM ioctls, memory setup, x86-64 long mode, VM exits |
-| [Performance Counters](performance_counters.md) | KVM statistics, perf events, resource limiting |
+| [Performance Counters](performance-counters.md) | KVM statistics, perf events, resource limiting |
 
 ## Guest Data Transfer
 

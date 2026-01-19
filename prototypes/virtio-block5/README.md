@@ -189,5 +189,5 @@ Options:
 
 ## Related Documentation
 
-- [Performance Counters](../../docs/performance_counters.md)
+- [Performance Counters](../../docs/performance-counters.md)
 - [virtio-block4 prototype](../virtio-block4/)
