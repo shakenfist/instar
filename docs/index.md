@@ -1,6 +1,6 @@
 # Imago Documentation
 
-Technical documentation for disk image format handling.
+Technical documentation for disk image format handling. Confused about how imago is different from qemu-img? Perhaps read the [technology primer](docs/technology-primer.md).
 
 ## QCOW2 Format
 

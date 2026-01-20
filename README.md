@@ -12,6 +12,8 @@ The name "imago" comes from Latin (meaning "image") and biology (the final
 adult stage of insect metamorphosis) - reflecting both the image handling
 and transformation aspects of the tool.
 
+Confused about how imago does these things? Perhaps read the [technology primer](docs/technology-primer.md).
+
 ## Supported Formats
 
 Initial target formats:
