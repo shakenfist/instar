@@ -45,6 +45,63 @@ difference is which resources they share. This is why "process isolation"
 really means "address space isolation" - threads within a process can access
 each other's memory freely, while separate processes cannot.
 
+**A note on fork and exec**: Process creation in Linux reveals how central the
+`task_struct` is. When a process calls `fork()`, the kernel creates a new
+`task_struct` by copying the parent's - then modifies specific fields like the
+PID, parent pointer, and some statistics. Memory pages are set up as
+copy-on-write rather than immediately duplicated, and file descriptors are
+cloned. The new process is essentially a duplicate of the parent with a few
+fields tweaked.
+
+The `exec()` family works differently: rather than copying a `task_struct`, it
+*replaces* parts of the existing one. The process keeps its PID, parent
+relationship, file descriptors (unless marked close-on-exec), and credentials,
+but its memory map is completely replaced with the new program's code and data.
+The instruction pointer is reset to the new program's entry point. From the
+kernel's perspective, `exec()` transforms the current process in place rather
+than creating a new one.
+
+This is why the classic pattern for spawning a new program is `fork()` followed
+by `exec()` in the child: fork creates the new `task_struct` (the new process
+identity), and exec loads the new program into it.
+
+**Copy-on-write and fork efficiency**: You might wonder how `fork()` can be
+fast if it copies the parent's entire address space. The answer is that it
+doesn't - not immediately. Instead, the kernel uses copy-on-write (COW).
+
+When `fork()` creates the child process, both parent and child page tables
+are set to point to the same physical pages. But crucially, those pages are
+marked read-only in both processes' page tables (even if they were originally
+writable). At this point, parent and child share all their memory - no copying
+has occurred.
+
+The magic happens when either process tries to write to a shared page. The
+write triggers a page fault (because the page is marked read-only). The kernel's
+page fault handler recognizes this as a COW fault: it allocates a new physical
+page, copies the contents of the original page, updates the faulting process's
+page table to point to the new copy (now marked writable), and resumes
+execution. The other process keeps its mapping to the original page.
+
+This means `fork()` is nearly instantaneous regardless of process size - only
+the page tables themselves need to be copied (and even that can be optimized).
+The actual memory copying is deferred until writes occur, and pages that are
+never written (like read-only code segments) are never copied at all.
+
+Note that COW affects *both* processes, not just the child. After `fork()`,
+the parent's previously-writable pages are now marked read-only too. The
+parent's first write to each shared page will trigger a COW fault just like
+the child's would. For a long-running server that forks handler processes,
+this means the parent pays a small penalty (one page fault per modified page)
+after each fork. This is one reason `posix_spawn()` exists as an alternative
+to `fork()` + `exec()` - it can avoid this overhead in cases where the parent
+doesn't need a full copy of itself.
+
+This is why the `fork()` + `exec()` pattern isn't as wasteful as it might
+seem. The child calls `exec()` almost immediately after `fork()`, which
+replaces the entire address space anyway. Thanks to COW, the child never
+actually copies most of the parent's memory - it just sets up page table
+entries that are immediately discarded when `exec()` loads the new program.
+
 ## Virtual Memory and Page Tables
 
 Before diving into context switching, it helps to understand how virtual memory
@@ -321,6 +378,57 @@ host-physical memory that the hypervisor has mapped into its EPT tables.
 Attempting to access unmapped memory causes an "EPT violation" VM exit,
 allowing the hypervisor to handle the fault (or terminate the VM).
 
+### IOMMU and Device Isolation (VT-d/AMD-Vi)
+
+EPT protects memory from guest CPU access, but there's another path to
+physical memory: DMA (Direct Memory Access). Devices like network cards,
+storage controllers, and GPUs can read and write to RAM directly, bypassing
+the CPU entirely. Without protection, a compromised or malicious device could
+DMA into arbitrary memory - including the hypervisor or other VMs.
+
+The IOMMU (I/O Memory Management Unit) extends the page table concept to
+devices. Intel calls their implementation VT-d (Virtualization Technology
+for Directed I/O); AMD calls theirs AMD-Vi. The IOMMU sits between devices
+and memory, translating device-physical addresses to host-physical addresses
+through its own set of page tables.
+
+Just as EPT creates a layer of address translation for guest CPUs, the IOMMU
+creates a layer for device DMA:
+
+| Access Path     | Translation                              | Protection Unit |
+|-----------------|------------------------------------------|-----------------|
+| Guest CPU       | Guest-virtual → Guest-physical → Host-physical | EPT/NPT        |
+| Device DMA      | Device-physical → Host-physical          | IOMMU           |
+
+When a device is assigned to a VM ("device passthrough"), the hypervisor
+configures the IOMMU so that the device can only DMA to memory belonging to
+that VM. The device sees what it believes are physical addresses, but those
+are translated through IOMMU page tables that the hypervisor controls. If
+the device tries to access memory outside its allowed range, the IOMMU
+blocks the access and raises an interrupt.
+
+This completes the memory isolation picture:
+
+- **EPT/NPT**: Prevents guest CPUs from accessing memory outside their VM
+- **IOMMU**: Prevents devices from accessing memory outside their assigned VM
+
+Without IOMMU protection, device passthrough would be a gaping security hole.
+A guest with a passed-through network card could program it to DMA anywhere
+in host memory, completely bypassing VM isolation. The IOMMU ensures that
+even with direct hardware access, the device remains confined to its VM's
+memory space.
+
+The IOMMU also enables another important feature: interrupt remapping. Just
+as devices can DMA to arbitrary addresses, they can also send interrupts
+that could be used to attack the host. The IOMMU can filter and remap device
+interrupts, ensuring they're delivered only to the appropriate VM.
+
+For imago's use case with virtio devices, IOMMU protection is less critical
+because virtio devices are emulated in userspace - they don't have direct
+hardware DMA capabilities. But understanding the IOMMU completes the picture
+of how modern systems achieve full memory isolation in virtualized
+environments.
+
 ### The Cost of VM Exits
 
 VM exits are significantly more expensive than system calls - typically by an
@@ -392,8 +500,12 @@ escape requires examining where the trust boundary lies in each model.
 
 **The container isolation model:**
 
-Containers run directly on the host kernel. The isolation between a container
-and the host (or other containers) is enforced by kernel features:
+Containers run directly on the host kernel. As described earlier, process
+creation in Linux works via `fork()` and `exec()` - the kernel copies the
+parent's `task_struct` and then loads a new program. Container processes are
+created exactly this way; they're ordinary Linux processes. The "container"
+aspect comes entirely from kernel features that restrict what those processes
+can see and do:
 
 - **Namespaces**: Provide isolated views of system resources (PIDs, network,
   mounts, users, etc.)
@@ -680,6 +792,52 @@ pub extern "C" fn _start() -> ! {
 }
 ```
 
+**The boot sequence:**
+
+Before `_start()` runs, something has to get the CPU into a usable state. On
+a normal Linux boot, the BIOS or UEFI firmware handles hardware initialization,
+then a bootloader (GRUB, systemd-boot) loads the kernel, which then sets up
+paging, interrupts, and drivers before reaching userspace. That's a lot of
+machinery.
+
+Imago takes a shortcut: the VMM (running on the host) configures the virtual
+CPU's initial state directly via KVM ioctls. Instead of emulating a BIOS boot,
+the VMM can set the vCPU's registers to whatever state it wants before starting
+execution.
+
+Imago skips real mode and protected mode entirely, starting the guest directly
+in 64-bit long mode with paging already enabled. The VMM sets up:
+
+- **Initial page tables**: A simple identity mapping where virtual addresses
+  equal physical addresses (at least for the memory regions the guest needs).
+  These page tables are placed in guest memory before boot.
+
+- **Control registers**: CR0 with paging and protected mode enabled, CR3
+  pointing to the page tables, CR4 with PAE (Physical Address Extension)
+  enabled.
+
+- **Segment registers**: CS, DS, SS, etc. configured for 64-bit flat memory
+  model. The GDT (Global Descriptor Table) is set up with minimal descriptors.
+
+- **RIP (instruction pointer)**: Set to the entry point (`_start`).
+
+- **RSP (stack pointer)**: Pointing to a pre-allocated stack region.
+
+When `KVM_RUN` executes, the vCPU begins executing at `_start` in 64-bit mode
+with a working stack and identity-mapped memory. No BIOS, no bootloader, no
+mode transitions - the guest code runs immediately.
+
+This is why imago's boot time is measured in microseconds rather than seconds.
+A traditional VM boot involves: firmware initialization → bootloader → kernel
+decompression → kernel initialization → init system → application startup.
+Imago skips all of that. The "boot" is just: set registers → run.
+
+The tradeoff is that this requires careful coordination between the VMM and
+the guest. The guest must be compiled to expect the specific memory layout and
+initial state that the VMM provides. There's no flexibility to boot different
+operating systems or use standard boot protocols - but for imago's single-
+purpose use case, that flexibility isn't needed.
+
 Instead of system calls, the guest uses two communication mechanisms:
 
 1. **Virtio-block devices** for data I/O: The guest reads and writes disk
@@ -695,6 +853,116 @@ Instead of system calls, the guest uses two communication mechanisms:
 The guest never calls `open()`, `read()`, `write()`, `mmap()`, or any other
 system call. It doesn't need to - it's not running on an OS. It accesses
 hardware (virtual hardware provided by the VMM) directly.
+
+**How virtio actually works:**
+
+Virtio deserves a closer look since it's central to imago's I/O. The protocol
+is designed for efficient communication between a guest and a hypervisor,
+avoiding the overhead of emulating real hardware.
+
+At its core, virtio uses a data structure called a "virtqueue" - a ring buffer
+in shared memory that both guest and host can access. Each virtqueue has three
+components:
+
+1. **Descriptor table**: An array of buffer descriptors. Each descriptor
+   contains a physical address, length, and flags (read/write, whether there's
+   a next descriptor in a chain).
+
+2. **Available ring**: Written by the guest, read by the host. When the guest
+   wants to send a request, it populates descriptors with buffer addresses,
+   chains them together, and adds the head descriptor's index to the available
+   ring.
+
+3. **Used ring**: Written by the host, read by the guest. When the host
+   completes a request, it adds the descriptor index and the number of bytes
+   written to the used ring.
+
+A typical virtio-block read operation works like this:
+
+1. The guest allocates three descriptors:
+   - Descriptor 0: Points to a request header (containing the operation type
+     and sector number), marked as device-readable
+   - Descriptor 1: Points to the data buffer, marked as device-writable
+   - Descriptor 2: Points to a status byte, marked as device-writable
+   - These are chained: descriptor 0's "next" points to 1, descriptor 1's
+     "next" points to 2
+
+2. The guest adds descriptor 0's index to the available ring
+
+3. The guest writes to a "doorbell" MMIO register to notify the host that
+   work is available (more on how this notification works below)
+
+4. The host (VMM) processes the request:
+   - Reads the descriptor chain from shared memory
+   - Extracts the sector number from the header
+   - Reads the data from the underlying file
+   - Writes the data to the guest's buffer (via the address in descriptor 1)
+   - Writes a success status to the status buffer (descriptor 2)
+   - Adds the completed descriptor to the used ring
+
+5. The host injects an interrupt into the guest (or the guest polls)
+
+6. The guest reads the used ring, sees the completion, and processes the data
+
+This design minimizes VM exits: the guest can batch multiple requests before
+ringing the doorbell, and the host can complete multiple requests before
+injecting an interrupt. The shared memory model means data doesn't need to be
+copied between address spaces - the host directly accesses guest memory
+through the descriptor addresses (translated via EPT).
+
+For imago, each virtio-block device represents a file on the host. The input
+device exposes the source disk image; the output device exposes the destination.
+The guest reads from one and writes to the other, with the VMM translating
+virtqueue operations into actual file I/O.
+
+**Avoiding VM exits with ioeventfd:**
+
+Step 3 above mentioned that writing to the doorbell register "causes a VM
+exit." That's the naive implementation, and it's expensive - as we discussed
+earlier, a VM exit costs thousands of cycles. For high-throughput I/O, those
+exits add up quickly.
+
+KVM provides a mechanism called **ioeventfd** that avoids most of these exits.
+The idea is simple: instead of trapping a guest MMIO write into the VMM via a
+full VM exit, KVM can be configured to recognize writes to specific addresses
+and signal a Linux eventfd directly in the kernel.
+
+Here's how it works:
+
+1. The VMM creates an eventfd (a Linux file descriptor that acts as a simple
+   counter/signaling mechanism)
+
+2. The VMM tells KVM: "when the guest writes to MMIO address X (the virtio
+   doorbell), don't cause a VM exit - instead, signal this eventfd"
+
+3. The VMM runs the vCPU in one thread while another thread (or async runtime)
+   waits on the eventfd using epoll/io_uring
+
+4. When the guest writes to the doorbell, KVM recognizes the address, signals
+   the eventfd, and *continues guest execution* without a VM exit
+
+5. The VMM's waiting thread wakes up, processes the virtqueue, and handles
+   the I/O
+
+The guest doesn't know or care whether a VM exit occurred - it just wrote to
+an MMIO address. But from the VMM's perspective, the notification happened
+asynchronously without stopping the guest. The vCPU can continue executing
+(perhaps preparing the next I/O request) while the VMM processes the current
+one.
+
+There's a complementary mechanism called **irqfd** for the reverse direction.
+Instead of the VMM injecting an interrupt by making a KVM ioctl (which
+requires a syscall), the VMM can write to an irqfd, and KVM will inject the
+interrupt directly. Combined with ioeventfd, this means the entire virtio
+notification path - guest to host and back - can happen without expensive
+transitions.
+
+Imago uses ioeventfd for its virtio doorbell notifications. When the guest
+submits an I/O request, the VMM receives an eventfd signal and can process
+the request while the guest continues running. This is particularly valuable
+for imago's workload, which involves streaming large amounts of data between
+virtio-block devices - minimizing per-request overhead directly improves
+throughput.
 
 **Where KVM fits in:**
 
