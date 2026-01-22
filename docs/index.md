@@ -1,6 +1,18 @@
 # Imago Documentation
 
-Technical documentation for disk image format handling. Confused about how imago is different from qemu-img? Perhaps read the [technology primer](docs/technology-primer.md).
+A safe, sandboxed disk image format converter.
+
+## Overview
+
+Imago replaces unsafe calls to `qemu-img` with a safer, sandboxed approach.
+Image format conversions are performed within a KVM execution context,
+providing strong isolation from the host system.
+
+The name "imago" comes from Latin (meaning "image") and biology (the final
+adult stage of insect metamorphosis) - reflecting both the image handling
+and transformation aspects of the tool.
+
+Confused about how imago does these things? Perhaps read the [technology primer](docs/technology-primer.md).
 
 ## QCOW2 Format
 
