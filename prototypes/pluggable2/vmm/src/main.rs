@@ -442,10 +442,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load operation binary at OPERATION_LOAD_ADDR (0x20000)
     guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
-    println!(
-        "Loaded operation binary at 0x{:x}",
-        OPERATION_LOAD_ADDR
-    );
+    println!("Loaded operation binary at 0x{:x}", OPERATION_LOAD_ADDR);
 
     // Write operation config at OPERATION_CONFIG_ADDR (0x19000)
     // Build flags from CLI arguments

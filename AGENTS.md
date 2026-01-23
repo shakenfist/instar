@@ -12,6 +12,12 @@ Imago is a safe, sandboxed disk image format converter. It replaces unsafe
 ```
 imago/
 ├── .devcontainer/  # Development containers (rust-lint)
+├── src/            # Main imago implementation
+│   ├── vmm/        # Virtual machine monitor (host-side)
+│   ├── core/       # Core guest initialization
+│   ├── shared/     # Shared library code
+│   ├── operations/ # Pluggable operations (info, copy)
+│   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates (guest-protocol)
 ├── prototypes/     # Experimental implementations (11 KVM prototypes)
 ├── scripts/        # Build and check scripts
@@ -26,9 +32,9 @@ imago/
 
 ## Current Status
 
-The project is in early prototype phase. We are exploring different
-implementation approaches before committing to a specific language or
-architecture.
+The project has moved from prototype phase to initial implementation. The `info`
+prototype has been promoted to the main implementation in `src/`. Prototypes
+remain in `prototypes/` for reference.
 
 ## Key Concepts
 
@@ -85,8 +91,11 @@ make help
 # List available prototypes
 make list-prototypes
 
+# Build the main imago project
+make imago
+
 # Build a specific prototype
-make build PROTOTYPE=virtio-block5
+make build-prototype PROTOTYPE=virtio-block5
 
 # Build all prototypes
 make build-all
@@ -97,11 +106,27 @@ make lint
 # Auto-fix formatting
 make lint-fix
 
+# Clean imago build
+make clean-imago
+
 # Clean a prototype's target directory
-make clean PROTOTYPE=virtio-block5
+make clean-prototype PROTOTYPE=virtio-block5
 
 # Clean everything (all targets + Docker images)
 make distclean
+```
+
+### Building and Running Imago
+
+The main imago implementation is in `src/`:
+
+```bash
+# Build imago
+make imago
+
+# Run imago (requires KVM)
+sudo src/target/release/imago info <IMAGE>
+sudo src/target/release/imago copy <INPUT> <OUTPUT>
 ```
 
 ### Testing Prototypes
@@ -111,13 +136,13 @@ Makefile for building and testing:
 
 ```bash
 # Build a specific prototype
-make build PROTOTYPE=virtio-block5
+make build-prototype PROTOTYPE=virtio-block5
 
 # Build the devcontainer for a prototype
-make build-devcontainer PROTOTYPE=virtio-block5
+make build-prototype-devcontainer PROTOTYPE=virtio-block5
 
 # View run instructions
-make run PROTOTYPE=virtio-block5
+make run-prototype PROTOTYPE=virtio-block5
 ```
 
 For manual testing without the Makefile:

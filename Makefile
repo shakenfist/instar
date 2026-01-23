@@ -3,14 +3,16 @@
 # Usage: make <target> [PROTOTYPE=<name>]
 #
 # Examples:
-#   make build PROTOTYPE=virtio-block5
+#   make imago                            # Build the main imago project
+#   make build-prototype PROTOTYPE=info   # Build a specific prototype
 #   make clean-all
 #   make lint
 #
 
-.PHONY: help list-prototypes build build-all clean clean-all \
+.PHONY: help list-prototypes build-prototype build-all clean-prototype clean-all \
         clean-devcontainers lint lint-fix build-lint-container \
-        install-hooks run guest-protocol ensure-devcontainer
+        install-hooks run-prototype guest-protocol ensure-prototype-devcontainer \
+        imago imago-devcontainer clean-imago run-imago build-prototype-devcontainer
 
 # Default target
 help:
@@ -22,32 +24,39 @@ help:
 	@echo "  help                 Show this help message"
 	@echo "  list-prototypes      List all available prototypes"
 	@echo ""
-	@echo "Building:"
-	@echo "  build                Build a specific prototype (requires PROTOTYPE=<name>)"
-	@echo "  build-all            Build all prototypes"
+	@echo "Main Project (src/):"
+	@echo "  imago                Build the main imago project"
+	@echo "  imago-devcontainer   Build devcontainer for main imago"
+	@echo "  clean-imago          Clean the main imago build"
+	@echo "  run-imago            Show how to run imago"
+	@echo ""
+	@echo "Prototypes:"
+	@echo "  build-prototype              Build a prototype (requires PROTOTYPE=<name>)"
+	@echo "  build-all                    Build all prototypes"
+	@echo "  build-prototype-devcontainer Build devcontainer for a prototype (requires PROTOTYPE=<name>)"
+	@echo "  clean-prototype              Clean a prototype's build (requires PROTOTYPE=<name>)"
+	@echo "  run-prototype                Run a prototype (requires PROTOTYPE=<name>)"
+	@echo ""
+	@echo "Shared:"
 	@echo "  guest-protocol       Build the shared guest-protocol crate"
-	@echo "  build-devcontainer   Build devcontainer for a prototype (requires PROTOTYPE=<name>)"
 	@echo "  build-lint-container Build the rust-lint Docker container"
 	@echo ""
 	@echo "Cleaning:"
-	@echo "  clean                Clean target directory for a prototype (requires PROTOTYPE=<name>)"
-	@echo "  clean-all            Clean all prototype target directories"
-	@echo "  clean-devcontainers  Remove all prototype devcontainer images"
+	@echo "  clean-all            Clean all build directories (main + prototypes)"
+	@echo "  clean-devcontainers  Remove all devcontainer images"
 	@echo "  clean-lint-container Remove the rust-lint Docker image"
 	@echo "  distclean            Remove everything (all targets + all containers)"
 	@echo ""
 	@echo "Linting:"
-	@echo "  lint                 Run rustfmt and clippy checks on all prototypes"
+	@echo "  lint                 Run rustfmt and clippy checks"
 	@echo "  lint-fix             Run rustfmt and clippy with auto-fix"
 	@echo "  install-hooks        Install pre-commit hooks"
 	@echo ""
-	@echo "Running:"
-	@echo "  run                  Run a prototype (requires PROTOTYPE=<name>)"
-	@echo ""
 	@echo "Examples:"
-	@echo "  make build PROTOTYPE=virtio-block5"
-	@echo "  make run PROTOTYPE=virtio-block5"
-	@echo "  make clean PROTOTYPE=helloworld"
+	@echo "  make imago"
+	@echo "  make build-prototype PROTOTYPE=virtio-block5"
+	@echo "  make run-prototype PROTOTYPE=virtio-block5"
+	@echo "  make clean-prototype PROTOTYPE=helloworld"
 	@echo "  make lint"
 
 # List of all prototypes
@@ -66,11 +75,74 @@ PROTOTYPES := \
 
 # Docker image names
 LINT_IMAGE := imago-rust-lint
+IMAGO_IMAGE := imago-build
 
 # Paths
+SRC_DIR := src
 PROTO_DIR := prototypes
 SCRIPTS_DIR := scripts
 DEVCONTAINER_DIR := .devcontainer
+
+# =============================================================================
+# Main Imago Project Targets
+# =============================================================================
+
+# Build the main imago project (runs inside devcontainer)
+imago: imago-devcontainer
+	@echo "Building imago..."
+	docker run --rm \
+		-u "$(shell id -u):$(shell id -g)" \
+		-e HOME=/home/vscode \
+		-e CARGO_HOME=/home/vscode/.cargo \
+		-e RUSTUP_HOME=/home/vscode/.rustup \
+		-v "$(CURDIR):/workspace" \
+		-w "/workspace/$(SRC_DIR)" \
+		"$(IMAGO_IMAGE)" \
+		bash build.sh
+
+# Build the imago devcontainer
+imago-devcontainer:
+	@if ! docker image inspect "$(IMAGO_IMAGE)" >/dev/null 2>&1; then \
+		echo "Building imago devcontainer image..."; \
+		docker build -t "$(IMAGO_IMAGE)" "$(SRC_DIR)/$(DEVCONTAINER_DIR)"; \
+	fi
+
+# Clean the main imago build
+clean-imago:
+	@echo "Cleaning imago build..."
+	@if docker image inspect "$(IMAGO_IMAGE)" >/dev/null 2>&1; then \
+		echo "Using container to clean (handles root-owned files)..."; \
+		docker run --rm \
+			-v "$(CURDIR):/workspace" \
+			-w "/workspace/$(SRC_DIR)" \
+			"$(IMAGO_IMAGE)" \
+			sh -c "rm -rf target *.bin"; \
+	else \
+		rm -rf "$(SRC_DIR)/target" 2>/dev/null || true; \
+		find "$(SRC_DIR)" -maxdepth 1 -name "*.bin" -delete 2>/dev/null || true; \
+	fi
+	@echo "Clean complete."
+
+# Show how to run imago
+run-imago:
+	@echo "Running imago"
+	@echo ""
+	@if [ ! -f "$(SRC_DIR)/target/release/imago" ]; then \
+		echo "Error: imago not built. Run 'make imago' first."; \
+		exit 1; \
+	fi
+	@echo "Note: Running requires KVM access (sudo or kvm group membership)"
+	@echo ""
+	@echo "Usage:"
+	@echo "  sudo $(SRC_DIR)/target/release/imago info <IMAGE>"
+	@echo "  sudo $(SRC_DIR)/target/release/imago copy <INPUT> <OUTPUT>"
+	@echo ""
+	@echo "For help:"
+	@echo "  $(SRC_DIR)/target/release/imago --help"
+
+# =============================================================================
+# Prototype Targets
+# =============================================================================
 
 # List all available prototypes
 list-prototypes:
@@ -92,7 +164,7 @@ ifeq ($(filter $(PROTOTYPE),$(PROTOTYPES)),)
 endif
 
 # Build a specific prototype (runs inside devcontainer)
-build: check-prototype ensure-devcontainer
+build-prototype: check-prototype ensure-prototype-devcontainer
 	@echo "Building prototype: $(PROTOTYPE)"
 	@if [ ! -f "$(PROTO_DIR)/$(PROTOTYPE)/build.sh" ]; then \
 		echo "Error: build.sh not found for $(PROTOTYPE)"; \
@@ -108,8 +180,8 @@ build: check-prototype ensure-devcontainer
 		"imago-$(PROTOTYPE)" \
 		bash build.sh
 
-# Ensure devcontainer exists (builds if needed)
-ensure-devcontainer: check-prototype
+# Ensure prototype devcontainer exists (builds if needed)
+ensure-prototype-devcontainer: check-prototype
 	@if ! docker image inspect "imago-$(PROTOTYPE)" >/dev/null 2>&1; then \
 		echo "Building devcontainer image for $(PROTOTYPE)..."; \
 		docker build -t "imago-$(PROTOTYPE)" "$(PROTO_DIR)/$(PROTOTYPE)/$(DEVCONTAINER_DIR)"; \
@@ -122,7 +194,7 @@ build-all:
 		if [ -d "$(PROTO_DIR)/$$p" ] && [ -f "$(PROTO_DIR)/$$p/build.sh" ]; then \
 			echo ""; \
 			echo "=== Building $$p ==="; \
-			$(MAKE) build PROTOTYPE=$$p || exit 1; \
+			$(MAKE) build-prototype PROTOTYPE=$$p || exit 1; \
 		fi; \
 	done
 	@echo ""
@@ -134,7 +206,7 @@ guest-protocol:
 	cd crates/guest-protocol && cargo build --release
 
 # Build devcontainer for a specific prototype
-build-devcontainer: check-prototype
+build-prototype-devcontainer: check-prototype
 	@echo "Building devcontainer for: $(PROTOTYPE)"
 	@if [ -f "$(PROTO_DIR)/$(PROTOTYPE)/$(DEVCONTAINER_DIR)/Dockerfile" ]; then \
 		docker build -t "imago-$(PROTOTYPE)" \
@@ -151,7 +223,7 @@ build-lint-container:
 
 # Clean target directory for a specific prototype
 # Runs inside container if available (to handle root-owned files from builds)
-clean: check-prototype
+clean-prototype: check-prototype
 	@echo "Cleaning target directory for: $(PROTOTYPE)"
 	@if docker image inspect "imago-$(PROTOTYPE)" >/dev/null 2>&1; then \
 		echo "Using container to clean (handles root-owned files)..."; \
@@ -171,9 +243,9 @@ clean: check-prototype
 		find "$(PROTO_DIR)/$(PROTOTYPE)" -maxdepth 1 -name "*.bin" -delete 2>/dev/null || true; \
 	fi
 
-# Clean all prototype target directories
+# Clean all build directories (main imago + prototypes)
 # Uses containers when available to handle root-owned files
-clean-all:
+clean-all: clean-imago
 	@echo "Cleaning all prototype target directories..."
 	@for p in $(PROTOTYPES); do \
 		if [ -d "$(PROTO_DIR)/$$p" ]; then \
@@ -195,9 +267,13 @@ clean-all:
 	done
 	@echo "Clean complete."
 
-# Remove all devcontainer images
+# Remove all devcontainer images (main imago + prototypes)
 clean-devcontainers:
 	@echo "Removing devcontainer images..."
+	@if docker image inspect "$(IMAGO_IMAGE)" >/dev/null 2>&1; then \
+		docker rmi "$(IMAGO_IMAGE)" || true; \
+		echo "Removed $(IMAGO_IMAGE)"; \
+	fi
 	@for p in $(PROTOTYPES); do \
 		if docker image inspect "imago-$$p" >/dev/null 2>&1; then \
 			docker rmi "imago-$$p" || true; \
@@ -242,14 +318,14 @@ install-hooks:
 	fi
 
 # Run a prototype (requires KVM access)
-run: check-prototype
+run-prototype: check-prototype
 	@echo "Running prototype: $(PROTOTYPE)"
 	@if [ ! -f "$(PROTO_DIR)/$(PROTOTYPE)/target/release/vmm" ]; then \
-		echo "Error: VMM not built. Run 'make build PROTOTYPE=$(PROTOTYPE)' first."; \
+		echo "Error: VMM not built. Run 'make build-prototype PROTOTYPE=$(PROTOTYPE)' first."; \
 		exit 1; \
 	fi
 	@if [ ! -f "$(PROTO_DIR)/$(PROTOTYPE)/guest.bin" ]; then \
-		echo "Error: guest.bin not found. Run 'make build PROTOTYPE=$(PROTOTYPE)' first."; \
+		echo "Error: guest.bin not found. Run 'make build-prototype PROTOTYPE=$(PROTOTYPE)' first."; \
 		exit 1; \
 	fi
 	@echo "Note: Running requires KVM access (sudo or kvm group membership)"

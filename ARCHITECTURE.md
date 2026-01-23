@@ -113,6 +113,15 @@ Cons:
 - [pluggable2](prototypes/pluggable2/) - Separate binary loading for operations
 - [info](prototypes/info/) - Image format detection (qemu-img info equivalent)
 
+**Current Implementation:**
+The `info` prototype has been promoted to the main implementation in `src/`. This
+provides a modular architecture with:
+- **vmm/** - Host-side virtual machine monitor
+- **core/** - Guest initialization (device init, call table)
+- **operations/info/** - Format detection operation
+- **operations/copy/** - File copy operation
+- **shared/** - Shared library code between components
+
 The rust-vmm project provides crates that reduce implementation effort by 70%+:
 - `kvm-ioctls` - Safe KVM API wrappers
 - `kvm-bindings` - KVM bindings

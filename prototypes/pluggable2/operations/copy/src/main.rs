@@ -100,17 +100,9 @@ pub unsafe extern "C" fn _start() -> u64 {
 
         for input_sector in start_sector..end_sector {
             // Read one input sector
-            if !(call_table.read_input_sector)(
-                input_sector,
-                buffer.as_mut_ptr(),
-                input_sector_size,
-            ) {
-                (call_table.send_error)(
-                    b"copy\0".as_ptr(),
-                    b"input\0".as_ptr(),
-                    input_sector,
-                    1,
-                );
+            if !(call_table.read_input_sector)(input_sector, buffer.as_mut_ptr(), input_sector_size)
+            {
+                (call_table.send_error)(b"copy\0".as_ptr(), b"input\0".as_ptr(), input_sector, 1);
                 return bytes_copied;
             }
 
@@ -226,17 +218,9 @@ pub unsafe extern "C" fn _start() -> u64 {
             }
 
             // Write one output sector
-            if !(call_table.write_output_sector)(
-                output_sector,
-                buffer.as_ptr(),
-                output_sector_size,
-            ) {
-                (call_table.send_error)(
-                    b"copy\0".as_ptr(),
-                    b"output\0".as_ptr(),
-                    output_sector,
-                    2,
-                );
+            if !(call_table.write_output_sector)(output_sector, buffer.as_ptr(), output_sector_size)
+            {
+                (call_table.send_error)(b"copy\0".as_ptr(), b"output\0".as_ptr(), output_sector, 2);
                 return bytes_copied;
             }
 

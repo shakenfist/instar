@@ -1,0 +1,14 @@
+[package]
+name = "info"
+version = "0.1.0"
+edition = "2021"
+description = "Info operation: detect image format and report metadata"
+license = "Apache-2.0"
+
+[dependencies]
+shared = { path = "../../shared" }
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true

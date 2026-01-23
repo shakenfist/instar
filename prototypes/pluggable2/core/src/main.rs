@@ -131,8 +131,7 @@ fn setup_call_table() {
 
 /// Call the operation at OPERATION_LOAD_ADDR
 unsafe fn call_operation() -> u64 {
-    let entry: shared::OperationEntry =
-        core::mem::transmute(OPERATION_LOAD_ADDR as *const ());
+    let entry: shared::OperationEntry = core::mem::transmute(OPERATION_LOAD_ADDR as *const ());
     entry()
 }
 
@@ -168,7 +167,10 @@ unsafe extern "C" fn ct_get_output_capacity() -> u64 {
 }
 
 unsafe extern "C" fn ct_get_input_sector_size() -> usize {
-    INPUT_DEVICE.as_ref().map(|d| d.sector_size()).unwrap_or(512)
+    INPUT_DEVICE
+        .as_ref()
+        .map(|d| d.sector_size())
+        .unwrap_or(512)
 }
 
 unsafe extern "C" fn ct_get_output_sector_size() -> usize {

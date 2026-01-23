@@ -23,7 +23,19 @@ Initial target formats:
 
 ## Project Status
 
-**Prototype phase** - Experimenting with different implementation approaches.
+**Initial implementation** - The `info` prototype has been promoted to the main
+imago implementation in `src/`. Prototypes remain available for reference.
+
+## Building Imago
+
+```bash
+# Build the main imago project
+make imago
+
+# The binaries will be in src/target/release/
+sudo src/target/release/imago info <IMAGE>
+sudo src/target/release/imago copy <INPUT> <OUTPUT>
+```
 
 ## Prototypes
 
@@ -82,10 +94,22 @@ make help
 make list-prototypes
 ```
 
-**Building:**
+**Main Imago Project:**
+```bash
+# Build imago
+make imago
+
+# Clean imago build
+make clean-imago
+
+# Show how to run imago
+make run-imago
+```
+
+**Prototypes:**
 ```bash
 # Build a specific prototype
-make build PROTOTYPE=virtio-block5
+make build-prototype PROTOTYPE=virtio-block5
 
 # Build all prototypes
 make build-all
@@ -94,7 +118,7 @@ make build-all
 make guest-protocol
 
 # Build devcontainer for a prototype
-make build-devcontainer PROTOTYPE=virtio-block5
+make build-prototype-devcontainer PROTOTYPE=virtio-block5
 
 # Build the rust-lint Docker container
 make build-lint-container
@@ -103,9 +127,9 @@ make build-lint-container
 **Cleaning:**
 ```bash
 # Clean a specific prototype's target directory
-make clean PROTOTYPE=virtio-block5
+make clean-prototype PROTOTYPE=virtio-block5
 
-# Clean all prototype target directories
+# Clean all build directories (main + prototypes)
 make clean-all
 
 # Remove all devcontainer Docker images
@@ -142,9 +166,15 @@ make run PROTOTYPE=virtio-block5
 imago/
 ├── .devcontainer/  # Development containers
 │   └── rust-lint/  # Stable Rust for linting
+├── src/            # Main imago implementation
+│   ├── vmm/        # Virtual machine monitor (host-side)
+│   ├── core/       # Core guest initialization
+│   ├── shared/     # Shared library code
+│   ├── operations/ # Pluggable operations (info, copy)
+│   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates
 │   └── guest-protocol/ # Protocol Buffers messaging for guests
-├── prototypes/     # Experimental implementations
+├── prototypes/     # Experimental implementations (reference)
 │   ├── helloworld/     # Minimal KVM VMM with bare-metal guest
 │   ├── helloworld2/    # Same, using rust-vmm vm-memory crate
 │   ├── virtio-block/   # Virtio-block device emulation
