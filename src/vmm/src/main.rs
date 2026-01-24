@@ -26,6 +26,7 @@ mod kvm_stats;
 mod stats;
 mod virtio;
 
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -147,19 +148,24 @@ const PTE_PRESENT: u64 = 1 << 0;
 const PTE_WRITABLE: u64 = 1 << 1;
 const PTE_PAGE_SIZE: u64 = 1 << 7;
 
-/// Serial decoder for framed protobuf messages
+/// Serial decoder for framed protobuf messages.
+///
+/// Uses VecDeque for O(1) removal from the front when discarding invalid bytes
+/// or draining consumed data, compared to Vec's O(n) operations.
 struct SerialDecoder {
-    buffer: Vec<u8>,
+    buffer: VecDeque<u8>,
 }
 
 impl SerialDecoder {
     fn new() -> Self {
-        Self { buffer: Vec::new() }
+        Self {
+            buffer: VecDeque::new(),
+        }
     }
 
     /// Add a byte and try to decode a message
     fn add_byte(&mut self, byte: u8) -> Option<guest_::GuestMessage> {
-        self.buffer.push(byte);
+        self.buffer.push_back(byte);
 
         // Need at least header to check length
         if self.buffer.len() < FRAME_HEADER_SIZE {
@@ -174,16 +180,17 @@ impl SerialDecoder {
             return None;
         }
 
+        // Make buffer contiguous for decode_framed which needs &[u8]
+        let slice = self.buffer.make_contiguous();
+
         // Try to decode
-        if let Some((msg, consumed)) = decode_framed(&self.buffer) {
+        if let Some((msg, consumed)) = decode_framed(slice) {
             self.buffer.drain(..consumed);
             return Some(msg);
         }
 
-        // Decode failed - discard first byte and try again later
-        if !self.buffer.is_empty() {
-            self.buffer.remove(0);
-        }
+        // Decode failed - discard first byte and try again later (O(1) with VecDeque)
+        self.buffer.pop_front();
         None
     }
 }
