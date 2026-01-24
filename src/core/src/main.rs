@@ -15,6 +15,7 @@ mod serial;
 mod virtio;
 
 use core::arch::asm;
+use core::cell::UnsafeCell;
 use core::panic::PanicInfo;
 use core::ptr::write_volatile;
 
@@ -35,11 +36,57 @@ const OUTPUT_MMIO_BASE: usize = 0x10001000;
 const INPUT_VQ_BASE: usize = 0x100000;
 const OUTPUT_VQ_BASE: usize = 0x110000;
 
-// Global device state (accessed by call table functions)
-// Using static mut because we need mutable access from extern "C" functions
-static mut INPUT_DEVICE: Option<VirtioBlock> = None;
-static mut OUTPUT_DEVICE: Option<VirtioBlock> = None;
-static mut CONFIG: Option<DeviceConfig> = None;
+/// A cell for single-threaded static mutable state.
+///
+/// This is a wrapper around `UnsafeCell` that implements `Sync`, making it
+/// usable in static variables. This is safe because:
+///
+/// 1. The guest runs on a single vCPU (no concurrent access possible)
+/// 2. All access is through the call table functions (no re-entrancy)
+/// 3. Initialization happens once in `_start()` before any other access
+///
+/// # Safety
+///
+/// This type must only be used in single-threaded contexts. Using it in
+/// multi-threaded code will cause data races (undefined behavior).
+struct SingleThreadCell<T>(UnsafeCell<T>);
+
+impl<T> SingleThreadCell<T> {
+    const fn new(value: T) -> Self {
+        Self(UnsafeCell::new(value))
+    }
+
+    /// Get a mutable reference to the inner value.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure no other references to the value exist.
+    /// This is guaranteed in single-threaded code.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn get_mut(&self) -> &mut T {
+        &mut *self.0.get()
+    }
+
+    /// Get a shared reference to the inner value.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure no mutable references to the value exist.
+    unsafe fn get(&self) -> &T {
+        &*self.0.get()
+    }
+}
+
+// SAFETY: This is only safe because the guest is single-threaded.
+// The guest runs on exactly one vCPU with no possibility of concurrent access.
+unsafe impl<T> Sync for SingleThreadCell<T> {}
+
+// Global device state (accessed by call table functions).
+// Using SingleThreadCell because we need interior mutability from extern "C" functions.
+// SAFETY: Guest runs on a single vCPU - no concurrent access is possible.
+static INPUT_DEVICE: SingleThreadCell<Option<VirtioBlock>> = SingleThreadCell::new(None);
+static OUTPUT_DEVICE: SingleThreadCell<Option<VirtioBlock>> = SingleThreadCell::new(None);
+static CONFIG: SingleThreadCell<Option<DeviceConfig>> = SingleThreadCell::new(None);
 
 /// Entry point
 #[no_mangle]
@@ -89,11 +136,12 @@ pub extern "C" fn _start() -> ! {
         None
     };
 
-    // Store devices and config in globals for call table access
+    // Store devices and config in globals for call table access.
+    // SAFETY: Single-threaded guest, no concurrent access possible.
     unsafe {
-        INPUT_DEVICE = Some(input);
-        OUTPUT_DEVICE = output;
-        CONFIG = Some(config.clone());
+        *INPUT_DEVICE.get_mut() = Some(input);
+        *OUTPUT_DEVICE.get_mut() = output;
+        *CONFIG.get_mut() = Some(config.clone());
     }
 
     // Set up call table
@@ -149,7 +197,7 @@ unsafe fn call_operation() -> u64 {
 // ============================================================================
 
 unsafe extern "C" fn ct_read_input_sector(sector: u64, buffer: *mut u8, len: usize) -> bool {
-    if let Some(ref mut dev) = INPUT_DEVICE {
+    if let Some(ref mut dev) = *INPUT_DEVICE.get_mut() {
         let slice = core::slice::from_raw_parts_mut(buffer, len);
         dev.read_sector(sector, slice)
     } else {
@@ -158,7 +206,7 @@ unsafe extern "C" fn ct_read_input_sector(sector: u64, buffer: *mut u8, len: usi
 }
 
 unsafe extern "C" fn ct_write_output_sector(sector: u64, buffer: *const u8, len: usize) -> bool {
-    if let Some(ref mut dev) = OUTPUT_DEVICE {
+    if let Some(ref mut dev) = *OUTPUT_DEVICE.get_mut() {
         let slice = core::slice::from_raw_parts(buffer, len);
         dev.write_sector(sector, slice)
     } else {
@@ -167,15 +215,24 @@ unsafe extern "C" fn ct_write_output_sector(sector: u64, buffer: *const u8, len:
 }
 
 unsafe extern "C" fn ct_get_input_capacity() -> u64 {
-    INPUT_DEVICE.as_ref().map(|d| d.capacity()).unwrap_or(0)
+    INPUT_DEVICE
+        .get()
+        .as_ref()
+        .map(|d| d.capacity())
+        .unwrap_or(0)
 }
 
 unsafe extern "C" fn ct_get_output_capacity() -> u64 {
-    OUTPUT_DEVICE.as_ref().map(|d| d.capacity()).unwrap_or(0)
+    OUTPUT_DEVICE
+        .get()
+        .as_ref()
+        .map(|d| d.capacity())
+        .unwrap_or(0)
 }
 
 unsafe extern "C" fn ct_get_input_sector_size() -> usize {
     INPUT_DEVICE
+        .get()
         .as_ref()
         .map(|d| d.sector_size())
         .unwrap_or(512)
@@ -183,13 +240,18 @@ unsafe extern "C" fn ct_get_input_sector_size() -> usize {
 
 unsafe extern "C" fn ct_get_output_sector_size() -> usize {
     OUTPUT_DEVICE
+        .get()
         .as_ref()
         .map(|d| d.sector_size())
         .unwrap_or(512)
 }
 
 unsafe extern "C" fn ct_get_progress_interval() -> u32 {
-    CONFIG.as_ref().map(|c| c.progress_percent).unwrap_or(10)
+    CONFIG
+        .get()
+        .as_ref()
+        .map(|c| c.progress_percent)
+        .unwrap_or(10)
 }
 
 unsafe extern "C" fn ct_send_progress(op: *const u8, current: u64, total: u64, percent: u32) {
