@@ -158,3 +158,58 @@ sudo ./target/release/vmm guest.bin  # Run (requires KVM)
 - Test with malformed/malicious input images
 - Verify sandbox containment
 - Check for resource exhaustion (memory, disk, CPU)
+
+## Claude Code Skills
+
+Custom skills are available in `.claude/skills/` to help with common development
+tasks:
+
+### `/imago-new-op` - Scaffold New Operations
+
+Creates a complete operation skeleton with all required files:
+
+```
+/imago-new-op <operation-name> [description]
+```
+
+Example:
+```
+/imago-new-op checksum "Calculate checksums of disk images"
+```
+
+This creates:
+- `src/operations/<name>/src/main.rs` - Entry point with call table setup
+- `src/operations/<name>/Cargo.toml` - Dependencies and build config
+- `src/operations/<name>/linker.ld` - Linker script for 0x20000 load address
+- `src/operations/<name>/.cargo/config.toml` - Cross-compilation settings
+
+### `/imago-format` - Disk Image Format Reference
+
+Quick reference for format structures, magic numbers, and parsing details:
+
+```
+/imago-format [format]
+```
+
+Where `[format]` is: `qcow2`, `vmdk`, `raw`, or omit for overview.
+
+### `/imago-debug` - Troubleshooting Guide
+
+Diagnose and fix common issues when developing guest operations:
+
+```
+/imago-debug [issue]
+```
+
+Where `[issue]` is: `build`, `boot`, `virtio`, `calltable`, `panic`, or omit for
+general guidance.
+
+### `/imago-calltable` - Call Table API Reference
+
+Complete documentation for the call table API used by operations:
+
+```
+/imago-calltable [function]
+```
+
+Where `[function]` is: `io`, `progress`, `config`, or omit for full reference.

@@ -235,6 +235,17 @@ The `docs/` directory contains:
 
 See `docs/index.md` for the full documentation index.
 
+## Claude Code Integration
+
+This project includes Claude Code skills for common development tasks:
+
+- `/imago-new-op <name>` - Scaffold a new operation binary
+- `/imago-format [format]` - Disk image format reference (qcow2, vmdk, raw)
+- `/imago-debug [issue]` - Troubleshooting guide for guest operations
+- `/imago-calltable [function]` - Call table API documentation
+
+See `.claude/skills/` for details.
+
 ## License
 
 Licensed under the Apache License, Version 2.0. See LICENSE file for details.
