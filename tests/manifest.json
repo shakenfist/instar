@@ -1,0 +1,44 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "Imago Test Manifest",
+    "version": "1.0.0",
+    "description": "Test images for comparing imago info output against qemu-img info",
+    "images": [
+        {
+            "id": "cirros-qcow2",
+            "path": "downloaded/cirros/cirros-0.6.3-x86_64-disk.img",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "CirrOS minimal cloud image, real-world qcow2 example",
+            "tags": ["qcow2", "cloud-image", "production-like"]
+        },
+        {
+            "id": "qcow2-v2",
+            "path": "downloaded/edge-cases/qcow2_v2.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "QCOW2 version 2 format (compat=0.10)",
+            "tags": ["qcow2", "version-2"]
+        },
+        {
+            "id": "plaso-vmdk",
+            "path": "downloaded/plaso/image.vmdk",
+            "format": "vmdk",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "Small monolithicSparse VMDK from plaso project",
+            "tags": ["vmdk", "monolithicSparse"]
+        },
+        {
+            "id": "hyperv-dynamic-vhd",
+            "path": "downloaded/qemu-iotests/hyperv2012r2-dynamic.vhd",
+            "format": "vpc",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "Dynamic VHD created by Hyper-V 2012 R2",
+            "tags": ["vhd", "hyper-v"]
+        }
+    ]
+}

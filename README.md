@@ -154,6 +154,28 @@ make lint-fix
 make install-hooks
 ```
 
+**Integration Testing:**
+```bash
+# Create Python venv for tests (testtools/stestr)
+make test-venv
+
+# Run safe integration tests
+make test
+
+# Run tests with verbose output (shows diffs)
+make test-report
+
+# Run all tests including malicious images (explicit opt-in)
+make test-malicious
+
+# Clean test artifacts
+make clean-tests
+```
+
+The integration tests compare `imago info` output against `qemu-img info` to
+verify drop-in replacement compatibility. Test images are in the sibling
+`imago-testdata/` repository.
+
 **Running:**
 ```bash
 # Show run instructions for a prototype
@@ -187,6 +209,11 @@ imago/
 │   ├── pluggable2/     # Separate binary loading for operations
 │   └── info/           # Image format detection (qemu-img info)
 ├── scripts/        # Build and check scripts
+├── tests/          # Integration tests (Python/testtools)
+│   ├── base.py         # Base test class
+│   ├── manifest.json   # Test image definitions
+│   ├── helpers/        # Test utilities
+│   └── test_*.py       # Test files
 ├── docs/           # Design documents and research
 │   ├── index.md    # Documentation index
 │   ├── usage.md    # Platform usage analysis (oVirt, Proxmox, OpenStack)

@@ -12,7 +12,8 @@
 .PHONY: help list-prototypes build-prototype build-all clean-prototype clean-all \
         clean-devcontainers lint lint-fix build-lint-container \
         install-hooks run-prototype guest-protocol ensure-prototype-devcontainer \
-        imago imago-devcontainer clean-imago run-imago build-prototype-devcontainer
+        imago imago-devcontainer clean-imago run-imago build-prototype-devcontainer \
+        test-venv test test-ci test-malicious test-report clean-tests
 
 # Default target
 help:
@@ -51,6 +52,14 @@ help:
 	@echo "  lint                 Run rustfmt and clippy checks"
 	@echo "  lint-fix             Run rustfmt and clippy with auto-fix"
 	@echo "  install-hooks        Install pre-commit hooks"
+	@echo ""
+	@echo "Testing:"
+	@echo "  test-venv            Create Python venv for tests"
+	@echo "  test                 Run safe integration tests"
+	@echo "  test-ci              Run CI-suitable tests (safe + caution)"
+	@echo "  test-malicious       Run all tests including malicious images"
+	@echo "  test-report          Show test differences without failing"
+	@echo "  clean-tests          Clean test artifacts"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make imago"
@@ -333,3 +342,51 @@ run-prototype: check-prototype
 	@echo ""
 	@echo "For virtio-block prototypes, additional arguments may be needed."
 	@echo "See $(PROTO_DIR)/$(PROTOTYPE)/README.md for usage details."
+
+# =============================================================================
+# Integration Test Targets
+# =============================================================================
+
+TESTS_DIR := tests
+PYTHON := python3
+VENV_DIR := $(TESTS_DIR)/.venv
+
+# Create virtual environment for tests
+test-venv:
+	@echo "Creating Python virtual environment for tests..."
+	@if [ ! -d "$(VENV_DIR)" ]; then \
+		$(PYTHON) -m venv $(VENV_DIR); \
+	fi
+	@$(VENV_DIR)/bin/pip install -q -r $(TESTS_DIR)/requirements.txt
+	@echo "Virtual environment ready at $(VENV_DIR)"
+
+# Run safe integration tests only
+test: imago test-venv
+	@echo "Running safe integration tests..."
+	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run test_info_safe
+
+# Run CI-suitable tests (safe + caution)
+test-ci: imago test-venv
+	@echo "Running CI tests (safe images)..."
+	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run "test_info_safe"
+
+# Run all tests including malicious (explicit opt-in)
+test-malicious: imago test-venv
+	@echo "WARNING: Running tests including malicious images"
+	@echo "This will process known malicious disk images."
+	@echo ""
+	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run
+
+# Run tests and show output (useful for seeing diffs during development)
+test-report: imago test-venv
+	@echo "Running tests with verbose output..."
+	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run --serial -- --verbose
+
+# Clean test artifacts
+clean-tests:
+	@echo "Cleaning test artifacts..."
+	rm -rf $(TESTS_DIR)/.venv
+	rm -rf $(TESTS_DIR)/__pycache__
+	rm -rf $(TESTS_DIR)/helpers/__pycache__
+	rm -rf $(TESTS_DIR)/.stestr
+	@echo "Test cleanup complete."

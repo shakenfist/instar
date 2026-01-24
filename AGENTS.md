@@ -21,6 +21,7 @@ imago/
 ├── crates/         # Shared Rust crates (guest-protocol)
 ├── prototypes/     # Experimental implementations (11 KVM prototypes)
 ├── scripts/        # Build and check scripts
+├── tests/          # Integration tests (Python/testtools)
 ├── docs/           # Design documents and research notes
 ├── testdata/       # Test images for security validation
 ├── Makefile        # Build and development automation
@@ -128,6 +129,44 @@ make imago
 sudo src/target/release/imago info <IMAGE>
 sudo src/target/release/imago copy <INPUT> <OUTPUT>
 ```
+
+### Integration Testing
+
+Integration tests compare `imago info` output against `qemu-img info` to verify
+drop-in replacement compatibility. Tests use Python testtools/stestr.
+
+```bash
+# Set up test environment
+make test-venv
+
+# Run safe integration tests
+make test
+
+# Run tests with verbose output (shows diffs on failure)
+make test-report
+
+# Run all tests including malicious images (use with caution)
+make test-malicious
+
+# Clean test artifacts
+make clean-tests
+```
+
+**Test structure:**
+- `tests/manifest.json` - Defines test images and their safety levels
+- `tests/test_info_safe.py` - Tests against known-safe images
+- `tests/test_info_malicious.py` - Tests against malicious images using expected overrides
+- `tests/expected_outputs/` - Expected output files for malicious images
+
+**Adding new test images:**
+1. Add the image to `imago-testdata/` repository
+2. Add an entry to `tests/manifest.json` with appropriate safety level
+3. For malicious images, create an expected output file in `tests/expected_outputs/`
+
+**Safety levels:**
+- `safe` - Run by default, known-good images
+- `caution` - Edge cases that may expose bugs
+- `malicious` - CVE exploit images, require explicit opt-in
 
 ### Testing Prototypes
 
