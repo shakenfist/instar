@@ -141,7 +141,7 @@ impl IoThread {
         let mut events: Vec<libc::epoll_event> =
             vec![libc::epoll_event { events: 0, u64: 0 }; max_events];
 
-        while running.load(Ordering::Relaxed) {
+        while running.load(Ordering::Acquire) {
             // Wait for events with a timeout (so we can check `running`)
             let nfds =
                 unsafe { libc::epoll_wait(epoll_fd, events.as_mut_ptr(), max_events as i32, 100) };
