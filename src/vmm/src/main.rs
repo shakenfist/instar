@@ -320,41 +320,85 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
     format!("[{}] {}", level, payload_str)
 }
 
-/// Print InfoResult in a user-friendly format (for non-verbose output)
-fn print_info_result(msg: &guest_::GuestMessage) {
+/// Format a byte size as human-readable string (matches qemu-img format)
+fn format_size_human(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const TIB: f64 = 1024.0 * 1024.0 * 1024.0 * 1024.0;
+
+    let bytes_f = bytes as f64;
+
+    if bytes_f >= TIB {
+        format_size_value(bytes_f / TIB, "TiB")
+    } else if bytes_f >= GIB {
+        format_size_value(bytes_f / GIB, "GiB")
+    } else if bytes_f >= MIB {
+        format_size_value(bytes_f / MIB, "MiB")
+    } else if bytes_f >= KIB {
+        format_size_value(bytes_f / KIB, "KiB")
+    } else {
+        format!("{} bytes", bytes)
+    }
+}
+
+/// Format a size value, showing decimal only if not a whole number
+fn format_size_value(value: f64, unit: &str) -> String {
+    // Round to one decimal place
+    let rounded = (value * 10.0).round() / 10.0;
+    if rounded.fract() == 0.0 {
+        // Whole number, no decimal
+        format!("{} {}", rounded as u64, unit)
+    } else {
+        // Show one decimal place
+        format!("{:.1} {}", rounded, unit)
+    }
+}
+
+/// Print InfoResult in qemu-img compatible format
+fn print_info_result(msg: &guest_::GuestMessage, filename: &str, file_size: u64) {
     if let Some(guest_::GuestMessage_::Payload::InfoResult(info)) = &msg.payload {
-        println!("image: {}", info.format);
-        if info.version > 0 {
-            println!("format version: {}", info.version);
-        }
-        println!("virtual size: {} bytes", info.virtual_size);
-        println!("actual size: {} bytes", info.actual_size);
+        // Get absolute path for filename
+        let abs_path = std::fs::canonicalize(filename)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| filename.to_string());
+
+        // Line 1: image path
+        println!("image: {}", abs_path);
+
+        // Line 2: file format
+        println!("file format: {}", info.format);
+
+        // Line 3: virtual size (human-readable with bytes in parentheses)
+        println!(
+            "virtual size: {} ({} bytes)",
+            format_size_human(info.virtual_size),
+            info.virtual_size
+        );
+
+        // Line 4: disk size (actual file size on disk)
+        println!("disk size: {}", format_size_human(file_size));
+
+        // Line 5: cluster_size (with underscore, matching qemu-img)
         if info.cluster_size > 0 {
-            println!("cluster size: {} bytes", info.cluster_size);
+            println!("cluster_size: {}", info.cluster_size);
         }
 
-        // Decode flags
-        if info.flags & (1 << 0) != 0 {
+        // Backing file (if present)
+        if info.flags & (1 << 0) != 0 && !info.backing_file.is_empty() {
             println!("backing file: {}", info.backing_file);
         }
-        if info.flags & (1 << 1) != 0 {
-            println!("external data file: {}", info.external_data_file);
-        }
-        if info.flags & (1 << 2) != 0 {
-            println!("encrypted: yes");
-        }
-        if info.flags & (1 << 3) != 0 {
-            println!("compressed: yes");
-        }
-        if info.flags & (1 << 4) != 0 {
-            println!("snapshots: yes");
-        }
-        if info.flags & (1 << 5) != 0 {
-            println!("dirty: yes");
-        }
-        if info.flags & (1 << 6) != 0 {
-            println!("corrupt: yes");
-        }
+
+        // Child node '/file' section (matches qemu-img output)
+        println!("Child node '/file':");
+        println!("    filename: {}", abs_path);
+        println!("    protocol type: file");
+        println!(
+            "    file length: {} ({} bytes)",
+            format_size_human(file_size),
+            file_size
+        );
+        println!("    disk size: {}", format_size_human(file_size));
     }
 }
 
@@ -682,7 +726,7 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
                                 Some(guest_::GuestMessage_::Payload::InfoResult(_))
                             );
                             if is_info_result {
-                                print_info_result(&msg);
+                                print_info_result(&msg, &args.input, input_size);
                             } else {
                                 debug!("{}", format_message(&msg));
                             }

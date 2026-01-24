@@ -67,6 +67,23 @@ message CompleteMessage {
   bool success = 3;
 }
 
+// QCOW2 format-specific information
+message Qcow2Info {
+  string compat = 1;           // "0.10" or "1.1"
+  string compression_type = 2; // "zlib" or "zstd"
+  bool lazy_refcounts = 3;
+  uint32 refcount_bits = 4;
+  bool corrupt = 5;
+  bool extended_l2 = 6;
+}
+
+// VMDK format-specific information
+message VmdkInfo {
+  uint32 cid = 1;
+  uint32 parent_cid = 2;
+  string create_type = 3;
+}
+
 // Image format detection result (from info operation)
 message InfoResultMessage {
   // Detected format: "unknown", "raw", "qcow2", "vmdk", "vmdk3", "vhd", "vhdx", "qcow1"
@@ -92,6 +109,9 @@ message InfoResultMessage {
   string backing_file = 7;
   // External data file path (if present, QCOW2 v3)
   string external_data_file = 8;
+  // Format-specific information (optional)
+  Qcow2Info qcow2_info = 9;
+  VmdkInfo vmdk_info = 10;
 }
 
 // Main message wrapper with level and payload

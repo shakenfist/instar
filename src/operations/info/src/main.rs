@@ -16,6 +16,10 @@ const QCOW2_MAGIC: u32 = 0x514649fb; // "QFI\xfb" (big-endian at offset 0)
 const QCOW1_MAGIC: u32 = 0x514649; // "QFI" (big-endian at offset 0, 3 bytes)
 const VMDK4_MAGIC: u32 = 0x564d444b; // "VMDK" (little-endian at offset 0)
 const VMDK3_MAGIC: u32 = 0x434f5744; // "COWD" (little-endian at offset 0)
+const VHD_COOKIE: u64 = 0x636f6e6563746978; // "conectix" (big-endian at footer offset 0)
+
+// VHD footer offsets (big-endian)
+const VHD_FOOTER_CURRENT_SIZE_OFFSET: usize = 48; // Current size (virtual size) in bytes
 
 // QCOW2 header offsets (big-endian)
 const QCOW2_VERSION_OFFSET: usize = 4;
@@ -89,8 +93,25 @@ pub unsafe extern "C" fn _start() -> u64 {
     let mut result = InfoResult::new();
     result.actual_size = actual_size;
 
-    // Detect format based on magic numbers
-    let format = detect_format(&buffer, input_sector_size);
+    // Detect format based on magic numbers (first sector)
+    let mut format = detect_format_header(&buffer, input_sector_size);
+
+    // Buffer for VHD footer (may be reused)
+    let mut footer_buffer = [0u8; MAX_SECTOR_SIZE];
+
+    // If no format detected from header, try VHD detection (footer at end of file)
+    if format == ImageFormat::Raw && input_capacity > 0 {
+        (call_table.debug_print)(b"info: checking VHD footer\n\0".as_ptr());
+        let last_sector = input_capacity - 1;
+        if (call_table.read_input_sector)(
+            last_sector,
+            footer_buffer.as_mut_ptr(),
+            input_sector_size,
+        ) {
+            format = detect_vhd_footer(&footer_buffer);
+        }
+    }
+
     result.format = format as u32;
 
     (call_table.debug_print)(b"info: detected format\n\0".as_ptr());
@@ -103,6 +124,19 @@ pub unsafe extern "C" fn _start() -> u64 {
             }
             ImageFormat::Vmdk4 => {
                 parse_vmdk4_header(&buffer, &mut result);
+            }
+            ImageFormat::Vhd => {
+                // VHD footer may be in first sector (dynamic) or last sector (fixed)
+                // Use first sector buffer if it has the footer, otherwise use footer_buffer
+                let vhd_cookie = u64::from_be_bytes([
+                    buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6],
+                    buffer[7],
+                ]);
+                if vhd_cookie == VHD_COOKIE {
+                    parse_vhd_footer(&buffer, &mut result);
+                } else {
+                    parse_vhd_footer(&footer_buffer, &mut result);
+                }
             }
             _ => {
                 // For raw and unknown formats, virtual size = actual size
@@ -141,13 +175,13 @@ fn format_to_str(format: ImageFormat) -> *const u8 {
         ImageFormat::Qcow1 => b"qcow1\0".as_ptr(),
         ImageFormat::Vmdk4 => b"vmdk\0".as_ptr(),
         ImageFormat::Vmdk3 => b"vmdk3\0".as_ptr(),
-        ImageFormat::Vhd => b"vhd\0".as_ptr(),
+        ImageFormat::Vhd => b"vpc\0".as_ptr(), // qemu-img calls VHD format "vpc"
         ImageFormat::Vhdx => b"vhdx\0".as_ptr(),
     }
 }
 
-/// Detect image format based on magic numbers
-fn detect_format(buffer: &[u8], len: usize) -> ImageFormat {
+/// Detect image format based on magic numbers in file header (first sector)
+fn detect_format_header(buffer: &[u8], len: usize) -> ImageFormat {
     if len < 8 {
         return ImageFormat::Unknown;
     }
@@ -180,12 +214,62 @@ fn detect_format(buffer: &[u8], len: usize) -> ImageFormat {
         return ImageFormat::Vhdx;
     }
 
-    // VHD has its signature at the end of the file, so we can't detect it
-    // from the first sector alone. We'd need to read the last 512 bytes.
-    // For now, we'll fall through to raw.
+    // Check for VHD/VPC magic "conectix" (big-endian)
+    // Dynamic VHDs have a footer copy at the start of the file
+    let vhd_cookie = u64::from_be_bytes([
+        buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
+    ]);
+    if vhd_cookie == VHD_COOKIE {
+        return ImageFormat::Vhd;
+    }
 
-    // If no known format detected, assume raw
+    // Fixed VHD has its signature only at the end, handled separately
+    // If no known format detected from header, assume raw (may be overridden)
     ImageFormat::Raw
+}
+
+/// Detect VHD format from file footer (last 512 bytes)
+fn detect_vhd_footer(buffer: &[u8]) -> ImageFormat {
+    if buffer.len() < 8 {
+        return ImageFormat::Raw;
+    }
+
+    // VHD footer starts with "conectix" cookie (big-endian)
+    let cookie = u64::from_be_bytes([
+        buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
+    ]);
+
+    if cookie == VHD_COOKIE {
+        return ImageFormat::Vhd;
+    }
+
+    ImageFormat::Raw
+}
+
+/// Parse VHD footer and populate result
+fn parse_vhd_footer(buffer: &[u8], result: &mut InfoResult) {
+    // VHD footer structure (all fields big-endian):
+    // Offset 0: Cookie "conectix" (8 bytes) - already verified
+    // Offset 48: Current Size (8 bytes) - virtual size in bytes
+    // Offset 56: Disk Geometry (4 bytes)
+    // Offset 60: Disk Type (4 bytes) - 2=fixed, 3=dynamic, 4=differencing
+
+    // Current size (virtual size) at offset 48
+    result.virtual_size = u64::from_be_bytes([
+        buffer[VHD_FOOTER_CURRENT_SIZE_OFFSET],
+        buffer[VHD_FOOTER_CURRENT_SIZE_OFFSET + 1],
+        buffer[VHD_FOOTER_CURRENT_SIZE_OFFSET + 2],
+        buffer[VHD_FOOTER_CURRENT_SIZE_OFFSET + 3],
+        buffer[VHD_FOOTER_CURRENT_SIZE_OFFSET + 4],
+        buffer[VHD_FOOTER_CURRENT_SIZE_OFFSET + 5],
+        buffer[VHD_FOOTER_CURRENT_SIZE_OFFSET + 6],
+        buffer[VHD_FOOTER_CURRENT_SIZE_OFFSET + 7],
+    ]);
+
+    // Disk geometry at offset 56 - qemu uses this as cluster_size
+    // VHD format: cylinders(2) + heads(1) + sectors(1)
+    // For VPC/VHD, cluster_size is typically 2 MiB (0x200000)
+    result.cluster_size = 2 * 1024 * 1024; // 2 MiB default for VHD
 }
 
 /// Parse QCOW2 header and populate result
