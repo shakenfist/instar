@@ -9,7 +9,9 @@
 
 use core::panic::PanicInfo;
 
-use shared::{CallTable, ImageFormat, InfoConfig, InfoResult, CALL_TABLE_ADDR, MAX_SECTOR_SIZE};
+use shared::{
+    CallTable, ImageFormat, InfoConfig, InfoResult, Qcow2Info, CALL_TABLE_ADDR, MAX_SECTOR_SIZE,
+};
 
 // Magic numbers for format detection (big-endian where noted)
 const QCOW2_MAGIC: u32 = 0x514649fb; // "QFI\xfb" (big-endian at offset 0)
@@ -30,11 +32,20 @@ const QCOW2_SIZE_OFFSET: usize = 24;
 const QCOW2_CRYPT_METHOD_OFFSET: usize = 32;
 const QCOW2_INCOMPATIBLE_FEATURES_OFFSET: usize = 72; // v3 only
 
+// Additional QCOW2 header offsets for format-specific info
+const QCOW2_COMPATIBLE_FEATURES_OFFSET: usize = 80; // v3 only
+const QCOW2_REFCOUNT_ORDER_OFFSET: usize = 96; // refcount_bits = 1 << refcount_order
+const QCOW2_COMPRESSION_TYPE_OFFSET: usize = 104; // v3 only (0=zlib, 1=zstd)
+
 // QCOW2 incompatible feature bits
 const QCOW2_INCOMPAT_DIRTY: u64 = 1 << 0;
 const QCOW2_INCOMPAT_CORRUPT: u64 = 1 << 1;
 const QCOW2_INCOMPAT_EXTERNAL_DATA: u64 = 1 << 2;
 const QCOW2_INCOMPAT_COMPRESSION: u64 = 1 << 3;
+const QCOW2_INCOMPAT_EXTENDED_L2: u64 = 1 << 4;
+
+// QCOW2 compatible feature bits
+const QCOW2_COMPAT_LAZY_REFCOUNTS: u64 = 1 << 0;
 
 // VMDK4 header offsets (little-endian)
 const VMDK4_VERSION_OFFSET: usize = 4;
@@ -116,11 +127,14 @@ pub unsafe extern "C" fn _start() -> u64 {
 
     (call_table.debug_print)(b"info: detected format\n\0".as_ptr());
 
+    // QCOW2-specific information (filled in if format is QCOW2)
+    let mut qcow2_info = Qcow2Info::new();
+
     // Parse format-specific metadata if detailed reporting enabled
     if detailed {
         match format {
             ImageFormat::Qcow2 => {
-                parse_qcow2_header(&buffer, &mut result, call_table);
+                parse_qcow2_header(&buffer, &mut result, &mut qcow2_info, call_table);
             }
             ImageFormat::Vmdk4 => {
                 parse_vmdk4_header(&buffer, &mut result);
@@ -149,16 +163,31 @@ pub unsafe extern "C" fn _start() -> u64 {
     let format_str = format_to_str(format);
 
     // Send result via protobuf over serial
-    (call_table.send_info_result)(
-        format_str,
-        result.version,
-        result.virtual_size,
-        result.actual_size,
-        result.cluster_size,
-        result.flags,
-        b"\0".as_ptr(), // backing_file (empty for now)
-        b"\0".as_ptr(), // external_data_file (empty for now)
-    );
+    // Use QCOW2-specific function for QCOW2 images to include format info
+    if format == ImageFormat::Qcow2 {
+        (call_table.send_info_result_qcow2)(
+            format_str,
+            result.version,
+            result.virtual_size,
+            result.actual_size,
+            result.cluster_size,
+            result.flags,
+            b"\0".as_ptr(), // backing_file (empty for now)
+            b"\0".as_ptr(), // external_data_file (empty for now)
+            &qcow2_info,
+        );
+    } else {
+        (call_table.send_info_result)(
+            format_str,
+            result.version,
+            result.virtual_size,
+            result.actual_size,
+            result.cluster_size,
+            result.flags,
+            b"\0".as_ptr(), // backing_file (empty for now)
+            b"\0".as_ptr(), // external_data_file (empty for now)
+        );
+    }
 
     (call_table.send_complete)(b"info\0".as_ptr(), bytes_read, true);
     (call_table.debug_print)(b"info: done\n\0".as_ptr());
@@ -272,8 +301,13 @@ fn parse_vhd_footer(buffer: &[u8], result: &mut InfoResult) {
     result.cluster_size = 2 * 1024 * 1024; // 2 MiB default for VHD
 }
 
-/// Parse QCOW2 header and populate result
-unsafe fn parse_qcow2_header(buffer: &[u8], result: &mut InfoResult, call_table: &CallTable) {
+/// Parse QCOW2 header and populate result and format-specific info
+unsafe fn parse_qcow2_header(
+    buffer: &[u8],
+    result: &mut InfoResult,
+    qcow2_info: &mut Qcow2Info,
+    call_table: &CallTable,
+) {
     // Version (big-endian u32 at offset 4)
     let version = u32::from_be_bytes([
         buffer[QCOW2_VERSION_OFFSET],
@@ -282,6 +316,9 @@ unsafe fn parse_qcow2_header(buffer: &[u8], result: &mut InfoResult, call_table:
         buffer[QCOW2_VERSION_OFFSET + 3],
     ]);
     result.version = version;
+
+    // Set compat based on version: v2 = 0.10, v3 = 1.1
+    qcow2_info.compat = if version >= 3 { 1 } else { 0 };
 
     // Cluster bits (big-endian u32 at offset 20)
     let cluster_bits = u32::from_be_bytes([
@@ -335,11 +372,25 @@ unsafe fn parse_qcow2_header(buffer: &[u8], result: &mut InfoResult, call_table:
 
     if backing_offset != 0 && backing_size > 0 {
         result.flags |= InfoResult::FLAG_HAS_BACKING_FILE;
-        // Note: The backing file path is embedded in the header, often right
-        // after the header structure. We would need to extract it from the
-        // buffer if it fits, or read more sectors if it doesn't.
-        // For now, just flag that it exists.
         (call_table.debug_print)(b"info: has backing file\n\0".as_ptr());
+    }
+
+    // Default compression type (zlib)
+    qcow2_info.compression_type = 0;
+
+    // For v2, refcount_bits is always 16 (refcount_order = 4)
+    // For v3+, read refcount_order from offset 96
+    if version >= 3 {
+        // Refcount order (big-endian u32 at offset 96) - refcount_bits = 1 << refcount_order
+        let refcount_order = u32::from_be_bytes([
+            buffer[QCOW2_REFCOUNT_ORDER_OFFSET],
+            buffer[QCOW2_REFCOUNT_ORDER_OFFSET + 1],
+            buffer[QCOW2_REFCOUNT_ORDER_OFFSET + 2],
+            buffer[QCOW2_REFCOUNT_ORDER_OFFSET + 3],
+        ]);
+        qcow2_info.refcount_bits = 1u32 << refcount_order;
+    } else {
+        qcow2_info.refcount_bits = 16;
     }
 
     // Version 3 specific features
@@ -361,6 +412,7 @@ unsafe fn parse_qcow2_header(buffer: &[u8], result: &mut InfoResult, call_table:
         }
         if (incompat & QCOW2_INCOMPAT_CORRUPT) != 0 {
             result.flags |= InfoResult::FLAG_CORRUPT;
+            qcow2_info.corrupt = true;
         }
         if (incompat & QCOW2_INCOMPAT_EXTERNAL_DATA) != 0 {
             result.flags |= InfoResult::FLAG_HAS_EXTERNAL_DATA;
@@ -369,6 +421,28 @@ unsafe fn parse_qcow2_header(buffer: &[u8], result: &mut InfoResult, call_table:
         if (incompat & QCOW2_INCOMPAT_COMPRESSION) != 0 {
             result.flags |= InfoResult::FLAG_COMPRESSED;
         }
+        if (incompat & QCOW2_INCOMPAT_EXTENDED_L2) != 0 {
+            qcow2_info.extended_l2 = true;
+        }
+
+        // Compatible features (big-endian u64 at offset 80)
+        let compat = u64::from_be_bytes([
+            buffer[QCOW2_COMPATIBLE_FEATURES_OFFSET],
+            buffer[QCOW2_COMPATIBLE_FEATURES_OFFSET + 1],
+            buffer[QCOW2_COMPATIBLE_FEATURES_OFFSET + 2],
+            buffer[QCOW2_COMPATIBLE_FEATURES_OFFSET + 3],
+            buffer[QCOW2_COMPATIBLE_FEATURES_OFFSET + 4],
+            buffer[QCOW2_COMPATIBLE_FEATURES_OFFSET + 5],
+            buffer[QCOW2_COMPATIBLE_FEATURES_OFFSET + 6],
+            buffer[QCOW2_COMPATIBLE_FEATURES_OFFSET + 7],
+        ]);
+
+        if (compat & QCOW2_COMPAT_LAZY_REFCOUNTS) != 0 {
+            qcow2_info.lazy_refcounts = true;
+        }
+
+        // Compression type (u8 at offset 104) - 0=zlib, 1=zstd
+        qcow2_info.compression_type = buffer[QCOW2_COMPRESSION_TYPE_OFFSET];
     }
 }
 

@@ -384,6 +384,51 @@ fn print_info_result(msg: &guest_::GuestMessage, filename: &str, file_size: u64)
             println!("cluster_size: {}", info.cluster_size);
         }
 
+        // Format specific information (QCOW2)
+        if info.format == "qcow2" {
+            println!("Format specific information:");
+
+            // compat: "0.10" or "1.1" (default to "0.10" for v2 if not set)
+            let compat = if info.qcow2_info.compat.is_empty() {
+                "0.10"
+            } else {
+                info.qcow2_info.compat.as_str()
+            };
+            let is_v3 = compat == "1.1";
+            println!("    compat: {}", compat);
+
+            // compression type (always shown)
+            let compression = if info.qcow2_info.compression_type.is_empty() {
+                "zlib"
+            } else {
+                info.qcow2_info.compression_type.as_str()
+            };
+            println!("    compression type: {}", compression);
+
+            // lazy refcounts (only for v3/1.1 compat)
+            if is_v3 {
+                println!("    lazy refcounts: {}", info.qcow2_info.lazy_refcounts);
+            }
+
+            // refcount bits (default to 16 if not set)
+            let refcount_bits = if info.qcow2_info.refcount_bits == 0 {
+                16
+            } else {
+                info.qcow2_info.refcount_bits
+            };
+            println!("    refcount bits: {}", refcount_bits);
+
+            // corrupt flag (only for v3/1.1 compat)
+            if is_v3 {
+                println!("    corrupt: {}", info.qcow2_info.corrupt);
+            }
+
+            // extended l2 (only for v3/1.1 compat)
+            if is_v3 {
+                println!("    extended l2: {}", info.qcow2_info.extended_l2);
+            }
+        }
+
         // Backing file (if present)
         if info.flags & (1 << 0) != 0 && !info.backing_file.is_empty() {
             println!("backing file: {}", info.backing_file);

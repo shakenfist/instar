@@ -104,14 +104,83 @@ pub struct CallTable {
         *const u8, // backing_file
         *const u8, // external_data_file
     ),
+
+    /// Send info result message with QCOW2-specific information.
+    /// Args: format (null-terminated), version, virtual_size, actual_size,
+    ///       cluster_size, flags, backing_file (null-terminated),
+    ///       external_data_file (null-terminated), qcow2_info pointer
+    pub send_info_result_qcow2: unsafe extern "C" fn(
+        *const u8,        // format
+        u32,              // version
+        u64,              // virtual_size
+        u64,              // actual_size
+        u32,              // cluster_size
+        u32,              // flags
+        *const u8,        // backing_file
+        *const u8,        // external_data_file
+        *const Qcow2Info, // qcow2_info
+    ),
+}
+
+/// QCOW2 format-specific information (FFI-safe).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Qcow2Info {
+    /// Compatibility version: 0 = "0.10", 1 = "1.1"
+    pub compat: u8,
+    /// Compression type: 0 = zlib, 1 = zstd
+    pub compression_type: u8,
+    /// Whether lazy refcounts are enabled
+    pub lazy_refcounts: bool,
+    /// Whether the image is marked corrupt
+    pub corrupt: bool,
+    /// Whether extended L2 entries are used
+    pub extended_l2: bool,
+    /// Padding for alignment
+    pub _pad: [u8; 3],
+    /// Number of refcount bits (typically 16)
+    pub refcount_bits: u32,
+}
+
+impl Qcow2Info {
+    /// Create new QCOW2 info with defaults
+    pub const fn new() -> Self {
+        Self {
+            compat: 0,
+            compression_type: 0,
+            lazy_refcounts: false,
+            corrupt: false,
+            extended_l2: false,
+            _pad: [0; 3],
+            refcount_bits: 16,
+        }
+    }
+
+    /// Get compat string for this info
+    pub fn compat_str(&self) -> &'static str {
+        match self.compat {
+            0 => "0.10",
+            1 => "1.1",
+            _ => "unknown",
+        }
+    }
+
+    /// Get compression type string for this info
+    pub fn compression_type_str(&self) -> &'static str {
+        match self.compression_type {
+            0 => "zlib",
+            1 => "zstd",
+            _ => "unknown",
+        }
+    }
 }
 
 impl CallTable {
     /// Magic value indicating a valid call table
     pub const MAGIC: u32 = 0x494D4147; // "IMAG"
 
-    /// Current ABI version (bumped for send_info_result addition)
-    pub const VERSION: u32 = 3;
+    /// Current ABI version (bumped for send_info_result_qcow2 addition)
+    pub const VERSION: u32 = 4;
 }
 
 // ============================================================================

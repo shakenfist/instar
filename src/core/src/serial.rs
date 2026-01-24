@@ -227,3 +227,39 @@ pub fn send_info_result(
     );
     send_message(&msg);
 }
+
+/// Send an info result message with QCOW2-specific information
+#[allow(clippy::too_many_arguments)]
+pub fn send_info_result_qcow2(
+    format: &str,
+    version: u32,
+    virtual_size: u64,
+    actual_size: u64,
+    cluster_size: u32,
+    flags: u32,
+    backing_file: &str,
+    external_data_file: &str,
+    qcow2_info: &shared::Qcow2Info,
+) {
+    let qcow2_data = guest_protocol::Qcow2InfoData {
+        compat: qcow2_info.compat_str(),
+        compression_type: qcow2_info.compression_type_str(),
+        lazy_refcounts: qcow2_info.lazy_refcounts,
+        refcount_bits: qcow2_info.refcount_bits,
+        corrupt: qcow2_info.corrupt,
+        extended_l2: qcow2_info.extended_l2,
+    };
+
+    let msg = guest_protocol::info_result_message_with_qcow2(
+        format,
+        version,
+        virtual_size,
+        actual_size,
+        cluster_size,
+        flags,
+        backing_file,
+        external_data_file,
+        &qcow2_data,
+    );
+    send_message(&msg);
+}
