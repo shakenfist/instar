@@ -269,15 +269,27 @@ impl VirtioBlock {
         self.avail_idx = avail_idx.wrapping_add(1);
         self.write_reg(reg::QUEUE_NOTIFY, 0);
 
+        // Wait for device to process the request with timeout.
+        // In bare-metal no_std, we use iteration count as a timeout mechanism.
+        // 100M iterations is generous - typical I/O completes in <1M iterations.
+        const MAX_WAIT_ITERATIONS: u64 = 100_000_000;
+
         let expected_used_idx = avail_idx.wrapping_add(1);
-        loop {
+        let mut timed_out = true;
+        for _ in 0..MAX_WAIT_ITERATIONS {
             unsafe {
                 let used_idx = read_volatile((self.used_base + 2) as *const u16);
                 if used_idx == expected_used_idx {
+                    timed_out = false;
                     break;
                 }
             }
             core::hint::spin_loop();
+        }
+
+        if timed_out {
+            send_error("timeout", self.name, sector, 0xDEAD);
+            return false;
         }
 
         let int_status = self.read_reg(reg::INTERRUPT_STATUS);
