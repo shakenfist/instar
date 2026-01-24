@@ -20,6 +20,7 @@
 //! - InfoResult reading for info operations
 
 mod backing;
+mod error;
 mod io_thread;
 mod ioevent;
 mod kvm_stats;
