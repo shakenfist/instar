@@ -31,8 +31,8 @@ const KVM_IOEVENTFD_FLAG_DATAMATCH: u32 = 1;
 const KVM_IOEVENTFD_FLAG_PIO: u32 = 2;
 const KVM_IOEVENTFD_FLAG_DEASSIGN: u32 = 4;
 
-/// QUEUE_NOTIFY register offset (from mmio.rs)
-const QUEUE_NOTIFY_OFFSET: u64 = 0x50;
+/// QUEUE_NOTIFY register offset (from shared crate)
+const QUEUE_NOTIFY_OFFSET: u64 = shared::virtio::reg::QUEUE_NOTIFY;
 
 /// Manages ioeventfd for a virtio device's queue notification.
 pub struct IoEvent {

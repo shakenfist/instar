@@ -5,6 +5,8 @@
 
 #![no_std]
 
+pub mod virtio;
+
 /// Address where the call table is located (set by core)
 pub const CALL_TABLE_ADDR: usize = 0x00018000;
 
@@ -316,6 +318,12 @@ pub struct InfoResult {
 
     /// Length of external data file path (0 if none)
     pub external_data_len: u16,
+}
+
+impl Default for InfoResult {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InfoResult {

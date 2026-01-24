@@ -1,7 +1,11 @@
 //! Virtio block device abstraction for the core guest.
+//!
+//! Register constants are imported from the shared crate to ensure consistency
+//! between guest and host code.
 
 use core::ptr::{read_volatile, write_volatile};
 
+use shared::virtio as shared_virtio;
 use shared::MAX_SECTOR_SIZE;
 
 use crate::serial::{send_capacity, send_error, send_init};
@@ -9,45 +13,52 @@ use crate::serial::{send_capacity, send_error, send_init};
 // DMA pool base address
 const DMA_POOL_BASE: usize = 0x200000;
 
-// Virtio MMIO register offsets
+// Virtio MMIO register offsets (re-exported as usize for pointer arithmetic)
 mod reg {
-    pub const MAGIC_VALUE: usize = 0x000;
-    pub const VERSION: usize = 0x004;
-    pub const DEVICE_ID: usize = 0x008;
-    pub const DEVICE_FEATURES: usize = 0x010;
-    pub const DEVICE_FEATURES_SEL: usize = 0x014;
-    pub const DRIVER_FEATURES: usize = 0x020;
-    pub const DRIVER_FEATURES_SEL: usize = 0x024;
-    pub const QUEUE_SEL: usize = 0x030;
-    pub const QUEUE_NUM_MAX: usize = 0x034;
-    pub const QUEUE_NUM: usize = 0x038;
-    pub const QUEUE_READY: usize = 0x044;
-    pub const QUEUE_NOTIFY: usize = 0x050;
-    pub const INTERRUPT_STATUS: usize = 0x060;
-    pub const INTERRUPT_ACK: usize = 0x064;
-    pub const STATUS: usize = 0x070;
-    pub const QUEUE_DESC_LOW: usize = 0x080;
-    pub const QUEUE_DESC_HIGH: usize = 0x084;
-    pub const QUEUE_DRIVER_LOW: usize = 0x090;
-    pub const QUEUE_DRIVER_HIGH: usize = 0x094;
-    pub const QUEUE_DEVICE_LOW: usize = 0x0A0;
-    pub const QUEUE_DEVICE_HIGH: usize = 0x0A4;
-    pub const CONFIG: usize = 0x100;
+    use super::shared_virtio::reg as shared_reg;
+
+    pub const MAGIC_VALUE: usize = shared_reg::MAGIC_VALUE as usize;
+    pub const VERSION: usize = shared_reg::VERSION as usize;
+    pub const DEVICE_ID: usize = shared_reg::DEVICE_ID as usize;
+    pub const DEVICE_FEATURES: usize = shared_reg::DEVICE_FEATURES as usize;
+    pub const DEVICE_FEATURES_SEL: usize = shared_reg::DEVICE_FEATURES_SEL as usize;
+    pub const DRIVER_FEATURES: usize = shared_reg::DRIVER_FEATURES as usize;
+    pub const DRIVER_FEATURES_SEL: usize = shared_reg::DRIVER_FEATURES_SEL as usize;
+    pub const QUEUE_SEL: usize = shared_reg::QUEUE_SEL as usize;
+    pub const QUEUE_NUM_MAX: usize = shared_reg::QUEUE_NUM_MAX as usize;
+    pub const QUEUE_NUM: usize = shared_reg::QUEUE_NUM as usize;
+    pub const QUEUE_READY: usize = shared_reg::QUEUE_READY as usize;
+    pub const QUEUE_NOTIFY: usize = shared_reg::QUEUE_NOTIFY as usize;
+    pub const INTERRUPT_STATUS: usize = shared_reg::INTERRUPT_STATUS as usize;
+    pub const INTERRUPT_ACK: usize = shared_reg::INTERRUPT_ACK as usize;
+    pub const STATUS: usize = shared_reg::STATUS as usize;
+    pub const QUEUE_DESC_LOW: usize = shared_reg::QUEUE_DESC_LOW as usize;
+    pub const QUEUE_DESC_HIGH: usize = shared_reg::QUEUE_DESC_HIGH as usize;
+    pub const QUEUE_DRIVER_LOW: usize = shared_reg::QUEUE_DRIVER_LOW as usize;
+    pub const QUEUE_DRIVER_HIGH: usize = shared_reg::QUEUE_DRIVER_HIGH as usize;
+    pub const QUEUE_DEVICE_LOW: usize = shared_reg::QUEUE_DEVICE_LOW as usize;
+    pub const QUEUE_DEVICE_HIGH: usize = shared_reg::QUEUE_DEVICE_HIGH as usize;
+    pub const CONFIG: usize = shared_reg::CONFIG as usize;
 }
 
+// Device status bits (re-exported as u32 for write_reg compatibility)
 mod status {
-    pub const ACKNOWLEDGE: u32 = 1;
-    pub const DRIVER: u32 = 2;
-    pub const DRIVER_OK: u32 = 4;
-    pub const FEATURES_OK: u32 = 8;
+    use shared::virtio::status as shared_status;
+
+    pub const ACKNOWLEDGE: u32 = shared_status::ACKNOWLEDGE as u32;
+    pub const DRIVER: u32 = shared_status::DRIVER as u32;
+    pub const DRIVER_OK: u32 = shared_status::DRIVER_OK as u32;
+    pub const FEATURES_OK: u32 = shared_status::FEATURES_OK as u32;
 }
 
-const VIRTIO_BLK_T_IN: u32 = 0;
-const VIRTIO_BLK_T_OUT: u32 = 1;
-const VIRTIO_BLK_S_OK: u8 = 0;
-const VIRTQ_DESC_F_NEXT: u16 = 1;
-const VIRTQ_DESC_F_WRITE: u16 = 2;
-const QUEUE_SIZE: u16 = 256;
+// Use shared constants directly where types match
+use shared_virtio::desc_flags::{NEXT as VIRTQ_DESC_F_NEXT, WRITE as VIRTQ_DESC_F_WRITE};
+use shared_virtio::request_status::OK as VIRTIO_BLK_S_OK;
+use shared_virtio::request_type::{IN as VIRTIO_BLK_T_IN, OUT as VIRTIO_BLK_T_OUT};
+use shared_virtio::QUEUE_SIZE_MAX;
+
+// Use shared queue size
+const QUEUE_SIZE: u16 = QUEUE_SIZE_MAX;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -106,19 +117,19 @@ impl VirtioBlock {
 
         send_init("probe", name, mmio_base as u64);
         let magic = dev.read_reg(reg::MAGIC_VALUE);
-        if magic != 0x74726976 {
+        if magic != shared_virtio::MAGIC {
             send_error("probe", name, 0, magic);
             return None;
         }
 
         let version = dev.read_reg(reg::VERSION);
-        if version != 2 {
+        if version != shared_virtio::VERSION {
             send_error("version", name, 0, version);
             return None;
         }
 
         let device_id = dev.read_reg(reg::DEVICE_ID);
-        if device_id != 2 {
+        if device_id != shared_virtio::DEVICE_ID_BLOCK {
             send_error("device_id", name, 0, device_id);
             return None;
         }

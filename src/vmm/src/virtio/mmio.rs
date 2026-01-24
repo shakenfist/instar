@@ -1,72 +1,61 @@
 //! Virtio MMIO register definitions and handling.
 //!
 //! Per VIRTIO 1.1 specification, section 4.2.2.
+//!
+//! Register constants are imported from the shared crate to ensure consistency
+//! between guest and host code. Local re-exports provide the u32 type expected
+//! by the VMM's MMIO handling code.
 
-/// MMIO register offsets
+use shared::virtio as shared_virtio;
+
+/// MMIO register offsets (re-exported as u32 for MMIO handling).
 pub mod reg {
-    pub const MAGIC_VALUE: u32 = 0x000;
-    pub const VERSION: u32 = 0x004;
-    pub const DEVICE_ID: u32 = 0x008;
-    pub const VENDOR_ID: u32 = 0x00C;
-    pub const DEVICE_FEATURES: u32 = 0x010;
-    pub const DEVICE_FEATURES_SEL: u32 = 0x014;
-    pub const DRIVER_FEATURES: u32 = 0x020;
-    pub const DRIVER_FEATURES_SEL: u32 = 0x024;
-    pub const QUEUE_SEL: u32 = 0x030;
-    pub const QUEUE_NUM_MAX: u32 = 0x034;
-    pub const QUEUE_NUM: u32 = 0x038;
-    pub const QUEUE_READY: u32 = 0x044;
-    pub const QUEUE_NOTIFY: u32 = 0x050;
-    pub const INTERRUPT_STATUS: u32 = 0x060;
-    pub const INTERRUPT_ACK: u32 = 0x064;
-    pub const STATUS: u32 = 0x070;
-    pub const QUEUE_DESC_LOW: u32 = 0x080;
-    pub const QUEUE_DESC_HIGH: u32 = 0x084;
-    pub const QUEUE_DRIVER_LOW: u32 = 0x090;
-    pub const QUEUE_DRIVER_HIGH: u32 = 0x094;
-    pub const QUEUE_DEVICE_LOW: u32 = 0x0A0;
-    pub const QUEUE_DEVICE_HIGH: u32 = 0x0A4;
-    pub const CONFIG_GENERATION: u32 = 0x0FC;
-    pub const CONFIG: u32 = 0x100;
+    use super::shared_virtio::reg as shared_reg;
+
+    pub const MAGIC_VALUE: u32 = shared_reg::MAGIC_VALUE as u32;
+    pub const VERSION: u32 = shared_reg::VERSION as u32;
+    pub const DEVICE_ID: u32 = shared_reg::DEVICE_ID as u32;
+    pub const VENDOR_ID: u32 = shared_reg::VENDOR_ID as u32;
+    pub const DEVICE_FEATURES: u32 = shared_reg::DEVICE_FEATURES as u32;
+    pub const DEVICE_FEATURES_SEL: u32 = shared_reg::DEVICE_FEATURES_SEL as u32;
+    pub const DRIVER_FEATURES: u32 = shared_reg::DRIVER_FEATURES as u32;
+    pub const DRIVER_FEATURES_SEL: u32 = shared_reg::DRIVER_FEATURES_SEL as u32;
+    pub const QUEUE_SEL: u32 = shared_reg::QUEUE_SEL as u32;
+    pub const QUEUE_NUM_MAX: u32 = shared_reg::QUEUE_NUM_MAX as u32;
+    pub const QUEUE_NUM: u32 = shared_reg::QUEUE_NUM as u32;
+    pub const QUEUE_READY: u32 = shared_reg::QUEUE_READY as u32;
+    pub const QUEUE_NOTIFY: u32 = shared_reg::QUEUE_NOTIFY as u32;
+    pub const INTERRUPT_STATUS: u32 = shared_reg::INTERRUPT_STATUS as u32;
+    pub const INTERRUPT_ACK: u32 = shared_reg::INTERRUPT_ACK as u32;
+    pub const STATUS: u32 = shared_reg::STATUS as u32;
+    pub const QUEUE_DESC_LOW: u32 = shared_reg::QUEUE_DESC_LOW as u32;
+    pub const QUEUE_DESC_HIGH: u32 = shared_reg::QUEUE_DESC_HIGH as u32;
+    pub const QUEUE_DRIVER_LOW: u32 = shared_reg::QUEUE_DRIVER_LOW as u32;
+    pub const QUEUE_DRIVER_HIGH: u32 = shared_reg::QUEUE_DRIVER_HIGH as u32;
+    pub const QUEUE_DEVICE_LOW: u32 = shared_reg::QUEUE_DEVICE_LOW as u32;
+    pub const QUEUE_DEVICE_HIGH: u32 = shared_reg::QUEUE_DEVICE_HIGH as u32;
+    pub const CONFIG_GENERATION: u32 = shared_reg::CONFIG_GENERATION as u32;
+    pub const CONFIG: u32 = shared_reg::CONFIG as u32;
 }
 
-/// Magic value for virtio MMIO devices ("virt")
-pub const MAGIC: u32 = 0x74726976;
+// Re-export shared constants directly
+pub use shared_virtio::DEVICE_ID_BLOCK;
+pub use shared_virtio::MAGIC;
+pub use shared_virtio::QUEUE_SIZE_MAX;
+pub use shared_virtio::VENDOR_ID;
+pub use shared_virtio::VERSION;
 
-/// Version (2 = modern virtio)
-pub const VERSION: u32 = 2;
-
-/// Device ID for block device
-pub const DEVICE_ID_BLOCK: u32 = 2;
-
-/// Our vendor ID
-pub const VENDOR_ID: u32 = 0x00001AF4; // Red Hat
-
-/// Device status bits (defined for completeness per VIRTIO 1.1 spec)
-#[allow(dead_code)]
+/// Device status bits (re-exported from shared crate for API completeness)
+#[allow(unused_imports)]
 pub mod status {
-    pub const ACKNOWLEDGE: u8 = 1;
-    pub const DRIVER: u8 = 2;
-    pub const DRIVER_OK: u8 = 4;
-    pub const FEATURES_OK: u8 = 8;
-    pub const DEVICE_NEEDS_RESET: u8 = 64;
-    pub const FAILED: u8 = 128;
+    pub use shared::virtio::status::*;
 }
 
-/// Block device feature bits (defined for completeness per VIRTIO 1.1 spec)
-#[allow(dead_code)]
+/// Block device feature bits (re-exported from shared crate)
+#[allow(unused_imports)]
 pub mod features {
-    pub const VIRTIO_BLK_F_SIZE_MAX: u64 = 1 << 1;
-    pub const VIRTIO_BLK_F_SEG_MAX: u64 = 1 << 2;
-    pub const VIRTIO_BLK_F_RO: u64 = 1 << 5;
-    pub const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
-    pub const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
-    pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
-    pub const VIRTIO_F_RING_PACKED: u64 = 1 << 34;
+    pub use shared::virtio::features::*;
 }
-
-/// Maximum queue size
-pub const QUEUE_SIZE_MAX: u16 = 256;
 
 /// Virtqueue state
 #[derive(Debug, Default)]
