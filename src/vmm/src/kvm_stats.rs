@@ -29,6 +29,7 @@
 use std::os::unix::io::AsRawFd;
 
 use kvm_ioctls::Kvm;
+use log::debug;
 
 /// KVM capability for binary statistics (value from Linux kernel headers).
 /// This is KVM_CAP_BINARY_STATS_FD = 203.
@@ -136,12 +137,12 @@ impl KvmStatsChecker {
     /// Display capability status.
     pub fn display_status(&self) {
         if self.supported {
-            println!("KVM binary statistics: supported");
-            println!("  Note: kvm-ioctls 0.19 does not expose stats_fd() yet.");
-            println!("  Using internal VMM counters for statistics.");
+            debug!("KVM binary statistics: supported");
+            debug!("  Note: kvm-ioctls 0.19 does not expose stats_fd() yet.");
+            debug!("  Using internal VMM counters for statistics.");
         } else {
-            println!("KVM binary statistics: not supported by kernel");
-            println!("  Using internal VMM counters for statistics.");
+            debug!("KVM binary statistics: not supported by kernel");
+            debug!("  Using internal VMM counters for statistics.");
         }
     }
 }

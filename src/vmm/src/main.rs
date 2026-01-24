@@ -36,6 +36,7 @@ use guest_protocol::{
 };
 use kvm_bindings::{kvm_regs, kvm_segment, kvm_sregs, kvm_userspace_memory_region};
 use kvm_ioctls::{Kvm, VcpuExit};
+use log::{debug, info};
 use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use backing::BackingStore;
@@ -311,6 +312,44 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
     format!("[{}] {}", level, payload_str)
 }
 
+/// Print InfoResult in a user-friendly format (for non-verbose output)
+fn print_info_result(msg: &guest_::GuestMessage) {
+    if let Some(guest_::GuestMessage_::Payload::InfoResult(info)) = &msg.payload {
+        println!("image: {}", info.format);
+        if info.version > 0 {
+            println!("format version: {}", info.version);
+        }
+        println!("virtual size: {} bytes", info.virtual_size);
+        println!("actual size: {} bytes", info.actual_size);
+        if info.cluster_size > 0 {
+            println!("cluster size: {} bytes", info.cluster_size);
+        }
+
+        // Decode flags
+        if info.flags & (1 << 0) != 0 {
+            println!("backing file: {}", info.backing_file);
+        }
+        if info.flags & (1 << 1) != 0 {
+            println!("external data file: {}", info.external_data_file);
+        }
+        if info.flags & (1 << 2) != 0 {
+            println!("encrypted: yes");
+        }
+        if info.flags & (1 << 3) != 0 {
+            println!("compressed: yes");
+        }
+        if info.flags & (1 << 4) != 0 {
+            println!("snapshots: yes");
+        }
+        if info.flags & (1 << 5) != 0 {
+            println!("dirty: yes");
+        }
+        if info.flags & (1 << 6) != 0 {
+            println!("corrupt: yes");
+        }
+    }
+}
+
 /// Get the directory containing the imago executable
 fn get_binary_dir() -> std::path::PathBuf {
     std::env::current_exe()
@@ -329,6 +368,10 @@ fn get_binary_path(name: &str) -> std::path::PathBuf {
 #[command(name = "imago")]
 #[command(about = "Safe, sandboxed disk image operations")]
 struct Cli {
+    /// Enable verbose output (debug information about KVM setup, memory, etc.)
+    #[arg(short, long, global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -399,6 +442,16 @@ struct CopyArgs {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let verbose = cli.verbose;
+
+    // Initialize logger based on --verbose flag
+    if verbose {
+        env_logger::Builder::new()
+            .filter_level(log::LevelFilter::Debug)
+            .format_target(false)
+            .format_timestamp(None)
+            .init();
+    }
 
     match cli.command {
         Commands::Info(args) => run_info(args),
@@ -423,7 +476,7 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Load core binary (device init, call table setup)
     let core_code = load_guest_binary(core_path.to_str().unwrap())?;
-    println!(
+    debug!(
         "Loaded core binary: {} bytes from {}",
         core_code.len(),
         core_path.display()
@@ -431,7 +484,7 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Load operation binary (info)
     let operation_code = load_guest_binary(operation_path.to_str().unwrap())?;
-    println!(
+    debug!(
         "Loaded operation binary: {} bytes from {}",
         operation_code.len(),
         operation_path.display()
@@ -439,7 +492,7 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Get input file size
     let input_size = std::fs::metadata(&args.input)?.len();
-    println!(
+    debug!(
         "Input file: {} ({} bytes, {} sectors @ {} bytes/sector)",
         args.input,
         input_size,
@@ -452,7 +505,7 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Open KVM
     let kvm = Kvm::new()?;
-    println!("KVM API version: {}", kvm.get_api_version());
+    debug!("KVM API version: {}", kvm.get_api_version());
 
     // Check KVM binary statistics capability
     let kvm_stats_checker = kvm_stats::KvmStatsChecker::new(&kvm);
@@ -460,11 +513,11 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Create VM
     let vm = kvm.create_vm()?;
-    println!("Created VM");
+    debug!("Created VM");
 
     // Create guest memory
     let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
-    println!("Allocated {} bytes of guest memory", GUEST_MEM_SIZE);
+    debug!("Allocated {} bytes of guest memory", GUEST_MEM_SIZE);
 
     // Get the memory region for KVM registration
     let region = guest_mem.find_region(GuestAddress(0)).unwrap();
@@ -481,30 +534,30 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         vm.set_user_memory_region(mem_region)?;
     }
-    println!("Configured memory region");
+    debug!("Configured memory region");
 
     // Set up GDT
     setup_gdt(&guest_mem)?;
-    println!("Set up GDT at 0x{:x}", GDT_BASE);
+    debug!("Set up GDT at 0x{:x}", GDT_BASE);
 
     // Set up page tables (identity map)
     setup_page_tables(&guest_mem)?;
-    println!("Set up page tables at 0x{:x}", PAGE_TABLE_BASE);
+    debug!("Set up page tables at 0x{:x}", PAGE_TABLE_BASE);
 
     // Load core binary at GUEST_CODE_BASE (0x10000)
     guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
-    println!("Loaded core binary at 0x{:x}", GUEST_CODE_BASE);
+    debug!("Loaded core binary at 0x{:x}", GUEST_CODE_BASE);
 
     // Load operation binary at OPERATION_LOAD_ADDR (0x20000)
     guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
-    println!("Loaded operation binary at 0x{:x}", OPERATION_LOAD_ADDR);
+    debug!("Loaded operation binary at 0x{:x}", OPERATION_LOAD_ADDR);
 
     // Write InfoConfig at OPERATION_CONFIG_ADDR (0x19000)
     // Layout: magic (u32), flags (u32)
     let info_flags: u32 = INFO_CONFIG_FLAG_DETAILED | INFO_CONFIG_FLAG_SECURITY_CHECK;
     guest_mem.write_obj(INFO_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
     guest_mem.write_obj(info_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
-    println!(
+    debug!(
         "Wrote info config at 0x{:x} (flags=0x{:x})",
         OPERATION_CONFIG_ADDR, info_flags
     );
@@ -518,11 +571,11 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
         INPUT_MMIO_BASE,
         INPUT_VQ_BASE,
     );
-    println!(
+    debug!(
         "Created virtio-block device at MMIO 0x{:x}",
         INPUT_MMIO_BASE
     );
-    println!("  Sector size: {} bytes", input_device.sector_size());
+    debug!("  Sector size: {} bytes", input_device.sector_size());
 
     // Wrap device in Arc<Mutex<>> for potential sharing with I/O thread
     let input_device = Arc::new(Mutex::new(input_device));
@@ -540,7 +593,7 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     match input_evt.register(&vm) {
         Ok(()) => {
-            println!("ioeventfd: enabled for queue notifications (with I/O thread)");
+            debug!("ioeventfd: enabled for queue notifications (with I/O thread)");
 
             // Configure devices for I/O thread (info: 1 input device only)
             let devices = vec![IoDevice {
@@ -557,7 +610,7 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
             ));
         }
         Err(e) => {
-            println!(
+            debug!(
                 "ioeventfd: failed to register ({:?}), falling back to VM exits",
                 e
             );
@@ -566,18 +619,18 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Create vCPU
     let mut vcpu = vm.create_vcpu(0)?;
-    println!("Created vCPU");
+    debug!("Created vCPU");
 
     // Set up registers
     let mut sregs = vcpu.get_sregs()?;
     setup_sregs(&mut sregs);
     vcpu.set_sregs(&sregs)?;
-    println!("Configured special registers for long mode");
+    debug!("Configured special registers for long mode");
 
     let mut regs = vcpu.get_regs()?;
     setup_regs(&mut regs);
     vcpu.set_regs(&regs)?;
-    println!(
+    debug!(
         "Configured general registers (RIP=0x{:x}, RSP=0x{:x})",
         regs.rip, regs.rsp
     );
@@ -594,20 +647,20 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Queue the configuration message for transmission (info uses only input device)
     let config = vmm_config_input_only(args.sector_size);
     serial_transmitter.queue_config(&config);
-    println!(
+    debug!(
         "Queued configuration message ({} bytes) for guest",
         serial_transmitter.buffer.len()
     );
 
     // Run the vCPU loop
-    println!("\n--- Starting guest execution ---\n");
+    debug!("Starting guest execution");
 
     loop {
         match vcpu.run()? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().unwrap().record_hlt();
-                println!("\n--- Guest executed HLT ---");
-                println!("Info operation completed successfully!");
+                info!("Guest executed HLT");
+                debug!("Info operation completed successfully!");
                 break;
             }
             VcpuExit::IoOut(port, data) => {
@@ -615,17 +668,26 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
                 if port == SERIAL_PORT {
                     for &byte in data {
                         if let Some(msg) = serial_decoder.add_byte(byte) {
-                            println!("{}", format_message(&msg));
+                            // InfoResult is always shown, other messages only in verbose mode
+                            let is_info_result = matches!(
+                                &msg.payload,
+                                Some(guest_::GuestMessage_::Payload::InfoResult(_))
+                            );
+                            if is_info_result {
+                                print_info_result(&msg);
+                            } else {
+                                debug!("{}", format_message(&msg));
+                            }
                         }
                     }
                 } else if port == DEBUG_PORT {
                     for &byte in data {
                         if let Some(line) = debug_buffer.add_byte(byte) {
-                            println!("[DEBUG] {}", line);
+                            debug!("[GUEST] {}", line);
                         }
                     }
                 } else {
-                    println!("IO OUT: port=0x{:x}, data={:?}", port, data);
+                    debug!("IO OUT: port=0x{:x}, data={:?}", port, data);
                 }
             }
             VcpuExit::IoIn(port, data) => {
@@ -655,7 +717,7 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap()
                         .mmio_read((addr - INPUT_MMIO_BASE) as u32)
                 } else {
-                    println!("Unknown MMIO read at 0x{:x}", addr);
+                    debug!("Unknown MMIO read at 0x{:x}", addr);
                     0
                 };
                 write_mmio_data(data, value);
@@ -675,27 +737,27 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
                             .record_read(io_stats.bytes_read, io_stats.sectors_read);
                     }
                 } else {
-                    println!("Unknown MMIO write at 0x{:x}", addr);
+                    debug!("Unknown MMIO write at 0x{:x}", addr);
                 }
             }
             VcpuExit::Shutdown => {
                 vmm_stats.lock().unwrap().record_shutdown();
-                println!("\n--- VM Shutdown (triple fault?) ---");
+                eprintln!("\n--- VM Shutdown (triple fault?) ---");
                 let regs = vcpu.get_regs()?;
                 let sregs = vcpu.get_sregs()?;
-                println!(
+                eprintln!(
                     "RIP=0x{:x}, RSP=0x{:x}, RBP=0x{:x}",
                     regs.rip, regs.rsp, regs.rbp
                 );
-                println!(
+                eprintln!(
                     "CR0=0x{:x}, CR3=0x{:x}, CR4=0x{:x}",
                     sregs.cr0, sregs.cr3, sregs.cr4
                 );
                 if regs.rsp < STACK_BASE || regs.rsp > STACK_TOP {
-                    println!();
-                    println!("*** LIKELY STACK OVERFLOW ***");
-                    println!("  RSP (0x{:x}) is outside stack region", regs.rsp);
-                    println!(
+                    eprintln!();
+                    eprintln!("*** LIKELY STACK OVERFLOW ***");
+                    eprintln!("  RSP (0x{:x}) is outside stack region", regs.rsp);
+                    eprintln!(
                         "  Stack region: 0x{:x} - 0x{:x} ({} bytes)",
                         STACK_BASE, STACK_TOP, STACK_SIZE
                     );
@@ -704,12 +766,12 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
             VcpuExit::FailEntry(reason, cpu) => {
                 vmm_stats.lock().unwrap().record_fail_entry();
-                println!("VM Entry Failed! reason=0x{:x}, cpu={}", reason, cpu);
+                eprintln!("VM Entry Failed! reason=0x{:x}, cpu={}", reason, cpu);
                 break;
             }
             exit => {
                 vmm_stats.lock().unwrap().record_unknown();
-                println!("Unexpected VM exit: {:?}", exit);
+                eprintln!("Unexpected VM exit: {:?}", exit);
                 break;
             }
         }
@@ -719,7 +781,9 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
         thread.stop();
     }
 
-    vmm_stats.lock().unwrap().display();
+    if log::log_enabled!(log::Level::Debug) {
+        vmm_stats.lock().unwrap().display();
+    }
 
     Ok(())
 }
@@ -749,7 +813,7 @@ fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Load core binary (device init, call table setup)
     let core_code = load_guest_binary(core_path.to_str().unwrap())?;
-    println!(
+    debug!(
         "Loaded core binary: {} bytes from {}",
         core_code.len(),
         core_path.display()
@@ -757,7 +821,7 @@ fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Load operation binary (copy)
     let operation_code = load_guest_binary(operation_path.to_str().unwrap())?;
-    println!(
+    debug!(
         "Loaded operation binary: {} bytes from {}",
         operation_code.len(),
         operation_path.display()
@@ -765,7 +829,7 @@ fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Get input file size
     let input_size = std::fs::metadata(&args.input)?.len();
-    println!(
+    debug!(
         "Input file: {} ({} bytes, {} sectors @ {} bytes/sector)",
         args.input,
         input_size,
@@ -790,7 +854,7 @@ fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         "pre-allocated"
     };
-    println!(
+    debug!(
         "Output file: {} (capacity {} bytes, {} sectors @ {} bytes/sector, {})",
         args.output,
         output_capacity,
@@ -801,16 +865,17 @@ fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Open KVM
     let kvm = Kvm::new()?;
-    println!("KVM API version: {}", kvm.get_api_version());
+    debug!("KVM API version: {}", kvm.get_api_version());
 
+    // Check KVM binary statistics capability
     let kvm_stats_checker = kvm_stats::KvmStatsChecker::new(&kvm);
     kvm_stats_checker.display_status();
 
     let vm = kvm.create_vm()?;
-    println!("Created VM");
+    debug!("Created VM");
 
     let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
-    println!("Allocated {} bytes of guest memory", GUEST_MEM_SIZE);
+    debug!("Allocated {} bytes of guest memory", GUEST_MEM_SIZE);
 
     let region = guest_mem.find_region(GuestAddress(0)).unwrap();
     let host_addr = region.as_ptr() as u64;
@@ -825,19 +890,19 @@ fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         vm.set_user_memory_region(mem_region)?;
     }
-    println!("Configured memory region");
+    debug!("Configured memory region");
 
     setup_gdt(&guest_mem)?;
-    println!("Set up GDT at 0x{:x}", GDT_BASE);
+    debug!("Set up GDT at 0x{:x}", GDT_BASE);
 
     setup_page_tables(&guest_mem)?;
-    println!("Set up page tables at 0x{:x}", PAGE_TABLE_BASE);
+    debug!("Set up page tables at 0x{:x}", PAGE_TABLE_BASE);
 
     guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
-    println!("Loaded core binary at 0x{:x}", GUEST_CODE_BASE);
+    debug!("Loaded core binary at 0x{:x}", GUEST_CODE_BASE);
 
     guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
-    println!("Loaded operation binary at 0x{:x}", OPERATION_LOAD_ADDR);
+    debug!("Loaded operation binary at 0x{:x}", OPERATION_LOAD_ADDR);
 
     // Write CopyConfig at OPERATION_CONFIG_ADDR
     let mut copy_flags: u32 = 0;
@@ -852,7 +917,7 @@ fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
     guest_mem.write_obj(copy_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
     guest_mem.write_obj(args.start_sector, GuestAddress(OPERATION_CONFIG_ADDR + 8))?;
     guest_mem.write_obj(args.sector_count, GuestAddress(OPERATION_CONFIG_ADDR + 16))?;
-    println!(
+    debug!(
         "Wrote copy config at 0x{:x} (flags=0x{:x}, start={}, count={})",
         OPERATION_CONFIG_ADDR, copy_flags, args.start_sector, args.sector_count
     );
@@ -874,11 +939,11 @@ fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
         OUTPUT_MMIO_BASE,
         OUTPUT_VQ_BASE,
     );
-    println!(
+    debug!(
         "Created virtio-block devices at MMIO 0x{:x} and 0x{:x}",
         INPUT_MMIO_BASE, OUTPUT_MMIO_BASE
     );
-    println!(
+    debug!(
         "  Input sector size: {} bytes, Output sector size: {} bytes",
         input_device.sector_size(),
         output_device.sector_size()
@@ -897,7 +962,7 @@ fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     match (input_evt.register(&vm), output_evt.register(&vm)) {
         (Ok(()), Ok(())) => {
-            println!("ioeventfd: enabled for queue notifications (with I/O thread)");
+            debug!("ioeventfd: enabled for queue notifications (with I/O thread)");
 
             // Configure devices for I/O thread (copy: 1 input + 1 output)
             let devices = vec![
@@ -921,7 +986,7 @@ fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
             ));
         }
         (Err(e), _) | (_, Err(e)) => {
-            println!(
+            debug!(
                 "ioeventfd: failed to register ({:?}), falling back to VM exits",
                 e
             );
@@ -929,17 +994,17 @@ fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut vcpu = vm.create_vcpu(0)?;
-    println!("Created vCPU");
+    debug!("Created vCPU");
 
     let mut sregs = vcpu.get_sregs()?;
     setup_sregs(&mut sregs);
     vcpu.set_sregs(&sregs)?;
-    println!("Configured special registers for long mode");
+    debug!("Configured special registers for long mode");
 
     let mut regs = vcpu.get_regs()?;
     setup_regs(&mut regs);
     vcpu.set_regs(&regs)?;
-    println!(
+    debug!(
         "Configured general registers (RIP=0x{:x}, RSP=0x{:x})",
         regs.rip, regs.rsp
     );
@@ -959,20 +1024,21 @@ fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
         100 => "none".to_string(),
         n => format!("every {}%", n),
     };
-    println!(
+    debug!(
         "Queued configuration message ({} bytes) for guest, progress: {}",
         serial_transmitter.buffer.len(),
         progress_desc
     );
 
-    println!("\n--- Starting guest execution ---\n");
+    // Run the vCPU loop
+    debug!("Starting guest execution");
 
     loop {
         match vcpu.run()? {
             VcpuExit::Hlt => {
                 vmm_stats.lock().unwrap().record_hlt();
-                println!("\n--- Guest executed HLT ---");
-                println!("Copy operation completed successfully!");
+                info!("Guest executed HLT");
+                debug!("Copy operation completed successfully!");
                 break;
             }
             VcpuExit::IoOut(port, data) => {
@@ -980,17 +1046,17 @@ fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
                 if port == SERIAL_PORT {
                     for &byte in data {
                         if let Some(msg) = serial_decoder.add_byte(byte) {
-                            println!("{}", format_message(&msg));
+                            debug!("{}", format_message(&msg));
                         }
                     }
                 } else if port == DEBUG_PORT {
                     for &byte in data {
                         if let Some(line) = debug_buffer.add_byte(byte) {
-                            println!("[DEBUG] {}", line);
+                            debug!("[GUEST] {}", line);
                         }
                     }
                 } else {
-                    println!("IO OUT: port=0x{:x}, data={:?}", port, data);
+                    debug!("IO OUT: port=0x{:x}, data={:?}", port, data);
                 }
             }
             VcpuExit::IoIn(port, data) => {
@@ -1026,7 +1092,7 @@ fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap()
                         .mmio_read((addr - OUTPUT_MMIO_BASE) as u32)
                 } else {
-                    println!("Unknown MMIO read at 0x{:x}", addr);
+                    debug!("Unknown MMIO read at 0x{:x}", addr);
                     0
                 };
                 write_mmio_data(data, value);
@@ -1057,62 +1123,62 @@ fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
                             .record_write(io_stats.bytes_written, io_stats.sectors_written);
                     }
                 } else {
-                    println!("Unknown MMIO write at 0x{:x}", addr);
+                    debug!("Unknown MMIO write at 0x{:x}", addr);
                 }
             }
             VcpuExit::Shutdown => {
                 vmm_stats.lock().unwrap().record_shutdown();
-                println!("\n--- VM Shutdown (triple fault?) ---");
+                eprintln!("\n--- VM Shutdown (triple fault?) ---");
                 let regs = vcpu.get_regs()?;
                 let sregs = vcpu.get_sregs()?;
-                println!(
+                eprintln!(
                     "RIP=0x{:x}, RSP=0x{:x}, RBP=0x{:x}",
                     regs.rip, regs.rsp, regs.rbp
                 );
-                println!(
+                eprintln!(
                     "CR0=0x{:x}, CR3=0x{:x}, CR4=0x{:x}",
                     sregs.cr0, sregs.cr3, sregs.cr4
                 );
                 if regs.rsp < STACK_BASE || regs.rsp > STACK_TOP {
-                    println!();
-                    println!("*** LIKELY STACK OVERFLOW ***");
-                    println!("  RSP (0x{:x}) is outside stack region", regs.rsp);
-                    println!(
+                    eprintln!();
+                    eprintln!("*** LIKELY STACK OVERFLOW ***");
+                    eprintln!("  RSP (0x{:x}) is outside stack region", regs.rsp);
+                    eprintln!(
                         "  Stack region: 0x{:x} - 0x{:x} ({} bytes)",
                         STACK_BASE, STACK_TOP, STACK_SIZE
                     );
                     if regs.rsp < STACK_BASE {
                         let underflow = STACK_BASE - regs.rsp;
-                        println!("  Stack underflowed by {} bytes", underflow);
+                        eprintln!("  Stack underflowed by {} bytes", underflow);
                     }
                 } else {
                     let stack_used = STACK_TOP - regs.rsp;
                     let stack_percent = (stack_used * 100) / STACK_SIZE;
-                    println!();
-                    println!(
+                    eprintln!();
+                    eprintln!(
                         "Stack usage: {} / {} bytes ({}%)",
                         stack_used, STACK_SIZE, stack_percent
                     );
                     if stack_percent > 90 {
-                        println!("*** WARNING: Stack was nearly exhausted ***");
+                        eprintln!("*** WARNING: Stack was nearly exhausted ***");
                     }
                 }
-                println!();
-                println!(
+                eprintln!();
+                eprintln!(
                     "Guest memory: {} bytes (0x{:x})",
                     GUEST_MEM_SIZE, GUEST_MEM_SIZE
                 );
-                println!("Code base: 0x{:x}", GUEST_CODE_BASE);
+                eprintln!("Code base: 0x{:x}", GUEST_CODE_BASE);
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
                 vmm_stats.lock().unwrap().record_fail_entry();
-                println!("VM Entry Failed! reason=0x{:x}, cpu={}", reason, cpu);
+                eprintln!("VM Entry Failed! reason=0x{:x}, cpu={}", reason, cpu);
                 break;
             }
             exit => {
                 vmm_stats.lock().unwrap().record_unknown();
-                println!("Unexpected VM exit: {:?}", exit);
+                eprintln!("Unexpected VM exit: {:?}", exit);
                 break;
             }
         }
@@ -1122,7 +1188,9 @@ fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
         thread.stop();
     }
 
-    vmm_stats.lock().unwrap().display();
+    if log::log_enabled!(log::Level::Debug) {
+        vmm_stats.lock().unwrap().display();
+    }
 
     Ok(())
 }

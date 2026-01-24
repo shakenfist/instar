@@ -16,6 +16,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 
 use kvm_bindings::kvm_ioeventfd;
 use kvm_ioctls::VmFd;
+use log::warn;
 use vmm_sys_util::eventfd::EventFd;
 
 /// KVM_IOEVENTFD ioctl number.
@@ -141,8 +142,8 @@ impl Drop for IoEvent {
         // Note: We can't unregister here because we don't have the VmFd.
         // The caller should ensure unregister() is called before dropping.
         if self.registered {
-            eprintln!(
-                "Warning: IoEvent dropped while still registered (mmio_base=0x{:x})",
+            warn!(
+                "IoEvent dropped while still registered (mmio_base=0x{:x})",
                 self.mmio_base
             );
         }

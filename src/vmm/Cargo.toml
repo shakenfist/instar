@@ -18,4 +18,6 @@ virtio-bindings = "0.2"
 vmm-sys-util = "0.12"
 clap = { version = "4.5", features = ["derive"] }
 libc = "0.2"
+log = "0.4"
+env_logger = "0.11"
 guest-protocol = { path = "../../crates/guest-protocol", features = ["std"] }
