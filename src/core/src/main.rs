@@ -252,17 +252,42 @@ unsafe extern "C" fn ct_send_info_result(
     );
 }
 
-/// Convert null-terminated C string to &str
+/// Convert null-terminated C string to &str.
+///
+/// # Safety
+///
+/// The caller must ensure:
+/// - `ptr` points to valid memory (or is null)
+/// - The memory remains valid for the returned lifetime
+///
+/// This function validates UTF-8 and returns an empty string if validation
+/// fails or if the string exceeds MAX_CSTR_LEN bytes.
 unsafe fn cstr_to_str(ptr: *const u8) -> &'static str {
+    // Maximum length to prevent unbounded reads on unterminated strings
+    const MAX_CSTR_LEN: usize = 4096;
+
     if ptr.is_null() {
         return "";
     }
+
+    // Find null terminator with length limit
     let mut len = 0;
-    while *ptr.add(len) != 0 {
+    while len < MAX_CSTR_LEN && *ptr.add(len) != 0 {
         len += 1;
     }
+
+    // If we hit the limit without finding null, return empty (unterminated string)
+    if len == MAX_CSTR_LEN && *ptr.add(len) != 0 {
+        return "";
+    }
+
     let slice = core::slice::from_raw_parts(ptr, len);
-    core::str::from_utf8_unchecked(slice)
+
+    // Validate UTF-8 instead of assuming it's valid
+    match core::str::from_utf8(slice) {
+        Ok(s) => s,
+        Err(_) => "", // Return empty string for invalid UTF-8
+    }
 }
 
 /// Halt the CPU
