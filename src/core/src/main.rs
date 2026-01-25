@@ -20,13 +20,13 @@ use core::panic::PanicInfo;
 use core::ptr::write_volatile;
 
 use shared::{
-    CallTable, Qcow2Info, CALL_TABLE_ADDR, OPERATION_CONFIG_ADDR, OPERATION_CONFIG_MAX_SIZE,
-    OPERATION_LOAD_ADDR,
+    CallTable, Qcow2Info, VmdkInfo, CALL_TABLE_ADDR, OPERATION_CONFIG_ADDR,
+    OPERATION_CONFIG_MAX_SIZE, OPERATION_LOAD_ADDR,
 };
 
 use crate::serial::{
     debug_print, read_config, send_complete, send_error, send_info_result, send_info_result_qcow2,
-    send_init, send_progress, DeviceConfig,
+    send_info_result_vmdk, send_init, send_progress, DeviceConfig,
 };
 use crate::virtio::VirtioBlock;
 
@@ -178,6 +178,7 @@ fn setup_call_table() {
         get_operation_config: ct_get_operation_config,
         send_info_result: ct_send_info_result,
         send_info_result_qcow2: ct_send_info_result_qcow2,
+        send_info_result_vmdk: ct_send_info_result_vmdk,
     };
 
     unsafe {
@@ -349,6 +350,43 @@ unsafe extern "C" fn ct_send_info_result_qcow2(
         backing_str,
         external_str,
         &qcow2_data,
+    );
+}
+
+/// Send info result message with VMDK-specific information.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn ct_send_info_result_vmdk(
+    format: *const u8,
+    version: u32,
+    virtual_size: u64,
+    actual_size: u64,
+    cluster_size: u32,
+    flags: u32,
+    backing_file: *const u8,
+    external_data_file: *const u8,
+    vmdk_info: *const VmdkInfo,
+) {
+    let format_str = cstr_to_str(format);
+    let backing_str = cstr_to_str(backing_file);
+    let external_str = cstr_to_str(external_data_file);
+
+    // Use default if null pointer
+    let vmdk_data = if vmdk_info.is_null() {
+        VmdkInfo::new()
+    } else {
+        *vmdk_info
+    };
+
+    send_info_result_vmdk(
+        format_str,
+        version,
+        virtual_size,
+        actual_size,
+        cluster_size,
+        flags,
+        backing_str,
+        external_str,
+        &vmdk_data,
     );
 }
 
