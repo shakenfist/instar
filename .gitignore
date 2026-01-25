@@ -3,6 +3,9 @@
 **/*.bin
 **/Cargo.lock
 
+# Cargo cache for docker builds
+.cargo-cache/
+
 # IDE
 .idea/
 .vscode/

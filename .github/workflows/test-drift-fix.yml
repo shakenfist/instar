@@ -1,0 +1,415 @@
+name: Fix test suite drift with Claude Code
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_turns:
+        description: 'Maximum Claude turns'
+        required: false
+        default: '200'
+        type: string
+      dry_run:
+        description: 'Dry run (test only, no PR)'
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    # Run weekly on Monday at 6am UTC
+    - cron: '0 6 * * 1'
+
+jobs:
+  test-and-fix:
+    runs-on: [self-hosted, claude-code]
+    timeout-minutes: 180
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Clean workspace
+        run: |
+          # Self-hosted runners don't auto-clean; remove leftover state
+          rm -rf ${GITHUB_WORKSPACE}/imago
+          rm -rf ${GITHUB_WORKSPACE}/imago-testdata
+          rm -f ${GITHUB_WORKSPACE}/*.txt
+
+      - name: Set environment variables
+        run: |
+          {
+            echo "DATESTAMP=$(date '+%Y%m%d')"
+            echo "DATEPRETTY=$(date '+%-d %B %Y')"
+          } >> $GITHUB_ENV
+
+      - name: Checkout imago
+        uses: actions/checkout@v4
+        with:
+          path: imago
+          fetch-depth: 0
+
+      - name: Checkout imago-testdata from GitLab
+        run: |
+          git clone --depth 1 \
+            http://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git \
+            imago-testdata
+
+      - name: Create working branch
+        run: |
+          cd ${GITHUB_WORKSPACE}/imago
+          git config --global user.name "shakenfist-bot"
+          git config --global user.email "bot@shakenfist.com"
+          # Delete local branch if it exists from previous run
+          git branch -D test-drift-fix-${DATESTAMP} 2>/dev/null || true
+          git checkout -b test-drift-fix-${DATESTAMP}
+
+      - name: Remove previous devcontainers, if any
+        run: |
+          docker image rm -f imago-build 2>/dev/null || true
+
+      - name: Build imago
+        env:
+          DOCKER_BUILDKIT: 1
+        run: |
+          cd ${GITHUB_WORKSPACE}/imago
+          set +e
+          make imago 2>&1 | tee ${GITHUB_WORKSPACE}/build-log.txt
+          build_exit_code=${PIPESTATUS[0]}
+          set -e
+          if [ ${build_exit_code} -ne 0 ]; then
+            echo "Build failed with exit code ${build_exit_code}"
+            exit ${build_exit_code}
+          fi
+
+      - name: Run initial tests
+        id: initial_test
+        continue-on-error: true
+        run: |
+          cd ${GITHUB_WORKSPACE}/imago
+          export IMAGO_TESTDATA_ROOT=${GITHUB_WORKSPACE}/imago-testdata
+
+          # Set up test venv without triggering imago rebuild
+          make test-venv
+
+          set +e
+          # Run tests directly, skipping make target's imago dependency
+          # Use PIPESTATUS to capture stestr exit code, not tee's
+          cd tests && .venv/bin/stestr run test_info_safe 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
+          test_exit_code=${PIPESTATUS[0]}
+          set -e
+
+          if [ ${test_exit_code} -eq 0 ]; then
+            echo "tests_passed=true" >> $GITHUB_OUTPUT
+          else
+            echo "tests_passed=false" >> $GITHUB_OUTPUT
+          fi
+
+          exit ${test_exit_code}
+
+      - name: Check for new unregistered images
+        id: new_images
+        run: |
+          cd ${GITHUB_WORKSPACE}/imago
+
+          # Find images in testdata not in manifest
+          python3 << 'EOF' > ${GITHUB_WORKSPACE}/new-images.txt
+          import json
+          import os
+          from pathlib import Path
+
+          testdata_root = os.environ.get('IMAGO_TESTDATA_ROOT',
+                                          '${GITHUB_WORKSPACE}/imago-testdata')
+          manifest_path = 'tests/manifest.json'
+
+          # Load manifest
+          with open(manifest_path) as f:
+              manifest = json.load(f)
+
+          registered_paths = {img['path'] for img in manifest['images']}
+
+          # Find image files in testdata (excluding .git)
+          image_extensions = {'.qcow2', '.vmdk', '.vhd', '.vhdx', '.img', '.raw'}
+          new_images = []
+
+          for root, dirs, files in os.walk(testdata_root):
+              # Skip .git
+              dirs[:] = [d for d in dirs if d != '.git']
+
+              for f in files:
+                  if any(f.endswith(ext) for ext in image_extensions):
+                      rel_path = os.path.relpath(os.path.join(root, f), testdata_root)
+                      if rel_path not in registered_paths:
+                          new_images.append(rel_path)
+
+          for img in sorted(new_images):
+              print(img)
+          EOF
+
+          if [ -s ${GITHUB_WORKSPACE}/new-images.txt ]; then
+            echo "new_images_found=true" >> $GITHUB_OUTPUT
+            echo "New images found:"
+            cat ${GITHUB_WORKSPACE}/new-images.txt
+          else
+            echo "new_images_found=false" >> $GITHUB_OUTPUT
+            echo "No new images found"
+          fi
+
+      - name: Exit early if nothing to do
+        if: |
+          steps.initial_test.outputs.tests_passed == 'true' &&
+          steps.new_images.outputs.new_images_found == 'false'
+        run: |
+          echo "All tests pass and no new images found. Nothing to do."
+          exit 0
+
+      - name: Prepare Claude prompt
+        if: |
+          steps.initial_test.outputs.tests_passed == 'false' ||
+          steps.new_images.outputs.new_images_found == 'true'
+        run: |
+          cat > ${GITHUB_WORKSPACE}/claude-prompt.txt << 'PROMPT_EOF'
+          The imago integration test suite needs attention. Please analyze and
+          fix any issues.
+
+          ## Context
+
+          imago is a safe drop-in replacement for qemu-img. The test suite
+          compares imago output against qemu-img output to verify compatibility.
+
+          ## Before You Start
+
+          1. Read AGENTS.md to understand the project structure and testing approach
+          2. Read the /imago-add-test-image skill at .claude/skills/imago-add-test-image.md
+          3. Read docs/quirks.md to understand known qemu-img compatibility quirks
+
+          PROMPT_EOF
+
+          # Add test failure context if tests failed
+          if [ "${{ steps.initial_test.outputs.tests_passed }}" == "false" ]; then
+            cat >> ${GITHUB_WORKSPACE}/claude-prompt.txt << 'PROMPT_EOF'
+
+          ## Test Failures
+
+          The following tests failed. Analyze the output differences and fix them:
+
+          PROMPT_EOF
+            cat ${GITHUB_WORKSPACE}/test-output.txt >> ${GITHUB_WORKSPACE}/claude-prompt.txt
+          fi
+
+          # Add new images context if found
+          if [ "${{ steps.new_images.outputs.new_images_found }}" == "true" ]; then
+            cat >> ${GITHUB_WORKSPACE}/claude-prompt.txt << 'PROMPT_EOF'
+
+          ## New Test Images
+
+          The following images exist in imago-testdata but are not registered
+          in the test manifest. For each image, determine if it should be added:
+
+          PROMPT_EOF
+            cat ${GITHUB_WORKSPACE}/new-images.txt >> ${GITHUB_WORKSPACE}/claude-prompt.txt
+
+            cat >> ${GITHUB_WORKSPACE}/claude-prompt.txt << 'PROMPT_EOF'
+
+          For each new image:
+          1. Examine the image with `./src/target/release/imago info <path>`
+          2. Determine the format and safety classification
+          3. Add to tests/manifest.json following the skill documentation
+          4. Add to the appropriate test file (test_info_safe.py or test_info_malicious.py)
+          5. For malicious images, create expected output in tests/expected_outputs/
+
+          PROMPT_EOF
+          fi
+
+          cat >> ${GITHUB_WORKSPACE}/claude-prompt.txt << 'PROMPT_EOF'
+
+          ## Your Task
+
+          1. Diagnose what's causing test failures (if any)
+          2. Fix imago code if needed (src/vmm/src/main.rs, src/operations/info/)
+          3. If fixing reveals a new qemu-img quirk:
+             - Document in docs/quirks.md
+             - Create docs/image_notes/<image-id>.md
+             - Update docs/image_notes/README.md
+          4. Add any new images to the test suite
+          5. Run `make test` to verify all fixes
+          6. Run `pre-commit run --all-files` to check formatting
+          7. Stage all changes with git add (do NOT commit)
+
+          ## Important Notes
+
+          - The testdata is at $IMAGO_TESTDATA_ROOT (set in environment)
+          - Build with `make imago` before testing
+          - Run tests with `make test`
+          - For malicious images, NEVER run qemu-img - use imago only
+          - Follow the quirk documentation patterns in existing image_notes files
+          PROMPT_EOF
+
+          echo "Prompt prepared:"
+          cat ${GITHUB_WORKSPACE}/claude-prompt.txt
+
+      - name: Run Claude Code to fix issues
+        id: claude_fix
+        if: |
+          steps.initial_test.outputs.tests_passed == 'false' ||
+          steps.new_images.outputs.new_images_found == 'true'
+        continue-on-error: true
+        env:
+          IMAGO_TESTDATA_ROOT: ${{ github.workspace }}/imago-testdata
+        run: |
+          cd ${GITHUB_WORKSPACE}/imago
+
+          if ! command -v claude &> /dev/null; then
+            echo "claude_available=false" >> $GITHUB_OUTPUT
+            echo "Error: Claude Code CLI not found"
+            exit 1
+          fi
+
+          echo "claude_available=true" >> $GITHUB_OUTPUT
+
+          claude -p "$(cat ${GITHUB_WORKSPACE}/claude-prompt.txt)" \
+            --dangerously-skip-permissions \
+            --max-turns ${{ inputs.max_turns || '50' }} \
+            --output-format text 2>&1 | tee ${GITHUB_WORKSPACE}/claude-output.txt || true
+
+      - name: Verify fixes
+        id: verify
+        if: steps.claude_fix.outputs.claude_available == 'true'
+        continue-on-error: true
+        env:
+          DOCKER_BUILDKIT: 1
+          IMAGO_TESTDATA_ROOT: ${{ github.workspace }}/imago-testdata
+        run: |
+          cd ${GITHUB_WORKSPACE}/imago
+
+          # Rebuild if code changed
+          if git diff --cached --name-only | grep -q "\.rs$"; then
+            echo "Rust code changed, rebuilding..."
+            make imago
+          fi
+
+          set +e
+          # Run tests directly, skipping make target's imago dependency
+          # Use PIPESTATUS to capture stestr exit code, not tee's
+          cd tests && .venv/bin/stestr run test_info_safe 2>&1 | tee ${GITHUB_WORKSPACE}/verify-output.txt
+          verify_exit_code=${PIPESTATUS[0]}
+          set -e
+
+          if [ ${verify_exit_code} -eq 0 ]; then
+            echo "fix_succeeded=true" >> $GITHUB_OUTPUT
+          else
+            echo "fix_succeeded=false" >> $GITHUB_OUTPUT
+          fi
+
+          exit ${verify_exit_code}
+
+      - name: Commit changes
+        if: |
+          steps.verify.outputs.fix_succeeded == 'true' &&
+          inputs.dry_run != true
+        run: |
+          cd ${GITHUB_WORKSPACE}/imago
+
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "Fix test suite drift for ${DATESTAMP}.
+
+          Claude Code automatically fixed test failures and/or added new
+          test images to the integration test suite.
+
+          Assisted-By: Claude Code
+          Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>"
+          fi
+
+      - name: Push and create PR
+        if: |
+          steps.verify.outputs.fix_succeeded == 'true' &&
+          inputs.dry_run != true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd ${GITHUB_WORKSPACE}/imago
+
+          git push -f origin test-drift-fix-${DATESTAMP}
+          sleep 5
+
+          gh pr create \
+            --assignee mikalstill \
+            --reviewer mikalstill \
+            --title "Fix test suite drift (${DATESTAMP})" \
+            --body "$(cat <<'EOF'
+          ## Summary
+
+          Claude Code automatically fixed test suite issues:
+
+          - Fixed test failures to match qemu-img output
+          - Added new test images to the manifest
+          - Updated quirks documentation as needed
+
+          ## Changes
+
+          $(git diff --stat HEAD~1)
+
+          ## Verification
+
+          All tests pass after these changes.
+
+          ---
+          🤖 Generated with [Claude Code](https://claude.com/claude-code)
+          EOF
+          )" \
+            --head $(git branch --show-current)
+
+      - name: Create issue for unfixable problems
+        if: |
+          (steps.initial_test.outputs.tests_passed == 'false' ||
+           steps.new_images.outputs.new_images_found == 'true') &&
+          (steps.claude_fix.outputs.claude_available != 'true' ||
+           steps.verify.outputs.fix_succeeded == 'false')
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let testOutput = 'See workflow logs for details.';
+            try {
+              testOutput = fs.readFileSync(
+                process.env.GITHUB_WORKSPACE + '/test-output.txt', 'utf8'
+              ).slice(-3000);  // Last 3KB
+            } catch (e) {}
+
+            const claudeAvailable =
+              '${{ steps.claude_fix.outputs.claude_available }}' === 'true';
+            const reason = claudeAvailable
+              ? 'Claude Code was unable to fix them automatically'
+              : 'Claude Code CLI was not available on the runner';
+
+            const workflowUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              `The test suite has issues that ${reason}.`,
+              '',
+              '**Test output (last 3KB):**',
+              '```',
+              testOutput,
+              '```',
+              '',
+              `See [workflow run](${workflowUrl}) for full details.`
+            ].join('\n');
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Test suite drift needs attention (${process.env.DATESTAMP})`,
+              body: body,
+              labels: ['test-failure', 'needs-attention']
+            });
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-drift-fix-logs-${{ env.DATESTAMP }}
+          path: |
+            ${{ github.workspace }}/build-log.txt
+            ${{ github.workspace }}/test-output.txt
+            ${{ github.workspace }}/verify-output.txt
+            ${{ github.workspace }}/claude-output.txt
+            ${{ github.workspace }}/claude-prompt.txt
+            ${{ github.workspace }}/new-images.txt
+          retention-days: 14

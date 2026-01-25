@@ -11,9 +11,10 @@
 
 .PHONY: help list-prototypes build-prototype build-all clean-prototype clean-all \
         clean-devcontainers lint lint-fix build-lint-container \
-        install-hooks run-prototype guest-protocol ensure-prototype-devcontainer \
-        imago imago-devcontainer clean-imago run-imago build-prototype-devcontainer \
-        test-venv test test-ci test-malicious test-report clean-tests
+        install-hooks run-prototype guest-protocol \
+        imago imago-devcontainer clean-imago run-imago \
+        test-venv test test-ci test-malicious test-report clean-tests \
+        clean-cargo-cache
 
 # Default target
 help:
@@ -34,7 +35,6 @@ help:
 	@echo "Prototypes:"
 	@echo "  build-prototype              Build a prototype (requires PROTOTYPE=<name>)"
 	@echo "  build-all                    Build all prototypes"
-	@echo "  build-prototype-devcontainer Build devcontainer for a prototype (requires PROTOTYPE=<name>)"
 	@echo "  clean-prototype              Clean a prototype's build (requires PROTOTYPE=<name>)"
 	@echo "  run-prototype                Run a prototype (requires PROTOTYPE=<name>)"
 	@echo ""
@@ -46,6 +46,7 @@ help:
 	@echo "  clean-all            Clean all build directories (main + prototypes)"
 	@echo "  clean-devcontainers  Remove all devcontainer images"
 	@echo "  clean-lint-container Remove the rust-lint Docker image"
+	@echo "  clean-cargo-cache    Remove cached cargo registry directory"
 	@echo "  distclean            Remove everything (all targets + all containers)"
 	@echo ""
 	@echo "Linting:"
@@ -91,6 +92,7 @@ SRC_DIR := src
 PROTO_DIR := prototypes
 SCRIPTS_DIR := scripts
 DEVCONTAINER_DIR := .devcontainer
+CARGO_CACHE_DIR := .cargo-cache
 
 # =============================================================================
 # Main Imago Project Targets
@@ -99,12 +101,14 @@ DEVCONTAINER_DIR := .devcontainer
 # Build the main imago project (runs inside devcontainer)
 imago: imago-devcontainer
 	@echo "Building imago..."
+	@mkdir -p "$(CURDIR)/$(CARGO_CACHE_DIR)/registry" "$(CURDIR)/$(CARGO_CACHE_DIR)/git"
 	docker run --rm \
 		-u "$(shell id -u):$(shell id -g)" \
-		-e HOME=/home/vscode \
-		-e CARGO_HOME=/home/vscode/.cargo \
-		-e RUSTUP_HOME=/home/vscode/.rustup \
+		-e HOME=/build \
+		-e CARGO_HOME=/build/.cargo \
 		-v "$(CURDIR):/workspace" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
 		-w "/workspace/$(SRC_DIR)" \
 		"$(IMAGO_IMAGE)" \
 		bash build.sh
@@ -172,31 +176,26 @@ ifeq ($(filter $(PROTOTYPE),$(PROTOTYPES)),)
 	$(error Invalid PROTOTYPE '$(PROTOTYPE)'. Run 'make list-prototypes' to see available options)
 endif
 
-# Build a specific prototype (runs inside devcontainer)
-build-prototype: check-prototype ensure-prototype-devcontainer
+# Build a specific prototype (uses shared devcontainer)
+build-prototype: check-prototype imago-devcontainer
 	@echo "Building prototype: $(PROTOTYPE)"
 	@if [ ! -f "$(PROTO_DIR)/$(PROTOTYPE)/build.sh" ]; then \
 		echo "Error: build.sh not found for $(PROTOTYPE)"; \
 		exit 1; \
 	fi
+	@mkdir -p "$(CURDIR)/$(CARGO_CACHE_DIR)/registry" "$(CURDIR)/$(CARGO_CACHE_DIR)/git"
 	docker run --rm \
 		-u "$(shell id -u):$(shell id -g)" \
-		-e HOME=/home/vscode \
-		-e CARGO_HOME=/home/vscode/.cargo \
-		-e RUSTUP_HOME=/home/vscode/.rustup \
+		-e HOME=/build \
+		-e CARGO_HOME=/build/.cargo \
 		-v "$(CURDIR):/workspace" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
 		-w "/workspace/$(PROTO_DIR)/$(PROTOTYPE)" \
-		"imago-$(PROTOTYPE)" \
+		"$(IMAGO_IMAGE)" \
 		bash build.sh
 
-# Ensure prototype devcontainer exists (builds if needed)
-ensure-prototype-devcontainer: check-prototype
-	@if ! docker image inspect "imago-$(PROTOTYPE)" >/dev/null 2>&1; then \
-		echo "Building devcontainer image for $(PROTOTYPE)..."; \
-		docker build -t "imago-$(PROTOTYPE)" "$(PROTO_DIR)/$(PROTOTYPE)/$(DEVCONTAINER_DIR)"; \
-	fi
-
-# Build all prototypes (each runs inside its devcontainer)
+# Build all prototypes (uses shared devcontainer)
 build-all:
 	@echo "Building all prototypes..."
 	@for p in $(PROTOTYPES); do \
@@ -214,32 +213,21 @@ guest-protocol:
 	@echo "Building guest-protocol crate..."
 	cd crates/guest-protocol && cargo build --release
 
-# Build devcontainer for a specific prototype
-build-prototype-devcontainer: check-prototype
-	@echo "Building devcontainer for: $(PROTOTYPE)"
-	@if [ -f "$(PROTO_DIR)/$(PROTOTYPE)/$(DEVCONTAINER_DIR)/Dockerfile" ]; then \
-		docker build -t "imago-$(PROTOTYPE)" \
-			"$(PROTO_DIR)/$(PROTOTYPE)/$(DEVCONTAINER_DIR)"; \
-	else \
-		echo "Error: Dockerfile not found for $(PROTOTYPE)"; \
-		exit 1; \
-	fi
-
 # Build the rust-lint container
 build-lint-container:
 	@echo "Building rust-lint container..."
 	docker build -t $(LINT_IMAGE) $(DEVCONTAINER_DIR)/rust-lint
 
 # Clean target directory for a specific prototype
-# Runs inside container if available (to handle root-owned files from builds)
+# Uses shared devcontainer to handle root-owned files from builds
 clean-prototype: check-prototype
 	@echo "Cleaning target directory for: $(PROTOTYPE)"
-	@if docker image inspect "imago-$(PROTOTYPE)" >/dev/null 2>&1; then \
+	@if docker image inspect "$(IMAGO_IMAGE)" >/dev/null 2>&1; then \
 		echo "Using container to clean (handles root-owned files)..."; \
 		docker run --rm \
 			-v "$(CURDIR):/workspace" \
 			-w "/workspace/$(PROTO_DIR)/$(PROTOTYPE)" \
-			"imago-$(PROTOTYPE)" \
+			"$(IMAGO_IMAGE)" \
 			sh -c "rm -rf target *.bin"; \
 		echo "Cleaned $(PROTO_DIR)/$(PROTOTYPE)"; \
 	else \
@@ -253,43 +241,40 @@ clean-prototype: check-prototype
 	fi
 
 # Clean all build directories (main imago + prototypes)
-# Uses containers when available to handle root-owned files
+# Uses shared devcontainer to handle root-owned files
 clean-all: clean-imago
 	@echo "Cleaning all prototype target directories..."
-	@for p in $(PROTOTYPES); do \
-		if [ -d "$(PROTO_DIR)/$$p" ]; then \
-			if docker image inspect "imago-$$p" >/dev/null 2>&1; then \
+	@if docker image inspect "$(IMAGO_IMAGE)" >/dev/null 2>&1; then \
+		for p in $(PROTOTYPES); do \
+			if [ -d "$(PROTO_DIR)/$$p" ]; then \
 				echo "Cleaning $$p (via container)..."; \
 				docker run --rm \
 					-v "$(CURDIR):/workspace" \
 					-w "/workspace/$(PROTO_DIR)/$$p" \
-					"imago-$$p" \
+					"$(IMAGO_IMAGE)" \
 					sh -c "rm -rf target *.bin" 2>/dev/null || true; \
-			else \
-				if [ -d "$(PROTO_DIR)/$$p/target" ]; then \
-					rm -rf "$(PROTO_DIR)/$$p/target" 2>/dev/null || \
-						echo "Warning: Could not remove $(PROTO_DIR)/$$p/target (try: sudo rm -rf)"; \
-				fi; \
-				find "$(PROTO_DIR)/$$p" -maxdepth 1 -name "*.bin" -delete 2>/dev/null || true; \
 			fi; \
-		fi; \
-	done
+		done; \
+	else \
+		for p in $(PROTOTYPES); do \
+			if [ -d "$(PROTO_DIR)/$$p/target" ]; then \
+				rm -rf "$(PROTO_DIR)/$$p/target" 2>/dev/null || \
+					echo "Warning: Could not remove $(PROTO_DIR)/$$p/target (try: sudo rm -rf)"; \
+			fi; \
+			find "$(PROTO_DIR)/$$p" -maxdepth 1 -name "*.bin" -delete 2>/dev/null || true; \
+		done; \
+	fi
 	@echo "Clean complete."
 
-# Remove all devcontainer images (main imago + prototypes)
+# Remove devcontainer image
 clean-devcontainers:
-	@echo "Removing devcontainer images..."
+	@echo "Removing devcontainer image..."
 	@if docker image inspect "$(IMAGO_IMAGE)" >/dev/null 2>&1; then \
 		docker rmi "$(IMAGO_IMAGE)" || true; \
 		echo "Removed $(IMAGO_IMAGE)"; \
+	else \
+		echo "$(IMAGO_IMAGE) not found"; \
 	fi
-	@for p in $(PROTOTYPES); do \
-		if docker image inspect "imago-$$p" >/dev/null 2>&1; then \
-			docker rmi "imago-$$p" || true; \
-			echo "Removed imago-$$p"; \
-		fi; \
-	done
-	@echo "Devcontainer cleanup complete."
 
 # Remove the rust-lint Docker image
 clean-lint-container:
@@ -301,8 +286,14 @@ clean-lint-container:
 		echo "$(LINT_IMAGE) not found"; \
 	fi
 
+# Remove cached cargo registry directory
+clean-cargo-cache:
+	@echo "Removing cargo cache directory..."
+	rm -rf "$(CURDIR)/$(CARGO_CACHE_DIR)"
+	@echo "Removed $(CARGO_CACHE_DIR)"
+
 # Remove everything
-distclean: clean-all clean-devcontainers clean-lint-container
+distclean: clean-all clean-devcontainers clean-lint-container clean-cargo-cache
 	@echo "Distclean complete."
 
 # Run rustfmt and clippy checks

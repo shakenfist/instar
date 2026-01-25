@@ -1,0 +1,42 @@
+# Binary dependencies for imago
+#
+# This file lists OS-level packages required to build and test imago.
+# Use bindep (pip install bindep) to install: bindep -b | xargs sudo apt install
+#
+# Format: package [platform:selector] [profile:tag]
+# See: https://docs.opendev.org/opendev/bindep/latest/readme.html
+
+# Build system
+make [platform:dpkg]
+make [platform:rpm]
+
+# Container runtime (for devcontainers and builds)
+docker.io [platform:dpkg]
+docker [platform:rpm]
+
+# Python for test suite
+python3 [platform:dpkg]
+python3 [platform:rpm]
+python3-venv [platform:dpkg]
+python3-virtualenv [platform:rpm]
+python3-pip [platform:dpkg]
+python3-pip [platform:rpm]
+
+# Testing - qemu-img for output comparison
+qemu-utils [platform:dpkg]
+qemu-img [platform:rpm]
+
+# Git and pre-commit
+git [platform:dpkg]
+git [platform:rpm]
+pre-commit [platform:dpkg]
+
+# KVM access for running imago
+qemu-kvm [platform:dpkg]
+qemu-kvm [platform:rpm]
+
+# Useful for development
+curl [platform:dpkg]
+curl [platform:rpm]
+jq [platform:dpkg]
+jq [platform:rpm]
