@@ -84,7 +84,7 @@ jobs:
         continue-on-error: true
         run: |
           cd ${GITHUB_WORKSPACE}/imago
-          export IMAGO_TESTDATA_ROOT=${GITHUB_WORKSPACE}/imago-testdata
+          export IMAGO_TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata
 
           # Set up test venv without triggering imago rebuild
           make test-venv
@@ -115,7 +115,7 @@ jobs:
           import os
           from pathlib import Path
 
-          testdata_root = os.environ.get('IMAGO_TESTDATA_ROOT',
+          testdata_root = os.environ.get('IMAGO_TESTDATA_PATH',
                                           '${GITHUB_WORKSPACE}/imago-testdata')
           manifest_path = 'tests/manifest.json'
 
@@ -235,7 +235,7 @@ jobs:
 
           ## Important Notes
 
-          - The testdata is at $IMAGO_TESTDATA_ROOT (set in environment)
+          - The testdata is at $IMAGO_TESTDATA_PATH (set in environment)
           - Build with `make imago` before testing
           - Run tests with `make test`
           - For malicious images, NEVER run qemu-img - use imago only
@@ -252,7 +252,7 @@ jobs:
           steps.new_images.outputs.new_images_found == 'true'
         continue-on-error: true
         env:
-          IMAGO_TESTDATA_ROOT: ${{ github.workspace }}/imago-testdata
+          IMAGO_TESTDATA_PATH: ${{ github.workspace }}/imago-testdata
         run: |
           cd ${GITHUB_WORKSPACE}/imago
 
@@ -275,7 +275,7 @@ jobs:
         continue-on-error: true
         env:
           DOCKER_BUILDKIT: 1
-          IMAGO_TESTDATA_ROOT: ${{ github.workspace }}/imago-testdata
+          IMAGO_TESTDATA_PATH: ${{ github.workspace }}/imago-testdata
         run: |
           cd ${GITHUB_WORKSPACE}/imago
 
