@@ -159,9 +159,15 @@ make clean-tests
 - `tests/expected_outputs/` - Expected output files for malicious images
 
 **Adding new test images:**
+
+Use the `/imago-add-test-image` skill for guided assistance, or manually:
+
 1. Add the image to `imago-testdata/` repository
 2. Add an entry to `tests/manifest.json` with appropriate safety level
-3. For malicious images, create an expected output file in `tests/expected_outputs/`
+3. Add a scenario to the appropriate test file (`test_info_safe.py` or `test_info_malicious.py`)
+4. For malicious images, create an expected output file in `tests/expected_outputs/`
+
+See `docs/testing.md` for detailed documentation.
 
 **Safety levels:**
 - `safe` - Run by default, known-good images
@@ -252,3 +258,17 @@ Complete documentation for the call table API used by operations:
 ```
 
 Where `[function]` is: `io`, `progress`, `config`, or omit for full reference.
+
+### `/imago-add-test-image` - Add Test Images
+
+Guided process for adding new disk images to the integration test suite:
+
+```
+/imago-add-test-image
+```
+
+This skill walks through:
+1. Gathering image metadata (path, format, safety level, description)
+2. Updating `tests/manifest.json`
+3. Adding test scenarios to the appropriate test file
+4. For malicious images: creating expected output files safely

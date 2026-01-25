@@ -320,8 +320,11 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
     format!("[{}] {}", level, payload_str)
 }
 
-/// Format a byte size as human-readable string (matches qemu-img format)
-fn format_size_human(bytes: u64) -> String {
+/// Format a byte size as human-readable string
+///
+/// When `qemu_compat` is true, uses qemu-img's 3-significant-figure formatting.
+/// When false, uses more accurate formatting with 1 decimal place when needed.
+fn format_size_human(bytes: u64, qemu_compat: bool) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = 1024.0 * 1024.0;
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -330,33 +333,64 @@ fn format_size_human(bytes: u64) -> String {
     let bytes_f = bytes as f64;
 
     if bytes_f >= TIB {
-        format_size_value(bytes_f / TIB, "TiB")
+        format_size_value(bytes_f / TIB, "TiB", qemu_compat)
     } else if bytes_f >= GIB {
-        format_size_value(bytes_f / GIB, "GiB")
+        format_size_value(bytes_f / GIB, "GiB", qemu_compat)
     } else if bytes_f >= MIB {
-        format_size_value(bytes_f / MIB, "MiB")
+        format_size_value(bytes_f / MIB, "MiB", qemu_compat)
     } else if bytes_f >= KIB {
-        format_size_value(bytes_f / KIB, "KiB")
+        format_size_value(bytes_f / KIB, "KiB", qemu_compat)
     } else {
         format!("{} bytes", bytes)
     }
 }
 
-/// Format a size value, showing decimal only if not a whole number
-fn format_size_value(value: f64, unit: &str) -> String {
-    // Round to one decimal place
-    let rounded = (value * 10.0).round() / 10.0;
-    if rounded.fract() == 0.0 {
-        // Whole number, no decimal
-        format!("{} {}", rounded as u64, unit)
+/// Format a size value
+///
+/// When `qemu_compat` is true, uses 3 significant figures (like qemu-img's %0.3g).
+/// When false, shows 1 decimal place when not a whole number.
+fn format_size_value(value: f64, unit: &str, qemu_compat: bool) -> String {
+    if qemu_compat {
+        // qemu-img uses %0.3g format (3 significant figures)
+        // For values >= 100, this effectively truncates to integer
+        // For values >= 10 and < 100, shows 1 decimal
+        // For values >= 1 and < 10, shows 2 decimals
+        let rounded = if value >= 100.0 {
+            value.floor()
+        } else if value >= 10.0 {
+            (value * 10.0).floor() / 10.0
+        } else if value >= 1.0 {
+            (value * 100.0).floor() / 100.0
+        } else {
+            (value * 1000.0).floor() / 1000.0
+        };
+
+        if rounded.fract() == 0.0 {
+            format!("{} {}", rounded as u64, unit)
+        } else {
+            // Format and trim trailing zeros
+            let s = format!("{}", rounded);
+            let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+            format!("{} {}", trimmed, unit)
+        }
     } else {
-        // Show one decimal place
-        format!("{:.1} {}", rounded, unit)
+        // Accurate formatting: round to one decimal place
+        let rounded = (value * 10.0).round() / 10.0;
+        if rounded.fract() == 0.0 {
+            format!("{} {}", rounded as u64, unit)
+        } else {
+            format!("{:.1} {}", rounded, unit)
+        }
     }
 }
 
 /// Print InfoResult in qemu-img compatible format
-fn print_info_result(msg: &guest_::GuestMessage, filename: &str, file_size: u64) {
+fn print_info_result(
+    msg: &guest_::GuestMessage,
+    filename: &str,
+    file_size: u64,
+    ignore_quirks: bool,
+) {
     if let Some(guest_::GuestMessage_::Payload::InfoResult(info)) = &msg.payload {
         // Get absolute path for filename
         let abs_path = std::fs::canonicalize(filename)
@@ -369,15 +403,26 @@ fn print_info_result(msg: &guest_::GuestMessage, filename: &str, file_size: u64)
         // Line 2: file format
         println!("file format: {}", info.format);
 
+        // qemu_compat is the opposite of ignore_quirks
+        let qemu_compat = !ignore_quirks;
+
         // Line 3: virtual size (human-readable with bytes in parentheses)
         println!(
             "virtual size: {} ({} bytes)",
-            format_size_human(info.virtual_size),
+            format_size_human(info.virtual_size, qemu_compat),
             info.virtual_size
         );
 
-        // Line 4: disk size (actual file size on disk)
-        println!("disk size: {}", format_size_human(file_size));
+        // Line 4: disk size
+        // qemu-img reports disk size as file size rounded up to filesystem block boundaries (4096)
+        // With --ignore-quirks, use the actual filesystem size
+        let disk_size = if ignore_quirks {
+            file_size
+        } else {
+            // Round up to 4096-byte blocks (typical filesystem block size)
+            ((file_size + 4095) / 4096) * 4096
+        };
+        println!("disk size: {}", format_size_human(disk_size, qemu_compat));
 
         // Line 5: cluster_size (with underscore, matching qemu-img)
         if info.cluster_size > 0 {
@@ -435,15 +480,25 @@ fn print_info_result(msg: &guest_::GuestMessage, filename: &str, file_size: u64)
         }
 
         // Child node '/file' section (matches qemu-img output)
+        // qemu-img uses the calculated file length (L1 table offset + size rounded to sector)
+        // for "file length" and block-rounded size for "disk size"
+        let file_length = if ignore_quirks {
+            file_size
+        } else {
+            info.actual_size
+        };
         println!("Child node '/file':");
         println!("    filename: {}", abs_path);
         println!("    protocol type: file");
         println!(
             "    file length: {} ({} bytes)",
-            format_size_human(file_size),
-            file_size
+            format_size_human(file_length, qemu_compat),
+            file_length
         );
-        println!("    disk size: {}", format_size_human(file_size));
+        println!(
+            "    disk size: {}",
+            format_size_human(disk_size, qemu_compat)
+        );
     }
 }
 
@@ -489,6 +544,10 @@ struct InfoArgs {
     /// Sector size for reading input (default: 65536)
     #[arg(long, default_value = "65536")]
     sector_size: u32,
+
+    /// Report true filesystem size instead of qemu-img-compatible calculated size
+    #[arg(long)]
+    ignore_quirks: bool,
 }
 
 #[derive(Args, Debug)]
@@ -771,7 +830,12 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
                                 Some(guest_::GuestMessage_::Payload::InfoResult(_))
                             );
                             if is_info_result {
-                                print_info_result(&msg, &args.input, input_size);
+                                print_info_result(
+                                    &msg,
+                                    &args.input,
+                                    input_size,
+                                    args.ignore_quirks,
+                                );
                             } else {
                                 debug!("{}", format_message(&msg));
                             }

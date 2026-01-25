@@ -33,6 +33,8 @@ const QCOW2_CRYPT_METHOD_OFFSET: usize = 32;
 const QCOW2_INCOMPATIBLE_FEATURES_OFFSET: usize = 72; // v3 only
 
 // Additional QCOW2 header offsets for format-specific info
+const QCOW2_L1_SIZE_OFFSET: usize = 36; // Number of L1 table entries
+const QCOW2_L1_TABLE_OFFSET_OFFSET: usize = 40; // L1 table file offset
 const QCOW2_COMPATIBLE_FEATURES_OFFSET: usize = 80; // v3 only
 const QCOW2_REFCOUNT_ORDER_OFFSET: usize = 96; // refcount_bits = 1 << refcount_order
 const QCOW2_COMPRESSION_TYPE_OFFSET: usize = 104; // v3 only (0=zlib, 1=zstd)
@@ -328,6 +330,30 @@ unsafe fn parse_qcow2_header(
         buffer[QCOW2_CLUSTER_BITS_OFFSET + 3],
     ]);
     result.cluster_size = 1u32 << cluster_bits;
+
+    // L1 table info for qemu-style disk size calculation
+    // qemu-img calculates disk size as: ceil((l1_offset + l1_size * 8) / 512) * 512
+    let l1_size = u32::from_be_bytes([
+        buffer[QCOW2_L1_SIZE_OFFSET],
+        buffer[QCOW2_L1_SIZE_OFFSET + 1],
+        buffer[QCOW2_L1_SIZE_OFFSET + 2],
+        buffer[QCOW2_L1_SIZE_OFFSET + 3],
+    ]);
+    let l1_table_offset = u64::from_be_bytes([
+        buffer[QCOW2_L1_TABLE_OFFSET_OFFSET],
+        buffer[QCOW2_L1_TABLE_OFFSET_OFFSET + 1],
+        buffer[QCOW2_L1_TABLE_OFFSET_OFFSET + 2],
+        buffer[QCOW2_L1_TABLE_OFFSET_OFFSET + 3],
+        buffer[QCOW2_L1_TABLE_OFFSET_OFFSET + 4],
+        buffer[QCOW2_L1_TABLE_OFFSET_OFFSET + 5],
+        buffer[QCOW2_L1_TABLE_OFFSET_OFFSET + 6],
+        buffer[QCOW2_L1_TABLE_OFFSET_OFFSET + 7],
+    ]);
+
+    // Calculate qemu-style disk size: highest offset rounded up to 512-byte sector
+    let l1_table_end = l1_table_offset + (l1_size as u64) * 8;
+    let qemu_disk_size = ((l1_table_end + 511) / 512) * 512;
+    result.actual_size = qemu_disk_size;
 
     // Virtual size (big-endian u64 at offset 24)
     result.virtual_size = u64::from_be_bytes([

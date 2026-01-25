@@ -12,7 +12,24 @@ The name "imago" comes from Latin (meaning "image") and biology (the final
 adult stage of insect metamorphosis) - reflecting both the image handling
 and transformation aspects of the tool.
 
-Confused about how imago does these things? Perhaps read the [technology primer](docs/technology-primer.md).
+The primary goal of `imago` is to be a safe drop in replacement for qemu-img.
+The current focus is on the `qemu-img info` sub-command, as the most painful
+part in terms of observed security exploits, but that will expand over time.
+We therefore have a test suite of images that we run against both tools,
+and any difference in output is considered a bug to be fixed -- if you
+observe such a difference please report it as a GitHub issue at
+https://github.com/shakenfist/imago. Obviously, providing an image which
+demonstrates your concern, even if that image would otherwise be considered
+malicious, is extremely helpful in fixing the bug and ensuring that we don't
+regress later.
+
+Along the pathway to complete equivalence, we have found a few examples of
+`qemu-img` behaviour that we found counter intuitive. These are documented
+on [our quirks page](quirks.md), and you can suppress `qemu-img`
+equivalence with the `--ignore-quirks` flag to `imago`.
+
+Confused about how `imago` does these things? Perhaps read the 
+[technology primer](technology-primer.md).
 
 ## QCOW2 Format
 
@@ -74,6 +91,13 @@ Methods for transferring data into and out of bare-metal KVM guests.
 | Document | Description |
 |----------|-------------|
 | [Why Rust](rust-rationale.md) | Memory safety, bare-metal support, rust-vmm ecosystem |
+| [Format Detection Safety](format-detection-safety.md) | Why auto-detection is safe in imago's KVM sandbox |
+
+## Compatibility
+
+| Document | Description |
+|----------|-------------|
+| [qemu-img Quirks](quirks.md) | Known differences between `imago` and qemu-img output |
 
 ## Rust Crate Ecosystem
 
@@ -115,10 +139,14 @@ Experimental implementations exploring secure isolated execution.
 | [Virtio-Block3](prototypes/virtio-block3.md) | Virtio-block with configurable sector sizes |
 | [Virtio-Block4](prototypes/virtio-block4.md) | Virtio-block with performance statistics |
 | [Virtio-Block5](prototypes/virtio-block5.md) | Virtio-block with ioeventfd/irqfd optimizations |
+| [Virtio-Block6](../prototypes/virtio-block6/README.md) | Sparse/dynamic output file support |
+| [Pluggable](../prototypes/pluggable/README.md) | Modular operation architecture with shared infrastructure |
+| [Pluggable2](../prototypes/pluggable2/README.md) | Separate binary loading for operations (minimal attack surface) |
+| [Info](../prototypes/info/README.md) | Image format detection (`qemu-img info` equivalent) |
 
 ## Shared Crates
 
-Reusable Rust crates for the imago project.
+Reusable Rust crates for the `imago` project.
 
 | Document | Description |
 |----------|-------------|
@@ -129,3 +157,4 @@ Reusable Rust crates for the imago project.
 | Document | Description |
 |----------|-------------|
 | [Building with Docker](building-with-docker.md) | Build prototypes using Docker CLI without VSCode |
+| [Integration Testing](testing.md) | Test suite comparing imago output against qemu-img |

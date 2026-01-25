@@ -270,6 +270,7 @@ This project includes Claude Code skills for common development tasks:
 - `/imago-format [format]` - Disk image format reference (qcow2, vmdk, raw)
 - `/imago-debug [issue]` - Troubleshooting guide for guest operations
 - `/imago-calltable [function]` - Call table API documentation
+- `/imago-add-test-image` - Add a new image to the integration test suite
 
 See `.claude/skills/` for details.
 
