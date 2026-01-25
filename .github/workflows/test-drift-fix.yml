@@ -264,10 +264,18 @@ jobs:
 
           echo "claude_available=true" >> $GITHUB_OUTPUT
 
+          # Record start time to find conversation logs created during this run
+          start_time=$(date +%s)
+
           claude -p "$(cat ${GITHUB_WORKSPACE}/claude-prompt.txt)" \
             --dangerously-skip-permissions \
             --max-turns ${{ inputs.max_turns || '50' }} \
             --output-format text 2>&1 | tee ${GITHUB_WORKSPACE}/claude-output.txt || true
+
+          # Collect Claude Code conversation logs for artifacts
+          mkdir -p ${GITHUB_WORKSPACE}/claude-logs
+          find ~/.claude/projects -name "*.jsonl" -newermt "@${start_time}" \
+            -exec cp {} ${GITHUB_WORKSPACE}/claude-logs/ \; 2>/dev/null || true
 
       - name: Verify fixes
         id: verify
@@ -412,4 +420,5 @@ jobs:
             ${{ github.workspace }}/claude-output.txt
             ${{ github.workspace }}/claude-prompt.txt
             ${{ github.workspace }}/new-images.txt
+            ${{ github.workspace }}/claude-logs/
           retention-days: 14
