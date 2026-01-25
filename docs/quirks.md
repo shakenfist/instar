@@ -88,19 +88,47 @@ For the QCOW2 v2 test file:
 ### Observed Behavior
 
 qemu-img uses `%0.3g` printf format (3 significant figures) for human-readable
-sizes. This can display values smaller than the actual size.
+sizes. This has different rounding behavior depending on the magnitude:
 
-For example:
-- 197120 bytes / 1024 = 192.5 KiB
-- With 3 significant figures: "192 KiB" (truncates to integer for values >= 100)
+**For values >= 100** (displayed as integers):
+
+The C `%0.3g` format truncates (floors) to the nearest integer:
+- 192.5 KiB → "192 KiB" (floors from 192.5)
+- 127.9 GiB → "127 GiB" (floors from 127.9)
+
+**For values 10-99** (displayed with 1 decimal place):
+
+Standard rounding applies:
+- 20.6875 MiB → "20.7 MiB" (rounds from 20.6875)
+- 15.44 KiB → "15.4 KiB" (rounds from 15.44)
+
+### Technical Details
+
+This behavior stems from C printf's `%0.3g` format which:
+1. Rounds to 3 significant figures using standard IEEE rounding
+2. Removes trailing zeros after the decimal point
+3. For integer results, displays no decimal point
+
+The "flooring" appearance for >= 100 values occurs because the result has no
+decimal places to display, and the rounding happens at the third significant
+digit (which is already in the integer part).
+
+Rust's `f64::round()` uses "round half away from zero", which differs from
+C's "round half to even" (banker's rounding). This causes discrepancies for
+values exactly at the midpoint (e.g., 192.5). imago uses floor for >= 100
+values to match qemu-img's observed output.
 
 ### imago Behavior
 
-**Default behavior**: imago matches qemu-img's 3-significant-figure formatting.
-For values >= 100, this floors to the nearest integer.
+**Default behavior**: imago matches qemu-img's formatting:
+- Values >= 100: floor to integer
+- Values 10-99: round to 1 decimal place
+- Values 1-9: round to 2 decimal places
+- Values < 1: round to 3 decimal places
 
-**With `--ignore-quirks` flag**: imago uses more accurate formatting, showing
-1 decimal place when the value is not a whole number (e.g., "192.5 KiB").
+**With `--ignore-quirks` flag**: imago uses consistent rounding with 1 decimal
+place when the value is not a whole number (e.g., "192.5 KiB" instead of
+"192 KiB").
 
 ## Summary of `--ignore-quirks` Effects
 

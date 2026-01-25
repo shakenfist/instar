@@ -136,6 +136,20 @@ Reference this file in the manifest:
 }
 ```
 
+## Image Notes
+
+The `docs/image_notes/` directory documents which test images exposed
+specific quirks or implementation details. When a test image reveals
+unexpected qemu-img behavior that requires compatibility work, create a
+markdown file documenting:
+
+- The specific values that revealed the behavior
+- How qemu-img handles the case
+- How imago now handles it
+- Links to relevant quirks documentation
+
+See [Image Notes](image_notes/README.md) for existing documentation.
+
 ## Adding New Test Images
 
 1. Add the image to `imago-testdata` repository
@@ -144,6 +158,7 @@ Reference this file in the manifest:
 4. For malicious images:
    - Create expected output file in `tests/expected_outputs/`
    - Add scenario to `test_info_malicious.py`
+5. If the image exposes new quirks: create `docs/image_notes/<image-id>.md`
 
 ## Output Comparison
 

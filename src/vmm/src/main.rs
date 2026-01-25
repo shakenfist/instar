@@ -352,17 +352,16 @@ fn format_size_human(bytes: u64, qemu_compat: bool) -> String {
 fn format_size_value(value: f64, unit: &str, qemu_compat: bool) -> String {
     if qemu_compat {
         // qemu-img uses %0.3g format (3 significant figures)
-        // For values >= 100, this effectively truncates to integer
-        // For values >= 10 and < 100, shows 1 decimal
-        // For values >= 1 and < 10, shows 2 decimals
+        // For values >= 100, truncates to integer (floor)
+        // For smaller values, rounds to the appropriate decimal places
         let rounded = if value >= 100.0 {
             value.floor()
         } else if value >= 10.0 {
-            (value * 10.0).floor() / 10.0
+            (value * 10.0).round() / 10.0
         } else if value >= 1.0 {
-            (value * 100.0).floor() / 100.0
+            (value * 100.0).round() / 100.0
         } else {
-            (value * 1000.0).floor() / 1000.0
+            (value * 1000.0).round() / 1000.0
         };
 
         if rounded.fract() == 0.0 {
@@ -480,12 +479,14 @@ fn print_info_result(
         }
 
         // Child node '/file' section (matches qemu-img output)
-        // qemu-img uses the calculated file length (L1 table offset + size rounded to sector)
-        // for "file length" and block-rounded size for "disk size"
+        // qemu-img reports max(actual_file_size, calculated_length) for "file length"
+        // where calculated_length is L1 table end rounded to 512-byte sector for QCOW2.
+        // For small files where metadata extends beyond data, use calculated length.
+        // For larger files with actual content, use the real file size.
         let file_length = if ignore_quirks {
             file_size
         } else {
-            info.actual_size
+            std::cmp::max(file_size, info.actual_size)
         };
         println!("Child node '/file':");
         println!("    filename: {}", abs_path);

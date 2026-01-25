@@ -103,6 +103,39 @@ Any difference fails the test.
 For malicious images, the test compares imago output against the stored
 expected output file.
 
+### Step 8: Document Any Quirks Discovered
+
+If the test reveals unexpected qemu-img behavior that required compatibility
+work in imago:
+
+1. **Create image notes** in `docs/image_notes/<image-id>.md`:
+   - Document the specific values that revealed the behavior
+   - Explain how qemu-img handles the case
+   - Explain how imago now handles it
+   - Link to relevant quirks documentation
+
+2. **Update docs/quirks.md** if this is a new quirk:
+   - Document the observed behavior
+   - Explain the root cause (if known)
+   - Document imago's default behavior
+   - Document `--ignore-quirks` behavior
+
+3. **Update docs/image_notes/README.md** to add the new image to the index
+
+See existing files like `docs/image_notes/qcow2-v2.md` for examples.
+
+### Step 9: Verify All Tests Still Pass
+
+After making any changes to support the new image, run the full test suite
+to ensure existing images still pass:
+
+```bash
+make test
+```
+
+If any existing tests fail after your changes, you may have introduced a
+regression. Check that your compatibility fix doesn't break other images.
+
 ## Example: Adding a Safe Image
 
 ```
@@ -142,6 +175,9 @@ For malicious images:
 | `tests/test_info_malicious.py` | Malicious image test scenarios |
 | `tests/expected_outputs/` | Expected output files for malicious images |
 | `tests/helpers/types.py` | TestImage dataclass |
+| `docs/quirks.md` | qemu-img quirks and `--ignore-quirks` documentation |
+| `docs/image_notes/` | Per-image documentation of quirks discovered |
+| `docs/image_notes/README.md` | Index of image notes |
 
 ## Safety Reminders
 
