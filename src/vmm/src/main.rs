@@ -388,6 +388,7 @@ fn print_info_result(
     msg: &guest_::GuestMessage,
     filename: &str,
     file_size: u64,
+    disk_blocks: u64,
     ignore_quirks: bool,
 ) {
     if let Some(guest_::GuestMessage_::Payload::InfoResult(info)) = &msg.payload {
@@ -413,13 +414,14 @@ fn print_info_result(
         );
 
         // Line 4: disk size
-        // qemu-img reports disk size as file size rounded up to filesystem block boundaries (4096)
-        // With --ignore-quirks, use the actual filesystem size
+        // qemu-img reports disk size based on st_blocks (actual disk blocks used),
+        // which accounts for sparse files. st_blocks is in 512-byte units.
+        // With --ignore-quirks, use the actual file size.
         let disk_size = if ignore_quirks {
             file_size
         } else {
-            // Round up to 4096-byte blocks (typical filesystem block size)
-            ((file_size + 4095) / 4096) * 4096
+            // st_blocks is in 512-byte units
+            disk_blocks * 512
         };
         println!("disk size: {}", format_size_human(disk_size, qemu_compat));
 
@@ -473,33 +475,33 @@ fn print_info_result(
             }
         }
 
+        // Format specific information (VMDK)
+        if info.format == "vmdk" {
+            println!("Format specific information:");
+            println!("    cid: {}", info.vmdk_info.cid);
+            println!("    parent cid: {}", info.vmdk_info.parent_cid);
+            println!("    create type: {}", info.vmdk_info.create_type.as_str());
+
+            // Extents section - for monolithicSparse there's one extent
+            // The extent info includes virtual size (in bytes), filename, cluster size, and format
+            println!("    extents:");
+            println!("        [0]:");
+            println!("            virtual size: {}", info.virtual_size);
+            println!("            filename: {}", abs_path);
+            println!("            cluster size: {}", info.cluster_size);
+            // qemu-img outputs "format: " with trailing space for empty format
+            print!("            format: ");
+            println!();
+        }
+
         // Backing file (if present)
         if info.flags & (1 << 0) != 0 && !info.backing_file.is_empty() {
             println!("backing file: {}", info.backing_file);
         }
 
-        // Child node '/file' section (matches qemu-img output)
-        // qemu-img reports max(actual_file_size, calculated_length) for "file length"
-        // where calculated_length is L1 table end rounded to 512-byte sector for QCOW2.
-        // For small files where metadata extends beyond data, use calculated length.
-        // For larger files with actual content, use the real file size.
-        let file_length = if ignore_quirks {
-            file_size
-        } else {
-            std::cmp::max(file_size, info.actual_size)
-        };
-        println!("Child node '/file':");
-        println!("    filename: {}", abs_path);
-        println!("    protocol type: file");
-        println!(
-            "    file length: {} ({} bytes)",
-            format_size_human(file_length, qemu_compat),
-            file_length
-        );
-        println!(
-            "    disk size: {}",
-            format_size_human(disk_size, qemu_compat)
-        );
+        // Note: qemu-img 7.2.x does NOT output the "Child node '/file'" section.
+        // This section was added in later qemu versions. For compatibility with
+        // qemu-img 7.2.x (Debian 12 / bookworm), we don't output it.
     }
 }
 
@@ -647,8 +649,17 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
         operation_path.display()
     );
 
-    // Get input file size
-    let input_size = std::fs::metadata(&args.input)?.len();
+    // Get input file metadata (size and disk blocks)
+    let input_metadata = std::fs::metadata(&args.input)?;
+    let input_size = input_metadata.len();
+    // Get disk blocks allocated (for sparse file disk size calculation)
+    #[cfg(unix)]
+    let input_disk_blocks = {
+        use std::os::unix::fs::MetadataExt;
+        input_metadata.blocks()
+    };
+    #[cfg(not(unix))]
+    let input_disk_blocks = (input_size + 511) / 512; // Fallback for non-Unix
     debug!(
         "Input file: {} ({} bytes, {} sectors @ {} bytes/sector)",
         args.input,
@@ -835,6 +846,7 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
                                     &msg,
                                     &args.input,
                                     input_size,
+                                    input_disk_blocks,
                                     args.ignore_quirks,
                                 );
                             } else {

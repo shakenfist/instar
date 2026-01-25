@@ -293,6 +293,54 @@ pub fn info_result_message_with_qcow2(
     msg
 }
 
+/// VMDK format-specific information for info_result_message_with_vmdk.
+pub struct VmdkInfoData<'a> {
+    /// Content ID (CID)
+    pub cid: u32,
+    /// Parent Content ID (parentCID) - 0xFFFFFFFF if no parent
+    pub parent_cid: u32,
+    /// Create type (e.g., "monolithicSparse")
+    pub create_type: &'a str,
+}
+
+/// Helper to create an info result message with VMDK-specific information.
+#[allow(clippy::too_many_arguments)]
+pub fn info_result_message_with_vmdk(
+    format: &str,
+    version: u32,
+    virtual_size: u64,
+    actual_size: u64,
+    cluster_size: u32,
+    flags: u32,
+    backing_file: &str,
+    external_data_file: &str,
+    vmdk_info: &VmdkInfoData,
+) -> guest_::GuestMessage {
+    let mut msg = guest_::GuestMessage::default();
+    msg.level = guest_::Level::Info;
+
+    let mut info = guest_::InfoResultMessage::default();
+    push_str(&mut info.format, format);
+    info.version = version;
+    info.virtual_size = virtual_size;
+    info.actual_size = actual_size;
+    info.cluster_size = cluster_size;
+    info.flags = flags;
+    push_str_256(&mut info.backing_file, backing_file);
+    push_str_256(&mut info.external_data_file, external_data_file);
+
+    // Set VMDK-specific information
+    info.vmdk_info.cid = vmdk_info.cid;
+    info.vmdk_info.parent_cid = vmdk_info.parent_cid;
+    push_str(&mut info.vmdk_info.create_type, vmdk_info.create_type);
+
+    // Mark vmdk_info as present so the encoder includes it
+    info._has.set_vmdk_info();
+
+    msg.payload = Some(guest_::GuestMessage_::Payload::InfoResult(info));
+    msg
+}
+
 // =============================================================================
 // VMM -> Guest configuration message support
 // =============================================================================

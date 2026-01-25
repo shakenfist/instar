@@ -120,6 +120,22 @@ pub struct CallTable {
         *const u8,        // external_data_file
         *const Qcow2Info, // qcow2_info
     ),
+
+    /// Send info result message with VMDK-specific information.
+    /// Args: format (null-terminated), version, virtual_size, actual_size,
+    ///       cluster_size, flags, backing_file (null-terminated),
+    ///       external_data_file (null-terminated), vmdk_info pointer
+    pub send_info_result_vmdk: unsafe extern "C" fn(
+        *const u8,       // format
+        u32,             // version
+        u64,             // virtual_size
+        u64,             // actual_size
+        u32,             // cluster_size
+        u32,             // flags
+        *const u8,       // backing_file
+        *const u8,       // external_data_file
+        *const VmdkInfo, // vmdk_info
+    ),
 }
 
 /// QCOW2 format-specific information (FFI-safe).
@@ -175,12 +191,56 @@ impl Qcow2Info {
     }
 }
 
+/// VMDK format-specific information (FFI-safe).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct VmdkInfo {
+    /// Content ID (CID) - unique identifier for this disk
+    pub cid: u32,
+    /// Parent Content ID (parentCID) - 0xFFFFFFFF if no parent
+    pub parent_cid: u32,
+    /// Create type length (bytes used in create_type array)
+    pub create_type_len: u8,
+    /// Padding for alignment
+    pub _pad: [u8; 3],
+    /// Create type string (null-terminated, max 31 chars + null)
+    pub create_type: [u8; 32],
+}
+
+impl VmdkInfo {
+    /// Create new VMDK info with defaults
+    pub const fn new() -> Self {
+        Self {
+            cid: 0,
+            parent_cid: 0xFFFFFFFF,
+            create_type_len: 0,
+            _pad: [0; 3],
+            create_type: [0; 32],
+        }
+    }
+
+    /// Set the create type string
+    pub fn set_create_type(&mut self, s: &[u8]) {
+        let len = s.len().min(31);
+        self.create_type[..len].copy_from_slice(&s[..len]);
+        self.create_type[len] = 0;
+        self.create_type_len = len as u8;
+    }
+
+    /// Get create type as a str slice (for display)
+    pub fn create_type_str(&self) -> &str {
+        let len = self.create_type_len as usize;
+        // Safety: we control the contents and ensure it's valid UTF-8 ASCII
+        core::str::from_utf8(&self.create_type[..len]).unwrap_or("")
+    }
+}
+
 impl CallTable {
     /// Magic value indicating a valid call table
     pub const MAGIC: u32 = 0x494D4147; // "IMAG"
 
-    /// Current ABI version (bumped for send_info_result_qcow2 addition)
-    pub const VERSION: u32 = 4;
+    /// Current ABI version (bumped for send_info_result_vmdk addition)
+    pub const VERSION: u32 = 5;
 }
 
 // ============================================================================

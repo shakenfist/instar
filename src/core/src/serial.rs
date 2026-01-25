@@ -263,3 +263,36 @@ pub fn send_info_result_qcow2(
     );
     send_message(&msg);
 }
+
+/// Send an info result message with VMDK-specific information
+#[allow(clippy::too_many_arguments)]
+pub fn send_info_result_vmdk(
+    format: &str,
+    version: u32,
+    virtual_size: u64,
+    actual_size: u64,
+    cluster_size: u32,
+    flags: u32,
+    backing_file: &str,
+    external_data_file: &str,
+    vmdk_info: &shared::VmdkInfo,
+) {
+    let vmdk_data = guest_protocol::VmdkInfoData {
+        cid: vmdk_info.cid,
+        parent_cid: vmdk_info.parent_cid,
+        create_type: vmdk_info.create_type_str(),
+    };
+
+    let msg = guest_protocol::info_result_message_with_vmdk(
+        format,
+        version,
+        virtual_size,
+        actual_size,
+        cluster_size,
+        flags,
+        backing_file,
+        external_data_file,
+        &vmdk_data,
+    );
+    send_message(&msg);
+}
