@@ -10,7 +10,8 @@
 use core::panic::PanicInfo;
 
 use shared::{
-    CallTable, ImageFormat, InfoConfig, InfoResult, Qcow2Info, CALL_TABLE_ADDR, MAX_SECTOR_SIZE,
+    CallTable, ImageFormat, InfoConfig, InfoResult, Qcow2Info, VmdkInfo, CALL_TABLE_ADDR,
+    MAX_SECTOR_SIZE,
 };
 
 // Magic numbers for format detection (big-endian where noted)
@@ -53,6 +54,8 @@ const QCOW2_COMPAT_LAZY_REFCOUNTS: u64 = 1 << 0;
 const VMDK4_VERSION_OFFSET: usize = 4;
 const VMDK4_CAPACITY_OFFSET: usize = 12;
 const VMDK4_GRAIN_SIZE_OFFSET: usize = 20;
+const VMDK4_DESC_OFFSET_OFFSET: usize = 28; // Descriptor offset in sectors
+const VMDK4_DESC_SIZE_OFFSET: usize = 36; // Descriptor size in sectors
 
 /// Entry point called by core after devices are initialized.
 ///
@@ -129,8 +132,9 @@ pub unsafe extern "C" fn _start() -> u64 {
 
     (call_table.debug_print)(b"info: detected format\n\0".as_ptr());
 
-    // QCOW2-specific information (filled in if format is QCOW2)
+    // Format-specific information structures
     let mut qcow2_info = Qcow2Info::new();
+    let mut vmdk_info = VmdkInfo::new();
 
     // Parse format-specific metadata if detailed reporting enabled
     if detailed {
@@ -139,7 +143,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                 parse_qcow2_header(&buffer, &mut result, &mut qcow2_info, call_table);
             }
             ImageFormat::Vmdk4 => {
-                parse_vmdk4_header(&buffer, &mut result);
+                parse_vmdk4_header(&buffer, &mut result, &mut vmdk_info, call_table);
             }
             ImageFormat::Vhd => {
                 // VHD footer may be in first sector (dynamic) or last sector (fixed)
@@ -165,7 +169,7 @@ pub unsafe extern "C" fn _start() -> u64 {
     let format_str = format_to_str(format);
 
     // Send result via protobuf over serial
-    // Use QCOW2-specific function for QCOW2 images to include format info
+    // Use format-specific functions to include format-specific info
     if format == ImageFormat::Qcow2 {
         (call_table.send_info_result_qcow2)(
             format_str,
@@ -177,6 +181,18 @@ pub unsafe extern "C" fn _start() -> u64 {
             b"\0".as_ptr(), // backing_file (empty for now)
             b"\0".as_ptr(), // external_data_file (empty for now)
             &qcow2_info,
+        );
+    } else if format == ImageFormat::Vmdk4 {
+        (call_table.send_info_result_vmdk)(
+            format_str,
+            result.version,
+            result.virtual_size,
+            result.actual_size,
+            result.cluster_size,
+            result.flags,
+            b"\0".as_ptr(), // backing_file (empty for now)
+            b"\0".as_ptr(), // external_data_file (empty for now)
+            &vmdk_info,
         );
     } else {
         (call_table.send_info_result)(
@@ -472,8 +488,13 @@ unsafe fn parse_qcow2_header(
     }
 }
 
-/// Parse VMDK4 header and populate result
-fn parse_vmdk4_header(buffer: &[u8], result: &mut InfoResult) {
+/// Parse VMDK4 header and populate result and VMDK-specific info
+unsafe fn parse_vmdk4_header(
+    buffer: &[u8],
+    result: &mut InfoResult,
+    vmdk_info: &mut VmdkInfo,
+    call_table: &CallTable,
+) {
     // Version (little-endian u32 at offset 4)
     let version = u32::from_le_bytes([
         buffer[VMDK4_VERSION_OFFSET],
@@ -511,9 +532,117 @@ fn parse_vmdk4_header(buffer: &[u8], result: &mut InfoResult) {
     // Grain size is similar to cluster size
     result.cluster_size = (grain_size * 512) as u32;
 
-    // VMDK can have embedded descriptors that reference other files,
-    // but detecting this requires parsing the descriptor text.
-    // For now, we just report the basic header info.
+    // Descriptor offset in sectors (little-endian u64 at offset 28)
+    let desc_offset_sectors = u64::from_le_bytes([
+        buffer[VMDK4_DESC_OFFSET_OFFSET],
+        buffer[VMDK4_DESC_OFFSET_OFFSET + 1],
+        buffer[VMDK4_DESC_OFFSET_OFFSET + 2],
+        buffer[VMDK4_DESC_OFFSET_OFFSET + 3],
+        buffer[VMDK4_DESC_OFFSET_OFFSET + 4],
+        buffer[VMDK4_DESC_OFFSET_OFFSET + 5],
+        buffer[VMDK4_DESC_OFFSET_OFFSET + 6],
+        buffer[VMDK4_DESC_OFFSET_OFFSET + 7],
+    ]);
+
+    // Descriptor size in sectors (little-endian u64 at offset 36)
+    let desc_size_sectors = u64::from_le_bytes([
+        buffer[VMDK4_DESC_SIZE_OFFSET],
+        buffer[VMDK4_DESC_SIZE_OFFSET + 1],
+        buffer[VMDK4_DESC_SIZE_OFFSET + 2],
+        buffer[VMDK4_DESC_SIZE_OFFSET + 3],
+        buffer[VMDK4_DESC_SIZE_OFFSET + 4],
+        buffer[VMDK4_DESC_SIZE_OFFSET + 5],
+        buffer[VMDK4_DESC_SIZE_OFFSET + 6],
+        buffer[VMDK4_DESC_SIZE_OFFSET + 7],
+    ]);
+
+    // Read and parse the descriptor if present
+    if desc_offset_sectors > 0 && desc_size_sectors > 0 {
+        (call_table.debug_print)(b"info: reading VMDK descriptor\n\0".as_ptr());
+
+        // Get input sector size (this is the virtio device's sector size, which may differ
+        // from VMDK's internal 512-byte sectors)
+        let input_sector_size = (call_table.get_input_sector_size)();
+
+        // VMDK header stores offsets in 512-byte sectors. Convert to byte offset,
+        // then to the actual device sector number.
+        let desc_byte_offset = desc_offset_sectors * 512;
+        let desc_sector = desc_byte_offset / input_sector_size as u64;
+        let offset_within_sector = (desc_byte_offset % input_sector_size as u64) as usize;
+
+        // Read the sector containing the descriptor
+        let mut desc_buffer = [0u8; MAX_SECTOR_SIZE];
+
+        if (call_table.read_input_sector)(desc_sector, desc_buffer.as_mut_ptr(), input_sector_size)
+        {
+            // Parse the descriptor text starting at the correct offset within the sector
+            // The descriptor typically starts within the sector at offset_within_sector
+            let desc_data = &desc_buffer[offset_within_sector..input_sector_size];
+            parse_vmdk_descriptor(desc_data, desc_data.len(), vmdk_info);
+        }
+    }
+}
+
+/// Parse VMDK descriptor text to extract CID, parentCID, and createType
+fn parse_vmdk_descriptor(buffer: &[u8], len: usize, vmdk_info: &mut VmdkInfo) {
+    // Find null terminator or end of buffer
+    let end = buffer[..len].iter().position(|&b| b == 0).unwrap_or(len);
+    let text = &buffer[..end];
+
+    // Parse line by line (newline separated)
+    let mut pos = 0;
+    while pos < text.len() {
+        // Find end of line
+        let line_end = text[pos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| pos + p)
+            .unwrap_or(text.len());
+
+        let line = &text[pos..line_end];
+
+        // Parse CID=<hex>
+        if line.starts_with(b"CID=") {
+            if let Some(cid) = parse_hex_value(&line[4..]) {
+                vmdk_info.cid = cid;
+            }
+        }
+        // Parse parentCID=<hex>
+        else if line.starts_with(b"parentCID=") {
+            if let Some(parent_cid) = parse_hex_value(&line[10..]) {
+                vmdk_info.parent_cid = parent_cid;
+            }
+        }
+        // Parse createType="<string>"
+        else if line.starts_with(b"createType=") {
+            // Skip createType=" and find closing quote
+            let value_start = 12; // After 'createType="'
+            if line.len() > value_start && line[11] == b'"' {
+                // Find closing quote
+                if let Some(quote_end) = line[value_start..].iter().position(|&b| b == b'"') {
+                    vmdk_info.set_create_type(&line[value_start..value_start + quote_end]);
+                }
+            }
+        }
+
+        pos = line_end + 1;
+    }
+}
+
+/// Parse a hex value from ASCII bytes (without 0x prefix)
+fn parse_hex_value(bytes: &[u8]) -> Option<u32> {
+    let mut value: u32 = 0;
+    for &b in bytes {
+        let digit = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            b'\r' | b'\n' | 0 => break, // End of value
+            _ => return None,
+        };
+        value = value.checked_mul(16)?.checked_add(digit as u32)?;
+    }
+    Some(value)
 }
 
 /// Get the call table from the fixed address
