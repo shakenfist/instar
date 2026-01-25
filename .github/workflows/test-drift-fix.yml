@@ -277,6 +277,16 @@ jobs:
           find ~/.claude/projects -name "*.jsonl" -newermt "@${start_time}" \
             -exec cp {} ${GITHUB_WORKSPACE}/claude-logs/ \; 2>/dev/null || true
 
+          # Capture git state for debugging failed attempts
+          echo "=== Git Status ===" > ${GITHUB_WORKSPACE}/claude-changes.txt
+          git status >> ${GITHUB_WORKSPACE}/claude-changes.txt 2>&1
+          echo "" >> ${GITHUB_WORKSPACE}/claude-changes.txt
+          echo "=== Staged Changes (git diff --cached) ===" >> ${GITHUB_WORKSPACE}/claude-changes.txt
+          git diff --cached >> ${GITHUB_WORKSPACE}/claude-changes.txt 2>&1
+          echo "" >> ${GITHUB_WORKSPACE}/claude-changes.txt
+          echo "=== Unstaged Changes (git diff) ===" >> ${GITHUB_WORKSPACE}/claude-changes.txt
+          git diff >> ${GITHUB_WORKSPACE}/claude-changes.txt 2>&1
+
       - name: Verify fixes
         id: verify
         if: steps.claude_fix.outputs.claude_available == 'true'
@@ -419,6 +429,7 @@ jobs:
             ${{ github.workspace }}/verify-output.txt
             ${{ github.workspace }}/claude-output.txt
             ${{ github.workspace }}/claude-prompt.txt
+            ${{ github.workspace }}/claude-changes.txt
             ${{ github.workspace }}/new-images.txt
             ${{ github.workspace }}/claude-logs/
           retention-days: 14
