@@ -35,8 +35,8 @@ class TestInfoSafe(testscenarios.WithScenarios, ImagoTestBase):
         tests_dir = Path(__file__).parent
         testdata_root = tests_dir.parent.parent / 'imago-testdata'
 
-        # Test human output format (json can be added later)
-        for output_type in ['human']:
+        # Test both human and json output formats
+        for output_type in ['human', 'json']:
             output_type_dir = f'qemu-img-{output_type}'
             version_map_path = (
                 testdata_root / 'expected-outputs' /
@@ -60,7 +60,7 @@ class TestInfoSafe(testscenarios.WithScenarios, ImagoTestBase):
                         f'{image_id}.stdout.txt'
                     )
                     if baseline_path.exists():
-                        scenario_name = f'{profile_name}-{image_id}'
+                        scenario_name = f'{output_type}-{profile_name}-{image_id}'
                         scenarios.append((scenario_name, {
                             'profile': profile_name,
                             'image_id': image_id,
@@ -88,10 +88,14 @@ class TestInfoSafe(testscenarios.WithScenarios, ImagoTestBase):
         # Get the qemu version string for this profile
         qemu_version = self.get_qemu_version_for_profile(self.profile)
 
-        # Run imago with explicit --qemu-version
+        # Map output_type to imago --output flag value
+        output_format = self.output_type if self.output_type != 'human' else None
+
+        # Run imago with explicit --qemu-version and output format
         imago_stdout, imago_stderr, imago_rc = self.run_imago_info(
             image.path,
-            qemu_version=qemu_version
+            qemu_version=qemu_version,
+            output_format=output_format
         )
 
         # Should succeed
