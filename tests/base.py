@@ -10,7 +10,11 @@ from typing import Optional, Tuple
 
 import testtools
 
-from helpers.comparators import compare_outputs, format_failure_message
+from helpers.comparators import (
+    compare_outputs,
+    format_failure_message,
+    substitute_testdata_root,
+)
 from helpers.types import TestImage
 
 
@@ -116,13 +120,17 @@ class ImagoTestBase(testtools.TestCase):
         """
         Load expected output for a specific profile from testdata.
 
+        Baselines use $TESTDATA_ROOT as a placeholder for portability.
+        This method substitutes the placeholder with the actual testdata
+        path for the current environment.
+
         Args:
             image_id: The test image identifier
             profile: Profile name (e.g., 'profile-6-0-0', 'profile-8-0-0')
             output_type: 'human' or 'json'
 
         Returns:
-            Expected output string
+            Expected output string with paths resolved for current environment
         """
         output_type_dir = f'qemu-img-{output_type}'
         output_path = (
@@ -135,7 +143,9 @@ class ImagoTestBase(testtools.TestCase):
                 f'No expected output found: {output_path}'
             )
 
-        return output_path.read_text()
+        # Substitute $TESTDATA_ROOT placeholder with actual path
+        content = output_path.read_text()
+        return substitute_testdata_root(content, str(self._testdata_root))
 
     def get_qemu_version_for_profile(self, profile: str) -> str:
         """

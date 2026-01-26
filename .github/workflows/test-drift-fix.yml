@@ -84,15 +84,11 @@ jobs:
         continue-on-error: true
         run: |
           cd ${GITHUB_WORKSPACE}/imago
-          export IMAGO_TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata
-
-          # Set up test venv without triggering imago rebuild
-          make test-venv
 
           set +e
-          # Run tests directly, skipping make target's imago dependency
-          # Use PIPESTATUS to capture stestr exit code, not tee's
-          cd tests && .venv/bin/stestr run test_info_safe 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
+          # Run tests inside container for consistent environment
+          # Container mounts testdata at /testdata for path consistency
+          make test-container TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
           test_exit_code=${PIPESTATUS[0]}
           set -e
 
@@ -293,20 +289,18 @@ jobs:
         continue-on-error: true
         env:
           DOCKER_BUILDKIT: 1
-          IMAGO_TESTDATA_PATH: ${{ github.workspace }}/imago-testdata
         run: |
           cd ${GITHUB_WORKSPACE}/imago
 
-          # Rebuild if code changed
+          # Rebuild if code changed (test-container depends on imago target)
           if git diff --cached --name-only | grep -q "\.rs$"; then
             echo "Rust code changed, rebuilding..."
             make imago
           fi
 
           set +e
-          # Run tests directly, skipping make target's imago dependency
-          # Use PIPESTATUS to capture stestr exit code, not tee's
-          cd tests && .venv/bin/stestr run test_info_safe 2>&1 | tee ${GITHUB_WORKSPACE}/verify-output.txt
+          # Run tests inside container for consistent environment
+          make test-container TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata 2>&1 | tee ${GITHUB_WORKSPACE}/verify-output.txt
           verify_exit_code=${PIPESTATUS[0]}
           set -e
 

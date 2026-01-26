@@ -1,8 +1,15 @@
 # syntax=docker/dockerfile:1
 FROM mcr.microsoft.com/devcontainers/base:debian
 
-# Install protobuf compiler (required for micropb-gen)
-RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/apt/lists/*
+# Install build dependencies and test tools
+# - protobuf-compiler: required for micropb-gen
+# - python3, python3-pip, python3-venv: for running integration tests
+RUN apt-get update && apt-get install -y \
+    protobuf-compiler \
+    python3 \
+    python3-pip \
+    python3-venv \
+    && rm -rf /var/lib/apt/lists/*
 
 # Create a shared build directory that any user can use
 RUN mkdir -p /build && chmod 777 /build
