@@ -230,6 +230,28 @@ bytes) cannot have those regions converted to holes.
 zero-filled blocks entirely. This correctly handles files with complex sparse
 patterns where `fallocate -d` would leave extra blocks allocated.
 
+### Test Framework Tolerance
+
+Even with `cp --sparse=always`, re-sparsified files may not have identical
+block allocation patterns to the original. Different filesystems, kernel
+versions, or sparse detection algorithms can result in allocation differences
+of one or more filesystem blocks (typically 4096 bytes).
+
+For this reason, the test comparison framework (`tests/helpers/comparators.py`)
+normalizes `actual-size` values in JSON output before comparison. Values are
+rounded down to the nearest 4096-byte boundary, so differences within one
+filesystem block are tolerated.
+
+This means:
+- Human output tests: Always exact match (sizes are rounded for display)
+- JSON output tests: `actual-size` values may differ by up to 4095 bytes
+
+This tolerance is appropriate because:
+1. `actual-size` reflects filesystem allocation, not image content
+2. Two systems running identical qemu-img on identical file content can report
+   different `actual-size` values depending on sparse file handling
+3. imago correctly reports the same value as qemu-img on the same system
+
 ### Note
 
 This is not a qemu-img quirk per se, but rather a filesystem/git interaction
