@@ -53,6 +53,16 @@
             "description": "VHDX format dynamic disk from QEMU iotests",
             "tags": ["vhdx", "dynamic"],
             "sha256": "a4fb24fa51fb4852d5a6bdc2b390a91b0a4e19b47696edc5a00c816067257402"
+        },
+        {
+            "id": "vmdk-streamoptimized",
+            "path": "downloaded/edge-cases/vmdk_streamoptimized.vmdk",
+            "format": "vmdk",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "streamOptimized VMDK format used in OVA/OVF exports",
+            "tags": ["vmdk", "streamOptimized", "ova"],
+            "sha256": "25195da02ad41ec3da974b45f4744ee07d32bb37a04402d4b167562577eb1c11"
         }
     ]
 }
