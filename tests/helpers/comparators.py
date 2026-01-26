@@ -2,6 +2,27 @@
 
 import difflib
 
+# Placeholder used in baseline files for the testdata root path
+TESTDATA_ROOT_PLACEHOLDER = '$TESTDATA_ROOT'
+
+
+def substitute_testdata_root(text: str, testdata_root: str) -> str:
+    """
+    Substitute the testdata root placeholder with the actual path.
+
+    Baselines store paths as $TESTDATA_ROOT/downloaded/... to be portable
+    across different environments. This function substitutes the placeholder
+    with the actual testdata path for the current environment.
+
+    Args:
+        text: Text containing $TESTDATA_ROOT placeholders
+        testdata_root: The actual testdata root path (IMAGO_TESTDATA_PATH)
+
+    Returns:
+        Text with placeholders substituted
+    """
+    return text.replace(TESTDATA_ROOT_PLACEHOLDER, testdata_root)
+
 
 def compare_outputs(imago_output: str, expected_output: str) -> tuple:
     """

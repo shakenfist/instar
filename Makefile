@@ -56,7 +56,8 @@ help:
 	@echo ""
 	@echo "Testing:"
 	@echo "  test-venv            Create Python venv for tests"
-	@echo "  test                 Run safe integration tests"
+	@echo "  test                 Run safe integration tests (on host)"
+	@echo "  test-container       Run tests inside container (consistent env)"
 	@echo "  test-ci              Run CI-suitable tests (safe + caution)"
 	@echo "  test-malicious       Run all tests including malicious images"
 	@echo "  test-report          Show test differences without failing"
@@ -342,6 +343,9 @@ TESTS_DIR := tests
 PYTHON := python3
 VENV_DIR := $(TESTS_DIR)/.venv
 
+# Testdata location - can be overridden with IMAGO_TESTDATA_PATH env var
+TESTDATA_PATH ?= $(CURDIR)/../imago-testdata
+
 # Create virtual environment for tests
 test-venv:
 	@echo "Creating Python virtual environment for tests..."
@@ -351,10 +355,36 @@ test-venv:
 	@$(VENV_DIR)/bin/pip install -q -r $(TESTS_DIR)/requirements.txt
 	@echo "Virtual environment ready at $(VENV_DIR)"
 
-# Run safe integration tests only
+# Run safe integration tests only (on host)
 test: imago test-venv
 	@echo "Running safe integration tests..."
 	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run test_info_safe
+
+# Run tests inside the devcontainer for consistent environment
+# This ensures consistent glibc, paths, and other system dependencies
+test-container: imago-devcontainer imago
+	@echo "Running tests inside container..."
+	@if [ ! -d "$(TESTDATA_PATH)" ]; then \
+		echo "Error: Test data not found at $(TESTDATA_PATH)"; \
+		echo "Set IMAGO_TESTDATA_PATH or ensure imago-testdata is a sibling directory."; \
+		exit 1; \
+	fi
+	docker run --rm \
+		--device=/dev/kvm \
+		-u "$(shell id -u):$(shell id -g)" \
+		-e HOME=/build \
+		-e IMAGO_TESTDATA_PATH=/testdata \
+		-v "$(CURDIR):/workspace" \
+		-v "$(TESTDATA_PATH):/testdata:ro" \
+		-w "/workspace" \
+		"$(IMAGO_IMAGE)" \
+		bash -c '\
+			echo "Setting up test environment..."; \
+			python3 -m venv /build/test-venv && \
+			/build/test-venv/bin/pip install -q -r tests/requirements.txt && \
+			echo "Running tests..."; \
+			cd tests && /build/test-venv/bin/stestr run test_info_safe \
+		'
 
 # Run CI-suitable tests (safe + caution)
 test-ci: imago test-venv
