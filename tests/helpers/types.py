@@ -19,6 +19,7 @@ class TestImage:
     skip_qemu_img: bool = False
     expected_error: Optional[str] = None
     cve_references: list = field(default_factory=list)
+    sha256: Optional[str] = None
 
     @property
     def is_safe(self) -> bool:
@@ -45,4 +46,5 @@ class TestImage:
             skip_qemu_img=data.get('skip_qemu_img', False),
             expected_error=data.get('expected_error'),
             cve_references=data.get('cve_references', []),
+            sha256=data.get('sha256'),
         )

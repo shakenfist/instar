@@ -11,7 +11,8 @@
             "safety": "safe",
             "run_in_ci": true,
             "description": "CirrOS minimal cloud image, real-world qcow2 example",
-            "tags": ["qcow2", "cloud-image", "production-like"]
+            "tags": ["qcow2", "cloud-image", "production-like"],
+            "sha256": "7d6355852aeb6dbcd191bcda7cd74f1536cfe5cbf8a10495a7283a8396e4b75b"
         },
         {
             "id": "qcow2-v2",
@@ -20,7 +21,8 @@
             "safety": "safe",
             "run_in_ci": true,
             "description": "QCOW2 version 2 format (compat=0.10)",
-            "tags": ["qcow2", "version-2"]
+            "tags": ["qcow2", "version-2"],
+            "sha256": "9ddff3f485139a881a3836119b582e64bfd9a97523743ca57f45ae98ab8686da"
         },
         {
             "id": "plaso-vmdk",
@@ -29,7 +31,8 @@
             "safety": "safe",
             "run_in_ci": true,
             "description": "Small monolithicSparse VMDK from plaso project",
-            "tags": ["vmdk", "monolithicSparse"]
+            "tags": ["vmdk", "monolithicSparse"],
+            "sha256": "b2ce876c61f799b29874c1de75eb5b91143ca0cac82a6cfba9f3b74b5b1d20ff"
         },
         {
             "id": "hyperv-dynamic-vhd",
@@ -38,7 +41,8 @@
             "safety": "safe",
             "run_in_ci": true,
             "description": "Dynamic VHD created by Hyper-V 2012 R2",
-            "tags": ["vhd", "hyper-v"]
+            "tags": ["vhd", "hyper-v"],
+            "sha256": "1340b8a51517ba5f0112c47694f3c8a4a2bb4f9933336a18cf0392f3490c6674"
         }
     ]
 }
