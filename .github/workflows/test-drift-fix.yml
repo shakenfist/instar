@@ -189,6 +189,47 @@ jobs:
           5. Run `make test` to verify all fixes
           6. Run `pre-commit run --all-files` to check formatting
           7. Stage all changes with git add (do NOT commit)
+          8. Output a commit summary (see below)
+
+          ## REQUIRED: Commit Summary Output
+
+          After completing your work and staging changes, you MUST output a commit
+          summary in the following exact format. This will be used as the git commit
+          message, so make it descriptive and specific to what you actually changed:
+
+          ```
+          COMMIT_SUMMARY_START
+          <First line: 50 chars max, imperative mood, ends with period>
+
+          <Body: Wrap at 72 chars. Explain WHAT changed and WHY. Be specific about
+          which files were modified, what the root cause was, and how you fixed it.
+          Do not use generic phrases like "fixed test failures" - describe the
+          actual technical changes.>
+          COMMIT_SUMMARY_END
+          ```
+
+          Example of a GOOD commit summary:
+          ```
+          COMMIT_SUMMARY_START
+          Fix VMDK extent size calculation for split volumes.
+
+          The streamOptimized VMDK parser was incorrectly summing extent sizes
+          without accounting for descriptor overhead. This caused a 512-byte
+          discrepancy in reported virtual size compared to qemu-img.
+
+          Modified src/operations/info/vmdk.rs to subtract the descriptor
+          length from the first extent's contribution to total size.
+          COMMIT_SUMMARY_END
+          ```
+
+          Example of a BAD commit summary (too generic):
+          ```
+          COMMIT_SUMMARY_START
+          Fix test failures.
+
+          Fixed the failing tests so they pass now.
+          COMMIT_SUMMARY_END
+          ```
 
           ## STOP: Read These Rules First
 
@@ -290,6 +331,34 @@ jobs:
           echo "=== Unstaged Changes (git diff) ===" >> ${GITHUB_WORKSPACE}/claude-changes.txt
           git diff >> ${GITHUB_WORKSPACE}/claude-changes.txt 2>&1
 
+      - name: Extract commit summary
+        id: extract_summary
+        if: steps.claude_fix.outputs.claude_available == 'true'
+        run: |
+          # Extract Claude's commit summary from output
+          if grep -q "COMMIT_SUMMARY_START" ${GITHUB_WORKSPACE}/claude-output.txt; then
+            # Extract text between markers, removing the markers themselves
+            sed -n '/COMMIT_SUMMARY_START/,/COMMIT_SUMMARY_END/p' \
+              ${GITHUB_WORKSPACE}/claude-output.txt | \
+              grep -v "COMMIT_SUMMARY_START" | \
+              grep -v "COMMIT_SUMMARY_END" | \
+              sed 's/^```$//' | \
+              sed '/^$/N;/^\n$/d' > ${GITHUB_WORKSPACE}/commit-summary.txt
+
+            # Check if we got meaningful content
+            if [ -s ${GITHUB_WORKSPACE}/commit-summary.txt ]; then
+              echo "summary_found=true" >> $GITHUB_OUTPUT
+              echo "Extracted commit summary:"
+              cat ${GITHUB_WORKSPACE}/commit-summary.txt
+            else
+              echo "summary_found=false" >> $GITHUB_OUTPUT
+              echo "Warning: COMMIT_SUMMARY markers found but content was empty"
+            fi
+          else
+            echo "summary_found=false" >> $GITHUB_OUTPUT
+            echo "Warning: No COMMIT_SUMMARY markers found in Claude output"
+          fi
+
       - name: Verify fixes
         id: verify
         if: steps.claude_fix.outputs.claude_available == 'true'
@@ -328,13 +397,29 @@ jobs:
 
           if [ -n "$(git status --porcelain)" ]; then
             git add -A
-            git commit -m "Fix test suite drift for ${DATESTAMP}.
+
+            # Use Claude's commit summary if available, otherwise use fallback
+            if [ "${{ steps.extract_summary.outputs.summary_found }}" == "true" ] && \
+               [ -s ${GITHUB_WORKSPACE}/commit-summary.txt ]; then
+              # Append attribution to Claude's summary
+              {
+                cat ${GITHUB_WORKSPACE}/commit-summary.txt
+                echo ""
+                echo "Assisted-By: Claude Code"
+                echo "Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>"
+              } > ${GITHUB_WORKSPACE}/commit-message.txt
+
+              git commit -F ${GITHUB_WORKSPACE}/commit-message.txt
+            else
+              # Fallback to generic message if no summary found
+              git commit -m "Fix test suite drift for ${DATESTAMP}.
 
           Claude Code automatically fixed test failures and/or added new
           test images to the integration test suite.
 
           Assisted-By: Claude Code
           Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>"
+            fi
           fi
 
       - name: Push and create PR
@@ -430,6 +515,8 @@ jobs:
             ${{ github.workspace }}/claude-output.txt
             ${{ github.workspace }}/claude-prompt.txt
             ${{ github.workspace }}/claude-changes.txt
+            ${{ github.workspace }}/commit-summary.txt
+            ${{ github.workspace }}/commit-message.txt
             ${{ github.workspace }}/new-images.txt
             ${{ github.workspace }}/claude-logs/
             ${{ github.workspace }}/fs-info.txt
