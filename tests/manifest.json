@@ -63,6 +63,16 @@
             "description": "streamOptimized VMDK format used in OVA/OVF exports",
             "tags": ["vmdk", "streamOptimized", "ova"],
             "sha256": "25195da02ad41ec3da974b45f4744ee07d32bb37a04402d4b167562577eb1c11"
+        },
+        {
+            "id": "vmdk-v3",
+            "path": "downloaded/qemu-iotests/iotest-version3.vmdk",
+            "format": "vmdk",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "VMDK native version 3 format from QEMU iotests",
+            "tags": ["vmdk", "version-3"],
+            "sha256": "0b67f248809938335a6f9375a8a76b3079f7c7e355df2837d5e05c9b45aaad5c"
         }
     ]
 }
