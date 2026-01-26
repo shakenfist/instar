@@ -516,6 +516,10 @@ fn print_info_result(
             // The extent info includes virtual size (in bytes), filename, cluster size, and format
             println!("    extents:");
             println!("        [0]:");
+            // Output compressed: true if the extent is compressed (e.g., streamOptimized)
+            if info.flags & INFO_RESULT_FLAG_COMPRESSED != 0 {
+                println!("            compressed: true");
+            }
             println!("            virtual size: {}", info.virtual_size);
             println!("            filename: {}", abs_path);
             println!("            cluster size: {}", info.cluster_size);
@@ -670,6 +674,10 @@ fn print_info_result_json(
         // Extents array - for monolithicSparse, there's one extent with the disk info
         println!("            \"extents\": [");
         println!("                {{");
+        // Output compressed: true if the extent is compressed (e.g., streamOptimized)
+        if info.flags & INFO_RESULT_FLAG_COMPRESSED != 0 {
+            println!("                    \"compressed\": true,");
+        }
         println!(
             "                    \"virtual-size\": {},",
             info.virtual_size
