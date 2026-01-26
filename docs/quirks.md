@@ -88,13 +88,16 @@ For the QCOW2 v2 test file:
 ### Observed Behavior
 
 qemu-img uses `%0.3g` printf format (3 significant figures) for human-readable
-sizes. This has different rounding behavior depending on the magnitude:
+sizes. This rounds to 3 significant figures, with the number of decimal places
+depending on the magnitude:
 
 **For values >= 100** (displayed as integers):
 
-The C `%0.3g` format truncates (floors) to the nearest integer:
-- 192.5 KiB → "192 KiB" (floors from 192.5)
-- 127.9 GiB → "127 GiB" (floors from 127.9)
+Rounds to nearest integer using "round half to even" (banker's rounding):
+- 126.998 GiB → "127 GiB" (rounds up from 126.998)
+- 192.5 KiB → "192 KiB" (rounds to even from 192.5)
+- 256.5 KiB → "256 KiB" (rounds to even from 256.5)
+- 127.5 GiB → "128 GiB" (rounds to even from 127.5)
 
 **For values 10-99** (displayed with 1 decimal place):
 
@@ -105,26 +108,20 @@ Standard rounding applies:
 ### Technical Details
 
 This behavior stems from C printf's `%0.3g` format which:
-1. Rounds to 3 significant figures using standard IEEE rounding
+1. Rounds to 3 significant figures using "round half to even" (banker's rounding)
 2. Removes trailing zeros after the decimal point
 3. For integer results, displays no decimal point
 
-The "flooring" appearance for >= 100 values occurs because the result has no
-decimal places to display, and the rounding happens at the third significant
-digit (which is already in the integer part).
-
-Rust's `f64::round()` uses "round half away from zero", which differs from
-C's "round half to even" (banker's rounding). This causes discrepancies for
-values exactly at the midpoint (e.g., 192.5). imago uses floor for >= 100
-values to match qemu-img's observed output.
+The key distinction is at exact midpoints (like 192.5): C rounds to the nearest
+even number (192), while Rust's default `round()` rounds away from zero (193).
 
 ### imago Behavior
 
-**Default behavior**: imago matches qemu-img's formatting:
-- Values >= 100: floor to integer
-- Values 10-99: round to 1 decimal place
-- Values 1-9: round to 2 decimal places
-- Values < 1: round to 3 decimal places
+**Default behavior**: imago matches qemu-img's formatting using banker's rounding:
+- Values >= 100: round to nearest integer (ties to even)
+- Values 10-99: round to 1 decimal place (ties to even)
+- Values 1-9: round to 2 decimal places (ties to even)
+- Values < 1: round to 3 decimal places (ties to even)
 
 **With `--ignore-quirks` flag**: imago uses consistent rounding with 1 decimal
 place when the value is not a whole number (e.g., "192.5 KiB" instead of
@@ -256,6 +253,73 @@ This tolerance is appropriate because:
 
 This is not a qemu-img quirk per se, but rather a filesystem/git interaction
 that affects qemu-img output consistency in CI environments.
+
+## VHD Virtual Size Calculation
+
+### Observed Behavior
+
+qemu-img calculates VHD virtual size differently depending on the creator
+application that produced the VHD file. The VHD footer contains both a
+"current size" field (explicit virtual size in bytes) and CHS geometry values
+(cylinders, heads, sectors per track).
+
+**For Virtual PC and legacy QEMU VHDs** (creator_app = "vpc " or "qemu"):
+
+qemu-img calculates virtual size from CHS geometry:
+```
+virtual_size = cylinders × heads × sectors_per_track × 512
+```
+
+**For modern applications** (Hyper-V, Disk2vhd, XenServer, Azure, etc.):
+
+qemu-img uses the disk_size field directly from the VHD footer.
+
+### Example
+
+For the `virtualpc-dynamic.vhd` test image (created by Virtual PC):
+- Footer disk_size field: 136,365,211,648 bytes
+- CHS geometry: 65,278 cylinders × 16 heads × 255 sectors
+- CHS-calculated size: 65,278 × 16 × 255 × 512 = 136,363,130,880 bytes
+- qemu-img reports: 136,363,130,880 bytes (CHS calculation)
+
+The difference (2,080,768 bytes) exists because Virtual PC's geometry algorithm
+cannot exactly represent the requested size, so it rounds down to the nearest
+CHS-representable value.
+
+### Why This Matters
+
+Virtual PC and original QEMU create VHD files that rely on CHS geometry for
+compatibility with legacy systems. Using the disk_size field directly for
+these images would report a larger virtual size than the geometry can address,
+potentially causing data corruption if writes exceed the CHS-addressable range.
+
+### Maximum CHS Geometry
+
+When CHS geometry reaches maximum values (65,535 × 16 × 255 = 267,382,800
+sectors = ~127 GiB), qemu-img falls back to using the disk_size field
+regardless of creator application. This prevents truncation for large disks.
+
+### Known Creator Applications
+
+| Creator App | Size Method | Application |
+|-------------|-------------|-------------|
+| `vpc `      | CHS         | Microsoft Virtual PC |
+| `qemu`      | CHS         | QEMU (legacy) |
+| `qem2`      | disk_size   | QEMU (modern) |
+| `win `      | disk_size   | Microsoft Hyper-V |
+| `d2v `      | disk_size   | Disk2vhd |
+| `tap\0`     | disk_size   | XenServer |
+| `CTXS`      | disk_size   | XenConverter |
+| `wa\0\0`    | disk_size   | Microsoft Azure |
+
+### imago Behavior
+
+**Default behavior**: imago matches qemu-img by checking the creator_app field
+and using CHS calculation for "vpc " and "qemu" creators (unless CHS is at
+maximum), or disk_size field for all others.
+
+**With `--ignore-quirks` flag**: Currently no change; the VHD size calculation
+always matches qemu-img for maximum compatibility.
 
 ## Future Additions
 
