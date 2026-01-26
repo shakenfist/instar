@@ -26,13 +26,6 @@ jobs:
       cancel-in-progress: true
 
     steps:
-      - name: Clean workspace
-        run: |
-          # Self-hosted runners don't auto-clean; remove leftover state
-          rm -rf ${GITHUB_WORKSPACE}/imago
-          rm -rf ${GITHUB_WORKSPACE}/imago-testdata
-          rm -f ${GITHUB_WORKSPACE}/*.txt
-
       - name: Set environment variables
         run: |
           {
@@ -245,10 +238,25 @@ jobs:
           ## Important Notes
 
           - The testdata is at $IMAGO_TESTDATA_PATH (set in environment)
-          - Build with `make imago` before testing
-          - Run tests with `make test`
           - For malicious images, NEVER run qemu-img - use imago only
           - Follow the quirk documentation patterns in existing image_notes files
+
+          ## CRITICAL: Always Use Make Targets
+
+          NEVER run cargo, docker, or rustc commands directly. Always use the
+          Makefile targets which handle user permissions correctly:
+
+          - Build: `make imago` (NOT `cargo build`)
+          - Test: `make test` or `make test-container` (NOT direct pytest/stestr)
+          - Lint: `make lint` or `make lint-fix` (NOT direct cargo clippy/rustfmt)
+          - Clean: `make clean-imago` (NOT `rm -rf target`)
+
+          Running cargo/docker directly creates files owned by root, which breaks
+          the CI runner's ability to clean up between jobs. The Makefile targets
+          run builds inside containers with correct user mapping.
+
+          If you need to explore or debug, use the pre-built binary at
+          `src/target/release/imago` - do not rebuild unless necessary.
           PROMPT_EOF
 
           echo "Prompt prepared:"
