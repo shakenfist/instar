@@ -372,6 +372,7 @@ test-container: imago-devcontainer imago
 	docker run --rm \
 		--device=/dev/kvm \
 		-u "$(shell id -u):$(shell id -g)" \
+		--group-add "$$(stat -c '%g' /dev/kvm)" \
 		-e HOME=/build \
 		-e IMAGO_TESTDATA_PATH=/testdata \
 		-v "$(CURDIR):/workspace" \
