@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1
-FROM mcr.microsoft.com/devcontainers/base:debian
+# Use Debian bookworm for GLIBC 2.36 compatibility with CI runners
+FROM mcr.microsoft.com/devcontainers/base:bookworm
 
 # Install protobuf compiler (required for micropb-gen)
 RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/apt/lists/*
