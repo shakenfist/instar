@@ -161,6 +161,10 @@ pub unsafe extern "C" fn _start() -> u64 {
             }
             ImageFormat::Vmdk4 => {
                 parse_vmdk4_header(&buffer, &mut result, &mut vmdk_info, call_table);
+                // Set compressed flag if createType indicates compression (e.g., streamOptimized)
+                if vmdk_info.create_type_str() == "streamOptimized" {
+                    result.flags |= InfoResult::FLAG_COMPRESSED;
+                }
             }
             ImageFormat::Vhd => {
                 // VHD footer may be in first sector (dynamic) or last sector (fixed)
