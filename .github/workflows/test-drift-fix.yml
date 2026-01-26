@@ -47,8 +47,10 @@ jobs:
 
       - name: Resparsify test images
         run: |
-          # Git streaming may fill sparse holes with zeros, affecting qemu-img
-          # disk_size output. Re-punch holes to normalize sparseness.
+          # Git streaming fills sparse holes with zeros, affecting qemu-img
+          # disk_size output. Restore sparseness using cp --sparse=always,
+          # which is more robust than fallocate -d for files with partial
+          # zero blocks or complex sparse patterns.
           cd ${GITHUB_WORKSPACE}/imago-testdata
           find downloaded/ -type f \( \
             -name "*.qcow2" -o \
@@ -56,7 +58,10 @@ jobs:
             -name "*.vhd" -o \
             -name "*.vhdx" -o \
             -name "*.img" \
-          \) -exec fallocate -d {} \;
+          \) -print0 | while IFS= read -r -d '' file; do
+            cp --sparse=always "$file" "$file.sparse"
+            mv "$file.sparse" "$file"
+          done
 
       - name: Check filesystem block size
         run: |
