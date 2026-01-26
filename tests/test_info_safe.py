@@ -10,6 +10,7 @@ qemu-img does not need to be installed.
 """
 
 import json
+import os
 from pathlib import Path
 
 import testscenarios
@@ -17,65 +18,76 @@ import testscenarios
 from base import ImagoTestBase
 
 
+# Test images to verify against each profile
+# These should be images that exist in all profile baselines
+TEST_IMAGES = [
+    'cirros-qcow2',
+    'qcow2-v2',
+]
+
+
+def _generate_scenarios():
+    """Generate test scenarios for all profile/image combinations.
+
+    This function is called at module load time to populate scenarios
+    before testscenarios performs test multiplication.
+    """
+    scenarios = []
+
+    tests_dir = Path(__file__).parent
+
+    # Resolve testdata root - can be overridden by environment variable
+    testdata_env = os.environ.get('IMAGO_TESTDATA_PATH')
+    if testdata_env:
+        testdata_root = Path(testdata_env)
+    else:
+        testdata_root = tests_dir.parent.parent / 'imago-testdata'
+
+    if not testdata_root.exists():
+        # Return empty scenarios if testdata not available
+        # Tests will be skipped appropriately
+        return scenarios
+
+    # Test both human and json output formats
+    for output_type in ['human', 'json']:
+        output_type_dir = f'qemu-img-{output_type}'
+        version_map_path = (
+            testdata_root / 'expected-outputs' /
+            output_type_dir / 'version-map.json'
+        )
+
+        if not version_map_path.exists():
+            continue
+
+        with open(version_map_path) as f:
+            version_map = json.load(f)
+
+        profiles = version_map.get('profiles', {})
+
+        for profile_name in sorted(profiles.keys()):
+            for image_id in TEST_IMAGES:
+                # Check if baseline exists for this image/profile
+                baseline_path = (
+                    testdata_root / 'expected-outputs' /
+                    output_type_dir / 'profiles' / profile_name /
+                    f'{image_id}.stdout.txt'
+                )
+                if baseline_path.exists():
+                    scenario_name = f'{output_type}-{profile_name}-{image_id}'
+                    scenarios.append((scenario_name, {
+                        'profile': profile_name,
+                        'image_id': image_id,
+                        'output_type': output_type,
+                    }))
+
+    return scenarios
+
+
 class TestInfoSafe(testscenarios.WithScenarios, ImagoTestBase):
     """Test imago info output against stored baselines for all profiles."""
 
-    # Test images to verify against each profile
-    # These should be images that exist in all profile baselines
-    test_images = [
-        'cirros-qcow2',
-        'qcow2-v2',
-    ]
-
-    @classmethod
-    def generate_scenarios(cls):
-        """Generate test scenarios for all profile/image combinations."""
-        scenarios = []
-
-        tests_dir = Path(__file__).parent
-        testdata_root = tests_dir.parent.parent / 'imago-testdata'
-
-        # Test both human and json output formats
-        for output_type in ['human', 'json']:
-            output_type_dir = f'qemu-img-{output_type}'
-            version_map_path = (
-                testdata_root / 'expected-outputs' /
-                output_type_dir / 'version-map.json'
-            )
-
-            if not version_map_path.exists():
-                continue
-
-            with open(version_map_path) as f:
-                version_map = json.load(f)
-
-            profiles = version_map.get('profiles', {})
-
-            for profile_name in sorted(profiles.keys()):
-                for image_id in cls.test_images:
-                    # Check if baseline exists for this image/profile
-                    baseline_path = (
-                        testdata_root / 'expected-outputs' /
-                        output_type_dir / 'profiles' / profile_name /
-                        f'{image_id}.stdout.txt'
-                    )
-                    if baseline_path.exists():
-                        scenario_name = f'{output_type}-{profile_name}-{image_id}'
-                        scenarios.append((scenario_name, {
-                            'profile': profile_name,
-                            'image_id': image_id,
-                            'output_type': output_type,
-                        }))
-
-        return scenarios
-
-    scenarios = []  # Populated by setUpClass
-
-    @classmethod
-    def setUpClass(cls):
-        """Generate scenarios before running tests."""
-        super().setUpClass()
-        cls.scenarios = cls.generate_scenarios()
+    # Scenarios must be populated at class definition time for testscenarios
+    scenarios = _generate_scenarios()
 
     def test_output_matches_baseline(self):
         """Test that imago output matches the stored baseline for this profile."""
