@@ -817,7 +817,7 @@ fn parse_hex_value(bytes: &[u8]) -> Option<u32> {
             b'0'..=b'9' => b - b'0',
             b'a'..=b'f' => b - b'a' + 10,
             b'A'..=b'F' => b - b'A' + 10,
-            b'\r' | b'\n' | 0 => break, // End of value
+            b' ' | b'\r' | b'\n' | 0 => break, // End of value (space terminates)
             _ => return None,
         };
         value = value.checked_mul(16)?.checked_add(digit as u32)?;
