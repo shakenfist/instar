@@ -43,6 +43,16 @@
             "description": "Dynamic VHD created by Hyper-V 2012 R2",
             "tags": ["vhd", "hyper-v"],
             "sha256": "1340b8a51517ba5f0112c47694f3c8a4a2bb4f9933336a18cf0392f3490c6674"
+        },
+        {
+            "id": "qemu-vhdx",
+            "path": "downloaded/qemu-iotests/iotest-dynamic-1G.vhdx",
+            "format": "vhdx",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "VHDX format dynamic disk from QEMU iotests",
+            "tags": ["vhdx", "dynamic"],
+            "sha256": "a4fb24fa51fb4852d5a6bdc2b390a91b0a4e19b47696edc5a00c816067257402"
         }
     ]
 }
