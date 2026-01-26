@@ -73,6 +73,16 @@
             "description": "VMDK native version 3 format from QEMU iotests",
             "tags": ["vmdk", "version-3"],
             "sha256": "0b67f248809938335a6f9375a8a76b3079f7c7e355df2837d5e05c9b45aaad5c"
+        },
+        {
+            "id": "virtualpc-vhd",
+            "path": "downloaded/qemu-iotests/virtualpc-dynamic.vhd",
+            "format": "vpc",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "Dynamic VHD created by Virtual PC (different creator than Hyper-V)",
+            "tags": ["vhd", "virtual-pc"],
+            "sha256": "7675fd9bcc5f705f69e69a2c5e948d2a6522eaac044540a0782ae6097a458d6a"
         }
     ]
 }
