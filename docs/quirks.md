@@ -176,6 +176,54 @@ When `--ignore-quirks` is specified:
 | file length | max(actual, metadata calc) | Actual file size |
 | Size formatting | 3 significant figures | 1 decimal place |
 
+## File Sparseness and Git
+
+### Observed Behavior
+
+qemu-img's reported "disk size" depends on the actual allocation of sparse
+files on disk. When disk images are transferred through git (clone, fetch),
+sparse holes may be filled with zeros, increasing the reported disk size.
+
+For example, the `iotest-dynamic-1G.vhdx` file:
+- Original (sparse): disk size 66.1 MiB
+- After git clone: disk size 100 MiB (holes filled with zeros)
+- After `fallocate -d`: disk size 66.1 MiB (holes restored)
+
+### Root Cause
+
+Git stores file contents as blobs and does not preserve sparse file semantics.
+When git writes a file during checkout, it writes all bytes sequentially,
+effectively "filling in" sparse holes with actual zero bytes. This increases
+the file's allocated blocks on disk.
+
+### CI/Testing Implications
+
+Test baselines are generated with sparse files. When the testdata repository
+is cloned in CI, the files may lose sparseness, causing disk_size mismatches.
+
+### Solution
+
+After cloning the testdata repository, run `fallocate --dig-holes` on the
+image files to restore sparse holes:
+
+```bash
+find downloaded/ -type f \( \
+    -name "*.qcow2" -o \
+    -name "*.vmdk" -o \
+    -name "*.vhd" -o \
+    -name "*.vhdx" -o \
+    -name "*.img" \
+\) -exec fallocate -d {} \;
+```
+
+This scans each file for zero-filled regions and converts them back to
+sparse holes, normalizing the disk allocation to match the original.
+
+### Note
+
+This is not a qemu-img quirk per se, but rather a filesystem/git interaction
+that affects qemu-img output consistency in CI environments.
+
 ## Future Additions
 
 Additional quirks will be documented here as they are discovered during

@@ -52,6 +52,19 @@ jobs:
             http://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git \
             imago-testdata
 
+      - name: Resparsify test images
+        run: |
+          # Git streaming may fill sparse holes with zeros, affecting qemu-img
+          # disk_size output. Re-punch holes to normalize sparseness.
+          cd ${GITHUB_WORKSPACE}/imago-testdata
+          find downloaded/ -type f \( \
+            -name "*.qcow2" -o \
+            -name "*.vmdk" -o \
+            -name "*.vhd" -o \
+            -name "*.vhdx" -o \
+            -name "*.img" \
+          \) -exec fallocate -d {} \;
+
       - name: Create working branch
         run: |
           cd ${GITHUB_WORKSPACE}/imago
