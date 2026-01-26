@@ -12,7 +12,8 @@
             "run_in_ci": true,
             "description": "CirrOS minimal cloud image, real-world qcow2 example",
             "tags": ["qcow2", "cloud-image", "production-like"],
-            "sha256": "7d6355852aeb6dbcd191bcda7cd74f1536cfe5cbf8a10495a7283a8396e4b75b"
+            "sha256": "7d6355852aeb6dbcd191bcda7cd74f1536cfe5cbf8a10495a7283a8396e4b75b",
+            "disk_blocks": 41640
         },
         {
             "id": "qcow2-v2",
@@ -22,7 +23,8 @@
             "run_in_ci": true,
             "description": "QCOW2 version 2 format (compat=0.10)",
             "tags": ["qcow2", "version-2"],
-            "sha256": "9ddff3f485139a881a3836119b582e64bfd9a97523743ca57f45ae98ab8686da"
+            "sha256": "9ddff3f485139a881a3836119b582e64bfd9a97523743ca57f45ae98ab8686da",
+            "disk_blocks": 104
         },
         {
             "id": "plaso-vmdk",

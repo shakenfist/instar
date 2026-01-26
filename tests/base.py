@@ -226,6 +226,44 @@ class ImagoTestBase(testtools.TestCase):
                 f'Regenerate baselines in imago-testdata or update manifest hash.'
             )
 
+        # Also check disk_blocks (st_blocks) for sparseness drift
+        self.skip_if_disk_blocks_mismatch(image)
+
+    def skip_if_disk_blocks_mismatch(self, image: TestImage) -> None:
+        """
+        Skip the test if the file's disk blocks don't match the manifest.
+
+        qemu-img reports disk size based on st_blocks, which varies depending
+        on filesystem sparseness. If a file is copied without preserving
+        sparseness (e.g., via git clone), st_blocks may differ from when
+        baselines were captured, causing disk size mismatches.
+        """
+        if image.disk_blocks is None:
+            return  # No disk_blocks specified, don't check
+
+        if not image.path.exists():
+            return  # Can't check non-existent file
+
+        # Get actual st_blocks from filesystem
+        try:
+            stat_result = image.path.stat()
+            # st_blocks is in 512-byte units on Unix
+            actual_blocks = getattr(stat_result, 'st_blocks', None)
+            if actual_blocks is None:
+                return  # Platform doesn't support st_blocks
+
+            if actual_blocks != image.disk_blocks:
+                self.skipTest(
+                    f'Image {image.id} has different sparseness than baselines.\n'
+                    f'  Expected st_blocks: {image.disk_blocks}\n'
+                    f'  Actual st_blocks:   {actual_blocks}\n'
+                    f'This causes disk size differences in qemu-img output.\n'
+                    f'Regenerate baselines on this machine or update manifest '
+                    f'disk_blocks.'
+                )
+        except OSError:
+            pass  # Can't stat file, skip check
+
     def get_imago_binary(self) -> Path:
         """Get path to the imago binary."""
         # Can be overridden by environment variable

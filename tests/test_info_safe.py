@@ -10,6 +10,7 @@ qemu-img does not need to be installed.
 """
 
 import json
+import os
 from pathlib import Path
 
 import testscenarios
@@ -33,7 +34,13 @@ class TestInfoSafe(testscenarios.WithScenarios, ImagoTestBase):
         scenarios = []
 
         tests_dir = Path(__file__).parent
-        testdata_root = tests_dir.parent.parent / 'imago-testdata'
+
+        # Resolve testdata root - can be overridden by environment variable
+        testdata_env = os.environ.get('IMAGO_TESTDATA_PATH')
+        if testdata_env:
+            testdata_root = Path(testdata_env)
+        else:
+            testdata_root = tests_dir.parent.parent / 'imago-testdata'
 
         # Test both human and json output formats
         for output_type in ['human', 'json']:

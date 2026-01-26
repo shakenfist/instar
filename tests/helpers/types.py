@@ -20,6 +20,7 @@ class TestImage:
     expected_error: Optional[str] = None
     cve_references: list = field(default_factory=list)
     sha256: Optional[str] = None
+    disk_blocks: Optional[int] = None  # st_blocks value for sparseness verification
 
     @property
     def is_safe(self) -> bool:
@@ -47,4 +48,5 @@ class TestImage:
             expected_error=data.get('expected_error'),
             cve_references=data.get('cve_references', []),
             sha256=data.get('sha256'),
+            disk_blocks=data.get('disk_blocks'),
         )
