@@ -190,6 +190,23 @@ jobs:
           6. Run `pre-commit run --all-files` to check formatting
           7. Stage all changes with git add (do NOT commit)
 
+          ## STOP: Read These Rules First
+
+          **NEVER run these commands directly - they create root-owned files:**
+
+          - `cargo build`, `cargo test`, `cargo clippy`, `cargo fmt`
+          - `docker build`, `docker run`
+          - `rustc`, `rustfmt`
+
+          **ALWAYS use these Makefile targets instead:**
+
+          - Build: `make imago`
+          - Test: `make test` or `make test-container`
+          - Lint: `make lint` or `make lint-fix`
+
+          The pre-built binary is at `src/target/release/imago` - use it directly
+          for testing without rebuilding.
+
           ## Important Notes
 
           - The testdata is at $IMAGO_TESTDATA_PATH (set in environment)
@@ -222,22 +239,11 @@ jobs:
           baseline data. The baselines represent what qemu-img actually outputs
           and must not be changed to match imago's current behavior.
 
-          ## CRITICAL: Always Use Make Targets
+          ## Reminder: Use Make Targets Only
 
-          NEVER run cargo, docker, or rustc commands directly. Always use the
-          Makefile targets which handle user permissions correctly:
-
-          - Build: `make imago` (NOT `cargo build`)
-          - Test: `make test` or `make test-container` (NOT direct pytest/stestr)
-          - Lint: `make lint` or `make lint-fix` (NOT direct cargo clippy/rustfmt)
-          - Clean: `make clean-imago` (NOT `rm -rf target`)
-
-          Running cargo/docker directly creates files owned by root, which breaks
-          the CI runner's ability to clean up between jobs. The Makefile targets
-          run builds inside containers with correct user mapping.
-
-          If you need to explore or debug, use the pre-built binary at
-          `src/target/release/imago` - do not rebuild unless necessary.
+          See "STOP: Read These Rules First" above. Running cargo/docker directly
+          creates root-owned files that break CI cleanup. Use `make imago`,
+          `make test`, and `make lint` exclusively.
           PROMPT_EOF
 
           echo "Prompt prepared:"

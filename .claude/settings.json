@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(cargo:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo run:*)",
+      "Bash(docker run:*)",
+      "Bash(docker build:*)",
+      "Bash(docker exec:*)",
+      "Bash(rustc:*)",
+      "Bash(rustfmt:*)"
+    ]
+  }
+}
