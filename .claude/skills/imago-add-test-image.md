@@ -1,7 +1,7 @@
 # Skill: Add Test Image to imago Test Suite
 
 Add a new disk image to the imago integration test suite. This skill handles
-both safe images (compared against live qemu-img output) and malicious images
+both safe images (compared against stored baseline outputs) and malicious images
 (compared against stored expected output files).
 
 ## When to Use
@@ -52,17 +52,35 @@ For malicious images, also add:
     "expected_override": "expected_outputs/<image-id>.txt"
 ```
 
-### Step 4: For Safe Images - Add Test Scenario
+### Step 4: For Safe Images - Generate Baseline Outputs
 
-Add scenario to `tests/test_info_safe.py`:
+Safe images are tested against stored baseline outputs in the `imago-testdata`
+repository. The test suite iterates all known output profiles (qemu-img version
+groups) and verifies that imago produces matching output for each profile.
 
-```python
-class TestInfoSafe(testscenarios.WithScenarios, ImagoTestBase):
-    scenarios = [
-        # ... existing scenarios ...
-        ('<image-id>', {'image_id': '<image-id>'}),
-    ]
-```
+**Important**: Tests do NOT run qemu-img live. They compare against pre-generated
+baselines stored in `imago-testdata/expected-outputs/`.
+
+1. **Add to test_images list** in `tests/test_info_safe.py`:
+   ```python
+   test_images = [
+       'cirros-qcow2',
+       'qcow2-v2',
+       '<image-id>',  # Add your new image
+   ]
+   ```
+
+2. **Generate baseline outputs** in the `imago-testdata` repository:
+   - For each profile (profile-6-0-0, profile-8-0-0), run qemu-img on the image
+     using a qemu-img version that matches that profile
+   - Store outputs in `expected-outputs/qemu-img-human/profiles/<profile>/<image-id>.stdout.txt`
+
+3. **Alternatively**, run the baseline generation scripts in imago-testdata:
+   ```bash
+   cd ../imago-testdata
+   ./scripts/capture-outputs.sh
+   ./scripts/generate-profiles.sh
+   ```
 
 ### Step 5: For Malicious Images - Create Expected Output
 
@@ -97,7 +115,8 @@ make test-malicious
 
 ### Step 7: Verify Output Matches
 
-For safe images, the test compares imago output against qemu-img output.
+For safe images, the test iterates all output profiles and compares imago output
+(when run with `--qemu-version X.Y`) against stored baseline outputs.
 Any difference fails the test.
 
 For malicious images, the test compares imago output against the stored
@@ -148,6 +167,12 @@ User: Add the CirrOS 0.6.3 image to the test suite
 5. Tags: qcow2, cloud-image, production-like
 ```
 
+Steps:
+1. Add to manifest.json
+2. Add image ID to test_images list in test_info_safe.py
+3. Generate baseline outputs in imago-testdata for all profiles
+4. Run `make test` to verify
+
 ## Example: Adding a Malicious Image
 
 ```
@@ -166,18 +191,31 @@ For malicious images:
 - Verify backing file path is correctly reported
 - Verify no actual file content from /etc/passwd appears
 
+## Output Profiles
+
+The test suite verifies imago output against multiple qemu-img version profiles:
+
+| Profile | qemu-img Versions | Key Feature |
+|---------|-------------------|-------------|
+| `profile-6-0-0` | 6.0 - 7.x | No "Child node '/file'" section |
+| `profile-8-0-0` | 8.0+ | Includes "Child node '/file'" section |
+
+See `docs/output-formats.md` for detailed profile documentation.
+
 ## Key Files
 
 | File | Purpose |
 |------|---------|
 | `tests/manifest.json` | Test image definitions |
-| `tests/test_info_safe.py` | Safe image test scenarios |
+| `tests/test_info_safe.py` | Safe image test - iterates profiles and baselines |
 | `tests/test_info_malicious.py` | Malicious image test scenarios |
 | `tests/expected_outputs/` | Expected output files for malicious images |
 | `tests/helpers/types.py` | TestImage dataclass |
 | `docs/quirks.md` | qemu-img quirks and `--ignore-quirks` documentation |
 | `docs/image_notes/` | Per-image documentation of quirks discovered |
 | `docs/image_notes/README.md` | Index of image notes |
+| `imago-testdata/expected-outputs/` | Stored baseline outputs for all profiles |
+| `imago-testdata/expected-outputs/qemu-img-human/version-map.json` | Profile definitions |
 
 ## Safety Reminders
 

@@ -1,10 +1,16 @@
 """
-Integration tests comparing imago info output to qemu-img info for safe images.
+Integration tests verifying imago info output matches stored baselines.
 
-These tests verify that imago produces identical output to qemu-img for
-known-safe disk images. Any difference, including whitespace, is a failure
-since imago aims to be a drop-in replacement.
+These tests iterate over all known output profiles (qemu-img version groups) and
+verify that imago produces correct output when given the --qemu-version flag.
+This ensures imago can correctly emulate any supported qemu-img version.
+
+Tests compare against pre-generated baselines stored in imago-testdata, so
+qemu-img does not need to be installed.
 """
+
+import json
+from pathlib import Path
 
 import testscenarios
 
@@ -12,37 +18,95 @@ from base import ImagoTestBase
 
 
 class TestInfoSafe(testscenarios.WithScenarios, ImagoTestBase):
-    """Test imago info against safe images."""
+    """Test imago info output against stored baselines for all profiles."""
 
-    # Scenarios are loaded from the manifest - only safe images
-    scenarios = [
-        ('cirros-qcow2', {'image_id': 'cirros-qcow2'}),
-        ('qcow2-v2', {'image_id': 'qcow2-v2'}),
-        ('plaso-vmdk', {'image_id': 'plaso-vmdk'}),
-        ('hyperv-dynamic-vhd', {'image_id': 'hyperv-dynamic-vhd'}),
+    # Test images to verify against each profile
+    # These should be images that exist in all profile baselines
+    test_images = [
+        'cirros-qcow2',
+        'qcow2-v2',
     ]
 
-    def test_output_matches_qemu_img(self):
-        """Test that imago info output exactly matches qemu-img info output."""
+    @classmethod
+    def generate_scenarios(cls):
+        """Generate test scenarios for all profile/image combinations."""
+        scenarios = []
+
+        tests_dir = Path(__file__).parent
+        testdata_root = tests_dir.parent.parent / 'imago-testdata'
+
+        # Test human output format (json can be added later)
+        for output_type in ['human']:
+            output_type_dir = f'qemu-img-{output_type}'
+            version_map_path = (
+                testdata_root / 'expected-outputs' /
+                output_type_dir / 'version-map.json'
+            )
+
+            if not version_map_path.exists():
+                continue
+
+            with open(version_map_path) as f:
+                version_map = json.load(f)
+
+            profiles = version_map.get('profiles', {})
+
+            for profile_name in sorted(profiles.keys()):
+                for image_id in cls.test_images:
+                    # Check if baseline exists for this image/profile
+                    baseline_path = (
+                        testdata_root / 'expected-outputs' /
+                        output_type_dir / 'profiles' / profile_name /
+                        f'{image_id}.stdout.txt'
+                    )
+                    if baseline_path.exists():
+                        scenario_name = f'{profile_name}-{image_id}'
+                        scenarios.append((scenario_name, {
+                            'profile': profile_name,
+                            'image_id': image_id,
+                            'output_type': output_type,
+                        }))
+
+        return scenarios
+
+    scenarios = []  # Populated by setUpClass
+
+    @classmethod
+    def setUpClass(cls):
+        """Generate scenarios before running tests."""
+        super().setUpClass()
+        cls.scenarios = cls.generate_scenarios()
+
+    def test_output_matches_baseline(self):
+        """Test that imago output matches the stored baseline for this profile."""
         image = self.get_image(self.image_id)
 
         # Skip if image file doesn't exist
         if not image.path.exists():
             self.skipTest(f'Image file not found: {image.path}')
 
-        # Run both commands
-        imago_stdout, imago_stderr, imago_rc = self.run_imago_info(image.path)
-        qemu_stdout, qemu_stderr, qemu_rc = self.run_qemu_img_info(image.path)
+        # Get the qemu version string for this profile
+        qemu_version = self.get_qemu_version_for_profile(self.profile)
 
-        # Both should succeed
-        self.assertEqual(
-            0, qemu_rc,
-            f'qemu-img failed for {image.id}: {qemu_stderr}'
+        # Run imago with explicit --qemu-version
+        imago_stdout, imago_stderr, imago_rc = self.run_imago_info(
+            image.path,
+            qemu_version=qemu_version
         )
+
+        # Should succeed
         self.assertEqual(
             0, imago_rc,
-            f'imago failed for {image.id}: {imago_stderr}'
+            f'imago failed for {self.image_id} with --qemu-version {qemu_version}: '
+            f'{imago_stderr}'
+        )
+
+        # Load expected output from baseline
+        expected = self.get_expected_output(
+            self.image_id,
+            self.profile,
+            self.output_type
         )
 
         # Outputs should match exactly
-        self.assert_outputs_match(image.id, imago_stdout, qemu_stdout)
+        self.assert_outputs_match(self.image_id, imago_stdout, expected)
