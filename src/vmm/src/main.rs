@@ -392,12 +392,29 @@ fn print_info_result(
     disk_blocks: u64,
     ignore_quirks: bool,
     profile: &version::OutputProfile,
+    output_format: &str,
 ) {
     if let Some(guest_::GuestMessage_::Payload::InfoResult(info)) = &msg.payload {
         // Get absolute path for filename
         let abs_path = std::fs::canonicalize(filename)
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| filename.to_string());
+
+        // Calculate disk size
+        // qemu-img reports disk size based on st_blocks (actual disk blocks used),
+        // which accounts for sparse files. st_blocks is in 512-byte units.
+        // With --ignore-quirks, use the actual file size.
+        let disk_size = if ignore_quirks {
+            file_size
+        } else {
+            // st_blocks is in 512-byte units
+            disk_blocks * 512
+        };
+
+        if output_format == "json" {
+            print_info_result_json(info, &abs_path, file_size, disk_size, profile);
+            return;
+        }
 
         // Line 1: image path
         println!("image: {}", abs_path);
@@ -520,6 +537,141 @@ fn print_info_result(
     }
 }
 
+/// Print info result in JSON format (matching qemu-img info --output=json)
+fn print_info_result_json(
+    info: &guest_::InfoResultMessage,
+    abs_path: &str,
+    file_size: u64,
+    disk_size: u64,
+    profile: &version::OutputProfile,
+) {
+    // Build JSON output to match qemu-img's format exactly
+    // qemu-img uses 4-space indentation
+
+    println!("{{");
+
+    // Children section (qemu-img 8.0+ only)
+    if profile.include_child_node {
+        println!("    \"children\": [");
+        println!("        {{");
+        println!("            \"name\": \"file\",");
+        println!("            \"info\": {{");
+        println!("                \"children\": [");
+        println!("                ],");
+        println!("                \"virtual-size\": {},", file_size);
+        println!(
+            "                \"filename\": \"{}\",",
+            escape_json_string(abs_path)
+        );
+        println!("                \"format\": \"file\",");
+        println!("                \"actual-size\": {},", disk_size);
+        println!("                \"format-specific\": {{");
+        println!("                    \"type\": \"file\",");
+        println!("                    \"data\": {{");
+        println!("                    }}");
+        println!("                }},");
+        println!("                \"dirty-flag\": false");
+        println!("            }}");
+        println!("        }}");
+        println!("    ],");
+    }
+
+    println!("    \"virtual-size\": {},", info.virtual_size);
+    println!("    \"filename\": \"{}\",", escape_json_string(abs_path));
+
+    if info.cluster_size > 0 {
+        println!("    \"cluster-size\": {},", info.cluster_size);
+    }
+
+    println!("    \"format\": \"{}\",", info.format);
+    println!("    \"actual-size\": {},", disk_size);
+
+    // Format-specific section
+    if info.format == "qcow2" {
+        println!("    \"format-specific\": {{");
+        println!("        \"type\": \"qcow2\",");
+        println!("        \"data\": {{");
+
+        let compat = if info.qcow2_info.compat.is_empty() {
+            "0.10"
+        } else {
+            info.qcow2_info.compat.as_str()
+        };
+        let is_v3 = compat == "1.1";
+
+        println!("            \"compat\": \"{}\",", compat);
+
+        let compression = if info.qcow2_info.compression_type.is_empty() {
+            "zlib"
+        } else {
+            info.qcow2_info.compression_type.as_str()
+        };
+        println!("            \"compression-type\": \"{}\",", compression);
+
+        if is_v3 {
+            println!(
+                "            \"lazy-refcounts\": {},",
+                info.qcow2_info.lazy_refcounts
+            );
+        }
+
+        let refcount_bits = if info.qcow2_info.refcount_bits == 0 {
+            16
+        } else {
+            info.qcow2_info.refcount_bits
+        };
+
+        if is_v3 {
+            println!("            \"refcount-bits\": {},", refcount_bits);
+            println!("            \"corrupt\": {},", info.qcow2_info.corrupt);
+            println!(
+                "            \"extended-l2\": {}",
+                info.qcow2_info.extended_l2
+            );
+        } else {
+            // For v2, refcount-bits is the last field (no trailing comma)
+            println!("            \"refcount-bits\": {}", refcount_bits);
+        }
+
+        println!("        }}");
+        println!("    }},");
+    } else if info.format == "vmdk" {
+        println!("    \"format-specific\": {{");
+        println!("        \"type\": \"vmdk\",");
+        println!("        \"data\": {{");
+        println!("            \"cid\": {},", info.vmdk_info.cid);
+        println!("            \"parent-cid\": {},", info.vmdk_info.parent_cid);
+        println!(
+            "            \"create-type\": \"{}\"",
+            info.vmdk_info.create_type.as_str()
+        );
+        println!("        }}");
+        println!("    }},");
+    }
+
+    println!("    \"dirty-flag\": false");
+    println!("}}");
+}
+
+/// Escape a string for JSON output
+fn escape_json_string(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => result.push_str("\\\""),
+            '\\' => result.push_str("\\\\"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            c if c.is_control() => {
+                result.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => result.push(c),
+        }
+    }
+    result
+}
+
 /// Get the directory containing the imago executable
 fn get_binary_dir() -> std::path::PathBuf {
     std::env::current_exe()
@@ -571,6 +723,10 @@ struct InfoArgs {
     /// By default, imago detects the installed qemu-img version and matches its output format.
     #[arg(long, value_name = "VERSION")]
     qemu_version: Option<String>,
+
+    /// Output format: human (default) or json
+    #[arg(long, default_value = "human", value_parser = ["human", "json"])]
+    output: String,
 }
 
 #[derive(Args, Debug)]
@@ -897,6 +1053,7 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
                                     input_disk_blocks,
                                     args.ignore_quirks,
                                     &profile,
+                                    &args.output,
                                 );
                             } else {
                                 debug!("{}", format_message(&msg));

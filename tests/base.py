@@ -179,7 +179,8 @@ class ImagoTestBase(testtools.TestCase):
         self,
         image_path: Path,
         timeout: int = 30,
-        qemu_version: Optional[str] = None
+        qemu_version: Optional[str] = None,
+        output_format: Optional[str] = None
     ) -> tuple:
         """
         Run imago info on an image.
@@ -188,6 +189,7 @@ class ImagoTestBase(testtools.TestCase):
             image_path: Path to the image file
             timeout: Timeout in seconds
             qemu_version: Optional qemu-img version to emulate (e.g., '7.2')
+            output_format: Optional output format ('human' or 'json')
 
         Returns:
             tuple: (stdout, stderr, return_code)
@@ -197,6 +199,8 @@ class ImagoTestBase(testtools.TestCase):
         cmd = [str(imago), 'info']
         if qemu_version:
             cmd.extend(['--qemu-version', qemu_version])
+        if output_format:
+            cmd.extend(['--output', output_format])
         cmd.append(str(image_path))
 
         try:
