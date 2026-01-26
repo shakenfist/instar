@@ -31,7 +31,19 @@ Create a kebab-case ID from the description:
 - `qcow2-backing-passwd` for QCOW2 with /etc/passwd backing file
 - `vmdk-monolithic-sparse` for monolithicSparse VMDK
 
-### Step 3: Update Manifest
+### Step 3: Compute Image Hash
+
+Compute the SHA256 hash of the image file for integrity verification:
+
+```bash
+sha256sum ../imago-testdata/<path-to-image>
+```
+
+This hash is stored in the manifest and verified at test time. If the image
+changes but baselines aren't regenerated, the test will skip with a clear
+message instead of failing with a confusing diff.
+
+### Step 4: Update Manifest
 
 Add entry to `tests/manifest.json`:
 
@@ -43,7 +55,8 @@ Add entry to `tests/manifest.json`:
     "safety": "<safe|caution|malicious>",
     "run_in_ci": <true for safe, false for malicious>,
     "description": "<description>",
-    "tags": ["<tag1>", "<tag2>"]
+    "tags": ["<tag1>", "<tag2>"],
+    "sha256": "<sha256-hash-from-step-3>"
 }
 ```
 
@@ -52,7 +65,7 @@ For malicious images, also add:
     "expected_override": "expected_outputs/<image-id>.txt"
 ```
 
-### Step 4: For Safe Images - Generate Baseline Outputs
+### Step 5: For Safe Images - Generate Baseline Outputs
 
 Safe images are tested against stored baseline outputs in the `imago-testdata`
 repository. The test suite iterates all known output profiles (qemu-img version
@@ -82,7 +95,7 @@ baselines stored in `imago-testdata/expected-outputs/`.
    ./scripts/generate-profiles.sh
    ```
 
-### Step 5: For Malicious Images - Create Expected Output
+### Step 6: For Malicious Images - Create Expected Output
 
 **CRITICAL**: Never run qemu-img on malicious images.
 
@@ -103,7 +116,7 @@ baselines stored in `imago-testdata/expected-outputs/`.
    ]
    ```
 
-### Step 6: Run Tests
+### Step 7: Run Tests
 
 ```bash
 # For safe images
@@ -113,7 +126,7 @@ make test
 make test-malicious
 ```
 
-### Step 7: Verify Output Matches
+### Step 8: Verify Output Matches
 
 For safe images, the test iterates all output profiles and compares imago output
 (when run with `--qemu-version X.Y`) against stored baseline outputs.
@@ -122,7 +135,7 @@ Any difference fails the test.
 For malicious images, the test compares imago output against the stored
 expected output file.
 
-### Step 8: Document Any Quirks Discovered
+### Step 9: Document Any Quirks Discovered
 
 If the test reveals unexpected qemu-img behavior that required compatibility
 work in imago:
@@ -143,7 +156,7 @@ work in imago:
 
 See existing files like `docs/image_notes/qcow2-v2.md` for examples.
 
-### Step 9: Verify All Tests Still Pass
+### Step 10: Verify All Tests Still Pass
 
 After making any changes to support the new image, run the full test suite
 to ensure existing images still pass:

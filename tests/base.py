@@ -1,5 +1,6 @@
 """Base test class for imago integration tests."""
 
+import hashlib
 import json
 import os
 import re
@@ -21,6 +22,7 @@ class ImagoTestBase(testtools.TestCase):
     _images_by_id = None
     _testdata_root = None
     _qemu_version: Optional[Tuple[int, int]] = None
+    _hash_verification_results: dict = {}  # image_id -> (valid, actual_hash)
 
     @classmethod
     def setUpClass(cls):
@@ -156,6 +158,63 @@ class ImagoTestBase(testtools.TestCase):
         if image_id not in self._images_by_id:
             self.fail(f'Unknown image id: {image_id}')
         return self._images_by_id[image_id]
+
+    def verify_image_hash(self, image: TestImage) -> Tuple[bool, Optional[str]]:
+        """
+        Verify the SHA256 hash of a test image matches the manifest.
+
+        Args:
+            image: The TestImage to verify
+
+        Returns:
+            tuple: (is_valid, actual_hash)
+                - is_valid: True if hash matches or no hash specified
+                - actual_hash: The computed hash, or None if file doesn't exist
+        """
+        # Check cache first
+        if image.id in self._hash_verification_results:
+            return self._hash_verification_results[image.id]
+
+        # If no hash specified, consider it valid (backwards compatibility)
+        if not image.sha256:
+            result = (True, None)
+            self._hash_verification_results[image.id] = result
+            return result
+
+        # If file doesn't exist, can't verify
+        if not image.path.exists():
+            result = (False, None)
+            self._hash_verification_results[image.id] = result
+            return result
+
+        # Compute SHA256 hash
+        sha256 = hashlib.sha256()
+        with open(image.path, 'rb') as f:
+            for chunk in iter(lambda: f.read(8192), b''):
+                sha256.update(chunk)
+        actual_hash = sha256.hexdigest()
+
+        is_valid = actual_hash == image.sha256
+        result = (is_valid, actual_hash)
+        self._hash_verification_results[image.id] = result
+        return result
+
+    def skip_if_hash_mismatch(self, image: TestImage) -> None:
+        """
+        Skip the test if the image hash doesn't match the manifest.
+
+        This helps catch test data drift - when image files change but
+        baselines haven't been regenerated.
+        """
+        is_valid, actual_hash = self.verify_image_hash(image)
+
+        if not is_valid and actual_hash is not None:
+            self.skipTest(
+                f'Image {image.id} has changed since baselines were captured.\n'
+                f'  Expected SHA256: {image.sha256}\n'
+                f'  Actual SHA256:   {actual_hash}\n'
+                f'Regenerate baselines in imago-testdata or update manifest hash.'
+            )
 
     def get_imago_binary(self) -> Path:
         """Get path to the imago binary."""

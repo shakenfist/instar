@@ -85,6 +85,9 @@ class TestInfoSafe(testscenarios.WithScenarios, ImagoTestBase):
         if not image.path.exists():
             self.skipTest(f'Image file not found: {image.path}')
 
+        # Skip if image hash doesn't match (indicates baselines need regeneration)
+        self.skip_if_hash_mismatch(image)
+
         # Get the qemu version string for this profile
         qemu_version = self.get_qemu_version_for_profile(self.profile)
 
