@@ -664,9 +664,27 @@ fn print_info_result_json(
         println!("            \"cid\": {},", info.vmdk_info.cid);
         println!("            \"parent-cid\": {},", info.vmdk_info.parent_cid);
         println!(
-            "            \"create-type\": \"{}\"",
+            "            \"create-type\": \"{}\",",
             info.vmdk_info.create_type.as_str()
         );
+        // Extents array - for monolithicSparse, there's one extent with the disk info
+        println!("            \"extents\": [");
+        println!("                {{");
+        println!(
+            "                    \"virtual-size\": {},",
+            info.virtual_size
+        );
+        println!(
+            "                    \"filename\": \"{}\",",
+            escape_json_string(abs_path)
+        );
+        println!(
+            "                    \"cluster-size\": {},",
+            info.cluster_size
+        );
+        println!("                    \"format\": \"\"");
+        println!("                }}");
+        println!("            ]");
         println!("        }}");
         println!("    }},");
     }
