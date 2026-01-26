@@ -6,7 +6,9 @@ A safe, sandboxed disk image format converter.
 
 Imago replaces unsafe calls to `qemu-img` with a safer, sandboxed approach.
 Image format conversions are performed within a KVM execution context,
-providing strong isolation from the host system.
+providing strong isolation from the host system. You can read the
+[announcement email I sent to the OpenStack mailing lists](openstack-announcement-email.md)
+if you're interested in my line of reasoning at the time.
 
 The name "imago" comes from Latin (meaning "image") and biology (the final
 adult stage of insect metamorphosis) - reflecting both the image handling
