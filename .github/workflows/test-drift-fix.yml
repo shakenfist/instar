@@ -191,6 +191,32 @@ jobs:
           - For malicious images, NEVER run qemu-img - use imago only
           - Follow the quirk documentation patterns in existing image_notes files
 
+          ## CRITICAL: Do NOT Build Prototypes
+
+          The prototypes/ directory contains experimental code that is NOT relevant
+          to this task. NEVER run any of these commands:
+
+          - `make build-prototype`
+          - `make build-all`
+          - `make run-prototype`
+          - Any command involving the prototypes/ directory
+
+          Building prototypes creates root-owned files that break CI cleanup.
+          Your task is ONLY to fix the main imago binary and tests.
+
+          ## CRITICAL: Do NOT Modify imago-testdata
+
+          The imago-testdata repository at $IMAGO_TESTDATA_PATH contains the
+          authoritative test baselines. NEVER modify any files in this directory:
+
+          - Do NOT edit files in expected-outputs/
+          - Do NOT regenerate baselines or profiles
+          - Do NOT run generate-baselines.py or detect-profiles.py
+
+          If tests fail, the fix must be in the imago code (src/), NOT in the
+          baseline data. The baselines represent what qemu-img actually outputs
+          and must not be changed to match imago's current behavior.
+
           ## CRITICAL: Always Use Make Targets
 
           NEVER run cargo, docker, or rustc commands directly. Always use the
