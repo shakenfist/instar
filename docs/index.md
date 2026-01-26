@@ -97,6 +97,7 @@ Methods for transferring data into and out of bare-metal KVM guests.
 
 | Document | Description |
 |----------|-------------|
+| [Output Formats](output-formats.md) | qemu-img output formats (human, JSON) and version profiles |
 | [qemu-img Quirks](quirks.md) | Known differences between `imago` and qemu-img output |
 | [Image Notes](image_notes/README.md) | Test images and the quirks they exposed |
 

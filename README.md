@@ -37,6 +37,37 @@ sudo src/target/release/imago info <IMAGE>
 sudo src/target/release/imago copy <INPUT> <OUTPUT>
 ```
 
+## Usage
+
+### Image Information
+
+```bash
+# Display image format information (matches qemu-img info output)
+imago info image.qcow2
+```
+
+### Version Compatibility
+
+Different qemu-img versions produce slightly different output formats:
+- **qemu-img 6.0-7.2** (Debian 12 bookworm): No "Child node '/file'" section
+- **qemu-img 8.0+** (Debian 13 trixie): Includes "Child node '/file'" section
+
+By default, imago detects the installed qemu-img version and emits matching output.
+This ensures true drop-in replacement compatibility.
+
+To explicitly specify which qemu-img version's output format to use:
+
+```bash
+# Emit output compatible with qemu-img 7.2 (no Child node section)
+imago info --qemu-version 7.2 image.qcow2
+
+# Emit output compatible with qemu-img 10.0 (includes Child node section)
+imago info --qemu-version 10.0 image.qcow2
+```
+
+See [docs/output-formats.md](docs/output-formats.md) for detailed documentation on
+output format profiles.
+
 ## Prototypes
 
 Working prototypes exploring the KVM-based sandboxing approach:

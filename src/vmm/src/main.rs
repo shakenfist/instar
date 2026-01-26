@@ -25,6 +25,7 @@ mod io_thread;
 mod ioevent;
 mod kvm_stats;
 mod stats;
+mod version;
 mod virtio;
 
 use std::collections::VecDeque;
@@ -390,6 +391,7 @@ fn print_info_result(
     file_size: u64,
     disk_blocks: u64,
     ignore_quirks: bool,
+    profile: &version::OutputProfile,
 ) {
     if let Some(guest_::GuestMessage_::Payload::InfoResult(info)) = &msg.payload {
         // Get absolute path for filename
@@ -499,9 +501,22 @@ fn print_info_result(
             println!("backing file: {}", info.backing_file);
         }
 
-        // Note: qemu-img 7.2.x does NOT output the "Child node '/file'" section.
-        // This section was added in later qemu versions. For compatibility with
-        // qemu-img 7.2.x (Debian 12 / bookworm), we don't output it.
+        // Child node '/file' section (qemu-img 8.0+)
+        // This section exposes information about the underlying protocol layer.
+        if profile.include_child_node {
+            println!("Child node '/file':");
+            println!("    filename: {}", abs_path);
+            println!("    protocol type: file");
+            println!(
+                "    file length: {} ({} bytes)",
+                format_size_human(file_size, qemu_compat),
+                file_size
+            );
+            println!(
+                "    disk size: {}",
+                format_size_human(disk_size, qemu_compat)
+            );
+        }
     }
 }
 
@@ -551,6 +566,11 @@ struct InfoArgs {
     /// Report true filesystem size instead of qemu-img-compatible calculated size
     #[arg(long)]
     ignore_quirks: bool,
+
+    /// Target qemu-img version for output compatibility (e.g., "7.2", "8.0", "10.0").
+    /// By default, imago detects the installed qemu-img version and matches its output format.
+    #[arg(long, value_name = "VERSION")]
+    qemu_version: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -628,6 +648,34 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
         );
         std::process::exit(1);
     }
+
+    // Determine output profile (from --qemu-version flag or by detection)
+    let profile = if let Some(ref version_str) = args.qemu_version {
+        match version::profile_for_version_str(version_str) {
+            Some(p) => {
+                debug!("Using output profile for qemu-img version {}", version_str);
+                p
+            }
+            None => {
+                eprintln!(
+                    "Error: invalid qemu version '{}' (expected format: X.Y)",
+                    version_str
+                );
+                std::process::exit(1);
+            }
+        }
+    } else {
+        let p = version::get_profile();
+        if let Some(v) = &p.version {
+            debug!(
+                "Detected qemu-img version {}, using matching output profile",
+                v
+            );
+        } else {
+            debug!("qemu-img not found, using newest output profile");
+        }
+        p.clone()
+    };
 
     // Auto-discover binaries in same directory as executable
     let core_path = get_binary_path("core.bin");
@@ -848,6 +896,7 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
                                     input_size,
                                     input_disk_blocks,
                                     args.ignore_quirks,
+                                    &profile,
                                 );
                             } else {
                                 debug!("{}", format_message(&msg));

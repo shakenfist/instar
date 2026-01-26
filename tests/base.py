@@ -2,9 +2,10 @@
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import testtools
 
@@ -19,12 +20,14 @@ class ImagoTestBase(testtools.TestCase):
     _manifest = None
     _images_by_id = None
     _testdata_root = None
+    _qemu_version: Optional[Tuple[int, int]] = None
 
     @classmethod
     def setUpClass(cls):
         """Load manifest once for all tests in the class."""
         super().setUpClass()
         cls._load_manifest()
+        cls._detect_qemu_version()
 
     @classmethod
     def _load_manifest(cls):
@@ -58,6 +61,96 @@ class ImagoTestBase(testtools.TestCase):
             image = TestImage.from_dict(img_data, cls._testdata_root)
             cls._images_by_id[image.id] = image
 
+    @classmethod
+    def _detect_qemu_version(cls):
+        """
+        Detect the installed qemu-img version.
+
+        This is only used for tests that verify our version detection code.
+        Profile output tests don't need this - they iterate all profiles
+        explicitly with --qemu-version.
+        """
+        if cls._qemu_version is not None:
+            return
+
+        try:
+            result = subprocess.run(
+                ['qemu-img', '--version'],
+                capture_output=True,
+                text=True
+            )
+            match = re.search(r'qemu-img version (\d+)\.(\d+)', result.stdout)
+            if match:
+                cls._qemu_version = (int(match.group(1)), int(match.group(2)))
+        except FileNotFoundError:
+            pass
+
+    def get_output_profiles(self, output_type: str = 'human') -> dict:
+        """
+        Get all output profiles for a given output type.
+
+        Args:
+            output_type: 'human' or 'json'
+
+        Returns:
+            dict with 'profiles' (profile_name -> representative_version)
+            and 'version_to_profile' (version -> profile_name)
+        """
+        output_type_dir = f'qemu-img-{output_type}'
+        version_map_path = (
+            self._testdata_root / 'expected-outputs' /
+            output_type_dir / 'version-map.json'
+        )
+
+        with open(version_map_path) as f:
+            return json.load(f)
+
+    def get_expected_output(
+        self,
+        image_id: str,
+        profile: str,
+        output_type: str = 'human'
+    ) -> str:
+        """
+        Load expected output for a specific profile from testdata.
+
+        Args:
+            image_id: The test image identifier
+            profile: Profile name (e.g., 'profile-6-0-0', 'profile-8-0-0')
+            output_type: 'human' or 'json'
+
+        Returns:
+            Expected output string
+        """
+        output_type_dir = f'qemu-img-{output_type}'
+        output_path = (
+            self._testdata_root / 'expected-outputs' /
+            output_type_dir / 'profiles' / profile / f'{image_id}.stdout.txt'
+        )
+
+        if not output_path.exists():
+            raise FileNotFoundError(
+                f'No expected output found: {output_path}'
+            )
+
+        return output_path.read_text()
+
+    def get_qemu_version_for_profile(self, profile: str) -> str:
+        """
+        Get a representative qemu version string for a profile.
+
+        Args:
+            profile: Profile name (e.g., 'profile-6-0-0', 'profile-8-0-0')
+
+        Returns:
+            Version string (e.g., '6.0', '8.0') suitable for --qemu-version
+        """
+        # Profile names are like 'profile-X-Y-Z', extract X.Y
+        parts = profile.replace('profile-', '').split('-')
+        if len(parts) >= 2:
+            return f'{parts[0]}.{parts[1]}'
+        return parts[0]
+
     def get_image(self, image_id: str) -> TestImage:
         """Get a test image by its ID."""
         if image_id not in self._images_by_id:
@@ -85,19 +178,30 @@ class ImagoTestBase(testtools.TestCase):
     def run_imago_info(
         self,
         image_path: Path,
-        timeout: int = 30
+        timeout: int = 30,
+        qemu_version: Optional[str] = None
     ) -> tuple:
         """
         Run imago info on an image.
+
+        Args:
+            image_path: Path to the image file
+            timeout: Timeout in seconds
+            qemu_version: Optional qemu-img version to emulate (e.g., '7.2')
 
         Returns:
             tuple: (stdout, stderr, return_code)
         """
         imago = self.get_imago_binary()
 
+        cmd = [str(imago), 'info']
+        if qemu_version:
+            cmd.extend(['--qemu-version', qemu_version])
+        cmd.append(str(image_path))
+
         try:
             result = subprocess.run(
-                [str(imago), 'info', str(image_path)],
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=timeout
