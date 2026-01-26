@@ -51,19 +51,19 @@ actual file is 196,616 bytes.
 
 **Documentation:** [docs/quirks.md](../quirks.md#block-rounded-disk-size)
 
-### 3. Integer Truncation for Values >= 100
+### 3. Banker's Rounding for Values >= 100
 
 **Observed:** qemu-img reports `file length: 192 KiB` for 197,120 bytes
-(192.5 KiB), truncating the .5 instead of rounding to 193.
+(192.5 KiB), rounding to the even integer instead of rounding up to 193.
 
 **Analysis:**
-- 197,120 / 1024 = 192.5 KiB
-- qemu-img's `%0.3g` format with 3 significant figures
-- For values >= 100, the result is an integer, and C printf truncates
-- Rust's `round()` would give 193, so imago uses `floor()` for this range
+- 197,120 / 1024 = 192.5 KiB (exactly at midpoint)
+- qemu-img's `%0.3g` format uses "round half to even" (banker's rounding)
+- At exact midpoints, C rounds to the nearest even number (192, not 193)
+- Rust's `round()` uses "round half away from zero" and would give 193
 
-**Implementation:** imago uses floor() for values >= 100 to match qemu-img's
-observed behavior.
+**Implementation:** imago uses banker's rounding (round half to even) for all
+magnitude ranges to match qemu-img's observed behavior.
 
 **Documentation:** [docs/quirks.md](../quirks.md#human-readable-size-formatting)
 

@@ -15,5 +15,6 @@ behaviors exist and which images can be used to verify them.
 
 | Image | Quirks Discovered |
 |-------|-------------------|
-| [qcow2-v2](qcow2-v2.md) | L1 table file length, block rounding, integer truncation |
+| [qcow2-v2](qcow2-v2.md) | L1 table file length, block rounding, banker's rounding |
 | [cirros-qcow2](cirros-qcow2.md) | Decimal rounding, max(actual, calculated) file length |
+| [virtualpc-vhd](virtualpc-vhd.md) | CHS-based virtual size, banker's rounding |
