@@ -18,12 +18,23 @@ import testscenarios
 from base import ImagoTestBase
 
 
-# Test images to verify against each profile
-# These should be images that exist in all profile baselines
-TEST_IMAGES = [
-    'cirros-qcow2',
-    'qcow2-v2',
-]
+def _get_safe_images_from_manifest():
+    """Load safe image IDs from the manifest file."""
+    tests_dir = Path(__file__).parent
+    manifest_path = tests_dir / 'manifest.json'
+
+    if not manifest_path.exists():
+        return []
+
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+
+    # Return IDs of all images marked as 'safe'
+    return [
+        img['id']
+        for img in manifest.get('images', [])
+        if img.get('safety') == 'safe'
+    ]
 
 
 def _generate_scenarios():
@@ -65,7 +76,7 @@ def _generate_scenarios():
         profiles = version_map.get('profiles', {})
 
         for profile_name in sorted(profiles.keys()):
-            for image_id in TEST_IMAGES:
+            for image_id in _get_safe_images_from_manifest():
                 # Check if baseline exists for this image/profile
                 baseline_path = (
                     testdata_root / 'expected-outputs' /
