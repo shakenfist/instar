@@ -130,6 +130,42 @@ values to match qemu-img's observed output.
 place when the value is not a whole number (e.g., "192.5 KiB" instead of
 "192 KiB").
 
+## Child Node File Length
+
+### Observed Behavior
+
+In qemu-img 8.0+, the Child node '/file' section reports a "file length" (human)
+or "virtual-size" (JSON) that may differ from the actual filesystem size.
+
+qemu-img reports the **larger** of:
+1. The actual filesystem file size
+2. The calculated size based on internal metadata (e.g., L1 table offset
+   rounded up to sector boundary for QCOW2)
+
+For files with data beyond the metadata structures (like real disk images),
+qemu-img reports the actual file size. For minimal files where the metadata
+calculation exceeds the actual size (like empty test images), it reports the
+metadata-based calculation.
+
+### Example
+
+For a minimal QCOW2 v2 test file:
+- Actual file size: 196616 bytes
+- L1 table calculation: (196608 + 512) = 197120 bytes
+- qemu-img file length: max(196616, 197120) = 197120 bytes
+
+For a real disk image (cirros):
+- Actual file size: 21692416 bytes
+- L1 table calculation: much smaller (metadata is at the start)
+- qemu-img file length: max(21692416, calc) = 21692416 bytes
+
+### imago Behavior
+
+**Default behavior**: imago matches qemu-img by reporting the larger of the
+actual file size and the internal metadata calculation.
+
+**With `--ignore-quirks` flag**: imago reports the actual filesystem size.
+
 ## Summary of `--ignore-quirks` Effects
 
 When `--ignore-quirks` is specified:
@@ -137,7 +173,7 @@ When `--ignore-quirks` is specified:
 | Field | Default (qemu-img compatible) | With --ignore-quirks |
 |-------|------------------------------|---------------------|
 | disk size | Block-rounded (4096 bytes) | Actual file size |
-| file length | L1 table calculation | Actual file size |
+| file length | max(actual, metadata calc) | Actual file size |
 | Size formatting | 3 significant figures | 1 decimal place |
 
 ## Future Additions

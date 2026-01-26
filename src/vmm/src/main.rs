@@ -412,7 +412,18 @@ fn print_info_result(
         };
 
         if output_format == "json" {
-            print_info_result_json(info, &abs_path, file_size, disk_size, profile);
+            // For child file length, qemu-img reports the larger of:
+            // 1. The actual filesystem size
+            // 2. The calculated size based on internal metadata (e.g., L1 table for QCOW2)
+            // This handles both files with data beyond metadata (use actual size) and
+            // minimal files where metadata calculation exceeds actual size.
+            // With --ignore-quirks, use the actual filesystem size instead.
+            let child_file_length = if ignore_quirks {
+                file_size
+            } else {
+                std::cmp::max(file_size, info.actual_size)
+            };
+            print_info_result_json(info, &abs_path, child_file_length, disk_size, profile);
             return;
         }
 
@@ -521,13 +532,24 @@ fn print_info_result(
         // Child node '/file' section (qemu-img 8.0+)
         // This section exposes information about the underlying protocol layer.
         if profile.include_child_node {
+            // For file length, qemu-img reports the larger of:
+            // 1. The actual filesystem size
+            // 2. The calculated size based on internal metadata (e.g., L1 table for QCOW2)
+            // This handles both files with data beyond metadata (use actual size) and
+            // minimal files where metadata calculation exceeds actual size.
+            // With --ignore-quirks, use the actual filesystem size instead.
+            let child_file_length = if ignore_quirks {
+                file_size
+            } else {
+                std::cmp::max(file_size, info.actual_size)
+            };
             println!("Child node '/file':");
             println!("    filename: {}", abs_path);
             println!("    protocol type: file");
             println!(
                 "    file length: {} ({} bytes)",
-                format_size_human(file_size, qemu_compat),
-                file_size
+                format_size_human(child_file_length, qemu_compat),
+                child_file_length
             );
             println!(
                 "    disk size: {}",
@@ -541,7 +563,7 @@ fn print_info_result(
 fn print_info_result_json(
     info: &guest_::InfoResultMessage,
     abs_path: &str,
-    file_size: u64,
+    child_file_length: u64,
     disk_size: u64,
     profile: &version::OutputProfile,
 ) {
@@ -558,7 +580,7 @@ fn print_info_result_json(
         println!("            \"info\": {{");
         println!("                \"children\": [");
         println!("                ],");
-        println!("                \"virtual-size\": {},", file_size);
+        println!("                \"virtual-size\": {},", child_file_length);
         println!(
             "                \"filename\": \"{}\",",
             escape_json_string(abs_path)
