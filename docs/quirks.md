@@ -203,8 +203,8 @@ is cloned in CI, the files may lose sparseness, causing disk_size mismatches.
 
 ### Solution
 
-After cloning the testdata repository, run `fallocate --dig-holes` on the
-image files to restore sparse holes:
+After cloning the testdata repository, restore sparse holes using
+`cp --sparse=always` which is more robust than `fallocate -d`:
 
 ```bash
 find downloaded/ -type f \( \
@@ -213,11 +213,22 @@ find downloaded/ -type f \( \
     -name "*.vhd" -o \
     -name "*.vhdx" -o \
     -name "*.img" \
-\) -exec fallocate -d {} \;
+\) -print0 | while IFS= read -r -d '' file; do
+    cp --sparse=always "$file" "$file.sparse"
+    mv "$file.sparse" "$file"
+done
 ```
 
-This scans each file for zero-filled regions and converts them back to
-sparse holes, normalizing the disk allocation to match the original.
+**Why `cp --sparse=always` instead of `fallocate -d`?**
+
+`fallocate -d` (FALLOC_FL_PUNCH_HOLE) can only punch holes in contiguous
+zero-filled regions that are aligned to filesystem block boundaries. Files
+with partial zero blocks (blocks containing mostly zeros but a few non-zero
+bytes) cannot have those regions converted to holes.
+
+`cp --sparse=always` reads the file content and writes a new file, skipping
+zero-filled blocks entirely. This correctly handles files with complex sparse
+patterns where `fallocate -d` would leave extra blocks allocated.
 
 ### Note
 
