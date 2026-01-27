@@ -42,6 +42,12 @@ def _generate_scenarios():
 
     This function is called at module load time to populate scenarios
     before testscenarios performs test multiplication.
+
+    Only generates scenarios where qemu-img successfully read the image
+    (return_code=0). Some images use features not supported by older
+    qemu-img versions (e.g., ZSTD compression), so we skip those
+    combinations rather than expecting imago to emulate qemu-img's
+    failure modes.
     """
     scenarios = []
 
@@ -78,18 +84,30 @@ def _generate_scenarios():
         for profile_name in sorted(profiles.keys()):
             for image_id in _get_safe_images_from_manifest():
                 # Check if baseline exists for this image/profile
-                baseline_path = (
+                profile_dir = (
                     testdata_root / 'expected-outputs' /
-                    output_type_dir / 'profiles' / profile_name /
-                    f'{image_id}.stdout.txt'
+                    output_type_dir / 'profiles' / profile_name
                 )
-                if baseline_path.exists():
-                    scenario_name = f'{output_type}-{profile_name}-{image_id}'
-                    scenarios.append((scenario_name, {
-                        'profile': profile_name,
-                        'image_id': image_id,
-                        'output_type': output_type,
-                    }))
+                baseline_path = profile_dir / f'{image_id}.stdout.txt'
+                meta_path = profile_dir / f'{image_id}.meta.json'
+
+                if not baseline_path.exists():
+                    continue
+
+                # Skip scenarios where qemu-img failed to read the image
+                # (e.g., ZSTD compression not supported in older versions)
+                if meta_path.exists():
+                    with open(meta_path) as f:
+                        meta = json.load(f)
+                    if meta.get('return_code', 0) != 0:
+                        continue
+
+                scenario_name = f'{output_type}-{profile_name}-{image_id}'
+                scenarios.append((scenario_name, {
+                    'profile': profile_name,
+                    'image_id': image_id,
+                    'output_type': output_type,
+                }))
 
     return scenarios
 
