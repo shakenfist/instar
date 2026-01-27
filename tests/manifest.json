@@ -83,6 +83,16 @@
             "description": "Dynamic VHD created by Virtual PC (different creator than Hyper-V)",
             "tags": ["vhd", "virtual-pc"],
             "sha256": "7675fd9bcc5f705f69e69a2c5e948d2a6522eaac044540a0782ae6097a458d6a"
+        },
+        {
+            "id": "qcow2-extended-l2",
+            "path": "downloaded/edge-cases/extended_l2.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "QCOW2 with extended L2 entries for subcluster allocation (QEMU 5.2+)",
+            "tags": ["qcow2", "extended-l2", "subcluster"],
+            "sha256": "d6e1ddf7c3e4154189a8121448c71b99a980111e6909101ab2bfce166e06c87e"
         }
     ]
 }
