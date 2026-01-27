@@ -103,6 +103,16 @@
             "description": "QCOW2 with ZSTD compression (QEMU 5.1+)",
             "tags": ["qcow2", "zstd", "compression"],
             "sha256": "e0cd67978044b159aecec2cfb93c96bb7a99673462512f4ed371c2151e076115"
+        },
+        {
+            "id": "qcow2-lazy-refcounts",
+            "path": "downloaded/edge-cases/lazy_refcounts.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "QCOW2 with lazy refcounts enabled (crash-consistent mode)",
+            "tags": ["qcow2", "lazy-refcounts", "crash-consistent"],
+            "sha256": "5cd68c25f61c475b7e5f63b263e0adc9d2b4dd5f9068df3d8c16dbb1063c1814"
         }
     ]
 }
