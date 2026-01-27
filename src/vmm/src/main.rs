@@ -346,6 +346,23 @@ fn format_size_human(bytes: u64, qemu_compat: bool) -> String {
     }
 }
 
+/// Round half to even (banker's rounding) - matches C printf behavior
+fn round_half_to_even(value: f64) -> f64 {
+    let floor = value.floor();
+    let fract = value - floor;
+
+    if (fract - 0.5).abs() < f64::EPSILON {
+        // Exactly at midpoint - round to even
+        if floor as i64 % 2 == 0 {
+            floor // Already even, round down
+        } else {
+            floor + 1.0 // Odd, round up to even
+        }
+    } else {
+        value.round() // Not at midpoint, use standard rounding
+    }
+}
+
 /// Format a size value
 ///
 /// When `qemu_compat` is true, uses 3 significant figures (like qemu-img's %0.3g).
@@ -353,16 +370,16 @@ fn format_size_human(bytes: u64, qemu_compat: bool) -> String {
 fn format_size_value(value: f64, unit: &str, qemu_compat: bool) -> String {
     if qemu_compat {
         // qemu-img uses %0.3g format (3 significant figures)
-        // For values >= 100, truncates to integer (floor)
-        // For smaller values, rounds to the appropriate decimal places
+        // C's printf uses "round half to even" (banker's rounding), which rounds
+        // midpoints (like 192.5) to the nearest even number (192).
         let rounded = if value >= 100.0 {
-            value.floor()
+            round_half_to_even(value)
         } else if value >= 10.0 {
-            (value * 10.0).round() / 10.0
+            round_half_to_even(value * 10.0) / 10.0
         } else if value >= 1.0 {
-            (value * 100.0).round() / 100.0
+            round_half_to_even(value * 100.0) / 100.0
         } else {
-            (value * 1000.0).round() / 1000.0
+            round_half_to_even(value * 1000.0) / 1000.0
         };
 
         if rounded.fract() == 0.0 {
