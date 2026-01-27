@@ -113,6 +113,16 @@
             "description": "QCOW2 with lazy refcounts enabled (crash-consistent mode)",
             "tags": ["qcow2", "lazy-refcounts", "crash-consistent"],
             "sha256": "5cd68c25f61c475b7e5f63b263e0adc9d2b4dd5f9068df3d8c16dbb1063c1814"
+        },
+        {
+            "id": "qcow2-min-cluster",
+            "path": "downloaded/edge-cases/min_cluster.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "QCOW2 with minimum 512-byte cluster size (parser stress test)",
+            "tags": ["qcow2", "min-cluster", "edge-case"],
+            "sha256": "b998df1302d22aac1fe999bf678086de486712c7129ee73157ee9bc880b0ced2"
         }
     ]
 }
