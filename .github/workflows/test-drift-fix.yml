@@ -434,18 +434,26 @@ jobs:
           git push -f origin test-drift-fix-${DATESTAMP}
           sleep 5
 
+          # Determine PR title - use commit summary first line if available
+          if [ "${{ steps.extract_summary.outputs.summary_found }}" == "true" ] && \
+             [ -s ${GITHUB_WORKSPACE}/commit-summary.txt ]; then
+            # Extract first line (commit title) and remove trailing period for PR title
+            PR_TITLE=$(head -1 ${GITHUB_WORKSPACE}/commit-summary.txt | sed 's/\.$//')
+            # Get the rest of the commit message for the body
+            COMMIT_BODY=$(tail -n +3 ${GITHUB_WORKSPACE}/commit-summary.txt)
+          else
+            PR_TITLE="Fix test suite drift (${DATESTAMP})"
+            COMMIT_BODY="Claude Code automatically fixed test failures and/or added new test images to the integration test suite."
+          fi
+
           gh pr create \
             --assignee mikalstill \
             --reviewer mikalstill \
-            --title "Fix test suite drift (${DATESTAMP})" \
-            --body "$(cat <<'EOF'
+            --title "${PR_TITLE}" \
+            --body "$(cat <<EOF
           ## Summary
 
-          Claude Code automatically fixed test suite issues:
-
-          - Fixed test failures to match qemu-img output
-          - Added new test images to the manifest
-          - Updated quirks documentation as needed
+          ${COMMIT_BODY}
 
           ## Changes
 
