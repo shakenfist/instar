@@ -133,6 +133,16 @@
             "description": "QCOW2 with maximum 2MB cluster size (parser stress test)",
             "tags": ["qcow2", "max-cluster", "edge-case"],
             "sha256": "ade4aabb29681add2cdaacb026a76944ad7abfdabc9c24172328e6c5e1614445"
+        },
+        {
+            "id": "qcow2-refcount-bits-64",
+            "path": "downloaded/edge-cases/refcount_bits_64.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "QCOW2 with maximum 64-bit refcount width",
+            "tags": ["qcow2", "refcount-bits", "edge-case"],
+            "sha256": "74de2184fd23b01b86d41431a2dc94254c84ca969a13e90dcb5abaf7d1931226"
         }
     ]
 }
