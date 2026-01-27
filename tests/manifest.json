@@ -153,6 +153,26 @@
             "description": "QCOW2 with minimum 1-bit refcount width",
             "tags": ["qcow2", "refcount-bits", "edge-case"],
             "sha256": "d042a76218165706aaf05b82361750c547864937693b62da7331c467bc50ed84"
+        },
+        {
+            "id": "vmdk-multi-partition",
+            "path": "downloaded/plaso/multi_partition_image.vmdk",
+            "format": "vmdk",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "Multi-partition monolithicSparse VMDK from plaso project",
+            "tags": ["vmdk", "monolithicSparse", "multi-partition"],
+            "sha256": "fc4995ebfd170d96aabafed181c1b74ec0429ab7b2c2dfa57555af12005fd1a8"
+        },
+        {
+            "id": "debian-12-sfagent",
+            "path": "downloaded/shakenfist/debian-12-sfagent-20260123.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "Real production Shaken Fist agent image based on Debian 12",
+            "tags": ["qcow2", "production", "debian", "cloud-image"],
+            "sha256": "443363b4899b0fc1a50d5dfbc86769d3d65e7b9e0e91ee7902ef860333313f3f"
         }
     ]
 }
