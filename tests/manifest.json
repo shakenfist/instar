@@ -173,6 +173,26 @@
             "description": "Real production Shaken Fist agent image based on Debian 12",
             "tags": ["qcow2", "production", "debian", "cloud-image"],
             "sha256": "443363b4899b0fc1a50d5dfbc86769d3d65e7b9e0e91ee7902ef860333313f3f"
+        },
+        {
+            "id": "vhdx-disk2vhd",
+            "path": "downloaded/qemu-iotests/test-disk2vhd.vhdx",
+            "format": "vhdx",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "VHDX created by Disk2VHD tool from QEMU iotests",
+            "tags": ["vhdx", "disk2vhd"],
+            "sha256": "5b6721d4f26ef13d259c380a7327b794d1c6dd79e386737d77e8d88f43259812"
+        },
+        {
+            "id": "vhd-d2v-zerofilled",
+            "path": "downloaded/qemu-iotests/d2v-zerofilled.vhd",
+            "format": "vpc",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "Zerofilled VHD created by Disk2VHD from QEMU iotests",
+            "tags": ["vhd", "disk2vhd", "zerofilled"],
+            "sha256": "af175e3c442b659e26b91029aacf2e62f2f7cf054404446db3185aafc38e079f"
         }
     ]
 }

@@ -6,13 +6,22 @@ import json
 # Placeholder used in baseline files for the testdata root path
 TESTDATA_ROOT_PLACEHOLDER = '$TESTDATA_ROOT'
 
-# Tolerance for actual-size field (filesystem block size).
-# The "actual-size" field reports allocated disk space which depends on
-# filesystem block allocation, not image content. When sparse files are
-# transferred via git and re-sparsified, the exact allocation can differ
-# by one or more filesystem blocks even for identical file content.
-# See docs/quirks.md "File Sparseness and Git" for details.
+# Tolerance for actual-size/disk size field (filesystem block size).
+# The "actual-size" (JSON) and "disk size" (human) fields report allocated
+# disk space which depends on filesystem block allocation, not image content.
+# When sparse files are transferred via git and re-sparsified, the exact
+# allocation can differ by one or more filesystem blocks even for identical
+# file content. See docs/quirks.md "File Sparseness and Git" for details.
 ACTUAL_SIZE_TOLERANCE = 4096
+
+# Size unit multipliers for parsing human-readable sizes
+SIZE_UNITS = {
+    'B': 1,
+    'KiB': 1024,
+    'MiB': 1024 * 1024,
+    'GiB': 1024 * 1024 * 1024,
+    'TiB': 1024 * 1024 * 1024 * 1024,
+}
 
 
 def substitute_testdata_root(text: str, testdata_root: str) -> str:
@@ -31,6 +40,101 @@ def substitute_testdata_root(text: str, testdata_root: str) -> str:
         Text with placeholders substituted
     """
     return text.replace(TESTDATA_ROOT_PLACEHOLDER, testdata_root)
+
+
+def _parse_human_size(size_str: str) -> int:
+    """
+    Parse a human-readable size string like '36 KiB' to bytes.
+
+    Args:
+        size_str: Size string like '36 KiB', '512 MiB', etc.
+
+    Returns:
+        Size in bytes, or -1 if parsing fails.
+    """
+    parts = size_str.strip().split()
+    if len(parts) != 2:
+        return -1
+    try:
+        value = int(parts[0])
+        unit = parts[1]
+        if unit in SIZE_UNITS:
+            return value * SIZE_UNITS[unit]
+    except (ValueError, KeyError):
+        pass
+    return -1
+
+
+def _compare_human_with_tolerance(
+    actual_text: str,
+    expected_text: str,
+    tolerance: int
+) -> tuple:
+    """
+    Compare human-readable outputs, allowing tolerance for disk size field.
+
+    The "disk size" field depends on filesystem block allocation which
+    varies across systems even for identical file content. This function
+    compares lines and allows disk size values to differ by up to the
+    tolerance value.
+
+    Args:
+        actual_text: Human-readable text from imago
+        expected_text: Human-readable text from baseline
+        tolerance: Maximum allowed difference for disk size values (in bytes)
+
+    Returns:
+        tuple: (matched: bool, normalized_actual: str, normalized_expected: str)
+               If matched, the normalized strings will be identical.
+               If not matched, they show what differed.
+    """
+    actual_lines = actual_text.splitlines(keepends=True)
+    expected_lines = expected_text.splitlines(keepends=True)
+
+    if len(actual_lines) != len(expected_lines):
+        return False, actual_text, expected_text
+
+    normalized_actual = []
+    normalized_expected = []
+    all_match = True
+
+    for actual_line, expected_line in zip(actual_lines, expected_lines):
+        # Check if this is a "disk size:" line
+        actual_stripped = actual_line.lstrip()
+        expected_stripped = expected_line.lstrip()
+
+        if (actual_stripped.startswith('disk size:') and
+                expected_stripped.startswith('disk size:')):
+            # Extract the size values
+            actual_size_str = actual_stripped.replace('disk size:', '').strip()
+            expected_size_str = expected_stripped.replace('disk size:', '').strip()
+
+            # Remove trailing newline for parsing
+            actual_size_str = actual_size_str.rstrip('\n')
+            expected_size_str = expected_size_str.rstrip('\n')
+
+            actual_bytes = _parse_human_size(actual_size_str)
+            expected_bytes = _parse_human_size(expected_size_str)
+
+            if actual_bytes >= 0 and expected_bytes >= 0:
+                if abs(actual_bytes - expected_bytes) <= tolerance:
+                    # Within tolerance, normalize to expected value
+                    normalized_actual.append(expected_line)
+                    normalized_expected.append(expected_line)
+                    continue
+
+        # Not a disk size line or not within tolerance
+        if actual_line != expected_line:
+            all_match = False
+
+        normalized_actual.append(actual_line)
+        normalized_expected.append(expected_line)
+
+    if all_match:
+        normalized = ''.join(normalized_expected)
+        return True, normalized, normalized
+
+    return False, ''.join(normalized_actual), ''.join(normalized_expected)
 
 
 def _compare_json_with_tolerance(
@@ -106,8 +210,9 @@ def compare_outputs(imago_output: str, expected_output: str) -> tuple:
     """
     Compare imago output against expected output (from qemu-img or override).
 
-    For JSON output, allows tolerance for the "actual-size" field which
-    depends on filesystem allocation and can vary across systems.
+    For JSON output, allows tolerance for the "actual-size" field.
+    For human output, allows tolerance for the "disk size:" field.
+    Both depend on filesystem allocation and can vary across systems.
     See docs/quirks.md "File Sparseness and Git" for details.
 
     Returns:
@@ -121,6 +226,14 @@ def compare_outputs(imago_output: str, expected_output: str) -> tuple:
 
     # For JSON output, try comparing with tolerance for actual-size
     matched, imago_normalized, expected_normalized = _compare_json_with_tolerance(
+        imago_output, expected_output, ACTUAL_SIZE_TOLERANCE
+    )
+
+    if matched:
+        return True, ''
+
+    # For human output, try comparing with tolerance for disk size
+    matched, imago_normalized, expected_normalized = _compare_human_with_tolerance(
         imago_output, expected_output, ACTUAL_SIZE_TOLERANCE
     )
 
