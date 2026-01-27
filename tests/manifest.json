@@ -123,6 +123,16 @@
             "description": "QCOW2 with minimum 512-byte cluster size (parser stress test)",
             "tags": ["qcow2", "min-cluster", "edge-case"],
             "sha256": "b998df1302d22aac1fe999bf678086de486712c7129ee73157ee9bc880b0ced2"
+        },
+        {
+            "id": "qcow2-max-cluster",
+            "path": "downloaded/edge-cases/max_cluster.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "QCOW2 with maximum 2MB cluster size (parser stress test)",
+            "tags": ["qcow2", "max-cluster", "edge-case"],
+            "sha256": "ade4aabb29681add2cdaacb026a76944ad7abfdabc9c24172328e6c5e1614445"
         }
     ]
 }
