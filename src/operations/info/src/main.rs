@@ -22,7 +22,14 @@ const VMDK3_MAGIC: u32 = 0x434f5744; // "COWD" (little-endian at offset 0)
 const VHD_COOKIE: u64 = 0x636f6e6563746978; // "conectix" (big-endian at footer offset 0)
 
 // VHD footer offsets (big-endian)
-const VHD_FOOTER_CURRENT_SIZE_OFFSET: usize = 48; // Current size (virtual size) in bytes
+const VHD_FOOTER_CREATOR_APP_OFFSET: usize = 28; // Creator application (4 bytes ASCII)
+const VHD_FOOTER_DISK_SIZE_OFFSET: usize = 40; // Original/virtual size in bytes (8 bytes)
+const VHD_FOOTER_DISK_GEOMETRY_OFFSET: usize = 56; // CHS geometry (4 bytes: cyls[2], heads[1], secs[1])
+
+// VHD maximum CHS geometry (indicates current_size should be used instead)
+const VHD_MAX_CHS_CYLS: u16 = 65535;
+const VHD_MAX_CHS_HEADS: u8 = 16;
+const VHD_MAX_CHS_SECS: u8 = 255;
 
 // QCOW2 header offsets (big-endian)
 const QCOW2_VERSION_OFFSET: usize = 4;
@@ -319,24 +326,62 @@ fn detect_vhd_footer(buffer: &[u8]) -> ImageFormat {
 }
 
 /// Parse VHD footer and populate result
+///
+/// VHD virtual size calculation varies by creator application:
+/// - "vpc " (Virtual PC) and "qemu": Use CHS geometry calculation
+/// - "qem2", "win " (Hyper-V), "d2v " (Disk2vhd), etc.: Use disk_size field
+///
+/// Exception: If CHS geometry is at maximum (65535×16×255), use disk_size
+/// regardless of creator, to avoid truncation for large disks.
 fn parse_vhd_footer(buffer: &[u8], result: &mut InfoResult) {
     // VHD footer structure (all fields big-endian):
     // Offset 0: Cookie "conectix" (8 bytes) - already verified
-    // Offset 48: Current Size (8 bytes) - virtual size in bytes
-    // Offset 56: Disk Geometry (4 bytes)
+    // Offset 28: Creator application (4 bytes ASCII)
+    // Offset 40: Disk size (8 bytes) - virtual disk capacity
+    // Offset 48: Data size (8 bytes) - physical data extent
+    // Offset 56: Disk geometry (4 bytes) - CHS values
     // Offset 60: Disk Type (4 bytes) - 2=fixed, 3=dynamic, 4=differencing
 
-    // Current size (virtual size) at offset 48
-    result.virtual_size = u64::from_be_bytes([
-        buffer[VHD_FOOTER_CURRENT_SIZE_OFFSET],
-        buffer[VHD_FOOTER_CURRENT_SIZE_OFFSET + 1],
-        buffer[VHD_FOOTER_CURRENT_SIZE_OFFSET + 2],
-        buffer[VHD_FOOTER_CURRENT_SIZE_OFFSET + 3],
-        buffer[VHD_FOOTER_CURRENT_SIZE_OFFSET + 4],
-        buffer[VHD_FOOTER_CURRENT_SIZE_OFFSET + 5],
-        buffer[VHD_FOOTER_CURRENT_SIZE_OFFSET + 6],
-        buffer[VHD_FOOTER_CURRENT_SIZE_OFFSET + 7],
+    // Read creator application (4 bytes ASCII at offset 28)
+    let creator_app = &buffer[VHD_FOOTER_CREATOR_APP_OFFSET..VHD_FOOTER_CREATOR_APP_OFFSET + 4];
+
+    // Read disk size (virtual size) at offset 40
+    let disk_size = u64::from_be_bytes([
+        buffer[VHD_FOOTER_DISK_SIZE_OFFSET],
+        buffer[VHD_FOOTER_DISK_SIZE_OFFSET + 1],
+        buffer[VHD_FOOTER_DISK_SIZE_OFFSET + 2],
+        buffer[VHD_FOOTER_DISK_SIZE_OFFSET + 3],
+        buffer[VHD_FOOTER_DISK_SIZE_OFFSET + 4],
+        buffer[VHD_FOOTER_DISK_SIZE_OFFSET + 5],
+        buffer[VHD_FOOTER_DISK_SIZE_OFFSET + 6],
+        buffer[VHD_FOOTER_DISK_SIZE_OFFSET + 7],
     ]);
+
+    // Read CHS geometry at offset 56
+    // Format: cylinders (2 bytes BE) + heads (1 byte) + sectors per track (1 byte)
+    let cyls = u16::from_be_bytes([
+        buffer[VHD_FOOTER_DISK_GEOMETRY_OFFSET],
+        buffer[VHD_FOOTER_DISK_GEOMETRY_OFFSET + 1],
+    ]);
+    let heads = buffer[VHD_FOOTER_DISK_GEOMETRY_OFFSET + 2];
+    let secs = buffer[VHD_FOOTER_DISK_GEOMETRY_OFFSET + 3];
+
+    // Check if CHS is at maximum (indicates disk_size should be used)
+    let chs_at_max =
+        cyls == VHD_MAX_CHS_CYLS && heads == VHD_MAX_CHS_HEADS && secs == VHD_MAX_CHS_SECS;
+
+    // Determine if this creator uses CHS geometry for size calculation
+    // "vpc " (Virtual PC) and "qemu" use CHS; others use disk_size field
+    let use_chs = (creator_app == b"vpc " || creator_app == b"qemu") && !chs_at_max;
+
+    if use_chs {
+        // Calculate virtual size from CHS geometry (in sectors × 512 bytes)
+        let total_sectors = cyls as u64 * heads as u64 * secs as u64;
+        result.virtual_size = total_sectors * 512;
+    } else {
+        // Use disk_size field directly
+        result.virtual_size = disk_size;
+    }
 
     // Disk geometry at offset 56 - qemu uses this as cluster_size
     // VHD format: cylinders(2) + heads(1) + sectors(1)
