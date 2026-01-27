@@ -93,6 +93,16 @@
             "description": "QCOW2 with extended L2 entries for subcluster allocation (QEMU 5.2+)",
             "tags": ["qcow2", "extended-l2", "subcluster"],
             "sha256": "d6e1ddf7c3e4154189a8121448c71b99a980111e6909101ab2bfce166e06c87e"
+        },
+        {
+            "id": "qcow2-zstd",
+            "path": "downloaded/edge-cases/zstd_compressed.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "QCOW2 with ZSTD compression (QEMU 5.1+)",
+            "tags": ["qcow2", "zstd", "compression"],
+            "sha256": "e0cd67978044b159aecec2cfb93c96bb7a99673462512f4ed371c2151e076115"
         }
     ]
 }
