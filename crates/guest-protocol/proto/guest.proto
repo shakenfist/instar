@@ -75,6 +75,7 @@ message Qcow2Info {
   uint32 refcount_bits = 4;
   bool corrupt = 5;
   bool extended_l2 = 6;
+  string backing_format = 7;   // Backing file format (from header extension)
 }
 
 // VMDK format-specific information

@@ -38,12 +38,13 @@ use micropb::{MessageEncode, PbEncoder};
 
 /// Maximum message size (excluding 2-byte length prefix).
 ///
-/// This is sized to accommodate InfoResultMessage with file paths up to 256
-/// characters each. This approach trades stack efficiency for simplicity.
+/// This is sized to accommodate InfoResultMessage with file paths up to 1024
+/// characters each (QCOW2 spec allows 1023 bytes for backing file path).
+/// This approach trades stack efficiency for simplicity.
 ///
 /// TODO: Consider refactoring to caller-provided buffers if stack usage
 /// becomes a concern in deeply nested call stacks.
-pub const MAX_MESSAGE_SIZE: usize = 600;
+pub const MAX_MESSAGE_SIZE: usize = 2200;
 
 /// Frame header size (2-byte little-endian length)
 pub const FRAME_HEADER_SIZE: usize = 2;
@@ -183,8 +184,9 @@ pub fn complete_message(operation: &str, count: u64, success: bool) -> guest_::G
     msg
 }
 
-/// Helper to push a string into a heapless String of larger capacity (256).
-fn push_str_256(dest: &mut heapless::String<256>, src: &str) {
+/// Helper to push a string into a heapless String of larger capacity (1024).
+/// QCOW2 spec allows backing file paths up to 1023 bytes.
+fn push_str_1024(dest: &mut heapless::String<1024>, src: &str) {
     dest.clear();
     for c in src.chars() {
         if dest.push(c).is_err() {
@@ -226,8 +228,8 @@ pub fn info_result_message(
     info.actual_size = actual_size;
     info.cluster_size = cluster_size;
     info.flags = flags;
-    push_str_256(&mut info.backing_file, backing_file);
-    push_str_256(&mut info.external_data_file, external_data_file);
+    push_str_1024(&mut info.backing_file, backing_file);
+    push_str_1024(&mut info.external_data_file, external_data_file);
 
     msg.payload = Some(guest_::GuestMessage_::Payload::InfoResult(info));
     msg
@@ -247,6 +249,8 @@ pub struct Qcow2InfoData {
     pub corrupt: bool,
     /// Whether extended L2 entries are used
     pub extended_l2: bool,
+    /// Backing file format (from header extension, e.g., "qcow2", "raw")
+    pub backing_format: &'static str,
 }
 
 /// Helper to create an info result message with QCOW2-specific information.
@@ -272,8 +276,8 @@ pub fn info_result_message_with_qcow2(
     info.actual_size = actual_size;
     info.cluster_size = cluster_size;
     info.flags = flags;
-    push_str_256(&mut info.backing_file, backing_file);
-    push_str_256(&mut info.external_data_file, external_data_file);
+    push_str_1024(&mut info.backing_file, backing_file);
+    push_str_1024(&mut info.external_data_file, external_data_file);
 
     // Set QCOW2-specific information
     push_str(&mut info.qcow2_info.compat, qcow2_info.compat);
@@ -285,6 +289,10 @@ pub fn info_result_message_with_qcow2(
     info.qcow2_info.refcount_bits = qcow2_info.refcount_bits;
     info.qcow2_info.corrupt = qcow2_info.corrupt;
     info.qcow2_info.extended_l2 = qcow2_info.extended_l2;
+    push_str(
+        &mut info.qcow2_info.backing_format,
+        qcow2_info.backing_format,
+    );
 
     // Mark qcow2_info as present so the encoder includes it
     info._has.set_qcow2_info();
@@ -326,8 +334,8 @@ pub fn info_result_message_with_vmdk(
     info.actual_size = actual_size;
     info.cluster_size = cluster_size;
     info.flags = flags;
-    push_str_256(&mut info.backing_file, backing_file);
-    push_str_256(&mut info.external_data_file, external_data_file);
+    push_str_1024(&mut info.backing_file, backing_file);
+    push_str_1024(&mut info.external_data_file, external_data_file);
 
     // Set VMDK-specific information
     info.vmdk_info.cid = vmdk_info.cid;

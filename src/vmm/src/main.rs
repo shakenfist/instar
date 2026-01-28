@@ -477,6 +477,15 @@ fn print_info_result(
             println!("cluster_size: {}", info.cluster_size);
         }
 
+        // Backing file (if present) - comes before Format specific information
+        if info.flags & (1 << 0) != 0 && !info.backing_file.is_empty() {
+            println!("backing file: {}", info.backing_file);
+            // Show backing file format if available
+            if !info.qcow2_info.backing_format.is_empty() {
+                println!("backing file format: {}", info.qcow2_info.backing_format);
+            }
+        }
+
         // Format specific information (QCOW2)
         if info.format == "qcow2" {
             println!("Format specific information:");
@@ -545,11 +554,6 @@ fn print_info_result(
             println!();
         }
 
-        // Backing file (if present)
-        if info.flags & (1 << 0) != 0 && !info.backing_file.is_empty() {
-            println!("backing file: {}", info.backing_file);
-        }
-
         // Child node '/file' section (qemu-img 8.0+)
         // This section exposes information about the underlying protocol layer.
         if profile.include_child_node {
@@ -593,6 +597,9 @@ fn print_info_result_json(
 
     println!("{{");
 
+    // Check if we have a backing file
+    let has_backing_file = info.flags & (1 << 0) != 0 && !info.backing_file.is_empty();
+
     // Children section (qemu-img 8.0+ only)
     if profile.include_child_node {
         println!("    \"children\": [");
@@ -617,6 +624,18 @@ fn print_info_result_json(
         println!("            }}");
         println!("        }}");
         println!("    ],");
+    }
+
+    // Backing file format - always output when there's a backing file
+    // For QCOW2, this comes from header extensions (v3)
+    if has_backing_file {
+        // Use the format from header extension if available, otherwise default to qcow2
+        let backing_format = if !info.qcow2_info.backing_format.is_empty() {
+            info.qcow2_info.backing_format.as_str()
+        } else {
+            "qcow2"
+        };
+        println!("    \"backing-filename-format\": \"{}\",", backing_format);
     }
 
     println!("    \"virtual-size\": {},", info.virtual_size);
@@ -712,6 +731,18 @@ fn print_info_result_json(
         println!("            ]");
         println!("        }}");
         println!("    }},");
+    }
+
+    // Backing file paths (if present)
+    if has_backing_file {
+        println!(
+            "    \"full-backing-filename\": \"{}\",",
+            escape_json_string(&info.backing_file)
+        );
+        println!(
+            "    \"backing-filename\": \"{}\",",
+            escape_json_string(&info.backing_file)
+        );
     }
 
     println!("    \"dirty-flag\": false");

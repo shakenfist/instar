@@ -138,6 +138,76 @@ pub struct CallTable {
     ),
 }
 
+/// Backing format type for QCOW2 header extension
+#[repr(u8)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum BackingFormat {
+    /// No backing format specified
+    #[default]
+    None = 0,
+    /// QCOW2 format
+    Qcow2 = 1,
+    /// Raw format
+    Raw = 2,
+    /// VMDK format
+    Vmdk = 3,
+    /// QCOW format (version 1)
+    Qcow = 4,
+    /// VHD/VPC format
+    Vpc = 5,
+    /// VHDX format
+    Vhdx = 6,
+    /// Unknown format (not in our list)
+    Unknown = 255,
+}
+
+impl BackingFormat {
+    /// Get backing format as a string
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BackingFormat::None => "",
+            BackingFormat::Qcow2 => "qcow2",
+            BackingFormat::Raw => "raw",
+            BackingFormat::Vmdk => "vmdk",
+            BackingFormat::Qcow => "qcow",
+            BackingFormat::Vpc => "vpc",
+            BackingFormat::Vhdx => "vhdx",
+            BackingFormat::Unknown => "unknown",
+        }
+    }
+
+    /// Parse a format string (case-insensitive first 5 chars)
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        // Quick check for common formats
+        if bytes.is_empty() {
+            return BackingFormat::None;
+        }
+
+        // Compare lowercase
+        let len = bytes.len().min(5);
+        let mut lower = [0u8; 5];
+        for (i, &b) in bytes[..len].iter().enumerate() {
+            lower[i] = if b.is_ascii_uppercase() { b + 32 } else { b };
+        }
+
+        if bytes.len() >= 5 && &lower[..5] == b"qcow2" {
+            BackingFormat::Qcow2
+        } else if bytes.len() >= 4 && &lower[..4] == b"qcow" {
+            BackingFormat::Qcow
+        } else if bytes.len() >= 3 && &lower[..3] == b"raw" {
+            BackingFormat::Raw
+        } else if bytes.len() >= 4 && &lower[..4] == b"vmdk" {
+            BackingFormat::Vmdk
+        } else if bytes.len() >= 3 && &lower[..3] == b"vpc" {
+            BackingFormat::Vpc
+        } else if bytes.len() >= 4 && &lower[..4] == b"vhdx" {
+            BackingFormat::Vhdx
+        } else {
+            BackingFormat::Unknown
+        }
+    }
+}
+
 /// QCOW2 format-specific information (FFI-safe).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -152,8 +222,10 @@ pub struct Qcow2Info {
     pub corrupt: bool,
     /// Whether extended L2 entries are used
     pub extended_l2: bool,
+    /// Backing file format (from header extension)
+    pub backing_format: BackingFormat,
     /// Padding for alignment
-    pub _pad: [u8; 3],
+    pub _pad: [u8; 2],
     /// Number of refcount bits (typically 16)
     pub refcount_bits: u32,
 }
@@ -167,7 +239,8 @@ impl Qcow2Info {
             lazy_refcounts: false,
             corrupt: false,
             extended_l2: false,
-            _pad: [0; 3],
+            backing_format: BackingFormat::None,
+            _pad: [0; 2],
             refcount_bits: 16,
         }
     }
@@ -188,6 +261,11 @@ impl Qcow2Info {
             1 => "zstd",
             _ => "unknown",
         }
+    }
+
+    /// Get backing format as a string
+    pub fn backing_format_str(&self) -> &'static str {
+        self.backing_format.as_str()
     }
 }
 

@@ -57,6 +57,14 @@ const QCOW2_INCOMPAT_EXTENDED_L2: u64 = 1 << 4;
 // QCOW2 compatible feature bits
 const QCOW2_COMPAT_LAZY_REFCOUNTS: u64 = 1 << 0;
 
+// Maximum backing file path length (QCOW2 spec allows up to 1023 bytes)
+const MAX_BACKING_FILE_LEN: usize = 1024;
+
+// QCOW2 header extension constants
+const QCOW2_HEADER_EXTENSION_OFFSET: usize = 104; // First extension after fixed header (v3)
+const QCOW2_EXT_BACKING_FORMAT: u32 = 0xE2792ACA; // Backing file format extension type
+const QCOW2_EXT_END: u32 = 0x00000000; // End of extensions marker
+
 // VMDK4 header offsets (little-endian)
 const VMDK4_VERSION_OFFSET: usize = 4;
 const VMDK4_CAPACITY_OFFSET: usize = 12;
@@ -160,11 +168,21 @@ pub unsafe extern "C" fn _start() -> u64 {
     let mut qcow2_info = Qcow2Info::new();
     let mut vmdk_info = VmdkInfo::new();
 
+    // Buffer for backing file path (null-terminated)
+    let mut backing_file_buf = [0u8; MAX_BACKING_FILE_LEN + 1];
+
     // Parse format-specific metadata if detailed reporting enabled
     if detailed {
         match format {
             ImageFormat::Qcow2 => {
-                parse_qcow2_header(&buffer, &mut result, &mut qcow2_info, call_table);
+                parse_qcow2_header(
+                    &buffer,
+                    &mut result,
+                    &mut qcow2_info,
+                    call_table,
+                    &mut backing_file_buf,
+                    input_sector_size,
+                );
             }
             ImageFormat::Vmdk4 => {
                 parse_vmdk4_header(&buffer, &mut result, &mut vmdk_info, call_table);
@@ -210,7 +228,7 @@ pub unsafe extern "C" fn _start() -> u64 {
             result.actual_size,
             result.cluster_size,
             result.flags,
-            b"\0".as_ptr(), // backing_file (empty for now)
+            backing_file_buf.as_ptr(),
             b"\0".as_ptr(), // external_data_file (empty for now)
             &qcow2_info,
         );
@@ -545,11 +563,15 @@ unsafe fn parse_vhdx_metadata(result: &mut InfoResult, actual_size: u64, call_ta
 }
 
 /// Parse QCOW2 header and populate result and format-specific info
+///
+/// Also reads the backing file path if present.
 unsafe fn parse_qcow2_header(
     buffer: &[u8],
     result: &mut InfoResult,
     qcow2_info: &mut Qcow2Info,
     call_table: &CallTable,
+    backing_file_buf: &mut [u8; MAX_BACKING_FILE_LEN + 1],
+    input_sector_size: usize,
 ) {
     // Version (big-endian u32 at offset 4)
     let version = u32::from_be_bytes([
@@ -640,6 +662,58 @@ unsafe fn parse_qcow2_header(
     if backing_offset != 0 && backing_size > 0 {
         result.flags |= InfoResult::FLAG_HAS_BACKING_FILE;
         (call_table.debug_print)(b"info: has backing file\n\0".as_ptr());
+
+        // Read the backing file name from the image
+        // Limit to our buffer size (protocol supports 1024 chars)
+        let read_size = core::cmp::min(backing_size as usize, MAX_BACKING_FILE_LEN);
+
+        // Calculate which sector contains the backing file offset
+        let backing_sector = backing_offset / input_sector_size as u64;
+        let offset_in_sector = (backing_offset % input_sector_size as u64) as usize;
+
+        // Use a temporary buffer for the sector
+        let mut sector_buf = [0u8; MAX_SECTOR_SIZE];
+
+        if (call_table.read_input_sector)(
+            backing_sector,
+            sector_buf.as_mut_ptr(),
+            input_sector_size,
+        ) {
+            // Calculate how many bytes we can read from this sector
+            let bytes_in_first_sector =
+                core::cmp::min(read_size, input_sector_size - offset_in_sector);
+
+            // Copy the backing file name to our buffer
+            for i in 0..bytes_in_first_sector {
+                backing_file_buf[i] = sector_buf[offset_in_sector + i];
+            }
+
+            // If the backing file spans sectors, read the next sector(s)
+            let mut bytes_read = bytes_in_first_sector;
+            let mut current_sector = backing_sector + 1;
+
+            while bytes_read < read_size {
+                if !(call_table.read_input_sector)(
+                    current_sector,
+                    sector_buf.as_mut_ptr(),
+                    input_sector_size,
+                ) {
+                    break;
+                }
+
+                let bytes_to_copy = core::cmp::min(read_size - bytes_read, input_sector_size);
+
+                for i in 0..bytes_to_copy {
+                    backing_file_buf[bytes_read + i] = sector_buf[i];
+                }
+
+                bytes_read += bytes_to_copy;
+                current_sector += 1;
+            }
+
+            // Ensure null termination
+            backing_file_buf[bytes_read] = 0;
+        }
     }
 
     // Default compression type (zlib)
@@ -710,6 +784,50 @@ unsafe fn parse_qcow2_header(
 
         // Compression type (u8 at offset 104) - 0=zlib, 1=zstd
         qcow2_info.compression_type = buffer[QCOW2_COMPRESSION_TYPE_OFFSET];
+
+        // Parse header extensions (v3+)
+        // Header length is at offset 100 (big-endian u32)
+        let header_length =
+            u32::from_be_bytes([buffer[100], buffer[101], buffer[102], buffer[103]]) as usize;
+
+        // Extensions start at header_length offset
+        // Each extension: type (4 bytes BE), length (4 bytes BE), data (length bytes, padded to 8)
+        let mut ext_offset = header_length;
+        while ext_offset + 8 <= buffer.len() {
+            let ext_type = u32::from_be_bytes([
+                buffer[ext_offset],
+                buffer[ext_offset + 1],
+                buffer[ext_offset + 2],
+                buffer[ext_offset + 3],
+            ]);
+            let ext_len = u32::from_be_bytes([
+                buffer[ext_offset + 4],
+                buffer[ext_offset + 5],
+                buffer[ext_offset + 6],
+                buffer[ext_offset + 7],
+            ]) as usize;
+
+            // End of extensions
+            if ext_type == QCOW2_EXT_END {
+                break;
+            }
+
+            // Check if we have enough data for this extension
+            if ext_offset + 8 + ext_len > buffer.len() {
+                break;
+            }
+
+            // Handle backing format extension
+            if ext_type == QCOW2_EXT_BACKING_FORMAT && ext_len > 0 {
+                let format_bytes = &buffer[ext_offset + 8..ext_offset + 8 + ext_len];
+                qcow2_info.backing_format = shared::BackingFormat::from_bytes(format_bytes);
+                (call_table.debug_print)(b"info: found backing format ext\n\0".as_ptr());
+            }
+
+            // Move to next extension (data is padded to 8-byte boundary)
+            let padded_len = (ext_len + 7) & !7;
+            ext_offset += 8 + padded_len;
+        }
     }
 }
 
