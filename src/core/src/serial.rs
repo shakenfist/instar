@@ -248,6 +248,7 @@ pub fn send_info_result_qcow2(
         refcount_bits: qcow2_info.refcount_bits,
         corrupt: qcow2_info.corrupt,
         extended_l2: qcow2_info.extended_l2,
+        backing_format: qcow2_info.backing_format_str(),
     };
 
     let msg = guest_protocol::info_result_message_with_qcow2(

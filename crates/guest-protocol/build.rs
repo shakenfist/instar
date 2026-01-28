@@ -27,14 +27,14 @@ fn main() {
     );
 
     // Configure longer strings for file paths in InfoResultMessage
-    // Backing file and external data file paths can be longer (up to 256 chars)
+    // QCOW2 spec allows backing file paths up to 1023 bytes
     generator.configure(
         ".guest.InfoResultMessage.backing_file",
-        micropb_gen::Config::new().max_bytes(256),
+        micropb_gen::Config::new().max_bytes(1024),
     );
     generator.configure(
         ".guest.InfoResultMessage.external_data_file",
-        micropb_gen::Config::new().max_bytes(256),
+        micropb_gen::Config::new().max_bytes(1024),
     );
 
     // Generate the Rust module

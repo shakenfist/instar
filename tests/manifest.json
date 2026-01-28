@@ -193,6 +193,46 @@
             "description": "Zerofilled VHD created by Disk2VHD from QEMU iotests",
             "tags": ["vhd", "disk2vhd", "zerofilled"],
             "sha256": "af175e3c442b659e26b91029aacf2e62f2f7cf054404446db3185aafc38e079f"
+        },
+        {
+            "id": "qcow2-base-for-chain",
+            "path": "downloaded/edge-cases/base_for_chain.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "Base image for overlay chain test (no backing file)",
+            "tags": ["qcow2", "backing-file", "base"],
+            "sha256": "0e7db0d4ad0a3b83d343a88d5991fc5024f7a9ec21c1d0e5f15261ebc3fd587e"
+        },
+        {
+            "id": "qcow2-overlay-chain",
+            "path": "downloaded/edge-cases/overlay_chain.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "QCOW2 overlay with backing file chain reference",
+            "tags": ["qcow2", "backing-file", "overlay"],
+            "sha256": "8b718526c43fc6859e539eb6dc215fabc83d95799bc9001a12278506fd134b23"
+        },
+        {
+            "id": "afl-vhd-max-table-entries",
+            "path": "downloaded/qemu-iotests/afl5.img",
+            "format": "vpc",
+            "safety": "malformed",
+            "run_in_ci": false,
+            "description": "AFL-discovered malformed VHD: Max Table Entries too large",
+            "tags": ["vhd", "malformed", "afl", "error-handling"],
+            "sha256": "36f4a8d05b5a19635e387d1b449ace3dab9bb82461a9c08606dae322377de958"
+        },
+        {
+            "id": "afl-vmdk-l1-too-big",
+            "path": "downloaded/qemu-iotests/afl9.vmdk",
+            "format": "vmdk",
+            "safety": "malformed",
+            "run_in_ci": false,
+            "description": "AFL-discovered malformed VMDK: L1 size too big",
+            "tags": ["vmdk", "malformed", "afl", "error-handling"],
+            "sha256": "71996b27606bda1c6ae0c3294595b03d8ab896923688632fe254a127b4f651e4"
         }
     ]
 }
