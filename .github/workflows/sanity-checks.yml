@@ -51,10 +51,19 @@ jobs:
             imago-build \
             cargo test --release
 
-      - name: Setup system config directory
+      - name: Test config commands in container
         run: |
-          sudo mkdir -p /etc/imago
-          sudo tee /etc/imago/config << 'EOF'
+          # Run all config tests inside the container to avoid glibc mismatch
+          docker run --rm \
+            -v "$(pwd):/workspace" \
+            -w "/workspace" \
+            imago-build \
+            bash -c '
+              set -e
+
+              # Setup system config directory
+              mkdir -p /etc/imago
+              cat > /etc/imago/config << EOF
           # System-wide imago configuration for CI testing
 
           [global]
@@ -63,7 +72,7 @@ jobs:
 
           [security]
           backing-path-allowlist = [
-              "$IMAGE_DIR",
+              "\$IMAGE_DIR",
               "/var/lib/libvirt/images",
           ]
           max-chain-depth = 16
@@ -77,10 +86,9 @@ jobs:
           verify = false
           EOF
 
-      - name: Setup user config directory
-        run: |
-          mkdir -p ~/.config/imago
-          cat > ~/.config/imago/config << 'EOF'
+              # Setup user config directory
+              mkdir -p ~/.config/imago
+              cat > ~/.config/imago/config << EOF
           # User imago configuration for CI testing
 
           [global]
@@ -88,8 +96,8 @@ jobs:
 
           [security]
           backing-path-allowlist = [
-              "$IMAGE_DIR",
-              "$CWD",
+              "\$IMAGE_DIR",
+              "\$CWD",
               "/tmp/test-images",
           ]
 
@@ -97,100 +105,86 @@ jobs:
           skip-zeros = true
           EOF
 
-      - name: Test config command (basic)
-        run: |
-          echo "=== Testing: imago config ==="
-          ./src/target/release/imago config
+              echo "=== Testing: imago config ==="
+              ./src/target/release/imago config
 
-      - name: Test config command (show sources)
-        run: |
-          echo "=== Testing: imago config --show-sources ==="
-          ./src/target/release/imago config --show-sources
+              echo ""
+              echo "=== Testing: imago config --show-sources ==="
+              ./src/target/release/imago config --show-sources
 
-      - name: Test config command (validate)
-        run: |
-          echo "=== Testing: imago config --validate ==="
-          ./src/target/release/imago config --validate
+              echo ""
+              echo "=== Testing: imago config --validate ==="
+              ./src/target/release/imago config --validate
 
-      - name: Verify config layering (user overrides system)
-        run: |
-          echo "=== Verifying config layering ==="
+              echo ""
+              echo "=== Verifying config layering ==="
+              OUTPUT=$(./src/target/release/imago config --show-sources)
 
-          OUTPUT=$(./src/target/release/imago config --show-sources)
+              # Verify verbose=true comes from user config (overrides system false)
+              if echo "$OUTPUT" | grep -q "verbose = true.*~/.config/imago/config"; then
+                echo "PASS: User config overrides system config for verbose"
+              else
+                echo "FAIL: Expected verbose=true from user config"
+                echo "$OUTPUT"
+                exit 1
+              fi
 
-          # Verify verbose=true comes from user config (overrides system's false)
-          if echo "$OUTPUT" | grep -q "verbose = true.*~/.config/imago/config"; then
-            echo "PASS: User config overrides system config for verbose"
-          else
-            echo "FAIL: Expected verbose=true from user config"
-            echo "$OUTPUT"
-            exit 1
-          fi
+              # Verify backing-path-allowlist comes from user config
+              if echo "$OUTPUT" | grep -q "backing-path-allowlist.*~/.config/imago/config"; then
+                echo "PASS: User config overrides system config for backing-path-allowlist"
+              else
+                echo "FAIL: Expected backing-path-allowlist from user config"
+                echo "$OUTPUT"
+                exit 1
+              fi
 
-          # Verify backing-path-allowlist comes from user config
-          if echo "$OUTPUT" | grep -q "backing-path-allowlist.*~/.config/imago/config"; then
-            echo "PASS: User config overrides system config for backing-path-allowlist"
-          else
-            echo "FAIL: Expected backing-path-allowlist from user config"
-            echo "$OUTPUT"
-            exit 1
-          fi
+              # Verify skip-zeros comes from user config
+              if echo "$OUTPUT" | grep -q "skip-zeros = true.*~/.config/imago/config"; then
+                echo "PASS: User config overrides system config for skip-zeros"
+              else
+                echo "FAIL: Expected skip-zeros=true from user config"
+                echo "$OUTPUT"
+                exit 1
+              fi
 
-          # Verify skip-zeros comes from user config
-          if echo "$OUTPUT" | grep -q "skip-zeros = true.*~/.config/imago/config"; then
-            echo "PASS: User config overrides system config for skip-zeros"
-          else
-            echo "FAIL: Expected skip-zeros=true from user config"
-            echo "$OUTPUT"
-            exit 1
-          fi
+              # Verify sparse comes from system config (not overridden by user)
+              if echo "$OUTPUT" | grep -q "sparse = true.*/etc/imago/config"; then
+                echo "PASS: System config value preserved when not overridden"
+              else
+                echo "FAIL: Expected sparse=true from system config"
+                echo "$OUTPUT"
+                exit 1
+              fi
 
-          # Verify sparse comes from system config (not overridden by user)
-          if echo "$OUTPUT" | grep -q "sparse = true.*/etc/imago/config"; then
-            echo "PASS: System config value preserved when not overridden"
-          else
-            echo "FAIL: Expected sparse=true from system config"
-            echo "$OUTPUT"
-            exit 1
-          fi
+              echo "All layering tests passed!"
 
-          echo "All layering tests passed!"
-
-      - name: Test invalid config detection
-        run: |
-          echo "=== Testing invalid config detection ==="
-
-          # Create an invalid config file
-          cat > /tmp/bad-config << 'EOF'
+              echo ""
+              echo "=== Testing invalid config detection ==="
+              cat > /tmp/bad-config << EOF
           [global
           verbose = true
           EOF
 
-          # Temporarily replace user config with invalid one
-          mv ~/.config/imago/config ~/.config/imago/config.bak
-          cp /tmp/bad-config ~/.config/imago/config
+              mv ~/.config/imago/config ~/.config/imago/config.bak
+              cp /tmp/bad-config ~/.config/imago/config
 
-          # Validate should fail
-          set +e
-          ./src/target/release/imago config --validate
-          EXIT_CODE=$?
-          set -e
+              set +e
+              ./src/target/release/imago config --validate
+              EXIT_CODE=$?
+              set -e
 
-          # Restore good config
-          mv ~/.config/imago/config.bak ~/.config/imago/config
+              mv ~/.config/imago/config.bak ~/.config/imago/config
 
-          if [ $EXIT_CODE -ne 0 ]; then
-            echo "PASS: Invalid config correctly detected"
-          else
-            echo "FAIL: Invalid config was not detected"
-            exit 1
-          fi
+              if [ $EXIT_CODE -ne 0 ]; then
+                echo "PASS: Invalid config correctly detected"
+              else
+                echo "FAIL: Invalid config was not detected"
+                exit 1
+              fi
 
-      - name: Cleanup
-        if: always()
-        run: |
-          sudo rm -rf /etc/imago
-          rm -rf ~/.config/imago
+              echo ""
+              echo "All config tests passed!"
+            '
 
   integration-tests:
     needs: sanity-checks
@@ -251,6 +245,13 @@ jobs:
           else
             echo "Block size matches expected value."
           fi
+
+      - name: Install Docker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y docker.io
+          sudo systemctl start docker
+          sudo chmod 666 /var/run/docker.sock
 
       - name: Remove previous devcontainers, if any
         run: |
