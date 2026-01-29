@@ -234,6 +234,7 @@ pub type Result<T> = std::result::Result<T, VmmError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error;
 
     #[test]
     fn test_vmm_error_display() {
