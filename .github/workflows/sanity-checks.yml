@@ -15,47 +15,34 @@ jobs:
     timeout-minutes: 30
 
     env:
+      DOCKER_BUILDKIT: 1
       # Limit parallelism to reduce memory usage (s worker has 4GB RAM)
       CARGO_BUILD_JOBS: 2
-      CARGO_INCREMENTAL: 0
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      - name: Remove previous devcontainers, if any
         run: |
-          if ! command -v rustup &> /dev/null; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-            source "$HOME/.cargo/env"
-          fi
-          rustup update stable
-          rustup default stable
-          rustc --version
-          cargo --version
+          docker image rm -f imago-build 2>/dev/null || true
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            src/vmm/target
-          key: ${{ runner.os }}-cargo-sanity-${{ hashFiles('src/vmm/Cargo.lock', 'src/vmm/Cargo.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-sanity-
-
-      - name: Build VMM
+      - name: Build and test via devcontainer
         run: |
-          source "$HOME/.cargo/env" 2>/dev/null || true
-          cd src/vmm
-          cargo build --release
-
-      - name: Run all unit tests
-        run: |
-          source "$HOME/.cargo/env" 2>/dev/null || true
-          cd src/vmm
-          cargo test --release
+          # Build the devcontainer and run cargo build + test inside it
+          make imago
+          # Run unit tests inside the container
+          docker run --rm \
+            -u "$(id -u):$(id -g)" \
+            -e HOME=/build \
+            -e CARGO_HOME=/build/.cargo \
+            -e CARGO_BUILD_JOBS=2 \
+            -v "$(pwd):/workspace" \
+            -v "$(pwd)/.cargo-cache/registry:/build/.cargo/registry" \
+            -v "$(pwd)/.cargo-cache/git:/build/.cargo/git" \
+            -w "/workspace/src/vmm" \
+            imago-build \
+            cargo test --release
 
       - name: Setup system config directory
         run: |
@@ -105,28 +92,24 @@ jobs:
 
       - name: Test config command (basic)
         run: |
-          source "$HOME/.cargo/env" 2>/dev/null || true
           echo "=== Testing: imago config ==="
-          ./src/vmm/target/release/imago config
+          ./src/target/release/imago config
 
       - name: Test config command (show sources)
         run: |
-          source "$HOME/.cargo/env" 2>/dev/null || true
           echo "=== Testing: imago config --show-sources ==="
-          ./src/vmm/target/release/imago config --show-sources
+          ./src/target/release/imago config --show-sources
 
       - name: Test config command (validate)
         run: |
-          source "$HOME/.cargo/env" 2>/dev/null || true
           echo "=== Testing: imago config --validate ==="
-          ./src/vmm/target/release/imago config --validate
+          ./src/target/release/imago config --validate
 
       - name: Verify config layering (user overrides system)
         run: |
-          source "$HOME/.cargo/env" 2>/dev/null || true
           echo "=== Verifying config layering ==="
 
-          OUTPUT=$(./src/vmm/target/release/imago config --show-sources)
+          OUTPUT=$(./src/target/release/imago config --show-sources)
 
           # Verify verbose=true comes from user config (overrides system's false)
           if echo "$OUTPUT" | grep -q "verbose = true.*~/.config/imago/config"; then
@@ -168,7 +151,6 @@ jobs:
 
       - name: Test invalid config detection
         run: |
-          source "$HOME/.cargo/env" 2>/dev/null || true
           echo "=== Testing invalid config detection ==="
 
           # Create an invalid config file
@@ -183,7 +165,7 @@ jobs:
 
           # Validate should fail
           set +e
-          ./src/vmm/target/release/imago config --validate
+          ./src/target/release/imago config --validate
           EXIT_CODE=$?
           set -e
 
