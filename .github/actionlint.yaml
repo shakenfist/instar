@@ -5,6 +5,12 @@ self-hosted-runner:
   # Custom labels used by our self-hosted runners
   labels:
     - claude-code
+    - debian-12
+    - xs
+    - s
+    - m
+    - l
+    - xl
 
 # Ignore certain shellcheck rules from run: blocks in workflow files.
 # These are overly pedantic for CI workflow scripts where the inputs are
