@@ -20,6 +20,7 @@
 //! - InfoResult reading for info operations
 
 mod backing;
+mod config;
 mod error;
 mod io_thread;
 mod ioevent;
@@ -800,6 +801,8 @@ enum Commands {
     Info(InfoArgs),
     /// Copy/convert disk images
     Copy(CopyArgs),
+    /// Display or validate configuration
+    Config(ConfigArgs),
 }
 
 #[derive(Args, Debug)]
@@ -871,6 +874,17 @@ struct CopyArgs {
     sector_count: u64,
 }
 
+#[derive(Args, Debug)]
+struct ConfigArgs {
+    /// Show which file each config value came from
+    #[arg(long)]
+    show_sources: bool,
+
+    /// Validate config files for syntax errors
+    #[arg(long)]
+    validate: bool,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let verbose = cli.verbose;
@@ -887,6 +901,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Info(args) => run_info(args),
         Commands::Copy(args) => run_copy(args),
+        Commands::Config(args) => run_config(args),
+    }
+}
+
+/// Run the config operation (display or validate configuration)
+fn run_config(args: ConfigArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if args.validate {
+        // Validate config files
+        let errors = config::validate_config_files();
+        if errors.is_empty() {
+            println!("All configuration files are valid.");
+            Ok(())
+        } else {
+            eprintln!("Configuration errors found:");
+            for (path, error) in &errors {
+                eprintln!("  {}: {}", path.display(), error);
+            }
+            std::process::exit(1);
+        }
+    } else {
+        // Display effective configuration
+        let tracked = config::load_config();
+        let output = config::format_config(&tracked, args.show_sources);
+        print!("{}", output);
+        Ok(())
     }
 }
 

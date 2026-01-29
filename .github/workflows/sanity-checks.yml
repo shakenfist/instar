@@ -1,0 +1,301 @@
+name: Sanity Checks
+
+on:
+  push:
+    paths:
+      - 'src/**'
+      - 'crates/**'
+      - 'Makefile'
+      - '.github/workflows/sanity-checks.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'crates/**'
+      - 'Makefile'
+      - '.github/workflows/sanity-checks.yml'
+  workflow_dispatch:
+
+jobs:
+  sanity-checks:
+    runs-on: [self-hosted, debian-12, s]
+    timeout-minutes: 30
+
+    env:
+      # Limit parallelism to reduce memory usage (s worker has 4GB RAM)
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          if ! command -v rustup &> /dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            source "$HOME/.cargo/env"
+          fi
+          rustup update stable
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/vmm/target
+          key: ${{ runner.os }}-cargo-sanity-${{ hashFiles('src/vmm/Cargo.lock', 'src/vmm/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-sanity-
+
+      - name: Build VMM
+        run: |
+          source "$HOME/.cargo/env" 2>/dev/null || true
+          cd src/vmm
+          cargo build --release
+
+      - name: Run all unit tests
+        run: |
+          source "$HOME/.cargo/env" 2>/dev/null || true
+          cd src/vmm
+          cargo test --release
+
+      - name: Setup system config directory
+        run: |
+          sudo mkdir -p /etc/imago
+          sudo tee /etc/imago/config << 'EOF'
+          # System-wide imago configuration for CI testing
+
+          [global]
+          verbose = false
+          output = "human"
+
+          [security]
+          backing-path-allowlist = [
+              "$IMAGE_DIR",
+              "/var/lib/libvirt/images",
+          ]
+          max-chain-depth = 16
+
+          [convert]
+          sparse = true
+          progress = false
+
+          [copy]
+          skip-zeros = false
+          verify = false
+          EOF
+
+      - name: Setup user config directory
+        run: |
+          mkdir -p ~/.config/imago
+          cat > ~/.config/imago/config << 'EOF'
+          # User imago configuration for CI testing
+
+          [global]
+          verbose = true
+
+          [security]
+          backing-path-allowlist = [
+              "$IMAGE_DIR",
+              "$CWD",
+              "/tmp/test-images",
+          ]
+
+          [copy]
+          skip-zeros = true
+          EOF
+
+      - name: Test config command (basic)
+        run: |
+          source "$HOME/.cargo/env" 2>/dev/null || true
+          echo "=== Testing: imago config ==="
+          ./src/vmm/target/release/imago config
+
+      - name: Test config command (show sources)
+        run: |
+          source "$HOME/.cargo/env" 2>/dev/null || true
+          echo "=== Testing: imago config --show-sources ==="
+          ./src/vmm/target/release/imago config --show-sources
+
+      - name: Test config command (validate)
+        run: |
+          source "$HOME/.cargo/env" 2>/dev/null || true
+          echo "=== Testing: imago config --validate ==="
+          ./src/vmm/target/release/imago config --validate
+
+      - name: Verify config layering (user overrides system)
+        run: |
+          source "$HOME/.cargo/env" 2>/dev/null || true
+          echo "=== Verifying config layering ==="
+
+          OUTPUT=$(./src/vmm/target/release/imago config --show-sources)
+
+          # Verify verbose=true comes from user config (overrides system's false)
+          if echo "$OUTPUT" | grep -q "verbose = true.*~/.config/imago/config"; then
+            echo "PASS: User config overrides system config for verbose"
+          else
+            echo "FAIL: Expected verbose=true from user config"
+            echo "$OUTPUT"
+            exit 1
+          fi
+
+          # Verify backing-path-allowlist comes from user config
+          if echo "$OUTPUT" | grep -q "backing-path-allowlist.*~/.config/imago/config"; then
+            echo "PASS: User config overrides system config for backing-path-allowlist"
+          else
+            echo "FAIL: Expected backing-path-allowlist from user config"
+            echo "$OUTPUT"
+            exit 1
+          fi
+
+          # Verify skip-zeros comes from user config
+          if echo "$OUTPUT" | grep -q "skip-zeros = true.*~/.config/imago/config"; then
+            echo "PASS: User config overrides system config for skip-zeros"
+          else
+            echo "FAIL: Expected skip-zeros=true from user config"
+            echo "$OUTPUT"
+            exit 1
+          fi
+
+          # Verify sparse comes from system config (not overridden by user)
+          if echo "$OUTPUT" | grep -q "sparse = true.*/etc/imago/config"; then
+            echo "PASS: System config value preserved when not overridden"
+          else
+            echo "FAIL: Expected sparse=true from system config"
+            echo "$OUTPUT"
+            exit 1
+          fi
+
+          echo "All layering tests passed!"
+
+      - name: Test invalid config detection
+        run: |
+          source "$HOME/.cargo/env" 2>/dev/null || true
+          echo "=== Testing invalid config detection ==="
+
+          # Create an invalid config file
+          cat > /tmp/bad-config << 'EOF'
+          [global
+          verbose = true
+          EOF
+
+          # Temporarily replace user config with invalid one
+          mv ~/.config/imago/config ~/.config/imago/config.bak
+          cp /tmp/bad-config ~/.config/imago/config
+
+          # Validate should fail
+          set +e
+          ./src/vmm/target/release/imago config --validate
+          EXIT_CODE=$?
+          set -e
+
+          # Restore good config
+          mv ~/.config/imago/config.bak ~/.config/imago/config
+
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "PASS: Invalid config correctly detected"
+          else
+            echo "FAIL: Invalid config was not detected"
+            exit 1
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          sudo rm -rf /etc/imago
+          rm -rf ~/.config/imago
+
+  integration-tests:
+    needs: sanity-checks
+    runs-on: [self-hosted, debian-12, xl]
+    timeout-minutes: 60
+
+    env:
+      DOCKER_BUILDKIT: 1
+
+    steps:
+      - name: Checkout imago
+        uses: actions/checkout@v4
+        with:
+          path: imago
+          fetch-depth: 0
+
+      - name: Checkout imago-testdata from GitLab
+        run: |
+          git clone --depth 1 \
+            http://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git \
+            imago-testdata
+
+      - name: Resparsify test images
+        run: |
+          # Git streaming fills sparse holes with zeros, affecting qemu-img
+          # disk_size output. Restore sparseness using cp --sparse=always,
+          # which is more robust than fallocate -d for files with partial
+          # zero blocks or complex sparse patterns.
+          cd ${GITHUB_WORKSPACE}/imago-testdata
+          find downloaded/ -type f \( \
+            -name "*.qcow2" -o \
+            -name "*.vmdk" -o \
+            -name "*.vhd" -o \
+            -name "*.vhdx" -o \
+            -name "*.img" \
+          \) -print0 | while IFS= read -r -d '' file; do
+            cp --sparse=always "$file" "$file.sparse"
+            mv "$file.sparse" "$file"
+          done
+
+      - name: Check filesystem block size
+        run: |
+          # Baselines were generated with 4096-byte block size. Different block
+          # sizes can affect qemu-img disk_size reporting due to allocation
+          # rounding differences.
+          EXPECTED_BLOCK_SIZE=4096
+          ACTUAL_BLOCK_SIZE=$(stat -f -c '%S' ${GITHUB_WORKSPACE}/imago-testdata/downloaded/)
+
+          echo "Filesystem block size: ${ACTUAL_BLOCK_SIZE} bytes"
+          echo "Expected block size: ${EXPECTED_BLOCK_SIZE} bytes"
+
+          if [ "${ACTUAL_BLOCK_SIZE}" != "${EXPECTED_BLOCK_SIZE}" ]; then
+            echo ""
+            echo "WARNING: Filesystem block size mismatch!"
+            echo "Baselines were generated on a filesystem with ${EXPECTED_BLOCK_SIZE}-byte blocks."
+            echo "This runner has ${ACTUAL_BLOCK_SIZE}-byte blocks."
+            echo "This may cause disk_size mismatches in qemu-img output."
+          else
+            echo "Block size matches expected value."
+          fi
+
+      - name: Remove previous devcontainers, if any
+        run: |
+          docker image rm -f imago-build 2>/dev/null || true
+
+      - name: Build imago
+        run: |
+          cd ${GITHUB_WORKSPACE}/imago
+          set +e
+          make imago 2>&1 | tee ${GITHUB_WORKSPACE}/build-log.txt
+          build_exit_code=${PIPESTATUS[0]}
+          set -e
+          if [ ${build_exit_code} -ne 0 ]; then
+            echo "Build failed with exit code ${build_exit_code}"
+            exit ${build_exit_code}
+          fi
+
+      - name: Run integration tests
+        run: |
+          cd ${GITHUB_WORKSPACE}/imago
+          make test-container TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
+
+      - name: Upload test artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-logs
+          path: |
+            ${{ github.workspace }}/build-log.txt
+            ${{ github.workspace }}/test-output.txt
+          retention-days: 7
