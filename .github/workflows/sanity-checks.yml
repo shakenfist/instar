@@ -1,12 +1,6 @@
 name: Sanity Checks
 
 on:
-  push:
-    paths:
-      - 'src/**'
-      - 'crates/**'
-      - 'Makefile'
-      - '.github/workflows/sanity-checks.yml'
   pull_request:
     paths:
       - 'src/**'
