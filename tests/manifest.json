@@ -233,6 +233,96 @@
             "description": "AFL-discovered malformed VMDK: L1 size too big",
             "tags": ["vmdk", "malformed", "afl", "error-handling"],
             "sha256": "71996b27606bda1c6ae0c3294595b03d8ab896923688632fe254a127b4f651e4"
+        },
+        {
+            "id": "chain-base-vmdk",
+            "path": "custom/backing-layers-format-change/base.vmdk",
+            "format": "vmdk",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "VMDK base image for cross-format backing chain test",
+            "tags": ["vmdk", "backing-file", "base", "format-change"],
+            "sha256": "e5d8783bf4d981d48e97c5919e4f1692b779497c5638b12fdd4ce98c3d76a818"
+        },
+        {
+            "id": "chain-middle-qcow2",
+            "path": "custom/backing-layers-format-change/middle.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "QCOW2 with VMDK backing file (cross-format chain)",
+            "tags": ["qcow2", "backing-file", "format-change"],
+            "sha256": "ddfe951955c57b89424a6cc9ce2c5d498595d6c328aa67c08eb3e44a6c03e3aa"
+        },
+        {
+            "id": "chain-top-qcow2",
+            "path": "custom/backing-layers-format-change/top.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "QCOW2 overlay on QCOW2->VMDK chain (three-layer backing)",
+            "tags": ["qcow2", "backing-file", "overlay", "format-change"],
+            "sha256": "567de8e117489f7b65ef6c6ae4873eaa9385bf992f507158e59cd08168547aaf"
+        },
+        {
+            "id": "sf-vda-backing",
+            "path": "downloaded/shakenfist/vda-backing",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "Shaken Fist production base image (2MB clusters)",
+            "tags": ["qcow2", "backing-file", "base", "production", "large-cluster"],
+            "sha256": "443363b4899b0fc1a50d5dfbc86769d3d65e7b9e0e91ee7902ef860333313f3f"
+        },
+        {
+            "id": "sf-vda",
+            "path": "downloaded/shakenfist/vda",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "Shaken Fist production overlay (2MB clusters, 30GB virtual)",
+            "tags": ["qcow2", "backing-file", "overlay", "production", "large-cluster"],
+            "sha256": "d99ec6d882b03e55f9c1b834e5c6a96b411b7bfebe18c87645d51f13f06b0596"
+        },
+        {
+            "id": "aurel32-debian-etch-sparc",
+            "path": "downloaded/aurel32/debian_etch_sparc_small.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "Aurel32 Debian Etch SPARC small image (2009 vintage)",
+            "tags": ["qcow2", "sparc", "aurel32", "historic"],
+            "sha256": "58207fe5c691911e109da6d6988e558585d4c18ee1273cfb6db75c179e93d8cd"
+        },
+        {
+            "id": "aurel32-debian-squeeze-armel",
+            "path": "downloaded/aurel32/debian_squeeze_armel_standard.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "Aurel32 Debian Squeeze ARM EABI little-endian standard image",
+            "tags": ["qcow2", "arm", "armel", "aurel32", "historic"],
+            "sha256": "f60e3f6b28cc659550a8b3770343892a8342906b2d2dbf6cd51fb504131a37fb"
+        },
+        {
+            "id": "aurel32-debian-squeeze-i386",
+            "path": "downloaded/aurel32/debian_squeeze_i386_standard.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "Aurel32 Debian Squeeze i386 standard image",
+            "tags": ["qcow2", "i386", "aurel32", "historic"],
+            "sha256": "6ff062087973327543ae1b62ac2553e86ac37236134ec9affb2a845acae4e4da"
+        },
+        {
+            "id": "aurel32-debian-wheezy-powerpc",
+            "path": "downloaded/aurel32/debian_wheezy_powerpc_standard.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "Aurel32 Debian Wheezy PowerPC standard image",
+            "tags": ["qcow2", "powerpc", "ppc", "aurel32", "historic"],
+            "sha256": "3a0fcdc9fe5a8f4816b524a807701ac6d9b950b90dab56ab32a6d7855c8850f9"
         }
     ]
 }
