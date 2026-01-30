@@ -280,16 +280,18 @@ jobs:
           TESTDATA=${GITHUB_WORKSPACE}/imago-testdata
 
           # Helper function to run imago and capture output regardless of exit code
+          # We mount the entire release directory because imago needs core.bin and info.bin
+          # in the same directory as the imago binary for chain discovery
           run_chain_test() {
             local image_path="$1"
             local mount_path="$2"
             set +e
             OUTPUT=$(docker run --rm \
               --device /dev/kvm \
-              -v "$(pwd)/src/target/release/imago:/imago:ro" \
+              -v "$(pwd)/src/target/release:/opt/imago:ro" \
               -v "${mount_path}:/images:ro" \
               imago-build \
-              /imago info --chain "$image_path" 2>&1)
+              /opt/imago/imago info --chain "$image_path" 2>&1)
             local exit_code=$?
             set -e
             echo "$OUTPUT"

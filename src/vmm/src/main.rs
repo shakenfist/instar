@@ -741,13 +741,28 @@ fn print_info_result_json(
 
     // Backing file paths (if present)
     if has_backing_file {
+        // full-backing-filename is the resolved absolute path
+        // If backing_file is relative, resolve it relative to the image's directory
+        let backing_file_str = info.backing_file.as_str();
+        let full_backing_filename = if std::path::Path::new(backing_file_str).is_absolute() {
+            backing_file_str.to_string()
+        } else {
+            // Get the directory containing the image file
+            let image_dir = std::path::Path::new(abs_path)
+                .parent()
+                .unwrap_or(std::path::Path::new("/"));
+            image_dir
+                .join(backing_file_str)
+                .to_string_lossy()
+                .to_string()
+        };
         println!(
             "    \"full-backing-filename\": \"{}\",",
-            escape_json_string(&info.backing_file)
+            escape_json_string(&full_backing_filename)
         );
         println!(
             "    \"backing-filename\": \"{}\",",
-            escape_json_string(&info.backing_file)
+            escape_json_string(backing_file_str)
         );
     }
 

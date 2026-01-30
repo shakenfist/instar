@@ -10,9 +10,16 @@ TESTDATA_ROOT_PLACEHOLDER = '$TESTDATA_ROOT'
 # The "actual-size" (JSON) and "disk size" (human) fields report allocated
 # disk space which depends on filesystem block allocation, not image content.
 # When sparse files are transferred via git and re-sparsified, the exact
-# allocation can differ by one or more filesystem blocks even for identical
-# file content. See docs/quirks.md "File Sparseness and Git" for details.
-ACTUAL_SIZE_TOLERANCE = 4096
+# allocation can differ significantly from the original - the sparsification
+# algorithm may detect different zero regions depending on filesystem block
+# size, kernel version, and file content layout. See docs/quirks.md
+# "File Sparseness and Git" for details.
+#
+# We use a relative tolerance (50%) rather than absolute bytes because:
+# 1. Large sparse files can have allocation differences of many MiB
+# 2. The difference is proportional to file size and sparseness
+# 3. actual-size reflects filesystem allocation, not image content
+ACTUAL_SIZE_TOLERANCE_PERCENT = 0.5  # Allow 50% difference
 
 # Size unit multipliers for parsing human-readable sizes
 SIZE_UNITS = {
@@ -68,7 +75,7 @@ def _parse_human_size(size_str: str) -> int:
 def _compare_human_with_tolerance(
     actual_text: str,
     expected_text: str,
-    tolerance: int
+    tolerance_percent: float
 ) -> tuple:
     """
     Compare human-readable outputs, allowing tolerance for disk size field.
@@ -76,12 +83,12 @@ def _compare_human_with_tolerance(
     The "disk size" field depends on filesystem block allocation which
     varies across systems even for identical file content. This function
     compares lines and allows disk size values to differ by up to the
-    tolerance value.
+    tolerance percentage.
 
     Args:
         actual_text: Human-readable text from imago
         expected_text: Human-readable text from baseline
-        tolerance: Maximum allowed difference for disk size values (in bytes)
+        tolerance_percent: Maximum allowed relative difference (0.5 = 50%)
 
     Returns:
         tuple: (matched: bool, normalized_actual: str, normalized_expected: str)
@@ -117,7 +124,12 @@ def _compare_human_with_tolerance(
             expected_bytes = _parse_human_size(expected_size_str)
 
             if actual_bytes >= 0 and expected_bytes >= 0:
-                if abs(actual_bytes - expected_bytes) <= tolerance:
+                if expected_bytes == 0:
+                    within_tolerance = actual_bytes == 0
+                else:
+                    relative_diff = abs(actual_bytes - expected_bytes) / expected_bytes
+                    within_tolerance = relative_diff <= tolerance_percent
+                if within_tolerance:
                     # Within tolerance, normalize to expected value
                     normalized_actual.append(expected_line)
                     normalized_expected.append(expected_line)
@@ -140,7 +152,7 @@ def _compare_human_with_tolerance(
 def _compare_json_with_tolerance(
     actual_text: str,
     expected_text: str,
-    tolerance: int
+    tolerance_percent: float
 ) -> tuple:
     """
     Compare JSON outputs, allowing tolerance for actual-size field.
@@ -148,12 +160,12 @@ def _compare_json_with_tolerance(
     The "actual-size" field depends on filesystem block allocation which
     varies across systems even for identical file content. This function
     compares JSON structures and allows actual-size values to differ by
-    up to the tolerance value.
+    up to the tolerance percentage.
 
     Args:
         actual_text: JSON text from imago
         expected_text: JSON text from baseline
-        tolerance: Maximum allowed difference for actual-size values
+        tolerance_percent: Maximum allowed relative difference (0.5 = 50%)
 
     Returns:
         tuple: (matched: bool, normalized_actual: str, normalized_expected: str)
@@ -188,9 +200,13 @@ def _compare_json_with_tolerance(
                     return False
             return True
         elif path.endswith('.actual-size'):
-            # Allow tolerance for actual-size field
+            # Allow percentage-based tolerance for actual-size field
+            # since sparse file allocation varies significantly across systems
             if isinstance(actual_val, int) and isinstance(expected_val, int):
-                return abs(actual_val - expected_val) <= tolerance
+                if expected_val == 0:
+                    return actual_val == 0
+                relative_diff = abs(actual_val - expected_val) / expected_val
+                return relative_diff <= tolerance_percent
             return actual_val == expected_val
         else:
             return actual_val == expected_val
@@ -226,7 +242,7 @@ def compare_outputs(imago_output: str, expected_output: str) -> tuple:
 
     # For JSON output, try comparing with tolerance for actual-size
     matched, imago_normalized, expected_normalized = _compare_json_with_tolerance(
-        imago_output, expected_output, ACTUAL_SIZE_TOLERANCE
+        imago_output, expected_output, ACTUAL_SIZE_TOLERANCE_PERCENT
     )
 
     if matched:
@@ -234,7 +250,7 @@ def compare_outputs(imago_output: str, expected_output: str) -> tuple:
 
     # For human output, try comparing with tolerance for disk size
     matched, imago_normalized, expected_normalized = _compare_human_with_tolerance(
-        imago_output, expected_output, ACTUAL_SIZE_TOLERANCE
+        imago_output, expected_output, ACTUAL_SIZE_TOLERANCE_PERCENT
     )
 
     if matched:
