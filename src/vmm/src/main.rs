@@ -485,7 +485,25 @@ fn print_info_result(
 
         // Backing file (if present) - comes before Format specific information
         if info.flags & (1 << 0) != 0 && !info.backing_file.is_empty() {
-            println!("backing file: {}", info.backing_file);
+            let backing_file_str = info.backing_file.as_str();
+            // If backing file is relative, show both the stored name and actual path
+            // (qemu-img shows "backing file: <name> (actual path: <resolved>)")
+            if !std::path::Path::new(backing_file_str).is_absolute() {
+                // Resolve relative to image's directory
+                let image_dir = std::path::Path::new(&abs_path)
+                    .parent()
+                    .unwrap_or(std::path::Path::new("/"));
+                let actual_path = image_dir
+                    .join(backing_file_str)
+                    .to_string_lossy()
+                    .to_string();
+                println!(
+                    "backing file: {} (actual path: {})",
+                    backing_file_str, actual_path
+                );
+            } else {
+                println!("backing file: {}", backing_file_str);
+            }
             // Show backing file format if available
             if !info.qcow2_info.backing_format.is_empty() {
                 println!("backing file format: {}", info.qcow2_info.backing_format);
@@ -612,8 +630,7 @@ fn print_info_result_json(
         println!("        {{");
         println!("            \"name\": \"file\",");
         println!("            \"info\": {{");
-        println!("                \"children\": [");
-        println!("                ],");
+        println!("                \"children\": [],");
         println!("                \"virtual-size\": {},", child_file_length);
         println!(
             "                \"filename\": \"{}\",",
@@ -623,8 +640,7 @@ fn print_info_result_json(
         println!("                \"actual-size\": {},", disk_size);
         println!("                \"format-specific\": {{");
         println!("                    \"type\": \"file\",");
-        println!("                    \"data\": {{");
-        println!("                    }}");
+        println!("                    \"data\": {{}}");
         println!("                }},");
         println!("                \"dirty-flag\": false");
         println!("            }}");

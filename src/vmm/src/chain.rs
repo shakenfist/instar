@@ -251,19 +251,57 @@ pub struct InfoOperationResult {
 /// Backing file paths can be:
 /// - Absolute paths (start with `/`)
 /// - Relative paths (resolved relative to the parent image's directory)
+///
+/// For portability, when an absolute path doesn't exist, we fall back to
+/// resolving just the filename relative to the parent image's directory.
+/// This handles images created on different machines where the absolute
+/// path may not match the current filesystem layout.
+///
+/// # Resolution strategy
+///
+/// 1. If relative: resolve relative to parent image's directory
+/// 2. If absolute and exists: use the absolute path
+/// 3. If absolute and doesn't exist: fall back to filename-only resolution
+///    relative to parent image's directory (for portability)
+/// 4. Canonicalize the result to prevent traversal attacks
+///
+/// # Security
+///
+/// This function only resolves paths - security allowlist validation happens
+/// in `validate_backing_path()` which calls this function. The allowlist is
+/// always checked regardless of which resolution strategy succeeded.
 pub fn resolve_backing_path(
     parent_image: &Path,
     backing_path: &str,
 ) -> Result<PathBuf, ChainError> {
     let backing = Path::new(backing_path);
+    let parent_dir = parent_image
+        .parent()
+        .ok_or_else(|| ChainError::PathResolutionError("no parent directory".to_string()))?;
 
     let resolved = if backing.is_absolute() {
-        backing.to_path_buf()
+        // For absolute paths: try the path directly first, then fall back
+        // to filename-only resolution for portability
+        if backing.exists() {
+            backing.to_path_buf()
+        } else {
+            // Absolute path doesn't exist - try filename only, relative to
+            // parent image's directory. This handles images created on other
+            // machines with different filesystem layouts.
+            if let Some(filename) = backing.file_name() {
+                let fallback = parent_dir.join(filename);
+                if fallback.exists() {
+                    fallback
+                } else {
+                    // Neither the absolute path nor the filename fallback exist
+                    return Err(ChainError::BackingFileNotFound(backing.to_path_buf()));
+                }
+            } else {
+                return Err(ChainError::BackingFileNotFound(backing.to_path_buf()));
+            }
+        }
     } else {
-        // Relative to parent image's directory
-        let parent_dir = parent_image
-            .parent()
-            .ok_or_else(|| ChainError::PathResolutionError("no parent directory".to_string()))?;
+        // Relative path: resolve relative to parent image's directory
         parent_dir.join(backing)
     };
 
@@ -437,6 +475,67 @@ mod tests {
         std::fs::write(&parent, b"").unwrap();
 
         let result = resolve_backing_path(&parent, "nonexistent.qcow2");
+        assert!(matches!(result, Err(ChainError::BackingFileNotFound(_))));
+    }
+
+    #[test]
+    fn test_absolute_path_fallback_to_filename() {
+        // Simulate an image created on a different machine with an absolute path
+        // that doesn't exist on this machine. The fallback should find the file
+        // by its filename in the parent image's directory.
+        let tmp = TempDir::new().unwrap();
+        let images_dir = tmp.path().join("images");
+        std::fs::create_dir_all(&images_dir).unwrap();
+
+        let parent = images_dir.join("top.qcow2");
+        std::fs::write(&parent, b"").unwrap();
+
+        // Create the backing file in the same directory as the parent
+        let backing = images_dir.join("base.qcow2");
+        std::fs::write(&backing, b"").unwrap();
+
+        // Use a non-existent absolute path that has the same filename
+        let nonexistent_absolute = "/some/other/machine/path/base.qcow2";
+        let resolved = resolve_backing_path(&parent, nonexistent_absolute).unwrap();
+
+        // Should fall back to finding base.qcow2 in the parent's directory
+        assert_eq!(resolved, backing.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn test_absolute_path_no_fallback_when_exists() {
+        // When the absolute path exists, it should be used directly
+        // (no fallback to filename)
+        let tmp = TempDir::new().unwrap();
+
+        // Create parent image
+        let parent = tmp.path().join("top.qcow2");
+        std::fs::write(&parent, b"").unwrap();
+
+        // Create backing file at absolute path
+        let other_dir = tmp.path().join("other");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let backing_absolute = other_dir.join("base.qcow2");
+        std::fs::write(&backing_absolute, b"absolute").unwrap();
+
+        // Also create a file with same name in parent's directory
+        let backing_local = tmp.path().join("base.qcow2");
+        std::fs::write(&backing_local, b"local").unwrap();
+
+        // Should use the absolute path, not the local file
+        let resolved = resolve_backing_path(&parent, backing_absolute.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, backing_absolute.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn test_absolute_path_fallback_not_found() {
+        // When absolute path doesn't exist and filename fallback also doesn't
+        // exist, should return BackingFileNotFound
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path().join("top.qcow2");
+        std::fs::write(&parent, b"").unwrap();
+
+        let result = resolve_backing_path(&parent, "/nonexistent/path/base.qcow2");
         assert!(matches!(result, Err(ChainError::BackingFileNotFound(_))));
     }
 
