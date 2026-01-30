@@ -13,7 +13,7 @@
         clean-devcontainers lint lint-fix build-lint-container \
         install-hooks run-prototype guest-protocol \
         imago imago-devcontainer clean-imago run-imago \
-        test-venv test test-ci test-malicious test-report clean-tests \
+        test-venv test test-rust test-integration test-ci test-malicious test-report clean-tests \
         clean-cargo-cache
 
 # Default target
@@ -56,7 +56,9 @@ help:
 	@echo ""
 	@echo "Testing:"
 	@echo "  test-venv            Create Python venv for tests"
-	@echo "  test                 Run safe integration tests (on host)"
+	@echo "  test                 Run all tests (Rust unit + Python integration)"
+	@echo "  test-rust            Run Rust unit tests only"
+	@echo "  test-integration     Run Python integration tests only (on host)"
 	@echo "  test-container       Run tests inside container (consistent env)"
 	@echo "  test-ci              Run CI-suitable tests (safe + caution)"
 	@echo "  test-malicious       Run all tests including malicious images"
@@ -355,9 +357,26 @@ test-venv:
 	@$(VENV_DIR)/bin/pip install -q -r $(TESTS_DIR)/requirements.txt
 	@echo "Virtual environment ready at $(VENV_DIR)"
 
-# Run safe integration tests only (on host)
-test: imago test-venv
-	@echo "Running safe integration tests..."
+# Run all tests (Rust unit tests + Python integration tests)
+test: test-rust test-integration
+
+# Run Rust unit tests
+test-rust: imago-devcontainer
+	@echo "Running Rust unit tests..."
+	docker run --rm \
+		-u "$(shell id -u):$(shell id -g)" \
+		-e HOME=/build \
+		-e CARGO_HOME=/build/.cargo \
+		-v "$(CURDIR):/workspace" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
+		-w "/workspace/src/vmm" \
+		"$(IMAGO_IMAGE)" \
+		cargo test --release
+
+# Run Python integration tests only (on host)
+test-integration: imago test-venv
+	@echo "Running Python integration tests..."
 	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run test_info_safe
 
 # Run tests inside the devcontainer for consistent environment

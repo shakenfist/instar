@@ -57,10 +57,10 @@ def get_disk_size(path: str) -> int:
 
 def _format_human_size(size_bytes: int) -> str:
     """
-    Format a size in bytes to human-readable format matching qemu-img style.
+    Format a size in bytes to human-readable format matching imago/qemu-img style.
 
-    qemu-img uses binary units (KiB, MiB, GiB) and rounds to whole numbers
-    when the value is an exact multiple.
+    Uses 3 significant figures like qemu-img's %0.3g format. This matches
+    imago's qemu_compat formatting mode.
 
     Args:
         size_bytes: Size in bytes
@@ -80,11 +80,30 @@ def _format_human_size(size_bytes: int) -> str:
     ]:
         if size_bytes >= unit_bytes:
             value = size_bytes / unit_bytes
-            # qemu-img typically shows whole numbers when exact
-            if value == int(value):
-                return f'{int(value)} {unit_name}'
-            # For non-exact values, show up to 2 decimal places
-            return f'{value:.2f} {unit_name}'.rstrip('0').rstrip('.')
+            # Use 3 significant figures like qemu-img's %0.3g format
+            # This matches imago's qemu_compat mode
+            if value >= 100.0:
+                # For values >= 100, round to whole number (3 sig figs)
+                rounded = round(value)
+                return f'{rounded} {unit_name}'
+            elif value >= 10.0:
+                # For values 10-99.9, use 1 decimal place
+                rounded = round(value * 10.0) / 10.0
+                if rounded == int(rounded):
+                    return f'{int(rounded)} {unit_name}'
+                return f'{rounded:.1f} {unit_name}'
+            elif value >= 1.0:
+                # For values 1-9.99, use 2 decimal places
+                rounded = round(value * 100.0) / 100.0
+                if rounded == int(rounded):
+                    return f'{int(rounded)} {unit_name}'
+                formatted = f'{rounded:.2f}'.rstrip('0').rstrip('.')
+                return f'{formatted} {unit_name}'
+            else:
+                # For values < 1, use 3 decimal places
+                rounded = round(value * 1000.0) / 1000.0
+                formatted = f'{rounded:.3f}'.rstrip('0').rstrip('.')
+                return f'{formatted} {unit_name}'
 
     return f'{size_bytes}'
 
