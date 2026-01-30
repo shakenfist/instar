@@ -231,23 +231,27 @@ patterns where `fallocate -d` would leave extra blocks allocated.
 
 Even with `cp --sparse=always`, re-sparsified files may not have identical
 block allocation patterns to the original. Different filesystems, kernel
-versions, or sparse detection algorithms can result in allocation differences
-of one or more filesystem blocks (typically 4096 bytes).
+versions, or sparse detection algorithms can result in significantly different
+allocation patterns. The sparsification algorithm may detect different zero
+regions depending on how the file content is laid out relative to filesystem
+block boundaries.
 
 For this reason, the test comparison framework (`tests/helpers/comparators.py`)
-normalizes `actual-size` values in JSON output before comparison. Values are
-rounded down to the nearest 4096-byte boundary, so differences within one
-filesystem block are tolerated.
+uses **percentage-based tolerance** for `actual-size` values. Values are
+compared with a 50% relative tolerance, meaning values that differ by up to
+50% of the expected value are considered equivalent.
 
 This means:
-- Human output tests: Always exact match (sizes are rounded for display)
-- JSON output tests: `actual-size` values may differ by up to 4095 bytes
+- JSON output tests: `actual-size` values may differ by up to 50%
+- Human output tests: `disk size:` values may differ by up to 50%
 
 This tolerance is appropriate because:
 1. `actual-size` reflects filesystem allocation, not image content
 2. Two systems running identical qemu-img on identical file content can report
-   different `actual-size` values depending on sparse file handling
-3. imago correctly reports the same value as qemu-img on the same system
+   significantly different `actual-size` values depending on sparse file handling
+3. Large sparse files can have allocation differences of tens of megabytes
+4. The difference is proportional to file size and sparseness patterns
+5. imago correctly reports the same value as qemu-img on the same system
 
 ### Note
 
