@@ -88,6 +88,14 @@ Methods for transferring data into and out of bare-metal KVM guests.
 | [Virtio-block](data-transfer-virtio-block.md) | Block device interface for sector-based transfers |
 | [Other Mechanisms](data-transfer-other.md) | Custom MMIO device, Port I/O, ioeventfd, virtio-fs, VFIO, hypercalls |
 
+## Imago-Specific Features
+
+Features unique to imago that do not exist in qemu-img.
+
+| Document | Description |
+|----------|-------------|
+| [Chain Discovery](chain-discovery.md) | `imago info --chain` - secure backing chain discovery |
+
 ## Design Decisions
 
 | Document | Description |

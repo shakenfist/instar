@@ -44,7 +44,14 @@ sudo src/target/release/imago copy <INPUT> <OUTPUT>
 ```bash
 # Display image format information (matches qemu-img info output)
 imago info image.qcow2
+
+# Discover and display the complete backing file chain
+imago info --chain image.qcow2
 ```
+
+The `--chain` flag iteratively runs the sandboxed info operation on each image
+in the backing chain, validating paths against a security allowlist to prevent
+directory traversal attacks.
 
 ### Version Compatibility
 

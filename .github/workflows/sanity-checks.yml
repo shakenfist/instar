@@ -274,6 +274,102 @@ jobs:
           cd ${GITHUB_WORKSPACE}/imago
           make test-container TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
 
+      - name: Test --chain flag (backing chain discovery)
+        run: |
+          cd ${GITHUB_WORKSPACE}/imago
+          TESTDATA=${GITHUB_WORKSPACE}/imago-testdata
+
+          echo "=== Testing --chain with 2-level chain (shakenfist/vda) ==="
+          OUTPUT=$(docker run --rm \
+            --device /dev/kvm \
+            -v "$(pwd)/src/target/release/imago:/imago:ro" \
+            -v "${TESTDATA}/downloaded/shakenfist:/images:ro" \
+            imago-build \
+            /imago info --chain /images/vda 2>&1)
+          echo "$OUTPUT"
+
+          # Verify chain has 2 images
+          COUNT=$(echo "$OUTPUT" | grep -c "^image:" || true)
+          if [ "$COUNT" -eq 2 ]; then
+            echo "PASS: 2-level chain detected correctly"
+          else
+            echo "FAIL: Expected 2 images in chain, got $COUNT"
+            exit 1
+          fi
+
+          # Verify backing file is reported
+          if echo "$OUTPUT" | grep -q "backing-file:"; then
+            echo "PASS: backing-file field present"
+          else
+            echo "FAIL: backing-file field missing"
+            exit 1
+          fi
+
+          echo ""
+          echo "=== Testing --chain with 2-level chain (edge-cases/overlay) ==="
+          OUTPUT=$(docker run --rm \
+            --device /dev/kvm \
+            -v "$(pwd)/src/target/release/imago:/imago:ro" \
+            -v "${TESTDATA}/downloaded/edge-cases:/images:ro" \
+            imago-build \
+            /imago info --chain /images/overlay_chain.qcow2 2>&1)
+          echo "$OUTPUT"
+
+          COUNT=$(echo "$OUTPUT" | grep -c "^image:" || true)
+          if [ "$COUNT" -eq 2 ]; then
+            echo "PASS: 2-level chain detected correctly"
+          else
+            echo "FAIL: Expected 2 images in chain, got $COUNT"
+            exit 1
+          fi
+
+          echo ""
+          echo "=== Testing --chain with 3-level mixed-format chain ==="
+          OUTPUT=$(docker run --rm \
+            --device /dev/kvm \
+            -v "$(pwd)/src/target/release/imago:/imago:ro" \
+            -v "${TESTDATA}/custom/backing-layers-format-change:/images:ro" \
+            imago-build \
+            /imago info --chain /images/top.qcow2 2>&1)
+          echo "$OUTPUT"
+
+          COUNT=$(echo "$OUTPUT" | grep -c "^image:" || true)
+          if [ "$COUNT" -eq 3 ]; then
+            echo "PASS: 3-level chain detected correctly"
+          else
+            echo "FAIL: Expected 3 images in chain, got $COUNT"
+            exit 1
+          fi
+
+          # Verify format changes are reported (qcow2 -> qcow2 -> vmdk)
+          if echo "$OUTPUT" | grep -q "format: vmdk"; then
+            echo "PASS: VMDK base format detected in mixed chain"
+          else
+            echo "FAIL: VMDK base format not detected"
+            exit 1
+          fi
+
+          echo ""
+          echo "=== Testing --chain with single image (no backing) ==="
+          OUTPUT=$(docker run --rm \
+            --device /dev/kvm \
+            -v "$(pwd)/src/target/release/imago:/imago:ro" \
+            -v "${TESTDATA}/downloaded/public-clouds:/images:ro" \
+            imago-build \
+            /imago info --chain /images/debian-12-genericcloud-amd64-20240507-1740.qcow2 2>&1)
+          echo "$OUTPUT"
+
+          COUNT=$(echo "$OUTPUT" | grep -c "^image:" || true)
+          if [ "$COUNT" -eq 1 ]; then
+            echo "PASS: Single image chain (no backing) detected correctly"
+          else
+            echo "FAIL: Expected 1 image in chain, got $COUNT"
+            exit 1
+          fi
+
+          echo ""
+          echo "All --chain tests passed!"
+
       - name: Upload test artifacts
         if: failure()
         uses: actions/upload-artifact@v4
