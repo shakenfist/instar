@@ -138,5 +138,7 @@ class TestInfoSafe(testscenarios.WithScenarios, ImagoTestBase):
             self.output_type
         )
 
-        # Outputs should match exactly
-        self.assert_outputs_match(self.image_id, imago_stdout, expected)
+        # Outputs should match (with actual disk size substituted from filesystem)
+        self.assert_outputs_match(
+            self.image_id, imago_stdout, expected, image_path=image.path
+        )

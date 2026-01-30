@@ -2,24 +2,11 @@
 
 import difflib
 import json
+import os
+import re
 
 # Placeholder used in baseline files for the testdata root path
 TESTDATA_ROOT_PLACEHOLDER = '$TESTDATA_ROOT'
-
-# Tolerance for actual-size/disk size field (filesystem block size).
-# The "actual-size" (JSON) and "disk size" (human) fields report allocated
-# disk space which depends on filesystem block allocation, not image content.
-# When sparse files are transferred via git and re-sparsified, the exact
-# allocation can differ significantly from the original - the sparsification
-# algorithm may detect different zero regions depending on filesystem block
-# size, kernel version, and file content layout. See docs/quirks.md
-# "File Sparseness and Git" for details.
-#
-# We use a relative tolerance (50%) rather than absolute bytes because:
-# 1. Large sparse files can have allocation differences of many MiB
-# 2. The difference is proportional to file size and sparseness
-# 3. actual-size reflects filesystem allocation, not image content
-ACTUAL_SIZE_TOLERANCE_PERCENT = 0.5  # Allow 50% difference
 
 # Size unit multipliers for parsing human-readable sizes
 SIZE_UNITS = {
@@ -49,6 +36,135 @@ def substitute_testdata_root(text: str, testdata_root: str) -> str:
     return text.replace(TESTDATA_ROOT_PLACEHOLDER, testdata_root)
 
 
+def get_disk_size(path: str) -> int:
+    """
+    Get the actual disk allocation for a file.
+
+    This returns st_blocks * 512, which is what qemu-img and imago report
+    as "actual-size" (JSON) or "disk size" (human). This value reflects
+    the actual disk space used, accounting for sparse files.
+
+    Args:
+        path: Path to the file
+
+    Returns:
+        Disk allocation in bytes (st_blocks * 512)
+    """
+    stat_result = os.stat(path)
+    # st_blocks is in 512-byte units on all platforms
+    return stat_result.st_blocks * 512
+
+
+def _format_human_size(size_bytes: int) -> str:
+    """
+    Format a size in bytes to human-readable format matching qemu-img style.
+
+    qemu-img uses binary units (KiB, MiB, GiB) and rounds to whole numbers
+    when the value is an exact multiple.
+
+    Args:
+        size_bytes: Size in bytes
+
+    Returns:
+        Formatted string like '36 KiB', '512 MiB', etc.
+    """
+    if size_bytes == 0:
+        return '0'
+
+    # Try each unit from largest to smallest
+    for unit_name, unit_bytes in [
+        ('TiB', 1024 ** 4),
+        ('GiB', 1024 ** 3),
+        ('MiB', 1024 ** 2),
+        ('KiB', 1024),
+    ]:
+        if size_bytes >= unit_bytes:
+            value = size_bytes / unit_bytes
+            # qemu-img typically shows whole numbers when exact
+            if value == int(value):
+                return f'{int(value)} {unit_name}'
+            # For non-exact values, show up to 2 decimal places
+            return f'{value:.2f} {unit_name}'.rstrip('0').rstrip('.')
+
+    return f'{size_bytes}'
+
+
+def substitute_actual_size(expected_output: str, disk_size: int) -> str:
+    """
+    Substitute the actual-size/disk size values in expected output.
+
+    The "actual-size" (JSON) and "disk size" (human) fields report allocated
+    disk space which depends on filesystem block allocation. Instead of using
+    stored baseline values, we substitute the actual disk size of the test
+    image at test time for accurate comparison.
+
+    Args:
+        expected_output: Expected output text (JSON or human format)
+        disk_size: Actual disk allocation in bytes from filesystem
+
+    Returns:
+        Expected output with actual-size values substituted
+    """
+    # Try JSON substitution first
+    try:
+        data = json.loads(expected_output)
+        data = _substitute_json_actual_size(data, disk_size)
+        return json.dumps(data, indent=4) + '\n'
+    except json.JSONDecodeError:
+        pass
+
+    # Try human format substitution
+    return _substitute_human_disk_size(expected_output, disk_size)
+
+
+def _substitute_json_actual_size(data: dict, disk_size: int) -> dict:
+    """
+    Recursively substitute actual-size values in JSON data.
+
+    Args:
+        data: Parsed JSON data (dict or list)
+        disk_size: Actual disk allocation in bytes
+
+    Returns:
+        JSON data with actual-size values replaced
+    """
+    if isinstance(data, dict):
+        result = {}
+        for key, value in data.items():
+            if key == 'actual-size':
+                result[key] = disk_size
+            elif isinstance(value, (dict, list)):
+                result[key] = _substitute_json_actual_size(value, disk_size)
+            else:
+                result[key] = value
+        return result
+    elif isinstance(data, list):
+        return [_substitute_json_actual_size(item, disk_size)
+                if isinstance(item, (dict, list)) else item
+                for item in data]
+    return data
+
+
+def _substitute_human_disk_size(text: str, disk_size: int) -> str:
+    """
+    Substitute disk size value in human-readable output.
+
+    Replaces lines like 'disk size: 36 KiB' with the actual disk size.
+
+    Args:
+        text: Human-readable output text
+        disk_size: Actual disk allocation in bytes
+
+    Returns:
+        Text with disk size line replaced
+    """
+    formatted_size = _format_human_size(disk_size)
+    # Match 'disk size: <value>' pattern, preserving leading whitespace
+    pattern = r'^(\s*disk size:\s*).*$'
+    replacement = rf'\g<1>{formatted_size}'
+    return re.sub(pattern, replacement, text, flags=re.MULTILINE)
+
+
 def _parse_human_size(size_str: str) -> int:
     """
     Parse a human-readable size string like '36 KiB' to bytes.
@@ -72,164 +188,13 @@ def _parse_human_size(size_str: str) -> int:
     return -1
 
 
-def _compare_human_with_tolerance(
-    actual_text: str,
-    expected_text: str,
-    tolerance_percent: float
-) -> tuple:
-    """
-    Compare human-readable outputs, allowing tolerance for disk size field.
-
-    The "disk size" field depends on filesystem block allocation which
-    varies across systems even for identical file content. This function
-    compares lines and allows disk size values to differ by up to the
-    tolerance percentage.
-
-    Args:
-        actual_text: Human-readable text from imago
-        expected_text: Human-readable text from baseline
-        tolerance_percent: Maximum allowed relative difference (0.5 = 50%)
-
-    Returns:
-        tuple: (matched: bool, normalized_actual: str, normalized_expected: str)
-               If matched, the normalized strings will be identical.
-               If not matched, they show what differed.
-    """
-    actual_lines = actual_text.splitlines(keepends=True)
-    expected_lines = expected_text.splitlines(keepends=True)
-
-    if len(actual_lines) != len(expected_lines):
-        return False, actual_text, expected_text
-
-    normalized_actual = []
-    normalized_expected = []
-    all_match = True
-
-    for actual_line, expected_line in zip(actual_lines, expected_lines):
-        # Check if this is a "disk size:" line
-        actual_stripped = actual_line.lstrip()
-        expected_stripped = expected_line.lstrip()
-
-        if (actual_stripped.startswith('disk size:') and
-                expected_stripped.startswith('disk size:')):
-            # Extract the size values
-            actual_size_str = actual_stripped.replace('disk size:', '').strip()
-            expected_size_str = expected_stripped.replace('disk size:', '').strip()
-
-            # Remove trailing newline for parsing
-            actual_size_str = actual_size_str.rstrip('\n')
-            expected_size_str = expected_size_str.rstrip('\n')
-
-            actual_bytes = _parse_human_size(actual_size_str)
-            expected_bytes = _parse_human_size(expected_size_str)
-
-            if actual_bytes >= 0 and expected_bytes >= 0:
-                if expected_bytes == 0:
-                    within_tolerance = actual_bytes == 0
-                else:
-                    relative_diff = abs(actual_bytes - expected_bytes) / expected_bytes
-                    within_tolerance = relative_diff <= tolerance_percent
-                if within_tolerance:
-                    # Within tolerance, normalize to expected value
-                    normalized_actual.append(expected_line)
-                    normalized_expected.append(expected_line)
-                    continue
-
-        # Not a disk size line or not within tolerance
-        if actual_line != expected_line:
-            all_match = False
-
-        normalized_actual.append(actual_line)
-        normalized_expected.append(expected_line)
-
-    if all_match:
-        normalized = ''.join(normalized_expected)
-        return True, normalized, normalized
-
-    return False, ''.join(normalized_actual), ''.join(normalized_expected)
-
-
-def _compare_json_with_tolerance(
-    actual_text: str,
-    expected_text: str,
-    tolerance_percent: float
-) -> tuple:
-    """
-    Compare JSON outputs, allowing tolerance for actual-size field.
-
-    The "actual-size" field depends on filesystem block allocation which
-    varies across systems even for identical file content. This function
-    compares JSON structures and allows actual-size values to differ by
-    up to the tolerance percentage.
-
-    Args:
-        actual_text: JSON text from imago
-        expected_text: JSON text from baseline
-        tolerance_percent: Maximum allowed relative difference (0.5 = 50%)
-
-    Returns:
-        tuple: (matched: bool, normalized_actual: str, normalized_expected: str)
-               If matched, the normalized strings will be identical.
-               If not matched, they show what differed.
-    """
-    try:
-        actual = json.loads(actual_text)
-        expected = json.loads(expected_text)
-    except json.JSONDecodeError:
-        # Not valid JSON, can't apply tolerance
-        return False, actual_text, expected_text
-
-    def values_match(actual_val, expected_val, path=''):
-        """
-        Recursively compare values, returning True if they match
-        (with tolerance for actual-size).
-        """
-        if isinstance(expected_val, dict) and isinstance(actual_val, dict):
-            if set(actual_val.keys()) != set(expected_val.keys()):
-                return False
-            for key in expected_val:
-                if not values_match(actual_val[key], expected_val[key],
-                                    f'{path}.{key}'):
-                    return False
-            return True
-        elif isinstance(expected_val, list) and isinstance(actual_val, list):
-            if len(actual_val) != len(expected_val):
-                return False
-            for i, (a, e) in enumerate(zip(actual_val, expected_val)):
-                if not values_match(a, e, f'{path}[{i}]'):
-                    return False
-            return True
-        elif path.endswith('.actual-size'):
-            # Allow percentage-based tolerance for actual-size field
-            # since sparse file allocation varies significantly across systems
-            if isinstance(actual_val, int) and isinstance(expected_val, int):
-                if expected_val == 0:
-                    return actual_val == 0
-                relative_diff = abs(actual_val - expected_val) / expected_val
-                return relative_diff <= tolerance_percent
-            return actual_val == expected_val
-        else:
-            return actual_val == expected_val
-
-    matched = values_match(actual, expected)
-
-    if matched:
-        # Return identical normalized text to indicate match
-        normalized = json.dumps(expected, indent=4) + '\n'
-        return True, normalized, normalized
-
-    # Not matched - return original texts for diff
-    return False, actual_text, expected_text
-
-
 def compare_outputs(imago_output: str, expected_output: str) -> tuple:
     """
-    Compare imago output against expected output (from qemu-img or override).
+    Compare imago output against expected output.
 
-    For JSON output, allows tolerance for the "actual-size" field.
-    For human output, allows tolerance for the "disk size:" field.
-    Both depend on filesystem allocation and can vary across systems.
-    See docs/quirks.md "File Sparseness and Git" for details.
+    This performs exact string comparison. The caller should have already
+    substituted environment-specific values (like actual-size) using
+    substitute_actual_size() before calling this function.
 
     Returns:
         tuple: (matched: bool, diff_text: str)
@@ -240,25 +205,9 @@ def compare_outputs(imago_output: str, expected_output: str) -> tuple:
     if imago_output == expected_output:
         return True, ''
 
-    # For JSON output, try comparing with tolerance for actual-size
-    matched, imago_normalized, expected_normalized = _compare_json_with_tolerance(
-        imago_output, expected_output, ACTUAL_SIZE_TOLERANCE_PERCENT
-    )
-
-    if matched:
-        return True, ''
-
-    # For human output, try comparing with tolerance for disk size
-    matched, imago_normalized, expected_normalized = _compare_human_with_tolerance(
-        imago_output, expected_output, ACTUAL_SIZE_TOLERANCE_PERCENT
-    )
-
-    if matched:
-        return True, ''
-
     # Generate a unified diff with whitespace made visible
-    imago_visible = _make_whitespace_visible(imago_normalized)
-    expected_visible = _make_whitespace_visible(expected_normalized)
+    imago_visible = _make_whitespace_visible(imago_output)
+    expected_visible = _make_whitespace_visible(expected_output)
 
     diff = difflib.unified_diff(
         expected_visible.splitlines(keepends=True),
@@ -326,7 +275,7 @@ def format_failure_message(
     msg_parts = [
         f'Output mismatch for {image_id}',
         '',
-        'Legend: ␣=trailing space, →=tab, ↵=trailing newline',
+        'Legend: \u2423=trailing space, \u2192=tab, \u21b5=trailing newline',
         '',
         'Diff (- expected, + actual):',
         diff_text,
