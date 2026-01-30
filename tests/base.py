@@ -13,6 +13,8 @@ import testtools
 from helpers.comparators import (
     compare_outputs,
     format_failure_message,
+    get_disk_size,
+    substitute_actual_size,
     substitute_testdata_root,
 )
 from helpers.types import TestImage
@@ -328,13 +330,31 @@ class ImagoTestBase(testtools.TestCase):
         self,
         image_id: str,
         imago_output: str,
-        expected_output: str
+        expected_output: str,
+        image_path: Optional[Path] = None
     ):
         """
         Assert that imago output matches expected output exactly.
 
+        If image_path is provided, the actual disk size is looked up from the
+        filesystem and substituted into the expected output. This ensures that
+        the "actual-size" (JSON) or "disk size" (human) field comparison uses
+        the current filesystem's view of the file, not a potentially stale
+        baseline value.
+
         Provides detailed diff output on failure with whitespace made visible.
+
+        Args:
+            image_id: The test image identifier (for error messages)
+            imago_output: Output from running imago
+            expected_output: Expected output (from baseline or qemu-img)
+            image_path: Path to the image file (for disk size substitution)
         """
+        # Substitute actual disk size if image path is provided
+        if image_path is not None:
+            disk_size = get_disk_size(str(image_path))
+            expected_output = substitute_actual_size(expected_output, disk_size)
+
         matched, diff_text = compare_outputs(imago_output, expected_output)
 
         if not matched:
