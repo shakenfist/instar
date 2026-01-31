@@ -26,11 +26,12 @@ for details on why this approach is secure.
 | QCOW1 | No | Yes | (none - deprecated format) |
 | VMDK (monolithic sparse) | Yes | Yes | plaso-vmdk, vmdk-multi-partition |
 | VMDK (stream optimized) | Yes | Yes | vmdk-streamoptimized |
-| VMDK (v3/COWD) | No | Yes | (none in test suite) |
-| VHD/VPC | Yes | Yes | hyperv-dynamic-vhd, virtualpc-vhd |
+| VMDK (v3/COWD) | Yes | Yes | vmdk-v3 |
+| VHD/VPC | Yes | Yes | hyperv-dynamic-vhd, virtualpc-vhd, vhd-d2v-zerofilled |
 | VHDX | Yes | Yes | qemu-vhdx, vhdx-disk2vhd |
 | RAW | Yes | Yes | raw-mbr-partitioned, raw-gpt-partitioned, etc. |
-| GPT/MBR | Yes (separate) | Partial | raw-mbr-partitioned, raw-gpt-partitioned |
+| MBR partition table | Yes | Yes | raw-mbr-partitioned |
+| GPT partition table | Yes | Yes | raw-gpt-partitioned |
 | VDI | Yes | **No** | (none) |
 | QED | Yes (banned) | **No** | (none) |
 | ISO | Yes | **No** | (none) |
@@ -47,7 +48,6 @@ The following formats are detected by oslo.utils but not imago:
 2. **QED** - Deprecated qemu format (oslo.utils bans it entirely)
 3. **ISO** - CD/DVD image format
 4. **LUKS** - Linux encrypted container format
-5. **GPT/MBR** - oslo.utils detects these as distinct from "raw"
 
 ---
 
@@ -57,7 +57,7 @@ The following formats are detected by oslo.utils but not imago:
 
 | Check | Description | oslo.utils | imago | Test Images |
 |-------|-------------|------------|-------|-------------|
-| backing_file | Detects external backing file reference | Rejects | Reports (FLAG_HAS_BACKING_FILE) | qcow2-overlay-chain, sf-vda |
+| backing_file | Detects external backing file reference | Rejects | Reports (FLAG_HAS_BACKING_FILE) | qcow2-overlay-chain, sf-vda, qcow2-backing-* |
 | data_file | Detects external data file feature | Rejects | Reports (FLAG_HAS_EXTERNAL_DATA) | (need to create) |
 | unknown_features | Unknown incompatible feature bits | Rejects | Partial - reports known bits | (need to create) |
 | dirty | Image not cleanly closed | N/A | Reports (FLAG_DIRTY) | (none) |
@@ -84,13 +84,14 @@ The following formats are detected by oslo.utils but not imago:
 | header/footer consistency | Signature mismatch | Rejects | **Not checked** | (none) |
 | createType validation | Unsupported types | Partial | Reports createType | vmdk-streamoptimized |
 
-### GPT/MBR Safety Checks
+### RAW/Partition Table Safety Checks
 
 | Check | Description | oslo.utils | imago | Test Images |
 |-------|-------------|------------|-------|-------------|
-| MBR signature | 0xAA55 at offset 510 | Yes | **Not checked** | raw-mbr-partitioned |
-| Boot flag validity | Must be 0x00 or 0x80 | Rejects | **Not checked** | (need to create) |
-| GPT protective MBR | CHS and LBA validation | Rejects | **Not checked** | raw-gpt-partitioned |
+| MBR signature | 0xAA55 at offset 510 | Yes | Yes | raw-mbr-partitioned |
+| MBR boot flag validity | Must be 0x00 or 0x80 | Rejects | Yes | raw-mbr-partitioned |
+| GPT protective MBR | Partition type 0xEE detection | Yes | Yes | raw-gpt-partitioned |
+| Partition table required | Reject files without valid table | N/A | Yes (default) | multiple raw-* images |
 
 ### Other Format Safety Checks
 
@@ -107,67 +108,127 @@ The following formats are detected by oslo.utils but not imago:
 
 ## Test Image Coverage
 
-### Currently Tested RAW Images
+### Current Test Images by Format
 
-| Image ID | Description | Safety | Tags |
-|----------|-------------|--------|------|
-| raw-mbr-partitioned | MBR partition table | safe | raw, mbr, partitioned |
-| raw-gpt-partitioned | GPT partition table | safe | raw, gpt, partitioned |
-| raw-fat-no-partition | FAT16 without partition table | safe | raw, fat, filesystem |
-| raw-sparse-empty | Sparse 100MB file | safe | raw, sparse, empty |
-| raw-zeros-1mb | 1MB zeros | safe | raw, zeros, minimal |
-| raw-mbr-truncated | Truncated MBR (256 bytes) | malformed | raw, mbr, truncated |
-| raw-gpt-truncated | Truncated GPT | malformed | raw, gpt, truncated |
-| raw-mbr-corrupted | Valid signature, garbage entries | malformed | raw, mbr, corrupted |
-| raw-random-garbage | Random bytes | malformed | raw, garbage |
-| raw-misleading-header | QCOW2 magic but invalid | malformed | raw, misleading |
-| raw-minimal-1byte | 1-byte file | malformed | raw, minimal, edge-case |
-| raw-qcow2-magic-wrong-offset | QCOW2 magic at offset 512 | malformed | raw, misleading, offset |
+#### QCOW2 Images (20+)
+
+| Image ID | Description | Safety | Key Features |
+|----------|-------------|--------|--------------|
+| cirros-qcow2 | CirrOS minimal cloud image | safe | Production-like |
+| qcow2-v2 | QCOW2 version 2 (compat=0.10) | safe | Version 2 format |
+| qcow2-extended-l2 | Extended L2 entries | safe | Subcluster allocation |
+| qcow2-zstd | ZSTD compression | safe | Compression type |
+| qcow2-lazy-refcounts | Lazy refcounts enabled | safe | Crash-consistent mode |
+| qcow2-min-cluster | 512-byte cluster size | safe | Parser stress test |
+| qcow2-max-cluster | 2MB cluster size | safe | Parser stress test |
+| qcow2-refcount-bits-64 | 64-bit refcount width | safe | Refcount edge case |
+| qcow2-refcount-bits-1 | 1-bit refcount width | safe | Refcount edge case |
+| qcow2-overlay-chain | Overlay with backing file | safe | Backing chain |
+| qcow2-base-for-chain | Base image (no backing) | safe | Backing chain base |
+| sf-vda | Shaken Fist production overlay | safe | Large cluster, 30GB virtual |
+| sf-vda-backing | Shaken Fist production base | safe | Large cluster |
+| debian-12-sfagent | Debian 12 production image | safe | Cloud image |
+| aurel32-* | Historic Debian images (4) | safe | Various architectures |
+| chain-top-qcow2 | Three-layer backing chain | safe | Cross-format chain |
+| chain-middle-qcow2 | QCOW2 with VMDK backing | safe | Cross-format chain |
+| qcow2-backing-textfile | Backing file to text file | malicious | CVE-2015-5163 |
+| qcow2-backing-etc-passwd | Backing file to /etc/passwd | malicious | CVE-2015-5163 |
+| qcow2-backing-garbage | Backing file to garbage | malicious | CVE-2015-5163 |
+
+#### VMDK Images (5)
+
+| Image ID | Description | Safety | Key Features |
+|----------|-------------|--------|--------------|
+| plaso-vmdk | MonolithicSparse VMDK | safe | Basic VMDK |
+| vmdk-multi-partition | Multi-partition VMDK | safe | Multiple partitions |
+| vmdk-streamoptimized | streamOptimized VMDK | safe | OVA/OVF format |
+| vmdk-v3 | VMDK version 3 | safe | Native version 3 |
+| chain-base-vmdk | VMDK base for chain test | safe | Cross-format chain |
+
+#### VHD/VPC Images (4)
+
+| Image ID | Description | Safety | Key Features |
+|----------|-------------|--------|--------------|
+| hyperv-dynamic-vhd | Hyper-V 2012 R2 VHD | safe | Dynamic allocation |
+| virtualpc-vhd | Virtual PC VHD | safe | Different creator |
+| vhd-d2v-zerofilled | Disk2VHD zerofilled VHD | safe | Zerofilled |
+| afl-vhd-max-table-entries | AFL-discovered malformed | malformed | Error handling |
+
+#### VHDX Images (2)
+
+| Image ID | Description | Safety | Key Features |
+|----------|-------------|--------|--------------|
+| qemu-vhdx | QEMU iotest VHDX | safe | Dynamic disk |
+| vhdx-disk2vhd | Disk2VHD created VHDX | safe | Different creator |
+
+#### RAW Images (12)
+
+| Image ID | Description | Safety | Partition Table |
+|----------|-------------|--------|-----------------|
+| raw-mbr-partitioned | MBR partition table | safe | MBR |
+| raw-gpt-partitioned | GPT partition table | safe | GPT |
+| raw-fat-no-partition | FAT16 without partition table | safe | None (requires --unsafe-quirks) |
+| raw-sparse-empty | Sparse 100MB file | safe | None (requires --unsafe-quirks) |
+| raw-zeros-1mb | 1MB zeros | safe | None (requires --unsafe-quirks) |
+| raw-mbr-truncated | Truncated MBR | malformed | Invalid |
+| raw-gpt-truncated | Truncated GPT | malformed | Invalid |
+| raw-mbr-corrupted | Valid signature, garbage entries | malformed | Invalid |
+| raw-random-garbage | Random bytes | malformed | None |
+| raw-misleading-header | QCOW2 magic but invalid | malformed | None |
+| raw-minimal-1byte | 1-byte file | malformed | None |
+| raw-qcow2-magic-wrong-offset | QCOW2 magic at offset 512 | malformed | None |
 
 ### Missing Test Images (Priority Order)
 
 #### High Priority - Security Relevant
 
-1. **qcow2-external-data-file** - QCOW2 with data_file feature enabled
+1. **qcow2-external-data-file** - QCOW2 with data_file feature enabled (CVE-2024-32498)
 2. **qcow2-unknown-features** - QCOW2 with unknown incompatible feature bits
 3. **vmdk-path-traversal** - VMDK descriptor with `/etc/passwd` in extent path
 4. **vmdk-no-extents** - VMDK descriptor with no extent declarations
-5. **raw-invalid-boot-flag** - MBR with boot flag != 0x00/0x80
 
 #### Medium Priority - Format Coverage
 
-6. **vdi-simple** - Basic VirtualBox VDI image
-7. **qed-simple** - QED format (for rejection testing)
-8. **luks-v1** - LUKS version 1 encrypted container
-9. **luks-v2** - LUKS version 2 (for version rejection testing)
-10. **iso-simple** - Basic ISO 9660 image
+5. **vdi-simple** - Basic VirtualBox VDI image
+6. **qed-simple** - QED format (for rejection testing)
+7. **luks-v1** - LUKS version 1 encrypted container
+8. **luks-v2** - LUKS version 2 (for version rejection testing)
+9. **iso-simple** - Basic ISO 9660 image
 
 #### Lower Priority - Edge Cases
 
-11. **raw-gpt-wrong-chs** - GPT with invalid protective MBR CHS values
-12. **raw-gpt-wrong-lba** - GPT with incorrect start LBA
-13. **vmdk-header-footer-mismatch** - VMDK with inconsistent signatures
-14. **qcow2-dirty** - QCOW2 with dirty bit set
-15. **qcow2-corrupt** - QCOW2 with corrupt bit set
+10. **vmdk-header-footer-mismatch** - VMDK with inconsistent signatures
+11. **qcow2-dirty** - QCOW2 with dirty bit set
+12. **qcow2-corrupt** - QCOW2 with corrupt bit set
+13. **qcow2-encrypted** - QCOW2 with encryption enabled
 
 ---
 
-## Implementation Gaps
+## Implementation Status
 
-### In Progress: MBR/GPT Partition Table Detection
+### Completed
 
-As part of the `--unsafe-quirks` feature, imago will add MBR/GPT detection
-to distinguish genuine raw disk images from arbitrary files. This addresses
-the root cause of backing file disclosure attacks.
+1. **MBR/GPT Partition Table Detection** - Implemented as part of `--unsafe-quirks`
+   feature. By default, files without recognized format headers must have a valid
+   partition table (MBR or GPT) to be accepted as RAW disk images.
 
-**Default behavior**: Files without recognized format headers must have a
-valid partition table (MBR or GPT) to be accepted as raw disk images.
+   - MBR: Valid 0x55AA signature at offset 510, plus valid boot indicators (0x00/0x80)
+   - GPT: Protective MBR with partition type 0xEE
 
-**With `--unsafe-quirks`**: Accept any file as raw (qemu-img compatible but
-insecure).
+   See [quirks.md](quirks.md#raw-as-fallback-format) for details.
 
-See [quirks.md](quirks.md#raw-as-fallback-format) and
-[configuration.md](configuration.md) for details.
+2. **QCOW2 Backing File Detection** - Reports backing file path and format
+   (from header extension). Tests include security-focused images that attempt
+   path traversal attacks (CVE-2015-5163).
+
+3. **QCOW2 Feature Bit Detection** - Reports dirty, corrupt, external data,
+   compression type, and extended L2 feature bits.
+
+4. **VMDK CreateType Detection** - Reports createType from descriptor for
+   streamOptimized and other VMDK variants.
+
+5. **Cross-Format Backing Chain Detection** - `--chain` flag discovers backing
+   chains across format boundaries (e.g., QCOW2 -> VMDK).
 
 ### Detections to Add
 
@@ -180,14 +241,12 @@ See [quirks.md](quirks.md#raw-as-fallback-format) and
 
 1. **QCOW2 unknown features** - Warn on unknown incompatible feature bits
 2. **VMDK path validation** - Detect path traversal in descriptors
-3. **MBR boot flag validation** - Detect invalid boot flags (in addition to presence)
-4. **GPT protective MBR validation** - Validate CHS/LBA values
+3. **QCOW2 external data file** - Create test image and verify detection
 
 ### Reporting Enhancements
 
-1. **Distinguish GPT/MBR from raw** - Currently all non-header formats report as "raw"
-2. **Report partition table type** - Could add metadata field for MBR/GPT detection
-3. **Security warnings** - Flag images with security-relevant features in output
+1. **Security warnings** - Flag images with security-relevant features in output
+2. **JSON output for chain** - Add `--output json` support for `--chain` flag
 
 ---
 
@@ -198,7 +257,8 @@ See [quirks.md](quirks.md#raw-as-fallback-format) and
 - [format-detection-safety.md](format-detection-safety.md) - Why imago's detection-only approach is secure
 - [security.md](security.md) - CVE analysis and threat model
 - [testing.md](testing.md) - Test framework documentation
+- [quirks.md](quirks.md) - Safe vs unsafe quirks classification
 
 ---
 
-*Document created: January 2026*
+*Document updated: January 2026*
