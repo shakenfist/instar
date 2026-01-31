@@ -386,7 +386,7 @@ jobs:
 
           echo ""
           echo "=== Testing --chain with single image (no backing) ==="
-          OUTPUT=$(run_chain_test /images/debian-12-genericcloud-amd64-20240507-1740.qcow2 "${TESTDATA}/downloaded/public-clouds")
+          OUTPUT=$(run_chain_test /images/debian-12-genericcloud-amd64.qcow2 "${TESTDATA}/downloaded/public-clouds")
 
           COUNT=$(echo "$OUTPUT" | grep -cE '^\s+\[[0-9]+\]' || true)
           if [ "$COUNT" -eq 1 ]; then
