@@ -354,6 +354,31 @@ The native AES encryption in QCOW/QCOW2 has design flaws:
 | External data file exploitation | CVE-2024-32498 |
 | Resource exhaustion | CVE-2015-5162, CVE-2018-10908, CVE-2024-4467 |
 
+### Root Cause: RAW as Fallback Format
+
+A fundamental design decision in qemu-img enables many of these vulnerabilities:
+**any file that doesn't match a known format is treated as a valid "raw" disk
+image.**
+
+This means when qemu-img follows a backing file reference to `/etc/shadow`:
+
+1. It opens the file and attempts format detection
+2. `/etc/shadow` has no QCOW2/VMDK/VHD magic number
+3. qemu-img treats it as a "raw" disk image (the fallback)
+4. The file contents are read as disk data
+
+If qemu-img instead rejected files without recognized disk image headers, these
+attacks would fail. A `/etc/shadow` file would be rejected as "not a valid disk
+image" rather than being silently accepted as "raw."
+
+A more defensive design would require:
+- Known format magic numbers (QCOW2, VMDK, VHD, etc.), OR
+- Valid partition table (MBR/GPT) for raw images
+
+This is why oslo.utils `format_inspector` detects MBR/GPT partition tables -
+to distinguish genuine raw disk images from arbitrary files that qemu-img would
+happily accept. See [quirks.md](quirks.md#raw-as-fallback-format) for details.
+
 ---
 
 ## Recommendations

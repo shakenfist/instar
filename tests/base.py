@@ -251,7 +251,8 @@ class ImagoTestBase(testtools.TestCase):
         image_path: Path,
         timeout: int = 30,
         qemu_version: Optional[str] = None,
-        output_format: Optional[str] = None
+        output_format: Optional[str] = None,
+        unsafe_quirks: bool = False
     ) -> tuple:
         """
         Run imago info on an image.
@@ -261,6 +262,10 @@ class ImagoTestBase(testtools.TestCase):
             timeout: Timeout in seconds
             qemu_version: Optional qemu-img version to emulate (e.g., '7.2')
             output_format: Optional output format ('human' or 'json')
+            unsafe_quirks: Enable unsafe qemu-img compatibility mode.
+                           When True, accepts any file as RAW without requiring
+                           a valid partition table. Required for testing images
+                           marked with unsafe_quirks_required in the manifest.
 
         Returns:
             tuple: (stdout, stderr, return_code)
@@ -272,6 +277,8 @@ class ImagoTestBase(testtools.TestCase):
             cmd.extend(['--qemu-version', qemu_version])
         if output_format:
             cmd.extend(['--output', output_format])
+        if unsafe_quirks:
+            cmd.append('--unsafe-quirks')
         cmd.append(str(image_path))
 
         try:

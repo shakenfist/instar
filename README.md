@@ -276,6 +276,25 @@ parsed or manipulated by code running with host privileges. Instead:
 2. The host only deals with opaque byte streams
 3. Any vulnerabilities in format parsing are contained within the sandbox
 
+### Secure RAW Format Detection
+
+Unlike qemu-img, imago validates RAW format detection by requiring a valid
+partition table (MBR or GPT). This prevents arbitrary files from being accepted
+as disk images, which is the root cause of backing file disclosure attacks
+(CVE-2015-5163, CVE-2024-32498).
+
+```bash
+# Default (secure): rejects files without valid format or partition table
+imago info /etc/passwd
+# Error: Unknown format (no valid disk image header or partition table)
+
+# Unsafe mode: matches qemu-img behavior (for compatibility testing only)
+imago info --unsafe-quirks /etc/passwd
+# file format: raw
+```
+
+See [docs/quirks.md](docs/quirks.md) for the classification of safe vs unsafe quirks.
+
 ## Test Data
 
 The `testdata/` directory contains 44 disk images for security validation:

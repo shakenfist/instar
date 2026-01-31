@@ -94,6 +94,7 @@ Features unique to imago that do not exist in qemu-img.
 
 | Document | Description |
 |----------|-------------|
+| [Configuration Guide](configuration.md) | Command-line flags, config files, quirk control |
 | [Chain Discovery](chain-discovery.md) | `imago info --chain` - secure backing chain discovery |
 
 ## Design Decisions
@@ -164,9 +165,15 @@ Reusable Rust crates for the `imago` project.
 |----------|-------------|
 | [guest-protocol](crates/guest-protocol.md) | Protocol Buffers messaging for guest-VMM communication |
 
+## Testing and Coverage
+
+| Document | Description |
+|----------|-------------|
+| [Integration Testing](testing.md) | Test suite comparing imago output against qemu-img |
+| [Format Coverage](format-coverage.md) | Comparison with oslo.utils format_inspector, test coverage gaps |
+
 ## Development
 
 | Document | Description |
 |----------|-------------|
 | [Building with Docker](building-with-docker.md) | Build prototypes using Docker CLI without VSCode |
-| [Integration Testing](testing.md) | Test suite comparing imago output against qemu-img |

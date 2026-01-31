@@ -3,7 +3,50 @@
 This document describes known behaviors in qemu-img that differ from what one
 might expect, and how imago handles these cases.
 
+## Quirk Classification: Safe vs Unsafe
+
+Quirks are classified into two categories based on their security implications:
+
+### Safe Quirks
+
+Safe quirks affect output formatting or calculation methods but do not introduce
+security vulnerabilities. Examples include:
+
+- Size rounding (to block or sector boundaries)
+- Number formatting (banker's rounding, significant figures)
+- VHD size calculation methods
+
+imago **mimics safe quirks by default** for qemu-img compatibility. Use
+`--ignore-quirks` to get more intuitive behavior.
+
+### Unsafe Quirks
+
+Unsafe quirks are behaviors that can enable security vulnerabilities. The
+primary example is:
+
+- **RAW as fallback format** - Treating any unrecognized file as a valid
+  raw disk image, which enables backing file disclosure attacks
+
+imago **does NOT mimic unsafe quirks by default**. Instead, imago applies
+additional validation (e.g., requiring MBR/GPT partition tables for raw images).
+Use `--unsafe-quirks` to match qemu-img's insecure behavior for compatibility
+testing.
+
+### Summary
+
+| Flag | Safe Quirks | Unsafe Quirks |
+|------|-------------|---------------|
+| (default) | Enabled (qemu-img compatible) | Disabled (secure) |
+| `--ignore-quirks` | Disabled (intuitive output) | Disabled (secure) |
+| `--unsafe-quirks` | Enabled (qemu-img compatible) | Enabled (insecure) |
+
+See [configuration.md](configuration.md) for full flag documentation.
+
+---
+
 ## QCOW2 disk_size Calculation
+
+**Classification: Safe Quirk**
 
 ### Observed Behavior
 
@@ -66,6 +109,8 @@ calculation, tests can perform exact output comparison.
 
 ## Block-Rounded Disk Size
 
+**Classification: Safe Quirk**
+
 ### Observed Behavior
 
 qemu-img reports "disk size" rounded up to filesystem block boundaries (4096
@@ -84,6 +129,8 @@ For the QCOW2 v2 test file:
 **With `--ignore-quirks` flag**: imago reports the actual file size.
 
 ## Human-Readable Size Formatting
+
+**Classification: Safe Quirk**
 
 ### Observed Behavior
 
@@ -128,6 +175,8 @@ place when the value is not a whole number (e.g., "192.5 KiB" instead of
 "192 KiB").
 
 ## Child Node File Length
+
+**Classification: Safe Quirk**
 
 ### Observed Behavior
 
@@ -174,6 +223,8 @@ When `--ignore-quirks` is specified:
 | Size formatting | 3 significant figures | 1 decimal place |
 
 ## File Sparseness and Git
+
+**Classification: Safe Quirk** (environmental, not a qemu-img behavior)
 
 ### Observed Behavior
 
@@ -255,6 +306,8 @@ that affects qemu-img output consistency in CI environments.
 
 ## VHD Virtual Size Calculation
 
+**Classification: Safe Quirk**
+
 ### Observed Behavior
 
 qemu-img calculates VHD virtual size differently depending on the creator
@@ -319,6 +372,131 @@ maximum), or disk_size field for all others.
 
 **With `--ignore-quirks` flag**: Currently no change; the VHD size calculation
 always matches qemu-img for maximum compatibility.
+
+## RAW as Fallback Format
+
+**Classification: Unsafe Quirk** - This behavior enables security vulnerabilities.
+
+### Observed Behavior
+
+qemu-img treats **any** file that does not match a known format's magic number
+as a "raw" disk image. This includes:
+
+- Actual raw disk images (with MBR/GPT partition tables)
+- Plain text files
+- Binary data files
+- Corrupted or truncated images
+- Random garbage
+
+For example, a simple text file:
+
+```bash
+$ echo "This is just a plain text file." > /tmp/test.txt
+$ qemu-img info /tmp/test.txt
+image: /tmp/test.txt
+file format: raw
+virtual size: 512 B (512 bytes)
+disk size: 4 KiB
+```
+
+### Why This Matters
+
+This behavior has important implications:
+
+1. **No format validation**: qemu-img cannot distinguish between a genuine raw
+   disk image and arbitrary data. A user could upload a PDF, JPEG, or executable
+   and qemu-img would happily call it a "raw" disk image.
+
+2. **Testing considerations**: When testing format detection, any file that
+   fails to match known formats will be reported as "raw" rather than
+   "unknown" or generating an error.
+
+### Security Implications: The Root Cause of Backing File Attacks
+
+**This "raw as fallback" behavior is the fundamental design flaw that enables
+backing file disclosure attacks (CVE-2015-5163, CVE-2024-32498, etc.).**
+
+Consider what happens when qemu-img processes a QCOW2 image with
+`backing_file = "/etc/shadow"`:
+
+1. qemu-img opens the QCOW2 image and parses its header
+2. qemu-img sees the backing file reference to `/etc/shadow`
+3. qemu-img opens `/etc/shadow` and tries to detect its format
+4. `/etc/shadow` has no recognized magic number (it's a text file)
+5. qemu-img treats `/etc/shadow` as a "raw" disk image
+6. qemu-img reads the file contents as disk data
+
+If qemu-img instead **rejected** files that don't match any known disk image
+format, the attack would fail at step 5. The backing file would be rejected
+as "not a valid disk image" rather than being slurped up as "raw" data.
+
+This design choice - treating unknown files as valid raw images rather than
+rejecting them - is what transforms a simple path reference into a data
+exfiltration vulnerability. A more defensive design would require backing
+files to have recognizable disk image headers (QCOW2, VMDK, VHD, or at minimum
+a valid MBR/GPT partition table for raw images).
+
+**Note**: imago avoids this vulnerability entirely through its KVM sandbox
+architecture - the guest cannot open arbitrary files regardless of format
+detection behavior. See [format-detection-safety.md](format-detection-safety.md)
+for details.
+
+### Cloud Environment Implications
+
+In cloud environments (OpenStack, etc.), format validation cannot rely solely
+on qemu-img. OpenStack's Glance uses oslo.utils `format_inspector` which
+detects GPT/MBR partition tables to distinguish "actual disk images" from
+"files we don't recognize."
+
+### Comparison with oslo.utils format_inspector
+
+oslo.utils takes a different approach:
+
+| File Type | qemu-img | oslo.utils |
+|-----------|----------|------------|
+| MBR-partitioned disk | raw | gpt (detects MBR) |
+| GPT-partitioned disk | raw | gpt |
+| FAT filesystem (no partition) | raw | raw |
+| Plain text file | raw | raw |
+| Random garbage | raw | raw |
+| Corrupted QCOW2 | raw (usually) | error or raw |
+
+oslo.utils can distinguish between "files with valid partition tables" (likely
+real disk images) and "files we don't recognize" (both labeled "raw" but with
+different confidence levels).
+
+### imago Behavior
+
+**Default behavior (secure)**: imago requires files detected as "raw" to have
+a valid partition table (MBR or GPT). Files without recognized format headers
+AND without valid partition tables are rejected as "unknown format" rather
+than being silently accepted as raw images.
+
+This prevents the backing file disclosure attacks described above, because
+`/etc/shadow` would be rejected as "not a valid disk image" rather than
+being treated as a raw disk.
+
+**With `--unsafe-quirks` flag**: imago matches qemu-img's behavior, treating
+any unrecognized file as a valid raw image. This is required for exact
+qemu-img output compatibility but should only be used in controlled testing
+environments, never in production.
+
+**Partition table detection**: imago checks for:
+- **MBR**: Valid 0xAA55 signature at offset 510-511, with at least one
+  partition entry having a valid boot flag (0x00 or 0x80)
+- **GPT**: Protective MBR with partition type 0xEE, followed by valid
+  GPT header at LBA 1
+
+See [format-coverage.md](format-coverage.md) for comparison with oslo.utils
+format_inspector.
+
+### Test Images
+
+The imago-testdata repository includes several test cases for this behavior:
+
+- `raw-random-garbage.raw` - Random bytes (detected as raw)
+- `raw-misleading-header.raw` - QCOW2 magic but invalid header (detected as raw)
+- `raw-minimal-1byte.raw` - Single byte file (detected as raw)
 
 ## Future Additions
 

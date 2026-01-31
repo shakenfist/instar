@@ -118,10 +118,13 @@ class TestInfoSafe(testscenarios.WithScenarios, ImagoTestBase):
         output_format = self.output_type if self.output_type != 'human' else None
 
         # Run imago with explicit --qemu-version and output format
+        # Use --unsafe-quirks for images that require it (e.g., raw files without
+        # partition tables that qemu-img would accept but imago rejects by default)
         imago_stdout, imago_stderr, imago_rc = self.run_imago_info(
             image.path,
             qemu_version=qemu_version,
-            output_format=output_format
+            output_format=output_format,
+            unsafe_quirks=image.requires_unsafe_quirks
         )
 
         # Should succeed
