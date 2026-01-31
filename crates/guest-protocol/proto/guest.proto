@@ -76,6 +76,7 @@ message Qcow2Info {
   bool corrupt = 5;
   bool extended_l2 = 6;
   string backing_format = 7;   // Backing file format (from header extension)
+  bool dirty = 8;              // Image not cleanly closed
 }
 
 // VMDK format-specific information

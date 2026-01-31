@@ -484,6 +484,12 @@ fn print_info_result(
             println!("cluster_size: {}", info.cluster_size);
         }
 
+        // QCOW2: "cleanly shut down: no" if dirty bit is set
+        // This output was added in qemu-img 6.1 (not present in 6.0)
+        if profile.include_dirty_flag && info.format == "qcow2" && info.qcow2_info.dirty {
+            println!("cleanly shut down: no");
+        }
+
         // Backing file (if present) - comes before Format specific information
         if info.flags & (1 << 0) != 0 && !info.backing_file.is_empty() {
             let backing_file_str = info.backing_file.as_str();
@@ -783,7 +789,16 @@ fn print_info_result_json(
         );
     }
 
-    println!("    \"dirty-flag\": false");
+    // For QCOW2, use the dirty flag from the image header
+    // For other formats, always report false
+    // Note: dirty-flag output was added in qemu-img 6.1; for 6.0 compatibility,
+    // always report false when profile.include_dirty_flag is false
+    let dirty_flag = if profile.include_dirty_flag && info.format == "qcow2" {
+        info.qcow2_info.dirty
+    } else {
+        false
+    };
+    println!("    \"dirty-flag\": {}", dirty_flag);
     println!("}}");
 }
 

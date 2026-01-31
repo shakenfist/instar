@@ -218,6 +218,8 @@ pub struct Qcow2Info {
     pub compression_type: u8,
     /// Whether lazy refcounts are enabled
     pub lazy_refcounts: bool,
+    /// Whether the image is marked dirty (not cleanly closed)
+    pub dirty: bool,
     /// Whether the image is marked corrupt
     pub corrupt: bool,
     /// Whether extended L2 entries are used
@@ -225,7 +227,7 @@ pub struct Qcow2Info {
     /// Backing file format (from header extension)
     pub backing_format: BackingFormat,
     /// Padding for alignment
-    pub _pad: [u8; 2],
+    pub _pad: [u8; 1],
     /// Number of refcount bits (typically 16)
     pub refcount_bits: u32,
 }
@@ -237,10 +239,11 @@ impl Qcow2Info {
             compat: 0,
             compression_type: 0,
             lazy_refcounts: false,
+            dirty: false,
             corrupt: false,
             extended_l2: false,
             backing_format: BackingFormat::None,
-            _pad: [0; 2],
+            _pad: [0; 1],
             refcount_bits: 16,
         }
     }

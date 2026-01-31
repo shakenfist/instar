@@ -245,6 +245,8 @@ pub struct Qcow2InfoData {
     pub lazy_refcounts: bool,
     /// Number of refcount bits (typically 16)
     pub refcount_bits: u32,
+    /// Whether the image is marked dirty (not cleanly closed)
+    pub dirty: bool,
     /// Whether the image is marked corrupt
     pub corrupt: bool,
     /// Whether extended L2 entries are used
@@ -287,6 +289,7 @@ pub fn info_result_message_with_qcow2(
     );
     info.qcow2_info.lazy_refcounts = qcow2_info.lazy_refcounts;
     info.qcow2_info.refcount_bits = qcow2_info.refcount_bits;
+    info.qcow2_info.dirty = qcow2_info.dirty;
     info.qcow2_info.corrupt = qcow2_info.corrupt;
     info.qcow2_info.extended_l2 = qcow2_info.extended_l2;
     push_str(
