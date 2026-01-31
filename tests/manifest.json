@@ -453,6 +453,51 @@
             "description": "QCOW2 magic at offset 512 instead of 0 (should be RAW)",
             "tags": ["raw", "malformed", "misleading", "offset"],
             "sha256": "c8669082e2d1c7f3d88d3db9936c074c018e2add8fc09f28102eaf66486abb2d"
+        },
+        {
+            "id": "qcow2-backing-textfile",
+            "path": "custom/security/qcow2-backing-textfile.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "description": "QCOW2 with backing file pointing to a text file (simulates CVE-2015-5163)",
+            "tags": ["qcow2", "backing-file", "security", "malicious"],
+            "cve_references": ["CVE-2015-5163"],
+            "sha256": "c30371da8c05552ed06b49bf80f09e880c0346a54db08ea06608ed308923e559"
+        },
+        {
+            "id": "qcow2-backing-etc-passwd",
+            "path": "custom/security/qcow2-backing-etc-passwd.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "description": "QCOW2 with backing file pointing to /etc/passwd",
+            "tags": ["qcow2", "backing-file", "security", "malicious", "path-traversal"],
+            "cve_references": ["CVE-2015-5163"],
+            "sha256": "d9f8bf849180e6f5a59c54dc407ced2374bff08b69406f5ff724af211886498e"
+        },
+        {
+            "id": "qcow2-backing-garbage",
+            "path": "custom/security/qcow2-backing-garbage.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "description": "QCOW2 with backing file pointing to random garbage (no partition table)",
+            "tags": ["qcow2", "backing-file", "security", "malicious"],
+            "cve_references": ["CVE-2015-5163"],
+            "sha256": "f1e4ccd7f758da67da81a58762d13aa0d3b37216865e815e72fd78a2bb9dcd0f"
+        },
+        {
+            "id": "security-fake-passwd",
+            "path": "custom/security/fake-passwd.txt",
+            "format": "raw",
+            "safety": "safe",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "unsafe_quirks_required": true,
+            "description": "Simulated sensitive file for backing file security tests",
+            "tags": ["raw", "security", "test-fixture"],
+            "sha256": "c7da12480777c79be269aa8aca0191374752b115b1c077af9dc3695eab4eaa4d"
         }
     ]
 }
