@@ -246,6 +246,7 @@ pub fn send_info_result_qcow2(
         compression_type: qcow2_info.compression_type_str(),
         lazy_refcounts: qcow2_info.lazy_refcounts,
         refcount_bits: qcow2_info.refcount_bits,
+        dirty: qcow2_info.dirty,
         corrupt: qcow2_info.corrupt,
         extended_l2: qcow2_info.extended_l2,
         backing_format: qcow2_info.backing_format_str(),

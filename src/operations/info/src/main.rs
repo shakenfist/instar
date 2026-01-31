@@ -907,6 +907,7 @@ unsafe fn parse_qcow2_header(
 
         if (incompat & QCOW2_INCOMPAT_DIRTY) != 0 {
             result.flags |= InfoResult::FLAG_DIRTY;
+            qcow2_info.dirty = true;
         }
         if (incompat & QCOW2_INCOMPAT_CORRUPT) != 0 {
             result.flags |= InfoResult::FLAG_CORRUPT;
