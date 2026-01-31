@@ -263,7 +263,7 @@ This avoids refcount lookups during normal writes when the flag is set.
 
 ## L2 Table Caching
 
-QEMU loads L2 tables on demand and caches them:
+qemu loads L2 tables on demand and caches them:
 
 ```c
 // L2 cache sizing formula
@@ -282,7 +282,7 @@ for memory efficiency.
 2. **L2 tables:** Each exactly one cluster; cluster-aligned
 3. **Offsets:** All table offsets must be cluster-aligned
 4. **Reserved bits:** Must be zero; reject images with non-zero reserved bits
-5. **Maximum L1 size:** 32 MB (QEMU limit)
+5. **Maximum L1 size:** 32 MB (qemu limit)
 
 ## Backing File Chain Resolution
 

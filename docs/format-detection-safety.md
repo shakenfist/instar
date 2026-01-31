@@ -13,7 +13,7 @@ security concerns documented in CVEs:
 ### 1. Format Confusion Attacks (CVE-2008-2004)
 
 When `qemu-img` auto-detects format, a malicious file named `image.raw` could
-actually contain QCOW2 headers. This causes QEMU to parse it as QCOW2 and
+actually contain QCOW2 headers. This causes qemu to parse it as QCOW2 and
 potentially follow backing file references like `/etc/shadow`.
 
 ### 2. Parser Selection Based on Untrusted Input

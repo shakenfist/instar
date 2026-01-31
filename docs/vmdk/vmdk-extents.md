@@ -91,11 +91,11 @@ ddb.toolsVersion = "<version>"
 
 | Mode | Description |
 |------|-------------|
-| RW | Read-Write (required by QEMU) |
+| RW | Read-Write (required by qemu) |
 | RDONLY | Read-only |
 | NOACCESS | No access |
 
-**Note:** QEMU only supports RW access mode.
+**Note:** qemu only supports RW access mode.
 
 ### Examples
 
@@ -190,7 +190,7 @@ typedef struct VMDKSESparseConstHeader {
     uint64_t grain_dir_offset;
     uint64_t grain_tables_offset;
     uint64_t grains_offset;
-} QEMU_PACKED;
+} qemu_PACKED;
 ```
 
 ### SESparse L2 Entry States
@@ -220,7 +220,7 @@ typedef struct VMDKSESparseConstHeader {
 | 2 | Similar to v1 |
 | 3 | 64-bit references, RGD, CBT |
 
-**Note:** Version 3 must be opened read-only in QEMU.
+**Note:** Version 3 must be opened read-only in qemu.
 
 ## Creating VMDK Images
 
@@ -236,5 +236,5 @@ qemu-img create -f vmdk -o subformat=streamOptimized disk.vmdk 20G
 
 ## References
 
-- QEMU source: `block/vmdk.c`
+- qemu source: `block/vmdk.c`
 - VMware VDDK 5.0 Technical Note

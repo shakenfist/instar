@@ -60,6 +60,25 @@ const QCOW2_COMPAT_LAZY_REFCOUNTS: u64 = 1 << 0;
 // Maximum backing file path length (QCOW2 spec allows up to 1023 bytes)
 const MAX_BACKING_FILE_LEN: usize = 1024;
 
+// MBR (Master Boot Record) partition table detection
+// MBR signature is 0x55AA at offset 510-511 (big-endian, bytes are 0x55, 0xAA)
+const MBR_SIGNATURE_OFFSET: usize = 510;
+const MBR_SIGNATURE: u16 = 0xAA55; // Little-endian: bytes 0x55, 0xAA
+
+// MBR partition table entry offsets (4 entries at 0x1BE, 0x1CE, 0x1DE, 0x1EE)
+const MBR_PARTITION_TABLE_OFFSET: usize = 0x1BE;
+const MBR_PARTITION_ENTRY_SIZE: usize = 16;
+
+// Valid MBR boot indicator values (first byte of partition entry)
+const MBR_BOOT_INACTIVE: u8 = 0x00;
+const MBR_BOOT_ACTIVE: u8 = 0x80;
+
+// GPT (GUID Partition Table) detection
+// GPT protective MBR has partition type 0xEE
+const GPT_PROTECTIVE_MBR_TYPE: u8 = 0xEE;
+// GPT header signature "EFI PART" at LBA 1 (sector 1)
+const GPT_SIGNATURE: u64 = 0x5452415020494645; // "EFI PART" in little-endian
+
 // QCOW2 header extension constants
 const QCOW2_HEADER_EXTENSION_OFFSET: usize = 104; // First extension after fixed header (v3)
 const QCOW2_EXT_BACKING_FORMAT: u32 = 0xE2792ACA; // Backing file format extension type
@@ -157,6 +176,57 @@ pub unsafe extern "C" fn _start() -> u64 {
             input_sector_size,
         ) {
             format = detect_vhd_footer(&footer_buffer);
+        }
+    }
+
+    // For RAW format: validate partition table unless unsafe quirks is enabled.
+    // This prevents arbitrary files (like /etc/passwd) from being accepted as
+    // valid disk images, which is the root cause of backing file disclosure attacks.
+    if format == ImageFormat::Raw {
+        let unsafe_quirks = config.is_valid() && config.unsafe_quirks_enabled();
+
+        if !unsafe_quirks {
+            // Check for valid partition table
+            let partition_type = detect_partition_table(&buffer);
+
+            match partition_type {
+                PartitionTableType::Mbr => {
+                    (call_table.debug_print)(b"info: found MBR partition table\n\0".as_ptr());
+                    result.flags |= InfoResult::FLAG_HAS_MBR;
+                }
+                PartitionTableType::Gpt => {
+                    (call_table.debug_print)(b"info: found GPT partition table\n\0".as_ptr());
+                    result.flags |= InfoResult::FLAG_HAS_GPT;
+                }
+                PartitionTableType::None => {
+                    // No valid partition table found - reject as unknown format
+                    // This is the secure default: only accept files that are
+                    // recognizably disk images
+                    (call_table.debug_print)(
+                        b"info: no partition table, rejecting as unknown\n\0".as_ptr(),
+                    );
+                    format = ImageFormat::Unknown;
+                }
+            }
+        } else {
+            // Unsafe quirks mode: accept any file as RAW (qemu-img compatible
+            // but insecure). Still detect partition table for informational
+            // purposes.
+            let partition_type = detect_partition_table(&buffer);
+            match partition_type {
+                PartitionTableType::Mbr => {
+                    result.flags |= InfoResult::FLAG_HAS_MBR;
+                }
+                PartitionTableType::Gpt => {
+                    result.flags |= InfoResult::FLAG_HAS_GPT;
+                }
+                PartitionTableType::None => {
+                    // Accept anyway in unsafe mode
+                    (call_table.debug_print)(
+                        b"info: no partition table (unsafe quirks)\n\0".as_ptr(),
+                    );
+                }
+            }
         }
     }
 
@@ -341,6 +411,93 @@ fn detect_vhd_footer(buffer: &[u8]) -> ImageFormat {
     }
 
     ImageFormat::Raw
+}
+
+/// Partition table type for RAW image validation
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PartitionTableType {
+    /// No valid partition table found
+    None,
+    /// MBR (Master Boot Record) partition table
+    Mbr,
+    /// GPT (GUID Partition Table)
+    Gpt,
+}
+
+/// Detect partition table type from the first sector (MBR/GPT detection)
+///
+/// This is used for RAW format validation. Files without a recognized format
+/// header must have a valid partition table to be accepted as RAW disk images
+/// in secure mode (without --unsafe-quirks).
+///
+/// Detection logic:
+/// 1. Check for MBR signature (0x55AA at offset 510)
+/// 2. Check for GPT protective MBR (partition type 0xEE)
+/// 3. Validate MBR boot indicators (must be 0x00 or 0x80)
+fn detect_partition_table(buffer: &[u8]) -> PartitionTableType {
+    // Need at least 512 bytes for MBR detection
+    if buffer.len() < 512 {
+        return PartitionTableType::None;
+    }
+
+    // Check MBR signature at offset 510-511
+    let signature = u16::from_le_bytes([
+        buffer[MBR_SIGNATURE_OFFSET],
+        buffer[MBR_SIGNATURE_OFFSET + 1],
+    ]);
+
+    if signature != MBR_SIGNATURE {
+        return PartitionTableType::None;
+    }
+
+    // Valid MBR signature found. Now check partition entries.
+    // MBR has 4 partition entries starting at offset 0x1BE (446)
+    let mut valid_mbr = false;
+    let mut has_gpt_protective = false;
+
+    for i in 0..4 {
+        let entry_offset = MBR_PARTITION_TABLE_OFFSET + (i * MBR_PARTITION_ENTRY_SIZE);
+
+        // Boot indicator (first byte of partition entry)
+        let boot_indicator = buffer[entry_offset];
+
+        // Partition type (5th byte of partition entry)
+        let partition_type = buffer[entry_offset + 4];
+
+        // Skip empty partitions (type 0x00)
+        if partition_type == 0x00 {
+            continue;
+        }
+
+        // Check for GPT protective MBR
+        if partition_type == GPT_PROTECTIVE_MBR_TYPE {
+            has_gpt_protective = true;
+        }
+
+        // Boot indicator must be 0x00 (inactive) or 0x80 (active)
+        if boot_indicator != MBR_BOOT_INACTIVE && boot_indicator != MBR_BOOT_ACTIVE {
+            // Invalid boot indicator - this isn't a valid MBR
+            return PartitionTableType::None;
+        }
+
+        // Found at least one valid partition entry
+        valid_mbr = true;
+    }
+
+    // If we found GPT protective MBR, report as GPT
+    // (full GPT header validation would require reading sector 1)
+    if has_gpt_protective {
+        return PartitionTableType::Gpt;
+    }
+
+    // If we found valid MBR entries, report as MBR
+    if valid_mbr {
+        return PartitionTableType::Mbr;
+    }
+
+    // Valid MBR signature but no partition entries - could be a boot sector
+    // or a filesystem without partitioning. Accept it as valid.
+    PartitionTableType::Mbr
 }
 
 /// Parse VHD footer and populate result

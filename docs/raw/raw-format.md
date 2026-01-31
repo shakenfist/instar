@@ -27,9 +27,9 @@ Raw images are completely unstructured:
 
 **That's it.** There is no header, footer, or metadata structure.
 
-## QEMU Raw Format Options
+## qemu Raw Format Options
 
-QEMU's raw driver supports two runtime options:
+qemu's raw driver supports two runtime options:
 
 ### offset
 
@@ -116,7 +116,7 @@ static int raw_probe(const uint8_t *buf, int buf_size, const char *filename) {
 }
 ```
 
-QEMU examines the first 512 bytes and each format driver returns a confidence
+qemu examines the first 512 bytes and each format driver returns a confidence
 score. Raw always returns 1, so it's selected only if no other format matches.
 
 ### Probed Image Restrictions
@@ -239,5 +239,5 @@ virt-sparsify --in-place disk.raw
 
 ## References
 
-- QEMU source: `block/raw-format.c`
-- QEMU docs: https://qemu-project.gitlab.io/qemu/system/images.html
+- qemu source: `block/raw-format.c`
+- qemu docs: https://qemu-project.gitlab.io/qemu/system/images.html

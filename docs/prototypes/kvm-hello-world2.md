@@ -216,7 +216,7 @@ The vm-memory crate is just the beginning. rust-vmm provides:
 | virtio-blk | ~70% for block device |
 | Overall | ~72% for full virtio-block |
 
-As noted in the [comparison document](../data-transfer-comparison.md), using
+As noted in the [comparison document](data-transfer-comparison.md), using
 rust-vmm crates reduces a complete virtio-block implementation from ~1600 lines
 to ~450 lines.
 

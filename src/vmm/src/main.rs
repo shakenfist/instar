@@ -20,6 +20,7 @@
 //! - InfoResult reading for info operations
 
 mod backing;
+mod chain;
 mod config;
 mod error;
 mod io_thread;
@@ -44,6 +45,10 @@ use log::{debug, info};
 use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use backing::BackingStore;
+use chain::{
+    check_chain_depth, check_circular_reference, validate_backing_path, BackingChain, ChainError,
+    ChainImage, ImageFormat, InfoOperationResult,
+};
 use io_thread::{DeviceRole, IoDevice};
 use ioevent::IoEvent;
 use stats::VmmStats;
@@ -65,6 +70,7 @@ const COPY_CONFIG_FLAG_SKIP_ZEROS: u32 = 1 << 1;
 const INFO_CONFIG_MAGIC: u32 = 0x494E464F; // "INFO"
 const INFO_CONFIG_FLAG_DETAILED: u32 = 1 << 0;
 const INFO_CONFIG_FLAG_SECURITY_CHECK: u32 = 1 << 1;
+const INFO_CONFIG_FLAG_UNSAFE_QUIRKS: u32 = 1 << 2;
 
 // InfoResult constants (must match shared crate)
 // These are defined for future use when parsing results from guest
@@ -480,7 +486,25 @@ fn print_info_result(
 
         // Backing file (if present) - comes before Format specific information
         if info.flags & (1 << 0) != 0 && !info.backing_file.is_empty() {
-            println!("backing file: {}", info.backing_file);
+            let backing_file_str = info.backing_file.as_str();
+            // If backing file is relative, show both the stored name and actual path
+            // (qemu-img shows "backing file: <name> (actual path: <resolved>)")
+            if !std::path::Path::new(backing_file_str).is_absolute() {
+                // Resolve relative to image's directory
+                let image_dir = std::path::Path::new(&abs_path)
+                    .parent()
+                    .unwrap_or(std::path::Path::new("/"));
+                let actual_path = image_dir
+                    .join(backing_file_str)
+                    .to_string_lossy()
+                    .to_string();
+                println!(
+                    "backing file: {} (actual path: {})",
+                    backing_file_str, actual_path
+                );
+            } else {
+                println!("backing file: {}", backing_file_str);
+            }
             // Show backing file format if available
             if !info.qcow2_info.backing_format.is_empty() {
                 println!("backing file format: {}", info.qcow2_info.backing_format);
@@ -607,8 +631,7 @@ fn print_info_result_json(
         println!("        {{");
         println!("            \"name\": \"file\",");
         println!("            \"info\": {{");
-        println!("                \"children\": [");
-        println!("                ],");
+        println!("                \"children\": [],");
         println!("                \"virtual-size\": {},", child_file_length);
         println!(
             "                \"filename\": \"{}\",",
@@ -618,8 +641,7 @@ fn print_info_result_json(
         println!("                \"actual-size\": {},", disk_size);
         println!("                \"format-specific\": {{");
         println!("                    \"type\": \"file\",");
-        println!("                    \"data\": {{");
-        println!("                    }}");
+        println!("                    \"data\": {{}}");
         println!("                }},");
         println!("                \"dirty-flag\": false");
         println!("            }}");
@@ -736,13 +758,28 @@ fn print_info_result_json(
 
     // Backing file paths (if present)
     if has_backing_file {
+        // full-backing-filename is the resolved absolute path
+        // If backing_file is relative, resolve it relative to the image's directory
+        let backing_file_str = info.backing_file.as_str();
+        let full_backing_filename = if std::path::Path::new(backing_file_str).is_absolute() {
+            backing_file_str.to_string()
+        } else {
+            // Get the directory containing the image file
+            let image_dir = std::path::Path::new(abs_path)
+                .parent()
+                .unwrap_or(std::path::Path::new("/"));
+            image_dir
+                .join(backing_file_str)
+                .to_string_lossy()
+                .to_string()
+        };
         println!(
             "    \"full-backing-filename\": \"{}\",",
-            escape_json_string(&info.backing_file)
+            escape_json_string(&full_backing_filename)
         );
         println!(
             "    \"backing-filename\": \"{}\",",
-            escape_json_string(&info.backing_file)
+            escape_json_string(backing_file_str)
         );
     }
 
@@ -783,6 +820,355 @@ fn get_binary_path(name: &str) -> std::path::PathBuf {
     get_binary_dir().join(name)
 }
 
+/// Execute the info operation on a single image file and capture the result.
+///
+/// This function sets up and runs the KVM guest with the info operation,
+/// then captures and returns the result instead of printing it.
+///
+/// # Arguments
+///
+/// * `input_path` - Path to the image file to analyze
+/// * `sector_size` - Sector size for the virtio-block device
+/// * `unsafe_quirks` - Enable unsafe qemu-img compatibility mode (accepts any file as RAW)
+///
+/// # Returns
+///
+/// The captured info operation result, or an error if the operation failed.
+fn execute_info_operation(
+    input_path: &Path,
+    sector_size: u32,
+    unsafe_quirks: bool,
+) -> Result<InfoOperationResult, Box<dyn std::error::Error>> {
+    // Auto-discover binaries in same directory as executable
+    let core_path = get_binary_path("core.bin");
+    let operation_path = get_binary_path("info.bin");
+
+    // Load core binary (device init, call table setup)
+    let core_code = load_guest_binary(core_path.to_str().unwrap())?;
+
+    // Load operation binary (info)
+    let operation_code = load_guest_binary(operation_path.to_str().unwrap())?;
+
+    // Get input file metadata
+    let input_metadata = std::fs::metadata(input_path)?;
+    let input_size = input_metadata.len();
+
+    // Open backing store (input only, read-only)
+    let input_backing = BackingStore::open(input_path, true, None, false)?;
+
+    // Open KVM
+    let kvm = Kvm::new()?;
+
+    // Create VM
+    let vm = kvm.create_vm()?;
+
+    // Create guest memory
+    let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
+
+    // Get the memory region for KVM registration
+    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let host_addr = region.as_ptr() as u64;
+
+    // Set up KVM memory region
+    let mem_region = kvm_userspace_memory_region {
+        slot: 0,
+        guest_phys_addr: 0,
+        memory_size: GUEST_MEM_SIZE,
+        userspace_addr: host_addr,
+        flags: 0,
+    };
+    unsafe {
+        vm.set_user_memory_region(mem_region)?;
+    }
+
+    // Set up GDT
+    setup_gdt(&guest_mem)?;
+
+    // Set up page tables (identity map)
+    setup_page_tables(&guest_mem)?;
+
+    // Load core binary at GUEST_CODE_BASE (0x10000)
+    guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
+
+    // Load operation binary at OPERATION_LOAD_ADDR (0x20000)
+    guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
+
+    // Write InfoConfig at OPERATION_CONFIG_ADDR (0x19000)
+    let mut info_flags: u32 = INFO_CONFIG_FLAG_DETAILED | INFO_CONFIG_FLAG_SECURITY_CHECK;
+    if unsafe_quirks {
+        info_flags |= INFO_CONFIG_FLAG_UNSAFE_QUIRKS;
+    }
+    guest_mem.write_obj(INFO_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
+    guest_mem.write_obj(info_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
+
+    // Create virtio-block device (input only for info operation)
+    let input_device = VirtioBlockDevice::new(
+        input_backing,
+        input_size,
+        sector_size as u64,
+        true, // read-only
+        INPUT_MMIO_BASE,
+        INPUT_VQ_BASE,
+    );
+
+    // Wrap device in Arc<Mutex<>> for potential sharing with I/O thread
+    let input_device = Arc::new(Mutex::new(input_device));
+
+    // Wrap guest memory in Arc for sharing
+    let guest_mem = Arc::new(guest_mem);
+
+    // Create shared statistics tracker
+    let vmm_stats = Arc::new(Mutex::new(VmmStats::new()));
+
+    // Set up ioeventfd for queue notifications
+    let mut io_thread: Option<io_thread::IoThread> = None;
+    let mut input_evt = IoEvent::new(INPUT_MMIO_BASE)?;
+
+    match input_evt.register(&vm) {
+        Ok(()) => {
+            // Configure devices for I/O thread (info: 1 input device only)
+            let devices = vec![IoDevice {
+                role: DeviceRole::Input,
+                device: Arc::clone(&input_device),
+                ioevent: input_evt,
+            }];
+
+            // Start the I/O thread
+            io_thread = Some(io_thread::IoThread::new(
+                devices,
+                Arc::clone(&guest_mem),
+                Arc::clone(&vmm_stats),
+            ));
+        }
+        Err(_) => {
+            // Fall back to VM exits for queue processing
+        }
+    }
+
+    // Create vCPU
+    let mut vcpu = vm.create_vcpu(0)?;
+
+    // Set up registers
+    let mut sregs = vcpu.get_sregs()?;
+    setup_sregs(&mut sregs);
+    vcpu.set_sregs(&sregs)?;
+
+    let mut regs = vcpu.get_regs()?;
+    setup_regs(&mut regs);
+    vcpu.set_regs(&regs)?;
+
+    // Create serial decoder for protobuf messages from guest
+    let mut serial_decoder = SerialDecoder::new();
+
+    // Create serial transmitter for sending config to guest
+    let mut serial_transmitter = SerialTransmitter::new();
+
+    // Create debug buffer for COM2 output
+    let mut debug_buffer = DebugBuffer::new();
+
+    // Queue the configuration message for transmission
+    let config = vmm_config_input_only(sector_size);
+    serial_transmitter.queue_config(&config);
+
+    // Variable to capture the result
+    let mut captured_result: Option<InfoOperationResult> = None;
+
+    // Run the vCPU loop
+    loop {
+        match vcpu.run()? {
+            VcpuExit::Hlt => {
+                break;
+            }
+            VcpuExit::IoOut(port, data) => {
+                if port == SERIAL_PORT {
+                    for &byte in data {
+                        if let Some(msg) = serial_decoder.add_byte(byte) {
+                            // Capture InfoResult
+                            if let Some(guest_::GuestMessage_::Payload::InfoResult(info)) =
+                                &msg.payload
+                            {
+                                captured_result = Some(InfoOperationResult {
+                                    format: info.format.to_string(),
+                                    virtual_size: info.virtual_size,
+                                    actual_size: info.actual_size,
+                                    cluster_size: info.cluster_size,
+                                    flags: info.flags,
+                                    backing_file: if info.backing_file.is_empty() {
+                                        None
+                                    } else {
+                                        Some(info.backing_file.to_string())
+                                    },
+                                });
+                            }
+                        }
+                    }
+                } else if port == DEBUG_PORT {
+                    for &byte in data {
+                        debug_buffer.add_byte(byte);
+                    }
+                }
+            }
+            VcpuExit::IoIn(port, data) => {
+                if port == SERIAL_PORT {
+                    for byte in data.iter_mut() {
+                        *byte = serial_transmitter.next_byte().unwrap_or(0);
+                    }
+                } else if port == SERIAL_PORT + 5 {
+                    let mut lsr = 0x60u8;
+                    if serial_transmitter.has_data() {
+                        lsr |= 0x01;
+                    }
+                    data[0] = lsr;
+                } else {
+                    for byte in data {
+                        *byte = 0;
+                    }
+                }
+            }
+            VcpuExit::MmioRead(addr, data) => {
+                let input_range = INPUT_MMIO_BASE..INPUT_MMIO_BASE + MMIO_SIZE;
+                let value = if input_range.contains(&addr) {
+                    input_device
+                        .lock()
+                        .unwrap()
+                        .mmio_read((addr - INPUT_MMIO_BASE) as u32)
+                } else {
+                    0
+                };
+                write_mmio_data(data, value);
+            }
+            VcpuExit::MmioWrite(addr, data) => {
+                let value = read_mmio_data(data);
+                let input_range = INPUT_MMIO_BASE..INPUT_MMIO_BASE + MMIO_SIZE;
+                if input_range.contains(&addr) {
+                    let mut device = input_device.lock().unwrap();
+                    device.mmio_write((addr - INPUT_MMIO_BASE) as u32, value);
+                    if io_thread.is_none() && device.should_process_queue() {
+                        device.process_queue(&guest_mem)?;
+                    }
+                }
+            }
+            VcpuExit::Shutdown => {
+                return Err("VM shutdown (possible triple fault)".into());
+            }
+            VcpuExit::FailEntry(reason, cpu) => {
+                return Err(format!("VM entry failed: reason=0x{:x}, cpu={}", reason, cpu).into());
+            }
+            _ => {
+                // Ignore other exits
+            }
+        }
+    }
+
+    if let Some(mut thread) = io_thread {
+        thread.stop();
+    }
+
+    captured_result.ok_or_else(|| "No info result received from guest".into())
+}
+
+/// Discover the complete backing file chain for an image.
+///
+/// This function iteratively runs the sandboxed info operation to discover
+/// the complete backing file chain. All format parsing happens in the KVM
+/// guest; this function only coordinates the discovery and validates paths.
+///
+/// # Arguments
+///
+/// * `top_image` - Path to the top-level image
+/// * `sector_size` - Sector size for virtio-block devices
+/// * `security_config` - Security configuration with path allowlist
+///
+/// # Returns
+///
+/// A BackingChain containing all images from top to base, or an error.
+fn discover_backing_chain(
+    top_image: &Path,
+    sector_size: u32,
+    security_config: &config::SecurityConfig,
+) -> Result<BackingChain, ChainError> {
+    let mut chain = BackingChain::new();
+    let mut seen_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut current = top_image
+        .canonicalize()
+        .map_err(|e| ChainError::PathResolutionError(format!("{}: {}", top_image.display(), e)))?;
+
+    loop {
+        // Check for circular references
+        check_circular_reference(&current, &seen_paths)?;
+
+        // Check chain depth
+        check_chain_depth(chain.len(), security_config)?;
+
+        seen_paths.push(current.clone());
+
+        // Run the sandboxed info operation
+        // Always use secure mode (unsafe_quirks=false) for backing chain discovery
+        let info_result = execute_info_operation(&current, sector_size, false)
+            .map_err(|e| ChainError::InfoOperationFailed(e.to_string()))?;
+
+        // Build chain image entry
+        let chain_image = ChainImage {
+            path: current.clone(),
+            format: ImageFormat::from_str(&info_result.format),
+            virtual_size: info_result.virtual_size,
+            actual_size: info_result.actual_size,
+            cluster_size: info_result.cluster_size,
+            backing_file_raw: info_result.backing_file.clone(),
+            flags: info_result.flags,
+        };
+
+        chain.push(chain_image);
+
+        // Check for backing file
+        match info_result.backing_file {
+            Some(backing_path) => {
+                // Validate and resolve the backing file path
+                let backing_resolved =
+                    validate_backing_path(&current, &backing_path, security_config)?;
+                current = backing_resolved;
+            }
+            None => {
+                // No backing file - end of chain
+                break;
+            }
+        }
+    }
+
+    Ok(chain)
+}
+
+/// Print the backing chain in human-readable format
+fn print_backing_chain(chain: &BackingChain) {
+    println!("Chain: {} image(s)", chain.len());
+    for (i, image) in chain.images().iter().enumerate() {
+        let backing_info = match &image.backing_file_raw {
+            Some(bf) => format!(" -> {}", bf),
+            None => String::new(),
+        };
+        println!(
+            "  [{}] {} ({}){}",
+            i,
+            image.path.display(),
+            image.format,
+            backing_info
+        );
+        println!(
+            "      virtual size: {} ({} bytes)",
+            format_size_human(image.virtual_size, false),
+            image.virtual_size
+        );
+        println!(
+            "      disk size: {} ({} bytes)",
+            format_size_human(image.actual_size, false),
+            image.actual_size
+        );
+        if image.cluster_size > 0 {
+            println!("      cluster size: {} bytes", image.cluster_size);
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "imago")]
 #[command(about = "Safe, sandboxed disk image operations")]
@@ -818,6 +1204,13 @@ struct InfoArgs {
     #[arg(long)]
     ignore_quirks: bool,
 
+    /// Enable unsafe qemu-img compatibility mode.
+    /// WARNING: This accepts any file as a valid RAW image, which enables
+    /// security vulnerabilities like backing file disclosure attacks.
+    /// Use only for compatibility testing, never in production.
+    #[arg(long)]
+    unsafe_quirks: bool,
+
     /// Target qemu-img version for output compatibility (e.g., "7.2", "8.0", "10.0").
     /// By default, imago detects the installed qemu-img version and matches its output format.
     #[arg(long, value_name = "VERSION")]
@@ -826,6 +1219,10 @@ struct InfoArgs {
     /// Output format: human (default) or json
     #[arg(long, default_value = "human", value_parser = ["human", "json"])]
     output: String,
+
+    /// Discover and display the complete backing file chain
+    #[arg(long)]
+    chain: bool,
 }
 
 #[derive(Args, Debug)]
@@ -938,6 +1335,23 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
             MAX_SECTOR_SIZE, args.sector_size
         );
         std::process::exit(1);
+    }
+
+    // Handle --chain flag: discover and display backing file chain
+    if args.chain {
+        let input_path = Path::new(&args.input);
+        let security_config = config::load_config().config.security;
+
+        match discover_backing_chain(input_path, args.sector_size, &security_config) {
+            Ok(chain) => {
+                print_backing_chain(&chain);
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("Error discovering backing chain: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
 
     // Determine output profile (from --qemu-version flag or by detection)
@@ -1061,7 +1475,10 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Write InfoConfig at OPERATION_CONFIG_ADDR (0x19000)
     // Layout: magic (u32), flags (u32)
-    let info_flags: u32 = INFO_CONFIG_FLAG_DETAILED | INFO_CONFIG_FLAG_SECURITY_CHECK;
+    let mut info_flags: u32 = INFO_CONFIG_FLAG_DETAILED | INFO_CONFIG_FLAG_SECURITY_CHECK;
+    if args.unsafe_quirks {
+        info_flags |= INFO_CONFIG_FLAG_UNSAFE_QUIRKS;
+    }
     guest_mem.write_obj(INFO_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
     guest_mem.write_obj(info_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
     debug!(

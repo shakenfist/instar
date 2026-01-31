@@ -304,5 +304,5 @@ device, calls `process_queue()`, and updates the shared statistics.
 ## Related Documentation
 
 - [Virtio-Block4 Prototype](virtio-block4.md) - Statistics tracking
-- [Performance Counters](../performance-counters.md)
-- [Data Transfer](../data-transfer-virtio-block.md)
+- [Performance Counters](performance-counters.md)
+- [Data Transfer](data-transfer-virtio-block.md)

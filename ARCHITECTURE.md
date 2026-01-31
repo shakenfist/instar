@@ -43,6 +43,26 @@ The sandboxed conversion engine:
 - Parses source format, writes destination format
 - Any exploit is contained within the sandbox
 
+### RAW Format Validation
+
+A key security enhancement over qemu-img is partition table validation for RAW
+format detection. qemu-img treats any unrecognized file as a valid RAW disk
+image, which is the root cause of backing file disclosure attacks (CVE-2015-5163,
+CVE-2024-32498).
+
+**Imago's default behavior (secure):** Files without recognized format headers
+must have a valid partition table (MBR or GPT) to be accepted as RAW disk images.
+Files without valid partition tables are rejected as "unknown format."
+
+**With `--unsafe-quirks`:** Matches qemu-img behavior for compatibility testing.
+This flag should never be used in production.
+
+Detection logic:
+- MBR: Valid 0x55AA signature at offset 510, plus valid boot indicators (0x00/0x80)
+- GPT: Protective MBR with partition type 0xEE
+
+See [quirks.md](docs/quirks.md) for details on safe vs unsafe quirks classification.
+
 ## Communication Protocol
 
 TBD - Options to explore:

@@ -41,7 +41,7 @@ typedef struct VMDK4Header {
     char filler[1];              // Padding
     char check_bytes[4];         // 0x0a, 0x20, 0x0d, 0x0a
     uint16_t compressAlgorithm;  // Compression type
-} QEMU_PACKED;
+} qemu_PACKED;
 ```
 
 ## VMDK3 Header Structure (40 bytes)
@@ -58,7 +58,7 @@ typedef struct VMDK3Header {
     uint32_t cylinders;          // CHS geometry
     uint32_t heads;
     uint32_t sectors_per_track;
-} QEMU_PACKED;
+} qemu_PACKED;
 ```
 
 ## Header Flags (VMDK4)
@@ -147,6 +147,6 @@ typedef struct VMDK3Header {
 
 ## References
 
-- QEMU source: `block/vmdk.c`
+- qemu source: `block/vmdk.c`
 - VMware VDDK Technical Note 5.0
 - See also: `vmdk-extents.md`, `vmdk-grain-tables.md`, `vmdk-compression.md`

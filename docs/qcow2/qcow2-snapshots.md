@@ -44,7 +44,7 @@ typedef struct QCowSnapshotHeader {
     // ID string follows (id_str_size bytes)
     // Name string follows (name_size bytes)
     // Padding to 8-byte boundary
-} QEMU_PACKED QCowSnapshotHeader;
+} qemu_PACKED QCowSnapshotHeader;
 ```
 
 **Size:** 48 bytes (base) + extra_data + id_str + name + padding
@@ -58,7 +58,7 @@ typedef struct QCowSnapshotExtraData {
     uint64_t vm_state_size_large;  // 64-bit VM state size
     uint64_t disk_size;            // Virtual disk size at snapshot
     uint64_t icount;               // Instruction count (record/replay)
-} QEMU_PACKED QCowSnapshotExtraData;
+} qemu_PACKED QCowSnapshotExtraData;
 ```
 
 **Size:** 24 bytes minimum for version 3
@@ -216,7 +216,7 @@ This ensures crash recovery always finds a valid snapshot table.
 The `extra_data_size` field enables future extensions:
 - Unknown extra data is preserved on read
 - Written back unchanged on update
-- Allows older QEMU to handle newer snapshot formats
+- Allows older qemu to handle newer snapshot formats
 
 ## Common Issues
 

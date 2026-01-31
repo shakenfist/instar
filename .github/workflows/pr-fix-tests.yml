@@ -1,0 +1,89 @@
+name: PR Fix Tests
+
+# Triggers Claude Code to fix test failures when an authorized user comments
+# "@shakenfist-bot please attempt to fix"
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  trigger-fix:
+    # Only run on PR comments (not issue comments)
+    if: |
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '@shakenfist-bot please attempt to fix')
+    runs-on: ubuntu-latest
+    name: "Trigger test fix"
+    outputs:
+      authorized: ${{ steps.check_permission.outputs.authorized }}
+      pr_ref: ${{ steps.pr_details.outputs.pr_ref }}
+      pr_number: ${{ github.event.issue.number }}
+
+    steps:
+      - name: Check commenter permissions
+        id: check_permission
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          permission=$(gh api \
+            repos/${{ github.repository }}/collaborators/${{ github.event.comment.user.login }}/permission \
+            --jq '.permission' 2>/dev/null || echo "none")
+
+          echo "User ${{ github.event.comment.user.login }} has permission: ${permission}"
+
+          if [[ "${permission}" == "admin" || "${permission}" == "write" ]]; then
+            echo "authorized=true" >> $GITHUB_OUTPUT
+            echo "User is authorized to request test fix"
+          else
+            echo "authorized=false" >> $GITHUB_OUTPUT
+            echo "User is not authorized to request test fix"
+          fi
+
+      - name: React to comment
+        if: steps.check_permission.outputs.authorized == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api \
+            repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+            -f content='rocket' \
+            --silent || true
+
+      - name: Post unauthorized message
+        if: steps.check_permission.outputs.authorized == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment ${{ github.event.issue.number }} \
+            --body "Sorry @${{ github.event.comment.user.login }}, only repository collaborators with write access can request a test fix."
+
+      - name: Get PR details
+        if: steps.check_permission.outputs.authorized == 'true'
+        id: pr_details
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_REF=$(gh pr view ${{ github.event.issue.number }} --json headRefName --jq '.headRefName')
+          echo "pr_ref=${PR_REF}" >> $GITHUB_OUTPUT
+          echo "PR branch: ${PR_REF}"
+
+      - name: Post starting message
+        if: steps.check_permission.outputs.authorized == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment ${{ github.event.issue.number }} \
+            --body "🤖 Starting Claude Code test fix run...
+
+          [View workflow run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+
+  fix-tests:
+    needs: trigger-fix
+    if: needs.trigger-fix.outputs.authorized == 'true'
+    uses: ./.github/workflows/test-drift-fix.yml
+    with:
+      ref: ${{ needs.trigger-fix.outputs.pr_ref }}
+      pr_number: ${{ needs.trigger-fix.outputs.pr_number }}
+      max_turns: '50'
+    secrets: inherit

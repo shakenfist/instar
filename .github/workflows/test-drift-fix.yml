@@ -13,6 +13,21 @@ on:
         required: false
         default: false
         type: boolean
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Branch to checkout (for PR-triggered runs)'
+        required: false
+        type: string
+      pr_number:
+        description: 'PR number (for PR-triggered runs)'
+        required: false
+        type: string
+      max_turns:
+        description: 'Maximum Claude turns'
+        required: false
+        default: '50'
+        type: string
   schedule:
     # Run weekly on Monday at 6am UTC
     - cron: '0 6 * * 1'
@@ -22,8 +37,14 @@ jobs:
     runs-on: [self-hosted, claude-code]
     timeout-minutes: 180
     concurrency:
-      group: ${{ github.workflow }}-${{ github.ref }}
+      group: ${{ github.workflow }}-${{ inputs.pr_number || github.ref }}
       cancel-in-progress: true
+
+    env:
+      # Set mode based on whether this is a PR-triggered run
+      IS_PR_RUN: ${{ inputs.pr_number != '' }}
+      PR_NUMBER: ${{ inputs.pr_number }}
+      PR_REF: ${{ inputs.ref }}
 
     steps:
       - name: Set environment variables
@@ -36,6 +57,7 @@ jobs:
       - name: Checkout imago
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.ref || '' }}
           path: imago
           fetch-depth: 0
 
@@ -87,11 +109,15 @@ jobs:
             echo "BLOCK_SIZE_MISMATCH=false" >> ${GITHUB_WORKSPACE}/fs-info.txt
           fi
 
-      - name: Create working branch
+      - name: Configure git
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
           git config --global user.name "shakenfist-bot"
           git config --global user.email "bot@shakenfist.com"
+
+      - name: Create working branch
+        if: env.IS_PR_RUN != 'true'
+        run: |
+          cd ${GITHUB_WORKSPACE}/imago
           # Delete local branch if it exists from previous run
           git branch -D test-drift-fix-${DATESTAMP} 2>/dev/null || true
           git checkout -b test-drift-fix-${DATESTAMP}
@@ -136,10 +162,16 @@ jobs:
           exit ${test_exit_code}
 
       - name: Exit early if nothing to do
-        if: |
-          steps.initial_test.outputs.tests_passed == 'true'
+        if: steps.initial_test.outputs.tests_passed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "All tests pass and no new images found. Nothing to do."
+          if [ "${IS_PR_RUN}" == "true" ]; then
+            gh pr comment ${PR_NUMBER} \
+              --repo ${{ github.repository }} \
+              --body "✅ All tests pass! No fixes needed."
+          fi
           exit 0
 
       - name: Prepare Claude prompt
@@ -405,6 +437,9 @@ jobs:
               {
                 cat ${GITHUB_WORKSPACE}/commit-summary.txt
                 echo ""
+                if [ "${IS_PR_RUN}" == "true" ]; then
+                  echo "Triggered-By: @shakenfist-bot please attempt to fix on PR #${PR_NUMBER}"
+                fi
                 echo "Assisted-By: Claude Code"
                 echo "Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>"
               } > ${GITHUB_WORKSPACE}/commit-message.txt
@@ -412,22 +447,49 @@ jobs:
               git commit -F ${GITHUB_WORKSPACE}/commit-message.txt
             else
               # Fallback to generic message if no summary found
-              git commit -m "Fix test suite drift for ${DATESTAMP}.
+              if [ "${IS_PR_RUN}" == "true" ]; then
+                git commit -m "Fix test failures on PR #${PR_NUMBER}.
+
+          Claude Code automatically fixed test failures.
+
+          Triggered-By: @shakenfist-bot please attempt to fix on PR #${PR_NUMBER}
+          Assisted-By: Claude Code
+          Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>"
+              else
+                git commit -m "Fix test suite drift for ${DATESTAMP}.
 
           Claude Code automatically fixed test failures and/or added new
           test images to the integration test suite.
 
           Assisted-By: Claude Code
           Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>"
+              fi
             fi
           fi
 
-      - name: Push and create PR
+      - name: Push changes (PR mode)
         if: |
+          env.IS_PR_RUN == 'true' &&
+          steps.verify.outputs.fix_succeeded == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd ${GITHUB_WORKSPACE}/imago
+          git push origin ${PR_REF}
+
+          gh pr comment ${PR_NUMBER} \
+            --repo ${{ github.repository }} \
+            --body "✅ Claude Code fixed the test failures and pushed the changes.
+
+          Please review the new commits."
+
+      - name: Push and create PR (scheduled/manual mode)
+        if: |
+          env.IS_PR_RUN != 'true' &&
           steps.verify.outputs.fix_succeeded == 'true' &&
           inputs.dry_run != true
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd ${GITHUB_WORKSPACE}/imago
 
@@ -469,8 +531,31 @@ jobs:
           )" \
             --head $(git branch --show-current)
 
-      - name: Create issue for unfixable problems
+      - name: Report failure (PR mode)
         if: |
+          env.IS_PR_RUN == 'true' &&
+          steps.initial_test.outputs.tests_passed == 'false' &&
+          (steps.claude_fix.outputs.claude_available != 'true' ||
+           steps.verify.outputs.fix_succeeded == 'false')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TEST_OUTPUT=$(tail -c 2000 ${GITHUB_WORKSPACE}/test-output.txt 2>/dev/null || echo "See workflow logs for details.")
+
+          gh pr comment ${PR_NUMBER} \
+            --repo ${{ github.repository }} \
+            --body "❌ Claude Code was unable to fix the test failures automatically.
+
+          [View workflow run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          **Last 2KB of test output:**
+          \`\`\`
+          ${TEST_OUTPUT}
+          \`\`\`"
+
+      - name: Create issue for unfixable problems (scheduled/manual mode)
+        if: |
+          env.IS_PR_RUN != 'true' &&
           steps.initial_test.outputs.tests_passed == 'false' &&
           (steps.claude_fix.outputs.claude_available != 'true' ||
            steps.verify.outputs.fix_succeeded == 'false')
@@ -515,7 +600,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-drift-fix-logs-${{ env.DATESTAMP }}
+          name: ${{ inputs.pr_number != '' && format('pr-fix-logs-{0}', inputs.pr_number) || format('test-drift-fix-logs-{0}', github.run_id) }}
           path: |
             ${{ github.workspace }}/build-log.txt
             ${{ github.workspace }}/test-output.txt

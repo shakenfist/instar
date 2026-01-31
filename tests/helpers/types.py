@@ -20,6 +20,7 @@ class TestImage:
     expected_error: Optional[str] = None
     cve_references: list = field(default_factory=list)
     sha256: Optional[str] = None
+    unsafe_quirks_required: bool = False
 
     @property
     def is_safe(self) -> bool:
@@ -30,6 +31,16 @@ class TestImage:
     def is_malicious(self) -> bool:
         """Return True if this is a malicious image."""
         return self.safety == 'malicious'
+
+    @property
+    def requires_unsafe_quirks(self) -> bool:
+        """Return True if this image requires --unsafe-quirks mode for testing.
+
+        Images without valid partition tables or format headers need this flag
+        to be accepted as RAW disk images. Without the flag, imago rejects them
+        as unknown format (secure default behavior).
+        """
+        return self.unsafe_quirks_required
 
     @classmethod
     def from_dict(cls, data: dict, testdata_root: Path) -> 'TestImage':
@@ -47,4 +58,5 @@ class TestImage:
             expected_error=data.get('expected_error'),
             cve_references=data.get('cve_references', []),
             sha256=data.get('sha256'),
+            unsafe_quirks_required=data.get('unsafe_quirks_required', False),
         )

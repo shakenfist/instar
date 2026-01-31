@@ -323,6 +323,181 @@
             "description": "Aurel32 Debian Wheezy PowerPC standard image",
             "tags": ["qcow2", "powerpc", "ppc", "aurel32", "historic"],
             "sha256": "3a0fcdc9fe5a8f4816b524a807701ac6d9b950b90dab56ab32a6d7855c8850f9"
+        },
+        {
+            "id": "raw-mbr-partitioned",
+            "path": "custom/raw/mbr-partitioned.raw",
+            "format": "raw",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "RAW disk image with MBR (DOS) partition table",
+            "tags": ["raw", "mbr", "partitioned"],
+            "sha256": "9b85d8087332ed6bebee04f97de67c3b51a56f00af085804236f3fc0386e5b67"
+        },
+        {
+            "id": "raw-gpt-partitioned",
+            "path": "custom/raw/gpt-partitioned.raw",
+            "format": "raw",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "RAW disk image with GPT partition table",
+            "tags": ["raw", "gpt", "partitioned"],
+            "sha256": "8c0f60e01031dad0695d94572dffb57061ed5060c5278f86e1a70ebc431c9cd9"
+        },
+        {
+            "id": "raw-fat-no-partition",
+            "path": "custom/raw/fat-no-partition-table.raw",
+            "format": "raw",
+            "safety": "safe",
+            "run_in_ci": true,
+            "unsafe_quirks_required": true,
+            "description": "RAW FAT16 filesystem without partition table",
+            "tags": ["raw", "fat", "no-partition-table", "filesystem"],
+            "sha256": "8e4ea7a915e5a1adfd02b74514c77215d04d6daf9c29be070e2e157c7db0074d"
+        },
+        {
+            "id": "raw-sparse-empty",
+            "path": "custom/raw/sparse-empty.raw",
+            "format": "raw",
+            "safety": "safe",
+            "run_in_ci": true,
+            "unsafe_quirks_required": true,
+            "description": "Sparse RAW file (100MB virtual, 0 bytes actual)",
+            "tags": ["raw", "sparse", "empty", "no-partition-table"],
+            "sha256": "20492a4d0d84f8beb1767f6616229f85d44c2827b64bdbfb260ee12fa1109e0e"
+        },
+        {
+            "id": "raw-zeros-1mb",
+            "path": "custom/raw/zeros-1mb.raw",
+            "format": "raw",
+            "safety": "safe",
+            "run_in_ci": true,
+            "unsafe_quirks_required": true,
+            "description": "Small RAW file filled with zeros (1MB)",
+            "tags": ["raw", "zeros", "minimal", "no-partition-table"],
+            "sha256": "30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58"
+        },
+        {
+            "id": "raw-mbr-truncated",
+            "path": "custom/raw/mbr-truncated.raw",
+            "format": "raw",
+            "safety": "malformed",
+            "run_in_ci": false,
+            "unsafe_quirks_required": true,
+            "description": "Truncated MBR (256 bytes instead of 512)",
+            "tags": ["raw", "mbr", "malformed", "truncated"],
+            "sha256": "5341e6b2646979a70e57653007a1f310169421ec9bdd9f1a5648f75ade005af1"
+        },
+        {
+            "id": "raw-gpt-truncated",
+            "path": "custom/raw/gpt-truncated.raw",
+            "format": "raw",
+            "safety": "malformed",
+            "run_in_ci": false,
+            "unsafe_quirks_required": true,
+            "description": "Truncated GPT (only protective MBR and partial header)",
+            "tags": ["raw", "gpt", "malformed", "truncated"],
+            "sha256": "b37fa67926733baf53ffb5d5325d7c073a17a624975d90bbde8a32db0f6f0a6f"
+        },
+        {
+            "id": "raw-mbr-corrupted",
+            "path": "custom/raw/mbr-corrupted.raw",
+            "format": "raw",
+            "safety": "malformed",
+            "run_in_ci": false,
+            "unsafe_quirks_required": true,
+            "description": "MBR with valid signature but garbage partition entries",
+            "tags": ["raw", "mbr", "malformed", "corrupted"],
+            "sha256": "36d6bc1d074d4244aef6fefe742e10c790b73caab20c4cf1002c7d0e86f6cabe"
+        },
+        {
+            "id": "raw-random-garbage",
+            "path": "custom/raw/random-garbage.raw",
+            "format": "raw",
+            "safety": "malformed",
+            "run_in_ci": false,
+            "unsafe_quirks_required": true,
+            "description": "Random bytes (no valid structure)",
+            "tags": ["raw", "malformed", "garbage"],
+            "sha256": "5f45dfcace8271c4820626fefe2689b5f698496cf5991f594be9c55ba1c96576"
+        },
+        {
+            "id": "raw-misleading-header",
+            "path": "custom/raw/misleading-header.raw",
+            "format": "raw",
+            "safety": "malformed",
+            "run_in_ci": false,
+            "unsafe_quirks_required": true,
+            "description": "QCOW2 magic at offset 0 but invalid header (512 bytes)",
+            "tags": ["raw", "malformed", "misleading", "qcow2-magic"],
+            "sha256": "d8ee125dd94a45798e3f7d419825e4c6f90e504ada5a768276b22217db7da9de"
+        },
+        {
+            "id": "raw-minimal-1byte",
+            "path": "custom/raw/minimal-1byte.raw",
+            "format": "raw",
+            "safety": "malformed",
+            "run_in_ci": false,
+            "unsafe_quirks_required": true,
+            "description": "Minimal 1-byte file (edge case)",
+            "tags": ["raw", "malformed", "minimal", "edge-case"],
+            "sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+        },
+        {
+            "id": "raw-qcow2-magic-wrong-offset",
+            "path": "custom/raw/qcow2-magic-wrong-offset.raw",
+            "format": "raw",
+            "safety": "malformed",
+            "run_in_ci": false,
+            "unsafe_quirks_required": true,
+            "description": "QCOW2 magic at offset 512 instead of 0 (should be RAW)",
+            "tags": ["raw", "malformed", "misleading", "offset"],
+            "sha256": "c8669082e2d1c7f3d88d3db9936c074c018e2add8fc09f28102eaf66486abb2d"
+        },
+        {
+            "id": "qcow2-backing-textfile",
+            "path": "custom/security/qcow2-backing-textfile.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "description": "QCOW2 with backing file pointing to a text file (simulates CVE-2015-5163)",
+            "tags": ["qcow2", "backing-file", "security", "malicious"],
+            "cve_references": ["CVE-2015-5163"],
+            "sha256": "c30371da8c05552ed06b49bf80f09e880c0346a54db08ea06608ed308923e559"
+        },
+        {
+            "id": "qcow2-backing-etc-passwd",
+            "path": "custom/security/qcow2-backing-etc-passwd.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "description": "QCOW2 with backing file pointing to /etc/passwd",
+            "tags": ["qcow2", "backing-file", "security", "malicious", "path-traversal"],
+            "cve_references": ["CVE-2015-5163"],
+            "sha256": "d9f8bf849180e6f5a59c54dc407ced2374bff08b69406f5ff724af211886498e"
+        },
+        {
+            "id": "qcow2-backing-garbage",
+            "path": "custom/security/qcow2-backing-garbage.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "description": "QCOW2 with backing file pointing to random garbage (no partition table)",
+            "tags": ["qcow2", "backing-file", "security", "malicious"],
+            "cve_references": ["CVE-2015-5163"],
+            "sha256": "f1e4ccd7f758da67da81a58762d13aa0d3b37216865e815e72fd78a2bb9dcd0f"
+        },
+        {
+            "id": "security-fake-passwd",
+            "path": "custom/security/fake-passwd.txt",
+            "format": "raw",
+            "safety": "safe",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "unsafe_quirks_required": true,
+            "description": "Simulated sensitive file for backing file security tests",
+            "tags": ["raw", "security", "test-fixture"],
+            "sha256": "c7da12480777c79be269aa8aca0191374752b115b1c077af9dc3695eab4eaa4d"
         }
     ]
 }
