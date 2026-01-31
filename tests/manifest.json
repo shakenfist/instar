@@ -498,6 +498,106 @@
             "description": "Simulated sensitive file for backing file security tests",
             "tags": ["raw", "security", "test-fixture"],
             "sha256": "c7da12480777c79be269aa8aca0191374752b115b1c077af9dc3695eab4eaa4d"
+        },
+        {
+            "id": "qcow2-external-data-file",
+            "path": "custom/security/qcow2-external-data-file.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "QCOW2 with external data file feature (CVE-2024-32498)",
+            "tags": ["qcow2", "external-data", "security", "malicious"],
+            "cve_references": ["CVE-2024-32498"],
+            "sha256": "63e9039cbe0b0bc21a538ecaa8368068bff365ccbb4b41ee80e2128eec67006d"
+        },
+        {
+            "id": "qcow2-unknown-features",
+            "path": "custom/security/qcow2-unknown-features.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "expected_error": "Unsupported qcow2 feature",
+            "description": "QCOW2 with unknown incompatible feature bit set",
+            "tags": ["qcow2", "unknown-features", "security", "malformed"],
+            "sha256": "6abc18c6dcb4a5db04988102be7f363de9b281743b5132de4d8e73b5c59a72ee"
+        },
+        {
+            "id": "vmdk-path-traversal",
+            "path": "custom/security/vmdk-path-traversal.vmdk",
+            "format": "vmdk",
+            "safety": "malicious",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "description": "VMDK descriptor with path traversal in extent path (/etc/passwd)",
+            "tags": ["vmdk", "path-traversal", "security", "malicious"],
+            "sha256": "ddd977b69cb62584b0fe0cab3c0f5589b015ce82794d265a094de2f3a80f28a5"
+        },
+        {
+            "id": "vmdk-no-extents",
+            "path": "custom/security/vmdk-no-extents.vmdk",
+            "format": "vmdk",
+            "safety": "malformed",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "description": "VMDK descriptor with no extent declarations",
+            "tags": ["vmdk", "no-extents", "malformed"],
+            "sha256": "918c8c6e174c9e8a5e20b03c0f44ac38a35ed6e84568f514c0eb196f8050c158"
+        },
+        {
+            "id": "vdi-simple",
+            "path": "custom/format-coverage/vdi-simple.vdi",
+            "format": "vdi",
+            "safety": "safe",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "description": "Basic VirtualBox VDI image for format detection testing",
+            "tags": ["vdi", "virtualbox", "format-coverage"],
+            "sha256": "377b963df2db9b016bb24857d3c3be66b0fb7fb1de36a96004652d7707c89c32"
+        },
+        {
+            "id": "qed-simple",
+            "path": "custom/format-coverage/qed-simple.qed",
+            "format": "qed",
+            "safety": "safe",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "description": "QED format image (deprecated, should be rejected by oslo.utils)",
+            "tags": ["qed", "deprecated", "format-coverage"],
+            "sha256": "35091a20b0971b6b67526e3b01f223d90d01dd41e20feaec7595f64452a5bd91"
+        },
+        {
+            "id": "iso-simple",
+            "path": "custom/format-coverage/iso-simple.iso",
+            "format": "iso",
+            "safety": "safe",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "unsafe_quirks_required": true,
+            "description": "Basic ISO 9660 image for format detection testing",
+            "tags": ["iso", "iso9660", "format-coverage"],
+            "sha256": "6c32e43331dbddc230fc5ed530a5f7cc4fcbb05330770a1e1ecc4afdbe0f7cc2"
+        },
+        {
+            "id": "qcow2-dirty",
+            "path": "custom/format-coverage/qcow2-dirty.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "QCOW2 with dirty bit set (unclean shutdown simulation)",
+            "tags": ["qcow2", "dirty", "feature-bit"],
+            "sha256": "bd280591863be76042415cb789fc934325e59716f87500726f4d21604a387348"
+        },
+        {
+            "id": "qcow2-corrupt",
+            "path": "custom/format-coverage/qcow2-corrupt.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "QCOW2 with corrupt bit set",
+            "tags": ["qcow2", "corrupt", "feature-bit"],
+            "sha256": "136842e4a4115436ab06f3c04ed9824c39e8e1a7ffaaac1f7dc9ad5de8a9268a"
         }
     ]
 }
