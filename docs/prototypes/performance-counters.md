@@ -6,7 +6,7 @@ use case of sandboxed image conversion.
 
 ## Why Performance Monitoring Matters
 
-The security analysis in [security.md](security.md) identifies several DoS
+The security analysis in [security.md](../security.md) identifies several DoS
 vulnerabilities (CVE-2024-4467, CVE-2015-5162, CVE-2018-10908) where maliciously
 crafted disk images cause excessive CPU or memory consumption. The recommended
 mitigations include:
