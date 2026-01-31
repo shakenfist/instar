@@ -32,9 +32,9 @@ for details on why this approach is secure.
 | RAW | Yes | Yes | raw-mbr-partitioned, raw-gpt-partitioned, etc. |
 | MBR partition table | Yes | Yes | raw-mbr-partitioned |
 | GPT partition table | Yes | Yes | raw-gpt-partitioned |
-| VDI | Yes | **No** | (none) |
-| QED | Yes (banned) | **No** | (none) |
-| ISO | Yes | **No** | (none) |
+| VDI | Yes | **No** | vdi-simple (test image available) |
+| QED | Yes (banned) | **No** | qed-simple (test image available) |
+| ISO | Yes | **No** | iso-simple (test image available) |
 | LUKS | Yes | **No** | (none) |
 | Parallels | No | **No** | parallels-v1, parallels-v2 (in testdata, not tested) |
 | Bochs | No | **No** | empty.bochs (in testdata, not tested) |
@@ -42,12 +42,12 @@ for details on why this approach is secure.
 
 ### Formats Not Yet Detected by Imago
 
-The following formats are detected by oslo.utils but not imago:
+The following formats are detected by oslo.utils but not imago (test images now available):
 
-1. **VDI (VirtualBox)** - Common virtualization format
-2. **QED** - Deprecated qemu format (oslo.utils bans it entirely)
-3. **ISO** - CD/DVD image format
-4. **LUKS** - Linux encrypted container format
+1. **VDI (VirtualBox)** - Common virtualization format (test: vdi-simple)
+2. **QED** - Deprecated qemu format, oslo.utils bans it (test: qed-simple)
+3. **ISO** - CD/DVD image format (test: iso-simple)
+4. **LUKS** - Linux encrypted container format (no test image yet)
 
 ---
 
@@ -58,10 +58,10 @@ The following formats are detected by oslo.utils but not imago:
 | Check | Description | oslo.utils | imago | Test Images |
 |-------|-------------|------------|-------|-------------|
 | backing_file | Detects external backing file reference | Rejects | Reports (FLAG_HAS_BACKING_FILE) | qcow2-overlay-chain, sf-vda, qcow2-backing-* |
-| data_file | Detects external data file feature | Rejects | Reports (FLAG_HAS_EXTERNAL_DATA) | (need to create) |
-| unknown_features | Unknown incompatible feature bits | Rejects | Partial - reports known bits | (need to create) |
-| dirty | Image not cleanly closed | N/A | Reports (FLAG_DIRTY) | (none) |
-| corrupt | Image marked corrupt | N/A | Reports (FLAG_CORRUPT) | (none) |
+| data_file | Detects external data file feature | Rejects | Reports (FLAG_HAS_EXTERNAL_DATA) | qcow2-external-data-file |
+| unknown_features | Unknown incompatible feature bits | Rejects | Partial - reports known bits | qcow2-unknown-features |
+| dirty | Image not cleanly closed | N/A | Reports (FLAG_DIRTY) | qcow2-dirty |
+| corrupt | Image marked corrupt | N/A | Reports (FLAG_CORRUPT) | qcow2-corrupt |
 | encrypted | Encryption enabled | N/A | Reports (FLAG_ENCRYPTED) | (none) |
 
 #### QCOW2 Incompatible Feature Bits
@@ -79,8 +79,8 @@ The following formats are detected by oslo.utils but not imago:
 
 | Check | Description | oslo.utils | imago | Test Images |
 |-------|-------------|------------|-------|-------------|
-| descriptor path traversal | Extent paths with `/` | Rejects | **Not checked** | (need to create) |
-| descriptor missing extents | No extent declarations | Rejects | **Not checked** | (need to create) |
+| descriptor path traversal | Extent paths with `/` | Rejects | **Not checked** | vmdk-path-traversal |
+| descriptor missing extents | No extent declarations | Rejects | **Not checked** | vmdk-no-extents |
 | header/footer consistency | Signature mismatch | Rejects | **Not checked** | (none) |
 | createType validation | Unsupported types | Partial | Reports createType | vmdk-streamoptimized |
 
@@ -110,7 +110,7 @@ The following formats are detected by oslo.utils but not imago:
 
 ### Current Test Images by Format
 
-#### QCOW2 Images (20+)
+#### QCOW2 Images (25+)
 
 | Image ID | Description | Safety | Key Features |
 |----------|-------------|--------|--------------|
@@ -131,11 +131,15 @@ The following formats are detected by oslo.utils but not imago:
 | aurel32-* | Historic Debian images (4) | safe | Various architectures |
 | chain-top-qcow2 | Three-layer backing chain | safe | Cross-format chain |
 | chain-middle-qcow2 | QCOW2 with VMDK backing | safe | Cross-format chain |
+| qcow2-dirty | Dirty bit set | safe | Unclean shutdown |
+| qcow2-corrupt | Corrupt bit set | safe | Corrupt flag |
 | qcow2-backing-textfile | Backing file to text file | malicious | CVE-2015-5163 |
 | qcow2-backing-etc-passwd | Backing file to /etc/passwd | malicious | CVE-2015-5163 |
 | qcow2-backing-garbage | Backing file to garbage | malicious | CVE-2015-5163 |
+| qcow2-external-data-file | External data file feature | malicious | CVE-2024-32498 |
+| qcow2-unknown-features | Unknown feature bit set | malicious | Unknown features |
 
-#### VMDK Images (5)
+#### VMDK Images (7)
 
 | Image ID | Description | Safety | Key Features |
 |----------|-------------|--------|--------------|
@@ -144,6 +148,8 @@ The following formats are detected by oslo.utils but not imago:
 | vmdk-streamoptimized | streamOptimized VMDK | safe | OVA/OVF format |
 | vmdk-v3 | VMDK version 3 | safe | Native version 3 |
 | chain-base-vmdk | VMDK base for chain test | safe | Cross-format chain |
+| vmdk-path-traversal | Path traversal in extent | malicious | /etc/passwd reference |
+| vmdk-no-extents | Missing extent declarations | malformed | Invalid descriptor |
 
 #### VHD/VPC Images (4)
 
@@ -160,6 +166,24 @@ The following formats are detected by oslo.utils but not imago:
 |----------|-------------|--------|--------------|
 | qemu-vhdx | QEMU iotest VHDX | safe | Dynamic disk |
 | vhdx-disk2vhd | Disk2VHD created VHDX | safe | Different creator |
+
+#### VDI Images (1)
+
+| Image ID | Description | Safety | Key Features |
+|----------|-------------|--------|--------------|
+| vdi-simple | Basic VirtualBox VDI | safe | Format detection test |
+
+#### QED Images (1)
+
+| Image ID | Description | Safety | Key Features |
+|----------|-------------|--------|--------------|
+| qed-simple | QED format image | safe | Deprecated format test |
+
+#### ISO Images (1)
+
+| Image ID | Description | Safety | Key Features |
+|----------|-------------|--------|--------------|
+| iso-simple | Basic ISO 9660 image | safe | Format detection test |
 
 #### RAW Images (12)
 
@@ -178,29 +202,20 @@ The following formats are detected by oslo.utils but not imago:
 | raw-minimal-1byte | 1-byte file | malformed | None |
 | raw-qcow2-magic-wrong-offset | QCOW2 magic at offset 512 | malformed | None |
 
-### Missing Test Images (Priority Order)
+### Remaining Test Images to Create
 
 #### High Priority - Security Relevant
 
-1. **qcow2-external-data-file** - QCOW2 with data_file feature enabled (CVE-2024-32498)
-2. **qcow2-unknown-features** - QCOW2 with unknown incompatible feature bits
-3. **vmdk-path-traversal** - VMDK descriptor with `/etc/passwd` in extent path
-4. **vmdk-no-extents** - VMDK descriptor with no extent declarations
+1. **qcow2-encrypted** - QCOW2 with encryption enabled
 
 #### Medium Priority - Format Coverage
 
-5. **vdi-simple** - Basic VirtualBox VDI image
-6. **qed-simple** - QED format (for rejection testing)
-7. **luks-v1** - LUKS version 1 encrypted container
-8. **luks-v2** - LUKS version 2 (for version rejection testing)
-9. **iso-simple** - Basic ISO 9660 image
+2. **luks-v1** - LUKS version 1 encrypted container
+3. **luks-v2** - LUKS version 2 (for version rejection testing)
 
 #### Lower Priority - Edge Cases
 
-10. **vmdk-header-footer-mismatch** - VMDK with inconsistent signatures
-11. **qcow2-dirty** - QCOW2 with dirty bit set
-12. **qcow2-corrupt** - QCOW2 with corrupt bit set
-13. **qcow2-encrypted** - QCOW2 with encryption enabled
+4. **vmdk-header-footer-mismatch** - VMDK with inconsistent signatures
 
 ---
 
@@ -230,6 +245,14 @@ The following formats are detected by oslo.utils but not imago:
 5. **Cross-Format Backing Chain Detection** - `--chain` flag discovers backing
    chains across format boundaries (e.g., QCOW2 -> VMDK).
 
+6. **Comprehensive Test Image Suite** - Test images now cover:
+   - QCOW2 external data file (CVE-2024-32498)
+   - QCOW2 unknown features
+   - QCOW2 dirty/corrupt bits
+   - VMDK path traversal
+   - VMDK missing extents
+   - VDI, QED, and ISO format detection
+
 ### Detections to Add
 
 1. **VDI format detection** - Magic number detection for VirtualBox images
@@ -241,7 +264,6 @@ The following formats are detected by oslo.utils but not imago:
 
 1. **QCOW2 unknown features** - Warn on unknown incompatible feature bits
 2. **VMDK path validation** - Detect path traversal in descriptors
-3. **QCOW2 external data file** - Create test image and verify detection
 
 ### Reporting Enhancements
 
