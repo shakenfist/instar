@@ -47,7 +47,7 @@ extension:
 typedef struct Qcow2CryptoHeaderExtension {
     uint64_t offset;   // Offset to LUKS header (cluster-aligned)
     uint64_t length;   // LUKS header length
-} QEMU_PACKED;
+} qemu_PACKED;
 ```
 
 ### LUKS Header Structure
@@ -81,7 +81,7 @@ struct QCryptoBlockLUKSHeader {
         uint32_t key_offset_sector;  // Encrypted key material offset
         uint32_t stripes;        // Anti-forensic stripes (default 4000)
     } key_slots[8];
-} QEMU_PACKED;  // Total: 592 bytes
+} qemu_PACKED;  // Total: 592 bytes
 ```
 
 ### Supported Ciphers

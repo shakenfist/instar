@@ -270,7 +270,7 @@ Analysis of qemu-img usage patterns across the Proxmox VE codebase.
 | proxmox-backup | 0 | Uses custom PBS block driver instead |
 | Other (Ceph) | 10+ | create, convert, info, compare, bench, snapshot |
 
-## pve-qemu - QEMU Patches
+## pve-qemu - qemu Patches
 
 Proxmox extends qemu-img through patches rather than wrapper scripts.
 
@@ -472,7 +472,7 @@ push $cmd->@*, "bs=$bs", "osize=$size", "if=$src_path", "of=$dst_path";
 ## proxmox-backup - Custom Block Driver
 
 Proxmox Backup Server does **not** use qemu-img. Instead, it implements
-a custom QEMU block driver (`pbs:` protocol) for direct archive access.
+a custom qemu block driver (`pbs:` protocol) for direct archive access.
 
 **PBS block driver URI format:**
 ```
@@ -499,7 +499,7 @@ qemu-img compare ${TEMPDIR}/large.raw rbd:rbd/${dest_image}
 
 **Location:** `qemu/tests/qemu-iotests/iotests.py`
 ```python
-qemu_img_args = os.environ.get('QEMU_IMG', 'qemu-img').strip().split(' ')
+qemu_img_args = os.environ.get('qemu_IMG', 'qemu-img').strip().split(' ')
 
 def qemu_img(*args):
     '''Run qemu-img and return the exit code'''
@@ -531,7 +531,7 @@ def compare_images(img1, img2):
 |---------|-----------------|
 | ZFS | Cache mode: none |
 | RBD/Ceph | 1MB block size for dd |
-| iSCSI | Path conversion to QEMU format |
+| iSCSI | Path conversion to qemu format |
 | LVM | Supports qcow2 snapshots on LV |
 
 ### Command-Line Options Summary
@@ -573,7 +573,7 @@ Analysis of qemu-img usage patterns across OpenStack components.
 
 **Resource Limits:**
 ```python
-QEMU_IMG_LIMITS = processutils.ProcessLimits(
+qemu_IMG_LIMITS = processutils.ProcessLimits(
     cpu_time=CONF.image_conversion_cpu_limit,       # default 60 seconds
     address_space=CONF.image_conversion_address_space_limit * units.Gi)  # default 1GB
 ```
@@ -587,7 +587,7 @@ if force_share:
 cmd.append(path)
 
 out, _err = utils.execute(*cmd, run_as_root=run_as_root,
-                          prlimit=QEMU_IMG_LIMITS)
+                          prlimit=qemu_IMG_LIMITS)
 ```
 
 **Version Detection:**
@@ -629,7 +629,7 @@ cmd.extend(['-O', 'luks',
 
 **Format Mapping:**
 ```python
-QEMU_IMG_FORMAT_MAP = {
+qemu_IMG_FORMAT_MAP = {
     'iso': 'raw',
     'vhd': 'vpc',
     'ploop': 'parallels',
@@ -723,7 +723,7 @@ def qemu_img_info(path, format=None, run_as_root=True):
     if format:
         cmd.extend(['-f', format])
     out, err = processutils.execute(*cmd, run_as_root=run_as_root,
-                                    prlimit=QEMU_IMG_LIMITS)
+                                    prlimit=qemu_IMG_LIMITS)
     return imageutils.QemuImgInfo(out, format='json')
 ```
 

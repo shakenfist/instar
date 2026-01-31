@@ -199,7 +199,7 @@ get_whole_cluster(bs, extent, cluster_offset, offset,
 
 ## L2 Cache
 
-QEMU caches grain tables for performance:
+qemu caches grain tables for performance:
 
 ```c
 #define L2_CACHE_SIZE 16
@@ -249,5 +249,5 @@ max_l1_entries = 32000000;
 
 ## References
 
-- QEMU source: `block/vmdk.c`
+- qemu source: `block/vmdk.c`
 - VMware VDDK 5.0 Technical Note

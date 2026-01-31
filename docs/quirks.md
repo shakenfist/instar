@@ -315,7 +315,7 @@ application that produced the VHD file. The VHD footer contains both a
 "current size" field (explicit virtual size in bytes) and CHS geometry values
 (cylinders, heads, sectors per track).
 
-**For Virtual PC and legacy QEMU VHDs** (creator_app = "vpc " or "qemu"):
+**For Virtual PC and legacy qemu VHDs** (creator_app = "vpc " or "qemu"):
 
 qemu-img calculates virtual size from CHS geometry:
 ```
@@ -340,7 +340,7 @@ CHS-representable value.
 
 ### Why This Matters
 
-Virtual PC and original QEMU create VHD files that rely on CHS geometry for
+Virtual PC and original qemu create VHD files that rely on CHS geometry for
 compatibility with legacy systems. Using the disk_size field directly for
 these images would report a larger virtual size than the geometry can address,
 potentially causing data corruption if writes exceed the CHS-addressable range.
@@ -356,8 +356,8 @@ regardless of creator application. This prevents truncation for large disks.
 | Creator App | Size Method | Application |
 |-------------|-------------|-------------|
 | `vpc `      | CHS         | Microsoft Virtual PC |
-| `qemu`      | CHS         | QEMU (legacy) |
-| `qem2`      | disk_size   | QEMU (modern) |
+| `qemu`      | CHS         | qemu (legacy) |
+| `qem2`      | disk_size   | qemu (modern) |
 | `win `      | disk_size   | Microsoft Hyper-V |
 | `d2v `      | disk_size   | Disk2vhd |
 | `tap\0`     | disk_size   | XenServer |

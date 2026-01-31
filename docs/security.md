@@ -40,7 +40,7 @@ These vulnerabilities affect qemu-img directly and impact all platforms using it
 | **CVE ID** | CVE-2024-4467 |
 | **CVSS Score** | 7.8 (High) |
 | **CWE** | CWE-400: Uncontrolled Resource Consumption |
-| **Affected Versions** | QEMU < 7.2.12, < 8.2.5, < 9.0.1 |
+| **Affected Versions** | qemu < 7.2.12, < 8.2.5, < 9.0.1 |
 
 **Description:** A flaw in qemu-img's 'info' command allows specially crafted
 image files containing `json:{}` values describing block devices to cause
@@ -51,7 +51,7 @@ excessive memory/CPU consumption or unauthorized file read/write operations.
 - Unauthorized read/write to external files on the host
 - Affects oVirt, Proxmox, and OpenStack deployments
 
-**Mitigation:** Update to QEMU 7.2.12, 8.2.5, or 9.0.1+.
+**Mitigation:** Update to qemu 7.2.12, 8.2.5, or 9.0.1+.
 
 ---
 
@@ -61,13 +61,13 @@ excessive memory/CPU consumption or unauthorized file read/write operations.
 |-----------|-------|
 | **CVE ID** | CVE-2014-0144 |
 | **Severity** | High |
-| **Affected Versions** | QEMU < 2.0.0 |
+| **Affected Versions** | qemu < 2.0.0 |
 
-**Description:** QEMU block drivers for CLOOP, QCOW2 v2, and other formats are
+**Description:** qemu block drivers for CLOOP, QCOW2 v2, and other formats are
 vulnerable to memory corruptions, integer/buffer overflows due to missing input
 validations.
 
-**Impact:** Remote code execution on host with QEMU process privileges.
+**Impact:** Remote code execution on host with qemu process privileges.
 
 ---
 
@@ -77,7 +77,7 @@ validations.
 |-----------|-------|
 | **CVE IDs** | CVE-2014-0222, CVE-2014-0223 |
 | **CVSS Score** | 7.5 (High) |
-| **Affected Versions** | QEMU < 1.7.2 |
+| **Affected Versions** | qemu < 1.7.2 |
 
 **Description:** Integer overflow flaws in QCOW version 1 handling allow
 memory corruption and potential code execution.
@@ -91,9 +91,9 @@ memory corruption and potential code execution.
 | **CVE ID** | CVE-2008-2004 |
 | **Severity** | Moderate |
 
-**Description:** When image format is not explicitly specified, QEMU probes the
+**Description:** When image format is not explicitly specified, qemu probes the
 image header to guess format. A malicious guest can write a crafted header to
-trick QEMU into using a different format, enabling arbitrary file access.
+trick qemu into using a different format, enabling arbitrary file access.
 
 **Key Lesson:** Always explicitly specify image format with `--format` flag.
 
@@ -250,14 +250,14 @@ permission validation. Users with Basic Operations role can delete disks.
 
 ---
 
-### CVE-2015-3456 (VENOM) - QEMU FDC Buffer Overflow
+### CVE-2015-3456 (VENOM) - qemu FDC Buffer Overflow
 
 | Attribute | Value |
 |-----------|-------|
 | **CVE ID** | CVE-2015-3456 |
 | **Severity** | Important |
 
-**Description:** Buffer overflow in QEMU's Floppy Disk Controller emulation
+**Description:** Buffer overflow in qemu's Floppy Disk Controller emulation
 allows guest-to-host escape. Exploitable even without explicit floppy
 configuration.
 
@@ -442,7 +442,7 @@ happily accept. See [quirks.md](quirks.md#raw-as-fallback-format) for details.
       CVE-2014-0222/3  - QCOW1 integer overflows
 
 2015: CVE-2015-1851    - Cinder format guessing
-      CVE-2015-3456    - VENOM (QEMU FDC buffer overflow)
+      CVE-2015-3456    - VENOM (qemu FDC buffer overflow)
       CVE-2015-5162    - Resource exhaustion DoS
       CVE-2015-5163    - QCOW2 backing file disclosure
 
@@ -470,9 +470,9 @@ happily accept. See [quirks.md](quirks.md#raw-as-fallback-format) for details.
 ## References
 
 ### General Resources
-- [QEMU Security Process](https://www.qemu.org/contribute/security-process/)
+- [qemu Security Process](https://www.qemu.org/contribute/security-process/)
 - [NVD - National Vulnerability Database](https://nvd.nist.gov/)
-- [CVE Details - QEMU](https://www.cvedetails.com/vulnerability-list/vendor_id-7506/Qemu.html)
+- [CVE Details - qemu](https://www.cvedetails.com/vulnerability-list/vendor_id-7506/Qemu.html)
 
 ### OpenStack
 - [OpenStack Security Advisories](https://security.openstack.org/)

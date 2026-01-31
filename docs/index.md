@@ -83,8 +83,8 @@ Analysis of how major virtualization platforms use qemu-img and handle disk imag
 
 ## QCOW2 Format
 
-Comprehensive documentation for the QEMU Copy-On-Write version 2 format,
-derived from QEMU source code analysis.
+Comprehensive documentation for the qemu Copy-On-Write version 2 format,
+derived from qemu source code analysis.
 
 | Document | Description |
 |----------|-------------|

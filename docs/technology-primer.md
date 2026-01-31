@@ -571,7 +571,7 @@ To escape a VM, an attacker typically needs to:
 3. Achieve code execution in the hypervisor context (Ring -1 / root mode)
 
 These bugs exist - VENOM (2015) exploited a floppy disk controller emulation
-bug in QEMU, and various virtio vulnerabilities have been found. But they're
+bug in qemu, and various virtio vulnerabilities have been found. But they're
 rarer than kernel bugs, and the exploitation is more constrained because the
 attacker controls less of the environment.
 
@@ -977,7 +977,7 @@ through `/dev/kvm`. The architecture has two components:
    ioctl interface to configure the VM and handles device emulation (the
    virtio-block and serial devices) in userspace
 
-Unlike QEMU (which provides a full-featured VMM with dozens of emulated
+Unlike qemu (which provides a full-featured VMM with dozens of emulated
 devices), imago's VMM exposes only the devices the guest needs: two
 virtio-block devices and a serial port. This minimal device model is part
 of the security story - fewer emulated devices means less code that could

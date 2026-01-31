@@ -1,11 +1,11 @@
 # QCOW2 Format Specification
 
-A comprehensive reference for the QEMU Copy-On-Write version 2 disk image format,
-compiled from QEMU source code analysis and official documentation.
+A comprehensive reference for the qemu Copy-On-Write version 2 disk image format,
+compiled from qemu source code analysis and official documentation.
 
 ## Overview
 
-QCOW2 is a disk image format used by QEMU that provides:
+QCOW2 is a disk image format used by qemu that provides:
 - Copy-on-write support with backing files
 - Sparse allocation (only allocated clusters consume space)
 - Snapshots with independent L1 tables
@@ -111,7 +111,7 @@ Header extensions follow immediately after the header, padded to 8-byte boundari
 #define MAX_CLUSTER_BITS        21          // 2 MB maximum
 #define DEFAULT_CLUSTER_SIZE    65536       // 64 KB default
 
-// Size limits (QEMU implementation)
+// Size limits (qemu implementation)
 #define QCOW_MAX_L1_SIZE        (32 * 1024 * 1024)   // 32 MB
 #define QCOW_MAX_REFTABLE_SIZE  (8 * 1024 * 1024)    // 8 MB
 #define QCOW_MAX_SNAPSHOTS      65536
@@ -134,7 +134,7 @@ Header extensions follow immediately after the header, padded to 8-byte boundari
 
 ## References
 
-- QEMU source: `block/qcow2.h`, `block/qcow2.c`
+- qemu source: `block/qcow2.h`, `block/qcow2.c`
 - Official docs: `docs/interop/qcow2.txt`
 - See also: `qcow2-l1l2-tables.md`, `qcow2-refcount.md`, `qcow2-snapshots.md`,
   `qcow2-compression.md`, `qcow2-encryption.md`

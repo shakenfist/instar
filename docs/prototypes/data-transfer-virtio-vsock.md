@@ -389,6 +389,6 @@ specifically need streaming without random access.
 
 - [Linux virtio_vsock.h](https://github.com/torvalds/linux/blob/master/include/uapi/linux/virtio_vsock.h)
 - [Linux vsock driver](https://github.com/torvalds/linux/blob/master/net/vmw_vsock/virtio_transport.c)
-- [QEMU vsock device](https://github.com/qemu/qemu/blob/master/hw/virtio/vhost-vsock.c)
+- [qemu vsock device](https://github.com/qemu/qemu/blob/master/hw/virtio/vhost-vsock.c)
 - [rust-vmm virtio-vsock](https://crates.io/crates/virtio-vsock) - VMM-side packet handling
 - [vhost-device-vsock](https://crates.io/crates/vhost-device-vsock) - vhost-user daemon
