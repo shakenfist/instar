@@ -105,9 +105,31 @@ Test images are defined in `tests/manifest.json`:
 | `format` | Expected disk format (qcow2, vmdk, vhd, etc.) |
 | `safety` | `safe`, `caution`, or `malicious` |
 | `run_in_ci` | Whether to include in CI test runs |
+| `unsafe_quirks_required` | If true, requires `--unsafe-quirks` flag for qemu-img compatibility |
 | `description` | Human-readable description |
 | `tags` | Searchable tags for filtering |
 | `expected_override` | Path to expected output file (for malicious images) |
+
+### Unsafe Quirks Testing
+
+Images marked with `unsafe_quirks_required: true` do not have valid format
+headers or partition tables. In default (secure) mode, imago rejects these
+files as "unknown format" rather than accepting them as raw images.
+
+To test qemu-img compatibility for these images, use `--unsafe-quirks`:
+
+```bash
+# Default mode: rejects files without valid structure
+imago info random-garbage.raw
+# Error: Unknown format (no valid disk image header or partition table)
+
+# Unsafe quirks mode: matches qemu-img behavior
+imago info --unsafe-quirks random-garbage.raw
+# file format: raw
+```
+
+See [configuration.md](configuration.md) and [quirks.md](quirks.md) for details
+on safe vs unsafe quirks.
 
 ## Test Data Location
 
@@ -176,3 +198,9 @@ The test suite performs exact string comparison. On failure, it shows:
 |----------|-------------|
 | `IMAGO_TESTDATA_PATH` | Override default testdata location |
 | `IMAGO_BINARY_PATH` | Override default imago binary location |
+
+## Related Documentation
+
+- [Format Coverage](format-coverage.md) - Comparison with oslo.utils format_inspector
+- [Format Detection Safety](format-detection-safety.md) - Security model for format auto-detection
+- [Security Analysis](security.md) - CVE analysis and threat model

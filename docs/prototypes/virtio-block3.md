@@ -206,6 +206,6 @@ This version introduces some early performance tuning options we can play with. 
 
 ## Related Documentation
 
-- [Virtio-Block Data Transfer](../data-transfer-virtio-block.md)
+- [Virtio-Block Data Transfer](data-transfer-virtio-block.md)
 - [guest-protocol crate](../crates/guest-protocol.md)
 - [Virtio-Block2 Prototype](virtio-block2.md)

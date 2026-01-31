@@ -22,10 +22,10 @@ security issue:
 
 | CVE | Impact | Root Cause |
 |-----|--------|------------|
-| CVE-2021-20255 | DoS/RCE in QEMU | Stack overflow in VNC |
-| CVE-2020-14364 | RCE in QEMU | Out-of-bounds read/write in USB |
-| CVE-2019-14378 | RCE in QEMU | Heap buffer overflow in SLiRP |
-| CVE-2017-2615 | RCE in QEMU | Out-of-bounds access in Cirrus VGA |
+| CVE-2021-20255 | DoS/RCE in qemu | Stack overflow in VNC |
+| CVE-2020-14364 | RCE in qemu | Out-of-bounds read/write in USB |
+| CVE-2019-14378 | RCE in qemu | Heap buffer overflow in SLiRP |
+| CVE-2017-2615 | RCE in qemu | Out-of-bounds access in Cirrus VGA |
 
 Rust eliminates entire classes of these vulnerabilities:
 

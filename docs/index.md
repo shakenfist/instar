@@ -30,13 +30,61 @@ Along the pathway to complete equivalence, we have found a few examples of
 on [our quirks page](quirks.md), and you can suppress `qemu-img`
 equivalence with the `--ignore-quirks` flag to `imago`.
 
-Confused about how `imago` does these things? Perhaps read the 
+Confused about how `imago` does these things? Perhaps read the
 [technology primer](technology-primer.md).
+
+---
+
+# Main Implementation Documentation
+
+## Imago-Specific Features
+
+Features unique to imago that do not exist in qemu-img.
+
+| Document | Description |
+|----------|-------------|
+| [Configuration Guide](configuration.md) | Command-line flags, config files, quirk control |
+| [Chain Discovery](chain-discovery.md) | `imago info --chain` - secure backing chain discovery |
+
+## Compatibility
+
+| Document | Description |
+|----------|-------------|
+| [Output Formats](output-formats.md) | qemu-img output formats (human, JSON) and version profiles |
+| [qemu-img Quirks](quirks.md) | Known differences between `imago` and qemu-img output |
+| [Image Notes](image_notes/README.md) | Test images and the quirks they exposed |
+
+## Testing and Coverage
+
+| Document | Description |
+|----------|-------------|
+| [Integration Testing](testing.md) | Test suite comparing imago output against qemu-img |
+| [Format Coverage](format-coverage.md) | Comparison with oslo.utils format_inspector, test coverage gaps |
+
+## Design Decisions
+
+| Document | Description |
+|----------|-------------|
+| [Why Rust](rust-rationale.md) | Memory safety, bare-metal support, rust-vmm ecosystem |
+| [Format Detection Safety](format-detection-safety.md) | Why auto-detection is safe in imago's KVM sandbox |
+
+## Platform Analysis
+
+Analysis of how major virtualization platforms use qemu-img and handle disk images.
+
+| Document | Description |
+|----------|-------------|
+| [Usage Analysis](usage.md) | How oVirt, Proxmox, and OpenStack use qemu-img |
+| [Security Vulnerabilities](security.md) | CVE analysis for image handling across platforms |
+
+---
+
+# Disk Image Format Specifications
 
 ## QCOW2 Format
 
-Comprehensive documentation for the QEMU Copy-On-Write version 2 format,
-derived from QEMU source code analysis.
+Comprehensive documentation for the qemu Copy-On-Write version 2 format,
+derived from qemu source code analysis.
 
 | Document | Description |
 |----------|-------------|
@@ -67,41 +115,59 @@ Documentation for VMware Virtual Machine Disk format.
 | [Grain Tables](vmdk/vmdk-grain-tables.md) | Address translation, GD/GT structure, COW |
 | [Compression](vmdk/vmdk-compression.md) | DEFLATE compression, streamOptimized format |
 
-## KVM Virtualization
+---
+
+# Prototype and Research Documentation
+
+The content below documents the prototyping and research phase of imago
+development. These documents are retained for historical context and may
+be useful for understanding design decisions, but the main implementation
+has evolved beyond these prototypes.
+
+## Prototypes
+
+Experimental implementations exploring secure isolated execution.
+
+| Prototype | Description |
+|-----------|-------------|
+| [KVM Hello World](prototypes/kvm-hello-world.md) | Minimal bare-metal KVM guest proof-of-concept |
+| [KVM Hello World 2](prototypes/kvm-hello-world2.md) | Using vm-memory crate for safer memory management |
+| [Virtio-Block](prototypes/virtio-block.md) | Virtio-block device emulation with file copy |
+| [Virtio-Block2](prototypes/virtio-block2.md) | Virtio-block with protobuf messaging |
+| [Virtio-Block3](prototypes/virtio-block3.md) | Virtio-block with configurable sector sizes |
+| [Virtio-Block4](prototypes/virtio-block4.md) | Virtio-block with performance statistics |
+| [Virtio-Block5](prototypes/virtio-block5.md) | Virtio-block with ioeventfd/irqfd optimizations |
+| [Virtio-Block6](../prototypes/virtio-block6/README.md) | Sparse/dynamic output file support |
+| [Pluggable](../prototypes/pluggable/README.md) | Modular operation architecture with shared infrastructure |
+| [Pluggable2](../prototypes/pluggable2/README.md) | Separate binary loading for operations (minimal attack surface) |
+| [Info](../prototypes/info/README.md) | Image format detection (`qemu-img info` equivalent) |
+
+## KVM Virtualization Research
 
 Documentation for building custom VMMs using the Linux KVM API.
 
 | Document | Description |
 |----------|-------------|
-| [KVM API Guide](kvm.md) | KVM ioctls, memory setup, x86-64 long mode, VM exits |
-| [Performance Counters](performance-counters.md) | KVM statistics, perf events, resource limiting |
+| [KVM API Guide](prototypes/kvm.md) | KVM ioctls, memory setup, x86-64 long mode, VM exits |
+| [Performance Counters](prototypes/performance-counters.md) | KVM statistics, perf events, resource limiting |
 
-## Guest Data Transfer
+## Guest Data Transfer Research
 
 Methods for transferring data into and out of bare-metal KVM guests.
 
 | Document | Description |
 |----------|-------------|
-| [Comparison](data-transfer-comparison.md) | Trade-offs, rust-vmm crates, and recommendations |
-| [Direct Memory](data-transfer-direct-memory.md) | Shared memory regions, coalesced I/O, completion signaling |
-| [Virtio-vsock](data-transfer-virtio-vsock.md) | Socket-based communication with CID addressing |
-| [Virtio-block](data-transfer-virtio-block.md) | Block device interface for sector-based transfers |
-| [Other Mechanisms](data-transfer-other.md) | Custom MMIO device, Port I/O, ioeventfd, virtio-fs, VFIO, hypercalls |
+| [Comparison](prototypes/data-transfer-comparison.md) | Trade-offs, rust-vmm crates, and recommendations |
+| [Direct Memory](prototypes/data-transfer-direct-memory.md) | Shared memory regions, coalesced I/O, completion signaling |
+| [Virtio-vsock](prototypes/data-transfer-virtio-vsock.md) | Socket-based communication with CID addressing |
+| [Virtio-block](prototypes/data-transfer-virtio-block.md) | Block device interface for sector-based transfers |
+| [Other Mechanisms](prototypes/data-transfer-other.md) | Custom MMIO device, Port I/O, ioeventfd, virtio-fs, VFIO, hypercalls |
 
-## Design Decisions
-
-| Document | Description |
-|----------|-------------|
-| [Why Rust](rust-rationale.md) | Memory safety, bare-metal support, rust-vmm ecosystem |
-| [Format Detection Safety](format-detection-safety.md) | Why auto-detection is safe in imago's KVM sandbox |
-
-## Compatibility
+## Development Tools
 
 | Document | Description |
 |----------|-------------|
-| [Output Formats](output-formats.md) | qemu-img output formats (human, JSON) and version profiles |
-| [qemu-img Quirks](quirks.md) | Known differences between `imago` and qemu-img output |
-| [Image Notes](image_notes/README.md) | Test images and the quirks they exposed |
+| [Building with Docker](prototypes/building-with-docker.md) | Build prototypes using Docker CLI without VSCode |
 
 ## Rust Crate Ecosystem
 
@@ -118,35 +184,8 @@ Cloud Hypervisor. These crates reduce virtio implementation effort by 70%+.
 | [virtio-vsock](https://crates.io/crates/virtio-vsock) | VMM | Vsock packet handling |
 | [virtio-drivers](https://crates.io/crates/virtio-drivers) | Guest | `no_std` virtio drivers |
 
-See [Comparison](data-transfer-comparison.md#rust-crate-ecosystem) for details
+See [Comparison](prototypes/data-transfer-comparison.md#rust-crate-ecosystem) for details
 on how these crates affect implementation complexity.
-
-## Platform Analysis
-
-Analysis of how major virtualization platforms use qemu-img and handle disk images.
-
-| Document | Description |
-|----------|-------------|
-| [Usage Analysis](usage.md) | How oVirt, Proxmox, and OpenStack use qemu-img |
-| [Security Vulnerabilities](security.md) | CVE analysis for image handling across platforms |
-
-## Prototypes
-
-Experimental implementations exploring secure isolated execution.
-
-| Document | Description |
-|----------|-------------|
-| [KVM Hello World](prototypes/kvm-hello-world.md) | Minimal bare-metal KVM guest proof-of-concept |
-| [KVM Hello World 2](prototypes/kvm-hello-world2.md) | Using vm-memory crate for safer memory management |
-| [Virtio-Block](prototypes/virtio-block.md) | Virtio-block device emulation with file copy |
-| [Virtio-Block2](prototypes/virtio-block2.md) | Virtio-block with protobuf messaging |
-| [Virtio-Block3](prototypes/virtio-block3.md) | Virtio-block with configurable sector sizes |
-| [Virtio-Block4](prototypes/virtio-block4.md) | Virtio-block with performance statistics |
-| [Virtio-Block5](prototypes/virtio-block5.md) | Virtio-block with ioeventfd/irqfd optimizations |
-| [Virtio-Block6](../prototypes/virtio-block6/README.md) | Sparse/dynamic output file support |
-| [Pluggable](../prototypes/pluggable/README.md) | Modular operation architecture with shared infrastructure |
-| [Pluggable2](../prototypes/pluggable2/README.md) | Separate binary loading for operations (minimal attack surface) |
-| [Info](../prototypes/info/README.md) | Image format detection (`qemu-img info` equivalent) |
 
 ## Shared Crates
 
@@ -155,10 +194,3 @@ Reusable Rust crates for the `imago` project.
 | Document | Description |
 |----------|-------------|
 | [guest-protocol](crates/guest-protocol.md) | Protocol Buffers messaging for guest-VMM communication |
-
-## Development
-
-| Document | Description |
-|----------|-------------|
-| [Building with Docker](building-with-docker.md) | Build prototypes using Docker CLI without VSCode |
-| [Integration Testing](testing.md) | Test suite comparing imago output against qemu-img |

@@ -156,5 +156,5 @@ transport (virtio-console, shared memory).
 
 - [guest-protocol crate](../crates/guest-protocol.md)
 - [Virtio-Block Prototype](virtio-block.md)
-- [Virtio-Block Data Transfer](../data-transfer-virtio-block.md)
+- [Virtio-Block Data Transfer](data-transfer-virtio-block.md)
 - [VIRTIO 1.1 Specification](https://docs.oasis-open.org/virtio/virtio/v1.1/virtio-v1.1.html)

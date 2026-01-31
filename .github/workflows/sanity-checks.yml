@@ -10,6 +10,32 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Check if the last commit was from the bot to prevent infinite loops in
+  # automated fixer jobs. This runs early so other jobs can depend on it.
+  check-bot-commit:
+    name: "Check bot commit"
+    if: github.event_name == 'pull_request'
+    runs-on: [self-hosted, static]
+    outputs:
+      is_bot: ${{ steps.check.outputs.is_bot }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check if last commit was from bot
+        id: check
+        run: |
+          LAST_AUTHOR_EMAIL=$(git log -1 --format='%ae')
+          echo "Last commit author: $LAST_AUTHOR_EMAIL"
+          if [ "$LAST_AUTHOR_EMAIL" = "bot@shakenfist.com" ]; then
+            echo "is_bot=true" >> $GITHUB_OUTPUT
+            echo "Last commit was from bot - automated fixers will be skipped"
+          else
+            echo "is_bot=false" >> $GITHUB_OUTPUT
+          fi
+
   sanity-checks:
     runs-on: [self-hosted, debian-12, s]
     timeout-minutes: 30
@@ -274,6 +300,107 @@ jobs:
           cd ${GITHUB_WORKSPACE}/imago
           make test-container TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
 
+      - name: Test --chain flag (backing chain discovery)
+        run: |
+          cd ${GITHUB_WORKSPACE}/imago
+          TESTDATA=${GITHUB_WORKSPACE}/imago-testdata
+
+          # Helper function to run imago and capture output regardless of exit code
+          # We mount the entire release directory because imago needs core.bin and info.bin
+          # in the same directory as the imago binary for chain discovery
+          run_chain_test() {
+            local image_path="$1"
+            local mount_path="$2"
+            set +e
+            OUTPUT=$(docker run --rm \
+              --device /dev/kvm \
+              -v "$(pwd)/src/target/release:/opt/imago:ro" \
+              -v "${mount_path}:/images:ro" \
+              imago-build \
+              /opt/imago/imago info --chain "$image_path" 2>&1)
+            local exit_code=$?
+            set -e
+            echo "$OUTPUT"
+            if [ $exit_code -ne 0 ]; then
+              echo "WARNING: imago exited with code $exit_code"
+            fi
+          }
+
+          echo "=== Testing --chain with 2-level chain (shakenfist/vda) ==="
+          OUTPUT=$(run_chain_test /images/vda "${TESTDATA}/downloaded/shakenfist")
+
+          # Verify chain has 2 images (output format: "  [0] path (format)")
+          COUNT=$(echo "$OUTPUT" | grep -cE '^\s+\[[0-9]+\]' || true)
+          if [ "$COUNT" -eq 2 ]; then
+            echo "PASS: 2-level chain detected correctly"
+          else
+            echo "FAIL: Expected 2 images in chain, got $COUNT"
+            echo "Full output was:"
+            echo "$OUTPUT"
+            exit 1
+          fi
+
+          # Verify backing file is reported (format: "path (format) -> backing")
+          if echo "$OUTPUT" | grep -q " -> "; then
+            echo "PASS: backing-file field present"
+          else
+            echo "FAIL: backing-file field missing"
+            exit 1
+          fi
+
+          echo ""
+          echo "=== Testing --chain with 2-level chain (edge-cases/overlay) ==="
+          OUTPUT=$(run_chain_test /images/overlay_chain.qcow2 "${TESTDATA}/downloaded/edge-cases")
+
+          COUNT=$(echo "$OUTPUT" | grep -cE '^\s+\[[0-9]+\]' || true)
+          if [ "$COUNT" -eq 2 ]; then
+            echo "PASS: 2-level chain detected correctly"
+          else
+            echo "FAIL: Expected 2 images in chain, got $COUNT"
+            echo "Full output was:"
+            echo "$OUTPUT"
+            exit 1
+          fi
+
+          echo ""
+          echo "=== Testing --chain with 3-level mixed-format chain ==="
+          OUTPUT=$(run_chain_test /images/top.qcow2 "${TESTDATA}/custom/backing-layers-format-change")
+
+          COUNT=$(echo "$OUTPUT" | grep -cE '^\s+\[[0-9]+\]' || true)
+          if [ "$COUNT" -eq 3 ]; then
+            echo "PASS: 3-level chain detected correctly"
+          else
+            echo "FAIL: Expected 3 images in chain, got $COUNT"
+            echo "Full output was:"
+            echo "$OUTPUT"
+            exit 1
+          fi
+
+          # Verify format changes are reported (qcow2 -> qcow2 -> vmdk)
+          if echo "$OUTPUT" | grep -q "(vmdk)"; then
+            echo "PASS: VMDK base format detected in mixed chain"
+          else
+            echo "FAIL: VMDK base format not detected"
+            exit 1
+          fi
+
+          echo ""
+          echo "=== Testing --chain with single image (no backing) ==="
+          OUTPUT=$(run_chain_test /images/debian-12-genericcloud-amd64.qcow2 "${TESTDATA}/downloaded/public-clouds")
+
+          COUNT=$(echo "$OUTPUT" | grep -cE '^\s+\[[0-9]+\]' || true)
+          if [ "$COUNT" -eq 1 ]; then
+            echo "PASS: Single image chain (no backing) detected correctly"
+          else
+            echo "FAIL: Expected 1 image in chain, got $COUNT"
+            echo "Full output was:"
+            echo "$OUTPUT"
+            exit 1
+          fi
+
+          echo ""
+          echo "All --chain tests passed!"
+
       - name: Upload test artifacts
         if: failure()
         uses: actions/upload-artifact@v4
@@ -283,3 +410,26 @@ jobs:
             ${{ github.workspace }}/build-log.txt
             ${{ github.workspace }}/test-output.txt
           retention-days: 7
+
+  automated_reviewer:
+    name: "Automated reviewer"
+    runs-on: [self-hosted, claude-code]
+    needs: [check-bot-commit, sanity-checks, integration-tests]
+    if: >-
+      ${{ github.event_name == 'pull_request' &&
+          needs.check-bot-commit.outputs.is_bot != 'true' }}
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-reviewer
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run automated reviewer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tools/review-pr-with-claude.sh --ci --pr ${{ github.event.pull_request.number }}

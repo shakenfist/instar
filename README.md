@@ -44,7 +44,14 @@ sudo src/target/release/imago copy <INPUT> <OUTPUT>
 ```bash
 # Display image format information (matches qemu-img info output)
 imago info image.qcow2
+
+# Discover and display the complete backing file chain
+imago info --chain image.qcow2
 ```
+
+The `--chain` flag iteratively runs the sandboxed info operation on each image
+in the backing chain, validating paths against a security allowlist to prevent
+directory traversal attacks.
 
 ### Version Compatibility
 
@@ -268,6 +275,25 @@ parsed or manipulated by code running with host privileges. Instead:
 1. A minimal KVM guest handles all image parsing and conversion
 2. The host only deals with opaque byte streams
 3. Any vulnerabilities in format parsing are contained within the sandbox
+
+### Secure RAW Format Detection
+
+Unlike qemu-img, imago validates RAW format detection by requiring a valid
+partition table (MBR or GPT). This prevents arbitrary files from being accepted
+as disk images, which is the root cause of backing file disclosure attacks
+(CVE-2015-5163, CVE-2024-32498).
+
+```bash
+# Default (secure): rejects files without valid format or partition table
+imago info /etc/passwd
+# Error: Unknown format (no valid disk image header or partition table)
+
+# Unsafe mode: matches qemu-img behavior (for compatibility testing only)
+imago info --unsafe-quirks /etc/passwd
+# file format: raw
+```
+
+See [docs/quirks.md](docs/quirks.md) for the classification of safe vs unsafe quirks.
 
 ## Test Data
 

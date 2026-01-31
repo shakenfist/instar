@@ -13,6 +13,8 @@ import testtools
 from helpers.comparators import (
     compare_outputs,
     format_failure_message,
+    get_disk_size,
+    substitute_actual_size,
     substitute_testdata_root,
 )
 from helpers.types import TestImage
@@ -249,7 +251,8 @@ class ImagoTestBase(testtools.TestCase):
         image_path: Path,
         timeout: int = 30,
         qemu_version: Optional[str] = None,
-        output_format: Optional[str] = None
+        output_format: Optional[str] = None,
+        unsafe_quirks: bool = False
     ) -> tuple:
         """
         Run imago info on an image.
@@ -259,6 +262,10 @@ class ImagoTestBase(testtools.TestCase):
             timeout: Timeout in seconds
             qemu_version: Optional qemu-img version to emulate (e.g., '7.2')
             output_format: Optional output format ('human' or 'json')
+            unsafe_quirks: Enable unsafe qemu-img compatibility mode.
+                           When True, accepts any file as RAW without requiring
+                           a valid partition table. Required for testing images
+                           marked with unsafe_quirks_required in the manifest.
 
         Returns:
             tuple: (stdout, stderr, return_code)
@@ -270,6 +277,8 @@ class ImagoTestBase(testtools.TestCase):
             cmd.extend(['--qemu-version', qemu_version])
         if output_format:
             cmd.extend(['--output', output_format])
+        if unsafe_quirks:
+            cmd.append('--unsafe-quirks')
         cmd.append(str(image_path))
 
         try:
@@ -328,13 +337,31 @@ class ImagoTestBase(testtools.TestCase):
         self,
         image_id: str,
         imago_output: str,
-        expected_output: str
+        expected_output: str,
+        image_path: Optional[Path] = None
     ):
         """
         Assert that imago output matches expected output exactly.
 
+        If image_path is provided, the actual disk size is looked up from the
+        filesystem and substituted into the expected output. This ensures that
+        the "actual-size" (JSON) or "disk size" (human) field comparison uses
+        the current filesystem's view of the file, not a potentially stale
+        baseline value.
+
         Provides detailed diff output on failure with whitespace made visible.
+
+        Args:
+            image_id: The test image identifier (for error messages)
+            imago_output: Output from running imago
+            expected_output: Expected output (from baseline or qemu-img)
+            image_path: Path to the image file (for disk size substitution)
         """
+        # Substitute actual disk size if image path is provided
+        if image_path is not None:
+            disk_size = get_disk_size(str(image_path))
+            expected_output = substitute_actual_size(expected_output, disk_size)
+
         matched, diff_text = compare_outputs(imago_output, expected_output)
 
         if not matched:

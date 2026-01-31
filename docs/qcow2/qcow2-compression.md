@@ -8,7 +8,7 @@ requirements for compressible data.
 | Value | Name | Description |
 |-------|------|-------------|
 | 0 | ZLIB | Default, always supported (deflate algorithm) |
-| 1 | ZSTD | Optional, requires QEMU compiled with zstd support |
+| 1 | ZSTD | Optional, requires qemu compiled with zstd support |
 
 The compression type is stored at header offset 104 (version 3+ only).
 
@@ -213,7 +213,7 @@ ssize_t qcow2_zstd_decompress(void *dest, size_t dest_size,
 
 ## Threading
 
-QEMU offloads compression/decompression to a thread pool:
+qemu offloads compression/decompression to a thread pool:
 
 ```c
 #define QCOW2_MAX_THREADS 4  // Maximum concurrent operations
