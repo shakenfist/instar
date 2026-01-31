@@ -10,6 +10,32 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Check if the last commit was from the bot to prevent infinite loops in
+  # automated fixer jobs. This runs early so other jobs can depend on it.
+  check-bot-commit:
+    name: "Check bot commit"
+    if: github.event_name == 'pull_request'
+    runs-on: [self-hosted, static]
+    outputs:
+      is_bot: ${{ steps.check.outputs.is_bot }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check if last commit was from bot
+        id: check
+        run: |
+          LAST_AUTHOR_EMAIL=$(git log -1 --format='%ae')
+          echo "Last commit author: $LAST_AUTHOR_EMAIL"
+          if [ "$LAST_AUTHOR_EMAIL" = "bot@shakenfist.com" ]; then
+            echo "is_bot=true" >> $GITHUB_OUTPUT
+            echo "Last commit was from bot - automated fixers will be skipped"
+          else
+            echo "is_bot=false" >> $GITHUB_OUTPUT
+          fi
+
   sanity-checks:
     runs-on: [self-hosted, debian-12, s]
     timeout-minutes: 30
@@ -384,3 +410,26 @@ jobs:
             ${{ github.workspace }}/build-log.txt
             ${{ github.workspace }}/test-output.txt
           retention-days: 7
+
+  automated_reviewer:
+    name: "Automated reviewer"
+    runs-on: [self-hosted, claude-code]
+    needs: [check-bot-commit, sanity-checks, integration-tests]
+    if: >-
+      ${{ github.event_name == 'pull_request' &&
+          needs.check-bot-commit.outputs.is_bot != 'true' }}
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-reviewer
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run automated reviewer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tools/review-pr-with-claude.sh --ci --pr ${{ github.event.pull_request.number }}
