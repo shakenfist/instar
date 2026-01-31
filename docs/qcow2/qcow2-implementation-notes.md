@@ -286,9 +286,9 @@ int validate_qcow2(QCow2Image *img) {
 }
 ```
 
-## QEMU Implementation Limits
+## qemu Implementation Limits
 
-These are QEMU-specific but useful guidelines:
+These are qemu-specific but useful guidelines:
 
 | Limit | Value | Notes |
 |-------|-------|-------|
@@ -301,7 +301,7 @@ These are QEMU-specific but useful guidelines:
 
 ## External References
 
-### QEMU Source Code
+### qemu Source Code
 
 - `block/qcow2.h` - Structure definitions
 - `block/qcow2.c` - Core implementation

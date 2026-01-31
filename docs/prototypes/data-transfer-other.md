@@ -439,7 +439,7 @@ When file semantics are natural (config files, large data files).
 
 ### Overview
 
-Kernel-accelerated virtio backend that bypasses QEMU for data path.
+Kernel-accelerated virtio backend that bypasses qemu for data path.
 
 ### Components
 

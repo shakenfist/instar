@@ -44,7 +44,7 @@ for details on why this approach is secure.
 The following formats are detected by oslo.utils but not imago:
 
 1. **VDI (VirtualBox)** - Common virtualization format
-2. **QED** - Deprecated QEMU format (oslo.utils bans it entirely)
+2. **QED** - Deprecated qemu format (oslo.utils bans it entirely)
 3. **ISO** - CD/DVD image format
 4. **LUKS** - Linux encrypted container format
 5. **GPT/MBR** - oslo.utils detects these as distinct from "raw"

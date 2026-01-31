@@ -30,7 +30,7 @@ typedef struct VmdkGrainMarker {
     uint64_t lba;     // Logical block address (sector offset)
     uint32_t size;    // Compressed data size in bytes
     uint8_t data[];   // Compressed grain data follows
-} QEMU_PACKED;
+} qemu_PACKED;
 ```
 
 **Header size:** 12 bytes
@@ -86,7 +86,7 @@ memcpy(output, uncomp_buf + in_grain_offset, bytes);
 
 1. **Whole grains only** - Cannot partially compress a grain
 2. **Single-pass writes** - Cannot overwrite already-written grains
-3. **Read-only for version 3** - QEMU opens v3 compressed images read-only
+3. **Read-only for version 3** - qemu opens v3 compressed images read-only
 4. **Marker required** - Compressed grains must have markers
 
 ```c
@@ -144,7 +144,7 @@ struct Marker {
     uint32_t size;             // Size (usually 0)
     uint32_t type;             // Marker type
     uint8_t pad[512 - 16];     // Padding to sector
-} QEMU_PACKED;
+} qemu_PACKED;
 ```
 
 ## Footer Structure
@@ -228,6 +228,6 @@ offset must be read from the footer.
 
 ## References
 
-- QEMU source: `block/vmdk.c`
+- qemu source: `block/vmdk.c`
 - VMware VDDK 5.0 Technical Note
 - zlib library: https://www.zlib.net/
