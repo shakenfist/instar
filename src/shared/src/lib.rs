@@ -459,6 +459,11 @@ impl InfoConfig {
     /// Flag: Check for potentially dangerous metadata (backing files, etc.)
     pub const FLAG_SECURITY_CHECK: u32 = 1 << 1;
 
+    /// Flag: Enable unsafe quirks mode (accept any file as RAW without
+    /// partition table validation). This matches qemu-img behavior but
+    /// introduces security vulnerabilities. Use only for compatibility testing.
+    pub const FLAG_UNSAFE_QUIRKS: u32 = 1 << 2;
+
     /// Create a default config
     pub const fn default_config() -> Self {
         Self {
@@ -480,6 +485,15 @@ impl InfoConfig {
     /// Check if security check flag is set
     pub fn should_check_security(&self) -> bool {
         (self.flags & Self::FLAG_SECURITY_CHECK) != 0
+    }
+
+    /// Check if unsafe quirks mode is enabled
+    ///
+    /// When enabled, any file will be accepted as a valid RAW image,
+    /// matching qemu-img's insecure behavior. When disabled (default),
+    /// files must have a valid partition table to be accepted as RAW.
+    pub fn unsafe_quirks_enabled(&self) -> bool {
+        (self.flags & Self::FLAG_UNSAFE_QUIRKS) != 0
     }
 }
 
@@ -557,6 +571,12 @@ impl InfoResult {
 
     /// Flag: Corrupt bit is set
     pub const FLAG_CORRUPT: u32 = 1 << 6;
+
+    /// Flag: RAW image has MBR partition table
+    pub const FLAG_HAS_MBR: u32 = 1 << 7;
+
+    /// Flag: RAW image has GPT partition table
+    pub const FLAG_HAS_GPT: u32 = 1 << 8;
 
     /// Create a new empty result
     pub const fn new() -> Self {

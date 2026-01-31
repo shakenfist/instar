@@ -70,6 +70,7 @@ const COPY_CONFIG_FLAG_SKIP_ZEROS: u32 = 1 << 1;
 const INFO_CONFIG_MAGIC: u32 = 0x494E464F; // "INFO"
 const INFO_CONFIG_FLAG_DETAILED: u32 = 1 << 0;
 const INFO_CONFIG_FLAG_SECURITY_CHECK: u32 = 1 << 1;
+const INFO_CONFIG_FLAG_UNSAFE_QUIRKS: u32 = 1 << 2;
 
 // InfoResult constants (must match shared crate)
 // These are defined for future use when parsing results from guest
@@ -828,6 +829,7 @@ fn get_binary_path(name: &str) -> std::path::PathBuf {
 ///
 /// * `input_path` - Path to the image file to analyze
 /// * `sector_size` - Sector size for the virtio-block device
+/// * `unsafe_quirks` - Enable unsafe qemu-img compatibility mode (accepts any file as RAW)
 ///
 /// # Returns
 ///
@@ -835,6 +837,7 @@ fn get_binary_path(name: &str) -> std::path::PathBuf {
 fn execute_info_operation(
     input_path: &Path,
     sector_size: u32,
+    unsafe_quirks: bool,
 ) -> Result<InfoOperationResult, Box<dyn std::error::Error>> {
     // Auto-discover binaries in same directory as executable
     let core_path = get_binary_path("core.bin");
@@ -891,7 +894,10 @@ fn execute_info_operation(
     guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
 
     // Write InfoConfig at OPERATION_CONFIG_ADDR (0x19000)
-    let info_flags: u32 = INFO_CONFIG_FLAG_DETAILED | INFO_CONFIG_FLAG_SECURITY_CHECK;
+    let mut info_flags: u32 = INFO_CONFIG_FLAG_DETAILED | INFO_CONFIG_FLAG_SECURITY_CHECK;
+    if unsafe_quirks {
+        info_flags |= INFO_CONFIG_FLAG_UNSAFE_QUIRKS;
+    }
     guest_mem.write_obj(INFO_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
     guest_mem.write_obj(info_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
 
@@ -1097,7 +1103,8 @@ fn discover_backing_chain(
         seen_paths.push(current.clone());
 
         // Run the sandboxed info operation
-        let info_result = execute_info_operation(&current, sector_size)
+        // Always use secure mode (unsafe_quirks=false) for backing chain discovery
+        let info_result = execute_info_operation(&current, sector_size, false)
             .map_err(|e| ChainError::InfoOperationFailed(e.to_string()))?;
 
         // Build chain image entry
@@ -1196,6 +1203,13 @@ struct InfoArgs {
     /// Report true filesystem size instead of qemu-img-compatible calculated size
     #[arg(long)]
     ignore_quirks: bool,
+
+    /// Enable unsafe qemu-img compatibility mode.
+    /// WARNING: This accepts any file as a valid RAW image, which enables
+    /// security vulnerabilities like backing file disclosure attacks.
+    /// Use only for compatibility testing, never in production.
+    #[arg(long)]
+    unsafe_quirks: bool,
 
     /// Target qemu-img version for output compatibility (e.g., "7.2", "8.0", "10.0").
     /// By default, imago detects the installed qemu-img version and matches its output format.
@@ -1461,7 +1475,10 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Write InfoConfig at OPERATION_CONFIG_ADDR (0x19000)
     // Layout: magic (u32), flags (u32)
-    let info_flags: u32 = INFO_CONFIG_FLAG_DETAILED | INFO_CONFIG_FLAG_SECURITY_CHECK;
+    let mut info_flags: u32 = INFO_CONFIG_FLAG_DETAILED | INFO_CONFIG_FLAG_SECURITY_CHECK;
+    if args.unsafe_quirks {
+        info_flags |= INFO_CONFIG_FLAG_UNSAFE_QUIRKS;
+    }
     guest_mem.write_obj(INFO_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
     guest_mem.write_obj(info_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
     debug!(
