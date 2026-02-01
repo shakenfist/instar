@@ -129,6 +129,13 @@ const QED_IMAGE_SIZE_OFFSET: usize = 48; // Virtual size in bytes (u64)
 const QED_BACKING_FILENAME_OFFSET_OFFSET: usize = 56; // Backing filename offset (u32)
 const QED_BACKING_FILENAME_SIZE_OFFSET: usize = 60; // Backing filename size (u32)
 
+// ISO 9660 format constants
+// ISO 9660 Primary Volume Descriptor starts at byte offset 32768 (sector 16 for 2048-byte CD sectors)
+// Byte 0: Volume Descriptor Type (1 = Primary)
+// Bytes 1-5: "CD001" standard identifier
+const ISO_MAGIC_BYTE_OFFSET: usize = 32769; // Absolute byte offset of "CD001" (32768 + 1)
+const ISO_MAGIC: &[u8; 5] = b"CD001"; // ISO 9660 standard identifier
+
 /// Entry point called by core after devices are initialized.
 ///
 /// Returns the number of bytes read.
@@ -200,12 +207,39 @@ pub unsafe extern "C" fn _start() -> u64 {
         }
     }
 
+    // Check if unsafe quirks mode is enabled (qemu-img compatible but insecure)
+    let unsafe_quirks = config.is_valid() && config.unsafe_quirks_enabled();
+
+    // If still no format detected, try ISO 9660 detection (magic at byte offset 32769)
+    // Note: qemu-img treats ISO as "raw", so we only detect ISO in safe mode.
+    // With --unsafe-quirks, ISO files will be reported as "raw" for qemu-img compatibility.
+    if format == ImageFormat::Raw && !unsafe_quirks {
+        (call_table.debug_print)(b"info: checking ISO 9660\n\0".as_ptr());
+        // ISO magic is at byte offset 32769 ("CD001" at 32768+1)
+        // Check if the magic is already in our first sector buffer
+        if input_sector_size >= ISO_MAGIC_BYTE_OFFSET + 5 {
+            // Large sector size: magic is in first sector
+            format = detect_iso_at_offset(&buffer, ISO_MAGIC_BYTE_OFFSET);
+        } else {
+            // Small sector size: need to read the sector containing the magic
+            let iso_sector = ISO_MAGIC_BYTE_OFFSET as u64 / input_sector_size as u64;
+            let offset_in_sector = ISO_MAGIC_BYTE_OFFSET % input_sector_size;
+            if input_capacity > iso_sector {
+                if (call_table.read_input_sector)(
+                    iso_sector,
+                    footer_buffer.as_mut_ptr(),
+                    input_sector_size,
+                ) {
+                    format = detect_iso_at_offset(&footer_buffer, offset_in_sector);
+                }
+            }
+        }
+    }
+
     // For RAW format: validate partition table unless unsafe quirks is enabled.
     // This prevents arbitrary files (like /etc/passwd) from being accepted as
     // valid disk images, which is the root cause of backing file disclosure attacks.
     if format == ImageFormat::Raw {
-        let unsafe_quirks = config.is_valid() && config.unsafe_quirks_enabled();
-
         if !unsafe_quirks {
             // Check for valid partition table
             let partition_type = detect_partition_table(&buffer);
@@ -386,6 +420,7 @@ fn format_to_str(format: ImageFormat) -> *const u8 {
         ImageFormat::Vhdx => b"vhdx\0".as_ptr(),
         ImageFormat::Vdi => b"vdi\0".as_ptr(),
         ImageFormat::Qed => b"qed\0".as_ptr(),
+        ImageFormat::Iso => b"iso\0".as_ptr(),
     }
 }
 
@@ -469,6 +504,29 @@ fn detect_vhd_footer(buffer: &[u8]) -> ImageFormat {
 
     if cookie == VHD_COOKIE {
         return ImageFormat::Vhd;
+    }
+
+    ImageFormat::Raw
+}
+
+/// Detect ISO 9660 format from buffer at the given offset
+///
+/// ISO 9660 format has the Primary Volume Descriptor at byte offset 32768.
+/// The structure is:
+/// - Byte 0: Volume Descriptor Type (1 = Primary Volume Descriptor)
+/// - Bytes 1-5: Standard Identifier "CD001"
+/// - Byte 6: Version (1)
+///
+/// The offset parameter should point to byte 32769 (where "CD001" starts).
+fn detect_iso_at_offset(buffer: &[u8], offset: usize) -> ImageFormat {
+    // Need at least offset + 5 bytes to check "CD001" magic
+    if buffer.len() < offset + 5 {
+        return ImageFormat::Raw;
+    }
+
+    // Check for "CD001" at the given offset
+    if buffer[offset..offset + 5] == *ISO_MAGIC {
+        return ImageFormat::Iso;
     }
 
     ImageFormat::Raw

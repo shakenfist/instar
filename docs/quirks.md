@@ -21,16 +21,18 @@ imago **mimics safe quirks by default** for qemu-img compatibility. Use
 
 ### Unsafe Quirks
 
-Unsafe quirks are behaviors that can enable security vulnerabilities. The
-primary example is:
+Unsafe quirks are behaviors that can enable security vulnerabilities or
+reduce format identification accuracy. Examples include:
 
 - **RAW as fallback format** - Treating any unrecognized file as a valid
   raw disk image, which enables backing file disclosure attacks
+- **ISO reported as RAW** - Not detecting ISO 9660 format, reducing format
+  visibility for policy decisions
 
 imago **does NOT mimic unsafe quirks by default**. Instead, imago applies
-additional validation (e.g., requiring MBR/GPT partition tables for raw images).
-Use `--unsafe-quirks` to match qemu-img's insecure behavior for compatibility
-testing.
+additional validation (e.g., requiring MBR/GPT partition tables for raw images,
+detecting ISO 9660 format). Use `--unsafe-quirks` to match qemu-img's behavior
+for compatibility testing.
 
 ### Summary
 
@@ -497,6 +499,57 @@ The imago-testdata repository includes several test cases for this behavior:
 - `raw-random-garbage.raw` - Random bytes (detected as raw)
 - `raw-misleading-header.raw` - QCOW2 magic but invalid header (detected as raw)
 - `raw-minimal-1byte.raw` - Single byte file (detected as raw)
+
+## ISO 9660 Detection vs RAW
+
+**Classification: Unsafe Quirk** - Related to format identification accuracy.
+
+### Observed Behavior
+
+qemu-img does not specifically detect ISO 9660 (CD/DVD image) format. Instead,
+it treats ISO files as "raw" disk images:
+
+```bash
+$ qemu-img info ubuntu.iso
+image: ubuntu.iso
+file format: raw
+virtual size: 4.7 GiB (5046586880 bytes)
+disk size: 4.7 GiB
+```
+
+### Why This Matters
+
+ISO 9660 is a distinct filesystem format used for CD/DVD images, with a
+well-defined structure:
+- Primary Volume Descriptor at sector 16 (byte offset 32768)
+- Standard identifier "CD001" at bytes 1-5 of the PVD
+
+Treating ISO files as "raw" means:
+1. Cloud platforms cannot distinguish ISOs from actual raw disk images
+2. Policy decisions (e.g., "reject ISO uploads") require external detection
+3. Format-specific handling (e.g., mount options) cannot be automated
+
+### imago Behavior
+
+**Default behavior (secure)**: imago detects ISO 9660 format by checking for
+the "CD001" magic at byte offset 32769. ISO files are reported as `file format: iso`
+rather than raw. This allows:
+- OpenStack/Glance to identify and policy-control ISO uploads
+- Better format reporting for administrators
+- Accurate format statistics
+
+**With `--unsafe-quirks` flag**: imago matches qemu-img's behavior, treating
+ISO files as "raw" disk images. This is required for exact qemu-img output
+compatibility but provides less information about the actual file format.
+
+### Technical Details
+
+ISO 9660 detection checks for:
+- "CD001" identifier at byte offset 32769 (32768 + 1)
+- Works with both small (512-byte) and large (65536-byte) sector sizes
+
+The detection is performed after other format checks (QCOW2, VMDK, VHD, etc.)
+but before the partition table validation for raw images.
 
 ## Future Additions
 
