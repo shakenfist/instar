@@ -35,7 +35,7 @@ for details on why this approach is secure.
 | VDI | Yes | Yes | vdi-simple |
 | QED | Yes (banned) | Yes | qed-simple |
 | ISO | Yes | Yes* | iso-simple |
-| LUKS | Yes | **No** | (none) |
+| LUKS | Yes | Yes | (none - test image needed) |
 | Parallels | No | **No** | parallels-v1, parallels-v2 (in testdata, not tested) |
 | Bochs | No | **No** | empty.bochs (in testdata, not tested) |
 | cloop | No | **No** | simple-pattern.cloop (in testdata, not tested) |
@@ -44,9 +44,7 @@ for details on why this approach is secure.
 
 ### Formats Not Yet Detected by Imago
 
-The following formats are detected by oslo.utils but not imago:
-
-1. **LUKS** - Linux encrypted container format (no test image yet)
+All formats detected by oslo.utils are now also detected by imago.
 
 ---
 
@@ -97,7 +95,7 @@ The following formats are detected by oslo.utils but not imago:
 | Format | Check | oslo.utils | imago |
 |--------|-------|------------|-------|
 | QED | Banned entirely | Rejects | Detects format |
-| LUKS | Version check (only v1) | Rejects v2+ | N/A (not detected) |
+| LUKS | Version check (only v1) | Rejects v2+ | Detects format, version |
 | VDI | None | Pass-through | Detects format, UUID |
 | ISO | None | Pass-through | Detects format* |
 | VHD | None | Pass-through | Detects creator app |
@@ -254,7 +252,7 @@ The following formats are detected by oslo.utils but not imago:
 
 ### Detections to Add
 
-1. **LUKS format detection** - Encrypted container detection
+All oslo.utils formats are now detected. No remaining format detections needed.
 
 ### Safety Checks to Add
 
