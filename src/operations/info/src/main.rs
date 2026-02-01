@@ -136,6 +136,12 @@ const QED_BACKING_FILENAME_SIZE_OFFSET: usize = 60; // Backing filename size (u3
 const ISO_MAGIC_BYTE_OFFSET: usize = 32769; // Absolute byte offset of "CD001" (32768 + 1)
 const ISO_MAGIC: &[u8; 5] = b"CD001"; // ISO 9660 standard identifier
 
+// LUKS format constants (Linux encrypted container)
+// LUKS magic is "LUKS\xba\xbe" (6 bytes) at offset 0
+// Version is big-endian u16 at offset 6 (1 for LUKS1, 2 for LUKS2)
+const LUKS_MAGIC: [u8; 6] = [0x4c, 0x55, 0x4b, 0x53, 0xba, 0xbe]; // "LUKS\xba\xbe"
+const LUKS_VERSION_OFFSET: usize = 6; // Version (big-endian u16)
+
 /// Entry point called by core after devices are initialized.
 ///
 /// Returns the number of bytes read.
@@ -340,6 +346,9 @@ pub unsafe extern "C" fn _start() -> u64 {
             ImageFormat::Qed => {
                 parse_qed_header(&buffer, &mut result);
             }
+            ImageFormat::Luks => {
+                parse_luks_header(&buffer, &mut result);
+            }
             _ => {
                 // For raw and unknown formats, virtual size = actual size
                 result.virtual_size = actual_size;
@@ -421,6 +430,7 @@ fn format_to_str(format: ImageFormat) -> *const u8 {
         ImageFormat::Vdi => b"vdi\0".as_ptr(),
         ImageFormat::Qed => b"qed\0".as_ptr(),
         ImageFormat::Iso => b"iso\0".as_ptr(),
+        ImageFormat::Luks => b"luks\0".as_ptr(),
     }
 }
 
@@ -484,6 +494,11 @@ fn detect_format_header(buffer: &[u8], len: usize) -> ImageFormat {
         if vdi_magic == VDI_MAGIC {
             return ImageFormat::Vdi;
         }
+    }
+
+    // Check LUKS magic at offset 0 (6 bytes: "LUKS\xba\xbe")
+    if len >= 6 && buffer[0..6] == LUKS_MAGIC {
+        return ImageFormat::Luks;
     }
 
     // Fixed VHD has its signature only at the end, handled separately
@@ -1383,6 +1398,28 @@ fn parse_qed_header(buffer: &[u8], result: &mut InfoResult) {
     if backing_offset > 0 && backing_size > 0 {
         result.flags |= InfoResult::FLAG_HAS_BACKING_FILE;
     }
+}
+
+/// Parse LUKS header and populate result
+///
+/// LUKS header structure:
+/// - Offset 0-5: Magic "LUKS\xba\xbe" (6 bytes)
+/// - Offset 6-7: Version (big-endian u16, 1 for LUKS1, 2 for LUKS2)
+///
+/// LUKS doesn't have a virtual size in the header - the encrypted container
+/// size is determined by the underlying block device.
+fn parse_luks_header(buffer: &[u8], result: &mut InfoResult) {
+    // Ensure buffer is large enough for LUKS header (at least 8 bytes)
+    if buffer.len() < 8 {
+        return;
+    }
+
+    // Version (big-endian u16 at offset 6)
+    result.version =
+        u16::from_be_bytes([buffer[LUKS_VERSION_OFFSET], buffer[LUKS_VERSION_OFFSET + 1]]) as u32;
+
+    // Mark as encrypted
+    result.flags |= InfoResult::FLAG_ENCRYPTED;
 }
 
 /// Parse a hex value from ASCII bytes (without 0x prefix)
