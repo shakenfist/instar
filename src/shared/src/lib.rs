@@ -463,6 +463,8 @@ pub enum ImageFormat {
     Qcow1 = 7,
     /// VDI format (VirtualBox, magic: 0xbeda107f at offset 64)
     Vdi = 8,
+    /// QED format (deprecated QEMU format, magic: 0x00444551 "QED\0")
+    Qed = 9,
 }
 
 impl ImageFormat {
@@ -477,6 +479,7 @@ impl ImageFormat {
             6 => ImageFormat::Vhdx,
             7 => ImageFormat::Qcow1,
             8 => ImageFormat::Vdi,
+            9 => ImageFormat::Qed,
             _ => ImageFormat::Unknown,
         }
     }
@@ -493,6 +496,7 @@ impl ImageFormat {
             ImageFormat::Vhdx => "vhdx",
             ImageFormat::Qcow1 => "qcow1",
             ImageFormat::Vdi => "vdi",
+            ImageFormat::Qed => "qed",
         }
     }
 }
