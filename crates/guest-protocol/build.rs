@@ -37,6 +37,12 @@ fn main() {
         micropb_gen::Config::new().max_bytes(1024),
     );
 
+    // Configure UUID field for VDI (36 characters: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+    generator.configure(
+        ".guest.VdiInfo.uuid",
+        micropb_gen::Config::new().max_bytes(48),
+    );
+
     // Generate the Rust module
     generator
         .compile_protos(&[proto_file], out_dir.join("guest.rs"))
