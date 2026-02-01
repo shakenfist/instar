@@ -20,13 +20,13 @@ use core::panic::PanicInfo;
 use core::ptr::write_volatile;
 
 use shared::{
-    CallTable, Qcow2Info, VmdkInfo, CALL_TABLE_ADDR, OPERATION_CONFIG_ADDR,
+    CallTable, Qcow2Info, VdiInfo, VmdkInfo, CALL_TABLE_ADDR, OPERATION_CONFIG_ADDR,
     OPERATION_CONFIG_MAX_SIZE, OPERATION_LOAD_ADDR,
 };
 
 use crate::serial::{
     debug_print, read_config, send_complete, send_error, send_info_result, send_info_result_qcow2,
-    send_info_result_vmdk, send_init, send_progress, DeviceConfig,
+    send_info_result_vdi, send_info_result_vmdk, send_init, send_progress, DeviceConfig,
 };
 use crate::virtio::VirtioBlock;
 
@@ -179,6 +179,7 @@ fn setup_call_table() {
         send_info_result: ct_send_info_result,
         send_info_result_qcow2: ct_send_info_result_qcow2,
         send_info_result_vmdk: ct_send_info_result_vmdk,
+        send_info_result_vdi: ct_send_info_result_vdi,
     };
 
     unsafe {
@@ -387,6 +388,43 @@ unsafe extern "C" fn ct_send_info_result_vmdk(
         backing_str,
         external_str,
         &vmdk_data,
+    );
+}
+
+/// Send info result message with VDI-specific information.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn ct_send_info_result_vdi(
+    format: *const u8,
+    version: u32,
+    virtual_size: u64,
+    actual_size: u64,
+    cluster_size: u32,
+    flags: u32,
+    backing_file: *const u8,
+    external_data_file: *const u8,
+    vdi_info: *const VdiInfo,
+) {
+    let format_str = cstr_to_str(format);
+    let backing_str = cstr_to_str(backing_file);
+    let external_str = cstr_to_str(external_data_file);
+
+    // Use default if null pointer
+    let vdi_data = if vdi_info.is_null() {
+        VdiInfo::new()
+    } else {
+        *vdi_info
+    };
+
+    send_info_result_vdi(
+        format_str,
+        version,
+        virtual_size,
+        actual_size,
+        cluster_size,
+        flags,
+        backing_str,
+        external_str,
+        &vdi_data,
     );
 }
 

@@ -86,9 +86,18 @@ message VmdkInfo {
   string create_type = 3;
 }
 
+// VDI (VirtualBox) format-specific information
+message VdiInfo {
+  uint32 image_type = 1;        // 1=dynamic, 2=fixed
+  uint32 block_size = 2;        // Block size in bytes
+  uint32 blocks_in_image = 3;   // Total number of blocks
+  uint32 blocks_allocated = 4;  // Number of allocated blocks
+  string uuid = 5;              // Image UUID
+}
+
 // Image format detection result (from info operation)
 message InfoResultMessage {
-  // Detected format: "unknown", "raw", "qcow2", "vmdk", "vmdk3", "vhd", "vhdx", "qcow1"
+  // Detected format: "unknown", "raw", "qcow2", "vmdk", "vmdk3", "vhd", "vhdx", "qcow1", "vdi"
   string format = 1;
   // Format version (e.g., 2 or 3 for QCOW2)
   uint32 version = 2;
@@ -114,6 +123,7 @@ message InfoResultMessage {
   // Format-specific information (optional)
   Qcow2Info qcow2_info = 9;
   VmdkInfo vmdk_info = 10;
+  VdiInfo vdi_info = 11;
 }
 
 // Main message wrapper with level and payload

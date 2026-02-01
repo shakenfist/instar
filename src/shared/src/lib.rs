@@ -136,6 +136,22 @@ pub struct CallTable {
         *const u8,       // external_data_file
         *const VmdkInfo, // vmdk_info
     ),
+
+    /// Send info result message with VDI-specific information.
+    /// Args: format (null-terminated), version, virtual_size, actual_size,
+    ///       cluster_size, flags, backing_file (null-terminated),
+    ///       external_data_file (null-terminated), vdi_info pointer
+    pub send_info_result_vdi: unsafe extern "C" fn(
+        *const u8,      // format
+        u32,            // version
+        u64,            // virtual_size
+        u64,            // actual_size
+        u32,            // cluster_size
+        u32,            // flags
+        *const u8,      // backing_file
+        *const u8,      // external_data_file
+        *const VdiInfo, // vdi_info
+    ),
 }
 
 /// Backing format type for QCOW2 header extension
@@ -316,12 +332,50 @@ impl VmdkInfo {
     }
 }
 
+/// VDI format-specific information (FFI-safe).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct VdiInfo {
+    /// Image type: 1 = dynamic, 2 = fixed (normal)
+    pub image_type: u32,
+    /// Block size in bytes (typically 1 MiB)
+    pub block_size: u32,
+    /// Total number of blocks in the image
+    pub blocks_in_image: u32,
+    /// Number of blocks currently allocated
+    pub blocks_allocated: u32,
+    /// UUID of the image (16 bytes)
+    pub uuid: [u8; 16],
+}
+
+impl VdiInfo {
+    /// Create new VDI info with defaults
+    pub const fn new() -> Self {
+        Self {
+            image_type: 0,
+            block_size: 0,
+            blocks_in_image: 0,
+            blocks_allocated: 0,
+            uuid: [0; 16],
+        }
+    }
+
+    /// Get image type as a string
+    pub fn image_type_str(&self) -> &'static str {
+        match self.image_type {
+            1 => "dynamic",
+            2 => "fixed",
+            _ => "unknown",
+        }
+    }
+}
+
 impl CallTable {
     /// Magic value indicating a valid call table
     pub const MAGIC: u32 = 0x494D4147; // "IMAG"
 
-    /// Current ABI version (bumped for send_info_result_vmdk addition)
-    pub const VERSION: u32 = 5;
+    /// Current ABI version (bumped for send_info_result_vdi addition)
+    pub const VERSION: u32 = 6;
 }
 
 // ============================================================================
@@ -407,6 +461,8 @@ pub enum ImageFormat {
     Vhdx = 6,
     /// QCOW version 1 (magic: 0x514649)
     Qcow1 = 7,
+    /// VDI format (VirtualBox, magic: 0xbeda107f at offset 64)
+    Vdi = 8,
 }
 
 impl ImageFormat {
@@ -420,6 +476,7 @@ impl ImageFormat {
             5 => ImageFormat::Vhd,
             6 => ImageFormat::Vhdx,
             7 => ImageFormat::Qcow1,
+            8 => ImageFormat::Vdi,
             _ => ImageFormat::Unknown,
         }
     }
@@ -435,6 +492,7 @@ impl ImageFormat {
             ImageFormat::Vhd => "vhd",
             ImageFormat::Vhdx => "vhdx",
             ImageFormat::Qcow1 => "qcow1",
+            ImageFormat::Vdi => "vdi",
         }
     }
 }

@@ -109,6 +109,8 @@ const IMAGE_FORMAT_VHD: u32 = 5;
 const IMAGE_FORMAT_VHDX: u32 = 6;
 #[allow(dead_code)]
 const IMAGE_FORMAT_QCOW1: u32 = 7;
+#[allow(dead_code)]
+const IMAGE_FORMAT_VDI: u32 = 8;
 
 // Stack: generous allocation for complex operations like qemu-img info
 // Place at 16MB with 4MB size to handle deep call stacks
@@ -585,6 +587,24 @@ fn print_info_result(
             println!();
         }
 
+        // Format specific information (VDI)
+        if info.format == "vdi" {
+            println!("Format specific information:");
+            // Image type: 1=dynamic, 2=fixed
+            let image_type_str = match info.vdi_info.image_type {
+                1 => "dynamic",
+                2 => "fixed",
+                _ => "unknown",
+            };
+            println!("    image type: {}", image_type_str);
+            println!("    block size: {}", info.vdi_info.block_size);
+            println!("    blocks in image: {}", info.vdi_info.blocks_in_image);
+            println!("    blocks allocated: {}", info.vdi_info.blocks_allocated);
+            if !info.vdi_info.uuid.is_empty() {
+                println!("    uuid: {}", info.vdi_info.uuid.as_str());
+            }
+        }
+
         // Child node '/file' section (qemu-img 8.0+)
         // This section exposes information about the underlying protocol layer.
         if profile.include_child_node {
@@ -758,6 +778,32 @@ fn print_info_result_json(
         println!("                    \"format\": \"\"");
         println!("                }}");
         println!("            ]");
+        println!("        }}");
+        println!("    }},");
+    } else if info.format == "vdi" {
+        println!("    \"format-specific\": {{");
+        println!("        \"type\": \"vdi\",");
+        println!("        \"data\": {{");
+        // Image type: 1=dynamic, 2=fixed
+        let image_type_str = match info.vdi_info.image_type {
+            1 => "dynamic",
+            2 => "fixed",
+            _ => "unknown",
+        };
+        println!("            \"image-type\": \"{}\",", image_type_str);
+        println!("            \"block-size\": {},", info.vdi_info.block_size);
+        println!(
+            "            \"blocks-in-image\": {},",
+            info.vdi_info.blocks_in_image
+        );
+        println!(
+            "            \"blocks-allocated\": {},",
+            info.vdi_info.blocks_allocated
+        );
+        println!(
+            "            \"uuid\": \"{}\"",
+            escape_json_string(info.vdi_info.uuid.as_str())
+        );
         println!("        }}");
         println!("    }},");
     }
