@@ -109,6 +109,14 @@ const IMAGE_FORMAT_VHD: u32 = 5;
 const IMAGE_FORMAT_VHDX: u32 = 6;
 #[allow(dead_code)]
 const IMAGE_FORMAT_QCOW1: u32 = 7;
+#[allow(dead_code)]
+const IMAGE_FORMAT_VDI: u32 = 8;
+#[allow(dead_code)]
+const IMAGE_FORMAT_QED: u32 = 9;
+#[allow(dead_code)]
+const IMAGE_FORMAT_ISO: u32 = 10;
+#[allow(dead_code)]
+const IMAGE_FORMAT_LUKS: u32 = 11;
 
 // Stack: generous allocation for complex operations like qemu-img info
 // Place at 16MB with 4MB size to handle deep call stacks
@@ -484,6 +492,12 @@ fn print_info_result(
             println!("cluster_size: {}", info.cluster_size);
         }
 
+        // QCOW2: "cleanly shut down: no" if dirty bit is set
+        // This output was added in qemu-img 6.1 (not present in 6.0)
+        if profile.include_dirty_flag && info.format == "qcow2" && info.qcow2_info.dirty {
+            println!("cleanly shut down: no");
+        }
+
         // Backing file (if present) - comes before Format specific information
         if info.flags & (1 << 0) != 0 && !info.backing_file.is_empty() {
             let backing_file_str = info.backing_file.as_str();
@@ -577,6 +591,24 @@ fn print_info_result(
             // qemu-img outputs "format: " with trailing space for empty format
             print!("            format: ");
             println!();
+        }
+
+        // Format specific information (VDI)
+        if info.format == "vdi" {
+            println!("Format specific information:");
+            // Image type: 1=dynamic, 2=fixed
+            let image_type_str = match info.vdi_info.image_type {
+                1 => "dynamic",
+                2 => "fixed",
+                _ => "unknown",
+            };
+            println!("    image type: {}", image_type_str);
+            println!("    block size: {}", info.vdi_info.block_size);
+            println!("    blocks in image: {}", info.vdi_info.blocks_in_image);
+            println!("    blocks allocated: {}", info.vdi_info.blocks_allocated);
+            if !info.vdi_info.uuid.is_empty() {
+                println!("    uuid: {}", info.vdi_info.uuid.as_str());
+            }
         }
 
         // Child node '/file' section (qemu-img 8.0+)
@@ -754,6 +786,32 @@ fn print_info_result_json(
         println!("            ]");
         println!("        }}");
         println!("    }},");
+    } else if info.format == "vdi" {
+        println!("    \"format-specific\": {{");
+        println!("        \"type\": \"vdi\",");
+        println!("        \"data\": {{");
+        // Image type: 1=dynamic, 2=fixed
+        let image_type_str = match info.vdi_info.image_type {
+            1 => "dynamic",
+            2 => "fixed",
+            _ => "unknown",
+        };
+        println!("            \"image-type\": \"{}\",", image_type_str);
+        println!("            \"block-size\": {},", info.vdi_info.block_size);
+        println!(
+            "            \"blocks-in-image\": {},",
+            info.vdi_info.blocks_in_image
+        );
+        println!(
+            "            \"blocks-allocated\": {},",
+            info.vdi_info.blocks_allocated
+        );
+        println!(
+            "            \"uuid\": \"{}\"",
+            escape_json_string(info.vdi_info.uuid.as_str())
+        );
+        println!("        }}");
+        println!("    }},");
     }
 
     // Backing file paths (if present)
@@ -783,7 +841,16 @@ fn print_info_result_json(
         );
     }
 
-    println!("    \"dirty-flag\": false");
+    // For QCOW2, use the dirty flag from the image header
+    // For other formats, always report false
+    // Note: dirty-flag output was added in qemu-img 6.1; for 6.0 compatibility,
+    // always report false when profile.include_dirty_flag is false
+    let dirty_flag = if profile.include_dirty_flag && info.format == "qcow2" {
+        info.qcow2_info.dirty
+    } else {
+        false
+    };
+    println!("    \"dirty-flag\": {}", dirty_flag);
     println!("}}");
 }
 

@@ -246,6 +246,7 @@ pub fn send_info_result_qcow2(
         compression_type: qcow2_info.compression_type_str(),
         lazy_refcounts: qcow2_info.lazy_refcounts,
         refcount_bits: qcow2_info.refcount_bits,
+        dirty: qcow2_info.dirty,
         corrupt: qcow2_info.corrupt,
         extended_l2: qcow2_info.extended_l2,
         backing_format: qcow2_info.backing_format_str(),
@@ -294,6 +295,104 @@ pub fn send_info_result_vmdk(
         backing_file,
         external_data_file,
         &vmdk_data,
+    );
+    send_message(&msg);
+}
+
+/// Format a UUID as a string (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+fn format_uuid(uuid: &[u8; 16]) -> [u8; 36] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 36];
+
+    // VDI uses little-endian UUID format (time_low, time_mid, time_hi are LE)
+    // Format: time_low (4 bytes LE) - time_mid (2 bytes LE) - time_hi (2 bytes LE)
+    //         - clock_seq (2 bytes BE) - node (6 bytes BE)
+
+    // time_low (bytes 0-3, little-endian)
+    buf[0] = HEX[(uuid[3] >> 4) as usize];
+    buf[1] = HEX[(uuid[3] & 0xf) as usize];
+    buf[2] = HEX[(uuid[2] >> 4) as usize];
+    buf[3] = HEX[(uuid[2] & 0xf) as usize];
+    buf[4] = HEX[(uuid[1] >> 4) as usize];
+    buf[5] = HEX[(uuid[1] & 0xf) as usize];
+    buf[6] = HEX[(uuid[0] >> 4) as usize];
+    buf[7] = HEX[(uuid[0] & 0xf) as usize];
+    buf[8] = b'-';
+
+    // time_mid (bytes 4-5, little-endian)
+    buf[9] = HEX[(uuid[5] >> 4) as usize];
+    buf[10] = HEX[(uuid[5] & 0xf) as usize];
+    buf[11] = HEX[(uuid[4] >> 4) as usize];
+    buf[12] = HEX[(uuid[4] & 0xf) as usize];
+    buf[13] = b'-';
+
+    // time_hi_and_version (bytes 6-7, little-endian)
+    buf[14] = HEX[(uuid[7] >> 4) as usize];
+    buf[15] = HEX[(uuid[7] & 0xf) as usize];
+    buf[16] = HEX[(uuid[6] >> 4) as usize];
+    buf[17] = HEX[(uuid[6] & 0xf) as usize];
+    buf[18] = b'-';
+
+    // clock_seq_hi_and_reserved, clock_seq_low (bytes 8-9, big-endian)
+    buf[19] = HEX[(uuid[8] >> 4) as usize];
+    buf[20] = HEX[(uuid[8] & 0xf) as usize];
+    buf[21] = HEX[(uuid[9] >> 4) as usize];
+    buf[22] = HEX[(uuid[9] & 0xf) as usize];
+    buf[23] = b'-';
+
+    // node (bytes 10-15, big-endian)
+    buf[24] = HEX[(uuid[10] >> 4) as usize];
+    buf[25] = HEX[(uuid[10] & 0xf) as usize];
+    buf[26] = HEX[(uuid[11] >> 4) as usize];
+    buf[27] = HEX[(uuid[11] & 0xf) as usize];
+    buf[28] = HEX[(uuid[12] >> 4) as usize];
+    buf[29] = HEX[(uuid[12] & 0xf) as usize];
+    buf[30] = HEX[(uuid[13] >> 4) as usize];
+    buf[31] = HEX[(uuid[13] & 0xf) as usize];
+    buf[32] = HEX[(uuid[14] >> 4) as usize];
+    buf[33] = HEX[(uuid[14] & 0xf) as usize];
+    buf[34] = HEX[(uuid[15] >> 4) as usize];
+    buf[35] = HEX[(uuid[15] & 0xf) as usize];
+
+    buf
+}
+
+/// Send an info result message with VDI-specific information
+#[allow(clippy::too_many_arguments)]
+pub fn send_info_result_vdi(
+    format: &str,
+    version: u32,
+    virtual_size: u64,
+    actual_size: u64,
+    cluster_size: u32,
+    flags: u32,
+    backing_file: &str,
+    external_data_file: &str,
+    vdi_info: &shared::VdiInfo,
+) {
+    // Format UUID as string
+    let uuid_bytes = format_uuid(&vdi_info.uuid);
+    // Safety: uuid_bytes contains only ASCII hex digits and dashes
+    let uuid_str = unsafe { core::str::from_utf8_unchecked(&uuid_bytes) };
+
+    let vdi_data = guest_protocol::VdiInfoData {
+        image_type: vdi_info.image_type,
+        block_size: vdi_info.block_size,
+        blocks_in_image: vdi_info.blocks_in_image,
+        blocks_allocated: vdi_info.blocks_allocated,
+        uuid: uuid_str,
+    };
+
+    let msg = guest_protocol::info_result_message_with_vdi(
+        format,
+        version,
+        virtual_size,
+        actual_size,
+        cluster_size,
+        flags,
+        backing_file,
+        external_data_file,
+        &vdi_data,
     );
     send_message(&msg);
 }

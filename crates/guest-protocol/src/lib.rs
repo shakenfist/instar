@@ -102,6 +102,16 @@ fn push_str(dest: &mut heapless::String<32>, src: &str) {
     }
 }
 
+/// Helper to push a string into a 48-char heapless String (for UUID: 36 chars).
+fn push_str_48(dest: &mut heapless::String<48>, src: &str) {
+    dest.clear();
+    for c in src.chars() {
+        if dest.push(c).is_err() {
+            break;
+        }
+    }
+}
+
 /// Helper to create an info-level init message.
 pub fn init_message(stage: &str, device: &str, address: u64) -> guest_::GuestMessage {
     let mut msg = guest_::GuestMessage::default();
@@ -245,6 +255,8 @@ pub struct Qcow2InfoData {
     pub lazy_refcounts: bool,
     /// Number of refcount bits (typically 16)
     pub refcount_bits: u32,
+    /// Whether the image is marked dirty (not cleanly closed)
+    pub dirty: bool,
     /// Whether the image is marked corrupt
     pub corrupt: bool,
     /// Whether extended L2 entries are used
@@ -287,6 +299,7 @@ pub fn info_result_message_with_qcow2(
     );
     info.qcow2_info.lazy_refcounts = qcow2_info.lazy_refcounts;
     info.qcow2_info.refcount_bits = qcow2_info.refcount_bits;
+    info.qcow2_info.dirty = qcow2_info.dirty;
     info.qcow2_info.corrupt = qcow2_info.corrupt;
     info.qcow2_info.extended_l2 = qcow2_info.extended_l2;
     push_str(
@@ -344,6 +357,60 @@ pub fn info_result_message_with_vmdk(
 
     // Mark vmdk_info as present so the encoder includes it
     info._has.set_vmdk_info();
+
+    msg.payload = Some(guest_::GuestMessage_::Payload::InfoResult(info));
+    msg
+}
+
+/// VDI format-specific information for info_result_message_with_vdi.
+pub struct VdiInfoData<'a> {
+    /// Image type (1=dynamic, 2=fixed)
+    pub image_type: u32,
+    /// Block size in bytes
+    pub block_size: u32,
+    /// Total number of blocks in the image
+    pub blocks_in_image: u32,
+    /// Number of blocks currently allocated
+    pub blocks_allocated: u32,
+    /// Image UUID as a formatted string
+    pub uuid: &'a str,
+}
+
+/// Helper to create an info result message with VDI-specific information.
+#[allow(clippy::too_many_arguments)]
+pub fn info_result_message_with_vdi(
+    format: &str,
+    version: u32,
+    virtual_size: u64,
+    actual_size: u64,
+    cluster_size: u32,
+    flags: u32,
+    backing_file: &str,
+    external_data_file: &str,
+    vdi_info: &VdiInfoData,
+) -> guest_::GuestMessage {
+    let mut msg = guest_::GuestMessage::default();
+    msg.level = guest_::Level::Info;
+
+    let mut info = guest_::InfoResultMessage::default();
+    push_str(&mut info.format, format);
+    info.version = version;
+    info.virtual_size = virtual_size;
+    info.actual_size = actual_size;
+    info.cluster_size = cluster_size;
+    info.flags = flags;
+    push_str_1024(&mut info.backing_file, backing_file);
+    push_str_1024(&mut info.external_data_file, external_data_file);
+
+    // Set VDI-specific information
+    info.vdi_info.image_type = vdi_info.image_type;
+    info.vdi_info.block_size = vdi_info.block_size;
+    info.vdi_info.blocks_in_image = vdi_info.blocks_in_image;
+    info.vdi_info.blocks_allocated = vdi_info.blocks_allocated;
+    push_str_48(&mut info.vdi_info.uuid, vdi_info.uuid);
+
+    // Mark vdi_info as present so the encoder includes it
+    info._has.set_vdi_info();
 
     msg.payload = Some(guest_::GuestMessage_::Payload::InfoResult(info));
     msg

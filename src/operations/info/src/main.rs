@@ -10,7 +10,7 @@
 use core::panic::PanicInfo;
 
 use shared::{
-    CallTable, ImageFormat, InfoConfig, InfoResult, Qcow2Info, VmdkInfo, CALL_TABLE_ADDR,
+    CallTable, ImageFormat, InfoConfig, InfoResult, Qcow2Info, VdiInfo, VmdkInfo, CALL_TABLE_ADDR,
     MAX_SECTOR_SIZE,
 };
 
@@ -20,6 +20,7 @@ const QCOW1_MAGIC: u32 = 0x514649; // "QFI" (big-endian at offset 0, 3 bytes)
 const VMDK4_MAGIC: u32 = 0x564d444b; // "VMDK" (little-endian at offset 0)
 const VMDK3_MAGIC: u32 = 0x434f5744; // "COWD" (little-endian at offset 0)
 const VHD_COOKIE: u64 = 0x636f6e6563746978; // "conectix" (big-endian at footer offset 0)
+const VDI_MAGIC: u32 = 0xbeda107f; // VDI signature (little-endian at offset 64)
 
 // VHD footer offsets (big-endian)
 const VHD_FOOTER_CREATOR_APP_OFFSET: usize = 28; // Creator application (4 bytes ASCII)
@@ -108,6 +109,39 @@ const VHDX_METADATA_ITEM_OFFSET: u64 = 0x10000; // File Parameters start here
                                                 // - Offset 0: Block Size (4 bytes LE)
                                                 // - Offset 8: Virtual Disk Size (8 bytes LE)
 
+// VDI header offsets (all little-endian)
+const VDI_SIGNATURE_OFFSET: usize = 64; // Magic signature
+const VDI_VERSION_OFFSET: usize = 68; // Version (1.1 = 0x00010001)
+const VDI_HEADER_SIZE_OFFSET: usize = 72; // Size of header
+const VDI_IMAGE_TYPE_OFFSET: usize = 76; // 1=dynamic, 2=fixed
+const VDI_DISK_SIZE_OFFSET: usize = 368; // Virtual disk size in bytes (u64)
+const VDI_BLOCK_SIZE_OFFSET: usize = 376; // Block size in bytes (u32)
+const VDI_BLOCKS_IN_IMAGE_OFFSET: usize = 384; // Total blocks (u32)
+const VDI_BLOCKS_ALLOCATED_OFFSET: usize = 388; // Allocated blocks (u32)
+const VDI_UUID_OFFSET: usize = 392; // UUID (16 bytes)
+
+// QED format constants (deprecated QEMU format, all little-endian)
+const QED_MAGIC: u32 = 0x00444551; // "QED\0" at offset 0
+const QED_CLUSTER_SIZE_OFFSET: usize = 4; // Cluster size in bytes (u32)
+const QED_TABLE_SIZE_OFFSET: usize = 8; // L1/L2 table size in clusters (u32)
+const QED_HEADER_SIZE_OFFSET: usize = 12; // Header size in bytes (u32)
+const QED_IMAGE_SIZE_OFFSET: usize = 48; // Virtual size in bytes (u64)
+const QED_BACKING_FILENAME_OFFSET_OFFSET: usize = 56; // Backing filename offset (u32)
+const QED_BACKING_FILENAME_SIZE_OFFSET: usize = 60; // Backing filename size (u32)
+
+// ISO 9660 format constants
+// ISO 9660 Primary Volume Descriptor starts at byte offset 32768 (sector 16 for 2048-byte CD sectors)
+// Byte 0: Volume Descriptor Type (1 = Primary)
+// Bytes 1-5: "CD001" standard identifier
+const ISO_MAGIC_BYTE_OFFSET: usize = 32769; // Absolute byte offset of "CD001" (32768 + 1)
+const ISO_MAGIC: &[u8; 5] = b"CD001"; // ISO 9660 standard identifier
+
+// LUKS format constants (Linux encrypted container)
+// LUKS magic is "LUKS\xba\xbe" (6 bytes) at offset 0
+// Version is big-endian u16 at offset 6 (1 for LUKS1, 2 for LUKS2)
+const LUKS_MAGIC: [u8; 6] = [0x4c, 0x55, 0x4b, 0x53, 0xba, 0xbe]; // "LUKS\xba\xbe"
+const LUKS_VERSION_OFFSET: usize = 6; // Version (big-endian u16)
+
 /// Entry point called by core after devices are initialized.
 ///
 /// Returns the number of bytes read.
@@ -179,12 +213,39 @@ pub unsafe extern "C" fn _start() -> u64 {
         }
     }
 
+    // Check if unsafe quirks mode is enabled (qemu-img compatible but insecure)
+    let unsafe_quirks = config.is_valid() && config.unsafe_quirks_enabled();
+
+    // If still no format detected, try ISO 9660 detection (magic at byte offset 32769)
+    // Note: qemu-img treats ISO as "raw", so we only detect ISO in safe mode.
+    // With --unsafe-quirks, ISO files will be reported as "raw" for qemu-img compatibility.
+    if format == ImageFormat::Raw && !unsafe_quirks {
+        (call_table.debug_print)(b"info: checking ISO 9660\n\0".as_ptr());
+        // ISO magic is at byte offset 32769 ("CD001" at 32768+1)
+        // Check if the magic is already in our first sector buffer
+        if input_sector_size >= ISO_MAGIC_BYTE_OFFSET + 5 {
+            // Large sector size: magic is in first sector
+            format = detect_iso_at_offset(&buffer, ISO_MAGIC_BYTE_OFFSET);
+        } else {
+            // Small sector size: need to read the sector containing the magic
+            let iso_sector = ISO_MAGIC_BYTE_OFFSET as u64 / input_sector_size as u64;
+            let offset_in_sector = ISO_MAGIC_BYTE_OFFSET % input_sector_size;
+            if input_capacity > iso_sector {
+                if (call_table.read_input_sector)(
+                    iso_sector,
+                    footer_buffer.as_mut_ptr(),
+                    input_sector_size,
+                ) {
+                    format = detect_iso_at_offset(&footer_buffer, offset_in_sector);
+                }
+            }
+        }
+    }
+
     // For RAW format: validate partition table unless unsafe quirks is enabled.
     // This prevents arbitrary files (like /etc/passwd) from being accepted as
     // valid disk images, which is the root cause of backing file disclosure attacks.
     if format == ImageFormat::Raw {
-        let unsafe_quirks = config.is_valid() && config.unsafe_quirks_enabled();
-
         if !unsafe_quirks {
             // Check for valid partition table
             let partition_type = detect_partition_table(&buffer);
@@ -237,6 +298,7 @@ pub unsafe extern "C" fn _start() -> u64 {
     // Format-specific information structures
     let mut qcow2_info = Qcow2Info::new();
     let mut vmdk_info = VmdkInfo::new();
+    let mut vdi_info = VdiInfo::new();
 
     // Buffer for backing file path (null-terminated)
     let mut backing_file_buf = [0u8; MAX_BACKING_FILE_LEN + 1];
@@ -278,6 +340,15 @@ pub unsafe extern "C" fn _start() -> u64 {
                 // VHDX requires reading metadata from specific regions
                 parse_vhdx_metadata(&mut result, actual_size, call_table);
             }
+            ImageFormat::Vdi => {
+                parse_vdi_header(&buffer, &mut result, &mut vdi_info);
+            }
+            ImageFormat::Qed => {
+                parse_qed_header(&buffer, &mut result);
+            }
+            ImageFormat::Luks => {
+                parse_luks_header(&buffer, &mut result);
+            }
             _ => {
                 // For raw and unknown formats, virtual size = actual size
                 result.virtual_size = actual_size;
@@ -314,6 +385,18 @@ pub unsafe extern "C" fn _start() -> u64 {
             b"\0".as_ptr(), // external_data_file (empty for now)
             &vmdk_info,
         );
+    } else if format == ImageFormat::Vdi {
+        (call_table.send_info_result_vdi)(
+            format_str,
+            result.version,
+            result.virtual_size,
+            result.actual_size,
+            result.cluster_size,
+            result.flags,
+            b"\0".as_ptr(), // backing_file (empty for now)
+            b"\0".as_ptr(), // external_data_file (empty for now)
+            &vdi_info,
+        );
     } else {
         (call_table.send_info_result)(
             format_str,
@@ -344,6 +427,10 @@ fn format_to_str(format: ImageFormat) -> *const u8 {
         ImageFormat::Vmdk3 => b"vmdk3\0".as_ptr(),
         ImageFormat::Vhd => b"vpc\0".as_ptr(), // qemu-img calls VHD format "vpc"
         ImageFormat::Vhdx => b"vhdx\0".as_ptr(),
+        ImageFormat::Vdi => b"vdi\0".as_ptr(),
+        ImageFormat::Qed => b"qed\0".as_ptr(),
+        ImageFormat::Iso => b"iso\0".as_ptr(),
+        ImageFormat::Luks => b"luks\0".as_ptr(),
     }
 }
 
@@ -372,6 +459,11 @@ fn detect_format_header(buffer: &[u8], len: usize) -> ImageFormat {
         return ImageFormat::Vmdk3;
     }
 
+    // Check QED magic (little-endian "QED\0")
+    if magic_le == QED_MAGIC {
+        return ImageFormat::Qed;
+    }
+
     // Check VHDX magic (little-endian, "vhdxfile" signature)
     let vhdx_sig = u64::from_le_bytes([
         buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
@@ -388,6 +480,25 @@ fn detect_format_header(buffer: &[u8], len: usize) -> ImageFormat {
     ]);
     if vhd_cookie == VHD_COOKIE {
         return ImageFormat::Vhd;
+    }
+
+    // Check VDI magic at offset 64 (little-endian)
+    // VDI header starts with text signature, magic is at offset 64
+    if len >= VDI_SIGNATURE_OFFSET + 4 {
+        let vdi_magic = u32::from_le_bytes([
+            buffer[VDI_SIGNATURE_OFFSET],
+            buffer[VDI_SIGNATURE_OFFSET + 1],
+            buffer[VDI_SIGNATURE_OFFSET + 2],
+            buffer[VDI_SIGNATURE_OFFSET + 3],
+        ]);
+        if vdi_magic == VDI_MAGIC {
+            return ImageFormat::Vdi;
+        }
+    }
+
+    // Check LUKS magic at offset 0 (6 bytes: "LUKS\xba\xbe")
+    if len >= 6 && buffer[0..6] == LUKS_MAGIC {
+        return ImageFormat::Luks;
     }
 
     // Fixed VHD has its signature only at the end, handled separately
@@ -408,6 +519,29 @@ fn detect_vhd_footer(buffer: &[u8]) -> ImageFormat {
 
     if cookie == VHD_COOKIE {
         return ImageFormat::Vhd;
+    }
+
+    ImageFormat::Raw
+}
+
+/// Detect ISO 9660 format from buffer at the given offset
+///
+/// ISO 9660 format has the Primary Volume Descriptor at byte offset 32768.
+/// The structure is:
+/// - Byte 0: Volume Descriptor Type (1 = Primary Volume Descriptor)
+/// - Bytes 1-5: Standard Identifier "CD001"
+/// - Byte 6: Version (1)
+///
+/// The offset parameter should point to byte 32769 (where "CD001" starts).
+fn detect_iso_at_offset(buffer: &[u8], offset: usize) -> ImageFormat {
+    // Need at least offset + 5 bytes to check "CD001" magic
+    if buffer.len() < offset + 5 {
+        return ImageFormat::Raw;
+    }
+
+    // Check for "CD001" at the given offset
+    if buffer[offset..offset + 5] == *ISO_MAGIC {
+        return ImageFormat::Iso;
     }
 
     ImageFormat::Raw
@@ -907,6 +1041,7 @@ unsafe fn parse_qcow2_header(
 
         if (incompat & QCOW2_INCOMPAT_DIRTY) != 0 {
             result.flags |= InfoResult::FLAG_DIRTY;
+            qcow2_info.dirty = true;
         }
         if (incompat & QCOW2_INCOMPAT_CORRUPT) != 0 {
             result.flags |= InfoResult::FLAG_CORRUPT;
@@ -1127,6 +1262,164 @@ fn parse_vmdk_descriptor(buffer: &[u8], len: usize, vmdk_info: &mut VmdkInfo) {
 
         pos = line_end + 1;
     }
+}
+
+/// Parse VDI header and populate result and VDI-specific info
+///
+/// VDI header structure (all little-endian):
+/// - Offset 0-63: Text signature ("<<< Oracle VM VirtualBox Disk Image >>>\n")
+/// - Offset 64-67: Magic signature (0xbeda107f)
+/// - Offset 68-71: Version (0x00010001 for 1.1)
+/// - Offset 72-75: Header size
+/// - Offset 76-79: Image type (1=dynamic, 2=fixed)
+/// - Offset 368-375: Virtual disk size in bytes
+/// - Offset 376-379: Block size in bytes
+/// - Offset 384-387: Total blocks
+/// - Offset 388-391: Allocated blocks
+/// - Offset 392-407: UUID (16 bytes)
+fn parse_vdi_header(buffer: &[u8], result: &mut InfoResult, vdi_info: &mut VdiInfo) {
+    // Ensure buffer is large enough for VDI header (at least 408 bytes for UUID end)
+    if buffer.len() < VDI_UUID_OFFSET + 16 {
+        return;
+    }
+
+    // Version (little-endian u32 at offset 68)
+    let version = u32::from_le_bytes([
+        buffer[VDI_VERSION_OFFSET],
+        buffer[VDI_VERSION_OFFSET + 1],
+        buffer[VDI_VERSION_OFFSET + 2],
+        buffer[VDI_VERSION_OFFSET + 3],
+    ]);
+    result.version = version;
+
+    // Image type (little-endian u32 at offset 76)
+    vdi_info.image_type = u32::from_le_bytes([
+        buffer[VDI_IMAGE_TYPE_OFFSET],
+        buffer[VDI_IMAGE_TYPE_OFFSET + 1],
+        buffer[VDI_IMAGE_TYPE_OFFSET + 2],
+        buffer[VDI_IMAGE_TYPE_OFFSET + 3],
+    ]);
+
+    // Virtual disk size (little-endian u64 at offset 368)
+    result.virtual_size = u64::from_le_bytes([
+        buffer[VDI_DISK_SIZE_OFFSET],
+        buffer[VDI_DISK_SIZE_OFFSET + 1],
+        buffer[VDI_DISK_SIZE_OFFSET + 2],
+        buffer[VDI_DISK_SIZE_OFFSET + 3],
+        buffer[VDI_DISK_SIZE_OFFSET + 4],
+        buffer[VDI_DISK_SIZE_OFFSET + 5],
+        buffer[VDI_DISK_SIZE_OFFSET + 6],
+        buffer[VDI_DISK_SIZE_OFFSET + 7],
+    ]);
+
+    // Block size (little-endian u32 at offset 376)
+    vdi_info.block_size = u32::from_le_bytes([
+        buffer[VDI_BLOCK_SIZE_OFFSET],
+        buffer[VDI_BLOCK_SIZE_OFFSET + 1],
+        buffer[VDI_BLOCK_SIZE_OFFSET + 2],
+        buffer[VDI_BLOCK_SIZE_OFFSET + 3],
+    ]);
+    // Use block_size as cluster_size for consistency with other formats
+    result.cluster_size = vdi_info.block_size;
+
+    // Blocks in image (little-endian u32 at offset 384)
+    vdi_info.blocks_in_image = u32::from_le_bytes([
+        buffer[VDI_BLOCKS_IN_IMAGE_OFFSET],
+        buffer[VDI_BLOCKS_IN_IMAGE_OFFSET + 1],
+        buffer[VDI_BLOCKS_IN_IMAGE_OFFSET + 2],
+        buffer[VDI_BLOCKS_IN_IMAGE_OFFSET + 3],
+    ]);
+
+    // Blocks allocated (little-endian u32 at offset 388)
+    vdi_info.blocks_allocated = u32::from_le_bytes([
+        buffer[VDI_BLOCKS_ALLOCATED_OFFSET],
+        buffer[VDI_BLOCKS_ALLOCATED_OFFSET + 1],
+        buffer[VDI_BLOCKS_ALLOCATED_OFFSET + 2],
+        buffer[VDI_BLOCKS_ALLOCATED_OFFSET + 3],
+    ]);
+
+    // UUID (16 bytes at offset 392)
+    vdi_info
+        .uuid
+        .copy_from_slice(&buffer[VDI_UUID_OFFSET..VDI_UUID_OFFSET + 16]);
+}
+
+/// Parse QED header and populate result
+///
+/// QED header structure (all little-endian):
+/// - Offset 0-3: Magic ("QED\0" = 0x00444551)
+/// - Offset 4-7: Cluster size in bytes
+/// - Offset 8-11: Table size (L1/L2) in clusters
+/// - Offset 12-15: Header size in bytes
+/// - Offset 48-55: Virtual disk size in bytes
+/// - Offset 56-59: Backing filename offset
+/// - Offset 60-63: Backing filename size
+fn parse_qed_header(buffer: &[u8], result: &mut InfoResult) {
+    // Ensure buffer is large enough for QED header (at least 64 bytes)
+    if buffer.len() < 64 {
+        return;
+    }
+
+    // Cluster size (little-endian u32 at offset 4)
+    result.cluster_size = u32::from_le_bytes([
+        buffer[QED_CLUSTER_SIZE_OFFSET],
+        buffer[QED_CLUSTER_SIZE_OFFSET + 1],
+        buffer[QED_CLUSTER_SIZE_OFFSET + 2],
+        buffer[QED_CLUSTER_SIZE_OFFSET + 3],
+    ]);
+
+    // Virtual disk size (little-endian u64 at offset 48)
+    result.virtual_size = u64::from_le_bytes([
+        buffer[QED_IMAGE_SIZE_OFFSET],
+        buffer[QED_IMAGE_SIZE_OFFSET + 1],
+        buffer[QED_IMAGE_SIZE_OFFSET + 2],
+        buffer[QED_IMAGE_SIZE_OFFSET + 3],
+        buffer[QED_IMAGE_SIZE_OFFSET + 4],
+        buffer[QED_IMAGE_SIZE_OFFSET + 5],
+        buffer[QED_IMAGE_SIZE_OFFSET + 6],
+        buffer[QED_IMAGE_SIZE_OFFSET + 7],
+    ]);
+
+    // Check for backing file (offset at 56, size at 60)
+    let backing_offset = u32::from_le_bytes([
+        buffer[QED_BACKING_FILENAME_OFFSET_OFFSET],
+        buffer[QED_BACKING_FILENAME_OFFSET_OFFSET + 1],
+        buffer[QED_BACKING_FILENAME_OFFSET_OFFSET + 2],
+        buffer[QED_BACKING_FILENAME_OFFSET_OFFSET + 3],
+    ]);
+    let backing_size = u32::from_le_bytes([
+        buffer[QED_BACKING_FILENAME_SIZE_OFFSET],
+        buffer[QED_BACKING_FILENAME_SIZE_OFFSET + 1],
+        buffer[QED_BACKING_FILENAME_SIZE_OFFSET + 2],
+        buffer[QED_BACKING_FILENAME_SIZE_OFFSET + 3],
+    ]);
+
+    // If backing file exists, set the flag
+    if backing_offset > 0 && backing_size > 0 {
+        result.flags |= InfoResult::FLAG_HAS_BACKING_FILE;
+    }
+}
+
+/// Parse LUKS header and populate result
+///
+/// LUKS header structure:
+/// - Offset 0-5: Magic "LUKS\xba\xbe" (6 bytes)
+/// - Offset 6-7: Version (big-endian u16, 1 for LUKS1, 2 for LUKS2)
+///
+/// LUKS doesn't have a virtual size in the header - the encrypted container
+/// size is determined by the underlying block device.
+fn parse_luks_header(buffer: &[u8], result: &mut InfoResult) {
+    // Ensure buffer is large enough for LUKS header (at least 8 bytes)
+    if buffer.len() < 8 {
+        return;
+    }
+
+    // Version (big-endian u16 at offset 6)
+    result.version =
+        u16::from_be_bytes([buffer[LUKS_VERSION_OFFSET], buffer[LUKS_VERSION_OFFSET + 1]]) as u32;
+
+    // Mark as encrypted
+    result.flags |= InfoResult::FLAG_ENCRYPTED;
 }
 
 /// Parse a hex value from ASCII bytes (without 0x prefix)
