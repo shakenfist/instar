@@ -598,6 +598,28 @@
             "description": "QCOW2 with corrupt bit set",
             "tags": ["qcow2", "corrupt", "feature-bit"],
             "sha256": "136842e4a4115436ab06f3c04ed9824c39e8e1a7ffaaac1f7dc9ad5de8a9268a"
+        },
+        {
+            "id": "luks-v1",
+            "path": "custom/format-coverage/luks-v1.luks",
+            "format": "luks",
+            "safety": "safe",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "description": "LUKS version 1 header for format detection testing",
+            "tags": ["luks", "luks1", "encrypted", "format-coverage"],
+            "sha256": "d13420d86afe0828d046430939647c46433231422b54979edc7c160e0e0f9244"
+        },
+        {
+            "id": "luks-v2",
+            "path": "custom/format-coverage/luks-v2.luks",
+            "format": "luks",
+            "safety": "safe",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "description": "LUKS version 2 header for format detection testing",
+            "tags": ["luks", "luks2", "encrypted", "format-coverage"],
+            "sha256": "0961fc4aaed74ca9acd9ac11430f2ffc00bc2b2696599a3e04325ff91e51ec26"
         }
     ]
 }
