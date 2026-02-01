@@ -63,17 +63,26 @@ pub struct OutputProfile {
     /// Include "Child node '/file'" section in human output and
     /// "children" array in JSON output. Added in qemu-img 8.0.
     pub include_child_node: bool,
+
+    /// Include dirty flag in output. When true, shows "cleanly shut down: no"
+    /// in human output and "dirty-flag": true in JSON output for dirty images.
+    /// Added in qemu-img 6.1. Before 6.1, dirty images were detected but the
+    /// flag was not exposed in the output.
+    pub include_dirty_flag: bool,
 }
 
 impl OutputProfile {
     /// Create a profile for a specific version.
     ///
     /// The profile features are determined by version thresholds:
+    /// - `include_dirty_flag`: true for version >= 6.1
     /// - `include_child_node`: true for major >= 8
     pub fn for_version(v: Version) -> Self {
         Self {
             version: Some(v),
             include_child_node: v.major >= 8,
+            // Dirty flag output was added in qemu-img 6.1
+            include_dirty_flag: v.major > 6 || (v.major == 6 && v.minor >= 1),
         }
     }
 
@@ -179,6 +188,20 @@ mod tests {
     }
 
     #[test]
+    fn test_profile_dirty_flag() {
+        // qemu-img 6.0 did not expose dirty flag in output
+        assert!(!OutputProfile::for_version(Version::new(6, 0)).include_dirty_flag);
+
+        // qemu-img 6.1+ exposes dirty flag in output
+        assert!(OutputProfile::for_version(Version::new(6, 1)).include_dirty_flag);
+        assert!(OutputProfile::for_version(Version::new(6, 2)).include_dirty_flag);
+        assert!(OutputProfile::for_version(Version::new(7, 0)).include_dirty_flag);
+        assert!(OutputProfile::for_version(Version::new(7, 2)).include_dirty_flag);
+        assert!(OutputProfile::for_version(Version::new(8, 0)).include_dirty_flag);
+        assert!(OutputProfile::for_version(Version::new(10, 0)).include_dirty_flag);
+    }
+
+    #[test]
     fn test_version_display() {
         assert_eq!(format!("{}", Version::new(7, 2)), "7.2");
         assert_eq!(format!("{}", Version::new(10, 0)), "10.0");
@@ -188,10 +211,12 @@ mod tests {
     fn test_profile_helpers() {
         let p6 = OutputProfile::profile_6_0_0();
         assert!(!p6.include_child_node);
+        assert!(!p6.include_dirty_flag); // 6.0 didn't expose dirty flag
         assert_eq!(p6.version, Some(Version::new(6, 0)));
 
         let p8 = OutputProfile::profile_8_0_0();
         assert!(p8.include_child_node);
+        assert!(p8.include_dirty_flag); // 8.0 exposes dirty flag
         assert_eq!(p8.version, Some(Version::new(8, 0)));
     }
 }
