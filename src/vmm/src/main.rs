@@ -125,13 +125,32 @@ const STACK_SIZE: u64 = 0x400000; // 4MB
 const STACK_TOP: u64 = STACK_BASE + STACK_SIZE - 8;
 
 // Virtio MMIO regions (must be OUTSIDE guest memory region for KVM to trap)
-const INPUT_MMIO_BASE: u64 = 0x10000000; // 256MB, outside 32MB guest memory
-const OUTPUT_MMIO_BASE: u64 = 0x10001000; // 256MB + 4KB
-const MMIO_SIZE: u64 = 0x1000;
+// Base address for all virtio devices: 256MB, outside 32MB guest memory
+const MMIO_BASE_START: u64 = 0x10000000;
+const MMIO_SIZE: u64 = 0x1000; // 4KB per device
 
 // Virtqueue memory regions (inside guest memory)
-const INPUT_VQ_BASE: u64 = 0x100000;
-const OUTPUT_VQ_BASE: u64 = 0x110000;
+// Each device gets 64KB for virtqueue structures
+const VQ_BASE_START: u64 = 0x100000; // 1MB
+const VQ_SIZE_PER_DEVICE: u64 = 0x10000; // 64KB per device
+
+// Maximum number of devices in a backing chain (matches config default)
+// This limits: MMIO range (16 * 4KB = 64KB) and VQ range (16 * 64KB = 1MB)
+const MAX_CHAIN_DEPTH: usize = 16;
+
+/// Calculate MMIO base address for device at given index.
+/// Index 0 = first input device (top of chain), higher indices = backing files.
+/// For operations with output, output device uses index after all inputs.
+#[inline]
+fn device_mmio_base(device_index: usize) -> u64 {
+    MMIO_BASE_START + (device_index as u64 * MMIO_SIZE)
+}
+
+/// Calculate virtqueue base address for device at given index.
+#[inline]
+fn device_vq_base(device_index: usize) -> u64 {
+    VQ_BASE_START + (device_index as u64 * VQ_SIZE_PER_DEVICE)
+}
 
 // DMA buffer pool (inside guest memory, used by guest not VMM)
 #[allow(dead_code)]
@@ -164,6 +183,183 @@ const EFER_LMA: u64 = 1 << 10;
 const PTE_PRESENT: u64 = 1 << 0;
 const PTE_WRITABLE: u64 = 1 << 1;
 const PTE_PAGE_SIZE: u64 = 1 << 7;
+
+// ============================================================================
+// Multi-device management (Phase 0c)
+//
+// All operations use DeviceSet for device management. This provides:
+// - Unified MMIO dispatch to correct device based on address
+// - Support for N input devices (backing chains)
+// - Consistent device index assignment
+// ============================================================================
+
+/// A managed device in the DeviceSet.
+struct ManagedDevice {
+    /// The virtio-block device
+    device: Arc<Mutex<VirtioBlockDevice>>,
+    /// MMIO base address for this device
+    mmio_base: u64,
+    /// Whether this is a read (input) or write (output) device
+    is_input: bool,
+}
+
+/// Manages a set of virtio-block devices for an operation.
+///
+/// This struct handles MMIO dispatch to the correct device based on address,
+/// and provides a unified interface for all operations.
+///
+/// # Device Layout
+///
+/// Devices are assigned sequential MMIO addresses starting at MMIO_BASE_START:
+/// - Device 0: MMIO at 0x10000000, VQ at 0x100000 (typically top image/input)
+/// - Device 1: MMIO at 0x10001000, VQ at 0x110000 (backing file or output)
+/// - Device N: MMIO at 0x10000000 + N*0x1000, VQ at 0x100000 + N*0x10000
+///
+/// # Usage
+///
+/// - `info`: 1 input device (device 0)
+/// - `copy`: 1 input + 1 output (devices 0 and 1)
+/// - `convert` (future): N input devices for chain + 1 output
+/// - `compare` (future): Two chains of input devices
+struct DeviceSet {
+    /// All managed devices in order of their device index
+    devices: Vec<ManagedDevice>,
+}
+
+impl DeviceSet {
+    /// Create a new empty device set.
+    fn new() -> Self {
+        Self {
+            devices: Vec::new(),
+        }
+    }
+
+    /// Add a device at the next available index.
+    /// Returns the device index assigned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the maximum chain depth (MAX_CHAIN_DEPTH) would be exceeded.
+    fn add_device(&mut self, device: Arc<Mutex<VirtioBlockDevice>>, is_input: bool) -> usize {
+        assert!(
+            self.devices.len() < MAX_CHAIN_DEPTH,
+            "Maximum chain depth ({}) exceeded",
+            MAX_CHAIN_DEPTH
+        );
+        let index = self.devices.len();
+        let mmio_base = device_mmio_base(index);
+        self.devices.push(ManagedDevice {
+            device,
+            mmio_base,
+            is_input,
+        });
+        index
+    }
+
+    /// Get the number of devices.
+    #[allow(dead_code)] // Will be used by convert/compare operations
+    fn len(&self) -> usize {
+        self.devices.len()
+    }
+
+    /// Check if the device set is empty.
+    #[allow(dead_code)] // Will be used by convert/compare operations
+    fn is_empty(&self) -> bool {
+        self.devices.is_empty()
+    }
+
+    /// Get a device by index.
+    #[allow(dead_code)] // Will be used by convert/compare operations
+    fn get(&self, index: usize) -> Option<&Arc<Mutex<VirtioBlockDevice>>> {
+        self.devices.get(index).map(|d| &d.device)
+    }
+
+    /// Find device index and offset for an MMIO address.
+    /// Returns (device_index, offset_within_device) or None if address is invalid.
+    fn find_device_for_mmio(&self, addr: u64) -> Option<(usize, u32)> {
+        for (index, managed) in self.devices.iter().enumerate() {
+            let range_start = managed.mmio_base;
+            let range_end = range_start + MMIO_SIZE;
+            if addr >= range_start && addr < range_end {
+                return Some((index, (addr - range_start) as u32));
+            }
+        }
+        None
+    }
+
+    /// Handle MMIO read, dispatching to the correct device.
+    fn mmio_read(&self, addr: u64) -> u32 {
+        if let Some((index, offset)) = self.find_device_for_mmio(addr) {
+            self.devices[index].device.lock().unwrap().mmio_read(offset)
+        } else {
+            log::debug!("Unknown MMIO read at 0x{:x}", addr);
+            0
+        }
+    }
+
+    /// Handle MMIO write, dispatching to the correct device.
+    /// Returns (device_index, should_process_queue) if a device was found.
+    fn mmio_write(&self, addr: u64, value: u32) -> Option<(usize, bool)> {
+        if let Some((index, offset)) = self.find_device_for_mmio(addr) {
+            let mut device = self.devices[index].device.lock().unwrap();
+            device.mmio_write(offset, value);
+            Some((index, device.should_process_queue()))
+        } else {
+            log::debug!("Unknown MMIO write at 0x{:x}", addr);
+            None
+        }
+    }
+
+    /// Process queue for a device and record stats.
+    fn process_queue_for_device(
+        &self,
+        index: usize,
+        guest_mem: &GuestMemoryMmap,
+        vmm_stats: &Arc<Mutex<VmmStats>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let managed = &self.devices[index];
+        let io_stats = managed.device.lock().unwrap().process_queue(guest_mem)?;
+
+        let mut stats = vmm_stats.lock().unwrap();
+        if managed.is_input {
+            stats.record_read(io_stats.bytes_read, io_stats.sectors_read);
+        } else {
+            stats.record_write(io_stats.bytes_written, io_stats.sectors_written);
+        }
+        Ok(())
+    }
+
+    /// Create IoDevice entries for the I/O thread.
+    fn create_io_devices(&self, events: Vec<IoEvent>) -> Vec<IoDevice> {
+        assert_eq!(
+            events.len(),
+            self.devices.len(),
+            "Must provide one IoEvent per device"
+        );
+
+        self.devices
+            .iter()
+            .zip(events)
+            .enumerate()
+            .map(|(index, (managed, ioevent))| {
+                let role = if managed.is_input {
+                    if index == 0 {
+                        DeviceRole::Input
+                    } else {
+                        DeviceRole::Backing(index as u32 - 1)
+                    }
+                } else {
+                    DeviceRole::Output
+                };
+                IoDevice {
+                    role,
+                    device: Arc::clone(&managed.device),
+                    ioevent,
+                }
+            })
+            .collect()
+    }
+}
 
 /// Serial decoder for framed protobuf messages.
 ///
@@ -968,18 +1164,24 @@ fn execute_info_operation(
     guest_mem.write_obj(INFO_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
     guest_mem.write_obj(info_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
 
+    // Create device set for managing virtio-block devices
+    let mut device_set = DeviceSet::new();
+
     // Create virtio-block device (input only for info operation)
+    let input_mmio = device_mmio_base(0);
+    let input_vq = device_vq_base(0);
     let input_device = VirtioBlockDevice::new(
         input_backing,
         input_size,
         sector_size as u64,
         true, // read-only
-        INPUT_MMIO_BASE,
-        INPUT_VQ_BASE,
+        input_mmio,
+        input_vq,
     );
 
-    // Wrap device in Arc<Mutex<>> for potential sharing with I/O thread
+    // Wrap device in Arc<Mutex<>> and add to device set
     let input_device = Arc::new(Mutex::new(input_device));
+    device_set.add_device(Arc::clone(&input_device), true);
 
     // Wrap guest memory in Arc for sharing
     let guest_mem = Arc::new(guest_mem);
@@ -989,20 +1191,16 @@ fn execute_info_operation(
 
     // Set up ioeventfd for queue notifications
     let mut io_thread: Option<io_thread::IoThread> = None;
-    let mut input_evt = IoEvent::new(INPUT_MMIO_BASE)?;
+    let mut input_evt = IoEvent::new(input_mmio)?;
 
     match input_evt.register(&vm) {
         Ok(()) => {
-            // Configure devices for I/O thread (info: 1 input device only)
-            let devices = vec![IoDevice {
-                role: DeviceRole::Input,
-                device: Arc::clone(&input_device),
-                ioevent: input_evt,
-            }];
+            // Create IoDevice entries via DeviceSet
+            let io_devices = device_set.create_io_devices(vec![input_evt]);
 
             // Start the I/O thread
             io_thread = Some(io_thread::IoThread::new(
-                devices,
+                io_devices,
                 Arc::clone(&guest_mem),
                 Arc::clone(&vmm_stats),
             ));
@@ -1093,25 +1291,18 @@ fn execute_info_operation(
                 }
             }
             VcpuExit::MmioRead(addr, data) => {
-                let input_range = INPUT_MMIO_BASE..INPUT_MMIO_BASE + MMIO_SIZE;
-                let value = if input_range.contains(&addr) {
-                    input_device
-                        .lock()
-                        .unwrap()
-                        .mmio_read((addr - INPUT_MMIO_BASE) as u32)
-                } else {
-                    0
-                };
+                let value = device_set.mmio_read(addr);
                 write_mmio_data(data, value);
             }
             VcpuExit::MmioWrite(addr, data) => {
                 let value = read_mmio_data(data);
-                let input_range = INPUT_MMIO_BASE..INPUT_MMIO_BASE + MMIO_SIZE;
-                if input_range.contains(&addr) {
-                    let mut device = input_device.lock().unwrap();
-                    device.mmio_write((addr - INPUT_MMIO_BASE) as u32, value);
-                    if io_thread.is_none() && device.should_process_queue() {
-                        device.process_queue(&guest_mem)?;
+                if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
+                    if io_thread.is_none() && should_process {
+                        device_set.process_queue_for_device(
+                            device_index,
+                            &guest_mem,
+                            &vmm_stats,
+                        )?;
                     }
                 }
             }
@@ -1553,23 +1744,30 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
         OPERATION_CONFIG_ADDR, info_flags
     );
 
+    // Create device set for managing virtio-block devices
+    let mut device_set = DeviceSet::new();
+
     // Create virtio-block device (input only for info operation)
+    // Device index 0 = primary input
+    let input_mmio = device_mmio_base(0);
+    let input_vq = device_vq_base(0);
     let input_device = VirtioBlockDevice::new(
         input_backing,
         input_size,
         args.sector_size as u64,
         true, // read-only
-        INPUT_MMIO_BASE,
-        INPUT_VQ_BASE,
+        input_mmio,
+        input_vq,
     );
     debug!(
-        "Created virtio-block device at MMIO 0x{:x}",
-        INPUT_MMIO_BASE
+        "Created virtio-block device at MMIO 0x{:x}, VQ 0x{:x}",
+        input_mmio, input_vq
     );
     debug!("  Sector size: {} bytes", input_device.sector_size());
 
-    // Wrap device in Arc<Mutex<>> for potential sharing with I/O thread
+    // Wrap device in Arc<Mutex<>> and add to device set
     let input_device = Arc::new(Mutex::new(input_device));
+    device_set.add_device(Arc::clone(&input_device), true);
 
     // Wrap guest memory in Arc for sharing
     let guest_mem = Arc::new(guest_mem);
@@ -1578,24 +1776,19 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
     let vmm_stats = Arc::new(Mutex::new(VmmStats::new()));
 
     // Set up ioeventfd for queue notifications
-    // Info operation uses only one input device
     let mut io_thread: Option<io_thread::IoThread> = None;
-    let mut input_evt = IoEvent::new(INPUT_MMIO_BASE)?;
+    let mut input_evt = IoEvent::new(input_mmio)?;
 
     match input_evt.register(&vm) {
         Ok(()) => {
             debug!("ioeventfd: enabled for queue notifications (with I/O thread)");
 
-            // Configure devices for I/O thread (info: 1 input device only)
-            let devices = vec![IoDevice {
-                role: DeviceRole::Input,
-                device: Arc::clone(&input_device),
-                ioevent: input_evt,
-            }];
+            // Create IoDevice entries via DeviceSet
+            let io_devices = device_set.create_io_devices(vec![input_evt]);
 
             // Start the I/O thread
             io_thread = Some(io_thread::IoThread::new(
-                devices,
+                io_devices,
                 Arc::clone(&guest_mem),
                 Arc::clone(&vmm_stats),
             ));
@@ -1709,34 +1902,20 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
             VcpuExit::MmioRead(addr, data) => {
                 vmm_stats.lock().unwrap().record_mmio_read();
-                let input_range = INPUT_MMIO_BASE..INPUT_MMIO_BASE + MMIO_SIZE;
-                let value = if input_range.contains(&addr) {
-                    input_device
-                        .lock()
-                        .unwrap()
-                        .mmio_read((addr - INPUT_MMIO_BASE) as u32)
-                } else {
-                    debug!("Unknown MMIO read at 0x{:x}", addr);
-                    0
-                };
+                let value = device_set.mmio_read(addr);
                 write_mmio_data(data, value);
             }
             VcpuExit::MmioWrite(addr, data) => {
                 vmm_stats.lock().unwrap().record_mmio_write();
                 let value = read_mmio_data(data);
-                let input_range = INPUT_MMIO_BASE..INPUT_MMIO_BASE + MMIO_SIZE;
-                if input_range.contains(&addr) {
-                    let mut device = input_device.lock().unwrap();
-                    device.mmio_write((addr - INPUT_MMIO_BASE) as u32, value);
-                    if io_thread.is_none() && device.should_process_queue() {
-                        let io_stats = device.process_queue(&guest_mem)?;
-                        vmm_stats
-                            .lock()
-                            .unwrap()
-                            .record_read(io_stats.bytes_read, io_stats.sectors_read);
+                if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
+                    if io_thread.is_none() && should_process {
+                        device_set.process_queue_for_device(
+                            device_index,
+                            &guest_mem,
+                            &vmm_stats,
+                        )?;
                     }
-                } else {
-                    debug!("Unknown MMIO write at 0x{:x}", addr);
                 }
             }
             VcpuExit::Shutdown => {
@@ -1921,26 +2100,36 @@ fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
         OPERATION_CONFIG_ADDR, copy_flags, args.start_sector, args.sector_count
     );
 
+    // Create device set for managing virtio-block devices
+    let mut device_set = DeviceSet::new();
+
     // Create virtio-block devices
+    // Device 0: input (read-only)
+    // Device 1: output (writable)
+    let input_mmio = device_mmio_base(0);
+    let input_vq = device_vq_base(0);
+    let output_mmio = device_mmio_base(1);
+    let output_vq = device_vq_base(1);
+
     let input_device = VirtioBlockDevice::new(
         input_backing,
         input_size,
         args.input_sector_size as u64,
         true,
-        INPUT_MMIO_BASE,
-        INPUT_VQ_BASE,
+        input_mmio,
+        input_vq,
     );
     let output_device = VirtioBlockDevice::new(
         output_backing,
         output_capacity,
         args.output_sector_size as u64,
         false,
-        OUTPUT_MMIO_BASE,
-        OUTPUT_VQ_BASE,
+        output_mmio,
+        output_vq,
     );
     debug!(
         "Created virtio-block devices at MMIO 0x{:x} and 0x{:x}",
-        INPUT_MMIO_BASE, OUTPUT_MMIO_BASE
+        input_mmio, output_mmio
     );
     debug!(
         "  Input sector size: {} bytes, Output sector size: {} bytes",
@@ -1948,38 +2137,30 @@ fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
         output_device.sector_size()
     );
 
+    // Wrap devices and add to device set
     let input_device = Arc::new(Mutex::new(input_device));
     let output_device = Arc::new(Mutex::new(output_device));
+    device_set.add_device(Arc::clone(&input_device), true); // is_input = true
+    device_set.add_device(Arc::clone(&output_device), false); // is_input = false
+
     let guest_mem = Arc::new(guest_mem);
     let vmm_stats = Arc::new(Mutex::new(VmmStats::new()));
 
     // Set up ioeventfd for queue notifications
-    // Copy operation uses 1 input device + 1 output device
     let mut io_thread: Option<io_thread::IoThread> = None;
-    let mut input_evt = IoEvent::new(INPUT_MMIO_BASE)?;
-    let mut output_evt = IoEvent::new(OUTPUT_MMIO_BASE)?;
+    let mut input_evt = IoEvent::new(input_mmio)?;
+    let mut output_evt = IoEvent::new(output_mmio)?;
 
     match (input_evt.register(&vm), output_evt.register(&vm)) {
         (Ok(()), Ok(())) => {
             debug!("ioeventfd: enabled for queue notifications (with I/O thread)");
 
-            // Configure devices for I/O thread (copy: 1 input + 1 output)
-            let devices = vec![
-                IoDevice {
-                    role: DeviceRole::Input,
-                    device: Arc::clone(&input_device),
-                    ioevent: input_evt,
-                },
-                IoDevice {
-                    role: DeviceRole::Output,
-                    device: Arc::clone(&output_device),
-                    ioevent: output_evt,
-                },
-            ];
+            // Create IoDevice entries via DeviceSet
+            let io_devices = device_set.create_io_devices(vec![input_evt, output_evt]);
 
             // Start the I/O thread
             io_thread = Some(io_thread::IoThread::new(
-                devices,
+                io_devices,
                 Arc::clone(&guest_mem),
                 Arc::clone(&vmm_stats),
             ));
@@ -2078,51 +2259,20 @@ fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
             VcpuExit::MmioRead(addr, data) => {
                 vmm_stats.lock().unwrap().record_mmio_read();
-                let input_range = INPUT_MMIO_BASE..INPUT_MMIO_BASE + MMIO_SIZE;
-                let output_range = OUTPUT_MMIO_BASE..OUTPUT_MMIO_BASE + MMIO_SIZE;
-                let value = if input_range.contains(&addr) {
-                    input_device
-                        .lock()
-                        .unwrap()
-                        .mmio_read((addr - INPUT_MMIO_BASE) as u32)
-                } else if output_range.contains(&addr) {
-                    output_device
-                        .lock()
-                        .unwrap()
-                        .mmio_read((addr - OUTPUT_MMIO_BASE) as u32)
-                } else {
-                    debug!("Unknown MMIO read at 0x{:x}", addr);
-                    0
-                };
+                let value = device_set.mmio_read(addr);
                 write_mmio_data(data, value);
             }
             VcpuExit::MmioWrite(addr, data) => {
                 vmm_stats.lock().unwrap().record_mmio_write();
                 let value = read_mmio_data(data);
-                let input_range = INPUT_MMIO_BASE..INPUT_MMIO_BASE + MMIO_SIZE;
-                let output_range = OUTPUT_MMIO_BASE..OUTPUT_MMIO_BASE + MMIO_SIZE;
-                if input_range.contains(&addr) {
-                    let mut device = input_device.lock().unwrap();
-                    device.mmio_write((addr - INPUT_MMIO_BASE) as u32, value);
-                    if io_thread.is_none() && device.should_process_queue() {
-                        let io_stats = device.process_queue(&guest_mem)?;
-                        vmm_stats
-                            .lock()
-                            .unwrap()
-                            .record_read(io_stats.bytes_read, io_stats.sectors_read);
+                if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
+                    if io_thread.is_none() && should_process {
+                        device_set.process_queue_for_device(
+                            device_index,
+                            &guest_mem,
+                            &vmm_stats,
+                        )?;
                     }
-                } else if output_range.contains(&addr) {
-                    let mut device = output_device.lock().unwrap();
-                    device.mmio_write((addr - OUTPUT_MMIO_BASE) as u32, value);
-                    if io_thread.is_none() && device.should_process_queue() {
-                        let io_stats = device.process_queue(&guest_mem)?;
-                        vmm_stats
-                            .lock()
-                            .unwrap()
-                            .record_write(io_stats.bytes_written, io_stats.sectors_written);
-                    }
-                } else {
-                    debug!("Unknown MMIO write at 0x{:x}", addr);
                 }
             }
             VcpuExit::Shutdown => {
