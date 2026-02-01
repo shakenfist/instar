@@ -467,6 +467,8 @@ pub enum ImageFormat {
     Qed = 9,
     /// ISO 9660 format (CD/DVD image, magic: "CD001" at offset 0x8001)
     Iso = 10,
+    /// LUKS format (Linux encrypted container, magic: "LUKS\xba\xbe" at offset 0)
+    Luks = 11,
 }
 
 impl ImageFormat {
@@ -483,6 +485,7 @@ impl ImageFormat {
             8 => ImageFormat::Vdi,
             9 => ImageFormat::Qed,
             10 => ImageFormat::Iso,
+            11 => ImageFormat::Luks,
             _ => ImageFormat::Unknown,
         }
     }
@@ -501,6 +504,7 @@ impl ImageFormat {
             ImageFormat::Vdi => "vdi",
             ImageFormat::Qed => "qed",
             ImageFormat::Iso => "iso",
+            ImageFormat::Luks => "luks",
         }
     }
 }
