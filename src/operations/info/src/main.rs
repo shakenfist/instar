@@ -120,6 +120,15 @@ const VDI_BLOCKS_IN_IMAGE_OFFSET: usize = 384; // Total blocks (u32)
 const VDI_BLOCKS_ALLOCATED_OFFSET: usize = 388; // Allocated blocks (u32)
 const VDI_UUID_OFFSET: usize = 392; // UUID (16 bytes)
 
+// QED format constants (deprecated QEMU format, all little-endian)
+const QED_MAGIC: u32 = 0x00444551; // "QED\0" at offset 0
+const QED_CLUSTER_SIZE_OFFSET: usize = 4; // Cluster size in bytes (u32)
+const QED_TABLE_SIZE_OFFSET: usize = 8; // L1/L2 table size in clusters (u32)
+const QED_HEADER_SIZE_OFFSET: usize = 12; // Header size in bytes (u32)
+const QED_IMAGE_SIZE_OFFSET: usize = 48; // Virtual size in bytes (u64)
+const QED_BACKING_FILENAME_OFFSET_OFFSET: usize = 56; // Backing filename offset (u32)
+const QED_BACKING_FILENAME_SIZE_OFFSET: usize = 60; // Backing filename size (u32)
+
 /// Entry point called by core after devices are initialized.
 ///
 /// Returns the number of bytes read.
@@ -294,6 +303,9 @@ pub unsafe extern "C" fn _start() -> u64 {
             ImageFormat::Vdi => {
                 parse_vdi_header(&buffer, &mut result, &mut vdi_info);
             }
+            ImageFormat::Qed => {
+                parse_qed_header(&buffer, &mut result);
+            }
             _ => {
                 // For raw and unknown formats, virtual size = actual size
                 result.virtual_size = actual_size;
@@ -373,6 +385,7 @@ fn format_to_str(format: ImageFormat) -> *const u8 {
         ImageFormat::Vhd => b"vpc\0".as_ptr(), // qemu-img calls VHD format "vpc"
         ImageFormat::Vhdx => b"vhdx\0".as_ptr(),
         ImageFormat::Vdi => b"vdi\0".as_ptr(),
+        ImageFormat::Qed => b"qed\0".as_ptr(),
     }
 }
 
@@ -399,6 +412,11 @@ fn detect_format_header(buffer: &[u8], len: usize) -> ImageFormat {
     }
     if magic_le == VMDK3_MAGIC {
         return ImageFormat::Vmdk3;
+    }
+
+    // Check QED magic (little-endian "QED\0")
+    if magic_le == QED_MAGIC {
+        return ImageFormat::Qed;
     }
 
     // Check VHDX magic (little-endian, "vhdxfile" signature)
@@ -1251,6 +1269,62 @@ fn parse_vdi_header(buffer: &[u8], result: &mut InfoResult, vdi_info: &mut VdiIn
     vdi_info
         .uuid
         .copy_from_slice(&buffer[VDI_UUID_OFFSET..VDI_UUID_OFFSET + 16]);
+}
+
+/// Parse QED header and populate result
+///
+/// QED header structure (all little-endian):
+/// - Offset 0-3: Magic ("QED\0" = 0x00444551)
+/// - Offset 4-7: Cluster size in bytes
+/// - Offset 8-11: Table size (L1/L2) in clusters
+/// - Offset 12-15: Header size in bytes
+/// - Offset 48-55: Virtual disk size in bytes
+/// - Offset 56-59: Backing filename offset
+/// - Offset 60-63: Backing filename size
+fn parse_qed_header(buffer: &[u8], result: &mut InfoResult) {
+    // Ensure buffer is large enough for QED header (at least 64 bytes)
+    if buffer.len() < 64 {
+        return;
+    }
+
+    // Cluster size (little-endian u32 at offset 4)
+    result.cluster_size = u32::from_le_bytes([
+        buffer[QED_CLUSTER_SIZE_OFFSET],
+        buffer[QED_CLUSTER_SIZE_OFFSET + 1],
+        buffer[QED_CLUSTER_SIZE_OFFSET + 2],
+        buffer[QED_CLUSTER_SIZE_OFFSET + 3],
+    ]);
+
+    // Virtual disk size (little-endian u64 at offset 48)
+    result.virtual_size = u64::from_le_bytes([
+        buffer[QED_IMAGE_SIZE_OFFSET],
+        buffer[QED_IMAGE_SIZE_OFFSET + 1],
+        buffer[QED_IMAGE_SIZE_OFFSET + 2],
+        buffer[QED_IMAGE_SIZE_OFFSET + 3],
+        buffer[QED_IMAGE_SIZE_OFFSET + 4],
+        buffer[QED_IMAGE_SIZE_OFFSET + 5],
+        buffer[QED_IMAGE_SIZE_OFFSET + 6],
+        buffer[QED_IMAGE_SIZE_OFFSET + 7],
+    ]);
+
+    // Check for backing file (offset at 56, size at 60)
+    let backing_offset = u32::from_le_bytes([
+        buffer[QED_BACKING_FILENAME_OFFSET_OFFSET],
+        buffer[QED_BACKING_FILENAME_OFFSET_OFFSET + 1],
+        buffer[QED_BACKING_FILENAME_OFFSET_OFFSET + 2],
+        buffer[QED_BACKING_FILENAME_OFFSET_OFFSET + 3],
+    ]);
+    let backing_size = u32::from_le_bytes([
+        buffer[QED_BACKING_FILENAME_SIZE_OFFSET],
+        buffer[QED_BACKING_FILENAME_SIZE_OFFSET + 1],
+        buffer[QED_BACKING_FILENAME_SIZE_OFFSET + 2],
+        buffer[QED_BACKING_FILENAME_SIZE_OFFSET + 3],
+    ]);
+
+    // If backing file exists, set the flag
+    if backing_offset > 0 && backing_size > 0 {
+        result.flags |= InfoResult::FLAG_HAS_BACKING_FILE;
+    }
 }
 
 /// Parse a hex value from ASCII bytes (without 0x prefix)
