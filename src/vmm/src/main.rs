@@ -113,6 +113,8 @@ const IMAGE_FORMAT_QCOW1: u32 = 7;
 const IMAGE_FORMAT_VDI: u32 = 8;
 #[allow(dead_code)]
 const IMAGE_FORMAT_QED: u32 = 9;
+#[allow(dead_code)]
+const IMAGE_FORMAT_ISO: u32 = 10;
 
 // Stack: generous allocation for complex operations like qemu-img info
 // Place at 16MB with 4MB size to handle deep call stacks
