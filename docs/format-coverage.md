@@ -32,22 +32,21 @@ for details on why this approach is secure.
 | RAW | Yes | Yes | raw-mbr-partitioned, raw-gpt-partitioned, etc. |
 | MBR partition table | Yes | Yes | raw-mbr-partitioned |
 | GPT partition table | Yes | Yes | raw-gpt-partitioned |
-| VDI | Yes | **No** | vdi-simple (test image available) |
-| QED | Yes (banned) | **No** | qed-simple (test image available) |
-| ISO | Yes | **No** | iso-simple (test image available) |
+| VDI | Yes | Yes | vdi-simple |
+| QED | Yes (banned) | Yes | qed-simple |
+| ISO | Yes | Yes* | iso-simple |
 | LUKS | Yes | **No** | (none) |
 | Parallels | No | **No** | parallels-v1, parallels-v2 (in testdata, not tested) |
 | Bochs | No | **No** | empty.bochs (in testdata, not tested) |
 | cloop | No | **No** | simple-pattern.cloop (in testdata, not tested) |
 
+*\* ISO detection is controlled by `--unsafe-quirks` flag: by default imago reports "iso", but with `--unsafe-quirks` it reports "raw" to match qemu-img behavior. See [quirks.md](quirks.md) for details.*
+
 ### Formats Not Yet Detected by Imago
 
-The following formats are detected by oslo.utils but not imago (test images now available):
+The following formats are detected by oslo.utils but not imago:
 
-1. **VDI (VirtualBox)** - Common virtualization format (test: vdi-simple)
-2. **QED** - Deprecated qemu format, oslo.utils bans it (test: qed-simple)
-3. **ISO** - CD/DVD image format (test: iso-simple)
-4. **LUKS** - Linux encrypted container format (no test image yet)
+1. **LUKS** - Linux encrypted container format (no test image yet)
 
 ---
 
@@ -97,10 +96,10 @@ The following formats are detected by oslo.utils but not imago (test images now 
 
 | Format | Check | oslo.utils | imago |
 |--------|-------|------------|-------|
-| QED | Banned entirely | Rejects | N/A (not detected) |
+| QED | Banned entirely | Rejects | Detects format |
 | LUKS | Version check (only v1) | Rejects v2+ | N/A (not detected) |
-| VDI | None | Pass-through | N/A (not detected) |
-| ISO | None | Pass-through | N/A (not detected) |
+| VDI | None | Pass-through | Detects format, UUID |
+| ISO | None | Pass-through | Detects format* |
 | VHD | None | Pass-through | Detects creator app |
 | VHDX | None | Pass-through | Detects block size |
 
@@ -255,10 +254,7 @@ The following formats are detected by oslo.utils but not imago (test images now 
 
 ### Detections to Add
 
-1. **VDI format detection** - Magic number detection for VirtualBox images
-2. **QED format detection** - Even if just to report "unsupported format"
-3. **ISO format detection** - ISO 9660 / UDF detection
-4. **LUKS format detection** - Encrypted container detection
+1. **LUKS format detection** - Encrypted container detection
 
 ### Safety Checks to Add
 
@@ -283,4 +279,4 @@ The following formats are detected by oslo.utils but not imago (test images now 
 
 ---
 
-*Document updated: January 2026*
+*Document updated: February 2026*
