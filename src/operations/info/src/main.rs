@@ -170,9 +170,9 @@ pub unsafe extern "C" fn _start() -> u64 {
         true // Default to detailed
     };
 
-    // Get device parameters
-    let input_capacity = (call_table.get_input_capacity)();
-    let input_sector_size = (call_table.get_input_sector_size)();
+    // Get device parameters (device 0 = primary input)
+    let input_capacity = (call_table.get_input_capacity)(0);
+    let input_sector_size = (call_table.get_input_sector_size)(0);
 
     // Calculate actual file size
     let actual_size = input_capacity * input_sector_size as u64;
@@ -182,8 +182,8 @@ pub unsafe extern "C" fn _start() -> u64 {
     // Buffer for reading data
     let mut buffer = [0u8; MAX_SECTOR_SIZE];
 
-    // Read first sector
-    if !(call_table.read_input_sector)(0, buffer.as_mut_ptr(), input_sector_size) {
+    // Read first sector (device 0, sector 0)
+    if !(call_table.read_input_sector)(0, 0, buffer.as_mut_ptr(), input_sector_size) {
         (call_table.send_error)(b"info\0".as_ptr(), b"input\0".as_ptr(), 0, 1);
         return 0;
     }
@@ -205,6 +205,7 @@ pub unsafe extern "C" fn _start() -> u64 {
         (call_table.debug_print)(b"info: checking VHD footer\n\0".as_ptr());
         let last_sector = input_capacity - 1;
         if (call_table.read_input_sector)(
+            0,
             last_sector,
             footer_buffer.as_mut_ptr(),
             input_sector_size,
@@ -232,6 +233,7 @@ pub unsafe extern "C" fn _start() -> u64 {
             let offset_in_sector = ISO_MAGIC_BYTE_OFFSET % input_sector_size;
             if input_capacity > iso_sector {
                 if (call_table.read_input_sector)(
+                    0,
                     iso_sector,
                     footer_buffer.as_mut_ptr(),
                     input_sector_size,
@@ -705,7 +707,7 @@ fn parse_vhd_footer(buffer: &[u8], result: &mut InfoResult) {
 /// - Metadata Region (offset from region table) - contains metadata table and items
 /// - Metadata items include File Parameters (block size) and Virtual Disk Size
 unsafe fn parse_vhdx_metadata(result: &mut InfoResult, actual_size: u64, call_table: &CallTable) {
-    let input_sector_size = (call_table.get_input_sector_size)();
+    let input_sector_size = (call_table.get_input_sector_size)(0);
     let mut buffer = [0u8; MAX_SECTOR_SIZE];
 
     // Step 1: Read region table at offset 0x30000 to find metadata region offset
@@ -713,8 +715,12 @@ unsafe fn parse_vhdx_metadata(result: &mut InfoResult, actual_size: u64, call_ta
     let region_table_offset_in_sector =
         (VHDX_REGION_TABLE_OFFSET % input_sector_size as u64) as usize;
 
-    if !(call_table.read_input_sector)(region_table_sector, buffer.as_mut_ptr(), input_sector_size)
-    {
+    if !(call_table.read_input_sector)(
+        0,
+        region_table_sector,
+        buffer.as_mut_ptr(),
+        input_sector_size,
+    ) {
         // Failed to read region table, fall back to actual size
         result.virtual_size = actual_size;
         return;
@@ -787,6 +793,7 @@ unsafe fn parse_vhdx_metadata(result: &mut InfoResult, actual_size: u64, call_ta
         (metadata_region_offset % input_sector_size as u64) as usize;
 
     if !(call_table.read_input_sector)(
+        0,
         metadata_table_sector,
         buffer.as_mut_ptr(),
         input_sector_size,
@@ -820,6 +827,7 @@ unsafe fn parse_vhdx_metadata(result: &mut InfoResult, actual_size: u64, call_ta
         (metadata_items_offset % input_sector_size as u64) as usize;
 
     if !(call_table.read_input_sector)(
+        0,
         metadata_items_sector,
         buffer.as_mut_ptr(),
         input_sector_size,
@@ -966,6 +974,7 @@ unsafe fn parse_qcow2_header(
         let mut sector_buf = [0u8; MAX_SECTOR_SIZE];
 
         if (call_table.read_input_sector)(
+            0,
             backing_sector,
             sector_buf.as_mut_ptr(),
             input_sector_size,
@@ -985,6 +994,7 @@ unsafe fn parse_qcow2_header(
 
             while bytes_read < read_size {
                 if !(call_table.read_input_sector)(
+                    0,
                     current_sector,
                     sector_buf.as_mut_ptr(),
                     input_sector_size,
@@ -1197,7 +1207,7 @@ unsafe fn parse_vmdk4_header(
 
         // Get input sector size (this is the virtio device's sector size, which may differ
         // from VMDK's internal 512-byte sectors)
-        let input_sector_size = (call_table.get_input_sector_size)();
+        let input_sector_size = (call_table.get_input_sector_size)(0);
 
         // VMDK header stores offsets in 512-byte sectors. Convert to byte offset,
         // then to the actual device sector number.
@@ -1208,8 +1218,12 @@ unsafe fn parse_vmdk4_header(
         // Read the sector containing the descriptor
         let mut desc_buffer = [0u8; MAX_SECTOR_SIZE];
 
-        if (call_table.read_input_sector)(desc_sector, desc_buffer.as_mut_ptr(), input_sector_size)
-        {
+        if (call_table.read_input_sector)(
+            0,
+            desc_sector,
+            desc_buffer.as_mut_ptr(),
+            input_sector_size,
+        ) {
             // Parse the descriptor text starting at the correct offset within the sector
             // The descriptor typically starts within the sector at offset_within_sector
             let desc_data = &desc_buffer[offset_within_sector..input_sector_size];
