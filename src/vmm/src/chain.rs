@@ -59,6 +59,23 @@ impl ImageFormat {
     pub fn supports_backing(&self) -> bool {
         matches!(self, ImageFormat::Qcow2 | ImageFormat::Qcow1)
     }
+
+    /// Convert to shared crate's ImageFormat u32 value.
+    ///
+    /// These values must match `shared::ImageFormat` enum values defined in
+    /// `src/shared/src/lib.rs` (which uses `#[repr(u32)]`).
+    pub fn to_shared_format_u32(self) -> u32 {
+        match self {
+            ImageFormat::Unknown => 0,
+            ImageFormat::Raw => 1,
+            ImageFormat::Qcow2 => 2,
+            ImageFormat::Vmdk4 => 3,
+            ImageFormat::Vmdk3 => 4,
+            ImageFormat::Vhd => 5,
+            ImageFormat::Vhdx => 6,
+            ImageFormat::Qcow1 => 7,
+        }
+    }
 }
 
 impl std::fmt::Display for ImageFormat {

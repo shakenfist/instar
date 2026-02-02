@@ -1442,26 +1442,6 @@ fn print_backing_chain(chain: &BackingChain) {
     }
 }
 
-/// Convert chain::ImageFormat to shared crate's ImageFormat u32 value.
-///
-/// The values here must match `shared::ImageFormat` enum values defined in
-/// `src/shared/src/lib.rs`. The shared crate uses `#[repr(u32)]` so enum
-/// variants map directly to these integer values:
-///   Unknown=0, Raw=1, Qcow2=2, Vmdk4=3, Vmdk3=4, Vhd=5, Vhdx=6, Qcow1=7
-#[allow(dead_code)] // Infrastructure for Phase 1+ (check, compare, convert)
-fn chain_format_to_u32(format: &ImageFormat) -> u32 {
-    match format {
-        ImageFormat::Unknown => 0,
-        ImageFormat::Raw => 1,
-        ImageFormat::Qcow2 => 2,
-        ImageFormat::Vmdk4 => 3,
-        ImageFormat::Vmdk3 => 4,
-        ImageFormat::Vhd => 5,
-        ImageFormat::Vhdx => 6,
-        ImageFormat::Qcow1 => 7,
-    }
-}
-
 /// Write a ChainConfig structure to guest memory at CHAIN_CONFIG_ADDR.
 ///
 /// This populates the chain config with metadata about all devices in the
@@ -1499,6 +1479,15 @@ fn write_chain_config(
 
     let device_count = chain.len().min(MAX_CHAIN_DEVICES);
 
+    if chain.len() > MAX_CHAIN_DEVICES {
+        debug!(
+            "Chain truncated: {} devices exceeds maximum of {}, only first {} will be passed",
+            chain.len(),
+            MAX_CHAIN_DEVICES,
+            MAX_CHAIN_DEVICES
+        );
+    }
+
     // Write header
     guest_mem.write_obj(CHAIN_CONFIG_MAGIC, GuestAddress(CHAIN_CONFIG_ADDR))?;
     guest_mem.write_obj(device_count as u32, GuestAddress(CHAIN_CONFIG_ADDR + 4))?;
@@ -1511,7 +1500,7 @@ fn write_chain_config(
         let device_offset = devices_base + (i as u64 * 32);
 
         guest_mem.write_obj(
-            chain_format_to_u32(&image.format),
+            image.format.to_shared_format_u32(),
             GuestAddress(device_offset),
         )?;
         guest_mem.write_obj(image.flags, GuestAddress(device_offset + 4))?;
