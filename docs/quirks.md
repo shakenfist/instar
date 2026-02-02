@@ -44,6 +44,51 @@ for compatibility testing.
 
 See [configuration.md](configuration.md) for full flag documentation.
 
+## Extra Detail Mode
+
+imago can provide additional format-specific information that qemu-img does not
+output. This extra information is disabled by default for qemu-img compatibility,
+but can be enabled with the `--extra-detail` flag.
+
+### VDI Format-Specific Information
+
+qemu-img does not output `format-specific` information for VDI (VirtualBox)
+images, even though the format contains useful metadata:
+
+```json
+{
+    "format": "vdi",
+    "format-specific": {
+        "type": "vdi",
+        "data": {
+            "image-type": "dynamic",
+            "block-size": 1048576,
+            "blocks-in-image": 10,
+            "blocks-allocated": 0,
+            "uuid": "914d94c9-e6a6-4968-9064-29fd03a9cdc2"
+        }
+    }
+}
+```
+
+**Default behavior**: imago matches qemu-img by not outputting VDI format-specific
+information.
+
+**With `--extra-detail` flag**: imago outputs the VDI format-specific section,
+providing additional metadata about the image structure.
+
+### When to Use `--extra-detail`
+
+Use this flag when you need:
+- VDI image type (dynamic vs fixed)
+- VDI block allocation statistics
+- VDI image UUID
+
+The extra information is particularly useful for:
+- Debugging VirtualBox image issues
+- Migration planning (understanding allocation patterns)
+- Image inspection and auditing
+
 ---
 
 ## QCOW2 disk_size Calculation

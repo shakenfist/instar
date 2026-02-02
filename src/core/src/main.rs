@@ -20,8 +20,8 @@ use core::panic::PanicInfo;
 use core::ptr::write_volatile;
 
 use shared::{
-    CallTable, Qcow2Info, VdiInfo, VmdkInfo, CALL_TABLE_ADDR, OPERATION_CONFIG_ADDR,
-    OPERATION_CONFIG_MAX_SIZE, OPERATION_LOAD_ADDR,
+    CallTable, ChainConfig, Qcow2Info, VdiInfo, VmdkInfo, CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR,
+    CHAIN_CONFIG_MAX_SIZE, OPERATION_CONFIG_ADDR, OPERATION_CONFIG_MAX_SIZE, OPERATION_LOAD_ADDR,
 };
 
 use crate::serial::{
@@ -212,6 +212,7 @@ fn setup_call_table() {
         send_complete: ct_send_complete,
         debug_print: ct_debug_print,
         get_operation_config: ct_get_operation_config,
+        get_chain_config: ct_get_chain_config,
         send_info_result: ct_send_info_result,
         send_info_result_qcow2: ct_send_info_result_qcow2,
         send_info_result_vmdk: ct_send_info_result_vmdk,
@@ -358,6 +359,26 @@ unsafe extern "C" fn ct_get_operation_config() -> shared::ConfigResult {
     shared::ConfigResult {
         ptr: OPERATION_CONFIG_ADDR as *const u8,
         len: OPERATION_CONFIG_MAX_SIZE,
+    }
+}
+
+/// Get chain configuration (metadata about backing chain devices).
+/// The VMM writes the config to CHAIN_CONFIG_ADDR before starting the guest.
+/// Returns ConfigResult - len=0 if no chain config is available (magic invalid).
+unsafe extern "C" fn ct_get_chain_config() -> shared::ConfigResult {
+    // Check if chain config is valid by reading the magic
+    let chain_config = &*(CHAIN_CONFIG_ADDR as *const ChainConfig);
+    if chain_config.magic == ChainConfig::MAGIC {
+        shared::ConfigResult {
+            ptr: CHAIN_CONFIG_ADDR as *const u8,
+            len: CHAIN_CONFIG_MAX_SIZE,
+        }
+    } else {
+        // No valid chain config - return empty result
+        shared::ConfigResult {
+            ptr: core::ptr::null(),
+            len: 0,
+        }
     }
 }
 

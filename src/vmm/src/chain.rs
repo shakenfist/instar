@@ -59,6 +59,23 @@ impl ImageFormat {
     pub fn supports_backing(&self) -> bool {
         matches!(self, ImageFormat::Qcow2 | ImageFormat::Qcow1)
     }
+
+    /// Convert to shared crate's ImageFormat u32 value.
+    ///
+    /// These values must match `shared::ImageFormat` enum values defined in
+    /// `src/shared/src/lib.rs` (which uses `#[repr(u32)]`).
+    pub fn to_shared_format_u32(self) -> u32 {
+        match self {
+            ImageFormat::Unknown => 0,
+            ImageFormat::Raw => 1,
+            ImageFormat::Qcow2 => 2,
+            ImageFormat::Vmdk4 => 3,
+            ImageFormat::Vmdk3 => 4,
+            ImageFormat::Vhd => 5,
+            ImageFormat::Vhdx => 6,
+            ImageFormat::Qcow1 => 7,
+        }
+    }
 }
 
 impl std::fmt::Display for ImageFormat {
@@ -582,5 +599,155 @@ mod tests {
             check_circular_reference(&path1, &seen),
             Err(ChainError::CircularReference(_))
         ));
+    }
+
+    // Tests for shared::ChainConfig and shared::ChainDeviceInfo structures
+    mod chain_config_tests {
+        use shared::{
+            ChainConfig, ChainDeviceInfo, ImageFormat as SharedImageFormat, InfoResult,
+            CHAIN_CONFIG_ADDR, CHAIN_CONFIG_MAX_SIZE, MAX_CHAIN_DEVICES, OPERATION_CONFIG_ADDR,
+            OPERATION_LOAD_ADDR,
+        };
+
+        #[test]
+        fn test_chain_device_info_new() {
+            let info = ChainDeviceInfo::new();
+            assert_eq!(info.format, 0);
+            assert_eq!(info.flags, 0);
+            assert_eq!(info.virtual_size, 0);
+            assert_eq!(info.actual_size, 0);
+            assert_eq!(info.cluster_size, 0);
+        }
+
+        #[test]
+        fn test_chain_device_info_detected_format() {
+            let mut info = ChainDeviceInfo::new();
+            info.format = SharedImageFormat::Qcow2 as u32;
+            assert_eq!(info.detected_format(), SharedImageFormat::Qcow2);
+
+            info.format = SharedImageFormat::Raw as u32;
+            assert_eq!(info.detected_format(), SharedImageFormat::Raw);
+        }
+
+        #[test]
+        fn test_chain_device_info_flags() {
+            let mut info = ChainDeviceInfo::new();
+
+            // No flags set
+            assert!(!info.has_backing_file());
+            assert!(!info.is_encrypted());
+            assert!(!info.is_compressed());
+
+            // Set backing file flag
+            info.flags = InfoResult::FLAG_HAS_BACKING_FILE;
+            assert!(info.has_backing_file());
+            assert!(!info.is_encrypted());
+
+            // Set encrypted flag
+            info.flags = InfoResult::FLAG_ENCRYPTED;
+            assert!(!info.has_backing_file());
+            assert!(info.is_encrypted());
+
+            // Set compressed flag
+            info.flags = InfoResult::FLAG_COMPRESSED;
+            assert!(info.is_compressed());
+
+            // Multiple flags
+            info.flags = InfoResult::FLAG_HAS_BACKING_FILE | InfoResult::FLAG_ENCRYPTED;
+            assert!(info.has_backing_file());
+            assert!(info.is_encrypted());
+        }
+
+        #[test]
+        fn test_chain_config_new() {
+            let config = ChainConfig::new();
+            assert_eq!(config.magic, ChainConfig::MAGIC);
+            assert_eq!(config.device_count, 0);
+            assert!(config.is_empty());
+            assert!(!config.is_valid()); // device_count must be > 0 for valid
+        }
+
+        #[test]
+        fn test_chain_config_with_devices() {
+            let mut config = ChainConfig::new();
+            config.device_count = 2;
+
+            // Set up first device (top image - qcow2)
+            config.devices[0].format = SharedImageFormat::Qcow2 as u32;
+            config.devices[0].virtual_size = 10 * 1024 * 1024 * 1024; // 10 GiB
+            config.devices[0].actual_size = 500 * 1024 * 1024; // 500 MiB
+            config.devices[0].cluster_size = 65536;
+            config.devices[0].flags = InfoResult::FLAG_HAS_BACKING_FILE;
+
+            // Set up second device (base image - raw)
+            config.devices[1].format = SharedImageFormat::Raw as u32;
+            config.devices[1].virtual_size = 10 * 1024 * 1024 * 1024;
+            config.devices[1].actual_size = 10 * 1024 * 1024 * 1024;
+            config.devices[1].cluster_size = 0;
+            config.devices[1].flags = 0;
+
+            assert!(config.is_valid());
+            assert_eq!(config.len(), 2);
+            assert!(!config.is_empty());
+            assert!(!config.is_single_image());
+
+            // Test top()
+            let top = config.top().unwrap();
+            assert_eq!(top.detected_format(), SharedImageFormat::Qcow2);
+            assert!(top.has_backing_file());
+
+            // Test base()
+            let base = config.base().unwrap();
+            assert_eq!(base.detected_format(), SharedImageFormat::Raw);
+            assert!(!base.has_backing_file());
+
+            // Test get()
+            assert!(config.get(0).is_some());
+            assert!(config.get(1).is_some());
+            assert!(config.get(2).is_none()); // Out of bounds
+        }
+
+        #[test]
+        fn test_chain_config_single_image() {
+            let mut config = ChainConfig::new();
+            config.device_count = 1;
+            config.devices[0].format = SharedImageFormat::Raw as u32;
+            config.devices[0].virtual_size = 1024 * 1024 * 1024;
+
+            assert!(config.is_valid());
+            assert!(config.is_single_image());
+            // top() and base() should return the same device
+            assert!(config.top().is_some());
+            assert!(config.base().is_some());
+        }
+
+        #[test]
+        fn test_chain_config_max_devices() {
+            let mut config = ChainConfig::new();
+            config.device_count = MAX_CHAIN_DEVICES as u32;
+
+            // Should be able to access all 16 devices
+            for i in 0..MAX_CHAIN_DEVICES {
+                assert!(config.get(i).is_some());
+            }
+            assert!(config.get(MAX_CHAIN_DEVICES).is_none());
+        }
+
+        #[test]
+        fn test_chain_config_struct_size() {
+            // Verify the struct sizes are what we expect for FFI
+            // ChainDeviceInfo: 4 + 4 + 8 + 8 + 4 + 4 = 32 bytes
+            assert_eq!(core::mem::size_of::<ChainDeviceInfo>(), 32);
+
+            // ChainConfig: 4 + 4 + 8 + (16 * 32) = 528 bytes
+            assert_eq!(core::mem::size_of::<ChainConfig>(), 528);
+        }
+
+        #[test]
+        fn test_chain_config_memory_address() {
+            // Verify the memory addresses don't overlap
+            assert!(CHAIN_CONFIG_ADDR > OPERATION_CONFIG_ADDR);
+            assert!(CHAIN_CONFIG_ADDR + CHAIN_CONFIG_MAX_SIZE <= OPERATION_LOAD_ADDR);
+        }
     }
 }
