@@ -788,6 +788,12 @@ impl ChainDeviceInfo {
 /// Device indices match the call table device indices:
 /// - Device 0: top/primary image
 /// - Devices 1..N-1: backing files in order (closer to base = higher index)
+///
+/// # Size and ConfigResult.len
+///
+/// The actual struct size is 528 bytes, but `CHAIN_CONFIG_MAX_SIZE` is 1024
+/// to allow room for future growth. Guest code should use `device_count`
+/// to determine how many device entries are valid, not `ConfigResult.len`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ChainConfig {
@@ -797,8 +803,11 @@ pub struct ChainConfig {
     /// Number of devices in the chain (1 = no backing files)
     pub device_count: u32,
 
-    /// Reserved for future use (flags, version, etc.)
-    pub _reserved: [u32; 2],
+    /// Structure version for future extensibility (currently 1)
+    pub version: u32,
+
+    /// Reserved for future use (flags, etc.)
+    pub _reserved: u32,
 
     /// Device information array (only first device_count entries are valid)
     pub devices: [ChainDeviceInfo; MAX_CHAIN_DEVICES],
@@ -808,17 +817,21 @@ impl ChainConfig {
     /// Magic value for chain config
     pub const MAGIC: u32 = 0x4348414E; // "CHAN"
 
+    /// Current structure version
+    pub const VERSION: u32 = 1;
+
     /// Create a new empty chain config
     pub const fn new() -> Self {
         Self {
             magic: Self::MAGIC,
             device_count: 0,
-            _reserved: [0; 2],
+            version: Self::VERSION,
+            _reserved: 0,
             devices: [ChainDeviceInfo::new(); MAX_CHAIN_DEVICES],
         }
     }
 
-    /// Check if config is valid
+    /// Check if config is valid (correct magic and has at least one device)
     pub fn is_valid(&self) -> bool {
         self.magic == Self::MAGIC && self.device_count > 0
     }

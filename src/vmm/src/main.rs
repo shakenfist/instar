@@ -79,6 +79,8 @@ const INFO_CONFIG_FLAG_UNSAFE_QUIRKS: u32 = 1 << 2;
 #[allow(dead_code)]
 const CHAIN_CONFIG_MAGIC: u32 = 0x4348414E; // "CHAN"
 #[allow(dead_code)]
+const CHAIN_CONFIG_VERSION: u32 = 1;
+#[allow(dead_code)]
 const MAX_CHAIN_DEVICES: usize = 16;
 
 // InfoResult constants (must match shared crate)
@@ -1441,6 +1443,11 @@ fn print_backing_chain(chain: &BackingChain) {
 }
 
 /// Convert chain::ImageFormat to shared crate's ImageFormat u32 value.
+///
+/// The values here must match `shared::ImageFormat` enum values defined in
+/// `src/shared/src/lib.rs`. The shared crate uses `#[repr(u32)]` so enum
+/// variants map directly to these integer values:
+///   Unknown=0, Raw=1, Qcow2=2, Vmdk4=3, Vmdk3=4, Vhd=5, Vhdx=6, Qcow1=7
 #[allow(dead_code)] // Infrastructure for Phase 1+ (check, compare, convert)
 fn chain_format_to_u32(format: &ImageFormat) -> u32 {
     match format {
@@ -1478,7 +1485,8 @@ fn write_chain_config(
     // Layout matches shared::ChainConfig exactly:
     // - magic: u32 (offset 0)
     // - device_count: u32 (offset 4)
-    // - _reserved: [u32; 2] (offset 8)
+    // - version: u32 (offset 8)
+    // - _reserved: u32 (offset 12)
     // - devices: [ChainDeviceInfo; 16] (offset 16)
     //
     // ChainDeviceInfo layout (32 bytes each):
@@ -1494,8 +1502,8 @@ fn write_chain_config(
     // Write header
     guest_mem.write_obj(CHAIN_CONFIG_MAGIC, GuestAddress(CHAIN_CONFIG_ADDR))?;
     guest_mem.write_obj(device_count as u32, GuestAddress(CHAIN_CONFIG_ADDR + 4))?;
-    guest_mem.write_obj(0u32, GuestAddress(CHAIN_CONFIG_ADDR + 8))?; // reserved[0]
-    guest_mem.write_obj(0u32, GuestAddress(CHAIN_CONFIG_ADDR + 12))?; // reserved[1]
+    guest_mem.write_obj(CHAIN_CONFIG_VERSION, GuestAddress(CHAIN_CONFIG_ADDR + 8))?;
+    guest_mem.write_obj(0u32, GuestAddress(CHAIN_CONFIG_ADDR + 12))?; // reserved
 
     // Write each device's info
     let devices_base = CHAIN_CONFIG_ADDR + 16;
