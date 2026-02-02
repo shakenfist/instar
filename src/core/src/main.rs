@@ -31,10 +31,32 @@ use crate::serial::{
 use crate::virtio::VirtioBlock;
 
 // Memory layout constants
-const INPUT_MMIO_BASE: usize = 0x10000000;
-const OUTPUT_MMIO_BASE: usize = 0x10001000;
-const INPUT_VQ_BASE: usize = 0x100000;
-const OUTPUT_VQ_BASE: usize = 0x110000;
+// Base addresses for device MMIO and virtqueues (must match VMM)
+const MMIO_BASE_START: usize = 0x10000000;
+const MMIO_SIZE: usize = 0x1000; // 4KB per device
+const VQ_BASE_START: usize = 0x100000; // 1MB
+const VQ_SIZE_PER_DEVICE: usize = 0x10000; // 64KB per device
+
+// Maximum number of input devices (backing chain depth)
+const MAX_INPUT_DEVICES: usize = 16;
+
+/// Calculate MMIO base address for device at given index.
+#[inline]
+const fn device_mmio_base(device_index: usize) -> usize {
+    MMIO_BASE_START + (device_index * MMIO_SIZE)
+}
+
+/// Calculate virtqueue base address for device at given index.
+#[inline]
+const fn device_vq_base(device_index: usize) -> usize {
+    VQ_BASE_START + (device_index * VQ_SIZE_PER_DEVICE)
+}
+
+// Legacy constants for backward compatibility
+const INPUT_MMIO_BASE: usize = MMIO_BASE_START; // device 0
+const OUTPUT_MMIO_BASE: usize = MMIO_BASE_START + MMIO_SIZE; // device 1
+const INPUT_VQ_BASE: usize = VQ_BASE_START; // device 0
+const OUTPUT_VQ_BASE: usize = VQ_BASE_START + VQ_SIZE_PER_DEVICE; // device 1
 
 /// A cell for single-threaded static mutable state.
 ///
@@ -84,7 +106,16 @@ unsafe impl<T> Sync for SingleThreadCell<T> {}
 // Global device state (accessed by call table functions).
 // Using SingleThreadCell because we need interior mutability from extern "C" functions.
 // SAFETY: Guest runs on a single vCPU - no concurrent access is possible.
-static INPUT_DEVICE: SingleThreadCell<Option<VirtioBlock>> = SingleThreadCell::new(None);
+
+/// Array of input devices (for backing chain support).
+/// Device 0 = primary/top image, devices 1..N = backing files.
+/// Legacy single-device functions (ct_read_input_sector, etc.) use index 0.
+static INPUT_DEVICES: SingleThreadCell<[Option<VirtioBlock>; MAX_INPUT_DEVICES]> =
+    SingleThreadCell::new([const { None }; MAX_INPUT_DEVICES]);
+
+/// Number of active input devices.
+static INPUT_DEVICE_COUNT: SingleThreadCell<usize> = SingleThreadCell::new(0);
+
 static OUTPUT_DEVICE: SingleThreadCell<Option<VirtioBlock>> = SingleThreadCell::new(None);
 static CONFIG: SingleThreadCell<Option<DeviceConfig>> = SingleThreadCell::new(None);
 
@@ -139,7 +170,11 @@ pub extern "C" fn _start() -> ! {
     // Store devices and config in globals for call table access.
     // SAFETY: Single-threaded guest, no concurrent access possible.
     unsafe {
-        *INPUT_DEVICE.get_mut() = Some(input);
+        // Store input device in the device array at index 0
+        let devices = INPUT_DEVICES.get_mut();
+        devices[0] = Some(input);
+        *INPUT_DEVICE_COUNT.get_mut() = 1;
+
         *OUTPUT_DEVICE.get_mut() = output;
         *CONFIG.get_mut() = Some(config.clone());
     }
@@ -164,11 +199,12 @@ fn setup_call_table() {
     let call_table = CallTable {
         magic: CallTable::MAGIC,
         version: CallTable::VERSION,
+        get_input_device_count: ct_get_input_device_count,
         read_input_sector: ct_read_input_sector,
-        write_output_sector: ct_write_output_sector,
         get_input_capacity: ct_get_input_capacity,
-        get_output_capacity: ct_get_output_capacity,
         get_input_sector_size: ct_get_input_sector_size,
+        write_output_sector: ct_write_output_sector,
+        get_output_capacity: ct_get_output_capacity,
         get_output_sector_size: ct_get_output_sector_size,
         get_progress_interval: ct_get_progress_interval,
         send_progress: ct_send_progress,
@@ -199,14 +235,61 @@ unsafe fn call_operation() -> u64 {
 // These are extern "C" functions that the operation binary calls
 // ============================================================================
 
-unsafe extern "C" fn ct_read_input_sector(sector: u64, buffer: *mut u8, len: usize) -> bool {
-    if let Some(ref mut dev) = *INPUT_DEVICE.get_mut() {
-        let slice = core::slice::from_raw_parts_mut(buffer, len);
-        dev.read_sector(sector, slice)
-    } else {
-        false
-    }
+/// Get the number of input devices available.
+unsafe extern "C" fn ct_get_input_device_count() -> u32 {
+    *INPUT_DEVICE_COUNT.get() as u32
 }
+
+/// Read a sector from a specific input device.
+/// Args: device index (0 = top/primary), sector number, buffer pointer, buffer length
+unsafe extern "C" fn ct_read_input_sector(
+    device_index: u32,
+    sector: u64,
+    buffer: *mut u8,
+    len: usize,
+) -> bool {
+    let index = device_index as usize;
+    let devices = INPUT_DEVICES.get_mut();
+    if index < *INPUT_DEVICE_COUNT.get() {
+        if let Some(ref mut dev) = devices[index] {
+            let slice = core::slice::from_raw_parts_mut(buffer, len);
+            return dev.read_sector(sector, slice);
+        }
+    }
+    false
+}
+
+/// Get capacity in sectors for a specific input device.
+/// Args: device index (0 = top/primary)
+/// Returns: capacity in sectors, or 0 if device index invalid
+unsafe extern "C" fn ct_get_input_capacity(device_index: u32) -> u64 {
+    let index = device_index as usize;
+    let devices = INPUT_DEVICES.get();
+    if index < *INPUT_DEVICE_COUNT.get() {
+        if let Some(ref dev) = devices[index] {
+            return dev.capacity();
+        }
+    }
+    0
+}
+
+/// Get sector size in bytes for a specific input device.
+/// Args: device index (0 = top/primary)
+/// Returns: sector size in bytes, or 0 if device index invalid
+unsafe extern "C" fn ct_get_input_sector_size(device_index: u32) -> usize {
+    let index = device_index as usize;
+    let devices = INPUT_DEVICES.get();
+    if index < *INPUT_DEVICE_COUNT.get() {
+        if let Some(ref dev) = devices[index] {
+            return dev.sector_size();
+        }
+    }
+    0
+}
+
+// ============================================================================
+// Output device functions (single device)
+// ============================================================================
 
 unsafe extern "C" fn ct_write_output_sector(sector: u64, buffer: *const u8, len: usize) -> bool {
     if let Some(ref mut dev) = *OUTPUT_DEVICE.get_mut() {
@@ -217,28 +300,12 @@ unsafe extern "C" fn ct_write_output_sector(sector: u64, buffer: *const u8, len:
     }
 }
 
-unsafe extern "C" fn ct_get_input_capacity() -> u64 {
-    INPUT_DEVICE
-        .get()
-        .as_ref()
-        .map(|d| d.capacity())
-        .unwrap_or(0)
-}
-
 unsafe extern "C" fn ct_get_output_capacity() -> u64 {
     OUTPUT_DEVICE
         .get()
         .as_ref()
         .map(|d| d.capacity())
         .unwrap_or(0)
-}
-
-unsafe extern "C" fn ct_get_input_sector_size() -> usize {
-    INPUT_DEVICE
-        .get()
-        .as_ref()
-        .map(|d| d.sector_size())
-        .unwrap_or(512)
 }
 
 unsafe extern "C" fn ct_get_output_sector_size() -> usize {
@@ -248,6 +315,10 @@ unsafe extern "C" fn ct_get_output_sector_size() -> usize {
         .map(|d| d.sector_size())
         .unwrap_or(512)
 }
+
+// ============================================================================
+// Progress and messaging functions
+// ============================================================================
 
 unsafe extern "C" fn ct_get_progress_interval() -> u32 {
     CONFIG
