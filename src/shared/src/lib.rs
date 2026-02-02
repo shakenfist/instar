@@ -16,6 +16,13 @@ pub const OPERATION_CONFIG_ADDR: usize = 0x00019000;
 /// Maximum size of operation config in bytes
 pub const OPERATION_CONFIG_MAX_SIZE: usize = 4096;
 
+/// Address where chain config is stored (set by VMM)
+/// This contains metadata about the backing chain for operations that need it.
+pub const CHAIN_CONFIG_ADDR: usize = 0x0001A000;
+
+/// Maximum size of chain config in bytes
+pub const CHAIN_CONFIG_MAX_SIZE: usize = 1024;
+
 /// Address where operation binaries are loaded
 pub const OPERATION_LOAD_ADDR: usize = 0x00020000;
 
@@ -106,6 +113,12 @@ pub struct CallTable {
     /// Returns: ConfigResult with pointer and length.
     /// The config format is operation-specific.
     pub get_operation_config: unsafe extern "C" fn() -> ConfigResult,
+
+    /// Get chain configuration (metadata about backing chain devices).
+    /// Returns: ConfigResult with pointer and length.
+    /// The config is a ChainConfig structure at CHAIN_CONFIG_ADDR.
+    /// Returns len=0 if no chain config is available.
+    pub get_chain_config: unsafe extern "C" fn() -> ConfigResult,
 
     /// Send info result message.
     /// Args: format (null-terminated), version, virtual_size, actual_size,
@@ -391,8 +404,8 @@ impl CallTable {
     /// Magic value indicating a valid call table
     pub const MAGIC: u32 = 0x494D4147; // "IMAG"
 
-    /// Current ABI version (bumped: removed legacy single-device input functions)
-    pub const VERSION: u32 = 8;
+    /// Current ABI version (bumped: added get_chain_config function)
+    pub const VERSION: u32 = 9;
 }
 
 // ============================================================================
@@ -694,6 +707,164 @@ impl InfoResult {
     /// Get the detected format
     pub fn detected_format(&self) -> ImageFormat {
         ImageFormat::from_u32(self.format)
+    }
+}
+
+// ============================================================================
+// Chain configuration structures (for multi-device/backing chain operations)
+// ============================================================================
+
+/// Maximum number of devices in a backing chain.
+pub const MAX_CHAIN_DEVICES: usize = 16;
+
+/// Information about a single device in the backing chain.
+///
+/// This structure provides metadata about each image in the chain,
+/// allowing operations to understand the format and capabilities of
+/// each device without parsing image headers.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ChainDeviceInfo {
+    /// Detected format (ImageFormat as u32)
+    pub format: u32,
+
+    /// Feature flags from the info operation
+    pub flags: u32,
+
+    /// Virtual size in bytes
+    pub virtual_size: u64,
+
+    /// Actual/disk size in bytes
+    pub actual_size: u64,
+
+    /// Cluster size in bytes (0 for raw images)
+    pub cluster_size: u32,
+
+    /// Reserved for future use
+    pub _reserved: u32,
+}
+
+impl ChainDeviceInfo {
+    /// Create a new empty device info
+    pub const fn new() -> Self {
+        Self {
+            format: 0,
+            flags: 0,
+            virtual_size: 0,
+            actual_size: 0,
+            cluster_size: 0,
+            _reserved: 0,
+        }
+    }
+
+    /// Get the detected format
+    pub fn detected_format(&self) -> ImageFormat {
+        ImageFormat::from_u32(self.format)
+    }
+
+    /// Check if this device has a backing file
+    pub fn has_backing_file(&self) -> bool {
+        (self.flags & InfoResult::FLAG_HAS_BACKING_FILE) != 0
+    }
+
+    /// Check if this device is encrypted
+    pub fn is_encrypted(&self) -> bool {
+        (self.flags & InfoResult::FLAG_ENCRYPTED) != 0
+    }
+
+    /// Check if this device has compressed clusters
+    pub fn is_compressed(&self) -> bool {
+        (self.flags & InfoResult::FLAG_COMPRESSED) != 0
+    }
+}
+
+/// Configuration for backing chain operations.
+///
+/// This structure is written to CHAIN_CONFIG_ADDR by the VMM when
+/// an operation involves a backing chain. It provides metadata about
+/// all devices in the chain, allowing operations to understand the
+/// chain structure without parsing image headers.
+///
+/// Device indices match the call table device indices:
+/// - Device 0: top/primary image
+/// - Devices 1..N-1: backing files in order (closer to base = higher index)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ChainConfig {
+    /// Magic number to verify config is valid (0x4348414E = "CHAN")
+    pub magic: u32,
+
+    /// Number of devices in the chain (1 = no backing files)
+    pub device_count: u32,
+
+    /// Reserved for future use (flags, version, etc.)
+    pub _reserved: [u32; 2],
+
+    /// Device information array (only first device_count entries are valid)
+    pub devices: [ChainDeviceInfo; MAX_CHAIN_DEVICES],
+}
+
+impl ChainConfig {
+    /// Magic value for chain config
+    pub const MAGIC: u32 = 0x4348414E; // "CHAN"
+
+    /// Create a new empty chain config
+    pub const fn new() -> Self {
+        Self {
+            magic: Self::MAGIC,
+            device_count: 0,
+            _reserved: [0; 2],
+            devices: [ChainDeviceInfo::new(); MAX_CHAIN_DEVICES],
+        }
+    }
+
+    /// Check if config is valid
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC && self.device_count > 0
+    }
+
+    /// Get the number of devices in the chain
+    pub fn len(&self) -> usize {
+        self.device_count as usize
+    }
+
+    /// Check if the chain is empty
+    pub fn is_empty(&self) -> bool {
+        self.device_count == 0
+    }
+
+    /// Get device info by index
+    pub fn get(&self, index: usize) -> Option<&ChainDeviceInfo> {
+        if index < self.device_count as usize {
+            Some(&self.devices[index])
+        } else {
+            None
+        }
+    }
+
+    /// Check if this is a simple single-image operation (no backing chain)
+    pub fn is_single_image(&self) -> bool {
+        self.device_count == 1
+    }
+
+    /// Get the top (primary) image info
+    pub fn top(&self) -> Option<&ChainDeviceInfo> {
+        self.get(0)
+    }
+
+    /// Get the base image info (last in chain)
+    pub fn base(&self) -> Option<&ChainDeviceInfo> {
+        if self.device_count > 0 {
+            self.get(self.device_count as usize - 1)
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for ChainConfig {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

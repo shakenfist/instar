@@ -59,6 +59,8 @@ const GDT_BASE: u64 = 0x1000;
 const PAGE_TABLE_BASE: u64 = 0x2000;
 const GUEST_CODE_BASE: u64 = 0x10000;
 const OPERATION_CONFIG_ADDR: u64 = 0x19000;
+#[allow(dead_code)] // Infrastructure for Phase 1+ (check, compare, convert)
+const CHAIN_CONFIG_ADDR: u64 = 0x1A000;
 const OPERATION_LOAD_ADDR: u64 = 0x20000;
 
 // CopyConfig constants (must match shared crate)
@@ -71,6 +73,13 @@ const INFO_CONFIG_MAGIC: u32 = 0x494E464F; // "INFO"
 const INFO_CONFIG_FLAG_DETAILED: u32 = 1 << 0;
 const INFO_CONFIG_FLAG_SECURITY_CHECK: u32 = 1 << 1;
 const INFO_CONFIG_FLAG_UNSAFE_QUIRKS: u32 = 1 << 2;
+
+// ChainConfig constants (must match shared crate)
+// These are used by write_chain_config() which is infrastructure for Phase 1+
+#[allow(dead_code)]
+const CHAIN_CONFIG_MAGIC: u32 = 0x4348414E; // "CHAN"
+#[allow(dead_code)]
+const MAX_CHAIN_DEVICES: usize = 16;
 
 // InfoResult constants (must match shared crate)
 // These are defined for future use when parsing results from guest
@@ -1429,6 +1438,113 @@ fn print_backing_chain(chain: &BackingChain) {
             println!("      cluster size: {} bytes", image.cluster_size);
         }
     }
+}
+
+/// Convert chain::ImageFormat to shared crate's ImageFormat u32 value.
+#[allow(dead_code)] // Infrastructure for Phase 1+ (check, compare, convert)
+fn chain_format_to_u32(format: &ImageFormat) -> u32 {
+    match format {
+        ImageFormat::Unknown => 0,
+        ImageFormat::Raw => 1,
+        ImageFormat::Qcow2 => 2,
+        ImageFormat::Vmdk4 => 3,
+        ImageFormat::Vmdk3 => 4,
+        ImageFormat::Vhd => 5,
+        ImageFormat::Vhdx => 6,
+        ImageFormat::Qcow1 => 7,
+    }
+}
+
+/// Write a ChainConfig structure to guest memory at CHAIN_CONFIG_ADDR.
+///
+/// This populates the chain config with metadata about all devices in the
+/// backing chain, allowing guest operations to understand the chain structure
+/// without parsing image headers.
+///
+/// # Arguments
+///
+/// * `guest_mem` - Guest memory to write to
+/// * `chain` - The backing chain to convert and write
+///
+/// # Returns
+///
+/// Ok(()) on success, error on memory write failure
+#[allow(dead_code)] // Infrastructure for Phase 1+ (check, compare, convert)
+fn write_chain_config(
+    guest_mem: &GuestMemoryMmap,
+    chain: &BackingChain,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Build the ChainConfig structure
+    // Layout matches shared::ChainConfig exactly:
+    // - magic: u32 (offset 0)
+    // - device_count: u32 (offset 4)
+    // - _reserved: [u32; 2] (offset 8)
+    // - devices: [ChainDeviceInfo; 16] (offset 16)
+    //
+    // ChainDeviceInfo layout (32 bytes each):
+    // - format: u32 (offset 0)
+    // - flags: u32 (offset 4)
+    // - virtual_size: u64 (offset 8)
+    // - actual_size: u64 (offset 16)
+    // - cluster_size: u32 (offset 24)
+    // - _reserved: u32 (offset 28)
+
+    let device_count = chain.len().min(MAX_CHAIN_DEVICES);
+
+    // Write header
+    guest_mem.write_obj(CHAIN_CONFIG_MAGIC, GuestAddress(CHAIN_CONFIG_ADDR))?;
+    guest_mem.write_obj(device_count as u32, GuestAddress(CHAIN_CONFIG_ADDR + 4))?;
+    guest_mem.write_obj(0u32, GuestAddress(CHAIN_CONFIG_ADDR + 8))?; // reserved[0]
+    guest_mem.write_obj(0u32, GuestAddress(CHAIN_CONFIG_ADDR + 12))?; // reserved[1]
+
+    // Write each device's info
+    let devices_base = CHAIN_CONFIG_ADDR + 16;
+    for (i, image) in chain.images().iter().take(MAX_CHAIN_DEVICES).enumerate() {
+        let device_offset = devices_base + (i as u64 * 32);
+
+        guest_mem.write_obj(
+            chain_format_to_u32(&image.format),
+            GuestAddress(device_offset),
+        )?;
+        guest_mem.write_obj(image.flags, GuestAddress(device_offset + 4))?;
+        guest_mem.write_obj(image.virtual_size, GuestAddress(device_offset + 8))?;
+        guest_mem.write_obj(image.actual_size, GuestAddress(device_offset + 16))?;
+        guest_mem.write_obj(image.cluster_size, GuestAddress(device_offset + 24))?;
+        guest_mem.write_obj(0u32, GuestAddress(device_offset + 28))?; // reserved
+    }
+
+    debug!(
+        "Wrote chain config at 0x{:x} ({} devices)",
+        CHAIN_CONFIG_ADDR, device_count
+    );
+
+    Ok(())
+}
+
+/// Create a single-device BackingChain from image info for simple operations.
+///
+/// This is used to populate chain config even for operations on single images
+/// without backing files, providing a consistent interface for operations.
+#[allow(dead_code)] // Infrastructure for Phase 1+ (check, compare, convert)
+fn create_single_image_chain(
+    path: &Path,
+    format: ImageFormat,
+    virtual_size: u64,
+    actual_size: u64,
+    cluster_size: u32,
+    flags: u32,
+) -> BackingChain {
+    let mut chain = BackingChain::new();
+    chain.push(ChainImage {
+        path: path.to_path_buf(),
+        format,
+        virtual_size,
+        actual_size,
+        cluster_size,
+        backing_file_raw: None,
+        flags,
+    });
+    chain
 }
 
 #[derive(Parser, Debug)]
