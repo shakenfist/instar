@@ -276,6 +276,10 @@ impl DeviceSet {
 
     /// Find device index and offset for an MMIO address.
     /// Returns (device_index, offset_within_device) or None if address is invalid.
+    ///
+    /// O(n) linear scan is acceptable here: n ≤ MAX_CHAIN_DEPTH (16), and the
+    /// simple iteration over a small contiguous Vec is cache-friendly and likely
+    /// faster than a hash map for this size.
     fn find_device_for_mmio(&self, addr: u64) -> Option<(usize, u32)> {
         for (index, managed) in self.devices.iter().enumerate() {
             let range_start = managed.mmio_base;
