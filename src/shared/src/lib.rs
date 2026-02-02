@@ -45,30 +45,10 @@ pub struct CallTable {
     /// Version of the call table ABI
     pub version: u32,
 
-    /// Read a sector from the input device.
-    /// Args: sector number, buffer pointer, buffer length
-    /// Returns: true on success
-    pub read_input_sector: unsafe extern "C" fn(u64, *mut u8, usize) -> bool,
-
-    /// Write a sector to the output device.
-    /// Args: sector number, buffer pointer, buffer length
-    /// Returns: true on success
-    pub write_output_sector: unsafe extern "C" fn(u64, *const u8, usize) -> bool,
-
-    /// Get input device capacity in sectors.
-    pub get_input_capacity: unsafe extern "C" fn() -> u64,
-
-    /// Get output device capacity in sectors.
-    pub get_output_capacity: unsafe extern "C" fn() -> u64,
-
-    /// Get input sector size in bytes.
-    pub get_input_sector_size: unsafe extern "C" fn() -> usize,
-
-    /// Get output sector size in bytes.
-    pub get_output_sector_size: unsafe extern "C" fn() -> usize,
-
     // =========================================================================
-    // Device-indexed I/O functions (for backing chain support)
+    // Input device functions (device-indexed for backing chain support)
+    // Device 0 is always the primary/top image.
+    // For chain operations, devices 1..N-1 are backing files in order.
     // =========================================================================
     /// Get the number of input devices available.
     /// For single-image operations this returns 1.
@@ -78,17 +58,31 @@ pub struct CallTable {
     /// Read a sector from a specific input device.
     /// Args: device index (0 = top/primary), sector number, buffer pointer, buffer length
     /// Returns: true on success, false if device index invalid or I/O error
-    pub read_input_sector_from: unsafe extern "C" fn(u32, u64, *mut u8, usize) -> bool,
+    pub read_input_sector: unsafe extern "C" fn(u32, u64, *mut u8, usize) -> bool,
 
     /// Get capacity in sectors for a specific input device.
     /// Args: device index (0 = top/primary)
     /// Returns: capacity in sectors, or 0 if device index invalid
-    pub get_input_capacity_of: unsafe extern "C" fn(u32) -> u64,
+    pub get_input_capacity: unsafe extern "C" fn(u32) -> u64,
 
     /// Get sector size in bytes for a specific input device.
     /// Args: device index (0 = top/primary)
     /// Returns: sector size in bytes, or 0 if device index invalid
-    pub get_input_sector_size_of: unsafe extern "C" fn(u32) -> usize,
+    pub get_input_sector_size: unsafe extern "C" fn(u32) -> usize,
+
+    // =========================================================================
+    // Output device functions (single device)
+    // =========================================================================
+    /// Write a sector to the output device.
+    /// Args: sector number, buffer pointer, buffer length
+    /// Returns: true on success
+    pub write_output_sector: unsafe extern "C" fn(u64, *const u8, usize) -> bool,
+
+    /// Get output device capacity in sectors.
+    pub get_output_capacity: unsafe extern "C" fn() -> u64,
+
+    /// Get output sector size in bytes.
+    pub get_output_sector_size: unsafe extern "C" fn() -> usize,
 
     /// Get progress reporting interval (0=every 10, 1-99=percent, 100=none).
     pub get_progress_interval: unsafe extern "C" fn() -> u32,
@@ -397,8 +391,8 @@ impl CallTable {
     /// Magic value indicating a valid call table
     pub const MAGIC: u32 = 0x494D4147; // "IMAG"
 
-    /// Current ABI version (bumped for device-indexed I/O functions)
-    pub const VERSION: u32 = 7;
+    /// Current ABI version (bumped: removed legacy single-device input functions)
+    pub const VERSION: u32 = 8;
 }
 
 // ============================================================================
