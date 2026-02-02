@@ -59,6 +59,8 @@ const GDT_BASE: u64 = 0x1000;
 const PAGE_TABLE_BASE: u64 = 0x2000;
 const GUEST_CODE_BASE: u64 = 0x10000;
 const OPERATION_CONFIG_ADDR: u64 = 0x19000;
+#[allow(dead_code)] // Infrastructure for Phase 1+ (check, compare, convert)
+const CHAIN_CONFIG_ADDR: u64 = 0x1A000;
 const OPERATION_LOAD_ADDR: u64 = 0x20000;
 
 // CopyConfig constants (must match shared crate)
@@ -71,6 +73,15 @@ const INFO_CONFIG_MAGIC: u32 = 0x494E464F; // "INFO"
 const INFO_CONFIG_FLAG_DETAILED: u32 = 1 << 0;
 const INFO_CONFIG_FLAG_SECURITY_CHECK: u32 = 1 << 1;
 const INFO_CONFIG_FLAG_UNSAFE_QUIRKS: u32 = 1 << 2;
+
+// ChainConfig constants (must match shared crate)
+// These are used by write_chain_config() which is infrastructure for Phase 1+
+#[allow(dead_code)]
+const CHAIN_CONFIG_MAGIC: u32 = 0x4348414E; // "CHAN"
+#[allow(dead_code)]
+const CHAIN_CONFIG_VERSION: u32 = 1;
+#[allow(dead_code)]
+const MAX_CHAIN_DEVICES: usize = 16;
 
 // InfoResult constants (must match shared crate)
 // These are defined for future use when parsing results from guest
@@ -556,8 +567,12 @@ fn format_size_human(bytes: u64, qemu_compat: bool) -> String {
         format_size_value(bytes_f / MIB, "MiB", qemu_compat)
     } else if bytes_f >= KIB {
         format_size_value(bytes_f / KIB, "KiB", qemu_compat)
+    } else if bytes == 0 {
+        // qemu-img outputs just "0" for zero bytes, no unit
+        "0".to_string()
     } else {
-        format!("{} bytes", bytes)
+        // qemu-img uses "B" for byte unit, not "bytes"
+        format!("{} B", bytes)
     }
 }
 
@@ -617,12 +632,14 @@ fn format_size_value(value: f64, unit: &str, qemu_compat: bool) -> String {
 }
 
 /// Print InfoResult in qemu-img compatible format
+#[allow(clippy::too_many_arguments)]
 fn print_info_result(
     msg: &guest_::GuestMessage,
     filename: &str,
     file_size: u64,
     disk_blocks: u64,
     ignore_quirks: bool,
+    extra_detail: bool,
     profile: &version::OutputProfile,
     output_format: &str,
 ) {
@@ -655,7 +672,14 @@ fn print_info_result(
             } else {
                 std::cmp::max(file_size, info.actual_size)
             };
-            print_info_result_json(info, &abs_path, child_file_length, disk_size, profile);
+            print_info_result_json(
+                info,
+                &abs_path,
+                child_file_length,
+                disk_size,
+                extra_detail,
+                profile,
+            );
             return;
         }
 
@@ -668,11 +692,20 @@ fn print_info_result(
         // qemu_compat is the opposite of ignore_quirks
         let qemu_compat = !ignore_quirks;
 
+        // For raw format, qemu-img reports virtual-size rounded up to 512-byte sectors.
+        // For structured formats (qcow2, vmdk, etc.), use the virtual size from headers.
+        let effective_virtual_size = if info.format == "raw" {
+            // Round up to 512-byte sector boundary
+            ((file_size + 511) / 512) * 512
+        } else {
+            info.virtual_size
+        };
+
         // Line 3: virtual size (human-readable with bytes in parentheses)
         println!(
             "virtual size: {} ({} bytes)",
-            format_size_human(info.virtual_size, qemu_compat),
-            info.virtual_size
+            format_size_human(effective_virtual_size, qemu_compat),
+            effective_virtual_size
         );
 
         // Line 4: disk size
@@ -794,7 +827,8 @@ fn print_info_result(
         }
 
         // Format specific information (VDI)
-        if info.format == "vdi" {
+        // Only output with --extra-detail flag since qemu-img doesn't show this
+        if info.format == "vdi" && extra_detail {
             println!("Format specific information:");
             // Image type: 1=dynamic, 2=fixed
             let image_type_str = match info.vdi_info.image_type {
@@ -825,13 +859,19 @@ fn print_info_result(
             } else {
                 std::cmp::max(file_size, info.actual_size)
             };
+            // For raw format, round up to 512-byte sector boundary
+            let effective_child_file_length = if info.format == "raw" {
+                ((child_file_length + 511) / 512) * 512
+            } else {
+                child_file_length
+            };
             println!("Child node '/file':");
             println!("    filename: {}", abs_path);
             println!("    protocol type: file");
             println!(
                 "    file length: {} ({} bytes)",
-                format_size_human(child_file_length, qemu_compat),
-                child_file_length
+                format_size_human(effective_child_file_length, qemu_compat),
+                effective_child_file_length
             );
             println!(
                 "    disk size: {}",
@@ -847,10 +887,27 @@ fn print_info_result_json(
     abs_path: &str,
     child_file_length: u64,
     disk_size: u64,
+    extra_detail: bool,
     profile: &version::OutputProfile,
 ) {
     // Build JSON output to match qemu-img's format exactly
     // qemu-img uses 4-space indentation
+
+    // For raw format, qemu-img reports virtual-size rounded up to 512-byte sectors.
+    // For structured formats (qcow2, vmdk, etc.), use the virtual size from headers.
+    let effective_virtual_size = if info.format == "raw" {
+        // Round up to 512-byte sector boundary
+        ((child_file_length + 511) / 512) * 512
+    } else {
+        info.virtual_size
+    };
+
+    // For child file length in raw format, also round up to 512-byte sectors
+    let effective_child_file_length = if info.format == "raw" {
+        ((child_file_length + 511) / 512) * 512
+    } else {
+        child_file_length
+    };
 
     println!("{{");
 
@@ -864,7 +921,10 @@ fn print_info_result_json(
         println!("            \"name\": \"file\",");
         println!("            \"info\": {{");
         println!("                \"children\": [],");
-        println!("                \"virtual-size\": {},", child_file_length);
+        println!(
+            "                \"virtual-size\": {},",
+            effective_child_file_length
+        );
         println!(
             "                \"filename\": \"{}\",",
             escape_json_string(abs_path)
@@ -893,7 +953,7 @@ fn print_info_result_json(
         println!("    \"backing-filename-format\": \"{}\",", backing_format);
     }
 
-    println!("    \"virtual-size\": {},", info.virtual_size);
+    println!("    \"virtual-size\": {},", effective_virtual_size);
     println!("    \"filename\": \"{}\",", escape_json_string(abs_path));
 
     if info.cluster_size > 0 {
@@ -986,7 +1046,10 @@ fn print_info_result_json(
         println!("            ]");
         println!("        }}");
         println!("    }},");
-    } else if info.format == "vdi" {
+    } else if info.format == "vdi" && extra_detail {
+        // VDI format-specific info is only output with --extra-detail flag.
+        // qemu-img doesn't output format-specific for VDI, but we can provide
+        // additional details when explicitly requested.
         println!("    \"format-specific\": {{");
         println!("        \"type\": \"vdi\",");
         println!("        \"data\": {{");
@@ -1431,6 +1494,108 @@ fn print_backing_chain(chain: &BackingChain) {
     }
 }
 
+/// Write a ChainConfig structure to guest memory at CHAIN_CONFIG_ADDR.
+///
+/// This populates the chain config with metadata about all devices in the
+/// backing chain, allowing guest operations to understand the chain structure
+/// without parsing image headers.
+///
+/// # Arguments
+///
+/// * `guest_mem` - Guest memory to write to
+/// * `chain` - The backing chain to convert and write
+///
+/// # Returns
+///
+/// Ok(()) on success, error on memory write failure
+#[allow(dead_code)] // Infrastructure for Phase 1+ (check, compare, convert)
+fn write_chain_config(
+    guest_mem: &GuestMemoryMmap,
+    chain: &BackingChain,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Build the ChainConfig structure
+    // Layout matches shared::ChainConfig exactly:
+    // - magic: u32 (offset 0)
+    // - device_count: u32 (offset 4)
+    // - version: u32 (offset 8)
+    // - _reserved: u32 (offset 12)
+    // - devices: [ChainDeviceInfo; 16] (offset 16)
+    //
+    // ChainDeviceInfo layout (32 bytes each):
+    // - format: u32 (offset 0)
+    // - flags: u32 (offset 4)
+    // - virtual_size: u64 (offset 8)
+    // - actual_size: u64 (offset 16)
+    // - cluster_size: u32 (offset 24)
+    // - _reserved: u32 (offset 28)
+
+    let device_count = chain.len().min(MAX_CHAIN_DEVICES);
+
+    if chain.len() > MAX_CHAIN_DEVICES {
+        debug!(
+            "Chain truncated: {} devices exceeds maximum of {}, only first {} will be passed",
+            chain.len(),
+            MAX_CHAIN_DEVICES,
+            MAX_CHAIN_DEVICES
+        );
+    }
+
+    // Write header
+    guest_mem.write_obj(CHAIN_CONFIG_MAGIC, GuestAddress(CHAIN_CONFIG_ADDR))?;
+    guest_mem.write_obj(device_count as u32, GuestAddress(CHAIN_CONFIG_ADDR + 4))?;
+    guest_mem.write_obj(CHAIN_CONFIG_VERSION, GuestAddress(CHAIN_CONFIG_ADDR + 8))?;
+    guest_mem.write_obj(0u32, GuestAddress(CHAIN_CONFIG_ADDR + 12))?; // reserved
+
+    // Write each device's info
+    let devices_base = CHAIN_CONFIG_ADDR + 16;
+    for (i, image) in chain.images().iter().take(MAX_CHAIN_DEVICES).enumerate() {
+        let device_offset = devices_base + (i as u64 * 32);
+
+        guest_mem.write_obj(
+            image.format.to_shared_format_u32(),
+            GuestAddress(device_offset),
+        )?;
+        guest_mem.write_obj(image.flags, GuestAddress(device_offset + 4))?;
+        guest_mem.write_obj(image.virtual_size, GuestAddress(device_offset + 8))?;
+        guest_mem.write_obj(image.actual_size, GuestAddress(device_offset + 16))?;
+        guest_mem.write_obj(image.cluster_size, GuestAddress(device_offset + 24))?;
+        guest_mem.write_obj(0u32, GuestAddress(device_offset + 28))?; // reserved
+    }
+
+    debug!(
+        "Wrote chain config at 0x{:x} ({} devices)",
+        CHAIN_CONFIG_ADDR, device_count
+    );
+
+    Ok(())
+}
+
+/// Create a single-device BackingChain from image info for simple operations.
+///
+/// This is used to populate chain config even for operations on single images
+/// without backing files, providing a consistent interface for operations.
+#[allow(dead_code)] // Infrastructure for Phase 1+ (check, compare, convert)
+fn create_single_image_chain(
+    path: &Path,
+    format: ImageFormat,
+    virtual_size: u64,
+    actual_size: u64,
+    cluster_size: u32,
+    flags: u32,
+) -> BackingChain {
+    let mut chain = BackingChain::new();
+    chain.push(ChainImage {
+        path: path.to_path_buf(),
+        format,
+        virtual_size,
+        actual_size,
+        cluster_size,
+        backing_file_raw: None,
+        flags,
+    });
+    chain
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "imago")]
 #[command(about = "Safe, sandboxed disk image operations")]
@@ -1485,6 +1650,12 @@ struct InfoArgs {
     /// Discover and display the complete backing file chain
     #[arg(long)]
     chain: bool,
+
+    /// Include extra format-specific details not provided by qemu-img.
+    /// This outputs additional information like VDI format-specific fields
+    /// that qemu-img doesn't include.
+    #[arg(long)]
+    extra_detail: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1868,6 +2039,7 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
                                     input_size,
                                     input_disk_blocks,
                                     args.ignore_quirks,
+                                    args.extra_detail,
                                     &profile,
                                     &args.output,
                                 );
