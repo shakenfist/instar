@@ -47,10 +47,10 @@ pub unsafe extern "C" fn _start() -> u64 {
         (0, 0, false) // Default: copy all, no skip zeros
     };
 
-    // Get device parameters
-    let input_capacity = (call_table.get_input_capacity)();
+    // Get device parameters (device 0 = primary input)
+    let input_capacity = (call_table.get_input_capacity)(0);
     let output_capacity = (call_table.get_output_capacity)();
-    let input_sector_size = (call_table.get_input_sector_size)();
+    let input_sector_size = (call_table.get_input_sector_size)(0);
     let output_sector_size = (call_table.get_output_sector_size)();
     let progress_interval = (call_table.get_progress_interval)();
 
@@ -100,8 +100,12 @@ pub unsafe extern "C" fn _start() -> u64 {
 
         for input_sector in start_sector..end_sector {
             // Read one input sector
-            if !(call_table.read_input_sector)(input_sector, buffer.as_mut_ptr(), input_sector_size)
-            {
+            if !(call_table.read_input_sector)(
+                0,
+                input_sector,
+                buffer.as_mut_ptr(),
+                input_sector_size,
+            ) {
                 (call_table.send_error)(b"copy\0".as_ptr(), b"input\0".as_ptr(), input_sector, 1);
                 return bytes_copied;
             }
@@ -186,6 +190,7 @@ pub unsafe extern "C" fn _start() -> u64 {
 
                 let offset = j * input_sector_size;
                 if !(call_table.read_input_sector)(
+                    0,
                     input_sector,
                     buffer.as_mut_ptr().add(offset),
                     input_sector_size,

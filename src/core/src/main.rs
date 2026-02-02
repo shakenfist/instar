@@ -199,16 +199,13 @@ fn setup_call_table() {
     let call_table = CallTable {
         magic: CallTable::MAGIC,
         version: CallTable::VERSION,
-        read_input_sector: ct_read_input_sector,
-        write_output_sector: ct_write_output_sector,
-        get_input_capacity: ct_get_input_capacity,
-        get_output_capacity: ct_get_output_capacity,
-        get_input_sector_size: ct_get_input_sector_size,
-        get_output_sector_size: ct_get_output_sector_size,
         get_input_device_count: ct_get_input_device_count,
-        read_input_sector_from: ct_read_input_sector_from,
-        get_input_capacity_of: ct_get_input_capacity_of,
-        get_input_sector_size_of: ct_get_input_sector_size_of,
+        read_input_sector: ct_read_input_sector,
+        get_input_capacity: ct_get_input_capacity,
+        get_input_sector_size: ct_get_input_sector_size,
+        write_output_sector: ct_write_output_sector,
+        get_output_capacity: ct_get_output_capacity,
+        get_output_sector_size: ct_get_output_sector_size,
         get_progress_interval: ct_get_progress_interval,
         send_progress: ct_send_progress,
         send_error: ct_send_error,
@@ -238,62 +235,14 @@ unsafe fn call_operation() -> u64 {
 // These are extern "C" functions that the operation binary calls
 // ============================================================================
 
-unsafe extern "C" fn ct_read_input_sector(sector: u64, buffer: *mut u8, len: usize) -> bool {
-    // Legacy function: read from device 0 (primary input)
-    ct_read_input_sector_from(0, sector, buffer, len)
-}
-
-unsafe extern "C" fn ct_write_output_sector(sector: u64, buffer: *const u8, len: usize) -> bool {
-    if let Some(ref mut dev) = *OUTPUT_DEVICE.get_mut() {
-        let slice = core::slice::from_raw_parts(buffer, len);
-        dev.write_sector(sector, slice)
-    } else {
-        false
-    }
-}
-
-unsafe extern "C" fn ct_get_input_capacity() -> u64 {
-    // Legacy function: get capacity of device 0 (primary input)
-    ct_get_input_capacity_of(0)
-}
-
-unsafe extern "C" fn ct_get_output_capacity() -> u64 {
-    OUTPUT_DEVICE
-        .get()
-        .as_ref()
-        .map(|d| d.capacity())
-        .unwrap_or(0)
-}
-
-unsafe extern "C" fn ct_get_input_sector_size() -> usize {
-    // Legacy function: get sector size of device 0 (primary input)
-    let size = ct_get_input_sector_size_of(0);
-    if size == 0 {
-        512
-    } else {
-        size
-    }
-}
-
-unsafe extern "C" fn ct_get_output_sector_size() -> usize {
-    OUTPUT_DEVICE
-        .get()
-        .as_ref()
-        .map(|d| d.sector_size())
-        .unwrap_or(512)
-}
-
-// ============================================================================
-// Device-indexed I/O functions (for backing chain support)
-// ============================================================================
-
 /// Get the number of input devices available.
 unsafe extern "C" fn ct_get_input_device_count() -> u32 {
     *INPUT_DEVICE_COUNT.get() as u32
 }
 
 /// Read a sector from a specific input device.
-unsafe extern "C" fn ct_read_input_sector_from(
+/// Args: device index (0 = top/primary), sector number, buffer pointer, buffer length
+unsafe extern "C" fn ct_read_input_sector(
     device_index: u32,
     sector: u64,
     buffer: *mut u8,
@@ -311,7 +260,9 @@ unsafe extern "C" fn ct_read_input_sector_from(
 }
 
 /// Get capacity in sectors for a specific input device.
-unsafe extern "C" fn ct_get_input_capacity_of(device_index: u32) -> u64 {
+/// Args: device index (0 = top/primary)
+/// Returns: capacity in sectors, or 0 if device index invalid
+unsafe extern "C" fn ct_get_input_capacity(device_index: u32) -> u64 {
     let index = device_index as usize;
     let devices = INPUT_DEVICES.get();
     if index < *INPUT_DEVICE_COUNT.get() {
@@ -323,7 +274,9 @@ unsafe extern "C" fn ct_get_input_capacity_of(device_index: u32) -> u64 {
 }
 
 /// Get sector size in bytes for a specific input device.
-unsafe extern "C" fn ct_get_input_sector_size_of(device_index: u32) -> usize {
+/// Args: device index (0 = top/primary)
+/// Returns: sector size in bytes, or 0 if device index invalid
+unsafe extern "C" fn ct_get_input_sector_size(device_index: u32) -> usize {
     let index = device_index as usize;
     let devices = INPUT_DEVICES.get();
     if index < *INPUT_DEVICE_COUNT.get() {
@@ -333,6 +286,39 @@ unsafe extern "C" fn ct_get_input_sector_size_of(device_index: u32) -> usize {
     }
     0
 }
+
+// ============================================================================
+// Output device functions (single device)
+// ============================================================================
+
+unsafe extern "C" fn ct_write_output_sector(sector: u64, buffer: *const u8, len: usize) -> bool {
+    if let Some(ref mut dev) = *OUTPUT_DEVICE.get_mut() {
+        let slice = core::slice::from_raw_parts(buffer, len);
+        dev.write_sector(sector, slice)
+    } else {
+        false
+    }
+}
+
+unsafe extern "C" fn ct_get_output_capacity() -> u64 {
+    OUTPUT_DEVICE
+        .get()
+        .as_ref()
+        .map(|d| d.capacity())
+        .unwrap_or(0)
+}
+
+unsafe extern "C" fn ct_get_output_sector_size() -> usize {
+    OUTPUT_DEVICE
+        .get()
+        .as_ref()
+        .map(|d| d.sector_size())
+        .unwrap_or(512)
+}
+
+// ============================================================================
+// Progress and messaging functions
+// ============================================================================
 
 unsafe extern "C" fn ct_get_progress_interval() -> u32 {
     CONFIG
