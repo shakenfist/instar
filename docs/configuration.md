@@ -11,6 +11,31 @@ flags and configuration files.
 |------|-------------|
 | `--output=human` | Human-readable output (default) |
 | `--output=json` | Machine-parseable JSON output |
+| `--extra-detail` | Include format-specific details not provided by qemu-img |
+
+#### `--extra-detail`
+
+Includes additional format-specific information that qemu-img does not output.
+This provides more comprehensive details about the disk image while maintaining
+compatibility with standard output.
+
+Currently supported extra details:
+
+- **VDI format**: image-type, block-size, blocks-in-image, blocks-allocated, uuid
+
+```bash
+# Default: matches qemu-img output
+imago info image.vdi
+
+# With --extra-detail: includes VDI-specific fields
+imago info --extra-detail image.vdi
+# format specific information:
+#     image-type: dynamic
+#     block-size: 1048576
+#     blocks-in-image: 1024
+#     blocks-allocated: 0
+#     uuid: 12345678-1234-1234-1234-123456789abc
+```
 
 ### Quirk Control
 
