@@ -8,6 +8,13 @@ repos:
         pass_filenames: false
         files: \.rs$
 
+      - id: binary-sizes
+        name: check binary sizes against memory layout
+        entry: ./scripts/check-binary-sizes.sh
+        language: script
+        pass_filenames: false
+        files: ^src/
+
   - repo: https://github.com/rhysd/actionlint
     rev: v1.7.7
     hooks:
