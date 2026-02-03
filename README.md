@@ -368,6 +368,8 @@ Additional development skills:
   Makefile targets like `make imago`, `make test-ci`)
 - `.claude/skills/testing-discipline.md` - Test verification workflow (never
   accept failures as "pre-existing" without verification)
+- `.claude/skills/pr-preparation.md` - PR readiness checklist (zero test
+  failures, no VM crashes, all checks passing)
 
 See `.claude/skills/` for details.
 
