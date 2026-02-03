@@ -103,6 +103,47 @@ cp "$COPY_BIN" target/release/
 cp "$CHECK_BIN" target/release/
 echo "Copied core.bin, info.bin, copy.bin, and check.bin to target/release/"
 
+# Check binary sizes against memory layout limits
+# Memory layout (from shared/src/lib.rs):
+#   - Core loads at 0x10000, must fit before operations at 0x20000 (max 64KB)
+#   - Operations load at 0x20000, must fit before configs at 0x80000 (max 384KB)
+echo ""
+echo "=== Checking binary sizes against memory layout ==="
+CORE_MAX=$((0x10000))      # 64KB
+OP_MAX=$((0x60000))        # 384KB
+FAILED=0
+
+check_size() {
+    local name="$1"
+    local file="$2"
+    local max="$3"
+    local size
+    size=$(wc -c < "$file")
+    local percent=$((size * 100 / max))
+    local max_kb=$((max / 1024))
+    local size_kb=$((size / 1024))
+
+    if [ "$size" -gt "$max" ]; then
+        echo "FAIL: $name is ${size_kb}KB, max ${max_kb}KB (${percent}%)"
+        return 1
+    else
+        echo "OK:   $name - ${size_kb}KB / ${max_kb}KB (${percent}%)"
+        return 0
+    fi
+}
+
+check_size "core.bin" "target/release/$CORE_BIN" "$CORE_MAX" || FAILED=1
+check_size "info.bin" "target/release/$INFO_BIN" "$OP_MAX" || FAILED=1
+check_size "copy.bin" "target/release/$COPY_BIN" "$OP_MAX" || FAILED=1
+check_size "check.bin" "target/release/$CHECK_BIN" "$OP_MAX" || FAILED=1
+
+if [ "$FAILED" -eq 1 ]; then
+    echo ""
+    echo "ERROR: Binary size check failed - memory overlap will occur!"
+    echo "Fix: reduce binary size or adjust memory layout in shared/src/lib.rs"
+    exit 1
+fi
+
 echo ""
 echo "=== Build complete ==="
 echo ""

@@ -12,7 +12,7 @@
 .PHONY: help list-prototypes build-prototype build-all clean-prototype clean-all \
         clean-devcontainers lint lint-fix build-lint-container \
         install-hooks run-prototype guest-protocol \
-        imago imago-devcontainer clean-imago run-imago \
+        imago imago-devcontainer clean-imago run-imago check-binary-sizes \
         test-venv test test-rust test-integration test-ci test-malicious test-report clean-tests \
         clean-cargo-cache
 
@@ -31,6 +31,7 @@ help:
 	@echo "  imago-devcontainer   Build devcontainer for main imago"
 	@echo "  clean-imago          Clean the main imago build"
 	@echo "  run-imago            Show how to run imago"
+	@echo "  check-binary-sizes   Verify binaries fit within memory regions"
 	@echo ""
 	@echo "Prototypes:"
 	@echo "  build-prototype              Build a prototype (requires PROTOTYPE=<name>)"
@@ -155,6 +156,11 @@ run-imago:
 	@echo ""
 	@echo "For help:"
 	@echo "  $(SRC_DIR)/target/release/imago --help"
+
+# Check that guest binaries fit within their memory regions
+# This prevents memory overlap bugs that cause VM crashes
+check-binary-sizes:
+	@./scripts/check-binary-sizes.sh
 
 # =============================================================================
 # Prototype Targets
