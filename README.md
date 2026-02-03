@@ -363,6 +363,11 @@ This project includes Claude Code skills for common development tasks:
 - `/imago-calltable [function]` - Call table API documentation
 - `/imago-add-test-image` - Add a new image to the integration test suite
 
+Additionally, `.claude/skills/build-and-test.md` documents the correct build and
+test patterns. **Important:** Always use Makefile targets (`make imago`,
+`make test-ci`) rather than running build scripts or cargo directly, as builds
+run inside Docker devcontainers.
+
 See `.claude/skills/` for details.
 
 ## License
