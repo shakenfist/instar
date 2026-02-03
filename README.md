@@ -370,6 +370,8 @@ Additional development skills:
   accept failures as "pre-existing" without verification)
 - `.claude/skills/pr-preparation.md` - PR readiness checklist (zero test
   failures, no VM crashes, all checks passing)
+- `.claude/skills/documentation-updates.md` - Documentation requirements (every
+  user-visible change requires docs updates)
 
 See `.claude/skills/` for details.
 
