@@ -571,6 +571,11 @@ impl InfoConfig {
     /// introduces security vulnerabilities. Use only for compatibility testing.
     pub const FLAG_UNSAFE_QUIRKS: u32 = 1 << 2;
 
+    /// Flag: Enable extra detail mode for detecting formats that qemu-img
+    /// doesn't recognize (e.g., LUKS). When not set, such formats are reported
+    /// as their qemu-img equivalent (usually "raw") for compatibility.
+    pub const FLAG_EXTRA_DETAIL: u32 = 1 << 3;
+
     /// Create a default config
     pub const fn default_config() -> Self {
         Self {
@@ -601,6 +606,15 @@ impl InfoConfig {
     /// files must have a valid partition table to be accepted as RAW.
     pub fn unsafe_quirks_enabled(&self) -> bool {
         (self.flags & Self::FLAG_UNSAFE_QUIRKS) != 0
+    }
+
+    /// Check if extra detail mode is enabled
+    ///
+    /// When enabled, formats that qemu-img doesn't recognize (like LUKS)
+    /// are detected and reported. When disabled (default), such formats
+    /// are reported as their qemu-img equivalent for compatibility.
+    pub fn extra_detail_enabled(&self) -> bool {
+        (self.flags & Self::FLAG_EXTRA_DETAIL) != 0
     }
 }
 

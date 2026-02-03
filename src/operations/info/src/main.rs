@@ -169,6 +169,10 @@ pub unsafe extern "C" fn _start() -> u64 {
     } else {
         true // Default to detailed
     };
+    // Extra detail mode enables detection of formats like LUKS that qemu-img
+    // doesn't recognize. Without it, these formats are reported as "raw" for
+    // qemu-img compatibility.
+    let extra_detail = config.is_valid() && config.extra_detail_enabled();
 
     // Get device parameters (device 0 = primary input)
     let input_capacity = (call_table.get_input_capacity)(0);
@@ -195,7 +199,9 @@ pub unsafe extern "C" fn _start() -> u64 {
     result.actual_size = actual_size;
 
     // Detect format based on magic numbers (first sector)
-    let mut format = detect_format_header(&buffer, input_sector_size);
+    // Pass extra_detail flag to control detection of formats like LUKS that qemu-img
+    // doesn't recognize - these are only shown with --extra-detail
+    let mut format = detect_format_header(&buffer, input_sector_size, extra_detail);
 
     // Buffer for VHD footer (may be reused)
     let mut footer_buffer = [0u8; MAX_SECTOR_SIZE];
@@ -437,7 +443,11 @@ fn format_to_str(format: ImageFormat) -> *const u8 {
 }
 
 /// Detect image format based on magic numbers in file header (first sector)
-fn detect_format_header(buffer: &[u8], len: usize) -> ImageFormat {
+/// Detect format from file header magic bytes.
+///
+/// When `extra_detail` is true, also detects formats like LUKS that qemu-img
+/// doesn't recognize. When false, these are reported as raw for compatibility.
+fn detect_format_header(buffer: &[u8], len: usize, extra_detail: bool) -> ImageFormat {
     if len < 8 {
         return ImageFormat::Unknown;
     }
@@ -499,7 +509,8 @@ fn detect_format_header(buffer: &[u8], len: usize) -> ImageFormat {
     }
 
     // Check LUKS magic at offset 0 (6 bytes: "LUKS\xba\xbe")
-    if len >= 6 && buffer[0..6] == LUKS_MAGIC {
+    // Only detect LUKS with --extra-detail since qemu-img doesn't recognize it
+    if extra_detail && len >= 6 && buffer[0..6] == LUKS_MAGIC {
         return ImageFormat::Luks;
     }
 
