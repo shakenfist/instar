@@ -72,4 +72,4 @@ pre-commit run --all-files
 
 1. **VM crash messages after output**: These appear on stderr and don't affect the actual operation result. The exit code indicates success/failure.
 
-2. **Test failures**: The test suite may have pre-existing failures. Check if failures existed before your changes by stashing and re-testing.
+2. **Test failures**: See `testing-discipline.md` for proper handling. Never assume failures are pre-existing without verification.
