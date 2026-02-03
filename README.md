@@ -372,6 +372,8 @@ Additional development skills:
   failures, no VM crashes, all checks passing)
 - `.claude/skills/documentation-updates.md` - Documentation requirements (every
   user-visible change requires docs updates)
+- `.claude/skills/correct-fixes.md` - Fix root causes, not symptoms (security
+  project: always do things the right way, not the easy way)
 
 See `.claude/skills/` for details.
 
