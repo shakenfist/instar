@@ -182,6 +182,10 @@ pub struct CallTable {
         *const u8,      // external_data_file
         *const VdiInfo, // vdi_info
     ),
+
+    /// Send check result message.
+    /// Args: check_result pointer containing all check results
+    pub send_check_result: unsafe extern "C" fn(*const CheckResult),
 }
 
 /// Backing format type for QCOW2 header extension
@@ -404,8 +408,8 @@ impl CallTable {
     /// Magic value indicating a valid call table
     pub const MAGIC: u32 = 0x494D4147; // "IMAG"
 
-    /// Current ABI version (bumped: added get_chain_config function)
-    pub const VERSION: u32 = 9;
+    /// Current ABI version (bumped: added check result functions)
+    pub const VERSION: u32 = 10;
 }
 
 // ============================================================================
@@ -707,6 +711,171 @@ impl InfoResult {
     /// Get the detected format
     pub fn detected_format(&self) -> ImageFormat {
         ImageFormat::from_u32(self.format)
+    }
+}
+
+// ============================================================================
+// Check operation configuration and results
+// ============================================================================
+
+/// Configuration for the check operation.
+///
+/// This structure is written to OPERATION_CONFIG_ADDR by the VMM.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CheckConfig {
+    /// Magic number to verify config is valid (0x43484543 = "CHEC")
+    pub magic: u32,
+
+    /// Configuration flags
+    pub flags: u32,
+}
+
+impl CheckConfig {
+    /// Magic value for check config
+    pub const MAGIC: u32 = 0x43484543; // "CHEC"
+
+    /// Flag: Attempt to repair errors (future feature)
+    pub const FLAG_REPAIR: u32 = 1 << 0;
+
+    /// Flag: Suppress output (quiet mode)
+    pub const FLAG_QUIET: u32 = 1 << 1;
+
+    /// Create a default config
+    pub const fn default_config() -> Self {
+        Self {
+            magic: Self::MAGIC,
+            flags: 0,
+        }
+    }
+
+    /// Check if config is valid
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+
+    /// Check if repair flag is set
+    pub fn should_repair(&self) -> bool {
+        (self.flags & Self::FLAG_REPAIR) != 0
+    }
+
+    /// Check if quiet flag is set
+    pub fn is_quiet(&self) -> bool {
+        (self.flags & Self::FLAG_QUIET) != 0
+    }
+}
+
+/// Result structure for the check operation.
+///
+/// Returned via send_check_result call table function.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CheckResult {
+    /// Magic number to verify result is valid (0x43485253 = "CHRS")
+    pub magic: u32,
+
+    /// Detected format (ImageFormat as u32)
+    pub format: u32,
+
+    /// Total number of errors found
+    pub total_errors: u32,
+
+    /// Number of corruptions (data integrity issues)
+    pub corruptions: u32,
+
+    /// Number of leaks (unreferenced allocated clusters)
+    pub leaks: u32,
+
+    /// Number of refcount inconsistencies
+    pub refcount_errors: u32,
+
+    /// Image end offset (highest byte offset in use)
+    pub image_end_offset: u64,
+
+    /// Total clusters checked
+    pub clusters_checked: u64,
+
+    /// Total allocated clusters
+    pub clusters_allocated: u64,
+
+    /// Fragmentation percentage (0-100)
+    pub fragmentation: u32,
+
+    /// Status flags
+    pub flags: u32,
+}
+
+impl Default for CheckResult {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CheckResult {
+    /// Magic value for check result
+    pub const MAGIC: u32 = 0x43485253; // "CHRS"
+
+    /// Flag: Image is valid (no errors)
+    pub const FLAG_VALID: u32 = 1 << 0;
+
+    /// Flag: Image has leaks that could be fixed
+    pub const FLAG_HAS_LEAKS: u32 = 1 << 1;
+
+    /// Flag: Image has corruptions (data may be lost)
+    pub const FLAG_HAS_CORRUPTIONS: u32 = 1 << 2;
+
+    /// Flag: Image marked dirty (not cleanly closed)
+    pub const FLAG_DIRTY: u32 = 1 << 3;
+
+    /// Flag: Image marked corrupt in header
+    pub const FLAG_CORRUPT_BIT: u32 = 1 << 4;
+
+    /// Flag: Check was incomplete (e.g., format not supported)
+    pub const FLAG_INCOMPLETE: u32 = 1 << 5;
+
+    /// Flag: Format does not support check (e.g., raw)
+    pub const FLAG_NOT_SUPPORTED: u32 = 1 << 6;
+
+    /// Create a new empty result
+    pub const fn new() -> Self {
+        Self {
+            magic: Self::MAGIC,
+            format: ImageFormat::Unknown as u32,
+            total_errors: 0,
+            corruptions: 0,
+            leaks: 0,
+            refcount_errors: 0,
+            image_end_offset: 0,
+            clusters_checked: 0,
+            clusters_allocated: 0,
+            fragmentation: 0,
+            flags: 0,
+        }
+    }
+
+    /// Check if result is valid
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+
+    /// Get the detected format
+    pub fn detected_format(&self) -> ImageFormat {
+        ImageFormat::from_u32(self.format)
+    }
+
+    /// Check if the image passed validation (no errors)
+    pub fn is_clean(&self) -> bool {
+        (self.flags & Self::FLAG_VALID) != 0 && self.total_errors == 0
+    }
+
+    /// Check if the image has any corruption
+    pub fn has_corruptions(&self) -> bool {
+        (self.flags & Self::FLAG_HAS_CORRUPTIONS) != 0 || self.corruptions > 0
+    }
+
+    /// Check if the image has any leaks
+    pub fn has_leaks(&self) -> bool {
+        (self.flags & Self::FLAG_HAS_LEAKS) != 0 || self.leaks > 0
     }
 }
 

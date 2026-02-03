@@ -6,6 +6,7 @@
 #   - core.bin at 0x10000 (device initialization, call table)
 #   - info.bin at 0x20000 (format detection operation)
 #   - copy.bin at 0x20000 (copy operation, same address as info)
+#   - check.bin at 0x20000 (integrity check operation, same address as info)
 
 set -e
 
@@ -69,6 +70,25 @@ else
 fi
 
 echo ""
+echo "=== Building check operation ==="
+cd operations/check
+cargo +nightly build --release
+cd ../..
+
+# Convert check ELF to flat binary
+echo "=== Converting check ELF to flat binary ==="
+CHECK_ELF="target/x86_64-unknown-none/release/check"
+CHECK_BIN="check.bin"
+
+if [ -f "$CHECK_ELF" ]; then
+    rust-objcopy -O binary "$CHECK_ELF" "$CHECK_BIN"
+    echo "Created $CHECK_BIN ($(wc -c < "$CHECK_BIN") bytes)"
+else
+    echo "Error: Check ELF not found at $CHECK_ELF"
+    exit 1
+fi
+
+echo ""
 echo "=== Building imago ==="
 cd vmm
 cargo build --release
@@ -80,7 +100,8 @@ echo "=== Copying binaries to target/release/ ==="
 cp "$CORE_BIN" target/release/
 cp "$INFO_BIN" target/release/
 cp "$COPY_BIN" target/release/
-echo "Copied core.bin, info.bin, and copy.bin to target/release/"
+cp "$CHECK_BIN" target/release/
+echo "Copied core.bin, info.bin, copy.bin, and check.bin to target/release/"
 
 echo ""
 echo "=== Build complete ==="
@@ -90,14 +111,17 @@ echo "  - imago          Safe, sandboxed disk image operations"
 echo "  - core.bin       Core guest (device init, call table) - loaded at 0x10000"
 echo "  - info.bin       Info operation (format detection) - loaded at 0x20000"
 echo "  - copy.bin       Copy operation (file copy) - loaded at 0x20000"
+echo "  - check.bin      Check operation (integrity validation) - loaded at 0x20000"
 echo ""
 echo "To run:"
 echo "  sudo ./target/release/imago info image.qcow2"
 echo "  sudo ./target/release/imago copy input.qcow2 output.raw"
+echo "  sudo ./target/release/imago check image.qcow2"
 echo ""
 echo "For help:"
 echo "  ./target/release/imago --help"
 echo "  ./target/release/imago info --help"
 echo "  ./target/release/imago copy --help"
+echo "  ./target/release/imago check --help"
 echo ""
 echo "Note: Running requires /dev/kvm access (root or kvm group)"

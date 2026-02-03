@@ -396,3 +396,22 @@ pub fn send_info_result_vdi(
     );
     send_message(&msg);
 }
+
+/// Send a check result message
+#[allow(clippy::too_many_arguments)]
+pub fn send_check_result(result: &shared::CheckResult) {
+    let format_name = result.detected_format().name();
+    let msg = guest_protocol::check_result_message(
+        format_name,
+        result.total_errors,
+        result.corruptions,
+        result.leaks,
+        result.refcount_errors,
+        result.image_end_offset,
+        result.clusters_checked,
+        result.clusters_allocated,
+        result.fragmentation,
+        result.flags,
+    );
+    send_message(&msg);
+}
