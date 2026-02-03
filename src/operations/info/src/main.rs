@@ -303,18 +303,17 @@ pub unsafe extern "C" fn _start() -> u64 {
 
     (call_table.verbose_print)(b"info: detected format\n\0".as_ptr());
 
-    // Format-specific information structures
-    let mut qcow2_info = Qcow2Info::new();
-    let mut vmdk_info = VmdkInfo::new();
-    let mut vdi_info = VdiInfo::new();
+    // Get format string for protobuf message
+    let format_str = format_to_str(format);
 
-    // Buffer for backing file path (null-terminated)
-    let mut backing_file_buf = [0u8; MAX_BACKING_FILE_LEN + 1];
+    // Parse format-specific metadata and send results
+    // Format-specific structs are created only within their respective branches
+    match format {
+        ImageFormat::Qcow2 => {
+            let mut qcow2_info = Qcow2Info::new();
+            let mut backing_file_buf = [0u8; MAX_BACKING_FILE_LEN + 1];
 
-    // Parse format-specific metadata if detailed reporting enabled
-    if detailed {
-        match format {
-            ImageFormat::Qcow2 => {
+            if detailed {
                 (call_table.verbose_print)(b"info: parsing qcow2\n\0".as_ptr());
                 parse_qcow2_header(
                     &buffer,
@@ -325,16 +324,64 @@ pub unsafe extern "C" fn _start() -> u64 {
                     input_sector_size,
                 );
             }
-            ImageFormat::Vmdk4 => {
+
+            (call_table.send_info_result_qcow2)(
+                format_str,
+                result.version,
+                result.virtual_size,
+                result.actual_size,
+                result.cluster_size,
+                result.flags,
+                backing_file_buf.as_ptr(),
+                b"\0".as_ptr(), // external_data_file (empty for now)
+                &qcow2_info,
+            );
+        }
+        ImageFormat::Vmdk4 => {
+            let mut vmdk_info = VmdkInfo::new();
+
+            if detailed {
                 parse_vmdk4_header(&buffer, &mut result, &mut vmdk_info, call_table);
-                // Set compressed flag if createType indicates compression (e.g., streamOptimized)
+                // Set compressed flag if createType indicates compression
                 if vmdk_info.create_type_str() == "streamOptimized" {
                     result.flags |= InfoResult::FLAG_COMPRESSED;
                 }
             }
-            ImageFormat::Vhd => {
+
+            (call_table.send_info_result_vmdk)(
+                format_str,
+                result.version,
+                result.virtual_size,
+                result.actual_size,
+                result.cluster_size,
+                result.flags,
+                b"\0".as_ptr(), // backing_file (empty for now)
+                b"\0".as_ptr(), // external_data_file (empty for now)
+                &vmdk_info,
+            );
+        }
+        ImageFormat::Vdi => {
+            let mut vdi_info = VdiInfo::new();
+
+            if detailed {
+                parse_vdi_header(&buffer, &mut result, &mut vdi_info);
+            }
+
+            (call_table.send_info_result_vdi)(
+                format_str,
+                result.version,
+                result.virtual_size,
+                result.actual_size,
+                result.cluster_size,
+                result.flags,
+                b"\0".as_ptr(), // backing_file (empty for now)
+                b"\0".as_ptr(), // external_data_file (empty for now)
+                &vdi_info,
+            );
+        }
+        ImageFormat::Vhd => {
+            if detailed {
                 // VHD footer may be in first sector (dynamic) or last sector (fixed)
-                // Use first sector buffer if it has the footer, otherwise use footer_buffer
                 let vhd_cookie = u64::from_be_bytes([
                     buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6],
                     buffer[7],
@@ -345,78 +392,83 @@ pub unsafe extern "C" fn _start() -> u64 {
                     parse_vhd_footer(&footer_buffer, &mut result);
                 }
             }
-            ImageFormat::Vhdx => {
-                // VHDX requires reading metadata from specific regions
+
+            (call_table.send_info_result)(
+                format_str,
+                result.version,
+                result.virtual_size,
+                result.actual_size,
+                result.cluster_size,
+                result.flags,
+                b"\0".as_ptr(),
+                b"\0".as_ptr(),
+            );
+        }
+        ImageFormat::Vhdx => {
+            if detailed {
                 parse_vhdx_metadata(&mut result, actual_size, call_table);
             }
-            ImageFormat::Vdi => {
-                parse_vdi_header(&buffer, &mut result, &mut vdi_info);
-            }
-            ImageFormat::Qed => {
+
+            (call_table.send_info_result)(
+                format_str,
+                result.version,
+                result.virtual_size,
+                result.actual_size,
+                result.cluster_size,
+                result.flags,
+                b"\0".as_ptr(),
+                b"\0".as_ptr(),
+            );
+        }
+        ImageFormat::Qed => {
+            if detailed {
                 parse_qed_header(&buffer, &mut result);
             }
-            ImageFormat::Luks => {
+
+            (call_table.send_info_result)(
+                format_str,
+                result.version,
+                result.virtual_size,
+                result.actual_size,
+                result.cluster_size,
+                result.flags,
+                b"\0".as_ptr(),
+                b"\0".as_ptr(),
+            );
+        }
+        ImageFormat::Luks => {
+            if detailed {
                 parse_luks_header(&buffer, &mut result);
             }
-            _ => {
-                // For raw and unknown formats, virtual size = actual size
+
+            (call_table.send_info_result)(
+                format_str,
+                result.version,
+                result.virtual_size,
+                result.actual_size,
+                result.cluster_size,
+                result.flags,
+                b"\0".as_ptr(),
+                b"\0".as_ptr(),
+            );
+        }
+        _ => {
+            // For raw and unknown formats, virtual size = actual size
+            if detailed {
                 result.virtual_size = actual_size;
             }
+
+            (call_table.send_info_result)(
+                format_str,
+                result.version,
+                result.virtual_size,
+                result.actual_size,
+                result.cluster_size,
+                result.flags,
+                b"\0".as_ptr(),
+                b"\0".as_ptr(),
+            );
         }
-    }
-
-    // Get format string for protobuf message
-    let format_str = format_to_str(format);
-
-    // Send result via protobuf over serial
-    // Use format-specific functions to include format-specific info
-    if format == ImageFormat::Qcow2 {
-        (call_table.send_info_result_qcow2)(
-            format_str,
-            result.version,
-            result.virtual_size,
-            result.actual_size,
-            result.cluster_size,
-            result.flags,
-            backing_file_buf.as_ptr(),
-            b"\0".as_ptr(), // external_data_file (empty for now)
-            &qcow2_info,
-        );
-    } else if format == ImageFormat::Vmdk4 {
-        (call_table.send_info_result_vmdk)(
-            format_str,
-            result.version,
-            result.virtual_size,
-            result.actual_size,
-            result.cluster_size,
-            result.flags,
-            b"\0".as_ptr(), // backing_file (empty for now)
-            b"\0".as_ptr(), // external_data_file (empty for now)
-            &vmdk_info,
-        );
-    } else if format == ImageFormat::Vdi {
-        (call_table.send_info_result_vdi)(
-            format_str,
-            result.version,
-            result.virtual_size,
-            result.actual_size,
-            result.cluster_size,
-            result.flags,
-            b"\0".as_ptr(), // backing_file (empty for now)
-            b"\0".as_ptr(), // external_data_file (empty for now)
-            &vdi_info,
-        );
-    } else {
-        (call_table.send_info_result)(
-            format_str,
-            result.version,
-            result.virtual_size,
-            result.actual_size,
-            result.cluster_size,
-            result.flags,
-            b"\0".as_ptr(), // backing_file (empty for now)
-            b"\0".as_ptr(), // external_data_file (empty for now)
-        );
     }
 
     (call_table.send_complete)(b"info\0".as_ptr(), bytes_read, true);
