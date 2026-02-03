@@ -8,17 +8,20 @@
 pub mod virtio;
 
 /// Address where the call table is located (set by core)
-pub const CALL_TABLE_ADDR: usize = 0x00018000;
+/// Located at 512KB to avoid overlap with core binary (which can grow past 32KB).
+/// The core binary is loaded at 0x10000 and may extend to 0x20000 (64KB max).
+/// The operation binary is loaded at 0x20000, so we place data structures at 0x80000.
+pub const CALL_TABLE_ADDR: usize = 0x00080000;
 
 /// Address where operation config is stored (set by VMM/core)
-pub const OPERATION_CONFIG_ADDR: usize = 0x00019000;
+pub const OPERATION_CONFIG_ADDR: usize = 0x00081000;
 
 /// Maximum size of operation config in bytes
 pub const OPERATION_CONFIG_MAX_SIZE: usize = 4096;
 
 /// Address where chain config is stored (set by VMM)
 /// This contains metadata about the backing chain for operations that need it.
-pub const CHAIN_CONFIG_ADDR: usize = 0x0001A000;
+pub const CHAIN_CONFIG_ADDR: usize = 0x00082000;
 
 /// Maximum size of chain config in bytes
 pub const CHAIN_CONFIG_MAX_SIZE: usize = 1024;
@@ -106,8 +109,12 @@ pub struct CallTable {
     /// Args: operation name (null-terminated), bytes processed, success
     pub send_complete: unsafe extern "C" fn(*const u8, u64, bool),
 
-    /// Debug print (null-terminated string).
+    /// Debug print (null-terminated string). Always prints.
     pub debug_print: unsafe extern "C" fn(*const u8),
+
+    /// Verbose print (null-terminated string). Only prints if verbose mode is enabled.
+    /// Use this for diagnostic messages that should only appear with --verbose.
+    pub verbose_print: unsafe extern "C" fn(*const u8),
 
     /// Get operation-specific configuration.
     /// Returns: ConfigResult with pointer and length.
@@ -408,8 +415,8 @@ impl CallTable {
     /// Magic value indicating a valid call table
     pub const MAGIC: u32 = 0x494D4147; // "IMAG"
 
-    /// Current ABI version (bumped: added check result functions)
-    pub const VERSION: u32 = 10;
+    /// Current ABI version (bumped: added verbose_print function)
+    pub const VERSION: u32 = 11;
 }
 
 // ============================================================================

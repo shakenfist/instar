@@ -28,7 +28,7 @@ pub unsafe extern "C" fn _start() -> u64 {
         return 0;
     }
 
-    (call_table.debug_print)(b"copy: start\n\0".as_ptr());
+    (call_table.verbose_print)(b"copy: start\n\0".as_ptr());
 
     // Get operation config
     let config_result = (call_table.get_operation_config)();
@@ -36,14 +36,14 @@ pub unsafe extern "C" fn _start() -> u64 {
 
     // Validate config and extract parameters
     let (cfg_start, cfg_count, skip_zeros) = if config.is_valid() {
-        (call_table.debug_print)(b"copy: config ok\n\0".as_ptr());
+        (call_table.verbose_print)(b"copy: config ok\n\0".as_ptr());
         (
             config.start_sector,
             config.sector_count,
             config.should_skip_zeros(),
         )
     } else {
-        (call_table.debug_print)(b"copy: no config\n\0".as_ptr());
+        (call_table.verbose_print)(b"copy: no config\n\0".as_ptr());
         (0, 0, false) // Default: copy all, no skip zeros
     };
 
@@ -84,7 +84,11 @@ pub unsafe extern "C" fn _start() -> u64 {
         total_bytes / input_sector_size as u64
     };
 
-    (call_table.debug_print)(b"copy: copying\n\0".as_ptr());
+    (call_table.verbose_print)(b"copy: copying\n\0".as_ptr());
+
+    if skip_zeros {
+        (call_table.verbose_print)(b"copy: skip zeros enabled\n\0".as_ptr());
+    }
 
     // Buffer for sector data
     let mut buffer = [0u8; MAX_SECTOR_SIZE];
@@ -97,6 +101,7 @@ pub unsafe extern "C" fn _start() -> u64 {
     if input_sector_size >= output_sector_size {
         // Read large input sectors, write multiple output sectors
         let ratio = input_sector_size / output_sector_size;
+        (call_table.verbose_print)(b"copy: input sectors >= output\n\0".as_ptr());
 
         for input_sector in start_sector..end_sector {
             // Read one input sector
@@ -172,6 +177,7 @@ pub unsafe extern "C" fn _start() -> u64 {
         let ratio = output_sector_size / input_sector_size;
         let output_sectors_to_copy = sectors_to_copy / ratio as u64;
         let start_output_sector = start_sector / ratio as u64;
+        (call_table.verbose_print)(b"copy: input sectors < output\n\0".as_ptr());
 
         for i in 0..output_sectors_to_copy {
             let output_sector = start_output_sector + i;
@@ -246,7 +252,7 @@ pub unsafe extern "C" fn _start() -> u64 {
     }
 
     (call_table.send_complete)(b"copy\0".as_ptr(), bytes_copied, true);
-    (call_table.debug_print)(b"copy: done\n\0".as_ptr());
+    (call_table.verbose_print)(b"copy: done\n\0".as_ptr());
 
     bytes_copied
 }

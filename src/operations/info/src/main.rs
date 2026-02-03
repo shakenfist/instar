@@ -149,7 +149,7 @@ const LUKS_VERSION_OFFSET: usize = 6; // Version (big-endian u16)
 pub unsafe extern "C" fn _start() -> u64 {
     let call_table = get_call_table();
 
-    // Verify call table is valid
+    // Verify call table is valid (always print these errors)
     if call_table.magic != CallTable::MAGIC {
         (call_table.debug_print)(b"info: bad magic\n\0".as_ptr());
         return 0;
@@ -158,8 +158,6 @@ pub unsafe extern "C" fn _start() -> u64 {
         (call_table.debug_print)(b"info: bad version\n\0".as_ptr());
         return 0;
     }
-
-    (call_table.debug_print)(b"info: start\n\0".as_ptr());
 
     // Get operation config (optional)
     let config_result = (call_table.get_operation_config)();
@@ -174,6 +172,8 @@ pub unsafe extern "C" fn _start() -> u64 {
     // qemu-img compatibility.
     let extra_detail = config.is_valid() && config.extra_detail_enabled();
 
+    (call_table.verbose_print)(b"info: start\n\0".as_ptr());
+
     // Get device parameters (device 0 = primary input)
     let input_capacity = (call_table.get_input_capacity)(0);
     let input_sector_size = (call_table.get_input_sector_size)(0);
@@ -181,7 +181,7 @@ pub unsafe extern "C" fn _start() -> u64 {
     // Calculate actual file size
     let actual_size = input_capacity * input_sector_size as u64;
 
-    (call_table.debug_print)(b"info: reading header\n\0".as_ptr());
+    (call_table.verbose_print)(b"info: reading header\n\0".as_ptr());
 
     // Buffer for reading data
     let mut buffer = [0u8; MAX_SECTOR_SIZE];
@@ -208,7 +208,7 @@ pub unsafe extern "C" fn _start() -> u64 {
 
     // If no format detected from header, try VHD detection (footer at end of file)
     if format == ImageFormat::Raw && input_capacity > 0 {
-        (call_table.debug_print)(b"info: checking VHD footer\n\0".as_ptr());
+        (call_table.verbose_print)(b"info: checking VHD footer\n\0".as_ptr());
         let last_sector = input_capacity - 1;
         if (call_table.read_input_sector)(
             0,
@@ -227,7 +227,7 @@ pub unsafe extern "C" fn _start() -> u64 {
     // Note: qemu-img treats ISO as "raw", so we only detect ISO in safe mode.
     // With --unsafe-quirks, ISO files will be reported as "raw" for qemu-img compatibility.
     if format == ImageFormat::Raw && !unsafe_quirks {
-        (call_table.debug_print)(b"info: checking ISO 9660\n\0".as_ptr());
+        (call_table.verbose_print)(b"info: checking ISO 9660\n\0".as_ptr());
         // ISO magic is at byte offset 32769 ("CD001" at 32768+1)
         // Check if the magic is already in our first sector buffer
         if input_sector_size >= ISO_MAGIC_BYTE_OFFSET + 5 {
@@ -260,18 +260,18 @@ pub unsafe extern "C" fn _start() -> u64 {
 
             match partition_type {
                 PartitionTableType::Mbr => {
-                    (call_table.debug_print)(b"info: found MBR partition table\n\0".as_ptr());
+                    (call_table.verbose_print)(b"info: found MBR partition table\n\0".as_ptr());
                     result.flags |= InfoResult::FLAG_HAS_MBR;
                 }
                 PartitionTableType::Gpt => {
-                    (call_table.debug_print)(b"info: found GPT partition table\n\0".as_ptr());
+                    (call_table.verbose_print)(b"info: found GPT partition table\n\0".as_ptr());
                     result.flags |= InfoResult::FLAG_HAS_GPT;
                 }
                 PartitionTableType::None => {
                     // No valid partition table found - reject as unknown format
                     // This is the secure default: only accept files that are
                     // recognizably disk images
-                    (call_table.debug_print)(
+                    (call_table.verbose_print)(
                         b"info: no partition table, rejecting as unknown\n\0".as_ptr(),
                     );
                     format = ImageFormat::Unknown;
@@ -291,7 +291,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                 }
                 PartitionTableType::None => {
                     // Accept anyway in unsafe mode
-                    (call_table.debug_print)(
+                    (call_table.verbose_print)(
                         b"info: no partition table (unsafe quirks)\n\0".as_ptr(),
                     );
                 }
@@ -301,7 +301,7 @@ pub unsafe extern "C" fn _start() -> u64 {
 
     result.format = format as u32;
 
-    (call_table.debug_print)(b"info: detected format\n\0".as_ptr());
+    (call_table.verbose_print)(b"info: detected format\n\0".as_ptr());
 
     // Format-specific information structures
     let mut qcow2_info = Qcow2Info::new();
@@ -315,6 +315,7 @@ pub unsafe extern "C" fn _start() -> u64 {
     if detailed {
         match format {
             ImageFormat::Qcow2 => {
+                (call_table.verbose_print)(b"info: parsing qcow2\n\0".as_ptr());
                 parse_qcow2_header(
                     &buffer,
                     &mut result,
@@ -419,7 +420,7 @@ pub unsafe extern "C" fn _start() -> u64 {
     }
 
     (call_table.send_complete)(b"info\0".as_ptr(), bytes_read, true);
-    (call_table.debug_print)(b"info: done\n\0".as_ptr());
+    (call_table.verbose_print)(b"info: done\n\0".as_ptr());
 
     bytes_read
 }
@@ -869,7 +870,7 @@ unsafe fn parse_vhdx_metadata(result: &mut InfoResult, actual_size: u64, call_ta
     ]);
     result.virtual_size = virtual_size;
 
-    (call_table.debug_print)(b"info: VHDX parsed ok\n\0".as_ptr());
+    (call_table.verbose_print)(b"info: VHDX parsed ok\n\0".as_ptr());
 }
 
 /// Parse QCOW2 header and populate result and format-specific info
@@ -971,7 +972,7 @@ unsafe fn parse_qcow2_header(
 
     if backing_offset != 0 && backing_size > 0 {
         result.flags |= InfoResult::FLAG_HAS_BACKING_FILE;
-        (call_table.debug_print)(b"info: has backing file\n\0".as_ptr());
+        (call_table.verbose_print)(b"info: has backing file\n\0".as_ptr());
 
         // Read the backing file name from the image
         // Limit to our buffer size (protocol supports 1024 chars)
@@ -1070,7 +1071,7 @@ unsafe fn parse_qcow2_header(
         }
         if (incompat & QCOW2_INCOMPAT_EXTERNAL_DATA) != 0 {
             result.flags |= InfoResult::FLAG_HAS_EXTERNAL_DATA;
-            (call_table.debug_print)(b"info: has external data\n\0".as_ptr());
+            (call_table.verbose_print)(b"info: has external data\n\0".as_ptr());
         }
         if (incompat & QCOW2_INCOMPAT_COMPRESSION) != 0 {
             result.flags |= InfoResult::FLAG_COMPRESSED;
@@ -1134,7 +1135,7 @@ unsafe fn parse_qcow2_header(
             if ext_type == QCOW2_EXT_BACKING_FORMAT && ext_len > 0 {
                 let format_bytes = &buffer[ext_offset + 8..ext_offset + 8 + ext_len];
                 qcow2_info.backing_format = shared::BackingFormat::from_bytes(format_bytes);
-                (call_table.debug_print)(b"info: found backing format ext\n\0".as_ptr());
+                (call_table.verbose_print)(b"info: found backing format ext\n\0".as_ptr());
             }
 
             // Move to next extension (data is padded to 8-byte boundary)
@@ -1214,7 +1215,7 @@ unsafe fn parse_vmdk4_header(
 
     // Read and parse the descriptor if present
     if desc_offset_sectors > 0 && desc_size_sectors > 0 {
-        (call_table.debug_print)(b"info: reading VMDK descriptor\n\0".as_ptr());
+        (call_table.verbose_print)(b"info: reading VMDK descriptor\n\0".as_ptr());
 
         // Get input sector size (this is the virtio device's sector size, which may differ
         // from VMDK's internal 512-byte sectors)

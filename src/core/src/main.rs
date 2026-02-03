@@ -196,8 +196,28 @@ pub extern "C" fn _start() -> ! {
     halt();
 }
 
+// Verbose flag bit position in operation config flags (bit 31, consistent across all configs)
+const CONFIG_FLAG_VERBOSE_BIT: u32 = 1 << 31;
+
 /// Set up the call table at the fixed address
 fn setup_call_table() {
+    // Read the operation config flags to determine if verbose mode is enabled.
+    // The config layout is: magic (u32), flags (u32), ...
+    // The verbose flag bit position is consistent across all operation configs.
+    let verbose = unsafe {
+        let flags_ptr = (OPERATION_CONFIG_ADDR + 4) as *const u32;
+        let flags = core::ptr::read_volatile(flags_ptr);
+        (flags & CONFIG_FLAG_VERBOSE_BIT) != 0
+    };
+
+    // Use actual debug_print for verbose_print when verbose is enabled,
+    // otherwise use a no-op to avoid serial I/O overhead.
+    let verbose_print_fn = if verbose {
+        ct_debug_print
+    } else {
+        ct_silent_print
+    };
+
     let call_table = CallTable {
         magic: CallTable::MAGIC,
         version: CallTable::VERSION,
@@ -213,6 +233,7 @@ fn setup_call_table() {
         send_error: ct_send_error,
         send_complete: ct_send_complete,
         debug_print: ct_debug_print,
+        verbose_print: verbose_print_fn,
         get_operation_config: ct_get_operation_config,
         get_chain_config: ct_get_chain_config,
         send_info_result: ct_send_info_result,
@@ -351,6 +372,13 @@ unsafe extern "C" fn ct_send_complete(op: *const u8, bytes: u64, success: bool) 
 unsafe extern "C" fn ct_debug_print(s: *const u8) {
     let str = cstr_to_str(s);
     debug_print(str);
+}
+
+/// No-op print function used for verbose_print when verbose mode is disabled.
+/// This avoids serial I/O overhead when debug output is not needed.
+#[allow(unused_variables)]
+unsafe extern "C" fn ct_silent_print(s: *const u8) {
+    // Do nothing - verbose output disabled
 }
 
 /// Get operation-specific configuration.

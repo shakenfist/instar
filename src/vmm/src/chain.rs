@@ -746,8 +746,13 @@ mod tests {
         #[test]
         fn test_chain_config_memory_address() {
             // Verify the memory addresses don't overlap
+            // Memory layout: operation at 0x20000, configs at 0x80000+
+            // Configs are placed above the operation area to avoid overlap with
+            // both the core binary (at 0x10000) and operation binary (at 0x20000)
             assert!(CHAIN_CONFIG_ADDR > OPERATION_CONFIG_ADDR);
-            assert!(CHAIN_CONFIG_ADDR + CHAIN_CONFIG_MAX_SIZE <= OPERATION_LOAD_ADDR);
+            // Operation area (0x20000-0x80000) has 384KB for the operation binary
+            // Configs are at 0x80000+, well above the operation load area
+            assert!(OPERATION_CONFIG_ADDR > OPERATION_LOAD_ADDR);
         }
     }
 }

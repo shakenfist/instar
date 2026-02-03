@@ -362,6 +362,7 @@ This project includes Claude Code skills for common development tasks:
 - `/imago-debug [issue]` - Troubleshooting guide for guest operations
 - `/imago-calltable [function]` - Call table API documentation
 - `/imago-add-test-image` - Add a new image to the integration test suite
+- `/verbose-print` - Guidelines for adding diagnostic verbose_print() calls
 
 Additional development skills:
 - `.claude/skills/build-and-test.md` - Correct build/test patterns (always use

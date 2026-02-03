@@ -54,14 +54,14 @@ use ioevent::IoEvent;
 use stats::VmmStats;
 use virtio::VirtioBlockDevice;
 
-// Memory layout constants
+// Memory layout constants (import shared ones from the shared crate)
 const GDT_BASE: u64 = 0x1000;
 const PAGE_TABLE_BASE: u64 = 0x2000;
 const GUEST_CODE_BASE: u64 = 0x10000;
-const OPERATION_CONFIG_ADDR: u64 = 0x19000;
+const OPERATION_LOAD_ADDR: u64 = shared::OPERATION_LOAD_ADDR as u64;
+const OPERATION_CONFIG_ADDR: u64 = shared::OPERATION_CONFIG_ADDR as u64;
 #[allow(dead_code)] // Infrastructure for Phase 1+ (check, compare, convert)
-const CHAIN_CONFIG_ADDR: u64 = 0x1A000;
-const OPERATION_LOAD_ADDR: u64 = 0x20000;
+const CHAIN_CONFIG_ADDR: u64 = shared::CHAIN_CONFIG_ADDR as u64;
 
 // CopyConfig constants (must match shared crate)
 const COPY_CONFIG_MAGIC: u32 = 0x434F5059; // "COPY"
@@ -74,6 +74,11 @@ const INFO_CONFIG_FLAG_DETAILED: u32 = 1 << 0;
 const INFO_CONFIG_FLAG_SECURITY_CHECK: u32 = 1 << 1;
 const INFO_CONFIG_FLAG_UNSAFE_QUIRKS: u32 = 1 << 2;
 const INFO_CONFIG_FLAG_EXTRA_DETAIL: u32 = 1 << 3;
+const INFO_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
+
+// CopyConfig constants (must match shared crate)
+#[allow(dead_code)]
+const COPY_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
 
 // CheckConfig constants (must match shared crate)
 const CHECK_CONFIG_MAGIC: u32 = 0x43484543; // "CHEC"
@@ -81,6 +86,8 @@ const CHECK_CONFIG_MAGIC: u32 = 0x43484543; // "CHEC"
 const CHECK_CONFIG_FLAG_REPAIR: u32 = 1 << 0;
 #[allow(dead_code)]
 const CHECK_CONFIG_FLAG_QUIET: u32 = 1 << 1;
+#[allow(dead_code)]
+const CHECK_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
 
 // CheckResult flag constants (must match shared crate)
 const CHECK_RESULT_FLAG_VALID: u32 = 1 << 0;
@@ -1777,9 +1784,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match cli.command {
-        Commands::Info(args) => run_info(args),
-        Commands::Copy(args) => run_copy(args),
-        Commands::Check(args) => run_check(args),
+        Commands::Info(args) => run_info(args, verbose),
+        Commands::Copy(args) => run_copy(args, verbose),
+        Commands::Check(args) => run_check(args, verbose),
         Commands::Config(args) => run_config(args),
     }
 }
@@ -1809,7 +1816,7 @@ fn run_config(args: ConfigArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Run the info operation (format detection)
-fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Validate sector size (must be power of 2, 512 to 64KB)
     if !(512..=MAX_SECTOR_SIZE).contains(&args.sector_size) || !args.sector_size.is_power_of_two() {
         eprintln!(
@@ -1955,7 +1962,7 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
     guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
     debug!("Loaded operation binary at 0x{:x}", OPERATION_LOAD_ADDR);
 
-    // Write InfoConfig at OPERATION_CONFIG_ADDR (0x19000)
+    // Write InfoConfig at OPERATION_CONFIG_ADDR
     // Layout: magic (u32), flags (u32)
     let mut info_flags: u32 = INFO_CONFIG_FLAG_DETAILED | INFO_CONFIG_FLAG_SECURITY_CHECK;
     if args.unsafe_quirks {
@@ -1963,6 +1970,9 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     if args.extra_detail {
         info_flags |= INFO_CONFIG_FLAG_EXTRA_DETAIL;
+    }
+    if verbose {
+        info_flags |= INFO_CONFIG_FLAG_VERBOSE;
     }
     guest_mem.write_obj(INFO_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
     guest_mem.write_obj(info_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
@@ -2195,7 +2205,7 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Run the copy operation
-fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Validate sector sizes (must be powers of 2, 512 to 64KB)
     for (name, size) in [
         ("input", args.input_sector_size),
@@ -2317,6 +2327,9 @@ fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     if args.skip_zeros {
         copy_flags |= COPY_CONFIG_FLAG_SKIP_ZEROS;
+    }
+    if verbose {
+        copy_flags |= COPY_CONFIG_FLAG_VERBOSE;
     }
 
     guest_mem.write_obj(COPY_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
@@ -2573,7 +2586,7 @@ fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Run the check operation (image integrity validation)
-fn run_check(args: CheckArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Validate sector size (must be power of 2, 512 to 64KB)
     if !(512..=MAX_SECTOR_SIZE).contains(&args.sector_size) || !args.sector_size.is_power_of_two() {
         eprintln!(
@@ -2666,11 +2679,14 @@ fn run_check(args: CheckArgs) -> Result<(), Box<dyn std::error::Error>> {
     guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
     debug!("Loaded operation binary at 0x{:x}", OPERATION_LOAD_ADDR);
 
-    // Write CheckConfig at OPERATION_CONFIG_ADDR (0x19000)
+    // Write CheckConfig at OPERATION_CONFIG_ADDR
     // Layout: magic (u32), flags (u32)
     let mut check_flags: u32 = 0;
     if args.quiet {
         check_flags |= CHECK_CONFIG_FLAG_QUIET;
+    }
+    if verbose {
+        check_flags |= CHECK_CONFIG_FLAG_VERBOSE;
     }
     guest_mem.write_obj(CHECK_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
     guest_mem.write_obj(check_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
