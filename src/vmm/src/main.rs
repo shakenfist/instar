@@ -73,6 +73,7 @@ const INFO_CONFIG_MAGIC: u32 = 0x494E464F; // "INFO"
 const INFO_CONFIG_FLAG_DETAILED: u32 = 1 << 0;
 const INFO_CONFIG_FLAG_SECURITY_CHECK: u32 = 1 << 1;
 const INFO_CONFIG_FLAG_UNSAFE_QUIRKS: u32 = 1 << 2;
+const INFO_CONFIG_FLAG_EXTRA_DETAIL: u32 = 1 << 3;
 
 // CheckConfig constants (must match shared crate)
 const CHECK_CONFIG_MAGIC: u32 = 0x43484543; // "CHEC"
@@ -1959,6 +1960,9 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut info_flags: u32 = INFO_CONFIG_FLAG_DETAILED | INFO_CONFIG_FLAG_SECURITY_CHECK;
     if args.unsafe_quirks {
         info_flags |= INFO_CONFIG_FLAG_UNSAFE_QUIRKS;
+    }
+    if args.extra_detail {
+        info_flags |= INFO_CONFIG_FLAG_EXTRA_DETAIL;
     }
     guest_mem.write_obj(INFO_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
     guest_mem.write_obj(info_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
