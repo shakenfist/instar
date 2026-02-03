@@ -305,6 +305,12 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
             }
             details
         }
+        Some(guest_::GuestMessage_::Payload::CheckResult(check)) => {
+            format!(
+                "check_result format={} errors={} corruptions={} leaks={} flags=0x{:x}",
+                check.format, check.total_errors, check.corruptions, check.leaks, check.flags
+            )
+        }
         None => "empty payload".to_string(),
     };
 
