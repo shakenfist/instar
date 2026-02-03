@@ -59,7 +59,7 @@ pub unsafe extern "C" fn _start() -> u64 {
         return 0;
     }
 
-    (call_table.debug_print)(b"check: start\n\0".as_ptr());
+    (call_table.verbose_print)(b"check: start\n\0".as_ptr());
 
     // Get operation config (optional)
     let config_result = (call_table.get_operation_config)();
@@ -77,7 +77,7 @@ pub unsafe extern "C" fn _start() -> u64 {
     // Calculate actual file size
     let actual_size = input_capacity * input_sector_size as u64;
 
-    (call_table.debug_print)(b"check: reading header\n\0".as_ptr());
+    (call_table.verbose_print)(b"check: reading header\n\0".as_ptr());
 
     // Buffer for reading data
     let mut buffer = [0u8; MAX_SECTOR_SIZE];
@@ -97,7 +97,7 @@ pub unsafe extern "C" fn _start() -> u64 {
     let format = detect_format(&buffer, input_sector_size);
     result.format = format as u32;
 
-    (call_table.debug_print)(b"check: detected format\n\0".as_ptr());
+    (call_table.verbose_print)(b"check: detected format\n\0".as_ptr());
 
     // Perform format-specific validation
     match format {
@@ -112,12 +112,14 @@ pub unsafe extern "C" fn _start() -> u64 {
         }
         ImageFormat::Raw => {
             // Raw format has no metadata to check
+            (call_table.verbose_print)(b"check: raw format, no metadata\n\0".as_ptr());
             result.flags |= CheckResult::FLAG_NOT_SUPPORTED;
             result.flags |= CheckResult::FLAG_VALID;
             result.image_end_offset = actual_size;
         }
         _ => {
             // Other formats: mark as not supported for now
+            (call_table.verbose_print)(b"check: format not supported\n\0".as_ptr());
             result.flags |= CheckResult::FLAG_NOT_SUPPORTED;
             result.image_end_offset = actual_size;
         }
@@ -132,7 +134,7 @@ pub unsafe extern "C" fn _start() -> u64 {
     (call_table.send_check_result)(&result);
 
     (call_table.send_complete)(b"check\0".as_ptr(), bytes_read, result.total_errors == 0);
-    (call_table.debug_print)(b"check: done\n\0".as_ptr());
+    (call_table.verbose_print)(b"check: done\n\0".as_ptr());
 
     bytes_read
 }
@@ -496,7 +498,7 @@ unsafe fn check_qcow2(
         result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
     }
 
-    (call_table.debug_print)(b"check: qcow2 check complete\n\0".as_ptr());
+    (call_table.verbose_print)(b"check: qcow2 check complete\n\0".as_ptr());
 
     bytes_read
 }
