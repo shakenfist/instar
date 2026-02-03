@@ -1804,7 +1804,7 @@ fn run_config(args: ConfigArgs) -> Result<(), Box<dyn std::error::Error>> {
             for (path, error) in &errors {
                 eprintln!("  {}: {}", path.display(), error);
             }
-            std::process::exit(1);
+            Err("configuration validation failed".into())
         }
     } else {
         // Display effective configuration
@@ -1819,11 +1819,11 @@ fn run_config(args: ConfigArgs) -> Result<(), Box<dyn std::error::Error>> {
 fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Validate sector size (must be power of 2, 512 to 64KB)
     if !(512..=MAX_SECTOR_SIZE).contains(&args.sector_size) || !args.sector_size.is_power_of_two() {
-        eprintln!(
-            "Error: sector size must be a power of 2, 512 to {} (got {})",
+        return Err(format!(
+            "sector size must be a power of 2, 512 to {} (got {})",
             MAX_SECTOR_SIZE, args.sector_size
-        );
-        std::process::exit(1);
+        )
+        .into());
     }
 
     // Handle --chain flag: discover and display backing file chain
@@ -1837,8 +1837,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
                 return Ok(());
             }
             Err(e) => {
-                eprintln!("Error discovering backing chain: {}", e);
-                std::process::exit(1);
+                return Err(format!("error discovering backing chain: {}", e).into());
             }
         }
     }
@@ -1851,11 +1850,11 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
                 p
             }
             None => {
-                eprintln!(
-                    "Error: invalid qemu version '{}' (expected format: X.Y)",
+                return Err(format!(
+                    "invalid qemu version '{}' (expected format: X.Y)",
                     version_str
-                );
-                std::process::exit(1);
+                )
+                .into());
             }
         }
     } else {
@@ -2076,6 +2075,9 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     // Run the vCPU loop
     debug!("Starting guest execution");
 
+    // Track VM errors - if set, we return an error instead of Ok(())
+    let mut vm_error: Option<String> = None;
+
     loop {
         match vcpu.run()? {
             VcpuExit::Hlt => {
@@ -2178,16 +2180,22 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
                         STACK_BASE, STACK_TOP, STACK_SIZE
                     );
                 }
+                vm_error = Some("VM shutdown (triple fault)".to_string());
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
                 vmm_stats.lock().unwrap().record_fail_entry();
                 eprintln!("VM Entry Failed! reason=0x{:x}, cpu={}", reason, cpu);
+                vm_error = Some(format!(
+                    "VM entry failed: reason=0x{:x}, cpu={}",
+                    reason, cpu
+                ));
                 break;
             }
             exit => {
                 vmm_stats.lock().unwrap().record_unknown();
                 eprintln!("Unexpected VM exit: {:?}", exit);
+                vm_error = Some(format!("unexpected VM exit: {:?}", exit));
                 break;
             }
         }
@@ -2201,6 +2209,11 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
         vmm_stats.lock().unwrap().display();
     }
 
+    // Return error if VM crashed or failed
+    if let Some(error) = vm_error {
+        return Err(error.into());
+    }
+
     Ok(())
 }
 
@@ -2212,11 +2225,11 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
         ("output", args.output_sector_size),
     ] {
         if !(512..=MAX_SECTOR_SIZE).contains(&size) || !size.is_power_of_two() {
-            eprintln!(
-                "Error: {} sector size must be a power of 2, 512 to {} (got {})",
+            return Err(format!(
+                "{} sector size must be a power of 2, 512 to {} (got {})",
                 name, MAX_SECTOR_SIZE, size
-            );
-            std::process::exit(1);
+            )
+            .into());
         }
     }
 
@@ -2454,6 +2467,9 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     // Run the vCPU loop
     debug!("Starting guest execution");
 
+    // Track VM errors - if set, we return an error instead of Ok(())
+    let mut vm_error: Option<String> = None;
+
     loop {
         match vcpu.run()? {
             VcpuExit::Hlt => {
@@ -2559,16 +2575,22 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
                     GUEST_MEM_SIZE, GUEST_MEM_SIZE
                 );
                 eprintln!("Code base: 0x{:x}", GUEST_CODE_BASE);
+                vm_error = Some("VM shutdown (triple fault)".to_string());
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
                 vmm_stats.lock().unwrap().record_fail_entry();
                 eprintln!("VM Entry Failed! reason=0x{:x}, cpu={}", reason, cpu);
+                vm_error = Some(format!(
+                    "VM entry failed: reason=0x{:x}, cpu={}",
+                    reason, cpu
+                ));
                 break;
             }
             exit => {
                 vmm_stats.lock().unwrap().record_unknown();
                 eprintln!("Unexpected VM exit: {:?}", exit);
+                vm_error = Some(format!("unexpected VM exit: {:?}", exit));
                 break;
             }
         }
@@ -2582,6 +2604,11 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
         vmm_stats.lock().unwrap().display();
     }
 
+    // Return error if VM crashed or failed
+    if let Some(error) = vm_error {
+        return Err(error.into());
+    }
+
     Ok(())
 }
 
@@ -2589,11 +2616,11 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
 fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Validate sector size (must be power of 2, 512 to 64KB)
     if !(512..=MAX_SECTOR_SIZE).contains(&args.sector_size) || !args.sector_size.is_power_of_two() {
-        eprintln!(
-            "Error: sector size must be a power of 2, 512 to {} (got {})",
+        return Err(format!(
+            "sector size must be a power of 2, 512 to {} (got {})",
             MAX_SECTOR_SIZE, args.sector_size
-        );
-        std::process::exit(1);
+        )
+        .into());
     }
 
     // Auto-discover binaries in same directory as executable
@@ -2789,6 +2816,9 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     // Track check result for exit code
     let mut check_passed = true;
 
+    // Track VM errors - if set, we return an error instead of Ok(())
+    let mut vm_error: Option<String> = None;
+
     // Run the vCPU loop
     debug!("Starting guest execution");
 
@@ -2875,11 +2905,22 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
             VcpuExit::Shutdown => {
                 vmm_stats.lock().unwrap().record_shutdown();
                 eprintln!("\n--- VM Shutdown (triple fault?) ---");
+                vm_error = Some("VM shutdown (triple fault)".to_string());
+                break;
+            }
+            VcpuExit::FailEntry(reason, cpu) => {
+                vmm_stats.lock().unwrap().record_fail_entry();
+                eprintln!("VM Entry Failed! reason=0x{:x}, cpu={}", reason, cpu);
+                vm_error = Some(format!(
+                    "VM entry failed: reason=0x{:x}, cpu={}",
+                    reason, cpu
+                ));
                 break;
             }
             exit => {
                 vmm_stats.lock().unwrap().record_unknown();
                 eprintln!("Unexpected VM exit: {:?}", exit);
+                vm_error = Some(format!("unexpected VM exit: {:?}", exit));
                 break;
             }
         }
@@ -2893,9 +2934,14 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
         vmm_stats.lock().unwrap().display();
     }
 
-    // Exit with non-zero code if check failed
+    // Return error if VM crashed or failed
+    if let Some(error) = vm_error {
+        return Err(error.into());
+    }
+
+    // Return error if check failed (image has errors or is invalid)
     if !check_passed {
-        std::process::exit(1);
+        return Err("image check failed: errors detected".into());
     }
 
     Ok(())

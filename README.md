@@ -363,6 +363,7 @@ This project includes Claude Code skills for common development tasks:
 - `/imago-calltable [function]` - Call table API documentation
 - `/imago-add-test-image` - Add a new image to the integration test suite
 - `/verbose-print` - Guidelines for adding diagnostic verbose_print() calls
+- `/error-handling` - Ensure all error conditions return proper exit codes
 
 Additional development skills:
 - `.claude/skills/build-and-test.md` - Correct build/test patterns (always use
@@ -375,6 +376,8 @@ Additional development skills:
   user-visible change requires docs updates)
 - `.claude/skills/correct-fixes.md` - Fix root causes, not symptoms (security
   project: always do things the right way, not the easy way)
+- `.claude/skills/error-handling.md` - Error propagation patterns (never use
+  exit(), always return errors with context)
 
 See `.claude/skills/` for details.
 
