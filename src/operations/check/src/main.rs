@@ -466,13 +466,20 @@ unsafe fn check_qcow2(
         return bytes_read;
     }
 
-    // Cluster bits and size
+    // Cluster bits and size (QCOW2 spec: valid range is 9-21)
     let cluster_bits = u32::from_be_bytes([
         header[QCOW2_CLUSTER_BITS_OFFSET],
         header[QCOW2_CLUSTER_BITS_OFFSET + 1],
         header[QCOW2_CLUSTER_BITS_OFFSET + 2],
         header[QCOW2_CLUSTER_BITS_OFFSET + 3],
     ]);
+    if cluster_bits < 9 || cluster_bits > 21 {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+        (call_table.debug_print)(b"check: invalid cluster_bits\n\0".as_ptr());
+        return bytes_read;
+    }
     let cluster_size = 1u64 << cluster_bits;
 
     // Virtual size
