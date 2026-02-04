@@ -606,7 +606,6 @@
             "safety": "safe",
             "run_in_ci": false,
             "skip_qemu_img": true,
-            "unsafe_quirks_required": true,
             "description": "LUKS version 1 header for format detection testing",
             "tags": ["luks", "luks1", "encrypted", "format-coverage"],
             "sha256": "d13420d86afe0828d046430939647c46433231422b54979edc7c160e0e0f9244"
@@ -618,7 +617,6 @@
             "safety": "safe",
             "run_in_ci": false,
             "skip_qemu_img": true,
-            "unsafe_quirks_required": true,
             "description": "LUKS version 2 header for format detection testing",
             "tags": ["luks", "luks2", "encrypted", "format-coverage"],
             "sha256": "0961fc4aaed74ca9acd9ac11430f2ffc00bc2b2696599a3e04325ff91e51ec26"
