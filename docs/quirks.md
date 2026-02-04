@@ -693,6 +693,80 @@ The imago-testdata repository includes corrupt test images for validation:
 | Default (secure) | All formats | QCOW2, VMDK, VHDX, VHD |
 | `--unsafe-quirks` | QCOW2 only | QCOW2 only |
 
+## Check JSON Schema Consistency
+
+**Classification: Safe Quirk** - Affects JSON output schema predictability.
+
+### Observed Behavior
+
+`qemu-img check --output=json` conditionally omits fields from its JSON
+output when their values are zero. For example, a QCOW2 image with no
+corruptions produces:
+
+```json
+{
+    "filename": "test.qcow2",
+    "format": "qcow2",
+    "check-errors": 0,
+    "image-end-offset": 262144,
+    "total-clusters": 2,
+    "allocated-clusters": 0,
+    "fragmented-clusters": 0
+}
+```
+
+The `corruptions`, `leaks`, and `refcount-errors` fields are absent.
+They only appear when their values are greater than zero:
+
+```json
+{
+    "filename": "corrupt.qcow2",
+    "format": "qcow2",
+    "check-errors": 3,
+    "corruptions": 3,
+    "image-end-offset": 262144,
+    ...
+}
+```
+
+### Why This Matters
+
+1. **Inconsistent schema**: Callers must handle both the presence and
+   absence of these fields, adding complexity to JSON parsing.
+
+2. **Brittle tooling**: Tools that expect a fixed set of fields may
+   break when corruptions are first encountered, or may silently
+   treat missing fields as absent rather than zero.
+
+3. **API contract ambiguity**: It is unclear whether a missing field
+   means "zero errors" or "not checked".
+
+### imago Behavior
+
+**Default behavior (consistent schema)**: imago always includes
+`corruptions`, `leaks`, and `refcount-errors` in JSON output,
+regardless of their values. This provides a predictable, fixed schema
+that callers can rely on:
+
+```json
+{
+    "filename": "test.qcow2",
+    "format": "qcow2",
+    "check-errors": 0,
+    "corruptions": 0,
+    "leaks": 0,
+    "refcount-errors": 0,
+    "image-end-offset": 262144,
+    "total-clusters": 2,
+    "allocated-clusters": 0,
+    "fragmented-clusters": 0
+}
+```
+
+**With `--unsafe-quirks` flag**: imago matches qemu-img's behavior,
+omitting `corruptions`, `leaks`, and `refcount-errors` when their
+values are zero.
+
 ## Future Additions
 
 Additional quirks will be documented here as they are discovered during

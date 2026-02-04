@@ -2859,7 +2859,12 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
                                         && result.total_errors == 0;
                                 }
                                 if !args.quiet || !check_passed {
-                                    print_check_result(&msg, &args.input, &args.output);
+                                    print_check_result(
+                                        &msg,
+                                        &args.input,
+                                        &args.output,
+                                        args.unsafe_quirks,
+                                    );
                                 }
                             } else {
                                 debug!("{}", format_message(&msg));
@@ -2958,7 +2963,12 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
 }
 
 /// Print check result in human-readable or JSON format
-fn print_check_result(msg: &guest_::GuestMessage, filename: &str, output_format: &str) {
+fn print_check_result(
+    msg: &guest_::GuestMessage,
+    filename: &str,
+    output_format: &str,
+    unsafe_quirks: bool,
+) {
     if let Some(guest_::GuestMessage_::Payload::CheckResult(result)) = &msg.payload {
         // Get absolute path for filename
         let abs_path = std::fs::canonicalize(filename)
@@ -2966,7 +2976,7 @@ fn print_check_result(msg: &guest_::GuestMessage, filename: &str, output_format:
             .unwrap_or_else(|_| filename.to_string());
 
         if output_format == "json" {
-            print_check_result_json(result, &abs_path);
+            print_check_result_json(result, &abs_path, unsafe_quirks);
             return;
         }
 
@@ -3019,7 +3029,16 @@ fn print_check_result(msg: &guest_::GuestMessage, filename: &str, output_format:
 }
 
 /// Print check result in JSON format
-fn print_check_result_json(result: &guest_protocol::guest_::CheckResultMessage, filename: &str) {
+///
+/// When `unsafe_quirks` is true, fields with zero values (corruptions,
+/// leaks, refcount-errors) are omitted to match qemu-img check's
+/// conditional schema. When false, all fields are always emitted for a
+/// consistent, predictable JSON schema.
+fn print_check_result_json(
+    result: &guest_protocol::guest_::CheckResultMessage,
+    filename: &str,
+    unsafe_quirks: bool,
+) {
     println!("{{");
     println!("    \"filename\": \"{}\",", escape_json_string(filename));
     println!(
@@ -3027,13 +3046,13 @@ fn print_check_result_json(result: &guest_protocol::guest_::CheckResultMessage, 
         escape_json_string(&result.format)
     );
     println!("    \"check-errors\": {},", result.total_errors);
-    if result.corruptions > 0 {
+    if !unsafe_quirks || result.corruptions > 0 {
         println!("    \"corruptions\": {},", result.corruptions);
     }
-    if result.leaks > 0 {
+    if !unsafe_quirks || result.leaks > 0 {
         println!("    \"leaks\": {},", result.leaks);
     }
-    if result.refcount_errors > 0 {
+    if !unsafe_quirks || result.refcount_errors > 0 {
         println!("    \"refcount-errors\": {},", result.refcount_errors);
     }
     println!("    \"image-end-offset\": {},", result.image_end_offset);
