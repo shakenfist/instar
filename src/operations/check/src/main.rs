@@ -78,7 +78,7 @@ pub unsafe extern "C" fn _start() -> u64 {
     let input_sector_size = (call_table.get_input_sector_size)(0);
 
     // Calculate actual file size
-    let actual_size = input_capacity * input_sector_size as u64;
+    let actual_size = input_capacity.saturating_mul(input_sector_size as u64);
 
     (call_table.verbose_print)(b"check: reading header\n\0".as_ptr());
 
