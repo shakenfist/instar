@@ -596,6 +596,103 @@ ISO 9660 detection checks for:
 The detection is performed after other format checks (QCOW2, VMDK, VHD, etc.)
 but before the partition table validation for raw images.
 
+## Check Operation Format Handling
+
+**Classification: Unsafe Quirk** - Related to format identification and validation
+accuracy.
+
+### Quirk 1: Format Misidentification
+
+#### Observed Behavior
+
+`qemu-img check` only recognizes QCOW2 format. All other image formats (VMDK,
+VHDX, VHD, VDI, etc.) are treated as "raw" format:
+
+```bash
+$ qemu-img check image.vmdk
+qemu-img: Could not open 'image.vmdk': Unknown image format
+# Or with older versions:
+This image format does not support checks
+```
+
+qemu-img does not attempt to detect the actual format when running check.
+
+#### Why This Matters
+
+1. **Format misidentification**: A valid VMDK image is not recognized as VMDK -
+   it's either rejected or processed as unknown/raw format.
+
+2. **Reduced visibility**: Administrators cannot determine what format an image
+   actually is using `qemu-img check`.
+
+#### imago Behavior
+
+**Default behavior (secure)**: imago detects the actual format of the image
+using the same detection logic as `imago info`. VMDK images are identified as
+"vmdk", VHDX as "vhdx", etc.
+
+**With `--unsafe-quirks` flag**: imago matches qemu-img's behavior, only
+detecting QCOW2 format. All other formats are reported as "raw".
+
+### Quirk 2: Lack of Validation for Non-QCOW2 Formats
+
+#### Observed Behavior
+
+`qemu-img check` only performs structural validation for QCOW2 images. For all
+other formats, it reports that checks are not supported and exits with success:
+
+```bash
+$ qemu-img check simple.vmdk
+This image format does not support checks
+$ echo $?
+0  # Success exit code despite no validation performed
+```
+
+This means a corrupt VMDK, VHDX, or VHD file would appear to "pass" the check
+simply because qemu-img didn't actually examine it.
+
+#### Why This Matters
+
+1. **False sense of security**: Users may believe an image has been validated
+   when no validation occurred.
+
+2. **Missed corruptions**: Corrupt headers, invalid offsets, and malformed
+   metadata are not detected for non-QCOW2 formats.
+
+#### imago Behavior
+
+**Default behavior (secure)**: imago performs format-appropriate validation for
+supported formats:
+
+- **VMDK**: Validates header version (1-3), capacity > 0, grain size power of 2,
+  descriptor offset within file bounds
+- **VHDX**: Validates file signature and region table signature at offset 0x30000
+- **VHD**: Validates footer cookie and disk type (2=fixed, 3=dynamic, 4=diff)
+
+Images with structural problems are marked with `FLAG_HAS_CORRUPTIONS` and
+report specific error counts. Images that pass validation are marked `FLAG_VALID`.
+
+**With `--unsafe-quirks` flag**: imago skips validation for non-QCOW2 formats,
+matching qemu-img's behavior. Non-QCOW2 images are marked as
+`FLAG_NOT_SUPPORTED | FLAG_VALID` without examination.
+
+### Test Images
+
+The imago-testdata repository includes corrupt test images for validation:
+
+| Image | Format | Corruption |
+|-------|--------|------------|
+| `vmdk-corrupt-version.vmdk` | VMDK | Invalid version (255) |
+| `vhdx-corrupt-region.vhdx` | VHDX | Invalid region table signature |
+| `vhd-corrupt-disktype.vhd` | VHD | Invalid disk type (255) |
+
+### Summary
+
+| Mode | Format Detection | Validation |
+|------|------------------|------------|
+| Default (secure) | All formats | QCOW2, VMDK, VHDX, VHD |
+| `--unsafe-quirks` | QCOW2 only | QCOW2 only |
+
 ## Future Additions
 
 Additional quirks will be documented here as they are discovered during

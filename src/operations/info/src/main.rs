@@ -10,17 +10,15 @@
 use core::panic::PanicInfo;
 
 use shared::{
+    format_detection::{
+        detect_format_from_header, detect_iso_at_offset, detect_vhd_footer, ISO_MAGIC_BYTE_OFFSET,
+        VDI_SIGNATURE_OFFSET, VHD_COOKIE,
+    },
     CallTable, ImageFormat, InfoConfig, InfoResult, Qcow2Info, VdiInfo, VmdkInfo, CALL_TABLE_ADDR,
     MAX_SECTOR_SIZE,
 };
 
-// Magic numbers for format detection (big-endian where noted)
-const QCOW2_MAGIC: u32 = 0x514649fb; // "QFI\xfb" (big-endian at offset 0)
-const QCOW1_MAGIC: u32 = 0x514649; // "QFI" (big-endian at offset 0, 3 bytes)
-const VMDK4_MAGIC: u32 = 0x564d444b; // "VMDK" (little-endian at offset 0)
-const VMDK3_MAGIC: u32 = 0x434f5744; // "COWD" (little-endian at offset 0)
-const VHD_COOKIE: u64 = 0x636f6e6563746978; // "conectix" (big-endian at footer offset 0)
-const VDI_MAGIC: u32 = 0xbeda107f; // VDI signature (little-endian at offset 64)
+// Note: Magic numbers for format detection are in shared::format_detection
 
 // VHD footer offsets (big-endian)
 const VHD_FOOTER_CREATOR_APP_OFFSET: usize = 28; // Creator application (4 bytes ASCII)
@@ -110,7 +108,7 @@ const VHDX_METADATA_ITEM_OFFSET: u64 = 0x10000; // File Parameters start here
                                                 // - Offset 8: Virtual Disk Size (8 bytes LE)
 
 // VDI header offsets (all little-endian)
-const VDI_SIGNATURE_OFFSET: usize = 64; // Magic signature
+// Note: VDI_SIGNATURE_OFFSET is in shared::format_detection
 const VDI_VERSION_OFFSET: usize = 68; // Version (1.1 = 0x00010001)
 const VDI_HEADER_SIZE_OFFSET: usize = 72; // Size of header
 const VDI_IMAGE_TYPE_OFFSET: usize = 76; // 1=dynamic, 2=fixed
@@ -121,7 +119,7 @@ const VDI_BLOCKS_ALLOCATED_OFFSET: usize = 388; // Allocated blocks (u32)
 const VDI_UUID_OFFSET: usize = 392; // UUID (16 bytes)
 
 // QED format constants (deprecated QEMU format, all little-endian)
-const QED_MAGIC: u32 = 0x00444551; // "QED\0" at offset 0
+// Note: QED_MAGIC is in shared::format_detection
 const QED_CLUSTER_SIZE_OFFSET: usize = 4; // Cluster size in bytes (u32)
 const QED_TABLE_SIZE_OFFSET: usize = 8; // L1/L2 table size in clusters (u32)
 const QED_HEADER_SIZE_OFFSET: usize = 12; // Header size in bytes (u32)
@@ -129,17 +127,11 @@ const QED_IMAGE_SIZE_OFFSET: usize = 48; // Virtual size in bytes (u64)
 const QED_BACKING_FILENAME_OFFSET_OFFSET: usize = 56; // Backing filename offset (u32)
 const QED_BACKING_FILENAME_SIZE_OFFSET: usize = 60; // Backing filename size (u32)
 
-// ISO 9660 format constants
-// ISO 9660 Primary Volume Descriptor starts at byte offset 32768 (sector 16 for 2048-byte CD sectors)
-// Byte 0: Volume Descriptor Type (1 = Primary)
-// Bytes 1-5: "CD001" standard identifier
-const ISO_MAGIC_BYTE_OFFSET: usize = 32769; // Absolute byte offset of "CD001" (32768 + 1)
-const ISO_MAGIC: &[u8; 5] = b"CD001"; // ISO 9660 standard identifier
+// Note: ISO_MAGIC_BYTE_OFFSET and ISO_MAGIC are in shared::format_detection
 
 // LUKS format constants (Linux encrypted container)
 // LUKS magic is "LUKS\xba\xbe" (6 bytes) at offset 0
-// Version is big-endian u16 at offset 6 (1 for LUKS1, 2 for LUKS2)
-const LUKS_MAGIC: [u8; 6] = [0x4c, 0x55, 0x4b, 0x53, 0xba, 0xbe]; // "LUKS\xba\xbe"
+// Note: LUKS_MAGIC is in shared::format_detection
 const LUKS_VERSION_OFFSET: usize = 6; // Version (big-endian u16)
 
 /// Entry point called by core after devices are initialized.
@@ -201,7 +193,7 @@ pub unsafe extern "C" fn _start() -> u64 {
     // Detect format based on magic numbers (first sector)
     // Pass extra_detail flag to control detection of formats like LUKS that qemu-img
     // doesn't recognize - these are only shown with --extra-detail
-    let mut format = detect_format_header(&buffer, input_sector_size, extra_detail);
+    let mut format = detect_format_from_header(&buffer, input_sector_size, extra_detail);
 
     // Buffer for VHD footer (may be reused)
     let mut footer_buffer = [0u8; MAX_SECTOR_SIZE];
@@ -495,123 +487,8 @@ fn format_to_str(format: ImageFormat) -> *const u8 {
     }
 }
 
-/// Detect image format based on magic numbers in file header (first sector)
-/// Detect format from file header magic bytes.
-///
-/// When `extra_detail` is true, also detects formats like LUKS that qemu-img
-/// doesn't recognize. When false, these are reported as raw for compatibility.
-fn detect_format_header(buffer: &[u8], len: usize, extra_detail: bool) -> ImageFormat {
-    if len < 8 {
-        return ImageFormat::Unknown;
-    }
-
-    // Check QCOW2/QCOW1 magic (big-endian)
-    let magic_be = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
-    if magic_be == QCOW2_MAGIC {
-        return ImageFormat::Qcow2;
-    }
-    // QCOW1 has 3-byte magic
-    if (magic_be >> 8) == QCOW1_MAGIC {
-        return ImageFormat::Qcow1;
-    }
-
-    // Check VMDK magic (little-endian)
-    let magic_le = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
-    if magic_le == VMDK4_MAGIC {
-        return ImageFormat::Vmdk4;
-    }
-    if magic_le == VMDK3_MAGIC {
-        return ImageFormat::Vmdk3;
-    }
-
-    // Check QED magic (little-endian "QED\0")
-    if magic_le == QED_MAGIC {
-        return ImageFormat::Qed;
-    }
-
-    // Check VHDX magic (little-endian, "vhdxfile" signature)
-    let vhdx_sig = u64::from_le_bytes([
-        buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
-    ]);
-    // "vhdxfile" in little-endian
-    if vhdx_sig == 0x656c696678646876 {
-        return ImageFormat::Vhdx;
-    }
-
-    // Check for VHD/VPC magic "conectix" (big-endian)
-    // Dynamic VHDs have a footer copy at the start of the file
-    let vhd_cookie = u64::from_be_bytes([
-        buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
-    ]);
-    if vhd_cookie == VHD_COOKIE {
-        return ImageFormat::Vhd;
-    }
-
-    // Check VDI magic at offset 64 (little-endian)
-    // VDI header starts with text signature, magic is at offset 64
-    if len >= VDI_SIGNATURE_OFFSET + 4 {
-        let vdi_magic = u32::from_le_bytes([
-            buffer[VDI_SIGNATURE_OFFSET],
-            buffer[VDI_SIGNATURE_OFFSET + 1],
-            buffer[VDI_SIGNATURE_OFFSET + 2],
-            buffer[VDI_SIGNATURE_OFFSET + 3],
-        ]);
-        if vdi_magic == VDI_MAGIC {
-            return ImageFormat::Vdi;
-        }
-    }
-
-    // Check LUKS magic at offset 0 (6 bytes: "LUKS\xba\xbe")
-    // Only detect LUKS with --extra-detail since qemu-img doesn't recognize it
-    if extra_detail && len >= 6 && buffer[0..6] == LUKS_MAGIC {
-        return ImageFormat::Luks;
-    }
-
-    // Fixed VHD has its signature only at the end, handled separately
-    // If no known format detected from header, assume raw (may be overridden)
-    ImageFormat::Raw
-}
-
-/// Detect VHD format from file footer (last 512 bytes)
-fn detect_vhd_footer(buffer: &[u8]) -> ImageFormat {
-    if buffer.len() < 8 {
-        return ImageFormat::Raw;
-    }
-
-    // VHD footer starts with "conectix" cookie (big-endian)
-    let cookie = u64::from_be_bytes([
-        buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
-    ]);
-
-    if cookie == VHD_COOKIE {
-        return ImageFormat::Vhd;
-    }
-
-    ImageFormat::Raw
-}
-
-/// Detect ISO 9660 format from buffer at the given offset
-///
-/// ISO 9660 format has the Primary Volume Descriptor at byte offset 32768.
-/// The structure is:
-/// - Byte 0: Volume Descriptor Type (1 = Primary Volume Descriptor)
-/// - Bytes 1-5: Standard Identifier "CD001"
-/// - Byte 6: Version (1)
-///
-/// The offset parameter should point to byte 32769 (where "CD001" starts).
-fn detect_iso_at_offset(buffer: &[u8], offset: usize) -> ImageFormat {
-    // Need at least offset + 5 bytes to check "CD001" magic
-    if buffer.len() < offset + 5 {
-        return ImageFormat::Raw;
-    }
-
-    // Check for "CD001" at the given offset
-    if buffer[offset..offset + 5] == *ISO_MAGIC {
-        return ImageFormat::Iso;
-    }
-
-    ImageFormat::Raw
-}
+// Note: detect_format_from_header, detect_vhd_footer, detect_iso_at_offset are
+// now in shared::format_detection
 
 /// Partition table type for RAW image validation
 #[derive(Clone, Copy, PartialEq, Eq)]
