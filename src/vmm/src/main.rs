@@ -3024,7 +3024,10 @@ fn print_check_result(msg: &guest_::GuestMessage, filename: &str, output_format:
 fn print_check_result_json(result: &guest_protocol::guest_::CheckResultMessage, filename: &str) {
     println!("{{");
     println!("    \"filename\": \"{}\",", escape_json_string(filename));
-    println!("    \"format\": \"{}\",", result.format);
+    println!(
+        "    \"format\": \"{}\",",
+        escape_json_string(&result.format)
+    );
     println!("    \"check-errors\": {},", result.total_errors);
     if result.corruptions > 0 {
         println!("    \"corruptions\": {},", result.corruptions);
