@@ -67,6 +67,8 @@ const CHAIN_CONFIG_ADDR: u64 = shared::CHAIN_CONFIG_ADDR as u64;
 const COPY_CONFIG_MAGIC: u32 = 0x434F5059; // "COPY"
 const COPY_CONFIG_FLAG_VERIFY: u32 = 1 << 0;
 const COPY_CONFIG_FLAG_SKIP_ZEROS: u32 = 1 << 1;
+#[allow(dead_code)]
+const COPY_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
 
 // InfoConfig constants (must match shared crate)
 const INFO_CONFIG_MAGIC: u32 = 0x494E464F; // "INFO"
@@ -75,10 +77,6 @@ const INFO_CONFIG_FLAG_SECURITY_CHECK: u32 = 1 << 1;
 const INFO_CONFIG_FLAG_UNSAFE_QUIRKS: u32 = 1 << 2;
 const INFO_CONFIG_FLAG_EXTRA_DETAIL: u32 = 1 << 3;
 const INFO_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
-
-// CopyConfig constants (must match shared crate)
-#[allow(dead_code)]
-const COPY_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
 
 // CheckConfig constants (must match shared crate)
 const CHECK_CONFIG_MAGIC: u32 = 0x43484543; // "CHEC"
