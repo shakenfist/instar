@@ -5,6 +5,7 @@
 
 #![no_std]
 
+pub mod format_detection;
 pub mod virtio;
 
 /// Address where the call table is located (set by core)
@@ -762,6 +763,13 @@ impl CheckConfig {
     /// Flag: Suppress output (quiet mode)
     pub const FLAG_QUIET: u32 = 1 << 1;
 
+    /// Flag: Enable unsafe quirks mode (qemu-img compatible behavior).
+    /// When enabled, non-QCOW2 formats are treated as "raw" and validation
+    /// is skipped for non-QCOW2 formats (matching qemu-img check behavior).
+    /// When disabled (default), imago detects the real format and performs
+    /// format-appropriate validation.
+    pub const FLAG_UNSAFE_QUIRKS: u32 = 1 << 2;
+
     /// Create a default config
     pub const fn default_config() -> Self {
         Self {
@@ -783,6 +791,11 @@ impl CheckConfig {
     /// Check if quiet flag is set
     pub fn is_quiet(&self) -> bool {
         (self.flags & Self::FLAG_QUIET) != 0
+    }
+
+    /// Check if unsafe quirks flag is set
+    pub fn unsafe_quirks_enabled(&self) -> bool {
+        (self.flags & Self::FLAG_UNSAFE_QUIRKS) != 0
     }
 }
 

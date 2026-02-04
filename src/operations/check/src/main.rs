@@ -14,10 +14,13 @@
 
 use core::panic::PanicInfo;
 
-use shared::{CallTable, CheckConfig, CheckResult, ImageFormat, CALL_TABLE_ADDR, MAX_SECTOR_SIZE};
+use shared::{
+    format_detection::{detect_format_from_header, detect_vhd_footer, VHD_COOKIE},
+    CallTable, CheckConfig, CheckResult, ImageFormat, CALL_TABLE_ADDR, MAX_SECTOR_SIZE,
+};
 
-// Magic numbers for format detection (big-endian where noted)
-const QCOW2_MAGIC: u32 = 0x514649fb; // "QFI\xfb" (big-endian at offset 0)
+// Note: Format detection magic constants are in shared::format_detection
+// QCOW2_MAGIC is implicitly used via detect_format_from_header
 
 // QCOW2 header offsets (big-endian)
 const QCOW2_VERSION_OFFSET: usize = 4;
@@ -64,10 +67,10 @@ pub unsafe extern "C" fn _start() -> u64 {
     // Get operation config (optional)
     let config_result = (call_table.get_operation_config)();
     let config = &*(config_result.ptr as *const CheckConfig);
-    let _quiet = if config.is_valid() {
-        config.is_quiet()
+    let (_quiet, unsafe_quirks) = if config.is_valid() {
+        (config.is_quiet(), config.unsafe_quirks_enabled())
     } else {
-        false
+        (false, false)
     };
 
     // Get device parameters (device 0 = primary input)
@@ -94,7 +97,32 @@ pub unsafe extern "C" fn _start() -> u64 {
     let mut result = CheckResult::new();
 
     // Detect format based on magic numbers
-    let format = detect_format(&buffer, input_sector_size);
+    // If unsafe_quirks is enabled, only detect QCOW2 (qemu-img compatible behavior)
+    // Otherwise, detect all supported formats
+    let mut format = if unsafe_quirks {
+        // qemu-img check only recognizes QCOW2, treats everything else as raw
+        detect_qcow2_only(&buffer, input_sector_size)
+    } else {
+        // Secure mode: detect all formats properly
+        detect_format_from_header(&buffer, input_sector_size, false)
+    };
+
+    // If format is still Raw and we're not in unsafe_quirks mode, check for VHD footer
+    // (fixed VHDs have their signature at the end of the file)
+    if format == ImageFormat::Raw && !unsafe_quirks && input_capacity > 0 {
+        let last_sector = input_capacity - 1;
+        let mut footer_buffer = [0u8; MAX_SECTOR_SIZE];
+        if (call_table.read_input_sector)(
+            0,
+            last_sector,
+            footer_buffer.as_mut_ptr(),
+            input_sector_size,
+        ) {
+            bytes_read += input_sector_size as u64;
+            format = detect_vhd_footer(&footer_buffer);
+        }
+    }
+
     result.format = format as u32;
 
     (call_table.verbose_print)(b"check: detected format\n\0".as_ptr());
@@ -110,6 +138,61 @@ pub unsafe extern "C" fn _start() -> u64 {
                 actual_size,
             );
         }
+        ImageFormat::Vmdk4 | ImageFormat::Vmdk3 => {
+            if unsafe_quirks {
+                // qemu-img compatible: no validation for non-QCOW2
+                (call_table.verbose_print)(b"check: vmdk not supported (quirks)\n\0".as_ptr());
+                result.flags |= CheckResult::FLAG_NOT_SUPPORTED;
+                result.flags |= CheckResult::FLAG_VALID;
+            } else {
+                // Validate VMDK header
+                bytes_read += check_vmdk(&buffer, &mut result, actual_size);
+            }
+            result.image_end_offset = actual_size;
+        }
+        ImageFormat::Vhdx => {
+            if unsafe_quirks {
+                (call_table.verbose_print)(b"check: vhdx not supported (quirks)\n\0".as_ptr());
+                result.flags |= CheckResult::FLAG_NOT_SUPPORTED;
+                result.flags |= CheckResult::FLAG_VALID;
+            } else {
+                // Validate VHDX structure
+                bytes_read += check_vhdx(&mut result, call_table, input_sector_size, actual_size);
+            }
+            result.image_end_offset = actual_size;
+        }
+        ImageFormat::Vhd => {
+            if unsafe_quirks {
+                (call_table.verbose_print)(b"check: vhd not supported (quirks)\n\0".as_ptr());
+                result.flags |= CheckResult::FLAG_NOT_SUPPORTED;
+                result.flags |= CheckResult::FLAG_VALID;
+            } else {
+                // Validate VHD footer
+                // For dynamic VHD, footer is at start; for fixed, we already read it
+                let vhd_cookie = u64::from_be_bytes([
+                    buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6],
+                    buffer[7],
+                ]);
+                if vhd_cookie == VHD_COOKIE {
+                    // Dynamic VHD - footer at start
+                    check_vhd_footer(&buffer, &mut result);
+                } else {
+                    // Fixed VHD - need to read last sector again
+                    let last_sector = input_capacity - 1;
+                    let mut footer_buffer = [0u8; MAX_SECTOR_SIZE];
+                    if (call_table.read_input_sector)(
+                        0,
+                        last_sector,
+                        footer_buffer.as_mut_ptr(),
+                        input_sector_size,
+                    ) {
+                        bytes_read += input_sector_size as u64;
+                        check_vhd_footer(&footer_buffer, &mut result);
+                    }
+                }
+            }
+            result.image_end_offset = actual_size;
+        }
         ImageFormat::Raw => {
             // Raw format has no metadata to check
             (call_table.verbose_print)(b"check: raw format, no metadata\n\0".as_ptr());
@@ -118,7 +201,8 @@ pub unsafe extern "C" fn _start() -> u64 {
             result.image_end_offset = actual_size;
         }
         _ => {
-            // Other formats: mark as not supported for now
+            // Other formats: mark as not supported
+            // Note: We still detect the correct format, but don't validate it yet
             (call_table.verbose_print)(b"check: format not supported\n\0".as_ptr());
             result.flags |= CheckResult::FLAG_NOT_SUPPORTED;
             result.image_end_offset = actual_size;
@@ -139,20 +223,213 @@ pub unsafe extern "C" fn _start() -> u64 {
     bytes_read
 }
 
-/// Detect image format based on magic numbers in file header
-fn detect_format(buffer: &[u8], len: usize) -> ImageFormat {
+/// Detect only QCOW2 format (for unsafe_quirks mode, matching qemu-img behavior)
+///
+/// qemu-img check only recognizes QCOW2 format. All other formats are treated as raw.
+fn detect_qcow2_only(buffer: &[u8], len: usize) -> ImageFormat {
     if len < 8 {
         return ImageFormat::Unknown;
     }
 
     // Check QCOW2 magic (big-endian)
+    const QCOW2_MAGIC: u32 = 0x514649fb;
     let magic_be = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
     if magic_be == QCOW2_MAGIC {
         return ImageFormat::Qcow2;
     }
 
-    // No recognized format - treat as raw
+    // qemu-img treats everything else as raw
     ImageFormat::Raw
+}
+
+// VMDK4 header offsets (little-endian)
+const VMDK4_VERSION_OFFSET: usize = 4;
+const VMDK4_CAPACITY_OFFSET: usize = 12;
+const VMDK4_GRAIN_SIZE_OFFSET: usize = 20;
+const VMDK4_DESC_OFFSET_OFFSET: usize = 28;
+const VMDK4_DESC_SIZE_OFFSET: usize = 36;
+
+// VHDX region table offset and signature
+const VHDX_REGION_TABLE_OFFSET: u64 = 0x30000;
+const VHDX_REGION_TABLE_SIG: u32 = 0x69676572; // "regi"
+
+// VHD footer disk type offset
+const VHD_FOOTER_DISK_TYPE_OFFSET: usize = 60;
+
+/// Check VMDK image integrity
+///
+/// Validates:
+/// - Header version (must be 1, 2, or 3)
+/// - Capacity > 0
+/// - Grain size is power of 2
+/// - Descriptor offset is within file bounds
+fn check_vmdk(header: &[u8], result: &mut CheckResult, actual_size: u64) -> u64 {
+    // Check version
+    let version = u32::from_le_bytes([
+        header[VMDK4_VERSION_OFFSET],
+        header[VMDK4_VERSION_OFFSET + 1],
+        header[VMDK4_VERSION_OFFSET + 2],
+        header[VMDK4_VERSION_OFFSET + 3],
+    ]);
+
+    if version == 0 || version > 3 {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+        return 0;
+    }
+
+    // Check capacity
+    let capacity_sectors = u64::from_le_bytes([
+        header[VMDK4_CAPACITY_OFFSET],
+        header[VMDK4_CAPACITY_OFFSET + 1],
+        header[VMDK4_CAPACITY_OFFSET + 2],
+        header[VMDK4_CAPACITY_OFFSET + 3],
+        header[VMDK4_CAPACITY_OFFSET + 4],
+        header[VMDK4_CAPACITY_OFFSET + 5],
+        header[VMDK4_CAPACITY_OFFSET + 6],
+        header[VMDK4_CAPACITY_OFFSET + 7],
+    ]);
+
+    if capacity_sectors == 0 {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+        return 0;
+    }
+
+    // Check grain size (must be power of 2)
+    let grain_size = u64::from_le_bytes([
+        header[VMDK4_GRAIN_SIZE_OFFSET],
+        header[VMDK4_GRAIN_SIZE_OFFSET + 1],
+        header[VMDK4_GRAIN_SIZE_OFFSET + 2],
+        header[VMDK4_GRAIN_SIZE_OFFSET + 3],
+        header[VMDK4_GRAIN_SIZE_OFFSET + 4],
+        header[VMDK4_GRAIN_SIZE_OFFSET + 5],
+        header[VMDK4_GRAIN_SIZE_OFFSET + 6],
+        header[VMDK4_GRAIN_SIZE_OFFSET + 7],
+    ]);
+
+    if grain_size == 0 || (grain_size & (grain_size - 1)) != 0 {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+        return 0;
+    }
+
+    // Check descriptor offset (if present, must be within file)
+    let desc_offset_sectors = u64::from_le_bytes([
+        header[VMDK4_DESC_OFFSET_OFFSET],
+        header[VMDK4_DESC_OFFSET_OFFSET + 1],
+        header[VMDK4_DESC_OFFSET_OFFSET + 2],
+        header[VMDK4_DESC_OFFSET_OFFSET + 3],
+        header[VMDK4_DESC_OFFSET_OFFSET + 4],
+        header[VMDK4_DESC_OFFSET_OFFSET + 5],
+        header[VMDK4_DESC_OFFSET_OFFSET + 6],
+        header[VMDK4_DESC_OFFSET_OFFSET + 7],
+    ]);
+
+    let desc_size_sectors = u64::from_le_bytes([
+        header[VMDK4_DESC_SIZE_OFFSET],
+        header[VMDK4_DESC_SIZE_OFFSET + 1],
+        header[VMDK4_DESC_SIZE_OFFSET + 2],
+        header[VMDK4_DESC_SIZE_OFFSET + 3],
+        header[VMDK4_DESC_SIZE_OFFSET + 4],
+        header[VMDK4_DESC_SIZE_OFFSET + 5],
+        header[VMDK4_DESC_SIZE_OFFSET + 6],
+        header[VMDK4_DESC_SIZE_OFFSET + 7],
+    ]);
+
+    if desc_offset_sectors > 0 {
+        let desc_end = desc_offset_sectors
+            .saturating_mul(512)
+            .saturating_add(desc_size_sectors.saturating_mul(512));
+        if desc_end > actual_size {
+            result.corruptions += 1;
+            result.total_errors += 1;
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+            return 0;
+        }
+    }
+
+    // VMDK header looks valid
+    0
+}
+
+/// Check VHDX image integrity
+///
+/// Validates:
+/// - Region table signature at offset 0x30000
+unsafe fn check_vhdx(
+    result: &mut CheckResult,
+    call_table: &CallTable,
+    sector_size: usize,
+    actual_size: u64,
+) -> u64 {
+    let mut bytes_read: u64 = 0;
+
+    // Check if file is large enough for region table
+    if actual_size < VHDX_REGION_TABLE_OFFSET + 4096 {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+        return bytes_read;
+    }
+
+    // Read region table
+    let mut buffer = [0u8; MAX_SECTOR_SIZE];
+    let region_table_sector = VHDX_REGION_TABLE_OFFSET / sector_size as u64;
+
+    if !(call_table.read_input_sector)(0, region_table_sector, buffer.as_mut_ptr(), sector_size) {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        return bytes_read;
+    }
+    bytes_read += sector_size as u64;
+
+    let offset_in_sector = (VHDX_REGION_TABLE_OFFSET % sector_size as u64) as usize;
+    let region_sig = u32::from_le_bytes([
+        buffer[offset_in_sector],
+        buffer[offset_in_sector + 1],
+        buffer[offset_in_sector + 2],
+        buffer[offset_in_sector + 3],
+    ]);
+
+    if region_sig != VHDX_REGION_TABLE_SIG {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+    }
+
+    bytes_read
+}
+
+/// Check VHD footer integrity
+///
+/// Validates:
+/// - Disk type is valid (2=fixed, 3=dynamic, 4=differencing)
+fn check_vhd_footer(footer: &[u8], result: &mut CheckResult) {
+    if footer.len() < VHD_FOOTER_DISK_TYPE_OFFSET + 4 {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+        return;
+    }
+
+    // Disk type is big-endian u32 at offset 60
+    let disk_type = u32::from_be_bytes([
+        footer[VHD_FOOTER_DISK_TYPE_OFFSET],
+        footer[VHD_FOOTER_DISK_TYPE_OFFSET + 1],
+        footer[VHD_FOOTER_DISK_TYPE_OFFSET + 2],
+        footer[VHD_FOOTER_DISK_TYPE_OFFSET + 3],
+    ]);
+
+    // Valid disk types: 2 (fixed), 3 (dynamic), 4 (differencing)
+    if disk_type < 2 || disk_type > 4 {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+    }
 }
 
 /// Check QCOW2 image integrity

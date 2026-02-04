@@ -87,6 +87,8 @@ const CHECK_CONFIG_FLAG_REPAIR: u32 = 1 << 0;
 #[allow(dead_code)]
 const CHECK_CONFIG_FLAG_QUIET: u32 = 1 << 1;
 #[allow(dead_code)]
+const CHECK_CONFIG_FLAG_UNSAFE_QUIRKS: u32 = 1 << 2;
+#[allow(dead_code)]
 const CHECK_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
 
 // CheckResult flag constants (must match shared crate)
@@ -1757,6 +1759,13 @@ struct CheckArgs {
     /// Quiet mode: only show errors
     #[arg(short, long)]
     quiet: bool,
+
+    /// Enable unsafe qemu-img compatible mode.
+    /// WARNING: This treats all non-QCOW2 formats as "raw" and skips
+    /// format-specific validation, matching qemu-img check behavior.
+    /// Use only for compatibility testing, never in production.
+    #[arg(long)]
+    unsafe_quirks: bool,
 }
 
 #[derive(Args, Debug)]
@@ -2714,6 +2723,9 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     }
     if verbose {
         check_flags |= CHECK_CONFIG_FLAG_VERBOSE;
+    }
+    if args.unsafe_quirks {
+        check_flags |= CHECK_CONFIG_FLAG_UNSAFE_QUIRKS;
     }
     guest_mem.write_obj(CHECK_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
     guest_mem.write_obj(check_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
