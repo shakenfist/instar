@@ -165,7 +165,7 @@ pub fn detect_vhd_footer(buffer: &[u8]) -> ImageFormat {
 ///
 /// `ImageFormat::Iso` if the buffer contains the ISO 9660 identifier, otherwise `Raw`.
 pub fn detect_iso_at_offset(buffer: &[u8], offset: usize) -> ImageFormat {
-    if buffer.len() > offset + 5 && buffer[offset..offset + 5] == ISO_MAGIC {
+    if buffer.len() >= offset + 5 && buffer[offset..offset + 5] == ISO_MAGIC {
         return ImageFormat::Iso;
     }
     ImageFormat::Raw
