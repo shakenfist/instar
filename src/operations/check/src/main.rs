@@ -67,10 +67,12 @@ pub unsafe extern "C" fn _start() -> u64 {
     // Get operation config (optional)
     let config_result = (call_table.get_operation_config)();
     let config = &*(config_result.ptr as *const CheckConfig);
-    let (_quiet, unsafe_quirks) = if config.is_valid() {
-        (config.is_quiet(), config.unsafe_quirks_enabled())
+    // Quiet mode is handled on the VMM side (suppressing output);
+    // the guest operation only needs the unsafe_quirks flag.
+    let unsafe_quirks = if config.is_valid() {
+        config.unsafe_quirks_enabled()
     } else {
-        (false, false)
+        false
     };
 
     // Get device parameters (device 0 = primary input)
