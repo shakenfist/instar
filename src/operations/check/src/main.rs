@@ -15,12 +15,9 @@
 use core::panic::PanicInfo;
 
 use shared::{
-    format_detection::{detect_format_from_header, detect_vhd_footer, VHD_COOKIE},
+    format_detection::{detect_format_from_header, detect_vhd_footer, QCOW2_MAGIC, VHD_COOKIE},
     CallTable, CheckConfig, CheckResult, ImageFormat, CALL_TABLE_ADDR, MAX_SECTOR_SIZE,
 };
-
-// Note: Format detection magic constants are in shared::format_detection
-// QCOW2_MAGIC is implicitly used via detect_format_from_header
 
 // QCOW2 header offsets (big-endian)
 const QCOW2_VERSION_OFFSET: usize = 4;
@@ -233,8 +230,7 @@ fn detect_qcow2_only(buffer: &[u8], len: usize) -> ImageFormat {
         return ImageFormat::Unknown;
     }
 
-    // Check QCOW2 magic (big-endian)
-    const QCOW2_MAGIC: u32 = 0x514649fb;
+    // Check QCOW2 magic (big-endian) - use shared constant
     let magic_be = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
     if magic_be == QCOW2_MAGIC {
         return ImageFormat::Qcow2;
