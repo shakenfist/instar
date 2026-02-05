@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""Render structured review JSON to human-readable markdown.
+
+This script takes the JSON output from the automated reviewer and converts
+it to a nicely formatted markdown comment suitable for posting on a PR.
+
+Usage:
+    render-review.py <input.json> [output.md]
+    render-review.py --validate <input.json>
+
+If output.md is not specified, writes to stdout.
+"""
+
+import json
+import sys
+from pathlib import Path
+
+# Try to import jsonschema for validation, but don't require it
+try:
+    import jsonschema
+    HAS_JSONSCHEMA = True
+except ImportError:
+    HAS_JSONSCHEMA = False
+
+
+SCHEMA_PATH = Path(__file__).parent / 'review-schema.json'
+
+SEVERITY_EMOJI = {
+    'critical': '🔴',
+    'high': '🟠',
+    'medium': '🟡',
+    'low': '🟢',
+}
+
+ACTION_LABEL = {
+    'fix': 'FIX',
+    'document': 'DOC',
+    'consider': 'CONSIDER',
+    'none': 'INFO',
+}
+
+CATEGORY_EMOJI = {
+    'security': '🔒',
+    'bug': '🐛',
+    'performance': '⚡',
+    'documentation': '📝',
+    'style': '🎨',
+    'testing': '🧪',
+    'other': '📋',
+}
+
+
+def load_schema():
+    """Load the JSON schema for validation."""
+    if not SCHEMA_PATH.exists():
+        return None
+    with open(SCHEMA_PATH) as f:
+        return json.load(f)
+
+
+def validate_review(review_data: dict) -> tuple[bool, str]:
+    """Validate review data against the schema.
+
+    Returns (is_valid, error_message).
+    """
+    if not HAS_JSONSCHEMA:
+        # Basic validation without jsonschema
+        if 'summary' not in review_data:
+            return False, "Missing required field: 'summary'"
+        if 'items' not in review_data:
+            return False, "Missing required field: 'items'"
+        if not isinstance(review_data['items'], list):
+            return False, "'items' must be an array"
+        for i, item in enumerate(review_data['items']):
+            for field in ['id', 'title', 'category', 'action']:
+                if field not in item:
+                    return False, f"Item {i}: missing required field '{field}'"
+            if item['action'] not in ['fix', 'document', 'consider', 'none']:
+                return False, f"Item {i}: invalid action '{item['action']}'"
+        return True, ''
+
+    schema = load_schema()
+    if schema is None:
+        return True, ''  # No schema available, skip validation
+
+    try:
+        jsonschema.validate(review_data, schema)
+        return True, ''
+    except jsonschema.ValidationError as e:
+        return False, str(e.message)
+
+
+def render_markdown(review_data: dict) -> str:
+    """Render review data to markdown format."""
+    lines = []
+
+    # Header
+    lines.append('## PR Review')
+    lines.append('')
+
+    # Summary
+    lines.append('### Summary')
+    lines.append('')
+    lines.append(review_data.get('summary', 'No summary provided.'))
+    lines.append('')
+
+    # Separate items by action type
+    fix_items = []
+    doc_items = []
+    consider_items = []
+    info_items = []
+
+    for item in review_data.get('items', []):
+        action = item.get('action', 'none')
+        if action == 'fix':
+            fix_items.append(item)
+        elif action == 'document':
+            doc_items.append(item)
+        elif action == 'consider':
+            consider_items.append(item)
+        else:
+            info_items.append(item)
+
+    # Action Items (things that must be done)
+    if fix_items or doc_items:
+        lines.append('---')
+        lines.append('')
+        lines.append('### Action Items')
+        lines.append('')
+
+        for item in fix_items + doc_items:
+            lines.extend(render_item(item))
+            lines.append('')
+
+    # Suggestions (optional improvements)
+    if consider_items:
+        lines.append('---')
+        lines.append('')
+        lines.append('### Suggestions')
+        lines.append('')
+        lines.append('*These are optional improvements to consider:*')
+        lines.append('')
+
+        for item in consider_items:
+            lines.extend(render_item(item))
+            lines.append('')
+
+    # Observations (informational only)
+    if info_items:
+        lines.append('---')
+        lines.append('')
+        lines.append('### Observations')
+        lines.append('')
+        lines.append('*These are informational and do not require action:*')
+        lines.append('')
+
+        for item in info_items:
+            lines.extend(render_item(item))
+            lines.append('')
+
+    # Positive feedback
+    positive = review_data.get('positive_feedback', [])
+    if positive:
+        lines.append('---')
+        lines.append('')
+        lines.append('### What\'s Good')
+        lines.append('')
+
+        for item in positive:
+            lines.append(f"✅ **{item['title']}**")
+            lines.append('')
+            lines.append(item.get('description', ''))
+            lines.append('')
+
+    # Test coverage
+    test_coverage = review_data.get('test_coverage')
+    if test_coverage:
+        lines.append('---')
+        lines.append('')
+        lines.append('### Test Coverage')
+        lines.append('')
+
+        if test_coverage.get('adequate'):
+            lines.append('✅ Test coverage appears adequate.')
+        else:
+            lines.append('⚠️ Test coverage may need improvement.')
+
+        missing = test_coverage.get('missing', [])
+        if missing:
+            lines.append('')
+            lines.append('**Missing test scenarios:**')
+            for scenario in missing:
+                lines.append(f'- {scenario}')
+        lines.append('')
+
+    # Footer
+    lines.append('---')
+    lines.append('')
+    lines.append('*🤖 This review was generated by the automated reviewer. '
+                 'Use `@shakenfist-bot please address comments` to have '
+                 'Claude Code address the action items.*')
+
+    return '\n'.join(lines)
+
+
+def render_item(item: dict) -> list[str]:
+    """Render a single review item to markdown lines."""
+    lines = []
+
+    # Build title line with emoji and labels
+    action = item.get('action', 'none')
+    category = item.get('category', 'other')
+    severity = item.get('severity')
+
+    action_label = ACTION_LABEL.get(action, 'INFO')
+    category_emoji = CATEGORY_EMOJI.get(category, '📋')
+
+    title_parts = [f"**{item['id']}. [{action_label}]**"]
+
+    if severity:
+        severity_emoji = SEVERITY_EMOJI.get(severity, '')
+        title_parts.append(f"{severity_emoji}")
+
+    title_parts.append(f"{category_emoji} {item['title']}")
+
+    lines.append(' '.join(title_parts))
+    lines.append('')
+
+    # Description
+    if item.get('description'):
+        lines.append(item['description'])
+        lines.append('')
+
+    # Location
+    if item.get('location'):
+        lines.append(f"📍 Location: `{item['location']}`")
+        lines.append('')
+
+    # Suggestion
+    if item.get('suggestion'):
+        lines.append(f"💡 **Suggestion:** {item['suggestion']}")
+        lines.append('')
+
+    # Rationale (for none/consider actions)
+    if item.get('rationale'):
+        lines.append(f"ℹ️ *{item['rationale']}*")
+        lines.append('')
+
+    return lines
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+
+    # Handle --validate flag
+    if sys.argv[1] == '--validate':
+        if len(sys.argv) < 3:
+            print('Error: --validate requires an input file')
+            sys.exit(1)
+        input_path = Path(sys.argv[2])
+        with open(input_path) as f:
+            data = json.load(f)
+        is_valid, error = validate_review(data)
+        if is_valid:
+            print('Valid')
+            sys.exit(0)
+        else:
+            print(f'Invalid: {error}')
+            sys.exit(1)
+
+    input_path = Path(sys.argv[1])
+    output_path = Path(sys.argv[2]) if len(sys.argv) > 2 else None
+
+    # Load and validate
+    with open(input_path) as f:
+        data = json.load(f)
+
+    is_valid, error = validate_review(data)
+    if not is_valid:
+        print(f'Error: Invalid review JSON: {error}', file=sys.stderr)
+        sys.exit(1)
+
+    # Render
+    markdown = render_markdown(data)
+
+    # Output
+    if output_path:
+        with open(output_path, 'w') as f:
+            f.write(markdown)
+    else:
+        print(markdown)
+
+
+if __name__ == '__main__':
+    main()

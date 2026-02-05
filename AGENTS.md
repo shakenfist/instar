@@ -286,14 +286,27 @@ Comment on a PR with these commands (requires write access to the repository):
 - `@shakenfist-bot please address comments` - Have Claude address automated review
   feedback, creating one commit per valid issue
 
+### How Automated Review Works
+
+The automated reviewer outputs structured JSON that is:
+1. Validated against a JSON schema (`tools/review-schema.json`)
+2. Rendered to human-readable markdown and posted as a PR comment
+3. Uploaded as an artifact for the address-comments workflow to consume
+
+Each review item has an `action` field:
+- `fix` - Must be fixed before merging
+- `document` - Documentation should be added
+- `consider` - Optional improvement (reviewer suggestion)
+- `none` - Informational observation only
+
 ### How Automated Comment Addressing Works
 
 When you trigger `@shakenfist-bot please address comments`:
 
-1. The bot fetches the latest automated review from `github-actions[bot]`
-2. It parses the "Summary of Action Items" section to extract individual issues
-3. For each issue, Claude Code:
-   - Analyzes whether the comment is valid and actionable
+1. The bot downloads the `review.json` artifact from the automated reviewer
+2. It extracts items where `action` is `fix` or `document`
+3. For each actionable item, Claude Code:
+   - Analyzes whether the item should be addressed
    - If valid: makes the fix, runs pre-commit, and stages changes
    - If disagreeing: provides a rationale explaining why
 4. Each valid fix gets its own commit with attribution
@@ -311,5 +324,7 @@ This allows reviewers to cherry-pick or drop individual fixes as needed.
 
 ### Scripts
 
-- `tools/review-pr-with-claude.sh` - Performs automated PR reviews
-- `tools/address-comments-with-claude.sh` - Addresses review comments
+- `tools/review-pr-with-claude.sh` - Performs automated PR reviews (outputs JSON)
+- `tools/address-comments-with-claude.sh` - Addresses review comments (reads JSON)
+- `tools/render-review.py` - Renders review JSON to markdown
+- `tools/review-schema.json` - JSON schema for review output validation

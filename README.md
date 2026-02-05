@@ -333,9 +333,10 @@ Comment on a PR with these commands (requires write access):
 | `@shakenfist-bot please attempt to fix` | Attempt to fix failing tests |
 | `@shakenfist-bot please address comments` | Address automated review comments |
 
-The "address comments" command parses the "Summary of Action Items" section from
-the automated reviewer and creates one commit per valid issue. If Claude disagrees
-with a suggestion, it will explain its rationale instead of making changes.
+The "address comments" command reads the structured JSON review artifact uploaded
+by the automated reviewer and creates one commit per actionable item (those marked
+with `action: fix` or `action: document`). If Claude disagrees with a suggestion,
+it will explain its rationale instead of making changes.
 
 ### Workflows
 

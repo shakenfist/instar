@@ -2,8 +2,8 @@
 
 # Address automated review comments on a PR using Claude Code.
 #
-# This script fetches review comments from the automated reviewer (github-actions[bot]),
-# parses actionable items, and uses Claude Code to address each one individually.
+# This script reads structured review JSON (from the automated reviewer) and
+# uses Claude Code to address each actionable item individually.
 # Each valid fix gets its own commit.
 #
 # Usage:
@@ -11,6 +11,7 @@
 #
 # Options:
 #   --pr NUMBER         PR number to address (required in CI, auto-detected locally)
+#   --review-json FILE  Path to review.json (downloaded from artifacts in CI)
 #   --max-turns N       Maximum Claude turns per item (default: 30)
 #   --ci                CI mode: output machine-readable status, no colors
 #   --dry-run           Don't make commits, just show what would be done
@@ -26,14 +27,14 @@
 #   1 - Error occurred
 #
 # Examples:
-#   # Address comments on PR #123
-#   tools/address-comments-with-claude.sh --pr 123
+#   # Address comments using review JSON from artifact
+#   tools/address-comments-with-claude.sh --pr 123 --review-json review.json
 #
-#   # CI mode
-#   tools/address-comments-with-claude.sh --ci --pr 123
+#   # CI mode (review JSON provided by workflow)
+#   tools/address-comments-with-claude.sh --ci --pr 123 --review-json review.json
 #
 #   # Dry run to see what would be done
-#   tools/address-comments-with-claude.sh --pr 123 --dry-run
+#   tools/address-comments-with-claude.sh --pr 123 --review-json review.json --dry-run
 
 set -e
 
@@ -42,6 +43,7 @@ cd "${topdir}"
 
 # Default options
 pr_number=""
+review_json=""
 max_turns=30
 ci_mode=false
 dry_run=false
@@ -73,6 +75,10 @@ while [[ $# -gt 0 ]]; do
             pr_number="$2"
             shift 2
             ;;
+        --review-json)
+            review_json="$2"
+            shift 2
+            ;;
         --max-turns)
             max_turns="$2"
             shift 2
@@ -90,7 +96,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --help|-h)
-            head -38 "$0" | tail -35
+            head -42 "$0" | tail -39
             exit 0
             ;;
         -*)
@@ -176,114 +182,76 @@ fi
 echo -e "${GREEN}✓ Addressing comments on PR #${pr_number}${NC}"
 echo
 
-# Step 2: Fetch PR information
-echo -e "${YELLOW}Step 2: Fetching PR information...${NC}"
+# Step 2: Get review JSON
+echo -e "${YELLOW}Step 2: Loading review JSON...${NC}"
 
-# Get PR details
-gh pr view "${pr_number}" --json title,body,author,baseRefName,headRefName \
-    > "${output_dir}/pr-info.json"
+if [ -n "${review_json}" ] && [ -f "${review_json}" ]; then
+    echo "Using provided review JSON: ${review_json}"
+    cp "${review_json}" "${output_dir}/review.json"
+else
+    # Try to download from the most recent automated review workflow artifacts
+    echo "No review JSON provided, attempting to download from GitHub artifacts..."
 
-pr_title=$(jq -r '.title' "${output_dir}/pr-info.json")
-pr_author=$(jq -r '.author.login' "${output_dir}/pr-info.json")
-base_branch=$(jq -r '.baseRefName' "${output_dir}/pr-info.json")
-head_branch=$(jq -r '.headRefName' "${output_dir}/pr-info.json")
+    # Find the most recent successful review workflow run for this PR
+    run_id=$(gh api "repos/${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner -q '.nameWithOwner')}/actions/workflows/sanity-checks.yml/runs" \
+        --jq "[.workflow_runs[] | select(.head_sha == \"$(gh pr view ${pr_number} --json headRefOid -q '.headRefOid')\" and .conclusion == \"success\")] | .[0].id" \
+        2>/dev/null || true)
 
-echo "Title: ${pr_title}"
-echo "Author: ${pr_author}"
-echo "Branch: ${head_branch} -> ${base_branch}"
-echo
+    if [ -n "${run_id}" ] && [ "${run_id}" != "null" ]; then
+        echo "Found workflow run: ${run_id}"
+        # Download artifact
+        gh run download "${run_id}" -n "review-json-${pr_number}" -D "${output_dir}/artifact" 2>/dev/null || true
 
-# Step 3: Fetch automated reviewer comments
-echo -e "${YELLOW}Step 3: Fetching automated reviewer comments...${NC}"
-
-# Get all reviews from github-actions[bot]
-gh api "repos/${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner -q '.nameWithOwner')}/pulls/${pr_number}/reviews" \
-    --jq '[.[] | select(.user.login == "github-actions[bot]")] | sort_by(.submitted_at) | last' \
-    > "${output_dir}/latest-review.json"
-
-if [ "$(cat "${output_dir}/latest-review.json")" == "null" ] || \
-   [ ! -s "${output_dir}/latest-review.json" ]; then
-    echo -e "${YELLOW}No automated review comments found on this PR${NC}"
-    ci_output "items_found" "0"
-    exit 0
-fi
-
-review_body=$(jq -r '.body' "${output_dir}/latest-review.json")
-review_id=$(jq -r '.id' "${output_dir}/latest-review.json")
-
-echo "Found review ID: ${review_id}"
-echo
-
-# Step 4: Parse action items from the review
-echo -e "${YELLOW}Step 4: Parsing action items from review...${NC}"
-
-# Extract the "Summary of Action Items" section (or similar headers)
-# Look for common patterns:
-# - "### Summary of Action Items"
-# - "### Action Items"
-# - "## Action Items"
-# The items are typically numbered like "1. **Category**: Description"
-echo "${review_body}" > "${output_dir}/review-body.md"
-
-# Extract action items section - find the header and take everything until next ## header
-# or end of file
-action_items_section=$(awk '
-    /^##+ *(Summary of )?Action Items/,/^##[^#]/ {
-        if (/^##[^#]/ && !/Action Items/) exit
-        print
-    }
-' "${output_dir}/review-body.md")
-
-if [ -z "${action_items_section}" ]; then
-    echo -e "${YELLOW}No 'Action Items' section found in review${NC}"
-    echo "Review body preview:"
-    echo "${review_body}" | head -20
-    ci_output "items_found" "0"
-    exit 0
-fi
-
-echo "Found action items section:"
-echo "${action_items_section}" | head -20
-echo
-
-# Parse individual items - extract numbered items like "1. **...**:"
-# Store each item in a file for processing
-item_count=0
-current_item=""
-
-while IFS= read -r line; do
-    # Check if this is a new numbered item (e.g., "1. **Security**: ..." or "1. Add ...")
-    if [[ "${line}" =~ ^[0-9]+\.[[:space:]] ]]; then
-        # Save previous item if exists
-        if [ -n "${current_item}" ]; then
-            ((item_count++))
-            echo "${current_item}" > "${output_dir}/item-${item_count}.txt"
+        if [ -f "${output_dir}/artifact/review.json" ]; then
+            mv "${output_dir}/artifact/review.json" "${output_dir}/review.json"
+            echo "Downloaded review.json from artifacts"
         fi
-        current_item="${line}"
-    elif [ -n "${current_item}" ]; then
-        # Continue current item (multi-line items)
-        current_item="${current_item}
-${line}"
     fi
-done <<< "${action_items_section}"
 
-# Save last item
-if [ -n "${current_item}" ]; then
-    ((item_count++))
-    echo "${current_item}" > "${output_dir}/item-${item_count}.txt"
+    if [ ! -f "${output_dir}/review.json" ]; then
+        echo -e "${RED}Error: Could not find review JSON${NC}"
+        echo "Provide --review-json FILE or ensure the review workflow uploaded an artifact"
+        exit 1
+    fi
 fi
 
-echo -e "${GREEN}Found ${item_count} action items${NC}"
+# Validate the JSON
+echo "Validating review JSON..."
+if ! python3 "${topdir}/tools/render-review.py" --validate "${output_dir}/review.json"; then
+    echo -e "${RED}Error: Invalid review JSON${NC}"
+    exit 1
+fi
+echo -e "${GREEN}✓ Review JSON is valid${NC}"
+echo
+
+# Step 3: Extract actionable items
+echo -e "${YELLOW}Step 3: Extracting actionable items...${NC}"
+
+# Extract items with action=fix or action=document
+actionable_items=$(jq -c '[.items[] | select(.action == "fix" or .action == "document")]' \
+    "${output_dir}/review.json")
+item_count=$(echo "${actionable_items}" | jq 'length')
+
+echo -e "${GREEN}Found ${item_count} actionable items${NC}"
 ci_output "items_found" "${item_count}"
 echo
 
 if [ "${item_count}" -eq 0 ]; then
-    echo -e "${YELLOW}No actionable items found${NC}"
+    echo -e "${YELLOW}No actionable items (action=fix or action=document) in review${NC}"
     exit 0
 fi
 
-# Step 5: Address each item with Claude
-echo -e "${YELLOW}Step 5: Addressing items with Claude Code...${NC}"
+# Save each item to a separate file for processing
+for i in $(seq 0 $((item_count - 1))); do
+    echo "${actionable_items}" | jq ".[$i]" > "${output_dir}/item-$((i + 1)).json"
+    item_title=$(jq -r '.title' "${output_dir}/item-$((i + 1)).json")
+    item_action=$(jq -r '.action' "${output_dir}/item-$((i + 1)).json")
+    echo "  $((i + 1)). [${item_action}] ${item_title}"
+done
+echo
+
+# Step 4: Address each item with Claude
+echo -e "${YELLOW}Step 4: Addressing items with Claude Code...${NC}"
 echo
 
 # Initialize summary tracking
@@ -299,18 +267,27 @@ addressed_count=0
 skipped_count=0
 
 for i in $(seq 1 "${item_count}"); do
-    item_file="${output_dir}/item-${i}.txt"
-    item_content=$(cat "${item_file}")
+    item_file="${output_dir}/item-${i}.json"
+    item_id=$(jq -r '.id' "${item_file}")
+    item_title=$(jq -r '.title' "${item_file}")
+    item_action=$(jq -r '.action' "${item_file}")
+    item_category=$(jq -r '.category' "${item_file}")
+    item_severity=$(jq -r '.severity // "N/A"' "${item_file}")
+    item_description=$(jq -r '.description // ""' "${item_file}")
+    item_location=$(jq -r '.location // ""' "${item_file}")
+    item_suggestion=$(jq -r '.suggestion // ""' "${item_file}")
 
     echo -e "${CYAN}----------------------------------------${NC}"
-    echo -e "${CYAN}Item ${i}/${item_count}:${NC}"
-    echo "${item_content}"
+    echo -e "${CYAN}Item ${i}/${item_count}: [${item_action}] ${item_title}${NC}"
+    echo "  Category: ${item_category}, Severity: ${item_severity}"
+    if [ -n "${item_location}" ] && [ "${item_location}" != "null" ]; then
+        echo "  Location: ${item_location}"
+    fi
     echo
 
     if [ "${dry_run}" = true ]; then
         echo -e "${YELLOW}[DRY RUN] Would address this item with Claude${NC}"
-        echo "| ${i} | $(echo "${item_content}" | head -1 | sed 's/|/\\|/g') " \
-             "| ⏸️ Dry run | - | - |" >> "${summary_file}"
+        echo "| ${item_id} | ${item_title} | ⏸️ Dry run | - | - |" >> "${summary_file}"
         continue
     fi
 
@@ -322,13 +299,23 @@ You are addressing a specific review comment on PR #${pr_number} for the Shaken 
 
 First, read AGENTS.md and ARCHITECTURE.md to understand the project structure.
 
-## The Review Comment to Address
+## The Review Item to Address
 
-${item_content}
+**Title**: ${item_title}
+**Category**: ${item_category}
+**Severity**: ${item_severity}
+**Action Required**: ${item_action}
+**Location**: ${item_location}
+
+**Description**:
+${item_description}
+
+**Suggestion**:
+${item_suggestion}
 
 ## Your Task
 
-1. Analyze this specific review comment
+1. Analyze this specific review item
 2. Determine if it's a valid issue that should be addressed
 3. If valid:
    - Make the necessary code changes
@@ -375,8 +362,7 @@ PROMPT_EOF
         --max-turns "${max_turns}" \
         --output-format text > "${claude_output_file}" 2>&1; then
         echo -e "${RED}Claude failed for item ${i}${NC}"
-        echo "| ${i} | $(echo "${item_content}" | head -1 | sed 's/|/\\|/g') " \
-             "| ❌ Error | - | Claude execution failed |" >> "${summary_file}"
+        echo "| ${item_id} | ${item_title} | ❌ Error | - | Claude execution failed |" >> "${summary_file}"
         ((skipped_count++))
         continue
     fi
@@ -391,8 +377,7 @@ PROMPT_EOF
 
         # Escape for markdown table
         rationale_escaped=$(echo "${rationale}" | tr '\n' ' ' | sed 's/|/\\|/g')
-        echo "| ${i} | $(echo "${item_content}" | head -1 | sed 's/|/\\|/g') " \
-             "| ⏭️ Skipped | - | ${rationale_escaped} |" >> "${summary_file}"
+        echo "| ${item_id} | ${item_title} | ⏭️ Skipped | - | ${rationale_escaped} |" >> "${summary_file}"
         ((skipped_count++))
         continue
     fi
@@ -406,8 +391,7 @@ PROMPT_EOF
         # Check if there are actually staged changes
         if [ -z "$(git diff --cached --name-only)" ]; then
             echo -e "${YELLOW}No changes were staged${NC}"
-            echo "| ${i} | $(echo "${item_content}" | head -1 | sed 's/|/\\|/g') " \
-                 "| ⏭️ Skipped | - | No changes needed |" >> "${summary_file}"
+            echo "| ${item_id} | ${item_title} | ⏭️ Skipped | - | No changes needed |" >> "${summary_file}"
             ((skipped_count++))
             continue
         fi
@@ -419,10 +403,10 @@ PROMPT_EOF
         commit_msg=$(cat << COMMIT_EOF
 ${change_summary}.
 
-Addresses review comment #${i} from automated review.
+Addresses review item #${item_id}: ${item_title}
 
-Original comment:
-$(echo "${item_content}" | head -5)
+Category: ${item_category}
+Severity: ${item_severity}
 
 Prompt: @shakenfist-bot please address comments on PR #${pr_number}
 
@@ -436,13 +420,11 @@ COMMIT_EOF
         commit_sha=$(git rev-parse --short HEAD)
 
         echo -e "${GREEN}Created commit: ${commit_sha}${NC}"
-        echo "| ${i} | $(echo "${item_content}" | head -1 | sed 's/|/\\|/g') " \
-             "| ✅ Fixed | \`${commit_sha}\` | ${change_summary} |" >> "${summary_file}"
+        echo "| ${item_id} | ${item_title} | ✅ Fixed | \`${commit_sha}\` | ${change_summary} |" >> "${summary_file}"
         ((addressed_count++))
     else
         echo -e "${YELLOW}No clear outcome from Claude${NC}"
-        echo "| ${i} | $(echo "${item_content}" | head -1 | sed 's/|/\\|/g') " \
-             "| ⚠️ Unclear | - | No summary marker found |" >> "${summary_file}"
+        echo "| ${item_id} | ${item_title} | ⚠️ Unclear | - | No summary marker found |" >> "${summary_file}"
         ((skipped_count++))
 
         # Reset any unstaged changes
@@ -455,8 +437,8 @@ done
 echo -e "${CYAN}----------------------------------------${NC}"
 echo
 
-# Step 6: Summary
-echo -e "${YELLOW}Step 6: Summary${NC}"
+# Step 5: Summary
+echo -e "${YELLOW}Step 5: Summary${NC}"
 echo
 echo -e "${GREEN}Addressed: ${addressed_count}${NC}"
 echo -e "${YELLOW}Skipped: ${skipped_count}${NC}"
