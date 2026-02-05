@@ -413,10 +413,10 @@ if ! python3 "${topdir}/tools/render-review.py" --validate "${output_dir}/review
 fi
 echo -e "${GREEN}JSON validation passed${NC}"
 
-# Render to markdown
+# Render to markdown (with embedded JSON for address-comments automation)
 echo
 echo -e "${YELLOW}Step 7: Rendering review to markdown...${NC}"
-python3 "${topdir}/tools/render-review.py" "${output_dir}/review.json" "${output_dir}/review.md"
+python3 "${topdir}/tools/render-review.py" --embed-json "${output_dir}/review.json" "${output_dir}/review.md"
 echo "Rendered review to ${output_dir}/review.md"
 
 # Post the review

@@ -5,8 +5,14 @@ This script takes the JSON output from the automated reviewer and converts
 it to a nicely formatted markdown comment suitable for posting on a PR.
 
 Usage:
-    render-review.py <input.json> [output.md]
+    render-review.py [--embed-json] <input.json> [output.md]
     render-review.py --validate <input.json>
+
+Options:
+    --embed-json    Include the raw JSON in a collapsed <details> section
+                    at the end of the markdown. This allows the address-comments
+                    automation to extract it from the PR comment.
+    --validate      Validate the JSON against the schema without rendering.
 
 If output.md is not specified, writes to stdout.
 """
@@ -90,8 +96,14 @@ def validate_review(review_data: dict) -> tuple[bool, str]:
         return False, str(e.message)
 
 
-def render_markdown(review_data: dict) -> str:
-    """Render review data to markdown format."""
+def render_markdown(review_data: dict, embed_json: bool = False) -> str:
+    """Render review data to markdown format.
+
+    Args:
+        review_data: The review data dictionary.
+        embed_json: If True, append the raw JSON in a collapsed details section
+                    for machine parsing by the address-comments automation.
+    """
     lines = []
 
     # Header
@@ -200,6 +212,18 @@ def render_markdown(review_data: dict) -> str:
                  'Use `@shakenfist-bot please address comments` to have '
                  'Claude Code address the action items.*')
 
+    # Optionally embed the JSON for machine parsing
+    if embed_json:
+        lines.append('')
+        lines.append('<details>')
+        lines.append('<summary>Machine-readable review data (for automation)</summary>')
+        lines.append('')
+        lines.append('```json')
+        lines.append(json.dumps(review_data, indent=2))
+        lines.append('```')
+        lines.append('')
+        lines.append('</details>')
+
     return '\n'.join(lines)
 
 
@@ -254,12 +278,20 @@ def main():
         print(__doc__)
         sys.exit(1)
 
+    # Parse arguments
+    args = sys.argv[1:]
+    embed_json = False
+
+    if '--embed-json' in args:
+        embed_json = True
+        args.remove('--embed-json')
+
     # Handle --validate flag
-    if sys.argv[1] == '--validate':
-        if len(sys.argv) < 3:
+    if args and args[0] == '--validate':
+        if len(args) < 2:
             print('Error: --validate requires an input file')
             sys.exit(1)
-        input_path = Path(sys.argv[2])
+        input_path = Path(args[1])
         with open(input_path) as f:
             data = json.load(f)
         is_valid, error = validate_review(data)
@@ -270,8 +302,12 @@ def main():
             print(f'Invalid: {error}')
             sys.exit(1)
 
-    input_path = Path(sys.argv[1])
-    output_path = Path(sys.argv[2]) if len(sys.argv) > 2 else None
+    if not args:
+        print(__doc__)
+        sys.exit(1)
+
+    input_path = Path(args[0])
+    output_path = Path(args[1]) if len(args) > 1 else None
 
     # Load and validate
     with open(input_path) as f:
@@ -283,7 +319,7 @@ def main():
         sys.exit(1)
 
     # Render
-    markdown = render_markdown(data)
+    markdown = render_markdown(data, embed_json=embed_json)
 
     # Output
     if output_path:

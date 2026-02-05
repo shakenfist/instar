@@ -6,12 +6,17 @@
 # uses Claude Code to address each actionable item individually.
 # Each valid fix gets its own commit.
 #
+# The review JSON can be:
+# 1. Provided directly via --review-json FILE
+# 2. Extracted automatically from the PR's review comments (embedded in a
+#    <details> section by the automated reviewer)
+#
 # Usage:
 #   tools/address-comments-with-claude.sh [options]
 #
 # Options:
 #   --pr NUMBER         PR number to address (required in CI, auto-detected locally)
-#   --review-json FILE  Path to review.json (downloaded from artifacts in CI)
+#   --review-json FILE  Path to review.json (optional, extracted from PR if not provided)
 #   --max-turns N       Maximum Claude turns per item (default: 30)
 #   --ci                CI mode: output machine-readable status, no colors
 #   --dry-run           Don't make commits, just show what would be done
@@ -27,14 +32,14 @@
 #   1 - Error occurred
 #
 # Examples:
-#   # Address comments using review JSON from artifact
+#   # Address comments (extracts JSON from PR review comment automatically)
+#   tools/address-comments-with-claude.sh --pr 123
+#
+#   # Address comments using explicit review JSON file
 #   tools/address-comments-with-claude.sh --pr 123 --review-json review.json
 #
-#   # CI mode (review JSON provided by workflow)
-#   tools/address-comments-with-claude.sh --ci --pr 123 --review-json review.json
-#
 #   # Dry run to see what would be done
-#   tools/address-comments-with-claude.sh --pr 123 --review-json review.json --dry-run
+#   tools/address-comments-with-claude.sh --pr 123 --dry-run
 
 set -e
 
@@ -189,30 +194,34 @@ if [ -n "${review_json}" ] && [ -f "${review_json}" ]; then
     echo "Using provided review JSON: ${review_json}"
     cp "${review_json}" "${output_dir}/review.json"
 else
-    # Try to download from the most recent automated review workflow artifacts
-    echo "No review JSON provided, attempting to download from GitHub artifacts..."
+    # Extract review JSON from the most recent automated review comment on the PR
+    echo "No review JSON provided, extracting from PR review comments..."
 
-    # Find the most recent successful review workflow run for this PR
-    run_id=$(gh api "repos/${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner -q '.nameWithOwner')}/actions/workflows/sanity-checks.yml/runs" \
-        --jq "[.workflow_runs[] | select(.head_sha == \"$(gh pr view ${pr_number} --json headRefOid -q '.headRefOid')\" and .conclusion == \"success\")] | .[0].id" \
+    repo="${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner -q '.nameWithOwner')}"
+
+    # Find the most recent review comment from github-actions[bot] that contains embedded JSON
+    # The JSON is in a <details> section with a ```json code block
+    review_body=$(gh api "repos/${repo}/pulls/${pr_number}/reviews" \
+        --jq '[.[] | select(.user.login == "github-actions[bot]" and (.body | contains("Machine-readable review data")))] | last | .body' \
         2>/dev/null || true)
 
-    if [ -n "${run_id}" ] && [ "${run_id}" != "null" ]; then
-        echo "Found workflow run: ${run_id}"
-        # Download artifact
-        gh run download "${run_id}" -n "review-json-${pr_number}" -D "${output_dir}/artifact" 2>/dev/null || true
-
-        if [ -f "${output_dir}/artifact/review.json" ]; then
-            mv "${output_dir}/artifact/review.json" "${output_dir}/review.json"
-            echo "Downloaded review.json from artifacts"
-        fi
-    fi
-
-    if [ ! -f "${output_dir}/review.json" ]; then
-        echo -e "${RED}Error: Could not find review JSON${NC}"
-        echo "Provide --review-json FILE or ensure the review workflow uploaded an artifact"
+    if [ -z "${review_body}" ] || [ "${review_body}" == "null" ]; then
+        echo -e "${RED}Error: Could not find automated review comment with embedded JSON${NC}"
+        echo "Ensure the PR has been reviewed by the automated reviewer."
         exit 1
     fi
+
+    # Extract JSON from between ```json and ``` markers within the <details> section
+    echo "${review_body}" | sed -n '/<details>/,/<\/details>/p' | \
+        sed -n '/^```json$/,/^```$/p' | sed '1d;$d' > "${output_dir}/review.json"
+
+    if [ ! -s "${output_dir}/review.json" ]; then
+        echo -e "${RED}Error: Could not extract JSON from review comment${NC}"
+        echo "The review comment may not have embedded JSON data."
+        exit 1
+    fi
+
+    echo "Extracted review JSON from PR comment"
 fi
 
 # Validate the JSON

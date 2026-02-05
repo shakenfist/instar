@@ -432,17 +432,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          mkdir -p ${{ github.workspace }}/review-output
+          # The review script embeds the JSON in the PR comment for the
+          # address-comments automation to extract later
           tools/review-pr-with-claude.sh \
             --ci \
-            --pr ${{ github.event.pull_request.number }} \
-            --output-dir ${{ github.workspace }}/review-output
-
-      - name: Upload review JSON artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: review-json-${{ github.event.pull_request.number }}
-          path: ${{ github.workspace }}/review-output/review.json
-          retention-days: 30
-          if-no-files-found: ignore
+            --pr ${{ github.event.pull_request.number }}

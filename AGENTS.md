@@ -291,7 +291,8 @@ Comment on a PR with these commands (requires write access to the repository):
 The automated reviewer outputs structured JSON that is:
 1. Validated against a JSON schema (`tools/review-schema.json`)
 2. Rendered to human-readable markdown and posted as a PR comment
-3. Uploaded as an artifact for the address-comments workflow to consume
+3. The raw JSON is embedded in a collapsed `<details>` section at the end of
+   the comment, allowing the address-comments automation to extract it
 
 Each review item has an `action` field:
 - `fix` - Must be fixed before merging
@@ -303,7 +304,8 @@ Each review item has an `action` field:
 
 When you trigger `@shakenfist-bot please address comments`:
 
-1. The bot downloads the `review.json` artifact from the automated reviewer
+1. The bot extracts the `review.json` from the PR review comment (from the
+   embedded `<details>` section)
 2. It extracts items where `action` is `fix` or `document`
 3. For each actionable item, Claude Code:
    - Analyzes whether the item should be addressed

@@ -103,52 +103,20 @@ jobs:
           git config --global user.name "Michael Still"
           git config --global user.email "mikal@stillhq.com"
 
-      - name: Download review JSON artifact
-        id: download
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p ${{ github.workspace }}/review-artifact
-
-          # Find the most recent successful sanity-checks run for this PR
-          PR_SHA=$(gh pr view ${{ env.PR_NUMBER }} --json headRefOid -q '.headRefOid')
-          RUN_ID=$(gh api "repos/${{ github.repository }}/actions/workflows/sanity-checks.yml/runs" \
-            --jq "[.workflow_runs[] | select(.head_sha == \"${PR_SHA}\" and .conclusion == \"success\")] | .[0].id")
-
-          if [ -n "${RUN_ID}" ] && [ "${RUN_ID}" != "null" ]; then
-            echo "Found workflow run: ${RUN_ID}"
-            gh run download "${RUN_ID}" \
-              -n "review-json-${{ env.PR_NUMBER }}" \
-              -D "${{ github.workspace }}/review-artifact" || true
-
-            if [ -f "${{ github.workspace }}/review-artifact/review.json" ]; then
-              echo "review_json=${{ github.workspace }}/review-artifact/review.json" >> $GITHUB_OUTPUT
-              echo "Downloaded review.json from artifacts"
-            else
-              echo "review_json=" >> $GITHUB_OUTPUT
-              echo "No review.json artifact found"
-            fi
-          else
-            echo "review_json=" >> $GITHUB_OUTPUT
-            echo "No successful workflow run found for PR SHA ${PR_SHA}"
-          fi
-
       - name: Run address comments script
         id: address
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          # Build arguments
-          ARGS="--ci --pr ${{ env.PR_NUMBER }} --output-dir ${{ github.workspace }}/address-output"
+          # The script will extract the review JSON from the PR comment
+          # (embedded in a <details> section by the automated reviewer)
+          mkdir -p ${{ github.workspace }}/address-output
 
-          # Add review JSON if available
-          if [ -n "${{ steps.download.outputs.review_json }}" ]; then
-            ARGS="${ARGS} --review-json ${{ steps.download.outputs.review_json }}"
-          fi
-
-          # Run the script
-          ./tools/address-comments-with-claude.sh ${ARGS} \
+          ./tools/address-comments-with-claude.sh \
+            --ci \
+            --pr ${{ env.PR_NUMBER }} \
+            --output-dir ${{ github.workspace }}/address-output \
             2>&1 | tee ${{ github.workspace }}/address-log.txt
 
           # Extract summary file path (last line of output)
