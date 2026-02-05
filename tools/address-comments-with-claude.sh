@@ -116,6 +116,12 @@ done
 
 setup_colors
 
+# Validate --max-turns is a positive integer
+if ! [[ "${max_turns}" =~ ^[0-9]+$ ]] || [ "${max_turns}" -lt 1 ]; then
+    echo -e "${RED}Error: --max-turns must be a positive integer${NC}"
+    exit 1
+fi
+
 # Create output directory
 if [ -z "${output_dir}" ]; then
     output_dir=$(mktemp -d)

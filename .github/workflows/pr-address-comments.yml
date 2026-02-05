@@ -168,7 +168,8 @@ jobs:
 
           if [ "${commit_count}" -gt 0 ]; then
             echo "Pushing ${commit_count} commits..."
-            git push origin HEAD:${{ env.PR_REF }}
+            # Use explicit refs/heads/ prefix for safety with user-provided branch names
+            git push origin HEAD:refs/heads/${{ env.PR_REF }}
           else
             echo "No commits to push"
           fi

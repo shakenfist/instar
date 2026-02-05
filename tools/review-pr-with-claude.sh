@@ -114,6 +114,12 @@ done
 
 setup_colors
 
+# Validate --max-turns is a positive integer
+if ! [[ "${max_turns}" =~ ^[0-9]+$ ]] || [ "${max_turns}" -lt 1 ]; then
+    echo -e "${RED}Error: --max-turns must be a positive integer${NC}"
+    exit 1
+fi
+
 # Create output directory
 if [ -z "${output_dir}" ]; then
     output_dir=$(mktemp -d)
@@ -325,11 +331,16 @@ The JSON will be validated and rendered to markdown by a separate script.
 PROMPT_EOF
 
 # Substitute variables in the prompt
-sed -i "s/\${pr_number}/${pr_number}/g" "${output_dir}/claude-prompt.txt"
-sed -i "s/\${pr_title}/${pr_title}/g" "${output_dir}/claude-prompt.txt"
-sed -i "s/\${pr_author}/${pr_author}/g" "${output_dir}/claude-prompt.txt"
-sed -i "s/\${head_branch}/${head_branch}/g" "${output_dir}/claude-prompt.txt"
-sed -i "s/\${base_branch}/${base_branch}/g" "${output_dir}/claude-prompt.txt"
+# Escape sed special characters in user-controlled input to prevent injection
+escape_sed() {
+    printf '%s' "$1" | sed 's/[&/\]/\\&/g'
+}
+
+sed -i "s|\${pr_number}|${pr_number}|g" "${output_dir}/claude-prompt.txt"
+sed -i "s|\${pr_title}|$(escape_sed "${pr_title}")|g" "${output_dir}/claude-prompt.txt"
+sed -i "s|\${pr_author}|$(escape_sed "${pr_author}")|g" "${output_dir}/claude-prompt.txt"
+sed -i "s|\${head_branch}|$(escape_sed "${head_branch}")|g" "${output_dir}/claude-prompt.txt"
+sed -i "s|\${base_branch}|$(escape_sed "${base_branch}")|g" "${output_dir}/claude-prompt.txt"
 
 # Append the diff
 cat "${output_dir}/pr-diff.txt" >> "${output_dir}/claude-prompt.txt"
@@ -388,14 +399,23 @@ if [ -z "${claude_result}" ]; then
 fi
 
 # Extract JSON from code block (between ```json and ```)
-review_json=$(echo "${claude_result}" | sed -n '/^```json$/,/^```$/p' | sed '1d;$d')
+# Allow for whitespace variations in the markers
+review_json=$(echo "${claude_result}" | sed -n '/^[[:space:]]*```json[[:space:]]*$/,/^[[:space:]]*```[[:space:]]*$/p' | sed '1d;$d')
 
 if [ -z "${review_json}" ]; then
-    echo -e "${RED}Error: No JSON code block found in Claude's response${NC}"
-    echo "Response was:"
-    echo "${claude_result}" | head -50
-    ci_output "review_posted" "false"
-    exit 1
+    echo -e "${YELLOW}Warning: No JSON code block found with standard markers${NC}"
+    echo "Attempting fallback extraction..."
+
+    # Fallback: try to find JSON object directly
+    review_json=$(echo "${claude_result}" | grep -Pzo '(?s)\{.*"summary".*"items".*\}' | tr '\0' '\n' || true)
+
+    if [ -z "${review_json}" ]; then
+        echo -e "${RED}Error: Could not extract JSON from Claude's response${NC}"
+        echo "Response was:"
+        echo "${claude_result}" | head -50
+        ci_output "review_posted" "false"
+        exit 1
+    fi
 fi
 
 # Save the extracted JSON
