@@ -56,7 +56,7 @@ CATEGORY_EMOJI = {
 }
 
 
-def load_schema():
+def load_schema() -> dict | None:
     """Load the JSON schema for validation."""
     if not SCHEMA_PATH.exists():
         return None
@@ -273,7 +273,7 @@ def render_item(item: dict) -> list[str]:
     return lines
 
 
-def main():
+def main() -> None:
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(1)
