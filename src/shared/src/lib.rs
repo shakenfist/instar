@@ -416,7 +416,7 @@ impl CallTable {
     /// Magic value indicating a valid call table
     pub const MAGIC: u32 = 0x494D4147; // "IMAG"
 
-    /// Current ABI version (bumped: added verbose_print function)
+    /// Current ABI version (bumped: added verbose_print and send_check_result)
     pub const VERSION: u32 = 11;
 }
 
