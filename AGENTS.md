@@ -272,3 +272,44 @@ This skill walks through:
 2. Updating `tests/manifest.json`
 3. Adding test scenarios to the appropriate test file
 4. For malicious images: creating expected output files safely
+
+## GitHub Automation
+
+The project includes Claude Code-powered GitHub automation for common PR tasks.
+
+### Available Bot Commands
+
+Comment on a PR with these commands (requires write access to the repository):
+
+- `@shakenfist-bot please re-review` - Request a fresh automated code review
+- `@shakenfist-bot please attempt to fix` - Have Claude attempt to fix failing tests
+- `@shakenfist-bot please address comments` - Have Claude address automated review
+  feedback, creating one commit per valid issue
+
+### How Automated Comment Addressing Works
+
+When you trigger `@shakenfist-bot please address comments`:
+
+1. The bot fetches the latest automated review from `github-actions[bot]`
+2. It parses the "Summary of Action Items" section to extract individual issues
+3. For each issue, Claude Code:
+   - Analyzes whether the comment is valid and actionable
+   - If valid: makes the fix, runs pre-commit, and stages changes
+   - If disagreeing: provides a rationale explaining why
+4. Each valid fix gets its own commit with attribution
+5. All commits are pushed and a summary is posted to the PR
+
+This allows reviewers to cherry-pick or drop individual fixes as needed.
+
+### Workflow Files
+
+- `.github/workflows/sanity-checks.yml` - Main CI with automated review
+- `.github/workflows/pr-re-review.yml` - Manual re-review trigger
+- `.github/workflows/pr-fix-tests.yml` - Test failure fixing
+- `.github/workflows/pr-address-comments.yml` - Review comment addressing
+- `.github/workflows/test-drift-fix.yml` - Scheduled/on-demand test maintenance
+
+### Scripts
+
+- `tools/review-pr-with-claude.sh` - Performs automated PR reviews
+- `tools/address-comments-with-claude.sh` - Addresses review comments

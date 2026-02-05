@@ -1,0 +1,226 @@
+name: PR Address Review Comments
+
+# Triggers Claude Code to address automated review comments when an authorized
+# user comments "@shakenfist-bot please address comments"
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  trigger-address:
+    # Only run on PR comments (not issue comments)
+    if: |
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '@shakenfist-bot please address comments')
+    runs-on: ubuntu-latest
+    name: "Trigger comment addressing"
+    outputs:
+      authorized: ${{ steps.check_permission.outputs.authorized }}
+      pr_ref: ${{ steps.pr_details.outputs.pr_ref }}
+      pr_number: ${{ github.event.issue.number }}
+
+    steps:
+      - name: Check commenter permissions
+        id: check_permission
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          permission=$(gh api \
+            repos/${{ github.repository }}/collaborators/${{ github.event.comment.user.login }}/permission \
+            --jq '.permission' 2>/dev/null || echo "none")
+
+          echo "User ${{ github.event.comment.user.login }} has permission: ${permission}"
+
+          if [[ "${permission}" == "admin" || "${permission}" == "write" ]]; then
+            echo "authorized=true" >> $GITHUB_OUTPUT
+            echo "User is authorized to request comment addressing"
+          else
+            echo "authorized=false" >> $GITHUB_OUTPUT
+            echo "User is not authorized to request comment addressing"
+          fi
+
+      - name: React to comment
+        if: steps.check_permission.outputs.authorized == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api \
+            repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+            -f content='rocket' \
+            --silent || true
+
+      - name: Post unauthorized message
+        if: steps.check_permission.outputs.authorized == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment ${{ github.event.issue.number }} \
+            --body "Sorry @${{ github.event.comment.user.login }}, only repository collaborators with write access can request comment addressing."
+
+      - name: Get PR details
+        if: steps.check_permission.outputs.authorized == 'true'
+        id: pr_details
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_REF=$(gh pr view ${{ github.event.issue.number }} --json headRefName --jq '.headRefName')
+          echo "pr_ref=${PR_REF}" >> $GITHUB_OUTPUT
+          echo "PR branch: ${PR_REF}"
+
+      - name: Post starting message
+        if: steps.check_permission.outputs.authorized == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment ${{ github.event.issue.number }} \
+            --body "🤖 Starting to address automated review comments...
+
+          [View workflow run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+
+  address-comments:
+    needs: trigger-address
+    if: needs.trigger-address.outputs.authorized == 'true'
+    runs-on: [self-hosted, claude-code]
+    timeout-minutes: 120
+    concurrency:
+      group: address-comments-${{ github.event.issue.number }}
+      cancel-in-progress: true
+
+    env:
+      PR_NUMBER: ${{ needs.trigger-address.outputs.pr_number }}
+      PR_REF: ${{ needs.trigger-address.outputs.pr_ref }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.trigger-address.outputs.pr_ref }}
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config --global user.name "Michael Still"
+          git config --global user.email "mikal@stillhq.com"
+
+      - name: Run address comments script
+        id: address
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          # Capture output for summary extraction
+          ./tools/address-comments-with-claude.sh \
+            --ci \
+            --pr ${{ env.PR_NUMBER }} \
+            --output-dir ${{ github.workspace }}/address-output \
+            2>&1 | tee ${{ github.workspace }}/address-log.txt
+
+          # Extract summary file path (last line of output)
+          summary_file=$(tail -1 ${{ github.workspace }}/address-log.txt)
+          if [ -f "${summary_file}" ]; then
+            cp "${summary_file}" ${{ github.workspace }}/summary.md
+          fi
+
+          # Extract counts from CI output
+          addressed=$(grep "^items_addressed=" ${{ github.workspace }}/address-log.txt | cut -d= -f2 || echo "0")
+          skipped=$(grep "^items_skipped=" ${{ github.workspace }}/address-log.txt | cut -d= -f2 || echo "0")
+
+          echo "addressed=${addressed}" >> $GITHUB_OUTPUT
+          echo "skipped=${skipped}" >> $GITHUB_OUTPUT
+
+      - name: Run pre-commit checks
+        id: precommit
+        continue-on-error: true
+        run: |
+          # Run pre-commit on all files to catch any issues
+          if command -v pre-commit &> /dev/null; then
+            pre-commit run --all-files 2>&1 | tee ${{ github.workspace }}/precommit-output.txt
+            echo "precommit_passed=$?" >> $GITHUB_OUTPUT
+          else
+            echo "pre-commit not available, skipping"
+            echo "precommit_passed=0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Fix pre-commit issues if any
+        if: steps.precommit.outputs.precommit_passed != '0'
+        run: |
+          # Stage any auto-fixed files and amend the last commit if there was one
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            # Only amend if we have commits to push
+            if [ "$(git rev-list --count origin/${{ env.PR_REF }}..HEAD)" -gt 0 ]; then
+              git commit --amend --no-edit
+            fi
+          fi
+
+      - name: Push commits
+        id: push
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Count commits to push
+          commit_count=$(git rev-list --count origin/${{ env.PR_REF }}..HEAD 2>/dev/null || echo "0")
+          echo "commit_count=${commit_count}" >> $GITHUB_OUTPUT
+
+          if [ "${commit_count}" -gt 0 ]; then
+            echo "Pushing ${commit_count} commits..."
+            git push origin HEAD:${{ env.PR_REF }}
+          else
+            echo "No commits to push"
+          fi
+
+      - name: Post success comment
+        if: steps.push.outputs.commit_count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Build summary from the markdown file
+          if [ -f "${{ github.workspace }}/summary.md" ]; then
+            summary=$(cat ${{ github.workspace }}/summary.md)
+          else
+            summary="See workflow logs for details."
+          fi
+
+          gh pr comment ${{ env.PR_NUMBER }} \
+            --body "$(cat <<EOF
+          ✅ Addressed automated review comments and pushed ${{ steps.push.outputs.commit_count }} commit(s).
+
+          ${summary}
+
+          [View workflow run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          EOF
+          )"
+
+      - name: Post no-changes comment
+        if: steps.push.outputs.commit_count == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -f "${{ github.workspace }}/summary.md" ]; then
+            summary=$(cat ${{ github.workspace }}/summary.md)
+          else
+            summary="No actionable items found or all items were skipped."
+          fi
+
+          gh pr comment ${{ env.PR_NUMBER }} \
+            --body "$(cat <<EOF
+          ℹ️ No changes were made after reviewing automated comments.
+
+          ${summary}
+
+          [View workflow run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          EOF
+          )"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: address-comments-logs-${{ env.PR_NUMBER }}
+          path: |
+            ${{ github.workspace }}/address-output/
+            ${{ github.workspace }}/address-log.txt
+            ${{ github.workspace }}/summary.md
+            ${{ github.workspace }}/precommit-output.txt
+          retention-days: 14
