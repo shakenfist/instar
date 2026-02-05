@@ -9,7 +9,8 @@
 #   tools/review-pr-with-claude.sh [options]
 #
 # Options:
-#   --pr NUMBER         PR number to review (required in CI, auto-detected locally)
+#   --pr NUMBER         PR number to review (required in CI, auto-detected
+#                       locally)
 #   --max-turns N       Maximum Claude turns (default: 50)
 #   --interactive       Run Claude in interactive mode (default: headless)
 #   --ci                CI mode: output machine-readable status, no colors
@@ -167,7 +168,9 @@ fi
 if [ -z "${pr_number}" ]; then
     # Try to get from GitHub Actions event
     if [ -n "${GITHUB_EVENT_PATH}" ] && [ -f "${GITHUB_EVENT_PATH}" ]; then
-        pr_number=$(jq -r '.pull_request.number // .number // empty' "${GITHUB_EVENT_PATH}" 2>/dev/null || true)
+        jq_filter='.pull_request.number // .number // empty'
+        pr_number=$(jq -r "${jq_filter}" "${GITHUB_EVENT_PATH}" \
+            2>/dev/null || true)
     fi
 
     # Try to get from current branch
@@ -212,15 +215,17 @@ echo
 
 # Check if diff is too large
 if [ "${diff_lines}" -gt 5000 ]; then
-    echo -e "${YELLOW}Warning: Large diff (${diff_lines} lines), review may be limited${NC}"
+    msg="Warning: Large diff (${diff_lines} lines), review may be limited"
+    echo -e "${YELLOW}${msg}${NC}"
 fi
 
 # Step 4: Check for existing bot reviews
 echo -e "${YELLOW}Step 4: Checking for existing reviews...${NC}"
 
+jq_filter='.reviews[] | select(.author.login == "github-actions"'
+jq_filter+=' or .author.login == "shakenfist-bot") | .id'
 existing_review=$(gh pr view "${pr_number}" --json reviews \
-    --jq '.reviews[] | select(.author.login == "github-actions" or .author.login == "shakenfist-bot") | .id' \
-    2>/dev/null | head -1 || true)
+    --jq "${jq_filter}" 2>/dev/null | head -1 || true)
 
 if [ -n "${existing_review}" ]; then
     if [ "${force}" = true ]; then
@@ -336,17 +341,18 @@ escape_sed() {
     printf '%s' "$1" | sed 's/[&/\]/\\&/g'
 }
 
-sed -i "s|\${pr_number}|${pr_number}|g" "${output_dir}/claude-prompt.txt"
-sed -i "s|\${pr_title}|$(escape_sed "${pr_title}")|g" "${output_dir}/claude-prompt.txt"
-sed -i "s|\${pr_author}|$(escape_sed "${pr_author}")|g" "${output_dir}/claude-prompt.txt"
-sed -i "s|\${head_branch}|$(escape_sed "${head_branch}")|g" "${output_dir}/claude-prompt.txt"
-sed -i "s|\${base_branch}|$(escape_sed "${base_branch}")|g" "${output_dir}/claude-prompt.txt"
+prompt_file="${output_dir}/claude-prompt.txt"
+sed -i "s|\${pr_number}|${pr_number}|g" "${prompt_file}"
+sed -i "s|\${pr_title}|$(escape_sed "${pr_title}")|g" "${prompt_file}"
+sed -i "s|\${pr_author}|$(escape_sed "${pr_author}")|g" "${prompt_file}"
+sed -i "s|\${head_branch}|$(escape_sed "${head_branch}")|g" "${prompt_file}"
+sed -i "s|\${base_branch}|$(escape_sed "${base_branch}")|g" "${prompt_file}"
 
 # Append the diff
-cat "${output_dir}/pr-diff.txt" >> "${output_dir}/claude-prompt.txt"
+cat "${output_dir}/pr-diff.txt" >> "${prompt_file}"
 
 if [ "${interactive}" = true ]; then
-    echo "Prompt file: ${output_dir}/claude-prompt.txt"
+    echo "Prompt file: ${prompt_file}"
     echo
     echo "Run 'claude' and paste the prompt to review the PR interactively."
     exit 0
@@ -355,7 +361,7 @@ fi
 if [ "${dry_run}" = true ]; then
     echo "Dry run mode - would send this prompt to Claude:"
     echo "---"
-    head -80 "${output_dir}/claude-prompt.txt"
+    head -80 "${prompt_file}"
     echo "..."
     echo "---"
     echo
@@ -365,16 +371,17 @@ fi
 
 # Run Claude Code to get JSON review
 echo "Running Claude to generate review JSON..."
-cat "${output_dir}/claude-prompt.txt" | claude -p - \
+cat "${prompt_file}" | claude -p - \
     --dangerously-skip-permissions \
     --max-turns "${max_turns}" \
     --output-format json > "${output_dir}/claude-output.json" || true
 
 # Extract metadata for CI output
-if [ -f "${output_dir}/claude-output.json" ]; then
-    num_turns=$(jq -r '.num_turns // "unknown"' "${output_dir}/claude-output.json")
-    duration_ms=$(jq -r '.duration_ms // "unknown"' "${output_dir}/claude-output.json")
-    cost_usd=$(jq -r '.total_cost_usd // "unknown"' "${output_dir}/claude-output.json")
+claude_output="${output_dir}/claude-output.json"
+if [ -f "${claude_output}" ]; then
+    num_turns=$(jq -r '.num_turns // "unknown"' "${claude_output}")
+    duration_ms=$(jq -r '.duration_ms // "unknown"' "${claude_output}")
+    cost_usd=$(jq -r '.total_cost_usd // "unknown"' "${claude_output}")
 
     echo -e "${BLUE}Claude execution stats:${NC}"
     echo "  Turns: ${num_turns} / ${max_turns}"
@@ -391,7 +398,7 @@ fi
 echo
 echo -e "${YELLOW}Step 6: Extracting and validating review JSON...${NC}"
 
-claude_result=$(jq -r '.result // empty' "${output_dir}/claude-output.json")
+claude_result=$(jq -r '.result // empty' "${claude_output}")
 if [ -z "${claude_result}" ]; then
     echo -e "${RED}Error: No result from Claude${NC}"
     ci_output "review_posted" "false"
@@ -400,17 +407,24 @@ fi
 
 # Extract JSON from code block (between ```json and ```)
 # Allow for whitespace variations in the markers
-review_json=$(echo "${claude_result}" | sed -n '/^[[:space:]]*```json[[:space:]]*$/,/^[[:space:]]*```[[:space:]]*$/p' | sed '1d;$d')
+json_start='^[[:space:]]*```json[[:space:]]*$'
+json_end='^[[:space:]]*```[[:space:]]*$'
+review_json=$(echo "${claude_result}" | \
+    sed -n "/${json_start}/,/${json_end}/p" | sed '1d;$d')
 
 if [ -z "${review_json}" ]; then
-    echo -e "${YELLOW}Warning: No JSON code block found with standard markers${NC}"
+    msg="Warning: No JSON code block found with standard markers"
+    echo -e "${YELLOW}${msg}${NC}"
     echo "Attempting fallback extraction..."
 
     # Fallback: try to find JSON object directly
-    review_json=$(echo "${claude_result}" | grep -Pzo '(?s)\{.*"summary".*"items".*\}' | tr '\0' '\n' || true)
+    json_pattern='(?s)\{.*"summary".*"items".*\}'
+    review_json=$(echo "${claude_result}" | \
+        grep -Pzo "${json_pattern}" | tr '\0' '\n' || true)
 
     if [ -z "${review_json}" ]; then
-        echo -e "${RED}Error: Could not extract JSON from Claude's response${NC}"
+        msg="Error: Could not extract JSON from Claude's response"
+        echo -e "${RED}${msg}${NC}"
         echo "Response was:"
         echo "${claude_result}" | head -50
         ci_output "review_posted" "false"
@@ -419,15 +433,19 @@ if [ -z "${review_json}" ]; then
 fi
 
 # Save the extracted JSON
-echo "${review_json}" > "${output_dir}/review.json"
-echo "Extracted review JSON to ${output_dir}/review.json"
+review_json_file="${output_dir}/review.json"
+review_md_file="${output_dir}/review.md"
+render_script="${topdir}/tools/render-review.py"
+
+echo "${review_json}" > "${review_json_file}"
+echo "Extracted review JSON to ${review_json_file}"
 
 # Validate the JSON
 echo "Validating JSON..."
-if ! python3 "${topdir}/tools/render-review.py" --validate "${output_dir}/review.json"; then
+if ! python3 "${render_script}" --validate "${review_json_file}"; then
     echo -e "${RED}Error: Review JSON failed validation${NC}"
     echo "JSON content:"
-    cat "${output_dir}/review.json"
+    cat "${review_json_file}"
     ci_output "review_posted" "false"
     exit 1
 fi
@@ -436,20 +454,21 @@ echo -e "${GREEN}JSON validation passed${NC}"
 # Render to markdown (with embedded JSON for address-comments automation)
 echo
 echo -e "${YELLOW}Step 7: Rendering review to markdown...${NC}"
-python3 "${topdir}/tools/render-review.py" --embed-json "${output_dir}/review.json" "${output_dir}/review.md"
-echo "Rendered review to ${output_dir}/review.md"
+python3 "${render_script}" --embed-json \
+    "${review_json_file}" "${review_md_file}"
+echo "Rendered review to ${review_md_file}"
 
 # Post the review
 echo
 echo -e "${YELLOW}Step 8: Posting review to PR...${NC}"
-gh pr review "${pr_number}" --comment --body "$(cat "${output_dir}/review.md")"
+gh pr review "${pr_number}" --comment --body "$(cat "${review_md_file}")"
 
 echo
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}PR review complete!${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo
-echo "Review JSON saved to: ${output_dir}/review.json"
-echo "Review markdown saved to: ${output_dir}/review.md"
+echo "Review JSON saved to: ${review_json_file}"
+echo "Review markdown saved to: ${review_md_file}"
 ci_output "review_posted" "true"
-ci_output "review_json_path" "${output_dir}/review.json"
+ci_output "review_json_path" "${review_json_file}"

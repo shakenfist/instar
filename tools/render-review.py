@@ -216,7 +216,8 @@ def render_markdown(review_data: dict, embed_json: bool = False) -> str:
     if embed_json:
         lines.append('')
         lines.append('<details>')
-        lines.append('<summary>Machine-readable review data (for automation)</summary>')
+        lines.append('<summary>Machine-readable review data (for automation)'
+                     '</summary>')
         lines.append('')
         lines.append('```json')
         lines.append(json.dumps(review_data, indent=2))
