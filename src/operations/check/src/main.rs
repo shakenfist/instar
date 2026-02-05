@@ -514,6 +514,19 @@ unsafe fn check_qcow2(
         header[QCOW2_L1_TABLE_OFFSET_OFFSET + 7],
     ]);
 
+    // Validate l1_size to prevent DoS from crafted images with enormous values.
+    // The L1 table must fit within the file: l1_size * 8 bytes <= actual_size.
+    // Also apply a reasonable maximum (16M entries covers 8EB with 2MB clusters).
+    const MAX_L1_ENTRIES: u32 = 16 * 1024 * 1024;
+    let l1_table_size_bytes = (l1_size as u64).saturating_mul(8);
+    if l1_size > MAX_L1_ENTRIES || l1_table_size_bytes > actual_size {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+        (call_table.debug_print)(b"check: l1_size exceeds bounds\n\0".as_ptr());
+        return bytes_read;
+    }
+
     // Refcount table info
     let refcount_table_offset = u64::from_be_bytes([
         header[QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET],
