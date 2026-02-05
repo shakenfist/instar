@@ -233,8 +233,8 @@ echo
 echo -e "${YELLOW}Step 5: Running Claude Code for review...${NC}"
 echo
 
-# Build the prompt
-cat > "${output_dir}/claude-prompt.txt" << PROMPT_EOF
+# Build the prompt - request structured JSON output
+cat > "${output_dir}/claude-prompt.txt" << 'PROMPT_EOF'
 You are reviewing Pull Request #${pr_number} for the Shaken Fist project.
 
 ## PR Information
@@ -255,39 +255,81 @@ You are reviewing Pull Request #${pr_number} for the Shaken Fist project.
 2. Analyze the changes for:
    - Code quality and readability
    - Potential bugs or logic errors
-   - Security concerns (SQL injection, command injection, etc.)
+   - Security concerns (integer overflow, bounds checking, etc.)
    - Performance implications
    - Test coverage (are new features tested?)
    - Documentation (are changes documented?)
    - Style consistency with the codebase
 
-3. Write a constructive review that:
-   - Starts with a brief summary of what the PR does
-   - Lists specific concerns with file:line references where applicable
-   - Suggests improvements where relevant
-   - Acknowledges good practices you observe
-   - Is professional and helpful in tone
+3. Output your review as a JSON object with the following structure:
 
-4. Post your review using this exact command:
-   gh pr review ${pr_number} --comment --body "<your review here>"
+```json
+{
+  "summary": "Brief 1-3 sentence summary of what the PR does",
+  "items": [
+    {
+      "id": 1,
+      "title": "Short title for this item",
+      "category": "security|bug|performance|documentation|style|testing|other",
+      "severity": "critical|high|medium|low",
+      "action": "fix|document|consider|none",
+      "description": "Detailed description of the issue or observation",
+      "location": "src/file.rs:100-150",
+      "suggestion": "Specific suggestion for how to address this",
+      "rationale": "For action=none or consider, explain why"
+    }
+  ],
+  "positive_feedback": [
+    {
+      "title": "What was done well",
+      "description": "Why this is good"
+    }
+  ],
+  "test_coverage": {
+    "adequate": true,
+    "missing": ["list of missing test scenarios"]
+  }
+}
+```
 
-   IMPORTANT: The review body must be properly escaped for the shell.
-   Use a heredoc if the review contains quotes or special characters:
+## Action Types
 
-   gh pr review ${pr_number} --comment --body "\$(cat <<'REVIEW_EOF'
-   Your review content here...
-   REVIEW_EOF
-   )"
+- **fix**: This MUST be fixed before merging (security issues, bugs, etc.)
+- **document**: Documentation should be added or updated
+- **consider**: Optional improvement, reviewer's suggestion but not required
+- **none**: Informational observation only, no action needed
+
+## Important Rules
+
+1. Every item MUST have: id, title, category, action
+2. Items with action="fix" MUST have severity
+3. Items with action="none" or "consider" SHOULD have rationale
+4. Include location (file:lines) when referencing specific code
+5. Be specific in suggestions - vague advice is not actionable
+
+## CRITICAL: Output Format
+
+Your response MUST contain a JSON code block with the review data.
+Start the JSON block with ```json and end with ```.
+Do NOT post the review to GitHub - just output the JSON.
+The JSON will be validated and rendered to markdown by a separate script.
 
 ## Code Style Notes for Shaken Fist
 
+- Rust code follows standard rustfmt conventions
 - Python code uses single quotes for strings, double quotes for docstrings
-- Line length limit is 80 chars (120 max)
-- Type hints are required in this project
+- Line length limit is 80 chars
 
 ## The PR Diff
 
 PROMPT_EOF
+
+# Substitute variables in the prompt
+sed -i "s/\${pr_number}/${pr_number}/g" "${output_dir}/claude-prompt.txt"
+sed -i "s/\${pr_title}/${pr_title}/g" "${output_dir}/claude-prompt.txt"
+sed -i "s/\${pr_author}/${pr_author}/g" "${output_dir}/claude-prompt.txt"
+sed -i "s/\${head_branch}/${head_branch}/g" "${output_dir}/claude-prompt.txt"
+sed -i "s/\${base_branch}/${base_branch}/g" "${output_dir}/claude-prompt.txt"
 
 # Append the diff
 cat "${output_dir}/pr-diff.txt" >> "${output_dir}/claude-prompt.txt"
@@ -302,30 +344,27 @@ fi
 if [ "${dry_run}" = true ]; then
     echo "Dry run mode - would send this prompt to Claude:"
     echo "---"
-    head -50 "${output_dir}/claude-prompt.txt"
+    head -80 "${output_dir}/claude-prompt.txt"
     echo "..."
     echo "---"
     echo
-    echo "Then Claude would post a review to PR #${pr_number}"
+    echo "Then Claude would output JSON which would be rendered and posted."
     exit 0
 fi
 
-# Run Claude Code - use JSON output to capture turn count and other metadata
+# Run Claude Code to get JSON review
+echo "Running Claude to generate review JSON..."
 cat "${output_dir}/claude-prompt.txt" | claude -p - \
     --dangerously-skip-permissions \
     --max-turns "${max_turns}" \
     --output-format json > "${output_dir}/claude-output.json" || true
 
-# Extract and display the result text
+# Extract metadata for CI output
 if [ -f "${output_dir}/claude-output.json" ]; then
-    jq -r '.result // empty' "${output_dir}/claude-output.json"
-
-    # Extract metadata for CI output
     num_turns=$(jq -r '.num_turns // "unknown"' "${output_dir}/claude-output.json")
     duration_ms=$(jq -r '.duration_ms // "unknown"' "${output_dir}/claude-output.json")
     cost_usd=$(jq -r '.total_cost_usd // "unknown"' "${output_dir}/claude-output.json")
 
-    echo
     echo -e "${BLUE}Claude execution stats:${NC}"
     echo "  Turns: ${num_turns} / ${max_turns}"
     echo "  Duration: ${duration_ms}ms"
@@ -336,8 +375,61 @@ if [ -f "${output_dir}/claude-output.json" ]; then
     ci_output "claude_cost_usd" "${cost_usd}"
 fi
 
+# Extract the JSON review from Claude's output
+# Claude's response is in .result, and the JSON is in a code block
+echo
+echo -e "${YELLOW}Step 6: Extracting and validating review JSON...${NC}"
+
+claude_result=$(jq -r '.result // empty' "${output_dir}/claude-output.json")
+if [ -z "${claude_result}" ]; then
+    echo -e "${RED}Error: No result from Claude${NC}"
+    ci_output "review_posted" "false"
+    exit 1
+fi
+
+# Extract JSON from code block (between ```json and ```)
+review_json=$(echo "${claude_result}" | sed -n '/^```json$/,/^```$/p' | sed '1d;$d')
+
+if [ -z "${review_json}" ]; then
+    echo -e "${RED}Error: No JSON code block found in Claude's response${NC}"
+    echo "Response was:"
+    echo "${claude_result}" | head -50
+    ci_output "review_posted" "false"
+    exit 1
+fi
+
+# Save the extracted JSON
+echo "${review_json}" > "${output_dir}/review.json"
+echo "Extracted review JSON to ${output_dir}/review.json"
+
+# Validate the JSON
+echo "Validating JSON..."
+if ! python3 "${topdir}/tools/render-review.py" --validate "${output_dir}/review.json"; then
+    echo -e "${RED}Error: Review JSON failed validation${NC}"
+    echo "JSON content:"
+    cat "${output_dir}/review.json"
+    ci_output "review_posted" "false"
+    exit 1
+fi
+echo -e "${GREEN}JSON validation passed${NC}"
+
+# Render to markdown
+echo
+echo -e "${YELLOW}Step 7: Rendering review to markdown...${NC}"
+python3 "${topdir}/tools/render-review.py" "${output_dir}/review.json" "${output_dir}/review.md"
+echo "Rendered review to ${output_dir}/review.md"
+
+# Post the review
+echo
+echo -e "${YELLOW}Step 8: Posting review to PR...${NC}"
+gh pr review "${pr_number}" --comment --body "$(cat "${output_dir}/review.md")"
+
 echo
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}PR review complete!${NC}"
 echo -e "${GREEN}========================================${NC}"
+echo
+echo "Review JSON saved to: ${output_dir}/review.json"
+echo "Review markdown saved to: ${output_dir}/review.md"
 ci_output "review_posted" "true"
+ci_output "review_json_path" "${output_dir}/review.json"
