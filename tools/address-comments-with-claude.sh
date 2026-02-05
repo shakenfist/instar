@@ -15,8 +15,10 @@
 #   tools/address-comments-with-claude.sh [options]
 #
 # Options:
-#   --pr NUMBER         PR number to address (required in CI, auto-detected locally)
-#   --review-json FILE  Path to review.json (optional, extracted from PR if not provided)
+#   --pr NUMBER         PR number to address (required in CI, auto-detected
+#                       locally)
+#   --review-json FILE  Path to review.json (optional, extracted from PR if
+#                       not provided)
 #   --max-turns N       Maximum Claude turns per item (default: 30)
 #   --ci                CI mode: output machine-readable status, no colors
 #   --dry-run           Don't make commits, just show what would be done
@@ -200,26 +202,35 @@ if [ -n "${review_json}" ] && [ -f "${review_json}" ]; then
     echo "Using provided review JSON: ${review_json}"
     cp "${review_json}" "${output_dir}/review.json"
 else
-    # Extract review JSON from the most recent automated review comment on the PR
+    # Extract review JSON from the most recent automated review comment on
+    # the PR
     echo "No review JSON provided, extracting from PR review comments..."
 
-    repo="${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner -q '.nameWithOwner')}"
+    repo="${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner \
+        -q '.nameWithOwner')}"
 
-    # Find the most recent review comment from github-actions[bot] that contains embedded JSON
-    # The JSON is in a <details> section with a ```json code block
+    # Find the most recent review comment from github-actions[bot] that
+    # contains embedded JSON. The JSON is in a <details> section with a
+    # ```json code block.
+    jq_filter='[.[] | select(.user.login == "github-actions[bot]"'
+    jq_filter+=' and (.body | contains("Machine-readable review data")))]'
+    jq_filter+=' | last | .body'
     review_body=$(gh api "repos/${repo}/pulls/${pr_number}/reviews" \
-        --jq '[.[] | select(.user.login == "github-actions[bot]" and (.body | contains("Machine-readable review data")))] | last | .body' \
-        2>/dev/null || true)
+        --jq "${jq_filter}" 2>/dev/null || true)
 
     if [ -z "${review_body}" ] || [ "${review_body}" == "null" ]; then
-        echo -e "${RED}Error: Could not find automated review comment with embedded JSON${NC}"
+        err_msg="Error: Could not find automated review comment"
+        err_msg+=" with embedded JSON"
+        echo -e "${RED}${err_msg}${NC}"
         echo "Ensure the PR has been reviewed by the automated reviewer."
         exit 1
     fi
 
-    # Extract JSON from between ```json and ``` markers within the <details> section
+    # Extract JSON from between ```json and ``` markers within the
+    # <details> section
     echo "${review_body}" | sed -n '/<details>/,/<\/details>/p' | \
-        sed -n '/^```json$/,/^```$/p' | sed '1d;$d' > "${output_dir}/review.json"
+        sed -n '/^```json$/,/^```$/p' | \
+        sed '1d;$d' > "${output_dir}/review.json"
 
     if [ ! -s "${output_dir}/review.json" ]; then
         echo -e "${RED}Error: Could not extract JSON from review comment${NC}"
@@ -232,7 +243,8 @@ fi
 
 # Validate the JSON
 echo "Validating review JSON..."
-if ! python3 "${topdir}/tools/render-review.py" --validate "${output_dir}/review.json"; then
+validate_cmd="${topdir}/tools/render-review.py"
+if ! python3 "${validate_cmd}" --validate "${output_dir}/review.json"; then
     echo -e "${RED}Error: Invalid review JSON${NC}"
     exit 1
 fi
@@ -243,8 +255,8 @@ echo
 echo -e "${YELLOW}Step 3: Extracting actionable items...${NC}"
 
 # Extract items with action=fix or action=document
-actionable_items=$(jq -c '[.items[] | select(.action == "fix" or .action == "document")]' \
-    "${output_dir}/review.json")
+jq_filter='[.items[] | select(.action == "fix" or .action == "document")]'
+actionable_items=$(jq -c "${jq_filter}" "${output_dir}/review.json")
 item_count=$(echo "${actionable_items}" | jq 'length')
 
 echo -e "${GREEN}Found ${item_count} actionable items${NC}"
@@ -252,15 +264,17 @@ ci_output "items_found" "${item_count}"
 echo
 
 if [ "${item_count}" -eq 0 ]; then
-    echo -e "${YELLOW}No actionable items (action=fix or action=document) in review${NC}"
+    msg="No actionable items (action=fix or action=document) in review"
+    echo -e "${YELLOW}${msg}${NC}"
     exit 0
 fi
 
 # Save each item to a separate file for processing
 for i in $(seq 0 $((item_count - 1))); do
-    echo "${actionable_items}" | jq ".[$i]" > "${output_dir}/item-$((i + 1)).json"
-    item_title=$(jq -r '.title' "${output_dir}/item-$((i + 1)).json")
-    item_action=$(jq -r '.action' "${output_dir}/item-$((i + 1)).json")
+    item_file="${output_dir}/item-$((i + 1)).json"
+    echo "${actionable_items}" | jq ".[$i]" > "${item_file}"
+    item_title=$(jq -r '.title' "${item_file}")
+    item_action=$(jq -r '.action' "${item_file}")
     echo "  $((i + 1)). [${item_action}] ${item_title}"
 done
 echo
@@ -293,7 +307,8 @@ for i in $(seq 1 "${item_count}"); do
     item_suggestion=$(jq -r '.suggestion // ""' "${item_file}")
 
     echo -e "${CYAN}----------------------------------------${NC}"
-    echo -e "${CYAN}Item ${i}/${item_count}: [${item_action}] ${item_title}${NC}"
+    item_header="Item ${i}/${item_count}: [${item_action}] ${item_title}"
+    echo -e "${CYAN}${item_header}${NC}"
     echo "  Category: ${item_category}, Severity: ${item_severity}"
     if [ -n "${item_location}" ] && [ "${item_location}" != "null" ]; then
         echo "  Location: ${item_location}"
@@ -302,7 +317,8 @@ for i in $(seq 1 "${item_count}"); do
 
     if [ "${dry_run}" = true ]; then
         echo -e "${YELLOW}[DRY RUN] Would address this item with Claude${NC}"
-        echo "| ${item_id} | ${item_title} | ⏸️ Dry run | - | - |" >> "${summary_file}"
+        row="| ${item_id} | ${item_title} | ⏸️ Dry run | - | - |"
+        echo "${row}" >> "${summary_file}"
         continue
     fi
 
@@ -377,7 +393,9 @@ PROMPT_EOF
         --max-turns "${max_turns}" \
         --output-format text > "${claude_output_file}" 2>&1; then
         echo -e "${RED}Claude failed for item ${i}${NC}"
-        echo "| ${item_id} | ${item_title} | ❌ Error | - | Claude execution failed |" >> "${summary_file}"
+        row="| ${item_id} | ${item_title} | ❌ Error | - |"
+        row+=" Claude execution failed |"
+        echo "${row}" >> "${summary_file}"
         ((skipped_count++))
         continue
     fi
@@ -392,7 +410,9 @@ PROMPT_EOF
 
         # Escape for markdown table
         rationale_escaped=$(echo "${rationale}" | tr '\n' ' ' | sed 's/|/\\|/g')
-        echo "| ${item_id} | ${item_title} | ⏭️ Skipped | - | ${rationale_escaped} |" >> "${summary_file}"
+        row="| ${item_id} | ${item_title} | ⏭️ Skipped | - |"
+        row+=" ${rationale_escaped} |"
+        echo "${row}" >> "${summary_file}"
         ((skipped_count++))
         continue
     fi
@@ -406,7 +426,9 @@ PROMPT_EOF
         # Check if there are actually staged changes
         if [ -z "$(git diff --cached --name-only)" ]; then
             echo -e "${YELLOW}No changes were staged${NC}"
-            echo "| ${item_id} | ${item_title} | ⏭️ Skipped | - | No changes needed |" >> "${summary_file}"
+            row="| ${item_id} | ${item_title} | ⏭️ Skipped | - |"
+            row+=" No changes needed |"
+            echo "${row}" >> "${summary_file}"
             ((skipped_count++))
             continue
         fi
@@ -435,11 +457,15 @@ COMMIT_EOF
         commit_sha=$(git rev-parse --short HEAD)
 
         echo -e "${GREEN}Created commit: ${commit_sha}${NC}"
-        echo "| ${item_id} | ${item_title} | ✅ Fixed | \`${commit_sha}\` | ${change_summary} |" >> "${summary_file}"
+        row="| ${item_id} | ${item_title} | ✅ Fixed |"
+        row+=" \`${commit_sha}\` | ${change_summary} |"
+        echo "${row}" >> "${summary_file}"
         ((addressed_count++))
     else
         echo -e "${YELLOW}No clear outcome from Claude${NC}"
-        echo "| ${item_id} | ${item_title} | ⚠️ Unclear | - | No summary marker found |" >> "${summary_file}"
+        row="| ${item_id} | ${item_title} | ⚠️ Unclear | - |"
+        row+=" No summary marker found |"
+        echo "${row}" >> "${summary_file}"
         ((skipped_count++))
 
         # Reset any unstaged changes
