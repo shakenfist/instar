@@ -2,10 +2,21 @@
 //!
 //! This operation reads the image and validates its internal structures,
 //! similar to `qemu-img check`. For QCOW2 images, it verifies:
-//! - Header validity
-//! - L1/L2 table entries
-//! - Refcount table consistency
-//! - Cluster allocation status
+//! - Header validity (version, cluster_bits, virtual_size)
+//! - L1 table entries (offset bounds, alignment)
+//! - L2 table entries (partial validation - first sector only)
+//! - Basic refcount table offset validation
+//!
+//! ## Current Limitations
+//!
+//! **L2 table validation is partial**: Only the first sector of each L2 table
+//! is validated. For a 64KB cluster size, this covers ~12.5% of entries. The
+//! fragmentation calculation is also based on this partial sample.
+//!
+//! **Refcount validation is not implemented**: The refcount table offset is
+//! validated, but individual refcount entries are not read or verified. This
+//! means `refcount_errors` and `leaks` in CheckResult will always be 0.
+//! Users comparing against `qemu-img check` output may notice this discrepancy.
 //!
 //! Results are sent via protobuf CheckResultMessage over the serial command channel.
 
@@ -433,11 +444,20 @@ fn check_vhd_footer(footer: &[u8], result: &mut CheckResult) {
 /// Check QCOW2 image integrity
 ///
 /// Validates:
-/// - Header magic and version
-/// - L1 table entries
-/// - L2 table entries (samples)
-/// - Refcount table structure
-/// - Checks for dirty/corrupt flags
+/// - Header magic, version, and cluster_bits range
+/// - L1 table entries (offset bounds and cluster alignment)
+/// - L2 table entries (first sector only - partial validation)
+/// - Refcount table offset (entries not validated)
+/// - Dirty/corrupt incompatible feature flags (v3 only)
+///
+/// ## Limitations
+///
+/// L2 table validation only reads the first sector of each L2 table, which
+/// covers approximately 12.5% of entries for 64KB clusters. Fragmentation
+/// metrics are based on this partial sample.
+///
+/// Refcount entries are not validated - only the refcount table offset is
+/// checked. The `refcount_errors` and `leaks` fields will always be 0.
 unsafe fn check_qcow2(
     header: &[u8],
     result: &mut CheckResult,

@@ -767,6 +767,24 @@ that callers can rely on:
 omitting `corruptions`, `leaks`, and `refcount-errors` when their
 values are zero.
 
+### Current Validation Limitations
+
+imago's QCOW2 check implementation has the following limitations compared
+to qemu-img:
+
+1. **Partial L2 table validation**: Only the first sector of each L2 table
+   is validated (approximately 12.5% coverage for 64KB clusters). The
+   fragmentation calculation is based on this partial sample.
+
+2. **No refcount validation**: The refcount table offset is verified, but
+   individual refcount entries are not read or validated. This means:
+   - `refcount-errors` will always be 0
+   - `leaks` will always be 0
+
+Users comparing imago output against `qemu-img check` may notice these
+discrepancies, particularly for images with refcount issues or extensive
+L2 table corruption beyond the first sector.
+
 ## Future Additions
 
 Additional quirks will be documented here as they are discovered during
