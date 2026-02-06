@@ -432,4 +432,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          tools/review-pr-with-claude.sh --ci --pr ${{ github.event.pull_request.number }}
+          # The review script embeds the JSON in the PR comment for the
+          # address-comments automation to extract later
+          tools/review-pr-with-claude.sh \
+            --ci \
+            --pr ${{ github.event.pull_request.number }}
