@@ -335,18 +335,26 @@ The JSON will be validated and rendered to markdown by a separate script.
 
 PROMPT_EOF
 
-# Substitute variables in the prompt
-# Escape sed special characters in user-controlled input to prevent injection
-escape_sed() {
-    printf '%s' "$1" | sed 's/[&/\]/\\&/g'
-}
-
+# Substitute variables in the prompt using Python for safe handling of
+# user-controlled input (PR titles can contain any characters including
+# newlines, quotes, and shell metacharacters)
 prompt_file="${output_dir}/claude-prompt.txt"
-sed -i "s|\${pr_number}|${pr_number}|g" "${prompt_file}"
-sed -i "s|\${pr_title}|$(escape_sed "${pr_title}")|g" "${prompt_file}"
-sed -i "s|\${pr_author}|$(escape_sed "${pr_author}")|g" "${prompt_file}"
-sed -i "s|\${head_branch}|$(escape_sed "${head_branch}")|g" "${prompt_file}"
-sed -i "s|\${base_branch}|$(escape_sed "${base_branch}")|g" "${prompt_file}"
+python3 - "${prompt_file}" "${pr_number}" "${pr_title}" "${pr_author}" \
+    "${head_branch}" "${base_branch}" << 'PYSUBST'
+import sys
+from pathlib import Path
+
+prompt_file = Path(sys.argv[1])
+pr_number, pr_title, pr_author, head_branch, base_branch = sys.argv[2:7]
+
+content = prompt_file.read_text()
+content = content.replace('${pr_number}', pr_number)
+content = content.replace('${pr_title}', pr_title)
+content = content.replace('${pr_author}', pr_author)
+content = content.replace('${head_branch}', head_branch)
+content = content.replace('${base_branch}', base_branch)
+prompt_file.write_text(content)
+PYSUBST
 
 # Append the diff
 cat "${output_dir}/pr-diff.txt" >> "${prompt_file}"
@@ -434,8 +442,10 @@ fi
 
 # Save the extracted JSON
 review_json_file="${output_dir}/review.json"
+review_json_with_issues="${output_dir}/review-with-issues.json"
 review_md_file="${output_dir}/review.md"
 render_script="${topdir}/tools/render-review.py"
+create_issues_script="${topdir}/tools/create-review-issues.py"
 
 echo "${review_json}" > "${review_json_file}"
 echo "Extracted review JSON to ${review_json_file}"
@@ -451,16 +461,32 @@ if ! python3 "${render_script}" --validate "${review_json_file}"; then
 fi
 echo -e "${GREEN}JSON validation passed${NC}"
 
+# Create GitHub issues for actionable items
+echo
+echo -e "${YELLOW}Step 7: Creating GitHub issues for action items...${NC}"
+if [ "${dry_run}" = true ]; then
+    echo "Dry run mode - skipping issue creation"
+    cp "${review_json_file}" "${review_json_with_issues}"
+else
+    python3 "${create_issues_script}" \
+        "${review_json_file}" \
+        "${review_json_with_issues}" \
+        --pr "${pr_number}" || {
+        echo -e "${YELLOW}Warning: Issue creation failed, continuing without issues${NC}"
+        cp "${review_json_file}" "${review_json_with_issues}"
+    }
+fi
+
 # Render to markdown (with embedded JSON for address-comments automation)
 echo
-echo -e "${YELLOW}Step 7: Rendering review to markdown...${NC}"
+echo -e "${YELLOW}Step 8: Rendering review to markdown...${NC}"
 python3 "${render_script}" --embed-json \
-    "${review_json_file}" "${review_md_file}"
+    "${review_json_with_issues}" "${review_md_file}"
 echo "Rendered review to ${review_md_file}"
 
 # Post the review
 echo
-echo -e "${YELLOW}Step 8: Posting review to PR...${NC}"
+echo -e "${YELLOW}Step 9: Posting review to PR...${NC}"
 gh pr review "${pr_number}" --comment --body "$(cat "${review_md_file}")"
 
 echo
@@ -468,7 +494,7 @@ echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}PR review complete!${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo
-echo "Review JSON saved to: ${review_json_file}"
+echo "Review JSON saved to: ${review_json_with_issues}"
 echo "Review markdown saved to: ${review_md_file}"
 ci_output "review_posted" "true"
-ci_output "review_json_path" "${review_json_file}"
+ci_output "review_json_path" "${review_json_with_issues}"

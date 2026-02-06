@@ -290,13 +290,17 @@ Comment on a PR with these commands (requires write access to the repository):
 
 The automated reviewer outputs structured JSON that is:
 1. Validated against a JSON schema (`tools/review-schema.json`)
-2. Rendered to human-readable markdown and posted as a PR comment
-3. The raw JSON is embedded in a collapsed `<details>` section at the end of
+2. GitHub issues are created for actionable items (action=fix or action=document)
+3. Rendered to human-readable markdown and posted as a PR comment
+4. The raw JSON is embedded in a collapsed `<details>` section at the end of
    the comment, allowing the address-comments automation to extract it
 
+The review comment includes links to the created issues with "Closes #N" syntax,
+so issues are automatically closed when the PR merges.
+
 Each review item has an `action` field:
-- `fix` - Must be fixed before merging
-- `document` - Documentation should be added
+- `fix` - Must be fixed before merging (creates an issue)
+- `document` - Documentation should be added (creates an issue)
 - `consider` - Optional improvement (reviewer suggestion)
 - `none` - Informational observation only
 
@@ -328,5 +332,6 @@ This allows reviewers to cherry-pick or drop individual fixes as needed.
 
 - `tools/review-pr-with-claude.sh` - Performs automated PR reviews (outputs JSON)
 - `tools/address-comments-with-claude.sh` - Addresses review comments (reads JSON)
-- `tools/render-review.py` - Renders review JSON to markdown
+- `tools/create-review-issues.py` - Creates GitHub issues for actionable items
+- `tools/render-review.py` - Renders review JSON to markdown (includes issue links)
 - `tools/review-schema.json` - JSON schema for review output validation

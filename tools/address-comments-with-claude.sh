@@ -118,6 +118,37 @@ done
 
 setup_colors
 
+# Sanitize user-controlled input for safe use in commit messages and logs
+# - Removes control characters
+# - Limits length
+# - Replaces problematic characters
+sanitize_input() {
+    local input="$1"
+    local max_length="${2:-200}"
+
+    # Remove control characters (except newline for descriptions)
+    # Replace backticks and dollar signs to prevent command substitution
+    local sanitized
+    sanitized=$(printf '%s' "${input}" | \
+        tr -d '\000-\010\013\014\016-\037' | \
+        sed 's/`/'"'"'/g; s/\$/S/g')
+
+    # Truncate to max length
+    if [ "${#sanitized}" -gt "${max_length}" ]; then
+        sanitized="${sanitized:0:${max_length}}..."
+    fi
+
+    printf '%s' "${sanitized}"
+}
+
+# Sanitize for use in commit message first line (stricter: single line, short)
+sanitize_commit_subject() {
+    local input="$1"
+    # Remove newlines, limit to 50 chars for subject line
+    printf '%s' "${input}" | tr -d '\n\r' | \
+        sed 's/`/'"'"'/g; s/\$/S/g' | cut -c1-50
+}
+
 # Validate --max-turns is a positive integer
 if ! [[ "${max_turns}" =~ ^[0-9]+$ ]] || [ "${max_turns}" -lt 1 ]; then
     echo -e "${RED}Error: --max-turns must be a positive integer${NC}"
@@ -297,14 +328,34 @@ skipped_count=0
 
 for i in $(seq 1 "${item_count}"); do
     item_file="${output_dir}/item-${i}.json"
+
+    # Extract and sanitize values from review JSON
+    # These values come from the automated review which is derived from PR data
     item_id=$(jq -r '.id' "${item_file}")
-    item_title=$(jq -r '.title' "${item_file}")
+    item_title_raw=$(jq -r '.title' "${item_file}")
     item_action=$(jq -r '.action' "${item_file}")
     item_category=$(jq -r '.category' "${item_file}")
     item_severity=$(jq -r '.severity // "N/A"' "${item_file}")
-    item_description=$(jq -r '.description // ""' "${item_file}")
+    item_description_raw=$(jq -r '.description // ""' "${item_file}")
     item_location=$(jq -r '.location // ""' "${item_file}")
-    item_suggestion=$(jq -r '.suggestion // ""' "${item_file}")
+    item_suggestion_raw=$(jq -r '.suggestion // ""' "${item_file}")
+
+    # Sanitize user-controlled content
+    item_title=$(sanitize_input "${item_title_raw}" 100)
+    item_description=$(sanitize_input "${item_description_raw}" 500)
+    item_suggestion=$(sanitize_input "${item_suggestion_raw}" 500)
+
+    # Validate item_id is numeric
+    if ! [[ "${item_id}" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}Warning: Invalid item ID, skipping${NC}"
+        continue
+    fi
+
+    # Validate action is one of the expected values
+    if [[ ! "${item_action}" =~ ^(fix|document|consider|none)$ ]]; then
+        echo -e "${RED}Warning: Invalid action '${item_action}', skipping${NC}"
+        continue
+    fi
 
     echo -e "${CYAN}----------------------------------------${NC}"
     item_header="Item ${i}/${item_count}: [${item_action}] ${item_title}"
@@ -419,9 +470,11 @@ PROMPT_EOF
 
     # Check for change summary
     if grep -q "CHANGE_SUMMARY_START" "${claude_output_file}"; then
-        change_summary=$(sed -n '/CHANGE_SUMMARY_START/,/CHANGE_SUMMARY_END/p' \
+        change_summary_raw=$(sed -n '/CHANGE_SUMMARY_START/,/CHANGE_SUMMARY_END/p' \
             "${claude_output_file}" | grep -v "CHANGE_SUMMARY" | grep -v '```' | \
             head -1 | xargs)
+        # Sanitize the change summary for use in commit message subject
+        change_summary=$(sanitize_commit_subject "${change_summary_raw}")
 
         # Check if there are actually staged changes
         if [ -z "$(git diff --cached --name-only)" ]; then

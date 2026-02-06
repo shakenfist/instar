@@ -205,6 +205,24 @@ def render_markdown(review_data: dict, embed_json: bool = False) -> str:
                 lines.append(f'- {scenario}')
         lines.append('')
 
+    # Collect issues created for auto-close links
+    issue_numbers = []
+    for item in review_data.get('items', []):
+        if item.get('issue_number'):
+            issue_numbers.append(item['issue_number'])
+
+    if issue_numbers:
+        lines.append('---')
+        lines.append('')
+        lines.append('### Related Issues')
+        lines.append('')
+        lines.append('The following issues were created for this review and '
+                     'will be closed when this PR merges:')
+        lines.append('')
+        for num in issue_numbers:
+            lines.append(f'- Closes #{num}')
+        lines.append('')
+
     # Footer
     lines.append('---')
     lines.append('')
@@ -247,6 +265,10 @@ def render_item(item: dict) -> list[str]:
         title_parts.append(f"{severity_emoji}")
 
     title_parts.append(f"{category_emoji} {item['title']}")
+
+    # Add issue link if present
+    if item.get('issue_number'):
+        title_parts.append(f"(#{item['issue_number']})")
 
     lines.append(' '.join(title_parts))
     lines.append('')

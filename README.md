@@ -338,9 +338,16 @@ comment (embedded in a collapsed `<details>` section) and creates one commit per
 actionable item (those marked with `action: fix` or `action: document`). If Claude
 disagrees with a suggestion, it will explain its rationale instead of making changes.
 
+### GitHub Issues
+
+The automated reviewer creates GitHub issues for actionable items (fix/document).
+These issues are linked in the review comment with "Closes #N" syntax, so they're
+automatically closed when the PR merges.
+
 ### Workflows
 
-- **Automated Review**: PRs automatically receive code review after CI passes
+- **Automated Review**: PRs automatically receive code review after CI passes,
+  and GitHub issues are created for actionable items
 - **Test Fixing**: On-demand test failure resolution via PR comment
 - **Comment Addressing**: On-demand resolution of review feedback via PR comment
 

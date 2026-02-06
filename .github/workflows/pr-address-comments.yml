@@ -65,6 +65,20 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           PR_REF=$(gh pr view ${{ github.event.issue.number }} --json headRefName --jq '.headRefName')
+
+          # Validate branch name to prevent command injection
+          # Allow only alphanumeric, hyphens, underscores, slashes, and dots
+          if ! [[ "${PR_REF}" =~ ^[a-zA-Z0-9/_.-]+$ ]]; then
+            echo "Error: Invalid branch name format: ${PR_REF}"
+            exit 1
+          fi
+
+          # Additional safety: reject names that could be git options
+          if [[ "${PR_REF}" == -* ]]; then
+            echo "Error: Branch name cannot start with hyphen: ${PR_REF}"
+            exit 1
+          fi
+
           echo "pr_ref=${PR_REF}" >> $GITHUB_OUTPUT
           echo "PR branch: ${PR_REF}"
 
@@ -152,7 +166,8 @@ jobs:
           if [ -n "$(git status --porcelain)" ]; then
             git add -A
             # Only amend if we have commits to push
-            if [ "$(git rev-list --count origin/${{ env.PR_REF }}..HEAD)" -gt 0 ]; then
+            # Use quoted variable to prevent word splitting
+            if [ "$(git rev-list --count "origin/${{ env.PR_REF }}"..HEAD)" -gt 0 ]; then
               git commit --amend --no-edit
             fi
           fi
@@ -161,15 +176,17 @@ jobs:
         id: push
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pass branch name through environment to avoid direct interpolation
+          BRANCH_NAME: ${{ env.PR_REF }}
         run: |
-          # Count commits to push
-          commit_count=$(git rev-list --count origin/${{ env.PR_REF }}..HEAD 2>/dev/null || echo "0")
+          # Count commits to push (use quoted variable)
+          commit_count=$(git rev-list --count "origin/${BRANCH_NAME}"..HEAD 2>/dev/null || echo "0")
           echo "commit_count=${commit_count}" >> $GITHUB_OUTPUT
 
           if [ "${commit_count}" -gt 0 ]; then
             echo "Pushing ${commit_count} commits..."
-            # Use explicit refs/heads/ prefix for safety with user-provided branch names
-            git push origin HEAD:refs/heads/${{ env.PR_REF }}
+            # Use explicit refs/heads/ prefix and quoted variable for safety
+            git push origin "HEAD:refs/heads/${BRANCH_NAME}"
           else
             echo "No commits to push"
           fi
