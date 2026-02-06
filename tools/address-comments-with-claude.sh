@@ -521,7 +521,7 @@ PROMPT_EOF
         commit_msg_file="${output_dir}/commit-msg-${i}.txt"
         {
             printf '%s.\n\n' "${change_summary}"
-            printf 'Addresses review item #%s: %s\n\n' "${item_id}" "${item_title}"
+            printf 'Addresses review item %s: %s\n\n' "${item_id}" "${item_title}"
             printf 'Category: %s\n' "${item_category}"
             printf 'Severity: %s\n\n' "${item_severity}"
             printf 'Prompt: @shakenfist-bot please address comments on PR #%s\n\n' \
