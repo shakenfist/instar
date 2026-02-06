@@ -639,9 +639,21 @@ unsafe fn check_qcow2(
     let mut l1_offset = l1_table_offset;
     let mut remaining_l1_entries = l1_size;
 
+    // input_capacity is the number of sectors in the input
+    let input_capacity = actual_size / sector_size as u64;
+
     while remaining_l1_entries > 0 {
         let l1_sector = l1_offset / sector_size as u64;
         let offset_in_sector = (l1_offset % sector_size as u64) as usize;
+
+        // Validate sector is within file bounds before reading
+        if l1_sector >= input_capacity {
+            result.corruptions += 1;
+            result.total_errors += 1;
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+            (call_table.debug_print)(b"check: L1 sector out of bounds\n\0".as_ptr());
+            break;
+        }
 
         if !(call_table.read_input_sector)(0, l1_sector, table_buffer.as_mut_ptr(), sector_size) {
             result.corruptions += 1;
@@ -716,6 +728,14 @@ unsafe fn check_qcow2(
             // For full validation, we would read the entire L2 table
             let l2_sector = l2_offset / sector_size as u64;
             let mut l2_buffer = [0u8; MAX_SECTOR_SIZE];
+
+            // Validate sector is within file bounds before reading
+            if l2_sector >= input_capacity {
+                result.corruptions += 1;
+                result.total_errors += 1;
+                (call_table.debug_print)(b"check: L2 sector out of bounds\n\0".as_ptr());
+                continue;
+            }
 
             if (call_table.read_input_sector)(0, l2_sector, l2_buffer.as_mut_ptr(), sector_size) {
                 bytes_read += sector_size as u64;
