@@ -402,6 +402,15 @@ unsafe fn check_vhdx(
     // Read region table
     let mut buffer = [0u8; MAX_SECTOR_SIZE];
     let region_table_sector = VHDX_REGION_TABLE_OFFSET / sector_size as u64;
+    let input_capacity = (call_table.get_input_capacity)(0);
+
+    // Validate sector is within file bounds before reading
+    if region_table_sector >= input_capacity {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+        return bytes_read;
+    }
 
     if !(call_table.read_input_sector)(0, region_table_sector, buffer.as_mut_ptr(), sector_size) {
         result.corruptions += 1;
