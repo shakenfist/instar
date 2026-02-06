@@ -613,13 +613,31 @@ unsafe fn check_qcow2(
     result.clusters_allocated = 0;
 
     // Track image end offset (highest offset used)
-    let mut max_offset: u64 = l1_table_offset + (l1_size as u64 * 8);
+    // Use checked arithmetic to handle potential overflow from corrupted images
+    let mut max_offset: u64 = match l1_table_offset.checked_add((l1_size as u64).saturating_mul(8))
+    {
+        Some(v) => v,
+        None => {
+            result.corruptions += 1;
+            result.total_errors += 1;
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+            (call_table.debug_print)(b"check: L1 table end offset overflow\n\0".as_ptr());
+            return bytes_read;
+        }
+    };
 
     // Update max_offset with refcount table
-    let refcount_table_end =
-        refcount_table_offset + (refcount_table_clusters as u64 * cluster_size);
-    if refcount_table_end > max_offset {
-        max_offset = refcount_table_end;
+    let refcount_table_size = (refcount_table_clusters as u64).saturating_mul(cluster_size);
+    if let Some(refcount_table_end) = refcount_table_offset.checked_add(refcount_table_size) {
+        if refcount_table_end > max_offset {
+            max_offset = refcount_table_end;
+        }
+    } else {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+        (call_table.debug_print)(b"check: refcount table end offset overflow\n\0".as_ptr());
+        return bytes_read;
     }
 
     // Buffer for L1/L2 table entries
@@ -718,10 +736,16 @@ unsafe fn check_qcow2(
             allocated_l2_tables += 1;
             result.clusters_allocated += 1;
 
-            // Update max offset
-            let l2_table_end = l2_offset + cluster_size;
-            if l2_table_end > max_offset {
-                max_offset = l2_table_end;
+            // Update max offset (checked arithmetic for defense-in-depth)
+            if let Some(l2_table_end) = l2_offset.checked_add(cluster_size) {
+                if l2_table_end > max_offset {
+                    max_offset = l2_table_end;
+                }
+            } else {
+                result.corruptions += 1;
+                result.total_errors += 1;
+                (call_table.debug_print)(b"check: L2 table end offset overflow\n\0".as_ptr());
+                continue;
             }
 
             // Sample L2 table validation (read first sector of L2 table)
@@ -788,19 +812,34 @@ unsafe fn check_qcow2(
 
                             result.clusters_allocated += 1;
 
-                            // Track fragmentation
+                            // Track fragmentation (use saturating_add to avoid overflow)
                             total_data_entries += 1;
-                            if last_data_offset != 0
-                                && data_offset != last_data_offset + cluster_size
-                            {
-                                fragmented_entries += 1;
+                            if last_data_offset != 0 {
+                                if let Some(expected_next) =
+                                    last_data_offset.checked_add(cluster_size)
+                                {
+                                    if data_offset != expected_next {
+                                        fragmented_entries += 1;
+                                    }
+                                } else {
+                                    // Overflow means definitely not sequential
+                                    fragmented_entries += 1;
+                                }
                             }
                             last_data_offset = data_offset;
 
-                            // Update max offset
-                            let data_end = data_offset + cluster_size;
-                            if data_end > max_offset {
-                                max_offset = data_end;
+                            // Update max offset (checked arithmetic for defense-in-depth)
+                            if let Some(data_end) = data_offset.checked_add(cluster_size) {
+                                if data_end > max_offset {
+                                    max_offset = data_end;
+                                }
+                            } else {
+                                result.corruptions += 1;
+                                result.total_errors += 1;
+                                (call_table.debug_print)(
+                                    b"check: data cluster end offset overflow\n\0".as_ptr(),
+                                );
+                                continue;
                             }
                         }
                     } else {
