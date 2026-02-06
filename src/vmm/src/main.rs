@@ -2823,8 +2823,8 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
         serial_transmitter.buffer.len()
     );
 
-    // Track check result for exit code
-    let mut check_passed = true;
+    // Track check result for exit code (default to false - require explicit pass)
+    let mut check_passed = false;
 
     // Track VM errors - if set, we return an error instead of Ok(())
     let mut vm_error: Option<String> = None;
