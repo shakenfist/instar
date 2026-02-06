@@ -676,15 +676,18 @@ report specific error counts. Images that pass validation are marked `FLAG_VALID
 matching qemu-img's behavior. Non-QCOW2 images are marked as
 `FLAG_NOT_SUPPORTED | FLAG_VALID` without examination.
 
-### Test Images
+### Test Images (Planned)
 
-The imago-testdata repository includes corrupt test images for validation:
+The following corrupt test images are planned for imago-testdata to validate
+corruption detection. Tests skip gracefully if these files do not exist:
 
 | Image | Format | Corruption |
 |-------|--------|------------|
 | `vmdk-corrupt-version.vmdk` | VMDK | Invalid version (255) |
 | `vhdx-corrupt-region.vhdx` | VHDX | Invalid region table signature |
 | `vhd-corrupt-disktype.vhd` | VHD | Invalid disk type (255) |
+
+These images should be placed in `custom/format-coverage/` when created.
 
 ### Summary
 
