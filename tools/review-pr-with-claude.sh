@@ -425,10 +425,28 @@ if [ -z "${review_json}" ]; then
     echo -e "${YELLOW}${msg}${NC}"
     echo "Attempting fallback extraction..."
 
-    # Fallback: try to find JSON object directly
-    json_pattern='(?s)\{.*"summary".*"items".*\}'
-    review_json=$(echo "${claude_result}" | \
-        grep -Pzo "${json_pattern}" | tr '\0' '\n' || true)
+    # Fallback: use Python for portable JSON extraction
+    # This handles multiline JSON without requiring grep -P (PCRE)
+    review_json=$(echo "${claude_result}" | python3 -c '
+import sys
+import re
+import json
+
+content = sys.stdin.read()
+
+# Try to find a JSON object with summary and items fields
+# Match from first { to last } that contains required fields
+match = re.search(r"\{[^{}]*\"summary\"[^{}]*\"items\".*\}", content, re.DOTALL)
+if match:
+    # Validate it is parseable JSON
+    try:
+        candidate = match.group(0)
+        json.loads(candidate)
+        print(candidate)
+    except json.JSONDecodeError:
+        # Try to find balanced braces
+        pass
+' 2>/dev/null || true)
 
     if [ -z "${review_json}" ]; then
         msg="Error: Could not extract JSON from Claude's response"
