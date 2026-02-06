@@ -1,4 +1,4 @@
-name: Sanity Checks
+name: Functional Tests
 
 on:
   pull_request:
@@ -6,7 +6,7 @@ on:
       - 'src/**'
       - 'crates/**'
       - 'Makefile'
-      - '.github/workflows/sanity-checks.yml'
+      - '.github/workflows/functional-tests.yml'
   workflow_dispatch:
 
 jobs:
@@ -36,7 +36,7 @@ jobs:
             echo "is_bot=false" >> $GITHUB_OUTPUT
           fi
 
-  sanity-checks:
+  build-and-test:
     runs-on: [self-hosted, debian-12, s]
     timeout-minutes: 30
 
@@ -213,7 +213,7 @@ jobs:
             '
 
   integration-tests:
-    needs: sanity-checks
+    needs: build-and-test
     runs-on: [self-hosted, debian-12, xl]
     timeout-minutes: 60
 
@@ -414,7 +414,7 @@ jobs:
   automated_reviewer:
     name: "Automated reviewer"
     runs-on: [self-hosted, claude-code]
-    needs: [check-bot-commit, sanity-checks, integration-tests]
+    needs: [check-bot-commit, build-and-test, integration-tests]
     if: >-
       ${{ github.event_name == 'pull_request' &&
           needs.check-bot-commit.outputs.is_bot != 'true' }}

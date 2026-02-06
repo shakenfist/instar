@@ -282,6 +282,7 @@ The project includes Claude Code-powered GitHub automation for common PR tasks.
 Comment on a PR with these commands (requires write access to the repository):
 
 - `@shakenfist-bot please re-review` - Request a fresh automated code review
+- `@shakenfist-bot please retest` - Re-run functional tests without pushing a new commit
 - `@shakenfist-bot please attempt to fix` - Have Claude attempt to fix failing tests
 - `@shakenfist-bot please address comments` - Have Claude address automated review
   feedback, creating one commit per valid issue
@@ -322,8 +323,9 @@ This allows reviewers to cherry-pick or drop individual fixes as needed.
 
 ### Workflow Files
 
-- `.github/workflows/sanity-checks.yml` - Main CI with automated review
+- `.github/workflows/functional-tests.yml` - Main CI with automated review
 - `.github/workflows/pr-re-review.yml` - Manual re-review trigger
+- `.github/workflows/pr-retest.yml` - Manual retest trigger via bot command
 - `.github/workflows/pr-fix-tests.yml` - Test failure fixing
 - `.github/workflows/pr-address-comments.yml` - Review comment addressing
 - `.github/workflows/test-drift-fix.yml` - Scheduled/on-demand test maintenance
