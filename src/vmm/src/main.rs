@@ -1649,7 +1649,7 @@ enum Commands {
     Info(InfoArgs),
     /// Copy/convert disk images
     Copy(CopyArgs),
-    /// Check image structural integrity
+    /// Check image structural integrity (partial L2 validation; see docs/quirks.md)
     Check(CheckArgs),
     /// Display or validate configuration
     Config(ConfigArgs),
