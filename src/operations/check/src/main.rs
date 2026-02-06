@@ -350,14 +350,28 @@ fn check_vmdk(header: &[u8], result: &mut CheckResult, actual_size: u64) -> u64 
     ]);
 
     if desc_offset_sectors > 0 {
-        let desc_end = desc_offset_sectors
-            .saturating_mul(512)
-            .saturating_add(desc_size_sectors.saturating_mul(512));
-        if desc_end > actual_size {
-            result.corruptions += 1;
-            result.total_errors += 1;
-            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
-            return 0;
+        // Use checked arithmetic to detect overflow from malicious values
+        let desc_end = desc_offset_sectors.checked_mul(512).and_then(|off| {
+            desc_size_sectors
+                .checked_mul(512)
+                .and_then(|sz| off.checked_add(sz))
+        });
+
+        match desc_end {
+            None => {
+                // Overflow in offset calculation indicates corruption
+                result.corruptions += 1;
+                result.total_errors += 1;
+                result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+                return 0;
+            }
+            Some(end) if end > actual_size => {
+                result.corruptions += 1;
+                result.total_errors += 1;
+                result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+                return 0;
+            }
+            Some(_) => {} // Valid offset within bounds
         }
     }
 
