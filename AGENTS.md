@@ -322,7 +322,7 @@ This allows reviewers to cherry-pick or drop individual fixes as needed.
 
 ### Workflow Files
 
-- `.github/workflows/sanity-checks.yml` - Main CI with automated review
+- `.github/workflows/functional-tests.yml` - Main CI with automated review
 - `.github/workflows/pr-re-review.yml` - Manual re-review trigger
 - `.github/workflows/pr-fix-tests.yml` - Test failure fixing
 - `.github/workflows/pr-address-comments.yml` - Review comment addressing
