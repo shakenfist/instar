@@ -56,6 +56,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh pr comment ${{ github.event.issue.number }} \
+            --repo ${{ github.repository }} \
             --body "Sorry @${{ github.event.comment.user.login }}, only repository collaborators with write access can request comment addressing."
 
       - name: Get PR details
@@ -89,6 +90,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh pr comment ${{ github.event.issue.number }} \
+            --repo ${{ github.repository }} \
             --body "🤖 Starting to address automated review comments...
 
           [View workflow run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
