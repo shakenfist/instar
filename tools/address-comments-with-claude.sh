@@ -229,9 +229,35 @@ echo
 # Step 2: Get review JSON
 echo -e "${YELLOW}Step 2: Loading review JSON...${NC}"
 
-if [ -n "${review_json}" ] && [ -f "${review_json}" ]; then
-    echo "Using provided review JSON: ${review_json}"
-    cp "${review_json}" "${output_dir}/review.json"
+if [ -n "${review_json}" ]; then
+    # Validate the provided path for security
+    # Check it's a regular file (not a device, symlink to sensitive file, etc.)
+    if [ ! -f "${review_json}" ]; then
+        echo -e "${RED}Error: Review JSON file not found: ${review_json}${NC}"
+        exit 1
+    fi
+
+    # Resolve to absolute path and check for path traversal attempts
+    resolved_path=$(realpath "${review_json}" 2>/dev/null)
+    if [ -z "${resolved_path}" ]; then
+        echo -e "${RED}Error: Could not resolve path: ${review_json}${NC}"
+        exit 1
+    fi
+
+    # Ensure it's a regular file (after symlink resolution)
+    if [ ! -f "${resolved_path}" ]; then
+        echo -e "${RED}Error: Path does not resolve to a file: ${review_json}${NC}"
+        exit 1
+    fi
+
+    # Verify it looks like JSON (basic sanity check)
+    if ! head -1 "${resolved_path}" | grep -q '^[[:space:]]*{'; then
+        echo -e "${RED}Error: File does not appear to be JSON: ${review_json}${NC}"
+        exit 1
+    fi
+
+    echo "Using provided review JSON: ${resolved_path}"
+    cp "${resolved_path}" "${output_dir}/review.json"
 else
     # Extract review JSON from the most recent automated review comment on
     # the PR
@@ -489,24 +515,22 @@ PROMPT_EOF
         echo -e "${GREEN}Changes staged, creating commit...${NC}"
         echo "Summary: ${change_summary}"
 
-        # Create the commit
-        commit_msg=$(cat << COMMIT_EOF
-${change_summary}.
+        # Create the commit message in a temp file for safer handling
+        # Using printf with %s avoids shell expansion issues
+        commit_msg_file="${output_dir}/commit-msg-${i}.txt"
+        {
+            printf '%s.\n\n' "${change_summary}"
+            printf 'Addresses review item #%s: %s\n\n' "${item_id}" "${item_title}"
+            printf 'Category: %s\n' "${item_category}"
+            printf 'Severity: %s\n\n' "${item_severity}"
+            printf 'Prompt: @shakenfist-bot please address comments on PR #%s\n\n' \
+                "${pr_number}"
+            printf 'Signed-off-by: Michael Still <mikal@stillhq.com>\n'
+            printf 'Assisted-By: Claude Code\n'
+            printf 'Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\n'
+        } > "${commit_msg_file}"
 
-Addresses review item #${item_id}: ${item_title}
-
-Category: ${item_category}
-Severity: ${item_severity}
-
-Prompt: @shakenfist-bot please address comments on PR #${pr_number}
-
-Signed-off-by: Michael Still <mikal@stillhq.com>
-Assisted-By: Claude Code
-Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
-COMMIT_EOF
-)
-
-        git commit -m "${commit_msg}"
+        git commit -F "${commit_msg_file}"
         commit_sha=$(git rev-parse --short HEAD)
 
         echo -e "${GREEN}Created commit: ${commit_sha}${NC}"
