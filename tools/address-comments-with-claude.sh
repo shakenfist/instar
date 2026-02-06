@@ -285,6 +285,7 @@ else
 
     # Extract JSON from between ```json and ``` markers within the
     # <details> section
+    # shellcheck disable=SC2016  # Single quotes intentional - matching literal backticks
     echo "${review_body}" | sed -n '/<details>/,/<\/details>/p' | \
         sed -n '/^```json$/,/^```$/p' | \
         sed '1d;$d' > "${output_dir}/review.json"
@@ -473,7 +474,7 @@ PROMPT_EOF
         row="| ${item_id} | ${item_title} | ❌ Error | - |"
         row+=" Claude execution failed |"
         echo "${row}" >> "${summary_file}"
-        ((skipped_count++))
+        skipped_count=$((skipped_count + 1))
         continue
     fi
 
@@ -490,7 +491,7 @@ PROMPT_EOF
         row="| ${item_id} | ${item_title} | ⏭️ Skipped | - |"
         row+=" ${rationale_escaped} |"
         echo "${row}" >> "${summary_file}"
-        ((skipped_count++))
+        skipped_count=$((skipped_count + 1))
         continue
     fi
 
@@ -508,7 +509,7 @@ PROMPT_EOF
             row="| ${item_id} | ${item_title} | ⏭️ Skipped | - |"
             row+=" No changes needed |"
             echo "${row}" >> "${summary_file}"
-            ((skipped_count++))
+            skipped_count=$((skipped_count + 1))
             continue
         fi
 
@@ -537,13 +538,13 @@ PROMPT_EOF
         row="| ${item_id} | ${item_title} | ✅ Fixed |"
         row+=" \`${commit_sha}\` | ${change_summary} |"
         echo "${row}" >> "${summary_file}"
-        ((addressed_count++))
+        addressed_count=$((addressed_count + 1))
     else
         echo -e "${YELLOW}No clear outcome from Claude${NC}"
         row="| ${item_id} | ${item_title} | ⚠️ Unclear | - |"
         row+=" No summary marker found |"
         echo "${row}" >> "${summary_file}"
-        ((skipped_count++))
+        skipped_count=$((skipped_count + 1))
 
         # Reset any unstaged changes
         git checkout -- . 2>/dev/null || true

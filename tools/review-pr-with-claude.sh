@@ -379,10 +379,10 @@ fi
 
 # Run Claude Code to get JSON review
 echo "Running Claude to generate review JSON..."
-cat "${prompt_file}" | claude -p - \
+claude -p - \
     --dangerously-skip-permissions \
     --max-turns "${max_turns}" \
-    --output-format json > "${output_dir}/claude-output.json" || true
+    --output-format json < "${prompt_file}" > "${output_dir}/claude-output.json" || true
 
 # Extract metadata for CI output
 claude_output="${output_dir}/claude-output.json"
