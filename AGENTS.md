@@ -272,3 +272,66 @@ This skill walks through:
 2. Updating `tests/manifest.json`
 3. Adding test scenarios to the appropriate test file
 4. For malicious images: creating expected output files safely
+
+## GitHub Automation
+
+The project includes Claude Code-powered GitHub automation for common PR tasks.
+
+### Available Bot Commands
+
+Comment on a PR with these commands (requires write access to the repository):
+
+- `@shakenfist-bot please re-review` - Request a fresh automated code review
+- `@shakenfist-bot please attempt to fix` - Have Claude attempt to fix failing tests
+- `@shakenfist-bot please address comments` - Have Claude address automated review
+  feedback, creating one commit per valid issue
+
+### How Automated Review Works
+
+The automated reviewer outputs structured JSON that is:
+1. Validated against a JSON schema (`tools/review-schema.json`)
+2. GitHub issues are created for actionable items (action=fix or action=document)
+3. Rendered to human-readable markdown and posted as a PR comment
+4. The raw JSON is embedded in a collapsed `<details>` section at the end of
+   the comment, allowing the address-comments automation to extract it
+
+The review comment includes links to the created issues with "Closes #N" syntax,
+so issues are automatically closed when the PR merges.
+
+Each review item has an `action` field:
+- `fix` - Must be fixed before merging (creates an issue)
+- `document` - Documentation should be added (creates an issue)
+- `consider` - Optional improvement (reviewer suggestion)
+- `none` - Informational observation only
+
+### How Automated Comment Addressing Works
+
+When you trigger `@shakenfist-bot please address comments`:
+
+1. The bot extracts the `review.json` from the PR review comment (from the
+   embedded `<details>` section)
+2. It extracts items where `action` is `fix` or `document`
+3. For each actionable item, Claude Code:
+   - Analyzes whether the item should be addressed
+   - If valid: makes the fix, runs pre-commit, and stages changes
+   - If disagreeing: provides a rationale explaining why
+4. Each valid fix gets its own commit with attribution
+5. All commits are pushed and a summary is posted to the PR
+
+This allows reviewers to cherry-pick or drop individual fixes as needed.
+
+### Workflow Files
+
+- `.github/workflows/sanity-checks.yml` - Main CI with automated review
+- `.github/workflows/pr-re-review.yml` - Manual re-review trigger
+- `.github/workflows/pr-fix-tests.yml` - Test failure fixing
+- `.github/workflows/pr-address-comments.yml` - Review comment addressing
+- `.github/workflows/test-drift-fix.yml` - Scheduled/on-demand test maintenance
+
+### Scripts
+
+- `tools/review-pr-with-claude.sh` - Performs automated PR reviews (outputs JSON)
+- `tools/address-comments-with-claude.sh` - Addresses review comments (reads JSON)
+- `tools/create-review-issues.py` - Creates GitHub issues for actionable items
+- `tools/render-review.py` - Renders review JSON to markdown (includes issue links)
+- `tools/review-schema.json` - JSON schema for review output validation
