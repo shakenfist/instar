@@ -440,7 +440,22 @@ unsafe fn check_vhdx(
 ///
 /// Validates:
 /// - Disk type is valid (2=fixed, 3=dynamic, 4=differencing)
+///
+/// # Buffer requirements
+///
+/// The footer buffer must be at least 64 bytes (VHD_FOOTER_DISK_TYPE_OFFSET + 4).
+/// Callers pass sector-sized buffers (minimum 512 bytes per sector_size validation),
+/// so this is always satisfied in practice.
 fn check_vhd_footer(footer: &[u8], result: &mut CheckResult) {
+    // Minimum buffer size: disk_type field at offset 60 + 4 bytes = 64 bytes.
+    // This is always satisfied since callers use sector-sized buffers (min 512 bytes).
+    debug_assert!(
+        footer.len() >= VHD_FOOTER_DISK_TYPE_OFFSET + 4,
+        "VHD footer buffer too small: {} < {}",
+        footer.len(),
+        VHD_FOOTER_DISK_TYPE_OFFSET + 4
+    );
+
     if footer.len() < VHD_FOOTER_DISK_TYPE_OFFSET + 4 {
         result.corruptions += 1;
         result.total_errors += 1;
