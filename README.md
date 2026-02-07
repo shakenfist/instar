@@ -362,6 +362,22 @@ This project includes Claude Code skills for common development tasks:
 - `/imago-debug [issue]` - Troubleshooting guide for guest operations
 - `/imago-calltable [function]` - Call table API documentation
 - `/imago-add-test-image` - Add a new image to the integration test suite
+- `/verbose-print` - Guidelines for adding diagnostic verbose_print() calls
+- `/error-handling` - Ensure all error conditions return proper exit codes
+
+Additional development skills:
+- `.claude/skills/build-and-test.md` - Correct build/test patterns (always use
+  Makefile targets like `make imago`, `make test-ci`)
+- `.claude/skills/testing-discipline.md` - Test verification workflow (never
+  accept failures as "pre-existing" without verification)
+- `.claude/skills/pr-preparation.md` - PR readiness checklist (zero test
+  failures, no VM crashes, all checks passing)
+- `.claude/skills/documentation-updates.md` - Documentation requirements (every
+  user-visible change requires docs updates)
+- `.claude/skills/correct-fixes.md` - Fix root causes, not symptoms (security
+  project: always do things the right way, not the easy way)
+- `.claude/skills/error-handling.md` - Error propagation patterns (never use
+  exit(), always return errors with context)
 
 See `.claude/skills/` for details.
 

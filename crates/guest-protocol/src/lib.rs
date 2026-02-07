@@ -416,6 +416,52 @@ pub fn info_result_message_with_vdi(
     msg
 }
 
+/// Helper to create a check result message.
+///
+/// # Arguments
+///
+/// * `format` - Detected format name ("raw", "qcow2", "vmdk", etc.)
+/// * `total_errors` - Total number of errors found
+/// * `corruptions` - Number of corruptions
+/// * `leaks` - Number of leaks
+/// * `refcount_errors` - Number of refcount inconsistencies
+/// * `image_end_offset` - Highest byte offset in use
+/// * `clusters_checked` - Total clusters checked
+/// * `clusters_allocated` - Total allocated clusters
+/// * `fragmentation` - Fragmentation percentage (0-100)
+/// * `flags` - Status flags bitfield
+#[allow(clippy::too_many_arguments)]
+pub fn check_result_message(
+    format: &str,
+    total_errors: u32,
+    corruptions: u32,
+    leaks: u32,
+    refcount_errors: u32,
+    image_end_offset: u64,
+    clusters_checked: u64,
+    clusters_allocated: u64,
+    fragmentation: u32,
+    flags: u32,
+) -> guest_::GuestMessage {
+    let mut msg = guest_::GuestMessage::default();
+    msg.level = guest_::Level::Info;
+
+    let mut result = guest_::CheckResultMessage::default();
+    push_str(&mut result.format, format);
+    result.total_errors = total_errors;
+    result.corruptions = corruptions;
+    result.leaks = leaks;
+    result.refcount_errors = refcount_errors;
+    result.image_end_offset = image_end_offset;
+    result.clusters_checked = clusters_checked;
+    result.clusters_allocated = clusters_allocated;
+    result.fragmentation = fragmentation;
+    result.flags = flags;
+
+    msg.payload = Some(guest_::GuestMessage_::Payload::CheckResult(result));
+    msg
+}
+
 // =============================================================================
 // VMM -> Guest configuration message support
 // =============================================================================

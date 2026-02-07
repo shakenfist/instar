@@ -22,6 +22,7 @@ compatibility with standard output.
 Currently supported extra details:
 
 - **VDI format**: image-type, block-size, blocks-in-image, blocks-allocated, uuid
+- **LUKS format detection**: Detects LUKS encrypted volumes (qemu-img reports these as "raw")
 
 ```bash
 # Default: matches qemu-img output
@@ -35,6 +36,22 @@ imago info --extra-detail image.vdi
 #     blocks-in-image: 1024
 #     blocks-allocated: 0
 #     uuid: 12345678-1234-1234-1234-123456789abc
+```
+
+**LUKS Detection**
+
+LUKS (Linux Unified Key Setup) encrypted volumes are detected by their magic
+bytes but qemu-img does not recognize them, reporting them as "raw" format.
+With `--extra-detail`, imago correctly identifies LUKS volumes:
+
+```bash
+# Default: matches qemu-img (reports as unknown due to no partition table)
+imago info encrypted.luks
+# file format: unknown
+
+# With --extra-detail: detects LUKS format
+imago info --extra-detail encrypted.luks
+# file format: luks
 ```
 
 ### Quirk Control

@@ -20,6 +20,15 @@ from helpers.comparators import (
 from helpers.types import TestImage
 
 
+# Mapping from command names to output type directory prefixes
+# 'info' uses legacy names for backwards compatibility
+COMMAND_OUTPUT_DIRS = {
+    'info': 'qemu-img',      # qemu-img-human, qemu-img-json
+    'check': 'check',        # check-human, check-json
+    'compare': 'compare',    # compare-human, compare-json
+}
+
+
 class ImagoTestBase(testtools.TestCase):
     """Base class for imago integration tests."""
 
@@ -93,18 +102,24 @@ class ImagoTestBase(testtools.TestCase):
         except FileNotFoundError:
             pass
 
-    def get_output_profiles(self, output_type: str = 'human') -> dict:
+    def get_output_profiles(
+        self,
+        output_type: str = 'human',
+        command: str = 'info'
+    ) -> dict:
         """
-        Get all output profiles for a given output type.
+        Get all output profiles for a given command and output type.
 
         Args:
             output_type: 'human' or 'json'
+            command: 'info', 'check', 'compare', etc.
 
         Returns:
             dict with 'profiles' (profile_name -> representative_version)
             and 'version_to_profile' (version -> profile_name)
         """
-        output_type_dir = f'qemu-img-{output_type}'
+        dir_prefix = COMMAND_OUTPUT_DIRS.get(command, command)
+        output_type_dir = f'{dir_prefix}-{output_type}'
         version_map_path = (
             self._testdata_root / 'expected-outputs' /
             output_type_dir / 'version-map.json'
@@ -117,7 +132,8 @@ class ImagoTestBase(testtools.TestCase):
         self,
         image_id: str,
         profile: str,
-        output_type: str = 'human'
+        output_type: str = 'human',
+        command: str = 'info'
     ) -> str:
         """
         Load expected output for a specific profile from testdata.
@@ -130,11 +146,13 @@ class ImagoTestBase(testtools.TestCase):
             image_id: The test image identifier
             profile: Profile name (e.g., 'profile-6-0-0', 'profile-8-0-0')
             output_type: 'human' or 'json'
+            command: 'info', 'check', 'compare', etc.
 
         Returns:
             Expected output string with paths resolved for current environment
         """
-        output_type_dir = f'qemu-img-{output_type}'
+        dir_prefix = COMMAND_OUTPUT_DIRS.get(command, command)
+        output_type_dir = f'{dir_prefix}-{output_type}'
         output_path = (
             self._testdata_root / 'expected-outputs' /
             output_type_dir / 'profiles' / profile / f'{image_id}.stdout.txt'
@@ -306,6 +324,83 @@ class ImagoTestBase(testtools.TestCase):
         try:
             result = subprocess.run(
                 ['qemu-img', 'info', str(image_path)],
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            return result.stdout, result.stderr, result.returncode
+        except subprocess.TimeoutExpired:
+            return '', 'Timeout after {}s'.format(timeout), -1
+
+    def run_imago_check(
+        self,
+        image_path: Path,
+        timeout: int = 30,
+        qemu_version: Optional[str] = None,
+        output_format: Optional[str] = None,
+        unsafe_quirks: bool = False,
+    ) -> tuple:
+        """
+        Run imago check on an image.
+
+        Args:
+            image_path: Path to the image file
+            timeout: Timeout in seconds
+            qemu_version: Optional qemu-img version to emulate (e.g., '7.2')
+            output_format: Optional output format ('human' or 'json')
+            unsafe_quirks: Enable unsafe qemu-img compatible mode. When True,
+                non-QCOW2 formats are treated as 'raw' and validation is skipped.
+
+        Returns:
+            tuple: (stdout, stderr, return_code)
+        """
+        imago = self.get_imago_binary()
+
+        cmd = [str(imago), 'check']
+        if qemu_version:
+            cmd.extend(['--qemu-version', qemu_version])
+        if output_format:
+            cmd.extend(['--output', output_format])
+        if unsafe_quirks:
+            cmd.append('--unsafe-quirks')
+        cmd.append(str(image_path))
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            return result.stdout, result.stderr, result.returncode
+        except subprocess.TimeoutExpired:
+            return '', 'Timeout after {}s'.format(timeout), -1
+
+    def run_qemu_img_check(
+        self,
+        image_path: Path,
+        timeout: int = 30,
+        output_format: Optional[str] = None,
+    ) -> tuple:
+        """
+        Run qemu-img check on an image.
+
+        Args:
+            image_path: Path to the image file
+            timeout: Timeout in seconds
+            output_format: Optional output format ('json' for JSON output)
+
+        Returns:
+            tuple: (stdout, stderr, return_code)
+        """
+        cmd = ['qemu-img', 'check']
+        if output_format:
+            cmd.extend([f'--output={output_format}'])
+        cmd.append(str(image_path))
+
+        try:
+            result = subprocess.run(
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=timeout

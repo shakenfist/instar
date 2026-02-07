@@ -59,6 +59,18 @@ Target formats: qcow2, raw, vmdk
 2. Include a README explaining the approach being tested
 3. Document any dependencies or build requirements
 
+### Planning Documents
+
+Implementation plans are kept as local-only files using the naming convention
+`PLAN-*.md` (e.g., `PLAN-convert.md`). These files are excluded from version
+control via `.gitignore` to allow developers to maintain detailed planning
+notes without cluttering the repository.
+
+When starting a major feature:
+1. Create a `PLAN-<feature>.md` file in the repository root
+2. Document the implementation phases and approach
+3. The file stays local - it won't be committed
+
 ### Code Style
 
 - Follow the conventions of whatever language is being used
