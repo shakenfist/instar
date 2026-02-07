@@ -32,6 +32,11 @@ on:
     # Run weekly on Monday at 6am UTC
     - cron: '0 6 * * 1'
 
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
 jobs:
   test-and-fix:
     runs-on: [self-hosted, claude-code]
