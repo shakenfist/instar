@@ -126,6 +126,37 @@ message InfoResultMessage {
   VdiInfo vdi_info = 11;
 }
 
+// Image integrity check result (from check operation)
+message CheckResultMessage {
+  // Detected format: "unknown", "raw", "qcow2", "vmdk", etc.
+  string format = 1;
+  // Total number of errors found
+  uint32 total_errors = 2;
+  // Number of corruptions (data integrity issues)
+  uint32 corruptions = 3;
+  // Number of leaks (unreferenced allocated clusters)
+  uint32 leaks = 4;
+  // Number of refcount inconsistencies
+  uint32 refcount_errors = 5;
+  // Image end offset (highest byte offset in use)
+  uint64 image_end_offset = 6;
+  // Total clusters checked
+  uint64 clusters_checked = 7;
+  // Total allocated clusters
+  uint64 clusters_allocated = 8;
+  // Fragmentation percentage (0-100)
+  uint32 fragmentation = 9;
+  // Status flags:
+  //   bit 0: valid (no errors)
+  //   bit 1: has_leaks
+  //   bit 2: has_corruptions
+  //   bit 3: dirty
+  //   bit 4: corrupt_bit (in header)
+  //   bit 5: incomplete check
+  //   bit 6: not_supported (format doesn't support check)
+  uint32 flags = 10;
+}
+
 // Main message wrapper with level and payload
 message GuestMessage {
   Level level = 1;
@@ -136,5 +167,6 @@ message GuestMessage {
     ErrorMessage error = 5;
     CompleteMessage complete = 6;
     InfoResultMessage info_result = 7;
+    CheckResultMessage check_result = 8;
   }
 }

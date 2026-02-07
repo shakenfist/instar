@@ -54,25 +54,54 @@ use ioevent::IoEvent;
 use stats::VmmStats;
 use virtio::VirtioBlockDevice;
 
-// Memory layout constants
+// Memory layout constants (import shared ones from the shared crate)
 const GDT_BASE: u64 = 0x1000;
 const PAGE_TABLE_BASE: u64 = 0x2000;
 const GUEST_CODE_BASE: u64 = 0x10000;
-const OPERATION_CONFIG_ADDR: u64 = 0x19000;
+const OPERATION_LOAD_ADDR: u64 = shared::OPERATION_LOAD_ADDR as u64;
+const OPERATION_CONFIG_ADDR: u64 = shared::OPERATION_CONFIG_ADDR as u64;
 #[allow(dead_code)] // Infrastructure for Phase 1+ (check, compare, convert)
-const CHAIN_CONFIG_ADDR: u64 = 0x1A000;
-const OPERATION_LOAD_ADDR: u64 = 0x20000;
+const CHAIN_CONFIG_ADDR: u64 = shared::CHAIN_CONFIG_ADDR as u64;
 
 // CopyConfig constants (must match shared crate)
 const COPY_CONFIG_MAGIC: u32 = 0x434F5059; // "COPY"
 const COPY_CONFIG_FLAG_VERIFY: u32 = 1 << 0;
 const COPY_CONFIG_FLAG_SKIP_ZEROS: u32 = 1 << 1;
+#[allow(dead_code)]
+const COPY_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
 
 // InfoConfig constants (must match shared crate)
 const INFO_CONFIG_MAGIC: u32 = 0x494E464F; // "INFO"
 const INFO_CONFIG_FLAG_DETAILED: u32 = 1 << 0;
 const INFO_CONFIG_FLAG_SECURITY_CHECK: u32 = 1 << 1;
 const INFO_CONFIG_FLAG_UNSAFE_QUIRKS: u32 = 1 << 2;
+const INFO_CONFIG_FLAG_EXTRA_DETAIL: u32 = 1 << 3;
+const INFO_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
+
+// CheckConfig constants (must match shared crate)
+const CHECK_CONFIG_MAGIC: u32 = 0x43484543; // "CHEC"
+#[allow(dead_code)]
+const CHECK_CONFIG_FLAG_REPAIR: u32 = 1 << 0;
+#[allow(dead_code)]
+const CHECK_CONFIG_FLAG_QUIET: u32 = 1 << 1;
+#[allow(dead_code)]
+const CHECK_CONFIG_FLAG_UNSAFE_QUIRKS: u32 = 1 << 2;
+#[allow(dead_code)]
+const CHECK_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
+
+// CheckResult flag constants (must match shared crate)
+const CHECK_RESULT_FLAG_VALID: u32 = 1 << 0;
+#[allow(dead_code)]
+const CHECK_RESULT_FLAG_HAS_LEAKS: u32 = 1 << 1;
+#[allow(dead_code)]
+const CHECK_RESULT_FLAG_HAS_CORRUPTIONS: u32 = 1 << 2;
+#[allow(dead_code)]
+const CHECK_RESULT_FLAG_DIRTY: u32 = 1 << 3;
+#[allow(dead_code)]
+const CHECK_RESULT_FLAG_CORRUPT_BIT: u32 = 1 << 4;
+#[allow(dead_code)]
+const CHECK_RESULT_FLAG_INCOMPLETE: u32 = 1 << 5;
+const CHECK_RESULT_FLAG_NOT_SUPPORTED: u32 = 1 << 6;
 
 // ChainConfig constants (must match shared crate)
 // These are used by write_chain_config() which is infrastructure for Phase 1+
@@ -540,6 +569,12 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
                 details.push_str(&format!(" external_data_file={}", info.external_data_file));
             }
             details
+        }
+        Some(guest_::GuestMessage_::Payload::CheckResult(check)) => {
+            format!(
+                "check_result format={} errors={} corruptions={} leaks={} flags=0x{:x}",
+                check.format, check.total_errors, check.corruptions, check.leaks, check.flags
+            )
         }
         None => "empty payload".to_string(),
     };
@@ -1614,6 +1649,8 @@ enum Commands {
     Info(InfoArgs),
     /// Copy/convert disk images
     Copy(CopyArgs),
+    /// Check image structural integrity (partial L2 validation; see docs/quirks.md)
+    Check(CheckArgs),
     /// Display or validate configuration
     Config(ConfigArgs),
 }
@@ -1705,6 +1742,31 @@ struct CopyArgs {
 }
 
 #[derive(Args, Debug)]
+struct CheckArgs {
+    /// Input image file
+    input: String,
+
+    /// Sector size for reading input (default: 65536)
+    #[arg(long, default_value = "65536")]
+    sector_size: u32,
+
+    /// Output format: human (default) or json
+    #[arg(long, default_value = "human", value_parser = ["human", "json"])]
+    output: String,
+
+    /// Quiet mode: only show errors
+    #[arg(short, long)]
+    quiet: bool,
+
+    /// Enable unsafe qemu-img compatible mode.
+    /// WARNING: This treats all non-QCOW2 formats as "raw" and skips
+    /// format-specific validation, matching qemu-img check behavior.
+    /// Use only for compatibility testing, never in production.
+    #[arg(long)]
+    unsafe_quirks: bool,
+}
+
+#[derive(Args, Debug)]
 struct ConfigArgs {
     /// Show which file each config value came from
     #[arg(long)]
@@ -1729,8 +1791,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     match cli.command {
-        Commands::Info(args) => run_info(args),
-        Commands::Copy(args) => run_copy(args),
+        Commands::Info(args) => run_info(args, verbose),
+        Commands::Copy(args) => run_copy(args, verbose),
+        Commands::Check(args) => run_check(args, verbose),
         Commands::Config(args) => run_config(args),
     }
 }
@@ -1748,7 +1811,7 @@ fn run_config(args: ConfigArgs) -> Result<(), Box<dyn std::error::Error>> {
             for (path, error) in &errors {
                 eprintln!("  {}: {}", path.display(), error);
             }
-            std::process::exit(1);
+            Err("configuration validation failed".into())
         }
     } else {
         // Display effective configuration
@@ -1760,14 +1823,14 @@ fn run_config(args: ConfigArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Run the info operation (format detection)
-fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Validate sector size (must be power of 2, 512 to 64KB)
     if !(512..=MAX_SECTOR_SIZE).contains(&args.sector_size) || !args.sector_size.is_power_of_two() {
-        eprintln!(
-            "Error: sector size must be a power of 2, 512 to {} (got {})",
+        return Err(format!(
+            "sector size must be a power of 2, 512 to {} (got {})",
             MAX_SECTOR_SIZE, args.sector_size
-        );
-        std::process::exit(1);
+        )
+        .into());
     }
 
     // Handle --chain flag: discover and display backing file chain
@@ -1781,8 +1844,7 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             Err(e) => {
-                eprintln!("Error discovering backing chain: {}", e);
-                std::process::exit(1);
+                return Err(format!("error discovering backing chain: {}", e).into());
             }
         }
     }
@@ -1795,11 +1857,11 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
                 p
             }
             None => {
-                eprintln!(
-                    "Error: invalid qemu version '{}' (expected format: X.Y)",
+                return Err(format!(
+                    "invalid qemu version '{}' (expected format: X.Y)",
                     version_str
-                );
-                std::process::exit(1);
+                )
+                .into());
             }
         }
     } else {
@@ -1906,11 +1968,17 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
     guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
     debug!("Loaded operation binary at 0x{:x}", OPERATION_LOAD_ADDR);
 
-    // Write InfoConfig at OPERATION_CONFIG_ADDR (0x19000)
+    // Write InfoConfig at OPERATION_CONFIG_ADDR
     // Layout: magic (u32), flags (u32)
     let mut info_flags: u32 = INFO_CONFIG_FLAG_DETAILED | INFO_CONFIG_FLAG_SECURITY_CHECK;
     if args.unsafe_quirks {
         info_flags |= INFO_CONFIG_FLAG_UNSAFE_QUIRKS;
+    }
+    if args.extra_detail {
+        info_flags |= INFO_CONFIG_FLAG_EXTRA_DETAIL;
+    }
+    if verbose {
+        info_flags |= INFO_CONFIG_FLAG_VERBOSE;
     }
     guest_mem.write_obj(INFO_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
     guest_mem.write_obj(info_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
@@ -2014,6 +2082,9 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Run the vCPU loop
     debug!("Starting guest execution");
 
+    // Track VM errors - if set, we return an error instead of Ok(())
+    let mut vm_error: Option<String> = None;
+
     loop {
         match vcpu.run()? {
             VcpuExit::Hlt => {
@@ -2116,16 +2187,22 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
                         STACK_BASE, STACK_TOP, STACK_SIZE
                     );
                 }
+                vm_error = Some("VM shutdown (triple fault)".to_string());
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
                 vmm_stats.lock().unwrap().record_fail_entry();
                 eprintln!("VM Entry Failed! reason=0x{:x}, cpu={}", reason, cpu);
+                vm_error = Some(format!(
+                    "VM entry failed: reason=0x{:x}, cpu={}",
+                    reason, cpu
+                ));
                 break;
             }
             exit => {
                 vmm_stats.lock().unwrap().record_unknown();
                 eprintln!("Unexpected VM exit: {:?}", exit);
+                vm_error = Some(format!("unexpected VM exit: {:?}", exit));
                 break;
             }
         }
@@ -2139,22 +2216,27 @@ fn run_info(args: InfoArgs) -> Result<(), Box<dyn std::error::Error>> {
         vmm_stats.lock().unwrap().display();
     }
 
+    // Return error if VM crashed or failed
+    if let Some(error) = vm_error {
+        return Err(error.into());
+    }
+
     Ok(())
 }
 
 /// Run the copy operation
-fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Validate sector sizes (must be powers of 2, 512 to 64KB)
     for (name, size) in [
         ("input", args.input_sector_size),
         ("output", args.output_sector_size),
     ] {
         if !(512..=MAX_SECTOR_SIZE).contains(&size) || !size.is_power_of_two() {
-            eprintln!(
-                "Error: {} sector size must be a power of 2, 512 to {} (got {})",
+            return Err(format!(
+                "{} sector size must be a power of 2, 512 to {} (got {})",
                 name, MAX_SECTOR_SIZE, size
-            );
-            std::process::exit(1);
+            )
+            .into());
         }
     }
 
@@ -2265,6 +2347,9 @@ fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     if args.skip_zeros {
         copy_flags |= COPY_CONFIG_FLAG_SKIP_ZEROS;
+    }
+    if verbose {
+        copy_flags |= COPY_CONFIG_FLAG_VERBOSE;
     }
 
     guest_mem.write_obj(COPY_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
@@ -2389,6 +2474,9 @@ fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Run the vCPU loop
     debug!("Starting guest execution");
 
+    // Track VM errors - if set, we return an error instead of Ok(())
+    let mut vm_error: Option<String> = None;
+
     loop {
         match vcpu.run()? {
             VcpuExit::Hlt => {
@@ -2494,16 +2582,22 @@ fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
                     GUEST_MEM_SIZE, GUEST_MEM_SIZE
                 );
                 eprintln!("Code base: 0x{:x}", GUEST_CODE_BASE);
+                vm_error = Some("VM shutdown (triple fault)".to_string());
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
                 vmm_stats.lock().unwrap().record_fail_entry();
                 eprintln!("VM Entry Failed! reason=0x{:x}, cpu={}", reason, cpu);
+                vm_error = Some(format!(
+                    "VM entry failed: reason=0x{:x}, cpu={}",
+                    reason, cpu
+                ));
                 break;
             }
             exit => {
                 vmm_stats.lock().unwrap().record_unknown();
                 eprintln!("Unexpected VM exit: {:?}", exit);
+                vm_error = Some(format!("unexpected VM exit: {:?}", exit));
                 break;
             }
         }
@@ -2517,7 +2611,455 @@ fn run_copy(args: CopyArgs) -> Result<(), Box<dyn std::error::Error>> {
         vmm_stats.lock().unwrap().display();
     }
 
+    // Return error if VM crashed or failed
+    if let Some(error) = vm_error {
+        return Err(error.into());
+    }
+
     Ok(())
+}
+
+/// Run the check operation (image integrity validation)
+fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate sector size (must be power of 2, 512 to 64KB)
+    if !(512..=MAX_SECTOR_SIZE).contains(&args.sector_size) || !args.sector_size.is_power_of_two() {
+        return Err(format!(
+            "sector size must be a power of 2, 512 to {} (got {})",
+            MAX_SECTOR_SIZE, args.sector_size
+        )
+        .into());
+    }
+
+    // Auto-discover binaries in same directory as executable
+    let core_path = get_binary_path("core.bin");
+    let operation_path = get_binary_path("check.bin");
+
+    // Load core binary (device init, call table setup)
+    let core_code = load_guest_binary(core_path.to_str().unwrap())?;
+    debug!(
+        "Loaded core binary: {} bytes from {}",
+        core_code.len(),
+        core_path.display()
+    );
+
+    // Load operation binary (check)
+    let operation_code = load_guest_binary(operation_path.to_str().unwrap())?;
+    debug!(
+        "Loaded operation binary: {} bytes from {}",
+        operation_code.len(),
+        operation_path.display()
+    );
+
+    // Get input file metadata
+    let input_metadata = std::fs::metadata(&args.input)?;
+    let input_size = input_metadata.len();
+    debug!(
+        "Input file: {} ({} bytes, {} sectors @ {} bytes/sector)",
+        args.input,
+        input_size,
+        input_size / args.sector_size as u64,
+        args.sector_size
+    );
+
+    // Open backing store (input only, read-only)
+    let input_backing = BackingStore::open(Path::new(&args.input), true, None, false)?;
+
+    // Open KVM
+    let kvm = Kvm::new()?;
+    debug!("KVM API version: {}", kvm.get_api_version());
+
+    // Check KVM binary statistics capability
+    let kvm_stats_checker = kvm_stats::KvmStatsChecker::new(&kvm);
+    kvm_stats_checker.display_status();
+
+    // Create VM
+    let vm = kvm.create_vm()?;
+    debug!("Created VM");
+
+    // Create guest memory
+    let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
+    debug!("Allocated {} bytes of guest memory", GUEST_MEM_SIZE);
+
+    // Get the memory region for KVM registration
+    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let host_addr = region.as_ptr() as u64;
+
+    // Set up KVM memory region
+    let mem_region = kvm_userspace_memory_region {
+        slot: 0,
+        guest_phys_addr: 0,
+        memory_size: GUEST_MEM_SIZE,
+        userspace_addr: host_addr,
+        flags: 0,
+    };
+    unsafe {
+        vm.set_user_memory_region(mem_region)?;
+    }
+    debug!("Configured memory region");
+
+    // Set up GDT
+    setup_gdt(&guest_mem)?;
+    debug!("Set up GDT at 0x{:x}", GDT_BASE);
+
+    // Set up page tables (identity map)
+    setup_page_tables(&guest_mem)?;
+    debug!("Set up page tables at 0x{:x}", PAGE_TABLE_BASE);
+
+    // Load core binary at GUEST_CODE_BASE (0x10000)
+    guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
+    debug!("Loaded core binary at 0x{:x}", GUEST_CODE_BASE);
+
+    // Load operation binary at OPERATION_LOAD_ADDR (0x20000)
+    guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
+    debug!("Loaded operation binary at 0x{:x}", OPERATION_LOAD_ADDR);
+
+    // Write CheckConfig at OPERATION_CONFIG_ADDR
+    // Layout: magic (u32), flags (u32)
+    let mut check_flags: u32 = 0;
+    if args.quiet {
+        check_flags |= CHECK_CONFIG_FLAG_QUIET;
+    }
+    if verbose {
+        check_flags |= CHECK_CONFIG_FLAG_VERBOSE;
+    }
+    if args.unsafe_quirks {
+        check_flags |= CHECK_CONFIG_FLAG_UNSAFE_QUIRKS;
+    }
+    guest_mem.write_obj(CHECK_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
+    guest_mem.write_obj(check_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
+    debug!(
+        "Wrote check config at 0x{:x} (flags=0x{:x})",
+        OPERATION_CONFIG_ADDR, check_flags
+    );
+
+    // Create device set for managing virtio-block devices
+    let mut device_set = DeviceSet::new();
+
+    // Create virtio-block device (input only for check operation)
+    let input_mmio = device_mmio_base(0);
+    let input_vq = device_vq_base(0);
+    let input_device = VirtioBlockDevice::new(
+        input_backing,
+        input_size,
+        args.sector_size as u64,
+        true, // read-only
+        input_mmio,
+        input_vq,
+    );
+    debug!(
+        "Created virtio-block device at MMIO 0x{:x}, VQ 0x{:x}",
+        input_mmio, input_vq
+    );
+    debug!("  Sector size: {} bytes", input_device.sector_size());
+
+    // Wrap device in Arc<Mutex<>> and add to device set
+    let input_device = Arc::new(Mutex::new(input_device));
+    device_set.add_device(Arc::clone(&input_device), true);
+
+    // Wrap guest memory in Arc for sharing
+    let guest_mem = Arc::new(guest_mem);
+
+    // Create shared statistics tracker
+    let vmm_stats = Arc::new(Mutex::new(VmmStats::new()));
+
+    // Set up ioeventfd for queue notifications
+    let mut io_thread: Option<io_thread::IoThread> = None;
+    let mut input_evt = IoEvent::new(input_mmio)?;
+
+    match input_evt.register(&vm) {
+        Ok(()) => {
+            debug!("ioeventfd: enabled for queue notifications (with I/O thread)");
+
+            // Create IoDevice entries via DeviceSet
+            let io_devices = device_set.create_io_devices(vec![input_evt]);
+
+            // Start the I/O thread
+            io_thread = Some(io_thread::IoThread::new(
+                io_devices,
+                Arc::clone(&guest_mem),
+                Arc::clone(&vmm_stats),
+            ));
+        }
+        Err(e) => {
+            debug!(
+                "ioeventfd: failed to register ({:?}), falling back to VM exits",
+                e
+            );
+        }
+    }
+
+    // Create vCPU
+    let mut vcpu = vm.create_vcpu(0)?;
+    debug!("Created vCPU");
+
+    // Set up registers
+    let mut sregs = vcpu.get_sregs()?;
+    setup_sregs(&mut sregs);
+    vcpu.set_sregs(&sregs)?;
+    debug!("Configured special registers for long mode");
+
+    let mut regs = vcpu.get_regs()?;
+    setup_regs(&mut regs);
+    vcpu.set_regs(&regs)?;
+    debug!(
+        "Configured general registers (RIP=0x{:x}, RSP=0x{:x})",
+        regs.rip, regs.rsp
+    );
+
+    // Create serial decoder for protobuf messages from guest
+    let mut serial_decoder = SerialDecoder::new();
+
+    // Create serial transmitter for sending config to guest
+    let mut serial_transmitter = SerialTransmitter::new();
+
+    // Create debug buffer for COM2 output
+    let mut debug_buffer = DebugBuffer::new();
+
+    // Queue the configuration message for transmission (check uses only input device)
+    let config = vmm_config_input_only(args.sector_size);
+    serial_transmitter.queue_config(&config);
+    debug!(
+        "Queued configuration message ({} bytes) for guest",
+        serial_transmitter.buffer.len()
+    );
+
+    // Track check result for exit code (default to false - require explicit pass)
+    let mut check_passed = false;
+
+    // Track VM errors - if set, we return an error instead of Ok(())
+    let mut vm_error: Option<String> = None;
+
+    // Run the vCPU loop
+    debug!("Starting guest execution");
+
+    loop {
+        match vcpu.run()? {
+            VcpuExit::Hlt => {
+                vmm_stats.lock().unwrap().record_hlt();
+                info!("Guest executed HLT");
+                debug!("Check operation completed!");
+                break;
+            }
+            VcpuExit::IoOut(port, data) => {
+                vmm_stats.lock().unwrap().record_io_out();
+                if port == SERIAL_PORT {
+                    for &byte in data {
+                        if let Some(msg) = serial_decoder.add_byte(byte) {
+                            // CheckResult is always shown (unless quiet), other messages only in verbose mode
+                            let is_check_result = matches!(
+                                &msg.payload,
+                                Some(guest_::GuestMessage_::Payload::CheckResult(_))
+                            );
+                            if is_check_result {
+                                if let Some(guest_::GuestMessage_::Payload::CheckResult(result)) =
+                                    &msg.payload
+                                {
+                                    // Track if check passed
+                                    check_passed = (result.flags & CHECK_RESULT_FLAG_VALID) != 0
+                                        && result.total_errors == 0;
+                                }
+                                if !args.quiet || !check_passed {
+                                    print_check_result(
+                                        &msg,
+                                        &args.input,
+                                        &args.output,
+                                        args.unsafe_quirks,
+                                    );
+                                }
+                            } else {
+                                debug!("{}", format_message(&msg));
+                            }
+                        }
+                    }
+                } else if port == DEBUG_PORT {
+                    for &byte in data {
+                        if let Some(line) = debug_buffer.add_byte(byte) {
+                            debug!("[GUEST] {}", line);
+                        }
+                    }
+                } else {
+                    debug!("IO OUT: port=0x{:x}, data={:?}", port, data);
+                }
+            }
+            VcpuExit::IoIn(port, data) => {
+                vmm_stats.lock().unwrap().record_io_in();
+                if port == SERIAL_PORT {
+                    for byte in data.iter_mut() {
+                        *byte = serial_transmitter.next_byte().unwrap_or(0);
+                    }
+                } else if port == SERIAL_PORT + 5 {
+                    let mut lsr = 0x60u8;
+                    if serial_transmitter.has_data() {
+                        lsr |= 0x01;
+                    }
+                    data[0] = lsr;
+                } else {
+                    for byte in data {
+                        *byte = 0;
+                    }
+                }
+            }
+            VcpuExit::MmioRead(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_read();
+                let value = device_set.mmio_read(addr);
+                write_mmio_data(data, value);
+            }
+            VcpuExit::MmioWrite(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_write();
+                let value = read_mmio_data(data);
+                if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
+                    if io_thread.is_none() && should_process {
+                        device_set.process_queue_for_device(
+                            device_index,
+                            &guest_mem,
+                            &vmm_stats,
+                        )?;
+                    }
+                }
+            }
+            VcpuExit::Shutdown => {
+                vmm_stats.lock().unwrap().record_shutdown();
+                eprintln!("\n--- VM Shutdown (triple fault?) ---");
+                vm_error = Some("VM shutdown (triple fault)".to_string());
+                break;
+            }
+            VcpuExit::FailEntry(reason, cpu) => {
+                vmm_stats.lock().unwrap().record_fail_entry();
+                eprintln!("VM Entry Failed! reason=0x{:x}, cpu={}", reason, cpu);
+                vm_error = Some(format!(
+                    "VM entry failed: reason=0x{:x}, cpu={}",
+                    reason, cpu
+                ));
+                break;
+            }
+            exit => {
+                vmm_stats.lock().unwrap().record_unknown();
+                eprintln!("Unexpected VM exit: {:?}", exit);
+                vm_error = Some(format!("unexpected VM exit: {:?}", exit));
+                break;
+            }
+        }
+    }
+
+    if let Some(mut thread) = io_thread {
+        thread.stop();
+    }
+
+    if log::log_enabled!(log::Level::Debug) {
+        vmm_stats.lock().unwrap().display();
+    }
+
+    // Return error if VM crashed or failed
+    if let Some(error) = vm_error {
+        return Err(error.into());
+    }
+
+    // Return error if check failed (image has errors or is invalid)
+    if !check_passed {
+        return Err("image check failed: errors detected".into());
+    }
+
+    Ok(())
+}
+
+/// Print check result in human-readable or JSON format
+fn print_check_result(
+    msg: &guest_::GuestMessage,
+    filename: &str,
+    output_format: &str,
+    unsafe_quirks: bool,
+) {
+    if let Some(guest_::GuestMessage_::Payload::CheckResult(result)) = &msg.payload {
+        // Get absolute path for filename
+        let abs_path = std::fs::canonicalize(filename)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| filename.to_string());
+
+        if output_format == "json" {
+            print_check_result_json(result, &abs_path, unsafe_quirks);
+            return;
+        }
+
+        // Human-readable output (similar to qemu-img check)
+        let has_errors = result.total_errors > 0;
+        let is_valid = (result.flags & CHECK_RESULT_FLAG_VALID) != 0;
+        let not_supported = (result.flags & CHECK_RESULT_FLAG_NOT_SUPPORTED) != 0;
+
+        if not_supported {
+            println!(
+                "This image format ({}) does not support checks",
+                result.format
+            );
+            return;
+        }
+
+        if has_errors {
+            if result.corruptions > 0 {
+                println!("{} errors were found on the image.", result.total_errors);
+                println!("Data may be corrupted, or the image has been written incompletely.");
+            }
+            if result.leaks > 0 {
+                println!("{} leaked clusters were found on the image.", result.leaks);
+                println!("This means waste of disk space, but no harm to data.");
+            }
+        } else if is_valid {
+            println!("No errors were found on the image.");
+        }
+
+        // Show statistics
+        if result.clusters_checked > 0 || result.clusters_allocated > 0 {
+            println!(
+                "{}/{} = {:.2}% allocated, {:.2}% fragmented",
+                result.clusters_allocated,
+                result.clusters_checked,
+                if result.clusters_checked > 0 {
+                    (result.clusters_allocated as f64 / result.clusters_checked as f64) * 100.0
+                } else {
+                    0.0
+                },
+                result.fragmentation as f64
+            );
+        }
+
+        // Show image end offset
+        if result.image_end_offset > 0 {
+            println!("Image end offset: {}", result.image_end_offset);
+        }
+    }
+}
+
+/// Print check result in JSON format
+///
+/// When `unsafe_quirks` is true, fields with zero values (corruptions,
+/// leaks, refcount-errors) are omitted to match qemu-img check's
+/// conditional schema. When false, all fields are always emitted for a
+/// consistent, predictable JSON schema.
+fn print_check_result_json(
+    result: &guest_protocol::guest_::CheckResultMessage,
+    filename: &str,
+    unsafe_quirks: bool,
+) {
+    println!("{{");
+    println!("    \"filename\": \"{}\",", escape_json_string(filename));
+    println!(
+        "    \"format\": \"{}\",",
+        escape_json_string(&result.format)
+    );
+    println!("    \"check-errors\": {},", result.total_errors);
+    if !unsafe_quirks || result.corruptions > 0 {
+        println!("    \"corruptions\": {},", result.corruptions);
+    }
+    if !unsafe_quirks || result.leaks > 0 {
+        println!("    \"leaks\": {},", result.leaks);
+    }
+    if !unsafe_quirks || result.refcount_errors > 0 {
+        println!("    \"refcount-errors\": {},", result.refcount_errors);
+    }
+    println!("    \"image-end-offset\": {},", result.image_end_offset);
+    println!("    \"total-clusters\": {},", result.clusters_checked);
+    println!("    \"allocated-clusters\": {},", result.clusters_allocated);
+    println!("    \"fragmented-clusters\": {}", result.fragmentation);
+    println!("}}");
 }
 
 fn load_guest_binary(path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {

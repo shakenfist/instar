@@ -6,6 +6,7 @@
 #   - core.bin at 0x10000 (device initialization, call table)
 #   - info.bin at 0x20000 (format detection operation)
 #   - copy.bin at 0x20000 (copy operation, same address as info)
+#   - check.bin at 0x20000 (integrity check operation, same address as info)
 
 set -e
 
@@ -69,6 +70,25 @@ else
 fi
 
 echo ""
+echo "=== Building check operation ==="
+cd operations/check
+cargo +nightly build --release
+cd ../..
+
+# Convert check ELF to flat binary
+echo "=== Converting check ELF to flat binary ==="
+CHECK_ELF="target/x86_64-unknown-none/release/check"
+CHECK_BIN="check.bin"
+
+if [ -f "$CHECK_ELF" ]; then
+    rust-objcopy -O binary "$CHECK_ELF" "$CHECK_BIN"
+    echo "Created $CHECK_BIN ($(wc -c < "$CHECK_BIN") bytes)"
+else
+    echo "Error: Check ELF not found at $CHECK_ELF"
+    exit 1
+fi
+
+echo ""
 echo "=== Building imago ==="
 cd vmm
 cargo build --release
@@ -80,7 +100,49 @@ echo "=== Copying binaries to target/release/ ==="
 cp "$CORE_BIN" target/release/
 cp "$INFO_BIN" target/release/
 cp "$COPY_BIN" target/release/
-echo "Copied core.bin, info.bin, and copy.bin to target/release/"
+cp "$CHECK_BIN" target/release/
+echo "Copied core.bin, info.bin, copy.bin, and check.bin to target/release/"
+
+# Check binary sizes against memory layout limits
+# Memory layout (from shared/src/lib.rs):
+#   - Core loads at 0x10000, must fit before operations at 0x20000 (max 64KB)
+#   - Operations load at 0x20000, must fit before configs at 0x80000 (max 384KB)
+echo ""
+echo "=== Checking binary sizes against memory layout ==="
+CORE_MAX=$((0x10000))      # 64KB
+OP_MAX=$((0x60000))        # 384KB
+FAILED=0
+
+check_size() {
+    local name="$1"
+    local file="$2"
+    local max="$3"
+    local size
+    size=$(wc -c < "$file")
+    local percent=$((size * 100 / max))
+    local max_kb=$((max / 1024))
+    local size_kb=$((size / 1024))
+
+    if [ "$size" -gt "$max" ]; then
+        echo "FAIL: $name is ${size_kb}KB, max ${max_kb}KB (${percent}%)"
+        return 1
+    else
+        echo "OK:   $name - ${size_kb}KB / ${max_kb}KB (${percent}%)"
+        return 0
+    fi
+}
+
+check_size "core.bin" "target/release/$CORE_BIN" "$CORE_MAX" || FAILED=1
+check_size "info.bin" "target/release/$INFO_BIN" "$OP_MAX" || FAILED=1
+check_size "copy.bin" "target/release/$COPY_BIN" "$OP_MAX" || FAILED=1
+check_size "check.bin" "target/release/$CHECK_BIN" "$OP_MAX" || FAILED=1
+
+if [ "$FAILED" -eq 1 ]; then
+    echo ""
+    echo "ERROR: Binary size check failed - memory overlap will occur!"
+    echo "Fix: reduce binary size or adjust memory layout in shared/src/lib.rs"
+    exit 1
+fi
 
 echo ""
 echo "=== Build complete ==="
@@ -90,14 +152,17 @@ echo "  - imago          Safe, sandboxed disk image operations"
 echo "  - core.bin       Core guest (device init, call table) - loaded at 0x10000"
 echo "  - info.bin       Info operation (format detection) - loaded at 0x20000"
 echo "  - copy.bin       Copy operation (file copy) - loaded at 0x20000"
+echo "  - check.bin      Check operation (integrity validation) - loaded at 0x20000"
 echo ""
 echo "To run:"
 echo "  sudo ./target/release/imago info image.qcow2"
 echo "  sudo ./target/release/imago copy input.qcow2 output.raw"
+echo "  sudo ./target/release/imago check image.qcow2"
 echo ""
 echo "For help:"
 echo "  ./target/release/imago --help"
 echo "  ./target/release/imago info --help"
 echo "  ./target/release/imago copy --help"
+echo "  ./target/release/imago check --help"
 echo ""
 echo "Note: Running requires /dev/kvm access (root or kvm group)"

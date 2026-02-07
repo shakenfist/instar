@@ -243,6 +243,12 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
                 info.format, info.version, info.virtual_size, info.actual_size, info.cluster_size, info.flags
             )
         }
+        Some(guest_::GuestMessage_::Payload::CheckResult(check)) => {
+            format!(
+                "check_result format={} errors={} corruptions={} leaks={} flags=0x{:x}",
+                check.format, check.total_errors, check.corruptions, check.leaks, check.flags
+            )
+        }
         None => "empty payload".to_string(),
     };
 

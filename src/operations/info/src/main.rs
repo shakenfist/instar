@@ -10,17 +10,15 @@
 use core::panic::PanicInfo;
 
 use shared::{
+    format_detection::{
+        detect_format_from_header, detect_iso_at_offset, detect_vhd_footer, ISO_MAGIC_BYTE_OFFSET,
+        VDI_SIGNATURE_OFFSET, VHD_COOKIE,
+    },
     CallTable, ImageFormat, InfoConfig, InfoResult, Qcow2Info, VdiInfo, VmdkInfo, CALL_TABLE_ADDR,
     MAX_SECTOR_SIZE,
 };
 
-// Magic numbers for format detection (big-endian where noted)
-const QCOW2_MAGIC: u32 = 0x514649fb; // "QFI\xfb" (big-endian at offset 0)
-const QCOW1_MAGIC: u32 = 0x514649; // "QFI" (big-endian at offset 0, 3 bytes)
-const VMDK4_MAGIC: u32 = 0x564d444b; // "VMDK" (little-endian at offset 0)
-const VMDK3_MAGIC: u32 = 0x434f5744; // "COWD" (little-endian at offset 0)
-const VHD_COOKIE: u64 = 0x636f6e6563746978; // "conectix" (big-endian at footer offset 0)
-const VDI_MAGIC: u32 = 0xbeda107f; // VDI signature (little-endian at offset 64)
+// Note: Magic numbers for format detection are in shared::format_detection
 
 // VHD footer offsets (big-endian)
 const VHD_FOOTER_CREATOR_APP_OFFSET: usize = 28; // Creator application (4 bytes ASCII)
@@ -110,7 +108,7 @@ const VHDX_METADATA_ITEM_OFFSET: u64 = 0x10000; // File Parameters start here
                                                 // - Offset 8: Virtual Disk Size (8 bytes LE)
 
 // VDI header offsets (all little-endian)
-const VDI_SIGNATURE_OFFSET: usize = 64; // Magic signature
+// Note: VDI_SIGNATURE_OFFSET is in shared::format_detection
 const VDI_VERSION_OFFSET: usize = 68; // Version (1.1 = 0x00010001)
 const VDI_HEADER_SIZE_OFFSET: usize = 72; // Size of header
 const VDI_IMAGE_TYPE_OFFSET: usize = 76; // 1=dynamic, 2=fixed
@@ -121,7 +119,7 @@ const VDI_BLOCKS_ALLOCATED_OFFSET: usize = 388; // Allocated blocks (u32)
 const VDI_UUID_OFFSET: usize = 392; // UUID (16 bytes)
 
 // QED format constants (deprecated QEMU format, all little-endian)
-const QED_MAGIC: u32 = 0x00444551; // "QED\0" at offset 0
+// Note: QED_MAGIC is in shared::format_detection
 const QED_CLUSTER_SIZE_OFFSET: usize = 4; // Cluster size in bytes (u32)
 const QED_TABLE_SIZE_OFFSET: usize = 8; // L1/L2 table size in clusters (u32)
 const QED_HEADER_SIZE_OFFSET: usize = 12; // Header size in bytes (u32)
@@ -129,17 +127,11 @@ const QED_IMAGE_SIZE_OFFSET: usize = 48; // Virtual size in bytes (u64)
 const QED_BACKING_FILENAME_OFFSET_OFFSET: usize = 56; // Backing filename offset (u32)
 const QED_BACKING_FILENAME_SIZE_OFFSET: usize = 60; // Backing filename size (u32)
 
-// ISO 9660 format constants
-// ISO 9660 Primary Volume Descriptor starts at byte offset 32768 (sector 16 for 2048-byte CD sectors)
-// Byte 0: Volume Descriptor Type (1 = Primary)
-// Bytes 1-5: "CD001" standard identifier
-const ISO_MAGIC_BYTE_OFFSET: usize = 32769; // Absolute byte offset of "CD001" (32768 + 1)
-const ISO_MAGIC: &[u8; 5] = b"CD001"; // ISO 9660 standard identifier
+// Note: ISO_MAGIC_BYTE_OFFSET and ISO_MAGIC are in shared::format_detection
 
 // LUKS format constants (Linux encrypted container)
 // LUKS magic is "LUKS\xba\xbe" (6 bytes) at offset 0
-// Version is big-endian u16 at offset 6 (1 for LUKS1, 2 for LUKS2)
-const LUKS_MAGIC: [u8; 6] = [0x4c, 0x55, 0x4b, 0x53, 0xba, 0xbe]; // "LUKS\xba\xbe"
+// Note: LUKS_MAGIC is in shared::format_detection
 const LUKS_VERSION_OFFSET: usize = 6; // Version (big-endian u16)
 
 /// Entry point called by core after devices are initialized.
@@ -149,7 +141,7 @@ const LUKS_VERSION_OFFSET: usize = 6; // Version (big-endian u16)
 pub unsafe extern "C" fn _start() -> u64 {
     let call_table = get_call_table();
 
-    // Verify call table is valid
+    // Verify call table is valid (always print these errors)
     if call_table.magic != CallTable::MAGIC {
         (call_table.debug_print)(b"info: bad magic\n\0".as_ptr());
         return 0;
@@ -159,8 +151,6 @@ pub unsafe extern "C" fn _start() -> u64 {
         return 0;
     }
 
-    (call_table.debug_print)(b"info: start\n\0".as_ptr());
-
     // Get operation config (optional)
     let config_result = (call_table.get_operation_config)();
     let config = &*(config_result.ptr as *const InfoConfig);
@@ -169,6 +159,12 @@ pub unsafe extern "C" fn _start() -> u64 {
     } else {
         true // Default to detailed
     };
+    // Extra detail mode enables detection of formats like LUKS that qemu-img
+    // doesn't recognize. Without it, these formats are reported as "raw" for
+    // qemu-img compatibility.
+    let extra_detail = config.is_valid() && config.extra_detail_enabled();
+
+    (call_table.verbose_print)(b"info: start\n\0".as_ptr());
 
     // Get device parameters (device 0 = primary input)
     let input_capacity = (call_table.get_input_capacity)(0);
@@ -177,7 +173,7 @@ pub unsafe extern "C" fn _start() -> u64 {
     // Calculate actual file size
     let actual_size = input_capacity * input_sector_size as u64;
 
-    (call_table.debug_print)(b"info: reading header\n\0".as_ptr());
+    (call_table.verbose_print)(b"info: reading header\n\0".as_ptr());
 
     // Buffer for reading data
     let mut buffer = [0u8; MAX_SECTOR_SIZE];
@@ -195,14 +191,16 @@ pub unsafe extern "C" fn _start() -> u64 {
     result.actual_size = actual_size;
 
     // Detect format based on magic numbers (first sector)
-    let mut format = detect_format_header(&buffer, input_sector_size);
+    // Pass extra_detail flag to control detection of formats like LUKS that qemu-img
+    // doesn't recognize - these are only shown with --extra-detail
+    let mut format = detect_format_from_header(&buffer, input_sector_size, extra_detail);
 
     // Buffer for VHD footer (may be reused)
     let mut footer_buffer = [0u8; MAX_SECTOR_SIZE];
 
     // If no format detected from header, try VHD detection (footer at end of file)
     if format == ImageFormat::Raw && input_capacity > 0 {
-        (call_table.debug_print)(b"info: checking VHD footer\n\0".as_ptr());
+        (call_table.verbose_print)(b"info: checking VHD footer\n\0".as_ptr());
         let last_sector = input_capacity - 1;
         if (call_table.read_input_sector)(
             0,
@@ -221,7 +219,7 @@ pub unsafe extern "C" fn _start() -> u64 {
     // Note: qemu-img treats ISO as "raw", so we only detect ISO in safe mode.
     // With --unsafe-quirks, ISO files will be reported as "raw" for qemu-img compatibility.
     if format == ImageFormat::Raw && !unsafe_quirks {
-        (call_table.debug_print)(b"info: checking ISO 9660\n\0".as_ptr());
+        (call_table.verbose_print)(b"info: checking ISO 9660\n\0".as_ptr());
         // ISO magic is at byte offset 32769 ("CD001" at 32768+1)
         // Check if the magic is already in our first sector buffer
         if input_sector_size >= ISO_MAGIC_BYTE_OFFSET + 5 {
@@ -254,18 +252,18 @@ pub unsafe extern "C" fn _start() -> u64 {
 
             match partition_type {
                 PartitionTableType::Mbr => {
-                    (call_table.debug_print)(b"info: found MBR partition table\n\0".as_ptr());
+                    (call_table.verbose_print)(b"info: found MBR partition table\n\0".as_ptr());
                     result.flags |= InfoResult::FLAG_HAS_MBR;
                 }
                 PartitionTableType::Gpt => {
-                    (call_table.debug_print)(b"info: found GPT partition table\n\0".as_ptr());
+                    (call_table.verbose_print)(b"info: found GPT partition table\n\0".as_ptr());
                     result.flags |= InfoResult::FLAG_HAS_GPT;
                 }
                 PartitionTableType::None => {
                     // No valid partition table found - reject as unknown format
                     // This is the secure default: only accept files that are
                     // recognizably disk images
-                    (call_table.debug_print)(
+                    (call_table.verbose_print)(
                         b"info: no partition table, rejecting as unknown\n\0".as_ptr(),
                     );
                     format = ImageFormat::Unknown;
@@ -285,7 +283,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                 }
                 PartitionTableType::None => {
                     // Accept anyway in unsafe mode
-                    (call_table.debug_print)(
+                    (call_table.verbose_print)(
                         b"info: no partition table (unsafe quirks)\n\0".as_ptr(),
                     );
                 }
@@ -295,20 +293,20 @@ pub unsafe extern "C" fn _start() -> u64 {
 
     result.format = format as u32;
 
-    (call_table.debug_print)(b"info: detected format\n\0".as_ptr());
+    (call_table.verbose_print)(b"info: detected format\n\0".as_ptr());
 
-    // Format-specific information structures
-    let mut qcow2_info = Qcow2Info::new();
-    let mut vmdk_info = VmdkInfo::new();
-    let mut vdi_info = VdiInfo::new();
+    // Get format string for protobuf message
+    let format_str = format_to_str(format);
 
-    // Buffer for backing file path (null-terminated)
-    let mut backing_file_buf = [0u8; MAX_BACKING_FILE_LEN + 1];
+    // Parse format-specific metadata and send results
+    // Format-specific structs are created only within their respective branches
+    match format {
+        ImageFormat::Qcow2 => {
+            let mut qcow2_info = Qcow2Info::new();
+            let mut backing_file_buf = [0u8; MAX_BACKING_FILE_LEN + 1];
 
-    // Parse format-specific metadata if detailed reporting enabled
-    if detailed {
-        match format {
-            ImageFormat::Qcow2 => {
+            if detailed {
+                (call_table.verbose_print)(b"info: parsing qcow2\n\0".as_ptr());
                 parse_qcow2_header(
                     &buffer,
                     &mut result,
@@ -318,16 +316,64 @@ pub unsafe extern "C" fn _start() -> u64 {
                     input_sector_size,
                 );
             }
-            ImageFormat::Vmdk4 => {
+
+            (call_table.send_info_result_qcow2)(
+                format_str,
+                result.version,
+                result.virtual_size,
+                result.actual_size,
+                result.cluster_size,
+                result.flags,
+                backing_file_buf.as_ptr(),
+                b"\0".as_ptr(), // external_data_file (empty for now)
+                &qcow2_info,
+            );
+        }
+        ImageFormat::Vmdk4 => {
+            let mut vmdk_info = VmdkInfo::new();
+
+            if detailed {
                 parse_vmdk4_header(&buffer, &mut result, &mut vmdk_info, call_table);
-                // Set compressed flag if createType indicates compression (e.g., streamOptimized)
+                // Set compressed flag if createType indicates compression
                 if vmdk_info.create_type_str() == "streamOptimized" {
                     result.flags |= InfoResult::FLAG_COMPRESSED;
                 }
             }
-            ImageFormat::Vhd => {
+
+            (call_table.send_info_result_vmdk)(
+                format_str,
+                result.version,
+                result.virtual_size,
+                result.actual_size,
+                result.cluster_size,
+                result.flags,
+                b"\0".as_ptr(), // backing_file (empty for now)
+                b"\0".as_ptr(), // external_data_file (empty for now)
+                &vmdk_info,
+            );
+        }
+        ImageFormat::Vdi => {
+            let mut vdi_info = VdiInfo::new();
+
+            if detailed {
+                parse_vdi_header(&buffer, &mut result, &mut vdi_info);
+            }
+
+            (call_table.send_info_result_vdi)(
+                format_str,
+                result.version,
+                result.virtual_size,
+                result.actual_size,
+                result.cluster_size,
+                result.flags,
+                b"\0".as_ptr(), // backing_file (empty for now)
+                b"\0".as_ptr(), // external_data_file (empty for now)
+                &vdi_info,
+            );
+        }
+        ImageFormat::Vhd => {
+            if detailed {
                 // VHD footer may be in first sector (dynamic) or last sector (fixed)
-                // Use first sector buffer if it has the footer, otherwise use footer_buffer
                 let vhd_cookie = u64::from_be_bytes([
                     buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6],
                     buffer[7],
@@ -338,82 +384,87 @@ pub unsafe extern "C" fn _start() -> u64 {
                     parse_vhd_footer(&footer_buffer, &mut result);
                 }
             }
-            ImageFormat::Vhdx => {
-                // VHDX requires reading metadata from specific regions
+
+            (call_table.send_info_result)(
+                format_str,
+                result.version,
+                result.virtual_size,
+                result.actual_size,
+                result.cluster_size,
+                result.flags,
+                b"\0".as_ptr(),
+                b"\0".as_ptr(),
+            );
+        }
+        ImageFormat::Vhdx => {
+            if detailed {
                 parse_vhdx_metadata(&mut result, actual_size, call_table);
             }
-            ImageFormat::Vdi => {
-                parse_vdi_header(&buffer, &mut result, &mut vdi_info);
-            }
-            ImageFormat::Qed => {
+
+            (call_table.send_info_result)(
+                format_str,
+                result.version,
+                result.virtual_size,
+                result.actual_size,
+                result.cluster_size,
+                result.flags,
+                b"\0".as_ptr(),
+                b"\0".as_ptr(),
+            );
+        }
+        ImageFormat::Qed => {
+            if detailed {
                 parse_qed_header(&buffer, &mut result);
             }
-            ImageFormat::Luks => {
+
+            (call_table.send_info_result)(
+                format_str,
+                result.version,
+                result.virtual_size,
+                result.actual_size,
+                result.cluster_size,
+                result.flags,
+                b"\0".as_ptr(),
+                b"\0".as_ptr(),
+            );
+        }
+        ImageFormat::Luks => {
+            if detailed {
                 parse_luks_header(&buffer, &mut result);
             }
-            _ => {
-                // For raw and unknown formats, virtual size = actual size
+
+            (call_table.send_info_result)(
+                format_str,
+                result.version,
+                result.virtual_size,
+                result.actual_size,
+                result.cluster_size,
+                result.flags,
+                b"\0".as_ptr(),
+                b"\0".as_ptr(),
+            );
+        }
+        _ => {
+            // For raw and unknown formats, virtual size = actual size
+            if detailed {
                 result.virtual_size = actual_size;
             }
+
+            (call_table.send_info_result)(
+                format_str,
+                result.version,
+                result.virtual_size,
+                result.actual_size,
+                result.cluster_size,
+                result.flags,
+                b"\0".as_ptr(),
+                b"\0".as_ptr(),
+            );
         }
     }
 
-    // Get format string for protobuf message
-    let format_str = format_to_str(format);
-
-    // Send result via protobuf over serial
-    // Use format-specific functions to include format-specific info
-    if format == ImageFormat::Qcow2 {
-        (call_table.send_info_result_qcow2)(
-            format_str,
-            result.version,
-            result.virtual_size,
-            result.actual_size,
-            result.cluster_size,
-            result.flags,
-            backing_file_buf.as_ptr(),
-            b"\0".as_ptr(), // external_data_file (empty for now)
-            &qcow2_info,
-        );
-    } else if format == ImageFormat::Vmdk4 {
-        (call_table.send_info_result_vmdk)(
-            format_str,
-            result.version,
-            result.virtual_size,
-            result.actual_size,
-            result.cluster_size,
-            result.flags,
-            b"\0".as_ptr(), // backing_file (empty for now)
-            b"\0".as_ptr(), // external_data_file (empty for now)
-            &vmdk_info,
-        );
-    } else if format == ImageFormat::Vdi {
-        (call_table.send_info_result_vdi)(
-            format_str,
-            result.version,
-            result.virtual_size,
-            result.actual_size,
-            result.cluster_size,
-            result.flags,
-            b"\0".as_ptr(), // backing_file (empty for now)
-            b"\0".as_ptr(), // external_data_file (empty for now)
-            &vdi_info,
-        );
-    } else {
-        (call_table.send_info_result)(
-            format_str,
-            result.version,
-            result.virtual_size,
-            result.actual_size,
-            result.cluster_size,
-            result.flags,
-            b"\0".as_ptr(), // backing_file (empty for now)
-            b"\0".as_ptr(), // external_data_file (empty for now)
-        );
-    }
-
     (call_table.send_complete)(b"info\0".as_ptr(), bytes_read, true);
-    (call_table.debug_print)(b"info: done\n\0".as_ptr());
+    (call_table.verbose_print)(b"info: done\n\0".as_ptr());
 
     bytes_read
 }
@@ -436,118 +487,8 @@ fn format_to_str(format: ImageFormat) -> *const u8 {
     }
 }
 
-/// Detect image format based on magic numbers in file header (first sector)
-fn detect_format_header(buffer: &[u8], len: usize) -> ImageFormat {
-    if len < 8 {
-        return ImageFormat::Unknown;
-    }
-
-    // Check QCOW2/QCOW1 magic (big-endian)
-    let magic_be = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
-    if magic_be == QCOW2_MAGIC {
-        return ImageFormat::Qcow2;
-    }
-    // QCOW1 has 3-byte magic
-    if (magic_be >> 8) == QCOW1_MAGIC {
-        return ImageFormat::Qcow1;
-    }
-
-    // Check VMDK magic (little-endian)
-    let magic_le = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
-    if magic_le == VMDK4_MAGIC {
-        return ImageFormat::Vmdk4;
-    }
-    if magic_le == VMDK3_MAGIC {
-        return ImageFormat::Vmdk3;
-    }
-
-    // Check QED magic (little-endian "QED\0")
-    if magic_le == QED_MAGIC {
-        return ImageFormat::Qed;
-    }
-
-    // Check VHDX magic (little-endian, "vhdxfile" signature)
-    let vhdx_sig = u64::from_le_bytes([
-        buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
-    ]);
-    // "vhdxfile" in little-endian
-    if vhdx_sig == 0x656c696678646876 {
-        return ImageFormat::Vhdx;
-    }
-
-    // Check for VHD/VPC magic "conectix" (big-endian)
-    // Dynamic VHDs have a footer copy at the start of the file
-    let vhd_cookie = u64::from_be_bytes([
-        buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
-    ]);
-    if vhd_cookie == VHD_COOKIE {
-        return ImageFormat::Vhd;
-    }
-
-    // Check VDI magic at offset 64 (little-endian)
-    // VDI header starts with text signature, magic is at offset 64
-    if len >= VDI_SIGNATURE_OFFSET + 4 {
-        let vdi_magic = u32::from_le_bytes([
-            buffer[VDI_SIGNATURE_OFFSET],
-            buffer[VDI_SIGNATURE_OFFSET + 1],
-            buffer[VDI_SIGNATURE_OFFSET + 2],
-            buffer[VDI_SIGNATURE_OFFSET + 3],
-        ]);
-        if vdi_magic == VDI_MAGIC {
-            return ImageFormat::Vdi;
-        }
-    }
-
-    // Check LUKS magic at offset 0 (6 bytes: "LUKS\xba\xbe")
-    if len >= 6 && buffer[0..6] == LUKS_MAGIC {
-        return ImageFormat::Luks;
-    }
-
-    // Fixed VHD has its signature only at the end, handled separately
-    // If no known format detected from header, assume raw (may be overridden)
-    ImageFormat::Raw
-}
-
-/// Detect VHD format from file footer (last 512 bytes)
-fn detect_vhd_footer(buffer: &[u8]) -> ImageFormat {
-    if buffer.len() < 8 {
-        return ImageFormat::Raw;
-    }
-
-    // VHD footer starts with "conectix" cookie (big-endian)
-    let cookie = u64::from_be_bytes([
-        buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
-    ]);
-
-    if cookie == VHD_COOKIE {
-        return ImageFormat::Vhd;
-    }
-
-    ImageFormat::Raw
-}
-
-/// Detect ISO 9660 format from buffer at the given offset
-///
-/// ISO 9660 format has the Primary Volume Descriptor at byte offset 32768.
-/// The structure is:
-/// - Byte 0: Volume Descriptor Type (1 = Primary Volume Descriptor)
-/// - Bytes 1-5: Standard Identifier "CD001"
-/// - Byte 6: Version (1)
-///
-/// The offset parameter should point to byte 32769 (where "CD001" starts).
-fn detect_iso_at_offset(buffer: &[u8], offset: usize) -> ImageFormat {
-    // Need at least offset + 5 bytes to check "CD001" magic
-    if buffer.len() < offset + 5 {
-        return ImageFormat::Raw;
-    }
-
-    // Check for "CD001" at the given offset
-    if buffer[offset..offset + 5] == *ISO_MAGIC {
-        return ImageFormat::Iso;
-    }
-
-    ImageFormat::Raw
-}
+// Note: detect_format_from_header, detect_vhd_footer, detect_iso_at_offset are
+// now in shared::format_detection
 
 /// Partition table type for RAW image validation
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -858,7 +799,7 @@ unsafe fn parse_vhdx_metadata(result: &mut InfoResult, actual_size: u64, call_ta
     ]);
     result.virtual_size = virtual_size;
 
-    (call_table.debug_print)(b"info: VHDX parsed ok\n\0".as_ptr());
+    (call_table.verbose_print)(b"info: VHDX parsed ok\n\0".as_ptr());
 }
 
 /// Parse QCOW2 header and populate result and format-specific info
@@ -960,7 +901,7 @@ unsafe fn parse_qcow2_header(
 
     if backing_offset != 0 && backing_size > 0 {
         result.flags |= InfoResult::FLAG_HAS_BACKING_FILE;
-        (call_table.debug_print)(b"info: has backing file\n\0".as_ptr());
+        (call_table.verbose_print)(b"info: has backing file\n\0".as_ptr());
 
         // Read the backing file name from the image
         // Limit to our buffer size (protocol supports 1024 chars)
@@ -1059,7 +1000,7 @@ unsafe fn parse_qcow2_header(
         }
         if (incompat & QCOW2_INCOMPAT_EXTERNAL_DATA) != 0 {
             result.flags |= InfoResult::FLAG_HAS_EXTERNAL_DATA;
-            (call_table.debug_print)(b"info: has external data\n\0".as_ptr());
+            (call_table.verbose_print)(b"info: has external data\n\0".as_ptr());
         }
         if (incompat & QCOW2_INCOMPAT_COMPRESSION) != 0 {
             result.flags |= InfoResult::FLAG_COMPRESSED;
@@ -1123,7 +1064,7 @@ unsafe fn parse_qcow2_header(
             if ext_type == QCOW2_EXT_BACKING_FORMAT && ext_len > 0 {
                 let format_bytes = &buffer[ext_offset + 8..ext_offset + 8 + ext_len];
                 qcow2_info.backing_format = shared::BackingFormat::from_bytes(format_bytes);
-                (call_table.debug_print)(b"info: found backing format ext\n\0".as_ptr());
+                (call_table.verbose_print)(b"info: found backing format ext\n\0".as_ptr());
             }
 
             // Move to next extension (data is padded to 8-byte boundary)
@@ -1203,7 +1144,7 @@ unsafe fn parse_vmdk4_header(
 
     // Read and parse the descriptor if present
     if desc_offset_sectors > 0 && desc_size_sectors > 0 {
-        (call_table.debug_print)(b"info: reading VMDK descriptor\n\0".as_ptr());
+        (call_table.verbose_print)(b"info: reading VMDK descriptor\n\0".as_ptr());
 
         // Get input sector size (this is the virtio device's sector size, which may differ
         // from VMDK's internal 512-byte sectors)

@@ -605,7 +605,7 @@ mod tests {
     mod chain_config_tests {
         use shared::{
             ChainConfig, ChainDeviceInfo, ImageFormat as SharedImageFormat, InfoResult,
-            CHAIN_CONFIG_ADDR, CHAIN_CONFIG_MAX_SIZE, MAX_CHAIN_DEVICES, OPERATION_CONFIG_ADDR,
+            CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR, MAX_CHAIN_DEVICES, OPERATION_CONFIG_ADDR,
             OPERATION_LOAD_ADDR,
         };
 
@@ -746,8 +746,23 @@ mod tests {
         #[test]
         fn test_chain_config_memory_address() {
             // Verify the memory addresses don't overlap
+            // Memory layout:
+            //   0x10000: core.bin (up to 64KB)
+            //   0x20000 (OPERATION_LOAD_ADDR): operation binary (up to 384KB)
+            //   0x80000 (CALL_TABLE_ADDR): call table
+            //   0x81000 (OPERATION_CONFIG_ADDR): operation config
+            //   0x82000 (CHAIN_CONFIG_ADDR): chain config
+            //
+            // The operation binary area (0x20000-0x80000 = 384KB) must be large
+            // enough for all operations (info.bin, copy.bin, check.bin). Binary
+            // sizes are validated at build time in the Makefile.
+
+            // Configs are ordered correctly (chain after operation config)
             assert!(CHAIN_CONFIG_ADDR > OPERATION_CONFIG_ADDR);
-            assert!(CHAIN_CONFIG_ADDR + CHAIN_CONFIG_MAX_SIZE <= OPERATION_LOAD_ADDR);
+            // Operation config is after call table
+            assert!(OPERATION_CONFIG_ADDR > CALL_TABLE_ADDR);
+            // Call table is above operation binary area (0x80000 > 0x20000)
+            assert!(CALL_TABLE_ADDR > OPERATION_LOAD_ADDR);
         }
     }
 }
