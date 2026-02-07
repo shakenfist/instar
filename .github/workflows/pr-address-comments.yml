@@ -66,12 +66,15 @@ jobs:
           sparse-checkout-cone-mode: false
 
       # Now checkout the PR branch for the actual code
+      # SECURITY: We use persist-credentials: false to prevent the token from
+      # being available in the checked-out repository's git config
       - name: Checkout PR branch
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.trigger-address.outputs.pr_ref }}
           fetch-depth: 0
           path: pr-code
+          persist-credentials: false
 
       - name: Configure git
         run: |
@@ -136,7 +139,10 @@ jobs:
 
           if [ "${commit_count}" -gt 0 ]; then
             echo "Pushing ${commit_count} commits..."
-            # Use explicit refs/heads/ prefix and quoted variable for safety
+            # SECURITY: Use gh CLI for push since persist-credentials: false
+            # prevents git from having stored credentials
+            # Configure git to use gh for authentication
+            gh auth setup-git
             git push origin "HEAD:refs/heads/${BRANCH_NAME}"
           else
             echo "No commits to push"
