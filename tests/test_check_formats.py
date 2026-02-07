@@ -67,7 +67,17 @@ class TestCheckFormatDetection(ImagoTestBase):
 
 
 class TestCheckCorruptImages(ImagoTestBase):
-    """Test check operation with deliberately corrupt images."""
+    """Test check operation with deliberately corrupt images.
+
+    TODO: These tests are placeholders pending creation of corrupt test images
+    in imago-testdata/custom/format-coverage/. The required images are:
+    - vmdk-corrupt-version.vmdk: VMDK with invalid version (255)
+    - vhdx-corrupt-region.vhdx: VHDX with invalid region table signature
+    - vhd-corrupt-disktype.vhd: VHD with invalid disk type (255)
+
+    Tests will skip gracefully until images are created.
+    See docs/quirks.md "Test Images (Planned)" section for details.
+    """
 
     def test_vmdk_corrupt_version(self):
         """VMDK with invalid version should report corruption."""
@@ -158,7 +168,12 @@ class TestCheckCorruptImages(ImagoTestBase):
 
 
 class TestCheckUnsafeQuirksMode(ImagoTestBase):
-    """Test that unsafe_quirks mode matches qemu-img behavior."""
+    """Test that unsafe_quirks mode matches qemu-img behavior.
+
+    TODO: test_unsafe_quirks_skips_vmdk_validation depends on
+    vmdk-corrupt-version.vmdk from TestCheckCorruptImages. See that class
+    docstring for details on the pending test image creation.
+    """
 
     def test_unsafe_quirks_skips_vmdk_validation(self):
         """With --unsafe-quirks, corrupt VMDK should not report errors."""
