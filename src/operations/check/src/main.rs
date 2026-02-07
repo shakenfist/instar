@@ -446,6 +446,16 @@ unsafe fn check_vhdx(
 /// The footer buffer must be at least 64 bytes (VHD_FOOTER_DISK_TYPE_OFFSET + 4).
 /// Callers pass sector-sized buffers (minimum 512 bytes per sector_size validation),
 /// so this is always satisfied in practice.
+///
+/// # Safety invariants
+///
+/// This function uses defense-in-depth for buffer size validation:
+/// - A `debug_assert!` catches programming errors during development
+/// - A runtime check handles undersized buffers gracefully in release builds,
+///   treating them as corrupted rather than panicking
+///
+/// The invariant is maintained by callers (`check_vhd`) which read full sectors
+/// into `MAX_SECTOR_SIZE` buffers before passing them here.
 fn check_vhd_footer(footer: &[u8], result: &mut CheckResult) {
     // Minimum buffer size: disk_type field at offset 60 + 4 bytes = 64 bytes.
     // This is always satisfied since callers use sector-sized buffers (min 512 bytes).
