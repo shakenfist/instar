@@ -3045,6 +3045,10 @@ fn print_check_result_json(
     filename: &str,
     unsafe_quirks: bool,
 ) {
+    // Extract flags for boolean fields
+    let is_dirty = (result.flags & CHECK_RESULT_FLAG_DIRTY) != 0;
+    let is_corrupt = (result.flags & CHECK_RESULT_FLAG_CORRUPT_BIT) != 0;
+
     println!("{{");
     println!("    \"filename\": \"{}\",", escape_json_string(filename));
     println!(
@@ -3064,7 +3068,10 @@ fn print_check_result_json(
     println!("    \"image-end-offset\": {},", result.image_end_offset);
     println!("    \"total-clusters\": {},", result.clusters_checked);
     println!("    \"allocated-clusters\": {},", result.clusters_allocated);
-    println!("    \"fragmented-clusters\": {}", result.fragmentation);
+    println!("    \"fragmented-clusters\": {},", result.fragmentation);
+    // QCOW2-specific flags (dirty bit = unclean shutdown, corrupt bit = known corruption)
+    println!("    \"dirty\": {},", is_dirty);
+    println!("    \"corrupt\": {}", is_corrupt);
     println!("}}");
 }
 
