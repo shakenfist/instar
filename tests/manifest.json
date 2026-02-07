@@ -620,6 +620,50 @@
             "description": "LUKS version 2 header for format detection testing",
             "tags": ["luks", "luks2", "encrypted", "format-coverage"],
             "sha256": "0961fc4aaed74ca9acd9ac11430f2ffc00bc2b2696599a3e04325ff91e51ec26"
+        },
+        {
+            "id": "vmdk-corrupt-version",
+            "path": "custom/format-coverage/vmdk-corrupt-version.vmdk",
+            "format": "vmdk",
+            "safety": "malformed",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "VMDK with invalid version (255) for corruption detection testing",
+            "tags": ["vmdk", "corrupt", "malformed", "format-coverage"],
+            "sha256": "991f059c8531717ccb2c09bf5e4706e662b04a722bb9055c3a827e4b1e263947"
+        },
+        {
+            "id": "vmdk-corrupt-descriptor",
+            "path": "custom/format-coverage/vmdk-corrupt-descriptor.vmdk",
+            "format": "vmdk",
+            "safety": "malformed",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "VMDK with descriptor offset beyond file bounds",
+            "tags": ["vmdk", "corrupt", "malformed", "format-coverage"],
+            "sha256": "7db765614e644677dee5b7f2667d888f43879e8c7a5f88edf5efc2647b6d8aee"
+        },
+        {
+            "id": "vhdx-corrupt-region",
+            "path": "custom/format-coverage/vhdx-corrupt-region.vhdx",
+            "format": "vhdx",
+            "safety": "malformed",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "VHDX with invalid region table signature",
+            "tags": ["vhdx", "corrupt", "malformed", "format-coverage"],
+            "sha256": "4563e94abf7b9c9135b4907b7412698f5bae728dc074a9ebaa426610441d9b22"
+        },
+        {
+            "id": "vhd-corrupt-disktype",
+            "path": "custom/format-coverage/vhd-corrupt-disktype.vhd",
+            "format": "vhd",
+            "safety": "malformed",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "VHD with invalid disk type (255)",
+            "tags": ["vhd", "corrupt", "malformed", "format-coverage"],
+            "sha256": "bfefede208a0d182f561aca493cafb71bc51f05e12255b02cdd98275e92d5109"
         }
     ]
 }
