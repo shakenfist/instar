@@ -1331,9 +1331,12 @@ unsafe fn check_qcow2(
                     let rc = u16::from_be_bytes([leak_scan_buffer[off], leak_scan_buffer[off + 1]]);
 
                     if rc > 0 {
-                        let cidx = rt_idx * entries_per_block
-                            + (s as u64) * ((sector_size / 2) as u64)
-                            + e as u64;
+                        let cidx = match rt_idx.checked_mul(entries_per_block).and_then(|v| {
+                            v.checked_add((s as u64) * ((sector_size / 2) as u64) + e as u64)
+                        }) {
+                            Some(v) => v,
+                            None => continue,
+                        };
                         if !bitmap_test(bitmap, bitmap_size, cidx) {
                             result.leaks += 1;
                             result.total_errors += 1;
