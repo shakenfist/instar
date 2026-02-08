@@ -1235,120 +1235,131 @@ unsafe fn check_qcow2(
         (call_table.verbose_print)(b"check: scanning refcounts for leaks\n\0".as_ptr());
 
         let entries_per_block = (cluster_size * 8) / refcount_bits as u64;
+        const MAX_REFTABLE_ENTRIES: u64 = 16 * 1024 * 1024;
         let reftable_entries = {
             let raw = (refcount_table_clusters as u64).saturating_mul(cluster_size / 8);
             let max_entries = actual_size / 8;
             core::cmp::min(raw, max_entries)
         };
-        let mut leak_scan_buffer = [0u8; MAX_SECTOR_SIZE];
+        if reftable_entries > MAX_REFTABLE_ENTRIES {
+            result.corruptions += 1;
+            result.total_errors += 1;
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+            (call_table.debug_print)(
+                b"check: reftable_entries exceeds bounds, skipping leak scan\n\0".as_ptr(),
+            );
+        } else {
+            let mut leak_scan_buffer = [0u8; MAX_SECTOR_SIZE];
 
-        // First pass: mark all refcount block clusters in the bitmap
-        // before scanning entries, so that refcount blocks covering
-        // other refcount blocks are not falsely reported as leaks.
-        for rt_idx in 0..reftable_entries {
-            let rt_byte_off = match rt_idx
-                .checked_mul(8)
-                .and_then(|v| refcount_table_offset.checked_add(v))
-            {
-                Some(off) => off,
-                None => break,
-            };
-            if rt_byte_off + 8 > actual_size {
-                break;
-            }
-            let refblock_off = match read_u64_be_cached(
-                call_table,
-                rt_byte_off,
-                sector_size,
-                input_capacity,
-                &mut reftable_cached_sector,
-                &mut reftable_cached_buffer,
-                &mut bytes_read,
-            ) {
-                Some(v) => v,
-                None => break,
-            };
-
-            if refblock_off != 0 {
-                bitmap_set(bitmap, bitmap_size, refblock_off / cluster_size);
-            }
-        }
-
-        // Second pass: scan individual refcount entries for leaks.
-        for rt_idx in 0..reftable_entries {
-            // Read refcount table entry
-            let rt_byte_off = match rt_idx
-                .checked_mul(8)
-                .and_then(|v| refcount_table_offset.checked_add(v))
-            {
-                Some(off) => off,
-                None => break,
-            };
-            if rt_byte_off + 8 > actual_size {
-                break;
-            }
-            let refblock_off = match read_u64_be_cached(
-                call_table,
-                rt_byte_off,
-                sector_size,
-                input_capacity,
-                &mut reftable_cached_sector,
-                &mut reftable_cached_buffer,
-                &mut bytes_read,
-            ) {
-                Some(v) => v,
-                None => break,
-            };
-
-            if refblock_off == 0 {
-                continue;
-            }
-
-            // Read each sector of this refcount block
-            let refblock_base_sector = refblock_off / sector_size as u64;
-            let sectors_per_block = ((cluster_size as usize) + sector_size - 1) / sector_size;
-            let mut entries_remaining = entries_per_block;
-
-            for s in 0..sectors_per_block {
-                let sec = refblock_base_sector + s as u64;
-                if sec >= input_capacity {
+            // First pass: mark all refcount block clusters in the bitmap
+            // before scanning entries, so that refcount blocks covering
+            // other refcount blocks are not falsely reported as leaks.
+            for rt_idx in 0..reftable_entries {
+                let rt_byte_off = match rt_idx
+                    .checked_mul(8)
+                    .and_then(|v| refcount_table_offset.checked_add(v))
+                {
+                    Some(off) => off,
+                    None => break,
+                };
+                if rt_byte_off + 8 > actual_size {
                     break;
                 }
-                if !(call_table.read_input_sector)(
-                    0,
-                    sec,
-                    leak_scan_buffer.as_mut_ptr(),
+                let refblock_off = match read_u64_be_cached(
+                    call_table,
+                    rt_byte_off,
                     sector_size,
+                    input_capacity,
+                    &mut reftable_cached_sector,
+                    &mut reftable_cached_buffer,
+                    &mut bytes_read,
                 ) {
+                    Some(v) => v,
+                    None => break,
+                };
+
+                if refblock_off != 0 {
+                    bitmap_set(bitmap, bitmap_size, refblock_off / cluster_size);
+                }
+            }
+
+            // Second pass: scan individual refcount entries for leaks.
+            for rt_idx in 0..reftable_entries {
+                // Read refcount table entry
+                let rt_byte_off = match rt_idx
+                    .checked_mul(8)
+                    .and_then(|v| refcount_table_offset.checked_add(v))
+                {
+                    Some(off) => off,
+                    None => break,
+                };
+                if rt_byte_off + 8 > actual_size {
                     break;
                 }
-                bytes_read += sector_size as u64;
+                let refblock_off = match read_u64_be_cached(
+                    call_table,
+                    rt_byte_off,
+                    sector_size,
+                    input_capacity,
+                    &mut reftable_cached_sector,
+                    &mut reftable_cached_buffer,
+                    &mut bytes_read,
+                ) {
+                    Some(v) => v,
+                    None => break,
+                };
 
-                let entries_this = core::cmp::min(entries_remaining, (sector_size / 2) as u64);
+                if refblock_off == 0 {
+                    continue;
+                }
 
-                for e in 0..entries_this as usize {
-                    let off = e * 2;
-                    let rc = u16::from_be_bytes([leak_scan_buffer[off], leak_scan_buffer[off + 1]]);
+                // Read each sector of this refcount block
+                let refblock_base_sector = refblock_off / sector_size as u64;
+                let sectors_per_block = ((cluster_size as usize) + sector_size - 1) / sector_size;
+                let mut entries_remaining = entries_per_block;
 
-                    if rc > 0 {
-                        let cidx = match rt_idx.checked_mul(entries_per_block).and_then(|v| {
-                            v.checked_add((s as u64) * ((sector_size / 2) as u64) + e as u64)
-                        }) {
-                            Some(v) => v,
-                            None => continue,
-                        };
-                        if !bitmap_test(bitmap, bitmap_size, cidx) {
-                            result.leaks += 1;
-                            result.total_errors += 1;
+                for s in 0..sectors_per_block {
+                    let sec = refblock_base_sector + s as u64;
+                    if sec >= input_capacity {
+                        break;
+                    }
+                    if !(call_table.read_input_sector)(
+                        0,
+                        sec,
+                        leak_scan_buffer.as_mut_ptr(),
+                        sector_size,
+                    ) {
+                        break;
+                    }
+                    bytes_read += sector_size as u64;
+
+                    let entries_this = core::cmp::min(entries_remaining, (sector_size / 2) as u64);
+
+                    for e in 0..entries_this as usize {
+                        let off = e * 2;
+                        let rc =
+                            u16::from_be_bytes([leak_scan_buffer[off], leak_scan_buffer[off + 1]]);
+
+                        if rc > 0 {
+                            let cidx = match rt_idx.checked_mul(entries_per_block).and_then(|v| {
+                                v.checked_add((s as u64) * ((sector_size / 2) as u64) + e as u64)
+                            }) {
+                                Some(v) => v,
+                                None => continue,
+                            };
+                            if !bitmap_test(bitmap, bitmap_size, cidx) {
+                                result.leaks += 1;
+                                result.total_errors += 1;
+                            }
                         }
                     }
+
+                    entries_remaining -= entries_this;
                 }
-
-                entries_remaining -= entries_this;
             }
-        }
 
-        (call_table.verbose_print)(b"check: leak scan complete\n\0".as_ptr());
+            (call_table.verbose_print)(b"check: leak scan complete\n\0".as_ptr());
+        } // end else (reftable_entries within bounds)
     } else if refcount_bits != 16 {
         (call_table.verbose_print)(
             b"check: skipping leak scan (non-16-bit refcounts)\n\0".as_ptr(),
