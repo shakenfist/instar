@@ -727,9 +727,10 @@ fn print_info_result(
         // qemu_compat is the opposite of ignore_quirks
         let qemu_compat = !ignore_quirks;
 
-        // For raw format, qemu-img reports virtual-size rounded up to 512-byte sectors.
-        // For structured formats (qcow2, vmdk, etc.), use the virtual size from headers.
-        let effective_virtual_size = if info.format == "raw" {
+        // For raw/unknown formats, qemu-img reports virtual-size as the file length
+        // rounded up to 512-byte sectors. For structured formats (qcow2, vmdk, etc.),
+        // use the virtual size from headers.
+        let effective_virtual_size = if info.format == "raw" || info.format == "unknown" {
             // Round up to 512-byte sector boundary
             ((file_size + 511) / 512) * 512
         } else {
@@ -928,17 +929,22 @@ fn print_info_result_json(
     // Build JSON output to match qemu-img's format exactly
     // qemu-img uses 4-space indentation
 
-    // For raw format, qemu-img reports virtual-size rounded up to 512-byte sectors.
-    // For structured formats (qcow2, vmdk, etc.), use the virtual size from headers.
-    let effective_virtual_size = if info.format == "raw" {
+    // For raw/unknown formats, qemu-img reports virtual-size as the file length
+    // rounded up to 512-byte sectors. For structured formats (qcow2, vmdk, etc.),
+    // use the virtual size from headers. The "unknown" case is important: files
+    // smaller than one guest sector (e.g., 512-byte LUKS headers with 64KB sectors)
+    // report 0 capacity to the guest, so the guest's virtual_size will be 0. The
+    // VMM must use the real file length instead.
+    let is_unstructured = info.format == "raw" || info.format == "unknown";
+    let effective_virtual_size = if is_unstructured {
         // Round up to 512-byte sector boundary
         ((child_file_length + 511) / 512) * 512
     } else {
         info.virtual_size
     };
 
-    // For child file length in raw format, also round up to 512-byte sectors
-    let effective_child_file_length = if info.format == "raw" {
+    // For child file length in raw/unknown format, also round up to 512-byte sectors
+    let effective_child_file_length = if is_unstructured {
         ((child_file_length + 511) / 512) * 512
     } else {
         child_file_length
