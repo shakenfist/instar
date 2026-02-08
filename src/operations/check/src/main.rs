@@ -761,6 +761,12 @@ unsafe fn check_qcow2(
         16 // v2 always uses 16-bit refcounts
     };
 
+    if refcount_bits != 16 {
+        (call_table.debug_print)(
+            b"check: refcount_bits != 16, skipping refcount/leak validation\n\0".as_ptr(),
+        );
+    }
+
     // L1 table info
     let l1_size = u32::from_be_bytes([
         header[QCOW2_L1_SIZE_OFFSET],
@@ -1326,6 +1332,10 @@ unsafe fn check_qcow2(
         }
 
         (call_table.verbose_print)(b"check: leak scan complete\n\0".as_ptr());
+    } else if refcount_bits != 16 {
+        (call_table.verbose_print)(
+            b"check: skipping leak scan (non-16-bit refcounts)\n\0".as_ptr(),
+        );
     }
 
     // Calculate fragmentation percentage
