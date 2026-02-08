@@ -405,8 +405,8 @@ pub unsafe extern "C" fn _start() -> u64 {
         }
     }
 
-    // Set VALID flag if no errors
-    if result.total_errors == 0 && result.corruptions == 0 {
+    // Set VALID flag if no corruptions (leaks alone don't invalidate)
+    if result.corruptions == 0 && result.refcount_errors == 0 {
         result.flags |= CheckResult::FLAG_VALID;
     }
 
