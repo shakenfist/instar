@@ -30,6 +30,17 @@ pub const CHAIN_CONFIG_MAX_SIZE: usize = 1024;
 /// Address where operation binaries are loaded
 pub const OPERATION_LOAD_ADDR: usize = 0x00020000;
 
+/// Scratch memory base address for operation use (after DMA pool).
+/// Operations can use this region for temporary bitmaps and buffers.
+/// DMA pool is at 0x200000 and uses ~64KB, so 0x300000 is safe.
+pub const SCRATCH_MEM_BASE: usize = 0x00300000;
+
+/// Scratch memory end address (before stack at 0x1000000)
+pub const SCRATCH_MEM_END: usize = 0x01000000;
+
+/// Scratch memory size in bytes (~13MB)
+pub const SCRATCH_MEM_SIZE: usize = SCRATCH_MEM_END - SCRATCH_MEM_BASE;
+
 /// Maximum sector size supported
 pub const MAX_SECTOR_SIZE: usize = 65536;
 
