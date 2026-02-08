@@ -1215,7 +1215,11 @@ unsafe fn check_qcow2(
         (call_table.verbose_print)(b"check: scanning refcounts for leaks\n\0".as_ptr());
 
         let entries_per_block = (cluster_size * 8) / refcount_bits as u64;
-        let reftable_entries = (refcount_table_clusters as u64) * (cluster_size / 8);
+        let reftable_entries = {
+            let raw = (refcount_table_clusters as u64).saturating_mul(cluster_size / 8);
+            let max_entries = actual_size / 8;
+            core::cmp::min(raw, max_entries)
+        };
         let mut leak_scan_buffer = [0u8; MAX_SECTOR_SIZE];
 
         for rt_idx in 0..reftable_entries {
