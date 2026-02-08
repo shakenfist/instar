@@ -409,7 +409,16 @@ pub unsafe extern "C" fn _start() -> u64 {
         }
     }
 
-    // Set VALID flag if no corruptions (leaks alone don't invalidate)
+    // Set VALID flag if no corruptions or refcount errors.
+    // Leaks (unreferenced allocated clusters) intentionally do NOT prevent
+    // FLAG_VALID from being set: the image data is intact and usable, leaks
+    // just waste space and are fixable with `qemu-img check -r leaks`.
+    // This matches qemu-img behavior where leaks produce exit code 3
+    // (check found leaks) rather than exit code 2 (check found errors).
+    //
+    // Note: leaks still increment total_errors, so the VMM will still
+    // report a non-zero exit code for leak-only images via check_passed
+    // (which requires both FLAG_VALID and total_errors == 0).
     if result.corruptions == 0 && result.refcount_errors == 0 {
         result.flags |= CheckResult::FLAG_VALID;
     }
