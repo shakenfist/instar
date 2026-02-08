@@ -140,6 +140,7 @@ provides a modular architecture with:
 - **core/** - Guest initialization (device init, call table)
 - **operations/info/** - Format detection operation
 - **operations/copy/** - File copy operation
+- **operations/check/** - Image integrity validation operation
 - **shared/** - Shared library code between components
 
 The rust-vmm project provides crates that reduce implementation effort by 70%+:

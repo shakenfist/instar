@@ -167,6 +167,142 @@ class TestCheckCorruptImages(ImagoTestBase):
         )
 
 
+class TestCheckQcow2Validation(ImagoTestBase):
+    """Test improved QCOW2 structural validation.
+
+    Uses deliberately corrupt images from
+    imago-testdata/custom/check-validation/ to verify overlap
+    detection, refcount validation, and leak detection.
+    """
+
+    def _get_check_validation_path(self, filename):
+        """Get path to a check-validation test image."""
+        path = (
+            self._testdata_root / 'custom' /
+            'check-validation' / filename
+        )
+        if not path.exists():
+            self.skipTest(
+                f'Test image not found: {path}. '
+                f'Run create-corrupt-images.py first.'
+            )
+        return path
+
+    def test_clean_qcow2_no_errors(self):
+        """Clean QCOW2 should report 0 errors across all fields."""
+        path = self._get_check_validation_path(
+            'qcow2-clean-with-data.qcow2'
+        )
+        stdout, stderr, rc = self.run_imago_check(
+            path, output_format='json'
+        )
+
+        self.assertEqual(rc, 0, f'Clean image failed: {stderr}')
+        result = json.loads(stdout)
+        self.assertEqual(result['format'], 'qcow2')
+        self.assertEqual(result['check-errors'], 0)
+        self.assertEqual(result['corruptions'], 0)
+        self.assertEqual(result['leaks'], 0)
+        self.assertEqual(result['refcount-errors'], 0)
+
+    def test_clean_qcow2_cluster_count(self):
+        """Clean QCOW2 should report correct allocated clusters."""
+        path = self._get_check_validation_path(
+            'qcow2-clean-with-data.qcow2'
+        )
+        stdout, stderr, rc = self.run_imago_check(
+            path, output_format='json'
+        )
+
+        result = json.loads(stdout)
+        # 4 data clusters + 1 L2 table = 5 allocated
+        self.assertEqual(
+            result['allocated-clusters'], 5,
+            'Should report 5 allocated clusters '
+            '(4 data + 1 L2 table)'
+        )
+
+    def test_overlapping_clusters_detected(self):
+        """Overlapping L2 entries should be detected as corruption."""
+        path = self._get_check_validation_path(
+            'qcow2-overlapping-clusters.qcow2'
+        )
+        stdout, stderr, rc = self.run_imago_check(
+            path, output_format='json'
+        )
+
+        self.assertNotEqual(rc, 0, 'Should exit non-zero')
+        result = json.loads(stdout)
+        self.assertGreater(
+            result['corruptions'], 0,
+            'Should detect overlapping cluster corruption'
+        )
+
+    def test_refcount_zero_detected(self):
+        """Referenced cluster with refcount=0 should be detected."""
+        path = self._get_check_validation_path(
+            'qcow2-refcount-zero.qcow2'
+        )
+        stdout, stderr, rc = self.run_imago_check(
+            path, output_format='json'
+        )
+
+        self.assertNotEqual(rc, 0, 'Should exit non-zero')
+        result = json.loads(stdout)
+        self.assertGreater(
+            result['refcount-errors'], 0,
+            'Should detect refcount=0 for referenced cluster'
+        )
+
+    def test_leaked_cluster_detected(self):
+        """Cluster with refcount>0 but no L2 reference = leak."""
+        path = self._get_check_validation_path(
+            'qcow2-leaked-cluster.qcow2'
+        )
+        stdout, stderr, rc = self.run_imago_check(
+            path, output_format='json'
+        )
+
+        self.assertNotEqual(rc, 0, 'Should exit non-zero')
+        result = json.loads(stdout)
+        self.assertGreater(
+            result['leaks'], 0,
+            'Should detect leaked cluster'
+        )
+        self.assertEqual(
+            result['corruptions'], 0,
+            'Leaked cluster should not be reported as corruption'
+        )
+
+    def test_clean_matches_qemu_img_end_offset(self):
+        """image-end-offset should match qemu-img check."""
+        path = self._get_check_validation_path(
+            'qcow2-clean-with-data.qcow2'
+        )
+
+        # Run both tools
+        imago_stdout, _, imago_rc = self.run_imago_check(
+            path, output_format='json'
+        )
+        qemu_stdout, _, qemu_rc = self.run_qemu_img_check(
+            path, output_format='json'
+        )
+
+        if qemu_rc != 0 and qemu_rc != 3:
+            self.skipTest(
+                f'qemu-img check failed unexpectedly: rc={qemu_rc}'
+            )
+
+        imago_result = json.loads(imago_stdout)
+        qemu_result = json.loads(qemu_stdout)
+
+        self.assertEqual(
+            imago_result['image-end-offset'],
+            qemu_result['image-end-offset'],
+            'image-end-offset should match qemu-img check'
+        )
+
+
 class TestCheckUnsafeQuirksMode(ImagoTestBase):
     """Test that unsafe_quirks mode matches qemu-img behavior.
 

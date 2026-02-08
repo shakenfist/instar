@@ -664,6 +664,46 @@
             "description": "VHD with invalid disk type (255)",
             "tags": ["vhd", "corrupt", "malformed", "format-coverage"],
             "sha256": "bfefede208a0d182f561aca493cafb71bc51f05e12255b02cdd98275e92d5109"
+        },
+        {
+            "id": "check-qcow2-clean",
+            "path": "custom/check-validation/qcow2-clean-with-data.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "Clean QCOW2 baseline with 4 data clusters (script-generated)",
+            "tags": ["qcow2", "check-validation", "clean", "baseline"]
+        },
+        {
+            "id": "check-qcow2-overlapping",
+            "path": "custom/check-validation/qcow2-overlapping-clusters.qcow2",
+            "format": "qcow2",
+            "safety": "malformed",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "QCOW2 with two L2 entries pointing to same host cluster",
+            "tags": ["qcow2", "check-validation", "overlap", "corruption"]
+        },
+        {
+            "id": "check-qcow2-refcount-zero",
+            "path": "custom/check-validation/qcow2-refcount-zero.qcow2",
+            "format": "qcow2",
+            "safety": "malformed",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "QCOW2 with referenced data cluster having refcount=0",
+            "tags": ["qcow2", "check-validation", "refcount", "corruption"]
+        },
+        {
+            "id": "check-qcow2-leaked",
+            "path": "custom/check-validation/qcow2-leaked-cluster.qcow2",
+            "format": "qcow2",
+            "safety": "malformed",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "QCOW2 with leaked cluster (refcount>0, no L2 reference)",
+            "tags": ["qcow2", "check-validation", "leak"]
         }
     ]
 }
