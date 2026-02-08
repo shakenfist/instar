@@ -11,6 +11,10 @@
 //! - Refcount table and block structure validation
 //! - Dirty/corrupt incompatible feature flags (v3 only)
 //!
+//! Refcount validation currently supports 16-bit refcounts (the standard
+//! QCOW2 default). Images with other refcount widths skip refcount and
+//! leak validation.
+//!
 //! Results are sent via protobuf CheckResultMessage over the serial
 //! command channel.
 
