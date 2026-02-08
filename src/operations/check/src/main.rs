@@ -1226,7 +1226,13 @@ unsafe fn check_qcow2(
         // before scanning entries, so that refcount blocks covering
         // other refcount blocks are not falsely reported as leaks.
         for rt_idx in 0..reftable_entries {
-            let rt_byte_off = refcount_table_offset + rt_idx * 8;
+            let rt_byte_off = match rt_idx
+                .checked_mul(8)
+                .and_then(|v| refcount_table_offset.checked_add(v))
+            {
+                Some(off) => off,
+                None => break,
+            };
             if rt_byte_off + 8 > actual_size {
                 break;
             }
@@ -1251,7 +1257,13 @@ unsafe fn check_qcow2(
         // Second pass: scan individual refcount entries for leaks.
         for rt_idx in 0..reftable_entries {
             // Read refcount table entry
-            let rt_byte_off = refcount_table_offset + rt_idx * 8;
+            let rt_byte_off = match rt_idx
+                .checked_mul(8)
+                .and_then(|v| refcount_table_offset.checked_add(v))
+            {
+                Some(off) => off,
+                None => break,
+            };
             if rt_byte_off + 8 > actual_size {
                 break;
             }
