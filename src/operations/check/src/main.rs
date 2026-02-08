@@ -172,7 +172,9 @@ unsafe fn lookup_refcount(
 
     // Read refcount table entry (big-endian u64 pointer to
     // refcount block)
-    let reftable_byte_off = refcount_table_offset + refblock_index * 8;
+    let reftable_byte_off = refblock_index
+        .checked_mul(8)
+        .and_then(|v| refcount_table_offset.checked_add(v))?;
     let refblock_offset = read_u64_be_cached(
         call_table,
         reftable_byte_off,
@@ -193,7 +195,9 @@ unsafe fn lookup_refcount(
     // overwhelmingly common case). Other widths are treated as
     // I/O errors to avoid silent misinterpretation.
     if refcount_bits == 16 {
-        let entry_byte_off = refblock_offset + entry_in_block * 2;
+        let entry_byte_off = entry_in_block
+            .checked_mul(2)
+            .and_then(|v| refblock_offset.checked_add(v))?;
         let rc = read_u16_be_cached(
             call_table,
             entry_byte_off,
