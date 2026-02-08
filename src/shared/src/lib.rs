@@ -30,10 +30,22 @@ pub const CHAIN_CONFIG_MAX_SIZE: usize = 1024;
 /// Address where operation binaries are loaded
 pub const OPERATION_LOAD_ADDR: usize = 0x00020000;
 
+/// DMA pool base address (must match core/virtio.rs and vmm/main.rs).
+/// Used for virtio request headers, data buffers, and status bytes.
+pub const DMA_POOL_BASE: usize = 0x00200000;
+
+/// DMA pool upper bound: header (16) + max sector (65536) + status (1), rounded up to 64KB.
+pub const DMA_POOL_END: usize = DMA_POOL_BASE + 0x10000;
+
 /// Scratch memory base address for operation use (after DMA pool).
 /// Operations can use this region for temporary bitmaps and buffers.
-/// DMA pool is at 0x200000 and uses ~64KB, so 0x300000 is safe.
 pub const SCRATCH_MEM_BASE: usize = 0x00300000;
+
+// Compile-time check: scratch memory must not overlap with the DMA pool.
+const _: () = assert!(
+    SCRATCH_MEM_BASE >= DMA_POOL_END,
+    "SCRATCH_MEM_BASE overlaps with DMA pool"
+);
 
 /// Scratch memory end address (before stack at 0x1000000)
 pub const SCRATCH_MEM_END: usize = 0x01000000;
