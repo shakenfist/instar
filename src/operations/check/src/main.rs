@@ -1222,6 +1222,33 @@ unsafe fn check_qcow2(
         };
         let mut leak_scan_buffer = [0u8; MAX_SECTOR_SIZE];
 
+        // First pass: mark all refcount block clusters in the bitmap
+        // before scanning entries, so that refcount blocks covering
+        // other refcount blocks are not falsely reported as leaks.
+        for rt_idx in 0..reftable_entries {
+            let rt_byte_off = refcount_table_offset + rt_idx * 8;
+            if rt_byte_off + 8 > actual_size {
+                break;
+            }
+            let refblock_off = match read_u64_be_cached(
+                call_table,
+                rt_byte_off,
+                sector_size,
+                input_capacity,
+                &mut reftable_cached_sector,
+                &mut reftable_cached_buffer,
+                &mut bytes_read,
+            ) {
+                Some(v) => v,
+                None => break,
+            };
+
+            if refblock_off != 0 {
+                bitmap_set(bitmap, bitmap_size, refblock_off / cluster_size);
+            }
+        }
+
+        // Second pass: scan individual refcount entries for leaks.
         for rt_idx in 0..reftable_entries {
             // Read refcount table entry
             let rt_byte_off = refcount_table_offset + rt_idx * 8;
@@ -1243,11 +1270,6 @@ unsafe fn check_qcow2(
 
             if refblock_off == 0 {
                 continue;
-            }
-
-            // Mark refcount block cluster in bitmap
-            if can_track {
-                bitmap_set(bitmap, bitmap_size, refblock_off / cluster_size);
             }
 
             // Read each sector of this refcount block
