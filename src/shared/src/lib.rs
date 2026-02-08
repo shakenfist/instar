@@ -47,10 +47,13 @@ const _: () = assert!(
     "SCRATCH_MEM_BASE overlaps with DMA pool"
 );
 
-/// Scratch memory end address (before stack at 0x1000000)
-pub const SCRATCH_MEM_END: usize = 0x01000000;
+/// Scratch memory end address.
+/// Must stay below STACK_BASE (0x1000000) defined in vmm/src/main.rs.
+/// A 64 KiB guard gap separates the scratch region from the stack so that
+/// an off-by-one or small overrun cannot corrupt active stack frames.
+pub const SCRATCH_MEM_END: usize = 0x00FF0000;
 
-/// Scratch memory size in bytes (~13MB)
+/// Scratch memory size in bytes (~12.9 MiB)
 pub const SCRATCH_MEM_SIZE: usize = SCRATCH_MEM_END - SCRATCH_MEM_BASE;
 
 /// Maximum sector size supported
