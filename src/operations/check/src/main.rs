@@ -47,25 +47,49 @@ const QCOW2_OFLAG_COMPRESSED: u64 = 1 << 62;
 const L1_OFFSET_MASK: u64 = 0x00fffffffffffe00;
 const L2_OFFSET_MASK: u64 = 0x00fffffffffffe00;
 
+/// Result of a bitmap_set operation.
+enum BitmapSetResult {
+    /// Bit was not previously set (no overlap).
+    NewBit,
+    /// Bit was already set — overlap detected.
+    AlreadySet,
+    /// Cluster index exceeds bitmap capacity; overlap status unknown.
+    BeyondCapacity,
+}
+
 /// Set a bit in the overlap-detection bitmap.
 ///
 /// The bitmap lives in scratch memory and tracks which host clusters
 /// have been referenced. Each bit corresponds to one host cluster.
 ///
-/// Returns `true` if the bit was already set (overlap detected).
-unsafe fn bitmap_set(bitmap: *mut u8, bitmap_size: usize, cluster_idx: u64) -> bool {
+/// Returns a `BitmapSetResult` distinguishing between "newly set",
+/// "already set (overlap)", and "beyond bitmap capacity".
+///
+/// Safety: callers gate on `can_track` before calling, so
+/// `BeyondCapacity` should never be reached in practice. It exists
+/// as a defensive measure to prevent silent false-negatives if
+/// the call-site guards are ever changed.
+unsafe fn bitmap_set(bitmap: *mut u8, bitmap_size: usize, cluster_idx: u64) -> BitmapSetResult {
     let byte_idx = (cluster_idx / 8) as usize;
     let bit_mask = 1u8 << (cluster_idx % 8) as u8;
     if byte_idx >= bitmap_size {
-        return false; // Beyond bitmap capacity
+        return BitmapSetResult::BeyondCapacity;
     }
     let byte_ptr = bitmap.add(byte_idx);
     let was_set = (*byte_ptr & bit_mask) != 0;
     *byte_ptr |= bit_mask;
-    was_set
+    if was_set {
+        BitmapSetResult::AlreadySet
+    } else {
+        BitmapSetResult::NewBit
+    }
 }
 
 /// Test whether a bit is set in the overlap-detection bitmap.
+///
+/// Returns `false` for indices beyond bitmap capacity. This is safe
+/// because callers only invoke this when `can_track` is true, which
+/// guarantees all valid cluster indices fit within the bitmap.
 unsafe fn bitmap_test(bitmap: *const u8, bitmap_size: usize, cluster_idx: u64) -> bool {
     let byte_idx = (cluster_idx / 8) as usize;
     let bit_mask = 1u8 << (cluster_idx % 8) as u8;
@@ -985,7 +1009,10 @@ unsafe fn check_qcow2(
             // Overlap check for L2 table cluster
             if can_track {
                 let l2_cidx = l2_offset / cluster_size;
-                if bitmap_set(bitmap, bitmap_size, l2_cidx) {
+                if matches!(
+                    bitmap_set(bitmap, bitmap_size, l2_cidx),
+                    BitmapSetResult::AlreadySet
+                ) {
                     result.corruptions += 1;
                     result.total_errors += 1;
                     (call_table.debug_print)(b"check: L2 table cluster overlap\n\0".as_ptr());
@@ -1114,7 +1141,10 @@ unsafe fn check_qcow2(
                         // Overlap detection
                         if can_track {
                             let cidx = data_off / cluster_size;
-                            if bitmap_set(bitmap, bitmap_size, cidx) {
+                            if matches!(
+                                bitmap_set(bitmap, bitmap_size, cidx),
+                                BitmapSetResult::AlreadySet
+                            ) {
                                 result.corruptions += 1;
                                 result.total_errors += 1;
                                 (call_table.debug_print)(b"check: overlap\n\0".as_ptr());
