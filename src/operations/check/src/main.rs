@@ -894,13 +894,14 @@ unsafe fn check_qcow2(
     }
 
     // ---- Initialize overlap-detection bitmap ----
-    let bitmap_size = SCRATCH_MEM_SIZE;
     let bitmap = SCRATCH_MEM_BASE as *mut u8;
-    // Zero the bitmap
+    let total_host_clusters = (actual_size + cluster_size - 1) / cluster_size;
+    let needed_bytes = ((total_host_clusters + 7) / 8) as usize;
+    let bitmap_size = core::cmp::min(needed_bytes, SCRATCH_MEM_SIZE);
+    // Only zero the bytes actually needed for this image's clusters
     core::ptr::write_bytes(bitmap, 0, bitmap_size);
 
     let max_trackable = (bitmap_size as u64) * 8;
-    let total_host_clusters = (actual_size + cluster_size - 1) / cluster_size;
     let can_track = total_host_clusters <= max_trackable;
 
     (call_table.verbose_print)(b"check: bitmap initialized\n\0".as_ptr());
