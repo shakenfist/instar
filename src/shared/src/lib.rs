@@ -30,6 +30,41 @@ pub const CHAIN_CONFIG_MAX_SIZE: usize = 1024;
 /// Address where operation binaries are loaded
 pub const OPERATION_LOAD_ADDR: usize = 0x00020000;
 
+/// DMA pool base address (must match core/virtio.rs and vmm/main.rs).
+/// Used for virtio request headers, data buffers, and status bytes.
+pub const DMA_POOL_BASE: usize = 0x00200000;
+
+/// DMA pool upper bound: header (16) + max sector (65536) + status (1), rounded up to 64KB.
+pub const DMA_POOL_END: usize = DMA_POOL_BASE + 0x10000;
+
+/// Stack base address (must match STACK_BASE in vmm/src/main.rs).
+/// Duplicated here so compile-time asserts can validate the memory map.
+pub const STACK_BASE: usize = 0x01000000; // 16 MiB
+
+/// Scratch memory base address for operation use (after DMA pool).
+/// Operations can use this region for temporary bitmaps and buffers.
+pub const SCRATCH_MEM_BASE: usize = 0x00300000;
+
+// Compile-time check: scratch memory must not overlap with the DMA pool.
+const _: () = assert!(
+    SCRATCH_MEM_BASE >= DMA_POOL_END,
+    "SCRATCH_MEM_BASE overlaps with DMA pool"
+);
+
+/// Scratch memory end address.
+/// Must stay below STACK_BASE with a guard gap so that an off-by-one or
+/// small overrun cannot corrupt active stack frames.
+pub const SCRATCH_MEM_END: usize = 0x00FF0000;
+
+// Compile-time check: scratch region must end at least 64 KiB below the stack.
+const _: () = assert!(
+    SCRATCH_MEM_END + 0x10000 <= STACK_BASE,
+    "SCRATCH_MEM_END is too close to STACK_BASE (need >= 64 KiB guard gap)"
+);
+
+/// Scratch memory size in bytes (~12.9 MiB)
+pub const SCRATCH_MEM_SIZE: usize = SCRATCH_MEM_END - SCRATCH_MEM_BASE;
+
 /// Maximum sector size supported
 pub const MAX_SECTOR_SIZE: usize = 65536;
 

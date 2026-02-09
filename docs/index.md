@@ -15,8 +15,9 @@ adult stage of insect metamorphosis) - reflecting both the image handling
 and transformation aspects of the tool.
 
 The primary goal of `imago` is to be a safe drop in replacement for qemu-img.
-The current focus is on the `qemu-img info` sub-command, as the most painful
-part in terms of observed security exploits, but that will expand over time.
+The current focus is on `qemu-img info` and `qemu-img check` sub-commands, as
+the most painful parts in terms of observed security exploits, but that will
+expand over time.
 We therefore have a test suite of images that we run against both tools,
 and any difference in output is considered a bug to be fixed -- if you
 observe such a difference please report it as a GitHub issue at
