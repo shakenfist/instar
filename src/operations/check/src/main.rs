@@ -1317,6 +1317,7 @@ unsafe fn check_qcow2(
                 let refblock_base_sector = refblock_off / sector_size as u64;
                 let sectors_per_block = ((cluster_size as usize) + sector_size - 1) / sector_size;
                 let mut entries_remaining = entries_per_block;
+                let entries_per_sector = (sector_size as u64 * 8) / refcount_bits as u64;
 
                 for s in 0..sectors_per_block {
                     let sec = refblock_base_sector + s as u64;
@@ -1333,16 +1334,17 @@ unsafe fn check_qcow2(
                     }
                     bytes_read += sector_size as u64;
 
-                    let entries_this = core::cmp::min(entries_remaining, (sector_size / 2) as u64);
+                    let entries_this = core::cmp::min(entries_remaining, entries_per_sector);
 
+                    let entry_bytes = (refcount_bits / 8) as usize;
                     for e in 0..entries_this as usize {
-                        let off = e * 2;
+                        let off = e * entry_bytes;
                         let rc =
                             u16::from_be_bytes([leak_scan_buffer[off], leak_scan_buffer[off + 1]]);
 
                         if rc > 0 {
                             let cidx = match rt_idx.checked_mul(entries_per_block).and_then(|v| {
-                                v.checked_add((s as u64) * ((sector_size / 2) as u64) + e as u64)
+                                v.checked_add((s as u64) * entries_per_sector + e as u64)
                             }) {
                                 Some(v) => v,
                                 None => continue,
