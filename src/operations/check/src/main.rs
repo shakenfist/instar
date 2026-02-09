@@ -4,21 +4,19 @@
 //! similar to `qemu-img check`. For QCOW2 images, it verifies:
 //! - Header validity (version, cluster_bits, virtual_size)
 //! - L1 table entries (offset bounds, alignment)
-//! - L2 table entries (partial validation - first sector only)
-//! - Basic refcount table offset validation
+//! - L2 table entries (full validation across all sectors)
+//! - Overlap detection (two L2 entries referencing same host cluster)
+//! - Refcount validation (referenced clusters must have refcount > 0)
+//! - Leak detection (clusters with refcount > 0 but no reference)
+//! - Refcount table and block structure validation
+//! - Dirty/corrupt incompatible feature flags (v3 only)
 //!
-//! ## Current Limitations
+//! Refcount validation currently supports 16-bit refcounts (the standard
+//! QCOW2 default). Images with other refcount widths skip refcount and
+//! leak validation.
 //!
-//! **L2 table validation is partial**: Only the first sector of each L2 table
-//! is validated. For a 64KB cluster size, this covers ~12.5% of entries. The
-//! fragmentation calculation is also based on this partial sample.
-//!
-//! **Refcount validation is not implemented**: The refcount table offset is
-//! validated, but individual refcount entries are not read or verified. This
-//! means `refcount_errors` and `leaks` in CheckResult will always be 0.
-//! Users comparing against `qemu-img check` output may notice this discrepancy.
-//!
-//! Results are sent via protobuf CheckResultMessage over the serial command channel.
+//! Results are sent via protobuf CheckResultMessage over the serial
+//! command channel.
 
 #![no_std]
 #![no_main]
@@ -28,6 +26,7 @@ use core::panic::PanicInfo;
 use shared::{
     format_detection::{detect_format_from_header, detect_vhd_footer, QCOW2_MAGIC, VHD_COOKIE},
     CallTable, CheckConfig, CheckResult, ImageFormat, CALL_TABLE_ADDR, MAX_SECTOR_SIZE,
+    SCRATCH_MEM_BASE, SCRATCH_MEM_SIZE,
 };
 
 // QCOW2 header offsets (big-endian)
@@ -45,13 +44,204 @@ const QCOW2_REFCOUNT_ORDER_OFFSET: usize = 96;
 const QCOW2_INCOMPAT_DIRTY: u64 = 1 << 0;
 const QCOW2_INCOMPAT_CORRUPT: u64 = 1 << 1;
 
-// L1/L2 table entry flags
-const QCOW2_OFLAG_COPIED: u64 = 1 << 63;
+// L2 table entry flags
 const QCOW2_OFLAG_COMPRESSED: u64 = 1 << 62;
 
 // Mask for extracting offset from L1/L2 entries (bits 9-55)
 const L1_OFFSET_MASK: u64 = 0x00fffffffffffe00;
 const L2_OFFSET_MASK: u64 = 0x00fffffffffffe00;
+
+/// Result of a bitmap_set operation.
+enum BitmapSetResult {
+    /// Bit was not previously set (no overlap).
+    NewBit,
+    /// Bit was already set — overlap detected.
+    AlreadySet,
+    /// Cluster index exceeds bitmap capacity; overlap status unknown.
+    BeyondCapacity,
+}
+
+/// Set a bit in the overlap-detection bitmap.
+///
+/// The bitmap lives in scratch memory and tracks which host clusters
+/// have been referenced. Each bit corresponds to one host cluster.
+///
+/// Returns a `BitmapSetResult` distinguishing between "newly set",
+/// "already set (overlap)", and "beyond bitmap capacity".
+///
+/// Safety: callers gate on `can_track` before calling, so
+/// `BeyondCapacity` should never be reached in practice. It exists
+/// as a defensive measure to prevent silent false-negatives if
+/// the call-site guards are ever changed.
+unsafe fn bitmap_set(bitmap: *mut u8, bitmap_size: usize, cluster_idx: u64) -> BitmapSetResult {
+    let byte_idx = (cluster_idx / 8) as usize;
+    let bit_mask = 1u8 << (cluster_idx % 8) as u8;
+    if byte_idx >= bitmap_size {
+        return BitmapSetResult::BeyondCapacity;
+    }
+    let byte_ptr = bitmap.add(byte_idx);
+    let was_set = (*byte_ptr & bit_mask) != 0;
+    *byte_ptr |= bit_mask;
+    if was_set {
+        BitmapSetResult::AlreadySet
+    } else {
+        BitmapSetResult::NewBit
+    }
+}
+
+/// Test whether a bit is set in the overlap-detection bitmap.
+///
+/// Returns `false` for indices beyond bitmap capacity. This is safe
+/// because callers only invoke this when `can_track` is true, which
+/// guarantees all valid cluster indices fit within the bitmap.
+unsafe fn bitmap_test(bitmap: *const u8, bitmap_size: usize, cluster_idx: u64) -> bool {
+    let byte_idx = (cluster_idx / 8) as usize;
+    let bit_mask = 1u8 << (cluster_idx % 8) as u8;
+    if byte_idx >= bitmap_size {
+        return false;
+    }
+    (*bitmap.add(byte_idx) & bit_mask) != 0
+}
+
+/// Read a big-endian u64 from a specific byte offset within the
+/// image, using a sector-level cache to minimize I/O.
+///
+/// `cached_sector` / `cached_buffer` provide a one-sector cache.
+/// Set `cached_sector` to `u64::MAX` to invalidate the cache.
+unsafe fn read_u64_be_cached(
+    call_table: &CallTable,
+    byte_offset: u64,
+    sector_size: usize,
+    input_capacity: u64,
+    cached_sector: &mut u64,
+    cached_buffer: &mut [u8; MAX_SECTOR_SIZE],
+    bytes_read: &mut u64,
+) -> Option<u64> {
+    let sector = byte_offset / sector_size as u64;
+    let off = (byte_offset % sector_size as u64) as usize;
+    if off + 8 > sector_size {
+        return None; // Entry spans sector boundary
+    }
+    if sector >= input_capacity {
+        return None;
+    }
+    if *cached_sector != sector {
+        if !(call_table.read_input_sector)(0, sector, cached_buffer.as_mut_ptr(), sector_size) {
+            return None;
+        }
+        *bytes_read += sector_size as u64;
+        *cached_sector = sector;
+    }
+    Some(u64::from_be_bytes([
+        cached_buffer[off],
+        cached_buffer[off + 1],
+        cached_buffer[off + 2],
+        cached_buffer[off + 3],
+        cached_buffer[off + 4],
+        cached_buffer[off + 5],
+        cached_buffer[off + 6],
+        cached_buffer[off + 7],
+    ]))
+}
+
+/// Read a 16-bit big-endian refcount entry from a specific byte
+/// offset, using a sector-level cache.
+unsafe fn read_u16_be_cached(
+    call_table: &CallTable,
+    byte_offset: u64,
+    sector_size: usize,
+    input_capacity: u64,
+    cached_sector: &mut u64,
+    cached_buffer: &mut [u8; MAX_SECTOR_SIZE],
+    bytes_read: &mut u64,
+) -> Option<u16> {
+    let sector = byte_offset / sector_size as u64;
+    let off = (byte_offset % sector_size as u64) as usize;
+    if off + 2 > sector_size {
+        return None;
+    }
+    if sector >= input_capacity {
+        return None;
+    }
+    if *cached_sector != sector {
+        if !(call_table.read_input_sector)(0, sector, cached_buffer.as_mut_ptr(), sector_size) {
+            return None;
+        }
+        *bytes_read += sector_size as u64;
+        *cached_sector = sector;
+    }
+    Some(u16::from_be_bytes([
+        cached_buffer[off],
+        cached_buffer[off + 1],
+    ]))
+}
+
+/// Look up the refcount for a host cluster.
+///
+/// Returns `Some(refcount)` on success, `None` on I/O error.
+/// A refcount of 0 means the cluster is not allocated.
+unsafe fn lookup_refcount(
+    call_table: &CallTable,
+    refcount_table_offset: u64,
+    refcount_bits: u32,
+    cluster_size: u64,
+    sector_size: usize,
+    input_capacity: u64,
+    host_offset: u64,
+    reftable_cached_sector: &mut u64,
+    reftable_cached_buffer: &mut [u8; MAX_SECTOR_SIZE],
+    refblock_cached_sector: &mut u64,
+    refblock_cached_buffer: &mut [u8; MAX_SECTOR_SIZE],
+    bytes_read: &mut u64,
+) -> Option<u64> {
+    let cluster_index = host_offset / cluster_size;
+    let entries_per_block = (cluster_size * 8) / refcount_bits as u64;
+    let refblock_index = cluster_index / entries_per_block;
+
+    // Read refcount table entry (big-endian u64 pointer to
+    // refcount block)
+    let reftable_byte_off = refblock_index
+        .checked_mul(8)
+        .and_then(|v| refcount_table_offset.checked_add(v))?;
+    let refblock_offset = read_u64_be_cached(
+        call_table,
+        reftable_byte_off,
+        sector_size,
+        input_capacity,
+        reftable_cached_sector,
+        reftable_cached_buffer,
+        bytes_read,
+    )?;
+
+    if refblock_offset == 0 {
+        return Some(0); // Block not allocated = refcount 0
+    }
+
+    // Read the individual refcount entry from the block
+    let entry_in_block = cluster_index % entries_per_block;
+    // Currently only 16-bit refcounts are supported (the
+    // overwhelmingly common case). Other widths are treated as
+    // I/O errors to avoid silent misinterpretation.
+    if refcount_bits == 16 {
+        let entry_byte_off = entry_in_block
+            .checked_mul(2)
+            .and_then(|v| refblock_offset.checked_add(v))?;
+        let rc = read_u16_be_cached(
+            call_table,
+            entry_byte_off,
+            sector_size,
+            input_capacity,
+            refblock_cached_sector,
+            refblock_cached_buffer,
+            bytes_read,
+        )?;
+        Some(rc as u64)
+    } else {
+        // Unsupported refcount width - skip validation rather
+        // than risk misreading entries
+        None
+    }
+}
 
 /// Entry point called by core after devices are initialized.
 ///
@@ -219,8 +409,17 @@ pub unsafe extern "C" fn _start() -> u64 {
         }
     }
 
-    // Set VALID flag if no errors
-    if result.total_errors == 0 && result.corruptions == 0 {
+    // Set VALID flag if no corruptions or refcount errors.
+    // Leaks (unreferenced allocated clusters) intentionally do NOT prevent
+    // FLAG_VALID from being set: the image data is intact and usable, leaks
+    // just waste space and are fixable with `qemu-img check -r leaks`.
+    // This matches qemu-img behavior where leaks produce exit code 3
+    // (check found leaks) rather than exit code 2 (check found errors).
+    //
+    // Note: leaks still increment total_errors, so the VMM will still
+    // report a non-zero exit code for leak-only images via check_passed
+    // (which requires both FLAG_VALID and total_errors == 0).
+    if result.corruptions == 0 && result.refcount_errors == 0 {
         result.flags |= CheckResult::FLAG_VALID;
     }
 
@@ -494,18 +693,11 @@ fn check_vhd_footer(footer: &[u8], result: &mut CheckResult) {
 /// Validates:
 /// - Header magic, version, and cluster_bits range
 /// - L1 table entries (offset bounds and cluster alignment)
-/// - L2 table entries (first sector only - partial validation)
-/// - Refcount table offset (entries not validated)
+/// - L2 table entries (full validation, all sectors)
+/// - Overlap detection (duplicate host cluster references)
+/// - Refcount validation (referenced clusters have refcount > 0)
+/// - Leak detection (refcount > 0 but no reference)
 /// - Dirty/corrupt incompatible feature flags (v3 only)
-///
-/// ## Limitations
-///
-/// L2 table validation only reads the first sector of each L2 table, which
-/// covers approximately 12.5% of entries for 64KB clusters. Fragmentation
-/// metrics are based on this partial sample.
-///
-/// Refcount entries are not validated - only the refcount table offset is
-/// checked. The `refcount_errors` and `leaks` fields will always be 0.
 unsafe fn check_qcow2(
     header: &[u8],
     result: &mut CheckResult,
@@ -549,7 +741,7 @@ unsafe fn check_qcow2(
     let cluster_size = 1u64 << cluster_bits;
 
     // Virtual size
-    let virtual_size = u64::from_be_bytes([
+    let _virtual_size = u64::from_be_bytes([
         header[QCOW2_SIZE_OFFSET],
         header[QCOW2_SIZE_OFFSET + 1],
         header[QCOW2_SIZE_OFFSET + 2],
@@ -559,6 +751,34 @@ unsafe fn check_qcow2(
         header[QCOW2_SIZE_OFFSET + 6],
         header[QCOW2_SIZE_OFFSET + 7],
     ]);
+
+    // Refcount bits: v2 always 16-bit, v3 reads refcount_order
+    let refcount_bits: u32 = if version >= 3 {
+        let refcount_order = u32::from_be_bytes([
+            header[QCOW2_REFCOUNT_ORDER_OFFSET],
+            header[QCOW2_REFCOUNT_ORDER_OFFSET + 1],
+            header[QCOW2_REFCOUNT_ORDER_OFFSET + 2],
+            header[QCOW2_REFCOUNT_ORDER_OFFSET + 3],
+        ]);
+        if refcount_order > 6 {
+            // refcount_order > 6 means refcount_bits > 64 which
+            // is invalid
+            result.corruptions += 1;
+            result.total_errors += 1;
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+            (call_table.debug_print)(b"check: invalid refcount_order\n\0".as_ptr());
+            return bytes_read;
+        }
+        1u32 << refcount_order
+    } else {
+        16 // v2 always uses 16-bit refcounts
+    };
+
+    if refcount_bits != 16 {
+        (call_table.debug_print)(
+            b"check: refcount_bits != 16, skipping refcount/leak validation\n\0".as_ptr(),
+        );
+    }
 
     // L1 table info
     let l1_size = u32::from_be_bytes([
@@ -578,9 +798,7 @@ unsafe fn check_qcow2(
         header[QCOW2_L1_TABLE_OFFSET_OFFSET + 7],
     ]);
 
-    // Validate l1_size to prevent DoS from crafted images with enormous values.
-    // The L1 table must fit within the file: l1_size * 8 bytes <= actual_size.
-    // Also apply a reasonable maximum (16M entries covers 8EB with 2MB clusters).
+    // Validate l1_size
     const MAX_L1_ENTRIES: u32 = 16 * 1024 * 1024;
     let l1_table_size_bytes = (l1_size as u64).saturating_mul(8);
     if l1_size > MAX_L1_ENTRIES || l1_table_size_bytes > actual_size {
@@ -653,15 +871,15 @@ unsafe fn check_qcow2(
     }
 
     // Calculate L2 entries per cluster
-    let l2_entries_per_cluster = cluster_size / 8; // Each L2 entry is 8 bytes
+    let l2_entries_per_cluster = cluster_size / 8;
 
-    // Calculate total clusters in image
-    let total_clusters = (actual_size + cluster_size - 1) / cluster_size;
+    // Number of sectors needed to read one full L2 table
+    let sectors_per_l2 = ((cluster_size as usize) + sector_size - 1) / sector_size;
+
     result.clusters_checked = 0;
     result.clusters_allocated = 0;
 
     // Track image end offset (highest offset used)
-    // Use checked arithmetic to handle potential overflow from corrupted images
     let mut max_offset: u64 = match l1_table_offset.checked_add((l1_size as u64).saturating_mul(8))
     {
         Some(v) => v,
@@ -669,34 +887,69 @@ unsafe fn check_qcow2(
             result.corruptions += 1;
             result.total_errors += 1;
             result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
-            (call_table.debug_print)(b"check: L1 table end offset overflow\n\0".as_ptr());
+            (call_table.debug_print)(b"check: L1 table end overflow\n\0".as_ptr());
             return bytes_read;
         }
     };
 
     // Update max_offset with refcount table
     let refcount_table_size = (refcount_table_clusters as u64).saturating_mul(cluster_size);
-    if let Some(refcount_table_end) = refcount_table_offset.checked_add(refcount_table_size) {
-        if refcount_table_end > max_offset {
-            max_offset = refcount_table_end;
+    if let Some(rte) = refcount_table_offset.checked_add(refcount_table_size) {
+        if rte > max_offset {
+            max_offset = rte;
         }
     } else {
         result.corruptions += 1;
         result.total_errors += 1;
         result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
-        (call_table.debug_print)(b"check: refcount table end offset overflow\n\0".as_ptr());
+        (call_table.debug_print)(b"check: refcount table end overflow\n\0".as_ptr());
         return bytes_read;
     }
 
-    // Buffer for L1/L2 table entries
+    // ---- Initialize overlap-detection bitmap ----
+    let bitmap = SCRATCH_MEM_BASE as *mut u8;
+    let total_host_clusters = (actual_size + cluster_size - 1) / cluster_size;
+    let needed_bytes = ((total_host_clusters + 7) / 8) as usize;
+    let bitmap_size = core::cmp::min(needed_bytes, SCRATCH_MEM_SIZE);
+    // Only zero the bytes actually needed for this image's clusters
+    core::ptr::write_bytes(bitmap, 0, bitmap_size);
+
+    let max_trackable = (bitmap_size as u64) * 8;
+    let can_track = total_host_clusters <= max_trackable;
+
+    (call_table.verbose_print)(b"check: bitmap initialized\n\0".as_ptr());
+
+    // ---- Mark metadata clusters in bitmap ----
+    // Header cluster (cluster 0)
+    if can_track {
+        bitmap_set(bitmap, bitmap_size, 0);
+    }
+    // L1 table clusters
+    if can_track {
+        let l1_start_cluster = l1_table_offset / cluster_size;
+        let l1_clusters = (l1_table_size_bytes + cluster_size - 1) / cluster_size;
+        for c in 0..l1_clusters {
+            bitmap_set(bitmap, bitmap_size, l1_start_cluster + c);
+        }
+    }
+    // Refcount table clusters
+    if can_track {
+        let rt_start_cluster = refcount_table_offset / cluster_size;
+        for c in 0..(refcount_table_clusters as u64) {
+            bitmap_set(bitmap, bitmap_size, rt_start_cluster + c);
+        }
+    }
+
+    // ---- Refcount cache buffers ----
+    let mut reftable_cached_sector: u64 = u64::MAX;
+    let mut reftable_cached_buffer = [0u8; MAX_SECTOR_SIZE];
+    let mut refblock_cached_sector: u64 = u64::MAX;
+    let mut refblock_cached_buffer = [0u8; MAX_SECTOR_SIZE];
+
+    // Buffer for L1 table entries
     let mut table_buffer = [0u8; MAX_SECTOR_SIZE];
 
-    // Read and validate L1 table entries
-    let mut l1_entries_checked: u32 = 0;
-    let mut allocated_l2_tables: u32 = 0;
-    let entries_per_sector = sector_size / 8;
-
-    // Track fragmentation: count non-sequential allocations
+    // Track fragmentation
     let mut last_data_offset: u64 = 0;
     let mut fragmented_entries: u64 = 0;
     let mut total_data_entries: u64 = 0;
@@ -704,15 +957,12 @@ unsafe fn check_qcow2(
     // Iterate through L1 table
     let mut l1_offset = l1_table_offset;
     let mut remaining_l1_entries = l1_size;
-
-    // input_capacity is the number of sectors in the input
     let input_capacity = actual_size / sector_size as u64;
 
     while remaining_l1_entries > 0 {
         let l1_sector = l1_offset / sector_size as u64;
         let offset_in_sector = (l1_offset % sector_size as u64) as usize;
 
-        // Validate sector is within file bounds before reading
         if l1_sector >= input_capacity {
             result.corruptions += 1;
             result.total_errors += 1;
@@ -729,39 +979,33 @@ unsafe fn check_qcow2(
         }
         bytes_read += sector_size as u64;
 
-        // Process L1 entries in this sector
         let entries_in_sector = core::cmp::min(
             remaining_l1_entries,
             ((sector_size - offset_in_sector) / 8) as u32,
         );
 
         for i in 0..entries_in_sector {
-            let entry_offset = offset_in_sector + (i as usize * 8);
+            let eo = offset_in_sector + (i as usize * 8);
             let l1_entry = u64::from_be_bytes([
-                table_buffer[entry_offset],
-                table_buffer[entry_offset + 1],
-                table_buffer[entry_offset + 2],
-                table_buffer[entry_offset + 3],
-                table_buffer[entry_offset + 4],
-                table_buffer[entry_offset + 5],
-                table_buffer[entry_offset + 6],
-                table_buffer[entry_offset + 7],
+                table_buffer[eo],
+                table_buffer[eo + 1],
+                table_buffer[eo + 2],
+                table_buffer[eo + 3],
+                table_buffer[eo + 4],
+                table_buffer[eo + 5],
+                table_buffer[eo + 6],
+                table_buffer[eo + 7],
             ]);
 
-            l1_entries_checked += 1;
             result.clusters_checked += 1;
 
-            // Skip zero entries (unallocated)
             if l1_entry == 0 {
                 continue;
             }
 
-            // Extract L2 table offset
             let l2_offset = l1_entry & L1_OFFSET_MASK;
 
-            // Validate L2 table offset
             if l2_offset == 0 {
-                // Zero offset with non-zero entry is invalid
                 result.corruptions += 1;
                 result.total_errors += 1;
                 continue;
@@ -774,132 +1018,354 @@ unsafe fn check_qcow2(
                 continue;
             }
 
-            // Check alignment
             if l2_offset % cluster_size != 0 {
                 result.corruptions += 1;
                 result.total_errors += 1;
                 continue;
             }
 
-            allocated_l2_tables += 1;
             result.clusters_allocated += 1;
 
-            // Update max offset (checked arithmetic for defense-in-depth)
-            if let Some(l2_table_end) = l2_offset.checked_add(cluster_size) {
-                if l2_table_end > max_offset {
-                    max_offset = l2_table_end;
+            // Overlap check for L2 table cluster
+            if can_track {
+                let l2_cidx = l2_offset / cluster_size;
+                if matches!(
+                    bitmap_set(bitmap, bitmap_size, l2_cidx),
+                    BitmapSetResult::AlreadySet
+                ) {
+                    result.corruptions += 1;
+                    result.total_errors += 1;
+                    (call_table.debug_print)(b"check: L2 table cluster overlap\n\0".as_ptr());
+                }
+            }
+
+            // Refcount check for L2 table cluster
+            if let Some(rc) = lookup_refcount(
+                call_table,
+                refcount_table_offset,
+                refcount_bits,
+                cluster_size,
+                sector_size,
+                input_capacity,
+                l2_offset,
+                &mut reftable_cached_sector,
+                &mut reftable_cached_buffer,
+                &mut refblock_cached_sector,
+                &mut refblock_cached_buffer,
+                &mut bytes_read,
+            ) {
+                if rc == 0 {
+                    result.refcount_errors += 1;
+                    result.total_errors += 1;
+                }
+                // Mark refcount block cluster in bitmap too
+                let entries_per_block = (cluster_size * 8) / refcount_bits as u64;
+                let rb_idx = (l2_offset / cluster_size) / entries_per_block;
+                let rb_byte_off = refcount_table_offset + rb_idx * 8;
+                if let Some(rb_off) = read_u64_be_cached(
+                    call_table,
+                    rb_byte_off,
+                    sector_size,
+                    input_capacity,
+                    &mut reftable_cached_sector,
+                    &mut reftable_cached_buffer,
+                    &mut bytes_read,
+                ) {
+                    if rb_off != 0 && can_track {
+                        bitmap_set(bitmap, bitmap_size, rb_off / cluster_size);
+                    }
+                }
+            }
+
+            // Update max offset
+            if let Some(l2e) = l2_offset.checked_add(cluster_size) {
+                if l2e > max_offset {
+                    max_offset = l2e;
                 }
             } else {
                 result.corruptions += 1;
                 result.total_errors += 1;
-                (call_table.debug_print)(b"check: L2 table end offset overflow\n\0".as_ptr());
                 continue;
             }
 
-            // Sample L2 table validation (read first sector of L2 table)
-            // For full validation, we would read the entire L2 table
-            let l2_sector = l2_offset / sector_size as u64;
+            // ---- Full L2 table validation ----
+            let l2_base_sector = l2_offset / sector_size as u64;
             let mut l2_buffer = [0u8; MAX_SECTOR_SIZE];
+            let mut l2_entries_remaining = l2_entries_per_cluster;
 
-            // Validate sector is within file bounds before reading
-            if l2_sector >= input_capacity {
-                result.corruptions += 1;
-                result.total_errors += 1;
-                (call_table.debug_print)(b"check: L2 sector out of bounds\n\0".as_ptr());
-                continue;
-            }
+            for s in 0..sectors_per_l2 {
+                let l2_sector = l2_base_sector + s as u64;
+                if l2_sector >= input_capacity {
+                    result.corruptions += 1;
+                    result.total_errors += 1;
+                    (call_table.debug_print)(b"check: L2 sector OOB\n\0".as_ptr());
+                    break;
+                }
 
-            if (call_table.read_input_sector)(0, l2_sector, l2_buffer.as_mut_ptr(), sector_size) {
+                if !(call_table.read_input_sector)(
+                    0,
+                    l2_sector,
+                    l2_buffer.as_mut_ptr(),
+                    sector_size,
+                ) {
+                    result.corruptions += 1;
+                    result.total_errors += 1;
+                    break;
+                }
                 bytes_read += sector_size as u64;
 
-                // Check L2 entries in this sector
-                let l2_entries_to_check =
-                    core::cmp::min(l2_entries_per_cluster as usize, sector_size / 8);
+                let entries_this_sector =
+                    core::cmp::min(l2_entries_remaining, (sector_size / 8) as u64);
 
-                for j in 0..l2_entries_to_check {
-                    let l2_entry_offset = j * 8;
-                    let l2_entry = u64::from_be_bytes([
-                        l2_buffer[l2_entry_offset],
-                        l2_buffer[l2_entry_offset + 1],
-                        l2_buffer[l2_entry_offset + 2],
-                        l2_buffer[l2_entry_offset + 3],
-                        l2_buffer[l2_entry_offset + 4],
-                        l2_buffer[l2_entry_offset + 5],
-                        l2_buffer[l2_entry_offset + 6],
-                        l2_buffer[l2_entry_offset + 7],
+                for j in 0..entries_this_sector as usize {
+                    let off = j * 8;
+                    let l2e = u64::from_be_bytes([
+                        l2_buffer[off],
+                        l2_buffer[off + 1],
+                        l2_buffer[off + 2],
+                        l2_buffer[off + 3],
+                        l2_buffer[off + 4],
+                        l2_buffer[off + 5],
+                        l2_buffer[off + 6],
+                        l2_buffer[off + 7],
                     ]);
 
                     result.clusters_checked += 1;
 
-                    // Skip unallocated entries
-                    if l2_entry == 0 {
+                    if l2e == 0 {
                         continue;
                     }
 
-                    // Check for compressed entry
-                    let is_compressed = (l2_entry & QCOW2_OFLAG_COMPRESSED) != 0;
+                    let compressed = (l2e & QCOW2_OFLAG_COMPRESSED) != 0;
 
-                    if !is_compressed {
-                        // Standard cluster: extract data offset
-                        let data_offset = l2_entry & L2_OFFSET_MASK;
+                    if !compressed {
+                        let data_off = l2e & L2_OFFSET_MASK;
+                        if data_off == 0 {
+                            continue;
+                        }
 
-                        if data_offset != 0 {
-                            // Validate data cluster offset
-                            if data_offset >= actual_size {
+                        if data_off >= actual_size {
+                            result.corruptions += 1;
+                            result.total_errors += 1;
+                            continue;
+                        }
+
+                        if data_off % cluster_size != 0 {
+                            result.corruptions += 1;
+                            result.total_errors += 1;
+                            continue;
+                        }
+
+                        result.clusters_allocated += 1;
+
+                        // Overlap detection
+                        if can_track {
+                            let cidx = data_off / cluster_size;
+                            if matches!(
+                                bitmap_set(bitmap, bitmap_size, cidx),
+                                BitmapSetResult::AlreadySet
+                            ) {
                                 result.corruptions += 1;
                                 result.total_errors += 1;
-                                continue;
-                            }
-
-                            // Check alignment
-                            if data_offset % cluster_size != 0 {
-                                result.corruptions += 1;
-                                result.total_errors += 1;
-                                continue;
-                            }
-
-                            result.clusters_allocated += 1;
-
-                            // Track fragmentation (use saturating_add to avoid overflow)
-                            total_data_entries += 1;
-                            if last_data_offset != 0 {
-                                if let Some(expected_next) =
-                                    last_data_offset.checked_add(cluster_size)
-                                {
-                                    if data_offset != expected_next {
-                                        fragmented_entries += 1;
-                                    }
-                                } else {
-                                    // Overflow means definitely not sequential
-                                    fragmented_entries += 1;
-                                }
-                            }
-                            last_data_offset = data_offset;
-
-                            // Update max offset (checked arithmetic for defense-in-depth)
-                            if let Some(data_end) = data_offset.checked_add(cluster_size) {
-                                if data_end > max_offset {
-                                    max_offset = data_end;
-                                }
-                            } else {
-                                result.corruptions += 1;
-                                result.total_errors += 1;
-                                (call_table.debug_print)(
-                                    b"check: data cluster end offset overflow\n\0".as_ptr(),
-                                );
-                                continue;
+                                (call_table.debug_print)(b"check: overlap\n\0".as_ptr());
                             }
                         }
+
+                        // Refcount validation
+                        if let Some(rc) = lookup_refcount(
+                            call_table,
+                            refcount_table_offset,
+                            refcount_bits,
+                            cluster_size,
+                            sector_size,
+                            input_capacity,
+                            data_off,
+                            &mut reftable_cached_sector,
+                            &mut reftable_cached_buffer,
+                            &mut refblock_cached_sector,
+                            &mut refblock_cached_buffer,
+                            &mut bytes_read,
+                        ) {
+                            if rc == 0 {
+                                result.refcount_errors += 1;
+                                result.total_errors += 1;
+                            }
+                        }
+
+                        // Fragmentation tracking
+                        total_data_entries += 1;
+                        if last_data_offset != 0 {
+                            if let Some(exp) = last_data_offset.checked_add(cluster_size) {
+                                if data_off != exp {
+                                    fragmented_entries += 1;
+                                }
+                            } else {
+                                fragmented_entries += 1;
+                            }
+                        }
+                        last_data_offset = data_off;
+
+                        // Update max offset
+                        if let Some(de) = data_off.checked_add(cluster_size) {
+                            if de > max_offset {
+                                max_offset = de;
+                            }
+                        } else {
+                            result.corruptions += 1;
+                            result.total_errors += 1;
+                        }
                     } else {
-                        // Compressed cluster - just count it
+                        // Compressed cluster
                         result.clusters_allocated += 1;
                     }
                 }
+
+                l2_entries_remaining -= entries_this_sector;
             }
         }
 
         remaining_l1_entries -= entries_in_sector;
         l1_offset += entries_in_sector as u64 * 8;
+    }
+
+    (call_table.verbose_print)(b"check: L1/L2 walk complete\n\0".as_ptr());
+
+    // ---- Leak detection: scan refcount blocks ----
+    if can_track && refcount_bits == 16 {
+        (call_table.verbose_print)(b"check: scanning refcounts for leaks\n\0".as_ptr());
+
+        let entries_per_block = (cluster_size * 8) / refcount_bits as u64;
+        const MAX_REFTABLE_ENTRIES: u64 = 16 * 1024 * 1024;
+        let reftable_entries = {
+            let raw = (refcount_table_clusters as u64).saturating_mul(cluster_size / 8);
+            let max_entries = actual_size / 8;
+            core::cmp::min(raw, max_entries)
+        };
+        if reftable_entries > MAX_REFTABLE_ENTRIES {
+            result.corruptions += 1;
+            result.total_errors += 1;
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+            (call_table.debug_print)(
+                b"check: reftable_entries exceeds bounds, skipping leak scan\n\0".as_ptr(),
+            );
+        } else {
+            let mut leak_scan_buffer = [0u8; MAX_SECTOR_SIZE];
+
+            // First pass: mark all refcount block clusters in the bitmap
+            // before scanning entries, so that refcount blocks covering
+            // other refcount blocks are not falsely reported as leaks.
+            for rt_idx in 0..reftable_entries {
+                let rt_byte_off = match rt_idx
+                    .checked_mul(8)
+                    .and_then(|v| refcount_table_offset.checked_add(v))
+                {
+                    Some(off) => off,
+                    None => break,
+                };
+                if rt_byte_off + 8 > actual_size {
+                    break;
+                }
+                let refblock_off = match read_u64_be_cached(
+                    call_table,
+                    rt_byte_off,
+                    sector_size,
+                    input_capacity,
+                    &mut reftable_cached_sector,
+                    &mut reftable_cached_buffer,
+                    &mut bytes_read,
+                ) {
+                    Some(v) => v,
+                    None => break,
+                };
+
+                if refblock_off != 0 {
+                    bitmap_set(bitmap, bitmap_size, refblock_off / cluster_size);
+                }
+            }
+
+            // Second pass: scan individual refcount entries for leaks.
+            for rt_idx in 0..reftable_entries {
+                // Read refcount table entry
+                let rt_byte_off = match rt_idx
+                    .checked_mul(8)
+                    .and_then(|v| refcount_table_offset.checked_add(v))
+                {
+                    Some(off) => off,
+                    None => break,
+                };
+                if rt_byte_off + 8 > actual_size {
+                    break;
+                }
+                let refblock_off = match read_u64_be_cached(
+                    call_table,
+                    rt_byte_off,
+                    sector_size,
+                    input_capacity,
+                    &mut reftable_cached_sector,
+                    &mut reftable_cached_buffer,
+                    &mut bytes_read,
+                ) {
+                    Some(v) => v,
+                    None => break,
+                };
+
+                if refblock_off == 0 {
+                    continue;
+                }
+
+                // Read each sector of this refcount block
+                let refblock_base_sector = refblock_off / sector_size as u64;
+                let sectors_per_block = ((cluster_size as usize) + sector_size - 1) / sector_size;
+                let mut entries_remaining = entries_per_block;
+                let entries_per_sector = (sector_size as u64 * 8) / refcount_bits as u64;
+
+                for s in 0..sectors_per_block {
+                    let sec = refblock_base_sector + s as u64;
+                    if sec >= input_capacity {
+                        break;
+                    }
+                    if !(call_table.read_input_sector)(
+                        0,
+                        sec,
+                        leak_scan_buffer.as_mut_ptr(),
+                        sector_size,
+                    ) {
+                        break;
+                    }
+                    bytes_read += sector_size as u64;
+
+                    let entries_this = core::cmp::min(entries_remaining, entries_per_sector);
+
+                    let entry_bytes = (refcount_bits / 8) as usize;
+                    for e in 0..entries_this as usize {
+                        let off = e * entry_bytes;
+                        let rc =
+                            u16::from_be_bytes([leak_scan_buffer[off], leak_scan_buffer[off + 1]]);
+
+                        if rc > 0 {
+                            let cidx = match rt_idx.checked_mul(entries_per_block).and_then(|v| {
+                                v.checked_add((s as u64) * entries_per_sector + e as u64)
+                            }) {
+                                Some(v) => v,
+                                None => continue,
+                            };
+                            if !bitmap_test(bitmap, bitmap_size, cidx) {
+                                result.leaks += 1;
+                                result.total_errors += 1;
+                            }
+                        }
+                    }
+
+                    entries_remaining -= entries_this;
+                }
+            }
+
+            (call_table.verbose_print)(b"check: leak scan complete\n\0".as_ptr());
+        } // end else (reftable_entries within bounds)
+    } else if refcount_bits != 16 {
+        (call_table.verbose_print)(
+            b"check: skipping leak scan (non-16-bit refcounts)\n\0".as_ptr(),
+        );
     }
 
     // Calculate fragmentation percentage
@@ -917,6 +1383,9 @@ unsafe fn check_qcow2(
         result.flags |= CheckResult::FLAG_HAS_LEAKS;
     }
     if result.corruptions > 0 {
+        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+    }
+    if result.refcount_errors > 0 {
         result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
     }
 

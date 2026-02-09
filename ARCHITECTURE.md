@@ -140,6 +140,7 @@ provides a modular architecture with:
 - **core/** - Guest initialization (device init, call table)
 - **operations/info/** - Format detection operation
 - **operations/copy/** - File copy operation
+- **operations/check/** - Image integrity validation operation
 - **shared/** - Shared library code between components
 
 The rust-vmm project provides crates that reduce implementation effort by 70%+:
@@ -148,6 +149,31 @@ The rust-vmm project provides crates that reduce implementation effort by 70%+:
 - `vm-memory` - Guest memory abstraction
 - `virtio-queue` - Virtqueue implementation
 - `virtio-bindings` - Virtio protocol bindings
+
+### Guest Memory Map
+
+The guest runs in 32 MiB of physical memory (`GUEST_MEM_SIZE = 0x2000000`).
+Constants are defined in `src/shared/src/lib.rs` with compile-time overlap
+checks.
+
+```
+Address         Size    Region
+──────────────  ──────  ─────────────────────────────────────────
+0x0000_1000             GDT
+0x0000_2000             Page tables
+0x0001_0000     64 KiB  core.bin (guest entry point)
+0x0002_0000    384 KiB  Operation binary (info/copy/check)
+0x0008_0000      4 KiB  Call table
+0x0008_1000      4 KiB  Operation config
+0x0008_2000      1 KiB  Chain config
+0x0010_0000      1 MiB  Virtqueue memory (16 devices × 64 KiB)
+0x0020_0000     64 KiB  DMA pool
+0x0030_0000   12.9 MiB  Scratch memory (temporary bitmaps/buffers)
+0x00FF_0000     64 KiB  ── guard gap ──
+0x0100_0000      4 MiB  Stack (grows down from STACK_TOP)
+0x0140_0000   12.0 MiB  (unused)
+0x0200_0000             End of guest memory
+```
 
 ## Format Support
 

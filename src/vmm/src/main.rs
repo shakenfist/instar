@@ -160,7 +160,7 @@ const IMAGE_FORMAT_LUKS: u32 = 11;
 
 // Stack: generous allocation for complex operations like qemu-img info
 // Place at 16MB with 4MB size to handle deep call stacks
-const STACK_BASE: u64 = 0x1000000; // 16MB
+const STACK_BASE: u64 = shared::STACK_BASE as u64;
 const STACK_SIZE: u64 = 0x400000; // 4MB
 const STACK_TOP: u64 = STACK_BASE + STACK_SIZE - 8;
 
@@ -3045,6 +3045,10 @@ fn print_check_result_json(
     filename: &str,
     unsafe_quirks: bool,
 ) {
+    // Extract flags for boolean fields
+    let is_dirty = (result.flags & CHECK_RESULT_FLAG_DIRTY) != 0;
+    let is_corrupt = (result.flags & CHECK_RESULT_FLAG_CORRUPT_BIT) != 0;
+
     println!("{{");
     println!("    \"filename\": \"{}\",", escape_json_string(filename));
     println!(
@@ -3064,7 +3068,10 @@ fn print_check_result_json(
     println!("    \"image-end-offset\": {},", result.image_end_offset);
     println!("    \"total-clusters\": {},", result.clusters_checked);
     println!("    \"allocated-clusters\": {},", result.clusters_allocated);
-    println!("    \"fragmented-clusters\": {}", result.fragmentation);
+    println!("    \"fragmented-clusters\": {},", result.fragmentation);
+    // QCOW2-specific flags (dirty bit = unclean shutdown, corrupt bit = known corruption)
+    println!("    \"dirty\": {},", is_dirty);
+    println!("    \"corrupt\": {}", is_corrupt);
     println!("}}");
 }
 

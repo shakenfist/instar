@@ -53,6 +53,24 @@ The `--chain` flag iteratively runs the sandboxed info operation on each image
 in the backing chain, validating paths against a security allowlist to prevent
 directory traversal attacks.
 
+### Image Integrity Check
+
+```bash
+# Validate image structural integrity (matches qemu-img check output)
+imago check image.qcow2
+
+# JSON output for programmatic consumption
+imago check --output json image.qcow2
+```
+
+For QCOW2 images, check validates:
+- Header integrity (version, cluster_bits, virtual_size)
+- Full L1/L2 table consistency (all sectors, not just first)
+- Overlap detection (two L2 entries referencing same host cluster)
+- Refcount validation (referenced clusters must have refcount > 0)
+- Leak detection (clusters with refcount > 0 but no L2 reference)
+- Dirty/corrupt incompatible feature flags
+
 ### Version Compatibility
 
 Different qemu-img versions produce slightly different output formats:
@@ -211,7 +229,8 @@ make clean-tests
 ```
 
 The integration tests compare `imago info` output against `qemu-img info` to
-verify drop-in replacement compatibility. Test images are in the sibling
+verify drop-in replacement compatibility, and validate `imago check` against
+deliberately corrupt test images. Test images are in the sibling
 `imago-testdata/` repository.
 
 **Running:**
@@ -230,7 +249,7 @@ imago/
 │   ├── vmm/        # Virtual machine monitor (host-side)
 │   ├── core/       # Core guest initialization
 │   ├── shared/     # Shared library code
-│   ├── operations/ # Pluggable operations (info, copy)
+│   ├── operations/ # Pluggable operations (info, copy, check)
 │   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates
 │   └── guest-protocol/ # Protocol Buffers messaging for guests
