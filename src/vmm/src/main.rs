@@ -160,7 +160,7 @@ const IMAGE_FORMAT_LUKS: u32 = 11;
 
 // Stack: generous allocation for complex operations like qemu-img info
 // Place at 16MB with 4MB size to handle deep call stacks
-const STACK_BASE: u64 = 0x1000000; // 16MB
+const STACK_BASE: u64 = shared::STACK_BASE as u64;
 const STACK_SIZE: u64 = 0x400000; // 4MB
 const STACK_TOP: u64 = STACK_BASE + STACK_SIZE - 8;
 
