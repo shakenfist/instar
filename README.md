@@ -61,6 +61,9 @@ imago check image.qcow2
 
 # JSON output for programmatic consumption
 imago check --output json image.qcow2
+
+# Validate the entire backing chain
+imago check --chain image.qcow2
 ```
 
 For QCOW2 images, check validates:
@@ -70,6 +73,20 @@ For QCOW2 images, check validates:
 - Refcount validation (referenced clusters must have refcount > 0)
 - Leak detection (clusters with refcount > 0 but no L2 reference)
 - Dirty/corrupt incompatible feature flags
+
+The `--chain` flag discovers the full backing chain (using the same chain
+discovery infrastructure as `imago info --chain`), sets up each image as a
+separate virtio-block device in the KVM guest, and validates:
+- Format consistency: each backing image's format matches what chain
+  discovery found
+- Virtual size validity: backing images must have non-zero virtual size
+- QCOW2 header validation: backing images that are QCOW2 get basic header
+  checks (magic, version, cluster_bits, L1/refcount table bounds, corrupt
+  feature flag)
+
+Chain errors are reported separately as `chain-errors` in JSON output and
+in human-readable output. Without `--chain`, check behaves identically to
+before (backward compatible).
 
 ### Version Compatibility
 
