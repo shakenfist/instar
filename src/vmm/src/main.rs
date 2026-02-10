@@ -2768,7 +2768,11 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     let mut io_events: Vec<IoEvent> = Vec::new();
 
     if let Some(ref chain) = chain {
-        // Multi-device chain mode: open each chain image as a separate device
+        // Multi-device chain mode: open each chain image as a separate device.
+        // All devices use the same sector_size: this is the virtio-block
+        // transport sector size (I/O granularity), not a format-level property.
+        // The guest reconstructs file size as capacity * sector_size, which
+        // works correctly regardless of the chosen sector_size value.
         for (i, image) in chain.images().iter().enumerate() {
             let backing = BackingStore::open(&image.path, true, None, false)?;
             let file_size = std::fs::metadata(&image.path)?.len();

@@ -632,7 +632,9 @@ mod vmm_config_support {
     ///
     /// # Arguments
     ///
-    /// * `sector_size` - Sector size for all input devices in bytes
+    /// * `sector_size` - Transport sector size for all input devices in bytes.
+    ///   This is the virtio-block I/O granularity, not a format-level property,
+    ///   so using the same value for all chain devices is correct.
     /// * `device_count` - Number of input devices (chain length)
     pub fn vmm_config_chain(sector_size: u32, device_count: usize) -> guest_::VmmConfig {
         let mut config = guest_::VmmConfig::default();
