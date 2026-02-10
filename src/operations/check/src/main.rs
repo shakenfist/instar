@@ -347,7 +347,6 @@ pub unsafe extern "C" fn _start() -> u64 {
                 // qemu-img compatible: no validation for non-QCOW2
                 (call_table.verbose_print)(b"check: vmdk not supported (quirks)\n\0".as_ptr());
                 result.flags |= CheckResult::FLAG_NOT_SUPPORTED;
-                result.flags |= CheckResult::FLAG_VALID;
             } else {
                 // Validate VMDK header
                 bytes_read += check_vmdk(&buffer, &mut result, actual_size);
@@ -358,7 +357,6 @@ pub unsafe extern "C" fn _start() -> u64 {
             if unsafe_quirks {
                 (call_table.verbose_print)(b"check: vhdx not supported (quirks)\n\0".as_ptr());
                 result.flags |= CheckResult::FLAG_NOT_SUPPORTED;
-                result.flags |= CheckResult::FLAG_VALID;
             } else {
                 // Validate VHDX structure
                 bytes_read += check_vhdx(&mut result, call_table, input_sector_size, actual_size);
@@ -369,7 +367,6 @@ pub unsafe extern "C" fn _start() -> u64 {
             if unsafe_quirks {
                 (call_table.verbose_print)(b"check: vhd not supported (quirks)\n\0".as_ptr());
                 result.flags |= CheckResult::FLAG_NOT_SUPPORTED;
-                result.flags |= CheckResult::FLAG_VALID;
             } else {
                 // Validate VHD footer
                 // For dynamic VHD, footer is at start; for fixed, we already read it
@@ -401,7 +398,6 @@ pub unsafe extern "C" fn _start() -> u64 {
             // Raw format has no metadata to check
             (call_table.verbose_print)(b"check: raw format, no metadata\n\0".as_ptr());
             result.flags |= CheckResult::FLAG_NOT_SUPPORTED;
-            result.flags |= CheckResult::FLAG_VALID;
             result.image_end_offset = actual_size;
         }
         _ => {
