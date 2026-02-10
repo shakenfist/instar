@@ -41,7 +41,7 @@ use guest_protocol::{
 };
 use kvm_bindings::{kvm_regs, kvm_segment, kvm_sregs, kvm_userspace_memory_region};
 use kvm_ioctls::{Kvm, VcpuExit};
-use log::{debug, info};
+use log::{debug, info, warn};
 use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use backing::BackingStore;
@@ -2828,18 +2828,34 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     // Set up ioeventfd for queue notifications
     let mut io_thread: Option<io_thread::IoThread> = None;
 
-    // Try to register all IoEvents with KVM
-    let mut all_registered = true;
-    for evt in &mut io_events {
+    // Try to register all IoEvents with KVM.
+    // Track how many succeeded so we can roll back on partial failure.
+    let mut registered_count = 0usize;
+    let mut registration_failed = false;
+    for evt in io_events.iter_mut() {
         if let Err(e) = evt.register(&vm) {
             debug!(
                 "ioeventfd: failed to register ({:?}), falling back to VM exits",
                 e
             );
-            all_registered = false;
+            registration_failed = true;
             break;
         }
+        registered_count += 1;
     }
+
+    // If registration failed partway through, unregister the ones that
+    // succeeded so they don't silently consume MMIO writes when falling
+    // back to VM exits.
+    if registration_failed {
+        for evt in io_events.iter_mut().take(registered_count) {
+            if let Err(e) = evt.unregister(&vm) {
+                warn!("ioeventfd: failed to unregister during rollback: {:?}", e);
+            }
+        }
+    }
+
+    let all_registered = !registration_failed;
 
     if all_registered && !io_events.is_empty() {
         debug!(
