@@ -85,8 +85,11 @@ separate virtio-block device in the KVM guest, and validates:
   feature flag)
 
 Chain errors are reported separately as `chain-errors` in JSON output and
-in human-readable output. Without `--chain`, check behaves identically to
-before (backward compatible).
+in human-readable output. Without `--chain`, `chain-errors` is always 0.
+
+**Note:** The `chain-errors` field is always present in JSON output,
+even when `--chain` is not used. This is a schema addition relative to
+previous versions.
 
 ### Version Compatibility
 
