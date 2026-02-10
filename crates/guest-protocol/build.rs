@@ -23,7 +23,7 @@ fn main() {
         ".",
         micropb_gen::Config::new()
             .max_bytes(32) // Max string length for stage/device/operation names
-            .max_len(4), // VmmConfig.devices needs at least 2 (input + output)
+            .max_len(17), // VmmConfig.devices: up to 16 chain inputs + 1 output
     );
 
     // Configure longer strings for file paths in InfoResultMessage

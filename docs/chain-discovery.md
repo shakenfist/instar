@@ -156,10 +156,18 @@ validating paths before following them.
 | `Circular reference detected` | Chain loops back to itself | Fix the image chain |
 | `Info operation failed` | Image parsing error | Check if image is corrupted |
 
-## Future Work
+## Operations Using Chain Discovery
 
-The chain discovery infrastructure will be used by future operations:
+The chain discovery infrastructure is used by the following operations:
+
+- **`imago info --chain`** - Discover and display the full backing chain
+- **`imago check --chain`** - Validate entire backing chains for consistency.
+  Each backing image is loaded as a separate virtio-block device in the KVM
+  guest and checked for format consistency, non-zero virtual size, and QCOW2
+  header integrity. Chain errors are reported separately from primary image
+  errors.
+
+### Future Work
 
 - **`imago convert`** - Flatten backing chains during format conversion
-- **`imago check`** - Validate entire backing chains for consistency
 - **Multi-device operations** - Load all images in chain as separate devices

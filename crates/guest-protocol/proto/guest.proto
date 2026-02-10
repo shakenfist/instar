@@ -154,7 +154,10 @@ message CheckResultMessage {
   //   bit 4: corrupt_bit (in header)
   //   bit 5: incomplete check
   //   bit 6: not_supported (format doesn't support check)
+  //   bit 7: chain_errors (backing chain validation errors)
   uint32 flags = 10;
+  // Number of backing chain validation errors
+  uint32 chain_errors = 11;
 }
 
 // Main message wrapper with level and payload

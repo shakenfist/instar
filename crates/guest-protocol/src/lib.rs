@@ -430,6 +430,7 @@ pub fn info_result_message_with_vdi(
 /// * `clusters_allocated` - Total allocated clusters
 /// * `fragmentation` - Fragmentation percentage (0-100)
 /// * `flags` - Status flags bitfield
+/// * `chain_errors` - Number of backing chain validation errors
 #[allow(clippy::too_many_arguments)]
 pub fn check_result_message(
     format: &str,
@@ -442,6 +443,7 @@ pub fn check_result_message(
     clusters_allocated: u64,
     fragmentation: u32,
     flags: u32,
+    chain_errors: u32,
 ) -> guest_::GuestMessage {
     let mut msg = guest_::GuestMessage::default();
     msg.level = guest_::Level::Info;
@@ -457,6 +459,7 @@ pub fn check_result_message(
     result.clusters_allocated = clusters_allocated;
     result.fragmentation = fragmentation;
     result.flags = flags;
+    result.chain_errors = chain_errors;
 
     msg.payload = Some(guest_::GuestMessage_::Payload::CheckResult(result));
     msg
@@ -620,7 +623,55 @@ mod vmm_config_support {
 
         config
     }
+
+    /// Helper to create a VmmConfig with multiple input devices
+    /// for backing chain operations (check --chain, future convert).
+    ///
+    /// Device 0 is named "input", devices 1..N-1 are named "input1",
+    /// "input2", etc. No output device is included.
+    ///
+    /// # Arguments
+    ///
+    /// * `sector_size` - Sector size for all input devices in bytes
+    /// * `device_count` - Number of input devices (chain length)
+    pub fn vmm_config_chain(sector_size: u32, device_count: usize) -> guest_::VmmConfig {
+        let mut config = guest_::VmmConfig::default();
+
+        for i in 0..device_count {
+            let mut dev = guest_::DeviceConfig::default();
+            if i == 0 {
+                super::push_str(&mut dev.name, "input");
+            } else {
+                // Format: "input1", "input2", ..., "input15"
+                let mut buf = [0u8; 8];
+                let name = format_chain_device_name(&mut buf, i);
+                super::push_str(&mut dev.name, name);
+            }
+            dev.sector_size = sector_size;
+            let _ = config.devices.push(dev);
+        }
+
+        config.progress_percent = 100;
+        config
+    }
+
+    /// Format a chain device name like "input1", "input2", etc.
+    fn format_chain_device_name(buf: &mut [u8; 8], index: usize) -> &str {
+        let prefix = b"input";
+        buf[..5].copy_from_slice(prefix);
+        // Write index as ASCII digit(s)
+        if index < 10 {
+            buf[5] = b'0' + index as u8;
+            core::str::from_utf8(&buf[..6]).unwrap_or("input0")
+        } else {
+            buf[5] = b'0' + (index / 10) as u8;
+            buf[6] = b'0' + (index % 10) as u8;
+            core::str::from_utf8(&buf[..7]).unwrap_or("input00")
+        }
+    }
 }
 
 #[cfg(feature = "std")]
-pub use vmm_config_support::{encode_vmm_config_framed, vmm_config, vmm_config_input_only};
+pub use vmm_config_support::{
+    encode_vmm_config_framed, vmm_config, vmm_config_chain, vmm_config_input_only,
+};

@@ -91,6 +91,10 @@ qemu-img convert -f SRC_FMT -O DST_FMT [-p] [-t none] [-T none] \
 qemu-img check --output json -f FORMAT <image>
 ```
 - Return code 3 (leaked clusters) is non-fatal
+- **Imago extension**: `imago check --chain` validates the entire backing
+  chain by discovering all backing images, loading them as separate
+  virtio-block devices, and checking format consistency, virtual size
+  validity, and QCOW2 header integrity for each backing image
 
 #### measure
 ```bash
