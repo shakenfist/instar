@@ -123,6 +123,17 @@ parses the file using the specified format's parser directly.
 imago info --format=qcow2 image.qcow2
 ```
 
+### Compare Options
+
+| Flag | Description |
+|------|-------------|
+| `-s` / `--strict` | Fail immediately if images differ in size |
+| `-q` / `--quiet` | Suppress output (exit code only) |
+
+In non-strict mode (default), images of different sizes are considered
+identical if the extra sectors in the larger image are all zeros. Strict
+mode fails immediately on any size difference, matching `qemu-img compare -s`.
+
 ### Backing Chain
 
 | Flag | Description |

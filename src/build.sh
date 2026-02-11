@@ -7,6 +7,7 @@
 #   - info.bin at 0x20000 (format detection operation)
 #   - copy.bin at 0x20000 (copy operation, same address as info)
 #   - check.bin at 0x20000 (integrity check operation, same address as info)
+#   - compare.bin at 0x20000 (image comparison operation, same address as info)
 
 set -e
 
@@ -89,6 +90,25 @@ else
 fi
 
 echo ""
+echo "=== Building compare operation ==="
+cd operations/compare
+cargo +nightly build --release
+cd ../..
+
+# Convert compare ELF to flat binary
+echo "=== Converting compare ELF to flat binary ==="
+COMPARE_ELF="target/x86_64-unknown-none/release/compare"
+COMPARE_BIN="compare.bin"
+
+if [ -f "$COMPARE_ELF" ]; then
+    rust-objcopy -O binary "$COMPARE_ELF" "$COMPARE_BIN"
+    echo "Created $COMPARE_BIN ($(wc -c < "$COMPARE_BIN") bytes)"
+else
+    echo "Error: Compare ELF not found at $COMPARE_ELF"
+    exit 1
+fi
+
+echo ""
 echo "=== Building imago ==="
 cd vmm
 cargo build --release
@@ -101,7 +121,8 @@ cp "$CORE_BIN" target/release/
 cp "$INFO_BIN" target/release/
 cp "$COPY_BIN" target/release/
 cp "$CHECK_BIN" target/release/
-echo "Copied core.bin, info.bin, copy.bin, and check.bin to target/release/"
+cp "$COMPARE_BIN" target/release/
+echo "Copied core.bin, info.bin, copy.bin, check.bin, and compare.bin to target/release/"
 
 # Check binary sizes against memory layout limits
 # Memory layout (from shared/src/lib.rs):
@@ -136,6 +157,7 @@ check_size "core.bin" "target/release/$CORE_BIN" "$CORE_MAX" || FAILED=1
 check_size "info.bin" "target/release/$INFO_BIN" "$OP_MAX" || FAILED=1
 check_size "copy.bin" "target/release/$COPY_BIN" "$OP_MAX" || FAILED=1
 check_size "check.bin" "target/release/$CHECK_BIN" "$OP_MAX" || FAILED=1
+check_size "compare.bin" "target/release/$COMPARE_BIN" "$OP_MAX" || FAILED=1
 
 if [ "$FAILED" -eq 1 ]; then
     echo ""
@@ -153,16 +175,19 @@ echo "  - core.bin       Core guest (device init, call table) - loaded at 0x1000
 echo "  - info.bin       Info operation (format detection) - loaded at 0x20000"
 echo "  - copy.bin       Copy operation (file copy) - loaded at 0x20000"
 echo "  - check.bin      Check operation (integrity validation) - loaded at 0x20000"
+echo "  - compare.bin    Compare operation (image comparison) - loaded at 0x20000"
 echo ""
 echo "To run:"
 echo "  sudo ./target/release/imago info image.qcow2"
 echo "  sudo ./target/release/imago copy input.qcow2 output.raw"
 echo "  sudo ./target/release/imago check image.qcow2"
+echo "  sudo ./target/release/imago compare image1.raw image2.raw"
 echo ""
 echo "For help:"
 echo "  ./target/release/imago --help"
 echo "  ./target/release/imago info --help"
 echo "  ./target/release/imago copy --help"
 echo "  ./target/release/imago check --help"
+echo "  ./target/release/imago compare --help"
 echo ""
 echo "Note: Running requires /dev/kvm access (root or kvm group)"

@@ -412,6 +412,86 @@ class ImagoTestBase(testtools.TestCase):
         except subprocess.TimeoutExpired:
             return '', 'Timeout after {}s'.format(timeout), -1
 
+    def run_imago_compare(
+        self,
+        image1_path: Path,
+        image2_path: Path,
+        timeout: int = 30,
+        output_format: Optional[str] = None,
+        strict: bool = False,
+        quiet: bool = False,
+    ) -> tuple:
+        """
+        Run imago compare on two images.
+
+        Args:
+            image1_path: Path to the first image file
+            image2_path: Path to the second image file
+            timeout: Timeout in seconds
+            output_format: Optional output format ('human' or 'json')
+            strict: Enable strict mode (fail on size differences)
+            quiet: Enable quiet mode
+
+        Returns:
+            tuple: (stdout, stderr, return_code)
+        """
+        imago = self.get_imago_binary()
+
+        cmd = [str(imago), 'compare']
+        if output_format:
+            cmd.extend(['--output', output_format])
+        if strict:
+            cmd.append('--strict')
+        if quiet:
+            cmd.append('--quiet')
+        cmd.extend([str(image1_path), str(image2_path)])
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            return result.stdout, result.stderr, result.returncode
+        except subprocess.TimeoutExpired:
+            return '', 'Timeout after {}s'.format(timeout), -1
+
+    def run_qemu_img_compare(
+        self,
+        image1_path: Path,
+        image2_path: Path,
+        timeout: int = 30,
+        strict: bool = False,
+    ) -> tuple:
+        """
+        Run qemu-img compare on two images.
+
+        Args:
+            image1_path: Path to the first image file
+            image2_path: Path to the second image file
+            timeout: Timeout in seconds
+            strict: Enable strict mode (-s flag)
+
+        Returns:
+            tuple: (stdout, stderr, return_code)
+        """
+        cmd = ['qemu-img', 'compare']
+        if strict:
+            cmd.append('-s')
+        cmd.extend([str(image1_path), str(image2_path)])
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            return result.stdout, result.stderr, result.returncode
+        except subprocess.TimeoutExpired:
+            return '', 'Timeout after {}s'.format(timeout), -1
+
     def load_expected_override(self, override_path: str) -> Optional[str]:
         """
         Load expected output from an override file.
