@@ -87,7 +87,6 @@ impl IoEvent {
     }
 
     /// Unregister this ioevent from KVM.
-    #[allow(dead_code)]
     pub fn unregister(&mut self, vm: &VmFd) -> std::io::Result<()> {
         if !self.registered {
             return Ok(());

@@ -36,12 +36,12 @@ use std::sync::{Arc, Mutex};
 
 use clap::{Args, Parser, Subcommand};
 use guest_protocol::{
-    decode_framed, encode_vmm_config_framed, guest_, vmm_config, vmm_config_input_only,
-    FRAME_HEADER_SIZE,
+    decode_framed, encode_vmm_config_framed, guest_, vmm_config, vmm_config_chain,
+    vmm_config_input_only, FRAME_HEADER_SIZE,
 };
 use kvm_bindings::{kvm_regs, kvm_segment, kvm_sregs, kvm_userspace_memory_region};
 use kvm_ioctls::{Kvm, VcpuExit};
-use log::{debug, info};
+use log::{debug, info, warn};
 use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use backing::BackingStore;
@@ -86,6 +86,7 @@ const CHECK_CONFIG_FLAG_REPAIR: u32 = 1 << 0;
 const CHECK_CONFIG_FLAG_QUIET: u32 = 1 << 1;
 #[allow(dead_code)]
 const CHECK_CONFIG_FLAG_UNSAFE_QUIRKS: u32 = 1 << 2;
+const CHECK_CONFIG_FLAG_CHAIN: u32 = 1 << 3;
 #[allow(dead_code)]
 const CHECK_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
 
@@ -1549,7 +1550,6 @@ fn print_backing_chain(chain: &BackingChain) {
 /// # Returns
 ///
 /// Ok(()) on success, error on memory write failure
-#[allow(dead_code)] // Infrastructure for Phase 1+ (check, compare, convert)
 fn write_chain_config(
     guest_mem: &GuestMemoryMmap,
     chain: &BackingChain,
@@ -1770,6 +1770,10 @@ struct CheckArgs {
     /// Use only for compatibility testing, never in production.
     #[arg(long)]
     unsafe_quirks: bool,
+
+    /// Validate the complete backing file chain
+    #[arg(long)]
+    chain: bool,
 }
 
 #[derive(Args, Debug)]
@@ -2656,6 +2660,25 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
         operation_path.display()
     );
 
+    // Handle --chain flag: discover backing chain before launching guest
+    let chain = if args.chain {
+        let input_path = Path::new(&args.input);
+        let security_config = config::load_config().config.security;
+        match discover_backing_chain(input_path, args.sector_size, &security_config) {
+            Ok(chain) => {
+                if verbose {
+                    print_backing_chain(&chain);
+                }
+                Some(chain)
+            }
+            Err(e) => {
+                return Err(format!("error discovering backing chain: {}", e).into());
+            }
+        }
+    } else {
+        None
+    };
+
     // Get input file metadata
     let input_metadata = std::fs::metadata(&args.input)?;
     let input_size = input_metadata.len();
@@ -2666,9 +2689,6 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
         input_size / args.sector_size as u64,
         args.sector_size
     );
-
-    // Open backing store (input only, read-only)
-    let input_backing = BackingStore::open(Path::new(&args.input), true, None, false)?;
 
     // Open KVM
     let kvm = Kvm::new()?;
@@ -2731,6 +2751,9 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     if args.unsafe_quirks {
         check_flags |= CHECK_CONFIG_FLAG_UNSAFE_QUIRKS;
     }
+    if args.chain {
+        check_flags |= CHECK_CONFIG_FLAG_CHAIN;
+    }
     guest_mem.write_obj(CHECK_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
     guest_mem.write_obj(check_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
     debug!(
@@ -2741,26 +2764,64 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     // Create device set for managing virtio-block devices
     let mut device_set = DeviceSet::new();
 
-    // Create virtio-block device (input only for check operation)
-    let input_mmio = device_mmio_base(0);
-    let input_vq = device_vq_base(0);
-    let input_device = VirtioBlockDevice::new(
-        input_backing,
-        input_size,
-        args.sector_size as u64,
-        true, // read-only
-        input_mmio,
-        input_vq,
-    );
-    debug!(
-        "Created virtio-block device at MMIO 0x{:x}, VQ 0x{:x}",
-        input_mmio, input_vq
-    );
-    debug!("  Sector size: {} bytes", input_device.sector_size());
+    // Set up devices: either multi-device chain or single input
+    let mut io_events: Vec<IoEvent> = Vec::new();
 
-    // Wrap device in Arc<Mutex<>> and add to device set
-    let input_device = Arc::new(Mutex::new(input_device));
-    device_set.add_device(Arc::clone(&input_device), true);
+    if let Some(ref chain) = chain {
+        // Multi-device chain mode: open each chain image as a separate device.
+        // All devices use the same sector_size: this is the virtio-block
+        // transport sector size (I/O granularity), not a format-level property.
+        // The guest reconstructs file size as capacity * sector_size, which
+        // works correctly regardless of the chosen sector_size value.
+        for (i, image) in chain.images().iter().enumerate() {
+            let backing = BackingStore::open(&image.path, true, None, false)?;
+            let file_size = std::fs::metadata(&image.path)?.len();
+            let mmio = device_mmio_base(i);
+            let vq = device_vq_base(i);
+            let device = VirtioBlockDevice::new(
+                backing,
+                file_size,
+                args.sector_size as u64,
+                true, // read-only
+                mmio,
+                vq,
+            );
+            debug!(
+                "Created chain device [{}] at MMIO 0x{:x}, VQ 0x{:x}: {}",
+                i,
+                mmio,
+                vq,
+                image.path.display()
+            );
+            let device = Arc::new(Mutex::new(device));
+            device_set.add_device(Arc::clone(&device), true);
+            io_events.push(IoEvent::new(mmio)?);
+        }
+
+        // Write chain config to guest memory
+        write_chain_config(&guest_mem, chain)?;
+    } else {
+        // Single-device mode (original behavior)
+        let input_backing = BackingStore::open(Path::new(&args.input), true, None, false)?;
+        let input_mmio = device_mmio_base(0);
+        let input_vq = device_vq_base(0);
+        let input_device = VirtioBlockDevice::new(
+            input_backing,
+            input_size,
+            args.sector_size as u64,
+            true, // read-only
+            input_mmio,
+            input_vq,
+        );
+        debug!(
+            "Created virtio-block device at MMIO 0x{:x}, VQ 0x{:x}",
+            input_mmio, input_vq
+        );
+        debug!("  Sector size: {} bytes", input_device.sector_size());
+        let input_device = Arc::new(Mutex::new(input_device));
+        device_set.add_device(Arc::clone(&input_device), true);
+        io_events.push(IoEvent::new(input_mmio)?);
+    }
 
     // Wrap guest memory in Arc for sharing
     let guest_mem = Arc::new(guest_mem);
@@ -2770,28 +2831,51 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
 
     // Set up ioeventfd for queue notifications
     let mut io_thread: Option<io_thread::IoThread> = None;
-    let mut input_evt = IoEvent::new(input_mmio)?;
 
-    match input_evt.register(&vm) {
-        Ok(()) => {
-            debug!("ioeventfd: enabled for queue notifications (with I/O thread)");
-
-            // Create IoDevice entries via DeviceSet
-            let io_devices = device_set.create_io_devices(vec![input_evt]);
-
-            // Start the I/O thread
-            io_thread = Some(io_thread::IoThread::new(
-                io_devices,
-                Arc::clone(&guest_mem),
-                Arc::clone(&vmm_stats),
-            ));
-        }
-        Err(e) => {
+    // Try to register all IoEvents with KVM.
+    // Track how many succeeded so we can roll back on partial failure.
+    let mut registered_count = 0usize;
+    let mut registration_failed = false;
+    for evt in io_events.iter_mut() {
+        if let Err(e) = evt.register(&vm) {
             debug!(
                 "ioeventfd: failed to register ({:?}), falling back to VM exits",
                 e
             );
+            registration_failed = true;
+            break;
         }
+        registered_count += 1;
+    }
+
+    // If registration failed partway through, unregister the ones that
+    // succeeded so they don't silently consume MMIO writes when falling
+    // back to VM exits.
+    if registration_failed {
+        for evt in io_events.iter_mut().take(registered_count) {
+            if let Err(e) = evt.unregister(&vm) {
+                warn!("ioeventfd: failed to unregister during rollback: {:?}", e);
+            }
+        }
+    }
+
+    let all_registered = !registration_failed;
+
+    if all_registered && !io_events.is_empty() {
+        debug!(
+            "ioeventfd: enabled for {} device(s) (with I/O thread)",
+            io_events.len()
+        );
+
+        // Create IoDevice entries via DeviceSet
+        let io_devices = device_set.create_io_devices(io_events);
+
+        // Start the I/O thread
+        io_thread = Some(io_thread::IoThread::new(
+            io_devices,
+            Arc::clone(&guest_mem),
+            Arc::clone(&vmm_stats),
+        ));
     }
 
     // Create vCPU
@@ -2821,8 +2905,12 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     // Create debug buffer for COM2 output
     let mut debug_buffer = DebugBuffer::new();
 
-    // Queue the configuration message for transmission (check uses only input device)
-    let config = vmm_config_input_only(args.sector_size);
+    // Queue the configuration message for transmission
+    let config = if let Some(ref chain) = chain {
+        vmm_config_chain(args.sector_size, chain.len())
+    } else {
+        vmm_config_input_only(args.sector_size)
+    };
     serial_transmitter.queue_config(&config);
     debug!(
         "Queued configuration message ({} bytes) for guest",
@@ -2862,7 +2950,8 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
                                 {
                                     // Track if check passed
                                     check_passed = (result.flags & CHECK_RESULT_FLAG_VALID) != 0
-                                        && result.total_errors == 0;
+                                        && result.total_errors == 0
+                                        && result.chain_errors == 0;
                                 }
                                 if !args.quiet || !check_passed {
                                     print_check_result(
@@ -3008,8 +3097,12 @@ fn print_check_result(
                 println!("{} leaked clusters were found on the image.", result.leaks);
                 println!("This means waste of disk space, but no harm to data.");
             }
-        } else if is_valid {
+        } else if is_valid && result.chain_errors == 0 {
             println!("No errors were found on the image.");
+        }
+
+        if result.chain_errors > 0 {
+            println!("{} backing chain error(s) were found.", result.chain_errors);
         }
 
         // Show statistics
@@ -3071,7 +3164,8 @@ fn print_check_result_json(
     println!("    \"fragmented-clusters\": {},", result.fragmentation);
     // QCOW2-specific flags (dirty bit = unclean shutdown, corrupt bit = known corruption)
     println!("    \"dirty\": {},", is_dirty);
-    println!("    \"corrupt\": {}", is_corrupt);
+    println!("    \"corrupt\": {},", is_corrupt);
+    println!("    \"chain-errors\": {}", result.chain_errors);
     println!("}}");
 }
 

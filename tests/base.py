@@ -339,6 +339,7 @@ class ImagoTestBase(testtools.TestCase):
         qemu_version: Optional[str] = None,
         output_format: Optional[str] = None,
         unsafe_quirks: bool = False,
+        chain: bool = False,
     ) -> tuple:
         """
         Run imago check on an image.
@@ -346,10 +347,10 @@ class ImagoTestBase(testtools.TestCase):
         Args:
             image_path: Path to the image file
             timeout: Timeout in seconds
-            qemu_version: Optional qemu-img version to emulate (e.g., '7.2')
+            qemu_version: Optional qemu-img version to emulate
             output_format: Optional output format ('human' or 'json')
-            unsafe_quirks: Enable unsafe qemu-img compatible mode. When True,
-                non-QCOW2 formats are treated as 'raw' and validation is skipped.
+            unsafe_quirks: Enable unsafe qemu-img compatible mode.
+            chain: Enable backing chain validation (--chain)
 
         Returns:
             tuple: (stdout, stderr, return_code)
@@ -363,6 +364,8 @@ class ImagoTestBase(testtools.TestCase):
             cmd.extend(['--output', output_format])
         if unsafe_quirks:
             cmd.append('--unsafe-quirks')
+        if chain:
+            cmd.append('--chain')
         cmd.append(str(image_path))
 
         try:

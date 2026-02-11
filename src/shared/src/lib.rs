@@ -805,6 +805,9 @@ impl CheckConfig {
     /// format-appropriate validation.
     pub const FLAG_UNSAFE_QUIRKS: u32 = 1 << 2;
 
+    /// Flag: Validate backing chain (chain mode)
+    pub const FLAG_CHAIN: u32 = 1 << 3;
+
     /// Create a default config
     pub const fn default_config() -> Self {
         Self {
@@ -832,6 +835,11 @@ impl CheckConfig {
     pub fn unsafe_quirks_enabled(&self) -> bool {
         (self.flags & Self::FLAG_UNSAFE_QUIRKS) != 0
     }
+
+    /// Check if chain validation flag is set
+    pub fn chain_enabled(&self) -> bool {
+        (self.flags & Self::FLAG_CHAIN) != 0
+    }
 }
 
 /// Result structure for the check operation.
@@ -857,6 +865,9 @@ pub struct CheckResult {
 
     /// Number of refcount inconsistencies
     pub refcount_errors: u32,
+
+    /// Number of backing chain validation errors
+    pub chain_errors: u32,
 
     /// Image end offset (highest byte offset in use)
     pub image_end_offset: u64,
@@ -905,6 +916,9 @@ impl CheckResult {
     /// Flag: Format does not support check (e.g., raw)
     pub const FLAG_NOT_SUPPORTED: u32 = 1 << 6;
 
+    /// Flag: Chain validation errors found
+    pub const FLAG_CHAIN_ERRORS: u32 = 1 << 7;
+
     /// Create a new empty result
     pub const fn new() -> Self {
         Self {
@@ -914,6 +928,7 @@ impl CheckResult {
             corruptions: 0,
             leaks: 0,
             refcount_errors: 0,
+            chain_errors: 0,
             image_end_offset: 0,
             clusters_checked: 0,
             clusters_allocated: 0,

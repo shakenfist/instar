@@ -76,6 +76,10 @@ pub struct DeviceConfig {
     pub progress_percent: u32,
     /// Whether an output device is configured (info ops don't need one)
     pub has_output_device: bool,
+    /// Number of input devices (1 for single-image, >1 for chain)
+    pub input_device_count: usize,
+    /// Sector sizes for additional input devices (index 0 = device 1)
+    pub extra_input_sector_sizes: [usize; 15],
 }
 
 impl Default for DeviceConfig {
@@ -85,8 +89,23 @@ impl Default for DeviceConfig {
             output_sector_size: 512,
             progress_percent: 10,
             has_output_device: false,
+            input_device_count: 1,
+            extra_input_sector_sizes: [0; 15],
         }
     }
+}
+
+/// Parse a device index from ASCII digit bytes (e.g., b"1" -> 1).
+fn parse_device_index(digits: &[u8]) -> usize {
+    let mut result: usize = 0;
+    for &b in digits {
+        if b >= b'0' && b <= b'9' {
+            result = result * 10 + (b - b'0') as usize;
+        } else {
+            return 0;
+        }
+    }
+    result
 }
 
 /// Read configuration from serial port at startup
@@ -126,17 +145,27 @@ pub fn read_config() -> DeviceConfig {
     }
 
     if let Some((vmm_config, _)) = decode_vmm_config_framed(&buf[..total_len]) {
+        let mut input_count: usize = 0;
         for dev in vmm_config.devices.iter() {
             let name: &str = dev.name.as_str();
             let sector_size = dev.sector_size as usize;
 
             if name == "input" {
                 config.input_sector_size = sector_size;
+                input_count += 1;
+            } else if name.len() > 5 && name.as_bytes()[..5] == *b"input" {
+                // Parse "input1" through "input15"
+                let idx = parse_device_index(&name.as_bytes()[5..]);
+                if idx > 0 && idx <= 15 {
+                    config.extra_input_sector_sizes[idx - 1] = sector_size;
+                    input_count += 1;
+                }
             } else if name == "output" {
                 config.output_sector_size = sector_size;
                 config.has_output_device = true;
             }
         }
+        config.input_device_count = input_count;
         config.progress_percent = vmm_config.progress_percent;
     }
 
@@ -412,6 +441,7 @@ pub fn send_check_result(result: &shared::CheckResult) {
         result.clusters_allocated,
         result.fragmentation,
         result.flags,
+        result.chain_errors,
     );
     send_message(&msg);
 }

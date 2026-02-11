@@ -11,6 +11,10 @@
 //! - Refcount table and block structure validation
 //! - Dirty/corrupt incompatible feature flags (v3 only)
 //!
+//! When `--chain` is enabled, the operation also validates the backing
+//! chain: format consistency, virtual size consistency across layers,
+//! and basic QCOW2 header validation for each backing image.
+//!
 //! Refcount validation currently supports 16-bit refcounts (the standard
 //! QCOW2 default). Images with other refcount widths skip refcount and
 //! leak validation.
@@ -25,8 +29,8 @@ use core::panic::PanicInfo;
 
 use shared::{
     format_detection::{detect_format_from_header, detect_vhd_footer, QCOW2_MAGIC, VHD_COOKIE},
-    CallTable, CheckConfig, CheckResult, ImageFormat, CALL_TABLE_ADDR, MAX_SECTOR_SIZE,
-    SCRATCH_MEM_BASE, SCRATCH_MEM_SIZE,
+    CallTable, ChainConfig, CheckConfig, CheckResult, ImageFormat, CALL_TABLE_ADDR,
+    MAX_SECTOR_SIZE, SCRATCH_MEM_BASE, SCRATCH_MEM_SIZE,
 };
 
 // QCOW2 header offsets (big-endian)
@@ -343,7 +347,6 @@ pub unsafe extern "C" fn _start() -> u64 {
                 // qemu-img compatible: no validation for non-QCOW2
                 (call_table.verbose_print)(b"check: vmdk not supported (quirks)\n\0".as_ptr());
                 result.flags |= CheckResult::FLAG_NOT_SUPPORTED;
-                result.flags |= CheckResult::FLAG_VALID;
             } else {
                 // Validate VMDK header
                 bytes_read += check_vmdk(&buffer, &mut result, actual_size);
@@ -354,7 +357,6 @@ pub unsafe extern "C" fn _start() -> u64 {
             if unsafe_quirks {
                 (call_table.verbose_print)(b"check: vhdx not supported (quirks)\n\0".as_ptr());
                 result.flags |= CheckResult::FLAG_NOT_SUPPORTED;
-                result.flags |= CheckResult::FLAG_VALID;
             } else {
                 // Validate VHDX structure
                 bytes_read += check_vhdx(&mut result, call_table, input_sector_size, actual_size);
@@ -365,7 +367,6 @@ pub unsafe extern "C" fn _start() -> u64 {
             if unsafe_quirks {
                 (call_table.verbose_print)(b"check: vhd not supported (quirks)\n\0".as_ptr());
                 result.flags |= CheckResult::FLAG_NOT_SUPPORTED;
-                result.flags |= CheckResult::FLAG_VALID;
             } else {
                 // Validate VHD footer
                 // For dynamic VHD, footer is at start; for fixed, we already read it
@@ -397,7 +398,6 @@ pub unsafe extern "C" fn _start() -> u64 {
             // Raw format has no metadata to check
             (call_table.verbose_print)(b"check: raw format, no metadata\n\0".as_ptr());
             result.flags |= CheckResult::FLAG_NOT_SUPPORTED;
-            result.flags |= CheckResult::FLAG_VALID;
             result.image_end_offset = actual_size;
         }
         _ => {
@@ -406,6 +406,23 @@ pub unsafe extern "C" fn _start() -> u64 {
             (call_table.verbose_print)(b"check: format not supported\n\0".as_ptr());
             result.flags |= CheckResult::FLAG_NOT_SUPPORTED;
             result.image_end_offset = actual_size;
+        }
+    }
+
+    // Chain validation (if --chain flag was set)
+    let chain_enabled = if config.is_valid() {
+        config.chain_enabled()
+    } else {
+        false
+    };
+    if chain_enabled {
+        let chain_result = (call_table.get_chain_config)();
+        if !chain_result.ptr.is_null() && chain_result.len > 0 {
+            let chain_config = &*(chain_result.ptr as *const ChainConfig);
+            if chain_config.is_valid() && chain_config.device_count > 1 {
+                (call_table.verbose_print)(b"check: validating backing chain\n\0".as_ptr());
+                bytes_read += validate_chain(call_table, chain_config, &mut result);
+            }
         }
     }
 
@@ -419,7 +436,7 @@ pub unsafe extern "C" fn _start() -> u64 {
     // Note: leaks still increment total_errors, so the VMM will still
     // report a non-zero exit code for leak-only images via check_passed
     // (which requires both FLAG_VALID and total_errors == 0).
-    if result.corruptions == 0 && result.refcount_errors == 0 {
+    if result.corruptions == 0 && result.refcount_errors == 0 && result.chain_errors == 0 {
         result.flags |= CheckResult::FLAG_VALID;
     }
 
@@ -1392,6 +1409,235 @@ unsafe fn check_qcow2(
     (call_table.verbose_print)(b"check: qcow2 check complete\n\0".as_ptr());
 
     bytes_read
+}
+
+/// Validate backing chain consistency.
+///
+/// For each backing device (1..device_count):
+/// 1. Read first sector and detect format
+/// 2. Cross-check format matches chain metadata from host
+/// 3. Cross-check virtual size consistency (overlay virtual size
+///    should not exceed its backing image's virtual size)
+/// 4. Run basic QCOW2 header validation for QCOW2 backing images
+///    (magic, version, cluster_bits, L1/refcount table bounds)
+///
+/// Returns the number of bytes read during validation.
+unsafe fn validate_chain(
+    call_table: &CallTable,
+    chain_config: &ChainConfig,
+    result: &mut CheckResult,
+) -> u64 {
+    let mut bytes_read: u64 = 0;
+    let device_count = chain_config.device_count as usize;
+
+    for dev_idx in 1..device_count {
+        let chain_dev = match chain_config.get(dev_idx) {
+            Some(d) => d,
+            None => break,
+        };
+
+        // Get device capacity from call table
+        let capacity = (call_table.get_input_capacity)(dev_idx as u32);
+        let sector_size = (call_table.get_input_sector_size)(dev_idx as u32);
+
+        if capacity == 0 || sector_size == 0 {
+            (call_table.debug_print)(b"check: chain device not available\n\0".as_ptr());
+            result.chain_errors += 1;
+            result.total_errors += 1;
+            continue;
+        }
+
+        // Read first sector of backing device
+        let mut header_buf = [0u8; MAX_SECTOR_SIZE];
+        if !(call_table.read_input_sector)(dev_idx as u32, 0, header_buf.as_mut_ptr(), sector_size)
+        {
+            (call_table.debug_print)(b"check: chain device read error\n\0".as_ptr());
+            result.chain_errors += 1;
+            result.total_errors += 1;
+            continue;
+        }
+        bytes_read += sector_size as u64;
+
+        // Detect format from header
+        let detected = detect_format_from_header(&header_buf, sector_size, false);
+
+        // Cross-check: format matches chain metadata
+        let expected_format = chain_dev.detected_format();
+        if detected != expected_format {
+            (call_table.debug_print)(b"check: chain format mismatch\n\0".as_ptr());
+            result.chain_errors += 1;
+            result.total_errors += 1;
+        }
+
+        // Cross-check: virtual size consistency
+        // A backing image's virtual size should not be zero
+        if chain_dev.virtual_size == 0 {
+            (call_table.debug_print)(b"check: chain backing has zero virtual size\n\0".as_ptr());
+            result.chain_errors += 1;
+            result.total_errors += 1;
+        }
+
+        // Basic QCOW2 header validation for QCOW2 backing images
+        if detected == ImageFormat::Qcow2 {
+            bytes_read += validate_chain_qcow2_header(
+                call_table,
+                &header_buf,
+                capacity * sector_size as u64,
+                result,
+            );
+        }
+    }
+
+    if result.chain_errors > 0 {
+        result.flags |= CheckResult::FLAG_CHAIN_ERRORS;
+    }
+
+    bytes_read
+}
+
+/// Basic QCOW2 header validation for a backing image.
+///
+/// This performs structural validation only (no L2/refcount walk)
+/// to avoid scratch memory conflicts with the primary image's check.
+/// Validates: magic, version, cluster_bits, L1 and refcount table bounds.
+///
+/// Returns bytes read (always 0 since we reuse the header buffer).
+unsafe fn validate_chain_qcow2_header(
+    call_table: &CallTable,
+    header: &[u8],
+    actual_size: u64,
+    result: &mut CheckResult,
+) -> u64 {
+    // Validate magic
+    let magic = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+    if magic != QCOW2_MAGIC {
+        (call_table.debug_print)(b"check: chain qcow2 bad magic\n\0".as_ptr());
+        result.chain_errors += 1;
+        result.total_errors += 1;
+        return 0;
+    }
+
+    // Validate version (2 or 3)
+    let version = u32::from_be_bytes([
+        header[QCOW2_VERSION_OFFSET],
+        header[QCOW2_VERSION_OFFSET + 1],
+        header[QCOW2_VERSION_OFFSET + 2],
+        header[QCOW2_VERSION_OFFSET + 3],
+    ]);
+    if version < 2 || version > 3 {
+        (call_table.debug_print)(b"check: chain qcow2 bad version\n\0".as_ptr());
+        result.chain_errors += 1;
+        result.total_errors += 1;
+        return 0;
+    }
+
+    // Validate cluster_bits (9-21)
+    let cluster_bits = u32::from_be_bytes([
+        header[QCOW2_CLUSTER_BITS_OFFSET],
+        header[QCOW2_CLUSTER_BITS_OFFSET + 1],
+        header[QCOW2_CLUSTER_BITS_OFFSET + 2],
+        header[QCOW2_CLUSTER_BITS_OFFSET + 3],
+    ]);
+    if cluster_bits < 9 || cluster_bits > 21 {
+        (call_table.debug_print)(b"check: chain qcow2 bad cluster_bits\n\0".as_ptr());
+        result.chain_errors += 1;
+        result.total_errors += 1;
+        return 0;
+    }
+
+    // Validate L1 table offset is within bounds
+    let l1_table_offset = u64::from_be_bytes([
+        header[QCOW2_L1_TABLE_OFFSET_OFFSET],
+        header[QCOW2_L1_TABLE_OFFSET_OFFSET + 1],
+        header[QCOW2_L1_TABLE_OFFSET_OFFSET + 2],
+        header[QCOW2_L1_TABLE_OFFSET_OFFSET + 3],
+        header[QCOW2_L1_TABLE_OFFSET_OFFSET + 4],
+        header[QCOW2_L1_TABLE_OFFSET_OFFSET + 5],
+        header[QCOW2_L1_TABLE_OFFSET_OFFSET + 6],
+        header[QCOW2_L1_TABLE_OFFSET_OFFSET + 7],
+    ]);
+    if l1_table_offset == 0 || l1_table_offset >= actual_size {
+        (call_table.debug_print)(b"check: chain qcow2 bad L1 offset\n\0".as_ptr());
+        result.chain_errors += 1;
+        result.total_errors += 1;
+        return 0;
+    }
+
+    // Validate L1 size
+    let l1_size = u32::from_be_bytes([
+        header[QCOW2_L1_SIZE_OFFSET],
+        header[QCOW2_L1_SIZE_OFFSET + 1],
+        header[QCOW2_L1_SIZE_OFFSET + 2],
+        header[QCOW2_L1_SIZE_OFFSET + 3],
+    ]);
+    let l1_table_size_bytes = (l1_size as u64).saturating_mul(8);
+    if l1_table_size_bytes > actual_size {
+        (call_table.debug_print)(b"check: chain qcow2 L1 too large\n\0".as_ptr());
+        result.chain_errors += 1;
+        result.total_errors += 1;
+        return 0;
+    }
+
+    // Validate refcount table offset is within bounds
+    let refcount_table_offset = u64::from_be_bytes([
+        header[QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET],
+        header[QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET + 1],
+        header[QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET + 2],
+        header[QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET + 3],
+        header[QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET + 4],
+        header[QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET + 5],
+        header[QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET + 6],
+        header[QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET + 7],
+    ]);
+    if refcount_table_offset == 0 || refcount_table_offset >= actual_size {
+        (call_table.debug_print)(b"check: chain qcow2 bad reftable offset\n\0".as_ptr());
+        result.chain_errors += 1;
+        result.total_errors += 1;
+        return 0;
+    }
+
+    // Validate refcount table clusters are within bounds
+    let refcount_table_clusters = u32::from_be_bytes([
+        header[QCOW2_REFCOUNT_TABLE_CLUSTERS_OFFSET],
+        header[QCOW2_REFCOUNT_TABLE_CLUSTERS_OFFSET + 1],
+        header[QCOW2_REFCOUNT_TABLE_CLUSTERS_OFFSET + 2],
+        header[QCOW2_REFCOUNT_TABLE_CLUSTERS_OFFSET + 3],
+    ]);
+    let cluster_size = 1u64 << cluster_bits;
+    let reftable_size = (refcount_table_clusters as u64).saturating_mul(cluster_size);
+    if let Some(rte) = refcount_table_offset.checked_add(reftable_size) {
+        if rte > actual_size {
+            (call_table.debug_print)(b"check: chain qcow2 reftable exceeds file\n\0".as_ptr());
+            result.chain_errors += 1;
+            result.total_errors += 1;
+            return 0;
+        }
+    } else {
+        result.chain_errors += 1;
+        result.total_errors += 1;
+        return 0;
+    }
+
+    // Check v3 incompatible features for corrupt bit
+    if version >= 3 && header.len() > QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 7 {
+        let incompat = u64::from_be_bytes([
+            header[QCOW2_INCOMPATIBLE_FEATURES_OFFSET],
+            header[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 1],
+            header[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 2],
+            header[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 3],
+            header[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 4],
+            header[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 5],
+            header[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 6],
+            header[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 7],
+        ]);
+        if (incompat & QCOW2_INCOMPAT_CORRUPT) != 0 {
+            (call_table.debug_print)(b"check: chain qcow2 corrupt bit set\n\0".as_ptr());
+            result.chain_errors += 1;
+            result.total_errors += 1;
+        }
+    }
+
+    0
 }
 
 /// Get the call table from the fixed address

@@ -140,8 +140,19 @@ provides a modular architecture with:
 - **core/** - Guest initialization (device init, call table)
 - **operations/info/** - Format detection operation
 - **operations/copy/** - File copy operation
-- **operations/check/** - Image integrity validation operation
+- **operations/check/** - Image integrity validation operation (with
+  optional `--chain` backing chain validation)
 - **shared/** - Shared library code between components
+
+**Chain validation in check (`--chain`):**
+The check operation supports an optional `--chain` flag that uses the host-side
+chain discovery infrastructure (same as `imago info --chain`) to discover the
+full backing chain, then sets up each image as a separate virtio-block device
+in the KVM guest. The guest validates each backing image for format consistency,
+non-zero virtual size, and QCOW2 header integrity (magic, version,
+cluster_bits, L1/refcount table bounds, corrupt feature flag). Backing file
+paths are validated against the security allowlist before being opened. Chain
+errors are reported separately from primary image errors.
 
 The rust-vmm project provides crates that reduce implementation effort by 70%+:
 - `kvm-ioctls` - Safe KVM API wrappers
