@@ -142,6 +142,8 @@ provides a modular architecture with:
 - **operations/copy/** - File copy operation
 - **operations/check/** - Image integrity validation operation (with
   optional `--chain` backing chain validation)
+- **operations/compare/** - Image comparison operation (sector-by-sector
+  data comparison between two images)
 - **shared/** - Shared library code between components
 
 **Chain validation in check (`--chain`):**

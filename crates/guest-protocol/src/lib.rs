@@ -465,6 +465,33 @@ pub fn check_result_message(
     msg
 }
 
+/// Helper to create a compare result message.
+///
+/// # Arguments
+///
+/// * `identical` - Whether images are logically identical
+/// * `first_mismatch_offset` - Byte offset of first mismatch (0 if identical)
+/// * `total_bytes_compared` - Total bytes compared
+/// * `flags` - Status flags (bit 0: size_mismatch)
+pub fn compare_result_message(
+    identical: bool,
+    first_mismatch_offset: u64,
+    total_bytes_compared: u64,
+    flags: u32,
+) -> guest_::GuestMessage {
+    let mut msg = guest_::GuestMessage::default();
+    msg.level = guest_::Level::Info;
+
+    let mut result = guest_::CompareResultMessage::default();
+    result.identical = identical;
+    result.first_mismatch_offset = first_mismatch_offset;
+    result.total_bytes_compared = total_bytes_compared;
+    result.flags = flags;
+
+    msg.payload = Some(guest_::GuestMessage_::Payload::CompareResult(result));
+    msg
+}
+
 // =============================================================================
 // VMM -> Guest configuration message support
 // =============================================================================

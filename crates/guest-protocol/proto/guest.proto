@@ -160,6 +160,19 @@ message CheckResultMessage {
   uint32 chain_errors = 11;
 }
 
+// Image comparison result (from compare operation)
+message CompareResultMessage {
+  // Whether the images are logically identical
+  bool identical = 1;
+  // Byte offset of first content mismatch (only valid if not identical)
+  uint64 first_mismatch_offset = 2;
+  // Total bytes compared
+  uint64 total_bytes_compared = 3;
+  // Status flags:
+  //   bit 0: size_mismatch (images have different sizes)
+  uint32 flags = 4;
+}
+
 // Main message wrapper with level and payload
 message GuestMessage {
   Level level = 1;
@@ -171,5 +184,6 @@ message GuestMessage {
     CompleteMessage complete = 6;
     InfoResultMessage info_result = 7;
     CheckResultMessage check_result = 8;
+    CompareResultMessage compare_result = 9;
   }
 }

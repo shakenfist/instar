@@ -235,6 +235,12 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
                 check.format, check.total_errors, check.corruptions, check.leaks, check.flags
             )
         }
+        Some(guest_::GuestMessage_::Payload::CompareResult(cmp)) => {
+            format!(
+                "compare_result identical={} first_mismatch_offset={} total_bytes_compared={} flags=0x{:x}",
+                cmp.identical, cmp.first_mismatch_offset, cmp.total_bytes_compared, cmp.flags
+            )
+        }
         None => "empty payload".to_string(),
     };
 

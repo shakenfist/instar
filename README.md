@@ -53,6 +53,28 @@ The `--chain` flag iteratively runs the sandboxed info operation on each image
 in the backing chain, validating paths against a security allowlist to prevent
 directory traversal attacks.
 
+### Image Comparison
+
+```bash
+# Compare two images for identical content (matches qemu-img compare output)
+imago compare image1.raw image2.raw
+
+# Strict mode: fail if images differ in size (even if content matches)
+imago compare -s image1.raw image2.raw
+
+# JSON output for programmatic consumption
+imago compare --output json image1.raw image2.raw
+```
+
+Exit codes: 0 = identical, 1 = content differs.
+
+The compare operation reads both images sector-by-sector and reports the
+first byte offset where content diverges. When images differ in size,
+non-strict mode (default) treats extra zero-filled sectors as matching,
+while strict mode (`-s`) fails immediately on any size difference.
+
+Output is byte-for-byte identical with `qemu-img compare`.
+
 ### Image Integrity Check
 
 ```bash
@@ -249,9 +271,10 @@ make clean-tests
 ```
 
 The integration tests compare `imago info` output against `qemu-img info` to
-verify drop-in replacement compatibility, and validate `imago check` against
-deliberately corrupt test images. Test images are in the sibling
-`imago-testdata/` repository.
+verify drop-in replacement compatibility, validate `imago check` against
+deliberately corrupt test images, and cross-validate `imago compare` output
+against `qemu-img compare`. Test images are in the sibling `imago-testdata/`
+repository.
 
 **Running:**
 ```bash
@@ -269,7 +292,7 @@ imago/
 │   ├── vmm/        # Virtual machine monitor (host-side)
 │   ├── core/       # Core guest initialization
 │   ├── shared/     # Shared library code
-│   ├── operations/ # Pluggable operations (info, copy, check)
+│   ├── operations/ # Pluggable operations (info, copy, check, compare)
 │   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates
 │   └── guest-protocol/ # Protocol Buffers messaging for guests
