@@ -229,6 +229,10 @@ pub struct CallTable {
     /// Send check result message.
     /// Args: check_result pointer containing all check results
     pub send_check_result: unsafe extern "C" fn(*const CheckResult),
+
+    /// Send compare result message.
+    /// Args: compare_result pointer containing comparison results
+    pub send_compare_result: unsafe extern "C" fn(*const CompareResult),
 }
 
 /// Backing format type for QCOW2 header extension
@@ -451,8 +455,8 @@ impl CallTable {
     /// Magic value indicating a valid call table
     pub const MAGIC: u32 = 0x494D4147; // "IMAG"
 
-    /// Current ABI version (bumped: added verbose_print and send_check_result)
-    pub const VERSION: u32 = 11;
+    /// Current ABI version (bumped: added send_compare_result)
+    pub const VERSION: u32 = 12;
 }
 
 // ============================================================================
@@ -960,6 +964,126 @@ impl CheckResult {
     /// Check if the image has any leaks
     pub fn has_leaks(&self) -> bool {
         (self.flags & Self::FLAG_HAS_LEAKS) != 0 || self.leaks > 0
+    }
+}
+
+// ============================================================================
+// Compare operation configuration and results
+// ============================================================================
+
+/// Configuration for the compare operation.
+///
+/// This structure is written to OPERATION_CONFIG_ADDR by the VMM.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CompareConfig {
+    /// Magic number to verify config is valid (0x434D5052 = "CMPR")
+    pub magic: u32,
+
+    /// Configuration flags
+    pub flags: u32,
+}
+
+impl CompareConfig {
+    /// Magic value for compare config
+    pub const MAGIC: u32 = 0x434D5052; // "CMPR"
+
+    /// Flag: Strict mode (fail on size differences)
+    pub const FLAG_STRICT: u32 = 1 << 0;
+
+    /// Flag: Suppress output (quiet mode)
+    pub const FLAG_QUIET: u32 = 1 << 1;
+
+    /// Flag: Verbose logging
+    pub const FLAG_VERBOSE: u32 = 1 << 31;
+
+    /// Create a default config
+    pub const fn default_config() -> Self {
+        Self {
+            magic: Self::MAGIC,
+            flags: 0,
+        }
+    }
+
+    /// Check if config is valid
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+
+    /// Check if strict mode is enabled
+    pub fn is_strict(&self) -> bool {
+        (self.flags & Self::FLAG_STRICT) != 0
+    }
+
+    /// Check if quiet flag is set
+    pub fn is_quiet(&self) -> bool {
+        (self.flags & Self::FLAG_QUIET) != 0
+    }
+}
+
+/// Result structure for the compare operation.
+///
+/// Returned via send_compare_result call table function.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CompareResult {
+    /// Magic number to verify result is valid (0x434D5253 = "CMRS")
+    pub magic: u32,
+
+    /// Whether images are logically identical
+    pub identical: u32, // u32 for FFI alignment (0=different, 1=identical)
+
+    /// Byte offset of first content mismatch (only valid if not identical)
+    pub first_mismatch_offset: u64,
+
+    /// Total bytes compared
+    pub total_bytes_compared: u64,
+
+    /// Status flags
+    pub flags: u32,
+
+    /// Reserved for future use
+    pub _reserved: u32,
+}
+
+impl Default for CompareResult {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CompareResult {
+    /// Magic value for compare result
+    pub const MAGIC: u32 = 0x434D5253; // "CMRS"
+
+    /// Flag: Images have different sizes
+    pub const FLAG_SIZE_MISMATCH: u32 = 1 << 0;
+
+    /// Create a new empty result (defaults to not identical)
+    pub const fn new() -> Self {
+        Self {
+            magic: Self::MAGIC,
+            identical: 0,
+            first_mismatch_offset: 0,
+            total_bytes_compared: 0,
+            flags: 0,
+            _reserved: 0,
+        }
+    }
+
+    /// Check if result is valid
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+
+    /// Check if images are identical
+    pub fn is_identical(&self) -> bool {
+        self.identical != 0
+    }
+
+    /// Check if images have different sizes
+    pub fn has_size_mismatch(&self) -> bool {
+        (self.flags & Self::FLAG_SIZE_MISMATCH) != 0
     }
 }
 

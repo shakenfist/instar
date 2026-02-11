@@ -445,3 +445,14 @@ pub fn send_check_result(result: &shared::CheckResult) {
     );
     send_message(&msg);
 }
+
+/// Send a compare result message
+pub fn send_compare_result(result: &shared::CompareResult) {
+    let msg = guest_protocol::compare_result_message(
+        result.is_identical(),
+        result.first_mismatch_offset,
+        result.total_bytes_compared,
+        result.flags,
+    );
+    send_message(&msg);
+}
