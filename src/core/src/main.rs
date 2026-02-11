@@ -175,7 +175,28 @@ pub extern "C" fn _start() -> ! {
         // Store input device in the device array at index 0
         let devices = INPUT_DEVICES.get_mut();
         devices[0] = Some(input);
-        *INPUT_DEVICE_COUNT.get_mut() = 1;
+        let mut active_count: usize = 1;
+
+        // Initialize additional input devices for backing chain
+        for i in 1..config.input_device_count {
+            let sector_size = config.extra_input_sector_sizes[i - 1];
+            if sector_size == 0 {
+                break;
+            }
+            let mmio = device_mmio_base(i);
+            let vq = device_vq_base(i);
+            match VirtioBlock::init(mmio, vq, sector_size, "chain") {
+                Some(dev) => {
+                    devices[i] = Some(dev);
+                    active_count += 1;
+                }
+                None => {
+                    debug_print("core: chain device init failed\n");
+                    break;
+                }
+            }
+        }
+        *INPUT_DEVICE_COUNT.get_mut() = active_count;
 
         *OUTPUT_DEVICE.get_mut() = output;
         *CONFIG.get_mut() = Some(config.clone());
