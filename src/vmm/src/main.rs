@@ -90,6 +90,14 @@ const CHECK_CONFIG_FLAG_CHAIN: u32 = 1 << 3;
 #[allow(dead_code)]
 const CHECK_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
 
+// CompareConfig constants (must match shared crate)
+const COMPARE_CONFIG_MAGIC: u32 = 0x434D5052; // "CMPR"
+const COMPARE_CONFIG_FLAG_STRICT: u32 = 1 << 0;
+#[allow(dead_code)]
+const COMPARE_CONFIG_FLAG_QUIET: u32 = 1 << 1;
+#[allow(dead_code)]
+const COMPARE_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
+
 // CheckResult flag constants (must match shared crate)
 const CHECK_RESULT_FLAG_VALID: u32 = 1 << 0;
 #[allow(dead_code)]
@@ -575,6 +583,12 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
             format!(
                 "check_result format={} errors={} corruptions={} leaks={} flags=0x{:x}",
                 check.format, check.total_errors, check.corruptions, check.leaks, check.flags
+            )
+        }
+        Some(guest_::GuestMessage_::Payload::CompareResult(cmp)) => {
+            format!(
+                "compare_result identical={} first_mismatch_offset={} total_bytes_compared={} flags=0x{:x}",
+                cmp.identical, cmp.first_mismatch_offset, cmp.total_bytes_compared, cmp.flags
             )
         }
         None => "empty payload".to_string(),
@@ -1657,6 +1671,8 @@ enum Commands {
     Copy(CopyArgs),
     /// Check image structural integrity (partial L2 validation; see docs/quirks.md)
     Check(CheckArgs),
+    /// Compare two disk images sector by sector
+    Compare(CompareArgs),
     /// Display or validate configuration
     Config(ConfigArgs),
 }
@@ -1777,6 +1793,31 @@ struct CheckArgs {
 }
 
 #[derive(Args, Debug)]
+struct CompareArgs {
+    /// First image file
+    image1: String,
+
+    /// Second image file
+    image2: String,
+
+    /// Sector size for reading images (default: 65536)
+    #[arg(long, default_value = "65536")]
+    sector_size: u32,
+
+    /// Output format: human (default) or json
+    #[arg(long, default_value = "human", value_parser = ["human", "json"])]
+    output: String,
+
+    /// Strict mode: fail on size differences
+    #[arg(short, long)]
+    strict: bool,
+
+    /// Quiet mode: only show errors
+    #[arg(short, long)]
+    quiet: bool,
+}
+
+#[derive(Args, Debug)]
 struct ConfigArgs {
     /// Show which file each config value came from
     #[arg(long)]
@@ -1804,6 +1845,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Info(args) => run_info(args, verbose),
         Commands::Copy(args) => run_copy(args, verbose),
         Commands::Check(args) => run_check(args, verbose),
+        Commands::Compare(args) => run_compare(args, verbose),
         Commands::Config(args) => run_config(args),
     }
 }
@@ -3166,6 +3208,449 @@ fn print_check_result_json(
     println!("    \"dirty\": {},", is_dirty);
     println!("    \"corrupt\": {},", is_corrupt);
     println!("    \"chain-errors\": {}", result.chain_errors);
+    println!("}}");
+}
+
+fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate sector size (must be power of 2, 512 to 64KB)
+    if !(512..=MAX_SECTOR_SIZE).contains(&args.sector_size) || !args.sector_size.is_power_of_two() {
+        return Err(format!(
+            "sector size must be a power of 2, 512 to {} (got {})",
+            MAX_SECTOR_SIZE, args.sector_size
+        )
+        .into());
+    }
+
+    // Auto-discover binaries in same directory as executable
+    let core_path = get_binary_path("core.bin");
+    let operation_path = get_binary_path("compare.bin");
+
+    // Load core binary (device init, call table setup)
+    let core_code = load_guest_binary(core_path.to_str().unwrap())?;
+    debug!(
+        "Loaded core binary: {} bytes from {}",
+        core_code.len(),
+        core_path.display()
+    );
+
+    // Load operation binary (compare)
+    let operation_code = load_guest_binary(operation_path.to_str().unwrap())?;
+    debug!(
+        "Loaded operation binary: {} bytes from {}",
+        operation_code.len(),
+        operation_path.display()
+    );
+
+    // Get input file metadata for both images
+    let input1_metadata = std::fs::metadata(&args.image1)?;
+    let input1_size = input1_metadata.len();
+    let input2_metadata = std::fs::metadata(&args.image2)?;
+    let input2_size = input2_metadata.len();
+    debug!(
+        "Image 1: {} ({} bytes, {} sectors @ {} bytes/sector)",
+        args.image1,
+        input1_size,
+        input1_size / args.sector_size as u64,
+        args.sector_size
+    );
+    debug!(
+        "Image 2: {} ({} bytes, {} sectors @ {} bytes/sector)",
+        args.image2,
+        input2_size,
+        input2_size / args.sector_size as u64,
+        args.sector_size
+    );
+
+    // Open KVM
+    let kvm = Kvm::new()?;
+    debug!("KVM API version: {}", kvm.get_api_version());
+
+    // Check KVM binary statistics capability
+    let kvm_stats_checker = kvm_stats::KvmStatsChecker::new(&kvm);
+    kvm_stats_checker.display_status();
+
+    // Create VM
+    let vm = kvm.create_vm()?;
+    debug!("Created VM");
+
+    // Create guest memory
+    let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
+    debug!("Allocated {} bytes of guest memory", GUEST_MEM_SIZE);
+
+    // Get the memory region for KVM registration
+    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let host_addr = region.as_ptr() as u64;
+
+    // Set up KVM memory region
+    let mem_region = kvm_userspace_memory_region {
+        slot: 0,
+        guest_phys_addr: 0,
+        memory_size: GUEST_MEM_SIZE,
+        userspace_addr: host_addr,
+        flags: 0,
+    };
+    unsafe {
+        vm.set_user_memory_region(mem_region)?;
+    }
+    debug!("Configured memory region");
+
+    // Set up GDT
+    setup_gdt(&guest_mem)?;
+    debug!("Set up GDT at 0x{:x}", GDT_BASE);
+
+    // Set up page tables (identity map)
+    setup_page_tables(&guest_mem)?;
+    debug!("Set up page tables at 0x{:x}", PAGE_TABLE_BASE);
+
+    // Load core binary at GUEST_CODE_BASE (0x10000)
+    guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
+    debug!("Loaded core binary at 0x{:x}", GUEST_CODE_BASE);
+
+    // Load operation binary at OPERATION_LOAD_ADDR (0x20000)
+    guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
+    debug!("Loaded operation binary at 0x{:x}", OPERATION_LOAD_ADDR);
+
+    // Write CompareConfig at OPERATION_CONFIG_ADDR
+    // Layout: magic (u32), flags (u32)
+    let mut compare_flags: u32 = 0;
+    if args.strict {
+        compare_flags |= COMPARE_CONFIG_FLAG_STRICT;
+    }
+    if args.quiet {
+        compare_flags |= COMPARE_CONFIG_FLAG_QUIET;
+    }
+    if verbose {
+        compare_flags |= COMPARE_CONFIG_FLAG_VERBOSE;
+    }
+    guest_mem.write_obj(COMPARE_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
+    guest_mem.write_obj(compare_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
+    debug!(
+        "Wrote compare config at 0x{:x} (flags=0x{:x})",
+        OPERATION_CONFIG_ADDR, compare_flags
+    );
+
+    // Create device set for managing virtio-block devices
+    let mut device_set = DeviceSet::new();
+
+    // Set up two input devices (image1 = device 0, image2 = device 1)
+    let mut io_events: Vec<IoEvent> = Vec::new();
+
+    let input1_backing = BackingStore::open(Path::new(&args.image1), true, None, false)?;
+    let input1_mmio = device_mmio_base(0);
+    let input1_vq = device_vq_base(0);
+    let input1_device = VirtioBlockDevice::new(
+        input1_backing,
+        input1_size,
+        args.sector_size as u64,
+        true, // read-only
+        input1_mmio,
+        input1_vq,
+    );
+    debug!(
+        "Created device [0] at MMIO 0x{:x}, VQ 0x{:x}: {}",
+        input1_mmio, input1_vq, args.image1
+    );
+    let input1_device = Arc::new(Mutex::new(input1_device));
+    device_set.add_device(Arc::clone(&input1_device), true);
+    io_events.push(IoEvent::new(input1_mmio)?);
+
+    let input2_backing = BackingStore::open(Path::new(&args.image2), true, None, false)?;
+    let input2_mmio = device_mmio_base(1);
+    let input2_vq = device_vq_base(1);
+    let input2_device = VirtioBlockDevice::new(
+        input2_backing,
+        input2_size,
+        args.sector_size as u64,
+        true, // read-only
+        input2_mmio,
+        input2_vq,
+    );
+    debug!(
+        "Created device [1] at MMIO 0x{:x}, VQ 0x{:x}: {}",
+        input2_mmio, input2_vq, args.image2
+    );
+    let input2_device = Arc::new(Mutex::new(input2_device));
+    device_set.add_device(Arc::clone(&input2_device), true);
+    io_events.push(IoEvent::new(input2_mmio)?);
+
+    // Wrap guest memory in Arc for sharing
+    let guest_mem = Arc::new(guest_mem);
+
+    // Create shared statistics tracker
+    let vmm_stats = Arc::new(Mutex::new(VmmStats::new()));
+
+    // Set up ioeventfd for queue notifications
+    let mut io_thread: Option<io_thread::IoThread> = None;
+
+    let mut registered_count = 0usize;
+    let mut registration_failed = false;
+    for evt in io_events.iter_mut() {
+        if let Err(e) = evt.register(&vm) {
+            debug!(
+                "ioeventfd: failed to register ({:?}), falling back to VM exits",
+                e
+            );
+            registration_failed = true;
+            break;
+        }
+        registered_count += 1;
+    }
+
+    if registration_failed {
+        for evt in io_events.iter_mut().take(registered_count) {
+            if let Err(e) = evt.unregister(&vm) {
+                warn!("ioeventfd: failed to unregister during rollback: {:?}", e);
+            }
+        }
+    }
+
+    let all_registered = !registration_failed;
+
+    if all_registered && !io_events.is_empty() {
+        debug!(
+            "ioeventfd: enabled for {} device(s) (with I/O thread)",
+            io_events.len()
+        );
+
+        let io_devices = device_set.create_io_devices(io_events);
+
+        io_thread = Some(io_thread::IoThread::new(
+            io_devices,
+            Arc::clone(&guest_mem),
+            Arc::clone(&vmm_stats),
+        ));
+    }
+
+    // Create vCPU
+    let mut vcpu = vm.create_vcpu(0)?;
+    debug!("Created vCPU");
+
+    // Set up registers
+    let mut sregs = vcpu.get_sregs()?;
+    setup_sregs(&mut sregs);
+    vcpu.set_sregs(&sregs)?;
+    debug!("Configured special registers for long mode");
+
+    let mut regs = vcpu.get_regs()?;
+    setup_regs(&mut regs);
+    vcpu.set_regs(&regs)?;
+    debug!(
+        "Configured general registers (RIP=0x{:x}, RSP=0x{:x})",
+        regs.rip, regs.rsp
+    );
+
+    // Create serial decoder for protobuf messages from guest
+    let mut serial_decoder = SerialDecoder::new();
+
+    // Create serial transmitter for sending config to guest
+    let mut serial_transmitter = SerialTransmitter::new();
+
+    // Create debug buffer for COM2 output
+    let mut debug_buffer = DebugBuffer::new();
+
+    // Queue the configuration message for transmission (2 input devices)
+    let config = vmm_config_chain(args.sector_size, 2);
+    serial_transmitter.queue_config(&config);
+    debug!(
+        "Queued configuration message ({} bytes) for guest",
+        serial_transmitter.buffer.len()
+    );
+
+    // Track compare result for exit code
+    let mut compare_identical = false;
+    let mut compare_result_received = false;
+
+    // Track VM errors
+    let mut vm_error: Option<String> = None;
+
+    // Run the vCPU loop
+    debug!("Starting guest execution");
+
+    loop {
+        match vcpu.run()? {
+            VcpuExit::Hlt => {
+                vmm_stats.lock().unwrap().record_hlt();
+                info!("Guest executed HLT");
+                debug!("Compare operation completed!");
+                break;
+            }
+            VcpuExit::IoOut(port, data) => {
+                vmm_stats.lock().unwrap().record_io_out();
+                if port == SERIAL_PORT {
+                    for &byte in data {
+                        if let Some(msg) = serial_decoder.add_byte(byte) {
+                            let is_compare_result = matches!(
+                                &msg.payload,
+                                Some(guest_::GuestMessage_::Payload::CompareResult(_))
+                            );
+                            if is_compare_result {
+                                if let Some(guest_::GuestMessage_::Payload::CompareResult(result)) =
+                                    &msg.payload
+                                {
+                                    let size_mismatch = (result.flags & 1) != 0;
+                                    // In strict mode, size mismatch means not identical
+                                    // regardless of content
+                                    compare_identical =
+                                        result.identical && !(args.strict && size_mismatch);
+                                    compare_result_received = true;
+                                }
+                                print_compare_result(&msg, &args.output, args.strict);
+                            } else {
+                                debug!("{}", format_message(&msg));
+                            }
+                        }
+                    }
+                } else if port == DEBUG_PORT {
+                    for &byte in data {
+                        if let Some(line) = debug_buffer.add_byte(byte) {
+                            debug!("[GUEST] {}", line);
+                        }
+                    }
+                } else {
+                    debug!("IO OUT: port=0x{:x}, data={:?}", port, data);
+                }
+            }
+            VcpuExit::IoIn(port, data) => {
+                vmm_stats.lock().unwrap().record_io_in();
+                if port == SERIAL_PORT {
+                    for byte in data.iter_mut() {
+                        *byte = serial_transmitter.next_byte().unwrap_or(0);
+                    }
+                } else if port == SERIAL_PORT + 5 {
+                    let mut lsr = 0x60u8;
+                    if serial_transmitter.has_data() {
+                        lsr |= 0x01;
+                    }
+                    data[0] = lsr;
+                } else {
+                    for byte in data {
+                        *byte = 0;
+                    }
+                }
+            }
+            VcpuExit::MmioRead(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_read();
+                let value = device_set.mmio_read(addr);
+                write_mmio_data(data, value);
+            }
+            VcpuExit::MmioWrite(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_write();
+                let value = read_mmio_data(data);
+                if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
+                    if io_thread.is_none() && should_process {
+                        device_set.process_queue_for_device(
+                            device_index,
+                            &guest_mem,
+                            &vmm_stats,
+                        )?;
+                    }
+                }
+            }
+            VcpuExit::Shutdown => {
+                vmm_stats.lock().unwrap().record_shutdown();
+                eprintln!("\n--- VM Shutdown (triple fault?) ---");
+                vm_error = Some("VM shutdown (triple fault)".to_string());
+                break;
+            }
+            VcpuExit::FailEntry(reason, cpu) => {
+                vmm_stats.lock().unwrap().record_fail_entry();
+                eprintln!("VM Entry Failed! reason=0x{:x}, cpu={}", reason, cpu);
+                vm_error = Some(format!(
+                    "VM entry failed: reason=0x{:x}, cpu={}",
+                    reason, cpu
+                ));
+                break;
+            }
+            exit => {
+                vmm_stats.lock().unwrap().record_unknown();
+                eprintln!("Unexpected VM exit: {:?}", exit);
+                vm_error = Some(format!("unexpected VM exit: {:?}", exit));
+                break;
+            }
+        }
+    }
+
+    if let Some(mut thread) = io_thread {
+        thread.stop();
+    }
+
+    if log::log_enabled!(log::Level::Debug) {
+        vmm_stats.lock().unwrap().display();
+    }
+
+    // Return error if VM crashed or failed
+    if let Some(error) = vm_error {
+        return Err(error.into());
+    }
+
+    // Return error if no result was received
+    if !compare_result_received {
+        return Err("compare operation failed: no result received".into());
+    }
+
+    // Exit with code 1 if images differ (no error message, matching
+    // qemu-img compare which just prints the mismatch info to stdout)
+    if !compare_identical {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+/// Print compare result in human-readable or JSON format.
+///
+/// Human output matches qemu-img compare (all output to stdout):
+/// - Identical: "Images are identical.\n"
+/// - Different: "Content mismatch at offset {offset}!\n"
+/// - Size warning (non-strict): "Warning: Image size mismatch!\n"
+/// - Size strict: "Strict mode: Image size mismatch!\n"
+fn print_compare_result(msg: &guest_::GuestMessage, output_format: &str, strict: bool) {
+    if let Some(guest_::GuestMessage_::Payload::CompareResult(result)) = &msg.payload {
+        if output_format == "json" {
+            print_compare_result_json(result);
+            return;
+        }
+
+        // Human-readable output (matches qemu-img compare exactly)
+        // All output goes to stdout to match qemu-img behavior
+        let size_mismatch = (result.flags & 1) != 0; // FLAG_SIZE_MISMATCH
+
+        if size_mismatch {
+            if strict {
+                println!("Strict mode: Image size mismatch!");
+            } else {
+                println!("Warning: Image size mismatch!");
+            }
+        }
+
+        if !strict || !size_mismatch {
+            if result.identical {
+                println!("Images are identical.");
+            } else {
+                println!(
+                    "Content mismatch at offset {}!",
+                    result.first_mismatch_offset
+                );
+            }
+        }
+    }
+}
+
+/// Print compare result in JSON format
+fn print_compare_result_json(result: &guest_protocol::guest_::CompareResultMessage) {
+    let size_mismatch = (result.flags & 1) != 0;
+
+    println!("{{");
+    println!("    \"identical\": {},", result.identical);
+    println!(
+        "    \"first-mismatch-offset\": {},",
+        result.first_mismatch_offset
+    );
+    println!(
+        "    \"total-bytes-compared\": {},",
+        result.total_bytes_compared
+    );
+    println!("    \"size-mismatch\": {}", size_mismatch);
     println!("}}");
 }
 

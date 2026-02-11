@@ -16,7 +16,7 @@ imago/
 │   ├── vmm/        # Virtual machine monitor (host-side)
 │   ├── core/       # Core guest initialization
 │   ├── shared/     # Shared library code
-│   ├── operations/ # Pluggable operations (info, copy, check)
+│   ├── operations/ # Pluggable operations (info, copy, check, compare)
 │   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates (guest-protocol)
 ├── prototypes/     # Experimental implementations (11 KVM prototypes)
@@ -145,8 +145,9 @@ sudo src/target/release/imago copy <INPUT> <OUTPUT>
 ### Integration Testing
 
 Integration tests compare `imago info` output against `qemu-img info` to verify
-drop-in replacement compatibility, and validate `imago check` against
-deliberately corrupt test images. Tests use Python testtools/stestr.
+drop-in replacement compatibility, validate `imago check` against deliberately
+corrupt test images, and cross-validate `imago compare` output against
+`qemu-img compare`. Tests use Python testtools/stestr.
 
 ```bash
 # Set up test environment
