@@ -202,8 +202,15 @@ unsafe fn init_qcow2_state(
     if cluster_bits < 9 || cluster_bits > 21 {
         return None;
     }
+    let cluster_size = 1u64 << cluster_bits;
+    // Reject clusters larger than our scratch buffers (MAX_SECTOR_SIZE = 64 KiB).
+    // The QCOW2 spec allows cluster_bits up to 21 (2 MiB), but our fixed-size
+    // comparison and decompression buffers cannot handle clusters that large.
+    if cluster_size > MAX_SECTOR_SIZE as u64 {
+        return None;
+    }
     state.cluster_bits = cluster_bits;
-    state.cluster_size = 1u64 << cluster_bits;
+    state.cluster_size = cluster_size;
 
     // Read virtual size (not used directly but validates header)
     let _virtual_size = read_u64_be_cached(
@@ -717,11 +724,16 @@ pub unsafe extern "C" fn _start() -> u64 {
 
     // Use the larger cluster size as the comparison chunk size.
     // Both must be a power of 2 so max works correctly.
-    let chunk_size = if dev0_info.cluster_size > dev1_info.cluster_size {
+    let mut chunk_size = if dev0_info.cluster_size > dev1_info.cluster_size {
         dev0_info.cluster_size
     } else {
         dev1_info.cluster_size
     };
+
+    // Clamp to buffer size: BUF_COMPARE_1/BUF_COMPARE_2 are MAX_SECTOR_SIZE each.
+    if chunk_size > MAX_SECTOR_SIZE as u64 {
+        chunk_size = MAX_SECTOR_SIZE as u64;
+    }
 
     // Compare virtual content up to the minimum virtual size
     let min_vsize = if vsize1 < vsize2 { vsize1 } else { vsize2 };
