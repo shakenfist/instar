@@ -381,7 +381,15 @@ unsafe fn read_compressed_cluster(
 
     let compressed_offset = l2_entry & offset_mask;
     let nb_sectors = ((l2_entry >> csize_shift) & csize_mask) + 1;
-    let compressed_size = nb_sectors * 512 - (compressed_offset & 511);
+    let nb_sectors_bytes = match nb_sectors.checked_mul(512) {
+        Some(v) => v,
+        None => return false,
+    };
+    let offset_remainder = compressed_offset & 511;
+    if nb_sectors_bytes < offset_remainder {
+        return false;
+    }
+    let compressed_size = nb_sectors_bytes - offset_remainder;
 
     if compressed_size == 0 || compressed_size > MAX_SECTOR_SIZE as u64 {
         return false;
