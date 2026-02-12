@@ -7,6 +7,7 @@ license = "Apache-2.0"
 
 [dependencies]
 shared = { path = "../../shared" }
+miniz_oxide = { version = "0.8", default-features = false }
 
 [profile.release]
 panic = "abort"

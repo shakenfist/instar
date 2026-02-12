@@ -68,10 +68,13 @@ imago compare --output json image1.raw image2.raw
 
 Exit codes: 0 = identical, 1 = content differs.
 
-The compare operation reads both images sector-by-sector and reports the
-first byte offset where content diverges. When images differ in size,
-non-strict mode (default) treats extra zero-filled sectors as matching,
-while strict mode (`-s`) fails immediately on any size difference.
+The compare operation reads the virtual content of both images and reports the
+first byte offset where content diverges. For QCOW2 images, this includes
+L1/L2 cluster table lookup and compressed cluster decompression (zlib/deflate),
+so comparisons work across formats (e.g., QCOW2 vs raw, compressed QCOW2 vs
+uncompressed QCOW2). When images differ in size, non-strict mode (default)
+treats extra zero-filled regions as matching, while strict mode (`-s`) fails
+immediately on any size difference.
 
 Output is byte-for-byte identical with `qemu-img compare`.
 
