@@ -454,29 +454,36 @@ unsafe fn read_compressed_cluster(
     let out_slice = core::slice::from_raw_parts_mut(out_buf, cluster_size as usize);
 
     // Use miniz_oxide's low-level decompress API for no_std
+    use miniz_oxide::inflate::core::inflate_flags;
+    use miniz_oxide::inflate::TINFLStatus;
+
     let mut decomp = miniz_oxide::inflate::core::DecompressorOxide::new();
-    let (_status, _in_consumed, out_produced) = miniz_oxide::inflate::core::decompress(
+    let (status, _in_consumed, out_produced) = miniz_oxide::inflate::core::decompress(
         &mut decomp,
         compressed_slice,
         out_slice,
         0,
-        miniz_oxide::inflate::core::inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER
-            | miniz_oxide::inflate::core::inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
+        inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER
+            | inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
     );
 
-    // Check that we produced exactly one cluster of output
-    if out_produced != cluster_size as usize {
+    // Check that decompression succeeded and produced exactly one cluster.
+    // Done means the stream was fully consumed; HasMoreOutput is acceptable
+    // when the output buffer is exactly cluster-sized (no more output needed).
+    let status_ok = status == TINFLStatus::Done || status == TINFLStatus::HasMoreOutput;
+    if !status_ok || out_produced != cluster_size as usize {
         // Try again without ZLIB header (raw deflate) since QCOW2
         // compression stores raw deflate data wrapped in a zlib stream
         let mut decomp2 = miniz_oxide::inflate::core::DecompressorOxide::new();
-        let (_status2, _in2, out2) = miniz_oxide::inflate::core::decompress(
+        let (status2, _in2, out2) = miniz_oxide::inflate::core::decompress(
             &mut decomp2,
             compressed_slice,
             out_slice,
             0,
-            miniz_oxide::inflate::core::inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
+            inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
         );
-        if out2 != cluster_size as usize {
+        let status2_ok = status2 == TINFLStatus::Done || status2 == TINFLStatus::HasMoreOutput;
+        if !status2_ok || out2 != cluster_size as usize {
             return false;
         }
     }
