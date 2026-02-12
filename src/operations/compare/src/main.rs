@@ -366,7 +366,7 @@ unsafe fn read_compressed_cluster(
     out_buf: *mut u8,
     cluster_size: u64,
     sector_size: usize,
-    _compressed_buf: *mut u8,
+    compressed_buf: *mut u8,
     bytes_read: &mut u64,
 ) -> bool {
     // Parse compressed L2 entry format:
@@ -403,7 +403,7 @@ unsafe fn read_compressed_cluster(
     let last_sector = (data_end + sector_size as u64 - 1) / sector_size as u64;
     let sectors_to_read = last_sector - first_sector;
 
-    // Ensure total read fits within BUF_CLUSTER_READ (MAX_SECTOR_SIZE bytes)
+    // Ensure total read fits within the compressed buffer (MAX_SECTOR_SIZE bytes)
     if sectors_to_read * sector_size as u64 > MAX_SECTOR_SIZE as u64 {
         return false;
     }
@@ -411,7 +411,7 @@ unsafe fn read_compressed_cluster(
     // Read all needed sectors into compressed_buf
     // We need to handle the case where compressed data spans multiple sectors
     // and doesn't start at a sector boundary.
-    let read_buf = BUF_CLUSTER_READ as *mut u8;
+    let read_buf = compressed_buf;
     for i in 0..sectors_to_read {
         let sector = first_sector + i;
         let buf_offset = (i as usize) * sector_size;
