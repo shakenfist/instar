@@ -247,6 +247,18 @@ unsafe fn init_qcow2_state(
         state.l1_cache_buf,
         bytes_read,
     )?;
+
+    // Validate L1 table offset: must be non-zero and the entire L1 table
+    // (l1_table_offset + l1_size * 8) must fit within the input device.
+    let actual_size = input_capacity.saturating_mul(sector_size as u64);
+    if l1_table_offset == 0 || l1_table_offset >= actual_size {
+        return None;
+    }
+    let l1_table_end = l1_table_offset.checked_add((l1_size as u64).saturating_mul(8))?;
+    if l1_table_end > actual_size {
+        return None;
+    }
+
     state.l1_table_offset = l1_table_offset;
 
     // Invalidate cache since we'll be reading L1/L2 tables from
@@ -279,8 +291,10 @@ unsafe fn qcow2_cluster_lookup(
         return Some(ClusterLookup::Unallocated);
     }
 
-    // Read L1 entry
-    let l1_byte_offset = state.l1_table_offset + l1_index * 8;
+    // Read L1 entry (use checked arithmetic to prevent overflow)
+    let l1_byte_offset = state
+        .l1_table_offset
+        .checked_add(l1_index.checked_mul(8)?)?;
     let l1_entry = read_u64_be_cached(
         call_table,
         state.device_idx,
@@ -298,8 +312,8 @@ unsafe fn qcow2_cluster_lookup(
         return Some(ClusterLookup::Unallocated);
     }
 
-    // Read L2 entry
-    let l2_byte_offset = l2_table_offset + l2_index * 8;
+    // Read L2 entry (use checked arithmetic to prevent overflow)
+    let l2_byte_offset = l2_table_offset.checked_add(l2_index.checked_mul(8)?)?;
     let l2_entry = read_u64_be_cached(
         call_table,
         state.device_idx,
