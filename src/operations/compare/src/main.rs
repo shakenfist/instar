@@ -395,6 +395,11 @@ unsafe fn read_compressed_cluster(
     let last_sector = (data_end + sector_size as u64 - 1) / sector_size as u64;
     let sectors_to_read = last_sector - first_sector;
 
+    // Ensure total read fits within BUF_CLUSTER_READ (MAX_SECTOR_SIZE bytes)
+    if sectors_to_read * sector_size as u64 > MAX_SECTOR_SIZE as u64 {
+        return false;
+    }
+
     // Read all needed sectors into compressed_buf
     // We need to handle the case where compressed data spans multiple sectors
     // and doesn't start at a sector boundary.
