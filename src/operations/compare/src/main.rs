@@ -312,6 +312,12 @@ unsafe fn qcow2_cluster_lookup(
         return Some(ClusterLookup::Unallocated);
     }
 
+    // Validate L2 table offset against device capacity
+    let actual_size = input_capacity.checked_mul(sector_size as u64)?;
+    if l2_table_offset >= actual_size {
+        return None;
+    }
+
     // Read L2 entry (use checked arithmetic to prevent overflow)
     let l2_byte_offset = l2_table_offset.checked_add(l2_index.checked_mul(8)?)?;
     let l2_entry = read_u64_be_cached(
