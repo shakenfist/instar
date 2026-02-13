@@ -171,6 +171,7 @@ make clean-tests
 - `tests/test_info_safe.py` - Tests against known-safe images
 - `tests/test_info_malicious.py` - Tests against malicious images using expected overrides
 - `tests/test_check_formats.py` - Tests for check operation (format detection, corruption, validation)
+- `tests/test_compare.py` - Tests for compare operation (raw-vs-raw, QCOW2-vs-raw, QCOW2-vs-QCOW2, compressed QCOW2)
 - `tests/expected_outputs/` - Expected output files for malicious images
 
 **Adding new test images:**
