@@ -467,10 +467,9 @@ unsafe fn read_compressed_cluster(
     );
 
     // Check that decompression succeeded and produced exactly one cluster.
-    // Done means the stream was fully consumed; HasMoreOutput is acceptable
-    // when the output buffer is exactly cluster-sized (no more output needed).
-    let status_ok = status == TINFLStatus::Done || status == TINFLStatus::HasMoreOutput;
-    if !status_ok || out_produced != cluster_size as usize {
+    // Only Done is acceptable — HasMoreOutput means the data decompresses to
+    // more than cluster_size bytes, indicating a corrupt or malicious image.
+    if status != TINFLStatus::Done || out_produced != cluster_size as usize {
         // Try again without ZLIB header (raw deflate) since QCOW2
         // compression stores raw deflate data wrapped in a zlib stream
         let mut decomp2 = miniz_oxide::inflate::core::DecompressorOxide::new();
@@ -481,8 +480,7 @@ unsafe fn read_compressed_cluster(
             0,
             inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
         );
-        let status2_ok = status2 == TINFLStatus::Done || status2 == TINFLStatus::HasMoreOutput;
-        if !status2_ok || out2 != cluster_size as usize {
+        if status2 != TINFLStatus::Done || out2 != cluster_size as usize {
             return false;
         }
     }
