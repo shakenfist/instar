@@ -539,6 +539,12 @@ unsafe fn read_virtual_cluster(
                 None => return false,
             };
 
+            // Always use the actual QCOW2 cluster size for reading/decompressing.
+            // The caller may pass a smaller cluster_size for the final partial chunk,
+            // but QCOW2 clusters must be read in full (decompression expects exactly
+            // one cluster). The caller limits how many bytes are compared afterward.
+            let qcow2_cluster_size = state.cluster_size;
+
             match qcow2_cluster_lookup(
                 call_table,
                 state,
@@ -549,7 +555,7 @@ unsafe fn read_virtual_cluster(
             ) {
                 Some(ClusterLookup::Unallocated) => {
                     // Unallocated: fill with zeros
-                    core::ptr::write_bytes(buf, 0, cluster_size as usize);
+                    core::ptr::write_bytes(buf, 0, qcow2_cluster_size as usize);
                     true
                 }
                 Some(ClusterLookup::Standard(host_offset)) => read_cluster_sectors(
@@ -557,7 +563,7 @@ unsafe fn read_virtual_cluster(
                     device_idx,
                     host_offset,
                     buf,
-                    cluster_size,
+                    qcow2_cluster_size,
                     sector_size,
                     bytes_read,
                 ),
@@ -567,7 +573,7 @@ unsafe fn read_virtual_cluster(
                     l2_entry,
                     state.cluster_bits,
                     buf,
-                    cluster_size,
+                    qcow2_cluster_size,
                     sector_size,
                     BUF_COMPRESSED_IN as *mut u8,
                     bytes_read,
