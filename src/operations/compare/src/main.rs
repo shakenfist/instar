@@ -548,7 +548,12 @@ unsafe fn read_virtual_cluster(
             // The caller may pass a smaller cluster_size for the final partial chunk,
             // but QCOW2 clusters must be read in full (decompression expects exactly
             // one cluster). The caller limits how many bytes are compared afterward.
+            // Safety: buf must be at least qcow2_cluster_size bytes, not just
+            // cluster_size bytes. This is guaranteed because qcow2_init_state()
+            // rejects cluster sizes > MAX_SECTOR_SIZE, and the buffers
+            // (BUF_COMPARE_1/BUF_COMPARE_2) are each MAX_SECTOR_SIZE bytes.
             let qcow2_cluster_size = state.cluster_size;
+            debug_assert!(qcow2_cluster_size <= MAX_SECTOR_SIZE as u64);
 
             match qcow2_cluster_lookup(
                 call_table,
