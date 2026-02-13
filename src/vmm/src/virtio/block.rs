@@ -127,7 +127,9 @@ impl VirtioBlockDevice {
     ) -> Self {
         Self {
             backing,
-            capacity: size_bytes / sector_size,
+            // Round up so partial final sectors are included.
+            // BackingStore handles reads beyond file end by zero-padding.
+            capacity: size_bytes.div_ceil(sector_size),
             sector_size,
             read_only,
             mmio_base,

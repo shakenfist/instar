@@ -3241,7 +3241,19 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         operation_path.display()
     );
 
-    // Get input file metadata for both images
+    // Detect format and metadata for both images via sandboxed info operation
+    let info1 = execute_info_operation(Path::new(&args.image1), args.sector_size, false)?;
+    let info2 = execute_info_operation(Path::new(&args.image2), args.sector_size, false)?;
+    debug!(
+        "Image 1: {} format={}, virtual_size={}, cluster_size={}, flags=0x{:x}",
+        args.image1, info1.format, info1.virtual_size, info1.cluster_size, info1.flags
+    );
+    debug!(
+        "Image 2: {} format={}, virtual_size={}, cluster_size={}, flags=0x{:x}",
+        args.image2, info2.format, info2.virtual_size, info2.cluster_size, info2.flags
+    );
+
+    // Get input file metadata for both images (physical file size for device setup)
     let input1_metadata = std::fs::metadata(&args.image1)?;
     let input1_size = input1_metadata.len();
     let input2_metadata = std::fs::metadata(&args.image2)?;
@@ -3327,6 +3339,39 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     debug!(
         "Wrote compare config at 0x{:x} (flags=0x{:x})",
         OPERATION_CONFIG_ADDR, compare_flags
+    );
+
+    // Write ChainConfig with format metadata for both images
+    // This tells the guest binary what format each device is and its virtual size
+    let format1 = ImageFormat::from_str(&info1.format);
+    let format2 = ImageFormat::from_str(&info2.format);
+
+    guest_mem.write_obj(CHAIN_CONFIG_MAGIC, GuestAddress(CHAIN_CONFIG_ADDR))?;
+    guest_mem.write_obj(2u32, GuestAddress(CHAIN_CONFIG_ADDR + 4))?; // device_count
+    guest_mem.write_obj(CHAIN_CONFIG_VERSION, GuestAddress(CHAIN_CONFIG_ADDR + 8))?;
+    guest_mem.write_obj(0u32, GuestAddress(CHAIN_CONFIG_ADDR + 12))?; // reserved
+
+    // Device 0 info
+    let dev0_base = CHAIN_CONFIG_ADDR + 16;
+    guest_mem.write_obj(format1.to_shared_format_u32(), GuestAddress(dev0_base))?;
+    guest_mem.write_obj(info1.flags, GuestAddress(dev0_base + 4))?;
+    guest_mem.write_obj(info1.virtual_size, GuestAddress(dev0_base + 8))?;
+    guest_mem.write_obj(info1.actual_size, GuestAddress(dev0_base + 16))?;
+    guest_mem.write_obj(info1.cluster_size, GuestAddress(dev0_base + 24))?;
+    guest_mem.write_obj(0u32, GuestAddress(dev0_base + 28))?; // reserved
+
+    // Device 1 info
+    let dev1_base = CHAIN_CONFIG_ADDR + 16 + 32;
+    guest_mem.write_obj(format2.to_shared_format_u32(), GuestAddress(dev1_base))?;
+    guest_mem.write_obj(info2.flags, GuestAddress(dev1_base + 4))?;
+    guest_mem.write_obj(info2.virtual_size, GuestAddress(dev1_base + 8))?;
+    guest_mem.write_obj(info2.actual_size, GuestAddress(dev1_base + 16))?;
+    guest_mem.write_obj(info2.cluster_size, GuestAddress(dev1_base + 24))?;
+    guest_mem.write_obj(0u32, GuestAddress(dev1_base + 28))?; // reserved
+
+    debug!(
+        "Wrote chain config at 0x{:x}: device_count=2, formats=[{}, {}]",
+        CHAIN_CONFIG_ADDR, info1.format, info2.format
     );
 
     // Create device set for managing virtio-block devices

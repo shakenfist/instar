@@ -55,14 +55,36 @@ structures via binary manipulation.
 
 Tests for the `imago compare` operation, cross-validated against `qemu-img
 compare`:
+
+**Raw-vs-raw (`TestCompareRawIdentical`, `TestCompareRawDifferent`,
+`TestCompareRawSizeMismatch`, `TestCompareRawJson`):**
 - **Identical images**: Self-compare and two identical files
 - **Different content**: Mismatch at offset 0 and at mid-file offsets
 - **Size mismatch**: Non-strict (zeros = identical), non-strict (non-zero =
   differs), and strict mode (always fails on size difference)
 - **JSON output**: Validates `identical`, `first-mismatch-offset`,
   `total-bytes-compared`, and `size-mismatch` fields
-- **qemu-img cross-validation**: Every scenario verifies byte-for-byte
-  identical stdout and matching exit codes with `qemu-img compare`
+
+**QCOW2-vs-raw (`TestCompareQcow2VsRaw`):**
+- Identical content across formats (including all-zeros)
+- Different content reports correct mismatch offset
+- Cross-validated against `qemu-img compare`
+
+**QCOW2-vs-QCOW2 (`TestCompareQcow2VsQcow2`):**
+- Identical and different content between two QCOW2 images
+- Virtual size mismatch handling
+- Cross-validated against `qemu-img compare`
+
+**Compressed QCOW2 (`TestCompareQcow2Compressed`):**
+- Compressed QCOW2 vs raw with same content (zlib decompression)
+- Compressed vs uncompressed QCOW2 with same content
+- Cross-validated against `qemu-img compare`
+
+Test images are created at runtime using `qemu-img create`, `qemu-io write`,
+and `qemu-img convert -c` (for compressed), so no external testdata is needed.
+
+**qemu-img cross-validation**: Every scenario verifies byte-for-byte
+identical stdout and matching exit codes with `qemu-img compare`.
 
 ### Security Tests (`test_security.py`)
 
