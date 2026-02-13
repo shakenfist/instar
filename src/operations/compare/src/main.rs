@@ -385,6 +385,7 @@ unsafe fn read_compressed_cluster(
     cluster_size: u64,
     sector_size: usize,
     compressed_buf: *mut u8,
+    input_capacity: u64,
     bytes_read: &mut u64,
 ) -> bool {
     // Parse compressed L2 entry format:
@@ -413,11 +414,15 @@ unsafe fn read_compressed_cluster(
         return false;
     }
 
+    // Validate compressed data range against device capacity
+    let data_end = compressed_offset + compressed_size;
+    let device_size = input_capacity.saturating_mul(sector_size as u64);
+    if data_end > device_size {
+        return false;
+    }
+
     // Read compressed data sector by sector
     let first_sector = compressed_offset / sector_size as u64;
-    // Calculate how many sectors we need to read to cover compressed data.
-    // The compressed data starts at compressed_offset and is compressed_size bytes.
-    let data_end = compressed_offset + compressed_size;
     let last_sector = (data_end + sector_size as u64 - 1) / sector_size as u64;
     let sectors_to_read = last_sector - first_sector;
 
@@ -576,6 +581,7 @@ unsafe fn read_virtual_cluster(
                     qcow2_cluster_size,
                     sector_size,
                     BUF_COMPRESSED_IN as *mut u8,
+                    input_capacity,
                     bytes_read,
                 ),
                 None => false,
