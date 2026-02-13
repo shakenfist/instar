@@ -451,6 +451,13 @@ unsafe fn read_compressed_cluster(
 
     // Extract the compressed data from within the read buffer
     let start_within_buf = (compressed_offset % sector_size as u64) as usize;
+
+    // Defense-in-depth: verify the compressed slice lies within the read data
+    let total_read = (sectors_to_read as usize) * sector_size;
+    if start_within_buf + compressed_size as usize > total_read {
+        return false;
+    }
+
     let compressed_data = read_buf.add(start_within_buf);
 
     // Decompress using miniz_oxide raw deflate
