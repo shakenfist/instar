@@ -584,7 +584,12 @@ unsafe fn read_chain_virtual_cluster(
                 // but QCOW2 clusters must be read in full (decompression expects exactly
                 // one cluster). The caller limits how many bytes are compared afterward.
                 let qcow2_cluster_size = state.cluster_size;
-                debug_assert!(qcow2_cluster_size <= MAX_SECTOR_SIZE as u64);
+                // Defense-in-depth: init_qcow2_state already rejects clusters
+                // larger than MAX_SECTOR_SIZE, but guard at the use-site too so
+                // a future refactor cannot silently introduce a buffer overflow.
+                if qcow2_cluster_size > MAX_SECTOR_SIZE as u64 {
+                    return false;
+                }
 
                 match qcow2_cluster_lookup(
                     call_table,
