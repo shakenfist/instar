@@ -701,7 +701,17 @@ pub unsafe extern "C" fn _start() -> u64 {
     // In compare, device_count is the total across both chains (always >= 2),
     // so we use is_valid() which checks magic and device_count > 0.
     let chain_config = &*(CHAIN_CONFIG_ADDR as *const ChainConfig);
-    let has_chain_config = chain_config.is_valid();
+    if !chain_config.is_valid() {
+        // The compare operation requires a valid ChainConfig to determine
+        // each device's format (QCOW2 vs raw). Without it, the comparison
+        // loop would read from uninitialized memory. The VMM always writes
+        // a ChainConfig for compare, so this is a defensive guard.
+        (call_table.debug_print)(b"compare: missing chain config\n\0".as_ptr());
+        let result = CompareResult::new();
+        (call_table.send_compare_result)(&result);
+        (call_table.send_complete)(b"compare\0".as_ptr(), 0, false);
+        return 0;
+    }
 
     // Verify all devices have consistent sector size
     let sector_size = (call_table.get_input_sector_size)(0);
@@ -723,69 +733,51 @@ pub unsafe extern "C" fn _start() -> u64 {
     (call_table.verbose_print)(b"compare: got capacities\n\0".as_ptr());
 
     // Determine virtual size and cluster size for each image (from top of chain)
-    let (dev0_info, dev1_info) = if has_chain_config {
-        let d0 = &chain_config.devices[0];
-        let d1 = &chain_config.devices[image2_start];
-        (
-            DeviceInfo {
-                virtual_size: d0.virtual_size,
-                cluster_size: if d0.cluster_size > 0 {
-                    d0.cluster_size as u64
-                } else {
-                    sector_size as u64
-                },
+    let d0 = &chain_config.devices[0];
+    let d1 = &chain_config.devices[image2_start];
+    let (dev0_info, dev1_info) = (
+        DeviceInfo {
+            virtual_size: d0.virtual_size,
+            cluster_size: if d0.cluster_size > 0 {
+                d0.cluster_size as u64
+            } else {
+                sector_size as u64
             },
-            DeviceInfo {
-                virtual_size: d1.virtual_size,
-                cluster_size: if d1.cluster_size > 0 {
-                    d1.cluster_size as u64
-                } else {
-                    sector_size as u64
-                },
+        },
+        DeviceInfo {
+            virtual_size: d1.virtual_size,
+            cluster_size: if d1.cluster_size > 0 {
+                d1.cluster_size as u64
+            } else {
+                sector_size as u64
             },
-        )
-    } else {
-        // No chain config: treat both as raw, use physical capacity
-        let cap1 = (call_table.get_input_capacity)(0);
-        let cap2 = (call_table.get_input_capacity)(image2_start as u32);
-        (
-            DeviceInfo {
-                virtual_size: cap1 * sector_size as u64,
-                cluster_size: sector_size as u64,
-            },
-            DeviceInfo {
-                virtual_size: cap2 * sector_size as u64,
-                cluster_size: sector_size as u64,
-            },
-        )
-    };
+        },
+    );
 
     (call_table.verbose_print)(b"compare: determined formats\n\0".as_ptr());
 
     // Initialize QCOW2 state for all QCOW2 devices across both chains
     let mut qcow2_states: [Option<Qcow2State>; MAX_CHAIN_DEVICES] = Default::default();
 
-    if has_chain_config {
-        for dev_idx in 0..total_devices {
-            let dev_info = &chain_config.devices[dev_idx];
-            if matches!(dev_info.detected_format(), ImageFormat::Qcow2) {
-                let cap = (call_table.get_input_capacity)(dev_idx as u32);
-                qcow2_states[dev_idx] = init_qcow2_state(
-                    call_table,
-                    dev_idx as u32,
-                    sector_size,
-                    cap,
-                    dev_l1_cache(dev_idx),
-                    dev_l2_cache(dev_idx),
-                    &mut bytes_read,
-                );
-                if qcow2_states[dev_idx].is_none() {
-                    (call_table.debug_print)(b"compare: failed to init qcow2 state\n\0".as_ptr());
-                    let result = CompareResult::new();
-                    (call_table.send_compare_result)(&result);
-                    (call_table.send_complete)(b"compare\0".as_ptr(), bytes_read, false);
-                    return bytes_read;
-                }
+    for dev_idx in 0..total_devices {
+        let dev_info = &chain_config.devices[dev_idx];
+        if matches!(dev_info.detected_format(), ImageFormat::Qcow2) {
+            let cap = (call_table.get_input_capacity)(dev_idx as u32);
+            qcow2_states[dev_idx] = init_qcow2_state(
+                call_table,
+                dev_idx as u32,
+                sector_size,
+                cap,
+                dev_l1_cache(dev_idx),
+                dev_l2_cache(dev_idx),
+                &mut bytes_read,
+            );
+            if qcow2_states[dev_idx].is_none() {
+                (call_table.debug_print)(b"compare: failed to init qcow2 state\n\0".as_ptr());
+                let result = CompareResult::new();
+                (call_table.send_compare_result)(&result);
+                (call_table.send_complete)(b"compare\0".as_ptr(), bytes_read, false);
+                return bytes_read;
             }
         }
     }
