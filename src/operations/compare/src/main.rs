@@ -697,10 +697,11 @@ pub unsafe extern "C" fn _start() -> u64 {
         return 0;
     }
 
-    // Read ChainConfig to learn format and virtual size for each device
+    // Read ChainConfig to learn format and virtual size for each device.
+    // In compare, device_count is the total across both chains (always >= 2),
+    // so we use is_valid() which checks magic and device_count > 0.
     let chain_config = &*(CHAIN_CONFIG_ADDR as *const ChainConfig);
-    let has_chain_config =
-        chain_config.magic == ChainConfig::MAGIC && chain_config.device_count >= 2;
+    let has_chain_config = chain_config.is_valid();
 
     // Verify all devices have consistent sector size
     let sector_size = (call_table.get_input_sector_size)(0);
