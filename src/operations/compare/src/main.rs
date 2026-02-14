@@ -688,6 +688,15 @@ pub unsafe extern "C" fn _start() -> u64 {
     let image2_start = image1_device_count;
     let total_devices = image1_device_count + image2_device_count;
 
+    // Each chain must have at least one device (the top image itself)
+    if image1_device_count < 1 || image2_device_count < 1 {
+        (call_table.debug_print)(b"compare: each chain must have >= 1 device\n\0".as_ptr());
+        let result = CompareResult::new();
+        (call_table.send_compare_result)(&result);
+        (call_table.send_complete)(b"compare\0".as_ptr(), 0, false);
+        return 0;
+    }
+
     // Bounds-check total_devices against the fixed-size arrays it will index
     if total_devices > MAX_CHAIN_DEVICES {
         (call_table.debug_print)(b"compare: total devices exceeds max\n\0".as_ptr());
@@ -707,6 +716,17 @@ pub unsafe extern "C" fn _start() -> u64 {
         // loop would read from uninitialized memory. The VMM always writes
         // a ChainConfig for compare, so this is a defensive guard.
         (call_table.debug_print)(b"compare: missing chain config\n\0".as_ptr());
+        let result = CompareResult::new();
+        (call_table.send_compare_result)(&result);
+        (call_table.send_complete)(b"compare\0".as_ptr(), 0, false);
+        return 0;
+    }
+
+    // Cross-check: CompareConfig device counts must match ChainConfig
+    if chain_config.device_count as usize != total_devices {
+        (call_table.debug_print)(
+            b"compare: chain_config.device_count != total_devices\n\0".as_ptr(),
+        );
         let result = CompareResult::new();
         (call_table.send_compare_result)(&result);
         (call_table.send_complete)(b"compare\0".as_ptr(), 0, false);
