@@ -166,8 +166,13 @@ The chain discovery infrastructure is used by the following operations:
   guest and checked for format consistency, non-zero virtual size, and QCOW2
   header integrity. Chain errors are reported separately from primary image
   errors.
+- **`imago compare`** - Automatically discovers backing chains for both images
+  being compared. All chain images are loaded as separate virtio-block devices
+  in the KVM guest. Unallocated QCOW2 clusters are resolved by walking the
+  backing chain, so overlay images compare correctly against their flattened
+  equivalents. Supports multi-level chains (e.g., top -> mid -> base) and
+  chains on both sides of the comparison.
 
 ### Future Work
 
 - **`imago convert`** - Flatten backing chains during format conversion
-- **Multi-device operations** - Load all images in chain as separate devices
