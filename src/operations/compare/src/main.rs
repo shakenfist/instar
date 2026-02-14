@@ -23,6 +23,7 @@ use core::panic::PanicInfo;
 use shared::{
     CallTable, ChainConfig, CompareConfig, CompareResult, ImageFormat, CALL_TABLE_ADDR,
     CHAIN_CONFIG_ADDR, MAX_CHAIN_DEVICES, MAX_SECTOR_SIZE, OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE,
+    SCRATCH_MEM_END,
 };
 
 // QCOW2 header offsets (big-endian)
@@ -45,6 +46,10 @@ const BUF_COMPRESSED_IN: usize = BUF_COMPARE_2 + MAX_SECTOR_SIZE;
 
 // Dynamic region: L1/L2 caches for QCOW2 devices (2 × MAX_SECTOR_SIZE per device)
 const DYNAMIC_BUFS_START: usize = BUF_COMPRESSED_IN + MAX_SECTOR_SIZE;
+const _: () = assert!(
+    DYNAMIC_BUFS_START + MAX_CHAIN_DEVICES * 2 * MAX_SECTOR_SIZE <= SCRATCH_MEM_END,
+    "Scratch memory too small for MAX_CHAIN_DEVICES L1/L2 caches"
+);
 
 /// Get the L1 cache buffer address for a given device index.
 fn dev_l1_cache(dev_idx: usize) -> *mut u8 {
