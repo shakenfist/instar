@@ -3265,6 +3265,17 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         chain2.len()
     );
 
+    if total_devices > MAX_CHAIN_DEVICES {
+        return Err(format!(
+            "combined chain depth {} (image1: {} + image2: {}) exceeds maximum of {} devices",
+            total_devices,
+            chain1.len(),
+            chain2.len(),
+            MAX_CHAIN_DEVICES
+        )
+        .into());
+    }
+
     // Open KVM
     let kvm = Kvm::new()?;
     debug!("KVM API version: {}", kvm.get_api_version());
