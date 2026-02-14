@@ -3241,36 +3241,28 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         operation_path.display()
     );
 
-    // Detect format and metadata for both images via sandboxed info operation
-    let info1 = execute_info_operation(Path::new(&args.image1), args.sector_size, false)?;
-    let info2 = execute_info_operation(Path::new(&args.image2), args.sector_size, false)?;
-    debug!(
-        "Image 1: {} format={}, virtual_size={}, cluster_size={}, flags=0x{:x}",
-        args.image1, info1.format, info1.virtual_size, info1.cluster_size, info1.flags
-    );
-    debug!(
-        "Image 2: {} format={}, virtual_size={}, cluster_size={}, flags=0x{:x}",
-        args.image2, info2.format, info2.virtual_size, info2.cluster_size, info2.flags
-    );
+    // Discover backing chains for both images (includes format detection)
+    let security_config = config::load_config().config.security;
+    let chain1 =
+        discover_backing_chain(Path::new(&args.image1), args.sector_size, &security_config)
+            .map_err(|e| format!("error discovering backing chain for {}: {}", args.image1, e))?;
+    let chain2 =
+        discover_backing_chain(Path::new(&args.image2), args.sector_size, &security_config)
+            .map_err(|e| format!("error discovering backing chain for {}: {}", args.image2, e))?;
 
-    // Get input file metadata for both images (physical file size for device setup)
-    let input1_metadata = std::fs::metadata(&args.image1)?;
-    let input1_size = input1_metadata.len();
-    let input2_metadata = std::fs::metadata(&args.image2)?;
-    let input2_size = input2_metadata.len();
+    if verbose {
+        debug!("Image 1 chain ({} image(s)):", chain1.len());
+        print_backing_chain(&chain1);
+        debug!("Image 2 chain ({} image(s)):", chain2.len());
+        print_backing_chain(&chain2);
+    }
+
+    let total_devices = chain1.len() + chain2.len();
     debug!(
-        "Image 1: {} ({} bytes, {} sectors @ {} bytes/sector)",
-        args.image1,
-        input1_size,
-        input1_size / args.sector_size as u64,
-        args.sector_size
-    );
-    debug!(
-        "Image 2: {} ({} bytes, {} sectors @ {} bytes/sector)",
-        args.image2,
-        input2_size,
-        input2_size / args.sector_size as u64,
-        args.sector_size
+        "Total devices: {} (image1: {} + image2: {})",
+        total_devices,
+        chain1.len(),
+        chain2.len()
     );
 
     // Open KVM
@@ -3323,7 +3315,7 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     debug!("Loaded operation binary at 0x{:x}", OPERATION_LOAD_ADDR);
 
     // Write CompareConfig at OPERATION_CONFIG_ADDR
-    // Layout: magic (u32), flags (u32)
+    // Layout: magic (u32), flags (u32), image1_device_count (u32), image2_device_count (u32)
     let mut compare_flags: u32 = 0;
     if args.strict {
         compare_flags |= COMPARE_CONFIG_FLAG_STRICT;
@@ -3336,87 +3328,117 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     }
     guest_mem.write_obj(COMPARE_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
     guest_mem.write_obj(compare_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
+    guest_mem.write_obj(chain1.len() as u32, GuestAddress(OPERATION_CONFIG_ADDR + 8))?;
+    guest_mem.write_obj(
+        chain2.len() as u32,
+        GuestAddress(OPERATION_CONFIG_ADDR + 12),
+    )?;
     debug!(
-        "Wrote compare config at 0x{:x} (flags=0x{:x})",
-        OPERATION_CONFIG_ADDR, compare_flags
+        "Wrote compare config at 0x{:x} (flags=0x{:x}, chain1={}, chain2={})",
+        OPERATION_CONFIG_ADDR,
+        compare_flags,
+        chain1.len(),
+        chain2.len()
     );
 
-    // Write ChainConfig with format metadata for both images
-    // This tells the guest binary what format each device is and its virtual size
-    let format1 = ImageFormat::from_str(&info1.format);
-    let format2 = ImageFormat::from_str(&info2.format);
-
+    // Write ChainConfig with format metadata for all chain images
+    // Devices are laid out: [chain1 images...] [chain2 images...]
     guest_mem.write_obj(CHAIN_CONFIG_MAGIC, GuestAddress(CHAIN_CONFIG_ADDR))?;
-    guest_mem.write_obj(2u32, GuestAddress(CHAIN_CONFIG_ADDR + 4))?; // device_count
+    guest_mem.write_obj(total_devices as u32, GuestAddress(CHAIN_CONFIG_ADDR + 4))?;
     guest_mem.write_obj(CHAIN_CONFIG_VERSION, GuestAddress(CHAIN_CONFIG_ADDR + 8))?;
     guest_mem.write_obj(0u32, GuestAddress(CHAIN_CONFIG_ADDR + 12))?; // reserved
 
-    // Device 0 info
-    let dev0_base = CHAIN_CONFIG_ADDR + 16;
-    guest_mem.write_obj(format1.to_shared_format_u32(), GuestAddress(dev0_base))?;
-    guest_mem.write_obj(info1.flags, GuestAddress(dev0_base + 4))?;
-    guest_mem.write_obj(info1.virtual_size, GuestAddress(dev0_base + 8))?;
-    guest_mem.write_obj(info1.actual_size, GuestAddress(dev0_base + 16))?;
-    guest_mem.write_obj(info1.cluster_size, GuestAddress(dev0_base + 24))?;
-    guest_mem.write_obj(0u32, GuestAddress(dev0_base + 28))?; // reserved
+    let devices_base = CHAIN_CONFIG_ADDR + 16;
+    let mut dev_idx: usize = 0;
 
-    // Device 1 info
-    let dev1_base = CHAIN_CONFIG_ADDR + 16 + 32;
-    guest_mem.write_obj(format2.to_shared_format_u32(), GuestAddress(dev1_base))?;
-    guest_mem.write_obj(info2.flags, GuestAddress(dev1_base + 4))?;
-    guest_mem.write_obj(info2.virtual_size, GuestAddress(dev1_base + 8))?;
-    guest_mem.write_obj(info2.actual_size, GuestAddress(dev1_base + 16))?;
-    guest_mem.write_obj(info2.cluster_size, GuestAddress(dev1_base + 24))?;
-    guest_mem.write_obj(0u32, GuestAddress(dev1_base + 28))?; // reserved
+    // Write chain1 device info entries
+    for image in chain1.images().iter() {
+        let dev_base = devices_base + (dev_idx as u64 * 32);
+        guest_mem.write_obj(image.format.to_shared_format_u32(), GuestAddress(dev_base))?;
+        guest_mem.write_obj(image.flags, GuestAddress(dev_base + 4))?;
+        guest_mem.write_obj(image.virtual_size, GuestAddress(dev_base + 8))?;
+        guest_mem.write_obj(image.actual_size, GuestAddress(dev_base + 16))?;
+        guest_mem.write_obj(image.cluster_size, GuestAddress(dev_base + 24))?;
+        guest_mem.write_obj(0u32, GuestAddress(dev_base + 28))?;
+        dev_idx += 1;
+    }
+
+    // Write chain2 device info entries
+    for image in chain2.images().iter() {
+        let dev_base = devices_base + (dev_idx as u64 * 32);
+        guest_mem.write_obj(image.format.to_shared_format_u32(), GuestAddress(dev_base))?;
+        guest_mem.write_obj(image.flags, GuestAddress(dev_base + 4))?;
+        guest_mem.write_obj(image.virtual_size, GuestAddress(dev_base + 8))?;
+        guest_mem.write_obj(image.actual_size, GuestAddress(dev_base + 16))?;
+        guest_mem.write_obj(image.cluster_size, GuestAddress(dev_base + 24))?;
+        guest_mem.write_obj(0u32, GuestAddress(dev_base + 28))?;
+        dev_idx += 1;
+    }
 
     debug!(
-        "Wrote chain config at 0x{:x}: device_count=2, formats=[{}, {}]",
-        CHAIN_CONFIG_ADDR, info1.format, info2.format
+        "Wrote chain config at 0x{:x}: device_count={}, chain1={}, chain2={}",
+        CHAIN_CONFIG_ADDR,
+        total_devices,
+        chain1.len(),
+        chain2.len()
     );
 
     // Create device set for managing virtio-block devices
     let mut device_set = DeviceSet::new();
-
-    // Set up two input devices (image1 = device 0, image2 = device 1)
     let mut io_events: Vec<IoEvent> = Vec::new();
 
-    let input1_backing = BackingStore::open(Path::new(&args.image1), true, None, false)?;
-    let input1_mmio = device_mmio_base(0);
-    let input1_vq = device_vq_base(0);
-    let input1_device = VirtioBlockDevice::new(
-        input1_backing,
-        input1_size,
-        args.sector_size as u64,
-        true, // read-only
-        input1_mmio,
-        input1_vq,
-    );
-    debug!(
-        "Created device [0] at MMIO 0x{:x}, VQ 0x{:x}: {}",
-        input1_mmio, input1_vq, args.image1
-    );
-    let input1_device = Arc::new(Mutex::new(input1_device));
-    device_set.add_device(Arc::clone(&input1_device), true);
-    io_events.push(IoEvent::new(input1_mmio)?);
+    // Set up devices for image1's chain (devices 0..chain1.len()-1)
+    for (i, image) in chain1.images().iter().enumerate() {
+        let backing = BackingStore::open(&image.path, true, None, false)?;
+        let file_size = std::fs::metadata(&image.path)?.len();
+        let mmio = device_mmio_base(i);
+        let vq = device_vq_base(i);
+        let device = VirtioBlockDevice::new(
+            backing,
+            file_size,
+            args.sector_size as u64,
+            true, // read-only
+            mmio,
+            vq,
+        );
+        debug!(
+            "Created chain1 device [{}] at MMIO 0x{:x}, VQ 0x{:x}: {}",
+            i,
+            mmio,
+            vq,
+            image.path.display()
+        );
+        let device = Arc::new(Mutex::new(device));
+        device_set.add_device(Arc::clone(&device), true);
+        io_events.push(IoEvent::new(mmio)?);
+    }
 
-    let input2_backing = BackingStore::open(Path::new(&args.image2), true, None, false)?;
-    let input2_mmio = device_mmio_base(1);
-    let input2_vq = device_vq_base(1);
-    let input2_device = VirtioBlockDevice::new(
-        input2_backing,
-        input2_size,
-        args.sector_size as u64,
-        true, // read-only
-        input2_mmio,
-        input2_vq,
-    );
-    debug!(
-        "Created device [1] at MMIO 0x{:x}, VQ 0x{:x}: {}",
-        input2_mmio, input2_vq, args.image2
-    );
-    let input2_device = Arc::new(Mutex::new(input2_device));
-    device_set.add_device(Arc::clone(&input2_device), true);
-    io_events.push(IoEvent::new(input2_mmio)?);
+    // Set up devices for image2's chain (devices chain1.len()..total_devices-1)
+    for (j, image) in chain2.images().iter().enumerate() {
+        let i = chain1.len() + j;
+        let backing = BackingStore::open(&image.path, true, None, false)?;
+        let file_size = std::fs::metadata(&image.path)?.len();
+        let mmio = device_mmio_base(i);
+        let vq = device_vq_base(i);
+        let device = VirtioBlockDevice::new(
+            backing,
+            file_size,
+            args.sector_size as u64,
+            true, // read-only
+            mmio,
+            vq,
+        );
+        debug!(
+            "Created chain2 device [{}] at MMIO 0x{:x}, VQ 0x{:x}: {}",
+            i,
+            mmio,
+            vq,
+            image.path.display()
+        );
+        let device = Arc::new(Mutex::new(device));
+        device_set.add_device(Arc::clone(&device), true);
+        io_events.push(IoEvent::new(mmio)?);
+    }
 
     // Wrap guest memory in Arc for sharing
     let guest_mem = Arc::new(guest_mem);
@@ -3493,8 +3515,8 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // Create debug buffer for COM2 output
     let mut debug_buffer = DebugBuffer::new();
 
-    // Queue the configuration message for transmission (2 input devices)
-    let config = vmm_config_chain(args.sector_size, 2);
+    // Queue the configuration message for transmission (all chain devices)
+    let config = vmm_config_chain(args.sector_size, total_devices);
     serial_transmitter.queue_config(&config);
     debug!(
         "Queued configuration message ({} bytes) for guest",
