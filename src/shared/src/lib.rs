@@ -1033,6 +1033,8 @@ impl CompareConfig {
 
     /// Number of devices in image1's backing chain.
     /// Returns 1 if unset (legacy config without chain fields).
+    /// Legacy configs have these fields at zero because guest memory is
+    /// zero-initialized. The zero-to-one fallback handles this case.
     pub fn image1_device_count(&self) -> u32 {
         if self.image1_device_count == 0 {
             1
@@ -1043,6 +1045,8 @@ impl CompareConfig {
 
     /// Number of devices in image2's backing chain.
     /// Returns 1 if unset (legacy config without chain fields).
+    /// Legacy configs have these fields at zero because guest memory is
+    /// zero-initialized. The zero-to-one fallback handles this case.
     pub fn image2_device_count(&self) -> u32 {
         if self.image2_device_count == 0 {
             1
