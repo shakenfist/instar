@@ -683,6 +683,15 @@ pub unsafe extern "C" fn _start() -> u64 {
     let image2_start = image1_device_count;
     let total_devices = image1_device_count + image2_device_count;
 
+    // Bounds-check total_devices against the fixed-size arrays it will index
+    if total_devices > MAX_CHAIN_DEVICES {
+        (call_table.debug_print)(b"compare: total devices exceeds max\n\0".as_ptr());
+        let result = CompareResult::new();
+        (call_table.send_compare_result)(&result);
+        (call_table.send_complete)(b"compare\0".as_ptr(), 0, false);
+        return 0;
+    }
+
     // Read ChainConfig to learn format and virtual size for each device
     let chain_config = &*(CHAIN_CONFIG_ADDR as *const ChainConfig);
     let has_chain_config =
