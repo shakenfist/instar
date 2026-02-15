@@ -1,0 +1,12 @@
+[package]
+name = "vmdk"
+version = "0.1.0"
+edition = "2021"
+description = "VMDK format parsing for bare-metal guest operations"
+license = "Apache-2.0"
+
+[dependencies]
+shared = { path = "../../shared" }
+
+[lib]
+# No std, this is used by bare-metal code

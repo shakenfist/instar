@@ -298,6 +298,10 @@ imago/
 │   ├── vmm/        # Virtual machine monitor (host-side)
 │   ├── core/       # Core guest initialization
 │   ├── shared/     # Shared library code
+│   ├── crates/     # Shared format parsing crates (no_std)
+│   │   ├── qcow2/  # QCOW2 header, L1/L2, decompression, refcounts
+│   │   ├── raw/    # MBR/GPT partition table detection
+│   │   └── vmdk/   # VMDK4 header and descriptor parsing
 │   ├── operations/ # Pluggable operations (info, copy, check, compare)
 │   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates

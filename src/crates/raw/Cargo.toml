@@ -1,0 +1,9 @@
+[package]
+name = "raw"
+version = "0.1.0"
+edition = "2021"
+description = "Raw disk image format validation (MBR/GPT partition tables)"
+license = "Apache-2.0"
+
+[lib]
+# No std, this is used by bare-metal code

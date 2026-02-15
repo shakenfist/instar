@@ -24,19 +24,27 @@ impl Version {
         Self { major, minor }
     }
 
-    /// Parse a version string like "7.2" or "10.0".
+    /// Parse a version string like "7.2", "10.0", or "10.2.0".
+    /// Accepts 1-3 parts (major, major.minor, major.minor.patch).
+    /// Rejects 4+ parts (e.g., "1.2.3.4") and non-numeric parts.
     pub fn parse(s: &str) -> Option<Self> {
         let parts: Vec<&str> = s.split('.').collect();
-        if parts.len() >= 2 {
-            let major = parts[0].parse().ok()?;
-            let minor = parts[1].parse().ok()?;
-            Some(Self { major, minor })
-        } else if parts.len() == 1 {
-            // Allow just major version (e.g., "8" means "8.0")
-            let major = parts[0].parse().ok()?;
-            Some(Self { major, minor: 0 })
-        } else {
-            None
+        match parts.len() {
+            2 | 3 => {
+                let major = parts[0].parse().ok()?;
+                let minor = parts[1].parse().ok()?;
+                // Validate patch part is numeric if present
+                if parts.len() == 3 {
+                    let _patch: u32 = parts[2].parse().ok()?;
+                }
+                Some(Self { major, minor })
+            }
+            1 => {
+                // Allow just major version (e.g., "8" means "8.0")
+                let major = parts[0].parse().ok()?;
+                Some(Self { major, minor: 0 })
+            }
+            _ => None,
         }
     }
 }
@@ -170,6 +178,8 @@ mod tests {
         assert_eq!(Version::parse("8"), Some(Version::new(8, 0)));
         assert_eq!(Version::parse(""), None);
         assert_eq!(Version::parse("abc"), None);
+        assert_eq!(Version::parse("1.2.3.4"), None);
+        assert_eq!(Version::parse("not.a.version"), None);
     }
 
     #[test]
