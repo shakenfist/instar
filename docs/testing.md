@@ -80,8 +80,16 @@ compare`:
 - Compressed vs uncompressed QCOW2 with same content
 - Cross-validated against `qemu-img compare`
 
+**Backing chains (`TestCompareBackingChain`):**
+- QCOW2 overlay with raw backing file vs flattened raw (identical)
+- QCOW2 overlay vs different raw (mismatch detected)
+- Deep chain (3-level: top -> mid -> base) vs flattened raw (identical)
+- Two different QCOW2 backing chains with same virtual content (identical)
+- All scenarios cross-validated against `qemu-img compare`
+
 Test images are created at runtime using `qemu-img create`, `qemu-io write`,
-and `qemu-img convert -c` (for compressed), so no external testdata is needed.
+`qemu-img convert -c` (for compressed), and `qemu-img create -b` (for backing
+chains), so no external testdata is needed.
 
 **qemu-img cross-validation**: Every scenario verifies byte-for-byte
 identical stdout and matching exit codes with `qemu-img compare`.

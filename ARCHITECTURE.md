@@ -144,7 +144,8 @@ provides a modular architecture with:
   optional `--chain` backing chain validation)
 - **operations/compare/** - Image comparison operation (format-aware virtual
   content comparison between two images, supporting raw-vs-raw, QCOW2-vs-raw,
-  and QCOW2-vs-QCOW2 including compressed clusters)
+  and QCOW2-vs-QCOW2 including compressed clusters and backing chain
+  flattening)
 - **shared/** - Shared library code between components
 
 **Chain validation in check (`--chain`):**
