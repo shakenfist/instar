@@ -948,3 +948,170 @@ class TestCompareBackingChain(ImagoTestBase):
             )
             self.assertEqual(imago_out, qemu_out)
             self.assertEqual(imago_rc, qemu_rc)
+
+    def test_overlay_no_writes_vs_raw_identical(self):
+        """Overlay with no writes (100% from backing) vs raw."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as base, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as ov, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as flat:
+            self._create_raw_with_data(
+                base.name, pattern=0xCC
+            )
+            # Create overlay with NO writes - all data from backing
+            self._create_overlay(base.name, ov.name)
+            self._flatten_to_raw(ov.name, flat.name)
+            stdout, stderr, rc = self.run_imago_compare(
+                Path(ov.name), Path(flat.name)
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(
+                stdout, 'Images are identical.\n'
+            )
+
+    def test_overlay_no_writes_vs_raw_matches_qemu(self):
+        """Overlay with no writes matches qemu-img compare."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as base, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as ov, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as flat:
+            self._create_raw_with_data(
+                base.name, pattern=0xCC
+            )
+            self._create_overlay(base.name, ov.name)
+            self._flatten_to_raw(ov.name, flat.name)
+            imago_out, _, imago_rc = self.run_imago_compare(
+                Path(ov.name), Path(flat.name)
+            )
+            qemu_out, _, qemu_rc = self.run_qemu_img_compare(
+                Path(ov.name), Path(flat.name)
+            )
+            self.assertEqual(imago_out, qemu_out)
+            self.assertEqual(imago_rc, qemu_rc)
+
+    def test_chains_different_virtual_sizes(self):
+        """Two chains with different virtual sizes, zero-fill tail."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as b1, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as o1, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as b2, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as o2:
+            # Chain 1: 1M with data at offset 0
+            self._create_raw_with_data(
+                b1.name, size='1M', pattern=0xAA
+            )
+            self._create_overlay(b1.name, o1.name, size='1M')
+            # Chain 2: 2M with same data at offset 0, rest zeros
+            self._create_raw_with_data(
+                b2.name, size='2M', pattern=0xAA
+            )
+            self._create_overlay(b2.name, o2.name, size='2M')
+            stdout, stderr, rc = self.run_imago_compare(
+                Path(o1.name), Path(o2.name)
+            )
+            # Non-strict: size mismatch but zeros = identical
+            self.assertEqual(rc, 0)
+            self.assertIn(
+                'Warning: Image size mismatch!', stdout
+            )
+            self.assertIn('Images are identical.', stdout)
+
+    def test_chains_different_virtual_sizes_matches_qemu(self):
+        """Chains with different sizes matches qemu-img."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as b1, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as o1, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as b2, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as o2:
+            self._create_raw_with_data(
+                b1.name, size='1M', pattern=0xAA
+            )
+            self._create_overlay(b1.name, o1.name, size='1M')
+            self._create_raw_with_data(
+                b2.name, size='2M', pattern=0xAA
+            )
+            self._create_overlay(b2.name, o2.name, size='2M')
+            imago_out, _, imago_rc = self.run_imago_compare(
+                Path(o1.name), Path(o2.name)
+            )
+            qemu_out, _, qemu_rc = self.run_qemu_img_compare(
+                Path(o1.name), Path(o2.name)
+            )
+            self.assertEqual(imago_out, qemu_out)
+            self.assertEqual(imago_rc, qemu_rc)
+
+    def test_passthrough_intermediate_vs_raw_identical(self):
+        """Chain with empty intermediate overlay vs flattened raw."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as base, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as mid, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as top, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as flat:
+            self._create_raw_with_data(
+                base.name, pattern=0x55
+            )
+            # Mid overlay: no writes (passthrough)
+            self._create_overlay(base.name, mid.name)
+            # Top overlay: writes at different offset
+            self._create_overlay(
+                mid.name, top.name, backing_fmt='qcow2'
+            )
+            self._write_to_qcow2(
+                top.name, pattern=0x66,
+                offset=131072, length=65536
+            )
+            self._flatten_to_raw(top.name, flat.name)
+            stdout, stderr, rc = self.run_imago_compare(
+                Path(top.name), Path(flat.name)
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(
+                stdout, 'Images are identical.\n'
+            )
+
+    def test_passthrough_intermediate_vs_raw_matches_qemu(self):
+        """Empty intermediate overlay matches qemu-img."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as base, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as mid, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as top, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as flat:
+            self._create_raw_with_data(
+                base.name, pattern=0x55
+            )
+            self._create_overlay(base.name, mid.name)
+            self._create_overlay(
+                mid.name, top.name, backing_fmt='qcow2'
+            )
+            self._write_to_qcow2(
+                top.name, pattern=0x66,
+                offset=131072, length=65536
+            )
+            self._flatten_to_raw(top.name, flat.name)
+            imago_out, _, imago_rc = self.run_imago_compare(
+                Path(top.name), Path(flat.name)
+            )
+            qemu_out, _, qemu_rc = self.run_qemu_img_compare(
+                Path(top.name), Path(flat.name)
+            )
+            self.assertEqual(imago_out, qemu_out)
+            self.assertEqual(imago_rc, qemu_rc)
+
+    def test_corrupt_backing_chain_image(self):
+        """Corrupt QCOW2 header in backing file is handled."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as base, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as mid, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as top:
+            self._create_raw_with_data(base.name)
+            self._create_overlay(base.name, mid.name)
+            self._write_to_qcow2(mid.name, pattern=0xDD)
+            self._create_overlay(
+                mid.name, top.name, backing_fmt='qcow2'
+            )
+            self._write_to_qcow2(
+                top.name, pattern=0xEE,
+                offset=131072, length=65536
+            )
+            # Corrupt mid's QCOW2 magic number (first 4 bytes)
+            with open(mid.name, 'r+b') as f:
+                f.seek(0)
+                f.write(b'\x00\x00\x00\x00')
+            # imago should fail gracefully (non-zero exit)
+            stdout, stderr, rc = self.run_imago_compare(
+                Path(top.name), Path(base.name)
+            )
+            self.assertNotEqual(rc, 0)
