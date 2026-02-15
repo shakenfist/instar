@@ -72,9 +72,12 @@ The compare operation reads the virtual content of both images and reports the
 first byte offset where content diverges. For QCOW2 images, this includes
 L1/L2 cluster table lookup and compressed cluster decompression (zlib/deflate),
 so comparisons work across formats (e.g., QCOW2 vs raw, compressed QCOW2 vs
-uncompressed QCOW2). When images differ in size, non-strict mode (default)
-treats extra zero-filled regions as matching, while strict mode (`-s`) fails
-immediately on any size difference.
+uncompressed QCOW2). QCOW2 backing chains are automatically discovered and
+flattened: unallocated clusters are resolved by walking the backing chain,
+so overlay images compare correctly against their flattened equivalents.
+When images differ in size, non-strict mode (default) treats extra zero-filled
+regions as matching, while strict mode (`-s`) fails immediately on any size
+difference.
 
 Output is byte-for-byte identical with `qemu-img compare`.
 

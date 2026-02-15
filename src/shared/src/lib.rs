@@ -982,6 +982,15 @@ pub struct CompareConfig {
 
     /// Configuration flags
     pub flags: u32,
+
+    /// Number of devices in image1's backing chain (0 = legacy/unset)
+    /// Devices [0, image1_device_count) belong to image1's chain.
+    pub image1_device_count: u32,
+
+    /// Number of devices in image2's backing chain (0 = legacy/unset)
+    /// Devices [image1_device_count, image1_device_count + image2_device_count)
+    /// belong to image2's chain.
+    pub image2_device_count: u32,
 }
 
 impl CompareConfig {
@@ -1002,6 +1011,8 @@ impl CompareConfig {
         Self {
             magic: Self::MAGIC,
             flags: 0,
+            image1_device_count: 1,
+            image2_device_count: 1,
         }
     }
 
@@ -1018,6 +1029,35 @@ impl CompareConfig {
     /// Check if quiet flag is set
     pub fn is_quiet(&self) -> bool {
         (self.flags & Self::FLAG_QUIET) != 0
+    }
+
+    /// Number of devices in image1's backing chain.
+    /// Returns 1 if unset (legacy config without chain fields).
+    /// Legacy configs have these fields at zero because guest memory is
+    /// zero-initialized. The zero-to-one fallback handles this case.
+    pub fn image1_device_count(&self) -> u32 {
+        if self.image1_device_count == 0 {
+            1
+        } else {
+            self.image1_device_count
+        }
+    }
+
+    /// Number of devices in image2's backing chain.
+    /// Returns 1 if unset (legacy config without chain fields).
+    /// Legacy configs have these fields at zero because guest memory is
+    /// zero-initialized. The zero-to-one fallback handles this case.
+    pub fn image2_device_count(&self) -> u32 {
+        if self.image2_device_count == 0 {
+            1
+        } else {
+            self.image2_device_count
+        }
+    }
+
+    /// Starting device index for image2's chain.
+    pub fn image2_start_device(&self) -> u32 {
+        self.image1_device_count()
     }
 }
 
