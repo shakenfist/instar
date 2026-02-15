@@ -20,23 +20,12 @@
 
 use core::panic::PanicInfo;
 
+use qcow2::ClusterLookup;
 use shared::{
     CallTable, ChainConfig, CompareConfig, CompareResult, ImageFormat, CALL_TABLE_ADDR,
     CHAIN_CONFIG_ADDR, MAX_CHAIN_DEVICES, MAX_SECTOR_SIZE, OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE,
     SCRATCH_MEM_END,
 };
-
-// QCOW2 header offsets (big-endian)
-const QCOW2_VERSION_OFFSET: usize = 4;
-const QCOW2_CLUSTER_BITS_OFFSET: usize = 20;
-const QCOW2_SIZE_OFFSET: usize = 24;
-const QCOW2_L1_SIZE_OFFSET: usize = 36;
-const QCOW2_L1_TABLE_OFFSET_OFFSET: usize = 40;
-
-// L2 table entry flags
-const QCOW_OFLAG_COMPRESSED: u64 = 1 << 62;
-// Mask for extracting offset from L1/L2 entries (bits 9-55)
-const L2_OFFSET_MASK: u64 = 0x00fffffffffffe00;
 
 // Scratch memory layout for compare operation.
 // Fixed buffers (3 × MAX_SECTOR_SIZE = 192KB):
@@ -61,460 +50,10 @@ fn dev_l2_cache(dev_idx: usize) -> *mut u8 {
     (DYNAMIC_BUFS_START + (dev_idx * 2 + 1) * MAX_SECTOR_SIZE) as *mut u8
 }
 
-/// State for reading QCOW2 virtual content from a device.
-struct Qcow2State {
-    device_idx: u32,
-    cluster_size: u64,
-    cluster_bits: u32,
-    l1_size: u32,
-    l1_table_offset: u64,
-    // Sector cache tracking for L1 table reads
-    l1_cached_sector: u64,
-    l1_cache_buf: *mut u8,
-    // Sector cache tracking for L2 table reads
-    l2_cached_sector: u64,
-    l2_cache_buf: *mut u8,
-}
-
 /// Describes the format and key parameters for one image (top of its chain).
 struct DeviceInfo {
     virtual_size: u64,
     cluster_size: u64,
-}
-
-/// Result of looking up a virtual offset in QCOW2 L1/L2 tables.
-enum ClusterLookup {
-    /// Cluster is unallocated (reads as zeros, or from backing)
-    Unallocated,
-    /// Standard cluster at given host byte offset
-    Standard(u64),
-    /// Compressed cluster: raw L2 entry for offset/size parsing
-    Compressed(u64),
-}
-
-/// Read a big-endian u64 from a specific byte offset within a device,
-/// using a sector-level cache to minimize I/O.
-///
-/// The cache buffers live in scratch memory at the addresses stored
-/// in `cached_sector` / `cache_buf`.
-unsafe fn read_u64_be_cached(
-    call_table: &CallTable,
-    device_idx: u32,
-    byte_offset: u64,
-    sector_size: usize,
-    input_capacity: u64,
-    cached_sector: &mut u64,
-    cache_buf: *mut u8,
-    bytes_read: &mut u64,
-) -> Option<u64> {
-    let sector = byte_offset / sector_size as u64;
-    let off = (byte_offset % sector_size as u64) as usize;
-    if off + 8 > sector_size {
-        return None; // Entry spans sector boundary
-    }
-    if sector >= input_capacity {
-        return None;
-    }
-    if *cached_sector != sector {
-        if !(call_table.read_input_sector)(device_idx, sector, cache_buf, sector_size) {
-            return None;
-        }
-        *bytes_read += sector_size as u64;
-        *cached_sector = sector;
-    }
-    let p = cache_buf.add(off);
-    Some(u64::from_be_bytes([
-        *p,
-        *p.add(1),
-        *p.add(2),
-        *p.add(3),
-        *p.add(4),
-        *p.add(5),
-        *p.add(6),
-        *p.add(7),
-    ]))
-}
-
-/// Read a big-endian u32 from a specific byte offset within a device,
-/// using a sector-level cache to minimize I/O.
-unsafe fn read_u32_be_cached(
-    call_table: &CallTable,
-    device_idx: u32,
-    byte_offset: u64,
-    sector_size: usize,
-    input_capacity: u64,
-    cached_sector: &mut u64,
-    cache_buf: *mut u8,
-    bytes_read: &mut u64,
-) -> Option<u32> {
-    let sector = byte_offset / sector_size as u64;
-    let off = (byte_offset % sector_size as u64) as usize;
-    if off + 4 > sector_size {
-        return None;
-    }
-    if sector >= input_capacity {
-        return None;
-    }
-    if *cached_sector != sector {
-        if !(call_table.read_input_sector)(device_idx, sector, cache_buf, sector_size) {
-            return None;
-        }
-        *bytes_read += sector_size as u64;
-        *cached_sector = sector;
-    }
-    let p = cache_buf.add(off);
-    Some(u32::from_be_bytes([*p, *p.add(1), *p.add(2), *p.add(3)]))
-}
-
-/// Initialize QCOW2 state by reading the header from the device.
-unsafe fn init_qcow2_state(
-    call_table: &CallTable,
-    device_idx: u32,
-    sector_size: usize,
-    input_capacity: u64,
-    l1_cache_buf: *mut u8,
-    l2_cache_buf: *mut u8,
-    bytes_read: &mut u64,
-) -> Option<Qcow2State> {
-    let mut state = Qcow2State {
-        device_idx,
-        cluster_size: 0,
-        cluster_bits: 0,
-        l1_size: 0,
-        l1_table_offset: 0,
-        l1_cached_sector: u64::MAX,
-        l1_cache_buf,
-        l2_cached_sector: u64::MAX,
-        l2_cache_buf,
-    };
-
-    // Read version (must be 2 or 3)
-    let version = read_u32_be_cached(
-        call_table,
-        device_idx,
-        QCOW2_VERSION_OFFSET as u64,
-        sector_size,
-        input_capacity,
-        &mut state.l1_cached_sector,
-        state.l1_cache_buf,
-        bytes_read,
-    )?;
-    if version != 2 && version != 3 {
-        return None;
-    }
-
-    // Read cluster_bits
-    let cluster_bits = read_u32_be_cached(
-        call_table,
-        device_idx,
-        QCOW2_CLUSTER_BITS_OFFSET as u64,
-        sector_size,
-        input_capacity,
-        &mut state.l1_cached_sector,
-        state.l1_cache_buf,
-        bytes_read,
-    )?;
-    if cluster_bits < 9 || cluster_bits > 21 {
-        return None;
-    }
-    let cluster_size = 1u64 << cluster_bits;
-    // Reject clusters larger than our scratch buffers (MAX_SECTOR_SIZE = 64 KiB).
-    // The QCOW2 spec allows cluster_bits up to 21 (2 MiB), but our fixed-size
-    // comparison and decompression buffers cannot handle clusters that large.
-    if cluster_size > MAX_SECTOR_SIZE as u64 {
-        return None;
-    }
-    state.cluster_bits = cluster_bits;
-    state.cluster_size = cluster_size;
-
-    // Read virtual size (not used directly but validates header)
-    let _virtual_size = read_u64_be_cached(
-        call_table,
-        device_idx,
-        QCOW2_SIZE_OFFSET as u64,
-        sector_size,
-        input_capacity,
-        &mut state.l1_cached_sector,
-        state.l1_cache_buf,
-        bytes_read,
-    )?;
-
-    // Read L1 table size
-    let l1_size = read_u32_be_cached(
-        call_table,
-        device_idx,
-        QCOW2_L1_SIZE_OFFSET as u64,
-        sector_size,
-        input_capacity,
-        &mut state.l1_cached_sector,
-        state.l1_cache_buf,
-        bytes_read,
-    )?;
-    state.l1_size = l1_size;
-
-    // Read L1 table offset
-    let l1_table_offset = read_u64_be_cached(
-        call_table,
-        device_idx,
-        QCOW2_L1_TABLE_OFFSET_OFFSET as u64,
-        sector_size,
-        input_capacity,
-        &mut state.l1_cached_sector,
-        state.l1_cache_buf,
-        bytes_read,
-    )?;
-
-    // Validate L1 table offset: must be non-zero and the entire L1 table
-    // (l1_table_offset + l1_size * 8) must fit within the input device.
-    let actual_size = input_capacity.saturating_mul(sector_size as u64);
-    if l1_table_offset == 0 || l1_table_offset >= actual_size {
-        return None;
-    }
-    let l1_table_end = l1_table_offset.checked_add((l1_size as u64).saturating_mul(8))?;
-    if l1_table_end > actual_size {
-        return None;
-    }
-
-    state.l1_table_offset = l1_table_offset;
-
-    // Invalidate cache since we'll be reading L1/L2 tables from
-    // different parts of the file
-    state.l1_cached_sector = u64::MAX;
-    state.l2_cached_sector = u64::MAX;
-
-    Some(state)
-}
-
-/// Look up the host cluster for a given virtual offset in a QCOW2 image.
-unsafe fn qcow2_cluster_lookup(
-    call_table: &CallTable,
-    state: &mut Qcow2State,
-    virtual_offset: u64,
-    sector_size: usize,
-    input_capacity: u64,
-    bytes_read: &mut u64,
-) -> Option<ClusterLookup> {
-    let cluster_size = state.cluster_size;
-    let entries_per_l2 = cluster_size / 8; // Each L2 entry is 8 bytes
-
-    // Calculate L1 and L2 indices
-    let l2_coverage = cluster_size * entries_per_l2;
-    let l1_index = virtual_offset / l2_coverage;
-    let l2_index = (virtual_offset / cluster_size) % entries_per_l2;
-
-    // Bounds check L1 index
-    if l1_index >= state.l1_size as u64 {
-        return Some(ClusterLookup::Unallocated);
-    }
-
-    // Read L1 entry (use checked arithmetic to prevent overflow)
-    let l1_byte_offset = state
-        .l1_table_offset
-        .checked_add(l1_index.checked_mul(8)?)?;
-    let l1_entry = read_u64_be_cached(
-        call_table,
-        state.device_idx,
-        l1_byte_offset,
-        sector_size,
-        input_capacity,
-        &mut state.l1_cached_sector,
-        state.l1_cache_buf,
-        bytes_read,
-    )?;
-
-    // L1 entry of 0 means unallocated
-    let l2_table_offset = l1_entry & L2_OFFSET_MASK;
-    if l2_table_offset == 0 {
-        return Some(ClusterLookup::Unallocated);
-    }
-
-    // Validate L2 table offset against device capacity
-    let actual_size = input_capacity.checked_mul(sector_size as u64)?;
-    if l2_table_offset >= actual_size {
-        return None;
-    }
-
-    // Read L2 entry (use checked arithmetic to prevent overflow)
-    let l2_byte_offset = l2_table_offset.checked_add(l2_index.checked_mul(8)?)?;
-    let l2_entry = read_u64_be_cached(
-        call_table,
-        state.device_idx,
-        l2_byte_offset,
-        sector_size,
-        input_capacity,
-        &mut state.l2_cached_sector,
-        state.l2_cache_buf,
-        bytes_read,
-    )?;
-
-    // Decode L2 entry
-    if l2_entry == 0 {
-        Some(ClusterLookup::Unallocated)
-    } else if (l2_entry & QCOW_OFLAG_COMPRESSED) != 0 {
-        Some(ClusterLookup::Compressed(l2_entry))
-    } else {
-        // Standard cluster: extract host offset
-        let host_offset = l2_entry & L2_OFFSET_MASK;
-        if host_offset == 0 {
-            // Zero cluster (preallocated but zero-filled)
-            Some(ClusterLookup::Unallocated)
-        } else {
-            Some(ClusterLookup::Standard(host_offset))
-        }
-    }
-}
-
-/// Read a standard (uncompressed) cluster's data from a device into
-/// the provided buffer, reading sector by sector.
-unsafe fn read_cluster_sectors(
-    call_table: &CallTable,
-    device_idx: u32,
-    host_offset: u64,
-    buf: *mut u8,
-    cluster_size: u64,
-    sector_size: usize,
-    bytes_read: &mut u64,
-) -> bool {
-    let first_sector = host_offset / sector_size as u64;
-    let sectors_per_cluster = cluster_size / sector_size as u64;
-
-    for i in 0..sectors_per_cluster {
-        let sector = first_sector + i;
-        let buf_offset = (i as usize) * sector_size;
-        if !(call_table.read_input_sector)(device_idx, sector, buf.add(buf_offset), sector_size) {
-            return false;
-        }
-        *bytes_read += sector_size as u64;
-    }
-    true
-}
-
-/// Read and decompress a compressed QCOW2 cluster.
-///
-/// Parses the compressed L2 entry to extract offset and size,
-/// reads the compressed data, and inflates using miniz_oxide.
-unsafe fn read_compressed_cluster(
-    call_table: &CallTable,
-    device_idx: u32,
-    l2_entry: u64,
-    cluster_bits: u32,
-    out_buf: *mut u8,
-    cluster_size: u64,
-    sector_size: usize,
-    compressed_buf: *mut u8,
-    input_capacity: u64,
-    bytes_read: &mut u64,
-) -> bool {
-    // Parse compressed L2 entry format:
-    // csize_shift = 62 - (cluster_bits - 8)
-    // offset_mask = (1 << csize_shift) - 1
-    // compressed_offset = l2_entry & offset_mask
-    // nb_sectors = ((l2_entry >> csize_shift) & csize_mask) + 1
-    // compressed_size = nb_sectors * 512 - (compressed_offset & 511)
-    let csize_shift = 62 - (cluster_bits as u64 - 8);
-    let csize_mask = (1u64 << (cluster_bits as u64 - 8)) - 1;
-    let offset_mask = (1u64 << csize_shift) - 1;
-
-    let compressed_offset = l2_entry & offset_mask;
-    let nb_sectors = ((l2_entry >> csize_shift) & csize_mask) + 1;
-    let nb_sectors_bytes = match nb_sectors.checked_mul(512) {
-        Some(v) => v,
-        None => return false,
-    };
-    let offset_remainder = compressed_offset & 511;
-    if nb_sectors_bytes < offset_remainder {
-        return false;
-    }
-    let compressed_size = nb_sectors_bytes - offset_remainder;
-
-    if compressed_size == 0 || compressed_size > MAX_SECTOR_SIZE as u64 {
-        return false;
-    }
-
-    // Validate compressed data range against device capacity
-    let data_end = compressed_offset + compressed_size;
-    let device_size = input_capacity.saturating_mul(sector_size as u64);
-    if data_end > device_size {
-        return false;
-    }
-
-    // Read compressed data sector by sector
-    let first_sector = compressed_offset / sector_size as u64;
-    let last_sector = (data_end + sector_size as u64 - 1) / sector_size as u64;
-    let sectors_to_read = last_sector - first_sector;
-
-    // Ensure total read fits within the compressed buffer (MAX_SECTOR_SIZE bytes)
-    if sectors_to_read * sector_size as u64 > MAX_SECTOR_SIZE as u64 {
-        return false;
-    }
-
-    // Read all needed sectors into compressed_buf
-    // We need to handle the case where compressed data spans multiple sectors
-    // and doesn't start at a sector boundary.
-    let read_buf = compressed_buf;
-    for i in 0..sectors_to_read {
-        let sector = first_sector + i;
-        let buf_offset = (i as usize) * sector_size;
-        if !(call_table.read_input_sector)(
-            device_idx,
-            sector,
-            read_buf.add(buf_offset),
-            sector_size,
-        ) {
-            return false;
-        }
-        *bytes_read += sector_size as u64;
-    }
-
-    // Extract the compressed data from within the read buffer
-    let start_within_buf = (compressed_offset % sector_size as u64) as usize;
-
-    // Defense-in-depth: verify the compressed slice lies within the read data
-    let total_read = (sectors_to_read as usize) * sector_size;
-    if start_within_buf + compressed_size as usize > total_read {
-        return false;
-    }
-
-    let compressed_data = read_buf.add(start_within_buf);
-
-    // Decompress using miniz_oxide raw deflate
-    let compressed_slice = core::slice::from_raw_parts(compressed_data, compressed_size as usize);
-    let out_slice = core::slice::from_raw_parts_mut(out_buf, cluster_size as usize);
-
-    // Use miniz_oxide's low-level decompress API for no_std
-    use miniz_oxide::inflate::core::inflate_flags;
-    use miniz_oxide::inflate::TINFLStatus;
-
-    let mut decomp = miniz_oxide::inflate::core::DecompressorOxide::new();
-    let (status, _in_consumed, out_produced) = miniz_oxide::inflate::core::decompress(
-        &mut decomp,
-        compressed_slice,
-        out_slice,
-        0,
-        inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER
-            | inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
-    );
-
-    // Check that decompression succeeded and produced exactly one cluster.
-    // Only Done is acceptable — HasMoreOutput means the data decompresses to
-    // more than cluster_size bytes, indicating a corrupt or malicious image.
-    if status != TINFLStatus::Done || out_produced != cluster_size as usize {
-        // Try again without ZLIB header (raw deflate) since QCOW2
-        // compression stores raw deflate data wrapped in a zlib stream
-        let mut decomp2 = miniz_oxide::inflate::core::DecompressorOxide::new();
-        let (status2, _in2, out2) = miniz_oxide::inflate::core::decompress(
-            &mut decomp2,
-            compressed_slice,
-            out_slice,
-            0,
-            inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
-        );
-        if status2 != TINFLStatus::Done || out2 != cluster_size as usize {
-            return false;
-        }
-    }
-
-    true
 }
 
 /// Read raw sectors from a device for a given virtual offset range.
@@ -564,7 +103,7 @@ unsafe fn read_chain_virtual_cluster(
     chunk_size: u64,
     sector_size: usize,
     chain_config: &ChainConfig,
-    qcow2_states: &mut [Option<Qcow2State>; MAX_CHAIN_DEVICES],
+    qcow2_states: &mut [Option<qcow2::Qcow2State>; MAX_CHAIN_DEVICES],
     bytes_read: &mut u64,
 ) -> bool {
     for dev_offset in 0..chain_len {
@@ -580,31 +119,21 @@ unsafe fn read_chain_virtual_cluster(
                 };
 
                 // Always use the actual QCOW2 cluster size for reading/decompressing.
-                // The caller may pass a smaller chunk_size for the final partial chunk,
-                // but QCOW2 clusters must be read in full (decompression expects exactly
-                // one cluster). The caller limits how many bytes are compared afterward.
                 let qcow2_cluster_size = state.cluster_size;
-                // Defense-in-depth: init_qcow2_state already rejects clusters
-                // larger than MAX_SECTOR_SIZE, but guard at the use-site too so
-                // a future refactor cannot silently introduce a buffer overflow.
+                // Defense-in-depth: Qcow2State::init already rejects clusters
+                // larger than MAX_SECTOR_SIZE, but guard at the use-site too.
                 if qcow2_cluster_size > MAX_SECTOR_SIZE as u64 {
                     return false;
                 }
 
-                match qcow2_cluster_lookup(
-                    call_table,
-                    state,
-                    virtual_offset,
-                    sector_size,
-                    cap,
-                    bytes_read,
-                ) {
+                match state.cluster_lookup(call_table, virtual_offset, sector_size, cap, bytes_read)
+                {
                     Some(ClusterLookup::Unallocated) => {
                         // Not in this device, try next in chain
                         continue;
                     }
                     Some(ClusterLookup::Standard(host_offset)) => {
-                        return read_cluster_sectors(
+                        return qcow2::read_cluster_sectors(
                             call_table,
                             dev_idx as u32,
                             host_offset,
@@ -615,7 +144,7 @@ unsafe fn read_chain_virtual_cluster(
                         );
                     }
                     Some(ClusterLookup::Compressed(l2_entry)) => {
-                        return read_compressed_cluster(
+                        return qcow2::read_compressed_cluster(
                             call_table,
                             dev_idx as u32,
                             l2_entry,
@@ -782,13 +311,13 @@ pub unsafe extern "C" fn _start() -> u64 {
     (call_table.verbose_print)(b"compare: determined formats\n\0".as_ptr());
 
     // Initialize QCOW2 state for all QCOW2 devices across both chains
-    let mut qcow2_states: [Option<Qcow2State>; MAX_CHAIN_DEVICES] = Default::default();
+    let mut qcow2_states: [Option<qcow2::Qcow2State>; MAX_CHAIN_DEVICES] = Default::default();
 
     for dev_idx in 0..total_devices {
         let dev_info = &chain_config.devices[dev_idx];
         if matches!(dev_info.detected_format(), ImageFormat::Qcow2) {
             let cap = (call_table.get_input_capacity)(dev_idx as u32);
-            qcow2_states[dev_idx] = init_qcow2_state(
+            qcow2_states[dev_idx] = qcow2::Qcow2State::init(
                 call_table,
                 dev_idx as u32,
                 sector_size,

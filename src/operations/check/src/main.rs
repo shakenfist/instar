@@ -33,28 +33,6 @@ use shared::{
     MAX_SECTOR_SIZE, SCRATCH_MEM_BASE, SCRATCH_MEM_SIZE,
 };
 
-// QCOW2 header offsets (big-endian)
-const QCOW2_VERSION_OFFSET: usize = 4;
-const QCOW2_CLUSTER_BITS_OFFSET: usize = 20;
-const QCOW2_SIZE_OFFSET: usize = 24;
-const QCOW2_L1_SIZE_OFFSET: usize = 36;
-const QCOW2_L1_TABLE_OFFSET_OFFSET: usize = 40;
-const QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET: usize = 48;
-const QCOW2_REFCOUNT_TABLE_CLUSTERS_OFFSET: usize = 56;
-const QCOW2_INCOMPATIBLE_FEATURES_OFFSET: usize = 72;
-const QCOW2_REFCOUNT_ORDER_OFFSET: usize = 96;
-
-// QCOW2 incompatible feature bits
-const QCOW2_INCOMPAT_DIRTY: u64 = 1 << 0;
-const QCOW2_INCOMPAT_CORRUPT: u64 = 1 << 1;
-
-// L2 table entry flags
-const QCOW2_OFLAG_COMPRESSED: u64 = 1 << 62;
-
-// Mask for extracting offset from L1/L2 entries (bits 9-55)
-const L1_OFFSET_MASK: u64 = 0x00fffffffffffe00;
-const L2_OFFSET_MASK: u64 = 0x00fffffffffffe00;
-
 /// Result of a bitmap_set operation.
 enum BitmapSetResult {
     /// Bit was not previously set (no overlap).
@@ -105,146 +83,6 @@ unsafe fn bitmap_test(bitmap: *const u8, bitmap_size: usize, cluster_idx: u64) -
         return false;
     }
     (*bitmap.add(byte_idx) & bit_mask) != 0
-}
-
-/// Read a big-endian u64 from a specific byte offset within the
-/// image, using a sector-level cache to minimize I/O.
-///
-/// `cached_sector` / `cached_buffer` provide a one-sector cache.
-/// Set `cached_sector` to `u64::MAX` to invalidate the cache.
-unsafe fn read_u64_be_cached(
-    call_table: &CallTable,
-    byte_offset: u64,
-    sector_size: usize,
-    input_capacity: u64,
-    cached_sector: &mut u64,
-    cached_buffer: &mut [u8; MAX_SECTOR_SIZE],
-    bytes_read: &mut u64,
-) -> Option<u64> {
-    let sector = byte_offset / sector_size as u64;
-    let off = (byte_offset % sector_size as u64) as usize;
-    if off + 8 > sector_size {
-        return None; // Entry spans sector boundary
-    }
-    if sector >= input_capacity {
-        return None;
-    }
-    if *cached_sector != sector {
-        if !(call_table.read_input_sector)(0, sector, cached_buffer.as_mut_ptr(), sector_size) {
-            return None;
-        }
-        *bytes_read += sector_size as u64;
-        *cached_sector = sector;
-    }
-    Some(u64::from_be_bytes([
-        cached_buffer[off],
-        cached_buffer[off + 1],
-        cached_buffer[off + 2],
-        cached_buffer[off + 3],
-        cached_buffer[off + 4],
-        cached_buffer[off + 5],
-        cached_buffer[off + 6],
-        cached_buffer[off + 7],
-    ]))
-}
-
-/// Read a 16-bit big-endian refcount entry from a specific byte
-/// offset, using a sector-level cache.
-unsafe fn read_u16_be_cached(
-    call_table: &CallTable,
-    byte_offset: u64,
-    sector_size: usize,
-    input_capacity: u64,
-    cached_sector: &mut u64,
-    cached_buffer: &mut [u8; MAX_SECTOR_SIZE],
-    bytes_read: &mut u64,
-) -> Option<u16> {
-    let sector = byte_offset / sector_size as u64;
-    let off = (byte_offset % sector_size as u64) as usize;
-    if off + 2 > sector_size {
-        return None;
-    }
-    if sector >= input_capacity {
-        return None;
-    }
-    if *cached_sector != sector {
-        if !(call_table.read_input_sector)(0, sector, cached_buffer.as_mut_ptr(), sector_size) {
-            return None;
-        }
-        *bytes_read += sector_size as u64;
-        *cached_sector = sector;
-    }
-    Some(u16::from_be_bytes([
-        cached_buffer[off],
-        cached_buffer[off + 1],
-    ]))
-}
-
-/// Look up the refcount for a host cluster.
-///
-/// Returns `Some(refcount)` on success, `None` on I/O error.
-/// A refcount of 0 means the cluster is not allocated.
-unsafe fn lookup_refcount(
-    call_table: &CallTable,
-    refcount_table_offset: u64,
-    refcount_bits: u32,
-    cluster_size: u64,
-    sector_size: usize,
-    input_capacity: u64,
-    host_offset: u64,
-    reftable_cached_sector: &mut u64,
-    reftable_cached_buffer: &mut [u8; MAX_SECTOR_SIZE],
-    refblock_cached_sector: &mut u64,
-    refblock_cached_buffer: &mut [u8; MAX_SECTOR_SIZE],
-    bytes_read: &mut u64,
-) -> Option<u64> {
-    let cluster_index = host_offset / cluster_size;
-    let entries_per_block = (cluster_size * 8) / refcount_bits as u64;
-    let refblock_index = cluster_index / entries_per_block;
-
-    // Read refcount table entry (big-endian u64 pointer to
-    // refcount block)
-    let reftable_byte_off = refblock_index
-        .checked_mul(8)
-        .and_then(|v| refcount_table_offset.checked_add(v))?;
-    let refblock_offset = read_u64_be_cached(
-        call_table,
-        reftable_byte_off,
-        sector_size,
-        input_capacity,
-        reftable_cached_sector,
-        reftable_cached_buffer,
-        bytes_read,
-    )?;
-
-    if refblock_offset == 0 {
-        return Some(0); // Block not allocated = refcount 0
-    }
-
-    // Read the individual refcount entry from the block
-    let entry_in_block = cluster_index % entries_per_block;
-    // Currently only 16-bit refcounts are supported (the
-    // overwhelmingly common case). Other widths are treated as
-    // I/O errors to avoid silent misinterpretation.
-    if refcount_bits == 16 {
-        let entry_byte_off = entry_in_block
-            .checked_mul(2)
-            .and_then(|v| refblock_offset.checked_add(v))?;
-        let rc = read_u16_be_cached(
-            call_table,
-            entry_byte_off,
-            sector_size,
-            input_capacity,
-            refblock_cached_sector,
-            refblock_cached_buffer,
-            bytes_read,
-        )?;
-        Some(rc as u64)
-    } else {
-        // Unsupported refcount width - skip validation rather
-        // than risk misreading entries
-        None
-    }
 }
 
 /// Entry point called by core after devices are initialized.
@@ -724,62 +562,36 @@ unsafe fn check_qcow2(
 ) -> u64 {
     let mut bytes_read: u64 = 0;
 
-    // Parse header fields
-    let version = u32::from_be_bytes([
-        header[QCOW2_VERSION_OFFSET],
-        header[QCOW2_VERSION_OFFSET + 1],
-        header[QCOW2_VERSION_OFFSET + 2],
-        header[QCOW2_VERSION_OFFSET + 3],
-    ]);
+    // Parse header using shared crate
+    let hdr = match qcow2::QcowHeader::parse(header) {
+        Some(h) => h,
+        None => {
+            result.corruptions += 1;
+            result.total_errors += 1;
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+            (call_table.debug_print)(b"check: invalid qcow2 header\n\0".as_ptr());
+            return bytes_read;
+        }
+    };
 
-    // Validate version (2 or 3)
-    if version < 2 || version > 3 {
-        result.corruptions += 1;
-        result.total_errors += 1;
-        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
-        (call_table.debug_print)(b"check: invalid qcow2 version\n\0".as_ptr());
-        return bytes_read;
-    }
+    let version = hdr.version;
+    let cluster_size = hdr.cluster_size;
+    let l1_size = hdr.l1_size;
+    let l1_table_offset = hdr.l1_table_offset;
+    let refcount_table_offset = hdr.refcount_table_offset;
+    let refcount_table_clusters = hdr.refcount_table_clusters;
 
-    // Cluster bits and size (QCOW2 spec: valid range is 9-21)
-    let cluster_bits = u32::from_be_bytes([
-        header[QCOW2_CLUSTER_BITS_OFFSET],
-        header[QCOW2_CLUSTER_BITS_OFFSET + 1],
-        header[QCOW2_CLUSTER_BITS_OFFSET + 2],
-        header[QCOW2_CLUSTER_BITS_OFFSET + 3],
-    ]);
-    if cluster_bits < 9 || cluster_bits > 21 {
-        result.corruptions += 1;
-        result.total_errors += 1;
-        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
-        (call_table.debug_print)(b"check: invalid cluster_bits\n\0".as_ptr());
-        return bytes_read;
-    }
-    let cluster_size = 1u64 << cluster_bits;
-
-    // Virtual size
-    let _virtual_size = u64::from_be_bytes([
-        header[QCOW2_SIZE_OFFSET],
-        header[QCOW2_SIZE_OFFSET + 1],
-        header[QCOW2_SIZE_OFFSET + 2],
-        header[QCOW2_SIZE_OFFSET + 3],
-        header[QCOW2_SIZE_OFFSET + 4],
-        header[QCOW2_SIZE_OFFSET + 5],
-        header[QCOW2_SIZE_OFFSET + 6],
-        header[QCOW2_SIZE_OFFSET + 7],
-    ]);
-
-    // Refcount bits: v2 always 16-bit, v3 reads refcount_order
-    let refcount_bits: u32 = if version >= 3 {
+    // Additional v3 refcount_order validation
+    // (QcowHeader::parse() falls back to 16 for invalid order,
+    // but check should flag it as corruption)
+    let refcount_bits = if version >= 3 {
         let refcount_order = u32::from_be_bytes([
-            header[QCOW2_REFCOUNT_ORDER_OFFSET],
-            header[QCOW2_REFCOUNT_ORDER_OFFSET + 1],
-            header[QCOW2_REFCOUNT_ORDER_OFFSET + 2],
-            header[QCOW2_REFCOUNT_ORDER_OFFSET + 3],
+            header[qcow2::REFCOUNT_ORDER_OFFSET],
+            header[qcow2::REFCOUNT_ORDER_OFFSET + 1],
+            header[qcow2::REFCOUNT_ORDER_OFFSET + 2],
+            header[qcow2::REFCOUNT_ORDER_OFFSET + 3],
         ]);
         if refcount_order > 6 {
-            // refcount_order > 6 means refcount_bits > 64 which
-            // is invalid
             result.corruptions += 1;
             result.total_errors += 1;
             result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
@@ -788,7 +600,7 @@ unsafe fn check_qcow2(
         }
         1u32 << refcount_order
     } else {
-        16 // v2 always uses 16-bit refcounts
+        16
     };
 
     if refcount_bits != 16 {
@@ -796,24 +608,6 @@ unsafe fn check_qcow2(
             b"check: refcount_bits != 16, skipping refcount/leak validation\n\0".as_ptr(),
         );
     }
-
-    // L1 table info
-    let l1_size = u32::from_be_bytes([
-        header[QCOW2_L1_SIZE_OFFSET],
-        header[QCOW2_L1_SIZE_OFFSET + 1],
-        header[QCOW2_L1_SIZE_OFFSET + 2],
-        header[QCOW2_L1_SIZE_OFFSET + 3],
-    ]);
-    let l1_table_offset = u64::from_be_bytes([
-        header[QCOW2_L1_TABLE_OFFSET_OFFSET],
-        header[QCOW2_L1_TABLE_OFFSET_OFFSET + 1],
-        header[QCOW2_L1_TABLE_OFFSET_OFFSET + 2],
-        header[QCOW2_L1_TABLE_OFFSET_OFFSET + 3],
-        header[QCOW2_L1_TABLE_OFFSET_OFFSET + 4],
-        header[QCOW2_L1_TABLE_OFFSET_OFFSET + 5],
-        header[QCOW2_L1_TABLE_OFFSET_OFFSET + 6],
-        header[QCOW2_L1_TABLE_OFFSET_OFFSET + 7],
-    ]);
 
     // Validate l1_size
     const MAX_L1_ENTRIES: u32 = 16 * 1024 * 1024;
@@ -826,42 +620,13 @@ unsafe fn check_qcow2(
         return bytes_read;
     }
 
-    // Refcount table info
-    let refcount_table_offset = u64::from_be_bytes([
-        header[QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET],
-        header[QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET + 1],
-        header[QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET + 2],
-        header[QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET + 3],
-        header[QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET + 4],
-        header[QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET + 5],
-        header[QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET + 6],
-        header[QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET + 7],
-    ]);
-    let refcount_table_clusters = u32::from_be_bytes([
-        header[QCOW2_REFCOUNT_TABLE_CLUSTERS_OFFSET],
-        header[QCOW2_REFCOUNT_TABLE_CLUSTERS_OFFSET + 1],
-        header[QCOW2_REFCOUNT_TABLE_CLUSTERS_OFFSET + 2],
-        header[QCOW2_REFCOUNT_TABLE_CLUSTERS_OFFSET + 3],
-    ]);
-
     // Check incompatible features (v3 only)
     if version >= 3 {
-        let incompat = u64::from_be_bytes([
-            header[QCOW2_INCOMPATIBLE_FEATURES_OFFSET],
-            header[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 1],
-            header[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 2],
-            header[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 3],
-            header[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 4],
-            header[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 5],
-            header[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 6],
-            header[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 7],
-        ]);
-
-        if (incompat & QCOW2_INCOMPAT_DIRTY) != 0 {
+        if hdr.dirty {
             result.flags |= CheckResult::FLAG_DIRTY;
             (call_table.debug_print)(b"check: image is dirty\n\0".as_ptr());
         }
-        if (incompat & QCOW2_INCOMPAT_CORRUPT) != 0 {
+        if hdr.corrupt {
             result.flags |= CheckResult::FLAG_CORRUPT_BIT;
             result.corruptions += 1;
             result.total_errors += 1;
@@ -1020,7 +785,7 @@ unsafe fn check_qcow2(
                 continue;
             }
 
-            let l2_offset = l1_entry & L1_OFFSET_MASK;
+            let l2_offset = l1_entry & qcow2::L1_OFFSET_MASK;
 
             if l2_offset == 0 {
                 result.corruptions += 1;
@@ -1057,8 +822,9 @@ unsafe fn check_qcow2(
             }
 
             // Refcount check for L2 table cluster
-            if let Some(rc) = lookup_refcount(
+            if let Some(rc) = qcow2::lookup_refcount(
                 call_table,
+                0,
                 refcount_table_offset,
                 refcount_bits,
                 cluster_size,
@@ -1066,9 +832,9 @@ unsafe fn check_qcow2(
                 input_capacity,
                 l2_offset,
                 &mut reftable_cached_sector,
-                &mut reftable_cached_buffer,
+                reftable_cached_buffer.as_mut_ptr(),
                 &mut refblock_cached_sector,
-                &mut refblock_cached_buffer,
+                refblock_cached_buffer.as_mut_ptr(),
                 &mut bytes_read,
             ) {
                 if rc == 0 {
@@ -1079,13 +845,14 @@ unsafe fn check_qcow2(
                 let entries_per_block = (cluster_size * 8) / refcount_bits as u64;
                 let rb_idx = (l2_offset / cluster_size) / entries_per_block;
                 let rb_byte_off = refcount_table_offset + rb_idx * 8;
-                if let Some(rb_off) = read_u64_be_cached(
+                if let Some(rb_off) = qcow2::read_u64_be_cached(
                     call_table,
+                    0,
                     rb_byte_off,
                     sector_size,
                     input_capacity,
                     &mut reftable_cached_sector,
-                    &mut reftable_cached_buffer,
+                    reftable_cached_buffer.as_mut_ptr(),
                     &mut bytes_read,
                 ) {
                     if rb_off != 0 && can_track {
@@ -1153,10 +920,10 @@ unsafe fn check_qcow2(
                         continue;
                     }
 
-                    let compressed = (l2e & QCOW2_OFLAG_COMPRESSED) != 0;
+                    let compressed = (l2e & qcow2::OFLAG_COMPRESSED) != 0;
 
                     if !compressed {
-                        let data_off = l2e & L2_OFFSET_MASK;
+                        let data_off = l2e & qcow2::L2_OFFSET_MASK;
                         if data_off == 0 {
                             continue;
                         }
@@ -1189,8 +956,9 @@ unsafe fn check_qcow2(
                         }
 
                         // Refcount validation
-                        if let Some(rc) = lookup_refcount(
+                        if let Some(rc) = qcow2::lookup_refcount(
                             call_table,
+                            0,
                             refcount_table_offset,
                             refcount_bits,
                             cluster_size,
@@ -1198,9 +966,9 @@ unsafe fn check_qcow2(
                             input_capacity,
                             data_off,
                             &mut reftable_cached_sector,
-                            &mut reftable_cached_buffer,
+                            reftable_cached_buffer.as_mut_ptr(),
                             &mut refblock_cached_sector,
-                            &mut refblock_cached_buffer,
+                            refblock_cached_buffer.as_mut_ptr(),
                             &mut bytes_read,
                         ) {
                             if rc == 0 {
@@ -1282,13 +1050,14 @@ unsafe fn check_qcow2(
                 if rt_byte_off + 8 > actual_size {
                     break;
                 }
-                let refblock_off = match read_u64_be_cached(
+                let refblock_off = match qcow2::read_u64_be_cached(
                     call_table,
+                    0,
                     rt_byte_off,
                     sector_size,
                     input_capacity,
                     &mut reftable_cached_sector,
-                    &mut reftable_cached_buffer,
+                    reftable_cached_buffer.as_mut_ptr(),
                     &mut bytes_read,
                 ) {
                     Some(v) => v,
@@ -1313,13 +1082,14 @@ unsafe fn check_qcow2(
                 if rt_byte_off + 8 > actual_size {
                     break;
                 }
-                let refblock_off = match read_u64_be_cached(
+                let refblock_off = match qcow2::read_u64_be_cached(
                     call_table,
+                    0,
                     rt_byte_off,
                     sector_size,
                     input_capacity,
                     &mut reftable_cached_sector,
-                    &mut reftable_cached_buffer,
+                    reftable_cached_buffer.as_mut_ptr(),
                     &mut bytes_read,
                 ) {
                     Some(v) => v,
@@ -1497,9 +1267,8 @@ unsafe fn validate_chain(
 
 /// Basic QCOW2 header validation for a backing image.
 ///
-/// This performs structural validation only (no L2/refcount walk)
-/// to avoid scratch memory conflicts with the primary image's check.
-/// Validates: magic, version, cluster_bits, L1 and refcount table bounds.
+/// Uses `qcow2::QcowHeader::parse()` for field extraction, then validates
+/// structural bounds. No L2/refcount walk (avoids scratch memory conflicts).
 ///
 /// Returns bytes read (always 0 since we reuse the header buffer).
 unsafe fn validate_chain_qcow2_header(
@@ -1517,46 +1286,19 @@ unsafe fn validate_chain_qcow2_header(
         return 0;
     }
 
-    // Validate version (2 or 3)
-    let version = u32::from_be_bytes([
-        header[QCOW2_VERSION_OFFSET],
-        header[QCOW2_VERSION_OFFSET + 1],
-        header[QCOW2_VERSION_OFFSET + 2],
-        header[QCOW2_VERSION_OFFSET + 3],
-    ]);
-    if version < 2 || version > 3 {
-        (call_table.debug_print)(b"check: chain qcow2 bad version\n\0".as_ptr());
-        result.chain_errors += 1;
-        result.total_errors += 1;
-        return 0;
-    }
-
-    // Validate cluster_bits (9-21)
-    let cluster_bits = u32::from_be_bytes([
-        header[QCOW2_CLUSTER_BITS_OFFSET],
-        header[QCOW2_CLUSTER_BITS_OFFSET + 1],
-        header[QCOW2_CLUSTER_BITS_OFFSET + 2],
-        header[QCOW2_CLUSTER_BITS_OFFSET + 3],
-    ]);
-    if cluster_bits < 9 || cluster_bits > 21 {
-        (call_table.debug_print)(b"check: chain qcow2 bad cluster_bits\n\0".as_ptr());
-        result.chain_errors += 1;
-        result.total_errors += 1;
-        return 0;
-    }
+    // Parse header (validates version 2|3 and cluster_bits 9-21)
+    let hdr = match qcow2::QcowHeader::parse(header) {
+        Some(h) => h,
+        None => {
+            (call_table.debug_print)(b"check: chain qcow2 bad header\n\0".as_ptr());
+            result.chain_errors += 1;
+            result.total_errors += 1;
+            return 0;
+        }
+    };
 
     // Validate L1 table offset is within bounds
-    let l1_table_offset = u64::from_be_bytes([
-        header[QCOW2_L1_TABLE_OFFSET_OFFSET],
-        header[QCOW2_L1_TABLE_OFFSET_OFFSET + 1],
-        header[QCOW2_L1_TABLE_OFFSET_OFFSET + 2],
-        header[QCOW2_L1_TABLE_OFFSET_OFFSET + 3],
-        header[QCOW2_L1_TABLE_OFFSET_OFFSET + 4],
-        header[QCOW2_L1_TABLE_OFFSET_OFFSET + 5],
-        header[QCOW2_L1_TABLE_OFFSET_OFFSET + 6],
-        header[QCOW2_L1_TABLE_OFFSET_OFFSET + 7],
-    ]);
-    if l1_table_offset == 0 || l1_table_offset >= actual_size {
+    if hdr.l1_table_offset == 0 || hdr.l1_table_offset >= actual_size {
         (call_table.debug_print)(b"check: chain qcow2 bad L1 offset\n\0".as_ptr());
         result.chain_errors += 1;
         result.total_errors += 1;
@@ -1564,13 +1306,7 @@ unsafe fn validate_chain_qcow2_header(
     }
 
     // Validate L1 size
-    let l1_size = u32::from_be_bytes([
-        header[QCOW2_L1_SIZE_OFFSET],
-        header[QCOW2_L1_SIZE_OFFSET + 1],
-        header[QCOW2_L1_SIZE_OFFSET + 2],
-        header[QCOW2_L1_SIZE_OFFSET + 3],
-    ]);
-    let l1_table_size_bytes = (l1_size as u64).saturating_mul(8);
+    let l1_table_size_bytes = (hdr.l1_size as u64).saturating_mul(8);
     if l1_table_size_bytes > actual_size {
         (call_table.debug_print)(b"check: chain qcow2 L1 too large\n\0".as_ptr());
         result.chain_errors += 1;
@@ -1579,17 +1315,7 @@ unsafe fn validate_chain_qcow2_header(
     }
 
     // Validate refcount table offset is within bounds
-    let refcount_table_offset = u64::from_be_bytes([
-        header[QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET],
-        header[QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET + 1],
-        header[QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET + 2],
-        header[QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET + 3],
-        header[QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET + 4],
-        header[QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET + 5],
-        header[QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET + 6],
-        header[QCOW2_REFCOUNT_TABLE_OFFSET_OFFSET + 7],
-    ]);
-    if refcount_table_offset == 0 || refcount_table_offset >= actual_size {
+    if hdr.refcount_table_offset == 0 || hdr.refcount_table_offset >= actual_size {
         (call_table.debug_print)(b"check: chain qcow2 bad reftable offset\n\0".as_ptr());
         result.chain_errors += 1;
         result.total_errors += 1;
@@ -1597,15 +1323,8 @@ unsafe fn validate_chain_qcow2_header(
     }
 
     // Validate refcount table clusters are within bounds
-    let refcount_table_clusters = u32::from_be_bytes([
-        header[QCOW2_REFCOUNT_TABLE_CLUSTERS_OFFSET],
-        header[QCOW2_REFCOUNT_TABLE_CLUSTERS_OFFSET + 1],
-        header[QCOW2_REFCOUNT_TABLE_CLUSTERS_OFFSET + 2],
-        header[QCOW2_REFCOUNT_TABLE_CLUSTERS_OFFSET + 3],
-    ]);
-    let cluster_size = 1u64 << cluster_bits;
-    let reftable_size = (refcount_table_clusters as u64).saturating_mul(cluster_size);
-    if let Some(rte) = refcount_table_offset.checked_add(reftable_size) {
+    let reftable_size = (hdr.refcount_table_clusters as u64).saturating_mul(hdr.cluster_size);
+    if let Some(rte) = hdr.refcount_table_offset.checked_add(reftable_size) {
         if rte > actual_size {
             (call_table.debug_print)(b"check: chain qcow2 reftable exceeds file\n\0".as_ptr());
             result.chain_errors += 1;
@@ -1619,22 +1338,10 @@ unsafe fn validate_chain_qcow2_header(
     }
 
     // Check v3 incompatible features for corrupt bit
-    if version >= 3 && header.len() > QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 7 {
-        let incompat = u64::from_be_bytes([
-            header[QCOW2_INCOMPATIBLE_FEATURES_OFFSET],
-            header[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 1],
-            header[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 2],
-            header[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 3],
-            header[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 4],
-            header[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 5],
-            header[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 6],
-            header[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 7],
-        ]);
-        if (incompat & QCOW2_INCOMPAT_CORRUPT) != 0 {
-            (call_table.debug_print)(b"check: chain qcow2 corrupt bit set\n\0".as_ptr());
-            result.chain_errors += 1;
-            result.total_errors += 1;
-        }
+    if hdr.corrupt {
+        (call_table.debug_print)(b"check: chain qcow2 corrupt bit set\n\0".as_ptr());
+        result.chain_errors += 1;
+        result.total_errors += 1;
     }
 
     0
