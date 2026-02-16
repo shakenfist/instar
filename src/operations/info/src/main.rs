@@ -260,6 +260,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                     call_table,
                     &mut backing_file_buf,
                     input_sector_size,
+                    input_capacity,
                 );
             }
 
@@ -677,6 +678,7 @@ unsafe fn parse_qcow2_header(
     call_table: &CallTable,
     backing_file_buf: &mut [u8; MAX_BACKING_FILE_LEN + 1],
     input_sector_size: usize,
+    input_capacity: u64,
 ) {
     let hdr = match qcow2::QcowHeader::parse(buffer) {
         Some(h) => h,
@@ -699,7 +701,14 @@ unsafe fn parse_qcow2_header(
     if hdr.backing_file_offset != 0 && hdr.backing_file_size > 0 {
         result.flags |= InfoResult::FLAG_HAS_BACKING_FILE;
         (call_table.verbose_print)(b"info: has backing file\n\0".as_ptr());
-        qcow2::read_backing_file(call_table, 0, &hdr, backing_file_buf, input_sector_size);
+        qcow2::read_backing_file(
+            call_table,
+            0,
+            &hdr,
+            backing_file_buf,
+            input_sector_size,
+            input_capacity,
+        );
     }
 
     // Version 3 specific features

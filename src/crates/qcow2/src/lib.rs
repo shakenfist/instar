@@ -282,6 +282,7 @@ pub unsafe fn read_backing_file(
     header: &QcowHeader,
     out_buf: &mut [u8],
     sector_size: usize,
+    input_capacity: u64,
 ) -> usize {
     if header.backing_file_offset == 0 || header.backing_file_size == 0 {
         return 0;
@@ -292,6 +293,11 @@ pub unsafe fn read_backing_file(
 
     let backing_sector = header.backing_file_offset / sector_size as u64;
     let offset_in_sector = (header.backing_file_offset % sector_size as u64) as usize;
+
+    // Validate backing sector is within device bounds
+    if backing_sector >= input_capacity {
+        return 0;
+    }
 
     let mut sector_buf = [0u8; MAX_SECTOR_SIZE];
 
@@ -312,6 +318,9 @@ pub unsafe fn read_backing_file(
     let mut current_sector = backing_sector + 1;
 
     while bytes_read < read_size {
+        if current_sector >= input_capacity {
+            break;
+        }
         if !(call_table.read_input_sector)(
             device_idx,
             current_sector,
