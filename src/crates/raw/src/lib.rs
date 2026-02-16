@@ -19,7 +19,7 @@ const MBR_BOOT_ACTIVE: u8 = 0x80;
 const GPT_PROTECTIVE_MBR_TYPE: u8 = 0xEE;
 
 /// Partition table type for RAW image validation.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PartitionTableType {
     /// No valid partition table found
     None,
@@ -84,4 +84,123 @@ pub fn detect_partition_table(buffer: &[u8]) -> PartitionTableType {
 
     // Valid MBR signature but no partition entries - boot sector
     PartitionTableType::Mbr
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: build a 512-byte sector buffer with MBR signature.
+    fn mbr_sector() -> [u8; 512] {
+        let mut buf = [0u8; 512];
+        // MBR signature 0x55AA at offset 510 (little-endian)
+        buf[510] = 0x55;
+        buf[511] = 0xAA;
+        buf
+    }
+
+    // ---- Buffer too short ----
+
+    #[test]
+    fn too_short_returns_none() {
+        assert_eq!(
+            detect_partition_table(&[0u8; 511]),
+            PartitionTableType::None
+        );
+        assert_eq!(detect_partition_table(&[]), PartitionTableType::None);
+    }
+
+    // ---- No MBR signature ----
+
+    #[test]
+    fn no_signature_returns_none() {
+        let buf = [0u8; 512];
+        assert_eq!(detect_partition_table(&buf), PartitionTableType::None);
+    }
+
+    #[test]
+    fn wrong_signature_returns_none() {
+        let mut buf = [0u8; 512];
+        buf[510] = 0xAA;
+        buf[511] = 0x55; // Reversed — wrong endianness
+        assert_eq!(detect_partition_table(&buf), PartitionTableType::None);
+    }
+
+    // ---- Valid MBR (boot sector with signature but no partitions) ----
+
+    #[test]
+    fn signature_only_is_mbr() {
+        let buf = mbr_sector();
+        // All partition entries are zeroed → "boot sector" path
+        assert_eq!(detect_partition_table(&buf), PartitionTableType::Mbr);
+    }
+
+    // ---- Valid MBR with active partition ----
+
+    #[test]
+    fn mbr_with_active_partition() {
+        let mut buf = mbr_sector();
+        let entry = MBR_PARTITION_TABLE_OFFSET;
+        buf[entry] = MBR_BOOT_ACTIVE; // boot indicator
+        buf[entry + 4] = 0x83; // Linux partition type
+        assert_eq!(detect_partition_table(&buf), PartitionTableType::Mbr);
+    }
+
+    #[test]
+    fn mbr_with_inactive_partition() {
+        let mut buf = mbr_sector();
+        let entry = MBR_PARTITION_TABLE_OFFSET;
+        buf[entry] = MBR_BOOT_INACTIVE;
+        buf[entry + 4] = 0x07; // NTFS
+        assert_eq!(detect_partition_table(&buf), PartitionTableType::Mbr);
+    }
+
+    // ---- Invalid boot indicator ----
+
+    #[test]
+    fn invalid_boot_indicator_returns_none() {
+        let mut buf = mbr_sector();
+        let entry = MBR_PARTITION_TABLE_OFFSET;
+        buf[entry] = 0x42; // Not 0x00 or 0x80
+        buf[entry + 4] = 0x83; // Non-empty partition type
+        assert_eq!(detect_partition_table(&buf), PartitionTableType::None);
+    }
+
+    // ---- GPT protective MBR ----
+
+    #[test]
+    fn gpt_protective_mbr() {
+        let mut buf = mbr_sector();
+        let entry = MBR_PARTITION_TABLE_OFFSET;
+        buf[entry] = MBR_BOOT_INACTIVE;
+        buf[entry + 4] = GPT_PROTECTIVE_MBR_TYPE; // 0xEE
+        assert_eq!(detect_partition_table(&buf), PartitionTableType::Gpt);
+    }
+
+    // ---- Multiple partitions ----
+
+    #[test]
+    fn multiple_valid_partitions() {
+        let mut buf = mbr_sector();
+        for i in 0..4 {
+            let entry = MBR_PARTITION_TABLE_OFFSET + i * MBR_PARTITION_ENTRY_SIZE;
+            buf[entry] = MBR_BOOT_INACTIVE;
+            buf[entry + 4] = 0x83;
+        }
+        assert_eq!(detect_partition_table(&buf), PartitionTableType::Mbr);
+    }
+
+    #[test]
+    fn second_partition_invalid_boot_indicator() {
+        let mut buf = mbr_sector();
+        // First partition valid
+        let e0 = MBR_PARTITION_TABLE_OFFSET;
+        buf[e0] = MBR_BOOT_INACTIVE;
+        buf[e0 + 4] = 0x83;
+        // Second partition has invalid boot indicator
+        let e1 = MBR_PARTITION_TABLE_OFFSET + MBR_PARTITION_ENTRY_SIZE;
+        buf[e1] = 0xFF;
+        buf[e1 + 4] = 0x07;
+        assert_eq!(detect_partition_table(&buf), PartitionTableType::None);
+    }
 }

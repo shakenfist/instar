@@ -854,6 +854,224 @@ pub unsafe fn read_compressed_cluster(
 // Refcount table lookup
 // ============================================================================
 
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal QCOW2 header buffer (≥105 bytes).
+    /// Fields default to valid v3, cluster_bits=16, virtual_size=1GiB.
+    fn make_qcow2_header() -> [u8; 512] {
+        let mut buf = [0u8; 512];
+        // version = 3
+        buf[VERSION_OFFSET..VERSION_OFFSET + 4].copy_from_slice(&3u32.to_be_bytes());
+        // cluster_bits = 16 (64 KiB clusters)
+        buf[CLUSTER_BITS_OFFSET..CLUSTER_BITS_OFFSET + 4].copy_from_slice(&16u32.to_be_bytes());
+        // virtual_size = 1 GiB
+        let vsize: u64 = 1 << 30;
+        buf[SIZE_OFFSET..SIZE_OFFSET + 8].copy_from_slice(&vsize.to_be_bytes());
+        // l1_size = 256
+        buf[L1_SIZE_OFFSET..L1_SIZE_OFFSET + 4].copy_from_slice(&256u32.to_be_bytes());
+        // l1_table_offset = 0x30000
+        buf[L1_TABLE_OFFSET_OFFSET..L1_TABLE_OFFSET_OFFSET + 8]
+            .copy_from_slice(&0x30000u64.to_be_bytes());
+        // refcount_table_offset = 0x10000
+        buf[REFCOUNT_TABLE_OFFSET_OFFSET..REFCOUNT_TABLE_OFFSET_OFFSET + 8]
+            .copy_from_slice(&0x10000u64.to_be_bytes());
+        // refcount_table_clusters = 1
+        buf[REFCOUNT_TABLE_CLUSTERS_OFFSET..REFCOUNT_TABLE_CLUSTERS_OFFSET + 4]
+            .copy_from_slice(&1u32.to_be_bytes());
+        // refcount_order = 4 (16-bit refcounts)
+        buf[REFCOUNT_ORDER_OFFSET..REFCOUNT_ORDER_OFFSET + 4].copy_from_slice(&4u32.to_be_bytes());
+        // header_length = 112
+        buf[HEADER_LENGTH_OFFSET..HEADER_LENGTH_OFFSET + 4].copy_from_slice(&112u32.to_be_bytes());
+        buf
+    }
+
+    // ---- QcowHeader::parse ----
+
+    #[test]
+    fn parse_valid_v3_header() {
+        let buf = make_qcow2_header();
+        let hdr = QcowHeader::parse(&buf).unwrap();
+        assert_eq!(hdr.version, 3);
+        assert_eq!(hdr.cluster_bits, 16);
+        assert_eq!(hdr.cluster_size, 1 << 16);
+        assert_eq!(hdr.virtual_size, 1 << 30);
+        assert_eq!(hdr.l1_size, 256);
+        assert_eq!(hdr.l1_table_offset, 0x30000);
+        assert_eq!(hdr.refcount_bits, 16);
+    }
+
+    #[test]
+    fn parse_valid_v2_header() {
+        let mut buf = make_qcow2_header();
+        buf[VERSION_OFFSET..VERSION_OFFSET + 4].copy_from_slice(&2u32.to_be_bytes());
+        let hdr = QcowHeader::parse(&buf).unwrap();
+        assert_eq!(hdr.version, 2);
+        // v2 defaults
+        assert_eq!(hdr.refcount_bits, 16);
+        assert_eq!(hdr.incompatible_features, 0);
+        assert_eq!(hdr.compatible_features, 0);
+        assert_eq!(hdr.compression_type, 0);
+    }
+
+    #[test]
+    fn parse_invalid_version() {
+        let mut buf = make_qcow2_header();
+        buf[VERSION_OFFSET..VERSION_OFFSET + 4].copy_from_slice(&1u32.to_be_bytes());
+        assert!(QcowHeader::parse(&buf).is_none());
+
+        buf[VERSION_OFFSET..VERSION_OFFSET + 4].copy_from_slice(&4u32.to_be_bytes());
+        assert!(QcowHeader::parse(&buf).is_none());
+    }
+
+    #[test]
+    fn parse_cluster_bits_out_of_range() {
+        let mut buf = make_qcow2_header();
+        // Too small
+        buf[CLUSTER_BITS_OFFSET..CLUSTER_BITS_OFFSET + 4].copy_from_slice(&8u32.to_be_bytes());
+        assert!(QcowHeader::parse(&buf).is_none());
+
+        // Too large
+        buf[CLUSTER_BITS_OFFSET..CLUSTER_BITS_OFFSET + 4].copy_from_slice(&22u32.to_be_bytes());
+        assert!(QcowHeader::parse(&buf).is_none());
+    }
+
+    #[test]
+    fn parse_cluster_bits_boundary() {
+        let mut buf = make_qcow2_header();
+        // Minimum valid: 9
+        buf[CLUSTER_BITS_OFFSET..CLUSTER_BITS_OFFSET + 4].copy_from_slice(&9u32.to_be_bytes());
+        let hdr = QcowHeader::parse(&buf).unwrap();
+        assert_eq!(hdr.cluster_size, 512);
+
+        // Maximum valid: 21
+        buf[CLUSTER_BITS_OFFSET..CLUSTER_BITS_OFFSET + 4].copy_from_slice(&21u32.to_be_bytes());
+        let hdr = QcowHeader::parse(&buf).unwrap();
+        assert_eq!(hdr.cluster_size, 1 << 21);
+    }
+
+    #[test]
+    fn parse_buffer_too_short() {
+        // 104 bytes = one less than minimum
+        let buf = [0u8; 104];
+        assert!(QcowHeader::parse(&buf).is_none());
+    }
+
+    #[test]
+    fn parse_exactly_minimum_size() {
+        let full = make_qcow2_header();
+        let buf = &full[..105];
+        let hdr = QcowHeader::parse(buf).unwrap();
+        assert_eq!(hdr.version, 3);
+    }
+
+    // ---- Feature flags ----
+
+    #[test]
+    fn parse_feature_flags() {
+        let mut buf = make_qcow2_header();
+        let incompat = INCOMPAT_DIRTY | INCOMPAT_CORRUPT | INCOMPAT_EXTENDED_L2;
+        buf[INCOMPATIBLE_FEATURES_OFFSET..INCOMPATIBLE_FEATURES_OFFSET + 8]
+            .copy_from_slice(&incompat.to_be_bytes());
+        let compat = COMPAT_LAZY_REFCOUNTS;
+        buf[COMPATIBLE_FEATURES_OFFSET..COMPATIBLE_FEATURES_OFFSET + 8]
+            .copy_from_slice(&compat.to_be_bytes());
+
+        let hdr = QcowHeader::parse(&buf).unwrap();
+        assert!(hdr.dirty);
+        assert!(hdr.corrupt);
+        assert!(hdr.extended_l2);
+        assert!(!hdr.has_external_data);
+        assert!(hdr.lazy_refcounts);
+    }
+
+    // ---- qemu_disk_size ----
+
+    #[test]
+    fn qemu_disk_size_normal() {
+        let buf = make_qcow2_header();
+        let hdr = QcowHeader::parse(&buf).unwrap();
+        // l1_table_offset=0x30000, l1_size=256 → end = 0x30000 + 256*8 = 0x30800
+        // rounded up to 512: 0x30800 (already aligned)
+        assert_eq!(hdr.qemu_disk_size(), 0x30800);
+    }
+
+    #[test]
+    fn qemu_disk_size_saturates_on_overflow() {
+        let mut buf = make_qcow2_header();
+        // Set l1_table_offset to near u64::MAX
+        buf[L1_TABLE_OFFSET_OFFSET..L1_TABLE_OFFSET_OFFSET + 8]
+            .copy_from_slice(&(u64::MAX - 100).to_be_bytes());
+        buf[L1_SIZE_OFFSET..L1_SIZE_OFFSET + 4].copy_from_slice(&1000u32.to_be_bytes());
+
+        let hdr = QcowHeader::parse(&buf).unwrap();
+        // Should saturate, not panic
+        let size = hdr.qemu_disk_size();
+        assert!(size <= u64::MAX);
+    }
+
+    // ---- compat helpers ----
+
+    #[test]
+    fn compat_str_and_value() {
+        let buf = make_qcow2_header();
+        let hdr = QcowHeader::parse(&buf).unwrap();
+        assert_eq!(hdr.compat_str(), "1.1");
+        assert_eq!(hdr.compat_value(), 1);
+
+        let mut v2buf = make_qcow2_header();
+        v2buf[VERSION_OFFSET..VERSION_OFFSET + 4].copy_from_slice(&2u32.to_be_bytes());
+        let hdr2 = QcowHeader::parse(&v2buf).unwrap();
+        assert_eq!(hdr2.compat_str(), "0.10");
+        assert_eq!(hdr2.compat_value(), 0);
+    }
+
+    // ---- parse_header_extensions ----
+
+    #[test]
+    fn header_extensions_v2_returns_none() {
+        let mut buf = make_qcow2_header();
+        buf[VERSION_OFFSET..VERSION_OFFSET + 4].copy_from_slice(&2u32.to_be_bytes());
+        let hdr = QcowHeader::parse(&buf).unwrap();
+        assert_eq!(parse_header_extensions(&buf, &hdr), BackingFormat::None);
+    }
+
+    #[test]
+    fn header_extensions_with_backing_format() {
+        let mut buf = make_qcow2_header();
+        let hdr = QcowHeader::parse(&buf).unwrap();
+        // header_length=112, so extensions start at offset 112
+        let ext_off = 112;
+        // Extension type = EXT_BACKING_FORMAT
+        buf[ext_off..ext_off + 4].copy_from_slice(&EXT_BACKING_FORMAT.to_be_bytes());
+        // Extension length = 5 ("qcow2")
+        buf[ext_off + 4..ext_off + 8].copy_from_slice(&5u32.to_be_bytes());
+        // Extension data
+        buf[ext_off + 8..ext_off + 13].copy_from_slice(b"qcow2");
+        // End extension after padding (5 padded to 8)
+        let next = ext_off + 8 + 8;
+        buf[next..next + 4].copy_from_slice(&EXT_END.to_be_bytes());
+
+        assert_eq!(parse_header_extensions(&buf, &hdr), BackingFormat::Qcow2);
+    }
+
+    #[test]
+    fn header_extensions_empty_returns_none() {
+        let mut buf = make_qcow2_header();
+        let hdr = QcowHeader::parse(&buf).unwrap();
+        // Place end-of-extensions immediately
+        let ext_off = 112;
+        buf[ext_off..ext_off + 4].copy_from_slice(&EXT_END.to_be_bytes());
+
+        assert_eq!(parse_header_extensions(&buf, &hdr), BackingFormat::None);
+    }
+}
+
 /// Look up the refcount for a host cluster via two-level table indirection.
 ///
 /// Returns `Some(refcount)` on success, `None` on I/O error or unsupported

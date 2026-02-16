@@ -168,3 +168,144 @@ pub fn parse_hex_value(bytes: &[u8]) -> Option<u32> {
     }
     Some(value)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared::VmdkInfo;
+
+    // ========================================================================
+    // parse_hex_value tests
+    // ========================================================================
+
+    #[test]
+    fn hex_simple_values() {
+        assert_eq!(parse_hex_value(b"0"), Some(0));
+        assert_eq!(parse_hex_value(b"1"), Some(1));
+        assert_eq!(parse_hex_value(b"a"), Some(10));
+        assert_eq!(parse_hex_value(b"ff"), Some(255));
+        assert_eq!(parse_hex_value(b"FF"), Some(255));
+        assert_eq!(parse_hex_value(b"fffffffe"), Some(0xFFFFFFFE));
+    }
+
+    #[test]
+    fn hex_empty_input() {
+        assert_eq!(parse_hex_value(b""), Some(0));
+    }
+
+    #[test]
+    fn hex_invalid_chars() {
+        assert_eq!(parse_hex_value(b"xyz"), None);
+        assert_eq!(parse_hex_value(b"0g"), None);
+    }
+
+    #[test]
+    fn hex_overflow() {
+        // ffffffff is u32::MAX, adding one more digit overflows
+        assert_eq!(parse_hex_value(b"ffffffff"), Some(u32::MAX));
+        assert_eq!(parse_hex_value(b"100000000"), None);
+    }
+
+    #[test]
+    fn hex_stops_at_whitespace_and_null() {
+        assert_eq!(parse_hex_value(b"ff "), Some(255));
+        assert_eq!(parse_hex_value(b"ff\r"), Some(255));
+        assert_eq!(parse_hex_value(b"ff\n"), Some(255));
+        assert_eq!(parse_hex_value(b"ff\0"), Some(255));
+    }
+
+    // ========================================================================
+    // Vmdk4Header::parse tests
+    // ========================================================================
+
+    /// Build a minimal 44-byte VMDK4 header buffer.
+    fn make_vmdk4_header(
+        version: u32,
+        capacity: u64,
+        grain_size: u64,
+        desc_offset: u64,
+        desc_size: u64,
+    ) -> [u8; 44] {
+        let mut buf = [0u8; 44];
+        buf[VERSION_OFFSET..VERSION_OFFSET + 4].copy_from_slice(&version.to_le_bytes());
+        buf[CAPACITY_OFFSET..CAPACITY_OFFSET + 8].copy_from_slice(&capacity.to_le_bytes());
+        buf[GRAIN_SIZE_OFFSET..GRAIN_SIZE_OFFSET + 8].copy_from_slice(&grain_size.to_le_bytes());
+        buf[DESC_OFFSET_OFFSET..DESC_OFFSET_OFFSET + 8].copy_from_slice(&desc_offset.to_le_bytes());
+        buf[DESC_SIZE_OFFSET..DESC_SIZE_OFFSET + 8].copy_from_slice(&desc_size.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn vmdk4_parse_valid() {
+        let buf = make_vmdk4_header(1, 2097152, 128, 1, 20);
+        let hdr = Vmdk4Header::parse(&buf).unwrap();
+        assert_eq!(hdr.version, 1);
+        assert_eq!(hdr.capacity_sectors, 2097152);
+        assert_eq!(hdr.virtual_size, 2097152 * 512);
+        assert_eq!(hdr.grain_size_sectors, 128);
+        assert_eq!(hdr.cluster_size, 128 * 512);
+        assert_eq!(hdr.desc_offset_sectors, 1);
+        assert_eq!(hdr.desc_size_sectors, 20);
+    }
+
+    #[test]
+    fn vmdk4_parse_short_buffer() {
+        assert!(Vmdk4Header::parse(&[0u8; 43]).is_none());
+        assert!(Vmdk4Header::parse(&[]).is_none());
+    }
+
+    #[test]
+    fn vmdk4_parse_capacity_overflow() {
+        // capacity_sectors so large that capacity * 512 overflows u64
+        let buf = make_vmdk4_header(1, u64::MAX, 128, 0, 0);
+        assert!(Vmdk4Header::parse(&buf).is_none());
+    }
+
+    #[test]
+    fn vmdk4_parse_grain_size_overflow() {
+        // grain_size_sectors so large that grain_size * 512 overflows u32
+        let huge_grain = (u32::MAX as u64) + 1; // won't fit in u32 after *512
+        let buf = make_vmdk4_header(1, 2048, huge_grain, 0, 0);
+        assert!(Vmdk4Header::parse(&buf).is_none());
+    }
+
+    // ========================================================================
+    // parse_descriptor tests
+    // ========================================================================
+
+    #[test]
+    fn descriptor_parses_cid_and_parent_cid() {
+        let desc = b"CID=fffffffe\nparentCID=12345678\n";
+        let mut info = VmdkInfo::new();
+        parse_descriptor(desc, desc.len(), &mut info);
+        assert_eq!(info.cid, 0xFFFFFFFE);
+        assert_eq!(info.parent_cid, 0x12345678);
+    }
+
+    #[test]
+    fn descriptor_parses_create_type() {
+        let desc = b"createType=\"monolithicSparse\"\n";
+        let mut info = VmdkInfo::new();
+        parse_descriptor(desc, desc.len(), &mut info);
+        assert_eq!(info.create_type_str(), "monolithicSparse");
+    }
+
+    #[test]
+    fn descriptor_handles_null_terminated_buffer() {
+        let mut buf = [0u8; 64];
+        let text = b"CID=abcd\n";
+        buf[..text.len()].copy_from_slice(text);
+        let mut info = VmdkInfo::new();
+        parse_descriptor(&buf, buf.len(), &mut info);
+        assert_eq!(info.cid, 0xABCD);
+    }
+
+    #[test]
+    fn descriptor_ignores_unknown_lines() {
+        let desc = b"version=1\nCID=1\nsomething=else\n";
+        let mut info = VmdkInfo::new();
+        parse_descriptor(desc, desc.len(), &mut info);
+        assert_eq!(info.cid, 1);
+        assert_eq!(info.parent_cid, 0xFFFFFFFF); // default unchanged
+    }
+}
