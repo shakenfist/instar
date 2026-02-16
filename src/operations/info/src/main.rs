@@ -130,11 +130,10 @@ pub unsafe extern "C" fn _start() -> u64 {
     let bytes_read = input_sector_size as u64;
 
     // Initialize result structure
-    // Note: actual_size is left as 0 for non-QCOW2 formats. The VMM uses
-    // max(real_file_size, actual_size) for "file length", so 0 means the
-    // VMM will use the real file size from the filesystem. Only QCOW2 sets
-    // actual_size to the computed header-based size (qemu_disk_size).
+    // Default actual_size to device_capacity so all formats report a sensible
+    // file size. QCOW2 overrides this with qemu_disk_size() from the header.
     let mut result = InfoResult::new();
+    result.actual_size = device_capacity;
 
     // Detect format based on magic numbers (first sector)
     // Pass extra_detail flag to control detection of formats like LUKS that qemu-img
