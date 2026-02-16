@@ -30,65 +30,8 @@ const VHD_MAX_CHS_CYLS: u16 = 65535;
 const VHD_MAX_CHS_HEADS: u8 = 16;
 const VHD_MAX_CHS_SECS: u8 = 255;
 
-// QCOW2 header offsets (big-endian)
-const QCOW2_VERSION_OFFSET: usize = 4;
-const QCOW2_BACKING_FILE_OFFSET_OFFSET: usize = 8;
-const QCOW2_BACKING_FILE_SIZE_OFFSET: usize = 16;
-const QCOW2_CLUSTER_BITS_OFFSET: usize = 20;
-const QCOW2_SIZE_OFFSET: usize = 24;
-const QCOW2_CRYPT_METHOD_OFFSET: usize = 32;
-const QCOW2_INCOMPATIBLE_FEATURES_OFFSET: usize = 72; // v3 only
-
-// Additional QCOW2 header offsets for format-specific info
-const QCOW2_L1_SIZE_OFFSET: usize = 36; // Number of L1 table entries
-const QCOW2_L1_TABLE_OFFSET_OFFSET: usize = 40; // L1 table file offset
-const QCOW2_COMPATIBLE_FEATURES_OFFSET: usize = 80; // v3 only
-const QCOW2_REFCOUNT_ORDER_OFFSET: usize = 96; // refcount_bits = 1 << refcount_order
-const QCOW2_COMPRESSION_TYPE_OFFSET: usize = 104; // v3 only (0=zlib, 1=zstd)
-
-// QCOW2 incompatible feature bits
-const QCOW2_INCOMPAT_DIRTY: u64 = 1 << 0;
-const QCOW2_INCOMPAT_CORRUPT: u64 = 1 << 1;
-const QCOW2_INCOMPAT_EXTERNAL_DATA: u64 = 1 << 2;
-const QCOW2_INCOMPAT_COMPRESSION: u64 = 1 << 3;
-const QCOW2_INCOMPAT_EXTENDED_L2: u64 = 1 << 4;
-
-// QCOW2 compatible feature bits
-const QCOW2_COMPAT_LAZY_REFCOUNTS: u64 = 1 << 0;
-
 // Maximum backing file path length (QCOW2 spec allows up to 1023 bytes)
 const MAX_BACKING_FILE_LEN: usize = 1024;
-
-// MBR (Master Boot Record) partition table detection
-// MBR signature is 0x55AA at offset 510-511 (big-endian, bytes are 0x55, 0xAA)
-const MBR_SIGNATURE_OFFSET: usize = 510;
-const MBR_SIGNATURE: u16 = 0xAA55; // Little-endian: bytes 0x55, 0xAA
-
-// MBR partition table entry offsets (4 entries at 0x1BE, 0x1CE, 0x1DE, 0x1EE)
-const MBR_PARTITION_TABLE_OFFSET: usize = 0x1BE;
-const MBR_PARTITION_ENTRY_SIZE: usize = 16;
-
-// Valid MBR boot indicator values (first byte of partition entry)
-const MBR_BOOT_INACTIVE: u8 = 0x00;
-const MBR_BOOT_ACTIVE: u8 = 0x80;
-
-// GPT (GUID Partition Table) detection
-// GPT protective MBR has partition type 0xEE
-const GPT_PROTECTIVE_MBR_TYPE: u8 = 0xEE;
-// GPT header signature "EFI PART" at LBA 1 (sector 1)
-const GPT_SIGNATURE: u64 = 0x5452415020494645; // "EFI PART" in little-endian
-
-// QCOW2 header extension constants
-const QCOW2_HEADER_EXTENSION_OFFSET: usize = 104; // First extension after fixed header (v3)
-const QCOW2_EXT_BACKING_FORMAT: u32 = 0xE2792ACA; // Backing file format extension type
-const QCOW2_EXT_END: u32 = 0x00000000; // End of extensions marker
-
-// VMDK4 header offsets (little-endian)
-const VMDK4_VERSION_OFFSET: usize = 4;
-const VMDK4_CAPACITY_OFFSET: usize = 12;
-const VMDK4_GRAIN_SIZE_OFFSET: usize = 20;
-const VMDK4_DESC_OFFSET_OFFSET: usize = 28; // Descriptor offset in sectors
-const VMDK4_DESC_SIZE_OFFSET: usize = 36; // Descriptor size in sectors
 
 // VHDX format constants (all offsets and values are little-endian)
 // VHDX region table is at fixed offset 192KB (0x30000)
@@ -170,8 +113,8 @@ pub unsafe extern "C" fn _start() -> u64 {
     let input_capacity = (call_table.get_input_capacity)(0);
     let input_sector_size = (call_table.get_input_sector_size)(0);
 
-    // Calculate actual file size
-    let actual_size = input_capacity * input_sector_size as u64;
+    // Calculate device capacity (may be padded to sector boundary)
+    let device_capacity = input_capacity * input_sector_size as u64;
 
     (call_table.verbose_print)(b"info: reading header\n\0".as_ptr());
 
@@ -187,8 +130,14 @@ pub unsafe extern "C" fn _start() -> u64 {
     let bytes_read = input_sector_size as u64;
 
     // Initialize result structure
+    // Note: actual_size is left as 0 for non-QCOW2 formats. The VMM uses
+    // max(real_file_size, actual_size) for "file length", so 0 means the
+    // VMM will use the real file size from the filesystem. Only QCOW2 sets
+    // actual_size to the computed header-based size (qemu_disk_size).
+    // Setting actual_size to device_capacity here would be WRONG because
+    // device_capacity may be padded to a sector boundary, producing
+    // incorrect "file length" values for non-QCOW2 formats.
     let mut result = InfoResult::new();
-    result.actual_size = actual_size;
 
     // Detect format based on magic numbers (first sector)
     // Pass extra_detail flag to control detection of formats like LUKS that qemu-img
@@ -248,18 +197,18 @@ pub unsafe extern "C" fn _start() -> u64 {
     if format == ImageFormat::Raw {
         if !unsafe_quirks {
             // Check for valid partition table
-            let partition_type = detect_partition_table(&buffer);
+            let partition_type = raw::detect_partition_table(&buffer);
 
             match partition_type {
-                PartitionTableType::Mbr => {
+                raw::PartitionTableType::Mbr => {
                     (call_table.verbose_print)(b"info: found MBR partition table\n\0".as_ptr());
                     result.flags |= InfoResult::FLAG_HAS_MBR;
                 }
-                PartitionTableType::Gpt => {
+                raw::PartitionTableType::Gpt => {
                     (call_table.verbose_print)(b"info: found GPT partition table\n\0".as_ptr());
                     result.flags |= InfoResult::FLAG_HAS_GPT;
                 }
-                PartitionTableType::None => {
+                raw::PartitionTableType::None => {
                     // No valid partition table found - reject as unknown format
                     // This is the secure default: only accept files that are
                     // recognizably disk images
@@ -273,15 +222,15 @@ pub unsafe extern "C" fn _start() -> u64 {
             // Unsafe quirks mode: accept any file as RAW (qemu-img compatible
             // but insecure). Still detect partition table for informational
             // purposes.
-            let partition_type = detect_partition_table(&buffer);
+            let partition_type = raw::detect_partition_table(&buffer);
             match partition_type {
-                PartitionTableType::Mbr => {
+                raw::PartitionTableType::Mbr => {
                     result.flags |= InfoResult::FLAG_HAS_MBR;
                 }
-                PartitionTableType::Gpt => {
+                raw::PartitionTableType::Gpt => {
                     result.flags |= InfoResult::FLAG_HAS_GPT;
                 }
-                PartitionTableType::None => {
+                raw::PartitionTableType::None => {
                     // Accept anyway in unsafe mode
                     (call_table.verbose_print)(
                         b"info: no partition table (unsafe quirks)\n\0".as_ptr(),
@@ -314,6 +263,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                     call_table,
                     &mut backing_file_buf,
                     input_sector_size,
+                    input_capacity,
                 );
             }
 
@@ -398,7 +348,7 @@ pub unsafe extern "C" fn _start() -> u64 {
         }
         ImageFormat::Vhdx => {
             if detailed {
-                parse_vhdx_metadata(&mut result, actual_size, call_table);
+                parse_vhdx_metadata(&mut result, device_capacity, call_table);
             }
 
             (call_table.send_info_result)(
@@ -447,7 +397,7 @@ pub unsafe extern "C" fn _start() -> u64 {
         _ => {
             // For raw and unknown formats, virtual size = actual size
             if detailed {
-                result.virtual_size = actual_size;
+                result.virtual_size = device_capacity;
             }
 
             (call_table.send_info_result)(
@@ -489,93 +439,7 @@ fn format_to_str(format: ImageFormat) -> *const u8 {
 
 // Note: detect_format_from_header, detect_vhd_footer, detect_iso_at_offset are
 // now in shared::format_detection
-
-/// Partition table type for RAW image validation
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PartitionTableType {
-    /// No valid partition table found
-    None,
-    /// MBR (Master Boot Record) partition table
-    Mbr,
-    /// GPT (GUID Partition Table)
-    Gpt,
-}
-
-/// Detect partition table type from the first sector (MBR/GPT detection)
-///
-/// This is used for RAW format validation. Files without a recognized format
-/// header must have a valid partition table to be accepted as RAW disk images
-/// in secure mode (without --unsafe-quirks).
-///
-/// Detection logic:
-/// 1. Check for MBR signature (0x55AA at offset 510)
-/// 2. Check for GPT protective MBR (partition type 0xEE)
-/// 3. Validate MBR boot indicators (must be 0x00 or 0x80)
-fn detect_partition_table(buffer: &[u8]) -> PartitionTableType {
-    // Need at least 512 bytes for MBR detection
-    if buffer.len() < 512 {
-        return PartitionTableType::None;
-    }
-
-    // Check MBR signature at offset 510-511
-    let signature = u16::from_le_bytes([
-        buffer[MBR_SIGNATURE_OFFSET],
-        buffer[MBR_SIGNATURE_OFFSET + 1],
-    ]);
-
-    if signature != MBR_SIGNATURE {
-        return PartitionTableType::None;
-    }
-
-    // Valid MBR signature found. Now check partition entries.
-    // MBR has 4 partition entries starting at offset 0x1BE (446)
-    let mut valid_mbr = false;
-    let mut has_gpt_protective = false;
-
-    for i in 0..4 {
-        let entry_offset = MBR_PARTITION_TABLE_OFFSET + (i * MBR_PARTITION_ENTRY_SIZE);
-
-        // Boot indicator (first byte of partition entry)
-        let boot_indicator = buffer[entry_offset];
-
-        // Partition type (5th byte of partition entry)
-        let partition_type = buffer[entry_offset + 4];
-
-        // Skip empty partitions (type 0x00)
-        if partition_type == 0x00 {
-            continue;
-        }
-
-        // Check for GPT protective MBR
-        if partition_type == GPT_PROTECTIVE_MBR_TYPE {
-            has_gpt_protective = true;
-        }
-
-        // Boot indicator must be 0x00 (inactive) or 0x80 (active)
-        if boot_indicator != MBR_BOOT_INACTIVE && boot_indicator != MBR_BOOT_ACTIVE {
-            // Invalid boot indicator - this isn't a valid MBR
-            return PartitionTableType::None;
-        }
-
-        // Found at least one valid partition entry
-        valid_mbr = true;
-    }
-
-    // If we found GPT protective MBR, report as GPT
-    // (full GPT header validation would require reading sector 1)
-    if has_gpt_protective {
-        return PartitionTableType::Gpt;
-    }
-
-    // If we found valid MBR entries, report as MBR
-    if valid_mbr {
-        return PartitionTableType::Mbr;
-    }
-
-    // Valid MBR signature but no partition entries - could be a boot sector
-    // or a filesystem without partitioning. Accept it as valid.
-    PartitionTableType::Mbr
-}
+// Note: detect_partition_table is in the raw crate
 
 /// Parse VHD footer and populate result
 ///
@@ -647,7 +511,11 @@ fn parse_vhd_footer(buffer: &[u8], result: &mut InfoResult) {
 /// - Region Table at 0x30000 (192KB) - contains region entries with GUIDs and offsets
 /// - Metadata Region (offset from region table) - contains metadata table and items
 /// - Metadata items include File Parameters (block size) and Virtual Disk Size
-unsafe fn parse_vhdx_metadata(result: &mut InfoResult, actual_size: u64, call_table: &CallTable) {
+unsafe fn parse_vhdx_metadata(
+    result: &mut InfoResult,
+    device_capacity: u64,
+    call_table: &CallTable,
+) {
     let input_sector_size = (call_table.get_input_sector_size)(0);
     let mut buffer = [0u8; MAX_SECTOR_SIZE];
 
@@ -663,7 +531,7 @@ unsafe fn parse_vhdx_metadata(result: &mut InfoResult, actual_size: u64, call_ta
         input_sector_size,
     ) {
         // Failed to read region table, fall back to actual size
-        result.virtual_size = actual_size;
+        result.virtual_size = device_capacity;
         return;
     }
 
@@ -676,7 +544,7 @@ unsafe fn parse_vhdx_metadata(result: &mut InfoResult, actual_size: u64, call_ta
     ]);
     if region_sig != VHDX_REGION_TABLE_SIG {
         (call_table.debug_print)(b"info: VHDX bad region sig\n\0".as_ptr());
-        result.virtual_size = actual_size;
+        result.virtual_size = device_capacity;
         return;
     }
 
@@ -724,7 +592,7 @@ unsafe fn parse_vhdx_metadata(result: &mut InfoResult, actual_size: u64, call_ta
 
     if metadata_region_offset == 0 {
         (call_table.debug_print)(b"info: VHDX no metadata region\n\0".as_ptr());
-        result.virtual_size = actual_size;
+        result.virtual_size = device_capacity;
         return;
     }
 
@@ -739,7 +607,7 @@ unsafe fn parse_vhdx_metadata(result: &mut InfoResult, actual_size: u64, call_ta
         buffer.as_mut_ptr(),
         input_sector_size,
     ) {
-        result.virtual_size = actual_size;
+        result.virtual_size = device_capacity;
         return;
     }
 
@@ -756,7 +624,7 @@ unsafe fn parse_vhdx_metadata(result: &mut InfoResult, actual_size: u64, call_ta
     ]);
     if metadata_sig != VHDX_METADATA_TABLE_SIG {
         (call_table.debug_print)(b"info: VHDX bad metadata sig\n\0".as_ptr());
-        result.virtual_size = actual_size;
+        result.virtual_size = device_capacity;
         return;
     }
 
@@ -773,7 +641,7 @@ unsafe fn parse_vhdx_metadata(result: &mut InfoResult, actual_size: u64, call_ta
         buffer.as_mut_ptr(),
         input_sector_size,
     ) {
-        result.virtual_size = actual_size;
+        result.virtual_size = device_capacity;
         return;
     }
 
@@ -804,7 +672,8 @@ unsafe fn parse_vhdx_metadata(result: &mut InfoResult, actual_size: u64, call_ta
 
 /// Parse QCOW2 header and populate result and format-specific info
 ///
-/// Also reads the backing file path if present.
+/// Uses `qcow2::QcowHeader::parse()` for field extraction and
+/// `qcow2::read_backing_file()` for backing file path reading.
 unsafe fn parse_qcow2_header(
     buffer: &[u8],
     result: &mut InfoResult,
@@ -812,410 +681,95 @@ unsafe fn parse_qcow2_header(
     call_table: &CallTable,
     backing_file_buf: &mut [u8; MAX_BACKING_FILE_LEN + 1],
     input_sector_size: usize,
+    input_capacity: u64,
 ) {
-    // Version (big-endian u32 at offset 4)
-    let version = u32::from_be_bytes([
-        buffer[QCOW2_VERSION_OFFSET],
-        buffer[QCOW2_VERSION_OFFSET + 1],
-        buffer[QCOW2_VERSION_OFFSET + 2],
-        buffer[QCOW2_VERSION_OFFSET + 3],
-    ]);
-    result.version = version;
+    let hdr = match qcow2::QcowHeader::parse(buffer) {
+        Some(h) => h,
+        None => return,
+    };
 
-    // Set compat based on version: v2 = 0.10, v3 = 1.1
-    qcow2_info.compat = if version >= 3 { 1 } else { 0 };
+    result.version = hdr.version;
+    qcow2_info.compat = hdr.compat_value();
+    result.cluster_size = hdr.cluster_size as u32;
+    result.actual_size = hdr.qemu_disk_size();
+    result.virtual_size = hdr.virtual_size;
+    qcow2_info.refcount_bits = hdr.refcount_bits;
+    qcow2_info.compression_type = hdr.compression_type;
 
-    // Cluster bits (big-endian u32 at offset 20)
-    let cluster_bits = u32::from_be_bytes([
-        buffer[QCOW2_CLUSTER_BITS_OFFSET],
-        buffer[QCOW2_CLUSTER_BITS_OFFSET + 1],
-        buffer[QCOW2_CLUSTER_BITS_OFFSET + 2],
-        buffer[QCOW2_CLUSTER_BITS_OFFSET + 3],
-    ]);
-    result.cluster_size = 1u32 << cluster_bits;
-
-    // L1 table info for qemu-style disk size calculation
-    // qemu-img calculates disk size as: ceil((l1_offset + l1_size * 8) / 512) * 512
-    let l1_size = u32::from_be_bytes([
-        buffer[QCOW2_L1_SIZE_OFFSET],
-        buffer[QCOW2_L1_SIZE_OFFSET + 1],
-        buffer[QCOW2_L1_SIZE_OFFSET + 2],
-        buffer[QCOW2_L1_SIZE_OFFSET + 3],
-    ]);
-    let l1_table_offset = u64::from_be_bytes([
-        buffer[QCOW2_L1_TABLE_OFFSET_OFFSET],
-        buffer[QCOW2_L1_TABLE_OFFSET_OFFSET + 1],
-        buffer[QCOW2_L1_TABLE_OFFSET_OFFSET + 2],
-        buffer[QCOW2_L1_TABLE_OFFSET_OFFSET + 3],
-        buffer[QCOW2_L1_TABLE_OFFSET_OFFSET + 4],
-        buffer[QCOW2_L1_TABLE_OFFSET_OFFSET + 5],
-        buffer[QCOW2_L1_TABLE_OFFSET_OFFSET + 6],
-        buffer[QCOW2_L1_TABLE_OFFSET_OFFSET + 7],
-    ]);
-
-    // Calculate qemu-style disk size: highest offset rounded up to 512-byte sector
-    let l1_table_end = l1_table_offset + (l1_size as u64) * 8;
-    let qemu_disk_size = ((l1_table_end + 511) / 512) * 512;
-    result.actual_size = qemu_disk_size;
-
-    // Virtual size (big-endian u64 at offset 24)
-    result.virtual_size = u64::from_be_bytes([
-        buffer[QCOW2_SIZE_OFFSET],
-        buffer[QCOW2_SIZE_OFFSET + 1],
-        buffer[QCOW2_SIZE_OFFSET + 2],
-        buffer[QCOW2_SIZE_OFFSET + 3],
-        buffer[QCOW2_SIZE_OFFSET + 4],
-        buffer[QCOW2_SIZE_OFFSET + 5],
-        buffer[QCOW2_SIZE_OFFSET + 6],
-        buffer[QCOW2_SIZE_OFFSET + 7],
-    ]);
-
-    // Encryption method (big-endian u32 at offset 32)
-    let crypt_method = u32::from_be_bytes([
-        buffer[QCOW2_CRYPT_METHOD_OFFSET],
-        buffer[QCOW2_CRYPT_METHOD_OFFSET + 1],
-        buffer[QCOW2_CRYPT_METHOD_OFFSET + 2],
-        buffer[QCOW2_CRYPT_METHOD_OFFSET + 3],
-    ]);
-    if crypt_method != 0 {
+    if hdr.crypt_method != 0 {
         result.flags |= InfoResult::FLAG_ENCRYPTED;
     }
 
-    // Backing file offset and size
-    let backing_offset = u64::from_be_bytes([
-        buffer[QCOW2_BACKING_FILE_OFFSET_OFFSET],
-        buffer[QCOW2_BACKING_FILE_OFFSET_OFFSET + 1],
-        buffer[QCOW2_BACKING_FILE_OFFSET_OFFSET + 2],
-        buffer[QCOW2_BACKING_FILE_OFFSET_OFFSET + 3],
-        buffer[QCOW2_BACKING_FILE_OFFSET_OFFSET + 4],
-        buffer[QCOW2_BACKING_FILE_OFFSET_OFFSET + 5],
-        buffer[QCOW2_BACKING_FILE_OFFSET_OFFSET + 6],
-        buffer[QCOW2_BACKING_FILE_OFFSET_OFFSET + 7],
-    ]);
-    let backing_size = u32::from_be_bytes([
-        buffer[QCOW2_BACKING_FILE_SIZE_OFFSET],
-        buffer[QCOW2_BACKING_FILE_SIZE_OFFSET + 1],
-        buffer[QCOW2_BACKING_FILE_SIZE_OFFSET + 2],
-        buffer[QCOW2_BACKING_FILE_SIZE_OFFSET + 3],
-    ]);
-
-    if backing_offset != 0 && backing_size > 0 {
+    // Read backing file path using shared crate
+    if hdr.backing_file_offset != 0 && hdr.backing_file_size > 0 {
         result.flags |= InfoResult::FLAG_HAS_BACKING_FILE;
         (call_table.verbose_print)(b"info: has backing file\n\0".as_ptr());
-
-        // Read the backing file name from the image
-        // Limit to our buffer size (protocol supports 1024 chars)
-        let read_size = core::cmp::min(backing_size as usize, MAX_BACKING_FILE_LEN);
-
-        // Calculate which sector contains the backing file offset
-        let backing_sector = backing_offset / input_sector_size as u64;
-        let offset_in_sector = (backing_offset % input_sector_size as u64) as usize;
-
-        // Use a temporary buffer for the sector
-        let mut sector_buf = [0u8; MAX_SECTOR_SIZE];
-
-        if (call_table.read_input_sector)(
+        qcow2::read_backing_file(
+            call_table,
             0,
-            backing_sector,
-            sector_buf.as_mut_ptr(),
+            &hdr,
+            backing_file_buf,
             input_sector_size,
-        ) {
-            // Calculate how many bytes we can read from this sector
-            let bytes_in_first_sector =
-                core::cmp::min(read_size, input_sector_size - offset_in_sector);
-
-            // Copy the backing file name to our buffer
-            for i in 0..bytes_in_first_sector {
-                backing_file_buf[i] = sector_buf[offset_in_sector + i];
-            }
-
-            // If the backing file spans sectors, read the next sector(s)
-            let mut bytes_read = bytes_in_first_sector;
-            let mut current_sector = backing_sector + 1;
-
-            while bytes_read < read_size {
-                if !(call_table.read_input_sector)(
-                    0,
-                    current_sector,
-                    sector_buf.as_mut_ptr(),
-                    input_sector_size,
-                ) {
-                    break;
-                }
-
-                let bytes_to_copy = core::cmp::min(read_size - bytes_read, input_sector_size);
-
-                for i in 0..bytes_to_copy {
-                    backing_file_buf[bytes_read + i] = sector_buf[i];
-                }
-
-                bytes_read += bytes_to_copy;
-                current_sector += 1;
-            }
-
-            // Ensure null termination
-            backing_file_buf[bytes_read] = 0;
-        }
-    }
-
-    // Default compression type (zlib)
-    qcow2_info.compression_type = 0;
-
-    // For v2, refcount_bits is always 16 (refcount_order = 4)
-    // For v3+, read refcount_order from offset 96
-    if version >= 3 {
-        // Refcount order (big-endian u32 at offset 96) - refcount_bits = 1 << refcount_order
-        let refcount_order = u32::from_be_bytes([
-            buffer[QCOW2_REFCOUNT_ORDER_OFFSET],
-            buffer[QCOW2_REFCOUNT_ORDER_OFFSET + 1],
-            buffer[QCOW2_REFCOUNT_ORDER_OFFSET + 2],
-            buffer[QCOW2_REFCOUNT_ORDER_OFFSET + 3],
-        ]);
-        qcow2_info.refcount_bits = 1u32 << refcount_order;
-    } else {
-        qcow2_info.refcount_bits = 16;
+            input_capacity,
+        );
     }
 
     // Version 3 specific features
-    if version >= 3 {
-        // Incompatible features (big-endian u64 at offset 72)
-        let incompat = u64::from_be_bytes([
-            buffer[QCOW2_INCOMPATIBLE_FEATURES_OFFSET],
-            buffer[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 1],
-            buffer[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 2],
-            buffer[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 3],
-            buffer[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 4],
-            buffer[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 5],
-            buffer[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 6],
-            buffer[QCOW2_INCOMPATIBLE_FEATURES_OFFSET + 7],
-        ]);
-
-        if (incompat & QCOW2_INCOMPAT_DIRTY) != 0 {
+    if hdr.version >= 3 {
+        if hdr.dirty {
             result.flags |= InfoResult::FLAG_DIRTY;
             qcow2_info.dirty = true;
         }
-        if (incompat & QCOW2_INCOMPAT_CORRUPT) != 0 {
+        if hdr.corrupt {
             result.flags |= InfoResult::FLAG_CORRUPT;
             qcow2_info.corrupt = true;
         }
-        if (incompat & QCOW2_INCOMPAT_EXTERNAL_DATA) != 0 {
+        if hdr.has_external_data {
             result.flags |= InfoResult::FLAG_HAS_EXTERNAL_DATA;
             (call_table.verbose_print)(b"info: has external data\n\0".as_ptr());
         }
-        if (incompat & QCOW2_INCOMPAT_COMPRESSION) != 0 {
+        if (hdr.incompatible_features & qcow2::INCOMPAT_COMPRESSION) != 0 {
             result.flags |= InfoResult::FLAG_COMPRESSED;
         }
-        if (incompat & QCOW2_INCOMPAT_EXTENDED_L2) != 0 {
+        if hdr.extended_l2 {
             qcow2_info.extended_l2 = true;
         }
-
-        // Compatible features (big-endian u64 at offset 80)
-        let compat = u64::from_be_bytes([
-            buffer[QCOW2_COMPATIBLE_FEATURES_OFFSET],
-            buffer[QCOW2_COMPATIBLE_FEATURES_OFFSET + 1],
-            buffer[QCOW2_COMPATIBLE_FEATURES_OFFSET + 2],
-            buffer[QCOW2_COMPATIBLE_FEATURES_OFFSET + 3],
-            buffer[QCOW2_COMPATIBLE_FEATURES_OFFSET + 4],
-            buffer[QCOW2_COMPATIBLE_FEATURES_OFFSET + 5],
-            buffer[QCOW2_COMPATIBLE_FEATURES_OFFSET + 6],
-            buffer[QCOW2_COMPATIBLE_FEATURES_OFFSET + 7],
-        ]);
-
-        if (compat & QCOW2_COMPAT_LAZY_REFCOUNTS) != 0 {
+        if hdr.lazy_refcounts {
             qcow2_info.lazy_refcounts = true;
         }
 
-        // Compression type (u8 at offset 104) - 0=zlib, 1=zstd
-        qcow2_info.compression_type = buffer[QCOW2_COMPRESSION_TYPE_OFFSET];
-
-        // Parse header extensions (v3+)
-        // Header length is at offset 100 (big-endian u32)
-        let header_length =
-            u32::from_be_bytes([buffer[100], buffer[101], buffer[102], buffer[103]]) as usize;
-
-        // Extensions start at header_length offset
-        // Each extension: type (4 bytes BE), length (4 bytes BE), data (length bytes, padded to 8)
-        let mut ext_offset = header_length;
-        while ext_offset + 8 <= buffer.len() {
-            let ext_type = u32::from_be_bytes([
-                buffer[ext_offset],
-                buffer[ext_offset + 1],
-                buffer[ext_offset + 2],
-                buffer[ext_offset + 3],
-            ]);
-            let ext_len = u32::from_be_bytes([
-                buffer[ext_offset + 4],
-                buffer[ext_offset + 5],
-                buffer[ext_offset + 6],
-                buffer[ext_offset + 7],
-            ]) as usize;
-
-            // End of extensions
-            if ext_type == QCOW2_EXT_END {
-                break;
-            }
-
-            // Check if we have enough data for this extension
-            if ext_offset + 8 + ext_len > buffer.len() {
-                break;
-            }
-
-            // Handle backing format extension
-            if ext_type == QCOW2_EXT_BACKING_FORMAT && ext_len > 0 {
-                let format_bytes = &buffer[ext_offset + 8..ext_offset + 8 + ext_len];
-                qcow2_info.backing_format = shared::BackingFormat::from_bytes(format_bytes);
-                (call_table.verbose_print)(b"info: found backing format ext\n\0".as_ptr());
-            }
-
-            // Move to next extension (data is padded to 8-byte boundary)
-            let padded_len = (ext_len + 7) & !7;
-            ext_offset += 8 + padded_len;
+        // Parse header extensions for backing format
+        let backing_format = qcow2::parse_header_extensions(buffer, &hdr);
+        if backing_format != shared::BackingFormat::None {
+            qcow2_info.backing_format = backing_format;
+            (call_table.verbose_print)(b"info: found backing format ext\n\0".as_ptr());
         }
     }
 }
 
-/// Parse VMDK4 header and populate result and VMDK-specific info
+/// Parse VMDK4 header and populate result and VMDK-specific info.
+///
+/// Uses `vmdk::Vmdk4Header::parse()` for binary header extraction and
+/// `vmdk::read_and_parse_descriptor()` for descriptor I/O + parsing.
 unsafe fn parse_vmdk4_header(
     buffer: &[u8],
     result: &mut InfoResult,
     vmdk_info: &mut VmdkInfo,
     call_table: &CallTable,
 ) {
-    // Version (little-endian u32 at offset 4)
-    let version = u32::from_le_bytes([
-        buffer[VMDK4_VERSION_OFFSET],
-        buffer[VMDK4_VERSION_OFFSET + 1],
-        buffer[VMDK4_VERSION_OFFSET + 2],
-        buffer[VMDK4_VERSION_OFFSET + 3],
-    ]);
-    result.version = version;
+    let hdr = match vmdk::Vmdk4Header::parse(buffer) {
+        Some(h) => h,
+        None => return,
+    };
 
-    // Capacity in sectors (little-endian u64 at offset 12)
-    let capacity_sectors = u64::from_le_bytes([
-        buffer[VMDK4_CAPACITY_OFFSET],
-        buffer[VMDK4_CAPACITY_OFFSET + 1],
-        buffer[VMDK4_CAPACITY_OFFSET + 2],
-        buffer[VMDK4_CAPACITY_OFFSET + 3],
-        buffer[VMDK4_CAPACITY_OFFSET + 4],
-        buffer[VMDK4_CAPACITY_OFFSET + 5],
-        buffer[VMDK4_CAPACITY_OFFSET + 6],
-        buffer[VMDK4_CAPACITY_OFFSET + 7],
-    ]);
-    // VMDK uses 512-byte sectors for capacity
-    result.virtual_size = capacity_sectors * 512;
-
-    // Grain size in sectors (little-endian u64 at offset 20)
-    let grain_size = u64::from_le_bytes([
-        buffer[VMDK4_GRAIN_SIZE_OFFSET],
-        buffer[VMDK4_GRAIN_SIZE_OFFSET + 1],
-        buffer[VMDK4_GRAIN_SIZE_OFFSET + 2],
-        buffer[VMDK4_GRAIN_SIZE_OFFSET + 3],
-        buffer[VMDK4_GRAIN_SIZE_OFFSET + 4],
-        buffer[VMDK4_GRAIN_SIZE_OFFSET + 5],
-        buffer[VMDK4_GRAIN_SIZE_OFFSET + 6],
-        buffer[VMDK4_GRAIN_SIZE_OFFSET + 7],
-    ]);
-    // Grain size is similar to cluster size
-    result.cluster_size = (grain_size * 512) as u32;
-
-    // Descriptor offset in sectors (little-endian u64 at offset 28)
-    let desc_offset_sectors = u64::from_le_bytes([
-        buffer[VMDK4_DESC_OFFSET_OFFSET],
-        buffer[VMDK4_DESC_OFFSET_OFFSET + 1],
-        buffer[VMDK4_DESC_OFFSET_OFFSET + 2],
-        buffer[VMDK4_DESC_OFFSET_OFFSET + 3],
-        buffer[VMDK4_DESC_OFFSET_OFFSET + 4],
-        buffer[VMDK4_DESC_OFFSET_OFFSET + 5],
-        buffer[VMDK4_DESC_OFFSET_OFFSET + 6],
-        buffer[VMDK4_DESC_OFFSET_OFFSET + 7],
-    ]);
-
-    // Descriptor size in sectors (little-endian u64 at offset 36)
-    let desc_size_sectors = u64::from_le_bytes([
-        buffer[VMDK4_DESC_SIZE_OFFSET],
-        buffer[VMDK4_DESC_SIZE_OFFSET + 1],
-        buffer[VMDK4_DESC_SIZE_OFFSET + 2],
-        buffer[VMDK4_DESC_SIZE_OFFSET + 3],
-        buffer[VMDK4_DESC_SIZE_OFFSET + 4],
-        buffer[VMDK4_DESC_SIZE_OFFSET + 5],
-        buffer[VMDK4_DESC_SIZE_OFFSET + 6],
-        buffer[VMDK4_DESC_SIZE_OFFSET + 7],
-    ]);
+    result.version = hdr.version;
+    result.virtual_size = hdr.virtual_size;
+    result.cluster_size = hdr.cluster_size;
 
     // Read and parse the descriptor if present
-    if desc_offset_sectors > 0 && desc_size_sectors > 0 {
+    if hdr.desc_offset_sectors > 0 && hdr.desc_size_sectors > 0 {
         (call_table.verbose_print)(b"info: reading VMDK descriptor\n\0".as_ptr());
-
-        // Get input sector size (this is the virtio device's sector size, which may differ
-        // from VMDK's internal 512-byte sectors)
-        let input_sector_size = (call_table.get_input_sector_size)(0);
-
-        // VMDK header stores offsets in 512-byte sectors. Convert to byte offset,
-        // then to the actual device sector number.
-        let desc_byte_offset = desc_offset_sectors * 512;
-        let desc_sector = desc_byte_offset / input_sector_size as u64;
-        let offset_within_sector = (desc_byte_offset % input_sector_size as u64) as usize;
-
-        // Read the sector containing the descriptor
-        let mut desc_buffer = [0u8; MAX_SECTOR_SIZE];
-
-        if (call_table.read_input_sector)(
-            0,
-            desc_sector,
-            desc_buffer.as_mut_ptr(),
-            input_sector_size,
-        ) {
-            // Parse the descriptor text starting at the correct offset within the sector
-            // The descriptor typically starts within the sector at offset_within_sector
-            let desc_data = &desc_buffer[offset_within_sector..input_sector_size];
-            parse_vmdk_descriptor(desc_data, desc_data.len(), vmdk_info);
-        }
-    }
-}
-
-/// Parse VMDK descriptor text to extract CID, parentCID, and createType
-fn parse_vmdk_descriptor(buffer: &[u8], len: usize, vmdk_info: &mut VmdkInfo) {
-    // Find null terminator or end of buffer
-    let end = buffer[..len].iter().position(|&b| b == 0).unwrap_or(len);
-    let text = &buffer[..end];
-
-    // Parse line by line (newline separated)
-    let mut pos = 0;
-    while pos < text.len() {
-        // Find end of line
-        let line_end = text[pos..]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map(|p| pos + p)
-            .unwrap_or(text.len());
-
-        let line = &text[pos..line_end];
-
-        // Parse CID=<hex>
-        if line.starts_with(b"CID=") {
-            if let Some(cid) = parse_hex_value(&line[4..]) {
-                vmdk_info.cid = cid;
-            }
-        }
-        // Parse parentCID=<hex>
-        else if line.starts_with(b"parentCID=") {
-            if let Some(parent_cid) = parse_hex_value(&line[10..]) {
-                vmdk_info.parent_cid = parent_cid;
-            }
-        }
-        // Parse createType="<string>"
-        else if line.starts_with(b"createType=") {
-            // Skip createType=" and find closing quote
-            let value_start = 12; // After 'createType="'
-            if line.len() > value_start && line[11] == b'"' {
-                // Find closing quote
-                if let Some(quote_end) = line[value_start..].iter().position(|&b| b == b'"') {
-                    vmdk_info.set_create_type(&line[value_start..value_start + quote_end]);
-                }
-            }
-        }
-
-        pos = line_end + 1;
+        vmdk::read_and_parse_descriptor(call_table, 0, &hdr, vmdk_info);
     }
 }
 
@@ -1375,22 +929,6 @@ fn parse_luks_header(buffer: &[u8], result: &mut InfoResult) {
 
     // Mark as encrypted
     result.flags |= InfoResult::FLAG_ENCRYPTED;
-}
-
-/// Parse a hex value from ASCII bytes (without 0x prefix)
-fn parse_hex_value(bytes: &[u8]) -> Option<u32> {
-    let mut value: u32 = 0;
-    for &b in bytes {
-        let digit = match b {
-            b'0'..=b'9' => b - b'0',
-            b'a'..=b'f' => b - b'a' + 10,
-            b'A'..=b'F' => b - b'A' + 10,
-            b' ' | b'\r' | b'\n' | 0 => break, // End of value (space terminates)
-            _ => return None,
-        };
-        value = value.checked_mul(16)?.checked_add(digit as u32)?;
-    }
-    Some(value)
 }
 
 /// Get the call table from the fixed address

@@ -302,7 +302,14 @@ jobs:
       - name: Run integration tests
         run: |
           cd ${GITHUB_WORKSPACE}/imago
+          set +e
           make test-container TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
+          test_exit_code=${PIPESTATUS[0]}
+          set -e
+          if [ ${test_exit_code} -ne 0 ]; then
+            echo "Integration tests failed with exit code ${test_exit_code}"
+            exit ${test_exit_code}
+          fi
 
       - name: Test --chain flag (backing chain discovery)
         run: |

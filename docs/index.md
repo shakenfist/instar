@@ -195,3 +195,14 @@ Reusable Rust crates for the `imago` project.
 | Document | Description |
 |----------|-------------|
 | [guest-protocol](crates/guest-protocol.md) | Protocol Buffers messaging for guest-VMM communication |
+
+### Format Parsing Crates (`src/crates/`)
+
+These `no_std` crates provide canonical format parsing implementations
+shared across all guest operations, eliminating code duplication:
+
+| Crate | Description | Used by |
+|-------|-------------|---------|
+| `qcow2` | QCOW2 header parsing, L1/L2 cluster lookup, decompression (feature-gated), refcount reading, backing file extraction | info, check, compare |
+| `raw` | MBR/GPT partition table detection | info |
+| `vmdk` | VMDK4 binary header parsing, descriptor I/O and text parsing | info |
