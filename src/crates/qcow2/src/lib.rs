@@ -193,9 +193,14 @@ impl QcowHeader {
 
     /// Calculate qemu-style actual disk size (highest metadata offset
     /// rounded up to 512-byte sector boundary).
+    ///
+    /// Uses saturating arithmetic because both `l1_table_offset` and
+    /// `l1_size` come from the untrusted on-disk header.
     pub fn qemu_disk_size(&self) -> u64 {
-        let l1_table_end = self.l1_table_offset + (self.l1_size as u64) * 8;
-        ((l1_table_end + 511) / 512) * 512
+        let l1_table_end = self
+            .l1_table_offset
+            .saturating_add((self.l1_size as u64).saturating_mul(8));
+        ((l1_table_end.saturating_add(511)) / 512).saturating_mul(512)
     }
 
     /// Get compat string: "0.10" for v2, "1.1" for v3+.
