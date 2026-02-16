@@ -102,6 +102,11 @@ pub struct QcowHeader {
     pub crypt_method: u32,
     pub refcount_table_offset: u64,
     pub refcount_table_clusters: u32,
+    /// Derived from `refcount_order`: `1 << refcount_order` for valid values
+    /// (0..=6), or 16 as a fallback for invalid values (>6). For v2 headers,
+    /// this is always 16. Note: invalid `refcount_order` values silently fall
+    /// back to 16-bit refcounts. Callers that need to detect invalid
+    /// `refcount_order` should re-check the raw header bytes.
     pub refcount_bits: u32,
     pub incompatible_features: u64,
     pub compatible_features: u64,
