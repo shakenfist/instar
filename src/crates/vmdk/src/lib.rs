@@ -63,12 +63,15 @@ impl Vmdk4Header {
         let desc_offset_sectors = le_u64(header, DESC_OFFSET_OFFSET);
         let desc_size_sectors = le_u64(header, DESC_SIZE_OFFSET);
 
+        let virtual_size = capacity_sectors.checked_mul(512)?;
+        let cluster_size = u32::try_from(grain_size_sectors.checked_mul(512)?).ok()?;
+
         Some(Vmdk4Header {
             version,
             capacity_sectors,
-            virtual_size: capacity_sectors * 512,
+            virtual_size,
             grain_size_sectors,
-            cluster_size: (grain_size_sectors * 512) as u32,
+            cluster_size,
             desc_offset_sectors,
             desc_size_sectors,
         })
@@ -94,7 +97,10 @@ pub unsafe fn read_and_parse_descriptor(
     }
 
     let input_sector_size = (call_table.get_input_sector_size)(device_idx);
-    let desc_byte_offset = header.desc_offset_sectors * 512;
+    let desc_byte_offset = match header.desc_offset_sectors.checked_mul(512) {
+        Some(v) => v,
+        None => return,
+    };
     let desc_sector = desc_byte_offset / input_sector_size as u64;
     let offset_within_sector = (desc_byte_offset % input_sector_size as u64) as usize;
 
