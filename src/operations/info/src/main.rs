@@ -763,8 +763,10 @@ unsafe fn parse_vmdk4_header(
     result.cluster_size = hdr.cluster_size;
 
     // Read and parse the descriptor if present
-    (call_table.verbose_print)(b"info: reading VMDK descriptor\n\0".as_ptr());
-    vmdk::read_and_parse_descriptor(call_table, 0, &hdr, vmdk_info);
+    if hdr.desc_offset_sectors > 0 && hdr.desc_size_sectors > 0 {
+        (call_table.verbose_print)(b"info: reading VMDK descriptor\n\0".as_ptr());
+        vmdk::read_and_parse_descriptor(call_table, 0, &hdr, vmdk_info);
+    }
 }
 
 /// Parse VDI header and populate result and VDI-specific info
