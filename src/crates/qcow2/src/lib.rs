@@ -786,7 +786,10 @@ pub unsafe fn read_compressed_cluster(
     }
 
     // Validate compressed data range against device capacity
-    let data_end = compressed_offset + compressed_size;
+    let data_end = match compressed_offset.checked_add(compressed_size) {
+        Some(v) => v,
+        None => return false,
+    };
     let device_size = input_capacity.saturating_mul(sector_size as u64);
     if data_end > device_size {
         return false;
