@@ -684,6 +684,49 @@ mod vmm_config_support {
         config
     }
 
+    /// Helper to create a VmmConfig with multiple input devices
+    /// (backing chain) plus one output device for convert operations.
+    ///
+    /// Input devices are named "input", "input1", "input2", etc.
+    /// The output device is named "output".
+    ///
+    /// # Arguments
+    ///
+    /// * `sector_size` - Transport sector size for input devices
+    /// * `output_sector_size` - Transport sector size for output device
+    /// * `input_device_count` - Number of input devices (chain length)
+    /// * `progress_percent` - Progress update interval
+    pub fn vmm_config_chain_with_output(
+        sector_size: u32,
+        output_sector_size: u32,
+        input_device_count: usize,
+        progress_percent: u32,
+    ) -> guest_::VmmConfig {
+        let mut config = guest_::VmmConfig::default();
+
+        for i in 0..input_device_count {
+            let mut dev = guest_::DeviceConfig::default();
+            if i == 0 {
+                super::push_str(&mut dev.name, "input");
+            } else {
+                let mut buf = [0u8; 8];
+                let name = format_chain_device_name(&mut buf, i);
+                super::push_str(&mut dev.name, name);
+            }
+            dev.sector_size = sector_size;
+            let _ = config.devices.push(dev);
+        }
+
+        // Add output device
+        let mut output_dev = guest_::DeviceConfig::default();
+        super::push_str(&mut output_dev.name, "output");
+        output_dev.sector_size = output_sector_size;
+        let _ = config.devices.push(output_dev);
+
+        config.progress_percent = progress_percent;
+        config
+    }
+
     /// Format a chain device name like "input1", "input2", etc.
     fn format_chain_device_name(buf: &mut [u8; 8], index: usize) -> &str {
         let prefix = b"input";
@@ -702,5 +745,6 @@ mod vmm_config_support {
 
 #[cfg(feature = "std")]
 pub use vmm_config_support::{
-    encode_vmm_config_framed, vmm_config, vmm_config_chain, vmm_config_input_only,
+    encode_vmm_config_framed, vmm_config, vmm_config_chain, vmm_config_chain_with_output,
+    vmm_config_input_only,
 };

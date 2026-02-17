@@ -15,9 +15,9 @@ adult stage of insect metamorphosis) - reflecting both the image handling
 and transformation aspects of the tool.
 
 The primary goal of `imago` is to be a safe drop in replacement for qemu-img.
-The current focus is on `qemu-img info`, `qemu-img check`, and `qemu-img
-compare` sub-commands, as the most painful parts in terms of observed security
-exploits, but that will expand over time.
+The current focus is on `qemu-img info`, `qemu-img check`, `qemu-img compare`,
+and `qemu-img convert` sub-commands, as the most painful parts in terms of
+observed security exploits, but that will expand over time.
 We therefore have a test suite of images that we run against both tools,
 and any difference in output is considered a bug to be fixed -- if you
 observe such a difference please report it as a GitHub issue at
@@ -203,6 +203,6 @@ shared across all guest operations, eliminating code duplication:
 
 | Crate | Description | Used by |
 |-------|-------------|---------|
-| `qcow2` | QCOW2 header parsing, L1/L2 cluster lookup, decompression (feature-gated), refcount reading, backing file extraction | info, check, compare |
+| `qcow2` | QCOW2 header parsing, L1/L2 cluster lookup, decompression (feature-gated), refcount reading, backing file extraction | info, check, compare, convert |
 | `raw` | MBR/GPT partition table detection | info |
 | `vmdk` | VMDK4 binary header parsing, descriptor I/O and text parsing | info |

@@ -141,7 +141,7 @@ provides a modular architecture with:
 - **crates/qcow2/** - Shared QCOW2 format crate: header parsing, L1/L2
   cluster lookup, compressed cluster decompression (behind `decompress`
   feature flag), refcount table reading, backing file extraction, header
-  extension parsing. Used by info, check, and compare operations.
+  extension parsing. Used by info, check, compare, and convert operations.
 - **crates/raw/** - Shared RAW format crate: MBR/GPT partition table
   detection. Used by info operation.
 - **crates/vmdk/** - Shared VMDK format crate: VMDK4 binary header parsing,
@@ -154,8 +154,10 @@ provides a modular architecture with:
   content comparison between two images, supporting raw-vs-raw, QCOW2-vs-raw,
   and QCOW2-vs-QCOW2 including compressed clusters and backing chain
   flattening)
+- **operations/convert/** - Image conversion operation (QCOW2 to raw with
+  backing chain flattening and compressed cluster decompression)
 - **shared/** - Shared library code between components (call table, configs,
-  format detection, memory layout constants)
+  format detection, memory layout constants, shared utilities)
 
 **Chain validation in check (`--chain`):**
 The check operation supports an optional `--chain` flag that uses the host-side

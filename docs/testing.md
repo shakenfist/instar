@@ -2,10 +2,10 @@
 
 The imago project includes a Python-based integration test suite that verifies
 `imago info` produces output identical to `qemu-img info`, that `imago check`
-correctly detects structural corruption in QCOW2 images, and that
-`imago compare` produces byte-for-byte identical output to `qemu-img compare`.
-Since imago aims to be a drop-in replacement, any difference in output is
-considered a bug.
+correctly detects structural corruption in QCOW2 images, that `imago compare`
+produces byte-for-byte identical output to `qemu-img compare`, and that
+`imago convert` produces output identical to `qemu-img convert`. Since imago
+aims to be a drop-in replacement, any difference in output is considered a bug.
 
 ## Architecture
 
@@ -16,7 +16,7 @@ The test suite uses:
 - **stestr** - Parallel test runner with result storage
 
 Tests compare imago output against either:
-1. Live `qemu-img` output (for safe images - info, compare)
+1. Live `qemu-img` output (for safe images - info, compare, convert)
 2. Stored expected output files (for malicious images)
 
 ## Test Categories
@@ -93,6 +93,39 @@ chains), so no external testdata is needed.
 
 **qemu-img cross-validation**: Every scenario verifies byte-for-byte
 identical stdout and matching exit codes with `qemu-img compare`.
+
+### Convert Tests (`test_convert.py`)
+
+Tests for the `imago convert` operation (QCOW2 to raw), cross-validated
+against `qemu-img convert`:
+
+**Basic conversion (`TestConvertBasicQcow2ToRaw`):**
+- Empty QCOW2 image to raw
+- QCOW2 with written data to raw
+- Output size matches virtual size
+- All cross-validated against `qemu-img convert`
+
+**Compressed QCOW2 (`TestConvertCompressed`):**
+- Compressed QCOW2 to raw (zlib decompression)
+- Compared against original raw source
+
+**Backing chains (`TestConvertBackingChain`):**
+- QCOW2 overlay with raw backing flattened to raw
+- Deep chain (3-level: top -> mid -> base) flattened to raw
+- Cross-validated against `qemu-img convert`
+
+**Raw passthrough (`TestConvertRawToRaw`):**
+- Raw to raw identity conversion
+
+**Error handling (`TestConvertErrors`):**
+- Unsupported output format rejected
+- Nonexistent input file rejected
+
+**Manifest images (`TestConvertManifestImages`):**
+- Converts real-world QCOW2 images from the test manifest
+- Cross-validates against `qemu-img convert` output
+- Skips images with cluster_size > 64KB (unsupported)
+- Skips images whose virtual_size exceeds available temp space
 
 ### Security Tests (`test_security.py`)
 

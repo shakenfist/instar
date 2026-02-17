@@ -16,7 +16,7 @@ imago/
 │   ├── vmm/        # Virtual machine monitor (host-side)
 │   ├── core/       # Core guest initialization
 │   ├── shared/     # Shared library code
-│   ├── operations/ # Pluggable operations (info, copy, check, compare)
+│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert)
 │   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates (guest-protocol)
 ├── prototypes/     # Experimental implementations (11 KVM prototypes)
@@ -146,8 +146,9 @@ sudo src/target/release/imago copy <INPUT> <OUTPUT>
 
 Integration tests compare `imago info` output against `qemu-img info` to verify
 drop-in replacement compatibility, validate `imago check` against deliberately
-corrupt test images, and cross-validate `imago compare` output against
-`qemu-img compare`. Tests use Python testtools/stestr.
+corrupt test images, cross-validate `imago compare` output against
+`qemu-img compare`, and cross-validate `imago convert` output against
+`qemu-img convert`. Tests use Python testtools/stestr.
 
 ```bash
 # Set up test environment
@@ -172,6 +173,7 @@ make clean-tests
 - `tests/test_info_malicious.py` - Tests against malicious images using expected overrides
 - `tests/test_check_formats.py` - Tests for check operation (format detection, corruption, validation)
 - `tests/test_compare.py` - Tests for compare operation (raw-vs-raw, QCOW2-vs-raw, QCOW2-vs-QCOW2, compressed QCOW2, backing chains)
+- `tests/test_convert.py` - Tests for convert operation (QCOW2-to-raw, compressed, backing chains, manifest-driven cross-validation)
 - `tests/expected_outputs/` - Expected output files for malicious images
 
 **Adding new test images:**

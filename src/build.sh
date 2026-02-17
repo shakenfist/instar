@@ -8,6 +8,7 @@
 #   - copy.bin at 0x20000 (copy operation, same address as info)
 #   - check.bin at 0x20000 (integrity check operation, same address as info)
 #   - compare.bin at 0x20000 (image comparison operation, same address as info)
+#   - convert.bin at 0x20000 (image conversion operation, same address as info)
 
 set -e
 
@@ -109,6 +110,25 @@ else
 fi
 
 echo ""
+echo "=== Building convert operation ==="
+cd operations/convert
+cargo +nightly build --release
+cd ../..
+
+# Convert convert ELF to flat binary
+echo "=== Converting convert ELF to flat binary ==="
+CONVERT_ELF="target/x86_64-unknown-none/release/convert"
+CONVERT_BIN="convert.bin"
+
+if [ -f "$CONVERT_ELF" ]; then
+    rust-objcopy -O binary "$CONVERT_ELF" "$CONVERT_BIN"
+    echo "Created $CONVERT_BIN ($(wc -c < "$CONVERT_BIN") bytes)"
+else
+    echo "Error: Convert ELF not found at $CONVERT_ELF"
+    exit 1
+fi
+
+echo ""
 echo "=== Building imago ==="
 cd vmm
 cargo build --release
@@ -122,7 +142,8 @@ cp "$INFO_BIN" target/release/
 cp "$COPY_BIN" target/release/
 cp "$CHECK_BIN" target/release/
 cp "$COMPARE_BIN" target/release/
-echo "Copied core.bin, info.bin, copy.bin, check.bin, and compare.bin to target/release/"
+cp "$CONVERT_BIN" target/release/
+echo "Copied core.bin, info.bin, copy.bin, check.bin, compare.bin, and convert.bin to target/release/"
 
 # Check binary sizes against memory layout limits
 # Memory layout (from shared/src/lib.rs):
@@ -158,6 +179,7 @@ check_size "info.bin" "target/release/$INFO_BIN" "$OP_MAX" || FAILED=1
 check_size "copy.bin" "target/release/$COPY_BIN" "$OP_MAX" || FAILED=1
 check_size "check.bin" "target/release/$CHECK_BIN" "$OP_MAX" || FAILED=1
 check_size "compare.bin" "target/release/$COMPARE_BIN" "$OP_MAX" || FAILED=1
+check_size "convert.bin" "target/release/$CONVERT_BIN" "$OP_MAX" || FAILED=1
 
 if [ "$FAILED" -eq 1 ]; then
     echo ""
@@ -176,12 +198,14 @@ echo "  - info.bin       Info operation (format detection) - loaded at 0x20000"
 echo "  - copy.bin       Copy operation (file copy) - loaded at 0x20000"
 echo "  - check.bin      Check operation (integrity validation) - loaded at 0x20000"
 echo "  - compare.bin    Compare operation (image comparison) - loaded at 0x20000"
+echo "  - convert.bin    Convert operation (image conversion) - loaded at 0x20000"
 echo ""
 echo "To run:"
 echo "  sudo ./target/release/imago info image.qcow2"
 echo "  sudo ./target/release/imago copy input.qcow2 output.raw"
 echo "  sudo ./target/release/imago check image.qcow2"
 echo "  sudo ./target/release/imago compare image1.raw image2.raw"
+echo "  sudo ./target/release/imago convert input.qcow2 output.raw"
 echo ""
 echo "For help:"
 echo "  ./target/release/imago --help"
@@ -189,5 +213,6 @@ echo "  ./target/release/imago info --help"
 echo "  ./target/release/imago copy --help"
 echo "  ./target/release/imago check --help"
 echo "  ./target/release/imago compare --help"
+echo "  ./target/release/imago convert --help"
 echo ""
 echo "Note: Running requires /dev/kvm access (root or kvm group)"
