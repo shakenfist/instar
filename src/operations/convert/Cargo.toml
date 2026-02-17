@@ -1,0 +1,13 @@
+[package]
+name = "convert"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+
+[dependencies]
+shared = { path = "../../shared" }
+qcow2 = { path = "../../crates/qcow2", features = ["decompress"] }

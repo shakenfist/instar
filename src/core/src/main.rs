@@ -151,24 +151,6 @@ pub extern "C" fn _start() -> ! {
         }
     };
 
-    // Initialize output device (only if configured)
-    let output = if config.has_output_device {
-        match VirtioBlock::init(
-            OUTPUT_MMIO_BASE,
-            OUTPUT_VQ_BASE,
-            config.output_sector_size,
-            "output",
-        ) {
-            Some(dev) => Some(dev),
-            None => {
-                send_complete("init", 0, false);
-                halt();
-            }
-        }
-    } else {
-        None
-    };
-
     // Store devices and config in globals for call table access.
     // SAFETY: Single-threaded guest, no concurrent access possible.
     unsafe {
@@ -197,6 +179,25 @@ pub extern "C" fn _start() -> ! {
             }
         }
         *INPUT_DEVICE_COUNT.get_mut() = active_count;
+
+        // Initialize output device (only if configured).
+        // Output device is placed after all input devices in the MMIO
+        // address space, so for chain operations with N input devices
+        // it sits at device index N instead of the fixed index 1.
+        let output = if config.has_output_device {
+            let output_idx = active_count;
+            let output_mmio = device_mmio_base(output_idx);
+            let output_vq = device_vq_base(output_idx);
+            match VirtioBlock::init(output_mmio, output_vq, config.output_sector_size, "output") {
+                Some(dev) => Some(dev),
+                None => {
+                    send_complete("init", 0, false);
+                    halt();
+                }
+            }
+        } else {
+            None
+        };
 
         *OUTPUT_DEVICE.get_mut() = output;
         *CONFIG.get_mut() = Some(config.clone());

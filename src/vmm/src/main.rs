@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use clap::{Args, Parser, Subcommand};
 use guest_protocol::{
     decode_framed, encode_vmm_config_framed, guest_, vmm_config, vmm_config_chain,
-    vmm_config_input_only, FRAME_HEADER_SIZE,
+    vmm_config_chain_with_output, vmm_config_input_only, FRAME_HEADER_SIZE,
 };
 use kvm_bindings::{kvm_regs, kvm_segment, kvm_sregs, kvm_userspace_memory_region};
 use kvm_ioctls::{Kvm, VcpuExit};
@@ -97,6 +97,12 @@ const COMPARE_CONFIG_FLAG_STRICT: u32 = 1 << 0;
 const COMPARE_CONFIG_FLAG_QUIET: u32 = 1 << 1;
 #[allow(dead_code)]
 const COMPARE_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
+
+// ConvertConfig constants (must match shared crate)
+const CONVERT_CONFIG_MAGIC: u32 = 0x434F4E56; // "CONV"
+const CONVERT_CONFIG_FLAG_SKIP_ZEROS: u32 = 1 << 0;
+#[allow(dead_code)]
+const CONVERT_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
 
 // CheckResult flag constants (must match shared crate)
 const CHECK_RESULT_FLAG_VALID: u32 = 1 << 0;
@@ -1673,6 +1679,8 @@ enum Commands {
     Check(CheckArgs),
     /// Compare two disk images sector by sector
     Compare(CompareArgs),
+    /// Convert a disk image to a different format (qcow2 -> raw)
+    Convert(ConvertArgs),
     /// Display or validate configuration
     Config(ConfigArgs),
 }
@@ -1818,6 +1826,35 @@ struct CompareArgs {
 }
 
 #[derive(Args, Debug)]
+struct ConvertArgs {
+    /// Input image file
+    input: String,
+
+    /// Output image file
+    output: String,
+
+    /// Output format (only "raw" supported currently)
+    #[arg(short = 'O', long = "output-format", default_value = "raw")]
+    output_format: String,
+
+    /// Sector size for I/O (default: 65536)
+    #[arg(long, default_value = "65536")]
+    sector_size: u32,
+
+    /// Skip writing zero-filled clusters to output (sparse output)
+    #[arg(short = 'S', long)]
+    skip_zeros: bool,
+
+    /// Progress update interval in percent (default: 10)
+    #[arg(short = 'p', long, default_value = "10")]
+    progress_percent: u32,
+
+    /// Don't create output file (must already exist)
+    #[arg(short = 'n', long)]
+    no_create: bool,
+}
+
+#[derive(Args, Debug)]
 struct ConfigArgs {
     /// Show which file each config value came from
     #[arg(long)]
@@ -1846,6 +1883,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Copy(args) => run_copy(args, verbose),
         Commands::Check(args) => run_check(args, verbose),
         Commands::Compare(args) => run_compare(args, verbose),
+        Commands::Convert(args) => run_convert(args, verbose),
         Commands::Config(args) => run_config(args),
     }
 }
@@ -3670,6 +3708,386 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // qemu-img compare which just prints the mismatch info to stdout)
     if !compare_identical {
         std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Only raw output format is supported
+    if args.output_format != "raw" {
+        return Err(format!(
+            "unsupported output format '{}' (only 'raw' is supported)",
+            args.output_format
+        )
+        .into());
+    }
+
+    // Validate sector size (must be power of 2, 512 to 64KB)
+    if !(512..=MAX_SECTOR_SIZE).contains(&args.sector_size) || !args.sector_size.is_power_of_two() {
+        return Err(format!(
+            "sector size must be a power of 2, 512 to {} (got {})",
+            MAX_SECTOR_SIZE, args.sector_size
+        )
+        .into());
+    }
+
+    // Auto-discover binaries
+    let core_path = get_binary_path("core.bin");
+    let operation_path = get_binary_path("convert.bin");
+
+    let core_code = load_guest_binary(core_path.to_str().unwrap())?;
+    debug!(
+        "Loaded core binary: {} bytes from {}",
+        core_code.len(),
+        core_path.display()
+    );
+
+    let operation_code = load_guest_binary(operation_path.to_str().unwrap())?;
+    debug!(
+        "Loaded operation binary: {} bytes from {}",
+        operation_code.len(),
+        operation_path.display()
+    );
+
+    // Discover input backing chain
+    let security_config = config::load_config().config.security;
+    let chain = discover_backing_chain(Path::new(&args.input), args.sector_size, &security_config)
+        .map_err(|e| format!("error discovering backing chain for {}: {}", args.input, e))?;
+
+    if verbose {
+        debug!("Input chain ({} image(s)):", chain.len());
+        print_backing_chain(&chain);
+    }
+
+    let input_device_count = chain.len();
+    if input_device_count > MAX_CHAIN_DEVICES {
+        return Err(format!(
+            "chain depth {} exceeds maximum of {} devices",
+            input_device_count, MAX_CHAIN_DEVICES
+        )
+        .into());
+    }
+
+    // Get virtual size from top of chain for output capacity
+    let virtual_size = chain.images()[0].virtual_size;
+    if virtual_size == 0 {
+        return Err("input image has zero virtual size".into());
+    }
+
+    // Open output file
+    let output_backing = if args.no_create {
+        BackingStore::open(Path::new(&args.output), false, None, false)?
+    } else {
+        BackingStore::open(
+            Path::new(&args.output),
+            false,
+            Some(virtual_size),
+            !args.skip_zeros, // sparse if not skip_zeros (default sparse)
+        )?
+    };
+
+    debug!(
+        "Output file: {} (capacity {} bytes)",
+        args.output, virtual_size
+    );
+
+    // Open KVM
+    let kvm = Kvm::new()?;
+    debug!("KVM API version: {}", kvm.get_api_version());
+
+    let kvm_stats_checker = kvm_stats::KvmStatsChecker::new(&kvm);
+    kvm_stats_checker.display_status();
+
+    let vm = kvm.create_vm()?;
+    debug!("Created VM");
+
+    let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
+    debug!("Allocated {} bytes of guest memory", GUEST_MEM_SIZE);
+
+    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let host_addr = region.as_ptr() as u64;
+
+    let mem_region = kvm_userspace_memory_region {
+        slot: 0,
+        guest_phys_addr: 0,
+        memory_size: GUEST_MEM_SIZE,
+        userspace_addr: host_addr,
+        flags: 0,
+    };
+    unsafe {
+        vm.set_user_memory_region(mem_region)?;
+    }
+    debug!("Configured memory region");
+
+    setup_gdt(&guest_mem)?;
+    debug!("Set up GDT at 0x{:x}", GDT_BASE);
+
+    setup_page_tables(&guest_mem)?;
+    debug!("Set up page tables at 0x{:x}", PAGE_TABLE_BASE);
+
+    guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
+    debug!("Loaded core binary at 0x{:x}", GUEST_CODE_BASE);
+
+    guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
+    debug!("Loaded operation binary at 0x{:x}", OPERATION_LOAD_ADDR);
+
+    // Write ConvertConfig at OPERATION_CONFIG_ADDR
+    let mut convert_flags: u32 = 0;
+    if args.skip_zeros {
+        convert_flags |= CONVERT_CONFIG_FLAG_SKIP_ZEROS;
+    }
+    if verbose {
+        convert_flags |= CONVERT_CONFIG_FLAG_VERBOSE;
+    }
+    guest_mem.write_obj(CONVERT_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
+    guest_mem.write_obj(convert_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
+    guest_mem.write_obj(
+        input_device_count as u32,
+        GuestAddress(OPERATION_CONFIG_ADDR + 8),
+    )?;
+    guest_mem.write_obj(
+        0u32, // target_format: Raw = 0
+        GuestAddress(OPERATION_CONFIG_ADDR + 12),
+    )?;
+    debug!(
+        "Wrote convert config at 0x{:x} (flags=0x{:x}, chain={})",
+        OPERATION_CONFIG_ADDR, convert_flags, input_device_count
+    );
+
+    // Write ChainConfig for input chain
+    write_chain_config(&guest_mem, &chain)?;
+
+    // Create device set: input chain devices + output device
+    let mut device_set = DeviceSet::new();
+    let mut io_events: Vec<IoEvent> = Vec::new();
+
+    // Set up input chain devices (read-only)
+    for (i, image) in chain.images().iter().enumerate() {
+        let backing = BackingStore::open(&image.path, true, None, false)?;
+        let file_size = std::fs::metadata(&image.path)?.len();
+        let mmio = device_mmio_base(i);
+        let vq = device_vq_base(i);
+        let device = VirtioBlockDevice::new(
+            backing,
+            file_size,
+            args.sector_size as u64,
+            true, // read-only
+            mmio,
+            vq,
+        );
+        debug!(
+            "Created input device [{}] at MMIO 0x{:x}: {}",
+            i,
+            mmio,
+            image.path.display()
+        );
+        let device = Arc::new(Mutex::new(device));
+        device_set.add_device(Arc::clone(&device), true);
+        io_events.push(IoEvent::new(mmio)?);
+    }
+
+    // Set up output device (writable)
+    let output_idx = input_device_count;
+    let output_mmio = device_mmio_base(output_idx);
+    let output_vq = device_vq_base(output_idx);
+    let output_device = VirtioBlockDevice::new(
+        output_backing,
+        virtual_size,
+        args.sector_size as u64,
+        false, // writable
+        output_mmio,
+        output_vq,
+    );
+    debug!(
+        "Created output device [{}] at MMIO 0x{:x}: {}",
+        output_idx, output_mmio, args.output
+    );
+    let output_device = Arc::new(Mutex::new(output_device));
+    device_set.add_device(Arc::clone(&output_device), false);
+    io_events.push(IoEvent::new(output_mmio)?);
+
+    let guest_mem = Arc::new(guest_mem);
+    let vmm_stats = Arc::new(Mutex::new(VmmStats::new()));
+
+    // Set up ioeventfd for queue notifications
+    let mut io_thread: Option<io_thread::IoThread> = None;
+
+    let mut registered_count = 0usize;
+    let mut registration_failed = false;
+    for evt in io_events.iter_mut() {
+        if let Err(e) = evt.register(&vm) {
+            debug!(
+                "ioeventfd: failed to register ({:?}), falling back to VM exits",
+                e
+            );
+            registration_failed = true;
+            break;
+        }
+        registered_count += 1;
+    }
+
+    if registration_failed {
+        for evt in io_events.iter_mut().take(registered_count) {
+            if let Err(e) = evt.unregister(&vm) {
+                warn!("ioeventfd: failed to unregister during rollback: {:?}", e);
+            }
+        }
+    }
+
+    let all_registered = !registration_failed;
+
+    if all_registered && !io_events.is_empty() {
+        debug!(
+            "ioeventfd: enabled for {} device(s) (with I/O thread)",
+            io_events.len()
+        );
+
+        let io_devices = device_set.create_io_devices(io_events);
+
+        io_thread = Some(io_thread::IoThread::new(
+            io_devices,
+            Arc::clone(&guest_mem),
+            Arc::clone(&vmm_stats),
+        ));
+    }
+
+    // Create vCPU
+    let mut vcpu = vm.create_vcpu(0)?;
+    debug!("Created vCPU");
+
+    let mut sregs = vcpu.get_sregs()?;
+    setup_sregs(&mut sregs);
+    vcpu.set_sregs(&sregs)?;
+    debug!("Configured special registers for long mode");
+
+    let mut regs = vcpu.get_regs()?;
+    setup_regs(&mut regs);
+    vcpu.set_regs(&regs)?;
+    debug!(
+        "Configured general registers (RIP=0x{:x}, RSP=0x{:x})",
+        regs.rip, regs.rsp
+    );
+
+    let mut serial_decoder = SerialDecoder::new();
+    let mut serial_transmitter = SerialTransmitter::new();
+    let mut debug_buffer = DebugBuffer::new();
+
+    // Queue config with input chain devices + output device
+    let config = vmm_config_chain_with_output(
+        args.sector_size,
+        args.sector_size,
+        input_device_count,
+        args.progress_percent,
+    );
+    serial_transmitter.queue_config(&config);
+    debug!(
+        "Queued configuration message ({} bytes) for guest",
+        serial_transmitter.buffer.len()
+    );
+
+    // Track VM errors
+    let mut vm_error: Option<String> = None;
+
+    // Run the vCPU loop
+    debug!("Starting guest execution");
+
+    loop {
+        match vcpu.run()? {
+            VcpuExit::Hlt => {
+                vmm_stats.lock().unwrap().record_hlt();
+                info!("Guest executed HLT");
+                debug!("Convert operation completed!");
+                break;
+            }
+            VcpuExit::IoOut(port, data) => {
+                vmm_stats.lock().unwrap().record_io_out();
+                if port == SERIAL_PORT {
+                    for &byte in data {
+                        if let Some(msg) = serial_decoder.add_byte(byte) {
+                            debug!("{}", format_message(&msg));
+                        }
+                    }
+                } else if port == DEBUG_PORT {
+                    for &byte in data {
+                        if let Some(line) = debug_buffer.add_byte(byte) {
+                            debug!("[GUEST] {}", line);
+                        }
+                    }
+                } else {
+                    debug!("IO OUT: port=0x{:x}, data={:?}", port, data);
+                }
+            }
+            VcpuExit::IoIn(port, data) => {
+                vmm_stats.lock().unwrap().record_io_in();
+                if port == SERIAL_PORT {
+                    for byte in data.iter_mut() {
+                        *byte = serial_transmitter.next_byte().unwrap_or(0);
+                    }
+                } else if port == SERIAL_PORT + 5 {
+                    let mut lsr = 0x60u8;
+                    if serial_transmitter.has_data() {
+                        lsr |= 0x01;
+                    }
+                    data[0] = lsr;
+                } else {
+                    for byte in data {
+                        *byte = 0;
+                    }
+                }
+            }
+            VcpuExit::MmioRead(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_read();
+                let value = device_set.mmio_read(addr);
+                write_mmio_data(data, value);
+            }
+            VcpuExit::MmioWrite(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_write();
+                let value = read_mmio_data(data);
+                if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
+                    if io_thread.is_none() && should_process {
+                        device_set.process_queue_for_device(
+                            device_index,
+                            &guest_mem,
+                            &vmm_stats,
+                        )?;
+                    }
+                }
+            }
+            VcpuExit::Shutdown => {
+                vmm_stats.lock().unwrap().record_shutdown();
+                eprintln!("\n--- VM Shutdown (triple fault?) ---");
+                vm_error = Some("VM shutdown (triple fault)".to_string());
+                break;
+            }
+            VcpuExit::FailEntry(reason, cpu) => {
+                vmm_stats.lock().unwrap().record_fail_entry();
+                eprintln!("VM Entry Failed! reason=0x{:x}, cpu={}", reason, cpu);
+                vm_error = Some(format!(
+                    "VM entry failed: reason=0x{:x}, cpu={}",
+                    reason, cpu
+                ));
+                break;
+            }
+            exit => {
+                vmm_stats.lock().unwrap().record_unknown();
+                eprintln!("Unexpected VM exit: {:?}", exit);
+                vm_error = Some(format!("unexpected VM exit: {:?}", exit));
+                break;
+            }
+        }
+    }
+
+    if let Some(mut thread) = io_thread {
+        thread.stop();
+    }
+
+    if log::log_enabled!(log::Level::Debug) {
+        vmm_stats.lock().unwrap().display();
+    }
+
+    if let Some(error) = vm_error {
+        return Err(error.into());
     }
 
     Ok(())

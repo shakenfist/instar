@@ -9,7 +9,9 @@
 
 #![no_std]
 
-use shared::{BackingFormat, CallTable, MAX_SECTOR_SIZE};
+use shared::{
+    BackingFormat, CallTable, ChainConfig, ImageFormat, COMPRESSED_BUF_SIZE, MAX_SECTOR_SIZE,
+};
 
 // ============================================================================
 // QCOW2 Header Constants
@@ -786,7 +788,7 @@ pub unsafe fn read_compressed_cluster(
     }
     let compressed_size = nb_sectors_bytes - offset_remainder;
 
-    if compressed_size == 0 || compressed_size > MAX_SECTOR_SIZE as u64 {
+    if compressed_size == 0 || compressed_size > COMPRESSED_BUF_SIZE as u64 {
         return false;
     }
 
@@ -805,7 +807,7 @@ pub unsafe fn read_compressed_cluster(
     let last_sector = (data_end + sector_size as u64 - 1) / sector_size as u64;
     let sectors_to_read = last_sector - first_sector;
 
-    if sectors_to_read * sector_size as u64 > MAX_SECTOR_SIZE as u64 {
+    if sectors_to_read * sector_size as u64 > COMPRESSED_BUF_SIZE as u64 {
         return false;
     }
 
@@ -1160,4 +1162,151 @@ pub unsafe fn lookup_refcount(
         // Unsupported refcount width
         None
     }
+}
+
+// ============================================================================
+// Chain-walking cluster reading
+// ============================================================================
+
+/// Read raw sectors from a device for a given virtual offset range.
+///
+/// Reads `chunk_size / sector_size` consecutive sectors starting at
+/// `virtual_offset`. If the device is smaller than the requested range,
+/// the remainder is zero-filled.
+///
+/// # Safety
+///
+/// `buf` must point to at least `chunk_size` writable bytes.
+/// `call_table` must be valid.
+pub unsafe fn read_raw_sectors(
+    call_table: &CallTable,
+    device_idx: u32,
+    virtual_offset: u64,
+    buf: *mut u8,
+    chunk_size: u64,
+    sector_size: usize,
+    input_capacity: u64,
+    bytes_read: &mut u64,
+) -> bool {
+    let first_sector = virtual_offset / sector_size as u64;
+    let sectors_per_chunk = chunk_size / sector_size as u64;
+
+    for i in 0..sectors_per_chunk {
+        let sector = first_sector + i;
+        if sector >= input_capacity {
+            // Beyond file: fill remainder with zeros
+            let remaining = ((sectors_per_chunk - i) as usize) * sector_size;
+            let dest = buf.add((i as usize) * sector_size);
+            core::ptr::write_bytes(dest, 0, remaining);
+            break;
+        }
+        let buf_offset = (i as usize) * sector_size;
+        if !(call_table.read_input_sector)(device_idx, sector, buf.add(buf_offset), sector_size) {
+            return false;
+        }
+        *bytes_read += sector_size as u64;
+    }
+    true
+}
+
+/// Read one cluster's worth of virtual data by walking a backing chain.
+///
+/// For each device in the chain (starting from the top):
+/// - QCOW2: perform L1/L2 lookup. If unallocated, try next device.
+/// - Raw/other: read sectors directly (base of chain).
+///
+/// If all devices have the cluster unallocated, fills with zeros.
+///
+/// # Safety
+///
+/// `buf` must point to at least `chunk_size` writable bytes.
+/// `compressed_buf` must point to at least `MAX_SECTOR_SIZE` writable
+/// bytes (used as scratch for decompressing compressed clusters).
+/// `call_table` must be valid.
+#[allow(unused_variables)]
+pub unsafe fn read_chain_virtual_cluster(
+    call_table: &CallTable,
+    chain_start: usize,
+    chain_len: usize,
+    virtual_offset: u64,
+    buf: *mut u8,
+    chunk_size: u64,
+    sector_size: usize,
+    chain_config: &ChainConfig,
+    qcow2_states: &mut [Option<Qcow2State>],
+    compressed_buf: *mut u8,
+    bytes_read: &mut u64,
+) -> bool {
+    for dev_offset in 0..chain_len {
+        let dev_idx = chain_start + dev_offset;
+        let format = chain_config.devices[dev_idx].detected_format();
+        let cap = (call_table.get_input_capacity)(dev_idx as u32);
+
+        match format {
+            ImageFormat::Qcow2 => {
+                let state = match &mut qcow2_states[dev_idx] {
+                    Some(s) => s,
+                    None => return false,
+                };
+
+                let qcow2_cluster_size = state.cluster_size;
+                if qcow2_cluster_size > MAX_SECTOR_SIZE as u64 {
+                    return false;
+                }
+
+                match state.cluster_lookup(call_table, virtual_offset, sector_size, cap, bytes_read)
+                {
+                    Some(ClusterLookup::Unallocated) => {
+                        continue;
+                    }
+                    Some(ClusterLookup::Standard(host_offset)) => {
+                        return read_cluster_sectors(
+                            call_table,
+                            dev_idx as u32,
+                            host_offset,
+                            buf,
+                            qcow2_cluster_size,
+                            sector_size,
+                            bytes_read,
+                        );
+                    }
+                    #[cfg(feature = "decompress")]
+                    Some(ClusterLookup::Compressed(l2_entry)) => {
+                        return read_compressed_cluster(
+                            call_table,
+                            dev_idx as u32,
+                            l2_entry,
+                            state.cluster_bits,
+                            buf,
+                            qcow2_cluster_size,
+                            sector_size,
+                            compressed_buf,
+                            cap,
+                            bytes_read,
+                        );
+                    }
+                    #[cfg(not(feature = "decompress"))]
+                    Some(ClusterLookup::Compressed(_)) => {
+                        return false;
+                    }
+                    None => return false,
+                }
+            }
+            _ => {
+                return read_raw_sectors(
+                    call_table,
+                    dev_idx as u32,
+                    virtual_offset,
+                    buf,
+                    chunk_size,
+                    sector_size,
+                    cap,
+                    bytes_read,
+                );
+            }
+        }
+    }
+    // All devices in chain had unallocated: fill with zeros
+    core::ptr::write_bytes(buf, 0, chunk_size as usize);
+    true
 }
