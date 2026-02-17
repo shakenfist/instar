@@ -756,7 +756,8 @@ pub unsafe fn read_cluster_sectors(
 /// # Safety
 ///
 /// `out_buf` must point to at least `cluster_size` writable bytes.
-/// `compressed_buf` must point to at least `MAX_SECTOR_SIZE` writable bytes.
+/// `compressed_buf` must point to at least `COMPRESSED_BUF_SIZE` writable bytes
+/// (used as scratch for decompressing compressed clusters).
 /// `call_table` must be valid.
 #[cfg(feature = "decompress")]
 pub unsafe fn read_compressed_cluster(
@@ -1220,7 +1221,7 @@ pub unsafe fn read_raw_sectors(
 /// # Safety
 ///
 /// `buf` must point to at least `chunk_size` writable bytes.
-/// `compressed_buf` must point to at least `MAX_SECTOR_SIZE` writable
+/// `compressed_buf` must point to at least `COMPRESSED_BUF_SIZE` writable
 /// bytes (used as scratch for decompressing compressed clusters).
 /// `call_table` must be valid.
 #[allow(unused_variables)]
