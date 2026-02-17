@@ -121,6 +121,15 @@ pub unsafe extern "C" fn _start() -> u64 {
         cluster_size
     };
 
+    // Guard: chunk_size must be >= output_sector_size, otherwise integer
+    // division at write time would produce zero sectors and silently drop
+    // all data. Both values are powers of two in [512, 65536].
+    if chunk_size < output_sector_size as u64 {
+        (call_table.debug_print)(b"convert: chunk < output sector size\n\0".as_ptr());
+        (call_table.send_complete)(b"convert\0".as_ptr(), 0, false);
+        return 0;
+    }
+
     (call_table.verbose_print)(b"convert: initializing qcow2 states\n\0".as_ptr());
 
     // Initialize QCOW2 state for each QCOW2 device in the chain
@@ -205,9 +214,11 @@ pub unsafe extern "C" fn _start() -> u64 {
             continue;
         }
 
-        // Write to output device sector by sector
+        // Write to output device sector by sector.
+        // Use ceiling division so a partial last chunk still gets written.
         let output_first_sector = virtual_offset / output_sector_size as u64;
-        let sectors_per_chunk = this_chunk / output_sector_size as u64;
+        let sectors_per_chunk =
+            (this_chunk + output_sector_size as u64 - 1) / output_sector_size as u64;
 
         for i in 0..sectors_per_chunk {
             let output_sector = output_first_sector + i;
