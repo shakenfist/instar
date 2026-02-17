@@ -99,6 +99,15 @@ pub unsafe extern "C" fn _start() -> u64 {
     // Get virtual size from top-of-chain device
     let top_dev = &chain_config.devices[0];
     let virtual_size = top_dev.virtual_size;
+
+    // Guard against zero virtual size to avoid division by zero in progress
+    // reporting. The VMM validates this, but the guest should be defensive
+    // since ChainConfig comes from guest memory.
+    if virtual_size == 0 {
+        (call_table.send_complete)(b"convert\0".as_ptr(), 0, false);
+        return 0;
+    }
+
     let cluster_size = if top_dev.cluster_size > 0 {
         top_dev.cluster_size as u64
     } else {
