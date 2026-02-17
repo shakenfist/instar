@@ -3771,6 +3771,21 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         .into());
     }
 
+    // Reject images with cluster_size > MAX_SECTOR_SIZE (64KB).
+    // The guest buffer is limited to MAX_SECTOR_SIZE, so larger clusters
+    // cannot be processed correctly.
+    for image in chain.images() {
+        if image.cluster_size > MAX_SECTOR_SIZE {
+            return Err(format!(
+                "cluster size {}KB in {} exceeds maximum supported {}KB",
+                image.cluster_size / 1024,
+                image.path.display(),
+                MAX_SECTOR_SIZE / 1024
+            )
+            .into());
+        }
+    }
+
     // Get virtual size from top of chain for output capacity
     let virtual_size = chain.images()[0].virtual_size;
     if virtual_size == 0 {
