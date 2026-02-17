@@ -3783,7 +3783,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
             Path::new(&args.output),
             false,
             Some(virtual_size),
-            !args.skip_zeros, // sparse if not skip_zeros (default sparse)
+            !args.skip_zeros, // pre-allocate when skipping zeros so unwritten regions are zero on disk
         )?
     };
 
