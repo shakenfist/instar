@@ -184,8 +184,15 @@ pub extern "C" fn _start() -> ! {
         // Output device is placed after all input devices in the MMIO
         // address space, so for chain operations with N input devices
         // it sits at device index N instead of the fixed index 1.
+        // Bounds check: output device VQ must not exceed the VQ region
+        // (MAX_INPUT_DEVICES slots total for input + output combined).
         let output = if config.has_output_device {
             let output_idx = active_count;
+            if output_idx >= MAX_INPUT_DEVICES {
+                debug_print("core: output device index exceeds VQ limit\n");
+                send_complete("init", 0, false);
+                halt();
+            }
             let output_mmio = device_mmio_base(output_idx);
             let output_vq = device_vq_base(output_idx);
             match VirtioBlock::init(output_mmio, output_vq, config.output_sector_size, "output") {

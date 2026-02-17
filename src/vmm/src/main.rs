@@ -3761,9 +3761,11 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     }
 
     let input_device_count = chain.len();
-    if input_device_count > MAX_CHAIN_DEVICES {
+    // Reserve one device slot for the output device to prevent its VQ
+    // memory from colliding with DMA_POOL_BASE.
+    if input_device_count + 1 > MAX_CHAIN_DEVICES {
         return Err(format!(
-            "chain depth {} exceeds maximum of {} devices",
+            "chain depth {} plus output device exceeds maximum of {} devices",
             input_device_count, MAX_CHAIN_DEVICES
         )
         .into());
