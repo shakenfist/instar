@@ -68,6 +68,10 @@ pub const SCRATCH_MEM_SIZE: usize = SCRATCH_MEM_END - SCRATCH_MEM_BASE;
 /// Maximum sector size supported
 pub const MAX_SECTOR_SIZE: usize = 65536;
 
+/// Compressed cluster read buffer size. Compressed data in QCOW2 can
+/// straddle a sector boundary, so we need room for 2 sectors.
+pub const COMPRESSED_BUF_SIZE: usize = 2 * MAX_SECTOR_SIZE;
+
 /// Result from get_operation_config (FFI-safe alternative to tuple)
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -457,6 +461,61 @@ impl CallTable {
 
     /// Current ABI version (bumped: added send_compare_result)
     pub const VERSION: u32 = 12;
+}
+
+// ============================================================================
+// Shared utility functions for guest operations
+// ============================================================================
+
+/// Check if a byte slice contains only zeros.
+pub fn is_all_zeros(buffer: &[u8], len: usize) -> bool {
+    for &byte in &buffer[..len] {
+        if byte != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Check if a raw pointer buffer contains only zeros.
+///
+/// # Safety
+///
+/// `buf` must point to at least `len` readable bytes.
+pub unsafe fn is_all_zeros_ptr(buf: *const u8, len: usize) -> bool {
+    for i in 0..len {
+        if *buf.add(i) != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Determine if progress should be reported based on interval
+/// settings and current progress.
+///
+/// - `interval = 0`: report every 10 counts (legacy mode)
+/// - `interval = 100`: never report
+/// - `interval = N`: report every N percent
+pub fn should_report_progress(interval: u32, percent: u32, last_percent: u32, count: u64) -> bool {
+    match interval {
+        0 => count % 10 == 9,
+        100 => false,
+        n => percent >= last_percent + n && percent > last_percent,
+    }
+}
+
+/// Get the L1 cache buffer address for a given device index.
+///
+/// Each device gets 2 × MAX_SECTOR_SIZE of cache space (L1 + L2),
+/// starting at `dynamic_bufs_start`.
+pub fn l1_cache_addr(dynamic_bufs_start: usize, dev_idx: usize) -> *mut u8 {
+    (dynamic_bufs_start + dev_idx * 2 * MAX_SECTOR_SIZE) as *mut u8
+}
+
+/// Get the L2 cache buffer address for a given device index.
+pub fn l2_cache_addr(dynamic_bufs_start: usize, dev_idx: usize) -> *mut u8 {
+    (dynamic_bufs_start + (dev_idx * 2 + 1) * MAX_SECTOR_SIZE) as *mut u8
 }
 
 // ============================================================================
@@ -1124,6 +1183,66 @@ impl CompareResult {
     /// Check if images have different sizes
     pub fn has_size_mismatch(&self) -> bool {
         (self.flags & Self::FLAG_SIZE_MISMATCH) != 0
+    }
+}
+
+/// Configuration for the convert operation.
+///
+/// This structure is written to OPERATION_CONFIG_ADDR by the VMM.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ConvertConfig {
+    /// Magic number to verify config is valid (0x434F4E56 = "CONV")
+    pub magic: u32,
+
+    /// Configuration flags
+    pub flags: u32,
+
+    /// Number of input devices in the backing chain
+    pub input_device_count: u32,
+
+    /// Target output format (ImageFormat as u32, only Raw for now)
+    pub target_format: u32,
+}
+
+impl ConvertConfig {
+    /// Magic value for convert config
+    pub const MAGIC: u32 = 0x434F4E56; // "CONV"
+
+    /// Flag: Skip writing zero-filled clusters to output
+    pub const FLAG_SKIP_ZEROS: u32 = 1 << 0;
+
+    /// Flag: Verbose logging
+    pub const FLAG_VERBOSE: u32 = 1 << 31;
+
+    /// Create a default config
+    pub const fn default_config() -> Self {
+        Self {
+            magic: Self::MAGIC,
+            flags: 0,
+            input_device_count: 1,
+            target_format: 0, // Raw
+        }
+    }
+
+    /// Check if config is valid
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+
+    /// Check if skip-zeros is enabled
+    pub fn should_skip_zeros(&self) -> bool {
+        (self.flags & Self::FLAG_SKIP_ZEROS) != 0
+    }
+
+    /// Number of input devices in the backing chain.
+    /// Returns 1 if unset (zero-initialized guest memory fallback).
+    pub fn input_device_count(&self) -> u32 {
+        if self.input_device_count == 0 {
+            1
+        } else {
+            self.input_device_count
+        }
     }
 }
 

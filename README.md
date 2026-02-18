@@ -24,7 +24,8 @@ Initial target formats:
 ## Project Status
 
 **Initial implementation** - The `info` prototype has been promoted to the main
-imago implementation in `src/`. Prototypes remain available for reference.
+imago implementation in `src/`. Operations include `info`, `copy`, `check`,
+`compare`, and `convert`. Prototypes remain available for reference.
 
 ## Building Imago
 
@@ -118,6 +119,26 @@ in human-readable output. Without `--chain`, `chain-errors` is always 0.
 **Note:** The `chain-errors` field is always present in JSON output,
 even when `--chain` is not used. This is a schema addition relative to
 previous versions.
+
+### Image Conversion
+
+```bash
+# Convert QCOW2 to raw (flattens backing chains)
+imago convert input.qcow2 output.raw
+
+# Convert with sparse output (skip writing zero-filled clusters)
+imago convert -S input.qcow2 output.raw
+
+# Progress reporting
+imago convert -p 5 input.qcow2 output.raw
+```
+
+The convert operation reads the virtual content of a QCOW2 image (including
+backing chain flattening) and writes it as a flat raw output. Compressed
+clusters (zlib/deflate) are decompressed transparently.
+
+**Limitations:** Cluster sizes above 64KB are not yet supported. Output
+format is currently limited to raw.
 
 ### Version Compatibility
 
@@ -278,8 +299,9 @@ make clean-tests
 
 The integration tests compare `imago info` output against `qemu-img info` to
 verify drop-in replacement compatibility, validate `imago check` against
-deliberately corrupt test images, and cross-validate `imago compare` output
-against `qemu-img compare`. Test images are in the sibling `imago-testdata/`
+deliberately corrupt test images, cross-validate `imago compare` output
+against `qemu-img compare`, and cross-validate `imago convert` output against
+`qemu-img convert`. Test images are in the sibling `imago-testdata/`
 repository.
 
 **Running:**
@@ -302,7 +324,7 @@ imago/
 │   │   ├── qcow2/  # QCOW2 header, L1/L2, decompression, refcounts
 │   │   ├── raw/    # MBR/GPT partition table detection
 │   │   └── vmdk/   # VMDK4 header and descriptor parsing
-│   ├── operations/ # Pluggable operations (info, copy, check, compare)
+│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert)
 │   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates
 │   └── guest-protocol/ # Protocol Buffers messaging for guests

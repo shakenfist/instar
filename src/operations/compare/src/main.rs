@@ -20,164 +20,32 @@
 
 use core::panic::PanicInfo;
 
-use qcow2::ClusterLookup;
 use shared::{
-    CallTable, ChainConfig, CompareConfig, CompareResult, ImageFormat, CALL_TABLE_ADDR,
-    CHAIN_CONFIG_ADDR, MAX_CHAIN_DEVICES, MAX_SECTOR_SIZE, OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE,
-    SCRATCH_MEM_END,
+    l1_cache_addr, l2_cache_addr, CallTable, ChainConfig, CompareConfig, CompareResult,
+    ImageFormat, CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR, COMPRESSED_BUF_SIZE, MAX_CHAIN_DEVICES,
+    MAX_SECTOR_SIZE, OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE, SCRATCH_MEM_END,
 };
 
 // Scratch memory layout for compare operation.
-// Fixed buffers (3 × MAX_SECTOR_SIZE = 192KB):
+// Fixed buffers:
+//   BUF_COMPARE_1 (64KB): first image cluster data
+//   BUF_COMPARE_2 (64KB): second image cluster data
+//   BUF_COMPRESSED_IN (128KB): compressed data may straddle a sector boundary
 const BUF_COMPARE_1: usize = SCRATCH_MEM_BASE;
 const BUF_COMPARE_2: usize = BUF_COMPARE_1 + MAX_SECTOR_SIZE;
 const BUF_COMPRESSED_IN: usize = BUF_COMPARE_2 + MAX_SECTOR_SIZE;
 
 // Dynamic region: L1/L2 caches for QCOW2 devices (2 × MAX_SECTOR_SIZE per device)
-const DYNAMIC_BUFS_START: usize = BUF_COMPRESSED_IN + MAX_SECTOR_SIZE;
+const DYNAMIC_BUFS_START: usize = BUF_COMPRESSED_IN + COMPRESSED_BUF_SIZE;
 const _: () = assert!(
     DYNAMIC_BUFS_START + MAX_CHAIN_DEVICES * 2 * MAX_SECTOR_SIZE <= SCRATCH_MEM_END,
     "Scratch memory too small for MAX_CHAIN_DEVICES L1/L2 caches"
 );
 
-/// Get the L1 cache buffer address for a given device index.
-fn dev_l1_cache(dev_idx: usize) -> *mut u8 {
-    (DYNAMIC_BUFS_START + dev_idx * 2 * MAX_SECTOR_SIZE) as *mut u8
-}
-
-/// Get the L2 cache buffer address for a given device index.
-fn dev_l2_cache(dev_idx: usize) -> *mut u8 {
-    (DYNAMIC_BUFS_START + (dev_idx * 2 + 1) * MAX_SECTOR_SIZE) as *mut u8
-}
-
 /// Describes the format and key parameters for one image (top of its chain).
 struct DeviceInfo {
     virtual_size: u64,
     cluster_size: u64,
-}
-
-/// Read raw sectors from a device for a given virtual offset range.
-unsafe fn read_raw_sectors(
-    call_table: &CallTable,
-    device_idx: u32,
-    virtual_offset: u64,
-    buf: *mut u8,
-    chunk_size: u64,
-    sector_size: usize,
-    input_capacity: u64,
-    bytes_read: &mut u64,
-) -> bool {
-    let first_sector = virtual_offset / sector_size as u64;
-    let sectors_per_cluster = chunk_size / sector_size as u64;
-
-    for i in 0..sectors_per_cluster {
-        let sector = first_sector + i;
-        if sector >= input_capacity {
-            // Beyond file: fill remainder with zeros
-            let remaining = ((sectors_per_cluster - i) as usize) * sector_size;
-            let dest = buf.add((i as usize) * sector_size);
-            core::ptr::write_bytes(dest, 0, remaining);
-            break;
-        }
-        let buf_offset = (i as usize) * sector_size;
-        if !(call_table.read_input_sector)(device_idx, sector, buf.add(buf_offset), sector_size) {
-            return false;
-        }
-        *bytes_read += sector_size as u64;
-    }
-    true
-}
-
-/// Read one cluster's worth of virtual data by walking a backing chain.
-///
-/// For each device in the chain (starting from the top):
-/// - QCOW2: perform L1/L2 lookup. If unallocated, try next device.
-/// - Raw/other: read sectors directly (always the base of the chain).
-/// If all devices have the cluster unallocated, fills with zeros.
-unsafe fn read_chain_virtual_cluster(
-    call_table: &CallTable,
-    chain_start: usize,
-    chain_len: usize,
-    virtual_offset: u64,
-    buf: *mut u8,
-    chunk_size: u64,
-    sector_size: usize,
-    chain_config: &ChainConfig,
-    qcow2_states: &mut [Option<qcow2::Qcow2State>; MAX_CHAIN_DEVICES],
-    bytes_read: &mut u64,
-) -> bool {
-    for dev_offset in 0..chain_len {
-        let dev_idx = chain_start + dev_offset;
-        let format = chain_config.devices[dev_idx].detected_format();
-        let cap = (call_table.get_input_capacity)(dev_idx as u32);
-
-        match format {
-            ImageFormat::Qcow2 => {
-                let state = match &mut qcow2_states[dev_idx] {
-                    Some(s) => s,
-                    None => return false,
-                };
-
-                // Always use the actual QCOW2 cluster size for reading/decompressing.
-                let qcow2_cluster_size = state.cluster_size;
-                // Defense-in-depth: Qcow2State::init already rejects clusters
-                // larger than MAX_SECTOR_SIZE, but guard at the use-site too.
-                if qcow2_cluster_size > MAX_SECTOR_SIZE as u64 {
-                    return false;
-                }
-
-                match state.cluster_lookup(call_table, virtual_offset, sector_size, cap, bytes_read)
-                {
-                    Some(ClusterLookup::Unallocated) => {
-                        // Not in this device, try next in chain
-                        continue;
-                    }
-                    Some(ClusterLookup::Standard(host_offset)) => {
-                        return qcow2::read_cluster_sectors(
-                            call_table,
-                            dev_idx as u32,
-                            host_offset,
-                            buf,
-                            qcow2_cluster_size,
-                            sector_size,
-                            bytes_read,
-                        );
-                    }
-                    Some(ClusterLookup::Compressed(l2_entry)) => {
-                        return qcow2::read_compressed_cluster(
-                            call_table,
-                            dev_idx as u32,
-                            l2_entry,
-                            state.cluster_bits,
-                            buf,
-                            qcow2_cluster_size,
-                            sector_size,
-                            BUF_COMPRESSED_IN as *mut u8,
-                            cap,
-                            bytes_read,
-                        );
-                    }
-                    None => return false,
-                }
-            }
-            _ => {
-                // Raw/unknown: read sectors directly (base of chain)
-                return read_raw_sectors(
-                    call_table,
-                    dev_idx as u32,
-                    virtual_offset,
-                    buf,
-                    chunk_size,
-                    sector_size,
-                    cap,
-                    bytes_read,
-                );
-            }
-        }
-    }
-    // All devices in chain had unallocated: fill with zeros
-    core::ptr::write_bytes(buf, 0, chunk_size as usize);
-    true
 }
 
 /// Entry point called by core after devices are initialized.
@@ -322,8 +190,8 @@ pub unsafe extern "C" fn _start() -> u64 {
                 dev_idx as u32,
                 sector_size,
                 cap,
-                dev_l1_cache(dev_idx),
-                dev_l2_cache(dev_idx),
+                l1_cache_addr(DYNAMIC_BUFS_START, dev_idx),
+                l2_cache_addr(DYNAMIC_BUFS_START, dev_idx),
                 &mut bytes_read,
             );
             if qcow2_states[dev_idx].is_none() {
@@ -385,7 +253,7 @@ pub unsafe extern "C" fn _start() -> u64 {
         };
 
         // Read virtual data from image1's chain
-        if !read_chain_virtual_cluster(
+        if !qcow2::read_chain_virtual_cluster(
             call_table,
             0,
             image1_device_count,
@@ -395,6 +263,7 @@ pub unsafe extern "C" fn _start() -> u64 {
             sector_size,
             chain_config,
             &mut qcow2_states,
+            BUF_COMPRESSED_IN as *mut u8,
             &mut bytes_read,
         ) {
             (call_table.send_error)(
@@ -410,7 +279,7 @@ pub unsafe extern "C" fn _start() -> u64 {
         }
 
         // Read virtual data from image2's chain
-        if !read_chain_virtual_cluster(
+        if !qcow2::read_chain_virtual_cluster(
             call_table,
             image2_start,
             image2_device_count,
@@ -420,6 +289,7 @@ pub unsafe extern "C" fn _start() -> u64 {
             sector_size,
             chain_config,
             &mut qcow2_states,
+            BUF_COMPRESSED_IN as *mut u8,
             &mut bytes_read,
         ) {
             (call_table.send_error)(
@@ -482,7 +352,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                     chunk_size
                 };
 
-                if !read_chain_virtual_cluster(
+                if !qcow2::read_chain_virtual_cluster(
                     call_table,
                     extra_chain_start,
                     extra_chain_len,
@@ -492,6 +362,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                     sector_size,
                     chain_config,
                     &mut qcow2_states,
+                    BUF_COMPRESSED_IN as *mut u8,
                     &mut bytes_read,
                 ) {
                     // I/O error: treat as mismatch
