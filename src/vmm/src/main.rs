@@ -3800,9 +3800,9 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
             Path::new(&args.output),
             false,
             Some(virtual_size),
-            // sparse=true  when NOT skipping zeros: file grows as sectors are written.
-            // sparse=false when skipping zeros: pre-allocate so unwritten regions are zero on disk.
-            !args.skip_zeros,
+            // sparse when skipping zeros: unwritten holes are zero-filled by the filesystem.
+            // pre-allocate when writing every cluster: no holes expected.
+            args.skip_zeros,
         )?
     };
 
