@@ -70,7 +70,7 @@ jobs:
 
       - name: Run automated reviewer
         if: steps.check_permission.outputs.authorized == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          tools/review-pr-with-claude.sh --ci --force --pr ${{ github.event.issue.number }}
+        uses: shakenfist/actions/review-pr-with-claude@main
+        with:
+          pr-number: ${{ github.event.issue.number }}
+          force: 'true'
