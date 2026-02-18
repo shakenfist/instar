@@ -12,6 +12,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  issues: write
 
 jobs:
   # Check if the last commit was from the bot to prevent infinite loops in
@@ -440,11 +441,6 @@ jobs:
           fetch-depth: 0
 
       - name: Run automated reviewer
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # The review script embeds the JSON in the PR comment for the
-          # address-comments automation to extract later
-          tools/review-pr-with-claude.sh \
-            --ci \
-            --pr ${{ github.event.pull_request.number }}
+        uses: shakenfist/actions/review-pr-with-claude@main
+        with:
+          pr-number: ${{ github.event.pull_request.number }}
