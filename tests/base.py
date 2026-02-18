@@ -492,6 +492,86 @@ class ImagoTestBase(testtools.TestCase):
         except subprocess.TimeoutExpired:
             return '', 'Timeout after {}s'.format(timeout), -1
 
+    def run_imago_convert(
+        self,
+        input_path: Path,
+        output_path: Path,
+        timeout: int = 60,
+        output_format: str = 'raw',
+        skip_zeros: bool = False,
+    ) -> tuple:
+        """
+        Run imago convert on an image.
+
+        Args:
+            input_path: Path to the input image file
+            output_path: Path to the output image file
+            timeout: Timeout in seconds
+            output_format: Output format (default: raw)
+            skip_zeros: Skip writing zero-filled clusters
+
+        Returns:
+            tuple: (stdout, stderr, return_code)
+        """
+        imago = self.get_imago_binary()
+
+        cmd = [
+            str(imago), 'convert',
+            '-O', output_format,
+        ]
+        if skip_zeros:
+            cmd.append('--skip-zeros')
+        cmd.extend([str(input_path), str(output_path)])
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            return result.stdout, result.stderr, result.returncode
+        except subprocess.TimeoutExpired:
+            return '', 'Timeout after {}s'.format(timeout), -1
+
+    def run_qemu_img_convert(
+        self,
+        input_path: Path,
+        output_path: Path,
+        timeout: int = 60,
+        output_format: str = 'raw',
+    ) -> tuple:
+        """
+        Run qemu-img convert on an image.
+
+        Args:
+            input_path: Path to the input image file
+            output_path: Path to the output image file
+            timeout: Timeout in seconds
+            output_format: Output format (default: raw)
+
+        Returns:
+            tuple: (stdout, stderr, return_code)
+        """
+        cmd = [
+            'qemu-img', 'convert',
+            '-f', 'qcow2',
+            '-O', output_format,
+            str(input_path),
+            str(output_path),
+        ]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            return result.stdout, result.stderr, result.returncode
+        except subprocess.TimeoutExpired:
+            return '', 'Timeout after {}s'.format(timeout), -1
+
     def load_expected_override(self, override_path: str) -> Optional[str]:
         """
         Load expected output from an override file.

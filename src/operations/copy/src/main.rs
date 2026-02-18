@@ -9,7 +9,9 @@
 
 use core::panic::PanicInfo;
 
-use shared::{CallTable, CopyConfig, CALL_TABLE_ADDR, MAX_SECTOR_SIZE};
+use shared::{
+    is_all_zeros, should_report_progress, CallTable, CopyConfig, CALL_TABLE_ADDR, MAX_SECTOR_SIZE,
+};
 
 /// Entry point called by core after devices are initialized.
 ///
@@ -260,25 +262,6 @@ pub unsafe extern "C" fn _start() -> u64 {
 /// Get the call table from the fixed address
 unsafe fn get_call_table() -> &'static CallTable {
     &*(CALL_TABLE_ADDR as *const CallTable)
-}
-
-/// Determine if progress should be reported
-fn should_report_progress(interval: u32, percent: u32, last_percent: u32, sector: u64) -> bool {
-    match interval {
-        0 => sector % 10 == 9, // Every 10 sectors
-        100 => false,          // Never
-        n => percent >= last_percent + n && percent > last_percent,
-    }
-}
-
-/// Check if a buffer contains only zeros
-fn is_all_zeros(buffer: &[u8], len: usize) -> bool {
-    for i in 0..len {
-        if buffer[i] != 0 {
-            return false;
-        }
-    }
-    true
 }
 
 #[panic_handler]
