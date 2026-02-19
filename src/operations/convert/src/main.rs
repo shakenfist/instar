@@ -16,9 +16,10 @@
 use core::panic::PanicInfo;
 
 use shared::{
-    is_all_zeros_ptr, l1_cache_addr, l2_cache_addr, should_report_progress, CallTable, ChainConfig,
-    ConvertConfig, ImageFormat, CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR, COMPRESSED_BUF_SIZE,
-    MAX_CHAIN_DEVICES, MAX_SECTOR_SIZE, OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE, SCRATCH_MEM_END,
+    is_all_zeros_ptr, should_report_progress, validate_call_table, verify_sector_sizes, CallTable,
+    ChainConfig, ConvertConfig, ImageFormat, CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR,
+    COMPRESSED_BUF_SIZE, MAX_CHAIN_DEVICES, MAX_SECTOR_SIZE, OPERATION_CONFIG_ADDR,
+    SCRATCH_MEM_BASE, SCRATCH_MEM_END,
 };
 
 // ================================================================
@@ -57,15 +58,7 @@ const _: () = assert!(
 pub unsafe extern "C" fn _start() -> u64 {
     let call_table = get_call_table();
 
-    // Verify call table is valid
-    if call_table.magic != CallTable::MAGIC {
-        (call_table.debug_print)(b"convert: bad magic\n\0".as_ptr());
-        return 0;
-    }
-    if call_table.version != CallTable::VERSION {
-        (call_table.debug_print)(b"convert: bad version\n\0".as_ptr());
-        return 0;
-    }
+    validate_call_table!(call_table, "convert");
 
     (call_table.verbose_print)(b"convert: start\n\0".as_ptr());
 
@@ -97,15 +90,14 @@ pub unsafe extern "C" fn _start() -> u64 {
     }
 
     // Verify input sector sizes are consistent
-    let sector_size = (call_table.get_input_sector_size)(0);
-    for dev_idx in 1..input_device_count {
-        let dev_ss = (call_table.get_input_sector_size)(dev_idx as u32);
-        if dev_ss != sector_size {
+    let sector_size = match verify_sector_sizes(call_table, input_device_count) {
+        Some(ss) => ss,
+        None => {
             (call_table.debug_print)(b"convert: sector size mismatch\n\0".as_ptr());
             (call_table.send_complete)(b"convert\0".as_ptr(), 0, false);
             return 0;
         }
-    }
+    };
 
     let mut bytes_read: u64 = 0;
 
@@ -122,25 +114,18 @@ pub unsafe extern "C" fn _start() -> u64 {
     // Initialize QCOW2 state for each QCOW2 input device
     let mut qcow2_states: [Option<qcow2::Qcow2State>; MAX_CHAIN_DEVICES] = Default::default();
 
-    for dev_idx in 0..input_device_count {
-        let dev_info = &chain_config.devices[dev_idx];
-        if matches!(dev_info.detected_format(), ImageFormat::Qcow2) {
-            let cap = (call_table.get_input_capacity)(dev_idx as u32);
-            qcow2_states[dev_idx] = qcow2::Qcow2State::init(
-                call_table,
-                dev_idx as u32,
-                sector_size,
-                cap,
-                l1_cache_addr(DYNAMIC_BUFS_START, dev_idx),
-                l2_cache_addr(DYNAMIC_BUFS_START, dev_idx),
-                &mut bytes_read,
-            );
-            if qcow2_states[dev_idx].is_none() {
-                (call_table.debug_print)(b"convert: failed to init qcow2\n\0".as_ptr());
-                (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
-                return bytes_read;
-            }
-        }
+    if !qcow2::init_chain_qcow2_states(
+        call_table,
+        chain_config,
+        &mut qcow2_states,
+        input_device_count,
+        sector_size,
+        DYNAMIC_BUFS_START,
+        &mut bytes_read,
+    ) {
+        (call_table.debug_print)(b"convert: failed to init qcow2\n\0".as_ptr());
+        (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
+        return bytes_read;
     }
 
     // Dispatch based on target format
