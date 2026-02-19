@@ -126,19 +126,32 @@ previous versions.
 # Convert QCOW2 to raw (flattens backing chains)
 imago convert input.qcow2 output.raw
 
+# Convert any input to QCOW2 v3 output
+imago convert -O qcow2 input.raw output.qcow2
+
+# Convert QCOW2 with backing chain to standalone QCOW2
+imago convert -O qcow2 overlay.qcow2 standalone.qcow2
+
 # Convert with sparse output (skip writing zero-filled clusters)
 imago convert -S input.qcow2 output.raw
+
+# Specify output cluster size for QCOW2 (default: 65536)
+imago convert -O qcow2 --cluster-size 4096 input.raw output.qcow2
 
 # Progress reporting
 imago convert -p 5 input.qcow2 output.raw
 ```
 
-The convert operation reads the virtual content of a QCOW2 image (including
-backing chain flattening) and writes it as a flat raw output. Compressed
-clusters (zlib/deflate) are decompressed transparently.
+The convert operation reads the virtual content of an input image (including
+backing chain flattening) and writes it in the requested output format.
+Compressed clusters (zlib/deflate) are decompressed transparently.
 
-**Limitations:** Cluster sizes above 64KB are not yet supported. Output
-format is currently limited to raw.
+Supported output formats:
+- **raw** (default) - Flat raw output
+- **qcow2** - QCOW2 v3 output with 16-bit refcounts, configurable cluster
+  size (512 bytes to 64KB, default 64KB)
+
+**Limitations:** Input cluster sizes above 64KB are not yet supported.
 
 ### Version Compatibility
 

@@ -1833,13 +1833,17 @@ struct ConvertArgs {
     /// Output image file
     output: String,
 
-    /// Output format (only "raw" supported currently)
+    /// Output format ("raw" or "qcow2")
     #[arg(short = 'O', long = "output-format", default_value = "raw")]
     output_format: String,
 
     /// Sector size for I/O (default: 65536)
     #[arg(long, default_value = "65536")]
     sector_size: u32,
+
+    /// Output cluster size for QCOW2 (default: 65536)
+    #[arg(long, default_value = "65536")]
+    cluster_size: u32,
 
     /// Skip writing zero-filled clusters to output (sparse output)
     #[arg(short = 'S', long)]
@@ -3714,20 +3718,38 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 }
 
 fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
-    // Only raw output format is supported
-    if args.output_format != "raw" {
-        return Err(format!(
-            "unsupported output format '{}' (only 'raw' is supported)",
-            args.output_format
-        )
-        .into());
-    }
+    // Parse and validate output format
+    let target_format = match args.output_format.as_str() {
+        "raw" => 0u32,   // ImageFormat::Raw
+        "qcow2" => 2u32, // ImageFormat::Qcow2
+        other => {
+            return Err(format!(
+                "unsupported output format '{}' \
+                 (supported: 'raw', 'qcow2')",
+                other
+            )
+            .into());
+        }
+    };
+    let is_qcow2_output = target_format == 2;
 
     // Validate sector size (must be power of 2, 512 to 64KB)
     if !(512..=MAX_SECTOR_SIZE).contains(&args.sector_size) || !args.sector_size.is_power_of_two() {
         return Err(format!(
             "sector size must be a power of 2, 512 to {} (got {})",
             MAX_SECTOR_SIZE, args.sector_size
+        )
+        .into());
+    }
+
+    // Validate cluster size for QCOW2 output
+    if is_qcow2_output
+        && (!(512..=65536).contains(&args.cluster_size) || !args.cluster_size.is_power_of_two())
+    {
+        return Err(format!(
+            "cluster size must be a power of 2, \
+             512 to 65536 (got {})",
+            args.cluster_size
         )
         .into());
     }
@@ -3792,23 +3814,40 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         return Err("input image has zero virtual size".into());
     }
 
-    // Open output file
+    // Open output file.
+    // For QCOW2 output the file is always sparse (the guest
+    // writes clusters on demand) and the capacity needs headroom
+    // for metadata (L1/L2 tables, refcount structures).
+    let output_capacity = if is_qcow2_output {
+        virtual_size
+            .saturating_add(virtual_size / 100)
+            .saturating_add(10 * 1024 * 1024)
+    } else {
+        virtual_size
+    };
+
     let output_backing = if args.no_create {
         BackingStore::open(Path::new(&args.output), false, None, false)?
+    } else if is_qcow2_output {
+        BackingStore::open(
+            Path::new(&args.output),
+            false,
+            Some(output_capacity),
+            true, // always sparse for QCOW2
+        )?
     } else {
         BackingStore::open(
             Path::new(&args.output),
             false,
             Some(virtual_size),
-            // sparse when skipping zeros: unwritten holes are zero-filled by the filesystem.
-            // pre-allocate when writing every cluster: no holes expected.
+            // sparse when skipping zeros
             args.skip_zeros,
         )?
     };
 
     debug!(
         "Output file: {} (capacity {} bytes)",
-        args.output, virtual_size
+        args.output, output_capacity
     );
 
     // Open KVM
@@ -3859,19 +3898,31 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     if verbose {
         convert_flags |= CONVERT_CONFIG_FLAG_VERBOSE;
     }
+    let output_cluster_bits: u32 = if is_qcow2_output {
+        args.cluster_size.trailing_zeros()
+    } else {
+        0
+    };
+
     guest_mem.write_obj(CONVERT_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
     guest_mem.write_obj(convert_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
     guest_mem.write_obj(
         input_device_count as u32,
         GuestAddress(OPERATION_CONFIG_ADDR + 8),
     )?;
+    guest_mem.write_obj(target_format, GuestAddress(OPERATION_CONFIG_ADDR + 12))?;
     guest_mem.write_obj(
-        0u32, // target_format: Raw = 0
-        GuestAddress(OPERATION_CONFIG_ADDR + 12),
+        output_cluster_bits,
+        GuestAddress(OPERATION_CONFIG_ADDR + 16),
     )?;
     debug!(
-        "Wrote convert config at 0x{:x} (flags=0x{:x}, chain={})",
-        OPERATION_CONFIG_ADDR, convert_flags, input_device_count
+        "Wrote convert config at 0x{:x} \
+         (flags=0x{:x}, chain={}, format={}, cluster_bits={})",
+        OPERATION_CONFIG_ADDR,
+        convert_flags,
+        input_device_count,
+        target_format,
+        output_cluster_bits,
     );
 
     // Write ChainConfig for input chain
@@ -3906,14 +3957,21 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         io_events.push(IoEvent::new(mmio)?);
     }
 
-    // Set up output device (writable)
+    // Set up output device (writable).
+    // For QCOW2 output, use the smaller of sector_size and
+    // cluster_size so that cluster writes align to whole sectors.
+    let output_sector_size = if is_qcow2_output {
+        core::cmp::min(args.sector_size, args.cluster_size)
+    } else {
+        args.sector_size
+    };
     let output_idx = input_device_count;
     let output_mmio = device_mmio_base(output_idx);
     let output_vq = device_vq_base(output_idx);
     let output_device = VirtioBlockDevice::new(
         output_backing,
-        virtual_size,
-        args.sector_size as u64,
+        output_capacity,
+        output_sector_size as u64,
         false, // writable
         output_mmio,
         output_vq,
@@ -3995,7 +4053,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // Queue config with input chain devices + output device
     let config = vmm_config_chain_with_output(
         args.sector_size,
-        args.sector_size,
+        output_sector_size,
         input_device_count,
         args.progress_percent,
     );
