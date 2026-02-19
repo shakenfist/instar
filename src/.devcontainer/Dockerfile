@@ -4,11 +4,13 @@ FROM mcr.microsoft.com/devcontainers/base:debian
 # Install build dependencies and test tools
 # - protobuf-compiler: required for micropb-gen
 # - python3, python3-pip, python3-venv: for running integration tests
+# - qemu-utils: provides qemu-img and qemu-io for compare/convert tests
 RUN apt-get update && apt-get install -y \
     protobuf-compiler \
     python3 \
     python3-pip \
     python3-venv \
+    qemu-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Create a shared build directory that any user can use
