@@ -1201,8 +1201,12 @@ pub struct ConvertConfig {
     /// Number of input devices in the backing chain
     pub input_device_count: u32,
 
-    /// Target output format (ImageFormat as u32, only Raw for now)
+    /// Target output format (ImageFormat as u32)
     pub target_format: u32,
+
+    /// Output cluster bits for QCOW2 output (0 = default 16 = 64KB).
+    /// Valid range: 9..=16. Ignored for non-QCOW2 output formats.
+    pub output_cluster_bits: u32,
 }
 
 impl ConvertConfig {
@@ -1221,7 +1225,8 @@ impl ConvertConfig {
             magic: Self::MAGIC,
             flags: 0,
             input_device_count: 1,
-            target_format: 0, // Raw
+            target_format: 0,       // Raw
+            output_cluster_bits: 0, // Default (16 = 64KB)
         }
     }
 
@@ -1242,6 +1247,21 @@ impl ConvertConfig {
             1
         } else {
             self.input_device_count
+        }
+    }
+
+    /// Target output format.
+    pub fn target_format(&self) -> ImageFormat {
+        ImageFormat::from_u32(self.target_format)
+    }
+
+    /// Output cluster bits for QCOW2 output.
+    /// Returns 16 (64KB) if unset or out of range.
+    pub fn output_cluster_bits(&self) -> u32 {
+        if self.output_cluster_bits >= 9 && self.output_cluster_bits <= 16 {
+            self.output_cluster_bits
+        } else {
+            16
         }
     }
 }
