@@ -1437,6 +1437,49 @@ impl Default for ChainConfig {
     }
 }
 
+// ============================================================================
+// Shared operation utilities
+// ============================================================================
+
+/// Validate the call table magic and version, printing an error and returning
+/// 0 from the calling function if validation fails.
+///
+/// Usage: `validate_call_table!(call_table, "convert");`
+#[macro_export]
+macro_rules! validate_call_table {
+    ($ct:expr, $name:literal) => {
+        if $ct.magic != CallTable::MAGIC {
+            ($ct.debug_print)(concat!($name, ": bad magic\n\0").as_ptr());
+            return 0;
+        }
+        if $ct.version != CallTable::VERSION {
+            ($ct.debug_print)(concat!($name, ": bad version\n\0").as_ptr());
+            return 0;
+        }
+    };
+}
+
+/// Verify all input devices have the same sector size.
+///
+/// Returns `Some(sector_size)` if all devices agree, or `None` if there
+/// is a mismatch. Caller is responsible for error reporting.
+///
+/// # Safety
+///
+/// Caller must ensure `call_table` points to a valid, initialized
+/// `CallTable` and that `device_count` does not exceed the number of
+/// attached input devices.
+pub unsafe fn verify_sector_sizes(call_table: &CallTable, device_count: usize) -> Option<usize> {
+    let sector_size = (call_table.get_input_sector_size)(0);
+    for dev_idx in 1..device_count {
+        let dev_ss = (call_table.get_input_sector_size)(dev_idx as u32);
+        if dev_ss != sector_size {
+            return None;
+        }
+    }
+    Some(sector_size)
+}
+
 /// Operation entry point signature.
 ///
 /// Operations must export a function with this signature at the start

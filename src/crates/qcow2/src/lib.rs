@@ -10,7 +10,8 @@
 #![no_std]
 
 use shared::{
-    BackingFormat, CallTable, ChainConfig, ImageFormat, COMPRESSED_BUF_SIZE, MAX_SECTOR_SIZE,
+    l1_cache_addr, l2_cache_addr, BackingFormat, CallTable, ChainConfig, ImageFormat,
+    COMPRESSED_BUF_SIZE, MAX_CHAIN_DEVICES, MAX_SECTOR_SIZE,
 };
 
 // ============================================================================
@@ -1350,5 +1351,47 @@ pub unsafe fn read_chain_virtual_cluster(
     }
     // All devices in chain had unallocated: fill with zeros
     core::ptr::write_bytes(buf, 0, chunk_size as usize);
+    true
+}
+
+/// Initialize QCOW2 state for each QCOW2 device in a chain.
+///
+/// Iterates over `device_count` devices, initializing a `Qcow2State` for
+/// each one whose format is QCOW2. Returns `true` on success, or `false`
+/// if any QCOW2 device fails to initialize.
+///
+/// # Safety
+///
+/// Caller must ensure `call_table` is a valid initialized `CallTable`,
+/// `chain_config` describes the attached devices, `device_count` does not
+/// exceed `MAX_CHAIN_DEVICES`, and the memory regions at
+/// `dynamic_bufs_start` are large enough for L1/L2 caches.
+pub unsafe fn init_chain_qcow2_states(
+    call_table: &CallTable,
+    chain_config: &ChainConfig,
+    qcow2_states: &mut [Option<Qcow2State>; MAX_CHAIN_DEVICES],
+    device_count: usize,
+    sector_size: usize,
+    dynamic_bufs_start: usize,
+    bytes_read: &mut u64,
+) -> bool {
+    for dev_idx in 0..device_count {
+        let dev_info = &chain_config.devices[dev_idx];
+        if matches!(dev_info.detected_format(), ImageFormat::Qcow2) {
+            let cap = (call_table.get_input_capacity)(dev_idx as u32);
+            qcow2_states[dev_idx] = Qcow2State::init(
+                call_table,
+                dev_idx as u32,
+                sector_size,
+                cap,
+                l1_cache_addr(dynamic_bufs_start, dev_idx),
+                l2_cache_addr(dynamic_bufs_start, dev_idx),
+                bytes_read,
+            );
+            if qcow2_states[dev_idx].is_none() {
+                return false;
+            }
+        }
+    }
     true
 }
