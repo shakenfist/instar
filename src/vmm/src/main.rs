@@ -3720,7 +3720,7 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Parse and validate output format
     let target_format = match args.output_format.as_str() {
-        "raw" => 0u32,   // ImageFormat::Raw
+        "raw" => 1u32,   // ImageFormat::Raw
         "qcow2" => 2u32, // ImageFormat::Qcow2
         other => {
             return Err(format!(
