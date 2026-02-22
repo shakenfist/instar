@@ -29,8 +29,8 @@ use core::panic::PanicInfo;
 
 use shared::{
     format_detection::{detect_format_from_header, detect_vhd_footer, QCOW2_MAGIC, VHD_COOKIE},
-    CallTable, ChainConfig, CheckConfig, CheckResult, ImageFormat, CALL_TABLE_ADDR,
-    MAX_SECTOR_SIZE, SCRATCH_MEM_BASE, SCRATCH_MEM_SIZE,
+    validate_call_table, CallTable, ChainConfig, CheckConfig, CheckResult, ImageFormat,
+    CALL_TABLE_ADDR, MAX_SECTOR_SIZE, SCRATCH_MEM_BASE, SCRATCH_MEM_SIZE,
 };
 
 /// Result of a bitmap_set operation.
@@ -92,15 +92,7 @@ unsafe fn bitmap_test(bitmap: *const u8, bitmap_size: usize, cluster_idx: u64) -
 pub unsafe extern "C" fn _start() -> u64 {
     let call_table = get_call_table();
 
-    // Verify call table is valid
-    if call_table.magic != CallTable::MAGIC {
-        (call_table.debug_print)(b"check: bad magic\n\0".as_ptr());
-        return 0;
-    }
-    if call_table.version != CallTable::VERSION {
-        (call_table.debug_print)(b"check: bad version\n\0".as_ptr());
-        return 0;
-    }
+    validate_call_table!(call_table, "check");
 
     (call_table.verbose_print)(b"check: start\n\0".as_ptr());
 

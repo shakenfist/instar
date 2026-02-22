@@ -14,8 +14,8 @@ use shared::{
         detect_format_from_header, detect_iso_at_offset, detect_vhd_footer, ISO_MAGIC_BYTE_OFFSET,
         VDI_SIGNATURE_OFFSET, VHD_COOKIE,
     },
-    CallTable, ImageFormat, InfoConfig, InfoResult, Qcow2Info, VdiInfo, VmdkInfo, CALL_TABLE_ADDR,
-    MAX_SECTOR_SIZE,
+    validate_call_table, CallTable, ImageFormat, InfoConfig, InfoResult, Qcow2Info, VdiInfo,
+    VmdkInfo, CALL_TABLE_ADDR, MAX_SECTOR_SIZE,
 };
 
 // Note: Magic numbers for format detection are in shared::format_detection
@@ -84,15 +84,7 @@ const LUKS_VERSION_OFFSET: usize = 6; // Version (big-endian u16)
 pub unsafe extern "C" fn _start() -> u64 {
     let call_table = get_call_table();
 
-    // Verify call table is valid (always print these errors)
-    if call_table.magic != CallTable::MAGIC {
-        (call_table.debug_print)(b"info: bad magic\n\0".as_ptr());
-        return 0;
-    }
-    if call_table.version != CallTable::VERSION {
-        (call_table.debug_print)(b"info: bad version\n\0".as_ptr());
-        return 0;
-    }
+    validate_call_table!(call_table, "info");
 
     // Get operation config (optional)
     let config_result = (call_table.get_operation_config)();

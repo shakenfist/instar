@@ -154,8 +154,11 @@ provides a modular architecture with:
   content comparison between two images, supporting raw-vs-raw, QCOW2-vs-raw,
   and QCOW2-vs-QCOW2 including compressed clusters and backing chain
   flattening)
-- **operations/convert/** - Image conversion operation (QCOW2 to raw with
-  backing chain flattening and compressed cluster decompression)
+- **operations/convert/** - Image conversion operation (any input to raw or
+  QCOW2 v3 output, with backing chain flattening and compressed cluster
+  decompression). QCOW2 writer uses linear cluster allocation with
+  OFLAG_COPIED, 16-bit refcounts, and iterative convergence for refcount
+  metadata sizing.
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities)
 
