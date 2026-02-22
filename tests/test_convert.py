@@ -360,6 +360,18 @@ class TestConvertManifestImages(ImagoTestBase):
             info.get('cluster-size'),
         )
 
+    def _timeout_for_vsize(self, vsize):
+        """Compute a per-operation timeout based on virtual size.
+
+        Returns a timeout in seconds that scales with image
+        virtual size. Uses 120s as minimum and adds 10s per
+        GiB of virtual size to accommodate CI I/O variance.
+        """
+        if not vsize:
+            return 120
+        gib = vsize / (1024 ** 3)
+        return max(120, int(120 + gib * 10))
+
     def _skip_if_unsupported(self, image_id, image_path):
         """Skip test if image has unsupported features."""
         vsize, csize = self._get_qcow2_info(image_path)
@@ -394,6 +406,9 @@ class TestConvertManifestImages(ImagoTestBase):
         self.skip_if_hash_mismatch(image)
         self._skip_if_unsupported(image_id, image.path)
 
+        vsize, _ = self._get_qcow2_info(image.path)
+        timeout = self._timeout_for_vsize(vsize)
+
         with tempfile.NamedTemporaryFile(suffix='.raw') \
                 as imago_raw, \
                 tempfile.NamedTemporaryFile(suffix='.raw') \
@@ -401,7 +416,7 @@ class TestConvertManifestImages(ImagoTestBase):
             # Convert with imago
             stdout, stderr, rc = self.run_imago_convert(
                 image.path, Path(imago_raw.name),
-                timeout=120
+                timeout=timeout
             )
             self.assertEqual(
                 rc, 0,
@@ -413,7 +428,7 @@ class TestConvertManifestImages(ImagoTestBase):
             q_stdout, q_stderr, q_rc = \
                 self.run_qemu_img_convert(
                     image.path, Path(qemu_raw.name),
-                    timeout=120
+                    timeout=timeout
                 )
             self.assertEqual(
                 q_rc, 0,
@@ -425,7 +440,7 @@ class TestConvertManifestImages(ImagoTestBase):
             cmp_out, _, cmp_rc = self.run_imago_compare(
                 Path(imago_raw.name),
                 Path(qemu_raw.name),
-                timeout=120
+                timeout=timeout
             )
             self.assertEqual(
                 cmp_rc, 0,
@@ -1124,6 +1139,9 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
         self.skip_if_hash_mismatch(image)
         self._skip_if_unsupported(image_id, image.path)
 
+        vsize, _ = self._get_qcow2_info(image.path)
+        timeout = self._timeout_for_vsize(vsize)
+
         with tempfile.NamedTemporaryFile(
                     suffix='.qcow2') as reenc, \
                 tempfile.NamedTemporaryFile(
@@ -1133,7 +1151,7 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
             # Re-encode: qcow2 -> qcow2
             stdout, stderr, rc = self.run_imago_convert(
                 image.path, Path(reenc.name),
-                output_format='qcow2', timeout=120
+                output_format='qcow2', timeout=timeout
             )
             self.assertEqual(
                 rc, 0,
@@ -1156,18 +1174,18 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
             # Convert both to raw via qemu-img
             self.run_qemu_img_convert(
                 image.path, Path(raw_orig.name),
-                timeout=120
+                timeout=timeout
             )
             self.run_qemu_img_convert(
                 Path(reenc.name), Path(raw_reenc.name),
-                timeout=120
+                timeout=timeout
             )
 
             # Compare virtual content
             cmp_out, _, cmp_rc = self.run_imago_compare(
                 Path(raw_orig.name),
                 Path(raw_reenc.name),
-                timeout=120
+                timeout=timeout
             )
             self.assertEqual(
                 cmp_rc, 0,
