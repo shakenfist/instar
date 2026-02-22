@@ -10,7 +10,8 @@
 #![no_std]
 
 use shared::{
-    BackingFormat, CallTable, ChainConfig, ImageFormat, COMPRESSED_BUF_SIZE, MAX_SECTOR_SIZE,
+    l1_cache_addr, l2_cache_addr, BackingFormat, CallTable, ChainConfig, ImageFormat,
+    COMPRESSED_BUF_SIZE, MAX_CHAIN_DEVICES, MAX_SECTOR_SIZE,
 };
 
 // ============================================================================
@@ -59,18 +60,38 @@ pub const L1_OFFSET_MASK: u64 = 0x00fffffffffffe00;
 pub const L2_OFFSET_MASK: u64 = 0x00fffffffffffe00;
 
 // ============================================================================
+// QCOW2 construction constants (for writing new images)
+// ============================================================================
+
+/// QCOW2 magic number (big-endian on disk: 0x51 0x46 0x49 0xfb)
+pub const QCOW2_MAGIC: u32 = 0x514649fb;
+/// QCOW2 version 3
+pub const QCOW2_VERSION_3: u32 = 3;
+/// V3 header length in bytes
+pub const QCOW2_HEADER_LENGTH_V3: u32 = 104;
+/// Default refcount order (4 = 16-bit refcounts)
+pub const QCOW2_DEFAULT_REFCOUNT_ORDER: u32 = 4;
+
+/// Offset of nb_snapshots field in the header
+pub const NB_SNAPSHOTS_OFFSET: usize = 60;
+/// Offset of snapshots_offset field in the header
+pub const SNAPSHOTS_OFFSET_OFFSET: usize = 64;
+/// Offset of autoclear_features field in the v3 header
+pub const AUTOCLEAR_FEATURES_OFFSET: usize = 88;
+
+// ============================================================================
 // Byte-order helpers
 // ============================================================================
 
 /// Read a big-endian u32 from a byte slice at the given offset.
 #[inline]
-fn be_u32(buf: &[u8], off: usize) -> u32 {
+pub fn be_u32(buf: &[u8], off: usize) -> u32 {
     u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
 }
 
 /// Read a big-endian u64 from a byte slice at the given offset.
 #[inline]
-fn be_u64(buf: &[u8], off: usize) -> u64 {
+pub fn be_u64(buf: &[u8], off: usize) -> u64 {
     u64::from_be_bytes([
         buf[off],
         buf[off + 1],
@@ -81,6 +102,27 @@ fn be_u64(buf: &[u8], off: usize) -> u64 {
         buf[off + 6],
         buf[off + 7],
     ])
+}
+
+/// Write a big-endian u16 to a byte slice at the given offset.
+#[inline]
+pub fn write_be_u16(buf: &mut [u8], off: usize, val: u16) {
+    let bytes = val.to_be_bytes();
+    buf[off..off + 2].copy_from_slice(&bytes);
+}
+
+/// Write a big-endian u32 to a byte slice at the given offset.
+#[inline]
+pub fn write_be_u32(buf: &mut [u8], off: usize, val: u32) {
+    let bytes = val.to_be_bytes();
+    buf[off..off + 4].copy_from_slice(&bytes);
+}
+
+/// Write a big-endian u64 to a byte slice at the given offset.
+#[inline]
+pub fn write_be_u64(buf: &mut [u8], off: usize, val: u64) {
+    let bytes = val.to_be_bytes();
+    buf[off..off + 8].copy_from_slice(&bytes);
 }
 
 // ============================================================================
@@ -1309,5 +1351,47 @@ pub unsafe fn read_chain_virtual_cluster(
     }
     // All devices in chain had unallocated: fill with zeros
     core::ptr::write_bytes(buf, 0, chunk_size as usize);
+    true
+}
+
+/// Initialize QCOW2 state for each QCOW2 device in a chain.
+///
+/// Iterates over `device_count` devices, initializing a `Qcow2State` for
+/// each one whose format is QCOW2. Returns `true` on success, or `false`
+/// if any QCOW2 device fails to initialize.
+///
+/// # Safety
+///
+/// Caller must ensure `call_table` is a valid initialized `CallTable`,
+/// `chain_config` describes the attached devices, `device_count` does not
+/// exceed `MAX_CHAIN_DEVICES`, and the memory regions at
+/// `dynamic_bufs_start` are large enough for L1/L2 caches.
+pub unsafe fn init_chain_qcow2_states(
+    call_table: &CallTable,
+    chain_config: &ChainConfig,
+    qcow2_states: &mut [Option<Qcow2State>; MAX_CHAIN_DEVICES],
+    device_count: usize,
+    sector_size: usize,
+    dynamic_bufs_start: usize,
+    bytes_read: &mut u64,
+) -> bool {
+    for dev_idx in 0..device_count {
+        let dev_info = &chain_config.devices[dev_idx];
+        if matches!(dev_info.detected_format(), ImageFormat::Qcow2) {
+            let cap = (call_table.get_input_capacity)(dev_idx as u32);
+            qcow2_states[dev_idx] = Qcow2State::init(
+                call_table,
+                dev_idx as u32,
+                sector_size,
+                cap,
+                l1_cache_addr(dynamic_bufs_start, dev_idx),
+                l2_cache_addr(dynamic_bufs_start, dev_idx),
+                bytes_read,
+            );
+            if qcow2_states[dev_idx].is_none() {
+                return false;
+            }
+        }
+    }
     true
 }

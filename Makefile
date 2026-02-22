@@ -381,9 +381,10 @@ test-rust: imago-devcontainer
 		cargo test --release
 
 # Run Python integration tests only (on host)
+# Runs all test files except malicious image tests (explicit opt-in via test-malicious)
 test-integration: imago test-venv
 	@echo "Running Python integration tests..."
-	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run test_info_safe
+	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run --exclude-regex test_info_malicious
 
 # Run tests inside the devcontainer for consistent environment
 # This ensures consistent glibc, paths, and other system dependencies
@@ -409,13 +410,14 @@ test-container: imago-devcontainer imago
 			python3 -m venv /build/test-venv && \
 			/build/test-venv/bin/pip install -q -r tests/requirements.txt && \
 			echo "Running tests..."; \
-			cd tests && /build/test-venv/bin/stestr run test_info_safe \
+			cd tests && /build/test-venv/bin/stestr run --exclude-regex test_info_malicious \
 		'
 
 # Run CI-suitable tests (safe + caution)
+# Runs all test files except malicious image tests
 test-ci: imago test-venv
 	@echo "Running CI tests (safe images)..."
-	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run "test_info_safe"
+	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run --exclude-regex test_info_malicious
 
 # Run all tests including malicious (explicit opt-in)
 test-malicious: imago test-venv

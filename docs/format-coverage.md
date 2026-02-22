@@ -48,6 +48,37 @@ All formats detected by oslo.utils are now also detected by imago.
 
 ---
 
+## Conversion Output Format Support
+
+The `imago convert` operation supports writing output in the following formats:
+
+| Output Format | Status | Key Features |
+|---------------|--------|--------------|
+| **raw** (default) | Supported | Flat byte-for-byte output, sparse output with `-S` |
+| **qcow2** | Supported | QCOW2 v3, 16-bit refcounts, configurable cluster size (512B-64KB) |
+| vmdk | Not yet | Planned: monolithicSparse with grain table writer |
+| vhd | Not yet | Planned: dynamic VHD with BAT writer |
+| vhdx | Not yet | Planned: VHDX with BAT, metadata, and log support |
+
+### Input Format Support for Conversion
+
+| Input Format | Status | Notes |
+|--------------|--------|-------|
+| raw | Supported | With MBR/GPT partition validation (unless `--unsafe-quirks`) |
+| qcow2 (v2/v3) | Supported | Including compressed clusters (zlib), backing chain flattening |
+| vmdk | Not yet | Needs grain table reader |
+| vhd/vhdx | Not yet | Needs BAT reader |
+
+### Limitations
+
+- Input cluster sizes above 64KB are not supported (affects both convert and
+  compare). The `debian-12-sfagent` image (2MB clusters) is skipped in tests.
+- ZSTD-compressed QCOW2 clusters are not supported (only zlib/deflate).
+- Extended L2 entries (subclusters) are not supported.
+- Encrypted QCOW2 images are not supported.
+
+---
+
 ## Safety Check Comparison
 
 ### QCOW2 Safety Checks

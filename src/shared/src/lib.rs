@@ -1201,8 +1201,12 @@ pub struct ConvertConfig {
     /// Number of input devices in the backing chain
     pub input_device_count: u32,
 
-    /// Target output format (ImageFormat as u32, only Raw for now)
+    /// Target output format (ImageFormat as u32)
     pub target_format: u32,
+
+    /// Output cluster bits for QCOW2 output (0 = default 16 = 64KB).
+    /// Valid range: 9..=16. Ignored for non-QCOW2 output formats.
+    pub output_cluster_bits: u32,
 }
 
 impl ConvertConfig {
@@ -1221,7 +1225,8 @@ impl ConvertConfig {
             magic: Self::MAGIC,
             flags: 0,
             input_device_count: 1,
-            target_format: 0, // Raw
+            target_format: 0,       // Raw
+            output_cluster_bits: 0, // Default (16 = 64KB)
         }
     }
 
@@ -1242,6 +1247,21 @@ impl ConvertConfig {
             1
         } else {
             self.input_device_count
+        }
+    }
+
+    /// Target output format.
+    pub fn target_format(&self) -> ImageFormat {
+        ImageFormat::from_u32(self.target_format)
+    }
+
+    /// Output cluster bits for QCOW2 output.
+    /// Returns 16 (64KB) if unset or out of range.
+    pub fn output_cluster_bits(&self) -> u32 {
+        if self.output_cluster_bits >= 9 && self.output_cluster_bits <= 16 {
+            self.output_cluster_bits
+        } else {
+            16
         }
     }
 }
@@ -1415,6 +1435,49 @@ impl Default for ChainConfig {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ============================================================================
+// Shared operation utilities
+// ============================================================================
+
+/// Validate the call table magic and version, printing an error and returning
+/// 0 from the calling function if validation fails.
+///
+/// Usage: `validate_call_table!(call_table, "convert");`
+#[macro_export]
+macro_rules! validate_call_table {
+    ($ct:expr, $name:literal) => {
+        if $ct.magic != CallTable::MAGIC {
+            ($ct.debug_print)(concat!($name, ": bad magic\n\0").as_ptr());
+            return 0;
+        }
+        if $ct.version != CallTable::VERSION {
+            ($ct.debug_print)(concat!($name, ": bad version\n\0").as_ptr());
+            return 0;
+        }
+    };
+}
+
+/// Verify all input devices have the same sector size.
+///
+/// Returns `Some(sector_size)` if all devices agree, or `None` if there
+/// is a mismatch. Caller is responsible for error reporting.
+///
+/// # Safety
+///
+/// Caller must ensure `call_table` points to a valid, initialized
+/// `CallTable` and that `device_count` does not exceed the number of
+/// attached input devices.
+pub unsafe fn verify_sector_sizes(call_table: &CallTable, device_count: usize) -> Option<usize> {
+    let sector_size = (call_table.get_input_sector_size)(0);
+    for dev_idx in 1..device_count {
+        let dev_ss = (call_table.get_input_sector_size)(dev_idx as u32);
+        if dev_ss != sector_size {
+            return None;
+        }
+    }
+    Some(sector_size)
 }
 
 /// Operation entry point signature.

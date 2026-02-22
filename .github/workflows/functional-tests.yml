@@ -235,7 +235,7 @@ jobs:
       - name: Checkout imago-testdata from GitLab
         run: |
           git clone --depth 1 \
-            http://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git \
+            https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git \
             imago-testdata
 
       - name: Resparsify test images
