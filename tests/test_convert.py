@@ -1109,6 +1109,18 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
             info.get('cluster-size'),
         )
 
+    def _timeout_for_vsize(self, vsize):
+        """Compute a per-operation timeout based on virtual size.
+
+        Returns a timeout in seconds that scales with image
+        virtual size. Uses 120s as minimum and adds 10s per
+        GiB of virtual size to accommodate CI I/O variance.
+        """
+        if not vsize:
+            return 120
+        gib = vsize / (1024 ** 3)
+        return max(120, int(120 + gib * 10))
+
     def _skip_if_unsupported(self, image_id, image_path):
         """Skip if image has unsupported features."""
         vsize, csize = self._get_qcow2_info(image_path)
