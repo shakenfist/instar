@@ -651,8 +651,8 @@ unsafe fn convert_to_qcow2(
     // incompatible_features (72) = 0
     // compatible_features (80) = 0
     // autoclear_features (88) = 0
-    qcow2::write_be_u32(hdr, 96, qcow2::QCOW2_DEFAULT_REFCOUNT_ORDER);
-    qcow2::write_be_u32(hdr, 100, qcow2::QCOW2_HEADER_LENGTH_V3);
+    qcow2::write_be_u32(hdr, 96, qcow2::QCOW2_DEFAULT_REFCOUNT_ORDER); // refcount_order
+    qcow2::write_be_u32(hdr, 100, qcow2::QCOW2_HEADER_LENGTH_V3); // header_length
 
     if !write_cluster_to_output(
         call_table,
