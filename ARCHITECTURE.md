@@ -140,8 +140,10 @@ provides a modular architecture with:
 - **core/** - Guest initialization (device init, call table)
 - **crates/qcow2/** - Shared QCOW2 format crate: header parsing, L1/L2
   cluster lookup, compressed cluster decompression (behind `decompress`
-  feature flag), refcount table reading, backing file extraction, header
-  extension parsing. Used by info, check, compare, and convert operations.
+  feature flag), cluster compression (behind `compress` feature flag
+  using raw deflate via miniz_oxide), refcount table reading, backing
+  file extraction, header extension parsing. Used by info, check,
+  compare, and convert operations.
 - **crates/raw/** - Shared RAW format crate: MBR/GPT partition table
   detection. Used by info operation.
 - **crates/vmdk/** - Shared VMDK format crate: VMDK4 binary header parsing,
@@ -158,7 +160,9 @@ provides a modular architecture with:
   QCOW2 v3 output, with backing chain flattening and compressed cluster
   decompression). QCOW2 writer uses linear cluster allocation with
   OFLAG_COPIED, 16-bit refcounts, and iterative convergence for refcount
-  metadata sizing.
+  metadata sizing. Optional compressed output (`-c` flag) packs clusters
+  at sector granularity using raw deflate (via miniz_oxide), with fallback
+  to uncompressed for incompressible data.
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities)
 

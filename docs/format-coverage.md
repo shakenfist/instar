@@ -55,7 +55,7 @@ The `imago convert` operation supports writing output in the following formats:
 | Output Format | Status | Key Features |
 |---------------|--------|--------------|
 | **raw** (default) | Supported | Flat byte-for-byte output, sparse output with `-S` |
-| **qcow2** | Supported | QCOW2 v3, 16-bit refcounts, configurable cluster size (512B-64KB) |
+| **qcow2** | Supported | QCOW2 v3, 16-bit refcounts, configurable cluster size (512B-64KB), optional zlib compression (`-c`) |
 | vmdk | Not yet | Planned: monolithicSparse with grain table writer |
 | vhd | Not yet | Planned: dynamic VHD with BAT writer |
 | vhdx | Not yet | Planned: VHDX with BAT, metadata, and log support |
