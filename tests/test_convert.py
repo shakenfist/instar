@@ -320,13 +320,15 @@ class TestConvertManifestImages(ImagoTestBase):
     For each safe standalone QCOW2 image in the manifest,
     convert to raw and cross-validate against qemu-img convert.
 
-    Images with cluster_size > 64KB are skipped (unsupported).
+    Images with cluster_size > 64KB or < 64KB are skipped
+    (unsupported — the guest binary uses 64KB sectors).
     Images whose virtual_size exceeds available temp space
     are skipped to avoid disk-full failures.
     """
 
-    # Maximum cluster size supported by the guest binary
+    # The guest binary uses 64KB sectors for I/O
     MAX_CLUSTER_SIZE = 65536
+    MIN_CLUSTER_SIZE = 65536
 
     # QCOW2 images that are safe standalone (no external backing
     # chain dependencies)
@@ -379,6 +381,11 @@ class TestConvertManifestImages(ImagoTestBase):
             self.skipTest(
                 f'{image_id}: cluster_size {csize} > '
                 f'{self.MAX_CLUSTER_SIZE} (unsupported)'
+            )
+        if csize and csize < self.MIN_CLUSTER_SIZE:
+            self.skipTest(
+                f'{image_id}: cluster_size {csize} < '
+                f'{self.MIN_CLUSTER_SIZE} (unsupported)'
             )
 
         # Need 2x virtual_size of temp space (imago + qemu-img
@@ -1468,6 +1475,7 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
     ]
 
     MAX_CLUSTER_SIZE = 65536
+    MIN_CLUSTER_SIZE = 65536
 
     def _get_qcow2_info(self, image_path):
         """Get virtual_size and cluster_size via qemu-img."""
@@ -1503,6 +1511,11 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
             self.skipTest(
                 f'{image_id}: cluster_size {csize} > '
                 f'{self.MAX_CLUSTER_SIZE}'
+            )
+        if csize and csize < self.MIN_CLUSTER_SIZE:
+            self.skipTest(
+                f'{image_id}: cluster_size {csize} < '
+                f'{self.MIN_CLUSTER_SIZE}'
             )
         if vsize:
             tmpdir = tempfile.gettempdir()
