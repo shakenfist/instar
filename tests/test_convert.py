@@ -965,6 +965,8 @@ class TestConvertToQcow2ManifestRaw(ImagoTestBase):
         'raw-qcow2-magic-wrong-offset',
     ]
 
+    _compress = False
+
     def _test_raw_to_qcow2(self, image_id):
         """Convert a raw manifest image to QCOW2."""
         image = self.get_image(image_id)
@@ -981,7 +983,9 @@ class TestConvertToQcow2ManifestRaw(ImagoTestBase):
             # Convert raw -> qcow2
             stdout, stderr, rc = self.run_imago_convert(
                 image.path, Path(qcow2.name),
-                output_format='qcow2', timeout=120
+                output_format='qcow2',
+                compress=self._compress,
+                timeout=120
             )
             self.assertEqual(
                 rc, 0,
@@ -1070,6 +1074,375 @@ class TestConvertToQcow2ManifestRaw(ImagoTestBase):
         )
 
 
+class TestConvertCompressedOutput(ImagoTestBase):
+    """Test compressed QCOW2 output (-c flag)."""
+
+    def test_compress_raw_to_qcow2(self):
+        """Convert raw with data to compressed QCOW2."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.qcow2') as qcow2:
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw.name, '1M'],
+                capture_output=True
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'raw', '-c',
+                 'write -P 0x42 0 65536', raw.name],
+                capture_output=True
+            )
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(raw.name), Path(qcow2.name),
+                output_format='qcow2', compress=True
+            )
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+
+            # Validate with qemu-img check
+            result = subprocess.run(
+                ['qemu-img', 'check', qcow2.name],
+                capture_output=True, text=True
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img check failed: {result.stderr}'
+            )
+
+    def test_compress_round_trip(self):
+        """Round-trip: raw -> compressed qcow2 -> raw."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as src, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.qcow2') as mid, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.raw') as dst:
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 src.name, '1M'],
+                capture_output=True
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'raw', '-c',
+                 'write -P 0x42 0 4096', src.name],
+                capture_output=True
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'raw', '-c',
+                 'write -P 0xAB 524288 8192', src.name],
+                capture_output=True
+            )
+
+            # raw -> compressed qcow2
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(src.name), Path(mid.name),
+                output_format='qcow2', compress=True
+            )
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+
+            # compressed qcow2 -> raw
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(mid.name), Path(dst.name)
+            )
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+
+            # Compare with original
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(src.name), Path(dst.name)
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Round-trip differs: {cmp_out}'
+            )
+
+    def test_compress_output_smaller(self):
+        """Compressed QCOW2 is smaller than uncompressed."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.qcow2') as uncomp, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.qcow2') as comp:
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw.name, '1M'],
+                capture_output=True
+            )
+            # Write compressible pattern (repeated bytes)
+            subprocess.run(
+                ['qemu-io', '-f', 'raw', '-c',
+                 'write -P 0x42 0 1048576', raw.name],
+                capture_output=True
+            )
+
+            # Uncompressed qcow2
+            self.run_imago_convert(
+                Path(raw.name), Path(uncomp.name),
+                output_format='qcow2'
+            )
+            # Compressed qcow2
+            self.run_imago_convert(
+                Path(raw.name), Path(comp.name),
+                output_format='qcow2', compress=True
+            )
+
+            uncomp_size = os.path.getsize(uncomp.name)
+            comp_size = os.path.getsize(comp.name)
+            self.assertLess(
+                comp_size, uncomp_size,
+                f'Compressed ({comp_size}) not smaller '
+                f'than uncompressed ({uncomp_size})'
+            )
+
+    def test_compress_qcow2_to_compressed_qcow2(self):
+        """Re-encode QCOW2 input as compressed QCOW2."""
+        with tempfile.NamedTemporaryFile(
+                    suffix='.qcow2') as src, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.qcow2') as comp, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.raw') as r1, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.raw') as r2:
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 src.name, '1M'],
+                capture_output=True
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'qcow2', '-c',
+                 'write -P 0x42 0 4096', src.name],
+                capture_output=True
+            )
+
+            # Re-encode with compression
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(src.name), Path(comp.name),
+                output_format='qcow2', compress=True
+            )
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+
+            # Validate
+            result = subprocess.run(
+                ['qemu-img', 'check', comp.name],
+                capture_output=True, text=True
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img check failed: {result.stderr}'
+            )
+
+            # Compare virtual content via raw
+            self.run_imago_convert(
+                Path(src.name), Path(r1.name)
+            )
+            self.run_imago_convert(
+                Path(comp.name), Path(r2.name)
+            )
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(r1.name), Path(r2.name)
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Re-encoded differs: {cmp_out}'
+            )
+
+    def test_compress_with_backing_chain(self):
+        """Flatten backing chain to compressed QCOW2."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir) / 'base.raw'
+            overlay = Path(tmpdir) / 'overlay.qcow2'
+            output = Path(tmpdir) / 'output.qcow2'
+            raw1 = Path(tmpdir) / 'raw1.raw'
+            raw2 = Path(tmpdir) / 'raw2.raw'
+
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 str(base), '1M'],
+                capture_output=True
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'raw', '-c',
+                 'write -P 0xBB 0 4096', str(base)],
+                capture_output=True
+            )
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-b', str(base), '-F', 'raw',
+                 str(overlay)],
+                capture_output=True
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'qcow2', '-c',
+                 'write -P 0xAA 65536 4096',
+                 str(overlay)],
+                capture_output=True
+            )
+
+            # Flatten to compressed QCOW2
+            stdout, stderr, rc = self.run_imago_convert(
+                overlay, output,
+                output_format='qcow2', compress=True
+            )
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+
+            # Validate
+            result = subprocess.run(
+                ['qemu-img', 'check', str(output)],
+                capture_output=True, text=True
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img check failed: {result.stderr}'
+            )
+
+            # No backing file reference
+            result = subprocess.run(
+                ['qemu-img', 'info', '--output=json',
+                 str(output)],
+                capture_output=True, text=True
+            )
+            info = json.loads(result.stdout)
+            self.assertNotIn('backing-filename', info)
+
+            # Compare virtual content
+            self.run_imago_convert(overlay, raw1)
+            self.run_imago_convert(output, raw2)
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                raw1, raw2
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Flattened differs: {cmp_out}'
+            )
+
+    def test_compress_incompressible_data(self):
+        """Compress random (incompressible) data."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.qcow2') as qcow2, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.raw') as roundtrip:
+            # Create raw with random data
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw.name, '1M'],
+                capture_output=True
+            )
+            # Write random data via dd from /dev/urandom
+            subprocess.run(
+                ['dd', 'if=/dev/urandom',
+                 f'of={raw.name}',
+                 'bs=65536', 'count=16',
+                 'conv=notrunc'],
+                capture_output=True
+            )
+
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(raw.name), Path(qcow2.name),
+                output_format='qcow2', compress=True
+            )
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+
+            # Must still be valid
+            result = subprocess.run(
+                ['qemu-img', 'check', qcow2.name],
+                capture_output=True, text=True
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img check failed: {result.stderr}'
+            )
+
+            # Round-trip must preserve data
+            self.run_imago_convert(
+                Path(qcow2.name), Path(roundtrip.name)
+            )
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(raw.name), Path(roundtrip.name)
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Round-trip differs: {cmp_out}'
+            )
+
+    def test_compress_empty_image(self):
+        """Compress an all-zero image."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.qcow2') as qcow2:
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw.name, '1M'],
+                capture_output=True
+            )
+
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(raw.name), Path(qcow2.name),
+                output_format='qcow2', compress=True
+            )
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+
+            result = subprocess.run(
+                ['qemu-img', 'check', qcow2.name],
+                capture_output=True, text=True
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img check failed: {result.stderr}'
+            )
+
+    def test_compress_cross_validate_with_qemu(self):
+        """Cross-validate imago compressed output with qemu."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as src, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.qcow2') as mid, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.raw') as imago_raw, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.raw') as qemu_raw:
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 src.name, '1M'],
+                capture_output=True
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'raw', '-c',
+                 'write -P 0x42 0 65536', src.name],
+                capture_output=True
+            )
+
+            # imago raw -> compressed qcow2
+            self.run_imago_convert(
+                Path(src.name), Path(mid.name),
+                output_format='qcow2', compress=True
+            )
+            # imago compressed qcow2 -> raw
+            self.run_imago_convert(
+                Path(mid.name), Path(imago_raw.name)
+            )
+            # qemu-img compressed qcow2 -> raw
+            self.run_qemu_img_convert(
+                Path(mid.name), Path(qemu_raw.name)
+            )
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(imago_raw.name), Path(qemu_raw.name)
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'qemu-img read differs: {cmp_out}'
+            )
+
+
+class TestConvertCompressedManifestRaw(
+    TestConvertToQcow2ManifestRaw
+):
+    """Convert manifest raw images to compressed QCOW2.
+
+    Inherits all test cases from TestConvertToQcow2ManifestRaw
+    but runs them with compression enabled.
+    """
+
+    _compress = True
+
+
 class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
     """Re-encode manifest QCOW2 images to fresh QCOW2.
 
@@ -1078,6 +1451,8 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
     round-trip both through raw to verify identical virtual
     content.
     """
+
+    _compress = False
 
     STANDALONE_QCOW2_IDS = [
         'cirros-qcow2',
@@ -1163,7 +1538,9 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
             # Re-encode: qcow2 -> qcow2
             stdout, stderr, rc = self.run_imago_convert(
                 image.path, Path(reenc.name),
-                output_format='qcow2', timeout=timeout
+                output_format='qcow2',
+                compress=self._compress,
+                timeout=timeout
             )
             self.assertEqual(
                 rc, 0,
@@ -1252,3 +1629,15 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
         self._test_reencode_qcow2(
             'aurel32-debian-wheezy-powerpc'
         )
+
+
+class TestConvertCompressedManifestQcow2(
+    TestConvertToQcow2ManifestQcow2
+):
+    """Re-encode manifest QCOW2 images to compressed QCOW2.
+
+    Inherits all test cases from TestConvertToQcow2ManifestQcow2
+    but runs them with compression enabled.
+    """
+
+    _compress = True

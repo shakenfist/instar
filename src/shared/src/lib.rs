@@ -1216,6 +1216,9 @@ impl ConvertConfig {
     /// Flag: Skip writing zero-filled clusters to output
     pub const FLAG_SKIP_ZEROS: u32 = 1 << 0;
 
+    /// Flag: Compress data clusters in QCOW2 output
+    pub const FLAG_COMPRESS: u32 = 1 << 1;
+
     /// Flag: Verbose logging
     pub const FLAG_VERBOSE: u32 = 1 << 31;
 
@@ -1238,6 +1241,11 @@ impl ConvertConfig {
     /// Check if skip-zeros is enabled
     pub fn should_skip_zeros(&self) -> bool {
         (self.flags & Self::FLAG_SKIP_ZEROS) != 0
+    }
+
+    /// Check if compression is enabled
+    pub fn should_compress(&self) -> bool {
+        (self.flags & Self::FLAG_COMPRESS) != 0
     }
 
     /// Number of input devices in the backing chain.
