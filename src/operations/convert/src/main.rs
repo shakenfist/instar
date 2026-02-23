@@ -647,7 +647,7 @@ unsafe fn write_qcow2_metadata(
     }
 
     // Write refcount table
-    write_refcount_table(
+    if !write_refcount_table(
         call_table,
         cs,
         reftable_offset,
@@ -656,7 +656,10 @@ unsafe fn write_qcow2_metadata(
         refblock_count,
         oss,
         oc,
-    );
+    ) {
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return false;
+    }
 
     // Write header
     if !write_qcow2_header(
@@ -896,7 +899,7 @@ unsafe fn write_refcount_table(
     refblock_count: u64,
     output_sector_size: usize,
     output_capacity: u64,
-) {
+) -> bool {
     let buf_rc = BUF_REFCOUNT as *mut u8;
     for rt_cluster in 0..reftable_clusters {
         core::ptr::write_bytes(buf_rc, 0, cluster_size as usize);
@@ -915,15 +918,18 @@ unsafe fn write_refcount_table(
         }
 
         let rt_off = reftable_offset + rt_cluster * cluster_size;
-        write_cluster_to_output(
+        if !write_cluster_to_output(
             call_table,
             buf_rc,
             rt_off,
             cluster_size,
             output_sector_size,
             output_capacity,
-        );
+        ) {
+            return false;
+        }
     }
+    true
 }
 
 // ================================================================
