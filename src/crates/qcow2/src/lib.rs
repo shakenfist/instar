@@ -126,6 +126,102 @@ pub fn write_be_u64(buf: &mut [u8], off: usize, val: u64) {
 }
 
 // ============================================================================
+// Compression support (writing compressed QCOW2 clusters)
+// ============================================================================
+
+/// Encode a compressed L2 entry for a compressed cluster.
+///
+/// The entry encodes the byte offset and the number of 512-byte
+/// sectors occupied by the compressed data, using the QCOW2
+/// compressed cluster format:
+///   - Bit 62: OFLAG_COMPRESSED
+///   - Bits (62-(cluster_bits-8)) to 61: nb_sectors - 1
+///   - Bits 0 to (62-(cluster_bits-8)-1): host byte offset
+pub fn encode_compressed_l2_entry(
+    host_offset: u64,
+    compressed_bytes: u64,
+    cluster_bits: u32,
+) -> u64 {
+    let csize_shift = 62 - (cluster_bits as u64 - 8);
+    let offset_mask = (1u64 << csize_shift) - 1;
+    let nb_sectors = (compressed_bytes + 511) / 512;
+    OFLAG_COMPRESSED | ((nb_sectors - 1) << csize_shift) | (host_offset & offset_mask)
+}
+
+/// Size in bytes of the compressor state (CompressorOxide).
+///
+/// Callers must provide at least this many bytes of scratch memory
+/// to [`compress_cluster_zlib`]. The compressor is too large for the
+/// guest stack (~200KB), so it must be placed in scratch memory.
+#[cfg(feature = "compress")]
+pub const COMPRESSOR_STATE_SIZE: usize = {
+    // CompressorOxide contains large hash tables and buffers.
+    // We compute the size at compile time.
+    core::mem::size_of::<miniz_oxide::deflate::core::CompressorOxide>()
+};
+
+/// Compress a cluster using zlib (deflate with zlib header).
+///
+/// Compresses `input_len` bytes from `input` into `output`, which
+/// must have capacity for at least `output_capacity` bytes.
+///
+/// `compressor_mem` must point to at least [`COMPRESSOR_STATE_SIZE`]
+/// bytes of writable memory (scratch memory, NOT the stack).
+///
+/// Returns the number of compressed bytes produced, or 0 on failure
+/// or if the compressed output would not be smaller than the input.
+///
+/// # Safety
+///
+/// `input` must point to at least `input_len` readable bytes.
+/// `output` must point to at least `output_capacity` writable bytes.
+/// `compressor_mem` must point to at least `COMPRESSOR_STATE_SIZE`
+/// writable bytes aligned to 8.
+#[cfg(feature = "compress")]
+pub unsafe fn compress_cluster_zlib(
+    compressor_mem: *mut u8,
+    input: *const u8,
+    input_len: usize,
+    output: *mut u8,
+    output_capacity: usize,
+) -> usize {
+    use miniz_oxide::deflate::core::{
+        compress, create_comp_flags_from_zip_params, CompressorOxide, TDEFLFlush, TDEFLStatus,
+    };
+
+    let in_slice = core::slice::from_raw_parts(input, input_len);
+    let out_slice = core::slice::from_raw_parts_mut(output, output_capacity);
+
+    // Compression level 6 (default, same as qemu-img), raw deflate.
+    // QCOW2 compression type 0 ("zlib") is actually raw deflate
+    // without a zlib wrapper header. qemu uses inflateInit2(-12)
+    // for decompression, so we must NOT write the zlib header.
+    // window_bits <= 0 omits the header.
+    let flags = create_comp_flags_from_zip_params(6, -15, 0);
+
+    // Initialize CompressorOxide at the provided scratch address.
+    // This avoids placing it on the stack (it's ~200KB, guest
+    // stack is only 64KB). With LTO the compiler should construct
+    // directly at the target address via return-value optimization.
+    let compressor = compressor_mem as *mut CompressorOxide;
+    core::ptr::write(compressor, CompressorOxide::new(flags));
+
+    let (status, _in_consumed, out_produced) =
+        compress(&mut *compressor, in_slice, out_slice, TDEFLFlush::Finish);
+
+    if status != TDEFLStatus::Done {
+        return 0;
+    }
+
+    // Don't use compressed form if it's not smaller
+    if out_produced >= input_len {
+        return 0;
+    }
+
+    out_produced
+}
+
+// ============================================================================
 // Parsed QCOW2 Header
 // ============================================================================
 

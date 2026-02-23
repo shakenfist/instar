@@ -101,6 +101,7 @@ const COMPARE_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
 // ConvertConfig constants (must match shared crate)
 const CONVERT_CONFIG_MAGIC: u32 = 0x434F4E56; // "CONV"
 const CONVERT_CONFIG_FLAG_SKIP_ZEROS: u32 = 1 << 0;
+const CONVERT_CONFIG_FLAG_COMPRESS: u32 = 1 << 1;
 #[allow(dead_code)]
 const CONVERT_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
 
@@ -1844,6 +1845,10 @@ struct ConvertArgs {
     /// Output cluster size for QCOW2 (default: 65536)
     #[arg(long, default_value = "65536")]
     cluster_size: u32,
+
+    /// Compress data clusters in QCOW2 output (requires -O qcow2)
+    #[arg(short = 'c', long)]
+    compress: bool,
 
     /// Skip writing zero-filled clusters to output (sparse output)
     #[arg(short = 'S', long)]
@@ -3754,6 +3759,13 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         .into());
     }
 
+    // Validate -c requires -O qcow2
+    if args.compress && !is_qcow2_output {
+        return Err("compression (-c) is only supported \
+             with QCOW2 output (-O qcow2)"
+            .into());
+    }
+
     // Auto-discover binaries
     let core_path = get_binary_path("core.bin");
     let operation_path = get_binary_path("convert.bin");
@@ -3895,6 +3907,9 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     if args.skip_zeros {
         convert_flags |= CONVERT_CONFIG_FLAG_SKIP_ZEROS;
     }
+    if args.compress {
+        convert_flags |= CONVERT_CONFIG_FLAG_COMPRESS;
+    }
     if verbose {
         convert_flags |= CONVERT_CONFIG_FLAG_VERBOSE;
     }
@@ -3958,9 +3973,14 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     }
 
     // Set up output device (writable).
-    // For QCOW2 output, use the smaller of sector_size and
-    // cluster_size so that cluster writes align to whole sectors.
-    let output_sector_size = if is_qcow2_output {
+    // For compressed QCOW2 output, use 512-byte sectors so
+    // compressed clusters can be packed at sector granularity.
+    // For uncompressed QCOW2, use the smaller of sector_size
+    // and cluster_size so that cluster writes align to whole
+    // sectors.
+    let output_sector_size = if is_qcow2_output && args.compress {
+        512
+    } else if is_qcow2_output {
         core::cmp::min(args.sector_size, args.cluster_size)
     } else {
         args.sector_size

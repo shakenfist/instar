@@ -123,6 +123,31 @@ parses the file using the specified format's parser directly.
 imago info --format=qcow2 image.qcow2
 ```
 
+### Convert Options
+
+| Flag | Description |
+|------|-------------|
+| `-O FORMAT` / `--output-format=FORMAT` | Output format (raw, qcow2) |
+| `-c` / `--compress` | Enable zlib compression for QCOW2 output |
+| `-S` / `--sparse` | Skip writing zero-filled clusters (raw output) |
+| `--cluster-size=N` | Output cluster size for QCOW2 (512 to 65536, default 65536) |
+| `-p N` / `--progress=N` | Report progress every N seconds |
+
+#### `-c` / `--compress`
+
+Enables zlib (raw deflate) compression for QCOW2 output, equivalent to
+`qemu-img convert -c`. Each non-zero data cluster is compressed and packed
+at sector-aligned (512-byte) positions. Clusters that don't compress smaller
+than the cluster size are written uncompressed as a fallback.
+
+```bash
+# Compressed QCOW2 output
+imago convert -c -O qcow2 input.raw output.qcow2
+
+# Requires -O qcow2 (compression only applies to QCOW2 output)
+imago convert -c input.raw output.raw  # Error: -c requires -O qcow2
+```
+
 ### Compare Options
 
 | Flag | Description |

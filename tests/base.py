@@ -500,6 +500,7 @@ class ImagoTestBase(testtools.TestCase):
         output_format: str = 'raw',
         skip_zeros: bool = False,
         cluster_size: int = None,
+        compress: bool = False,
     ) -> tuple:
         """
         Run imago convert on an image.
@@ -511,6 +512,7 @@ class ImagoTestBase(testtools.TestCase):
             output_format: Output format (default: raw)
             skip_zeros: Skip writing zero-filled clusters
             cluster_size: Output cluster size (qcow2 only)
+            compress: Compress data clusters (qcow2 only)
 
         Returns:
             tuple: (stdout, stderr, return_code)
@@ -525,6 +527,8 @@ class ImagoTestBase(testtools.TestCase):
             cmd.append('--skip-zeros')
         if cluster_size is not None:
             cmd.extend(['--cluster-size', str(cluster_size)])
+        if compress:
+            cmd.append('--compress')
         cmd.extend([str(input_path), str(output_path)])
 
         try:
@@ -545,6 +549,7 @@ class ImagoTestBase(testtools.TestCase):
         timeout: int = 60,
         output_format: str = 'raw',
         input_format: str = None,
+        compress: bool = False,
     ) -> tuple:
         """
         Run qemu-img convert on an image.
@@ -555,11 +560,14 @@ class ImagoTestBase(testtools.TestCase):
             timeout: Timeout in seconds
             output_format: Output format (default: raw)
             input_format: Input format (default: auto-detect)
+            compress: Compress data clusters (-c flag)
 
         Returns:
             tuple: (stdout, stderr, return_code)
         """
         cmd = ['qemu-img', 'convert']
+        if compress:
+            cmd.append('-c')
         if input_format:
             cmd.extend(['-f', input_format])
         cmd.extend([
