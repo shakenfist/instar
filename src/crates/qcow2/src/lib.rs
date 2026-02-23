@@ -51,6 +51,28 @@ pub const INCOMPAT_EXTENDED_L2: u64 = 1 << 4;
 // Compatible feature bits
 pub const COMPAT_LAZY_REFCOUNTS: u64 = 1 << 0;
 
+/// Bitmask of incompatible features that this implementation supports.
+///
+/// Operations should reject images with unsupported incompatible features
+/// (per the QCOW2 spec, unknown incompatible bits MUST cause rejection).
+///
+/// - Bit 0 (dirty): handled (informational, data still readable)
+/// - Bit 1 (corrupt): handled (informational, data still readable)
+/// - Bit 2 (external_data): NOT supported (data in separate file)
+/// - Bit 3 (compression): conditionally supported (see below)
+/// - Bit 4 (extended_l2): NOT supported yet
+///
+/// When the `decompress-zstd` feature is enabled, bit 3 is included
+/// because ZSTD decompression is available. Otherwise only zlib
+/// (compression_type=0) works, and bit 3 is not needed since zlib
+/// images don't set it.
+#[cfg(not(feature = "decompress-zstd"))]
+pub const SUPPORTED_INCOMPAT_FEATURES: u64 = INCOMPAT_DIRTY | INCOMPAT_CORRUPT;
+
+#[cfg(feature = "decompress-zstd")]
+pub const SUPPORTED_INCOMPAT_FEATURES: u64 =
+    INCOMPAT_DIRTY | INCOMPAT_CORRUPT | INCOMPAT_COMPRESSION;
+
 // L1/L2 entry masks and flags
 /// Bit 62 set indicates a compressed cluster in an L2 entry
 pub const OFLAG_COMPRESSED: u64 = 1 << 62;
@@ -633,6 +655,12 @@ pub struct Qcow2State {
     pub cluster_bits: u32,
     pub l1_size: u32,
     pub l1_table_offset: u64,
+    /// Raw incompatible_features from the v3 header (0 for v2).
+    pub incompatible_features: u64,
+    /// Compression type from the v3 header (0=zlib, 1=zstd).
+    pub compression_type: u8,
+    /// True when INCOMPAT_EXTENDED_L2 (bit 4) is set.
+    pub extended_l2: bool,
     // Sector cache tracking for L1 table reads
     pub l1_cached_sector: u64,
     pub l1_cache_buf: *mut u8,
@@ -642,11 +670,18 @@ pub struct Qcow2State {
 }
 
 impl Qcow2State {
+    /// Return the bitmask of incompatible features that are set but
+    /// not in `supported_mask`. Returns 0 if all set features are
+    /// supported.
+    pub fn unsupported_incompat_features(&self, supported_mask: u64) -> u64 {
+        self.incompatible_features & !supported_mask
+    }
+
     /// Initialize QCOW2 state by reading the header from a device.
     ///
-    /// Reads version, cluster_bits, L1 table size/offset from the device
-    /// header and validates them. Returns `None` if the header is invalid
-    /// or I/O fails.
+    /// Reads version, cluster_bits, L1 table size/offset, and v3
+    /// feature fields from the device header and validates them.
+    /// Returns `None` if the header is invalid or I/O fails.
     ///
     /// Rejects clusters larger than `MAX_SECTOR_SIZE` (64 KiB) since the
     /// fixed-size comparison and decompression buffers cannot handle them.
@@ -670,6 +705,9 @@ impl Qcow2State {
             cluster_bits: 0,
             l1_size: 0,
             l1_table_offset: 0,
+            incompatible_features: 0,
+            compression_type: 0,
+            extended_l2: false,
             l1_cached_sector: u64::MAX,
             l1_cache_buf,
             l2_cached_sector: u64::MAX,
@@ -724,6 +762,38 @@ impl Qcow2State {
             state.l1_cache_buf,
             bytes_read,
         )?;
+
+        // Read v3 feature fields (incompatible_features at offset 72,
+        // compression_type at offset 104). For v2, these default to 0.
+        if version >= 3 {
+            state.incompatible_features = read_u64_be_cached(
+                call_table,
+                device_idx,
+                INCOMPATIBLE_FEATURES_OFFSET as u64,
+                sector_size,
+                input_capacity,
+                &mut state.l1_cached_sector,
+                state.l1_cache_buf,
+                bytes_read,
+            )?;
+            state.extended_l2 = (state.incompatible_features & INCOMPAT_EXTENDED_L2) != 0;
+
+            // compression_type is a single byte at offset 104.
+            // Read the containing u32 at offset 104 and take the
+            // high byte (big-endian: byte at offset 104 is bits
+            // 31-24 of the u32 at 104).
+            let ct_word = read_u32_be_cached(
+                call_table,
+                device_idx,
+                COMPRESSION_TYPE_OFFSET as u64,
+                sector_size,
+                input_capacity,
+                &mut state.l1_cached_sector,
+                state.l1_cache_buf,
+                bytes_read,
+            )?;
+            state.compression_type = (ct_word >> 24) as u8;
+        }
 
         // Read L1 table size
         let l1_size = read_u32_be_cached(

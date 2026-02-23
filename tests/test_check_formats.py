@@ -1,6 +1,9 @@
 """Tests for check operation format detection and validation."""
 
 import json
+import struct
+import subprocess
+import tempfile
 from pathlib import Path
 
 from base import ImagoTestBase
@@ -339,3 +342,122 @@ class TestCheckUnsafeQuirksMode(ImagoTestBase):
             errors, 0,
             'With --unsafe-quirks, no errors should be reported'
         )
+
+
+class TestIncompatibleFeatureBits(ImagoTestBase):
+    """Test that operations reject QCOW2 images with unsupported
+    incompatible feature bits.
+
+    Per the QCOW2 spec, unknown or unsupported incompatible feature
+    bits MUST cause the reader to refuse to open the image. The info
+    operation is exempt (it should always report what it can).
+    """
+
+    def _create_patched_qcow2(self, incompat_bits):
+        """Create a v3 QCOW2 and patch incompatible_features.
+
+        Returns a NamedTemporaryFile (caller must manage lifetime).
+        The incompatible_features field is at offset 72, 8 bytes
+        big-endian.
+        """
+        f = tempfile.NamedTemporaryFile(suffix='.qcow2')
+        subprocess.run(
+            ['qemu-img', 'create', '-f', 'qcow2',
+             '-o', 'compat=1.1', f.name, '1M'],
+            capture_output=True, check=True
+        )
+        # Patch the incompatible_features field (offset 72, 8 bytes BE)
+        with open(f.name, 'r+b') as fh:
+            fh.seek(72)
+            fh.write(struct.pack('>Q', incompat_bits))
+        return f
+
+    def test_check_rejects_unknown_feature_bit(self):
+        """Check should reject images with unknown feature bit 5."""
+        with self._create_patched_qcow2(1 << 5) as img:
+            stdout, stderr, rc = self.run_imago_check(
+                Path(img.name), output_format='json'
+            )
+            self.assertNotEqual(
+                rc, 0,
+                'check should reject unknown feature bit 5'
+            )
+            result = json.loads(stdout)
+            self.assertGreater(result.get('corruptions', 0), 0)
+
+    def test_check_rejects_external_data_bit(self):
+        """Check should reject images with external data (bit 2)."""
+        with self._create_patched_qcow2(1 << 2) as img:
+            stdout, stderr, rc = self.run_imago_check(
+                Path(img.name), output_format='json'
+            )
+            self.assertNotEqual(
+                rc, 0,
+                'check should reject external data bit'
+            )
+
+    def test_check_rejects_extended_l2_bit(self):
+        """Check should reject images with extended L2 (bit 4).
+
+        This test will need updating once extended L2 support is added.
+        """
+        with self._create_patched_qcow2(1 << 4) as img:
+            stdout, stderr, rc = self.run_imago_check(
+                Path(img.name), output_format='json'
+            )
+            self.assertNotEqual(
+                rc, 0,
+                'check should reject extended L2 bit'
+            )
+
+    def test_check_allows_dirty_bit(self):
+        """Check should accept images with only the dirty bit set."""
+        with self._create_patched_qcow2(1 << 0) as img:
+            stdout, stderr, rc = self.run_imago_check(
+                Path(img.name), output_format='json'
+            )
+            result = json.loads(stdout)
+            self.assertTrue(
+                result.get('dirty', False),
+                'dirty flag should be reported'
+            )
+
+    def test_info_accepts_unknown_feature_bit(self):
+        """Info should still work on images with unknown bits."""
+        with self._create_patched_qcow2(1 << 5) as img:
+            stdout, stderr, rc = self.run_imago_info(
+                Path(img.name), output_format='json'
+            )
+            self.assertEqual(
+                rc, 0,
+                f'info should accept any image: {stderr}'
+            )
+
+    def test_compare_rejects_unknown_feature_bit(self):
+        """Compare should reject images with unknown feature bits."""
+        with self._create_patched_qcow2(1 << 5) as img, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as raw:
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw.name, '1M'],
+                capture_output=True, check=True
+            )
+            stdout, stderr, rc = self.run_imago_compare(
+                Path(img.name), Path(raw.name)
+            )
+            self.assertNotEqual(
+                rc, 0,
+                'compare should reject unknown feature bits'
+            )
+
+    def test_convert_rejects_unknown_feature_bit(self):
+        """Convert should reject images with unknown feature bits."""
+        with self._create_patched_qcow2(1 << 5) as img, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as raw:
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(img.name), Path(raw.name)
+            )
+            self.assertNotEqual(
+                rc, 0,
+                'convert should reject unknown feature bits'
+            )

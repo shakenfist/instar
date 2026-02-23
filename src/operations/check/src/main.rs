@@ -624,6 +624,18 @@ unsafe fn check_qcow2(
             result.total_errors += 1;
             (call_table.debug_print)(b"check: corrupt bit set\n\0".as_ptr());
         }
+
+        // Reject images with unsupported incompatible features.
+        // Per the QCOW2 spec, unknown incompatible bits MUST cause
+        // the reader to refuse to open the image.
+        let unsupported = hdr.incompatible_features & !qcow2::SUPPORTED_INCOMPAT_FEATURES;
+        if unsupported != 0 {
+            result.corruptions += 1;
+            result.total_errors += 1;
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+            (call_table.debug_print)(b"check: unsupported incompatible features\n\0".as_ptr());
+            return bytes_read;
+        }
     }
 
     // Validate L1 table offset

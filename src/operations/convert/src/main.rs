@@ -177,6 +177,16 @@ pub unsafe extern "C" fn _start() -> u64 {
         return bytes_read;
     }
 
+    // Reject QCOW2 images with unsupported incompatible features
+    for state in qcow2_states.iter().flatten() {
+        let unsupported = state.unsupported_incompat_features(qcow2::SUPPORTED_INCOMPAT_FEATURES);
+        if unsupported != 0 {
+            (call_table.debug_print)(b"convert: unsupported incompatible features\n\0".as_ptr());
+            (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
+            return bytes_read;
+        }
+    }
+
     // Dispatch based on target format
     let target = config.target_format();
     match target {

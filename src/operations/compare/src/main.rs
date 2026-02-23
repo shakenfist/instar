@@ -188,6 +188,18 @@ pub unsafe extern "C" fn _start() -> u64 {
         return bytes_read;
     }
 
+    // Reject QCOW2 images with unsupported incompatible features
+    for state in qcow2_states.iter().flatten() {
+        let unsupported = state.unsupported_incompat_features(qcow2::SUPPORTED_INCOMPAT_FEATURES);
+        if unsupported != 0 {
+            (call_table.debug_print)(b"compare: unsupported incompatible features\n\0".as_ptr());
+            let result = CompareResult::new();
+            (call_table.send_compare_result)(&result);
+            (call_table.send_complete)(b"compare\0".as_ptr(), bytes_read, false);
+            return bytes_read;
+        }
+    }
+
     (call_table.verbose_print)(b"compare: initialized device states\n\0".as_ptr());
 
     // Initialize result
