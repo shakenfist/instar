@@ -1003,6 +1003,31 @@ pub unsafe fn read_cluster_sectors(
 /// `compressed_buf`. Returns the (pointer, length) of the compressed
 /// data within the buffer, or `None` on any error.
 ///
+/// Parse a compressed L2 entry and return the host byte offset and
+/// compressed byte size without performing any I/O.
+///
+/// Returns `Some((host_offset, compressed_bytes))` on success, or
+/// `None` if the entry fields are inconsistent.
+pub fn parse_compressed_l2_entry(l2_entry: u64, cluster_bits: u32) -> Option<(u64, u64)> {
+    let csize_shift = 62 - (cluster_bits as u64 - 8);
+    let csize_mask = (1u64 << (cluster_bits as u64 - 8)) - 1;
+    let offset_mask = (1u64 << csize_shift) - 1;
+
+    let compressed_offset = l2_entry & offset_mask;
+    let nb_sectors = ((l2_entry >> csize_shift) & csize_mask) + 1;
+    let nb_sectors_bytes = nb_sectors.checked_mul(512)?;
+    let offset_remainder = compressed_offset & 511;
+    if nb_sectors_bytes < offset_remainder {
+        return None;
+    }
+    let compressed_size = nb_sectors_bytes - offset_remainder;
+    if compressed_size == 0 {
+        return None;
+    }
+
+    Some((compressed_offset, compressed_size))
+}
+
 /// This is the common prefix shared by both zlib and ZSTD decompression
 /// paths: L2 entry parsing, bounds validation, and sector-by-sector I/O.
 ///

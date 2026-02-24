@@ -500,10 +500,9 @@ class TestZstdCompression(ImagoTestBase):
     def test_check_accepts_zstd_feature_bits(self):
         """Check should not reject ZSTD images for unsupported features.
 
-        Verifies the INCOMPAT_COMPRESSION bit is accepted by check.
-        Note: compressed images may trigger pre-existing leak-detection
-        edge cases unrelated to ZSTD, so we check for zero corruptions
-        rather than zero total errors.
+        Verifies the INCOMPAT_COMPRESSION bit is accepted by check
+        and that compressed clusters are correctly tracked in the
+        overlap bitmap (no false leak reports).
         """
         with self._create_zstd_qcow2(
             data_pattern=b'\xaa' * 4096
@@ -515,6 +514,16 @@ class TestZstdCompression(ImagoTestBase):
             self.assertEqual(
                 result.get('corruptions', 0), 0,
                 'ZSTD feature bits should not cause corruption'
+            )
+            self.assertEqual(
+                result.get('leaks', 0), 0,
+                f'Compressed clusters should not cause '
+                f'false leaks: {stderr}'
+            )
+            self.assertEqual(
+                result.get('check-errors', 0), 0,
+                f'ZSTD image should have zero '
+                f'check-errors: {stderr}'
             )
 
     def test_info_reports_zstd_image(self):
@@ -950,6 +959,142 @@ class TestZstdBackingChain(ImagoTestBase):
                 rc, 0,
                 'ZSTD overlay should match flat '
                 f'raw: {stderr}'
+            )
+
+
+class TestCheckCompressedLeaks(ImagoTestBase):
+    """Compressed clusters should not cause false leak reports."""
+
+    def test_compressed_zlib_no_leaks(self):
+        """Zlib-compressed QCOW2 should have zero leaks."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.qcow2') as comp:
+            # Create raw with data
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw.name, '1M'],
+                capture_output=True, check=True
+            )
+            with open(raw.name, 'r+b') as f:
+                f.write(b'\xAA' * 65536)
+
+            # Convert to compressed QCOW2
+            subprocess.run(
+                ['qemu-img', 'convert', '-c',
+                 '-f', 'raw', '-O', 'qcow2',
+                 raw.name, comp.name],
+                capture_output=True, check=True
+            )
+
+            stdout, stderr, rc = self.run_imago_check(
+                Path(comp.name), output_format='json'
+            )
+            result = json.loads(stdout)
+            self.assertEqual(
+                result.get('corruptions', 0), 0,
+                f'Unexpected corruptions: {stderr}'
+            )
+            self.assertEqual(
+                result.get('leaks', 0), 0,
+                f'Compressed clusters should not cause '
+                f'false leaks: {stderr}'
+            )
+            self.assertEqual(
+                result.get('check-errors', 0), 0,
+                f'Unexpected check-errors: {stderr}'
+            )
+
+    def test_compressed_matches_qemu_img(self):
+        """Compressed check results should match qemu-img."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.qcow2') as comp:
+            # Create raw with multiple data patterns
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw.name, '4M'],
+                capture_output=True, check=True
+            )
+            with open(raw.name, 'r+b') as f:
+                for i in range(4):
+                    f.seek(i * 65536)
+                    f.write(bytes([0xAA + i]) * 65536)
+
+            # Convert to compressed QCOW2
+            subprocess.run(
+                ['qemu-img', 'convert', '-c',
+                 '-f', 'raw', '-O', 'qcow2',
+                 raw.name, comp.name],
+                capture_output=True, check=True
+            )
+
+            # Run qemu-img check
+            qemu_result = subprocess.run(
+                ['qemu-img', 'check', '-f', 'qcow2',
+                 '--output=json', comp.name],
+                capture_output=True, text=True
+            )
+            qemu_data = json.loads(qemu_result.stdout)
+            qemu_leaks = qemu_data.get('leaks', 0)
+            qemu_corruptions = qemu_data.get('corruptions', 0)
+
+            # Run imago check
+            stdout, stderr, rc = self.run_imago_check(
+                Path(comp.name), output_format='json'
+            )
+            imago_data = json.loads(stdout)
+
+            self.assertEqual(
+                imago_data.get('corruptions', 0),
+                qemu_corruptions,
+                f'Corruption count mismatch: {stderr}'
+            )
+            self.assertEqual(
+                imago_data.get('leaks', 0),
+                qemu_leaks,
+                f'Leak count mismatch: {stderr}'
+            )
+
+    def test_compressed_multi_cluster_no_leaks(self):
+        """Multi-cluster compressed image should have zero leaks."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.qcow2') as comp:
+            # Create larger image with many clusters
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw.name, '8M'],
+                capture_output=True, check=True
+            )
+            with open(raw.name, 'r+b') as f:
+                for i in range(128):
+                    f.seek(i * 65536)
+                    f.write(bytes([i & 0xFF]) * 65536)
+
+            subprocess.run(
+                ['qemu-img', 'convert', '-c',
+                 '-f', 'raw', '-O', 'qcow2',
+                 raw.name, comp.name],
+                capture_output=True, check=True
+            )
+
+            stdout, stderr, rc = self.run_imago_check(
+                Path(comp.name), output_format='json'
+            )
+            result = json.loads(stdout)
+            self.assertEqual(
+                result.get('corruptions', 0), 0,
+                f'Unexpected corruptions: {stderr}'
+            )
+            self.assertEqual(
+                result.get('leaks', 0), 0,
+                f'Multi-cluster compressed should not '
+                f'cause false leaks: {stderr}'
+            )
+            self.assertEqual(
+                result.get('check-errors', 0), 0,
+                f'Unexpected check-errors: {stderr}'
             )
 
 
