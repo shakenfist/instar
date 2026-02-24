@@ -951,3 +951,128 @@ class TestZstdBackingChain(ImagoTestBase):
                 'ZSTD overlay should match flat '
                 f'raw: {stderr}'
             )
+
+
+class TestCheckRefcountWidths(ImagoTestBase):
+    """Test check with non-16-bit refcount widths."""
+
+    def _create_refcount_qcow2(self, refcount_bits):
+        """Create a QCOW2 v3 image with a specific refcount width."""
+        f = tempfile.NamedTemporaryFile(suffix='.qcow2')
+        subprocess.run(
+            ['qemu-img', 'create', '-f', 'qcow2',
+             '-o', f'refcount_bits={refcount_bits}',
+             f.name, '1M'],
+            capture_output=True, check=True
+        )
+        # Write some data so there are allocated clusters
+        subprocess.run(
+            ['qemu-io', '-c',
+             'write -P 0xAA 0 65536', f.name],
+            capture_output=True, check=True
+        )
+        return f
+
+    def _check_no_errors(self, refcount_bits):
+        """Run check on an image with given refcount_bits."""
+        with self._create_refcount_qcow2(refcount_bits) as img:
+            # Cross-validate with qemu-img check first
+            qemu_result = subprocess.run(
+                ['qemu-img', 'check', '-f', 'qcow2',
+                 '--output=json', img.name],
+                capture_output=True, text=True
+            )
+            if qemu_result.returncode not in (0, 3):
+                self.skipTest(
+                    f'qemu-img check failed for '
+                    f'refcount_bits={refcount_bits}: '
+                    f'{qemu_result.stderr}'
+                )
+
+            stdout, stderr, rc = self.run_imago_check(
+                Path(img.name), output_format='json'
+            )
+            result = json.loads(stdout)
+            self.assertEqual(
+                result.get('corruptions', 0), 0,
+                f'refcount_bits={refcount_bits}: '
+                f'unexpected corruptions: {stderr}'
+            )
+            self.assertEqual(
+                result.get('leaks', 0), 0,
+                f'refcount_bits={refcount_bits}: '
+                f'unexpected leaks: {stderr}'
+            )
+            self.assertEqual(
+                result.get('check-errors', 0), 0,
+                f'refcount_bits={refcount_bits}: '
+                f'unexpected check-errors: {stderr}'
+            )
+
+    def test_check_1bit_refcount(self):
+        """Check should work with 1-bit refcounts."""
+        self._check_no_errors(1)
+
+    def test_check_2bit_refcount(self):
+        """Check should work with 2-bit refcounts."""
+        self._check_no_errors(2)
+
+    def test_check_4bit_refcount(self):
+        """Check should work with 4-bit refcounts."""
+        self._check_no_errors(4)
+
+    def test_check_8bit_refcount(self):
+        """Check should work with 8-bit refcounts."""
+        self._check_no_errors(8)
+
+    def test_check_16bit_refcount(self):
+        """Check should work with 16-bit refcounts (default)."""
+        self._check_no_errors(16)
+
+    def test_check_32bit_refcount(self):
+        """Check should work with 32-bit refcounts."""
+        self._check_no_errors(32)
+
+    def test_check_64bit_refcount(self):
+        """Check should work with 64-bit refcounts."""
+        self._check_no_errors(64)
+
+    def test_manifest_refcount_bits_1(self):
+        """Manifest image with 1-bit refcounts should pass check."""
+        image = self.get_image('qcow2-refcount-bits-1')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        stdout, stderr, rc = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('corruptions', 0), 0,
+            f'Unexpected corruptions: {stderr}'
+        )
+        self.assertEqual(
+            result.get('leaks', 0), 0,
+            f'Unexpected leaks: {stderr}'
+        )
+
+    def test_manifest_refcount_bits_64(self):
+        """Manifest image with 64-bit refcounts should pass check."""
+        image = self.get_image('qcow2-refcount-bits-64')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        stdout, stderr, rc = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('corruptions', 0), 0,
+            f'Unexpected corruptions: {stderr}'
+        )
+        self.assertEqual(
+            result.get('leaks', 0), 0,
+            f'Unexpected leaks: {stderr}'
+        )
