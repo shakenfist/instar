@@ -15,6 +15,7 @@ imago/
 ├── src/            # Main imago implementation
 │   ├── vmm/        # Virtual machine monitor (host-side)
 │   ├── core/       # Core guest initialization
+│   ├── crates/     # Shared format crates (qcow2, raw, vmdk)
 │   ├── shared/     # Shared library code
 │   ├── operations/ # Pluggable operations (info, copy, check, compare, convert)
 │   └── build.sh    # Build script
@@ -171,7 +172,7 @@ make clean-tests
 - `tests/manifest.json` - Defines test images and their safety levels
 - `tests/test_info_safe.py` - Tests against known-safe images
 - `tests/test_info_malicious.py` - Tests against malicious images using expected overrides
-- `tests/test_check_formats.py` - Tests for check operation (format detection, corruption, validation)
+- `tests/test_check_formats.py` - Tests for check operation (format detection, corruption, validation, incompatible feature bits, ZSTD compression, extended L2 entries)
 - `tests/test_compare.py` - Tests for compare operation (raw-vs-raw, QCOW2-vs-raw, QCOW2-vs-QCOW2, compressed QCOW2, backing chains)
 - `tests/test_convert.py` - Tests for convert operation (QCOW2-to-raw, raw-to-QCOW2, QCOW2 re-encoding, compressed output with `-c` flag, backing chains, round-trip validation, errors, manifest-driven cross-validation against qemu-img including compressed output)
 - `tests/expected_outputs/` - Expected output files for malicious images

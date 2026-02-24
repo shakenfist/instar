@@ -139,11 +139,13 @@ provides a modular architecture with:
 - **vmm/** - Host-side virtual machine monitor
 - **core/** - Guest initialization (device init, call table)
 - **crates/qcow2/** - Shared QCOW2 format crate: header parsing, L1/L2
-  cluster lookup, compressed cluster decompression (behind `decompress`
-  feature flag), cluster compression (behind `compress` feature flag
-  using raw deflate via miniz_oxide), refcount table reading, backing
-  file extraction, header extension parsing. Used by info, check,
-  compare, and convert operations.
+  cluster lookup (including extended L2 with 16-byte entries), compressed
+  cluster decompression (zlib via `decompress` feature, ZSTD via
+  `decompress-zstd` feature using ruzstd), cluster compression (behind
+  `compress` feature flag using raw deflate via miniz_oxide), refcount
+  table reading, backing file extraction, header extension parsing,
+  incompatible feature bit validation. Used by info, check, compare,
+  and convert operations.
 - **crates/raw/** - Shared RAW format crate: MBR/GPT partition table
   detection. Used by info operation.
 - **crates/vmdk/** - Shared VMDK format crate: VMDK4 binary header parsing,
