@@ -63,18 +63,20 @@ pub const COMPAT_LAZY_REFCOUNTS: u64 = 1 << 0;
 /// - Bit 1 (corrupt): handled (informational, data still readable)
 /// - Bit 2 (external_data): NOT supported (data in separate file)
 /// - Bit 3 (compression): conditionally supported (see below)
-/// - Bit 4 (extended_l2): NOT supported yet
+/// - Bit 4 (extended_l2): supported (16-byte L2 entries; subcluster
+///   bitmap is ignored, treating the cluster as fully allocated)
 ///
 /// When the `decompress-zstd` feature is enabled, bit 3 is included
 /// because ZSTD decompression is available. Otherwise only zlib
 /// (compression_type=0) works, and bit 3 is not needed since zlib
 /// images don't set it.
 #[cfg(not(feature = "decompress-zstd"))]
-pub const SUPPORTED_INCOMPAT_FEATURES: u64 = INCOMPAT_DIRTY | INCOMPAT_CORRUPT;
+pub const SUPPORTED_INCOMPAT_FEATURES: u64 =
+    INCOMPAT_DIRTY | INCOMPAT_CORRUPT | INCOMPAT_EXTENDED_L2;
 
 #[cfg(feature = "decompress-zstd")]
 pub const SUPPORTED_INCOMPAT_FEATURES: u64 =
-    INCOMPAT_DIRTY | INCOMPAT_CORRUPT | INCOMPAT_COMPRESSION;
+    INCOMPAT_DIRTY | INCOMPAT_CORRUPT | INCOMPAT_COMPRESSION | INCOMPAT_EXTENDED_L2;
 
 // L1/L2 entry masks and flags
 /// Bit 62 set indicates a compressed cluster in an L2 entry
@@ -859,7 +861,8 @@ impl Qcow2State {
         bytes_read: &mut u64,
     ) -> Option<ClusterLookup> {
         let cluster_size = self.cluster_size;
-        let entries_per_l2 = cluster_size / 8;
+        let entry_size: u64 = if self.extended_l2 { 16 } else { 8 };
+        let entries_per_l2 = cluster_size / entry_size;
 
         // Calculate L1 and L2 indices
         let l2_coverage = cluster_size * entries_per_l2;
@@ -896,8 +899,8 @@ impl Qcow2State {
             return None;
         }
 
-        // Read L2 entry
-        let l2_byte_offset = l2_table_offset.checked_add(l2_index.checked_mul(8)?)?;
+        // Read L2 entry (first 8 bytes of each entry, whether 8 or 16 bytes)
+        let l2_byte_offset = l2_table_offset.checked_add(l2_index.checked_mul(entry_size)?)?;
         let l2_entry = read_u64_be_cached(
             call_table,
             self.device_idx,

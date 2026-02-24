@@ -396,18 +396,16 @@ class TestIncompatibleFeatureBits(ImagoTestBase):
                 'check should reject external data bit'
             )
 
-    def test_check_rejects_extended_l2_bit(self):
-        """Check should reject images with extended L2 (bit 4).
-
-        This test will need updating once extended L2 support is added.
-        """
+    def test_check_accepts_extended_l2_bit(self):
+        """Check should accept images with extended L2 (bit 4)."""
         with self._create_patched_qcow2(1 << 4) as img:
             stdout, stderr, rc = self.run_imago_check(
                 Path(img.name), output_format='json'
             )
-            self.assertNotEqual(
-                rc, 0,
-                'check should reject extended L2 bit'
+            result = json.loads(stdout)
+            self.assertEqual(
+                result.get('corruptions', 0), 0,
+                'extended L2 bit should not cause corruption'
             )
 
     def test_check_allows_dirty_bit(self):
@@ -589,4 +587,133 @@ class TestZstdCompression(ImagoTestBase):
             self.assertEqual(
                 rc, 0,
                 f'ZSTD image should match raw: {stderr}'
+            )
+
+
+class TestExtendedL2(ImagoTestBase):
+    """Test QCOW2 v3 extended L2 entry support.
+
+    QCOW2 v3 images with INCOMPAT_EXTENDED_L2 (bit 4) use 16-byte
+    L2 entries: the first 8 bytes are the standard L2 entry and the
+    second 8 bytes are a subcluster allocation bitmap (32 subclusters
+    per cluster). We treat the cluster as fully allocated if any
+    subcluster is present (conservative but correct).
+    """
+
+    def _create_extended_l2_qcow2(
+        self, size='1M', data_pattern=None
+    ):
+        """Create an extended L2 QCOW2 image.
+
+        Returns a NamedTemporaryFile (caller manages lifetime).
+        """
+        img = tempfile.NamedTemporaryFile(suffix='.qcow2')
+        subprocess.run(
+            ['qemu-img', 'create', '-f', 'qcow2',
+             '-o', 'extended_l2=on',
+             img.name, size],
+            capture_output=True, check=True
+        )
+        if data_pattern:
+            subprocess.run(
+                ['qemu-io', '-c',
+                 f'write -P {data_pattern} 0 65536',
+                 img.name],
+                capture_output=True, check=True
+            )
+        return img
+
+    def test_check_extended_l2_clean(self):
+        """Check should accept a clean extended L2 image."""
+        with self._create_extended_l2_qcow2(
+            data_pattern=0xAA
+        ) as img:
+            stdout, stderr, rc = self.run_imago_check(
+                Path(img.name), output_format='json'
+            )
+            result = json.loads(stdout)
+            self.assertEqual(
+                result.get('corruptions', 0), 0,
+                f'clean ext L2 should have no corruptions: '
+                f'{stderr}'
+            )
+
+    def test_info_extended_l2(self):
+        """Info should report extended L2 images correctly."""
+        with self._create_extended_l2_qcow2(
+            data_pattern=0xBB
+        ) as img:
+            stdout, stderr, rc = self.run_imago_info(
+                Path(img.name), output_format='json'
+            )
+            self.assertEqual(
+                rc, 0,
+                f'info should accept ext L2 image: {stderr}'
+            )
+            result = json.loads(stdout)
+            qcow2_data = (
+                result.get('format-specific', {})
+                .get('data', {})
+            )
+            self.assertTrue(
+                qcow2_data.get('extended-l2', False),
+                'info should report extended-l2: true'
+            )
+
+    def test_convert_extended_l2_to_raw(self):
+        """Convert an extended L2 QCOW2 to raw."""
+        with self._create_extended_l2_qcow2(
+            data_pattern=0xCC
+        ) as img, \
+                tempfile.NamedTemporaryFile(suffix='.raw') \
+                as imago_raw, \
+                tempfile.NamedTemporaryFile(suffix='.raw') \
+                as qemu_raw:
+            # Convert with imago
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(img.name), Path(imago_raw.name)
+            )
+            self.assertEqual(
+                rc, 0,
+                f'convert should handle ext L2: {stderr}'
+            )
+
+            # Convert with qemu-img for comparison
+            subprocess.run(
+                ['qemu-img', 'convert', '-f', 'qcow2',
+                 '-O', 'raw', img.name, qemu_raw.name],
+                capture_output=True, check=True
+            )
+
+            # Compare outputs
+            stdout2, stderr2, rc2 = self.run_imago_compare(
+                Path(imago_raw.name), Path(qemu_raw.name)
+            )
+            self.assertEqual(
+                rc2, 0,
+                'ext L2 convert output should match '
+                f'qemu-img: {stderr2}'
+            )
+
+    def test_compare_extended_l2_vs_raw(self):
+        """Compare an extended L2 QCOW2 against raw equivalent."""
+        with self._create_extended_l2_qcow2(
+            data_pattern=0xDD
+        ) as img, \
+                tempfile.NamedTemporaryFile(suffix='.raw') \
+                as raw:
+            # Create matching raw via qemu-img
+            subprocess.run(
+                ['qemu-img', 'convert', '-f', 'qcow2',
+                 '-O', 'raw', img.name, raw.name],
+                capture_output=True, check=True
+            )
+
+            # Compare ext L2 qcow2 vs raw
+            stdout, stderr, rc = self.run_imago_compare(
+                Path(img.name), Path(raw.name)
+            )
+            self.assertEqual(
+                rc, 0,
+                f'ext L2 should match raw: {stderr}'
             )
