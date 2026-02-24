@@ -624,6 +624,27 @@ unsafe fn check_qcow2(
             result.total_errors += 1;
             (call_table.debug_print)(b"check: corrupt bit set\n\0".as_ptr());
         }
+
+        // Reject images with unsupported incompatible features.
+        // Per the QCOW2 spec, unknown incompatible bits MUST cause
+        // the reader to refuse to open the image.
+        //
+        // Check uses a wider mask than data-processing operations
+        // because structural validation (L1/L2 tables, refcounts)
+        // works regardless of compression type. INCOMPAT_COMPRESSION
+        // only affects how cluster data is compressed, not the table
+        // structure that check validates.
+        let check_supported = qcow2::SUPPORTED_INCOMPAT_FEATURES
+            | qcow2::INCOMPAT_COMPRESSION
+            | qcow2::INCOMPAT_EXTENDED_L2;
+        let unsupported = hdr.incompatible_features & !check_supported;
+        if unsupported != 0 {
+            result.corruptions += 1;
+            result.total_errors += 1;
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+            (call_table.debug_print)(b"check: unsupported incompatible features\n\0".as_ptr());
+            return bytes_read;
+        }
     }
 
     // Validate L1 table offset
@@ -645,7 +666,10 @@ unsafe fn check_qcow2(
     }
 
     // Calculate L2 entries per cluster
-    let l2_entries_per_cluster = cluster_size / 8;
+    // Extended L2 entries are 16 bytes (8-byte standard entry + 8-byte
+    // subcluster bitmap), so there are half as many entries per cluster.
+    let l2_entry_size: u64 = if hdr.extended_l2 { 16 } else { 8 };
+    let l2_entries_per_cluster = cluster_size / l2_entry_size;
 
     // Number of sectors needed to read one full L2 table
     let sectors_per_l2 = ((cluster_size as usize) + sector_size - 1) / sector_size;
@@ -891,10 +915,10 @@ unsafe fn check_qcow2(
                 bytes_read += sector_size as u64;
 
                 let entries_this_sector =
-                    core::cmp::min(l2_entries_remaining, (sector_size / 8) as u64);
+                    core::cmp::min(l2_entries_remaining, (sector_size as u64) / l2_entry_size);
 
                 for j in 0..entries_this_sector as usize {
-                    let off = j * 8;
+                    let off = j * l2_entry_size as usize;
                     let l2e = u64::from_be_bytes([
                         l2_buffer[off],
                         l2_buffer[off + 1],

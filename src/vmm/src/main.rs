@@ -4083,8 +4083,9 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         serial_transmitter.buffer.len()
     );
 
-    // Track VM errors
+    // Track VM errors and guest-reported convert success
     let mut vm_error: Option<String> = None;
+    let mut convert_success = true;
 
     // Run the vCPU loop
     debug!("Starting guest execution");
@@ -4102,6 +4103,15 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                 if port == SERIAL_PORT {
                     for &byte in data {
                         if let Some(msg) = serial_decoder.add_byte(byte) {
+                            // Track convert operation success from
+                            // the completion message
+                            if let Some(guest_::GuestMessage_::Payload::Complete(comp)) =
+                                &msg.payload
+                            {
+                                if comp.operation == "convert" && !comp.success {
+                                    convert_success = false;
+                                }
+                            }
                             debug!("{}", format_message(&msg));
                         }
                     }
@@ -4185,6 +4195,10 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 
     if let Some(error) = vm_error {
         return Err(error.into());
+    }
+
+    if !convert_success {
+        return Err("convert operation failed".into());
     }
 
     Ok(())

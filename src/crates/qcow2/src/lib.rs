@@ -9,6 +9,9 @@
 
 #![no_std]
 
+#[cfg(feature = "decompress-zstd")]
+extern crate alloc;
+
 use shared::{
     l1_cache_addr, l2_cache_addr, BackingFormat, CallTable, ChainConfig, ImageFormat,
     COMPRESSED_BUF_SIZE, MAX_CHAIN_DEVICES, MAX_SECTOR_SIZE,
@@ -50,6 +53,30 @@ pub const INCOMPAT_EXTENDED_L2: u64 = 1 << 4;
 
 // Compatible feature bits
 pub const COMPAT_LAZY_REFCOUNTS: u64 = 1 << 0;
+
+/// Bitmask of incompatible features that this implementation supports.
+///
+/// Operations should reject images with unsupported incompatible features
+/// (per the QCOW2 spec, unknown incompatible bits MUST cause rejection).
+///
+/// - Bit 0 (dirty): handled (informational, data still readable)
+/// - Bit 1 (corrupt): handled (informational, data still readable)
+/// - Bit 2 (external_data): NOT supported (data in separate file)
+/// - Bit 3 (compression): conditionally supported (see below)
+/// - Bit 4 (extended_l2): supported (16-byte L2 entries; subcluster
+///   bitmap is ignored, treating the cluster as fully allocated)
+///
+/// When the `decompress-zstd` feature is enabled, bit 3 is included
+/// because ZSTD decompression is available. Otherwise only zlib
+/// (compression_type=0) works, and bit 3 is not needed since zlib
+/// images don't set it.
+#[cfg(not(feature = "decompress-zstd"))]
+pub const SUPPORTED_INCOMPAT_FEATURES: u64 =
+    INCOMPAT_DIRTY | INCOMPAT_CORRUPT | INCOMPAT_EXTENDED_L2;
+
+#[cfg(feature = "decompress-zstd")]
+pub const SUPPORTED_INCOMPAT_FEATURES: u64 =
+    INCOMPAT_DIRTY | INCOMPAT_CORRUPT | INCOMPAT_COMPRESSION | INCOMPAT_EXTENDED_L2;
 
 // L1/L2 entry masks and flags
 /// Bit 62 set indicates a compressed cluster in an L2 entry
@@ -633,6 +660,12 @@ pub struct Qcow2State {
     pub cluster_bits: u32,
     pub l1_size: u32,
     pub l1_table_offset: u64,
+    /// Raw incompatible_features from the v3 header (0 for v2).
+    pub incompatible_features: u64,
+    /// Compression type from the v3 header (0=zlib, 1=zstd).
+    pub compression_type: u8,
+    /// True when INCOMPAT_EXTENDED_L2 (bit 4) is set.
+    pub extended_l2: bool,
     // Sector cache tracking for L1 table reads
     pub l1_cached_sector: u64,
     pub l1_cache_buf: *mut u8,
@@ -642,11 +675,18 @@ pub struct Qcow2State {
 }
 
 impl Qcow2State {
+    /// Return the bitmask of incompatible features that are set but
+    /// not in `supported_mask`. Returns 0 if all set features are
+    /// supported.
+    pub fn unsupported_incompat_features(&self, supported_mask: u64) -> u64 {
+        self.incompatible_features & !supported_mask
+    }
+
     /// Initialize QCOW2 state by reading the header from a device.
     ///
-    /// Reads version, cluster_bits, L1 table size/offset from the device
-    /// header and validates them. Returns `None` if the header is invalid
-    /// or I/O fails.
+    /// Reads version, cluster_bits, L1 table size/offset, and v3
+    /// feature fields from the device header and validates them.
+    /// Returns `None` if the header is invalid or I/O fails.
     ///
     /// Rejects clusters larger than `MAX_SECTOR_SIZE` (64 KiB) since the
     /// fixed-size comparison and decompression buffers cannot handle them.
@@ -670,6 +710,9 @@ impl Qcow2State {
             cluster_bits: 0,
             l1_size: 0,
             l1_table_offset: 0,
+            incompatible_features: 0,
+            compression_type: 0,
+            extended_l2: false,
             l1_cached_sector: u64::MAX,
             l1_cache_buf,
             l2_cached_sector: u64::MAX,
@@ -724,6 +767,38 @@ impl Qcow2State {
             state.l1_cache_buf,
             bytes_read,
         )?;
+
+        // Read v3 feature fields (incompatible_features at offset 72,
+        // compression_type at offset 104). For v2, these default to 0.
+        if version >= 3 {
+            state.incompatible_features = read_u64_be_cached(
+                call_table,
+                device_idx,
+                INCOMPATIBLE_FEATURES_OFFSET as u64,
+                sector_size,
+                input_capacity,
+                &mut state.l1_cached_sector,
+                state.l1_cache_buf,
+                bytes_read,
+            )?;
+            state.extended_l2 = (state.incompatible_features & INCOMPAT_EXTENDED_L2) != 0;
+
+            // compression_type is a single byte at offset 104.
+            // Read the containing u32 at offset 104 and take the
+            // high byte (big-endian: byte at offset 104 is bits
+            // 31-24 of the u32 at 104).
+            let ct_word = read_u32_be_cached(
+                call_table,
+                device_idx,
+                COMPRESSION_TYPE_OFFSET as u64,
+                sector_size,
+                input_capacity,
+                &mut state.l1_cached_sector,
+                state.l1_cache_buf,
+                bytes_read,
+            )?;
+            state.compression_type = (ct_word >> 24) as u8;
+        }
 
         // Read L1 table size
         let l1_size = read_u32_be_cached(
@@ -786,7 +861,8 @@ impl Qcow2State {
         bytes_read: &mut u64,
     ) -> Option<ClusterLookup> {
         let cluster_size = self.cluster_size;
-        let entries_per_l2 = cluster_size / 8;
+        let entry_size: u64 = if self.extended_l2 { 16 } else { 8 };
+        let entries_per_l2 = cluster_size / entry_size;
 
         // Calculate L1 and L2 indices
         let l2_coverage = cluster_size * entries_per_l2;
@@ -823,8 +899,8 @@ impl Qcow2State {
             return None;
         }
 
-        // Read L2 entry
-        let l2_byte_offset = l2_table_offset.checked_add(l2_index.checked_mul(8)?)?;
+        // Read L2 entry (first 8 bytes of each entry, whether 8 or 16 bytes)
+        let l2_byte_offset = l2_table_offset.checked_add(l2_index.checked_mul(entry_size)?)?;
         let l2_entry = read_u64_be_cached(
             call_table,
             self.device_idx,
@@ -886,7 +962,91 @@ pub unsafe fn read_cluster_sectors(
     true
 }
 
-/// Read and decompress a compressed QCOW2 cluster.
+/// Parse a compressed L2 entry and read the raw compressed data into
+/// `compressed_buf`. Returns the (pointer, length) of the compressed
+/// data within the buffer, or `None` on any error.
+///
+/// This is the common prefix shared by both zlib and ZSTD decompression
+/// paths: L2 entry parsing, bounds validation, and sector-by-sector I/O.
+///
+/// # Safety
+///
+/// `compressed_buf` must point to at least `COMPRESSED_BUF_SIZE` writable bytes.
+/// `call_table` must be valid.
+#[cfg(any(feature = "decompress", feature = "decompress-zstd"))]
+unsafe fn read_compressed_data(
+    call_table: &CallTable,
+    device_idx: u32,
+    l2_entry: u64,
+    cluster_bits: u32,
+    sector_size: usize,
+    compressed_buf: *mut u8,
+    input_capacity: u64,
+    bytes_read: &mut u64,
+) -> Option<(*const u8, usize)> {
+    // Parse compressed L2 entry format
+    let csize_shift = 62 - (cluster_bits as u64 - 8);
+    let csize_mask = (1u64 << (cluster_bits as u64 - 8)) - 1;
+    let offset_mask = (1u64 << csize_shift) - 1;
+
+    let compressed_offset = l2_entry & offset_mask;
+    let nb_sectors = ((l2_entry >> csize_shift) & csize_mask) + 1;
+    let nb_sectors_bytes = nb_sectors.checked_mul(512)?;
+    let offset_remainder = compressed_offset & 511;
+    if nb_sectors_bytes < offset_remainder {
+        return None;
+    }
+    let compressed_size = nb_sectors_bytes - offset_remainder;
+
+    if compressed_size == 0 || compressed_size > COMPRESSED_BUF_SIZE as u64 {
+        return None;
+    }
+
+    // Validate compressed data range against device capacity
+    let data_end = compressed_offset.checked_add(compressed_size)?;
+    let device_size = input_capacity.saturating_mul(sector_size as u64);
+    if data_end > device_size {
+        return None;
+    }
+
+    // Read compressed data sector by sector
+    let first_sector = compressed_offset / sector_size as u64;
+    let last_sector = (data_end + sector_size as u64 - 1) / sector_size as u64;
+    let sectors_to_read = last_sector - first_sector;
+
+    if sectors_to_read * sector_size as u64 > COMPRESSED_BUF_SIZE as u64 {
+        return None;
+    }
+
+    let read_buf = compressed_buf;
+    for i in 0..sectors_to_read {
+        let sector = first_sector + i;
+        let buf_offset = (i as usize) * sector_size;
+        if !(call_table.read_input_sector)(
+            device_idx,
+            sector,
+            read_buf.add(buf_offset),
+            sector_size,
+        ) {
+            return None;
+        }
+        *bytes_read += sector_size as u64;
+    }
+
+    // Extract compressed data from within the read buffer
+    let start_within_buf = (compressed_offset % sector_size as u64) as usize;
+    let total_read = (sectors_to_read as usize) * sector_size;
+    if start_within_buf + compressed_size as usize > total_read {
+        return None;
+    }
+
+    Some((
+        read_buf.add(start_within_buf) as *const u8,
+        compressed_size as usize,
+    ))
+}
+
+/// Read and decompress a zlib-compressed QCOW2 cluster.
 ///
 /// Parses the compressed L2 entry to extract offset and size,
 /// reads the compressed data, and inflates using miniz_oxide.
@@ -910,70 +1070,21 @@ pub unsafe fn read_compressed_cluster(
     input_capacity: u64,
     bytes_read: &mut u64,
 ) -> bool {
-    // Parse compressed L2 entry format
-    let csize_shift = 62 - (cluster_bits as u64 - 8);
-    let csize_mask = (1u64 << (cluster_bits as u64 - 8)) - 1;
-    let offset_mask = (1u64 << csize_shift) - 1;
-
-    let compressed_offset = l2_entry & offset_mask;
-    let nb_sectors = ((l2_entry >> csize_shift) & csize_mask) + 1;
-    let nb_sectors_bytes = match nb_sectors.checked_mul(512) {
+    let (compressed_data, compressed_len) = match read_compressed_data(
+        call_table,
+        device_idx,
+        l2_entry,
+        cluster_bits,
+        sector_size,
+        compressed_buf,
+        input_capacity,
+        bytes_read,
+    ) {
         Some(v) => v,
         None => return false,
     };
-    let offset_remainder = compressed_offset & 511;
-    if nb_sectors_bytes < offset_remainder {
-        return false;
-    }
-    let compressed_size = nb_sectors_bytes - offset_remainder;
 
-    if compressed_size == 0 || compressed_size > COMPRESSED_BUF_SIZE as u64 {
-        return false;
-    }
-
-    // Validate compressed data range against device capacity
-    let data_end = match compressed_offset.checked_add(compressed_size) {
-        Some(v) => v,
-        None => return false,
-    };
-    let device_size = input_capacity.saturating_mul(sector_size as u64);
-    if data_end > device_size {
-        return false;
-    }
-
-    // Read compressed data sector by sector
-    let first_sector = compressed_offset / sector_size as u64;
-    let last_sector = (data_end + sector_size as u64 - 1) / sector_size as u64;
-    let sectors_to_read = last_sector - first_sector;
-
-    if sectors_to_read * sector_size as u64 > COMPRESSED_BUF_SIZE as u64 {
-        return false;
-    }
-
-    let read_buf = compressed_buf;
-    for i in 0..sectors_to_read {
-        let sector = first_sector + i;
-        let buf_offset = (i as usize) * sector_size;
-        if !(call_table.read_input_sector)(
-            device_idx,
-            sector,
-            read_buf.add(buf_offset),
-            sector_size,
-        ) {
-            return false;
-        }
-        *bytes_read += sector_size as u64;
-    }
-
-    // Extract compressed data from within the read buffer
-    let start_within_buf = (compressed_offset % sector_size as u64) as usize;
-    let total_read = (sectors_to_read as usize) * sector_size;
-    if start_within_buf + compressed_size as usize > total_read {
-        return false;
-    }
-
-    let compressed_data = read_buf.add(start_within_buf);
-    let compressed_slice = core::slice::from_raw_parts(compressed_data, compressed_size as usize);
+    let compressed_slice = core::slice::from_raw_parts(compressed_data, compressed_len);
     let out_slice = core::slice::from_raw_parts_mut(out_buf, cluster_size as usize);
 
     // Decompress using miniz_oxide
@@ -1006,6 +1117,60 @@ pub unsafe fn read_compressed_cluster(
     }
 
     true
+}
+
+/// Read and decompress a ZSTD-compressed QCOW2 cluster.
+///
+/// Same interface as [`read_compressed_cluster`] but uses ruzstd
+/// for decompression instead of miniz_oxide. Used for QCOW2 v3
+/// images with `compression_type=1` (ZSTD).
+///
+/// The caller MUST reset the bump allocator before calling this
+/// function, as ruzstd allocates internally via `alloc`.
+///
+/// # Safety
+///
+/// Same requirements as [`read_compressed_cluster`].
+#[cfg(feature = "decompress-zstd")]
+pub unsafe fn read_compressed_cluster_zstd(
+    call_table: &CallTable,
+    device_idx: u32,
+    l2_entry: u64,
+    cluster_bits: u32,
+    out_buf: *mut u8,
+    cluster_size: u64,
+    sector_size: usize,
+    compressed_buf: *mut u8,
+    input_capacity: u64,
+    bytes_read: &mut u64,
+) -> bool {
+    let (compressed_data, compressed_len) = match read_compressed_data(
+        call_table,
+        device_idx,
+        l2_entry,
+        cluster_bits,
+        sector_size,
+        compressed_buf,
+        input_capacity,
+        bytes_read,
+    ) {
+        Some(v) => v,
+        None => return false,
+    };
+
+    let compressed_slice = core::slice::from_raw_parts(compressed_data, compressed_len);
+    let out_slice = core::slice::from_raw_parts_mut(out_buf, cluster_size as usize);
+
+    // Decompress using ruzstd (ZSTD)
+    let mut decoder = match ruzstd::decoding::StreamingDecoder::new(compressed_slice) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+
+    match ruzstd::io::Read::read_exact(&mut decoder, out_slice) {
+        Ok(()) => true,
+        Err(_) => false,
+    }
 }
 
 // ============================================================================
@@ -1393,6 +1558,10 @@ pub unsafe fn read_chain_virtual_cluster(
                     return false;
                 }
 
+                // Capture fields before mutable borrow in cluster_lookup
+                let compression_type = state.compression_type;
+                let cluster_bits = state.cluster_bits;
+
                 match state.cluster_lookup(call_table, virtual_offset, sector_size, cap, bytes_read)
                 {
                     Some(ClusterLookup::Unallocated) => {
@@ -1411,11 +1580,31 @@ pub unsafe fn read_chain_virtual_cluster(
                     }
                     #[cfg(feature = "decompress")]
                     Some(ClusterLookup::Compressed(l2_entry)) => {
+                        // Dispatch based on compression type:
+                        // 0 = zlib (deflate), 1 = zstd
+                        #[cfg(feature = "decompress-zstd")]
+                        if compression_type == 1 {
+                            return read_compressed_cluster_zstd(
+                                call_table,
+                                dev_idx as u32,
+                                l2_entry,
+                                cluster_bits,
+                                buf,
+                                qcow2_cluster_size,
+                                sector_size,
+                                compressed_buf,
+                                cap,
+                                bytes_read,
+                            );
+                        }
+                        if compression_type != 0 {
+                            return false;
+                        }
                         return read_compressed_cluster(
                             call_table,
                             dev_idx as u32,
                             l2_entry,
-                            state.cluster_bits,
+                            cluster_bits,
                             buf,
                             qcow2_cluster_size,
                             sector_size,

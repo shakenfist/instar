@@ -15,50 +15,11 @@
 
 extern crate alloc;
 
-use core::alloc::{GlobalAlloc, Layout};
 use core::panic::PanicInfo;
 
-/// Simple bump allocator backed by a fixed-size static buffer.
-///
-/// Required because miniz_oxide's `deflate` module (gated behind
-/// `with-alloc`) uses `Vec` internally in some code paths. The
-/// buffer is sized to accommodate the deflate compressor's needs
-/// (output buffer copy within compress_to_vec, etc.).
-///
-/// This is a single-threaded bare-metal guest, so no synchronization
-/// is needed beyond the atomic pointer.
-struct BumpAllocator;
-
-/// 256KB heap for miniz_oxide deflate internals.
-const HEAP_SIZE: usize = 256 * 1024;
-static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
-static HEAP_POS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for BumpAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let size = layout.size();
-        let align = layout.align();
-
-        let pos = HEAP_POS.load(core::sync::atomic::Ordering::Relaxed);
-        let aligned = (pos + align - 1) & !(align - 1);
-        let new_pos = aligned + size;
-
-        if new_pos > HEAP_SIZE {
-            return core::ptr::null_mut();
-        }
-
-        HEAP_POS.store(new_pos, core::sync::atomic::Ordering::Relaxed);
-        unsafe { HEAP.as_mut_ptr().add(aligned) }
-    }
-
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-        // Bump allocator doesn't free individual allocations.
-        // The heap is reset between compression calls if needed.
-    }
-}
-
-#[global_allocator]
-static ALLOC: BumpAllocator = BumpAllocator;
+// 256KB bump allocator for miniz_oxide compression and ruzstd
+// ZSTD decoding. Reset HEAP_POS to 0 between operations.
+shared::bump_allocator!(256 * 1024);
 
 use shared::{
     is_all_zeros_ptr, should_report_progress, validate_call_table, verify_sector_sizes, CallTable,
@@ -177,6 +138,16 @@ pub unsafe extern "C" fn _start() -> u64 {
         return bytes_read;
     }
 
+    // Reject QCOW2 images with unsupported incompatible features
+    for state in qcow2_states.iter().flatten() {
+        let unsupported = state.unsupported_incompat_features(qcow2::SUPPORTED_INCOMPAT_FEATURES);
+        if unsupported != 0 {
+            (call_table.debug_print)(b"convert: unsupported incompatible features\n\0".as_ptr());
+            (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
+            return bytes_read;
+        }
+    }
+
     // Dispatch based on target format
     let target = config.target_format();
     match target {
@@ -272,6 +243,9 @@ unsafe fn convert_to_raw(
         } else {
             chunk_size
         };
+
+        // Reset bump allocator before ZSTD decompression
+        HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 
         if !qcow2::read_chain_virtual_cluster(
             call_table,
@@ -738,6 +712,9 @@ unsafe fn convert_to_qcow2(
             let remaining = virtual_size - virtual_offset;
             let this_chunk = core::cmp::min(remaining, layout.cluster_size);
 
+            // Reset bump allocator before ZSTD decompression
+            HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
+
             // Read input data
             if !qcow2::read_chain_virtual_cluster(
                 call_table,
@@ -1024,6 +1001,9 @@ unsafe fn convert_to_qcow2_compressed(
             let virtual_offset = vc * layout.cluster_size;
             let remaining = virtual_size - virtual_offset;
             let this_chunk = core::cmp::min(remaining, layout.cluster_size);
+
+            // Reset bump allocator before ZSTD decompression
+            HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 
             // Read input data
             if !qcow2::read_chain_virtual_cluster(

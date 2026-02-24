@@ -10,7 +10,7 @@
 //!
 //! Supports raw-vs-raw, QCOW2-vs-raw, and QCOW2-vs-QCOW2 comparison.
 //! For QCOW2 images, performs L1/L2 table lookup and decompresses
-//! compressed clusters using miniz_oxide (deflate).
+//! compressed clusters using miniz_oxide (deflate) or ruzstd (ZSTD).
 //!
 //! Results are sent via protobuf CompareResultMessage over the serial
 //! command channel.
@@ -18,7 +18,13 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use core::panic::PanicInfo;
+
+// 256KB bump allocator for ruzstd ZSTD decoding internals.
+// Reset HEAP_POS to 0 before each decompression call.
+shared::bump_allocator!(256 * 1024);
 
 use shared::{
     validate_call_table, verify_sector_sizes, CallTable, ChainConfig, CompareConfig, CompareResult,
@@ -188,6 +194,18 @@ pub unsafe extern "C" fn _start() -> u64 {
         return bytes_read;
     }
 
+    // Reject QCOW2 images with unsupported incompatible features
+    for state in qcow2_states.iter().flatten() {
+        let unsupported = state.unsupported_incompat_features(qcow2::SUPPORTED_INCOMPAT_FEATURES);
+        if unsupported != 0 {
+            (call_table.debug_print)(b"compare: unsupported incompatible features\n\0".as_ptr());
+            let result = CompareResult::new();
+            (call_table.send_compare_result)(&result);
+            (call_table.send_complete)(b"compare\0".as_ptr(), bytes_read, false);
+            return bytes_read;
+        }
+    }
+
     (call_table.verbose_print)(b"compare: initialized device states\n\0".as_ptr());
 
     // Initialize result
@@ -236,6 +254,9 @@ pub unsafe extern "C" fn _start() -> u64 {
             chunk_size
         };
 
+        // Reset bump allocator before ZSTD decompression
+        HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
+
         // Read virtual data from image1's chain
         if !qcow2::read_chain_virtual_cluster(
             call_table,
@@ -261,6 +282,9 @@ pub unsafe extern "C" fn _start() -> u64 {
             (call_table.send_complete)(b"compare\0".as_ptr(), bytes_read, false);
             return bytes_read;
         }
+
+        // Reset bump allocator before ZSTD decompression
+        HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 
         // Read virtual data from image2's chain
         if !qcow2::read_chain_virtual_cluster(
@@ -335,6 +359,9 @@ pub unsafe extern "C" fn _start() -> u64 {
                 } else {
                     chunk_size
                 };
+
+                // Reset bump allocator before ZSTD decompression
+                HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 
                 if !qcow2::read_chain_virtual_cluster(
                     call_table,
