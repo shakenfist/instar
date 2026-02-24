@@ -598,6 +598,43 @@ pub unsafe fn read_u32_be_cached(
     Some(u32::from_be_bytes([*p, *p.add(1), *p.add(2), *p.add(3)]))
 }
 
+/// Read a single byte from a specific byte offset within a device,
+/// using a one-sector cache to minimize I/O.
+///
+/// Used for sub-byte and 8-bit refcount entry reading.
+///
+/// # Safety
+///
+/// `cache_buf` must point to at least `MAX_SECTOR_SIZE` writable bytes.
+/// `call_table` must point to a valid initialized call table.
+pub unsafe fn read_u8_cached(
+    call_table: &CallTable,
+    device_idx: u32,
+    byte_offset: u64,
+    sector_size: usize,
+    input_capacity: u64,
+    cached_sector: &mut u64,
+    cache_buf: *mut u8,
+    bytes_read: &mut u64,
+) -> Option<u8> {
+    let sector = byte_offset / sector_size as u64;
+    let off = (byte_offset % sector_size as u64) as usize;
+    if off + 1 > sector_size {
+        return None;
+    }
+    if sector >= input_capacity {
+        return None;
+    }
+    if *cached_sector != sector {
+        if !(call_table.read_input_sector)(device_idx, sector, cache_buf, sector_size) {
+            return None;
+        }
+        *bytes_read += sector_size as u64;
+        *cached_sector = sector;
+    }
+    Some(*cache_buf.add(off))
+}
+
 /// Read a big-endian u16 from a specific byte offset within a device,
 /// using a one-sector cache to minimize I/O.
 ///
@@ -1400,8 +1437,9 @@ mod tests {
 /// Returns `Some(refcount)` on success, `None` on I/O error or unsupported
 /// refcount width. A refcount of 0 means the cluster is not allocated.
 ///
-/// Currently only 16-bit refcounts are supported (the overwhelmingly common
-/// case). Other widths cause this function to return `None`.
+/// Supports all standard QCOW2 refcount widths: 1, 2, 4, 8, 16, 32,
+/// and 64 bits. Sub-byte widths (1, 2, 4) use little-endian bit
+/// ordering within each byte, matching QEMU's implementation.
 ///
 /// # Safety
 ///
@@ -1445,26 +1483,95 @@ pub unsafe fn lookup_refcount(
         return Some(0); // Block not allocated = refcount 0
     }
 
-    // Read the individual refcount entry from the block
+    // Read the individual refcount entry from the block.
+    // Sub-byte widths use little-endian bit order within each byte
+    // (entry 0 occupies the LSB), matching QEMU's get_refcount_ro*
+    // functions.
     let entry_in_block = cluster_index % entries_per_block;
-    if refcount_bits == 16 {
-        let entry_byte_off = entry_in_block
-            .checked_mul(2)
-            .and_then(|v| refblock_offset.checked_add(v))?;
-        let rc = read_u16_be_cached(
-            call_table,
-            device_idx,
-            entry_byte_off,
-            sector_size,
-            input_capacity,
-            refblock_cached_sector,
-            refblock_cache_buf,
-            bytes_read,
-        )?;
-        Some(rc as u64)
-    } else {
-        // Unsupported refcount width
-        None
+    match refcount_bits {
+        1 | 2 | 4 => {
+            // Sub-byte: multiple entries packed per byte
+            let entries_per_byte = 8 / refcount_bits as u64;
+            let byte_in_block = entry_in_block / entries_per_byte;
+            let entry_byte_off = refblock_offset.checked_add(byte_in_block)?;
+            let raw_byte = read_u8_cached(
+                call_table,
+                device_idx,
+                entry_byte_off,
+                sector_size,
+                input_capacity,
+                refblock_cached_sector,
+                refblock_cache_buf,
+                bytes_read,
+            )?;
+            // Little-endian bit order: entry 0 at LSB
+            let bit_pos = (entry_in_block % entries_per_byte) * refcount_bits as u64;
+            let mask = (1u64 << refcount_bits) - 1;
+            Some((raw_byte as u64 >> bit_pos) & mask)
+        }
+        8 => {
+            let entry_byte_off = refblock_offset.checked_add(entry_in_block)?;
+            let rc = read_u8_cached(
+                call_table,
+                device_idx,
+                entry_byte_off,
+                sector_size,
+                input_capacity,
+                refblock_cached_sector,
+                refblock_cache_buf,
+                bytes_read,
+            )?;
+            Some(rc as u64)
+        }
+        16 => {
+            let entry_byte_off = entry_in_block
+                .checked_mul(2)
+                .and_then(|v| refblock_offset.checked_add(v))?;
+            let rc = read_u16_be_cached(
+                call_table,
+                device_idx,
+                entry_byte_off,
+                sector_size,
+                input_capacity,
+                refblock_cached_sector,
+                refblock_cache_buf,
+                bytes_read,
+            )?;
+            Some(rc as u64)
+        }
+        32 => {
+            let entry_byte_off = entry_in_block
+                .checked_mul(4)
+                .and_then(|v| refblock_offset.checked_add(v))?;
+            let rc = read_u32_be_cached(
+                call_table,
+                device_idx,
+                entry_byte_off,
+                sector_size,
+                input_capacity,
+                refblock_cached_sector,
+                refblock_cache_buf,
+                bytes_read,
+            )?;
+            Some(rc as u64)
+        }
+        64 => {
+            let entry_byte_off = entry_in_block
+                .checked_mul(8)
+                .and_then(|v| refblock_offset.checked_add(v))?;
+            let rc = read_u64_be_cached(
+                call_table,
+                device_idx,
+                entry_byte_off,
+                sector_size,
+                input_capacity,
+                refblock_cached_sector,
+                refblock_cache_buf,
+                bytes_read,
+            )?;
+            Some(rc)
+        }
+        _ => None, // Unsupported refcount width
     }
 }
 
