@@ -717,3 +717,237 @@ class TestExtendedL2(ImagoTestBase):
                 rc, 0,
                 f'ext L2 should match raw: {stderr}'
             )
+
+    def test_convert_extended_l2_compressed_to_raw(self):
+        """Convert a compressed extended L2 QCOW2 to raw.
+
+        Tests the combination of extended L2 entries (16-byte stride)
+        with compressed clusters (zlib). These are orthogonal features
+        that both affect L2 table interpretation.
+        """
+        # Create extended L2 image with data
+        with self._create_extended_l2_qcow2(
+            data_pattern=0xEE
+        ) as ext_img, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.qcow2'
+                ) as compressed, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.raw'
+                ) as imago_raw, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.raw'
+                ) as qemu_raw:
+            # Re-encode with compression
+            subprocess.run(
+                ['qemu-img', 'convert', '-f', 'qcow2',
+                 '-O', 'qcow2', '-c',
+                 '-o', 'extended_l2=on',
+                 ext_img.name, compressed.name],
+                capture_output=True, check=True
+            )
+
+            # Convert with imago
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(compressed.name),
+                Path(imago_raw.name)
+            )
+            self.assertEqual(
+                rc, 0,
+                'convert should handle compressed '
+                f'ext L2: {stderr}'
+            )
+
+            # Convert with qemu-img for comparison
+            subprocess.run(
+                ['qemu-img', 'convert', '-f', 'qcow2',
+                 '-O', 'raw',
+                 compressed.name, qemu_raw.name],
+                capture_output=True, check=True
+            )
+
+            # Compare outputs
+            stdout2, stderr2, rc2 = self.run_imago_compare(
+                Path(imago_raw.name),
+                Path(qemu_raw.name)
+            )
+            self.assertEqual(
+                rc2, 0,
+                'compressed ext L2 convert output '
+                f'should match qemu-img: {stderr2}'
+            )
+
+
+class TestZstdBackingChain(ImagoTestBase):
+    """Test ZSTD-compressed QCOW2 images with backing chains.
+
+    Verifies that ZSTD decompression works correctly when the input
+    image is part of a backing chain that needs to be flattened.
+    """
+
+    def _zstd_supported(self):
+        """Check if qemu-img supports ZSTD compression."""
+        result = subprocess.run(
+            ['qemu-img', 'create', '-f', 'qcow2',
+             '-o', 'compression_type=zstd',
+             '/dev/null', '1M'],
+            capture_output=True
+        )
+        return result.returncode == 0
+
+    def test_convert_zstd_with_backing_chain(self):
+        """Convert a ZSTD image that has a backing chain."""
+        if not self._zstd_supported():
+            self.skipTest(
+                'qemu-img does not support ZSTD'
+            )
+
+        with tempfile.NamedTemporaryFile(
+            suffix='.raw'
+        ) as base_raw, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.qcow2'
+                ) as base_qcow2, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.qcow2'
+                ) as overlay, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.raw'
+                ) as imago_raw, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.raw'
+                ) as qemu_raw:
+            # Create base raw with data
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 base_raw.name, '1M'],
+                capture_output=True, check=True
+            )
+            with open(base_raw.name, 'r+b') as f:
+                f.write(b'\xAA' * 65536)
+
+            # Convert base to QCOW2
+            subprocess.run(
+                ['qemu-img', 'convert', '-f', 'raw',
+                 '-O', 'qcow2',
+                 base_raw.name, base_qcow2.name],
+                capture_output=True, check=True
+            )
+
+            # Create ZSTD overlay with backing
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-o', 'compression_type=zstd',
+                 '-b', base_qcow2.name,
+                 '-F', 'qcow2',
+                 overlay.name, '1M'],
+                capture_output=True, check=True
+            )
+            # Write different data to overlay
+            subprocess.run(
+                ['qemu-io', '-c',
+                 'write -P 0xBB 65536 65536',
+                 overlay.name],
+                capture_output=True, check=True
+            )
+
+            # Convert with imago (flattens chain)
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(overlay.name),
+                Path(imago_raw.name)
+            )
+            self.assertEqual(
+                rc, 0,
+                'convert should handle ZSTD with '
+                f'backing chain: {stderr}'
+            )
+
+            # Convert with qemu-img for comparison
+            subprocess.run(
+                ['qemu-img', 'convert', '-f', 'qcow2',
+                 '-O', 'raw',
+                 overlay.name, qemu_raw.name],
+                capture_output=True, check=True
+            )
+
+            # Compare outputs
+            stdout2, stderr2, rc2 = self.run_imago_compare(
+                Path(imago_raw.name),
+                Path(qemu_raw.name)
+            )
+            self.assertEqual(
+                rc2, 0,
+                'ZSTD backing chain convert should '
+                f'match qemu-img: {stderr2}'
+            )
+
+    def test_compare_zstd_backing_vs_flattened(self):
+        """Compare a ZSTD overlay (with backing) against flat raw."""
+        if not self._zstd_supported():
+            self.skipTest(
+                'qemu-img does not support ZSTD'
+            )
+
+        with tempfile.NamedTemporaryFile(
+            suffix='.raw'
+        ) as base_raw, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.qcow2'
+                ) as base_qcow2, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.qcow2'
+                ) as overlay, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.raw'
+                ) as flat_raw:
+            # Create base raw with data
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 base_raw.name, '1M'],
+                capture_output=True, check=True
+            )
+            with open(base_raw.name, 'r+b') as f:
+                f.write(b'\xCC' * 65536)
+
+            # Convert base to QCOW2
+            subprocess.run(
+                ['qemu-img', 'convert', '-f', 'raw',
+                 '-O', 'qcow2',
+                 base_raw.name, base_qcow2.name],
+                capture_output=True, check=True
+            )
+
+            # Create ZSTD overlay with backing
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-o', 'compression_type=zstd',
+                 '-b', base_qcow2.name,
+                 '-F', 'qcow2',
+                 overlay.name, '1M'],
+                capture_output=True, check=True
+            )
+            subprocess.run(
+                ['qemu-io', '-c',
+                 'write -P 0xDD 65536 65536',
+                 overlay.name],
+                capture_output=True, check=True
+            )
+
+            # Flatten with qemu-img for reference
+            subprocess.run(
+                ['qemu-img', 'convert', '-f', 'qcow2',
+                 '-O', 'raw',
+                 overlay.name, flat_raw.name],
+                capture_output=True, check=True
+            )
+
+            # Compare ZSTD overlay vs flattened raw
+            stdout, stderr, rc = self.run_imago_compare(
+                Path(overlay.name),
+                Path(flat_raw.name)
+            )
+            self.assertEqual(
+                rc, 0,
+                'ZSTD overlay should match flat '
+                f'raw: {stderr}'
+            )

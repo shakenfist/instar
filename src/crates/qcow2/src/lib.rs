@@ -962,7 +962,91 @@ pub unsafe fn read_cluster_sectors(
     true
 }
 
-/// Read and decompress a compressed QCOW2 cluster.
+/// Parse a compressed L2 entry and read the raw compressed data into
+/// `compressed_buf`. Returns the (pointer, length) of the compressed
+/// data within the buffer, or `None` on any error.
+///
+/// This is the common prefix shared by both zlib and ZSTD decompression
+/// paths: L2 entry parsing, bounds validation, and sector-by-sector I/O.
+///
+/// # Safety
+///
+/// `compressed_buf` must point to at least `COMPRESSED_BUF_SIZE` writable bytes.
+/// `call_table` must be valid.
+#[cfg(any(feature = "decompress", feature = "decompress-zstd"))]
+unsafe fn read_compressed_data(
+    call_table: &CallTable,
+    device_idx: u32,
+    l2_entry: u64,
+    cluster_bits: u32,
+    sector_size: usize,
+    compressed_buf: *mut u8,
+    input_capacity: u64,
+    bytes_read: &mut u64,
+) -> Option<(*const u8, usize)> {
+    // Parse compressed L2 entry format
+    let csize_shift = 62 - (cluster_bits as u64 - 8);
+    let csize_mask = (1u64 << (cluster_bits as u64 - 8)) - 1;
+    let offset_mask = (1u64 << csize_shift) - 1;
+
+    let compressed_offset = l2_entry & offset_mask;
+    let nb_sectors = ((l2_entry >> csize_shift) & csize_mask) + 1;
+    let nb_sectors_bytes = nb_sectors.checked_mul(512)?;
+    let offset_remainder = compressed_offset & 511;
+    if nb_sectors_bytes < offset_remainder {
+        return None;
+    }
+    let compressed_size = nb_sectors_bytes - offset_remainder;
+
+    if compressed_size == 0 || compressed_size > COMPRESSED_BUF_SIZE as u64 {
+        return None;
+    }
+
+    // Validate compressed data range against device capacity
+    let data_end = compressed_offset.checked_add(compressed_size)?;
+    let device_size = input_capacity.saturating_mul(sector_size as u64);
+    if data_end > device_size {
+        return None;
+    }
+
+    // Read compressed data sector by sector
+    let first_sector = compressed_offset / sector_size as u64;
+    let last_sector = (data_end + sector_size as u64 - 1) / sector_size as u64;
+    let sectors_to_read = last_sector - first_sector;
+
+    if sectors_to_read * sector_size as u64 > COMPRESSED_BUF_SIZE as u64 {
+        return None;
+    }
+
+    let read_buf = compressed_buf;
+    for i in 0..sectors_to_read {
+        let sector = first_sector + i;
+        let buf_offset = (i as usize) * sector_size;
+        if !(call_table.read_input_sector)(
+            device_idx,
+            sector,
+            read_buf.add(buf_offset),
+            sector_size,
+        ) {
+            return None;
+        }
+        *bytes_read += sector_size as u64;
+    }
+
+    // Extract compressed data from within the read buffer
+    let start_within_buf = (compressed_offset % sector_size as u64) as usize;
+    let total_read = (sectors_to_read as usize) * sector_size;
+    if start_within_buf + compressed_size as usize > total_read {
+        return None;
+    }
+
+    Some((
+        read_buf.add(start_within_buf) as *const u8,
+        compressed_size as usize,
+    ))
+}
+
+/// Read and decompress a zlib-compressed QCOW2 cluster.
 ///
 /// Parses the compressed L2 entry to extract offset and size,
 /// reads the compressed data, and inflates using miniz_oxide.
@@ -986,70 +1070,21 @@ pub unsafe fn read_compressed_cluster(
     input_capacity: u64,
     bytes_read: &mut u64,
 ) -> bool {
-    // Parse compressed L2 entry format
-    let csize_shift = 62 - (cluster_bits as u64 - 8);
-    let csize_mask = (1u64 << (cluster_bits as u64 - 8)) - 1;
-    let offset_mask = (1u64 << csize_shift) - 1;
-
-    let compressed_offset = l2_entry & offset_mask;
-    let nb_sectors = ((l2_entry >> csize_shift) & csize_mask) + 1;
-    let nb_sectors_bytes = match nb_sectors.checked_mul(512) {
+    let (compressed_data, compressed_len) = match read_compressed_data(
+        call_table,
+        device_idx,
+        l2_entry,
+        cluster_bits,
+        sector_size,
+        compressed_buf,
+        input_capacity,
+        bytes_read,
+    ) {
         Some(v) => v,
         None => return false,
     };
-    let offset_remainder = compressed_offset & 511;
-    if nb_sectors_bytes < offset_remainder {
-        return false;
-    }
-    let compressed_size = nb_sectors_bytes - offset_remainder;
 
-    if compressed_size == 0 || compressed_size > COMPRESSED_BUF_SIZE as u64 {
-        return false;
-    }
-
-    // Validate compressed data range against device capacity
-    let data_end = match compressed_offset.checked_add(compressed_size) {
-        Some(v) => v,
-        None => return false,
-    };
-    let device_size = input_capacity.saturating_mul(sector_size as u64);
-    if data_end > device_size {
-        return false;
-    }
-
-    // Read compressed data sector by sector
-    let first_sector = compressed_offset / sector_size as u64;
-    let last_sector = (data_end + sector_size as u64 - 1) / sector_size as u64;
-    let sectors_to_read = last_sector - first_sector;
-
-    if sectors_to_read * sector_size as u64 > COMPRESSED_BUF_SIZE as u64 {
-        return false;
-    }
-
-    let read_buf = compressed_buf;
-    for i in 0..sectors_to_read {
-        let sector = first_sector + i;
-        let buf_offset = (i as usize) * sector_size;
-        if !(call_table.read_input_sector)(
-            device_idx,
-            sector,
-            read_buf.add(buf_offset),
-            sector_size,
-        ) {
-            return false;
-        }
-        *bytes_read += sector_size as u64;
-    }
-
-    // Extract compressed data from within the read buffer
-    let start_within_buf = (compressed_offset % sector_size as u64) as usize;
-    let total_read = (sectors_to_read as usize) * sector_size;
-    if start_within_buf + compressed_size as usize > total_read {
-        return false;
-    }
-
-    let compressed_data = read_buf.add(start_within_buf);
-    let compressed_slice = core::slice::from_raw_parts(compressed_data, compressed_size as usize);
+    let compressed_slice = core::slice::from_raw_parts(compressed_data, compressed_len);
     let out_slice = core::slice::from_raw_parts_mut(out_buf, cluster_size as usize);
 
     // Decompress using miniz_oxide
@@ -1109,70 +1144,21 @@ pub unsafe fn read_compressed_cluster_zstd(
     input_capacity: u64,
     bytes_read: &mut u64,
 ) -> bool {
-    // Parse compressed L2 entry format (same as zlib path)
-    let csize_shift = 62 - (cluster_bits as u64 - 8);
-    let csize_mask = (1u64 << (cluster_bits as u64 - 8)) - 1;
-    let offset_mask = (1u64 << csize_shift) - 1;
-
-    let compressed_offset = l2_entry & offset_mask;
-    let nb_sectors = ((l2_entry >> csize_shift) & csize_mask) + 1;
-    let nb_sectors_bytes = match nb_sectors.checked_mul(512) {
+    let (compressed_data, compressed_len) = match read_compressed_data(
+        call_table,
+        device_idx,
+        l2_entry,
+        cluster_bits,
+        sector_size,
+        compressed_buf,
+        input_capacity,
+        bytes_read,
+    ) {
         Some(v) => v,
         None => return false,
     };
-    let offset_remainder = compressed_offset & 511;
-    if nb_sectors_bytes < offset_remainder {
-        return false;
-    }
-    let compressed_size = nb_sectors_bytes - offset_remainder;
 
-    if compressed_size == 0 || compressed_size > COMPRESSED_BUF_SIZE as u64 {
-        return false;
-    }
-
-    // Validate compressed data range against device capacity
-    let data_end = match compressed_offset.checked_add(compressed_size) {
-        Some(v) => v,
-        None => return false,
-    };
-    let device_size = input_capacity.saturating_mul(sector_size as u64);
-    if data_end > device_size {
-        return false;
-    }
-
-    // Read compressed data sector by sector
-    let first_sector = compressed_offset / sector_size as u64;
-    let last_sector = (data_end + sector_size as u64 - 1) / sector_size as u64;
-    let sectors_to_read = last_sector - first_sector;
-
-    if sectors_to_read * sector_size as u64 > COMPRESSED_BUF_SIZE as u64 {
-        return false;
-    }
-
-    let read_buf = compressed_buf;
-    for i in 0..sectors_to_read {
-        let sector = first_sector + i;
-        let buf_offset = (i as usize) * sector_size;
-        if !(call_table.read_input_sector)(
-            device_idx,
-            sector,
-            read_buf.add(buf_offset),
-            sector_size,
-        ) {
-            return false;
-        }
-        *bytes_read += sector_size as u64;
-    }
-
-    // Extract compressed data from within the read buffer
-    let start_within_buf = (compressed_offset % sector_size as u64) as usize;
-    let total_read = (sectors_to_read as usize) * sector_size;
-    if start_within_buf + compressed_size as usize > total_read {
-        return false;
-    }
-
-    let compressed_data = read_buf.add(start_within_buf);
-    let compressed_slice = core::slice::from_raw_parts(compressed_data, compressed_size as usize);
+    let compressed_slice = core::slice::from_raw_parts(compressed_data, compressed_len);
     let out_slice = core::slice::from_raw_parts_mut(out_buf, cluster_size as usize);
 
     // Decompress using ruzstd (ZSTD)
