@@ -8,6 +8,60 @@
 pub mod format_detection;
 pub mod virtio;
 
+/// Define a bump allocator with a fixed-size static heap.
+///
+/// This macro generates a `BumpAllocator` struct, a static heap array,
+/// and registers it as `#[global_allocator]`. Used by operations that
+/// need `alloc` support (e.g., for ruzstd ZSTD decoding or miniz_oxide
+/// compression).
+///
+/// The allocator never frees; callers must reset `HEAP_POS` to 0
+/// between logical operations that don't need persistent heap state.
+///
+/// # Example
+///
+/// ```ignore
+/// shared::bump_allocator!(256 * 1024); // 256KB heap
+///
+/// // Reset before each decompression call:
+/// HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
+/// ```
+#[macro_export]
+macro_rules! bump_allocator {
+    ($heap_size:expr) => {
+        struct BumpAllocator;
+
+        const HEAP_SIZE: usize = $heap_size;
+        static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
+        static HEAP_POS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+        unsafe impl core::alloc::GlobalAlloc for BumpAllocator {
+            unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+                let size = layout.size();
+                let align = layout.align();
+
+                let pos = HEAP_POS.load(core::sync::atomic::Ordering::Relaxed);
+                let aligned = (pos + align - 1) & !(align - 1);
+                let new_pos = aligned + size;
+
+                if new_pos > HEAP_SIZE {
+                    return core::ptr::null_mut();
+                }
+
+                HEAP_POS.store(new_pos, core::sync::atomic::Ordering::Relaxed);
+                unsafe { HEAP.as_mut_ptr().add(aligned) }
+            }
+
+            unsafe fn dealloc(&self, _ptr: *mut u8, _layout: core::alloc::Layout) {
+                // Bump allocator doesn't free individual allocations.
+            }
+        }
+
+        #[global_allocator]
+        static ALLOC: BumpAllocator = BumpAllocator;
+    };
+}
+
 /// Address where the call table is located (set by core)
 /// Located at 512KB to avoid overlap with core binary (which can grow past 32KB).
 /// The core binary is loaded at 0x10000 and may extend to 0x20000 (64KB max).

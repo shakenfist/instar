@@ -71,11 +71,12 @@ Exit codes: 0 = identical, 1 = content differs.
 
 The compare operation reads the virtual content of both images and reports the
 first byte offset where content diverges. For QCOW2 images, this includes
-L1/L2 cluster table lookup and compressed cluster decompression (zlib/deflate),
-so comparisons work across formats (e.g., QCOW2 vs raw, compressed QCOW2 vs
-uncompressed QCOW2). QCOW2 backing chains are automatically discovered and
-flattened: unallocated clusters are resolved by walking the backing chain,
-so overlay images compare correctly against their flattened equivalents.
+L1/L2 cluster table lookup (including extended L2 entries) and compressed
+cluster decompression (zlib and ZSTD), so comparisons work across formats
+(e.g., QCOW2 vs raw, compressed QCOW2 vs uncompressed QCOW2). QCOW2 backing
+chains are automatically discovered and flattened: unallocated clusters are
+resolved by walking the backing chain, so overlay images compare correctly
+against their flattened equivalents.
 When images differ in size, non-strict mode (default) treats extra zero-filled
 regions as matching, while strict mode (`-s`) fails immediately on any size
 difference.
@@ -97,7 +98,8 @@ imago check --chain image.qcow2
 
 For QCOW2 images, check validates:
 - Header integrity (version, cluster_bits, virtual_size)
-- Full L1/L2 table consistency (all sectors, not just first)
+- Incompatible feature bit validation (rejects unknown bits per spec)
+- Full L1/L2 table consistency (all sectors, including extended L2)
 - Overlap detection (two L2 entries referencing same host cluster)
 - Refcount validation (referenced clusters must have refcount > 0)
 - Leak detection (clusters with refcount > 0 but no L2 reference)
@@ -147,7 +149,8 @@ imago convert -p 5 input.qcow2 output.raw
 
 The convert operation reads the virtual content of an input image (including
 backing chain flattening) and writes it in the requested output format.
-Compressed clusters (zlib/deflate) are decompressed transparently.
+Compressed clusters (zlib/deflate and ZSTD) are decompressed transparently.
+QCOW2 v3 images with extended L2 entries (subclusters) are also supported.
 
 Supported output formats:
 - **raw** (default) - Flat raw output
