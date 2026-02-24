@@ -567,6 +567,7 @@ unsafe fn check_qcow2(
 
     let version = hdr.version;
     let cluster_size = hdr.cluster_size;
+    let cluster_bits = hdr.cluster_bits;
     let l1_size = hdr.l1_size;
     let l1_table_offset = hdr.l1_table_offset;
     let refcount_table_offset = hdr.refcount_table_offset;
@@ -1011,6 +1012,39 @@ unsafe fn check_qcow2(
                     } else {
                         // Compressed cluster
                         result.clusters_allocated += 1;
+
+                        // Parse compressed entry to find host clusters
+                        // for bitmap tracking and bounds validation.
+                        if let Some((comp_off, comp_size)) =
+                            qcow2::parse_compressed_l2_entry(l2e, cluster_bits)
+                        {
+                            if let Some(comp_end) = comp_off.checked_add(comp_size) {
+                                if comp_end > actual_size {
+                                    result.corruptions += 1;
+                                    result.total_errors += 1;
+                                } else {
+                                    // Track max offset for compressed data
+                                    if comp_end > max_offset {
+                                        max_offset = comp_end;
+                                    }
+
+                                    // Mark host clusters in bitmap for leak
+                                    // prevention. Ignore AlreadySet: compressed
+                                    // clusters can share host clusters via
+                                    // sub-cluster packing.
+                                    if can_track {
+                                        let first = comp_off / cluster_size;
+                                        let last = (comp_end - 1) / cluster_size;
+                                        for cidx in first..=last {
+                                            bitmap_set(bitmap, bitmap_size, cidx);
+                                        }
+                                    }
+                                }
+                            } else {
+                                result.corruptions += 1;
+                                result.total_errors += 1;
+                            }
+                        }
                     }
                 }
 
