@@ -283,6 +283,9 @@ unsafe fn convert_to_raw(
             chunk_size
         };
 
+        // Reset bump allocator before ZSTD decompression
+        HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
+
         if !qcow2::read_chain_virtual_cluster(
             call_table,
             0,
@@ -748,6 +751,9 @@ unsafe fn convert_to_qcow2(
             let remaining = virtual_size - virtual_offset;
             let this_chunk = core::cmp::min(remaining, layout.cluster_size);
 
+            // Reset bump allocator before ZSTD decompression
+            HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
+
             // Read input data
             if !qcow2::read_chain_virtual_cluster(
                 call_table,
@@ -1034,6 +1040,9 @@ unsafe fn convert_to_qcow2_compressed(
             let virtual_offset = vc * layout.cluster_size;
             let remaining = virtual_size - virtual_offset;
             let this_chunk = core::cmp::min(remaining, layout.cluster_size);
+
+            // Reset bump allocator before ZSTD decompression
+            HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 
             // Read input data
             if !qcow2::read_chain_virtual_cluster(

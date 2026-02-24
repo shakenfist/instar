@@ -628,7 +628,14 @@ unsafe fn check_qcow2(
         // Reject images with unsupported incompatible features.
         // Per the QCOW2 spec, unknown incompatible bits MUST cause
         // the reader to refuse to open the image.
-        let unsupported = hdr.incompatible_features & !qcow2::SUPPORTED_INCOMPAT_FEATURES;
+        //
+        // Check uses a wider mask than data-processing operations
+        // because structural validation (L1/L2 tables, refcounts)
+        // works regardless of compression type. INCOMPAT_COMPRESSION
+        // only affects how cluster data is compressed, not the table
+        // structure that check validates.
+        let check_supported = qcow2::SUPPORTED_INCOMPAT_FEATURES | qcow2::INCOMPAT_COMPRESSION;
+        let unsupported = hdr.incompatible_features & !check_supported;
         if unsupported != 0 {
             result.corruptions += 1;
             result.total_errors += 1;

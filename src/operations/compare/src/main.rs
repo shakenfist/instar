@@ -10,7 +10,7 @@
 //!
 //! Supports raw-vs-raw, QCOW2-vs-raw, and QCOW2-vs-QCOW2 comparison.
 //! For QCOW2 images, performs L1/L2 table lookup and decompresses
-//! compressed clusters using miniz_oxide (deflate).
+//! compressed clusters using miniz_oxide (deflate) or ruzstd (ZSTD).
 //!
 //! Results are sent via protobuf CompareResultMessage over the serial
 //! command channel.
@@ -18,7 +18,48 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use core::alloc::{GlobalAlloc, Layout};
 use core::panic::PanicInfo;
+
+/// Simple bump allocator for ruzstd's internal heap allocations.
+///
+/// ruzstd uses `alloc` (Vec, Box) for its decode tables and ring
+/// buffer. This bump allocator provides the backing memory. The
+/// heap is reset before each ZSTD decompression call by the
+/// `read_chain_virtual_cluster` dispatch in the qcow2 crate.
+struct BumpAllocator;
+
+/// 256KB heap for ruzstd internals.
+const HEAP_SIZE: usize = 256 * 1024;
+static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
+static HEAP_POS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+unsafe impl GlobalAlloc for BumpAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let size = layout.size();
+        let align = layout.align();
+
+        let pos = HEAP_POS.load(core::sync::atomic::Ordering::Relaxed);
+        let aligned = (pos + align - 1) & !(align - 1);
+        let new_pos = aligned + size;
+
+        if new_pos > HEAP_SIZE {
+            return core::ptr::null_mut();
+        }
+
+        HEAP_POS.store(new_pos, core::sync::atomic::Ordering::Relaxed);
+        unsafe { HEAP.as_mut_ptr().add(aligned) }
+    }
+
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
+        // Bump allocator doesn't free individual allocations.
+    }
+}
+
+#[global_allocator]
+static ALLOC: BumpAllocator = BumpAllocator;
 
 use shared::{
     validate_call_table, verify_sector_sizes, CallTable, ChainConfig, CompareConfig, CompareResult,
@@ -248,6 +289,9 @@ pub unsafe extern "C" fn _start() -> u64 {
             chunk_size
         };
 
+        // Reset bump allocator before ZSTD decompression
+        HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
+
         // Read virtual data from image1's chain
         if !qcow2::read_chain_virtual_cluster(
             call_table,
@@ -273,6 +317,9 @@ pub unsafe extern "C" fn _start() -> u64 {
             (call_table.send_complete)(b"compare\0".as_ptr(), bytes_read, false);
             return bytes_read;
         }
+
+        // Reset bump allocator before ZSTD decompression
+        HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 
         // Read virtual data from image2's chain
         if !qcow2::read_chain_virtual_cluster(
@@ -347,6 +394,9 @@ pub unsafe extern "C" fn _start() -> u64 {
                 } else {
                     chunk_size
                 };
+
+                // Reset bump allocator before ZSTD decompression
+                HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 
                 if !qcow2::read_chain_virtual_cluster(
                     call_table,
