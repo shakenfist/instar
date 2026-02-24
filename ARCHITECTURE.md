@@ -166,7 +166,8 @@ provides a modular architecture with:
   at sector granularity using raw deflate (via miniz_oxide), with fallback
   to uncompressed for incompressible data.
 - **shared/** - Shared library code between components (call table, configs,
-  format detection, memory layout constants, shared utilities)
+  format detection, memory layout constants, shared utilities,
+  `bump_allocator!` macro for operations needing heap allocation)
 
 **Chain validation in check (`--chain`):**
 The check operation supports an optional `--chain` flag that uses the host-side

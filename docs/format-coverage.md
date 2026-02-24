@@ -65,7 +65,7 @@ The `imago convert` operation supports writing output in the following formats:
 | Input Format | Status | Notes |
 |--------------|--------|-------|
 | raw | Supported | With MBR/GPT partition validation (unless `--unsafe-quirks`) |
-| qcow2 (v2/v3) | Supported | Including compressed clusters (zlib), backing chain flattening |
+| qcow2 (v2/v3) | Supported | Including compressed clusters (zlib and ZSTD), extended L2 entries, backing chain flattening |
 | vmdk | Not yet | Needs grain table reader |
 | vhd/vhdx | Not yet | Needs BAT reader |
 
@@ -73,8 +73,6 @@ The `imago convert` operation supports writing output in the following formats:
 
 - Input cluster sizes above 64KB are not supported (affects both convert and
   compare). The `debian-12-sfagent` image (2MB clusters) is skipped in tests.
-- ZSTD-compressed QCOW2 clusters are not supported (only zlib/deflate).
-- Extended L2 entries (subclusters) are not supported.
 - Encrypted QCOW2 images are not supported.
 
 ---
@@ -87,7 +85,7 @@ The `imago convert` operation supports writing output in the following formats:
 |-------|-------------|------------|-------|-------------|
 | backing_file | Detects external backing file reference | Rejects | Reports (FLAG_HAS_BACKING_FILE) | qcow2-overlay-chain, sf-vda, qcow2-backing-* |
 | data_file | Detects external data file feature | Rejects | Reports (FLAG_HAS_EXTERNAL_DATA) | qcow2-external-data-file |
-| unknown_features | Unknown incompatible feature bits | Rejects | Partial - reports known bits | qcow2-unknown-features |
+| unknown_features | Unknown incompatible feature bits | Rejects | Rejects in check/compare/convert; info reports | qcow2-unknown-features |
 | dirty | Image not cleanly closed | N/A | Reports (FLAG_DIRTY) | qcow2-dirty |
 | corrupt | Image marked corrupt | N/A | Reports (FLAG_CORRUPT) | qcow2-corrupt |
 | encrypted | Encryption enabled | N/A | Reports (FLAG_ENCRYPTED) | (none) |
@@ -101,7 +99,7 @@ The `imago convert` operation supports writing output in the following formats:
 | 2 | External data file | Rejects | QCOW2_INCOMPAT_EXTERNAL_DATA |
 | 3 | Compression type | N/A | QCOW2_INCOMPAT_COMPRESSION |
 | 4 | Extended L2 | N/A | QCOW2_INCOMPAT_EXTENDED_L2 |
-| 5+ | Unknown | Rejects | **Not checked** |
+| 5+ | Unknown | Rejects | Rejected by check/compare/convert |
 
 ### VMDK Safety Checks
 
@@ -273,7 +271,20 @@ The `imago convert` operation supports writing output in the following formats:
 5. **Cross-Format Backing Chain Detection** - `--chain` flag discovers backing
    chains across format boundaries (e.g., QCOW2 -> VMDK).
 
-6. **Comprehensive Test Image Suite** - Test images now cover:
+6. **QCOW2 Incompatible Feature Bit Validation** - check, compare, and convert
+   operations reject images with unsupported incompatible feature bits (per QCOW2
+   spec). Supported bits: dirty (0), corrupt (1), compression type (3), extended
+   L2 (4). Unsupported: external data file (2), unknown bits (5+).
+
+7. **ZSTD Compressed Cluster Decompression** - QCOW2 v3 images with
+   `compression_type=1` (ZSTD) are now supported in compare and convert
+   operations using the ruzstd pure-Rust decoder.
+
+8. **Extended L2 Entry Support** - QCOW2 v3 images with 128-bit L2 entries
+   (32 subclusters) are now correctly parsed. The 16-byte entry stride is
+   used for L2 table iteration and cluster lookup.
+
+9. **Comprehensive Test Image Suite** - Test images now cover:
    - QCOW2 external data file (CVE-2024-32498)
    - QCOW2 unknown features
    - QCOW2 dirty/corrupt bits
@@ -287,8 +298,7 @@ All oslo.utils formats are now detected. No remaining format detections needed.
 
 ### Safety Checks to Add
 
-1. **QCOW2 unknown features** - Warn on unknown incompatible feature bits
-2. **VMDK path validation** - Detect path traversal in descriptors
+1. **VMDK path validation** - Detect path traversal in descriptors
 
 ### Reporting Enhancements
 
