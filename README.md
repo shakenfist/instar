@@ -101,8 +101,10 @@ For QCOW2 images, check validates:
 - Incompatible feature bit validation (rejects unknown bits per spec)
 - Full L1/L2 table consistency (all sectors, including extended L2)
 - Overlap detection (two L2 entries referencing same host cluster)
-- Refcount validation (referenced clusters must have refcount > 0)
-- Leak detection (clusters with refcount > 0 but no L2 reference)
+- Refcount validation for all widths (1/2/4/8/16/32/64-bit refcounts)
+- Leak detection (clusters with refcount > 0 but no L2 reference),
+  including correct handling of compressed cluster host ranges
+- Cluster sizes from 512B to 2MB (cluster_bits 9-21)
 - Dirty/corrupt incompatible feature flags
 
 The `--chain` flag discovers the full backing chain (using the same chain
@@ -157,7 +159,8 @@ Supported output formats:
 - **qcow2** - QCOW2 v3 output with 16-bit refcounts, configurable cluster
   size (512 bytes to 64KB, default 64KB), optional zlib compression (`-c`)
 
-**Limitations:** Input cluster sizes above 64KB are not yet supported.
+**Limitations:** Compressed clusters with cluster sizes above 64KB cannot
+be decompressed. Uncompressed clusters up to 2MB are fully supported.
 
 ### Version Compatibility
 
