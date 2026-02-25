@@ -122,6 +122,12 @@ pub const SCRATCH_MEM_SIZE: usize = SCRATCH_MEM_END - SCRATCH_MEM_BASE;
 /// Maximum sector size supported
 pub const MAX_SECTOR_SIZE: usize = 65536;
 
+/// Maximum QCOW2 cluster size supported.
+/// QCOW2 allows cluster_bits 9-21 (512B to 2MB). Large clusters
+/// are processed in MAX_SECTOR_SIZE-sized chunks rather than
+/// buffered fully.
+pub const MAX_CLUSTER_SIZE: usize = 2 * 1024 * 1024;
+
 /// Compressed cluster read buffer size. Compressed data in QCOW2 can
 /// straddle a sector boundary, so we need room for 2 sectors.
 pub const COMPRESSED_BUF_SIZE: usize = 2 * MAX_SECTOR_SIZE;

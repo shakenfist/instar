@@ -14,7 +14,7 @@ extern crate alloc;
 
 use shared::{
     l1_cache_addr, l2_cache_addr, BackingFormat, CallTable, ChainConfig, ImageFormat,
-    COMPRESSED_BUF_SIZE, MAX_CHAIN_DEVICES, MAX_SECTOR_SIZE,
+    COMPRESSED_BUF_SIZE, MAX_CHAIN_DEVICES, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE,
 };
 
 // ============================================================================
@@ -725,8 +725,8 @@ impl Qcow2State {
     /// feature fields from the device header and validates them.
     /// Returns `None` if the header is invalid or I/O fails.
     ///
-    /// Rejects clusters larger than `MAX_SECTOR_SIZE` (64 KiB) since the
-    /// fixed-size comparison and decompression buffers cannot handle them.
+    /// Rejects clusters larger than `MAX_CLUSTER_SIZE` (2 MiB). Large
+    /// clusters are read in `MAX_SECTOR_SIZE`-sized chunks by callers.
     ///
     /// # Safety
     ///
@@ -786,8 +786,8 @@ impl Qcow2State {
             return None;
         }
         let cluster_size = 1u64 << cluster_bits;
-        // Reject clusters larger than our scratch buffers
-        if cluster_size > MAX_SECTOR_SIZE as u64 {
+        // Reject clusters larger than our maximum supported size
+        if cluster_size > MAX_CLUSTER_SIZE as u64 {
             return None;
         }
         state.cluster_bits = cluster_bits;
@@ -1686,9 +1686,6 @@ pub unsafe fn read_chain_virtual_cluster(
                 };
 
                 let qcow2_cluster_size = state.cluster_size;
-                if qcow2_cluster_size > MAX_SECTOR_SIZE as u64 {
-                    return false;
-                }
 
                 // Capture fields before mutable borrow in cluster_lookup
                 let compression_type = state.compression_type;
@@ -1700,18 +1697,33 @@ pub unsafe fn read_chain_virtual_cluster(
                         continue;
                     }
                     Some(ClusterLookup::Standard(host_offset)) => {
+                        // For large clusters (> chunk_size), calculate
+                        // the intra-cluster offset to read only the
+                        // requested chunk rather than the full cluster.
+                        let intra_offset = virtual_offset % qcow2_cluster_size;
+                        let read_offset = host_offset + intra_offset;
+                        let read_size = if chunk_size < qcow2_cluster_size {
+                            chunk_size
+                        } else {
+                            qcow2_cluster_size
+                        };
                         return read_cluster_sectors(
                             call_table,
                             dev_idx as u32,
-                            host_offset,
+                            read_offset,
                             buf,
-                            qcow2_cluster_size,
+                            read_size,
                             sector_size,
                             bytes_read,
                         );
                     }
                     #[cfg(feature = "decompress")]
                     Some(ClusterLookup::Compressed(l2_entry)) => {
+                        // Compressed clusters with large cluster sizes
+                        // can't be decompressed into chunk-sized buffers.
+                        if qcow2_cluster_size > MAX_SECTOR_SIZE as u64 {
+                            return false;
+                        }
                         // Dispatch based on compression type:
                         // 0 = zlib (deflate), 1 = zstd
                         #[cfg(feature = "decompress-zstd")]

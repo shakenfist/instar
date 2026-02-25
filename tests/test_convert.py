@@ -326,8 +326,9 @@ class TestConvertManifestImages(ImagoTestBase):
     are skipped to avoid disk-full failures.
     """
 
-    # The guest binary uses 64KB sectors for I/O
-    MAX_CLUSTER_SIZE = 65536
+    # Large clusters (up to 2MB) are supported; I/O uses 64KB chunks
+    MAX_CLUSTER_SIZE = 2097152
+    # Clusters smaller than sector size (64KB) can't be converted
     MIN_CLUSTER_SIZE = 65536
 
     # QCOW2 images that are safe standalone (no external backing
@@ -338,6 +339,7 @@ class TestConvertManifestImages(ImagoTestBase):
         'qcow2-lazy-refcounts',
         'qcow2-min-cluster',
         'qcow2-refcount-bits-1',
+        'qcow2-max-cluster',
         'debian-12-sfagent',
         'aurel32-debian-etch-sparc',
         'aurel32-debian-squeeze-armel',
@@ -374,6 +376,10 @@ class TestConvertManifestImages(ImagoTestBase):
         gib = vsize / (1024 ** 3)
         return max(120, int(120 + gib * 10))
 
+    # Max I/O buffer size: compressed clusters need a full-cluster
+    # decompression buffer, limited to MAX_SECTOR_SIZE (64KB).
+    MAX_DECOMPRESS_CLUSTER = 65536
+
     def _skip_if_unsupported(self, image_id, image_path):
         """Skip test if image has unsupported features."""
         vsize, csize = self._get_qcow2_info(image_path)
@@ -387,6 +393,26 @@ class TestConvertManifestImages(ImagoTestBase):
                 f'{image_id}: cluster_size {csize} < '
                 f'{self.MIN_CLUSTER_SIZE} (unsupported)'
             )
+
+        # Compressed clusters with large cluster sizes can't be
+        # decompressed (buffer limited to MAX_SECTOR_SIZE).
+        if csize and csize > self.MAX_DECOMPRESS_CLUSTER:
+            result = subprocess.run(
+                [
+                    'qemu-img', 'check', '--output=json',
+                    '-f', 'qcow2', str(image_path),
+                ],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode in (0, 3):
+                info = json.loads(result.stdout)
+                comp = info.get('compressed-clusters', 0)
+                if comp > 0:
+                    self.skipTest(
+                        f'{image_id}: {comp} compressed '
+                        f'clusters with cluster_size '
+                        f'{csize} (unsupported)'
+                    )
 
         # Need 2x virtual_size of temp space (imago + qemu-img
         # outputs). Check available space with a safety margin.
@@ -502,6 +528,10 @@ class TestConvertManifestImages(ImagoTestBase):
         self._test_manifest_convert(
             'aurel32-debian-wheezy-powerpc'
         )
+
+    def test_convert_qcow2_max_cluster(self):
+        """Convert QCOW2 with maximum 2MB cluster size."""
+        self._test_manifest_convert('qcow2-max-cluster')
 
 
 class TestConvertRawToQcow2(ImagoTestBase):
@@ -1467,6 +1497,7 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
         'qcow2-lazy-refcounts',
         'qcow2-min-cluster',
         'qcow2-refcount-bits-1',
+        'qcow2-max-cluster',
         'debian-12-sfagent',
         'aurel32-debian-etch-sparc',
         'aurel32-debian-squeeze-armel',
@@ -1474,7 +1505,7 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
         'aurel32-debian-wheezy-powerpc',
     ]
 
-    MAX_CLUSTER_SIZE = 65536
+    MAX_CLUSTER_SIZE = 2097152
     MIN_CLUSTER_SIZE = 65536
 
     def _get_qcow2_info(self, image_path):
@@ -1504,6 +1535,9 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
         gib = vsize / (1024 ** 3)
         return max(120, int(120 + gib * 10))
 
+    # Max I/O buffer size for decompression
+    MAX_DECOMPRESS_CLUSTER = 65536
+
     def _skip_if_unsupported(self, image_id, image_path):
         """Skip if image has unsupported features."""
         vsize, csize = self._get_qcow2_info(image_path)
@@ -1517,6 +1551,29 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
                 f'{image_id}: cluster_size {csize} < '
                 f'{self.MIN_CLUSTER_SIZE}'
             )
+
+        # Compressed clusters with large cluster sizes
+        # can't be decompressed (buffer limited).
+        if csize and csize > self.MAX_DECOMPRESS_CLUSTER:
+            result = subprocess.run(
+                [
+                    'qemu-img', 'check', '--output=json',
+                    '-f', 'qcow2', str(image_path),
+                ],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode in (0, 3):
+                info = json.loads(result.stdout)
+                comp = info.get(
+                    'compressed-clusters', 0
+                )
+                if comp > 0:
+                    self.skipTest(
+                        f'{image_id}: {comp} compressed '
+                        f'clusters with cluster_size '
+                        f'{csize} (unsupported)'
+                    )
+
         if vsize:
             tmpdir = tempfile.gettempdir()
             st = os.statvfs(tmpdir)
@@ -1643,6 +1700,10 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
             'aurel32-debian-wheezy-powerpc'
         )
 
+    def test_reencode_max_cluster(self):
+        """Re-encode QCOW2 with maximum 2MB cluster size."""
+        self._test_reencode_qcow2('qcow2-max-cluster')
+
 
 class TestConvertCompressedManifestQcow2(
     TestConvertToQcow2ManifestQcow2
@@ -1654,3 +1715,136 @@ class TestConvertCompressedManifestQcow2(
     """
 
     _compress = True
+
+
+class TestConvertLargeCluster(ImagoTestBase):
+    """Test convert and compare with cluster sizes > 64KB.
+
+    Verifies that large-cluster QCOW2 images can be converted to
+    raw and that the output matches qemu-img conversion.
+    """
+
+    def test_convert_2mb_cluster_to_raw(self):
+        """Convert a 2MB-cluster QCOW2 to raw, cross-validate."""
+        with tempfile.NamedTemporaryFile(
+            suffix='.qcow2', delete=False
+        ) as f:
+            qcow2_path = f.name
+        try:
+            subprocess.run(
+                [
+                    'qemu-img', 'create', '-f', 'qcow2',
+                    '-o', 'cluster_size=2M',
+                    qcow2_path, '64M',
+                ],
+                check=True, capture_output=True, timeout=30,
+            )
+            # Write data at various offsets
+            for offset in ['0', '4M', '32M', '60M']:
+                subprocess.run(
+                    [
+                        'qemu-io', '-f', 'qcow2', '-c',
+                        f'write -P 0xAB {offset} 64K',
+                        qcow2_path,
+                    ],
+                    check=True, capture_output=True,
+                    timeout=30,
+                )
+
+            with tempfile.NamedTemporaryFile(
+                suffix='.raw', delete=False
+            ) as imago_f, tempfile.NamedTemporaryFile(
+                suffix='.raw', delete=False
+            ) as qemu_f:
+                imago_raw = imago_f.name
+                qemu_raw = qemu_f.name
+                try:
+                    # Convert with imago
+                    stdout, stderr, rc = \
+                        self.run_imago_convert(
+                            Path(qcow2_path),
+                            Path(imago_raw),
+                        )
+                    self.assertEqual(
+                        rc, 0,
+                        f'imago convert failed: {stderr}'
+                    )
+
+                    # Convert with qemu-img
+                    subprocess.run(
+                        [
+                            'qemu-img', 'convert',
+                            '-f', 'qcow2', '-O', 'raw',
+                            qcow2_path, qemu_raw,
+                        ],
+                        check=True, capture_output=True,
+                        timeout=120,
+                    )
+
+                    # Compare outputs
+                    cmp_out, _, cmp_rc = \
+                        self.run_imago_compare(
+                            Path(imago_raw),
+                            Path(qemu_raw),
+                        )
+                    self.assertEqual(
+                        cmp_rc, 0,
+                        f'Convert output differs from '
+                        f'qemu-img: {cmp_out}'
+                    )
+                finally:
+                    os.unlink(imago_raw)
+                    os.unlink(qemu_raw)
+        finally:
+            os.unlink(qcow2_path)
+
+    def test_compare_2mb_cluster_vs_raw(self):
+        """Compare a 2MB-cluster QCOW2 against its raw equivalent."""
+        with tempfile.NamedTemporaryFile(
+            suffix='.qcow2', delete=False
+        ) as qf, tempfile.NamedTemporaryFile(
+            suffix='.raw', delete=False
+        ) as rf:
+            qcow2_path = qf.name
+            raw_path = rf.name
+        try:
+            # Create raw with known content
+            subprocess.run(
+                [
+                    'qemu-img', 'create', '-f', 'raw',
+                    raw_path, '16M',
+                ],
+                check=True, capture_output=True, timeout=30,
+            )
+            subprocess.run(
+                [
+                    'qemu-io', '-f', 'raw', '-c',
+                    'write -P 0xBE 0 1M',
+                    raw_path,
+                ],
+                check=True, capture_output=True, timeout=30,
+            )
+
+            # Convert raw to 2MB-cluster QCOW2 via qemu-img
+            subprocess.run(
+                [
+                    'qemu-img', 'convert',
+                    '-f', 'raw', '-O', 'qcow2',
+                    '-o', 'cluster_size=2M',
+                    raw_path, qcow2_path,
+                ],
+                check=True, capture_output=True, timeout=30,
+            )
+
+            # Compare QCOW2 against raw with imago
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(qcow2_path), Path(raw_path),
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'2MB-cluster QCOW2 differs from raw: '
+                f'{cmp_out}'
+            )
+        finally:
+            os.unlink(qcow2_path)
+            os.unlink(raw_path)
