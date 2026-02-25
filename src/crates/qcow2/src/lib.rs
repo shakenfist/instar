@@ -999,10 +999,6 @@ pub unsafe fn read_cluster_sectors(
     true
 }
 
-/// Parse a compressed L2 entry and read the raw compressed data into
-/// `compressed_buf`. Returns the (pointer, length) of the compressed
-/// data within the buffer, or `None` on any error.
-///
 /// Parse a compressed L2 entry and return the host byte offset and
 /// compressed byte size without performing any I/O.
 ///
