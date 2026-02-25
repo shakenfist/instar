@@ -143,9 +143,11 @@ provides a modular architecture with:
   cluster decompression (zlib via `decompress` feature, ZSTD via
   `decompress-zstd` feature using ruzstd), cluster compression (behind
   `compress` feature flag using raw deflate via miniz_oxide), refcount
-  table reading, backing file extraction, header extension parsing,
-  incompatible feature bit validation. Used by info, check, compare,
-  and convert operations.
+  table reading (all widths: 1/2/4/8/16/32/64-bit), compressed L2 entry
+  parsing, backing file extraction, header extension parsing,
+  incompatible feature bit validation. Supports cluster sizes from 512B
+  to 2MB (cluster_bits 9-21). Used by info, check, compare, and convert
+  operations.
 - **crates/raw/** - Shared RAW format crate: MBR/GPT partition table
   detection. Used by info operation.
 - **crates/vmdk/** - Shared VMDK format crate: VMDK4 binary header parsing,
@@ -215,12 +217,14 @@ Address         Size    Region
 
 ### qcow2
 
-QEMU Copy-On-Write version 2. Features:
-- Sparse allocation
-- Snapshots
-- Compression (zlib, zstd)
-- Encryption (LUKS)
-- Backing files
+QEMU Copy-On-Write version 2/3. Supported features:
+- Sparse allocation with cluster sizes 512B-2MB (cluster_bits 9-21)
+- Compression (zlib, zstd) for clusters up to 64KB
+- Backing file chains (automatic flattening)
+- Refcount widths: 1, 2, 4, 8, 16, 32, 64 bits
+- Extended L2 entries (16-byte with subcluster bitmaps)
+- Incompatible feature bit validation
+- Not yet supported: encryption (LUKS), external data files, snapshots
 
 ### raw
 
