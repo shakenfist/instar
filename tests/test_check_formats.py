@@ -1,6 +1,7 @@
 """Tests for check operation format detection and validation."""
 
 import json
+import os
 import struct
 import subprocess
 import tempfile
@@ -500,10 +501,9 @@ class TestZstdCompression(ImagoTestBase):
     def test_check_accepts_zstd_feature_bits(self):
         """Check should not reject ZSTD images for unsupported features.
 
-        Verifies the INCOMPAT_COMPRESSION bit is accepted by check.
-        Note: compressed images may trigger pre-existing leak-detection
-        edge cases unrelated to ZSTD, so we check for zero corruptions
-        rather than zero total errors.
+        Verifies the INCOMPAT_COMPRESSION bit is accepted by check
+        and that compressed clusters are correctly tracked in the
+        overlap bitmap (no false leak reports).
         """
         with self._create_zstd_qcow2(
             data_pattern=b'\xaa' * 4096
@@ -515,6 +515,16 @@ class TestZstdCompression(ImagoTestBase):
             self.assertEqual(
                 result.get('corruptions', 0), 0,
                 'ZSTD feature bits should not cause corruption'
+            )
+            self.assertEqual(
+                result.get('leaks', 0), 0,
+                f'Compressed clusters should not cause '
+                f'false leaks: {stderr}'
+            )
+            self.assertEqual(
+                result.get('check-errors', 0), 0,
+                f'ZSTD image should have zero '
+                f'check-errors: {stderr}'
             )
 
     def test_info_reports_zstd_image(self):
@@ -951,3 +961,414 @@ class TestZstdBackingChain(ImagoTestBase):
                 'ZSTD overlay should match flat '
                 f'raw: {stderr}'
             )
+
+
+class TestCheckCompressedLeaks(ImagoTestBase):
+    """Compressed clusters should not cause false leak reports."""
+
+    def test_compressed_zlib_no_leaks(self):
+        """Zlib-compressed QCOW2 should have zero leaks."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.qcow2') as comp:
+            # Create raw with data
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw.name, '1M'],
+                capture_output=True, check=True
+            )
+            with open(raw.name, 'r+b') as f:
+                f.write(b'\xAA' * 65536)
+
+            # Convert to compressed QCOW2
+            subprocess.run(
+                ['qemu-img', 'convert', '-c',
+                 '-f', 'raw', '-O', 'qcow2',
+                 raw.name, comp.name],
+                capture_output=True, check=True
+            )
+
+            stdout, stderr, rc = self.run_imago_check(
+                Path(comp.name), output_format='json'
+            )
+            result = json.loads(stdout)
+            self.assertEqual(
+                result.get('corruptions', 0), 0,
+                f'Unexpected corruptions: {stderr}'
+            )
+            self.assertEqual(
+                result.get('leaks', 0), 0,
+                f'Compressed clusters should not cause '
+                f'false leaks: {stderr}'
+            )
+            self.assertEqual(
+                result.get('check-errors', 0), 0,
+                f'Unexpected check-errors: {stderr}'
+            )
+
+    def test_compressed_matches_qemu_img(self):
+        """Compressed check results should match qemu-img."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.qcow2') as comp:
+            # Create raw with multiple data patterns
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw.name, '4M'],
+                capture_output=True, check=True
+            )
+            with open(raw.name, 'r+b') as f:
+                for i in range(4):
+                    f.seek(i * 65536)
+                    f.write(bytes([0xAA + i]) * 65536)
+
+            # Convert to compressed QCOW2
+            subprocess.run(
+                ['qemu-img', 'convert', '-c',
+                 '-f', 'raw', '-O', 'qcow2',
+                 raw.name, comp.name],
+                capture_output=True, check=True
+            )
+
+            # Run qemu-img check
+            qemu_result = subprocess.run(
+                ['qemu-img', 'check', '-f', 'qcow2',
+                 '--output=json', comp.name],
+                capture_output=True, text=True
+            )
+            qemu_data = json.loads(qemu_result.stdout)
+            qemu_leaks = qemu_data.get('leaks', 0)
+            qemu_corruptions = qemu_data.get('corruptions', 0)
+
+            # Run imago check
+            stdout, stderr, rc = self.run_imago_check(
+                Path(comp.name), output_format='json'
+            )
+            imago_data = json.loads(stdout)
+
+            self.assertEqual(
+                imago_data.get('corruptions', 0),
+                qemu_corruptions,
+                f'Corruption count mismatch: {stderr}'
+            )
+            self.assertEqual(
+                imago_data.get('leaks', 0),
+                qemu_leaks,
+                f'Leak count mismatch: {stderr}'
+            )
+
+    def test_compressed_multi_cluster_no_leaks(self):
+        """Multi-cluster compressed image should have zero leaks."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
+                tempfile.NamedTemporaryFile(
+                    suffix='.qcow2') as comp:
+            # Create larger image with many clusters
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw.name, '8M'],
+                capture_output=True, check=True
+            )
+            with open(raw.name, 'r+b') as f:
+                for i in range(128):
+                    f.seek(i * 65536)
+                    f.write(bytes([i & 0xFF]) * 65536)
+
+            subprocess.run(
+                ['qemu-img', 'convert', '-c',
+                 '-f', 'raw', '-O', 'qcow2',
+                 raw.name, comp.name],
+                capture_output=True, check=True
+            )
+
+            stdout, stderr, rc = self.run_imago_check(
+                Path(comp.name), output_format='json'
+            )
+            result = json.loads(stdout)
+            self.assertEqual(
+                result.get('corruptions', 0), 0,
+                f'Unexpected corruptions: {stderr}'
+            )
+            self.assertEqual(
+                result.get('leaks', 0), 0,
+                f'Multi-cluster compressed should not '
+                f'cause false leaks: {stderr}'
+            )
+            self.assertEqual(
+                result.get('check-errors', 0), 0,
+                f'Unexpected check-errors: {stderr}'
+            )
+
+
+class TestCheckRefcountWidths(ImagoTestBase):
+    """Test check with non-16-bit refcount widths."""
+
+    def _create_refcount_qcow2(self, refcount_bits):
+        """Create a QCOW2 v3 image with a specific refcount width."""
+        f = tempfile.NamedTemporaryFile(suffix='.qcow2')
+        subprocess.run(
+            ['qemu-img', 'create', '-f', 'qcow2',
+             '-o', f'refcount_bits={refcount_bits}',
+             f.name, '1M'],
+            capture_output=True, check=True
+        )
+        # Write some data so there are allocated clusters
+        subprocess.run(
+            ['qemu-io', '-c',
+             'write -P 0xAA 0 65536', f.name],
+            capture_output=True, check=True
+        )
+        return f
+
+    def _check_no_errors(self, refcount_bits):
+        """Run check on an image with given refcount_bits."""
+        with self._create_refcount_qcow2(refcount_bits) as img:
+            # Cross-validate with qemu-img check first
+            qemu_result = subprocess.run(
+                ['qemu-img', 'check', '-f', 'qcow2',
+                 '--output=json', img.name],
+                capture_output=True, text=True
+            )
+            if qemu_result.returncode not in (0, 3):
+                self.skipTest(
+                    f'qemu-img check failed for '
+                    f'refcount_bits={refcount_bits}: '
+                    f'{qemu_result.stderr}'
+                )
+
+            stdout, stderr, rc = self.run_imago_check(
+                Path(img.name), output_format='json'
+            )
+            result = json.loads(stdout)
+            self.assertEqual(
+                result.get('corruptions', 0), 0,
+                f'refcount_bits={refcount_bits}: '
+                f'unexpected corruptions: {stderr}'
+            )
+            self.assertEqual(
+                result.get('leaks', 0), 0,
+                f'refcount_bits={refcount_bits}: '
+                f'unexpected leaks: {stderr}'
+            )
+            self.assertEqual(
+                result.get('check-errors', 0), 0,
+                f'refcount_bits={refcount_bits}: '
+                f'unexpected check-errors: {stderr}'
+            )
+
+    def test_check_1bit_refcount(self):
+        """Check should work with 1-bit refcounts."""
+        self._check_no_errors(1)
+
+    def test_check_2bit_refcount(self):
+        """Check should work with 2-bit refcounts."""
+        self._check_no_errors(2)
+
+    def test_check_4bit_refcount(self):
+        """Check should work with 4-bit refcounts."""
+        self._check_no_errors(4)
+
+    def test_check_8bit_refcount(self):
+        """Check should work with 8-bit refcounts."""
+        self._check_no_errors(8)
+
+    def test_check_16bit_refcount(self):
+        """Check should work with 16-bit refcounts (default)."""
+        self._check_no_errors(16)
+
+    def test_check_32bit_refcount(self):
+        """Check should work with 32-bit refcounts."""
+        self._check_no_errors(32)
+
+    def test_check_64bit_refcount(self):
+        """Check should work with 64-bit refcounts."""
+        self._check_no_errors(64)
+
+    def test_manifest_refcount_bits_1(self):
+        """Manifest image with 1-bit refcounts should pass check."""
+        image = self.get_image('qcow2-refcount-bits-1')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        stdout, stderr, rc = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('corruptions', 0), 0,
+            f'Unexpected corruptions: {stderr}'
+        )
+        self.assertEqual(
+            result.get('leaks', 0), 0,
+            f'Unexpected leaks: {stderr}'
+        )
+
+    def test_manifest_refcount_bits_64(self):
+        """Manifest image with 64-bit refcounts should pass check."""
+        image = self.get_image('qcow2-refcount-bits-64')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        stdout, stderr, rc = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('corruptions', 0), 0,
+            f'Unexpected corruptions: {stderr}'
+        )
+        self.assertEqual(
+            result.get('leaks', 0), 0,
+            f'Unexpected leaks: {stderr}'
+        )
+
+
+class TestCheckLargeCluster(ImagoTestBase):
+    """Test check operation with cluster sizes > 64KB.
+
+    QCOW2 supports cluster_bits 9-21 (512B to 2MB). These tests
+    verify that the check operation correctly handles large cluster
+    sizes that exceed the I/O sector size.
+    """
+
+    def test_check_2mb_cluster_clean(self):
+        """A clean 2MB-cluster QCOW2 should pass check."""
+        with tempfile.NamedTemporaryFile(
+            suffix='.qcow2', delete=False
+        ) as f:
+            tmp = f.name
+        try:
+            subprocess.run(
+                [
+                    'qemu-img', 'create', '-f', 'qcow2',
+                    '-o', 'cluster_size=2M',
+                    tmp, '64M',
+                ],
+                check=True, capture_output=True, timeout=30,
+            )
+            # Write some data so it's not entirely empty
+            subprocess.run(
+                [
+                    'qemu-io', '-f', 'qcow2', '-c',
+                    'write -P 0xAB 0 4M',
+                    tmp,
+                ],
+                check=True, capture_output=True, timeout=30,
+            )
+
+            # Verify qemu-img check passes
+            qemu_result = subprocess.run(
+                [
+                    'qemu-img', 'check', '--output=json',
+                    '-f', 'qcow2', tmp,
+                ],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertIn(
+                qemu_result.returncode, (0, 3),
+                f'qemu-img check failed: {qemu_result.stderr}'
+            )
+
+            # Verify imago check passes
+            stdout, stderr, rc = self.run_imago_check(
+                tmp, output_format='json'
+            )
+            result = json.loads(stdout)
+            self.assertEqual(
+                result.get('corruptions', 0), 0,
+                f'Unexpected corruptions: {stderr}'
+            )
+            self.assertEqual(
+                result.get('leaks', 0), 0,
+                f'Unexpected leaks: {stderr}'
+            )
+            self.assertEqual(
+                result.get('check-errors', 0), 0,
+                f'Unexpected check-errors: {stderr}'
+            )
+        finally:
+            os.unlink(tmp)
+
+    def test_check_256k_cluster_clean(self):
+        """A clean 256K-cluster QCOW2 should pass check."""
+        with tempfile.NamedTemporaryFile(
+            suffix='.qcow2', delete=False
+        ) as f:
+            tmp = f.name
+        try:
+            subprocess.run(
+                [
+                    'qemu-img', 'create', '-f', 'qcow2',
+                    '-o', 'cluster_size=256K',
+                    tmp, '32M',
+                ],
+                check=True, capture_output=True, timeout=30,
+            )
+            subprocess.run(
+                [
+                    'qemu-io', '-f', 'qcow2', '-c',
+                    'write -P 0xCD 0 2M',
+                    tmp,
+                ],
+                check=True, capture_output=True, timeout=30,
+            )
+
+            stdout, stderr, rc = self.run_imago_check(
+                tmp, output_format='json'
+            )
+            result = json.loads(stdout)
+            self.assertEqual(
+                result.get('corruptions', 0), 0,
+                f'Unexpected corruptions: {stderr}'
+            )
+            self.assertEqual(
+                result.get('leaks', 0), 0,
+                f'Unexpected leaks: {stderr}'
+            )
+            self.assertEqual(
+                result.get('check-errors', 0), 0,
+                f'Unexpected check-errors: {stderr}'
+            )
+        finally:
+            os.unlink(tmp)
+
+    def test_check_manifest_max_cluster(self):
+        """Manifest image with 2MB clusters should pass check."""
+        image = self.get_image('qcow2-max-cluster')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        stdout, stderr, rc = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('corruptions', 0), 0,
+            f'Unexpected corruptions: {stderr}'
+        )
+        self.assertEqual(
+            result.get('leaks', 0), 0,
+            f'Unexpected leaks: {stderr}'
+        )
+
+    def test_check_manifest_sf_vda_backing(self):
+        """sf-vda-backing (2MB clusters) should pass check."""
+        image = self.get_image('sf-vda-backing')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        stdout, stderr, rc = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('corruptions', 0), 0,
+            f'Unexpected corruptions: {stderr}'
+        )
+        self.assertEqual(
+            result.get('leaks', 0), 0,
+            f'Unexpected leaks: {stderr}'
+        )

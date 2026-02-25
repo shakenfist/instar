@@ -15,9 +15,8 @@
 //! chain: format consistency, virtual size consistency across layers,
 //! and basic QCOW2 header validation for each backing image.
 //!
-//! Refcount validation currently supports 16-bit refcounts (the standard
-//! QCOW2 default). Images with other refcount widths skip refcount and
-//! leak validation.
+//! Refcount validation supports all standard QCOW2 refcount widths
+//! (1, 2, 4, 8, 16, 32, and 64 bits).
 //!
 //! Results are sent via protobuf CheckResultMessage over the serial
 //! command channel.
@@ -568,6 +567,7 @@ unsafe fn check_qcow2(
 
     let version = hdr.version;
     let cluster_size = hdr.cluster_size;
+    let cluster_bits = hdr.cluster_bits;
     let l1_size = hdr.l1_size;
     let l1_table_offset = hdr.l1_table_offset;
     let refcount_table_offset = hdr.refcount_table_offset;
@@ -594,12 +594,6 @@ unsafe fn check_qcow2(
     } else {
         16
     };
-
-    if refcount_bits != 16 {
-        (call_table.debug_print)(
-            b"check: refcount_bits != 16, skipping refcount/leak validation\n\0".as_ptr(),
-        );
-    }
 
     // Validate l1_size
     const MAX_L1_ENTRIES: u32 = 16 * 1024 * 1024;
@@ -1018,6 +1012,39 @@ unsafe fn check_qcow2(
                     } else {
                         // Compressed cluster
                         result.clusters_allocated += 1;
+
+                        // Parse compressed entry to find host clusters
+                        // for bitmap tracking and bounds validation.
+                        if let Some((comp_off, comp_size)) =
+                            qcow2::parse_compressed_l2_entry(l2e, cluster_bits)
+                        {
+                            if let Some(comp_end) = comp_off.checked_add(comp_size) {
+                                if comp_end > actual_size {
+                                    result.corruptions += 1;
+                                    result.total_errors += 1;
+                                } else {
+                                    // Track max offset for compressed data
+                                    if comp_end > max_offset {
+                                        max_offset = comp_end;
+                                    }
+
+                                    // Mark host clusters in bitmap for leak
+                                    // prevention. Ignore AlreadySet: compressed
+                                    // clusters can share host clusters via
+                                    // sub-cluster packing.
+                                    if can_track {
+                                        let first = comp_off / cluster_size;
+                                        let last = (comp_end - 1) / cluster_size;
+                                        for cidx in first..=last {
+                                            bitmap_set(bitmap, bitmap_size, cidx);
+                                        }
+                                    }
+                                }
+                            } else {
+                                result.corruptions += 1;
+                                result.total_errors += 1;
+                            }
+                        }
                     }
                 }
 
@@ -1032,7 +1059,7 @@ unsafe fn check_qcow2(
     (call_table.verbose_print)(b"check: L1/L2 walk complete\n\0".as_ptr());
 
     // ---- Leak detection: scan refcount blocks ----
-    if can_track && refcount_bits == 16 {
+    if can_track {
         (call_table.verbose_print)(b"check: scanning refcounts for leaks\n\0".as_ptr());
 
         let entries_per_block = (cluster_size * 8) / refcount_bits as u64;
@@ -1139,11 +1166,8 @@ unsafe fn check_qcow2(
 
                     let entries_this = core::cmp::min(entries_remaining, entries_per_sector);
 
-                    let entry_bytes = (refcount_bits / 8) as usize;
                     for e in 0..entries_this as usize {
-                        let off = e * entry_bytes;
-                        let rc =
-                            u16::from_be_bytes([leak_scan_buffer[off], leak_scan_buffer[off + 1]]);
+                        let rc = read_refcount_from_buffer(&leak_scan_buffer, e, refcount_bits);
 
                         if rc > 0 {
                             let cidx = match rt_idx.checked_mul(entries_per_block).and_then(|v| {
@@ -1165,10 +1189,6 @@ unsafe fn check_qcow2(
 
             (call_table.verbose_print)(b"check: leak scan complete\n\0".as_ptr());
         } // end else (reftable_entries within bounds)
-    } else if refcount_bits != 16 {
-        (call_table.verbose_print)(
-            b"check: skipping leak scan (non-16-bit refcounts)\n\0".as_ptr(),
-        );
     }
 
     // Calculate fragmentation percentage
@@ -1361,6 +1381,52 @@ unsafe fn validate_chain_qcow2_header(
     }
 
     0
+}
+
+/// Read a refcount entry from a sector buffer.
+///
+/// `entry_index` is the index of the entry within this sector.
+/// `refcount_bits` must be 1, 2, 4, 8, 16, 32, or 64.
+///
+/// Sub-byte widths use little-endian bit ordering within each byte
+/// (entry 0 at the LSB), matching QEMU's implementation.
+fn read_refcount_from_buffer(
+    buf: &[u8; MAX_SECTOR_SIZE],
+    entry_index: usize,
+    refcount_bits: u32,
+) -> u64 {
+    match refcount_bits {
+        1 | 2 | 4 => {
+            let entries_per_byte = 8 / refcount_bits as usize;
+            let byte_idx = entry_index / entries_per_byte;
+            let bit_pos = (entry_index % entries_per_byte) * refcount_bits as usize;
+            let mask = (1u64 << refcount_bits) - 1;
+            (buf[byte_idx] as u64 >> bit_pos) & mask
+        }
+        8 => buf[entry_index] as u64,
+        16 => {
+            let off = entry_index * 2;
+            u16::from_be_bytes([buf[off], buf[off + 1]]) as u64
+        }
+        32 => {
+            let off = entry_index * 4;
+            u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as u64
+        }
+        64 => {
+            let off = entry_index * 8;
+            u64::from_be_bytes([
+                buf[off],
+                buf[off + 1],
+                buf[off + 2],
+                buf[off + 3],
+                buf[off + 4],
+                buf[off + 5],
+                buf[off + 6],
+                buf[off + 7],
+            ])
+        }
+        _ => 0,
+    }
 }
 
 /// Get the call table from the fixed address

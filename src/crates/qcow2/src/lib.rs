@@ -14,7 +14,7 @@ extern crate alloc;
 
 use shared::{
     l1_cache_addr, l2_cache_addr, BackingFormat, CallTable, ChainConfig, ImageFormat,
-    COMPRESSED_BUF_SIZE, MAX_CHAIN_DEVICES, MAX_SECTOR_SIZE,
+    COMPRESSED_BUF_SIZE, MAX_CHAIN_DEVICES, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE,
 };
 
 // ============================================================================
@@ -598,6 +598,43 @@ pub unsafe fn read_u32_be_cached(
     Some(u32::from_be_bytes([*p, *p.add(1), *p.add(2), *p.add(3)]))
 }
 
+/// Read a single byte from a specific byte offset within a device,
+/// using a one-sector cache to minimize I/O.
+///
+/// Used for sub-byte and 8-bit refcount entry reading.
+///
+/// # Safety
+///
+/// `cache_buf` must point to at least `MAX_SECTOR_SIZE` writable bytes.
+/// `call_table` must point to a valid initialized call table.
+pub unsafe fn read_u8_cached(
+    call_table: &CallTable,
+    device_idx: u32,
+    byte_offset: u64,
+    sector_size: usize,
+    input_capacity: u64,
+    cached_sector: &mut u64,
+    cache_buf: *mut u8,
+    bytes_read: &mut u64,
+) -> Option<u8> {
+    let sector = byte_offset / sector_size as u64;
+    let off = (byte_offset % sector_size as u64) as usize;
+    if off + 1 > sector_size {
+        return None;
+    }
+    if sector >= input_capacity {
+        return None;
+    }
+    if *cached_sector != sector {
+        if !(call_table.read_input_sector)(device_idx, sector, cache_buf, sector_size) {
+            return None;
+        }
+        *bytes_read += sector_size as u64;
+        *cached_sector = sector;
+    }
+    Some(*cache_buf.add(off))
+}
+
 /// Read a big-endian u16 from a specific byte offset within a device,
 /// using a one-sector cache to minimize I/O.
 ///
@@ -688,8 +725,8 @@ impl Qcow2State {
     /// feature fields from the device header and validates them.
     /// Returns `None` if the header is invalid or I/O fails.
     ///
-    /// Rejects clusters larger than `MAX_SECTOR_SIZE` (64 KiB) since the
-    /// fixed-size comparison and decompression buffers cannot handle them.
+    /// Rejects clusters larger than `MAX_CLUSTER_SIZE` (2 MiB). Large
+    /// clusters are read in `MAX_SECTOR_SIZE`-sized chunks by callers.
     ///
     /// # Safety
     ///
@@ -749,8 +786,8 @@ impl Qcow2State {
             return None;
         }
         let cluster_size = 1u64 << cluster_bits;
-        // Reject clusters larger than our scratch buffers
-        if cluster_size > MAX_SECTOR_SIZE as u64 {
+        // Reject clusters larger than our maximum supported size
+        if cluster_size > MAX_CLUSTER_SIZE as u64 {
             return None;
         }
         state.cluster_bits = cluster_bits;
@@ -962,10 +999,31 @@ pub unsafe fn read_cluster_sectors(
     true
 }
 
-/// Parse a compressed L2 entry and read the raw compressed data into
-/// `compressed_buf`. Returns the (pointer, length) of the compressed
-/// data within the buffer, or `None` on any error.
+/// Parse a compressed L2 entry and return the host byte offset and
+/// compressed byte size without performing any I/O.
 ///
+/// Returns `Some((host_offset, compressed_bytes))` on success, or
+/// `None` if the entry fields are inconsistent.
+pub fn parse_compressed_l2_entry(l2_entry: u64, cluster_bits: u32) -> Option<(u64, u64)> {
+    let csize_shift = 62 - (cluster_bits as u64 - 8);
+    let csize_mask = (1u64 << (cluster_bits as u64 - 8)) - 1;
+    let offset_mask = (1u64 << csize_shift) - 1;
+
+    let compressed_offset = l2_entry & offset_mask;
+    let nb_sectors = ((l2_entry >> csize_shift) & csize_mask) + 1;
+    let nb_sectors_bytes = nb_sectors.checked_mul(512)?;
+    let offset_remainder = compressed_offset & 511;
+    if nb_sectors_bytes < offset_remainder {
+        return None;
+    }
+    let compressed_size = nb_sectors_bytes - offset_remainder;
+    if compressed_size == 0 {
+        return None;
+    }
+
+    Some((compressed_offset, compressed_size))
+}
+
 /// This is the common prefix shared by both zlib and ZSTD decompression
 /// paths: L2 entry parsing, bounds validation, and sector-by-sector I/O.
 ///
@@ -1400,8 +1458,9 @@ mod tests {
 /// Returns `Some(refcount)` on success, `None` on I/O error or unsupported
 /// refcount width. A refcount of 0 means the cluster is not allocated.
 ///
-/// Currently only 16-bit refcounts are supported (the overwhelmingly common
-/// case). Other widths cause this function to return `None`.
+/// Supports all standard QCOW2 refcount widths: 1, 2, 4, 8, 16, 32,
+/// and 64 bits. Sub-byte widths (1, 2, 4) use little-endian bit
+/// ordering within each byte, matching QEMU's implementation.
 ///
 /// # Safety
 ///
@@ -1445,26 +1504,95 @@ pub unsafe fn lookup_refcount(
         return Some(0); // Block not allocated = refcount 0
     }
 
-    // Read the individual refcount entry from the block
+    // Read the individual refcount entry from the block.
+    // Sub-byte widths use little-endian bit order within each byte
+    // (entry 0 occupies the LSB), matching QEMU's get_refcount_ro*
+    // functions.
     let entry_in_block = cluster_index % entries_per_block;
-    if refcount_bits == 16 {
-        let entry_byte_off = entry_in_block
-            .checked_mul(2)
-            .and_then(|v| refblock_offset.checked_add(v))?;
-        let rc = read_u16_be_cached(
-            call_table,
-            device_idx,
-            entry_byte_off,
-            sector_size,
-            input_capacity,
-            refblock_cached_sector,
-            refblock_cache_buf,
-            bytes_read,
-        )?;
-        Some(rc as u64)
-    } else {
-        // Unsupported refcount width
-        None
+    match refcount_bits {
+        1 | 2 | 4 => {
+            // Sub-byte: multiple entries packed per byte
+            let entries_per_byte = 8 / refcount_bits as u64;
+            let byte_in_block = entry_in_block / entries_per_byte;
+            let entry_byte_off = refblock_offset.checked_add(byte_in_block)?;
+            let raw_byte = read_u8_cached(
+                call_table,
+                device_idx,
+                entry_byte_off,
+                sector_size,
+                input_capacity,
+                refblock_cached_sector,
+                refblock_cache_buf,
+                bytes_read,
+            )?;
+            // Little-endian bit order: entry 0 at LSB
+            let bit_pos = (entry_in_block % entries_per_byte) * refcount_bits as u64;
+            let mask = (1u64 << refcount_bits) - 1;
+            Some((raw_byte as u64 >> bit_pos) & mask)
+        }
+        8 => {
+            let entry_byte_off = refblock_offset.checked_add(entry_in_block)?;
+            let rc = read_u8_cached(
+                call_table,
+                device_idx,
+                entry_byte_off,
+                sector_size,
+                input_capacity,
+                refblock_cached_sector,
+                refblock_cache_buf,
+                bytes_read,
+            )?;
+            Some(rc as u64)
+        }
+        16 => {
+            let entry_byte_off = entry_in_block
+                .checked_mul(2)
+                .and_then(|v| refblock_offset.checked_add(v))?;
+            let rc = read_u16_be_cached(
+                call_table,
+                device_idx,
+                entry_byte_off,
+                sector_size,
+                input_capacity,
+                refblock_cached_sector,
+                refblock_cache_buf,
+                bytes_read,
+            )?;
+            Some(rc as u64)
+        }
+        32 => {
+            let entry_byte_off = entry_in_block
+                .checked_mul(4)
+                .and_then(|v| refblock_offset.checked_add(v))?;
+            let rc = read_u32_be_cached(
+                call_table,
+                device_idx,
+                entry_byte_off,
+                sector_size,
+                input_capacity,
+                refblock_cached_sector,
+                refblock_cache_buf,
+                bytes_read,
+            )?;
+            Some(rc as u64)
+        }
+        64 => {
+            let entry_byte_off = entry_in_block
+                .checked_mul(8)
+                .and_then(|v| refblock_offset.checked_add(v))?;
+            let rc = read_u64_be_cached(
+                call_table,
+                device_idx,
+                entry_byte_off,
+                sector_size,
+                input_capacity,
+                refblock_cached_sector,
+                refblock_cache_buf,
+                bytes_read,
+            )?;
+            Some(rc)
+        }
+        _ => None, // Unsupported refcount width
     }
 }
 
@@ -1554,9 +1682,6 @@ pub unsafe fn read_chain_virtual_cluster(
                 };
 
                 let qcow2_cluster_size = state.cluster_size;
-                if qcow2_cluster_size > MAX_SECTOR_SIZE as u64 {
-                    return false;
-                }
 
                 // Capture fields before mutable borrow in cluster_lookup
                 let compression_type = state.compression_type;
@@ -1568,18 +1693,33 @@ pub unsafe fn read_chain_virtual_cluster(
                         continue;
                     }
                     Some(ClusterLookup::Standard(host_offset)) => {
+                        // For large clusters (> chunk_size), calculate
+                        // the intra-cluster offset to read only the
+                        // requested chunk rather than the full cluster.
+                        let intra_offset = virtual_offset % qcow2_cluster_size;
+                        let read_offset = host_offset + intra_offset;
+                        let read_size = if chunk_size < qcow2_cluster_size {
+                            chunk_size
+                        } else {
+                            qcow2_cluster_size
+                        };
                         return read_cluster_sectors(
                             call_table,
                             dev_idx as u32,
-                            host_offset,
+                            read_offset,
                             buf,
-                            qcow2_cluster_size,
+                            read_size,
                             sector_size,
                             bytes_read,
                         );
                     }
                     #[cfg(feature = "decompress")]
                     Some(ClusterLookup::Compressed(l2_entry)) => {
+                        // Compressed clusters with large cluster sizes
+                        // can't be decompressed into chunk-sized buffers.
+                        if qcow2_cluster_size > MAX_SECTOR_SIZE as u64 {
+                            return false;
+                        }
                         // Dispatch based on compression type:
                         // 0 = zlib (deflate), 1 = zstd
                         #[cfg(feature = "decompress-zstd")]

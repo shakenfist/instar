@@ -218,6 +218,9 @@ const GUEST_MEM_SIZE: u64 = 0x2000000;
 // Maximum sector size supported by guest (must match guest's MAX_SECTOR_SIZE)
 const MAX_SECTOR_SIZE: u32 = 65536; // 64KB
 
+// Maximum QCOW2 cluster size supported (must match guest's MAX_CLUSTER_SIZE)
+const MAX_CLUSTER_SIZE: usize = 2 * 1024 * 1024; // 2MB
+
 // Serial port (COM1 - protobuf messages)
 const SERIAL_PORT: u16 = 0x3f8;
 
@@ -3805,16 +3808,16 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         .into());
     }
 
-    // Reject images with cluster_size > MAX_SECTOR_SIZE (64KB).
-    // The guest buffer is limited to MAX_SECTOR_SIZE, so larger clusters
-    // cannot be processed correctly.
+    // Reject images with cluster_size > MAX_CLUSTER_SIZE (2MB).
+    // Large clusters are processed in MAX_SECTOR_SIZE-sized chunks by
+    // the guest, but the QCOW2 header parser limits at MAX_CLUSTER_SIZE.
     for image in chain.images() {
-        if image.cluster_size > MAX_SECTOR_SIZE {
+        if image.cluster_size as usize > MAX_CLUSTER_SIZE {
             return Err(format!(
                 "cluster size {}KB in {} exceeds maximum supported {}KB",
                 image.cluster_size / 1024,
                 image.path.display(),
-                MAX_SECTOR_SIZE / 1024
+                MAX_CLUSTER_SIZE / 1024
             )
             .into());
         }
