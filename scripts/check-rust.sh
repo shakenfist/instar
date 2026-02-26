@@ -63,9 +63,16 @@ if [ -d "$PROJECT_ROOT/src" ]; then
         run_in_docker "src" cargo fmt --all -- --check || FAILED=1
     fi
 
-    # Run clippy only on imago crate (guest crates are no_std and don't support clippy)
-    echo "Running clippy on imago..."
-    run_in_docker "src" cargo clippy -p imago -- -D warnings || FAILED=1
+    # Run clippy on all workspace crates except no_main guest binaries
+    echo "Running clippy on workspace..."
+    run_in_docker "src" cargo clippy --workspace \
+        --exclude core \
+        --exclude info \
+        --exclude copy \
+        --exclude check \
+        --exclude compare \
+        --exclude convert \
+        -- -D warnings || FAILED=1
 
     echo ""
 fi

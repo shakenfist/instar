@@ -69,7 +69,8 @@ jobs:
         run: |
           # Build the devcontainer and run cargo build + test inside it
           make imago
-          # Run unit tests inside the container
+          # Run unit tests inside the container (all workspace crates
+          # except no_main guest binaries)
           docker run --rm \
             -u "$(id -u):$(id -g)" \
             -e HOME=/build \
@@ -78,9 +79,15 @@ jobs:
             -v "$(pwd):/workspace" \
             -v "$(pwd)/.cargo-cache/registry:/build/.cargo/registry" \
             -v "$(pwd)/.cargo-cache/git:/build/.cargo/git" \
-            -w "/workspace/src/vmm" \
+            -w "/workspace/src" \
             imago-build \
-            cargo test --release
+            cargo test --release --workspace \
+              --exclude core \
+              --exclude info \
+              --exclude copy \
+              --exclude check \
+              --exclude compare \
+              --exclude convert
 
       - name: Test config commands in container
         run: |

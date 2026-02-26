@@ -8,13 +8,18 @@
 //! All code is `no_std` compatible for bare-metal KVM guest execution.
 
 #![no_std]
+// Guest crate I/O uses function pointers (no closures/trait objects in
+// no_std), so cached-read helpers inherently need many parameters.
+#![allow(clippy::too_many_arguments)]
 
 #[cfg(feature = "decompress-zstd")]
 extern crate alloc;
 
+#[cfg(any(feature = "decompress", feature = "decompress-zstd"))]
+use shared::COMPRESSED_BUF_SIZE;
 use shared::{
     l1_cache_addr, l2_cache_addr, BackingFormat, CallTable, ChainConfig, ImageFormat,
-    COMPRESSED_BUF_SIZE, MAX_CHAIN_DEVICES, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE,
+    MAX_CHAIN_DEVICES, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE,
 };
 
 // ============================================================================
@@ -308,7 +313,7 @@ impl QcowHeader {
         }
 
         let cluster_bits = be_u32(header, CLUSTER_BITS_OFFSET);
-        if cluster_bits < 9 || cluster_bits > 21 {
+        if !(9..=21).contains(&cluster_bits) {
             return None;
         }
         let cluster_size = 1u64 << cluster_bits;
@@ -782,7 +787,7 @@ impl Qcow2State {
             state.l1_cache_buf,
             bytes_read,
         )?;
-        if cluster_bits < 9 || cluster_bits > 21 {
+        if !(9..=21).contains(&cluster_bits) {
             return None;
         }
         let cluster_size = 1u64 << cluster_bits;
@@ -1800,11 +1805,11 @@ pub unsafe fn init_chain_qcow2_states(
     dynamic_bufs_start: usize,
     bytes_read: &mut u64,
 ) -> bool {
-    for dev_idx in 0..device_count {
+    for (dev_idx, state) in qcow2_states.iter_mut().enumerate().take(device_count) {
         let dev_info = &chain_config.devices[dev_idx];
         if matches!(dev_info.detected_format(), ImageFormat::Qcow2) {
             let cap = (call_table.get_input_capacity)(dev_idx as u32);
-            qcow2_states[dev_idx] = Qcow2State::init(
+            *state = Qcow2State::init(
                 call_table,
                 dev_idx as u32,
                 sector_size,
@@ -1813,7 +1818,7 @@ pub unsafe fn init_chain_qcow2_states(
                 l2_cache_addr(dynamic_bufs_start, dev_idx),
                 bytes_read,
             );
-            if qcow2_states[dev_idx].is_none() {
+            if state.is_none() {
                 return false;
             }
         }
