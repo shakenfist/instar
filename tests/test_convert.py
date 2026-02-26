@@ -2284,3 +2284,113 @@ class TestConvertToVmdk(ImagoTestBase):
     def test_vmdk_to_vmdk_roundtrip(self):
         """Round-trip: vmdk -> vmdk -> raw."""
         self._test_to_vmdk_roundtrip('plaso-vmdk')
+
+
+class TestConvertToVmdkCompressed(ImagoTestBase):
+    """Test converting images to streamOptimized VMDK output.
+
+    Uses -O vmdk -c to produce compressed streamOptimized VMDKs,
+    then verifies by converting back to raw and comparing.
+    """
+
+    def _test_to_vmdk_compressed_roundtrip(
+        self, image_id, timeout=120
+    ):
+        """Convert to streamOptimized VMDK, round-trip, compare."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.vmdk') as vmdk_out, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as rt_raw, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as qemu_raw:
+            # Convert to streamOptimized VMDK
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(vmdk_out.name),
+                output_format='vmdk',
+                compress=True,
+                timeout=timeout
+            )
+            self.assertEqual(
+                rc, 0,
+                f'imago convert to streamOptimized vmdk '
+                f'failed for {image_id}: {stderr}'
+            )
+
+            # Verify qemu-img can read and reports
+            # streamOptimized format
+            result = subprocess.run(
+                [
+                    'qemu-img', 'info', '--output=json',
+                    vmdk_out.name,
+                ],
+                capture_output=True, text=True,
+                timeout=30
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img info failed: {result.stderr}'
+            )
+            info = json.loads(result.stdout)
+            self.assertEqual(
+                info.get('format'), 'vmdk',
+                f'Not VMDK: {info.get("format")}'
+            )
+
+            # Round-trip: streamOptimized VMDK -> raw
+            rt_stdout, rt_stderr, rt_rc = \
+                self.run_imago_convert(
+                    Path(vmdk_out.name),
+                    Path(rt_raw.name),
+                    timeout=timeout
+                )
+            self.assertEqual(
+                rt_rc, 0,
+                f'Round-trip convert failed for '
+                f'{image_id}: {rt_stderr}'
+            )
+
+            # Convert original to raw with qemu-img
+            q_stdout, q_stderr, q_rc = \
+                self.run_qemu_img_convert(
+                    image.path, Path(qemu_raw.name),
+                    timeout=timeout
+                )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed: {q_stderr}'
+            )
+
+            # Compare round-tripped raw vs qemu-img raw
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(rt_raw.name),
+                Path(qemu_raw.name),
+                timeout=timeout
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Round-trip mismatch for {image_id}: '
+                f'{cmp_out}'
+            )
+
+    def test_raw_to_streamoptimized_vmdk(self):
+        """Round-trip: raw -> streamOptimized vmdk -> raw."""
+        self._test_to_vmdk_compressed_roundtrip(
+            'raw-mbr-partitioned'
+        )
+
+    def test_qcow2_to_streamoptimized_vmdk(self):
+        """Round-trip: qcow2 -> streamOptimized vmdk -> raw."""
+        self._test_to_vmdk_compressed_roundtrip(
+            'cirros-qcow2'
+        )
+
+    def test_vmdk_to_streamoptimized_vmdk(self):
+        """Round-trip: vmdk -> streamOptimized vmdk -> raw."""
+        self._test_to_vmdk_compressed_roundtrip('plaso-vmdk')

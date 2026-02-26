@@ -17,15 +17,15 @@ extern crate alloc;
 
 use core::panic::PanicInfo;
 
-// 256KB bump allocator for miniz_oxide compression and ruzstd
-// ZSTD decoding. Reset HEAP_POS to 0 between operations.
-shared::bump_allocator!(256 * 1024);
+// Bump allocator backed by scratch memory for miniz_oxide compression
+// and ruzstd ZSTD decoding. Reset HEAP_POS to 0 between operations.
+shared::bump_allocator!();
 
 use shared::{
     is_all_zeros_ptr, should_report_progress, validate_call_table, verify_sector_sizes, CallTable,
-    ChainConfig, ConvertConfig, ImageFormat, CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR,
+    ChainConfig, ConvertConfig, ImageFormat, ALLOC_HEAP_BASE, CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR,
     COMPRESSED_BUF_SIZE, MAX_CHAIN_DEVICES, MAX_SECTOR_SIZE, OPERATION_CONFIG_ADDR,
-    SCRATCH_MEM_BASE, SCRATCH_MEM_END,
+    SCRATCH_MEM_BASE,
 };
 
 // ================================================================
@@ -59,7 +59,7 @@ const BUF_REFCOUNT: usize = BUF_HEADER + MAX_SECTOR_SIZE;
 const DYNAMIC_BUFS_START: usize = BUF_REFCOUNT + MAX_SECTOR_SIZE;
 
 const _: () = assert!(
-    DYNAMIC_BUFS_START + MAX_CHAIN_DEVICES * 2 * MAX_SECTOR_SIZE <= SCRATCH_MEM_END,
+    DYNAMIC_BUFS_START + MAX_CHAIN_DEVICES * 2 * MAX_SECTOR_SIZE <= ALLOC_HEAP_BASE,
     "Scratch memory too small for MAX_CHAIN_DEVICES L1/L2 caches"
 );
 
@@ -178,16 +178,31 @@ pub unsafe extern "C" fn _start() -> u64 {
                 )
             }
         }
-        ImageFormat::Vmdk4 => convert_to_vmdk(
-            call_table,
-            chain_config,
-            &mut chain_states,
-            input_device_count,
-            virtual_size,
-            sector_size,
-            skip_zeros,
-            &mut bytes_read,
-        ),
+        ImageFormat::Vmdk4 => {
+            if config.should_compress() {
+                convert_to_vmdk_compressed(
+                    call_table,
+                    chain_config,
+                    &mut chain_states,
+                    input_device_count,
+                    virtual_size,
+                    sector_size,
+                    skip_zeros,
+                    &mut bytes_read,
+                )
+            } else {
+                convert_to_vmdk(
+                    call_table,
+                    chain_config,
+                    &mut chain_states,
+                    input_device_count,
+                    virtual_size,
+                    sector_size,
+                    skip_zeros,
+                    &mut bytes_read,
+                )
+            }
+        }
         _ => convert_to_raw(
             call_table,
             chain_config,
@@ -507,7 +522,7 @@ unsafe fn init_qcow2_output_layout(
     let l1_clusters = ((l1_size_bytes as u64 + cluster_size - 1) / cluster_size).max(1);
     let l1_write_bytes = l1_clusters as usize * cluster_size as usize;
 
-    if l1_buf_addr + l1_write_bytes > SCRATCH_MEM_END {
+    if l1_buf_addr + l1_write_bytes > ALLOC_HEAP_BASE {
         (call_table.debug_print)(b"convert: L1 too large for scratch\n\0".as_ptr());
         (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
         return None;
@@ -967,10 +982,10 @@ unsafe fn convert_to_qcow2_compressed(
 
     // Refcount tracking array follows compressor state
     let refcount_array_addr = (compressor_addr + compressor_size + 1) & !1;
-    let refcount_array_bytes = SCRATCH_MEM_END - refcount_array_addr;
+    let refcount_array_bytes = ALLOC_HEAP_BASE - refcount_array_addr;
     let max_refcount_entries = refcount_array_bytes / 2;
 
-    if refcount_array_addr >= SCRATCH_MEM_END || max_refcount_entries < 64 {
+    if refcount_array_addr >= ALLOC_HEAP_BASE || max_refcount_entries < 64 {
         (call_table.debug_print)(b"convert: no room for refcount array\n\0".as_ptr());
         (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
         return *bytes_read;
@@ -1298,7 +1313,7 @@ unsafe fn init_vmdk_output_layout(
     // Round up to 8-byte alignment for safety
     let gd_alloc = (gd_bytes + 7) & !7;
 
-    if gd_buf_addr + gd_alloc > SCRATCH_MEM_END {
+    if gd_buf_addr + gd_alloc > ALLOC_HEAP_BASE {
         (call_table.debug_print)(b"convert: VMDK GD too large for scratch\n\0".as_ptr());
         (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
         return None;
@@ -1560,6 +1575,369 @@ unsafe fn convert_to_vmdk(
             (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
             return *bytes_read;
         }
+    }
+
+    (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, true);
+    (call_table.verbose_print)(b"convert: done\n\0".as_ptr());
+    *bytes_read
+}
+
+// ================================================================
+// streamOptimized VMDK output (Phase 8e)
+// ================================================================
+
+/// Convert input to streamOptimized VMDK format with DEFLATE
+/// compression.
+///
+/// Layout:
+///   Header (512B, gd_offset=GD_AT_END) | Descriptor |
+///   Grain markers + compressed data | GTs | GD |
+///   Footer (512B, real gd_offset) | EOS marker (512B zeros)
+#[allow(clippy::too_many_arguments)]
+unsafe fn convert_to_vmdk_compressed(
+    call_table: &CallTable,
+    chain_config: &ChainConfig,
+    chain_states: &mut qcow2::ChainStates,
+    input_device_count: usize,
+    virtual_size: u64,
+    sector_size: usize,
+    skip_zeros: bool,
+    bytes_read: &mut u64,
+) -> u64 {
+    let layout =
+        match init_vmdk_output_layout(call_table, input_device_count, virtual_size, bytes_read) {
+            Some(l) => l,
+            None => return *bytes_read,
+        };
+
+    let buf_data = BUF_DATA as *mut u8;
+    let buf_gt = BUF_L2_OUT as *mut u8;
+    // Reuse BUF_COMPRESSED_IN as the staging buffer for grain
+    // markers + compressed data. We compress into offset 12
+    // (after the marker header) so the result is contiguous.
+    let buf_staging = BUF_COMPRESSED_IN as *mut u8;
+    let oss = layout.output_sector_size;
+    let oc = layout.output_capacity;
+
+    // CompressorOxide state follows GD buffer in scratch memory
+    let gd_buf_end = (layout.gd_buf as usize) + ((layout.gd_bytes + 7) & !7);
+    let compressor_addr = (gd_buf_end + 7) & !7;
+    let compressor_size = qcow2::COMPRESSOR_STATE_SIZE;
+    if compressor_addr + compressor_size > ALLOC_HEAP_BASE {
+        (call_table.debug_print)(b"convert: no room for compressor state\n\0".as_ptr());
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
+    }
+    let compressor_mem = compressor_addr as *mut u8;
+
+    (call_table.verbose_print)(b"convert: starting streamOptimized vmdk\n\0".as_ptr());
+    // Write position starts after header+descriptor (sector-aligned)
+    let mut write_pos = layout.grain_data_start;
+    let mut grains_done: u64 = 0;
+    let mut last_percent: u32 = 0;
+
+    let gd_slice = core::slice::from_raw_parts_mut(layout.gd_buf, layout.gd_bytes);
+
+    // Process each GD entry
+    for gd_idx in 0..layout.num_gd_entries {
+        // Zero the GT buffer
+        core::ptr::write_bytes(buf_gt, 0, MAX_SECTOR_SIZE);
+
+        let mut gt_has_data = false;
+
+        let first_grain = gd_idx as u64 * VMDK_GTES_PER_GT as u64;
+        let last_grain = core::cmp::min(first_grain + VMDK_GTES_PER_GT as u64, layout.total_grains);
+
+        for grain in first_grain..last_grain {
+            let virtual_offset = grain * VMDK_GRAIN_SIZE_BYTES;
+            let remaining = virtual_size - virtual_offset;
+            let this_chunk = if remaining < VMDK_GRAIN_SIZE_BYTES {
+                remaining
+            } else {
+                VMDK_GRAIN_SIZE_BYTES
+            };
+
+            // Reset bump allocator before ZSTD decompression
+            HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
+
+            // Read input data
+            if !qcow2::read_chain_virtual_cluster(
+                call_table,
+                0,
+                input_device_count,
+                virtual_offset,
+                buf_data,
+                this_chunk,
+                sector_size,
+                chain_config,
+                chain_states,
+                BUF_COMPRESSED_IN as *mut u8,
+                bytes_read,
+            ) {
+                (call_table.send_error)(
+                    b"convert\0".as_ptr(),
+                    b"input\0".as_ptr(),
+                    virtual_offset / sector_size as u64,
+                    1,
+                );
+                (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+                return *bytes_read;
+            }
+            // Skip zero grains
+            if skip_zeros && is_all_zeros_ptr(buf_data, this_chunk as usize) {
+                grains_done += 1;
+                let pct = (grains_done * 100 / layout.total_grains) as u32;
+                if should_report_progress(layout.progress_interval, pct, last_percent, grains_done)
+                {
+                    (call_table.send_progress)(
+                        b"convert\0".as_ptr(),
+                        grains_done,
+                        layout.total_grains,
+                        pct,
+                    );
+                    last_percent = pct;
+                }
+                continue;
+            }
+
+            // Zero-pad partial final grain
+            if this_chunk < VMDK_GRAIN_SIZE_BYTES {
+                core::ptr::write_bytes(
+                    buf_data.add(this_chunk as usize),
+                    0,
+                    (VMDK_GRAIN_SIZE_BYTES - this_chunk) as usize,
+                );
+            }
+
+            // Reset bump allocator before compression
+            HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
+
+            // Compress the grain into staging buffer at offset 12
+            // (leaving room for the grain marker header).
+            let compress_out = buf_staging.add(vmdk::GRAIN_MARKER_SIZE);
+            let compress_cap = COMPRESSED_BUF_SIZE - vmdk::GRAIN_MARKER_SIZE;
+            let compressed_len = qcow2::compress_deflate_raw(
+                compressor_mem,
+                buf_data,
+                VMDK_GRAIN_SIZE_BYTES as usize,
+                compress_out,
+                compress_cap,
+            );
+
+            if compressed_len == 0 {
+                (call_table.debug_print)(b"convert: vmdk compression error\n\0".as_ptr());
+                (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+                return *bytes_read;
+            }
+
+            // Build grain marker: 12 bytes (u64 LBA + u32 size)
+            // followed by compressed data, padded to 512 bytes.
+            let lba = virtual_offset / 512;
+            let marker_plus_data = vmdk::GRAIN_MARKER_SIZE as u64 + compressed_len as u64;
+            let padded = (marker_plus_data + 511) & !511;
+
+            // Write marker header into the first 12 bytes
+            let staging = core::slice::from_raw_parts_mut(buf_staging, padded as usize);
+            vmdk::write_le_u64(staging, 0, lba);
+            vmdk::write_le_u32(staging, 8, compressed_len as u32);
+            // Zero padding after compressed data
+            let data_end = vmdk::GRAIN_MARKER_SIZE + compressed_len;
+            if data_end < padded as usize {
+                core::ptr::write_bytes(buf_staging.add(data_end), 0, padded as usize - data_end);
+            }
+
+            // Write marker + compressed data to output
+            if !write_bytes_to_output(call_table, buf_staging, write_pos, padded, oss, oc) {
+                (call_table.send_error)(
+                    b"convert\0".as_ptr(),
+                    b"output\0".as_ptr(),
+                    write_pos / oss as u64,
+                    2,
+                );
+                (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+                return *bytes_read;
+            }
+
+            // Record GTE: sector offset of grain marker
+            let gt_idx = (grain - first_grain) as usize;
+            let gt_slice = core::slice::from_raw_parts_mut(buf_gt, VMDK_GT_BYTES as usize);
+            vmdk::write_le_u32(gt_slice, gt_idx * 4, (write_pos / 512) as u32);
+
+            write_pos += padded;
+            gt_has_data = true;
+            grains_done += 1;
+
+            let pct = (grains_done * 100 / layout.total_grains) as u32;
+            if should_report_progress(layout.progress_interval, pct, last_percent, grains_done) {
+                (call_table.send_progress)(
+                    b"convert\0".as_ptr(),
+                    grains_done,
+                    layout.total_grains,
+                    pct,
+                );
+                last_percent = pct;
+            }
+        }
+
+        // Write GT if any grains were written
+        if gt_has_data {
+            write_pos = (write_pos + 511) & !511;
+
+            let gt_write_bytes = (VMDK_GT_BYTES + 511) & !511;
+            let gt_sectors = gt_write_bytes / 512;
+
+            // Write GT marker before the GT data
+            let buf_marker = BUF_REFCOUNT as *mut u8;
+            core::ptr::write_bytes(buf_marker, 0, 512);
+            let marker_slice = core::slice::from_raw_parts_mut(buf_marker, 512);
+            vmdk::build_metadata_marker(marker_slice, gt_sectors as u64, vmdk::MARKER_GT);
+            if !write_bytes_to_output(call_table, buf_marker, write_pos, 512, oss, oc) {
+                (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+                return *bytes_read;
+            }
+            write_pos += 512;
+
+            // Write GT data
+            if !write_bytes_to_output(call_table, buf_gt, write_pos, gt_write_bytes, oss, oc) {
+                (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+                return *bytes_read;
+            }
+
+            // GD entry points to the GT data (after marker)
+            vmdk::write_le_u32(gd_slice, gd_idx as usize * 4, (write_pos / 512) as u32);
+            write_pos += gt_write_bytes;
+        }
+    }
+
+    // -- Write GD marker + GD --
+    write_pos = (write_pos + 511) & !511;
+    let gd_write_bytes = ((layout.gd_bytes as u64 + 511) & !511).max(512);
+    let gd_sectors = gd_write_bytes / 512;
+
+    // GD marker
+    let buf_marker = BUF_REFCOUNT as *mut u8;
+    core::ptr::write_bytes(buf_marker, 0, 512);
+    let marker_slice = core::slice::from_raw_parts_mut(buf_marker, 512);
+    vmdk::build_metadata_marker(marker_slice, gd_sectors as u64, vmdk::MARKER_GD);
+    if !write_bytes_to_output(call_table, buf_marker, write_pos, 512, oss, oc) {
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
+    }
+    write_pos += 512;
+
+    // GD data
+    let gd_byte_offset = write_pos;
+    let buf_staging = BUF_HEADER as *mut u8;
+    core::ptr::write_bytes(buf_staging, 0, gd_write_bytes as usize);
+    core::ptr::copy_nonoverlapping(layout.gd_buf, buf_staging, layout.gd_bytes);
+    if !write_bytes_to_output(
+        call_table,
+        buf_staging,
+        gd_byte_offset,
+        gd_write_bytes,
+        oss,
+        oc,
+    ) {
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
+    }
+    write_pos += gd_write_bytes;
+
+    // -- Pad to MAX_SECTOR_SIZE boundary --
+    // The footer structure (marker + footer + EOS = 3 sectors) must
+    // be at the very end of the file. Pad so that the total file
+    // size (write_pos + 1536) is a multiple of MAX_SECTOR_SIZE.
+    // This ensures the VMDK can be read back with any sector size
+    // up to MAX_SECTOR_SIZE without the capacity rounding up and
+    // misaligning the footer.
+    let footer_tail = 3 * 512u64; // marker + footer + EOS
+    let total_before_pad = write_pos + footer_tail;
+    let padded_total =
+        (total_before_pad + MAX_SECTOR_SIZE as u64 - 1) & !(MAX_SECTOR_SIZE as u64 - 1);
+    let pad_bytes = padded_total - total_before_pad;
+    if pad_bytes > 0 {
+        // Write zero-filled padding sectors
+        let buf_pad = BUF_REFCOUNT as *mut u8;
+        core::ptr::write_bytes(buf_pad, 0, MAX_SECTOR_SIZE);
+        let mut remaining = pad_bytes;
+        while remaining > 0 {
+            let chunk = core::cmp::min(remaining, oss as u64);
+            if !write_bytes_to_output(call_table, buf_pad, write_pos, chunk, oss, oc) {
+                (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+                return *bytes_read;
+            }
+            write_pos += chunk;
+            remaining -= chunk;
+        }
+    }
+
+    // -- Write footer marker + footer --
+    // Footer marker
+    core::ptr::write_bytes(buf_marker, 0, 512);
+    let marker_slice = core::slice::from_raw_parts_mut(buf_marker, 512);
+    vmdk::build_metadata_marker(
+        marker_slice,
+        1, // footer is 1 sector
+        vmdk::MARKER_FOOTER,
+    );
+    if !write_bytes_to_output(call_table, buf_marker, write_pos, 512, oss, oc) {
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
+    }
+    write_pos += 512;
+
+    // Footer (header copy with real GD offset)
+    let buf_footer = BUF_HEADER as *mut u8;
+    core::ptr::write_bytes(buf_footer, 0, 512);
+    let footer_slice = core::slice::from_raw_parts_mut(buf_footer, 512);
+    let overhead_sectors = layout.grain_data_start / 512;
+    vmdk::build_streamoptimized_header(
+        footer_slice,
+        layout.capacity_sectors,
+        VMDK_GRAIN_SIZE_SECTORS,
+        VMDK_GTES_PER_GT,
+        gd_byte_offset / 512, // Real GD offset in the footer
+        overhead_sectors,
+    );
+    if !write_bytes_to_output(call_table, buf_footer, write_pos, 512, oss, oc) {
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
+    }
+    write_pos += 512;
+
+    // -- Write EOS marker (sector of zeros) --
+    core::ptr::write_bytes(buf_footer, 0, 512);
+    if !write_bytes_to_output(call_table, buf_footer, write_pos, 512, oss, oc) {
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
+    }
+
+    // -- Write header at offset 0 (gd_offset = GD_AT_END) --
+    let buf_hdr = BUF_HEADER as *mut u8;
+    core::ptr::write_bytes(buf_hdr, 0, 512);
+    let hdr_slice = core::slice::from_raw_parts_mut(buf_hdr, 512);
+    vmdk::build_streamoptimized_header(
+        hdr_slice,
+        layout.capacity_sectors,
+        VMDK_GRAIN_SIZE_SECTORS,
+        VMDK_GTES_PER_GT,
+        vmdk::GD_AT_END, // GD_AT_END sentinel (raw value)
+        overhead_sectors,
+    );
+    if !write_bytes_to_output(call_table, buf_hdr, 0, 512, oss, oc) {
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
+    }
+
+    // -- Write descriptor at offset 512 --
+    let buf_desc = BUF_REFCOUNT as *mut u8;
+    let desc_bytes = vmdk::DESC_SECTORS * 512;
+    core::ptr::write_bytes(buf_desc, 0, desc_bytes as usize);
+    let desc_slice = core::slice::from_raw_parts_mut(buf_desc, desc_bytes as usize);
+    vmdk::build_streamoptimized_descriptor(desc_slice, 0, layout.capacity_sectors);
+    if !write_bytes_to_output(call_table, buf_desc, 512, desc_bytes, oss, oc) {
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
     }
 
     (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, true);

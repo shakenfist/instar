@@ -8,12 +8,16 @@
 pub mod format_detection;
 pub mod virtio;
 
-/// Define a bump allocator with a fixed-size static heap.
+/// Define a bump allocator backed by a fixed address in guest memory.
 ///
-/// This macro generates a `BumpAllocator` struct, a static heap array,
-/// and registers it as `#[global_allocator]`. Used by operations that
-/// need `alloc` support (e.g., for ruzstd ZSTD decoding or miniz_oxide
-/// compression).
+/// This macro generates a `BumpAllocator` struct and registers it as
+/// `#[global_allocator]`. Used by operations that need `alloc` support
+/// (e.g., for ruzstd ZSTD decoding or miniz_oxide compression).
+///
+/// The heap lives at a fixed address in scratch memory (not a static
+/// array) to avoid .bss bloat that can overlap with the config area
+/// at 0x80000. Guest memory is zeroed on creation, so no explicit
+/// initialization is needed.
 ///
 /// The allocator never frees; callers must reset `HEAP_POS` to 0
 /// between logical operations that don't need persistent heap state.
@@ -21,18 +25,18 @@ pub mod virtio;
 /// # Example
 ///
 /// ```ignore
-/// shared::bump_allocator!(256 * 1024); // 256KB heap
+/// shared::bump_allocator!();
 ///
 /// // Reset before each decompression call:
 /// HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 /// ```
 #[macro_export]
 macro_rules! bump_allocator {
-    ($heap_size:expr) => {
+    () => {
         struct BumpAllocator;
 
-        const HEAP_SIZE: usize = $heap_size;
-        static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
+        const HEAP_BASE: usize = shared::ALLOC_HEAP_BASE;
+        const HEAP_SIZE: usize = shared::ALLOC_HEAP_SIZE;
         static HEAP_POS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
         unsafe impl core::alloc::GlobalAlloc for BumpAllocator {
@@ -49,7 +53,7 @@ macro_rules! bump_allocator {
                 }
 
                 HEAP_POS.store(new_pos, core::sync::atomic::Ordering::Relaxed);
-                unsafe { HEAP.as_mut_ptr().add(aligned) }
+                (HEAP_BASE + aligned) as *mut u8
             }
 
             unsafe fn dealloc(&self, _ptr: *mut u8, _layout: core::alloc::Layout) {
@@ -118,6 +122,22 @@ const _: () = assert!(
 
 /// Scratch memory size in bytes (~12.9 MiB)
 pub const SCRATCH_MEM_SIZE: usize = SCRATCH_MEM_END - SCRATCH_MEM_BASE;
+
+/// Size of the bump allocator heap (512 KiB).
+/// Must be large enough for miniz_oxide CompressorOxide Box allocations
+/// (~253 KiB) plus ruzstd ZSTD decoder allocations.
+pub const ALLOC_HEAP_SIZE: usize = 512 * 1024;
+
+/// Base address for the bump allocator heap in scratch memory.
+/// Placed at the end of scratch memory to avoid conflicts with
+/// operation-specific buffers that grow forward from SCRATCH_MEM_BASE.
+pub const ALLOC_HEAP_BASE: usize = SCRATCH_MEM_END - ALLOC_HEAP_SIZE;
+
+// Compile-time check: allocator heap must be within scratch memory.
+const _: () = assert!(
+    ALLOC_HEAP_BASE >= SCRATCH_MEM_BASE,
+    "ALLOC_HEAP_BASE is below SCRATCH_MEM_BASE"
+);
 
 /// Maximum sector size supported
 pub const MAX_SECTOR_SIZE: usize = 65536;

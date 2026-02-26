@@ -77,6 +77,22 @@ pub const GRAIN_MARKER_SIZE: usize = 12;
 pub const VMDK4_MAGIC: u32 = 0x564D_444B;
 
 // ============================================================================
+// Metadata marker types (streamOptimized)
+// ============================================================================
+
+/// End-of-stream marker type.
+pub const MARKER_EOS: u32 = 0;
+/// Grain table marker type.
+pub const MARKER_GT: u32 = 1;
+/// Grain directory marker type.
+pub const MARKER_GD: u32 = 2;
+/// Footer marker type.
+pub const MARKER_FOOTER: u32 = 3;
+
+/// Size of a metadata marker (one sector).
+pub const METADATA_MARKER_SIZE: usize = 512;
+
+// ============================================================================
 // Byte-order helpers
 // ============================================================================
 
@@ -110,6 +126,12 @@ fn le_u64(buf: &[u8], off: usize) -> u64 {
 // ============================================================================
 // Write helpers (little-endian)
 // ============================================================================
+
+/// Write a little-endian u16 to a byte slice.
+#[inline]
+pub fn write_le_u16(buf: &mut [u8], off: usize, val: u16) {
+    buf[off..off + 2].copy_from_slice(&val.to_le_bytes());
+}
 
 /// Write a little-endian u32 to a byte slice.
 #[inline]
@@ -159,6 +181,79 @@ pub fn build_sparse_header(
     buf[75] = b'\r';
     buf[76] = b'\n';
     // compressAlgorithm = 0 (uncompressed) - already zero
+}
+
+/// Build a streamOptimized VMDK4 header in `buf`.
+///
+/// Similar to `build_sparse_header` but sets compression flags
+/// and uses `GD_AT_END` as the GD offset (the real offset is
+/// stored in the footer).
+/// `buf` must be at least 512 bytes and should be pre-zeroed.
+pub fn build_streamoptimized_header(
+    buf: &mut [u8],
+    capacity_sectors: u64,
+    grain_size_sectors: u64,
+    num_gtes_per_gt: u32,
+    gd_offset_sectors: u64,
+    overhead_sectors: u64,
+) {
+    write_le_u32(buf, MAGIC_OFFSET, VMDK4_MAGIC);
+    write_le_u32(buf, VERSION_OFFSET, 3);
+    write_le_u32(
+        buf,
+        FLAGS_OFFSET,
+        FLAG_VALID_NEW_LINE | FLAG_COMPRESSED | FLAG_MARKER | FLAG_ZERO_GRAIN,
+    );
+    write_le_u64(buf, CAPACITY_OFFSET, capacity_sectors);
+    write_le_u64(buf, GRAIN_SIZE_OFFSET, grain_size_sectors);
+    write_le_u64(buf, DESC_OFFSET_OFFSET, 1); // Descriptor at sector 1
+    write_le_u64(buf, DESC_SIZE_OFFSET, DESC_SECTORS);
+    write_le_u32(buf, NUM_GTES_PER_GT_OFFSET, num_gtes_per_gt);
+    write_le_u64(buf, RGD_OFFSET_OFFSET, 0); // No redundant GD
+    write_le_u64(buf, GD_OFFSET_OFFSET, gd_offset_sectors);
+    write_le_u64(buf, OVERHEAD_OFFSET, overhead_sectors);
+    // Newline detection bytes (for FLAG_VALID_NEW_LINE)
+    buf[73] = b'\n';
+    buf[74] = b' ';
+    buf[75] = b'\r';
+    buf[76] = b'\n';
+    write_le_u16(buf, COMPRESS_ALGORITHM_OFFSET, COMPRESS_DEFLATE);
+}
+
+/// Build a streamOptimized descriptor into `buf` starting at
+/// `offset`. Returns the number of bytes written.
+pub fn build_streamoptimized_descriptor(
+    buf: &mut [u8],
+    offset: usize,
+    capacity_sectors: u64,
+) -> usize {
+    let mut pos = offset;
+
+    let mut put = |bytes: &[u8]| {
+        let end = pos + bytes.len();
+        if end <= buf.len() {
+            buf[pos..end].copy_from_slice(bytes);
+        }
+        pos = end;
+    };
+
+    put(b"# Disk DescriptorFile\n");
+    put(b"version=1\n");
+    put(b"CID=fffffffe\n");
+    put(b"parentCID=ffffffff\n");
+    put(b"createType=\"streamOptimized\"\n\n");
+    put(b"# Extent description\n");
+    put(b"RW ");
+
+    let mut num_buf = [0u8; 20];
+    let num_str = format_u64(capacity_sectors, &mut num_buf);
+    put(num_str);
+
+    put(b" SPARSE \"output.vmdk\"\n\n");
+    put(b"# The Disk Data Base\n");
+    put(b"#DDB\n");
+
+    pos - offset
 }
 
 /// Build a monolithicSparse descriptor into `buf` starting at
@@ -215,6 +310,21 @@ fn format_u64(mut val: u64, buf: &mut [u8; 20]) -> &[u8] {
         val /= 10;
     }
     &buf[pos..20]
+}
+
+/// Build a metadata marker into a 512-byte buffer.
+///
+/// Used in streamOptimized VMDK output. Each metadata section
+/// (GT, GD, footer) is preceded by a sector-sized marker.
+///
+/// `buf` must be at least 512 bytes and should be pre-zeroed.
+/// `num_sectors` is the number of data sectors that follow.
+/// `marker_type` is one of MARKER_GT, MARKER_GD, MARKER_FOOTER,
+/// or MARKER_EOS.
+pub fn build_metadata_marker(buf: &mut [u8], num_sectors: u64, marker_type: u32) {
+    write_le_u64(buf, 0, num_sectors);
+    write_le_u32(buf, 8, 0); // size (unused for metadata markers)
+    write_le_u32(buf, 12, marker_type);
 }
 
 // ============================================================================
