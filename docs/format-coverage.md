@@ -56,7 +56,7 @@ The `imago convert` operation supports writing output in the following formats:
 |---------------|--------|--------------|
 | **raw** (default) | Supported | Flat byte-for-byte output, sparse output with `-S` |
 | **qcow2** | Supported | QCOW2 v3, 16-bit refcounts, configurable cluster size (512B-64KB), optional zlib compression (`-c`) |
-| vmdk | Not yet | Planned: monolithicSparse with grain table writer |
+| **vmdk** | Supported | monolithicSparse (default), streamOptimized with `-c` (DEFLATE compressed) |
 | vhd | Not yet | Planned: dynamic VHD with BAT writer |
 | vhdx | Not yet | Planned: VHDX with BAT, metadata, and log support |
 
@@ -66,7 +66,8 @@ The `imago convert` operation supports writing output in the following formats:
 |--------------|--------|-------|
 | raw | Supported | With MBR/GPT partition validation (unless `--unsafe-quirks`) |
 | qcow2 (v2/v3) | Supported | Including compressed clusters (zlib and ZSTD), extended L2 entries, backing chain flattening |
-| vmdk | Not yet | Needs grain table reader |
+| vmdk (monolithicSparse) | Supported | Grain directory/table two-level lookup, sector-cached reads |
+| vmdk (streamOptimized) | Supported | DEFLATE decompression, footer-based GD offset resolution |
 | vhd/vhdx | Not yet | Needs BAT reader |
 
 ### Limitations
@@ -111,10 +112,16 @@ The `imago convert` operation supports writing output in the following formats:
 
 | Check | Description | oslo.utils | imago | Test Images |
 |-------|-------------|------------|-------|-------------|
-| descriptor path traversal | Extent paths with `/` | Rejects | **Not checked** | vmdk-path-traversal |
-| descriptor missing extents | No extent declarations | Rejects | **Not checked** | vmdk-no-extents |
-| header/footer consistency | Signature mismatch | Rejects | **Not checked** | (none) |
+| descriptor path traversal | Extent paths with `/` | Rejects | Detects multi-extent (FLAG_NOT_SUPPORTED) | vmdk-path-traversal |
+| descriptor missing extents | No extent declarations | Rejects | Validated via GD/GT walk | vmdk-no-extents |
+| header/footer consistency | Signature mismatch | Rejects | Footer magic validated (streamOptimized) | vmdk-streamoptimized |
 | createType validation | Unsupported types | Partial | Reports createType | vmdk-streamoptimized |
+| grain directory bounds | GD offset within file | N/A | Validated | plaso-vmdk, vmdk-multi-partition |
+| grain table bounds | GT offsets within file | N/A | Validated per GD entry | plaso-vmdk, vmdk-multi-partition |
+| grain data bounds | Grain offsets within file | N/A | Validated per GTE | plaso-vmdk, vmdk-multi-partition |
+| grain overlap | Two grains at same offset | N/A | 1-bit-per-grain bitmap | plaso-vmdk, vmdk-multi-partition |
+| multi-extent detection | Multiple extents in descriptor | N/A | Reports FLAG_NOT_SUPPORTED | (none - no multi-extent test image) |
+| fragmentation | Non-sequential grain layout | N/A | Reports fragmentation count | plaso-vmdk, vmdk-multi-partition |
 
 ### RAW/Partition Table Safety Checks
 
@@ -245,10 +252,6 @@ The `imago convert` operation supports writing output in the following formats:
 2. **luks-v1** - LUKS version 1 encrypted container
 3. **luks-v2** - LUKS version 2 (for version rejection testing)
 
-#### Lower Priority - Edge Cases
-
-4. **vmdk-header-footer-mismatch** - VMDK with inconsistent signatures
-
 ---
 
 ## Implementation Status
@@ -298,13 +301,24 @@ The `imago convert` operation supports writing output in the following formats:
    - VMDK missing extents
    - VDI, QED, and ISO format detection
 
+10. **VMDK Input/Output Support** - Convert supports VMDK as both input and
+    output format. Input: monolithicSparse (grain directory/table lookup) and
+    streamOptimized (DEFLATE decompression). Output: monolithicSparse (default)
+    and streamOptimized with `-c` flag (DEFLATE compressed).
+
+11. **VMDK Structural Integrity Check** - Full GD/GT validation in check
+    operation: grain directory bounds checking, grain table walk with offset
+    validation, grain overlap detection (1-bit-per-grain bitmap in scratch
+    memory), streamOptimized footer validation, multi-extent detection via
+    descriptor parsing, fragmentation measurement.
+
 ### Detections to Add
 
 All oslo.utils formats are now detected. No remaining format detections needed.
 
 ### Safety Checks to Add
 
-1. **VMDK path validation** - Detect path traversal in descriptors
+None currently outstanding. All VMDK safety checks are now implemented.
 
 ### Reporting Enhancements
 

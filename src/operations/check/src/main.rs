@@ -703,19 +703,15 @@ unsafe fn check_vmdk(
 
         result.clusters_allocated += 1;
 
-        // Overlap check for GT
+        // Mark GT grains as metadata in the bitmap.
+        // GT and GD grains may colocate in the same host grain
+        // (especially in small streamOptimized VMDKs), so we mark
+        // without checking AlreadySet — same as header/descriptor/GD.
         if can_track {
             let first_grain = gt_byte_off / grain_size_bytes;
             let last_grain = gt_end.saturating_sub(1) / grain_size_bytes;
             for g in first_grain..=last_grain {
-                if matches!(
-                    bitmap_set(bitmap, bitmap_size, g),
-                    BitmapSetResult::AlreadySet
-                ) {
-                    result.corruptions += 1;
-                    result.total_errors += 1;
-                    (call_table.debug_print)(b"check: GT overlap\n\0".as_ptr());
-                }
+                bitmap_set(bitmap, bitmap_size, g);
             }
         }
 
