@@ -15,7 +15,11 @@
 #[cfg(feature = "decompress-zstd")]
 extern crate alloc;
 
-#[cfg(any(feature = "decompress", feature = "decompress-zstd"))]
+#[cfg(any(
+    feature = "decompress",
+    feature = "decompress-zstd",
+    feature = "vmdk-decompress"
+))]
 use shared::COMPRESSED_BUF_SIZE;
 use shared::{
     l1_cache_addr, l2_cache_addr, BackingFormat, CallTable, ChainConfig, ImageFormat,
@@ -1820,9 +1824,28 @@ pub unsafe fn read_chain_virtual_cluster(
                             bytes_read,
                         );
                     }
-                    Some(GrainLookup::Compressed(_marker_offset)) => {
-                        // Compressed grains (streamOptimized) handled
-                        // in Phase 8c with vmdk decompress feature.
+                    #[cfg(feature = "vmdk-decompress")]
+                    Some(GrainLookup::Compressed(marker_offset)) => {
+                        // Compressed grains can't decompress into
+                        // a buffer smaller than the grain.
+                        if grain_size_bytes > MAX_SECTOR_SIZE as u64 {
+                            return false;
+                        }
+                        return vmdk::read_compressed_grain(
+                            call_table,
+                            dev_idx as u32,
+                            marker_offset,
+                            grain_size_bytes,
+                            buf,
+                            sector_size,
+                            compressed_buf,
+                            COMPRESSED_BUF_SIZE,
+                            cap,
+                            bytes_read,
+                        );
+                    }
+                    #[cfg(not(feature = "vmdk-decompress"))]
+                    Some(GrainLookup::Compressed(_)) => {
                         return false;
                     }
                     None => return false,
