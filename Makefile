@@ -366,7 +366,7 @@ test-venv:
 # Run all tests (Rust unit tests + Python integration tests)
 test: test-rust test-integration
 
-# Run Rust unit tests
+# Run Rust unit tests (all workspace crates except no_main guest binaries)
 test-rust: imago-devcontainer
 	@echo "Running Rust unit tests..."
 	docker run --rm \
@@ -376,9 +376,15 @@ test-rust: imago-devcontainer
 		-v "$(CURDIR):/workspace" \
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
-		-w "/workspace/src/vmm" \
+		-w "/workspace/src" \
 		"$(IMAGO_IMAGE)" \
-		cargo test --release
+		cargo test --release --workspace \
+			--exclude core \
+			--exclude info \
+			--exclude copy \
+			--exclude check \
+			--exclude compare \
+			--exclude convert
 
 # Run Python integration tests only (on host)
 # Runs all test files except malicious image tests (explicit opt-in via test-malicious)

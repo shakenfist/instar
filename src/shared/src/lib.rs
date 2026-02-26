@@ -301,7 +301,7 @@ pub struct CallTable {
 
 /// Backing format type for QCOW2 header extension
 #[repr(u8)]
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub enum BackingFormat {
     /// No backing format specified
     #[default]
