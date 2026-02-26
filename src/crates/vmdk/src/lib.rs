@@ -108,6 +108,116 @@ fn le_u64(buf: &[u8], off: usize) -> u64 {
 }
 
 // ============================================================================
+// Write helpers (little-endian)
+// ============================================================================
+
+/// Write a little-endian u32 to a byte slice.
+#[inline]
+pub fn write_le_u32(buf: &mut [u8], off: usize, val: u32) {
+    buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
+}
+
+/// Write a little-endian u64 to a byte slice.
+#[inline]
+pub fn write_le_u64(buf: &mut [u8], off: usize, val: u64) {
+    buf[off..off + 8].copy_from_slice(&val.to_le_bytes());
+}
+
+// ============================================================================
+// Header and descriptor builders (VMDK output)
+// ============================================================================
+
+/// Number of descriptor sectors (512-byte) reserved in the output.
+pub const DESC_SECTORS: u64 = 20;
+
+/// Build a monolithicSparse VMDK4 header in `buf`.
+///
+/// Fills the first 512 bytes with the binary header fields.
+/// `buf` must be at least 512 bytes and should be pre-zeroed.
+pub fn build_sparse_header(
+    buf: &mut [u8],
+    capacity_sectors: u64,
+    grain_size_sectors: u64,
+    num_gtes_per_gt: u32,
+    gd_offset_sectors: u64,
+    overhead_sectors: u64,
+) {
+    write_le_u32(buf, MAGIC_OFFSET, VMDK4_MAGIC);
+    write_le_u32(buf, VERSION_OFFSET, 1);
+    write_le_u32(buf, FLAGS_OFFSET, FLAG_VALID_NEW_LINE);
+    write_le_u64(buf, CAPACITY_OFFSET, capacity_sectors);
+    write_le_u64(buf, GRAIN_SIZE_OFFSET, grain_size_sectors);
+    write_le_u64(buf, DESC_OFFSET_OFFSET, 1); // Descriptor at sector 1
+    write_le_u64(buf, DESC_SIZE_OFFSET, DESC_SECTORS);
+    write_le_u32(buf, NUM_GTES_PER_GT_OFFSET, num_gtes_per_gt);
+    write_le_u64(buf, RGD_OFFSET_OFFSET, 0); // No redundant GD
+    write_le_u64(buf, GD_OFFSET_OFFSET, gd_offset_sectors);
+    write_le_u64(buf, OVERHEAD_OFFSET, overhead_sectors);
+    // Newline detection bytes (for FLAG_VALID_NEW_LINE)
+    buf[73] = b'\n';
+    buf[74] = b' ';
+    buf[75] = b'\r';
+    buf[76] = b'\n';
+    // compressAlgorithm = 0 (uncompressed) - already zero
+}
+
+/// Build a monolithicSparse descriptor into `buf` starting at
+/// `offset`. Returns the number of bytes written.
+///
+/// The descriptor contains the minimum fields needed for
+/// interoperability: version, CID, parentCID, createType, and
+/// an extent description.
+pub fn build_descriptor(buf: &mut [u8], offset: usize, capacity_sectors: u64) -> usize {
+    // We build the descriptor as a byte string to avoid
+    // alloc (this is no_std code). Format capacity as decimal.
+    let mut pos = offset;
+
+    // Helper: copy bytes into buf
+    let mut put = |bytes: &[u8]| {
+        let end = pos + bytes.len();
+        if end <= buf.len() {
+            buf[pos..end].copy_from_slice(bytes);
+        }
+        pos = end;
+    };
+
+    put(b"# Disk DescriptorFile\n");
+    put(b"version=1\n");
+    put(b"CID=fffffffe\n");
+    put(b"parentCID=ffffffff\n");
+    put(b"createType=\"monolithicSparse\"\n\n");
+    put(b"# Extent description\n");
+    put(b"RW ");
+
+    // Format capacity_sectors as decimal
+    let mut num_buf = [0u8; 20]; // Max u64 decimal = 20 digits
+    let num_str = format_u64(capacity_sectors, &mut num_buf);
+    put(num_str);
+
+    put(b" SPARSE \"output.vmdk\"\n\n");
+    put(b"# The Disk Data Base\n");
+    put(b"#DDB\n");
+
+    pos - offset
+}
+
+/// Format a u64 as a decimal string in a fixed buffer.
+/// Returns a slice of the formatted digits.
+fn format_u64(mut val: u64, buf: &mut [u8; 20]) -> &[u8] {
+    if val == 0 {
+        buf[19] = b'0';
+        return &buf[19..20];
+    }
+    let mut pos = 20;
+    while val > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (val % 10) as u8;
+        val /= 10;
+    }
+    &buf[pos..20]
+}
+
+// ============================================================================
 // Basic header parsing (used by info operation)
 // ============================================================================
 

@@ -291,7 +291,7 @@ class TestConvertErrors(ImagoTestBase):
     def test_convert_unsupported_output_format(self):
         """Converting to unsupported format returns an error."""
         with tempfile.NamedTemporaryFile(suffix='.raw') as src, \
-                tempfile.NamedTemporaryFile(suffix='.vmdk') as dst:
+                tempfile.NamedTemporaryFile(suffix='.vdi') as dst:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  src.name, '1M'],
@@ -299,7 +299,7 @@ class TestConvertErrors(ImagoTestBase):
             )
             stdout, stderr, rc = self.run_imago_convert(
                 Path(src.name), Path(dst.name),
-                output_format='vmdk'
+                output_format='vdi'
             )
             self.assertNotEqual(rc, 0)
             self.assertIn('unsupported', stderr.lower())
@@ -2180,3 +2180,107 @@ class TestConvertVmdkStreamOptimized(ImagoTestBase):
     def test_compare_vmdk_v3_vs_raw(self):
         """Compare VMDK v3 (streamOptimized) vs raw."""
         self._compare_streamopt_vs_raw('vmdk-v3')
+
+
+class TestConvertToVmdk(ImagoTestBase):
+    """Test converting images to VMDK monolithicSparse output.
+
+    Converts images to VMDK with imago, then verifies the output
+    by converting back to raw and comparing against qemu-img.
+    """
+
+    def _test_to_vmdk_roundtrip(self, image_id):
+        """Convert image to VMDK, then back to raw, compare."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.vmdk') as vmdk_out, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as rt_raw, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as qemu_raw:
+            # Convert to VMDK with imago
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(vmdk_out.name),
+                output_format='vmdk',
+                timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'imago convert to vmdk failed for '
+                f'{image_id}: {stderr}'
+            )
+
+            # Verify qemu-img can read the VMDK
+            result = subprocess.run(
+                [
+                    'qemu-img', 'info', '--output=json',
+                    vmdk_out.name,
+                ],
+                capture_output=True, text=True,
+                timeout=30
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img info failed on imago VMDK: '
+                f'{result.stderr}'
+            )
+            info = json.loads(result.stdout)
+            self.assertEqual(
+                info.get('format'), 'vmdk',
+                f'Output is not VMDK format: '
+                f'{info.get("format")}'
+            )
+
+            # Round-trip: convert VMDK back to raw
+            rt_stdout, rt_stderr, rt_rc = \
+                self.run_imago_convert(
+                    Path(vmdk_out.name),
+                    Path(rt_raw.name),
+                    timeout=120
+                )
+            self.assertEqual(
+                rt_rc, 0,
+                f'Round-trip convert failed for '
+                f'{image_id}: {rt_stderr}'
+            )
+
+            # Convert original to raw with qemu-img
+            q_stdout, q_stderr, q_rc = \
+                self.run_qemu_img_convert(
+                    image.path, Path(qemu_raw.name),
+                    timeout=120
+                )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed: {q_stderr}'
+            )
+
+            # Compare round-tripped raw vs qemu-img raw
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(rt_raw.name),
+                Path(qemu_raw.name),
+                timeout=120
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Round-trip mismatch for {image_id}: '
+                f'{cmp_out}'
+            )
+
+    def test_raw_to_vmdk_roundtrip(self):
+        """Round-trip: raw -> vmdk -> raw."""
+        self._test_to_vmdk_roundtrip('raw-mbr-partitioned')
+
+    def test_qcow2_to_vmdk_roundtrip(self):
+        """Round-trip: qcow2 -> vmdk -> raw."""
+        self._test_to_vmdk_roundtrip('cirros-qcow2')
+
+    def test_vmdk_to_vmdk_roundtrip(self):
+        """Round-trip: vmdk -> vmdk -> raw."""
+        self._test_to_vmdk_roundtrip('plaso-vmdk')
