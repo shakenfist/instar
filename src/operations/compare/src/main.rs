@@ -22,14 +22,14 @@ extern crate alloc;
 
 use core::panic::PanicInfo;
 
-// 256KB bump allocator for ruzstd ZSTD decoding internals.
+// Bump allocator backed by scratch memory for ruzstd ZSTD decoding.
 // Reset HEAP_POS to 0 before each decompression call.
-shared::bump_allocator!(256 * 1024);
+shared::bump_allocator!();
 
 use shared::{
     validate_call_table, verify_sector_sizes, CallTable, ChainConfig, CompareConfig, CompareResult,
-    ImageFormat, CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR, COMPRESSED_BUF_SIZE, MAX_CHAIN_DEVICES,
-    MAX_SECTOR_SIZE, OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE, SCRATCH_MEM_END,
+    ImageFormat, ALLOC_HEAP_BASE, CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR, COMPRESSED_BUF_SIZE,
+    MAX_CHAIN_DEVICES, MAX_SECTOR_SIZE, OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE,
 };
 
 // Scratch memory layout for compare operation.
@@ -44,7 +44,7 @@ const BUF_COMPRESSED_IN: usize = BUF_COMPARE_2 + MAX_SECTOR_SIZE;
 // Dynamic region: L1/L2 caches for QCOW2 devices (2 × MAX_SECTOR_SIZE per device)
 const DYNAMIC_BUFS_START: usize = BUF_COMPRESSED_IN + COMPRESSED_BUF_SIZE;
 const _: () = assert!(
-    DYNAMIC_BUFS_START + MAX_CHAIN_DEVICES * 2 * MAX_SECTOR_SIZE <= SCRATCH_MEM_END,
+    DYNAMIC_BUFS_START + MAX_CHAIN_DEVICES * 2 * MAX_SECTOR_SIZE <= ALLOC_HEAP_BASE,
     "Scratch memory too small for MAX_CHAIN_DEVICES L1/L2 caches"
 );
 

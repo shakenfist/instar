@@ -1849,7 +1849,7 @@ struct ConvertArgs {
     #[arg(long, default_value = "65536")]
     cluster_size: u32,
 
-    /// Compress data clusters in QCOW2 output (requires -O qcow2)
+    /// Compress output data (QCOW2: zlib clusters, VMDK: streamOptimized)
     #[arg(short = 'c', long)]
     compress: bool,
 
@@ -3764,10 +3764,10 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         .into());
     }
 
-    // Validate -c requires -O qcow2
-    if args.compress && !is_qcow2_output {
+    // Validate -c requires -O qcow2 or -O vmdk
+    if args.compress && !is_qcow2_output && !is_vmdk_output {
         return Err("compression (-c) is only supported with \
-             QCOW2 output (-O qcow2)"
+             QCOW2 (-O qcow2) or VMDK (-O vmdk) output"
             .into());
     }
 
@@ -3985,7 +3985,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // For uncompressed QCOW2, use the smaller of sector_size
     // and cluster_size so that cluster writes align to whole
     // sectors.
-    let output_sector_size = if is_qcow2_output && args.compress {
+    let output_sector_size = if (is_qcow2_output || is_vmdk_output) && args.compress {
         512
     } else if is_qcow2_output {
         core::cmp::min(args.sector_size, args.cluster_size)

@@ -259,6 +259,45 @@ pub unsafe fn compress_cluster_zlib(
     out_produced
 }
 
+/// Compress data with raw DEFLATE, always returning the compressed
+/// size. Unlike `compress_cluster_zlib`, this returns the compressed
+/// output even if it is larger than the input. Returns 0 only on
+/// actual compression error.
+///
+/// Used by VMDK streamOptimized output where all non-zero grains
+/// must be stored as compressed data with a grain marker.
+///
+/// # Safety
+/// Same requirements as `compress_cluster_zlib`.
+#[cfg(feature = "compress")]
+pub unsafe fn compress_deflate_raw(
+    compressor_mem: *mut u8,
+    input: *const u8,
+    input_len: usize,
+    output: *mut u8,
+    output_capacity: usize,
+) -> usize {
+    use miniz_oxide::deflate::core::{
+        compress, create_comp_flags_from_zip_params, CompressorOxide, TDEFLFlush, TDEFLStatus,
+    };
+
+    let in_slice = core::slice::from_raw_parts(input, input_len);
+    let out_slice = core::slice::from_raw_parts_mut(output, output_capacity);
+
+    let flags = create_comp_flags_from_zip_params(6, -15, 0);
+    let compressor = compressor_mem as *mut CompressorOxide;
+    core::ptr::write(compressor, CompressorOxide::new(flags));
+
+    let (status, _in_consumed, out_produced) =
+        compress(&mut *compressor, in_slice, out_slice, TDEFLFlush::Finish);
+
+    if status != TDEFLStatus::Done {
+        return 0;
+    }
+
+    out_produced
+}
+
 // ============================================================================
 // Parsed QCOW2 Header
 // ============================================================================
