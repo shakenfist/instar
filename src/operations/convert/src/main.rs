@@ -119,27 +119,27 @@ pub unsafe extern "C" fn _start() -> u64 {
         return 0;
     }
 
-    (call_table.verbose_print)(b"convert: initializing qcow2 states\n\0".as_ptr());
+    (call_table.verbose_print)(b"convert: initializing chain states\n\0".as_ptr());
 
-    // Initialize QCOW2 state for each QCOW2 input device
-    let mut qcow2_states: [Option<qcow2::Qcow2State>; MAX_CHAIN_DEVICES] = Default::default();
+    // Initialize format-specific state for each input device
+    let mut chain_states = qcow2::ChainStates::default();
 
-    if !qcow2::init_chain_qcow2_states(
+    if !qcow2::init_chain_states(
         call_table,
         chain_config,
-        &mut qcow2_states,
+        &mut chain_states,
         input_device_count,
         sector_size,
         DYNAMIC_BUFS_START,
         &mut bytes_read,
     ) {
-        (call_table.debug_print)(b"convert: failed to init qcow2\n\0".as_ptr());
+        (call_table.debug_print)(b"convert: failed to init chain states\n\0".as_ptr());
         (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
         return bytes_read;
     }
 
     // Reject QCOW2 images with unsupported incompatible features
-    for state in qcow2_states.iter().flatten() {
+    for state in chain_states.qcow2_states.iter().flatten() {
         let unsupported = state.unsupported_incompat_features(qcow2::SUPPORTED_INCOMPAT_FEATURES);
         if unsupported != 0 {
             (call_table.debug_print)(b"convert: unsupported incompatible features\n\0".as_ptr());
@@ -157,7 +157,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                     call_table,
                     config,
                     chain_config,
-                    &mut qcow2_states,
+                    &mut chain_states,
                     input_device_count,
                     virtual_size,
                     sector_size,
@@ -169,7 +169,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                     call_table,
                     config,
                     chain_config,
-                    &mut qcow2_states,
+                    &mut chain_states,
                     input_device_count,
                     virtual_size,
                     sector_size,
@@ -181,7 +181,7 @@ pub unsafe extern "C" fn _start() -> u64 {
         _ => convert_to_raw(
             call_table,
             chain_config,
-            &mut qcow2_states,
+            &mut chain_states,
             input_device_count,
             virtual_size,
             sector_size,
@@ -198,7 +198,7 @@ pub unsafe extern "C" fn _start() -> u64 {
 unsafe fn convert_to_raw(
     call_table: &CallTable,
     chain_config: &ChainConfig,
-    qcow2_states: &mut [Option<qcow2::Qcow2State>; MAX_CHAIN_DEVICES],
+    chain_states: &mut qcow2::ChainStates,
     input_device_count: usize,
     virtual_size: u64,
     sector_size: usize,
@@ -256,7 +256,7 @@ unsafe fn convert_to_raw(
             this_chunk,
             sector_size,
             chain_config,
-            qcow2_states,
+            chain_states,
             BUF_COMPRESSED_IN as *mut u8,
             bytes_read,
         ) {
@@ -664,7 +664,7 @@ unsafe fn convert_to_qcow2(
     call_table: &CallTable,
     config: &ConvertConfig,
     chain_config: &ChainConfig,
-    qcow2_states: &mut [Option<qcow2::Qcow2State>; MAX_CHAIN_DEVICES],
+    chain_states: &mut qcow2::ChainStates,
     input_device_count: usize,
     virtual_size: u64,
     sector_size: usize,
@@ -725,7 +725,7 @@ unsafe fn convert_to_qcow2(
                 this_chunk,
                 sector_size,
                 chain_config,
-                qcow2_states,
+                chain_states,
                 BUF_COMPRESSED_IN as *mut u8,
                 bytes_read,
             ) {
@@ -932,7 +932,7 @@ unsafe fn convert_to_qcow2_compressed(
     call_table: &CallTable,
     config: &ConvertConfig,
     chain_config: &ChainConfig,
-    qcow2_states: &mut [Option<qcow2::Qcow2State>; MAX_CHAIN_DEVICES],
+    chain_states: &mut qcow2::ChainStates,
     input_device_count: usize,
     virtual_size: u64,
     sector_size: usize,
@@ -1015,7 +1015,7 @@ unsafe fn convert_to_qcow2_compressed(
                 this_chunk,
                 sector_size,
                 chain_config,
-                qcow2_states,
+                chain_states,
                 BUF_COMPRESSED_IN as *mut u8,
                 bytes_read,
             ) {

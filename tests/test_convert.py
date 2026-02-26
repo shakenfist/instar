@@ -1848,3 +1848,169 @@ class TestConvertLargeCluster(ImagoTestBase):
         finally:
             os.unlink(qcow2_path)
             os.unlink(raw_path)
+
+
+class TestConvertVmdkToRaw(ImagoTestBase):
+    """Test VMDK monolithicSparse to raw conversion.
+
+    Converts monolithicSparse VMDK images to raw and
+    cross-validates against qemu-img convert output.
+    """
+
+    VMDK_SPARSE_IDS = [
+        'plaso-vmdk',
+        'vmdk-multi-partition',
+        'chain-base-vmdk',
+    ]
+
+    def _get_vmdk_info(self, image_path):
+        """Get virtual_size via qemu-img info."""
+        result = subprocess.run(
+            [
+                'qemu-img', 'info', '--output=json',
+                str(image_path),
+            ],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return None
+        info = json.loads(result.stdout)
+        return info.get('virtual-size')
+
+    def _timeout_for_vsize(self, vsize):
+        """Compute timeout based on virtual size."""
+        if not vsize:
+            return 120
+        gib = vsize / (1024 ** 3)
+        return max(120, int(120 + gib * 10))
+
+    def _test_vmdk_convert(self, image_id):
+        """Convert a VMDK image to raw and cross-validate."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        vsize = self._get_vmdk_info(image.path)
+        timeout = self._timeout_for_vsize(vsize)
+
+        # Check available temp space
+        if vsize:
+            tmpdir = tempfile.gettempdir()
+            st = os.statvfs(tmpdir)
+            avail = st.f_bavail * st.f_frsize
+            needed = vsize * 2 + 100 * 1024 * 1024
+            if avail < needed:
+                self.skipTest(
+                    f'{image_id}: needs '
+                    f'{needed // (1024**3)}GB temp, '
+                    f'only {avail // (1024**3)}GB '
+                    f'available'
+                )
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') \
+                as imago_raw, \
+                tempfile.NamedTemporaryFile(suffix='.raw') \
+                as qemu_raw:
+            # Convert with imago
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(imago_raw.name),
+                timeout=timeout
+            )
+            self.assertEqual(
+                rc, 0,
+                f'imago convert failed for {image_id}: '
+                f'{stderr}'
+            )
+
+            # Convert with qemu-img
+            q_stdout, q_stderr, q_rc = \
+                self.run_qemu_img_convert(
+                    image.path, Path(qemu_raw.name),
+                    timeout=timeout
+                )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed for '
+                f'{image_id}: {q_stderr}'
+            )
+
+            # Compare outputs
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(imago_raw.name),
+                Path(qemu_raw.name),
+                timeout=timeout
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Convert output for {image_id} differs '
+                f'from qemu-img: {cmp_out}'
+            )
+
+    def test_convert_plaso_vmdk(self):
+        """Convert plaso monolithicSparse VMDK to raw."""
+        self._test_vmdk_convert('plaso-vmdk')
+
+    def test_convert_vmdk_multi_partition(self):
+        """Convert multi-partition VMDK to raw."""
+        self._test_vmdk_convert('vmdk-multi-partition')
+
+    def test_convert_chain_base_vmdk(self):
+        """Convert backing chain base VMDK to raw."""
+        self._test_vmdk_convert('chain-base-vmdk')
+
+
+class TestConvertVmdkCompare(ImagoTestBase):
+    """Test comparing VMDK images against raw equivalents.
+
+    Uses imago compare to verify VMDK virtual content matches
+    the qemu-img-converted raw baseline.
+    """
+
+    def _compare_vmdk_vs_raw(self, image_id):
+        """Compare VMDK against its qemu-img-converted raw."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') \
+                as qemu_raw:
+            # Convert with qemu-img as baseline
+            q_stdout, q_stderr, q_rc = \
+                self.run_qemu_img_convert(
+                    image.path, Path(qemu_raw.name),
+                    timeout=120
+                )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed for '
+                f'{image_id}: {q_stderr}'
+            )
+
+            # Compare VMDK directly against raw
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                image.path, Path(qemu_raw.name),
+                timeout=120
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'VMDK {image_id} differs from raw: '
+                f'{cmp_out}'
+            )
+
+    def test_compare_plaso_vmdk_vs_raw(self):
+        """Compare plaso VMDK against qemu-img raw."""
+        self._compare_vmdk_vs_raw('plaso-vmdk')
+
+    def test_compare_vmdk_multi_partition_vs_raw(self):
+        """Compare multi-partition VMDK against raw."""
+        self._compare_vmdk_vs_raw('vmdk-multi-partition')
+
+    def test_compare_chain_base_vmdk_vs_raw(self):
+        """Compare chain base VMDK against raw."""
+        self._compare_vmdk_vs_raw('chain-base-vmdk')
