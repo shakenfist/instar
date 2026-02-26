@@ -150,8 +150,12 @@ provides a modular architecture with:
   operations.
 - **crates/raw/** - Shared RAW format crate: MBR/GPT partition table
   detection. Used by info operation.
-- **crates/vmdk/** - Shared VMDK format crate: VMDK4 binary header parsing,
-  descriptor I/O and text parsing. Used by info operation.
+- **crates/vmdk/** - Shared VMDK format crate: VMDK4 binary header parsing
+  (basic and full), descriptor I/O and text parsing, grain directory/table
+  reading with sector-cached lookups, streamOptimized footer reading,
+  grain marker handling, and write helpers for monolithicSparse and
+  streamOptimized output. Used by info, check, convert, and compare
+  operations.
 - **operations/info/** - Format detection operation
 - **operations/copy/** - File copy operation
 - **operations/check/** - Image integrity validation operation (with
@@ -232,12 +236,19 @@ Simple byte-for-byte disk representation. No metadata, just data.
 
 ### vmdk
 
-VMware Virtual Machine Disk. Multiple sub-formats:
-- monolithicSparse
+VMware Virtual Machine Disk. Supported sub-formats for input/output:
+- monolithicSparse (input, output, check)
+- streamOptimized (input, output with `-c`, check)
+
+Detected but not yet supported for I/O:
 - monolithicFlat
-- twoGbMaxExtentSparse
-- twoGbMaxExtentFlat
-- streamOptimized
+- twoGbMaxExtentSparse / twoGbMaxExtentFlat (multi-extent, detected and
+  rejected gracefully)
+
+The check operation performs full structural validation: grain directory
+and grain table walk, grain offset bounds checking, overlap detection
+via 1-bit-per-grain bitmap, streamOptimized footer validation, and
+multi-extent detection.
 
 ## Open Questions
 

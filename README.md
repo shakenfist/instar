@@ -107,6 +107,16 @@ For QCOW2 images, check validates:
 - Cluster sizes from 512B to 2MB (cluster_bits 9-21)
 - Dirty/corrupt incompatible feature flags
 
+For VMDK images (monolithicSparse and streamOptimized), check validates:
+- Full header parsing (version, capacity, grain size, flags, compression)
+- Descriptor bounds and multi-extent detection (graceful rejection)
+- Grain directory offset within file bounds
+- Full grain directory and grain table walk
+- Grain data offsets within file bounds
+- Overlap detection via 1-bit-per-grain bitmap (same pattern as QCOW2)
+- streamOptimized footer validation (magic, GD offset)
+- Fragmentation measurement
+
 The `--chain` flag discovers the full backing chain (using the same chain
 discovery infrastructure as `imago info --chain`), sets up each image as a
 separate virtio-block device in the KVM guest, and validates:
