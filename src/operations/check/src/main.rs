@@ -171,15 +171,26 @@ pub unsafe extern "C" fn _start() -> u64 {
                 actual_size,
             );
         }
-        ImageFormat::Vmdk4 | ImageFormat::Vmdk3 => {
+        ImageFormat::Vmdk4 => {
             if unsafe_quirks {
-                // qemu-img compatible: no validation for non-QCOW2
                 (call_table.verbose_print)(b"check: vmdk not supported (quirks)\n\0".as_ptr());
                 result.flags |= CheckResult::FLAG_NOT_SUPPORTED;
+                result.image_end_offset = actual_size;
             } else {
-                // Validate VMDK header
-                bytes_read += check_vmdk(&buffer, &mut result, actual_size);
+                bytes_read += check_vmdk(
+                    &buffer,
+                    &mut result,
+                    call_table,
+                    input_sector_size,
+                    actual_size,
+                );
             }
+        }
+        ImageFormat::Vmdk3 => {
+            // VMDK version 3 is a legacy format; no detailed
+            // structural checking support
+            (call_table.verbose_print)(b"check: vmdk3 format detected\n\0".as_ptr());
+            result.flags |= CheckResult::FLAG_NOT_SUPPORTED;
             result.image_end_offset = actual_size;
         }
         ImageFormat::Vhdx => {
@@ -296,13 +307,6 @@ fn detect_qcow2_only(buffer: &[u8], len: usize) -> ImageFormat {
     ImageFormat::Raw
 }
 
-// VMDK4 header offsets (little-endian)
-const VMDK4_VERSION_OFFSET: usize = 4;
-const VMDK4_CAPACITY_OFFSET: usize = 12;
-const VMDK4_GRAIN_SIZE_OFFSET: usize = 20;
-const VMDK4_DESC_OFFSET_OFFSET: usize = 28;
-const VMDK4_DESC_SIZE_OFFSET: usize = 36;
-
 // VHDX region table offset and signature
 const VHDX_REGION_TABLE_OFFSET: u64 = 0x30000;
 const VHDX_REGION_TABLE_SIG: u32 = 0x69676572; // "regi"
@@ -310,118 +314,560 @@ const VHDX_REGION_TABLE_SIG: u32 = 0x69676572; // "regi"
 // VHD footer disk type offset
 const VHD_FOOTER_DISK_TYPE_OFFSET: usize = 60;
 
-/// Check VMDK image integrity
+/// Read the GD offset from a streamOptimized VMDK footer.
+///
+/// The footer is a copy of the VMDK4 header located at EOF - 1024
+/// bytes (between the footer marker and EOS marker).
+unsafe fn read_vmdk_footer_gd_offset(
+    call_table: &CallTable,
+    sector_size: usize,
+    actual_size: u64,
+    input_capacity: u64,
+    bytes_read: &mut u64,
+) -> Option<u64> {
+    let footer_byte_offset = actual_size.checked_sub(1024)?;
+    let footer_sector = footer_byte_offset / sector_size as u64;
+    let offset_in_sector = (footer_byte_offset % sector_size as u64) as usize;
+
+    if footer_sector >= input_capacity {
+        return None;
+    }
+
+    let mut buf = [0u8; MAX_SECTOR_SIZE];
+    if !(call_table.read_input_sector)(0, footer_sector, buf.as_mut_ptr(), sector_size) {
+        return None;
+    }
+    *bytes_read += sector_size as u64;
+
+    // Footer must fit within this sector
+    if offset_in_sector + vmdk::HEADER_FULL_SIZE > sector_size {
+        return None;
+    }
+    let footer = &buf[offset_in_sector..];
+
+    // Validate footer magic
+    let magic = u32::from_le_bytes([
+        footer[vmdk::MAGIC_OFFSET],
+        footer[vmdk::MAGIC_OFFSET + 1],
+        footer[vmdk::MAGIC_OFFSET + 2],
+        footer[vmdk::MAGIC_OFFSET + 3],
+    ]);
+    if magic != vmdk::VMDK4_MAGIC {
+        return None;
+    }
+
+    // Read GD offset from footer
+    let gd_offset = u64::from_le_bytes([
+        footer[vmdk::GD_OFFSET_OFFSET],
+        footer[vmdk::GD_OFFSET_OFFSET + 1],
+        footer[vmdk::GD_OFFSET_OFFSET + 2],
+        footer[vmdk::GD_OFFSET_OFFSET + 3],
+        footer[vmdk::GD_OFFSET_OFFSET + 4],
+        footer[vmdk::GD_OFFSET_OFFSET + 5],
+        footer[vmdk::GD_OFFSET_OFFSET + 6],
+        footer[vmdk::GD_OFFSET_OFFSET + 7],
+    ]);
+    if gd_offset == vmdk::GD_AT_END {
+        return None; // Footer should have the real offset
+    }
+    Some(gd_offset)
+}
+
+/// Count extent description lines in a VMDK descriptor buffer.
+///
+/// Scans for lines starting with "RW " or "RDONLY " which indicate
+/// disk extents. Multi-extent VMDKs have more than one such line.
+fn count_extent_lines(desc: &[u8]) -> u32 {
+    let end = desc.iter().position(|&b| b == 0).unwrap_or(desc.len());
+    let text = &desc[..end];
+    let mut count = 0u32;
+    let mut pos = 0;
+    while pos < text.len() {
+        let line_end = text[pos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| pos + p)
+            .unwrap_or(text.len());
+        let line = &text[pos..line_end];
+        if line.starts_with(b"RW ") || line.starts_with(b"RDONLY ") {
+            count += 1;
+        }
+        pos = line_end + 1;
+    }
+    count
+}
+
+/// Check VMDK4 image structural integrity.
 ///
 /// Validates:
-/// - Header version (must be 1, 2, or 3)
-/// - Capacity > 0
-/// - Grain size is power of 2
-/// - Descriptor offset is within file bounds
-fn check_vmdk(header: &[u8], result: &mut CheckResult, actual_size: u64) -> u64 {
-    // Check version
-    let version = u32::from_le_bytes([
-        header[VMDK4_VERSION_OFFSET],
-        header[VMDK4_VERSION_OFFSET + 1],
-        header[VMDK4_VERSION_OFFSET + 2],
-        header[VMDK4_VERSION_OFFSET + 3],
-    ]);
+/// - Full header parsing (version, capacity, grain size, flags)
+/// - Descriptor bounds and multi-extent detection
+/// - Grain directory offset within file bounds
+/// - Grain table offsets (referenced by GD entries)
+/// - Grain data offsets (referenced by GT entries)
+/// - Overlap detection via 1-bit-per-grain bitmap
+/// - streamOptimized footer validation
+/// - Fragmentation measurement
+unsafe fn check_vmdk(
+    header: &[u8],
+    result: &mut CheckResult,
+    call_table: &CallTable,
+    sector_size: usize,
+    actual_size: u64,
+) -> u64 {
+    let mut bytes_read: u64 = 0;
+    let input_capacity = actual_size / sector_size as u64;
 
-    if version == 0 || version > 3 {
+    // Parse full header
+    let hdr = match vmdk::Vmdk4HeaderFull::parse(header) {
+        Some(h) => h,
+        None => {
+            result.corruptions += 1;
+            result.total_errors += 1;
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+            (call_table.debug_print)(b"check: invalid vmdk header\n\0".as_ptr());
+            result.image_end_offset = actual_size;
+            return bytes_read;
+        }
+    };
+
+    // Validate version
+    if hdr.version == 0 || hdr.version > 3 {
         result.corruptions += 1;
         result.total_errors += 1;
         result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
-        return 0;
+        result.image_end_offset = actual_size;
+        return bytes_read;
     }
 
-    // Check capacity
-    let capacity_sectors = u64::from_le_bytes([
-        header[VMDK4_CAPACITY_OFFSET],
-        header[VMDK4_CAPACITY_OFFSET + 1],
-        header[VMDK4_CAPACITY_OFFSET + 2],
-        header[VMDK4_CAPACITY_OFFSET + 3],
-        header[VMDK4_CAPACITY_OFFSET + 4],
-        header[VMDK4_CAPACITY_OFFSET + 5],
-        header[VMDK4_CAPACITY_OFFSET + 6],
-        header[VMDK4_CAPACITY_OFFSET + 7],
-    ]);
-
-    if capacity_sectors == 0 {
+    // Validate capacity
+    if hdr.capacity_sectors == 0 {
         result.corruptions += 1;
         result.total_errors += 1;
         result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
-        return 0;
+        result.image_end_offset = actual_size;
+        return bytes_read;
     }
 
-    // Check grain size (must be power of 2)
-    let grain_size = u64::from_le_bytes([
-        header[VMDK4_GRAIN_SIZE_OFFSET],
-        header[VMDK4_GRAIN_SIZE_OFFSET + 1],
-        header[VMDK4_GRAIN_SIZE_OFFSET + 2],
-        header[VMDK4_GRAIN_SIZE_OFFSET + 3],
-        header[VMDK4_GRAIN_SIZE_OFFSET + 4],
-        header[VMDK4_GRAIN_SIZE_OFFSET + 5],
-        header[VMDK4_GRAIN_SIZE_OFFSET + 6],
-        header[VMDK4_GRAIN_SIZE_OFFSET + 7],
-    ]);
-
-    if grain_size == 0 || (grain_size & (grain_size - 1)) != 0 {
+    // Validate grain size (must be power of 2)
+    if hdr.grain_size_sectors == 0 || (hdr.grain_size_sectors & (hdr.grain_size_sectors - 1)) != 0 {
         result.corruptions += 1;
         result.total_errors += 1;
         result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
-        return 0;
+        result.image_end_offset = actual_size;
+        return bytes_read;
     }
 
-    // Check descriptor offset (if present, must be within file)
-    let desc_offset_sectors = u64::from_le_bytes([
-        header[VMDK4_DESC_OFFSET_OFFSET],
-        header[VMDK4_DESC_OFFSET_OFFSET + 1],
-        header[VMDK4_DESC_OFFSET_OFFSET + 2],
-        header[VMDK4_DESC_OFFSET_OFFSET + 3],
-        header[VMDK4_DESC_OFFSET_OFFSET + 4],
-        header[VMDK4_DESC_OFFSET_OFFSET + 5],
-        header[VMDK4_DESC_OFFSET_OFFSET + 6],
-        header[VMDK4_DESC_OFFSET_OFFSET + 7],
-    ]);
-
-    let desc_size_sectors = u64::from_le_bytes([
-        header[VMDK4_DESC_SIZE_OFFSET],
-        header[VMDK4_DESC_SIZE_OFFSET + 1],
-        header[VMDK4_DESC_SIZE_OFFSET + 2],
-        header[VMDK4_DESC_SIZE_OFFSET + 3],
-        header[VMDK4_DESC_SIZE_OFFSET + 4],
-        header[VMDK4_DESC_SIZE_OFFSET + 5],
-        header[VMDK4_DESC_SIZE_OFFSET + 6],
-        header[VMDK4_DESC_SIZE_OFFSET + 7],
-    ]);
-
-    if desc_offset_sectors > 0 {
-        // Use checked arithmetic to detect overflow from malicious values
-        let desc_end = desc_offset_sectors.checked_mul(512).and_then(|off| {
-            desc_size_sectors
+    // Validate descriptor bounds
+    if hdr.desc_offset_sectors > 0 {
+        let desc_end = hdr.desc_offset_sectors.checked_mul(512).and_then(|off| {
+            hdr.desc_size_sectors
                 .checked_mul(512)
                 .and_then(|sz| off.checked_add(sz))
         });
-
         match desc_end {
             None => {
-                // Overflow in offset calculation indicates corruption
                 result.corruptions += 1;
                 result.total_errors += 1;
                 result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
-                return 0;
+                result.image_end_offset = actual_size;
+                return bytes_read;
             }
             Some(end) if end > actual_size => {
                 result.corruptions += 1;
                 result.total_errors += 1;
                 result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
-                return 0;
+                result.image_end_offset = actual_size;
+                return bytes_read;
             }
-            Some(_) => {} // Valid offset within bounds
+            Some(_) => {}
         }
     }
 
-    // VMDK header looks valid
-    0
+    // Parse descriptor for multi-extent detection
+    if hdr.desc_offset_sectors > 0 && hdr.desc_size_sectors > 0 {
+        let desc_byte_offset = hdr.desc_offset_sectors * 512;
+        let desc_sector = desc_byte_offset / sector_size as u64;
+        if desc_sector < input_capacity {
+            let mut desc_buf = [0u8; MAX_SECTOR_SIZE];
+            if (call_table.read_input_sector)(0, desc_sector, desc_buf.as_mut_ptr(), sector_size) {
+                bytes_read += sector_size as u64;
+                let offset_in_sector = (desc_byte_offset % sector_size as u64) as usize;
+                let desc_data = &desc_buf[offset_in_sector..sector_size];
+                let extent_count = count_extent_lines(desc_data);
+                if extent_count > 1 {
+                    (call_table.debug_print)(
+                        b"check: multi-extent vmdk not supported\n\0".as_ptr(),
+                    );
+                    result.flags |= CheckResult::FLAG_NOT_SUPPORTED;
+                    result.image_end_offset = actual_size;
+                    return bytes_read;
+                }
+            }
+        }
+    }
+
+    // Validate num_gtes_per_gt
+    if hdr.num_gtes_per_gt == 0 {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+        result.image_end_offset = actual_size;
+        return bytes_read;
+    }
+
+    // Calculate number of GD entries
+    let num_gd_entries = match hdr.num_gd_entries() {
+        Some(n) if n > 0 => n,
+        _ => {
+            result.corruptions += 1;
+            result.total_errors += 1;
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+            result.image_end_offset = actual_size;
+            return bytes_read;
+        }
+    };
+
+    // Resolve GD offset (handle streamOptimized)
+    let is_stream_optimized = hdr.gd_offset_sectors == vmdk::GD_AT_END;
+    let gd_offset_sectors = if is_stream_optimized {
+        match read_vmdk_footer_gd_offset(
+            call_table,
+            sector_size,
+            actual_size,
+            input_capacity,
+            &mut bytes_read,
+        ) {
+            Some(off) => off,
+            None => {
+                result.corruptions += 1;
+                result.total_errors += 1;
+                result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+                (call_table.debug_print)(b"check: invalid vmdk footer\n\0".as_ptr());
+                result.image_end_offset = actual_size;
+                return bytes_read;
+            }
+        }
+    } else {
+        hdr.gd_offset_sectors
+    };
+
+    // Validate GD offset within file
+    let gd_byte_offset = match gd_offset_sectors.checked_mul(512) {
+        Some(off) if off < actual_size => off,
+        _ => {
+            result.corruptions += 1;
+            result.total_errors += 1;
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+            (call_table.debug_print)(b"check: GD offset out of bounds\n\0".as_ptr());
+            result.image_end_offset = actual_size;
+            return bytes_read;
+        }
+    };
+
+    // Validate GD doesn't extend beyond file
+    let gd_size_bytes = match (num_gd_entries as u64).checked_mul(4) {
+        Some(sz) => sz,
+        None => {
+            result.corruptions += 1;
+            result.total_errors += 1;
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+            result.image_end_offset = actual_size;
+            return bytes_read;
+        }
+    };
+    let gd_end = match gd_byte_offset.checked_add(gd_size_bytes) {
+        Some(end) if end <= actual_size => end,
+        _ => {
+            result.corruptions += 1;
+            result.total_errors += 1;
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+            (call_table.debug_print)(b"check: GD extends beyond file\n\0".as_ptr());
+            result.image_end_offset = actual_size;
+            return bytes_read;
+        }
+    };
+
+    (call_table.verbose_print)(b"check: vmdk header valid\n\0".as_ptr());
+
+    // ---- Initialize overlap-detection bitmap ----
+    let bitmap = SCRATCH_MEM_BASE as *mut u8;
+    let grain_size_bytes = hdr.grain_size_bytes;
+    let total_host_grains = (actual_size + grain_size_bytes - 1) / grain_size_bytes;
+    let needed_bytes = ((total_host_grains + 7) / 8) as usize;
+    let bitmap_size = core::cmp::min(needed_bytes, SCRATCH_MEM_SIZE);
+    core::ptr::write_bytes(bitmap, 0, bitmap_size);
+    let max_trackable = (bitmap_size as u64) * 8;
+    let can_track = total_host_grains <= max_trackable;
+
+    (call_table.verbose_print)(b"check: vmdk bitmap initialized\n\0".as_ptr());
+
+    // ---- Mark metadata regions in bitmap ----
+    if can_track {
+        // Header grain (grain 0)
+        bitmap_set(bitmap, bitmap_size, 0);
+
+        // Descriptor grains
+        if hdr.desc_offset_sectors > 0 {
+            let desc_start = hdr.desc_offset_sectors * 512;
+            let desc_end_b = desc_start + hdr.desc_size_sectors * 512;
+            let first = desc_start / grain_size_bytes;
+            let last = desc_end_b.saturating_sub(1) / grain_size_bytes;
+            for g in first..=last {
+                bitmap_set(bitmap, bitmap_size, g);
+            }
+        }
+
+        // Grain directory grains
+        let gd_first = gd_byte_offset / grain_size_bytes;
+        let gd_last = gd_end.saturating_sub(1) / grain_size_bytes;
+        for g in gd_first..=gd_last {
+            bitmap_set(bitmap, bitmap_size, g);
+        }
+    }
+
+    // ---- Cache buffers for GD/GT reads ----
+    let mut gd_cached_sector: u64 = u64::MAX;
+    let mut gd_cache = [0u8; MAX_SECTOR_SIZE];
+    let mut gt_cached_sector: u64 = u64::MAX;
+    let mut gt_cache = [0u8; MAX_SECTOR_SIZE];
+
+    // ---- Track statistics ----
+    let mut max_offset = gd_end;
+    result.clusters_checked = 0;
+    result.clusters_allocated = 0;
+    let mut last_data_offset: u64 = 0;
+    let mut fragmented_entries: u64 = 0;
+    let mut total_data_entries: u64 = 0;
+    let gt_size_bytes = (hdr.num_gtes_per_gt as u64) * 4;
+
+    // ---- Walk grain directory ----
+    for gd_idx in 0..num_gd_entries {
+        let gd_byte_off = match (gd_idx as u64)
+            .checked_mul(4)
+            .and_then(|v| gd_byte_offset.checked_add(v))
+        {
+            Some(off) => off,
+            None => {
+                result.corruptions += 1;
+                result.total_errors += 1;
+                break;
+            }
+        };
+
+        let gd_entry = match vmdk::read_u32_le_cached(
+            call_table,
+            0,
+            gd_byte_off,
+            sector_size,
+            input_capacity,
+            &mut gd_cached_sector,
+            gd_cache.as_mut_ptr(),
+            &mut bytes_read,
+        ) {
+            Some(v) => v,
+            None => {
+                result.corruptions += 1;
+                result.total_errors += 1;
+                (call_table.debug_print)(b"check: GD read error\n\0".as_ptr());
+                break;
+            }
+        };
+
+        result.clusters_checked += 1;
+
+        if gd_entry == 0 {
+            continue;
+        }
+
+        // Validate GT offset
+        let gt_byte_off = match (gd_entry as u64).checked_mul(512) {
+            Some(off) if off < actual_size => off,
+            _ => {
+                result.corruptions += 1;
+                result.total_errors += 1;
+                (call_table.debug_print)(b"check: GT offset out of bounds\n\0".as_ptr());
+                continue;
+            }
+        };
+
+        // Validate GT doesn't extend beyond file
+        let gt_end = match gt_byte_off.checked_add(gt_size_bytes) {
+            Some(end) if end <= actual_size => end,
+            _ => {
+                result.corruptions += 1;
+                result.total_errors += 1;
+                continue;
+            }
+        };
+
+        result.clusters_allocated += 1;
+
+        // Overlap check for GT
+        if can_track {
+            let first_grain = gt_byte_off / grain_size_bytes;
+            let last_grain = gt_end.saturating_sub(1) / grain_size_bytes;
+            for g in first_grain..=last_grain {
+                if matches!(
+                    bitmap_set(bitmap, bitmap_size, g),
+                    BitmapSetResult::AlreadySet
+                ) {
+                    result.corruptions += 1;
+                    result.total_errors += 1;
+                    (call_table.debug_print)(b"check: GT overlap\n\0".as_ptr());
+                }
+            }
+        }
+
+        // Update max offset
+        if gt_end > max_offset {
+            max_offset = gt_end;
+        }
+
+        // ---- Walk grain table entries ----
+        for gt_idx in 0..hdr.num_gtes_per_gt {
+            let gte_byte_off = match (gt_idx as u64)
+                .checked_mul(4)
+                .and_then(|v| gt_byte_off.checked_add(v))
+            {
+                Some(off) => off,
+                None => {
+                    result.corruptions += 1;
+                    result.total_errors += 1;
+                    break;
+                }
+            };
+
+            let gte = match vmdk::read_u32_le_cached(
+                call_table,
+                0,
+                gte_byte_off,
+                sector_size,
+                input_capacity,
+                &mut gt_cached_sector,
+                gt_cache.as_mut_ptr(),
+                &mut bytes_read,
+            ) {
+                Some(v) => v,
+                None => {
+                    result.corruptions += 1;
+                    result.total_errors += 1;
+                    break;
+                }
+            };
+
+            result.clusters_checked += 1;
+
+            if gte == vmdk::GTE_UNALLOCATED {
+                continue;
+            }
+
+            if hdr.has_zero_grain && gte == vmdk::GTE_ZEROED {
+                continue;
+            }
+
+            // Validate grain offset
+            let grain_off = match (gte as u64).checked_mul(512) {
+                Some(off) => off,
+                None => {
+                    result.corruptions += 1;
+                    result.total_errors += 1;
+                    continue;
+                }
+            };
+
+            if grain_off >= actual_size {
+                result.corruptions += 1;
+                result.total_errors += 1;
+                (call_table.debug_print)(b"check: grain offset out of bounds\n\0".as_ptr());
+                continue;
+            }
+
+            if hdr.is_compressed {
+                // Compressed grain: GTE points to grain marker.
+                // Validate offset is within bounds. Compressed data
+                // is variable-size; mark the host grain in the bitmap
+                // (overlaps are expected, like QCOW2 compressed).
+                result.clusters_allocated += 1;
+                if can_track {
+                    bitmap_set(bitmap, bitmap_size, grain_off / grain_size_bytes);
+                }
+                if grain_off > max_offset {
+                    max_offset = grain_off;
+                }
+            } else {
+                // Standard grain: validate full grain within file
+                let grain_end = match grain_off.checked_add(grain_size_bytes) {
+                    Some(end) => end,
+                    None => {
+                        result.corruptions += 1;
+                        result.total_errors += 1;
+                        continue;
+                    }
+                };
+
+                if grain_end > actual_size {
+                    result.corruptions += 1;
+                    result.total_errors += 1;
+                    continue;
+                }
+
+                result.clusters_allocated += 1;
+
+                // Overlap detection
+                if can_track {
+                    let gidx = grain_off / grain_size_bytes;
+                    if matches!(
+                        bitmap_set(bitmap, bitmap_size, gidx),
+                        BitmapSetResult::AlreadySet
+                    ) {
+                        result.corruptions += 1;
+                        result.total_errors += 1;
+                        (call_table.debug_print)(b"check: grain overlap\n\0".as_ptr());
+                    }
+                }
+
+                // Fragmentation tracking
+                total_data_entries += 1;
+                if last_data_offset != 0 {
+                    if let Some(expected) = last_data_offset.checked_add(grain_size_bytes) {
+                        if grain_off != expected {
+                            fragmented_entries += 1;
+                        }
+                    } else {
+                        fragmented_entries += 1;
+                    }
+                }
+                last_data_offset = grain_off;
+
+                // Update max offset
+                if grain_end > max_offset {
+                    max_offset = grain_end;
+                }
+            }
+        }
+    }
+
+    (call_table.verbose_print)(b"check: vmdk GD/GT walk complete\n\0".as_ptr());
+
+    // Calculate fragmentation
+    if total_data_entries > 1 {
+        result.fragmentation = ((fragmented_entries * 100) / (total_data_entries - 1)) as u32;
+    }
+
+    // Set image end offset
+    if is_stream_optimized {
+        result.image_end_offset = actual_size;
+    } else {
+        result.image_end_offset = max_offset;
+    }
+
+    // Set flags
+    if result.corruptions > 0 {
+        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+    }
+
+    bytes_read
 }
 
 /// Check VHDX image integrity
