@@ -542,6 +542,142 @@ impl VmdkState {
 }
 
 // ============================================================================
+// Compressed grain reading (streamOptimized VMDK)
+// ============================================================================
+
+/// Read and decompress a compressed grain from a streamOptimized VMDK.
+///
+/// The grain marker is 12 bytes at `marker_byte_offset`:
+/// - u64 LE: uncompressed LBA (sector number)
+/// - u32 LE: compressed data size in bytes
+///
+/// Immediately after the marker is the DEFLATE-compressed grain data.
+/// Decompression uses miniz_oxide (tries zlib-wrapped first, then raw
+/// DEFLATE).
+///
+/// # Safety
+///
+/// `out_buf` must point to at least `grain_size_bytes` writable bytes.
+/// `compressed_buf` must point to at least `compressed_buf_size`
+/// writable bytes. `call_table` must be valid.
+#[cfg(feature = "decompress")]
+pub unsafe fn read_compressed_grain(
+    call_table: &CallTable,
+    device_idx: u32,
+    marker_byte_offset: u64,
+    grain_size_bytes: u64,
+    out_buf: *mut u8,
+    sector_size: usize,
+    compressed_buf: *mut u8,
+    compressed_buf_size: usize,
+    input_capacity: u64,
+    bytes_read: &mut u64,
+) -> bool {
+    // Read the sector containing the grain marker header.
+    let first_sector = marker_byte_offset / sector_size as u64;
+    let marker_off = (marker_byte_offset % sector_size as u64) as usize;
+
+    if first_sector >= input_capacity {
+        return false;
+    }
+
+    // Read first sector
+    if !(call_table.read_input_sector)(device_idx, first_sector, compressed_buf, sector_size) {
+        return false;
+    }
+    *bytes_read += sector_size as u64;
+
+    // Marker must fit within this sector (12 bytes)
+    if marker_off + GRAIN_MARKER_SIZE > sector_size {
+        return false;
+    }
+
+    // Parse compressed_size from the marker (offset 8, u32 LE)
+    let marker_ptr = compressed_buf.add(marker_off);
+    let compressed_size = u32::from_le_bytes([
+        *marker_ptr.add(8),
+        *marker_ptr.add(9),
+        *marker_ptr.add(10),
+        *marker_ptr.add(11),
+    ]) as usize;
+
+    if compressed_size == 0 {
+        // Empty grain: fill with zeros
+        core::ptr::write_bytes(out_buf, 0, grain_size_bytes as usize);
+        return true;
+    }
+
+    // Validate compressed data fits in our buffer
+    let total_needed = GRAIN_MARKER_SIZE + compressed_size;
+    if total_needed > compressed_buf_size {
+        return false;
+    }
+
+    // Calculate how many sectors we need in total
+    let total_byte_end = marker_byte_offset + total_needed as u64;
+    let last_sector = (total_byte_end + sector_size as u64 - 1) / sector_size as u64;
+    let sectors_to_read = last_sector - first_sector;
+
+    if sectors_to_read * sector_size as u64 > compressed_buf_size as u64 {
+        return false;
+    }
+
+    // Read remaining sectors (first one already read)
+    for i in 1..sectors_to_read {
+        let sector = first_sector + i;
+        if sector >= input_capacity {
+            return false;
+        }
+        let buf_offset = (i as usize) * sector_size;
+        if !(call_table.read_input_sector)(
+            device_idx,
+            sector,
+            compressed_buf.add(buf_offset),
+            sector_size,
+        ) {
+            return false;
+        }
+        *bytes_read += sector_size as u64;
+    }
+
+    // Decompress: compressed data starts after the 12-byte marker
+    let data_offset = marker_off + GRAIN_MARKER_SIZE;
+    let compressed_slice =
+        core::slice::from_raw_parts(compressed_buf.add(data_offset), compressed_size);
+    let out_slice = core::slice::from_raw_parts_mut(out_buf, grain_size_bytes as usize);
+
+    use miniz_oxide::inflate::core::inflate_flags;
+    use miniz_oxide::inflate::TINFLStatus;
+
+    // Try zlib-wrapped DEFLATE first (standard for VMDK)
+    let mut decomp = miniz_oxide::inflate::core::DecompressorOxide::new();
+    let (status, _in_consumed, out_produced) = miniz_oxide::inflate::core::decompress(
+        &mut decomp,
+        compressed_slice,
+        out_slice,
+        0,
+        inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER
+            | inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
+    );
+
+    if status == TINFLStatus::Done && out_produced == grain_size_bytes as usize {
+        return true;
+    }
+
+    // Fall back to raw DEFLATE (no zlib header)
+    let mut decomp2 = miniz_oxide::inflate::core::DecompressorOxide::new();
+    let (status2, _in2, out2) = miniz_oxide::inflate::core::decompress(
+        &mut decomp2,
+        compressed_slice,
+        out_slice,
+        0,
+        inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
+    );
+
+    status2 == TINFLStatus::Done && out2 == grain_size_bytes as usize
+}
+
+// ============================================================================
 // Cached sector read helper (little-endian u32)
 // ============================================================================
 

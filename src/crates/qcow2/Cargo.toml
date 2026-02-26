@@ -10,6 +10,7 @@ decompress = ["miniz_oxide"]
 decompress-zstd = ["ruzstd"]
 compress = ["miniz_oxide", "miniz_oxide/with-alloc"]
 vmdk-input = ["vmdk"]
+vmdk-decompress = ["vmdk-input", "vmdk/decompress"]
 
 [dependencies]
 shared = { path = "../../shared" }

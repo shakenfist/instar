@@ -1999,8 +1999,8 @@ class TestConvertVmdkCompare(ImagoTestBase):
             )
             self.assertEqual(
                 cmp_rc, 0,
-                f'VMDK {image_id} differs from raw: '
-                f'{cmp_out}'
+                f'Sparse VMDK {image_id} content '
+                f'differs from raw: {cmp_out}'
             )
 
     def test_compare_plaso_vmdk_vs_raw(self):
@@ -2014,3 +2014,169 @@ class TestConvertVmdkCompare(ImagoTestBase):
     def test_compare_chain_base_vmdk_vs_raw(self):
         """Compare chain base VMDK against raw."""
         self._compare_vmdk_vs_raw('chain-base-vmdk')
+
+
+class TestConvertVmdkStreamOptimized(ImagoTestBase):
+    """Test streamOptimized VMDK conversion and comparison.
+
+    streamOptimized VMDKs use DEFLATE-compressed grains with
+    grain markers, and store the grain directory at the end of
+    the file (GD_AT_END). This tests decompression and footer
+    reading.
+    """
+
+    STREAM_OPT_IDS = [
+        'vmdk-streamoptimized',
+        'vmdk-v3',
+    ]
+
+    def _get_vmdk_info(self, image_path):
+        """Get virtual_size via qemu-img info."""
+        result = subprocess.run(
+            [
+                'qemu-img', 'info', '--output=json',
+                str(image_path),
+            ],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return None
+        info = json.loads(result.stdout)
+        return info.get('virtual-size')
+
+    def _test_streamopt_convert(self, image_id):
+        """Convert streamOptimized VMDK to raw, validate."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        vsize = self._get_vmdk_info(image.path)
+        timeout = max(120, int(120 + (vsize or 0)
+                                / (1024 ** 3) * 10))
+
+        # Check temp space
+        if vsize:
+            tmpdir = tempfile.gettempdir()
+            st = os.statvfs(tmpdir)
+            avail = st.f_bavail * st.f_frsize
+            needed = vsize * 2 + 100 * 1024 * 1024
+            if avail < needed:
+                self.skipTest(
+                    f'{image_id}: needs '
+                    f'{needed // (1024**3)}GB temp, '
+                    f'only {avail // (1024**3)}GB '
+                    f'available'
+                )
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') \
+                as imago_raw, \
+                tempfile.NamedTemporaryFile(suffix='.raw') \
+                as qemu_raw:
+            # Convert with imago
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(imago_raw.name),
+                timeout=timeout
+            )
+            self.assertEqual(
+                rc, 0,
+                f'imago convert failed for {image_id}: '
+                f'{stderr}'
+            )
+
+            # Convert with qemu-img
+            q_stdout, q_stderr, q_rc = \
+                self.run_qemu_img_convert(
+                    image.path, Path(qemu_raw.name),
+                    timeout=timeout
+                )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed for '
+                f'{image_id}: {q_stderr}'
+            )
+
+            # Compare outputs
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(imago_raw.name),
+                Path(qemu_raw.name),
+                timeout=timeout
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Convert output for {image_id} differs '
+                f'from qemu-img: {cmp_out}'
+            )
+
+    def test_convert_vmdk_streamoptimized(self):
+        """Convert streamOptimized VMDK to raw."""
+        self._test_streamopt_convert(
+            'vmdk-streamoptimized'
+        )
+
+    def test_convert_vmdk_v3(self):
+        """Convert VMDK v3 (streamOptimized) to raw."""
+        self._test_streamopt_convert('vmdk-v3')
+
+    def _compare_streamopt_vs_raw(self, image_id):
+        """Compare streamOptimized VMDK vs raw baseline."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        vsize = self._get_vmdk_info(image.path)
+
+        # Check temp space
+        if vsize:
+            tmpdir = tempfile.gettempdir()
+            st = os.statvfs(tmpdir)
+            avail = st.f_bavail * st.f_frsize
+            needed = vsize + 100 * 1024 * 1024
+            if avail < needed:
+                self.skipTest(
+                    f'{image_id}: needs '
+                    f'{needed // (1024**3)}GB temp, '
+                    f'only {avail // (1024**3)}GB '
+                    f'available'
+                )
+
+        timeout = max(120, int(120 + (vsize or 0)
+                                / (1024 ** 3) * 10))
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') \
+                as qemu_raw:
+            q_stdout, q_stderr, q_rc = \
+                self.run_qemu_img_convert(
+                    image.path, Path(qemu_raw.name),
+                    timeout=timeout
+                )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed for '
+                f'{image_id}: {q_stderr}'
+            )
+
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                image.path, Path(qemu_raw.name),
+                timeout=timeout
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'StreamOpt VMDK {image_id} differs '
+                f'from raw: {cmp_out}'
+            )
+
+    def test_compare_vmdk_streamoptimized_vs_raw(self):
+        """Compare streamOptimized VMDK against raw."""
+        self._compare_streamopt_vs_raw(
+            'vmdk-streamoptimized'
+        )
+
+    def test_compare_vmdk_v3_vs_raw(self):
+        """Compare VMDK v3 (streamOptimized) vs raw."""
+        self._compare_streamopt_vs_raw('vmdk-v3')
