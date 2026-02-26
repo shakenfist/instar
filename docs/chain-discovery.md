@@ -172,7 +172,7 @@ The chain discovery infrastructure is used by the following operations:
   backing chain, so overlay images compare correctly against their flattened
   equivalents. Supports multi-level chains (e.g., top -> mid -> base) and
   chains on both sides of the comparison.
-
-### Future Work
-
-- **`imago convert`** - Flatten backing chains during format conversion
+- **`imago convert`** - Discovers backing chains for the input image and loads
+  all chain images as separate virtio-block devices for flattening. The guest
+  walks the chain to resolve unallocated clusters, producing a standalone
+  output image with no backing dependencies.
