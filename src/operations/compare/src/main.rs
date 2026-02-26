@@ -175,19 +175,19 @@ pub unsafe extern "C" fn _start() -> u64 {
 
     (call_table.verbose_print)(b"compare: determined formats\n\0".as_ptr());
 
-    // Initialize QCOW2 state for all QCOW2 devices across both chains
-    let mut qcow2_states: [Option<qcow2::Qcow2State>; MAX_CHAIN_DEVICES] = Default::default();
+    // Initialize format-specific state for all devices across both chains
+    let mut chain_states = qcow2::ChainStates::default();
 
-    if !qcow2::init_chain_qcow2_states(
+    if !qcow2::init_chain_states(
         call_table,
         chain_config,
-        &mut qcow2_states,
+        &mut chain_states,
         total_devices,
         sector_size,
         DYNAMIC_BUFS_START,
         &mut bytes_read,
     ) {
-        (call_table.debug_print)(b"compare: failed to init qcow2 state\n\0".as_ptr());
+        (call_table.debug_print)(b"compare: failed to init chain states\n\0".as_ptr());
         let result = CompareResult::new();
         (call_table.send_compare_result)(&result);
         (call_table.send_complete)(b"compare\0".as_ptr(), bytes_read, false);
@@ -195,7 +195,7 @@ pub unsafe extern "C" fn _start() -> u64 {
     }
 
     // Reject QCOW2 images with unsupported incompatible features
-    for state in qcow2_states.iter().flatten() {
+    for state in chain_states.qcow2_states.iter().flatten() {
         let unsupported = state.unsupported_incompat_features(qcow2::SUPPORTED_INCOMPAT_FEATURES);
         if unsupported != 0 {
             (call_table.debug_print)(b"compare: unsupported incompatible features\n\0".as_ptr());
@@ -267,7 +267,7 @@ pub unsafe extern "C" fn _start() -> u64 {
             this_chunk,
             sector_size,
             chain_config,
-            &mut qcow2_states,
+            &mut chain_states,
             BUF_COMPRESSED_IN as *mut u8,
             &mut bytes_read,
         ) {
@@ -296,7 +296,7 @@ pub unsafe extern "C" fn _start() -> u64 {
             this_chunk,
             sector_size,
             chain_config,
-            &mut qcow2_states,
+            &mut chain_states,
             BUF_COMPRESSED_IN as *mut u8,
             &mut bytes_read,
         ) {
@@ -372,7 +372,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                     this_chunk,
                     sector_size,
                     chain_config,
-                    &mut qcow2_states,
+                    &mut chain_states,
                     BUF_COMPRESSED_IN as *mut u8,
                     &mut bytes_read,
                 ) {

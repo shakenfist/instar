@@ -21,6 +21,8 @@ use shared::{
     l1_cache_addr, l2_cache_addr, BackingFormat, CallTable, ChainConfig, ImageFormat,
     MAX_CHAIN_DEVICES, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE,
 };
+#[cfg(feature = "vmdk-input")]
+use vmdk::{GrainLookup, VmdkState};
 
 // ============================================================================
 // QCOW2 Header Constants
@@ -991,7 +993,14 @@ pub unsafe fn read_cluster_sectors(
     bytes_read: &mut u64,
 ) -> bool {
     let first_sector = host_offset / sector_size as u64;
-    let sectors_per_cluster = cluster_size / sector_size as u64;
+    // Ensure at least one sector is read when cluster_size < sector_size.
+    // The caller's buffer is always >= MAX_SECTOR_SIZE.
+    let read_size = if cluster_size < sector_size as u64 {
+        sector_size as u64
+    } else {
+        cluster_size
+    };
+    let sectors_per_cluster = read_size / sector_size as u64;
 
     for i in 0..sectors_per_cluster {
         let sector = first_sector + i;
@@ -1626,7 +1635,14 @@ pub unsafe fn read_raw_sectors(
     bytes_read: &mut u64,
 ) -> bool {
     let first_sector = virtual_offset / sector_size as u64;
-    let sectors_per_chunk = chunk_size / sector_size as u64;
+    // Ensure at least one sector is read when chunk_size < sector_size.
+    // The caller's buffer is always >= MAX_SECTOR_SIZE.
+    let read_size = if chunk_size < sector_size as u64 {
+        sector_size as u64
+    } else {
+        chunk_size
+    };
+    let sectors_per_chunk = read_size / sector_size as u64;
 
     for i in 0..sectors_per_chunk {
         let sector = first_sector + i;
@@ -1650,6 +1666,8 @@ pub unsafe fn read_raw_sectors(
 ///
 /// For each device in the chain (starting from the top):
 /// - QCOW2: perform L1/L2 lookup. If unallocated, try next device.
+/// - VMDK (with `vmdk-input` feature): perform GD/GT grain lookup.
+///   If unallocated, try next device.
 /// - Raw/other: read sectors directly (base of chain).
 ///
 /// If all devices have the cluster unallocated, fills with zeros.
@@ -1670,7 +1688,7 @@ pub unsafe fn read_chain_virtual_cluster(
     chunk_size: u64,
     sector_size: usize,
     chain_config: &ChainConfig,
-    qcow2_states: &mut [Option<Qcow2State>],
+    chain_states: &mut ChainStates,
     compressed_buf: *mut u8,
     bytes_read: &mut u64,
 ) -> bool {
@@ -1681,7 +1699,7 @@ pub unsafe fn read_chain_virtual_cluster(
 
         match format {
             ImageFormat::Qcow2 => {
-                let state = match &mut qcow2_states[dev_idx] {
+                let state = match &mut chain_states.qcow2_states[dev_idx] {
                     Some(s) => s,
                     None => return false,
                 };
@@ -1765,6 +1783,51 @@ pub unsafe fn read_chain_virtual_cluster(
                     None => return false,
                 }
             }
+            #[cfg(feature = "vmdk-input")]
+            ImageFormat::Vmdk4 => {
+                let state = match &mut chain_states.vmdk_states[dev_idx] {
+                    Some(s) => s,
+                    None => return false,
+                };
+
+                let grain_size_bytes = state.grain_size_bytes;
+
+                match state.grain_lookup(call_table, virtual_offset, sector_size, cap, bytes_read) {
+                    Some(GrainLookup::Unallocated) => {
+                        continue;
+                    }
+                    Some(GrainLookup::Zeroed) => {
+                        core::ptr::write_bytes(buf, 0, chunk_size as usize);
+                        return true;
+                    }
+                    Some(GrainLookup::Standard(host_offset)) => {
+                        // Handle intra-grain offset for large grains
+                        let intra_offset = virtual_offset % grain_size_bytes;
+                        let read_offset = host_offset + intra_offset;
+                        let grain_remaining = grain_size_bytes - intra_offset;
+                        let read_size = if chunk_size < grain_remaining {
+                            chunk_size
+                        } else {
+                            grain_remaining
+                        };
+                        return read_cluster_sectors(
+                            call_table,
+                            dev_idx as u32,
+                            read_offset,
+                            buf,
+                            read_size,
+                            sector_size,
+                            bytes_read,
+                        );
+                    }
+                    Some(GrainLookup::Compressed(_marker_offset)) => {
+                        // Compressed grains (streamOptimized) handled
+                        // in Phase 8c with vmdk decompress feature.
+                        return false;
+                    }
+                    None => return false,
+                }
+            }
             _ => {
                 return read_raw_sectors(
                     call_table,
@@ -1821,6 +1884,88 @@ pub unsafe fn init_chain_qcow2_states(
             if state.is_none() {
                 return false;
             }
+        }
+    }
+    true
+}
+
+// ============================================================================
+// ChainStates: unified state container for multi-format chain reading
+// ============================================================================
+
+/// Bundled state for all format-specific chain readers.
+///
+/// Holds per-device state arrays for each supported input format.
+/// VMDK state is feature-gated to avoid binary bloat when not needed.
+/// Each device in a chain uses at most one format's state slot.
+#[derive(Default)]
+pub struct ChainStates {
+    pub qcow2_states: [Option<Qcow2State>; MAX_CHAIN_DEVICES],
+    #[cfg(feature = "vmdk-input")]
+    pub vmdk_states: [Option<VmdkState>; MAX_CHAIN_DEVICES],
+}
+
+/// Initialize format-specific state for all devices in a chain.
+///
+/// Initializes QCOW2 state for QCOW2 devices, and (when the
+/// `vmdk-input` feature is enabled) VMDK state for VMDK4 devices.
+/// Each device reuses the same per-device cache memory region
+/// (2 × MAX_SECTOR_SIZE), since a device is never both QCOW2 and VMDK.
+///
+/// Returns `true` on success, `false` if any device fails to
+/// initialize.
+///
+/// # Safety
+///
+/// Same requirements as `init_chain_qcow2_states`: valid `call_table`,
+/// valid `chain_config`, `device_count <= MAX_CHAIN_DEVICES`, and
+/// sufficient memory at `dynamic_bufs_start`.
+pub unsafe fn init_chain_states(
+    call_table: &CallTable,
+    chain_config: &ChainConfig,
+    chain_states: &mut ChainStates,
+    device_count: usize,
+    sector_size: usize,
+    dynamic_bufs_start: usize,
+    bytes_read: &mut u64,
+) -> bool {
+    for dev_idx in 0..device_count {
+        let dev_info = &chain_config.devices[dev_idx];
+        let format = dev_info.detected_format();
+        let cap = (call_table.get_input_capacity)(dev_idx as u32);
+
+        match format {
+            ImageFormat::Qcow2 => {
+                chain_states.qcow2_states[dev_idx] = Qcow2State::init(
+                    call_table,
+                    dev_idx as u32,
+                    sector_size,
+                    cap,
+                    l1_cache_addr(dynamic_bufs_start, dev_idx),
+                    l2_cache_addr(dynamic_bufs_start, dev_idx),
+                    bytes_read,
+                );
+                if chain_states.qcow2_states[dev_idx].is_none() {
+                    return false;
+                }
+            }
+            #[cfg(feature = "vmdk-input")]
+            ImageFormat::Vmdk4 => {
+                // Reuse the same cache slots: L1→GD, L2→GT
+                chain_states.vmdk_states[dev_idx] = VmdkState::init(
+                    call_table,
+                    dev_idx as u32,
+                    sector_size,
+                    cap,
+                    l1_cache_addr(dynamic_bufs_start, dev_idx),
+                    l2_cache_addr(dynamic_bufs_start, dev_idx),
+                    bytes_read,
+                );
+                if chain_states.vmdk_states[dev_idx].is_none() {
+                    return false;
+                }
+            }
+            _ => {} // Raw and other formats need no per-device state
         }
     }
     true
