@@ -1612,9 +1612,12 @@ unsafe fn convert_to_vmdk_compressed(
 
     let buf_data = BUF_DATA as *mut u8;
     let buf_gt = BUF_L2_OUT as *mut u8;
-    // Reuse BUF_COMPRESSED_IN as the staging buffer for grain
-    // markers + compressed data. We compress into offset 12
-    // (after the marker header) so the result is contiguous.
+    // SAFETY: buf_staging intentionally aliases BUF_COMPRESSED_IN.
+    // BUF_COMPRESSED_IN is also passed to read_chain_virtual_cluster()
+    // as the input decompression buffer.  The read completes and its
+    // result is copied into buf_data *before* we touch buf_staging for
+    // output compression, so the two uses never overlap in time.
+    // Do NOT reorder: output compression must stay after the read call.
     let buf_staging = BUF_COMPRESSED_IN as *mut u8;
     let oss = layout.output_sector_size;
     let oc = layout.output_capacity;
