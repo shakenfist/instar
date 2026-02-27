@@ -70,12 +70,12 @@ imago compare --output json image1.raw image2.raw
 Exit codes: 0 = identical, 1 = content differs.
 
 The compare operation reads the virtual content of both images and reports the
-first byte offset where content diverges. For QCOW2 images, this includes
-L1/L2 cluster table lookup (including extended L2 entries) and compressed
-cluster decompression (zlib and ZSTD), so comparisons work across formats
-(e.g., QCOW2 vs raw, compressed QCOW2 vs uncompressed QCOW2). QCOW2 backing
-chains are automatically discovered and flattened: unallocated clusters are
-resolved by walking the backing chain, so overlay images compare correctly
+first byte offset where content diverges. For QCOW2 and VMDK images, this
+includes cluster/grain table lookup and compressed cluster decompression
+(zlib, ZSTD, and DEFLATE), so comparisons work across formats (e.g., QCOW2
+vs raw, VMDK vs raw, compressed QCOW2 vs uncompressed QCOW2). Backing
+chains are automatically discovered and flattened: unallocated clusters/grains
+are resolved by walking the backing chain, so overlay images compare correctly
 against their flattened equivalents.
 When images differ in size, non-strict mode (default) treats extra zero-filled
 regions as matching, while strict mode (`-s`) fails immediately on any size

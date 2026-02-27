@@ -128,7 +128,7 @@ Chain discovery works with any format that supports backing files:
 | QCOW2  | ✓ Yes |
 | QCOW1  | ✓ Yes |
 | Raw    | No |
-| VMDK   | Partial (parent links, not yet fully supported) |
+| VMDK   | ✓ Yes (descriptor parentFileNameHint) |
 | VHD    | No |
 | VHDX   | No |
 
