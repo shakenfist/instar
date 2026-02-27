@@ -73,8 +73,10 @@ The `imago convert` operation supports writing output in the following formats:
 
 ### Limitations
 
-- Input cluster sizes above 64KB are not supported (affects both convert and
-  compare). The `debian-12-sfagent` image (2MB clusters) is skipped in tests.
+- Compressed clusters with cluster sizes above 64KB cannot be decompressed
+  (decompression buffer limited to 64KB). Uncompressed clusters up to 2MB are
+  fully supported. The `debian-12-sfagent` image (2MB clusters with 692
+  compressed clusters) is skipped in convert/compare tests for this reason.
 - Encrypted QCOW2 images are not supported.
 - Extended L2 images with partially-allocated subclusters may return stale host
   data for unallocated subclusters. The extended L2 support reads only the first
