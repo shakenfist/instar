@@ -525,6 +525,7 @@ impl VmdkState {
         device_idx: u32,
         sector_size: usize,
         input_capacity: u64,
+        actual_file_size: u64,
         gd_cache_buf: *mut u8,
         gt_cache_buf: *mut u8,
         bytes_read: &mut u64,
@@ -569,6 +570,7 @@ impl VmdkState {
                 device_idx,
                 sector_size,
                 input_capacity,
+                actual_file_size,
                 bytes_read,
             )?
         } else {
@@ -616,14 +618,17 @@ impl VmdkState {
         device_idx: u32,
         sector_size: usize,
         input_capacity: u64,
+        actual_file_size: u64,
         bytes_read: &mut u64,
     ) -> Option<u64> {
         // Footer is at EOF - 1024 bytes (the middle of the last 3
         // 512-byte sectors: footer_marker | footer_header | eos).
-        // In terms of the device's actual sector size, we need to
-        // read the sector containing byte offset (file_size - 1024).
-        let actual_size = input_capacity.checked_mul(sector_size as u64)?;
-        let footer_byte_offset = actual_size.checked_sub(1024)?;
+        // We must use the actual file size here, not capacity *
+        // sector_size, because when the file size doesn't evenly
+        // divide the sector size the capacity is rounded up and
+        // the calculated offset would land in zero-padded space
+        // beyond the real file data.
+        let footer_byte_offset = actual_file_size.checked_sub(1024)?;
         let footer_sector = footer_byte_offset / sector_size as u64;
         let offset_in_sector = (footer_byte_offset % sector_size as u64) as usize;
 
