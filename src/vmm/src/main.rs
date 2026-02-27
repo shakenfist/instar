@@ -3992,11 +3992,12 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     }
 
     // Set up output device (writable).
-    // For compressed QCOW2 output, use 512-byte sectors so
-    // compressed clusters can be packed at sector granularity.
-    // For uncompressed QCOW2, use the smaller of sector_size
-    // and cluster_size so that cluster writes align to whole
-    // sectors.
+    // For compressed QCOW2/VMDK output, use 512-byte sectors so
+    // compressed clusters/grains can be packed at sector granularity.
+    // For uncompressed QCOW2, use min(sector_size, cluster_size)
+    // so that cluster writes align to whole sectors.
+    // For uncompressed VMDK and raw, use sector_size (VMDK GTEs
+    // always reference 512-byte sectors internally).
     let output_sector_size = if (is_qcow2_output || is_vmdk_output) && args.compress {
         512
     } else if is_qcow2_output {
