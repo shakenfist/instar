@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["vmm", "shared", "core", "crates/qcow2", "crates/raw", "crates/vmdk", "operations/info", "operations/copy", "operations/check", "operations/compare", "operations/convert"]
+members = ["vmm", "shared", "core", "crates/qcow2", "crates/raw", "crates/vmdk", "crates/vhd", "operations/info", "operations/copy", "operations/check", "operations/compare", "operations/convert"]

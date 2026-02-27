@@ -1,0 +1,973 @@
+//! VHD/VPC (Virtual Hard Disk) format parsing.
+//!
+//! Provides VHD footer and dynamic header parsing, BAT (Block Allocation
+//! Table) reading, and block lookup for dynamic VHD images. Fixed VHDs
+//! (disk_type=2) are treated as raw data with a trailing footer.
+
+#![no_std]
+#![allow(clippy::too_many_arguments)]
+
+use shared::{CallTable, MAX_SECTOR_SIZE};
+
+// ============================================================================
+// VHD footer field offsets (all big-endian)
+// ============================================================================
+
+/// Footer size in bytes.
+pub const FOOTER_SIZE: usize = 512;
+
+/// Footer cookie offset: "conectix" (8 bytes, big-endian).
+pub const FOOTER_COOKIE_OFFSET: usize = 0;
+/// Footer features offset (u32 BE).
+pub const FOOTER_FEATURES_OFFSET: usize = 8;
+/// Footer format version offset (u32 BE).
+pub const FOOTER_FORMAT_VERSION_OFFSET: usize = 12;
+/// Footer data offset (u64 BE) — offset to dynamic header.
+pub const FOOTER_DATA_OFFSET_OFFSET: usize = 16;
+/// Footer timestamp offset (u32 BE).
+pub const FOOTER_TIMESTAMP_OFFSET: usize = 24;
+/// Footer creator application offset (4 bytes).
+pub const FOOTER_CREATOR_APP_OFFSET: usize = 28;
+/// Footer creator version offset (u32 BE).
+pub const FOOTER_CREATOR_VERSION_OFFSET: usize = 32;
+/// Footer creator host OS offset (u32 BE).
+pub const FOOTER_CREATOR_HOST_OFFSET: usize = 36;
+/// Footer original size offset (u64 BE).
+pub const FOOTER_ORIGINAL_SIZE_OFFSET: usize = 40;
+/// Footer current size offset (u64 BE).
+pub const FOOTER_CURRENT_SIZE_OFFSET: usize = 48;
+/// Footer disk geometry offset (4 bytes: CHS).
+pub const FOOTER_GEOMETRY_OFFSET: usize = 56;
+/// Footer disk type offset (u32 BE).
+pub const FOOTER_DISK_TYPE_OFFSET: usize = 60;
+/// Footer checksum offset (u32 BE).
+pub const FOOTER_CHECKSUM_OFFSET: usize = 64;
+/// Footer unique ID offset (16 bytes UUID).
+pub const FOOTER_UUID_OFFSET: usize = 68;
+/// Footer saved state offset (u8).
+pub const FOOTER_SAVED_STATE_OFFSET: usize = 84;
+
+// ============================================================================
+// VHD dynamic header field offsets (all big-endian)
+// ============================================================================
+
+/// Dynamic header size in bytes.
+pub const DYNAMIC_HEADER_SIZE: usize = 1024;
+
+/// Dynamic header cookie offset: "cxsparse" (8 bytes).
+pub const DYN_COOKIE_OFFSET: usize = 0;
+/// Dynamic header data offset (u64 BE) — unused, should be 0xFFFFFFFFFFFFFFFF.
+pub const DYN_DATA_OFFSET_OFFSET: usize = 8;
+/// Dynamic header table offset (u64 BE) — byte offset to BAT.
+pub const DYN_TABLE_OFFSET_OFFSET: usize = 16;
+/// Dynamic header version offset (u32 BE).
+pub const DYN_HEADER_VERSION_OFFSET: usize = 24;
+/// Dynamic header max table entries (u32 BE) — number of BAT entries.
+pub const DYN_MAX_TABLE_ENTRIES_OFFSET: usize = 28;
+/// Dynamic header block size (u32 BE) — bytes per data block.
+pub const DYN_BLOCK_SIZE_OFFSET: usize = 32;
+/// Dynamic header checksum offset (u32 BE).
+pub const DYN_CHECKSUM_OFFSET: usize = 36;
+
+// ============================================================================
+// VHD constants
+// ============================================================================
+
+/// VHD footer cookie: "conectix" (big-endian u64).
+pub const VHD_COOKIE: u64 = 0x636f_6e65_6374_6978;
+
+/// VHD dynamic header cookie: "cxsparse" (big-endian u64).
+pub const CXSPARSE_COOKIE: u64 = 0x6378_7370_6172_7365;
+
+/// VHD format version 1.0 (stored as major.minor in u32 BE).
+pub const VHD_VERSION_1_0: u32 = 0x0001_0000;
+
+/// Disk type: Fixed (raw data + footer).
+pub const DISK_TYPE_FIXED: u32 = 2;
+/// Disk type: Dynamic (footer + dynamic header + BAT + blocks).
+pub const DISK_TYPE_DYNAMIC: u32 = 3;
+/// Disk type: Differencing (has parent locators).
+pub const DISK_TYPE_DIFFERENCING: u32 = 4;
+
+/// BAT entry value indicating an unallocated block.
+pub const BAT_UNALLOCATED: u32 = 0xFFFF_FFFF;
+
+/// Default block size (2 MiB).
+pub const DEFAULT_BLOCK_SIZE: u32 = 2 * 1024 * 1024;
+
+/// VHD features: reserved bit (must be set).
+pub const FEATURES_RESERVED: u32 = 0x0000_0002;
+
+// ============================================================================
+// Byte-order helpers (big-endian)
+// ============================================================================
+
+/// Read a big-endian u16 from a byte slice.
+#[inline]
+fn be_u16(buf: &[u8], off: usize) -> u16 {
+    u16::from_be_bytes([buf[off], buf[off + 1]])
+}
+
+/// Read a big-endian u32 from a byte slice.
+#[inline]
+fn be_u32(buf: &[u8], off: usize) -> u32 {
+    u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
+
+/// Read a big-endian u64 from a byte slice.
+#[inline]
+fn be_u64(buf: &[u8], off: usize) -> u64 {
+    u64::from_be_bytes([
+        buf[off],
+        buf[off + 1],
+        buf[off + 2],
+        buf[off + 3],
+        buf[off + 4],
+        buf[off + 5],
+        buf[off + 6],
+        buf[off + 7],
+    ])
+}
+
+// ============================================================================
+// Write helpers (big-endian)
+// ============================================================================
+
+/// Write a big-endian u16 to a byte slice.
+#[inline]
+pub fn write_be_u16(buf: &mut [u8], off: usize, val: u16) {
+    buf[off..off + 2].copy_from_slice(&val.to_be_bytes());
+}
+
+/// Write a big-endian u32 to a byte slice.
+#[inline]
+pub fn write_be_u32(buf: &mut [u8], off: usize, val: u32) {
+    buf[off..off + 4].copy_from_slice(&val.to_be_bytes());
+}
+
+/// Write a big-endian u64 to a byte slice.
+#[inline]
+pub fn write_be_u64(buf: &mut [u8], off: usize, val: u64) {
+    buf[off..off + 8].copy_from_slice(&val.to_be_bytes());
+}
+
+// ============================================================================
+// VHD footer parsing
+// ============================================================================
+
+/// Parsed VHD footer fields.
+pub struct VhdFooter {
+    pub cookie: u64,
+    pub features: u32,
+    pub format_version: u32,
+    pub data_offset: u64,
+    pub original_size: u64,
+    pub current_size: u64,
+    pub cylinders: u16,
+    pub heads: u8,
+    pub sectors_per_track: u8,
+    pub disk_type: u32,
+    pub checksum: u32,
+    pub uuid: [u8; 16],
+}
+
+impl VhdFooter {
+    /// Parse a VHD footer from raw bytes.
+    ///
+    /// `buf` must contain at least 512 bytes starting at the footer.
+    /// Returns `None` if the buffer is too small or the cookie is invalid.
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        if buf.len() < FOOTER_SIZE {
+            return None;
+        }
+
+        let cookie = be_u64(buf, FOOTER_COOKIE_OFFSET);
+        if cookie != VHD_COOKIE {
+            return None;
+        }
+
+        let features = be_u32(buf, FOOTER_FEATURES_OFFSET);
+        let format_version = be_u32(buf, FOOTER_FORMAT_VERSION_OFFSET);
+        let data_offset = be_u64(buf, FOOTER_DATA_OFFSET_OFFSET);
+        let original_size = be_u64(buf, FOOTER_ORIGINAL_SIZE_OFFSET);
+        let current_size = be_u64(buf, FOOTER_CURRENT_SIZE_OFFSET);
+
+        let cylinders = be_u16(buf, FOOTER_GEOMETRY_OFFSET);
+        let heads = buf[FOOTER_GEOMETRY_OFFSET + 2];
+        let sectors_per_track = buf[FOOTER_GEOMETRY_OFFSET + 3];
+
+        let disk_type = be_u32(buf, FOOTER_DISK_TYPE_OFFSET);
+        let checksum = be_u32(buf, FOOTER_CHECKSUM_OFFSET);
+
+        let mut uuid = [0u8; 16];
+        uuid.copy_from_slice(&buf[FOOTER_UUID_OFFSET..FOOTER_UUID_OFFSET + 16]);
+
+        Some(VhdFooter {
+            cookie,
+            features,
+            format_version,
+            data_offset,
+            original_size,
+            current_size,
+            cylinders,
+            heads,
+            sectors_per_track,
+            disk_type,
+            checksum,
+            uuid,
+        })
+    }
+}
+
+// ============================================================================
+// VHD dynamic header parsing
+// ============================================================================
+
+/// Parsed VHD dynamic header fields.
+pub struct VhdDynamicHeader {
+    pub cookie: u64,
+    pub table_offset: u64,
+    pub header_version: u32,
+    pub max_table_entries: u32,
+    pub block_size: u32,
+    pub checksum: u32,
+}
+
+impl VhdDynamicHeader {
+    /// Parse a VHD dynamic header from raw bytes.
+    ///
+    /// `buf` must contain at least 1024 bytes starting at the dynamic
+    /// header. Returns `None` if the buffer is too small or the cookie
+    /// is invalid.
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        if buf.len() < DYNAMIC_HEADER_SIZE {
+            return None;
+        }
+
+        let cookie = be_u64(buf, DYN_COOKIE_OFFSET);
+        if cookie != CXSPARSE_COOKIE {
+            return None;
+        }
+
+        let table_offset = be_u64(buf, DYN_TABLE_OFFSET_OFFSET);
+        let header_version = be_u32(buf, DYN_HEADER_VERSION_OFFSET);
+        let max_table_entries = be_u32(buf, DYN_MAX_TABLE_ENTRIES_OFFSET);
+        let block_size = be_u32(buf, DYN_BLOCK_SIZE_OFFSET);
+        let checksum = be_u32(buf, DYN_CHECKSUM_OFFSET);
+
+        Some(VhdDynamicHeader {
+            cookie,
+            table_offset,
+            header_version,
+            max_table_entries,
+            block_size,
+            checksum,
+        })
+    }
+}
+
+// ============================================================================
+// Checksum computation
+// ============================================================================
+
+/// Compute the VHD checksum for a buffer.
+///
+/// The checksum is the one's complement of the sum of all bytes in the
+/// structure, with the checksum field itself set to zero during computation.
+pub fn compute_checksum(buf: &[u8], checksum_offset: usize) -> u32 {
+    let mut sum: u32 = 0;
+    for (i, &b) in buf.iter().enumerate() {
+        if i >= checksum_offset && i < checksum_offset + 4 {
+            continue;
+        }
+        sum = sum.wrapping_add(b as u32);
+    }
+    !sum
+}
+
+// ============================================================================
+// CHS geometry calculation (VPC algorithm)
+// ============================================================================
+
+/// Compute CHS geometry for a VHD using the VPC algorithm.
+///
+/// This matches the exact algorithm used by Virtual PC / Hyper-V to
+/// compute CHS geometry from the disk size in bytes.
+///
+/// Returns `(cylinders, heads, sectors_per_track)`.
+pub fn compute_vhd_geometry(size: u64) -> (u16, u8, u8) {
+    let total_sectors = size / 512;
+
+    // Cap at the maximum CHS addressable sectors
+    let total_sectors = if total_sectors > 65535 * 16 * 255 {
+        65535 * 16 * 255
+    } else {
+        total_sectors
+    };
+
+    if total_sectors >= 65535 * 16 * 63 {
+        // Large disk: use maximum geometry
+        return (65535, 16, 255);
+    }
+
+    let mut sectors_per_track;
+    let mut heads;
+    let mut cyl_times_heads;
+
+    if total_sectors >= 65535 * 3 * 17 {
+        // Medium-large disk
+        sectors_per_track = 255;
+        heads = 16;
+        cyl_times_heads = total_sectors / sectors_per_track;
+    } else {
+        // Smaller disk
+        sectors_per_track = 17;
+        cyl_times_heads = total_sectors / sectors_per_track;
+
+        heads = (cyl_times_heads + 1023) / 1024;
+        if heads < 4 {
+            heads = 4;
+        }
+
+        if cyl_times_heads >= (heads * 1024) || heads > 16 {
+            sectors_per_track = 31;
+            heads = 16;
+            cyl_times_heads = total_sectors / sectors_per_track;
+        }
+
+        if cyl_times_heads >= (heads * 1024) {
+            sectors_per_track = 63;
+            heads = 16;
+            cyl_times_heads = total_sectors / sectors_per_track;
+        }
+    }
+
+    let cylinders = cyl_times_heads / heads;
+
+    (cylinders as u16, heads as u8, sectors_per_track as u8)
+}
+
+// ============================================================================
+// Block lookup result
+// ============================================================================
+
+/// Result of looking up a virtual offset in the VHD BAT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockLookup {
+    /// The block is not allocated (reads as zeros or from parent).
+    Unallocated,
+    /// The block is allocated at the given host byte offset
+    /// (past the sector bitmap, pointing to the data region).
+    Allocated { host_byte_offset: u64 },
+}
+
+// ============================================================================
+// VHD state for BAT I/O
+// ============================================================================
+
+/// Runtime state for reading VHD blocks from a device.
+///
+/// Analogous to `qcow2::Qcow2State` and `vmdk::VmdkState`. Maintains
+/// a sector cache for BAT reads.
+pub struct VhdState {
+    pub device_idx: u32,
+    pub disk_type: u32,
+    pub block_size: u32,
+    pub block_data_offset: u32,
+    pub max_table_entries: u32,
+    pub table_offset: u64,
+    pub current_size: u64,
+    // Sector cache for BAT reads
+    pub bat_cached_sector: u64,
+    pub bat_cache_buf: *mut u8,
+    // Sector cache for data reads (reused for sector bitmap skip)
+    pub data_cached_sector: u64,
+    pub data_cache_buf: *mut u8,
+}
+
+impl VhdState {
+    /// Initialize VHD state by reading footer and dynamic header.
+    ///
+    /// For dynamic VHDs: reads the footer (first sector), then the
+    /// dynamic header, validates, and sets up state.
+    ///
+    /// For fixed VHDs: reads the footer from the last sector,
+    /// validates, and sets up minimal state (no BAT needed).
+    ///
+    /// Returns `None` if the footer/header is invalid or I/O fails.
+    ///
+    /// # Safety
+    ///
+    /// `bat_cache_buf` and `data_cache_buf` must each point to at
+    /// least `MAX_SECTOR_SIZE` writable bytes. `call_table` must be
+    /// valid.
+    pub unsafe fn init(
+        call_table: &CallTable,
+        device_idx: u32,
+        sector_size: usize,
+        input_capacity: u64,
+        bat_cache_buf: *mut u8,
+        data_cache_buf: *mut u8,
+        bytes_read: &mut u64,
+    ) -> Option<Self> {
+        // Read first sector (contains footer copy for dynamic VHDs,
+        // or raw data for fixed VHDs).
+        let mut first_sector = [0u8; MAX_SECTOR_SIZE];
+        if !(call_table.read_input_sector)(device_idx, 0, first_sector.as_mut_ptr(), sector_size) {
+            return None;
+        }
+        *bytes_read += sector_size as u64;
+
+        // Try parsing footer from first sector
+        let footer = VhdFooter::parse(&first_sector);
+
+        if footer.is_none() {
+            // No footer at start — try the last sector (fixed VHD
+            // only has footer at end).
+            let last_sector_idx = input_capacity.checked_sub(1)?;
+            let mut last_sector = [0u8; MAX_SECTOR_SIZE];
+            if !(call_table.read_input_sector)(
+                device_idx,
+                last_sector_idx,
+                last_sector.as_mut_ptr(),
+                sector_size,
+            ) {
+                return None;
+            }
+            *bytes_read += sector_size as u64;
+
+            // For large sectors the footer is at the start of the
+            // last sector (footer is only 512 bytes).
+            let footer = VhdFooter::parse(&last_sector)?;
+            return Self::init_fixed(
+                footer,
+                device_idx,
+                input_capacity,
+                sector_size,
+                bat_cache_buf,
+                data_cache_buf,
+            );
+        }
+
+        let footer = footer.unwrap();
+
+        if footer.disk_type == DISK_TYPE_FIXED {
+            return Self::init_fixed(
+                footer,
+                device_idx,
+                input_capacity,
+                sector_size,
+                bat_cache_buf,
+                data_cache_buf,
+            );
+        }
+
+        if footer.disk_type != DISK_TYPE_DYNAMIC && footer.disk_type != DISK_TYPE_DIFFERENCING {
+            return None;
+        }
+
+        // Read dynamic header at footer.data_offset
+        let dyn_byte_offset = footer.data_offset;
+        let actual_size = input_capacity.checked_mul(sector_size as u64)?;
+        if dyn_byte_offset >= actual_size {
+            return None;
+        }
+        // Dynamic header is 1024 bytes. We need to read enough
+        // sectors to cover it.
+        let dyn_sector = dyn_byte_offset / sector_size as u64;
+        let dyn_off_in_sector = (dyn_byte_offset % sector_size as u64) as usize;
+
+        // Read up to 2 sectors to ensure we get the full 1024-byte header
+        let mut dyn_buf = [0u8; MAX_SECTOR_SIZE];
+        if !(call_table.read_input_sector)(
+            device_idx,
+            dyn_sector,
+            dyn_buf.as_mut_ptr(),
+            sector_size,
+        ) {
+            return None;
+        }
+        *bytes_read += sector_size as u64;
+
+        // If the dynamic header doesn't fit in the first sector,
+        // read the next one too. For typical VHDs the footer is at
+        // offset 0 and the dynamic header at offset 512, so with
+        // 512-byte sectors we need to read sector 1 + sector 2.
+        // With larger sectors, it fits in one.
+        let dyn_available = sector_size - dyn_off_in_sector;
+        let mut dyn_header_bytes = [0u8; DYNAMIC_HEADER_SIZE];
+        if dyn_available >= DYNAMIC_HEADER_SIZE {
+            dyn_header_bytes.copy_from_slice(
+                &dyn_buf[dyn_off_in_sector..dyn_off_in_sector + DYNAMIC_HEADER_SIZE],
+            );
+        } else {
+            // First part from this sector
+            dyn_header_bytes[..dyn_available]
+                .copy_from_slice(&dyn_buf[dyn_off_in_sector..sector_size]);
+            // Read next sector
+            let next_sector = dyn_sector + 1;
+            if next_sector >= input_capacity {
+                return None;
+            }
+            if !(call_table.read_input_sector)(
+                device_idx,
+                next_sector,
+                dyn_buf.as_mut_ptr(),
+                sector_size,
+            ) {
+                return None;
+            }
+            *bytes_read += sector_size as u64;
+            let remaining = DYNAMIC_HEADER_SIZE - dyn_available;
+            dyn_header_bytes[dyn_available..DYNAMIC_HEADER_SIZE]
+                .copy_from_slice(&dyn_buf[..remaining]);
+        }
+
+        let dyn_header = VhdDynamicHeader::parse(&dyn_header_bytes)?;
+
+        // Validate
+        if dyn_header.block_size == 0 {
+            return None;
+        }
+        // Block size must be a power of 2
+        if (dyn_header.block_size & (dyn_header.block_size - 1)) != 0 {
+            return None;
+        }
+        if dyn_header.max_table_entries == 0 {
+            return None;
+        }
+
+        // Validate BAT offset
+        let bat_byte_offset = dyn_header.table_offset;
+        if bat_byte_offset >= actual_size {
+            return None;
+        }
+        let bat_size_bytes = (dyn_header.max_table_entries as u64).checked_mul(4)?;
+        let bat_end = bat_byte_offset.checked_add(bat_size_bytes)?;
+        if bat_end > actual_size {
+            return None;
+        }
+
+        // Sector bitmap size: ceil(block_size / 512 / 8) rounded up
+        // to next 512-byte boundary.
+        let sectors_per_block = dyn_header.block_size / 512;
+        let bitmap_bytes = ((sectors_per_block + 7) / 8 + 511) & !511;
+
+        Some(VhdState {
+            device_idx,
+            disk_type: footer.disk_type,
+            block_size: dyn_header.block_size,
+            block_data_offset: bitmap_bytes,
+            max_table_entries: dyn_header.max_table_entries,
+            table_offset: dyn_header.table_offset,
+            current_size: footer.current_size,
+            bat_cached_sector: u64::MAX,
+            bat_cache_buf,
+            data_cached_sector: u64::MAX,
+            data_cache_buf,
+        })
+    }
+
+    /// Initialize state for a fixed VHD.
+    ///
+    /// Fixed VHDs have raw data from offset 0 with a 512-byte footer
+    /// appended at the end. No BAT or dynamic header exists.
+    fn init_fixed(
+        footer: VhdFooter,
+        device_idx: u32,
+        _input_capacity: u64,
+        _sector_size: usize,
+        bat_cache_buf: *mut u8,
+        data_cache_buf: *mut u8,
+    ) -> Option<Self> {
+        Some(VhdState {
+            device_idx,
+            disk_type: DISK_TYPE_FIXED,
+            block_size: 0,
+            block_data_offset: 0,
+            max_table_entries: 0,
+            table_offset: 0,
+            current_size: footer.current_size,
+            bat_cached_sector: u64::MAX,
+            bat_cache_buf,
+            data_cached_sector: u64::MAX,
+            data_cache_buf,
+        })
+    }
+
+    /// Check if this is a fixed VHD (raw data, no BAT).
+    pub fn is_fixed(&self) -> bool {
+        self.disk_type == DISK_TYPE_FIXED
+    }
+
+    /// Look up the host location for a given virtual byte offset.
+    ///
+    /// For dynamic VHDs: reads the BAT entry for the containing block.
+    /// If allocated, returns the host byte offset past the sector
+    /// bitmap. If unallocated (0xFFFFFFFF), returns `Unallocated`.
+    ///
+    /// # Safety
+    ///
+    /// `call_table` must be valid. Cache buffers must still be valid.
+    pub unsafe fn block_lookup(
+        &mut self,
+        call_table: &CallTable,
+        virtual_offset: u64,
+        sector_size: usize,
+        input_capacity: u64,
+        bytes_read: &mut u64,
+    ) -> Option<BlockLookup> {
+        if self.is_fixed() {
+            // Fixed VHDs: data is at the same offset as virtual
+            return Some(BlockLookup::Allocated {
+                host_byte_offset: virtual_offset,
+            });
+        }
+
+        // Calculate which block this virtual offset falls in
+        let block_idx = virtual_offset / self.block_size as u64;
+
+        if block_idx >= self.max_table_entries as u64 {
+            return Some(BlockLookup::Unallocated);
+        }
+
+        // Read BAT entry (u32 BE at table_offset + block_idx * 4)
+        let bat_byte_offset = self.table_offset.checked_add(block_idx.checked_mul(4)?)?;
+
+        let bat_entry = read_u32_be_cached(
+            call_table,
+            self.device_idx,
+            bat_byte_offset,
+            sector_size,
+            input_capacity,
+            &mut self.bat_cached_sector,
+            self.bat_cache_buf,
+            bytes_read,
+        )?;
+
+        if bat_entry == BAT_UNALLOCATED {
+            return Some(BlockLookup::Unallocated);
+        }
+
+        // BAT entry is the absolute sector number (512-byte sectors)
+        // of the block's sector bitmap. Data follows the bitmap.
+        let block_host_offset = (bat_entry as u64).checked_mul(512)?;
+        let data_start = block_host_offset.checked_add(self.block_data_offset as u64)?;
+
+        // Offset within the block
+        let intra_block_offset = virtual_offset % self.block_size as u64;
+
+        Some(BlockLookup::Allocated {
+            host_byte_offset: data_start + intra_block_offset,
+        })
+    }
+}
+
+// ============================================================================
+// Cached sector read helper (big-endian u32)
+// ============================================================================
+
+shared::cached_read!(read_u32_be_cached, u32, be, 4);
+
+// ============================================================================
+// VHD footer/header builder helpers (for output)
+// ============================================================================
+
+/// Build a VHD footer into `buf`.
+///
+/// `buf` must be at least 512 bytes and should be pre-zeroed.
+/// The checksum field is computed and written automatically.
+pub fn build_footer(
+    buf: &mut [u8],
+    current_size: u64,
+    disk_type: u32,
+    data_offset: u64,
+    uuid: &[u8; 16],
+) {
+    // Cookie: "conectix"
+    write_be_u64(buf, FOOTER_COOKIE_OFFSET, VHD_COOKIE);
+    // Features: reserved bit
+    write_be_u32(buf, FOOTER_FEATURES_OFFSET, FEATURES_RESERVED);
+    // Format version: 1.0
+    write_be_u32(buf, FOOTER_FORMAT_VERSION_OFFSET, VHD_VERSION_1_0);
+    // Data offset (to dynamic header, or 0xFFFFFFFFFFFFFFFF for fixed)
+    write_be_u64(buf, FOOTER_DATA_OFFSET_OFFSET, data_offset);
+    // Timestamp: 0 (we don't track creation time)
+    write_be_u32(buf, FOOTER_TIMESTAMP_OFFSET, 0);
+    // Creator application: "imgo"
+    buf[FOOTER_CREATOR_APP_OFFSET] = b'i';
+    buf[FOOTER_CREATOR_APP_OFFSET + 1] = b'm';
+    buf[FOOTER_CREATOR_APP_OFFSET + 2] = b'g';
+    buf[FOOTER_CREATOR_APP_OFFSET + 3] = b'o';
+    // Creator version: 1.0
+    write_be_u32(buf, FOOTER_CREATOR_VERSION_OFFSET, 0x0001_0000);
+    // Creator host OS: "Wi2k" (Windows) — standard value
+    write_be_u32(buf, FOOTER_CREATOR_HOST_OFFSET, 0x5769_326B);
+    // Original size = current size
+    write_be_u64(buf, FOOTER_ORIGINAL_SIZE_OFFSET, current_size);
+    // Current size
+    write_be_u64(buf, FOOTER_CURRENT_SIZE_OFFSET, current_size);
+    // Geometry
+    let (cyl, heads, spt) = compute_vhd_geometry(current_size);
+    write_be_u16(buf, FOOTER_GEOMETRY_OFFSET, cyl);
+    buf[FOOTER_GEOMETRY_OFFSET + 2] = heads;
+    buf[FOOTER_GEOMETRY_OFFSET + 3] = spt;
+    // Disk type
+    write_be_u32(buf, FOOTER_DISK_TYPE_OFFSET, disk_type);
+    // UUID
+    buf[FOOTER_UUID_OFFSET..FOOTER_UUID_OFFSET + 16].copy_from_slice(uuid);
+    // Saved state: 0
+    buf[FOOTER_SAVED_STATE_OFFSET] = 0;
+
+    // Compute and write checksum (must be last)
+    let checksum = compute_checksum(buf, FOOTER_CHECKSUM_OFFSET);
+    write_be_u32(buf, FOOTER_CHECKSUM_OFFSET, checksum);
+}
+
+/// Build a VHD dynamic header into `buf`.
+///
+/// `buf` must be at least 1024 bytes and should be pre-zeroed.
+/// The checksum field is computed and written automatically.
+pub fn build_dynamic_header(
+    buf: &mut [u8],
+    table_offset: u64,
+    max_table_entries: u32,
+    block_size: u32,
+) {
+    // Cookie: "cxsparse"
+    write_be_u64(buf, DYN_COOKIE_OFFSET, CXSPARSE_COOKIE);
+    // Data offset: unused, should be 0xFFFFFFFFFFFFFFFF
+    write_be_u64(buf, DYN_DATA_OFFSET_OFFSET, 0xFFFF_FFFF_FFFF_FFFF);
+    // Table offset (BAT byte offset)
+    write_be_u64(buf, DYN_TABLE_OFFSET_OFFSET, table_offset);
+    // Header version: 1.0
+    write_be_u32(buf, DYN_HEADER_VERSION_OFFSET, VHD_VERSION_1_0);
+    // Max table entries
+    write_be_u32(buf, DYN_MAX_TABLE_ENTRIES_OFFSET, max_table_entries);
+    // Block size
+    write_be_u32(buf, DYN_BLOCK_SIZE_OFFSET, block_size);
+
+    // Compute and write checksum (must be last)
+    let checksum = compute_checksum(buf, DYN_CHECKSUM_OFFSET);
+    write_be_u32(buf, DYN_CHECKSUM_OFFSET, checksum);
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ====================================================================
+    // VhdFooter::parse tests
+    // ====================================================================
+
+    /// Build a minimal VHD footer buffer.
+    fn make_footer(current_size: u64, disk_type: u32, data_offset: u64) -> [u8; 512] {
+        let mut buf = [0u8; 512];
+        write_be_u64(&mut buf, FOOTER_COOKIE_OFFSET, VHD_COOKIE);
+        write_be_u32(&mut buf, FOOTER_FEATURES_OFFSET, FEATURES_RESERVED);
+        write_be_u32(&mut buf, FOOTER_FORMAT_VERSION_OFFSET, VHD_VERSION_1_0);
+        write_be_u64(&mut buf, FOOTER_DATA_OFFSET_OFFSET, data_offset);
+        write_be_u64(&mut buf, FOOTER_ORIGINAL_SIZE_OFFSET, current_size);
+        write_be_u64(&mut buf, FOOTER_CURRENT_SIZE_OFFSET, current_size);
+        let (cyl, heads, spt) = compute_vhd_geometry(current_size);
+        write_be_u16(&mut buf, FOOTER_GEOMETRY_OFFSET, cyl);
+        buf[FOOTER_GEOMETRY_OFFSET + 2] = heads;
+        buf[FOOTER_GEOMETRY_OFFSET + 3] = spt;
+        write_be_u32(&mut buf, FOOTER_DISK_TYPE_OFFSET, disk_type);
+        let checksum = compute_checksum(&buf, FOOTER_CHECKSUM_OFFSET);
+        write_be_u32(&mut buf, FOOTER_CHECKSUM_OFFSET, checksum);
+        buf
+    }
+
+    #[test]
+    fn footer_parse_dynamic() {
+        let size = 1024 * 1024 * 1024; // 1 GiB
+        let buf = make_footer(size, DISK_TYPE_DYNAMIC, 512);
+        let footer = VhdFooter::parse(&buf).unwrap();
+        assert_eq!(footer.cookie, VHD_COOKIE);
+        assert_eq!(footer.current_size, size);
+        assert_eq!(footer.disk_type, DISK_TYPE_DYNAMIC);
+        assert_eq!(footer.data_offset, 512);
+    }
+
+    #[test]
+    fn footer_parse_fixed() {
+        let size = 512 * 1024 * 1024; // 512 MiB
+        let data_off = 0xFFFF_FFFF_FFFF_FFFF;
+        let buf = make_footer(size, DISK_TYPE_FIXED, data_off);
+        let footer = VhdFooter::parse(&buf).unwrap();
+        assert_eq!(footer.disk_type, DISK_TYPE_FIXED);
+        assert_eq!(footer.data_offset, data_off);
+    }
+
+    #[test]
+    fn footer_parse_short_buffer() {
+        assert!(VhdFooter::parse(&[0u8; 511]).is_none());
+        assert!(VhdFooter::parse(&[0u8; 0]).is_none());
+    }
+
+    #[test]
+    fn footer_parse_bad_cookie() {
+        let mut buf = make_footer(1024 * 1024, DISK_TYPE_DYNAMIC, 512);
+        buf[0] = 0; // Corrupt cookie
+        assert!(VhdFooter::parse(&buf).is_none());
+    }
+
+    // ====================================================================
+    // VhdDynamicHeader::parse tests
+    // ====================================================================
+
+    /// Build a minimal VHD dynamic header buffer.
+    fn make_dynamic_header(
+        table_offset: u64,
+        max_table_entries: u32,
+        block_size: u32,
+    ) -> [u8; 1024] {
+        let mut buf = [0u8; 1024];
+        write_be_u64(&mut buf, DYN_COOKIE_OFFSET, CXSPARSE_COOKIE);
+        write_be_u64(&mut buf, DYN_DATA_OFFSET_OFFSET, 0xFFFF_FFFF_FFFF_FFFF);
+        write_be_u64(&mut buf, DYN_TABLE_OFFSET_OFFSET, table_offset);
+        write_be_u32(&mut buf, DYN_HEADER_VERSION_OFFSET, VHD_VERSION_1_0);
+        write_be_u32(&mut buf, DYN_MAX_TABLE_ENTRIES_OFFSET, max_table_entries);
+        write_be_u32(&mut buf, DYN_BLOCK_SIZE_OFFSET, block_size);
+        let checksum = compute_checksum(&buf, DYN_CHECKSUM_OFFSET);
+        write_be_u32(&mut buf, DYN_CHECKSUM_OFFSET, checksum);
+        buf
+    }
+
+    #[test]
+    fn dynamic_header_parse_valid() {
+        let buf = make_dynamic_header(1536, 512, DEFAULT_BLOCK_SIZE);
+        let hdr = VhdDynamicHeader::parse(&buf).unwrap();
+        assert_eq!(hdr.cookie, CXSPARSE_COOKIE);
+        assert_eq!(hdr.table_offset, 1536);
+        assert_eq!(hdr.max_table_entries, 512);
+        assert_eq!(hdr.block_size, DEFAULT_BLOCK_SIZE);
+    }
+
+    #[test]
+    fn dynamic_header_parse_short_buffer() {
+        assert!(VhdDynamicHeader::parse(&[0u8; 1023]).is_none());
+        assert!(VhdDynamicHeader::parse(&[0u8; 0]).is_none());
+    }
+
+    #[test]
+    fn dynamic_header_parse_bad_cookie() {
+        let mut buf = make_dynamic_header(1536, 512, DEFAULT_BLOCK_SIZE);
+        buf[0] = 0; // Corrupt cookie
+        assert!(VhdDynamicHeader::parse(&buf).is_none());
+    }
+
+    // ====================================================================
+    // Checksum tests
+    // ====================================================================
+
+    #[test]
+    fn checksum_zeros() {
+        let buf = [0u8; 512];
+        // All zeros → sum = 0 → complement = 0xFFFFFFFF
+        assert_eq!(compute_checksum(&buf, FOOTER_CHECKSUM_OFFSET), !0u32);
+    }
+
+    #[test]
+    fn checksum_footer_round_trip() {
+        let buf = make_footer(1024 * 1024 * 1024, DISK_TYPE_DYNAMIC, 512);
+        let stored = be_u32(&buf, FOOTER_CHECKSUM_OFFSET);
+        let computed = compute_checksum(&buf, FOOTER_CHECKSUM_OFFSET);
+        assert_eq!(stored, computed);
+    }
+
+    #[test]
+    fn checksum_dynamic_header_round_trip() {
+        let buf = make_dynamic_header(1536, 512, DEFAULT_BLOCK_SIZE);
+        let stored = be_u32(&buf, DYN_CHECKSUM_OFFSET);
+        let computed = compute_checksum(&buf, DYN_CHECKSUM_OFFSET);
+        assert_eq!(stored, computed);
+    }
+
+    // ====================================================================
+    // CHS geometry tests
+    // ====================================================================
+
+    #[test]
+    fn geometry_small_disk() {
+        // 40 MiB disk
+        let size = 40 * 1024 * 1024;
+        let (cyl, heads, spt) = compute_vhd_geometry(size);
+        assert!(cyl > 0);
+        assert!(heads >= 4);
+        assert!(spt >= 17);
+        // Total addressable should cover the size
+        let addressable = cyl as u64 * heads as u64 * spt as u64 * 512;
+        assert!(addressable >= size || addressable >= cyl as u64 * heads as u64 * spt as u64 * 512);
+    }
+
+    #[test]
+    fn geometry_1gib_disk() {
+        // 1 GiB disk
+        let size = 1024 * 1024 * 1024;
+        let (cyl, heads, spt) = compute_vhd_geometry(size);
+        assert!(cyl > 0);
+        assert!(heads > 0);
+        assert!(spt > 0);
+    }
+
+    #[test]
+    fn geometry_large_disk() {
+        // 2 TiB disk (max CHS)
+        let size = 2u64 * 1024 * 1024 * 1024 * 1024;
+        let (cyl, heads, spt) = compute_vhd_geometry(size);
+        assert_eq!(cyl, 65535);
+        assert_eq!(heads, 16);
+        assert_eq!(spt, 255);
+    }
+
+    #[test]
+    fn geometry_zero_disk() {
+        let (cyl, heads, spt) = compute_vhd_geometry(0);
+        // Zero size: total_sectors = 0, should still produce valid geometry
+        assert_eq!(spt, 17); // Falls into small disk branch
+    }
+
+    // ====================================================================
+    // build_footer / build_dynamic_header round-trip tests
+    // ====================================================================
+
+    #[test]
+    fn build_footer_round_trip() {
+        let size = 1024 * 1024 * 1024; // 1 GiB
+        let uuid = [1u8; 16];
+        let mut buf = [0u8; 512];
+        build_footer(&mut buf, size, DISK_TYPE_DYNAMIC, 512, &uuid);
+
+        let footer = VhdFooter::parse(&buf).unwrap();
+        assert_eq!(footer.current_size, size);
+        assert_eq!(footer.original_size, size);
+        assert_eq!(footer.disk_type, DISK_TYPE_DYNAMIC);
+        assert_eq!(footer.data_offset, 512);
+        assert_eq!(footer.uuid, uuid);
+
+        // Verify checksum
+        let computed = compute_checksum(&buf, FOOTER_CHECKSUM_OFFSET);
+        assert_eq!(footer.checksum, computed);
+    }
+
+    #[test]
+    fn build_dynamic_header_round_trip() {
+        let mut buf = [0u8; 1024];
+        build_dynamic_header(&mut buf, 1536, 512, DEFAULT_BLOCK_SIZE);
+
+        let hdr = VhdDynamicHeader::parse(&buf).unwrap();
+        assert_eq!(hdr.table_offset, 1536);
+        assert_eq!(hdr.max_table_entries, 512);
+        assert_eq!(hdr.block_size, DEFAULT_BLOCK_SIZE);
+
+        // Verify checksum
+        let computed = compute_checksum(&buf, DYN_CHECKSUM_OFFSET);
+        assert_eq!(hdr.checksum, computed);
+    }
+}
