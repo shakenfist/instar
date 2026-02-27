@@ -46,6 +46,7 @@ Features unique to imago that do not exist in qemu-img.
 |----------|-------------|
 | [Configuration Guide](configuration.md) | Command-line flags, config files, quirk control |
 | [Chain Discovery](chain-discovery.md) | `imago info --chain` - secure backing chain discovery |
+| [Chain Config Protocol](chain-config.md) | Chain config structure layout and VMM-to-guest data flow |
 
 ## Compatibility
 

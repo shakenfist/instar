@@ -217,6 +217,9 @@ Address         Size    Region
 0x0200_0000             End of guest memory
 ```
 
+See [docs/chain-config.md](docs/chain-config.md) for the chain config
+structure layout and VMM-to-guest data flow.
+
 ## Format Support
 
 ### qcow2
