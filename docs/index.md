@@ -207,3 +207,4 @@ shared across all guest operations, eliminating code duplication:
 | `qcow2` | QCOW2 header parsing, L1/L2 cluster lookup, decompression (feature-gated), refcount reading, backing file extraction | info, check, compare, convert |
 | `raw` | MBR/GPT partition table detection | info |
 | `vmdk` | VMDK4 binary header parsing, descriptor I/O and text parsing, grain directory/table reading, streamOptimized footer/marker handling, write helpers | info, check, convert |
+| `vhd` | VHD/VPC footer and dynamic header parsing, BAT reading with sector-cached lookups, block-level data access, write helpers (footer, dynamic header, geometry) | info, check, compare, convert |
