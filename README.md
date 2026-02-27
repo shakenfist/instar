@@ -20,6 +20,7 @@ Initial target formats:
 - **qcow2** - QEMU Copy-On-Write format
 - **raw** - Raw disk images
 - **vmdk** - VMware Virtual Machine Disk
+- **vpc** (VHD) - Virtual Hard Disk (Hyper-V, Virtual PC)
 
 ## Project Status
 
@@ -71,9 +72,9 @@ Exit codes: 0 = identical, 1 = content differs.
 
 The compare operation reads the virtual content of both images and reports the
 first byte offset where content diverges. For QCOW2 and VMDK images, this
-includes cluster/grain table lookup and compressed cluster decompression
+includes cluster/grain/block table lookup and compressed cluster decompression
 (zlib, ZSTD, and DEFLATE), so comparisons work across formats (e.g., QCOW2
-vs raw, VMDK vs raw, compressed QCOW2 vs uncompressed QCOW2). Backing
+vs raw, VMDK vs raw, VHD vs raw, compressed QCOW2 vs uncompressed QCOW2). Backing
 chains are automatically discovered and flattened: unallocated clusters/grains
 are resolved by walking the backing chain, so overlay images compare correctly
 against their flattened equivalents.
@@ -117,6 +118,15 @@ For VMDK images (monolithicSparse and streamOptimized), check validates:
 - streamOptimized footer validation (magic, GD offset)
 - Fragmentation measurement
 
+For VHD images (dynamic and fixed), check validates:
+- Footer cookie and checksum (from first or last sector)
+- Disk type validity (fixed, dynamic, differencing)
+- Dynamic header cookie and checksum
+- BAT offset within file bounds
+- BAT entry validation: allocated block offsets within file
+- Overlap detection (no two BAT entries reference same block)
+- Footer copy consistency (start vs end of file)
+
 The `--chain` flag discovers the full backing chain (using the same chain
 discovery infrastructure as `imago info --chain`), sets up each image as a
 separate virtio-block device in the KVM guest, and validates:
@@ -155,6 +165,9 @@ imago convert -S input.qcow2 output.raw
 # Specify output cluster size for QCOW2 (default: 65536)
 imago convert -O qcow2 --cluster-size 4096 input.raw output.qcow2
 
+# Convert to VHD dynamic format
+imago convert -O vpc input.qcow2 output.vhd
+
 # Progress reporting
 imago convert -p 5 input.qcow2 output.raw
 ```
@@ -168,6 +181,8 @@ Supported output formats:
 - **raw** (default) - Flat raw output
 - **qcow2** - QCOW2 v3 output with 16-bit refcounts, configurable cluster
   size (512 bytes to 64KB, default 64KB), optional zlib compression (`-c`)
+- **vmdk** - VMDK monolithicSparse output, optional DEFLATE compression (`-c`)
+- **vpc** - VHD dynamic output with 2 MiB blocks
 
 **Limitations:** Compressed clusters with cluster sizes above 64KB cannot
 be decompressed. Uncompressed clusters up to 2MB are fully supported.
@@ -355,6 +370,7 @@ imago/
 │   ├── crates/     # Shared format parsing crates (no_std)
 │   │   ├── qcow2/  # QCOW2 header, L1/L2, decompression, refcounts
 │   │   ├── raw/    # MBR/GPT partition table detection
+│   │   ├── vhd/    # VHD footer, dynamic header, BAT parsing
 │   │   └── vmdk/   # VMDK4 header and descriptor parsing
 │   ├── operations/ # Pluggable operations (info, copy, check, compare, convert)
 │   └── build.sh    # Build script
