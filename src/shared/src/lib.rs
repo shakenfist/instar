@@ -5,6 +5,7 @@
 
 #![no_std]
 
+pub mod bitmap;
 pub mod format_detection;
 pub mod virtio;
 
@@ -63,6 +64,166 @@ macro_rules! bump_allocator {
 
         #[global_allocator]
         static ALLOC: BumpAllocator = BumpAllocator;
+    };
+}
+
+/// Generate a sector-cached read function for a given type and endianness.
+///
+/// All format crates (qcow2, vmdk, vhd) need to read typed values from
+/// specific byte offsets within virtio-block devices. This macro generates
+/// functions that cache the most recently read sector to minimize I/O when
+/// reading consecutive values from the same sector.
+///
+/// # Parameters
+///
+/// - `$name`: function name to generate (e.g., `read_u32_le_cached`)
+/// - `$ty`: return type (u8, u16, u32, u64)
+/// - `$endian`: `be` for big-endian or `le` for little-endian
+/// - `$width`: byte width (1, 2, 4, 8)
+///
+/// # Example
+///
+/// ```ignore
+/// shared::cached_read!(read_u32_le_cached, u32, le, 4);
+/// shared::cached_read!(read_u64_be_cached, u64, be, 8);
+/// ```
+///
+/// The generated function has the signature:
+/// ```ignore
+/// pub unsafe fn $name(
+///     call_table: &shared::CallTable,
+///     device_idx: u32,
+///     byte_offset: u64,
+///     sector_size: usize,
+///     input_capacity: u64,
+///     cached_sector: &mut u64,
+///     cache_buf: *mut u8,
+///     bytes_read: &mut u64,
+/// ) -> Option<$ty>
+/// ```
+#[macro_export]
+macro_rules! cached_read {
+    ($name:ident, u8, $endian:ident, 1) => {
+        /// Read a single byte from a specific byte offset within a device,
+        /// using a one-sector cache to minimize I/O.
+        ///
+        /// # Safety
+        ///
+        /// `cache_buf` must point to at least `sector_size` writable bytes.
+        /// `call_table` must point to a valid initialized call table.
+        pub unsafe fn $name(
+            call_table: &shared::CallTable,
+            device_idx: u32,
+            byte_offset: u64,
+            sector_size: usize,
+            input_capacity: u64,
+            cached_sector: &mut u64,
+            cache_buf: *mut u8,
+            bytes_read: &mut u64,
+        ) -> Option<u8> {
+            let sector = byte_offset / sector_size as u64;
+            let off = (byte_offset % sector_size as u64) as usize;
+            if off >= sector_size {
+                return None;
+            }
+            if sector >= input_capacity {
+                return None;
+            }
+            if *cached_sector != sector {
+                if !(call_table.read_input_sector)(device_idx, sector, cache_buf, sector_size) {
+                    return None;
+                }
+                *bytes_read += sector_size as u64;
+                *cached_sector = sector;
+            }
+            Some(*cache_buf.add(off))
+        }
+    };
+    ($name:ident, $ty:ty, be, $width:expr) => {
+        /// Read a big-endian value from a specific byte offset within a device,
+        /// using a one-sector cache to minimize I/O.
+        ///
+        /// # Safety
+        ///
+        /// `cache_buf` must point to at least `sector_size` writable bytes.
+        /// `call_table` must point to a valid initialized call table.
+        pub unsafe fn $name(
+            call_table: &shared::CallTable,
+            device_idx: u32,
+            byte_offset: u64,
+            sector_size: usize,
+            input_capacity: u64,
+            cached_sector: &mut u64,
+            cache_buf: *mut u8,
+            bytes_read: &mut u64,
+        ) -> Option<$ty> {
+            let sector = byte_offset / sector_size as u64;
+            let off = (byte_offset % sector_size as u64) as usize;
+            if off + $width > sector_size {
+                return None;
+            }
+            if sector >= input_capacity {
+                return None;
+            }
+            if *cached_sector != sector {
+                if !(call_table.read_input_sector)(device_idx, sector, cache_buf, sector_size) {
+                    return None;
+                }
+                *bytes_read += sector_size as u64;
+                *cached_sector = sector;
+            }
+            let p = cache_buf.add(off);
+            let mut bytes = [0u8; $width];
+            let mut i = 0;
+            while i < $width {
+                bytes[i] = *p.add(i);
+                i += 1;
+            }
+            Some(<$ty>::from_be_bytes(bytes))
+        }
+    };
+    ($name:ident, $ty:ty, le, $width:expr) => {
+        /// Read a little-endian value from a specific byte offset within a
+        /// device, using a one-sector cache to minimize I/O.
+        ///
+        /// # Safety
+        ///
+        /// `cache_buf` must point to at least `sector_size` writable bytes.
+        /// `call_table` must point to a valid initialized call table.
+        pub unsafe fn $name(
+            call_table: &shared::CallTable,
+            device_idx: u32,
+            byte_offset: u64,
+            sector_size: usize,
+            input_capacity: u64,
+            cached_sector: &mut u64,
+            cache_buf: *mut u8,
+            bytes_read: &mut u64,
+        ) -> Option<$ty> {
+            let sector = byte_offset / sector_size as u64;
+            let off = (byte_offset % sector_size as u64) as usize;
+            if off + $width > sector_size {
+                return None;
+            }
+            if sector >= input_capacity {
+                return None;
+            }
+            if *cached_sector != sector {
+                if !(call_table.read_input_sector)(device_idx, sector, cache_buf, sector_size) {
+                    return None;
+                }
+                *bytes_read += sector_size as u64;
+                *cached_sector = sector;
+            }
+            let p = cache_buf.add(off);
+            let mut bytes = [0u8; $width];
+            let mut i = 0;
+            while i < $width {
+                bytes[i] = *p.add(i);
+                i += 1;
+            }
+            Some(<$ty>::from_le_bytes(bytes))
+        }
     };
 }
 
