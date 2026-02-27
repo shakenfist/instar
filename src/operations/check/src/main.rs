@@ -28,7 +28,7 @@ use core::panic::PanicInfo;
 
 use shared::{
     bitmap::{BitmapContext, BitmapSetResult},
-    format_detection::{detect_format_from_header, detect_vhd_footer, QCOW2_MAGIC, VHD_COOKIE},
+    format_detection::{detect_format_from_header, detect_vhd_footer, QCOW2_MAGIC},
     validate_call_table, CallTable, ChainConfig, CheckConfig, CheckResult, ImageFormat,
     CALL_TABLE_ADDR, MAX_SECTOR_SIZE,
 };
@@ -157,29 +157,13 @@ pub unsafe extern "C" fn _start() -> u64 {
                 (call_table.verbose_print)(b"check: vhd not supported (quirks)\n\0".as_ptr());
                 result.flags |= CheckResult::FLAG_NOT_SUPPORTED;
             } else {
-                // Validate VHD footer
-                // For dynamic VHD, footer is at start; for fixed, we already read it
-                let vhd_cookie = u64::from_be_bytes([
-                    buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6],
-                    buffer[7],
-                ]);
-                if vhd_cookie == VHD_COOKIE {
-                    // Dynamic VHD - footer at start
-                    check_vhd_footer(&buffer, &mut result);
-                } else {
-                    // Fixed VHD - need to read last sector again
-                    let last_sector = input_capacity - 1;
-                    let mut footer_buffer = [0u8; MAX_SECTOR_SIZE];
-                    if (call_table.read_input_sector)(
-                        0,
-                        last_sector,
-                        footer_buffer.as_mut_ptr(),
-                        input_sector_size,
-                    ) {
-                        bytes_read += input_sector_size as u64;
-                        check_vhd_footer(&footer_buffer, &mut result);
-                    }
-                }
+                bytes_read += check_vhd(
+                    &buffer,
+                    &mut result,
+                    call_table,
+                    input_sector_size,
+                    actual_size,
+                );
             }
             result.image_end_offset = actual_size;
         }
@@ -259,9 +243,6 @@ fn detect_qcow2_only(buffer: &[u8], len: usize) -> ImageFormat {
 // VHDX region table offset and signature
 const VHDX_REGION_TABLE_OFFSET: u64 = 0x30000;
 const VHDX_REGION_TABLE_SIG: u32 = 0x69676572; // "regi"
-
-// VHD footer disk type offset
-const VHD_FOOTER_DISK_TYPE_OFFSET: usize = 60;
 
 /// Read the GD offset from a streamOptimized VMDK footer.
 ///
@@ -864,57 +845,318 @@ unsafe fn check_vhdx(
     bytes_read
 }
 
-/// Check VHD footer integrity
+/// Check VHD image integrity.
 ///
 /// Validates:
-/// - Disk type is valid (2=fixed, 3=dynamic, 4=differencing)
-///
-/// # Buffer requirements
-///
-/// The footer buffer must be at least 64 bytes (VHD_FOOTER_DISK_TYPE_OFFSET + 4).
-/// Callers pass sector-sized buffers (minimum 512 bytes per sector_size validation),
-/// so this is always satisfied in practice.
-///
-/// # Safety invariants
-///
-/// This function uses defense-in-depth for buffer size validation:
-/// - A `debug_assert!` catches programming errors during development
-/// - A runtime check handles undersized buffers gracefully in release builds,
-///   treating them as corrupted rather than panicking
-///
-/// The invariant is maintained by callers (`check_vhd`) which read full sectors
-/// into `MAX_SECTOR_SIZE` buffers before passing them here.
-fn check_vhd_footer(footer: &[u8], result: &mut CheckResult) {
-    // Minimum buffer size: disk_type field at offset 60 + 4 bytes = 64 bytes.
-    // This is always satisfied since callers use sector-sized buffers (min 512 bytes).
-    debug_assert!(
-        footer.len() >= VHD_FOOTER_DISK_TYPE_OFFSET + 4,
-        "VHD footer buffer too small: {} < {}",
-        footer.len(),
-        VHD_FOOTER_DISK_TYPE_OFFSET + 4
-    );
+/// - Footer cookie and checksum (from first or last sector)
+/// - Disk type validity (2=fixed, 3=dynamic, 4=differencing)
+/// - For dynamic VHDs:
+///   - Dynamic header cookie and checksum
+///   - BAT offset within file bounds
+///   - BAT entries: allocated block offsets within file bounds
+///   - Overlap detection (no two BAT entries reference same block)
+///   - Footer copy consistency (start vs end of file)
+unsafe fn check_vhd(
+    header: &[u8],
+    result: &mut CheckResult,
+    call_table: &CallTable,
+    sector_size: usize,
+    actual_size: u64,
+) -> u64 {
+    let mut bytes_read: u64 = 0;
+    let input_capacity = (call_table.get_input_capacity)(0);
 
-    if footer.len() < VHD_FOOTER_DISK_TYPE_OFFSET + 4 {
+    // Try parsing footer from first sector (dynamic VHDs)
+    let start_footer = vhd::VhdFooter::parse(header);
+
+    let (footer, footer_buf) = if let Some(f) = start_footer {
+        // Footer found at start — dynamic or differencing VHD
+        (f, header)
+    } else {
+        // Try last sector (fixed VHDs)
+        if input_capacity == 0 {
+            result.corruptions += 1;
+            result.total_errors += 1;
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+            return bytes_read;
+        }
+        // We already read the last sector during format detection,
+        // but we need to re-read it here to get the buffer.
+        // (The format detection code doesn't pass the buffer to us.)
+        let last_sector = input_capacity - 1;
+        // Use a static buffer on the stack
+        let mut last_buf = [0u8; MAX_SECTOR_SIZE];
+        if !(call_table.read_input_sector)(0, last_sector, last_buf.as_mut_ptr(), sector_size) {
+            result.corruptions += 1;
+            result.total_errors += 1;
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+            return bytes_read;
+        }
+        bytes_read += sector_size as u64;
+
+        match vhd::VhdFooter::parse(&last_buf) {
+            Some(f) => {
+                // Validate checksum of footer at end
+                let expected = vhd::compute_checksum(
+                    &last_buf[..vhd::FOOTER_SIZE],
+                    vhd::FOOTER_CHECKSUM_OFFSET,
+                );
+                if f.checksum != expected {
+                    result.corruptions += 1;
+                    result.total_errors += 1;
+                }
+                // Validate disk type
+                if f.disk_type < 2 || f.disk_type > 4 {
+                    result.corruptions += 1;
+                    result.total_errors += 1;
+                }
+                // Fixed VHD — no further structural validation needed
+                if result.corruptions > 0 {
+                    result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+                }
+                return bytes_read;
+            }
+            None => {
+                result.corruptions += 1;
+                result.total_errors += 1;
+                result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+                return bytes_read;
+            }
+        }
+    };
+
+    // Validate footer checksum
+    let expected_cksum =
+        vhd::compute_checksum(&footer_buf[..vhd::FOOTER_SIZE], vhd::FOOTER_CHECKSUM_OFFSET);
+    if footer.checksum != expected_cksum {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        (call_table.debug_print)(b"check: VHD footer checksum mismatch\n\0".as_ptr());
+    }
+
+    // Validate disk type
+    if footer.disk_type < 2 || footer.disk_type > 4 {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        (call_table.debug_print)(b"check: invalid VHD disk type\n\0".as_ptr());
+    }
+
+    // For fixed VHDs with footer at start, nothing more to check
+    if footer.disk_type == vhd::DISK_TYPE_FIXED {
+        if result.corruptions > 0 {
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+        }
+        return bytes_read;
+    }
+
+    // Dynamic or differencing VHD: read and validate dynamic header
+    let dyn_byte_offset = footer.data_offset;
+    if dyn_byte_offset >= actual_size {
         result.corruptions += 1;
         result.total_errors += 1;
         result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
-        return;
+        (call_table.debug_print)(b"check: VHD dynamic header offset out of bounds\n\0".as_ptr());
+        return bytes_read;
     }
 
-    // Disk type is big-endian u32 at offset 60
-    let disk_type = u32::from_be_bytes([
-        footer[VHD_FOOTER_DISK_TYPE_OFFSET],
-        footer[VHD_FOOTER_DISK_TYPE_OFFSET + 1],
-        footer[VHD_FOOTER_DISK_TYPE_OFFSET + 2],
-        footer[VHD_FOOTER_DISK_TYPE_OFFSET + 3],
-    ]);
+    let dyn_sector = dyn_byte_offset / sector_size as u64;
+    let dyn_off_in_sector = (dyn_byte_offset % sector_size as u64) as usize;
 
-    // Valid disk types: 2 (fixed), 3 (dynamic), 4 (differencing)
-    if disk_type < 2 || disk_type > 4 {
+    let mut dyn_buf = [0u8; MAX_SECTOR_SIZE];
+    if !(call_table.read_input_sector)(0, dyn_sector, dyn_buf.as_mut_ptr(), sector_size) {
         result.corruptions += 1;
         result.total_errors += 1;
         result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+        return bytes_read;
     }
+    bytes_read += sector_size as u64;
+
+    // Read second sector if dynamic header spans across sector boundary
+    let dyn_available = sector_size - dyn_off_in_sector;
+    let mut dyn_header_bytes = [0u8; vhd::DYNAMIC_HEADER_SIZE];
+    if dyn_available >= vhd::DYNAMIC_HEADER_SIZE {
+        dyn_header_bytes.copy_from_slice(
+            &dyn_buf[dyn_off_in_sector..dyn_off_in_sector + vhd::DYNAMIC_HEADER_SIZE],
+        );
+    } else {
+        dyn_header_bytes[..dyn_available].copy_from_slice(&dyn_buf[dyn_off_in_sector..sector_size]);
+        let next_sector = dyn_sector + 1;
+        if next_sector >= input_capacity {
+            result.corruptions += 1;
+            result.total_errors += 1;
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+            return bytes_read;
+        }
+        if !(call_table.read_input_sector)(0, next_sector, dyn_buf.as_mut_ptr(), sector_size) {
+            result.corruptions += 1;
+            result.total_errors += 1;
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+            return bytes_read;
+        }
+        bytes_read += sector_size as u64;
+        let remaining = vhd::DYNAMIC_HEADER_SIZE - dyn_available;
+        dyn_header_bytes[dyn_available..vhd::DYNAMIC_HEADER_SIZE]
+            .copy_from_slice(&dyn_buf[..remaining]);
+    }
+
+    let dyn_header = match vhd::VhdDynamicHeader::parse(&dyn_header_bytes) {
+        Some(h) => h,
+        None => {
+            result.corruptions += 1;
+            result.total_errors += 1;
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+            (call_table.debug_print)(b"check: invalid VHD dynamic header\n\0".as_ptr());
+            return bytes_read;
+        }
+    };
+
+    // Validate dynamic header checksum
+    let dyn_expected = vhd::compute_checksum(&dyn_header_bytes, vhd::DYN_CHECKSUM_OFFSET);
+    if dyn_header.checksum != dyn_expected {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        (call_table.debug_print)(b"check: VHD dynamic header checksum mismatch\n\0".as_ptr());
+    }
+
+    // Validate BAT offset
+    let bat_offset = dyn_header.table_offset;
+    let bat_size_bytes = dyn_header.max_table_entries as u64 * 4;
+    if bat_offset >= actual_size || bat_offset + bat_size_bytes > actual_size {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+        (call_table.debug_print)(b"check: VHD BAT offset out of bounds\n\0".as_ptr());
+        return bytes_read;
+    }
+
+    // Validate block size
+    if dyn_header.block_size == 0 || (dyn_header.block_size & (dyn_header.block_size - 1)) != 0 {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+        (call_table.debug_print)(b"check: VHD block size invalid\n\0".as_ptr());
+        return bytes_read;
+    }
+
+    // Sector bitmap size per block
+    let sectors_per_block = dyn_header.block_size / 512;
+    let bitmap_bytes = ((sectors_per_block + 7) / 8 + 511) & !511;
+    let block_total_bytes = bitmap_bytes as u64 + dyn_header.block_size as u64;
+
+    // Set up overlap detection bitmap
+    // Each slot represents one "block unit" (bitmap + data) worth of 512-byte sectors
+    let total_file_sectors = (actual_size + 511) / 512;
+    let block_total_sectors = (block_total_bytes + 511) / 512;
+    // Track in units of block_total_sectors to detect overlapping blocks
+    let total_block_slots = if block_total_sectors > 0 {
+        (total_file_sectors + block_total_sectors - 1) / block_total_sectors
+    } else {
+        0
+    };
+    let bmp = BitmapContext::init_in_scratch(total_block_slots);
+
+    // Use cached read for BAT entries
+    shared::cached_read!(read_u32_be_cached, u32, be, 4);
+
+    let mut bat_cached_sector: u64 = u64::MAX;
+    let bat_cache_buf = (shared::SCRATCH_MEM_BASE + bmp.size) as *mut u8;
+    // Ensure cache buffer doesn't exceed scratch
+    if shared::SCRATCH_MEM_BASE + bmp.size + MAX_SECTOR_SIZE > shared::SCRATCH_MEM_END {
+        // Not enough memory for BAT cache; skip BAT validation
+        if result.corruptions > 0 {
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+        }
+        return bytes_read;
+    }
+
+    let mut allocated_blocks: u64 = 0;
+
+    for entry_idx in 0..dyn_header.max_table_entries {
+        let bat_byte_offset = bat_offset + entry_idx as u64 * 4;
+
+        let bat_entry = match read_u32_be_cached(
+            call_table,
+            0,
+            bat_byte_offset,
+            sector_size,
+            input_capacity,
+            &mut bat_cached_sector,
+            bat_cache_buf,
+            &mut bytes_read,
+        ) {
+            Some(v) => v,
+            None => {
+                result.corruptions += 1;
+                result.total_errors += 1;
+                (call_table.debug_print)(b"check: VHD BAT read failed\n\0".as_ptr());
+                continue;
+            }
+        };
+
+        if bat_entry == vhd::BAT_UNALLOCATED {
+            continue;
+        }
+
+        allocated_blocks += 1;
+
+        // Validate block offset is within file
+        let block_host_offset = bat_entry as u64 * 512;
+        let block_end = block_host_offset + block_total_bytes;
+        if block_end > actual_size {
+            result.corruptions += 1;
+            result.total_errors += 1;
+            (call_table.debug_print)(b"check: VHD block offset out of bounds\n\0".as_ptr());
+            continue;
+        }
+
+        // Overlap detection
+        if bmp.can_track && block_total_sectors > 0 {
+            let slot = block_host_offset / (block_total_sectors * 512);
+            match bmp.set(slot) {
+                BitmapSetResult::AlreadySet => {
+                    result.corruptions += 1;
+                    result.total_errors += 1;
+                    (call_table.debug_print)(b"check: VHD overlapping blocks\n\0".as_ptr());
+                }
+                BitmapSetResult::NewBit => {}
+                BitmapSetResult::BeyondCapacity => {}
+            }
+        }
+    }
+
+    result.clusters_allocated = allocated_blocks;
+    result.clusters_checked = dyn_header.max_table_entries as u64;
+
+    // Verify footer copy at end of file matches footer at start
+    if input_capacity > 0 {
+        let last_sector = input_capacity - 1;
+        let mut end_footer_buf = [0u8; MAX_SECTOR_SIZE];
+        if (call_table.read_input_sector)(0, last_sector, end_footer_buf.as_mut_ptr(), sector_size)
+        {
+            bytes_read += sector_size as u64;
+            if let Some(end_footer) = vhd::VhdFooter::parse(&end_footer_buf) {
+                // Compare key fields
+                if end_footer.current_size != footer.current_size
+                    || end_footer.disk_type != footer.disk_type
+                    || end_footer.data_offset != footer.data_offset
+                {
+                    result.corruptions += 1;
+                    result.total_errors += 1;
+                    (call_table.debug_print)(
+                        b"check: VHD footer mismatch (start vs end)\n\0".as_ptr(),
+                    );
+                }
+            }
+            // If end footer doesn't parse, that's OK for fixed VHDs
+            // but we've already handled fixed above
+        }
+    }
+
+    if result.corruptions > 0 {
+        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+    }
+
+    bytes_read
 }
 
 /// Check QCOW2 image integrity
