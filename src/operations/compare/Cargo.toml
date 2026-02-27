@@ -7,7 +7,7 @@ license = "Apache-2.0"
 
 [dependencies]
 shared = { path = "../../shared" }
-qcow2 = { path = "../../crates/qcow2", features = ["decompress", "decompress-zstd", "vmdk-decompress"] }
+qcow2 = { path = "../../crates/qcow2", features = ["decompress", "decompress-zstd", "vmdk-decompress", "vhd-input"] }
 
 [profile.release]
 panic = "abort"
