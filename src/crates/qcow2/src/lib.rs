@@ -2019,6 +2019,7 @@ pub unsafe fn init_chain_states(
                     dev_idx as u32,
                     sector_size,
                     cap,
+                    dev_info.actual_size,
                     l1_cache_addr(dynamic_bufs_start, dev_idx),
                     l2_cache_addr(dynamic_bufs_start, dev_idx),
                     bytes_read,

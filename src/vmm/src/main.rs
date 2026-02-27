@@ -1498,12 +1498,24 @@ fn discover_backing_chain(
         let info_result = execute_info_operation(&current, sector_size, false)
             .map_err(|e| ChainError::InfoOperationFailed(e.to_string()))?;
 
+        // Get actual filesystem size for the chain config. The guest
+        // info operation may report actual_size=0 for non-QCOW2 formats
+        // (by design), but the chain config needs the real file size so
+        // format readers can locate structures relative to EOF (e.g.
+        // streamOptimized VMDK footer).
+        let file_size = std::fs::metadata(&current).map(|m| m.len()).unwrap_or(0);
+        let actual_size = if info_result.actual_size > 0 {
+            info_result.actual_size
+        } else {
+            file_size
+        };
+
         // Build chain image entry
         let chain_image = ChainImage {
             path: current.clone(),
             format: ImageFormat::from_str(&info_result.format),
             virtual_size: info_result.virtual_size,
-            actual_size: info_result.actual_size,
+            actual_size,
             cluster_size: info_result.cluster_size,
             backing_file_raw: info_result.backing_file.clone(),
             flags: info_result.flags,
