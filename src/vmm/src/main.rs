@@ -1498,12 +1498,24 @@ fn discover_backing_chain(
         let info_result = execute_info_operation(&current, sector_size, false)
             .map_err(|e| ChainError::InfoOperationFailed(e.to_string()))?;
 
+        // Get actual filesystem size for the chain config. The guest
+        // info operation may report actual_size=0 for non-QCOW2 formats
+        // (by design), but the chain config needs the real file size so
+        // format readers can locate structures relative to EOF (e.g.
+        // streamOptimized VMDK footer).
+        let file_size = std::fs::metadata(&current).map(|m| m.len()).unwrap_or(0);
+        let actual_size = if info_result.actual_size > 0 {
+            info_result.actual_size
+        } else {
+            file_size
+        };
+
         // Build chain image entry
         let chain_image = ChainImage {
             path: current.clone(),
             format: ImageFormat::from_str(&info_result.format),
             virtual_size: info_result.virtual_size,
-            actual_size: info_result.actual_size,
+            actual_size,
             cluster_size: info_result.cluster_size,
             backing_file_raw: info_result.backing_file.clone(),
             flags: info_result.flags,
@@ -1837,7 +1849,7 @@ struct ConvertArgs {
     /// Output image file
     output: String,
 
-    /// Output format ("raw" or "qcow2")
+    /// Output format ("raw", "qcow2", or "vmdk")
     #[arg(short = 'O', long = "output-format", default_value = "raw")]
     output_format: String,
 
@@ -1849,7 +1861,7 @@ struct ConvertArgs {
     #[arg(long, default_value = "65536")]
     cluster_size: u32,
 
-    /// Compress data clusters in QCOW2 output (requires -O qcow2)
+    /// Compress output data (QCOW2: zlib clusters, VMDK: streamOptimized)
     #[arg(short = 'c', long)]
     compress: bool,
 
@@ -3730,16 +3742,18 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     let target_format = match args.output_format.as_str() {
         "raw" => 1u32,   // ImageFormat::Raw
         "qcow2" => 2u32, // ImageFormat::Qcow2
+        "vmdk" => 3u32,  // ImageFormat::Vmdk4
         other => {
             return Err(format!(
                 "unsupported output format '{}' \
-                 (supported: 'raw', 'qcow2')",
+                 (supported: 'raw', 'qcow2', 'vmdk')",
                 other
             )
             .into());
         }
     };
     let is_qcow2_output = target_format == 2;
+    let is_vmdk_output = target_format == 3;
 
     // Validate sector size (must be power of 2, 512 to 64KB)
     if !(512..=MAX_SECTOR_SIZE).contains(&args.sector_size) || !args.sector_size.is_power_of_two() {
@@ -3762,10 +3776,10 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         .into());
     }
 
-    // Validate -c requires -O qcow2
-    if args.compress && !is_qcow2_output {
-        return Err("compression (-c) is only supported \
-             with QCOW2 output (-O qcow2)"
+    // Validate -c requires -O qcow2 or -O vmdk
+    if args.compress && !is_qcow2_output && !is_vmdk_output {
+        return Err("compression (-c) is only supported with \
+             QCOW2 (-O qcow2) or VMDK (-O vmdk) output"
             .into());
     }
 
@@ -3833,7 +3847,9 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // For QCOW2 output the file is always sparse (the guest
     // writes clusters on demand) and the capacity needs headroom
     // for metadata (L1/L2 tables, refcount structures).
-    let output_capacity = if is_qcow2_output {
+    let output_capacity = if is_qcow2_output || is_vmdk_output {
+        // QCOW2 and VMDK need headroom for metadata (tables,
+        // header, descriptor, alignment padding).
         virtual_size
             .saturating_add(virtual_size / 100)
             .saturating_add(10 * 1024 * 1024)
@@ -3843,12 +3859,12 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 
     let output_backing = if args.no_create {
         BackingStore::open(Path::new(&args.output), false, None, false)?
-    } else if is_qcow2_output {
+    } else if is_qcow2_output || is_vmdk_output {
         BackingStore::open(
             Path::new(&args.output),
             false,
             Some(output_capacity),
-            true, // always sparse for QCOW2
+            true, // always sparse for structured formats
         )?
     } else {
         BackingStore::open(
@@ -3976,12 +3992,13 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     }
 
     // Set up output device (writable).
-    // For compressed QCOW2 output, use 512-byte sectors so
-    // compressed clusters can be packed at sector granularity.
-    // For uncompressed QCOW2, use the smaller of sector_size
-    // and cluster_size so that cluster writes align to whole
-    // sectors.
-    let output_sector_size = if is_qcow2_output && args.compress {
+    // For compressed QCOW2/VMDK output, use 512-byte sectors so
+    // compressed clusters/grains can be packed at sector granularity.
+    // For uncompressed QCOW2, use min(sector_size, cluster_size)
+    // so that cluster writes align to whole sectors.
+    // For uncompressed VMDK and raw, use sector_size (VMDK GTEs
+    // always reference 512-byte sectors internally).
+    let output_sector_size = if (is_qcow2_output || is_vmdk_output) && args.compress {
         512
     } else if is_qcow2_output {
         core::cmp::min(args.sector_size, args.cluster_size)

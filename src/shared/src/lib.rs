@@ -5,15 +5,20 @@
 
 #![no_std]
 
+pub mod bitmap;
 pub mod format_detection;
 pub mod virtio;
 
-/// Define a bump allocator with a fixed-size static heap.
+/// Define a bump allocator backed by a fixed address in guest memory.
 ///
-/// This macro generates a `BumpAllocator` struct, a static heap array,
-/// and registers it as `#[global_allocator]`. Used by operations that
-/// need `alloc` support (e.g., for ruzstd ZSTD decoding or miniz_oxide
-/// compression).
+/// This macro generates a `BumpAllocator` struct and registers it as
+/// `#[global_allocator]`. Used by operations that need `alloc` support
+/// (e.g., for ruzstd ZSTD decoding or miniz_oxide compression).
+///
+/// The heap lives at a fixed address in scratch memory (not a static
+/// array) to avoid .bss bloat that can overlap with the config area
+/// at 0x80000. Guest memory is zeroed on creation, so no explicit
+/// initialization is needed.
 ///
 /// The allocator never frees; callers must reset `HEAP_POS` to 0
 /// between logical operations that don't need persistent heap state.
@@ -21,18 +26,18 @@ pub mod virtio;
 /// # Example
 ///
 /// ```ignore
-/// shared::bump_allocator!(256 * 1024); // 256KB heap
+/// shared::bump_allocator!();
 ///
 /// // Reset before each decompression call:
 /// HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 /// ```
 #[macro_export]
 macro_rules! bump_allocator {
-    ($heap_size:expr) => {
+    () => {
         struct BumpAllocator;
 
-        const HEAP_SIZE: usize = $heap_size;
-        static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
+        const HEAP_BASE: usize = shared::ALLOC_HEAP_BASE;
+        const HEAP_SIZE: usize = shared::ALLOC_HEAP_SIZE;
         static HEAP_POS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
         unsafe impl core::alloc::GlobalAlloc for BumpAllocator {
@@ -49,7 +54,7 @@ macro_rules! bump_allocator {
                 }
 
                 HEAP_POS.store(new_pos, core::sync::atomic::Ordering::Relaxed);
-                unsafe { HEAP.as_mut_ptr().add(aligned) }
+                (HEAP_BASE + aligned) as *mut u8
             }
 
             unsafe fn dealloc(&self, _ptr: *mut u8, _layout: core::alloc::Layout) {
@@ -59,6 +64,166 @@ macro_rules! bump_allocator {
 
         #[global_allocator]
         static ALLOC: BumpAllocator = BumpAllocator;
+    };
+}
+
+/// Generate a sector-cached read function for a given type and endianness.
+///
+/// All format crates (qcow2, vmdk, vhd) need to read typed values from
+/// specific byte offsets within virtio-block devices. This macro generates
+/// functions that cache the most recently read sector to minimize I/O when
+/// reading consecutive values from the same sector.
+///
+/// # Parameters
+///
+/// - `$name`: function name to generate (e.g., `read_u32_le_cached`)
+/// - `$ty`: return type (u8, u16, u32, u64)
+/// - `$endian`: `be` for big-endian or `le` for little-endian
+/// - `$width`: byte width (1, 2, 4, 8)
+///
+/// # Example
+///
+/// ```ignore
+/// shared::cached_read!(read_u32_le_cached, u32, le, 4);
+/// shared::cached_read!(read_u64_be_cached, u64, be, 8);
+/// ```
+///
+/// The generated function has the signature:
+/// ```ignore
+/// pub unsafe fn $name(
+///     call_table: &shared::CallTable,
+///     device_idx: u32,
+///     byte_offset: u64,
+///     sector_size: usize,
+///     input_capacity: u64,
+///     cached_sector: &mut u64,
+///     cache_buf: *mut u8,
+///     bytes_read: &mut u64,
+/// ) -> Option<$ty>
+/// ```
+#[macro_export]
+macro_rules! cached_read {
+    ($name:ident, u8, $endian:ident, 1) => {
+        /// Read a single byte from a specific byte offset within a device,
+        /// using a one-sector cache to minimize I/O.
+        ///
+        /// # Safety
+        ///
+        /// `cache_buf` must point to at least `sector_size` writable bytes.
+        /// `call_table` must point to a valid initialized call table.
+        pub unsafe fn $name(
+            call_table: &shared::CallTable,
+            device_idx: u32,
+            byte_offset: u64,
+            sector_size: usize,
+            input_capacity: u64,
+            cached_sector: &mut u64,
+            cache_buf: *mut u8,
+            bytes_read: &mut u64,
+        ) -> Option<u8> {
+            let sector = byte_offset / sector_size as u64;
+            let off = (byte_offset % sector_size as u64) as usize;
+            if off >= sector_size {
+                return None;
+            }
+            if sector >= input_capacity {
+                return None;
+            }
+            if *cached_sector != sector {
+                if !(call_table.read_input_sector)(device_idx, sector, cache_buf, sector_size) {
+                    return None;
+                }
+                *bytes_read += sector_size as u64;
+                *cached_sector = sector;
+            }
+            Some(*cache_buf.add(off))
+        }
+    };
+    ($name:ident, $ty:ty, be, $width:expr) => {
+        /// Read a big-endian value from a specific byte offset within a device,
+        /// using a one-sector cache to minimize I/O.
+        ///
+        /// # Safety
+        ///
+        /// `cache_buf` must point to at least `sector_size` writable bytes.
+        /// `call_table` must point to a valid initialized call table.
+        pub unsafe fn $name(
+            call_table: &shared::CallTable,
+            device_idx: u32,
+            byte_offset: u64,
+            sector_size: usize,
+            input_capacity: u64,
+            cached_sector: &mut u64,
+            cache_buf: *mut u8,
+            bytes_read: &mut u64,
+        ) -> Option<$ty> {
+            let sector = byte_offset / sector_size as u64;
+            let off = (byte_offset % sector_size as u64) as usize;
+            if off + $width > sector_size {
+                return None;
+            }
+            if sector >= input_capacity {
+                return None;
+            }
+            if *cached_sector != sector {
+                if !(call_table.read_input_sector)(device_idx, sector, cache_buf, sector_size) {
+                    return None;
+                }
+                *bytes_read += sector_size as u64;
+                *cached_sector = sector;
+            }
+            let p = cache_buf.add(off);
+            let mut bytes = [0u8; $width];
+            let mut i = 0;
+            while i < $width {
+                bytes[i] = *p.add(i);
+                i += 1;
+            }
+            Some(<$ty>::from_be_bytes(bytes))
+        }
+    };
+    ($name:ident, $ty:ty, le, $width:expr) => {
+        /// Read a little-endian value from a specific byte offset within a
+        /// device, using a one-sector cache to minimize I/O.
+        ///
+        /// # Safety
+        ///
+        /// `cache_buf` must point to at least `sector_size` writable bytes.
+        /// `call_table` must point to a valid initialized call table.
+        pub unsafe fn $name(
+            call_table: &shared::CallTable,
+            device_idx: u32,
+            byte_offset: u64,
+            sector_size: usize,
+            input_capacity: u64,
+            cached_sector: &mut u64,
+            cache_buf: *mut u8,
+            bytes_read: &mut u64,
+        ) -> Option<$ty> {
+            let sector = byte_offset / sector_size as u64;
+            let off = (byte_offset % sector_size as u64) as usize;
+            if off + $width > sector_size {
+                return None;
+            }
+            if sector >= input_capacity {
+                return None;
+            }
+            if *cached_sector != sector {
+                if !(call_table.read_input_sector)(device_idx, sector, cache_buf, sector_size) {
+                    return None;
+                }
+                *bytes_read += sector_size as u64;
+                *cached_sector = sector;
+            }
+            let p = cache_buf.add(off);
+            let mut bytes = [0u8; $width];
+            let mut i = 0;
+            while i < $width {
+                bytes[i] = *p.add(i);
+                i += 1;
+            }
+            Some(<$ty>::from_le_bytes(bytes))
+        }
     };
 }
 
@@ -118,6 +283,22 @@ const _: () = assert!(
 
 /// Scratch memory size in bytes (~12.9 MiB)
 pub const SCRATCH_MEM_SIZE: usize = SCRATCH_MEM_END - SCRATCH_MEM_BASE;
+
+/// Size of the bump allocator heap (512 KiB).
+/// Must be large enough for miniz_oxide CompressorOxide Box allocations
+/// (~253 KiB) plus ruzstd ZSTD decoder allocations.
+pub const ALLOC_HEAP_SIZE: usize = 512 * 1024;
+
+/// Base address for the bump allocator heap in scratch memory.
+/// Placed at the end of scratch memory to avoid conflicts with
+/// operation-specific buffers that grow forward from SCRATCH_MEM_BASE.
+pub const ALLOC_HEAP_BASE: usize = SCRATCH_MEM_END - ALLOC_HEAP_SIZE;
+
+// Compile-time check: allocator heap must be within scratch memory.
+const _: () = assert!(
+    ALLOC_HEAP_BASE >= SCRATCH_MEM_BASE,
+    "ALLOC_HEAP_BASE is below SCRATCH_MEM_BASE"
+);
 
 /// Maximum sector size supported
 pub const MAX_SECTOR_SIZE: usize = 65536;
@@ -301,7 +482,7 @@ pub struct CallTable {
 
 /// Backing format type for QCOW2 header extension
 #[repr(u8)]
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub enum BackingFormat {
     /// No backing format specified
     #[default]

@@ -10,4 +10,5 @@ panic = "abort"
 
 [dependencies]
 shared = { path = "../../shared" }
-qcow2 = { path = "../../crates/qcow2", features = ["decompress", "decompress-zstd", "compress"] }
+qcow2 = { path = "../../crates/qcow2", features = ["decompress", "decompress-zstd", "compress", "vmdk-decompress"] }
+vmdk = { path = "../../crates/vmdk" }

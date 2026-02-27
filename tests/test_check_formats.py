@@ -112,6 +112,36 @@ class TestCheckCorruptImages(ImagoTestBase):
             'Corrupt VMDK should report errors'
         )
 
+    def test_vmdk_corrupt_descriptor(self):
+        """VMDK with descriptor beyond file should report corruption."""
+        testdata_root = self._testdata_root
+        vmdk_path = (
+            testdata_root / 'custom' / 'format-coverage' /
+            'vmdk-corrupt-descriptor.vmdk'
+        )
+
+        if not vmdk_path.exists():
+            self.skipTest(
+                f'Corrupt VMDK not found: {vmdk_path}'
+            )
+
+        stdout, stderr, rc = self.run_imago_check(
+            vmdk_path, output_format='json'
+        )
+
+        result = json.loads(stdout)
+        self.assertIn(
+            result.get('format', '').lower(),
+            ['vmdk', 'vmdk4'],
+            'Should detect as VMDK format'
+        )
+
+        self.assertGreater(
+            result.get('corruptions', 0), 0,
+            'VMDK with corrupt descriptor offset should '
+            'report corruption'
+        )
+
     def test_vhdx_corrupt_region(self):
         """VHDX with invalid region table should report corruption."""
         testdata_root = self._testdata_root

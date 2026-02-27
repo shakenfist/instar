@@ -5,8 +5,12 @@ edition = "2021"
 description = "VMDK format parsing for bare-metal guest operations"
 license = "Apache-2.0"
 
+[features]
+decompress = ["miniz_oxide"]
+
 [dependencies]
 shared = { path = "../../shared" }
+miniz_oxide = { version = "0.8", default-features = false, optional = true }
 
 [lib]
 # No std, this is used by bare-metal code
