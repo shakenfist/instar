@@ -46,6 +46,7 @@ Features unique to imago that do not exist in qemu-img.
 |----------|-------------|
 | [Configuration Guide](configuration.md) | Command-line flags, config files, quirk control |
 | [Chain Discovery](chain-discovery.md) | `imago info --chain` - secure backing chain discovery |
+| [Chain Config Protocol](chain-config.md) | Chain config structure layout and VMM-to-guest data flow |
 
 ## Compatibility
 
@@ -205,4 +206,4 @@ shared across all guest operations, eliminating code duplication:
 |-------|-------------|---------|
 | `qcow2` | QCOW2 header parsing, L1/L2 cluster lookup, decompression (feature-gated), refcount reading, backing file extraction | info, check, compare, convert |
 | `raw` | MBR/GPT partition table detection | info |
-| `vmdk` | VMDK4 binary header parsing, descriptor I/O and text parsing | info |
+| `vmdk` | VMDK4 binary header parsing, descriptor I/O and text parsing, grain directory/table reading, streamOptimized footer/marker handling, write helpers | info, check, convert |

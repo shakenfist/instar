@@ -291,7 +291,7 @@ class TestConvertErrors(ImagoTestBase):
     def test_convert_unsupported_output_format(self):
         """Converting to unsupported format returns an error."""
         with tempfile.NamedTemporaryFile(suffix='.raw') as src, \
-                tempfile.NamedTemporaryFile(suffix='.vmdk') as dst:
+                tempfile.NamedTemporaryFile(suffix='.vdi') as dst:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw',
                  src.name, '1M'],
@@ -299,7 +299,7 @@ class TestConvertErrors(ImagoTestBase):
             )
             stdout, stderr, rc = self.run_imago_convert(
                 Path(src.name), Path(dst.name),
-                output_format='vmdk'
+                output_format='vdi'
             )
             self.assertNotEqual(rc, 0)
             self.assertIn('unsupported', stderr.lower())
@@ -1848,3 +1848,708 @@ class TestConvertLargeCluster(ImagoTestBase):
         finally:
             os.unlink(qcow2_path)
             os.unlink(raw_path)
+
+
+class TestConvertVmdkToRaw(ImagoTestBase):
+    """Test VMDK monolithicSparse to raw conversion.
+
+    Converts monolithicSparse VMDK images to raw and
+    cross-validates against qemu-img convert output.
+    """
+
+    VMDK_SPARSE_IDS = [
+        'plaso-vmdk',
+        'vmdk-multi-partition',
+        'chain-base-vmdk',
+    ]
+
+    def _get_vmdk_info(self, image_path):
+        """Get virtual_size via qemu-img info."""
+        result = subprocess.run(
+            [
+                'qemu-img', 'info', '--output=json',
+                str(image_path),
+            ],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return None
+        info = json.loads(result.stdout)
+        return info.get('virtual-size')
+
+    def _timeout_for_vsize(self, vsize):
+        """Compute timeout based on virtual size."""
+        if not vsize:
+            return 120
+        gib = vsize / (1024 ** 3)
+        return max(120, int(120 + gib * 10))
+
+    def _test_vmdk_convert(self, image_id):
+        """Convert a VMDK image to raw and cross-validate."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        vsize = self._get_vmdk_info(image.path)
+        timeout = self._timeout_for_vsize(vsize)
+
+        # Check available temp space
+        if vsize:
+            tmpdir = tempfile.gettempdir()
+            st = os.statvfs(tmpdir)
+            avail = st.f_bavail * st.f_frsize
+            needed = vsize * 2 + 100 * 1024 * 1024
+            if avail < needed:
+                self.skipTest(
+                    f'{image_id}: needs '
+                    f'{needed // (1024**3)}GB temp, '
+                    f'only {avail // (1024**3)}GB '
+                    f'available'
+                )
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') \
+                as imago_raw, \
+                tempfile.NamedTemporaryFile(suffix='.raw') \
+                as qemu_raw:
+            # Convert with imago
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(imago_raw.name),
+                timeout=timeout
+            )
+            self.assertEqual(
+                rc, 0,
+                f'imago convert failed for {image_id}: '
+                f'{stderr}'
+            )
+
+            # Convert with qemu-img
+            q_stdout, q_stderr, q_rc = \
+                self.run_qemu_img_convert(
+                    image.path, Path(qemu_raw.name),
+                    timeout=timeout
+                )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed for '
+                f'{image_id}: {q_stderr}'
+            )
+
+            # Compare outputs
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(imago_raw.name),
+                Path(qemu_raw.name),
+                timeout=timeout
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Convert output for {image_id} differs '
+                f'from qemu-img: {cmp_out}'
+            )
+
+    def test_convert_plaso_vmdk(self):
+        """Convert plaso monolithicSparse VMDK to raw."""
+        self._test_vmdk_convert('plaso-vmdk')
+
+    def test_convert_vmdk_multi_partition(self):
+        """Convert multi-partition VMDK to raw."""
+        self._test_vmdk_convert('vmdk-multi-partition')
+
+    def test_convert_chain_base_vmdk(self):
+        """Convert backing chain base VMDK to raw."""
+        self._test_vmdk_convert('chain-base-vmdk')
+
+
+class TestConvertVmdkCompare(ImagoTestBase):
+    """Test comparing VMDK images against raw equivalents.
+
+    Uses imago compare to verify VMDK virtual content matches
+    the qemu-img-converted raw baseline.
+    """
+
+    def _compare_vmdk_vs_raw(self, image_id):
+        """Compare VMDK against its qemu-img-converted raw."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') \
+                as qemu_raw:
+            # Convert with qemu-img as baseline
+            q_stdout, q_stderr, q_rc = \
+                self.run_qemu_img_convert(
+                    image.path, Path(qemu_raw.name),
+                    timeout=120
+                )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed for '
+                f'{image_id}: {q_stderr}'
+            )
+
+            # Compare VMDK directly against raw
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                image.path, Path(qemu_raw.name),
+                timeout=120
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Sparse VMDK {image_id} content '
+                f'differs from raw: {cmp_out}'
+            )
+
+    def test_compare_plaso_vmdk_vs_raw(self):
+        """Compare plaso VMDK against qemu-img raw."""
+        self._compare_vmdk_vs_raw('plaso-vmdk')
+
+    def test_compare_vmdk_multi_partition_vs_raw(self):
+        """Compare multi-partition VMDK against raw."""
+        self._compare_vmdk_vs_raw('vmdk-multi-partition')
+
+    def test_compare_chain_base_vmdk_vs_raw(self):
+        """Compare chain base VMDK against raw."""
+        self._compare_vmdk_vs_raw('chain-base-vmdk')
+
+
+class TestConvertVmdkStreamOptimized(ImagoTestBase):
+    """Test streamOptimized VMDK conversion and comparison.
+
+    streamOptimized VMDKs use DEFLATE-compressed grains with
+    grain markers, and store the grain directory at the end of
+    the file (GD_AT_END). This tests decompression and footer
+    reading.
+    """
+
+    STREAM_OPT_IDS = [
+        'vmdk-streamoptimized',
+        'vmdk-v3',
+    ]
+
+    def _get_vmdk_info(self, image_path):
+        """Get virtual_size via qemu-img info."""
+        result = subprocess.run(
+            [
+                'qemu-img', 'info', '--output=json',
+                str(image_path),
+            ],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return None
+        info = json.loads(result.stdout)
+        return info.get('virtual-size')
+
+    def _test_streamopt_convert(self, image_id):
+        """Convert streamOptimized VMDK to raw, validate."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        vsize = self._get_vmdk_info(image.path)
+        timeout = max(120, int(120 + (vsize or 0)
+                                / (1024 ** 3) * 10))
+
+        # Check temp space
+        if vsize:
+            tmpdir = tempfile.gettempdir()
+            st = os.statvfs(tmpdir)
+            avail = st.f_bavail * st.f_frsize
+            needed = vsize * 2 + 100 * 1024 * 1024
+            if avail < needed:
+                self.skipTest(
+                    f'{image_id}: needs '
+                    f'{needed // (1024**3)}GB temp, '
+                    f'only {avail // (1024**3)}GB '
+                    f'available'
+                )
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') \
+                as imago_raw, \
+                tempfile.NamedTemporaryFile(suffix='.raw') \
+                as qemu_raw:
+            # Convert with imago
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(imago_raw.name),
+                timeout=timeout
+            )
+            self.assertEqual(
+                rc, 0,
+                f'imago convert failed for {image_id}: '
+                f'{stderr}'
+            )
+
+            # Convert with qemu-img
+            q_stdout, q_stderr, q_rc = \
+                self.run_qemu_img_convert(
+                    image.path, Path(qemu_raw.name),
+                    timeout=timeout
+                )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed for '
+                f'{image_id}: {q_stderr}'
+            )
+
+            # Compare outputs
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(imago_raw.name),
+                Path(qemu_raw.name),
+                timeout=timeout
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Convert output for {image_id} differs '
+                f'from qemu-img: {cmp_out}'
+            )
+
+    def test_convert_vmdk_streamoptimized(self):
+        """Convert streamOptimized VMDK to raw."""
+        self._test_streamopt_convert(
+            'vmdk-streamoptimized'
+        )
+
+    def test_convert_vmdk_v3(self):
+        """Convert VMDK v3 (streamOptimized) to raw."""
+        self._test_streamopt_convert('vmdk-v3')
+
+    def _compare_streamopt_vs_raw(self, image_id):
+        """Compare streamOptimized VMDK vs raw baseline."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        vsize = self._get_vmdk_info(image.path)
+
+        # Check temp space
+        if vsize:
+            tmpdir = tempfile.gettempdir()
+            st = os.statvfs(tmpdir)
+            avail = st.f_bavail * st.f_frsize
+            needed = vsize + 100 * 1024 * 1024
+            if avail < needed:
+                self.skipTest(
+                    f'{image_id}: needs '
+                    f'{needed // (1024**3)}GB temp, '
+                    f'only {avail // (1024**3)}GB '
+                    f'available'
+                )
+
+        timeout = max(120, int(120 + (vsize or 0)
+                                / (1024 ** 3) * 10))
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') \
+                as qemu_raw:
+            q_stdout, q_stderr, q_rc = \
+                self.run_qemu_img_convert(
+                    image.path, Path(qemu_raw.name),
+                    timeout=timeout
+                )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed for '
+                f'{image_id}: {q_stderr}'
+            )
+
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                image.path, Path(qemu_raw.name),
+                timeout=timeout
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'StreamOpt VMDK {image_id} differs '
+                f'from raw: {cmp_out}'
+            )
+
+    def test_compare_vmdk_streamoptimized_vs_raw(self):
+        """Compare streamOptimized VMDK against raw."""
+        self._compare_streamopt_vs_raw(
+            'vmdk-streamoptimized'
+        )
+
+    def test_compare_vmdk_v3_vs_raw(self):
+        """Compare VMDK v3 (streamOptimized) vs raw."""
+        self._compare_streamopt_vs_raw('vmdk-v3')
+
+
+class TestConvertToVmdk(ImagoTestBase):
+    """Test converting images to VMDK monolithicSparse output.
+
+    Converts images to VMDK with imago, then verifies the output
+    by converting back to raw and comparing against qemu-img.
+    """
+
+    def _test_to_vmdk_roundtrip(self, image_id):
+        """Convert image to VMDK, then back to raw, compare."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.vmdk') as vmdk_out, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as rt_raw, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as qemu_raw:
+            # Convert to VMDK with imago
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(vmdk_out.name),
+                output_format='vmdk',
+                timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'imago convert to vmdk failed for '
+                f'{image_id}: {stderr}'
+            )
+
+            # Verify qemu-img can read the VMDK
+            result = subprocess.run(
+                [
+                    'qemu-img', 'info', '--output=json',
+                    vmdk_out.name,
+                ],
+                capture_output=True, text=True,
+                timeout=30
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img info failed on imago VMDK: '
+                f'{result.stderr}'
+            )
+            info = json.loads(result.stdout)
+            self.assertEqual(
+                info.get('format'), 'vmdk',
+                f'Output is not VMDK format: '
+                f'{info.get("format")}'
+            )
+
+            # Round-trip: convert VMDK back to raw
+            rt_stdout, rt_stderr, rt_rc = \
+                self.run_imago_convert(
+                    Path(vmdk_out.name),
+                    Path(rt_raw.name),
+                    timeout=120
+                )
+            self.assertEqual(
+                rt_rc, 0,
+                f'Round-trip convert failed for '
+                f'{image_id}: {rt_stderr}'
+            )
+
+            # Convert original to raw with qemu-img
+            q_stdout, q_stderr, q_rc = \
+                self.run_qemu_img_convert(
+                    image.path, Path(qemu_raw.name),
+                    timeout=120
+                )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed: {q_stderr}'
+            )
+
+            # Compare round-tripped raw vs qemu-img raw
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(rt_raw.name),
+                Path(qemu_raw.name),
+                timeout=120
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Round-trip mismatch for {image_id}: '
+                f'{cmp_out}'
+            )
+
+    def test_raw_to_vmdk_roundtrip(self):
+        """Round-trip: raw -> vmdk -> raw."""
+        self._test_to_vmdk_roundtrip('raw-mbr-partitioned')
+
+    def test_qcow2_to_vmdk_roundtrip(self):
+        """Round-trip: qcow2 -> vmdk -> raw."""
+        self._test_to_vmdk_roundtrip('cirros-qcow2')
+
+    def test_vmdk_to_vmdk_roundtrip(self):
+        """Round-trip: vmdk -> vmdk -> raw."""
+        self._test_to_vmdk_roundtrip('plaso-vmdk')
+
+
+class TestConvertToVmdkCompressed(ImagoTestBase):
+    """Test converting images to streamOptimized VMDK output.
+
+    Uses -O vmdk -c to produce compressed streamOptimized VMDKs,
+    then verifies by converting back to raw and comparing.
+    """
+
+    def _test_to_vmdk_compressed_roundtrip(
+        self, image_id, timeout=120
+    ):
+        """Convert to streamOptimized VMDK, round-trip, compare."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.vmdk') as vmdk_out, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as rt_raw, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as qemu_raw:
+            # Convert to streamOptimized VMDK
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(vmdk_out.name),
+                output_format='vmdk',
+                compress=True,
+                timeout=timeout
+            )
+            self.assertEqual(
+                rc, 0,
+                f'imago convert to streamOptimized vmdk '
+                f'failed for {image_id}: {stderr}'
+            )
+
+            # Verify qemu-img can read and reports
+            # streamOptimized format
+            result = subprocess.run(
+                [
+                    'qemu-img', 'info', '--output=json',
+                    vmdk_out.name,
+                ],
+                capture_output=True, text=True,
+                timeout=30
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img info failed: {result.stderr}'
+            )
+            info = json.loads(result.stdout)
+            self.assertEqual(
+                info.get('format'), 'vmdk',
+                f'Not VMDK: {info.get("format")}'
+            )
+
+            # Round-trip: streamOptimized VMDK -> raw
+            rt_stdout, rt_stderr, rt_rc = \
+                self.run_imago_convert(
+                    Path(vmdk_out.name),
+                    Path(rt_raw.name),
+                    timeout=timeout
+                )
+            self.assertEqual(
+                rt_rc, 0,
+                f'Round-trip convert failed for '
+                f'{image_id}: {rt_stderr}'
+            )
+
+            # Convert original to raw with qemu-img
+            q_stdout, q_stderr, q_rc = \
+                self.run_qemu_img_convert(
+                    image.path, Path(qemu_raw.name),
+                    timeout=timeout
+                )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed: {q_stderr}'
+            )
+
+            # Compare round-tripped raw vs qemu-img raw
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(rt_raw.name),
+                Path(qemu_raw.name),
+                timeout=timeout
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Round-trip mismatch for {image_id}: '
+                f'{cmp_out}'
+            )
+
+    def test_raw_to_streamoptimized_vmdk(self):
+        """Round-trip: raw -> streamOptimized vmdk -> raw."""
+        self._test_to_vmdk_compressed_roundtrip(
+            'raw-mbr-partitioned'
+        )
+
+    def test_qcow2_to_streamoptimized_vmdk(self):
+        """Round-trip: qcow2 -> streamOptimized vmdk -> raw."""
+        self._test_to_vmdk_compressed_roundtrip(
+            'cirros-qcow2'
+        )
+
+    def test_vmdk_to_streamoptimized_vmdk(self):
+        """Round-trip: vmdk -> streamOptimized vmdk -> raw."""
+        self._test_to_vmdk_compressed_roundtrip('plaso-vmdk')
+
+
+class TestConvertVmdkToQcow2Roundtrip(ImagoTestBase):
+    """Test VMDK -> QCOW2 -> raw roundtrip conversions.
+
+    Converts VMDK images to QCOW2 with imago, then back to raw,
+    and cross-validates against qemu-img.
+    """
+
+    def _test_vmdk_to_qcow2_roundtrip(self, image_id):
+        """Convert VMDK to QCOW2, then to raw, compare."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.qcow2') as qcow2_out, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as rt_raw, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as qemu_raw:
+            # Convert VMDK to QCOW2
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(qcow2_out.name),
+                output_format='qcow2',
+                timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'imago convert vmdk->qcow2 failed for '
+                f'{image_id}: {stderr}'
+            )
+
+            # Round-trip: QCOW2 -> raw
+            rt_stdout, rt_stderr, rt_rc = \
+                self.run_imago_convert(
+                    Path(qcow2_out.name),
+                    Path(rt_raw.name),
+                    timeout=120
+                )
+            self.assertEqual(
+                rt_rc, 0,
+                f'Round-trip qcow2->raw failed for '
+                f'{image_id}: {rt_stderr}'
+            )
+
+            # Convert original to raw with qemu-img
+            q_stdout, q_stderr, q_rc = \
+                self.run_qemu_img_convert(
+                    image.path, Path(qemu_raw.name),
+                    timeout=120
+                )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed: {q_stderr}'
+            )
+
+            # Compare round-tripped raw vs qemu-img raw
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(rt_raw.name),
+                Path(qemu_raw.name),
+                timeout=120
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'VMDK->QCOW2->raw mismatch for '
+                f'{image_id}: {cmp_out}'
+            )
+
+    def test_plaso_vmdk_to_qcow2(self):
+        """Round-trip: monolithicSparse vmdk -> qcow2 -> raw."""
+        self._test_vmdk_to_qcow2_roundtrip('plaso-vmdk')
+
+    def test_streamoptimized_vmdk_to_qcow2(self):
+        """Round-trip: streamOptimized vmdk -> qcow2 -> raw."""
+        self._test_vmdk_to_qcow2_roundtrip(
+            'vmdk-streamoptimized'
+        )
+
+    def test_vmdk_multi_partition_to_qcow2(self):
+        """Round-trip: multi-partition vmdk -> qcow2 -> raw."""
+        self._test_vmdk_to_qcow2_roundtrip(
+            'vmdk-multi-partition'
+        )
+
+
+class TestConvertVmdkCheckOutput(ImagoTestBase):
+    """Test that imago-produced VMDK output passes check.
+
+    Converts images to VMDK, then runs imago check to verify
+    structural integrity of our own output.
+    """
+
+    def _test_vmdk_output_check(
+        self, image_id, compress=False
+    ):
+        """Convert to VMDK, then check the output."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.vmdk') as vmdk_out:
+            # Convert to VMDK
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(vmdk_out.name),
+                output_format='vmdk',
+                compress=compress,
+                timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'imago convert to vmdk failed for '
+                f'{image_id}: {stderr}'
+            )
+
+            # Check the output VMDK
+            chk_stdout, chk_stderr, chk_rc = \
+                self.run_imago_check(
+                    Path(vmdk_out.name),
+                    output_format='json'
+                )
+            result = json.loads(chk_stdout)
+
+            self.assertEqual(
+                result.get('format', '').lower(), 'vmdk',
+                f'Output should be detected as vmdk'
+            )
+            self.assertEqual(
+                result.get('check-errors', -1), 0,
+                f'imago VMDK output should have 0 errors: '
+                f'{chk_stdout}'
+            )
+
+    def test_check_monolithic_sparse_output(self):
+        """Check imago monolithicSparse VMDK output."""
+        self._test_vmdk_output_check(
+            'raw-mbr-partitioned'
+        )
+
+    def test_check_streamoptimized_output(self):
+        """Check imago streamOptimized VMDK output."""
+        self._test_vmdk_output_check(
+            'raw-mbr-partitioned', compress=True
+        )
+
+    def test_check_qcow2_to_vmdk_output(self):
+        """Check imago VMDK output from QCOW2 input."""
+        self._test_vmdk_output_check('cirros-qcow2')
+
+    def test_check_vmdk_to_vmdk_output(self):
+        """Check imago VMDK output from VMDK input."""
+        self._test_vmdk_output_check('plaso-vmdk')
