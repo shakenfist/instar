@@ -27,62 +27,11 @@
 use core::panic::PanicInfo;
 
 use shared::{
+    bitmap::{BitmapContext, BitmapSetResult},
     format_detection::{detect_format_from_header, detect_vhd_footer, QCOW2_MAGIC, VHD_COOKIE},
     validate_call_table, CallTable, ChainConfig, CheckConfig, CheckResult, ImageFormat,
-    CALL_TABLE_ADDR, MAX_SECTOR_SIZE, SCRATCH_MEM_BASE, SCRATCH_MEM_SIZE,
+    CALL_TABLE_ADDR, MAX_SECTOR_SIZE,
 };
-
-/// Result of a bitmap_set operation.
-enum BitmapSetResult {
-    /// Bit was not previously set (no overlap).
-    NewBit,
-    /// Bit was already set — overlap detected.
-    AlreadySet,
-    /// Cluster index exceeds bitmap capacity; overlap status unknown.
-    BeyondCapacity,
-}
-
-/// Set a bit in the overlap-detection bitmap.
-///
-/// The bitmap lives in scratch memory and tracks which host clusters
-/// have been referenced. Each bit corresponds to one host cluster.
-///
-/// Returns a `BitmapSetResult` distinguishing between "newly set",
-/// "already set (overlap)", and "beyond bitmap capacity".
-///
-/// Safety: callers gate on `can_track` before calling, so
-/// `BeyondCapacity` should never be reached in practice. It exists
-/// as a defensive measure to prevent silent false-negatives if
-/// the call-site guards are ever changed.
-unsafe fn bitmap_set(bitmap: *mut u8, bitmap_size: usize, cluster_idx: u64) -> BitmapSetResult {
-    let byte_idx = (cluster_idx / 8) as usize;
-    let bit_mask = 1u8 << (cluster_idx % 8) as u8;
-    if byte_idx >= bitmap_size {
-        return BitmapSetResult::BeyondCapacity;
-    }
-    let byte_ptr = bitmap.add(byte_idx);
-    let was_set = (*byte_ptr & bit_mask) != 0;
-    *byte_ptr |= bit_mask;
-    if was_set {
-        BitmapSetResult::AlreadySet
-    } else {
-        BitmapSetResult::NewBit
-    }
-}
-
-/// Test whether a bit is set in the overlap-detection bitmap.
-///
-/// Returns `false` for indices beyond bitmap capacity. This is safe
-/// because callers only invoke this when `can_track` is true, which
-/// guarantees all valid cluster indices fit within the bitmap.
-unsafe fn bitmap_test(bitmap: *const u8, bitmap_size: usize, cluster_idx: u64) -> bool {
-    let byte_idx = (cluster_idx / 8) as usize;
-    let bit_mask = 1u8 << (cluster_idx % 8) as u8;
-    if byte_idx >= bitmap_size {
-        return false;
-    }
-    (*bitmap.add(byte_idx) & bit_mask) != 0
-}
 
 /// Entry point called by core after devices are initialized.
 ///
@@ -591,21 +540,16 @@ unsafe fn check_vmdk(
     (call_table.verbose_print)(b"check: vmdk header valid\n\0".as_ptr());
 
     // ---- Initialize overlap-detection bitmap ----
-    let bitmap = SCRATCH_MEM_BASE as *mut u8;
     let grain_size_bytes = hdr.grain_size_bytes;
     let total_host_grains = (actual_size + grain_size_bytes - 1) / grain_size_bytes;
-    let needed_bytes = ((total_host_grains + 7) / 8) as usize;
-    let bitmap_size = core::cmp::min(needed_bytes, SCRATCH_MEM_SIZE);
-    core::ptr::write_bytes(bitmap, 0, bitmap_size);
-    let max_trackable = (bitmap_size as u64) * 8;
-    let can_track = total_host_grains <= max_trackable;
+    let bmp = BitmapContext::init_in_scratch(total_host_grains);
 
     (call_table.verbose_print)(b"check: vmdk bitmap initialized\n\0".as_ptr());
 
     // ---- Mark metadata regions in bitmap ----
-    if can_track {
+    if bmp.can_track {
         // Header grain (grain 0)
-        bitmap_set(bitmap, bitmap_size, 0);
+        bmp.set(0);
 
         // Descriptor grains
         if hdr.desc_offset_sectors > 0 {
@@ -614,7 +558,7 @@ unsafe fn check_vmdk(
             let first = desc_start / grain_size_bytes;
             let last = desc_end_b.saturating_sub(1) / grain_size_bytes;
             for g in first..=last {
-                bitmap_set(bitmap, bitmap_size, g);
+                bmp.set(g);
             }
         }
 
@@ -622,7 +566,7 @@ unsafe fn check_vmdk(
         let gd_first = gd_byte_offset / grain_size_bytes;
         let gd_last = gd_end.saturating_sub(1) / grain_size_bytes;
         for g in gd_first..=gd_last {
-            bitmap_set(bitmap, bitmap_size, g);
+            bmp.set(g);
         }
     }
 
@@ -707,11 +651,11 @@ unsafe fn check_vmdk(
         // GT and GD grains may colocate in the same host grain
         // (especially in small streamOptimized VMDKs), so we mark
         // without checking AlreadySet — same as header/descriptor/GD.
-        if can_track {
+        if bmp.can_track {
             let first_grain = gt_byte_off / grain_size_bytes;
             let last_grain = gt_end.saturating_sub(1) / grain_size_bytes;
             for g in first_grain..=last_grain {
-                bitmap_set(bitmap, bitmap_size, g);
+                bmp.set(g);
             }
         }
 
@@ -785,8 +729,8 @@ unsafe fn check_vmdk(
                 // is variable-size; mark the host grain in the bitmap
                 // (overlaps are expected, like QCOW2 compressed).
                 result.clusters_allocated += 1;
-                if can_track {
-                    bitmap_set(bitmap, bitmap_size, grain_off / grain_size_bytes);
+                if bmp.can_track {
+                    bmp.set(grain_off / grain_size_bytes);
                 }
                 if grain_off > max_offset {
                     max_offset = grain_off;
@@ -811,12 +755,9 @@ unsafe fn check_vmdk(
                 result.clusters_allocated += 1;
 
                 // Overlap detection
-                if can_track {
+                if bmp.can_track {
                     let gidx = grain_off / grain_size_bytes;
-                    if matches!(
-                        bitmap_set(bitmap, bitmap_size, gidx),
-                        BitmapSetResult::AlreadySet
-                    ) {
+                    if matches!(bmp.set(gidx), BitmapSetResult::AlreadySet) {
                         result.corruptions += 1;
                         result.total_errors += 1;
                         (call_table.debug_print)(b"check: grain overlap\n\0".as_ptr());
@@ -1141,36 +1082,29 @@ unsafe fn check_qcow2(
     }
 
     // ---- Initialize overlap-detection bitmap ----
-    let bitmap = SCRATCH_MEM_BASE as *mut u8;
     let total_host_clusters = (actual_size + cluster_size - 1) / cluster_size;
-    let needed_bytes = ((total_host_clusters + 7) / 8) as usize;
-    let bitmap_size = core::cmp::min(needed_bytes, SCRATCH_MEM_SIZE);
-    // Only zero the bytes actually needed for this image's clusters
-    core::ptr::write_bytes(bitmap, 0, bitmap_size);
-
-    let max_trackable = (bitmap_size as u64) * 8;
-    let can_track = total_host_clusters <= max_trackable;
+    let bmp = BitmapContext::init_in_scratch(total_host_clusters);
 
     (call_table.verbose_print)(b"check: bitmap initialized\n\0".as_ptr());
 
     // ---- Mark metadata clusters in bitmap ----
     // Header cluster (cluster 0)
-    if can_track {
-        bitmap_set(bitmap, bitmap_size, 0);
+    if bmp.can_track {
+        bmp.set(0);
     }
     // L1 table clusters
-    if can_track {
+    if bmp.can_track {
         let l1_start_cluster = l1_table_offset / cluster_size;
         let l1_clusters = (l1_table_size_bytes + cluster_size - 1) / cluster_size;
         for c in 0..l1_clusters {
-            bitmap_set(bitmap, bitmap_size, l1_start_cluster + c);
+            bmp.set(l1_start_cluster + c);
         }
     }
     // Refcount table clusters
-    if can_track {
+    if bmp.can_track {
         let rt_start_cluster = refcount_table_offset / cluster_size;
         for c in 0..(refcount_table_clusters as u64) {
-            bitmap_set(bitmap, bitmap_size, rt_start_cluster + c);
+            bmp.set(rt_start_cluster + c);
         }
     }
 
@@ -1261,12 +1195,9 @@ unsafe fn check_qcow2(
             result.clusters_allocated += 1;
 
             // Overlap check for L2 table cluster
-            if can_track {
+            if bmp.can_track {
                 let l2_cidx = l2_offset / cluster_size;
-                if matches!(
-                    bitmap_set(bitmap, bitmap_size, l2_cidx),
-                    BitmapSetResult::AlreadySet
-                ) {
+                if matches!(bmp.set(l2_cidx), BitmapSetResult::AlreadySet) {
                     result.corruptions += 1;
                     result.total_errors += 1;
                     (call_table.debug_print)(b"check: L2 table cluster overlap\n\0".as_ptr());
@@ -1307,8 +1238,8 @@ unsafe fn check_qcow2(
                     reftable_cached_buffer.as_mut_ptr(),
                     &mut bytes_read,
                 ) {
-                    if rb_off != 0 && can_track {
-                        bitmap_set(bitmap, bitmap_size, rb_off / cluster_size);
+                    if rb_off != 0 && bmp.can_track {
+                        bmp.set(rb_off / cluster_size);
                     }
                 }
             }
@@ -1395,12 +1326,9 @@ unsafe fn check_qcow2(
                         result.clusters_allocated += 1;
 
                         // Overlap detection
-                        if can_track {
+                        if bmp.can_track {
                             let cidx = data_off / cluster_size;
-                            if matches!(
-                                bitmap_set(bitmap, bitmap_size, cidx),
-                                BitmapSetResult::AlreadySet
-                            ) {
+                            if matches!(bmp.set(cidx), BitmapSetResult::AlreadySet) {
                                 result.corruptions += 1;
                                 result.total_errors += 1;
                                 (call_table.debug_print)(b"check: overlap\n\0".as_ptr());
@@ -1474,11 +1402,11 @@ unsafe fn check_qcow2(
                                     // prevention. Ignore AlreadySet: compressed
                                     // clusters can share host clusters via
                                     // sub-cluster packing.
-                                    if can_track {
+                                    if bmp.can_track {
                                         let first = comp_off / cluster_size;
                                         let last = (comp_end - 1) / cluster_size;
                                         for cidx in first..=last {
-                                            bitmap_set(bitmap, bitmap_size, cidx);
+                                            bmp.set(cidx);
                                         }
                                     }
                                 }
@@ -1501,7 +1429,7 @@ unsafe fn check_qcow2(
     (call_table.verbose_print)(b"check: L1/L2 walk complete\n\0".as_ptr());
 
     // ---- Leak detection: scan refcount blocks ----
-    if can_track {
+    if bmp.can_track {
         (call_table.verbose_print)(b"check: scanning refcounts for leaks\n\0".as_ptr());
 
         let entries_per_block = (cluster_size * 8) / refcount_bits as u64;
@@ -1550,7 +1478,7 @@ unsafe fn check_qcow2(
                 };
 
                 if refblock_off != 0 {
-                    bitmap_set(bitmap, bitmap_size, refblock_off / cluster_size);
+                    bmp.set(refblock_off / cluster_size);
                 }
             }
 
@@ -1618,7 +1546,7 @@ unsafe fn check_qcow2(
                                 Some(v) => v,
                                 None => continue,
                             };
-                            if !bitmap_test(bitmap, bitmap_size, cidx) {
+                            if !bmp.test(cidx) {
                                 result.leaks += 1;
                                 result.total_errors += 1;
                             }
