@@ -287,6 +287,24 @@ Implemented full VHDX support in 5 sub-phases:
   metadata parsing, BAT bounds/alignment/overlap/state validation.
 - **Phase 10e**: Integration tests (VHDX→raw, raw→VHDX, round-trip,
   compare, check output) and documentation updates.
+- **Phase 10f** (fix): VMM cluster_size check excluded VHD/VHDX
+  (block_size ≠ cluster_size), and VHDX output capacity calculation
+  accounts for 32MB block rounding.
+
+## Deferred Work (from Phase 10 review)
+
+### Refactoring Opportunities (not blocking, future improvement)
+
+17. **Byte-order helper duplication grows** — VHDX adds LE helpers
+    (`le_u16`/`le_u32`/`le_u64`, `write_le_*`) duplicating the
+    pattern from VHD's LE and QCOW2/VMDK's BE helpers. All format
+    crates have ~20 lines of identical byte-order helpers. Still
+    not blocking — same recommendation as item 11.
+
+18. **Two-pass zero check in convert_to_vhdx** — Same pattern as
+    item 12 (VHD). Each 32 MiB VHDX block is read twice when
+    skip-zeros is enabled. Performance impact is minimal for
+    typical images due to OS page cache.
 
 ---
 
