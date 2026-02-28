@@ -58,7 +58,7 @@ The `imago convert` operation supports writing output in the following formats:
 | **qcow2** | Supported | QCOW2 v3, 16-bit refcounts, configurable cluster size (512B-64KB), optional zlib compression (`-c`) |
 | **vmdk** | Supported | monolithicSparse (default), streamOptimized with `-c` (DEFLATE compressed) |
 | **vpc** (VHD) | Supported | Dynamic VHD with 2 MiB blocks, BAT-based allocation, skip-zeros support |
-| vhdx | Not yet | Planned: VHDX with BAT, metadata, and log support |
+| **vhdx** | Supported | Dynamic VHDX with 32 MiB blocks, CRC-32C checksums, 1MB-aligned structures |
 
 ### Input Format Support for Conversion
 
@@ -70,6 +70,7 @@ The `imago convert` operation supports writing output in the following formats:
 | vmdk (streamOptimized) | Supported | DEFLATE decompression, footer-based GD offset resolution |
 | vhd (fixed) | Supported | Raw sector reads with footer validation |
 | vhd (dynamic) | Supported | BAT-based block lookup, sector-cached reads |
+| vhdx (dynamic) | Supported | 64-bit BAT with interleaved SB entries, GUID-based metadata, CRC-32C validation |
 
 ### Limitations
 
@@ -144,7 +145,7 @@ The `imago convert` operation supports writing output in the following formats:
 | VDI | None | Pass-through | Detects format, UUID |
 | ISO | None | Pass-through | Detects format* |
 | VHD | None | Pass-through | Detects creator app; full check validation (footer/header checksums, BAT bounds, overlap detection) |
-| VHDX | None | Pass-through | Detects block size |
+| VHDX | None | Pass-through | Detects block size; full check validation (header CRC-32C, region table CRC, metadata, BAT bounds/alignment/overlap) |
 
 ---
 
@@ -325,6 +326,19 @@ The `imago convert` operation supports writing output in the following formats:
     cookie and checksum validation, BAT offset and entry bounds checking,
     overlap detection (1-bit-per-block bitmap in scratch memory), footer
     copy consistency (start vs end of file).
+
+14. **VHDX Input/Output Support** - Convert supports VHDX as both input
+    and output format. Input: dynamic VHDX (64-bit BAT with interleaved
+    sector bitmap entries, GUID-based metadata, CRC-32C header/region
+    validation). Output: dynamic VHDX with 32 MiB blocks, 1MB-aligned
+    structures, and skip-zeros support.
+
+15. **VHDX Structural Integrity Check** - Full validation in check
+    operation: dual header CRC-32C validation with active header
+    selection by sequence number, dirty log detection, region table
+    CRC-32C validation, GUID-based metadata parsing (all required items),
+    BAT entry validation (offset bounds, 1MB alignment, overlap
+    detection, state validation), differencing disk detection.
 
 ### Detections to Add
 

@@ -208,3 +208,4 @@ shared across all guest operations, eliminating code duplication:
 | `raw` | MBR/GPT partition table detection | info |
 | `vmdk` | VMDK4 binary header parsing, descriptor I/O and text parsing, grain directory/table reading, streamOptimized footer/marker handling, write helpers | info, check, convert |
 | `vhd` | VHD/VPC footer and dynamic header parsing, BAT reading with sector-cached lookups, block-level data access, write helpers (footer, dynamic header, geometry) | info, check, compare, convert |
+| `vhdx` | VHDX header/region table/metadata parsing with CRC-32C validation, GUID-based metadata lookup, 64-bit BAT reading with interleaved SB entries, output builders (file identifier, headers, region table, metadata, BAT) | check, compare, convert |
