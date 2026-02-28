@@ -57,7 +57,7 @@ The `imago convert` operation supports writing output in the following formats:
 | **raw** (default) | Supported | Flat byte-for-byte output, sparse output with `-S` |
 | **qcow2** | Supported | QCOW2 v3, 16-bit refcounts, configurable cluster size (512B-64KB), optional zlib compression (`-c`) |
 | **vmdk** | Supported | monolithicSparse (default), streamOptimized with `-c` (DEFLATE compressed) |
-| vhd | Not yet | Planned: dynamic VHD with BAT writer |
+| **vpc** (VHD) | Supported | Dynamic VHD with 2 MiB blocks, BAT-based allocation, skip-zeros support |
 | vhdx | Not yet | Planned: VHDX with BAT, metadata, and log support |
 
 ### Input Format Support for Conversion
@@ -68,12 +68,15 @@ The `imago convert` operation supports writing output in the following formats:
 | qcow2 (v2/v3) | Supported | Including compressed clusters (zlib and ZSTD), extended L2 entries, backing chain flattening |
 | vmdk (monolithicSparse) | Supported | Grain directory/table two-level lookup, sector-cached reads |
 | vmdk (streamOptimized) | Supported | DEFLATE decompression, footer-based GD offset resolution |
-| vhd/vhdx | Not yet | Needs BAT reader |
+| vhd (fixed) | Supported | Raw sector reads with footer validation |
+| vhd (dynamic) | Supported | BAT-based block lookup, sector-cached reads |
 
 ### Limitations
 
-- Input cluster sizes above 64KB are not supported (affects both convert and
-  compare). The `debian-12-sfagent` image (2MB clusters) is skipped in tests.
+- Compressed clusters with cluster sizes above 64KB cannot be decompressed
+  (decompression buffer limited to 64KB). Uncompressed clusters up to 2MB are
+  fully supported. The `debian-12-sfagent` image (2MB clusters with 692
+  compressed clusters) is skipped in convert/compare tests for this reason.
 - Encrypted QCOW2 images are not supported.
 - Extended L2 images with partially-allocated subclusters may return stale host
   data for unallocated subclusters. The extended L2 support reads only the first
@@ -140,7 +143,7 @@ The `imago convert` operation supports writing output in the following formats:
 | LUKS | Version check (only v1) | Rejects v2+ | Detects format, version |
 | VDI | None | Pass-through | Detects format, UUID |
 | ISO | None | Pass-through | Detects format* |
-| VHD | None | Pass-through | Detects creator app |
+| VHD | None | Pass-through | Detects creator app; full check validation (footer/header checksums, BAT bounds, overlap detection) |
 | VHDX | None | Pass-through | Detects block size |
 
 ---
@@ -311,6 +314,17 @@ The `imago convert` operation supports writing output in the following formats:
     validation, grain overlap detection (1-bit-per-grain bitmap in scratch
     memory), streamOptimized footer validation, multi-extent detection via
     descriptor parsing, fragmentation measurement.
+
+12. **VHD Input/Output Support** - Convert supports VHD as both input and
+    output format. Input: fixed VHD (raw sector reads) and dynamic VHD
+    (BAT-based block lookup). Output: dynamic VHD with 2 MiB blocks,
+    sector bitmaps, and skip-zeros support.
+
+13. **VHD Structural Integrity Check** - Full BAT validation in check
+    operation: footer cookie and checksum validation, dynamic header
+    cookie and checksum validation, BAT offset and entry bounds checking,
+    overlap detection (1-bit-per-block bitmap in scratch memory), footer
+    copy consistency (start vs end of file).
 
 ### Detections to Add
 

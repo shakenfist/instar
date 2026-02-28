@@ -203,6 +203,16 @@ pub unsafe extern "C" fn _start() -> u64 {
                 )
             }
         }
+        ImageFormat::Vhd => convert_to_vhd(
+            call_table,
+            chain_config,
+            &mut chain_states,
+            input_device_count,
+            virtual_size,
+            sector_size,
+            skip_zeros,
+            &mut bytes_read,
+        ),
         _ => convert_to_raw(
             call_table,
             chain_config,
@@ -1945,6 +1955,416 @@ unsafe fn convert_to_vmdk_compressed(
 
     (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, true);
     (call_table.verbose_print)(b"convert: done\n\0".as_ptr());
+    *bytes_read
+}
+
+// ================================================================
+// VHD output path
+// ================================================================
+
+/// Convert input to VHD dynamic format.
+///
+/// Layout:
+/// ```text
+/// [0]        Footer copy (512 bytes, padded to output sector)
+/// [oss]      Dynamic header (1024 bytes, padded to output sector)
+/// [bat_off]  BAT (max_table_entries × 4, padded to output sector)
+/// [data]     Block data: sector bitmap + block_size per block
+/// [EOF-oss]  Footer (512 bytes, padded to output sector)
+/// ```
+///
+/// Blocks are written sequentially. The BAT is written as all-
+/// unallocated initially, then rewritten with actual offsets after
+/// all blocks are emitted.
+#[allow(clippy::too_many_arguments)]
+unsafe fn convert_to_vhd(
+    call_table: &CallTable,
+    chain_config: &ChainConfig,
+    chain_states: &mut qcow2::ChainStates,
+    input_device_count: usize,
+    virtual_size: u64,
+    sector_size: usize,
+    skip_zeros: bool,
+    bytes_read: &mut u64,
+) -> u64 {
+    let oss = (call_table.get_output_sector_size)();
+    let oc = (call_table.get_output_capacity)();
+    let progress_interval = (call_table.get_progress_interval)();
+
+    let block_size = vhd::DEFAULT_BLOCK_SIZE as u64; // 2 MiB
+    let max_table_entries = ((virtual_size + block_size - 1) / block_size) as u32;
+
+    // Sector bitmap: ceil(block_size / 512 / 8) rounded up to 512
+    let sectors_per_block = block_size / 512;
+    let bitmap_bytes = ((sectors_per_block + 7) / 8 + 511) & !511;
+
+    // Layout offsets (all aligned to output sector size)
+    let footer_copy_offset: u64 = 0;
+    let dyn_header_offset = align_up(vhd::FOOTER_SIZE as u64, oss);
+    let bat_offset = align_up(dyn_header_offset + vhd::DYNAMIC_HEADER_SIZE as u64, oss);
+    let bat_size_bytes = max_table_entries as u64 * 4;
+    let bat_padded = align_up(bat_size_bytes, oss);
+    let data_start = bat_offset + bat_padded;
+
+    // BAT buffer — allocate after dynamic input caches
+    let bat_buf_addr = DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE;
+    let bat_alloc = align_up(bat_size_bytes, 8) as usize;
+
+    if bat_buf_addr + bat_alloc > ALLOC_HEAP_BASE {
+        (call_table.debug_print)(b"convert: VHD BAT too large for scratch\n\0".as_ptr());
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
+    }
+
+    let bat_buf = bat_buf_addr as *mut u8;
+    // Initialize all BAT entries to 0xFFFFFFFF (unallocated)
+    core::ptr::write_bytes(bat_buf, 0xFF, bat_alloc);
+
+    (call_table.verbose_print)(b"convert: starting VHD conversion\n\0".as_ptr());
+
+    // Generate a deterministic UUID from virtual_size
+    let mut uuid = [0u8; 16];
+    let size_bytes = virtual_size.to_le_bytes();
+    uuid[0..8].copy_from_slice(&size_bytes);
+    // Mark as UUID version 4, variant 1 for basic conformance
+    uuid[6] = (uuid[6] & 0x0F) | 0x40; // version 4
+    uuid[8] = (uuid[8] & 0x3F) | 0x80; // variant 1
+
+    // Write initial footer copy at offset 0
+    let buf_hdr = BUF_HEADER as *mut u8;
+    core::ptr::write_bytes(buf_hdr, 0, oss);
+    let footer_slice = core::slice::from_raw_parts_mut(buf_hdr, vhd::FOOTER_SIZE);
+    vhd::build_footer(
+        footer_slice,
+        virtual_size,
+        vhd::DISK_TYPE_DYNAMIC,
+        dyn_header_offset,
+        &uuid,
+    );
+    if !write_bytes_to_output(
+        call_table,
+        buf_hdr,
+        footer_copy_offset,
+        align_up(vhd::FOOTER_SIZE as u64, oss),
+        oss,
+        oc,
+    ) {
+        (call_table.send_error)(b"convert\0".as_ptr(), b"output\0".as_ptr(), 0, 2);
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
+    }
+
+    // Write dynamic header
+    core::ptr::write_bytes(buf_hdr, 0, oss);
+    let dyn_slice = core::slice::from_raw_parts_mut(buf_hdr, vhd::DYNAMIC_HEADER_SIZE);
+    vhd::build_dynamic_header(dyn_slice, bat_offset, max_table_entries, block_size as u32);
+    if !write_bytes_to_output(
+        call_table,
+        buf_hdr,
+        dyn_header_offset,
+        align_up(vhd::DYNAMIC_HEADER_SIZE as u64, oss),
+        oss,
+        oc,
+    ) {
+        (call_table.send_error)(
+            b"convert\0".as_ptr(),
+            b"output\0".as_ptr(),
+            dyn_header_offset / oss as u64,
+            2,
+        );
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
+    }
+
+    // Write placeholder BAT (all 0xFFFFFFFF)
+    // Write in output-sector-sized chunks
+    let bat_write_buf = BUF_L2_OUT as *mut u8;
+    let mut bat_written: u64 = 0;
+    while bat_written < bat_padded {
+        core::ptr::write_bytes(bat_write_buf, 0xFF, oss);
+        if !write_bytes_to_output(
+            call_table,
+            bat_write_buf,
+            bat_offset + bat_written,
+            oss as u64,
+            oss,
+            oc,
+        ) {
+            (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+            return *bytes_read;
+        }
+        bat_written += oss as u64;
+    }
+
+    // Write block data
+    let buf_data = BUF_DATA as *mut u8;
+    let mut next_free_byte = data_start;
+    let mut blocks_done: u64 = 0;
+    let total_blocks = max_table_entries as u64;
+    let mut last_percent: u32 = 0;
+
+    // Prepare a sector bitmap with all bits set (all sectors present)
+    // Reuse BUF_REFCOUNT for bitmap
+    let bitmap_buf = BUF_REFCOUNT as *mut u8;
+    core::ptr::write_bytes(bitmap_buf, 0xFF, bitmap_bytes as usize);
+
+    for block_idx in 0..max_table_entries {
+        let virtual_offset = block_idx as u64 * block_size;
+        let remaining = virtual_size - virtual_offset;
+        let this_block = if remaining < block_size {
+            remaining
+        } else {
+            block_size
+        };
+
+        // Reset bump allocator before ZSTD decompression
+        HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
+
+        // Read input data (block_size may be > MAX_SECTOR_SIZE,
+        // so read in chunks)
+        let mut block_all_zeros = true;
+        let chunk_size = MAX_SECTOR_SIZE as u64;
+        let mut intra_offset: u64 = 0;
+
+        // First pass: check if entire block is zeros
+        while intra_offset < this_block {
+            let chunk_remaining = this_block - intra_offset;
+            let this_chunk = if chunk_remaining < chunk_size {
+                chunk_remaining
+            } else {
+                chunk_size
+            };
+
+            HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
+
+            if !qcow2::read_chain_virtual_cluster(
+                call_table,
+                0,
+                input_device_count,
+                virtual_offset + intra_offset,
+                buf_data,
+                this_chunk,
+                sector_size,
+                chain_config,
+                chain_states,
+                BUF_COMPRESSED_IN as *mut u8,
+                bytes_read,
+            ) {
+                (call_table.send_error)(
+                    b"convert\0".as_ptr(),
+                    b"input\0".as_ptr(),
+                    (virtual_offset + intra_offset) / sector_size as u64,
+                    1,
+                );
+                (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+                return *bytes_read;
+            }
+
+            if !is_all_zeros_ptr(buf_data, this_chunk as usize) {
+                block_all_zeros = false;
+            }
+
+            intra_offset += this_chunk;
+        }
+
+        // Skip zero blocks when configured
+        if skip_zeros && block_all_zeros {
+            blocks_done += 1;
+            let pct = (blocks_done * 100 / total_blocks) as u32;
+            if should_report_progress(progress_interval, pct, last_percent, blocks_done) {
+                (call_table.send_progress)(b"convert\0".as_ptr(), blocks_done, total_blocks, pct);
+                last_percent = pct;
+            }
+            continue;
+        }
+
+        // Allocate block: sector bitmap + data
+        let block_byte_offset = align_up(next_free_byte, 512);
+        let block_total = bitmap_bytes + block_size;
+        next_free_byte = block_byte_offset + block_total;
+
+        // Record BAT entry (absolute sector in 512-byte sectors)
+        let bat_slice = core::slice::from_raw_parts_mut(bat_buf, bat_alloc);
+        vhd::write_be_u32(
+            bat_slice,
+            block_idx as usize * 4,
+            (block_byte_offset / 512) as u32,
+        );
+
+        // Write sector bitmap (all 1s)
+        if !write_bytes_to_output(
+            call_table,
+            bitmap_buf,
+            block_byte_offset,
+            bitmap_bytes,
+            oss,
+            oc,
+        ) {
+            (call_table.send_error)(
+                b"convert\0".as_ptr(),
+                b"output\0".as_ptr(),
+                block_byte_offset / oss as u64,
+                2,
+            );
+            (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+            return *bytes_read;
+        }
+
+        // Write block data in chunks
+        let data_byte_offset = block_byte_offset + bitmap_bytes;
+        intra_offset = 0;
+        while intra_offset < this_block {
+            let chunk_remaining = this_block - intra_offset;
+            let this_chunk = if chunk_remaining < chunk_size {
+                chunk_remaining
+            } else {
+                chunk_size
+            };
+
+            HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
+
+            if !qcow2::read_chain_virtual_cluster(
+                call_table,
+                0,
+                input_device_count,
+                virtual_offset + intra_offset,
+                buf_data,
+                this_chunk,
+                sector_size,
+                chain_config,
+                chain_states,
+                BUF_COMPRESSED_IN as *mut u8,
+                bytes_read,
+            ) {
+                (call_table.send_error)(
+                    b"convert\0".as_ptr(),
+                    b"input\0".as_ptr(),
+                    (virtual_offset + intra_offset) / sector_size as u64,
+                    1,
+                );
+                (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+                return *bytes_read;
+            }
+
+            // Zero-pad partial final chunk
+            if this_chunk < chunk_size {
+                core::ptr::write_bytes(
+                    buf_data.add(this_chunk as usize),
+                    0,
+                    (chunk_size - this_chunk) as usize,
+                );
+            }
+
+            if !write_bytes_to_output(
+                call_table,
+                buf_data,
+                data_byte_offset + intra_offset,
+                this_chunk,
+                oss,
+                oc,
+            ) {
+                (call_table.send_error)(
+                    b"convert\0".as_ptr(),
+                    b"output\0".as_ptr(),
+                    (data_byte_offset + intra_offset) / oss as u64,
+                    2,
+                );
+                (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+                return *bytes_read;
+            }
+
+            intra_offset += this_chunk;
+        }
+
+        // Zero-pad remaining block data if this_block < block_size
+        if this_block < block_size {
+            let pad_start = data_byte_offset + this_block;
+            let pad_len = block_size - this_block;
+            let mut pad_written: u64 = 0;
+            core::ptr::write_bytes(buf_data, 0, chunk_size as usize);
+            while pad_written < pad_len {
+                let write_len = if pad_len - pad_written < chunk_size {
+                    pad_len - pad_written
+                } else {
+                    chunk_size
+                };
+                if !write_bytes_to_output(
+                    call_table,
+                    buf_data,
+                    pad_start + pad_written,
+                    write_len,
+                    oss,
+                    oc,
+                ) {
+                    (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+                    return *bytes_read;
+                }
+                pad_written += write_len;
+            }
+        }
+
+        blocks_done += 1;
+        let pct = (blocks_done * 100 / total_blocks) as u32;
+        if should_report_progress(progress_interval, pct, last_percent, blocks_done) {
+            (call_table.send_progress)(b"convert\0".as_ptr(), blocks_done, total_blocks, pct);
+            last_percent = pct;
+        }
+    }
+
+    // Rewrite BAT with actual offsets
+    let mut bat_rewritten: u64 = 0;
+    while bat_rewritten < bat_padded {
+        let write_len = oss as u64;
+        // Copy from BAT buffer to write buffer
+        let src_off = bat_rewritten as usize;
+        let copy_len = if src_off + oss <= bat_alloc {
+            oss
+        } else {
+            bat_alloc - src_off
+        };
+        core::ptr::write_bytes(bat_write_buf, 0xFF, oss);
+        if copy_len > 0 {
+            core::ptr::copy_nonoverlapping(bat_buf.add(src_off), bat_write_buf, copy_len);
+        }
+        if !write_bytes_to_output(
+            call_table,
+            bat_write_buf,
+            bat_offset + bat_rewritten,
+            write_len,
+            oss,
+            oc,
+        ) {
+            (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+            return *bytes_read;
+        }
+        bat_rewritten += write_len;
+    }
+
+    // Write final footer at end of file
+    let footer_end_offset = align_up(next_free_byte, oss);
+    core::ptr::write_bytes(buf_hdr, 0, oss);
+    let footer_slice = core::slice::from_raw_parts_mut(buf_hdr, vhd::FOOTER_SIZE);
+    vhd::build_footer(
+        footer_slice,
+        virtual_size,
+        vhd::DISK_TYPE_DYNAMIC,
+        dyn_header_offset,
+        &uuid,
+    );
+    if !write_bytes_to_output(
+        call_table,
+        buf_hdr,
+        footer_end_offset,
+        align_up(vhd::FOOTER_SIZE as u64, oss),
+        oss,
+        oc,
+    ) {
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
+    }
+
+    (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, true);
+    (call_table.verbose_print)(b"convert: VHD done\n\0".as_ptr());
     *bytes_read
 }
 

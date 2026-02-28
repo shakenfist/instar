@@ -9,6 +9,7 @@ license = "Apache-2.0"
 shared = { path = "../../shared" }
 qcow2 = { path = "../../crates/qcow2" }
 vmdk = { path = "../../crates/vmdk" }
+vhd = { path = "../../crates/vhd" }
 
 [profile.release]
 panic = "abort"

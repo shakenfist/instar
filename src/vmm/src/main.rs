@@ -1849,7 +1849,7 @@ struct ConvertArgs {
     /// Output image file
     output: String,
 
-    /// Output format ("raw", "qcow2", or "vmdk")
+    /// Output format ("raw", "qcow2", "vmdk", or "vpc")
     #[arg(short = 'O', long = "output-format", default_value = "raw")]
     output_format: String,
 
@@ -3743,10 +3743,11 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         "raw" => 1u32,   // ImageFormat::Raw
         "qcow2" => 2u32, // ImageFormat::Qcow2
         "vmdk" => 3u32,  // ImageFormat::Vmdk4
+        "vpc" => 5u32,   // ImageFormat::Vhd
         other => {
             return Err(format!(
                 "unsupported output format '{}' \
-                 (supported: 'raw', 'qcow2', 'vmdk')",
+                 (supported: 'raw', 'qcow2', 'vmdk', 'vpc')",
                 other
             )
             .into());
