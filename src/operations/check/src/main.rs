@@ -240,10 +240,6 @@ fn detect_qcow2_only(buffer: &[u8], len: usize) -> ImageFormat {
     ImageFormat::Raw
 }
 
-// VHDX region table offset and signature
-const VHDX_REGION_TABLE_OFFSET: u64 = 0x30000;
-const VHDX_REGION_TABLE_SIG: u32 = 0x69676572; // "regi"
-
 /// Read the GD offset from a streamOptimized VMDK footer.
 ///
 /// The footer is a copy of the VMDK4 header located at EOF - 1024
@@ -788,10 +784,19 @@ unsafe fn check_vmdk(
     bytes_read
 }
 
-/// Check VHDX image integrity
+/// Check VHDX image integrity.
 ///
 /// Validates:
-/// - Region table signature at offset 0x30000
+/// - Header 1 and Header 2: signature, CRC-32C checksum, active header
+///   selection via sequence_number
+/// - Dirty log detection (non-zero log_guid in active header)
+/// - Region table 1: signature, CRC-32C, entry count, BAT/metadata
+///   region presence
+/// - Metadata: table signature, required items (FileParameters,
+///   VirtualDiskSize, LogicalSectorSize, PhysicalSectorSize)
+/// - Differencing disk detection (has_parent → unsupported)
+/// - BAT entries: allocated block offsets within file bounds, 1MB
+///   alignment, overlap detection via BitmapContext
 unsafe fn check_vhdx(
     result: &mut CheckResult,
     call_table: &CallTable,
@@ -799,50 +804,394 @@ unsafe fn check_vhdx(
     actual_size: u64,
 ) -> u64 {
     let mut bytes_read: u64 = 0;
-
-    // Check if file is large enough for region table
-    if actual_size < VHDX_REGION_TABLE_OFFSET + 4096 {
-        result.corruptions += 1;
-        result.total_errors += 1;
-        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
-        return bytes_read;
-    }
-
-    // Read region table
-    let mut buffer = [0u8; MAX_SECTOR_SIZE];
-    let region_table_sector = VHDX_REGION_TABLE_OFFSET / sector_size as u64;
     let input_capacity = (call_table.get_input_capacity)(0);
 
-    // Validate sector is within file bounds before reading
-    if region_table_sector >= input_capacity {
+    // Need at least space for region table 1 + region table size
+    if actual_size < vhdx::REGION_TABLE1_OFFSET + 65536 {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+        (call_table.debug_print)(b"check: VHDX too small for headers\n\0".as_ptr());
+        return bytes_read;
+    }
+
+    // --- Validate headers ---
+    // Read and validate Header 1 (0x10000)
+    let header1 = read_vhdx_header(
+        call_table,
+        vhdx::HEADER1_OFFSET,
+        sector_size,
+        input_capacity,
+        &mut bytes_read,
+    );
+    // Read and validate Header 2 (0x20000)
+    let header2 = read_vhdx_header(
+        call_table,
+        vhdx::HEADER2_OFFSET,
+        sector_size,
+        input_capacity,
+        &mut bytes_read,
+    );
+
+    let header = match (&header1, &header2) {
+        (Some(h1), Some(h2)) => {
+            if h1.sequence_number >= h2.sequence_number {
+                h1
+            } else {
+                h2
+            }
+        }
+        (Some(h1), None) => {
+            // Header 2 is invalid — warn but continue with header 1
+            result.corruptions += 1;
+            result.total_errors += 1;
+            (call_table.debug_print)(b"check: VHDX header 2 invalid\n\0".as_ptr());
+            h1
+        }
+        (None, Some(h2)) => {
+            // Header 1 is invalid — warn but continue with header 2
+            result.corruptions += 1;
+            result.total_errors += 1;
+            (call_table.debug_print)(b"check: VHDX header 1 invalid\n\0".as_ptr());
+            h2
+        }
+        (None, None) => {
+            result.corruptions += 1;
+            result.total_errors += 1;
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+            (call_table.debug_print)(b"check: both VHDX headers invalid\n\0".as_ptr());
+            return bytes_read;
+        }
+    };
+
+    // Dirty log detection
+    if header.log_guid != [0u8; 16] {
+        result.flags |= CheckResult::FLAG_DIRTY;
+        (call_table.debug_print)(b"check: VHDX has dirty log\n\0".as_ptr());
+    }
+
+    // --- Validate region table 1 ---
+    // Read the full 64KB region table for CRC-32C validation.
+    // We read it in 64KB/sector_size chunks into scratch memory.
+    let rt_start_sector = vhdx::REGION_TABLE1_OFFSET / sector_size as u64;
+    let rt_sectors = 65536 / sector_size;
+
+    // Use scratch memory for the 64KB region table
+    let rt_buf = shared::SCRATCH_MEM_BASE as *mut u8;
+    if shared::SCRATCH_MEM_BASE + 65536 > shared::ALLOC_HEAP_BASE {
+        // Not enough scratch memory
+        result.corruptions += 1;
+        result.total_errors += 1;
+        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+        (call_table.debug_print)(b"check: not enough scratch for VHDX RT\n\0".as_ptr());
+        return bytes_read;
+    }
+
+    for i in 0..rt_sectors {
+        let sector = rt_start_sector + i as u64;
+        if sector >= input_capacity {
+            result.corruptions += 1;
+            result.total_errors += 1;
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+            return bytes_read;
+        }
+        if !(call_table.read_input_sector)(0, sector, rt_buf.add(i * sector_size), sector_size) {
+            result.corruptions += 1;
+            result.total_errors += 1;
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+            return bytes_read;
+        }
+        bytes_read += sector_size as u64;
+    }
+
+    let rt_slice = core::slice::from_raw_parts(rt_buf, 65536);
+    let (regions, _entry_count) = match vhdx::parse_region_table(rt_slice) {
+        Some(r) => r,
+        None => {
+            result.corruptions += 1;
+            result.total_errors += 1;
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+            (call_table.debug_print)(b"check: VHDX region table invalid\n\0".as_ptr());
+            return bytes_read;
+        }
+    };
+
+    // regions[0] = BAT, regions[1] = Metadata
+    let bat_offset = regions[0].file_offset;
+    let bat_length = regions[0].length;
+    let metadata_offset = regions[1].file_offset;
+
+    // Validate region offsets are within file
+    if bat_offset >= actual_size || metadata_offset >= actual_size {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+        (call_table.debug_print)(b"check: VHDX region offset out of bounds\n\0".as_ptr());
+        return bytes_read;
+    }
+
+    // Validate region offsets are 1MB-aligned
+    if bat_offset % vhdx::MB_ALIGN != 0 || metadata_offset % vhdx::MB_ALIGN != 0 {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        (call_table.debug_print)(b"check: VHDX region not 1MB-aligned\n\0".as_ptr());
+    }
+
+    // --- Validate metadata ---
+    let metadata = match vhdx::parse_metadata(
+        call_table,
+        0,
+        metadata_offset,
+        sector_size,
+        input_capacity,
+        &mut bytes_read,
+    ) {
+        Some(m) => m,
+        None => {
+            result.corruptions += 1;
+            result.total_errors += 1;
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+            (call_table.debug_print)(b"check: VHDX metadata invalid\n\0".as_ptr());
+            return bytes_read;
+        }
+    };
+
+    // Check for differencing disk
+    if metadata.has_parent {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+        (call_table.debug_print)(b"check: VHDX differencing disk unsupported\n\0".as_ptr());
+        return bytes_read;
+    }
+
+    // Validate sector sizes
+    if metadata.logical_sector_size != 512 && metadata.logical_sector_size != 4096 {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        (call_table.debug_print)(b"check: VHDX invalid logical sector size\n\0".as_ptr());
+    }
+
+    // --- Validate BAT ---
+    let block_size = metadata.block_size;
+    let virtual_disk_size = metadata.virtual_disk_size;
+    let logical_sector_size = metadata.logical_sector_size;
+
+    // Calculate chunk_ratio
+    let chunk_ratio = if block_size > 0 && logical_sector_size > 0 {
+        ((1u64 << 23) * logical_sector_size as u64) / block_size as u64
+    } else {
         result.corruptions += 1;
         result.total_errors += 1;
         result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
         return bytes_read;
-    }
+    };
 
-    if !(call_table.read_input_sector)(0, region_table_sector, buffer.as_mut_ptr(), sector_size) {
+    if chunk_ratio == 0 {
         result.corruptions += 1;
         result.total_errors += 1;
+        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+        (call_table.debug_print)(b"check: VHDX chunk ratio is zero\n\0".as_ptr());
         return bytes_read;
     }
-    bytes_read += sector_size as u64;
 
-    let offset_in_sector = (VHDX_REGION_TABLE_OFFSET % sector_size as u64) as usize;
-    let region_sig = u32::from_le_bytes([
-        buffer[offset_in_sector],
-        buffer[offset_in_sector + 1],
-        buffer[offset_in_sector + 2],
-        buffer[offset_in_sector + 3],
-    ]);
+    // Calculate total BAT entries (payload + interleaved SB entries)
+    let total_payload_blocks = virtual_disk_size.div_ceil(block_size as u64);
+    let sb_entries = total_payload_blocks.div_ceil(chunk_ratio);
+    let total_bat_entries = total_payload_blocks + sb_entries;
 
-    if region_sig != VHDX_REGION_TABLE_SIG {
+    // Validate BAT region can hold all entries
+    let needed_bat_bytes = total_bat_entries * 8;
+    if needed_bat_bytes > bat_length as u64 {
         result.corruptions += 1;
         result.total_errors += 1;
+        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+        (call_table.debug_print)(b"check: VHDX BAT region too small\n\0".as_ptr());
+        return bytes_read;
+    }
+
+    // Set up overlap detection bitmap.
+    // Each slot represents one block_size worth of file space in MB units.
+    let total_file_mb = actual_size.div_ceil(vhdx::MB_ALIGN);
+    let block_mb = (block_size as u64).div_ceil(vhdx::MB_ALIGN);
+    let total_block_slots = if block_mb > 0 {
+        total_file_mb.div_ceil(block_mb)
+    } else {
+        0
+    };
+    let bmp = BitmapContext::init_in_scratch(total_block_slots);
+
+    // Set up cached BAT read
+    shared::cached_read!(read_u64_le_cached, u64, le, 8);
+
+    let bat_cache_start = shared::SCRATCH_MEM_BASE + bmp.size;
+    let bat_cache_buf = bat_cache_start as *mut u8;
+    // Verify we have room for the cache buffer
+    if bat_cache_start + MAX_SECTOR_SIZE > shared::ALLOC_HEAP_BASE {
+        // Not enough memory for BAT cache; skip BAT validation
+        if result.corruptions > 0 {
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+        }
+        return bytes_read;
+    }
+
+    let mut bat_cached_sector: u64 = u64::MAX;
+    let mut allocated_blocks: u64 = 0;
+    let mut payload_block_idx: u64 = 0;
+
+    for bat_idx in 0..total_bat_entries {
+        // Determine if this is a sector bitmap entry (skip it)
+        // SB entries appear at indices: chunk_ratio, 2*chunk_ratio+1,
+        // 3*chunk_ratio+2, etc.
+        // A payload block's BAT index = payload_block_idx +
+        //     (payload_block_idx / chunk_ratio)
+        // If bat_idx doesn't match the next expected payload index,
+        // it's a SB entry.
+        let expected_payload_bat_idx = payload_block_idx + (payload_block_idx / chunk_ratio);
+        if bat_idx != expected_payload_bat_idx {
+            // This is a sector bitmap entry; skip it
+            continue;
+        }
+
+        // This is a payload BAT entry
+        let bat_byte_offset = bat_offset + bat_idx * 8;
+
+        let bat_entry = match read_u64_le_cached(
+            call_table,
+            0,
+            bat_byte_offset,
+            sector_size,
+            input_capacity,
+            &mut bat_cached_sector,
+            bat_cache_buf,
+            &mut bytes_read,
+        ) {
+            Some(v) => v,
+            None => {
+                result.corruptions += 1;
+                result.total_errors += 1;
+                (call_table.debug_print)(b"check: VHDX BAT read failed\n\0".as_ptr());
+                payload_block_idx += 1;
+                continue;
+            }
+        };
+
+        let state = bat_entry & vhdx::BAT_ENTRY_STATE_MASK;
+        let file_offset = bat_entry & vhdx::BAT_ENTRY_OFFSET_MASK;
+
+        match state {
+            vhdx::PAYLOAD_BLOCK_NOT_PRESENT
+            | vhdx::PAYLOAD_BLOCK_ZERO
+            | vhdx::PAYLOAD_BLOCK_UNMAPPED
+            | vhdx::PAYLOAD_BLOCK_UNDEFINED => {
+                // Unallocated or zero; no host offset to validate
+            }
+            vhdx::PAYLOAD_BLOCK_FULLY_PRESENT => {
+                allocated_blocks += 1;
+
+                // Validate offset is within file bounds
+                let block_end = file_offset + block_size as u64;
+                if block_end > actual_size {
+                    result.corruptions += 1;
+                    result.total_errors += 1;
+                    (call_table.debug_print)(
+                        b"check: VHDX block offset out of bounds\n\0".as_ptr(),
+                    );
+                    payload_block_idx += 1;
+                    continue;
+                }
+
+                // Validate 1MB alignment
+                if file_offset % vhdx::MB_ALIGN != 0 {
+                    result.corruptions += 1;
+                    result.total_errors += 1;
+                    (call_table.debug_print)(b"check: VHDX block not 1MB-aligned\n\0".as_ptr());
+                }
+
+                // Overlap detection
+                if bmp.can_track && block_mb > 0 {
+                    let slot = file_offset / (block_mb * vhdx::MB_ALIGN);
+                    match bmp.set(slot) {
+                        BitmapSetResult::AlreadySet => {
+                            result.corruptions += 1;
+                            result.total_errors += 1;
+                            (call_table.debug_print)(
+                                b"check: VHDX overlapping blocks\n\0".as_ptr(),
+                            );
+                        }
+                        BitmapSetResult::NewBit => {}
+                        BitmapSetResult::BeyondCapacity => {}
+                    }
+                }
+            }
+            vhdx::PAYLOAD_BLOCK_PARTIALLY_PRESENT => {
+                // Only valid for differencing disks, which we rejected
+                result.corruptions += 1;
+                result.total_errors += 1;
+                (call_table.debug_print)(b"check: VHDX partially present in non-diff\n\0".as_ptr());
+            }
+            _ => {
+                // Unknown BAT entry state
+                result.corruptions += 1;
+                result.total_errors += 1;
+                (call_table.debug_print)(b"check: VHDX unknown BAT entry state\n\0".as_ptr());
+            }
+        }
+
+        payload_block_idx += 1;
+    }
+
+    result.clusters_allocated = allocated_blocks;
+    result.clusters_checked = total_payload_blocks;
+
+    if result.corruptions > 0 {
         result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
     }
 
     bytes_read
+}
+
+/// Read and validate a VHDX header at the given byte offset.
+///
+/// Returns `Some(VhdxHeader)` if valid (signature + CRC-32C match),
+/// `None` otherwise. Reads the full 4KB header.
+unsafe fn read_vhdx_header(
+    call_table: &CallTable,
+    header_offset: u64,
+    sector_size: usize,
+    input_capacity: u64,
+    bytes_read: &mut u64,
+) -> Option<vhdx::VhdxHeader> {
+    // The header is 4KB. Read enough sectors to cover it.
+    let start_sector = header_offset / sector_size as u64;
+    let sectors_needed = vhdx::HEADER_SIZE.div_ceil(sector_size);
+
+    // Use a stack buffer — 4KB is enough for the header
+    let mut header_buf = [0u8; vhdx::HEADER_SIZE];
+
+    for i in 0..sectors_needed {
+        let sector = start_sector + i as u64;
+        if sector >= input_capacity {
+            return None;
+        }
+        // Read into the appropriate offset in header_buf
+        let buf_offset = i * sector_size;
+        let remaining = vhdx::HEADER_SIZE - buf_offset;
+        let copy_len = if remaining < sector_size {
+            remaining
+        } else {
+            sector_size
+        };
+        // We need a sector-aligned temporary buffer for the read
+        let mut tmp = [0u8; MAX_SECTOR_SIZE];
+        if !(call_table.read_input_sector)(0, sector, tmp.as_mut_ptr(), sector_size) {
+            return None;
+        }
+        *bytes_read += sector_size as u64;
+        header_buf[buf_offset..buf_offset + copy_len].copy_from_slice(&tmp[..copy_len]);
+    }
+
+    vhdx::VhdxHeader::parse(&header_buf)
 }
 
 /// Check VHD image integrity.
