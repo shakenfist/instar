@@ -2553,3 +2553,12 @@ class TestConvertVmdkCheckOutput(ImagoTestBase):
     def test_check_vmdk_to_vmdk_output(self):
         """Check imago VMDK output from VMDK input."""
         self._test_vmdk_output_check('plaso-vmdk')
+
+
+# TODO: Add VHD integration tests matching VMDK coverage above:
+#   - TestConvertVhdToRaw: VHD->raw conversion cross-validated with qemu-img
+#   - TestConvertToVhd: raw/qcow2/vhd->VHD round-trip (raw->VHD->raw)
+#   - TestConvertVhdToQcow2Roundtrip: VHD->QCOW2->raw round-trip
+#   - TestConvertVhdCheckOutput: imago check on imago-produced VHD files
+#   - TestConvertVhdCompare: VHD vs raw comparison via imago compare
+# Test images available: hyperv-dynamic-vhd, virtualpc-vhd, vhd-d2v-zerofilled

@@ -156,21 +156,29 @@ provides a modular architecture with:
   grain marker handling, and write helpers for monolithicSparse and
   streamOptimized output. Used by info, check, convert, and compare
   operations.
+- **crates/vhd/** - Shared VHD/VPC format crate: footer parsing and
+  validation (conectix cookie, CHS geometry, disk type), dynamic header
+  parsing (cxsparse cookie, BAT offset, block size), BAT reading with
+  sector-cached lookups, block-level data access via BlockLookup enum,
+  VhdState for stateful block I/O, and write helpers (build_footer,
+  build_dynamic_header, compute_vhd_geometry). Used by info, check,
+  convert, and compare operations.
 - **operations/info/** - Format detection operation
 - **operations/copy/** - File copy operation
 - **operations/check/** - Image integrity validation operation (with
   optional `--chain` backing chain validation)
 - **operations/compare/** - Image comparison operation (format-aware virtual
-  content comparison between two images, supporting raw-vs-raw, QCOW2-vs-raw,
-  and QCOW2-vs-QCOW2 including compressed clusters and backing chain
-  flattening)
-- **operations/convert/** - Image conversion operation (any input to raw or
-  QCOW2 v3 output, with backing chain flattening and compressed cluster
-  decompression). QCOW2 writer uses linear cluster allocation with
-  OFLAG_COPIED, 16-bit refcounts, and iterative convergence for refcount
-  metadata sizing. Optional compressed output (`-c` flag) packs clusters
-  at sector granularity using raw deflate (via miniz_oxide), with fallback
-  to uncompressed for incompressible data.
+  content comparison between two images, supporting raw, QCOW2, VMDK, and
+  VHD inputs including compressed clusters and backing chain flattening)
+- **operations/convert/** - Image conversion operation (any input to raw,
+  QCOW2 v3, VMDK, or VHD output, with backing chain flattening and
+  compressed cluster decompression). QCOW2 writer uses linear cluster
+  allocation with OFLAG_COPIED, 16-bit refcounts, and iterative
+  convergence for refcount metadata sizing. Optional compressed output
+  (`-c` flag) packs clusters at sector granularity using raw deflate
+  (via miniz_oxide), with fallback to uncompressed for incompressible
+  data. VHD writer emits dynamic VHD with 2 MiB blocks, sector bitmaps,
+  and BAT rewriting.
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation)
@@ -252,6 +260,18 @@ The check operation performs full structural validation: grain directory
 and grain table walk, grain offset bounds checking, overlap detection
 via 1-bit-per-grain bitmap, streamOptimized footer validation, and
 multi-extent detection.
+
+### vhd
+
+Microsoft Virtual Hard Disk. Supported sub-formats:
+- Fixed (type 2): raw data with 512-byte footer appended
+- Dynamic (type 3): BAT-based block allocation with 2 MiB blocks (input,
+  output, check)
+
+The check operation performs full structural validation: footer cookie
+and checksum, dynamic header cookie and checksum, BAT offset and entry
+bounds checking, overlap detection via 1-bit-per-block bitmap, and
+footer copy consistency (start vs end of file).
 
 ## Open Questions
 

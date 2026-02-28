@@ -25,6 +25,8 @@ use shared::{
     l1_cache_addr, l2_cache_addr, BackingFormat, CallTable, ChainConfig, ImageFormat,
     MAX_CHAIN_DEVICES, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE,
 };
+#[cfg(feature = "vhd-input")]
+use vhd::{BlockLookup, VhdState};
 #[cfg(feature = "vmdk-input")]
 use vmdk::{GrainLookup, VmdkState};
 
@@ -1739,6 +1741,47 @@ pub unsafe fn read_chain_virtual_cluster(
                     None => return false,
                 }
             }
+            #[cfg(feature = "vhd-input")]
+            ImageFormat::Vhd => {
+                let state = match &mut chain_states.vhd_states[dev_idx] {
+                    Some(s) => s,
+                    None => return false,
+                };
+
+                if state.is_fixed() {
+                    // Fixed VHD: raw data from offset 0, read directly
+                    return read_raw_sectors(
+                        call_table,
+                        dev_idx as u32,
+                        virtual_offset,
+                        buf,
+                        chunk_size,
+                        sector_size,
+                        cap,
+                        bytes_read,
+                    );
+                }
+
+                match state.block_lookup(call_table, virtual_offset, sector_size, cap, bytes_read) {
+                    Some(BlockLookup::Unallocated) => {
+                        continue;
+                    }
+                    Some(BlockLookup::Allocated { host_byte_offset }) => {
+                        // host_byte_offset already includes the
+                        // intra-block offset from block_lookup()
+                        return read_cluster_sectors(
+                            call_table,
+                            dev_idx as u32,
+                            host_byte_offset,
+                            buf,
+                            chunk_size,
+                            sector_size,
+                            bytes_read,
+                        );
+                    }
+                    None => return false,
+                }
+            }
             _ => {
                 return read_raw_sectors(
                     call_table,
@@ -1807,21 +1850,25 @@ pub unsafe fn init_chain_qcow2_states(
 /// Bundled state for all format-specific chain readers.
 ///
 /// Holds per-device state arrays for each supported input format.
-/// VMDK state is feature-gated to avoid binary bloat when not needed.
-/// Each device in a chain uses at most one format's state slot.
+/// VMDK and VHD state is feature-gated to avoid binary bloat when
+/// not needed. Each device in a chain uses at most one format's
+/// state slot.
 #[derive(Default)]
 pub struct ChainStates {
     pub qcow2_states: [Option<Qcow2State>; MAX_CHAIN_DEVICES],
     #[cfg(feature = "vmdk-input")]
     pub vmdk_states: [Option<VmdkState>; MAX_CHAIN_DEVICES],
+    #[cfg(feature = "vhd-input")]
+    pub vhd_states: [Option<VhdState>; MAX_CHAIN_DEVICES],
 }
 
 /// Initialize format-specific state for all devices in a chain.
 ///
 /// Initializes QCOW2 state for QCOW2 devices, and (when the
-/// `vmdk-input` feature is enabled) VMDK state for VMDK4 devices.
-/// Each device reuses the same per-device cache memory region
-/// (2 × MAX_SECTOR_SIZE), since a device is never both QCOW2 and VMDK.
+/// respective features are enabled) VMDK state for VMDK4 devices
+/// and VHD state for VHD devices. Each device reuses the same
+/// per-device cache memory region (2 × MAX_SECTOR_SIZE), since a
+/// device is never more than one format.
 ///
 /// Returns `true` on success, `false` if any device fails to
 /// initialize.
@@ -1874,6 +1921,22 @@ pub unsafe fn init_chain_states(
                     bytes_read,
                 );
                 if chain_states.vmdk_states[dev_idx].is_none() {
+                    return false;
+                }
+            }
+            #[cfg(feature = "vhd-input")]
+            ImageFormat::Vhd => {
+                // Reuse the same cache slots: L1→BAT, L2→data
+                chain_states.vhd_states[dev_idx] = VhdState::init(
+                    call_table,
+                    dev_idx as u32,
+                    sector_size,
+                    cap,
+                    l1_cache_addr(dynamic_bufs_start, dev_idx),
+                    l2_cache_addr(dynamic_bufs_start, dev_idx),
+                    bytes_read,
+                );
+                if chain_states.vhd_states[dev_idx].is_none() {
                     return false;
                 }
             }
