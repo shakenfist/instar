@@ -2314,12 +2314,7 @@ unsafe fn convert_to_vhd(
     // Rewrite BAT with actual offsets
     let mut bat_rewritten: u64 = 0;
     while bat_rewritten < bat_padded {
-        let remaining = bat_padded - bat_rewritten;
-        let write_len = if remaining < oss as u64 {
-            oss as u64
-        } else {
-            oss as u64
-        };
+        let write_len = oss as u64;
         // Copy from BAT buffer to write buffer
         let src_off = bat_rewritten as usize;
         let copy_len = if src_off + oss <= bat_alloc {
