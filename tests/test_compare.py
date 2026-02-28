@@ -1,4 +1,10 @@
-"""Tests for compare operation (raw-vs-raw, QCOW2, backing chains)."""
+"""Tests for compare operation (raw-vs-raw, QCOW2, backing chains).
+
+TODO: Add VHD compare integration tests matching VMDK coverage in
+test_convert.py (TestConvertVmdkCompare). Should test VHD vs raw
+comparison using imago compare with hyperv-dynamic-vhd, virtualpc-vhd,
+and vhd-d2v-zerofilled test images.
+"""
 
 import json
 import subprocess
