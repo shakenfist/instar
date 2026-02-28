@@ -1026,7 +1026,7 @@ pub fn build_metadata(
     write_le_u64(buf, 0, METADATA_TABLE_SIGNATURE);
     // Reserved u16 at offset 8
     // Entry count at offset 10
-    let entry_count: u16 = 5; // FileParams, VirtualSize, LogicalSS, PhysicalSS, (VirtualDiskID skipped for output simplicity)
+    let entry_count: u16 = 5; // FileParams, VirtualSize, LogicalSS, PhysicalSS, VirtualDiskID
     write_le_u16(buf, 10, entry_count);
     // Reserved 20 bytes at offset 12..32
 
