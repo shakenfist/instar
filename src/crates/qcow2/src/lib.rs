@@ -27,6 +27,8 @@ use shared::{
 };
 #[cfg(feature = "vhd-input")]
 use vhd::{BlockLookup, VhdState};
+#[cfg(feature = "vhdx-input")]
+use vhdx::{VhdxBlockLookup, VhdxState};
 #[cfg(feature = "vmdk-input")]
 use vmdk::{GrainLookup, VmdkState};
 
@@ -1782,6 +1784,30 @@ pub unsafe fn read_chain_virtual_cluster(
                     None => return false,
                 }
             }
+            #[cfg(feature = "vhdx-input")]
+            ImageFormat::Vhdx => {
+                let state = match &mut chain_states.vhdx_states[dev_idx] {
+                    Some(s) => s,
+                    None => return false,
+                };
+                match state.block_lookup(call_table, virtual_offset, sector_size, cap, bytes_read) {
+                    Some(VhdxBlockLookup::NotPresent) | Some(VhdxBlockLookup::Zero) => {
+                        continue;
+                    }
+                    Some(VhdxBlockLookup::Present { host_byte_offset }) => {
+                        return read_cluster_sectors(
+                            call_table,
+                            dev_idx as u32,
+                            host_byte_offset,
+                            buf,
+                            chunk_size,
+                            sector_size,
+                            bytes_read,
+                        );
+                    }
+                    None => return false,
+                }
+            }
             _ => {
                 return read_raw_sectors(
                     call_table,
@@ -1860,6 +1886,8 @@ pub struct ChainStates {
     pub vmdk_states: [Option<VmdkState>; MAX_CHAIN_DEVICES],
     #[cfg(feature = "vhd-input")]
     pub vhd_states: [Option<VhdState>; MAX_CHAIN_DEVICES],
+    #[cfg(feature = "vhdx-input")]
+    pub vhdx_states: [Option<VhdxState>; MAX_CHAIN_DEVICES],
 }
 
 /// Initialize format-specific state for all devices in a chain.
@@ -1937,6 +1965,22 @@ pub unsafe fn init_chain_states(
                     bytes_read,
                 );
                 if chain_states.vhd_states[dev_idx].is_none() {
+                    return false;
+                }
+            }
+            #[cfg(feature = "vhdx-input")]
+            ImageFormat::Vhdx => {
+                // Reuse the same cache slots: L1→BAT, L2→data
+                chain_states.vhdx_states[dev_idx] = VhdxState::init(
+                    call_table,
+                    dev_idx as u32,
+                    sector_size,
+                    cap,
+                    l1_cache_addr(dynamic_bufs_start, dev_idx),
+                    l2_cache_addr(dynamic_bufs_start, dev_idx),
+                    bytes_read,
+                );
+                if chain_states.vhdx_states[dev_idx].is_none() {
                     return false;
                 }
             }
