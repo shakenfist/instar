@@ -15,7 +15,7 @@ imago/
 ├── src/            # Main imago implementation
 │   ├── vmm/        # Virtual machine monitor (host-side)
 │   ├── core/       # Core guest initialization
-│   ├── crates/     # Shared format crates (qcow2, raw, vmdk, vhd)
+│   ├── crates/     # Shared format crates (qcow2, raw, vmdk, vhd, vhdx)
 │   ├── shared/     # Shared library code
 │   ├── operations/ # Pluggable operations (info, copy, check, compare, convert)
 │   └── build.sh    # Build script
@@ -50,7 +50,7 @@ The core principle: **never parse untrusted data with host privileges**.
 
 ### Supported Formats
 
-Target formats: qcow2, raw, vmdk, vpc (VHD)
+Target formats: qcow2, raw, vmdk, vpc (VHD), vhdx (VHDX)
 
 ## Working on This Project
 

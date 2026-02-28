@@ -163,22 +163,31 @@ provides a modular architecture with:
   VhdState for stateful block I/O, and write helpers (build_footer,
   build_dynamic_header, compute_vhd_geometry). Used by info, check,
   convert, and compare operations.
+- **crates/vhdx/** - Shared VHDX format crate: CRC-32C (Castagnoli)
+  checksum implementation, dual header parsing with sequence number
+  selection, region table parsing with CRC validation, GUID-based
+  metadata item lookup, 64-bit BAT reading with interleaved sector
+  bitmap entry handling, VhdxState for stateful block I/O, and output
+  builders (file identifier, headers, region table, metadata, BAT
+  entries). Used by check, convert, and compare operations.
 - **operations/info/** - Format detection operation
 - **operations/copy/** - File copy operation
 - **operations/check/** - Image integrity validation operation (with
   optional `--chain` backing chain validation)
 - **operations/compare/** - Image comparison operation (format-aware virtual
-  content comparison between two images, supporting raw, QCOW2, VMDK, and
-  VHD inputs including compressed clusters and backing chain flattening)
+  content comparison between two images, supporting raw, QCOW2, VMDK,
+  VHD, and VHDX inputs including compressed clusters and backing chain
+  flattening)
 - **operations/convert/** - Image conversion operation (any input to raw,
-  QCOW2 v3, VMDK, or VHD output, with backing chain flattening and
-  compressed cluster decompression). QCOW2 writer uses linear cluster
-  allocation with OFLAG_COPIED, 16-bit refcounts, and iterative
+  QCOW2 v3, VMDK, VHD, or VHDX output, with backing chain flattening
+  and compressed cluster decompression). QCOW2 writer uses linear
+  cluster allocation with OFLAG_COPIED, 16-bit refcounts, and iterative
   convergence for refcount metadata sizing. Optional compressed output
   (`-c` flag) packs clusters at sector granularity using raw deflate
   (via miniz_oxide), with fallback to uncompressed for incompressible
   data. VHD writer emits dynamic VHD with 2 MiB blocks, sector bitmaps,
-  and BAT rewriting.
+  and BAT rewriting. VHDX writer emits dynamic VHDX with 32 MiB blocks,
+  1MB-aligned structures, CRC-32C checksums, and BAT rewriting.
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation)
@@ -272,6 +281,22 @@ The check operation performs full structural validation: footer cookie
 and checksum, dynamic header cookie and checksum, BAT offset and entry
 bounds checking, overlap detection via 1-bit-per-block bitmap, and
 footer copy consistency (start vs end of file).
+
+### vhdx
+
+Microsoft VHDX Virtual Hard Disk v2 (Hyper-V). Supported:
+- Dynamic VHDX: BAT-based block allocation with 32 MiB blocks (input,
+  output, check)
+
+VHDX uses CRC-32C (Castagnoli) checksums, GUID-identified metadata,
+64-bit BAT entries with interleaved sector bitmap entries, and 1MB-aligned
+structures. All on-disk fields are little-endian.
+
+The check operation performs full structural validation: dual header
+CRC-32C validation with active header selection by sequence number,
+dirty log detection, region table CRC-32C validation, GUID-based
+metadata parsing, BAT entry validation (offset bounds, 1MB alignment,
+overlap detection, state validation).
 
 ## Open Questions
 
