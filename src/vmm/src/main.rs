@@ -3744,10 +3744,11 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         "qcow2" => 2u32, // ImageFormat::Qcow2
         "vmdk" => 3u32,  // ImageFormat::Vmdk4
         "vpc" => 5u32,   // ImageFormat::Vhd
+        "vhdx" => 6u32,  // ImageFormat::Vhdx
         other => {
             return Err(format!(
                 "unsupported output format '{}' \
-                 (supported: 'raw', 'qcow2', 'vmdk', 'vpc')",
+                 (supported: 'raw', 'qcow2', 'vmdk', 'vpc', 'vhdx')",
                 other
             )
             .into());
