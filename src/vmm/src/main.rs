@@ -3756,6 +3756,8 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     };
     let is_qcow2_output = target_format == 2;
     let is_vmdk_output = target_format == 3;
+    let is_vhd_output = target_format == 5;
+    let is_vhdx_output = target_format == 6;
 
     // Validate sector size (must be power of 2, 512 to 64KB)
     if !(512..=MAX_SECTOR_SIZE).contains(&args.sector_size) || !args.sector_size.is_power_of_two() {
@@ -3827,7 +3829,13 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // Reject images with cluster_size > MAX_CLUSTER_SIZE (2MB).
     // Large clusters are processed in MAX_SECTOR_SIZE-sized chunks by
     // the guest, but the QCOW2 header parser limits at MAX_CLUSTER_SIZE.
+    // VHD and VHDX report their block_size in cluster_size which can
+    // be much larger (e.g. 32MB for VHDX) — these formats use their
+    // own block_lookup path that handles large blocks correctly.
     for image in chain.images() {
+        if matches!(image.format, ImageFormat::Vhd | ImageFormat::Vhdx) {
+            continue;
+        }
         if image.cluster_size as usize > MAX_CLUSTER_SIZE {
             return Err(format!(
                 "cluster size {}KB in {} exceeds maximum supported {}KB",
@@ -3849,9 +3857,19 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // For QCOW2 output the file is always sparse (the guest
     // writes clusters on demand) and the capacity needs headroom
     // for metadata (L1/L2 tables, refcount structures).
-    let output_capacity = if is_qcow2_output || is_vmdk_output {
-        // QCOW2 and VMDK need headroom for metadata (tables,
-        // header, descriptor, alignment padding).
+    let is_structured_output = is_qcow2_output || is_vmdk_output || is_vhd_output || is_vhdx_output;
+    let output_capacity = if is_vhdx_output {
+        // VHDX uses 32MB blocks — data is rounded up to block_size
+        // boundaries, plus ~4MB metadata overhead (file identifier,
+        // headers, region tables, log, BAT, metadata region).
+        let vhdx_block: u64 = 32 * 1024 * 1024;
+        virtual_size
+            .div_ceil(vhdx_block)
+            .saturating_mul(vhdx_block)
+            .saturating_add(10 * 1024 * 1024)
+    } else if is_structured_output {
+        // QCOW2, VMDK, and VHD need headroom for metadata (tables,
+        // headers, descriptor, BAT, alignment padding).
         virtual_size
             .saturating_add(virtual_size / 100)
             .saturating_add(10 * 1024 * 1024)
@@ -3861,7 +3879,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 
     let output_backing = if args.no_create {
         BackingStore::open(Path::new(&args.output), false, None, false)?
-    } else if is_qcow2_output || is_vmdk_output {
+    } else if is_structured_output {
         BackingStore::open(
             Path::new(&args.output),
             false,
