@@ -869,6 +869,10 @@ unsafe fn check_vhd(
     // Try parsing footer from first sector (dynamic VHDs)
     let start_footer = vhd::VhdFooter::parse(header);
 
+    // SAFETY: the else branch below always returns early, so `footer_buf`
+    // is only used after this block when it equals `header` (the caller-owned
+    // slice).  If a future change removes the early returns, `footer_buf`
+    // would dangle — keep the else branch self-contained.
     let (footer, footer_buf) = if let Some(f) = start_footer {
         // Footer found at start — dynamic or differencing VHD
         (f, header)
