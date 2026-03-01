@@ -95,6 +95,17 @@ message VdiInfo {
   string uuid = 5;              // Image UUID
 }
 
+// LUKS (Linux Unified Key Setup) format-specific information
+message LuksInfo {
+  string cipher = 1;            // Cipher name (e.g., "aes")
+  string cipher_mode = 2;       // Cipher mode (e.g., "xts-plain64")
+  string hash = 3;              // Hash spec (e.g., "sha256")
+  string uuid = 4;              // Volume UUID
+  uint32 payload_offset = 5;    // Payload offset in 512-byte sectors (v1)
+  uint32 master_key_length = 6; // Master key length in bytes
+  uint32 active_key_slots = 7;  // Number of active key slots
+}
+
 // Image format detection result (from info operation)
 message InfoResultMessage {
   // Detected format: "unknown", "raw", "qcow2", "vmdk", "vmdk3", "vhd", "vhdx", "qcow1", "vdi"
@@ -124,6 +135,7 @@ message InfoResultMessage {
   Qcow2Info qcow2_info = 9;
   VmdkInfo vmdk_info = 10;
   VdiInfo vdi_info = 11;
+  LuksInfo luks_info = 12;
 }
 
 // Image integrity check result (from check operation)

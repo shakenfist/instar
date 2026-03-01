@@ -43,7 +43,6 @@ create_luks_container() {
     local inner_format="$2"
     local output_name="$3"
     local container_size_mb=16
-    local inner_size="8M"
 
     echo "Creating $output_name (LUKS v${luks_version}, inner: ${inner_format})..."
 
