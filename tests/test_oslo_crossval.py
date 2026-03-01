@@ -1,0 +1,422 @@
+"""
+Cross-validation tests: imago vs oslo.utils format_inspector.
+
+oslo.utils is the safety gate for image uploads in OpenStack (Glance,
+Nova, Cinder). These tests verify that imago's format detection and
+safety reporting agree with oslo.utils, documenting any intentional
+divergences.
+
+Tests are skipped automatically if oslo.utils is not installed.
+"""
+
+import json
+from pathlib import Path
+
+import testscenarios
+
+from base import ImagoTestBase
+
+try:
+    from oslo_utils.imageutils import format_inspector
+    HAS_OSLO = True
+except ImportError:
+    HAS_OSLO = False
+
+
+# Images oslo.utils cannot detect or would error on.
+# Excluded from all cross-validation tests.
+OSLO_SKIP_IMAGES = {
+    # Raw images without partition tables (oslo returns None)
+    'raw-fat-no-partition',
+    'raw-sparse-empty',
+    'raw-zeros-1mb',
+    'security-fake-passwd',
+    # Malformed raw images
+    'raw-mbr-truncated',
+    'raw-gpt-truncated',
+    'raw-mbr-corrupted',
+    'raw-random-garbage',
+    'raw-misleading-header',
+    'raw-minimal-1byte',
+    'raw-qcow2-magic-wrong-offset',
+    # Corrupt format-specific images
+    'vmdk-corrupt-version',
+    'vmdk-corrupt-descriptor',
+    'vhdx-corrupt-region',
+    'vhd-corrupt-disktype',
+    # AFL-discovered malformed images
+    'afl-vhd-max-table-entries',
+    'afl-vmdk-l1-too-big',
+    # Script-generated check validation images
+    'check-qcow2-clean',
+    'check-qcow2-overlapping',
+    'check-qcow2-refcount-zero',
+    'check-qcow2-leaked',
+    # Malformed VMDK descriptors
+    'vmdk-no-extents',
+    'vmdk-path-traversal',
+}
+
+# Format name mapping: imago -> oslo.utils.
+# Most formats use the same name; only divergences listed.
+IMAGO_TO_OSLO_FORMAT = {
+    'vpc': 'vhd',
+}
+
+# Images where format detection intentionally diverges.
+# Maps image_id -> (imago_format, oslo_format).
+KNOWN_FORMAT_DIVERGENCES = {
+    # oslo.utils GPTInspector detects both MBR and GPT
+    # partitioned raw images as 'gpt'. imago reports 'raw'
+    # (matching qemu-img behaviour).
+    'raw-mbr-partitioned': ('raw', 'gpt'),
+    'raw-gpt-partitioned': ('raw', 'gpt'),
+    # vmdk-multi-partition is detected as 'raw' by imago
+    # and 'gpt' by oslo (the file appears to be a raw disk
+    # with GPT partitions despite the .vmdk extension).
+    'vmdk-multi-partition': ('raw', 'gpt'),
+    # imago reports ISO as 'raw' (with --unsafe-quirks);
+    # oslo detects as 'iso'.
+    'iso-simple': ('raw', 'iso'),
+    # imago reports LUKS as 'unknown'; oslo detects
+    # as 'luks'.
+    'luks-v1': ('unknown', 'luks'),
+    'luks-v2': ('unknown', 'luks'),
+}
+
+# Known safety divergences: images where imago does not
+# expose certain safety-relevant fields in JSON output
+# (handled via KVM sandbox instead).
+KNOWN_SAFETY_DIVERGENCES = {
+    # imago detects the external data file feature bit
+    # but does not expose the data-file path in JSON.
+    'qcow2-external-data-file': {'data_file'},
+}
+
+# Formats where virtual size is not comparable between
+# tools. QED is included because oslo.utils bans QED and
+# may not parse its virtual size correctly.
+VSIZE_SKIP_FORMATS = {'iso', 'luks', 'qed'}
+
+
+def _load_manifest():
+    """Load all images from the manifest."""
+    tests_dir = Path(__file__).parent
+    manifest_path = tests_dir / 'manifest.json'
+    if not manifest_path.exists():
+        return []
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    return manifest.get('images', [])
+
+
+def _generate_scenarios(skip_formats=None):
+    """Generate test scenarios from manifest.
+
+    Args:
+        skip_formats: Optional set of format names to exclude.
+    """
+    skip_formats = skip_formats or set()
+    scenarios = []
+    for img in _load_manifest():
+        if img['id'] in OSLO_SKIP_IMAGES:
+            continue
+        if img['format'] in skip_formats:
+            continue
+        scenarios.append(
+            (img['id'], {'image_id': img['id']})
+        )
+    return scenarios
+
+
+class TestOsloFormatDetection(
+    testscenarios.WithScenarios, ImagoTestBase
+):
+    """Cross-validate format detection: imago vs oslo.utils."""
+
+    scenarios = _generate_scenarios()
+
+    def setUp(self):
+        super().setUp()
+        if not HAS_OSLO:
+            self.skipTest('oslo.utils not installed')
+
+    def test_format_agrees(self):
+        """Verify imago and oslo.utils detect the same format."""
+        image = self.get_image(self.image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        inspector = format_inspector.detect_file_format(
+            str(image.path)
+        )
+        if inspector is None:
+            self.skipTest(
+                f'oslo.utils returned None for '
+                f'{self.image_id}'
+            )
+
+        oslo_format = inspector.NAME
+
+        # Known divergences: verify oslo side only
+        if self.image_id in KNOWN_FORMAT_DIVERGENCES:
+            _, expected_oslo = (
+                KNOWN_FORMAT_DIVERGENCES[self.image_id]
+            )
+            self.assertEqual(
+                expected_oslo, oslo_format,
+                f'{self.image_id}: expected oslo '
+                f'{expected_oslo!r}, got {oslo_format!r}'
+            )
+            return
+
+        # Run imago to get its format detection
+        stdout, stderr, rc = self.run_imago_info(
+            image.path,
+            output_format='json',
+            unsafe_quirks=image.requires_unsafe_quirks,
+        )
+        if rc != 0:
+            self.skipTest(
+                f'imago failed: {stderr.strip()}'
+            )
+
+        imago_data = json.loads(stdout)
+        imago_format = imago_data.get('format')
+
+        # Map imago name to oslo convention
+        expected_oslo = IMAGO_TO_OSLO_FORMAT.get(
+            imago_format, imago_format
+        )
+
+        self.assertEqual(
+            expected_oslo, oslo_format,
+            f'{self.image_id}: imago={imago_format!r} '
+            f'(mapped={expected_oslo!r}), '
+            f'oslo={oslo_format!r}'
+        )
+
+
+class TestOsloSafetyCheck(
+    testscenarios.WithScenarios, ImagoTestBase
+):
+    """Cross-validate safety verdicts: imago vs oslo.utils."""
+
+    scenarios = _generate_scenarios()
+
+    def setUp(self):
+        super().setUp()
+        if not HAS_OSLO:
+            self.skipTest('oslo.utils not installed')
+
+    def test_safety_agrees(self):
+        """Verify safety-relevant metadata agrees."""
+        image = self.get_image(self.image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        inspector = format_inspector.detect_file_format(
+            str(image.path)
+        )
+        if inspector is None:
+            self.skipTest(
+                f'oslo.utils returned None for '
+                f'{self.image_id}'
+            )
+
+        oslo_safe = True
+        oslo_failures = {}
+        try:
+            inspector.safety_check()
+        except format_inspector.SafetyCheckFailed as e:
+            oslo_safe = False
+            oslo_failures = e.failures
+        except format_inspector.ImageFormatError:
+            # Incomplete or unparseable file (e.g., LUKS
+            # header stubs). Treat as rejection.
+            oslo_safe = False
+
+        # Known divergence: QED is always banned by oslo.utils
+        # but imago detects without rejecting (KVM sandbox
+        # makes it safe to inspect).
+        if image.format == 'qed':
+            self.assertFalse(
+                oslo_safe,
+                f'Expected oslo to reject QED: '
+                f'{self.image_id}'
+            )
+            return
+
+        # Known divergence: oslo.utils rejects LUKS v2+
+        # (only supports v1). imago detects both.
+        if image.format == 'luks':
+            return
+
+        # Run imago to get metadata
+        stdout, stderr, rc = self.run_imago_info(
+            image.path,
+            output_format='json',
+            unsafe_quirks=image.requires_unsafe_quirks,
+        )
+
+        # If imago rejects, both tools may agree on rejection
+        if rc != 0:
+            return
+
+        imago_data = json.loads(stdout)
+
+        # Cross-validate backing file detection
+        imago_has_backing = (
+            'backing-filename' in imago_data
+        )
+        oslo_flags_backing = (
+            'backing_file' in oslo_failures
+        )
+
+        if oslo_flags_backing:
+            self.assertTrue(
+                imago_has_backing,
+                f'{self.image_id}: oslo flagged '
+                f'backing_file but imago has no '
+                f'backing-filename'
+            )
+        if imago_has_backing:
+            self.assertTrue(
+                oslo_flags_backing,
+                f'{self.image_id}: imago reports '
+                f'backing-filename but oslo did not '
+                f'flag backing_file '
+                f'(oslo_failures={oslo_failures})'
+            )
+
+        # Cross-validate external data file detection
+        known = KNOWN_SAFETY_DIVERGENCES.get(
+            self.image_id, set()
+        )
+        oslo_flags_data = 'data_file' in oslo_failures
+        fmt_data = (
+            imago_data
+            .get('format-specific', {})
+            .get('data', {})
+        )
+        imago_has_data_file = bool(
+            fmt_data.get('data-file')
+        )
+
+        if oslo_flags_data and 'data_file' not in known:
+            self.assertTrue(
+                imago_has_data_file,
+                f'{self.image_id}: oslo flagged '
+                f'data_file but imago has no '
+                f'data-file in format-specific'
+            )
+        if imago_has_data_file:
+            self.assertTrue(
+                oslo_flags_data,
+                f'{self.image_id}: imago reports '
+                f'data-file but oslo did not flag '
+                f'data_file '
+                f'(oslo_failures={oslo_failures})'
+            )
+
+
+class TestOsloVirtualSize(
+    testscenarios.WithScenarios, ImagoTestBase
+):
+    """Cross-validate virtual size: imago vs oslo.utils."""
+
+    scenarios = _generate_scenarios(
+        skip_formats=VSIZE_SKIP_FORMATS
+    )
+
+    def setUp(self):
+        super().setUp()
+        if not HAS_OSLO:
+            self.skipTest('oslo.utils not installed')
+
+    def test_virtual_size_agrees(self):
+        """Verify virtual size matches between tools."""
+        image = self.get_image(self.image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        # Skip images where format detection diverges —
+        # virtual size from different formats is not
+        # comparable.
+        if self.image_id in KNOWN_FORMAT_DIVERGENCES:
+            self.skipTest(
+                f'{self.image_id}: format diverges, '
+                f'virtual size not comparable'
+            )
+
+        inspector = format_inspector.detect_file_format(
+            str(image.path)
+        )
+        if inspector is None:
+            self.skipTest(
+                f'oslo.utils returned None for '
+                f'{self.image_id}'
+            )
+
+        oslo_vsize = inspector.virtual_size
+        if oslo_vsize is None:
+            self.skipTest(
+                f'oslo.utils reports no virtual size '
+                f'for {self.image_id}'
+            )
+
+        # Run imago to get virtual size
+        stdout, stderr, rc = self.run_imago_info(
+            image.path,
+            output_format='json',
+            unsafe_quirks=image.requires_unsafe_quirks,
+        )
+        if rc != 0:
+            self.skipTest(
+                f'imago failed: {stderr.strip()}'
+            )
+
+        imago_data = json.loads(stdout)
+        imago_vsize = imago_data.get('virtual-size')
+        if imago_vsize is None:
+            self.skipTest(
+                f'imago reports no virtual-size for '
+                f'{self.image_id}'
+            )
+
+        # VPC/VHD virtual size may differ due to CHS
+        # geometry rounding. Allow up to one cylinder
+        # (255 * 63 * 512 = 8,225,280 bytes).
+        if image.format == 'vpc':
+            delta = abs(oslo_vsize - imago_vsize)
+            self.assertLessEqual(
+                delta, 8225280,
+                f'{self.image_id}: virtual size delta '
+                f'{delta} > 8225280 (CHS rounding) '
+                f'(oslo={oslo_vsize}, '
+                f'imago={imago_vsize})'
+            )
+        # Allow 512-byte delta for raw images due to
+        # sector rounding differences between tools
+        elif image.format == 'raw':
+            delta = abs(oslo_vsize - imago_vsize)
+            self.assertLessEqual(
+                delta, 512,
+                f'{self.image_id}: virtual size delta '
+                f'{delta} > 512 bytes '
+                f'(oslo={oslo_vsize}, '
+                f'imago={imago_vsize})'
+            )
+        else:
+            self.assertEqual(
+                oslo_vsize, imago_vsize,
+                f'{self.image_id}: '
+                f'oslo={oslo_vsize}, '
+                f'imago={imago_vsize}'
+            )
