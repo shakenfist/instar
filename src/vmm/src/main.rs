@@ -1783,6 +1783,16 @@ struct InfoArgs {
     /// that qemu-img doesn't include.
     #[arg(long)]
     extra_detail: bool,
+
+    /// LUKS passphrase for decrypting the first payload sector to detect
+    /// the inner format. When provided, imago decrypts and reports the
+    /// format inside the LUKS container (e.g., qcow2, raw).
+    #[arg(long, value_name = "PASSPHRASE")]
+    luks_passphrase: Option<String>,
+
+    /// Read LUKS passphrase from a file (first line, trailing newline stripped).
+    #[arg(long, value_name = "PATH", conflicts_with = "luks_passphrase")]
+    luks_passphrase_file: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -2127,7 +2137,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     debug!("Loaded operation binary at 0x{:x}", OPERATION_LOAD_ADDR);
 
     // Write InfoConfig at OPERATION_CONFIG_ADDR
-    // Layout: magic (u32), flags (u32)
+    // Layout: magic (u32), flags (u32), passphrase_len (u32), _pad (u32), passphrase (256 bytes)
     let mut info_flags: u32 = INFO_CONFIG_FLAG_DETAILED | INFO_CONFIG_FLAG_SECURITY_CHECK;
     if args.unsafe_quirks {
         info_flags |= INFO_CONFIG_FLAG_UNSAFE_QUIRKS;
@@ -2140,6 +2150,43 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     }
     guest_mem.write_obj(INFO_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
     guest_mem.write_obj(info_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
+
+    // Resolve LUKS passphrase from --luks-passphrase or --luks-passphrase-file
+    let passphrase = if let Some(ref pp) = args.luks_passphrase {
+        Some(pp.clone())
+    } else if let Some(ref path) = args.luks_passphrase_file {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read passphrase file '{}': {}", path, e))?;
+        // Strip trailing newline (like how most tools read key files)
+        Some(content.trim_end_matches('\n').to_string())
+    } else {
+        None
+    };
+
+    // Write passphrase to guest config if provided
+    if let Some(ref pp) = passphrase {
+        let pp_bytes = pp.as_bytes();
+        if pp_bytes.len() > shared::INFO_CONFIG_MAX_PASSPHRASE {
+            return Err(format!(
+                "passphrase too long ({} bytes, max {})",
+                pp_bytes.len(),
+                shared::INFO_CONFIG_MAX_PASSPHRASE
+            )
+            .into());
+        }
+        guest_mem.write_obj(
+            pp_bytes.len() as u32,
+            GuestAddress(OPERATION_CONFIG_ADDR + 8),
+        )?;
+        guest_mem
+            .write_slice(pp_bytes, GuestAddress(OPERATION_CONFIG_ADDR + 16))
+            .map_err(|e| format!("failed to write passphrase to guest memory: {}", e))?;
+        debug!(
+            "Wrote LUKS passphrase ({} bytes) to guest config",
+            pp_bytes.len()
+        );
+    }
+
     debug!(
         "Wrote info config at 0x{:x} (flags=0x{:x})",
         OPERATION_CONFIG_ADDR, info_flags
