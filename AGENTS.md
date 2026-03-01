@@ -175,6 +175,7 @@ make clean-tests
 - `tests/test_check_formats.py` - Tests for check operation (format detection, corruption, validation, incompatible feature bits, ZSTD compression, extended L2 entries, ZSTD + backing chains, extended L2 + compressed clusters, refcount widths 1-64 bit, compressed cluster leak detection, large cluster sizes 256K-2MB, VMDK GD/GT validation with overlap detection)
 - `tests/test_compare.py` - Tests for compare operation (raw-vs-raw, QCOW2-vs-raw, QCOW2-vs-QCOW2, compressed QCOW2, backing chains)
 - `tests/test_convert.py` - Tests for convert operation (QCOW2-to-raw, raw-to-QCOW2, QCOW2 re-encoding, compressed output with `-c` flag, backing chains, round-trip validation, errors, large cluster sizes up to 2MB, manifest-driven cross-validation against qemu-img including compressed output)
+- `tests/test_oslo_crossval.py` - Cross-validation against oslo.utils format_inspector (format detection, safety checks, virtual size). Skips gracefully if oslo.utils is not installed. Known divergences documented in module constants.
 - `tests/expected_outputs/` - Expected output files for malicious images
 
 **Adding new test images:**
