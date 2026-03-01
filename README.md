@@ -364,8 +364,10 @@ The integration tests compare `imago info` output against `qemu-img info` to
 verify drop-in replacement compatibility, validate `imago check` against
 deliberately corrupt test images, cross-validate `imago compare` output
 against `qemu-img compare`, and cross-validate `imago convert` output against
-`qemu-img convert`. Test images are in the sibling `imago-testdata/`
-repository.
+`qemu-img convert`. oslo.utils `format_inspector` cross-validation tests
+verify that imago's format detection, safety checks, and virtual size
+reporting agree with OpenStack's image safety gate. Test images are in the
+sibling `imago-testdata/` repository.
 
 **Running:**
 ```bash
