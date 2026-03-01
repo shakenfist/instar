@@ -984,6 +984,9 @@ impl ImageFormat {
 /// Configuration for the info operation.
 ///
 /// This structure is written to OPERATION_CONFIG_ADDR by the VMM.
+/// Maximum passphrase length for LUKS decryption.
+pub const INFO_CONFIG_MAX_PASSPHRASE: usize = 256;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct InfoConfig {
@@ -992,6 +995,15 @@ pub struct InfoConfig {
 
     /// Configuration flags
     pub flags: u32,
+
+    /// LUKS passphrase length (0 = no passphrase provided)
+    pub passphrase_len: u32,
+
+    /// Padding for alignment
+    pub _pad: u32,
+
+    /// LUKS passphrase (null-padded, max 256 bytes)
+    pub passphrase: [u8; INFO_CONFIG_MAX_PASSPHRASE],
 }
 
 impl InfoConfig {
@@ -1019,6 +1031,9 @@ impl InfoConfig {
         Self {
             magic: Self::MAGIC,
             flags: Self::FLAG_DETAILED | Self::FLAG_SECURITY_CHECK,
+            passphrase_len: 0,
+            _pad: 0,
+            passphrase: [0; INFO_CONFIG_MAX_PASSPHRASE],
         }
     }
 
@@ -1053,6 +1068,17 @@ impl InfoConfig {
     /// are reported as their qemu-img equivalent for compatibility.
     pub fn extra_detail_enabled(&self) -> bool {
         (self.flags & Self::FLAG_EXTRA_DETAIL) != 0
+    }
+
+    /// Check if a LUKS passphrase was provided
+    pub fn has_passphrase(&self) -> bool {
+        self.passphrase_len > 0
+    }
+
+    /// Get the passphrase bytes (empty slice if none)
+    pub fn passphrase_bytes(&self) -> &[u8] {
+        let len = (self.passphrase_len as usize).min(INFO_CONFIG_MAX_PASSPHRASE);
+        &self.passphrase[..len]
     }
 }
 
