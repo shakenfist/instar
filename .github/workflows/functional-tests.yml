@@ -430,6 +430,84 @@ jobs:
             ${{ github.workspace }}/test-output.txt
           retention-days: 7
 
+  # Cross-validate imago against oslo.utils git master.
+  # This catches drift from oslo.utils development before
+  # it reaches PyPI. Allowed to fail (informational).
+  oslo-crossval-master:
+    needs: build-and-test
+    runs-on: [self-hosted, debian-12, xl]
+    timeout-minutes: 30
+    continue-on-error: true
+
+    env:
+      DOCKER_BUILDKIT: 1
+
+    steps:
+      - name: Checkout imago
+        uses: actions/checkout@v4
+        with:
+          path: imago
+          fetch-depth: 0
+
+      - name: Checkout imago-testdata from GitLab
+        run: |
+          git clone --depth 1 \
+            https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git \
+            imago-testdata
+
+      - name: Resparsify test images
+        run: |
+          cd ${GITHUB_WORKSPACE}/imago-testdata
+          find downloaded/ -type f \( \
+            -name "*.qcow2" -o \
+            -name "*.vmdk" -o \
+            -name "*.vhd" -o \
+            -name "*.vhdx" -o \
+            -name "*.img" \
+          \) -print0 | while IFS= read -r -d '' file; do
+            cp --sparse=always "$file" "$file.sparse"
+            mv "$file.sparse" "$file"
+          done
+
+      - name: Install Docker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y docker.io
+          sudo systemctl start docker
+          sudo chmod 666 /var/run/docker.sock
+
+      - name: Remove previous devcontainers, if any
+        run: |
+          docker image rm -f imago-build 2>/dev/null || true
+
+      - name: Build imago
+        run: |
+          cd ${GITHUB_WORKSPACE}/imago
+          make imago
+
+      - name: Run oslo crossval with oslo.utils master
+        run: |
+          cd ${GITHUB_WORKSPACE}/imago
+          docker run --rm \
+            --device=/dev/kvm \
+            -u "$(id -u):$(id -g)" \
+            --group-add "$(stat -c '%g' /dev/kvm)" \
+            -e HOME=/build \
+            -e IMAGO_TESTDATA_PATH=/testdata \
+            -v "$(pwd):/workspace" \
+            -v "${GITHUB_WORKSPACE}/imago-testdata:/testdata:ro" \
+            -w "/workspace" \
+            imago-build \
+            bash -c '
+              python3 -m venv /build/test-venv &&
+              /build/test-venv/bin/pip install -q \
+                -r tests/requirements.txt &&
+              /build/test-venv/bin/pip install -q \
+                git+https://github.com/openstack/oslo.utils.git &&
+              cd tests &&
+              /build/test-venv/bin/stestr run test_oslo_crossval
+            '
+
   automated_reviewer:
     name: "Automated reviewer"
     runs-on: [self-hosted, claude-code]
