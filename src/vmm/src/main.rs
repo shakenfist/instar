@@ -1141,6 +1141,50 @@ fn print_info_result_json(
         );
         println!("        }}");
         println!("    }},");
+    } else if info.format == "luks" && extra_detail {
+        // LUKS format-specific info is only output with --extra-detail flag.
+        // qemu-img doesn't output format-specific for LUKS.
+        println!("    \"format-specific\": {{");
+        println!("        \"type\": \"luks\",");
+        println!("        \"data\": {{");
+        if !info.luks_info.cipher.is_empty() {
+            println!(
+                "            \"cipher\": \"{}\",",
+                escape_json_string(info.luks_info.cipher.as_str())
+            );
+            println!(
+                "            \"cipher-mode\": \"{}\",",
+                escape_json_string(info.luks_info.cipher_mode.as_str())
+            );
+            println!(
+                "            \"hash\": \"{}\",",
+                escape_json_string(info.luks_info.hash.as_str())
+            );
+        }
+        if !info.luks_info.uuid.is_empty() {
+            println!(
+                "            \"uuid\": \"{}\",",
+                escape_json_string(info.luks_info.uuid.as_str())
+            );
+        }
+        if info.luks_info.payload_offset > 0 {
+            println!(
+                "            \"payload-offset\": {},",
+                info.luks_info.payload_offset
+            );
+        }
+        if info.luks_info.master_key_length > 0 {
+            println!(
+                "            \"master-key-length\": {},",
+                info.luks_info.master_key_length
+            );
+        }
+        println!(
+            "            \"active-key-slots\": {}",
+            info.luks_info.active_key_slots
+        );
+        println!("        }}");
+        println!("    }},");
     }
 
     // Backing file paths (if present)

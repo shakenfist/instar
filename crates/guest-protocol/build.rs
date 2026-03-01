@@ -43,6 +43,12 @@ fn main() {
         micropb_gen::Config::new().max_bytes(48),
     );
 
+    // Configure LUKS UUID field (36 characters, same as VDI)
+    generator.configure(
+        ".guest.LuksInfo.uuid",
+        micropb_gen::Config::new().max_bytes(48),
+    );
+
     // Generate the Rust module
     generator
         .compile_protos(&[proto_file], out_dir.join("guest.rs"))

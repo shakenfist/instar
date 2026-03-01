@@ -20,15 +20,15 @@ use core::panic::PanicInfo;
 use core::ptr::write_volatile;
 
 use shared::{
-    CallTable, ChainConfig, CheckResult, CompareResult, Qcow2Info, VdiInfo, VmdkInfo,
+    CallTable, ChainConfig, CheckResult, CompareResult, LuksInfo, Qcow2Info, VdiInfo, VmdkInfo,
     CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR, CHAIN_CONFIG_MAX_SIZE, OPERATION_CONFIG_ADDR,
     OPERATION_CONFIG_MAX_SIZE, OPERATION_LOAD_ADDR,
 };
 
 use crate::serial::{
     debug_print, read_config, send_check_result, send_compare_result, send_complete, send_error,
-    send_info_result, send_info_result_qcow2, send_info_result_vdi, send_info_result_vmdk,
-    send_init, send_progress, DeviceConfig,
+    send_info_result, send_info_result_luks, send_info_result_qcow2, send_info_result_vdi,
+    send_info_result_vmdk, send_init, send_progress, DeviceConfig,
 };
 use crate::virtio::VirtioBlock;
 
@@ -269,6 +269,7 @@ fn setup_call_table() {
         send_info_result_qcow2: ct_send_info_result_qcow2,
         send_info_result_vmdk: ct_send_info_result_vmdk,
         send_info_result_vdi: ct_send_info_result_vdi,
+        send_info_result_luks: ct_send_info_result_luks,
         send_check_result: ct_send_check_result,
         send_compare_result: ct_send_compare_result,
     };
@@ -578,6 +579,42 @@ unsafe extern "C" fn ct_send_info_result_vdi(
         backing_str,
         external_str,
         &vdi_data,
+    );
+}
+
+/// Send info result message with LUKS-specific information.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn ct_send_info_result_luks(
+    format: *const u8,
+    version: u32,
+    virtual_size: u64,
+    actual_size: u64,
+    cluster_size: u32,
+    flags: u32,
+    backing_file: *const u8,
+    external_data_file: *const u8,
+    luks_info: *const LuksInfo,
+) {
+    let format_str = cstr_to_str(format);
+    let backing_str = cstr_to_str(backing_file);
+    let external_str = cstr_to_str(external_data_file);
+
+    let luks_data = if luks_info.is_null() {
+        LuksInfo::new()
+    } else {
+        *luks_info
+    };
+
+    send_info_result_luks(
+        format_str,
+        version,
+        virtual_size,
+        actual_size,
+        cluster_size,
+        flags,
+        backing_str,
+        external_str,
+        &luks_data,
     );
 }
 
