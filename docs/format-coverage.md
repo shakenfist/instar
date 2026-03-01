@@ -355,6 +355,44 @@ None currently outstanding. All VMDK safety checks are now implemented.
 
 ---
 
+## oslo.utils Cross-Validation Testing
+
+Automated tests in `tests/test_oslo_crossval.py` run both imago and
+oslo.utils `format_inspector` against every test image and compare
+results. Three test classes cover format detection, safety checks,
+and virtual size.
+
+### Running Locally
+
+```bash
+# With oslo.utils installed (included in tests/requirements.txt)
+cd tests && ../.venv/bin/stestr run test_oslo_crossval
+
+# Without oslo.utils — all tests skip gracefully
+```
+
+### Documented Divergences
+
+| Area | Image(s) | imago | oslo.utils | Reason |
+|------|----------|-------|-----------|--------|
+| Format | raw-mbr-partitioned, raw-gpt-partitioned | raw | gpt | oslo GPTInspector detects partition tables; imago matches qemu-img |
+| Format | vmdk-multi-partition | raw | gpt | File is raw with GPT despite .vmdk extension |
+| Format | iso-simple | raw | iso | imago reports ISO as raw with --unsafe-quirks |
+| Format | luks-v1, luks-v2 | unknown | luks | imago does not expose LUKS in info output |
+| Safety | QED images | pass | reject | oslo bans QED; imago uses KVM sandbox |
+| Safety | LUKS v2 | pass | reject | oslo rejects LUKS v2+; imago detects both |
+| Safety | qcow2-external-data-file | no data-file field | flags data_file | imago detects feature bit but does not expose path in JSON |
+| Vsize | VPC/VHD images | - | - | CHS geometry rounding (up to 8 MB delta allowed) |
+
+### CI Integration
+
+The `oslo-crossval-master` job in `.github/workflows/functional-tests.yml`
+installs oslo.utils from git master (over the PyPI release) and runs only
+the crossval tests. It has `continue-on-error: true` so upstream changes
+are surfaced as warnings rather than blocking PRs.
+
+---
+
 ## References
 
 - [oslo.utils format_inspector.py](https://github.com/openstack/oslo.utils/blob/master/oslo_utils/imageutils/format_inspector.py)

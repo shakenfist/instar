@@ -308,67 +308,44 @@ Implemented full VHDX support in 5 sub-phases:
 
 ---
 
-## Phase 11: oslo.utils format_inspector Cross-Validation
+## Phase 11: oslo.utils format_inspector Cross-Validation ✓
 
-### Motivation
+**Status:** Complete (March 2026)
 
-imago currently tests against qemu-img baselines but has no automated
-testing against oslo.utils `format_inspector`. oslo.utils is the safety
-gate for image uploads in OpenStack (Glance, Nova, Cinder). If imago's
-format detection or safety flags drift from what oslo.utils reports,
-OpenStack deployments using imago could silently accept images that
-oslo.utils would reject (or vice versa).
+### 11a: Add oslo.utils to test dependencies ✓
 
-oslo.utils is actively evolving — ContainerFileInspector (978095),
-LUKS decryption (978097), GPT/MBR safety check reorganization
-(938679) — making automated cross-validation increasingly important.
+Added `oslo.utils>=8.0.0` to `tests/requirements.txt`. Installed
+automatically in CI via `make test-container`.
 
-### 11a: Add oslo.utils to test dependencies
+### 11b: format_inspector cross-validation test class ✓
 
-**Files:** `tests/requirements.txt` or test venv setup
+`tests/test_oslo_crossval.py` — three test classes with 128 tests:
 
-Install oslo.utils (and its imageutils module) into the test venv.
-Pin to a known version initially; later add a CI job that tests
-against oslo.utils master.
+- **TestOsloFormatDetection** — compares format names (with
+  `IMAGO_TO_OSLO_FORMAT` mapping for vpc→vhd)
+- **TestOsloSafetyCheck** — cross-validates backing_file and
+  data_file safety flags between tools
+- **TestOsloVirtualSize** — compares virtual size (with CHS
+  rounding tolerance for VPC format)
 
-### 11b: format_inspector cross-validation test class
+Documented divergences in module constants:
+- GPT detection: oslo detects MBR/GPT raw images as 'gpt'
+- QED banning: oslo always rejects QED; imago uses KVM sandbox
+- LUKS: oslo rejects v2+; imago detects both versions
+- External data file: imago detects feature bit but does not
+  expose data-file path in JSON output
+- ISO/LUKS format names: imago reports 'raw'/'unknown'
 
-**Files:** `tests/test_oslo_crossval.py`
+### 11c: CI integration ✓
 
-New test class that iterates over all test images in the manifest
-and for each image:
+Added `oslo-crossval-master` job to
+`.github/workflows/functional-tests.yml`. Installs oslo.utils from
+git master, runs crossval tests only, `continue-on-error: true`.
 
-1. Runs `imago info --output json` to get imago's detection result
-2. Runs oslo.utils `format_inspector.detect_file_format()` to get
-   oslo's detection result
-3. Compares: detected format name, virtual size, safety verdict
+### 11d: Documentation ✓
 
-For safety comparison:
-- Run `inspector.safety_check()` and capture pass/fail + failure
-  reasons
-- Map oslo.utils safety failures to imago's JSON flag fields:
-  - `backing_file` failure → `FLAG_HAS_BACKING_FILE` in imago
-  - `data_file` failure → `FLAG_HAS_EXTERNAL_DATA` in imago
-  - `unknown_features` failure → `FLAG_UNKNOWN_INCOMPAT` in imago
-- Any oslo.utils rejection that imago doesn't flag (or vice versa)
-  is a test failure
-
-### 11c: CI integration
-
-**Files:** `.github/workflows/test.yml` or new workflow
-
-Add a CI job (or extend existing) that:
-1. Installs oslo.utils from PyPI (latest release)
-2. Runs the cross-validation tests
-3. Optionally: a second job testing against oslo.utils master
-   (allowed to fail, for early warning of upstream changes)
-
-### 11d: Monitor GPT/MBR safety check changes
-
-oslo.utils review 938679 reorganizes GPT/MBR safety checks and may
-change which images pass/fail. The cross-validation tests from 11b
-will catch this automatically, but we should also review the change
-when it merges to understand any intentional divergence.
+Updated `docs/format-coverage.md`, `README.md`, `ARCHITECTURE.md`,
+`AGENTS.md` with oslo.utils crossval documentation.
 
 ---
 
