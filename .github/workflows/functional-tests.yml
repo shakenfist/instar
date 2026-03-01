@@ -5,6 +5,8 @@ on:
     paths:
       - 'src/**'
       - 'crates/**'
+      - 'tests/**'
+      - 'scripts/**'
       - 'Makefile'
       - '.github/workflows/functional-tests.yml'
   workflow_dispatch:

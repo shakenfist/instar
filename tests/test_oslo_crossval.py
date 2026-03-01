@@ -1,20 +1,20 @@
 """
 Cross-validation tests: imago vs oslo.utils format_inspector.
 
-oslo.utils is the safety gate for image uploads in OpenStack (Glance,
-Nova, Cinder). These tests verify that imago's format detection and
-safety reporting agree with oslo.utils, documenting any intentional
-divergences.
+oslo.utils is the safety gate for image uploads in OpenStack
+(Glance, Nova, Cinder). These tests verify that imago's format
+detection and safety reporting agree with oslo.utils, documenting
+any intentional divergences.
 
 Tests are skipped automatically if oslo.utils is not installed.
 """
 
 import json
-from pathlib import Path
 
 import testscenarios
 
 from base import ImagoTestBase
+from helpers import load_manifest_images
 
 try:
     from oslo_utils.imageutils import format_inspector
@@ -99,17 +99,6 @@ KNOWN_SAFETY_DIVERGENCES = {
 VSIZE_SKIP_FORMATS = {'iso', 'luks', 'qed'}
 
 
-def _load_manifest():
-    """Load all images from the manifest."""
-    tests_dir = Path(__file__).parent
-    manifest_path = tests_dir / 'manifest.json'
-    if not manifest_path.exists():
-        return []
-    with open(manifest_path) as f:
-        manifest = json.load(f)
-    return manifest.get('images', [])
-
-
 def _generate_scenarios(skip_formats=None):
     """Generate test scenarios from manifest.
 
@@ -118,7 +107,7 @@ def _generate_scenarios(skip_formats=None):
     """
     skip_formats = skip_formats or set()
     scenarios = []
-    for img in _load_manifest():
+    for img in load_manifest_images():
         if img['id'] in OSLO_SKIP_IMAGES:
             continue
         if img['format'] in skip_formats:
@@ -129,26 +118,25 @@ def _generate_scenarios(skip_formats=None):
     return scenarios
 
 
-class TestOsloFormatDetection(
-    testscenarios.WithScenarios, ImagoTestBase
-):
-    """Cross-validate format detection: imago vs oslo.utils."""
-
-    scenarios = _generate_scenarios()
+class OsloCrossvalMixin:
+    """Shared setUp and helpers for oslo crossval tests."""
 
     def setUp(self):
         super().setUp()
         if not HAS_OSLO:
             self.skipTest('oslo.utils not installed')
 
-    def test_format_agrees(self):
-        """Verify imago and oslo.utils detect the same format."""
+    def _get_oslo_inspector(self):
+        """Get image and oslo inspector, skipping if unavailable.
+
+        Returns:
+            (image, inspector) tuple.
+        """
         image = self.get_image(self.image_id)
         if not image.path.exists():
             self.skipTest(
                 f'Image not found: {image.path}'
             )
-
         inspector = format_inspector.detect_file_format(
             str(image.path)
         )
@@ -157,7 +145,21 @@ class TestOsloFormatDetection(
                 f'oslo.utils returned None for '
                 f'{self.image_id}'
             )
+        return image, inspector
 
+
+class TestOsloFormatDetection(
+    testscenarios.WithScenarios,
+    OsloCrossvalMixin,
+    ImagoTestBase,
+):
+    """Cross-validate format detection: imago vs oslo.utils."""
+
+    scenarios = _generate_scenarios()
+
+    def test_format_agrees(self):
+        """Verify imago and oslo.utils detect the same format."""
+        image, inspector = self._get_oslo_inspector()
         oslo_format = inspector.NAME
 
         # Known divergences: verify oslo side only
@@ -200,33 +202,17 @@ class TestOsloFormatDetection(
 
 
 class TestOsloSafetyCheck(
-    testscenarios.WithScenarios, ImagoTestBase
+    testscenarios.WithScenarios,
+    OsloCrossvalMixin,
+    ImagoTestBase,
 ):
     """Cross-validate safety verdicts: imago vs oslo.utils."""
 
     scenarios = _generate_scenarios()
 
-    def setUp(self):
-        super().setUp()
-        if not HAS_OSLO:
-            self.skipTest('oslo.utils not installed')
-
     def test_safety_agrees(self):
         """Verify safety-relevant metadata agrees."""
-        image = self.get_image(self.image_id)
-        if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
-
-        inspector = format_inspector.detect_file_format(
-            str(image.path)
-        )
-        if inspector is None:
-            self.skipTest(
-                f'oslo.utils returned None for '
-                f'{self.image_id}'
-            )
+        image, inspector = self._get_oslo_inspector()
 
         oslo_safe = True
         oslo_failures = {}
@@ -270,12 +256,8 @@ class TestOsloSafetyCheck(
         imago_data = json.loads(stdout)
 
         # Cross-validate backing file detection
-        imago_has_backing = (
-            'backing-filename' in imago_data
-        )
-        oslo_flags_backing = (
-            'backing_file' in oslo_failures
-        )
+        imago_has_backing = 'backing-filename' in imago_data
+        oslo_flags_backing = 'backing_file' in oslo_failures
 
         if oslo_flags_backing:
             self.assertTrue(
@@ -325,7 +307,9 @@ class TestOsloSafetyCheck(
 
 
 class TestOsloVirtualSize(
-    testscenarios.WithScenarios, ImagoTestBase
+    testscenarios.WithScenarios,
+    OsloCrossvalMixin,
+    ImagoTestBase,
 ):
     """Cross-validate virtual size: imago vs oslo.utils."""
 
@@ -333,18 +317,9 @@ class TestOsloVirtualSize(
         skip_formats=VSIZE_SKIP_FORMATS
     )
 
-    def setUp(self):
-        super().setUp()
-        if not HAS_OSLO:
-            self.skipTest('oslo.utils not installed')
-
     def test_virtual_size_agrees(self):
         """Verify virtual size matches between tools."""
-        image = self.get_image(self.image_id)
-        if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
+        image, inspector = self._get_oslo_inspector()
 
         # Skip images where format detection diverges —
         # virtual size from different formats is not
@@ -353,15 +328,6 @@ class TestOsloVirtualSize(
             self.skipTest(
                 f'{self.image_id}: format diverges, '
                 f'virtual size not comparable'
-            )
-
-        inspector = format_inspector.detect_file_format(
-            str(image.path)
-        )
-        if inspector is None:
-            self.skipTest(
-                f'oslo.utils returned None for '
-                f'{self.image_id}'
             )
 
         oslo_vsize = inspector.virtual_size
