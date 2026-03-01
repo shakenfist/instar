@@ -606,9 +606,8 @@
             "safety": "safe",
             "run_in_ci": false,
             "skip_qemu_img": true,
-            "description": "LUKS version 1 header for format detection testing",
-            "tags": ["luks", "luks1", "encrypted", "format-coverage"],
-            "sha256": "d13420d86afe0828d046430939647c46433231422b54979edc7c160e0e0f9244"
+            "description": "LUKS v1 synthetic header with realistic fields (aes-xts-plain64, sha256, 1 active key slot)",
+            "tags": ["luks", "luks1", "encrypted", "format-coverage"]
         },
         {
             "id": "luks-v2",
@@ -617,9 +616,44 @@
             "safety": "safe",
             "run_in_ci": false,
             "skip_qemu_img": true,
-            "description": "LUKS version 2 header for format detection testing",
-            "tags": ["luks", "luks2", "encrypted", "format-coverage"],
-            "sha256": "0961fc4aaed74ca9acd9ac11430f2ffc00bc2b2696599a3e04325ff91e51ec26"
+            "description": "LUKS v2 synthetic header with JSON metadata (argon2id, aes-xts-plain64)",
+            "tags": ["luks", "luks2", "encrypted", "format-coverage"]
+        },
+        {
+            "id": "luks-v1-raw-gpt",
+            "path": "custom/format-coverage/luks-v1-raw-gpt.img",
+            "format": "luks",
+            "safety": "safe",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "passphrase": "test-passphrase",
+            "description": "LUKS v1 container with GPT-partitioned raw inner format",
+            "tags": ["luks", "luks1", "encrypted", "inner-format", "format-coverage"],
+            "generated_by": "scripts/create-luks-testdata.sh"
+        },
+        {
+            "id": "luks-v1-qcow2",
+            "path": "custom/format-coverage/luks-v1-qcow2.img",
+            "format": "luks",
+            "safety": "safe",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "passphrase": "test-passphrase",
+            "description": "LUKS v1 container with QCOW2 inner format",
+            "tags": ["luks", "luks1", "encrypted", "inner-format", "format-coverage"],
+            "generated_by": "scripts/create-luks-testdata.sh"
+        },
+        {
+            "id": "luks-v2-raw-gpt",
+            "path": "custom/format-coverage/luks-v2-raw-gpt.img",
+            "format": "luks",
+            "safety": "safe",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "passphrase": "test-passphrase",
+            "description": "LUKS v2 container with GPT-partitioned raw inner format",
+            "tags": ["luks", "luks2", "encrypted", "inner-format", "format-coverage"],
+            "generated_by": "scripts/create-luks-testdata.sh"
         },
         {
             "id": "vmdk-corrupt-version",
