@@ -213,6 +213,16 @@ pub unsafe extern "C" fn _start() -> u64 {
             skip_zeros,
             &mut bytes_read,
         ),
+        ImageFormat::Vhdx => convert_to_vhdx(
+            call_table,
+            chain_config,
+            &mut chain_states,
+            input_device_count,
+            virtual_size,
+            sector_size,
+            skip_zeros,
+            &mut bytes_read,
+        ),
         _ => convert_to_raw(
             call_table,
             chain_config,
@@ -2366,6 +2376,498 @@ unsafe fn convert_to_vhd(
     (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, true);
     (call_table.verbose_print)(b"convert: VHD done\n\0".as_ptr());
     *bytes_read
+}
+
+// ================================================================
+// VHDX output path
+// ================================================================
+
+/// Convert input to VHDX dynamic output.
+///
+/// VHDX output layout (all regions 1MB-aligned):
+///   0x00000     File Identifier (64KB)
+///   0x10000     Header 1 (64KB)
+///   0x20000     Header 2 (64KB)
+///   0x30000     Region Table 1 (64KB)
+///   0x40000     Region Table 2 (64KB)
+///   0x100000    Log region (1MB, empty/reserved)
+///   0x200000    BAT region (1MB-aligned)
+///   next 1MB    Metadata region (1MB)
+///   next 1MB    Payload blocks (block_size each)
+#[allow(clippy::too_many_arguments)]
+unsafe fn convert_to_vhdx(
+    call_table: &CallTable,
+    chain_config: &ChainConfig,
+    chain_states: &mut qcow2::ChainStates,
+    input_device_count: usize,
+    virtual_size: u64,
+    sector_size: usize,
+    skip_zeros: bool,
+    bytes_read: &mut u64,
+) -> u64 {
+    let oss = (call_table.get_output_sector_size)();
+    let oc = (call_table.get_output_capacity)();
+    let progress_interval = (call_table.get_progress_interval)();
+
+    let block_size = vhdx::DEFAULT_BLOCK_SIZE as u64; // 32 MiB
+    let logical_sector_size: u32 = 512;
+    let physical_sector_size: u32 = 4096;
+
+    let (total_bat_entries, chunk_ratio, total_payload_blocks) =
+        vhdx::calculate_bat_layout(virtual_size, block_size as u32, logical_sector_size);
+
+    // Layout offsets (all 1MB-aligned per VHDX spec)
+    let file_id_offset: u64 = 0; // 64KB
+    let _header1_offset: u64 = 0x10000; // 64KB
+    let _header2_offset: u64 = 0x20000; // 64KB
+    let _rt1_offset: u64 = 0x30000; // 64KB
+    let _rt2_offset: u64 = 0x40000; // 64KB
+    let log_offset: u64 = 0x10_0000; // 1MB
+    let bat_offset: u64 = 0x20_0000; // 2MB
+    let bat_size_bytes = total_bat_entries as u64 * 8;
+    let bat_region_size = align_up(bat_size_bytes, vhdx::MB_ALIGN as usize);
+    let metadata_offset = bat_offset + bat_region_size;
+    let metadata_region_size = vhdx::MB_ALIGN; // 1MB
+    let payload_start = metadata_offset + metadata_region_size;
+
+    // BAT buffer — allocate after dynamic input caches
+    let bat_buf_addr = DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE;
+    let bat_alloc = align_up(bat_size_bytes, 8) as usize;
+
+    if bat_buf_addr + bat_alloc > ALLOC_HEAP_BASE {
+        (call_table.debug_print)(b"convert: VHDX BAT too large for scratch\n\0".as_ptr());
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
+    }
+
+    let bat_buf = bat_buf_addr as *mut u8;
+    // Initialize all BAT entries to 0 (NOT_PRESENT)
+    core::ptr::write_bytes(bat_buf, 0, bat_alloc);
+
+    (call_table.verbose_print)(b"convert: starting VHDX conversion\n\0".as_ptr());
+
+    // --- Write file identifier (64KB) ---
+    let buf_hdr = BUF_HEADER as *mut u8;
+    core::ptr::write_bytes(buf_hdr, 0, MAX_SECTOR_SIZE);
+    let fi_slice = core::slice::from_raw_parts_mut(buf_hdr, MAX_SECTOR_SIZE);
+    vhdx::build_file_identifier(fi_slice);
+    if !write_bytes_to_output(
+        call_table,
+        buf_hdr,
+        file_id_offset,
+        MAX_SECTOR_SIZE as u64,
+        oss,
+        oc,
+    ) {
+        (call_table.send_error)(b"convert\0".as_ptr(), b"output\0".as_ptr(), 0, 2);
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
+    }
+
+    // --- Write Header 1 (4KB header in 64KB region) ---
+    core::ptr::write_bytes(buf_hdr, 0, MAX_SECTOR_SIZE);
+    let hdr_slice = core::slice::from_raw_parts_mut(buf_hdr, vhdx::HEADER_SIZE);
+    vhdx::build_header(hdr_slice, 1); // sequence_number = 1
+                                      // Write as 64KB region (pad remaining with zeros — already zeroed)
+    if !write_bytes_to_output(
+        call_table,
+        buf_hdr,
+        vhdx::HEADER1_OFFSET,
+        MAX_SECTOR_SIZE as u64,
+        oss,
+        oc,
+    ) {
+        (call_table.send_error)(
+            b"convert\0".as_ptr(),
+            b"output\0".as_ptr(),
+            vhdx::HEADER1_OFFSET / oss as u64,
+            2,
+        );
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
+    }
+
+    // --- Write Header 2 (copy with sequence_number = 2) ---
+    core::ptr::write_bytes(buf_hdr, 0, MAX_SECTOR_SIZE);
+    let hdr_slice = core::slice::from_raw_parts_mut(buf_hdr, vhdx::HEADER_SIZE);
+    vhdx::build_header(hdr_slice, 2); // sequence_number = 2
+    if !write_bytes_to_output(
+        call_table,
+        buf_hdr,
+        vhdx::HEADER2_OFFSET,
+        MAX_SECTOR_SIZE as u64,
+        oss,
+        oc,
+    ) {
+        (call_table.send_error)(
+            b"convert\0".as_ptr(),
+            b"output\0".as_ptr(),
+            vhdx::HEADER2_OFFSET / oss as u64,
+            2,
+        );
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
+    }
+
+    // --- Write Region Table 1 (64KB) ---
+    core::ptr::write_bytes(buf_hdr, 0, MAX_SECTOR_SIZE);
+    let rt_slice = core::slice::from_raw_parts_mut(buf_hdr, MAX_SECTOR_SIZE);
+    vhdx::build_region_table(
+        rt_slice,
+        bat_offset,
+        bat_region_size as u32,
+        metadata_offset,
+        metadata_region_size as u32,
+    );
+    if !write_bytes_to_output(
+        call_table,
+        buf_hdr,
+        vhdx::REGION_TABLE1_OFFSET,
+        MAX_SECTOR_SIZE as u64,
+        oss,
+        oc,
+    ) {
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
+    }
+
+    // --- Write Region Table 2 (copy) ---
+    if !write_bytes_to_output(
+        call_table,
+        buf_hdr,
+        vhdx::REGION_TABLE2_OFFSET,
+        MAX_SECTOR_SIZE as u64,
+        oss,
+        oc,
+    ) {
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
+    }
+
+    // --- Write log region (1MB of zeros, just ensure it exists) ---
+    // The log region is at 0x100000, 1MB. Since output is pre-zeroed
+    // for sparse formats, we only need to ensure the region exists
+    // by writing at least one sector.
+    core::ptr::write_bytes(buf_hdr, 0, oss);
+    if !write_bytes_to_output(call_table, buf_hdr, log_offset, oss as u64, oss, oc) {
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
+    }
+
+    // --- Write placeholder BAT (all NOT_PRESENT = 0x00) ---
+    let bat_write_buf = BUF_L2_OUT as *mut u8;
+    let mut bat_written: u64 = 0;
+    let bat_padded = align_up(bat_size_bytes, oss);
+    while bat_written < bat_padded {
+        core::ptr::write_bytes(bat_write_buf, 0, oss);
+        if !write_bytes_to_output(
+            call_table,
+            bat_write_buf,
+            bat_offset + bat_written,
+            oss as u64,
+            oss,
+            oc,
+        ) {
+            (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+            return *bytes_read;
+        }
+        bat_written += oss as u64;
+    }
+
+    // --- Write metadata region ---
+    // Metadata table is in the first sector, items at offset 0x10000
+    // within the metadata region. We need to write both parts.
+
+    // Write metadata table header (first 64KB of metadata region)
+    core::ptr::write_bytes(buf_hdr, 0, MAX_SECTOR_SIZE);
+    let md_slice = core::slice::from_raw_parts_mut(buf_hdr, MAX_SECTOR_SIZE);
+    vhdx::build_metadata(
+        md_slice,
+        block_size as u32,
+        virtual_size,
+        logical_sector_size,
+        physical_sector_size,
+        false, // no parent
+    );
+    if !write_bytes_to_output(
+        call_table,
+        buf_hdr,
+        metadata_offset,
+        MAX_SECTOR_SIZE as u64,
+        oss,
+        oc,
+    ) {
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
+    }
+
+    // The metadata items are at metadata_offset + 0x10000. The
+    // build_metadata() wrote them into the buffer at offset 0x10000
+    // if the buffer was large enough. Since MAX_SECTOR_SIZE = 64KB
+    // = 0x10000, the items are at the very end of our 64KB buffer.
+    // We need to write them as a separate sector.
+    // Actually, build_metadata writes items at buf[0x10000..], but
+    // our buffer is exactly 0x10000 (64KB), so items_base is at
+    // the buffer boundary. Let's handle this by writing metadata
+    // items separately.
+    let buf_data = BUF_DATA as *mut u8;
+    core::ptr::write_bytes(buf_data, 0, oss);
+    let item_slice = core::slice::from_raw_parts_mut(buf_data, oss);
+    // File Parameters: block_size (u32) + flags (u32)
+    vhdx::write_le_u32(item_slice, 0, block_size as u32);
+    vhdx::write_le_u32(item_slice, 4, 0); // flags: no parent
+                                          // Virtual Disk Size (u64) at offset 8
+    vhdx::write_le_u64(item_slice, 8, virtual_size);
+    // Logical Sector Size (u32) at offset 16
+    vhdx::write_le_u32(item_slice, 16, logical_sector_size);
+    // Physical Sector Size (u32) at offset 20
+    vhdx::write_le_u32(item_slice, 20, physical_sector_size);
+    // Virtual Disk ID (16 bytes) at offset 24
+    let size_bytes = virtual_size.to_le_bytes();
+    item_slice[24..32].copy_from_slice(&size_bytes);
+    let bs_bytes = (block_size as u32).to_le_bytes();
+    item_slice[32..36].copy_from_slice(&bs_bytes);
+    item_slice[36] = b'V';
+    item_slice[37] = b'H';
+    item_slice[38] = b'D';
+    item_slice[39] = b'X';
+
+    if !write_bytes_to_output(
+        call_table,
+        buf_data,
+        metadata_offset + 0x10000,
+        oss as u64,
+        oss,
+        oc,
+    ) {
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
+    }
+
+    // --- Write payload blocks ---
+    let mut next_free_offset = payload_start;
+    let mut blocks_done: u64 = 0;
+    let total_blocks = total_payload_blocks as u64;
+    let mut last_percent: u32 = 0;
+    let chunk_size = MAX_SECTOR_SIZE as u64;
+
+    for block_idx in 0..total_payload_blocks {
+        let virtual_offset = block_idx as u64 * block_size;
+        let remaining = virtual_size - virtual_offset;
+        let this_block = if remaining < block_size {
+            remaining
+        } else {
+            block_size
+        };
+
+        HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
+
+        // First pass: check if block is all zeros
+        let mut block_all_zeros = true;
+        let mut intra_offset: u64 = 0;
+
+        while intra_offset < this_block {
+            let chunk_remaining = this_block - intra_offset;
+            let this_chunk = if chunk_remaining < chunk_size {
+                chunk_remaining
+            } else {
+                chunk_size
+            };
+
+            HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
+
+            if !qcow2::read_chain_virtual_cluster(
+                call_table,
+                0,
+                input_device_count,
+                virtual_offset + intra_offset,
+                buf_data,
+                this_chunk,
+                sector_size,
+                chain_config,
+                chain_states,
+                BUF_COMPRESSED_IN as *mut u8,
+                bytes_read,
+            ) {
+                (call_table.send_error)(
+                    b"convert\0".as_ptr(),
+                    b"input\0".as_ptr(),
+                    (virtual_offset + intra_offset) / sector_size as u64,
+                    1,
+                );
+                (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+                return *bytes_read;
+            }
+
+            if !is_all_zeros_ptr(buf_data, this_chunk as usize) {
+                block_all_zeros = false;
+            }
+
+            intra_offset += this_chunk;
+        }
+
+        // Skip zero blocks when configured
+        if skip_zeros && block_all_zeros {
+            blocks_done += 1;
+            let pct = (blocks_done * 100 / total_blocks) as u32;
+            if should_report_progress(progress_interval, pct, last_percent, blocks_done) {
+                (call_table.send_progress)(b"convert\0".as_ptr(), blocks_done, total_blocks, pct);
+                last_percent = pct;
+            }
+            continue;
+        }
+
+        // Allocate block (must be 1MB-aligned per VHDX spec)
+        let block_file_offset = align_up(next_free_offset, vhdx::MB_ALIGN as usize);
+        next_free_offset = block_file_offset + block_size;
+
+        // Record BAT entry: state=FULLY_PRESENT, offset=block_file_offset
+        let bat_index = vhdx_payload_bat_index(block_idx, chunk_ratio);
+        let entry = vhdx::build_bat_entry(vhdx::PAYLOAD_BLOCK_FULLY_PRESENT, block_file_offset);
+        let bat_slice = core::slice::from_raw_parts_mut(bat_buf, bat_alloc);
+        vhdx::write_le_u64(bat_slice, bat_index as usize * 8, entry);
+
+        // Write block data in chunks
+        intra_offset = 0;
+        while intra_offset < this_block {
+            let chunk_remaining = this_block - intra_offset;
+            let this_chunk = if chunk_remaining < chunk_size {
+                chunk_remaining
+            } else {
+                chunk_size
+            };
+
+            HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
+
+            if !qcow2::read_chain_virtual_cluster(
+                call_table,
+                0,
+                input_device_count,
+                virtual_offset + intra_offset,
+                buf_data,
+                this_chunk,
+                sector_size,
+                chain_config,
+                chain_states,
+                BUF_COMPRESSED_IN as *mut u8,
+                bytes_read,
+            ) {
+                (call_table.send_error)(
+                    b"convert\0".as_ptr(),
+                    b"input\0".as_ptr(),
+                    (virtual_offset + intra_offset) / sector_size as u64,
+                    1,
+                );
+                (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+                return *bytes_read;
+            }
+
+            // Zero-pad partial final chunk
+            if this_chunk < chunk_size {
+                core::ptr::write_bytes(
+                    buf_data.add(this_chunk as usize),
+                    0,
+                    (chunk_size - this_chunk) as usize,
+                );
+            }
+
+            if !write_bytes_to_output(
+                call_table,
+                buf_data,
+                block_file_offset + intra_offset,
+                this_chunk,
+                oss,
+                oc,
+            ) {
+                (call_table.send_error)(
+                    b"convert\0".as_ptr(),
+                    b"output\0".as_ptr(),
+                    (block_file_offset + intra_offset) / oss as u64,
+                    2,
+                );
+                (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+                return *bytes_read;
+            }
+
+            intra_offset += this_chunk;
+        }
+
+        // Zero-pad remaining block data if this_block < block_size
+        if this_block < block_size {
+            let pad_start = block_file_offset + this_block;
+            let pad_len = block_size - this_block;
+            let mut pad_written: u64 = 0;
+            core::ptr::write_bytes(buf_data, 0, chunk_size as usize);
+            while pad_written < pad_len {
+                let write_len = if pad_len - pad_written < chunk_size {
+                    pad_len - pad_written
+                } else {
+                    chunk_size
+                };
+                if !write_bytes_to_output(
+                    call_table,
+                    buf_data,
+                    pad_start + pad_written,
+                    write_len,
+                    oss,
+                    oc,
+                ) {
+                    (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+                    return *bytes_read;
+                }
+                pad_written += write_len;
+            }
+        }
+
+        blocks_done += 1;
+        let pct = (blocks_done * 100 / total_blocks) as u32;
+        if should_report_progress(progress_interval, pct, last_percent, blocks_done) {
+            (call_table.send_progress)(b"convert\0".as_ptr(), blocks_done, total_blocks, pct);
+            last_percent = pct;
+        }
+    }
+
+    // --- Rewrite BAT with actual offsets ---
+    let mut bat_rewritten: u64 = 0;
+    while bat_rewritten < bat_padded {
+        let write_len = oss as u64;
+        let src_off = bat_rewritten as usize;
+        let copy_len = if src_off + oss <= bat_alloc {
+            oss
+        } else if bat_alloc > src_off {
+            bat_alloc - src_off
+        } else {
+            0
+        };
+        core::ptr::write_bytes(bat_write_buf, 0, oss);
+        if copy_len > 0 {
+            core::ptr::copy_nonoverlapping(bat_buf.add(src_off), bat_write_buf, copy_len);
+        }
+        if !write_bytes_to_output(
+            call_table,
+            bat_write_buf,
+            bat_offset + bat_rewritten,
+            write_len,
+            oss,
+            oc,
+        ) {
+            (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+            return *bytes_read;
+        }
+        bat_rewritten += write_len;
+    }
+
+    (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, true);
+    (call_table.verbose_print)(b"convert: VHDX done\n\0".as_ptr());
+    *bytes_read
+}
+
+/// Compute the BAT array index for a payload block, accounting for
+/// interleaved sector bitmap entries.
+#[inline]
+fn vhdx_payload_bat_index(payload_block_idx: u32, chunk_ratio: u32) -> u32 {
+    let sb_entries_before = payload_block_idx / chunk_ratio;
+    payload_block_idx + sb_entries_before
 }
 
 /// Round `val` up to the next multiple of `align`.

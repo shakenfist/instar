@@ -21,6 +21,7 @@ Initial target formats:
 - **raw** - Raw disk images
 - **vmdk** - VMware Virtual Machine Disk
 - **vpc** (VHD) - Virtual Hard Disk (Hyper-V, Virtual PC)
+- **vhdx** - VHDX Virtual Hard Disk v2 (Hyper-V)
 
 ## Project Status
 
@@ -127,6 +128,17 @@ For VHD images (dynamic and fixed), check validates:
 - Overlap detection (no two BAT entries reference same block)
 - Footer copy consistency (start vs end of file)
 
+For VHDX images, check validates:
+- Header 1 and Header 2: signature, CRC-32C checksum, active header
+  selection by sequence number
+- Dirty log detection (non-zero log GUID)
+- Region table: signature, CRC-32C, BAT and metadata region presence
+- Metadata: required items (FileParameters, VirtualDiskSize,
+  LogicalSectorSize, PhysicalSectorSize)
+- Differencing disk detection (unsupported)
+- BAT entries: block offsets within file bounds, 1MB alignment,
+  overlap detection, state validation
+
 The `--chain` flag discovers the full backing chain (using the same chain
 discovery infrastructure as `imago info --chain`), sets up each image as a
 separate virtio-block device in the KVM guest, and validates:
@@ -168,6 +180,9 @@ imago convert -O qcow2 --cluster-size 4096 input.raw output.qcow2
 # Convert to VHD dynamic format
 imago convert -O vpc input.qcow2 output.vhd
 
+# Convert to VHDX dynamic format
+imago convert -O vhdx input.qcow2 output.vhdx
+
 # Progress reporting
 imago convert -p 5 input.qcow2 output.raw
 ```
@@ -183,6 +198,7 @@ Supported output formats:
   size (512 bytes to 64KB, default 64KB), optional zlib compression (`-c`)
 - **vmdk** - VMDK monolithicSparse output, optional DEFLATE compression (`-c`)
 - **vpc** - VHD dynamic output with 2 MiB blocks
+- **vhdx** - VHDX dynamic output with 32 MiB blocks
 
 **Limitations:** Compressed clusters with cluster sizes above 64KB cannot
 be decompressed. Uncompressed clusters up to 2MB are fully supported.
@@ -371,6 +387,7 @@ imago/
 │   │   ├── qcow2/  # QCOW2 header, L1/L2, decompression, refcounts
 │   │   ├── raw/    # MBR/GPT partition table detection
 │   │   ├── vhd/    # VHD footer, dynamic header, BAT parsing
+│   │   ├── vhdx/   # VHDX headers, region table, metadata, BAT, CRC-32C
 │   │   └── vmdk/   # VMDK4 header and descriptor parsing
 │   ├── operations/ # Pluggable operations (info, copy, check, compare, convert)
 │   └── build.sh    # Build script

@@ -270,9 +270,41 @@ Enhance VHD check:
 Manifest-driven VHD tests. Round-trip tests. Update README.md,
 ARCHITECTURE.md, AGENTS.md, format-coverage.md.
 
-## Phase 10: VHDX input+output
+## Phase 10: VHDX input+output — COMPLETE
 
-Design for this phase will occur later.
+Implemented full VHDX support in 5 sub-phases:
+
+- **Phase 10a**: VHDX crate (`src/crates/vhdx/`) with CRC-32C (Castagnoli)
+  implementation, header/region table/metadata parsing, BAT reading with
+  interleaved sector bitmap entries, VhdxState for block I/O, and output
+  builders. ~1400 lines, 19 unit tests.
+- **Phase 10b**: VHDX input support in convert and compare operations via
+  `vhdx-input` feature gate in qcow2 crate chain reader.
+- **Phase 10c**: VHDX dynamic output in convert operation. 32 MiB blocks,
+  1MB-aligned structures, CRC-32C checksums, skip-zeros support.
+- **Phase 10d**: Enhanced VHDX check with comprehensive validation: dual
+  header CRC-32C, dirty log detection, region table CRC, GUID-based
+  metadata parsing, BAT bounds/alignment/overlap/state validation.
+- **Phase 10e**: Integration tests (VHDX→raw, raw→VHDX, round-trip,
+  compare, check output) and documentation updates.
+- **Phase 10f** (fix): VMM cluster_size check excluded VHD/VHDX
+  (block_size ≠ cluster_size), and VHDX output capacity calculation
+  accounts for 32MB block rounding.
+
+## Deferred Work (from Phase 10 review)
+
+### Refactoring Opportunities (not blocking, future improvement)
+
+17. **Byte-order helper duplication grows** — VHDX adds LE helpers
+    (`le_u16`/`le_u32`/`le_u64`, `write_le_*`) duplicating the
+    pattern from VHD's LE and QCOW2/VMDK's BE helpers. All format
+    crates have ~20 lines of identical byte-order helpers. Still
+    not blocking — same recommendation as item 11.
+
+18. **Two-pass zero check in convert_to_vhdx** — Same pattern as
+    item 12 (VHD). Each 32 MiB VHDX block is read twice when
+    skip-zeros is enabled. Performance impact is minimal for
+    typical images due to OS page cache.
 
 ---
 

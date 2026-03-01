@@ -2562,3 +2562,337 @@ class TestConvertVmdkCheckOutput(ImagoTestBase):
 #   - TestConvertVhdCheckOutput: imago check on imago-produced VHD files
 #   - TestConvertVhdCompare: VHD vs raw comparison via imago compare
 # Test images available: hyperv-dynamic-vhd, virtualpc-vhd, vhd-d2v-zerofilled
+
+
+class TestConvertVhdxToRaw(ImagoTestBase):
+    """Test VHDX to raw conversion.
+
+    Converts VHDX images to raw and cross-validates against
+    qemu-img convert output.
+    """
+
+    VHDX_IDS = [
+        'qemu-vhdx',
+        'vhdx-disk2vhd',
+    ]
+
+    def _get_vhdx_info(self, image_path):
+        """Get virtual_size via qemu-img info."""
+        result = subprocess.run(
+            [
+                'qemu-img', 'info', '--output=json',
+                str(image_path),
+            ],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return None
+        info = json.loads(result.stdout)
+        return info.get('virtual-size')
+
+    def _timeout_for_vsize(self, vsize):
+        """Compute timeout based on virtual size."""
+        if not vsize:
+            return 120
+        gib = vsize / (1024 ** 3)
+        return max(120, int(120 + gib * 10))
+
+    def _test_vhdx_convert(self, image_id):
+        """Convert a VHDX image to raw and cross-validate."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        vsize = self._get_vhdx_info(image.path)
+        timeout = self._timeout_for_vsize(vsize)
+
+        # Check available temp space
+        if vsize:
+            tmpdir = tempfile.gettempdir()
+            st = os.statvfs(tmpdir)
+            avail = st.f_bavail * st.f_frsize
+            needed = vsize * 2 + 100 * 1024 * 1024
+            if avail < needed:
+                self.skipTest(
+                    f'{image_id}: needs '
+                    f'{needed // (1024**3)}GB temp, '
+                    f'only {avail // (1024**3)}GB '
+                    f'available'
+                )
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') \
+                as imago_raw, \
+                tempfile.NamedTemporaryFile(suffix='.raw') \
+                as qemu_raw:
+            # Convert with imago
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(imago_raw.name),
+                timeout=timeout
+            )
+            self.assertEqual(
+                rc, 0,
+                f'imago convert failed for {image_id}: '
+                f'{stderr}'
+            )
+
+            # Convert with qemu-img
+            q_stdout, q_stderr, q_rc = \
+                self.run_qemu_img_convert(
+                    image.path, Path(qemu_raw.name),
+                    timeout=timeout
+                )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed for '
+                f'{image_id}: {q_stderr}'
+            )
+
+            # Compare outputs
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(imago_raw.name),
+                Path(qemu_raw.name),
+                timeout=timeout
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Convert output for {image_id} differs '
+                f'from qemu-img: {cmp_out}'
+            )
+
+    def test_convert_qemu_vhdx(self):
+        """Convert QEMU iotest VHDX to raw."""
+        self._test_vhdx_convert('qemu-vhdx')
+
+    def test_convert_vhdx_disk2vhd(self):
+        """Convert Disk2VHD VHDX to raw."""
+        self._test_vhdx_convert('vhdx-disk2vhd')
+
+
+class TestConvertVhdxCompare(ImagoTestBase):
+    """Test comparing VHDX images against raw equivalents.
+
+    Uses imago compare to verify VHDX virtual content matches
+    the qemu-img-converted raw baseline.
+    """
+
+    def _compare_vhdx_vs_raw(self, image_id):
+        """Compare VHDX against its qemu-img-converted raw."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') \
+                as qemu_raw:
+            # Convert with qemu-img as baseline
+            q_stdout, q_stderr, q_rc = \
+                self.run_qemu_img_convert(
+                    image.path, Path(qemu_raw.name),
+                    timeout=120
+                )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed for '
+                f'{image_id}: {q_stderr}'
+            )
+
+            # Compare VHDX directly against raw
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                image.path, Path(qemu_raw.name),
+                timeout=120
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'VHDX {image_id} content '
+                f'differs from raw: {cmp_out}'
+            )
+
+    def test_compare_qemu_vhdx_vs_raw(self):
+        """Compare QEMU iotest VHDX against raw."""
+        self._compare_vhdx_vs_raw('qemu-vhdx')
+
+    def test_compare_vhdx_disk2vhd_vs_raw(self):
+        """Compare Disk2VHD VHDX against raw."""
+        self._compare_vhdx_vs_raw('vhdx-disk2vhd')
+
+
+class TestConvertToVhdx(ImagoTestBase):
+    """Test converting images to VHDX output.
+
+    Converts images to VHDX with imago, then verifies the output
+    by converting back to raw and comparing against qemu-img.
+    """
+
+    def _test_to_vhdx_roundtrip(self, image_id):
+        """Convert image to VHDX, then back to raw, compare."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.vhdx') as vhdx_out, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as rt_raw, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as qemu_raw:
+            # Convert to VHDX with imago
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(vhdx_out.name),
+                output_format='vhdx',
+                timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'imago convert to vhdx failed for '
+                f'{image_id}: {stderr}'
+            )
+
+            # Verify qemu-img can read the VHDX
+            result = subprocess.run(
+                [
+                    'qemu-img', 'info', '--output=json',
+                    vhdx_out.name,
+                ],
+                capture_output=True, text=True,
+                timeout=30
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img info failed on imago VHDX: '
+                f'{result.stderr}'
+            )
+            info = json.loads(result.stdout)
+            self.assertEqual(
+                info.get('format'), 'vhdx',
+                f'Output is not VHDX format: '
+                f'{info.get("format")}'
+            )
+
+            # Round-trip: convert VHDX back to raw
+            rt_stdout, rt_stderr, rt_rc = \
+                self.run_imago_convert(
+                    Path(vhdx_out.name),
+                    Path(rt_raw.name),
+                    timeout=120
+                )
+            self.assertEqual(
+                rt_rc, 0,
+                f'Round-trip convert failed for '
+                f'{image_id}: {rt_stderr}'
+            )
+
+            # Convert original to raw with qemu-img
+            q_stdout, q_stderr, q_rc = \
+                self.run_qemu_img_convert(
+                    image.path, Path(qemu_raw.name),
+                    timeout=120
+                )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed: {q_stderr}'
+            )
+
+            # Compare round-tripped raw vs qemu-img raw
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(rt_raw.name),
+                Path(qemu_raw.name),
+                timeout=120
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Round-trip mismatch for {image_id}: '
+                f'{cmp_out}'
+            )
+
+    def test_raw_to_vhdx_roundtrip(self):
+        """Round-trip: raw -> vhdx -> raw."""
+        self._test_to_vhdx_roundtrip('raw-mbr-partitioned')
+
+    def test_qcow2_to_vhdx_roundtrip(self):
+        """Round-trip: qcow2 -> vhdx -> raw."""
+        self._test_to_vhdx_roundtrip('cirros-qcow2')
+
+    def test_vhdx_to_vhdx_roundtrip(self):
+        """Round-trip: vhdx -> vhdx -> raw."""
+        self._test_to_vhdx_roundtrip('qemu-vhdx')
+
+
+class TestConvertVhdxCheckOutput(ImagoTestBase):
+    """Test that imago-produced VHDX output passes check.
+
+    Converts images to VHDX, then runs imago check to verify
+    structural integrity of our own output.
+    """
+
+    def _test_vhdx_output_check(self, image_id):
+        """Convert to VHDX, then check the output."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.vhdx') as vhdx_out:
+            # Convert to VHDX
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(vhdx_out.name),
+                output_format='vhdx',
+                timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'imago convert to vhdx failed for '
+                f'{image_id}: {stderr}'
+            )
+
+            # Check the output VHDX
+            chk_stdout, chk_stderr, chk_rc = \
+                self.run_imago_check(
+                    Path(vhdx_out.name),
+                    output_format='json'
+                )
+            result = json.loads(chk_stdout)
+
+            self.assertEqual(
+                result.get('format', '').lower(),
+                'vhdx',
+                f'Output should be detected as vhdx'
+            )
+            self.assertEqual(
+                result.get('check-errors', -1), 0,
+                f'imago VHDX output should have 0 '
+                f'errors: {chk_stdout}'
+            )
+
+    def test_check_raw_to_vhdx_output(self):
+        """Check imago VHDX output from raw input."""
+        self._test_vhdx_output_check(
+            'raw-mbr-partitioned'
+        )
+
+    def test_check_qcow2_to_vhdx_output(self):
+        """Check imago VHDX output from QCOW2 input."""
+        self._test_vhdx_output_check('cirros-qcow2')
+
+    def test_check_vhdx_to_vhdx_output(self):
+        """Check imago VHDX output from VHDX input."""
+        self._test_vhdx_output_check('qemu-vhdx')
+
+
+# TODO: Add VHD integration tests matching VMDK coverage above:
+#   - TestConvertVhdToRaw: VHD->raw conversion cross-validated with qemu-img
+#   - TestConvertToVhd: raw/qcow2/vhd->VHD round-trip (raw->VHD->raw)
+#   - TestConvertVhdToQcow2Roundtrip: VHD->QCOW2->raw round-trip
+#   - TestConvertVhdCheckOutput: imago check on imago-produced VHD files
+#   - TestConvertVhdCompare: VHD vs raw comparison via imago compare
+# Test images available: hyperv-dynamic-vhd, virtualpc-vhd, vhd-d2v-zerofilled
