@@ -305,7 +305,9 @@ overlap detection, state validation).
 detection, safety verdicts, and virtual size. Known divergences
 (GPT detection for raw images, QED banning, LUKS v2 rejection)
 are documented in the test module. CI runs the crossval tests
-against both the PyPI release and oslo.utils git master.
+against the PyPI release as part of the integration-test suite,
+and a separate job runs them against oslo.utils git master to
+catch upstream drift early.
 
 ## Open Questions
 
