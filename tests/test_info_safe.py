@@ -16,23 +16,14 @@ from pathlib import Path
 import testscenarios
 
 from base import ImagoTestBase
+from helpers import load_manifest_images
 
 
 def _get_safe_images_from_manifest():
     """Load safe image IDs from the manifest file."""
-    tests_dir = Path(__file__).parent
-    manifest_path = tests_dir / 'manifest.json'
-
-    if not manifest_path.exists():
-        return []
-
-    with open(manifest_path) as f:
-        manifest = json.load(f)
-
-    # Return IDs of all images marked as 'safe'
     return [
         img['id']
-        for img in manifest.get('images', [])
+        for img in load_manifest_images()
         if img.get('safety') == 'safe'
     ]
 

@@ -298,6 +298,17 @@ dirty log detection, region table CRC-32C validation, GUID-based
 metadata parsing, BAT entry validation (offset bounds, 1MB alignment,
 overlap detection, state validation).
 
+## oslo.utils Cross-Validation
+
+`tests/test_oslo_crossval.py` runs both imago and oslo.utils
+`format_inspector` against every test image, comparing format
+detection, safety verdicts, and virtual size. Known divergences
+(GPT detection for raw images, QED banning, LUKS v2 rejection)
+are documented in the test module. CI runs the crossval tests
+against the PyPI release as part of the integration-test suite,
+and a separate job runs them against oslo.utils git master to
+catch upstream drift early.
+
 ## Open Questions
 
 1. How to handle backing files in qcow2? Flatten on conversion?
