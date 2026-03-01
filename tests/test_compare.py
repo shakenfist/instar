@@ -4,6 +4,9 @@ TODO: Add VHD compare integration tests matching VMDK coverage in
 test_convert.py (TestConvertVmdkCompare). Should test VHD vs raw
 comparison using imago compare with hyperv-dynamic-vhd, virtualpc-vhd,
 and vhd-d2v-zerofilled test images.
+
+Note: VHDX compare integration tests (VHDX vs raw comparison) are in
+test_convert.py (TestConvertVhdxCompare).
 """
 
 import json
