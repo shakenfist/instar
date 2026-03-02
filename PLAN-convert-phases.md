@@ -534,15 +534,30 @@ Gerrit review 978095 and related changes show oslo.utils is adding:
     easier to selectively loosen rejections.
 
 **Implications for imago:**
-- imago already detects LUKS format but doesn't inspect inner
-  content. If OpenStack starts cascading safety checks through
-  LUKS containers, imago should consider reporting the inner
-  format too (though our KVM sandbox makes this less critical).
+- imago now reports LUKS inner format when given a passphrase,
+  matching oslo.utils ContainerFileInspector functionality.
 - The GPT/MBR safety check reorganization may change oslo.utils
   output format; monitor for test compatibility impact.
-- The `ContainerFileInspector` pattern is worth noting if we add
-  LUKS support to `imago convert` — we'd need similar chained
-  format detection in the guest.
+
+## Deferred Work (from Phase 12 review)
+
+### Future LUKS Enhancements
+
+19. **LUKS v2 Argon2id decryption** — LUKS v2 uses Argon2id for
+    key derivation, which requires significant memory (typically
+    1 GiB). The current 32 MiB guest allocation is insufficient.
+    The `--max-guest-memory` CLI flag provides infrastructure;
+    implementation requires dynamic page table expansion in the
+    VMM and guest, plus integrating an Argon2 crate (no_std).
+
+20. **LUKS v2 test container** — `luks-v2-raw-gpt` is defined
+    in the manifest but not yet created (cryptsetup v2 format
+    requires Argon2 for key derivation, which is slow in CI).
+    Create when v2 decryption is implemented.
+
+21. **LUKS convert support** — Currently LUKS is info-only.
+    Future: `imago convert --luks-passphrase` could decrypt
+    LUKS and convert the inner image in a single pass.
 
 ## Verification
 
