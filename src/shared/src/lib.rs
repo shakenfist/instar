@@ -471,6 +471,22 @@ pub struct CallTable {
         *const VdiInfo, // vdi_info
     ),
 
+    /// Send info result message with LUKS-specific information.
+    /// Args: format (null-terminated), version, virtual_size, actual_size,
+    ///       cluster_size, flags, backing_file (null-terminated),
+    ///       external_data_file (null-terminated), luks_info pointer
+    pub send_info_result_luks: unsafe extern "C" fn(
+        *const u8,       // format
+        u32,             // version
+        u64,             // virtual_size
+        u64,             // actual_size
+        u32,             // cluster_size
+        u32,             // flags
+        *const u8,       // backing_file
+        *const u8,       // external_data_file
+        *const LuksInfo, // luks_info
+    ),
+
     /// Send check result message.
     /// Args: check_result pointer containing all check results
     pub send_check_result: unsafe extern "C" fn(*const CheckResult),
@@ -696,6 +712,100 @@ impl VdiInfo {
     }
 }
 
+/// LUKS format-specific information (FFI-safe).
+///
+/// Contains parsed LUKS header fields for both v1 and v2.
+/// String fields are null-terminated with fixed-size buffers
+/// matching the LUKS on-disk format (32 bytes for cipher/mode/hash,
+/// 37 bytes for UUID).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LuksInfo {
+    /// Cipher name (null-terminated, e.g., "aes")
+    pub cipher: [u8; 32],
+    /// Cipher mode (null-terminated, e.g., "xts-plain64")
+    pub cipher_mode: [u8; 32],
+    /// Hash spec (null-terminated, e.g., "sha256")
+    pub hash: [u8; 32],
+    /// UUID (null-terminated, 36 chars + null)
+    pub uuid: [u8; 37],
+    /// Padding for alignment
+    pub _pad: [u8; 3],
+    /// Payload offset in 512-byte sectors (LUKS v1)
+    pub payload_offset: u32,
+    /// Master key length in bytes
+    pub master_key_length: u32,
+    /// Number of active key slots
+    pub active_key_slots: u32,
+    /// Detected inner format name after decryption (null-terminated)
+    pub inner_format: [u8; 16],
+    /// Virtual size of the inner format in bytes (0 if not detected)
+    pub inner_virtual_size: u64,
+}
+
+impl Default for LuksInfo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LuksInfo {
+    /// Create new LUKS info with defaults
+    pub const fn new() -> Self {
+        Self {
+            cipher: [0; 32],
+            cipher_mode: [0; 32],
+            hash: [0; 32],
+            uuid: [0; 37],
+            _pad: [0; 3],
+            payload_offset: 0,
+            master_key_length: 0,
+            active_key_slots: 0,
+            inner_format: [0; 16],
+            inner_virtual_size: 0,
+        }
+    }
+
+    /// Get cipher name as a str slice
+    pub fn cipher_str(&self) -> &str {
+        cstr_to_str(&self.cipher)
+    }
+
+    /// Get cipher mode as a str slice
+    pub fn cipher_mode_str(&self) -> &str {
+        cstr_to_str(&self.cipher_mode)
+    }
+
+    /// Get hash spec as a str slice
+    pub fn hash_str(&self) -> &str {
+        cstr_to_str(&self.hash)
+    }
+
+    /// Get UUID as a str slice
+    pub fn uuid_str(&self) -> &str {
+        cstr_to_str(&self.uuid)
+    }
+
+    /// Get inner format name as a str slice
+    pub fn inner_format_str(&self) -> &str {
+        cstr_to_str(&self.inner_format)
+    }
+
+    /// Set the inner format name from a string slice
+    pub fn set_inner_format(&mut self, name: &str) {
+        let bytes = name.as_bytes();
+        let len = bytes.len().min(self.inner_format.len() - 1);
+        self.inner_format[..len].copy_from_slice(&bytes[..len]);
+        self.inner_format[len] = 0;
+    }
+}
+
+/// Extract a null-terminated string from a byte buffer.
+fn cstr_to_str(buf: &[u8]) -> &str {
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    core::str::from_utf8(&buf[..end]).unwrap_or("")
+}
+
 impl CallTable {
     /// Magic value indicating a valid call table
     pub const MAGIC: u32 = 0x494D4147; // "IMAG"
@@ -893,6 +1003,9 @@ impl ImageFormat {
 /// Configuration for the info operation.
 ///
 /// This structure is written to OPERATION_CONFIG_ADDR by the VMM.
+/// Maximum passphrase length for LUKS decryption.
+pub const INFO_CONFIG_MAX_PASSPHRASE: usize = 256;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct InfoConfig {
@@ -901,6 +1014,15 @@ pub struct InfoConfig {
 
     /// Configuration flags
     pub flags: u32,
+
+    /// LUKS passphrase length (0 = no passphrase provided)
+    pub passphrase_len: u32,
+
+    /// Padding for alignment
+    pub _pad: u32,
+
+    /// LUKS passphrase (null-padded, max 256 bytes)
+    pub passphrase: [u8; INFO_CONFIG_MAX_PASSPHRASE],
 }
 
 impl InfoConfig {
@@ -928,6 +1050,9 @@ impl InfoConfig {
         Self {
             magic: Self::MAGIC,
             flags: Self::FLAG_DETAILED | Self::FLAG_SECURITY_CHECK,
+            passphrase_len: 0,
+            _pad: 0,
+            passphrase: [0; INFO_CONFIG_MAX_PASSPHRASE],
         }
     }
 
@@ -962,6 +1087,17 @@ impl InfoConfig {
     /// are reported as their qemu-img equivalent for compatibility.
     pub fn extra_detail_enabled(&self) -> bool {
         (self.flags & Self::FLAG_EXTRA_DETAIL) != 0
+    }
+
+    /// Check if a LUKS passphrase was provided
+    pub fn has_passphrase(&self) -> bool {
+        self.passphrase_len > 0
+    }
+
+    /// Get the passphrase bytes (empty slice if none)
+    pub fn passphrase_bytes(&self) -> &[u8] {
+        let len = (self.passphrase_len as usize).min(INFO_CONFIG_MAX_PASSPHRASE);
+        &self.passphrase[..len]
     }
 }
 

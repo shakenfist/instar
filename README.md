@@ -22,6 +22,7 @@ Initial target formats:
 - **vmdk** - VMware Virtual Machine Disk
 - **vpc** (VHD) - Virtual Hard Disk (Hyper-V, Virtual PC)
 - **vhdx** - VHDX Virtual Hard Disk v2 (Hyper-V)
+- **luks** - LUKS encrypted containers (v1/v2, info with optional decryption)
 
 ## Project Status
 
@@ -50,6 +51,9 @@ imago info image.qcow2
 
 # Discover and display the complete backing file chain
 imago info --chain image.qcow2
+
+# Inspect LUKS container with inner format detection
+imago info --luks-passphrase 'secret' encrypted.luks
 ```
 
 The `--chain` flag iteratively runs the sandboxed info operation on each image

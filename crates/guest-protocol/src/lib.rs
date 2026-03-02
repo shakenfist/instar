@@ -416,6 +416,74 @@ pub fn info_result_message_with_vdi(
     msg
 }
 
+/// LUKS format-specific information for info_result_message_with_luks.
+pub struct LuksInfoData<'a> {
+    /// Cipher name (e.g., "aes")
+    pub cipher: &'a str,
+    /// Cipher mode (e.g., "xts-plain64")
+    pub cipher_mode: &'a str,
+    /// Hash spec (e.g., "sha256")
+    pub hash: &'a str,
+    /// Volume UUID
+    pub uuid: &'a str,
+    /// Payload offset in 512-byte sectors (LUKS v1)
+    pub payload_offset: u32,
+    /// Master key length in bytes
+    pub master_key_length: u32,
+    /// Number of active key slots
+    pub active_key_slots: u32,
+    /// Detected inner format after decryption (empty if not decrypted)
+    pub inner_format: &'a str,
+    /// Virtual size of inner format (0 if not detected)
+    pub inner_virtual_size: u64,
+}
+
+/// Helper to create an info result message with LUKS-specific information.
+#[allow(clippy::too_many_arguments)]
+pub fn info_result_message_with_luks(
+    format: &str,
+    version: u32,
+    virtual_size: u64,
+    actual_size: u64,
+    cluster_size: u32,
+    flags: u32,
+    backing_file: &str,
+    external_data_file: &str,
+    luks_info: &LuksInfoData,
+) -> guest_::GuestMessage {
+    let mut msg = guest_::GuestMessage::default();
+    msg.level = guest_::Level::Info;
+
+    let mut info = guest_::InfoResultMessage::default();
+    push_str(&mut info.format, format);
+    info.version = version;
+    info.virtual_size = virtual_size;
+    info.actual_size = actual_size;
+    info.cluster_size = cluster_size;
+    info.flags = flags;
+    push_str_1024(&mut info.backing_file, backing_file);
+    push_str_1024(&mut info.external_data_file, external_data_file);
+
+    // Set LUKS-specific information
+    push_str(&mut info.luks_info.cipher, luks_info.cipher);
+    push_str(&mut info.luks_info.cipher_mode, luks_info.cipher_mode);
+    push_str(&mut info.luks_info.hash, luks_info.hash);
+    push_str_48(&mut info.luks_info.uuid, luks_info.uuid);
+    info.luks_info.payload_offset = luks_info.payload_offset;
+    info.luks_info.master_key_length = luks_info.master_key_length;
+    info.luks_info.active_key_slots = luks_info.active_key_slots;
+    if !luks_info.inner_format.is_empty() {
+        push_str(&mut info.luks_info.inner_format, luks_info.inner_format);
+        info.luks_info.inner_virtual_size = luks_info.inner_virtual_size;
+    }
+
+    // Mark luks_info as present so the encoder includes it
+    info._has.set_luks_info();
+
+    msg.payload = Some(guest_::GuestMessage_::Payload::InfoResult(info));
+    msg
+}
+
 /// Helper to create a check result message.
 ///
 /// # Arguments

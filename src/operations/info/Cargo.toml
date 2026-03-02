@@ -11,6 +11,14 @@ qcow2 = { path = "../../crates/qcow2" }
 raw = { path = "../../crates/raw" }
 vmdk = { path = "../../crates/vmdk" }
 
+# RustCrypto crates for LUKS1 decryption (all no_std, no alloc)
+aes = { version = "0.8", default-features = false }
+xts-mode = { version = "0.5", default-features = false }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+hmac = { version = "0.12", default-features = false }
+sha1 = { version = "0.10", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+
 [profile.release]
 panic = "abort"
 opt-level = "z"
