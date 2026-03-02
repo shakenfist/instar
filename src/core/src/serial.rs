@@ -426,6 +426,45 @@ pub fn send_info_result_vdi(
     send_message(&msg);
 }
 
+/// Send an info result message with LUKS-specific information
+#[allow(clippy::too_many_arguments)]
+pub fn send_info_result_luks(
+    format: &str,
+    version: u32,
+    virtual_size: u64,
+    actual_size: u64,
+    cluster_size: u32,
+    flags: u32,
+    backing_file: &str,
+    external_data_file: &str,
+    luks_info: &shared::LuksInfo,
+) {
+    let luks_data = guest_protocol::LuksInfoData {
+        cipher: luks_info.cipher_str(),
+        cipher_mode: luks_info.cipher_mode_str(),
+        hash: luks_info.hash_str(),
+        uuid: luks_info.uuid_str(),
+        payload_offset: luks_info.payload_offset,
+        master_key_length: luks_info.master_key_length,
+        active_key_slots: luks_info.active_key_slots,
+        inner_format: luks_info.inner_format_str(),
+        inner_virtual_size: luks_info.inner_virtual_size,
+    };
+
+    let msg = guest_protocol::info_result_message_with_luks(
+        format,
+        version,
+        virtual_size,
+        actual_size,
+        cluster_size,
+        flags,
+        backing_file,
+        external_data_file,
+        &luks_data,
+    );
+    send_message(&msg);
+}
+
 /// Send a check result message
 #[allow(clippy::too_many_arguments)]
 pub fn send_check_result(result: &shared::CheckResult) {

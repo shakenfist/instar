@@ -248,7 +248,7 @@ QEMU Copy-On-Write version 2/3. Supported features:
 - Refcount widths: 1, 2, 4, 8, 16, 32, 64 bits
 - Extended L2 entries (16-byte with subcluster bitmaps)
 - Incompatible feature bit validation
-- Not yet supported: encryption (LUKS), external data files, snapshots
+- Not yet supported: encryption (QCOW2-native), external data files, snapshots
 
 ### raw
 
@@ -297,6 +297,23 @@ CRC-32C validation with active header selection by sequence number,
 dirty log detection, region table CRC-32C validation, GUID-based
 metadata parsing, BAT entry validation (offset bounds, 1MB alignment,
 overlap detection, state validation).
+
+### luks
+
+LUKS encrypted containers (v1 and v2). The info operation parses:
+- Version, cipher name, cipher mode, hash algorithm
+- UUID, payload offset, master key length, active key slots
+- LUKS v2: JSON metadata area for cipher/hash extraction
+
+With `--luks-passphrase`, LUKS v1 containers are decrypted inside the
+KVM guest using pure-Rust RustCrypto crates (PBKDF2 + AES-XTS, software
+AES implementation for bare-metal). The decrypted first block is passed
+through format detection to report the inner format and virtual size.
+
+LUKS v2 decryption (Argon2id KDF) is not yet supported due to memory
+requirements exceeding the default 32 MiB guest allocation. The
+`--max-guest-memory` CLI flag provides infrastructure for future
+implementation.
 
 ## oslo.utils Cross-Validation
 
