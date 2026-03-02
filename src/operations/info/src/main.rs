@@ -1680,8 +1680,7 @@ fn af_diffuse(data: &mut [u8], key_bytes: usize) {
 fn cstr_from_header(header: &[u8], offset: usize, max_len: usize) -> &str {
     let field = &header[offset..offset + max_len];
     let end = field.iter().position(|&b| b == 0).unwrap_or(max_len);
-    // Safety: LUKS header fields contain ASCII strings
-    unsafe { core::str::from_utf8_unchecked(&field[..end]) }
+    core::str::from_utf8(&field[..end]).unwrap_or("")
 }
 
 /// Get the call table from the fixed address
