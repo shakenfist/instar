@@ -1809,6 +1809,12 @@ struct InfoArgs {
     /// Read LUKS passphrase from a file (first line, trailing newline stripped).
     #[arg(long, value_name = "PATH", conflicts_with = "luks_passphrase")]
     luks_passphrase_file: Option<String>,
+
+    /// Maximum guest memory for LUKS2 Argon2 key derivation (e.g., "1G", "2G").
+    /// LUKS2 uses Argon2id which is memory-hard — typical images require 1 GB.
+    /// Without this flag, LUKS2 metadata is reported but decryption is skipped.
+    #[arg(long, value_name = "SIZE")]
+    max_guest_memory: Option<String>,
 }
 
 #[derive(Args, Debug)]
