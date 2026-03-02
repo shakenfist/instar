@@ -111,6 +111,15 @@ const LUKS_SLOT_STRIPES_OFFSET: usize = 44; // AF stripe count (u32 BE)
 // LUKS v1 AFsplitter default stripe count
 const LUKS_DEFAULT_STRIPES: u32 = 4000;
 
+// LUKS v2 binary header offsets
+const LUKS2_HEADER_SIZE_OFFSET: usize = 8; // Header size including JSON area (u64 BE)
+const LUKS2_UUID_OFFSET: usize = 168; // UUID (40 bytes, null-terminated)
+const LUKS2_BINARY_HEADER_SIZE: usize = 4096; // Binary header is always 4096 bytes
+
+// Maximum JSON area to read for metadata scanning (first 16 KiB covers typical
+// cryptsetup output which is ~2-4 KiB of JSON).
+const LUKS2_JSON_SCAN_SIZE: usize = 16384;
+
 /// Entry point called by core after devices are initialized.
 ///
 /// Returns the number of bytes read.
@@ -408,7 +417,13 @@ pub unsafe extern "C" fn _start() -> u64 {
             let mut luks_info = LuksInfo::new();
 
             if detailed {
-                parse_luks_header(&buffer, &mut result, &mut luks_info);
+                parse_luks_header(
+                    &buffer,
+                    &mut result,
+                    &mut luks_info,
+                    call_table,
+                    input_sector_size,
+                );
             }
 
             // Attempt LUKS1 decryption if passphrase provided
@@ -963,7 +978,13 @@ fn parse_qed_header(buffer: &[u8], result: &mut InfoResult) {
 ///
 /// LUKS doesn't have a virtual size in the header — the encrypted
 /// container size is determined by the underlying block device.
-fn parse_luks_header(buffer: &[u8], result: &mut InfoResult, luks_info: &mut LuksInfo) {
+unsafe fn parse_luks_header(
+    buffer: &[u8],
+    result: &mut InfoResult,
+    luks_info: &mut LuksInfo,
+    call_table: &CallTable,
+    input_sector_size: usize,
+) {
     // Ensure buffer is large enough for basic LUKS header
     if buffer.len() < 8 {
         return;
@@ -1038,16 +1059,201 @@ fn parse_luks_header(buffer: &[u8], result: &mut InfoResult, luks_info: &mut Luk
             }
         }
         luks_info.active_key_slots = active_slots;
-    } else if version == 2 && buffer.len() >= 180 {
-        // LUKS v2: parse binary header fields
-        // The cipher/mode/hash are in the JSON metadata area (not parsed
-        // here), but we can extract the UUID from the binary header.
+    } else if version == 2 && buffer.len() >= LUKS2_UUID_OFFSET + 36 {
+        // LUKS v2: parse binary header fields and JSON metadata area
 
-        // UUID (36 bytes, null-padded, at offset 144 in LUKS v2)
-        let uuid_src = &buffer[144..144 + 36];
+        // UUID (40 bytes, null-terminated, at offset 168 in LUKS v2)
+        let uuid_src = &buffer[LUKS2_UUID_OFFSET..LUKS2_UUID_OFFSET + 36];
         let copy_len = uuid_src.len().min(luks_info.uuid.len());
         luks_info.uuid[..copy_len].copy_from_slice(&uuid_src[..copy_len]);
+
+        // Read the JSON metadata area. The JSON starts at offset 4096
+        // (right after the 4096-byte binary header).
+        //
+        // If the input sector size is >= 4096 + minimum JSON size, the
+        // JSON is already in `buffer` (which is MAX_SECTOR_SIZE = 64 KiB).
+        // Otherwise, read additional sectors into scratch memory.
+        if input_sector_size > LUKS2_BINARY_HEADER_SIZE && buffer.len() > LUKS2_BINARY_HEADER_SIZE {
+            // JSON is in the already-read first sector
+            let json_data = &buffer[LUKS2_BINARY_HEADER_SIZE..];
+            let json_len = json_data
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(json_data.len());
+            if json_len > 0 {
+                parse_luks2_json(&json_data[..json_len], luks_info, call_table);
+            }
+        } else if input_sector_size <= LUKS2_BINARY_HEADER_SIZE {
+            // Need to read sectors containing the JSON area
+            let json_buf =
+                core::slice::from_raw_parts_mut(SCRATCH_MEM_BASE as *mut u8, LUKS2_JSON_SCAN_SIZE);
+
+            let json_start_sector = LUKS2_BINARY_HEADER_SIZE / input_sector_size;
+            let sectors_to_read = LUKS2_JSON_SCAN_SIZE / input_sector_size;
+            let mut json_bytes_read = 0usize;
+            for i in 0..sectors_to_read {
+                let sector = (json_start_sector + i) as u64;
+                let offset = i * input_sector_size;
+                if !(call_table.read_input_sector)(
+                    0,
+                    sector,
+                    json_buf[offset..].as_mut_ptr(),
+                    input_sector_size,
+                ) {
+                    break;
+                }
+                json_bytes_read = offset + input_sector_size;
+            }
+
+            if json_bytes_read > 0 {
+                let json_data = &json_buf[..json_bytes_read];
+                let json_len = json_data
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(json_data.len());
+                if json_len > 0 {
+                    parse_luks2_json(&json_data[..json_len], luks_info, call_table);
+                }
+            }
+        }
     }
+}
+
+/// Parse LUKS2 JSON metadata to extract cipher, mode, and hash.
+///
+/// LUKS2 stores its metadata as JSON. We scan for specific patterns
+/// rather than fully parsing JSON, since we're in a no_std environment.
+///
+/// Key patterns we look for:
+/// - `"encryption":"aes-xts-plain64"` (in segments section) → cipher + mode
+/// - `"hash":"sha256"` (in digests or AF section) → hash algorithm
+/// - `"key_size":64` (in keyslots area section) → master key length
+/// - `"offset":"..."` (in segments section) → payload offset
+unsafe fn parse_luks2_json(json: &[u8], luks_info: &mut LuksInfo, call_table: &CallTable) {
+    (call_table.verbose_print)(b"luks2: parsing JSON metadata\n\0".as_ptr());
+
+    // Extract encryption string from segments section.
+    // Look for "segments" first, then "encryption" within it.
+    if let Some(seg_pos) = find_pattern(json, b"\"segments\"") {
+        if let Some(enc) = extract_json_string(&json[seg_pos..], b"\"encryption\"") {
+            // Split "aes-xts-plain64" into cipher="aes" and mode="xts-plain64"
+            if let Some(dash_pos) = enc.iter().position(|&b| b == b'-') {
+                let cipher = &enc[..dash_pos];
+                let mode = &enc[dash_pos + 1..];
+                copy_null_padded(cipher, &mut luks_info.cipher);
+                copy_null_padded(mode, &mut luks_info.cipher_mode);
+            } else {
+                copy_null_padded(enc, &mut luks_info.cipher);
+            }
+        }
+
+        // Extract payload offset from segments: "offset":"16777216"
+        if let Some(off_str) = extract_json_string(&json[seg_pos..], b"\"offset\"") {
+            let offset_bytes = parse_ascii_u64(off_str);
+            if offset_bytes > 0 {
+                // Convert bytes to 512-byte sectors for consistency with LUKS1
+                luks_info.payload_offset = (offset_bytes / 512) as u32;
+            }
+        }
+    }
+
+    // Extract hash from digests section
+    if let Some(dig_pos) = find_pattern(json, b"\"digests\"") {
+        if let Some(hash) = extract_json_string(&json[dig_pos..], b"\"hash\"") {
+            copy_null_padded(hash, &mut luks_info.hash);
+        }
+    }
+
+    // Extract key_size from keyslots area section
+    if let Some(ks_pos) = find_pattern(json, b"\"keyslots\"") {
+        if let Some(ks_val) = extract_json_number(&json[ks_pos..], b"\"key_size\"") {
+            luks_info.master_key_length = ks_val as u32;
+        }
+
+        // Count active key slots by counting "kdf" entries in keyslots.
+        // Each active keyslot has exactly one "kdf" sub-object.
+        let ks_end = find_pattern(&json[ks_pos..], b"\"segments\"")
+            .map(|p| ks_pos + p)
+            .unwrap_or(json.len());
+        let ks_section = &json[ks_pos..ks_end];
+        let mut active = 0u32;
+        let mut search_from = 0;
+        while let Some(pos) = find_pattern(&ks_section[search_from..], b"\"kdf\"") {
+            active += 1;
+            search_from += pos + 5;
+            if search_from >= ks_section.len() {
+                break;
+            }
+        }
+        luks_info.active_key_slots = active;
+    }
+}
+
+/// Find a byte pattern in a slice, returning the position of the match start.
+fn find_pattern(data: &[u8], pattern: &[u8]) -> Option<usize> {
+    if pattern.len() > data.len() {
+        return None;
+    }
+    for i in 0..=data.len() - pattern.len() {
+        if data[i..i + pattern.len()] == *pattern {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Extract a JSON string value following a key pattern.
+///
+/// Looks for `key:"value"` or `key: "value"` and returns the value bytes.
+/// The search is limited to the next 256 bytes after the key.
+fn extract_json_string<'a>(data: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    let key_pos = find_pattern(data, key)?;
+    let after_key = key_pos + key.len();
+    let search_end = (after_key + 256).min(data.len());
+    let rest = &data[after_key..search_end];
+
+    // Find the colon, then the opening quote
+    let colon_pos = rest.iter().position(|&b| b == b':')?;
+    let after_colon = &rest[colon_pos + 1..];
+    let quote_start = after_colon.iter().position(|&b| b == b'"')?;
+    let value_start = quote_start + 1;
+    let value_bytes = &after_colon[value_start..];
+    let quote_end = value_bytes.iter().position(|&b| b == b'"')?;
+
+    Some(&value_bytes[..quote_end])
+}
+
+/// Extract a JSON numeric value following a key pattern.
+///
+/// Looks for `key:123` or `key: 123` and returns the parsed number.
+fn extract_json_number(data: &[u8], key: &[u8]) -> Option<u64> {
+    let key_pos = find_pattern(data, key)?;
+    let after_key = key_pos + key.len();
+    let search_end = (after_key + 64).min(data.len());
+    let rest = &data[after_key..search_end];
+
+    // Find the colon, then the first digit
+    let colon_pos = rest.iter().position(|&b| b == b':')?;
+    let after_colon = &rest[colon_pos + 1..];
+    let digit_start = after_colon.iter().position(|&b| b.is_ascii_digit())?;
+    let digits = &after_colon[digit_start..];
+    let digit_end = digits
+        .iter()
+        .position(|&b| !b.is_ascii_digit())
+        .unwrap_or(digits.len());
+
+    Some(parse_ascii_u64(&digits[..digit_end]))
+}
+
+/// Parse an ASCII decimal number from a byte slice.
+fn parse_ascii_u64(data: &[u8]) -> u64 {
+    let mut result: u64 = 0;
+    for &b in data {
+        if b.is_ascii_digit() {
+            result = result.saturating_mul(10).saturating_add((b - b'0') as u64);
+        }
+    }
+    result
 }
 
 /// Copy a null-padded string from source to destination buffer.

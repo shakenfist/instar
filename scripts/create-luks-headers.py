@@ -113,64 +113,62 @@ def build_luks_v1_header():
 
 
 def build_luks_v2_header():
-    """Build a minimal LUKS v2 binary header (4096 bytes).
+    """Build a LUKS v2 header with JSON metadata (16 KiB).
 
-    LUKS v2 has a binary header followed by a JSON metadata
-    area. For testing purposes, we create a binary header with
-    realistic field values and a minimal JSON area.
+    LUKS v2 has a 4096-byte binary header followed by a JSON
+    metadata area. For testing, we create both with realistic
+    field values per the LUKS2 on-disk format spec v1.1.
 
-    Binary header layout (first 512 bytes):
+    Binary header layout (4096 bytes):
       Offset  Size  Description
-      0       6     Magic
+      0       6     Magic ("LUKS\\xba\\xbe")
       6       2     Version (2)
-      8       8     Header size (bytes)
+      8       8     Header size (binary + JSON, bytes)
       16      8     Sequence ID
-      24      48    Label (null-padded)
-      72      40    Checksum algorithm
-      112     32    Salt
-      144     36    UUID
-      180     8     Header offset (subsystem)
-      188     324   Reserved / padding
+      24      48    Label (null-padded ASCII)
+      72      32    Checksum algorithm (null-padded)
+      104     64    Salt
+      168     40    UUID (null-terminated ASCII)
+      208     48    Subsystem label (null-padded)
+      256     8     Header offset
+      264     184   Padding
+      448     64    Checksum
+      512     3584  Padding
     """
-    # LUKS2 header is typically 16384 bytes, but for a test
-    # header we just need enough to parse. Use 4096 bytes.
-    header_size = 4096
-    header = bytearray(header_size)
+    # Total header = 16384 bytes (4096 binary + 12288 JSON)
+    total_size = 16384
+    header = bytearray(total_size)
 
     # Magic + version
     header[0:6] = LUKS_MAGIC
     struct.pack_into('>H', header, 6, 2)
 
-    # Header size (uint64 big-endian)
-    struct.pack_into('>Q', header, 8, 16384)
+    # Header size (uint64 big-endian) — total primary area
+    struct.pack_into('>Q', header, 8, total_size)
 
     # Sequence ID
     struct.pack_into('>Q', header, 16, 1)
 
-    # Label (48 bytes, null-padded)
+    # Label (48 bytes, null-padded, at offset 24)
     header[24:72] = pad_string('test-luks2-volume', 48)
 
-    # Checksum algorithm (40 bytes, null-padded)
-    header[72:112] = pad_string('sha256', 40)
+    # Checksum algorithm (32 bytes, null-padded, at offset 72)
+    header[72:104] = pad_string('sha256', 32)
 
-    # Salt (32 bytes)
-    header[112:144] = bytes(range(100, 132))
+    # Salt (64 bytes, at offset 104)
+    header[104:168] = bytes(range(100, 164))
 
-    # UUID (36 bytes, null-padded)
-    header[144:180] = pad_string(
-        'abcdef01-2345-6789-abcd-ef0123456789', 36
+    # UUID (40 bytes, null-terminated, at offset 168)
+    header[168:208] = pad_string(
+        'abcdef01-2345-6789-abcd-ef0123456789', 40
     )
 
-    # Subsystem header offset
-    struct.pack_into('>Q', header, 180, 0)
-
-    # JSON metadata area starts after the binary header
-    # (offset 512 in a real LUKS2 header). We write a
-    # minimal JSON config for testing.
+    # JSON metadata area starts at offset 4096 (after binary
+    # header), null-terminated within the 12288-byte area.
     json_area = (
         '{\n'
         '  "config": {\n'
-        '    "json_size": 3072\n'
+        '    "json_size": 12288\n'
         '  },\n'
         '  "keyslots": {\n'
         '    "0": {\n'
@@ -223,8 +221,7 @@ def build_luks_v2_header():
         '}\n'
     )
     json_bytes = json_area.encode('utf-8')
-    # JSON area starts at offset 512 in the header
-    json_offset = 512
+    json_offset = 4096  # JSON area starts after binary header
     header[json_offset:json_offset + len(json_bytes)] = (
         json_bytes
     )
