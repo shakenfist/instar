@@ -447,6 +447,8 @@ pub fn send_info_result_luks(
         payload_offset: luks_info.payload_offset,
         master_key_length: luks_info.master_key_length,
         active_key_slots: luks_info.active_key_slots,
+        inner_format: luks_info.inner_format_str(),
+        inner_virtual_size: luks_info.inner_virtual_size,
     };
 
     let msg = guest_protocol::info_result_message_with_luks(

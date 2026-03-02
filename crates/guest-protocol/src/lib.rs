@@ -432,6 +432,10 @@ pub struct LuksInfoData<'a> {
     pub master_key_length: u32,
     /// Number of active key slots
     pub active_key_slots: u32,
+    /// Detected inner format after decryption (empty if not decrypted)
+    pub inner_format: &'a str,
+    /// Virtual size of inner format (0 if not detected)
+    pub inner_virtual_size: u64,
 }
 
 /// Helper to create an info result message with LUKS-specific information.
@@ -468,6 +472,10 @@ pub fn info_result_message_with_luks(
     info.luks_info.payload_offset = luks_info.payload_offset;
     info.luks_info.master_key_length = luks_info.master_key_length;
     info.luks_info.active_key_slots = luks_info.active_key_slots;
+    if !luks_info.inner_format.is_empty() {
+        push_str(&mut info.luks_info.inner_format, luks_info.inner_format);
+        info.luks_info.inner_virtual_size = luks_info.inner_virtual_size;
+    }
 
     // Mark luks_info as present so the encoder includes it
     info._has.set_luks_info();
