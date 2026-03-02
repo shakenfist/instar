@@ -35,7 +35,7 @@ for details on why this approach is secure.
 | VDI | Yes | Yes | vdi-simple |
 | QED | Yes (banned) | Yes | qed-simple |
 | ISO | Yes | Yes* | iso-simple |
-| LUKS | Yes | Yes | (none - test image needed) |
+| LUKS | Yes | Yes | luks-v1, luks-v2, luks-v1-raw-gpt, luks-v1-qcow2 |
 | Parallels | No | **No** | parallels-v1, parallels-v2 (in testdata, not tested) |
 | Bochs | No | **No** | empty.bochs (in testdata, not tested) |
 | cloop | No | **No** | simple-pattern.cloop (in testdata, not tested) |
@@ -141,7 +141,7 @@ The `imago convert` operation supports writing output in the following formats:
 | Format | Check | oslo.utils | imago |
 |--------|-------|------------|-------|
 | QED | Banned entirely | Rejects | Detects format |
-| LUKS | Version check (only v1) | Rejects v2+ | Detects format, version |
+| LUKS | Version check (only v1) | Rejects v2+ | Detects format, version, cipher, hash, UUID, payload offset, key slots, inner format (with passphrase) |
 | VDI | None | Pass-through | Detects format, UUID |
 | ISO | None | Pass-through | Detects format* |
 | VHD | None | Pass-through | Detects creator app; full check validation (footer/header checksums, BAT bounds, overlap detection) |
@@ -222,6 +222,15 @@ The `imago convert` operation supports writing output in the following formats:
 |----------|-------------|--------|--------------|
 | qed-simple | QED format image | safe | Deprecated format test |
 
+#### LUKS Images (4)
+
+| Image ID | Description | Safety | Key Features |
+|----------|-------------|--------|--------------|
+| luks-v1 | LUKS v1 header (synthetic) | safe | Header parsing test |
+| luks-v2 | LUKS v2 header with JSON metadata (synthetic) | safe | JSON metadata parsing |
+| luks-v1-raw-gpt | LUKS v1 wrapping GPT raw image | safe | Inner format detection (raw) |
+| luks-v1-qcow2 | LUKS v1 wrapping QCOW2 image | safe | Inner format detection (qcow2) |
+
 #### ISO Images (1)
 
 | Image ID | Description | Safety | Key Features |
@@ -250,11 +259,6 @@ The `imago convert` operation supports writing output in the following formats:
 #### High Priority - Security Relevant
 
 1. **qcow2-encrypted** - QCOW2 with encryption enabled
-
-#### Medium Priority - Format Coverage
-
-2. **luks-v1** - LUKS version 1 encrypted container
-3. **luks-v2** - LUKS version 2 (for version rejection testing)
 
 ---
 
@@ -340,6 +344,15 @@ The `imago convert` operation supports writing output in the following formats:
     BAT entry validation (offset bounds, 1MB alignment, overlap
     detection, state validation), differencing disk detection.
 
+16. **LUKS Container Inspection** - Full LUKS v1 and v2 header parsing with
+    cipher, cipher mode, hash algorithm, UUID, payload offset, master key
+    length, and active key slot reporting. LUKS v2 JSON metadata parsing
+    extracts cipher/hash from the JSON area. With `--luks-passphrase`, LUKS
+    v1 images are decrypted (PBKDF2 + AES-XTS, pure Rust RustCrypto crates
+    in no_std guest) and inner format is detected and reported (including
+    inner virtual size). Synthetic test headers for header parsing; real
+    LUKS containers (created via cryptsetup) for decryption testing.
+
 ### Detections to Add
 
 All oslo.utils formats are now detected. No remaining format detections needed.
@@ -378,7 +391,7 @@ cd tests && ../.venv/bin/stestr run test_oslo_crossval
 | Format | raw-mbr-partitioned, raw-gpt-partitioned | raw | gpt | oslo GPTInspector detects partition tables; imago matches qemu-img |
 | Format | vmdk-multi-partition | raw | gpt | File is raw with GPT despite .vmdk extension |
 | Format | iso-simple | raw | iso | imago reports ISO as raw with --unsafe-quirks |
-| Format | luks-v1, luks-v2 | unknown | luks | imago does not expose LUKS in info output |
+| Format | luks-v1, luks-v2 | luks | luks | Match (imago now reports LUKS format with full metadata) |
 | Safety | QED images | pass | reject | oslo bans QED; imago uses KVM sandbox |
 | Safety | LUKS v2 | pass | reject | oslo rejects LUKS v2+; imago detects both |
 | Safety | qcow2-external-data-file | no data-file field | flags data_file | imago detects feature bit but does not expose path in JSON |
@@ -404,4 +417,4 @@ are surfaced as warnings rather than blocking PRs.
 
 ---
 
-*Document updated: February 2026*
+*Document updated: March 2026*
