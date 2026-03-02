@@ -1447,6 +1447,14 @@ unsafe fn try_luks1_decrypt(
     // Read key material from disk in sector-sized chunks
     // Key material offset is in 512-byte sectors (LUKS v1 always uses 512-byte sectors)
     let km_byte_offset = slot.key_material_offset as u64 * 512;
+
+    // Validate key material region fits within device capacity
+    let cap = (call_table.get_input_capacity)(0) * input_sector_size as u64;
+    if km_byte_offset + km_total_bytes as u64 > cap {
+        (call_table.debug_print)(b"luks: key material offset exceeds device capacity\n\0".as_ptr());
+        return None;
+    }
+
     let km_start_sector = km_byte_offset / input_sector_size as u64;
     let km_sectors_needed = (km_total_bytes + input_sector_size - 1) / input_sector_size;
 
