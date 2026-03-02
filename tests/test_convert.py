@@ -368,13 +368,13 @@ class TestConvertManifestImages(ImagoTestBase):
         """Compute a per-operation timeout based on virtual size.
 
         Returns a timeout in seconds that scales with image
-        virtual size. Uses 120s as minimum and adds 10s per
+        virtual size. Uses 120s as minimum and adds 15s per
         GiB of virtual size to accommodate CI I/O variance.
         """
         if not vsize:
             return 120
         gib = vsize / (1024 ** 3)
-        return max(120, int(120 + gib * 10))
+        return max(120, int(120 + gib * 15))
 
     # Max I/O buffer size: compressed clusters need a full-cluster
     # decompression buffer, limited to MAX_SECTOR_SIZE (64KB).
@@ -1527,13 +1527,13 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
         """Compute a per-operation timeout based on virtual size.
 
         Returns a timeout in seconds that scales with image
-        virtual size. Uses 120s as minimum and adds 10s per
+        virtual size. Uses 120s as minimum and adds 15s per
         GiB of virtual size to accommodate CI I/O variance.
         """
         if not vsize:
             return 120
         gib = vsize / (1024 ** 3)
-        return max(120, int(120 + gib * 10))
+        return max(120, int(120 + gib * 15))
 
     # Max I/O buffer size for decompression
     MAX_DECOMPRESS_CLUSTER = 65536
@@ -1882,7 +1882,7 @@ class TestConvertVmdkToRaw(ImagoTestBase):
         if not vsize:
             return 120
         gib = vsize / (1024 ** 3)
-        return max(120, int(120 + gib * 10))
+        return max(120, int(120 + gib * 15))
 
     def _test_vmdk_convert(self, image_id):
         """Convert a VMDK image to raw and cross-validate."""
@@ -2595,7 +2595,7 @@ class TestConvertVhdxToRaw(ImagoTestBase):
         if not vsize:
             return 120
         gib = vsize / (1024 ** 3)
-        return max(120, int(120 + gib * 10))
+        return max(120, int(120 + gib * 15))
 
     def _test_vhdx_convert(self, image_id):
         """Convert a VHDX image to raw and cross-validate."""
