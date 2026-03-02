@@ -737,6 +737,10 @@ pub struct LuksInfo {
     pub master_key_length: u32,
     /// Number of active key slots
     pub active_key_slots: u32,
+    /// Detected inner format name after decryption (null-terminated)
+    pub inner_format: [u8; 16],
+    /// Virtual size of the inner format in bytes (0 if not detected)
+    pub inner_virtual_size: u64,
 }
 
 impl Default for LuksInfo {
@@ -757,6 +761,8 @@ impl LuksInfo {
             payload_offset: 0,
             master_key_length: 0,
             active_key_slots: 0,
+            inner_format: [0; 16],
+            inner_virtual_size: 0,
         }
     }
 
@@ -778,6 +784,19 @@ impl LuksInfo {
     /// Get UUID as a str slice
     pub fn uuid_str(&self) -> &str {
         cstr_to_str(&self.uuid)
+    }
+
+    /// Get inner format name as a str slice
+    pub fn inner_format_str(&self) -> &str {
+        cstr_to_str(&self.inner_format)
+    }
+
+    /// Set the inner format name from a string slice
+    pub fn set_inner_format(&mut self, name: &str) {
+        let bytes = name.as_bytes();
+        let len = bytes.len().min(self.inner_format.len() - 1);
+        self.inner_format[..len].copy_from_slice(&bytes[..len]);
+        self.inner_format[len] = 0;
     }
 }
 

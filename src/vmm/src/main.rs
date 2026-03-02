@@ -1179,10 +1179,26 @@ fn print_info_result_json(
                 info.luks_info.master_key_length
             );
         }
-        println!(
-            "            \"active-key-slots\": {}",
-            info.luks_info.active_key_slots
-        );
+        let has_inner = !info.luks_info.inner_format.is_empty();
+        if has_inner {
+            println!(
+                "            \"active-key-slots\": {},",
+                info.luks_info.active_key_slots
+            );
+            println!(
+                "            \"inner-format\": \"{}\",",
+                escape_json_string(info.luks_info.inner_format.as_str())
+            );
+            println!(
+                "            \"inner-virtual-size\": {}",
+                info.luks_info.inner_virtual_size
+            );
+        } else {
+            println!(
+                "            \"active-key-slots\": {}",
+                info.luks_info.active_key_slots
+            );
+        }
         println!("        }}");
         println!("    }},");
     }

@@ -104,6 +104,8 @@ message LuksInfo {
   uint32 payload_offset = 5;    // Payload offset in 512-byte sectors (v1)
   uint32 master_key_length = 6; // Master key length in bytes
   uint32 active_key_slots = 7;  // Number of active key slots
+  string inner_format = 8;      // Detected inner format after decryption (e.g., "qcow2", "raw")
+  uint64 inner_virtual_size = 9; // Virtual size of inner format (if detected)
 }
 
 // Image format detection result (from info operation)

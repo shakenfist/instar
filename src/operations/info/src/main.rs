@@ -413,13 +413,11 @@ pub unsafe extern "C" fn _start() -> u64 {
 
             // Attempt LUKS1 decryption if passphrase provided
             if config.is_valid() && config.has_passphrase() && result.version == 1 {
-                if let Some(_inner) =
+                if let Some((inner_fmt, inner_vsize)) =
                     try_luks1_decrypt(&buffer, config, call_table, input_sector_size)
                 {
-                    (call_table.debug_print)(
-                        b"luks: decryption succeeded, inner format detected\n\0".as_ptr(),
-                    );
-                    // Inner format output will be added in Phase 12d
+                    luks_info.set_inner_format(inner_fmt.name());
+                    luks_info.inner_virtual_size = inner_vsize;
                 } else {
                     (call_table.debug_print)(
                         b"luks: decryption failed (wrong passphrase?)\n\0".as_ptr(),
@@ -1081,13 +1079,13 @@ struct LuksKeySlot {
 /// 7. Decrypt first payload sector with verified master key
 /// 8. Detect inner format from decrypted data
 ///
-/// Returns the detected inner ImageFormat, or None if decryption fails.
+/// Returns (inner_format, inner_virtual_size) or None if decryption fails.
 unsafe fn try_luks1_decrypt(
     header: &[u8],
     config: &InfoConfig,
     call_table: &CallTable,
     input_sector_size: usize,
-) -> Option<ImageFormat> {
+) -> Option<(ImageFormat, u64)> {
     if !config.has_passphrase() {
         return None;
     }
@@ -1383,7 +1381,40 @@ unsafe fn try_luks1_decrypt(
     // Use extra_detail=true so LUKS-within-LUKS would be detected
     let inner_format = detect_format_from_header(decrypt_buf, 512, true);
 
-    Some(inner_format)
+    // Extract inner virtual size from the decrypted header where possible
+    let inner_virtual_size = match inner_format {
+        ImageFormat::Qcow2 => {
+            // QCOW2: virtual_size at offset 24 (big-endian u64)
+            if decrypt_buf.len() >= 32 {
+                u64::from_be_bytes([
+                    decrypt_buf[24],
+                    decrypt_buf[25],
+                    decrypt_buf[26],
+                    decrypt_buf[27],
+                    decrypt_buf[28],
+                    decrypt_buf[29],
+                    decrypt_buf[30],
+                    decrypt_buf[31],
+                ])
+            } else {
+                0
+            }
+        }
+        ImageFormat::Raw => {
+            // Raw: inner size = device bytes - payload offset bytes
+            let cap_sectors = (call_table.get_input_capacity)(0);
+            let cap_bytes = cap_sectors * input_sector_size as u64;
+            let payload_bytes = payload_offset as u64 * 512;
+            if cap_bytes > payload_bytes {
+                cap_bytes - payload_bytes
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    };
+
+    Some((inner_format, inner_virtual_size))
 }
 
 /// AFsplitter diffuse function: hash each key_bytes-length block.
