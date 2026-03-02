@@ -15,7 +15,7 @@ use shared::{
         VDI_SIGNATURE_OFFSET, VHD_COOKIE,
     },
     validate_call_table, CallTable, ImageFormat, InfoConfig, InfoResult, LuksInfo, Qcow2Info,
-    VdiInfo, VmdkInfo, CALL_TABLE_ADDR, MAX_SECTOR_SIZE, SCRATCH_MEM_BASE,
+    VdiInfo, VmdkInfo, CALL_TABLE_ADDR, MAX_SECTOR_SIZE, SCRATCH_MEM_BASE, SCRATCH_MEM_SIZE,
 };
 
 // Crypto imports for LUKS1 decryption
@@ -1428,7 +1428,17 @@ unsafe fn try_luks1_decrypt(
 
     // Step 2: Read encrypted key material from disk
     // Key material size = key_bytes * stripes (typically 64 * 4000 = 256000 bytes)
-    let km_total_bytes = key_bytes * slot.stripes as usize;
+    let km_total_bytes = match (key_bytes).checked_mul(slot.stripes as usize) {
+        Some(n) => n,
+        None => {
+            (call_table.debug_print)(b"luks: key material size overflow\n\0".as_ptr());
+            return None;
+        }
+    };
+    if km_total_bytes > SCRATCH_MEM_SIZE {
+        (call_table.debug_print)(b"luks: key material exceeds scratch memory\n\0".as_ptr());
+        return None;
+    }
 
     // Use scratch memory for key material I/O buffer
     // Scratch memory starts at SCRATCH_MEM_BASE (0x300000)
