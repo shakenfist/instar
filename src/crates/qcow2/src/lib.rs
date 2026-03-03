@@ -55,6 +55,7 @@ pub const COMPRESSION_TYPE_OFFSET: usize = 104;
 
 // Header extension type IDs
 pub const EXT_BACKING_FORMAT: u32 = 0xE2792ACA;
+pub const EXT_EXTERNAL_DATA_FILE: u32 = 0x44415441; // "DATA"
 pub const EXT_END: u32 = 0x00000000;
 /// Start of header extensions in v2 (fixed 72-byte header)
 pub const V2_HEADER_EXTENSION_OFFSET: usize = 72;
@@ -448,20 +449,37 @@ impl QcowHeader {
     }
 }
 
+/// Results from parsing QCOW2 v3 header extensions.
+pub struct HeaderExtensionResults {
+    /// Backing format from EXT_BACKING_FORMAT extension.
+    pub backing_format: BackingFormat,
+    /// Byte offset of the data file name within the header buffer
+    /// (0 if no DATA extension found).
+    pub data_file_name_offset: usize,
+    /// Length of the data file name in bytes (0 if absent).
+    pub data_file_name_len: usize,
+}
+
 /// Parse QCOW2 header extensions from a header buffer.
 ///
-/// Looks for the backing format extension (`EXT_BACKING_FORMAT`) and
-/// returns it. Only applicable to v3+ headers (v2 has no extensions
-/// at the standard offsets).
+/// Walks all v3+ header extensions and returns the backing format
+/// and external data file name location (if present). Only applicable
+/// to v3+ headers (v2 has no extensions at the standard offsets).
 ///
 /// `header` is the same buffer passed to `QcowHeader::parse()`.
 /// `parsed` is the parsed header (needed for version check).
-pub fn parse_header_extensions(header: &[u8], parsed: &QcowHeader) -> BackingFormat {
+pub fn parse_header_extensions(header: &[u8], parsed: &QcowHeader) -> HeaderExtensionResults {
+    let mut result = HeaderExtensionResults {
+        backing_format: BackingFormat::None,
+        data_file_name_offset: 0,
+        data_file_name_len: 0,
+    };
+
     if parsed.version < 3 {
-        return BackingFormat::None;
+        return result;
     }
     if header.len() < HEADER_LENGTH_OFFSET + 4 {
-        return BackingFormat::None;
+        return result;
     }
 
     let header_length = be_u32(header, HEADER_LENGTH_OFFSET) as usize;
@@ -481,7 +499,10 @@ pub fn parse_header_extensions(header: &[u8], parsed: &QcowHeader) -> BackingFor
 
         if ext_type == EXT_BACKING_FORMAT && ext_len > 0 {
             let format_bytes = &header[ext_offset + 8..ext_offset + 8 + ext_len];
-            return BackingFormat::from_bytes(format_bytes);
+            result.backing_format = BackingFormat::from_bytes(format_bytes);
+        } else if ext_type == EXT_EXTERNAL_DATA_FILE && ext_len > 0 {
+            result.data_file_name_offset = ext_offset + 8;
+            result.data_file_name_len = ext_len;
         }
 
         // Move to next extension (data padded to 8-byte boundary)
@@ -489,7 +510,7 @@ pub fn parse_header_extensions(header: &[u8], parsed: &QcowHeader) -> BackingFor
         ext_offset += 8 + padded_len;
     }
 
-    BackingFormat::None
+    result
 }
 
 /// Read the backing file path from a QCOW2 image.

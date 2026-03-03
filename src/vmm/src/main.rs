@@ -819,6 +819,11 @@ fn print_info_result(
             }
         }
 
+        // External data file (if present, QCOW2 v3)
+        if info.flags & (1 << 1) != 0 && !info.external_data_file.is_empty() {
+            println!("data file: {}", info.external_data_file.as_str());
+        }
+
         // Format specific information (QCOW2)
         if info.format == "qcow2" {
             println!("Format specific information:");
@@ -1064,13 +1069,26 @@ fn print_info_result_json(
             info.qcow2_info.refcount_bits
         };
 
+        let has_data_file = info.flags & (1 << 1) != 0 && !info.external_data_file.is_empty();
+
         if is_v3 {
             println!("            \"refcount-bits\": {},", refcount_bits);
             println!("            \"corrupt\": {},", info.qcow2_info.corrupt);
-            println!(
-                "            \"extended-l2\": {}",
-                info.qcow2_info.extended_l2
-            );
+            if has_data_file {
+                println!(
+                    "            \"extended-l2\": {},",
+                    info.qcow2_info.extended_l2
+                );
+                println!(
+                    "            \"data-file\": \"{}\"",
+                    escape_json_string(info.external_data_file.as_str())
+                );
+            } else {
+                println!(
+                    "            \"extended-l2\": {}",
+                    info.qcow2_info.extended_l2
+                );
+            }
         } else {
             // For v2, refcount-bits is the last field (no trailing comma)
             println!("            \"refcount-bits\": {}", refcount_bits);
@@ -1455,6 +1473,11 @@ fn execute_info_operation(
                                         None
                                     } else {
                                         Some(info.backing_file.to_string())
+                                    },
+                                    external_data_file: if info.external_data_file.is_empty() {
+                                        None
+                                    } else {
+                                        Some(info.external_data_file.to_string())
                                     },
                                 });
                             }
