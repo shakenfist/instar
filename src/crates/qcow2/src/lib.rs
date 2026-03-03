@@ -77,7 +77,9 @@ pub const COMPAT_LAZY_REFCOUNTS: u64 = 1 << 0;
 ///
 /// - Bit 0 (dirty): handled (informational, data still readable)
 /// - Bit 1 (corrupt): handled (informational, data still readable)
-/// - Bit 2 (external_data): NOT supported (data in separate file)
+/// - Bit 2 (external_data): supported (data in separate device via
+///   ChainDeviceInfo.data_device_idx; VMM validates and opens the
+///   data file as a separate virtio-block device)
 /// - Bit 3 (compression): conditionally supported (see below)
 /// - Bit 4 (extended_l2): supported (16-byte L2 entries; subcluster
 ///   bitmap is ignored, treating the cluster as fully allocated)
@@ -88,11 +90,14 @@ pub const COMPAT_LAZY_REFCOUNTS: u64 = 1 << 0;
 /// images don't set it.
 #[cfg(not(feature = "decompress-zstd"))]
 pub const SUPPORTED_INCOMPAT_FEATURES: u64 =
-    INCOMPAT_DIRTY | INCOMPAT_CORRUPT | INCOMPAT_EXTENDED_L2;
+    INCOMPAT_DIRTY | INCOMPAT_CORRUPT | INCOMPAT_EXTERNAL_DATA | INCOMPAT_EXTENDED_L2;
 
 #[cfg(feature = "decompress-zstd")]
-pub const SUPPORTED_INCOMPAT_FEATURES: u64 =
-    INCOMPAT_DIRTY | INCOMPAT_CORRUPT | INCOMPAT_COMPRESSION | INCOMPAT_EXTENDED_L2;
+pub const SUPPORTED_INCOMPAT_FEATURES: u64 = INCOMPAT_DIRTY
+    | INCOMPAT_CORRUPT
+    | INCOMPAT_EXTERNAL_DATA
+    | INCOMPAT_COMPRESSION
+    | INCOMPAT_EXTENDED_L2;
 
 // L1/L2 entry masks and flags
 /// Bit 62 set indicates a compressed cluster in an L2 entry
@@ -1643,9 +1648,18 @@ pub unsafe fn read_chain_virtual_cluster(
                         } else {
                             qcow2_cluster_size
                         };
+                        // If this device has an external data file, read
+                        // standard clusters from the data device instead.
+                        // Compressed clusters stay on the metadata device.
+                        let read_dev = chain_config.devices[dev_idx].data_device_idx;
+                        let read_dev = if read_dev != 0 {
+                            read_dev
+                        } else {
+                            dev_idx as u32
+                        };
                         return read_cluster_sectors(
                             call_table,
-                            dev_idx as u32,
+                            read_dev,
                             read_offset,
                             buf,
                             read_size,

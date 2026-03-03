@@ -416,15 +416,22 @@ class TestIncompatibleFeatureBits(ImagoTestBase):
             result = json.loads(stdout)
             self.assertGreater(result.get('corruptions', 0), 0)
 
-    def test_check_rejects_external_data_bit(self):
-        """Check should reject images with external data (bit 2)."""
+    def test_check_accepts_external_data_bit(self):
+        """Check should accept images with external data (bit 2).
+
+        The external data incompatible feature bit is now supported.
+        Check accepts the bit because structural validation (L1/L2
+        tables, refcounts) works on the metadata file regardless of
+        whether cluster data is in an external file.
+        """
         with self._create_patched_qcow2(1 << 2) as img:
             stdout, stderr, rc = self.run_imago_check(
                 Path(img.name), output_format='json'
             )
-            self.assertNotEqual(
-                rc, 0,
-                'check should reject external data bit'
+            result = json.loads(stdout)
+            self.assertEqual(
+                result.get('corruptions', 0), 0,
+                'external data bit should not cause corruption'
             )
 
     def test_check_accepts_extended_l2_bit(self):
