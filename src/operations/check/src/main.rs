@@ -1608,7 +1608,8 @@ unsafe fn check_qcow2(
         // structure that check validates.
         let check_supported = qcow2::SUPPORTED_INCOMPAT_FEATURES
             | qcow2::INCOMPAT_COMPRESSION
-            | qcow2::INCOMPAT_EXTENDED_L2;
+            | qcow2::INCOMPAT_EXTENDED_L2
+            | qcow2::INCOMPAT_EXTERNAL_DATA;
         let unsupported = hdr.incompatible_features & !check_supported;
         if unsupported != 0 {
             result.corruptions += 1;
