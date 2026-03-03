@@ -288,6 +288,7 @@ pub unsafe extern "C" fn _start() -> u64 {
         ImageFormat::Qcow2 => {
             let mut qcow2_info = Qcow2Info::new();
             let mut backing_file_buf = [0u8; MAX_BACKING_FILE_LEN + 1];
+            let mut external_data_file_buf = [0u8; MAX_BACKING_FILE_LEN + 1];
 
             if detailed {
                 (call_table.verbose_print)(b"info: parsing qcow2\n\0".as_ptr());
@@ -297,6 +298,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                     &mut qcow2_info,
                     call_table,
                     &mut backing_file_buf,
+                    &mut external_data_file_buf,
                     input_sector_size,
                     input_capacity,
                 );
@@ -310,7 +312,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                 result.cluster_size,
                 result.flags,
                 backing_file_buf.as_ptr(),
-                b"\0".as_ptr(), // external_data_file (empty for now)
+                external_data_file_buf.as_ptr(),
                 &qcow2_info,
             );
         }
@@ -738,6 +740,7 @@ unsafe fn parse_qcow2_header(
     qcow2_info: &mut Qcow2Info,
     call_table: &CallTable,
     backing_file_buf: &mut [u8; MAX_BACKING_FILE_LEN + 1],
+    external_data_file_buf: &mut [u8; MAX_BACKING_FILE_LEN + 1],
     input_sector_size: usize,
     input_capacity: u64,
 ) {
@@ -796,11 +799,20 @@ unsafe fn parse_qcow2_header(
             qcow2_info.lazy_refcounts = true;
         }
 
-        // Parse header extensions for backing format
-        let backing_format = qcow2::parse_header_extensions(buffer, &hdr);
-        if backing_format != shared::BackingFormat::None {
-            qcow2_info.backing_format = backing_format;
+        // Parse header extensions for backing format and data file name
+        let ext_results = qcow2::parse_header_extensions(buffer, &hdr);
+        if ext_results.backing_format != shared::BackingFormat::None {
+            qcow2_info.backing_format = ext_results.backing_format;
             (call_table.verbose_print)(b"info: found backing format ext\n\0".as_ptr());
+        }
+
+        // Extract external data file name from header extension
+        if ext_results.data_file_name_len > 0 {
+            let off = ext_results.data_file_name_offset;
+            let len = ext_results.data_file_name_len.min(MAX_BACKING_FILE_LEN);
+            external_data_file_buf[..len].copy_from_slice(&buffer[off..off + len]);
+            external_data_file_buf[len] = 0; // null-terminate
+            (call_table.verbose_print)(b"info: found data file ext\n\0".as_ptr());
         }
     }
 }

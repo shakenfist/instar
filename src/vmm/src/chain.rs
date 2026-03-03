@@ -261,6 +261,9 @@ pub struct InfoOperationResult {
     pub flags: u32,
     /// Backing file path (if any)
     pub backing_file: Option<String>,
+    /// External data file path (if any, QCOW2 v3)
+    #[allow(dead_code)]
+    pub external_data_file: Option<String>,
 }
 
 /// Resolve a backing file path relative to the parent image.
