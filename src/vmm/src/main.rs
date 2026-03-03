@@ -124,7 +124,7 @@ const CHECK_RESULT_FLAG_NOT_SUPPORTED: u32 = 1 << 6;
 #[allow(dead_code)]
 const CHAIN_CONFIG_MAGIC: u32 = 0x4348414E; // "CHAN"
 #[allow(dead_code)]
-const CHAIN_CONFIG_VERSION: u32 = 1;
+const CHAIN_CONFIG_VERSION: u32 = 2;
 #[allow(dead_code)]
 const MAX_CHAIN_DEVICES: usize = 16;
 
@@ -1593,6 +1593,21 @@ fn discover_backing_chain(
             file_size
         };
 
+        // For the top image only, check for external data file.
+        // The data file path is untrusted (parsed from the QCOW2 header
+        // inside the sandbox), so we validate it against the allowlist.
+        if chain.images.is_empty() {
+            if let Some(ref data_path) = info_result.external_data_file {
+                let data_resolved = validate_backing_path(&current, data_path, security_config)?;
+                debug!(
+                    "External data file validated: {} -> {}",
+                    data_path,
+                    data_resolved.display()
+                );
+                chain.external_data_file = Some(data_resolved);
+            }
+        }
+
         // Build chain image entry
         let chain_image = ChainImage {
             path: current.clone(),
@@ -1627,6 +1642,9 @@ fn discover_backing_chain(
 /// Print the backing chain in human-readable format
 fn print_backing_chain(chain: &BackingChain) {
     println!("Chain: {} image(s)", chain.len());
+    if let Some(ref data_file) = chain.external_data_file {
+        println!("  External data file: {}", data_file.display());
+    }
     for (i, image) in chain.images().iter().enumerate() {
         let backing_info = match &image.backing_file_raw {
             Some(bf) => format!(" -> {}", bf),
@@ -1655,11 +1673,147 @@ fn print_backing_chain(chain: &BackingChain) {
     }
 }
 
+/// Write device info entries for a single backing chain to guest memory.
+///
+/// Writes ChainDeviceInfo entries starting at `devices_base + start_idx * 32`.
+/// If the chain has an external data file, it is inserted as device `start_idx + 1`
+/// (between the top image and the rest of the backing chain).
+///
+/// Returns the number of device entries written.
+fn write_chain_device_entries(
+    guest_mem: &GuestMemoryMmap,
+    chain: &BackingChain,
+    devices_base: u64,
+    start_idx: usize,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let has_data_file = chain.external_data_file.is_some();
+    let mut idx = start_idx;
+
+    for (chain_pos, image) in chain.images().iter().enumerate() {
+        if idx >= MAX_CHAIN_DEVICES {
+            break;
+        }
+
+        let dev_offset = devices_base + (idx as u64 * 32);
+        guest_mem.write_obj(
+            image.format.to_shared_format_u32(),
+            GuestAddress(dev_offset),
+        )?;
+        guest_mem.write_obj(image.flags, GuestAddress(dev_offset + 4))?;
+        guest_mem.write_obj(image.virtual_size, GuestAddress(dev_offset + 8))?;
+        guest_mem.write_obj(image.actual_size, GuestAddress(dev_offset + 16))?;
+        guest_mem.write_obj(image.cluster_size, GuestAddress(dev_offset + 24))?;
+
+        // For top image with external data file, point to the next device
+        let data_dev_idx: u32 = if chain_pos == 0 && has_data_file {
+            (idx + 1) as u32
+        } else {
+            0 // data is in self
+        };
+        guest_mem.write_obj(data_dev_idx, GuestAddress(dev_offset + 28))?;
+        idx += 1;
+
+        // After the top image, insert the external data file device entry
+        if chain_pos == 0 && has_data_file && idx < MAX_CHAIN_DEVICES {
+            let data_path = chain.external_data_file.as_ref().unwrap();
+            let data_size = std::fs::metadata(data_path).map(|m| m.len()).unwrap_or(0);
+            let dev_offset = devices_base + (idx as u64 * 32);
+            guest_mem.write_obj(
+                ImageFormat::Raw.to_shared_format_u32(),
+                GuestAddress(dev_offset),
+            )?;
+            guest_mem.write_obj(0u32, GuestAddress(dev_offset + 4))?; // no flags
+            guest_mem.write_obj(data_size, GuestAddress(dev_offset + 8))?;
+            guest_mem.write_obj(data_size, GuestAddress(dev_offset + 16))?;
+            guest_mem.write_obj(0u32, GuestAddress(dev_offset + 24))?; // no cluster size
+            guest_mem.write_obj(0u32, GuestAddress(dev_offset + 28))?; // data in self
+            idx += 1;
+        }
+    }
+
+    Ok(idx - start_idx)
+}
+
+/// Open virtio-block devices for a backing chain, including data file if present.
+///
+/// After the top image (first in chain), if the chain has an external data file,
+/// it is opened as a separate read-only device. Remaining backing chain images follow.
+///
+/// Returns the number of devices opened.
+fn open_chain_devices(
+    chain: &BackingChain,
+    sector_size: u64,
+    device_set: &mut DeviceSet,
+    io_events: &mut Vec<IoEvent>,
+    start_idx: usize,
+    label: &str,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut idx = start_idx;
+
+    for (chain_pos, image) in chain.images().iter().enumerate() {
+        let backing = BackingStore::open(&image.path, true, None, false)?;
+        let file_size = std::fs::metadata(&image.path)?.len();
+        let mmio = device_mmio_base(idx);
+        let vq = device_vq_base(idx);
+        let device = VirtioBlockDevice::new(
+            backing,
+            file_size,
+            sector_size,
+            true, // read-only
+            mmio,
+            vq,
+        );
+        debug!(
+            "Created {} device [{}] at MMIO 0x{:x}: {}",
+            label,
+            idx,
+            mmio,
+            image.path.display()
+        );
+        let device = Arc::new(Mutex::new(device));
+        device_set.add_device(Arc::clone(&device), true);
+        io_events.push(IoEvent::new(mmio)?);
+        idx += 1;
+
+        // After the top image, insert the external data file device
+        if chain_pos == 0 {
+            if let Some(ref data_path) = chain.external_data_file {
+                let data_backing = BackingStore::open(data_path, true, None, false)?;
+                let data_size = std::fs::metadata(data_path)?.len();
+                let mmio = device_mmio_base(idx);
+                let vq = device_vq_base(idx);
+                let device = VirtioBlockDevice::new(
+                    data_backing,
+                    data_size,
+                    sector_size,
+                    true, // read-only
+                    mmio,
+                    vq,
+                );
+                debug!(
+                    "Created {} data file device [{}] at MMIO 0x{:x}: {}",
+                    label,
+                    idx,
+                    mmio,
+                    data_path.display()
+                );
+                let device = Arc::new(Mutex::new(device));
+                device_set.add_device(Arc::clone(&device), true);
+                io_events.push(IoEvent::new(mmio)?);
+                idx += 1;
+            }
+        }
+    }
+
+    Ok(idx - start_idx)
+}
+
 /// Write a ChainConfig structure to guest memory at CHAIN_CONFIG_ADDR.
 ///
 /// This populates the chain config with metadata about all devices in the
 /// backing chain, allowing guest operations to understand the chain structure
-/// without parsing image headers.
+/// without parsing image headers. If the chain has an external data file,
+/// it is inserted as device 1 between the top image and the backing chain.
 ///
 /// # Arguments
 ///
@@ -1687,14 +1841,14 @@ fn write_chain_config(
     // - virtual_size: u64 (offset 8)
     // - actual_size: u64 (offset 16)
     // - cluster_size: u32 (offset 24)
-    // - _reserved: u32 (offset 28)
+    // - data_device_idx: u32 (offset 28)
 
-    let device_count = chain.len().min(MAX_CHAIN_DEVICES);
+    let device_count = chain.total_devices().min(MAX_CHAIN_DEVICES);
 
-    if chain.len() > MAX_CHAIN_DEVICES {
+    if chain.total_devices() > MAX_CHAIN_DEVICES {
         debug!(
             "Chain truncated: {} devices exceeds maximum of {}, only first {} will be passed",
-            chain.len(),
+            chain.total_devices(),
             MAX_CHAIN_DEVICES,
             MAX_CHAIN_DEVICES
         );
@@ -1706,21 +1860,9 @@ fn write_chain_config(
     guest_mem.write_obj(CHAIN_CONFIG_VERSION, GuestAddress(CHAIN_CONFIG_ADDR + 8))?;
     guest_mem.write_obj(0u32, GuestAddress(CHAIN_CONFIG_ADDR + 12))?; // reserved
 
-    // Write each device's info
+    // Write device entries (handles data file insertion)
     let devices_base = CHAIN_CONFIG_ADDR + 16;
-    for (i, image) in chain.images().iter().take(MAX_CHAIN_DEVICES).enumerate() {
-        let device_offset = devices_base + (i as u64 * 32);
-
-        guest_mem.write_obj(
-            image.format.to_shared_format_u32(),
-            GuestAddress(device_offset),
-        )?;
-        guest_mem.write_obj(image.flags, GuestAddress(device_offset + 4))?;
-        guest_mem.write_obj(image.virtual_size, GuestAddress(device_offset + 8))?;
-        guest_mem.write_obj(image.actual_size, GuestAddress(device_offset + 16))?;
-        guest_mem.write_obj(image.cluster_size, GuestAddress(device_offset + 24))?;
-        guest_mem.write_obj(0u32, GuestAddress(device_offset + 28))?; // reserved
-    }
+    write_chain_device_entries(guest_mem, chain, devices_base, 0)?;
 
     debug!(
         "Wrote chain config at 0x{:x} ({} devices)",
@@ -3013,30 +3155,16 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
         // transport sector size (I/O granularity), not a format-level property.
         // The guest reconstructs file size as capacity * sector_size, which
         // works correctly regardless of the chosen sector_size value.
-        for (i, image) in chain.images().iter().enumerate() {
-            let backing = BackingStore::open(&image.path, true, None, false)?;
-            let file_size = std::fs::metadata(&image.path)?.len();
-            let mmio = device_mmio_base(i);
-            let vq = device_vq_base(i);
-            let device = VirtioBlockDevice::new(
-                backing,
-                file_size,
-                args.sector_size as u64,
-                true, // read-only
-                mmio,
-                vq,
-            );
-            debug!(
-                "Created chain device [{}] at MMIO 0x{:x}, VQ 0x{:x}: {}",
-                i,
-                mmio,
-                vq,
-                image.path.display()
-            );
-            let device = Arc::new(Mutex::new(device));
-            device_set.add_device(Arc::clone(&device), true);
-            io_events.push(IoEvent::new(mmio)?);
-        }
+        // If the top image has an external data file, it's opened as a
+        // separate device between the top image and the backing chain.
+        open_chain_devices(
+            chain,
+            args.sector_size as u64,
+            &mut device_set,
+            &mut io_events,
+            0,
+            "chain",
+        )?;
 
         // Write chain config to guest memory
         write_chain_config(&guest_mem, chain)?;
@@ -3147,7 +3275,7 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
 
     // Queue the configuration message for transmission
     let config = if let Some(ref chain) = chain {
-        vmm_config_chain(args.sector_size, chain.len())
+        vmm_config_chain(args.sector_size, chain.total_devices())
     } else {
         vmm_config_input_only(args.sector_size)
     };
@@ -3455,20 +3583,20 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         print_backing_chain(&chain2);
     }
 
-    let total_devices = chain1.len() + chain2.len();
+    let total_devices = chain1.total_devices() + chain2.total_devices();
     debug!(
         "Total devices: {} (image1: {} + image2: {})",
         total_devices,
-        chain1.len(),
-        chain2.len()
+        chain1.total_devices(),
+        chain2.total_devices()
     );
 
     if total_devices > MAX_CHAIN_DEVICES {
         return Err(format!(
             "combined chain depth {} (image1: {} + image2: {}) exceeds maximum of {} devices",
             total_devices,
-            chain1.len(),
-            chain2.len(),
+            chain1.total_devices(),
+            chain2.total_devices(),
             MAX_CHAIN_DEVICES
         )
         .into());
@@ -3537,117 +3665,65 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     }
     guest_mem.write_obj(COMPARE_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
     guest_mem.write_obj(compare_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
-    guest_mem.write_obj(chain1.len() as u32, GuestAddress(OPERATION_CONFIG_ADDR + 8))?;
     guest_mem.write_obj(
-        chain2.len() as u32,
+        chain1.total_devices() as u32,
+        GuestAddress(OPERATION_CONFIG_ADDR + 8),
+    )?;
+    guest_mem.write_obj(
+        chain2.total_devices() as u32,
         GuestAddress(OPERATION_CONFIG_ADDR + 12),
     )?;
     debug!(
         "Wrote compare config at 0x{:x} (flags=0x{:x}, chain1={}, chain2={})",
         OPERATION_CONFIG_ADDR,
         compare_flags,
-        chain1.len(),
-        chain2.len()
+        chain1.total_devices(),
+        chain2.total_devices()
     );
 
     // Write ChainConfig with format metadata for all chain images
-    // Devices are laid out: [chain1 images...] [chain2 images...]
+    // Devices are laid out: [chain1 devices...] [chain2 devices...]
+    // Each chain may include an external data file device after its top image.
     guest_mem.write_obj(CHAIN_CONFIG_MAGIC, GuestAddress(CHAIN_CONFIG_ADDR))?;
     guest_mem.write_obj(total_devices as u32, GuestAddress(CHAIN_CONFIG_ADDR + 4))?;
     guest_mem.write_obj(CHAIN_CONFIG_VERSION, GuestAddress(CHAIN_CONFIG_ADDR + 8))?;
     guest_mem.write_obj(0u32, GuestAddress(CHAIN_CONFIG_ADDR + 12))?; // reserved
 
     let devices_base = CHAIN_CONFIG_ADDR + 16;
-    let mut dev_idx: usize = 0;
-
-    // Write chain1 device info entries
-    for image in chain1.images().iter() {
-        let dev_base = devices_base + (dev_idx as u64 * 32);
-        guest_mem.write_obj(image.format.to_shared_format_u32(), GuestAddress(dev_base))?;
-        guest_mem.write_obj(image.flags, GuestAddress(dev_base + 4))?;
-        guest_mem.write_obj(image.virtual_size, GuestAddress(dev_base + 8))?;
-        guest_mem.write_obj(image.actual_size, GuestAddress(dev_base + 16))?;
-        guest_mem.write_obj(image.cluster_size, GuestAddress(dev_base + 24))?;
-        guest_mem.write_obj(0u32, GuestAddress(dev_base + 28))?;
-        dev_idx += 1;
-    }
-
-    // Write chain2 device info entries
-    for image in chain2.images().iter() {
-        let dev_base = devices_base + (dev_idx as u64 * 32);
-        guest_mem.write_obj(image.format.to_shared_format_u32(), GuestAddress(dev_base))?;
-        guest_mem.write_obj(image.flags, GuestAddress(dev_base + 4))?;
-        guest_mem.write_obj(image.virtual_size, GuestAddress(dev_base + 8))?;
-        guest_mem.write_obj(image.actual_size, GuestAddress(dev_base + 16))?;
-        guest_mem.write_obj(image.cluster_size, GuestAddress(dev_base + 24))?;
-        guest_mem.write_obj(0u32, GuestAddress(dev_base + 28))?;
-        dev_idx += 1;
-    }
+    let chain1_written = write_chain_device_entries(&guest_mem, &chain1, devices_base, 0)?;
+    write_chain_device_entries(&guest_mem, &chain2, devices_base, chain1_written)?;
 
     debug!(
         "Wrote chain config at 0x{:x}: device_count={}, chain1={}, chain2={}",
         CHAIN_CONFIG_ADDR,
         total_devices,
-        chain1.len(),
-        chain2.len()
+        chain1.total_devices(),
+        chain2.total_devices()
     );
 
     // Create device set for managing virtio-block devices
     let mut device_set = DeviceSet::new();
     let mut io_events: Vec<IoEvent> = Vec::new();
 
-    // Set up devices for image1's chain (devices 0..chain1.len()-1)
-    for (i, image) in chain1.images().iter().enumerate() {
-        let backing = BackingStore::open(&image.path, true, None, false)?;
-        let file_size = std::fs::metadata(&image.path)?.len();
-        let mmio = device_mmio_base(i);
-        let vq = device_vq_base(i);
-        let device = VirtioBlockDevice::new(
-            backing,
-            file_size,
-            args.sector_size as u64,
-            true, // read-only
-            mmio,
-            vq,
-        );
-        debug!(
-            "Created chain1 device [{}] at MMIO 0x{:x}, VQ 0x{:x}: {}",
-            i,
-            mmio,
-            vq,
-            image.path.display()
-        );
-        let device = Arc::new(Mutex::new(device));
-        device_set.add_device(Arc::clone(&device), true);
-        io_events.push(IoEvent::new(mmio)?);
-    }
+    // Set up devices for image1's chain (including data file if present)
+    let chain1_devs = open_chain_devices(
+        &chain1,
+        args.sector_size as u64,
+        &mut device_set,
+        &mut io_events,
+        0,
+        "chain1",
+    )?;
 
-    // Set up devices for image2's chain (devices chain1.len()..total_devices-1)
-    for (j, image) in chain2.images().iter().enumerate() {
-        let i = chain1.len() + j;
-        let backing = BackingStore::open(&image.path, true, None, false)?;
-        let file_size = std::fs::metadata(&image.path)?.len();
-        let mmio = device_mmio_base(i);
-        let vq = device_vq_base(i);
-        let device = VirtioBlockDevice::new(
-            backing,
-            file_size,
-            args.sector_size as u64,
-            true, // read-only
-            mmio,
-            vq,
-        );
-        debug!(
-            "Created chain2 device [{}] at MMIO 0x{:x}, VQ 0x{:x}: {}",
-            i,
-            mmio,
-            vq,
-            image.path.display()
-        );
-        let device = Arc::new(Mutex::new(device));
-        device_set.add_device(Arc::clone(&device), true);
-        io_events.push(IoEvent::new(mmio)?);
-    }
+    // Set up devices for image2's chain (including data file if present)
+    open_chain_devices(
+        &chain2,
+        args.sector_size as u64,
+        &mut device_set,
+        &mut io_events,
+        chain1_devs,
+        "chain2",
+    )?;
 
     // Wrap guest memory in Arc for sharing
     let guest_mem = Arc::new(guest_mem);
@@ -3951,7 +4027,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         print_backing_chain(&chain);
     }
 
-    let input_device_count = chain.len();
+    let input_device_count = chain.total_devices();
     // Reserve one device slot for the output device to prevent its VQ
     // memory from colliding with DMA_POOL_BASE.
     if input_device_count + 1 > MAX_CHAIN_DEVICES {
@@ -4122,30 +4198,15 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     let mut device_set = DeviceSet::new();
     let mut io_events: Vec<IoEvent> = Vec::new();
 
-    // Set up input chain devices (read-only)
-    for (i, image) in chain.images().iter().enumerate() {
-        let backing = BackingStore::open(&image.path, true, None, false)?;
-        let file_size = std::fs::metadata(&image.path)?.len();
-        let mmio = device_mmio_base(i);
-        let vq = device_vq_base(i);
-        let device = VirtioBlockDevice::new(
-            backing,
-            file_size,
-            args.sector_size as u64,
-            true, // read-only
-            mmio,
-            vq,
-        );
-        debug!(
-            "Created input device [{}] at MMIO 0x{:x}: {}",
-            i,
-            mmio,
-            image.path.display()
-        );
-        let device = Arc::new(Mutex::new(device));
-        device_set.add_device(Arc::clone(&device), true);
-        io_events.push(IoEvent::new(mmio)?);
-    }
+    // Set up input chain devices (read-only), including data file if present
+    open_chain_devices(
+        &chain,
+        args.sector_size as u64,
+        &mut device_set,
+        &mut io_events,
+        0,
+        "input",
+    )?;
 
     // Set up output device (writable).
     // For compressed QCOW2/VMDK output, use 512-byte sectors so
