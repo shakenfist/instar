@@ -793,7 +793,7 @@ fn print_info_result(
         }
 
         // Backing file (if present) - comes before Format specific information
-        if info.flags & (1 << 0) != 0 && !info.backing_file.is_empty() {
+        if info.flags & INFO_RESULT_FLAG_HAS_BACKING_FILE != 0 && !info.backing_file.is_empty() {
             let backing_file_str = info.backing_file.as_str();
             // If backing file is relative, show both the stored name and actual path
             // (qemu-img shows "backing file: <name> (actual path: <resolved>)")
@@ -820,7 +820,9 @@ fn print_info_result(
         }
 
         // External data file (if present, QCOW2 v3)
-        if info.flags & (1 << 1) != 0 && !info.external_data_file.is_empty() {
+        if info.flags & INFO_RESULT_FLAG_HAS_EXTERNAL_DATA != 0
+            && !info.external_data_file.is_empty()
+        {
             println!("data file: {}", info.external_data_file.as_str());
         }
 
@@ -983,7 +985,8 @@ fn print_info_result_json(
     println!("{{");
 
     // Check if we have a backing file
-    let has_backing_file = info.flags & (1 << 0) != 0 && !info.backing_file.is_empty();
+    let has_backing_file =
+        info.flags & INFO_RESULT_FLAG_HAS_BACKING_FILE != 0 && !info.backing_file.is_empty();
 
     // Children section (qemu-img 8.0+ only)
     if profile.include_child_node {
@@ -1069,7 +1072,8 @@ fn print_info_result_json(
             info.qcow2_info.refcount_bits
         };
 
-        let has_data_file = info.flags & (1 << 1) != 0 && !info.external_data_file.is_empty();
+        let has_data_file = info.flags & INFO_RESULT_FLAG_HAS_EXTERNAL_DATA != 0
+            && !info.external_data_file.is_empty();
 
         if is_v3 {
             println!("            \"refcount-bits\": {},", refcount_bits);
