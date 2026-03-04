@@ -455,6 +455,7 @@ impl QcowHeader {
 }
 
 /// Results from parsing QCOW2 v3 header extensions.
+#[derive(Debug, PartialEq)]
 pub struct HeaderExtensionResults {
     /// Backing format from EXT_BACKING_FORMAT extension.
     pub backing_format: BackingFormat,
@@ -1355,7 +1356,10 @@ mod tests {
         let mut buf = make_qcow2_header();
         buf[VERSION_OFFSET..VERSION_OFFSET + 4].copy_from_slice(&2u32.to_be_bytes());
         let hdr = QcowHeader::parse(&buf).unwrap();
-        assert_eq!(parse_header_extensions(&buf, &hdr), BackingFormat::None);
+        assert_eq!(
+            parse_header_extensions(&buf, &hdr).backing_format,
+            BackingFormat::None,
+        );
     }
 
     #[test]
@@ -1374,7 +1378,9 @@ mod tests {
         let next = ext_off + 8 + 8;
         buf[next..next + 4].copy_from_slice(&EXT_END.to_be_bytes());
 
-        assert_eq!(parse_header_extensions(&buf, &hdr), BackingFormat::Qcow2);
+        let result = parse_header_extensions(&buf, &hdr);
+        assert_eq!(result.backing_format, BackingFormat::Qcow2);
+        assert_eq!(result.data_file_name_len, 0);
     }
 
     #[test]
@@ -1385,7 +1391,10 @@ mod tests {
         let ext_off = 112;
         buf[ext_off..ext_off + 4].copy_from_slice(&EXT_END.to_be_bytes());
 
-        assert_eq!(parse_header_extensions(&buf, &hdr), BackingFormat::None);
+        assert_eq!(
+            parse_header_extensions(&buf, &hdr).backing_format,
+            BackingFormat::None,
+        );
     }
 }
 
