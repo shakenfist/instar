@@ -518,6 +518,7 @@
             "safety": "safe",
             "run_in_ci": false,
             "skip_qemu_img": true,
+            "data_file": "qcow2-external-data-raw.raw",
             "description": "QCOW2 with external data file (data_file_raw=on, MBR partition table)",
             "tags": ["qcow2", "external-data", "generated"]
         },
