@@ -512,6 +512,16 @@
             "sha256": "63e9039cbe0b0bc21a538ecaa8368068bff365ccbb4b41ee80e2128eec67006d"
         },
         {
+            "id": "qcow2-external-data-raw",
+            "path": "custom/external-data/qcow2-external-data-raw.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "description": "QCOW2 with external data file (data_file_raw=on, MBR partition table)",
+            "tags": ["qcow2", "external-data", "generated"]
+        },
+        {
             "id": "qcow2-unknown-features",
             "path": "custom/security/qcow2-unknown-features.qcow2",
             "format": "qcow2",

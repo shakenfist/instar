@@ -17,7 +17,7 @@ Confused about how imago does these things? Perhaps read the [technology primer]
 ## Supported Formats
 
 Initial target formats:
-- **qcow2** - QEMU Copy-On-Write format
+- **qcow2** - QEMU Copy-On-Write format (including external data files)
 - **raw** - Raw disk images
 - **vmdk** - VMware Virtual Machine Disk
 - **vpc** (VHD) - Virtual Hard Disk (Hyper-V, Virtual PC)
