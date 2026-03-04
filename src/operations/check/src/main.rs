@@ -109,6 +109,38 @@ pub unsafe extern "C" fn _start() -> u64 {
 
     (call_table.verbose_print)(b"check: detected format\n\0".as_ptr());
 
+    // Determine external data file size from chain config (if available).
+    // When a QCOW2 has an external data file, standard cluster offsets
+    // point into the data device, not the metadata device. The check
+    // operation must skip bounds/overlap/refcount validation for those
+    // clusters against the metadata file.
+    let data_file_size: u64 = {
+        let chain_result = (call_table.get_chain_config)();
+        if !chain_result.ptr.is_null() && chain_result.len > 0 {
+            let cc = &*(chain_result.ptr as *const ChainConfig);
+            if cc.is_valid() {
+                if let Some(dev0) = cc.get(0) {
+                    if dev0.has_external_data_device() {
+                        let data_idx = dev0.data_device_idx as usize;
+                        if let Some(data_dev) = cc.get(data_idx) {
+                            data_dev.actual_size
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    };
+
     // Perform format-specific validation
     match format {
         ImageFormat::Qcow2 => {
@@ -118,6 +150,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                 call_table,
                 input_sector_size,
                 actual_size,
+                data_file_size,
             );
         }
         ImageFormat::Vmdk4 => {
@@ -1528,6 +1561,7 @@ unsafe fn check_qcow2(
     call_table: &CallTable,
     sector_size: usize,
     actual_size: u64,
+    data_file_size: u64,
 ) -> u64 {
     let mut bytes_read: u64 = 0;
 
@@ -1618,6 +1652,18 @@ unsafe fn check_qcow2(
             (call_table.debug_print)(b"check: unsupported incompatible features\n\0".as_ptr());
             return bytes_read;
         }
+    }
+
+    // Determine if this image uses an external data file.
+    // When true, standard (uncompressed) L2 cluster offsets point into
+    // the external data file, not this metadata file. We must skip
+    // bounds/overlap/refcount checks for those clusters against the
+    // metadata file size. Compressed clusters and L2 tables remain in
+    // the metadata file and are validated normally.
+    let has_external_data = hdr.has_external_data;
+
+    if has_external_data {
+        (call_table.verbose_print)(b"check: external data file detected\n\0".as_ptr());
     }
 
     // Validate L1 table offset
@@ -1907,49 +1953,65 @@ unsafe fn check_qcow2(
                             continue;
                         }
 
-                        if data_off >= actual_size {
-                            result.corruptions += 1;
-                            result.total_errors += 1;
-                            continue;
-                        }
-
                         if data_off % cluster_size != 0 {
                             result.corruptions += 1;
                             result.total_errors += 1;
                             continue;
                         }
 
-                        result.clusters_allocated += 1;
-
-                        // Overlap detection
-                        if bmp.can_track {
-                            let cidx = data_off / cluster_size;
-                            if matches!(bmp.set(cidx), BitmapSetResult::AlreadySet) {
+                        if has_external_data {
+                            // Standard cluster data is in the external
+                            // data file. Skip overlap/refcount checks
+                            // (those track metadata file only).
+                            // Validate offset against data file size
+                            // only if the data file was provided.
+                            if data_file_size > 0 && data_off >= data_file_size {
                                 result.corruptions += 1;
                                 result.total_errors += 1;
-                                (call_table.debug_print)(b"check: overlap\n\0".as_ptr());
+                                continue;
                             }
-                        }
 
-                        // Refcount validation
-                        if let Some(rc) = qcow2::lookup_refcount(
-                            call_table,
-                            0,
-                            refcount_table_offset,
-                            refcount_bits,
-                            cluster_size,
-                            sector_size,
-                            input_capacity,
-                            data_off,
-                            &mut reftable_cached_sector,
-                            reftable_cached_buffer.as_mut_ptr(),
-                            &mut refblock_cached_sector,
-                            refblock_cached_buffer.as_mut_ptr(),
-                            &mut bytes_read,
-                        ) {
-                            if rc == 0 {
-                                result.refcount_errors += 1;
+                            result.clusters_allocated += 1;
+                        } else {
+                            // Standard cluster data is in this file.
+                            if data_off >= actual_size {
+                                result.corruptions += 1;
                                 result.total_errors += 1;
+                                continue;
+                            }
+
+                            result.clusters_allocated += 1;
+
+                            // Overlap detection
+                            if bmp.can_track {
+                                let cidx = data_off / cluster_size;
+                                if matches!(bmp.set(cidx), BitmapSetResult::AlreadySet) {
+                                    result.corruptions += 1;
+                                    result.total_errors += 1;
+                                    (call_table.debug_print)(b"check: overlap\n\0".as_ptr());
+                                }
+                            }
+
+                            // Refcount validation
+                            if let Some(rc) = qcow2::lookup_refcount(
+                                call_table,
+                                0,
+                                refcount_table_offset,
+                                refcount_bits,
+                                cluster_size,
+                                sector_size,
+                                input_capacity,
+                                data_off,
+                                &mut reftable_cached_sector,
+                                reftable_cached_buffer.as_mut_ptr(),
+                                &mut refblock_cached_sector,
+                                refblock_cached_buffer.as_mut_ptr(),
+                                &mut bytes_read,
+                            ) {
+                                if rc == 0 {
+                                    result.refcount_errors += 1;
+                                    result.total_errors += 1;
+                                }
                             }
                         }
 
@@ -1966,14 +2028,16 @@ unsafe fn check_qcow2(
                         }
                         last_data_offset = data_off;
 
-                        // Update max offset
-                        if let Some(de) = data_off.checked_add(cluster_size) {
-                            if de > max_offset {
-                                max_offset = de;
+                        // Update max offset (only for metadata file)
+                        if !has_external_data {
+                            if let Some(de) = data_off.checked_add(cluster_size) {
+                                if de > max_offset {
+                                    max_offset = de;
+                                }
+                            } else {
+                                result.corruptions += 1;
+                                result.total_errors += 1;
                             }
-                        } else {
-                            result.corruptions += 1;
-                            result.total_errors += 1;
                         }
                     } else {
                         // Compressed cluster

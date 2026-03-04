@@ -399,6 +399,56 @@ JSON area at offset 4096).
 Updated format-coverage.md, README.md, ARCHITECTURE.md, AGENTS.md
 with LUKS support documentation. Marked Phase 12 complete.
 
+## Phase 13: QCOW2 External Data File Support ✓
+
+QCOW2 v3 allows separating metadata (L1/L2 tables, refcounts) from
+cluster data via the "external data file" feature (incompatible bit 2).
+Full read support: info reports the data file path, check/convert/compare
+process images when the data file is provided via `--chain`.
+
+### 13a: Parse DATA header extension and expose path ✓
+
+Added `EXT_EXTERNAL_DATA_FILE` constant (0x44415441) and refactored
+`parse_header_extensions()` to return `HeaderExtensionResults` with both
+backing format and data file name. Info operation extracts data file name
+and passes it to VMM. Human output: `data file: <path>`. JSON output:
+`data-file` in `format-specific.data`.
+
+### 13b: VMM-side data file discovery and device setup ✓
+
+Chain discovery validates external data file path against allowlist
+(CVE-2024-32498). Data file opens as device 1, backing chain shifts to
+devices 2+. `ChainDeviceInfo.data_device_idx` field (replaces `_reserved`)
+tells the guest which device holds cluster data. `ChainConfig.VERSION`
+bumped to 2. Helper functions `write_chain_device_entries()` and
+`open_chain_devices()` used across convert, check, and compare operations.
+
+### 13c: Guest-side cluster read dispatch ✓
+
+`INCOMPAT_EXTERNAL_DATA` added to `SUPPORTED_INCOMPAT_FEATURES` in both
+`#[cfg]` variants. `read_chain_virtual_cluster()` dispatches standard
+cluster reads to `data_device_idx` when non-zero. Compressed clusters and
+L1/L2 table reads stay on the metadata device. Check operation's supported
+features mask updated.
+
+### 13d: Test images and integration tests ✓
+
+Fixed check operation to skip bounds/overlap/refcount validation for
+standard cluster data offsets when external data bit is set. Created
+`scripts/create-external-data-testdata.sh` for test image generation.
+Added `qcow2-external-data-raw` to manifest. Implemented security tests
+(`test_imago_reports_external_data_file_without_reading_content`,
+`test_imago_reports_external_data_file_in_json`). Added check integration
+tests (`TestCheckExternalDataFile` class).
+
+### 13e: Oslo crossval and documentation ✓
+
+Removed `qcow2-external-data-file` from `KNOWN_SAFETY_DIVERGENCES` — imago
+now reports the data-file path in JSON, resolving the oslo crossval
+divergence. Updated format-coverage.md (feature bit table, capabilities
+list, divergences table), ARCHITECTURE.md (QCOW2 features), README.md,
+AGENTS.md.
+
 ---
 
 ## Key Architectural Decisions
