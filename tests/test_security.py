@@ -95,17 +95,69 @@ class TestSecurityFeatureDetection(ImagoTestBase):
             '/etc/passwd content leaked in output!'
         )
 
-    def test_imago_does_not_follow_external_data(self):
+    def test_imago_reports_external_data_file_without_reading_content(self):
         """
-        Verify imago detects but doesn't follow external data file references.
+        Verify imago reports external data file path without reading its content.
 
-        QCOW2 v3 supports external data files which could reference
-        sensitive system files. imago should report these but not read them.
+        QCOW2 v3 supports external data files (CVE-2024-32498) which could
+        reference sensitive system files. The info operation should report
+        the path from the DATA header extension without opening or reading
+        the data file itself.
         """
-        # TODO: Implement when we have external data file test infrastructure
-        # Need to create a QCOW2 v3 with external_data_file pointing to
-        # a sensitive file
-        self.skipTest('External data file security test not yet implemented')
+        image = self.get_image('qcow2-external-data-file')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+
+        # Run imago info (without --chain, so no file opens)
+        stdout, stderr, rc = self.run_imago_info(image.path)
+
+        # Should succeed — the QCOW2 metadata is valid
+        self.assertEqual(
+            0, rc,
+            f'imago should process QCOW2 with external data: {stderr}'
+        )
+
+        # Should report the data file path
+        self.assertIn(
+            'data file',
+            stdout.lower(),
+            f'Expected data file reference in output: {stdout}'
+        )
+        self.assertIn(
+            'external-data.raw',
+            stdout,
+            f'Expected external-data.raw in data file path: {stdout}'
+        )
+
+    def test_imago_reports_external_data_file_in_json(self):
+        """
+        Verify imago reports external data file in JSON format-specific data.
+        """
+        image = self.get_image('qcow2-external-data-file')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+
+        stdout, stderr, rc = self.run_imago_info(
+            image.path, output_format='json'
+        )
+
+        self.assertEqual(
+            0, rc,
+            f'imago should process QCOW2 with external data: {stderr}'
+        )
+
+        import json
+        data = json.loads(stdout)
+        fmt_data = data.get('format-specific', {}).get('data', {})
+        self.assertIn(
+            'data-file', fmt_data,
+            f'Expected data-file in format-specific.data: {fmt_data}'
+        )
+        self.assertEqual(
+            'external-data.raw',
+            fmt_data['data-file'],
+            f'Expected external-data.raw as data-file value: {fmt_data}'
+        )
 
     def test_imago_handles_vmdk_descriptor_safely(self):
         """

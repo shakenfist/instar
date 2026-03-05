@@ -88,9 +88,8 @@ KNOWN_FORMAT_DIVERGENCES = {
 # expose certain safety-relevant fields in JSON output
 # (handled via KVM sandbox instead).
 KNOWN_SAFETY_DIVERGENCES = {
-    # imago detects the external data file feature bit
-    # but does not expose the data-file path in JSON.
-    'qcow2-external-data-file': {'data_file'},
+    # No remaining divergences: imago now reports
+    # the data-file path in JSON output (Phase 13).
 }
 
 # Formats where virtual size is not comparable between

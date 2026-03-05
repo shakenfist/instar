@@ -1681,8 +1681,12 @@ pub struct ChainDeviceInfo {
     /// Cluster size in bytes (0 for raw images)
     pub cluster_size: u32,
 
-    /// Reserved for future use
-    pub _reserved: u32,
+    /// Device index holding this device's cluster data.
+    /// 0 = data is in this device itself (normal case).
+    /// Non-zero = device index of the external data file.
+    /// Used for QCOW2 images with external data files where
+    /// metadata (L1/L2/refcounts) and cluster data are separate.
+    pub data_device_idx: u32,
 }
 
 impl ChainDeviceInfo {
@@ -1694,7 +1698,7 @@ impl ChainDeviceInfo {
             virtual_size: 0,
             actual_size: 0,
             cluster_size: 0,
-            _reserved: 0,
+            data_device_idx: 0,
         }
     }
 
@@ -1716,6 +1720,13 @@ impl ChainDeviceInfo {
     /// Check if this device has compressed clusters
     pub fn is_compressed(&self) -> bool {
         (self.flags & InfoResult::FLAG_COMPRESSED) != 0
+    }
+
+    /// Check if this device has an external data file on another device.
+    /// When true, standard cluster reads should go to `data_device_idx`
+    /// instead of this device.
+    pub fn has_external_data_device(&self) -> bool {
+        self.data_device_idx != 0
     }
 }
 
@@ -1758,8 +1769,8 @@ impl ChainConfig {
     /// Magic value for chain config
     pub const MAGIC: u32 = 0x4348414E; // "CHAN"
 
-    /// Current structure version
-    pub const VERSION: u32 = 1;
+    /// Current structure version (2 = data_device_idx field)
+    pub const VERSION: u32 = 2;
 
     /// Create a new empty chain config
     pub const fn new() -> Self {

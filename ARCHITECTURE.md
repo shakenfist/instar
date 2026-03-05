@@ -248,7 +248,8 @@ QEMU Copy-On-Write version 2/3. Supported features:
 - Refcount widths: 1, 2, 4, 8, 16, 32, 64 bits
 - Extended L2 entries (16-byte with subcluster bitmaps)
 - Incompatible feature bit validation
-- Not yet supported: encryption (QCOW2-native), external data files, snapshots
+- External data files (metadata/data separation, chain discovery with allowlist)
+- Not yet supported: encryption (QCOW2-native), snapshots
 
 ### raw
 
