@@ -2995,6 +2995,13 @@ class TestConvertVhdCompare(ImagoTestBase):
     the qemu-img-converted raw baseline.
     """
 
+    def _timeout_for_vsize(self, vsize):
+        """Compute timeout based on virtual size."""
+        if not vsize:
+            return 120
+        gib = vsize / (1024 ** 3)
+        return max(120, int(120 + gib * 15))
+
     def _compare_vhd_vs_raw(self, image_id):
         """Compare VHD against its qemu-img-converted raw."""
         image = self.get_image(image_id)
@@ -3006,6 +3013,7 @@ class TestConvertVhdCompare(ImagoTestBase):
 
         # qemu-img converts VHD to raw at full virtual
         # size; skip if insufficient temp space.
+        vsize = 0
         result = subprocess.run(
             [
                 'qemu-img', 'info', '--output=json',
@@ -3029,12 +3037,14 @@ class TestConvertVhdCompare(ImagoTestBase):
                     f'available'
                 )
 
+        timeout = self._timeout_for_vsize(vsize)
+
         with tempfile.NamedTemporaryFile(
                 suffix='.raw') as qemu_raw:
             q_stdout, q_stderr, q_rc = \
                 self.run_qemu_img_convert(
                     image.path, Path(qemu_raw.name),
-                    timeout=120
+                    timeout=timeout
                 )
             self.assertEqual(
                 q_rc, 0,
@@ -3043,7 +3053,7 @@ class TestConvertVhdCompare(ImagoTestBase):
 
             cmp_out, _, cmp_rc = self.run_imago_compare(
                 image.path, Path(qemu_raw.name),
-                timeout=120
+                timeout=timeout
             )
             self.assertEqual(
                 cmp_rc, 0,
@@ -3269,6 +3279,13 @@ class TestConvertVhdToQcow2Roundtrip(ImagoTestBase):
     against qemu-img VHD -> raw baseline.
     """
 
+    def _timeout_for_vsize(self, vsize):
+        """Compute timeout based on virtual size."""
+        if not vsize:
+            return 120
+        gib = vsize / (1024 ** 3)
+        return max(120, int(120 + gib * 15))
+
     def _test_vhd_qcow2_roundtrip(self, image_id):
         """VHD -> QCOW2 -> raw, compare against baseline."""
         image = self.get_image(image_id)
@@ -3279,6 +3296,7 @@ class TestConvertVhdToQcow2Roundtrip(ImagoTestBase):
         self.skip_if_hash_mismatch(image)
 
         # Need space for QCOW2 + 2x raw at virtual size
+        vsize = 0
         result = subprocess.run(
             [
                 'qemu-img', 'info', '--output=json',
@@ -3302,6 +3320,8 @@ class TestConvertVhdToQcow2Roundtrip(ImagoTestBase):
                     f'available'
                 )
 
+        timeout = self._timeout_for_vsize(vsize)
+
         with tempfile.NamedTemporaryFile(
                 suffix='.qcow2') as qcow2_out, \
                 tempfile.NamedTemporaryFile(
@@ -3312,7 +3332,7 @@ class TestConvertVhdToQcow2Roundtrip(ImagoTestBase):
             stdout, stderr, rc = self.run_imago_convert(
                 image.path, Path(qcow2_out.name),
                 output_format='qcow2',
-                timeout=120
+                timeout=timeout
             )
             self.assertEqual(
                 rc, 0,
@@ -3325,7 +3345,7 @@ class TestConvertVhdToQcow2Roundtrip(ImagoTestBase):
                 self.run_imago_convert(
                     Path(qcow2_out.name),
                     Path(rt_raw.name),
-                    timeout=120
+                    timeout=timeout
                 )
             self.assertEqual(
                 rt_rc, 0,
@@ -3337,7 +3357,7 @@ class TestConvertVhdToQcow2Roundtrip(ImagoTestBase):
             q_stdout, q_stderr, q_rc = \
                 self.run_qemu_img_convert(
                     image.path, Path(qemu_raw.name),
-                    timeout=120
+                    timeout=timeout
                 )
             self.assertEqual(
                 q_rc, 0,
@@ -3349,7 +3369,7 @@ class TestConvertVhdToQcow2Roundtrip(ImagoTestBase):
             cmp_out, _, cmp_rc = self.run_imago_compare(
                 Path(rt_raw.name),
                 Path(qemu_raw.name),
-                timeout=120
+                timeout=timeout
             )
             self.assertEqual(
                 cmp_rc, 0,
