@@ -14,6 +14,7 @@ format support and cross-tool validation work.
 - Phase 11: oslo.utils format_inspector cross-validation testing.
 - Phase 12: LUKS container inspection (inner format detection with
   passphrase).
+- Phase 14: Byte-order consolidation & VHD integration tests.
 
 ---
 
@@ -588,6 +589,49 @@ Gerrit review 978095 and related changes show oslo.utils is adding:
   matching oslo.utils ContainerFileInspector functionality.
 - The GPT/MBR safety check reorganization may change oslo.utils
   output format; monitor for test compatibility impact.
+
+## Phase 14: Byte-Order Consolidation & VHD Integration Tests ✓
+
+Consolidate duplicate byte-order helpers from format crates into the
+shared crate, add comprehensive VHD integration tests, and fix VHD
+sector alignment bugs discovered during testing.
+
+### 14a: Byte-order helper consolidation ✓
+
+Moved all 12 byte-order helpers (`be_u16/32/64`, `le_u16/32/64`,
+`write_be_u16/32/64`, `write_le_u16/32/64`) from qcow2, vhd, vhdx,
+and vmdk crates into `src/shared/src/lib.rs`. Updated ~30 call sites
+in the convert operation. Eliminates ~120 lines of duplication.
+
+### 14b: VHD-to-raw conversion tests ✓
+
+Added `TestConvertVhdToRaw` class testing conversion of hyperv-dynamic,
+virtualpc, and d2v-zerofilled VHD images to raw with qemu-img
+cross-validation.
+
+### 14c: VHD round-trip and check-output tests ✓
+
+Added `TestConvertToVhd` (raw/qcow2/VHD → VHD → raw round-trip) and
+`TestConvertVhdCheckOutput` (structural integrity of imago-produced VHD).
+
+### 14d: VHD compare and cross-format round-trip tests ✓
+
+Added `TestConvertVhdCompare` (VHD vs raw baseline) and
+`TestConvertVhdToQcow2Roundtrip` (VHD → QCOW2 → raw). All tests
+include temp space checks for large images.
+
+### 14e: Bug fixes discovered during testing ✓
+
+- **VHD read sector alignment**: VHD BAT entries use 512-byte sector
+  addressing, but the device sector size can be 65536 bytes. Added
+  `read_offset_sectors()` to handle sub-sector-aligned reads for VHD
+  data that starts mid-sector.
+- **VHD write sector alignment**: When writing VHD output, the bitmap
+  (512 bytes) and data share the same output sector (65536 bytes).
+  Separate writes clobbered each other. Fixed with carry-buffer approach
+  that assembles bitmap+data into sector-aligned writes using a read
+  buffer for input I/O and a carry buffer for the 512-byte leftover
+  between output sectors.
 
 ## Deferred Work (from Phase 12 review)
 

@@ -7,7 +7,9 @@
 #![no_std]
 #![allow(clippy::too_many_arguments)]
 
-use shared::{CallTable, MAX_SECTOR_SIZE};
+use shared::{
+    be_u16, be_u32, be_u64, write_be_u16, write_be_u32, write_be_u64, CallTable, MAX_SECTOR_SIZE,
+};
 
 // ============================================================================
 // VHD footer field offsets (all big-endian)
@@ -97,59 +99,6 @@ pub const DEFAULT_BLOCK_SIZE: u32 = 2 * 1024 * 1024;
 
 /// VHD features: reserved bit (must be set).
 pub const FEATURES_RESERVED: u32 = 0x0000_0002;
-
-// ============================================================================
-// Byte-order helpers (big-endian)
-// ============================================================================
-
-/// Read a big-endian u16 from a byte slice.
-#[inline]
-fn be_u16(buf: &[u8], off: usize) -> u16 {
-    u16::from_be_bytes([buf[off], buf[off + 1]])
-}
-
-/// Read a big-endian u32 from a byte slice.
-#[inline]
-fn be_u32(buf: &[u8], off: usize) -> u32 {
-    u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
-}
-
-/// Read a big-endian u64 from a byte slice.
-#[inline]
-fn be_u64(buf: &[u8], off: usize) -> u64 {
-    u64::from_be_bytes([
-        buf[off],
-        buf[off + 1],
-        buf[off + 2],
-        buf[off + 3],
-        buf[off + 4],
-        buf[off + 5],
-        buf[off + 6],
-        buf[off + 7],
-    ])
-}
-
-// ============================================================================
-// Write helpers (big-endian)
-// ============================================================================
-
-/// Write a big-endian u16 to a byte slice.
-#[inline]
-pub fn write_be_u16(buf: &mut [u8], off: usize, val: u16) {
-    buf[off..off + 2].copy_from_slice(&val.to_be_bytes());
-}
-
-/// Write a big-endian u32 to a byte slice.
-#[inline]
-pub fn write_be_u32(buf: &mut [u8], off: usize, val: u32) {
-    buf[off..off + 4].copy_from_slice(&val.to_be_bytes());
-}
-
-/// Write a big-endian u64 to a byte slice.
-#[inline]
-pub fn write_be_u64(buf: &mut [u8], off: usize, val: u64) {
-    buf[off..off + 8].copy_from_slice(&val.to_be_bytes());
-}
 
 // ============================================================================
 // VHD footer parsing
