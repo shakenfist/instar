@@ -15,6 +15,7 @@ format support and cross-tool validation work.
 - Phase 12: LUKS container inspection (inner format detection with
   passphrase).
 - Phase 14: Byte-order consolidation & VHD integration tests.
+- Phase 15: Test coverage gaps & minor optimizations.
 
 ---
 
@@ -499,10 +500,8 @@ Phase 9 (VHD) is complete. All sub-phases 9a-9e committed.
 
 ### Refactoring Opportunities (not blocking, future improvement)
 
-11. **Byte-order helper duplication** — `be_u16`/`be_u32`/`be_u64`
-    and `write_be_*` helpers are duplicated across qcow2, vmdk,
-    and vhd crates (~130 lines total). Could be moved to shared
-    crate. Pre-existing pattern; VHD followed the convention.
+11. **Byte-order helper duplication** — DONE (Phase 14a). Moved all
+    12 helpers to shared crate, updated ~30 call sites.
 
 12. **Two-pass zero check in convert_to_vhd** — When skip-zeros
     is enabled, VHD output reads each 2 MiB block twice: once to
@@ -514,15 +513,12 @@ Phase 9 (VHD) is complete. All sub-phases 9a-9e committed.
 
 ### Test Gaps (Phase 9)
 
-13. **No VHD convert integration tests** — No tests for VHD→raw,
-    raw→VHD, QCOW2→VHD, or VHD→QCOW2 conversion round-trips.
-    VMDK has full round-trip coverage (TestConvertVmdkToRaw,
-    TestConvertToVmdk, TestConvertVmdkToQcow2Roundtrip,
-    TestConvertVmdkCheckOutput). VHD needs equivalent tests.
+13. **No VHD convert integration tests** — DONE (Phase 14b-14d).
+    Added TestConvertVhdToRaw, TestConvertToVhd,
+    TestConvertVhdCheckOutput, TestConvertVhdToQcow2Roundtrip.
 
-14. **No VHD compare integration tests** — No tests comparing
-    VHD vs raw equivalence after conversion. VMDK has
-    TestConvertVmdkCompare for this.
+14. **No VHD compare integration tests** — DONE (Phase 14d).
+    Added TestConvertVhdCompare.
 
 15. **No fixed VHD test image** — All VHD test images are
     dynamic. No fixed VHD (disk_type=2) test image exists.
@@ -553,9 +549,12 @@ Phase 9 (VHD) is complete. All sub-phases 9a-9e committed.
    `run_in_ci=false` (not available in CI). Consider making them available
    or adding local-only tests.
 
-5. **Security test placeholders** — `test_imago_handles_vmdk_descriptor_safely`
-   and `test_imago_does_not_follow_external_data` are SKIPPED with "not yet
-   implemented". These need the security test framework to be built out.
+5. **Security test placeholders** — `test_imago_does_not_follow_external_data`
+   DONE (Phase 13d, implemented as two tests:
+   `test_imago_reports_external_data_file_without_reading_content` and
+   `test_imago_reports_external_data_file_in_json`).
+   `test_imago_handles_vmdk_descriptor_safely` remains SKIPPED — needs
+   VMDK descriptor extent parsing and the vmdk-path-traversal test image.
 
 6. **Multi-extent VMDK tests** — No test images exercise the multi-extent
    detection and error path. Would need a multi-extent test image.
