@@ -16,7 +16,7 @@ imago/
 │   ├── vmm/        # Virtual machine monitor (host-side)
 │   ├── core/       # Core guest initialization
 │   ├── crates/     # Shared format crates (qcow2, raw, vmdk, vhd, vhdx)
-│   ├── shared/     # Shared library code
+│   ├── shared/     # Shared library code (byte-order helpers, configs)
 │   ├── operations/ # Pluggable operations (info, copy, check, compare, convert)
 │   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates (guest-protocol)

@@ -2555,15 +2555,6 @@ class TestConvertVmdkCheckOutput(ImagoTestBase):
         self._test_vmdk_output_check('plaso-vmdk')
 
 
-# TODO: Add VHD integration tests matching VMDK coverage above:
-#   - TestConvertVhdToRaw: VHD->raw conversion cross-validated with qemu-img
-#   - TestConvertToVhd: raw/qcow2/vhd->VHD round-trip (raw->VHD->raw)
-#   - TestConvertVhdToQcow2Roundtrip: VHD->QCOW2->raw round-trip
-#   - TestConvertVhdCheckOutput: imago check on imago-produced VHD files
-#   - TestConvertVhdCompare: VHD vs raw comparison via imago compare
-# Test images available: hyperv-dynamic-vhd, virtualpc-vhd, vhd-d2v-zerofilled
-
-
 class TestConvertVhdxToRaw(ImagoTestBase):
     """Test VHDX to raw conversion.
 
@@ -2889,10 +2880,489 @@ class TestConvertVhdxCheckOutput(ImagoTestBase):
         self._test_vhdx_output_check('qemu-vhdx')
 
 
-# TODO: Add VHD integration tests matching VMDK coverage above:
-#   - TestConvertVhdToRaw: VHD->raw conversion cross-validated with qemu-img
-#   - TestConvertToVhd: raw/qcow2/vhd->VHD round-trip (raw->VHD->raw)
-#   - TestConvertVhdToQcow2Roundtrip: VHD->QCOW2->raw round-trip
-#   - TestConvertVhdCheckOutput: imago check on imago-produced VHD files
-#   - TestConvertVhdCompare: VHD vs raw comparison via imago compare
-# Test images available: hyperv-dynamic-vhd, virtualpc-vhd, vhd-d2v-zerofilled
+class TestConvertVhdToRaw(ImagoTestBase):
+    """Test VHD to raw conversion.
+
+    Converts dynamic VHD images to raw and cross-validates
+    against qemu-img convert output.
+    """
+
+    VHD_IDS = [
+        'hyperv-dynamic-vhd',
+        'virtualpc-vhd',
+        'vhd-d2v-zerofilled',
+    ]
+
+    def _get_vhd_info(self, image_path):
+        """Get virtual_size via qemu-img info."""
+        result = subprocess.run(
+            [
+                'qemu-img', 'info', '--output=json',
+                str(image_path),
+            ],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return None
+        info = json.loads(result.stdout)
+        return info.get('virtual-size')
+
+    def _timeout_for_vsize(self, vsize):
+        """Compute timeout based on virtual size."""
+        if not vsize:
+            return 120
+        gib = vsize / (1024 ** 3)
+        return max(120, int(120 + gib * 15))
+
+    def _test_vhd_convert(self, image_id):
+        """Convert a VHD image to raw and cross-validate."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        vsize = self._get_vhd_info(image.path)
+        timeout = self._timeout_for_vsize(vsize)
+
+        if vsize:
+            tmpdir = tempfile.gettempdir()
+            st = os.statvfs(tmpdir)
+            avail = st.f_bavail * st.f_frsize
+            needed = vsize * 2 + 100 * 1024 * 1024
+            if avail < needed:
+                self.skipTest(
+                    f'{image_id}: needs '
+                    f'{needed // (1024**3)}GB temp, '
+                    f'only {avail // (1024**3)}GB '
+                    f'available'
+                )
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') \
+                as imago_raw, \
+                tempfile.NamedTemporaryFile(suffix='.raw') \
+                as qemu_raw:
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(imago_raw.name),
+                timeout=timeout
+            )
+            self.assertEqual(
+                rc, 0,
+                f'imago convert failed for {image_id}: '
+                f'{stderr}'
+            )
+
+            q_stdout, q_stderr, q_rc = \
+                self.run_qemu_img_convert(
+                    image.path, Path(qemu_raw.name),
+                    timeout=timeout
+                )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed for '
+                f'{image_id}: {q_stderr}'
+            )
+
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(imago_raw.name),
+                Path(qemu_raw.name),
+                timeout=timeout
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Convert output for {image_id} differs '
+                f'from qemu-img: {cmp_out}'
+            )
+
+    def test_convert_hyperv_dynamic_vhd(self):
+        """Convert Hyper-V 2012 R2 dynamic VHD to raw."""
+        self._test_vhd_convert('hyperv-dynamic-vhd')
+
+    def test_convert_virtualpc_vhd(self):
+        """Convert Virtual PC dynamic VHD to raw."""
+        self._test_vhd_convert('virtualpc-vhd')
+
+    def test_convert_vhd_d2v_zerofilled(self):
+        """Convert Disk2VHD zerofilled VHD to raw."""
+        self._test_vhd_convert('vhd-d2v-zerofilled')
+
+
+class TestConvertVhdCompare(ImagoTestBase):
+    """Test comparing VHD images against raw equivalents.
+
+    Uses imago compare to verify VHD virtual content matches
+    the qemu-img-converted raw baseline.
+    """
+
+    def _compare_vhd_vs_raw(self, image_id):
+        """Compare VHD against its qemu-img-converted raw."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        # qemu-img converts VHD to raw at full virtual
+        # size; skip if insufficient temp space.
+        result = subprocess.run(
+            [
+                'qemu-img', 'info', '--output=json',
+                str(image.path),
+            ],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            vsize = json.loads(
+                result.stdout
+            ).get('virtual-size', 0)
+            tmpdir = tempfile.gettempdir()
+            st = os.statvfs(tmpdir)
+            avail = st.f_bavail * st.f_frsize
+            needed = vsize + 100 * 1024 * 1024
+            if avail < needed:
+                self.skipTest(
+                    f'{image_id}: needs '
+                    f'{needed // (1024**3)}GB temp, '
+                    f'only {avail // (1024**3)}GB '
+                    f'available'
+                )
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.raw') as qemu_raw:
+            q_stdout, q_stderr, q_rc = \
+                self.run_qemu_img_convert(
+                    image.path, Path(qemu_raw.name),
+                    timeout=120
+                )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed: {q_stderr}'
+            )
+
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                image.path, Path(qemu_raw.name),
+                timeout=120
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'VHD {image_id} content '
+                f'differs from raw: {cmp_out}'
+            )
+
+    def test_compare_hyperv_vhd_vs_raw(self):
+        """Compare Hyper-V dynamic VHD against raw."""
+        self._compare_vhd_vs_raw('hyperv-dynamic-vhd')
+
+    def test_compare_virtualpc_vhd_vs_raw(self):
+        """Compare Virtual PC dynamic VHD against raw."""
+        self._compare_vhd_vs_raw('virtualpc-vhd')
+
+    def test_compare_vhd_d2v_zerofilled_vs_raw(self):
+        """Compare Disk2VHD zerofilled VHD against raw."""
+        self._compare_vhd_vs_raw('vhd-d2v-zerofilled')
+
+
+class TestConvertToVhd(ImagoTestBase):
+    """Test converting images to VHD output.
+
+    Converts images to VHD with imago, then verifies the output
+    by converting back to raw and comparing against qemu-img.
+    """
+
+    def _test_to_vhd_roundtrip(self, image_id):
+        """Convert image to VHD, then back to raw, compare."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        # Need space for VHD + 2x raw at virtual size
+        result = subprocess.run(
+            [
+                'qemu-img', 'info', '--output=json',
+                str(image.path),
+            ],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            vsize = json.loads(
+                result.stdout
+            ).get('virtual-size', 0)
+            tmpdir = tempfile.gettempdir()
+            st = os.statvfs(tmpdir)
+            avail = st.f_bavail * st.f_frsize
+            needed = vsize * 2 + 100 * 1024 * 1024
+            if avail < needed:
+                self.skipTest(
+                    f'{image_id}: needs '
+                    f'{needed // (1024**3)}GB temp, '
+                    f'only {avail // (1024**3)}GB '
+                    f'available'
+                )
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.vhd') as vhd_out, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as rt_raw, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as qemu_raw:
+            # Convert to VHD with imago
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(vhd_out.name),
+                output_format='vpc',
+                timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'imago convert to vpc failed for '
+                f'{image_id}: {stderr}'
+            )
+
+            # Verify qemu-img can read the VHD
+            result = subprocess.run(
+                [
+                    'qemu-img', 'info', '--output=json',
+                    vhd_out.name,
+                ],
+                capture_output=True, text=True,
+                timeout=30
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img info failed on imago VHD: '
+                f'{result.stderr}'
+            )
+            info = json.loads(result.stdout)
+            self.assertEqual(
+                info.get('format'), 'vpc',
+                f'Output is not VHD format: '
+                f'{info.get("format")}'
+            )
+
+            # Round-trip: convert VHD back to raw
+            rt_stdout, rt_stderr, rt_rc = \
+                self.run_imago_convert(
+                    Path(vhd_out.name),
+                    Path(rt_raw.name),
+                    timeout=120
+                )
+            self.assertEqual(
+                rt_rc, 0,
+                f'Round-trip raw conversion failed '
+                f'for {image_id}: {rt_stderr}'
+            )
+
+            # Convert original to raw with qemu-img
+            q_stdout, q_stderr, q_rc = \
+                self.run_qemu_img_convert(
+                    image.path, Path(qemu_raw.name),
+                    timeout=120
+                )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img baseline failed for '
+                f'{image_id}: {q_stderr}'
+            )
+
+            # Compare round-trip against baseline
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(rt_raw.name),
+                Path(qemu_raw.name),
+                timeout=120
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'VHD round-trip differs for '
+                f'{image_id}: {cmp_out}'
+            )
+
+    def test_raw_to_vhd_roundtrip(self):
+        """Round-trip: raw -> VHD -> raw."""
+        self._test_to_vhd_roundtrip(
+            'raw-mbr-partitioned'
+        )
+
+    def test_qcow2_to_vhd_roundtrip(self):
+        """Round-trip: qcow2 -> VHD -> raw."""
+        self._test_to_vhd_roundtrip('cirros-qcow2')
+
+    def test_vhd_to_vhd_roundtrip(self):
+        """Round-trip: VHD -> VHD -> raw."""
+        self._test_to_vhd_roundtrip(
+            'vhd-d2v-zerofilled'
+        )
+
+
+class TestConvertVhdCheckOutput(ImagoTestBase):
+    """Test that imago-produced VHD output passes check.
+
+    Converts images to VHD, then runs imago check to verify
+    structural integrity of our own output.
+    """
+
+    def _test_vhd_output_check(self, image_id):
+        """Convert to VHD, then check the output."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.vhd') as vhd_out:
+            # Convert to VHD
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(vhd_out.name),
+                output_format='vpc',
+                timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'imago convert to vpc failed for '
+                f'{image_id}: {stderr}'
+            )
+
+            # Check the output VHD
+            chk_stdout, chk_stderr, chk_rc = \
+                self.run_imago_check(
+                    Path(vhd_out.name),
+                    output_format='json'
+                )
+            result = json.loads(chk_stdout)
+            self.assertEqual(
+                result.get('format', '').lower(),
+                'vhd',
+                f'Output should be detected as vhd'
+            )
+            self.assertEqual(
+                result.get('check-errors', -1), 0,
+                f'imago VHD output should have 0 '
+                f'errors: {chk_stdout}'
+            )
+
+    def test_check_raw_to_vhd_output(self):
+        """Check imago VHD output from raw input."""
+        self._test_vhd_output_check(
+            'raw-mbr-partitioned'
+        )
+
+    def test_check_qcow2_to_vhd_output(self):
+        """Check imago VHD output from QCOW2 input."""
+        self._test_vhd_output_check('cirros-qcow2')
+
+    def test_check_vhd_to_vhd_output(self):
+        """Check imago VHD output from VHD input."""
+        self._test_vhd_output_check(
+            'vhd-d2v-zerofilled'
+        )
+
+
+class TestConvertVhdToQcow2Roundtrip(ImagoTestBase):
+    """Test VHD -> QCOW2 -> raw round-trip conversion.
+
+    Converts VHD to QCOW2, then to raw, and compares
+    against qemu-img VHD -> raw baseline.
+    """
+
+    def _test_vhd_qcow2_roundtrip(self, image_id):
+        """VHD -> QCOW2 -> raw, compare against baseline."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        # Need space for QCOW2 + 2x raw at virtual size
+        result = subprocess.run(
+            [
+                'qemu-img', 'info', '--output=json',
+                str(image.path),
+            ],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            vsize = json.loads(
+                result.stdout
+            ).get('virtual-size', 0)
+            tmpdir = tempfile.gettempdir()
+            st = os.statvfs(tmpdir)
+            avail = st.f_bavail * st.f_frsize
+            needed = vsize * 2 + 100 * 1024 * 1024
+            if avail < needed:
+                self.skipTest(
+                    f'{image_id}: needs '
+                    f'{needed // (1024**3)}GB temp, '
+                    f'only {avail // (1024**3)}GB '
+                    f'available'
+                )
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.qcow2') as qcow2_out, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as rt_raw, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as qemu_raw:
+            # VHD -> QCOW2
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(qcow2_out.name),
+                output_format='qcow2',
+                timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'VHD->QCOW2 failed for '
+                f'{image_id}: {stderr}'
+            )
+
+            # QCOW2 -> raw
+            rt_stdout, rt_stderr, rt_rc = \
+                self.run_imago_convert(
+                    Path(qcow2_out.name),
+                    Path(rt_raw.name),
+                    timeout=120
+                )
+            self.assertEqual(
+                rt_rc, 0,
+                f'QCOW2->raw failed for '
+                f'{image_id}: {rt_stderr}'
+            )
+
+            # Baseline: VHD -> raw with qemu-img
+            q_stdout, q_stderr, q_rc = \
+                self.run_qemu_img_convert(
+                    image.path, Path(qemu_raw.name),
+                    timeout=120
+                )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img baseline failed for '
+                f'{image_id}: {q_stderr}'
+            )
+
+            # Compare round-trip against baseline
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(rt_raw.name),
+                Path(qemu_raw.name),
+                timeout=120
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'VHD->QCOW2->raw differs for '
+                f'{image_id}: {cmp_out}'
+            )
+
+    def test_hyperv_vhd_qcow2_roundtrip(self):
+        """VHD (Hyper-V) -> QCOW2 -> raw round-trip."""
+        self._test_vhd_qcow2_roundtrip(
+            'hyperv-dynamic-vhd'
+        )
+
+    def test_virtualpc_vhd_qcow2_roundtrip(self):
+        """VHD (Virtual PC) -> QCOW2 -> raw round-trip."""
+        self._test_vhd_qcow2_roundtrip('virtualpc-vhd')

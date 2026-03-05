@@ -160,9 +160,11 @@ provides a modular architecture with:
   validation (conectix cookie, CHS geometry, disk type), dynamic header
   parsing (cxsparse cookie, BAT offset, block size), BAT reading with
   sector-cached lookups, block-level data access via BlockLookup enum,
-  VhdState for stateful block I/O, and write helpers (build_footer,
-  build_dynamic_header, compute_vhd_geometry). Used by info, check,
-  convert, and compare operations.
+  VhdState for stateful block I/O, sub-sector-aligned read support
+  (`read_offset_sectors` for VHD data spanning device sector boundaries),
+  and write helpers (build_footer, build_dynamic_header,
+  compute_vhd_geometry). Used by info, check, convert, and compare
+  operations.
 - **crates/vhdx/** - Shared VHDX format crate: CRC-32C (Castagnoli)
   checksum implementation, dual header parsing with sequence number
   selection, region table parsing with CRC validation, GUID-based
@@ -186,11 +188,15 @@ provides a modular architecture with:
   (`-c` flag) packs clusters at sector granularity using raw deflate
   (via miniz_oxide), with fallback to uncompressed for incompressible
   data. VHD writer emits dynamic VHD with 2 MiB blocks, sector bitmaps,
-  and BAT rewriting. VHDX writer emits dynamic VHDX with 32 MiB blocks,
+  and BAT rewriting (blocks aligned to output sector size with carry-buffer
+  assembly to handle bitmap+data spanning sector boundaries). VHDX writer
+  emits dynamic VHDX with 32 MiB blocks,
   1MB-aligned structures, CRC-32C checksums, and BAT rewriting.
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
-  `bump_allocator!` macro for operations needing heap allocation)
+  `bump_allocator!` macro for operations needing heap allocation,
+  centralized byte-order helpers: `be_u16/32/64`, `le_u16/32/64`,
+  `write_be_u16/32/64`, `write_le_u16/32/64`)
 
 **Chain validation in check (`--chain`):**
 The check operation supports an optional `--chain` flag that uses the host-side

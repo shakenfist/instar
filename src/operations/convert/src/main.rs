@@ -468,22 +468,22 @@ unsafe fn write_qcow2_header(
     core::ptr::write_bytes(buf_hdr, 0, cluster_size as usize);
     let hdr = core::slice::from_raw_parts_mut(buf_hdr, cluster_size as usize);
 
-    qcow2::write_be_u32(hdr, 0, qcow2::QCOW2_MAGIC);
-    qcow2::write_be_u32(hdr, 4, qcow2::QCOW2_VERSION_3);
+    shared::write_be_u32(hdr, 0, qcow2::QCOW2_MAGIC);
+    shared::write_be_u32(hdr, 4, qcow2::QCOW2_VERSION_3);
     // backing_file_offset (8) and backing_file_size (16) = 0
-    qcow2::write_be_u32(hdr, 20, cluster_bits);
-    qcow2::write_be_u64(hdr, 24, virtual_size);
+    shared::write_be_u32(hdr, 20, cluster_bits);
+    shared::write_be_u64(hdr, 24, virtual_size);
     // crypt_method (32) = 0
-    qcow2::write_be_u32(hdr, 36, l1_size);
-    qcow2::write_be_u64(hdr, 40, l1_offset);
-    qcow2::write_be_u64(hdr, 48, reftable_offset);
-    qcow2::write_be_u32(hdr, 56, reftable_clusters as u32);
+    shared::write_be_u32(hdr, 36, l1_size);
+    shared::write_be_u64(hdr, 40, l1_offset);
+    shared::write_be_u64(hdr, 48, reftable_offset);
+    shared::write_be_u32(hdr, 56, reftable_clusters as u32);
     // nb_snapshots (60) = 0, snapshots_offset (64) = 0
     // incompatible_features (72) = 0
     // compatible_features (80) = 0
     // autoclear_features (88) = 0
-    qcow2::write_be_u32(hdr, 96, qcow2::QCOW2_DEFAULT_REFCOUNT_ORDER); // refcount_order
-    qcow2::write_be_u32(hdr, 100, qcow2::QCOW2_HEADER_LENGTH_V3); // header_length
+    shared::write_be_u32(hdr, 96, qcow2::QCOW2_DEFAULT_REFCOUNT_ORDER); // refcount_order
+    shared::write_be_u32(hdr, 100, qcow2::QCOW2_HEADER_LENGTH_V3); // header_length
 
     write_cluster_to_output(
         call_table,
@@ -655,7 +655,7 @@ unsafe fn write_qcow2_metadata(
             } else {
                 1
             };
-            qcow2::write_be_u16(rc_slice, e as usize * 2, refcount);
+            shared::write_be_u16(rc_slice, e as usize * 2, refcount);
         }
 
         let rb_offset = refblock_base_offset + rb * cs;
@@ -849,7 +849,7 @@ unsafe fn convert_to_qcow2(
             // OFLAG_COPIED (bit 63) must be set when refcount=1
             let l2_entry_idx = (vc - first_vc) as usize;
             let l2_slice = core::slice::from_raw_parts_mut(buf_l2, layout.cluster_size as usize);
-            qcow2::write_be_u64(l2_slice, l2_entry_idx * 8, data_offset | (1u64 << 63));
+            shared::write_be_u64(l2_slice, l2_entry_idx * 8, data_offset | (1u64 << 63));
 
             clusters_done += 1;
             let pct = (clusters_done * 100 / layout.total_virtual_clusters) as u32;
@@ -888,7 +888,7 @@ unsafe fn convert_to_qcow2(
             // Record L2 offset in L1 table
             // OFLAG_COPIED (bit 63) must be set when refcount=1
             let l1_slice = core::slice::from_raw_parts_mut(layout.l1_buf, layout.l1_write_bytes);
-            qcow2::write_be_u64(l1_slice, l1_idx as usize * 8, l2_offset | (1u64 << 63));
+            shared::write_be_u64(l1_slice, l1_idx as usize * 8, l2_offset | (1u64 << 63));
         }
     }
 
@@ -936,7 +936,7 @@ unsafe fn write_refcount_table(
         for e in 0..count {
             let rb_idx = first_entry + e;
             let rb_off = refblock_base_offset + rb_idx * cluster_size;
-            qcow2::write_be_u64(rt_slice, e as usize * 8, rb_off);
+            shared::write_be_u64(rt_slice, e as usize * 8, rb_off);
         }
 
         let rt_off = reftable_offset + rt_cluster * cluster_size;
@@ -1158,7 +1158,7 @@ unsafe fn convert_to_qcow2_compressed(
                     compressed_len as u64,
                     layout.cluster_bits,
                 );
-                qcow2::write_be_u64(l2_slice, l2_entry_idx * 8, l2_entry);
+                shared::write_be_u64(l2_slice, l2_entry_idx * 8, l2_entry);
 
                 // Track refcounts for touched host clusters
                 let first_host = write_pos / layout.cluster_size;
@@ -1192,7 +1192,7 @@ unsafe fn convert_to_qcow2_compressed(
                 }
 
                 // Standard L2 entry with OFLAG_COPIED
-                qcow2::write_be_u64(l2_slice, l2_entry_idx * 8, write_pos | (1u64 << 63));
+                shared::write_be_u64(l2_slice, l2_entry_idx * 8, write_pos | (1u64 << 63));
 
                 inc_refcount(
                     refcount_array,
@@ -1249,7 +1249,7 @@ unsafe fn convert_to_qcow2_compressed(
 
             // Record L2 offset in L1 table (OFLAG_COPIED)
             let l1_slice = core::slice::from_raw_parts_mut(layout.l1_buf, layout.l1_write_bytes);
-            qcow2::write_be_u64(l1_slice, l1_idx as usize * 8, write_pos | (1u64 << 63));
+            shared::write_be_u64(l1_slice, l1_idx as usize * 8, write_pos | (1u64 << 63));
 
             write_pos += layout.cluster_size;
         }
@@ -1505,7 +1505,7 @@ unsafe fn convert_to_vmdk(
             // Set GTE (sector offset in 512-byte sectors)
             let gt_idx = (grain - first_grain) as usize;
             let gt_slice = core::slice::from_raw_parts_mut(buf_gt, VMDK_GT_BYTES as usize);
-            vmdk::write_le_u32(gt_slice, gt_idx * 4, (grain_byte_offset / 512) as u32);
+            shared::write_le_u32(gt_slice, gt_idx * 4, (grain_byte_offset / 512) as u32);
 
             grains_done += 1;
             let pct = (grains_done * 100 / layout.total_grains) as u32;
@@ -1536,7 +1536,7 @@ unsafe fn convert_to_vmdk(
             }
 
             // Record GD entry (GT sector in 512-byte sectors)
-            vmdk::write_le_u32(gd_slice, gd_idx as usize * 4, (gt_byte_offset / 512) as u32);
+            shared::write_le_u32(gd_slice, gd_idx as usize * 4, (gt_byte_offset / 512) as u32);
         }
         // else: GD[gd_idx] stays 0 (unallocated)
     }
@@ -1761,8 +1761,8 @@ unsafe fn convert_to_vmdk_compressed(
 
             // Write marker header into the first 12 bytes
             let staging = core::slice::from_raw_parts_mut(buf_staging, padded as usize);
-            vmdk::write_le_u64(staging, 0, lba);
-            vmdk::write_le_u32(staging, 8, compressed_len as u32);
+            shared::write_le_u64(staging, 0, lba);
+            shared::write_le_u32(staging, 8, compressed_len as u32);
             // Zero padding after compressed data
             let data_end = vmdk::GRAIN_MARKER_SIZE + compressed_len;
             if data_end < padded as usize {
@@ -1784,7 +1784,7 @@ unsafe fn convert_to_vmdk_compressed(
             // Record GTE: sector offset of grain marker
             let gt_idx = (grain - first_grain) as usize;
             let gt_slice = core::slice::from_raw_parts_mut(buf_gt, VMDK_GT_BYTES as usize);
-            vmdk::write_le_u32(gt_slice, gt_idx * 4, (write_pos / 512) as u32);
+            shared::write_le_u32(gt_slice, gt_idx * 4, (write_pos / 512) as u32);
 
             write_pos += padded;
             gt_has_data = true;
@@ -1827,7 +1827,7 @@ unsafe fn convert_to_vmdk_compressed(
             }
 
             // GD entry points to the GT data (after marker)
-            vmdk::write_le_u32(gd_slice, gd_idx as usize * 4, (write_pos / 512) as u32);
+            shared::write_le_u32(gd_slice, gd_idx as usize * 4, (write_pos / 512) as u32);
             write_pos += gt_write_bytes;
         }
     }
@@ -2188,128 +2188,115 @@ unsafe fn convert_to_vhd(
             continue;
         }
 
-        // Allocate block: sector bitmap + data
-        let block_byte_offset = align_up(next_free_byte, 512);
-        let block_total = bitmap_bytes + block_size;
-        next_free_byte = block_byte_offset + block_total;
+        // Allocate block aligned to output sector size. The bitmap
+        // and data form a contiguous stream; they must be written
+        // together because the output sector size can exceed 512
+        // bytes, and separate writes would clobber each other when
+        // bitmap and data share the same output sector.
+        let block_byte_offset = align_up(next_free_byte, oss);
+        let block_raw_bytes = bitmap_bytes + block_size;
+        let block_aligned = (block_raw_bytes + oss as u64 - 1) & !(oss as u64 - 1);
+        next_free_byte = block_byte_offset + block_aligned;
 
         // Record BAT entry (absolute sector in 512-byte sectors)
         let bat_slice = core::slice::from_raw_parts_mut(bat_buf, bat_alloc);
-        vhd::write_be_u32(
+        shared::write_be_u32(
             bat_slice,
             block_idx as usize * 4,
             (block_byte_offset / 512) as u32,
         );
 
-        // Write sector bitmap (all 1s)
-        if !write_bytes_to_output(
-            call_table,
-            bitmap_buf,
-            block_byte_offset,
-            bitmap_bytes,
-            oss,
-            oc,
-        ) {
-            (call_table.send_error)(
-                b"convert\0".as_ptr(),
-                b"output\0".as_ptr(),
-                block_byte_offset / oss as u64,
-                2,
-            );
-            (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
-            return *bytes_read;
-        }
+        // Write bitmap + data as sector-aligned I/O. Input reads
+        // must stay sector-aligned; the bitmap shifts data by
+        // bitmap_bytes so each output sector is assembled from a
+        // carry (leftover from previous read) plus a fresh read.
+        let read_buf = BUF_L2_OUT as *mut u8;
+        let carry_buf = BUF_HEADER as *mut u8;
+        let mut carry_len: usize = 0;
+        let mut vdata_read: u64 = 0;
+        let total_sectors = block_aligned / oss as u64;
 
-        // Write block data in chunks
-        let data_byte_offset = block_byte_offset + bitmap_bytes;
-        intra_offset = 0;
-        while intra_offset < this_block {
-            let chunk_remaining = this_block - intra_offset;
-            let this_chunk = if chunk_remaining < chunk_size {
-                chunk_remaining
-            } else {
-                chunk_size
-            };
+        for s in 0..total_sectors {
+            let write_offset = block_byte_offset + s * chunk_size;
 
-            HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
+            // Zero the output buffer (padding is automatic)
+            core::ptr::write_bytes(buf_data, 0, chunk_size as usize);
+            let mut out_pos: usize = 0;
 
-            if !qcow2::read_chain_virtual_cluster(
-                call_table,
-                0,
-                input_device_count,
-                virtual_offset + intra_offset,
-                buf_data,
-                this_chunk,
-                sector_size,
-                chain_config,
-                chain_states,
-                BUF_COMPRESSED_IN as *mut u8,
-                bytes_read,
-            ) {
-                (call_table.send_error)(
-                    b"convert\0".as_ptr(),
-                    b"input\0".as_ptr(),
-                    (virtual_offset + intra_offset) / sector_size as u64,
-                    1,
-                );
-                (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
-                return *bytes_read;
+            // First sector: prepend bitmap
+            if s == 0 {
+                core::ptr::copy_nonoverlapping(bitmap_buf, buf_data, bitmap_bytes as usize);
+                out_pos = bitmap_bytes as usize;
             }
 
-            // Zero-pad partial final chunk
-            if this_chunk < chunk_size {
-                core::ptr::write_bytes(
-                    buf_data.add(this_chunk as usize),
+            // Prepend carry from previous read
+            if carry_len > 0 {
+                core::ptr::copy_nonoverlapping(carry_buf, buf_data.add(out_pos), carry_len);
+                out_pos += carry_len;
+                carry_len = 0;
+            }
+
+            // Read a sector-aligned chunk of virtual data
+            let space = chunk_size as usize - out_pos;
+            if space > 0 && vdata_read < this_block {
+                let remaining = this_block - vdata_read;
+                let to_read = if remaining < chunk_size {
+                    remaining
+                } else {
+                    chunk_size
+                };
+
+                HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
+
+                if !qcow2::read_chain_virtual_cluster(
+                    call_table,
                     0,
-                    (chunk_size - this_chunk) as usize,
-                );
+                    input_device_count,
+                    virtual_offset + vdata_read,
+                    read_buf,
+                    to_read,
+                    sector_size,
+                    chain_config,
+                    chain_states,
+                    BUF_COMPRESSED_IN as *mut u8,
+                    bytes_read,
+                ) {
+                    (call_table.send_error)(
+                        b"convert\0".as_ptr(),
+                        b"input\0".as_ptr(),
+                        (virtual_offset + vdata_read) / sector_size as u64,
+                        1,
+                    );
+                    (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+                    return *bytes_read;
+                }
+                vdata_read += to_read;
+
+                // Copy what fits into the output sector
+                let copy_len = if (to_read as usize) <= space {
+                    to_read as usize
+                } else {
+                    space
+                };
+                core::ptr::copy_nonoverlapping(read_buf, buf_data.add(out_pos), copy_len);
+
+                // Save excess as carry for next sector
+                if (to_read as usize) > space {
+                    carry_len = to_read as usize - space;
+                    core::ptr::copy_nonoverlapping(read_buf.add(space), carry_buf, carry_len);
+                }
             }
 
-            if !write_bytes_to_output(
-                call_table,
-                buf_data,
-                data_byte_offset + intra_offset,
-                this_chunk,
-                oss,
-                oc,
-            ) {
+            // Write full sector (unused bytes are already zeroed)
+            if !write_bytes_to_output(call_table, buf_data, write_offset, chunk_size, oss, oc) {
                 (call_table.send_error)(
                     b"convert\0".as_ptr(),
                     b"output\0".as_ptr(),
-                    (data_byte_offset + intra_offset) / oss as u64,
+                    write_offset / oss as u64,
                     2,
                 );
                 (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                 return *bytes_read;
-            }
-
-            intra_offset += this_chunk;
-        }
-
-        // Zero-pad remaining block data if this_block < block_size
-        if this_block < block_size {
-            let pad_start = data_byte_offset + this_block;
-            let pad_len = block_size - this_block;
-            let mut pad_written: u64 = 0;
-            core::ptr::write_bytes(buf_data, 0, chunk_size as usize);
-            while pad_written < pad_len {
-                let write_len = if pad_len - pad_written < chunk_size {
-                    pad_len - pad_written
-                } else {
-                    chunk_size
-                };
-                if !write_bytes_to_output(
-                    call_table,
-                    buf_data,
-                    pad_start + pad_written,
-                    write_len,
-                    oss,
-                    oc,
-                ) {
-                    (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
-                    return *bytes_read;
-                }
-                pad_written += write_len;
             }
         }
 
@@ -2614,14 +2601,14 @@ unsafe fn convert_to_vhdx(
     core::ptr::write_bytes(buf_data, 0, oss);
     let item_slice = core::slice::from_raw_parts_mut(buf_data, oss);
     // File Parameters: block_size (u32) + flags (u32)
-    vhdx::write_le_u32(item_slice, 0, block_size as u32);
-    vhdx::write_le_u32(item_slice, 4, 0); // flags: no parent
-                                          // Virtual Disk Size (u64) at offset 8
-    vhdx::write_le_u64(item_slice, 8, virtual_size);
+    shared::write_le_u32(item_slice, 0, block_size as u32);
+    shared::write_le_u32(item_slice, 4, 0); // flags: no parent
+                                            // Virtual Disk Size (u64) at offset 8
+    shared::write_le_u64(item_slice, 8, virtual_size);
     // Logical Sector Size (u32) at offset 16
-    vhdx::write_le_u32(item_slice, 16, logical_sector_size);
+    shared::write_le_u32(item_slice, 16, logical_sector_size);
     // Physical Sector Size (u32) at offset 20
-    vhdx::write_le_u32(item_slice, 20, physical_sector_size);
+    shared::write_le_u32(item_slice, 20, physical_sector_size);
     // Virtual Disk ID (16 bytes) at offset 24
     let size_bytes = virtual_size.to_le_bytes();
     item_slice[24..32].copy_from_slice(&size_bytes);
@@ -2725,7 +2712,7 @@ unsafe fn convert_to_vhdx(
         let bat_index = vhdx_payload_bat_index(block_idx, chunk_ratio);
         let entry = vhdx::build_bat_entry(vhdx::PAYLOAD_BLOCK_FULLY_PRESENT, block_file_offset);
         let bat_slice = core::slice::from_raw_parts_mut(bat_buf, bat_alloc);
-        vhdx::write_le_u64(bat_slice, bat_index as usize * 8, entry);
+        shared::write_le_u64(bat_slice, bat_index as usize * 8, entry);
 
         // Write block data in chunks
         intra_offset = 0;
