@@ -135,6 +135,49 @@ jobs:
             echo "BLOCK_SIZE_MISMATCH=false" >> ${GITHUB_WORKSPACE}/fs-info.txt
           fi
 
+      - name: Fetch prior CI failure logs from PR
+        id: prior_failures
+        if: env.IS_PR_RUN == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Fetching failure details from PR #${PR_NUMBER}..."
+
+          # Get the head SHA of the PR
+          HEAD_SHA=$(gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}" \
+            --jq '.head.sha')
+          echo "PR head SHA: ${HEAD_SHA}"
+
+          # Find failed check runs on that commit
+          FAILED_RUNS=$(gh api "repos/${{ github.repository }}/commits/${HEAD_SHA}/check-runs" \
+            --jq '[.check_runs[] | select(.conclusion == "failure") | {name, id}]')
+          echo "Failed check runs: ${FAILED_RUNS}"
+
+          FAILURE_FILE="${GITHUB_WORKSPACE}/prior-ci-failures.txt"
+          echo "" > "${FAILURE_FILE}"
+
+          # For each failed check run, fetch logs and extract failure lines
+          for RUN_ID in $(echo "${FAILED_RUNS}" | jq -r '.[].id'); do
+            RUN_NAME=$(echo "${FAILED_RUNS}" | jq -r ".[] | select(.id == ${RUN_ID}) | .name")
+            echo "=== Failures from check run: ${RUN_NAME} (${RUN_ID}) ===" >> "${FAILURE_FILE}"
+
+            # Fetch job logs and extract FAILED tests with tracebacks
+            gh api "repos/${{ github.repository }}/actions/jobs/${RUN_ID}/logs" 2>/dev/null | \
+              grep -E "FAILED|Traceback|MismatchError|AssertionError|Error:|Failed [0-9]+ test|Passed:|make:.*Error" \
+              >> "${FAILURE_FILE}" 2>/dev/null || true
+
+            echo "" >> "${FAILURE_FILE}"
+          done
+
+          if [ -s "${FAILURE_FILE}" ] && grep -q "FAILED\|Error" "${FAILURE_FILE}"; then
+            echo "has_prior_failures=true" >> $GITHUB_OUTPUT
+            echo "Prior CI failures found:"
+            cat "${FAILURE_FILE}"
+          else
+            echo "has_prior_failures=false" >> $GITHUB_OUTPUT
+            echo "No prior CI failures found on this PR."
+          fi
+
       - name: Configure git
         run: |
           git config --global user.name "shakenfist-bot"
@@ -188,7 +231,9 @@ jobs:
           exit ${test_exit_code}
 
       - name: Exit early if nothing to do
-        if: steps.initial_test.outputs.tests_passed == 'true'
+        if: |
+          steps.initial_test.outputs.tests_passed == 'true' &&
+          steps.prior_failures.outputs.has_prior_failures != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -202,7 +247,8 @@ jobs:
 
       - name: Prepare Claude prompt
         if: |
-          steps.initial_test.outputs.tests_passed == 'false'
+          steps.initial_test.outputs.tests_passed == 'false' ||
+          steps.prior_failures.outputs.has_prior_failures == 'true'
         run: |
           cat > ${GITHUB_WORKSPACE}/claude-prompt.txt << 'PROMPT_EOF'
           The imago integration test suite needs attention. Please analyze and
@@ -221,16 +267,46 @@ jobs:
 
           PROMPT_EOF
 
-          # Add test failure context if tests failed
+          # Add prior CI failure context if available (from the PR's failed check runs)
+          if [ "${{ steps.prior_failures.outputs.has_prior_failures }}" == "true" ]; then
+            cat >> ${GITHUB_WORKSPACE}/claude-prompt.txt << 'PROMPT_EOF'
+
+          ## Prior CI Failures (from the PR's most recent CI run)
+
+          The following test failures were observed in the PR's CI run. These
+          failures triggered this fix attempt. Note: these failures may be
+          intermittent — they may not reproduce when you re-run the tests
+          locally. If so, investigate whether the tests are flaky (e.g.
+          timeouts, resource-dependent) and fix the root cause.
+
+          PROMPT_EOF
+            cat ${GITHUB_WORKSPACE}/prior-ci-failures.txt >> ${GITHUB_WORKSPACE}/claude-prompt.txt
+          fi
+
+          # Add local test failure context if tests failed on this run
           if [ "${{ steps.initial_test.outputs.tests_passed }}" == "false" ]; then
             cat >> ${GITHUB_WORKSPACE}/claude-prompt.txt << 'PROMPT_EOF'
 
-          ## Test Failures
+          ## Local Test Failures (from re-running tests on this runner)
 
-          The following tests failed. Analyze the output differences and fix them:
+          The following tests failed when re-run. Analyze the output
+          differences and fix them:
 
           PROMPT_EOF
             cat ${GITHUB_WORKSPACE}/test-output.txt >> ${GITHUB_WORKSPACE}/claude-prompt.txt
+
+          elif [ "${{ steps.prior_failures.outputs.has_prior_failures }}" == "true" ]; then
+            cat >> ${GITHUB_WORKSPACE}/claude-prompt.txt << 'PROMPT_EOF'
+
+          ## Local Test Results
+
+          Note: All tests PASSED when re-run on this runner. The failures
+          above were from the PR's CI run but did not reproduce here. This
+          suggests the failures are intermittent. Please investigate the
+          failing tests for flakiness (e.g. timeouts, resource sensitivity,
+          race conditions) and fix the root cause so they are reliable.
+
+          PROMPT_EOF
           fi
 
           cat >> ${GITHUB_WORKSPACE}/claude-prompt.txt << 'PROMPT_EOF'
@@ -351,7 +427,8 @@ jobs:
       - name: Run Claude Code to fix issues
         id: claude_fix
         if: |
-          steps.initial_test.outputs.tests_passed == 'false'
+          steps.initial_test.outputs.tests_passed == 'false' ||
+          steps.prior_failures.outputs.has_prior_failures == 'true'
         continue-on-error: true
         env:
           IMAGO_TESTDATA_PATH: ${{ github.workspace }}/imago-testdata
@@ -560,7 +637,8 @@ jobs:
       - name: Report failure (PR mode)
         if: |
           env.IS_PR_RUN == 'true' &&
-          steps.initial_test.outputs.tests_passed == 'false' &&
+          (steps.initial_test.outputs.tests_passed == 'false' ||
+           steps.prior_failures.outputs.has_prior_failures == 'true') &&
           (steps.claude_fix.outputs.claude_available != 'true' ||
            steps.verify.outputs.fix_succeeded == 'false')
         env:
@@ -582,7 +660,8 @@ jobs:
       - name: Create issue for unfixable problems (scheduled/manual mode)
         if: |
           env.IS_PR_RUN != 'true' &&
-          steps.initial_test.outputs.tests_passed == 'false' &&
+          (steps.initial_test.outputs.tests_passed == 'false' ||
+           steps.prior_failures.outputs.has_prior_failures == 'true') &&
           (steps.claude_fix.outputs.claude_available != 'true' ||
            steps.verify.outputs.fix_succeeded == 'false')
         uses: actions/github-script@v7
@@ -639,4 +718,5 @@ jobs:
             ${{ github.workspace }}/new-images.txt
             ${{ github.workspace }}/claude-logs/
             ${{ github.workspace }}/fs-info.txt
+            ${{ github.workspace }}/prior-ci-failures.txt
           retention-days: 14
