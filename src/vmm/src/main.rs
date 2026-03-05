@@ -1598,6 +1598,8 @@ fn discover_backing_chain(
         };
 
         // For the top image only, check for external data file.
+        // External data files on backing images are not currently supported;
+        // only the top image's data file is discovered and passed to the guest.
         // The data file path is untrusted (parsed from the QCOW2 header
         // inside the sandbox), so we validate it against the allowlist.
         if chain.images.is_empty() {
