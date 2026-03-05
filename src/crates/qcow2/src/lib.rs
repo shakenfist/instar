@@ -55,6 +55,7 @@ pub const COMPRESSION_TYPE_OFFSET: usize = 104;
 
 // Header extension type IDs
 pub const EXT_BACKING_FORMAT: u32 = 0xE2792ACA;
+pub const EXT_EXTERNAL_DATA_FILE: u32 = 0x44415441; // "DATA"
 pub const EXT_END: u32 = 0x00000000;
 /// Start of header extensions in v2 (fixed 72-byte header)
 pub const V2_HEADER_EXTENSION_OFFSET: usize = 72;
@@ -76,7 +77,9 @@ pub const COMPAT_LAZY_REFCOUNTS: u64 = 1 << 0;
 ///
 /// - Bit 0 (dirty): handled (informational, data still readable)
 /// - Bit 1 (corrupt): handled (informational, data still readable)
-/// - Bit 2 (external_data): NOT supported (data in separate file)
+/// - Bit 2 (external_data): supported (data in separate device via
+///   ChainDeviceInfo.data_device_idx; VMM validates and opens the
+///   data file as a separate virtio-block device)
 /// - Bit 3 (compression): conditionally supported (see below)
 /// - Bit 4 (extended_l2): supported (16-byte L2 entries; subcluster
 ///   bitmap is ignored, treating the cluster as fully allocated)
@@ -87,11 +90,14 @@ pub const COMPAT_LAZY_REFCOUNTS: u64 = 1 << 0;
 /// images don't set it.
 #[cfg(not(feature = "decompress-zstd"))]
 pub const SUPPORTED_INCOMPAT_FEATURES: u64 =
-    INCOMPAT_DIRTY | INCOMPAT_CORRUPT | INCOMPAT_EXTENDED_L2;
+    INCOMPAT_DIRTY | INCOMPAT_CORRUPT | INCOMPAT_EXTERNAL_DATA | INCOMPAT_EXTENDED_L2;
 
 #[cfg(feature = "decompress-zstd")]
-pub const SUPPORTED_INCOMPAT_FEATURES: u64 =
-    INCOMPAT_DIRTY | INCOMPAT_CORRUPT | INCOMPAT_COMPRESSION | INCOMPAT_EXTENDED_L2;
+pub const SUPPORTED_INCOMPAT_FEATURES: u64 = INCOMPAT_DIRTY
+    | INCOMPAT_CORRUPT
+    | INCOMPAT_EXTERNAL_DATA
+    | INCOMPAT_COMPRESSION
+    | INCOMPAT_EXTENDED_L2;
 
 // L1/L2 entry masks and flags
 /// Bit 62 set indicates a compressed cluster in an L2 entry
@@ -448,20 +454,38 @@ impl QcowHeader {
     }
 }
 
+/// Results from parsing QCOW2 v3 header extensions.
+#[derive(Debug, PartialEq)]
+pub struct HeaderExtensionResults {
+    /// Backing format from EXT_BACKING_FORMAT extension.
+    pub backing_format: BackingFormat,
+    /// Byte offset of the data file name within the header buffer
+    /// (0 if no DATA extension found).
+    pub data_file_name_offset: usize,
+    /// Length of the data file name in bytes (0 if absent).
+    pub data_file_name_len: usize,
+}
+
 /// Parse QCOW2 header extensions from a header buffer.
 ///
-/// Looks for the backing format extension (`EXT_BACKING_FORMAT`) and
-/// returns it. Only applicable to v3+ headers (v2 has no extensions
-/// at the standard offsets).
+/// Walks all v3+ header extensions and returns the backing format
+/// and external data file name location (if present). Only applicable
+/// to v3+ headers (v2 has no extensions at the standard offsets).
 ///
 /// `header` is the same buffer passed to `QcowHeader::parse()`.
 /// `parsed` is the parsed header (needed for version check).
-pub fn parse_header_extensions(header: &[u8], parsed: &QcowHeader) -> BackingFormat {
+pub fn parse_header_extensions(header: &[u8], parsed: &QcowHeader) -> HeaderExtensionResults {
+    let mut result = HeaderExtensionResults {
+        backing_format: BackingFormat::None,
+        data_file_name_offset: 0,
+        data_file_name_len: 0,
+    };
+
     if parsed.version < 3 {
-        return BackingFormat::None;
+        return result;
     }
     if header.len() < HEADER_LENGTH_OFFSET + 4 {
-        return BackingFormat::None;
+        return result;
     }
 
     let header_length = be_u32(header, HEADER_LENGTH_OFFSET) as usize;
@@ -481,7 +505,10 @@ pub fn parse_header_extensions(header: &[u8], parsed: &QcowHeader) -> BackingFor
 
         if ext_type == EXT_BACKING_FORMAT && ext_len > 0 {
             let format_bytes = &header[ext_offset + 8..ext_offset + 8 + ext_len];
-            return BackingFormat::from_bytes(format_bytes);
+            result.backing_format = BackingFormat::from_bytes(format_bytes);
+        } else if ext_type == EXT_EXTERNAL_DATA_FILE && ext_len > 0 {
+            result.data_file_name_offset = ext_offset + 8;
+            result.data_file_name_len = ext_len;
         }
 
         // Move to next extension (data padded to 8-byte boundary)
@@ -489,7 +516,7 @@ pub fn parse_header_extensions(header: &[u8], parsed: &QcowHeader) -> BackingFor
         ext_offset += 8 + padded_len;
     }
 
-    BackingFormat::None
+    result
 }
 
 /// Read the backing file path from a QCOW2 image.
@@ -1329,7 +1356,10 @@ mod tests {
         let mut buf = make_qcow2_header();
         buf[VERSION_OFFSET..VERSION_OFFSET + 4].copy_from_slice(&2u32.to_be_bytes());
         let hdr = QcowHeader::parse(&buf).unwrap();
-        assert_eq!(parse_header_extensions(&buf, &hdr), BackingFormat::None);
+        assert_eq!(
+            parse_header_extensions(&buf, &hdr).backing_format,
+            BackingFormat::None,
+        );
     }
 
     #[test]
@@ -1348,7 +1378,9 @@ mod tests {
         let next = ext_off + 8 + 8;
         buf[next..next + 4].copy_from_slice(&EXT_END.to_be_bytes());
 
-        assert_eq!(parse_header_extensions(&buf, &hdr), BackingFormat::Qcow2);
+        let result = parse_header_extensions(&buf, &hdr);
+        assert_eq!(result.backing_format, BackingFormat::Qcow2);
+        assert_eq!(result.data_file_name_len, 0);
     }
 
     #[test]
@@ -1359,7 +1391,10 @@ mod tests {
         let ext_off = 112;
         buf[ext_off..ext_off + 4].copy_from_slice(&EXT_END.to_be_bytes());
 
-        assert_eq!(parse_header_extensions(&buf, &hdr), BackingFormat::None);
+        assert_eq!(
+            parse_header_extensions(&buf, &hdr).backing_format,
+            BackingFormat::None,
+        );
     }
 }
 
@@ -1622,9 +1657,18 @@ pub unsafe fn read_chain_virtual_cluster(
                         } else {
                             qcow2_cluster_size
                         };
+                        // If this device has an external data file, read
+                        // standard clusters from the data device instead.
+                        // Compressed clusters stay on the metadata device.
+                        let read_dev = chain_config.devices[dev_idx].data_device_idx;
+                        let read_dev = if read_dev != 0 {
+                            read_dev
+                        } else {
+                            dev_idx as u32
+                        };
                         return read_cluster_sectors(
                             call_table,
-                            dev_idx as u32,
+                            read_dev,
                             read_offset,
                             buf,
                             read_size,

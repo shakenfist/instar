@@ -399,6 +399,56 @@ JSON area at offset 4096).
 Updated format-coverage.md, README.md, ARCHITECTURE.md, AGENTS.md
 with LUKS support documentation. Marked Phase 12 complete.
 
+## Phase 13: QCOW2 External Data File Support ✓
+
+QCOW2 v3 allows separating metadata (L1/L2 tables, refcounts) from
+cluster data via the "external data file" feature (incompatible bit 2).
+Full read support: info reports the data file path, check/convert/compare
+process images when the data file is provided via `--chain`.
+
+### 13a: Parse DATA header extension and expose path ✓
+
+Added `EXT_EXTERNAL_DATA_FILE` constant (0x44415441) and refactored
+`parse_header_extensions()` to return `HeaderExtensionResults` with both
+backing format and data file name. Info operation extracts data file name
+and passes it to VMM. Human output: `data file: <path>`. JSON output:
+`data-file` in `format-specific.data`.
+
+### 13b: VMM-side data file discovery and device setup ✓
+
+Chain discovery validates external data file path against allowlist
+(CVE-2024-32498). Data file opens as device 1, backing chain shifts to
+devices 2+. `ChainDeviceInfo.data_device_idx` field (replaces `_reserved`)
+tells the guest which device holds cluster data. `ChainConfig.VERSION`
+bumped to 2. Helper functions `write_chain_device_entries()` and
+`open_chain_devices()` used across convert, check, and compare operations.
+
+### 13c: Guest-side cluster read dispatch ✓
+
+`INCOMPAT_EXTERNAL_DATA` added to `SUPPORTED_INCOMPAT_FEATURES` in both
+`#[cfg]` variants. `read_chain_virtual_cluster()` dispatches standard
+cluster reads to `data_device_idx` when non-zero. Compressed clusters and
+L1/L2 table reads stay on the metadata device. Check operation's supported
+features mask updated.
+
+### 13d: Test images and integration tests ✓
+
+Fixed check operation to skip bounds/overlap/refcount validation for
+standard cluster data offsets when external data bit is set. Created
+`scripts/create-external-data-testdata.sh` for test image generation.
+Added `qcow2-external-data-raw` to manifest. Implemented security tests
+(`test_imago_reports_external_data_file_without_reading_content`,
+`test_imago_reports_external_data_file_in_json`). Added check integration
+tests (`TestCheckExternalDataFile` class).
+
+### 13e: Oslo crossval and documentation ✓
+
+Removed `qcow2-external-data-file` from `KNOWN_SAFETY_DIVERGENCES` — imago
+now reports the data-file path in JSON, resolving the oslo crossval
+divergence. Updated format-coverage.md (feature bit table, capabilities
+list, divergences table), ARCHITECTURE.md (QCOW2 features), README.md,
+AGENTS.md.
+
 ---
 
 ## Key Architectural Decisions
@@ -534,15 +584,30 @@ Gerrit review 978095 and related changes show oslo.utils is adding:
     easier to selectively loosen rejections.
 
 **Implications for imago:**
-- imago already detects LUKS format but doesn't inspect inner
-  content. If OpenStack starts cascading safety checks through
-  LUKS containers, imago should consider reporting the inner
-  format too (though our KVM sandbox makes this less critical).
+- imago now reports LUKS inner format when given a passphrase,
+  matching oslo.utils ContainerFileInspector functionality.
 - The GPT/MBR safety check reorganization may change oslo.utils
   output format; monitor for test compatibility impact.
-- The `ContainerFileInspector` pattern is worth noting if we add
-  LUKS support to `imago convert` — we'd need similar chained
-  format detection in the guest.
+
+## Deferred Work (from Phase 12 review)
+
+### Future LUKS Enhancements
+
+19. **LUKS v2 Argon2id decryption** — LUKS v2 uses Argon2id for
+    key derivation, which requires significant memory (typically
+    1 GiB). The current 32 MiB guest allocation is insufficient.
+    The `--max-guest-memory` CLI flag provides infrastructure;
+    implementation requires dynamic page table expansion in the
+    VMM and guest, plus integrating an Argon2 crate (no_std).
+
+20. **LUKS v2 test container** — `luks-v2-raw-gpt` is defined
+    in the manifest but not yet created (cryptsetup v2 format
+    requires Argon2 for key derivation, which is slow in CI).
+    Create when v2 decryption is implemented.
+
+21. **LUKS convert support** — Currently LUKS is info-only.
+    Future: `imago convert --luks-passphrase` could decrypt
+    LUKS and convert the inner image in a single pass.
 
 ## Verification
 

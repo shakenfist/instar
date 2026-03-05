@@ -107,7 +107,7 @@ The `imago convert` operation supports writing output in the following formats:
 |-----|------|------------|-------|
 | 0 | Dirty bit | N/A | QCOW2_INCOMPAT_DIRTY |
 | 1 | Corrupt bit | N/A | QCOW2_INCOMPAT_CORRUPT |
-| 2 | External data file | Rejects | QCOW2_INCOMPAT_EXTERNAL_DATA |
+| 2 | External data file | Rejects | Supported (data file path in JSON, chain read) |
 | 3 | Compression type | N/A | QCOW2_INCOMPAT_COMPRESSION |
 | 4 | Extended L2 | N/A | QCOW2_INCOMPAT_EXTENDED_L2 |
 | 5+ | Unknown | Rejects | Rejected by check/compare/convert |
@@ -290,8 +290,8 @@ The `imago convert` operation supports writing output in the following formats:
 
 6. **QCOW2 Incompatible Feature Bit Validation** - check, compare, and convert
    operations reject images with unsupported incompatible feature bits (per QCOW2
-   spec). Supported bits: dirty (0), corrupt (1), compression type (3), extended
-   L2 (4). Unsupported: external data file (2), unknown bits (5+).
+   spec). Supported bits: dirty (0), corrupt (1), external data file (2),
+   compression type (3), extended L2 (4). Unsupported: unknown bits (5+).
 
 7. **ZSTD Compressed Cluster Decompression** - QCOW2 v3 images with
    `compression_type=1` (ZSTD) are now supported in compare and convert
@@ -353,6 +353,17 @@ The `imago convert` operation supports writing output in the following formats:
     inner virtual size). Synthetic test headers for header parsing; real
     LUKS containers (created via cryptsetup) for decryption testing.
 
+17. **QCOW2 External Data File Support** - Full read support for QCOW2 v3
+    images with external data files (incompatible feature bit 2). The DATA
+    header extension (type 0x44415441) is parsed to extract the data file
+    path, which is reported in both human and JSON output. Chain discovery
+    validates the data file path against the allowlist (CVE-2024-32498
+    prevention) and opens it as a separate virtio-block device. Standard
+    cluster reads dispatch to the data device; compressed clusters and
+    metadata (L1/L2/refcounts) remain in the metadata device. The check
+    operation skips bounds/overlap/refcount validation for data clusters
+    when the external data bit is set.
+
 ### Detections to Add
 
 All oslo.utils formats are now detected. No remaining format detections needed.
@@ -394,7 +405,7 @@ cd tests && ../.venv/bin/stestr run test_oslo_crossval
 | Format | luks-v1, luks-v2 | luks | luks | Match (imago now reports LUKS format with full metadata) |
 | Safety | QED images | pass | reject | oslo bans QED; imago uses KVM sandbox |
 | Safety | LUKS v2 | pass | reject | oslo rejects LUKS v2+; imago detects both |
-| Safety | qcow2-external-data-file | no data-file field | flags data_file | imago detects feature bit but does not expose path in JSON |
+| Safety | qcow2-external-data-file | reports data-file | flags data_file | Match: both detect external data file path |
 | Vsize | VPC/VHD images | - | - | CHS geometry rounding (up to 8 MB delta allowed) |
 
 ### CI Integration

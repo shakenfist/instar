@@ -21,6 +21,14 @@ class TestImage:
     cve_references: list = field(default_factory=list)
     sha256: Optional[str] = None
     unsafe_quirks_required: bool = False
+    data_file: Optional[str] = None
+
+    @property
+    def data_file_path(self) -> Optional[Path]:
+        """Return the absolute path to the companion data file, if any."""
+        if self.data_file is None:
+            return None
+        return self.path.parent / self.data_file
 
     @property
     def is_safe(self) -> bool:
@@ -59,4 +67,5 @@ class TestImage:
             cve_references=data.get('cve_references', []),
             sha256=data.get('sha256'),
             unsafe_quirks_required=data.get('unsafe_quirks_required', False),
+            data_file=data.get('data_file'),
         )

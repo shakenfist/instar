@@ -416,15 +416,22 @@ class TestIncompatibleFeatureBits(ImagoTestBase):
             result = json.loads(stdout)
             self.assertGreater(result.get('corruptions', 0), 0)
 
-    def test_check_rejects_external_data_bit(self):
-        """Check should reject images with external data (bit 2)."""
+    def test_check_accepts_external_data_bit(self):
+        """Check should accept images with external data (bit 2).
+
+        The external data incompatible feature bit is now supported.
+        Check accepts the bit because structural validation (L1/L2
+        tables, refcounts) works on the metadata file regardless of
+        whether cluster data is in an external file.
+        """
         with self._create_patched_qcow2(1 << 2) as img:
             stdout, stderr, rc = self.run_imago_check(
                 Path(img.name), output_format='json'
             )
-            self.assertNotEqual(
-                rc, 0,
-                'check should reject external data bit'
+            result = json.loads(stdout)
+            self.assertEqual(
+                result.get('corruptions', 0), 0,
+                'external data bit should not cause corruption'
             )
 
     def test_check_accepts_extended_l2_bit(self):
@@ -1401,4 +1408,79 @@ class TestCheckLargeCluster(ImagoTestBase):
         self.assertEqual(
             result.get('leaks', 0), 0,
             f'Unexpected leaks: {stderr}'
+        )
+
+
+class TestCheckExternalDataFile(ImagoTestBase):
+    """Tests for check operation with QCOW2 external data files."""
+
+    def test_check_external_data_no_errors_with_chain(self):
+        """Check --chain on a well-formed external data file image.
+
+        When the data file is available via --chain, check should
+        report zero corruptions.
+        """
+        image = self.get_image('qcow2-external-data-raw')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+
+        stdout, stderr, rc = self.run_imago_check(
+            image.path, output_format='json', chain=True
+        )
+        self.assertEqual(
+            0, rc,
+            f'check --chain should succeed: {stderr}'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('corruptions', 0), 0,
+            f'No corruptions expected with external data file: {stderr}'
+        )
+
+    def test_check_external_data_no_errors_without_chain(self):
+        """Check without --chain on a QCOW2 with external data.
+
+        When the external data bit is set, check should skip validation
+        of standard cluster offsets (they point into the data file).
+        Metadata validation (L1/L2 structure, refcounts) still works.
+        """
+        image = self.get_image('qcow2-external-data-raw')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+
+        stdout, stderr, rc = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        self.assertEqual(
+            0, rc,
+            f'check should succeed for external data: {stderr}'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('corruptions', 0), 0,
+            f'No corruptions expected (data offsets skipped): {stderr}'
+        )
+
+    def test_check_security_image_external_data(self):
+        """Check should succeed on the CVE-2024-32498 security test image.
+
+        The malicious test image has the external data bit set. Check
+        should accept it without reporting false corruptions from data
+        cluster offsets.
+        """
+        image = self.get_image('qcow2-external-data-file')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+
+        stdout, stderr, rc = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        self.assertEqual(
+            0, rc,
+            f'check should succeed for external data: {stderr}'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('corruptions', 0), 0,
+            f'No corruptions expected: {stderr}'
         )

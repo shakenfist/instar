@@ -50,7 +50,8 @@ The core principle: **never parse untrusted data with host privileges**.
 
 ### Supported Formats
 
-Target formats: qcow2, raw, vmdk, vpc (VHD), vhdx (VHDX), luks (info)
+Target formats: qcow2 (including external data files), raw, vmdk, vpc (VHD),
+vhdx (VHDX), luks (info with optional decryption)
 
 ## Working on This Project
 

@@ -124,17 +124,35 @@ pub struct ChainImage {
 pub struct BackingChain {
     /// Images in the chain, from top (index 0) to base (last index)
     pub images: Vec<ChainImage>,
+    /// Validated path to external data file for the top image (QCOW2 v3).
+    /// When present, the data file is opened as a separate virtio-block
+    /// device between the top image (device 0) and the backing chain.
+    pub external_data_file: Option<PathBuf>,
 }
 
 impl BackingChain {
     /// Create a new empty backing chain
     pub fn new() -> Self {
-        Self { images: Vec::new() }
+        Self {
+            images: Vec::new(),
+            external_data_file: None,
+        }
     }
 
     /// Get the number of images in the chain
     pub fn len(&self) -> usize {
         self.images.len()
+    }
+
+    /// Total number of virtio-block devices needed for this chain.
+    /// Includes the external data file device if present.
+    pub fn total_devices(&self) -> usize {
+        self.images.len()
+            + if self.external_data_file.is_some() {
+                1
+            } else {
+                0
+            }
     }
 
     /// Check if the chain is empty
@@ -261,6 +279,8 @@ pub struct InfoOperationResult {
     pub flags: u32,
     /// Backing file path (if any)
     pub backing_file: Option<String>,
+    /// External data file path (if any, QCOW2 v3)
+    pub external_data_file: Option<String>,
 }
 
 /// Resolve a backing file path relative to the parent image.
