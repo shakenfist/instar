@@ -3081,6 +3081,13 @@ class TestConvertToVhd(ImagoTestBase):
     by converting back to raw and comparing against qemu-img.
     """
 
+    def _timeout_for_vsize(self, vsize):
+        """Compute timeout based on virtual size."""
+        if not vsize:
+            return 120
+        gib = vsize / (1024 ** 3)
+        return max(120, int(120 + gib * 15))
+
     def _test_to_vhd_roundtrip(self, image_id):
         """Convert image to VHD, then back to raw, compare."""
         image = self.get_image(image_id)
@@ -3090,7 +3097,10 @@ class TestConvertToVhd(ImagoTestBase):
             )
         self.skip_if_hash_mismatch(image)
 
-        # Need space for VHD + 2x raw at virtual size
+        # Need space for VHD + 2x raw at virtual size.
+        # Use 3x vsize to account for VHD intermediate
+        # plus two full raw files written concurrently.
+        vsize = 0
         result = subprocess.run(
             [
                 'qemu-img', 'info', '--output=json',
@@ -3105,7 +3115,7 @@ class TestConvertToVhd(ImagoTestBase):
             tmpdir = tempfile.gettempdir()
             st = os.statvfs(tmpdir)
             avail = st.f_bavail * st.f_frsize
-            needed = vsize * 2 + 100 * 1024 * 1024
+            needed = vsize * 3 + 100 * 1024 * 1024
             if avail < needed:
                 self.skipTest(
                     f'{image_id}: needs '
@@ -3113,6 +3123,8 @@ class TestConvertToVhd(ImagoTestBase):
                     f'only {avail // (1024**3)}GB '
                     f'available'
                 )
+
+        timeout = self._timeout_for_vsize(vsize)
 
         with tempfile.NamedTemporaryFile(
                 suffix='.vhd') as vhd_out, \
@@ -3124,7 +3136,7 @@ class TestConvertToVhd(ImagoTestBase):
             stdout, stderr, rc = self.run_imago_convert(
                 image.path, Path(vhd_out.name),
                 output_format='vpc',
-                timeout=120
+                timeout=timeout
             )
             self.assertEqual(
                 rc, 0,
@@ -3158,7 +3170,7 @@ class TestConvertToVhd(ImagoTestBase):
                 self.run_imago_convert(
                     Path(vhd_out.name),
                     Path(rt_raw.name),
-                    timeout=120
+                    timeout=timeout
                 )
             self.assertEqual(
                 rt_rc, 0,
@@ -3170,7 +3182,7 @@ class TestConvertToVhd(ImagoTestBase):
             q_stdout, q_stderr, q_rc = \
                 self.run_qemu_img_convert(
                     image.path, Path(qemu_raw.name),
-                    timeout=120
+                    timeout=timeout
                 )
             self.assertEqual(
                 q_rc, 0,
@@ -3182,7 +3194,7 @@ class TestConvertToVhd(ImagoTestBase):
             cmp_out, _, cmp_rc = self.run_imago_compare(
                 Path(rt_raw.name),
                 Path(qemu_raw.name),
-                timeout=120
+                timeout=timeout
             )
             self.assertEqual(
                 cmp_rc, 0,
@@ -3295,7 +3307,9 @@ class TestConvertVhdToQcow2Roundtrip(ImagoTestBase):
             )
         self.skip_if_hash_mismatch(image)
 
-        # Need space for QCOW2 + 2x raw at virtual size
+        # Need space for QCOW2 + 2x raw at virtual size.
+        # Use 3x vsize to account for QCOW2 intermediate
+        # plus two full raw files written concurrently.
         vsize = 0
         result = subprocess.run(
             [
@@ -3311,7 +3325,7 @@ class TestConvertVhdToQcow2Roundtrip(ImagoTestBase):
             tmpdir = tempfile.gettempdir()
             st = os.statvfs(tmpdir)
             avail = st.f_bavail * st.f_frsize
-            needed = vsize * 2 + 100 * 1024 * 1024
+            needed = vsize * 3 + 100 * 1024 * 1024
             if avail < needed:
                 self.skipTest(
                     f'{image_id}: needs '
