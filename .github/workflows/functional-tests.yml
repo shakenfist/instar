@@ -249,7 +249,8 @@ jobs:
             cd "${CACHED}"
             git remote set-url origin \
               "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git"
-            git pull --depth 1
+            git fetch --depth 1 origin main
+            git reset --hard origin/main
             echo "TESTDATA_PATH=${CACHED}" >> $GITHUB_ENV
           else
             echo "No cache found, cloning fresh..."
@@ -451,7 +452,8 @@ jobs:
             cd "${CACHED}"
             git remote set-url origin \
               "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git"
-            git pull --depth 1
+            git fetch --depth 1 origin main
+            git reset --hard origin/main
             echo "TESTDATA_PATH=${CACHED}" >> $GITHUB_ENV
           else
             echo "No cache found, cloning fresh..."
@@ -551,7 +553,8 @@ jobs:
             cd "${CACHED}"
             git remote set-url origin \
               "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git"
-            git pull --depth 1
+            git fetch --depth 1 origin main
+            git reset --hard origin/main
             echo "TESTDATA_PATH=${CACHED}" >> $GITHUB_ENV
           else
             echo "No cache found, cloning fresh..."
