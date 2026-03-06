@@ -82,6 +82,9 @@ KNOWN_FORMAT_DIVERGENCES = {
     # as 'luks'.
     'luks-v1': ('unknown', 'luks'),
     'luks-v2': ('unknown', 'luks'),
+    'luks-v1-raw-gpt': ('unknown', 'luks'),
+    'luks-v1-qcow2': ('unknown', 'luks'),
+    'luks-v2-raw-gpt': ('unknown', 'luks'),
 }
 
 # Known safety divergences: images where imago does not
@@ -107,6 +110,8 @@ def _generate_scenarios(skip_formats=None):
     skip_formats = skip_formats or set()
     scenarios = []
     for img in load_manifest_images():
+        if not img.get('run_in_ci', True):
+            continue
         if img['id'] in OSLO_SKIP_IMAGES:
             continue
         if img['format'] in skip_formats:
