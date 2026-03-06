@@ -60,7 +60,8 @@ help:
 	@echo "  test                 Run all tests (Rust unit + Python integration)"
 	@echo "  test-rust            Run Rust unit tests only"
 	@echo "  test-integration     Run Python integration tests only (on host)"
-	@echo "  test-container       Run tests inside container (consistent env)"
+	@echo "  test-container       Run tests inside container (excl. test_large_)"
+	@echo "  test-container-large Run large-disk tests in container (concurrency=1)"
 	@echo "  test-ci              Run CI-suitable tests (safe + caution)"
 	@echo "  test-malicious       Run all tests including malicious images"
 	@echo "  test-report          Show test differences without failing"
@@ -415,8 +416,42 @@ test-container: imago-devcontainer imago
 			echo "Setting up test environment..."; \
 			python3 -m venv /build/test-venv && \
 			/build/test-venv/bin/pip install -q -r tests/requirements.txt && \
-			echo "Running tests..."; \
-			cd tests && /build/test-venv/bin/stestr run --exclude-regex test_info_malicious \
+			echo "Running tests (excluding test_large_ and test_info_malicious)..."; \
+			cd tests && \
+			/build/test-venv/bin/stestr run \
+				--exclude-regex "test_info_malicious|test_large_" \
+		'
+
+# Run only large-disk tests inside container at concurrency=1.
+# These tests involve images with 127 GiB virtual sizes that expand
+# to hundreds of GiB during conversion. Run on a worker with
+# sufficient disk space (600+ GB).
+test-container-large: imago-devcontainer imago
+	@echo "Running large-disk tests inside container..."
+	@if [ ! -d "$(TESTDATA_PATH)" ]; then \
+		echo "Error: Test data not found at $(TESTDATA_PATH)"; \
+		echo "Set IMAGO_TESTDATA_PATH or ensure imago-testdata is a sibling directory."; \
+		exit 1; \
+	fi
+	docker run --rm \
+		--device=/dev/kvm \
+		-u "$(shell id -u):$(shell id -g)" \
+		--group-add "$$(stat -c '%g' /dev/kvm)" \
+		-e HOME=/build \
+		-e IMAGO_TESTDATA_PATH=/testdata \
+		-v "$(CURDIR):/workspace" \
+		-v "$(TESTDATA_PATH):/testdata:ro" \
+		-w "/workspace" \
+		"$(IMAGO_IMAGE)" \
+		bash -c '\
+			echo "Setting up test environment..."; \
+			python3 -m venv /build/test-venv && \
+			/build/test-venv/bin/pip install -q -r tests/requirements.txt && \
+			echo "Running large-disk tests (concurrency=1)..."; \
+			cd tests && \
+			/build/test-venv/bin/stestr run \
+				--include-regex "test_large_" \
+				--concurrency 1 \
 		'
 
 # Run CI-suitable tests (safe + caution)

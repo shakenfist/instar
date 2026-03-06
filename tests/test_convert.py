@@ -2975,11 +2975,11 @@ class TestConvertVhdToRaw(ImagoTestBase):
                 f'from qemu-img: {cmp_out}'
             )
 
-    def test_convert_hyperv_dynamic_vhd(self):
+    def test_large_convert_hyperv_dynamic_vhd(self):
         """Convert Hyper-V 2012 R2 dynamic VHD to raw."""
         self._test_vhd_convert('hyperv-dynamic-vhd')
 
-    def test_convert_virtualpc_vhd(self):
+    def test_large_convert_virtualpc_vhd(self):
         """Convert Virtual PC dynamic VHD to raw."""
         self._test_vhd_convert('virtualpc-vhd')
 
@@ -3061,11 +3061,11 @@ class TestConvertVhdCompare(ImagoTestBase):
                 f'differs from raw: {cmp_out}'
             )
 
-    def test_compare_hyperv_vhd_vs_raw(self):
+    def test_large_compare_hyperv_vhd_vs_raw(self):
         """Compare Hyper-V dynamic VHD against raw."""
         self._compare_vhd_vs_raw('hyperv-dynamic-vhd')
 
-    def test_compare_virtualpc_vhd_vs_raw(self):
+    def test_large_compare_virtualpc_vhd_vs_raw(self):
         """Compare Virtual PC dynamic VHD against raw."""
         self._compare_vhd_vs_raw('virtualpc-vhd')
 
@@ -3391,12 +3391,12 @@ class TestConvertVhdToQcow2Roundtrip(ImagoTestBase):
                 f'{image_id}: {cmp_out}'
             )
 
-    def test_hyperv_vhd_qcow2_roundtrip(self):
+    def test_large_hyperv_vhd_qcow2_roundtrip(self):
         """VHD (Hyper-V) -> QCOW2 -> raw round-trip."""
         self._test_vhd_qcow2_roundtrip(
             'hyperv-dynamic-vhd'
         )
 
-    def test_virtualpc_vhd_qcow2_roundtrip(self):
+    def test_large_virtualpc_vhd_qcow2_roundtrip(self):
         """VHD (Virtual PC) -> QCOW2 -> raw round-trip."""
         self._test_vhd_qcow2_roundtrip('virtualpc-vhd')
