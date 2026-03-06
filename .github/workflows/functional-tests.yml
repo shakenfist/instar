@@ -241,19 +241,31 @@ jobs:
           path: imago
           fetch-depth: 0
 
-      - name: Checkout imago-testdata from GitLab
+      - name: Prepare imago-testdata
         run: |
-          git clone --depth 1 \
-            https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git \
-            imago-testdata
+          CACHED=/srv/ci/cached/imago-testdata
+          if [ -d "${CACHED}/.git" ]; then
+            echo "Using cached testdata, updating in place..."
+            cd "${CACHED}"
+            git remote set-url origin \
+              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git"
+            git pull --depth 1
+            echo "TESTDATA_PATH=${CACHED}" >> $GITHUB_ENV
+          else
+            echo "No cache found, cloning fresh..."
+            git clone --depth 1 \
+              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git" \
+              ${GITHUB_WORKSPACE}/imago-testdata
+            echo "TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata" >> $GITHUB_ENV
+          fi
 
       - name: Resparsify test images
         run: |
-          # Git streaming fills sparse holes with zeros, affecting qemu-img
-          # disk_size output. Restore sparseness using cp --sparse=always,
-          # which is more robust than fallocate -d for files with partial
-          # zero blocks or complex sparse patterns.
-          cd ${GITHUB_WORKSPACE}/imago-testdata
+          # Git operations (clone or pull) fill sparse holes with zeros,
+          # affecting qemu-img disk_size output. Restore sparseness with
+          # cp --sparse=always. This is fast and idempotent on already-sparse
+          # files from the cache.
+          cd ${TESTDATA_PATH}
           find downloaded/ -type f \( \
             -name "*.qcow2" -o \
             -name "*.vmdk" -o \
@@ -264,27 +276,6 @@ jobs:
             cp --sparse=always "$file" "$file.sparse"
             mv "$file.sparse" "$file"
           done
-
-      - name: Check filesystem block size
-        run: |
-          # Baselines were generated with 4096-byte block size. Different block
-          # sizes can affect qemu-img disk_size reporting due to allocation
-          # rounding differences.
-          EXPECTED_BLOCK_SIZE=4096
-          ACTUAL_BLOCK_SIZE=$(stat -f -c '%S' ${GITHUB_WORKSPACE}/imago-testdata/downloaded/)
-
-          echo "Filesystem block size: ${ACTUAL_BLOCK_SIZE} bytes"
-          echo "Expected block size: ${EXPECTED_BLOCK_SIZE} bytes"
-
-          if [ "${ACTUAL_BLOCK_SIZE}" != "${EXPECTED_BLOCK_SIZE}" ]; then
-            echo ""
-            echo "WARNING: Filesystem block size mismatch!"
-            echo "Baselines were generated on a filesystem with ${EXPECTED_BLOCK_SIZE}-byte blocks."
-            echo "This runner has ${ACTUAL_BLOCK_SIZE}-byte blocks."
-            echo "This may cause disk_size mismatches in qemu-img output."
-          else
-            echo "Block size matches expected value."
-          fi
 
       - name: Install Docker
         run: |
@@ -313,7 +304,7 @@ jobs:
         run: |
           cd ${GITHUB_WORKSPACE}/imago
           set +e
-          make test-container TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
+          make test-container TESTDATA_PATH=${TESTDATA_PATH} 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
           test_exit_code=${PIPESTATUS[0]}
           set -e
           if [ ${test_exit_code} -ne 0 ]; then
@@ -324,7 +315,7 @@ jobs:
       - name: Test --chain flag (backing chain discovery)
         run: |
           cd ${GITHUB_WORKSPACE}/imago
-          TESTDATA=${GITHUB_WORKSPACE}/imago-testdata
+          TESTDATA=${TESTDATA_PATH}
 
           # Helper function to run imago and capture output regardless of exit code
           # We mount the entire release directory because imago needs core.bin and info.bin
@@ -452,15 +443,31 @@ jobs:
           path: imago
           fetch-depth: 0
 
-      - name: Checkout imago-testdata from GitLab
+      - name: Prepare imago-testdata
         run: |
-          git clone --depth 1 \
-            https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git \
-            imago-testdata
+          CACHED=/srv/ci/cached/imago-testdata
+          if [ -d "${CACHED}/.git" ]; then
+            echo "Using cached testdata, updating in place..."
+            cd "${CACHED}"
+            git remote set-url origin \
+              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git"
+            git pull --depth 1
+            echo "TESTDATA_PATH=${CACHED}" >> $GITHUB_ENV
+          else
+            echo "No cache found, cloning fresh..."
+            git clone --depth 1 \
+              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git" \
+              ${GITHUB_WORKSPACE}/imago-testdata
+            echo "TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata" >> $GITHUB_ENV
+          fi
 
       - name: Resparsify test images
         run: |
-          cd ${GITHUB_WORKSPACE}/imago-testdata
+          # Git operations (clone or pull) fill sparse holes with zeros,
+          # affecting qemu-img disk_size output. Restore sparseness with
+          # cp --sparse=always. This is fast and idempotent on already-sparse
+          # files from the cache.
+          cd ${TESTDATA_PATH}
           find downloaded/ -type f \( \
             -name "*.qcow2" -o \
             -name "*.vmdk" -o \
@@ -499,7 +506,7 @@ jobs:
         run: |
           cd ${GITHUB_WORKSPACE}/imago
           set +e
-          make test-container-large TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
+          make test-container-large TESTDATA_PATH=${TESTDATA_PATH} 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
           test_exit_code=${PIPESTATUS[0]}
           set -e
           if [ ${test_exit_code} -ne 0 ]; then
@@ -536,15 +543,31 @@ jobs:
           path: imago
           fetch-depth: 0
 
-      - name: Checkout imago-testdata from GitLab
+      - name: Prepare imago-testdata
         run: |
-          git clone --depth 1 \
-            https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git \
-            imago-testdata
+          CACHED=/srv/ci/cached/imago-testdata
+          if [ -d "${CACHED}/.git" ]; then
+            echo "Using cached testdata, updating in place..."
+            cd "${CACHED}"
+            git remote set-url origin \
+              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git"
+            git pull --depth 1
+            echo "TESTDATA_PATH=${CACHED}" >> $GITHUB_ENV
+          else
+            echo "No cache found, cloning fresh..."
+            git clone --depth 1 \
+              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git" \
+              ${GITHUB_WORKSPACE}/imago-testdata
+            echo "TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata" >> $GITHUB_ENV
+          fi
 
       - name: Resparsify test images
         run: |
-          cd ${GITHUB_WORKSPACE}/imago-testdata
+          # Git operations (clone or pull) fill sparse holes with zeros,
+          # affecting qemu-img disk_size output. Restore sparseness with
+          # cp --sparse=always. This is fast and idempotent on already-sparse
+          # files from the cache.
+          cd ${TESTDATA_PATH}
           find downloaded/ -type f \( \
             -name "*.qcow2" -o \
             -name "*.vmdk" -o \
@@ -582,7 +605,7 @@ jobs:
             -e HOME=/build \
             -e IMAGO_TESTDATA_PATH=/testdata \
             -v "$(pwd):/workspace" \
-            -v "${GITHUB_WORKSPACE}/imago-testdata:/testdata:ro" \
+            -v "${TESTDATA_PATH}:/testdata:ro" \
             -w "/workspace" \
             imago-build \
             bash -c '
