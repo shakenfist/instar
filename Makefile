@@ -450,8 +450,8 @@ test-container-large: imago-devcontainer imago
 			echo "Running large-disk tests (concurrency=1)..."; \
 			cd tests && \
 			/build/test-venv/bin/stestr run \
-				--include-regex "test_large_" \
 				--concurrency 1 \
+				test_large_ \
 		'
 
 # Run CI-suitable tests (safe + caution)
