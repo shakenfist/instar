@@ -184,7 +184,9 @@ provides a modular architecture with:
   QCOW2 v3, VMDK, VHD, or VHDX output, with backing chain flattening
   and compressed cluster decompression). QCOW2 writer uses linear
   cluster allocation with OFLAG_COPIED, 16-bit refcounts, and iterative
-  convergence for refcount metadata sizing. Optional compressed output
+  convergence for refcount metadata sizing. Sparse output is the default
+  (skip zero-filled clusters, matching `qemu-img convert`); use
+  `--no-skip-zeros` for dense output. Optional compressed output
   (`-c` flag) packs clusters at sector granularity using raw deflate
   (via miniz_oxide), with fallback to uncompressed for incompressible
   data. VHD writer emits dynamic VHD with 2 MiB blocks, sector bitmaps,

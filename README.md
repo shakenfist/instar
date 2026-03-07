@@ -175,8 +175,8 @@ imago convert -O qcow2 overlay.qcow2 standalone.qcow2
 # Convert with compressed QCOW2 output (zlib/deflate compression)
 imago convert -c -O qcow2 input.raw output.qcow2
 
-# Convert with sparse output (skip writing zero-filled clusters)
-imago convert -S input.qcow2 output.raw
+# Convert with dense output (write all clusters including zeros)
+imago convert --no-skip-zeros input.qcow2 output.raw
 
 # Specify output cluster size for QCOW2 (default: 65536)
 imago convert -O qcow2 --cluster-size 4096 input.raw output.qcow2
@@ -195,6 +195,10 @@ The convert operation reads the virtual content of an input image (including
 backing chain flattening) and writes it in the requested output format.
 Compressed clusters (zlib/deflate and ZSTD) are decompressed transparently.
 QCOW2 v3 images with extended L2 entries (subclusters) are also supported.
+
+By default, convert produces sparse output by skipping zero-filled clusters
+(matching `qemu-img convert` behavior). Use `--no-skip-zeros` for dense output.
+The default can also be set via `convert.sparse` in the config file.
 
 Supported output formats:
 - **raw** (default) - Flat raw output

@@ -374,7 +374,7 @@ class TestConvertManifestImages(ImagoTestBase):
         if not vsize:
             return 120
         gib = vsize / (1024 ** 3)
-        return max(120, int(120 + gib * 30))
+        return max(120, int(120 + gib * 15))
 
     # Max I/O buffer size: compressed clusters need a full-cluster
     # decompression buffer, limited to MAX_SECTOR_SIZE (64KB).
@@ -414,19 +414,6 @@ class TestConvertManifestImages(ImagoTestBase):
                         f'{csize} (unsupported)'
                     )
 
-        # Need 2x virtual_size of temp space (imago + qemu-img
-        # outputs). Check available space with a safety margin.
-        if vsize:
-            tmpdir = tempfile.gettempdir()
-            st = os.statvfs(tmpdir)
-            avail = st.f_bavail * st.f_frsize
-            needed = vsize * 2 + 100 * 1024 * 1024  # +100MB
-            if avail < needed:
-                self.skipTest(
-                    f'{image_id}: needs '
-                    f'{needed // (1024**3)}GB temp, '
-                    f'only {avail // (1024**3)}GB available'
-                )
 
     def _test_manifest_convert(self, image_id):
         """Convert a manifest image and cross-validate."""
@@ -1533,7 +1520,7 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
         if not vsize:
             return 120
         gib = vsize / (1024 ** 3)
-        return max(120, int(120 + gib * 30))
+        return max(120, int(120 + gib * 15))
 
     # Max I/O buffer size for decompression
     MAX_DECOMPRESS_CLUSTER = 65536
@@ -1574,17 +1561,6 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
                         f'{csize} (unsupported)'
                     )
 
-        if vsize:
-            tmpdir = tempfile.gettempdir()
-            st = os.statvfs(tmpdir)
-            avail = st.f_bavail * st.f_frsize
-            # Need space for: re-encoded qcow2, 2x raw
-            needed = vsize * 2 + 100 * 1024 * 1024
-            if avail < needed:
-                self.skipTest(
-                    f'{image_id}: needs '
-                    f'{needed // (1024**3)}GB temp'
-                )
 
     def _test_reencode_qcow2(self, image_id):
         """Re-encode a QCOW2 image and validate."""
@@ -1882,7 +1858,7 @@ class TestConvertVmdkToRaw(ImagoTestBase):
         if not vsize:
             return 120
         gib = vsize / (1024 ** 3)
-        return max(120, int(120 + gib * 30))
+        return max(120, int(120 + gib * 15))
 
     def _test_vmdk_convert(self, image_id):
         """Convert a VMDK image to raw and cross-validate."""
@@ -1895,20 +1871,6 @@ class TestConvertVmdkToRaw(ImagoTestBase):
 
         vsize = self._get_vmdk_info(image.path)
         timeout = self._timeout_for_vsize(vsize)
-
-        # Check available temp space
-        if vsize:
-            tmpdir = tempfile.gettempdir()
-            st = os.statvfs(tmpdir)
-            avail = st.f_bavail * st.f_frsize
-            needed = vsize * 2 + 100 * 1024 * 1024
-            if avail < needed:
-                self.skipTest(
-                    f'{image_id}: needs '
-                    f'{needed // (1024**3)}GB temp, '
-                    f'only {avail // (1024**3)}GB '
-                    f'available'
-                )
 
         with tempfile.NamedTemporaryFile(suffix='.raw') \
                 as imago_raw, \
@@ -2057,20 +2019,6 @@ class TestConvertVmdkStreamOptimized(ImagoTestBase):
         timeout = max(120, int(120 + (vsize or 0)
                                 / (1024 ** 3) * 10))
 
-        # Check temp space
-        if vsize:
-            tmpdir = tempfile.gettempdir()
-            st = os.statvfs(tmpdir)
-            avail = st.f_bavail * st.f_frsize
-            needed = vsize * 2 + 100 * 1024 * 1024
-            if avail < needed:
-                self.skipTest(
-                    f'{image_id}: needs '
-                    f'{needed // (1024**3)}GB temp, '
-                    f'only {avail // (1024**3)}GB '
-                    f'available'
-                )
-
         with tempfile.NamedTemporaryFile(suffix='.raw') \
                 as imago_raw, \
                 tempfile.NamedTemporaryFile(suffix='.raw') \
@@ -2130,20 +2078,6 @@ class TestConvertVmdkStreamOptimized(ImagoTestBase):
         self.skip_if_hash_mismatch(image)
 
         vsize = self._get_vmdk_info(image.path)
-
-        # Check temp space
-        if vsize:
-            tmpdir = tempfile.gettempdir()
-            st = os.statvfs(tmpdir)
-            avail = st.f_bavail * st.f_frsize
-            needed = vsize + 100 * 1024 * 1024
-            if avail < needed:
-                self.skipTest(
-                    f'{image_id}: needs '
-                    f'{needed // (1024**3)}GB temp, '
-                    f'only {avail // (1024**3)}GB '
-                    f'available'
-                )
 
         timeout = max(120, int(120 + (vsize or 0)
                                 / (1024 ** 3) * 10))
@@ -2586,7 +2520,7 @@ class TestConvertVhdxToRaw(ImagoTestBase):
         if not vsize:
             return 120
         gib = vsize / (1024 ** 3)
-        return max(120, int(120 + gib * 30))
+        return max(120, int(120 + gib * 15))
 
     def _test_vhdx_convert(self, image_id):
         """Convert a VHDX image to raw and cross-validate."""
@@ -2599,20 +2533,6 @@ class TestConvertVhdxToRaw(ImagoTestBase):
 
         vsize = self._get_vhdx_info(image.path)
         timeout = self._timeout_for_vsize(vsize)
-
-        # Check available temp space
-        if vsize:
-            tmpdir = tempfile.gettempdir()
-            st = os.statvfs(tmpdir)
-            avail = st.f_bavail * st.f_frsize
-            needed = vsize * 2 + 100 * 1024 * 1024
-            if avail < needed:
-                self.skipTest(
-                    f'{image_id}: needs '
-                    f'{needed // (1024**3)}GB temp, '
-                    f'only {avail // (1024**3)}GB '
-                    f'available'
-                )
 
         with tempfile.NamedTemporaryFile(suffix='.raw') \
                 as imago_raw, \
@@ -2907,13 +2827,6 @@ class TestConvertVhdToRaw(ImagoTestBase):
         info = json.loads(result.stdout)
         return info.get('virtual-size')
 
-    def _timeout_for_vsize(self, vsize):
-        """Compute timeout based on virtual size."""
-        if not vsize:
-            return 120
-        gib = vsize / (1024 ** 3)
-        return max(120, int(120 + gib * 30))
-
     def _test_vhd_convert(self, image_id):
         """Convert a VHD image to raw and cross-validate."""
         image = self.get_image(image_id)
@@ -2924,20 +2837,16 @@ class TestConvertVhdToRaw(ImagoTestBase):
         self.skip_if_hash_mismatch(image)
 
         vsize = self._get_vhd_info(image.path)
-        timeout = self._timeout_for_vsize(vsize)
 
+        # With sparse output (default), both imago and
+        # qemu-img skip unallocated blocks so actual disk
+        # usage is small regardless of virtual size.
+        # Timeout scales modestly with virtual size.
         if vsize:
-            tmpdir = tempfile.gettempdir()
-            st = os.statvfs(tmpdir)
-            avail = st.f_bavail * st.f_frsize
-            needed = vsize * 2 + 100 * 1024 * 1024
-            if avail < needed:
-                self.skipTest(
-                    f'{image_id}: needs '
-                    f'{needed // (1024**3)}GB temp, '
-                    f'only {avail // (1024**3)}GB '
-                    f'available'
-                )
+            gib = vsize / (1024 ** 3)
+            timeout = max(120, int(120 + gib * 5))
+        else:
+            timeout = 120
 
         with tempfile.NamedTemporaryFile(suffix='.raw') \
                 as imago_raw, \
@@ -2975,11 +2884,11 @@ class TestConvertVhdToRaw(ImagoTestBase):
                 f'from qemu-img: {cmp_out}'
             )
 
-    def test_large_convert_hyperv_dynamic_vhd(self):
+    def test_convert_hyperv_dynamic_vhd(self):
         """Convert Hyper-V 2012 R2 dynamic VHD to raw."""
         self._test_vhd_convert('hyperv-dynamic-vhd')
 
-    def test_large_convert_virtualpc_vhd(self):
+    def test_convert_virtualpc_vhd(self):
         """Convert Virtual PC dynamic VHD to raw."""
         self._test_vhd_convert('virtualpc-vhd')
 
@@ -2995,13 +2904,6 @@ class TestConvertVhdCompare(ImagoTestBase):
     the qemu-img-converted raw baseline.
     """
 
-    def _timeout_for_vsize(self, vsize):
-        """Compute timeout based on virtual size."""
-        if not vsize:
-            return 120
-        gib = vsize / (1024 ** 3)
-        return max(120, int(120 + gib * 30))
-
     def _compare_vhd_vs_raw(self, image_id):
         """Compare VHD against its qemu-img-converted raw."""
         image = self.get_image(image_id)
@@ -3011,8 +2913,8 @@ class TestConvertVhdCompare(ImagoTestBase):
             )
         self.skip_if_hash_mismatch(image)
 
-        # qemu-img converts VHD to raw at full virtual
-        # size; skip if insufficient temp space.
+        # qemu-img produces sparse raw output by default,
+        # so disk usage is small regardless of virtual size.
         vsize = 0
         result = subprocess.run(
             [
@@ -3025,19 +2927,12 @@ class TestConvertVhdCompare(ImagoTestBase):
             vsize = json.loads(
                 result.stdout
             ).get('virtual-size', 0)
-            tmpdir = tempfile.gettempdir()
-            st = os.statvfs(tmpdir)
-            avail = st.f_bavail * st.f_frsize
-            needed = vsize + 100 * 1024 * 1024
-            if avail < needed:
-                self.skipTest(
-                    f'{image_id}: needs '
-                    f'{needed // (1024**3)}GB temp, '
-                    f'only {avail // (1024**3)}GB '
-                    f'available'
-                )
 
-        timeout = self._timeout_for_vsize(vsize)
+        if vsize:
+            gib = vsize / (1024 ** 3)
+            timeout = max(120, int(120 + gib * 5))
+        else:
+            timeout = 120
 
         with tempfile.NamedTemporaryFile(
                 suffix='.raw') as qemu_raw:
@@ -3061,11 +2956,11 @@ class TestConvertVhdCompare(ImagoTestBase):
                 f'differs from raw: {cmp_out}'
             )
 
-    def test_large_compare_hyperv_vhd_vs_raw(self):
+    def test_compare_hyperv_vhd_vs_raw(self):
         """Compare Hyper-V dynamic VHD against raw."""
         self._compare_vhd_vs_raw('hyperv-dynamic-vhd')
 
-    def test_large_compare_virtualpc_vhd_vs_raw(self):
+    def test_compare_virtualpc_vhd_vs_raw(self):
         """Compare Virtual PC dynamic VHD against raw."""
         self._compare_vhd_vs_raw('virtualpc-vhd')
 
@@ -3081,13 +2976,6 @@ class TestConvertToVhd(ImagoTestBase):
     by converting back to raw and comparing against qemu-img.
     """
 
-    def _timeout_for_vsize(self, vsize):
-        """Compute timeout based on virtual size."""
-        if not vsize:
-            return 120
-        gib = vsize / (1024 ** 3)
-        return max(120, int(120 + gib * 30))
-
     def _test_to_vhd_roundtrip(self, image_id):
         """Convert image to VHD, then back to raw, compare."""
         image = self.get_image(image_id)
@@ -3097,9 +2985,8 @@ class TestConvertToVhd(ImagoTestBase):
             )
         self.skip_if_hash_mismatch(image)
 
-        # Need space for VHD + 2x raw at virtual size.
-        # Use 3x vsize to account for VHD intermediate
-        # plus two full raw files written concurrently.
+        # With sparse output (default), disk usage is small
+        # regardless of virtual size.
         vsize = 0
         result = subprocess.run(
             [
@@ -3112,19 +2999,12 @@ class TestConvertToVhd(ImagoTestBase):
             vsize = json.loads(
                 result.stdout
             ).get('virtual-size', 0)
-            tmpdir = tempfile.gettempdir()
-            st = os.statvfs(tmpdir)
-            avail = st.f_bavail * st.f_frsize
-            needed = vsize * 3 + 100 * 1024 * 1024
-            if avail < needed:
-                self.skipTest(
-                    f'{image_id}: needs '
-                    f'{needed // (1024**3)}GB temp, '
-                    f'only {avail // (1024**3)}GB '
-                    f'available'
-                )
 
-        timeout = self._timeout_for_vsize(vsize)
+        if vsize:
+            gib = vsize / (1024 ** 3)
+            timeout = max(120, int(120 + gib * 5))
+        else:
+            timeout = 120
 
         with tempfile.NamedTemporaryFile(
                 suffix='.vhd') as vhd_out, \
@@ -3291,13 +3171,6 @@ class TestConvertVhdToQcow2Roundtrip(ImagoTestBase):
     against qemu-img VHD -> raw baseline.
     """
 
-    def _timeout_for_vsize(self, vsize):
-        """Compute timeout based on virtual size."""
-        if not vsize:
-            return 120
-        gib = vsize / (1024 ** 3)
-        return max(120, int(120 + gib * 30))
-
     def _test_vhd_qcow2_roundtrip(self, image_id):
         """VHD -> QCOW2 -> raw, compare against baseline."""
         image = self.get_image(image_id)
@@ -3307,9 +3180,8 @@ class TestConvertVhdToQcow2Roundtrip(ImagoTestBase):
             )
         self.skip_if_hash_mismatch(image)
 
-        # Need space for QCOW2 + 2x raw at virtual size.
-        # Use 3x vsize to account for QCOW2 intermediate
-        # plus two full raw files written concurrently.
+        # With sparse output (default), all intermediate and
+        # output files are small regardless of virtual size.
         vsize = 0
         result = subprocess.run(
             [
@@ -3322,19 +3194,12 @@ class TestConvertVhdToQcow2Roundtrip(ImagoTestBase):
             vsize = json.loads(
                 result.stdout
             ).get('virtual-size', 0)
-            tmpdir = tempfile.gettempdir()
-            st = os.statvfs(tmpdir)
-            avail = st.f_bavail * st.f_frsize
-            needed = vsize * 3 + 100 * 1024 * 1024
-            if avail < needed:
-                self.skipTest(
-                    f'{image_id}: needs '
-                    f'{needed // (1024**3)}GB temp, '
-                    f'only {avail // (1024**3)}GB '
-                    f'available'
-                )
 
-        timeout = self._timeout_for_vsize(vsize)
+        if vsize:
+            gib = vsize / (1024 ** 3)
+            timeout = max(120, int(120 + gib * 5))
+        else:
+            timeout = 120
 
         with tempfile.NamedTemporaryFile(
                 suffix='.qcow2') as qcow2_out, \
@@ -3391,12 +3256,12 @@ class TestConvertVhdToQcow2Roundtrip(ImagoTestBase):
                 f'{image_id}: {cmp_out}'
             )
 
-    def test_large_hyperv_vhd_qcow2_roundtrip(self):
+    def test_hyperv_vhd_qcow2_roundtrip(self):
         """VHD (Hyper-V) -> QCOW2 -> raw round-trip."""
         self._test_vhd_qcow2_roundtrip(
             'hyperv-dynamic-vhd'
         )
 
-    def test_large_virtualpc_vhd_qcow2_roundtrip(self):
+    def test_virtualpc_vhd_qcow2_roundtrip(self):
         """VHD (Virtual PC) -> QCOW2 -> raw round-trip."""
         self._test_vhd_qcow2_roundtrip('virtualpc-vhd')

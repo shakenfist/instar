@@ -2112,9 +2112,14 @@ struct ConvertArgs {
     #[arg(short = 'c', long)]
     compress: bool,
 
-    /// Skip writing zero-filled clusters to output (sparse output)
-    #[arg(short = 'S', long)]
+    /// Skip writing zero-filled clusters to output (sparse output, default).
+    /// This is enabled by default; use --no-skip-zeros to write dense output.
+    #[arg(short = 'S', long, overrides_with = "no_skip_zeros")]
     skip_zeros: bool,
+
+    /// Write full dense output (don't skip zero-filled clusters)
+    #[arg(long, overrides_with = "skip_zeros")]
+    no_skip_zeros: bool,
 
     /// Progress update interval in percent (default: 10)
     #[arg(short = 'p', long, default_value = "10")]
@@ -4023,8 +4028,20 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         operation_path.display()
     );
 
+    // Load configuration and resolve skip_zeros:
+    //   CLI --no-skip-zeros > CLI --skip-zeros/-S > config convert.sparse > default(true)
+    let tracked_config = config::load_config();
+    let skip_zeros = if args.no_skip_zeros {
+        false
+    } else if args.skip_zeros {
+        true
+    } else {
+        tracked_config.config.convert.sparse.unwrap_or(true)
+    };
+    debug!("skip_zeros = {}", skip_zeros);
+
     // Discover input backing chain
-    let security_config = config::load_config().config.security;
+    let security_config = tracked_config.config.security;
     let chain = discover_backing_chain(Path::new(&args.input), args.sector_size, &security_config)
         .map_err(|e| format!("error discovering backing chain for {}: {}", args.input, e))?;
 
@@ -4109,8 +4126,8 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
             Path::new(&args.output),
             false,
             Some(virtual_size),
-            // sparse when skipping zeros
-            args.skip_zeros,
+            // sparse when skipping zeros (default: true)
+            skip_zeros,
         )?
     };
 
@@ -4161,7 +4178,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 
     // Write ConvertConfig at OPERATION_CONFIG_ADDR
     let mut convert_flags: u32 = 0;
-    if args.skip_zeros {
+    if skip_zeros {
         convert_flags |= CONVERT_CONFIG_FLAG_SKIP_ZEROS;
     }
     if args.compress {
@@ -4442,6 +4459,14 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 
     if !convert_success {
         return Err("convert operation failed".into());
+    }
+
+    // For sparse raw output, truncate to virtual size so the
+    // apparent file size matches the image's virtual size (same
+    // as qemu-img convert behavior).
+    if skip_zeros && !is_structured_output {
+        let f = std::fs::OpenOptions::new().write(true).open(&args.output)?;
+        f.set_len(virtual_size)?;
     }
 
     Ok(())
