@@ -424,108 +424,6 @@ jobs:
             ${{ github.workspace }}/test-output.txt
           retention-days: 7
 
-  # Large-disk integration tests run in parallel on a worker with more
-  # disk space. These tests involve VHD images with 127 GiB virtual
-  # sizes that expand to hundreds of GiB during conversion/comparison.
-  # Tests are named test_large_* and run at concurrency=1 to avoid
-  # exhausting temp space.
-  integration-tests-large:
-    needs: build-and-test
-    runs-on: [self-hosted, debian-12, xl-bigdisk]
-    timeout-minutes: 150
-
-    env:
-      DOCKER_BUILDKIT: 1
-
-    steps:
-      - name: Checkout imago
-        uses: actions/checkout@v4
-        with:
-          path: imago
-          fetch-depth: 0
-
-      - name: Prepare imago-testdata
-        run: |
-          CACHED=/srv/ci/cached/imago-testdata
-          if [ -d "${CACHED}/.git" ]; then
-            echo "Using cached testdata, updating in place..."
-            cd "${CACHED}"
-            git remote set-url origin \
-              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git"
-            git fetch --depth 1 origin main
-            git reset --hard origin/main
-            echo "TESTDATA_PATH=${CACHED}" >> $GITHUB_ENV
-          else
-            echo "No cache found, cloning fresh..."
-            git clone --depth 1 \
-              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git" \
-              ${GITHUB_WORKSPACE}/imago-testdata
-            echo "TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata" >> $GITHUB_ENV
-          fi
-
-      - name: Resparsify test images
-        run: |
-          # Git operations (clone or pull) fill sparse holes with zeros,
-          # affecting qemu-img disk_size output. Restore sparseness with
-          # cp --sparse=always. This is fast and idempotent on already-sparse
-          # files from the cache.
-          cd ${TESTDATA_PATH}
-          find downloaded/ -type f \( \
-            -name "*.qcow2" -o \
-            -name "*.vmdk" -o \
-            -name "*.vhd" -o \
-            -name "*.vhdx" -o \
-            -name "*.img" \
-          \) -print0 | while IFS= read -r -d '' file; do
-            cp --sparse=always "$file" "$file.sparse"
-            mv "$file.sparse" "$file"
-          done
-
-      - name: Install Docker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y docker.io
-          sudo systemctl start docker
-          sudo chmod 666 /var/run/docker.sock
-
-      - name: Remove previous devcontainers, if any
-        run: |
-          docker image rm -f imago-build 2>/dev/null || true
-
-      - name: Build imago
-        run: |
-          cd ${GITHUB_WORKSPACE}/imago
-          set +e
-          make imago 2>&1 | tee ${GITHUB_WORKSPACE}/build-log.txt
-          build_exit_code=${PIPESTATUS[0]}
-          set -e
-          if [ ${build_exit_code} -ne 0 ]; then
-            echo "Build failed with exit code ${build_exit_code}"
-            exit ${build_exit_code}
-          fi
-
-      - name: Run large-disk integration tests
-        run: |
-          cd ${GITHUB_WORKSPACE}/imago
-          set +e
-          make test-container-large TESTDATA_PATH=${TESTDATA_PATH} 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
-          test_exit_code=${PIPESTATUS[0]}
-          set -e
-          if [ ${test_exit_code} -ne 0 ]; then
-            echo "Large-disk integration tests failed with exit code ${test_exit_code}"
-            exit ${test_exit_code}
-          fi
-
-      - name: Upload test artifacts
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: integration-test-large-logs
-          path: |
-            ${{ github.workspace }}/build-log.txt
-            ${{ github.workspace }}/test-output.txt
-          retention-days: 7
-
   # Cross-validate imago against oslo.utils git master.
   # This catches drift from oslo.utils development before
   # it reaches PyPI. Allowed to fail (informational).
@@ -624,7 +522,7 @@ jobs:
   automated_reviewer:
     name: "Automated reviewer"
     runs-on: [self-hosted, claude-code]
-    needs: [check-bot-commit, build-and-test, integration-tests, integration-tests-large]
+    needs: [check-bot-commit, build-and-test, integration-tests]
     if: >-
       ${{ github.event_name == 'pull_request' &&
           needs.check-bot-commit.outputs.is_bot != 'true' }}

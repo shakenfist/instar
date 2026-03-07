@@ -498,7 +498,7 @@ class ImagoTestBase(testtools.TestCase):
         output_path: Path,
         timeout: int = 60,
         output_format: str = 'raw',
-        skip_zeros: bool = False,
+        skip_zeros: bool = None,
         cluster_size: int = None,
         compress: bool = False,
     ) -> tuple:
@@ -511,6 +511,7 @@ class ImagoTestBase(testtools.TestCase):
             timeout: Timeout in seconds
             output_format: Output format (default: raw)
             skip_zeros: Skip writing zero-filled clusters
+                (None=use CLI default which is true)
             cluster_size: Output cluster size (qcow2 only)
             compress: Compress data clusters (qcow2 only)
 
@@ -523,8 +524,10 @@ class ImagoTestBase(testtools.TestCase):
             str(imago), 'convert',
             '-O', output_format,
         ]
-        if skip_zeros:
+        if skip_zeros is True:
             cmd.append('--skip-zeros')
+        elif skip_zeros is False:
+            cmd.append('--no-skip-zeros')
         if cluster_size is not None:
             cmd.extend(['--cluster-size', str(cluster_size)])
         if compress:
