@@ -2838,13 +2838,12 @@ class TestConvertVhdToRaw(ImagoTestBase):
 
         vsize = self._get_vhd_info(image.path)
 
-        # With sparse output (default), both imago and
-        # qemu-img skip unallocated blocks so actual disk
-        # usage is small regardless of virtual size.
-        # Timeout scales modestly with virtual size.
+        # Convert is fast with sparse output, but compare
+        # reads the full virtual range even for sparse files.
+        # Timeout scales with virtual size for the compare.
         if vsize:
             gib = vsize / (1024 ** 3)
-            timeout = max(120, int(120 + gib * 5))
+            timeout = max(120, int(120 + gib * 15))
         else:
             timeout = 120
 
@@ -2930,7 +2929,7 @@ class TestConvertVhdCompare(ImagoTestBase):
 
         if vsize:
             gib = vsize / (1024 ** 3)
-            timeout = max(120, int(120 + gib * 5))
+            timeout = max(120, int(120 + gib * 15))
         else:
             timeout = 120
 
@@ -3002,7 +3001,7 @@ class TestConvertToVhd(ImagoTestBase):
 
         if vsize:
             gib = vsize / (1024 ** 3)
-            timeout = max(120, int(120 + gib * 5))
+            timeout = max(120, int(120 + gib * 15))
         else:
             timeout = 120
 
@@ -3197,7 +3196,7 @@ class TestConvertVhdToQcow2Roundtrip(ImagoTestBase):
 
         if vsize:
             gib = vsize / (1024 ** 3)
-            timeout = max(120, int(120 + gib * 5))
+            timeout = max(120, int(120 + gib * 15))
         else:
             timeout = 120
 
