@@ -419,6 +419,7 @@ test-container: imago-devcontainer imago
 			cd tests && \
 			/build/test-venv/bin/stestr run \
 				--exclude-regex "test_info_malicious" \
+				--concurrency 4 \
 		'
 
 # Run CI-suitable tests (safe + caution)
