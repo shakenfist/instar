@@ -297,11 +297,8 @@ Implemented full VHDX support in 5 sub-phases:
 
 ### Refactoring Opportunities (not blocking, future improvement)
 
-17. **Byte-order helper duplication grows** — VHDX adds LE helpers
-    (`le_u16`/`le_u32`/`le_u64`, `write_le_*`) duplicating the
-    pattern from VHD's LE and QCOW2/VMDK's BE helpers. All format
-    crates have ~20 lines of identical byte-order helpers. Still
-    not blocking — same recommendation as item 11.
+17. **Byte-order helper duplication grows** — DONE (Phase 14a,
+    same as item 11). All helpers consolidated in shared crate.
 
 18. **Two-pass zero check in convert_to_vhdx** — Same pattern as
     item 12 (VHD). Each 32 MiB VHDX block is read twice when
