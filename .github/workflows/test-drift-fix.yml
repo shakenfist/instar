@@ -87,19 +87,32 @@ jobs:
           path: imago
           fetch-depth: 0
 
-      - name: Checkout imago-testdata from GitLab
+      - name: Prepare imago-testdata
         run: |
-          git clone --depth 1 \
-            https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git \
-            imago-testdata
+          CACHED=/srv/ci/cached/imago-testdata
+          if [ -d "${CACHED}/.git" ]; then
+            echo "Using cached testdata, updating in place..."
+            cd "${CACHED}"
+            git remote set-url origin \
+              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git"
+            git fetch --depth 1 origin main
+            git reset --hard origin/main
+            echo "TESTDATA_PATH=${CACHED}" >> $GITHUB_ENV
+          else
+            echo "No cache found, cloning fresh..."
+            git clone --depth 1 \
+              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git" \
+              ${GITHUB_WORKSPACE}/imago-testdata
+            echo "TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata" >> $GITHUB_ENV
+          fi
 
       - name: Resparsify test images
         run: |
-          # Git streaming fills sparse holes with zeros, affecting qemu-img
-          # disk_size output. Restore sparseness using cp --sparse=always,
-          # which is more robust than fallocate -d for files with partial
-          # zero blocks or complex sparse patterns.
-          cd ${GITHUB_WORKSPACE}/imago-testdata
+          # Git operations (clone or pull) fill sparse holes with zeros,
+          # affecting qemu-img disk_size output. Restore sparseness with
+          # cp --sparse=always. This is fast and idempotent on already-sparse
+          # files from the cache.
+          cd ${TESTDATA_PATH}
           find downloaded/ -type f \( \
             -name "*.qcow2" -o \
             -name "*.vmdk" -o \
@@ -111,28 +124,47 @@ jobs:
             mv "$file.sparse" "$file"
           done
 
-      - name: Check filesystem block size
+      - name: Fetch prior CI failure logs from PR
+        id: prior_failures
+        if: env.IS_PR_RUN == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Baselines were generated with 4096-byte block size. Different block
-          # sizes can affect qemu-img disk_size reporting due to allocation
-          # rounding differences.
-          EXPECTED_BLOCK_SIZE=4096
-          ACTUAL_BLOCK_SIZE=$(stat -f -c '%S' ${GITHUB_WORKSPACE}/imago-testdata/downloaded/)
+          echo "Fetching failure details from PR #${PR_NUMBER}..."
 
-          echo "Filesystem block size: ${ACTUAL_BLOCK_SIZE} bytes" | tee ${GITHUB_WORKSPACE}/fs-info.txt
-          echo "Expected block size: ${EXPECTED_BLOCK_SIZE} bytes" | tee -a ${GITHUB_WORKSPACE}/fs-info.txt
+          # Get the head SHA of the PR
+          HEAD_SHA=$(gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}" \
+            --jq '.head.sha')
+          echo "PR head SHA: ${HEAD_SHA}"
 
-          if [ "${ACTUAL_BLOCK_SIZE}" != "${EXPECTED_BLOCK_SIZE}" ]; then
-            echo ""
-            echo "WARNING: Filesystem block size mismatch!"
-            echo "Baselines were generated on a filesystem with ${EXPECTED_BLOCK_SIZE}-byte blocks."
-            echo "This runner has ${ACTUAL_BLOCK_SIZE}-byte blocks."
-            echo "This may cause disk_size mismatches in qemu-img output."
-            echo ""
-            echo "BLOCK_SIZE_MISMATCH=true" >> ${GITHUB_WORKSPACE}/fs-info.txt
+          # Find failed check runs on that commit
+          FAILED_RUNS=$(gh api "repos/${{ github.repository }}/commits/${HEAD_SHA}/check-runs" \
+            --jq '[.check_runs[] | select(.conclusion == "failure") | {name, id}]')
+          echo "Failed check runs: ${FAILED_RUNS}"
+
+          FAILURE_FILE="${GITHUB_WORKSPACE}/prior-ci-failures.txt"
+          echo "" > "${FAILURE_FILE}"
+
+          # For each failed check run, fetch logs and extract failure lines
+          for RUN_ID in $(echo "${FAILED_RUNS}" | jq -r '.[].id'); do
+            RUN_NAME=$(echo "${FAILED_RUNS}" | jq -r ".[] | select(.id == ${RUN_ID}) | .name")
+            echo "=== Failures from check run: ${RUN_NAME} (${RUN_ID}) ===" >> "${FAILURE_FILE}"
+
+            # Fetch job logs and extract FAILED tests with tracebacks
+            gh api "repos/${{ github.repository }}/actions/jobs/${RUN_ID}/logs" 2>/dev/null | \
+              grep -E "FAILED|Traceback|MismatchError|AssertionError|Error:|Failed [0-9]+ test|Passed:|make:.*Error" \
+              >> "${FAILURE_FILE}" 2>/dev/null || true
+
+            echo "" >> "${FAILURE_FILE}"
+          done
+
+          if [ -s "${FAILURE_FILE}" ] && grep -q "FAILED\|Error" "${FAILURE_FILE}"; then
+            echo "has_prior_failures=true" >> $GITHUB_OUTPUT
+            echo "Prior CI failures found:"
+            cat "${FAILURE_FILE}"
           else
-            echo "Block size matches expected value."
-            echo "BLOCK_SIZE_MISMATCH=false" >> ${GITHUB_WORKSPACE}/fs-info.txt
+            echo "has_prior_failures=false" >> $GITHUB_OUTPUT
+            echo "No prior CI failures found on this PR."
           fi
 
       - name: Configure git
@@ -175,7 +207,7 @@ jobs:
           set +e
           # Run tests inside container for consistent environment
           # Container mounts testdata at /testdata for path consistency
-          make test-container TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
+          make test-container TESTDATA_PATH=${TESTDATA_PATH} 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
           test_exit_code=${PIPESTATUS[0]}
           set -e
 
@@ -188,7 +220,9 @@ jobs:
           exit ${test_exit_code}
 
       - name: Exit early if nothing to do
-        if: steps.initial_test.outputs.tests_passed == 'true'
+        if: |
+          steps.initial_test.outputs.tests_passed == 'true' &&
+          steps.prior_failures.outputs.has_prior_failures != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -202,7 +236,8 @@ jobs:
 
       - name: Prepare Claude prompt
         if: |
-          steps.initial_test.outputs.tests_passed == 'false'
+          steps.initial_test.outputs.tests_passed == 'false' ||
+          steps.prior_failures.outputs.has_prior_failures == 'true'
         run: |
           cat > ${GITHUB_WORKSPACE}/claude-prompt.txt << 'PROMPT_EOF'
           The imago integration test suite needs attention. Please analyze and
@@ -221,16 +256,46 @@ jobs:
 
           PROMPT_EOF
 
-          # Add test failure context if tests failed
+          # Add prior CI failure context if available (from the PR's failed check runs)
+          if [ "${{ steps.prior_failures.outputs.has_prior_failures }}" == "true" ]; then
+            cat >> ${GITHUB_WORKSPACE}/claude-prompt.txt << 'PROMPT_EOF'
+
+          ## Prior CI Failures (from the PR's most recent CI run)
+
+          The following test failures were observed in the PR's CI run. These
+          failures triggered this fix attempt. Note: these failures may be
+          intermittent — they may not reproduce when you re-run the tests
+          locally. If so, investigate whether the tests are flaky (e.g.
+          timeouts, resource-dependent) and fix the root cause.
+
+          PROMPT_EOF
+            cat ${GITHUB_WORKSPACE}/prior-ci-failures.txt >> ${GITHUB_WORKSPACE}/claude-prompt.txt
+          fi
+
+          # Add local test failure context if tests failed on this run
           if [ "${{ steps.initial_test.outputs.tests_passed }}" == "false" ]; then
             cat >> ${GITHUB_WORKSPACE}/claude-prompt.txt << 'PROMPT_EOF'
 
-          ## Test Failures
+          ## Local Test Failures (from re-running tests on this runner)
 
-          The following tests failed. Analyze the output differences and fix them:
+          The following tests failed when re-run. Analyze the output
+          differences and fix them:
 
           PROMPT_EOF
             cat ${GITHUB_WORKSPACE}/test-output.txt >> ${GITHUB_WORKSPACE}/claude-prompt.txt
+
+          elif [ "${{ steps.prior_failures.outputs.has_prior_failures }}" == "true" ]; then
+            cat >> ${GITHUB_WORKSPACE}/claude-prompt.txt << 'PROMPT_EOF'
+
+          ## Local Test Results
+
+          Note: All tests PASSED when re-run on this runner. The failures
+          above were from the PR's CI run but did not reproduce here. This
+          suggests the failures are intermittent. Please investigate the
+          failing tests for flakiness (e.g. timeouts, resource sensitivity,
+          race conditions) and fix the root cause so they are reliable.
+
+          PROMPT_EOF
           fi
 
           cat >> ${GITHUB_WORKSPACE}/claude-prompt.txt << 'PROMPT_EOF'
@@ -351,10 +416,11 @@ jobs:
       - name: Run Claude Code to fix issues
         id: claude_fix
         if: |
-          steps.initial_test.outputs.tests_passed == 'false'
+          steps.initial_test.outputs.tests_passed == 'false' ||
+          steps.prior_failures.outputs.has_prior_failures == 'true'
         continue-on-error: true
         env:
-          IMAGO_TESTDATA_PATH: ${{ github.workspace }}/imago-testdata
+          IMAGO_TESTDATA_PATH: ${{ env.TESTDATA_PATH }}
         run: |
           cd ${GITHUB_WORKSPACE}/imago
 
@@ -434,7 +500,7 @@ jobs:
 
           set +e
           # Run tests inside container for consistent environment
-          make test-container TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata 2>&1 | tee ${GITHUB_WORKSPACE}/verify-output.txt
+          make test-container TESTDATA_PATH=${TESTDATA_PATH} 2>&1 | tee ${GITHUB_WORKSPACE}/verify-output.txt
           verify_exit_code=${PIPESTATUS[0]}
           set -e
 
@@ -560,7 +626,8 @@ jobs:
       - name: Report failure (PR mode)
         if: |
           env.IS_PR_RUN == 'true' &&
-          steps.initial_test.outputs.tests_passed == 'false' &&
+          (steps.initial_test.outputs.tests_passed == 'false' ||
+           steps.prior_failures.outputs.has_prior_failures == 'true') &&
           (steps.claude_fix.outputs.claude_available != 'true' ||
            steps.verify.outputs.fix_succeeded == 'false')
         env:
@@ -582,7 +649,8 @@ jobs:
       - name: Create issue for unfixable problems (scheduled/manual mode)
         if: |
           env.IS_PR_RUN != 'true' &&
-          steps.initial_test.outputs.tests_passed == 'false' &&
+          (steps.initial_test.outputs.tests_passed == 'false' ||
+           steps.prior_failures.outputs.has_prior_failures == 'true') &&
           (steps.claude_fix.outputs.claude_available != 'true' ||
            steps.verify.outputs.fix_succeeded == 'false')
         uses: actions/github-script@v7
@@ -639,4 +707,5 @@ jobs:
             ${{ github.workspace }}/new-images.txt
             ${{ github.workspace }}/claude-logs/
             ${{ github.workspace }}/fs-info.txt
+            ${{ github.workspace }}/prior-ci-failures.txt
           retention-days: 14

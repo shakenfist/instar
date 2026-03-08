@@ -22,8 +22,8 @@ extern crate alloc;
 ))]
 use shared::COMPRESSED_BUF_SIZE;
 use shared::{
-    l1_cache_addr, l2_cache_addr, BackingFormat, CallTable, ChainConfig, ImageFormat,
-    MAX_CHAIN_DEVICES, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE,
+    be_u32, be_u64, l1_cache_addr, l2_cache_addr, BackingFormat, CallTable, ChainConfig,
+    ImageFormat, MAX_CHAIN_DEVICES, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE,
 };
 #[cfg(feature = "vhd-input")]
 use vhd::{BlockLookup, VhdState};
@@ -126,52 +126,6 @@ pub const NB_SNAPSHOTS_OFFSET: usize = 60;
 pub const SNAPSHOTS_OFFSET_OFFSET: usize = 64;
 /// Offset of autoclear_features field in the v3 header
 pub const AUTOCLEAR_FEATURES_OFFSET: usize = 88;
-
-// ============================================================================
-// Byte-order helpers
-// ============================================================================
-
-/// Read a big-endian u32 from a byte slice at the given offset.
-#[inline]
-pub fn be_u32(buf: &[u8], off: usize) -> u32 {
-    u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
-}
-
-/// Read a big-endian u64 from a byte slice at the given offset.
-#[inline]
-pub fn be_u64(buf: &[u8], off: usize) -> u64 {
-    u64::from_be_bytes([
-        buf[off],
-        buf[off + 1],
-        buf[off + 2],
-        buf[off + 3],
-        buf[off + 4],
-        buf[off + 5],
-        buf[off + 6],
-        buf[off + 7],
-    ])
-}
-
-/// Write a big-endian u16 to a byte slice at the given offset.
-#[inline]
-pub fn write_be_u16(buf: &mut [u8], off: usize, val: u16) {
-    let bytes = val.to_be_bytes();
-    buf[off..off + 2].copy_from_slice(&bytes);
-}
-
-/// Write a big-endian u32 to a byte slice at the given offset.
-#[inline]
-pub fn write_be_u32(buf: &mut [u8], off: usize, val: u32) {
-    let bytes = val.to_be_bytes();
-    buf[off..off + 4].copy_from_slice(&bytes);
-}
-
-/// Write a big-endian u64 to a byte slice at the given offset.
-#[inline]
-pub fn write_be_u64(buf: &mut [u8], off: usize, val: u64) {
-    let bytes = val.to_be_bytes();
-    buf[off..off + 8].copy_from_slice(&bytes);
-}
 
 // ============================================================================
 // Compression support (writing compressed QCOW2 clusters)
@@ -932,6 +886,86 @@ pub unsafe fn read_cluster_sectors(
             return false;
         }
         *bytes_read += sector_size as u64;
+    }
+    true
+}
+
+/// Read data starting at an arbitrary byte offset that may not be
+/// sector-aligned.
+///
+/// VHD data blocks are addressed in 512-byte sectors, but the device
+/// sector size may be larger (e.g. 65536 bytes). When the data start
+/// offset falls inside a sector, this function reads the first sector
+/// to a temporary location and copies the relevant tail, then reads
+/// the remaining sectors directly into `buf`.
+///
+/// Uses `buf` itself (offset by one sector) as scratch space for the
+/// first partial-sector read. This is safe because VHD blocks are
+/// always >= 2 MiB while the max sector is 64 KiB, so the buffer
+/// always has room beyond the first sector's output position.
+///
+/// # Safety
+///
+/// `buf` must point to at least `max(chunk_size, sector_size) + sector_size`
+/// writable bytes.  The caller's cluster buffer (MAX_CLUSTER_SIZE) satisfies
+/// this since VHD blocks are >= 2 MiB and sectors are <= 64 KiB.
+/// `call_table` must be valid.
+#[cfg(feature = "vhd-input")]
+unsafe fn read_offset_sectors(
+    call_table: &CallTable,
+    device_idx: u32,
+    host_offset: u64,
+    buf: *mut u8,
+    chunk_size: u64,
+    sector_size: usize,
+    bytes_read: &mut u64,
+) -> bool {
+    let first_sector = host_offset / sector_size as u64;
+    let off_in_sector = (host_offset % sector_size as u64) as usize;
+    let first_useful = sector_size - off_in_sector;
+
+    // Read the first (partial) sector into buf at offset sector_size
+    // (scratch area) and copy the useful tail to buf[0..].
+    let scratch = buf.add(sector_size);
+    if !(call_table.read_input_sector)(device_idx, first_sector, scratch, sector_size) {
+        return false;
+    }
+    *bytes_read += sector_size as u64;
+    let first_copy = if (chunk_size as usize) < first_useful {
+        chunk_size as usize
+    } else {
+        first_useful
+    };
+    core::ptr::copy_nonoverlapping(scratch.add(off_in_sector), buf, first_copy);
+
+    if chunk_size as usize <= first_useful {
+        return true;
+    }
+
+    // Read remaining full sectors directly into buf
+    let mut buf_pos = first_copy;
+    let mut sector = first_sector + 1;
+    let mut remaining = chunk_size as usize - first_copy;
+
+    while remaining > 0 {
+        let copy_len = if remaining < sector_size {
+            // Last partial sector: read into scratch, copy
+            if !(call_table.read_input_sector)(device_idx, sector, scratch, sector_size) {
+                return false;
+            }
+            core::ptr::copy_nonoverlapping(scratch, buf.add(buf_pos), remaining);
+            *bytes_read += sector_size as u64;
+            break;
+        } else {
+            sector_size
+        };
+        if !(call_table.read_input_sector)(device_idx, sector, buf.add(buf_pos), sector_size) {
+            return false;
+        }
+        *bytes_read += sector_size as u64;
+        buf_pos += copy_len;
+        sector += 1;
+        remaining -= copy_len;
     }
     true
 }
@@ -1814,8 +1848,26 @@ pub unsafe fn read_chain_virtual_cluster(
                     }
                     Some(BlockLookup::Allocated { host_byte_offset }) => {
                         // host_byte_offset already includes the
-                        // intra-block offset from block_lookup()
-                        return read_cluster_sectors(
+                        // intra-block offset from block_lookup().
+                        // VHD data may start mid-sector when the
+                        // device sector size is larger than 512
+                        // bytes (the bitmap + data layout uses
+                        // 512-byte sector addressing).
+                        let intra_sector = (host_byte_offset % sector_size as u64) as usize;
+                        if intra_sector == 0 {
+                            return read_cluster_sectors(
+                                call_table,
+                                dev_idx as u32,
+                                host_byte_offset,
+                                buf,
+                                chunk_size,
+                                sector_size,
+                                bytes_read,
+                            );
+                        }
+                        // Sub-sector offset: read each sector and
+                        // copy the relevant portion into buf.
+                        return read_offset_sectors(
                             call_table,
                             dev_idx as u32,
                             host_byte_offset,

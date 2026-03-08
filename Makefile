@@ -60,7 +60,7 @@ help:
 	@echo "  test                 Run all tests (Rust unit + Python integration)"
 	@echo "  test-rust            Run Rust unit tests only"
 	@echo "  test-integration     Run Python integration tests only (on host)"
-	@echo "  test-container       Run tests inside container (consistent env)"
+	@echo "  test-container       Run tests inside container"
 	@echo "  test-ci              Run CI-suitable tests (safe + caution)"
 	@echo "  test-malicious       Run all tests including malicious images"
 	@echo "  test-report          Show test differences without failing"
@@ -415,8 +415,11 @@ test-container: imago-devcontainer imago
 			echo "Setting up test environment..."; \
 			python3 -m venv /build/test-venv && \
 			/build/test-venv/bin/pip install -q -r tests/requirements.txt && \
-			echo "Running tests..."; \
-			cd tests && /build/test-venv/bin/stestr run --exclude-regex test_info_malicious \
+			echo "Running tests (excluding test_info_malicious)..."; \
+			cd tests && \
+			/build/test-venv/bin/stestr run \
+				--exclude-regex "test_info_malicious" \
+				--concurrency 4 \
 		'
 
 # Run CI-suitable tests (safe + caution)
