@@ -3301,3 +3301,119 @@ class TestConvertVhdToQcow2Roundtrip(ImagoTestBase):
     def test_virtualpc_vhd_qcow2_roundtrip(self):
         """VHD (Virtual PC) -> QCOW2 -> raw round-trip."""
         self._test_vhd_qcow2_roundtrip('virtualpc-vhd')
+
+
+class TestConvertEncryptedQcow2(ImagoTestBase):
+    """Test conversion of AES-encrypted QCOW2 images."""
+
+    def test_convert_encrypted_aes_to_raw(self):
+        """Convert AES-encrypted QCOW2 to raw with password."""
+        image = self.get_image('qcow2-encrypted-aes')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.raw') as raw_out, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as qemu_raw:
+            # Convert with imago using password
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(raw_out.name),
+                qcow2_password='testpass'
+            )
+            self.assertEqual(
+                rc, 0,
+                f'Encrypted convert failed: {stderr}'
+            )
+
+            # Convert with qemu-img for baseline
+            subprocess.run(
+                [
+                    'qemu-img', 'convert',
+                    '--object',
+                    'secret,id=sec0,data=testpass',
+                    '--image-opts',
+                    'driver=qcow2,encrypt.key-secret=sec0,'
+                    'file.driver=file,'
+                    f'file.filename={image.path}',
+                    '-O', 'raw',
+                    qemu_raw.name,
+                ],
+                capture_output=True, text=True,
+                timeout=30, check=True
+            )
+
+            # Compare outputs
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(raw_out.name),
+                Path(qemu_raw.name)
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Output differs from qemu-img: '
+                f'{cmp_out}'
+            )
+
+    def test_convert_encrypted_without_password(self):
+        """Converting encrypted QCOW2 without password
+        should fail or produce wrong output."""
+        image = self.get_image('qcow2-encrypted-aes')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.raw') as raw_out:
+            # Convert without password - should still
+            # produce output but data will be encrypted
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(raw_out.name)
+            )
+            # The conversion may succeed (data is just
+            # not decrypted) or fail - either is acceptable
+            # as long as it doesn't crash
+            self.assertIn(
+                rc, [0, 1],
+                f'Unexpected crash: {stderr}'
+            )
+
+    def test_convert_encrypted_wrong_password(self):
+        """Converting with wrong password should produce
+        different output than correct password."""
+        image = self.get_image('qcow2-encrypted-aes')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.raw') as correct_raw, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as wrong_raw:
+            # Convert with correct password
+            _, _, rc1 = self.run_imago_convert(
+                image.path, Path(correct_raw.name),
+                qcow2_password='testpass'
+            )
+            self.assertEqual(rc1, 0)
+
+            # Convert with wrong password
+            _, _, rc2 = self.run_imago_convert(
+                image.path, Path(wrong_raw.name),
+                qcow2_password='wrongpass'
+            )
+            self.assertEqual(rc2, 0)
+
+            # Outputs should differ
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(correct_raw.name),
+                Path(wrong_raw.name)
+            )
+            self.assertNotEqual(
+                cmp_rc, 0,
+                'Wrong password produced same output '
+                'as correct password'
+            )

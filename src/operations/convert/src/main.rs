@@ -152,6 +152,17 @@ pub unsafe extern "C" fn _start() -> u64 {
         }
     }
 
+    // Construct AES key from passphrase if provided (for QCOW2 crypt_method=1)
+    let aes_key: Option<[u8; 16]> = if config.has_passphrase() {
+        let mut key = [0u8; 16];
+        let pass = config.passphrase_bytes();
+        let copy_len = if pass.len() < 16 { pass.len() } else { 16 };
+        key[..copy_len].copy_from_slice(&pass[..copy_len]);
+        Some(key)
+    } else {
+        None
+    };
+
     // Dispatch based on target format
     let target = config.target_format();
     match target {
@@ -166,6 +177,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                     virtual_size,
                     sector_size,
                     skip_zeros,
+                    aes_key.as_ref(),
                     &mut bytes_read,
                 )
             } else {
@@ -178,6 +190,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                     virtual_size,
                     sector_size,
                     skip_zeros,
+                    aes_key.as_ref(),
                     &mut bytes_read,
                 )
             }
@@ -192,6 +205,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                     virtual_size,
                     sector_size,
                     skip_zeros,
+                    aes_key.as_ref(),
                     &mut bytes_read,
                 )
             } else {
@@ -203,6 +217,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                     virtual_size,
                     sector_size,
                     skip_zeros,
+                    aes_key.as_ref(),
                     &mut bytes_read,
                 )
             }
@@ -215,6 +230,7 @@ pub unsafe extern "C" fn _start() -> u64 {
             virtual_size,
             sector_size,
             skip_zeros,
+            aes_key.as_ref(),
             &mut bytes_read,
         ),
         ImageFormat::Vhdx => convert_to_vhdx(
@@ -225,6 +241,7 @@ pub unsafe extern "C" fn _start() -> u64 {
             virtual_size,
             sector_size,
             skip_zeros,
+            aes_key.as_ref(),
             &mut bytes_read,
         ),
         _ => convert_to_raw(
@@ -235,6 +252,7 @@ pub unsafe extern "C" fn _start() -> u64 {
             virtual_size,
             sector_size,
             skip_zeros,
+            aes_key.as_ref(),
             &mut bytes_read,
         ),
     }
@@ -252,6 +270,7 @@ unsafe fn convert_to_raw(
     virtual_size: u64,
     sector_size: usize,
     skip_zeros: bool,
+    aes_key: Option<&[u8; 16]>,
     bytes_read: &mut u64,
 ) -> u64 {
     let output_sector_size = (call_table.get_output_sector_size)();
@@ -314,6 +333,7 @@ unsafe fn convert_to_raw(
             BUF_COMPRESSED_IN as *mut u8,
             staging_buf,
             &mut staging_cluster_offset,
+            aes_key,
             bytes_read,
         ) {
             (call_table.send_error)(
@@ -727,6 +747,7 @@ unsafe fn convert_to_qcow2(
     virtual_size: u64,
     sector_size: usize,
     skip_zeros: bool,
+    aes_key: Option<&[u8; 16]>,
     bytes_read: &mut u64,
 ) -> u64 {
     let layout = match init_qcow2_output_layout(
@@ -792,6 +813,7 @@ unsafe fn convert_to_qcow2(
                 BUF_COMPRESSED_IN as *mut u8,
                 staging_buf,
                 &mut staging_cluster_offset,
+                aes_key,
                 bytes_read,
             ) {
                 (call_table.send_error)(
@@ -1002,6 +1024,7 @@ unsafe fn convert_to_qcow2_compressed(
     virtual_size: u64,
     sector_size: usize,
     skip_zeros: bool,
+    aes_key: Option<&[u8; 16]>,
     bytes_read: &mut u64,
 ) -> u64 {
     let layout = match init_qcow2_output_layout(
@@ -1090,6 +1113,7 @@ unsafe fn convert_to_qcow2_compressed(
                 BUF_COMPRESSED_IN as *mut u8,
                 staging_buf,
                 &mut staging_cluster_offset,
+                aes_key,
                 bytes_read,
             ) {
                 (call_table.send_error)(
@@ -1400,6 +1424,7 @@ unsafe fn convert_to_vmdk(
     virtual_size: u64,
     sector_size: usize,
     skip_zeros: bool,
+    aes_key: Option<&[u8; 16]>,
     bytes_read: &mut u64,
 ) -> u64 {
     let layout =
@@ -1467,6 +1492,7 @@ unsafe fn convert_to_vmdk(
                 BUF_COMPRESSED_IN as *mut u8,
                 staging_buf,
                 &mut staging_cluster_offset,
+                aes_key,
                 bytes_read,
             ) {
                 (call_table.send_error)(
@@ -1658,6 +1684,7 @@ unsafe fn convert_to_vmdk_compressed(
     virtual_size: u64,
     sector_size: usize,
     skip_zeros: bool,
+    aes_key: Option<&[u8; 16]>,
     bytes_read: &mut u64,
 ) -> u64 {
     let layout =
@@ -1738,6 +1765,7 @@ unsafe fn convert_to_vmdk_compressed(
                 BUF_COMPRESSED_IN as *mut u8,
                 staging_buf,
                 &mut staging_cluster_offset,
+                aes_key,
                 bytes_read,
             ) {
                 (call_table.send_error)(
@@ -2038,6 +2066,7 @@ unsafe fn convert_to_vhd(
     virtual_size: u64,
     sector_size: usize,
     skip_zeros: bool,
+    aes_key: Option<&[u8; 16]>,
     bytes_read: &mut u64,
 ) -> u64 {
     let oss = (call_table.get_output_sector_size)();
@@ -2209,6 +2238,7 @@ unsafe fn convert_to_vhd(
                 BUF_COMPRESSED_IN as *mut u8,
                 staging_buf,
                 &mut staging_cluster_offset,
+                aes_key,
                 bytes_read,
             ) {
                 (call_table.send_error)(
@@ -2313,6 +2343,7 @@ unsafe fn convert_to_vhd(
                     BUF_COMPRESSED_IN as *mut u8,
                     staging_buf,
                     &mut staging_cluster_offset,
+                    aes_key,
                     bytes_read,
                 ) {
                     (call_table.send_error)(
@@ -2444,6 +2475,7 @@ unsafe fn convert_to_vhdx(
     virtual_size: u64,
     sector_size: usize,
     skip_zeros: bool,
+    aes_key: Option<&[u8; 16]>,
     bytes_read: &mut u64,
 ) -> u64 {
     let oss = (call_table.get_output_sector_size)();
@@ -2736,6 +2768,7 @@ unsafe fn convert_to_vhdx(
                 BUF_COMPRESSED_IN as *mut u8,
                 staging_buf,
                 &mut staging_cluster_offset,
+                aes_key,
                 bytes_read,
             ) {
                 (call_table.send_error)(
@@ -2802,6 +2835,7 @@ unsafe fn convert_to_vhdx(
                 BUF_COMPRESSED_IN as *mut u8,
                 staging_buf,
                 &mut staging_cluster_offset,
+                aes_key,
                 bytes_read,
             ) {
                 (call_table.send_error)(
