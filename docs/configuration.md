@@ -129,7 +129,8 @@ imago info --format=qcow2 image.qcow2
 |------|-------------|
 | `-O FORMAT` / `--output-format=FORMAT` | Output format (raw, qcow2) |
 | `-c` / `--compress` | Enable zlib compression for QCOW2 output |
-| `-S` / `--sparse` | Skip writing zero-filled clusters (raw output) |
+| `-S` / `--skip-zeros` | Skip writing zero-filled clusters (default, sparse output) |
+| `--no-skip-zeros` | Write all clusters including zeros (dense output) |
 | `--cluster-size=N` | Output cluster size for QCOW2 (512 to 65536, default 65536) |
 | `-p N` / `--progress=N` | Report progress every N seconds |
 
@@ -147,6 +148,26 @@ imago convert -c -O qcow2 input.raw output.qcow2
 # Requires -O qcow2 (compression only applies to QCOW2 output)
 imago convert -c input.raw output.raw  # Error: -c requires -O qcow2
 ```
+
+#### `-S` / `--skip-zeros` (default)
+
+Skips writing zero-filled clusters to the output, producing a sparse file.
+This is enabled by default, matching `qemu-img convert` behavior. The
+default can be overridden via the config file:
+
+```toml
+[convert]
+sparse = false  # Disable sparse output by default
+```
+
+Resolution order (first match wins):
+1. `--no-skip-zeros` on the command line (forces dense output)
+2. `--skip-zeros` / `-S` on the command line (forces sparse output)
+3. `convert.sparse` in the config file
+4. Default: `true` (sparse output)
+
+For raw output, the output file is truncated to the image's virtual size
+after conversion so the apparent file size matches the source image.
 
 ### Compare Options
 

@@ -9,7 +9,10 @@
 // no_std), so cached-read helpers inherently need many parameters.
 #![allow(clippy::too_many_arguments)]
 
-use shared::{CallTable, VmdkInfo, MAX_SECTOR_SIZE};
+use shared::{
+    le_u16, le_u32, le_u64, write_le_u16, write_le_u32, write_le_u64, CallTable, VmdkInfo,
+    MAX_SECTOR_SIZE,
+};
 
 // ============================================================================
 // VMDK4 binary header offsets (all little-endian)
@@ -91,59 +94,6 @@ pub const MARKER_FOOTER: u32 = 3;
 
 /// Size of a metadata marker (one sector).
 pub const METADATA_MARKER_SIZE: usize = 512;
-
-// ============================================================================
-// Byte-order helpers
-// ============================================================================
-
-/// Read a little-endian u16 from a byte slice.
-#[inline]
-fn le_u16(buf: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes([buf[off], buf[off + 1]])
-}
-
-/// Read a little-endian u32 from a byte slice.
-#[inline]
-fn le_u32(buf: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
-}
-
-/// Read a little-endian u64 from a byte slice.
-#[inline]
-fn le_u64(buf: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes([
-        buf[off],
-        buf[off + 1],
-        buf[off + 2],
-        buf[off + 3],
-        buf[off + 4],
-        buf[off + 5],
-        buf[off + 6],
-        buf[off + 7],
-    ])
-}
-
-// ============================================================================
-// Write helpers (little-endian)
-// ============================================================================
-
-/// Write a little-endian u16 to a byte slice.
-#[inline]
-pub fn write_le_u16(buf: &mut [u8], off: usize, val: u16) {
-    buf[off..off + 2].copy_from_slice(&val.to_le_bytes());
-}
-
-/// Write a little-endian u32 to a byte slice.
-#[inline]
-pub fn write_le_u32(buf: &mut [u8], off: usize, val: u32) {
-    buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
-}
-
-/// Write a little-endian u64 to a byte slice.
-#[inline]
-pub fn write_le_u64(buf: &mut [u8], off: usize, val: u64) {
-    buf[off..off + 8].copy_from_slice(&val.to_le_bytes());
-}
 
 // ============================================================================
 // Header and descriptor builders (VMDK output)

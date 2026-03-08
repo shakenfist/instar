@@ -14,6 +14,8 @@ format support and cross-tool validation work.
 - Phase 11: oslo.utils format_inspector cross-validation testing.
 - Phase 12: LUKS container inspection (inner format detection with
   passphrase).
+- Phase 14: Byte-order consolidation & VHD integration tests.
+- Phase 15: Test coverage gaps & minor optimizations.
 
 ---
 
@@ -295,11 +297,8 @@ Implemented full VHDX support in 5 sub-phases:
 
 ### Refactoring Opportunities (not blocking, future improvement)
 
-17. **Byte-order helper duplication grows** — VHDX adds LE helpers
-    (`le_u16`/`le_u32`/`le_u64`, `write_le_*`) duplicating the
-    pattern from VHD's LE and QCOW2/VMDK's BE helpers. All format
-    crates have ~20 lines of identical byte-order helpers. Still
-    not blocking — same recommendation as item 11.
+17. **Byte-order helper duplication grows** — DONE (Phase 14a,
+    same as item 11). All helpers consolidated in shared crate.
 
 18. **Two-pass zero check in convert_to_vhdx** — Same pattern as
     item 12 (VHD). Each 32 MiB VHDX block is read twice when
@@ -498,10 +497,8 @@ Phase 9 (VHD) is complete. All sub-phases 9a-9e committed.
 
 ### Refactoring Opportunities (not blocking, future improvement)
 
-11. **Byte-order helper duplication** — `be_u16`/`be_u32`/`be_u64`
-    and `write_be_*` helpers are duplicated across qcow2, vmdk,
-    and vhd crates (~130 lines total). Could be moved to shared
-    crate. Pre-existing pattern; VHD followed the convention.
+11. **Byte-order helper duplication** — DONE (Phase 14a). Moved all
+    12 helpers to shared crate, updated ~30 call sites.
 
 12. **Two-pass zero check in convert_to_vhd** — When skip-zeros
     is enabled, VHD output reads each 2 MiB block twice: once to
@@ -513,15 +510,12 @@ Phase 9 (VHD) is complete. All sub-phases 9a-9e committed.
 
 ### Test Gaps (Phase 9)
 
-13. **No VHD convert integration tests** — No tests for VHD→raw,
-    raw→VHD, QCOW2→VHD, or VHD→QCOW2 conversion round-trips.
-    VMDK has full round-trip coverage (TestConvertVmdkToRaw,
-    TestConvertToVmdk, TestConvertVmdkToQcow2Roundtrip,
-    TestConvertVmdkCheckOutput). VHD needs equivalent tests.
+13. **No VHD convert integration tests** — DONE (Phase 14b-14d).
+    Added TestConvertVhdToRaw, TestConvertToVhd,
+    TestConvertVhdCheckOutput, TestConvertVhdToQcow2Roundtrip.
 
-14. **No VHD compare integration tests** — No tests comparing
-    VHD vs raw equivalence after conversion. VMDK has
-    TestConvertVmdkCompare for this.
+14. **No VHD compare integration tests** — DONE (Phase 14d).
+    Added TestConvertVhdCompare.
 
 15. **No fixed VHD test image** — All VHD test images are
     dynamic. No fixed VHD (disk_type=2) test image exists.
@@ -552,9 +546,12 @@ Phase 9 (VHD) is complete. All sub-phases 9a-9e committed.
    `run_in_ci=false` (not available in CI). Consider making them available
    or adding local-only tests.
 
-5. **Security test placeholders** — `test_imago_handles_vmdk_descriptor_safely`
-   and `test_imago_does_not_follow_external_data` are SKIPPED with "not yet
-   implemented". These need the security test framework to be built out.
+5. **Security test placeholders** — `test_imago_does_not_follow_external_data`
+   DONE (Phase 13d, implemented as two tests:
+   `test_imago_reports_external_data_file_without_reading_content` and
+   `test_imago_reports_external_data_file_in_json`).
+   `test_imago_handles_vmdk_descriptor_safely` remains SKIPPED — needs
+   VMDK descriptor extent parsing and the vmdk-path-traversal test image.
 
 6. **Multi-extent VMDK tests** — No test images exercise the multi-extent
    detection and error path. Would need a multi-extent test image.
@@ -588,6 +585,49 @@ Gerrit review 978095 and related changes show oslo.utils is adding:
   matching oslo.utils ContainerFileInspector functionality.
 - The GPT/MBR safety check reorganization may change oslo.utils
   output format; monitor for test compatibility impact.
+
+## Phase 14: Byte-Order Consolidation & VHD Integration Tests ✓
+
+Consolidate duplicate byte-order helpers from format crates into the
+shared crate, add comprehensive VHD integration tests, and fix VHD
+sector alignment bugs discovered during testing.
+
+### 14a: Byte-order helper consolidation ✓
+
+Moved all 12 byte-order helpers (`be_u16/32/64`, `le_u16/32/64`,
+`write_be_u16/32/64`, `write_le_u16/32/64`) from qcow2, vhd, vhdx,
+and vmdk crates into `src/shared/src/lib.rs`. Updated ~30 call sites
+in the convert operation. Eliminates ~120 lines of duplication.
+
+### 14b: VHD-to-raw conversion tests ✓
+
+Added `TestConvertVhdToRaw` class testing conversion of hyperv-dynamic,
+virtualpc, and d2v-zerofilled VHD images to raw with qemu-img
+cross-validation.
+
+### 14c: VHD round-trip and check-output tests ✓
+
+Added `TestConvertToVhd` (raw/qcow2/VHD → VHD → raw round-trip) and
+`TestConvertVhdCheckOutput` (structural integrity of imago-produced VHD).
+
+### 14d: VHD compare and cross-format round-trip tests ✓
+
+Added `TestConvertVhdCompare` (VHD vs raw baseline) and
+`TestConvertVhdToQcow2Roundtrip` (VHD → QCOW2 → raw). All tests
+include temp space checks for large images.
+
+### 14e: Bug fixes discovered during testing ✓
+
+- **VHD read sector alignment**: VHD BAT entries use 512-byte sector
+  addressing, but the device sector size can be 65536 bytes. Added
+  `read_offset_sectors()` to handle sub-sector-aligned reads for VHD
+  data that starts mid-sector.
+- **VHD write sector alignment**: When writing VHD output, the bitmap
+  (512 bytes) and data share the same output sector (65536 bytes).
+  Separate writes clobbered each other. Fixed with carry-buffer approach
+  that assembles bitmap+data into sector-aligned writes using a read
+  buffer for input I/O and a carry buffer for the 512-byte leftover
+  between output sectors.
 
 ## Deferred Work (from Phase 12 review)
 

@@ -54,7 +54,7 @@ The `imago convert` operation supports writing output in the following formats:
 
 | Output Format | Status | Key Features |
 |---------------|--------|--------------|
-| **raw** (default) | Supported | Flat byte-for-byte output, sparse output with `-S` |
+| **raw** (default) | Supported | Flat byte-for-byte output, sparse by default (`--no-skip-zeros` for dense) |
 | **qcow2** | Supported | QCOW2 v3, 16-bit refcounts, configurable cluster size (512B-64KB), optional zlib compression (`-c`) |
 | **vmdk** | Supported | monolithicSparse (default), streamOptimized with `-c` (DEFLATE compressed) |
 | **vpc** (VHD) | Supported | Dynamic VHD with 2 MiB blocks, BAT-based allocation, skip-zeros support |
