@@ -1523,3 +1523,68 @@ class TestCheckVhdFixed(ImagoTestBase):
             result.get('corruptions', 0), 0,
             f'No corruptions expected: {stderr}'
         )
+
+
+class TestCheckVmdkMultiExtent(ImagoTestBase):
+    """Tests for check operation with multi-extent VMDK."""
+
+    def test_check_vmdk_multi_extent_detected(self):
+        """Check detects multi-extent VMDK as vmdk format."""
+        image = self.get_image('vmdk-multi-extent')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+
+        stdout, stderr, rc = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('format', '').lower(), 'vmdk',
+            f'Expected vmdk format: {stdout}'
+        )
+
+    def test_check_vmdk_multi_extent_not_supported(self):
+        """Check reports not-supported for multi-extent VMDK.
+
+        Multi-extent VMDKs trigger FLAG_NOT_SUPPORTED in check, which
+        causes early return with 0 clusters checked. In human output
+        this prints "does not support checks".
+        """
+        image = self.get_image('vmdk-multi-extent')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+
+        # JSON output: early bail means 0 clusters checked
+        stdout, stderr, rc = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('total-clusters', -1), 0,
+            f'Multi-extent VMDK should bail early with 0 clusters: {stdout}'
+        )
+
+        # Human output: "does not support checks"
+        stdout_h, stderr_h, rc_h = self.run_imago_check(
+            image.path, output_format='human'
+        )
+        self.assertIn(
+            'does not support checks', stdout_h.lower(),
+            f'Expected not-supported message: {stdout_h}'
+        )
+
+    def test_info_vmdk_multi_extent_format(self):
+        """Info detects multi-extent VMDK as vmdk format."""
+        image = self.get_image('vmdk-multi-extent')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+
+        stdout, stderr, rc = self.run_imago_info(image.path)
+        self.assertEqual(
+            0, rc,
+            f'info should succeed for multi-extent VMDK: {stderr}'
+        )
+        self.assertIn(
+            'vmdk', stdout.lower(),
+            f'Expected vmdk format: {stdout}'
+        )
