@@ -257,7 +257,9 @@ QEMU Copy-On-Write version 2/3. Supported features:
 - Extended L2 entries (16-byte with subcluster bitmaps)
 - Incompatible feature bit validation
 - External data files (metadata/data separation, chain discovery with allowlist)
-- Not yet supported: encryption (QCOW2-native), snapshots
+- Legacy AES-128-CBC encryption (crypt_method=1) decryption via `--qcow2-password`
+- Snapshot table parsing, detection, and extraction via `--snapshot`
+- Not yet supported: LUKS-in-QCOW2 encryption (crypt_method=2)
 
 ### raw
 
