@@ -7,7 +7,8 @@
 # Default output: ../imago-testdata/custom/format-coverage/
 #
 # Creates:
-#   vhd-fixed.vhd  - 10 MiB fixed VHD (disk_type=2)
+#   vhd-fixed.vhd         - 10 MiB fixed VHD (disk_type=2)
+#   vhd-differencing.vhd  - Differencing VHD (disk_type=4)
 
 set -euo pipefail
 
@@ -131,5 +132,55 @@ with open(path, "wb") as f:
 
 print(f"  Created {path} ({os.path.getsize(path)} bytes)")
 ' "$OUTDIR"
+
+# --- Differencing VHD (disk_type=4) ---
+#
+# qemu-img does not support creating differencing VHDs directly.
+# Strategy: create a dynamic VHD, then patch disk_type from 3 to 4
+# in both the copy footer (sector 0) and the real footer (last 512
+# bytes), recomputing checksums. This exercises DISK_TYPE_DIFFERENCING
+# acceptance in VhdState::init().
+
+echo "  Creating vhd-differencing.vhd..."
+qemu-img create -f vpc -o subformat=dynamic \
+    "$OUTDIR/vhd-differencing.vhd" 10M >/dev/null 2>&1
+
+# Write some data so the BAT has allocated blocks
+qemu-io -f vpc -c "write -P 0xCD 2097152 512" \
+    "$OUTDIR/vhd-differencing.vhd" >/dev/null 2>&1
+
+# Patch disk_type from 3 (dynamic) to 4 (differencing) in both footers
+python3 -c '
+import struct, sys, os
+
+path = sys.argv[1]
+
+def patch_footer_at(data, offset):
+    """Patch disk_type to 4 and recompute checksum at given offset."""
+    # disk_type is at footer+60 (big-endian u32)
+    struct.pack_into(">I", data, offset + 60, 4)
+    # Zero out checksum field before recomputing
+    struct.pack_into(">I", data, offset + 64, 0)
+    # Compute ones-complement checksum over 512-byte footer
+    total = 0
+    for i in range(512):
+        total = (total + data[offset + i]) & 0xFFFFFFFF
+    checksum = (~total) & 0xFFFFFFFF
+    struct.pack_into(">I", data, offset + 64, checksum)
+
+with open(path, "r+b") as f:
+    data = bytearray(f.read())
+
+    # Patch copy footer at sector 0
+    patch_footer_at(data, 0)
+
+    # Patch real footer at last 512 bytes
+    patch_footer_at(data, len(data) - 512)
+
+    f.seek(0)
+    f.write(data)
+
+print(f"  Patched {path} to disk_type=4 ({os.path.getsize(path)} bytes)")
+' "$OUTDIR/vhd-differencing.vhd"
 
 echo "Done. Verify with: qemu-img info $OUTDIR/vhd-fixed.vhd"
