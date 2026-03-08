@@ -29,7 +29,7 @@ shared::bump_allocator!();
 use shared::{
     validate_call_table, verify_sector_sizes, CallTable, ChainConfig, CompareConfig, CompareResult,
     ImageFormat, ALLOC_HEAP_BASE, CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR, COMPRESSED_BUF_SIZE,
-    MAX_CHAIN_DEVICES, MAX_SECTOR_SIZE, OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE,
+    MAX_CHAIN_DEVICES, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE, OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE,
 };
 
 // Scratch memory layout for compare operation.
@@ -44,8 +44,9 @@ const BUF_COMPRESSED_IN: usize = BUF_COMPARE_2 + MAX_SECTOR_SIZE;
 // Dynamic region: L1/L2 caches for QCOW2 devices (2 × MAX_SECTOR_SIZE per device)
 const DYNAMIC_BUFS_START: usize = BUF_COMPRESSED_IN + COMPRESSED_BUF_SIZE;
 const _: () = assert!(
-    DYNAMIC_BUFS_START + MAX_CHAIN_DEVICES * 2 * MAX_SECTOR_SIZE <= ALLOC_HEAP_BASE,
-    "Scratch memory too small for MAX_CHAIN_DEVICES L1/L2 caches"
+    DYNAMIC_BUFS_START + MAX_CHAIN_DEVICES * 2 * MAX_SECTOR_SIZE + MAX_CLUSTER_SIZE
+        <= ALLOC_HEAP_BASE,
+    "Scratch memory too small for L1/L2 caches + staging buffer"
 );
 
 /// Describes the format and key parameters for one image (top of its chain).
@@ -240,6 +241,12 @@ pub unsafe extern "C" fn _start() -> u64 {
     let buf1 = BUF_COMPARE_1 as *mut u8;
     let buf2 = BUF_COMPARE_2 as *mut u8;
 
+    // Staging buffer for decompressing clusters larger than chunk_size (>64KB).
+    // Placed after L1/L2 caches in scratch memory.
+    let staging_buf_addr = DYNAMIC_BUFS_START + total_devices * 2 * MAX_SECTOR_SIZE;
+    let staging_buf = staging_buf_addr as *mut u8;
+    let mut staging_cluster_offset: u64 = u64::MAX;
+
     (call_table.verbose_print)(b"compare: comparing virtual content\n\0".as_ptr());
 
     let mut mismatch_found = false;
@@ -269,6 +276,8 @@ pub unsafe extern "C" fn _start() -> u64 {
             chain_config,
             &mut chain_states,
             BUF_COMPRESSED_IN as *mut u8,
+            staging_buf,
+            &mut staging_cluster_offset,
             &mut bytes_read,
         ) {
             (call_table.send_error)(
@@ -298,6 +307,8 @@ pub unsafe extern "C" fn _start() -> u64 {
             chain_config,
             &mut chain_states,
             BUF_COMPRESSED_IN as *mut u8,
+            staging_buf,
+            &mut staging_cluster_offset,
             &mut bytes_read,
         ) {
             (call_table.send_error)(
@@ -374,6 +385,8 @@ pub unsafe extern "C" fn _start() -> u64 {
                     chain_config,
                     &mut chain_states,
                     BUF_COMPRESSED_IN as *mut u8,
+                    staging_buf,
+                    &mut staging_cluster_offset,
                     &mut bytes_read,
                 ) {
                     // I/O error: treat as mismatch
