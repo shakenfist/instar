@@ -124,7 +124,7 @@ The `imago convert` operation supports writing output in the following formats:
 | grain table bounds | GT offsets within file | N/A | Validated per GD entry | plaso-vmdk, vmdk-multi-partition |
 | grain data bounds | Grain offsets within file | N/A | Validated per GTE | plaso-vmdk, vmdk-multi-partition |
 | grain overlap | Two grains at same offset | N/A | 1-bit-per-grain bitmap | plaso-vmdk, vmdk-multi-partition |
-| multi-extent detection | Multiple extents in descriptor | N/A | Reports FLAG_NOT_SUPPORTED | (none - no multi-extent test image) |
+| multi-extent detection | Multiple extents in descriptor | N/A | Reports FLAG_NOT_SUPPORTED | vmdk-multi-extent |
 | fragmentation | Non-sequential grain layout | N/A | Reports fragmentation count | plaso-vmdk, vmdk-multi-partition |
 
 ### RAW/Partition Table Safety Checks
@@ -182,7 +182,7 @@ The `imago convert` operation supports writing output in the following formats:
 | qcow2-external-data-file | External data file feature | malicious | CVE-2024-32498 |
 | qcow2-unknown-features | Unknown feature bit set | malicious | Unknown features |
 
-#### VMDK Images (7)
+#### VMDK Images (8)
 
 | Image ID | Description | Safety | Key Features |
 |----------|-------------|--------|--------------|
@@ -190,17 +190,20 @@ The `imago convert` operation supports writing output in the following formats:
 | vmdk-multi-partition | Multi-partition VMDK | safe | Multiple partitions |
 | vmdk-streamoptimized | streamOptimized VMDK | safe | OVA/OVF format |
 | vmdk-v3 | VMDK version 3 | safe | Native version 3 |
+| vmdk-multi-extent | Binary VMDK4 with two extent lines | safe | Multi-extent detection |
 | chain-base-vmdk | VMDK base for chain test | safe | Cross-format chain |
 | vmdk-path-traversal | Path traversal in extent | malicious | /etc/passwd reference |
 | vmdk-no-extents | Missing extent declarations | malformed | Invalid descriptor |
 
-#### VHD/VPC Images (4)
+#### VHD/VPC Images (6)
 
 | Image ID | Description | Safety | Key Features |
 |----------|-------------|--------|--------------|
 | hyperv-dynamic-vhd | Hyper-V 2012 R2 VHD | safe | Dynamic allocation |
 | virtualpc-vhd | Virtual PC VHD | safe | Different creator |
 | vhd-d2v-zerofilled | Disk2VHD zerofilled VHD | safe | Zerofilled |
+| vhd-fixed | Fixed VHD (disk_type=2) | safe | Fixed allocation |
+| vhd-differencing | Differencing VHD (disk_type=4) | safe | Differencing type |
 | afl-vhd-max-table-entries | AFL-discovered malformed | malformed | Error handling |
 
 #### VHDX Images (2)
