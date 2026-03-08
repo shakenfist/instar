@@ -2172,6 +2172,7 @@ unsafe fn convert_to_vhd(
 
             if !is_all_zeros_ptr(buf_data, this_chunk as usize) {
                 block_all_zeros = false;
+                break;
             }
 
             intra_offset += this_chunk;
@@ -2688,6 +2689,7 @@ unsafe fn convert_to_vhdx(
 
             if !is_all_zeros_ptr(buf_data, this_chunk as usize) {
                 block_all_zeros = false;
+                break;
             }
 
             intra_offset += this_chunk;
