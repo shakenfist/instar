@@ -77,6 +77,7 @@ message Qcow2Info {
   bool extended_l2 = 6;
   string backing_format = 7;   // Backing file format (from header extension)
   bool dirty = 8;              // Image not cleanly closed
+  uint32 nb_snapshots = 9;     // Number of snapshots in snapshot table
 }
 
 // VMDK format-specific information

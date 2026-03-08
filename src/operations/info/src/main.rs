@@ -761,6 +761,12 @@ unsafe fn parse_qcow2_header(
         result.flags |= InfoResult::FLAG_ENCRYPTED;
     }
 
+    if hdr.nb_snapshots > 0 {
+        result.flags |= InfoResult::FLAG_HAS_SNAPSHOTS;
+        qcow2_info.nb_snapshots = hdr.nb_snapshots;
+        (call_table.verbose_print)(b"info: image has snapshots\n\0".as_ptr());
+    }
+
     // Read backing file path using shared crate
     if hdr.backing_file_offset != 0 && hdr.backing_file_size > 0 {
         result.flags |= InfoResult::FLAG_HAS_BACKING_FILE;

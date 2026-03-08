@@ -502,6 +502,7 @@ class ImagoTestBase(testtools.TestCase):
         cluster_size: int = None,
         compress: bool = False,
         qcow2_password: str = None,
+        snapshot: str = None,
     ) -> tuple:
         """
         Run imago convert on an image.
@@ -516,6 +517,7 @@ class ImagoTestBase(testtools.TestCase):
             cluster_size: Output cluster size (qcow2 only)
             compress: Compress data clusters (qcow2 only)
             qcow2_password: Password for AES-encrypted QCOW2
+            snapshot: Snapshot ID or name to extract
 
         Returns:
             tuple: (stdout, stderr, return_code)
@@ -536,6 +538,8 @@ class ImagoTestBase(testtools.TestCase):
             cmd.append('--compress')
         if qcow2_password is not None:
             cmd.extend(['--qcow2-password', qcow2_password])
+        if snapshot is not None:
+            cmd.extend(['--snapshot', snapshot])
         cmd.extend([str(input_path), str(output_path)])
 
         try:

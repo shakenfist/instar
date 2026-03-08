@@ -784,6 +784,17 @@
             "tags": ["qcow2", "check-validation", "leak"]
         },
         {
+            "id": "qcow2-snapshots",
+            "path": "custom/format-coverage/qcow2-snapshots.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "QCOW2 with 2 internal snapshots (snap1=0xAA, snap2=0xBB, active=0xCC)",
+            "tags": ["qcow2", "snapshots", "format-coverage"],
+            "generated_by": "scripts/create-qcow2-snapshot-testdata.sh"
+        },
+        {
             "id": "qcow2-encrypted-aes",
             "path": "custom/format-coverage/qcow2-encrypted-aes.qcow2",
             "format": "qcow2",

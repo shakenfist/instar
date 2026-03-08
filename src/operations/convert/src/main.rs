@@ -163,6 +163,94 @@ pub unsafe extern "C" fn _start() -> u64 {
         None
     };
 
+    // If a snapshot ID was specified, find the snapshot and override L1 table
+    if config.has_snapshot_id() {
+        let snap_id = config.snapshot_id_bytes();
+        // The top-of-chain device must be QCOW2 with snapshots
+        if let Some(ref mut qcow2_state) = chain_states.qcow2_states[0] {
+            // Read nb_snapshots and snapshots_offset from header
+            let nb_snapshots = match qcow2::read_u32_be_cached(
+                call_table,
+                0,
+                qcow2::NB_SNAPSHOTS_OFFSET as u64,
+                sector_size,
+                (call_table.get_input_capacity)(0),
+                &mut qcow2_state.l1_cached_sector,
+                qcow2_state.l1_cache_buf,
+                &mut bytes_read,
+            ) {
+                Some(v) => v,
+                None => {
+                    (call_table.debug_print)(
+                        b"convert: failed to read snapshot count\n\0".as_ptr(),
+                    );
+                    (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
+                    return bytes_read;
+                }
+            };
+            let snapshots_offset = match qcow2::read_u64_be_cached(
+                call_table,
+                0,
+                qcow2::SNAPSHOTS_OFFSET_OFFSET as u64,
+                sector_size,
+                (call_table.get_input_capacity)(0),
+                &mut qcow2_state.l1_cached_sector,
+                qcow2_state.l1_cache_buf,
+                &mut bytes_read,
+            ) {
+                Some(v) => v,
+                None => {
+                    (call_table.debug_print)(
+                        b"convert: failed to read snapshot offset\n\0".as_ptr(),
+                    );
+                    (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
+                    return bytes_read;
+                }
+            };
+
+            if nb_snapshots == 0 {
+                (call_table.debug_print)(b"convert: no snapshots in image\n\0".as_ptr());
+                (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
+                return bytes_read;
+            }
+
+            // Use L2 cache buffer as scratch for snapshot parsing
+            let snap_cache = qcow2_state.l2_cache_buf;
+            let snap_table = qcow2::parse_snapshot_table(
+                call_table,
+                0,
+                nb_snapshots,
+                snapshots_offset,
+                sector_size,
+                (call_table.get_input_capacity)(0),
+                snap_cache,
+                &mut bytes_read,
+            );
+            // Invalidate L2 cache since we used it as scratch
+            qcow2_state.l2_cached_sector = u64::MAX;
+
+            match qcow2::find_snapshot(&snap_table, snap_id) {
+                Some(idx) => {
+                    let snap = &snap_table.entries[idx];
+                    qcow2_state.l1_table_offset = snap.l1_table_offset;
+                    qcow2_state.l1_size = snap.l1_size;
+                    // Invalidate L1 cache since we changed L1 table
+                    qcow2_state.l1_cached_sector = u64::MAX;
+                    (call_table.verbose_print)(b"convert: using snapshot L1 table\n\0".as_ptr());
+                }
+                None => {
+                    (call_table.debug_print)(b"convert: snapshot not found\n\0".as_ptr());
+                    (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
+                    return bytes_read;
+                }
+            }
+        } else {
+            (call_table.debug_print)(b"convert: snapshot requires QCOW2 input\n\0".as_ptr());
+            (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
+            return bytes_read;
+        }
+    }
+
     // Dispatch based on target format
     let target = config.target_format();
     match target {

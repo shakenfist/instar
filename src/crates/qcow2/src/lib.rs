@@ -292,6 +292,10 @@ pub struct QcowHeader {
     pub incompatible_features: u64,
     pub compatible_features: u64,
     pub compression_type: u8,
+    /// Number of snapshots in the snapshot table
+    pub nb_snapshots: u32,
+    /// Byte offset of the snapshot table in the file
+    pub snapshots_offset: u64,
     // Derived flags
     pub dirty: bool,
     pub corrupt: bool,
@@ -335,6 +339,8 @@ impl QcowHeader {
         let crypt_method = be_u32(header, CRYPT_METHOD_OFFSET);
         let refcount_table_offset = be_u64(header, REFCOUNT_TABLE_OFFSET_OFFSET);
         let refcount_table_clusters = be_u32(header, REFCOUNT_TABLE_CLUSTERS_OFFSET);
+        let nb_snapshots = be_u32(header, NB_SNAPSHOTS_OFFSET);
+        let snapshots_offset = be_u64(header, SNAPSHOTS_OFFSET_OFFSET);
 
         // v3 specific fields
         let (refcount_bits, incompatible_features, compatible_features, compression_type) =
@@ -369,6 +375,8 @@ impl QcowHeader {
             incompatible_features,
             compatible_features,
             compression_type,
+            nb_snapshots,
+            snapshots_offset,
             dirty: (incompatible_features & INCOMPAT_DIRTY) != 0,
             corrupt: (incompatible_features & INCOMPAT_CORRUPT) != 0,
             has_external_data: (incompatible_features & INCOMPAT_EXTERNAL_DATA) != 0,
@@ -546,6 +554,299 @@ pub unsafe fn read_backing_file(
     // Null terminate
     out_buf[bytes_read] = 0;
     bytes_read
+}
+
+// ============================================================================
+// Snapshot table parsing
+// ============================================================================
+
+/// Maximum number of snapshots we will parse (memory constraint).
+pub const MAX_SNAPSHOTS: usize = 16;
+
+/// Parsed snapshot table entry.
+pub struct SnapshotEntry {
+    /// Byte offset of this snapshot's L1 table
+    pub l1_table_offset: u64,
+    /// Number of entries in this snapshot's L1 table
+    pub l1_size: u32,
+    /// Snapshot ID string length
+    pub id_len: u16,
+    /// Snapshot name string length
+    pub name_len: u16,
+    /// Snapshot ID (null-terminated, max 63 chars)
+    pub id: [u8; 64],
+    /// Snapshot name (null-terminated, max 63 chars)
+    pub name: [u8; 64],
+    /// Creation timestamp (seconds since epoch)
+    pub date_sec: u32,
+    /// VM state size in bytes
+    pub vm_state_size: u32,
+}
+
+impl SnapshotEntry {
+    const fn zeroed() -> Self {
+        Self {
+            l1_table_offset: 0,
+            l1_size: 0,
+            id_len: 0,
+            name_len: 0,
+            id: [0; 64],
+            name: [0; 64],
+            date_sec: 0,
+            vm_state_size: 0,
+        }
+    }
+}
+
+/// Result of parsing the snapshot table.
+pub struct SnapshotTable {
+    /// Number of valid entries
+    pub count: usize,
+    /// Parsed entries (up to MAX_SNAPSHOTS)
+    pub entries: [SnapshotEntry; MAX_SNAPSHOTS],
+}
+
+impl SnapshotTable {
+    const fn empty() -> Self {
+        Self {
+            count: 0,
+            entries: [
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+            ],
+        }
+    }
+}
+
+/// Parse the QCOW2 snapshot table from disk.
+///
+/// Reads variable-length snapshot entries starting at `snapshots_offset`.
+/// Each entry has a fixed 40-byte header followed by variable-length
+/// ID and name strings, then padding to an 8-byte boundary.
+///
+/// # Safety
+///
+/// `call_table` must be valid. `cache_buf` must point to at least
+/// `MAX_SECTOR_SIZE` writable bytes.
+pub unsafe fn parse_snapshot_table(
+    call_table: &CallTable,
+    device_idx: u32,
+    nb_snapshots: u32,
+    snapshots_offset: u64,
+    sector_size: usize,
+    input_capacity: u64,
+    cache_buf: *mut u8,
+    bytes_read: &mut u64,
+) -> SnapshotTable {
+    let mut table = SnapshotTable::empty();
+    let count = (nb_snapshots as usize).min(MAX_SNAPSHOTS);
+    let mut offset = snapshots_offset;
+    let mut cached_sector = u64::MAX;
+
+    for i in 0..count {
+        // Snapshot header layout (40 bytes):
+        //   0-3:   l1_table_offset (u64) [high word]
+        //   ...actually the format is:
+        //   0-7:   l1_table_offset (u64 BE)
+        //   8-11:  l1_size (u32 BE)
+        //   12-13: id_str_size (u16 BE)
+        //   14-15: name_size (u16 BE)
+        //   16-19: date_sec (u32 BE)
+        //   20-23: date_nsec (u32 BE)
+        //   24-31: vm_clock_nsec (u64 BE)
+        //   32-35: vm_state_size (u32 BE)
+        //   36-39: extra_data_size (u32 BE)
+        //   Then: extra_data_size bytes of extra data
+        //   Then: id_str_size bytes (not null-terminated)
+        //   Then: name_size bytes (not null-terminated)
+        //   Then: padding to 8-byte boundary
+
+        let l1_table_offset = match read_u64_be_cached(
+            call_table,
+            device_idx,
+            offset,
+            sector_size,
+            input_capacity,
+            &mut cached_sector,
+            cache_buf,
+            bytes_read,
+        ) {
+            Some(v) => v,
+            None => break,
+        };
+
+        let l1_size = match read_u32_be_cached(
+            call_table,
+            device_idx,
+            offset + 8,
+            sector_size,
+            input_capacity,
+            &mut cached_sector,
+            cache_buf,
+            bytes_read,
+        ) {
+            Some(v) => v,
+            None => break,
+        };
+
+        let id_str_size = match read_u16_be_cached(
+            call_table,
+            device_idx,
+            offset + 12,
+            sector_size,
+            input_capacity,
+            &mut cached_sector,
+            cache_buf,
+            bytes_read,
+        ) {
+            Some(v) => v,
+            None => break,
+        };
+
+        let name_size = match read_u16_be_cached(
+            call_table,
+            device_idx,
+            offset + 14,
+            sector_size,
+            input_capacity,
+            &mut cached_sector,
+            cache_buf,
+            bytes_read,
+        ) {
+            Some(v) => v,
+            None => break,
+        };
+
+        let date_sec = match read_u32_be_cached(
+            call_table,
+            device_idx,
+            offset + 16,
+            sector_size,
+            input_capacity,
+            &mut cached_sector,
+            cache_buf,
+            bytes_read,
+        ) {
+            Some(v) => v,
+            None => break,
+        };
+
+        let vm_state_size = match read_u32_be_cached(
+            call_table,
+            device_idx,
+            offset + 32,
+            sector_size,
+            input_capacity,
+            &mut cached_sector,
+            cache_buf,
+            bytes_read,
+        ) {
+            Some(v) => v,
+            None => break,
+        };
+
+        let extra_data_size = match read_u32_be_cached(
+            call_table,
+            device_idx,
+            offset + 36,
+            sector_size,
+            input_capacity,
+            &mut cached_sector,
+            cache_buf,
+            bytes_read,
+        ) {
+            Some(v) => v,
+            None => break,
+        };
+
+        // Read ID string (byte by byte, up to 63 chars)
+        let id_copy_len = (id_str_size as usize).min(63);
+        let id_start = offset + 40 + extra_data_size as u64;
+        let entry = &mut table.entries[i];
+        for j in 0..id_copy_len {
+            if let Some(b) = read_u8_cached(
+                call_table,
+                device_idx,
+                id_start + j as u64,
+                sector_size,
+                input_capacity,
+                &mut cached_sector,
+                cache_buf,
+                bytes_read,
+            ) {
+                entry.id[j] = b;
+            }
+        }
+        entry.id[id_copy_len] = 0;
+
+        // Read name string (byte by byte, up to 63 chars)
+        let name_copy_len = (name_size as usize).min(63);
+        let name_start = id_start + id_str_size as u64;
+        for j in 0..name_copy_len {
+            if let Some(b) = read_u8_cached(
+                call_table,
+                device_idx,
+                name_start + j as u64,
+                sector_size,
+                input_capacity,
+                &mut cached_sector,
+                cache_buf,
+                bytes_read,
+            ) {
+                entry.name[j] = b;
+            }
+        }
+        entry.name[name_copy_len] = 0;
+
+        entry.l1_table_offset = l1_table_offset;
+        entry.l1_size = l1_size;
+        entry.id_len = id_str_size;
+        entry.name_len = name_size;
+        entry.date_sec = date_sec;
+        entry.vm_state_size = vm_state_size;
+        table.count = i + 1;
+
+        // Advance to next entry: 40 + extra_data_size + id_str_size + name_size
+        // rounded up to 8-byte boundary
+        let entry_size = 40 + extra_data_size as u64 + id_str_size as u64 + name_size as u64;
+        offset += (entry_size + 7) & !7;
+    }
+
+    table
+}
+
+/// Find a snapshot by ID or name string.
+///
+/// Returns the index into `SnapshotTable::entries` if found.
+pub fn find_snapshot(table: &SnapshotTable, needle: &[u8]) -> Option<usize> {
+    for i in 0..table.count {
+        let entry = &table.entries[i];
+        // Compare against ID
+        let id_len = entry.id_len as usize;
+        if id_len == needle.len() && entry.id[..id_len] == *needle {
+            return Some(i);
+        }
+        // Compare against name
+        let name_len = entry.name_len as usize;
+        if name_len == needle.len() && entry.name[..name_len] == *needle {
+            return Some(i);
+        }
+    }
+    None
 }
 
 // ============================================================================
