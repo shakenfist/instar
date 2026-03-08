@@ -195,6 +195,17 @@
             "sha256": "af175e3c442b659e26b91029aacf2e62f2f7cf054404446db3185aafc38e079f"
         },
         {
+            "id": "vmdk-multi-extent",
+            "path": "custom/format-coverage/vmdk-multi-extent.vmdk",
+            "format": "vmdk",
+            "safety": "safe",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "description": "Binary VMDK4 with two extent lines for multi-extent detection testing",
+            "tags": ["vmdk", "multi-extent", "format-coverage"],
+            "generated_by": "scripts/create-vmdk-testdata.sh"
+        },
+        {
             "id": "vhd-fixed",
             "path": "custom/format-coverage/vhd-fixed.vhd",
             "format": "vpc",

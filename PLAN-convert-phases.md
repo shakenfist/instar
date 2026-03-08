@@ -649,6 +649,25 @@ include temp space checks for large images.
     Future: `imago convert --luks-passphrase` could decrypt
     LUKS and convert the inner image in a single pass.
 
+### Format Capability Gaps
+
+22. **Compressed clusters >64KB** — Decompression is limited to
+    cluster sizes up to 64KB (MAX_SECTOR_SIZE). Clusters larger
+    than 64KB (e.g. 256KB, 2MB) cannot be decompressed because
+    the full compressed payload must fit in a single I/O buffer.
+    Uncompressed clusters up to 2MB work fine. Would require a
+    multi-sector decompression buffer or streaming decompressor.
+
+23. **QCOW2 encryption** — QCOW2-native encryption (AES-CBC in
+    v2, LUKS-in-QCOW2 in v3) is not supported. The info operation
+    detects encryption feature bits but does not decrypt. Convert
+    rejects encrypted images.
+
+24. **QCOW2 snapshots** — Snapshot table parsing, internal
+    snapshot extraction, and snapshot-aware conversion are not
+    implemented. The info operation reports snapshot count but
+    does not enumerate them.
+
 ## Verification
 
 After each sub-phase:
