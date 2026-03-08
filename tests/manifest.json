@@ -195,6 +195,17 @@
             "sha256": "af175e3c442b659e26b91029aacf2e62f2f7cf054404446db3185aafc38e079f"
         },
         {
+            "id": "vhd-fixed",
+            "path": "custom/format-coverage/vhd-fixed.vhd",
+            "format": "vpc",
+            "safety": "safe",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "description": "Fixed VHD (disk_type=2) with MBR signature and 0xBE pattern at 1 MiB",
+            "tags": ["vhd", "fixed"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
+        },
+        {
             "id": "qcow2-base-for-chain",
             "path": "downloaded/edge-cases/base_for_chain.qcow2",
             "format": "qcow2",

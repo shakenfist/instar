@@ -1461,6 +1461,45 @@ class TestCheckExternalDataFile(ImagoTestBase):
             f'No corruptions expected (data offsets skipped): {stderr}'
         )
 
+
+class TestCheckVhdFixed(ImagoTestBase):
+    """Tests for check operation with fixed VHD (disk_type=2)."""
+
+    def test_check_vhd_fixed_detects_vpc(self):
+        """Check detects fixed VHD as vpc format with no errors."""
+        image = self.get_image('vhd-fixed')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+
+        stdout, stderr, rc = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        self.assertEqual(
+            0, rc,
+            f'check should succeed for fixed VHD: {stderr}'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('corruptions', 0), 0,
+            f'No corruptions expected for fixed VHD: {stdout}'
+        )
+
+    def test_info_vhd_fixed_format(self):
+        """Info detects fixed VHD as vpc format."""
+        image = self.get_image('vhd-fixed')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+
+        stdout, stderr, rc = self.run_imago_info(image.path)
+        self.assertEqual(
+            0, rc,
+            f'info should succeed for fixed VHD: {stderr}'
+        )
+        self.assertIn(
+            'vpc', stdout.lower(),
+            f'Expected vpc format for fixed VHD: {stdout}'
+        )
+
     def test_check_security_image_external_data(self):
         """Check should succeed on the CVE-2024-32498 security test image.
 
