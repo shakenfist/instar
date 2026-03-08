@@ -873,6 +873,11 @@ fn print_info_result(
             if is_v3 {
                 println!("    extended l2: {}", info.qcow2_info.extended_l2);
             }
+
+            // snapshot count (only shown if > 0)
+            if info.qcow2_info.nb_snapshots > 0 {
+                println!("Snapshot count: {}", info.qcow2_info.nb_snapshots);
+            }
         }
 
         // Format specific information (VMDK)
@@ -2148,6 +2153,10 @@ struct ConvertArgs {
     /// Read QCOW2 AES decryption password from file
     #[arg(long, value_name = "PATH", conflicts_with = "qcow2_password")]
     qcow2_password_file: Option<String>,
+
+    /// Extract a specific snapshot (by ID or name) instead of the active image
+    #[arg(long, value_name = "ID")]
+    snapshot: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -4283,6 +4292,27 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         debug!(
             "Wrote QCOW2 passphrase ({} bytes) to convert config",
             pass_bytes.len()
+        );
+    }
+
+    // Write snapshot ID if specified
+    if let Some(ref snapshot_id) = args.snapshot {
+        let snap_bytes = snapshot_id.as_bytes();
+        if snap_bytes.len() > 64 {
+            return Err("Snapshot ID too long (max 64 bytes)".into());
+        }
+        // snapshot_id_len at offset 284 (28 + 256)
+        guest_mem.write_obj(
+            snap_bytes.len() as u32,
+            GuestAddress(OPERATION_CONFIG_ADDR + 284),
+        )?;
+        // _pad2 at offset 288 is zero-initialized
+        // snapshot_id at offset 292
+        guest_mem.write_slice(snap_bytes, GuestAddress(OPERATION_CONFIG_ADDR + 292))?;
+        debug!(
+            "Wrote snapshot ID '{}' ({} bytes) to convert config",
+            snapshot_id,
+            snap_bytes.len()
         );
     }
 

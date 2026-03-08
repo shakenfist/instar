@@ -682,6 +682,8 @@ pub struct Qcow2Info {
     pub _pad: [u8; 1],
     /// Number of refcount bits (typically 16)
     pub refcount_bits: u32,
+    /// Number of snapshots in the snapshot table
+    pub nb_snapshots: u32,
 }
 
 impl Qcow2Info {
@@ -697,6 +699,7 @@ impl Qcow2Info {
             backing_format: BackingFormat::None,
             _pad: [0; 1],
             refcount_bits: 16,
+            nb_snapshots: 0,
         }
     }
 
@@ -1688,6 +1691,7 @@ impl CompareResult {
 
 /// Maximum passphrase length for QCOW2 AES decryption.
 pub const CONVERT_CONFIG_MAX_PASSPHRASE: usize = 256;
+pub const CONVERT_CONFIG_MAX_SNAPSHOT_ID: usize = 64;
 
 /// Configuration for the convert operation.
 ///
@@ -1719,6 +1723,15 @@ pub struct ConvertConfig {
 
     /// QCOW2 AES passphrase (null-padded, max 256 bytes)
     pub passphrase: [u8; CONVERT_CONFIG_MAX_PASSPHRASE],
+
+    /// Snapshot ID or name length (0 = no snapshot, use active image)
+    pub snapshot_id_len: u32,
+
+    /// Padding for alignment
+    pub _pad2: u32,
+
+    /// Snapshot ID or name (null-padded, max 64 bytes)
+    pub snapshot_id: [u8; CONVERT_CONFIG_MAX_SNAPSHOT_ID],
 }
 
 impl ConvertConfig {
@@ -1748,6 +1761,9 @@ impl ConvertConfig {
             passphrase_len: 0,
             _pad: 0,
             passphrase: [0; CONVERT_CONFIG_MAX_PASSPHRASE],
+            snapshot_id_len: 0,
+            _pad2: 0,
+            snapshot_id: [0; CONVERT_CONFIG_MAX_SNAPSHOT_ID],
         }
     }
 
@@ -1800,6 +1816,17 @@ impl ConvertConfig {
     pub fn passphrase_bytes(&self) -> &[u8] {
         let len = (self.passphrase_len as usize).min(CONVERT_CONFIG_MAX_PASSPHRASE);
         &self.passphrase[..len]
+    }
+
+    /// Check if a snapshot ID was provided.
+    pub fn has_snapshot_id(&self) -> bool {
+        self.snapshot_id_len > 0
+    }
+
+    /// Get the snapshot ID bytes (up to snapshot_id_len).
+    pub fn snapshot_id_bytes(&self) -> &[u8] {
+        let len = (self.snapshot_id_len as usize).min(CONVERT_CONFIG_MAX_SNAPSHOT_ID);
+        &self.snapshot_id[..len]
     }
 }
 

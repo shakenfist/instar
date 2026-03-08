@@ -3303,6 +3303,169 @@ class TestConvertVhdToQcow2Roundtrip(ImagoTestBase):
         self._test_vhd_qcow2_roundtrip('virtualpc-vhd')
 
 
+class TestConvertSnapshot(ImagoTestBase):
+    """Test conversion of specific QCOW2 snapshots."""
+
+    def test_convert_snap1(self):
+        """Convert snap1 and verify 0xAA pattern."""
+        image = self.get_image('qcow2-snapshots')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.raw') as raw_out, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as qemu_raw:
+            # Convert snap1 with imago
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(raw_out.name),
+                snapshot='snap1'
+            )
+            self.assertEqual(
+                rc, 0,
+                f'Snapshot convert failed: {stderr}'
+            )
+
+            # Convert snap1 with qemu-img
+            subprocess.run(
+                [
+                    'qemu-img', 'convert',
+                    '-l', 'snap1',
+                    '-f', 'qcow2', '-O', 'raw',
+                    str(image.path),
+                    qemu_raw.name,
+                ],
+                capture_output=True, text=True,
+                timeout=30, check=True
+            )
+
+            # Compare outputs
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(raw_out.name),
+                Path(qemu_raw.name)
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'snap1 differs from qemu-img: '
+                f'{cmp_out}'
+            )
+
+    def test_convert_snap2(self):
+        """Convert snap2 and verify 0xBB pattern."""
+        image = self.get_image('qcow2-snapshots')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.raw') as raw_out, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as qemu_raw:
+            # Convert snap2 with imago
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(raw_out.name),
+                snapshot='snap2'
+            )
+            self.assertEqual(
+                rc, 0,
+                f'Snapshot convert failed: {stderr}'
+            )
+
+            # Convert snap2 with qemu-img
+            subprocess.run(
+                [
+                    'qemu-img', 'convert',
+                    '-l', 'snap2',
+                    '-f', 'qcow2', '-O', 'raw',
+                    str(image.path),
+                    qemu_raw.name,
+                ],
+                capture_output=True, text=True,
+                timeout=30, check=True
+            )
+
+            # Compare outputs
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(raw_out.name),
+                Path(qemu_raw.name)
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'snap2 differs from qemu-img: '
+                f'{cmp_out}'
+            )
+
+    def test_convert_by_snapshot_id(self):
+        """Convert by numeric snapshot ID (1) instead of
+        name."""
+        image = self.get_image('qcow2-snapshots')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.raw') as raw_out, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as qemu_raw:
+            # Convert snapshot ID "1" with imago
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(raw_out.name),
+                snapshot='1'
+            )
+            self.assertEqual(
+                rc, 0,
+                f'Snapshot ID convert failed: '
+                f'{stderr}'
+            )
+
+            # Convert snap1 with qemu-img
+            subprocess.run(
+                [
+                    'qemu-img', 'convert',
+                    '-l', 'snapshot.name=snap1',
+                    '-f', 'qcow2', '-O', 'raw',
+                    str(image.path),
+                    qemu_raw.name,
+                ],
+                capture_output=True, text=True,
+                timeout=30, check=True
+            )
+
+            # Compare outputs — ID "1" should match snap1
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(raw_out.name),
+                Path(qemu_raw.name)
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Snapshot ID 1 differs from snap1: '
+                f'{cmp_out}'
+            )
+
+    def test_convert_nonexistent_snapshot(self):
+        """Converting a nonexistent snapshot should fail."""
+        image = self.get_image('qcow2-snapshots')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.raw') as raw_out:
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(raw_out.name),
+                snapshot='nonexistent'
+            )
+            self.assertNotEqual(
+                rc, 0,
+                'Should fail for nonexistent snapshot'
+            )
+
+
 class TestConvertEncryptedQcow2(ImagoTestBase):
     """Test conversion of AES-encrypted QCOW2 images."""
 
