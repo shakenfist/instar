@@ -21,7 +21,7 @@ imago/
 │   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates (guest-protocol)
 ├── prototypes/     # Experimental implementations (11 KVM prototypes)
-├── scripts/        # Build and check scripts
+├── scripts/        # Build, check, and test image generation scripts
 ├── tests/          # Integration tests (Python/testtools)
 ├── docs/           # Design documents and research notes
 ├── testdata/       # Test images for security validation
