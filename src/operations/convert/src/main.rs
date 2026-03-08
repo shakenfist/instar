@@ -24,8 +24,8 @@ shared::bump_allocator!();
 use shared::{
     is_all_zeros_ptr, should_report_progress, validate_call_table, verify_sector_sizes, CallTable,
     ChainConfig, ConvertConfig, ImageFormat, ALLOC_HEAP_BASE, CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR,
-    COMPRESSED_BUF_SIZE, MAX_CHAIN_DEVICES, MAX_SECTOR_SIZE, OPERATION_CONFIG_ADDR,
-    SCRATCH_MEM_BASE,
+    COMPRESSED_BUF_SIZE, MAX_CHAIN_DEVICES, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE,
+    OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE,
 };
 
 // ================================================================
@@ -45,7 +45,10 @@ use shared::{
 // Dynamic region: L1/L2 caches for input QCOW2 devices
 //   (2 × MAX_SECTOR_SIZE per device)
 //
-// After dynamic caches: output L1 table (QCOW2 path only,
+// After dynamic caches: decompression staging buffer (2MB)
+//   for compressed clusters larger than chunk_size
+//
+// After staging buffer: output L1 table (QCOW2 path only,
 //   size computed at runtime)
 //
 // For compressed QCOW2 output (after L1 table):
@@ -59,8 +62,9 @@ const BUF_REFCOUNT: usize = BUF_HEADER + MAX_SECTOR_SIZE;
 const DYNAMIC_BUFS_START: usize = BUF_REFCOUNT + MAX_SECTOR_SIZE;
 
 const _: () = assert!(
-    DYNAMIC_BUFS_START + MAX_CHAIN_DEVICES * 2 * MAX_SECTOR_SIZE <= ALLOC_HEAP_BASE,
-    "Scratch memory too small for MAX_CHAIN_DEVICES L1/L2 caches"
+    DYNAMIC_BUFS_START + MAX_CHAIN_DEVICES * 2 * MAX_SECTOR_SIZE + MAX_CLUSTER_SIZE
+        <= ALLOC_HEAP_BASE,
+    "Scratch memory too small for L1/L2 caches + staging buffer"
 );
 
 /// Entry point called by core after devices are initialized.
@@ -275,6 +279,11 @@ unsafe fn convert_to_raw(
 
     (call_table.verbose_print)(b"convert: starting raw conversion\n\0".as_ptr());
 
+    // Staging buffer for decompressing clusters larger than chunk_size
+    let staging_buf_addr = DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE;
+    let staging_buf = staging_buf_addr as *mut u8;
+    let mut staging_cluster_offset: u64 = u64::MAX;
+
     let buf = BUF_DATA as *mut u8;
     let mut virtual_offset: u64 = 0;
     let mut last_percent: u32 = 0;
@@ -303,6 +312,8 @@ unsafe fn convert_to_raw(
             chain_config,
             chain_states,
             BUF_COMPRESSED_IN as *mut u8,
+            staging_buf,
+            &mut staging_cluster_offset,
             bytes_read,
         ) {
             (call_table.send_error)(
@@ -537,7 +548,9 @@ unsafe fn init_qcow2_output_layout(
     let l2_coverage = cluster_size * entries_per_l2 as u64;
     let l1_size = ((virtual_size + l2_coverage - 1) / l2_coverage) as u32;
 
-    let l1_buf_addr = DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE;
+    // L1 table starts after dynamic caches + staging buffer
+    let l1_buf_addr =
+        DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE + MAX_CLUSTER_SIZE;
     let l1_size_bytes = l1_size as usize * 8;
     let l1_clusters = ((l1_size_bytes as u64 + cluster_size - 1) / cluster_size).max(1);
     let l1_write_bytes = l1_clusters as usize * cluster_size as usize;
@@ -730,6 +743,11 @@ unsafe fn convert_to_qcow2(
     let buf_data = BUF_DATA as *mut u8;
     let buf_l2 = BUF_L2_OUT as *mut u8;
 
+    // Staging buffer for decompressing clusters larger than chunk_size
+    let staging_buf_addr = DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE;
+    let staging_buf = staging_buf_addr as *mut u8;
+    let mut staging_cluster_offset: u64 = u64::MAX;
+
     (call_table.verbose_print)(b"convert: starting qcow2 conversion\n\0".as_ptr());
 
     // Linear cluster allocator. Cluster 0 is the header.
@@ -772,6 +790,8 @@ unsafe fn convert_to_qcow2(
                 chain_config,
                 chain_states,
                 BUF_COMPRESSED_IN as *mut u8,
+                staging_buf,
+                &mut staging_cluster_offset,
                 bytes_read,
             ) {
                 (call_table.send_error)(
@@ -1013,6 +1033,12 @@ unsafe fn convert_to_qcow2_compressed(
 
     let buf_data = BUF_DATA as *mut u8;
     let buf_l2 = BUF_L2_OUT as *mut u8;
+
+    // Staging buffer for decompressing clusters larger than chunk_size
+    let staging_buf_addr = DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE;
+    let staging_buf = staging_buf_addr as *mut u8;
+    let mut staging_cluster_offset: u64 = u64::MAX;
+
     // Reuse BUF_COMPRESSED_IN for compressed output (it's free
     // after read_chain_virtual_cluster returns).
     let buf_compressed_out = BUF_COMPRESSED_IN as *mut u8;
@@ -1062,6 +1088,8 @@ unsafe fn convert_to_qcow2_compressed(
                 chain_config,
                 chain_states,
                 BUF_COMPRESSED_IN as *mut u8,
+                staging_buf,
+                &mut staging_cluster_offset,
                 bytes_read,
             ) {
                 (call_table.send_error)(
@@ -1327,8 +1355,9 @@ unsafe fn init_vmdk_output_layout(
     let grain_data_start = (desc_end + output_sector_size as u64 - 1) / output_sector_size as u64
         * output_sector_size as u64;
 
-    // Allocate GD buffer after dynamic input caches
-    let gd_buf_addr = DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE;
+    // Allocate GD buffer after dynamic input caches + staging buffer
+    let gd_buf_addr =
+        DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE + MAX_CLUSTER_SIZE;
     let gd_bytes = num_gd_entries as usize * 4;
     // Round up to 8-byte alignment for safety
     let gd_alloc = (gd_bytes + 7) & !7;
@@ -1384,6 +1413,11 @@ unsafe fn convert_to_vmdk(
     let oss = layout.output_sector_size;
     let oc = layout.output_capacity;
 
+    // Staging buffer for decompressing clusters larger than chunk_size
+    let staging_buf_addr = DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE;
+    let staging_buf = staging_buf_addr as *mut u8;
+    let mut staging_cluster_offset: u64 = u64::MAX;
+
     (call_table.verbose_print)(b"convert: starting vmdk conversion\n\0".as_ptr());
 
     // Byte offset allocator (grain data starts after
@@ -1431,6 +1465,8 @@ unsafe fn convert_to_vmdk(
                 chain_config,
                 chain_states,
                 BUF_COMPRESSED_IN as *mut u8,
+                staging_buf,
+                &mut staging_cluster_offset,
                 bytes_read,
             ) {
                 (call_table.send_error)(
@@ -1640,6 +1676,11 @@ unsafe fn convert_to_vmdk_compressed(
     // Do NOT reorder: output compression must stay after the read call.
     let buf_staging = BUF_COMPRESSED_IN as *mut u8;
     let oss = layout.output_sector_size;
+
+    // Staging buffer for decompressing clusters larger than chunk_size
+    let staging_buf_addr = DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE;
+    let staging_buf = staging_buf_addr as *mut u8;
+    let mut staging_cluster_offset: u64 = u64::MAX;
     let oc = layout.output_capacity;
 
     // CompressorOxide state follows GD buffer in scratch memory
@@ -1695,6 +1736,8 @@ unsafe fn convert_to_vmdk_compressed(
                 chain_config,
                 chain_states,
                 BUF_COMPRESSED_IN as *mut u8,
+                staging_buf,
+                &mut staging_cluster_offset,
                 bytes_read,
             ) {
                 (call_table.send_error)(
@@ -2016,8 +2059,9 @@ unsafe fn convert_to_vhd(
     let bat_padded = align_up(bat_size_bytes, oss);
     let data_start = bat_offset + bat_padded;
 
-    // BAT buffer — allocate after dynamic input caches
-    let bat_buf_addr = DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE;
+    // BAT buffer — allocate after dynamic input caches + staging buffer
+    let bat_buf_addr =
+        DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE + MAX_CLUSTER_SIZE;
     let bat_alloc = align_up(bat_size_bytes, 8) as usize;
 
     if bat_buf_addr + bat_alloc > ALLOC_HEAP_BASE {
@@ -2029,6 +2073,11 @@ unsafe fn convert_to_vhd(
     let bat_buf = bat_buf_addr as *mut u8;
     // Initialize all BAT entries to 0xFFFFFFFF (unallocated)
     core::ptr::write_bytes(bat_buf, 0xFF, bat_alloc);
+
+    // Staging buffer for decompressing clusters larger than chunk_size
+    let staging_buf_addr = DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE;
+    let staging_buf = staging_buf_addr as *mut u8;
+    let mut staging_cluster_offset: u64 = u64::MAX;
 
     (call_table.verbose_print)(b"convert: starting VHD conversion\n\0".as_ptr());
 
@@ -2158,6 +2207,8 @@ unsafe fn convert_to_vhd(
                 chain_config,
                 chain_states,
                 BUF_COMPRESSED_IN as *mut u8,
+                staging_buf,
+                &mut staging_cluster_offset,
                 bytes_read,
             ) {
                 (call_table.send_error)(
@@ -2260,6 +2311,8 @@ unsafe fn convert_to_vhd(
                     chain_config,
                     chain_states,
                     BUF_COMPRESSED_IN as *mut u8,
+                    staging_buf,
+                    &mut staging_cluster_offset,
                     bytes_read,
                 ) {
                     (call_table.send_error)(
@@ -2418,8 +2471,9 @@ unsafe fn convert_to_vhdx(
     let metadata_region_size = vhdx::MB_ALIGN; // 1MB
     let payload_start = metadata_offset + metadata_region_size;
 
-    // BAT buffer — allocate after dynamic input caches
-    let bat_buf_addr = DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE;
+    // BAT buffer — allocate after dynamic input caches + staging buffer
+    let bat_buf_addr =
+        DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE + MAX_CLUSTER_SIZE;
     let bat_alloc = align_up(bat_size_bytes, 8) as usize;
 
     if bat_buf_addr + bat_alloc > ALLOC_HEAP_BASE {
@@ -2431,6 +2485,11 @@ unsafe fn convert_to_vhdx(
     let bat_buf = bat_buf_addr as *mut u8;
     // Initialize all BAT entries to 0 (NOT_PRESENT)
     core::ptr::write_bytes(bat_buf, 0, bat_alloc);
+
+    // Staging buffer for decompressing clusters larger than chunk_size
+    let staging_buf_addr = DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE;
+    let staging_buf = staging_buf_addr as *mut u8;
+    let mut staging_cluster_offset: u64 = u64::MAX;
 
     (call_table.verbose_print)(b"convert: starting VHDX conversion\n\0".as_ptr());
 
@@ -2675,6 +2734,8 @@ unsafe fn convert_to_vhdx(
                 chain_config,
                 chain_states,
                 BUF_COMPRESSED_IN as *mut u8,
+                staging_buf,
+                &mut staging_cluster_offset,
                 bytes_read,
             ) {
                 (call_table.send_error)(
@@ -2739,6 +2800,8 @@ unsafe fn convert_to_vhdx(
                 chain_config,
                 chain_states,
                 BUF_COMPRESSED_IN as *mut u8,
+                staging_buf,
+                &mut staging_cluster_offset,
                 bytes_read,
             ) {
                 (call_table.send_error)(

@@ -376,8 +376,10 @@ class TestConvertManifestImages(ImagoTestBase):
         gib = vsize / (1024 ** 3)
         return max(120, int(120 + gib * 15))
 
-    # Max I/O buffer size: compressed clusters need a full-cluster
-    # decompression buffer, limited to MAX_SECTOR_SIZE (64KB).
+    # Max cluster size for compressed cluster decompression. The staging
+    # buffer handles decompressed output up to 2MB, but compressed input
+    # data is limited to COMPRESSED_BUF_SIZE (128KB). For clusters > 64KB,
+    # the compressed input data may exceed this limit, so we skip those.
     MAX_DECOMPRESS_CLUSTER = 65536
 
     def _skip_if_unsupported(self, image_id, image_path):
@@ -1522,7 +1524,7 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
         gib = vsize / (1024 ** 3)
         return max(120, int(120 + gib * 15))
 
-    # Max I/O buffer size for decompression
+    # Max cluster size for compressed cluster decompression
     MAX_DECOMPRESS_CLUSTER = 65536
 
     def _skip_if_unsupported(self, image_id, image_path):

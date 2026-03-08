@@ -1642,6 +1642,10 @@ pub unsafe fn read_raw_sectors(
 /// `buf` must point to at least `chunk_size` writable bytes.
 /// `compressed_buf` must point to at least `COMPRESSED_BUF_SIZE` writable
 /// bytes (used as scratch for decompressing compressed clusters).
+/// `staging_buf` must point to at least `MAX_CLUSTER_SIZE` writable bytes
+/// (used for decompressing clusters larger than `chunk_size`).
+/// `staging_cluster_offset` tracks which cluster is cached in `staging_buf`
+/// (set to `u64::MAX` to invalidate).
 /// `call_table` must be valid.
 #[allow(unused_variables)]
 pub unsafe fn read_chain_virtual_cluster(
@@ -1655,6 +1659,8 @@ pub unsafe fn read_chain_virtual_cluster(
     chain_config: &ChainConfig,
     chain_states: &mut ChainStates,
     compressed_buf: *mut u8,
+    staging_buf: *mut u8,
+    staging_cluster_offset: &mut u64,
     bytes_read: &mut u64,
 ) -> bool {
     for dev_offset in 0..chain_len {
@@ -1712,16 +1718,28 @@ pub unsafe fn read_chain_virtual_cluster(
                     }
                     #[cfg(feature = "decompress")]
                     Some(ClusterLookup::Compressed(l2_entry)) => {
-                        // Compressed clusters with large cluster sizes
-                        // can't be decompressed into chunk-sized buffers.
-                        if qcow2_cluster_size > MAX_SECTOR_SIZE as u64 {
-                            return false;
-                        }
-                        // Dispatch based on compression type:
-                        // 0 = zlib (deflate), 1 = zstd
-                        #[cfg(feature = "decompress-zstd")]
-                        if compression_type == 1 {
-                            return read_compressed_cluster_zstd(
+                        // For clusters that fit in the output buffer,
+                        // decompress directly (fast path).
+                        if qcow2_cluster_size <= chunk_size {
+                            #[cfg(feature = "decompress-zstd")]
+                            if compression_type == 1 {
+                                return read_compressed_cluster_zstd(
+                                    call_table,
+                                    dev_idx as u32,
+                                    l2_entry,
+                                    cluster_bits,
+                                    buf,
+                                    qcow2_cluster_size,
+                                    sector_size,
+                                    compressed_buf,
+                                    cap,
+                                    bytes_read,
+                                );
+                            }
+                            if compression_type != 0 {
+                                return false;
+                            }
+                            return read_compressed_cluster(
                                 call_table,
                                 dev_idx as u32,
                                 l2_entry,
@@ -1734,21 +1752,66 @@ pub unsafe fn read_chain_virtual_cluster(
                                 bytes_read,
                             );
                         }
-                        if compression_type != 0 {
+
+                        // Large cluster: decompress into staging buffer,
+                        // then copy the requested chunk.
+                        if qcow2_cluster_size > MAX_CLUSTER_SIZE as u64 {
                             return false;
                         }
-                        return read_compressed_cluster(
-                            call_table,
-                            dev_idx as u32,
-                            l2_entry,
-                            cluster_bits,
+                        let cluster_base = virtual_offset & !(qcow2_cluster_size - 1);
+                        if *staging_cluster_offset != cluster_base {
+                            // Decompress full cluster into staging buffer
+                            #[cfg(feature = "decompress-zstd")]
+                            if compression_type == 1 {
+                                if !read_compressed_cluster_zstd(
+                                    call_table,
+                                    dev_idx as u32,
+                                    l2_entry,
+                                    cluster_bits,
+                                    staging_buf,
+                                    qcow2_cluster_size,
+                                    sector_size,
+                                    compressed_buf,
+                                    cap,
+                                    bytes_read,
+                                ) {
+                                    return false;
+                                }
+                                *staging_cluster_offset = cluster_base;
+                                let intra = (virtual_offset - cluster_base) as usize;
+                                core::ptr::copy_nonoverlapping(
+                                    staging_buf.add(intra),
+                                    buf,
+                                    chunk_size as usize,
+                                );
+                                return true;
+                            }
+                            if compression_type != 0 {
+                                return false;
+                            }
+                            if !read_compressed_cluster(
+                                call_table,
+                                dev_idx as u32,
+                                l2_entry,
+                                cluster_bits,
+                                staging_buf,
+                                qcow2_cluster_size,
+                                sector_size,
+                                compressed_buf,
+                                cap,
+                                bytes_read,
+                            ) {
+                                return false;
+                            }
+                            *staging_cluster_offset = cluster_base;
+                        }
+                        let intra = (virtual_offset - cluster_base) as usize;
+                        core::ptr::copy_nonoverlapping(
+                            staging_buf.add(intra),
                             buf,
-                            qcow2_cluster_size,
-                            sector_size,
-                            compressed_buf,
-                            cap,
-                            bytes_read,
+                            chunk_size as usize,
                         );
+                        return true;
                     }
                     #[cfg(not(feature = "decompress"))]
                     Some(ClusterLookup::Compressed(_)) => {
@@ -1796,23 +1859,53 @@ pub unsafe fn read_chain_virtual_cluster(
                     }
                     #[cfg(feature = "vmdk-decompress")]
                     Some(GrainLookup::Compressed(marker_offset)) => {
-                        // Compressed grains can't decompress into
-                        // a buffer smaller than the grain.
-                        if grain_size_bytes > MAX_SECTOR_SIZE as u64 {
+                        // For grains that fit in the output buffer,
+                        // decompress directly (fast path).
+                        if grain_size_bytes <= chunk_size {
+                            return vmdk::read_compressed_grain(
+                                call_table,
+                                dev_idx as u32,
+                                marker_offset,
+                                grain_size_bytes,
+                                buf,
+                                sector_size,
+                                compressed_buf,
+                                COMPRESSED_BUF_SIZE,
+                                cap,
+                                bytes_read,
+                            );
+                        }
+
+                        // Large grain: decompress into staging buffer,
+                        // then copy the requested chunk.
+                        if grain_size_bytes > MAX_CLUSTER_SIZE as u64 {
                             return false;
                         }
-                        return vmdk::read_compressed_grain(
-                            call_table,
-                            dev_idx as u32,
-                            marker_offset,
-                            grain_size_bytes,
+                        let grain_base = virtual_offset & !(grain_size_bytes - 1);
+                        if *staging_cluster_offset != grain_base {
+                            if !vmdk::read_compressed_grain(
+                                call_table,
+                                dev_idx as u32,
+                                marker_offset,
+                                grain_size_bytes,
+                                staging_buf,
+                                sector_size,
+                                compressed_buf,
+                                COMPRESSED_BUF_SIZE,
+                                cap,
+                                bytes_read,
+                            ) {
+                                return false;
+                            }
+                            *staging_cluster_offset = grain_base;
+                        }
+                        let intra = (virtual_offset - grain_base) as usize;
+                        core::ptr::copy_nonoverlapping(
+                            staging_buf.add(intra),
                             buf,
-                            sector_size,
-                            compressed_buf,
-                            COMPRESSED_BUF_SIZE,
-                            cap,
-                            bytes_read,
+                            chunk_size as usize,
                         );
+                        return true;
                     }
                     #[cfg(not(feature = "vmdk-decompress"))]
                     Some(GrainLookup::Compressed(_)) => {
