@@ -585,6 +585,8 @@ pub struct Qcow2State {
     pub incompatible_features: u64,
     /// Compression type from the v3 header (0=zlib, 1=zstd).
     pub compression_type: u8,
+    /// Encryption method from the header (0=none, 1=AES-128-CBC, 2=LUKS).
+    pub crypt_method: u32,
     /// True when INCOMPAT_EXTENDED_L2 (bit 4) is set.
     pub extended_l2: bool,
     // Sector cache tracking for L1 table reads
@@ -633,6 +635,7 @@ impl Qcow2State {
             l1_table_offset: 0,
             incompatible_features: 0,
             compression_type: 0,
+            crypt_method: 0,
             extended_l2: false,
             l1_cached_sector: u64::MAX,
             l1_cache_buf,
@@ -682,6 +685,18 @@ impl Qcow2State {
             call_table,
             device_idx,
             SIZE_OFFSET as u64,
+            sector_size,
+            input_capacity,
+            &mut state.l1_cached_sector,
+            state.l1_cache_buf,
+            bytes_read,
+        )?;
+
+        // Read crypt_method (offset 32, 4 bytes)
+        state.crypt_method = read_u32_be_cached(
+            call_table,
+            device_idx,
+            CRYPT_METHOD_OFFSET as u64,
             sector_size,
             input_capacity,
             &mut state.l1_cached_sector,
@@ -1627,6 +1642,65 @@ pub unsafe fn read_raw_sectors(
     true
 }
 
+/// Decrypt a buffer of QCOW2 data encrypted with legacy AES-128-CBC
+/// (crypt_method=1).
+///
+/// Each 512-byte sector is encrypted independently with AES-128-CBC.
+/// The IV for each sector is the virtual sector number (virtual byte
+/// offset / 512) as a little-endian u64, zero-padded to 16 bytes.
+///
+/// # Safety
+///
+/// `buf` must point to at least `len` writable bytes. `len` must be
+/// a multiple of 512. `virtual_offset` is the guest-visible byte offset
+/// of the start of the data (used to compute sector-based IVs).
+#[cfg(feature = "aes-decrypt")]
+pub unsafe fn decrypt_cluster_aes_cbc(
+    buf: *mut u8,
+    len: u64,
+    virtual_offset: u64,
+    aes_key: &[u8; 16],
+) {
+    use aes::cipher::{BlockDecrypt, KeyInit};
+    use aes::Aes128;
+
+    let cipher = Aes128::new(aes_key.into());
+    let sector_size: u64 = 512;
+    let block_size: usize = 16;
+    let num_sectors = len / sector_size;
+
+    for i in 0..num_sectors {
+        let sector_offset = (i * sector_size) as usize;
+
+        // IV: virtual sector number as LE u64, zero-padded to 16 bytes
+        let virt_sector = (virtual_offset + i * sector_size) / sector_size;
+        let mut prev = [0u8; 16];
+        prev[..8].copy_from_slice(&virt_sector.to_le_bytes());
+
+        // CBC decryption: for each 16-byte block, decrypt then XOR with
+        // the previous ciphertext block (or IV for the first block).
+        let blocks_per_sector = sector_size as usize / block_size;
+        for j in 0..blocks_per_sector {
+            let block_off = sector_offset + j * block_size;
+            let block_ptr = buf.add(block_off);
+
+            // Save ciphertext before decryption (needed for next block's XOR)
+            let mut ct = [0u8; 16];
+            core::ptr::copy_nonoverlapping(block_ptr, ct.as_mut_ptr(), 16);
+
+            // Decrypt the block in-place
+            let block = &mut *(block_ptr as *mut aes::cipher::generic_array::GenericArray<u8, _>);
+            cipher.decrypt_block(block);
+
+            // XOR with previous ciphertext (or IV)
+            for k in 0..16 {
+                *block_ptr.add(k) ^= prev[k];
+            }
+            prev = ct;
+        }
+    }
+}
+
 /// Read one cluster's worth of virtual data by walking a backing chain.
 ///
 /// For each device in the chain (starting from the top):
@@ -1646,6 +1720,8 @@ pub unsafe fn read_raw_sectors(
 /// (used for decompressing clusters larger than `chunk_size`).
 /// `staging_cluster_offset` tracks which cluster is cached in `staging_buf`
 /// (set to `u64::MAX` to invalidate).
+/// `aes_key` is `Some(&key)` to decrypt AES-128-CBC encrypted clusters
+/// (crypt_method=1), or `None` for unencrypted images.
 /// `call_table` must be valid.
 #[allow(unused_variables)]
 pub unsafe fn read_chain_virtual_cluster(
@@ -1661,6 +1737,7 @@ pub unsafe fn read_chain_virtual_cluster(
     compressed_buf: *mut u8,
     staging_buf: *mut u8,
     staging_cluster_offset: &mut u64,
+    aes_key: Option<&[u8; 16]>,
     bytes_read: &mut u64,
 ) -> bool {
     for dev_offset in 0..chain_len {
@@ -1680,6 +1757,7 @@ pub unsafe fn read_chain_virtual_cluster(
                 // Capture fields before mutable borrow in cluster_lookup
                 let compression_type = state.compression_type;
                 let cluster_bits = state.cluster_bits;
+                let crypt_method = state.crypt_method;
 
                 match state.cluster_lookup(call_table, virtual_offset, sector_size, cap, bytes_read)
                 {
@@ -1706,7 +1784,7 @@ pub unsafe fn read_chain_virtual_cluster(
                         } else {
                             dev_idx as u32
                         };
-                        return read_cluster_sectors(
+                        if !read_cluster_sectors(
                             call_table,
                             read_dev,
                             read_offset,
@@ -1714,7 +1792,17 @@ pub unsafe fn read_chain_virtual_cluster(
                             read_size,
                             sector_size,
                             bytes_read,
-                        );
+                        ) {
+                            return false;
+                        }
+                        // Decrypt AES-128-CBC encrypted clusters
+                        #[cfg(feature = "aes-decrypt")]
+                        if crypt_method == 1 {
+                            if let Some(key) = aes_key {
+                                decrypt_cluster_aes_cbc(buf, read_size, virtual_offset, key);
+                            }
+                        }
+                        return true;
                     }
                     #[cfg(feature = "decompress")]
                     Some(ClusterLookup::Compressed(l2_entry)) => {

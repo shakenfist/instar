@@ -247,6 +247,17 @@ pub unsafe extern "C" fn _start() -> u64 {
     let staging_buf = staging_buf_addr as *mut u8;
     let mut staging_cluster_offset: u64 = u64::MAX;
 
+    // Construct AES key from passphrase if provided (for QCOW2 crypt_method=1)
+    let aes_key: Option<[u8; 16]> = if config.has_passphrase() {
+        let mut key = [0u8; 16];
+        let pass = config.passphrase_bytes();
+        let copy_len = if pass.len() < 16 { pass.len() } else { 16 };
+        key[..copy_len].copy_from_slice(&pass[..copy_len]);
+        Some(key)
+    } else {
+        None
+    };
+
     (call_table.verbose_print)(b"compare: comparing virtual content\n\0".as_ptr());
 
     let mut mismatch_found = false;
@@ -278,6 +289,7 @@ pub unsafe extern "C" fn _start() -> u64 {
             BUF_COMPRESSED_IN as *mut u8,
             staging_buf,
             &mut staging_cluster_offset,
+            aes_key.as_ref(),
             &mut bytes_read,
         ) {
             (call_table.send_error)(
@@ -309,6 +321,7 @@ pub unsafe extern "C" fn _start() -> u64 {
             BUF_COMPRESSED_IN as *mut u8,
             staging_buf,
             &mut staging_cluster_offset,
+            aes_key.as_ref(),
             &mut bytes_read,
         ) {
             (call_table.send_error)(
@@ -387,6 +400,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                     BUF_COMPRESSED_IN as *mut u8,
                     staging_buf,
                     &mut staging_cluster_offset,
+                    aes_key.as_ref(),
                     &mut bytes_read,
                 ) {
                     // I/O error: treat as mismatch

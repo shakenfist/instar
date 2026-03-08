@@ -782,6 +782,18 @@
             "skip_qemu_img": true,
             "description": "QCOW2 with leaked cluster (refcount>0, no L2 reference)",
             "tags": ["qcow2", "check-validation", "leak"]
+        },
+        {
+            "id": "qcow2-encrypted-aes",
+            "path": "custom/format-coverage/qcow2-encrypted-aes.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "passphrase": "testpass",
+            "description": "QCOW2 v2 with legacy AES-128-CBC encryption (crypt_method=1)",
+            "tags": ["qcow2", "encrypted", "aes", "format-coverage"],
+            "generated_by": "scripts/create-qcow2-encrypted-testdata.sh"
         }
     ]
 }
