@@ -1461,6 +1461,92 @@ class TestCheckExternalDataFile(ImagoTestBase):
             f'No corruptions expected (data offsets skipped): {stderr}'
         )
 
+
+class TestCheckVhdFixed(ImagoTestBase):
+    """Tests for check operation with fixed VHD (disk_type=2)."""
+
+    def test_check_vhd_fixed_detects_vpc(self):
+        """Check detects fixed VHD as vpc format with no errors."""
+        image = self.get_image('vhd-fixed')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+
+        stdout, stderr, rc = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        self.assertEqual(
+            0, rc,
+            f'check should succeed for fixed VHD: {stderr}'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('corruptions', 0), 0,
+            f'No corruptions expected for fixed VHD: {stdout}'
+        )
+
+    def test_info_vhd_fixed_format(self):
+        """Info detects fixed VHD as vpc format."""
+        image = self.get_image('vhd-fixed')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+
+        stdout, stderr, rc = self.run_imago_info(image.path)
+        self.assertEqual(
+            0, rc,
+            f'info should succeed for fixed VHD: {stderr}'
+        )
+        self.assertIn(
+            'vpc', stdout.lower(),
+            f'Expected vpc format for fixed VHD: {stdout}'
+        )
+
+
+class TestCheckVhdDifferencing(ImagoTestBase):
+    """Tests for check operation with differencing VHD (disk_type=4)."""
+
+    def test_check_vhd_differencing_detects_vpc(self):
+        """Check detects differencing VHD as vpc/vhd format."""
+        image = self.get_image('vhd-differencing')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+
+        stdout, stderr, rc = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        self.assertEqual(
+            0, rc,
+            f'check should succeed for differencing VHD: {stderr}'
+        )
+        result = json.loads(stdout)
+        self.assertIn(
+            result.get('format', '').lower(), ('vpc', 'vhd'),
+            f'Expected vpc/vhd format for differencing VHD: {stdout}'
+        )
+        self.assertEqual(
+            result.get('corruptions', 0), 0,
+            f'No corruptions expected: {stdout}'
+        )
+
+    def test_info_vhd_differencing_format(self):
+        """Info detects differencing VHD as vpc format."""
+        image = self.get_image('vhd-differencing')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+
+        stdout, stderr, rc = self.run_imago_info(image.path)
+        self.assertEqual(
+            0, rc,
+            f'info should succeed for differencing VHD: {stderr}'
+        )
+        self.assertIn(
+            'vpc', stdout.lower(),
+            f'Expected vpc format: {stdout}'
+        )
+
+
+class TestCheckSecurityExternalData(ImagoTestBase):
+    """Tests for check with external data file security images."""
+
     def test_check_security_image_external_data(self):
         """Check should succeed on the CVE-2024-32498 security test image.
 
@@ -1483,4 +1569,69 @@ class TestCheckExternalDataFile(ImagoTestBase):
         self.assertEqual(
             result.get('corruptions', 0), 0,
             f'No corruptions expected: {stderr}'
+        )
+
+
+class TestCheckVmdkMultiExtent(ImagoTestBase):
+    """Tests for check operation with multi-extent VMDK."""
+
+    def test_check_vmdk_multi_extent_detected(self):
+        """Check detects multi-extent VMDK as vmdk format."""
+        image = self.get_image('vmdk-multi-extent')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+
+        stdout, stderr, rc = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('format', '').lower(), 'vmdk',
+            f'Expected vmdk format: {stdout}'
+        )
+
+    def test_check_vmdk_multi_extent_not_supported(self):
+        """Check reports not-supported for multi-extent VMDK.
+
+        Multi-extent VMDKs trigger FLAG_NOT_SUPPORTED in check, which
+        causes early return with 0 clusters checked. In human output
+        this prints "does not support checks".
+        """
+        image = self.get_image('vmdk-multi-extent')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+
+        # JSON output: early bail means 0 clusters checked
+        stdout, stderr, rc = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('total-clusters', -1), 0,
+            f'Multi-extent VMDK should bail early with 0 clusters: {stdout}'
+        )
+
+        # Human output: "does not support checks"
+        stdout_h, stderr_h, rc_h = self.run_imago_check(
+            image.path, output_format='human'
+        )
+        self.assertIn(
+            'does not support checks', stdout_h.lower(),
+            f'Expected not-supported message: {stdout_h}'
+        )
+
+    def test_info_vmdk_multi_extent_format(self):
+        """Info detects multi-extent VMDK as vmdk format."""
+        image = self.get_image('vmdk-multi-extent')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+
+        stdout, stderr, rc = self.run_imago_info(image.path)
+        self.assertEqual(
+            0, rc,
+            f'info should succeed for multi-extent VMDK: {stderr}'
+        )
+        self.assertIn(
+            'vmdk', stdout.lower(),
+            f'Expected vmdk format: {stdout}'
         )

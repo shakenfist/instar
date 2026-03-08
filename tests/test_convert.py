@@ -2895,6 +2895,41 @@ class TestConvertVhdToRaw(ImagoTestBase):
         """Convert Disk2VHD zerofilled VHD to raw."""
         self._test_vhd_convert('vhd-d2v-zerofilled')
 
+    def test_convert_vhd_fixed(self):
+        """Convert fixed VHD (disk_type=2) to raw.
+
+        qemu-img doesn't auto-detect fixed VHD, so we validate
+        the conversion output independently rather than
+        cross-validating against qemu-img.
+        """
+        image = self.get_image('vhd-fixed')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(out.name), timeout=60
+            )
+            self.assertEqual(
+                rc, 0,
+                f'imago convert failed for vhd-fixed: {stderr}'
+            )
+
+            # Output should be 10 MiB (no footer)
+            out_size = Path(out.name).stat().st_size
+            self.assertEqual(
+                out_size, 10 * 1024 * 1024,
+                f'Expected 10 MiB output, got {out_size}'
+            )
+
+            # Check 0xBE pattern at 1 MiB offset
+            out.seek(1024 * 1024)
+            data = out.read(512)
+            self.assertEqual(
+                data, bytes([0xBE] * 512),
+                'Expected 0xBE pattern at 1 MiB offset'
+            )
+
 
 class TestConvertVhdCompare(ImagoTestBase):
     """Test comparing VHD images against raw equivalents.

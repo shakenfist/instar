@@ -324,6 +324,21 @@ requirements exceeding the default 32 MiB guest allocation. The
 `--max-guest-memory` CLI flag provides infrastructure for future
 implementation.
 
+## Test Image Generation
+
+Synthetic test images that cannot be created by `qemu-img` are built
+by scripts in `scripts/`:
+
+- `create-vhd-testdata.sh` — Fixed VHD (disk_type=2) and differencing
+  VHD (disk_type=4) via Python struct packing and qemu-img patching
+- `create-vmdk-testdata.sh` — Binary VMDK4 with multi-extent descriptor
+- `create-luks-testdata.sh` — LUKS v1 containers with inner formats
+- `create-check-testdata.sh` — QCOW2 images with specific corruptions
+
+Generated images live in `../imago-testdata/custom/format-coverage/`.
+The test manifest (`tests/manifest.json`) references them with
+`generated_by` and `skip_qemu_img: true`.
+
 ## oslo.utils Cross-Validation
 
 `tests/test_oslo_crossval.py` runs both imago and oslo.utils

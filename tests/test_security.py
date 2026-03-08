@@ -163,12 +163,86 @@ class TestSecurityFeatureDetection(ImagoTestBase):
         """
         Verify imago handles VMDK descriptors without following extent paths.
 
-        VMDK descriptor files can reference arbitrary files as extents.
-        imago should parse the descriptor but not read referenced extents.
+        VMDK descriptor files can reference arbitrary files as extents
+        (e.g. /etc/passwd). Text-only VMDK descriptors have no binary
+        magic, so imago rejects them as unknown format — extent paths
+        are never followed.
         """
-        # TODO: Implement when we have VMDK descriptor test infrastructure
-        # Need to create a VMDK descriptor pointing to a sensitive file
-        self.skipTest('VMDK descriptor security test not yet implemented')
+        image = self.get_image('vmdk-path-traversal')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+
+        # Text-only descriptor has no binary magic, so imago
+        # reports "unknown" format — extent paths never followed
+        stdout, stderr, rc = self.run_imago_info(image.path)
+        self.assertEqual(
+            0, rc,
+            f'imago info failed unexpectedly: {stderr}'
+        )
+        self.assertIn(
+            'unknown', stdout.lower(),
+            f'Expected unknown format for text descriptor: {stdout}'
+        )
+
+        # No /etc/passwd content should appear in output
+        combined = stdout.lower() + stderr.lower()
+        self.assertNotIn(
+            'root:', combined,
+            '/etc/passwd content leaked in output!'
+        )
+
+        # With --unsafe-quirks, accepted as raw (still no leak)
+        stdout_u, stderr_u, rc_u = self.run_imago_info(
+            image.path, unsafe_quirks=True
+        )
+        self.assertEqual(
+            0, rc_u,
+            f'--unsafe-quirks should accept as raw: {stderr_u}'
+        )
+        self.assertIn(
+            'raw', stdout_u.lower(),
+            'Expected raw format with --unsafe-quirks'
+        )
+        combined_u = stdout_u.lower() + stderr_u.lower()
+        self.assertNotIn(
+            'root:', combined_u,
+            '/etc/passwd content leaked with --unsafe-quirks!'
+        )
+
+    def test_imago_handles_vmdk_no_extents_safely(self):
+        """
+        Verify imago rejects VMDK descriptors with no extent declarations.
+
+        A VMDK descriptor with no RW/RDONLY/NOACCESS extent lines is
+        invalid. imago should reject it as unknown format (no binary
+        magic).
+        """
+        image = self.get_image('vmdk-no-extents')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+
+        stdout, stderr, rc = self.run_imago_info(image.path)
+        self.assertEqual(
+            0, rc,
+            f'imago info failed unexpectedly: {stderr}'
+        )
+        self.assertIn(
+            'unknown', stdout.lower(),
+            f'Expected unknown format for no-extent descriptor: {stdout}'
+        )
+
+        # With --unsafe-quirks, accepted as raw
+        stdout_u, stderr_u, rc_u = self.run_imago_info(
+            image.path, unsafe_quirks=True
+        )
+        self.assertEqual(
+            0, rc_u,
+            f'--unsafe-quirks should accept as raw: {stderr_u}'
+        )
+        self.assertIn(
+            'raw', stdout_u.lower(),
+            'Expected raw format with --unsafe-quirks'
+        )
 
 
 class TestBackingChainSecurity(ImagoTestBase):

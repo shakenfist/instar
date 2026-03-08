@@ -300,10 +300,8 @@ Implemented full VHDX support in 5 sub-phases:
 17. **Byte-order helper duplication grows** — DONE (Phase 14a,
     same as item 11). All helpers consolidated in shared crate.
 
-18. **Two-pass zero check in convert_to_vhdx** — Same pattern as
-    item 12 (VHD). Each 32 MiB VHDX block is read twice when
-    skip-zeros is enabled. Performance impact is minimal for
-    typical images due to OS page cache.
+18. **Two-pass zero check in convert_to_vhdx** — DONE (Phase 15e).
+    Same fix as item 12: `break` after `block_all_zeros = false`.
 
 ---
 
@@ -500,13 +498,10 @@ Phase 9 (VHD) is complete. All sub-phases 9a-9e committed.
 11. **Byte-order helper duplication** — DONE (Phase 14a). Moved all
     12 helpers to shared crate, updated ~30 call sites.
 
-12. **Two-pass zero check in convert_to_vhd** — When skip-zeros
-    is enabled, VHD output reads each 2 MiB block twice: once to
-    check if all-zeros, once to write. This is a memory vs I/O
-    tradeoff (block is 2 MiB but I/O buffer is 64 KB, so the
-    entire block can't be buffered). Performance impact is minor
-    for typical images. Could be optimized with a streaming
-    approach that buffers results across chunks.
+12. **Two-pass zero check in convert_to_vhd** — DONE (Phase 15e).
+    Added `break` after `block_all_zeros = false` to bail early
+    when first non-zero chunk is found, avoiding up to 31
+    unnecessary reads per block.
 
 ### Test Gaps (Phase 9)
 
@@ -517,12 +512,12 @@ Phase 9 (VHD) is complete. All sub-phases 9a-9e committed.
 14. **No VHD compare integration tests** — DONE (Phase 14d).
     Added TestConvertVhdCompare.
 
-15. **No fixed VHD test image** — All VHD test images are
-    dynamic. No fixed VHD (disk_type=2) test image exists.
+15. **No fixed VHD test image** — DONE (Phase 15b). Synthetic
+    10 MiB fixed VHD with MBR signature and 0xBE pattern.
 
-16. **No differencing VHD test image** — Code handles
-    disk_type=4 (differencing) in check, but no test image
-    exercises this path.
+16. **No differencing VHD test image** — DONE (Phase 15d).
+    Dynamic VHD patched to disk_type=4 exercises
+    DISK_TYPE_DIFFERENCING acceptance.
 
 ## Deferred Work (from Phase 8 review)
 
@@ -546,15 +541,14 @@ Phase 9 (VHD) is complete. All sub-phases 9a-9e committed.
    `run_in_ci=false` (not available in CI). Consider making them available
    or adding local-only tests.
 
-5. **Security test placeholders** — `test_imago_does_not_follow_external_data`
-   DONE (Phase 13d, implemented as two tests:
-   `test_imago_reports_external_data_file_without_reading_content` and
-   `test_imago_reports_external_data_file_in_json`).
-   `test_imago_handles_vmdk_descriptor_safely` remains SKIPPED — needs
-   VMDK descriptor extent parsing and the vmdk-path-traversal test image.
+5. **Security test placeholders** — DONE (Phase 13d + 15a).
+   External data test done in Phase 13d. VMDK descriptor security
+   test done in Phase 15a (text-only descriptors rejected as
+   unknown format — correct security behavior).
 
-6. **Multi-extent VMDK tests** — No test images exercise the multi-extent
-   detection and error path. Would need a multi-extent test image.
+6. **Multi-extent VMDK tests** — DONE (Phase 15c). Synthetic
+   binary VMDK4 with two extent lines exercises
+   `count_extent_lines()` and FLAG_NOT_SUPPORTED path.
 
 ### oslo.utils format_inspector developments (Feb 2026)
 
@@ -629,6 +623,50 @@ include temp space checks for large images.
   buffer for input I/O and a carry buffer for the 512-byte leftover
   between output sectors.
 
+## Phase 15: Test Coverage Gaps & Minor Optimizations ✓
+
+**Status:** Complete (March 2026)
+
+Addresses six deferred work items from Phases 8–10 reviews.
+
+### 15a: VMDK descriptor security test ✓
+
+Un-skipped `test_imago_handles_vmdk_descriptor_safely` and implemented
+the test body. Text-only VMDK descriptors are correctly rejected as
+unknown format (no binary magic = no VMDK parsing = no extent path
+following). Added `test_imago_handles_vmdk_no_extents_safely`.
+
+### 15b: Fixed VHD test image ✓
+
+Created `scripts/create-vhd-testdata.sh` generating a 10 MiB fixed VHD
+(disk_type=2) with MBR signature and 0xBE data pattern. Added check and
+convert tests exercising `init_fixed()`.
+
+### 15c: Multi-extent VMDK test ✓
+
+Created `scripts/create-vmdk-testdata.sh` generating a synthetic binary
+VMDK4 with two extent lines. Exercises `count_extent_lines()` and the
+FLAG_NOT_SUPPORTED early-bail path in check.
+
+### 15d: Differencing VHD test image ✓
+
+Extended VHD testdata script to create a differencing VHD (disk_type=4)
+by patching a qemu-img dynamic VHD. Exercises DISK_TYPE_DIFFERENCING
+acceptance in `VhdState::init()`.
+
+### 15e: VHD/VHDX skip-zeros bail-early ✓
+
+Added `break` after `block_all_zeros = false` in both VHD and VHDX
+zero-check loops. Avoids reading up to 31 (VHD) or 511 (VHDX)
+unnecessary chunks per data-heavy block.
+
+### 15f: Documentation ✓
+
+Updated `docs/format-coverage.md` with new test images. Marked deferred
+items 5, 6, 12, 15, 16, 18 as done in this file.
+
+---
+
 ## Deferred Work (from Phase 12 review)
 
 ### Future LUKS Enhancements
@@ -648,6 +686,25 @@ include temp space checks for large images.
 21. **LUKS convert support** — Currently LUKS is info-only.
     Future: `imago convert --luks-passphrase` could decrypt
     LUKS and convert the inner image in a single pass.
+
+### Format Capability Gaps
+
+22. **Compressed clusters >64KB** — Decompression is limited to
+    cluster sizes up to 64KB (MAX_SECTOR_SIZE). Clusters larger
+    than 64KB (e.g. 256KB, 2MB) cannot be decompressed because
+    the full compressed payload must fit in a single I/O buffer.
+    Uncompressed clusters up to 2MB work fine. Would require a
+    multi-sector decompression buffer or streaming decompressor.
+
+23. **QCOW2 encryption** — QCOW2-native encryption (AES-CBC in
+    v2, LUKS-in-QCOW2 in v3) is not supported. The info operation
+    detects encryption feature bits but does not decrypt. Convert
+    rejects encrypted images.
+
+24. **QCOW2 snapshots** — Snapshot table parsing, internal
+    snapshot extraction, and snapshot-aware conversion are not
+    implemented. The info operation reports snapshot count but
+    does not enumerate them.
 
 ## Verification
 
