@@ -251,7 +251,7 @@ structure layout and VMM-to-guest data flow.
 
 QEMU Copy-On-Write version 2/3. Supported features:
 - Sparse allocation with cluster sizes 512B-2MB (cluster_bits 9-21)
-- Compression (zlib, zstd) for clusters up to 64KB
+- Compression (zlib, zstd) for clusters up to 2MB
 - Backing file chains (automatic flattening)
 - Refcount widths: 1, 2, 4, 8, 16, 32, 64 bits
 - Extended L2 entries (16-byte with subcluster bitmaps)
