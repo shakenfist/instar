@@ -689,22 +689,23 @@ items 5, 6, 12, 15, 16, 18 as done in this file.
 
 ### Format Capability Gaps
 
-22. **Compressed clusters >64KB** — Decompression is limited to
-    cluster sizes up to 64KB (MAX_SECTOR_SIZE). Clusters larger
-    than 64KB (e.g. 256KB, 2MB) cannot be decompressed because
-    the full compressed payload must fit in a single I/O buffer.
-    Uncompressed clusters up to 2MB work fine. Would require a
-    multi-sector decompression buffer or streaming decompressor.
+22. ~~**Compressed clusters >64KB**~~ — **Done (Phase 16a).**
+    Added 2MB decompression staging buffer. Compressed clusters
+    up to 2MB are now decompressed via a staging buffer, with
+    chunk-level caching to avoid re-decompression. The 128KB
+    compressed input buffer limit still applies.
 
-23. **QCOW2 encryption** — QCOW2-native encryption (AES-CBC in
-    v2, LUKS-in-QCOW2 in v3) is not supported. The info operation
-    detects encryption feature bits but does not decrypt. Convert
-    rejects encrypted images.
+23. ~~**QCOW2 encryption**~~ — **Done (Phase 16b).** Legacy
+    AES-128-CBC decryption (crypt_method=1) is supported via
+    `--qcow2-password`. Per-sector CBC with PLAIN64 IV using
+    virtual sector numbers. LUKS-in-QCOW2 (crypt_method=2)
+    is not yet supported.
 
-24. **QCOW2 snapshots** — Snapshot table parsing, internal
-    snapshot extraction, and snapshot-aware conversion are not
-    implemented. The info operation reports snapshot count but
-    does not enumerate them.
+24. ~~**QCOW2 snapshots**~~ — **Done (Phase 16c).** Snapshot
+    table parsing, detection (info reports count), and extraction
+    via `convert --snapshot <ID|name>` are implemented. Up to 16
+    snapshots are parsed. Extraction works by overriding the
+    active L1 table with the snapshot's L1 table.
 
 ## Verification
 
