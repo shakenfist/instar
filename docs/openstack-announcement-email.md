@@ -91,7 +91,7 @@ things. I don't know how OpenStack feels about protobufs however.
 By "command line compatible", I mean that my current goal is to
 provide a version of `imago info` and `imago convert` that is
 byte for byte identical to the output of the same `qemu-img info`
-or `qemu-convert` command. This has some interesting edge cases
+or `qemu-img convert` command. This has some interesting edge cases
 in as much as `qemu-img` has changed its output format at least
 once since 2020. Additionally, I suspect I've found at least one
 `qemu-img` bug in this process. Imago resolves these issues by
