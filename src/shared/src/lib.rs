@@ -403,9 +403,11 @@ pub const MAX_SECTOR_SIZE: usize = 65536;
 /// buffered fully.
 pub const MAX_CLUSTER_SIZE: usize = 2 * 1024 * 1024;
 
-/// Compressed cluster read buffer size. Compressed data in QCOW2 can
-/// straddle a sector boundary, so we need room for 2 sectors.
-pub const COMPRESSED_BUF_SIZE: usize = 2 * MAX_SECTOR_SIZE;
+/// Compressed cluster read buffer size. Must hold the worst-case sector
+/// reads for a compressed cluster: up to MAX_CLUSTER_SIZE of compressed
+/// data, plus one extra sector because compressed data can straddle a
+/// sector boundary.
+pub const COMPRESSED_BUF_SIZE: usize = MAX_CLUSTER_SIZE + MAX_SECTOR_SIZE;
 
 /// Result from get_operation_config (FFI-safe alternative to tuple)
 #[repr(C)]
@@ -682,6 +684,8 @@ pub struct Qcow2Info {
     pub _pad: [u8; 1],
     /// Number of refcount bits (typically 16)
     pub refcount_bits: u32,
+    /// Number of snapshots in the snapshot table
+    pub nb_snapshots: u32,
 }
 
 impl Qcow2Info {
@@ -697,6 +701,7 @@ impl Qcow2Info {
             backing_format: BackingFormat::None,
             _pad: [0; 1],
             refcount_bits: 16,
+            nb_snapshots: 0,
         }
     }
 
@@ -1501,6 +1506,9 @@ impl CheckResult {
 // Compare operation configuration and results
 // ============================================================================
 
+/// Maximum passphrase length for compare config QCOW2 AES decryption.
+pub const COMPARE_CONFIG_MAX_PASSPHRASE: usize = 256;
+
 /// Configuration for the compare operation.
 ///
 /// This structure is written to OPERATION_CONFIG_ADDR by the VMM.
@@ -1521,6 +1529,15 @@ pub struct CompareConfig {
     /// Devices [image1_device_count, image1_device_count + image2_device_count)
     /// belong to image2's chain.
     pub image2_device_count: u32,
+
+    /// QCOW2 AES passphrase length (0 = no passphrase provided)
+    pub passphrase_len: u32,
+
+    /// Padding for alignment
+    pub _pad: u32,
+
+    /// QCOW2 AES passphrase (null-padded, max 256 bytes)
+    pub passphrase: [u8; COMPARE_CONFIG_MAX_PASSPHRASE],
 }
 
 impl CompareConfig {
@@ -1536,6 +1553,9 @@ impl CompareConfig {
     /// Flag: Verbose logging
     pub const FLAG_VERBOSE: u32 = 1 << 31;
 
+    /// Flag: Decrypt AES-encrypted QCOW2 input
+    pub const FLAG_DECRYPT_AES: u32 = 1 << 2;
+
     /// Create a default config
     pub const fn default_config() -> Self {
         Self {
@@ -1543,6 +1563,9 @@ impl CompareConfig {
             flags: 0,
             image1_device_count: 1,
             image2_device_count: 1,
+            passphrase_len: 0,
+            _pad: 0,
+            passphrase: [0; COMPARE_CONFIG_MAX_PASSPHRASE],
         }
     }
 
@@ -1559,6 +1582,17 @@ impl CompareConfig {
     /// Check if quiet flag is set
     pub fn is_quiet(&self) -> bool {
         (self.flags & Self::FLAG_QUIET) != 0
+    }
+
+    /// Check if a passphrase was provided for AES decryption.
+    pub fn has_passphrase(&self) -> bool {
+        self.passphrase_len > 0
+    }
+
+    /// Get the passphrase bytes (up to passphrase_len).
+    pub fn passphrase_bytes(&self) -> &[u8] {
+        let len = (self.passphrase_len as usize).min(COMPARE_CONFIG_MAX_PASSPHRASE);
+        &self.passphrase[..len]
     }
 
     /// Number of devices in image1's backing chain.
@@ -1657,6 +1691,10 @@ impl CompareResult {
     }
 }
 
+/// Maximum passphrase length for QCOW2 AES decryption.
+pub const CONVERT_CONFIG_MAX_PASSPHRASE: usize = 256;
+pub const CONVERT_CONFIG_MAX_SNAPSHOT_ID: usize = 64;
+
 /// Configuration for the convert operation.
 ///
 /// This structure is written to OPERATION_CONFIG_ADDR by the VMM.
@@ -1678,6 +1716,24 @@ pub struct ConvertConfig {
     /// Output cluster bits for QCOW2 output (0 = default 16 = 64KB).
     /// Valid range: 9..=16. Ignored for non-QCOW2 output formats.
     pub output_cluster_bits: u32,
+
+    /// QCOW2 AES passphrase length (0 = no passphrase provided)
+    pub passphrase_len: u32,
+
+    /// Padding for alignment
+    pub _pad: u32,
+
+    /// QCOW2 AES passphrase (null-padded, max 256 bytes)
+    pub passphrase: [u8; CONVERT_CONFIG_MAX_PASSPHRASE],
+
+    /// Snapshot ID or name length (0 = no snapshot, use active image)
+    pub snapshot_id_len: u32,
+
+    /// Padding for alignment
+    pub _pad2: u32,
+
+    /// Snapshot ID or name (null-padded, max 64 bytes)
+    pub snapshot_id: [u8; CONVERT_CONFIG_MAX_SNAPSHOT_ID],
 }
 
 impl ConvertConfig {
@@ -1690,6 +1746,9 @@ impl ConvertConfig {
     /// Flag: Compress data clusters in QCOW2 output
     pub const FLAG_COMPRESS: u32 = 1 << 1;
 
+    /// Flag: Decrypt AES-encrypted QCOW2 input
+    pub const FLAG_DECRYPT_AES: u32 = 1 << 2;
+
     /// Flag: Verbose logging
     pub const FLAG_VERBOSE: u32 = 1 << 31;
 
@@ -1701,6 +1760,12 @@ impl ConvertConfig {
             input_device_count: 1,
             target_format: 0,       // Raw
             output_cluster_bits: 0, // Default (16 = 64KB)
+            passphrase_len: 0,
+            _pad: 0,
+            passphrase: [0; CONVERT_CONFIG_MAX_PASSPHRASE],
+            snapshot_id_len: 0,
+            _pad2: 0,
+            snapshot_id: [0; CONVERT_CONFIG_MAX_SNAPSHOT_ID],
         }
     }
 
@@ -1742,6 +1807,28 @@ impl ConvertConfig {
         } else {
             16
         }
+    }
+
+    /// Check if a passphrase was provided for AES decryption.
+    pub fn has_passphrase(&self) -> bool {
+        self.passphrase_len > 0
+    }
+
+    /// Get the passphrase bytes (up to passphrase_len).
+    pub fn passphrase_bytes(&self) -> &[u8] {
+        let len = (self.passphrase_len as usize).min(CONVERT_CONFIG_MAX_PASSPHRASE);
+        &self.passphrase[..len]
+    }
+
+    /// Check if a snapshot ID was provided.
+    pub fn has_snapshot_id(&self) -> bool {
+        self.snapshot_id_len > 0
+    }
+
+    /// Get the snapshot ID bytes (up to snapshot_id_len).
+    pub fn snapshot_id_bytes(&self) -> &[u8] {
+        let len = (self.snapshot_id_len as usize).min(CONVERT_CONFIG_MAX_SNAPSHOT_ID);
+        &self.snapshot_id[..len]
     }
 }
 

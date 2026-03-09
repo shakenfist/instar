@@ -376,9 +376,10 @@ class TestConvertManifestImages(ImagoTestBase):
         gib = vsize / (1024 ** 3)
         return max(120, int(120 + gib * 15))
 
-    # Max I/O buffer size: compressed clusters need a full-cluster
-    # decompression buffer, limited to MAX_SECTOR_SIZE (64KB).
-    MAX_DECOMPRESS_CLUSTER = 65536
+    # Max cluster size for compressed cluster decompression. Both the
+    # decompression staging buffer and the compressed input buffer now
+    # support clusters up to MAX_CLUSTER_SIZE (2MB).
+    MAX_DECOMPRESS_CLUSTER = 2097152
 
     def _skip_if_unsupported(self, image_id, image_path):
         """Skip test if image has unsupported features."""
@@ -394,8 +395,8 @@ class TestConvertManifestImages(ImagoTestBase):
                 f'{self.MIN_CLUSTER_SIZE} (unsupported)'
             )
 
-        # Compressed clusters with large cluster sizes can't be
-        # decompressed (buffer limited to MAX_SECTOR_SIZE).
+        # Compressed clusters with cluster sizes exceeding the
+        # decompression limit cannot be handled.
         if csize and csize > self.MAX_DECOMPRESS_CLUSTER:
             result = subprocess.run(
                 [
@@ -1522,8 +1523,8 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
         gib = vsize / (1024 ** 3)
         return max(120, int(120 + gib * 15))
 
-    # Max I/O buffer size for decompression
-    MAX_DECOMPRESS_CLUSTER = 65536
+    # Max cluster size for compressed cluster decompression
+    MAX_DECOMPRESS_CLUSTER = 2097152
 
     def _skip_if_unsupported(self, image_id, image_path):
         """Skip if image has unsupported features."""
@@ -1539,8 +1540,8 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
                 f'{self.MIN_CLUSTER_SIZE}'
             )
 
-        # Compressed clusters with large cluster sizes
-        # can't be decompressed (buffer limited).
+        # Compressed clusters exceeding the decompression
+        # limit cannot be handled.
         if csize and csize > self.MAX_DECOMPRESS_CLUSTER:
             result = subprocess.run(
                 [
@@ -3299,3 +3300,282 @@ class TestConvertVhdToQcow2Roundtrip(ImagoTestBase):
     def test_virtualpc_vhd_qcow2_roundtrip(self):
         """VHD (Virtual PC) -> QCOW2 -> raw round-trip."""
         self._test_vhd_qcow2_roundtrip('virtualpc-vhd')
+
+
+class TestConvertSnapshot(ImagoTestBase):
+    """Test conversion of specific QCOW2 snapshots."""
+
+    def test_convert_snap1(self):
+        """Convert snap1 and verify 0xAA pattern."""
+        image = self.get_image('qcow2-snapshots')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.raw') as raw_out, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as qemu_raw:
+            # Convert snap1 with imago
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(raw_out.name),
+                snapshot='snap1'
+            )
+            self.assertEqual(
+                rc, 0,
+                f'Snapshot convert failed: {stderr}'
+            )
+
+            # Convert snap1 with qemu-img
+            subprocess.run(
+                [
+                    'qemu-img', 'convert',
+                    '-l', 'snap1',
+                    '-f', 'qcow2', '-O', 'raw',
+                    str(image.path),
+                    qemu_raw.name,
+                ],
+                capture_output=True, text=True,
+                timeout=30, check=True
+            )
+
+            # Compare outputs
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(raw_out.name),
+                Path(qemu_raw.name)
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'snap1 differs from qemu-img: '
+                f'{cmp_out}'
+            )
+
+    def test_convert_snap2(self):
+        """Convert snap2 and verify 0xBB pattern."""
+        image = self.get_image('qcow2-snapshots')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.raw') as raw_out, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as qemu_raw:
+            # Convert snap2 with imago
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(raw_out.name),
+                snapshot='snap2'
+            )
+            self.assertEqual(
+                rc, 0,
+                f'Snapshot convert failed: {stderr}'
+            )
+
+            # Convert snap2 with qemu-img
+            subprocess.run(
+                [
+                    'qemu-img', 'convert',
+                    '-l', 'snap2',
+                    '-f', 'qcow2', '-O', 'raw',
+                    str(image.path),
+                    qemu_raw.name,
+                ],
+                capture_output=True, text=True,
+                timeout=30, check=True
+            )
+
+            # Compare outputs
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(raw_out.name),
+                Path(qemu_raw.name)
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'snap2 differs from qemu-img: '
+                f'{cmp_out}'
+            )
+
+    def test_convert_by_snapshot_id(self):
+        """Convert by numeric snapshot ID (1) instead of
+        name."""
+        image = self.get_image('qcow2-snapshots')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.raw') as raw_out, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as qemu_raw:
+            # Convert snapshot ID "1" with imago
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(raw_out.name),
+                snapshot='1'
+            )
+            self.assertEqual(
+                rc, 0,
+                f'Snapshot ID convert failed: '
+                f'{stderr}'
+            )
+
+            # Convert snap1 with qemu-img
+            subprocess.run(
+                [
+                    'qemu-img', 'convert',
+                    '-l', 'snapshot.name=snap1',
+                    '-f', 'qcow2', '-O', 'raw',
+                    str(image.path),
+                    qemu_raw.name,
+                ],
+                capture_output=True, text=True,
+                timeout=30, check=True
+            )
+
+            # Compare outputs — ID "1" should match snap1
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(raw_out.name),
+                Path(qemu_raw.name)
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Snapshot ID 1 differs from snap1: '
+                f'{cmp_out}'
+            )
+
+    def test_convert_nonexistent_snapshot(self):
+        """Converting a nonexistent snapshot should fail."""
+        image = self.get_image('qcow2-snapshots')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.raw') as raw_out:
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(raw_out.name),
+                snapshot='nonexistent'
+            )
+            self.assertNotEqual(
+                rc, 0,
+                'Should fail for nonexistent snapshot'
+            )
+
+
+class TestConvertEncryptedQcow2(ImagoTestBase):
+    """Test conversion of AES-encrypted QCOW2 images."""
+
+    def test_convert_encrypted_aes_to_raw(self):
+        """Convert AES-encrypted QCOW2 to raw with password."""
+        image = self.get_image('qcow2-encrypted-aes')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.raw') as raw_out, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as qemu_raw:
+            # Convert with imago using password
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(raw_out.name),
+                qcow2_password='testpass'
+            )
+            self.assertEqual(
+                rc, 0,
+                f'Encrypted convert failed: {stderr}'
+            )
+
+            # Convert with qemu-img for baseline
+            subprocess.run(
+                [
+                    'qemu-img', 'convert',
+                    '--object',
+                    'secret,id=sec0,data=testpass',
+                    '--image-opts',
+                    'driver=qcow2,encrypt.key-secret=sec0,'
+                    'file.driver=file,'
+                    f'file.filename={image.path}',
+                    '-O', 'raw',
+                    qemu_raw.name,
+                ],
+                capture_output=True, text=True,
+                timeout=30, check=True
+            )
+
+            # Compare outputs
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(raw_out.name),
+                Path(qemu_raw.name)
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Output differs from qemu-img: '
+                f'{cmp_out}'
+            )
+
+    def test_convert_encrypted_without_password(self):
+        """Converting encrypted QCOW2 without password
+        should fail or produce wrong output."""
+        image = self.get_image('qcow2-encrypted-aes')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.raw') as raw_out:
+            # Convert without password - should still
+            # produce output but data will be encrypted
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(raw_out.name)
+            )
+            # The conversion may succeed (data is just
+            # not decrypted) or fail - either is acceptable
+            # as long as it doesn't crash
+            self.assertIn(
+                rc, [0, 1],
+                f'Unexpected crash: {stderr}'
+            )
+
+    def test_convert_encrypted_wrong_password(self):
+        """Converting with wrong password should produce
+        different output than correct password."""
+        image = self.get_image('qcow2-encrypted-aes')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.raw') as correct_raw, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as wrong_raw:
+            # Convert with correct password
+            _, _, rc1 = self.run_imago_convert(
+                image.path, Path(correct_raw.name),
+                qcow2_password='testpass'
+            )
+            self.assertEqual(rc1, 0)
+
+            # Convert with wrong password
+            _, _, rc2 = self.run_imago_convert(
+                image.path, Path(wrong_raw.name),
+                qcow2_password='wrongpass'
+            )
+            self.assertEqual(rc2, 0)
+
+            # Outputs should differ
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(correct_raw.name),
+                Path(wrong_raw.name)
+            )
+            self.assertNotEqual(
+                cmp_rc, 0,
+                'Wrong password produced same output '
+                'as correct password'
+            )

@@ -193,8 +193,11 @@ imago convert -p 5 input.qcow2 output.raw
 
 The convert operation reads the virtual content of an input image (including
 backing chain flattening) and writes it in the requested output format.
-Compressed clusters (zlib/deflate and ZSTD) are decompressed transparently.
-QCOW2 v3 images with extended L2 entries (subclusters) are also supported.
+Compressed clusters (zlib/deflate and ZSTD) are decompressed transparently,
+including clusters up to 2MB. QCOW2 v3 images with extended L2 entries
+(subclusters) are also supported. Legacy AES-128-CBC encrypted QCOW2 images
+(`crypt_method=1`) can be decrypted with `--qcow2-password`. Individual
+snapshots can be extracted with `--snapshot <name-or-id>`.
 
 By default, convert produces sparse output by skipping zero-filled clusters
 (matching `qemu-img convert` behavior). Use `--no-skip-zeros` for dense output.
@@ -207,9 +210,6 @@ Supported output formats:
 - **vmdk** - VMDK monolithicSparse output, optional DEFLATE compression (`-c`)
 - **vpc** - VHD dynamic output with 2 MiB blocks
 - **vhdx** - VHDX dynamic output with 32 MiB blocks
-
-**Limitations:** Compressed clusters with cluster sizes above 64KB cannot
-be decompressed. Uncompressed clusters up to 2MB are fully supported.
 
 ### Version Compatibility
 

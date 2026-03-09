@@ -292,6 +292,10 @@ pub struct QcowHeader {
     pub incompatible_features: u64,
     pub compatible_features: u64,
     pub compression_type: u8,
+    /// Number of snapshots in the snapshot table
+    pub nb_snapshots: u32,
+    /// Byte offset of the snapshot table in the file
+    pub snapshots_offset: u64,
     // Derived flags
     pub dirty: bool,
     pub corrupt: bool,
@@ -335,6 +339,8 @@ impl QcowHeader {
         let crypt_method = be_u32(header, CRYPT_METHOD_OFFSET);
         let refcount_table_offset = be_u64(header, REFCOUNT_TABLE_OFFSET_OFFSET);
         let refcount_table_clusters = be_u32(header, REFCOUNT_TABLE_CLUSTERS_OFFSET);
+        let nb_snapshots = be_u32(header, NB_SNAPSHOTS_OFFSET);
+        let snapshots_offset = be_u64(header, SNAPSHOTS_OFFSET_OFFSET);
 
         // v3 specific fields
         let (refcount_bits, incompatible_features, compatible_features, compression_type) =
@@ -369,6 +375,8 @@ impl QcowHeader {
             incompatible_features,
             compatible_features,
             compression_type,
+            nb_snapshots,
+            snapshots_offset,
             dirty: (incompatible_features & INCOMPAT_DIRTY) != 0,
             corrupt: (incompatible_features & INCOMPAT_CORRUPT) != 0,
             has_external_data: (incompatible_features & INCOMPAT_EXTERNAL_DATA) != 0,
@@ -549,6 +557,299 @@ pub unsafe fn read_backing_file(
 }
 
 // ============================================================================
+// Snapshot table parsing
+// ============================================================================
+
+/// Maximum number of snapshots we will parse (memory constraint).
+pub const MAX_SNAPSHOTS: usize = 16;
+
+/// Parsed snapshot table entry.
+pub struct SnapshotEntry {
+    /// Byte offset of this snapshot's L1 table
+    pub l1_table_offset: u64,
+    /// Number of entries in this snapshot's L1 table
+    pub l1_size: u32,
+    /// Snapshot ID string length
+    pub id_len: u16,
+    /// Snapshot name string length
+    pub name_len: u16,
+    /// Snapshot ID (null-terminated, max 63 chars)
+    pub id: [u8; 64],
+    /// Snapshot name (null-terminated, max 63 chars)
+    pub name: [u8; 64],
+    /// Creation timestamp (seconds since epoch)
+    pub date_sec: u32,
+    /// VM state size in bytes
+    pub vm_state_size: u32,
+}
+
+impl SnapshotEntry {
+    const fn zeroed() -> Self {
+        Self {
+            l1_table_offset: 0,
+            l1_size: 0,
+            id_len: 0,
+            name_len: 0,
+            id: [0; 64],
+            name: [0; 64],
+            date_sec: 0,
+            vm_state_size: 0,
+        }
+    }
+}
+
+/// Result of parsing the snapshot table.
+pub struct SnapshotTable {
+    /// Number of valid entries
+    pub count: usize,
+    /// Parsed entries (up to MAX_SNAPSHOTS)
+    pub entries: [SnapshotEntry; MAX_SNAPSHOTS],
+}
+
+impl SnapshotTable {
+    const fn empty() -> Self {
+        Self {
+            count: 0,
+            entries: [
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+                SnapshotEntry::zeroed(),
+            ],
+        }
+    }
+}
+
+/// Parse the QCOW2 snapshot table from disk.
+///
+/// Reads variable-length snapshot entries starting at `snapshots_offset`.
+/// Each entry has a fixed 40-byte header followed by variable-length
+/// ID and name strings, then padding to an 8-byte boundary.
+///
+/// # Safety
+///
+/// `call_table` must be valid. `cache_buf` must point to at least
+/// `MAX_SECTOR_SIZE` writable bytes.
+pub unsafe fn parse_snapshot_table(
+    call_table: &CallTable,
+    device_idx: u32,
+    nb_snapshots: u32,
+    snapshots_offset: u64,
+    sector_size: usize,
+    input_capacity: u64,
+    cache_buf: *mut u8,
+    bytes_read: &mut u64,
+) -> SnapshotTable {
+    let mut table = SnapshotTable::empty();
+    let count = (nb_snapshots as usize).min(MAX_SNAPSHOTS);
+    let mut offset = snapshots_offset;
+    let mut cached_sector = u64::MAX;
+
+    for i in 0..count {
+        // Snapshot header layout (40 bytes):
+        //   0-3:   l1_table_offset (u64) [high word]
+        //   ...actually the format is:
+        //   0-7:   l1_table_offset (u64 BE)
+        //   8-11:  l1_size (u32 BE)
+        //   12-13: id_str_size (u16 BE)
+        //   14-15: name_size (u16 BE)
+        //   16-19: date_sec (u32 BE)
+        //   20-23: date_nsec (u32 BE)
+        //   24-31: vm_clock_nsec (u64 BE)
+        //   32-35: vm_state_size (u32 BE)
+        //   36-39: extra_data_size (u32 BE)
+        //   Then: extra_data_size bytes of extra data
+        //   Then: id_str_size bytes (not null-terminated)
+        //   Then: name_size bytes (not null-terminated)
+        //   Then: padding to 8-byte boundary
+
+        let l1_table_offset = match read_u64_be_cached(
+            call_table,
+            device_idx,
+            offset,
+            sector_size,
+            input_capacity,
+            &mut cached_sector,
+            cache_buf,
+            bytes_read,
+        ) {
+            Some(v) => v,
+            None => break,
+        };
+
+        let l1_size = match read_u32_be_cached(
+            call_table,
+            device_idx,
+            offset + 8,
+            sector_size,
+            input_capacity,
+            &mut cached_sector,
+            cache_buf,
+            bytes_read,
+        ) {
+            Some(v) => v,
+            None => break,
+        };
+
+        let id_str_size = match read_u16_be_cached(
+            call_table,
+            device_idx,
+            offset + 12,
+            sector_size,
+            input_capacity,
+            &mut cached_sector,
+            cache_buf,
+            bytes_read,
+        ) {
+            Some(v) => v,
+            None => break,
+        };
+
+        let name_size = match read_u16_be_cached(
+            call_table,
+            device_idx,
+            offset + 14,
+            sector_size,
+            input_capacity,
+            &mut cached_sector,
+            cache_buf,
+            bytes_read,
+        ) {
+            Some(v) => v,
+            None => break,
+        };
+
+        let date_sec = match read_u32_be_cached(
+            call_table,
+            device_idx,
+            offset + 16,
+            sector_size,
+            input_capacity,
+            &mut cached_sector,
+            cache_buf,
+            bytes_read,
+        ) {
+            Some(v) => v,
+            None => break,
+        };
+
+        let vm_state_size = match read_u32_be_cached(
+            call_table,
+            device_idx,
+            offset + 32,
+            sector_size,
+            input_capacity,
+            &mut cached_sector,
+            cache_buf,
+            bytes_read,
+        ) {
+            Some(v) => v,
+            None => break,
+        };
+
+        let extra_data_size = match read_u32_be_cached(
+            call_table,
+            device_idx,
+            offset + 36,
+            sector_size,
+            input_capacity,
+            &mut cached_sector,
+            cache_buf,
+            bytes_read,
+        ) {
+            Some(v) => v,
+            None => break,
+        };
+
+        // Read ID string (byte by byte, up to 63 chars)
+        let id_copy_len = (id_str_size as usize).min(63);
+        let id_start = offset + 40 + extra_data_size as u64;
+        let entry = &mut table.entries[i];
+        for j in 0..id_copy_len {
+            if let Some(b) = read_u8_cached(
+                call_table,
+                device_idx,
+                id_start + j as u64,
+                sector_size,
+                input_capacity,
+                &mut cached_sector,
+                cache_buf,
+                bytes_read,
+            ) {
+                entry.id[j] = b;
+            }
+        }
+        entry.id[id_copy_len] = 0;
+
+        // Read name string (byte by byte, up to 63 chars)
+        let name_copy_len = (name_size as usize).min(63);
+        let name_start = id_start + id_str_size as u64;
+        for j in 0..name_copy_len {
+            if let Some(b) = read_u8_cached(
+                call_table,
+                device_idx,
+                name_start + j as u64,
+                sector_size,
+                input_capacity,
+                &mut cached_sector,
+                cache_buf,
+                bytes_read,
+            ) {
+                entry.name[j] = b;
+            }
+        }
+        entry.name[name_copy_len] = 0;
+
+        entry.l1_table_offset = l1_table_offset;
+        entry.l1_size = l1_size;
+        entry.id_len = id_str_size;
+        entry.name_len = name_size;
+        entry.date_sec = date_sec;
+        entry.vm_state_size = vm_state_size;
+        table.count = i + 1;
+
+        // Advance to next entry: 40 + extra_data_size + id_str_size + name_size
+        // rounded up to 8-byte boundary
+        let entry_size = 40 + extra_data_size as u64 + id_str_size as u64 + name_size as u64;
+        offset += (entry_size + 7) & !7;
+    }
+
+    table
+}
+
+/// Find a snapshot by ID or name string.
+///
+/// Returns the index into `SnapshotTable::entries` if found.
+pub fn find_snapshot(table: &SnapshotTable, needle: &[u8]) -> Option<usize> {
+    for i in 0..table.count {
+        let entry = &table.entries[i];
+        // Compare against ID
+        let id_len = entry.id_len as usize;
+        if id_len == needle.len() && entry.id[..id_len] == *needle {
+            return Some(i);
+        }
+        // Compare against name
+        let name_len = entry.name_len as usize;
+        if name_len == needle.len() && entry.name[..name_len] == *needle {
+            return Some(i);
+        }
+    }
+    None
+}
+
+// ============================================================================
 // Sector-cached I/O helpers (generated by shared::cached_read! macro)
 // ============================================================================
 
@@ -585,6 +886,8 @@ pub struct Qcow2State {
     pub incompatible_features: u64,
     /// Compression type from the v3 header (0=zlib, 1=zstd).
     pub compression_type: u8,
+    /// Encryption method from the header (0=none, 1=AES-128-CBC, 2=LUKS).
+    pub crypt_method: u32,
     /// True when INCOMPAT_EXTENDED_L2 (bit 4) is set.
     pub extended_l2: bool,
     // Sector cache tracking for L1 table reads
@@ -633,6 +936,7 @@ impl Qcow2State {
             l1_table_offset: 0,
             incompatible_features: 0,
             compression_type: 0,
+            crypt_method: 0,
             extended_l2: false,
             l1_cached_sector: u64::MAX,
             l1_cache_buf,
@@ -682,6 +986,18 @@ impl Qcow2State {
             call_table,
             device_idx,
             SIZE_OFFSET as u64,
+            sector_size,
+            input_capacity,
+            &mut state.l1_cached_sector,
+            state.l1_cache_buf,
+            bytes_read,
+        )?;
+
+        // Read crypt_method (offset 32, 4 bytes)
+        state.crypt_method = read_u32_be_cached(
+            call_table,
+            device_idx,
+            CRYPT_METHOD_OFFSET as u64,
             sector_size,
             input_capacity,
             &mut state.l1_cached_sector,
@@ -1627,6 +1943,65 @@ pub unsafe fn read_raw_sectors(
     true
 }
 
+/// Decrypt a buffer of QCOW2 data encrypted with legacy AES-128-CBC
+/// (crypt_method=1).
+///
+/// Each 512-byte sector is encrypted independently with AES-128-CBC.
+/// The IV for each sector is the virtual sector number (virtual byte
+/// offset / 512) as a little-endian u64, zero-padded to 16 bytes.
+///
+/// # Safety
+///
+/// `buf` must point to at least `len` writable bytes. `len` must be
+/// a multiple of 512. `virtual_offset` is the guest-visible byte offset
+/// of the start of the data (used to compute sector-based IVs).
+#[cfg(feature = "aes-decrypt")]
+pub unsafe fn decrypt_cluster_aes_cbc(
+    buf: *mut u8,
+    len: u64,
+    virtual_offset: u64,
+    aes_key: &[u8; 16],
+) {
+    use aes::cipher::{BlockDecrypt, KeyInit};
+    use aes::Aes128;
+
+    let cipher = Aes128::new(aes_key.into());
+    let sector_size: u64 = 512;
+    let block_size: usize = 16;
+    let num_sectors = len / sector_size;
+
+    for i in 0..num_sectors {
+        let sector_offset = (i * sector_size) as usize;
+
+        // IV: virtual sector number as LE u64, zero-padded to 16 bytes
+        let virt_sector = (virtual_offset + i * sector_size) / sector_size;
+        let mut prev = [0u8; 16];
+        prev[..8].copy_from_slice(&virt_sector.to_le_bytes());
+
+        // CBC decryption: for each 16-byte block, decrypt then XOR with
+        // the previous ciphertext block (or IV for the first block).
+        let blocks_per_sector = sector_size as usize / block_size;
+        for j in 0..blocks_per_sector {
+            let block_off = sector_offset + j * block_size;
+            let block_ptr = buf.add(block_off);
+
+            // Save ciphertext before decryption (needed for next block's XOR)
+            let mut ct = [0u8; 16];
+            core::ptr::copy_nonoverlapping(block_ptr, ct.as_mut_ptr(), 16);
+
+            // Decrypt the block in-place
+            let block = &mut *(block_ptr as *mut aes::cipher::generic_array::GenericArray<u8, _>);
+            cipher.decrypt_block(block);
+
+            // XOR with previous ciphertext (or IV)
+            for k in 0..16 {
+                *block_ptr.add(k) ^= prev[k];
+            }
+            prev = ct;
+        }
+    }
+}
+
 /// Read one cluster's worth of virtual data by walking a backing chain.
 ///
 /// For each device in the chain (starting from the top):
@@ -1642,6 +2017,12 @@ pub unsafe fn read_raw_sectors(
 /// `buf` must point to at least `chunk_size` writable bytes.
 /// `compressed_buf` must point to at least `COMPRESSED_BUF_SIZE` writable
 /// bytes (used as scratch for decompressing compressed clusters).
+/// `staging_buf` must point to at least `MAX_CLUSTER_SIZE` writable bytes
+/// (used for decompressing clusters larger than `chunk_size`).
+/// `staging_cluster_offset` tracks which cluster is cached in `staging_buf`
+/// (set to `u64::MAX` to invalidate).
+/// `aes_key` is `Some(&key)` to decrypt AES-128-CBC encrypted clusters
+/// (crypt_method=1), or `None` for unencrypted images.
 /// `call_table` must be valid.
 #[allow(unused_variables)]
 pub unsafe fn read_chain_virtual_cluster(
@@ -1655,6 +2036,9 @@ pub unsafe fn read_chain_virtual_cluster(
     chain_config: &ChainConfig,
     chain_states: &mut ChainStates,
     compressed_buf: *mut u8,
+    staging_buf: *mut u8,
+    staging_cluster_offset: &mut u64,
+    aes_key: Option<&[u8; 16]>,
     bytes_read: &mut u64,
 ) -> bool {
     for dev_offset in 0..chain_len {
@@ -1674,6 +2058,7 @@ pub unsafe fn read_chain_virtual_cluster(
                 // Capture fields before mutable borrow in cluster_lookup
                 let compression_type = state.compression_type;
                 let cluster_bits = state.cluster_bits;
+                let crypt_method = state.crypt_method;
 
                 match state.cluster_lookup(call_table, virtual_offset, sector_size, cap, bytes_read)
                 {
@@ -1700,7 +2085,7 @@ pub unsafe fn read_chain_virtual_cluster(
                         } else {
                             dev_idx as u32
                         };
-                        return read_cluster_sectors(
+                        if !read_cluster_sectors(
                             call_table,
                             read_dev,
                             read_offset,
@@ -1708,20 +2093,42 @@ pub unsafe fn read_chain_virtual_cluster(
                             read_size,
                             sector_size,
                             bytes_read,
-                        );
+                        ) {
+                            return false;
+                        }
+                        // Decrypt AES-128-CBC encrypted clusters
+                        #[cfg(feature = "aes-decrypt")]
+                        if crypt_method == 1 {
+                            if let Some(key) = aes_key {
+                                decrypt_cluster_aes_cbc(buf, read_size, virtual_offset, key);
+                            }
+                        }
+                        return true;
                     }
                     #[cfg(feature = "decompress")]
                     Some(ClusterLookup::Compressed(l2_entry)) => {
-                        // Compressed clusters with large cluster sizes
-                        // can't be decompressed into chunk-sized buffers.
-                        if qcow2_cluster_size > MAX_SECTOR_SIZE as u64 {
-                            return false;
-                        }
-                        // Dispatch based on compression type:
-                        // 0 = zlib (deflate), 1 = zstd
-                        #[cfg(feature = "decompress-zstd")]
-                        if compression_type == 1 {
-                            return read_compressed_cluster_zstd(
+                        // For clusters that fit in the output buffer,
+                        // decompress directly (fast path).
+                        if qcow2_cluster_size <= chunk_size {
+                            #[cfg(feature = "decompress-zstd")]
+                            if compression_type == 1 {
+                                return read_compressed_cluster_zstd(
+                                    call_table,
+                                    dev_idx as u32,
+                                    l2_entry,
+                                    cluster_bits,
+                                    buf,
+                                    qcow2_cluster_size,
+                                    sector_size,
+                                    compressed_buf,
+                                    cap,
+                                    bytes_read,
+                                );
+                            }
+                            if compression_type != 0 {
+                                return false;
+                            }
+                            return read_compressed_cluster(
                                 call_table,
                                 dev_idx as u32,
                                 l2_entry,
@@ -1734,21 +2141,66 @@ pub unsafe fn read_chain_virtual_cluster(
                                 bytes_read,
                             );
                         }
-                        if compression_type != 0 {
+
+                        // Large cluster: decompress into staging buffer,
+                        // then copy the requested chunk.
+                        if qcow2_cluster_size > MAX_CLUSTER_SIZE as u64 {
                             return false;
                         }
-                        return read_compressed_cluster(
-                            call_table,
-                            dev_idx as u32,
-                            l2_entry,
-                            cluster_bits,
+                        let cluster_base = virtual_offset & !(qcow2_cluster_size - 1);
+                        if *staging_cluster_offset != cluster_base {
+                            // Decompress full cluster into staging buffer
+                            #[cfg(feature = "decompress-zstd")]
+                            if compression_type == 1 {
+                                if !read_compressed_cluster_zstd(
+                                    call_table,
+                                    dev_idx as u32,
+                                    l2_entry,
+                                    cluster_bits,
+                                    staging_buf,
+                                    qcow2_cluster_size,
+                                    sector_size,
+                                    compressed_buf,
+                                    cap,
+                                    bytes_read,
+                                ) {
+                                    return false;
+                                }
+                                *staging_cluster_offset = cluster_base;
+                                let intra = (virtual_offset - cluster_base) as usize;
+                                core::ptr::copy_nonoverlapping(
+                                    staging_buf.add(intra),
+                                    buf,
+                                    chunk_size as usize,
+                                );
+                                return true;
+                            }
+                            if compression_type != 0 {
+                                return false;
+                            }
+                            if !read_compressed_cluster(
+                                call_table,
+                                dev_idx as u32,
+                                l2_entry,
+                                cluster_bits,
+                                staging_buf,
+                                qcow2_cluster_size,
+                                sector_size,
+                                compressed_buf,
+                                cap,
+                                bytes_read,
+                            ) {
+                                return false;
+                            }
+                            *staging_cluster_offset = cluster_base;
+                        }
+                        let intra = (virtual_offset - cluster_base) as usize;
+                        core::ptr::copy_nonoverlapping(
+                            staging_buf.add(intra),
                             buf,
-                            qcow2_cluster_size,
-                            sector_size,
-                            compressed_buf,
-                            cap,
-                            bytes_read,
+                            chunk_size as usize,
                         );
+                        return true;
                     }
                     #[cfg(not(feature = "decompress"))]
                     Some(ClusterLookup::Compressed(_)) => {
@@ -1796,23 +2248,53 @@ pub unsafe fn read_chain_virtual_cluster(
                     }
                     #[cfg(feature = "vmdk-decompress")]
                     Some(GrainLookup::Compressed(marker_offset)) => {
-                        // Compressed grains can't decompress into
-                        // a buffer smaller than the grain.
-                        if grain_size_bytes > MAX_SECTOR_SIZE as u64 {
+                        // For grains that fit in the output buffer,
+                        // decompress directly (fast path).
+                        if grain_size_bytes <= chunk_size {
+                            return vmdk::read_compressed_grain(
+                                call_table,
+                                dev_idx as u32,
+                                marker_offset,
+                                grain_size_bytes,
+                                buf,
+                                sector_size,
+                                compressed_buf,
+                                COMPRESSED_BUF_SIZE,
+                                cap,
+                                bytes_read,
+                            );
+                        }
+
+                        // Large grain: decompress into staging buffer,
+                        // then copy the requested chunk.
+                        if grain_size_bytes > MAX_CLUSTER_SIZE as u64 {
                             return false;
                         }
-                        return vmdk::read_compressed_grain(
-                            call_table,
-                            dev_idx as u32,
-                            marker_offset,
-                            grain_size_bytes,
+                        let grain_base = virtual_offset & !(grain_size_bytes - 1);
+                        if *staging_cluster_offset != grain_base {
+                            if !vmdk::read_compressed_grain(
+                                call_table,
+                                dev_idx as u32,
+                                marker_offset,
+                                grain_size_bytes,
+                                staging_buf,
+                                sector_size,
+                                compressed_buf,
+                                COMPRESSED_BUF_SIZE,
+                                cap,
+                                bytes_read,
+                            ) {
+                                return false;
+                            }
+                            *staging_cluster_offset = grain_base;
+                        }
+                        let intra = (virtual_offset - grain_base) as usize;
+                        core::ptr::copy_nonoverlapping(
+                            staging_buf.add(intra),
                             buf,
-                            sector_size,
-                            compressed_buf,
-                            COMPRESSED_BUF_SIZE,
-                            cap,
-                            bytes_read,
+                            chunk_size as usize,
                         );
+                        return true;
                     }
                     #[cfg(not(feature = "vmdk-decompress"))]
                     Some(GrainLookup::Compressed(_)) => {

@@ -263,6 +263,8 @@ pub struct Qcow2InfoData {
     pub extended_l2: bool,
     /// Backing file format (from header extension, e.g., "qcow2", "raw")
     pub backing_format: &'static str,
+    /// Number of snapshots in the snapshot table
+    pub nb_snapshots: u32,
 }
 
 /// Helper to create an info result message with QCOW2-specific information.
@@ -306,6 +308,7 @@ pub fn info_result_message_with_qcow2(
         &mut info.qcow2_info.backing_format,
         qcow2_info.backing_format,
     );
+    info.qcow2_info.nb_snapshots = qcow2_info.nb_snapshots;
 
     // Mark qcow2_info as present so the encoder includes it
     info._has.set_qcow2_info();

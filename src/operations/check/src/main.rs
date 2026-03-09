@@ -1618,6 +1618,18 @@ unsafe fn check_qcow2(
         return bytes_read;
     }
 
+    // Report encryption status (applies to both v2 and v3)
+    if hdr.crypt_method == 1 {
+        (call_table.verbose_print)(b"check: image uses AES encryption\n\0".as_ptr());
+    } else if hdr.crypt_method == 2 {
+        (call_table.verbose_print)(b"check: image uses LUKS encryption\n\0".as_ptr());
+    }
+
+    // Report snapshot count
+    if hdr.nb_snapshots > 0 {
+        (call_table.verbose_print)(b"check: image has snapshots\n\0".as_ptr());
+    }
+
     // Check incompatible features (v3 only)
     if version >= 3 {
         if hdr.dirty {

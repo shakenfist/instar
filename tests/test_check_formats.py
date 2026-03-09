@@ -1635,3 +1635,69 @@ class TestCheckVmdkMultiExtent(ImagoTestBase):
             'vmdk', stdout.lower(),
             f'Expected vmdk format: {stdout}'
         )
+
+
+class TestCheckQcow2Snapshots(ImagoTestBase):
+    """Test that info detects and reports QCOW2 snapshots."""
+
+    def test_info_reports_snapshot_count(self):
+        """Info should report snapshot count for images
+        with snapshots."""
+        image = self.get_image('qcow2-snapshots')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        stdout, stderr, rc = self.run_imago_info(
+            image.path
+        )
+        self.assertEqual(
+            0, rc,
+            f'info failed: {stderr}'
+        )
+        self.assertIn(
+            'Snapshot count: 2', stdout,
+            f'Expected snapshot count: {stdout}'
+        )
+
+    def test_check_with_snapshots_reports_leaks(self):
+        """Check on snapshot images should report leaked
+        clusters (snapshot L1/L2/data clusters have refcount
+        but are not referenced by the active L1 table)."""
+        image = self.get_image('qcow2-snapshots')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        stdout, stderr, rc = self.run_imago_check(
+            image.path
+        )
+        # Leaked clusters are expected — snapshot metadata
+        # has refcount > 0 but no active L2 reference
+        self.assertIn(
+            'leaked', stdout,
+            f'Expected leaked clusters: {stdout}'
+        )
+
+    def test_info_no_snapshots_for_normal_image(self):
+        """Info should not report snapshot count for images
+        without snapshots."""
+        image = self.get_image('cirros-qcow2')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        stdout, stderr, rc = self.run_imago_info(
+            image.path
+        )
+        self.assertEqual(
+            0, rc,
+            f'info failed: {stderr}'
+        )
+        self.assertNotIn(
+            'Snapshot count', stdout,
+            f'Should not report snapshots: {stdout}'
+        )

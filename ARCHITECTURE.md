@@ -251,13 +251,15 @@ structure layout and VMM-to-guest data flow.
 
 QEMU Copy-On-Write version 2/3. Supported features:
 - Sparse allocation with cluster sizes 512B-2MB (cluster_bits 9-21)
-- Compression (zlib, zstd) for clusters up to 64KB
+- Compression (zlib, zstd) for clusters up to 2MB
 - Backing file chains (automatic flattening)
 - Refcount widths: 1, 2, 4, 8, 16, 32, 64 bits
 - Extended L2 entries (16-byte with subcluster bitmaps)
 - Incompatible feature bit validation
 - External data files (metadata/data separation, chain discovery with allowlist)
-- Not yet supported: encryption (QCOW2-native), snapshots
+- Legacy AES-128-CBC encryption (crypt_method=1) decryption via `--qcow2-password`
+- Snapshot table parsing, detection, and extraction via `--snapshot`
+- Not yet supported: LUKS-in-QCOW2 encryption (crypt_method=2)
 
 ### raw
 
