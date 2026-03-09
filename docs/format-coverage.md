@@ -74,10 +74,9 @@ The `imago convert` operation supports writing output in the following formats:
 
 ### Limitations
 
-- Compressed clusters up to 2MB are now fully supported via a decompression
-  staging buffer. The compressed input data is still limited to 128KB
-  (COMPRESSED_BUF_SIZE), which is sufficient for well-compressed clusters but
-  may cause pathological (incompressible) data to fail gracefully.
+- Compressed clusters up to 2MB (MAX_CLUSTER_SIZE) are fully supported. Both
+  the decompression staging buffer and compressed input buffer handle up to
+  MAX_CLUSTER_SIZE + MAX_SECTOR_SIZE (2MB + 64KB).
 - QCOW2 legacy AES-128-CBC encryption (crypt_method=1) is supported via
   `--qcow2-password`. LUKS-in-QCOW2 encryption (crypt_method=2) is not yet
   supported.

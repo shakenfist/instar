@@ -403,9 +403,11 @@ pub const MAX_SECTOR_SIZE: usize = 65536;
 /// buffered fully.
 pub const MAX_CLUSTER_SIZE: usize = 2 * 1024 * 1024;
 
-/// Compressed cluster read buffer size. Compressed data in QCOW2 can
-/// straddle a sector boundary, so we need room for 2 sectors.
-pub const COMPRESSED_BUF_SIZE: usize = 2 * MAX_SECTOR_SIZE;
+/// Compressed cluster read buffer size. Must hold the worst-case sector
+/// reads for a compressed cluster: up to MAX_CLUSTER_SIZE of compressed
+/// data, plus one extra sector because compressed data can straddle a
+/// sector boundary.
+pub const COMPRESSED_BUF_SIZE: usize = MAX_CLUSTER_SIZE + MAX_SECTOR_SIZE;
 
 /// Result from get_operation_config (FFI-safe alternative to tuple)
 #[repr(C)]

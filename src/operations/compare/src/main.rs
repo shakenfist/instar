@@ -36,7 +36,7 @@ use shared::{
 // Fixed buffers:
 //   BUF_COMPARE_1 (64KB): first image cluster data
 //   BUF_COMPARE_2 (64KB): second image cluster data
-//   BUF_COMPRESSED_IN (128KB): compressed data may straddle a sector boundary
+//   BUF_COMPRESSED_IN (2MB+64KB): compressed data up to MAX_CLUSTER_SIZE
 const BUF_COMPARE_1: usize = SCRATCH_MEM_BASE;
 const BUF_COMPARE_2: usize = BUF_COMPARE_1 + MAX_SECTOR_SIZE;
 const BUF_COMPRESSED_IN: usize = BUF_COMPARE_2 + MAX_SECTOR_SIZE;

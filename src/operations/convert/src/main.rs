@@ -33,7 +33,7 @@ use shared::{
 // ================================================================
 // Fixed buffers (used by both raw and QCOW2 output paths):
 //   BUF_DATA         (64KB): input/output data buffer
-//   BUF_COMPRESSED_IN (128KB): compressed input data (also
+//   BUF_COMPRESSED_IN (2MB+64KB): compressed input data (also
 //                     reused as compressed output buffer)
 //
 // Additional fixed buffers for QCOW2 output (unused by raw path,
@@ -57,9 +57,9 @@ use shared::{
 const BUF_DATA: usize = SCRATCH_MEM_BASE;
 const BUF_COMPRESSED_IN: usize = BUF_DATA + MAX_SECTOR_SIZE;
 const BUF_L2_OUT: usize = BUF_COMPRESSED_IN + COMPRESSED_BUF_SIZE;
-const BUF_HEADER: usize = BUF_L2_OUT + MAX_SECTOR_SIZE;
-const BUF_REFCOUNT: usize = BUF_HEADER + MAX_SECTOR_SIZE;
-const DYNAMIC_BUFS_START: usize = BUF_REFCOUNT + MAX_SECTOR_SIZE;
+const BUF_HEADER: usize = BUF_L2_OUT + MAX_SECTOR_SIZE; // 64KB
+const BUF_REFCOUNT: usize = BUF_HEADER + MAX_SECTOR_SIZE; // 64KB
+const DYNAMIC_BUFS_START: usize = BUF_REFCOUNT + MAX_SECTOR_SIZE; // 64KB
 
 const _: () = assert!(
     DYNAMIC_BUFS_START + MAX_CHAIN_DEVICES * 2 * MAX_SECTOR_SIZE + MAX_CLUSTER_SIZE

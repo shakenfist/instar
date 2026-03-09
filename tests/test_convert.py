@@ -376,12 +376,10 @@ class TestConvertManifestImages(ImagoTestBase):
         gib = vsize / (1024 ** 3)
         return max(120, int(120 + gib * 15))
 
-    # Max cluster size for compressed cluster decompression. The staging
-    # buffer handles decompressed output up to 2MB, but compressed input
-    # data is limited to COMPRESSED_BUF_SIZE (128KB). Real-world 2MB
-    # cluster images (e.g. debian-12-sfagent) contain clusters that
-    # exceed this compressed input limit.
-    MAX_DECOMPRESS_CLUSTER = 65536
+    # Max cluster size for compressed cluster decompression. Both the
+    # decompression staging buffer and the compressed input buffer now
+    # support clusters up to MAX_CLUSTER_SIZE (2MB).
+    MAX_DECOMPRESS_CLUSTER = 2097152
 
     def _skip_if_unsupported(self, image_id, image_path):
         """Skip test if image has unsupported features."""
@@ -397,8 +395,8 @@ class TestConvertManifestImages(ImagoTestBase):
                 f'{self.MIN_CLUSTER_SIZE} (unsupported)'
             )
 
-        # Compressed clusters with large cluster sizes may have
-        # compressed data exceeding the 128KB input buffer.
+        # Compressed clusters with cluster sizes exceeding the
+        # decompression limit cannot be handled.
         if csize and csize > self.MAX_DECOMPRESS_CLUSTER:
             result = subprocess.run(
                 [
@@ -1526,7 +1524,7 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
         return max(120, int(120 + gib * 15))
 
     # Max cluster size for compressed cluster decompression
-    MAX_DECOMPRESS_CLUSTER = 65536
+    MAX_DECOMPRESS_CLUSTER = 2097152
 
     def _skip_if_unsupported(self, image_id, image_path):
         """Skip if image has unsupported features."""
@@ -1542,8 +1540,8 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
                 f'{self.MIN_CLUSTER_SIZE}'
             )
 
-        # Compressed clusters with large cluster sizes may
-        # have compressed data exceeding 128KB input buffer.
+        # Compressed clusters exceeding the decompression
+        # limit cannot be handled.
         if csize and csize > self.MAX_DECOMPRESS_CLUSTER:
             result = subprocess.run(
                 [
