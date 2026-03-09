@@ -307,6 +307,10 @@ pub unsafe extern "C" fn _start() -> u64 {
         // Reset bump allocator before ZSTD decompression
         HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 
+        // Invalidate the staging buffer cache so image2's read doesn't
+        // hit data decompressed for image1 at the same virtual offset.
+        staging_cluster_offset = u64::MAX;
+
         // Read virtual data from image2's chain
         if !qcow2::read_chain_virtual_cluster(
             call_table,
