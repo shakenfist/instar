@@ -378,8 +378,9 @@ class TestConvertManifestImages(ImagoTestBase):
 
     # Max cluster size for compressed cluster decompression. The staging
     # buffer handles decompressed output up to 2MB, but compressed input
-    # data is limited to COMPRESSED_BUF_SIZE (128KB). For clusters > 64KB,
-    # the compressed input data may exceed this limit, so we skip those.
+    # data is limited to COMPRESSED_BUF_SIZE (128KB). Real-world 2MB
+    # cluster images (e.g. debian-12-sfagent) contain clusters that
+    # exceed this compressed input limit.
     MAX_DECOMPRESS_CLUSTER = 65536
 
     def _skip_if_unsupported(self, image_id, image_path):
@@ -396,8 +397,8 @@ class TestConvertManifestImages(ImagoTestBase):
                 f'{self.MIN_CLUSTER_SIZE} (unsupported)'
             )
 
-        # Compressed clusters with large cluster sizes can't be
-        # decompressed (buffer limited to MAX_SECTOR_SIZE).
+        # Compressed clusters with large cluster sizes may have
+        # compressed data exceeding the 128KB input buffer.
         if csize and csize > self.MAX_DECOMPRESS_CLUSTER:
             result = subprocess.run(
                 [
@@ -1541,8 +1542,8 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
                 f'{self.MIN_CLUSTER_SIZE}'
             )
 
-        # Compressed clusters with large cluster sizes
-        # can't be decompressed (buffer limited).
+        # Compressed clusters with large cluster sizes may
+        # have compressed data exceeding 128KB input buffer.
         if csize and csize > self.MAX_DECOMPRESS_CLUSTER:
             result = subprocess.run(
                 [
