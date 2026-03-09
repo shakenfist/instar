@@ -62,6 +62,7 @@ const OPERATION_LOAD_ADDR: u64 = shared::OPERATION_LOAD_ADDR as u64;
 const OPERATION_CONFIG_ADDR: u64 = shared::OPERATION_CONFIG_ADDR as u64;
 #[allow(dead_code)] // Infrastructure for Phase 1+ (check, compare, convert)
 const CHAIN_CONFIG_ADDR: u64 = shared::CHAIN_CONFIG_ADDR as u64;
+const VMM_PARAMS_ADDR: u64 = shared::VMM_PARAMS_ADDR as u64;
 
 // CopyConfig constants (must match shared crate)
 const COPY_CONFIG_MAGIC: u32 = 0x434F5059; // "COPY"
@@ -185,8 +186,9 @@ const STACK_SIZE: u64 = 0x400000; // 4MB
 const STACK_TOP: u64 = STACK_BASE + STACK_SIZE - 8;
 
 // Virtio MMIO regions (must be OUTSIDE guest memory region for KVM to trap)
-// Base address for all virtio devices: 256MB, outside 32MB guest memory
-const MMIO_BASE_START: u64 = 0x10000000;
+// Default MMIO base for 32MB guest memory (256MB, well outside memory region).
+// When guest memory exceeds this, MMIO is dynamically placed above guest memory.
+const DEFAULT_MMIO_BASE: u64 = 0x10000000;
 const MMIO_SIZE: u64 = 0x1000; // 4KB per device
 
 // Virtqueue memory regions (inside guest memory)
@@ -198,12 +200,29 @@ const VQ_SIZE_PER_DEVICE: u64 = 0x10000; // 64KB per device
 // This limits: MMIO range (16 * 4KB = 64KB) and VQ range (16 * 64KB = 1MB)
 const MAX_CHAIN_DEPTH: usize = 16;
 
+/// Active MMIO base address. Set once before creating devices.
+/// Default is DEFAULT_MMIO_BASE (256MB), moved above guest memory when needed.
+static mut ACTIVE_MMIO_BASE: u64 = DEFAULT_MMIO_BASE;
+
+/// Set the MMIO base address based on guest memory size.
+/// Must be called before any device creation.
+fn set_mmio_base_for_mem_size(guest_mem_size: u64) {
+    unsafe {
+        ACTIVE_MMIO_BASE = if guest_mem_size <= DEFAULT_MMIO_BASE {
+            DEFAULT_MMIO_BASE
+        } else {
+            // Place MMIO at next 1GB boundary above guest memory
+            (guest_mem_size + (1 << 30) - 1) & !((1 << 30) - 1)
+        };
+    }
+}
+
 /// Calculate MMIO base address for device at given index.
 /// Index 0 = first input device (top of chain), higher indices = backing files.
 /// For operations with output, output device uses index after all inputs.
 #[inline]
 fn device_mmio_base(device_index: usize) -> u64 {
-    MMIO_BASE_START + (device_index as u64 * MMIO_SIZE)
+    unsafe { ACTIVE_MMIO_BASE + (device_index as u64 * MMIO_SIZE) }
 }
 
 /// Calculate virtqueue base address for device at given index.
@@ -2386,11 +2405,19 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     }
     debug!("Configured memory region");
 
+    // Set MMIO base (must be above guest memory for KVM to trap accesses)
+    set_mmio_base_for_mem_size(guest_mem_size);
+
+    // Write MMIO base to VMM_PARAMS_ADDR so the guest can discover it
+    let mmio_base = unsafe { ACTIVE_MMIO_BASE };
+    guest_mem.write_obj(mmio_base, GuestAddress(VMM_PARAMS_ADDR))?;
+    debug!("Wrote MMIO base 0x{:x} to VMM_PARAMS_ADDR", mmio_base);
+
     // Set up GDT
     setup_gdt(&guest_mem)?;
     debug!("Set up GDT at 0x{:x}", GDT_BASE);
 
-    // Set up page tables (identity map)
+    // Set up page tables (identity map, covers guest memory + MMIO region)
     setup_page_tables(&guest_mem, guest_mem_size)?;
     debug!("Set up page tables at 0x{:x}", PAGE_TABLE_BASE);
 
@@ -4726,9 +4753,15 @@ fn setup_page_tables(
         GuestAddress(pml4_addr),
     )?;
 
+    // Coverage must include both guest memory AND the MMIO region.
+    // MMIO is placed above guest memory when guest_mem_size > DEFAULT_MMIO_BASE.
+    let mmio_base = unsafe { ACTIVE_MMIO_BASE };
+    let mmio_end = mmio_base + MMIO_SIZE * MAX_CHAIN_DEPTH as u64;
+    let coverage = guest_mem_size.max(mmio_end);
+
     // For >1GB: multiple PD pages, each covering 1GB (512 × 2MB pages).
     // Page table area 0x2000-0x10000 fits PML4 + PDPT + up to 12 PD pages = 12GB.
-    let num_gb = guest_mem_size.div_ceil(1 << 30);
+    let num_gb = coverage.div_ceil(1 << 30);
     let num_pd_pages = num_gb.max(1);
     let max_pd_pages = (GUEST_CODE_BASE - pd_base) / 0x1000;
     if num_pd_pages > max_pd_pages {
