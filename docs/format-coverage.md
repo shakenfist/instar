@@ -74,11 +74,14 @@ The `imago convert` operation supports writing output in the following formats:
 
 ### Limitations
 
-- Compressed clusters with cluster sizes above 64KB cannot be decompressed
-  (decompression buffer limited to 64KB). Uncompressed clusters up to 2MB are
-  fully supported. The `debian-12-sfagent` image (2MB clusters with 692
-  compressed clusters) is skipped in convert/compare tests for this reason.
-- Encrypted QCOW2 images are not supported.
+- Compressed clusters up to 2MB (MAX_CLUSTER_SIZE) are fully supported. Both
+  the decompression staging buffer and compressed input buffer handle up to
+  MAX_CLUSTER_SIZE + MAX_SECTOR_SIZE (2MB + 64KB).
+- QCOW2 legacy AES-128-CBC encryption (crypt_method=1) is supported via
+  `--qcow2-password`. LUKS-in-QCOW2 encryption (crypt_method=2) is not yet
+  supported.
+- QCOW2 snapshots: snapshot table parsing and extraction via
+  `convert --snapshot <ID|name>` are supported (up to 16 snapshots).
 - Extended L2 images with partially-allocated subclusters may return stale host
   data for unallocated subclusters. The extended L2 support reads only the first
   8 bytes of each 16-byte entry (the cluster descriptor), ignoring the subcluster

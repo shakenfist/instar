@@ -96,12 +96,16 @@ const COMPARE_CONFIG_FLAG_STRICT: u32 = 1 << 0;
 #[allow(dead_code)]
 const COMPARE_CONFIG_FLAG_QUIET: u32 = 1 << 1;
 #[allow(dead_code)]
+const COMPARE_CONFIG_FLAG_DECRYPT_AES: u32 = 1 << 2;
+#[allow(dead_code)]
 const COMPARE_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
 
 // ConvertConfig constants (must match shared crate)
 const CONVERT_CONFIG_MAGIC: u32 = 0x434F4E56; // "CONV"
 const CONVERT_CONFIG_FLAG_SKIP_ZEROS: u32 = 1 << 0;
 const CONVERT_CONFIG_FLAG_COMPRESS: u32 = 1 << 1;
+#[allow(dead_code)]
+const CONVERT_CONFIG_FLAG_DECRYPT_AES: u32 = 1 << 2;
 #[allow(dead_code)]
 const CONVERT_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
 
@@ -868,6 +872,11 @@ fn print_info_result(
             // extended l2 (only for v3/1.1 compat)
             if is_v3 {
                 println!("    extended l2: {}", info.qcow2_info.extended_l2);
+            }
+
+            // snapshot count (only shown if > 0)
+            if info.qcow2_info.nb_snapshots > 0 {
+                println!("Snapshot count: {}", info.qcow2_info.nb_snapshots);
             }
         }
 
@@ -2086,6 +2095,14 @@ struct CompareArgs {
     /// Quiet mode: only show errors
     #[arg(short, long)]
     quiet: bool,
+
+    /// QCOW2 AES decryption password (for crypt_method=1 images)
+    #[arg(long, value_name = "PASSWORD")]
+    qcow2_password: Option<String>,
+
+    /// Read QCOW2 AES decryption password from file
+    #[arg(long, value_name = "PATH", conflicts_with = "qcow2_password")]
+    qcow2_password_file: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -2128,6 +2145,18 @@ struct ConvertArgs {
     /// Don't create output file (must already exist)
     #[arg(short = 'n', long)]
     no_create: bool,
+
+    /// QCOW2 AES decryption password (for crypt_method=1 images)
+    #[arg(long, value_name = "PASSWORD")]
+    qcow2_password: Option<String>,
+
+    /// Read QCOW2 AES decryption password from file
+    #[arg(long, value_name = "PATH", conflicts_with = "qcow2_password")]
+    qcow2_password_file: Option<String>,
+
+    /// Extract a specific snapshot (by ID or name) instead of the active image
+    #[arg(long, value_name = "ID")]
+    snapshot: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -3684,6 +3713,37 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         chain2.total_devices() as u32,
         GuestAddress(OPERATION_CONFIG_ADDR + 12),
     )?;
+
+    // Resolve QCOW2 AES passphrase (--qcow2-password or --qcow2-password-file)
+    let qcow2_passphrase = if let Some(ref pass) = args.qcow2_password {
+        Some(pass.clone())
+    } else if let Some(ref path) = args.qcow2_password_file {
+        let mut data = std::fs::read_to_string(path)?;
+        if data.ends_with('\n') {
+            data.pop();
+        }
+        Some(data)
+    } else {
+        None
+    };
+
+    if let Some(ref passphrase) = qcow2_passphrase {
+        let pass_bytes = passphrase.as_bytes();
+        if pass_bytes.len() > 256 {
+            return Err("QCOW2 passphrase too long (max 256 bytes)".into());
+        }
+        guest_mem.write_obj(
+            pass_bytes.len() as u32,
+            GuestAddress(OPERATION_CONFIG_ADDR + 16),
+        )?;
+        // _pad at offset 20 is zero-initialized
+        guest_mem.write_slice(pass_bytes, GuestAddress(OPERATION_CONFIG_ADDR + 24))?;
+        debug!(
+            "Wrote QCOW2 passphrase ({} bytes) to compare config",
+            pass_bytes.len()
+        );
+    }
+
     debug!(
         "Wrote compare config at 0x{:x} (flags=0x{:x}, chain1={}, chain2={})",
         OPERATION_CONFIG_ADDR,
@@ -4204,6 +4264,58 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         output_cluster_bits,
         GuestAddress(OPERATION_CONFIG_ADDR + 16),
     )?;
+
+    // Resolve QCOW2 AES passphrase (--qcow2-password or --qcow2-password-file)
+    let qcow2_passphrase = if let Some(ref pass) = args.qcow2_password {
+        Some(pass.clone())
+    } else if let Some(ref path) = args.qcow2_password_file {
+        let mut data = std::fs::read_to_string(path)?;
+        if data.ends_with('\n') {
+            data.pop();
+        }
+        Some(data)
+    } else {
+        None
+    };
+
+    if let Some(ref passphrase) = qcow2_passphrase {
+        let pass_bytes = passphrase.as_bytes();
+        if pass_bytes.len() > 256 {
+            return Err("QCOW2 passphrase too long (max 256 bytes)".into());
+        }
+        guest_mem.write_obj(
+            pass_bytes.len() as u32,
+            GuestAddress(OPERATION_CONFIG_ADDR + 20),
+        )?;
+        // _pad at offset 24 is zero-initialized
+        guest_mem.write_slice(pass_bytes, GuestAddress(OPERATION_CONFIG_ADDR + 28))?;
+        debug!(
+            "Wrote QCOW2 passphrase ({} bytes) to convert config",
+            pass_bytes.len()
+        );
+    }
+
+    // Write snapshot ID if specified
+    if let Some(ref snapshot_id) = args.snapshot {
+        let snap_bytes = snapshot_id.as_bytes();
+        if snap_bytes.len() > 64 {
+            return Err("Snapshot ID too long (max 64 bytes)".into());
+        }
+        // snapshot_id_len at offset 284 (28 + 256)
+        guest_mem.write_obj(
+            snap_bytes.len() as u32,
+            GuestAddress(OPERATION_CONFIG_ADDR + 284),
+        )?;
+        // _pad2 at offset 288 is zero-initialized
+        // snapshot_id at offset 292
+        guest_mem.write_slice(snap_bytes, GuestAddress(OPERATION_CONFIG_ADDR + 292))?;
+        debug!(
+            "Wrote snapshot ID '{}' ({} bytes) to convert config",
+            snapshot_id,
+            snap_bytes.len()
+        );
+    }
+
     debug!(
         "Wrote convert config at 0x{:x} \
          (flags=0x{:x}, chain={}, format={}, cluster_bits={})",

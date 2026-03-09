@@ -9,6 +9,7 @@ license = "Apache-2.0"
 decompress = ["miniz_oxide"]
 decompress-zstd = ["ruzstd"]
 compress = ["miniz_oxide", "miniz_oxide/with-alloc"]
+aes-decrypt = ["aes"]
 vmdk-input = ["vmdk"]
 vmdk-decompress = ["vmdk-input", "vmdk/decompress"]
 vhd-input = ["vhd"]
@@ -18,6 +19,7 @@ vhdx-input = ["vhdx"]
 shared = { path = "../../shared" }
 miniz_oxide = { version = "0.8", default-features = false, optional = true }
 ruzstd = { version = "0.8", default-features = false, optional = true }
+aes = { version = "0.8", default-features = false, optional = true }
 vmdk = { path = "../vmdk", optional = true }
 vhd = { path = "../vhd", optional = true }
 vhdx = { path = "../vhdx", optional = true }
