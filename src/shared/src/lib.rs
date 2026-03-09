@@ -340,6 +340,11 @@ pub const CHAIN_CONFIG_ADDR: usize = 0x00082000;
 /// Maximum size of chain config in bytes
 pub const CHAIN_CONFIG_MAX_SIZE: usize = 1024;
 
+/// Address where VMM parameters are stored (set by VMM before guest starts).
+/// Layout: mmio_base (u64 at offset 0).
+/// If mmio_base is 0, the guest uses the default (0x10000000).
+pub const VMM_PARAMS_ADDR: usize = 0x00083000;
+
 /// Address where operation binaries are loaded
 pub const OPERATION_LOAD_ADDR: usize = 0x00020000;
 
