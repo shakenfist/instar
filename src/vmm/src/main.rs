@@ -247,6 +247,25 @@ const PTE_PRESENT: u64 = 1 << 0;
 const PTE_WRITABLE: u64 = 1 << 1;
 const PTE_PAGE_SIZE: u64 = 1 << 7;
 
+/// Parse a memory size string like "256M", "1G", "4096" into bytes.
+fn parse_memory_size(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty memory size string".into());
+    }
+    let (num_str, multiplier) = match s.as_bytes().last() {
+        Some(b'G' | b'g') => (&s[..s.len() - 1], 1u64 << 30),
+        Some(b'M' | b'm') => (&s[..s.len() - 1], 1u64 << 20),
+        Some(b'K' | b'k') => (&s[..s.len() - 1], 1u64 << 10),
+        _ => (s, 1u64),
+    };
+    let num: u64 = num_str
+        .parse()
+        .map_err(|_| format!("invalid memory size: '{}'", s))?;
+    num.checked_mul(multiplier)
+        .ok_or_else(|| format!("memory size overflow: '{}'", s).into())
+}
+
 // ============================================================================
 // Multi-device management (Phase 0c)
 //
@@ -1372,7 +1391,7 @@ fn execute_info_operation(
     setup_gdt(&guest_mem)?;
 
     // Set up page tables (identity map)
-    setup_page_tables(&guest_mem)?;
+    setup_page_tables(&guest_mem, GUEST_MEM_SIZE)?;
 
     // Load core binary at GUEST_CODE_BASE (0x10000)
     guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
@@ -2314,6 +2333,26 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     // Open backing store (input only, read-only)
     let input_backing = BackingStore::open(Path::new(&args.input), true, None, false)?;
 
+    // Parse --max-guest-memory for LUKS v2 Argon2id support
+    let guest_mem_size: u64 = if let Some(ref mem_str) = args.max_guest_memory {
+        let requested = parse_memory_size(mem_str)?;
+        if requested < GUEST_MEM_SIZE {
+            return Err(format!(
+                "--max-guest-memory must be at least {}MB (got {})",
+                GUEST_MEM_SIZE / (1024 * 1024),
+                mem_str
+            )
+            .into());
+        }
+        debug!(
+            "Using {} bytes of guest memory (--max-guest-memory {})",
+            requested, mem_str
+        );
+        requested
+    } else {
+        GUEST_MEM_SIZE
+    };
+
     // Open KVM
     let kvm = Kvm::new()?;
     debug!("KVM API version: {}", kvm.get_api_version());
@@ -2327,8 +2366,8 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     debug!("Created VM");
 
     // Create guest memory
-    let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
-    debug!("Allocated {} bytes of guest memory", GUEST_MEM_SIZE);
+    let guest_mem = create_guest_memory(guest_mem_size)?;
+    debug!("Allocated {} bytes of guest memory", guest_mem_size);
 
     // Get the memory region for KVM registration
     let region = guest_mem.find_region(GuestAddress(0)).unwrap();
@@ -2338,7 +2377,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     let mem_region = kvm_userspace_memory_region {
         slot: 0,
         guest_phys_addr: 0,
-        memory_size: GUEST_MEM_SIZE,
+        memory_size: guest_mem_size,
         userspace_addr: host_addr,
         flags: 0,
     };
@@ -2352,7 +2391,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     debug!("Set up GDT at 0x{:x}", GDT_BASE);
 
     // Set up page tables (identity map)
-    setup_page_tables(&guest_mem)?;
+    setup_page_tables(&guest_mem, guest_mem_size)?;
     debug!("Set up page tables at 0x{:x}", PAGE_TABLE_BASE);
 
     // Load core binary at GUEST_CODE_BASE (0x10000)
@@ -2414,9 +2453,17 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
         );
     }
 
+    // Write argon2_mem_size to InfoConfig (offset 272 = 4+4+4+4+256)
+    let argon2_mem_size: u64 = if guest_mem_size > GUEST_MEM_SIZE {
+        guest_mem_size - GUEST_MEM_SIZE
+    } else {
+        0
+    };
+    guest_mem.write_obj(argon2_mem_size, GuestAddress(OPERATION_CONFIG_ADDR + 272))?;
+
     debug!(
-        "Wrote info config at 0x{:x} (flags=0x{:x})",
-        OPERATION_CONFIG_ADDR, info_flags
+        "Wrote info config at 0x{:x} (flags=0x{:x}, argon2_mem_size={})",
+        OPERATION_CONFIG_ADDR, info_flags, argon2_mem_size
     );
 
     // Create device set for managing virtio-block devices
@@ -2763,7 +2810,7 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     setup_gdt(&guest_mem)?;
     debug!("Set up GDT at 0x{:x}", GDT_BASE);
 
-    setup_page_tables(&guest_mem)?;
+    setup_page_tables(&guest_mem, GUEST_MEM_SIZE)?;
     debug!("Set up page tables at 0x{:x}", PAGE_TABLE_BASE);
 
     guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
@@ -3150,7 +3197,7 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     debug!("Set up GDT at 0x{:x}", GDT_BASE);
 
     // Set up page tables (identity map)
-    setup_page_tables(&guest_mem)?;
+    setup_page_tables(&guest_mem, GUEST_MEM_SIZE)?;
     debug!("Set up page tables at 0x{:x}", PAGE_TABLE_BASE);
 
     // Load core binary at GUEST_CODE_BASE (0x10000)
@@ -3680,7 +3727,7 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     debug!("Set up GDT at 0x{:x}", GDT_BASE);
 
     // Set up page tables (identity map)
-    setup_page_tables(&guest_mem)?;
+    setup_page_tables(&guest_mem, GUEST_MEM_SIZE)?;
     debug!("Set up page tables at 0x{:x}", PAGE_TABLE_BASE);
 
     // Load core binary at GUEST_CODE_BASE (0x10000)
@@ -4227,7 +4274,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     setup_gdt(&guest_mem)?;
     debug!("Set up GDT at 0x{:x}", GDT_BASE);
 
-    setup_page_tables(&guest_mem)?;
+    setup_page_tables(&guest_mem, GUEST_MEM_SIZE)?;
     debug!("Set up page tables at 0x{:x}", PAGE_TABLE_BASE);
 
     guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
@@ -4665,10 +4712,13 @@ fn setup_gdt(guest_mem: &GuestMemoryMmap) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-fn setup_page_tables(guest_mem: &GuestMemoryMmap) -> Result<(), Box<dyn std::error::Error>> {
+fn setup_page_tables(
+    guest_mem: &GuestMemoryMmap,
+    guest_mem_size: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
     let pml4_addr = PAGE_TABLE_BASE;
     let pdpt_addr = PAGE_TABLE_BASE + 0x1000;
-    let pd_addr = PAGE_TABLE_BASE + 0x2000;
+    let pd_base = PAGE_TABLE_BASE + 0x2000;
 
     // PML4[0] -> PDPT
     guest_mem.write_obj(
@@ -4676,17 +4726,36 @@ fn setup_page_tables(guest_mem: &GuestMemoryMmap) -> Result<(), Box<dyn std::err
         GuestAddress(pml4_addr),
     )?;
 
-    // PDPT[0] -> PD
-    guest_mem.write_obj(
-        pd_addr | PTE_PRESENT | PTE_WRITABLE,
-        GuestAddress(pdpt_addr),
-    )?;
+    // For >1GB: multiple PD pages, each covering 1GB (512 × 2MB pages).
+    // Page table area 0x2000-0x10000 fits PML4 + PDPT + up to 12 PD pages = 12GB.
+    let num_gb = guest_mem_size.div_ceil(1 << 30);
+    let num_pd_pages = num_gb.max(1);
+    let max_pd_pages = (GUEST_CODE_BASE - pd_base) / 0x1000;
+    if num_pd_pages > max_pd_pages {
+        return Err(format!(
+            "guest memory {}GB requires {} PD pages, max {} ({}GB)",
+            num_gb, num_pd_pages, max_pd_pages, max_pd_pages
+        )
+        .into());
+    }
 
-    // PD entries: 512 x 2MB pages = 1GB identity mapped
-    for i in 0..512u64 {
-        let phys_addr = i * 0x200000;
-        let entry = phys_addr | PTE_PRESENT | PTE_WRITABLE | PTE_PAGE_SIZE;
-        guest_mem.write_obj(entry, GuestAddress(pd_addr + i * 8))?;
+    // PDPT[i] -> PD[i] for each GB of memory
+    for gb in 0..num_pd_pages {
+        let pd_addr = pd_base + gb * 0x1000;
+        guest_mem.write_obj(
+            pd_addr | PTE_PRESENT | PTE_WRITABLE,
+            GuestAddress(pdpt_addr + gb * 8),
+        )?;
+    }
+
+    // PD entries: identity-map with 2MB pages (full PD pages)
+    for gb in 0..num_pd_pages {
+        let pd_addr = pd_base + gb * 0x1000;
+        for j in 0..512u64 {
+            let phys_addr = (gb * 512 + j) * 0x200000;
+            let entry = phys_addr | PTE_PRESENT | PTE_WRITABLE | PTE_PAGE_SIZE;
+            guest_mem.write_obj(entry, GuestAddress(pd_addr + j * 8))?;
+        }
     }
 
     Ok(())
