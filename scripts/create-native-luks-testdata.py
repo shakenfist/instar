@@ -120,7 +120,6 @@ def aes_xts_encrypt(key, data, sector_size, first_sector):
 
 def aes_xts_decrypt(key, data, sector_size, first_sector):
     """Decrypt data using AES-XTS with plain64 IV generation."""
-    half = len(key) // 2
     result = bytearray()
     num_sectors = len(data) // sector_size
 
