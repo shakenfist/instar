@@ -258,8 +258,8 @@ QEMU Copy-On-Write version 2/3. Supported features:
 - Incompatible feature bit validation
 - External data files (metadata/data separation, chain discovery with allowlist)
 - Legacy AES-128-CBC encryption (crypt_method=1) decryption via `--qcow2-password`
+- LUKS-in-QCOW2 encryption (crypt_method=2) decryption via `--luks-passphrase`
 - Snapshot table parsing, detection, and extraction via `--snapshot`
-- Not yet supported: LUKS-in-QCOW2 encryption (crypt_method=2)
 
 ### raw
 
@@ -316,15 +316,16 @@ LUKS encrypted containers (v1 and v2). The info operation parses:
 - UUID, payload offset, master key length, active key slots
 - LUKS v2: JSON metadata area for cipher/hash extraction
 
-With `--luks-passphrase`, LUKS v1 containers are decrypted inside the
-KVM guest using pure-Rust RustCrypto crates (PBKDF2 + AES-XTS, software
-AES implementation for bare-metal). The decrypted first block is passed
-through format detection to report the inner format and virtual size.
+With `--luks-passphrase`, LUKS v1 and v2 containers are decrypted inside
+the KVM guest using pure-Rust RustCrypto crates (software AES, no
+hardware acceleration needed in bare-metal). Key derivation uses PBKDF2
+(v1) or Argon2id (v2, requires `--max-guest-memory` for the 1GB+ working
+memory). The decrypted first block is passed through format detection to
+report the inner format and virtual size.
 
-LUKS v2 decryption (Argon2id KDF) is not yet supported due to memory
-requirements exceeding the default 32 MiB guest allocation. The
-`--max-guest-memory` CLI flag provides infrastructure for future
-implementation.
+The convert operation supports decrypting native LUKS containers
+(`--luks-passphrase`) and LUKS-in-QCOW2 images (crypt_method=2). Both
+use AES-XTS-plain64 for payload decryption.
 
 ## Test Image Generation
 
@@ -335,6 +336,8 @@ by scripts in `scripts/`:
   VHD (disk_type=4) via Python struct packing and qemu-img patching
 - `create-vmdk-testdata.sh` — Binary VMDK4 with multi-extent descriptor
 - `create-luks-testdata.sh` — LUKS v1 containers with inner formats
+- `create-native-luks-testdata.py` — LUKS v1 with known encrypted content
+- `create-qcow2-luks-testdata.sh` — QCOW2 with LUKS encryption (crypt_method=2)
 - `create-check-testdata.sh` — QCOW2 images with specific corruptions
 
 Generated images live in `../imago-testdata/custom/format-coverage/`.

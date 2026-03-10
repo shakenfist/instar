@@ -22,7 +22,7 @@ use core::ptr::write_volatile;
 use shared::{
     CallTable, ChainConfig, CheckResult, CompareResult, LuksInfo, Qcow2Info, VdiInfo, VmdkInfo,
     CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR, CHAIN_CONFIG_MAX_SIZE, OPERATION_CONFIG_ADDR,
-    OPERATION_CONFIG_MAX_SIZE, OPERATION_LOAD_ADDR,
+    OPERATION_CONFIG_MAX_SIZE, OPERATION_LOAD_ADDR, VMM_PARAMS_ADDR,
 };
 
 use crate::serial::{
@@ -33,8 +33,8 @@ use crate::serial::{
 use crate::virtio::VirtioBlock;
 
 // Memory layout constants
-// Base addresses for device MMIO and virtqueues (must match VMM)
-const MMIO_BASE_START: usize = 0x10000000;
+// Default MMIO base; overridden by VMM via VMM_PARAMS_ADDR when guest memory > 256MB.
+const DEFAULT_MMIO_BASE: usize = 0x10000000;
 const MMIO_SIZE: usize = 0x1000; // 4KB per device
 const VQ_BASE_START: usize = 0x100000; // 1MB
 const VQ_SIZE_PER_DEVICE: usize = 0x10000; // 64KB per device
@@ -42,10 +42,24 @@ const VQ_SIZE_PER_DEVICE: usize = 0x10000; // 64KB per device
 // Maximum number of input devices (backing chain depth)
 const MAX_INPUT_DEVICES: usize = 16;
 
+/// MMIO base start, read from VMM_PARAMS_ADDR at startup.
+static mut MMIO_BASE_START: usize = DEFAULT_MMIO_BASE;
+
+/// Read MMIO base from VMM_PARAMS_ADDR. If the VMM wrote a non-zero value,
+/// use it; otherwise fall back to the default (0x10000000).
+fn read_mmio_base_from_params() {
+    let value = unsafe { core::ptr::read_volatile(VMM_PARAMS_ADDR as *const u64) };
+    if value != 0 {
+        unsafe {
+            MMIO_BASE_START = value as usize;
+        }
+    }
+}
+
 /// Calculate MMIO base address for device at given index.
 #[inline]
-const fn device_mmio_base(device_index: usize) -> usize {
-    MMIO_BASE_START + (device_index * MMIO_SIZE)
+fn device_mmio_base(device_index: usize) -> usize {
+    unsafe { MMIO_BASE_START + (device_index * MMIO_SIZE) }
 }
 
 /// Calculate virtqueue base address for device at given index.
@@ -53,12 +67,6 @@ const fn device_mmio_base(device_index: usize) -> usize {
 const fn device_vq_base(device_index: usize) -> usize {
     VQ_BASE_START + (device_index * VQ_SIZE_PER_DEVICE)
 }
-
-// Legacy constants for backward compatibility
-const INPUT_MMIO_BASE: usize = MMIO_BASE_START; // device 0
-const OUTPUT_MMIO_BASE: usize = MMIO_BASE_START + MMIO_SIZE; // device 1
-const INPUT_VQ_BASE: usize = VQ_BASE_START; // device 0
-const OUTPUT_VQ_BASE: usize = VQ_BASE_START + VQ_SIZE_PER_DEVICE; // device 1
 
 /// A cell for single-threaded static mutable state.
 ///
@@ -126,6 +134,9 @@ static CONFIG: SingleThreadCell<Option<DeviceConfig>> = SingleThreadCell::new(No
 pub extern "C" fn _start() -> ! {
     debug_print("core: start\n");
 
+    // Read MMIO base from VMM parameters (may differ from default for large guest memory)
+    read_mmio_base_from_params();
+
     // Read configuration from VMM over serial
     let config = read_config();
     debug_print("core: config\n");
@@ -139,8 +150,8 @@ pub extern "C" fn _start() -> ! {
 
     // Initialize input device
     let input = match VirtioBlock::init(
-        INPUT_MMIO_BASE,
-        INPUT_VQ_BASE,
+        device_mmio_base(0),
+        device_vq_base(0),
         config.input_sector_size,
         "input",
     ) {

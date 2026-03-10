@@ -340,6 +340,11 @@ pub const CHAIN_CONFIG_ADDR: usize = 0x00082000;
 /// Maximum size of chain config in bytes
 pub const CHAIN_CONFIG_MAX_SIZE: usize = 1024;
 
+/// Address where VMM parameters are stored (set by VMM before guest starts).
+/// Layout: mmio_base (u64 at offset 0).
+/// If mmio_base is 0, the guest uses the default (0x10000000).
+pub const VMM_PARAMS_ADDR: usize = 0x00083000;
+
 /// Address where operation binaries are loaded
 pub const OPERATION_LOAD_ADDR: usize = 0x00020000;
 
@@ -393,6 +398,11 @@ const _: () = assert!(
     ALLOC_HEAP_BASE >= SCRATCH_MEM_BASE,
     "ALLOC_HEAP_BASE is below SCRATCH_MEM_BASE"
 );
+
+/// Base address for Argon2 working memory (above the standard 32MB layout).
+/// When --max-guest-memory allocates more than 32MB, the extra memory
+/// starting at this address is available for Argon2id key derivation.
+pub const ARGON2_MEM_BASE: usize = 0x02000000; // 32 MiB
 
 /// Maximum sector size supported
 pub const MAX_SECTOR_SIZE: usize = 65536;
@@ -1122,6 +1132,11 @@ pub struct InfoConfig {
 
     /// LUKS passphrase (null-padded, max 256 bytes)
     pub passphrase: [u8; INFO_CONFIG_MAX_PASSPHRASE],
+
+    /// Size of Argon2 working memory in bytes (0 = not available).
+    /// When non-zero, memory at ARGON2_MEM_BASE is available for
+    /// Argon2id key derivation (LUKS v2 decryption).
+    pub argon2_mem_size: u64,
 }
 
 impl InfoConfig {
@@ -1152,6 +1167,7 @@ impl InfoConfig {
             passphrase_len: 0,
             _pad: 0,
             passphrase: [0; INFO_CONFIG_MAX_PASSPHRASE],
+            argon2_mem_size: 0,
         }
     }
 

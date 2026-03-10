@@ -35,7 +35,7 @@ for details on why this approach is secure.
 | VDI | Yes | Yes | vdi-simple |
 | QED | Yes (banned) | Yes | qed-simple |
 | ISO | Yes | Yes* | iso-simple |
-| LUKS | Yes | Yes | luks-v1, luks-v2, luks-v1-raw-gpt, luks-v1-qcow2 |
+| LUKS | Yes | Yes | luks-v1, luks-v2, luks-v1-raw-gpt, luks-v1-qcow2, luks-v1-aes-xts |
 | Parallels | No | **No** | parallels-v1, parallels-v2 (in testdata, not tested) |
 | Bochs | No | **No** | empty.bochs (in testdata, not tested) |
 | cloop | No | **No** | simple-pattern.cloop (in testdata, not tested) |
@@ -78,10 +78,14 @@ The `imago convert` operation supports writing output in the following formats:
   the decompression staging buffer and compressed input buffer handle up to
   MAX_CLUSTER_SIZE + MAX_SECTOR_SIZE (2MB + 64KB).
 - QCOW2 legacy AES-128-CBC encryption (crypt_method=1) is supported via
-  `--qcow2-password`. LUKS-in-QCOW2 encryption (crypt_method=2) is not yet
-  supported.
+  `--qcow2-password`. LUKS-in-QCOW2 encryption (crypt_method=2) is supported
+  via `--luks-passphrase`.
 - QCOW2 snapshots: snapshot table parsing and extraction via
   `convert --snapshot <ID|name>` are supported (up to 16 snapshots).
+- `imago compare` does not yet support LUKS-in-QCOW2 decryption. Comparing
+  LUKS-encrypted QCOW2 images (crypt_method=2) will compare ciphertext, not
+  decrypted content. A future phase may add `--luks-passphrase` support to
+  compare for consistency with the convert operation.
 - Extended L2 images with partially-allocated subclusters may return stale host
   data for unallocated subclusters. The extended L2 support reads only the first
   8 bytes of each 16-byte entry (the cluster descriptor), ignoring the subcluster
@@ -102,7 +106,7 @@ The `imago convert` operation supports writing output in the following formats:
 | unknown_features | Unknown incompatible feature bits | Rejects | Rejects in check/compare/convert; info reports | qcow2-unknown-features |
 | dirty | Image not cleanly closed | N/A | Reports (FLAG_DIRTY) | qcow2-dirty |
 | corrupt | Image marked corrupt | N/A | Reports (FLAG_CORRUPT) | qcow2-corrupt |
-| encrypted | Encryption enabled | N/A | Reports (FLAG_ENCRYPTED) | (none) |
+| encrypted | Encryption enabled | N/A | Reports (FLAG_ENCRYPTED), decrypts with passphrase | qcow2-luks, qcow2-encrypted-aes |
 
 #### QCOW2 Incompatible Feature Bits
 
@@ -144,7 +148,7 @@ The `imago convert` operation supports writing output in the following formats:
 | Format | Check | oslo.utils | imago |
 |--------|-------|------------|-------|
 | QED | Banned entirely | Rejects | Detects format |
-| LUKS | Version check (only v1) | Rejects v2+ | Detects format, version, cipher, hash, UUID, payload offset, key slots, inner format (with passphrase) |
+| LUKS | Version check (only v1) | Rejects v2+ | Detects format, version, cipher, hash, UUID, payload offset, key slots, inner format (with passphrase); convert decrypts v1/v2 containers |
 | VDI | None | Pass-through | Detects format, UUID |
 | ISO | None | Pass-through | Detects format* |
 | VHD | None | Pass-through | Detects creator app; full check validation (footer/header checksums, BAT bounds, overlap detection) |
@@ -228,7 +232,7 @@ The `imago convert` operation supports writing output in the following formats:
 |----------|-------------|--------|--------------|
 | qed-simple | QED format image | safe | Deprecated format test |
 
-#### LUKS Images (4)
+#### LUKS Images (7)
 
 | Image ID | Description | Safety | Key Features |
 |----------|-------------|--------|--------------|
@@ -236,6 +240,9 @@ The `imago convert` operation supports writing output in the following formats:
 | luks-v2 | LUKS v2 header with JSON metadata (synthetic) | safe | JSON metadata parsing |
 | luks-v1-raw-gpt | LUKS v1 wrapping GPT raw image | safe | Inner format detection (raw) |
 | luks-v1-qcow2 | LUKS v1 wrapping QCOW2 image | safe | Inner format detection (qcow2) |
+| luks-v1-aes-xts | LUKS v1 with known encrypted content | safe | Native LUKS conversion test |
+| luks-v2-raw-gpt | LUKS v2 wrapping GPT raw image | safe | Argon2id decryption test |
+| qcow2-luks | QCOW2 v3 with LUKS encryption (crypt_method=2) | safe | LUKS-in-QCOW2 conversion test |
 
 #### ISO Images (1)
 
@@ -264,7 +271,8 @@ The `imago convert` operation supports writing output in the following formats:
 
 #### High Priority - Security Relevant
 
-1. **qcow2-encrypted** - QCOW2 with encryption enabled
+All high-priority test images have been created (qcow2-encrypted-aes,
+qcow2-luks).
 
 ---
 
@@ -350,14 +358,16 @@ The `imago convert` operation supports writing output in the following formats:
     BAT entry validation (offset bounds, 1MB alignment, overlap
     detection, state validation), differencing disk detection.
 
-16. **LUKS Container Inspection** - Full LUKS v1 and v2 header parsing with
-    cipher, cipher mode, hash algorithm, UUID, payload offset, master key
-    length, and active key slot reporting. LUKS v2 JSON metadata parsing
-    extracts cipher/hash from the JSON area. With `--luks-passphrase`, LUKS
-    v1 images are decrypted (PBKDF2 + AES-XTS, pure Rust RustCrypto crates
-    in no_std guest) and inner format is detected and reported (including
-    inner virtual size). Synthetic test headers for header parsing; real
-    LUKS containers (created via cryptsetup) for decryption testing.
+16. **LUKS Container Inspection and Conversion** - Full LUKS v1 and v2 header
+    parsing with cipher, cipher mode, hash algorithm, UUID, payload offset,
+    master key length, and active key slot reporting. LUKS v2 JSON metadata
+    parsing extracts cipher/hash from the JSON area. With `--luks-passphrase`,
+    LUKS v1 (PBKDF2) and v2 (Argon2id, requires `--max-guest-memory`) containers
+    are decrypted using pure-Rust RustCrypto crates in the no_std guest. The
+    info operation detects inner format; the convert operation decrypts native
+    LUKS containers and LUKS-in-QCOW2 images (crypt_method=2) using AES-XTS-
+    plain64. Dynamic guest memory allocation supports Argon2id's 1GB+ working
+    memory requirement.
 
 17. **QCOW2 External Data File Support** - Full read support for QCOW2 v3
     images with external data files (incompatible feature bit 2). The DATA

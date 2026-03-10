@@ -805,6 +805,30 @@
             "description": "QCOW2 v2 with legacy AES-128-CBC encryption (crypt_method=1)",
             "tags": ["qcow2", "encrypted", "aes", "format-coverage"],
             "generated_by": "scripts/create-qcow2-encrypted-testdata.sh"
+        },
+        {
+            "id": "qcow2-luks",
+            "path": "custom/format-coverage/qcow2-luks.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "passphrase": "test-passphrase",
+            "description": "QCOW2 v3 with LUKS encryption (crypt_method=2, AES-XTS)",
+            "tags": ["qcow2", "encrypted", "luks", "format-coverage"],
+            "generated_by": "scripts/create-qcow2-luks-testdata.sh"
+        },
+        {
+            "id": "luks-v1-aes-xts",
+            "path": "custom/format-coverage/luks-v1-aes-xts.img",
+            "format": "luks",
+            "safety": "safe",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "passphrase": "test-passphrase",
+            "description": "LUKS v1 container with known encrypted content (aes-xts-plain64, low iterations)",
+            "tags": ["luks", "luks1", "encrypted", "convert", "format-coverage"],
+            "generated_by": "scripts/create-native-luks-testdata.py"
         }
     ]
 }
