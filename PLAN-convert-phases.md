@@ -671,21 +671,20 @@ items 5, 6, 12, 15, 16, 18 as done in this file.
 
 ### Future LUKS Enhancements
 
-19. **LUKS v2 Argon2id decryption** — LUKS v2 uses Argon2id for
-    key derivation, which requires significant memory (typically
-    1 GiB). The current 32 MiB guest allocation is insufficient.
-    The `--max-guest-memory` CLI flag provides infrastructure;
-    implementation requires dynamic page table expansion in the
-    VMM and guest, plus integrating an Argon2 crate (no_std).
+19. ~~**LUKS v2 Argon2id decryption**~~ — **Done (Phase 17b).**
+    Dynamic guest memory (`--max-guest-memory`) enables Argon2id's
+    1GB+ working memory. The info operation decrypts LUKS v2
+    containers using Argon2id KDF + AES-XTS, reporting inner
+    format and virtual size.
 
-20. **LUKS v2 test container** — `luks-v2-raw-gpt` is defined
-    in the manifest but not yet created (cryptsetup v2 format
-    requires Argon2 for key derivation, which is slow in CI).
-    Create when v2 decryption is implemented.
+20. ~~**LUKS v2 test container**~~ — **Done (Phase 17b).**
+    `luks-v2-raw-gpt` is activated in the manifest and tested
+    with `--max-guest-memory 1G`.
 
-21. **LUKS convert support** — Currently LUKS is info-only.
-    Future: `imago convert --luks-passphrase` could decrypt
-    LUKS and convert the inner image in a single pass.
+21. ~~**LUKS convert support**~~ — **Done (Phase 17c/17d).**
+    LUKS-in-QCOW2 (crypt_method=2) decryption via `--luks-passphrase`
+    in convert/compare (Phase 17c). Native LUKS container conversion
+    with AES-XTS-plain64 decryption (Phase 17d).
 
 ### Format Capability Gaps
 
