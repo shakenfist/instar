@@ -103,7 +103,6 @@ def af_split(master_key, key_bytes, stripes):
 
 def aes_xts_encrypt(key, data, sector_size, first_sector):
     """Encrypt data using AES-XTS with plain64 IV generation."""
-    half = len(key) // 2
     result = bytearray()
     num_sectors = len(data) // sector_size
 
