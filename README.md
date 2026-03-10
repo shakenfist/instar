@@ -22,7 +22,7 @@ Initial target formats:
 - **vmdk** - VMware Virtual Machine Disk
 - **vpc** (VHD) - Virtual Hard Disk (Hyper-V, Virtual PC)
 - **vhdx** - VHDX Virtual Hard Disk v2 (Hyper-V)
-- **luks** - LUKS encrypted containers (v1/v2, info with optional decryption)
+- **luks** - LUKS encrypted containers (v1/v2, info + convert with decryption)
 
 ## Project Status
 
@@ -196,8 +196,10 @@ backing chain flattening) and writes it in the requested output format.
 Compressed clusters (zlib/deflate and ZSTD) are decompressed transparently,
 including clusters up to 2MB. QCOW2 v3 images with extended L2 entries
 (subclusters) are also supported. Legacy AES-128-CBC encrypted QCOW2 images
-(`crypt_method=1`) can be decrypted with `--qcow2-password`. Individual
-snapshots can be extracted with `--snapshot <name-or-id>`.
+(`crypt_method=1`) can be decrypted with `--qcow2-password`. LUKS-in-QCOW2
+images (`crypt_method=2`) and native LUKS containers can be decrypted with
+`--luks-passphrase`. Individual snapshots can be extracted with
+`--snapshot <name-or-id>`.
 
 By default, convert produces sparse output by skipping zero-filled clusters
 (matching `qemu-img convert` behavior). Use `--no-skip-zeros` for dense output.

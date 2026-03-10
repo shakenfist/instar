@@ -15,13 +15,15 @@ use shared::{
         VDI_SIGNATURE_OFFSET, VHD_COOKIE,
     },
     validate_call_table, CallTable, ImageFormat, InfoConfig, InfoResult, LuksInfo, Qcow2Info,
-    VdiInfo, VmdkInfo, CALL_TABLE_ADDR, MAX_SECTOR_SIZE, SCRATCH_MEM_BASE, SCRATCH_MEM_SIZE,
+    VdiInfo, VmdkInfo, ARGON2_MEM_BASE, CALL_TABLE_ADDR, MAX_SECTOR_SIZE, SCRATCH_MEM_BASE,
+    SCRATCH_MEM_SIZE,
 };
 
-// Crypto imports for LUKS1 decryption
+// Crypto imports for LUKS decryption
 use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockDecrypt, KeyInit};
 use aes::{Aes128, Aes256};
+use argon2::Argon2;
 use hmac::Hmac;
 use pbkdf2::pbkdf2;
 use sha1::Sha1;
@@ -418,24 +420,40 @@ pub unsafe extern "C" fn _start() -> u64 {
         ImageFormat::Luks => {
             let mut luks_info = LuksInfo::new();
 
-            if detailed {
-                parse_luks_header(
-                    &buffer,
-                    &mut result,
-                    &mut luks_info,
-                    call_table,
-                    input_sector_size,
-                );
+            // Always parse LUKS header — chain discovery needs payload_offset
+            // for virtual_size calculation even without --extra-detail.
+            parse_luks_header(
+                &buffer,
+                &mut result,
+                &mut luks_info,
+                call_table,
+                input_sector_size,
+            );
+
+            // Set virtual size to the payload area size (inner image).
+            // LUKS v1 payload_offset is in 512-byte sectors.
+            // LUKS v2 uses data_offset from JSON (stored in payload_offset).
+            if luks_info.payload_offset > 0 {
+                let payload_byte_offset = luks_info.payload_offset as u64 * 512;
+                if device_capacity > payload_byte_offset {
+                    result.virtual_size = device_capacity - payload_byte_offset;
+                }
             }
 
-            // Attempt LUKS1 decryption if passphrase provided
-            if config.is_valid() && config.has_passphrase() && result.version == 1 {
-                if let Some((inner_fmt, inner_vsize)) =
+            // Attempt LUKS decryption if passphrase provided
+            if config.is_valid() && config.has_passphrase() {
+                let decrypt_result = if result.version == 1 {
                     try_luks1_decrypt(&buffer, config, call_table, input_sector_size)
-                {
+                } else if result.version == 2 {
+                    try_luks2_decrypt(&buffer, &luks_info, config, call_table, input_sector_size)
+                } else {
+                    None
+                };
+
+                if let Some((inner_fmt, inner_vsize)) = decrypt_result {
                     luks_info.set_inner_format(inner_fmt.name());
                     luks_info.inner_virtual_size = inner_vsize;
-                } else {
+                } else if result.version == 1 || result.version == 2 {
                     (call_table.debug_print)(
                         b"luks: decryption failed (wrong passphrase?)\n\0".as_ptr(),
                     );
@@ -1291,6 +1309,216 @@ struct LuksKeySlot {
     stripes: u32,
 }
 
+/// LUKS v2 key slot parameters extracted from JSON metadata.
+struct Luks2KeySlot {
+    // KDF parameters (Argon2id)
+    kdf_time: u32,       // iterations (time cost)
+    kdf_memory: u32,     // memory in KiB
+    kdf_cpus: u32,       // parallelism
+    kdf_salt: [u8; 32],  // decoded from base64
+    kdf_salt_len: usize, // actual salt length
+
+    // Key material area
+    area_offset: u64, // byte offset of key material
+    area_size: u64,   // byte size of key material
+
+    // AF splitter
+    af_stripes: u32,      // typically 4000
+    af_hash_sha256: bool, // true=sha256, false=sha1
+
+    // Key size
+    key_size: u32, // 32 or 64 bytes
+}
+
+/// LUKS v2 digest parameters extracted from JSON metadata.
+struct Luks2Digest {
+    digest_type_pbkdf2: bool, // true = pbkdf2 verification
+    hash_sha256: bool,        // true=sha256
+    iterations: u32,
+    salt: [u8; 32],
+    salt_len: usize,
+    digest: [u8; 32], // expected digest value
+    digest_len: usize,
+}
+
+/// Decode standard base64 (with + / = padding) into output buffer.
+/// Returns the number of bytes written, or 0 on error.
+fn base64_decode(input: &[u8], output: &mut [u8]) -> usize {
+    #[inline]
+    fn decode_char(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let mut out_pos = 0;
+    let mut i = 0;
+    // Strip trailing padding
+    let end = input
+        .iter()
+        .rposition(|&b| b != b'=')
+        .map(|p| p + 1)
+        .unwrap_or(0);
+
+    while i + 1 < end {
+        let n = match (i + 1..end.min(i + 4)).count() + 1 {
+            c if c >= 2 => c,
+            _ => break,
+        };
+
+        let a = match decode_char(input[i]) {
+            Some(v) => v as u32,
+            None => return out_pos,
+        };
+        let b = match decode_char(input[i + 1]) {
+            Some(v) => v as u32,
+            None => return out_pos,
+        };
+
+        if out_pos >= output.len() {
+            return out_pos;
+        }
+        output[out_pos] = ((a << 2) | (b >> 4)) as u8;
+        out_pos += 1;
+
+        if n > 2 && i + 2 < end {
+            let c = match decode_char(input[i + 2]) {
+                Some(v) => v as u32,
+                None => return out_pos,
+            };
+            if out_pos >= output.len() {
+                return out_pos;
+            }
+            output[out_pos] = ((b << 4) | (c >> 2)) as u8;
+            out_pos += 1;
+
+            if n > 3 && i + 3 < end {
+                let d = match decode_char(input[i + 3]) {
+                    Some(v) => v as u32,
+                    None => return out_pos,
+                };
+                if out_pos >= output.len() {
+                    return out_pos;
+                }
+                output[out_pos] = ((c << 6) | d) as u8;
+                out_pos += 1;
+            }
+        }
+
+        i += 4;
+    }
+    out_pos
+}
+
+/// Extract full LUKS v2 keyslot parameters from JSON metadata.
+///
+/// Parses KDF (argon2id), AF (stripes, hash), area (offset, size),
+/// and key_size from the first keyslot in the JSON.
+fn parse_luks2_keyslot(json: &[u8]) -> Option<Luks2KeySlot> {
+    let ks_pos = find_pattern(json, b"\"keyslots\"")?;
+    let ks_data = &json[ks_pos..];
+
+    // Find keyslot section boundary (ends at "tokens" or "segments")
+    let ks_end = find_pattern(ks_data, b"\"tokens\"")
+        .or_else(|| find_pattern(ks_data, b"\"segments\""))
+        .unwrap_or(ks_data.len());
+    let ks_section = &ks_data[..ks_end];
+
+    // Check KDF type is argon2id
+    let kdf_pos = find_pattern(ks_section, b"\"kdf\"")?;
+    let kdf_data = &ks_section[kdf_pos..];
+    let kdf_type = extract_json_string(kdf_data, b"\"type\"")?;
+    if kdf_type != b"argon2id" {
+        return None;
+    }
+
+    let kdf_time = extract_json_number(kdf_data, b"\"time\"")? as u32;
+    let kdf_memory = extract_json_number(kdf_data, b"\"memory\"")? as u32;
+    let kdf_cpus = extract_json_number(kdf_data, b"\"cpus\"")? as u32;
+
+    // Decode base64 salt
+    let salt_b64 = extract_json_string(kdf_data, b"\"salt\"")?;
+    let mut kdf_salt = [0u8; 32];
+    let kdf_salt_len = base64_decode(salt_b64, &mut kdf_salt);
+    if kdf_salt_len == 0 {
+        return None;
+    }
+
+    // Key size
+    let key_size = extract_json_number(ks_section, b"\"key_size\"")? as u32;
+
+    // AF parameters
+    let af_pos = find_pattern(ks_section, b"\"af\"")?;
+    let af_data = &ks_section[af_pos..];
+    let af_stripes = extract_json_number(af_data, b"\"stripes\"").unwrap_or(4000) as u32;
+    let af_hash = extract_json_string(af_data, b"\"hash\"").unwrap_or(b"sha256");
+    let af_hash_sha256 = af_hash == b"sha256";
+
+    // Area parameters
+    let area_pos = find_pattern(ks_section, b"\"area\"")?;
+    let area_data = &ks_section[area_pos..];
+    let area_offset_str = extract_json_string(area_data, b"\"offset\"")?;
+    let area_offset = parse_ascii_u64(area_offset_str);
+    let area_size_str = extract_json_string(area_data, b"\"size\"")?;
+    let area_size = parse_ascii_u64(area_size_str);
+
+    Some(Luks2KeySlot {
+        kdf_time,
+        kdf_memory,
+        kdf_cpus,
+        kdf_salt,
+        kdf_salt_len,
+        area_offset,
+        area_size,
+        af_stripes,
+        af_hash_sha256,
+        key_size,
+    })
+}
+
+/// Extract LUKS v2 digest parameters from JSON metadata.
+fn parse_luks2_digest(json: &[u8]) -> Option<Luks2Digest> {
+    let dig_pos = find_pattern(json, b"\"digests\"")?;
+    let dig_data = &json[dig_pos..];
+
+    // Find digest section boundary (ends at "config" or end)
+    let dig_end = find_pattern(dig_data, b"\"config\"").unwrap_or(dig_data.len());
+    let dig_section = &dig_data[..dig_end];
+
+    let dig_type = extract_json_string(dig_section, b"\"type\"")?;
+    let digest_type_pbkdf2 = dig_type == b"pbkdf2";
+
+    let hash = extract_json_string(dig_section, b"\"hash\"").unwrap_or(b"sha256");
+    let hash_sha256 = hash == b"sha256";
+
+    let iterations = extract_json_number(dig_section, b"\"iterations\"").unwrap_or(0) as u32;
+
+    // Decode base64 salt
+    let salt_b64 = extract_json_string(dig_section, b"\"salt\"")?;
+    let mut salt = [0u8; 32];
+    let salt_len = base64_decode(salt_b64, &mut salt);
+
+    // Decode base64 digest
+    let digest_b64 = extract_json_string(dig_section, b"\"digest\"")?;
+    let mut digest = [0u8; 32];
+    let digest_len = base64_decode(digest_b64, &mut digest);
+
+    Some(Luks2Digest {
+        digest_type_pbkdf2,
+        hash_sha256,
+        iterations,
+        salt,
+        salt_len,
+        digest,
+        digest_len,
+    })
+}
+
 /// Attempt LUKS1 decryption and return the detected inner format.
 ///
 /// This implements the full LUKS1 decryption pipeline:
@@ -1474,7 +1702,9 @@ unsafe fn try_luks1_decrypt(
     }
 
     let km_start_sector = km_byte_offset / input_sector_size as u64;
-    let km_sectors_needed = (km_total_bytes + input_sector_size - 1) / input_sector_size;
+    let km_end_byte = km_byte_offset + km_total_bytes as u64;
+    let km_end_sector = (km_end_byte + input_sector_size as u64 - 1) / input_sector_size as u64;
+    let km_sectors_needed = (km_end_sector - km_start_sector) as usize;
 
     let mut sector_buf = [0u8; MAX_SECTOR_SIZE];
     let mut km_pos = 0usize;
@@ -1542,9 +1772,14 @@ unsafe fn try_luks1_decrypt(
     mk.copy_from_slice(&km_buf[..key_bytes]);
 
     // Process remaining stripes
+    // AFsplitter uses the same hash as the LUKS header's hash spec
+    let use_sha256_diffuse = hash == "sha256";
     for i in 1..stripes {
-        // Hash the accumulator (diffuse function)
-        af_diffuse(mk, key_bytes);
+        if use_sha256_diffuse {
+            af_diffuse_sha256(mk, key_bytes);
+        } else {
+            af_diffuse(mk, key_bytes);
+        }
 
         // XOR with next stripe
         let stripe_offset = i * key_bytes;
@@ -1692,6 +1927,396 @@ fn af_diffuse(data: &mut [u8], key_bytes: usize) {
         let hash_result = hasher.finalize();
         data[offset..offset + remainder].copy_from_slice(&hash_result[..remainder]);
     }
+}
+
+/// AFsplitter diffuse function using SHA-256 (for LUKS v2).
+///
+/// LUKS v2 AF typically uses SHA-256 for diffusion, with 32-byte
+/// digest chunks instead of SHA-1's 20-byte chunks.
+fn af_diffuse_sha256(data: &mut [u8], key_bytes: usize) {
+    let digest_size = 32; // SHA-256 output size
+    let full_blocks = key_bytes / digest_size;
+    let remainder = key_bytes % digest_size;
+
+    for i in 0..full_blocks {
+        let offset = i * digest_size;
+        let block_num = (i as u32).to_be_bytes();
+
+        let mut hasher = Sha256::new();
+        hasher.update(&block_num);
+        hasher.update(&data[offset..offset + digest_size]);
+        let hash_result = hasher.finalize();
+        data[offset..offset + digest_size].copy_from_slice(&hash_result);
+    }
+
+    if remainder > 0 {
+        let offset = full_blocks * digest_size;
+        let block_num = (full_blocks as u32).to_be_bytes();
+
+        let mut hasher = Sha256::new();
+        hasher.update(&block_num);
+        hasher.update(&data[offset..offset + remainder]);
+        let hash_result = hasher.finalize();
+        data[offset..offset + remainder].copy_from_slice(&hash_result[..remainder]);
+    }
+}
+
+/// Attempt LUKS2 decryption with Argon2id KDF.
+///
+/// Pipeline:
+/// 1. Parse keyslot and digest parameters from JSON
+/// 2. Argon2id key derivation (requires extra guest memory)
+/// 3. Read encrypted key material from disk
+/// 4. AES-XTS decrypt key material
+/// 5. AFsplitter merge (SHA-256) to recover candidate master key
+/// 6. Verify master key via PBKDF2 digest
+/// 7. Decrypt first payload sector with verified master key
+/// 8. Detect inner format from decrypted data
+///
+/// Returns (inner_format, inner_virtual_size) or None if decryption fails.
+unsafe fn try_luks2_decrypt(
+    buffer: &[u8],
+    luks_info: &LuksInfo,
+    config: &InfoConfig,
+    call_table: &CallTable,
+    input_sector_size: usize,
+) -> Option<(ImageFormat, u64)> {
+    if !config.has_passphrase() {
+        return None;
+    }
+
+    // Check that Argon2 memory is available
+    if config.argon2_mem_size == 0 {
+        (call_table.verbose_print)(
+            b"luks2: skipping decryption (no --max-guest-memory)\n\0".as_ptr(),
+        );
+        return None;
+    }
+
+    // Get JSON data — either from the buffer (large sectors) or read from disk
+    let json: &[u8] = if input_sector_size > LUKS2_BINARY_HEADER_SIZE
+        && buffer.len() > LUKS2_BINARY_HEADER_SIZE
+    {
+        let json_data = &buffer[LUKS2_BINARY_HEADER_SIZE..];
+        let json_len = json_data
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(json_data.len());
+        &json_data[..json_len]
+    } else {
+        // Read JSON from disk into scratch memory (will be reused later for key material)
+        let json_buf =
+            core::slice::from_raw_parts_mut(SCRATCH_MEM_BASE as *mut u8, LUKS2_JSON_SCAN_SIZE);
+        let json_start_sector = LUKS2_BINARY_HEADER_SIZE / input_sector_size;
+        let sectors_to_read = LUKS2_JSON_SCAN_SIZE / input_sector_size;
+        let mut json_bytes_read = 0usize;
+        for i in 0..sectors_to_read {
+            let sector = (json_start_sector + i) as u64;
+            let offset = i * input_sector_size;
+            if !(call_table.read_input_sector)(
+                0,
+                sector,
+                json_buf[offset..].as_mut_ptr(),
+                input_sector_size,
+            ) {
+                break;
+            }
+            json_bytes_read = offset + input_sector_size;
+        }
+        if json_bytes_read == 0 {
+            (call_table.debug_print)(b"luks2: failed to read JSON area\n\0".as_ptr());
+            return None;
+        }
+        let json_len = json_buf[..json_bytes_read]
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(json_bytes_read);
+        &json_buf[..json_len]
+    };
+
+    // Parse keyslot parameters from JSON
+    let slot = match parse_luks2_keyslot(json) {
+        Some(s) => s,
+        None => {
+            (call_table.debug_print)(b"luks2: failed to parse keyslot JSON\n\0".as_ptr());
+            return None;
+        }
+    };
+
+    // Parse digest parameters
+    let digest_params = match parse_luks2_digest(json) {
+        Some(d) => d,
+        None => {
+            (call_table.debug_print)(b"luks2: failed to parse digest JSON\n\0".as_ptr());
+            return None;
+        }
+    };
+
+    let payload_offset_sectors = luks_info.payload_offset;
+
+    let key_bytes = slot.key_size as usize;
+    if key_bytes != 32 && key_bytes != 64 {
+        (call_table.debug_print)(b"luks2: unsupported key size\n\0".as_ptr());
+        return None;
+    }
+
+    // Verify we have enough Argon2 memory
+    let needed_kib = slot.kdf_memory as u64;
+    let available_kib = config.argon2_mem_size / 1024;
+    if needed_kib > available_kib {
+        (call_table.debug_print)(b"luks2: insufficient Argon2 memory\n\0".as_ptr());
+        return None;
+    }
+
+    (call_table.verbose_print)(b"luks2: starting Argon2id key derivation\n\0".as_ptr());
+
+    // Step 1: Argon2id key derivation
+    let passphrase = config.passphrase_bytes();
+    let mut derived_key = [0u8; 64];
+    let dk = &mut derived_key[..key_bytes];
+
+    // Construct Argon2id parameters
+    let params = match argon2::Params::new(slot.kdf_memory, slot.kdf_time, slot.kdf_cpus, None) {
+        Ok(p) => p,
+        Err(_) => {
+            (call_table.debug_print)(b"luks2: invalid Argon2 params\n\0".as_ptr());
+            return None;
+        }
+    };
+
+    let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+
+    // Construct memory blocks from ARGON2_MEM_BASE
+    let num_blocks = (slot.kdf_memory as usize * 1024) / 1024; // memory in KiB = number of 1KiB blocks
+    let memory_ptr = ARGON2_MEM_BASE as *mut argon2::Block;
+    let memory_blocks = core::slice::from_raw_parts_mut(memory_ptr, num_blocks);
+
+    // Zero the memory blocks before use
+    for block in memory_blocks.iter_mut() {
+        *block = argon2::Block::default();
+    }
+
+    if argon2
+        .hash_password_into_with_memory(
+            passphrase,
+            &slot.kdf_salt[..slot.kdf_salt_len],
+            dk,
+            memory_blocks,
+        )
+        .is_err()
+    {
+        (call_table.debug_print)(b"luks2: Argon2id derivation failed\n\0".as_ptr());
+        return None;
+    }
+
+    (call_table.verbose_print)(b"luks2: Argon2id complete, reading key material\n\0".as_ptr());
+
+    // Step 2: Read encrypted key material from disk
+    let km_total_bytes = (key_bytes as u64)
+        .checked_mul(slot.af_stripes as u64)
+        .unwrap_or(0) as usize;
+    if km_total_bytes == 0 || km_total_bytes > SCRATCH_MEM_SIZE {
+        (call_table.debug_print)(b"luks2: key material size invalid\n\0".as_ptr());
+        return None;
+    }
+
+    let km_buf = core::slice::from_raw_parts_mut(SCRATCH_MEM_BASE as *mut u8, km_total_bytes);
+
+    // Key material offset is in bytes for LUKS v2
+    let km_byte_offset = slot.area_offset;
+
+    let cap = (call_table.get_input_capacity)(0) * input_sector_size as u64;
+    if km_byte_offset + km_total_bytes as u64 > cap {
+        (call_table.debug_print)(
+            b"luks2: key material offset exceeds device capacity\n\0".as_ptr(),
+        );
+        return None;
+    }
+
+    let km_start_sector = km_byte_offset / input_sector_size as u64;
+    let km_end_byte = km_byte_offset + km_total_bytes as u64;
+    let km_end_sector = (km_end_byte + input_sector_size as u64 - 1) / input_sector_size as u64;
+    let km_sectors_needed = (km_end_sector - km_start_sector) as usize;
+
+    let mut sector_buf = [0u8; MAX_SECTOR_SIZE];
+    let mut km_pos = 0usize;
+
+    for s in 0..km_sectors_needed {
+        let sector_idx = km_start_sector + s as u64;
+        if !(call_table.read_input_sector)(
+            0,
+            sector_idx,
+            sector_buf.as_mut_ptr(),
+            input_sector_size,
+        ) {
+            (call_table.debug_print)(b"luks2: failed to read key material\n\0".as_ptr());
+            return None;
+        }
+
+        let offset_in_sector = if s == 0 {
+            (km_byte_offset % input_sector_size as u64) as usize
+        } else {
+            0
+        };
+        let available = input_sector_size - offset_in_sector;
+        let to_copy = available.min(km_total_bytes - km_pos);
+        km_buf[km_pos..km_pos + to_copy]
+            .copy_from_slice(&sector_buf[offset_in_sector..offset_in_sector + to_copy]);
+        km_pos += to_copy;
+
+        if km_pos >= km_total_bytes {
+            break;
+        }
+    }
+
+    (call_table.verbose_print)(b"luks2: decrypting key material with AES-XTS\n\0".as_ptr());
+
+    // Step 3: AES-XTS decrypt the key material
+    let half = key_bytes / 2;
+    if half == 16 {
+        let cipher_1 = Aes128::new(GenericArray::from_slice(&dk[..16]));
+        let cipher_2 = Aes128::new(GenericArray::from_slice(&dk[16..32]));
+        let xts = xts_mode::Xts128::new(cipher_1, cipher_2);
+        xts.decrypt_area(km_buf, 512, 0, xts_mode::get_tweak_default);
+    } else if half == 32 {
+        let cipher_1 = Aes256::new(GenericArray::from_slice(&dk[..32]));
+        let cipher_2 = Aes256::new(GenericArray::from_slice(&dk[32..64]));
+        let xts = xts_mode::Xts128::new(cipher_1, cipher_2);
+        xts.decrypt_area(km_buf, 512, 0, xts_mode::get_tweak_default);
+    } else {
+        (call_table.debug_print)(b"luks2: unsupported key half size\n\0".as_ptr());
+        return None;
+    }
+
+    (call_table.verbose_print)(b"luks2: AFsplitter merge\n\0".as_ptr());
+
+    // Step 4: AFsplitter merge
+    let stripes = slot.af_stripes as usize;
+    let mut candidate = [0u8; 64];
+    let mk = &mut candidate[..key_bytes];
+
+    mk.copy_from_slice(&km_buf[..key_bytes]);
+
+    for i in 1..stripes {
+        if slot.af_hash_sha256 {
+            af_diffuse_sha256(mk, key_bytes);
+        } else {
+            af_diffuse(mk, key_bytes);
+        }
+
+        let stripe_offset = i * key_bytes;
+        for j in 0..key_bytes {
+            mk[j] ^= km_buf[stripe_offset + j];
+        }
+    }
+
+    (call_table.verbose_print)(b"luks2: verifying master key\n\0".as_ptr());
+
+    // Step 5: Verify master key against digest
+    if digest_params.digest_type_pbkdf2 && digest_params.iterations > 0 {
+        let mut verify_digest = [0u8; 32];
+        let verify_len = digest_params.digest_len.min(32);
+
+        if digest_params.hash_sha256 {
+            pbkdf2::<Hmac<Sha256>>(
+                mk,
+                &digest_params.salt[..digest_params.salt_len],
+                digest_params.iterations,
+                &mut verify_digest[..verify_len],
+            )
+            .unwrap_or_else(|_| {});
+        } else {
+            // SHA-1 fallback
+            let mut verify_20 = [0u8; 20];
+            let vlen = verify_len.min(20);
+            pbkdf2::<Hmac<Sha1>>(
+                mk,
+                &digest_params.salt[..digest_params.salt_len],
+                digest_params.iterations,
+                &mut verify_20[..vlen],
+            )
+            .unwrap_or_else(|_| {});
+            verify_digest[..vlen].copy_from_slice(&verify_20[..vlen]);
+        }
+
+        if verify_digest[..digest_params.digest_len]
+            != digest_params.digest[..digest_params.digest_len]
+        {
+            (call_table.debug_print)(b"luks2: master key verification failed\n\0".as_ptr());
+            return None;
+        }
+    }
+
+    (call_table.verbose_print)(b"luks2: master key verified, decrypting payload\n\0".as_ptr());
+
+    // Step 6: Decrypt first payload sector
+    // LUKS v2 payload_offset is in 512-byte sectors (already converted from JSON bytes)
+    let payload_byte_offset = payload_offset_sectors as u64 * 512;
+    let payload_sector = payload_byte_offset / input_sector_size as u64;
+
+    let mut payload_buf = [0u8; MAX_SECTOR_SIZE];
+    if !(call_table.read_input_sector)(
+        0,
+        payload_sector,
+        payload_buf.as_mut_ptr(),
+        input_sector_size,
+    ) {
+        (call_table.debug_print)(b"luks2: failed to read payload sector\n\0".as_ptr());
+        return None;
+    }
+
+    // Decrypt using the master key with AES-XTS
+    let payload_offset_in_sector = (payload_byte_offset % input_sector_size as u64) as usize;
+    let decrypt_buf = &mut payload_buf[payload_offset_in_sector..payload_offset_in_sector + 512];
+
+    if half == 16 {
+        let cipher_1 = Aes128::new(GenericArray::from_slice(&mk[..16]));
+        let cipher_2 = Aes128::new(GenericArray::from_slice(&mk[16..32]));
+        let xts = xts_mode::Xts128::new(cipher_1, cipher_2);
+        xts.decrypt_area(decrypt_buf, 512, 0, xts_mode::get_tweak_default);
+    } else if half == 32 {
+        let cipher_1 = Aes256::new(GenericArray::from_slice(&mk[..32]));
+        let cipher_2 = Aes256::new(GenericArray::from_slice(&mk[32..64]));
+        let xts = xts_mode::Xts128::new(cipher_1, cipher_2);
+        xts.decrypt_area(decrypt_buf, 512, 0, xts_mode::get_tweak_default);
+    }
+
+    (call_table.verbose_print)(b"luks2: detecting inner format\n\0".as_ptr());
+
+    // Step 7: Detect inner format
+    let inner_format = detect_format_from_header(decrypt_buf, 512, true);
+
+    let inner_virtual_size = match inner_format {
+        ImageFormat::Qcow2 => {
+            if decrypt_buf.len() >= 32 {
+                u64::from_be_bytes([
+                    decrypt_buf[24],
+                    decrypt_buf[25],
+                    decrypt_buf[26],
+                    decrypt_buf[27],
+                    decrypt_buf[28],
+                    decrypt_buf[29],
+                    decrypt_buf[30],
+                    decrypt_buf[31],
+                ])
+            } else {
+                0
+            }
+        }
+        ImageFormat::Raw => {
+            let cap_sectors = (call_table.get_input_capacity)(0);
+            let cap_bytes = cap_sectors * input_sector_size as u64;
+            let payload_bytes = payload_offset_sectors as u64 * 512;
+            if cap_bytes > payload_bytes {
+                cap_bytes - payload_bytes
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    };
+
+    Some((inner_format, inner_virtual_size))
 }
 
 /// Extract a null-terminated string from a fixed-size header field.
