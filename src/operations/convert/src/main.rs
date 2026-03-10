@@ -132,6 +132,18 @@ pub unsafe extern "C" fn _start() -> u64 {
         return 0;
     }
 
+    // Native LUKS container: decrypt and convert inner payload
+    if top_dev.format == ImageFormat::Luks as u32 {
+        if !config.has_passphrase() {
+            (call_table.debug_print)(
+                b"convert: LUKS container requires --luks-passphrase\n\0".as_ptr(),
+            );
+            (call_table.send_complete)(b"convert\0".as_ptr(), 0, false);
+            return 0;
+        }
+        return convert_native_luks(call_table, config, sector_size, virtual_size, skip_zeros);
+    }
+
     (call_table.verbose_print)(b"convert: initializing chain states\n\0".as_ptr());
 
     // Initialize format-specific state for each input device
@@ -423,6 +435,190 @@ pub unsafe extern "C" fn _start() -> u64 {
             &mut bytes_read,
         ),
     }
+}
+
+// ================================================================
+// Native LUKS container conversion (decrypt + output raw)
+// ================================================================
+
+/// Convert a native LUKS container to raw by decrypting the payload area.
+///
+/// Reads the LUKS header from device 0 at offset 0, derives the master key,
+/// then reads the payload area sector by sector, decrypts with AES-XTS
+/// (plain64 IV), and writes to the output device.
+///
+/// Currently only supports LUKS v1 with raw inner format. The output is
+/// always raw regardless of the target_format setting.
+unsafe fn convert_native_luks(
+    call_table: &CallTable,
+    config: &ConvertConfig,
+    sector_size: usize,
+    virtual_size: u64,
+    skip_zeros: bool,
+) -> u64 {
+    let mut bytes_read: u64 = 0;
+
+    (call_table.verbose_print)(b"convert: native LUKS container detected\n\0".as_ptr());
+
+    // Derive master key using the existing LUKS key derivation.
+    // For native LUKS, the header starts at offset 0 in the file.
+    let mut luks_master_key = [0u8; 64];
+    let result = derive_luks_master_key(
+        call_table,
+        0, // device index
+        0, // LUKS header at offset 0
+        LUKS_V1_HEADER_SIZE as u64,
+        config.passphrase_bytes(),
+        sector_size,
+        &mut luks_master_key,
+        &mut bytes_read,
+    );
+
+    let (key_len, luks_sector_size) = match result {
+        Some(v) => v,
+        None => {
+            (call_table.debug_print)(b"convert: LUKS key derivation failed\n\0".as_ptr());
+            (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
+            return bytes_read;
+        }
+    };
+
+    (call_table.verbose_print)(b"convert: LUKS master key derived\n\0".as_ptr());
+
+    let luks_key = &luks_master_key[..key_len];
+
+    // Read payload offset from LUKS header (already in the cache from key derivation).
+    // Re-read first sector to get payload offset.
+    let input_capacity = (call_table.get_input_capacity)(0);
+    let mut hdr_buf = [0u8; MAX_SECTOR_SIZE];
+    if !(call_table.read_input_sector)(0, 0, hdr_buf.as_mut_ptr(), sector_size) {
+        (call_table.debug_print)(b"convert: failed to re-read LUKS header\n\0".as_ptr());
+        (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
+        return bytes_read;
+    }
+    bytes_read += sector_size as u64;
+
+    let payload_offset_sectors = u32::from_be_bytes([
+        hdr_buf[LUKS_PAYLOAD_OFFSET_OFFSET],
+        hdr_buf[LUKS_PAYLOAD_OFFSET_OFFSET + 1],
+        hdr_buf[LUKS_PAYLOAD_OFFSET_OFFSET + 2],
+        hdr_buf[LUKS_PAYLOAD_OFFSET_OFFSET + 3],
+    ]) as u64;
+
+    // Payload byte offset (LUKS v1 uses 512-byte sectors for payload offset)
+    let payload_byte_offset = payload_offset_sectors * 512;
+
+    (call_table.verbose_print)(b"convert: starting LUKS decryption\n\0".as_ptr());
+
+    // Read payload sequentially, decrypt, write to output
+    let output_sector_size = (call_table.get_output_sector_size)();
+    let progress_interval = (call_table.get_progress_interval)();
+
+    // Use sector_size as the chunk size for reading
+    let chunk_size = sector_size as u64;
+    let buf = BUF_DATA as *mut u8;
+    let mut payload_offset: u64 = 0;
+    let mut last_percent: u32 = 0;
+    let mut chunks_done: u64 = 0;
+    let total_chunks = (virtual_size + chunk_size - 1) / chunk_size;
+
+    while payload_offset < virtual_size {
+        let remaining = virtual_size - payload_offset;
+        let this_chunk = if remaining < chunk_size {
+            remaining
+        } else {
+            chunk_size
+        };
+
+        // Read the encrypted sector from the payload area
+        let physical_byte_offset = payload_byte_offset + payload_offset;
+        let read_sector = physical_byte_offset / sector_size as u64;
+
+        if read_sector >= input_capacity {
+            // Past end of device, fill with zeros
+            core::ptr::write_bytes(buf, 0, this_chunk as usize);
+        } else {
+            if !(call_table.read_input_sector)(0, read_sector, buf, sector_size) {
+                (call_table.send_error)(b"convert\0".as_ptr(), b"input\0".as_ptr(), read_sector, 1);
+                (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
+                return bytes_read;
+            }
+            bytes_read += sector_size as u64;
+
+            // Handle sub-sector offset if payload doesn't start on sector boundary
+            let offset_in_sector = (physical_byte_offset % sector_size as u64) as usize;
+            if offset_in_sector != 0 {
+                // Shift data to start of buffer
+                core::ptr::copy(buf.add(offset_in_sector), buf, this_chunk as usize);
+            }
+
+            // Decrypt the sector using AES-XTS with plain64 IV.
+            // For native LUKS, the IV is the sector number relative to
+            // the start of the payload area.
+            qcow2::decrypt_cluster_aes_xts(
+                buf,
+                this_chunk,
+                payload_offset,
+                luks_key,
+                luks_sector_size,
+            );
+        }
+
+        // Skip zero-filled sectors
+        if skip_zeros && is_all_zeros_ptr(buf, this_chunk as usize) {
+            payload_offset += this_chunk;
+            chunks_done += 1;
+            let percent = (chunks_done * 100 / total_chunks) as u32;
+            if should_report_progress(progress_interval, percent, last_percent, chunks_done) {
+                (call_table.send_progress)(
+                    b"convert\0".as_ptr(),
+                    chunks_done,
+                    total_chunks,
+                    percent,
+                );
+                last_percent = percent;
+            }
+            continue;
+        }
+
+        // Write decrypted data to output
+        let output_first_sector = payload_offset / output_sector_size as u64;
+        let sectors_per_chunk =
+            (this_chunk + output_sector_size as u64 - 1) / output_sector_size as u64;
+
+        for s in 0..sectors_per_chunk {
+            let sector_offset = s * output_sector_size as u64;
+            let write_len = core::cmp::min(output_sector_size as u64, this_chunk - sector_offset);
+            if write_len > 0 {
+                if !(call_table.write_output_sector)(
+                    output_first_sector + s,
+                    buf.add(sector_offset as usize),
+                    write_len as usize,
+                ) {
+                    (call_table.send_error)(
+                        b"convert\0".as_ptr(),
+                        b"output\0".as_ptr(),
+                        output_first_sector + s,
+                        1,
+                    );
+                    (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
+                    return bytes_read;
+                }
+            }
+        }
+
+        payload_offset += this_chunk;
+        chunks_done += 1;
+        let percent = (chunks_done * 100 / total_chunks) as u32;
+        if should_report_progress(progress_interval, percent, last_percent, chunks_done) {
+            (call_table.send_progress)(b"convert\0".as_ptr(), chunks_done, total_chunks, percent);
+            last_percent = percent;
+        }
+    }
+
+    (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, true);
+    (call_table.verbose_print)(b"convert: done\n\0".as_ptr());
+    bytes_read
 }
 
 // ================================================================

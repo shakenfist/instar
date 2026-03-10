@@ -35,6 +35,8 @@ pub enum ImageFormat {
     Vhd,
     /// VHDX format
     Vhdx,
+    /// LUKS encrypted container
+    Luks,
     /// Unknown or unsupported format
     Unknown,
 }
@@ -50,6 +52,7 @@ impl ImageFormat {
             "vmdk3" => ImageFormat::Vmdk3,
             "vpc" => ImageFormat::Vhd,
             "vhdx" => ImageFormat::Vhdx,
+            "luks" => ImageFormat::Luks,
             _ => ImageFormat::Unknown,
         }
     }
@@ -74,6 +77,7 @@ impl ImageFormat {
             ImageFormat::Vhd => 5,
             ImageFormat::Vhdx => 6,
             ImageFormat::Qcow1 => 7,
+            ImageFormat::Luks => 11,
         }
     }
 }
@@ -88,6 +92,7 @@ impl std::fmt::Display for ImageFormat {
             ImageFormat::Vmdk3 => write!(f, "vmdk3"),
             ImageFormat::Vhd => write!(f, "vpc"),
             ImageFormat::Vhdx => write!(f, "vhdx"),
+            ImageFormat::Luks => write!(f, "luks"),
             ImageFormat::Unknown => write!(f, "unknown"),
         }
     }

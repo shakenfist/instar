@@ -51,7 +51,7 @@ pub const ISO_MAGIC: [u8; 5] = *b"CD001";
 /// The detected `ImageFormat`. Returns `Raw` if no known format is detected
 /// from the header (this may be overridden by VHD footer detection or partition
 /// table validation depending on the caller).
-pub fn detect_format_from_header(buffer: &[u8], len: usize, extra_detail: bool) -> ImageFormat {
+pub fn detect_format_from_header(buffer: &[u8], len: usize, _extra_detail: bool) -> ImageFormat {
     if len < 8 {
         return ImageFormat::Unknown;
     }
@@ -112,8 +112,10 @@ pub fn detect_format_from_header(buffer: &[u8], len: usize, extra_detail: bool) 
     }
 
     // Check LUKS magic at offset 0 (6 bytes: "LUKS\xba\xbe")
-    // Only detect LUKS with extra_detail since qemu-img doesn't recognize it
-    if extra_detail && len >= 6 && buffer[0..6] == LUKS_MAGIC {
+    // Always detect LUKS so chain discovery and convert can handle it.
+    // The info output display uses extra_detail to control LUKS-specific
+    // reporting for qemu-img compatibility.
+    if len >= 6 && buffer[0..6] == LUKS_MAGIC {
         return ImageFormat::Luks;
     }
 

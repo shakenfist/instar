@@ -420,14 +420,24 @@ pub unsafe extern "C" fn _start() -> u64 {
         ImageFormat::Luks => {
             let mut luks_info = LuksInfo::new();
 
-            if detailed {
-                parse_luks_header(
-                    &buffer,
-                    &mut result,
-                    &mut luks_info,
-                    call_table,
-                    input_sector_size,
-                );
+            // Always parse LUKS header — chain discovery needs payload_offset
+            // for virtual_size calculation even without --extra-detail.
+            parse_luks_header(
+                &buffer,
+                &mut result,
+                &mut luks_info,
+                call_table,
+                input_sector_size,
+            );
+
+            // Set virtual size to the payload area size (inner image).
+            // LUKS v1 payload_offset is in 512-byte sectors.
+            // LUKS v2 uses data_offset from JSON (stored in payload_offset).
+            if luks_info.payload_offset > 0 {
+                let payload_byte_offset = luks_info.payload_offset as u64 * 512;
+                if device_capacity > payload_byte_offset {
+                    result.virtual_size = device_capacity - payload_byte_offset;
+                }
             }
 
             // Attempt LUKS decryption if passphrase provided
