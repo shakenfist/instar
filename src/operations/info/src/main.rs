@@ -1772,9 +1772,14 @@ unsafe fn try_luks1_decrypt(
     mk.copy_from_slice(&km_buf[..key_bytes]);
 
     // Process remaining stripes
+    // AFsplitter uses the same hash as the LUKS header's hash spec
+    let use_sha256_diffuse = hash == "sha256";
     for i in 1..stripes {
-        // Hash the accumulator (diffuse function)
-        af_diffuse(mk, key_bytes);
+        if use_sha256_diffuse {
+            af_diffuse_sha256(mk, key_bytes);
+        } else {
+            af_diffuse(mk, key_bytes);
+        }
 
         // XOR with next stripe
         let stripe_offset = i * key_bytes;
