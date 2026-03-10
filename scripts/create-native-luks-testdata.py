@@ -12,7 +12,6 @@ Usage: python3 create-native-luks-testdata.py <output_dir>
 """
 
 import hashlib
-import hmac
 import os
 import struct
 import sys
