@@ -25,8 +25,17 @@ use shared::{
     is_all_zeros_ptr, should_report_progress, validate_call_table, verify_sector_sizes, CallTable,
     ChainConfig, ConvertConfig, ImageFormat, ALLOC_HEAP_BASE, CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR,
     COMPRESSED_BUF_SIZE, MAX_CHAIN_DEVICES, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE,
-    OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE,
+    OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE, SCRATCH_MEM_SIZE,
 };
+
+// RustCrypto imports for LUKS-in-QCOW2 key derivation (crypt_method=2)
+use aes::cipher::generic_array::GenericArray;
+use aes::cipher::{BlockDecrypt, KeyInit};
+use aes::{Aes128, Aes256};
+use hmac::Hmac;
+use pbkdf2::pbkdf2;
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
 
 // ================================================================
 // Scratch memory layout
@@ -163,6 +172,55 @@ pub unsafe extern "C" fn _start() -> u64 {
         None
     };
 
+    // LUKS master key for crypt_method=2 (derived later if needed)
+    let mut luks_master_key = [0u8; 64];
+    let mut luks_master_key_len: usize = 0;
+    let mut luks_sector_size: u64 = 512;
+
+    // Derive LUKS master key if top-of-chain is encrypted QCOW2 (crypt_method=2)
+    if let Some(ref state) = chain_states.qcow2_states[0] {
+        if state.crypt_method == 2 && config.has_passphrase() {
+            if state.luks_ext_offset == 0 || state.luks_ext_len == 0 {
+                (call_table.debug_print)(
+                    b"convert: crypt_method=2 but no LUKS extension found\n\0".as_ptr(),
+                );
+                (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
+                return bytes_read;
+            }
+
+            let result = derive_luks_master_key(
+                call_table,
+                state.device_idx,
+                state.luks_ext_offset,
+                state.luks_ext_len,
+                config.passphrase_bytes(),
+                sector_size,
+                &mut luks_master_key,
+                &mut bytes_read,
+            );
+            match result {
+                Some((key_len, sec_size)) => {
+                    luks_master_key_len = key_len;
+                    luks_sector_size = sec_size;
+                    (call_table.verbose_print)(
+                        b"convert: LUKS master key derived successfully\n\0".as_ptr(),
+                    );
+                }
+                None => {
+                    (call_table.debug_print)(b"convert: LUKS key derivation failed\n\0".as_ptr());
+                    (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
+                    return bytes_read;
+                }
+            }
+        } else if state.crypt_method == 2 && !config.has_passphrase() {
+            (call_table.debug_print)(
+                b"convert: LUKS-encrypted QCOW2 requires --luks-passphrase\n\0".as_ptr(),
+            );
+            (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
+            return bytes_read;
+        }
+    }
+
     // If a snapshot ID was specified, find the snapshot and override L1 table
     if config.has_snapshot_id() {
         let snap_id = config.snapshot_id_bytes();
@@ -251,6 +309,13 @@ pub unsafe extern "C" fn _start() -> u64 {
         }
     }
 
+    // Construct LUKS key slice if master key was derived
+    let luks_key: Option<&[u8]> = if luks_master_key_len > 0 {
+        Some(&luks_master_key[..luks_master_key_len])
+    } else {
+        None
+    };
+
     // Dispatch based on target format
     let target = config.target_format();
     match target {
@@ -266,6 +331,8 @@ pub unsafe extern "C" fn _start() -> u64 {
                     sector_size,
                     skip_zeros,
                     aes_key.as_ref(),
+                    luks_key,
+                    luks_sector_size,
                     &mut bytes_read,
                 )
             } else {
@@ -279,6 +346,8 @@ pub unsafe extern "C" fn _start() -> u64 {
                     sector_size,
                     skip_zeros,
                     aes_key.as_ref(),
+                    luks_key,
+                    luks_sector_size,
                     &mut bytes_read,
                 )
             }
@@ -294,6 +363,8 @@ pub unsafe extern "C" fn _start() -> u64 {
                     sector_size,
                     skip_zeros,
                     aes_key.as_ref(),
+                    luks_key,
+                    luks_sector_size,
                     &mut bytes_read,
                 )
             } else {
@@ -306,6 +377,8 @@ pub unsafe extern "C" fn _start() -> u64 {
                     sector_size,
                     skip_zeros,
                     aes_key.as_ref(),
+                    luks_key,
+                    luks_sector_size,
                     &mut bytes_read,
                 )
             }
@@ -319,6 +392,8 @@ pub unsafe extern "C" fn _start() -> u64 {
             sector_size,
             skip_zeros,
             aes_key.as_ref(),
+            luks_key,
+            luks_sector_size,
             &mut bytes_read,
         ),
         ImageFormat::Vhdx => convert_to_vhdx(
@@ -330,6 +405,8 @@ pub unsafe extern "C" fn _start() -> u64 {
             sector_size,
             skip_zeros,
             aes_key.as_ref(),
+            luks_key,
+            luks_sector_size,
             &mut bytes_read,
         ),
         _ => convert_to_raw(
@@ -341,9 +418,361 @@ pub unsafe extern "C" fn _start() -> u64 {
             sector_size,
             skip_zeros,
             aes_key.as_ref(),
+            luks_key,
+            luks_sector_size,
             &mut bytes_read,
         ),
     }
+}
+
+// ================================================================
+// LUKS-in-QCOW2 key derivation (crypt_method=2)
+// ================================================================
+
+// LUKS v1 header constants
+const LUKS_V1_HEADER_SIZE: usize = 592;
+const LUKS_VERSION_OFFSET: usize = 6;
+const LUKS_CIPHER_NAME_OFFSET: usize = 8;
+const LUKS_CIPHER_MODE_OFFSET: usize = 40;
+const LUKS_HASH_SPEC_OFFSET: usize = 72;
+const LUKS_PAYLOAD_OFFSET_OFFSET: usize = 104;
+const LUKS_KEY_BYTES_OFFSET: usize = 108;
+const LUKS_MK_DIGEST_OFFSET: usize = 112;
+const LUKS_MK_DIGEST_SALT_OFFSET: usize = 132;
+const LUKS_MK_DIGEST_ITER_OFFSET: usize = 164;
+const LUKS_KEY_SLOT_BASE: usize = 208;
+const LUKS_KEY_SLOT_SIZE: usize = 48;
+const LUKS_KEY_SLOT_ACTIVE: u32 = 0x00AC71F3;
+const LUKS_SLOT_ITERATIONS_OFFSET: usize = 4;
+const LUKS_SLOT_SALT_OFFSET: usize = 8;
+const LUKS_SLOT_KEY_MATERIAL_OFFSET: usize = 40;
+const LUKS_SLOT_STRIPES_OFFSET: usize = 44;
+
+/// AFsplitter diffuse function using SHA-1 (for LUKS v1).
+fn af_diffuse_sha1(data: &mut [u8], key_bytes: usize) {
+    let digest_size = 20;
+    let full_blocks = key_bytes / digest_size;
+    let remainder = key_bytes % digest_size;
+
+    for i in 0..full_blocks {
+        let offset = i * digest_size;
+        let block_num = (i as u32).to_be_bytes();
+        let mut hasher = Sha1::new();
+        hasher.update(&block_num);
+        hasher.update(&data[offset..offset + digest_size]);
+        let result = hasher.finalize();
+        data[offset..offset + digest_size].copy_from_slice(&result);
+    }
+    if remainder > 0 {
+        let offset = full_blocks * digest_size;
+        let block_num = (full_blocks as u32).to_be_bytes();
+        let mut hasher = Sha1::new();
+        hasher.update(&block_num);
+        hasher.update(&data[offset..offset + remainder]);
+        let result = hasher.finalize();
+        data[offset..offset + remainder].copy_from_slice(&result[..remainder]);
+    }
+}
+
+/// AFsplitter diffuse function using SHA-256 (for LUKS v1 with sha256 hash).
+fn af_diffuse_sha256(data: &mut [u8], key_bytes: usize) {
+    let digest_size = 32;
+    let full_blocks = key_bytes / digest_size;
+    let remainder = key_bytes % digest_size;
+
+    for i in 0..full_blocks {
+        let offset = i * digest_size;
+        let block_num = (i as u32).to_be_bytes();
+        let mut hasher = Sha256::new();
+        hasher.update(&block_num);
+        hasher.update(&data[offset..offset + digest_size]);
+        let result = hasher.finalize();
+        data[offset..offset + digest_size].copy_from_slice(&result);
+    }
+    if remainder > 0 {
+        let offset = full_blocks * digest_size;
+        let block_num = (full_blocks as u32).to_be_bytes();
+        let mut hasher = Sha256::new();
+        hasher.update(&block_num);
+        hasher.update(&data[offset..offset + remainder]);
+        let result = hasher.finalize();
+        data[offset..offset + remainder].copy_from_slice(&result[..remainder]);
+    }
+}
+
+/// Compare a header field against a string.
+fn header_field_eq(header: &[u8], offset: usize, max_len: usize, expected: &[u8]) -> bool {
+    let end = (offset + max_len).min(header.len());
+    let field = &header[offset..end];
+    let nul_pos = field.iter().position(|&b| b == 0).unwrap_or(field.len());
+    &field[..nul_pos] == expected
+}
+
+/// Derive LUKS v1 master key from an embedded LUKS header in QCOW2.
+///
+/// Reads the LUKS binary header and key material from the QCOW2 LUKS
+/// extension area, performs PBKDF2 key derivation, AES-XTS decryption
+/// of key material, AFsplitter merge, and master key verification.
+///
+/// Returns (key_len, luks_sector_size) on success. The derived key is
+/// written to `out_key` (up to 64 bytes).
+unsafe fn derive_luks_master_key(
+    call_table: &CallTable,
+    device_idx: u32,
+    luks_ext_offset: u64,
+    luks_ext_len: u64,
+    passphrase: &[u8],
+    sector_size: usize,
+    out_key: &mut [u8; 64],
+    bytes_read: &mut u64,
+) -> Option<(usize, u64)> {
+    // Read the LUKS binary header from the extension area
+    let input_capacity = (call_table.get_input_capacity)(device_idx);
+    let mut hdr_buf = [0u8; LUKS_V1_HEADER_SIZE];
+
+    // Read header data sector by sector
+    let hdr_start_sector = luks_ext_offset / sector_size as u64;
+    let hdr_offset_in_sector = (luks_ext_offset % sector_size as u64) as usize;
+    let mut sector_buf = [0u8; MAX_SECTOR_SIZE];
+    let mut hdr_pos = 0usize;
+
+    while hdr_pos < LUKS_V1_HEADER_SIZE {
+        let cur_sector =
+            hdr_start_sector + (hdr_offset_in_sector + hdr_pos) as u64 / sector_size as u64;
+        let off_in_sec = (hdr_offset_in_sector + hdr_pos) % sector_size;
+        if !(call_table.read_input_sector)(
+            device_idx,
+            cur_sector,
+            sector_buf.as_mut_ptr(),
+            sector_size,
+        ) {
+            (call_table.debug_print)(b"luks-qcow2: failed to read LUKS header\n\0".as_ptr());
+            return None;
+        }
+        *bytes_read += sector_size as u64;
+        let avail = sector_size - off_in_sec;
+        let needed = LUKS_V1_HEADER_SIZE - hdr_pos;
+        let to_copy = avail.min(needed);
+        hdr_buf[hdr_pos..hdr_pos + to_copy]
+            .copy_from_slice(&sector_buf[off_in_sec..off_in_sec + to_copy]);
+        hdr_pos += to_copy;
+    }
+
+    // Verify LUKS magic and version
+    if &hdr_buf[0..6] != b"LUKS\xba\xbe" {
+        (call_table.debug_print)(b"luks-qcow2: bad LUKS magic\n\0".as_ptr());
+        return None;
+    }
+    let version = u16::from_be_bytes([
+        hdr_buf[LUKS_VERSION_OFFSET],
+        hdr_buf[LUKS_VERSION_OFFSET + 1],
+    ]);
+    if version != 1 {
+        (call_table.debug_print)(b"luks-qcow2: only LUKS v1 supported in QCOW2\n\0".as_ptr());
+        return None;
+    }
+
+    // Verify cipher and mode
+    if !header_field_eq(&hdr_buf, LUKS_CIPHER_NAME_OFFSET, 32, b"aes") {
+        (call_table.debug_print)(b"luks-qcow2: unsupported cipher\n\0".as_ptr());
+        return None;
+    }
+    if !header_field_eq(&hdr_buf, LUKS_CIPHER_MODE_OFFSET, 32, b"xts-plain64") {
+        (call_table.debug_print)(b"luks-qcow2: unsupported mode\n\0".as_ptr());
+        return None;
+    }
+
+    let use_sha256 = header_field_eq(&hdr_buf, LUKS_HASH_SPEC_OFFSET, 32, b"sha256");
+    let use_sha1 = header_field_eq(&hdr_buf, LUKS_HASH_SPEC_OFFSET, 32, b"sha1");
+    if !use_sha256 && !use_sha1 {
+        (call_table.debug_print)(b"luks-qcow2: unsupported hash\n\0".as_ptr());
+        return None;
+    }
+
+    let key_bytes = u32::from_be_bytes([
+        hdr_buf[LUKS_KEY_BYTES_OFFSET],
+        hdr_buf[LUKS_KEY_BYTES_OFFSET + 1],
+        hdr_buf[LUKS_KEY_BYTES_OFFSET + 2],
+        hdr_buf[LUKS_KEY_BYTES_OFFSET + 3],
+    ]) as usize;
+    if key_bytes != 32 && key_bytes != 64 {
+        (call_table.debug_print)(b"luks-qcow2: unsupported key size\n\0".as_ptr());
+        return None;
+    }
+
+    // Master key digest for verification
+    let mut mk_digest = [0u8; 20];
+    mk_digest.copy_from_slice(&hdr_buf[LUKS_MK_DIGEST_OFFSET..LUKS_MK_DIGEST_OFFSET + 20]);
+    let mut mk_digest_salt = [0u8; 32];
+    mk_digest_salt
+        .copy_from_slice(&hdr_buf[LUKS_MK_DIGEST_SALT_OFFSET..LUKS_MK_DIGEST_SALT_OFFSET + 32]);
+    let mk_digest_iterations = u32::from_be_bytes([
+        hdr_buf[LUKS_MK_DIGEST_ITER_OFFSET],
+        hdr_buf[LUKS_MK_DIGEST_ITER_OFFSET + 1],
+        hdr_buf[LUKS_MK_DIGEST_ITER_OFFSET + 2],
+        hdr_buf[LUKS_MK_DIGEST_ITER_OFFSET + 3],
+    ]);
+
+    // Find first active key slot
+    let mut slot_iterations = 0u32;
+    let mut slot_salt = [0u8; 32];
+    let mut slot_km_offset = 0u32;
+    let mut slot_stripes = 0u32;
+    let mut found_slot = false;
+
+    for i in 0..8 {
+        let base = LUKS_KEY_SLOT_BASE + i * LUKS_KEY_SLOT_SIZE;
+        let state = u32::from_be_bytes([
+            hdr_buf[base],
+            hdr_buf[base + 1],
+            hdr_buf[base + 2],
+            hdr_buf[base + 3],
+        ]);
+        if state == LUKS_KEY_SLOT_ACTIVE {
+            slot_iterations = u32::from_be_bytes([
+                hdr_buf[base + LUKS_SLOT_ITERATIONS_OFFSET],
+                hdr_buf[base + LUKS_SLOT_ITERATIONS_OFFSET + 1],
+                hdr_buf[base + LUKS_SLOT_ITERATIONS_OFFSET + 2],
+                hdr_buf[base + LUKS_SLOT_ITERATIONS_OFFSET + 3],
+            ]);
+            slot_salt.copy_from_slice(
+                &hdr_buf[base + LUKS_SLOT_SALT_OFFSET..base + LUKS_SLOT_SALT_OFFSET + 32],
+            );
+            slot_km_offset = u32::from_be_bytes([
+                hdr_buf[base + LUKS_SLOT_KEY_MATERIAL_OFFSET],
+                hdr_buf[base + LUKS_SLOT_KEY_MATERIAL_OFFSET + 1],
+                hdr_buf[base + LUKS_SLOT_KEY_MATERIAL_OFFSET + 2],
+                hdr_buf[base + LUKS_SLOT_KEY_MATERIAL_OFFSET + 3],
+            ]);
+            slot_stripes = u32::from_be_bytes([
+                hdr_buf[base + LUKS_SLOT_STRIPES_OFFSET],
+                hdr_buf[base + LUKS_SLOT_STRIPES_OFFSET + 1],
+                hdr_buf[base + LUKS_SLOT_STRIPES_OFFSET + 2],
+                hdr_buf[base + LUKS_SLOT_STRIPES_OFFSET + 3],
+            ]);
+            found_slot = true;
+            break;
+        }
+    }
+    if !found_slot {
+        (call_table.debug_print)(b"luks-qcow2: no active key slot\n\0".as_ptr());
+        return None;
+    }
+
+    (call_table.verbose_print)(b"luks-qcow2: starting PBKDF2 key derivation\n\0".as_ptr());
+
+    // Step 1: PBKDF2 to derive split key
+    let mut derived_key = [0u8; 64];
+    let dk = &mut derived_key[..key_bytes];
+    if use_sha256 {
+        pbkdf2::<Hmac<Sha256>>(passphrase, &slot_salt, slot_iterations, dk).unwrap_or_else(|_| {});
+    } else {
+        pbkdf2::<Hmac<Sha1>>(passphrase, &slot_salt, slot_iterations, dk).unwrap_or_else(|_| {});
+    }
+
+    (call_table.verbose_print)(b"luks-qcow2: reading key material\n\0".as_ptr());
+
+    // Step 2: Read encrypted key material from LUKS extension
+    // Key material offset is in 512-byte sectors within the LUKS header
+    let km_total_bytes = key_bytes.checked_mul(slot_stripes as usize).unwrap_or(0);
+    if km_total_bytes == 0 || km_total_bytes > SCRATCH_MEM_SIZE {
+        (call_table.debug_print)(b"luks-qcow2: key material too large\n\0".as_ptr());
+        return None;
+    }
+
+    let km_buf = core::slice::from_raw_parts_mut(SCRATCH_MEM_BASE as *mut u8, km_total_bytes);
+    let km_byte_offset = luks_ext_offset + (slot_km_offset as u64 * 512);
+    let km_start_sector = km_byte_offset / sector_size as u64;
+    let km_end_byte = km_byte_offset + km_total_bytes as u64;
+    let km_end_sector = (km_end_byte + sector_size as u64 - 1) / sector_size as u64;
+    let km_sectors_needed = (km_end_sector - km_start_sector) as usize;
+
+    let mut km_pos = 0usize;
+    for s in 0..km_sectors_needed {
+        let sector_idx = km_start_sector + s as u64;
+        if !(call_table.read_input_sector)(
+            device_idx,
+            sector_idx,
+            sector_buf.as_mut_ptr(),
+            sector_size,
+        ) {
+            (call_table.debug_print)(b"luks-qcow2: failed to read key material\n\0".as_ptr());
+            return None;
+        }
+        *bytes_read += sector_size as u64;
+        let off_in_sec = if s == 0 {
+            (km_byte_offset % sector_size as u64) as usize
+        } else {
+            0
+        };
+        let avail = sector_size - off_in_sec;
+        let to_copy = avail.min(km_total_bytes - km_pos);
+        km_buf[km_pos..km_pos + to_copy]
+            .copy_from_slice(&sector_buf[off_in_sec..off_in_sec + to_copy]);
+        km_pos += to_copy;
+        if km_pos >= km_total_bytes {
+            break;
+        }
+    }
+
+    (call_table.verbose_print)(b"luks-qcow2: decrypting key material\n\0".as_ptr());
+
+    // Step 3: AES-XTS decrypt key material
+    let half = key_bytes / 2;
+    if half == 16 {
+        let c1 = Aes128::new(GenericArray::from_slice(&dk[..16]));
+        let c2 = Aes128::new(GenericArray::from_slice(&dk[16..32]));
+        let xts = xts_mode::Xts128::new(c1, c2);
+        xts.decrypt_area(km_buf, 512, 0, xts_mode::get_tweak_default);
+    } else if half == 32 {
+        let c1 = Aes256::new(GenericArray::from_slice(&dk[..32]));
+        let c2 = Aes256::new(GenericArray::from_slice(&dk[32..64]));
+        let xts = xts_mode::Xts128::new(c1, c2);
+        xts.decrypt_area(km_buf, 512, 0, xts_mode::get_tweak_default);
+    }
+
+    (call_table.verbose_print)(b"luks-qcow2: AFsplitter merge\n\0".as_ptr());
+
+    // Step 4: AFsplitter merge
+    let stripes = slot_stripes as usize;
+    let mut candidate = [0u8; 64];
+    let mk = &mut candidate[..key_bytes];
+    mk.copy_from_slice(&km_buf[..key_bytes]);
+
+    for i in 1..stripes {
+        if use_sha256 {
+            af_diffuse_sha256(mk, key_bytes);
+        } else {
+            af_diffuse_sha1(mk, key_bytes);
+        }
+        let stripe_offset = i * key_bytes;
+        for j in 0..key_bytes {
+            mk[j] ^= km_buf[stripe_offset + j];
+        }
+    }
+
+    (call_table.verbose_print)(b"luks-qcow2: verifying master key\n\0".as_ptr());
+
+    // Step 5: Verify master key via PBKDF2 digest
+    let mut verify = [0u8; 20];
+    if use_sha256 {
+        pbkdf2::<Hmac<Sha256>>(mk, &mk_digest_salt, mk_digest_iterations, &mut verify)
+            .unwrap_or_else(|_| {});
+    } else {
+        pbkdf2::<Hmac<Sha1>>(mk, &mk_digest_salt, mk_digest_iterations, &mut verify)
+            .unwrap_or_else(|_| {});
+    }
+
+    if verify != mk_digest {
+        (call_table.debug_print)(b"luks-qcow2: master key verification failed\n\0".as_ptr());
+        return None;
+    }
+
+    (call_table.verbose_print)(b"luks-qcow2: master key verified\n\0".as_ptr());
+
+    out_key[..key_bytes].copy_from_slice(mk);
+    // LUKS v1 always uses 512-byte sectors
+    Some((key_bytes, 512))
 }
 
 // ================================================================
@@ -359,6 +788,8 @@ unsafe fn convert_to_raw(
     sector_size: usize,
     skip_zeros: bool,
     aes_key: Option<&[u8; 16]>,
+    luks_key: Option<&[u8]>,
+    luks_sector_size: u64,
     bytes_read: &mut u64,
 ) -> u64 {
     let output_sector_size = (call_table.get_output_sector_size)();
@@ -422,6 +853,8 @@ unsafe fn convert_to_raw(
             staging_buf,
             &mut staging_cluster_offset,
             aes_key,
+            luks_key,
+            luks_sector_size,
             bytes_read,
         ) {
             (call_table.send_error)(
@@ -836,6 +1269,8 @@ unsafe fn convert_to_qcow2(
     sector_size: usize,
     skip_zeros: bool,
     aes_key: Option<&[u8; 16]>,
+    luks_key: Option<&[u8]>,
+    luks_sector_size: u64,
     bytes_read: &mut u64,
 ) -> u64 {
     let layout = match init_qcow2_output_layout(
@@ -902,6 +1337,8 @@ unsafe fn convert_to_qcow2(
                 staging_buf,
                 &mut staging_cluster_offset,
                 aes_key,
+                luks_key,
+                luks_sector_size,
                 bytes_read,
             ) {
                 (call_table.send_error)(
@@ -1113,6 +1550,8 @@ unsafe fn convert_to_qcow2_compressed(
     sector_size: usize,
     skip_zeros: bool,
     aes_key: Option<&[u8; 16]>,
+    luks_key: Option<&[u8]>,
+    luks_sector_size: u64,
     bytes_read: &mut u64,
 ) -> u64 {
     let layout = match init_qcow2_output_layout(
@@ -1202,6 +1641,8 @@ unsafe fn convert_to_qcow2_compressed(
                 staging_buf,
                 &mut staging_cluster_offset,
                 aes_key,
+                luks_key,
+                luks_sector_size,
                 bytes_read,
             ) {
                 (call_table.send_error)(
@@ -1513,6 +1954,8 @@ unsafe fn convert_to_vmdk(
     sector_size: usize,
     skip_zeros: bool,
     aes_key: Option<&[u8; 16]>,
+    luks_key: Option<&[u8]>,
+    luks_sector_size: u64,
     bytes_read: &mut u64,
 ) -> u64 {
     let layout =
@@ -1581,6 +2024,8 @@ unsafe fn convert_to_vmdk(
                 staging_buf,
                 &mut staging_cluster_offset,
                 aes_key,
+                luks_key,
+                luks_sector_size,
                 bytes_read,
             ) {
                 (call_table.send_error)(
@@ -1773,6 +2218,8 @@ unsafe fn convert_to_vmdk_compressed(
     sector_size: usize,
     skip_zeros: bool,
     aes_key: Option<&[u8; 16]>,
+    luks_key: Option<&[u8]>,
+    luks_sector_size: u64,
     bytes_read: &mut u64,
 ) -> u64 {
     let layout =
@@ -1854,6 +2301,8 @@ unsafe fn convert_to_vmdk_compressed(
                 staging_buf,
                 &mut staging_cluster_offset,
                 aes_key,
+                luks_key,
+                luks_sector_size,
                 bytes_read,
             ) {
                 (call_table.send_error)(
@@ -2155,6 +2604,8 @@ unsafe fn convert_to_vhd(
     sector_size: usize,
     skip_zeros: bool,
     aes_key: Option<&[u8; 16]>,
+    luks_key: Option<&[u8]>,
+    luks_sector_size: u64,
     bytes_read: &mut u64,
 ) -> u64 {
     let oss = (call_table.get_output_sector_size)();
@@ -2327,6 +2778,8 @@ unsafe fn convert_to_vhd(
                 staging_buf,
                 &mut staging_cluster_offset,
                 aes_key,
+                luks_key,
+                luks_sector_size,
                 bytes_read,
             ) {
                 (call_table.send_error)(
@@ -2432,6 +2885,8 @@ unsafe fn convert_to_vhd(
                     staging_buf,
                     &mut staging_cluster_offset,
                     aes_key,
+                    luks_key,
+                    luks_sector_size,
                     bytes_read,
                 ) {
                     (call_table.send_error)(
@@ -2564,6 +3019,8 @@ unsafe fn convert_to_vhdx(
     sector_size: usize,
     skip_zeros: bool,
     aes_key: Option<&[u8; 16]>,
+    luks_key: Option<&[u8]>,
+    luks_sector_size: u64,
     bytes_read: &mut u64,
 ) -> u64 {
     let oss = (call_table.get_output_sector_size)();
@@ -2857,6 +3314,8 @@ unsafe fn convert_to_vhdx(
                 staging_buf,
                 &mut staging_cluster_offset,
                 aes_key,
+                luks_key,
+                luks_sector_size,
                 bytes_read,
             ) {
                 (call_table.send_error)(
@@ -2924,6 +3383,8 @@ unsafe fn convert_to_vhdx(
                 staging_buf,
                 &mut staging_cluster_offset,
                 aes_key,
+                luks_key,
+                luks_sector_size,
                 bytes_read,
             ) {
                 (call_table.send_error)(

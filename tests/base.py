@@ -502,6 +502,7 @@ class ImagoTestBase(testtools.TestCase):
         cluster_size: int = None,
         compress: bool = False,
         qcow2_password: str = None,
+        luks_passphrase: str = None,
         snapshot: str = None,
     ) -> tuple:
         """
@@ -517,6 +518,7 @@ class ImagoTestBase(testtools.TestCase):
             cluster_size: Output cluster size (qcow2 only)
             compress: Compress data clusters (qcow2 only)
             qcow2_password: Password for AES-encrypted QCOW2
+            luks_passphrase: Passphrase for LUKS-encrypted images
             snapshot: Snapshot ID or name to extract
 
         Returns:
@@ -538,6 +540,10 @@ class ImagoTestBase(testtools.TestCase):
             cmd.append('--compress')
         if qcow2_password is not None:
             cmd.extend(['--qcow2-password', qcow2_password])
+        if luks_passphrase is not None:
+            cmd.extend(
+                ['--luks-passphrase', luks_passphrase]
+            )
         if snapshot is not None:
             cmd.extend(['--snapshot', snapshot])
         cmd.extend([str(input_path), str(output_path)])

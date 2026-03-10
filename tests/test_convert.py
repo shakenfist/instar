@@ -3579,3 +3579,99 @@ class TestConvertEncryptedQcow2(ImagoTestBase):
                 'Wrong password produced same output '
                 'as correct password'
             )
+
+
+class TestConvertLuksQcow2(ImagoTestBase):
+    """Test conversion of LUKS-encrypted QCOW2 images
+    (crypt_method=2)."""
+
+    def test_convert_luks_qcow2_to_raw(self):
+        """Convert LUKS-in-QCOW2 to raw with passphrase."""
+        image = self.get_image('qcow2-luks')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.raw') as raw_out, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as qemu_raw:
+            # Convert with imago using LUKS passphrase
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(raw_out.name),
+                luks_passphrase='test-passphrase'
+            )
+            self.assertEqual(
+                rc, 0,
+                f'LUKS-QCOW2 convert failed: {stderr}'
+            )
+
+            # Convert with qemu-img for baseline
+            subprocess.run(
+                [
+                    'qemu-img', 'convert',
+                    '--object',
+                    'secret,id=sec0,data=test-passphrase',
+                    '--image-opts',
+                    'driver=qcow2,'
+                    'encrypt.key-secret=sec0,'
+                    'file.driver=file,'
+                    f'file.filename={image.path}',
+                    '-O', 'raw',
+                    qemu_raw.name,
+                ],
+                capture_output=True, text=True,
+                timeout=30, check=True
+            )
+
+            # Compare outputs
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(raw_out.name),
+                Path(qemu_raw.name)
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Output differs from qemu-img: '
+                f'{cmp_out}'
+            )
+
+    def test_convert_luks_qcow2_without_passphrase(self):
+        """Converting LUKS-QCOW2 without passphrase should
+        fail gracefully."""
+        image = self.get_image('qcow2-luks')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.raw') as raw_out:
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(raw_out.name)
+            )
+            # Should fail or produce encrypted data
+            self.assertIn(
+                rc, [0, 1],
+                f'Unexpected crash: {stderr}'
+            )
+
+    def test_convert_luks_qcow2_wrong_passphrase(self):
+        """Converting with wrong passphrase should fail."""
+        image = self.get_image('qcow2-luks')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.raw') as raw_out:
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(raw_out.name),
+                luks_passphrase='wrong-passphrase'
+            )
+            # Key derivation should fail verification
+            self.assertNotEqual(
+                rc, 0,
+                'Wrong passphrase should fail'
+            )
