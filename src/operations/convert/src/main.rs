@@ -30,7 +30,7 @@ use shared::{
 
 // RustCrypto imports for LUKS-in-QCOW2 key derivation (crypt_method=2)
 use aes::cipher::generic_array::GenericArray;
-use aes::cipher::{BlockDecrypt, KeyInit};
+use aes::cipher::KeyInit;
 use aes::{Aes128, Aes256};
 use hmac::Hmac;
 use pbkdf2::pbkdf2;
