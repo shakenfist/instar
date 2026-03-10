@@ -82,6 +82,10 @@ The `imago convert` operation supports writing output in the following formats:
   via `--luks-passphrase`.
 - QCOW2 snapshots: snapshot table parsing and extraction via
   `convert --snapshot <ID|name>` are supported (up to 16 snapshots).
+- `imago compare` does not yet support LUKS-in-QCOW2 decryption. Comparing
+  LUKS-encrypted QCOW2 images (crypt_method=2) will compare ciphertext, not
+  decrypted content. A future phase may add `--luks-passphrase` support to
+  compare for consistency with the convert operation.
 - Extended L2 images with partially-allocated subclusters may return stale host
   data for unallocated subclusters. The extended L2 support reads only the first
   8 bytes of each 16-byte entry (the cluster descriptor), ignoring the subcluster
