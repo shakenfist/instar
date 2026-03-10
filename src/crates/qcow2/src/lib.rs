@@ -56,6 +56,7 @@ pub const COMPRESSION_TYPE_OFFSET: usize = 104;
 // Header extension type IDs
 pub const EXT_BACKING_FORMAT: u32 = 0xE2792ACA;
 pub const EXT_EXTERNAL_DATA_FILE: u32 = 0x44415441; // "DATA"
+pub const EXT_ENCRYPT_HEADER: u32 = 0x0537BE77; // Full disk encryption header pointer (crypt_method=2)
 pub const EXT_END: u32 = 0x00000000;
 /// Start of header extensions in v2 (fixed 72-byte header)
 pub const V2_HEADER_EXTENSION_OFFSET: usize = 72;
@@ -426,6 +427,13 @@ pub struct HeaderExtensionResults {
     pub data_file_name_offset: usize,
     /// Length of the data file name in bytes (0 if absent).
     pub data_file_name_len: usize,
+    /// Byte offset of the LUKS header data within the QCOW2 file
+    /// (0 if no encryption header pointer extension found). Present when
+    /// crypt_method=2. The extension 0x0537BE77 contains a pointer
+    /// (offset + length) to the actual LUKS header stored elsewhere in the file.
+    pub luks_header_offset: u64,
+    /// Length of the LUKS header data in bytes (0 if absent).
+    pub luks_header_len: u64,
 }
 
 /// Parse QCOW2 header extensions from a header buffer.
@@ -441,6 +449,8 @@ pub fn parse_header_extensions(header: &[u8], parsed: &QcowHeader) -> HeaderExte
         backing_format: BackingFormat::None,
         data_file_name_offset: 0,
         data_file_name_len: 0,
+        luks_header_offset: 0,
+        luks_header_len: 0,
     };
 
     if parsed.version < 3 {
@@ -471,6 +481,11 @@ pub fn parse_header_extensions(header: &[u8], parsed: &QcowHeader) -> HeaderExte
         } else if ext_type == EXT_EXTERNAL_DATA_FILE && ext_len > 0 {
             result.data_file_name_offset = ext_offset + 8;
             result.data_file_name_len = ext_len;
+        } else if ext_type == EXT_ENCRYPT_HEADER && ext_len >= 16 {
+            // Extension data is a pointer: offset (u64 BE) + length (u64 BE)
+            let data_start = ext_offset + 8;
+            result.luks_header_offset = be_u64(header, data_start);
+            result.luks_header_len = be_u64(header, data_start + 8);
         }
 
         // Move to next extension (data padded to 8-byte boundary)
@@ -888,6 +903,12 @@ pub struct Qcow2State {
     pub compression_type: u8,
     /// Encryption method from the header (0=none, 1=AES-128-CBC, 2=LUKS).
     pub crypt_method: u32,
+    /// Byte offset of the LUKS header extension data within the QCOW2 file.
+    /// Only valid when crypt_method=2. The extension contains the full LUKS
+    /// binary header and key material areas.
+    pub luks_ext_offset: u64,
+    /// Length of the LUKS header extension in bytes.
+    pub luks_ext_len: u64,
     /// True when INCOMPAT_EXTENDED_L2 (bit 4) is set.
     pub extended_l2: bool,
     // Sector cache tracking for L1 table reads
@@ -937,6 +958,8 @@ impl Qcow2State {
             incompatible_features: 0,
             compression_type: 0,
             crypt_method: 0,
+            luks_ext_offset: 0,
+            luks_ext_len: 0,
             extended_l2: false,
             l1_cached_sector: u64::MAX,
             l1_cache_buf,
@@ -1035,6 +1058,112 @@ impl Qcow2State {
                 bytes_read,
             )?;
             state.compression_type = (ct_word >> 24) as u8;
+
+            // If crypt_method=2, scan header extensions to find the LUKS
+            // header extension offset. Extensions start at header_length.
+            if state.crypt_method == 2 {
+                let header_length = read_u32_be_cached(
+                    call_table,
+                    device_idx,
+                    HEADER_LENGTH_OFFSET as u64,
+                    sector_size,
+                    input_capacity,
+                    &mut state.l1_cached_sector,
+                    state.l1_cache_buf,
+                    bytes_read,
+                )? as u64;
+
+                let mut ext_off = header_length;
+                // Scan up to 1MB of extensions (generous upper bound)
+                while ext_off + 8 < 1024 * 1024 {
+                    let ext_type = read_u32_be_cached(
+                        call_table,
+                        device_idx,
+                        ext_off,
+                        sector_size,
+                        input_capacity,
+                        &mut state.l1_cached_sector,
+                        state.l1_cache_buf,
+                        bytes_read,
+                    );
+                    let ext_type = match ext_type {
+                        Some(v) => v,
+                        None => break,
+                    };
+                    let ext_len = read_u32_be_cached(
+                        call_table,
+                        device_idx,
+                        ext_off + 4,
+                        sector_size,
+                        input_capacity,
+                        &mut state.l1_cached_sector,
+                        state.l1_cache_buf,
+                        bytes_read,
+                    );
+                    let ext_len = match ext_len {
+                        Some(v) => v as u64,
+                        None => break,
+                    };
+
+                    if ext_type == EXT_END {
+                        break;
+                    }
+                    if ext_type == EXT_ENCRYPT_HEADER && ext_len >= 16 {
+                        // Extension data is a pointer: offset (u64 BE) + length (u64 BE)
+                        // pointing to the actual LUKS header elsewhere in the file.
+                        let ptr_off = ext_off + 8;
+                        let hi = read_u32_be_cached(
+                            call_table,
+                            device_idx,
+                            ptr_off,
+                            sector_size,
+                            input_capacity,
+                            &mut state.l1_cached_sector,
+                            state.l1_cache_buf,
+                            bytes_read,
+                        );
+                        let lo = read_u32_be_cached(
+                            call_table,
+                            device_idx,
+                            ptr_off + 4,
+                            sector_size,
+                            input_capacity,
+                            &mut state.l1_cached_sector,
+                            state.l1_cache_buf,
+                            bytes_read,
+                        );
+                        if let (Some(h), Some(l)) = (hi, lo) {
+                            state.luks_ext_offset = ((h as u64) << 32) | (l as u64);
+                        }
+                        let hi2 = read_u32_be_cached(
+                            call_table,
+                            device_idx,
+                            ptr_off + 8,
+                            sector_size,
+                            input_capacity,
+                            &mut state.l1_cached_sector,
+                            state.l1_cache_buf,
+                            bytes_read,
+                        );
+                        let lo2 = read_u32_be_cached(
+                            call_table,
+                            device_idx,
+                            ptr_off + 12,
+                            sector_size,
+                            input_capacity,
+                            &mut state.l1_cached_sector,
+                            state.l1_cache_buf,
+                            bytes_read,
+                        );
+                        if let (Some(h), Some(l)) = (hi2, lo2) {
+                            state.luks_ext_len = ((h as u64) << 32) | (l as u64);
+                        }
+                        break;
+                    }
+                    // Move to next (8-byte aligned)
+                    ext_off += 8 + ((ext_len + 7) & !7);
+                }
+            }
         }
 
         // Read L1 table size
@@ -2002,6 +2131,58 @@ pub unsafe fn decrypt_cluster_aes_cbc(
     }
 }
 
+/// Decrypt a buffer of QCOW2 data encrypted with LUKS AES-XTS
+/// (crypt_method=2).
+///
+/// Each sector (default 512 bytes) is encrypted independently with AES-XTS.
+/// The tweak for each sector is its virtual sector number (PLAIN64 IV mode):
+/// sector_num = virtual_byte_offset / luks_sector_size.
+///
+/// # Safety
+///
+/// `buf` must point to at least `len` writable bytes. `len` must be
+/// a multiple of `luks_sector_size`. `virtual_offset` is the guest-visible
+/// byte offset of the start of the data.
+/// `luks_key` must be 32 bytes (AES-128-XTS) or 64 bytes (AES-256-XTS).
+#[cfg(feature = "luks-decrypt")]
+pub unsafe fn decrypt_cluster_aes_xts(
+    buf: *mut u8,
+    len: u64,
+    virtual_offset: u64,
+    luks_key: &[u8],
+    luks_sector_size: u64,
+) {
+    use aes::cipher::generic_array::GenericArray;
+    use aes::cipher::KeyInit;
+    use aes::{Aes128, Aes256};
+
+    let data = core::slice::from_raw_parts_mut(buf, len as usize);
+    let first_sector = virtual_offset / luks_sector_size;
+    let half = luks_key.len() / 2;
+
+    if half == 16 {
+        let c1 = Aes128::new(GenericArray::from_slice(&luks_key[..16]));
+        let c2 = Aes128::new(GenericArray::from_slice(&luks_key[16..32]));
+        let xts = xts_mode::Xts128::new(c1, c2);
+        xts.decrypt_area(
+            data,
+            luks_sector_size as usize,
+            first_sector as u128,
+            xts_mode::get_tweak_default,
+        );
+    } else if half == 32 {
+        let c1 = Aes256::new(GenericArray::from_slice(&luks_key[..32]));
+        let c2 = Aes256::new(GenericArray::from_slice(&luks_key[32..64]));
+        let xts = xts_mode::Xts128::new(c1, c2);
+        xts.decrypt_area(
+            data,
+            luks_sector_size as usize,
+            first_sector as u128,
+            xts_mode::get_tweak_default,
+        );
+    }
+}
+
 /// Read one cluster's worth of virtual data by walking a backing chain.
 ///
 /// For each device in the chain (starting from the top):
@@ -2023,6 +2204,10 @@ pub unsafe fn decrypt_cluster_aes_cbc(
 /// (set to `u64::MAX` to invalidate).
 /// `aes_key` is `Some(&key)` to decrypt AES-128-CBC encrypted clusters
 /// (crypt_method=1), or `None` for unencrypted images.
+/// `luks_key` is `Some(key_bytes)` to decrypt LUKS AES-XTS encrypted
+/// clusters (crypt_method=2). Key length determines cipher:
+/// 32 bytes = AES-128-XTS, 64 bytes = AES-256-XTS.
+/// `luks_sector_size` is the LUKS sector size for XTS (typically 512).
 /// `call_table` must be valid.
 #[allow(unused_variables)]
 pub unsafe fn read_chain_virtual_cluster(
@@ -2039,6 +2224,8 @@ pub unsafe fn read_chain_virtual_cluster(
     staging_buf: *mut u8,
     staging_cluster_offset: &mut u64,
     aes_key: Option<&[u8; 16]>,
+    luks_key: Option<&[u8]>,
+    luks_sector_size: u64,
     bytes_read: &mut u64,
 ) -> bool {
     for dev_offset in 0..chain_len {
@@ -2101,6 +2288,22 @@ pub unsafe fn read_chain_virtual_cluster(
                         if crypt_method == 1 {
                             if let Some(key) = aes_key {
                                 decrypt_cluster_aes_cbc(buf, read_size, virtual_offset, key);
+                            }
+                        }
+                        // Decrypt LUKS AES-XTS encrypted clusters.
+                        // IV is based on the physical byte offset within
+                        // the QCOW2 file (host offset), not the virtual
+                        // guest offset. Each sector's IV = physical_byte_offset / sector_size.
+                        #[cfg(feature = "luks-decrypt")]
+                        if crypt_method == 2 {
+                            if let Some(key) = luks_key {
+                                decrypt_cluster_aes_xts(
+                                    buf,
+                                    read_size,
+                                    read_offset,
+                                    key,
+                                    luks_sector_size,
+                                );
                             }
                         }
                         return true;

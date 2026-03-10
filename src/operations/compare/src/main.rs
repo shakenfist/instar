@@ -290,6 +290,8 @@ pub unsafe extern "C" fn _start() -> u64 {
             staging_buf,
             &mut staging_cluster_offset,
             aes_key.as_ref(),
+            None,
+            512u64,
             &mut bytes_read,
         ) {
             (call_table.send_error)(
@@ -326,6 +328,8 @@ pub unsafe extern "C" fn _start() -> u64 {
             staging_buf,
             &mut staging_cluster_offset,
             aes_key.as_ref(),
+            None,
+            512u64,
             &mut bytes_read,
         ) {
             (call_table.send_error)(
@@ -405,6 +409,8 @@ pub unsafe extern "C" fn _start() -> u64 {
                     staging_buf,
                     &mut staging_cluster_offset,
                     aes_key.as_ref(),
+                    None,
+                    512u64,
                     &mut bytes_read,
                 ) {
                     // I/O error: treat as mismatch
