@@ -2279,50 +2279,118 @@ pub unsafe fn read_chain_virtual_cluster(
                     Some(ClusterLookup::Unallocated) => {
                         continue;
                     }
-                    Some(ClusterLookup::StandardSubclusters(host_offset, _bitmap)) => {
-                        // Extended L2 with subcluster bitmap — handled
-                        // in step 19b. For now, treat as Standard.
+                    Some(ClusterLookup::StandardSubclusters(host_offset, bitmap)) => {
+                        let alloc_bits = bitmap as u32;
+                        let zero_bits = (bitmap >> 32) as u32;
+
                         let intra_offset = virtual_offset % qcow2_cluster_size;
-                        let read_offset = host_offset + intra_offset;
                         let read_size = if chunk_size < qcow2_cluster_size {
                             chunk_size
                         } else {
                             qcow2_cluster_size
                         };
+
+                        // Fast path: all subclusters allocated, none zeroed
+                        if alloc_bits == 0xFFFF_FFFF && zero_bits == 0 {
+                            let read_offset = host_offset + intra_offset;
+                            let read_dev = chain_config.devices[dev_idx].data_device_idx;
+                            let read_dev = if read_dev != 0 {
+                                read_dev
+                            } else {
+                                dev_idx as u32
+                            };
+                            if !read_cluster_sectors(
+                                call_table,
+                                read_dev,
+                                read_offset,
+                                buf,
+                                read_size,
+                                sector_size,
+                                bytes_read,
+                            ) {
+                                return false;
+                            }
+                            #[cfg(feature = "aes-decrypt")]
+                            if crypt_method == 1 {
+                                if let Some(key) = aes_key {
+                                    decrypt_cluster_aes_cbc(buf, read_size, virtual_offset, key);
+                                }
+                            }
+                            #[cfg(feature = "luks-decrypt")]
+                            if crypt_method == 2 {
+                                if let Some(key) = luks_key {
+                                    decrypt_cluster_aes_xts(
+                                        buf,
+                                        read_size,
+                                        host_offset + intra_offset,
+                                        key,
+                                        luks_sector_size,
+                                    );
+                                }
+                            }
+                            return true;
+                        }
+
+                        // Slow path: per-subcluster handling
+                        let sc_size = qcow2_cluster_size / 32;
+                        let sc_start = intra_offset / sc_size;
+                        let sc_count = read_size / sc_size;
                         let read_dev = chain_config.devices[dev_idx].data_device_idx;
                         let read_dev = if read_dev != 0 {
                             read_dev
                         } else {
                             dev_idx as u32
                         };
-                        if !read_cluster_sectors(
-                            call_table,
-                            read_dev,
-                            read_offset,
-                            buf,
-                            read_size,
-                            sector_size,
-                            bytes_read,
-                        ) {
-                            return false;
-                        }
-                        #[cfg(feature = "aes-decrypt")]
-                        if crypt_method == 1 {
-                            if let Some(key) = aes_key {
-                                decrypt_cluster_aes_cbc(buf, read_size, virtual_offset, key);
+
+                        for i in 0..sc_count {
+                            let sc_idx = (sc_start + i) as u32;
+                            let is_zero = (zero_bits >> sc_idx) & 1 != 0;
+                            let is_alloc = (alloc_bits >> sc_idx) & 1 != 0;
+                            let buf_off = (i * sc_size) as usize;
+
+                            if is_zero {
+                                // Zero this subcluster regardless of alloc
+                                core::ptr::write_bytes(buf.add(buf_off), 0, sc_size as usize);
+                            } else if is_alloc && host_offset != 0 {
+                                // Read host data for this subcluster
+                                let sc_host_offset = host_offset + (sc_start + i) * sc_size;
+                                if !read_cluster_sectors(
+                                    call_table,
+                                    read_dev,
+                                    sc_host_offset,
+                                    buf.add(buf_off),
+                                    sc_size,
+                                    sector_size,
+                                    bytes_read,
+                                ) {
+                                    return false;
+                                }
+                                #[cfg(feature = "aes-decrypt")]
+                                if crypt_method == 1 {
+                                    if let Some(key) = aes_key {
+                                        decrypt_cluster_aes_cbc(
+                                            buf.add(buf_off),
+                                            sc_size,
+                                            virtual_offset + i * sc_size,
+                                            key,
+                                        );
+                                    }
+                                }
+                                #[cfg(feature = "luks-decrypt")]
+                                if crypt_method == 2 {
+                                    if let Some(key) = luks_key {
+                                        decrypt_cluster_aes_xts(
+                                            buf.add(buf_off),
+                                            sc_size,
+                                            sc_host_offset,
+                                            key,
+                                            luks_sector_size,
+                                        );
+                                    }
+                                }
                             }
-                        }
-                        #[cfg(feature = "luks-decrypt")]
-                        if crypt_method == 2 {
-                            if let Some(key) = luks_key {
-                                decrypt_cluster_aes_xts(
-                                    buf,
-                                    read_size,
-                                    read_offset,
-                                    key,
-                                    luks_sector_size,
-                                );
-                            }
+                            // else: unallocated — leave buf untouched
+                            // (preserves backing data or zeros)
                         }
                         return true;
                     }
