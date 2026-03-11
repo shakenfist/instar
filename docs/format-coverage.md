@@ -71,6 +71,8 @@ The `imago convert` operation supports writing output in the following formats:
 | vhd (fixed) | Supported | Raw sector reads with footer validation |
 | vhd (dynamic) | Supported | BAT-based block lookup, sector-cached reads |
 | vhdx (dynamic) | Supported | 64-bit BAT with interleaved SB entries, GUID-based metadata, CRC-32C validation |
+| luks (v1/v2, native) | Supported | Decrypts with `--luks-passphrase`; v1 PBKDF2, v2 Argon2id (`--max-guest-memory`); detects inner format (raw, QCOW2) |
+| luks wrapping qcow2 | Supported | Transparent inner QCOW2 detection and decryption via CallTable function pointer wrapping |
 
 ### Limitations
 
@@ -79,7 +81,11 @@ The `imago convert` operation supports writing output in the following formats:
   MAX_CLUSTER_SIZE + MAX_SECTOR_SIZE (2MB + 64KB).
 - QCOW2 legacy AES-128-CBC encryption (crypt_method=1) is supported via
   `--qcow2-password`. LUKS-in-QCOW2 encryption (crypt_method=2) is supported
-  via `--luks-passphrase`.
+  via `--luks-passphrase`. Native LUKS containers (v1 with PBKDF2, v2 with
+  Argon2id) are supported via `--luks-passphrase` (v2 also requires
+  `--max-guest-memory`). LUKS containers wrapping QCOW2 images are
+  transparently detected and the inner QCOW2 is processed as the
+  conversion source.
 - QCOW2 snapshots: snapshot table parsing and extraction via
   `convert --snapshot <ID|name>` are supported (up to 16 snapshots).
 - `imago compare` does not yet support LUKS-in-QCOW2 decryption. Comparing
@@ -232,7 +238,7 @@ The `imago convert` operation supports writing output in the following formats:
 |----------|-------------|--------|--------------|
 | qed-simple | QED format image | safe | Deprecated format test |
 
-#### LUKS Images (7)
+#### LUKS Images (9)
 
 | Image ID | Description | Safety | Key Features |
 |----------|-------------|--------|--------------|
@@ -240,8 +246,10 @@ The `imago convert` operation supports writing output in the following formats:
 | luks-v2 | LUKS v2 header with JSON metadata (synthetic) | safe | JSON metadata parsing |
 | luks-v1-raw-gpt | LUKS v1 wrapping GPT raw image | safe | Inner format detection (raw) |
 | luks-v1-qcow2 | LUKS v1 wrapping QCOW2 image | safe | Inner format detection (qcow2) |
-| luks-v1-aes-xts | LUKS v1 with known encrypted content | safe | Native LUKS conversion test |
+| luks-v1-aes-xts | LUKS v1 with known encrypted content | safe | Native LUKS v1 conversion test |
+| luks-v2-aes-xts | LUKS v2 with low-memory Argon2id | safe | Native LUKS v2 conversion test |
 | luks-v2-raw-gpt | LUKS v2 wrapping GPT raw image | safe | Argon2id decryption test |
+| luks-v1-qcow2-inner | LUKS v1 wrapping QCOW2 inner image | safe | LUKS-wrapping-QCOW2 conversion |
 | qcow2-luks | QCOW2 v3 with LUKS encryption (crypt_method=2) | safe | LUKS-in-QCOW2 conversion test |
 
 #### ISO Images (1)
@@ -367,7 +375,10 @@ qcow2-luks).
     info operation detects inner format; the convert operation decrypts native
     LUKS containers and LUKS-in-QCOW2 images (crypt_method=2) using AES-XTS-
     plain64. Dynamic guest memory allocation supports Argon2id's 1GB+ working
-    memory requirement.
+    memory requirement. Shared LUKS logic is extracted into `src/crates/luks/`
+    with `decrypt` and `kdf-argon2` feature flags. Native LUKS containers
+    wrapping QCOW2 images are transparently handled via CallTable function
+    pointer wrapping (no qcow2 crate changes needed).
 
 17. **QCOW2 External Data File Support** - Full read support for QCOW2 v3
     images with external data files (incompatible feature bit 2). The DATA

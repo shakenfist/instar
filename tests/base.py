@@ -504,6 +504,7 @@ class ImagoTestBase(testtools.TestCase):
         qcow2_password: str = None,
         luks_passphrase: str = None,
         snapshot: str = None,
+        max_guest_memory: str = None,
     ) -> tuple:
         """
         Run imago convert on an image.
@@ -546,6 +547,10 @@ class ImagoTestBase(testtools.TestCase):
             )
         if snapshot is not None:
             cmd.extend(['--snapshot', snapshot])
+        if max_guest_memory is not None:
+            cmd.extend(
+                ['--max-guest-memory', max_guest_memory]
+            )
         cmd.extend([str(input_path), str(output_path)])
 
         try:

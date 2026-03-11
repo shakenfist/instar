@@ -1750,6 +1750,15 @@ pub struct ConvertConfig {
 
     /// Snapshot ID or name (null-padded, max 64 bytes)
     pub snapshot_id: [u8; CONVERT_CONFIG_MAX_SNAPSHOT_ID],
+
+    /// Padding for u64 alignment (offset 356 → 360)
+    pub _pad3: u32,
+
+    /// Extra guest memory available for Argon2id (bytes).
+    /// When non-zero, memory at ARGON2_MEM_BASE is available for
+    /// Argon2id key derivation (LUKS v2). Set via --max-guest-memory.
+    /// Offset: 360
+    pub argon2_mem_size: u64,
 }
 
 impl ConvertConfig {
@@ -1782,6 +1791,8 @@ impl ConvertConfig {
             snapshot_id_len: 0,
             _pad2: 0,
             snapshot_id: [0; CONVERT_CONFIG_MAX_SNAPSHOT_ID],
+            _pad3: 0,
+            argon2_mem_size: 0,
         }
     }
 

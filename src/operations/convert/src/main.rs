@@ -23,19 +23,12 @@ shared::bump_allocator!();
 
 use shared::{
     is_all_zeros_ptr, should_report_progress, validate_call_table, verify_sector_sizes, CallTable,
-    ChainConfig, ConvertConfig, ImageFormat, ALLOC_HEAP_BASE, CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR,
-    COMPRESSED_BUF_SIZE, MAX_CHAIN_DEVICES, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE,
+    ChainConfig, ConvertConfig, ImageFormat, ALLOC_HEAP_BASE, ARGON2_MEM_BASE, CALL_TABLE_ADDR,
+    CHAIN_CONFIG_ADDR, COMPRESSED_BUF_SIZE, MAX_CHAIN_DEVICES, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE,
     OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE, SCRATCH_MEM_SIZE,
 };
 
-// RustCrypto imports for LUKS-in-QCOW2 key derivation (crypt_method=2)
-use aes::cipher::generic_array::GenericArray;
-use aes::cipher::KeyInit;
-use aes::{Aes128, Aes256};
-use hmac::Hmac;
-use pbkdf2::pbkdf2;
-use sha1::Sha1;
-use sha2::{Digest, Sha256};
+// LUKS key derivation is now in the luks crate
 
 // ================================================================
 // Scratch memory layout
@@ -75,6 +68,73 @@ const _: () = assert!(
         <= ALLOC_HEAP_BASE,
     "Scratch memory too small for L1/L2 caches + staging buffer"
 );
+
+// ================================================================
+// LUKS-wrapping-QCOW2: transparent decryption layer
+// ================================================================
+// When a native LUKS container wraps a QCOW2 image, we interpose on
+// the CallTable read functions so that the QCOW2 chain reader
+// transparently reads decrypted data. This avoids modifying the
+// qcow2 crate at all — the function pointer replacement makes the
+// inner QCOW2 look like a normal (unencrypted) device.
+
+/// Static context for the LUKS read wrapper functions.
+/// Only one LUKS-wrapped conversion can be active at a time (single-threaded guest).
+static mut LUKS_WRAP_ORIG_READ: unsafe extern "C" fn(u32, u64, *mut u8, usize) -> bool = {
+    unsafe extern "C" fn dummy(_: u32, _: u64, _: *mut u8, _: usize) -> bool {
+        false
+    }
+    dummy
+};
+static mut LUKS_WRAP_ORIG_CAP: unsafe extern "C" fn(u32) -> u64 = {
+    unsafe extern "C" fn dummy(_: u32) -> u64 {
+        0
+    }
+    dummy
+};
+static mut LUKS_WRAP_KEY: [u8; 64] = [0u8; 64];
+static mut LUKS_WRAP_KEY_LEN: usize = 0;
+static mut LUKS_WRAP_LUKS_SECTOR_SIZE: u64 = 512;
+static mut LUKS_WRAP_PAYLOAD_OFFSET: u64 = 0;
+static mut LUKS_WRAP_INNER_SECTORS: u64 = 0;
+static mut LUKS_WRAP_DEVICE_SECTOR_SIZE: usize = 0;
+
+/// Wrapped read_input_sector: offsets and decrypts reads from device 0.
+unsafe extern "C" fn luks_wrapped_read(
+    device_idx: u32,
+    sector: u64,
+    buf: *mut u8,
+    sector_size: usize,
+) -> bool {
+    if device_idx == 0 {
+        let offset_sectors = LUKS_WRAP_PAYLOAD_OFFSET / LUKS_WRAP_DEVICE_SECTOR_SIZE as u64;
+        if !LUKS_WRAP_ORIG_READ(device_idx, sector + offset_sectors, buf, sector_size) {
+            return false;
+        }
+        // Decrypt in-place. IV is based on the byte offset within the
+        // LUKS payload (= sector * sector_size for the inner device).
+        let virtual_byte_offset = sector * sector_size as u64;
+        qcow2::decrypt_cluster_aes_xts(
+            buf,
+            sector_size as u64,
+            virtual_byte_offset,
+            &LUKS_WRAP_KEY[..LUKS_WRAP_KEY_LEN],
+            LUKS_WRAP_LUKS_SECTOR_SIZE,
+        );
+        true
+    } else {
+        LUKS_WRAP_ORIG_READ(device_idx, sector, buf, sector_size)
+    }
+}
+
+/// Wrapped get_input_capacity: returns inner payload capacity for device 0.
+unsafe extern "C" fn luks_wrapped_capacity(device_idx: u32) -> u64 {
+    if device_idx == 0 {
+        LUKS_WRAP_INNER_SECTORS
+    } else {
+        LUKS_WRAP_ORIG_CAP(device_idx)
+    }
+}
 
 /// Entry point called by core after devices are initialized.
 #[no_mangle]
@@ -447,8 +507,8 @@ pub unsafe extern "C" fn _start() -> u64 {
 /// then reads the payload area sector by sector, decrypts with AES-XTS
 /// (plain64 IV), and writes to the output device.
 ///
-/// Currently only supports LUKS v1 with raw inner format. The output is
-/// always raw regardless of the target_format setting.
+/// Supports LUKS v1 (PBKDF2) and LUKS v2 (Argon2id) with raw inner format.
+/// The output is always raw regardless of the target_format setting.
 unsafe fn convert_native_luks(
     call_table: &CallTable,
     config: &ConvertConfig,
@@ -460,53 +520,148 @@ unsafe fn convert_native_luks(
 
     (call_table.verbose_print)(b"convert: native LUKS container detected\n\0".as_ptr());
 
-    // Derive master key using the existing LUKS key derivation.
-    // For native LUKS, the header starts at offset 0 in the file.
-    let mut luks_master_key = [0u8; 64];
-    let result = derive_luks_master_key(
-        call_table,
-        0, // device index
-        0, // LUKS header at offset 0
-        LUKS_V1_HEADER_SIZE as u64,
-        config.passphrase_bytes(),
-        sector_size,
-        &mut luks_master_key,
-        &mut bytes_read,
-    );
-
-    let (key_len, luks_sector_size) = match result {
-        Some(v) => v,
-        None => {
-            (call_table.debug_print)(b"convert: LUKS key derivation failed\n\0".as_ptr());
-            (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
-            return bytes_read;
-        }
-    };
-
-    (call_table.verbose_print)(b"convert: LUKS master key derived\n\0".as_ptr());
-
-    let luks_key = &luks_master_key[..key_len];
-
-    // Read payload offset from LUKS header (already in the cache from key derivation).
-    // Re-read first sector to get payload offset.
-    let input_capacity = (call_table.get_input_capacity)(0);
+    // Read first sector to detect LUKS version
     let mut hdr_buf = [0u8; MAX_SECTOR_SIZE];
     if !(call_table.read_input_sector)(0, 0, hdr_buf.as_mut_ptr(), sector_size) {
-        (call_table.debug_print)(b"convert: failed to re-read LUKS header\n\0".as_ptr());
+        (call_table.debug_print)(b"convert: failed to read LUKS header\n\0".as_ptr());
         (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
         return bytes_read;
     }
     bytes_read += sector_size as u64;
 
-    let payload_offset_sectors = u32::from_be_bytes([
-        hdr_buf[LUKS_PAYLOAD_OFFSET_OFFSET],
-        hdr_buf[LUKS_PAYLOAD_OFFSET_OFFSET + 1],
-        hdr_buf[LUKS_PAYLOAD_OFFSET_OFFSET + 2],
-        hdr_buf[LUKS_PAYLOAD_OFFSET_OFFSET + 3],
-    ]) as u64;
+    let luks_version = match luks::get_version(&hdr_buf) {
+        Some(v) => v,
+        None => {
+            (call_table.debug_print)(b"convert: invalid LUKS magic\n\0".as_ptr());
+            (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
+            return bytes_read;
+        }
+    };
 
-    // Payload byte offset (LUKS v1 uses 512-byte sectors for payload offset)
-    let payload_byte_offset = payload_offset_sectors * 512;
+    let mut luks_master_key = [0u8; 64];
+    let (key_len, luks_sector_size, payload_byte_offset);
+
+    if luks_version == 1 {
+        // LUKS v1: derive master key via PBKDF2
+        let result = derive_luks_master_key(
+            call_table,
+            0, // device index
+            0, // LUKS header at offset 0
+            luks::LUKS_V1_HEADER_SIZE as u64,
+            config.passphrase_bytes(),
+            sector_size,
+            &mut luks_master_key,
+            &mut bytes_read,
+        );
+
+        let (kl, ls) = match result {
+            Some(v) => v,
+            None => {
+                (call_table.debug_print)(b"convert: LUKS v1 key derivation failed\n\0".as_ptr());
+                (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
+                return bytes_read;
+            }
+        };
+        key_len = kl;
+        luks_sector_size = ls;
+
+        // Read payload offset from LUKS v1 header (512-byte sectors)
+        let payload_offset_sectors = u32::from_be_bytes([
+            hdr_buf[luks::LUKS_PAYLOAD_OFFSET_OFFSET],
+            hdr_buf[luks::LUKS_PAYLOAD_OFFSET_OFFSET + 1],
+            hdr_buf[luks::LUKS_PAYLOAD_OFFSET_OFFSET + 2],
+            hdr_buf[luks::LUKS_PAYLOAD_OFFSET_OFFSET + 3],
+        ]) as u64;
+        payload_byte_offset = payload_offset_sectors * 512;
+    } else if luks_version == 2 {
+        // LUKS v2: derive master key via Argon2id
+        let result = derive_luks_v2_master_key(
+            call_table,
+            config,
+            sector_size,
+            &mut luks_master_key,
+            &mut bytes_read,
+        );
+
+        let (kl, ls, pbo) = match result {
+            Some(v) => v,
+            None => {
+                (call_table.debug_print)(b"convert: LUKS v2 key derivation failed\n\0".as_ptr());
+                (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
+                return bytes_read;
+            }
+        };
+        key_len = kl;
+        luks_sector_size = ls;
+        payload_byte_offset = pbo;
+    } else {
+        (call_table.debug_print)(b"convert: unsupported LUKS version\n\0".as_ptr());
+        (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
+        return bytes_read;
+    }
+
+    (call_table.verbose_print)(b"convert: LUKS master key derived\n\0".as_ptr());
+
+    let luks_key = &luks_master_key[..key_len];
+    let input_capacity = (call_table.get_input_capacity)(0);
+
+    // Compute the inner payload size. Use the chain virtual_size
+    // (from info) as the primary size, but cap at the device capacity
+    // minus the payload offset to avoid reading past the device.
+    let input_bytes = input_capacity * sector_size as u64;
+    let capacity_based_size = if input_bytes > payload_byte_offset {
+        input_bytes - payload_byte_offset
+    } else {
+        0
+    };
+    let inner_size = if capacity_based_size > 0 && virtual_size > capacity_based_size {
+        capacity_based_size
+    } else {
+        virtual_size
+    };
+
+    // Detect inner format by decrypting first sector of payload
+    {
+        let buf = BUF_DATA as *mut u8;
+        let payload_sector = payload_byte_offset / sector_size as u64;
+        if payload_sector < input_capacity
+            && (call_table.read_input_sector)(0, payload_sector, buf, sector_size)
+        {
+            let offset_in_sector = (payload_byte_offset % sector_size as u64) as usize;
+            // Decrypt the sector to inspect the inner header
+            qcow2::decrypt_cluster_aes_xts(
+                buf,
+                sector_size as u64,
+                0, // IV starts at 0 (first payload sector)
+                luks_key,
+                luks_sector_size,
+            );
+            bytes_read += sector_size as u64;
+
+            // Check for QCOW2 magic at the start of the decrypted payload
+            if offset_in_sector + 4 <= sector_size {
+                let p = buf.add(offset_in_sector);
+                let magic = u32::from_be_bytes([*p, *p.add(1), *p.add(2), *p.add(3)]);
+                if magic == qcow2::QCOW2_MAGIC {
+                    (call_table.verbose_print)(
+                        b"convert: inner format is QCOW2, switching to chain reader\n\0".as_ptr(),
+                    );
+                    return convert_luks_wrapped_qcow2(
+                        call_table,
+                        config,
+                        sector_size,
+                        &luks_master_key,
+                        key_len,
+                        luks_sector_size,
+                        payload_byte_offset,
+                        inner_size,
+                        skip_zeros,
+                        &mut bytes_read,
+                    );
+                }
+            }
+        }
+    }
 
     (call_table.verbose_print)(b"convert: starting LUKS decryption\n\0".as_ptr());
 
@@ -520,10 +675,10 @@ unsafe fn convert_native_luks(
     let mut payload_offset: u64 = 0;
     let mut last_percent: u32 = 0;
     let mut chunks_done: u64 = 0;
-    let total_chunks = (virtual_size + chunk_size - 1) / chunk_size;
+    let total_chunks = (inner_size + chunk_size - 1) / chunk_size;
 
-    while payload_offset < virtual_size {
-        let remaining = virtual_size - payload_offset;
+    while payload_offset < inner_size {
+        let remaining = inner_size - payload_offset;
         let this_chunk = if remaining < chunk_size {
             remaining
         } else {
@@ -622,93 +777,242 @@ unsafe fn convert_native_luks(
 }
 
 // ================================================================
-// LUKS-in-QCOW2 key derivation (crypt_method=2)
+// LUKS-wrapping-QCOW2 conversion
 // ================================================================
 
-// LUKS v1 header constants
-const LUKS_V1_HEADER_SIZE: usize = 592;
-const LUKS_VERSION_OFFSET: usize = 6;
-const LUKS_CIPHER_NAME_OFFSET: usize = 8;
-const LUKS_CIPHER_MODE_OFFSET: usize = 40;
-const LUKS_HASH_SPEC_OFFSET: usize = 72;
-const LUKS_PAYLOAD_OFFSET_OFFSET: usize = 104;
-const LUKS_KEY_BYTES_OFFSET: usize = 108;
-const LUKS_MK_DIGEST_OFFSET: usize = 112;
-const LUKS_MK_DIGEST_SALT_OFFSET: usize = 132;
-const LUKS_MK_DIGEST_ITER_OFFSET: usize = 164;
-const LUKS_KEY_SLOT_BASE: usize = 208;
-const LUKS_KEY_SLOT_SIZE: usize = 48;
-const LUKS_KEY_SLOT_ACTIVE: u32 = 0x00AC71F3;
-const LUKS_SLOT_ITERATIONS_OFFSET: usize = 4;
-const LUKS_SLOT_SALT_OFFSET: usize = 8;
-const LUKS_SLOT_KEY_MATERIAL_OFFSET: usize = 40;
-const LUKS_SLOT_STRIPES_OFFSET: usize = 44;
+/// Convert a LUKS container whose inner payload is a QCOW2 image.
+///
+/// Sets up transparent decryption via function pointer wrapping in
+/// the CallTable, then delegates to the normal QCOW2 chain reader
+/// and output conversion path.
+#[allow(clippy::too_many_arguments)]
+unsafe fn convert_luks_wrapped_qcow2(
+    call_table: &CallTable,
+    config: &ConvertConfig,
+    sector_size: usize,
+    luks_key: &[u8; 64],
+    key_len: usize,
+    luks_sector_size: u64,
+    payload_byte_offset: u64,
+    inner_payload_size: u64,
+    skip_zeros: bool,
+    bytes_read: &mut u64,
+) -> u64 {
+    // Set up the static LUKS wrapper context
+    LUKS_WRAP_ORIG_READ = call_table.read_input_sector;
+    LUKS_WRAP_ORIG_CAP = call_table.get_input_capacity;
+    LUKS_WRAP_KEY[..key_len].copy_from_slice(&luks_key[..key_len]);
+    LUKS_WRAP_KEY_LEN = key_len;
+    LUKS_WRAP_LUKS_SECTOR_SIZE = luks_sector_size;
+    LUKS_WRAP_PAYLOAD_OFFSET = payload_byte_offset;
+    LUKS_WRAP_INNER_SECTORS = inner_payload_size / sector_size as u64;
+    LUKS_WRAP_DEVICE_SECTOR_SIZE = sector_size;
 
-/// AFsplitter diffuse function using SHA-1 (for LUKS v1).
-fn af_diffuse_sha1(data: &mut [u8], key_bytes: usize) {
-    let digest_size = 20;
-    let full_blocks = key_bytes / digest_size;
-    let remainder = key_bytes % digest_size;
+    // Create a wrapped call table with decryption-aware read functions
+    let mut wrapped_ct: CallTable = core::ptr::read(call_table);
+    wrapped_ct.read_input_sector = luks_wrapped_read;
+    wrapped_ct.get_input_capacity = luks_wrapped_capacity;
 
-    for i in 0..full_blocks {
-        let offset = i * digest_size;
-        let block_num = (i as u32).to_be_bytes();
-        let mut hasher = Sha1::new();
-        hasher.update(&block_num);
-        hasher.update(&data[offset..offset + digest_size]);
-        let result = hasher.finalize();
-        data[offset..offset + digest_size].copy_from_slice(&result);
+    // Read the inner QCOW2 header via the wrapped (decrypted) read path
+    let mut hdr_buf = [0u8; MAX_SECTOR_SIZE];
+    if !(wrapped_ct.read_input_sector)(0, 0, hdr_buf.as_mut_ptr(), sector_size) {
+        (call_table.debug_print)(b"convert: failed to read inner QCOW2 header\n\0".as_ptr());
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
     }
-    if remainder > 0 {
-        let offset = full_blocks * digest_size;
-        let block_num = (full_blocks as u32).to_be_bytes();
-        let mut hasher = Sha1::new();
-        hasher.update(&block_num);
-        hasher.update(&data[offset..offset + remainder]);
-        let result = hasher.finalize();
-        data[offset..offset + remainder].copy_from_slice(&result[..remainder]);
+    *bytes_read += sector_size as u64;
+
+    // Parse virtual_size and cluster_bits from QCOW2 header
+    let inner_virtual_size = u64::from_be_bytes([
+        hdr_buf[24],
+        hdr_buf[25],
+        hdr_buf[26],
+        hdr_buf[27],
+        hdr_buf[28],
+        hdr_buf[29],
+        hdr_buf[30],
+        hdr_buf[31],
+    ]);
+    let cluster_bits = u32::from_be_bytes([hdr_buf[20], hdr_buf[21], hdr_buf[22], hdr_buf[23]]);
+
+    if inner_virtual_size == 0 || cluster_bits < 9 || cluster_bits > 21 {
+        (call_table.debug_print)(b"convert: invalid inner QCOW2 header\n\0".as_ptr());
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
     }
+
+    // Build a chain config for the inner QCOW2
+    let chain_config = &*(CHAIN_CONFIG_ADDR as *mut ChainConfig);
+    let orig_format = chain_config.devices[0].format;
+    let orig_virtual_size = chain_config.devices[0].virtual_size;
+    let orig_cluster_size = chain_config.devices[0].cluster_size;
+
+    // Temporarily modify device 0 to look like QCOW2
+    let chain_config_mut = &mut *(CHAIN_CONFIG_ADDR as *mut ChainConfig);
+    chain_config_mut.devices[0].format = ImageFormat::Qcow2 as u32;
+    chain_config_mut.devices[0].virtual_size = inner_virtual_size;
+    chain_config_mut.devices[0].cluster_size = 1u32 << cluster_bits;
+
+    // Initialize QCOW2 chain states using the wrapped call table
+    let mut chain_states = qcow2::ChainStates::default();
+    if !qcow2::init_chain_states(
+        &wrapped_ct,
+        chain_config_mut,
+        &mut chain_states,
+        1,
+        sector_size,
+        DYNAMIC_BUFS_START,
+        bytes_read,
+    ) {
+        (call_table.debug_print)(b"convert: failed to init inner QCOW2 chain states\n\0".as_ptr());
+        // Restore original chain config
+        chain_config_mut.devices[0].format = orig_format;
+        chain_config_mut.devices[0].virtual_size = orig_virtual_size;
+        chain_config_mut.devices[0].cluster_size = orig_cluster_size;
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
+    }
+
+    // Reject unsupported incompatible features
+    for state in chain_states.qcow2_states.iter().flatten() {
+        let unsupported = state.unsupported_incompat_features(qcow2::SUPPORTED_INCOMPAT_FEATURES);
+        if unsupported != 0 {
+            (call_table.debug_print)(b"convert: inner QCOW2 has unsupported features\n\0".as_ptr());
+            chain_config_mut.devices[0].format = orig_format;
+            chain_config_mut.devices[0].virtual_size = orig_virtual_size;
+            chain_config_mut.devices[0].cluster_size = orig_cluster_size;
+            (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+            return *bytes_read;
+        }
+    }
+
+    (call_table.verbose_print)(b"convert: converting inner QCOW2 via chain reader\n\0".as_ptr());
+
+    // Dispatch based on target format (same logic as main path)
+    let target = config.target_format();
+    let result = match target {
+        ImageFormat::Qcow2 => {
+            if config.should_compress() {
+                convert_to_qcow2_compressed(
+                    &wrapped_ct,
+                    config,
+                    chain_config_mut,
+                    &mut chain_states,
+                    1,
+                    inner_virtual_size,
+                    sector_size,
+                    skip_zeros,
+                    None,
+                    None,
+                    512,
+                    bytes_read,
+                )
+            } else {
+                convert_to_qcow2(
+                    &wrapped_ct,
+                    config,
+                    chain_config_mut,
+                    &mut chain_states,
+                    1,
+                    inner_virtual_size,
+                    sector_size,
+                    skip_zeros,
+                    None,
+                    None,
+                    512,
+                    bytes_read,
+                )
+            }
+        }
+        ImageFormat::Vmdk4 => {
+            if config.should_compress() {
+                convert_to_vmdk_compressed(
+                    &wrapped_ct,
+                    chain_config_mut,
+                    &mut chain_states,
+                    1,
+                    inner_virtual_size,
+                    sector_size,
+                    skip_zeros,
+                    None,
+                    None,
+                    512,
+                    bytes_read,
+                )
+            } else {
+                convert_to_vmdk(
+                    &wrapped_ct,
+                    chain_config_mut,
+                    &mut chain_states,
+                    1,
+                    inner_virtual_size,
+                    sector_size,
+                    skip_zeros,
+                    None,
+                    None,
+                    512,
+                    bytes_read,
+                )
+            }
+        }
+        ImageFormat::Vhd => convert_to_vhd(
+            &wrapped_ct,
+            chain_config_mut,
+            &mut chain_states,
+            1,
+            inner_virtual_size,
+            sector_size,
+            skip_zeros,
+            None,
+            None,
+            512,
+            bytes_read,
+        ),
+        ImageFormat::Vhdx => convert_to_vhdx(
+            &wrapped_ct,
+            chain_config_mut,
+            &mut chain_states,
+            1,
+            inner_virtual_size,
+            sector_size,
+            skip_zeros,
+            None,
+            None,
+            512,
+            bytes_read,
+        ),
+        _ => convert_to_raw(
+            &wrapped_ct,
+            chain_config_mut,
+            &mut chain_states,
+            1,
+            inner_virtual_size,
+            sector_size,
+            skip_zeros,
+            None,
+            None,
+            512,
+            bytes_read,
+        ),
+    };
+
+    // Restore original chain config
+    chain_config_mut.devices[0].format = orig_format;
+    chain_config_mut.devices[0].virtual_size = orig_virtual_size;
+    chain_config_mut.devices[0].cluster_size = orig_cluster_size;
+
+    result
 }
 
-/// AFsplitter diffuse function using SHA-256 (for LUKS v1 with sha256 hash).
-fn af_diffuse_sha256(data: &mut [u8], key_bytes: usize) {
-    let digest_size = 32;
-    let full_blocks = key_bytes / digest_size;
-    let remainder = key_bytes % digest_size;
-
-    for i in 0..full_blocks {
-        let offset = i * digest_size;
-        let block_num = (i as u32).to_be_bytes();
-        let mut hasher = Sha256::new();
-        hasher.update(&block_num);
-        hasher.update(&data[offset..offset + digest_size]);
-        let result = hasher.finalize();
-        data[offset..offset + digest_size].copy_from_slice(&result);
-    }
-    if remainder > 0 {
-        let offset = full_blocks * digest_size;
-        let block_num = (full_blocks as u32).to_be_bytes();
-        let mut hasher = Sha256::new();
-        hasher.update(&block_num);
-        hasher.update(&data[offset..offset + remainder]);
-        let result = hasher.finalize();
-        data[offset..offset + remainder].copy_from_slice(&result[..remainder]);
-    }
-}
-
-/// Compare a header field against a string.
-fn header_field_eq(header: &[u8], offset: usize, max_len: usize, expected: &[u8]) -> bool {
-    let end = (offset + max_len).min(header.len());
-    let field = &header[offset..end];
-    let nul_pos = field.iter().position(|&b| b == 0).unwrap_or(field.len());
-    &field[..nul_pos] == expected
-}
+// ================================================================
+// LUKS-in-QCOW2 key derivation (crypt_method=2)
+// ================================================================
 
 /// Derive LUKS v1 master key from an embedded LUKS header in QCOW2.
 ///
 /// Reads the LUKS binary header and key material from the QCOW2 LUKS
-/// extension area, performs PBKDF2 key derivation, AES-XTS decryption
-/// of key material, AFsplitter merge, and master key verification.
+/// extension area, then delegates to the luks crate for PBKDF2 key
+/// derivation, AES-XTS decryption, AFsplitter merge, and verification.
 ///
 /// Returns (key_len, luks_sector_size) on success. The derived key is
 /// written to `out_key` (up to 64 bytes).
@@ -716,23 +1020,21 @@ unsafe fn derive_luks_master_key(
     call_table: &CallTable,
     device_idx: u32,
     luks_ext_offset: u64,
-    luks_ext_len: u64,
+    _luks_ext_len: u64,
     passphrase: &[u8],
     sector_size: usize,
     out_key: &mut [u8; 64],
     bytes_read: &mut u64,
 ) -> Option<(usize, u64)> {
     // Read the LUKS binary header from the extension area
-    let input_capacity = (call_table.get_input_capacity)(device_idx);
-    let mut hdr_buf = [0u8; LUKS_V1_HEADER_SIZE];
+    let mut hdr_buf = [0u8; luks::LUKS_V1_HEADER_SIZE];
 
-    // Read header data sector by sector
     let hdr_start_sector = luks_ext_offset / sector_size as u64;
     let hdr_offset_in_sector = (luks_ext_offset % sector_size as u64) as usize;
     let mut sector_buf = [0u8; MAX_SECTOR_SIZE];
     let mut hdr_pos = 0usize;
 
-    while hdr_pos < LUKS_V1_HEADER_SIZE {
+    while hdr_pos < luks::LUKS_V1_HEADER_SIZE {
         let cur_sector =
             hdr_start_sector + (hdr_offset_in_sector + hdr_pos) as u64 / sector_size as u64;
         let off_in_sec = (hdr_offset_in_sector + hdr_pos) % sector_size;
@@ -747,137 +1049,60 @@ unsafe fn derive_luks_master_key(
         }
         *bytes_read += sector_size as u64;
         let avail = sector_size - off_in_sec;
-        let needed = LUKS_V1_HEADER_SIZE - hdr_pos;
+        let needed = luks::LUKS_V1_HEADER_SIZE - hdr_pos;
         let to_copy = avail.min(needed);
         hdr_buf[hdr_pos..hdr_pos + to_copy]
             .copy_from_slice(&sector_buf[off_in_sec..off_in_sec + to_copy]);
         hdr_pos += to_copy;
     }
 
-    // Verify LUKS magic and version
-    if &hdr_buf[0..6] != b"LUKS\xba\xbe" {
-        (call_table.debug_print)(b"luks-qcow2: bad LUKS magic\n\0".as_ptr());
-        return None;
-    }
-    let version = u16::from_be_bytes([
-        hdr_buf[LUKS_VERSION_OFFSET],
-        hdr_buf[LUKS_VERSION_OFFSET + 1],
-    ]);
-    if version != 1 {
-        (call_table.debug_print)(b"luks-qcow2: only LUKS v1 supported in QCOW2\n\0".as_ptr());
+    // Parse header using luks crate
+    let parsed = match luks::parse_v1_header(&hdr_buf) {
+        Some(h) => h,
+        None => {
+            (call_table.debug_print)(b"luks-qcow2: bad LUKS header\n\0".as_ptr());
+            return None;
+        }
+    };
+
+    if !luks::v1_is_aes_xts(&parsed) {
+        (call_table.debug_print)(b"luks-qcow2: unsupported cipher/mode\n\0".as_ptr());
         return None;
     }
 
-    // Verify cipher and mode
-    if !header_field_eq(&hdr_buf, LUKS_CIPHER_NAME_OFFSET, 32, b"aes") {
-        (call_table.debug_print)(b"luks-qcow2: unsupported cipher\n\0".as_ptr());
-        return None;
-    }
-    if !header_field_eq(&hdr_buf, LUKS_CIPHER_MODE_OFFSET, 32, b"xts-plain64") {
-        (call_table.debug_print)(b"luks-qcow2: unsupported mode\n\0".as_ptr());
-        return None;
-    }
-
-    let use_sha256 = header_field_eq(&hdr_buf, LUKS_HASH_SPEC_OFFSET, 32, b"sha256");
-    let use_sha1 = header_field_eq(&hdr_buf, LUKS_HASH_SPEC_OFFSET, 32, b"sha1");
-    if !use_sha256 && !use_sha1 {
-        (call_table.debug_print)(b"luks-qcow2: unsupported hash\n\0".as_ptr());
-        return None;
-    }
-
-    let key_bytes = u32::from_be_bytes([
-        hdr_buf[LUKS_KEY_BYTES_OFFSET],
-        hdr_buf[LUKS_KEY_BYTES_OFFSET + 1],
-        hdr_buf[LUKS_KEY_BYTES_OFFSET + 2],
-        hdr_buf[LUKS_KEY_BYTES_OFFSET + 3],
-    ]) as usize;
+    let key_bytes = parsed.key_bytes as usize;
     if key_bytes != 32 && key_bytes != 64 {
         (call_table.debug_print)(b"luks-qcow2: unsupported key size\n\0".as_ptr());
         return None;
     }
 
-    // Master key digest for verification
-    let mut mk_digest = [0u8; 20];
-    mk_digest.copy_from_slice(&hdr_buf[LUKS_MK_DIGEST_OFFSET..LUKS_MK_DIGEST_OFFSET + 20]);
-    let mut mk_digest_salt = [0u8; 32];
-    mk_digest_salt
-        .copy_from_slice(&hdr_buf[LUKS_MK_DIGEST_SALT_OFFSET..LUKS_MK_DIGEST_SALT_OFFSET + 32]);
-    let mk_digest_iterations = u32::from_be_bytes([
-        hdr_buf[LUKS_MK_DIGEST_ITER_OFFSET],
-        hdr_buf[LUKS_MK_DIGEST_ITER_OFFSET + 1],
-        hdr_buf[LUKS_MK_DIGEST_ITER_OFFSET + 2],
-        hdr_buf[LUKS_MK_DIGEST_ITER_OFFSET + 3],
-    ]);
-
-    // Find first active key slot
-    let mut slot_iterations = 0u32;
-    let mut slot_salt = [0u8; 32];
-    let mut slot_km_offset = 0u32;
-    let mut slot_stripes = 0u32;
-    let mut found_slot = false;
-
-    for i in 0..8 {
-        let base = LUKS_KEY_SLOT_BASE + i * LUKS_KEY_SLOT_SIZE;
-        let state = u32::from_be_bytes([
-            hdr_buf[base],
-            hdr_buf[base + 1],
-            hdr_buf[base + 2],
-            hdr_buf[base + 3],
-        ]);
-        if state == LUKS_KEY_SLOT_ACTIVE {
-            slot_iterations = u32::from_be_bytes([
-                hdr_buf[base + LUKS_SLOT_ITERATIONS_OFFSET],
-                hdr_buf[base + LUKS_SLOT_ITERATIONS_OFFSET + 1],
-                hdr_buf[base + LUKS_SLOT_ITERATIONS_OFFSET + 2],
-                hdr_buf[base + LUKS_SLOT_ITERATIONS_OFFSET + 3],
-            ]);
-            slot_salt.copy_from_slice(
-                &hdr_buf[base + LUKS_SLOT_SALT_OFFSET..base + LUKS_SLOT_SALT_OFFSET + 32],
-            );
-            slot_km_offset = u32::from_be_bytes([
-                hdr_buf[base + LUKS_SLOT_KEY_MATERIAL_OFFSET],
-                hdr_buf[base + LUKS_SLOT_KEY_MATERIAL_OFFSET + 1],
-                hdr_buf[base + LUKS_SLOT_KEY_MATERIAL_OFFSET + 2],
-                hdr_buf[base + LUKS_SLOT_KEY_MATERIAL_OFFSET + 3],
-            ]);
-            slot_stripes = u32::from_be_bytes([
-                hdr_buf[base + LUKS_SLOT_STRIPES_OFFSET],
-                hdr_buf[base + LUKS_SLOT_STRIPES_OFFSET + 1],
-                hdr_buf[base + LUKS_SLOT_STRIPES_OFFSET + 2],
-                hdr_buf[base + LUKS_SLOT_STRIPES_OFFSET + 3],
-            ]);
-            found_slot = true;
-            break;
+    let slot_idx = match luks::find_active_v1_slot(&parsed) {
+        Some(i) => i,
+        None => {
+            (call_table.debug_print)(b"luks-qcow2: no active key slot\n\0".as_ptr());
+            return None;
         }
-    }
-    if !found_slot {
-        (call_table.debug_print)(b"luks-qcow2: no active key slot\n\0".as_ptr());
-        return None;
-    }
-
-    (call_table.verbose_print)(b"luks-qcow2: starting PBKDF2 key derivation\n\0".as_ptr());
-
-    // Step 1: PBKDF2 to derive split key
-    let mut derived_key = [0u8; 64];
-    let dk = &mut derived_key[..key_bytes];
-    if use_sha256 {
-        pbkdf2::<Hmac<Sha256>>(passphrase, &slot_salt, slot_iterations, dk).unwrap_or_else(|_| {});
-    } else {
-        pbkdf2::<Hmac<Sha1>>(passphrase, &slot_salt, slot_iterations, dk).unwrap_or_else(|_| {});
-    }
+    };
 
     (call_table.verbose_print)(b"luks-qcow2: reading key material\n\0".as_ptr());
 
-    // Step 2: Read encrypted key material from LUKS extension
-    // Key material offset is in 512-byte sectors within the LUKS header
-    let km_total_bytes = key_bytes.checked_mul(slot_stripes as usize).unwrap_or(0);
+    // Read encrypted key material from LUKS extension
+    let (km_byte_offset_rel, km_total_bytes) =
+        match luks::v1_key_material_region(&parsed.slots[slot_idx], parsed.key_bytes) {
+            Some(v) => v,
+            None => {
+                (call_table.debug_print)(b"luks-qcow2: key material too large\n\0".as_ptr());
+                return None;
+            }
+        };
+
     if km_total_bytes == 0 || km_total_bytes > SCRATCH_MEM_SIZE {
         (call_table.debug_print)(b"luks-qcow2: key material too large\n\0".as_ptr());
         return None;
     }
 
     let km_buf = core::slice::from_raw_parts_mut(SCRATCH_MEM_BASE as *mut u8, km_total_bytes);
-    let km_byte_offset = luks_ext_offset + (slot_km_offset as u64 * 512);
+    let km_byte_offset = luks_ext_offset + km_byte_offset_rel;
     let km_start_sector = km_byte_offset / sector_size as u64;
     let km_end_byte = km_byte_offset + km_total_bytes as u64;
     let km_end_sector = (km_end_byte + sector_size as u64 - 1) / sector_size as u64;
@@ -911,64 +1136,235 @@ unsafe fn derive_luks_master_key(
         }
     }
 
-    (call_table.verbose_print)(b"luks-qcow2: decrypting key material\n\0".as_ptr());
+    (call_table.verbose_print)(b"luks-qcow2: deriving master key\n\0".as_ptr());
 
-    // Step 3: AES-XTS decrypt key material
-    let half = key_bytes / 2;
-    if half == 16 {
-        let c1 = Aes128::new(GenericArray::from_slice(&dk[..16]));
-        let c2 = Aes128::new(GenericArray::from_slice(&dk[16..32]));
-        let xts = xts_mode::Xts128::new(c1, c2);
-        xts.decrypt_area(km_buf, 512, 0, xts_mode::get_tweak_default);
-    } else if half == 32 {
-        let c1 = Aes256::new(GenericArray::from_slice(&dk[..32]));
-        let c2 = Aes256::new(GenericArray::from_slice(&dk[32..64]));
-        let xts = xts_mode::Xts128::new(c1, c2);
-        xts.decrypt_area(km_buf, 512, 0, xts_mode::get_tweak_default);
-    }
-
-    (call_table.verbose_print)(b"luks-qcow2: AFsplitter merge\n\0".as_ptr());
-
-    // Step 4: AFsplitter merge
-    let stripes = slot_stripes as usize;
-    let mut candidate = [0u8; 64];
-    let mk = &mut candidate[..key_bytes];
-    mk.copy_from_slice(&km_buf[..key_bytes]);
-
-    for i in 1..stripes {
-        if use_sha256 {
-            af_diffuse_sha256(mk, key_bytes);
-        } else {
-            af_diffuse_sha1(mk, key_bytes);
+    // Derive master key using the luks crate (PBKDF2 + AES-XTS + AFsplit + verify)
+    let derived = match luks::derive_v1_master_key(&parsed, passphrase, km_buf) {
+        Some(d) => d,
+        None => {
+            (call_table.debug_print)(b"luks-qcow2: master key verification failed\n\0".as_ptr());
+            return None;
         }
-        let stripe_offset = i * key_bytes;
-        for j in 0..key_bytes {
-            mk[j] ^= km_buf[stripe_offset + j];
-        }
-    }
-
-    (call_table.verbose_print)(b"luks-qcow2: verifying master key\n\0".as_ptr());
-
-    // Step 5: Verify master key via PBKDF2 digest
-    let mut verify = [0u8; 20];
-    if use_sha256 {
-        pbkdf2::<Hmac<Sha256>>(mk, &mk_digest_salt, mk_digest_iterations, &mut verify)
-            .unwrap_or_else(|_| {});
-    } else {
-        pbkdf2::<Hmac<Sha1>>(mk, &mk_digest_salt, mk_digest_iterations, &mut verify)
-            .unwrap_or_else(|_| {});
-    }
-
-    if verify != mk_digest {
-        (call_table.debug_print)(b"luks-qcow2: master key verification failed\n\0".as_ptr());
-        return None;
-    }
+    };
 
     (call_table.verbose_print)(b"luks-qcow2: master key verified\n\0".as_ptr());
 
-    out_key[..key_bytes].copy_from_slice(mk);
-    // LUKS v1 always uses 512-byte sectors
-    Some((key_bytes, 512))
+    out_key[..derived.key_len].copy_from_slice(&derived.key[..derived.key_len]);
+    Some((derived.key_len, derived.luks_sector_size))
+}
+
+// ================================================================
+// Native LUKS v2 key derivation (Argon2id)
+// ================================================================
+
+/// Derive LUKS v2 master key from a native LUKS v2 container.
+///
+/// Reads the JSON metadata area, parses keyslot and digest parameters,
+/// then uses Argon2id key derivation via the luks crate.
+///
+/// Returns (key_len, luks_sector_size, payload_byte_offset) on success.
+/// The derived key is written to `out_key` (up to 64 bytes).
+unsafe fn derive_luks_v2_master_key(
+    call_table: &CallTable,
+    config: &ConvertConfig,
+    sector_size: usize,
+    out_key: &mut [u8; 64],
+    bytes_read: &mut u64,
+) -> Option<(usize, u64, u64)> {
+    if config.argon2_mem_size == 0 {
+        (call_table.debug_print)(
+            b"convert: LUKS v2 requires --max-guest-memory for Argon2id\n\0".as_ptr(),
+        );
+        return None;
+    }
+
+    // Read JSON metadata area (starts at 4KB, scan up to 16KB)
+    let json_buf =
+        core::slice::from_raw_parts_mut(SCRATCH_MEM_BASE as *mut u8, luks::LUKS2_JSON_SCAN_SIZE);
+    let json_start_sector = luks::LUKS2_BINARY_HEADER_SIZE / sector_size;
+    let sectors_to_read = luks::LUKS2_JSON_SCAN_SIZE / sector_size;
+    let mut json_bytes_read = 0usize;
+
+    // For large sector sizes (>= 4KB), the JSON may be in the first sector
+    if sector_size >= luks::LUKS2_BINARY_HEADER_SIZE {
+        // Re-read sector 0 which contains both binary header and start of JSON
+        let mut sector_buf = [0u8; MAX_SECTOR_SIZE];
+        if !(call_table.read_input_sector)(0, 0, sector_buf.as_mut_ptr(), sector_size) {
+            (call_table.debug_print)(b"convert: failed to read LUKS v2 header\n\0".as_ptr());
+            return None;
+        }
+        *bytes_read += sector_size as u64;
+        let json_offset = luks::LUKS2_BINARY_HEADER_SIZE;
+        let avail = sector_size - json_offset;
+        let to_copy = avail.min(luks::LUKS2_JSON_SCAN_SIZE);
+        json_buf[..to_copy].copy_from_slice(&sector_buf[json_offset..json_offset + to_copy]);
+        json_bytes_read = to_copy;
+    } else {
+        for i in 0..sectors_to_read {
+            let sector = (json_start_sector + i) as u64;
+            let offset = i * sector_size;
+            if !(call_table.read_input_sector)(
+                0,
+                sector,
+                json_buf[offset..].as_mut_ptr(),
+                sector_size,
+            ) {
+                break;
+            }
+            *bytes_read += sector_size as u64;
+            json_bytes_read = offset + sector_size;
+        }
+    }
+
+    if json_bytes_read == 0 {
+        (call_table.debug_print)(b"convert: failed to read LUKS v2 JSON area\n\0".as_ptr());
+        return None;
+    }
+
+    // Find null terminator in JSON data
+    let json_len = json_buf[..json_bytes_read]
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(json_bytes_read);
+    let json = &json_buf[..json_len];
+
+    // Parse keyslot and digest parameters
+    let slot = match luks::parse_v2_keyslot(json) {
+        Some(s) => s,
+        None => {
+            (call_table.debug_print)(b"convert: failed to parse LUKS v2 keyslot\n\0".as_ptr());
+            return None;
+        }
+    };
+
+    let digest_params = match luks::parse_v2_digest(json) {
+        Some(d) => d,
+        None => {
+            (call_table.debug_print)(b"convert: failed to parse LUKS v2 digest\n\0".as_ptr());
+            return None;
+        }
+    };
+
+    let key_bytes = slot.key_size as usize;
+    if key_bytes != 32 && key_bytes != 64 {
+        (call_table.debug_print)(b"convert: unsupported LUKS v2 key size\n\0".as_ptr());
+        return None;
+    }
+
+    // Parse payload offset from JSON BEFORE key material read overwrites
+    // SCRATCH_MEM_BASE (which shares memory with json_buf).
+    let mut payload_offset_sectors = 0u32;
+    let mut cipher = [0u8; 32];
+    let mut cipher_mode = [0u8; 32];
+    let mut hash = [0u8; 32];
+    let mut mk_len = 0u32;
+    let mut active_slots = 0u32;
+    luks::parse_v2_json_metadata(
+        json,
+        &mut cipher,
+        &mut cipher_mode,
+        &mut hash,
+        &mut payload_offset_sectors,
+        &mut mk_len,
+        &mut active_slots,
+    );
+    let payload_byte_offset = payload_offset_sectors as u64 * 512;
+
+    // Verify we have enough Argon2 memory
+    let needed_kib = slot.kdf_memory as u64;
+    let available_kib = config.argon2_mem_size / 1024;
+    if needed_kib > available_kib {
+        (call_table.debug_print)(
+            b"convert: insufficient Argon2 memory (use larger --max-guest-memory)\n\0".as_ptr(),
+        );
+        return None;
+    }
+
+    (call_table.verbose_print)(b"convert: reading LUKS v2 key material\n\0".as_ptr());
+
+    // Read encrypted key material from disk
+    let km_total_bytes = (key_bytes as u64)
+        .checked_mul(slot.af_stripes as u64)
+        .unwrap_or(0) as usize;
+    if km_total_bytes == 0 || km_total_bytes > SCRATCH_MEM_SIZE {
+        (call_table.debug_print)(b"convert: LUKS v2 key material size invalid\n\0".as_ptr());
+        return None;
+    }
+
+    let km_buf = core::slice::from_raw_parts_mut(SCRATCH_MEM_BASE as *mut u8, km_total_bytes);
+    let km_byte_offset = slot.area_offset;
+
+    let cap = (call_table.get_input_capacity)(0) * sector_size as u64;
+    if km_byte_offset + km_total_bytes as u64 > cap {
+        (call_table.debug_print)(
+            b"convert: LUKS v2 key material exceeds device capacity\n\0".as_ptr(),
+        );
+        return None;
+    }
+
+    let km_start_sector = km_byte_offset / sector_size as u64;
+    let km_end_byte = km_byte_offset + km_total_bytes as u64;
+    let km_end_sector = (km_end_byte + sector_size as u64 - 1) / sector_size as u64;
+    let km_sectors_needed = (km_end_sector - km_start_sector) as usize;
+
+    let mut sector_buf = [0u8; MAX_SECTOR_SIZE];
+    let mut km_pos = 0usize;
+
+    for s in 0..km_sectors_needed {
+        let sector_idx = km_start_sector + s as u64;
+        if !(call_table.read_input_sector)(0, sector_idx, sector_buf.as_mut_ptr(), sector_size) {
+            (call_table.debug_print)(b"convert: failed to read LUKS v2 key material\n\0".as_ptr());
+            return None;
+        }
+        *bytes_read += sector_size as u64;
+
+        let offset_in_sector = if s == 0 {
+            (km_byte_offset % sector_size as u64) as usize
+        } else {
+            0
+        };
+        let available = sector_size - offset_in_sector;
+        let to_copy = available.min(km_total_bytes - km_pos);
+        km_buf[km_pos..km_pos + to_copy]
+            .copy_from_slice(&sector_buf[offset_in_sector..offset_in_sector + to_copy]);
+        km_pos += to_copy;
+
+        if km_pos >= km_total_bytes {
+            break;
+        }
+    }
+
+    (call_table.verbose_print)(b"convert: deriving LUKS v2 master key (Argon2id)\n\0".as_ptr());
+
+    // Allocate Argon2 memory at ARGON2_MEM_BASE
+    let num_blocks = (slot.kdf_memory as usize * 1024) / 1024;
+    let memory_ptr = ARGON2_MEM_BASE as *mut argon2::Block;
+    let memory_blocks = core::slice::from_raw_parts_mut(memory_ptr, num_blocks);
+
+    let passphrase = config.passphrase_bytes();
+    let derived = match luks::derive_v2_master_key(
+        &slot,
+        &digest_params,
+        passphrase,
+        km_buf,
+        memory_blocks,
+    ) {
+        Some(d) => d,
+        None => {
+            (call_table.debug_print)(b"convert: LUKS v2 master key derivation failed\n\0".as_ptr());
+            return None;
+        }
+    };
+
+    (call_table.verbose_print)(b"convert: LUKS v2 master key verified\n\0".as_ptr());
+
+    out_key[..derived.key_len].copy_from_slice(&derived.key[..derived.key_len]);
+
+    Some((
+        derived.key_len,
+        derived.luks_sector_size,
+        payload_byte_offset,
+    ))
 }
 
 // ================================================================

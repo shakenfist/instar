@@ -706,6 +706,46 @@ items 5, 6, 12, 15, 16, 18 as done in this file.
     snapshots are parsed. Extraction works by overriding the
     active L1 table with the snapshot's L1 table.
 
+## Phase 18: LUKS Crate Extraction & Enhanced LUKS Convert ✓
+
+**Status:** Complete (March 2026)
+
+Extracted shared LUKS code into a dedicated crate, added LUKS v2 native
+convert support with Argon2id KDF, and added transparent LUKS-wrapping-
+QCOW2 conversion.
+
+### 18a: Extract luks crate ✓
+
+Extracted LUKS constants, header parsing, PBKDF2/Argon2id key derivation,
+AFsplitter, and master key verification into `src/crates/luks/`. Features:
+`decrypt` (AES-XTS payload decryption), `kdf-argon2` (Argon2id KDF).
+The info and convert operations now depend on the luks crate instead of
+duplicating LUKS logic.
+
+### 18b: LUKS v2 native convert support ✓
+
+Added Argon2id KDF support to the convert operation for native LUKS v2
+containers. Added `--max-guest-memory` flag to the convert CLI (previously
+only available in info). LUKS v2 header parsing extracts the JSON metadata
+area to determine payload offset. Fixed a bug where JSON metadata was read
+from the same SCRATCH_MEM_BASE as key material, causing the key material
+to be overwritten before the payload offset could be extracted. Test image:
+`luks-v2-aes-xts` (synthetic with low-memory Argon2id parameters, built
+by `scripts/create-native-luks-testdata.py`).
+
+### 18c: LUKS-wrapping-QCOW2 convert ✓
+
+When a native LUKS container wraps a QCOW2 image, the convert operation
+now detects the inner QCOW2 format and transparently decrypts via
+CallTable function pointer wrapping. Static globals hold the LUKS context
+(payload offset, AES-XTS key, IV), and the `read_input_sector` and
+`get_input_capacity` function pointers are replaced with wrappers that
+offset and decrypt reads from device 0. No changes to the qcow2 crate
+were needed. Test image: `luks-v1-qcow2-inner` (created by
+`scripts/create-native-luks-testdata.py`).
+
+---
+
 ## Verification
 
 After each sub-phase:
