@@ -3757,5 +3757,165 @@ class TestConvertNativeLuks(ImagoTestBase):
             # Key derivation should fail verification
             self.assertNotEqual(
                 rc, 0,
-                'Wrong passphrase should fail'
+                'Wrong passphrase should fail (v1)'
+            )
+
+
+class TestConvertNativeLuksV2(ImagoTestBase):
+    """Test conversion of native LUKS v2 containers (Argon2id
+    KDF)."""
+
+    def test_convert_native_luks_v2_to_raw(self):
+        """Convert native LUKS v2 container to raw."""
+        image = self.get_image('luks-v2-aes-xts')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        expected_raw = (
+            image.path.parent / 'luks-v2-aes-xts-inner.raw'
+        )
+        if not expected_raw.exists():
+            self.skipTest(
+                f'Expected raw not found: {expected_raw}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.raw') as raw_out:
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(raw_out.name),
+                luks_passphrase='test-passphrase',
+                max_guest_memory='64M',
+            )
+            self.assertEqual(
+                rc, 0,
+                f'Native LUKS v2 convert failed: {stderr}'
+            )
+
+            # Compare against known expected content
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(raw_out.name),
+                expected_raw
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Output differs from expected: '
+                f'{cmp_out}'
+            )
+
+    def test_convert_native_luks_v2_without_memory(self):
+        """LUKS v2 without --max-guest-memory should fail."""
+        image = self.get_image('luks-v2-aes-xts')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.raw') as raw_out:
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(raw_out.name),
+                luks_passphrase='test-passphrase',
+            )
+            self.assertNotEqual(
+                rc, 0,
+                'Should fail without --max-guest-memory'
+            )
+
+    def test_convert_native_luks_v2_wrong_passphrase(self):
+        """Wrong passphrase for LUKS v2 should fail."""
+        image = self.get_image('luks-v2-aes-xts')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.raw') as raw_out:
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(raw_out.name),
+                luks_passphrase='wrong-passphrase',
+                max_guest_memory='64M',
+            )
+            self.assertNotEqual(
+                rc, 0,
+                'Wrong passphrase should fail (v2)'
+            )
+
+
+class TestConvertLuksWrappedQcow2(ImagoTestBase):
+    """Test conversion of LUKS containers wrapping QCOW2 images."""
+
+    def test_convert_luks_wrapped_qcow2_to_raw(self):
+        """Convert LUKS v1 wrapping QCOW2 to raw."""
+        image = self.get_image('luks-v1-qcow2-inner')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        expected_raw = (
+            image.path.parent
+            / 'luks-v1-qcow2-inner-inner.raw'
+        )
+        if not expected_raw.exists():
+            self.skipTest(
+                f'Expected raw not found: {expected_raw}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.raw') as raw_out:
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(raw_out.name),
+                luks_passphrase='test-passphrase',
+            )
+            self.assertEqual(
+                rc, 0,
+                f'LUKS-wrapped QCOW2 convert failed: '
+                f'{stderr}'
+            )
+
+            # The output may be larger than the inner raw
+            # (pre-allocated to LUKS payload size). Compare
+            # only the expected number of bytes.
+            expected_data = expected_raw.read_bytes()
+            output_data = Path(raw_out.name).read_bytes()
+            self.assertGreaterEqual(
+                len(output_data), len(expected_data),
+                f'Output too small: {len(output_data)} < '
+                f'{len(expected_data)}'
+            )
+            self.assertEqual(
+                output_data[:len(expected_data)],
+                expected_data,
+                'Output content does not match expected '
+                'inner raw'
+            )
+            # Trailing bytes should be zero
+            if len(output_data) > len(expected_data):
+                trailing = output_data[len(expected_data):]
+                self.assertEqual(
+                    trailing,
+                    b'\x00' * len(trailing),
+                    'Trailing bytes are not zero'
+                )
+
+    def test_convert_luks_wrapped_qcow2_without_passphrase(
+            self):
+        """Missing passphrase should fail."""
+        image = self.get_image('luks-v1-qcow2-inner')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+                suffix='.raw') as raw_out:
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(raw_out.name),
+            )
+            self.assertNotEqual(
+                rc, 0,
+                'Should fail without passphrase'
             )

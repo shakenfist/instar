@@ -172,6 +172,11 @@ provides a modular architecture with:
   bitmap entry handling, VhdxState for stateful block I/O, and output
   builders (file identifier, headers, region table, metadata, BAT
   entries). Used by check, convert, and compare operations.
+- **crates/luks/** - Shared LUKS format crate: LUKS v1/v2 header
+  constants, header parsing, PBKDF2 key derivation, Argon2id key
+  derivation (behind `kdf-argon2` feature), AFsplitter key recovery,
+  master key verification, and AES-XTS payload decryption (behind
+  `decrypt` feature). Used by info and convert operations.
 - **operations/info/** - Format detection operation
 - **operations/copy/** - File copy operation
 - **operations/check/** - Image integrity validation operation (with
@@ -325,7 +330,13 @@ report the inner format and virtual size.
 
 The convert operation supports decrypting native LUKS containers
 (`--luks-passphrase`) and LUKS-in-QCOW2 images (crypt_method=2). Both
-use AES-XTS-plain64 for payload decryption.
+use AES-XTS-plain64 for payload decryption. Native LUKS containers
+wrapping QCOW2 images are transparently handled: the convert operation
+detects the inner QCOW2 format and wraps the CallTable I/O function
+pointers to offset and decrypt reads, allowing the qcow2 crate to
+process the inner image without modification. LUKS v2 containers
+using Argon2id KDF require `--max-guest-memory` to allocate the
+working memory needed for key derivation.
 
 ## Test Image Generation
 
@@ -336,7 +347,8 @@ by scripts in `scripts/`:
   VHD (disk_type=4) via Python struct packing and qemu-img patching
 - `create-vmdk-testdata.sh` — Binary VMDK4 with multi-extent descriptor
 - `create-luks-testdata.sh` — LUKS v1 containers with inner formats
-- `create-native-luks-testdata.py` — LUKS v1 with known encrypted content
+- `create-native-luks-testdata.py` — LUKS v1/v2 with known encrypted
+  content (v1 raw, v2 Argon2id, v1 wrapping QCOW2)
 - `create-qcow2-luks-testdata.sh` — QCOW2 with LUKS encryption (crypt_method=2)
 - `create-check-testdata.sh` — QCOW2 images with specific corruptions
 

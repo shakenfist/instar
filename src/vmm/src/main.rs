@@ -2192,17 +2192,23 @@ struct ConvertArgs {
     #[arg(long, value_name = "PATH", conflicts_with = "qcow2_password")]
     qcow2_password_file: Option<String>,
 
-    /// LUKS passphrase for QCOW2 crypt_method=2 (LUKS-in-QCOW2) decryption
+    /// LUKS passphrase for native LUKS or QCOW2 crypt_method=2 decryption
     #[arg(long, value_name = "PASSPHRASE")]
     luks_passphrase: Option<String>,
 
-    /// Read LUKS passphrase from file (for QCOW2 crypt_method=2)
+    /// Read LUKS passphrase from file (for native LUKS or QCOW2 crypt_method=2)
     #[arg(long, value_name = "PATH", conflicts_with = "luks_passphrase")]
     luks_passphrase_file: Option<String>,
 
     /// Extract a specific snapshot (by ID or name) instead of the active image
     #[arg(long, value_name = "ID")]
     snapshot: Option<String>,
+
+    /// Maximum guest memory for LUKS v2 Argon2id key derivation (e.g., "1G", "2G").
+    /// LUKS v2 uses Argon2id which is memory-hard — typical images require 1 GB.
+    /// Without this flag, native LUKS v2 conversion will fail.
+    #[arg(long, value_name = "SIZE")]
+    max_guest_memory: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -4278,6 +4284,26 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         args.output, output_capacity
     );
 
+    // Parse --max-guest-memory for LUKS v2 Argon2id support
+    let guest_mem_size: u64 = if let Some(ref mem_str) = args.max_guest_memory {
+        let requested = parse_memory_size(mem_str)?;
+        if requested < GUEST_MEM_SIZE {
+            return Err(format!(
+                "--max-guest-memory must be at least {}MB (got {})",
+                GUEST_MEM_SIZE / (1024 * 1024),
+                mem_str
+            )
+            .into());
+        }
+        debug!(
+            "Using {} bytes of guest memory (--max-guest-memory {})",
+            requested, mem_str
+        );
+        requested
+    } else {
+        GUEST_MEM_SIZE
+    };
+
     // Open KVM
     let kvm = Kvm::new()?;
     debug!("KVM API version: {}", kvm.get_api_version());
@@ -4288,8 +4314,8 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     let vm = kvm.create_vm()?;
     debug!("Created VM");
 
-    let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
-    debug!("Allocated {} bytes of guest memory", GUEST_MEM_SIZE);
+    let guest_mem = create_guest_memory(guest_mem_size)?;
+    debug!("Allocated {} bytes of guest memory", guest_mem_size);
 
     let region = guest_mem.find_region(GuestAddress(0)).unwrap();
     let host_addr = region.as_ptr() as u64;
@@ -4297,7 +4323,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     let mem_region = kvm_userspace_memory_region {
         slot: 0,
         guest_phys_addr: 0,
-        memory_size: GUEST_MEM_SIZE,
+        memory_size: guest_mem_size,
         userspace_addr: host_addr,
         flags: 0,
     };
@@ -4309,7 +4335,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     setup_gdt(&guest_mem)?;
     debug!("Set up GDT at 0x{:x}", GDT_BASE);
 
-    setup_page_tables(&guest_mem, GUEST_MEM_SIZE)?;
+    setup_page_tables(&guest_mem, guest_mem_size)?;
     debug!("Set up page tables at 0x{:x}", PAGE_TABLE_BASE);
 
     guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
@@ -4411,14 +4437,23 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         );
     }
 
+    // Write argon2_mem_size to ConvertConfig (offset 360 = 292 + 64 + 4 pad)
+    let argon2_mem_size: u64 = if guest_mem_size > GUEST_MEM_SIZE {
+        guest_mem_size - GUEST_MEM_SIZE
+    } else {
+        0
+    };
+    guest_mem.write_obj(argon2_mem_size, GuestAddress(OPERATION_CONFIG_ADDR + 360))?;
+
     debug!(
         "Wrote convert config at 0x{:x} \
-         (flags=0x{:x}, chain={}, format={}, cluster_bits={})",
+         (flags=0x{:x}, chain={}, format={}, cluster_bits={}, argon2_mem_size={})",
         OPERATION_CONFIG_ADDR,
         convert_flags,
         input_device_count,
         target_format,
         output_cluster_bits,
+        argon2_mem_size,
     );
 
     // Write ChainConfig for input chain
