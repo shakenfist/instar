@@ -139,7 +139,8 @@ provides a modular architecture with:
 - **vmm/** - Host-side virtual machine monitor
 - **core/** - Guest initialization (device init, call table)
 - **crates/qcow2/** - Shared QCOW2 format crate: header parsing, L1/L2
-  cluster lookup (including extended L2 with 16-byte entries), compressed
+  cluster lookup (including extended L2 with 16-byte entries
+  and full subcluster bitmap parsing), compressed
   cluster decompression (zlib via `decompress` feature, ZSTD via
   `decompress-zstd` feature using ruzstd), cluster compression (behind
   `compress` feature flag using raw deflate via miniz_oxide), refcount
@@ -259,7 +260,10 @@ QEMU Copy-On-Write version 2/3. Supported features:
 - Compression (zlib, zstd) for clusters up to 2MB
 - Backing file chains (automatic flattening)
 - Refcount widths: 1, 2, 4, 8, 16, 32, 64 bits
-- Extended L2 entries (16-byte with subcluster bitmaps)
+- Extended L2 entries (16-byte with subcluster bitmaps;
+  full subcluster support — the bitmap is parsed for
+  per-subcluster data reading: Normal, Zero, and
+  Unallocated states)
 - Incompatible feature bit validation
 - External data files (metadata/data separation, chain discovery with allowlist)
 - Legacy AES-128-CBC encryption (crypt_method=1) decryption via `--qcow2-password`

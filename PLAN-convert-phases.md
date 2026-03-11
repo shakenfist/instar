@@ -744,6 +744,29 @@ offset and decrypt reads from device 0. No changes to the qcow2 crate
 were needed. Test image: `luks-v1-qcow2-inner` (created by
 `scripts/create-native-luks-testdata.py`).
 
+## Phase 19: Extended L2 Subcluster Support ✓
+
+**Status:** Complete (March 2026)
+
+Added full per-subcluster data reading for QCOW2 extended L2
+entries. The 16-byte L2 entry bitmap (32 subclusters) is now
+parsed to determine each subcluster's state.
+
+### Changes
+
+- **StandardSubclusters variant** in `ClusterLookup`: carries
+  the host offset plus the 32-bit subcluster bitmap, enabling
+  per-subcluster dispatch in the chain reader.
+- **Per-subcluster reading** in `read_chain_virtual_cluster`:
+  Normal subclusters read host data, Zero subclusters are
+  zeroed, Unallocated subclusters fall through to backing
+  or read as zeros.
+- **Check operation bitmap validation**: verifies subcluster
+  bitmap consistency for extended L2 entries.
+- **4 new integration tests** (`TestExtendedL2Subclusters`):
+  partial subcluster allocation with mixed Normal, Zero, and
+  Unallocated states.
+
 ---
 
 ## Verification
