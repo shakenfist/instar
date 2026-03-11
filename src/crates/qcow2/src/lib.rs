@@ -2388,9 +2388,13 @@ pub unsafe fn read_chain_virtual_cluster(
                                         );
                                     }
                                 }
+                            } else if dev_offset == 0 {
+                                // Unallocated subcluster at bottom of
+                                // chain (no backing below): zero it.
+                                core::ptr::write_bytes(buf.add(buf_off), 0, sc_size as usize);
                             }
-                            // else: unallocated — leave buf untouched
-                            // (preserves backing data or zeros)
+                            // else: unallocated with backing below —
+                            // leave buf untouched (preserves backing data)
                         }
                         return true;
                     }
