@@ -78,10 +78,10 @@ const QED_BACKING_FILENAME_SIZE_OFFSET: usize = 60; // Backing filename size (u3
 
 // LUKS constants from the luks crate
 use luks::{
-    LUKS2_BINARY_HEADER_SIZE, LUKS2_JSON_SCAN_SIZE, LUKS2_UUID_OFFSET, LUKS_CIPHER_MODE_OFFSET,
-    LUKS_CIPHER_NAME_OFFSET, LUKS_HASH_SPEC_OFFSET, LUKS_KEY_BYTES_OFFSET, LUKS_KEY_SLOT_ACTIVE,
-    LUKS_KEY_SLOT_BASE, LUKS_KEY_SLOT_SIZE, LUKS_NUM_KEY_SLOTS, LUKS_PAYLOAD_OFFSET_OFFSET,
-    LUKS_UUID_OFFSET, LUKS_V1_HEADER_SIZE, LUKS_VERSION_OFFSET,
+    copy_null_padded, LUKS2_BINARY_HEADER_SIZE, LUKS2_JSON_SCAN_SIZE, LUKS2_UUID_OFFSET,
+    LUKS_CIPHER_MODE_OFFSET, LUKS_CIPHER_NAME_OFFSET, LUKS_HASH_SPEC_OFFSET, LUKS_KEY_BYTES_OFFSET,
+    LUKS_KEY_SLOT_ACTIVE, LUKS_KEY_SLOT_BASE, LUKS_KEY_SLOT_SIZE, LUKS_NUM_KEY_SLOTS,
+    LUKS_PAYLOAD_OFFSET_OFFSET, LUKS_UUID_OFFSET, LUKS_V1_HEADER_SIZE, LUKS_VERSION_OFFSET,
 };
 
 /// Entry point called by core after devices are initialized.
@@ -1131,19 +1131,6 @@ unsafe fn parse_luks_header(
             }
         }
     }
-}
-
-// JSON helpers, base64, key slot structs, and v2 JSON parsing are
-// now provided by the luks crate. Only copy_null_padded is kept here
-// because parse_luks_header uses it for v1 header field extraction.
-
-/// Copy a null-padded string from source to destination buffer.
-/// Ensures the destination is null-terminated.
-fn copy_null_padded(src: &[u8], dst: &mut [u8]) {
-    let end = src.iter().position(|&b| b == 0).unwrap_or(src.len());
-    let copy_len = end.min(dst.len() - 1);
-    dst[..copy_len].copy_from_slice(&src[..copy_len]);
-    dst[copy_len] = 0;
 }
 
 /// Attempt LUKS1 decryption and return the detected inner format.
