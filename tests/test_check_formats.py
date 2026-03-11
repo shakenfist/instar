@@ -825,6 +825,155 @@ class TestExtendedL2(ImagoTestBase):
             )
 
 
+class TestExtendedL2Subclusters(ImagoTestBase):
+    """Test correct per-subcluster handling in extended L2 images.
+
+    Creates QCOW2 images with partially-allocated subclusters and
+    verifies that convert/compare produce correct output by comparing
+    against qemu-img convert (the gold standard).
+    """
+
+    def _create_partial_subcluster_qcow2(self):
+        """Create an extended L2 QCOW2 with mixed subcluster states.
+
+        Layout (64KB cluster = 32 subclusters of 2KB each):
+        - Cluster 0: first 32KB written (0xAA), next 16KB zeroed,
+          last 16KB unallocated
+        - Cluster 1: fully written (0xBB)
+        - Rest: unallocated
+
+        Returns a NamedTemporaryFile.
+        """
+        img = tempfile.NamedTemporaryFile(suffix='.qcow2')
+        subprocess.run(
+            ['qemu-img', 'create', '-f', 'qcow2',
+             '-o', 'extended_l2=on,cluster_size=65536',
+             img.name, '1M'],
+            capture_output=True, check=True
+        )
+        # Write first 32KB of cluster 0 (subclusters 0-15)
+        subprocess.run(
+            ['qemu-io', '-c', 'write -P 0xAA 0 32768',
+             img.name],
+            capture_output=True, check=True
+        )
+        # Zero next 16KB of cluster 0 (subclusters 16-23)
+        subprocess.run(
+            ['qemu-io', '-c', 'write -z 32768 16384',
+             img.name],
+            capture_output=True, check=True
+        )
+        # Write full cluster 1 (subclusters 0-31)
+        subprocess.run(
+            ['qemu-io', '-c', 'write -P 0xBB 65536 65536',
+             img.name],
+            capture_output=True, check=True
+        )
+        return img
+
+    def test_convert_partial_subclusters(self):
+        """Partially-allocated extended L2 cluster converts
+        correctly when compared against qemu-img."""
+        with self._create_partial_subcluster_qcow2() as img, \
+                tempfile.NamedTemporaryFile(suffix='.raw') \
+                as imago_raw, \
+                tempfile.NamedTemporaryFile(suffix='.raw') \
+                as qemu_raw:
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(img.name), Path(imago_raw.name)
+            )
+            self.assertEqual(
+                rc, 0,
+                f'convert should handle partial subclusters: '
+                f'{stderr}'
+            )
+
+            subprocess.run(
+                ['qemu-img', 'convert', '-f', 'qcow2',
+                 '-O', 'raw', img.name, qemu_raw.name],
+                capture_output=True, check=True
+            )
+
+            stdout2, stderr2, rc2 = self.run_imago_compare(
+                Path(imago_raw.name), Path(qemu_raw.name)
+            )
+            self.assertEqual(
+                rc2, 0,
+                'partial subcluster convert should match '
+                f'qemu-img: {stderr2}'
+            )
+
+    def test_convert_zero_subclusters(self):
+        """Zero subclusters produce zeros in output even though
+        host data may exist at the cluster offset."""
+        with self._create_partial_subcluster_qcow2() as img, \
+                tempfile.NamedTemporaryFile(suffix='.raw') \
+                as imago_raw:
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(img.name), Path(imago_raw.name)
+            )
+            self.assertEqual(rc, 0, f'convert failed: {stderr}')
+
+            with open(imago_raw.name, 'rb') as f:
+                data = f.read()
+
+            # First 32KB should be 0xAA (allocated subclusters)
+            self.assertEqual(
+                data[:32768], b'\xAA' * 32768,
+                'first 32KB should be 0xAA'
+            )
+            # Next 16KB should be zeros (zero subclusters)
+            self.assertEqual(
+                data[32768:49152], b'\x00' * 16384,
+                'bytes 32KB-48KB should be zeros'
+            )
+            # Next 16KB should be zeros (unallocated subclusters)
+            self.assertEqual(
+                data[49152:65536], b'\x00' * 16384,
+                'bytes 48KB-64KB should be zeros (unalloc)'
+            )
+            # Cluster 1 should be 0xBB
+            self.assertEqual(
+                data[65536:131072], b'\xBB' * 65536,
+                'cluster 1 should be 0xBB'
+            )
+
+    def test_compare_partial_vs_raw(self):
+        """Compare extended L2 with partial subclusters against
+        qemu-img convert output."""
+        with self._create_partial_subcluster_qcow2() as img, \
+                tempfile.NamedTemporaryFile(suffix='.raw') \
+                as raw:
+            subprocess.run(
+                ['qemu-img', 'convert', '-f', 'qcow2',
+                 '-O', 'raw', img.name, raw.name],
+                capture_output=True, check=True
+            )
+
+            stdout, stderr, rc = self.run_imago_compare(
+                Path(img.name), Path(raw.name)
+            )
+            self.assertEqual(
+                rc, 0,
+                'partial subcluster qcow2 should match '
+                f'raw: {stderr}'
+            )
+
+    def test_check_partial_subclusters(self):
+        """Check should accept extended L2 images with partial
+        subcluster allocation without reporting corruptions."""
+        with self._create_partial_subcluster_qcow2() as img:
+            stdout, stderr, rc = self.run_imago_check(
+                Path(img.name), output_format='json'
+            )
+            result = json.loads(stdout)
+            self.assertEqual(
+                result.get('corruptions', 0), 0,
+                'partial subclusters should not be corrupt: '
+                f'{stderr}'
+            )
+
+
 class TestZstdBackingChain(ImagoTestBase):
     """Test ZSTD-compressed QCOW2 images with backing chains.
 
