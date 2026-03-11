@@ -15,7 +15,7 @@ imago/
 ├── src/            # Main imago implementation
 │   ├── vmm/        # Virtual machine monitor (host-side)
 │   ├── core/       # Core guest initialization
-│   ├── crates/     # Shared format crates (qcow2, raw, vmdk, vhd, vhdx)
+│   ├── crates/     # Shared format crates (qcow2, raw, vmdk, vhd, vhdx, luks)
 │   ├── shared/     # Shared library code (byte-order helpers, configs)
 │   ├── operations/ # Pluggable operations (info, copy, check, compare, convert)
 │   └── build.sh    # Build script
@@ -175,7 +175,7 @@ make clean-tests
 - `tests/test_info_malicious.py` - Tests against malicious images using expected overrides
 - `tests/test_check_formats.py` - Tests for check operation (format detection, corruption, validation, incompatible feature bits, ZSTD compression, extended L2 entries, ZSTD + backing chains, extended L2 + compressed clusters, refcount widths 1-64 bit, compressed cluster leak detection, large cluster sizes 256K-2MB, VMDK GD/GT validation with overlap detection, QCOW2 snapshot detection)
 - `tests/test_compare.py` - Tests for compare operation (raw-vs-raw, QCOW2-vs-raw, QCOW2-vs-QCOW2, compressed QCOW2, backing chains)
-- `tests/test_convert.py` - Tests for convert operation (QCOW2-to-raw, raw-to-QCOW2, QCOW2 re-encoding, compressed output with `-c` flag, backing chains, round-trip validation, errors, large cluster sizes up to 2MB, manifest-driven cross-validation against qemu-img including compressed output, encrypted QCOW2 decryption, LUKS-in-QCOW2 decryption, native LUKS decryption, snapshot extraction)
+- `tests/test_convert.py` - Tests for convert operation (QCOW2-to-raw, raw-to-QCOW2, QCOW2 re-encoding, compressed output with `-c` flag, backing chains, round-trip validation, errors, large cluster sizes up to 2MB, manifest-driven cross-validation against qemu-img including compressed output, encrypted QCOW2 decryption, LUKS-in-QCOW2 decryption, native LUKS v1/v2 decryption, LUKS v2 with Argon2id KDF and --max-guest-memory, LUKS-wrapping-QCOW2 conversion, snapshot extraction)
 - `tests/test_oslo_crossval.py` - Cross-validation against oslo.utils
   format_inspector (format detection, safety checks, virtual size).
   Skips if oslo.utils is not installed.
@@ -196,10 +196,14 @@ Real LUKS containers (luks-v1-raw-gpt, luks-v1-qcow2) are created by
 `scripts/create-luks-testdata.sh` using cryptsetup, with known test
 passphrases stored in the manifest. The `luks-v1-aes-xts` test image is
 built by `scripts/create-native-luks-testdata.py` (no root required) with
-known encrypted content for conversion testing. LUKS-in-QCOW2 test images
-are created by `scripts/create-qcow2-luks-testdata.sh`. These use
-`skip_qemu_img: true` since qemu-img cannot inspect inside LUKS without
-a secret object.
+known encrypted content for conversion testing. The `luks-v2-aes-xts`
+test image is built by `scripts/create-native-luks-v2-testdata.py` with
+low-memory Argon2id parameters for LUKS v2 conversion testing. The
+`luks-v1-qcow2-inner` test image is created by
+`scripts/create-luks-qcow2-inner-testdata.sh` for testing LUKS containers
+wrapping QCOW2 images. LUKS-in-QCOW2 test images are created by
+`scripts/create-qcow2-luks-testdata.sh`. These use `skip_qemu_img: true`
+since qemu-img cannot inspect inside LUKS without a secret object.
 
 See `docs/testing.md` for detailed documentation.
 
