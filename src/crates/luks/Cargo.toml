@@ -1,0 +1,23 @@
+[package]
+name = "luks"
+version = "0.1.0"
+edition = "2021"
+description = "LUKS v1/v2 header parsing and key derivation for bare-metal guest operations"
+license = "Apache-2.0"
+
+[features]
+kdf-pbkdf2 = ["pbkdf2", "hmac", "sha1", "sha2"]
+kdf-argon2 = ["dep:argon2", "sha2"]
+decrypt = ["aes", "xts-mode", "kdf-pbkdf2"]
+
+[dependencies]
+aes = { version = "0.8", default-features = false, optional = true }
+xts-mode = { version = "0.5", default-features = false, optional = true }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"], optional = true }
+hmac = { version = "0.12", default-features = false, optional = true }
+sha1 = { version = "0.10", default-features = false, optional = true }
+sha2 = { version = "0.10", default-features = false, optional = true }
+argon2 = { version = "0.5", default-features = false, optional = true }
+
+[lib]
+# No std, this is used by bare-metal code

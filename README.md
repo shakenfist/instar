@@ -187,6 +187,12 @@ imago convert -O vpc input.qcow2 output.vhd
 # Convert to VHDX dynamic format
 imago convert -O vhdx input.qcow2 output.vhdx
 
+# Decrypt native LUKS v2 container (Argon2id KDF)
+imago convert --luks-passphrase 'secret' --max-guest-memory 1G encrypted.luks output.raw
+
+# Decrypt LUKS container wrapping a QCOW2 image
+imago convert --luks-passphrase 'secret' luks-wrapped.img output.raw
+
 # Progress reporting
 imago convert -p 5 input.qcow2 output.raw
 ```
@@ -198,8 +204,11 @@ including clusters up to 2MB. QCOW2 v3 images with extended L2 entries
 (subclusters) are also supported. Legacy AES-128-CBC encrypted QCOW2 images
 (`crypt_method=1`) can be decrypted with `--qcow2-password`. LUKS-in-QCOW2
 images (`crypt_method=2`) and native LUKS containers can be decrypted with
-`--luks-passphrase`. Individual snapshots can be extracted with
-`--snapshot <name-or-id>`.
+`--luks-passphrase`. LUKS v2 containers using Argon2id KDF require
+`--max-guest-memory` (e.g., `--max-guest-memory 1G`). Native LUKS
+containers wrapping QCOW2 images are transparently detected and
+decrypted, with the inner QCOW2 processed as the conversion source.
+Individual snapshots can be extracted with `--snapshot <name-or-id>`.
 
 By default, convert produces sparse output by skipping zero-filled clusters
 (matching `qemu-img convert` behavior). Use `--no-skip-zeros` for dense output.
@@ -400,7 +409,8 @@ imago/
 │   │   ├── raw/    # MBR/GPT partition table detection
 │   │   ├── vhd/    # VHD footer, dynamic header, BAT parsing
 │   │   ├── vhdx/   # VHDX headers, region table, metadata, BAT, CRC-32C
-│   │   └── vmdk/   # VMDK4 header and descriptor parsing
+│   │   ├── vmdk/   # VMDK4 header and descriptor parsing
+│   │   └── luks/   # LUKS header parsing, KDF, AFsplitter, decryption
 │   ├── operations/ # Pluggable operations (info, copy, check, compare, convert)
 │   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates
