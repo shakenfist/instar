@@ -92,12 +92,12 @@ The `imago convert` operation supports writing output in the following formats:
   LUKS-encrypted QCOW2 images (crypt_method=2) will compare ciphertext, not
   decrypted content. A future phase may add `--luks-passphrase` support to
   compare for consistency with the convert operation.
-- Extended L2 images with partially-allocated subclusters may return stale host
-  data for unallocated subclusters. The extended L2 support reads only the first
-  8 bytes of each 16-byte entry (the cluster descriptor), ignoring the subcluster
-  allocation bitmap. This treats the entire cluster as fully allocated, which is
-  conservative (data is read rather than zeroed) but could produce incorrect
-  output for convert/compare when subclusters matter.
+- Extended L2 images with subclusters are fully supported.
+  The 16-byte L2 entry bitmap is parsed to determine
+  per-subcluster state: Normal subclusters read host data,
+  Zero subclusters are zeroed, and Unallocated subclusters
+  preserve backing data or read as zeros if no backing
+  image is present.
 
 ---
 
