@@ -2308,6 +2308,58 @@ pub unsafe fn read_chain_virtual_cluster(
                             dev_idx as u32
                         };
 
+                        // Pre-fill unallocated subclusters from backing
+                        // chain so overlay data can selectively overwrite.
+                        let has_unalloc = (0..sc_count).any(|i| {
+                            let sc_idx = (sc_start + i) as u32;
+                            let is_zero = (zero_bits >> sc_idx) & 1 != 0;
+                            let is_alloc = (alloc_bits >> sc_idx) & 1 != 0;
+                            !is_zero && (!is_alloc || host_offset == 0)
+                        });
+
+                        if has_unalloc {
+                            let remaining = chain_len - dev_offset - 1;
+                            if remaining > 0 {
+                                // Fill buffer from backing chain; overlay
+                                // subclusters will overwrite below.
+                                if !read_chain_virtual_cluster(
+                                    call_table,
+                                    chain_start + dev_offset + 1,
+                                    remaining,
+                                    virtual_offset,
+                                    buf,
+                                    chunk_size,
+                                    sector_size,
+                                    chain_config,
+                                    chain_states,
+                                    compressed_buf,
+                                    staging_buf,
+                                    staging_cluster_offset,
+                                    aes_key,
+                                    luks_key,
+                                    luks_sector_size,
+                                    bytes_read,
+                                ) {
+                                    return false;
+                                }
+                            } else {
+                                // Bottom of chain: zero unallocated subclusters
+                                for i in 0..sc_count {
+                                    let sc_idx = (sc_start + i) as u32;
+                                    let is_zero = (zero_bits >> sc_idx) & 1 != 0;
+                                    let is_alloc = (alloc_bits >> sc_idx) & 1 != 0;
+                                    if !is_zero && (!is_alloc || host_offset == 0) {
+                                        let buf_off = (i * sc_size) as usize;
+                                        core::ptr::write_bytes(
+                                            buf.add(buf_off),
+                                            0,
+                                            sc_size as usize,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
                         for i in 0..sc_count {
                             let sc_idx = (sc_start + i) as u32;
                             let is_zero = (zero_bits >> sc_idx) & 1 != 0;
@@ -2354,13 +2406,9 @@ pub unsafe fn read_chain_virtual_cluster(
                                         );
                                     }
                                 }
-                            } else if dev_offset == 0 {
-                                // Unallocated subcluster at bottom of
-                                // chain (no backing below): zero it.
-                                core::ptr::write_bytes(buf.add(buf_off), 0, sc_size as usize);
                             }
-                            // else: unallocated with backing below —
-                            // leave buf untouched (preserves backing data)
+                            // Unallocated subclusters: pre-filled from
+                            // backing chain or zeroed above.
                         }
                         return true;
                     }
