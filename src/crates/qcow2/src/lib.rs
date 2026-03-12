@@ -1314,7 +1314,14 @@ impl Qcow2State {
             if host_offset == 0 && !self.extended_l2 {
                 Some(ClusterLookup::Unallocated)
             } else if self.extended_l2 {
-                Some(ClusterLookup::StandardSubclusters(host_offset, bitmap))
+                let alloc_bits = bitmap as u32;
+                let zero_bits = (bitmap >> 32) as u32;
+                if alloc_bits == 0xFFFF_FFFF && zero_bits == 0 {
+                    // All subclusters allocated, none zeroed — same as Standard
+                    Some(ClusterLookup::Standard(host_offset))
+                } else {
+                    Some(ClusterLookup::StandardSubclusters(host_offset, bitmap))
+                }
             } else {
                 Some(ClusterLookup::Standard(host_offset))
             }
@@ -2290,48 +2297,7 @@ pub unsafe fn read_chain_virtual_cluster(
                             qcow2_cluster_size
                         };
 
-                        // Fast path: all subclusters allocated, none zeroed
-                        if alloc_bits == 0xFFFF_FFFF && zero_bits == 0 {
-                            let read_offset = host_offset + intra_offset;
-                            let read_dev = chain_config.devices[dev_idx].data_device_idx;
-                            let read_dev = if read_dev != 0 {
-                                read_dev
-                            } else {
-                                dev_idx as u32
-                            };
-                            if !read_cluster_sectors(
-                                call_table,
-                                read_dev,
-                                read_offset,
-                                buf,
-                                read_size,
-                                sector_size,
-                                bytes_read,
-                            ) {
-                                return false;
-                            }
-                            #[cfg(feature = "aes-decrypt")]
-                            if crypt_method == 1 {
-                                if let Some(key) = aes_key {
-                                    decrypt_cluster_aes_cbc(buf, read_size, virtual_offset, key);
-                                }
-                            }
-                            #[cfg(feature = "luks-decrypt")]
-                            if crypt_method == 2 {
-                                if let Some(key) = luks_key {
-                                    decrypt_cluster_aes_xts(
-                                        buf,
-                                        read_size,
-                                        host_offset + intra_offset,
-                                        key,
-                                        luks_sector_size,
-                                    );
-                                }
-                            }
-                            return true;
-                        }
-
-                        // Slow path: per-subcluster handling
+                        // Per-subcluster handling for mixed allocation
                         let sc_size = qcow2_cluster_size / 32;
                         let sc_start = intra_offset / sc_size;
                         let sc_count = read_size / sc_size;
