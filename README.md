@@ -375,6 +375,14 @@ make test-report
 # Run all tests including malicious images (explicit opt-in)
 make test-malicious
 
+# Run tests inside container (as CI does)
+make test-container
+
+# Run split test targets (used by CI for parallel execution)
+make test-container-core              # info, check, security, oslo-crossval
+make test-container-convert-qcow2    # QCOW2/VMDK/RAW convert + compare
+make test-container-convert-vhd      # VHD/VHDX convert (slowest)
+
 # Clean test artifacts
 make clean-tests
 ```

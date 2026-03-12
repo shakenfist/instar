@@ -226,10 +226,12 @@ jobs:
               echo "All config tests passed!"
             '
 
-  integration-tests:
+  # Core integration tests: info, check, security, version-detection, oslo-crossval
+  # These are fast (header-parsing only, no full image conversion)
+  integration-core:
     needs: build-and-test
     runs-on: [self-hosted, debian-12, xl]
-    timeout-minutes: 90
+    timeout-minutes: 45
 
     env:
       DOCKER_BUILDKIT: 1
@@ -262,10 +264,6 @@ jobs:
 
       - name: Resparsify test images
         run: |
-          # Git operations (clone or pull) fill sparse holes with zeros,
-          # affecting qemu-img disk_size output. Restore sparseness with
-          # cp --sparse=always. This is fast and idempotent on already-sparse
-          # files from the cache.
           cd ${TESTDATA_PATH}
           find downloaded/ -type f \( \
             -name "*.qcow2" -o \
@@ -301,15 +299,15 @@ jobs:
             exit ${build_exit_code}
           fi
 
-      - name: Run integration tests
+      - name: Run core integration tests
         run: |
           cd ${GITHUB_WORKSPACE}/imago
           set +e
-          make test-container TESTDATA_PATH=${TESTDATA_PATH} 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
+          make test-container-core TESTDATA_PATH=${TESTDATA_PATH} 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
           test_exit_code=${PIPESTATUS[0]}
           set -e
           if [ ${test_exit_code} -ne 0 ]; then
-            echo "Integration tests failed with exit code ${test_exit_code}"
+            echo "Core integration tests failed with exit code ${test_exit_code}"
             exit ${test_exit_code}
           fi
 
@@ -418,7 +416,195 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: integration-test-logs
+          name: integration-core-logs
+          path: |
+            ${{ github.workspace }}/build-log.txt
+            ${{ github.workspace }}/test-output.txt
+          retention-days: 7
+
+  # QCOW2/VMDK/RAW conversion and comparison tests
+  integration-convert-qcow2:
+    needs: build-and-test
+    runs-on: [self-hosted, debian-12, xl]
+    timeout-minutes: 60
+
+    env:
+      DOCKER_BUILDKIT: 1
+
+    steps:
+      - name: Checkout imago
+        uses: actions/checkout@v4
+        with:
+          path: imago
+          fetch-depth: 0
+
+      - name: Prepare imago-testdata
+        run: |
+          CACHED=/srv/ci/cached/imago-testdata
+          if [ -d "${CACHED}/.git" ]; then
+            echo "Using cached testdata, updating in place..."
+            cd "${CACHED}"
+            git remote set-url origin \
+              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git"
+            git fetch --depth 1 origin main
+            git reset --hard origin/main
+            echo "TESTDATA_PATH=${CACHED}" >> $GITHUB_ENV
+          else
+            echo "No cache found, cloning fresh..."
+            git clone --depth 1 \
+              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git" \
+              ${GITHUB_WORKSPACE}/imago-testdata
+            echo "TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata" >> $GITHUB_ENV
+          fi
+
+      - name: Resparsify test images
+        run: |
+          cd ${TESTDATA_PATH}
+          find downloaded/ -type f \( \
+            -name "*.qcow2" -o \
+            -name "*.vmdk" -o \
+            -name "*.vhd" -o \
+            -name "*.vhdx" -o \
+            -name "*.img" \
+          \) -print0 | while IFS= read -r -d '' file; do
+            cp --sparse=always "$file" "$file.sparse"
+            mv "$file.sparse" "$file"
+          done
+
+      - name: Install Docker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y docker.io
+          sudo systemctl start docker
+          sudo chmod 666 /var/run/docker.sock
+
+      - name: Remove previous devcontainers, if any
+        run: |
+          docker image rm -f imago-build 2>/dev/null || true
+
+      - name: Build imago
+        run: |
+          cd ${GITHUB_WORKSPACE}/imago
+          set +e
+          make imago 2>&1 | tee ${GITHUB_WORKSPACE}/build-log.txt
+          build_exit_code=${PIPESTATUS[0]}
+          set -e
+          if [ ${build_exit_code} -ne 0 ]; then
+            echo "Build failed with exit code ${build_exit_code}"
+            exit ${build_exit_code}
+          fi
+
+      - name: Run QCOW2/VMDK/RAW convert + compare tests
+        run: |
+          cd ${GITHUB_WORKSPACE}/imago
+          set +e
+          make test-container-convert-qcow2 TESTDATA_PATH=${TESTDATA_PATH} 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
+          test_exit_code=${PIPESTATUS[0]}
+          set -e
+          if [ ${test_exit_code} -ne 0 ]; then
+            echo "QCOW2/VMDK/RAW convert tests failed with exit code ${test_exit_code}"
+            exit ${test_exit_code}
+          fi
+
+      - name: Upload test artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-convert-qcow2-logs
+          path: |
+            ${{ github.workspace }}/build-log.txt
+            ${{ github.workspace }}/test-output.txt
+          retention-days: 7
+
+  # VHD/VHDX conversion tests (slowest format family)
+  integration-convert-vhd:
+    needs: build-and-test
+    runs-on: [self-hosted, debian-12, xl]
+    timeout-minutes: 90
+
+    env:
+      DOCKER_BUILDKIT: 1
+
+    steps:
+      - name: Checkout imago
+        uses: actions/checkout@v4
+        with:
+          path: imago
+          fetch-depth: 0
+
+      - name: Prepare imago-testdata
+        run: |
+          CACHED=/srv/ci/cached/imago-testdata
+          if [ -d "${CACHED}/.git" ]; then
+            echo "Using cached testdata, updating in place..."
+            cd "${CACHED}"
+            git remote set-url origin \
+              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git"
+            git fetch --depth 1 origin main
+            git reset --hard origin/main
+            echo "TESTDATA_PATH=${CACHED}" >> $GITHUB_ENV
+          else
+            echo "No cache found, cloning fresh..."
+            git clone --depth 1 \
+              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git" \
+              ${GITHUB_WORKSPACE}/imago-testdata
+            echo "TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata" >> $GITHUB_ENV
+          fi
+
+      - name: Resparsify test images
+        run: |
+          cd ${TESTDATA_PATH}
+          find downloaded/ -type f \( \
+            -name "*.qcow2" -o \
+            -name "*.vmdk" -o \
+            -name "*.vhd" -o \
+            -name "*.vhdx" -o \
+            -name "*.img" \
+          \) -print0 | while IFS= read -r -d '' file; do
+            cp --sparse=always "$file" "$file.sparse"
+            mv "$file.sparse" "$file"
+          done
+
+      - name: Install Docker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y docker.io
+          sudo systemctl start docker
+          sudo chmod 666 /var/run/docker.sock
+
+      - name: Remove previous devcontainers, if any
+        run: |
+          docker image rm -f imago-build 2>/dev/null || true
+
+      - name: Build imago
+        run: |
+          cd ${GITHUB_WORKSPACE}/imago
+          set +e
+          make imago 2>&1 | tee ${GITHUB_WORKSPACE}/build-log.txt
+          build_exit_code=${PIPESTATUS[0]}
+          set -e
+          if [ ${build_exit_code} -ne 0 ]; then
+            echo "Build failed with exit code ${build_exit_code}"
+            exit ${build_exit_code}
+          fi
+
+      - name: Run VHD/VHDX convert tests
+        run: |
+          cd ${GITHUB_WORKSPACE}/imago
+          set +e
+          make test-container-convert-vhd TESTDATA_PATH=${TESTDATA_PATH} 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
+          test_exit_code=${PIPESTATUS[0]}
+          set -e
+          if [ ${test_exit_code} -ne 0 ]; then
+            echo "VHD/VHDX convert tests failed with exit code ${test_exit_code}"
+            exit ${test_exit_code}
+          fi
+
+      - name: Upload test artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-convert-vhd-logs
           path: |
             ${{ github.workspace }}/build-log.txt
             ${{ github.workspace }}/test-output.txt
@@ -522,7 +708,7 @@ jobs:
   automated_reviewer:
     name: "Automated reviewer"
     runs-on: [self-hosted, claude-code]
-    needs: [check-bot-commit, build-and-test, integration-tests]
+    needs: [check-bot-commit, build-and-test, integration-core, integration-convert-qcow2, integration-convert-vhd]
     if: >-
       ${{ github.event_name == 'pull_request' &&
           needs.check-bot-commit.outputs.is_bot != 'true' }}
