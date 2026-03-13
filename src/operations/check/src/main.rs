@@ -1951,6 +1951,22 @@ unsafe fn check_qcow2(
                         l2_buffer[off + 7],
                     ]);
 
+                    // Read subcluster bitmap if extended L2
+                    let sc_bitmap = if hdr.extended_l2 {
+                        u64::from_be_bytes([
+                            l2_buffer[off + 8],
+                            l2_buffer[off + 9],
+                            l2_buffer[off + 10],
+                            l2_buffer[off + 11],
+                            l2_buffer[off + 12],
+                            l2_buffer[off + 13],
+                            l2_buffer[off + 14],
+                            l2_buffer[off + 15],
+                        ])
+                    } else {
+                        0
+                    };
+
                     result.clusters_checked += 1;
 
                     if l2e == 0 {
@@ -1958,6 +1974,16 @@ unsafe fn check_qcow2(
                     }
 
                     let compressed = (l2e & qcow2::OFLAG_COMPRESSED) != 0;
+
+                    // Validate: compressed entries must not have
+                    // a non-trivial subcluster bitmap
+                    if compressed && hdr.extended_l2 {
+                        let alloc_bits = sc_bitmap as u32;
+                        if alloc_bits != 0 && alloc_bits != 0xFFFF_FFFF {
+                            result.corruptions += 1;
+                            result.total_errors += 1;
+                        }
+                    }
 
                     if !compressed {
                         let data_off = l2e & qcow2::L2_OFFSET_MASK;

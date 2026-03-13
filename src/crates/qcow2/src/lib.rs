@@ -883,6 +883,10 @@ pub enum ClusterLookup {
     Unallocated,
     /// Standard cluster at given host byte offset
     Standard(u64),
+    /// Standard cluster with extended L2 subcluster bitmap.
+    /// (host_offset, subcluster_bitmap)
+    /// Bitmap bits 0-31 = allocation, bits 32-63 = zero.
+    StandardSubclusters(u64, u64),
     /// Compressed cluster: raw L2 entry for offset/size parsing
     Compressed(u64),
 }
@@ -1265,7 +1269,7 @@ impl Qcow2State {
             return None;
         }
 
-        // Read L2 entry (first 8 bytes of each entry, whether 8 or 16 bytes)
+        // Read L2 entry (first 8 bytes of each 8- or 16-byte entry)
         let l2_byte_offset = l2_table_offset.checked_add(l2_index.checked_mul(entry_size)?)?;
         let l2_entry = read_u64_be_cached(
             call_table,
@@ -1278,16 +1282,46 @@ impl Qcow2State {
             bytes_read,
         )?;
 
+        // For extended L2, read the subcluster bitmap (second 8 bytes)
+        let bitmap = if self.extended_l2 {
+            read_u64_be_cached(
+                call_table,
+                self.device_idx,
+                l2_byte_offset + 8,
+                sector_size,
+                input_capacity,
+                &mut self.l2_cached_sector,
+                self.l2_cache_buf,
+                bytes_read,
+            )
+            .unwrap_or(0)
+        } else {
+            0
+        };
+
         // Decode L2 entry
         if l2_entry == 0 {
-            Some(ClusterLookup::Unallocated)
+            if self.extended_l2 && (bitmap >> 32) != 0 {
+                // l2_entry is 0 but bitmap has zero bits set (zero-plain subclusters)
+                Some(ClusterLookup::StandardSubclusters(0, bitmap))
+            } else {
+                Some(ClusterLookup::Unallocated)
+            }
         } else if (l2_entry & OFLAG_COMPRESSED) != 0 {
             Some(ClusterLookup::Compressed(l2_entry))
         } else {
             let host_offset = l2_entry & L2_OFFSET_MASK;
-            if host_offset == 0 {
-                // Zero cluster (preallocated but zero-filled)
+            if host_offset == 0 && !self.extended_l2 {
                 Some(ClusterLookup::Unallocated)
+            } else if self.extended_l2 {
+                let alloc_bits = bitmap as u32;
+                let zero_bits = (bitmap >> 32) as u32;
+                if alloc_bits == 0xFFFF_FFFF && zero_bits == 0 {
+                    // All subclusters allocated, none zeroed — same as Standard
+                    Some(ClusterLookup::Standard(host_offset))
+                } else {
+                    Some(ClusterLookup::StandardSubclusters(host_offset, bitmap))
+                }
             } else {
                 Some(ClusterLookup::Standard(host_offset))
             }
@@ -2210,6 +2244,7 @@ pub unsafe fn decrypt_cluster_aes_xts(
 /// `luks_sector_size` is the LUKS sector size for XTS (typically 512).
 /// `call_table` must be valid.
 #[allow(unused_variables)]
+#[allow(clippy::only_used_in_recursion)]
 pub unsafe fn read_chain_virtual_cluster(
     call_table: &CallTable,
     chain_start: usize,
@@ -2251,6 +2286,111 @@ pub unsafe fn read_chain_virtual_cluster(
                 {
                     Some(ClusterLookup::Unallocated) => {
                         continue;
+                    }
+                    Some(ClusterLookup::StandardSubclusters(host_offset, bitmap)) => {
+                        let alloc_bits = bitmap as u32;
+                        let zero_bits = (bitmap >> 32) as u32;
+
+                        let intra_offset = virtual_offset % qcow2_cluster_size;
+                        let read_size = if chunk_size < qcow2_cluster_size {
+                            chunk_size
+                        } else {
+                            qcow2_cluster_size
+                        };
+
+                        // Per-subcluster handling for mixed allocation
+                        let sc_size = qcow2_cluster_size / 32;
+                        let sc_start = intra_offset / sc_size;
+                        let sc_count = read_size / sc_size;
+                        let read_dev = chain_config.devices[dev_idx].data_device_idx;
+                        let read_dev = if read_dev != 0 {
+                            read_dev
+                        } else {
+                            dev_idx as u32
+                        };
+
+                        // Read the entire cluster chunk from disk first.
+                        // We read the full chunk rather than per-subcluster
+                        // because subclusters (2KB) may be smaller than the
+                        // I/O sector size (up to 64KB), which would cause
+                        // read_cluster_sectors to overrun the buffer.
+                        if host_offset != 0 {
+                            let read_offset = host_offset + intra_offset;
+                            if !read_cluster_sectors(
+                                call_table,
+                                read_dev,
+                                read_offset,
+                                buf,
+                                read_size,
+                                sector_size,
+                                bytes_read,
+                            ) {
+                                return false;
+                            }
+                            #[cfg(feature = "aes-decrypt")]
+                            if crypt_method == 1 {
+                                if let Some(key) = aes_key {
+                                    decrypt_cluster_aes_cbc(buf, read_size, virtual_offset, key);
+                                }
+                            }
+                            #[cfg(feature = "luks-decrypt")]
+                            if crypt_method == 2 {
+                                if let Some(key) = luks_key {
+                                    decrypt_cluster_aes_xts(
+                                        buf,
+                                        read_size,
+                                        host_offset + intra_offset,
+                                        key,
+                                        luks_sector_size,
+                                    );
+                                }
+                            }
+                        }
+
+                        // Now selectively fill non-allocated subclusters:
+                        // - Zero subclusters: always zero
+                        // - Unallocated subclusters: fill from backing
+                        //   chain or zero at bottom of chain
+                        for i in 0..sc_count {
+                            let sc_idx = (sc_start + i) as u32;
+                            let is_zero = (zero_bits >> sc_idx) & 1 != 0;
+                            let is_alloc = (alloc_bits >> sc_idx) & 1 != 0;
+                            let buf_off = (i * sc_size) as usize;
+
+                            if is_zero || (!is_alloc && host_offset == 0) {
+                                core::ptr::write_bytes(buf.add(buf_off), 0, sc_size as usize);
+                            } else if !is_alloc {
+                                // Unallocated subcluster with a backing chain
+                                let remaining = chain_len - dev_offset - 1;
+                                if remaining > 0 {
+                                    if !read_chain_virtual_cluster(
+                                        call_table,
+                                        chain_start + dev_offset + 1,
+                                        remaining,
+                                        virtual_offset + i * sc_size,
+                                        buf.add(buf_off),
+                                        sc_size,
+                                        sector_size,
+                                        chain_config,
+                                        chain_states,
+                                        compressed_buf,
+                                        staging_buf,
+                                        staging_cluster_offset,
+                                        aes_key,
+                                        luks_key,
+                                        luks_sector_size,
+                                        bytes_read,
+                                    ) {
+                                        return false;
+                                    }
+                                } else {
+                                    // Bottom of chain: zero
+                                    core::ptr::write_bytes(buf.add(buf_off), 0, sc_size as usize);
+                                }
+                            }
+                            // Allocated subclusters: already read above
+                        }
+                        return true;
                     }
                     Some(ClusterLookup::Standard(host_offset)) => {
                         // For large clusters (> chunk_size), calculate
