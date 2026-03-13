@@ -978,6 +978,106 @@
             "description": "QCOW2 with cluster_bits=22 (above maximum valid value of 21)",
             "tags": ["qcow2", "adversarial", "boundary-value", "cluster-bits"],
             "generated_by": "scripts/create-overflow-testdata.sh"
+        },
+
+        {
+            "id": "qcow2-refcount-order-7",
+            "path": "custom/audit/qcow2-refcount-order-7.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "QCOW2 v3 with refcount_order=7 (above max 6, 128-bit refcounts)",
+            "tags": ["qcow2", "adversarial", "boundary-value", "refcount"],
+            "generated_by": "scripts/create-boundary-testdata.py"
+        },
+        {
+            "id": "qcow2-refcount-order-255",
+            "path": "custom/audit/qcow2-refcount-order-255.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "QCOW2 v3 with refcount_order=255 (extreme value)",
+            "tags": ["qcow2", "adversarial", "boundary-value", "refcount"],
+            "generated_by": "scripts/create-boundary-testdata.py"
+        },
+        {
+            "id": "qcow2-vsize-petabyte",
+            "path": "custom/audit/qcow2-vsize-petabyte.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "QCOW2 v3 with virtual_size=2^50 (1 petabyte)",
+            "tags": ["qcow2", "adversarial", "boundary-value", "virtual-size"],
+            "generated_by": "scripts/create-boundary-testdata.py"
+        },
+        {
+            "id": "qcow2-vsize-max",
+            "path": "custom/audit/qcow2-vsize-max.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "QCOW2 v3 with virtual_size=2^63-1 (maximum possible)",
+            "tags": ["qcow2", "adversarial", "boundary-value", "virtual-size"],
+            "generated_by": "scripts/create-boundary-testdata.py"
+        },
+        {
+            "id": "vmdk-grain-size-zero",
+            "path": "custom/audit/vmdk-grain-size-zero.vmdk",
+            "format": "vmdk",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "VMDK with grain_size_sectors=0 (division by zero trigger)",
+            "tags": ["vmdk", "adversarial", "boundary-value", "grain-size"],
+            "generated_by": "scripts/create-boundary-testdata.py"
+        },
+        {
+            "id": "vmdk-grain-size-huge",
+            "path": "custom/audit/vmdk-grain-size-huge.vmdk",
+            "format": "vmdk",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "VMDK with grain_size_sectors near u64::MAX (overflow trigger)",
+            "tags": ["vmdk", "adversarial", "boundary-value", "grain-size"],
+            "generated_by": "scripts/create-boundary-testdata.py"
+        },
+        {
+            "id": "vhdx-conflicting-headers",
+            "path": "custom/audit/vhdx-conflicting-headers.vhdx",
+            "format": "vhdx",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "VHDX with two valid headers having different sequence numbers",
+            "tags": ["vhdx", "adversarial", "boundary-value", "dual-header"],
+            "generated_by": "scripts/create-boundary-testdata.py"
+        },
+        {
+            "id": "vhd-bat-beyond-eof",
+            "path": "custom/audit/vhd-bat-beyond-eof.vhd",
+            "format": "vpc",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "VHD with BAT entry pointing to offset past end of file",
+            "tags": ["vhd", "adversarial", "boundary-value", "bat-beyond-eof"],
+            "generated_by": "scripts/create-boundary-testdata.py"
+        },
+        {
+            "id": "vhdx-bat-beyond-eof",
+            "path": "custom/audit/vhdx-bat-beyond-eof.vhdx",
+            "format": "vhdx",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "VHDX with BAT entry pointing to offset past end of file",
+            "tags": ["vhdx", "adversarial", "boundary-value", "bat-beyond-eof"],
+            "generated_by": "scripts/create-boundary-testdata.py"
         }
     ]
 }

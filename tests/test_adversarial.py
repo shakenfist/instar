@@ -297,3 +297,205 @@ class TestAdversarialIntegerOverflow(ImagoTestBase):
                 timeout=10
             )
             self.assertNotEqual(0, rc, 'cluster_bits=8 should be rejected')
+
+
+class TestAdversarialRefcountOrder(ImagoTestBase):
+    """Verify refcount_order edge cases are handled safely."""
+
+    def _get_adversarial_image(self, image_id):
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        return image
+
+    def test_info_refcount_order_7(self):
+        image = self._get_adversarial_image('qcow2-refcount-order-7')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'info', str(image.path)],
+            timeout=10
+        )
+
+    def test_check_refcount_order_7(self):
+        image = self._get_adversarial_image('qcow2-refcount-order-7')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'check', str(image.path)],
+            timeout=10
+        )
+
+    def test_info_refcount_order_255(self):
+        image = self._get_adversarial_image('qcow2-refcount-order-255')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'info', str(image.path)],
+            timeout=10
+        )
+
+    def test_check_refcount_order_255(self):
+        image = self._get_adversarial_image('qcow2-refcount-order-255')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'check', str(image.path)],
+            timeout=10
+        )
+
+
+class TestAdversarialOversizedVsize(ImagoTestBase):
+    """Verify oversized virtual size values are handled safely."""
+
+    def _get_adversarial_image(self, image_id):
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        return image
+
+    def test_info_vsize_petabyte(self):
+        """Info should report the petabyte size without crashing."""
+        image = self._get_adversarial_image('qcow2-vsize-petabyte')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'info', str(image.path)],
+            timeout=10
+        )
+
+    def test_check_vsize_petabyte(self):
+        image = self._get_adversarial_image('qcow2-vsize-petabyte')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'check', str(image.path)],
+            timeout=30
+        )
+
+    # NOTE: convert with petabyte vsize is intentionally not tested here.
+    # Imago iterates the full virtual address space during conversion,
+    # so a 1PB vsize would take unreasonably long. This is a known
+    # resource exhaustion vector via oversized virtual size — tracked
+    # as a potential future improvement (early termination when all
+    # L1 entries are unallocated).
+
+    def test_info_vsize_max(self):
+        image = self._get_adversarial_image('qcow2-vsize-max')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'info', str(image.path)],
+            timeout=10
+        )
+
+    def test_check_vsize_max(self):
+        image = self._get_adversarial_image('qcow2-vsize-max')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'check', str(image.path)],
+            timeout=30
+        )
+
+
+class TestAdversarialVmdkGrainSize(ImagoTestBase):
+    """Verify VMDK grain size boundary values are handled safely."""
+
+    def _get_adversarial_image(self, image_id):
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        return image
+
+    def test_info_grain_size_zero(self):
+        image = self._get_adversarial_image('vmdk-grain-size-zero')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'info', str(image.path)],
+            timeout=10
+        )
+
+    def test_check_grain_size_zero(self):
+        image = self._get_adversarial_image('vmdk-grain-size-zero')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'check', str(image.path)],
+            timeout=10
+        )
+
+    def test_info_grain_size_huge(self):
+        image = self._get_adversarial_image('vmdk-grain-size-huge')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'info', str(image.path)],
+            timeout=10
+        )
+
+    def test_check_grain_size_huge(self):
+        image = self._get_adversarial_image('vmdk-grain-size-huge')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'check', str(image.path)],
+            timeout=10
+        )
+
+
+class TestAdversarialVhdxConflictingHeaders(ImagoTestBase):
+    """Verify VHDX with conflicting dual headers is handled correctly."""
+
+    def _get_adversarial_image(self, image_id):
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        return image
+
+    def test_info_conflicting_headers(self):
+        image = self._get_adversarial_image('vhdx-conflicting-headers')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'info', str(image.path)],
+            timeout=10
+        )
+
+    def test_check_conflicting_headers(self):
+        image = self._get_adversarial_image('vhdx-conflicting-headers')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'check', str(image.path)],
+            timeout=10
+        )
+
+
+class TestAdversarialBatBeyondEof(ImagoTestBase):
+    """Verify BAT entries beyond EOF are handled safely."""
+
+    def _get_adversarial_image(self, image_id):
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        return image
+
+    def test_info_vhd_bat_beyond_eof(self):
+        image = self._get_adversarial_image('vhd-bat-beyond-eof')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'info', str(image.path)],
+            timeout=10
+        )
+
+    def test_check_vhd_bat_beyond_eof(self):
+        image = self._get_adversarial_image('vhd-bat-beyond-eof')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'check', str(image.path)],
+            timeout=10
+        )
+
+    def test_convert_vhd_bat_beyond_eof(self):
+        image = self._get_adversarial_image('vhd-bat-beyond-eof')
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            stdout, stderr, rc = self.run_adversarial(
+                [str(self.get_imago_binary()), 'convert',
+                 str(image.path), out.name],
+                timeout=10
+            )
+
+    def test_info_vhdx_bat_beyond_eof(self):
+        image = self._get_adversarial_image('vhdx-bat-beyond-eof')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'info', str(image.path)],
+            timeout=10
+        )
+
+    def test_check_vhdx_bat_beyond_eof(self):
+        image = self._get_adversarial_image('vhdx-bat-beyond-eof')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'check', str(image.path)],
+            timeout=10
+        )
+
+    def test_convert_vhdx_bat_beyond_eof(self):
+        image = self._get_adversarial_image('vhdx-bat-beyond-eof')
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            stdout, stderr, rc = self.run_adversarial(
+                [str(self.get_imago_binary()), 'convert',
+                 str(image.path), out.name],
+                timeout=10
+            )
