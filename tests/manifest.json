@@ -876,6 +876,40 @@
             "description": "QCOW2 v3 with zstd-compressed all-zero clusters (compression bomb)",
             "tags": ["qcow2", "adversarial", "compression-bomb", "zstd"],
             "generated_by": "scripts/create-compression-bomb-testdata.sh"
+        },
+
+        {
+            "id": "qcow2-circular-2",
+            "path": "custom/audit/qcow2-circular-a.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "QCOW2 in 2-level circular chain (A->B->A)",
+            "tags": ["qcow2", "adversarial", "circular-chain", "backing-file"],
+            "generated_by": "scripts/create-circular-chain-testdata.sh"
+        },
+        {
+            "id": "qcow2-circular-3",
+            "path": "custom/audit/qcow2-circular-3a.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "QCOW2 in 3-level circular chain (A->B->C->A)",
+            "tags": ["qcow2", "adversarial", "circular-chain", "backing-file"],
+            "generated_by": "scripts/create-circular-chain-testdata.sh"
+        },
+        {
+            "id": "qcow2-self-referencing",
+            "path": "custom/audit/qcow2-self-referencing.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "QCOW2 with backing file pointing to itself (A->A)",
+            "tags": ["qcow2", "adversarial", "circular-chain", "self-reference"],
+            "generated_by": "scripts/create-circular-chain-testdata.sh"
         }
     ]
 }
