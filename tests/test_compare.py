@@ -1,4 +1,4 @@
-"""Tests for compare operation (raw-vs-raw, QCOW2, backing chains).
+"""Tests for compare operation (raw-vs-raw, QCOW2, backing chains, LUKS).
 
 Note: VHD compare integration tests (VHD vs raw comparison) are in
 test_convert.py (TestConvertVhdCompare). VHDX compare integration
@@ -1118,5 +1118,73 @@ class TestCompareBackingChain(ImagoTestBase):
             # imago should fail gracefully (non-zero exit)
             stdout, stderr, rc = self.run_imago_compare(
                 Path(top.name), Path(base.name)
+            )
+            self.assertNotEqual(rc, 0)
+
+
+class TestCompareLuksQcow2(ImagoTestBase):
+    """Test compare with LUKS-encrypted QCOW2 images (crypt_method=2)."""
+
+    def test_compare_luks_qcow2_vs_raw(self):
+        """Compare LUKS-in-QCOW2 against its decrypted raw equivalent."""
+        image = self.get_image('qcow2-luks')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+            # First convert LUKS-QCOW2 to raw using imago
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, Path(raw_out.name),
+                luks_passphrase='test-passphrase'
+            )
+            self.assertEqual(
+                rc, 0,
+                f'LUKS-QCOW2 convert to raw failed: {stderr}'
+            )
+
+            # Now compare the original LUKS-QCOW2 directly against
+            # the decrypted raw, using --luks-passphrase
+            stdout, stderr, rc = self.run_imago_compare(
+                image.path, Path(raw_out.name),
+                luks_passphrase='test-passphrase'
+            )
+            self.assertEqual(
+                rc, 0,
+                f'LUKS-QCOW2 vs raw compare failed: {stderr}'
+            )
+            self.assertIn('identical', stdout.lower())
+
+    def test_compare_luks_qcow2_without_passphrase(self):
+        """Compare LUKS-in-QCOW2 without passphrase should fail."""
+        image = self.get_image('qcow2-luks')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+            # Create a small raw file for comparison target
+            with open(raw_out.name, 'wb') as f:
+                f.write(b'\x00' * 1048576)
+
+            # Compare without passphrase should fail
+            stdout, stderr, rc = self.run_imago_compare(
+                image.path, Path(raw_out.name)
+            )
+            self.assertNotEqual(rc, 0)
+
+    def test_compare_luks_qcow2_wrong_passphrase(self):
+        """Compare LUKS-in-QCOW2 with wrong passphrase should fail."""
+        image = self.get_image('qcow2-luks')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+            # Create a small raw file for comparison target
+            with open(raw_out.name, 'wb') as f:
+                f.write(b'\x00' * 1048576)
+
+            # Compare with wrong passphrase should fail
+            stdout, stderr, rc = self.run_imago_compare(
+                image.path, Path(raw_out.name),
+                luks_passphrase='wrong-passphrase'
             )
             self.assertNotEqual(rc, 0)

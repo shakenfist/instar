@@ -420,6 +420,7 @@ class ImagoTestBase(testtools.TestCase):
         output_format: Optional[str] = None,
         strict: bool = False,
         quiet: bool = False,
+        luks_passphrase: str = None,
     ) -> tuple:
         """
         Run imago compare on two images.
@@ -431,6 +432,7 @@ class ImagoTestBase(testtools.TestCase):
             output_format: Optional output format ('human' or 'json')
             strict: Enable strict mode (fail on size differences)
             quiet: Enable quiet mode
+            luks_passphrase: Passphrase for LUKS-encrypted images
 
         Returns:
             tuple: (stdout, stderr, return_code)
@@ -444,6 +446,8 @@ class ImagoTestBase(testtools.TestCase):
             cmd.append('--strict')
         if quiet:
             cmd.append('--quiet')
+        if luks_passphrase is not None:
+            cmd.extend(['--luks-passphrase', luks_passphrase])
         cmd.extend([str(image1_path), str(image2_path)])
 
         try:
