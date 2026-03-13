@@ -14,6 +14,7 @@
         install-hooks run-prototype guest-protocol \
         imago imago-devcontainer clean-imago run-imago check-binary-sizes \
         test-venv test test-rust test-integration test-ci test-malicious test-report clean-tests \
+        test-container test-container-core test-container-convert-qcow2 test-container-convert-vhd \
         clean-cargo-cache
 
 # Default target
@@ -60,7 +61,10 @@ help:
 	@echo "  test                 Run all tests (Rust unit + Python integration)"
 	@echo "  test-rust            Run Rust unit tests only"
 	@echo "  test-integration     Run Python integration tests only (on host)"
-	@echo "  test-container       Run tests inside container"
+	@echo "  test-container       Run all tests inside container"
+	@echo "  test-container-core  Run core tests (info, check, security) inside container"
+	@echo "  test-container-convert-qcow2  Run QCOW2/VMDK/RAW convert tests inside container"
+	@echo "  test-container-convert-vhd    Run VHD/VHDX convert tests inside container"
 	@echo "  test-ci              Run CI-suitable tests (safe + caution)"
 	@echo "  test-malicious       Run all tests including malicious images"
 	@echo "  test-report          Show test differences without failing"
@@ -420,6 +424,95 @@ test-container: imago-devcontainer imago
 			/build/test-venv/bin/stestr run \
 				--exclude-regex "test_info_malicious" \
 				--concurrency 4 \
+		'
+
+# Run core integration tests inside container (info, check, security, version, oslo-crossval)
+# Excludes convert and compare tests which are split into separate targets
+test-container-core: imago-devcontainer imago
+	@echo "Running core integration tests inside container..."
+	@if [ ! -d "$(TESTDATA_PATH)" ]; then \
+		echo "Error: Test data not found at $(TESTDATA_PATH)"; \
+		echo "Set IMAGO_TESTDATA_PATH or ensure imago-testdata is a sibling directory."; \
+		exit 1; \
+	fi
+	docker run --rm \
+		--device=/dev/kvm \
+		-u "$(shell id -u):$(shell id -g)" \
+		--group-add "$$(stat -c '%g' /dev/kvm)" \
+		-e HOME=/build \
+		-e IMAGO_TESTDATA_PATH=/testdata \
+		-v "$(CURDIR):/workspace" \
+		-v "$(TESTDATA_PATH):/testdata:ro" \
+		-w "/workspace" \
+		"$(IMAGO_IMAGE)" \
+		bash -c '\
+			echo "Setting up test environment..."; \
+			python3 -m venv /build/test-venv && \
+			/build/test-venv/bin/pip install -q -r tests/requirements.txt && \
+			echo "Running core tests (excluding convert, compare, malicious)..."; \
+			cd tests && \
+			/build/test-venv/bin/stestr run \
+				--exclude-regex "(test_convert\.|test_compare\.|test_info_malicious)" \
+				--concurrency 4 \
+		'
+
+# Run QCOW2/VMDK/RAW convert + compare tests inside container
+test-container-convert-qcow2: imago-devcontainer imago
+	@echo "Running QCOW2/VMDK/RAW convert + compare tests inside container..."
+	@if [ ! -d "$(TESTDATA_PATH)" ]; then \
+		echo "Error: Test data not found at $(TESTDATA_PATH)"; \
+		echo "Set IMAGO_TESTDATA_PATH or ensure imago-testdata is a sibling directory."; \
+		exit 1; \
+	fi
+	docker run --rm \
+		--device=/dev/kvm \
+		-u "$(shell id -u):$(shell id -g)" \
+		--group-add "$$(stat -c '%g' /dev/kvm)" \
+		-e HOME=/build \
+		-e IMAGO_TESTDATA_PATH=/testdata \
+		-v "$(CURDIR):/workspace" \
+		-v "$(TESTDATA_PATH):/testdata:ro" \
+		-w "/workspace" \
+		"$(IMAGO_IMAGE)" \
+		bash -c '\
+			echo "Setting up test environment..."; \
+			python3 -m venv /build/test-venv && \
+			/build/test-venv/bin/pip install -q -r tests/requirements.txt && \
+			echo "Running QCOW2/VMDK/RAW convert + compare tests..."; \
+			cd tests && \
+			/build/test-venv/bin/stestr run \
+				--exclude-regex "Vhd" \
+				--concurrency 4 \
+				"(test_convert\.|test_compare\.)" \
+		'
+
+# Run VHD/VHDX convert tests inside container
+test-container-convert-vhd: imago-devcontainer imago
+	@echo "Running VHD/VHDX convert tests inside container..."
+	@if [ ! -d "$(TESTDATA_PATH)" ]; then \
+		echo "Error: Test data not found at $(TESTDATA_PATH)"; \
+		echo "Set IMAGO_TESTDATA_PATH or ensure imago-testdata is a sibling directory."; \
+		exit 1; \
+	fi
+	docker run --rm \
+		--device=/dev/kvm \
+		-u "$(shell id -u):$(shell id -g)" \
+		--group-add "$$(stat -c '%g' /dev/kvm)" \
+		-e HOME=/build \
+		-e IMAGO_TESTDATA_PATH=/testdata \
+		-v "$(CURDIR):/workspace" \
+		-v "$(TESTDATA_PATH):/testdata:ro" \
+		-w "/workspace" \
+		"$(IMAGO_IMAGE)" \
+		bash -c '\
+			echo "Setting up test environment..."; \
+			python3 -m venv /build/test-venv && \
+			/build/test-venv/bin/pip install -q -r tests/requirements.txt && \
+			echo "Running VHD/VHDX convert tests..."; \
+			cd tests && \
+			/build/test-venv/bin/stestr run \
+				--concurrency 4 \
+				"test_convert\.TestConvert.*Vhd" \
 		'
 
 # Run CI-suitable tests (safe + caution)
