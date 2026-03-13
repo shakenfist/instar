@@ -117,6 +117,8 @@ impl KvmStatsChecker {
         // Check if the capability is available using raw ioctl.
         // KVM_CAP_BINARY_STATS_FD (203) is not yet exposed in kvm-ioctls,
         // so we use a direct ioctl call.
+        // SAFETY: kvm FD is valid from Kvm::new(). KVM_CHECK_EXTENSION
+        // is a read-only capability query with no side effects.
         let ret = unsafe {
             libc::ioctl(
                 kvm.as_raw_fd(),

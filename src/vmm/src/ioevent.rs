@@ -103,6 +103,7 @@ impl IoEvent {
             ..Default::default()
         };
 
+        // SAFETY: ioeventfd struct fully initialized, vm FD is valid.
         let ret = unsafe { libc::ioctl(vm.as_raw_fd(), KVM_IOEVENTFD, &ioeventfd) };
 
         if ret < 0 {
@@ -191,6 +192,8 @@ impl IoEventWithMatch {
             ..Default::default()
         };
 
+        // SAFETY: ioeventfd struct fully initialized with datamatch,
+        // vm FD is valid. Error checked below.
         let ret = unsafe { libc::ioctl(vm.as_raw_fd(), KVM_IOEVENTFD, &ioeventfd) };
 
         if ret < 0 {
@@ -218,6 +221,7 @@ impl IoEventWithMatch {
             ..Default::default()
         };
 
+        // SAFETY: ioeventfd struct fully initialized, vm FD is valid.
         let ret = unsafe { libc::ioctl(vm.as_raw_fd(), KVM_IOEVENTFD, &ioeventfd) };
 
         if ret < 0 {
