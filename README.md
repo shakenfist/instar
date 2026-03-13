@@ -400,8 +400,10 @@ against `qemu-img compare`, and cross-validate `imago convert` output against
 verify that imago's format detection, safety checks, and virtual size
 reporting agree with OpenStack's image safety gate. Adversarial image tests
 verify safe handling of compression bombs, circular/deep backing chains,
-integer overflow headers, and boundary value edge cases (refcount order,
-oversized virtual sizes, VMDK grain sizes, VHDX dual headers, BAT beyond EOF). Test images are in the sibling `imago-testdata/`
+integer overflow headers, boundary value edge cases (refcount order,
+oversized virtual sizes, VMDK grain sizes, VHDX dual headers, BAT beyond EOF),
+and format confusion attacks (polyglot files, truncated headers, VMDK
+descriptor attacks). Test images are in the sibling `imago-testdata/`
 repository.
 
 **Running:**
