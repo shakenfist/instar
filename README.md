@@ -71,6 +71,9 @@ imago compare -s image1.raw image2.raw
 
 # JSON output for programmatic consumption
 imago compare --output json image1.raw image2.raw
+
+# Compare LUKS-encrypted QCOW2 against decrypted raw
+imago compare --luks-passphrase secret encrypted.qcow2 decrypted.raw
 ```
 
 Exit codes: 0 = identical, 1 = content differs.
@@ -79,10 +82,12 @@ The compare operation reads the virtual content of both images and reports the
 first byte offset where content diverges. For QCOW2 and VMDK images, this
 includes cluster/grain/block table lookup and compressed cluster decompression
 (zlib, ZSTD, and DEFLATE), so comparisons work across formats (e.g., QCOW2
-vs raw, VMDK vs raw, VHD vs raw, compressed QCOW2 vs uncompressed QCOW2). Backing
-chains are automatically discovered and flattened: unallocated clusters/grains
-are resolved by walking the backing chain, so overlay images compare correctly
-against their flattened equivalents.
+vs raw, VMDK vs raw, VHD vs raw, compressed QCOW2 vs uncompressed QCOW2).
+LUKS-encrypted QCOW2 images (crypt_method=2) can be compared at the
+plaintext level using `--luks-passphrase`. Backing chains are automatically
+discovered and flattened: unallocated clusters/grains are resolved by walking
+the backing chain, so overlay images compare correctly against their flattened
+equivalents.
 When images differ in size, non-strict mode (default) treats extra zero-filled
 regions as matching, while strict mode (`-s`) fails immediately on any size
 difference.
@@ -257,7 +262,7 @@ Working prototypes exploring the KVM-based sandboxing approach:
 | [virtio-block3](prototypes/virtio-block3/) | Adds configurable sector sizes |
 | [virtio-block4](prototypes/virtio-block4/) | Adds performance statistics tracking |
 | [virtio-block5](prototypes/virtio-block5/) | Adds ioeventfd optimization |
-| [virtio-block6](prototypes/virtio-block6/) | Adds sparse/dynamic output file support, adopt recommended sector sizes and progress reporting intervals based on previous testing |
+| [virtio-block6](prototypes/virtio-block6/) | Sparse/dynamic output, recommended sector sizes, progress reporting |
 | [pluggable](prototypes/pluggable/) | Modular architecture separating core infrastructure from pluggable operations |
 | [pluggable2](prototypes/pluggable2/) | Separate binary loading for operations (reduced attack surface) |
 | [info](prototypes/info/) | Image format detection (qemu-img info equivalent) |

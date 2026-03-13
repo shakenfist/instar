@@ -2141,6 +2141,14 @@ struct CompareArgs {
     /// Read QCOW2 AES decryption password from file
     #[arg(long, value_name = "PATH", conflicts_with = "qcow2_password")]
     qcow2_password_file: Option<String>,
+
+    /// LUKS passphrase for QCOW2 crypt_method=2 decryption
+    #[arg(long, value_name = "PASSPHRASE")]
+    luks_passphrase: Option<String>,
+
+    /// Read LUKS passphrase from file (for QCOW2 crypt_method=2)
+    #[arg(long, value_name = "PATH", conflicts_with = "luks_passphrase")]
+    luks_passphrase_file: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -3815,10 +3823,24 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         None
     };
 
-    if let Some(ref passphrase) = qcow2_passphrase {
+    // Resolve LUKS passphrase (--luks-passphrase or --luks-passphrase-file)
+    let luks_passphrase = if let Some(ref pp) = args.luks_passphrase {
+        Some(pp.clone())
+    } else if let Some(ref path) = args.luks_passphrase_file {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read LUKS passphrase file '{}': {}", path, e))?;
+        Some(content.trim_end_matches('\n').to_string())
+    } else {
+        None
+    };
+
+    // Use LUKS passphrase if no QCOW2 passphrase was provided
+    let effective_passphrase = qcow2_passphrase.or(luks_passphrase);
+
+    if let Some(ref passphrase) = effective_passphrase {
         let pass_bytes = passphrase.as_bytes();
         if pass_bytes.len() > 256 {
-            return Err("QCOW2 passphrase too long (max 256 bytes)".into());
+            return Err("passphrase too long (max 256 bytes)".into());
         }
         guest_mem.write_obj(
             pass_bytes.len() as u32,
@@ -3827,7 +3849,7 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         // _pad at offset 20 is zero-initialized
         guest_mem.write_slice(pass_bytes, GuestAddress(OPERATION_CONFIG_ADDR + 24))?;
         debug!(
-            "Wrote QCOW2 passphrase ({} bytes) to compare config",
+            "Wrote passphrase ({} bytes) to compare config",
             pass_bytes.len()
         );
     }
