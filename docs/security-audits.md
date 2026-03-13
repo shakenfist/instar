@@ -133,7 +133,7 @@ reviewed. Key findings:
 | Tool | Status | Result |
 |------|--------|--------|
 | cargo clippy (-D warnings) | Pass | 0 warnings on VMM + library crates |
-| cargo audit | Pending | Not yet installed in lint container |
+| cargo audit | Pass | 0 vulnerabilities in 136 dependencies |
 | rustfmt | Pass | All code formatted |
 | check-binary-sizes.sh | Pass | All guest binaries within memory layout |
 | shellcheck | Pass | All scripts clean |
