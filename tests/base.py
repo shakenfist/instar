@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import resource
 import subprocess
 from pathlib import Path
 from typing import Optional, Tuple
@@ -612,6 +613,51 @@ class ImagoTestBase(testtools.TestCase):
             return result.stdout, result.stderr, result.returncode
         except subprocess.TimeoutExpired:
             return '', 'Timeout after {}s'.format(timeout), -1
+
+    def run_adversarial(
+        self,
+        cmd: list,
+        timeout: int = 30,
+        max_memory_mb: int = 512
+    ) -> tuple:
+        """Run a command against an adversarial image with safety checks.
+
+        Asserts that the process completes within the timeout (no hang)
+        and exits normally without being killed by a signal (no crash).
+
+        Args:
+            cmd: Command and arguments to run
+            timeout: Maximum seconds before declaring a hang
+            max_memory_mb: Memory limit in MB (applied via RLIMIT_AS)
+
+        Returns:
+            tuple: (stdout, stderr, return_code)
+        """
+        def set_limits():
+            mem = max_memory_mb * 1024 * 1024
+            resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                preexec_fn=set_limits
+            )
+        except subprocess.TimeoutExpired:
+            self.fail(
+                f'Process hung (>{timeout}s): {" ".join(cmd)}'
+            )
+
+        if result.returncode < 0:
+            sig = -result.returncode
+            self.fail(
+                f'Process crashed with signal {sig}: '
+                f'{result.stderr}'
+            )
+
+        return (result.stdout, result.stderr, result.returncode)
 
     def load_expected_override(self, override_path: str) -> Optional[str]:
         """
