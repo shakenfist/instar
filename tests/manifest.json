@@ -910,6 +910,29 @@
             "description": "QCOW2 with backing file pointing to itself (A->A)",
             "tags": ["qcow2", "adversarial", "circular-chain", "self-reference"],
             "generated_by": "scripts/create-circular-chain-testdata.sh"
+        },
+
+        {
+            "id": "qcow2-chain-depth-16",
+            "path": "custom/audit/qcow2-chain-depth-16-overlay-15.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "QCOW2 at top of 16-level backing chain (at max depth, should succeed)",
+            "tags": ["qcow2", "adversarial", "deep-chain", "depth-limit"],
+            "generated_by": "scripts/create-deep-chain-testdata.sh"
+        },
+        {
+            "id": "qcow2-chain-depth-17",
+            "path": "custom/audit/qcow2-chain-depth-17-overlay-16.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "QCOW2 at top of 17-level backing chain (exceeds max depth, should be rejected)",
+            "tags": ["qcow2", "adversarial", "deep-chain", "depth-limit"],
+            "generated_by": "scripts/create-deep-chain-testdata.sh"
         }
     ]
 }

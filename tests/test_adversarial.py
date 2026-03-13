@@ -170,7 +170,11 @@ class TestAdversarialDeepChain(ImagoTestBase):
         return image
 
     def test_convert_chain_depth_16(self):
-        """Chain at exactly 16 levels should succeed."""
+        """Chain at 16 levels exceeds device limit for convert.
+
+        Convert needs an output device, so 16 input + 1 output = 17
+        exceeds the 16-device maximum. This should be rejected cleanly.
+        """
         image = self._get_adversarial_image('qcow2-chain-depth-16')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
             stdout, stderr, rc = self.run_adversarial(
@@ -178,9 +182,9 @@ class TestAdversarialDeepChain(ImagoTestBase):
                  str(image.path), out.name],
                 timeout=30
             )
-            self.assertEqual(
+            self.assertNotEqual(
                 0, rc,
-                f'Chain depth 16 should succeed: {stderr}'
+                'Chain depth 16 convert should be rejected (needs output device)'
             )
 
     def test_convert_chain_depth_17(self):
