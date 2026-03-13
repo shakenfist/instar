@@ -372,6 +372,9 @@ by scripts in `scripts/`:
 - `create-boundary-testdata.py` — Boundary value tests: refcount order edges,
   oversized virtual sizes, VMDK grain sizes, VHDX conflicting headers,
   VHD/VHDX BAT beyond EOF
+- `create-format-confusion-testdata.py` — Format confusion tests: polyglot
+  files (QCOW2+VMDK, QCOW2+ELF), truncated headers (QCOW2, VMDK, VHD),
+  VMDK descriptor attacks (null bytes, multi-extent, huge size)
 
 Generated images live in `../imago-testdata/custom/format-coverage/`
 and `../imago-testdata/custom/audit/` (adversarial images).
