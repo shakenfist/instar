@@ -3624,7 +3624,18 @@ unsafe fn convert_to_vhdx(
     let physical_sector_size: u32 = 4096;
 
     let (total_bat_entries, chunk_ratio, total_payload_blocks) =
-        vhdx::calculate_bat_layout(virtual_size, block_size as u32, logical_sector_size);
+        match vhdx::calculate_bat_layout(virtual_size, block_size as u32, logical_sector_size) {
+            Some(v) => v,
+            None => {
+                (call_table.send_error)(
+                    b"convert\0".as_ptr(),
+                    b"VHDX BAT layout overflow\0".as_ptr(),
+                    0,
+                    1,
+                );
+                return 1;
+            }
+        };
 
     // Layout offsets (all 1MB-aligned per VHDX spec)
     let file_id_offset: u64 = 0; // 64KB
