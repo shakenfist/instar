@@ -207,6 +207,8 @@ static mut ACTIVE_MMIO_BASE: u64 = DEFAULT_MMIO_BASE;
 /// Set the MMIO base address based on guest memory size.
 /// Must be called before any device creation.
 fn set_mmio_base_for_mem_size(guest_mem_size: u64) {
+    // SAFETY: Called once from main() before any device creation or
+    // guest execution. No concurrent access is possible at this point.
     unsafe {
         ACTIVE_MMIO_BASE = if guest_mem_size <= DEFAULT_MMIO_BASE {
             DEFAULT_MMIO_BASE
@@ -222,6 +224,9 @@ fn set_mmio_base_for_mem_size(guest_mem_size: u64) {
 /// For operations with output, output device uses index after all inputs.
 #[inline]
 fn device_mmio_base(device_index: usize) -> u64 {
+    // SAFETY: ACTIVE_MMIO_BASE is initialized by set_mmio_base_for_mem_size()
+    // before any call to this function. After initialization, the value is
+    // never modified, so concurrent reads are safe.
     unsafe { ACTIVE_MMIO_BASE + (device_index as u64 * MMIO_SIZE) }
 }
 
@@ -1402,6 +1407,10 @@ fn execute_info_operation(
         userspace_addr: host_addr,
         flags: 0,
     };
+    // SAFETY: mem_region.userspace_addr points to a valid GuestMemoryMmap
+    // allocation that outlives the VM. The slot/guest_phys_addr are unique
+    // per operation entry point. KVM requires this call to be unsafe but
+    // the memory contract is satisfied.
     unsafe {
         vm.set_user_memory_region(mem_region)?;
     }
@@ -2414,6 +2423,10 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
         userspace_addr: host_addr,
         flags: 0,
     };
+    // SAFETY: mem_region.userspace_addr points to a valid GuestMemoryMmap
+    // allocation that outlives the VM. The slot/guest_phys_addr are unique
+    // per operation entry point. KVM requires this call to be unsafe but
+    // the memory contract is satisfied.
     unsafe {
         vm.set_user_memory_region(mem_region)?;
     }
@@ -2423,6 +2436,8 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     set_mmio_base_for_mem_size(guest_mem_size);
 
     // Write MMIO base to VMM_PARAMS_ADDR so the guest can discover it
+    // SAFETY: ACTIVE_MMIO_BASE was initialized before VM setup and is
+    // never modified after initialization. Read-only access is safe.
     let mmio_base = unsafe { ACTIVE_MMIO_BASE };
     guest_mem.write_obj(mmio_base, GuestAddress(VMM_PARAMS_ADDR))?;
     debug!("Wrote MMIO base 0x{:x} to VMM_PARAMS_ADDR", mmio_base);
@@ -2843,6 +2858,10 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
         userspace_addr: host_addr,
         flags: 0,
     };
+    // SAFETY: mem_region.userspace_addr points to a valid GuestMemoryMmap
+    // allocation that outlives the VM. The slot/guest_phys_addr are unique
+    // per operation entry point. KVM requires this call to be unsafe but
+    // the memory contract is satisfied.
     unsafe {
         vm.set_user_memory_region(mem_region)?;
     }
@@ -3228,6 +3247,10 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
         userspace_addr: host_addr,
         flags: 0,
     };
+    // SAFETY: mem_region.userspace_addr points to a valid GuestMemoryMmap
+    // allocation that outlives the VM. The slot/guest_phys_addr are unique
+    // per operation entry point. KVM requires this call to be unsafe but
+    // the memory contract is satisfied.
     unsafe {
         vm.set_user_memory_region(mem_region)?;
     }
@@ -3758,6 +3781,10 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         userspace_addr: host_addr,
         flags: 0,
     };
+    // SAFETY: mem_region.userspace_addr points to a valid GuestMemoryMmap
+    // allocation that outlives the VM. The slot/guest_phys_addr are unique
+    // per operation entry point. KVM requires this call to be unsafe but
+    // the memory contract is satisfied.
     unsafe {
         vm.set_user_memory_region(mem_region)?;
     }
@@ -4327,6 +4354,10 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         userspace_addr: host_addr,
         flags: 0,
     };
+    // SAFETY: mem_region.userspace_addr points to a valid GuestMemoryMmap
+    // allocation that outlives the VM. The slot/guest_phys_addr are unique
+    // per operation entry point. KVM requires this call to be unsafe but
+    // the memory contract is satisfied.
     unsafe {
         vm.set_user_memory_region(mem_region)?;
     }
@@ -4811,6 +4842,8 @@ fn setup_page_tables(
 
     // Coverage must include both guest memory AND the MMIO region.
     // MMIO is placed above guest memory when guest_mem_size > DEFAULT_MMIO_BASE.
+    // SAFETY: ACTIVE_MMIO_BASE was initialized before VM setup and is
+    // never modified after initialization. Read-only access is safe.
     let mmio_base = unsafe { ACTIVE_MMIO_BASE };
     let mmio_end = mmio_base + MMIO_SIZE * MAX_CHAIN_DEPTH as u64;
     let coverage = guest_mem_size.max(mmio_end);
