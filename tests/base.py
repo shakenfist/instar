@@ -190,6 +190,13 @@ class ImagoTestBase(testtools.TestCase):
             self.fail(f'Unknown image id: {image_id}')
         return self._images_by_id[image_id]
 
+    def get_adversarial_image(self, image_id: str) -> TestImage:
+        """Get an adversarial test image, skipping if not found on disk."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        return image
+
     def verify_image_hash(self, image: TestImage) -> Tuple[bool, Optional[str]]:
         """
         Verify the SHA256 hash of a test image matches the manifest.
