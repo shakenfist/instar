@@ -1575,6 +1575,10 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
 
         vsize, _ = self._get_qcow2_info(image.path)
         timeout = self._timeout_for_vsize(vsize)
+        # Compressed output is significantly slower due to
+        # zlib compression of every cluster.
+        if self._compress:
+            timeout *= 3
 
         with tempfile.NamedTemporaryFile(
                     suffix='.qcow2') as reenc, \
