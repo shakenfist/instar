@@ -20,7 +20,7 @@ class TestAdversarialCompressionBomb(ImagoTestBase):
 
     def test_info_compression_bomb_zlib(self):
         image = self.get_adversarial_image('qcow2-compression-bomb-zlib')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
             timeout=10
         )
@@ -29,7 +29,7 @@ class TestAdversarialCompressionBomb(ImagoTestBase):
 
     def test_check_compression_bomb_zlib(self):
         image = self.get_adversarial_image('qcow2-compression-bomb-zlib')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'check', str(image.path)],
             timeout=30
         )
@@ -37,7 +37,7 @@ class TestAdversarialCompressionBomb(ImagoTestBase):
     def test_convert_compression_bomb_zlib(self):
         image = self.get_adversarial_image('qcow2-compression-bomb-zlib')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
-            stdout, stderr, rc = self.run_adversarial(
+            self.run_adversarial(
                 [str(self.get_imago_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=30
@@ -51,14 +51,14 @@ class TestAdversarialCompressionBomb(ImagoTestBase):
 
     def test_info_compression_bomb_zstd(self):
         image = self.get_adversarial_image('qcow2-compression-bomb-zstd')
-        stdout, stderr, rc = self.run_adversarial(
+        _ = self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_compression_bomb_zstd(self):
         image = self.get_adversarial_image('qcow2-compression-bomb-zstd')
-        stdout, stderr, rc = self.run_adversarial(
+        _ = self.run_adversarial(
             [str(self.get_imago_binary()), 'check', str(image.path)],
             timeout=30
         )
@@ -66,7 +66,7 @@ class TestAdversarialCompressionBomb(ImagoTestBase):
     def test_convert_compression_bomb_zstd(self):
         image = self.get_adversarial_image('qcow2-compression-bomb-zstd')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
-            stdout, stderr, rc = self.run_adversarial(
+            _ = self.run_adversarial(
                 [str(self.get_imago_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=30
@@ -84,7 +84,7 @@ class TestAdversarialCircularChain(ImagoTestBase):
 
     def test_info_circular_2(self):
         image = self.get_adversarial_image('qcow2-circular-2')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
             timeout=10
         )
@@ -92,7 +92,7 @@ class TestAdversarialCircularChain(ImagoTestBase):
 
     def test_check_chain_circular_2(self):
         image = self.get_adversarial_image('qcow2-circular-2')
-        stdout, stderr, rc = self.run_adversarial(
+        _stdout, _stderr, rc = self.run_adversarial(
             [str(self.get_imago_binary()), 'check', '--chain',
              str(image.path)],
             timeout=10
@@ -103,7 +103,7 @@ class TestAdversarialCircularChain(ImagoTestBase):
     def test_convert_circular_2(self):
         image = self.get_adversarial_image('qcow2-circular-2')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
-            stdout, stderr, rc = self.run_adversarial(
+            _stdout, _stderr, rc = self.run_adversarial(
                 [str(self.get_imago_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
@@ -112,7 +112,7 @@ class TestAdversarialCircularChain(ImagoTestBase):
 
     def test_check_chain_circular_3(self):
         image = self.get_adversarial_image('qcow2-circular-3')
-        stdout, stderr, rc = self.run_adversarial(
+        _stdout, _stderr, rc = self.run_adversarial(
             [str(self.get_imago_binary()), 'check', '--chain',
              str(image.path)],
             timeout=10
@@ -122,7 +122,7 @@ class TestAdversarialCircularChain(ImagoTestBase):
     def test_convert_circular_3(self):
         image = self.get_adversarial_image('qcow2-circular-3')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
-            stdout, stderr, rc = self.run_adversarial(
+            _stdout, _stderr, rc = self.run_adversarial(
                 [str(self.get_imago_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
@@ -141,7 +141,7 @@ class TestAdversarialCircularChain(ImagoTestBase):
     def test_convert_self_referencing(self):
         image = self.get_adversarial_image('qcow2-self-referencing')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
-            stdout, stderr, rc = self.run_adversarial(
+            _stdout, _stderr, rc = self.run_adversarial(
                 [str(self.get_imago_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
@@ -199,7 +199,7 @@ class TestAdversarialDeepChain(ImagoTestBase):
 
     def test_check_chain_depth_17(self):
         image = self.get_adversarial_image('qcow2-chain-depth-17')
-        stdout, stderr, rc = self.run_adversarial(
+        _stdout, _stderr, rc = self.run_adversarial(
             [str(self.get_imago_binary()), 'check', '--chain',
              str(image.path)],
             timeout=10
@@ -216,28 +216,28 @@ class TestAdversarialIntegerOverflow(ImagoTestBase):
 
     def test_info_l1_overflow(self):
         image = self.get_adversarial_image('qcow2-l1-overflow')
-        stdout, stderr, rc = self.run_adversarial(
+        _, _, _ = self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_l1_overflow(self):
         image = self.get_adversarial_image('qcow2-l1-overflow')
-        stdout, stderr, rc = self.run_adversarial(
+        _, _, _ = self.run_adversarial(
             [str(self.get_imago_binary()), 'check', str(image.path)],
             timeout=10
         )
 
     def test_info_l1_zero(self):
         image = self.get_adversarial_image('qcow2-l1-zero')
-        stdout, stderr, rc = self.run_adversarial(
+        _, _, _ = self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_l1_zero(self):
         image = self.get_adversarial_image('qcow2-l1-zero')
-        stdout, stderr, rc = self.run_adversarial(
+        _, _, _ = self.run_adversarial(
             [str(self.get_imago_binary()), 'check', str(image.path)],
             timeout=10
         )
@@ -245,7 +245,7 @@ class TestAdversarialIntegerOverflow(ImagoTestBase):
     def test_info_cluster_bits_low(self):
         """Info reports header fields — no crash expected for cluster_bits=8."""
         image = self.get_adversarial_image('qcow2-cluster-bits-low')
-        stdout, stderr, rc = self.run_adversarial(
+        _, _, _ = self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
             timeout=10
         )
@@ -253,7 +253,7 @@ class TestAdversarialIntegerOverflow(ImagoTestBase):
     def test_info_cluster_bits_high(self):
         """Info reports header fields — no crash expected for cluster_bits=22."""
         image = self.get_adversarial_image('qcow2-cluster-bits-high')
-        stdout, stderr, rc = self.run_adversarial(
+        _, _, _ = self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
             timeout=10
         )
@@ -261,7 +261,7 @@ class TestAdversarialIntegerOverflow(ImagoTestBase):
     def test_convert_l1_overflow(self):
         image = self.get_adversarial_image('qcow2-l1-overflow')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
-            stdout, stderr, rc = self.run_adversarial(
+            _, _, _ = self.run_adversarial(
                 [str(self.get_imago_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
@@ -270,7 +270,7 @@ class TestAdversarialIntegerOverflow(ImagoTestBase):
     def test_convert_cluster_bits_low(self):
         image = self.get_adversarial_image('qcow2-cluster-bits-low')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
-            stdout, stderr, rc = self.run_adversarial(
+            _, _, rc = self.run_adversarial(
                 [str(self.get_imago_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
@@ -284,28 +284,28 @@ class TestAdversarialRefcountOrder(ImagoTestBase):
 
     def test_info_refcount_order_7(self):
         image = self.get_adversarial_image('qcow2-refcount-order-7')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_refcount_order_7(self):
         image = self.get_adversarial_image('qcow2-refcount-order-7')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'check', str(image.path)],
             timeout=10
         )
 
     def test_info_refcount_order_255(self):
         image = self.get_adversarial_image('qcow2-refcount-order-255')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_refcount_order_255(self):
         image = self.get_adversarial_image('qcow2-refcount-order-255')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'check', str(image.path)],
             timeout=10
         )
@@ -318,14 +318,14 @@ class TestAdversarialOversizedVsize(ImagoTestBase):
     def test_info_vsize_petabyte(self):
         """Info should report the petabyte size without crashing."""
         image = self.get_adversarial_image('qcow2-vsize-petabyte')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_vsize_petabyte(self):
         image = self.get_adversarial_image('qcow2-vsize-petabyte')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'check', str(image.path)],
             timeout=30
         )
@@ -339,14 +339,14 @@ class TestAdversarialOversizedVsize(ImagoTestBase):
 
     def test_info_vsize_max(self):
         image = self.get_adversarial_image('qcow2-vsize-max')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_vsize_max(self):
         image = self.get_adversarial_image('qcow2-vsize-max')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'check', str(image.path)],
             timeout=30
         )
@@ -358,28 +358,28 @@ class TestAdversarialVmdkGrainSize(ImagoTestBase):
 
     def test_info_grain_size_zero(self):
         image = self.get_adversarial_image('vmdk-grain-size-zero')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_grain_size_zero(self):
         image = self.get_adversarial_image('vmdk-grain-size-zero')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'check', str(image.path)],
             timeout=10
         )
 
     def test_info_grain_size_huge(self):
         image = self.get_adversarial_image('vmdk-grain-size-huge')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_grain_size_huge(self):
         image = self.get_adversarial_image('vmdk-grain-size-huge')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'check', str(image.path)],
             timeout=10
         )
@@ -391,14 +391,14 @@ class TestAdversarialVhdxConflictingHeaders(ImagoTestBase):
 
     def test_info_conflicting_headers(self):
         image = self.get_adversarial_image('vhdx-conflicting-headers')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_conflicting_headers(self):
         image = self.get_adversarial_image('vhdx-conflicting-headers')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'check', str(image.path)],
             timeout=10
         )
@@ -410,14 +410,14 @@ class TestAdversarialBatBeyondEof(ImagoTestBase):
 
     def test_info_vhd_bat_beyond_eof(self):
         image = self.get_adversarial_image('vhd-bat-beyond-eof')
-        stdout, stderr, rc = self.run_adversarial(
+        _ = self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_vhd_bat_beyond_eof(self):
         image = self.get_adversarial_image('vhd-bat-beyond-eof')
-        stdout, stderr, rc = self.run_adversarial(
+        _ = self.run_adversarial(
             [str(self.get_imago_binary()), 'check', str(image.path)],
             timeout=10
         )
@@ -425,7 +425,7 @@ class TestAdversarialBatBeyondEof(ImagoTestBase):
     def test_convert_vhd_bat_beyond_eof(self):
         image = self.get_adversarial_image('vhd-bat-beyond-eof')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
-            stdout, stderr, rc = self.run_adversarial(
+            self.run_adversarial(
                 [str(self.get_imago_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
@@ -433,14 +433,14 @@ class TestAdversarialBatBeyondEof(ImagoTestBase):
 
     def test_info_vhdx_bat_beyond_eof(self):
         image = self.get_adversarial_image('vhdx-bat-beyond-eof')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_vhdx_bat_beyond_eof(self):
         image = self.get_adversarial_image('vhdx-bat-beyond-eof')
-        stdout, stderr, rc = self.run_adversarial(
+        _ = self.run_adversarial(
             [str(self.get_imago_binary()), 'check', str(image.path)],
             timeout=10
         )
@@ -448,7 +448,7 @@ class TestAdversarialBatBeyondEof(ImagoTestBase):
     def test_convert_vhdx_bat_beyond_eof(self):
         image = self.get_adversarial_image('vhdx-bat-beyond-eof')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
-            stdout, stderr, rc = self.run_adversarial(
+            self.run_adversarial(
                 [str(self.get_imago_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
@@ -467,14 +467,14 @@ class TestAdversarialPolyglot(ImagoTestBase):
     def test_info_polyglot_qcow2_vmdk(self):
         """QCOW2 magic with VMDK descriptor body — info should detect as QCOW2."""
         image = self.get_adversarial_image('polyglot-qcow2-vmdk')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_polyglot_qcow2_vmdk(self):
         image = self.get_adversarial_image('polyglot-qcow2-vmdk')
-        stdout, stderr, rc = self.run_adversarial(
+        _ = self.run_adversarial(
             [str(self.get_imago_binary()), 'check', str(image.path)],
             timeout=10
         )
@@ -482,7 +482,7 @@ class TestAdversarialPolyglot(ImagoTestBase):
     def test_convert_polyglot_qcow2_vmdk(self):
         image = self.get_adversarial_image('polyglot-qcow2-vmdk')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
-            stdout, stderr, rc = self.run_adversarial(
+            _, stderr, rc = self.run_adversarial(
                 [str(self.get_imago_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
@@ -491,14 +491,14 @@ class TestAdversarialPolyglot(ImagoTestBase):
     def test_info_polyglot_qcow2_elf(self):
         """QCOW2 magic with ELF binary body — info should detect as QCOW2."""
         image = self.get_adversarial_image('polyglot-qcow2-elf')
-        stdout, stderr, rc = self.run_adversarial(
+        _ = self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_polyglot_qcow2_elf(self):
         image = self.get_adversarial_image('polyglot-qcow2-elf')
-        stdout, stderr, rc = self.run_adversarial(
+        _, _, _ = self.run_adversarial(
             [str(self.get_imago_binary()), 'check', str(image.path)],
             timeout=10
         )
@@ -506,7 +506,7 @@ class TestAdversarialPolyglot(ImagoTestBase):
     def test_convert_polyglot_qcow2_elf(self):
         image = self.get_adversarial_image('polyglot-qcow2-elf')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
-            stdout, stderr, rc = self.run_adversarial(
+            _ = self.run_adversarial(
                 [str(self.get_imago_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
@@ -524,14 +524,14 @@ class TestAdversarialTruncatedHeader(ImagoTestBase):
 
     def test_info_truncated_qcow2(self):
         image = self.get_adversarial_image('qcow2-truncated-header-v2')
-        stdout, stderr, rc = self.run_adversarial(
+        _ = self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_truncated_qcow2(self):
         image = self.get_adversarial_image('qcow2-truncated-header-v2')
-        stdout, stderr, rc = self.run_adversarial(
+        _ = self.run_adversarial(
             [str(self.get_imago_binary()), 'check', str(image.path)],
             timeout=10
         )
@@ -539,7 +539,7 @@ class TestAdversarialTruncatedHeader(ImagoTestBase):
     def test_convert_truncated_qcow2(self):
         image = self.get_adversarial_image('qcow2-truncated-header-v2')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
-            stdout, stderr, rc = self.run_adversarial(
+            self.run_adversarial(
                 [str(self.get_imago_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
@@ -547,14 +547,14 @@ class TestAdversarialTruncatedHeader(ImagoTestBase):
 
     def test_info_truncated_vmdk(self):
         image = self.get_adversarial_image('vmdk-truncated-after-magic')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_truncated_vmdk(self):
         image = self.get_adversarial_image('vmdk-truncated-after-magic')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'check', str(image.path)],
             timeout=10
         )
@@ -562,7 +562,7 @@ class TestAdversarialTruncatedHeader(ImagoTestBase):
     def test_convert_truncated_vmdk(self):
         image = self.get_adversarial_image('vmdk-truncated-after-magic')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
-            stdout, stderr, rc = self.run_adversarial(
+            self.run_adversarial(
                 [str(self.get_imago_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
@@ -570,14 +570,14 @@ class TestAdversarialTruncatedHeader(ImagoTestBase):
 
     def test_info_truncated_vhd(self):
         image = self.get_adversarial_image('vhd-truncated-footer')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_truncated_vhd(self):
         image = self.get_adversarial_image('vhd-truncated-footer')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'check', str(image.path)],
             timeout=10
         )
@@ -585,7 +585,7 @@ class TestAdversarialTruncatedHeader(ImagoTestBase):
     def test_convert_truncated_vhd(self):
         image = self.get_adversarial_image('vhd-truncated-footer')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
-            stdout, stderr, rc = self.run_adversarial(
+            self.run_adversarial(
                 [str(self.get_imago_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
@@ -602,21 +602,21 @@ class TestAdversarialVmdkDescriptor(ImagoTestBase):
 
     def test_info_descriptor_null_bytes(self):
         image = self.get_adversarial_image('vmdk-descriptor-null-bytes')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_descriptor_null_bytes(self):
         image = self.get_adversarial_image('vmdk-descriptor-null-bytes')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'check', str(image.path)],
             timeout=10
         )
 
     def test_info_descriptor_multi_extent(self):
         image = self.get_adversarial_image('vmdk-descriptor-multi-extent')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
             timeout=10
         )
@@ -629,21 +629,21 @@ class TestAdversarialVmdkDescriptor(ImagoTestBase):
         if multi-extent detection fires. Either is acceptable.
         """
         image = self.get_adversarial_image('vmdk-descriptor-multi-extent')
-        stdout, stderr, rc = self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', str(image.path)],
-            timeout=10
-        )
+            self.run_adversarial(
+                [str(self.get_imago_binary()), 'check', str(image.path)],
+                timeout=10
+            )
 
     def test_info_descriptor_huge(self):
         image = self.get_adversarial_image('vmdk-descriptor-huge')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_descriptor_huge(self):
         image = self.get_adversarial_image('vmdk-descriptor-huge')
-        stdout, stderr, rc = self.run_adversarial(
+        self.run_adversarial(
             [str(self.get_imago_binary()), 'check', str(image.path)],
             timeout=10
         )
