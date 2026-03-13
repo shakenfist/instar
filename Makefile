@@ -452,7 +452,7 @@ test-container-core: imago-devcontainer imago
 			echo "Running core tests (excluding convert, compare, malicious)..."; \
 			cd tests && \
 			/build/test-venv/bin/stestr run \
-				--exclude-regex "(test_convert|test_compare|test_info_malicious)" \
+				--exclude-regex "(test_convert\.|test_compare\.|test_info_malicious)" \
 				--concurrency 4 \
 		'
 
@@ -483,7 +483,7 @@ test-container-convert-qcow2: imago-devcontainer imago
 			/build/test-venv/bin/stestr run \
 				--exclude-regex "Vhd" \
 				--concurrency 4 \
-				"(test_convert|test_compare)" \
+				"(test_convert\.|test_compare\.)" \
 		'
 
 # Run VHD/VHDX convert tests inside container
