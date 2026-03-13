@@ -369,6 +369,9 @@ by scripts in `scripts/`:
 - `create-circular-chain-testdata.sh` — Circular backing chains (2/3-level, self-ref)
 - `create-deep-chain-testdata.sh` — 16/17-level deep backing chains
 - `create-overflow-testdata.sh` — L1 overflow, zero L1, invalid cluster_bits
+- `create-boundary-testdata.py` — Boundary value tests: refcount order edges,
+  oversized virtual sizes, VMDK grain sizes, VHDX conflicting headers,
+  VHD/VHDX BAT beyond EOF
 
 Generated images live in `../imago-testdata/custom/format-coverage/`
 and `../imago-testdata/custom/audit/` (adversarial images).
