@@ -482,8 +482,8 @@ pub unsafe extern "C" fn _start() -> u64 {
                     staging_buf,
                     &mut staging_cluster_offset,
                     aes_key.as_ref(),
-                    None,
-                    512u64,
+                    luks_key,
+                    luks_sector_size,
                     &mut bytes_read,
                 ) {
                     // I/O error: treat as mismatch
