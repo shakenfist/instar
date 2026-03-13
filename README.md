@@ -484,6 +484,13 @@ imago info --unsafe-quirks /etc/passwd
 
 See [docs/quirks.md](docs/quirks.md) for the classification of safe vs unsafe quirks.
 
+### Security Audits
+
+The codebase undergoes periodic security audits covering unsafe code review,
+integer arithmetic analysis, and adversarial image testing. Audit results are
+published in [docs/security-audits.md](docs/security-audits.md). The audit
+methodology is documented in `PLAN-audit.md`.
+
 ## Test Data
 
 The `testdata/` directory contains 44 disk images for security validation:
