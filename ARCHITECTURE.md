@@ -184,8 +184,8 @@ provides a modular architecture with:
   optional `--chain` backing chain validation)
 - **operations/compare/** - Image comparison operation (format-aware virtual
   content comparison between two images, supporting raw, QCOW2, VMDK,
-  VHD, and VHDX inputs including compressed clusters and backing chain
-  flattening)
+  VHD, and VHDX inputs including compressed clusters, backing chain
+  flattening, and LUKS-in-QCOW2 decryption via `--luks-passphrase`)
 - **operations/convert/** - Image conversion operation (any input to raw,
   QCOW2 v3, VMDK, VHD, or VHDX output, with backing chain flattening
   and compressed cluster decompression). QCOW2 writer uses linear
