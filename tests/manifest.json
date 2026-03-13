@@ -1078,6 +1078,94 @@
             "description": "VHDX with BAT entry pointing to offset past end of file",
             "tags": ["vhdx", "adversarial", "boundary-value", "bat-beyond-eof"],
             "generated_by": "scripts/create-boundary-testdata.py"
+        },
+        {
+            "id": "polyglot-qcow2-vmdk",
+            "path": "custom/audit/polyglot-qcow2-vmdk.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "QCOW2 magic header with VMDK descriptor body content",
+            "tags": ["qcow2", "adversarial", "format-confusion", "polyglot"],
+            "generated_by": "scripts/create-format-confusion-testdata.py"
+        },
+        {
+            "id": "polyglot-qcow2-elf",
+            "path": "custom/audit/polyglot-qcow2-elf.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "QCOW2 magic header with ELF binary content after header",
+            "tags": ["qcow2", "adversarial", "format-confusion", "polyglot"],
+            "generated_by": "scripts/create-format-confusion-testdata.py"
+        },
+        {
+            "id": "qcow2-truncated-header-v2",
+            "path": "custom/audit/qcow2-truncated-header-v2.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "QCOW2 v2 header truncated at 32 bytes (mid-field)",
+            "tags": ["qcow2", "adversarial", "format-confusion", "truncated"],
+            "generated_by": "scripts/create-format-confusion-testdata.py"
+        },
+        {
+            "id": "vmdk-truncated-after-magic",
+            "path": "custom/audit/vmdk-truncated-after-magic.vmdk",
+            "format": "vmdk",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "VMDK sparse header with only magic and version (8 bytes)",
+            "tags": ["vmdk", "adversarial", "format-confusion", "truncated"],
+            "generated_by": "scripts/create-format-confusion-testdata.py"
+        },
+        {
+            "id": "vhd-truncated-footer",
+            "path": "custom/audit/vhd-truncated-footer.vhd",
+            "format": "vpc",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "VHD footer truncated at 48 bytes (missing disk type and checksum)",
+            "tags": ["vhd", "adversarial", "format-confusion", "truncated"],
+            "generated_by": "scripts/create-format-confusion-testdata.py"
+        },
+        {
+            "id": "vmdk-descriptor-null-bytes",
+            "path": "custom/audit/vmdk-descriptor-null-bytes.vmdk",
+            "format": "vmdk",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "VMDK with null bytes embedded in descriptor text",
+            "tags": ["vmdk", "adversarial", "format-confusion", "descriptor"],
+            "generated_by": "scripts/create-format-confusion-testdata.py"
+        },
+        {
+            "id": "vmdk-descriptor-multi-extent",
+            "path": "custom/audit/vmdk-descriptor-multi-extent.vmdk",
+            "format": "vmdk",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "VMDK with multiple extent declarations in descriptor",
+            "tags": ["vmdk", "adversarial", "format-confusion", "descriptor", "multi-extent"],
+            "generated_by": "scripts/create-format-confusion-testdata.py"
+        },
+        {
+            "id": "vmdk-descriptor-huge",
+            "path": "custom/audit/vmdk-descriptor-huge.vmdk",
+            "format": "vmdk",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "VMDK header claiming >1MB descriptor size with tiny actual file",
+            "tags": ["vmdk", "adversarial", "format-confusion", "descriptor"],
+            "generated_by": "scripts/create-format-confusion-testdata.py"
         }
     ]
 }

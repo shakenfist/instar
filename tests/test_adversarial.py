@@ -499,3 +499,212 @@ class TestAdversarialBatBeyondEof(ImagoTestBase):
                  str(image.path), out.name],
                 timeout=10
             )
+
+
+class TestAdversarialPolyglot(ImagoTestBase):
+    """Verify polyglot files are handled safely.
+
+    These files have valid magic bytes for one format but body content
+    from another format. Format detection should work (magic wins),
+    but structural validation should catch the inconsistency.
+    """
+
+    def _get_adversarial_image(self, image_id):
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        return image
+
+    def test_info_polyglot_qcow2_vmdk(self):
+        """QCOW2 magic with VMDK descriptor body — info should detect as QCOW2."""
+        image = self._get_adversarial_image('polyglot-qcow2-vmdk')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'info', str(image.path)],
+            timeout=10
+        )
+
+    def test_check_polyglot_qcow2_vmdk(self):
+        image = self._get_adversarial_image('polyglot-qcow2-vmdk')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'check', str(image.path)],
+            timeout=10
+        )
+
+    def test_convert_polyglot_qcow2_vmdk(self):
+        image = self._get_adversarial_image('polyglot-qcow2-vmdk')
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            stdout, stderr, rc = self.run_adversarial(
+                [str(self.get_imago_binary()), 'convert',
+                 str(image.path), out.name],
+                timeout=10
+            )
+
+    def test_info_polyglot_qcow2_elf(self):
+        """QCOW2 magic with ELF binary body — info should detect as QCOW2."""
+        image = self._get_adversarial_image('polyglot-qcow2-elf')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'info', str(image.path)],
+            timeout=10
+        )
+
+    def test_check_polyglot_qcow2_elf(self):
+        image = self._get_adversarial_image('polyglot-qcow2-elf')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'check', str(image.path)],
+            timeout=10
+        )
+
+    def test_convert_polyglot_qcow2_elf(self):
+        image = self._get_adversarial_image('polyglot-qcow2-elf')
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            stdout, stderr, rc = self.run_adversarial(
+                [str(self.get_imago_binary()), 'convert',
+                 str(image.path), out.name],
+                timeout=10
+            )
+
+
+class TestAdversarialTruncatedHeader(ImagoTestBase):
+    """Verify truncated format headers fail gracefully.
+
+    These files have valid magic bytes but are truncated mid-field,
+    so the parser cannot read the complete header. All operations
+    should fail with a clear error, not crash.
+    """
+
+    def _get_adversarial_image(self, image_id):
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        return image
+
+    def test_info_truncated_qcow2(self):
+        image = self._get_adversarial_image('qcow2-truncated-header-v2')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'info', str(image.path)],
+            timeout=10
+        )
+
+    def test_check_truncated_qcow2(self):
+        image = self._get_adversarial_image('qcow2-truncated-header-v2')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'check', str(image.path)],
+            timeout=10
+        )
+
+    def test_convert_truncated_qcow2(self):
+        image = self._get_adversarial_image('qcow2-truncated-header-v2')
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            stdout, stderr, rc = self.run_adversarial(
+                [str(self.get_imago_binary()), 'convert',
+                 str(image.path), out.name],
+                timeout=10
+            )
+
+    def test_info_truncated_vmdk(self):
+        image = self._get_adversarial_image('vmdk-truncated-after-magic')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'info', str(image.path)],
+            timeout=10
+        )
+
+    def test_check_truncated_vmdk(self):
+        image = self._get_adversarial_image('vmdk-truncated-after-magic')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'check', str(image.path)],
+            timeout=10
+        )
+
+    def test_convert_truncated_vmdk(self):
+        image = self._get_adversarial_image('vmdk-truncated-after-magic')
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            stdout, stderr, rc = self.run_adversarial(
+                [str(self.get_imago_binary()), 'convert',
+                 str(image.path), out.name],
+                timeout=10
+            )
+
+    def test_info_truncated_vhd(self):
+        image = self._get_adversarial_image('vhd-truncated-footer')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'info', str(image.path)],
+            timeout=10
+        )
+
+    def test_check_truncated_vhd(self):
+        image = self._get_adversarial_image('vhd-truncated-footer')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'check', str(image.path)],
+            timeout=10
+        )
+
+    def test_convert_truncated_vhd(self):
+        image = self._get_adversarial_image('vhd-truncated-footer')
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            stdout, stderr, rc = self.run_adversarial(
+                [str(self.get_imago_binary()), 'convert',
+                 str(image.path), out.name],
+                timeout=10
+            )
+
+
+class TestAdversarialVmdkDescriptor(ImagoTestBase):
+    """Verify VMDK descriptor attacks are handled safely.
+
+    These test the VMDK descriptor parser with adversarial input:
+    null bytes, multiple extent declarations, and inflated size claims.
+    """
+
+    def _get_adversarial_image(self, image_id):
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        return image
+
+    def test_info_descriptor_null_bytes(self):
+        image = self._get_adversarial_image('vmdk-descriptor-null-bytes')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'info', str(image.path)],
+            timeout=10
+        )
+
+    def test_check_descriptor_null_bytes(self):
+        image = self._get_adversarial_image('vmdk-descriptor-null-bytes')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'check', str(image.path)],
+            timeout=10
+        )
+
+    def test_info_descriptor_multi_extent(self):
+        image = self._get_adversarial_image('vmdk-descriptor-multi-extent')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'info', str(image.path)],
+            timeout=10
+        )
+
+    def test_check_descriptor_multi_extent(self):
+        """Check handles multi-extent VMDK without crash.
+
+        The check operation may return rc=0 with 'does not support checks'
+        if the VMDK subtype is not recognized, or reject with non-zero rc
+        if multi-extent detection fires. Either is acceptable.
+        """
+        image = self._get_adversarial_image('vmdk-descriptor-multi-extent')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'check', str(image.path)],
+            timeout=10
+        )
+
+    def test_info_descriptor_huge(self):
+        image = self._get_adversarial_image('vmdk-descriptor-huge')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'info', str(image.path)],
+            timeout=10
+        )
+
+    def test_check_descriptor_huge(self):
+        image = self._get_adversarial_image('vmdk-descriptor-huge')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'check', str(image.path)],
+            timeout=10
+        )
