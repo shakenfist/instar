@@ -933,6 +933,51 @@
             "description": "QCOW2 at top of 17-level backing chain (exceeds max depth, should be rejected)",
             "tags": ["qcow2", "adversarial", "deep-chain", "depth-limit"],
             "generated_by": "scripts/create-deep-chain-testdata.sh"
+        },
+
+        {
+            "id": "qcow2-l1-overflow",
+            "path": "custom/audit/qcow2-l1-overflow.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "QCOW2 with l1_size near u32::MAX to trigger integer overflow checks",
+            "tags": ["qcow2", "adversarial", "integer-overflow", "l1-table"],
+            "generated_by": "scripts/create-overflow-testdata.sh"
+        },
+        {
+            "id": "qcow2-l1-zero",
+            "path": "custom/audit/qcow2-l1-zero.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "QCOW2 with l1_size=0 (degenerate, no L1 table entries)",
+            "tags": ["qcow2", "adversarial", "integer-overflow", "l1-table"],
+            "generated_by": "scripts/create-overflow-testdata.sh"
+        },
+        {
+            "id": "qcow2-cluster-bits-low",
+            "path": "custom/audit/qcow2-cluster-bits-low.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "QCOW2 with cluster_bits=8 (below minimum valid value of 9)",
+            "tags": ["qcow2", "adversarial", "boundary-value", "cluster-bits"],
+            "generated_by": "scripts/create-overflow-testdata.sh"
+        },
+        {
+            "id": "qcow2-cluster-bits-high",
+            "path": "custom/audit/qcow2-cluster-bits-high.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "QCOW2 with cluster_bits=22 (above maximum valid value of 21)",
+            "tags": ["qcow2", "adversarial", "boundary-value", "cluster-bits"],
+            "generated_by": "scripts/create-overflow-testdata.sh"
         }
     ]
 }
