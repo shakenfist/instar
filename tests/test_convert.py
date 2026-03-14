@@ -1831,6 +1831,258 @@ class TestConvertLargeCluster(ImagoTestBase):
             os.unlink(raw_path)
 
 
+class TestConvertLargeClusterOutput(ImagoTestBase):
+    """Test QCOW2 output with large cluster sizes (>64KB).
+
+    Verifies that imago can produce valid QCOW2 images with
+    cluster sizes of 128KB and 2MB, both uncompressed and
+    compressed, and that round-trip fidelity is preserved.
+    """
+
+    def _roundtrip_large_cluster(
+        self, cluster_size, compress=False, image_size='64M'
+    ):
+        """Helper: raw -> qcow2 (large cluster) -> raw, compare."""
+        with tempfile.NamedTemporaryFile(
+            suffix='.raw', delete=False
+        ) as src_f, tempfile.NamedTemporaryFile(
+            suffix='.qcow2', delete=False
+        ) as mid_f, tempfile.NamedTemporaryFile(
+            suffix='.raw', delete=False
+        ) as dst_f:
+            src = src_f.name
+            mid = mid_f.name
+            dst = dst_f.name
+        try:
+            # Create raw with data at multiple offsets
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 src, image_size],
+                check=True, capture_output=True, timeout=30,
+            )
+            for offset in ['0', '4M', '32M']:
+                subprocess.run(
+                    ['qemu-io', '-f', 'raw', '-c',
+                     f'write -P 0xAB {offset} 64K', src],
+                    check=True, capture_output=True,
+                    timeout=30,
+                )
+
+            # raw -> qcow2 with large cluster
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(src), Path(mid),
+                output_format='qcow2',
+                cluster_size=cluster_size,
+                compress=compress,
+                timeout=120,
+            )
+            self.assertEqual(
+                rc, 0,
+                f'raw -> qcow2 (cluster={cluster_size}, '
+                f'compress={compress}) failed: {stderr}'
+            )
+
+            # Validate with qemu-img check
+            result = subprocess.run(
+                ['qemu-img', 'check', mid],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img check failed: {result.stderr}'
+            )
+
+            # Verify cluster size and format in qemu-img info
+            info_result = subprocess.run(
+                ['qemu-img', 'info', '--output=json', mid],
+                capture_output=True, text=True, timeout=30,
+            )
+            info = json.loads(info_result.stdout)
+            self.assertEqual(info['format'], 'qcow2')
+            self.assertEqual(
+                info['cluster-size'], cluster_size,
+                f'Expected cluster-size {cluster_size}, '
+                f'got {info["cluster-size"]}'
+            )
+
+            # qcow2 -> raw
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(mid), Path(dst), timeout=120,
+            )
+            self.assertEqual(
+                rc, 0,
+                f'qcow2 -> raw failed: {stderr}'
+            )
+
+            # Compare round-trip
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(src), Path(dst),
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Round-trip differs (cluster={cluster_size},'
+                f' compress={compress}): {cmp_out}'
+            )
+        finally:
+            for p in [src, mid, dst]:
+                if os.path.exists(p):
+                    os.unlink(p)
+
+    def test_roundtrip_128k_cluster(self):
+        """Round-trip raw -> qcow2 (128KB cluster) -> raw."""
+        self._roundtrip_large_cluster(131072)
+
+    def test_roundtrip_2m_cluster(self):
+        """Round-trip raw -> qcow2 (2MB cluster) -> raw."""
+        self._roundtrip_large_cluster(2097152)
+
+    def test_roundtrip_128k_cluster_compressed(self):
+        """Round-trip raw -> compressed qcow2 (128KB) -> raw."""
+        self._roundtrip_large_cluster(131072, compress=True)
+
+    def test_roundtrip_2m_cluster_compressed(self):
+        """Round-trip raw -> compressed qcow2 (2MB) -> raw."""
+        self._roundtrip_large_cluster(2097152, compress=True)
+
+    def test_qcow2_to_qcow2_large_cluster(self):
+        """Convert QCOW2 (default cluster) -> QCOW2 (128KB)."""
+        with tempfile.NamedTemporaryFile(
+            suffix='.raw', delete=False
+        ) as raw_f, tempfile.NamedTemporaryFile(
+            suffix='.qcow2', delete=False
+        ) as src_f, tempfile.NamedTemporaryFile(
+            suffix='.qcow2', delete=False
+        ) as dst_f:
+            raw = raw_f.name
+            src = src_f.name
+            dst = dst_f.name
+        try:
+            # Create a small QCOW2 with default cluster size
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw, '16M'],
+                check=True, capture_output=True, timeout=30,
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'raw', '-c',
+                 'write -P 0xCD 0 64K', raw],
+                check=True, capture_output=True, timeout=30,
+            )
+            subprocess.run(
+                ['qemu-img', 'convert', '-f', 'raw',
+                 '-O', 'qcow2', raw, src],
+                check=True, capture_output=True, timeout=30,
+            )
+
+            # Convert QCOW2 -> QCOW2 with 128KB clusters
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(src), Path(dst),
+                output_format='qcow2',
+                cluster_size=131072,
+                timeout=120,
+            )
+            self.assertEqual(
+                rc, 0,
+                f'qcow2 -> qcow2 (128KB) failed: {stderr}'
+            )
+
+            # Validate
+            result = subprocess.run(
+                ['qemu-img', 'check', dst],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img check failed: {result.stderr}'
+            )
+
+            # Verify cluster size
+            info_result = subprocess.run(
+                ['qemu-img', 'info', '--output=json', dst],
+                capture_output=True, text=True, timeout=30,
+            )
+            info = json.loads(info_result.stdout)
+            self.assertEqual(info['cluster-size'], 131072)
+
+            # Compare content against original raw
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(raw), Path(dst),
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Content differs: {cmp_out}'
+            )
+        finally:
+            for p in [raw, src, dst]:
+                if os.path.exists(p):
+                    os.unlink(p)
+
+    def test_2m_cluster_preserves_size(self):
+        """2MB cluster output -> convert back preserves data."""
+        with tempfile.NamedTemporaryFile(
+            suffix='.qcow2', delete=False
+        ) as src_f, tempfile.NamedTemporaryFile(
+            suffix='.qcow2', delete=False
+        ) as dst_f:
+            src = src_f.name
+            dst = dst_f.name
+        try:
+            # Create 2MB-cluster QCOW2 with qemu-img
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-o', 'cluster_size=2M', src, '64M'],
+                check=True, capture_output=True, timeout=30,
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'qcow2', '-c',
+                 'write -P 0xEF 0 1M', src],
+                check=True, capture_output=True, timeout=30,
+            )
+
+            # Convert with imago, preserving 2MB cluster size
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(src), Path(dst),
+                output_format='qcow2',
+                cluster_size=2097152,
+                timeout=120,
+            )
+            self.assertEqual(
+                rc, 0,
+                f'2MB re-encode failed: {stderr}'
+            )
+
+            # Validate
+            result = subprocess.run(
+                ['qemu-img', 'check', dst],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img check failed: {result.stderr}'
+            )
+
+            # Verify cluster size preserved
+            info_result = subprocess.run(
+                ['qemu-img', 'info', '--output=json', dst],
+                capture_output=True, text=True, timeout=30,
+            )
+            info = json.loads(info_result.stdout)
+            self.assertEqual(info['cluster-size'], 2097152)
+
+            # Compare content
+            cmp_out, _, cmp_rc = self.run_imago_compare(
+                Path(src), Path(dst),
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Content differs: {cmp_out}'
+            )
+        finally:
+            for p in [src, dst]:
+                if os.path.exists(p):
+                    os.unlink(p)
+
+
 class TestConvertVmdkToRaw(ImagoTestBase):
     """Test VMDK monolithicSparse to raw conversion.
 
