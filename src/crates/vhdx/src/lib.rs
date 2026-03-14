@@ -1289,8 +1289,16 @@ mod tests {
     fn bat_layout_overflow_returns_none() {
         // Extreme virtual_disk_size that would overflow u32
         assert!(calculate_bat_layout(u64::MAX, 1024 * 1024, 512).is_none());
-        // Large but not extreme
-        assert!(calculate_bat_layout(1u64 << 50, 1024 * 1024, 512).is_none());
+        // Large enough to overflow u32 total_blocks with 1MB blocks:
+        // 1 << 53 bytes / 1MB = 1 << 33 blocks > u32::MAX
+        assert!(calculate_bat_layout(1u64 << 53, 1024 * 1024, 512).is_none());
+    }
+
+    #[test]
+    fn bat_layout_large_but_valid() {
+        // 1 PiB (1 << 50) with 1MB blocks = 1 << 30 blocks,
+        // fits in u32 — should succeed
+        assert!(calculate_bat_layout(1u64 << 50, 1024 * 1024, 512).is_some());
     }
 
     // ====================================================================
