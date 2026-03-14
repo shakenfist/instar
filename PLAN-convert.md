@@ -183,6 +183,15 @@
   overlap detection, refcount validation, leak detection) but
   only does basic format detection for other formats.
 
+*Pre-existing test failures (not regressions):*
+- VHD round-trip tests (TestConvertToVhd): Content mismatch
+  at offset 130562 for raw-mbr-partitioned, qcow2, and vhd
+  inputs. Likely a VHD write alignment or carry-buffer bug.
+- VMDK compressed output tests (TestConvertToVmdkCompressed):
+  raw/qcow2/vmdk to streamOptimized VMDK fail.
+- VHD d2v-zerofilled conversion (TestConvertVhdToRaw):
+  test_convert_vhd_d2v_zerofilled fails.
+
 *Resolved in later phases (items formerly listed here):*
 - ~~Compressed clusters > 64KB (input)~~ — Done (Phase 16a)
 - ~~VMDK output format~~ — Done (Phase 8)
@@ -306,7 +315,10 @@
 
 ## Executive Summary
 
-Implement `imago convert` to enable format-aware disk image conversion within the secure KVM sandbox. Before convert, we'll implement `imago check` and `imago compare` to provide verification tools. Testing will use both imago and qemu-img for validation.
+Implement `imago convert` to enable format-aware disk image conversion
+within the secure KVM sandbox. Before convert, we'll implement
+`imago check` and `imago compare` to provide verification tools.
+Testing will use both imago and qemu-img for validation.
 
 ## Implementation Order
 
@@ -339,7 +351,8 @@ Imago uses a sandboxed architecture for security:
 
 ## Phase -1: Configuration File Support
 
-**Goal**: Allow persistent configuration of imago options via config files, reducing command-line verbosity for repeated operations.
+**Goal**: Allow persistent configuration of imago options via config
+files, reducing command-line verbosity for repeated operations.
 
 ### Configuration Hierarchy
 
