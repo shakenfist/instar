@@ -128,11 +128,66 @@ reviewed. Key findings:
 - QCOW2 compressed cluster shift `62 - (cluster_bits - 8)`.
   Safe because `cluster_bits` is validated to 9..=21 at parse time.
 
+### Truncating Cast Audit
+
+All `as u32`, `as u16`, and `as u8` casts on values wider than the
+target type were catalogued and classified.
+
+#### Format crates (library code)
+
+| Location | Cast | Classification | Notes |
+|----------|------|----------------|-------|
+| qcow2: cluster_bits parsing | `as u32` | Bounded | Validated to 9..=21 before cast |
+| qcow2: L1/L2 index calculations | `as u32` | Guarded | Preceded by checked arithmetic |
+| qcow2: refcount_bits | `as u32` | Bounded | Derived from refcount_order (0..=6) |
+| vmdk: grain marker fields | `as u32` | Bounded | Grain size constant (128 sectors) |
+| vmdk: descriptor parsing | `as u32` | Bounded | Descriptor limited to 20KB |
+| vhd: CHS geometry | `as u16`, `as u8` | Bounded | Algorithm caps to CHS limits before cast |
+| vhdx: BAT entries | `as u32` | **Fixed** | Was truncating; now uses `u32::try_from()` |
+
+#### Guest core and shared
+
+| Location | Cast | Classification | Notes |
+|----------|------|----------------|-------|
+| shared/bitmap.rs | `as usize` | Platform | u64 to usize, safe on x86-64 |
+| core/main.rs: call table | `as usize` | Platform | u64 to usize, safe on x86-64 |
+| core/virtio.rs: ring indices | `as u16` | Bounded | Queue size ≤ 256, index masked |
+
+#### Operations (guest-side)
+
+| Location | Cast | Classification | Notes |
+|----------|------|----------------|-------|
+| convert: `reftable_clusters as u32` (line 1624) | u64→u32 | Bounded | QCOW2 header field; reftable must fit in scratch memory (~12.5MB), so clusters ≤ ~200 |
+| convert: `l1_size` (line 1682) | u64→u32 | Bounded | L1 table must fit in scratch memory; checked at line 1693 before use |
+| convert: `entries_per_l2` (line 1680) | u64→u32 | Bounded | cluster_size/8; cluster_bits ≤ 21 so max = 262144 |
+| convert: `num_gd_entries` (line 2495) | u64→u32 | Bounded | GD must fit in scratch memory; checked at line 2510 |
+| convert: GTE sector offset (lines 2695, 2987) | u64→u32 | Spec | VMDK GTE is 32-bit sector offset per specification |
+| convert: GDE sector offset (line 2726) | u64→u32 | Spec | VMDK GDE is 32-bit sector offset per specification |
+| convert: progress percentage | u64→u32 | Bounded | Result of `(n * 100 / total)`, always ≤ 100 |
+| info/check: format header fields | various | Bounded | Values validated by format crate parsers |
+
+#### VMM (host-side)
+
+| Location | Cast | Classification | Notes |
+|----------|------|----------------|-------|
+| main.rs: sector size | `as u32` | Bounded | Sector sizes are 512 or 4096 |
+| main.rs: MMIO/config offsets | `as u32` | Bounded | Fixed layout constants |
+| virtio/block.rs: queue operations | `as u16` | Bounded | Queue size ≤ 256 |
+
+**Summary:** 0 unguarded truncating casts on untrusted input remain.
+The VHDX BAT truncation (the only finding) has been fixed. All other
+casts are either bounded by construction, guarded by preceding checks,
+constrained by the VMDK/QCOW2 specification, or platform-safe
+(u64→usize on x86-64). The operations marked "Bounded" are safe
+because the corresponding data structures must fit within the guest's
+12.5MB scratch memory — any value large enough to overflow u32 would
+have already been rejected by the scratch memory bounds check.
+
 ### Static Analysis Tooling
 
 | Tool | Status | Result |
 |------|--------|--------|
-| cargo clippy (-D warnings) | Pass | 0 warnings on VMM + library crates |
+| cargo clippy (nightly, -D warnings) | Pass | 0 warnings on VMM + all library crates |
 | cargo audit | Pass | 0 vulnerabilities in 136 dependencies |
 | rustfmt | Pass | All code formatted |
 | check-binary-sizes.sh | Pass | All guest binaries within memory layout |
