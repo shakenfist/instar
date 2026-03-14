@@ -804,7 +804,7 @@ fn print_info_result(
         // use the virtual size from headers.
         let effective_virtual_size = if info.format == "raw" || info.format == "unknown" {
             // Round up to 512-byte sector boundary
-            ((file_size + 511) / 512) * 512
+            file_size.div_ceil(512) * 512
         } else {
             info.virtual_size
         };
@@ -981,7 +981,7 @@ fn print_info_result(
             };
             // For raw format, round up to 512-byte sector boundary
             let effective_child_file_length = if info.format == "raw" {
-                ((child_file_length + 511) / 512) * 512
+                child_file_length.div_ceil(512) * 512
             } else {
                 child_file_length
             };
@@ -1022,14 +1022,14 @@ fn print_info_result_json(
     let is_unstructured = info.format == "raw" || info.format == "unknown";
     let effective_virtual_size = if is_unstructured {
         // Round up to 512-byte sector boundary
-        ((child_file_length + 511) / 512) * 512
+        child_file_length.div_ceil(512) * 512
     } else {
         info.virtual_size
     };
 
     // For child file length in raw/unknown format, also round up to 512-byte sectors
     let effective_child_file_length = if is_unstructured {
-        ((child_file_length + 511) / 512) * 512
+        child_file_length.div_ceil(512) * 512
     } else {
         child_file_length
     };
@@ -2510,11 +2510,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     }
 
     // Write argon2_mem_size to InfoConfig (offset 272 = 4+4+4+4+256)
-    let argon2_mem_size: u64 = if guest_mem_size > GUEST_MEM_SIZE {
-        guest_mem_size - GUEST_MEM_SIZE
-    } else {
-        0
-    };
+    let argon2_mem_size: u64 = guest_mem_size.saturating_sub(GUEST_MEM_SIZE);
     guest_mem.write_obj(argon2_mem_size, GuestAddress(OPERATION_CONFIG_ADDR + 272))?;
 
     debug!(
@@ -4469,11 +4465,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     }
 
     // Write argon2_mem_size to ConvertConfig (offset 360 = 292 + 64 + 4 pad)
-    let argon2_mem_size: u64 = if guest_mem_size > GUEST_MEM_SIZE {
-        guest_mem_size - GUEST_MEM_SIZE
-    } else {
-        0
-    };
+    let argon2_mem_size: u64 = guest_mem_size.saturating_sub(GUEST_MEM_SIZE);
     guest_mem.write_obj(argon2_mem_size, GuestAddress(OPERATION_CONFIG_ADDR + 360))?;
 
     debug!(

@@ -43,7 +43,7 @@ impl BitmapContext {
     /// use by other code for the lifetime of this `BitmapContext`.
     pub unsafe fn init_in_scratch(total_items: u64) -> Self {
         let ptr = SCRATCH_MEM_BASE as *mut u8;
-        let needed_bytes = ((total_items + 7) / 8) as usize;
+        let needed_bytes = total_items.div_ceil(8) as usize;
         let size = core::cmp::min(needed_bytes, SCRATCH_MEM_SIZE);
         core::ptr::write_bytes(ptr, 0, size);
         let max_trackable = (size as u64) * 8;
