@@ -1829,7 +1829,7 @@ impl ConvertConfig {
     /// Output cluster bits for QCOW2 output.
     /// Returns 16 (64KB) if unset or out of range.
     pub fn output_cluster_bits(&self) -> u32 {
-        if self.output_cluster_bits >= 9 && self.output_cluster_bits <= 16 {
+        if self.output_cluster_bits >= 9 && self.output_cluster_bits <= 21 {
             self.output_cluster_bits
         } else {
             16

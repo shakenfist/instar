@@ -4186,11 +4186,11 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 
     // Validate cluster size for QCOW2 output
     if is_qcow2_output
-        && (!(512..=65536).contains(&args.cluster_size) || !args.cluster_size.is_power_of_two())
+        && (!(512..=2097152).contains(&args.cluster_size) || !args.cluster_size.is_power_of_two())
     {
         return Err(format!(
             "cluster size must be a power of 2, \
-             512 to 65536 (got {})",
+             512 to 2097152 (got {})",
             args.cluster_size
         )
         .into());
