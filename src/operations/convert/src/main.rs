@@ -94,6 +94,12 @@ impl ScratchLayout {
             dynamic_start,
         }
     }
+
+    /// Address of the decompression staging buffer, after per-device
+    /// L1/L2 caches in the dynamic region.
+    fn staging_buf_addr(&self, input_device_count: usize) -> usize {
+        self.dynamic_start + input_device_count * 2 * MAX_SECTOR_SIZE
+    }
 }
 
 // Verify worst-case layout fits: 2MB output clusters + 16 input
@@ -1486,7 +1492,7 @@ unsafe fn convert_to_raw(
     (call_table.verbose_print)(b"convert: starting raw conversion\n\0".as_ptr());
 
     // Staging buffer for decompressing clusters larger than chunk_size
-    let staging_buf_addr = layout.dynamic_start + input_device_count * 2 * MAX_SECTOR_SIZE;
+    let staging_buf_addr = layout.staging_buf_addr(input_device_count);
     let staging_buf = staging_buf_addr as *mut u8;
     let mut staging_cluster_offset: u64 = u64::MAX;
 
@@ -1761,8 +1767,7 @@ unsafe fn init_qcow2_output_layout(
     let l1_size = ((virtual_size + l2_coverage - 1) / l2_coverage) as u32;
 
     // L1 table starts after dynamic caches + staging buffer
-    let l1_buf_addr =
-        layout.dynamic_start + input_device_count * 2 * MAX_SECTOR_SIZE + MAX_CLUSTER_SIZE;
+    let l1_buf_addr = layout.staging_buf_addr(input_device_count) + MAX_CLUSTER_SIZE;
     let l1_size_bytes = l1_size as usize * 8;
     let l1_clusters = ((l1_size_bytes as u64 + cluster_size - 1) / cluster_size).max(1);
     let l1_write_bytes = l1_clusters as usize * cluster_size as usize;
@@ -1965,7 +1970,7 @@ unsafe fn convert_to_qcow2(
     let buf_l2 = scratch_layout.buf_multipurpose as *mut u8;
 
     // Staging buffer for decompressing clusters larger than chunk_size
-    let staging_buf_addr = scratch_layout.dynamic_start + input_device_count * 2 * MAX_SECTOR_SIZE;
+    let staging_buf_addr = scratch_layout.staging_buf_addr(input_device_count);
     let staging_buf = staging_buf_addr as *mut u8;
     let mut staging_cluster_offset: u64 = u64::MAX;
 
@@ -2268,7 +2273,7 @@ unsafe fn convert_to_qcow2_compressed(
     let buf_l2 = scratch_layout.buf_multipurpose as *mut u8;
 
     // Staging buffer for decompressing clusters larger than chunk_size
-    let staging_buf_addr = scratch_layout.dynamic_start + input_device_count * 2 * MAX_SECTOR_SIZE;
+    let staging_buf_addr = scratch_layout.staging_buf_addr(input_device_count);
     let staging_buf = staging_buf_addr as *mut u8;
     let mut staging_cluster_offset: u64 = u64::MAX;
 
@@ -2594,8 +2599,7 @@ unsafe fn init_vmdk_output_layout(
         * output_sector_size as u64;
 
     // Allocate GD buffer after dynamic input caches + staging buffer
-    let gd_buf_addr =
-        layout.dynamic_start + input_device_count * 2 * MAX_SECTOR_SIZE + MAX_CLUSTER_SIZE;
+    let gd_buf_addr = layout.staging_buf_addr(input_device_count) + MAX_CLUSTER_SIZE;
     let gd_bytes = num_gd_entries as usize * 4;
     // Round up to 8-byte alignment for safety
     let gd_alloc = (gd_bytes + 7) & !7;
@@ -2662,7 +2666,7 @@ unsafe fn convert_to_vmdk(
     let oc = layout.output_capacity;
 
     // Staging buffer for decompressing clusters larger than chunk_size
-    let staging_buf_addr = scratch_layout.dynamic_start + input_device_count * 2 * MAX_SECTOR_SIZE;
+    let staging_buf_addr = scratch_layout.staging_buf_addr(input_device_count);
     let staging_buf = staging_buf_addr as *mut u8;
     let mut staging_cluster_offset: u64 = u64::MAX;
 
@@ -2940,7 +2944,7 @@ unsafe fn convert_to_vmdk_compressed(
     let oss = layout.output_sector_size;
 
     // Staging buffer for decompressing clusters larger than chunk_size
-    let staging_buf_addr = scratch_layout.dynamic_start + input_device_count * 2 * MAX_SECTOR_SIZE;
+    let staging_buf_addr = scratch_layout.staging_buf_addr(input_device_count);
     let staging_buf = staging_buf_addr as *mut u8;
     let mut staging_cluster_offset: u64 = u64::MAX;
     let oc = layout.output_capacity;
@@ -3332,8 +3336,7 @@ unsafe fn convert_to_vhd(
     let data_start = bat_offset + bat_padded;
 
     // BAT buffer — allocate after dynamic input caches + staging buffer
-    let bat_buf_addr =
-        layout.dynamic_start + input_device_count * 2 * MAX_SECTOR_SIZE + MAX_CLUSTER_SIZE;
+    let bat_buf_addr = layout.staging_buf_addr(input_device_count) + MAX_CLUSTER_SIZE;
     let bat_alloc = align_up(bat_size_bytes, 8) as usize;
 
     if bat_buf_addr + bat_alloc > ALLOC_HEAP_BASE {
@@ -3347,7 +3350,7 @@ unsafe fn convert_to_vhd(
     core::ptr::write_bytes(bat_buf, 0xFF, bat_alloc);
 
     // Staging buffer for decompressing clusters larger than chunk_size
-    let staging_buf_addr = layout.dynamic_start + input_device_count * 2 * MAX_SECTOR_SIZE;
+    let staging_buf_addr = layout.staging_buf_addr(input_device_count);
     let staging_buf = staging_buf_addr as *mut u8;
     let mut staging_cluster_offset: u64 = u64::MAX;
 
@@ -3769,8 +3772,7 @@ unsafe fn convert_to_vhdx(
     let payload_start = metadata_offset + metadata_region_size;
 
     // BAT buffer — allocate after dynamic input caches + staging buffer
-    let bat_buf_addr =
-        layout.dynamic_start + input_device_count * 2 * MAX_SECTOR_SIZE + MAX_CLUSTER_SIZE;
+    let bat_buf_addr = layout.staging_buf_addr(input_device_count) + MAX_CLUSTER_SIZE;
     let bat_alloc = align_up(bat_size_bytes, 8) as usize;
 
     if bat_buf_addr + bat_alloc > ALLOC_HEAP_BASE {
@@ -3784,7 +3786,7 @@ unsafe fn convert_to_vhdx(
     core::ptr::write_bytes(bat_buf, 0, bat_alloc);
 
     // Staging buffer for decompressing clusters larger than chunk_size
-    let staging_buf_addr = layout.dynamic_start + input_device_count * 2 * MAX_SECTOR_SIZE;
+    let staging_buf_addr = layout.staging_buf_addr(input_device_count);
     let staging_buf = staging_buf_addr as *mut u8;
     let mut staging_cluster_offset: u64 = u64::MAX;
 
