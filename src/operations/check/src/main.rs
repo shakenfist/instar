@@ -1562,6 +1562,21 @@ unsafe fn check_vhd(
         (call_table.debug_print)(b"check: invalid VHD disk type\n\0".as_ptr());
     }
 
+    // CHS geometry cross-check
+    let (exp_cyl, exp_heads, exp_spt) = vhd::compute_vhd_geometry(footer.current_size);
+    if footer.cylinders != exp_cyl
+        || footer.heads != exp_heads
+        || footer.sectors_per_track != exp_spt
+    {
+        // Non-standard geometry: warn but don't count as corruption
+        (call_table.debug_print)(b"check: VHD CHS geometry mismatch\n\0".as_ptr());
+    }
+
+    // Compare original_size and current_size
+    if footer.original_size != footer.current_size {
+        (call_table.debug_print)(b"check: VHD original_size != current_size\n\0".as_ptr());
+    }
+
     // For fixed VHDs with footer at start, nothing more to check
     if footer.disk_type == vhd::DISK_TYPE_FIXED {
         if result.corruptions > 0 {

@@ -2151,3 +2151,29 @@ class TestCheckEnhancedValidation(ImagoTestBase):
                 'Partially cleared bitmap should '
                 'be detected'
             )
+
+    def test_check_vhd_geometry_existing(self):
+        """VHD geometry check runs without errors on test images.
+
+        Geometry and original_size checks are informational
+        only (debug_print), so this verifies they don't
+        introduce false corruptions.
+        """
+        for img_id in [
+            'hyperv-dynamic-vhd', 'virtualpc-vhd',
+            'vhd-d2v-zerofilled'
+        ]:
+            image = self.get_image(img_id)
+            if not image.path.exists():
+                continue
+            self.skip_if_hash_mismatch(image)
+
+            stdout, _, rc = self.run_imago_check(
+                image.path, output_format='json'
+            )
+            result = json.loads(stdout)
+            self.assertEqual(
+                result.get('corruptions', -1), 0,
+                f'{img_id} should have no '
+                f'corruptions: {stdout}'
+            )
