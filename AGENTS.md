@@ -203,12 +203,8 @@ make clean-tests
   LUKS v2 with Argon2id KDF and --max-guest-memory,
   LUKS-wrapping-QCOW2 conversion, snapshot extraction)
 - `tests/test_adversarial.py` - Adversarial image tests: compression bombs, circular
-  backing chains, deep chains, integer overflow triggers. Uses `run_adversarial()`
-  helper with timeout/memory/signal enforcement.
   backing chains, deep chains, integer overflow triggers, refcount order edges,
   oversized virtual sizes, VMDK grain size boundaries, VHDX conflicting dual
-  headers, VHD/VHDX BAT beyond EOF. Uses `run_adversarial()` helper with
-  timeout/memory/signal enforcement.
   headers, VHD/VHDX BAT beyond EOF, polyglot files (QCOW2+VMDK, QCOW2+ELF),
   truncated headers (QCOW2, VMDK, VHD), VMDK descriptor attacks (null bytes,
   multi-extent, huge size). Uses `run_adversarial()` helper with timeout/memory/
