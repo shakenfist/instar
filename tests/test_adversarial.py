@@ -243,7 +243,7 @@ class TestAdversarialIntegerOverflow(ImagoTestBase):
         )
 
     def test_info_cluster_bits_low(self):
-        """Info reports header fields — no crash expected for cluster_bits=8."""
+        """Info reports header fields — no crash for cluster_bits=8 (below min 9)."""
         image = self.get_adversarial_image('qcow2-cluster-bits-low')
         _, _, _ = self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
@@ -251,7 +251,7 @@ class TestAdversarialIntegerOverflow(ImagoTestBase):
         )
 
     def test_info_cluster_bits_high(self):
-        """Info reports header fields — no crash expected for cluster_bits=22."""
+        """Info reports header fields — no crash for cluster_bits=22 (above max 21)."""
         image = self.get_adversarial_image('qcow2-cluster-bits-high')
         _, _, _ = self.run_adversarial(
             [str(self.get_imago_binary()), 'info', str(image.path)],
