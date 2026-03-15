@@ -33,16 +33,19 @@ use shared::{
 // ================================================================
 // Scratch memory layout
 // ================================================================
-// Fixed buffers (used by both raw and QCOW2 output paths):
-//   BUF_DATA         (64KB): input/output data buffer
-//   BUF_COMPRESSED_IN (2MB+64KB): compressed input data (also
-//                     reused as compressed output buffer)
+// Buffer sizes depend on the output cluster size (up to 2MB for
+// QCOW2, MAX_SECTOR_SIZE for other formats). Layout computed at
+// runtime via ScratchLayout::new().
 //
-// Additional fixed buffers for QCOW2 output (unused by raw path,
-// but always reserved to keep the layout consistent):
-//   BUF_L2_OUT   (64KB): current output L2 table being built
-//   BUF_HEADER   (64KB): header cluster buffer
-//   BUF_REFCOUNT (64KB): refcount block buffer
+//   BUF_COMPRESSED    (2MB+64KB): compressed input/output data
+//   BUF_MULTIPURPOSE  (cluster_size): shared buffer for L2 table,
+//                     header cluster, and refcount block (these
+//                     are used in non-overlapping phases)
+//   BUF_DATA          (cluster_size): input/output data buffer
+//   DYNAMIC_START:    L1/L2 caches, staging buffer, L1 table, etc.
+//
+// For non-QCOW2 output, BUF_MULTIPURPOSE and BUF_DATA are
+// MAX_SECTOR_SIZE (64KB), matching the previous fixed layout.
 //
 // Dynamic region: L1/L2 caches for input QCOW2 devices
 //   (2 × MAX_SECTOR_SIZE per device)
@@ -56,17 +59,61 @@ use shared::{
 // For compressed QCOW2 output (after L1 table):
 //   Refcount array: u16 per host cluster, remaining scratch
 
-const BUF_DATA: usize = SCRATCH_MEM_BASE;
-const BUF_COMPRESSED_IN: usize = BUF_DATA + MAX_SECTOR_SIZE;
-const BUF_L2_OUT: usize = BUF_COMPRESSED_IN + COMPRESSED_BUF_SIZE;
-const BUF_HEADER: usize = BUF_L2_OUT + MAX_SECTOR_SIZE; // 64KB
-const BUF_REFCOUNT: usize = BUF_HEADER + MAX_SECTOR_SIZE; // 64KB
-const DYNAMIC_BUFS_START: usize = BUF_REFCOUNT + MAX_SECTOR_SIZE; // 64KB
+/// Scratch memory layout computed from output cluster size.
+struct ScratchLayout {
+    /// Compressed input/output buffer (COMPRESSED_BUF_SIZE).
+    buf_compressed: usize,
+    /// Shared buffer for L2 table, header, and refcount block.
+    /// Size = max(MAX_SECTOR_SIZE, output_cluster_size).
+    buf_multipurpose: usize,
+    /// Data buffer for reading/writing cluster data.
+    /// Size = max(MAX_SECTOR_SIZE, output_cluster_size).
+    buf_data: usize,
+    /// Size of buf_multipurpose and buf_data.
+    buf_size: usize,
+    /// Start of dynamic allocations (caches, staging, L1, etc).
+    dynamic_start: usize,
+}
 
+impl ScratchLayout {
+    fn new(output_cluster_size: usize) -> Self {
+        let buf_size = if output_cluster_size > MAX_SECTOR_SIZE {
+            output_cluster_size
+        } else {
+            MAX_SECTOR_SIZE
+        };
+        let buf_compressed = SCRATCH_MEM_BASE;
+        let buf_multipurpose = buf_compressed + COMPRESSED_BUF_SIZE;
+        let buf_data = buf_multipurpose + buf_size;
+        let dynamic_start = buf_data + buf_size;
+        Self {
+            buf_compressed,
+            buf_multipurpose,
+            buf_data,
+            buf_size,
+            dynamic_start,
+        }
+    }
+
+    /// Address of the decompression staging buffer, after per-device
+    /// L1/L2 caches in the dynamic region.
+    fn staging_buf_addr(&self, input_device_count: usize) -> usize {
+        self.dynamic_start + input_device_count * 2 * MAX_SECTOR_SIZE
+    }
+}
+
+// Verify worst-case layout fits: 2MB output clusters + 16 input
+// devices + staging buffer.
 const _: () = assert!(
-    DYNAMIC_BUFS_START + MAX_CHAIN_DEVICES * 2 * MAX_SECTOR_SIZE + MAX_CLUSTER_SIZE
+    // BUF_COMPRESSED + BUF_MULTIPURPOSE(2MB) + BUF_DATA(2MB)
+    // + 16 device caches + staging buffer
+    SCRATCH_MEM_BASE
+        + COMPRESSED_BUF_SIZE
+        + MAX_CLUSTER_SIZE * 2
+        + MAX_CHAIN_DEVICES * 2 * MAX_SECTOR_SIZE
+        + MAX_CLUSTER_SIZE
         <= ALLOC_HEAP_BASE,
-    "Scratch memory too small for L1/L2 caches + staging buffer"
+    "Scratch memory too small for max layout"
 );
 
 // ================================================================
@@ -184,6 +231,16 @@ pub unsafe extern "C" fn _start() -> u64 {
 
     let mut bytes_read: u64 = 0;
 
+    // Compute scratch layout based on output cluster size.
+    // For QCOW2 output, buffers scale with cluster size (up to 2MB).
+    // For other formats, use MAX_SECTOR_SIZE (64KB).
+    let output_cluster_size = if config.target_format() == ImageFormat::Qcow2 {
+        1usize << config.output_cluster_bits()
+    } else {
+        MAX_SECTOR_SIZE
+    };
+    let layout = ScratchLayout::new(output_cluster_size);
+
     // Get virtual size from top-of-chain device
     let top_dev = &chain_config.devices[0];
     let virtual_size = top_dev.virtual_size;
@@ -201,7 +258,14 @@ pub unsafe extern "C" fn _start() -> u64 {
             (call_table.send_complete)(b"convert\0".as_ptr(), 0, false);
             return 0;
         }
-        return convert_native_luks(call_table, config, sector_size, virtual_size, skip_zeros);
+        return convert_native_luks(
+            call_table,
+            config,
+            sector_size,
+            virtual_size,
+            skip_zeros,
+            &layout,
+        );
     }
 
     (call_table.verbose_print)(b"convert: initializing chain states\n\0".as_ptr());
@@ -215,7 +279,7 @@ pub unsafe extern "C" fn _start() -> u64 {
         &mut chain_states,
         input_device_count,
         sector_size,
-        DYNAMIC_BUFS_START,
+        layout.dynamic_start,
         &mut bytes_read,
     ) {
         (call_table.debug_print)(b"convert: failed to init chain states\n\0".as_ptr());
@@ -406,6 +470,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                     luks_key,
                     luks_sector_size,
                     &mut bytes_read,
+                    &layout,
                 )
             } else {
                 convert_to_qcow2(
@@ -421,6 +486,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                     luks_key,
                     luks_sector_size,
                     &mut bytes_read,
+                    &layout,
                 )
             }
         }
@@ -438,6 +504,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                     luks_key,
                     luks_sector_size,
                     &mut bytes_read,
+                    &layout,
                 )
             } else {
                 convert_to_vmdk(
@@ -452,6 +519,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                     luks_key,
                     luks_sector_size,
                     &mut bytes_read,
+                    &layout,
                 )
             }
         }
@@ -467,6 +535,7 @@ pub unsafe extern "C" fn _start() -> u64 {
             luks_key,
             luks_sector_size,
             &mut bytes_read,
+            &layout,
         ),
         ImageFormat::Vhdx => convert_to_vhdx(
             call_table,
@@ -480,6 +549,7 @@ pub unsafe extern "C" fn _start() -> u64 {
             luks_key,
             luks_sector_size,
             &mut bytes_read,
+            &layout,
         ),
         _ => convert_to_raw(
             call_table,
@@ -493,6 +563,7 @@ pub unsafe extern "C" fn _start() -> u64 {
             luks_key,
             luks_sector_size,
             &mut bytes_read,
+            &layout,
         ),
     }
 }
@@ -515,6 +586,7 @@ unsafe fn convert_native_luks(
     sector_size: usize,
     virtual_size: u64,
     skip_zeros: bool,
+    layout: &ScratchLayout,
 ) -> u64 {
     let mut bytes_read: u64 = 0;
 
@@ -622,7 +694,7 @@ unsafe fn convert_native_luks(
 
     // Detect inner format by decrypting first sector of payload
     {
-        let buf = BUF_DATA as *mut u8;
+        let buf = layout.buf_data as *mut u8;
         let payload_sector = payload_byte_offset / sector_size as u64;
         if payload_sector < input_capacity
             && (call_table.read_input_sector)(0, payload_sector, buf, sector_size)
@@ -657,6 +729,7 @@ unsafe fn convert_native_luks(
                         inner_size,
                         skip_zeros,
                         &mut bytes_read,
+                        layout,
                     );
                 }
             }
@@ -671,7 +744,7 @@ unsafe fn convert_native_luks(
 
     // Use sector_size as the chunk size for reading
     let chunk_size = sector_size as u64;
-    let buf = BUF_DATA as *mut u8;
+    let buf = layout.buf_data as *mut u8;
     let mut payload_offset: u64 = 0;
     let mut last_percent: u32 = 0;
     let mut chunks_done: u64 = 0;
@@ -797,6 +870,7 @@ unsafe fn convert_luks_wrapped_qcow2(
     inner_payload_size: u64,
     skip_zeros: bool,
     bytes_read: &mut u64,
+    layout: &ScratchLayout,
 ) -> u64 {
     // Set up the static LUKS wrapper context
     LUKS_WRAP_ORIG_READ = call_table.read_input_sector;
@@ -861,7 +935,7 @@ unsafe fn convert_luks_wrapped_qcow2(
         &mut chain_states,
         1,
         sector_size,
-        DYNAMIC_BUFS_START,
+        layout.dynamic_start,
         bytes_read,
     ) {
         (call_table.debug_print)(b"convert: failed to init inner QCOW2 chain states\n\0".as_ptr());
@@ -906,6 +980,7 @@ unsafe fn convert_luks_wrapped_qcow2(
                     None,
                     512,
                     bytes_read,
+                    layout,
                 )
             } else {
                 convert_to_qcow2(
@@ -921,6 +996,7 @@ unsafe fn convert_luks_wrapped_qcow2(
                     None,
                     512,
                     bytes_read,
+                    layout,
                 )
             }
         }
@@ -938,6 +1014,7 @@ unsafe fn convert_luks_wrapped_qcow2(
                     None,
                     512,
                     bytes_read,
+                    layout,
                 )
             } else {
                 convert_to_vmdk(
@@ -952,6 +1029,7 @@ unsafe fn convert_luks_wrapped_qcow2(
                     None,
                     512,
                     bytes_read,
+                    layout,
                 )
             }
         }
@@ -967,6 +1045,7 @@ unsafe fn convert_luks_wrapped_qcow2(
             None,
             512,
             bytes_read,
+            layout,
         ),
         ImageFormat::Vhdx => convert_to_vhdx(
             &wrapped_ct,
@@ -980,6 +1059,7 @@ unsafe fn convert_luks_wrapped_qcow2(
             None,
             512,
             bytes_read,
+            layout,
         ),
         _ => convert_to_raw(
             &wrapped_ct,
@@ -993,6 +1073,7 @@ unsafe fn convert_luks_wrapped_qcow2(
             None,
             512,
             bytes_read,
+            layout,
         ),
     };
 
@@ -1383,6 +1464,7 @@ unsafe fn convert_to_raw(
     luks_key: Option<&[u8]>,
     luks_sector_size: u64,
     bytes_read: &mut u64,
+    layout: &ScratchLayout,
 ) -> u64 {
     let output_sector_size = (call_table.get_output_sector_size)();
     let output_capacity = (call_table.get_output_capacity)();
@@ -1410,11 +1492,11 @@ unsafe fn convert_to_raw(
     (call_table.verbose_print)(b"convert: starting raw conversion\n\0".as_ptr());
 
     // Staging buffer for decompressing clusters larger than chunk_size
-    let staging_buf_addr = DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE;
+    let staging_buf_addr = layout.staging_buf_addr(input_device_count);
     let staging_buf = staging_buf_addr as *mut u8;
     let mut staging_cluster_offset: u64 = u64::MAX;
 
-    let buf = BUF_DATA as *mut u8;
+    let buf = layout.buf_data as *mut u8;
     let mut virtual_offset: u64 = 0;
     let mut last_percent: u32 = 0;
     let mut chunks_done: u64 = 0;
@@ -1441,7 +1523,7 @@ unsafe fn convert_to_raw(
             sector_size,
             chain_config,
             chain_states,
-            BUF_COMPRESSED_IN as *mut u8,
+            layout.buf_compressed as *mut u8,
             staging_buf,
             &mut staging_cluster_offset,
             aes_key,
@@ -1607,8 +1689,10 @@ unsafe fn write_qcow2_header(
     reftable_clusters: u64,
     output_sector_size: usize,
     output_capacity: u64,
+    scratch_layout: &ScratchLayout,
 ) -> bool {
-    let buf_hdr = BUF_HEADER as *mut u8;
+    // BUF_HEADER: use multipurpose buffer for header cluster
+    let buf_hdr = scratch_layout.buf_multipurpose as *mut u8;
     core::ptr::write_bytes(buf_hdr, 0, cluster_size as usize);
     let hdr = core::slice::from_raw_parts_mut(buf_hdr, cluster_size as usize);
 
@@ -1670,6 +1754,7 @@ unsafe fn init_qcow2_output_layout(
     input_device_count: usize,
     virtual_size: u64,
     bytes_read: &mut u64,
+    layout: &ScratchLayout,
 ) -> Option<Qcow2OutputLayout> {
     let output_sector_size = (call_table.get_output_sector_size)();
     let output_capacity = (call_table.get_output_capacity)();
@@ -1682,8 +1767,7 @@ unsafe fn init_qcow2_output_layout(
     let l1_size = ((virtual_size + l2_coverage - 1) / l2_coverage) as u32;
 
     // L1 table starts after dynamic caches + staging buffer
-    let l1_buf_addr =
-        DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE + MAX_CLUSTER_SIZE;
+    let l1_buf_addr = layout.staging_buf_addr(input_device_count) + MAX_CLUSTER_SIZE;
     let l1_size_bytes = l1_size as usize * 8;
     let l1_clusters = ((l1_size_bytes as u64 + cluster_size - 1) / cluster_size).max(1);
     let l1_write_bytes = l1_clusters as usize * cluster_size as usize;
@@ -1735,6 +1819,7 @@ unsafe fn write_qcow2_metadata(
     data_end_offset: u64,
     refcount_array: Option<(*mut u16, usize)>,
     bytes_read: &mut u64,
+    scratch_layout: &ScratchLayout,
 ) -> bool {
     let cs = layout.cluster_size;
     let oss = layout.output_sector_size;
@@ -1779,8 +1864,8 @@ unsafe fn write_qcow2_metadata(
         }
     }
 
-    // Write refcount blocks
-    let buf_rc = BUF_REFCOUNT as *mut u8;
+    // Write refcount blocks (BUF_REFCOUNT: multipurpose buffer)
+    let buf_rc = scratch_layout.buf_multipurpose as *mut u8;
     for rb in 0..refblock_count {
         core::ptr::write_bytes(buf_rc, 0, cs as usize);
         let rc_slice = core::slice::from_raw_parts_mut(buf_rc, cs as usize);
@@ -1821,6 +1906,7 @@ unsafe fn write_qcow2_metadata(
         refblock_count,
         oss,
         oc,
+        scratch_layout,
     ) {
         (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
         return false;
@@ -1838,6 +1924,7 @@ unsafe fn write_qcow2_metadata(
         reftable_clusters,
         oss,
         oc,
+        scratch_layout,
     ) {
         (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
         return false;
@@ -1864,6 +1951,7 @@ unsafe fn convert_to_qcow2(
     luks_key: Option<&[u8]>,
     luks_sector_size: u64,
     bytes_read: &mut u64,
+    scratch_layout: &ScratchLayout,
 ) -> u64 {
     let layout = match init_qcow2_output_layout(
         call_table,
@@ -1871,16 +1959,18 @@ unsafe fn convert_to_qcow2(
         input_device_count,
         virtual_size,
         bytes_read,
+        scratch_layout,
     ) {
         Some(l) => l,
         None => return *bytes_read,
     };
 
-    let buf_data = BUF_DATA as *mut u8;
-    let buf_l2 = BUF_L2_OUT as *mut u8;
+    let buf_data = scratch_layout.buf_data as *mut u8;
+    // BUF_L2_OUT: use multipurpose buffer for L2 table
+    let buf_l2 = scratch_layout.buf_multipurpose as *mut u8;
 
     // Staging buffer for decompressing clusters larger than chunk_size
-    let staging_buf_addr = DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE;
+    let staging_buf_addr = scratch_layout.staging_buf_addr(input_device_count);
     let staging_buf = staging_buf_addr as *mut u8;
     let mut staging_cluster_offset: u64 = u64::MAX;
 
@@ -1925,7 +2015,7 @@ unsafe fn convert_to_qcow2(
                 sector_size,
                 chain_config,
                 chain_states,
-                BUF_COMPRESSED_IN as *mut u8,
+                scratch_layout.buf_compressed as *mut u8,
                 staging_buf,
                 &mut staging_cluster_offset,
                 aes_key,
@@ -2060,6 +2150,7 @@ unsafe fn convert_to_qcow2(
         data_end_offset,
         None,
         bytes_read,
+        scratch_layout,
     ) {
         return *bytes_read;
     }
@@ -2080,8 +2171,10 @@ unsafe fn write_refcount_table(
     refblock_count: u64,
     output_sector_size: usize,
     output_capacity: u64,
+    scratch_layout: &ScratchLayout,
 ) -> bool {
-    let buf_rc = BUF_REFCOUNT as *mut u8;
+    // BUF_REFCOUNT: use multipurpose buffer for refcount table
+    let buf_rc = scratch_layout.buf_multipurpose as *mut u8;
     for rt_cluster in 0..reftable_clusters {
         core::ptr::write_bytes(buf_rc, 0, cluster_size as usize);
         let rt_slice = core::slice::from_raw_parts_mut(buf_rc, cluster_size as usize);
@@ -2145,6 +2238,7 @@ unsafe fn convert_to_qcow2_compressed(
     luks_key: Option<&[u8]>,
     luks_sector_size: u64,
     bytes_read: &mut u64,
+    scratch_layout: &ScratchLayout,
 ) -> u64 {
     let layout = match init_qcow2_output_layout(
         call_table,
@@ -2152,6 +2246,7 @@ unsafe fn convert_to_qcow2_compressed(
         input_device_count,
         virtual_size,
         bytes_read,
+        scratch_layout,
     ) {
         Some(l) => l,
         None => return *bytes_read,
@@ -2173,17 +2268,18 @@ unsafe fn convert_to_qcow2_compressed(
         return *bytes_read;
     }
 
-    let buf_data = BUF_DATA as *mut u8;
-    let buf_l2 = BUF_L2_OUT as *mut u8;
+    let buf_data = scratch_layout.buf_data as *mut u8;
+    // BUF_L2_OUT: use multipurpose buffer for L2 table
+    let buf_l2 = scratch_layout.buf_multipurpose as *mut u8;
 
     // Staging buffer for decompressing clusters larger than chunk_size
-    let staging_buf_addr = DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE;
+    let staging_buf_addr = scratch_layout.staging_buf_addr(input_device_count);
     let staging_buf = staging_buf_addr as *mut u8;
     let mut staging_cluster_offset: u64 = u64::MAX;
 
     // Reuse BUF_COMPRESSED_IN for compressed output (it's free
     // after read_chain_virtual_cluster returns).
-    let buf_compressed_out = BUF_COMPRESSED_IN as *mut u8;
+    let buf_compressed_out = scratch_layout.buf_compressed as *mut u8;
     let compressor_mem = compressor_addr as *mut u8;
     let refcount_array = refcount_array_addr as *mut u16;
 
@@ -2229,7 +2325,7 @@ unsafe fn convert_to_qcow2_compressed(
                 sector_size,
                 chain_config,
                 chain_states,
-                BUF_COMPRESSED_IN as *mut u8,
+                scratch_layout.buf_compressed as *mut u8,
                 staging_buf,
                 &mut staging_cluster_offset,
                 aes_key,
@@ -2437,6 +2533,7 @@ unsafe fn convert_to_qcow2_compressed(
         write_pos,
         Some((refcount_array, max_refcount_entries)),
         bytes_read,
+        scratch_layout,
     ) {
         return *bytes_read;
     }
@@ -2482,6 +2579,7 @@ unsafe fn init_vmdk_output_layout(
     input_device_count: usize,
     virtual_size: u64,
     bytes_read: &mut u64,
+    layout: &ScratchLayout,
 ) -> Option<VmdkOutputLayout> {
     let output_sector_size = (call_table.get_output_sector_size)();
     let output_capacity = (call_table.get_output_capacity)();
@@ -2501,8 +2599,7 @@ unsafe fn init_vmdk_output_layout(
         * output_sector_size as u64;
 
     // Allocate GD buffer after dynamic input caches + staging buffer
-    let gd_buf_addr =
-        DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE + MAX_CLUSTER_SIZE;
+    let gd_buf_addr = layout.staging_buf_addr(input_device_count) + MAX_CLUSTER_SIZE;
     let gd_bytes = num_gd_entries as usize * 4;
     // Round up to 8-byte alignment for safety
     let gd_alloc = (gd_bytes + 7) & !7;
@@ -2549,20 +2646,27 @@ unsafe fn convert_to_vmdk(
     luks_key: Option<&[u8]>,
     luks_sector_size: u64,
     bytes_read: &mut u64,
+    scratch_layout: &ScratchLayout,
 ) -> u64 {
-    let layout =
-        match init_vmdk_output_layout(call_table, input_device_count, virtual_size, bytes_read) {
-            Some(l) => l,
-            None => return *bytes_read,
-        };
+    let layout = match init_vmdk_output_layout(
+        call_table,
+        input_device_count,
+        virtual_size,
+        bytes_read,
+        scratch_layout,
+    ) {
+        Some(l) => l,
+        None => return *bytes_read,
+    };
 
-    let buf_data = BUF_DATA as *mut u8;
-    let buf_gt = BUF_L2_OUT as *mut u8;
+    let buf_data = scratch_layout.buf_data as *mut u8;
+    // BUF_L2_OUT: use multipurpose buffer for GT
+    let buf_gt = scratch_layout.buf_multipurpose as *mut u8;
     let oss = layout.output_sector_size;
     let oc = layout.output_capacity;
 
     // Staging buffer for decompressing clusters larger than chunk_size
-    let staging_buf_addr = DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE;
+    let staging_buf_addr = scratch_layout.staging_buf_addr(input_device_count);
     let staging_buf = staging_buf_addr as *mut u8;
     let mut staging_cluster_offset: u64 = u64::MAX;
 
@@ -2612,7 +2716,7 @@ unsafe fn convert_to_vmdk(
                 sector_size,
                 chain_config,
                 chain_states,
-                BUF_COMPRESSED_IN as *mut u8,
+                scratch_layout.buf_compressed as *mut u8,
                 staging_buf,
                 &mut staging_cluster_offset,
                 aes_key,
@@ -2740,7 +2844,8 @@ unsafe fn convert_to_vmdk(
     }
 
     // -- Write header + descriptor --
-    let buf_hdr = BUF_HEADER as *mut u8;
+    // BUF_HEADER: use multipurpose buffer for header
+    let buf_hdr = scratch_layout.buf_multipurpose as *mut u8;
     core::ptr::write_bytes(buf_hdr, 0, oss);
     let hdr_slice = core::slice::from_raw_parts_mut(buf_hdr, oss);
 
@@ -2772,8 +2877,8 @@ unsafe fn convert_to_vmdk(
             return *bytes_read;
         }
 
-        // Build descriptor in a separate buffer
-        let buf_desc = BUF_REFCOUNT as *mut u8;
+        // Build descriptor in a separate buffer (BUF_REFCOUNT: multipurpose)
+        let buf_desc = scratch_layout.buf_multipurpose as *mut u8;
         core::ptr::write_bytes(buf_desc, 0, oss);
         let desc_slice = core::slice::from_raw_parts_mut(buf_desc, oss);
         vmdk::build_descriptor(desc_slice, 0, layout.capacity_sectors);
@@ -2813,26 +2918,33 @@ unsafe fn convert_to_vmdk_compressed(
     luks_key: Option<&[u8]>,
     luks_sector_size: u64,
     bytes_read: &mut u64,
+    scratch_layout: &ScratchLayout,
 ) -> u64 {
-    let layout =
-        match init_vmdk_output_layout(call_table, input_device_count, virtual_size, bytes_read) {
-            Some(l) => l,
-            None => return *bytes_read,
-        };
+    let layout = match init_vmdk_output_layout(
+        call_table,
+        input_device_count,
+        virtual_size,
+        bytes_read,
+        scratch_layout,
+    ) {
+        Some(l) => l,
+        None => return *bytes_read,
+    };
 
-    let buf_data = BUF_DATA as *mut u8;
-    let buf_gt = BUF_L2_OUT as *mut u8;
+    let buf_data = scratch_layout.buf_data as *mut u8;
+    // BUF_L2_OUT: use multipurpose buffer for GT
+    let buf_gt = scratch_layout.buf_multipurpose as *mut u8;
     // SAFETY: buf_staging intentionally aliases BUF_COMPRESSED_IN.
     // BUF_COMPRESSED_IN is also passed to read_chain_virtual_cluster()
     // as the input decompression buffer.  The read completes and its
     // result is copied into buf_data *before* we touch buf_staging for
     // output compression, so the two uses never overlap in time.
     // Do NOT reorder: output compression must stay after the read call.
-    let buf_staging = BUF_COMPRESSED_IN as *mut u8;
+    let buf_staging = scratch_layout.buf_compressed as *mut u8;
     let oss = layout.output_sector_size;
 
     // Staging buffer for decompressing clusters larger than chunk_size
-    let staging_buf_addr = DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE;
+    let staging_buf_addr = scratch_layout.staging_buf_addr(input_device_count);
     let staging_buf = staging_buf_addr as *mut u8;
     let mut staging_cluster_offset: u64 = u64::MAX;
     let oc = layout.output_capacity;
@@ -2889,7 +3001,7 @@ unsafe fn convert_to_vmdk_compressed(
                 sector_size,
                 chain_config,
                 chain_states,
-                BUF_COMPRESSED_IN as *mut u8,
+                scratch_layout.buf_compressed as *mut u8,
                 staging_buf,
                 &mut staging_cluster_offset,
                 aes_key,
@@ -3009,8 +3121,11 @@ unsafe fn convert_to_vmdk_compressed(
             let gt_write_bytes = (VMDK_GT_BYTES + 511) & !511;
             let gt_sectors = gt_write_bytes / 512;
 
-            // Write GT marker before the GT data
-            let buf_marker = BUF_REFCOUNT as *mut u8;
+            // Write GT marker before the GT data.
+            // Use buf_data (not buf_multipurpose) because buf_gt aliases
+            // buf_multipurpose and still holds the GT entries we need to
+            // write immediately after the marker.
+            let buf_marker = scratch_layout.buf_data as *mut u8;
             core::ptr::write_bytes(buf_marker, 0, 512);
             let marker_slice = core::slice::from_raw_parts_mut(buf_marker, 512);
             vmdk::build_metadata_marker(marker_slice, gt_sectors as u64, vmdk::MARKER_GT);
@@ -3037,8 +3152,8 @@ unsafe fn convert_to_vmdk_compressed(
     let gd_write_bytes = ((layout.gd_bytes as u64 + 511) & !511).max(512);
     let gd_sectors = gd_write_bytes / 512;
 
-    // GD marker
-    let buf_marker = BUF_REFCOUNT as *mut u8;
+    // GD marker (BUF_REFCOUNT: multipurpose)
+    let buf_marker = scratch_layout.buf_multipurpose as *mut u8;
     core::ptr::write_bytes(buf_marker, 0, 512);
     let marker_slice = core::slice::from_raw_parts_mut(buf_marker, 512);
     vmdk::build_metadata_marker(marker_slice, gd_sectors as u64, vmdk::MARKER_GD);
@@ -3050,7 +3165,8 @@ unsafe fn convert_to_vmdk_compressed(
 
     // GD data
     let gd_byte_offset = write_pos;
-    let buf_staging = BUF_HEADER as *mut u8;
+    // BUF_HEADER: use multipurpose buffer for GD staging
+    let buf_staging = scratch_layout.buf_multipurpose as *mut u8;
     core::ptr::write_bytes(buf_staging, 0, gd_write_bytes as usize);
     core::ptr::copy_nonoverlapping(layout.gd_buf, buf_staging, layout.gd_bytes);
     if !write_bytes_to_output(
@@ -3079,8 +3195,8 @@ unsafe fn convert_to_vmdk_compressed(
         (total_before_pad + MAX_SECTOR_SIZE as u64 - 1) & !(MAX_SECTOR_SIZE as u64 - 1);
     let pad_bytes = padded_total - total_before_pad;
     if pad_bytes > 0 {
-        // Write zero-filled padding sectors
-        let buf_pad = BUF_REFCOUNT as *mut u8;
+        // Write zero-filled padding sectors (BUF_REFCOUNT: multipurpose)
+        let buf_pad = scratch_layout.buf_multipurpose as *mut u8;
         core::ptr::write_bytes(buf_pad, 0, MAX_SECTOR_SIZE);
         let mut remaining = pad_bytes;
         while remaining > 0 {
@@ -3109,8 +3225,8 @@ unsafe fn convert_to_vmdk_compressed(
     }
     write_pos += 512;
 
-    // Footer (header copy with real GD offset)
-    let buf_footer = BUF_HEADER as *mut u8;
+    // Footer (header copy with real GD offset) (BUF_HEADER: multipurpose)
+    let buf_footer = scratch_layout.buf_multipurpose as *mut u8;
     core::ptr::write_bytes(buf_footer, 0, 512);
     let footer_slice = core::slice::from_raw_parts_mut(buf_footer, 512);
     let overhead_sectors = layout.grain_data_start / 512;
@@ -3136,7 +3252,8 @@ unsafe fn convert_to_vmdk_compressed(
     }
 
     // -- Write header at offset 0 (gd_offset = GD_AT_END) --
-    let buf_hdr = BUF_HEADER as *mut u8;
+    // BUF_HEADER: use multipurpose buffer for header
+    let buf_hdr = scratch_layout.buf_multipurpose as *mut u8;
     core::ptr::write_bytes(buf_hdr, 0, 512);
     let hdr_slice = core::slice::from_raw_parts_mut(buf_hdr, 512);
     vmdk::build_streamoptimized_header(
@@ -3153,7 +3270,8 @@ unsafe fn convert_to_vmdk_compressed(
     }
 
     // -- Write descriptor at offset 512 --
-    let buf_desc = BUF_REFCOUNT as *mut u8;
+    // BUF_REFCOUNT: use multipurpose buffer for descriptor
+    let buf_desc = scratch_layout.buf_multipurpose as *mut u8;
     let desc_bytes = vmdk::DESC_SECTORS * 512;
     core::ptr::write_bytes(buf_desc, 0, desc_bytes as usize);
     let desc_slice = core::slice::from_raw_parts_mut(buf_desc, desc_bytes as usize);
@@ -3199,6 +3317,7 @@ unsafe fn convert_to_vhd(
     luks_key: Option<&[u8]>,
     luks_sector_size: u64,
     bytes_read: &mut u64,
+    layout: &ScratchLayout,
 ) -> u64 {
     let oss = (call_table.get_output_sector_size)();
     let oc = (call_table.get_output_capacity)();
@@ -3220,8 +3339,7 @@ unsafe fn convert_to_vhd(
     let data_start = bat_offset + bat_padded;
 
     // BAT buffer — allocate after dynamic input caches + staging buffer
-    let bat_buf_addr =
-        DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE + MAX_CLUSTER_SIZE;
+    let bat_buf_addr = layout.staging_buf_addr(input_device_count) + MAX_CLUSTER_SIZE;
     let bat_alloc = align_up(bat_size_bytes, 8) as usize;
 
     if bat_buf_addr + bat_alloc > ALLOC_HEAP_BASE {
@@ -3235,7 +3353,7 @@ unsafe fn convert_to_vhd(
     core::ptr::write_bytes(bat_buf, 0xFF, bat_alloc);
 
     // Staging buffer for decompressing clusters larger than chunk_size
-    let staging_buf_addr = DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE;
+    let staging_buf_addr = layout.staging_buf_addr(input_device_count);
     let staging_buf = staging_buf_addr as *mut u8;
     let mut staging_cluster_offset: u64 = u64::MAX;
 
@@ -3250,7 +3368,8 @@ unsafe fn convert_to_vhd(
     uuid[8] = (uuid[8] & 0x3F) | 0x80; // variant 1
 
     // Write initial footer copy at offset 0
-    let buf_hdr = BUF_HEADER as *mut u8;
+    // BUF_HEADER: use multipurpose buffer for header
+    let buf_hdr = layout.buf_multipurpose as *mut u8;
     core::ptr::write_bytes(buf_hdr, 0, oss);
     let footer_slice = core::slice::from_raw_parts_mut(buf_hdr, vhd::FOOTER_SIZE);
     vhd::build_footer(
@@ -3297,7 +3416,8 @@ unsafe fn convert_to_vhd(
 
     // Write placeholder BAT (all 0xFFFFFFFF)
     // Write in output-sector-sized chunks
-    let bat_write_buf = BUF_L2_OUT as *mut u8;
+    // BUF_L2_OUT: use multipurpose buffer for BAT write
+    let bat_write_buf = layout.buf_multipurpose as *mut u8;
     let mut bat_written: u64 = 0;
     while bat_written < bat_padded {
         core::ptr::write_bytes(bat_write_buf, 0xFF, oss);
@@ -3316,18 +3436,22 @@ unsafe fn convert_to_vhd(
     }
 
     // Write block data
-    let buf_data = BUF_DATA as *mut u8;
+    let buf_data = layout.buf_data as *mut u8;
     let mut next_free_byte = data_start;
     let mut blocks_done: u64 = 0;
     let total_blocks = max_table_entries as u64;
     let mut last_percent: u32 = 0;
 
-    // Prepare a sector bitmap with all bits set (all sectors present)
-    // Reuse BUF_REFCOUNT for bitmap
-    let bitmap_buf = BUF_REFCOUNT as *mut u8;
-    core::ptr::write_bytes(bitmap_buf, 0xFF, bitmap_bytes as usize);
+    // Prepare a sector bitmap with all bits set (all sectors present).
+    // Uses buf_multipurpose, which also serves as read_buf below.
+    // Must re-initialize each block since read_buf overwrites it.
+    let bitmap_buf = layout.buf_multipurpose as *mut u8;
 
     for block_idx in 0..max_table_entries {
+        // Re-initialize bitmap each iteration because read_buf
+        // (which aliases bitmap_buf via buf_multipurpose) is used
+        // for input reads that overwrite the bitmap data.
+        core::ptr::write_bytes(bitmap_buf, 0xFF, bitmap_bytes as usize);
         let virtual_offset = block_idx as u64 * block_size;
         let remaining = virtual_size - virtual_offset;
         let this_block = if remaining < block_size {
@@ -3366,7 +3490,7 @@ unsafe fn convert_to_vhd(
                 sector_size,
                 chain_config,
                 chain_states,
-                BUF_COMPRESSED_IN as *mut u8,
+                layout.buf_compressed as *mut u8,
                 staging_buf,
                 &mut staging_cluster_offset,
                 aes_key,
@@ -3425,8 +3549,16 @@ unsafe fn convert_to_vhd(
         // must stay sector-aligned; the bitmap shifts data by
         // bitmap_bytes so each output sector is assembled from a
         // carry (leftover from previous read) plus a fresh read.
-        let read_buf = BUF_L2_OUT as *mut u8;
-        let carry_buf = BUF_HEADER as *mut u8;
+        // BUF_L2_OUT: use multipurpose buffer for read buffer
+        let read_buf = layout.buf_multipurpose as *mut u8;
+        // SAFETY: carry_buf intentionally aliases BUF_COMPRESSED_IN.
+        // BUF_COMPRESSED_IN is also passed to read_chain_virtual_cluster()
+        // as the input decompression buffer.  Carry data is always consumed
+        // (copied to buf_data and carry_len reset to 0) *before* the next
+        // read_chain_virtual_cluster call that may use the buffer for
+        // decompression, so the two uses never overlap in time.
+        // Do NOT reorder: carry consumption must stay before the read call.
+        let carry_buf = layout.buf_compressed as *mut u8;
         let mut carry_len: usize = 0;
         let mut vdata_read: u64 = 0;
         let total_sectors = block_aligned / oss as u64;
@@ -3473,7 +3605,7 @@ unsafe fn convert_to_vhd(
                     sector_size,
                     chain_config,
                     chain_states,
-                    BUF_COMPRESSED_IN as *mut u8,
+                    layout.buf_compressed as *mut u8,
                     staging_buf,
                     &mut staging_cluster_offset,
                     aes_key,
@@ -3614,6 +3746,7 @@ unsafe fn convert_to_vhdx(
     luks_key: Option<&[u8]>,
     luks_sector_size: u64,
     bytes_read: &mut u64,
+    layout: &ScratchLayout,
 ) -> u64 {
     let oss = (call_table.get_output_sector_size)();
     let oc = (call_table.get_output_capacity)();
@@ -3652,8 +3785,7 @@ unsafe fn convert_to_vhdx(
     let payload_start = metadata_offset + metadata_region_size;
 
     // BAT buffer — allocate after dynamic input caches + staging buffer
-    let bat_buf_addr =
-        DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE + MAX_CLUSTER_SIZE;
+    let bat_buf_addr = layout.staging_buf_addr(input_device_count) + MAX_CLUSTER_SIZE;
     let bat_alloc = align_up(bat_size_bytes, 8) as usize;
 
     if bat_buf_addr + bat_alloc > ALLOC_HEAP_BASE {
@@ -3667,14 +3799,15 @@ unsafe fn convert_to_vhdx(
     core::ptr::write_bytes(bat_buf, 0, bat_alloc);
 
     // Staging buffer for decompressing clusters larger than chunk_size
-    let staging_buf_addr = DYNAMIC_BUFS_START + input_device_count * 2 * MAX_SECTOR_SIZE;
+    let staging_buf_addr = layout.staging_buf_addr(input_device_count);
     let staging_buf = staging_buf_addr as *mut u8;
     let mut staging_cluster_offset: u64 = u64::MAX;
 
     (call_table.verbose_print)(b"convert: starting VHDX conversion\n\0".as_ptr());
 
     // --- Write file identifier (64KB) ---
-    let buf_hdr = BUF_HEADER as *mut u8;
+    // BUF_HEADER: use multipurpose buffer for header
+    let buf_hdr = layout.buf_multipurpose as *mut u8;
     core::ptr::write_bytes(buf_hdr, 0, MAX_SECTOR_SIZE);
     let fi_slice = core::slice::from_raw_parts_mut(buf_hdr, MAX_SECTOR_SIZE);
     vhdx::build_file_identifier(fi_slice);
@@ -3782,7 +3915,8 @@ unsafe fn convert_to_vhdx(
     }
 
     // --- Write placeholder BAT (all NOT_PRESENT = 0x00) ---
-    let bat_write_buf = BUF_L2_OUT as *mut u8;
+    // BUF_L2_OUT: use multipurpose buffer for BAT write
+    let bat_write_buf = layout.buf_multipurpose as *mut u8;
     let mut bat_written: u64 = 0;
     let bat_padded = align_up(bat_size_bytes, oss);
     while bat_written < bat_padded {
@@ -3837,7 +3971,7 @@ unsafe fn convert_to_vhdx(
     // our buffer is exactly 0x10000 (64KB), so items_base is at
     // the buffer boundary. Let's handle this by writing metadata
     // items separately.
-    let buf_data = BUF_DATA as *mut u8;
+    let buf_data = layout.buf_data as *mut u8;
     core::ptr::write_bytes(buf_data, 0, oss);
     let item_slice = core::slice::from_raw_parts_mut(buf_data, oss);
     // File Parameters: block_size (u32) + flags (u32)
@@ -3913,7 +4047,7 @@ unsafe fn convert_to_vhdx(
                 sector_size,
                 chain_config,
                 chain_states,
-                BUF_COMPRESSED_IN as *mut u8,
+                layout.buf_compressed as *mut u8,
                 staging_buf,
                 &mut staging_cluster_offset,
                 aes_key,
@@ -3982,7 +4116,7 @@ unsafe fn convert_to_vhdx(
                 sector_size,
                 chain_config,
                 chain_states,
-                BUF_COMPRESSED_IN as *mut u8,
+                layout.buf_compressed as *mut u8,
                 staging_buf,
                 &mut staging_cluster_offset,
                 aes_key,

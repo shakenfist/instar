@@ -1375,19 +1375,16 @@ pub unsafe fn read_cluster_sectors(
 /// VHD data blocks are addressed in 512-byte sectors, but the device
 /// sector size may be larger (e.g. 65536 bytes). When the data start
 /// offset falls inside a sector, this function reads the first sector
-/// to a temporary location and copies the relevant tail, then reads
-/// the remaining sectors directly into `buf`.
+/// into `scratch` and copies the relevant tail, then reads the
+/// remaining sectors directly into `buf`.
 ///
-/// Uses `buf` itself (offset by one sector) as scratch space for the
-/// first partial-sector read. This is safe because VHD blocks are
-/// always >= 2 MiB while the max sector is 64 KiB, so the buffer
-/// always has room beyond the first sector's output position.
+/// `scratch` is a caller-provided buffer used for partial-sector reads
+/// so that `buf` is not overwritten beyond `chunk_size` bytes.
 ///
 /// # Safety
 ///
-/// `buf` must point to at least `max(chunk_size, sector_size) + sector_size`
-/// writable bytes.  The caller's cluster buffer (MAX_CLUSTER_SIZE) satisfies
-/// this since VHD blocks are >= 2 MiB and sectors are <= 64 KiB.
+/// `buf` must point to at least `max(chunk_size, sector_size)` writable
+/// bytes.  `scratch` must point to at least `sector_size` writable bytes.
 /// `call_table` must be valid.
 #[cfg(feature = "vhd-input")]
 unsafe fn read_offset_sectors(
@@ -1397,15 +1394,12 @@ unsafe fn read_offset_sectors(
     buf: *mut u8,
     chunk_size: u64,
     sector_size: usize,
+    scratch: *mut u8,
     bytes_read: &mut u64,
 ) -> bool {
     let first_sector = host_offset / sector_size as u64;
     let off_in_sector = (host_offset % sector_size as u64) as usize;
     let first_useful = sector_size - off_in_sector;
-
-    // Read the first (partial) sector into buf at offset sector_size
-    // (scratch area) and copy the useful tail to buf[0..].
-    let scratch = buf.add(sector_size);
     if !(call_table.read_input_sector)(device_idx, first_sector, scratch, sector_size) {
         return false;
     }
@@ -2699,6 +2693,7 @@ pub unsafe fn read_chain_virtual_cluster(
                             buf,
                             chunk_size,
                             sector_size,
+                            compressed_buf,
                             bytes_read,
                         );
                     }

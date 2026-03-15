@@ -198,11 +198,15 @@ provides a modular architecture with:
   flattening, and LUKS-in-QCOW2 decryption via `--luks-passphrase`)
 - **operations/convert/** - Image conversion operation (any input to raw,
   QCOW2 v3, VMDK, VHD, or VHDX output, with backing chain flattening
-  and compressed cluster decompression). QCOW2 writer uses linear
-  cluster allocation with OFLAG_COPIED, 16-bit refcounts, and iterative
-  convergence for refcount metadata sizing. Sparse output is the default
-  (skip zero-filled clusters, matching `qemu-img convert`); use
-  `--no-skip-zeros` for dense output. Optional compressed output
+  and compressed cluster decompression). Scratch memory layout is computed
+  at runtime via `ScratchLayout` based on output cluster size, enabling
+  QCOW2 output with cluster sizes from 512B to 2MB. Three conceptual
+  buffers (header, L2 table, refcount block) share a single multipurpose
+  buffer since they are used in non-overlapping phases. QCOW2 writer
+  uses linear cluster allocation with OFLAG_COPIED, 16-bit refcounts,
+  and iterative convergence for refcount metadata sizing. Sparse output
+  is the default (skip zero-filled clusters, matching `qemu-img convert`);
+  use `--no-skip-zeros` for dense output. Optional compressed output
   (`-c` flag) packs clusters at sector granularity using raw deflate
   (via miniz_oxide), with fallback to uncompressed for incompressible
   data. VHD writer emits dynamic VHD with 2 MiB blocks, sector bitmaps,
