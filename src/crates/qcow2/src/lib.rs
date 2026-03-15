@@ -1397,15 +1397,12 @@ unsafe fn read_offset_sectors(
     buf: *mut u8,
     chunk_size: u64,
     sector_size: usize,
+    scratch: *mut u8,
     bytes_read: &mut u64,
 ) -> bool {
     let first_sector = host_offset / sector_size as u64;
     let off_in_sector = (host_offset % sector_size as u64) as usize;
     let first_useful = sector_size - off_in_sector;
-
-    // Read the first (partial) sector into buf at offset sector_size
-    // (scratch area) and copy the useful tail to buf[0..].
-    let scratch = buf.add(sector_size);
     if !(call_table.read_input_sector)(device_idx, first_sector, scratch, sector_size) {
         return false;
     }
@@ -2699,6 +2696,7 @@ pub unsafe fn read_chain_virtual_cluster(
                             buf,
                             chunk_size,
                             sector_size,
+                            compressed_buf,
                             bytes_read,
                         );
                     }
