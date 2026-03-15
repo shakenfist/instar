@@ -55,6 +55,36 @@ OSLO_SKIP_IMAGES = {
     # Malformed VMDK descriptors
     'vmdk-no-extents',
     'vmdk-path-traversal',
+    # Adversarial images — deliberately malformed, not suitable for
+    # cross-validation against oslo.utils format_inspector
+    'qcow2-compression-bomb-zlib',
+    'qcow2-compression-bomb-zstd',
+    'qcow2-circular-2',
+    'qcow2-circular-3',
+    'qcow2-self-referencing',
+    'qcow2-chain-depth-16',
+    'qcow2-chain-depth-17',
+    'qcow2-l1-overflow',
+    'qcow2-l1-zero',
+    'qcow2-cluster-bits-low',
+    'qcow2-cluster-bits-high',
+    'qcow2-refcount-order-7',
+    'qcow2-refcount-order-255',
+    'qcow2-vsize-petabyte',
+    'qcow2-vsize-max',
+    'vmdk-grain-size-zero',
+    'vmdk-grain-size-huge',
+    'vhdx-conflicting-headers',
+    'vhd-bat-beyond-eof',
+    'vhdx-bat-beyond-eof',
+    'polyglot-qcow2-vmdk',
+    'polyglot-qcow2-elf',
+    'qcow2-truncated-header-v2',
+    'vmdk-truncated-after-magic',
+    'vhd-truncated-footer',
+    'vmdk-descriptor-null-bytes',
+    'vmdk-descriptor-multi-extent',
+    'vmdk-descriptor-huge',
 }
 
 # Format name mapping: imago -> oslo.utils.
