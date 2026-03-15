@@ -399,8 +399,13 @@ deliberately corrupt test images, cross-validate `imago compare` output
 against `qemu-img compare`, and cross-validate `imago convert` output against
 `qemu-img convert`. oslo.utils `format_inspector` cross-validation tests
 verify that imago's format detection, safety checks, and virtual size
-reporting agree with OpenStack's image safety gate. Test images are in the
-sibling `imago-testdata/` repository.
+reporting agree with OpenStack's image safety gate. Adversarial image tests
+verify safe handling of compression bombs, circular/deep backing chains,
+integer overflow headers, boundary value edge cases (refcount order,
+oversized virtual sizes, VMDK grain sizes, VHDX dual headers, BAT beyond EOF),
+and format confusion attacks (polyglot files, truncated headers, VMDK
+descriptor attacks). Test images are in the sibling `imago-testdata/`
+repository.
 
 **Running:**
 ```bash
