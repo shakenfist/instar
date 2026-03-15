@@ -3121,8 +3121,11 @@ unsafe fn convert_to_vmdk_compressed(
             let gt_write_bytes = (VMDK_GT_BYTES + 511) & !511;
             let gt_sectors = gt_write_bytes / 512;
 
-            // Write GT marker before the GT data (BUF_REFCOUNT: multipurpose)
-            let buf_marker = scratch_layout.buf_multipurpose as *mut u8;
+            // Write GT marker before the GT data.
+            // Use buf_data (not buf_multipurpose) because buf_gt aliases
+            // buf_multipurpose and still holds the GT entries we need to
+            // write immediately after the marker.
+            let buf_marker = scratch_layout.buf_data as *mut u8;
             core::ptr::write_bytes(buf_marker, 0, 512);
             let marker_slice = core::slice::from_raw_parts_mut(buf_marker, 512);
             vmdk::build_metadata_marker(marker_slice, gt_sectors as u64, vmdk::MARKER_GT);
@@ -3439,12 +3442,16 @@ unsafe fn convert_to_vhd(
     let total_blocks = max_table_entries as u64;
     let mut last_percent: u32 = 0;
 
-    // Prepare a sector bitmap with all bits set (all sectors present)
-    // Reuse BUF_REFCOUNT (multipurpose buffer) for bitmap
+    // Prepare a sector bitmap with all bits set (all sectors present).
+    // Uses buf_multipurpose, which also serves as read_buf below.
+    // Must re-initialize each block since read_buf overwrites it.
     let bitmap_buf = layout.buf_multipurpose as *mut u8;
-    core::ptr::write_bytes(bitmap_buf, 0xFF, bitmap_bytes as usize);
 
     for block_idx in 0..max_table_entries {
+        // Re-initialize bitmap each iteration because read_buf
+        // (which aliases bitmap_buf via buf_multipurpose) is used
+        // for input reads that overwrite the bitmap data.
+        core::ptr::write_bytes(bitmap_buf, 0xFF, bitmap_bytes as usize);
         let virtual_offset = block_idx as u64 * block_size;
         let remaining = virtual_size - virtual_offset;
         let this_block = if remaining < block_size {
