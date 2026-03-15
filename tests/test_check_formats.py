@@ -1850,3 +1850,97 @@ class TestCheckQcow2Snapshots(ImagoTestBase):
             'Snapshot count', stdout,
             f'Should not report snapshots: {stdout}'
         )
+
+
+class TestCheckEnhancedValidation(ImagoTestBase):
+    """Test enhanced structural validation for VMDK, VHD, VHDX.
+
+    Phase 22 validation: grain markers, RGD, block bitmaps,
+    geometry, region table fallback, log detection, fragmentation.
+    """
+
+    def test_check_streamoptimized_vmdk_clean(self):
+        """StreamOptimized VMDK should pass grain marker checks."""
+        image = self.get_image('vmdk-streamoptimized')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        self.assertEqual(
+            rc, 0,
+            f'check failed for streamOptimized VMDK: '
+            f'{stderr}'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('corruptions', -1), 0,
+            f'Clean streamOptimized VMDK reported '
+            f'corruptions: {stdout}'
+        )
+
+    def test_check_vmdk_corrupt_grain_marker(self):
+        """VMDK with corrupt grain marker LBA should report error."""
+        image = self.get_image('raw-mbr-partitioned')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+            suffix='.vmdk'
+        ) as vmdk_tmp:
+            # Create a streamOptimized VMDK with data
+            _, stderr, rc = self.run_imago_convert(
+                image.path, Path(vmdk_tmp.name),
+                output_format='vmdk', compress=True,
+                timeout=60
+            )
+            self.assertEqual(
+                rc, 0,
+                f'convert to vmdk failed: {stderr}'
+            )
+
+            data = Path(vmdk_tmp.name).read_bytes()
+
+            # Find first grain marker after descriptor
+            desc_off = struct.unpack_from(
+                '<Q', data, 28
+            )[0]
+            desc_sz = struct.unpack_from(
+                '<Q', data, 36
+            )[0]
+            grain_start = (desc_off + desc_sz) * 512
+
+            # Verify there's a grain marker with data
+            if grain_start + 12 > len(data):
+                self.skipTest(
+                    'VMDK too small for grain marker'
+                )
+            _, comp_size = struct.unpack_from(
+                '<QI', data, grain_start
+            )
+            if comp_size == 0:
+                self.skipTest(
+                    'No compressed grain data found'
+                )
+
+            # Corrupt the LBA field
+            with open(vmdk_tmp.name, 'r+b') as f:
+                f.seek(grain_start)
+                f.write(struct.pack('<Q', 0xDEADBEEF))
+
+            stdout, stderr, rc = self.run_imago_check(
+                Path(vmdk_tmp.name),
+                output_format='json'
+            )
+            result = json.loads(stdout)
+            self.assertGreater(
+                result.get('corruptions', 0), 0,
+                'Corrupt grain marker LBA should '
+                'be detected'
+            )

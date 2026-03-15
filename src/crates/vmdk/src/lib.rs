@@ -277,6 +277,22 @@ pub fn build_metadata_marker(buf: &mut [u8], num_sectors: u64, marker_type: u32)
     write_le_u32(buf, 12, marker_type);
 }
 
+/// Parse a grain marker from a 12-byte buffer.
+///
+/// Returns `(lba, compressed_size)` where `lba` is the virtual
+/// grain LBA in sectors and `compressed_size` is the byte count
+/// of the compressed payload following the marker.
+///
+/// Returns `None` if `buf` is shorter than 12 bytes.
+pub fn parse_grain_marker(buf: &[u8]) -> Option<(u64, u32)> {
+    if buf.len() < GRAIN_MARKER_SIZE {
+        return None;
+    }
+    let lba = le_u64(buf, 0);
+    let size = le_u32(buf, 8);
+    Some((lba, size))
+}
+
 // ============================================================================
 // Basic header parsing (used by info operation)
 // ============================================================================

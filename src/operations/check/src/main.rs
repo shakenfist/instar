@@ -734,16 +734,73 @@ unsafe fn check_vmdk(
             }
 
             if hdr.is_compressed {
-                // Compressed grain: GTE points to grain marker.
-                // Validate offset is within bounds. Compressed data
-                // is variable-size; mark the host grain in the bitmap
-                // (overlaps are expected, like QCOW2 compressed).
+                // Compressed grain: GTE points to grain marker
+                // (12 bytes: u64 LBA + u32 compressed_size).
+                // Read and validate the marker.
+                let marker_sector = grain_off / sector_size as u64;
+                let marker_off_in_sector = (grain_off % sector_size as u64) as usize;
+
+                if marker_sector < input_capacity
+                    && marker_off_in_sector + vmdk::GRAIN_MARKER_SIZE <= sector_size
+                {
+                    let mut marker_buf = [0u8; MAX_SECTOR_SIZE];
+                    if (call_table.read_input_sector)(
+                        0,
+                        marker_sector,
+                        marker_buf.as_mut_ptr(),
+                        sector_size,
+                    ) {
+                        bytes_read += sector_size as u64;
+                        if let Some((lba, comp_size)) =
+                            vmdk::parse_grain_marker(&marker_buf[marker_off_in_sector..])
+                        {
+                            // Validate LBA matches expected virtual grain
+                            let expected_lba = (gd_idx as u64)
+                                .saturating_mul(hdr.num_gtes_per_gt as u64)
+                                .saturating_add(gt_idx as u64)
+                                .saturating_mul(hdr.grain_size_sectors);
+                            if lba != expected_lba {
+                                result.corruptions += 1;
+                                result.total_errors += 1;
+                                (call_table.debug_print)(
+                                    b"check: grain marker LBA mismatch\n\0".as_ptr(),
+                                );
+                            }
+
+                            // Validate compressed_size > 0
+                            if comp_size == 0 {
+                                result.corruptions += 1;
+                                result.total_errors += 1;
+                                (call_table.debug_print)(
+                                    b"check: grain marker zero size\n\0".as_ptr(),
+                                );
+                            }
+
+                            // Validate compressed data fits in file
+                            let data_end = grain_off
+                                .checked_add(vmdk::GRAIN_MARKER_SIZE as u64)
+                                .and_then(|v| v.checked_add(comp_size as u64));
+                            match data_end {
+                                Some(end) if end <= actual_size => {
+                                    if end > max_offset {
+                                        max_offset = end;
+                                    }
+                                }
+                                _ => {
+                                    result.corruptions += 1;
+                                    result.total_errors += 1;
+                                    (call_table.debug_print)(
+                                        b"check: grain data beyond EOF\n\0".as_ptr(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
                 result.clusters_allocated += 1;
                 if bmp.can_track {
                     bmp.set(grain_off / grain_size_bytes);
-                }
-                if grain_off > max_offset {
-                    max_offset = grain_off;
                 }
             } else {
                 // Standard grain: validate full grain within file
