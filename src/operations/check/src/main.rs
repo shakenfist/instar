@@ -854,6 +854,184 @@ unsafe fn check_vmdk(
 
     (call_table.verbose_print)(b"check: vmdk GD/GT walk complete\n\0".as_ptr());
 
+    // ---- Validate redundant grain directory (RGD) ----
+    if (hdr.flags & vmdk::FLAG_USE_RGD) != 0 && hdr.rgd_offset_sectors != 0 {
+        let rgd_byte_offset = match hdr.rgd_offset_sectors.checked_mul(512) {
+            Some(off) if off < actual_size => off,
+            _ => {
+                result.corruptions += 1;
+                result.total_errors += 1;
+                (call_table.debug_print)(b"check: RGD offset out of bounds\n\0".as_ptr());
+                // Skip RGD validation but continue
+                0
+            }
+        };
+
+        if rgd_byte_offset > 0 {
+            let rgd_end = match rgd_byte_offset.checked_add(gd_size_bytes) {
+                Some(end) if end <= actual_size => end,
+                _ => {
+                    result.corruptions += 1;
+                    result.total_errors += 1;
+                    (call_table.debug_print)(b"check: RGD extends beyond file\n\0".as_ptr());
+                    0
+                }
+            };
+
+            if rgd_end > 0 {
+                // Mark RGD region in bitmap. RGD may colocate
+                // with GD/GT/descriptor in the same grain
+                // (especially small VMDKs), so mark without
+                // checking AlreadySet — same as GD marking.
+                if bmp.can_track {
+                    let rgd_first = rgd_byte_offset / grain_size_bytes;
+                    let rgd_last = rgd_end.saturating_sub(1) / grain_size_bytes;
+                    for g in rgd_first..=rgd_last {
+                        bmp.set(g);
+                    }
+                }
+
+                if rgd_end > max_offset {
+                    max_offset = rgd_end;
+                }
+
+                // Compare RGD against primary GD.
+                // GD and RGD entries point to different GT copies, so
+                // we compare allocation consistency (both zero or both
+                // non-zero) and, for allocated entries, compare the
+                // GT contents they reference.
+                let mut rgd_cached_sector: u64 = u64::MAX;
+                let mut rgd_cache = [0u8; MAX_SECTOR_SIZE];
+                let mut rgd_mismatches: u64 = 0;
+
+                let mut gd2_cached_sector: u64 = u64::MAX;
+                let mut gd2_cache = [0u8; MAX_SECTOR_SIZE];
+
+                // Extra caches for GT/RGT comparison reads
+                let mut gt_cmp_cached: u64 = u64::MAX;
+                let mut gt_cmp_cache = [0u8; MAX_SECTOR_SIZE];
+                let mut rgt_cmp_cached: u64 = u64::MAX;
+                let mut rgt_cmp_cache = [0u8; MAX_SECTOR_SIZE];
+
+                for i in 0..num_gd_entries {
+                    let gd_off = match (i as u64)
+                        .checked_mul(4)
+                        .and_then(|v| gd_byte_offset.checked_add(v))
+                    {
+                        Some(off) => off,
+                        None => break,
+                    };
+                    let rgd_off = match (i as u64)
+                        .checked_mul(4)
+                        .and_then(|v| rgd_byte_offset.checked_add(v))
+                    {
+                        Some(off) => off,
+                        None => break,
+                    };
+
+                    let gd_val = vmdk::read_u32_le_cached(
+                        call_table,
+                        0,
+                        gd_off,
+                        sector_size,
+                        input_capacity,
+                        &mut gd2_cached_sector,
+                        gd2_cache.as_mut_ptr(),
+                        &mut bytes_read,
+                    );
+                    let rgd_val = vmdk::read_u32_le_cached(
+                        call_table,
+                        0,
+                        rgd_off,
+                        sector_size,
+                        input_capacity,
+                        &mut rgd_cached_sector,
+                        rgd_cache.as_mut_ptr(),
+                        &mut bytes_read,
+                    );
+
+                    match (gd_val, rgd_val) {
+                        (Some(gd), Some(rgd)) => {
+                            // Check allocation consistency
+                            if (gd == 0) != (rgd == 0) {
+                                rgd_mismatches += 1;
+                                continue;
+                            }
+                            // Both allocated: compare GT contents
+                            if gd != 0 && rgd != 0 {
+                                let gt_base = (gd as u64) * 512;
+                                let rgt_base = (rgd as u64) * 512;
+                                for j in 0..hdr.num_gtes_per_gt {
+                                    let gt_e_off = match (j as u64)
+                                        .checked_mul(4)
+                                        .and_then(|v| gt_base.checked_add(v))
+                                    {
+                                        Some(off) => off,
+                                        None => break,
+                                    };
+                                    let rgt_e_off = match (j as u64)
+                                        .checked_mul(4)
+                                        .and_then(|v| rgt_base.checked_add(v))
+                                    {
+                                        Some(off) => off,
+                                        None => break,
+                                    };
+                                    let gt_e = vmdk::read_u32_le_cached(
+                                        call_table,
+                                        0,
+                                        gt_e_off,
+                                        sector_size,
+                                        input_capacity,
+                                        &mut gt_cmp_cached,
+                                        gt_cmp_cache.as_mut_ptr(),
+                                        &mut bytes_read,
+                                    );
+                                    let rgt_e = vmdk::read_u32_le_cached(
+                                        call_table,
+                                        0,
+                                        rgt_e_off,
+                                        sector_size,
+                                        input_capacity,
+                                        &mut rgt_cmp_cached,
+                                        rgt_cmp_cache.as_mut_ptr(),
+                                        &mut bytes_read,
+                                    );
+                                    match (gt_e, rgt_e) {
+                                        (Some(a), Some(b)) if a != b => {
+                                            rgd_mismatches += 1;
+                                            // One mismatch per GD entry is enough
+                                            break;
+                                        }
+                                        (None, _) | (_, None) => {
+                                            rgd_mismatches += 1;
+                                            break;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            // Read error on either GD or RGD
+                            result.corruptions += 1;
+                            result.total_errors += 1;
+                            (call_table.debug_print)(b"check: RGD read error\n\0".as_ptr());
+                            break;
+                        }
+                    }
+                }
+
+                if rgd_mismatches > 0 {
+                    result.corruptions += 1;
+                    result.total_errors += 1;
+                    (call_table.debug_print)(b"check: GD/RGD mismatch\n\0".as_ptr());
+                }
+
+                (call_table.verbose_print)(b"check: RGD validation complete\n\0".as_ptr());
+            }
+        }
+    }
+
     // Calculate fragmentation
     if total_data_entries > 1 {
         result.fragmentation = ((fragmented_entries * 100) / (total_data_entries - 1)) as u32;

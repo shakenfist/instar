@@ -1944,3 +1944,105 @@ class TestCheckEnhancedValidation(ImagoTestBase):
                 'Corrupt grain marker LBA should '
                 'be detected'
             )
+
+    def test_check_vmdk_rgd_mismatch(self):
+        """VMDK with mismatched GD/RGD should report error."""
+        image = self.get_image('raw-mbr-partitioned')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+            suffix='.vmdk'
+        ) as vmdk_tmp:
+            # Create a monolithicSparse VMDK (uncompressed)
+            _, stderr, rc = self.run_imago_convert(
+                image.path, Path(vmdk_tmp.name),
+                output_format='vmdk', compress=False,
+                timeout=60
+            )
+            self.assertEqual(
+                rc, 0,
+                f'convert to vmdk failed: {stderr}'
+            )
+
+            data = bytearray(
+                Path(vmdk_tmp.name).read_bytes()
+            )
+
+            # Parse header fields
+            flags = struct.unpack_from('<I', data, 8)[0]
+            num_gtes = struct.unpack_from(
+                '<I', data, 44
+            )[0]
+            gd_offset_sectors = struct.unpack_from(
+                '<Q', data, 56
+            )[0]
+            capacity = struct.unpack_from(
+                '<Q', data, 12
+            )[0]
+            grain_size = struct.unpack_from(
+                '<Q', data, 20
+            )[0]
+
+            # Calculate GD size
+            total_grains = (
+                (capacity + grain_size - 1) // grain_size
+            )
+            num_gd_entries = (
+                (total_grains + num_gtes - 1) // num_gtes
+            )
+            gd_byte_off = gd_offset_sectors * 512
+            gd_size = num_gd_entries * 4
+
+            # Create an RGD at end of file. Copy the GD
+            # but zero out the first non-zero entry to
+            # create an allocation mismatch (GD says
+            # allocated, RGD says unallocated).
+            rgd_byte_off = len(data)
+            if rgd_byte_off % 512 != 0:
+                pad = 512 - (rgd_byte_off % 512)
+                data.extend(b'\x00' * pad)
+                rgd_byte_off = len(data)
+
+            gd_data = bytearray(
+                data[gd_byte_off:gd_byte_off + gd_size]
+            )
+            # Zero out first non-zero entry
+            for i in range(0, len(gd_data), 4):
+                val = struct.unpack_from(
+                    '<I', gd_data, i
+                )[0]
+                if val != 0:
+                    struct.pack_into(
+                        '<I', gd_data, i, 0
+                    )
+                    break
+
+            data.extend(gd_data)
+            remainder = len(gd_data) % 512
+            if remainder != 0:
+                data.extend(b'\x00' * (512 - remainder))
+
+            # Set FLAG_USE_RGD (bit 1) in flags
+            flags |= (1 << 1)
+            struct.pack_into('<I', data, 8, flags)
+
+            # Set rgd_offset (offset 48) in sectors
+            rgd_sectors = rgd_byte_off // 512
+            struct.pack_into(
+                '<Q', data, 48, rgd_sectors
+            )
+
+            Path(vmdk_tmp.name).write_bytes(data)
+
+            stdout, stderr, rc = self.run_imago_check(
+                Path(vmdk_tmp.name),
+                output_format='json'
+            )
+            result = json.loads(stdout)
+            self.assertGreater(
+                result.get('corruptions', 0), 0,
+                'GD/RGD mismatch should be detected'
+            )
