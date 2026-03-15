@@ -1,6 +1,6 @@
 # Plan: Implementing `imago convert` (and Prerequisites)
 
-## Status: Phase 21 Complete - Large Cluster Output
+## Status: Phase 21 Complete + Bug Fixes
 
 **Completed:**
 - Phase -1: Configuration file support
@@ -160,8 +160,12 @@
 - Phase 19: Extended L2 subcluster support.
 - Phase 21: Large cluster QCOW2 output (up to 2MB). Dynamic
   buffer layout via ScratchLayout struct, lifted VMM validation
-  from 64KB to 2MB, 6 integration tests. See
-  PLAN-convert-phase21.md.
+  from 64KB to 2MB, 6 integration tests. Fixed three buffer
+  aliasing bugs: VMDK GT marker overwrote GT entries via
+  buf_multipurpose, VHD bitmap not re-initialized per block,
+  VHD input read_offset_sectors buffer overflow corrupting
+  device caches. All 7 previously-failing VMDK/VHD tests
+  now pass.
 
 **Known gaps (not yet scheduled):**
 
@@ -170,38 +174,16 @@
   configurable. This is a VMDK format convention.
 - VHD output block size: Fixed at 2MB, not configurable.
 - VHDX output block size: Fixed at 32MB, not configurable.
-- Extended L2 subcluster-level I/O: The 32-bit subcluster
-  allocation/zero bitmaps in extended L2 entries are parsed but
-  each cluster is treated as fully allocated if any subcluster
-  is present. This is conservative and correct, but wastes I/O
-  on partially-allocated clusters.
 - QCOW2 encrypted output: Decryption works (AES-128-CBC via
   --qcow2-password, LUKS via --luks-passphrase) but writing
   encrypted QCOW2 output is not supported.
-- VMDK/VHD/VHDX structural validation in check: The check
-  operation performs full QCOW2 structural validation (L2 scan,
-  overlap detection, refcount validation, leak detection) but
-  only does basic format detection for other formats.
-
-*Pre-existing test failures (not regressions):*
-- VHD round-trip tests (TestConvertToVhd): Content mismatch
-  at offset 130562 for raw-mbr-partitioned, qcow2, and vhd
-  inputs. Likely a VHD write alignment or carry-buffer bug.
-- VMDK compressed output tests (TestConvertToVmdkCompressed):
-  raw/qcow2/vmdk to streamOptimized VMDK fail.
-- VHD d2v-zerofilled conversion (TestConvertVhdToRaw):
-  test_convert_vhd_d2v_zerofilled fails.
-
-*Resolved in later phases (items formerly listed here):*
-- ~~Compressed clusters > 64KB (input)~~ — Done (Phase 16a)
-- ~~VMDK output format~~ — Done (Phase 8)
-- ~~VHD output format~~ — Done (Phase 9)
-- ~~VHDX output format~~ — Done (Phase 10)
-- ~~QCOW2 encryption~~ — Done (Phase 16b, 17c)
-- ~~External data file mode~~ — Done (Phase 13)
-- ~~Snapshot handling~~ — Done (Phase 16c)
-- ~~VMDK format in compare/check~~ — Done (Phase 8)
-- ~~VHD/VHDX format in compare/check~~ — Done (Phase 9, 10)
+- VMDK/VHD/VHDX check validation gaps: All three formats
+  have header parsing, metadata table walking, bounds
+  checking, and overlap detection. Remaining gaps: VMDK
+  grain marker validation and RGD consistency, VHD block
+  bitmap and geometry validation, VHDX region table 2
+  fallback and log entry inspection. See
+  PLAN-convert-phase22.md.
 
 *Additional qemu-img subcommands (not yet implemented):*
 - create: Create new disk images
