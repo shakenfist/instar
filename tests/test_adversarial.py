@@ -629,10 +629,10 @@ class TestAdversarialVmdkDescriptor(ImagoTestBase):
         if multi-extent detection fires. Either is acceptable.
         """
         image = self.get_adversarial_image('vmdk-descriptor-multi-extent')
-            self.run_adversarial(
-                [str(self.get_imago_binary()), 'check', str(image.path)],
-                timeout=10
-            )
+        self.run_adversarial(
+            [str(self.get_imago_binary()), 'check', str(image.path)],
+            timeout=10
+        )
 
     def test_info_descriptor_huge(self):
         image = self.get_adversarial_image('vmdk-descriptor-huge')
