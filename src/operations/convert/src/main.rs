@@ -3551,7 +3551,13 @@ unsafe fn convert_to_vhd(
         // carry (leftover from previous read) plus a fresh read.
         // BUF_L2_OUT: use multipurpose buffer for read buffer
         let read_buf = layout.buf_multipurpose as *mut u8;
-        // BUF_HEADER: use compressed buffer for carry (non-overlapping use)
+        // SAFETY: carry_buf intentionally aliases BUF_COMPRESSED_IN.
+        // BUF_COMPRESSED_IN is also passed to read_chain_virtual_cluster()
+        // as the input decompression buffer.  Carry data is always consumed
+        // (copied to buf_data and carry_len reset to 0) *before* the next
+        // read_chain_virtual_cluster call that may use the buffer for
+        // decompression, so the two uses never overlap in time.
+        // Do NOT reorder: carry consumption must stay before the read call.
         let carry_buf = layout.buf_compressed as *mut u8;
         let mut carry_len: usize = 0;
         let mut vdata_read: u64 = 0;
