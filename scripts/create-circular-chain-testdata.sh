@@ -70,7 +70,7 @@ outpath = os.path.join('$OUTDIR_ABS', 'qcow2-self-referencing.qcow2')
 backing_name = b'qcow2-self-referencing.qcow2'
 
 magic = b'QFI\xfb'
-header = struct.pack('>4sI Q II Q I I Q Q I I Q Q',
+header = struct.pack('>4sI Q II Q I I Q Q I I Q',
     magic, 2,           # version 2
     72,                  # backing_file_offset (right after header)
     len(backing_name),   # backing_file_size
@@ -81,7 +81,8 @@ header = struct.pack('>4sI Q II Q I I Q Q I I Q Q',
     65536,               # l1_table_offset
     2 * 65536,           # refcount_table_offset
     1,                   # refcount_table_clusters
-    0, 0, 0,             # snapshots, padding
+    0,                   # nb_snapshots
+    0,                   # snapshots_offset
 )
 
 with open(outpath, 'wb') as f:
