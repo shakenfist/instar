@@ -183,8 +183,9 @@ imago convert -c -O qcow2 input.raw output.qcow2
 # Convert with dense output (write all clusters including zeros)
 imago convert --no-skip-zeros input.qcow2 output.raw
 
-# Specify output cluster size for QCOW2 (default: 65536)
+# Specify output cluster size for QCOW2 (512 to 2097152, default: 65536)
 imago convert -O qcow2 --cluster-size 4096 input.raw output.qcow2
+imago convert -O qcow2 --cluster-size 2097152 input.raw output.qcow2
 
 # Convert to VHD dynamic format
 imago convert -O vpc input.qcow2 output.vhd
