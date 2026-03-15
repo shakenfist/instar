@@ -143,6 +143,8 @@ impl IoThread {
 
         while running.load(Ordering::Acquire) {
             // Wait for events with a timeout (so we can check `running`)
+            // SAFETY: epoll_fd is a valid epoll FD from epoll_create1().
+            // events has capacity for max_events epoll_event structs.
             let nfds =
                 unsafe { libc::epoll_wait(epoll_fd, events.as_mut_ptr(), max_events as i32, 100) };
 
@@ -188,6 +190,7 @@ impl IoThread {
         }
 
         // Clean up
+        // SAFETY: epoll_fd is a valid open FD, closed exactly once here.
         unsafe {
             libc::close(epoll_fd);
         }
@@ -195,6 +198,8 @@ impl IoThread {
 
     /// Set up epoll to monitor all device eventfds.
     fn setup_epoll(devices: &[IoDevice]) -> std::io::Result<libc::c_int> {
+        // SAFETY: epoll_create1 is a simple syscall; return value is
+        // checked for errors immediately below.
         let epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         if epoll_fd < 0 {
             return Err(std::io::Error::last_os_error());
@@ -205,6 +210,8 @@ impl IoThread {
                 events: libc::EPOLLIN as u32,
                 u64: io_device.ioevent.as_raw_fd() as u64,
             };
+            // SAFETY: epoll_fd and ioevent FD are valid; event struct is
+            // fully initialized on the stack. Error checked below.
             if unsafe {
                 libc::epoll_ctl(
                     epoll_fd,
@@ -214,6 +221,7 @@ impl IoThread {
                 )
             } < 0
             {
+                // SAFETY: epoll_fd is valid; closing on error before return.
                 unsafe { libc::close(epoll_fd) };
                 return Err(std::io::Error::last_os_error());
             }

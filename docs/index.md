@@ -78,6 +78,7 @@ Analysis of how major virtualization platforms use qemu-img and handle disk imag
 |----------|-------------|
 | [Usage Analysis](usage.md) | How oVirt, Proxmox, and OpenStack use qemu-img |
 | [Security Vulnerabilities](security.md) | CVE analysis for image handling across platforms |
+| [Security Audits](security-audits.md) | Audit results, unsafe code review, and standing security properties |
 
 ---
 

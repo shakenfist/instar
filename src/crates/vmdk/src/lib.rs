@@ -790,7 +790,7 @@ pub unsafe fn read_compressed_grain(
 
     // Calculate how many sectors we need in total
     let total_byte_end = marker_byte_offset + total_needed as u64;
-    let last_sector = (total_byte_end + sector_size as u64 - 1) / sector_size as u64;
+    let last_sector = total_byte_end.div_ceil(sector_size as u64);
     let sectors_to_read = last_sector - first_sector;
 
     if sectors_to_read * sector_size as u64 > compressed_buf_size as u64 {

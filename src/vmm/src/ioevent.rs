@@ -103,6 +103,7 @@ impl IoEvent {
             ..Default::default()
         };
 
+        // SAFETY: ioeventfd struct fully initialized, vm FD is valid.
         let ret = unsafe { libc::ioctl(vm.as_raw_fd(), KVM_IOEVENTFD, &ioeventfd) };
 
         if ret < 0 {
@@ -117,10 +118,7 @@ impl IoEvent {
     ///
     /// Returns the number of signals if any, or None if no signal pending.
     pub fn poll(&self) -> Option<u64> {
-        match self.eventfd.read() {
-            Ok(count) => Some(count),
-            Err(_) => None,
-        }
+        self.eventfd.read().ok()
     }
 
     /// Get the raw file descriptor for use with poll/epoll.
@@ -191,6 +189,8 @@ impl IoEventWithMatch {
             ..Default::default()
         };
 
+        // SAFETY: ioeventfd struct fully initialized with datamatch,
+        // vm FD is valid. Error checked below.
         let ret = unsafe { libc::ioctl(vm.as_raw_fd(), KVM_IOEVENTFD, &ioeventfd) };
 
         if ret < 0 {
@@ -218,6 +218,7 @@ impl IoEventWithMatch {
             ..Default::default()
         };
 
+        // SAFETY: ioeventfd struct fully initialized, vm FD is valid.
         let ret = unsafe { libc::ioctl(vm.as_raw_fd(), KVM_IOEVENTFD, &ioeventfd) };
 
         if ret < 0 {
@@ -230,10 +231,7 @@ impl IoEventWithMatch {
 
     /// Check if the eventfd has been signaled.
     pub fn poll(&self) -> Option<u64> {
-        match self.eventfd.read() {
-            Ok(count) => Some(count),
-            Err(_) => None,
-        }
+        self.eventfd.read().ok()
     }
 
     /// Get the raw file descriptor.

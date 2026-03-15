@@ -147,7 +147,7 @@ pub fn encode_compressed_l2_entry(
 ) -> u64 {
     let csize_shift = 62 - (cluster_bits as u64 - 8);
     let offset_mask = (1u64 << csize_shift) - 1;
-    let nb_sectors = (compressed_bytes + 511) / 512;
+    let nb_sectors = compressed_bytes.div_ceil(512);
     OFLAG_COMPRESSED | ((nb_sectors - 1) << csize_shift) | (host_offset & offset_mask)
 }
 
