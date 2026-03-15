@@ -1743,6 +1743,71 @@ unsafe fn check_vhd(
                 BitmapSetResult::BeyondCapacity => {}
             }
         }
+
+        // Sector bitmap validation: for non-differencing
+        // dynamic VHDs, all bitmap bits should be set
+        // (full-block allocation).
+        if footer.disk_type == vhd::DISK_TYPE_DYNAMIC {
+            let bitmap_sector = block_host_offset / sector_size as u64;
+            let bitmap_sectors_count =
+                (bitmap_bytes as u64 + sector_size as u64 - 1) / sector_size as u64;
+            let mut all_ones = true;
+
+            for s in 0..bitmap_sectors_count {
+                let sec = bitmap_sector + s;
+                if sec >= input_capacity {
+                    break;
+                }
+                let mut bmp_buf = [0u8; MAX_SECTOR_SIZE];
+                if !(call_table.read_input_sector)(0, sec, bmp_buf.as_mut_ptr(), sector_size) {
+                    break;
+                }
+                bytes_read += sector_size as u64;
+
+                // How many bitmap bytes are in this sector
+                let done = (s as u32) * sector_size as u32;
+                let remaining = bitmap_bytes - done;
+                let check_len = if remaining < sector_size as u32 {
+                    remaining as usize
+                } else {
+                    sector_size
+                };
+
+                for i in 0..check_len {
+                    // Last bitmap byte may have padding
+                    // bits beyond actual sectors
+                    if (done + i as u32) == bitmap_bytes - 1 {
+                        // Mask: only check bits for
+                        // actual sectors
+                        let total_bitmap_bits = sectors_per_block;
+                        let bits_before = (done + i as u32) * 8;
+                        let valid_bits = total_bitmap_bits - bits_before;
+                        let valid = if valid_bits >= 8 { 8 } else { valid_bits };
+                        let mask = 0xFFu8 << (8 - valid);
+                        if bmp_buf[i] & mask != mask {
+                            all_ones = false;
+                            break;
+                        }
+                    } else if bmp_buf[i] != 0xFF {
+                        all_ones = false;
+                        break;
+                    }
+                }
+                if !all_ones {
+                    break;
+                }
+            }
+
+            if !all_ones {
+                // Partial bitmap in a dynamic (non-
+                // differencing) VHD is unusual
+                result.leaks += 1;
+                result.total_errors += 1;
+                (call_table.debug_print)(
+                    b"check: VHD block bitmap partially allocated\n\0".as_ptr(),
+                );
+            }
+        }
     }
 
     result.clusters_allocated = allocated_blocks;

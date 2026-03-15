@@ -2046,3 +2046,108 @@ class TestCheckEnhancedValidation(ImagoTestBase):
                 result.get('corruptions', 0), 0,
                 'GD/RGD mismatch should be detected'
             )
+
+    def test_check_vhd_clean_bitmap(self):
+        """Dynamic VHD should pass bitmap checks cleanly."""
+        image = self.get_image('raw-mbr-partitioned')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+            suffix='.vhd'
+        ) as vhd_tmp:
+            _, stderr, rc = self.run_imago_convert(
+                image.path, Path(vhd_tmp.name),
+                output_format='vpc', timeout=60
+            )
+            self.assertEqual(
+                rc, 0,
+                f'convert to vhd failed: {stderr}'
+            )
+
+            stdout, _, rc = self.run_imago_check(
+                Path(vhd_tmp.name),
+                output_format='json'
+            )
+            self.assertEqual(rc, 0, f'check failed: {stdout}')
+            result = json.loads(stdout)
+            self.assertEqual(
+                result.get('corruptions', -1), 0,
+                'Clean VHD should have no corruptions'
+            )
+            self.assertEqual(
+                result.get('leaks', -1), 0,
+                'Clean VHD should have no leaks'
+            )
+
+    def test_check_vhd_corrupt_bitmap(self):
+        """VHD with partially cleared bitmap should warn."""
+        image = self.get_image('raw-mbr-partitioned')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+            suffix='.vhd'
+        ) as vhd_tmp:
+            _, stderr, rc = self.run_imago_convert(
+                image.path, Path(vhd_tmp.name),
+                output_format='vpc', timeout=60
+            )
+            self.assertEqual(
+                rc, 0,
+                f'convert to vhd failed: {stderr}'
+            )
+
+            data = bytearray(
+                Path(vhd_tmp.name).read_bytes()
+            )
+
+            # Parse footer (at sector 0 for dynamic VHD)
+            data_offset = struct.unpack_from(
+                '>Q', data, 16
+            )[0]
+            # Parse dynamic header to find BAT
+            bat_offset = struct.unpack_from(
+                '>Q', data, data_offset + 16
+            )[0]
+            block_size = struct.unpack_from(
+                '>I', data, data_offset + 32
+            )[0]
+
+            # Find first allocated BAT entry
+            max_entries = struct.unpack_from(
+                '>I', data, data_offset + 28
+            )[0]
+            first_block_sector = None
+            for i in range(max_entries):
+                entry = struct.unpack_from(
+                    '>I', data,
+                    bat_offset + i * 4
+                )[0]
+                if entry != 0xFFFFFFFF:
+                    first_block_sector = entry
+                    break
+
+            if first_block_sector is None:
+                self.skipTest('No allocated blocks in VHD')
+
+            # Corrupt the sector bitmap: clear some bits
+            bitmap_off = first_block_sector * 512
+            data[bitmap_off] = 0x00
+
+            Path(vhd_tmp.name).write_bytes(data)
+
+            stdout, _, rc = self.run_imago_check(
+                Path(vhd_tmp.name),
+                output_format='json'
+            )
+            result = json.loads(stdout)
+            self.assertGreater(
+                result.get('leaks', 0), 0,
+                'Partially cleared bitmap should '
+                'be detected'
+            )
