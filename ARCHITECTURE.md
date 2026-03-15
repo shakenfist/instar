@@ -63,6 +63,16 @@ Detection logic:
 
 See [quirks.md](docs/quirks.md) for details on safe vs unsafe quirks classification.
 
+### Security Audits
+
+All `unsafe` code in the codebase has been audited and classified. The VMM
+(host-side) code uses unsafe primarily for KVM ioctls and libc FFI — all
+invariants are enforced. Guest-side format parsing uses unsafe for pointer
+arithmetic on binary data, with comprehensive bounds checking on all
+image-derived offsets. Integer arithmetic on untrusted input uses Rust's
+checked arithmetic (`checked_mul`, `checked_add`). See
+[docs/security-audits.md](docs/security-audits.md) for full audit results.
+
 ## Communication Protocol
 
 TBD - Options to explore:

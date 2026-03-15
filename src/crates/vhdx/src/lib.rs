@@ -739,6 +739,12 @@ impl VhdxState {
         };
         let total_bat_entries = total_blocks + sb_entries;
 
+        // Validate BAT counts fit in u32 (a malicious image
+        // could claim extreme virtual_disk_size that would
+        // overflow u32 on truncation).
+        let total_bat_entries_u32 = u32::try_from(total_bat_entries).ok()?;
+        let chunk_ratio_u32 = u32::try_from(chunk_ratio).ok()?;
+
         // Validate BAT region can hold all entries
         let needed_bat_bytes = total_bat_entries * 8;
         if needed_bat_bytes > bat_length as u64 {
@@ -751,8 +757,8 @@ impl VhdxState {
             virtual_disk_size: metadata.virtual_disk_size,
             logical_sector_size: metadata.logical_sector_size,
             bat_offset,
-            total_bat_entries: total_bat_entries as u32,
-            chunk_ratio: chunk_ratio as u32,
+            total_bat_entries: total_bat_entries_u32,
+            chunk_ratio: chunk_ratio_u32,
             bat_cached_sector: u64::MAX,
             bat_cache_buf,
             data_cached_sector: u64::MAX,
@@ -1089,20 +1095,24 @@ pub fn build_bat_entry(state: u64, file_offset: u64) -> u64 {
 /// virtual size and block size.
 ///
 /// Returns `(total_bat_entries, chunk_ratio, total_payload_blocks)`.
+/// Returns `None` if the layout overflows u32 (e.g. extreme
+/// virtual_disk_size from a malicious image).
 pub fn calculate_bat_layout(
     virtual_disk_size: u64,
     block_size: u32,
     logical_sector_size: u32,
-) -> (u32, u32, u32) {
-    let total_blocks = virtual_disk_size.div_ceil(block_size as u64) as u32;
-    let chunk_ratio = ((1u64 << 23) * logical_sector_size as u64 / block_size as u64) as u32;
+) -> Option<(u32, u32, u32)> {
+    let total_blocks_u64 = virtual_disk_size.div_ceil(block_size as u64);
+    let chunk_ratio_u64 = (1u64 << 23) * logical_sector_size as u64 / block_size as u64;
+    let total_blocks = u32::try_from(total_blocks_u64).ok()?;
+    let chunk_ratio = u32::try_from(chunk_ratio_u64).ok()?;
     let sb_entries = if chunk_ratio > 0 {
         total_blocks.div_ceil(chunk_ratio)
     } else {
         0
     };
-    let total_bat_entries = total_blocks + sb_entries;
-    (total_bat_entries, chunk_ratio, total_blocks)
+    let total_bat_entries = total_blocks.checked_add(sb_entries)?;
+    Some((total_bat_entries, chunk_ratio, total_blocks))
 }
 
 // ============================================================================
@@ -1248,7 +1258,7 @@ mod tests {
     #[test]
     fn bat_layout_1gb_32mb_blocks() {
         let (total, chunk_ratio, payload_blocks) =
-            calculate_bat_layout(1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512);
+            calculate_bat_layout(1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512).unwrap();
         assert_eq!(payload_blocks, 32); // 1GB / 32MB
         assert_eq!(chunk_ratio, 128); // (2^23 * 512) / 32MB
                                       // SB entries = ceil(32/128) = 1
@@ -1258,7 +1268,7 @@ mod tests {
     #[test]
     fn bat_layout_4gb_32mb_blocks() {
         let (total, chunk_ratio, payload_blocks) =
-            calculate_bat_layout(4u64 * 1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512);
+            calculate_bat_layout(4u64 * 1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512).unwrap();
         assert_eq!(payload_blocks, 128);
         assert_eq!(chunk_ratio, 128);
         // 128 payload + ceil(128/128)=1 SB
@@ -1268,11 +1278,27 @@ mod tests {
     #[test]
     fn bat_layout_256mb_1mb_blocks() {
         let (total, chunk_ratio, payload_blocks) =
-            calculate_bat_layout(256 * 1024 * 1024, 1024 * 1024, 512);
+            calculate_bat_layout(256 * 1024 * 1024, 1024 * 1024, 512).unwrap();
         assert_eq!(payload_blocks, 256);
         assert_eq!(chunk_ratio, 4096); // (2^23 * 512) / 1MB
                                        // SB entries = ceil(256/4096) = 1
         assert_eq!(total, 257);
+    }
+
+    #[test]
+    fn bat_layout_overflow_returns_none() {
+        // Extreme virtual_disk_size that would overflow u32
+        assert!(calculate_bat_layout(u64::MAX, 1024 * 1024, 512).is_none());
+        // Large enough to overflow u32 total_blocks with 1MB blocks:
+        // 1 << 53 bytes / 1MB = 1 << 33 blocks > u32::MAX
+        assert!(calculate_bat_layout(1u64 << 53, 1024 * 1024, 512).is_none());
+    }
+
+    #[test]
+    fn bat_layout_large_but_valid() {
+        // 1 PiB (1 << 50) with 1MB blocks = 1 << 30 blocks,
+        // fits in u32 — should succeed
+        assert!(calculate_bat_layout(1u64 << 50, 1024 * 1024, 512).is_some());
     }
 
     // ====================================================================

@@ -273,7 +273,7 @@ pub fn compute_vhd_geometry(size: u64) -> (u16, u8, u8) {
         sectors_per_track = 17;
         cyl_times_heads = total_sectors / sectors_per_track;
 
-        heads = (cyl_times_heads + 1023) / 1024;
+        heads = cyl_times_heads.div_ceil(1024);
         if heads < 4 {
             heads = 4;
         }
@@ -500,7 +500,7 @@ impl VhdState {
         // Sector bitmap size: ceil(block_size / 512 / 8) rounded up
         // to next 512-byte boundary.
         let sectors_per_block = dyn_header.block_size / 512;
-        let bitmap_bytes = ((sectors_per_block + 7) / 8 + 511) & !511;
+        let bitmap_bytes = (sectors_per_block.div_ceil(8) + 511) & !511;
 
         Some(VhdState {
             device_idx,
