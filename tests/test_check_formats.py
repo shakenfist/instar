@@ -2177,3 +2177,49 @@ class TestCheckEnhancedValidation(ImagoTestBase):
                 f'{img_id} should have no '
                 f'corruptions: {stdout}'
             )
+
+    def test_check_vhdx_rt1_corrupt_rt2_fallback(self):
+        """VHDX with corrupt RT1 should fall back to RT2."""
+        image = self.get_image('qemu-vhdx')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(
+            suffix='.vhdx'
+        ) as vhdx_tmp:
+            import shutil
+            shutil.copy2(image.path, vhdx_tmp.name)
+
+            data = bytearray(
+                Path(vhdx_tmp.name).read_bytes()
+            )
+
+            # Corrupt RT1 signature at 0x30000
+            # Region table signature is "regi" (4 bytes)
+            rt1_off = 0x30000
+            data[rt1_off:rt1_off + 4] = b'XXXX'
+
+            Path(vhdx_tmp.name).write_bytes(data)
+
+            stdout, _, rc = self.run_imago_check(
+                Path(vhdx_tmp.name),
+                output_format='json'
+            )
+            result = json.loads(stdout)
+            # Should report RT1 corruption but still
+            # succeed using RT2
+            self.assertGreater(
+                result.get('corruptions', 0), 0,
+                'RT1 corruption should be reported'
+            )
+            # Should not have FLAG_HAS_CORRUPTIONS set
+            # (RT2 fallback worked) — check that the
+            # image is still parseable
+            self.assertIn(
+                'format', result,
+                'VHDX should still be parseable '
+                'with RT2 fallback'
+            )

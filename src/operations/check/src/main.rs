@@ -1138,16 +1138,14 @@ unsafe fn check_vhdx(
         (call_table.debug_print)(b"check: VHDX has dirty log\n\0".as_ptr());
     }
 
-    // --- Validate region table 1 ---
-    // Read the full 64KB region table for CRC-32C validation.
-    // We read it in 64KB/sector_size chunks into scratch memory.
-    let rt_start_sector = vhdx::REGION_TABLE1_OFFSET / sector_size as u64;
+    // --- Validate region tables (RT1 at 0x30000, RT2 at 0x40000) ---
     let rt_sectors = 65536 / sector_size;
 
-    // Use scratch memory for the 64KB region table
+    // Use scratch memory: first 64KB for RT data, next 64KB for RT1
+    // copy (for RT1/RT2 comparison)
     let rt_buf = shared::SCRATCH_MEM_BASE as *mut u8;
-    if shared::SCRATCH_MEM_BASE + 65536 > shared::ALLOC_HEAP_BASE {
-        // Not enough scratch memory
+    let rt1_copy = (shared::SCRATCH_MEM_BASE + 65536) as *mut u8;
+    if shared::SCRATCH_MEM_BASE + 131072 > shared::ALLOC_HEAP_BASE {
         result.corruptions += 1;
         result.total_errors += 1;
         result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
@@ -1155,34 +1153,94 @@ unsafe fn check_vhdx(
         return bytes_read;
     }
 
+    // Read RT1
+    let mut rt1_read_ok = true;
+    let rt1_start = vhdx::REGION_TABLE1_OFFSET / sector_size as u64;
     for i in 0..rt_sectors {
-        let sector = rt_start_sector + i as u64;
-        if sector >= input_capacity {
-            result.corruptions += 1;
-            result.total_errors += 1;
-            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
-            return bytes_read;
-        }
-        if !(call_table.read_input_sector)(0, sector, rt_buf.add(i * sector_size), sector_size) {
-            result.corruptions += 1;
-            result.total_errors += 1;
-            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
-            return bytes_read;
+        let sector = rt1_start + i as u64;
+        if sector >= input_capacity
+            || !(call_table.read_input_sector)(0, sector, rt_buf.add(i * sector_size), sector_size)
+        {
+            rt1_read_ok = false;
+            break;
         }
         bytes_read += sector_size as u64;
     }
 
-    let rt_slice = core::slice::from_raw_parts(rt_buf, 65536);
-    let (regions, _entry_count) = match vhdx::parse_region_table(rt_slice) {
-        Some(r) => r,
-        None => {
+    let rt1_parsed = if rt1_read_ok {
+        let rt_slice = core::slice::from_raw_parts(rt_buf, 65536);
+        vhdx::parse_region_table(rt_slice)
+    } else {
+        None
+    };
+
+    // Save RT1 data for comparison if valid
+    let rt1_valid = rt1_parsed.is_some();
+    if rt1_valid {
+        core::ptr::copy_nonoverlapping(rt_buf, rt1_copy, 65536);
+    }
+
+    // Read RT2
+    let mut rt2_read_ok = true;
+    let rt2_start = vhdx::REGION_TABLE2_OFFSET / sector_size as u64;
+    for i in 0..rt_sectors {
+        let sector = rt2_start + i as u64;
+        if sector >= input_capacity
+            || !(call_table.read_input_sector)(0, sector, rt_buf.add(i * sector_size), sector_size)
+        {
+            rt2_read_ok = false;
+            break;
+        }
+        bytes_read += sector_size as u64;
+    }
+
+    let rt2_parsed = if rt2_read_ok {
+        let rt_slice = core::slice::from_raw_parts(rt_buf, 65536);
+        vhdx::parse_region_table(rt_slice)
+    } else {
+        None
+    };
+
+    // If both valid, compare raw contents for consistency
+    if rt1_parsed.is_some() && rt2_parsed.is_some() {
+        let rt1_slice = core::slice::from_raw_parts(rt1_copy, 65536);
+        let rt2_slice = core::slice::from_raw_parts(rt_buf, 65536);
+        let mut mismatch = false;
+        for i in 0..65536 {
+            if rt1_slice[i] != rt2_slice[i] {
+                mismatch = true;
+                break;
+            }
+        }
+        if mismatch {
             result.corruptions += 1;
             result.total_errors += 1;
-            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
-            (call_table.debug_print)(b"check: VHDX region table invalid\n\0".as_ptr());
-            return bytes_read;
+            (call_table.debug_print)(b"check: VHDX RT1/RT2 mismatch\n\0".as_ptr());
         }
+    } else if rt1_parsed.is_some() {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        (call_table.debug_print)(b"check: VHDX region table 2 invalid\n\0".as_ptr());
+    } else if rt2_parsed.is_some() {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        (call_table.debug_print)(b"check: VHDX region table 1 invalid, using RT2\n\0".as_ptr());
+    }
+
+    // Pick whichever region table is valid (prefer RT1)
+    let rt_result = if let Some(r) = rt1_parsed {
+        r
+    } else if let Some(r) = rt2_parsed {
+        // Need to re-read RT2 into scratch for use below
+        r
+    } else {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+        (call_table.debug_print)(b"check: both VHDX region tables invalid\n\0".as_ptr());
+        return bytes_read;
     };
+    let (regions, _entry_count) = rt_result;
 
     // regions[0] = BAT, regions[1] = Metadata
     let bat_offset = regions[0].file_offset;
