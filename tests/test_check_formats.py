@@ -2242,3 +2242,119 @@ class TestCheckEnhancedValidation(ImagoTestBase):
                 'VHDX should still be parseable '
                 'with RT2 fallback'
             )
+
+    def test_check_vhd_fragmentation_zero(self):
+        """VHD created by imago should have zero fragmentation."""
+        image = self.get_image('raw-zeros-1mb')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(
+            suffix='.vpc'
+        ) as vpc_tmp:
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, vpc_tmp.name,
+                output_format='vpc'
+            )
+            self.assertEqual(
+                rc, 0,
+                f'convert to VHD failed: {stderr}'
+            )
+
+            stdout, stderr, rc = self.run_imago_check(
+                Path(vpc_tmp.name),
+                output_format='json'
+            )
+            self.assertEqual(
+                rc, 0,
+                f'check failed for VHD: {stderr}'
+            )
+            result = json.loads(stdout)
+            self.assertEqual(
+                result.get('fragmented-clusters', -1), 0,
+                'VHD from sequential convert should '
+                'have zero fragmentation'
+            )
+
+    def test_check_vhdx_fragmentation_zero(self):
+        """VHDX created by imago should have zero fragmentation."""
+        image = self.get_image('raw-zeros-1mb')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(
+            suffix='.vhdx'
+        ) as vhdx_tmp:
+            stdout, stderr, rc = self.run_imago_convert(
+                image.path, vhdx_tmp.name,
+                output_format='vhdx'
+            )
+            self.assertEqual(
+                rc, 0,
+                f'convert to VHDX failed: {stderr}'
+            )
+
+            stdout, stderr, rc = self.run_imago_check(
+                Path(vhdx_tmp.name),
+                output_format='json'
+            )
+            self.assertEqual(
+                rc, 0,
+                f'check failed for VHDX: {stderr}'
+            )
+            result = json.loads(stdout)
+            self.assertEqual(
+                result.get('fragmented-clusters', -1), 0,
+                'VHDX from sequential convert should '
+                'have zero fragmentation'
+            )
+
+    def test_check_existing_vhd_fragmentation(self):
+        """Existing VHD test images should report fragmentation."""
+        image = self.get_image('hyperv-dynamic-vhd')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        self.assertEqual(
+            rc, 0,
+            f'check failed for VHD: {stderr}'
+        )
+        result = json.loads(stdout)
+        self.assertIn(
+            'fragmented-clusters', result,
+            'VHD check should report fragmentation'
+        )
+
+    def test_check_existing_vhdx_fragmentation(self):
+        """Existing VHDX test images should report fragmentation."""
+        image = self.get_image('qemu-vhdx')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        self.assertEqual(
+            rc, 0,
+            f'check failed for VHDX: {stderr}'
+        )
+        result = json.loads(stdout)
+        self.assertIn(
+            'fragmented-clusters', result,
+            'VHDX check should report fragmentation'
+        )

@@ -1434,6 +1434,9 @@ unsafe fn check_vhdx(
     let mut bat_cached_sector: u64 = u64::MAX;
     let mut allocated_blocks: u64 = 0;
     let mut payload_block_idx: u64 = 0;
+    let mut last_block_end: u64 = 0;
+    let mut fragmented_blocks: u64 = 0;
+    let mut total_data_blocks: u64 = 0;
 
     for bat_idx in 0..total_bat_entries {
         // Determine if this is a sector bitmap entry (skip it)
@@ -1519,6 +1522,13 @@ unsafe fn check_vhdx(
                         BitmapSetResult::BeyondCapacity => {}
                     }
                 }
+
+                // Fragmentation tracking
+                total_data_blocks += 1;
+                if last_block_end != 0 && file_offset != last_block_end {
+                    fragmented_blocks += 1;
+                }
+                last_block_end = block_end;
             }
             vhdx::PAYLOAD_BLOCK_PARTIALLY_PRESENT => {
                 // Only valid for differencing disks, which we rejected
@@ -1539,6 +1549,10 @@ unsafe fn check_vhdx(
 
     result.clusters_allocated = allocated_blocks;
     result.clusters_checked = total_payload_blocks;
+
+    if total_data_blocks > 1 {
+        result.fragmentation = ((fragmented_blocks * 100) / (total_data_blocks - 1)) as u32;
+    }
 
     if result.corruptions > 0 {
         result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
@@ -1834,6 +1848,9 @@ unsafe fn check_vhd(
     }
 
     let mut allocated_blocks: u64 = 0;
+    let mut last_block_end: u64 = 0;
+    let mut fragmented_blocks: u64 = 0;
+    let mut total_data_blocks: u64 = 0;
 
     for entry_idx in 0..dyn_header.max_table_entries {
         let bat_byte_offset = bat_offset + entry_idx as u64 * 4;
@@ -1886,6 +1903,13 @@ unsafe fn check_vhd(
                 BitmapSetResult::BeyondCapacity => {}
             }
         }
+
+        // Fragmentation tracking
+        total_data_blocks += 1;
+        if last_block_end != 0 && block_host_offset != last_block_end {
+            fragmented_blocks += 1;
+        }
+        last_block_end = block_end;
 
         // Sector bitmap validation: for non-differencing
         // dynamic VHDs, all bitmap bits should be set
@@ -1955,6 +1979,11 @@ unsafe fn check_vhd(
 
     result.clusters_allocated = allocated_blocks;
     result.clusters_checked = dyn_header.max_table_entries as u64;
+
+    // Calculate fragmentation
+    if total_data_blocks > 1 {
+        result.fragmentation = ((fragmented_blocks * 100) / (total_data_blocks - 1)) as u32;
+    }
 
     // Verify footer copy at end of file matches footer at start
     if input_capacity > 0 {
