@@ -2013,7 +2013,6 @@ class TestCheckEnhancedValidation(ImagoTestBase):
             data_offset = struct.unpack_from('>Q', data, 16)[0]
             # Parse dynamic header to find BAT
             bat_offset = struct.unpack_from('>Q', data, data_offset + 16)[0]
-            block_size = struct.unpack_from('>I', data, data_offset + 32)[0]
 
             # Find first allocated BAT entry
             max_entries = struct.unpack_from('>I', data, data_offset + 28)[0]
