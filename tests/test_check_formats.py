@@ -2178,6 +2178,25 @@ class TestCheckEnhancedValidation(ImagoTestBase):
                 f'corruptions: {stdout}'
             )
 
+    def test_check_vhdx_clean_not_dirty(self):
+        """Clean VHDX should not have dirty flag set."""
+        image = self.get_image('qemu-vhdx')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        stdout, _, rc = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        self.assertEqual(rc, 0)
+        result = json.loads(stdout)
+        self.assertFalse(
+            result.get('dirty', True),
+            'Clean VHDX should not be dirty'
+        )
+
     def test_check_vhdx_rt1_corrupt_rt2_fallback(self):
         """VHDX with corrupt RT1 should fall back to RT2."""
         image = self.get_image('qemu-vhdx')

@@ -1132,10 +1132,80 @@ unsafe fn check_vhdx(
         }
     };
 
-    // Dirty log detection
+    // Dirty log detection and log entry validation
     if header.log_guid != [0u8; 16] {
         result.flags |= CheckResult::FLAG_DIRTY;
         (call_table.debug_print)(b"check: VHDX has dirty log\n\0".as_ptr());
+
+        // Scan log entries for valid signatures and CRC-32C
+        if header.log_length > 0 && header.log_offset > 0 {
+            let log_end = header.log_offset.saturating_add(header.log_length as u64);
+            if log_end <= actual_size {
+                let entry_size: u64 = 4096;
+                let num_entries = header.log_length as u64 / entry_size;
+                let mut valid_entries: u64 = 0;
+                let mut min_seq: u64 = u64::MAX;
+                let mut max_seq: u64 = 0;
+
+                let mut entry_buf = [0u8; MAX_SECTOR_SIZE];
+                for e in 0..num_entries {
+                    let entry_off = header.log_offset + e * entry_size;
+                    let entry_sector = entry_off / sector_size as u64;
+                    if entry_sector >= input_capacity {
+                        break;
+                    }
+
+                    // Read the 4KB entry (may span multiple sectors)
+                    let sectors_per_entry = (entry_size as usize + sector_size - 1) / sector_size;
+                    if sectors_per_entry > 1 || entry_size as usize > sector_size {
+                        // Entry spans multiple sectors; only check
+                        // single-sector case for simplicity
+                        break;
+                    }
+
+                    if !(call_table.read_input_sector)(
+                        0,
+                        entry_sector,
+                        entry_buf.as_mut_ptr(),
+                        sector_size,
+                    ) {
+                        break;
+                    }
+                    bytes_read += sector_size as u64;
+
+                    let off = (entry_off % sector_size as u64) as usize;
+                    if off + 24 > sector_size {
+                        continue;
+                    }
+
+                    // Check "loge" signature
+                    if &entry_buf[off..off + 4] != b"loge" {
+                        continue;
+                    }
+
+                    // Validate CRC-32C (checksum at offset 4)
+                    let entry_len = shared::le_u32(&entry_buf[off..], 8) as usize;
+                    if entry_len >= 24 && off + entry_len <= sector_size {
+                        let crc = vhdx::compute_crc32c(&entry_buf[off..off + entry_len], 4);
+                        let stored = shared::le_u32(&entry_buf[off..], 4);
+                        if crc == stored {
+                            valid_entries += 1;
+                            let seq = shared::le_u64(&entry_buf[off..], 16);
+                            if seq < min_seq {
+                                min_seq = seq;
+                            }
+                            if seq > max_seq {
+                                max_seq = seq;
+                            }
+                        }
+                    }
+                }
+
+                if valid_entries > 0 {
+                    (call_table.debug_print)(b"check: VHDX log has valid entries\n\0".as_ptr());
+                }
+            }
+        }
     }
 
     // --- Validate region tables (RT1 at 0x30000, RT2 at 0x40000) ---
