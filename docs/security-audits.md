@@ -30,7 +30,7 @@ KVM sandbox entirely.
 
 | Location | Category | Verdict | Notes |
 |----------|----------|---------|-------|
-| vmm/main.rs: ACTIVE_MMIO_BASE | Static mut read/write | Fragile | Should use OnceLock; safe in practice (single-threaded setup) |
+| vmm/main.rs: ACTIVE_MMIO_BASE | Static mut read/write | Fragile | Should use OnceLock; safe (single-threaded) |
 | vmm/main.rs: set_user_memory_region | KVM API | Sound | Memory region lifetime managed correctly |
 | vmm/io_thread.rs: epoll syscalls | libc FFI | Sound | All FDs validated, errors checked |
 | vmm/ioevent.rs: KVM_IOEVENTFD ioctls | libc FFI | Sound | Structs fully initialized, errors checked |
@@ -45,9 +45,9 @@ use OnceLock), all others sound.
 | Location | Category | Verdict | Notes |
 |----------|----------|---------|-------|
 | core/main.rs: SingleThreadCell | Interior mutability | Sound | Single vCPU enforces invariant |
-| core/main.rs: cstr_to_str | Pointer scan | Fragile | Bounded to 4096 bytes, UTF-8 validated; relies on operation providing valid readable memory |
-| core/main.rs: call_operation | Transmute to fn ptr | Inherent | Design boundary — operation binary IS the untrusted code |
-| core/main.rs: ct_read_input_sector | Buffer pointer | Fragile | Device index bounds-checked; buffer pointer trusted from operation |
+| core/main.rs: cstr_to_str | Pointer scan | Fragile | Bounded to 4096B, UTF-8 validated; relies on valid memory |
+| core/main.rs: call_operation | Transmute to fn ptr | Inherent | Design boundary — operation IS untrusted code |
+| core/main.rs: ct_read_input_sector | Buffer pointer | Fragile | Device index checked; buffer ptr trusted from op |
 | core/main.rs: ct_write_output_sector | Buffer pointer | Fragile | Buffer pointer trusted from operation |
 | core/main.rs: ct_send_info_result_* | Struct pointer | Fragile | Null-checked but non-null validity trusted |
 | core/main.rs: ct_get_chain_config | Config pointer | Sound | Magic validated before returning |
@@ -66,7 +66,7 @@ sandbox with no access to host memory.
 
 | Crate | Unsafe fns | Verdict | Notes |
 |-------|-----------|---------|-------|
-| qcow2 | 18 | All sound | Comprehensive bounds checking on all image-derived offsets; checked arithmetic for L1/L2/refcount lookups |
+| qcow2 | 18 | All sound | Bounds checking on all image offsets; checked arithmetic for L1/L2/refcount |
 | vmdk | 5 | All sound | Grain marker validation, descriptor bounds checking |
 | vhd | 2 | All sound | Block index bounds-checked, BAT uses checked arithmetic |
 | vhdx | 4 | All sound | Multi-layer validation; BAT truncation **fixed** (see below) |
@@ -157,8 +157,8 @@ target type were catalogued and classified.
 
 | Location | Cast | Classification | Notes |
 |----------|------|----------------|-------|
-| convert: `reftable_clusters as u32` (line 1624) | u64→u32 | Bounded | QCOW2 header field; reftable must fit in scratch memory (~12.5MB), so clusters ≤ ~200 |
-| convert: `l1_size` (line 1682) | u64→u32 | Bounded | L1 table must fit in scratch memory; checked at line 1693 before use |
+| convert: `reftable_clusters as u32` (ln 1624) | u64→u32 | Bounded | Reftable fits in scratch (~12.5MB), ≤ ~200 |
+| convert: `l1_size` (line 1682) | u64→u32 | Bounded | L1 fits in scratch; checked at line 1693 before use |
 | convert: `entries_per_l2` (line 1680) | u64→u32 | Bounded | cluster_size/8; cluster_bits ≤ 21 so max = 262144 |
 | convert: `num_gd_entries` (line 2495) | u64→u32 | Bounded | GD must fit in scratch memory; checked at line 2510 |
 | convert: GTE sector offset (lines 2695, 2987) | u64→u32 | Spec | VMDK GTE is 32-bit sector offset per specification |
