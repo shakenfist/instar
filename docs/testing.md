@@ -43,6 +43,15 @@ Tests for the `imago check` operation:
   - Overlapping clusters (two L2 entries pointing to same host cluster)
   - Refcount-zero (referenced cluster with refcount=0)
   - Leaked cluster (refcount>0 but no L2 reference)
+- **Enhanced VMDK/VHD/VHDX validation** (`TestCheckEnhancedValidation`):
+  - VMDK grain marker validation (corrupt LBA detection)
+  - VMDK redundant grain directory (RGD) mismatch detection
+  - VHD sector bitmap validation (clean and corrupt bitmaps)
+  - VHD CHS geometry cross-check (no false corruptions on test images)
+  - VHDX region table fallback (RT1 corruption with RT2 recovery)
+  - VHDX dirty log detection (clean images show dirty=false)
+  - VHD/VHDX fragmentation tracking (zero for sequential convert, present for existing images)
+  - Positive tests for all clean VMDK, VHD, and VHDX test images
 - **Unsafe quirks mode**: Verifies non-QCOW2 formats are treated as raw with
   `--unsafe-quirks`
 

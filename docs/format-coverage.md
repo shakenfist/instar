@@ -340,7 +340,9 @@ qcow2-luks).
     operation: grain directory bounds checking, grain table walk with offset
     validation, grain overlap detection (1-bit-per-grain bitmap in scratch
     memory), streamOptimized footer validation, multi-extent detection via
-    descriptor parsing, fragmentation measurement.
+    descriptor parsing, grain marker validation for compressed grains (LBA
+    and compressed size), redundant grain directory (RGD) consistency
+    checking when FLAG_USE_RGD is set, fragmentation measurement.
 
 12. **VHD Input/Output Support** - Convert supports VHD as both input and
     output format. Input: fixed VHD (raw sector reads) and dynamic VHD
@@ -351,7 +353,10 @@ qcow2-luks).
     operation: footer cookie and checksum validation, dynamic header
     cookie and checksum validation, BAT offset and entry bounds checking,
     overlap detection (1-bit-per-block bitmap in scratch memory), footer
-    copy consistency (start vs end of file).
+    copy consistency (start vs end of file), sector bitmap validation
+    (all bits set for non-differencing VHDs), CHS geometry cross-check
+    against VPC algorithm, original/current size comparison,
+    fragmentation measurement.
 
 14. **VHDX Input/Output Support** - Convert supports VHDX as both input
     and output format. Input: dynamic VHDX (64-bit BAT with interleaved
@@ -361,10 +366,12 @@ qcow2-luks).
 
 15. **VHDX Structural Integrity Check** - Full validation in check
     operation: dual header CRC-32C validation with active header
-    selection by sequence number, dirty log detection, region table
-    CRC-32C validation, GUID-based metadata parsing (all required items),
-    BAT entry validation (offset bounds, 1MB alignment, overlap
-    detection, state validation), differencing disk detection.
+    selection by sequence number, dirty log detection with log entry
+    scanning (signatures, CRC-32C, sequence number range), dual region
+    table validation with RT2 fallback, GUID-based metadata parsing
+    (all required items), BAT entry validation (offset bounds, 1MB
+    alignment, overlap detection, state validation), differencing disk
+    detection, fragmentation measurement.
 
 16. **LUKS Container Inspection and Conversion** - Full LUKS v1 and v2 header
     parsing with cipher, cipher mode, hash algorithm, UUID, payload offset,

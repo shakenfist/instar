@@ -661,13 +661,23 @@ simply because qemu-img didn't actually examine it.
 
 #### imago Behavior
 
-**Default behavior (secure)**: imago performs format-appropriate validation for
-supported formats:
+**Default behavior (secure)**: imago performs comprehensive format-appropriate
+validation for supported formats:
 
-- **VMDK**: Validates header version (1-3), capacity > 0, grain size power of 2,
-  descriptor offset within file bounds
-- **VHDX**: Validates file signature and region table signature at offset 0x30000
-- **VHD**: Validates footer cookie and disk type (2=fixed, 3=dynamic, 4=diff)
+- **VMDK**: Full header parsing, grain directory and grain table walk, grain
+  offset bounds checking, overlap detection (1-bit-per-grain bitmap),
+  streamOptimized footer validation, grain marker validation for compressed
+  grains (LBA and compressed size), redundant grain directory (RGD)
+  consistency checking, fragmentation measurement
+- **VHD**: Footer cookie and checksum validation, dynamic header validation,
+  BAT offset and entry bounds checking, overlap detection (1-bit-per-block
+  bitmap), footer copy consistency, sector bitmap validation, CHS geometry
+  cross-check, fragmentation measurement
+- **VHDX**: Dual header CRC-32C validation with active header selection,
+  dirty log detection with log entry scanning, dual region table validation
+  with RT2 fallback, GUID-based metadata parsing, BAT entry validation
+  (offset bounds, 1MB alignment, overlap detection), fragmentation
+  measurement
 
 Images with structural problems are marked with `FLAG_HAS_CORRUPTIONS` and
 report specific error counts. Images that pass validation are marked `FLAG_VALID`.

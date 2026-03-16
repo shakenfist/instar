@@ -1855,169 +1855,105 @@ class TestCheckQcow2Snapshots(ImagoTestBase):
 class TestCheckEnhancedValidation(ImagoTestBase):
     """Test enhanced structural validation for VMDK, VHD, VHDX.
 
-    Phase 22 validation: grain markers, RGD, block bitmaps,
-    geometry, region table fallback, log detection, fragmentation.
+    Phase 22 validation: grain markers, RGD, block bitmaps, geometry, region table fallback,
+    log detection, fragmentation.
     """
 
     def test_check_streamoptimized_vmdk_clean(self):
         """StreamOptimized VMDK should pass grain marker checks."""
         image = self.get_image('vmdk-streamoptimized')
         if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
+            self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        stdout, stderr, rc = self.run_imago_check(
-            image.path, output_format='json'
-        )
-        self.assertEqual(
-            rc, 0,
-            f'check failed for streamOptimized VMDK: '
-            f'{stderr}'
-        )
+        stdout, stderr, rc = self.run_imago_check(image.path, output_format='json')
+        self.assertEqual(rc, 0, f'check failed for streamOptimized VMDK: {stderr}')
         result = json.loads(stdout)
         self.assertEqual(
             result.get('corruptions', -1), 0,
-            f'Clean streamOptimized VMDK reported '
-            f'corruptions: {stdout}'
+            f'Clean streamOptimized VMDK reported corruptions: {stdout}'
         )
 
     def test_check_vmdk_corrupt_grain_marker(self):
         """VMDK with corrupt grain marker LBA should report error."""
         image = self.get_image('raw-mbr-partitioned')
         if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
+            self.skipTest(f'Image not found: {image.path}')
 
-        with tempfile.NamedTemporaryFile(
-            suffix='.vmdk'
-        ) as vmdk_tmp:
+        with tempfile.NamedTemporaryFile(suffix='.vmdk') as vmdk_tmp:
             # Create a streamOptimized VMDK with data
             _, stderr, rc = self.run_imago_convert(
-                image.path, Path(vmdk_tmp.name),
-                output_format='vmdk', compress=True,
-                timeout=60
+                image.path, Path(vmdk_tmp.name), output_format='vmdk', compress=True, timeout=60
             )
-            self.assertEqual(
-                rc, 0,
-                f'convert to vmdk failed: {stderr}'
-            )
+            self.assertEqual(rc, 0, f'convert to vmdk failed: {stderr}')
 
             data = Path(vmdk_tmp.name).read_bytes()
 
             # Find first grain marker after descriptor
-            desc_off = struct.unpack_from(
-                '<Q', data, 28
-            )[0]
-            desc_sz = struct.unpack_from(
-                '<Q', data, 36
-            )[0]
+            desc_off = struct.unpack_from('<Q', data, 28)[0]
+            desc_sz = struct.unpack_from('<Q', data, 36)[0]
             grain_start = (desc_off + desc_sz) * 512
 
             # Verify there's a grain marker with data
             if grain_start + 12 > len(data):
-                self.skipTest(
-                    'VMDK too small for grain marker'
-                )
-            _, comp_size = struct.unpack_from(
-                '<QI', data, grain_start
-            )
+                self.skipTest('VMDK too small for grain marker')
+            _, comp_size = struct.unpack_from('<QI', data, grain_start)
             if comp_size == 0:
-                self.skipTest(
-                    'No compressed grain data found'
-                )
+                self.skipTest('No compressed grain data found')
 
             # Corrupt the LBA field
             with open(vmdk_tmp.name, 'r+b') as f:
                 f.seek(grain_start)
                 f.write(struct.pack('<Q', 0xDEADBEEF))
 
-            stdout, stderr, rc = self.run_imago_check(
-                Path(vmdk_tmp.name),
-                output_format='json'
-            )
+            stdout, stderr, rc = self.run_imago_check(Path(vmdk_tmp.name), output_format='json')
             result = json.loads(stdout)
             self.assertGreater(
-                result.get('corruptions', 0), 0,
-                'Corrupt grain marker LBA should '
-                'be detected'
+                result.get('corruptions', 0), 0, 'Corrupt grain marker LBA should be detected'
             )
 
     def test_check_vmdk_rgd_mismatch(self):
         """VMDK with mismatched GD/RGD should report error."""
         image = self.get_image('raw-mbr-partitioned')
         if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
+            self.skipTest(f'Image not found: {image.path}')
 
-        with tempfile.NamedTemporaryFile(
-            suffix='.vmdk'
-        ) as vmdk_tmp:
+        with tempfile.NamedTemporaryFile(suffix='.vmdk') as vmdk_tmp:
             # Create a monolithicSparse VMDK (uncompressed)
             _, stderr, rc = self.run_imago_convert(
-                image.path, Path(vmdk_tmp.name),
-                output_format='vmdk', compress=False,
-                timeout=60
+                image.path, Path(vmdk_tmp.name), output_format='vmdk', compress=False, timeout=60
             )
-            self.assertEqual(
-                rc, 0,
-                f'convert to vmdk failed: {stderr}'
-            )
+            self.assertEqual(rc, 0, f'convert to vmdk failed: {stderr}')
 
-            data = bytearray(
-                Path(vmdk_tmp.name).read_bytes()
-            )
+            data = bytearray(Path(vmdk_tmp.name).read_bytes())
 
             # Parse header fields
             flags = struct.unpack_from('<I', data, 8)[0]
-            num_gtes = struct.unpack_from(
-                '<I', data, 44
-            )[0]
-            gd_offset_sectors = struct.unpack_from(
-                '<Q', data, 56
-            )[0]
-            capacity = struct.unpack_from(
-                '<Q', data, 12
-            )[0]
-            grain_size = struct.unpack_from(
-                '<Q', data, 20
-            )[0]
+            num_gtes = struct.unpack_from('<I', data, 44)[0]
+            gd_offset_sectors = struct.unpack_from('<Q', data, 56)[0]
+            capacity = struct.unpack_from('<Q', data, 12)[0]
+            grain_size = struct.unpack_from('<Q', data, 20)[0]
 
             # Calculate GD size
-            total_grains = (
-                (capacity + grain_size - 1) // grain_size
-            )
-            num_gd_entries = (
-                (total_grains + num_gtes - 1) // num_gtes
-            )
+            total_grains = (capacity + grain_size - 1) // grain_size
+            num_gd_entries = (total_grains + num_gtes - 1) // num_gtes
             gd_byte_off = gd_offset_sectors * 512
             gd_size = num_gd_entries * 4
 
-            # Create an RGD at end of file. Copy the GD
-            # but zero out the first non-zero entry to
-            # create an allocation mismatch (GD says
-            # allocated, RGD says unallocated).
+            # Create an RGD at end of file. Copy the GD but zero out the first non-zero entry
+            # to create an allocation mismatch (GD says allocated, RGD says unallocated).
             rgd_byte_off = len(data)
             if rgd_byte_off % 512 != 0:
                 pad = 512 - (rgd_byte_off % 512)
                 data.extend(b'\x00' * pad)
                 rgd_byte_off = len(data)
 
-            gd_data = bytearray(
-                data[gd_byte_off:gd_byte_off + gd_size]
-            )
+            gd_data = bytearray(data[gd_byte_off:gd_byte_off + gd_size])
             # Zero out first non-zero entry
             for i in range(0, len(gd_data), 4):
-                val = struct.unpack_from(
-                    '<I', gd_data, i
-                )[0]
+                val = struct.unpack_from('<I', gd_data, i)[0]
                 if val != 0:
-                    struct.pack_into(
-                        '<I', gd_data, i, 0
-                    )
+                    struct.pack_into('<I', gd_data, i, 0)
                     break
 
             data.extend(gd_data)
@@ -2031,103 +1967,59 @@ class TestCheckEnhancedValidation(ImagoTestBase):
 
             # Set rgd_offset (offset 48) in sectors
             rgd_sectors = rgd_byte_off // 512
-            struct.pack_into(
-                '<Q', data, 48, rgd_sectors
-            )
+            struct.pack_into('<Q', data, 48, rgd_sectors)
 
             Path(vmdk_tmp.name).write_bytes(data)
 
-            stdout, stderr, rc = self.run_imago_check(
-                Path(vmdk_tmp.name),
-                output_format='json'
-            )
+            stdout, stderr, rc = self.run_imago_check(Path(vmdk_tmp.name), output_format='json')
             result = json.loads(stdout)
             self.assertGreater(
-                result.get('corruptions', 0), 0,
-                'GD/RGD mismatch should be detected'
+                result.get('corruptions', 0), 0, 'GD/RGD mismatch should be detected'
             )
 
     def test_check_vhd_clean_bitmap(self):
         """Dynamic VHD should pass bitmap checks cleanly."""
         image = self.get_image('raw-mbr-partitioned')
         if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
+            self.skipTest(f'Image not found: {image.path}')
 
-        with tempfile.NamedTemporaryFile(
-            suffix='.vhd'
-        ) as vhd_tmp:
+        with tempfile.NamedTemporaryFile(suffix='.vhd') as vhd_tmp:
             _, stderr, rc = self.run_imago_convert(
-                image.path, Path(vhd_tmp.name),
-                output_format='vpc', timeout=60
+                image.path, Path(vhd_tmp.name), output_format='vpc', timeout=60
             )
-            self.assertEqual(
-                rc, 0,
-                f'convert to vhd failed: {stderr}'
-            )
+            self.assertEqual(rc, 0, f'convert to vhd failed: {stderr}')
 
-            stdout, _, rc = self.run_imago_check(
-                Path(vhd_tmp.name),
-                output_format='json'
-            )
+            stdout, _, rc = self.run_imago_check(Path(vhd_tmp.name), output_format='json')
             self.assertEqual(rc, 0, f'check failed: {stdout}')
             result = json.loads(stdout)
-            self.assertEqual(
-                result.get('corruptions', -1), 0,
-                'Clean VHD should have no corruptions'
-            )
-            self.assertEqual(
-                result.get('leaks', -1), 0,
-                'Clean VHD should have no leaks'
-            )
+            self.assertEqual(result.get('corruptions', -1), 0, 'Clean VHD should have no corruptions')
+            self.assertEqual(result.get('leaks', -1), 0, 'Clean VHD should have no leaks')
 
     def test_check_vhd_corrupt_bitmap(self):
         """VHD with partially cleared bitmap should warn."""
         image = self.get_image('raw-mbr-partitioned')
         if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
+            self.skipTest(f'Image not found: {image.path}')
 
-        with tempfile.NamedTemporaryFile(
-            suffix='.vhd'
-        ) as vhd_tmp:
+        with tempfile.NamedTemporaryFile(suffix='.vhd') as vhd_tmp:
             _, stderr, rc = self.run_imago_convert(
-                image.path, Path(vhd_tmp.name),
-                output_format='vpc', timeout=60
+                image.path, Path(vhd_tmp.name), output_format='vpc', timeout=60
             )
-            self.assertEqual(
-                rc, 0,
-                f'convert to vhd failed: {stderr}'
-            )
+            self.assertEqual(rc, 0, f'convert to vhd failed: {stderr}')
 
-            data = bytearray(
-                Path(vhd_tmp.name).read_bytes()
-            )
+            data = bytearray(Path(vhd_tmp.name).read_bytes())
 
             # Parse footer (at sector 0 for dynamic VHD)
-            data_offset = struct.unpack_from(
-                '>Q', data, 16
-            )[0]
+            data_offset = struct.unpack_from('>Q', data, 16)[0]
             # Parse dynamic header to find BAT
-            bat_offset = struct.unpack_from(
-                '>Q', data, data_offset + 16
-            )[0]
-            block_size = struct.unpack_from(
-                '>I', data, data_offset + 32
-            )[0]
+            bat_offset = struct.unpack_from('>Q', data, data_offset + 16)[0]
+            block_size = struct.unpack_from('>I', data, data_offset + 32)[0]
 
             # Find first allocated BAT entry
-            max_entries = struct.unpack_from(
-                '>I', data, data_offset + 28
-            )[0]
+            max_entries = struct.unpack_from('>I', data, data_offset + 28)[0]
             first_block_sector = None
             for i in range(max_entries):
-                entry = struct.unpack_from(
-                    '>I', data,
-                    bat_offset + i * 4
-                )[0]
+                entry = struct.unpack_from('>I', data, bat_offset + i * 4)[0]
                 if entry != 0xFFFFFFFF:
                     first_block_sector = entry
                     break
@@ -2141,385 +2033,226 @@ class TestCheckEnhancedValidation(ImagoTestBase):
 
             Path(vhd_tmp.name).write_bytes(data)
 
-            stdout, _, rc = self.run_imago_check(
-                Path(vhd_tmp.name),
-                output_format='json'
-            )
+            stdout, _, rc = self.run_imago_check(Path(vhd_tmp.name), output_format='json')
             result = json.loads(stdout)
             self.assertGreater(
-                result.get('leaks', 0), 0,
-                'Partially cleared bitmap should '
-                'be detected'
+                result.get('leaks', 0), 0, 'Partially cleared bitmap should be detected'
             )
 
     def test_check_vhd_geometry_existing(self):
         """VHD geometry check runs without errors on test images.
 
-        Geometry and original_size checks are informational
-        only (debug_print), so this verifies they don't
-        introduce false corruptions.
+        Geometry and original_size checks are informational only (debug_print), so this verifies
+        they don't introduce false corruptions.
         """
-        for img_id in [
-            'hyperv-dynamic-vhd', 'virtualpc-vhd',
-            'vhd-d2v-zerofilled'
-        ]:
+        for img_id in ['hyperv-dynamic-vhd', 'virtualpc-vhd', 'vhd-d2v-zerofilled']:
             image = self.get_image(img_id)
             if not image.path.exists():
                 continue
             self.skip_if_hash_mismatch(image)
 
-            stdout, _, rc = self.run_imago_check(
-                image.path, output_format='json'
-            )
+            stdout, _, rc = self.run_imago_check(image.path, output_format='json')
             result = json.loads(stdout)
             self.assertEqual(
                 result.get('corruptions', -1), 0,
-                f'{img_id} should have no '
-                f'corruptions: {stdout}'
+                f'{img_id} should have no corruptions: {stdout}'
             )
 
     def test_check_vhdx_clean_not_dirty(self):
         """Clean VHDX should not have dirty flag set."""
         image = self.get_image('qemu-vhdx')
         if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
+            self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        stdout, _, rc = self.run_imago_check(
-            image.path, output_format='json'
-        )
+        stdout, _, rc = self.run_imago_check(image.path, output_format='json')
         self.assertEqual(rc, 0)
         result = json.loads(stdout)
-        self.assertFalse(
-            result.get('dirty', True),
-            'Clean VHDX should not be dirty'
-        )
+        self.assertFalse(result.get('dirty', True), 'Clean VHDX should not be dirty')
 
     def test_check_vhdx_rt1_corrupt_rt2_fallback(self):
         """VHDX with corrupt RT1 should fall back to RT2."""
         image = self.get_image('qemu-vhdx')
         if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
+            self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(
-            suffix='.vhdx'
-        ) as vhdx_tmp:
+        with tempfile.NamedTemporaryFile(suffix='.vhdx') as vhdx_tmp:
             import shutil
             shutil.copy2(image.path, vhdx_tmp.name)
 
-            data = bytearray(
-                Path(vhdx_tmp.name).read_bytes()
-            )
+            data = bytearray(Path(vhdx_tmp.name).read_bytes())
 
-            # Corrupt RT1 signature at 0x30000
-            # Region table signature is "regi" (4 bytes)
+            # Corrupt RT1 signature at 0x30000 — region table signature is "regi" (4 bytes)
             rt1_off = 0x30000
             data[rt1_off:rt1_off + 4] = b'XXXX'
 
             Path(vhdx_tmp.name).write_bytes(data)
 
-            stdout, _, rc = self.run_imago_check(
-                Path(vhdx_tmp.name),
-                output_format='json'
-            )
+            stdout, _, rc = self.run_imago_check(Path(vhdx_tmp.name), output_format='json')
             result = json.loads(stdout)
-            # Should report RT1 corruption but still
-            # succeed using RT2
-            self.assertGreater(
-                result.get('corruptions', 0), 0,
-                'RT1 corruption should be reported'
-            )
-            # Should not have FLAG_HAS_CORRUPTIONS set
-            # (RT2 fallback worked) — check that the
-            # image is still parseable
-            self.assertIn(
-                'format', result,
-                'VHDX should still be parseable '
-                'with RT2 fallback'
-            )
+            # Should report RT1 corruption but still succeed using RT2
+            self.assertGreater(result.get('corruptions', 0), 0, 'RT1 corruption should be reported')
+            # RT2 fallback worked — check that the image is still parseable
+            self.assertIn('format', result, 'VHDX should still be parseable with RT2 fallback')
 
     def test_check_vhd_fragmentation_zero(self):
         """VHD created by imago should have zero fragmentation."""
         image = self.get_image('raw-zeros-1mb')
         if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
+            self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(
-            suffix='.vpc'
-        ) as vpc_tmp:
-            stdout, stderr, rc = self.run_imago_convert(
-                image.path, vpc_tmp.name,
-                output_format='vpc'
-            )
-            self.assertEqual(
-                rc, 0,
-                f'convert to VHD failed: {stderr}'
-            )
+        with tempfile.NamedTemporaryFile(suffix='.vpc') as vpc_tmp:
+            stdout, stderr, rc = self.run_imago_convert(image.path, vpc_tmp.name, output_format='vpc')
+            self.assertEqual(rc, 0, f'convert to VHD failed: {stderr}')
 
-            stdout, stderr, rc = self.run_imago_check(
-                Path(vpc_tmp.name),
-                output_format='json'
-            )
-            self.assertEqual(
-                rc, 0,
-                f'check failed for VHD: {stderr}'
-            )
+            stdout, stderr, rc = self.run_imago_check(Path(vpc_tmp.name), output_format='json')
+            self.assertEqual(rc, 0, f'check failed for VHD: {stderr}')
             result = json.loads(stdout)
             self.assertEqual(
                 result.get('fragmented-clusters', -1), 0,
-                'VHD from sequential convert should '
-                'have zero fragmentation'
+                'VHD from sequential convert should have zero fragmentation'
             )
 
     def test_check_vhdx_fragmentation_zero(self):
         """VHDX created by imago should have zero fragmentation."""
         image = self.get_image('raw-zeros-1mb')
         if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
+            self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        with tempfile.NamedTemporaryFile(
-            suffix='.vhdx'
-        ) as vhdx_tmp:
-            stdout, stderr, rc = self.run_imago_convert(
-                image.path, vhdx_tmp.name,
-                output_format='vhdx'
-            )
-            self.assertEqual(
-                rc, 0,
-                f'convert to VHDX failed: {stderr}'
-            )
+        with tempfile.NamedTemporaryFile(suffix='.vhdx') as vhdx_tmp:
+            stdout, stderr, rc = self.run_imago_convert(image.path, vhdx_tmp.name, output_format='vhdx')
+            self.assertEqual(rc, 0, f'convert to VHDX failed: {stderr}')
 
-            stdout, stderr, rc = self.run_imago_check(
-                Path(vhdx_tmp.name),
-                output_format='json'
-            )
-            self.assertEqual(
-                rc, 0,
-                f'check failed for VHDX: {stderr}'
-            )
+            stdout, stderr, rc = self.run_imago_check(Path(vhdx_tmp.name), output_format='json')
+            self.assertEqual(rc, 0, f'check failed for VHDX: {stderr}')
             result = json.loads(stdout)
             self.assertEqual(
                 result.get('fragmented-clusters', -1), 0,
-                'VHDX from sequential convert should '
-                'have zero fragmentation'
+                'VHDX from sequential convert should have zero fragmentation'
             )
 
     def test_check_existing_vhd_fragmentation(self):
         """Existing VHD test images should report fragmentation."""
         image = self.get_image('hyperv-dynamic-vhd')
         if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
+            self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        stdout, stderr, rc = self.run_imago_check(
-            image.path, output_format='json'
-        )
-        self.assertEqual(
-            rc, 0,
-            f'check failed for VHD: {stderr}'
-        )
+        stdout, stderr, rc = self.run_imago_check(image.path, output_format='json')
+        self.assertEqual(rc, 0, f'check failed for VHD: {stderr}')
         result = json.loads(stdout)
-        self.assertIn(
-            'fragmented-clusters', result,
-            'VHD check should report fragmentation'
-        )
+        self.assertIn('fragmented-clusters', result, 'VHD check should report fragmentation')
 
     def test_check_existing_vhdx_fragmentation(self):
         """Existing VHDX test images should report fragmentation."""
         image = self.get_image('qemu-vhdx')
         if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
+            self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        stdout, stderr, rc = self.run_imago_check(
-            image.path, output_format='json'
-        )
-        self.assertEqual(
-            rc, 0,
-            f'check failed for VHDX: {stderr}'
-        )
+        stdout, stderr, rc = self.run_imago_check(image.path, output_format='json')
+        self.assertEqual(rc, 0, f'check failed for VHDX: {stderr}')
         result = json.loads(stdout)
-        self.assertIn(
-            'fragmented-clusters', result,
-            'VHDX check should report fragmentation'
-        )
+        self.assertIn('fragmented-clusters', result, 'VHDX check should report fragmentation')
 
     def test_check_plaso_vmdk_clean(self):
         """Plaso monolithicSparse VMDK should pass with zero errors."""
         image = self.get_image('plaso-vmdk')
         if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
+            self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        stdout, stderr, rc = self.run_imago_check(
-            image.path, output_format='json'
-        )
-        self.assertEqual(
-            rc, 0,
-            f'check failed for plaso VMDK: {stderr}'
-        )
+        stdout, stderr, rc = self.run_imago_check(image.path, output_format='json')
+        self.assertEqual(rc, 0, f'check failed for plaso VMDK: {stderr}')
         result = json.loads(stdout)
         self.assertEqual(
-            result.get('corruptions', -1), 0,
-            f'Clean plaso VMDK reported corruptions: '
-            f'{stdout}'
+            result.get('corruptions', -1), 0, f'Clean plaso VMDK reported corruptions: {stdout}'
         )
 
     def test_check_vmdk_v3_detected(self):
         """VMDK v3 should be detected and checked as VMDK."""
         image = self.get_image('vmdk-v3')
         if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
+            self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        stdout, _, _ = self.run_imago_check(
-            image.path, output_format='json'
-        )
+        stdout, _, _ = self.run_imago_check(image.path, output_format='json')
         result = json.loads(stdout)
-        self.assertEqual(
-            result.get('format', ''), 'vmdk',
-            'VMDK v3 should be detected as vmdk'
-        )
+        self.assertEqual(result.get('format', ''), 'vmdk', 'VMDK v3 should be detected as vmdk')
 
     def test_check_vmdk_multi_partition_clean(self):
         """Multi-partition VMDK should pass with zero errors."""
         image = self.get_image('vmdk-multi-partition')
         if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
+            self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        stdout, stderr, rc = self.run_imago_check(
-            image.path, output_format='json'
-        )
-        self.assertEqual(
-            rc, 0,
-            f'check failed for multi-partition VMDK: '
-            f'{stderr}'
-        )
+        stdout, stderr, rc = self.run_imago_check(image.path, output_format='json')
+        self.assertEqual(rc, 0, f'check failed for multi-partition VMDK: {stderr}')
         result = json.loads(stdout)
         self.assertEqual(
-            result.get('corruptions', -1), 0,
-            f'Clean multi-partition VMDK reported '
-            f'corruptions: {stdout}'
+            result.get('corruptions', -1), 0, f'Clean multi-partition VMDK reported corruptions: {stdout}'
         )
 
     def test_check_virtualpc_vhd_clean(self):
         """VirtualPC VHD should pass with zero errors."""
         image = self.get_image('virtualpc-vhd')
         if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
+            self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        stdout, stderr, rc = self.run_imago_check(
-            image.path, output_format='json'
-        )
-        self.assertEqual(
-            rc, 0,
-            f'check failed for VirtualPC VHD: {stderr}'
-        )
+        stdout, stderr, rc = self.run_imago_check(image.path, output_format='json')
+        self.assertEqual(rc, 0, f'check failed for VirtualPC VHD: {stderr}')
         result = json.loads(stdout)
         self.assertEqual(
-            result.get('corruptions', -1), 0,
-            f'Clean VirtualPC VHD reported corruptions: '
-            f'{stdout}'
+            result.get('corruptions', -1), 0, f'Clean VirtualPC VHD reported corruptions: {stdout}'
         )
 
     def test_check_vhd_d2v_zerofilled_detected(self):
         """Disk2VHD zerofilled VHD should be detected as VHD.
 
-        This image has cleared sector bitmap bits (leaks)
-        which is expected for a zerofilled disk2vhd image.
+        This image has cleared sector bitmap bits (leaks) which is expected for a zerofilled
+        disk2vhd image.
         """
         image = self.get_image('vhd-d2v-zerofilled')
         if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
+            self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        stdout, _, _ = self.run_imago_check(
-            image.path, output_format='json'
-        )
+        stdout, _, _ = self.run_imago_check(image.path, output_format='json')
         result = json.loads(stdout)
-        self.assertEqual(
-            result.get('format', ''), 'vhd',
-            'd2v zerofilled should be detected as vhd'
-        )
-        self.assertEqual(
-            result.get('corruptions', -1), 0,
-            'd2v zerofilled should have no corruptions'
-        )
+        self.assertEqual(result.get('format', ''), 'vhd', 'd2v zerofilled should be detected as vhd')
+        self.assertEqual(result.get('corruptions', -1), 0, 'd2v zerofilled should have no corruptions')
         # Leaks expected (cleared bitmap bits)
-        self.assertGreater(
-            result.get('leaks', 0), 0,
-            'd2v zerofilled should report bitmap leaks'
-        )
+        self.assertGreater(result.get('leaks', 0), 0, 'd2v zerofilled should report bitmap leaks')
 
     def test_check_vhd_fixed_clean(self):
         """Fixed VHD should pass with zero errors."""
         image = self.get_image('vhd-fixed')
         if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
+            self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        stdout, stderr, rc = self.run_imago_check(
-            image.path, output_format='json'
-        )
-        self.assertEqual(
-            rc, 0,
-            f'check failed for fixed VHD: {stderr}'
-        )
+        stdout, stderr, rc = self.run_imago_check(image.path, output_format='json')
+        self.assertEqual(rc, 0, f'check failed for fixed VHD: {stderr}')
         result = json.loads(stdout)
         self.assertEqual(
-            result.get('corruptions', -1), 0,
-            f'Clean fixed VHD reported corruptions: '
-            f'{stdout}'
+            result.get('corruptions', -1), 0, f'Clean fixed VHD reported corruptions: {stdout}'
         )
 
     def test_check_vhdx_disk2vhd_clean(self):
         """Disk2VHD VHDX should pass with zero errors."""
         image = self.get_image('vhdx-disk2vhd')
         if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
+            self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
 
-        stdout, stderr, rc = self.run_imago_check(
-            image.path, output_format='json'
-        )
-        self.assertEqual(
-            rc, 0,
-            f'check failed for disk2vhd VHDX: {stderr}'
-        )
+        stdout, stderr, rc = self.run_imago_check(image.path, output_format='json')
+        self.assertEqual(rc, 0, f'check failed for disk2vhd VHDX: {stderr}')
         result = json.loads(stdout)
         self.assertEqual(
-            result.get('corruptions', -1), 0,
-            f'Clean disk2vhd VHDX reported '
-            f'corruptions: {stdout}'
+            result.get('corruptions', -1), 0, f'Clean disk2vhd VHDX reported corruptions: {stdout}'
         )
