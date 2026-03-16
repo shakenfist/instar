@@ -584,7 +584,8 @@ class TestCVEReproduction(ImagoTestBase):
         image = self.get_adversarial_image('cve-2022-47951-vmdk-hostile-extent')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
             _stdout, _stderr, _rc = self.run_imago_convert(image.path, out.name)
-            out_data = open(out.name, 'rb').read(4096)
+            with open(out.name, 'rb') as f:
+                out_data = f.read(4096)
             for forbidden in [b'root:', b'daemon:', b'bin:']:
                 self.assertNotIn(
                     forbidden, out_data,
