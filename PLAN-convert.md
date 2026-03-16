@@ -1,6 +1,6 @@
 # Plan: Implementing `imago convert` (and Prerequisites)
 
-## Status: Phase 21 Complete + Bug Fixes
+## Status: Phase 22 Complete
 
 **Completed:**
 - Phase -1: Configuration file support
@@ -166,6 +166,15 @@
   VHD input read_offset_sectors buffer overflow corrupting
   device caches. All 7 previously-failing VMDK/VHD tests
   now pass.
+- Phase 22: Enhanced VMDK/VHD/VHDX check validation. VMDK
+  grain marker validation for compressed grains, redundant
+  grain directory (RGD) consistency checking. VHD sector
+  bitmap validation, CHS geometry cross-check, fragmentation
+  measurement. VHDX dual region table validation with RT2
+  fallback, dirty log entry scanning, fragmentation
+  measurement. 19 new tests in TestCheckEnhancedValidation
+  plus positive clean-image tests for all VMDK/VHD/VHDX
+  test images.
 
 **Known gaps (not yet scheduled):**
 
@@ -177,13 +186,21 @@
 - QCOW2 encrypted output: Decryption works (AES-128-CBC via
   --qcow2-password, LUKS via --luks-passphrase) but writing
   encrypted QCOW2 output is not supported.
-- VMDK/VHD/VHDX check validation gaps: All three formats
-  have header parsing, metadata table walking, bounds
-  checking, and overlap detection. Remaining gaps: VMDK
-  grain marker validation and RGD consistency, VHD block
-  bitmap and geometry validation, VHDX region table 2
-  fallback and log entry inspection. See
-  PLAN-convert-phase22.md.
+
+*Check operation code quality:*
+- Fragmentation tracking pattern (init, loop, compute) is
+  duplicated across check_vmdk, check_vhdx, check_vhd, and
+  check_qcow2. Could be extracted into a shared helper.
+- Corruption recording pattern (result.corruptions += 1;
+  result.total_errors += 1; debug_print) appears ~99 times.
+  Could be a macro.
+
+*Pre-existing check issues:*
+- vmdk-v3 (iotest-version3.vmdk) reports 1 corruption during
+  check. Root cause not yet investigated.
+- vhd-d2v-zerofilled (d2v-zerofilled.vhd) reports 125 leaks.
+  This is expected: the zerofilled disk2vhd image has cleared
+  sector bitmap bits which bitmap validation correctly reports.
 
 *Additional qemu-img subcommands (not yet implemented):*
 - create: Create new disk images
@@ -291,9 +308,10 @@
   above counts are from the Phase 7 snapshot.)
 
 **Next Steps:**
-- All convert phases (through Phase 21) are complete. Remaining
-  work is additional qemu-img subcommands (create, resize, etc.)
-  and the security audit (PLAN-audit.md).
+- All convert phases (through Phase 22) are complete. Remaining
+  work is additional qemu-img subcommands (create, resize, etc.),
+  the security audit (PLAN-audit.md), and optional check code
+  refactoring (fragmentation/corruption pattern deduplication).
 
 ## Executive Summary
 
