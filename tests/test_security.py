@@ -3,10 +3,14 @@ Security-focused tests for imago.
 
 These tests verify that imago correctly detects and reports security-relevant
 features in disk images (backing files, external data files, etc.) without
-being exploited by them.
+being exploited by them. The TestCVEReproduction class specifically validates
+that known qemu-img CVEs are mitigated by imago's architecture.
 """
 
+import json
 import subprocess
+import tempfile
+import time
 
 import testtools
 
@@ -461,3 +465,212 @@ class TestRawFormatValidation(ImagoTestBase):
             stdout.lower(),
             f'Expected imago to report GPT image as raw, got: {stdout}'
         )
+
+
+class TestCVEReproduction(ImagoTestBase):
+    """CVE reproduction tests (Phase 4 of security audit).
+
+    Each test uses a purpose-built reproducer image that mimics the attack
+    vector from a known qemu-img CVE. Tests verify that imago's mitigations
+    (KVM sandbox, host-side path allowlist, bounded buffers, checked
+    arithmetic) prevent exploitation.
+    """
+
+    def run_imago_info_chain(self, image_path, timeout=30):
+        """Run imago info --chain on an image."""
+        imago = self.get_imago_binary()
+        cmd = [str(imago), 'info', '--chain', str(image_path)]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            return result.stdout, result.stderr, result.returncode
+        except subprocess.TimeoutExpired:
+            return '', f'Timeout after {timeout}s', -1
+
+    # ----------------------------------------------------------------
+    # CVE-2024-32498: QCOW2 external data file path traversal
+    # ----------------------------------------------------------------
+
+    def test_cve_2024_32498_info_reports_data_file_path(self):
+        """External data file path is reported without opening the file."""
+        image = self.get_adversarial_image('cve-2024-32498-extdata-etc-passwd')
+        stdout, stderr, rc = self.run_imago_info(image.path, output_format='json')
+        self.assertEqual(rc, 0, f'imago info failed: {stderr}')
+
+        data = json.loads(stdout)
+        fmt_data = data.get('format-specific', {}).get('data', {})
+        self.assertEqual(fmt_data.get('data-file'), '/etc/passwd', f'Expected data-file=/etc/passwd: {fmt_data}')
+
+    def test_cve_2024_32498_no_passwd_content_leaked(self):
+        """No /etc/passwd content appears in info output."""
+        image = self.get_adversarial_image('cve-2024-32498-extdata-etc-passwd')
+        stdout, stderr, rc = self.run_imago_info(image.path)
+        self.assertEqual(rc, 0, f'imago info failed: {stderr}')
+        combined = stdout + stderr
+        self.assertNotIn('root:', combined, '/etc/passwd content leaked in output!')
+
+    def test_cve_2024_32498_chain_rejects_external_data_file(self):
+        """Chain mode rejects external data file outside allowlist."""
+        image = self.get_adversarial_image('cve-2024-32498-extdata-etc-passwd')
+        stdout, stderr, rc = self.run_imago_info_chain(image.path)
+        # Chain should fail — /etc/passwd is outside the allowed directories
+        self.assertNotEqual(rc, 0, f'Chain should reject /etc/passwd as external data file: {stdout}')
+
+    def test_cve_2024_32498_convert_rejects_external_data_file(self):
+        """Convert rejects image with external data file pointing to host path."""
+        image = self.get_adversarial_image('cve-2024-32498-extdata-etc-passwd')
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            stdout, stderr, rc = self.run_imago_convert(image.path, out.name)
+            # Convert should fail — external data file can't be accessed
+            self.assertNotEqual(rc, 0, f'Convert should reject external data file: {stdout}')
+            # No /etc/passwd content in output file
+            out_data = open(out.name, 'rb').read(1024)
+            self.assertNotIn(b'root:', out_data, '/etc/passwd content in converted output!')
+
+    # ----------------------------------------------------------------
+    # CVE-2015-5163: Backing file path traversal
+    # ----------------------------------------------------------------
+
+    def test_cve_2015_5163_dotdot_info_reports_path(self):
+        """Info reports the ../../../etc/passwd backing path without reading it."""
+        image = self.get_adversarial_image('cve-2015-5163-traversal-dotdot')
+        stdout, stderr, rc = self.run_imago_info(image.path)
+        self.assertEqual(rc, 0, f'imago info failed: {stderr}')
+        self.assertIn('etc/passwd', stdout, f'Expected backing file path in output: {stdout}')
+        self.assertNotIn('root:', stdout + stderr, '/etc/passwd content leaked!')
+
+    def test_cve_2015_5163_dotdot_chain_rejects(self):
+        """Chain mode rejects ../ traversal backing path."""
+        image = self.get_adversarial_image('cve-2015-5163-traversal-dotdot')
+        stdout, stderr, rc = self.run_imago_info_chain(image.path)
+        self.assertNotEqual(rc, 0, f'Chain should reject traversal path: {stdout}')
+
+    def test_cve_2015_5163_dotdot_convert_rejects(self):
+        """Convert rejects image with ../ traversal backing path."""
+        image = self.get_adversarial_image('cve-2015-5163-traversal-dotdot')
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            stdout, stderr, rc = self.run_imago_convert(image.path, out.name)
+            self.assertNotEqual(rc, 0, f'Convert should reject traversal backing path: {stdout}')
+
+    def test_cve_2015_5163_null_byte_info(self):
+        """Backing file path with embedded null byte is handled safely."""
+        image = self.get_adversarial_image('cve-2015-5163-traversal-null')
+        stdout, stderr, rc = self.run_imago_info(image.path)
+        self.assertEqual(rc, 0, f'imago info failed: {stderr}')
+        # Should report some form of the backing file path
+        self.assertNotIn('root:', stdout + stderr, '/etc/passwd content leaked via null byte bypass!')
+
+    def test_cve_2015_5163_null_byte_chain_rejects(self):
+        """Chain mode rejects backing path with embedded null byte."""
+        image = self.get_adversarial_image('cve-2015-5163-traversal-null')
+        stdout, stderr, rc = self.run_imago_info_chain(image.path)
+        self.assertNotEqual(rc, 0, f'Chain should reject null-byte path: {stdout}')
+
+    # ----------------------------------------------------------------
+    # CVE-2022-47951: VMDK descriptor with host file extent paths
+    # ----------------------------------------------------------------
+
+    def test_cve_2022_47951_info_no_shadow_content(self):
+        """Binary VMDK with /etc/shadow extent does not leak file content."""
+        image = self.get_adversarial_image('cve-2022-47951-vmdk-hostile-extent')
+        stdout, stderr, rc = self.run_imago_info(image.path)
+        # imago should detect this as VMDK (binary magic present)
+        self.assertEqual(rc, 0, f'imago info failed: {stderr}')
+        combined = (stdout + stderr).lower()
+        # /etc/shadow content should never appear
+        for forbidden in ['root:', 'daemon:', 'bin:']:
+            self.assertNotIn(forbidden, combined, f'/etc/shadow content leaked: {forbidden}')
+
+    def test_cve_2022_47951_convert_no_shadow_content(self):
+        """Converting VMDK with hostile extent does not produce /etc/shadow data."""
+        image = self.get_adversarial_image('cve-2022-47951-vmdk-hostile-extent')
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            stdout, stderr, rc = self.run_imago_convert(image.path, out.name)
+            # Convert may succeed or fail — either way, no shadow content
+            out_data = open(out.name, 'rb').read(4096)
+            for forbidden in [b'root:', b'daemon:', b'bin:']:
+                self.assertNotIn(forbidden, out_data, f'/etc/shadow in converted output: {forbidden}')
+
+    # ----------------------------------------------------------------
+    # CVE-2015-5162: Resource exhaustion via tiny petabyte image
+    # ----------------------------------------------------------------
+
+    def test_cve_2015_5162_info_completes_quickly(self):
+        """Info on a tiny image claiming 1 PB completes within 5 seconds."""
+        image = self.get_adversarial_image('cve-2015-5162-tiny-petabyte')
+        start = time.monotonic()
+        stdout, stderr, rc = self.run_imago_info(image.path)
+        elapsed = time.monotonic() - start
+        self.assertEqual(rc, 0, f'imago info failed: {stderr}')
+        self.assertLess(elapsed, 5.0, f'Info took {elapsed:.1f}s on petabyte image (expected <5s)')
+
+    def test_cve_2015_5162_check_completes_quickly(self):
+        """Check on a tiny image claiming 1 PB completes within 10 seconds."""
+        image = self.get_adversarial_image('cve-2015-5162-tiny-petabyte')
+        start = time.monotonic()
+        stdout, stderr, rc = self.run_imago_check(image.path)
+        elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 10.0, f'Check took {elapsed:.1f}s on petabyte image (expected <10s)')
+
+    # ----------------------------------------------------------------
+    # CVE-2014-0223: Integer overflow in L1 table size
+    # ----------------------------------------------------------------
+
+    def test_cve_2014_0223_info_no_crash(self):
+        """Info on image with L1 overflow boundary does not crash."""
+        image = self.get_adversarial_image('cve-2014-0223-l1-overflow-boundary')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'info', str(image.path)], timeout=10
+        )
+        # Should complete without signal (no crash)
+
+    def test_cve_2014_0223_check_no_crash(self):
+        """Check on image with L1 overflow boundary does not crash."""
+        image = self.get_adversarial_image('cve-2014-0223-l1-overflow-boundary')
+        stdout, stderr, rc = self.run_adversarial(
+            [str(self.get_imago_binary()), 'check', str(image.path)], timeout=10
+        )
+
+    def test_cve_2014_0223_convert_no_crash(self):
+        """Convert on image with L1 overflow boundary does not crash."""
+        image = self.get_adversarial_image('cve-2014-0223-l1-overflow-boundary')
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            stdout, stderr, rc = self.run_adversarial(
+                [str(self.get_imago_binary()), 'convert', str(image.path), out.name], timeout=10
+            )
+
+    # ----------------------------------------------------------------
+    # CVE-2024-4467: json:{} block device specification
+    # ----------------------------------------------------------------
+
+    def test_cve_2024_4467_json_prefix_rejected(self):
+        """File with json:{} content is rejected as unknown format."""
+        image = self.get_adversarial_image('cve-2024-4467-json-prefix')
+        stdout, stderr, rc = self.run_imago_info(image.path)
+        # Should be detected as unknown (no valid format magic or partition table)
+        self.assertEqual(rc, 0, f'imago info failed: {stderr}')
+        self.assertIn('unknown', stdout.lower(), f'Expected unknown format for json: content: {stdout}')
+
+    def test_cve_2024_4467_no_shadow_content(self):
+        """File with json:{} referencing /etc/shadow does not leak content."""
+        image = self.get_adversarial_image('cve-2024-4467-json-prefix')
+        stdout, stderr, rc = self.run_imago_info(image.path)
+        combined = (stdout + stderr).lower()
+        for forbidden in ['root:', 'daemon:', 'bin:']:
+            self.assertNotIn(forbidden, combined, f'/etc/shadow content leaked via json: {forbidden}')
+
+    def test_cve_2024_4467_cli_treats_json_as_filename(self):
+        """imago CLI does not interpret json:{} as a block device spec.
+
+        This tests that passing a literal 'json:{...}' string as an argument
+        is treated as a filename, not parsed as a block driver specification.
+        """
+        imago = self.get_imago_binary()
+        json_arg = 'json:{"driver":"raw","file":{"driver":"file","filename":"/etc/shadow"}}'
+        result = subprocess.run(
+            [str(imago), 'info', json_arg],
+            capture_output=True, text=True, timeout=10
+        )
+        # Should fail because the file doesn't exist (treated as literal path)
+        combined = (result.stdout + result.stderr).lower()
+        self.assertNotIn('root:', combined, 'json: argument was interpreted as block driver!')
+        self.assertNotIn('daemon:', combined, 'json: argument was interpreted as block driver!')
