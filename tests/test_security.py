@@ -612,7 +612,7 @@ class TestCVEReproduction(ImagoTestBase):
         """Check on a tiny image claiming 1 PB completes within 10 seconds."""
         image = self.get_adversarial_image('cve-2015-5162-tiny-petabyte')
         start = time.monotonic()
-        _stdout, _stderr, _rc = self.run_imago_check(image.path)
+        self.run_imago_check(image.path)
         elapsed = time.monotonic() - start
         self.assertLess(
             elapsed, 10.0,
