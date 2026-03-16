@@ -1302,7 +1302,6 @@ unsafe fn check_vhdx(
     let rt_result = if let Some(r) = rt1_parsed {
         r
     } else if let Some(r) = rt2_parsed {
-        // Need to re-read RT2 into scratch for use below
         r
     } else {
         result.corruptions += 1;
