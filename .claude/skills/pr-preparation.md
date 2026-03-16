@@ -74,7 +74,7 @@ Only after all checks pass:
 ```bash
 # Ensure branch is up to date
 git fetch origin
-git rebase origin/main  # or appropriate base branch
+git rebase origin/develop  # or appropriate base branch
 
 # Push
 git push -u origin <branch-name>

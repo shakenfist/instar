@@ -9,7 +9,7 @@ name: PR Address Review Comments
 #
 # 1. Authorization: Only repository maintainers can trigger (enforced by
 #    shakenfist/actions/pr-bot-trigger before any code checkout)
-# 2. Trusted tools: Scripts are checked out from the base branch (main), not
+# 2. Trusted tools: Scripts are checked out from the base branch (develop), not
 #    the PR, preventing execution of malicious code from the PR
 # 3. No credential persistence: persist-credentials: false prevents the
 #    GITHUB_TOKEN from being stored in the checked-out repository
