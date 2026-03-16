@@ -583,7 +583,7 @@ class TestCVEReproduction(ImagoTestBase):
         """Converting VMDK with hostile extent does not produce /etc/shadow data."""
         image = self.get_adversarial_image('cve-2022-47951-vmdk-hostile-extent')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
-            _stdout, _stderr, _rc = self.run_imago_convert(image.path, out.name)
+            _ = self.run_imago_convert(image.path, out.name)
             with open(out.name, 'rb') as f:
                 out_data = f.read(4096)
             for forbidden in [b'root:', b'daemon:', b'bin:']:
