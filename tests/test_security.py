@@ -513,7 +513,8 @@ class TestCVEReproduction(ImagoTestBase):
                 rc, 0,
                 f'Convert should reject external data file: {stdout}'
             )
-            out_data = open(out.name, 'rb').read(1024)
+            with open(out.name, 'rb') as f:
+                out_data = f.read(1024)
             self.assertNotIn(
                 b'root:', out_data,
                 '/etc/passwd content in converted output!'
