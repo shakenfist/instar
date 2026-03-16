@@ -755,6 +755,7 @@ unsafe fn check_vmdk(
                             vmdk::parse_grain_marker(&marker_buf[marker_off_in_sector..])
                         {
                             // Validate LBA matches expected virtual grain
+                            // Saturating arithmetic: if overflow occurs, mismatch is correct (corrupt image)
                             let expected_lba = (gd_idx as u64)
                                 .saturating_mul(hdr.num_gtes_per_gt as u64)
                                 .saturating_add(gt_idx as u64)
