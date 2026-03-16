@@ -1818,6 +1818,7 @@ unsafe fn check_vhd(
 
     // Sector bitmap size per block
     let sectors_per_block = dyn_header.block_size / 512;
+    let actual_bitmap_bytes = (sectors_per_block + 7) / 8;
     let bitmap_bytes = ((sectors_per_block + 7) / 8 + 511) & !511;
     let block_total_bytes = bitmap_bytes as u64 + dyn_header.block_size as u64;
 
@@ -1941,15 +1942,17 @@ unsafe fn check_vhd(
                 };
 
                 for i in 0..check_len {
-                    // Last bitmap byte may have padding
-                    // bits beyond actual sectors
-                    if (done + i as u32) == bitmap_bytes - 1 {
+                    let byte_index = done + i as u32;
+                    // Skip padding bytes beyond actual bitmap
+                    if byte_index >= actual_bitmap_bytes {
+                        break;
+                    }
+                    // Last meaningful bitmap byte may have
+                    // padding bits beyond actual sectors
+                    if byte_index == actual_bitmap_bytes - 1 && sectors_per_block % 8 != 0 {
                         // Mask: only check bits for
                         // actual sectors
-                        let total_bitmap_bits = sectors_per_block;
-                        let bits_before = (done + i as u32) * 8;
-                        let valid_bits = total_bitmap_bits - bits_before;
-                        let valid = if valid_bits >= 8 { 8 } else { valid_bits };
+                        let valid = sectors_per_block % 8;
                         let mask = 0xFFu8 << (8 - valid);
                         if bmp_buf[i] & mask != mask {
                             all_ones = false;
