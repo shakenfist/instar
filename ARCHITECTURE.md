@@ -301,8 +301,10 @@ Detected but not yet supported for I/O:
 
 The check operation performs full structural validation: grain directory
 and grain table walk, grain offset bounds checking, overlap detection
-via 1-bit-per-grain bitmap, streamOptimized footer validation, and
-multi-extent detection.
+via 1-bit-per-grain bitmap, streamOptimized footer validation,
+multi-extent detection, grain marker validation for compressed grains
+(LBA and compressed size), redundant grain directory (RGD) consistency
+checking, and fragmentation measurement.
 
 ### vhd
 
@@ -313,8 +315,9 @@ Microsoft Virtual Hard Disk. Supported sub-formats:
 
 The check operation performs full structural validation: footer cookie
 and checksum, dynamic header cookie and checksum, BAT offset and entry
-bounds checking, overlap detection via 1-bit-per-block bitmap, and
-footer copy consistency (start vs end of file).
+bounds checking, overlap detection via 1-bit-per-block bitmap, footer
+copy consistency (start vs end of file), sector bitmap validation,
+CHS geometry cross-check, and fragmentation measurement.
 
 ### vhdx
 
@@ -328,9 +331,10 @@ structures. All on-disk fields are little-endian.
 
 The check operation performs full structural validation: dual header
 CRC-32C validation with active header selection by sequence number,
-dirty log detection, region table CRC-32C validation, GUID-based
-metadata parsing, BAT entry validation (offset bounds, 1MB alignment,
-overlap detection, state validation).
+dirty log detection with log entry scanning, dual region table
+validation with RT2 fallback, GUID-based metadata parsing, BAT entry
+validation (offset bounds, 1MB alignment, overlap detection, state
+validation), and fragmentation measurement.
 
 ### luks
 

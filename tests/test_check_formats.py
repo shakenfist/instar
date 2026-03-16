@@ -2358,3 +2358,168 @@ class TestCheckEnhancedValidation(ImagoTestBase):
             'fragmented-clusters', result,
             'VHDX check should report fragmentation'
         )
+
+    def test_check_plaso_vmdk_clean(self):
+        """Plaso monolithicSparse VMDK should pass with zero errors."""
+        image = self.get_image('plaso-vmdk')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        self.assertEqual(
+            rc, 0,
+            f'check failed for plaso VMDK: {stderr}'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('corruptions', -1), 0,
+            f'Clean plaso VMDK reported corruptions: '
+            f'{stdout}'
+        )
+
+    def test_check_vmdk_v3_detected(self):
+        """VMDK v3 should be detected and checked as VMDK."""
+        image = self.get_image('vmdk-v3')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        stdout, _, _ = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('format', ''), 'vmdk',
+            'VMDK v3 should be detected as vmdk'
+        )
+
+    def test_check_vmdk_multi_partition_clean(self):
+        """Multi-partition VMDK should pass with zero errors."""
+        image = self.get_image('vmdk-multi-partition')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        self.assertEqual(
+            rc, 0,
+            f'check failed for multi-partition VMDK: '
+            f'{stderr}'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('corruptions', -1), 0,
+            f'Clean multi-partition VMDK reported '
+            f'corruptions: {stdout}'
+        )
+
+    def test_check_virtualpc_vhd_clean(self):
+        """VirtualPC VHD should pass with zero errors."""
+        image = self.get_image('virtualpc-vhd')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        self.assertEqual(
+            rc, 0,
+            f'check failed for VirtualPC VHD: {stderr}'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('corruptions', -1), 0,
+            f'Clean VirtualPC VHD reported corruptions: '
+            f'{stdout}'
+        )
+
+    def test_check_vhd_d2v_zerofilled_detected(self):
+        """Disk2VHD zerofilled VHD should be detected as VHD.
+
+        This image has cleared sector bitmap bits (leaks)
+        which is expected for a zerofilled disk2vhd image.
+        """
+        image = self.get_image('vhd-d2v-zerofilled')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        stdout, _, _ = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('format', ''), 'vhd',
+            'd2v zerofilled should be detected as vhd'
+        )
+        self.assertEqual(
+            result.get('corruptions', -1), 0,
+            'd2v zerofilled should have no corruptions'
+        )
+        # Leaks expected (cleared bitmap bits)
+        self.assertGreater(
+            result.get('leaks', 0), 0,
+            'd2v zerofilled should report bitmap leaks'
+        )
+
+    def test_check_vhd_fixed_clean(self):
+        """Fixed VHD should pass with zero errors."""
+        image = self.get_image('vhd-fixed')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        self.assertEqual(
+            rc, 0,
+            f'check failed for fixed VHD: {stderr}'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('corruptions', -1), 0,
+            f'Clean fixed VHD reported corruptions: '
+            f'{stdout}'
+        )
+
+    def test_check_vhdx_disk2vhd_clean(self):
+        """Disk2VHD VHDX should pass with zero errors."""
+        image = self.get_image('vhdx-disk2vhd')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_imago_check(
+            image.path, output_format='json'
+        )
+        self.assertEqual(
+            rc, 0,
+            f'check failed for disk2vhd VHDX: {stderr}'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('corruptions', -1), 0,
+            f'Clean disk2vhd VHDX reported '
+            f'corruptions: {stdout}'
+        )

@@ -126,6 +126,8 @@ For VMDK images (monolithicSparse and streamOptimized), check validates:
 - Grain data offsets within file bounds
 - Overlap detection via 1-bit-per-grain bitmap (same pattern as QCOW2)
 - streamOptimized footer validation (magic, GD offset)
+- Grain marker validation for compressed grains (LBA, compressed size)
+- Redundant grain directory (RGD) consistency when FLAG_USE_RGD is set
 - Fragmentation measurement
 
 For VHD images (dynamic and fixed), check validates:
@@ -136,17 +138,24 @@ For VHD images (dynamic and fixed), check validates:
 - BAT entry validation: allocated block offsets within file
 - Overlap detection (no two BAT entries reference same block)
 - Footer copy consistency (start vs end of file)
+- Sector bitmap validation (all bits set for non-differencing VHDs)
+- CHS geometry cross-check against VPC algorithm
+- Original/current size comparison
+- Fragmentation measurement
 
 For VHDX images, check validates:
 - Header 1 and Header 2: signature, CRC-32C checksum, active header
   selection by sequence number
-- Dirty log detection (non-zero log GUID)
+- Dirty log detection with log entry scanning (signatures, CRC-32C,
+  sequence number range)
 - Region table: signature, CRC-32C, BAT and metadata region presence
+- Redundant region table (RT2) validation and fallback
 - Metadata: required items (FileParameters, VirtualDiskSize,
   LogicalSectorSize, PhysicalSectorSize)
 - Differencing disk detection (unsupported)
 - BAT entries: block offsets within file bounds, 1MB alignment,
   overlap detection, state validation
+- Fragmentation measurement
 
 The `--chain` flag discovers the full backing chain (using the same chain
 discovery infrastructure as `imago info --chain`), sets up each image as a

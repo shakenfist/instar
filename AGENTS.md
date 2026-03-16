@@ -189,7 +189,11 @@ make clean-tests
   detection, large cluster sizes 256K-2MB, VMDK GD/GT
   validation with overlap detection, QCOW2 snapshot
   detection, TestExtendedL2Subclusters for partial
-  subcluster allocation with Normal/Zero/Unallocated states)
+  subcluster allocation with Normal/Zero/Unallocated states,
+  TestCheckEnhancedValidation for VMDK grain marker and RGD
+  validation, VHD sector bitmap and geometry checks, VHDX
+  region table fallback and log detection, VHD/VHDX
+  fragmentation tracking)
 - `tests/test_compare.py` - Tests for compare operation
   (raw-vs-raw, QCOW2-vs-raw, QCOW2-vs-QCOW2, compressed
   QCOW2, backing chains, LUKS-in-QCOW2 decryption)
