@@ -63,6 +63,14 @@ Features unique to imago that do not exist in qemu-img.
 | [Integration Testing](testing.md) | Test suite comparing imago output against qemu-img |
 | [Format Coverage](format-coverage.md) | Comparison with oslo.utils format_inspector, test coverage gaps |
 
+## Understanding the Codebase
+
+| Document | Description |
+|----------|-------------|
+| [Commentary Index](commentary/index.md) | Lions-style annotated walkthrough of the codebase |
+| [Reading Order](commentary/reading-order.md) | Which files to read, in what sequence, and what to look for |
+| [Architectural Decisions](commentary/architectural-decisions.md) | The *why* behind every major design choice |
+
 ## Design Decisions
 
 | Document | Description |
