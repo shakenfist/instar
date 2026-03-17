@@ -178,10 +178,12 @@
 - QCOW2 encrypted output: Decryption works (AES-128-CBC via
   --qcow2-password, LUKS via --luks-passphrase) but writing
   encrypted QCOW2 output is not supported.
-- VMDK/VHD/VHDX structural validation in check: The check
-  operation performs full QCOW2 structural validation (L2 scan,
-  overlap detection, refcount validation, leak detection) but
-  only does basic format detection for other formats.
+- ~~VMDK/VHD/VHDX structural validation in check~~ — Done
+  (PLAN-vmdk-vhd-vhdx-structural.md). All three formats now
+  have full structural validation: compressed grain marker
+  validation and RGD cross-check for VMDK, version/feature/
+  fragmentation/fixed size validation for VHD, file identifier/
+  region table cross-check/fragmentation for VHDX.
 
 *Resolved in later phases (items formerly listed here):*
 - ~~VHD round-trip tests (TestConvertToVhd)~~ — Fixed

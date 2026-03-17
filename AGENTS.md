@@ -190,9 +190,12 @@ make clean-tests
   + backing chains, extended L2 + compressed clusters,
   refcount widths 1-64 bit, compressed cluster leak
   detection, large cluster sizes 256K-2MB, VMDK GD/GT
-  validation with overlap detection, QCOW2 snapshot
-  detection, TestExtendedL2Subclusters for partial
-  subcluster allocation with Normal/Zero/Unallocated states)
+  validation with overlap/compressed grain marker/RGD checks,
+  VHD fragmentation/version/feature/fixed size validation,
+  VHDX file identifier/region table cross-check/fragmentation,
+  QCOW2 snapshot detection, TestExtendedL2Subclusters for
+  partial subcluster allocation with Normal/Zero/Unallocated
+  states)
 - `tests/test_compare.py` - Tests for compare operation
   (raw-vs-raw, QCOW2-vs-raw, QCOW2-vs-QCOW2, compressed
   QCOW2, backing chains, LUKS-in-QCOW2 decryption)

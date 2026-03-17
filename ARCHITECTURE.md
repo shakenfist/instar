@@ -301,9 +301,11 @@ Detected but not yet supported for I/O:
   rejected gracefully)
 
 The check operation performs full structural validation: grain directory
-and grain table walk, grain offset bounds checking, overlap detection
-via 1-bit-per-grain bitmap, streamOptimized footer validation, and
-multi-extent detection.
+and grain table walk, grain offset bounds checking, compressed grain
+marker validation (LBA consistency and compressed size bounds),
+redundant grain directory (RGD) cross-check, overlap detection via
+1-bit-per-grain bitmap, streamOptimized footer validation, fragmentation
+measurement, and multi-extent detection.
 
 ### vhd
 
@@ -313,9 +315,10 @@ Microsoft Virtual Hard Disk. Supported sub-formats:
   output, check)
 
 The check operation performs full structural validation: footer cookie
-and checksum, dynamic header cookie and checksum, BAT offset and entry
-bounds checking, overlap detection via 1-bit-per-block bitmap, and
-footer copy consistency (start vs end of file).
+and checksum, format version and feature flag validation, dynamic header
+cookie/checksum/version, BAT offset and entry bounds checking, overlap
+detection via 1-bit-per-block bitmap, fragmentation tracking, fixed VHD
+size validation, and footer copy consistency (start vs end of file).
 
 ### vhdx
 
@@ -327,11 +330,12 @@ VHDX uses CRC-32C (Castagnoli) checksums, GUID-identified metadata,
 64-bit BAT entries with interleaved sector bitmap entries, and 1MB-aligned
 structures. All on-disk fields are little-endian.
 
-The check operation performs full structural validation: dual header
-CRC-32C validation with active header selection by sequence number,
-dirty log detection, region table CRC-32C validation, GUID-based
-metadata parsing, BAT entry validation (offset bounds, 1MB alignment,
-overlap detection, state validation).
+The check operation performs full structural validation: file identifier
+signature check, dual header CRC-32C validation with active header
+selection by sequence number, dirty log detection, region table 1 and 2
+CRC-32C validation with cross-consistency check, GUID-based metadata
+parsing, BAT entry validation (offset bounds, 1MB alignment, overlap
+detection, state validation), and fragmentation tracking.
 
 ### luks
 
