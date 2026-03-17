@@ -132,8 +132,30 @@ jobs:
           path: fuzz-logs/
           retention-days: 90
 
+      - name: Install GitHub CLI
+        if: failure()
+        run: |
+          if ! command -v gh &>/dev/null; then
+            sudo mkdir -p -m 755 /etc/apt/keyrings
+            wget -qO- \
+              https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+              | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+              >/dev/null
+            sudo chmod go+r \
+              /etc/apt/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) \
+              signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] \
+              https://cli.github.com/packages stable main" \
+              | sudo tee /etc/apt/sources.list.d/github-cli.list \
+              >/dev/null
+            sudo apt-get update
+            sudo apt-get install -y gh
+          fi
+
       - name: Ensure security-audit label exists
         if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh label create "security-audit" \
             --description "Findings from security audit and fuzzing" \
@@ -142,6 +164,8 @@ jobs:
 
       - name: File issues for divergences
         if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Look for divergence report files
           for report in fuzz-logs/divergence-*.json; do

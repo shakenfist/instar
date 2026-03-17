@@ -193,25 +193,45 @@ def run_qemu_img(subcmd, args, timeout=30):
 # Output comparison
 # ---------------------------------------------------------------------------
 
+def _strip_divergent_fields(obj):
+    """Recursively strip known-divergent fields from a JSON object.
+
+    Handles nested structures like the 'children' array in info
+    JSON output, where each child has its own 'info' dict with
+    filename, actual-size, etc.
+    """
+    if isinstance(obj, dict):
+        # Fields that differ because imago and qemu-img operate
+        # on separate copies with different paths
+        for field in ('filename',):
+            obj.pop(field, None)
+        # Fields that vary by filesystem allocation or are
+        # format-implementation-specific
+        for field in KNOWN_DIVERGENCE_FIELDS:
+            obj.pop(field, None)
+        obj.pop('format-specific', None)
+        obj.pop('dirty-flag', None)
+        # Recurse into remaining values
+        for key in list(obj.keys()):
+            obj[key] = _strip_divergent_fields(obj[key])
+    elif isinstance(obj, list):
+        obj = [_strip_divergent_fields(item) for item in obj]
+    return obj
+
+
 def normalize_info_json(raw_json):
     """Parse and normalize info JSON for comparison.
 
     Removes fields known to differ between imago and qemu-img
-    (disk size, allocation details) and sorts keys for stable
-    comparison.
+    (filenames, disk size, allocation details) and sorts keys
+    for stable comparison. Handles nested children objects.
     """
     try:
         data = json.loads(raw_json)
     except (json.JSONDecodeError, ValueError):
         return raw_json.strip()
 
-    # Remove known-divergent fields
-    for field in KNOWN_DIVERGENCE_FIELDS:
-        data.pop(field, None)
-
-    # Remove format-specific metadata that may differ
-    data.pop('format-specific', None)
-    data.pop('dirty-flag', None)
+    _strip_divergent_fields(data)
 
     return json.dumps(data, sort_keys=True, indent=2)
 
