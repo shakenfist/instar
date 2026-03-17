@@ -296,3 +296,157 @@ partition table). This attack class is architecturally impossible.
 
 None. All 6 CVEs are fully mitigated by imago's existing
 architecture. No new code changes were required.
+
+## Phase 5: VMM Boundary Audit
+
+**Date:** 2026-03-17
+**Scope:** All host-side VMM code — virtio-block device emulation,
+serial protocol handling, KVM memory mapping, MMIO dispatch, and
+KVM exit handling.
+**Techniques:** Manual code review of all VMM source files
+(main.rs, virtio/block.rs, virtio/mmio.rs, backing.rs, io_thread.rs,
+ioevent.rs, error.rs).
+
+### Motivation
+
+The KVM sandbox is imago's primary security boundary. All format
+parsing runs inside the guest, but the VMM runs on the host with
+full privileges. Bugs in the VMM bypass the sandbox entirely. This
+audit examined every path where guest-controlled data influences
+VMM behaviour.
+
+### Areas Audited
+
+| Area | Files | Verdict |
+|------|-------|---------|
+| Virtio-block I/O bounds | virtio/block.rs, backing.rs | 5 bugs found, all fixed |
+| Serial protocol decoding | main.rs (SerialDecoder, DebugBuffer) | 2 bugs found, all fixed |
+| KVM memory mapping | main.rs (memory setup) | Sound |
+| MMIO dispatch | virtio/block.rs, virtio/mmio.rs, main.rs | 1 bug found, fixed |
+| KVM exit handling | main.rs (6 run loops) | 1 bug found, fixed |
+| Guest memory isolation | main.rs, vm-memory crate | Sound |
+| Port I/O dispatch | main.rs | Sound |
+| Page table setup | main.rs | Sound |
+| Config area writes | main.rs, shared/lib.rs | Sound |
+
+### Bugs Found and Fixed
+
+#### 1. No sector bounds check in virtio-block I/O (High)
+
+**Location:** `virtio/block.rs`, `do_read()` and `do_write()`
+**Issue:** The guest-supplied `sector` field from the virtio-block
+request header was used directly to compute a file offset without
+checking against the device capacity. A malicious guest could
+write to arbitrary offsets in the output file.
+**Fix:** Added `validate_sector_offset()` method that checks
+`sector < capacity` and uses `checked_mul` for the offset
+calculation. Both `do_read` and `do_write` reject out-of-bounds
+requests with IOERR status.
+
+#### 2. Integer overflow in sector offset calculation (High)
+
+**Location:** `virtio/block.rs`, `do_read()` and `do_write()`
+**Issue:** `sector * sector_size` used wrapping multiplication.
+With a large `sector` value, the result could wrap to a small
+offset, causing I/O to target the wrong location.
+**Fix:** Uses `checked_mul` in `validate_sector_offset()`,
+returning IOERR on overflow.
+
+#### 3. Integer overflow in BackingStore offset arithmetic (Medium)
+
+**Location:** `backing.rs`, `read_at()` and `write_at()`
+**Issue:** `offset + buf.len() as u64` could wrap around if
+offset was near `u64::MAX`, bypassing bounds checks.
+**Fix:** Added `checked_end()` helper using `checked_add`,
+returning an error on overflow.
+
+#### 4. No capacity enforcement on BackingStore writes (Medium)
+
+**Location:** `backing.rs`, `write_at()`
+**Issue:** The backing store had no independent enforcement of
+its capacity limit for write operations. A write beyond capacity
+would silently extend the file.
+**Fix:** `write_at()` now rejects writes where `offset + len`
+exceeds `capacity`, returning an `InvalidInput` error.
+
+#### 5. Unbounded I/O buffer allocation (Medium)
+
+**Location:** `virtio/block.rs`, `do_read()` and `do_write()`
+**Issue:** The I/O buffer was allocated as `vec![0u8; len]`
+where `len` came from the guest-controlled descriptor. A guest
+could request up to 4GB (u32::MAX), causing VMM-side OOM.
+**Fix:** Added `MAX_IO_BUFFER_SIZE` constant (1 MB). Requests
+exceeding this limit are rejected with IOERR.
+
+#### 6. run_sandboxed_info silently ignores unknown exits (Medium)
+
+**Location:** `main.rs`, sandboxed info run loop
+**Issue:** The catch-all arm was `_ => {}` (silently ignore),
+while all other run loops properly break with an error. This
+could cause an infinite loop if the guest triggered an unexpected
+KVM exit type like InternalError.
+**Fix:** Changed to `exit => { return Err(...) }` matching the
+pattern used in all other run loops.
+
+#### 7. DebugBuffer unbounded String growth (Moderate)
+
+**Location:** `main.rs`, `DebugBuffer`
+**Issue:** If a guest wrote to COM2 without sending newlines,
+the `String` buffer grew without bound, eventually exhausting
+host memory.
+**Fix:** Added `MAX_DEBUG_LINE` constant (4096 bytes). Lines
+exceeding this length are forcibly flushed.
+
+#### 8. SerialDecoder buffer no size cap (Low)
+
+**Location:** `main.rs`, `SerialDecoder`
+**Issue:** A guest sending a length prefix claiming 65535 bytes
+would cause the decoder to accumulate up to ~64KB before
+attempting a decode. While bounded by the u16 wire format, no
+explicit size cap existed.
+**Fix:** Added `MAX_SERIAL_BUFFER` constant. Length prefixes
+exceeding `MAX_MESSAGE_SIZE + FRAME_HEADER_SIZE + 256` are
+rejected immediately by discarding the leading byte.
+
+### Additional Hardening
+
+**Descriptor index validation:** The `process_request()` function
+now validates `desc_idx < queue_size` before indexing the
+descriptor table, via a new `read_descriptor()` helper. Previously,
+`_queue_size` was accepted but unused.
+
+### Sound Areas (no issues found)
+
+**KVM memory isolation:** A single KVM memory region maps exactly
+to an anonymous mmap. No host memory is mapped into the guest.
+All guest memory access goes through `GuestMemoryMmap` with bounds
+checking.
+
+**MMIO dispatch:** MMIO addresses are dispatched via linear scan
+over registered devices. Unmapped addresses return 0 (read) or
+are silently ignored (write). All register offsets use exhaustive
+`match` with safe defaults. Queue selector uses modulo indexing
+(`queue_sel % queues.len()`).
+
+**Page tables and config areas:** Guest page tables identity-map
+the MMIO region correctly. KVM EPT provides the actual isolation.
+Config writes are all within the 32MB guest memory boundary with
+explicit size bounds.
+
+**Port I/O:** Unknown ports return 0 (read) or are logged (write).
+No crash or corruption paths.
+
+**HLT/Shutdown/FailEntry:** All run loops handle these exits
+correctly by breaking with appropriate error messages.
+
+### Fragile Areas (defence-in-depth, not exploitable)
+
+These items are not security bugs but were noted as potential
+improvements:
+
+- `static mut ACTIVE_MMIO_BASE`: Should use `OnceLock<u64>`.
+  Safe in practice (written once before concurrent access).
+- No runtime binary size validation (build-time check exists).
+- No stack guard page in guest memory (guest-only concern).
+- I/O thread silently drops `process_queue` errors via `if let`.
+- Mutex `unwrap()` could cascade if another thread panics.

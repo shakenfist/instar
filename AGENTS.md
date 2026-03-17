@@ -47,6 +47,9 @@ The core principle: **never parse untrusted data with host privileges**.
 - Host code only handles opaque byte streams
 - All format parsing happens inside a KVM sandbox
 - Exploits in format parsers are contained within the sandbox
+- The VMM (host-side) code has been security audited — see
+  `docs/security-audits.md` for full results and `PLAN-audit.md`
+  for methodology
 
 ### Supported Formats
 

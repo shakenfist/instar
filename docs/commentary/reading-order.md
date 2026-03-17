@@ -57,7 +57,7 @@ the main vCPU loop.
 else together. It is also the largest single file in the codebase
 (~1800 lines), so budget time accordingly.
 
-### Step 2: `virtio.rs` -- Device emulation
+### Step 2: `virtio/block.rs`, `virtio/mmio.rs` -- Device emulation
 
 **What you will find:** The implementation of virtio-block devices using
 the `virtio-queue` crate. The `VirtioBlockDevice` struct that manages
@@ -80,6 +80,13 @@ read/write handlers that the vCPU run loop dispatches to on
 - The virtio-block layer translates virtqueue requests into host file
   I/O. This is the security boundary in action: the VMM reads/writes raw
   bytes from files. It never interprets those bytes as image format data.
+
+- The `validate_io_request()` method checks every I/O request before
+  it reaches the backing store: sector must be within device capacity,
+  the offset calculation uses `checked_mul` to prevent integer overflow,
+  and the buffer size is capped at `MAX_IO_BUFFER_SIZE` (1 MB) to prevent
+  OOM from a malicious guest descriptor. The `read_descriptor()` helper
+  validates descriptor indices against the queue size.
 
 ### Step 3: `io_thread.rs` -- Threaded I/O
 
@@ -122,10 +129,17 @@ allowlist. Circular reference and depth limit checks.
 
 **What you will find:** Supporting modules for configuration file
 parsing, error types, backing store abstractions, and performance
-statistics. These are straightforward plumbing.
+statistics.
 
-**Read these lightly.** They exist to support the main flow and contain
-few surprising design decisions.
+**What to pay attention to in `backing.rs`:** The `BackingStore` enforces
+device capacity on every write via `checked_add` overflow protection and
+an explicit `end > capacity` check. This is a defence-in-depth layer
+behind the virtio-block validation -- even if the virtio layer were
+bypassed, the backing store would reject writes beyond the image
+boundary.
+
+**Read the others lightly.** They exist to support the main flow and
+contain few surprising design decisions.
 
 ---
 

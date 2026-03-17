@@ -503,9 +503,19 @@ See [docs/quirks.md](docs/quirks.md) for the classification of safe vs unsafe qu
 ### Security Audits
 
 The codebase undergoes periodic security audits covering unsafe code review,
-integer arithmetic analysis, and adversarial image testing. Audit results are
-published in [docs/security-audits.md](docs/security-audits.md). The audit
-methodology is documented in `PLAN-audit.md`.
+integer arithmetic analysis, adversarial image testing, CVE reproduction, and
+VMM boundary auditing. Completed audit phases:
+
+- **Static analysis:** All unsafe blocks classified, integer arithmetic reviewed,
+  clippy/cargo-audit clean. 1 bug found and fixed (VHDX BAT overflow).
+- **Adversarial images:** 61 hand-crafted malicious images across 12 attack
+  categories, 0 bypasses.
+- **CVE reproduction:** 6 known qemu-img CVEs verified as mitigated, 0 bypasses.
+- **VMM boundary audit:** Full review of host-side code (virtio-block I/O,
+  serial protocol, MMIO dispatch, KVM exit handling). 8 bugs found and fixed.
+
+Audit results are published in [docs/security-audits.md](docs/security-audits.md).
+The audit methodology is documented in `PLAN-audit.md`.
 
 ## Test Data
 

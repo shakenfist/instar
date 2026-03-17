@@ -183,16 +183,10 @@
   overlap detection, refcount validation, leak detection) but
   only does basic format detection for other formats.
 
-*Pre-existing test failures (not regressions):*
-- VHD round-trip tests (TestConvertToVhd): Content mismatch
-  at offset 130562 for raw-mbr-partitioned, qcow2, and vhd
-  inputs. Likely a VHD write alignment or carry-buffer bug.
-- VMDK compressed output tests (TestConvertToVmdkCompressed):
-  raw/qcow2/vmdk to streamOptimized VMDK fail.
-- VHD d2v-zerofilled conversion (TestConvertVhdToRaw):
-  test_convert_vhd_d2v_zerofilled fails.
-
 *Resolved in later phases (items formerly listed here):*
+- ~~VHD round-trip tests (TestConvertToVhd)~~ — Fixed
+- ~~VMDK compressed output (TestConvertToVmdkCompressed)~~ — Fixed
+- ~~VHD d2v-zerofilled conversion~~ — Fixed
 - ~~Compressed clusters > 64KB (input)~~ — Done (Phase 16a)
 - ~~VMDK output format~~ — Done (Phase 8)
 - ~~VHD output format~~ — Done (Phase 9)
