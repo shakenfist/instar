@@ -193,4 +193,63 @@ mod tests {
         backing.read_at(1000, &mut buf2).unwrap();
         assert_eq!(buf2, [0, 0, 0, 0]);
     }
+
+    #[test]
+    fn test_checked_end_normal() {
+        assert_eq!(BackingStore::checked_end(0, 100).unwrap(), 100);
+        assert_eq!(BackingStore::checked_end(500, 500).unwrap(), 1000);
+    }
+
+    #[test]
+    fn test_checked_end_overflow() {
+        let result = BackingStore::checked_end(u64::MAX, 1);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_write_beyond_capacity_rejected() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&[0u8; 4096]).unwrap();
+        tmp.flush().unwrap();
+
+        let mut backing = BackingStore::open(tmp.path(), false, Some(4096), false).unwrap();
+
+        // Write within capacity — should succeed
+        backing.write_at(0, &[1, 2, 3, 4]).unwrap();
+
+        // Write that ends exactly at capacity — should succeed
+        backing.write_at(4092, &[1, 2, 3, 4]).unwrap();
+
+        // Write that extends 1 byte past capacity — should fail
+        let result = backing.write_at(4093, &[1, 2, 3, 4]);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_write_beyond_capacity_sparse() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mut backing = BackingStore::open(tmp.path(), false, Some(4096), true).unwrap();
+
+        // Write within capacity in sparse mode — should succeed
+        backing.write_at(4000, &[1, 2, 3, 4]).unwrap();
+
+        // Write beyond capacity in sparse mode — should still be rejected
+        let result = backing.write_at(4094, &[1, 2, 3, 4]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_read_with_overflow_offset() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&[0u8; 4096]).unwrap();
+        tmp.flush().unwrap();
+
+        let mut backing = BackingStore::open(tmp.path(), true, None, false).unwrap();
+
+        // offset near u64::MAX + any length would overflow
+        let result = backing.read_at(u64::MAX, &mut [0u8; 1]);
+        assert!(result.is_err());
+    }
 }
