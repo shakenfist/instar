@@ -23,7 +23,7 @@ imago/
 ├── prototypes/     # Experimental implementations (11 KVM prototypes)
 ├── scripts/        # Build, check, and test image generation scripts
 ├── tests/          # Integration tests (Python/testtools)
-├── docs/           # Design documents and research notes
+├── docs/           # Design documents, research notes, and Lions-style commentary
 ├── testdata/       # Test images for security validation
 ├── Makefile        # Build and development automation
 ├── README.md       # Project overview

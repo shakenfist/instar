@@ -12,7 +12,10 @@ The name "imago" comes from Latin (meaning "image") and biology (the final
 adult stage of insect metamorphosis) - reflecting both the image handling
 and transformation aspects of the tool.
 
-Confused about how imago does these things? Perhaps read the [technology primer](docs/technology-primer.md).
+Confused about how imago does these things? Perhaps read the
+[technology primer](docs/technology-primer.md). If you want a guided tour of
+the source code, the [Lions-style commentary](docs/commentary/index.md)
+provides a reading order and annotated walkthrough of the codebase.
 
 ## Supported Formats
 
