@@ -369,16 +369,11 @@ by scripts in `scripts/`:
   content (v1 raw, v2 Argon2id, v1 wrapping QCOW2)
 - `create-qcow2-luks-testdata.sh` — QCOW2 with LUKS encryption (crypt_method=2)
 - `create-check-testdata.sh` — QCOW2 images with specific corruptions
-- `create-compression-bomb-testdata.sh` — Zlib/ZSTD compression bombs
-- `create-circular-chain-testdata.sh` — Circular backing chains (2/3-level, self-ref)
-- `create-deep-chain-testdata.sh` — 16/17-level deep backing chains
-- `create-overflow-testdata.sh` — L1 overflow, zero L1, invalid cluster_bits
-- `create-boundary-testdata.py` — Boundary value tests: refcount order edges,
-  oversized virtual sizes, VMDK grain sizes, VHDX conflicting headers,
-  VHD/VHDX BAT beyond EOF
-- `create-format-confusion-testdata.py` — Format confusion tests: polyglot
-  files (QCOW2+VMDK, QCOW2+ELF), truncated headers (QCOW2, VMDK, VHD),
-  VMDK descriptor attacks (null bytes, multi-extent, huge size)
+Adversarial and CVE-reproducer image generation scripts live in
+`imago-testdata/scripts/` (the private testdata repository), not in
+the public `imago/scripts/` directory. This includes scripts for
+compression bombs, circular/deep chains, integer overflow headers,
+boundary values, format confusion, and CVE reproducers.
 
 Generated images live in `../imago-testdata/custom/format-coverage/`
 and `../imago-testdata/custom/audit/` (adversarial images).

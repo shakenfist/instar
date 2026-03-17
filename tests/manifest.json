@@ -1166,6 +1166,91 @@
             "description": "VMDK header claiming >1MB descriptor size with tiny actual file",
             "tags": ["vmdk", "adversarial", "format-confusion", "descriptor"],
             "generated_by": "imago-testdata/scripts/create-format-confusion-testdata.py"
+        },
+
+        {
+            "id": "cve-2024-32498-extdata-etc-passwd",
+            "path": "custom/audit/cve/cve-2024-32498-extdata-etc-passwd.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "CVE-2024-32498: QCOW2 with external data file pointing to /etc/passwd",
+            "tags": ["qcow2", "security", "cve", "external-data", "path-traversal"],
+            "cve_references": ["CVE-2024-32498"],
+            "generated_by": "imago-testdata/scripts/create-cve-reproducer-testdata.py"
+        },
+        {
+            "id": "cve-2015-5163-traversal-dotdot",
+            "path": "custom/audit/cve/cve-2015-5163-traversal-dotdot.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "CVE-2015-5163: QCOW2 with backing file using ../ path traversal",
+            "tags": ["qcow2", "security", "cve", "backing-file", "path-traversal"],
+            "cve_references": ["CVE-2015-5163"],
+            "generated_by": "imago-testdata/scripts/create-cve-reproducer-testdata.py"
+        },
+        {
+            "id": "cve-2015-5163-traversal-null",
+            "path": "custom/audit/cve/cve-2015-5163-traversal-null.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "CVE-2015-5163: QCOW2 with backing file containing embedded null byte",
+            "tags": ["qcow2", "security", "cve", "backing-file", "null-byte"],
+            "cve_references": ["CVE-2015-5163"],
+            "generated_by": "imago-testdata/scripts/create-cve-reproducer-testdata.py"
+        },
+        {
+            "id": "cve-2022-47951-vmdk-hostile-extent",
+            "path": "custom/audit/cve/cve-2022-47951-vmdk-hostile-extent.vmdk",
+            "format": "vmdk",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "CVE-2022-47951: Binary VMDK with descriptor referencing /etc/shadow as extent",
+            "tags": ["vmdk", "security", "cve", "path-traversal", "descriptor"],
+            "cve_references": ["CVE-2022-47951"],
+            "generated_by": "imago-testdata/scripts/create-cve-reproducer-testdata.py"
+        },
+        {
+            "id": "cve-2015-5162-tiny-petabyte",
+            "path": "custom/audit/cve/cve-2015-5162-tiny-petabyte.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "CVE-2015-5162: Minimal QCOW2 claiming 1 PB virtual size (resource exhaustion)",
+            "tags": ["qcow2", "security", "cve", "resource-exhaustion", "oversized"],
+            "cve_references": ["CVE-2015-5162"],
+            "generated_by": "imago-testdata/scripts/create-cve-reproducer-testdata.py"
+        },
+        {
+            "id": "cve-2014-0223-l1-overflow-boundary",
+            "path": "custom/audit/cve/cve-2014-0223-l1-overflow-boundary.qcow2",
+            "format": "qcow2",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "CVE-2014-0223: QCOW2 with l1_size at integer overflow boundary (u32::MAX/8+1)",
+            "tags": ["qcow2", "security", "cve", "integer-overflow", "l1-table"],
+            "cve_references": ["CVE-2014-0223"],
+            "generated_by": "imago-testdata/scripts/create-cve-reproducer-testdata.py"
+        },
+        {
+            "id": "cve-2024-4467-json-prefix",
+            "path": "custom/audit/cve/cve-2024-4467-json-prefix.raw",
+            "format": "raw",
+            "safety": "malicious",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "CVE-2024-4467: File with json:{} block device specification content",
+            "tags": ["raw", "security", "cve", "json", "format-confusion"],
+            "cve_references": ["CVE-2024-4467"],
+            "generated_by": "imago-testdata/scripts/create-cve-reproducer-testdata.py"
         }
     ]
 }

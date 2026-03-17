@@ -404,8 +404,10 @@ verify safe handling of compression bombs, circular/deep backing chains,
 integer overflow headers, boundary value edge cases (refcount order,
 oversized virtual sizes, VMDK grain sizes, VHDX dual headers, BAT beyond EOF),
 and format confusion attacks (polyglot files, truncated headers, VMDK
-descriptor attacks). Test images are in the sibling `imago-testdata/`
-repository.
+descriptor attacks). CVE reproduction tests verify that 6 known qemu-img CVEs
+(CVE-2024-32498, CVE-2015-5163, CVE-2022-47951, CVE-2015-5162, CVE-2014-0223,
+CVE-2024-4467) are fully mitigated by imago's architecture. Test images are in
+the sibling `imago-testdata/` repository.
 
 **Running:**
 ```bash

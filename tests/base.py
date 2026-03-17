@@ -278,7 +278,8 @@ class ImagoTestBase(testtools.TestCase):
         timeout: int = 30,
         qemu_version: Optional[str] = None,
         output_format: Optional[str] = None,
-        unsafe_quirks: bool = False
+        unsafe_quirks: bool = False,
+        chain: bool = False,
     ) -> tuple:
         """
         Run imago info on an image.
@@ -292,6 +293,7 @@ class ImagoTestBase(testtools.TestCase):
                            When True, accepts any file as RAW without requiring
                            a valid partition table. Required for testing images
                            marked with unsafe_quirks_required in the manifest.
+            chain: Enable backing chain discovery (--chain)
 
         Returns:
             tuple: (stdout, stderr, return_code)
@@ -299,6 +301,8 @@ class ImagoTestBase(testtools.TestCase):
         imago = self.get_imago_binary()
 
         cmd = [str(imago), 'info']
+        if chain:
+            cmd.append('--chain')
         if qemu_version:
             cmd.extend(['--qemu-version', qemu_version])
         if output_format:

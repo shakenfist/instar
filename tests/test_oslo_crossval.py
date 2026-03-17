@@ -85,6 +85,15 @@ OSLO_SKIP_IMAGES = {
     'vmdk-descriptor-null-bytes',
     'vmdk-descriptor-multi-extent',
     'vmdk-descriptor-huge',
+    # CVE reproducer images — deliberately malicious, not suitable
+    # for cross-validation against oslo.utils format_inspector
+    'cve-2024-32498-extdata-etc-passwd',
+    'cve-2015-5163-traversal-dotdot',
+    'cve-2015-5163-traversal-null',
+    'cve-2022-47951-vmdk-hostile-extent',
+    'cve-2015-5162-tiny-petabyte',
+    'cve-2014-0223-l1-overflow-boundary',
+    'cve-2024-4467-json-prefix',
 }
 
 # Format name mapping: imago -> oslo.utils.
