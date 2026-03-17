@@ -1477,17 +1477,24 @@ unsafe fn convert_to_raw(
         sector_size as u64
     };
 
+    // chunk_size is capped at MAX_SECTOR_SIZE for large clusters.
+    // For small clusters (< output sector size), we accumulate
+    // multiple clusters per output sector write.
     let chunk_size = if cluster_size > MAX_SECTOR_SIZE as u64 {
         MAX_SECTOR_SIZE as u64
     } else {
         cluster_size
     };
 
-    if chunk_size < output_sector_size as u64 {
-        (call_table.debug_print)(b"convert: chunk < output sector size\n\0".as_ptr());
-        (call_table.send_complete)(b"convert\0".as_ptr(), 0, false);
-        return 0;
-    }
+    // Number of chunks to accumulate before writing an output
+    // sector.  Usually 1, but > 1 when cluster_size < output
+    // sector size (e.g. 512-byte or 4096-byte clusters with
+    // 64KB sector size).
+    let chunks_per_output_sector = if chunk_size < output_sector_size as u64 {
+        (output_sector_size as u64 + chunk_size - 1) / chunk_size
+    } else {
+        1
+    };
 
     (call_table.verbose_print)(b"convert: starting raw conversion\n\0".as_ptr());
 
@@ -1501,6 +1508,13 @@ unsafe fn convert_to_raw(
     let mut last_percent: u32 = 0;
     let mut chunks_done: u64 = 0;
     let total_chunks = (virtual_size + chunk_size - 1) / chunk_size;
+
+    // When cluster_size < output_sector_size we accumulate
+    // multiple clusters into the buffer before writing.  Track
+    // how many bytes we have buffered and the virtual offset
+    // where the current accumulation started.
+    let mut accum_bytes: u64 = 0;
+    let mut accum_start: u64 = 0;
 
     while virtual_offset < virtual_size {
         let remaining = virtual_size - virtual_offset;
@@ -1518,7 +1532,7 @@ unsafe fn convert_to_raw(
             0,
             input_device_count,
             virtual_offset,
-            buf,
+            buf.add(accum_bytes as usize),
             this_chunk,
             sector_size,
             chain_config,
@@ -1541,11 +1555,28 @@ unsafe fn convert_to_raw(
             return *bytes_read;
         }
 
-        if skip_zeros && is_all_zeros_ptr(buf, this_chunk as usize) {
-            virtual_offset += this_chunk;
-            chunks_done += 1;
-            let percent = (chunks_done * 100 / total_chunks) as u32;
-            if should_report_progress(progress_interval, percent, last_percent, chunks_done) {
+        if accum_bytes == 0 {
+            accum_start = virtual_offset;
+        }
+        accum_bytes += this_chunk;
+        virtual_offset += this_chunk;
+        chunks_done += 1;
+
+        // Flush when we've accumulated enough for an output
+        // sector, or when we've reached the end of the image.
+        let should_flush = accum_bytes >= output_sector_size as u64
+            || virtual_offset >= virtual_size;
+
+        if !should_flush {
+            // Report progress even when not flushing
+            let percent =
+                (chunks_done * 100 / total_chunks) as u32;
+            if should_report_progress(
+                progress_interval,
+                percent,
+                last_percent,
+                chunks_done,
+            ) {
                 (call_table.send_progress)(
                     b"convert\0".as_ptr(),
                     chunks_done,
@@ -1557,31 +1588,76 @@ unsafe fn convert_to_raw(
             continue;
         }
 
-        let output_first_sector = virtual_offset / output_sector_size as u64;
-        let sectors_per_chunk =
-            (this_chunk + output_sector_size as u64 - 1) / output_sector_size as u64;
+        // Check if the entire accumulated buffer is zeros
+        if skip_zeros
+            && is_all_zeros_ptr(buf, accum_bytes as usize)
+        {
+            accum_bytes = 0;
+            let percent =
+                (chunks_done * 100 / total_chunks) as u32;
+            if should_report_progress(
+                progress_interval,
+                percent,
+                last_percent,
+                chunks_done,
+            ) {
+                (call_table.send_progress)(
+                    b"convert\0".as_ptr(),
+                    chunks_done,
+                    total_chunks,
+                    percent,
+                );
+                last_percent = percent;
+            }
+            continue;
+        }
 
-        for i in 0..sectors_per_chunk {
+        // Pad any partial final sector with zeros
+        let write_size = if accum_bytes < output_sector_size as u64 {
+            let pad_start = accum_bytes as usize;
+            let pad_end = output_sector_size;
+            for i in pad_start..pad_end {
+                *buf.add(i) = 0;
+            }
+            output_sector_size as u64
+        } else {
+            accum_bytes
+        };
+
+        let output_first_sector =
+            accum_start / output_sector_size as u64;
+        let sectors_to_write = (write_size
+            + output_sector_size as u64
+            - 1)
+            / output_sector_size as u64;
+
+        for i in 0..sectors_to_write {
             let output_sector = output_first_sector + i;
             if output_sector >= output_capacity {
                 break;
             }
             let offset = (i as usize) * output_sector_size;
-            if !(call_table.write_output_sector)(output_sector, buf.add(offset), output_sector_size)
-            {
+            if !(call_table.write_output_sector)(
+                output_sector,
+                buf.add(offset),
+                output_sector_size,
+            ) {
                 (call_table.send_error)(
                     b"convert\0".as_ptr(),
                     b"output\0".as_ptr(),
                     output_sector,
                     2,
                 );
-                (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+                (call_table.send_complete)(
+                    b"convert\0".as_ptr(),
+                    *bytes_read,
+                    false,
+                );
                 return *bytes_read;
             }
         }
 
-        virtual_offset += this_chunk;
-        chunks_done += 1;
+        accum_bytes = 0;
 
         let percent = (chunks_done * 100 / total_chunks) as u32;
         if should_report_progress(progress_interval, percent, last_percent, chunks_done) {
