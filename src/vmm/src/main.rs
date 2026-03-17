@@ -479,6 +479,10 @@ struct SerialDecoder {
     buffer: VecDeque<u8>,
 }
 
+/// Maximum serial decoder buffer size: frame header + max protobuf message
+/// plus a small margin. Rejects length prefixes claiming more than this.
+const MAX_SERIAL_BUFFER: usize = FRAME_HEADER_SIZE + guest_protocol::MAX_MESSAGE_SIZE + 256;
+
 impl SerialDecoder {
     fn new() -> Self {
         Self {
@@ -498,6 +502,13 @@ impl SerialDecoder {
         // Check if we have a complete message
         let msg_len = u16::from_le_bytes([self.buffer[0], self.buffer[1]]) as usize;
         let total_len = FRAME_HEADER_SIZE + msg_len;
+
+        // Reject oversized length prefixes -- no valid message exceeds
+        // MAX_MESSAGE_SIZE, so discard the leading byte and resync.
+        if total_len > MAX_SERIAL_BUFFER {
+            self.buffer.pop_front();
+            return None;
+        }
 
         if self.buffer.len() < total_len {
             return None;
@@ -557,10 +568,13 @@ impl SerialTransmitter {
     }
 }
 
-/// Debug output buffer - collects characters until newline, then prints
+/// Debug output buffer - collects characters until newline, then prints.
+/// Truncates lines longer than MAX_DEBUG_LINE to prevent unbounded growth.
 struct DebugBuffer {
     line: String,
 }
+
+const MAX_DEBUG_LINE: usize = 4096;
 
 impl DebugBuffer {
     fn new() -> Self {
@@ -569,9 +583,13 @@ impl DebugBuffer {
         }
     }
 
-    /// Add a byte; if it's a newline, return the complete line
+    /// Add a byte; if it's a newline, return the complete line.
+    /// Lines exceeding MAX_DEBUG_LINE are forcibly flushed.
     fn add_byte(&mut self, byte: u8) -> Option<String> {
-        if byte == b'\n' {
+        if byte == b'\n' || self.line.len() >= MAX_DEBUG_LINE {
+            if byte != b'\n' {
+                self.line.push(byte as char);
+            }
             let result = std::mem::take(&mut self.line);
             Some(result)
         } else {
@@ -1588,8 +1606,8 @@ fn execute_info_operation(
             VcpuExit::FailEntry(reason, cpu) => {
                 return Err(format!("VM entry failed: reason=0x{:x}, cpu={}", reason, cpu).into());
             }
-            _ => {
-                // Ignore other exits
+            exit => {
+                return Err(format!("unexpected VM exit: {:?}", exit).into());
             }
         }
     }

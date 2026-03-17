@@ -73,10 +73,18 @@ impl BackingStore {
         })
     }
 
+    /// Compute `offset + buf.len()` with overflow checking.
+    fn checked_end(offset: u64, len: usize) -> io::Result<u64> {
+        offset
+            .checked_add(len as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "offset + length overflow"))
+    }
+
     /// Read data from the backing store at the given offset.
     pub fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        let end = Self::checked_end(offset, buf.len())?;
+
         // For sparse files, reading beyond current size returns zeros
-        let end = offset + buf.len() as u64;
         if end > self.current_size {
             if offset >= self.current_size {
                 // Entire read is beyond file - return zeros
@@ -97,7 +105,20 @@ impl BackingStore {
 
     /// Write data to the backing store at the given offset.
     pub fn write_at(&mut self, offset: u64, buf: &[u8]) -> io::Result<()> {
-        let end = offset + buf.len() as u64;
+        let end = Self::checked_end(offset, buf.len())?;
+
+        // Reject writes beyond the device capacity
+        if end > self.capacity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "write at offset {} + {} bytes exceeds capacity {}",
+                    offset,
+                    buf.len(),
+                    self.capacity
+                ),
+            ));
+        }
 
         // In sparse mode, track the growing file size
         if self.sparse && end > self.current_size {

@@ -352,6 +352,22 @@ impl VirtioBlockDevice {
         Ok(stats)
     }
 
+    /// Read a descriptor from the table, validating the index against
+    /// the queue size to prevent out-of-bounds reads within guest memory.
+    fn read_descriptor(
+        guest_mem: &GuestMemoryMmap,
+        desc_table_addr: u64,
+        desc_idx: u16,
+        queue_size: u16,
+    ) -> Result<VirtqDesc, Box<dyn std::error::Error>> {
+        if desc_idx >= queue_size {
+            return Err(
+                format!("descriptor index {} >= queue size {}", desc_idx, queue_size).into(),
+            );
+        }
+        Ok(guest_mem.read_obj(GuestAddress(desc_table_addr + (desc_idx as u64 * 16)))?)
+    }
+
     /// Process a single block request.
     ///
     /// Returns (bytes_written_to_used_ring, io_stats).
@@ -360,15 +376,14 @@ impl VirtioBlockDevice {
         guest_mem: &GuestMemoryMmap,
         desc_table_addr: u64,
         first_desc_idx: u16,
-        _queue_size: u16,
+        queue_size: u16,
     ) -> Result<(u32, IoStats), Box<dyn std::error::Error>> {
         let mut desc_idx = first_desc_idx;
         let mut total_written = 0u32;
         let mut stats = IoStats::default();
 
         // Read header descriptor
-        let header_desc: VirtqDesc =
-            guest_mem.read_obj(GuestAddress(desc_table_addr + (desc_idx as u64 * 16)))?;
+        let header_desc = Self::read_descriptor(guest_mem, desc_table_addr, desc_idx, queue_size)?;
         let header: VirtioBlkReqHeader = guest_mem.read_obj(GuestAddress(header_desc.addr))?;
 
         // Move to data descriptor
@@ -378,8 +393,7 @@ impl VirtioBlockDevice {
         desc_idx = header_desc.next;
 
         // Read data descriptor
-        let data_desc: VirtqDesc =
-            guest_mem.read_obj(GuestAddress(desc_table_addr + (desc_idx as u64 * 16)))?;
+        let data_desc = Self::read_descriptor(guest_mem, desc_table_addr, desc_idx, queue_size)?;
 
         // Process based on request type
         let status = match header.type_ {
@@ -429,12 +443,43 @@ impl VirtioBlockDevice {
         desc_idx = data_desc.next;
 
         // Write status
-        let status_desc: VirtqDesc =
-            guest_mem.read_obj(GuestAddress(desc_table_addr + (desc_idx as u64 * 16)))?;
+        let status_desc = Self::read_descriptor(guest_mem, desc_table_addr, desc_idx, queue_size)?;
         guest_mem.write_obj(status, GuestAddress(status_desc.addr))?;
         total_written += 1;
 
         Ok((total_written, stats))
+    }
+
+    /// Maximum buffer size for a single I/O request (1 MB).
+    ///
+    /// Prevents a malicious guest from causing large VMM-side heap
+    /// allocations via a crafted data descriptor length.
+    const MAX_IO_BUFFER_SIZE: u32 = 1024 * 1024;
+
+    /// Validate a sector offset and compute the byte offset, returning
+    /// IOERR if the access is out of bounds or would overflow.
+    fn validate_sector_offset(
+        &self,
+        sector: u64,
+        len: u32,
+    ) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+        // Check sector is within device capacity
+        if sector >= self.capacity {
+            return Ok(None);
+        }
+
+        // Use checked arithmetic to prevent overflow
+        let offset = match sector.checked_mul(self.sector_size) {
+            Some(o) => o,
+            None => return Ok(None),
+        };
+
+        // Verify the end of the access doesn't overflow
+        if offset.checked_add(len as u64).is_none() {
+            return Ok(None);
+        }
+
+        Ok(Some(offset))
     }
 
     /// Read from backing store to guest memory
@@ -445,7 +490,14 @@ impl VirtioBlockDevice {
         addr: u64,
         len: u32,
     ) -> Result<u8, Box<dyn std::error::Error>> {
-        let offset = sector * self.sector_size;
+        if len > Self::MAX_IO_BUFFER_SIZE {
+            return Ok(request_status::IOERR);
+        }
+
+        let offset = match self.validate_sector_offset(sector, len)? {
+            Some(o) => o,
+            None => return Ok(request_status::IOERR),
+        };
 
         let mut buf = vec![0u8; len as usize];
         self.backing.read_at(offset, &mut buf)?;
@@ -462,7 +514,14 @@ impl VirtioBlockDevice {
         addr: u64,
         len: u32,
     ) -> Result<u8, Box<dyn std::error::Error>> {
-        let offset = sector * self.sector_size;
+        if len > Self::MAX_IO_BUFFER_SIZE {
+            return Ok(request_status::IOERR);
+        }
+
+        let offset = match self.validate_sector_offset(sector, len)? {
+            Some(o) => o,
+            None => return Ok(request_status::IOERR),
+        };
 
         let mut buf = vec![0u8; len as usize];
         guest_mem.read_slice(&mut buf, GuestAddress(addr))?;
