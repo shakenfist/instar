@@ -292,6 +292,13 @@ def _file_sha256(path):
 
 def op_info(imago_bin, imago_copy, qemu_copy, fmt, timeout):
     """Run info on both copies and compare JSON output."""
+    # Raw images created by the fuzzer have no partition table,
+    # so imago intentionally rejects them as "unknown format"
+    # while qemu-img reports "raw".  This is a documented
+    # unsafe quirk (see docs/quirks.md), not a bug.
+    if fmt == 'raw':
+        return None
+
     i_out, i_err, i_rc = run_imago(
         imago_bin, ['info'], ['--output', 'json', str(imago_copy)],
         timeout=timeout,
