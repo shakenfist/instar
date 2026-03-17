@@ -387,7 +387,7 @@ at three tiers:
 
 | Trigger | Iterations | When |
 |---------|-----------|------|
-| `pull_request` | 10 | PR changes fuzzer script or workflow |
+| `pull_request` | 100 | PR changes fuzzer script or workflow |
 | `push` to develop | 200 | Post-merge smoke test |
 | `schedule` | 1000 | Nightly at 02:00 UTC |
 | `workflow_dispatch` | configurable | Manual trigger |

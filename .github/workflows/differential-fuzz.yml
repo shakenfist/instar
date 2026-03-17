@@ -81,7 +81,7 @@ jobs:
             echo "iterations=${{ inputs.iterations }}" >> $GITHUB_OUTPUT
             echo "timeout=${{ inputs.timeout }}" >> $GITHUB_OUTPUT
           elif [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "iterations=10" >> $GITHUB_OUTPUT
+            echo "iterations=100" >> $GITHUB_OUTPUT
             echo "timeout=30" >> $GITHUB_OUTPUT
           elif [ "${{ github.event_name }}" = "push" ]; then
             echo "iterations=200" >> $GITHUB_OUTPUT
