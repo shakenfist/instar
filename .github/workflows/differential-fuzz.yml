@@ -1,0 +1,207 @@
+name: Differential Fuzzing
+
+on:
+  # Nightly: 1000 iterations with random seed
+  schedule:
+    - cron: '0 2 * * *'
+
+  # PR validation: 10 iterations to prove the fuzzer works
+  pull_request:
+    paths:
+      - 'scripts/differential-fuzz.py'
+      - '.github/workflows/differential-fuzz.yml'
+
+  # Post-merge smoke test: 200 iterations
+  push:
+    branches: [develop]
+    paths:
+      - 'src/**'
+      - 'crates/**'
+      - 'scripts/differential-fuzz.py'
+
+  # Manual: configurable
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: 'Number of fuzzing iterations'
+        required: false
+        default: '1000'
+        type: string
+      seed:
+        description: 'Random seed (leave empty for random)'
+        required: false
+        default: ''
+        type: string
+      timeout:
+        description: 'Per-operation timeout in seconds'
+        required: false
+        default: '30'
+        type: string
+      fail_fast:
+        description: 'Exit on first divergence'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  differential-fuzz:
+    runs-on: [self-hosted, debian-12, xl]
+    timeout-minutes: 600
+
+    env:
+      DOCKER_BUILDKIT: 1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Docker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y docker.io
+          sudo systemctl start docker
+          sudo chmod 666 /var/run/docker.sock
+
+      - name: Remove previous devcontainers, if any
+        run: |
+          docker image rm -f imago-build 2>/dev/null || true
+
+      - name: Build imago
+        run: |
+          make imago
+
+      - name: Determine iteration count
+        id: params
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "iterations=${{ inputs.iterations }}" >> $GITHUB_OUTPUT
+            echo "timeout=${{ inputs.timeout }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "iterations=10" >> $GITHUB_OUTPUT
+            echo "timeout=30" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            echo "iterations=200" >> $GITHUB_OUTPUT
+            echo "timeout=30" >> $GITHUB_OUTPUT
+          else
+            # schedule (nightly)
+            echo "iterations=1000" >> $GITHUB_OUTPUT
+            echo "timeout=30" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run differential fuzzing
+        run: |
+          SEED_ARG=""
+          if [ -n "${{ inputs.seed }}" ]; then
+            SEED_ARG="--seed ${{ inputs.seed }}"
+          fi
+
+          FAIL_FAST_ARG=""
+          if [ "${{ inputs.fail_fast }}" = "true" ]; then
+            FAIL_FAST_ARG="--fail-fast"
+          fi
+
+          # Run fuzzing inside the devcontainer so imago has KVM
+          # access. Mount the workspace and a logs directory.
+          mkdir -p ${GITHUB_WORKSPACE}/fuzz-logs
+
+          docker run --rm \
+            --device /dev/kvm \
+            -u "$(id -u):$(id -g)" \
+            --group-add "$(stat -c '%g' /dev/kvm)" \
+            -e HOME=/build \
+            -v "$(pwd):/workspace" \
+            -w "/workspace" \
+            imago-build \
+            python3 scripts/differential-fuzz.py \
+              --imago /workspace/src/target/release/imago \
+              --iterations ${{ steps.params.outputs.iterations }} \
+              --timeout ${{ steps.params.outputs.timeout }} \
+              --log-dir /workspace/fuzz-logs \
+              ${SEED_ARG} \
+              ${FAIL_FAST_ARG}
+
+      - name: Upload fuzzing logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-logs
+          path: fuzz-logs/
+          retention-days: 90
+
+      - name: Ensure security-audit label exists
+        if: failure()
+        run: |
+          gh label create "security-audit" \
+            --description "Findings from security audit and fuzzing" \
+            --color "D93F0B" \
+            2>/dev/null || true
+
+      - name: File issues for divergences
+        if: failure()
+        run: |
+          # Look for divergence report files
+          for report in fuzz-logs/divergence-*.json; do
+            [ -f "$report" ] || continue
+
+            SEED=$(python3 -c "
+          import json, sys
+          d = json.load(open('$report'))
+          print(d['seed'])
+          ")
+            ITERATION=$(python3 -c "
+          import json, sys
+          d = json.load(open('$report'))
+          print(d['iteration'])
+          ")
+            DIV_TYPE=$(python3 -c "
+          import json, sys
+          d = json.load(open('$report'))
+          print(d['divergence'].get('type', 'unknown'))
+          ")
+            ATTRS=$(python3 -c "
+          import json, sys
+          d = json.load(open('$report'))
+          print(json.dumps(d['attributes'], indent=2))
+          ")
+            DETAILS=$(python3 -c "
+          import json, sys
+          d = json.load(open('$report'))
+          print(json.dumps(d['divergence'], indent=2))
+          ")
+
+            gh issue create \
+              --label "security-audit" \
+              --title "Differential fuzz: ${DIV_TYPE} (seed ${SEED}, iter ${ITERATION})" \
+              --body "$(cat <<EOF
+          ## Differential fuzzing divergence
+
+          **Type:** \`${DIV_TYPE}\`
+          **Seed:** \`${SEED}\`
+          **Iteration:** \`${ITERATION}\`
+          **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          ### Image attributes
+          \`\`\`json
+          ${ATTRS}
+          \`\`\`
+
+          ### Divergence details
+          \`\`\`json
+          ${DETAILS}
+          \`\`\`
+
+          ### Reproduction
+          \`\`\`bash
+          python3 scripts/differential-fuzz.py \\
+            --imago src/target/release/imago \\
+            --iterations $((ITERATION + 1)) \\
+            --seed ${SEED} \\
+            --fail-fast
+          \`\`\`
+          EOF
+          )"
+          done

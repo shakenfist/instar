@@ -61,6 +61,7 @@ Features unique to imago that do not exist in qemu-img.
 | Document | Description |
 |----------|-------------|
 | [Integration Testing](testing.md) | Test suite comparing imago output against qemu-img |
+| [Differential Fuzzing](testing.md#differential-fuzzing) | Randomised imago vs qemu-img comparison |
 | [Format Coverage](format-coverage.md) | Comparison with oslo.utils format_inspector, test coverage gaps |
 
 ## Understanding the Codebase

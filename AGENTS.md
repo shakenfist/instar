@@ -415,6 +415,7 @@ This allows reviewers to cherry-pick or drop individual fixes as needed.
 - `.github/workflows/pr-fix-tests.yml` - Test failure fixing
 - `.github/workflows/pr-address-comments.yml` - Review comment addressing
 - `.github/workflows/test-drift-fix.yml` - Scheduled/on-demand test maintenance
+- `.github/workflows/differential-fuzz.yml` - On-demand differential fuzzing (imago vs qemu-img)
 
 ### Scripts
 
@@ -423,3 +424,4 @@ This allows reviewers to cherry-pick or drop individual fixes as needed.
 - `tools/create-review-issues.py` - Creates GitHub issues for actionable items
 - `tools/render-review.py` - Renders review JSON to markdown (includes issue links)
 - `tools/review-schema.json` - JSON schema for review output validation
+- `scripts/differential-fuzz.py` - Differential fuzzing script (imago vs qemu-img)

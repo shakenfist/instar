@@ -391,6 +391,30 @@ against the PyPI release as part of the integration-test suite,
 and a separate job runs them against oslo.utils git master to
 catch upstream drift early.
 
+## Differential Fuzzing
+
+`scripts/differential-fuzz.py` implements Phase 3 of the security audit plan.
+For each iteration it:
+
+1. Generates a random disk image using qemu-img (varying format, virtual size,
+   cluster size, compression, and data patterns).
+2. Creates separate copies for imago and qemu-img.
+3. Runs a random chain of 2-4 operations (info, check, convert, compressed
+   convert) against both tools.
+4. Compares outputs: exit codes, JSON info output (after normalisation to
+   remove known-divergent fields like disk size), and converted file content
+   (via SHA-256 of raw-flattened output).
+
+Known quirks (see `docs/quirks.md`) are excluded from comparison: non-QCOW2
+formats for `check` (qemu-img only checks QCOW2), disk size fields, and
+format-specific metadata.
+
+The CI workflow (`.github/workflows/differential-fuzz.yml`) runs on
+`[self-hosted, debian-12, xl]` VM runners with KVM access. It accepts
+configurable iteration count, seed, and timeout, uploads logs as artifacts,
+and auto-files GitHub Issues with the `security-audit` label for any
+divergences found.
+
 ## Open Questions
 
 1. How to handle backing files in qcow2? Flatten on conversion?

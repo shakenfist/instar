@@ -346,6 +346,69 @@ The test suite performs exact string comparison. On failure, it shows:
 | `IMAGO_TESTDATA_PATH` | Override default testdata location |
 | `IMAGO_BINARY_PATH` | Override default imago binary location |
 
+## Differential Fuzzing
+
+The project includes a differential fuzzer (`scripts/differential-fuzz.py`)
+that compares imago against qemu-img on randomly generated images. This is
+Phase 3 of the security audit plan (`PLAN-audit.md`).
+
+### How it works
+
+For each iteration the fuzzer:
+
+1. Picks a random seed (logged for reproducibility).
+2. Generates a random disk image with `qemu-img create`, varying format
+   (qcow2, raw, vmdk, vpc), virtual size (1M-1G), cluster size,
+   compression, and data patterns (zeros, random, sparse, MBR).
+3. Creates separate copies for imago and qemu-img.
+4. Runs a random chain of 2-4 operations (info, check, convert,
+   compressed convert) against both tools.
+5. Compares outputs at each stage: exit codes, normalized JSON info
+   output, and converted file content (SHA-256 of raw-flattened output).
+
+Known quirks (see [quirks.md](quirks.md)) are excluded from comparison:
+non-QCOW2 formats for `check`, disk size fields, and format-specific
+metadata.
+
+### Running locally
+
+```bash
+python3 scripts/differential-fuzz.py \
+    --imago src/target/release/imago \
+    --iterations 100 \
+    --seed 42 \
+    --log-dir ./fuzz-logs
+```
+
+### CI integration
+
+The fuzzer runs automatically via `.github/workflows/differential-fuzz.yml`
+at three tiers:
+
+| Trigger | Iterations | When |
+|---------|-----------|------|
+| `pull_request` | 10 | PR changes fuzzer script or workflow |
+| `push` to develop | 200 | Post-merge smoke test |
+| `schedule` | 1000 | Nightly at 02:00 UTC |
+| `workflow_dispatch` | configurable | Manual trigger |
+
+On failure, the workflow uploads logs as artifacts and auto-files GitHub
+Issues with the `security-audit` label, including the seed, iteration,
+image attributes, and a reproduction command.
+
+### Reproducing a divergence
+
+Each divergence report includes the seed and iteration number. To
+reproduce:
+
+```bash
+python3 scripts/differential-fuzz.py \
+    --imago src/target/release/imago \
+    --iterations <ITERATION + 1> \
+    --seed <SEED> \
+    --fail-fast
+```
+
 ## Related Documentation
 
 - [Format Coverage](format-coverage.md) - Comparison with oslo.utils format_inspector
