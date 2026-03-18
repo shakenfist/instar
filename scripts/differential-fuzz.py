@@ -272,7 +272,12 @@ def _extract_libyal_fields(kv, field_specs):
             try:
                 result[target_key] = int(kv[source_key])
             except ValueError:
-                pass
+                # Silently skip fields that cannot be parsed as integers.
+                logger.debug(
+                    "Skipping non-integer libyal field %r with value %r",
+                    source_key,
+                    kv[source_key],
+                )
         else:
             result[target_key] = kv[source_key]
     return result
