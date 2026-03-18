@@ -1651,6 +1651,14 @@ unsafe fn check_vhd(
                     result.total_errors += 1;
                     (call_table.debug_print)(b"check: VHD invalid format version\n\0".as_ptr());
                 }
+                // Validate features (reserved bit must be set)
+                if f.features & vhd::FEATURES_RESERVED == 0 {
+                    result.corruptions += 1;
+                    result.total_errors += 1;
+                    (call_table.debug_print)(
+                        b"check: VHD features missing reserved bit\n\0".as_ptr(),
+                    );
+                }
                 // Fixed VHD: data_offset should be 0xFFFFFFFFFFFFFFFF
                 if f.disk_type == vhd::DISK_TYPE_FIXED && f.data_offset != 0xFFFF_FFFF_FFFF_FFFF {
                     result.corruptions += 1;
