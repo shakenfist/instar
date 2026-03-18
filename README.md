@@ -605,6 +605,12 @@ gh workflow run differential-fuzz.yml \
 The fuzzer generates random images (varying format, size, cluster size,
 compression, data patterns), runs chains of operations (info, check, convert)
 against both tools, and reports divergences with full reproduction details.
+
+When libyal tools are available (`vmdkinfo`, `vhdiinfo`, `qcowinfo`), the
+fuzzer also cross-checks imago output against these independent forensic-grade
+parsers. This provides a third opinion for QCOW2 (alongside qemu-img) and
+fills the gap for VMDK/VHD/VHDX where qemu-img check is unavailable.
+
 See `scripts/differential-fuzz.py` for implementation details.
 
 ## Claude Code Integration

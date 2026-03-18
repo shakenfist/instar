@@ -414,6 +414,23 @@ Known quirks (see `docs/quirks.md`) are excluded from comparison: non-QCOW2
 formats for `check` (qemu-img only checks QCOW2), disk size fields, and
 format-specific metadata.
 
+### libyal Cross-Validation
+
+When libyal tools are installed (`libvmdk-utils`, `libvhdi-utils`,
+`libqcow-utils`), the fuzzer adds two additional layers of comparison:
+
+1. **Info cross-check**: Parsed fields from libyal tools (virtual size,
+   format version, cluster size, etc.) are compared against imago's JSON
+   output for the same image.
+2. **Parse-success consistency**: For each format, if the libyal tool
+   successfully parses the image, imago check should report no errors
+   (and vice versa). Disagreements are flagged as divergences.
+
+This closes the gap where VMDK/VHD/VHDX had no differential reference for
+check validation, and provides a third independent opinion for QCOW2 beyond
+qemu-img. libyal tools are optional — the fuzzer degrades gracefully when
+they are unavailable.
+
 The CI workflow (`.github/workflows/differential-fuzz.yml`) runs on
 `[self-hosted, debian-12, xl]` VM runners with KVM access. It accepts
 configurable iteration count, seed, and timeout, uploads logs as artifacts,
