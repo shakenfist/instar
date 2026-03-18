@@ -2516,6 +2516,13 @@ fn read_refcount_from_buffer_at(
     entry_index: usize,
     refcount_bits: u32,
 ) -> u64 {
+    // Defensive bounds check: base_offset must be within the
+    // sector buffer.  Callers maintain this invariant via
+    // entries_this_sector, but we check explicitly for defence
+    // in depth in this security-critical code.
+    if base_offset >= MAX_SECTOR_SIZE {
+        return 0;
+    }
     match refcount_bits {
         1 | 2 | 4 => {
             let entries_per_byte = 8 / refcount_bits as usize;

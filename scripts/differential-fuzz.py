@@ -4,8 +4,9 @@
 For each iteration this script:
   1. Picks a random seed (logged for reproducibility).
   2. Generates a random disk image with qemu-img create.
-  3. Runs a random chain of operations (info, check, convert,
-     compare) against both imago and qemu-img on separate copies.
+  3. Runs a random set of operations (info, check, convert)
+     independently against both imago and qemu-img on separate
+     copies of the same input image.
   4. Compares outputs at each stage; exits with details on the
      first unexplained divergence.
 
@@ -457,7 +458,8 @@ def run_iteration(imago_bin, workdir, rng, iteration, timeout):
         shutil.copy2(image_path, imago_copy)
         shutil.copy2(image_path, qemu_copy)
 
-        # Pick a random chain of 2-4 operations
+        # Pick a random set of 2-4 operations to run independently
+        # on the same input image
         num_ops = rng.randint(2, 4)
         ops = [rng.choice(OPERATIONS) for _ in range(num_ops)]
         attrs['operations'] = ops
@@ -669,28 +671,30 @@ def main():
 
     finally:
         elapsed = time.time() - start_time
+        iterations_done = i + 1 if 'i' in dir() else 0
         logger.info(
             'Fuzzing complete: %d iterations in %.1fs (%.1f iter/s)',
-            args.iterations, elapsed,
-            args.iterations / elapsed if elapsed > 0 else 0,
+            iterations_done, elapsed,
+            iterations_done / elapsed if elapsed > 0 else 0,
         )
         logger.info('Divergences found: %d', len(divergences))
 
+        # Write summary (including in --fail-fast mode)
+        summary = {
+            'seed': seed,
+            'iterations': args.iterations,
+            'iterations_completed': iterations_done,
+            'elapsed_seconds': round(elapsed, 1),
+            'divergences_found': len(divergences),
+            'divergence_iterations': [d[0] for d in divergences],
+        }
+        summary_path = log_dir / f'summary-{seed}.json'
+        with open(summary_path, 'w') as f:
+            json.dump(summary, f, indent=2)
+        logger.info('Summary written to %s', summary_path)
+
         if cleanup_workdir:
             shutil.rmtree(workdir, ignore_errors=True)
-
-    # Write summary
-    summary = {
-        'seed': seed,
-        'iterations': args.iterations,
-        'elapsed_seconds': round(elapsed, 1),
-        'divergences_found': len(divergences),
-        'divergence_iterations': [d[0] for d in divergences],
-    }
-    summary_path = log_dir / f'summary-{seed}.json'
-    with open(summary_path, 'w') as f:
-        json.dump(summary, f, indent=2)
-    logger.info('Summary written to %s', summary_path)
 
     if divergences:
         print(

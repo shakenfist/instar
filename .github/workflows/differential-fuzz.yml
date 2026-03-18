@@ -5,7 +5,7 @@ on:
   schedule:
     - cron: '0 2 * * *'
 
-  # PR validation: 10 iterations to prove the fuzzer works
+  # PR validation: 100 iterations when fuzzer code changes
   pull_request:
     paths:
       - 'scripts/differential-fuzz.py'
@@ -50,7 +50,7 @@ permissions:
 jobs:
   differential-fuzz:
     runs-on: [self-hosted, debian-12, xl]
-    timeout-minutes: 600
+    timeout-minutes: 180
 
     env:
       DOCKER_BUILDKIT: 1
@@ -76,14 +76,18 @@ jobs:
 
       - name: Determine iteration count
         id: params
+        env:
+          INPUT_ITERATIONS: ${{ inputs.iterations }}
+          INPUT_TIMEOUT: ${{ inputs.timeout }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "iterations=${{ inputs.iterations }}" >> $GITHUB_OUTPUT
-            echo "timeout=${{ inputs.timeout }}" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "iterations=${INPUT_ITERATIONS}" >> $GITHUB_OUTPUT
+            echo "timeout=${INPUT_TIMEOUT}" >> $GITHUB_OUTPUT
+          elif [ "$EVENT_NAME" = "pull_request" ]; then
             echo "iterations=100" >> $GITHUB_OUTPUT
             echo "timeout=30" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event_name }}" = "push" ]; then
+          elif [ "$EVENT_NAME" = "push" ]; then
             echo "iterations=200" >> $GITHUB_OUTPUT
             echo "timeout=30" >> $GITHUB_OUTPUT
           else
@@ -93,14 +97,19 @@ jobs:
           fi
 
       - name: Run differential fuzzing
+        env:
+          FUZZ_SEED: ${{ inputs.seed }}
+          FUZZ_ITERATIONS: ${{ steps.params.outputs.iterations }}
+          FUZZ_TIMEOUT: ${{ steps.params.outputs.timeout }}
+          FUZZ_FAIL_FAST: ${{ inputs.fail_fast }}
         run: |
           SEED_ARG=""
-          if [ -n "${{ inputs.seed }}" ]; then
-            SEED_ARG="--seed ${{ inputs.seed }}"
+          if [ -n "$FUZZ_SEED" ]; then
+            SEED_ARG="--seed $FUZZ_SEED"
           fi
 
           FAIL_FAST_ARG=""
-          if [ "${{ inputs.fail_fast }}" = "true" ]; then
+          if [ "$FUZZ_FAIL_FAST" = "true" ]; then
             FAIL_FAST_ARG="--fail-fast"
           fi
 
@@ -118,8 +127,8 @@ jobs:
             imago-build \
             python3 scripts/differential-fuzz.py \
               --imago /workspace/src/target/release/imago \
-              --iterations ${{ steps.params.outputs.iterations }} \
-              --timeout ${{ steps.params.outputs.timeout }} \
+              --iterations "$FUZZ_ITERATIONS" \
+              --timeout "$FUZZ_TIMEOUT" \
               --log-dir /workspace/fuzz-logs \
               ${SEED_ARG} \
               ${FAIL_FAST_ARG}
@@ -166,66 +175,62 @@ jobs:
         if: failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          # Look for divergence report files
           for report in fuzz-logs/divergence-*.json; do
             [ -f "$report" ] || continue
 
-            SEED=$(python3 -c "
+            python3 -c "
           import json, sys
-          d = json.load(open('$report'))
-          print(d['seed'])
-          ")
-            ITERATION=$(python3 -c "
-          import json, sys
-          d = json.load(open('$report'))
-          print(d['iteration'])
-          ")
-            DIV_TYPE=$(python3 -c "
-          import json, sys
-          d = json.load(open('$report'))
-          print(d['divergence'].get('type', 'unknown'))
-          ")
-            ATTRS=$(python3 -c "
-          import json, sys
-          d = json.load(open('$report'))
-          print(json.dumps(d['attributes'], indent=2))
-          ")
-            DETAILS=$(python3 -c "
-          import json, sys
-          d = json.load(open('$report'))
-          print(json.dumps(d['divergence'], indent=2))
-          ")
 
-            gh issue create \
-              --label "security-audit" \
-              --title "Differential fuzz: ${DIV_TYPE} (seed ${SEED}, iter ${ITERATION})" \
-              --body "$(cat <<EOF
-          ## Differential fuzzing divergence
+          d = json.load(open('$report'))
+          seed = d['seed']
+          iteration = d['iteration']
+          div_type = d['divergence'].get('type', 'unknown')
+          attrs = json.dumps(d['attributes'], indent=2)
+          details = json.dumps(d['divergence'], indent=2)
 
-          **Type:** \`${DIV_TYPE}\`
-          **Seed:** \`${SEED}\`
-          **Iteration:** \`${ITERATION}\`
-          **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          title = (
+              f'Differential fuzz: {div_type}'
+              f' (seed {seed}, iter {iteration})'
+          )
+          body = f'''## Differential fuzzing divergence
+
+          **Type:** \`{div_type}\`
+          **Seed:** \`{seed}\`
+          **Iteration:** \`{iteration}\`
+          **Workflow run:** {sys.argv[1]}
 
           ### Image attributes
           \`\`\`json
-          ${ATTRS}
+          {attrs}
           \`\`\`
 
           ### Divergence details
           \`\`\`json
-          ${DETAILS}
+          {details}
           \`\`\`
 
           ### Reproduction
           \`\`\`bash
-          python3 scripts/differential-fuzz.py \\
-            --imago src/target/release/imago \\
-            --iterations $((ITERATION + 1)) \\
-            --seed ${SEED} \\
+          python3 scripts/differential-fuzz.py \\\\
+            --imago src/target/release/imago \\\\
+            --iterations {iteration + 1} \\\\
+            --seed {seed} \\\\
             --fail-fast
           \`\`\`
-          EOF
-          )"
+          '''
+
+          # Write to files for gh to consume safely
+          with open('/tmp/issue-title.txt', 'w') as f:
+              f.write(title)
+          with open('/tmp/issue-body.md', 'w') as f:
+              f.write(body)
+          " "$WORKFLOW_RUN_URL"
+
+            TITLE=$(cat /tmp/issue-title.txt)
+            gh issue create \
+              --label "security-audit" \
+              --title "$TITLE" \
+              --body-file /tmp/issue-body.md
           done
