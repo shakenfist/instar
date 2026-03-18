@@ -127,29 +127,38 @@ For VMDK images (monolithicSparse and streamOptimized), check validates:
 - Grain directory offset within file bounds
 - Full grain directory and grain table walk
 - Grain data offsets within file bounds
+- Compressed grain marker validation (LBA consistency, compressed size
+  bounds, marker-plus-data within file)
+- Redundant Grain Directory (RGD) cross-check when FLAG_USE_RGD is set
 - Overlap detection via 1-bit-per-grain bitmap (same pattern as QCOW2)
 - streamOptimized footer validation (magic, GD offset)
 - Fragmentation measurement
 
 For VHD images (dynamic and fixed), check validates:
 - Footer cookie and checksum (from first or last sector)
+- Format version (must be 1.0) and features (reserved bit required)
 - Disk type validity (fixed, dynamic, differencing)
-- Dynamic header cookie and checksum
+- Fixed VHD: data_offset check, file size vs virtual size validation
+- Dynamic header cookie, checksum, and version
 - BAT offset within file bounds
 - BAT entry validation: allocated block offsets within file
 - Overlap detection (no two BAT entries reference same block)
+- Fragmentation tracking (non-sequential block allocation)
 - Footer copy consistency (start vs end of file)
 
 For VHDX images, check validates:
+- File identifier signature at offset 0 ("vhdxfile")
 - Header 1 and Header 2: signature, CRC-32C checksum, active header
   selection by sequence number
 - Dirty log detection (non-zero log GUID)
-- Region table: signature, CRC-32C, BAT and metadata region presence
+- Region table 1: signature, CRC-32C, BAT and metadata region presence
+- Region table 2: cross-validation against region table 1
 - Metadata: required items (FileParameters, VirtualDiskSize,
   LogicalSectorSize, PhysicalSectorSize)
 - Differencing disk detection (unsupported)
 - BAT entries: block offsets within file bounds, 1MB alignment,
   overlap detection, state validation
+- Fragmentation tracking (non-sequential block allocation)
 
 The `--chain` flag discovers the full backing chain (using the same chain
 discovery infrastructure as `imago info --chain`), sets up each image as a

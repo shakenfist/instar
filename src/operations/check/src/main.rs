@@ -1,15 +1,22 @@
 //! Check operation: validate image structural integrity.
 //!
 //! This operation reads the image and validates its internal structures,
-//! similar to `qemu-img check`. For QCOW2 images, it verifies:
-//! - Header validity (version, cluster_bits, virtual_size)
-//! - L1 table entries (offset bounds, alignment)
-//! - L2 table entries (full validation across all sectors)
-//! - Overlap detection (two L2 entries referencing same host cluster)
-//! - Refcount validation (referenced clusters must have refcount > 0)
-//! - Leak detection (clusters with refcount > 0 but no reference)
-//! - Refcount table and block structure validation
-//! - Dirty/corrupt incompatible feature flags (v3 only)
+//! similar to `qemu-img check`. Supported formats:
+//!
+//! **QCOW2:** Header, L1/L2 full walk, overlap detection, refcount
+//! validation (all widths 1-64 bit), leak detection, dirty/corrupt
+//! flags, extended L2 subclusters, external data files.
+//!
+//! **VMDK:** Header, GD/GT walk, overlap detection, compressed grain
+//! marker validation (LBA + size), RGD cross-check, fragmentation.
+//!
+//! **VHD:** Footer/dynamic header checksums, version/feature validation,
+//! BAT walk, overlap detection, fragmentation, fixed VHD size check,
+//! footer copy consistency.
+//!
+//! **VHDX:** File identifier, dual header CRC-32C, region table 1+2
+//! cross-validation, metadata parsing, BAT walk, overlap detection,
+//! fragmentation, dirty log detection.
 //!
 //! When `--chain` is enabled, the operation also validates the backing
 //! chain: format consistency, virtual size consistency across layers,
@@ -179,16 +186,21 @@ pub unsafe extern "C" fn _start() -> u64 {
             if unsafe_quirks {
                 (call_table.verbose_print)(b"check: vhdx not supported (quirks)\n\0".as_ptr());
                 result.flags |= CheckResult::FLAG_NOT_SUPPORTED;
+                result.image_end_offset = actual_size;
             } else {
                 // Validate VHDX structure
                 bytes_read += check_vhdx(&mut result, call_table, input_sector_size, actual_size);
+                // check_vhdx sets image_end_offset; fall back to actual_size
+                if result.image_end_offset == 0 {
+                    result.image_end_offset = actual_size;
+                }
             }
-            result.image_end_offset = actual_size;
         }
         ImageFormat::Vhd => {
             if unsafe_quirks {
                 (call_table.verbose_print)(b"check: vhd not supported (quirks)\n\0".as_ptr());
                 result.flags |= CheckResult::FLAG_NOT_SUPPORTED;
+                result.image_end_offset = actual_size;
             } else {
                 bytes_read += check_vhd(
                     &buffer,
@@ -197,8 +209,11 @@ pub unsafe extern "C" fn _start() -> u64 {
                     input_sector_size,
                     actual_size,
                 );
+                // check_vhd sets image_end_offset; fall back to actual_size
+                if result.image_end_offset == 0 {
+                    result.image_end_offset = actual_size;
+                }
             }
-            result.image_end_offset = actual_size;
         }
         ImageFormat::Raw => {
             // Raw format has no metadata to check
@@ -366,6 +381,8 @@ fn count_extent_lines(desc: &[u8]) -> u32 {
 /// - Grain data offsets (referenced by GT entries)
 /// - Overlap detection via 1-bit-per-grain bitmap
 /// - streamOptimized footer validation
+/// - Compressed grain marker validation (LBA, compressed size, bounds)
+/// - Redundant Grain Directory (RGD) cross-check when FLAG_USE_RGD set
 /// - Fragmentation measurement
 unsafe fn check_vmdk(
     header: &[u8],
@@ -585,6 +602,9 @@ unsafe fn check_vmdk(
     let mut gd_cache = [0u8; MAX_SECTOR_SIZE];
     let mut gt_cached_sector: u64 = u64::MAX;
     let mut gt_cache = [0u8; MAX_SECTOR_SIZE];
+    // Separate cache for grain marker reads (compressed grains)
+    let mut marker_cached_sector: u64 = u64::MAX;
+    let mut marker_cache = [0u8; MAX_SECTOR_SIZE];
 
     // ---- Track statistics ----
     let mut max_offset = gd_end;
@@ -593,6 +613,8 @@ unsafe fn check_vmdk(
     let mut last_data_offset: u64 = 0;
     let mut fragmented_entries: u64 = 0;
     let mut total_data_entries: u64 = 0;
+    let mut compressed_grains: u64 = 0;
+    let mut zero_grains: u64 = 0;
     let gt_size_bytes = (hdr.num_gtes_per_gt as u64) * 4;
 
     // ---- Walk grain directory ----
@@ -713,6 +735,7 @@ unsafe fn check_vmdk(
             }
 
             if hdr.has_zero_grain && gte == vmdk::GTE_ZEROED {
+                zero_grains += 1;
                 continue;
             }
 
@@ -734,16 +757,117 @@ unsafe fn check_vmdk(
             }
 
             if hdr.is_compressed {
-                // Compressed grain: GTE points to grain marker.
-                // Validate offset is within bounds. Compressed data
-                // is variable-size; mark the host grain in the bitmap
-                // (overlaps are expected, like QCOW2 compressed).
+                // Compressed grain: GTE points to a 12-byte grain marker
+                // (u64 LE lba + u32 LE compressed_size) followed by the
+                // compressed data. Validate the marker structure.
                 result.clusters_allocated += 1;
+                compressed_grains += 1;
+
+                // Validate marker fits in file
+                if grain_off + vmdk::GRAIN_MARKER_SIZE as u64 > actual_size {
+                    result.corruptions += 1;
+                    result.total_errors += 1;
+                    (call_table.debug_print)(
+                        b"check: grain marker extends beyond file\n\0".as_ptr(),
+                    );
+                } else {
+                    // Read marker LBA (u64 LE at marker offset)
+                    let marker_lba = vmdk::read_u32_le_cached(
+                        call_table,
+                        0,
+                        grain_off,
+                        sector_size,
+                        input_capacity,
+                        &mut marker_cached_sector,
+                        marker_cache.as_mut_ptr(),
+                        &mut bytes_read,
+                    );
+                    let marker_lba_hi = vmdk::read_u32_le_cached(
+                        call_table,
+                        0,
+                        grain_off + 4,
+                        sector_size,
+                        input_capacity,
+                        &mut marker_cached_sector,
+                        marker_cache.as_mut_ptr(),
+                        &mut bytes_read,
+                    );
+                    // Read compressed size (u32 LE at marker offset + 8)
+                    let marker_csize = vmdk::read_u32_le_cached(
+                        call_table,
+                        0,
+                        grain_off + 8,
+                        sector_size,
+                        input_capacity,
+                        &mut marker_cached_sector,
+                        marker_cache.as_mut_ptr(),
+                        &mut bytes_read,
+                    );
+
+                    if let (Some(lba_lo), Some(lba_hi), Some(csize)) =
+                        (marker_lba, marker_lba_hi, marker_csize)
+                    {
+                        let marker_lba_val = lba_lo as u64 | ((lba_hi as u64) << 32);
+
+                        // Validate compressed size > 0
+                        if csize == 0 {
+                            result.corruptions += 1;
+                            result.total_errors += 1;
+                            (call_table.debug_print)(
+                                b"check: grain marker has zero compressed size\n\0".as_ptr(),
+                            );
+                        }
+
+                        // Validate compressed size doesn't exceed grain size
+                        if (csize as u64) > grain_size_bytes {
+                            result.corruptions += 1;
+                            result.total_errors += 1;
+                            (call_table.debug_print)(
+                                b"check: compressed size exceeds grain size\n\0".as_ptr(),
+                            );
+                        }
+
+                        // Validate marker + compressed data fits in file
+                        if let Some(marker_end) = grain_off
+                            .checked_add(vmdk::GRAIN_MARKER_SIZE as u64)
+                            .and_then(|v| v.checked_add(csize as u64))
+                        {
+                            if marker_end > actual_size {
+                                result.corruptions += 1;
+                                result.total_errors += 1;
+                                (call_table.debug_print)(
+                                    b"check: grain marker+data beyond file\n\0".as_ptr(),
+                                );
+                            }
+                            if marker_end > max_offset {
+                                max_offset = marker_end;
+                            }
+                        } else {
+                            result.corruptions += 1;
+                            result.total_errors += 1;
+                        }
+
+                        // Validate LBA matches expected virtual offset
+                        let expected_lba =
+                            (gd_idx as u64) * (hdr.num_gtes_per_gt as u64) * hdr.grain_size_sectors
+                                + (gt_idx as u64) * hdr.grain_size_sectors;
+                        if marker_lba_val != expected_lba {
+                            result.corruptions += 1;
+                            result.total_errors += 1;
+                            (call_table.debug_print)(
+                                b"check: grain marker LBA mismatch\n\0".as_ptr(),
+                            );
+                        }
+                    } else {
+                        result.corruptions += 1;
+                        result.total_errors += 1;
+                        (call_table.debug_print)(b"check: grain marker read failed\n\0".as_ptr());
+                    }
+                }
+
+                // Mark host grain in bitmap (overlaps expected for compressed)
                 if bmp.can_track {
                     bmp.set(grain_off / grain_size_bytes);
-                }
-                if grain_off > max_offset {
-                    max_offset = grain_off;
                 }
             } else {
                 // Standard grain: validate full grain within file
@@ -797,6 +921,122 @@ unsafe fn check_vmdk(
 
     (call_table.verbose_print)(b"check: vmdk GD/GT walk complete\n\0".as_ptr());
 
+    // ---- RGD (Redundant Grain Directory) validation ----
+    let has_rgd = (hdr.flags & vmdk::FLAG_USE_RGD) != 0;
+    if has_rgd {
+        if hdr.rgd_offset_sectors == 0 {
+            // FLAG_USE_RGD set but no RGD offset
+            result.corruptions += 1;
+            result.total_errors += 1;
+            (call_table.debug_print)(b"check: FLAG_USE_RGD set but rgd_offset=0\n\0".as_ptr());
+        } else {
+            let rgd_byte_offset = match hdr.rgd_offset_sectors.checked_mul(512) {
+                Some(off) if off < actual_size => off,
+                _ => {
+                    result.corruptions += 1;
+                    result.total_errors += 1;
+                    (call_table.debug_print)(b"check: RGD offset out of bounds\n\0".as_ptr());
+                    0 // sentinel: skip RGD walk
+                }
+            };
+
+            if rgd_byte_offset > 0 {
+                // Validate RGD doesn't extend beyond file
+                let rgd_end = rgd_byte_offset
+                    .checked_add(gd_size_bytes)
+                    .filter(|&end| end <= actual_size);
+                match rgd_end {
+                    None => {
+                        result.corruptions += 1;
+                        result.total_errors += 1;
+                        (call_table.debug_print)(b"check: RGD extends beyond file\n\0".as_ptr());
+                    }
+                    Some(rgd_end_off) => {
+                        // Mark RGD grains in bitmap (should not overlap GD/GT/data)
+                        if bmp.can_track {
+                            let rgd_first = rgd_byte_offset / grain_size_bytes;
+                            let rgd_last = rgd_end_off.saturating_sub(1) / grain_size_bytes;
+                            for g in rgd_first..=rgd_last {
+                                if matches!(bmp.set(g), BitmapSetResult::AlreadySet) {
+                                    result.corruptions += 1;
+                                    result.total_errors += 1;
+                                    (call_table.debug_print)(
+                                        b"check: RGD overlaps other data\n\0".as_ptr(),
+                                    );
+                                }
+                            }
+                        }
+
+                        // Compare RGD entries against primary GD entries
+                        let mut rgd_cached_sector: u64 = u64::MAX;
+                        let mut rgd_cache = [0u8; MAX_SECTOR_SIZE];
+                        // Reset GD cache for a clean re-read
+                        gd_cached_sector = u64::MAX;
+
+                        for gd_idx_r in 0..num_gd_entries {
+                            let primary_off = match (gd_idx_r as u64)
+                                .checked_mul(4)
+                                .and_then(|v| gd_byte_offset.checked_add(v))
+                            {
+                                Some(off) => off,
+                                None => break,
+                            };
+                            let rgd_off = match (gd_idx_r as u64)
+                                .checked_mul(4)
+                                .and_then(|v| rgd_byte_offset.checked_add(v))
+                            {
+                                Some(off) => off,
+                                None => break,
+                            };
+
+                            let gd_val = vmdk::read_u32_le_cached(
+                                call_table,
+                                0,
+                                primary_off,
+                                sector_size,
+                                input_capacity,
+                                &mut gd_cached_sector,
+                                gd_cache.as_mut_ptr(),
+                                &mut bytes_read,
+                            );
+                            let rgd_val = vmdk::read_u32_le_cached(
+                                call_table,
+                                0,
+                                rgd_off,
+                                sector_size,
+                                input_capacity,
+                                &mut rgd_cached_sector,
+                                rgd_cache.as_mut_ptr(),
+                                &mut bytes_read,
+                            );
+
+                            match (gd_val, rgd_val) {
+                                (Some(g), Some(r)) => {
+                                    if g != r {
+                                        result.corruptions += 1;
+                                        result.total_errors += 1;
+                                        (call_table.debug_print)(
+                                            b"check: RGD entry mismatch\n\0".as_ptr(),
+                                        );
+                                    }
+                                }
+                                _ => {
+                                    result.corruptions += 1;
+                                    result.total_errors += 1;
+                                    (call_table.debug_print)(b"check: RGD read error\n\0".as_ptr());
+                                    break;
+                                }
+                            }
+                        }
+                        (call_table.verbose_print)(
+                            b"check: vmdk RGD validation complete\n\0".as_ptr(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // Calculate fragmentation
     if total_data_entries > 1 {
         result.fragmentation = ((fragmented_entries * 100) / (total_data_entries - 1)) as u32;
@@ -820,16 +1060,19 @@ unsafe fn check_vmdk(
 /// Check VHDX image integrity.
 ///
 /// Validates:
+/// - File identifier signature at offset 0 ("vhdxfile")
 /// - Header 1 and Header 2: signature, CRC-32C checksum, active header
 ///   selection via sequence_number
 /// - Dirty log detection (non-zero log_guid in active header)
 /// - Region table 1: signature, CRC-32C, entry count, BAT/metadata
 ///   region presence
+/// - Region table 2: cross-validation against region table 1
 /// - Metadata: table signature, required items (FileParameters,
 ///   VirtualDiskSize, LogicalSectorSize, PhysicalSectorSize)
 /// - Differencing disk detection (has_parent → unsupported)
 /// - BAT entries: allocated block offsets within file bounds, 1MB
 ///   alignment, overlap detection via BitmapContext
+/// - Fragmentation tracking (non-sequential block allocation)
 unsafe fn check_vhdx(
     result: &mut CheckResult,
     call_table: &CallTable,
@@ -839,13 +1082,32 @@ unsafe fn check_vhdx(
     let mut bytes_read: u64 = 0;
     let input_capacity = (call_table.get_input_capacity)(0);
 
-    // Need at least space for region table 1 + region table size
-    if actual_size < vhdx::REGION_TABLE1_OFFSET + 65536 {
+    // Need at least space for region table 2 + region table size
+    if actual_size < vhdx::REGION_TABLE2_OFFSET + 65536 {
         result.corruptions += 1;
         result.total_errors += 1;
         result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
         (call_table.debug_print)(b"check: VHDX too small for headers\n\0".as_ptr());
         return bytes_read;
+    }
+
+    // --- Validate file identifier (offset 0) ---
+    {
+        let mut id_buf = [0u8; MAX_SECTOR_SIZE];
+        if (call_table.read_input_sector)(0, 0, id_buf.as_mut_ptr(), sector_size) {
+            bytes_read += sector_size as u64;
+            let sig = u64::from_le_bytes([
+                id_buf[0], id_buf[1], id_buf[2], id_buf[3], id_buf[4], id_buf[5], id_buf[6],
+                id_buf[7],
+            ]);
+            if sig != vhdx::FILE_IDENTIFIER_SIGNATURE {
+                result.corruptions += 1;
+                result.total_errors += 1;
+                (call_table.debug_print)(
+                    b"check: VHDX file identifier signature missing\n\0".as_ptr(),
+                );
+            }
+        }
     }
 
     // --- Validate headers ---
@@ -953,6 +1215,58 @@ unsafe fn check_vhdx(
     let bat_offset = regions[0].file_offset;
     let bat_length = regions[0].length;
     let metadata_offset = regions[1].file_offset;
+
+    // --- Validate region table 2 (cross-check with RT1) ---
+    {
+        let rt2_start_sector = vhdx::REGION_TABLE2_OFFSET / sector_size as u64;
+        let rt2_buf = (shared::SCRATCH_MEM_BASE + 65536) as *mut u8;
+        if shared::SCRATCH_MEM_BASE + 131072 <= shared::ALLOC_HEAP_BASE {
+            let mut rt2_ok = true;
+            for i in 0..rt_sectors {
+                let sector = rt2_start_sector + i as u64;
+                if sector >= input_capacity {
+                    rt2_ok = false;
+                    break;
+                }
+                if !(call_table.read_input_sector)(
+                    0,
+                    sector,
+                    rt2_buf.add(i * sector_size),
+                    sector_size,
+                ) {
+                    rt2_ok = false;
+                    break;
+                }
+                bytes_read += sector_size as u64;
+            }
+            if rt2_ok {
+                let rt2_slice = core::slice::from_raw_parts(rt2_buf, 65536);
+                match vhdx::parse_region_table(rt2_slice) {
+                    Some((regions2, _)) => {
+                        // Cross-check: BAT and metadata regions must match
+                        if regions2[0].file_offset != bat_offset
+                            || regions2[0].length != bat_length
+                            || regions2[1].file_offset != metadata_offset
+                        {
+                            result.corruptions += 1;
+                            result.total_errors += 1;
+                            (call_table.debug_print)(
+                                b"check: VHDX region tables inconsistent\n\0".as_ptr(),
+                            );
+                        }
+                    }
+                    None => {
+                        // RT2 invalid but RT1 is valid — report corruption
+                        result.corruptions += 1;
+                        result.total_errors += 1;
+                        (call_table.debug_print)(
+                            b"check: VHDX region table 2 invalid\n\0".as_ptr(),
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     // Validate region offsets are within file
     if bat_offset >= actual_size || metadata_offset >= actual_size {
@@ -1071,6 +1385,10 @@ unsafe fn check_vhdx(
     let mut bat_cached_sector: u64 = u64::MAX;
     let mut allocated_blocks: u64 = 0;
     let mut payload_block_idx: u64 = 0;
+    let mut max_block_offset: u64 = 0;
+    let mut last_block_offset: u64 = 0;
+    let mut fragmented_blocks: u64 = 0;
+    let mut total_alloc_for_frag: u64 = 0;
 
     for bat_idx in 0..total_bat_entries {
         // Determine if this is a sector bitmap entry (skip it)
@@ -1134,6 +1452,21 @@ unsafe fn check_vhdx(
                     continue;
                 }
 
+                // Track max offset
+                if block_end > max_block_offset {
+                    max_block_offset = block_end;
+                }
+
+                // Fragmentation tracking
+                total_alloc_for_frag += 1;
+                if last_block_offset != 0 {
+                    let expected = last_block_offset + block_size as u64;
+                    if file_offset != expected {
+                        fragmented_blocks += 1;
+                    }
+                }
+                last_block_offset = file_offset;
+
                 // Validate 1MB alignment
                 if file_offset % vhdx::MB_ALIGN != 0 {
                     result.corruptions += 1;
@@ -1176,6 +1509,16 @@ unsafe fn check_vhdx(
 
     result.clusters_allocated = allocated_blocks;
     result.clusters_checked = total_payload_blocks;
+
+    // Calculate fragmentation
+    if total_alloc_for_frag > 1 {
+        result.fragmentation = ((fragmented_blocks * 100) / (total_alloc_for_frag - 1)) as u32;
+    }
+
+    // Set image_end_offset (VHDX data is MB-aligned, use max block or file size)
+    if max_block_offset > 0 {
+        result.image_end_offset = max_block_offset;
+    }
 
     if result.corruptions > 0 {
         result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
@@ -1232,11 +1575,17 @@ unsafe fn read_vhdx_header(
 /// Validates:
 /// - Footer cookie and checksum (from first or last sector)
 /// - Disk type validity (2=fixed, 3=dynamic, 4=differencing)
+/// - Format version (must be 1.0)
+/// - Features (FEATURES_RESERVED bit must be set)
+/// - For fixed VHDs:
+///   - data_offset must be 0xFFFFFFFFFFFFFFFF
+///   - File size must accommodate virtual size + footer
 /// - For dynamic VHDs:
-///   - Dynamic header cookie and checksum
+///   - Dynamic header cookie, checksum, and version
 ///   - BAT offset within file bounds
 ///   - BAT entries: allocated block offsets within file bounds
 ///   - Overlap detection (no two BAT entries reference same block)
+///   - Fragmentation tracking (non-sequential block allocation)
 ///   - Footer copy consistency (start vs end of file)
 unsafe fn check_vhd(
     header: &[u8],
@@ -1296,7 +1645,43 @@ unsafe fn check_vhd(
                     result.corruptions += 1;
                     result.total_errors += 1;
                 }
-                // Fixed VHD — no further structural validation needed
+                // Validate version
+                if f.format_version != vhd::VHD_VERSION_1_0 {
+                    result.corruptions += 1;
+                    result.total_errors += 1;
+                    (call_table.debug_print)(b"check: VHD invalid format version\n\0".as_ptr());
+                }
+                // Validate features (reserved bit must be set)
+                if f.features & vhd::FEATURES_RESERVED == 0 {
+                    result.corruptions += 1;
+                    result.total_errors += 1;
+                    (call_table.debug_print)(
+                        b"check: VHD features missing reserved bit\n\0".as_ptr(),
+                    );
+                }
+                // Fixed VHD: data_offset should be 0xFFFFFFFFFFFFFFFF
+                if f.disk_type == vhd::DISK_TYPE_FIXED && f.data_offset != 0xFFFF_FFFF_FFFF_FFFF {
+                    result.corruptions += 1;
+                    result.total_errors += 1;
+                    (call_table.debug_print)(
+                        b"check: fixed VHD has non-empty data_offset\n\0".as_ptr(),
+                    );
+                }
+                // Fixed VHD: virtual size must fit in the device
+                // (actual_size may be padded to sector boundaries by VMM)
+                if f.disk_type == vhd::DISK_TYPE_FIXED {
+                    let min_expected = f.current_size.saturating_add(vhd::FOOTER_SIZE as u64);
+                    if actual_size < min_expected {
+                        result.corruptions += 1;
+                        result.total_errors += 1;
+                        (call_table.debug_print)(b"check: fixed VHD truncated\n\0".as_ptr());
+                    }
+                    // Fixed VHDs: all sectors are "allocated"
+                    let total_sectors = f.current_size / 512;
+                    result.clusters_checked = total_sectors;
+                    result.clusters_allocated = total_sectors;
+                    result.image_end_offset = actual_size;
+                }
                 if result.corruptions > 0 {
                     result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
                 }
@@ -1325,6 +1710,20 @@ unsafe fn check_vhd(
         result.corruptions += 1;
         result.total_errors += 1;
         (call_table.debug_print)(b"check: invalid VHD disk type\n\0".as_ptr());
+    }
+
+    // Validate format version
+    if footer.format_version != vhd::VHD_VERSION_1_0 {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        (call_table.debug_print)(b"check: VHD invalid format version\n\0".as_ptr());
+    }
+
+    // Validate features (reserved bit must be set)
+    if footer.features & vhd::FEATURES_RESERVED == 0 {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        (call_table.debug_print)(b"check: VHD features missing reserved bit\n\0".as_ptr());
     }
 
     // For fixed VHDs with footer at start, nothing more to check
@@ -1404,6 +1803,13 @@ unsafe fn check_vhd(
         (call_table.debug_print)(b"check: VHD dynamic header checksum mismatch\n\0".as_ptr());
     }
 
+    // Validate dynamic header version
+    if dyn_header.header_version != vhd::VHD_VERSION_1_0 {
+        result.corruptions += 1;
+        result.total_errors += 1;
+        (call_table.debug_print)(b"check: VHD dynamic header version invalid\n\0".as_ptr());
+    }
+
     // Validate BAT offset
     let bat_offset = dyn_header.table_offset;
     let bat_size_bytes = dyn_header.max_table_entries as u64 * 4;
@@ -1456,6 +1862,10 @@ unsafe fn check_vhd(
     }
 
     let mut allocated_blocks: u64 = 0;
+    let mut max_block_offset: u64 = 0;
+    let mut last_block_offset: u64 = 0;
+    let mut fragmented_blocks: u64 = 0;
+    let mut total_alloc_for_frag: u64 = 0;
 
     for entry_idx in 0..dyn_header.max_table_entries {
         let bat_byte_offset = bat_offset + entry_idx as u64 * 4;
@@ -1495,6 +1905,21 @@ unsafe fn check_vhd(
             continue;
         }
 
+        // Track max offset for image_end_offset
+        if block_end > max_block_offset {
+            max_block_offset = block_end;
+        }
+
+        // Fragmentation tracking
+        total_alloc_for_frag += 1;
+        if last_block_offset != 0 {
+            let expected = last_block_offset + block_total_bytes;
+            if block_host_offset != expected {
+                fragmented_blocks += 1;
+            }
+        }
+        last_block_offset = block_host_offset;
+
         // Overlap detection
         if bmp.can_track && block_total_sectors > 0 {
             let slot = block_host_offset / (block_total_sectors * 512);
@@ -1512,6 +1937,17 @@ unsafe fn check_vhd(
 
     result.clusters_allocated = allocated_blocks;
     result.clusters_checked = dyn_header.max_table_entries as u64;
+
+    // Calculate fragmentation
+    if total_alloc_for_frag > 1 {
+        result.fragmentation = ((fragmented_blocks * 100) / (total_alloc_for_frag - 1)) as u32;
+    }
+
+    // Set image end offset
+    if max_block_offset > 0 {
+        // Include the footer at end of file
+        result.image_end_offset = actual_size;
+    }
 
     // Verify footer copy at end of file matches footer at start
     if input_capacity > 0 {

@@ -137,6 +137,8 @@ The `imago convert` operation supports writing output in the following formats:
 | grain table bounds | GT offsets within file | N/A | Validated per GD entry | plaso-vmdk, vmdk-multi-partition |
 | grain data bounds | Grain offsets within file | N/A | Validated per GTE | plaso-vmdk, vmdk-multi-partition |
 | grain overlap | Two grains at same offset | N/A | 1-bit-per-grain bitmap | plaso-vmdk, vmdk-multi-partition |
+| compressed grain markers | Validate LBA, size, bounds | N/A | Marker structure validated per compressed GTE | vmdk-streamoptimized |
+| redundant GD (RGD) | Cross-check against primary GD | N/A | Entry-by-entry comparison when FLAG_USE_RGD set | qemu-img-created VMDKs |
 | multi-extent detection | Multiple extents in descriptor | N/A | Reports FLAG_NOT_SUPPORTED | vmdk-multi-extent |
 | fragmentation | Non-sequential grain layout | N/A | Reports fragmentation count | plaso-vmdk, vmdk-multi-partition |
 
@@ -157,8 +159,8 @@ The `imago convert` operation supports writing output in the following formats:
 | LUKS | Version check (only v1) | Rejects v2+ | Detects format, version, cipher, hash, UUID, payload offset, key slots, inner format (with passphrase); convert decrypts v1/v2 containers |
 | VDI | None | Pass-through | Detects format, UUID |
 | ISO | None | Pass-through | Detects format* |
-| VHD | None | Pass-through | Detects creator app; full check validation (footer/header checksums, BAT bounds, overlap detection) |
-| VHDX | None | Pass-through | Detects block size; full check validation (header CRC-32C, region table CRC, metadata, BAT bounds/alignment/overlap) |
+| VHD | None | Pass-through | Detects creator app; full check validation (footer/header checksums, version/feature validation, BAT bounds, overlap detection, fragmentation, fixed VHD size check, footer copy consistency) |
+| VHDX | None | Pass-through | Detects block size; full check validation (file identifier, dual header CRC-32C, region table 1+2 cross-check, metadata, BAT bounds/alignment/overlap, fragmentation) |
 
 ---
 
