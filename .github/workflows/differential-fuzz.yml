@@ -74,29 +74,7 @@ jobs:
         run: |
           make imago
 
-      - name: Determine iteration count
-        id: params
-        env:
-          INPUT_ITERATIONS: ${{ inputs.iterations }}
-          INPUT_TIMEOUT: ${{ inputs.timeout }}
-          EVENT_NAME: ${{ github.event_name }}
-        run: |
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            echo "iterations=${INPUT_ITERATIONS}" >> $GITHUB_OUTPUT
-            echo "timeout=${INPUT_TIMEOUT}" >> $GITHUB_OUTPUT
-          elif [ "$EVENT_NAME" = "pull_request" ]; then
-            echo "iterations=100" >> $GITHUB_OUTPUT
-            echo "timeout=30" >> $GITHUB_OUTPUT
-          elif [ "$EVENT_NAME" = "push" ]; then
-            echo "iterations=200" >> $GITHUB_OUTPUT
-            echo "timeout=30" >> $GITHUB_OUTPUT
-          else
-            # schedule (nightly)
-            echo "iterations=1000" >> $GITHUB_OUTPUT
-            echo "timeout=30" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Install GitHub CLI
+      - name: Install GitHub CLI on host
         run: |
           if ! command -v gh &>/dev/null; then
             sudo mkdir -p -m 755 /etc/apt/keyrings
@@ -124,11 +102,26 @@ jobs:
             --color "D93F0B" \
             2>/dev/null || true
 
-      - name: Install qemu-img
+      - name: Determine iteration count
+        id: params
+        env:
+          INPUT_ITERATIONS: ${{ inputs.iterations }}
+          INPUT_TIMEOUT: ${{ inputs.timeout }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          if ! command -v qemu-img &>/dev/null; then
-            sudo apt-get update
-            sudo apt-get install -y qemu-utils
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "iterations=${INPUT_ITERATIONS}" >> $GITHUB_OUTPUT
+            echo "timeout=${INPUT_TIMEOUT}" >> $GITHUB_OUTPUT
+          elif [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "iterations=100" >> $GITHUB_OUTPUT
+            echo "timeout=30" >> $GITHUB_OUTPUT
+          elif [ "$EVENT_NAME" = "push" ]; then
+            echo "iterations=200" >> $GITHUB_OUTPUT
+            echo "timeout=30" >> $GITHUB_OUTPUT
+          else
+            # schedule (nightly)
+            echo "iterations=1000" >> $GITHUB_OUTPUT
+            echo "timeout=30" >> $GITHUB_OUTPUT
           fi
 
       - name: Run differential fuzzing
@@ -150,20 +143,52 @@ jobs:
             FAIL_FAST_ARG="--fail-fast"
           fi
 
-          # Run fuzzing directly on the host.  imago needs
-          # /dev/kvm (the runner has it); the Docker container
-          # was only needed for building.
+          # The imago binary is built inside the Docker container
+          # (nightly Rust, newer glibc) so it must also run inside
+          # the container.  We install gh and qemu-utils inside
+          # the container at runtime so the fuzzer can file issues
+          # and create test images.
           mkdir -p fuzz-logs
 
-          python3 scripts/differential-fuzz.py \
-            --imago src/target/release/imago \
-            --iterations "$FUZZ_ITERATIONS" \
-            --timeout "$FUZZ_TIMEOUT" \
-            --log-dir fuzz-logs \
-            --create-issues \
-            --workflow-url "$WORKFLOW_URL" \
-            ${SEED_ARG} \
-            ${FAIL_FAST_ARG}
+          docker run --rm \
+            --device /dev/kvm \
+            -u "$(id -u):$(id -g)" \
+            --group-add "$(stat -c '%g' /dev/kvm)" \
+            -e HOME=/build \
+            -e GH_TOKEN="$GH_TOKEN" \
+            -e WORKFLOW_URL="$WORKFLOW_URL" \
+            -v "$(pwd):/workspace" \
+            -w "/workspace" \
+            imago-build \
+            bash -c "
+              # Install gh and qemu-img inside the container
+              apt-get update -qq && \
+              apt-get install -y -qq wget qemu-utils >/dev/null 2>&1
+              mkdir -p -m 755 /etc/apt/keyrings
+              wget -qO- \
+                https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+                | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+                >/dev/null
+              chmod go+r \
+                /etc/apt/keyrings/githubcli-archive-keyring.gpg
+              echo \"deb [arch=\$(dpkg --print-architecture) \
+                signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] \
+                https://cli.github.com/packages stable main\" \
+                | tee /etc/apt/sources.list.d/github-cli.list \
+                >/dev/null
+              apt-get update -qq && \
+              apt-get install -y -qq gh >/dev/null 2>&1
+
+              python3 /workspace/scripts/differential-fuzz.py \
+                --imago /workspace/src/target/release/imago \
+                --iterations $FUZZ_ITERATIONS \
+                --timeout $FUZZ_TIMEOUT \
+                --log-dir /workspace/fuzz-logs \
+                --create-issues \
+                --workflow-url \"\$WORKFLOW_URL\" \
+                $SEED_ARG \
+                $FAIL_FAST_ARG
+            "
 
       - name: Upload fuzzing logs
         if: always()
