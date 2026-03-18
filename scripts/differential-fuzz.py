@@ -257,87 +257,63 @@ def parse_libyal_kv(output):
     return result
 
 
-def parse_vmdkinfo(output):
-    """Parse vmdkinfo output into comparable fields.
+def _extract_libyal_fields(kv, field_specs):
+    """Extract fields from parsed libyal key-value output.
 
-    Returns a dict with normalized field names that can be
-    compared against imago info JSON.
+    Each spec in field_specs is (source_key, target_key, type)
+    where type is 'str' or 'int'. Integer fields that fail to
+    parse are silently skipped.
     """
-    kv = parse_libyal_kv(output)
     result = {}
-
-    if 'media size' in kv:
-        try:
-            result['virtual-size'] = int(kv['media size'])
-        except ValueError:
-            pass
-
-    if 'format version' in kv:
-        result['format-version'] = kv['format version']
-
-    if 'disk type' in kv:
-        result['disk-type'] = kv['disk type']
-
-    if 'compression method' in kv:
-        result['compression'] = kv['compression method']
-
+    for source_key, target_key, value_type in field_specs:
+        if source_key not in kv:
+            continue
+        if value_type == 'int':
+            try:
+                result[target_key] = int(kv[source_key])
+            except ValueError:
+                pass
+        else:
+            result[target_key] = kv[source_key]
     return result
+
+
+# Field mappings per libyal tool: (libyal_key, imago_key, type)
+_VMDKINFO_FIELDS = [
+    ('media size', 'virtual-size', 'int'),
+    ('format version', 'format-version', 'str'),
+    ('disk type', 'disk-type', 'str'),
+    ('compression method', 'compression', 'str'),
+]
+
+_VHDIINFO_FIELDS = [
+    ('media size', 'virtual-size', 'int'),
+    ('disk type', 'disk-type', 'str'),
+    ('format version', 'format-version', 'str'),
+]
+
+_QCOWINFO_FIELDS = [
+    ('media size', 'virtual-size', 'int'),
+    ('format version', 'format-version', 'str'),
+    ('cluster block size', 'cluster-size', 'int'),
+    ('compression method', 'compression', 'str'),
+    ('encryption method', 'encryption', 'str'),
+]
+
+
+def parse_vmdkinfo(output):
+    """Parse vmdkinfo output into comparable fields."""
+    return _extract_libyal_fields(parse_libyal_kv(output), _VMDKINFO_FIELDS)
 
 
 def parse_vhdiinfo(output):
-    """Parse vhdiinfo output into comparable fields.
-
-    Handles both VHD and VHDX images.
-    """
-    kv = parse_libyal_kv(output)
-    result = {}
-
-    if 'media size' in kv:
-        try:
-            result['virtual-size'] = int(kv['media size'])
-        except ValueError:
-            pass
-
-    if 'disk type' in kv:
-        result['disk-type'] = kv['disk type']
-
-    if 'format version' in kv:
-        result['format-version'] = kv['format version']
-
-    return result
+    """Parse vhdiinfo output into comparable fields (VHD and VHDX)."""
+    return _extract_libyal_fields(parse_libyal_kv(output), _VHDIINFO_FIELDS)
 
 
 def parse_qcowinfo(output):
-    """Parse qcowinfo output into comparable fields.
-
-    Extracts format version, media size, cluster block size,
-    and compression/encryption details.
-    """
-    kv = parse_libyal_kv(output)
-    result = {}
-
-    if 'media size' in kv:
-        try:
-            result['virtual-size'] = int(kv['media size'])
-        except ValueError:
-            pass
-
-    if 'format version' in kv:
-        result['format-version'] = kv['format version']
-
-    if 'cluster block size' in kv:
-        try:
-            result['cluster-size'] = int(kv['cluster block size'])
-        except ValueError:
-            pass
-
-    if 'compression method' in kv:
-        result['compression'] = kv['compression method']
-
-    if 'encryption method' in kv:
-        result['encryption'] = kv['encryption method']
-
-    return result
+    """Parse qcowinfo output into comparable fields (QCOW v1/v2/v3)."""
+    return _extract_libyal_fields(parse_libyal_kv(output), _QCOWINFO_FIELDS)
 
 
 # Map tool names to their output parsers
