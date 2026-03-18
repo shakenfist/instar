@@ -5,12 +5,26 @@ FROM mcr.microsoft.com/devcontainers/base:debian
 # - protobuf-compiler: required for micropb-gen
 # - python3, python3-pip, python3-venv: for running integration tests
 # - qemu-utils: provides qemu-img and qemu-io for compare/convert tests
+# - wget: for downloading gh CLI keyring
 RUN apt-get update && apt-get install -y \
     protobuf-compiler \
     python3 \
     python3-pip \
     python3-venv \
     qemu-utils \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install GitHub CLI (used by differential fuzzer to file issues)
+RUN mkdir -p -m 755 /etc/apt/keyrings \
+    && wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+       | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) \
+       signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] \
+       https://cli.github.com/packages stable main" \
+       | tee /etc/apt/sources.list.d/github-cli.list >/dev/null \
+    && apt-get update && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
 
 # Create a shared build directory that any user can use
