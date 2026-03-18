@@ -1349,22 +1349,53 @@ pub unsafe fn read_cluster_sectors(
     bytes_read: &mut u64,
 ) -> bool {
     let first_sector = host_offset / sector_size as u64;
-    // Ensure at least one sector is read when cluster_size < sector_size.
-    // The caller's buffer is always >= MAX_SECTOR_SIZE.
-    let read_size = if cluster_size < sector_size as u64 {
-        sector_size as u64
-    } else {
-        cluster_size
-    };
-    let sectors_per_cluster = read_size / sector_size as u64;
+    let offset_in_sector =
+        (host_offset % sector_size as u64) as usize;
 
-    for i in 0..sectors_per_cluster {
-        let sector = first_sector + i;
-        let buf_offset = (i as usize) * sector_size;
-        if !(call_table.read_input_sector)(device_idx, sector, buf.add(buf_offset), sector_size) {
+    if cluster_size < sector_size as u64 {
+        // The cluster fits inside a single sector.  Read the
+        // sector, then copy only the cluster's bytes to the
+        // caller's buffer so that buf[0] contains the first
+        // byte of the cluster, not the first byte of the
+        // sector.
+        //
+        // We use a stack buffer for the sector read.  The
+        // caller's buffer is at least MAX_SECTOR_SIZE, but we
+        // must not clobber bytes beyond cluster_size because
+        // the caller may be accumulating multiple clusters
+        // into the same buffer.
+        let mut sector_buf = [0u8; MAX_SECTOR_SIZE];
+        if !(call_table.read_input_sector)(
+            device_idx,
+            first_sector,
+            sector_buf.as_mut_ptr(),
+            sector_size,
+        ) {
             return false;
         }
         *bytes_read += sector_size as u64;
+        core::ptr::copy_nonoverlapping(
+            sector_buf.as_ptr().add(offset_in_sector),
+            buf,
+            cluster_size as usize,
+        );
+    } else {
+        // Cluster spans one or more full sectors.
+        let sectors_per_cluster =
+            cluster_size / sector_size as u64;
+        for i in 0..sectors_per_cluster {
+            let sector = first_sector + i;
+            let buf_offset = (i as usize) * sector_size;
+            if !(call_table.read_input_sector)(
+                device_idx,
+                sector,
+                buf.add(buf_offset),
+                sector_size,
+            ) {
+                return false;
+            }
+            *bytes_read += sector_size as u64;
+        }
     }
     true
 }

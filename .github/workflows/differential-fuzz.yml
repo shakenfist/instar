@@ -1,0 +1,199 @@
+name: Differential Fuzzing
+
+on:
+  # Nightly: 1000 iterations with random seed
+  schedule:
+    - cron: '0 2 * * *'
+
+  # PR validation: 100 iterations when fuzzer code changes
+  pull_request:
+    paths:
+      - 'scripts/differential-fuzz.py'
+      - '.github/workflows/differential-fuzz.yml'
+
+  # Post-merge smoke test: 200 iterations
+  push:
+    branches: [develop]
+    paths:
+      - 'src/**'
+      - 'crates/**'
+      - 'scripts/differential-fuzz.py'
+
+  # Manual: configurable
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: 'Number of fuzzing iterations'
+        required: false
+        default: '1000'
+        type: string
+      seed:
+        description: 'Random seed (leave empty for random)'
+        required: false
+        default: ''
+        type: string
+      timeout:
+        description: 'Per-operation timeout in seconds'
+        required: false
+        default: '30'
+        type: string
+      fail_fast:
+        description: 'Exit on first divergence'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  differential-fuzz:
+    runs-on: [self-hosted, debian-12, xl]
+    timeout-minutes: 180
+
+    env:
+      DOCKER_BUILDKIT: 1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Docker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y docker.io
+          sudo systemctl start docker
+          sudo chmod 666 /var/run/docker.sock
+
+      - name: Remove previous devcontainers, if any
+        run: |
+          docker image rm -f imago-build 2>/dev/null || true
+
+      - name: Build imago
+        run: |
+          make imago
+
+      - name: Install GitHub CLI on host
+        run: |
+          if ! command -v gh &>/dev/null; then
+            sudo mkdir -p -m 755 /etc/apt/keyrings
+            wget -qO- \
+              https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+              | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+              >/dev/null
+            sudo chmod go+r \
+              /etc/apt/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) \
+              signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] \
+              https://cli.github.com/packages stable main" \
+              | sudo tee /etc/apt/sources.list.d/github-cli.list \
+              >/dev/null
+            sudo apt-get update
+            sudo apt-get install -y gh
+          fi
+
+      - name: Ensure security-audit label exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create "security-audit" \
+            --description "Findings from security audit and fuzzing" \
+            --color "D93F0B" \
+            2>/dev/null || true
+
+      - name: Determine iteration count
+        id: params
+        env:
+          INPUT_ITERATIONS: ${{ inputs.iterations }}
+          INPUT_TIMEOUT: ${{ inputs.timeout }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "iterations=${INPUT_ITERATIONS}" >> $GITHUB_OUTPUT
+            echo "timeout=${INPUT_TIMEOUT}" >> $GITHUB_OUTPUT
+          elif [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "iterations=100" >> $GITHUB_OUTPUT
+            echo "timeout=30" >> $GITHUB_OUTPUT
+          elif [ "$EVENT_NAME" = "push" ]; then
+            echo "iterations=200" >> $GITHUB_OUTPUT
+            echo "timeout=30" >> $GITHUB_OUTPUT
+          else
+            # schedule (nightly)
+            echo "iterations=1000" >> $GITHUB_OUTPUT
+            echo "timeout=30" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run differential fuzzing
+        env:
+          FUZZ_SEED: ${{ inputs.seed }}
+          FUZZ_ITERATIONS: ${{ steps.params.outputs.iterations }}
+          FUZZ_TIMEOUT: ${{ steps.params.outputs.timeout }}
+          FUZZ_FAIL_FAST: ${{ inputs.fail_fast }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          SEED_ARG=""
+          if [ -n "$FUZZ_SEED" ]; then
+            SEED_ARG="--seed $FUZZ_SEED"
+          fi
+
+          FAIL_FAST_ARG=""
+          if [ "$FUZZ_FAIL_FAST" = "true" ]; then
+            FAIL_FAST_ARG="--fail-fast"
+          fi
+
+          # The imago binary is built inside the Docker container
+          # (nightly Rust, newer glibc) so it must also run inside
+          # the container.  We install gh and qemu-utils inside
+          # the container at runtime so the fuzzer can file issues
+          # and create test images.
+          mkdir -p fuzz-logs
+
+          docker run --rm \
+            --device /dev/kvm \
+            -u "$(id -u):$(id -g)" \
+            --group-add "$(stat -c '%g' /dev/kvm)" \
+            -e HOME=/build \
+            -e GH_TOKEN="$GH_TOKEN" \
+            -e WORKFLOW_URL="$WORKFLOW_URL" \
+            -v "$(pwd):/workspace" \
+            -w "/workspace" \
+            imago-build \
+            bash -c "
+              # Install gh and qemu-img inside the container
+              apt-get update -qq && \
+              apt-get install -y -qq wget qemu-utils >/dev/null 2>&1
+              mkdir -p -m 755 /etc/apt/keyrings
+              wget -qO- \
+                https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+                | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+                >/dev/null
+              chmod go+r \
+                /etc/apt/keyrings/githubcli-archive-keyring.gpg
+              echo \"deb [arch=\$(dpkg --print-architecture) \
+                signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] \
+                https://cli.github.com/packages stable main\" \
+                | tee /etc/apt/sources.list.d/github-cli.list \
+                >/dev/null
+              apt-get update -qq && \
+              apt-get install -y -qq gh >/dev/null 2>&1
+
+              python3 /workspace/scripts/differential-fuzz.py \
+                --imago /workspace/src/target/release/imago \
+                --iterations $FUZZ_ITERATIONS \
+                --timeout $FUZZ_TIMEOUT \
+                --log-dir /workspace/fuzz-logs \
+                --create-issues \
+                --workflow-url \"\$WORKFLOW_URL\" \
+                $SEED_ARG \
+                $FAIL_FAST_ARG
+            "
+
+      - name: Upload fuzzing logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-logs
+          path: fuzz-logs/
+          retention-days: 90

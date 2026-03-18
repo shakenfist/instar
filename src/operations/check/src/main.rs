@@ -2346,11 +2346,22 @@ unsafe fn check_qcow2(
             }
 
             // ---- Full L2 table validation ----
+            // When sector_size > cluster_size, the L2 table may
+            // start mid-sector.  Track the byte offset within the
+            // sector buffer.
             let l2_base_sector = l2_offset / sector_size as u64;
+            let l2_offset_in_sector =
+                (l2_offset % sector_size as u64) as usize;
+            let l2_end = l2_offset + cluster_size;
+            let l2_last_sector =
+                (l2_end.saturating_sub(1)) / sector_size as u64;
+            let l2_sectors_to_read =
+                (l2_last_sector - l2_base_sector + 1) as usize;
             let mut l2_buffer = [0u8; MAX_SECTOR_SIZE];
             let mut l2_entries_remaining = l2_entries_per_cluster;
+            let mut l2_buf_start = l2_offset_in_sector;
 
-            for s in 0..sectors_per_l2 {
+            for s in 0..l2_sectors_to_read {
                 let l2_sector = l2_base_sector + s as u64;
                 if l2_sector >= input_capacity {
                     result.corruptions += 1;
@@ -2371,11 +2382,16 @@ unsafe fn check_qcow2(
                 }
                 bytes_read += sector_size as u64;
 
-                let entries_this_sector =
-                    core::cmp::min(l2_entries_remaining, (sector_size as u64) / l2_entry_size);
+                let usable_bytes =
+                    (sector_size - l2_buf_start) as u64;
+                let entries_this_sector = core::cmp::min(
+                    l2_entries_remaining,
+                    usable_bytes / l2_entry_size,
+                );
 
                 for j in 0..entries_this_sector as usize {
-                    let off = j * l2_entry_size as usize;
+                    let off =
+                        l2_buf_start + j * l2_entry_size as usize;
                     let l2e = u64::from_be_bytes([
                         l2_buffer[off],
                         l2_buffer[off + 1],
@@ -2553,6 +2569,8 @@ unsafe fn check_qcow2(
                 }
 
                 l2_entries_remaining -= entries_this_sector;
+                // Subsequent sectors start at byte 0
+                l2_buf_start = 0;
             }
         }
 
@@ -2647,13 +2665,26 @@ unsafe fn check_qcow2(
                     continue;
                 }
 
-                // Read each sector of this refcount block
+                // Read each sector of this refcount block.
+                // When sector_size > cluster_size, the refcount block
+                // may start mid-sector. We must offset reads within
+                // the buffer to the block's actual position.
                 let refblock_base_sector = refblock_off / sector_size as u64;
-                let sectors_per_block = ((cluster_size as usize) + sector_size - 1) / sector_size;
+                let refblock_offset_in_sector =
+                    (refblock_off % sector_size as u64) as usize;
+                let refblock_end_in_file = refblock_off + cluster_size;
+                let last_sector = (refblock_end_in_file
+                    .saturating_sub(1))
+                    / sector_size as u64;
+                let sectors_to_read = (last_sector - refblock_base_sector + 1) as usize;
                 let mut entries_remaining = entries_per_block;
-                let entries_per_sector = (sector_size as u64 * 8) / refcount_bits as u64;
 
-                for s in 0..sectors_per_block {
+                // Byte offset of the refcount block data within the
+                // first sector's buffer.  For the first sector this is
+                // the sub-sector offset; for subsequent sectors it is 0.
+                let mut buf_start = refblock_offset_in_sector;
+
+                for s in 0..sectors_to_read {
                     let sec = refblock_base_sector + s as u64;
                     if sec >= input_capacity {
                         break;
@@ -2668,15 +2699,29 @@ unsafe fn check_qcow2(
                     }
                     bytes_read += sector_size as u64;
 
-                    let entries_this = core::cmp::min(entries_remaining, entries_per_sector);
+                    // How many usable refcount bytes are in this
+                    // sector, starting from buf_start?
+                    let usable_bytes = sector_size - buf_start;
+                    let entries_this_sector =
+                        (usable_bytes as u64 * 8) / refcount_bits as u64;
+                    let entries_this =
+                        core::cmp::min(entries_remaining, entries_this_sector);
 
                     for e in 0..entries_this as usize {
-                        let rc = read_refcount_from_buffer(&leak_scan_buffer, e, refcount_bits);
+                        let rc = read_refcount_from_buffer_at(
+                            &leak_scan_buffer,
+                            buf_start,
+                            e,
+                            refcount_bits,
+                        );
 
                         if rc > 0 {
-                            let cidx = match rt_idx.checked_mul(entries_per_block).and_then(|v| {
-                                v.checked_add((s as u64) * entries_per_sector + e as u64)
-                            }) {
+                            let global_entry =
+                                entries_per_block - entries_remaining + e as u64;
+                            let cidx = match rt_idx
+                                .checked_mul(entries_per_block)
+                                .and_then(|v| v.checked_add(global_entry))
+                            {
                                 Some(v) => v,
                                 None => continue,
                             };
@@ -2688,6 +2733,8 @@ unsafe fn check_qcow2(
                     }
 
                     entries_remaining -= entries_this;
+                    // Subsequent sectors start at byte 0
+                    buf_start = 0;
                 }
             }
 
@@ -2887,37 +2934,57 @@ unsafe fn validate_chain_qcow2_header(
     0
 }
 
-/// Read a refcount entry from a sector buffer.
+/// Read a refcount entry from a sector buffer at a given byte
+/// offset.
 ///
-/// `entry_index` is the index of the entry within this sector.
+/// `base_offset` is the byte offset within `buf` where the
+/// refcount block data begins (non-zero when sector_size >
+/// cluster_size and the block starts mid-sector).
+/// `entry_index` is the index of the entry relative to
+/// `base_offset`.
 /// `refcount_bits` must be 1, 2, 4, 8, 16, 32, or 64.
 ///
-/// Sub-byte widths use little-endian bit ordering within each byte
-/// (entry 0 at the LSB), matching QEMU's implementation.
-fn read_refcount_from_buffer(
+/// Sub-byte widths use little-endian bit ordering within each
+/// byte (entry 0 at the LSB), matching QEMU's implementation.
+fn read_refcount_from_buffer_at(
     buf: &[u8; MAX_SECTOR_SIZE],
+    base_offset: usize,
     entry_index: usize,
     refcount_bits: u32,
 ) -> u64 {
+    // Defensive bounds check: base_offset must be within the
+    // sector buffer.  Callers maintain this invariant via
+    // entries_this_sector, but we check explicitly for defence
+    // in depth in this security-critical code.
+    if base_offset >= MAX_SECTOR_SIZE {
+        return 0;
+    }
     match refcount_bits {
         1 | 2 | 4 => {
             let entries_per_byte = 8 / refcount_bits as usize;
-            let byte_idx = entry_index / entries_per_byte;
-            let bit_pos = (entry_index % entries_per_byte) * refcount_bits as usize;
+            let byte_idx =
+                base_offset + entry_index / entries_per_byte;
+            let bit_pos = (entry_index % entries_per_byte)
+                * refcount_bits as usize;
             let mask = (1u64 << refcount_bits) - 1;
             (buf[byte_idx] as u64 >> bit_pos) & mask
         }
-        8 => buf[entry_index] as u64,
+        8 => buf[base_offset + entry_index] as u64,
         16 => {
-            let off = entry_index * 2;
+            let off = base_offset + entry_index * 2;
             u16::from_be_bytes([buf[off], buf[off + 1]]) as u64
         }
         32 => {
-            let off = entry_index * 4;
-            u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as u64
+            let off = base_offset + entry_index * 4;
+            u32::from_be_bytes([
+                buf[off],
+                buf[off + 1],
+                buf[off + 2],
+                buf[off + 3],
+            ]) as u64
         }
         64 => {
-            let off = entry_index * 8;
+            let off = base_offset + entry_index * 8;
             u64::from_be_bytes([
                 buf[off],
                 buf[off + 1],

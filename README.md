@@ -584,6 +584,29 @@ automatically closed when the PR merges.
 
 See `.github/workflows/` for implementation details.
 
+### Differential Fuzzing
+
+On-demand differential fuzzing compares imago against qemu-img on randomly
+generated images to find behavioral divergences:
+
+```bash
+# Run locally (requires imago binary and qemu-img)
+python3 scripts/differential-fuzz.py \
+    --imago src/target/release/imago \
+    --iterations 100 \
+    --seed 42
+
+# Trigger via GitHub Actions (workflow_dispatch)
+gh workflow run differential-fuzz.yml \
+    -f iterations=1000 \
+    -f seed=42
+```
+
+The fuzzer generates random images (varying format, size, cluster size,
+compression, data patterns), runs chains of operations (info, check, convert)
+against both tools, and reports divergences with full reproduction details.
+See `scripts/differential-fuzz.py` for implementation details.
+
 ## Claude Code Integration
 
 This project includes Claude Code skills for common development tasks:
