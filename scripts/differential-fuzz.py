@@ -542,6 +542,74 @@ def write_divergence_report(log_dir, seed, iteration, attrs, divergence):
     return report_path
 
 
+def file_github_issue(seed, iteration, attrs, divergence, workflow_url):
+    """File a GitHub issue for a divergence immediately.
+
+    Requires the `gh` CLI to be installed and GH_TOKEN to be set.
+    Logs a warning and continues if issue creation fails.
+    """
+    div_type = divergence.get('type', 'unknown')
+    attrs_json = json.dumps(attrs, indent=2)
+    details_json = json.dumps(divergence, indent=2)
+
+    title = (
+        f'Differential fuzz: {div_type}'
+        f' (seed {seed}, iter {iteration})'
+    )
+    run_line = ''
+    if workflow_url:
+        run_line = f'**Workflow run:** {workflow_url}\n'
+
+    body = (
+        f'## Differential fuzzing divergence\n\n'
+        f'**Type:** `{div_type}`\n'
+        f'**Seed:** `{seed}`\n'
+        f'**Iteration:** `{iteration}`\n'
+        f'{run_line}\n'
+        f'### Image attributes\n'
+        f'```json\n{attrs_json}\n```\n\n'
+        f'### Divergence details\n'
+        f'```json\n{details_json}\n```\n\n'
+        f'### Reproduction\n'
+        f'```bash\n'
+        f'python3 scripts/differential-fuzz.py \\\n'
+        f'  --imago src/target/release/imago \\\n'
+        f'  --iterations {iteration + 1} \\\n'
+        f'  --seed {seed} \\\n'
+        f'  --fail-fast\n'
+        f'```\n'
+    )
+
+    try:
+        result = subprocess.run(
+            [
+                'gh', 'issue', 'create',
+                '--label', 'security-audit',
+                '--title', title,
+                '--body', body,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            issue_url = result.stdout.strip()
+            logger.info(
+                'Filed issue for iteration %d: %s',
+                iteration, issue_url,
+            )
+        else:
+            logger.warning(
+                'Failed to file issue for iteration %d: %s',
+                iteration, result.stderr.strip(),
+            )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        logger.warning(
+            'Could not file issue for iteration %d: %s',
+            iteration, exc,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -577,6 +645,15 @@ def main():
     parser.add_argument(
         '--fail-fast', action='store_true',
         help='Exit on first divergence (default: continue and report)',
+    )
+    parser.add_argument(
+        '--create-issues', action='store_true',
+        help='File GitHub issues immediately as divergences are found '
+             '(requires gh CLI and GH_TOKEN)',
+    )
+    parser.add_argument(
+        '--workflow-url', type=str, default=None,
+        help='URL of the CI workflow run (included in filed issues)',
     )
     args = parser.parse_args()
 
@@ -662,6 +739,12 @@ def main():
                     'DIVERGENCE at iteration %d: %s (report: %s)',
                     i, div.get('type', 'unknown'), report_path,
                 )
+
+                if args.create_issues:
+                    file_github_issue(
+                        seed, i, attrs, div,
+                        args.workflow_url,
+                    )
 
                 if args.fail_fast:
                     logger.error(

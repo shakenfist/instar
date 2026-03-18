@@ -96,53 +96,7 @@ jobs:
             echo "timeout=30" >> $GITHUB_OUTPUT
           fi
 
-      - name: Run differential fuzzing
-        env:
-          FUZZ_SEED: ${{ inputs.seed }}
-          FUZZ_ITERATIONS: ${{ steps.params.outputs.iterations }}
-          FUZZ_TIMEOUT: ${{ steps.params.outputs.timeout }}
-          FUZZ_FAIL_FAST: ${{ inputs.fail_fast }}
-        run: |
-          SEED_ARG=""
-          if [ -n "$FUZZ_SEED" ]; then
-            SEED_ARG="--seed $FUZZ_SEED"
-          fi
-
-          FAIL_FAST_ARG=""
-          if [ "$FUZZ_FAIL_FAST" = "true" ]; then
-            FAIL_FAST_ARG="--fail-fast"
-          fi
-
-          # Run fuzzing inside the devcontainer so imago has KVM
-          # access. Mount the workspace and a logs directory.
-          mkdir -p ${GITHUB_WORKSPACE}/fuzz-logs
-
-          docker run --rm \
-            --device /dev/kvm \
-            -u "$(id -u):$(id -g)" \
-            --group-add "$(stat -c '%g' /dev/kvm)" \
-            -e HOME=/build \
-            -v "$(pwd):/workspace" \
-            -w "/workspace" \
-            imago-build \
-            python3 scripts/differential-fuzz.py \
-              --imago /workspace/src/target/release/imago \
-              --iterations "$FUZZ_ITERATIONS" \
-              --timeout "$FUZZ_TIMEOUT" \
-              --log-dir /workspace/fuzz-logs \
-              ${SEED_ARG} \
-              ${FAIL_FAST_ARG}
-
-      - name: Upload fuzzing logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fuzz-logs
-          path: fuzz-logs/
-          retention-days: 90
-
       - name: Install GitHub CLI
-        if: failure()
         run: |
           if ! command -v gh &>/dev/null; then
             sudo mkdir -p -m 755 /etc/apt/keyrings
@@ -162,7 +116,6 @@ jobs:
           fi
 
       - name: Ensure security-audit label exists
-        if: failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -171,66 +124,51 @@ jobs:
             --color "D93F0B" \
             2>/dev/null || true
 
-      - name: File issues for divergences
-        if: failure()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      - name: Install qemu-img
         run: |
-          for report in fuzz-logs/divergence-*.json; do
-            [ -f "$report" ] || continue
+          if ! command -v qemu-img &>/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y qemu-utils
+          fi
 
-            python3 -c "
-          import json, sys
+      - name: Run differential fuzzing
+        env:
+          FUZZ_SEED: ${{ inputs.seed }}
+          FUZZ_ITERATIONS: ${{ steps.params.outputs.iterations }}
+          FUZZ_TIMEOUT: ${{ steps.params.outputs.timeout }}
+          FUZZ_FAIL_FAST: ${{ inputs.fail_fast }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          SEED_ARG=""
+          if [ -n "$FUZZ_SEED" ]; then
+            SEED_ARG="--seed $FUZZ_SEED"
+          fi
 
-          d = json.load(open('$report'))
-          seed = d['seed']
-          iteration = d['iteration']
-          div_type = d['divergence'].get('type', 'unknown')
-          attrs = json.dumps(d['attributes'], indent=2)
-          details = json.dumps(d['divergence'], indent=2)
+          FAIL_FAST_ARG=""
+          if [ "$FUZZ_FAIL_FAST" = "true" ]; then
+            FAIL_FAST_ARG="--fail-fast"
+          fi
 
-          title = (
-              f'Differential fuzz: {div_type}'
-              f' (seed {seed}, iter {iteration})'
-          )
-          body = f'''## Differential fuzzing divergence
+          # Run fuzzing directly on the host.  imago needs
+          # /dev/kvm (the runner has it); the Docker container
+          # was only needed for building.
+          mkdir -p fuzz-logs
 
-          **Type:** \`{div_type}\`
-          **Seed:** \`{seed}\`
-          **Iteration:** \`{iteration}\`
-          **Workflow run:** {sys.argv[1]}
+          python3 scripts/differential-fuzz.py \
+            --imago src/target/release/imago \
+            --iterations "$FUZZ_ITERATIONS" \
+            --timeout "$FUZZ_TIMEOUT" \
+            --log-dir fuzz-logs \
+            --create-issues \
+            --workflow-url "$WORKFLOW_URL" \
+            ${SEED_ARG} \
+            ${FAIL_FAST_ARG}
 
-          ### Image attributes
-          \`\`\`json
-          {attrs}
-          \`\`\`
-
-          ### Divergence details
-          \`\`\`json
-          {details}
-          \`\`\`
-
-          ### Reproduction
-          \`\`\`bash
-          python3 scripts/differential-fuzz.py \\\\
-            --imago src/target/release/imago \\\\
-            --iterations {iteration + 1} \\\\
-            --seed {seed} \\\\
-            --fail-fast
-          \`\`\`
-          '''
-
-          # Write to files for gh to consume safely
-          with open('/tmp/issue-title.txt', 'w') as f:
-              f.write(title)
-          with open('/tmp/issue-body.md', 'w') as f:
-              f.write(body)
-          " "$WORKFLOW_RUN_URL"
-
-            TITLE=$(cat /tmp/issue-title.txt)
-            gh issue create \
-              --label "security-audit" \
-              --title "$TITLE" \
-              --body-file /tmp/issue-body.md
-          done
+      - name: Upload fuzzing logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-logs
+          path: fuzz-logs/
+          retention-days: 90
