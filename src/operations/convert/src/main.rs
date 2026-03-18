@@ -2050,6 +2050,20 @@ unsafe fn convert_to_qcow2(
     let staging_buf = staging_buf_addr as *mut u8;
     let mut staging_cluster_offset: u64 = u64::MAX;
 
+    // Input cluster size — each read_chain_virtual_cluster call
+    // reads one input cluster, so when the output cluster is
+    // larger we must loop to fill the buffer.
+    let input_cluster_size_q = {
+        let top = &chain_config.devices[0];
+        if top.cluster_size > 0 {
+            top.cluster_size as u64
+        } else {
+            sector_size as u64
+        }
+    };
+    let read_chunk_q =
+        core::cmp::min(input_cluster_size_q, layout.cluster_size);
+
     (call_table.verbose_print)(b"convert: starting qcow2 conversion\n\0".as_ptr());
 
     // Linear cluster allocator. Cluster 0 is the header.
@@ -2077,36 +2091,52 @@ unsafe fn convert_to_qcow2(
             let remaining = virtual_size - virtual_offset;
             let this_chunk = core::cmp::min(remaining, layout.cluster_size);
 
-            // Reset bump allocator before ZSTD decompression
-            HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
-
-            // Read input data
-            if !qcow2::read_chain_virtual_cluster(
-                call_table,
-                0,
-                input_device_count,
-                virtual_offset,
-                buf_data,
-                this_chunk,
-                sector_size,
-                chain_config,
-                chain_states,
-                scratch_layout.buf_compressed as *mut u8,
-                staging_buf,
-                &mut staging_cluster_offset,
-                aes_key,
-                luks_key,
-                luks_sector_size,
-                bytes_read,
-            ) {
-                (call_table.send_error)(
-                    b"convert\0".as_ptr(),
-                    b"input\0".as_ptr(),
-                    virtual_offset / sector_size as u64,
-                    1,
+            // Read input data, one input cluster at a time
+            let mut buf_filled_q: u64 = 0;
+            while buf_filled_q < this_chunk {
+                let piece = core::cmp::min(
+                    read_chunk_q,
+                    this_chunk - buf_filled_q,
                 );
-                (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
-                return *bytes_read;
+
+                HEAP_POS.store(
+                    0,
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+
+                if !qcow2::read_chain_virtual_cluster(
+                    call_table,
+                    0,
+                    input_device_count,
+                    virtual_offset + buf_filled_q,
+                    buf_data.add(buf_filled_q as usize),
+                    piece,
+                    sector_size,
+                    chain_config,
+                    chain_states,
+                    scratch_layout.buf_compressed as *mut u8,
+                    staging_buf,
+                    &mut staging_cluster_offset,
+                    aes_key,
+                    luks_key,
+                    luks_sector_size,
+                    bytes_read,
+                ) {
+                    (call_table.send_error)(
+                        b"convert\0".as_ptr(),
+                        b"input\0".as_ptr(),
+                        (virtual_offset + buf_filled_q)
+                            / sector_size as u64,
+                        1,
+                    );
+                    (call_table.send_complete)(
+                        b"convert\0".as_ptr(),
+                        *bytes_read,
+                        false,
+                    );
+                    return *bytes_read;
+                }
+                buf_filled_q += piece;
             }
 
             // Skip zero clusters when configured
@@ -2371,6 +2401,19 @@ unsafe fn convert_to_qcow2_compressed(
     let mut clusters_done: u64 = 0;
     let mut last_percent: u32 = 0;
 
+    // Input cluster size for read_chain_virtual_cluster.
+    // Each call reads one input cluster, so when the output
+    // cluster is larger we must loop to fill the buffer.
+    let input_cluster_size = {
+        let top = &chain_config.devices[0];
+        if top.cluster_size > 0 {
+            top.cluster_size as u64
+        } else {
+            sector_size as u64
+        }
+    };
+    let read_chunk = core::cmp::min(input_cluster_size, layout.cluster_size);
+
     // Process each L2 range
     for l1_idx in 0..layout.l1_size {
         core::ptr::write_bytes(buf_l2, 0, layout.cluster_size as usize);
@@ -2387,36 +2430,54 @@ unsafe fn convert_to_qcow2_compressed(
             let remaining = virtual_size - virtual_offset;
             let this_chunk = core::cmp::min(remaining, layout.cluster_size);
 
-            // Reset bump allocator before ZSTD decompression
-            HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
-
-            // Read input data
-            if !qcow2::read_chain_virtual_cluster(
-                call_table,
-                0,
-                input_device_count,
-                virtual_offset,
-                buf_data,
-                this_chunk,
-                sector_size,
-                chain_config,
-                chain_states,
-                scratch_layout.buf_compressed as *mut u8,
-                staging_buf,
-                &mut staging_cluster_offset,
-                aes_key,
-                luks_key,
-                luks_sector_size,
-                bytes_read,
-            ) {
-                (call_table.send_error)(
-                    b"convert\0".as_ptr(),
-                    b"input\0".as_ptr(),
-                    virtual_offset / sector_size as u64,
-                    1,
+            // Read input data, one input cluster at a time
+            // when input clusters are smaller than output.
+            let mut buf_filled: u64 = 0;
+            while buf_filled < this_chunk {
+                let piece = core::cmp::min(
+                    read_chunk,
+                    this_chunk - buf_filled,
                 );
-                (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
-                return *bytes_read;
+
+                // Reset bump allocator before ZSTD decompression
+                HEAP_POS.store(
+                    0,
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+
+                if !qcow2::read_chain_virtual_cluster(
+                    call_table,
+                    0,
+                    input_device_count,
+                    virtual_offset + buf_filled,
+                    buf_data.add(buf_filled as usize),
+                    piece,
+                    sector_size,
+                    chain_config,
+                    chain_states,
+                    scratch_layout.buf_compressed as *mut u8,
+                    staging_buf,
+                    &mut staging_cluster_offset,
+                    aes_key,
+                    luks_key,
+                    luks_sector_size,
+                    bytes_read,
+                ) {
+                    (call_table.send_error)(
+                        b"convert\0".as_ptr(),
+                        b"input\0".as_ptr(),
+                        (virtual_offset + buf_filled)
+                            / sector_size as u64,
+                        1,
+                    );
+                    (call_table.send_complete)(
+                        b"convert\0".as_ptr(),
+                        *bytes_read,
+                        false,
+                    );
+                    return *bytes_read;
+                }
+                buf_filled += piece;
             }
 
             // Skip zero clusters
