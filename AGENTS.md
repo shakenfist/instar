@@ -416,6 +416,7 @@ This allows reviewers to cherry-pick or drop individual fixes as needed.
 ### Workflow Files
 
 - `.github/workflows/functional-tests.yml` - Main CI with automated review
+- `.github/workflows/release.yml` - Release workflow (Sigstore-signed tags, GitHub Releases with pre-compiled binaries)
 - `.github/workflows/pr-re-review.yml` - Manual re-review trigger
 - `.github/workflows/pr-retest.yml` - Manual retest trigger via bot command
 - `.github/workflows/pr-fix-tests.yml` - Test failure fixing

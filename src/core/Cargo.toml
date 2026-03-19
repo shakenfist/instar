@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Core guest binary: device initialization, call table, operation dispatch"
 license = "Apache-2.0"
+publish = false
 
 [dependencies]
 guest-protocol = { path = "../../crates/guest-protocol" }

@@ -1,0 +1,153 @@
+# Release workflow for Imago
+#
+# Triggers on version tags (v*). Requires approval from the 'release'
+# environment before publishing. Uses Sigstore for tag signing and
+# GitHub Releases for binary distribution.
+#
+# Adapted from shakenfist/development/templates/release-automation/
+# for Rust binary releases (no PyPI, pre-compiled binaries instead).
+
+name: Release
+
+permissions: {}
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+  # Allow manual trigger for testing (won't publish without a tag)
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Linux binaries
+    runs-on: [self-hosted, debian-12, s]
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+
+    env:
+      DOCKER_BUILDKIT: 1
+      CARGO_BUILD_JOBS: 2
+
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          # Add later if there is demand:
+          # - x86_64-unknown-linux-musl
+          # - aarch64-unknown-linux-gnu
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Docker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y docker.io
+          sudo systemctl start docker
+          sudo chmod 666 /var/run/docker.sock
+
+      - name: Remove previous devcontainers, if any
+        run: |
+          docker image rm -f imago-build 2>/dev/null || true
+
+      - name: Build imago (VMM + guest binaries)
+        run: make imago
+
+      - name: Package binary
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          # For workflow_dispatch without a tag, use "dev"
+          if [ -z "${TAG_NAME}" ] || [ "${TAG_NAME}" = "${GITHUB_REF}" ]; then
+            TAG_NAME="dev"
+          fi
+          ARCHIVE="imago-${TAG_NAME}-${{ matrix.target }}.tar.gz"
+          mkdir staging
+          cp src/target/release/imago staging/
+          cp src/target/release/core.bin staging/
+          cp src/target/release/info.bin staging/
+          cp src/target/release/copy.bin staging/
+          cp src/target/release/check.bin staging/
+          cp src/target/release/compare.bin staging/
+          cp src/target/release/convert.bin staging/
+          cp LICENSE README.md staging/
+          tar -czf "${ARCHIVE}" -C staging .
+          echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
+
+      - name: Upload distribution artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+
+  sign-tag:
+    name: Sign release tag with Sigstore
+    needs: build
+    runs-on: [self-hosted, debian-12, s]
+    environment: release
+
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install gitsign
+        run: |
+          GITSIGN_VERSION="0.14.0"
+          curl -sLO "https://github.com/sigstore/gitsign/releases/download/v${GITSIGN_VERSION}/gitsign_${GITSIGN_VERSION}_linux_amd64"
+          curl -sLO "https://github.com/sigstore/gitsign/releases/download/v${GITSIGN_VERSION}/checksums.txt"
+          sha256sum --ignore-missing -c checksums.txt
+          chmod +x "gitsign_${GITSIGN_VERSION}_linux_amd64"
+          sudo mv "gitsign_${GITSIGN_VERSION}_linux_amd64" /usr/local/bin/gitsign
+
+      - name: Configure git for Sigstore signing
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global tag.gpgsign true
+          git config --global gpg.format x509
+          git config --global gpg.x509.program gitsign
+
+      - name: Create signed tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          echo "Signing tag: ${TAG_NAME}"
+          git tag -d "${TAG_NAME}" || true
+          git tag -s "${TAG_NAME}" -m "Release ${TAG_NAME}" "${GITHUB_SHA}"
+          git push origin "${TAG_NAME}" --force
+
+  github-release:
+    name: Create GitHub Release
+    needs: [build, sign-tag]
+    runs-on: [self-hosted, static]
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: "*.tar.gz"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Raw disk image format validation (MBR/GPT partition tables)"
 license = "Apache-2.0"
+repository = "https://github.com/shakenfist/imago"
+authors = ["Michael Still <mikal@stillhq.com>"]
+keywords = ["raw", "disk-image", "mbr", "gpt", "no-std"]
+categories = ["no-std", "parser-implementations"]
 
 [lib]
 # No std, this is used by bare-metal code

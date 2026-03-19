@@ -2,6 +2,9 @@
 name = "convert"
 version = "0.1.0"
 edition = "2021"
+description = "Convert operation: transform between disk image formats"
+license = "Apache-2.0"
+publish = false
 
 [profile.release]
 opt-level = "s"

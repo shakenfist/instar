@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Shared types between core and operations (call table, constants)"
 license = "Apache-2.0"
+publish = false
 
 [lib]
 # No std, this is used by bare-metal code
