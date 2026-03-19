@@ -83,7 +83,8 @@ The `imago convert` operation supports writing output in the following formats:
   `--qcow2-password`. LUKS-in-QCOW2 encryption (crypt_method=2) is supported
   via `--luks-passphrase`. LUKS-encrypted QCOW2 output is supported via
   `--luks-encrypt-passphrase` (AES-256-XTS with PBKDF2-SHA256 key derivation,
-  LUKS v1 headers). Encrypted output cannot be combined with compression. Native LUKS containers (v1 with PBKDF2, v2 with
+  LUKS v1 headers). Encrypted output cannot be combined with
+  compression. Native LUKS containers (v1 with PBKDF2, v2 with
   Argon2id) are supported via `--luks-passphrase` (v2 also requires
   `--max-guest-memory`). LUKS containers wrapping QCOW2 images are
   transparently detected and the inner QCOW2 is processed as the

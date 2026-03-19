@@ -1124,3 +1124,112 @@ pub fn derive_v2_master_key(
     result.key[..key_bytes].copy_from_slice(&candidate[..key_bytes]);
     Some(result)
 }
+
+// ─── Unit tests ─────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[cfg(all(feature = "decrypt", feature = "encrypt"))]
+mod encrypt_tests {
+    use super::*;
+    extern crate alloc;
+    use alloc::vec;
+
+    #[test]
+    fn test_aes_xts_encrypt_decrypt_roundtrip_128() {
+        let key = [0x42u8; 32]; // AES-128-XTS: 16+16
+        let original = [0xABu8; 512];
+        let mut buf = original;
+        aes_xts_encrypt(&mut buf, &key, 0);
+        assert_ne!(buf, original, "encrypted data should differ");
+        aes_xts_decrypt(&mut buf, &key, 0);
+        assert_eq!(buf, original, "round-trip should recover original");
+    }
+
+    #[test]
+    fn test_aes_xts_encrypt_decrypt_roundtrip_256() {
+        let key = [0x55u8; 64]; // AES-256-XTS: 32+32
+        let mut data = [0u8; 1024];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        let original = data;
+        aes_xts_encrypt(&mut data, &key, 7);
+        assert_ne!(data, original);
+        aes_xts_decrypt(&mut data, &key, 7);
+        assert_eq!(data, original);
+    }
+
+    #[test]
+    fn test_af_split_merge_roundtrip() {
+        let master_key = [
+            0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04,
+            0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
+            0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
+            0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0xFF,
+        ];
+        let key_bytes = 32;
+        let stripes = 10;
+        let mut km_buf = vec![0x42u8; key_bytes * stripes];
+        af_split(&master_key, key_bytes, stripes, true, &mut km_buf);
+        let mut recovered = [0u8; 64];
+        af_merge(&km_buf, key_bytes, stripes, true, &mut recovered);
+        assert_eq!(
+            &recovered[..key_bytes], &master_key[..],
+            "af_split then af_merge should recover master key"
+        );
+    }
+
+    #[test]
+    fn test_build_v1_header_and_parse_roundtrip() {
+        let master_key = [0x11u8; 64];
+        let passphrase = b"test-passphrase";
+        let mk_digest_salt = [0x22u8; 32];
+        let slot_salt = [0x33u8; 32];
+        let uuid = b"00000000-0000-4000-8000-000000000000";
+        let key_bytes = 64;
+        let stripes = LUKS_DEFAULT_STRIPES as usize;
+        let af_random = vec![0x44u8; (stripes - 1) * key_bytes];
+        let params = LuksV1BuildParams {
+            master_key: &master_key,
+            passphrase,
+            iterations: 1,
+            mk_digest_iterations: 1,
+            mk_digest_salt: &mk_digest_salt,
+            slot_salt: &slot_salt,
+            af_random: &af_random,
+            uuid: &uuid,
+            use_sha256: true,
+        };
+        let mut out = vec![0u8; 4096 + key_bytes * stripes];
+        let total = build_v1_header(&params, &mut out)
+            .expect("build should succeed");
+        assert!(total > LUKS_V1_HEADER_SIZE);
+        let parsed = parse_v1_header(&out)
+            .expect("parse should succeed");
+        assert_eq!(parsed.version, 1);
+        assert_eq!(parsed.key_bytes as usize, key_bytes);
+        assert!(v1_is_aes_xts(&parsed));
+        assert!(parsed.slots[0].active);
+        assert_eq!(parsed.slots[0].stripes as usize, stripes);
+        for i in 1..8 {
+            assert!(!parsed.slots[i].active);
+        }
+    }
+
+    #[test]
+    fn test_build_v1_header_invalid_key_size() {
+        let params = LuksV1BuildParams {
+            master_key: &[0u8; 48],
+            passphrase: b"test",
+            iterations: 1,
+            mk_digest_iterations: 1,
+            mk_digest_salt: &[0u8; 32],
+            slot_salt: &[0u8; 32],
+            af_random: &[0u8; 1000],
+            uuid: b"00000000-0000-4000-8000-000000000000",
+            use_sha256: true,
+        };
+        let mut out = vec![0u8; 300000];
+        assert!(build_v1_header(&params, &mut out).is_none());
+    }
+}
