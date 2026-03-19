@@ -70,12 +70,7 @@ jobs:
           ARCHIVE="imago-${TAG_NAME}-${{ matrix.target }}.tar.gz"
           mkdir staging
           cp src/target/release/imago staging/
-          cp src/target/release/core.bin staging/
-          cp src/target/release/info.bin staging/
-          cp src/target/release/copy.bin staging/
-          cp src/target/release/check.bin staging/
-          cp src/target/release/compare.bin staging/
-          cp src/target/release/convert.bin staging/
+          cp src/target/release/*.bin staging/
           cp LICENSE README.md staging/
           tar -czf "${ARCHIVE}" -C staging .
           echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
