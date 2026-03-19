@@ -36,6 +36,22 @@ pub fn input_size_bytes() -> u64 {
     FUZZ_DATA.with(|f| f.borrow().len() as u64)
 }
 
+/// Extract a u64 offset from bytes 512..520 of the fuzz input.
+///
+/// Many fuzz targets use a fixed set of lookup offsets plus one
+/// derived from the fuzz input for deeper exploration. This helper
+/// extracts that dynamic offset from a consistent location (the
+/// first byte past the first sector).
+pub fn extract_fuzz_offset(data: &[u8]) -> Option<u64> {
+    if data.len() < 520 {
+        return None;
+    }
+    Some(u64::from_le_bytes([
+        data[512], data[513], data[514], data[515],
+        data[516], data[517], data[518], data[519],
+    ]))
+}
+
 /// Build a CallTable with mock function pointers backed by the
 /// thread-local fuzz input.
 pub fn build_call_table() -> shared::CallTable {

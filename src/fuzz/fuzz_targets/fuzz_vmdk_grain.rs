@@ -41,11 +41,7 @@ fuzz_target!(|data: &[u8]| {
             }
 
             // Fuzz-derived offset
-            if data.len() >= 520 {
-                let dynamic_offset = u64::from_le_bytes([
-                    data[512], data[513], data[514], data[515],
-                    data[516], data[517], data[518], data[519],
-                ]);
+            if let Some(dynamic_offset) = imago_fuzz::extract_fuzz_offset(data) {
                 let _ = state.grain_lookup(
                     &call_table,
                     dynamic_offset,
