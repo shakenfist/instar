@@ -275,10 +275,11 @@ jobs:
             gh issue edit "$ISSUE_NUMBER" \
               --add-label "autofix-complex" \
               --remove-label "autofix-attempted"
+            WORKFLOW_RUN="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             gh issue comment "$ISSUE_NUMBER" --body \
-              "Automated fix exceeded complexity guardrails (${CHANGED_FILES} source files changed, limit is 3). Needs human attention.
+              "Autofix exceeded complexity limit (${CHANGED_FILES} files, max 3). Needs human attention.
 
-              Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+              Workflow: $WORKFLOW_RUN"
           else
             echo "too_complex=false" >> $GITHUB_OUTPUT
           fi
@@ -463,10 +464,11 @@ jobs:
             gh issue edit "$ISSUE_NUMBER" \
               --add-label "autofix-complex" \
               --remove-label "autofix-attempted"
+            WORKFLOW_RUN="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             gh issue comment "$ISSUE_NUMBER" --body \
-              "Automated fix exceeded complexity guardrails on second attempt (${CHANGED_FILES} files). Needs human attention.
+              "Autofix exceeded complexity limit on attempt 2 (${CHANGED_FILES} files). Needs human attention.
 
-              Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+              Workflow: $WORKFLOW_RUN"
           else
             echo "too_complex=false" >> $GITHUB_OUTPUT
           fi
