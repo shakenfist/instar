@@ -226,31 +226,28 @@ jobs:
 
                 # File GitHub issue immediately
                 CRASH_SIZE=$(stat -c%s "$CRASH_FILE" 2>/dev/null || echo "unknown")
+                LOG_EXCERPT=$(tail -30 "coverage-fuzz-logs/${TARGET}.log" 2>/dev/null | sed 's/^/    /')
+                BODY=$(printf '%s\n' \
+                  "## Coverage-guided fuzzing crash" \
+                  "" \
+                  "Target: ${TARGET}" \
+                  "Crash signature: ${SIGNATURE}" \
+                  "Crash input size: ${CRASH_SIZE} bytes" \
+                  "CI run: ${WORKFLOW_URL}" \
+                  "" \
+                  "### Reproduction" \
+                  "" \
+                  "    cd src/fuzz" \
+                  "    cargo fuzz run ${TARGET} artifacts/${TARGET}/<crash-file>" \
+                  "" \
+                  "### Log excerpt" \
+                  "" \
+                  "${LOG_EXCERPT}")
+
                 gh issue create \
                   --label "security-audit" \
                   --title "Coverage fuzz crash: ${TARGET}" \
-                  --body "$(cat <<ISSUE_EOF
-## Coverage-guided fuzzing crash
-
-**Target:** \`${TARGET}\`
-**Crash signature:** \`${SIGNATURE}\`
-**Crash input size:** ${CRASH_SIZE} bytes
-**CI run:** ${WORKFLOW_URL}
-
-### Reproduction
-
-\`\`\`bash
-cd src/fuzz
-cargo fuzz run ${TARGET} artifacts/${TARGET}/<crash-file>
-\`\`\`
-
-### Log excerpt
-
-\`\`\`
-$(tail -30 coverage-fuzz-logs/${TARGET}.log)
-\`\`\`
-ISSUE_EOF
-                )"
+                  --body "${BODY}"
               fi
             fi
 
