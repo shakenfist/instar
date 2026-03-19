@@ -42,7 +42,9 @@ Download the latest release from
 
 ```bash
 # Download and extract
-curl -sL https://github.com/shakenfist/imago/releases/latest/download/imago-v0.1.0-x86_64-unknown-linux-gnu.tar.gz \
+# Replace VERSION with the desired release (e.g. v0.2.0)
+VERSION=v0.2.0
+curl -sL "https://github.com/shakenfist/imago/releases/download/${VERSION}/imago-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
   | tar xz -C /usr/local/bin/
 
 # Verify it works
@@ -577,7 +579,13 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 Release artifacts (pre-compiled Linux binaries) are published to
 [GitHub Releases](https://github.com/shakenfist/imago/releases)
 via the release workflow (`.github/workflows/release.yml`). Tags
-are signed with Sigstore.
+are signed with Sigstore. To cut a release:
+
+```bash
+make release VERSION=0.2.0
+git push origin HEAD
+git push origin v0.2.0
+```
 
 ## Documentation
 

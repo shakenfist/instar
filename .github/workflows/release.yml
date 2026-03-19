@@ -20,8 +20,69 @@ on:
   workflow_dispatch:
 
 jobs:
+  check-version:
+    name: Verify Cargo.toml version matches tag
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: [self-hosted, static]
+
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check version consistency
+        id: check
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          EXPECTED="${TAG_NAME#v}"
+          ACTUAL=$(grep '^version = ' src/vmm/Cargo.toml \
+            | head -1 | sed 's/version = "//;s/"//')
+          echo "Tag: ${TAG_NAME}"
+          echo "Expected version: ${EXPECTED}"
+          echo "Cargo.toml version: ${ACTUAL}"
+
+          if [ "${ACTUAL}" != "${EXPECTED}" ]; then
+            echo "mismatch=true" >> "$GITHUB_OUTPUT"
+            echo "tag=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+            echo "expected=${EXPECTED}" >> "$GITHUB_OUTPUT"
+            echo "actual=${ACTUAL}" >> "$GITHUB_OUTPUT"
+            echo "::error::Version mismatch: tag ${TAG_NAME} expects ${EXPECTED} but Cargo.toml has ${ACTUAL}"
+            exit 1
+          fi
+
+      - name: File issue on version mismatch
+        if: failure() && steps.check.outputs.mismatch == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "Release ${{ steps.check.outputs.tag }}: Cargo.toml version mismatch" \
+            --label "bug" \
+            --body "$(cat <<'ISSUE_EOF'
+          The release workflow for tag \`${{ steps.check.outputs.tag }}\` failed
+          because the Cargo.toml version does not match the tag.
+
+          - **Tag expects:** ${{ steps.check.outputs.expected }}
+          - **Cargo.toml has:** ${{ steps.check.outputs.actual }}
+
+          To fix this, bump the version and re-tag:
+          \`\`\`bash
+          make release VERSION=${{ steps.check.outputs.expected }}
+          git push origin HEAD
+          git push origin ${{ steps.check.outputs.tag }}
+          \`\`\`
+
+          See the [failed workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.
+          ISSUE_EOF
+          )"
+
   build:
     name: Build Linux binaries
+    needs: check-version
+    if: always() && (needs.check-version.result == 'success' || needs.check-version.result == 'skipped')
     runs-on: [self-hosted, debian-12, s]
     timeout-minutes: 30
 

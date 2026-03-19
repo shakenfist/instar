@@ -5,13 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.1.0] - Unreleased
+## [0.2.0] - Unreleased
 
-Initial public release.
+First public release.
 
-### Added
+### Added (since v0.1)
 
-- **Operations:** info, copy, check, compare, convert
+- **New operations:** check, compare, convert (v0.1 had only
+  info and copy)
+- **Format crates** extracted into standalone `no_std` libraries:
+  qcow2, vmdk, vhd, vhdx, luks, raw
 - **Input formats:**
   - Raw (with MBR/GPT partition table validation)
   - QCOW2 v2/v3 (zlib and ZSTD compression, extended L2
@@ -43,5 +46,14 @@ Initial public release.
 - **Fuzzing:** 13 coverage-guided fuzz targets, differential
   fuzzing against qemu-img, cross-validation against
   oslo.utils format_inspector
+- **Release tooling:** Sigstore-signed tags, pre-compiled
+  binary distribution via GitHub Releases
 
-[0.1.0]: https://github.com/shakenfist/imago/releases/tag/v0.1.0
+## [0.1] - 2026-01-28
+
+Internal pre-release. Operations: info, copy. Format parsing
+was inline (no standalone crates). No check, compare, or
+convert operations. No public binary distribution.
+
+[0.2.0]: https://github.com/shakenfist/imago/releases/tag/v0.2.0
+[0.1]: https://github.com/shakenfist/imago/releases/tag/v0.1

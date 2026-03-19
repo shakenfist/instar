@@ -15,7 +15,8 @@ mitigation plan within 7 days for confirmed vulnerabilities.
 
 | Version | Supported          |
 |---------|--------------------|
-| 0.1.x   | Yes                |
+| 0.2.x   | Yes                |
+| 0.1     | No (internal only) |
 
 ## Security Model
 
