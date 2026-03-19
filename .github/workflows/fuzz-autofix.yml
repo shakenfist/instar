@@ -599,34 +599,35 @@ jobs:
           REPRODUCER=$(grep -E 'cargo fuzz run|differential-fuzz\.py' \
             ${GITHUB_WORKSPACE}/issue-body.txt | head -3 || echo "See issue for details")
 
+          {
+            echo "## Summary"
+            echo ""
+            echo "Automated fix for #${ISSUE_NUMBER}."
+            echo ""
+            echo "$COMMIT_BODY"
+            echo ""
+            echo "## Verification"
+            echo ""
+            echo "- Build succeeded (make imago)"
+            echo "- Core tests passed (make test-container-core)"
+            echo ""
+            echo "## Reproduction"
+            echo ""
+            echo '```bash'
+            echo "$REPRODUCER"
+            echo '```'
+            echo ""
+            echo "Fixes #${ISSUE_NUMBER}"
+            echo ""
+            echo "---"
+            echo "Generated with [Claude Code](https://claude.com/claude-code)"
+          } > /tmp/pr-body.txt
+
           gh pr create \
             --assignee mikalstill \
             --reviewer mikalstill \
             --title "${PR_TITLE}" \
-            --body "$(cat <<PR_EOF
-          ## Summary
-
-          Automated fix for #${ISSUE_NUMBER}.
-
-          ${COMMIT_BODY}
-
-          ## Verification
-
-          - Build succeeded (\`make imago\`)
-          - Core tests passed (\`make test-container-core\`)
-
-          ## Reproduction
-
-          \`\`\`bash
-          ${REPRODUCER}
-          \`\`\`
-
-          Fixes #${ISSUE_NUMBER}
-
-          ---
-          🤖 Generated with [Claude Code](https://claude.com/claude-code)
-          PR_EOF
-          )"
+            --body-file /tmp/pr-body.txt
 
           # Clean up the in-progress label
           gh issue edit "$ISSUE_NUMBER" --remove-label "autofix-attempted"
@@ -659,24 +660,24 @@ jobs:
             ATTEMPT2_SUMMARY=$(tail -30 ${GITHUB_WORKSPACE}/claude-changes-2.txt)
           fi
 
-          gh issue comment "$ISSUE_NUMBER" --body "$(cat <<FAIL_EOF
-          ## Automated fix failed (2 attempts)
+          WORKFLOW_RUN="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          {
+            echo "## Automated fix failed (2 attempts)"
+            echo ""
+            echo "Both fix attempts were unsuccessful. This issue needs human attention."
+            echo ""
+            echo "### Attempt 1"
+            echo ""
+            echo "$ATTEMPT1_SUMMARY" | sed 's/^/    /'
+            echo ""
+            echo "### Attempt 2"
+            echo ""
+            echo "$ATTEMPT2_SUMMARY" | sed 's/^/    /'
+            echo ""
+            echo "Workflow run: $WORKFLOW_RUN"
+          } > /tmp/fail-comment.txt
 
-          Both fix attempts were unsuccessful. This issue needs human attention.
-
-          ### Attempt 1
-          \`\`\`
-          ${ATTEMPT1_SUMMARY}
-          \`\`\`
-
-          ### Attempt 2
-          \`\`\`
-          ${ATTEMPT2_SUMMARY}
-          \`\`\`
-
-          Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          FAIL_EOF
-          )"
+          gh issue comment "$ISSUE_NUMBER" --body-file /tmp/fail-comment.txt
 
       - name: Upload logs
         if: always()
