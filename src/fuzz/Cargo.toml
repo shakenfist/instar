@@ -26,36 +26,43 @@ debug = true
 name = "fuzz_format_detect"
 path = "fuzz_targets/fuzz_format_detect.rs"
 doc = false
+test = false
 
 [[bin]]
 name = "fuzz_qcow2_header"
 path = "fuzz_targets/fuzz_qcow2_header.rs"
 doc = false
+test = false
 
 [[bin]]
 name = "fuzz_vmdk_header"
 path = "fuzz_targets/fuzz_vmdk_header.rs"
 doc = false
+test = false
 
 [[bin]]
 name = "fuzz_vhd_footer"
 path = "fuzz_targets/fuzz_vhd_footer.rs"
 doc = false
+test = false
 
 [[bin]]
 name = "fuzz_vhdx_header"
 path = "fuzz_targets/fuzz_vhdx_header.rs"
 doc = false
+test = false
 
 [[bin]]
 name = "fuzz_raw_partition"
 path = "fuzz_targets/fuzz_raw_partition.rs"
 doc = false
+test = false
 
 [[bin]]
 name = "fuzz_luks_header"
 path = "fuzz_targets/fuzz_luks_header.rs"
 doc = false
+test = false
 
 # CallTable-dependent targets
 
@@ -63,28 +70,34 @@ doc = false
 name = "fuzz_qcow2_l1l2"
 path = "fuzz_targets/fuzz_qcow2_l1l2.rs"
 doc = false
+test = false
 
 [[bin]]
 name = "fuzz_qcow2_refcount"
 path = "fuzz_targets/fuzz_qcow2_refcount.rs"
 doc = false
+test = false
 
 [[bin]]
 name = "fuzz_qcow2_decompress"
 path = "fuzz_targets/fuzz_qcow2_decompress.rs"
 doc = false
+test = false
 
 [[bin]]
 name = "fuzz_vmdk_grain"
 path = "fuzz_targets/fuzz_vmdk_grain.rs"
 doc = false
+test = false
 
 [[bin]]
 name = "fuzz_vhd_bat"
 path = "fuzz_targets/fuzz_vhd_bat.rs"
 doc = false
+test = false
 
 [[bin]]
 name = "fuzz_vhdx_metadata"
 path = "fuzz_targets/fuzz_vhdx_metadata.rs"
 doc = false
+test = false
