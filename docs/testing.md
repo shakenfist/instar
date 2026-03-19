@@ -503,6 +503,16 @@ Issues with the `security-audit` label immediately when found. New
 corpus entries are pushed to `imago-testdata/custom/fuzz-corpus/`
 after nightly runs.
 
+### Automated bug fixes
+
+The CI workflow (`.github/workflows/fuzz-autofix.yml`) runs daily
+at 06:00 UTC and picks up open `security-audit` issues. It invokes
+Claude Code (30-turn limit) to diagnose and fix the crash, then
+verifies the fix by rebuilding and running core tests. Two attempts
+per issue; failed issues are labelled `autofix-failed` for human
+attention. Complexity guardrails prevent runaway fixes (max 3 files,
+no cross-crate changes, no new dependencies).
+
 ## Related Documentation
 
 - [Format Coverage](format-coverage.md) - Comparison with oslo.utils format_inspector
