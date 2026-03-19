@@ -1740,6 +1740,7 @@ unsafe fn write_qcow2_header(
     reftable_offset: u64,
     reftable_clusters: u64,
     extended_l2: bool,
+    luks_header_data: Option<(&[u8], usize)>,
     output_sector_size: usize,
     output_capacity: u64,
     scratch_layout: &ScratchLayout,
@@ -1754,7 +1755,9 @@ unsafe fn write_qcow2_header(
     // backing_file_offset (8) and backing_file_size (16) = 0
     shared::write_be_u32(hdr, 20, cluster_bits);
     shared::write_be_u64(hdr, 24, virtual_size);
-    // crypt_method (32) = 0
+    // crypt_method
+    let crypt_method: u32 = if luks_header_data.is_some() { 2 } else { 0 };
+    shared::write_be_u32(hdr, 32, crypt_method);
     shared::write_be_u32(hdr, 36, l1_size);
     shared::write_be_u64(hdr, 40, l1_offset);
     shared::write_be_u64(hdr, 48, reftable_offset);
@@ -1770,6 +1773,21 @@ unsafe fn write_qcow2_header(
     // autoclear_features (88) = 0
     shared::write_be_u32(hdr, 96, qcow2::QCOW2_DEFAULT_REFCOUNT_ORDER); // refcount_order
     shared::write_be_u32(hdr, 100, qcow2::QCOW2_HEADER_LENGTH_V3); // header_length
+
+    // Write header extensions after the fixed header (offset 104)
+    if let Some((_luks_data, luks_len)) = luks_header_data {
+        let ext_start = qcow2::QCOW2_HEADER_LENGTH_V3 as usize;
+        // EXT_ENCRYPT_HEADER extension stores a pointer (offset + length)
+        // to the LUKS binary data which lives at cluster 1+ in the file.
+        shared::write_be_u32(hdr, ext_start, qcow2::EXT_ENCRYPT_HEADER);
+        shared::write_be_u32(hdr, ext_start + 4, 16); // pointer is 16 bytes
+        // LUKS data starts at cluster 1 (byte offset = cluster_size)
+        shared::write_be_u64(hdr, ext_start + 8, cluster_size);
+        shared::write_be_u64(hdr, ext_start + 16, luks_len as u64);
+        // End-of-extensions marker
+        shared::write_be_u32(hdr, ext_start + 24, 0);
+        shared::write_be_u32(hdr, ext_start + 28, 0);
+    }
 
     write_cluster_to_output(
         call_table,
@@ -1890,6 +1908,7 @@ unsafe fn write_qcow2_metadata(
     virtual_size: u64,
     data_end_offset: u64,
     refcount_array: Option<(*mut u16, usize)>,
+    luks_header_data: Option<(&[u8], usize)>,
     bytes_read: &mut u64,
     scratch_layout: &ScratchLayout,
 ) -> bool {
@@ -1995,6 +2014,7 @@ unsafe fn write_qcow2_metadata(
         reftable_offset,
         reftable_clusters,
         layout.extended_l2,
+        luks_header_data,
         oss,
         oc,
         scratch_layout,
@@ -2060,10 +2080,119 @@ unsafe fn convert_to_qcow2(
     };
     let read_chunk_q = core::cmp::min(input_cluster_size_q, layout.cluster_size);
 
+    // LUKS encrypt setup: read master key and build header if enabled
+    let mut luks_encrypt_key = [0u8; 64];
+    let mut luks_encrypt_key_len: usize = 0;
+    let mut luks_hdr_len: usize = 0;
+    let mut luks_clusters: u64 = 0;
+
+    if config.encrypt_luks_output() {
+        let key_bytes = config.luks_encrypt_key_bytes as usize;
+        let data_addr = config.luks_random_data_addr as usize;
+        let data_size = config.luks_random_data_size as usize;
+
+        if key_bytes != 32 && key_bytes != 64 {
+            (call_table.debug_print)(b"convert: invalid LUKS key size\n\0".as_ptr());
+            (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+            return *bytes_read;
+        }
+        if data_addr == 0 || data_size == 0 {
+            (call_table.debug_print)(b"convert: no LUKS random data\n\0".as_ptr());
+            (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+            return *bytes_read;
+        }
+
+        // Read random data from guest memory at LUKS_ENCRYPT_DATA_ADDR
+        let data_slice = core::slice::from_raw_parts(data_addr as *const u8, data_size);
+
+        // Extract master key for per-cluster encryption
+        luks_encrypt_key[..key_bytes].copy_from_slice(&data_slice[..key_bytes]);
+        luks_encrypt_key_len = key_bytes;
+
+        let mk_salt_offset = 64;
+        let slot_salt_offset = mk_salt_offset + 32;
+        let uuid_offset = slot_salt_offset + 32;
+        let af_offset = uuid_offset + 36;
+
+        let mk_digest_salt: &[u8; 32] =
+            data_slice[mk_salt_offset..mk_salt_offset + 32].try_into().unwrap_or(&[0u8; 32]);
+        let slot_salt: &[u8; 32] =
+            data_slice[slot_salt_offset..slot_salt_offset + 32].try_into().unwrap_or(&[0u8; 32]);
+        let uuid: &[u8; 36] =
+            data_slice[uuid_offset..uuid_offset + 36].try_into().unwrap_or(&[0u8; 36]);
+
+        let pp_len = config.passphrase_len as usize;
+        let passphrase = &config.passphrase[..pp_len];
+
+        let params = luks::LuksV1BuildParams {
+            master_key: &data_slice[..key_bytes],
+            passphrase,
+            iterations: config.luks_encrypt_iterations,
+            mk_digest_iterations: config.luks_encrypt_iterations,
+            mk_digest_salt,
+            slot_salt,
+            af_random: &data_slice[af_offset..],
+            uuid,
+            use_sha256: true,
+        };
+
+        // Build LUKS header into a fixed guest memory address
+        // (not the stack — the header + key material is ~260KB)
+        let build_buf = core::slice::from_raw_parts_mut(
+            shared::LUKS_HEADER_BUILD_ADDR as *mut u8, 262144,
+        );
+        match luks::build_v1_header(&params, build_buf) {
+            Some(len) => {
+                luks_hdr_len = len;
+                luks_clusters =
+                    (luks_hdr_len as u64 + layout.cluster_size - 1) / layout.cluster_size;
+                (call_table.verbose_print)(
+                    b"convert: built LUKS v1 header\n\0".as_ptr(),
+                );
+            }
+            None => {
+                (call_table.debug_print)(
+                    b"convert: failed to build LUKS header\n\0".as_ptr(),
+                );
+                (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+                return *bytes_read;
+            }
+        }
+    }
+
     (call_table.verbose_print)(b"convert: starting qcow2 conversion\n\0".as_ptr());
 
     // Linear cluster allocator. Cluster 0 is the header.
-    let mut next_free: u64 = 1;
+    // If LUKS, clusters 1..luks_clusters hold the LUKS header binary data.
+    let mut next_free: u64 = 1 + luks_clusters;
+
+    // Write LUKS header clusters to output (clusters 1..luks_clusters)
+    if luks_hdr_len > 0 {
+        let build_buf = shared::LUKS_HEADER_BUILD_ADDR as *const u8;
+        for c in 0..luks_clusters {
+            let offset = (1 + c) * layout.cluster_size;
+            let src_off = c as usize * layout.cluster_size as usize;
+            let src_ptr = build_buf.add(src_off) as *mut u8;
+            // Zero-pad last cluster if partial
+            let remaining = luks_hdr_len.saturating_sub(src_off);
+            if remaining < layout.cluster_size as usize {
+                core::ptr::write_bytes(
+                    src_ptr.add(remaining), 0,
+                    layout.cluster_size as usize - remaining,
+                );
+            }
+            if !write_cluster_to_output(
+                call_table, src_ptr, offset,
+                layout.cluster_size, layout.output_sector_size,
+                layout.output_capacity,
+            ) {
+                (call_table.send_complete)(
+                    b"convert\0".as_ptr(), *bytes_read, false,
+                );
+                return *bytes_read;
+            }
+        }
+    }
 
     let mut clusters_done: u64 = 0;
     let mut last_percent: u32 = 0;
@@ -2166,6 +2295,18 @@ unsafe fn convert_to_qcow2(
                 );
             }
 
+            // Encrypt data cluster if LUKS output is enabled
+            if luks_encrypt_key_len > 0 {
+                let physical_sector = data_offset / 512;
+                luks::aes_xts_encrypt(
+                    core::slice::from_raw_parts_mut(
+                        buf_data, layout.cluster_size as usize,
+                    ),
+                    &luks_encrypt_key[..luks_encrypt_key_len],
+                    physical_sector,
+                );
+            }
+
             // Write data cluster to output
             if !write_cluster_to_output(
                 call_table,
@@ -2240,12 +2381,21 @@ unsafe fn convert_to_qcow2(
 
     // -- Write metadata at end --
     let data_end_offset = next_free * layout.cluster_size;
+    let luks_hdr_opt: Option<(&[u8], usize)> = if luks_hdr_len > 0 {
+        // The actual LUKS data is already written at clusters 1..K.
+        // We just pass a dummy reference and the length for the
+        // header extension pointer.
+        Some((&[], luks_hdr_len))
+    } else {
+        None
+    };
     if !write_qcow2_metadata(
         call_table,
         &layout,
         virtual_size,
         data_end_offset,
         None,
+        luks_hdr_opt,
         bytes_read,
         scratch_layout,
     ) {
@@ -2659,6 +2809,7 @@ unsafe fn convert_to_qcow2_compressed(
         virtual_size,
         write_pos,
         Some((refcount_array, max_refcount_entries)),
+        None, // LUKS encrypt + compress is not supported
         bytes_read,
         scratch_layout,
     ) {

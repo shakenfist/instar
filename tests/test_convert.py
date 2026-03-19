@@ -4431,3 +4431,162 @@ class TestConvertExtendedL2Output(ImagoTestBase):
                 Path(raw_in.name), Path(raw_out.name)
             )
             self.assertEqual(rc, 0, f'stderr: {stderr}')
+
+
+class TestConvertLuksEncryptOutput(ImagoTestBase):
+    """Test LUKS-encrypted QCOW2 output (crypt_method=2)."""
+
+    def test_convert_luks_encrypt_raw_to_qcow2(self):
+        """Convert raw to LUKS-encrypted QCOW2, decrypt back."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_in, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw_in.name, '1M'],
+                capture_output=True
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'raw', '-c',
+                 'write -P 0x42 0 4096', raw_in.name],
+                capture_output=True
+            )
+
+            # Encrypt
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(raw_in.name), Path(qcow2.name),
+                output_format='qcow2',
+                luks_encrypt_passphrase='testpass123'
+            )
+            self.assertEqual(rc, 0, f'Encrypt failed: {stderr}')
+
+            # Decrypt back to raw
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(qcow2.name), Path(raw_out.name),
+                output_format='raw',
+                luks_passphrase='testpass123'
+            )
+            self.assertEqual(rc, 0, f'Decrypt failed: {stderr}')
+
+            # Compare
+            stdout, stderr, rc = self.run_imago_compare(
+                Path(raw_in.name), Path(raw_out.name)
+            )
+            self.assertEqual(
+                rc, 0,
+                f'Round-trip mismatch: {stderr}'
+            )
+
+    def test_convert_luks_encrypt_roundtrip(self):
+        """Encrypt with LUKS, decrypt, verify data at offsets."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_in, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw_in.name, '2M'],
+                capture_output=True
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'raw', '-c',
+                 'write -P 0xAB 0 65536', raw_in.name],
+                capture_output=True
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'raw', '-c',
+                 'write -P 0xCD 1048576 8192',
+                 raw_in.name],
+                capture_output=True
+            )
+
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(raw_in.name), Path(qcow2.name),
+                output_format='qcow2',
+                luks_encrypt_passphrase='roundtrip'
+            )
+            self.assertEqual(rc, 0, f'Encrypt failed: {stderr}')
+
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(qcow2.name), Path(raw_out.name),
+                output_format='raw',
+                luks_passphrase='roundtrip'
+            )
+            self.assertEqual(rc, 0, f'Decrypt failed: {stderr}')
+
+            stdout, stderr, rc = self.run_imago_compare(
+                Path(raw_in.name), Path(raw_out.name)
+            )
+            self.assertEqual(
+                rc, 0, f'Round-trip mismatch: {stderr}'
+            )
+
+    def test_convert_luks_encrypt_wrong_passphrase(self):
+        """Decryption with wrong passphrase should fail."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_in, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw_in.name, '1M'],
+                capture_output=True
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'raw', '-c',
+                 'write -P 0x42 0 4096', raw_in.name],
+                capture_output=True
+            )
+
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(raw_in.name), Path(qcow2.name),
+                output_format='qcow2',
+                luks_encrypt_passphrase='correctpass'
+            )
+            self.assertEqual(rc, 0, f'Encrypt failed: {stderr}')
+
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(qcow2.name), Path(raw_out.name),
+                output_format='raw',
+                luks_passphrase='wrongpass'
+            )
+            self.assertNotEqual(
+                rc, 0,
+                'Should fail with wrong passphrase'
+            )
+
+    def test_convert_luks_encrypt_compress_rejected(self):
+        """LUKS encrypt + compress should be rejected."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_in, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2:
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw_in.name, '1M'],
+                capture_output=True
+            )
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(raw_in.name), Path(qcow2.name),
+                output_format='qcow2', compress=True,
+                luks_encrypt_passphrase='test'
+            )
+            self.assertNotEqual(
+                rc, 0,
+                'Should reject LUKS encrypt + compress'
+            )
+
+    def test_convert_luks_encrypt_non_qcow2_rejected(self):
+        """LUKS encrypt with non-QCOW2 output is rejected."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_in, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw_in.name, '1M'],
+                capture_output=True
+            )
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(raw_in.name), Path(raw_out.name),
+                output_format='raw',
+                luks_encrypt_passphrase='test'
+            )
+            self.assertNotEqual(
+                rc, 0,
+                'Should reject LUKS encrypt with -O raw'
+            )

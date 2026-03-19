@@ -337,6 +337,19 @@ pub const OPERATION_CONFIG_MAX_SIZE: usize = 4096;
 /// This contains metadata about the backing chain for operations that need it.
 pub const CHAIN_CONFIG_ADDR: usize = 0x00082000;
 
+/// Address where LUKS encrypt random data is stored (set by VMM).
+/// Layout: master_key (64B) + mk_digest_salt (32B) + slot_salt (32B)
+/// + uuid (36B) + AF random stripes (key_bytes * (stripes-1)).
+/// Maximum size: 64 + 32 + 32 + 36 + 64*3999 = 255,100 bytes.
+pub const LUKS_ENCRYPT_DATA_ADDR: usize = 0x01800000;
+
+/// Address where the guest builds the LUKS v1 header output.
+/// Placed after the DMA pool (0x210000). The built header
+/// (592B header + key material, ~260KB for AES-256-XTS) is
+/// written here, then copied cluster-by-cluster to the output.
+/// Ends at ~0x250000, safely below SCRATCH_MEM_BASE (0x300000).
+pub const LUKS_HEADER_BUILD_ADDR: usize = 0x01840000;
+
 /// Maximum size of chain config in bytes
 pub const CHAIN_CONFIG_MAX_SIZE: usize = 1024;
 
@@ -1759,6 +1772,25 @@ pub struct ConvertConfig {
     /// Argon2id key derivation (LUKS v2). Set via --max-guest-memory.
     /// Offset: 360
     pub argon2_mem_size: u64,
+
+    /// PBKDF2 iteration count for LUKS output encryption.
+    /// Only used when FLAG_ENCRYPT_LUKS is set.
+    /// Offset: 368
+    pub luks_encrypt_iterations: u32,
+
+    /// Length of master key for LUKS output (32 or 64).
+    /// Offset: 372
+    pub luks_encrypt_key_bytes: u32,
+
+    /// Address in guest memory where LUKS random data is stored.
+    /// The VMM writes: master key (64 bytes) + MK digest salt (32 bytes)
+    /// + slot salt (32 bytes) + UUID (36 bytes) + AF random stripes.
+    /// Offset: 376
+    pub luks_random_data_addr: u64,
+
+    /// Total size of the LUKS random data region.
+    /// Offset: 384
+    pub luks_random_data_size: u64,
 }
 
 impl ConvertConfig {
@@ -1776,6 +1808,9 @@ impl ConvertConfig {
 
     /// Flag: Write extended L2 entries (16-byte) in QCOW2 output
     pub const FLAG_EXTENDED_L2: u32 = 1 << 3;
+
+    /// Flag: Write LUKS-encrypted QCOW2 output (crypt_method=2)
+    pub const FLAG_ENCRYPT_LUKS: u32 = 1 << 4;
 
     /// Flag: Verbose logging
     pub const FLAG_VERBOSE: u32 = 1 << 31;
@@ -1796,6 +1831,10 @@ impl ConvertConfig {
             snapshot_id: [0; CONVERT_CONFIG_MAX_SNAPSHOT_ID],
             _pad3: 0,
             argon2_mem_size: 0,
+            luks_encrypt_iterations: 0,
+            luks_encrypt_key_bytes: 0,
+            luks_random_data_addr: 0,
+            luks_random_data_size: 0,
         }
     }
 
@@ -1817,6 +1856,11 @@ impl ConvertConfig {
     /// Check if extended L2 output is enabled
     pub fn extended_l2_output(&self) -> bool {
         (self.flags & Self::FLAG_EXTENDED_L2) != 0
+    }
+
+    /// Check if LUKS-encrypted output is enabled
+    pub fn encrypt_luks_output(&self) -> bool {
+        (self.flags & Self::FLAG_ENCRYPT_LUKS) != 0
     }
 
     /// Number of input devices in the backing chain.
