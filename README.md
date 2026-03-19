@@ -613,6 +613,29 @@ fills the gap for VMDK/VHD/VHDX where qemu-img check is unavailable.
 
 See `scripts/differential-fuzz.py` for implementation details.
 
+### Coverage-Guided Fuzzing
+
+Coverage-guided fuzzing uses `cargo-fuzz` (libFuzzer) to exercise the
+parser crates directly without the VMM/KVM stack:
+
+```bash
+# Inside the imago-build container:
+cd src/fuzz
+cargo fuzz run fuzz_qcow2_header -- -max_total_time=60
+```
+
+13 fuzz targets cover all parser crates (QCOW2, VMDK, VHD, VHDX, RAW,
+LUKS) including header parsing, L1/L2 lookup, refcount traversal, and
+decompression. Seed the corpus from `imago-testdata`:
+
+```bash
+python3 scripts/extract-fuzz-corpus.py --testdata /path/to/imago-testdata
+```
+
+The CI workflow runs nightly at 04:00 UTC. Crashes are minimized and
+filed as GitHub Issues with the `security-audit` label immediately.
+See `src/fuzz/` for target implementations.
+
 ## Claude Code Integration
 
 This project includes Claude Code skills for common development tasks:

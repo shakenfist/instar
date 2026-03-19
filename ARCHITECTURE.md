@@ -437,6 +437,26 @@ configurable iteration count, seed, and timeout, uploads logs as artifacts,
 and auto-files GitHub Issues with the `security-audit` label for any
 divergences found.
 
+### Coverage-Guided Fuzzing
+
+Coverage-guided fuzzing (`src/fuzz/`) uses `cargo-fuzz` (libFuzzer) to
+exercise the `no_std` parser crates directly without the VMM/KVM stack.
+A mock `CallTable` (in `src/fuzz/src/lib.rs`) backed by thread-local
+fuzzer input provides sector-based I/O, allowing libFuzzer to explore
+deeply malformed inputs.
+
+13 fuzz targets cover all parser crates: format detection, header
+parsing (QCOW2, VMDK, VHD, VHDX, RAW, LUKS), L1/L2 cluster lookup,
+refcount table traversal, zlib decompression, grain directory lookup,
+BAT traversal, and VHDX metadata parsing.
+
+The seed corpus is extracted from `imago-testdata` by
+`scripts/extract-fuzz-corpus.py`, which filters images by format and
+generates hand-crafted minimal valid inputs. The CI workflow
+(`.github/workflows/coverage-fuzz.yml`) runs nightly at 04:00 UTC
+(1 hour per target), with PR smoke tests and manual dispatch. Crashes
+are minimized and filed as GitHub Issues immediately.
+
 ## Open Questions
 
 1. How to handle backing files in qcow2? Flatten on conversion?

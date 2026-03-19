@@ -450,3 +450,51 @@ improvements:
 - No stack guard page in guest memory (guest-only concern).
 - I/O thread silently drops `process_queue` errors via `if let`.
 - Mutex `unwrap()` could cascade if another thread panics.
+
+## Phase 6: Coverage-Guided Fuzzing (2026-03-19)
+
+### Scope
+
+Coverage-guided fuzzing of all `no_std` parser crates using
+`cargo-fuzz` (libFuzzer). 13 fuzz targets exercise format detection,
+header parsing, L1/L2 cluster lookup, refcount table traversal,
+decompression, grain directory lookup, BAT traversal, and VHDX
+metadata parsing.
+
+### Technique
+
+A mock `CallTable` backed by fuzzer input (`src/fuzz/src/lib.rs`)
+replaces the real VMM/KVM I/O layer, allowing libFuzzer to explore
+deeply malformed inputs without the full virtual machine stack. The
+seed corpus is extracted from `imago-testdata` test images plus
+hand-crafted minimal valid inputs for each format.
+
+### Targets
+
+| Target | Crate | Entry points |
+|--------|-------|-------------|
+| `fuzz_format_detect` | shared | `detect_format_from_header`, `detect_vhd_footer` |
+| `fuzz_qcow2_header` | qcow2 | `QcowHeader::parse`, `parse_header_extensions` |
+| `fuzz_qcow2_l1l2` | qcow2 | `Qcow2State::init`, `cluster_lookup` |
+| `fuzz_qcow2_refcount` | qcow2 | `lookup_refcount` |
+| `fuzz_qcow2_decompress` | qcow2 | `read_compressed_cluster` |
+| `fuzz_vmdk_header` | vmdk | `Vmdk4Header::parse`, `parse_descriptor` |
+| `fuzz_vmdk_grain` | vmdk | `VmdkState::init`, `grain_lookup` |
+| `fuzz_vhd_footer` | vhd | `VhdFooter::parse`, `VhdDynamicHeader::parse` |
+| `fuzz_vhd_bat` | vhd | `VhdState::init`, `block_lookup` |
+| `fuzz_vhdx_header` | vhdx | `VhdxHeader::parse`, `parse_region_table` |
+| `fuzz_vhdx_metadata` | vhdx | `VhdxState::init`, `block_lookup`, `parse_metadata` |
+| `fuzz_raw_partition` | raw | `detect_partition_table` |
+| `fuzz_luks_header` | luks | `parse_v1_header`, `parse_v2_keyslot`, `parse_v2_digest` |
+
+### Infrastructure
+
+- CI workflow: `.github/workflows/coverage-fuzz.yml`
+- Nightly runs: 1 hour per target at 04:00 UTC
+- Corpus seeding: `scripts/extract-fuzz-corpus.py`
+- Corpus storage: `imago-testdata/custom/fuzz-corpus/`
+- Crash reporting: automatic GitHub Issue filing with `security-audit` label
+
+### Findings
+
+*To be updated as fuzzing runs accumulate.*
