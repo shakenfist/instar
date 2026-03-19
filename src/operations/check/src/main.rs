@@ -952,26 +952,32 @@ unsafe fn check_vmdk(
                         (call_table.debug_print)(b"check: RGD extends beyond file\n\0".as_ptr());
                     }
                     Some(rgd_end_off) => {
-                        // Mark RGD grains in bitmap (should not overlap GD/GT/data)
+                        // Mark RGD grains in bitmap.  RGD metadata shares
+                        // host grains with other metadata (header, descriptor,
+                        // GD, GT) in small VMDKs, so mark without overlap
+                        // checking — same treatment as GT grains.
                         if bmp.can_track {
                             let rgd_first = rgd_byte_offset / grain_size_bytes;
                             let rgd_last = rgd_end_off.saturating_sub(1) / grain_size_bytes;
                             for g in rgd_first..=rgd_last {
-                                if matches!(bmp.set(g), BitmapSetResult::AlreadySet) {
-                                    result.corruptions += 1;
-                                    result.total_errors += 1;
-                                    (call_table.debug_print)(
-                                        b"check: RGD overlaps other data\n\0".as_ptr(),
-                                    );
-                                }
+                                bmp.set(g);
                             }
                         }
 
-                        // Compare RGD entries against primary GD entries
+                        // Cross-validate RGD against primary GD.
+                        //
+                        // GD and RGD entries are sector offsets to separate
+                        // grain table copies — they naturally differ.  The
+                        // correct check is: both must agree on allocation
+                        // state (both zero or both non-zero), and when both
+                        // are allocated the grain table *contents* must match.
                         let mut rgd_cached_sector: u64 = u64::MAX;
                         let mut rgd_cache = [0u8; MAX_SECTOR_SIZE];
-                        // Reset GD cache for a clean re-read
+                        let mut rgd_gt_cached_sector: u64 = u64::MAX;
+                        let mut rgd_gt_cache = [0u8; MAX_SECTOR_SIZE];
+                        // Reset GD/GT caches for clean re-reads
                         gd_cached_sector = u64::MAX;
+                        gt_cached_sector = u64::MAX;
 
                         for gd_idx_r in 0..num_gd_entries {
                             let primary_off = match (gd_idx_r as u64)
@@ -1012,12 +1018,105 @@ unsafe fn check_vmdk(
 
                             match (gd_val, rgd_val) {
                                 (Some(g), Some(r)) => {
-                                    if g != r {
+                                    // Both zero (unallocated) — agree
+                                    if g == 0 && r == 0 {
+                                        continue;
+                                    }
+                                    // Allocation state mismatch
+                                    if (g == 0) != (r == 0) {
                                         result.corruptions += 1;
                                         result.total_errors += 1;
                                         (call_table.debug_print)(
-                                            b"check: RGD entry mismatch\n\0".as_ptr(),
+                                            b"check: RGD alloc state mismatch\n\0".as_ptr(),
                                         );
+                                        continue;
+                                    }
+                                    // Both allocated — compare GT contents
+                                    let gd_gt_off = match (g as u64).checked_mul(512) {
+                                        Some(off) if off < actual_size => off,
+                                        _ => {
+                                            // Primary GT out of bounds (already flagged)
+                                            continue;
+                                        }
+                                    };
+                                    let rgd_gt_off = match (r as u64).checked_mul(512) {
+                                        Some(off) if off < actual_size => off,
+                                        _ => {
+                                            result.corruptions += 1;
+                                            result.total_errors += 1;
+                                            (call_table.debug_print)(
+                                                b"check: RGD GT offset out of bounds\n\0".as_ptr(),
+                                            );
+                                            continue;
+                                        }
+                                    };
+
+                                    // Mark RGD GT grains in bitmap (no overlap check)
+                                    if bmp.can_track {
+                                        let rgd_gt_end = rgd_gt_off.saturating_add(gt_size_bytes);
+                                        let first = rgd_gt_off / grain_size_bytes;
+                                        let last = rgd_gt_end.saturating_sub(1) / grain_size_bytes;
+                                        for gg in first..=last {
+                                            bmp.set(gg);
+                                        }
+                                    }
+
+                                    // Compare each GTE in the primary vs redundant GT
+                                    for gt_idx_r in 0..hdr.num_gtes_per_gt {
+                                        let p_gte_off = match (gt_idx_r as u64)
+                                            .checked_mul(4)
+                                            .and_then(|v| gd_gt_off.checked_add(v))
+                                        {
+                                            Some(off) => off,
+                                            None => break,
+                                        };
+                                        let r_gte_off = match (gt_idx_r as u64)
+                                            .checked_mul(4)
+                                            .and_then(|v| rgd_gt_off.checked_add(v))
+                                        {
+                                            Some(off) => off,
+                                            None => break,
+                                        };
+
+                                        let p_gte = vmdk::read_u32_le_cached(
+                                            call_table,
+                                            0,
+                                            p_gte_off,
+                                            sector_size,
+                                            input_capacity,
+                                            &mut gt_cached_sector,
+                                            gt_cache.as_mut_ptr(),
+                                            &mut bytes_read,
+                                        );
+                                        let r_gte = vmdk::read_u32_le_cached(
+                                            call_table,
+                                            0,
+                                            r_gte_off,
+                                            sector_size,
+                                            input_capacity,
+                                            &mut rgd_gt_cached_sector,
+                                            rgd_gt_cache.as_mut_ptr(),
+                                            &mut bytes_read,
+                                        );
+
+                                        match (p_gte, r_gte) {
+                                            (Some(pv), Some(rv)) if pv != rv => {
+                                                result.corruptions += 1;
+                                                result.total_errors += 1;
+                                                (call_table.debug_print)(
+                                                    b"check: RGD GT entry mismatch\n\0".as_ptr(),
+                                                );
+                                            }
+                                            (None, _) | (_, None) => {
+                                                result.corruptions += 1;
+                                                result.total_errors += 1;
+                                                (call_table.debug_print)(
+                                                    b"check: RGD GT read error\n\0".as_ptr(),
+                                                );
+                                                break;
+                                            }
+                                            _ => {}
+                                        }
                                     }
                                 }
                                 _ => {
@@ -2350,13 +2449,10 @@ unsafe fn check_qcow2(
             // start mid-sector.  Track the byte offset within the
             // sector buffer.
             let l2_base_sector = l2_offset / sector_size as u64;
-            let l2_offset_in_sector =
-                (l2_offset % sector_size as u64) as usize;
+            let l2_offset_in_sector = (l2_offset % sector_size as u64) as usize;
             let l2_end = l2_offset + cluster_size;
-            let l2_last_sector =
-                (l2_end.saturating_sub(1)) / sector_size as u64;
-            let l2_sectors_to_read =
-                (l2_last_sector - l2_base_sector + 1) as usize;
+            let l2_last_sector = (l2_end.saturating_sub(1)) / sector_size as u64;
+            let l2_sectors_to_read = (l2_last_sector - l2_base_sector + 1) as usize;
             let mut l2_buffer = [0u8; MAX_SECTOR_SIZE];
             let mut l2_entries_remaining = l2_entries_per_cluster;
             let mut l2_buf_start = l2_offset_in_sector;
@@ -2382,16 +2478,12 @@ unsafe fn check_qcow2(
                 }
                 bytes_read += sector_size as u64;
 
-                let usable_bytes =
-                    (sector_size - l2_buf_start) as u64;
-                let entries_this_sector = core::cmp::min(
-                    l2_entries_remaining,
-                    usable_bytes / l2_entry_size,
-                );
+                let usable_bytes = (sector_size - l2_buf_start) as u64;
+                let entries_this_sector =
+                    core::cmp::min(l2_entries_remaining, usable_bytes / l2_entry_size);
 
                 for j in 0..entries_this_sector as usize {
-                    let off =
-                        l2_buf_start + j * l2_entry_size as usize;
+                    let off = l2_buf_start + j * l2_entry_size as usize;
                     let l2e = u64::from_be_bytes([
                         l2_buffer[off],
                         l2_buffer[off + 1],
@@ -2670,12 +2762,9 @@ unsafe fn check_qcow2(
                 // may start mid-sector. We must offset reads within
                 // the buffer to the block's actual position.
                 let refblock_base_sector = refblock_off / sector_size as u64;
-                let refblock_offset_in_sector =
-                    (refblock_off % sector_size as u64) as usize;
+                let refblock_offset_in_sector = (refblock_off % sector_size as u64) as usize;
                 let refblock_end_in_file = refblock_off + cluster_size;
-                let last_sector = (refblock_end_in_file
-                    .saturating_sub(1))
-                    / sector_size as u64;
+                let last_sector = (refblock_end_in_file.saturating_sub(1)) / sector_size as u64;
                 let sectors_to_read = (last_sector - refblock_base_sector + 1) as usize;
                 let mut entries_remaining = entries_per_block;
 
@@ -2702,10 +2791,8 @@ unsafe fn check_qcow2(
                     // How many usable refcount bytes are in this
                     // sector, starting from buf_start?
                     let usable_bytes = sector_size - buf_start;
-                    let entries_this_sector =
-                        (usable_bytes as u64 * 8) / refcount_bits as u64;
-                    let entries_this =
-                        core::cmp::min(entries_remaining, entries_this_sector);
+                    let entries_this_sector = (usable_bytes as u64 * 8) / refcount_bits as u64;
+                    let entries_this = core::cmp::min(entries_remaining, entries_this_sector);
 
                     for e in 0..entries_this as usize {
                         let rc = read_refcount_from_buffer_at(
@@ -2716,8 +2803,7 @@ unsafe fn check_qcow2(
                         );
 
                         if rc > 0 {
-                            let global_entry =
-                                entries_per_block - entries_remaining + e as u64;
+                            let global_entry = entries_per_block - entries_remaining + e as u64;
                             let cidx = match rt_idx
                                 .checked_mul(entries_per_block)
                                 .and_then(|v| v.checked_add(global_entry))
@@ -2962,10 +3048,8 @@ fn read_refcount_from_buffer_at(
     match refcount_bits {
         1 | 2 | 4 => {
             let entries_per_byte = 8 / refcount_bits as usize;
-            let byte_idx =
-                base_offset + entry_index / entries_per_byte;
-            let bit_pos = (entry_index % entries_per_byte)
-                * refcount_bits as usize;
+            let byte_idx = base_offset + entry_index / entries_per_byte;
+            let bit_pos = (entry_index % entries_per_byte) * refcount_bits as usize;
             let mask = (1u64 << refcount_bits) - 1;
             (buf[byte_idx] as u64 >> bit_pos) & mask
         }
@@ -2976,12 +3060,7 @@ fn read_refcount_from_buffer_at(
         }
         32 => {
             let off = base_offset + entry_index * 4;
-            u32::from_be_bytes([
-                buf[off],
-                buf[off + 1],
-                buf[off + 2],
-                buf[off + 3],
-            ]) as u64
+            u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as u64
         }
         64 => {
             let off = base_offset + entry_index * 8;

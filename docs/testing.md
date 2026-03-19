@@ -367,8 +367,25 @@ For each iteration the fuzzer:
    output, and converted file content (SHA-256 of raw-flattened output).
 
 Known quirks (see [quirks.md](quirks.md)) are excluded from comparison:
-non-QCOW2 formats for `check`, disk size fields, and format-specific
-metadata.
+disk size fields and format-specific metadata.
+
+### libyal cross-validation
+
+When libyal tools are installed in the environment (`libvmdk-utils`,
+`libvhdi-utils`, `libqcow-utils`), the fuzzer adds two additional
+comparison layers:
+
+1. **Info cross-check**: Parsed fields from `vmdkinfo`, `vhdiinfo`,
+   and `qcowinfo` (virtual size, format version, cluster size, etc.)
+   are compared against imago's JSON output for the same image.
+2. **Parse-success consistency**: For each format, if the libyal tool
+   successfully parses the image, imago check should report no errors
+   (and vice versa). Disagreements are flagged as divergences.
+
+This closes the gap where VMDK/VHD/VHDX had no differential reference
+for `check` validation (qemu-img check only supports QCOW2), and
+provides a third independent opinion for QCOW2. libyal tools are
+optional — the fuzzer degrades gracefully when they are unavailable.
 
 ### Running locally
 

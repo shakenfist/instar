@@ -5,8 +5,13 @@ FROM mcr.microsoft.com/devcontainers/base:debian
 # - protobuf-compiler: required for micropb-gen
 # - python3, python3-pip, python3-venv: for running integration tests
 # - qemu-utils: provides qemu-img and qemu-io for compare/convert tests
+# - libqcow-utils, libvhdi-utils, libvmdk-utils: libyal forensic parsers
+#   for differential fuzzing (independent QCOW2/VHD/VHDX/VMDK reference)
 # - wget: for downloading gh CLI keyring
 RUN apt-get update && apt-get install -y \
+    libqcow-utils \
+    libvhdi-utils \
+    libvmdk-utils \
     protobuf-compiler \
     python3 \
     python3-pip \
