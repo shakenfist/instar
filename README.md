@@ -202,6 +202,12 @@ imago convert -O qcow2 --cluster-size 2097152 input.raw output.qcow2
 # Write QCOW2 output with extended L2 entries (16-byte entries with subcluster bitmaps)
 imago convert -O qcow2 --extended-l2 input.raw output.qcow2
 
+# Write LUKS-encrypted QCOW2 output (AES-256-XTS, crypt_method=2)
+imago convert -O qcow2 --luks-encrypt-passphrase 'secret' input.raw encrypted.qcow2
+
+# Decrypt LUKS-encrypted QCOW2 back to raw
+imago convert --luks-passphrase 'secret' encrypted.qcow2 output.raw
+
 # Convert to VHD dynamic format
 imago convert -O vpc input.qcow2 output.vhd
 

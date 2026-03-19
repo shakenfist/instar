@@ -381,7 +381,13 @@ tables, and optionally compressed clusters.
   L2 table (requiring more L1 entries) and sets `incompatible_features`
   bit 4 in the output header. Written data clusters are marked fully
   allocated (`EXTENDED_L2_BITMAP_ALL_ALLOC`); compressed clusters use
-  a zero bitmap per the QCOW2 spec.
+  a zero bitmap per the QCOW2 spec. The `--luks-encrypt-passphrase`
+  flag enables LUKS-encrypted output (crypt_method=2). The VMM generates
+  random key material and passes it to the guest at a dedicated memory
+  region. The guest builds a LUKS v1 header (PBKDF2 + AFsplitter +
+  AES-XTS key wrapping), writes it to clusters 1-K, encrypts each data
+  cluster with AES-XTS, and stores an EXT_ENCRYPT_HEADER extension
+  pointer in the QCOW2 header.
 
 - The `bump_allocator!()` macro provides heap allocation for compression
   (miniz_oxide) and ZSTD decompression (ruzstd). The heap is reset

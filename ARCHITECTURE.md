@@ -284,6 +284,8 @@ QEMU Copy-On-Write version 2/3. Supported features:
 - External data files (metadata/data separation, chain discovery with allowlist)
 - Legacy AES-128-CBC encryption (crypt_method=1) decryption via `--qcow2-password`
 - LUKS-in-QCOW2 encryption (crypt_method=2) decryption via `--luks-passphrase`
+- LUKS-encrypted output (crypt_method=2) via `--luks-encrypt-passphrase`
+  (AES-256-XTS with PBKDF2-SHA256 key derivation, LUKS v1 headers)
 - Snapshot table parsing, detection, and extraction via `--snapshot`
 
 ### raw
