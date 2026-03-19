@@ -255,3 +255,196 @@ unsafe extern "C" fn mock_send_info_result_luks(
 unsafe extern "C" fn mock_send_check_result(_result: *const shared::CheckResult) {}
 
 unsafe extern "C" fn mock_send_compare_result(_result: *const shared::CompareResult) {}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- extract_fuzz_offset --
+
+    #[test]
+    fn extract_fuzz_offset_too_short() {
+        assert_eq!(extract_fuzz_offset(&[0u8; 519]), None);
+        assert_eq!(extract_fuzz_offset(&[]), None);
+    }
+
+    #[test]
+    fn extract_fuzz_offset_exact_size() {
+        let mut data = vec![0u8; 520];
+        data[512..520].copy_from_slice(&42u64.to_le_bytes());
+        assert_eq!(extract_fuzz_offset(&data), Some(42));
+    }
+
+    #[test]
+    fn extract_fuzz_offset_large_value() {
+        let mut data = vec![0u8; 1024];
+        data[512..520].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(extract_fuzz_offset(&data), Some(u64::MAX));
+    }
+
+    // -- set_fuzz_input / input_capacity / input_size_bytes --
+
+    #[test]
+    fn empty_input() {
+        set_fuzz_input(&[]);
+        assert_eq!(input_capacity(), 0);
+        assert_eq!(input_size_bytes(), 0);
+    }
+
+    #[test]
+    fn input_one_byte() {
+        set_fuzz_input(&[0xAA]);
+        assert_eq!(input_capacity(), 1); // rounds up to 1 sector
+        assert_eq!(input_size_bytes(), 1);
+    }
+
+    #[test]
+    fn input_exact_sector() {
+        set_fuzz_input(&[0u8; 512]);
+        assert_eq!(input_capacity(), 1);
+        assert_eq!(input_size_bytes(), 512);
+    }
+
+    #[test]
+    fn input_sector_plus_one() {
+        set_fuzz_input(&[0u8; 513]);
+        assert_eq!(input_capacity(), 2);
+        assert_eq!(input_size_bytes(), 513);
+    }
+
+    #[test]
+    fn input_replaces_previous() {
+        set_fuzz_input(&[0u8; 1024]);
+        assert_eq!(input_capacity(), 2);
+        set_fuzz_input(&[0u8; 512]);
+        assert_eq!(input_capacity(), 1);
+    }
+
+    // -- build_call_table --
+
+    #[test]
+    fn call_table_has_correct_magic_and_version() {
+        let ct = build_call_table();
+        assert_eq!(ct.magic, shared::CallTable::MAGIC);
+        assert_eq!(ct.version, shared::CallTable::VERSION);
+    }
+
+    // -- mock_read_input_sector --
+
+    /// Helper: read a sector via the mock and return (success, buffer).
+    fn read_sector(sector: u64, len: usize) -> (bool, Vec<u8>) {
+        let mut buf = vec![0xFFu8; len];
+        let ok = unsafe {
+            mock_read_input_sector(0, sector, buf.as_mut_ptr(), len)
+        };
+        (ok, buf)
+    }
+
+    #[test]
+    fn read_sector_within_bounds() {
+        let data: Vec<u8> = (0..512).map(|i| (i & 0xFF) as u8).collect();
+        set_fuzz_input(&data);
+
+        let (ok, buf) = read_sector(0, 512);
+        assert!(ok);
+        assert_eq!(buf, data);
+    }
+
+    #[test]
+    fn read_sector_beyond_eof_returns_false() {
+        set_fuzz_input(&[0u8; 512]);
+
+        let (ok, buf) = read_sector(1, 512);
+        assert!(!ok);
+        assert!(buf.iter().all(|&b| b == 0), "out-of-bounds read should zero-fill");
+    }
+
+    #[test]
+    fn read_partial_last_sector_zero_pads() {
+        // 600 bytes = 1 full sector + 88 bytes into second sector
+        let mut data = vec![0u8; 600];
+        data[512..600].fill(0xAB);
+        set_fuzz_input(&data);
+
+        // Sector 1 starts at byte 512. Only 88 bytes available,
+        // rest should be zero-padded. Returns true (sector starts
+        // within bounds).
+        let (ok, buf) = read_sector(1, 512);
+        assert!(ok);
+        assert_eq!(&buf[..88], &[0xAB; 88]);
+        assert!(buf[88..].iter().all(|&b| b == 0), "remainder should be zero");
+    }
+
+    #[test]
+    fn read_empty_input_returns_false() {
+        set_fuzz_input(&[]);
+
+        let (ok, buf) = read_sector(0, 512);
+        assert!(!ok);
+        assert!(buf.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn read_very_large_sector_number_returns_false() {
+        set_fuzz_input(&[0u8; 512]);
+
+        let (ok, buf) = read_sector(u64::MAX, 512);
+        assert!(!ok);
+        assert!(buf.iter().all(|&b| b == 0));
+    }
+
+    // -- mock_get_input_capacity / mock_get_input_sector_size --
+
+    #[test]
+    fn mock_capacity_matches_public_fn() {
+        set_fuzz_input(&[0u8; 1500]);
+        let expected = input_capacity();
+        let got = unsafe { mock_get_input_capacity(0) };
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn mock_sector_size_is_512() {
+        let got = unsafe { mock_get_input_sector_size(0) };
+        assert_eq!(got, 512);
+    }
+
+    // -- mock_get_input_device_count --
+
+    #[test]
+    fn device_count_is_one() {
+        let got = unsafe { mock_get_input_device_count() };
+        assert_eq!(got, 1);
+    }
+
+    // -- mock_write_output_sector --
+
+    #[test]
+    fn write_output_always_succeeds() {
+        let buf = [0u8; 512];
+        let ok = unsafe {
+            mock_write_output_sector(0, buf.as_ptr(), buf.len())
+        };
+        assert!(ok);
+    }
+
+    // -- config mocks return empty --
+
+    #[test]
+    fn operation_config_is_empty() {
+        let cfg = unsafe { mock_get_operation_config() };
+        assert!(cfg.ptr.is_null());
+        assert_eq!(cfg.len, 0);
+    }
+
+    #[test]
+    fn chain_config_is_empty() {
+        let cfg = unsafe { mock_get_chain_config() };
+        assert!(cfg.ptr.is_null());
+        assert_eq!(cfg.len, 0);
+    }
+}
