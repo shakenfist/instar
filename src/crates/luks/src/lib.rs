@@ -560,14 +560,14 @@ pub fn copy_null_padded(src: &[u8], dst: &mut [u8]) {
 
 // ─── AFsplitter ─────────────────────────────────────────────────────
 
-#[cfg(feature = "decrypt")]
+#[cfg(any(feature = "decrypt", feature = "encrypt"))]
 use sha1::Sha1;
 
-#[cfg(any(feature = "decrypt", feature = "kdf-argon2"))]
+#[cfg(any(feature = "decrypt", feature = "encrypt", feature = "kdf-argon2"))]
 use sha2::{Digest, Sha256};
 
 /// AFsplitter diffuse function using SHA-1 (for LUKS v1 with sha1 hash).
-#[cfg(feature = "decrypt")]
+#[cfg(any(feature = "decrypt", feature = "encrypt"))]
 pub fn af_diffuse_sha1(data: &mut [u8], key_bytes: usize) {
     let digest_size = 20;
     let full_blocks = key_bytes / digest_size;
@@ -594,7 +594,7 @@ pub fn af_diffuse_sha1(data: &mut [u8], key_bytes: usize) {
 }
 
 /// AFsplitter diffuse function using SHA-256 (for LUKS v2 or v1 with sha256 hash).
-#[cfg(any(feature = "decrypt", feature = "kdf-argon2"))]
+#[cfg(any(feature = "decrypt", feature = "encrypt", feature = "kdf-argon2"))]
 pub fn af_diffuse_sha256(data: &mut [u8], key_bytes: usize) {
     let digest_size = 32;
     let full_blocks = key_bytes / digest_size;
@@ -625,7 +625,7 @@ pub fn af_diffuse_sha256(data: &mut [u8], key_bytes: usize) {
 /// `km_buf` contains `stripes * key_bytes` bytes of decrypted key material.
 /// `out_key` receives the merged master key (must be >= `key_bytes`).
 /// `use_sha256` selects SHA-256 diffuse (true) vs SHA-1 diffuse (false).
-#[cfg(feature = "decrypt")]
+#[cfg(any(feature = "decrypt", feature = "encrypt"))]
 pub fn af_merge(
     km_buf: &[u8],
     key_bytes: usize,
@@ -649,17 +649,65 @@ pub fn af_merge(
     }
 }
 
+/// AFsplitter split: distribute a master key across striped key material.
+///
+/// This is the inverse of `af_merge`. Given `master_key` (key_bytes)
+/// and `km_buf` pre-filled with random data in stripes 0..stripes-2,
+/// this function computes the final stripe so that
+/// `af_merge(km_buf, key_bytes, stripes, use_sha256, out)` recovers
+/// `master_key`.
+///
+/// `km_buf` must be `stripes * key_bytes` bytes. Stripes 0 through
+/// stripes-2 must be pre-filled with random data by the caller.
+/// The final stripe (at offset `(stripes-1) * key_bytes`) is computed
+/// by this function.
+#[cfg(feature = "encrypt")]
+pub fn af_split(
+    master_key: &[u8],
+    key_bytes: usize,
+    stripes: usize,
+    use_sha256: bool,
+    km_buf: &mut [u8],
+) {
+    // Replay the merge accumulation on stripes 0..stripes-2
+    let mut accum = [0u8; 64];
+    accum[..key_bytes].copy_from_slice(&km_buf[..key_bytes]);
+
+    for i in 1..stripes - 1 {
+        if use_sha256 {
+            af_diffuse_sha256(&mut accum[..key_bytes], key_bytes);
+        } else {
+            af_diffuse_sha1(&mut accum[..key_bytes], key_bytes);
+        }
+        let stripe_offset = i * key_bytes;
+        for j in 0..key_bytes {
+            accum[j] ^= km_buf[stripe_offset + j];
+        }
+    }
+
+    // One more diffuse, then XOR with master key to get final stripe
+    if use_sha256 {
+        af_diffuse_sha256(&mut accum[..key_bytes], key_bytes);
+    } else {
+        af_diffuse_sha1(&mut accum[..key_bytes], key_bytes);
+    }
+    let last_offset = (stripes - 1) * key_bytes;
+    for j in 0..key_bytes {
+        km_buf[last_offset + j] = accum[j] ^ master_key[j];
+    }
+}
+
 // ─── Key derivation ─────────────────────────────────────────────────
 
-#[cfg(feature = "decrypt")]
+#[cfg(any(feature = "decrypt", feature = "encrypt"))]
 use aes::cipher::generic_array::GenericArray;
-#[cfg(feature = "decrypt")]
+#[cfg(any(feature = "decrypt", feature = "encrypt"))]
 use aes::cipher::KeyInit;
-#[cfg(feature = "decrypt")]
+#[cfg(any(feature = "decrypt", feature = "encrypt"))]
 use aes::{Aes128, Aes256};
-#[cfg(feature = "decrypt")]
+#[cfg(any(feature = "decrypt", feature = "encrypt"))]
 use hmac::Hmac;
-#[cfg(feature = "decrypt")]
+#[cfg(any(feature = "decrypt", feature = "encrypt"))]
 use pbkdf2::pbkdf2;
 
 /// AES-XTS decrypt a buffer in place.
@@ -682,8 +730,29 @@ pub fn aes_xts_decrypt(buf: &mut [u8], key: &[u8], start_sector: u64) {
     }
 }
 
+/// AES-XTS encrypt a buffer in place.
+///
+/// Splits the key in half: first half = data key, second = tweak key.
+/// Uses 512-byte sectors starting at the given sector index.
+/// This is the inverse of `aes_xts_decrypt`.
+#[cfg(feature = "encrypt")]
+pub fn aes_xts_encrypt(buf: &mut [u8], key: &[u8], start_sector: u64) {
+    let half = key.len() / 2;
+    if half == 16 {
+        let c1 = Aes128::new(GenericArray::from_slice(&key[..16]));
+        let c2 = Aes128::new(GenericArray::from_slice(&key[16..32]));
+        let xts = xts_mode::Xts128::new(c1, c2);
+        xts.encrypt_area(buf, 512, start_sector as u128, xts_mode::get_tweak_default);
+    } else if half == 32 {
+        let c1 = Aes256::new(GenericArray::from_slice(&key[..32]));
+        let c2 = Aes256::new(GenericArray::from_slice(&key[32..64]));
+        let xts = xts_mode::Xts128::new(c1, c2);
+        xts.encrypt_area(buf, 512, start_sector as u128, xts_mode::get_tweak_default);
+    }
+}
+
 /// PBKDF2 key derivation with SHA-256 or SHA-1.
-#[cfg(feature = "decrypt")]
+#[cfg(any(feature = "decrypt", feature = "encrypt"))]
 pub fn pbkdf2_derive(
     passphrase: &[u8],
     salt: &[u8],
