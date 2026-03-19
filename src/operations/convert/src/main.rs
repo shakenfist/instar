@@ -1739,6 +1739,7 @@ unsafe fn write_qcow2_header(
     l1_offset: u64,
     reftable_offset: u64,
     reftable_clusters: u64,
+    extended_l2: bool,
     output_sector_size: usize,
     output_capacity: u64,
     scratch_layout: &ScratchLayout,
@@ -1759,7 +1760,12 @@ unsafe fn write_qcow2_header(
     shared::write_be_u64(hdr, 48, reftable_offset);
     shared::write_be_u32(hdr, 56, reftable_clusters as u32);
     // nb_snapshots (60) = 0, snapshots_offset (64) = 0
-    // incompatible_features (72) = 0
+    let incompat_features: u64 = if extended_l2 {
+        qcow2::INCOMPAT_EXTENDED_L2 as u64
+    } else {
+        0
+    };
+    shared::write_be_u64(hdr, 72, incompat_features);
     // compatible_features (80) = 0
     // autoclear_features (88) = 0
     shared::write_be_u32(hdr, 96, qcow2::QCOW2_DEFAULT_REFCOUNT_ORDER); // refcount_order
@@ -1779,6 +1785,12 @@ unsafe fn write_qcow2_header(
 // Shared QCOW2 output helpers
 // ================================================================
 
+/// Extended L2 bitmap for a fully-allocated, non-zero cluster:
+/// all 32 subclusters allocated (bits 0-31 = 1), none zero
+/// (bits 32-63 = 0). Used when writing data clusters with
+/// --extended-l2.
+const EXTENDED_L2_BITMAP_ALL_ALLOC: u64 = 0x00000000_FFFFFFFFu64;
+
 /// Computed layout parameters for QCOW2 output. Used by both
 /// uncompressed and compressed paths to avoid duplicating the
 /// initialization logic.
@@ -1786,6 +1798,10 @@ struct Qcow2OutputLayout {
     cluster_bits: u32,
     cluster_size: u64,
     entries_per_l2: u32,
+    /// Bytes per L2 entry: 8 for standard, 16 for extended L2.
+    l2_entry_size: u32,
+    /// Whether to write extended L2 entries with subcluster bitmaps.
+    extended_l2: bool,
     l1_size: u32,
     l1_buf: *mut u8,
     l1_clusters: u64,
@@ -1814,7 +1830,9 @@ unsafe fn init_qcow2_output_layout(
 
     let cluster_bits = config.output_cluster_bits();
     let cluster_size = 1u64 << cluster_bits;
-    let entries_per_l2 = (cluster_size / 8) as u32;
+    let extended_l2 = config.extended_l2_output();
+    let l2_entry_size: u32 = if extended_l2 { 16 } else { 8 };
+    let entries_per_l2 = (cluster_size / l2_entry_size as u64) as u32;
     let l2_coverage = cluster_size * entries_per_l2 as u64;
     let l1_size = ((virtual_size + l2_coverage - 1) / l2_coverage) as u32;
 
@@ -1839,6 +1857,8 @@ unsafe fn init_qcow2_output_layout(
         cluster_bits,
         cluster_size,
         entries_per_l2,
+        l2_entry_size,
+        extended_l2,
         l1_size,
         l1_buf,
         l1_clusters,
@@ -1974,6 +1994,7 @@ unsafe fn write_qcow2_metadata(
         l1_offset,
         reftable_offset,
         reftable_clusters,
+        layout.extended_l2,
         oss,
         oc,
         scratch_layout,
@@ -2168,7 +2189,13 @@ unsafe fn convert_to_qcow2(
             // OFLAG_COPIED (bit 63) must be set when refcount=1
             let l2_entry_idx = (vc - first_vc) as usize;
             let l2_slice = core::slice::from_raw_parts_mut(buf_l2, layout.cluster_size as usize);
-            shared::write_be_u64(l2_slice, l2_entry_idx * 8, data_offset | (1u64 << 63));
+            let entry_byte = l2_entry_idx * layout.l2_entry_size as usize;
+            shared::write_be_u64(l2_slice, entry_byte, data_offset | (1u64 << 63));
+            if layout.extended_l2 {
+                shared::write_be_u64(
+                    l2_slice, entry_byte + 8, EXTENDED_L2_BITMAP_ALL_ALLOC,
+                );
+            }
 
             clusters_done += 1;
             let pct = (clusters_done * 100 / layout.total_virtual_clusters) as u32;
@@ -2517,7 +2544,11 @@ unsafe fn convert_to_qcow2_compressed(
                     compressed_len as u64,
                     layout.cluster_bits,
                 );
-                shared::write_be_u64(l2_slice, l2_entry_idx * 8, l2_entry);
+                let entry_byte = l2_entry_idx * layout.l2_entry_size as usize;
+                shared::write_be_u64(l2_slice, entry_byte, l2_entry);
+                // Extended L2: compressed clusters must have bitmap = 0
+                // (QCOW2 spec: subcluster bitmaps are reserved for
+                // compressed clusters)
 
                 // Track refcounts for touched host clusters
                 let first_host = write_pos / layout.cluster_size;
@@ -2551,7 +2582,13 @@ unsafe fn convert_to_qcow2_compressed(
                 }
 
                 // Standard L2 entry with OFLAG_COPIED
-                shared::write_be_u64(l2_slice, l2_entry_idx * 8, write_pos | (1u64 << 63));
+                let entry_byte = l2_entry_idx * layout.l2_entry_size as usize;
+                shared::write_be_u64(l2_slice, entry_byte, write_pos | (1u64 << 63));
+                if layout.extended_l2 {
+                    shared::write_be_u64(
+                        l2_slice, entry_byte + 8, EXTENDED_L2_BITMAP_ALL_ALLOC,
+                    );
+                }
 
                 inc_refcount(
                     refcount_array,

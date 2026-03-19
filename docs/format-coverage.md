@@ -92,12 +92,16 @@ The `imago convert` operation supports writing output in the following formats:
   (crypt_method=2) via `--luks-passphrase`, matching the
   convert operation. This allows comparing encrypted QCOW2
   images directly against their decrypted equivalents.
-- Extended L2 images with subclusters are fully supported.
-  The 16-byte L2 entry bitmap is parsed to determine
-  per-subcluster state: Normal subclusters read host data,
-  Zero subclusters are zeroed, and Unallocated subclusters
-  preserve backing data or read as zeros if no backing
-  image is present.
+- Extended L2 images with subclusters are fully supported
+  for both input and output. The 16-byte L2 entry bitmap is
+  parsed to determine per-subcluster state: Normal subclusters
+  read host data, Zero subclusters are zeroed, and Unallocated
+  subclusters preserve backing data or read as zeros if no
+  backing image is present. QCOW2 output with `--extended-l2`
+  writes 16-byte L2 entries with `incompatible_features` bit 4
+  set. Written data clusters are marked fully allocated
+  (alloc_bits=0xFFFFFFFF). Works with both uncompressed and
+  compressed output.
 
 ---
 

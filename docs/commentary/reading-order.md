@@ -376,6 +376,12 @@ tables, and optionally compressed clusters.
   each L2 entry gets OFLAG_COPIED set (meaning refcount is exactly 1),
   and refcount metadata sizing uses iterative convergence because the
   refcount tables themselves consume clusters that need refcounting.
+  The `--extended-l2` flag switches from 8-byte to 16-byte L2 entries
+  with subcluster allocation/zero bitmaps. This halves the entries per
+  L2 table (requiring more L1 entries) and sets `incompatible_features`
+  bit 4 in the output header. Written data clusters are marked fully
+  allocated (`EXTENDED_L2_BITMAP_ALL_ALLOC`); compressed clusters use
+  a zero bitmap per the QCOW2 spec.
 
 - The `bump_allocator!()` macro provides heap allocation for compression
   (miniz_oxide) and ZSTD decompression (ruzstd). The heap is reset

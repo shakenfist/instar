@@ -199,6 +199,9 @@ imago convert --no-skip-zeros input.qcow2 output.raw
 imago convert -O qcow2 --cluster-size 4096 input.raw output.qcow2
 imago convert -O qcow2 --cluster-size 2097152 input.raw output.qcow2
 
+# Write QCOW2 output with extended L2 entries (16-byte entries with subcluster bitmaps)
+imago convert -O qcow2 --extended-l2 input.raw output.qcow2
+
 # Convert to VHD dynamic format
 imago convert -O vpc input.qcow2 output.vhd
 

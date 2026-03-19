@@ -107,6 +107,7 @@ const CONVERT_CONFIG_FLAG_SKIP_ZEROS: u32 = 1 << 0;
 const CONVERT_CONFIG_FLAG_COMPRESS: u32 = 1 << 1;
 #[allow(dead_code)]
 const CONVERT_CONFIG_FLAG_DECRYPT_AES: u32 = 1 << 2;
+const CONVERT_CONFIG_FLAG_EXTENDED_L2: u32 = 1 << 3;
 #[allow(dead_code)]
 const CONVERT_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
 
@@ -2235,6 +2236,10 @@ struct ConvertArgs {
     #[arg(long, value_name = "PATH", conflicts_with = "luks_passphrase")]
     luks_passphrase_file: Option<String>,
 
+    /// Write extended L2 entries (16-byte with subcluster bitmaps) in QCOW2 output
+    #[arg(long)]
+    extended_l2: bool,
+
     /// Extract a specific snapshot (by ID or name) instead of the active image
     #[arg(long, value_name = "ID")]
     snapshot: Option<String>,
@@ -4221,6 +4226,11 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
             .into());
     }
 
+    // Validate --extended-l2 requires -O qcow2
+    if args.extended_l2 && !is_qcow2_output {
+        return Err("--extended-l2 is only supported with QCOW2 (-O qcow2) output".into());
+    }
+
     // Auto-discover binaries
     let core_path = get_binary_path("core.bin");
     let operation_path = get_binary_path("convert.bin");
@@ -4421,6 +4431,9 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     }
     if verbose {
         convert_flags |= CONVERT_CONFIG_FLAG_VERBOSE;
+    }
+    if args.extended_l2 {
+        convert_flags |= CONVERT_CONFIG_FLAG_EXTENDED_L2;
     }
     let output_cluster_bits: u32 = if is_qcow2_output {
         args.cluster_size.trailing_zeros()

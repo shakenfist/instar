@@ -517,6 +517,7 @@ class ImagoTestBase(testtools.TestCase):
         skip_zeros: bool = None,
         cluster_size: int = None,
         compress: bool = False,
+        extended_l2: bool = False,
         qcow2_password: str = None,
         luks_passphrase: str = None,
         snapshot: str = None,
@@ -555,6 +556,8 @@ class ImagoTestBase(testtools.TestCase):
             cmd.extend(['--cluster-size', str(cluster_size)])
         if compress:
             cmd.append('--compress')
+        if extended_l2:
+            cmd.append('--extended-l2')
         if qcow2_password is not None:
             cmd.extend(['--qcow2-password', qcow2_password])
         if luks_passphrase is not None:

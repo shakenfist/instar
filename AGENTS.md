@@ -207,7 +207,8 @@ make clean-tests
   including compressed output, encrypted QCOW2 decryption,
   LUKS-in-QCOW2 decryption, native LUKS v1/v2 decryption,
   LUKS v2 with Argon2id KDF and --max-guest-memory,
-  LUKS-wrapping-QCOW2 conversion, snapshot extraction)
+  LUKS-wrapping-QCOW2 conversion, snapshot extraction,
+  extended L2 output with `--extended-l2`)
 - `tests/test_adversarial.py` - Adversarial image tests: compression bombs, circular
   backing chains, deep chains, integer overflow triggers, refcount order edges,
   oversized virtual sizes, VMDK grain size boundaries, VHDX conflicting dual

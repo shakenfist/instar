@@ -1774,6 +1774,9 @@ impl ConvertConfig {
     /// Flag: Decrypt AES-encrypted QCOW2 input
     pub const FLAG_DECRYPT_AES: u32 = 1 << 2;
 
+    /// Flag: Write extended L2 entries (16-byte) in QCOW2 output
+    pub const FLAG_EXTENDED_L2: u32 = 1 << 3;
+
     /// Flag: Verbose logging
     pub const FLAG_VERBOSE: u32 = 1 << 31;
 
@@ -1809,6 +1812,11 @@ impl ConvertConfig {
     /// Check if compression is enabled
     pub fn should_compress(&self) -> bool {
         (self.flags & Self::FLAG_COMPRESS) != 0
+    }
+
+    /// Check if extended L2 output is enabled
+    pub fn extended_l2_output(&self) -> bool {
+        (self.flags & Self::FLAG_EXTENDED_L2) != 0
     }
 
     /// Number of input devices in the backing chain.
