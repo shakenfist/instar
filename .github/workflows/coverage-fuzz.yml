@@ -147,7 +147,6 @@ jobs:
             -w "/workspace/src/fuzz" \
             imago-build \
             bash -c "
-              cargo install cargo-fuzz 2>/dev/null || true
               cargo fuzz build 2>&1 | tee /workspace/coverage-fuzz-logs/build.log
             "
 
