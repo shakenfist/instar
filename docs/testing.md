@@ -426,6 +426,83 @@ python3 scripts/differential-fuzz.py \
     --fail-fast
 ```
 
+## Phase 6: Coverage-Guided Fuzzing
+
+Coverage-guided fuzzing uses `cargo-fuzz` (libFuzzer) to exercise the
+`no_std` parser crates directly, without the full VMM/KVM stack. A
+mock `CallTable` backed by fuzzer input provides the I/O layer,
+allowing libFuzzer to explore malformed input space that differential
+fuzzing (Phase 3) cannot reach.
+
+### Fuzz targets
+
+13 targets across all parser crates, organized in `src/fuzz/`:
+
+| Target | Crate | Type |
+|--------|-------|------|
+| `fuzz_format_detect` | shared | Buffer-based |
+| `fuzz_qcow2_header` | qcow2 | Buffer-based |
+| `fuzz_qcow2_l1l2` | qcow2 | CallTable |
+| `fuzz_qcow2_refcount` | qcow2 | CallTable |
+| `fuzz_qcow2_decompress` | qcow2 | CallTable |
+| `fuzz_vmdk_header` | vmdk | Buffer-based |
+| `fuzz_vmdk_grain` | vmdk | CallTable |
+| `fuzz_vhd_footer` | vhd | Buffer-based |
+| `fuzz_vhd_bat` | vhd | CallTable |
+| `fuzz_vhdx_header` | vhdx | Buffer-based |
+| `fuzz_vhdx_metadata` | vhdx | CallTable |
+| `fuzz_raw_partition` | raw | Buffer-based |
+| `fuzz_luks_header` | luks | Buffer-based |
+
+**Buffer-based** targets call parser functions that take `&[u8]`
+directly (e.g. `QcowHeader::parse(data)`). **CallTable** targets
+use the mock CallTable from `src/fuzz/src/lib.rs` to simulate
+sector-based I/O from the fuzzer input.
+
+### Running locally
+
+```bash
+# Inside the imago-build container:
+cd src/fuzz
+
+# Run a single target for 60 seconds
+cargo fuzz run fuzz_qcow2_header -- -max_total_time=60
+
+# Run with specific corpus
+cargo fuzz run fuzz_qcow2_header corpus/fuzz_qcow2_header/
+
+# Minimize a crash
+cargo fuzz tmin fuzz_qcow2_header artifacts/fuzz_qcow2_header/<crash>
+
+# Generate coverage report
+cargo fuzz coverage fuzz_qcow2_header
+```
+
+### Corpus seeding
+
+The seed corpus is extracted from `imago-testdata` using:
+
+```bash
+python3 scripts/extract-fuzz-corpus.py --testdata /path/to/imago-testdata
+```
+
+This copies test images into per-target corpus directories under
+`src/fuzz/corpus/`, filtered by format. Header-only targets receive
+truncated copies. Hand-crafted minimal valid inputs are also generated
+for each format.
+
+### CI integration
+
+The CI workflow (`.github/workflows/coverage-fuzz.yml`) runs:
+- **Nightly:** 1 hour per target at 04:00 UTC
+- **PR validation:** 60-second smoke test when fuzz/parser code changes
+- **Manual dispatch:** configurable duration and target selection
+
+Crashes are minimized with `cargo fuzz tmin` and filed as GitHub
+Issues with the `security-audit` label immediately when found. New
+corpus entries are pushed to `imago-testdata/custom/fuzz-corpus/`
+after nightly runs.
+
 ## Related Documentation
 
 - [Format Coverage](format-coverage.md) - Comparison with oslo.utils format_inspector

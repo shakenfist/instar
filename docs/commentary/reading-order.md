@@ -405,6 +405,44 @@ against `qemu-img` output to verify drop-in compatibility.
   that imago's format detection agrees with OpenStack's `format_inspector`.
   This catches drift between the two implementations.
 
+### Step 12: `src/fuzz/` -- Coverage-guided fuzzing
+
+**What you will find:** A `cargo-fuzz` (libFuzzer) project with 13 fuzz
+targets that exercise the `no_std` parser crates directly, without the
+VMM/KVM stack. The harness module (`src/lib.rs`) provides a mock
+`CallTable` backed by thread-local fuzzer input. Fuzz targets are split
+into buffer-based (header parsing) and CallTable-dependent (L1/L2 lookup,
+refcount traversal, decompression, BAT/grain lookup).
+
+**What to pay attention to:**
+
+- The mock `CallTable` in `src/fuzz/src/lib.rs` replaces real sector I/O
+  with reads from the fuzzer input buffer. This is the key abstraction
+  that decouples parsers from the VMM for fuzzing.
+
+- Buffer-based targets (e.g. `fuzz_qcow2_header`) call `parse()` methods
+  directly with the fuzz input as `&[u8]`. No CallTable needed.
+
+- CallTable-dependent targets (e.g. `fuzz_qcow2_l1l2`) initialise parser
+  state via the mock CallTable, then exercise lookup functions at both
+  fixed and fuzz-derived offsets.
+
+- The corpus seeding script (`scripts/extract-fuzz-corpus.py`) extracts
+  seed images from the separate `imago-testdata` repository, filtered by
+  format. No adversarial images are stored in the main repo.
+
+- The CI workflow (`coverage-fuzz.yml`) runs nightly and on PRs that touch
+  fuzz/parser code. Crashes are minimised and filed as GitHub Issues
+  immediately.
+
+### Step 13: `scripts/differential-fuzz.py` -- Differential fuzzing
+
+**What you will find:** A Python script that generates random valid images
+and compares imago output against `qemu-img` (and optionally libyal tools).
+This is complementary to coverage-guided fuzzing: differential fuzzing
+explores valid image space, while coverage fuzzing explores malformed input
+space.
+
 ---
 
 ## Summary: The Complete Data Flow

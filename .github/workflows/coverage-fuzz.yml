@@ -1,0 +1,324 @@
+name: Coverage-Guided Fuzzing
+
+on:
+  # Nightly: 1 hour per target
+  schedule:
+    - cron: '0 4 * * *'
+
+  # PR validation: 60s smoke test when fuzz/parser code changes
+  pull_request:
+    paths:
+      - 'src/fuzz/**'
+      - 'src/crates/**'
+      - 'src/shared/**'
+      - '.github/workflows/coverage-fuzz.yml'
+
+  # Manual: configurable duration and target selection
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Fuzz duration per target (seconds)'
+        required: false
+        default: '3600'
+        type: string
+      targets:
+        description: 'Comma-separated target names (empty = all)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  coverage-fuzz:
+    runs-on: [self-hosted, debian-12, xl]
+    timeout-minutes: 480
+
+    env:
+      DOCKER_BUILDKIT: 1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare imago-testdata
+        env:
+          TESTDATA_TOKEN: ${{ secrets.GITLAB_TESTDATA_TOKEN }}
+        run: |
+          CACHED=/srv/ci/cached/imago-testdata
+          if [ -d "$CACHED/.git" ]; then
+            cd "$CACHED" && git pull --ff-only \
+              "https://oauth2:${TESTDATA_TOKEN}@gitlab.home.stillhq.com/private/imago-testdata.git" \
+              2>/dev/null || true
+            echo "TESTDATA_PATH=${CACHED}" >> $GITHUB_ENV
+          else
+            git clone --depth 1 \
+              "https://oauth2:${TESTDATA_TOKEN}@gitlab.home.stillhq.com/private/imago-testdata.git" \
+              ${GITHUB_WORKSPACE}/imago-testdata
+            echo "TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata" >> $GITHUB_ENV
+          fi
+
+      - name: Install Docker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y docker.io
+          sudo systemctl start docker
+          sudo chmod 666 /var/run/docker.sock
+
+      - name: Remove previous devcontainers, if any
+        run: |
+          docker image rm -f imago-build 2>/dev/null || true
+
+      - name: Build devcontainer
+        run: |
+          make imago-devcontainer
+
+      - name: Install GitHub CLI on host
+        run: |
+          if ! command -v gh &>/dev/null; then
+            sudo mkdir -p -m 755 /etc/apt/keyrings
+            wget -qO- \
+              https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+              | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+              >/dev/null
+            sudo chmod go+r \
+              /etc/apt/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) \
+              signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] \
+              https://cli.github.com/packages stable main" \
+              | sudo tee /etc/apt/sources.list.d/github-cli.list \
+              >/dev/null
+            sudo apt-get update
+            sudo apt-get install -y gh
+          fi
+
+      - name: Ensure security-audit label exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create "security-audit" \
+            --description "Findings from security audit and fuzzing" \
+            --color "D93F0B" \
+            2>/dev/null || true
+
+      - name: Determine fuzz duration
+        id: params
+        env:
+          INPUT_DURATION: ${{ inputs.duration }}
+          INPUT_TARGETS: ${{ inputs.targets }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "duration=${INPUT_DURATION}" >> $GITHUB_OUTPUT
+            echo "targets=${INPUT_TARGETS}" >> $GITHUB_OUTPUT
+          elif [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "duration=60" >> $GITHUB_OUTPUT
+            echo "targets=" >> $GITHUB_OUTPUT
+          else
+            # schedule (nightly)
+            echo "duration=3600" >> $GITHUB_OUTPUT
+            echo "targets=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Seed corpus from testdata
+        run: |
+          python3 scripts/extract-fuzz-corpus.py \
+            --testdata "${TESTDATA_PATH}"
+
+      - name: Run coverage-guided fuzzing
+        env:
+          FUZZ_DURATION: ${{ steps.params.outputs.duration }}
+          FUZZ_TARGETS: ${{ steps.params.outputs.targets }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          mkdir -p coverage-fuzz-logs
+
+          # Build fuzz targets inside container
+          docker run --rm \
+            -u "$(id -u):$(id -g)" \
+            -e HOME=/build \
+            -e CARGO_HOME=/build/.cargo \
+            -v "$(pwd):/workspace" \
+            -v "$(pwd)/.cargo-cache/registry:/build/.cargo/registry" \
+            -v "$(pwd)/.cargo-cache/git:/build/.cargo/git" \
+            -w "/workspace/src/fuzz" \
+            imago-build \
+            bash -c "
+              cargo install cargo-fuzz 2>/dev/null || true
+              cargo fuzz build 2>&1 | tee /workspace/coverage-fuzz-logs/build.log
+            "
+
+          # Determine target list
+          if [ -n "$FUZZ_TARGETS" ]; then
+            IFS=',' read -ra TARGETS <<< "$FUZZ_TARGETS"
+          else
+            TARGETS=(
+              fuzz_format_detect
+              fuzz_qcow2_header
+              fuzz_qcow2_l1l2
+              fuzz_qcow2_refcount
+              fuzz_qcow2_decompress
+              fuzz_vmdk_header
+              fuzz_vmdk_grain
+              fuzz_vhd_footer
+              fuzz_vhd_bat
+              fuzz_vhdx_header
+              fuzz_vhdx_metadata
+              fuzz_raw_partition
+              fuzz_luks_header
+            )
+          fi
+
+          CRASHES_FOUND=0
+
+          for TARGET in "${TARGETS[@]}"; do
+            echo "=== Fuzzing $TARGET for ${FUZZ_DURATION}s ==="
+
+            # Run fuzzer inside container
+            EXIT_CODE=0
+            docker run --rm \
+              -u "$(id -u):$(id -g)" \
+              -e HOME=/build \
+              -e CARGO_HOME=/build/.cargo \
+              -v "$(pwd):/workspace" \
+              -v "$(pwd)/.cargo-cache/registry:/build/.cargo/registry" \
+              -v "$(pwd)/.cargo-cache/git:/build/.cargo/git" \
+              -w "/workspace/src/fuzz" \
+              imago-build \
+              bash -c "
+                cargo fuzz run $TARGET \
+                  -- -max_total_time=$FUZZ_DURATION \
+                     -max_len=4194304 \
+                     -rss_limit_mb=4096 \
+                  2>&1 | tee /workspace/coverage-fuzz-logs/${TARGET}.log
+              " || EXIT_CODE=$?
+
+            if [ $EXIT_CODE -ne 0 ]; then
+              echo "!!! Crash found in $TARGET (exit code $EXIT_CODE) !!!"
+              CRASHES_FOUND=$((CRASHES_FOUND + 1))
+
+              # Attempt to minimize the crash
+              CRASH_FILE=$(find src/fuzz/artifacts/$TARGET/ -type f 2>/dev/null | head -1)
+              if [ -n "$CRASH_FILE" ]; then
+                echo "Minimizing crash: $CRASH_FILE"
+                docker run --rm \
+                  -u "$(id -u):$(id -g)" \
+                  -e HOME=/build \
+                  -e CARGO_HOME=/build/.cargo \
+                  -v "$(pwd):/workspace" \
+                  -v "$(pwd)/.cargo-cache/registry:/build/.cargo/registry" \
+                  -v "$(pwd)/.cargo-cache/git:/build/.cargo/git" \
+                  -w "/workspace/src/fuzz" \
+                  imago-build \
+                  bash -c "
+                    cargo fuzz tmin $TARGET /workspace/$CRASH_FILE \
+                      -- -max_len=4194304 \
+                      2>&1 | tee /workspace/coverage-fuzz-logs/${TARGET}-tmin.log
+                  " || true
+
+                # Extract crash signature from log
+                SIGNATURE=$(grep -m1 'panicked at\|SUMMARY:' \
+                  coverage-fuzz-logs/${TARGET}.log 2>/dev/null \
+                  | head -c 120 || echo "unknown crash")
+
+                # File GitHub issue immediately
+                CRASH_SIZE=$(stat -c%s "$CRASH_FILE" 2>/dev/null || echo "unknown")
+                gh issue create \
+                  --label "security-audit" \
+                  --title "Coverage fuzz crash: ${TARGET}" \
+                  --body "$(cat <<ISSUE_EOF
+## Coverage-guided fuzzing crash
+
+**Target:** \`${TARGET}\`
+**Crash signature:** \`${SIGNATURE}\`
+**Crash input size:** ${CRASH_SIZE} bytes
+**CI run:** ${WORKFLOW_URL}
+
+### Reproduction
+
+\`\`\`bash
+cd src/fuzz
+cargo fuzz run ${TARGET} artifacts/${TARGET}/<crash-file>
+\`\`\`
+
+### Log excerpt
+
+\`\`\`
+$(tail -30 coverage-fuzz-logs/${TARGET}.log)
+\`\`\`
+ISSUE_EOF
+                )"
+              fi
+            fi
+
+            echo "=== Completed $TARGET ==="
+          done
+
+          echo "Total crashes found: $CRASHES_FOUND"
+          echo "crashes_found=$CRASHES_FOUND" >> $GITHUB_ENV
+
+      - name: Push corpus to imago-testdata
+        if: github.event_name == 'schedule'
+        env:
+          PUSH_TOKEN: ${{ secrets.GITLAB_TESTDATA_PUSH_TOKEN }}
+        run: |
+          # Only push corpus on nightly runs
+          if [ -z "$PUSH_TOKEN" ]; then
+            echo "GITLAB_TESTDATA_PUSH_TOKEN not set, skipping corpus push"
+            exit 0
+          fi
+
+          CORPUS_SRC="src/fuzz/corpus"
+          if [ ! -d "$CORPUS_SRC" ]; then
+            echo "No corpus directory found, skipping"
+            exit 0
+          fi
+
+          # Clone with push token
+          PUSH_DIR=$(mktemp -d)
+          git clone --depth 1 \
+            "https://oauth2:${PUSH_TOKEN}@gitlab.home.stillhq.com/private/imago-testdata.git" \
+            "$PUSH_DIR"
+
+          # Merge corpus entries
+          CHANGED=0
+          for TARGET_DIR in "$CORPUS_SRC"/*/; do
+            TARGET=$(basename "$TARGET_DIR")
+            DEST="$PUSH_DIR/custom/fuzz-corpus/$TARGET"
+            mkdir -p "$DEST"
+            for FILE in "$TARGET_DIR"*; do
+              [ -f "$FILE" ] || continue
+              NAME=$(basename "$FILE")
+              if [ ! -f "$DEST/$NAME" ]; then
+                cp "$FILE" "$DEST/$NAME"
+                CHANGED=1
+              fi
+            done
+          done
+
+          if [ "$CHANGED" -eq 1 ]; then
+            cd "$PUSH_DIR"
+            git add custom/fuzz-corpus/
+            git -c user.name="CI Fuzzer" \
+                -c user.email="ci@imago.dev" \
+                commit -m "Add fuzz corpus entries from nightly run $(date -u +%Y-%m-%d)"
+            git push origin HEAD
+            echo "Pushed new corpus entries to imago-testdata"
+          else
+            echo "No new corpus entries to push"
+          fi
+
+          rm -rf "$PUSH_DIR"
+
+      - name: Upload fuzzing logs and artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-fuzz-logs
+          path: |
+            coverage-fuzz-logs/
+            src/fuzz/artifacts/
+          retention-days: 90
