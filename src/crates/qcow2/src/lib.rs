@@ -1349,8 +1349,7 @@ pub unsafe fn read_cluster_sectors(
     bytes_read: &mut u64,
 ) -> bool {
     let first_sector = host_offset / sector_size as u64;
-    let offset_in_sector =
-        (host_offset % sector_size as u64) as usize;
+    let offset_in_sector = (host_offset % sector_size as u64) as usize;
 
     if cluster_size < sector_size as u64 {
         // The cluster fits inside a single sector.  Read the
@@ -1381,17 +1380,12 @@ pub unsafe fn read_cluster_sectors(
         );
     } else {
         // Cluster spans one or more full sectors.
-        let sectors_per_cluster =
-            cluster_size / sector_size as u64;
+        let sectors_per_cluster = cluster_size / sector_size as u64;
         for i in 0..sectors_per_cluster {
             let sector = first_sector + i;
             let buf_offset = (i as usize) * sector_size;
-            if !(call_table.read_input_sector)(
-                device_idx,
-                sector,
-                buf.add(buf_offset),
-                sector_size,
-            ) {
+            if !(call_table.read_input_sector)(device_idx, sector, buf.add(buf_offset), sector_size)
+            {
                 return false;
             }
             *bytes_read += sector_size as u64;

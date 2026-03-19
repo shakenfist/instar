@@ -1564,19 +1564,13 @@ unsafe fn convert_to_raw(
 
         // Flush when we've accumulated enough for an output
         // sector, or when we've reached the end of the image.
-        let should_flush = accum_bytes >= output_sector_size as u64
-            || virtual_offset >= virtual_size;
+        let should_flush =
+            accum_bytes >= output_sector_size as u64 || virtual_offset >= virtual_size;
 
         if !should_flush {
             // Report progress even when not flushing
-            let percent =
-                (chunks_done * 100 / total_chunks) as u32;
-            if should_report_progress(
-                progress_interval,
-                percent,
-                last_percent,
-                chunks_done,
-            ) {
+            let percent = (chunks_done * 100 / total_chunks) as u32;
+            if should_report_progress(progress_interval, percent, last_percent, chunks_done) {
                 (call_table.send_progress)(
                     b"convert\0".as_ptr(),
                     chunks_done,
@@ -1589,18 +1583,10 @@ unsafe fn convert_to_raw(
         }
 
         // Check if the entire accumulated buffer is zeros
-        if skip_zeros
-            && is_all_zeros_ptr(buf, accum_bytes as usize)
-        {
+        if skip_zeros && is_all_zeros_ptr(buf, accum_bytes as usize) {
             accum_bytes = 0;
-            let percent =
-                (chunks_done * 100 / total_chunks) as u32;
-            if should_report_progress(
-                progress_interval,
-                percent,
-                last_percent,
-                chunks_done,
-            ) {
+            let percent = (chunks_done * 100 / total_chunks) as u32;
+            if should_report_progress(progress_interval, percent, last_percent, chunks_done) {
                 (call_table.send_progress)(
                     b"convert\0".as_ptr(),
                     chunks_done,
@@ -1624,12 +1610,9 @@ unsafe fn convert_to_raw(
             accum_bytes
         };
 
-        let output_first_sector =
-            accum_start / output_sector_size as u64;
-        let sectors_to_write = (write_size
-            + output_sector_size as u64
-            - 1)
-            / output_sector_size as u64;
+        let output_first_sector = accum_start / output_sector_size as u64;
+        let sectors_to_write =
+            (write_size + output_sector_size as u64 - 1) / output_sector_size as u64;
 
         for i in 0..sectors_to_write {
             let output_sector = output_first_sector + i;
@@ -1637,22 +1620,15 @@ unsafe fn convert_to_raw(
                 break;
             }
             let offset = (i as usize) * output_sector_size;
-            if !(call_table.write_output_sector)(
-                output_sector,
-                buf.add(offset),
-                output_sector_size,
-            ) {
+            if !(call_table.write_output_sector)(output_sector, buf.add(offset), output_sector_size)
+            {
                 (call_table.send_error)(
                     b"convert\0".as_ptr(),
                     b"output\0".as_ptr(),
                     output_sector,
                     2,
                 );
-                (call_table.send_complete)(
-                    b"convert\0".as_ptr(),
-                    *bytes_read,
-                    false,
-                );
+                (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                 return *bytes_read;
             }
         }
@@ -2061,8 +2037,7 @@ unsafe fn convert_to_qcow2(
             sector_size as u64
         }
     };
-    let read_chunk_q =
-        core::cmp::min(input_cluster_size_q, layout.cluster_size);
+    let read_chunk_q = core::cmp::min(input_cluster_size_q, layout.cluster_size);
 
     (call_table.verbose_print)(b"convert: starting qcow2 conversion\n\0".as_ptr());
 
@@ -2094,15 +2069,9 @@ unsafe fn convert_to_qcow2(
             // Read input data, one input cluster at a time
             let mut buf_filled_q: u64 = 0;
             while buf_filled_q < this_chunk {
-                let piece = core::cmp::min(
-                    read_chunk_q,
-                    this_chunk - buf_filled_q,
-                );
+                let piece = core::cmp::min(read_chunk_q, this_chunk - buf_filled_q);
 
-                HEAP_POS.store(
-                    0,
-                    core::sync::atomic::Ordering::Relaxed,
-                );
+                HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 
                 if !qcow2::read_chain_virtual_cluster(
                     call_table,
@@ -2125,15 +2094,10 @@ unsafe fn convert_to_qcow2(
                     (call_table.send_error)(
                         b"convert\0".as_ptr(),
                         b"input\0".as_ptr(),
-                        (virtual_offset + buf_filled_q)
-                            / sector_size as u64,
+                        (virtual_offset + buf_filled_q) / sector_size as u64,
                         1,
                     );
-                    (call_table.send_complete)(
-                        b"convert\0".as_ptr(),
-                        *bytes_read,
-                        false,
-                    );
+                    (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                     return *bytes_read;
                 }
                 buf_filled_q += piece;
@@ -2434,16 +2398,10 @@ unsafe fn convert_to_qcow2_compressed(
             // when input clusters are smaller than output.
             let mut buf_filled: u64 = 0;
             while buf_filled < this_chunk {
-                let piece = core::cmp::min(
-                    read_chunk,
-                    this_chunk - buf_filled,
-                );
+                let piece = core::cmp::min(read_chunk, this_chunk - buf_filled);
 
                 // Reset bump allocator before ZSTD decompression
-                HEAP_POS.store(
-                    0,
-                    core::sync::atomic::Ordering::Relaxed,
-                );
+                HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 
                 if !qcow2::read_chain_virtual_cluster(
                     call_table,
@@ -2466,15 +2424,10 @@ unsafe fn convert_to_qcow2_compressed(
                     (call_table.send_error)(
                         b"convert\0".as_ptr(),
                         b"input\0".as_ptr(),
-                        (virtual_offset + buf_filled)
-                            / sector_size as u64,
+                        (virtual_offset + buf_filled) / sector_size as u64,
                         1,
                     );
-                    (call_table.send_complete)(
-                        b"convert\0".as_ptr(),
-                        *bytes_read,
-                        false,
-                    );
+                    (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                     return *bytes_read;
                 }
                 buf_filled += piece;
