@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Copy operation: read from input, write to output"
 license = "Apache-2.0"
+publish = false
 
 [dependencies]
 shared = { path = "../../shared" }

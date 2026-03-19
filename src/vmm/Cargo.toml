@@ -2,8 +2,14 @@
 name = "imago"
 version = "0.1.0"
 edition = "2021"
-description = "Safe, sandboxed disk image operations"
+description = "Safe, sandboxed disk image operations using KVM isolation"
 license = "Apache-2.0"
+repository = "https://github.com/shakenfist/imago"
+homepage = "https://github.com/shakenfist/imago"
+readme = "../../README.md"
+authors = ["Michael Still <mikal@stillhq.com>"]
+keywords = ["disk-image", "qcow2", "kvm", "vmdk", "vhd"]
+categories = ["command-line-utilities", "virtualization"]
 
 [[bin]]
 name = "imago"

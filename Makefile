@@ -15,7 +15,7 @@
         imago imago-devcontainer clean-imago run-imago check-binary-sizes \
         test-venv test test-rust test-integration test-ci test-malicious test-report clean-tests \
         test-container test-container-core test-container-convert-qcow2 test-container-convert-vhd \
-        clean-cargo-cache
+        clean-cargo-cache release check-version
 
 # Default target
 help:
@@ -55,6 +55,10 @@ help:
 	@echo "  lint                 Run rustfmt and clippy checks"
 	@echo "  lint-fix             Run rustfmt and clippy with auto-fix"
 	@echo "  install-hooks        Install pre-commit hooks"
+	@echo ""
+	@echo "Release:"
+	@echo "  release VERSION=x.y.z  Bump versions, commit, and tag a release"
+	@echo "  check-version          Verify Cargo.toml versions match a git tag"
 	@echo ""
 	@echo "Testing:"
 	@echo "  test-venv            Create Python venv for tests"
@@ -541,3 +545,87 @@ clean-tests:
 	rm -rf $(TESTS_DIR)/helpers/__pycache__
 	rm -rf $(TESTS_DIR)/.stestr
 	@echo "Test cleanup complete."
+
+# =============================================================================
+# Release Targets
+# =============================================================================
+
+# All Cargo.toml files that carry the workspace version
+CARGO_TOML_FILES := \
+	src/vmm/Cargo.toml \
+	src/shared/Cargo.toml \
+	src/core/Cargo.toml \
+	src/crates/qcow2/Cargo.toml \
+	src/crates/vmdk/Cargo.toml \
+	src/crates/vhd/Cargo.toml \
+	src/crates/vhdx/Cargo.toml \
+	src/crates/luks/Cargo.toml \
+	src/crates/raw/Cargo.toml \
+	src/operations/info/Cargo.toml \
+	src/operations/copy/Cargo.toml \
+	src/operations/check/Cargo.toml \
+	src/operations/compare/Cargo.toml \
+	src/operations/convert/Cargo.toml \
+	crates/guest-protocol/Cargo.toml
+
+# Bump all Cargo.toml versions, commit, and create a signed tag.
+#
+# Usage: make release VERSION=0.2.0
+#
+# This does NOT push -- review the commit and tag before pushing.
+release:
+ifndef VERSION
+	$(error VERSION is not set. Usage: make release VERSION=0.2.0)
+endif
+	@echo "Bumping version to $(VERSION) in all Cargo.toml files..."
+	@for f in $(CARGO_TOML_FILES); do \
+		if [ ! -f "$$f" ]; then \
+			echo "Error: $$f not found"; \
+			exit 1; \
+		fi; \
+		sed -i 's/^version = ".*"/version = "$(VERSION)"/' "$$f"; \
+		echo "  updated $$f"; \
+	done
+	@echo ""
+	@echo "Verifying all versions match..."
+	@MISMATCH=0; \
+	for f in $(CARGO_TOML_FILES); do \
+		VER=$$(grep '^version = ' "$$f" | head -1 | \
+			sed 's/version = "//;s/"//'); \
+		if [ "$$VER" != "$(VERSION)" ]; then \
+			echo "  MISMATCH: $$f has version $$VER"; \
+			MISMATCH=1; \
+		fi; \
+	done; \
+	if [ $$MISMATCH -ne 0 ]; then \
+		echo "Error: version mismatch detected"; \
+		exit 1; \
+	fi
+	@echo "All versions set to $(VERSION)."
+	@echo ""
+	@echo "Creating release commit and tag..."
+	git add $(CARGO_TOML_FILES)
+	git commit -m "Release v$(VERSION)."
+	git tag "v$(VERSION)" -m "Release v$(VERSION)"
+	@echo ""
+	@echo "Done. Review the commit and tag, then push with:"
+	@echo "  git push origin HEAD"
+	@echo "  git push origin v$(VERSION)"
+
+# Verify that the version in src/vmm/Cargo.toml matches a tag.
+# Used by the release workflow as a safety check.
+#
+# Usage: make check-version TAG=v0.2.0
+check-version:
+ifndef TAG
+	$(error TAG is not set. Usage: make check-version TAG=v0.2.0)
+endif
+	@EXPECTED=$$(echo "$(TAG)" | sed 's/^v//'); \
+	ACTUAL=$$(grep '^version = ' src/vmm/Cargo.toml | head -1 | \
+		sed 's/version = "//;s/"//'); \
+	if [ "$$ACTUAL" != "$$EXPECTED" ]; then \
+		echo "ERROR: Tag $(TAG) expects version $$EXPECTED"; \
+		echo "       but src/vmm/Cargo.toml has $$ACTUAL"; \
+		exit 1; \
+	fi; \
+	echo "Version check passed: $$ACTUAL matches $(TAG)"

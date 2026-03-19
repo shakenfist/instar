@@ -33,6 +33,36 @@ Initial target formats:
 imago implementation in `src/`. Operations include `info`, `copy`, `check`,
 `compare`, and `convert`. Prototypes remain available for reference.
 
+## Installation
+
+### Pre-compiled binary (recommended)
+
+Download the latest release from
+[GitHub Releases](https://github.com/shakenfist/imago/releases):
+
+```bash
+# Download and extract
+# Replace VERSION with the desired release (e.g. v0.2.0)
+VERSION=v0.2.0
+curl -sL "https://github.com/shakenfist/imago/releases/download/${VERSION}/imago-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+  | tar xz -C /usr/local/bin/
+
+# Verify it works
+imago --help
+```
+
+### System requirements
+
+- **Linux** (imago uses KVM for sandboxed image processing)
+- **KVM access**: `/dev/kvm` must be accessible
+- Your user must be in the `kvm` group (`sudo usermod -aG kvm $USER`)
+
+### Build from source
+
+If you prefer to build from source, see [Building Imago](#building-imago)
+below. This requires Docker and a nightly Rust toolchain (handled
+automatically by the build container).
+
 ## Building Imago
 
 ```bash
@@ -478,6 +508,8 @@ imago/
 │   ├── malicious/  # CVE exploit images (DANGEROUS)
 │   └── downloaded/ # External test images (CirrOS, QEMU iotests, etc.)
 ├── Makefile        # Build and development automation
+├── CHANGELOG.md    # Release history
+├── SECURITY.md     # Vulnerability reporting and security policy
 └── README.md
 ```
 
@@ -539,6 +571,21 @@ The `testdata/` directory contains 44 disk images for security validation:
 - **AFL-discovered** - Malformed images from QEMU's fuzzing that trigger parser errors
 
 See `testdata/README.md` for full documentation.
+
+## Releases
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes.
+
+Release artifacts (pre-compiled Linux binaries) are published to
+[GitHub Releases](https://github.com/shakenfist/imago/releases)
+via the release workflow (`.github/workflows/release.yml`). Tags
+are signed with Sigstore. To cut a release:
+
+```bash
+make release VERSION=0.2.0
+git push origin HEAD
+git push origin v0.2.0
+```
 
 ## Documentation
 

@@ -2,6 +2,9 @@
 name = "convert"
 version = "0.1.0"
 edition = "2021"
+description = "Convert operation: transform between disk image formats"
+license = "Apache-2.0"
+publish = false
 
 [profile.release]
 opt-level = "s"
@@ -10,7 +13,10 @@ panic = "abort"
 
 [dependencies]
 shared = { path = "../../shared" }
-qcow2 = { path = "../../crates/qcow2", features = ["decompress", "decompress-zstd", "compress", "aes-decrypt", "luks-decrypt", "vmdk-decompress", "vhd-input", "vhdx-input"] }
+qcow2 = { path = "../../crates/qcow2", features = [
+    "decompress", "decompress-zstd", "compress", "aes-decrypt",
+    "luks-decrypt", "vmdk-decompress", "vhd-input", "vhdx-input",
+] }
 vmdk = { path = "../../crates/vmdk" }
 vhd = { path = "../../crates/vhd" }
 vhdx = { path = "../../crates/vhdx" }

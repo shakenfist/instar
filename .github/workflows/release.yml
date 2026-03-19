@@ -1,0 +1,209 @@
+# Release workflow for Imago
+#
+# Triggers on version tags (v*). Requires approval from the 'release'
+# environment before publishing. Uses Sigstore for tag signing and
+# GitHub Releases for binary distribution.
+#
+# Adapted from shakenfist/development/templates/release-automation/
+# for Rust binary releases (no PyPI, pre-compiled binaries instead).
+
+name: Release
+
+permissions: {}
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+  # Allow manual trigger for testing (won't publish without a tag)
+  workflow_dispatch:
+
+jobs:
+  check-version:
+    name: Verify Cargo.toml version matches tag
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: [self-hosted, static]
+
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check version consistency
+        id: check
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          EXPECTED="${TAG_NAME#v}"
+          ACTUAL=$(grep '^version = ' src/vmm/Cargo.toml \
+            | head -1 | sed 's/version = "//;s/"//')
+          echo "Tag: ${TAG_NAME}"
+          echo "Expected version: ${EXPECTED}"
+          echo "Cargo.toml version: ${ACTUAL}"
+
+          if [ "${ACTUAL}" != "${EXPECTED}" ]; then
+            echo "mismatch=true" >> "$GITHUB_OUTPUT"
+            echo "tag=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+            echo "expected=${EXPECTED}" >> "$GITHUB_OUTPUT"
+            echo "actual=${ACTUAL}" >> "$GITHUB_OUTPUT"
+            echo "::error::Version mismatch: tag ${TAG_NAME} expects ${EXPECTED} but Cargo.toml has ${ACTUAL}"
+            exit 1
+          fi
+
+      - name: File issue on version mismatch
+        if: failure() && steps.check.outputs.mismatch == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "Release ${{ steps.check.outputs.tag }}: Cargo.toml version mismatch" \
+            --label "bug" \
+            --body "$(cat <<'ISSUE_EOF'
+          The release workflow for tag \`${{ steps.check.outputs.tag }}\` failed
+          because the Cargo.toml version does not match the tag.
+
+          - **Tag expects:** ${{ steps.check.outputs.expected }}
+          - **Cargo.toml has:** ${{ steps.check.outputs.actual }}
+
+          To fix this, bump the version and re-tag:
+          \`\`\`bash
+          make release VERSION=${{ steps.check.outputs.expected }}
+          git push origin HEAD
+          git push origin ${{ steps.check.outputs.tag }}
+          \`\`\`
+
+          See the [failed workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.
+          ISSUE_EOF
+          )"
+
+  build:
+    name: Build Linux binaries
+    needs: check-version
+    if: always() && (needs.check-version.result == 'success' || needs.check-version.result == 'skipped')
+    runs-on: [self-hosted, debian-12, s]
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+
+    env:
+      DOCKER_BUILDKIT: 1
+      CARGO_BUILD_JOBS: 2
+
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          # Add later if there is demand:
+          # - x86_64-unknown-linux-musl
+          # - aarch64-unknown-linux-gnu
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Docker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y docker.io
+          sudo systemctl start docker
+          sudo chmod 666 /var/run/docker.sock
+
+      - name: Remove previous devcontainers, if any
+        run: |
+          docker image rm -f imago-build 2>/dev/null || true
+
+      - name: Build imago (VMM + guest binaries)
+        run: make imago
+
+      - name: Package binary
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          # For workflow_dispatch without a tag, use "dev"
+          if [ -z "${TAG_NAME}" ] || [ "${TAG_NAME}" = "${GITHUB_REF}" ]; then
+            TAG_NAME="dev"
+          fi
+          ARCHIVE="imago-${TAG_NAME}-${{ matrix.target }}.tar.gz"
+          mkdir staging
+          cp src/target/release/imago staging/
+          cp src/target/release/*.bin staging/
+          cp LICENSE README.md staging/
+          tar -czf "${ARCHIVE}" -C staging .
+          echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
+
+      - name: Upload distribution artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+
+  sign-tag:
+    name: Sign release tag with Sigstore
+    needs: build
+    runs-on: [self-hosted, debian-12, s]
+    environment: release
+
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install gitsign
+        run: |
+          GITSIGN_VERSION="0.14.0"
+          curl -sLO "https://github.com/sigstore/gitsign/releases/download/v${GITSIGN_VERSION}/gitsign_${GITSIGN_VERSION}_linux_amd64"
+          curl -sLO "https://github.com/sigstore/gitsign/releases/download/v${GITSIGN_VERSION}/checksums.txt"
+          sha256sum --ignore-missing -c checksums.txt
+          chmod +x "gitsign_${GITSIGN_VERSION}_linux_amd64"
+          sudo mv "gitsign_${GITSIGN_VERSION}_linux_amd64" /usr/local/bin/gitsign
+
+      - name: Configure git for Sigstore signing
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global tag.gpgsign true
+          git config --global gpg.format x509
+          git config --global gpg.x509.program gitsign
+
+      - name: Create signed tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          echo "Signing tag: ${TAG_NAME}"
+          git tag -d "${TAG_NAME}" || true
+          git tag -s "${TAG_NAME}" -m "Release ${TAG_NAME}" "${GITHUB_SHA}"
+          git push origin "${TAG_NAME}" --force
+
+  github-release:
+    name: Create GitHub Release
+    needs: [build, sign-tag]
+    runs-on: [self-hosted, static]
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: "*.tar.gz"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

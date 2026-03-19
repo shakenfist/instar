@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "QCOW2 format parsing for bare-metal guest operations"
 license = "Apache-2.0"
+repository = "https://github.com/shakenfist/imago"
+authors = ["Michael Still <mikal@stillhq.com>"]
+keywords = ["qcow2", "disk-image", "no-std", "parser"]
+categories = ["no-std", "parser-implementations"]
 
 [features]
 decompress = ["miniz_oxide"]
