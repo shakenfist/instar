@@ -697,6 +697,185 @@ pub fn af_split(
     }
 }
 
+// ─── LUKS v1 header construction ────────────────────────────────────
+
+/// Default number of AFsplitter stripes for LUKS v1 key slots.
+pub const LUKS_DEFAULT_STRIPES: u32 = 4000;
+
+/// LUKS v1 key slot inactive marker.
+pub const LUKS_KEY_SLOT_DEAD: u32 = 0x0000DEAD;
+
+/// Parameters for building a LUKS v1 header.
+pub struct LuksV1BuildParams<'a> {
+    /// AES master key (32 bytes for AES-128-XTS, 64 for AES-256-XTS).
+    pub master_key: &'a [u8],
+    /// User passphrase.
+    pub passphrase: &'a [u8],
+    /// PBKDF2 iteration count for key slot derivation.
+    pub iterations: u32,
+    /// PBKDF2 iteration count for master key digest verification.
+    pub mk_digest_iterations: u32,
+    /// Random salt for master key digest (32 bytes).
+    pub mk_digest_salt: &'a [u8; 32],
+    /// Random salt for key slot 0 (32 bytes).
+    pub slot_salt: &'a [u8; 32],
+    /// Random data for AFsplitter stripes (must be
+    /// `(LUKS_DEFAULT_STRIPES - 1) * master_key.len()` bytes).
+    pub af_random: &'a [u8],
+    /// UUID string (36 bytes ASCII, e.g. "12345678-1234-1234-1234-123456789abc").
+    pub uuid: &'a [u8; 36],
+    /// Use SHA-256 (true) or SHA-1 (false) for PBKDF2 and AFsplitter.
+    pub use_sha256: bool,
+}
+
+/// Build a LUKS v1 binary header + encrypted key material into `out`.
+///
+/// Writes the 592-byte header followed by the encrypted key material
+/// for slot 0. Returns the total number of bytes written, or None
+/// on failure.
+///
+/// The key material is placed at sector 8 (byte 4096) to match the
+/// conventional LUKS v1 layout. The payload offset is set to 0
+/// because in QCOW2 crypt_method=2, the LUKS header is metadata
+/// only — encrypted data is at each cluster's host offset.
+///
+/// `out` must be large enough for the header (592 bytes) + padding
+/// to sector 8 + key material (key_bytes * LUKS_DEFAULT_STRIPES).
+/// A safe size is `4096 + 64 * 4000 = 260096` bytes.
+#[cfg(feature = "encrypt")]
+pub fn build_v1_header(params: &LuksV1BuildParams, out: &mut [u8]) -> Option<usize> {
+    let key_bytes = params.master_key.len();
+    if key_bytes != 32 && key_bytes != 64 {
+        return None;
+    }
+    let stripes = LUKS_DEFAULT_STRIPES as usize;
+    let km_size = key_bytes * stripes;
+    // Key material starts at sector 8 (byte 4096)
+    let km_sector_offset: u32 = 8;
+    let km_byte_offset = km_sector_offset as usize * 512;
+    let total_size = km_byte_offset + km_size;
+
+    if out.len() < total_size {
+        return None;
+    }
+    if params.af_random.len() < (stripes - 1) * key_bytes {
+        return None;
+    }
+
+    // Zero the output buffer up to total_size
+    for b in out[..total_size].iter_mut() {
+        *b = 0;
+    }
+
+    // ── Write binary header ──
+
+    // Magic
+    out[0..6].copy_from_slice(&LUKS_MAGIC);
+    // Version = 1
+    out[LUKS_VERSION_OFFSET..LUKS_VERSION_OFFSET + 2]
+        .copy_from_slice(&1u16.to_be_bytes());
+    // Cipher name: "aes"
+    out[LUKS_CIPHER_NAME_OFFSET..LUKS_CIPHER_NAME_OFFSET + 3]
+        .copy_from_slice(b"aes");
+    // Cipher mode: "xts-plain64"
+    out[LUKS_CIPHER_MODE_OFFSET..LUKS_CIPHER_MODE_OFFSET + 11]
+        .copy_from_slice(b"xts-plain64");
+    // Hash spec
+    let hash_name = if params.use_sha256 {
+        b"sha256\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+    } else {
+        b"sha1\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+    };
+    let hash_len = if params.use_sha256 { 6 } else { 4 };
+    out[LUKS_HASH_SPEC_OFFSET..LUKS_HASH_SPEC_OFFSET + hash_len]
+        .copy_from_slice(&hash_name[..hash_len]);
+    // Payload offset = 0 (QCOW2 crypt_method=2: no payload in LUKS area)
+    out[LUKS_PAYLOAD_OFFSET_OFFSET..LUKS_PAYLOAD_OFFSET_OFFSET + 4]
+        .copy_from_slice(&0u32.to_be_bytes());
+    // Key bytes
+    out[LUKS_KEY_BYTES_OFFSET..LUKS_KEY_BYTES_OFFSET + 4]
+        .copy_from_slice(&(key_bytes as u32).to_be_bytes());
+
+    // MK digest salt
+    out[LUKS_MK_DIGEST_SALT_OFFSET..LUKS_MK_DIGEST_SALT_OFFSET + 32]
+        .copy_from_slice(params.mk_digest_salt);
+    // MK digest iterations
+    out[LUKS_MK_DIGEST_ITER_OFFSET..LUKS_MK_DIGEST_ITER_OFFSET + 4]
+        .copy_from_slice(&params.mk_digest_iterations.to_be_bytes());
+
+    // Compute MK digest: PBKDF2(master_key, mk_digest_salt, mk_digest_iter)
+    let mut mk_digest = [0u8; 20];
+    pbkdf2_derive(
+        params.master_key,
+        params.mk_digest_salt,
+        params.mk_digest_iterations,
+        &mut mk_digest,
+        params.use_sha256,
+    );
+    out[LUKS_MK_DIGEST_OFFSET..LUKS_MK_DIGEST_OFFSET + 20]
+        .copy_from_slice(&mk_digest);
+
+    // UUID
+    out[LUKS_UUID_OFFSET..LUKS_UUID_OFFSET + 36]
+        .copy_from_slice(params.uuid);
+
+    // ── Key slot 0 (active) ──
+    let slot_base = LUKS_KEY_SLOT_BASE;
+    out[slot_base..slot_base + 4]
+        .copy_from_slice(&LUKS_KEY_SLOT_ACTIVE.to_be_bytes());
+    out[slot_base + LUKS_SLOT_ITERATIONS_OFFSET
+        ..slot_base + LUKS_SLOT_ITERATIONS_OFFSET + 4]
+        .copy_from_slice(&params.iterations.to_be_bytes());
+    out[slot_base + LUKS_SLOT_SALT_OFFSET
+        ..slot_base + LUKS_SLOT_SALT_OFFSET + 32]
+        .copy_from_slice(params.slot_salt);
+    out[slot_base + LUKS_SLOT_KEY_MATERIAL_OFFSET
+        ..slot_base + LUKS_SLOT_KEY_MATERIAL_OFFSET + 4]
+        .copy_from_slice(&km_sector_offset.to_be_bytes());
+    out[slot_base + LUKS_SLOT_STRIPES_OFFSET
+        ..slot_base + LUKS_SLOT_STRIPES_OFFSET + 4]
+        .copy_from_slice(&(stripes as u32).to_be_bytes());
+
+    // ── Key slots 1-7 (inactive) ──
+    for i in 1..LUKS_NUM_KEY_SLOTS {
+        let base = LUKS_KEY_SLOT_BASE + i * LUKS_KEY_SLOT_SIZE;
+        out[base..base + 4]
+            .copy_from_slice(&LUKS_KEY_SLOT_DEAD.to_be_bytes());
+    }
+
+    // ── Prepare and encrypt key material ──
+
+    // Fill key material buffer with AF random stripes + computed final stripe
+    let km_buf = &mut out[km_byte_offset..km_byte_offset + km_size];
+    // Copy random stripes 0..stripes-2
+    km_buf[..((stripes - 1) * key_bytes)]
+        .copy_from_slice(&params.af_random[..(stripes - 1) * key_bytes]);
+
+    // Compute final stripe via af_split
+    af_split(
+        params.master_key,
+        key_bytes,
+        stripes,
+        params.use_sha256,
+        km_buf,
+    );
+
+    // Derive the split key from passphrase (same length as master key)
+    let mut split_key = [0u8; 64];
+    pbkdf2_derive(
+        params.passphrase,
+        params.slot_salt,
+        params.iterations,
+        &mut split_key[..key_bytes],
+        params.use_sha256,
+    );
+
+    // Encrypt key material with AES-XTS using the derived split key
+    aes_xts_encrypt(km_buf, &split_key[..key_bytes], 0);
+
+    Some(total_size)
+}
+
 // ─── Key derivation ─────────────────────────────────────────────────
 
 #[cfg(any(feature = "decrypt", feature = "encrypt"))]
