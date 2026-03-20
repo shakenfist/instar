@@ -1211,7 +1211,7 @@
             "safety": "malicious",
             "run_in_ci": true,
             "skip_qemu_img": true,
-            "description": "CVE-2022-47951: Binary VMDK with descriptor referencing /etc/shadow as extent",
+            "description": "CVE-2022-47951: Text VMDK descriptor referencing /etc/shadow as FLAT extent",
             "tags": ["vmdk", "security", "cve", "path-traversal", "descriptor"],
             "cve_references": ["CVE-2022-47951"],
             "generated_by": "imago-testdata/scripts/create-cve-reproducer-testdata.py"
@@ -1223,7 +1223,7 @@
             "safety": "malicious",
             "run_in_ci": true,
             "skip_qemu_img": true,
-            "description": "CVE-2015-5162: Minimal QCOW2 claiming 1 PB virtual size (resource exhaustion)",
+            "description": "CVE-2015-5162: Minimal QCOW2 (192 KiB) with correct L1 table for 1 PiB virtual size",
             "tags": ["qcow2", "security", "cve", "resource-exhaustion", "oversized"],
             "cve_references": ["CVE-2015-5162"],
             "generated_by": "imago-testdata/scripts/create-cve-reproducer-testdata.py"
