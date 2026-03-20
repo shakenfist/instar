@@ -2241,12 +2241,25 @@ struct ConvertArgs {
     #[arg(long)]
     extended_l2: bool,
 
-    /// Passphrase for LUKS-encrypted QCOW2 output (crypt_method=2, AES-256-XTS)
-    #[arg(long, value_name = "PASSPHRASE")]
+    /// Passphrase for LUKS-encrypted QCOW2 output (crypt_method=2, AES-256-XTS).
+    /// Cannot be used with --luks-passphrase or --qcow2-password (they share
+    /// the same config field; use separate invocations to decrypt then re-encrypt).
+    #[arg(
+        long,
+        value_name = "PASSPHRASE",
+        conflicts_with_all = ["luks_passphrase", "luks_passphrase_file",
+                              "qcow2_password", "qcow2_password_file"]
+    )]
     luks_encrypt_passphrase: Option<String>,
 
     /// Read LUKS encryption passphrase from file
-    #[arg(long, value_name = "PATH", conflicts_with = "luks_encrypt_passphrase")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["luks_encrypt_passphrase", "luks_passphrase",
+                              "luks_passphrase_file", "qcow2_password",
+                              "qcow2_password_file"]
+    )]
     luks_encrypt_passphrase_file: Option<String>,
 
     /// PBKDF2 iteration count for LUKS output encryption (default: 20000)
