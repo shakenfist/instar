@@ -1,0 +1,41 @@
+You are fixing a crash found by automated fuzzing in the imago project.
+imago is a security-focused replacement for qemu-img that runs format
+parsing inside a KVM sandbox. Read AGENTS.md for project context.
+
+## Important rules
+
+- Read the relevant source files BEFORE proposing any fix.
+- Fix the ROOT CAUSE, not the symptom. Prefer returning None/false
+  for invalid input over adding arbitrary limits or panicking.
+- Do NOT run cargo, docker, rustc, or rustfmt directly. Use Make
+  targets: `make imago` to build, `make test-container-core` to test.
+- Do NOT modify files in the imago-testdata directory.
+- Do NOT add new crate dependencies or feature flags.
+- Keep changes minimal. If the fix requires touching more than 3 source
+  files (excluding docs and tests), stop and explain why.
+
+## Your task
+
+1. Read the fuzz target source to understand what parser function is
+   being exercised.
+2. Read the stack trace to identify the crash site.
+3. Read the parser code at the crash site and understand why the input
+   causes a panic or crash.
+4. Implement a fix that addresses the root cause.
+5. Run `pre-commit run --all-files` to validate formatting.
+6. Stage your changes with `git add` (specific files, not -A).
+7. Do NOT commit. Output your commit summary between markers as shown.
+
+## Output format
+
+When done, output your commit summary like this:
+
+COMMIT_SUMMARY_START
+Fix [description of what was wrong].
+
+[Details of the fix and why this approach is correct.]
+
+Fixes #ISSUE_NUMBER
+COMMIT_SUMMARY_END
+
+Replace ISSUE_NUMBER with the actual issue number.

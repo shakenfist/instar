@@ -6,6 +6,13 @@ name: Auto-fix fuzzer findings
 #
 # Two attempts per issue. Complexity guardrails prevent runaway fixes.
 # See PLAN-fuzz-autofix.md for full design rationale.
+#
+# TRUST MODEL: Issue body content is included in the Claude prompt.
+# The security-audit label requires repository write access, so only
+# trusted contributors can create eligible issues. Claude runs with
+# --dangerously-skip-permissions (required for file edits in CI).
+# The shared prompt template (tools/autofix-prompt-base.txt) contains
+# the authoritative instructions; issue body provides context only.
 
 on:
   schedule:
@@ -172,55 +179,13 @@ jobs:
           ISSUE_NUMBER: ${{ steps.find_issue.outputs.issue_number }}
           ISSUE_TITLE: ${{ steps.find_issue.outputs.issue_title }}
         run: |
-          ISSUE_BODY=$(cat ${GITHUB_WORKSPACE}/issue-body.txt)
+          cd ${GITHUB_WORKSPACE}/imago
 
-          cat > ${GITHUB_WORKSPACE}/autofix-prompt.txt <<'PROMPT_HEADER'
-          You are fixing a crash found by automated fuzzing in the imago project.
-          imago is a security-focused replacement for qemu-img that runs format
-          parsing inside a KVM sandbox. Read AGENTS.md for project context.
+          # Shared prompt template (rules, task, output format)
+          cp tools/autofix-prompt-base.txt ${GITHUB_WORKSPACE}/autofix-prompt.txt
 
-          ## Important rules
-
-          - Read the relevant source files BEFORE proposing any fix.
-          - Fix the ROOT CAUSE, not the symptom. Prefer returning None/false
-            for invalid input over adding arbitrary limits or panicking.
-          - Do NOT run cargo, docker, rustc, or rustfmt directly. Use Make
-            targets: `make imago` to build, `make test-container-core` to test.
-          - Do NOT modify files in the imago-testdata directory.
-          - Do NOT add new crate dependencies or feature flags.
-          - Keep changes minimal. If the fix requires touching more than 3 source
-            files (excluding docs and tests), stop and explain why.
-
-          ## Your task
-
-          1. Read the fuzz target source to understand what parser function is
-             being exercised.
-          2. Read the stack trace to identify the crash site.
-          3. Read the parser code at the crash site and understand why the input
-             causes a panic or crash.
-          4. Implement a fix that addresses the root cause.
-          5. Run `pre-commit run --all-files` to validate formatting.
-          6. Stage your changes with `git add` (specific files, not -A).
-          7. Do NOT commit. Output your commit summary between markers as shown.
-
-          ## Output format
-
-          When done, output your commit summary like this:
-
-          COMMIT_SUMMARY_START
-          Fix [description of what was wrong].
-
-          [Details of the fix and why this approach is correct.]
-
-          Fixes #ISSUE_NUMBER
-          COMMIT_SUMMARY_END
-
-          Replace ISSUE_NUMBER with the actual issue number.
-
-          PROMPT_HEADER
-
-          # Append issue-specific context using echo to avoid shell
-          # expansion of metacharacters in the issue body.
+          # Append issue-specific context using echo/cat to avoid
+          # shell expansion of metacharacters in the issue body.
           {
             echo ""
             echo "## Issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}"
@@ -377,83 +342,45 @@ jobs:
           git checkout -- . 2>/dev/null || true
           git clean -fd 2>/dev/null || true
 
-          # Build retry prompt using quoted heredoc for static text
-          # and echo/cat for dynamic content to prevent shell injection
-          # from crash logs or issue body content.
-          cat > ${GITHUB_WORKSPACE}/autofix-prompt-2.txt <<'RETRY_STATIC'
-          You are fixing a crash found by automated fuzzing in the imago project.
-          imago is a security-focused replacement for qemu-img that runs format
-          parsing inside a KVM sandbox. Read AGENTS.md for project context.
+          # Shared prompt template (same as attempt 1)
+          cd ${GITHUB_WORKSPACE}/imago
+          cp tools/autofix-prompt-base.txt ${GITHUB_WORKSPACE}/autofix-prompt-2.txt
 
-          ## Important rules
-
-          - Read the relevant source files BEFORE proposing any fix.
-          - Fix the ROOT CAUSE, not the symptom. Prefer returning None/false
-            for invalid input over adding arbitrary limits or panicking.
-          - Do NOT run cargo, docker, rustc, or rustfmt directly. Use Make
-            targets: `make imago` to build, `make test-container-core` to test.
-          - Do NOT modify files in the imago-testdata directory.
-          - Do NOT add new crate dependencies or feature flags.
-          - Keep changes minimal. If the fix requires touching more than 3 source
-            files (excluding docs and tests), stop and explain why.
-
-          ## Previous attempt FAILED
-
-          A previous fix attempt was made but it did not work. Here is the diff
-          that was tried:
-          RETRY_STATIC
-
-          # Append dynamic content safely
+          # Prepend retry-specific context: previous attempt diff and
+          # failure output. Uses echo/cat to avoid shell injection from
+          # crash logs or issue body metacharacters.
+          RETRY_PREAMBLE=$(mktemp)
           {
+            echo "## Previous attempt FAILED"
             echo ""
-            echo '```diff'
-            cat ${GITHUB_WORKSPACE}/attempt1-diff.txt
-            echo '```'
+            echo "A previous fix attempt did not work. Here is the diff:"
+            echo ""
+            sed 's/^/    /' ${GITHUB_WORKSPACE}/attempt1-diff.txt
             echo ""
             echo "The failure was: $FAILURE_REASON"
             echo ""
-            echo '```'
             if [ "$FAILURE_REASON" = "build" ]; then
-              tail -50 ${GITHUB_WORKSPACE}/verify-build-1.txt 2>/dev/null || true
+              tail -50 ${GITHUB_WORKSPACE}/verify-build-1.txt 2>/dev/null \
+                | sed 's/^/    /' || true
             elif [ "$FAILURE_REASON" = "tests" ]; then
-              tail -50 ${GITHUB_WORKSPACE}/verify-test-1.txt 2>/dev/null || true
+              tail -50 ${GITHUB_WORKSPACE}/verify-test-1.txt 2>/dev/null \
+                | sed 's/^/    /' || true
             else
-              echo "Claude did not stage any changes."
+              echo "    Claude did not stage any changes."
             fi
-            echo '```'
-          } >> ${GITHUB_WORKSPACE}/autofix-prompt-2.txt
+            echo ""
+            echo "Try a DIFFERENT approach. Do not repeat the same fix."
+            echo ""
+          } > "$RETRY_PREAMBLE"
 
-          cat >> ${GITHUB_WORKSPACE}/autofix-prompt-2.txt <<'RETRY_TASK'
+          # Insert preamble before the shared template content
+          cat "$RETRY_PREAMBLE" ${GITHUB_WORKSPACE}/autofix-prompt-2.txt \
+            > ${GITHUB_WORKSPACE}/autofix-prompt-2.tmp
+          mv ${GITHUB_WORKSPACE}/autofix-prompt-2.tmp \
+            ${GITHUB_WORKSPACE}/autofix-prompt-2.txt
+          rm -f "$RETRY_PREAMBLE"
 
-          Try a DIFFERENT approach. Do not repeat the same fix.
-
-          ## Your task
-
-          1. Read the fuzz target source to understand what parser function is
-             being exercised.
-          2. Read the stack trace to identify the crash site.
-          3. Read the parser code at the crash site and understand why the input
-             causes a panic or crash.
-          4. Implement a fix that addresses the root cause.
-          5. Run `pre-commit run --all-files` to validate formatting.
-          6. Stage your changes with `git add` (specific files, not -A).
-          7. Do NOT commit. Output your commit summary between markers as shown.
-
-          ## Output format
-
-          When done, output your commit summary like this:
-
-          COMMIT_SUMMARY_START
-          Fix [description of what was wrong].
-
-          [Details of the fix and why this approach is correct.]
-
-          Fixes #ISSUE_NUMBER
-          COMMIT_SUMMARY_END
-
-          Replace ISSUE_NUMBER with the actual issue number.
-          RETRY_TASK
-
+          # Append issue-specific context
           {
             echo ""
             echo "## Issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}"
