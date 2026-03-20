@@ -340,7 +340,7 @@ pub const CHAIN_CONFIG_ADDR: usize = 0x00082000;
 /// Address where LUKS encrypt random data is stored (set by VMM).
 /// Layout: master_key (64B) + mk_digest_salt (32B) + slot_salt (32B)
 /// + uuid (36B) + AF random stripes (key_bytes * (stripes-1)).
-/// Maximum size: 64 + 32 + 32 + 36 + 64*3999 = 255,100 bytes.
+/// Maximum size: 64 + 32 + 32 + 36 + 64*3999 = 256,100 bytes.
 pub const LUKS_ENCRYPT_DATA_ADDR: usize = 0x01800000;
 
 /// Address where the guest builds the LUKS v1 header output.
