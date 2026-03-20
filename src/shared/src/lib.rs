@@ -344,10 +344,11 @@ pub const CHAIN_CONFIG_ADDR: usize = 0x00082000;
 pub const LUKS_ENCRYPT_DATA_ADDR: usize = 0x01800000;
 
 /// Address where the guest builds the LUKS v1 header output.
-/// Placed after the DMA pool (0x210000). The built header
-/// (592B header + key material, ~260KB for AES-256-XTS) is
-/// written here, then copied cluster-by-cluster to the output.
-/// Ends at ~0x250000, safely below SCRATCH_MEM_BASE (0x300000).
+/// Placed at 24.25MB in guest address space, after the stack
+/// (STACK_BASE = 0x01000000). The built header (592B header +
+/// key material, ~260KB for AES-256-XTS) is written here, then
+/// copied cluster-by-cluster to the output. Ends at ~0x01880000,
+/// safely below guest memory end (GUEST_MEM_SIZE = 0x02000000).
 pub const LUKS_HEADER_BUILD_ADDR: usize = 0x01840000;
 
 /// Maximum size of chain config in bytes
