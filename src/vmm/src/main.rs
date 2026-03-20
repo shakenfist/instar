@@ -4584,8 +4584,10 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         let uuid_offset = 64 + 32 + 32;
         let uuid_template = b"00000000-0000-4000-8000-000000000000";
         random_data[uuid_offset..uuid_offset + 36].copy_from_slice(uuid_template);
-        // Fill UUID hex digits from random bytes
+        // Fill UUID hex digits from separate random bytes (not master key)
         let hex_chars = b"0123456789abcdef";
+        let mut uuid_rand = [0u8; 32];
+        rng.fill(&mut uuid_rand[..]);
         let mut ri = 0usize;
         for i in 0..36 {
             let c = random_data[uuid_offset + i];
@@ -4597,11 +4599,11 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                 random_data[uuid_offset + i] = b'4'; // version
             } else if i == 19 {
                 random_data[uuid_offset + i] =
-                    hex_chars[(8 + (random_data[ri] & 0x03)) as usize]; // variant
+                    hex_chars[(8 + (uuid_rand[ri] & 0x03)) as usize]; // variant
                 ri += 1;
             } else {
                 random_data[uuid_offset + i] =
-                    hex_chars[(random_data[ri] & 0x0F) as usize];
+                    hex_chars[(uuid_rand[ri] & 0x0F) as usize];
                 ri += 1;
             }
         }
