@@ -20,7 +20,7 @@ qcow2 = { path = "../../crates/qcow2", features = [
 vmdk = { path = "../../crates/vmdk" }
 vhd = { path = "../../crates/vhd" }
 vhdx = { path = "../../crates/vhdx" }
-luks = { path = "../../crates/luks", features = ["decrypt", "kdf-argon2"] }
+luks = { path = "../../crates/luks", features = ["decrypt", "encrypt", "kdf-argon2"] }
 
 # Argon2 crate still needed directly for Block type in memory allocation
 argon2 = { version = "0.5", default-features = false }

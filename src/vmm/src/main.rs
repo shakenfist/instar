@@ -107,6 +107,8 @@ const CONVERT_CONFIG_FLAG_SKIP_ZEROS: u32 = 1 << 0;
 const CONVERT_CONFIG_FLAG_COMPRESS: u32 = 1 << 1;
 #[allow(dead_code)]
 const CONVERT_CONFIG_FLAG_DECRYPT_AES: u32 = 1 << 2;
+const CONVERT_CONFIG_FLAG_EXTENDED_L2: u32 = 1 << 3;
+const CONVERT_CONFIG_FLAG_ENCRYPT_LUKS: u32 = 1 << 4;
 #[allow(dead_code)]
 const CONVERT_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
 
@@ -2235,6 +2237,35 @@ struct ConvertArgs {
     #[arg(long, value_name = "PATH", conflicts_with = "luks_passphrase")]
     luks_passphrase_file: Option<String>,
 
+    /// Write extended L2 entries (16-byte with subcluster bitmaps) in QCOW2 output
+    #[arg(long)]
+    extended_l2: bool,
+
+    /// Passphrase for LUKS-encrypted QCOW2 output (crypt_method=2, AES-256-XTS).
+    /// Cannot be used with --luks-passphrase or --qcow2-password (they share
+    /// the same config field; use separate invocations to decrypt then re-encrypt).
+    #[arg(
+        long,
+        value_name = "PASSPHRASE",
+        conflicts_with_all = ["luks_passphrase", "luks_passphrase_file",
+                              "qcow2_password", "qcow2_password_file"]
+    )]
+    luks_encrypt_passphrase: Option<String>,
+
+    /// Read LUKS encryption passphrase from file
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["luks_encrypt_passphrase", "luks_passphrase",
+                              "luks_passphrase_file", "qcow2_password",
+                              "qcow2_password_file"]
+    )]
+    luks_encrypt_passphrase_file: Option<String>,
+
+    /// PBKDF2 iteration count for LUKS output encryption (default: 20000)
+    #[arg(long, default_value = "20000")]
+    luks_encrypt_iterations: u32,
+
     /// Extract a specific snapshot (by ID or name) instead of the active image
     #[arg(long, value_name = "ID")]
     snapshot: Option<String>,
@@ -4221,6 +4252,38 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
             .into());
     }
 
+    // Validate --extended-l2 requires -O qcow2
+    if args.extended_l2 && !is_qcow2_output {
+        return Err("--extended-l2 is only supported with QCOW2 (-O qcow2) output".into());
+    }
+
+    // Resolve LUKS encrypt passphrase
+    let luks_encrypt_passphrase = if let Some(ref pp) = args.luks_encrypt_passphrase {
+        Some(pp.clone())
+    } else if let Some(ref path) = args.luks_encrypt_passphrase_file {
+        let mut data = std::fs::read_to_string(path)?;
+        if data.ends_with('\n') {
+            data.pop();
+        }
+        Some(data)
+    } else {
+        None
+    };
+
+    // Validate --luks-encrypt-passphrase requires -O qcow2
+    if luks_encrypt_passphrase.is_some() && !is_qcow2_output {
+        return Err(
+            "--luks-encrypt-passphrase is only supported with QCOW2 (-O qcow2) output".into(),
+        );
+    }
+
+    // Validate --luks-encrypt-passphrase conflicts with -c
+    if luks_encrypt_passphrase.is_some() && args.compress {
+        return Err(
+            "--luks-encrypt-passphrase cannot be combined with -c (compression)".into(),
+        );
+    }
+
     // Auto-discover binaries
     let core_path = get_binary_path("core.bin");
     let operation_path = get_binary_path("convert.bin");
@@ -4422,6 +4485,12 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     if verbose {
         convert_flags |= CONVERT_CONFIG_FLAG_VERBOSE;
     }
+    if args.extended_l2 {
+        convert_flags |= CONVERT_CONFIG_FLAG_EXTENDED_L2;
+    }
+    if luks_encrypt_passphrase.is_some() {
+        convert_flags |= CONVERT_CONFIG_FLAG_ENCRYPT_LUKS;
+    }
     let output_cluster_bits: u32 = if is_qcow2_output {
         args.cluster_size.trailing_zeros()
     } else {
@@ -4507,6 +4576,80 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // Write argon2_mem_size to ConvertConfig (offset 360 = 292 + 64 + 4 pad)
     let argon2_mem_size: u64 = guest_mem_size.saturating_sub(GUEST_MEM_SIZE);
     guest_mem.write_obj(argon2_mem_size, GuestAddress(OPERATION_CONFIG_ADDR + 360))?;
+
+    // Write LUKS encrypt config fields (offsets 368-391)
+    if let Some(ref encrypt_pp) = luks_encrypt_passphrase {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+
+        let key_bytes: usize = 64; // AES-256-XTS
+        let stripes: usize = 4000;
+        let af_random_size = (stripes - 1) * key_bytes;
+
+        // Generate random data: master_key(64) + mk_salt(32) + slot_salt(32) + uuid(36)
+        let random_header_size = 64 + 32 + 32 + 36;
+        let total_random = random_header_size + af_random_size;
+
+        let mut random_data = vec![0u8; total_random];
+        rng.fill(&mut random_data[..]);
+
+        // Format UUID as ASCII hex (bytes 128..164)
+        let uuid_offset = 64 + 32 + 32;
+        let uuid_template = b"00000000-0000-4000-8000-000000000000";
+        random_data[uuid_offset..uuid_offset + 36].copy_from_slice(uuid_template);
+        // Fill UUID hex digits from separate random bytes (not master key)
+        let hex_chars = b"0123456789abcdef";
+        let mut uuid_rand = [0u8; 32];
+        rng.fill(&mut uuid_rand[..]);
+        let mut ri = 0usize;
+        for i in 0..36 {
+            let c = random_data[uuid_offset + i];
+            if c == b'-' {
+                continue;
+            }
+            // Use random byte for hex positions (skip version/variant bits)
+            if i == 14 {
+                random_data[uuid_offset + i] = b'4'; // version
+            } else if i == 19 {
+                random_data[uuid_offset + i] =
+                    hex_chars[(8 + (uuid_rand[ri] & 0x03)) as usize]; // variant
+                ri += 1;
+            } else {
+                random_data[uuid_offset + i] =
+                    hex_chars[(uuid_rand[ri] & 0x0F) as usize];
+                ri += 1;
+            }
+        }
+
+        // Write passphrase into ConvertConfig passphrase field
+        // (reuses the existing passphrase field for LUKS encrypt passphrase)
+        let pp_bytes = encrypt_pp.as_bytes();
+        let pp_len = pp_bytes.len().min(256);
+        guest_mem.write_obj(pp_len as u32, GuestAddress(OPERATION_CONFIG_ADDR + 20))?;
+        guest_mem
+            .write_slice(&pp_bytes[..pp_len], GuestAddress(OPERATION_CONFIG_ADDR + 28))?;
+
+        // Write LUKS encrypt config fields
+        guest_mem.write_obj(
+            args.luks_encrypt_iterations,
+            GuestAddress(OPERATION_CONFIG_ADDR + 368),
+        )?;
+        guest_mem.write_obj(key_bytes as u32, GuestAddress(OPERATION_CONFIG_ADDR + 372))?;
+        let luks_data_addr = shared::LUKS_ENCRYPT_DATA_ADDR as u64;
+        guest_mem.write_obj(luks_data_addr, GuestAddress(OPERATION_CONFIG_ADDR + 376))?;
+        guest_mem.write_obj(
+            total_random as u64,
+            GuestAddress(OPERATION_CONFIG_ADDR + 384),
+        )?;
+
+        // Write random data to guest memory
+        guest_mem.write_slice(&random_data, GuestAddress(luks_data_addr))?;
+
+        debug!(
+            "LUKS encrypt: key_bytes={}, iterations={}, random_data={}B at 0x{:x}",
+            key_bytes, args.luks_encrypt_iterations, total_random, luks_data_addr
+        );
+    }
 
     debug!(
         "Wrote convert config at 0x{:x} \

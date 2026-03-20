@@ -386,13 +386,14 @@ test-rust: imago-devcontainer
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
 		-w "/workspace/src" \
 		"$(IMAGO_IMAGE)" \
-		cargo test --release --workspace \
+		bash -c 'cargo test --release --workspace \
 			--exclude core \
 			--exclude info \
 			--exclude copy \
 			--exclude check \
 			--exclude compare \
-			--exclude convert
+			--exclude convert && \
+		cargo test --release -p luks --features "decrypt,encrypt"'
 
 # Run Python integration tests only (on host)
 # Runs all test files except malicious image tests (explicit opt-in via test-malicious)

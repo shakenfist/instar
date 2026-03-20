@@ -278,11 +278,14 @@ QEMU Copy-On-Write version 2/3. Supported features:
 - Extended L2 entries (16-byte with subcluster bitmaps;
   full subcluster support — the bitmap is parsed for
   per-subcluster data reading: Normal, Zero, and
-  Unallocated states)
+  Unallocated states). Output with `--extended-l2` writes
+  16-byte L2 entries with `incompatible_features` bit 4.
 - Incompatible feature bit validation
 - External data files (metadata/data separation, chain discovery with allowlist)
 - Legacy AES-128-CBC encryption (crypt_method=1) decryption via `--qcow2-password`
 - LUKS-in-QCOW2 encryption (crypt_method=2) decryption via `--luks-passphrase`
+- LUKS-encrypted output (crypt_method=2) via `--luks-encrypt-passphrase`
+  (AES-256-XTS with PBKDF2-SHA256 key derivation, LUKS v1 headers)
 - Snapshot table parsing, detection, and extraction via `--snapshot`
 
 ### raw

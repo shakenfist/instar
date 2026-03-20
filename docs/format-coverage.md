@@ -81,7 +81,10 @@ The `imago convert` operation supports writing output in the following formats:
   MAX_CLUSTER_SIZE + MAX_SECTOR_SIZE (2MB + 64KB).
 - QCOW2 legacy AES-128-CBC encryption (crypt_method=1) is supported via
   `--qcow2-password`. LUKS-in-QCOW2 encryption (crypt_method=2) is supported
-  via `--luks-passphrase`. Native LUKS containers (v1 with PBKDF2, v2 with
+  via `--luks-passphrase`. LUKS-encrypted QCOW2 output is supported via
+  `--luks-encrypt-passphrase` (AES-256-XTS with PBKDF2-SHA256 key derivation,
+  LUKS v1 headers). Encrypted output cannot be combined with
+  compression. Native LUKS containers (v1 with PBKDF2, v2 with
   Argon2id) are supported via `--luks-passphrase` (v2 also requires
   `--max-guest-memory`). LUKS containers wrapping QCOW2 images are
   transparently detected and the inner QCOW2 is processed as the
@@ -92,12 +95,16 @@ The `imago convert` operation supports writing output in the following formats:
   (crypt_method=2) via `--luks-passphrase`, matching the
   convert operation. This allows comparing encrypted QCOW2
   images directly against their decrypted equivalents.
-- Extended L2 images with subclusters are fully supported.
-  The 16-byte L2 entry bitmap is parsed to determine
-  per-subcluster state: Normal subclusters read host data,
-  Zero subclusters are zeroed, and Unallocated subclusters
-  preserve backing data or read as zeros if no backing
-  image is present.
+- Extended L2 images with subclusters are fully supported
+  for both input and output. The 16-byte L2 entry bitmap is
+  parsed to determine per-subcluster state: Normal subclusters
+  read host data, Zero subclusters are zeroed, and Unallocated
+  subclusters preserve backing data or read as zeros if no
+  backing image is present. QCOW2 output with `--extended-l2`
+  writes 16-byte L2 entries with `incompatible_features` bit 4
+  set. Written data clusters are marked fully allocated
+  (alloc_bits=0xFFFFFFFF). Works with both uncompressed and
+  compressed output.
 
 ---
 

@@ -13,6 +13,7 @@ categories = ["no-std", "parser-implementations"]
 kdf-pbkdf2 = ["pbkdf2", "hmac", "sha1", "sha2"]
 kdf-argon2 = ["dep:argon2", "sha2"]
 decrypt = ["aes", "xts-mode", "kdf-pbkdf2"]
+encrypt = ["aes", "xts-mode", "kdf-pbkdf2", "sha1", "sha2"]
 
 [dependencies]
 aes = { version = "0.8", default-features = false, optional = true }

@@ -4175,3 +4175,418 @@ class TestConvertLuksWrappedQcow2(ImagoTestBase):
                 rc, 0,
                 'Should fail without passphrase'
             )
+
+
+class TestConvertExtendedL2Output(ImagoTestBase):
+    """Test QCOW2 output with extended L2 entries."""
+
+    def test_convert_extended_l2_raw_to_qcow2(self):
+        """Convert raw to QCOW2 with --extended-l2."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2:
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw.name, '1M'],
+                capture_output=True
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'raw', '-c',
+                 'write -P 0x42 0 4096', raw.name],
+                capture_output=True
+            )
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(raw.name), Path(qcow2.name),
+                output_format='qcow2', extended_l2=True
+            )
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+
+            # Validate with qemu-img check
+            result = subprocess.run(
+                ['qemu-img', 'check', qcow2.name],
+                capture_output=True, text=True
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img check failed: {result.stderr}'
+            )
+
+            # Verify extended L2 in info output
+            result = subprocess.run(
+                ['qemu-img', 'info', '--output=json',
+                 qcow2.name],
+                capture_output=True, text=True
+            )
+            info = json.loads(result.stdout)
+            ext_l2 = info.get(
+                'format-specific', {}
+            ).get('data', {}).get('extended-l2', False)
+            self.assertTrue(
+                ext_l2,
+                f'Expected extended-l2=true in info: '
+                f'{info.get("format-specific", {})}'
+            )
+
+    def test_convert_extended_l2_roundtrip(self):
+        """Round-trip: raw -> extended L2 QCOW2 -> raw."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_in, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw_in.name, '1M'],
+                capture_output=True
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'raw', '-c',
+                 'write -P 0xAB 0 65536', raw_in.name],
+                capture_output=True
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'raw', '-c',
+                 'write -P 0xCD 524288 8192',
+                 raw_in.name],
+                capture_output=True
+            )
+
+            # raw -> extended L2 QCOW2
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(raw_in.name), Path(qcow2.name),
+                output_format='qcow2', extended_l2=True
+            )
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+
+            # extended L2 QCOW2 -> raw
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(qcow2.name), Path(raw_out.name),
+                output_format='raw'
+            )
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+
+            # Compare original and round-tripped
+            stdout, stderr, rc = self.run_imago_compare(
+                Path(raw_in.name), Path(raw_out.name)
+            )
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+
+    def test_convert_extended_l2_qcow2_to_qcow2(self):
+        """Re-encode standard QCOW2 as extended L2 QCOW2."""
+        with tempfile.NamedTemporaryFile(suffix='.qcow2') as q_in, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as q_out, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as raw1, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as raw2:
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 q_in.name, '1M'],
+                capture_output=True
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'qcow2', '-c',
+                 'write -P 0x55 0 4096', q_in.name],
+                capture_output=True
+            )
+
+            # standard QCOW2 -> extended L2 QCOW2
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(q_in.name), Path(q_out.name),
+                output_format='qcow2', extended_l2=True
+            )
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+
+            # Validate output
+            result = subprocess.run(
+                ['qemu-img', 'check', q_out.name],
+                capture_output=True, text=True
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img check failed: {result.stderr}'
+            )
+
+            # Both to raw, then compare
+            self.run_imago_convert(
+                Path(q_in.name), Path(raw1.name),
+                output_format='raw'
+            )
+            self.run_imago_convert(
+                Path(q_out.name), Path(raw2.name),
+                output_format='raw'
+            )
+            stdout, stderr, rc = self.run_imago_compare(
+                Path(raw1.name), Path(raw2.name)
+            )
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+
+    def test_convert_extended_l2_compressed(self):
+        """Extended L2 with compression."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_in, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw_in.name, '1M'],
+                capture_output=True
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'raw', '-c',
+                 'write -P 0x42 0 65536', raw_in.name],
+                capture_output=True
+            )
+
+            # raw -> compressed extended L2 QCOW2
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(raw_in.name), Path(qcow2.name),
+                output_format='qcow2', compress=True,
+                extended_l2=True
+            )
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+
+            # Validate
+            result = subprocess.run(
+                ['qemu-img', 'check', qcow2.name],
+                capture_output=True, text=True
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img check failed: {result.stderr}'
+            )
+
+            # Round-trip to raw and compare
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(qcow2.name), Path(raw_out.name),
+                output_format='raw'
+            )
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+            stdout, stderr, rc = self.run_imago_compare(
+                Path(raw_in.name), Path(raw_out.name)
+            )
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+
+    def test_convert_extended_l2_non_qcow2_rejected(self):
+        """--extended-l2 with non-QCOW2 output is rejected."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_in, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw_in.name, '1M'],
+                capture_output=True
+            )
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(raw_in.name), Path(raw_out.name),
+                output_format='raw', extended_l2=True
+            )
+            self.assertNotEqual(
+                rc, 0,
+                'Should reject --extended-l2 with -O raw'
+            )
+
+    def test_convert_extended_l2_sparse(self):
+        """Extended L2 with skip-zeros (sparse output)."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_in, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw_in.name, '10M'],
+                capture_output=True
+            )
+            # Write a small amount of data
+            subprocess.run(
+                ['qemu-io', '-f', 'raw', '-c',
+                 'write -P 0x42 0 4096', raw_in.name],
+                capture_output=True
+            )
+
+            # Convert with skip-zeros
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(raw_in.name), Path(qcow2.name),
+                output_format='qcow2', extended_l2=True,
+                skip_zeros=True
+            )
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+
+            # Validate
+            result = subprocess.run(
+                ['qemu-img', 'check', qcow2.name],
+                capture_output=True, text=True
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img check failed: {result.stderr}'
+            )
+
+            # Sparse output should be small
+            qcow2_size = os.path.getsize(qcow2.name)
+            self.assertLess(
+                qcow2_size, 5 * 1024 * 1024,
+                f'Extended L2 output ({qcow2_size}) not sparse'
+            )
+
+            # Round-trip and compare
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(qcow2.name), Path(raw_out.name),
+                output_format='raw'
+            )
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+            stdout, stderr, rc = self.run_imago_compare(
+                Path(raw_in.name), Path(raw_out.name)
+            )
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+
+
+class TestConvertLuksEncryptOutput(ImagoTestBase):
+    """Test LUKS-encrypted QCOW2 output (crypt_method=2)."""
+
+    def test_convert_luks_encrypt_raw_to_qcow2(self):
+        """Convert raw to LUKS-encrypted QCOW2, decrypt back."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_in, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw_in.name, '1M'],
+                capture_output=True
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'raw', '-c',
+                 'write -P 0x42 0 4096', raw_in.name],
+                capture_output=True
+            )
+
+            # Encrypt
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(raw_in.name), Path(qcow2.name),
+                output_format='qcow2',
+                luks_encrypt_passphrase='testpass123'
+            )
+            self.assertEqual(rc, 0, f'Encrypt failed: {stderr}')
+
+            # Decrypt back to raw
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(qcow2.name), Path(raw_out.name),
+                output_format='raw',
+                luks_passphrase='testpass123'
+            )
+            self.assertEqual(rc, 0, f'Decrypt failed: {stderr}')
+
+            # Compare
+            stdout, stderr, rc = self.run_imago_compare(
+                Path(raw_in.name), Path(raw_out.name)
+            )
+            self.assertEqual(
+                rc, 0,
+                f'Round-trip mismatch: {stderr}'
+            )
+
+    def test_convert_luks_encrypt_roundtrip(self):
+        """Encrypt with LUKS, decrypt, verify data at offsets."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_in, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw_in.name, '2M'],
+                capture_output=True
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'raw', '-c',
+                 'write -P 0xAB 0 65536', raw_in.name],
+                capture_output=True
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'raw', '-c',
+                 'write -P 0xCD 1048576 8192',
+                 raw_in.name],
+                capture_output=True
+            )
+
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(raw_in.name), Path(qcow2.name),
+                output_format='qcow2',
+                luks_encrypt_passphrase='roundtrip'
+            )
+            self.assertEqual(rc, 0, f'Encrypt failed: {stderr}')
+
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(qcow2.name), Path(raw_out.name),
+                output_format='raw',
+                luks_passphrase='roundtrip'
+            )
+            self.assertEqual(rc, 0, f'Decrypt failed: {stderr}')
+
+            stdout, stderr, rc = self.run_imago_compare(
+                Path(raw_in.name), Path(raw_out.name)
+            )
+            self.assertEqual(
+                rc, 0, f'Round-trip mismatch: {stderr}'
+            )
+
+    def test_convert_luks_encrypt_wrong_passphrase(self):
+        """Decryption with wrong passphrase should fail."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_in, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw_in.name, '1M'],
+                capture_output=True
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'raw', '-c',
+                 'write -P 0x42 0 4096', raw_in.name],
+                capture_output=True
+            )
+
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(raw_in.name), Path(qcow2.name),
+                output_format='qcow2',
+                luks_encrypt_passphrase='correctpass'
+            )
+            self.assertEqual(rc, 0, f'Encrypt failed: {stderr}')
+
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(qcow2.name), Path(raw_out.name),
+                output_format='raw',
+                luks_passphrase='wrongpass'
+            )
+            self.assertNotEqual(
+                rc, 0,
+                'Should fail with wrong passphrase'
+            )
+
+    def test_convert_luks_encrypt_compress_rejected(self):
+        """LUKS encrypt + compress should be rejected."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_in, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2:
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw_in.name, '1M'],
+                capture_output=True
+            )
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(raw_in.name), Path(qcow2.name),
+                output_format='qcow2', compress=True,
+                luks_encrypt_passphrase='test'
+            )
+            self.assertNotEqual(
+                rc, 0,
+                'Should reject LUKS encrypt + compress'
+            )
+
+    def test_convert_luks_encrypt_non_qcow2_rejected(self):
+        """LUKS encrypt with non-QCOW2 output is rejected."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_in, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw_in.name, '1M'],
+                capture_output=True
+            )
+            stdout, stderr, rc = self.run_imago_convert(
+                Path(raw_in.name), Path(raw_out.name),
+                output_format='raw',
+                luks_encrypt_passphrase='test'
+            )
+            self.assertNotEqual(
+                rc, 0,
+                'Should reject LUKS encrypt with -O raw'
+            )

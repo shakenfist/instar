@@ -560,14 +560,14 @@ pub fn copy_null_padded(src: &[u8], dst: &mut [u8]) {
 
 // ─── AFsplitter ─────────────────────────────────────────────────────
 
-#[cfg(feature = "decrypt")]
+#[cfg(any(feature = "decrypt", feature = "encrypt"))]
 use sha1::Sha1;
 
-#[cfg(any(feature = "decrypt", feature = "kdf-argon2"))]
+#[cfg(any(feature = "decrypt", feature = "encrypt", feature = "kdf-argon2"))]
 use sha2::{Digest, Sha256};
 
 /// AFsplitter diffuse function using SHA-1 (for LUKS v1 with sha1 hash).
-#[cfg(feature = "decrypt")]
+#[cfg(any(feature = "decrypt", feature = "encrypt"))]
 pub fn af_diffuse_sha1(data: &mut [u8], key_bytes: usize) {
     let digest_size = 20;
     let full_blocks = key_bytes / digest_size;
@@ -594,7 +594,7 @@ pub fn af_diffuse_sha1(data: &mut [u8], key_bytes: usize) {
 }
 
 /// AFsplitter diffuse function using SHA-256 (for LUKS v2 or v1 with sha256 hash).
-#[cfg(any(feature = "decrypt", feature = "kdf-argon2"))]
+#[cfg(any(feature = "decrypt", feature = "encrypt", feature = "kdf-argon2"))]
 pub fn af_diffuse_sha256(data: &mut [u8], key_bytes: usize) {
     let digest_size = 32;
     let full_blocks = key_bytes / digest_size;
@@ -625,7 +625,7 @@ pub fn af_diffuse_sha256(data: &mut [u8], key_bytes: usize) {
 /// `km_buf` contains `stripes * key_bytes` bytes of decrypted key material.
 /// `out_key` receives the merged master key (must be >= `key_bytes`).
 /// `use_sha256` selects SHA-256 diffuse (true) vs SHA-1 diffuse (false).
-#[cfg(feature = "decrypt")]
+#[cfg(any(feature = "decrypt", feature = "encrypt"))]
 pub fn af_merge(
     km_buf: &[u8],
     key_bytes: usize,
@@ -649,17 +649,244 @@ pub fn af_merge(
     }
 }
 
+/// AFsplitter split: distribute a master key across striped key material.
+///
+/// This is the inverse of `af_merge`. Given `master_key` (key_bytes)
+/// and `km_buf` pre-filled with random data in stripes 0..stripes-2,
+/// this function computes the final stripe so that
+/// `af_merge(km_buf, key_bytes, stripes, use_sha256, out)` recovers
+/// `master_key`.
+///
+/// `km_buf` must be `stripes * key_bytes` bytes. Stripes 0 through
+/// stripes-2 must be pre-filled with random data by the caller.
+/// The final stripe (at offset `(stripes-1) * key_bytes`) is computed
+/// by this function.
+#[cfg(feature = "encrypt")]
+pub fn af_split(
+    master_key: &[u8],
+    key_bytes: usize,
+    stripes: usize,
+    use_sha256: bool,
+    km_buf: &mut [u8],
+) {
+    // Replay the merge accumulation on stripes 0..stripes-2
+    let mut accum = [0u8; 64];
+    accum[..key_bytes].copy_from_slice(&km_buf[..key_bytes]);
+
+    for i in 1..stripes - 1 {
+        if use_sha256 {
+            af_diffuse_sha256(&mut accum[..key_bytes], key_bytes);
+        } else {
+            af_diffuse_sha1(&mut accum[..key_bytes], key_bytes);
+        }
+        let stripe_offset = i * key_bytes;
+        for j in 0..key_bytes {
+            accum[j] ^= km_buf[stripe_offset + j];
+        }
+    }
+
+    // One more diffuse, then XOR with master key to get final stripe
+    if use_sha256 {
+        af_diffuse_sha256(&mut accum[..key_bytes], key_bytes);
+    } else {
+        af_diffuse_sha1(&mut accum[..key_bytes], key_bytes);
+    }
+    let last_offset = (stripes - 1) * key_bytes;
+    for j in 0..key_bytes {
+        km_buf[last_offset + j] = accum[j] ^ master_key[j];
+    }
+}
+
+// ─── LUKS v1 header construction ────────────────────────────────────
+
+/// Default number of AFsplitter stripes for LUKS v1 key slots.
+pub const LUKS_DEFAULT_STRIPES: u32 = 4000;
+
+/// LUKS v1 key slot inactive marker.
+pub const LUKS_KEY_SLOT_DEAD: u32 = 0x0000DEAD;
+
+/// Parameters for building a LUKS v1 header.
+pub struct LuksV1BuildParams<'a> {
+    /// AES master key (32 bytes for AES-128-XTS, 64 for AES-256-XTS).
+    pub master_key: &'a [u8],
+    /// User passphrase.
+    pub passphrase: &'a [u8],
+    /// PBKDF2 iteration count for key slot derivation.
+    pub iterations: u32,
+    /// PBKDF2 iteration count for master key digest verification.
+    pub mk_digest_iterations: u32,
+    /// Random salt for master key digest (32 bytes).
+    pub mk_digest_salt: &'a [u8; 32],
+    /// Random salt for key slot 0 (32 bytes).
+    pub slot_salt: &'a [u8; 32],
+    /// Random data for AFsplitter stripes (must be
+    /// `(LUKS_DEFAULT_STRIPES - 1) * master_key.len()` bytes).
+    pub af_random: &'a [u8],
+    /// UUID string (36 bytes ASCII, e.g. "12345678-1234-1234-1234-123456789abc").
+    pub uuid: &'a [u8; 36],
+    /// Use SHA-256 (true) or SHA-1 (false) for PBKDF2 and AFsplitter.
+    pub use_sha256: bool,
+}
+
+/// Build a LUKS v1 binary header + encrypted key material into `out`.
+///
+/// Writes the 592-byte header followed by the encrypted key material
+/// for slot 0. Returns the total number of bytes written, or None
+/// on failure.
+///
+/// The key material is placed at sector 8 (byte 4096) to match the
+/// conventional LUKS v1 layout. The payload offset is set to 0
+/// because in QCOW2 crypt_method=2, the LUKS header is metadata
+/// only — encrypted data is at each cluster's host offset.
+///
+/// `out` must be large enough for the header (592 bytes) + padding
+/// to sector 8 + key material (key_bytes * LUKS_DEFAULT_STRIPES).
+/// A safe size is `4096 + 64 * 4000 = 260096` bytes.
+#[cfg(feature = "encrypt")]
+pub fn build_v1_header(params: &LuksV1BuildParams, out: &mut [u8]) -> Option<usize> {
+    let key_bytes = params.master_key.len();
+    if key_bytes != 32 && key_bytes != 64 {
+        return None;
+    }
+    let stripes = LUKS_DEFAULT_STRIPES as usize;
+    let km_size = key_bytes * stripes;
+    // Key material starts at sector 8 (byte 4096)
+    let km_sector_offset: u32 = 8;
+    let km_byte_offset = km_sector_offset as usize * 512;
+    let total_size = km_byte_offset + km_size;
+
+    if out.len() < total_size {
+        return None;
+    }
+    if params.af_random.len() < (stripes - 1) * key_bytes {
+        return None;
+    }
+
+    // Zero the output buffer up to total_size
+    for b in out[..total_size].iter_mut() {
+        *b = 0;
+    }
+
+    // ── Write binary header ──
+
+    // Magic
+    out[0..6].copy_from_slice(&LUKS_MAGIC);
+    // Version = 1
+    out[LUKS_VERSION_OFFSET..LUKS_VERSION_OFFSET + 2]
+        .copy_from_slice(&1u16.to_be_bytes());
+    // Cipher name: "aes"
+    out[LUKS_CIPHER_NAME_OFFSET..LUKS_CIPHER_NAME_OFFSET + 3]
+        .copy_from_slice(b"aes");
+    // Cipher mode: "xts-plain64"
+    out[LUKS_CIPHER_MODE_OFFSET..LUKS_CIPHER_MODE_OFFSET + 11]
+        .copy_from_slice(b"xts-plain64");
+    // Hash spec
+    let hash_name = if params.use_sha256 {
+        b"sha256\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+    } else {
+        b"sha1\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+    };
+    let hash_len = if params.use_sha256 { 6 } else { 4 };
+    out[LUKS_HASH_SPEC_OFFSET..LUKS_HASH_SPEC_OFFSET + hash_len]
+        .copy_from_slice(&hash_name[..hash_len]);
+    // Payload offset = 0 (QCOW2 crypt_method=2: no payload in LUKS area)
+    out[LUKS_PAYLOAD_OFFSET_OFFSET..LUKS_PAYLOAD_OFFSET_OFFSET + 4]
+        .copy_from_slice(&0u32.to_be_bytes());
+    // Key bytes
+    out[LUKS_KEY_BYTES_OFFSET..LUKS_KEY_BYTES_OFFSET + 4]
+        .copy_from_slice(&(key_bytes as u32).to_be_bytes());
+
+    // MK digest salt
+    out[LUKS_MK_DIGEST_SALT_OFFSET..LUKS_MK_DIGEST_SALT_OFFSET + 32]
+        .copy_from_slice(params.mk_digest_salt);
+    // MK digest iterations
+    out[LUKS_MK_DIGEST_ITER_OFFSET..LUKS_MK_DIGEST_ITER_OFFSET + 4]
+        .copy_from_slice(&params.mk_digest_iterations.to_be_bytes());
+
+    // Compute MK digest: PBKDF2(master_key, mk_digest_salt, mk_digest_iter)
+    let mut mk_digest = [0u8; 20];
+    pbkdf2_derive(
+        params.master_key,
+        params.mk_digest_salt,
+        params.mk_digest_iterations,
+        &mut mk_digest,
+        params.use_sha256,
+    );
+    out[LUKS_MK_DIGEST_OFFSET..LUKS_MK_DIGEST_OFFSET + 20]
+        .copy_from_slice(&mk_digest);
+
+    // UUID
+    out[LUKS_UUID_OFFSET..LUKS_UUID_OFFSET + 36]
+        .copy_from_slice(params.uuid);
+
+    // ── Key slot 0 (active) ──
+    let slot_base = LUKS_KEY_SLOT_BASE;
+    out[slot_base..slot_base + 4]
+        .copy_from_slice(&LUKS_KEY_SLOT_ACTIVE.to_be_bytes());
+    out[slot_base + LUKS_SLOT_ITERATIONS_OFFSET
+        ..slot_base + LUKS_SLOT_ITERATIONS_OFFSET + 4]
+        .copy_from_slice(&params.iterations.to_be_bytes());
+    out[slot_base + LUKS_SLOT_SALT_OFFSET
+        ..slot_base + LUKS_SLOT_SALT_OFFSET + 32]
+        .copy_from_slice(params.slot_salt);
+    out[slot_base + LUKS_SLOT_KEY_MATERIAL_OFFSET
+        ..slot_base + LUKS_SLOT_KEY_MATERIAL_OFFSET + 4]
+        .copy_from_slice(&km_sector_offset.to_be_bytes());
+    out[slot_base + LUKS_SLOT_STRIPES_OFFSET
+        ..slot_base + LUKS_SLOT_STRIPES_OFFSET + 4]
+        .copy_from_slice(&(stripes as u32).to_be_bytes());
+
+    // ── Key slots 1-7 (inactive) ──
+    for i in 1..LUKS_NUM_KEY_SLOTS {
+        let base = LUKS_KEY_SLOT_BASE + i * LUKS_KEY_SLOT_SIZE;
+        out[base..base + 4]
+            .copy_from_slice(&LUKS_KEY_SLOT_DEAD.to_be_bytes());
+    }
+
+    // ── Prepare and encrypt key material ──
+
+    // Fill key material buffer with AF random stripes + computed final stripe
+    let km_buf = &mut out[km_byte_offset..km_byte_offset + km_size];
+    // Copy random stripes 0..stripes-2
+    km_buf[..((stripes - 1) * key_bytes)]
+        .copy_from_slice(&params.af_random[..(stripes - 1) * key_bytes]);
+
+    // Compute final stripe via af_split
+    af_split(
+        params.master_key,
+        key_bytes,
+        stripes,
+        params.use_sha256,
+        km_buf,
+    );
+
+    // Derive the split key from passphrase (same length as master key)
+    let mut split_key = [0u8; 64];
+    pbkdf2_derive(
+        params.passphrase,
+        params.slot_salt,
+        params.iterations,
+        &mut split_key[..key_bytes],
+        params.use_sha256,
+    );
+
+    // Encrypt key material with AES-XTS using the derived split key
+    aes_xts_encrypt(km_buf, &split_key[..key_bytes], 0);
+
+    Some(total_size)
+}
+
 // ─── Key derivation ─────────────────────────────────────────────────
 
-#[cfg(feature = "decrypt")]
+#[cfg(any(feature = "decrypt", feature = "encrypt"))]
 use aes::cipher::generic_array::GenericArray;
-#[cfg(feature = "decrypt")]
+#[cfg(any(feature = "decrypt", feature = "encrypt"))]
 use aes::cipher::KeyInit;
-#[cfg(feature = "decrypt")]
+#[cfg(any(feature = "decrypt", feature = "encrypt"))]
 use aes::{Aes128, Aes256};
-#[cfg(feature = "decrypt")]
+#[cfg(any(feature = "decrypt", feature = "encrypt"))]
 use hmac::Hmac;
-#[cfg(feature = "decrypt")]
+#[cfg(any(feature = "decrypt", feature = "encrypt"))]
 use pbkdf2::pbkdf2;
 
 /// AES-XTS decrypt a buffer in place.
@@ -682,8 +909,29 @@ pub fn aes_xts_decrypt(buf: &mut [u8], key: &[u8], start_sector: u64) {
     }
 }
 
+/// AES-XTS encrypt a buffer in place.
+///
+/// Splits the key in half: first half = data key, second = tweak key.
+/// Uses 512-byte sectors starting at the given sector index.
+/// This is the inverse of `aes_xts_decrypt`.
+#[cfg(feature = "encrypt")]
+pub fn aes_xts_encrypt(buf: &mut [u8], key: &[u8], start_sector: u64) {
+    let half = key.len() / 2;
+    if half == 16 {
+        let c1 = Aes128::new(GenericArray::from_slice(&key[..16]));
+        let c2 = Aes128::new(GenericArray::from_slice(&key[16..32]));
+        let xts = xts_mode::Xts128::new(c1, c2);
+        xts.encrypt_area(buf, 512, start_sector as u128, xts_mode::get_tweak_default);
+    } else if half == 32 {
+        let c1 = Aes256::new(GenericArray::from_slice(&key[..32]));
+        let c2 = Aes256::new(GenericArray::from_slice(&key[32..64]));
+        let xts = xts_mode::Xts128::new(c1, c2);
+        xts.encrypt_area(buf, 512, start_sector as u128, xts_mode::get_tweak_default);
+    }
+}
+
 /// PBKDF2 key derivation with SHA-256 or SHA-1.
-#[cfg(feature = "decrypt")]
+#[cfg(any(feature = "decrypt", feature = "encrypt"))]
 pub fn pbkdf2_derive(
     passphrase: &[u8],
     salt: &[u8],
@@ -875,4 +1123,113 @@ pub fn derive_v2_master_key(
     };
     result.key[..key_bytes].copy_from_slice(&candidate[..key_bytes]);
     Some(result)
+}
+
+// ─── Unit tests ─────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[cfg(all(feature = "decrypt", feature = "encrypt"))]
+mod encrypt_tests {
+    use super::*;
+    extern crate alloc;
+    use alloc::vec;
+
+    #[test]
+    fn test_aes_xts_encrypt_decrypt_roundtrip_128() {
+        let key = [0x42u8; 32]; // AES-128-XTS: 16+16
+        let original = [0xABu8; 512];
+        let mut buf = original;
+        aes_xts_encrypt(&mut buf, &key, 0);
+        assert_ne!(buf, original, "encrypted data should differ");
+        aes_xts_decrypt(&mut buf, &key, 0);
+        assert_eq!(buf, original, "round-trip should recover original");
+    }
+
+    #[test]
+    fn test_aes_xts_encrypt_decrypt_roundtrip_256() {
+        let key = [0x55u8; 64]; // AES-256-XTS: 32+32
+        let mut data = [0u8; 1024];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        let original = data;
+        aes_xts_encrypt(&mut data, &key, 7);
+        assert_ne!(data, original);
+        aes_xts_decrypt(&mut data, &key, 7);
+        assert_eq!(data, original);
+    }
+
+    #[test]
+    fn test_af_split_merge_roundtrip() {
+        let master_key = [
+            0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04,
+            0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
+            0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
+            0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0xFF,
+        ];
+        let key_bytes = 32;
+        let stripes = 10;
+        let mut km_buf = vec![0x42u8; key_bytes * stripes];
+        af_split(&master_key, key_bytes, stripes, true, &mut km_buf);
+        let mut recovered = [0u8; 64];
+        af_merge(&km_buf, key_bytes, stripes, true, &mut recovered);
+        assert_eq!(
+            &recovered[..key_bytes], &master_key[..],
+            "af_split then af_merge should recover master key"
+        );
+    }
+
+    #[test]
+    fn test_build_v1_header_and_parse_roundtrip() {
+        let master_key = [0x11u8; 64];
+        let passphrase = b"test-passphrase";
+        let mk_digest_salt = [0x22u8; 32];
+        let slot_salt = [0x33u8; 32];
+        let uuid = b"00000000-0000-4000-8000-000000000000";
+        let key_bytes = 64;
+        let stripes = LUKS_DEFAULT_STRIPES as usize;
+        let af_random = vec![0x44u8; (stripes - 1) * key_bytes];
+        let params = LuksV1BuildParams {
+            master_key: &master_key,
+            passphrase,
+            iterations: 1,
+            mk_digest_iterations: 1,
+            mk_digest_salt: &mk_digest_salt,
+            slot_salt: &slot_salt,
+            af_random: &af_random,
+            uuid: &uuid,
+            use_sha256: true,
+        };
+        let mut out = vec![0u8; 4096 + key_bytes * stripes];
+        let total = build_v1_header(&params, &mut out)
+            .expect("build should succeed");
+        assert!(total > LUKS_V1_HEADER_SIZE);
+        let parsed = parse_v1_header(&out)
+            .expect("parse should succeed");
+        assert_eq!(parsed.version, 1);
+        assert_eq!(parsed.key_bytes as usize, key_bytes);
+        assert!(v1_is_aes_xts(&parsed));
+        assert!(parsed.slots[0].active);
+        assert_eq!(parsed.slots[0].stripes as usize, stripes);
+        for i in 1..8 {
+            assert!(!parsed.slots[i].active);
+        }
+    }
+
+    #[test]
+    fn test_build_v1_header_invalid_key_size() {
+        let params = LuksV1BuildParams {
+            master_key: &[0u8; 48],
+            passphrase: b"test",
+            iterations: 1,
+            mk_digest_iterations: 1,
+            mk_digest_salt: &[0u8; 32],
+            slot_salt: &[0u8; 32],
+            af_random: &[0u8; 1000],
+            uuid: b"00000000-0000-4000-8000-000000000000",
+            use_sha256: true,
+        };
+        let mut out = vec![0u8; 300000];
+        assert!(build_v1_header(&params, &mut out).is_none());
+    }
 }
