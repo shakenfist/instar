@@ -104,14 +104,18 @@ jobs:
           # Filter out issues with blocking labels or existing PRs
           OPEN_PRS=$(gh pr list --state open --json body --limit 50 | jq -r '.[].body')
 
-          echo "$ISSUES" | jq -c '.[]' | while read -r ISSUE; do
+          # Process substitution keeps the loop in the main shell so
+          # GITHUB_OUTPUT writes and exit work correctly (unlike a pipe
+          # which runs the loop in a subshell).
+          while read -r ISSUE; do
             NUM=$(echo "$ISSUE" | jq -r '.number')
             TITLE=$(echo "$ISSUE" | jq -r '.title')
             BODY=$(echo "$ISSUE" | jq -r '.body')
             LABELS=$(echo "$ISSUE" | jq -r '.labels[].name' 2>/dev/null)
 
             # Skip if has blocking labels
-            if echo "$LABELS" | grep -qE '^(autofix-failed|autofix-complex|autofix-attempted)$'; then
+            if echo "$LABELS" | grep -qE \
+                '^(autofix-failed|autofix-complex|autofix-attempted)$'; then
               continue
             fi
 
@@ -121,7 +125,8 @@ jobs:
             fi
 
             # Must contain a reproduction command
-            if ! echo "$BODY" | grep -qE 'cargo fuzz run|differential-fuzz\.py'; then
+            if ! echo "$BODY" | grep -qE \
+                'cargo fuzz run|differential-fuzz\.py'; then
               continue
             fi
 
@@ -131,7 +136,7 @@ jobs:
             echo "issue_title=${TITLE}" >> $GITHUB_OUTPUT
             echo "found=true" >> $GITHUB_OUTPUT
             exit 0
-          done
+          done < <(echo "$ISSUES" | jq -c '.[]')
 
           # No eligible issue found
           echo "found=false" >> $GITHUB_OUTPUT
@@ -214,13 +219,14 @@ jobs:
 
           PROMPT_HEADER
 
-          # Append issue-specific context
-          cat >> ${GITHUB_WORKSPACE}/autofix-prompt.txt <<ISSUE_CONTEXT
-
-          ## Issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}
-
-          ${ISSUE_BODY}
-          ISSUE_CONTEXT
+          # Append issue-specific context using echo to avoid shell
+          # expansion of metacharacters in the issue body.
+          {
+            echo ""
+            echo "## Issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}"
+            echo ""
+            cat ${GITHUB_WORKSPACE}/issue-body.txt
+          } >> ${GITHUB_WORKSPACE}/autofix-prompt.txt
 
       - name: Run Claude Code (attempt 1)
         id: attempt1
@@ -263,23 +269,41 @@ jobs:
           cd ${GITHUB_WORKSPACE}/imago
 
           # Count changed source files (exclude docs, tests, manifests)
-          CHANGED_FILES=$(git diff --cached --name-only \
-            | grep -vE '(\.md$|^tests/|^docs/|manifest\.json$)' \
+          CHANGED_SRC=$(git diff --cached --name-only \
+            | grep -vE '(\.md$|^tests/|^docs/|manifest\.json$)')
+          CHANGED_FILES=$(echo "$CHANGED_SRC" | grep -c '.' || true)
+
+          # Check for cross-crate changes (multiple dirs under src/crates/)
+          CRATE_DIRS=$(echo "$CHANGED_SRC" \
+            | grep '^src/crates/' \
+            | cut -d'/' -f1-3 \
+            | sort -u \
             | wc -l)
+          # Also check if both VMM and a parser crate are touched
+          HAS_VMM=$(echo "$CHANGED_SRC" | grep -c '^src/vmm/' || true)
 
           echo "changed_files=${CHANGED_FILES}" >> $GITHUB_OUTPUT
 
+          REASON=""
           if [ "$CHANGED_FILES" -gt 3 ]; then
-            echo "Fix touches ${CHANGED_FILES} source files (limit: 3)"
+            REASON="too many files (${CHANGED_FILES}, max 3)"
+          elif [ "$CRATE_DIRS" -gt 1 ]; then
+            REASON="cross-crate changes (${CRATE_DIRS} crates)"
+          elif [ "$HAS_VMM" -gt 0 ] && [ "$CRATE_DIRS" -gt 0 ]; then
+            REASON="spans VMM and parser crate"
+          fi
+
+          if [ -n "$REASON" ]; then
+            echo "Complexity guardrail: $REASON"
             echo "too_complex=true" >> $GITHUB_OUTPUT
             gh issue edit "$ISSUE_NUMBER" \
               --add-label "autofix-complex" \
               --remove-label "autofix-attempted"
-            WORKFLOW_RUN="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            WFRUN="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             gh issue comment "$ISSUE_NUMBER" --body \
-              "Autofix exceeded complexity limit (${CHANGED_FILES} files, max 3). Needs human attention.
+              "Autofix exceeded complexity limit: ${REASON}. Needs human attention.
 
-              Workflow: $WORKFLOW_RUN"
+              Workflow: $WFRUN"
           else
             echo "too_complex=false" >> $GITHUB_OUTPUT
           fi
@@ -353,11 +377,10 @@ jobs:
           git checkout -- . 2>/dev/null || true
           git clean -fd 2>/dev/null || true
 
-          # Build retry prompt with first attempt context
-          ISSUE_BODY=$(cat ${GITHUB_WORKSPACE}/issue-body.txt)
-          ATTEMPT1_DIFF=$(cat ${GITHUB_WORKSPACE}/attempt1-diff.txt)
-
-          cat > ${GITHUB_WORKSPACE}/autofix-prompt-2.txt <<RETRY_PROMPT
+          # Build retry prompt using quoted heredoc for static text
+          # and echo/cat for dynamic content to prevent shell injection
+          # from crash logs or issue body content.
+          cat > ${GITHUB_WORKSPACE}/autofix-prompt-2.txt <<'RETRY_STATIC'
           You are fixing a crash found by automated fuzzing in the imago project.
           imago is a security-focused replacement for qemu-img that runs format
           parsing inside a KVM sandbox. Read AGENTS.md for project context.
@@ -368,7 +391,7 @@ jobs:
           - Fix the ROOT CAUSE, not the symptom. Prefer returning None/false
             for invalid input over adding arbitrary limits or panicking.
           - Do NOT run cargo, docker, rustc, or rustfmt directly. Use Make
-            targets: \`make imago\` to build, \`make test-container-core\` to test.
+            targets: `make imago` to build, `make test-container-core` to test.
           - Do NOT modify files in the imago-testdata directory.
           - Do NOT add new crate dependencies or feature flags.
           - Keep changes minimal. If the fix requires touching more than 3 source
@@ -378,16 +401,29 @@ jobs:
 
           A previous fix attempt was made but it did not work. Here is the diff
           that was tried:
+          RETRY_STATIC
 
-          \`\`\`diff
-          ${ATTEMPT1_DIFF}
-          \`\`\`
+          # Append dynamic content safely
+          {
+            echo ""
+            echo '```diff'
+            cat ${GITHUB_WORKSPACE}/attempt1-diff.txt
+            echo '```'
+            echo ""
+            echo "The failure was: $FAILURE_REASON"
+            echo ""
+            echo '```'
+            if [ "$FAILURE_REASON" = "build" ]; then
+              tail -50 ${GITHUB_WORKSPACE}/verify-build-1.txt 2>/dev/null || true
+            elif [ "$FAILURE_REASON" = "tests" ]; then
+              tail -50 ${GITHUB_WORKSPACE}/verify-test-1.txt 2>/dev/null || true
+            else
+              echo "Claude did not stage any changes."
+            fi
+            echo '```'
+          } >> ${GITHUB_WORKSPACE}/autofix-prompt-2.txt
 
-          The failure was: ${FAILURE_REASON}
-
-          \`\`\`
-          ${FAILURE_OUTPUT}
-          \`\`\`
+          cat >> ${GITHUB_WORKSPACE}/autofix-prompt-2.txt <<'RETRY_TASK'
 
           Try a DIFFERENT approach. Do not repeat the same fix.
 
@@ -399,8 +435,8 @@ jobs:
           3. Read the parser code at the crash site and understand why the input
              causes a panic or crash.
           4. Implement a fix that addresses the root cause.
-          5. Run \`pre-commit run --all-files\` to validate formatting.
-          6. Stage your changes with \`git add\` (specific files, not -A).
+          5. Run `pre-commit run --all-files` to validate formatting.
+          6. Stage your changes with `git add` (specific files, not -A).
           7. Do NOT commit. Output your commit summary between markers as shown.
 
           ## Output format
@@ -412,13 +448,18 @@ jobs:
 
           [Details of the fix and why this approach is correct.]
 
-          Fixes #${ISSUE_NUMBER}
+          Fixes #ISSUE_NUMBER
           COMMIT_SUMMARY_END
 
-          ## Issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}
+          Replace ISSUE_NUMBER with the actual issue number.
+          RETRY_TASK
 
-          ${ISSUE_BODY}
-          RETRY_PROMPT
+          {
+            echo ""
+            echo "## Issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}"
+            echo ""
+            cat ${GITHUB_WORKSPACE}/issue-body.txt
+          } >> ${GITHUB_WORKSPACE}/autofix-prompt-2.txt
 
           echo "retry_ready=true" >> $GITHUB_OUTPUT
 
@@ -454,21 +495,36 @@ jobs:
           ISSUE_NUMBER: ${{ steps.find_issue.outputs.issue_number }}
         run: |
           cd ${GITHUB_WORKSPACE}/imago
-          CHANGED_FILES=$(git diff --cached --name-only \
-            | grep -vE '(\.md$|^tests/|^docs/|manifest\.json$)' \
+          CHANGED_SRC=$(git diff --cached --name-only \
+            | grep -vE '(\.md$|^tests/|^docs/|manifest\.json$)')
+          CHANGED_FILES=$(echo "$CHANGED_SRC" | grep -c '.' || true)
+          CRATE_DIRS=$(echo "$CHANGED_SRC" \
+            | grep '^src/crates/' \
+            | cut -d'/' -f1-3 \
+            | sort -u \
             | wc -l)
+          HAS_VMM=$(echo "$CHANGED_SRC" | grep -c '^src/vmm/' || true)
           echo "changed_files=${CHANGED_FILES}" >> $GITHUB_OUTPUT
 
+          REASON=""
           if [ "$CHANGED_FILES" -gt 3 ]; then
+            REASON="too many files (${CHANGED_FILES}, max 3)"
+          elif [ "$CRATE_DIRS" -gt 1 ]; then
+            REASON="cross-crate changes (${CRATE_DIRS} crates)"
+          elif [ "$HAS_VMM" -gt 0 ] && [ "$CRATE_DIRS" -gt 0 ]; then
+            REASON="spans VMM and parser crate"
+          fi
+
+          if [ -n "$REASON" ]; then
             echo "too_complex=true" >> $GITHUB_OUTPUT
             gh issue edit "$ISSUE_NUMBER" \
               --add-label "autofix-complex" \
               --remove-label "autofix-attempted"
-            WORKFLOW_RUN="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            WFRUN="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             gh issue comment "$ISSUE_NUMBER" --body \
-              "Autofix exceeded complexity limit on attempt 2 (${CHANGED_FILES} files). Needs human attention.
+              "Autofix exceeded complexity limit on attempt 2: ${REASON}. Needs human attention.
 
-              Workflow: $WORKFLOW_RUN"
+              Workflow: $WFRUN"
           else
             echo "too_complex=false" >> $GITHUB_OUTPUT
           fi
@@ -554,12 +610,15 @@ jobs:
         run: |
           cd ${GITHUB_WORKSPACE}/imago
 
-          if [ -z "$(git status --porcelain)" ]; then
-            echo "No changes to commit"
+          # Claude is instructed to stage files itself. Only stage
+          # tracked modified files as a safety net (not -A which would
+          # pick up temp files or editor artifacts).
+          git add -u
+
+          if [ -z "$(git diff --cached --name-only)" ]; then
+            echo "No changes staged"
             exit 0
           fi
-
-          git add -A
 
           # Build commit message
           if [ "${{ steps.extract_summary.outputs.summary_found }}" == "true" ] && \
