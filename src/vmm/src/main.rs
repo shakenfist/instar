@@ -4635,7 +4635,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
             GuestAddress(OPERATION_CONFIG_ADDR + 368),
         )?;
         guest_mem.write_obj(key_bytes as u32, GuestAddress(OPERATION_CONFIG_ADDR + 372))?;
-        let luks_data_addr = 0x01800000u64; // 24MB — well into safe guest memory
+        let luks_data_addr = shared::LUKS_ENCRYPT_DATA_ADDR as u64;
         guest_mem.write_obj(luks_data_addr, GuestAddress(OPERATION_CONFIG_ADDR + 376))?;
         guest_mem.write_obj(
             total_random as u64,
