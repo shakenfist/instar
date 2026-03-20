@@ -89,12 +89,30 @@ jobs:
         run: |
           cd ${GITHUB_WORKSPACE}/imago
 
+          # Helper: check if issue body is valid fuzzer JSON.
+          # Returns 0 if the body parses as JSON with required fields.
+          is_valid_fuzzer_json() {
+            local body="$1"
+            echo "$body" | jq -e '
+              .source and .target and .signature and .reproducer
+            ' >/dev/null 2>&1
+          }
+
           if [ -n "$INPUT_ISSUE" ]; then
             # Manual dispatch with specific issue
-            ISSUE_JSON=$(gh issue view "$INPUT_ISSUE" --json number,title,body,labels)
+            ISSUE_JSON=$(gh issue view "$INPUT_ISSUE" \
+              --json number,title,body,labels)
             ISSUE_NUMBER=$(echo "$ISSUE_JSON" | jq -r '.number')
             ISSUE_TITLE=$(echo "$ISSUE_JSON" | jq -r '.title')
-            echo "$ISSUE_JSON" | jq -r '.body' > ${GITHUB_WORKSPACE}/issue-body.txt
+            BODY=$(echo "$ISSUE_JSON" | jq -r '.body')
+
+            if ! is_valid_fuzzer_json "$BODY"; then
+              echo "Issue #${ISSUE_NUMBER} body is not valid fuzzer JSON"
+              echo "found=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            echo "$BODY" > ${GITHUB_WORKSPACE}/issue-body.json
             echo "issue_number=${ISSUE_NUMBER}" >> $GITHUB_OUTPUT
             echo "issue_title=${ISSUE_TITLE}" >> $GITHUB_OUTPUT
             echo "found=true" >> $GITHUB_OUTPUT
@@ -109,7 +127,8 @@ jobs:
             --limit 20)
 
           # Filter out issues with blocking labels or existing PRs
-          OPEN_PRS=$(gh pr list --state open --json body --limit 50 | jq -r '.[].body')
+          OPEN_PRS=$(gh pr list --state open --json body \
+            --limit 50 | jq -r '.[].body')
 
           # Process substitution keeps the loop in the main shell so
           # GITHUB_OUTPUT writes and exit work correctly (unlike a pipe
@@ -118,7 +137,8 @@ jobs:
             NUM=$(echo "$ISSUE" | jq -r '.number')
             TITLE=$(echo "$ISSUE" | jq -r '.title')
             BODY=$(echo "$ISSUE" | jq -r '.body')
-            LABELS=$(echo "$ISSUE" | jq -r '.labels[].name' 2>/dev/null)
+            LABELS=$(echo "$ISSUE" | jq -r \
+              '.labels[].name' 2>/dev/null)
 
             # Skip if has blocking labels
             if echo "$LABELS" | grep -qE \
@@ -131,14 +151,13 @@ jobs:
               continue
             fi
 
-            # Must contain a reproduction command
-            if ! echo "$BODY" | grep -qE \
-                'cargo fuzz run|differential-fuzz\.py'; then
+            # Must have valid structured JSON body from our fuzzers
+            if ! is_valid_fuzzer_json "$BODY"; then
               continue
             fi
 
             # Found an eligible issue
-            echo "$BODY" > ${GITHUB_WORKSPACE}/issue-body.txt
+            echo "$BODY" > ${GITHUB_WORKSPACE}/issue-body.json
             echo "issue_number=${NUM}" >> $GITHUB_OUTPUT
             echo "issue_title=${TITLE}" >> $GITHUB_OUTPUT
             echo "found=true" >> $GITHUB_OUTPUT
@@ -182,15 +201,34 @@ jobs:
           cd ${GITHUB_WORKSPACE}/imago
 
           # Shared prompt template (rules, task, output format)
-          cp tools/autofix-prompt-base.txt ${GITHUB_WORKSPACE}/autofix-prompt.txt
+          cp tools/autofix-prompt-base.txt \
+            ${GITHUB_WORKSPACE}/autofix-prompt.txt
 
-          # Append issue-specific context using echo/cat to avoid
-          # shell expansion of metacharacters in the issue body.
+          # Extract validated fields from the structured JSON body.
+          # Only specific fields are included — raw body text is never
+          # passed to the prompt, preventing prompt injection.
+          IJSON=${GITHUB_WORKSPACE}/issue-body.json
+          F_TARGET=$(jq -r '.target' "$IJSON")
+          F_SIG=$(jq -r '.signature' "$IJSON")
+          F_REPRO=$(jq -r '.reproducer' "$IJSON")
+          F_LOG=$(jq -r '.log_excerpt // empty' "$IJSON")
+          F_SIZE=$(jq -r '.crash_input_size // empty' "$IJSON")
+
           {
             echo ""
             echo "## Issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}"
             echo ""
-            cat ${GITHUB_WORKSPACE}/issue-body.txt
+            echo "Fuzz target: ${F_TARGET}"
+            echo "Crash signature: ${F_SIG}"
+            echo "Crash input size: ${F_SIZE}"
+            echo ""
+            echo "Reproduction command:"
+            echo "    ${F_REPRO}"
+            if [ -n "$F_LOG" ]; then
+              echo ""
+              echo "Log excerpt:"
+              echo "$F_LOG" | sed 's/^/    /'
+            fi
           } >> ${GITHUB_WORKSPACE}/autofix-prompt.txt
 
       - name: Run Claude Code (attempt 1)
@@ -235,7 +273,15 @@ jobs:
 
           # Count changed source files (exclude docs, tests, manifests)
           CHANGED_SRC=$(git diff --cached --name-only \
-            | grep -vE '(\.md$|^tests/|^docs/|manifest\.json$)')
+            | grep -vE '(\.md$|^tests/|^docs/|manifest\.json$)' \
+            || true)
+
+          if [ -z "$CHANGED_SRC" ]; then
+            echo "changed_files=0" >> $GITHUB_OUTPUT
+            echo "too_complex=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           CHANGED_FILES=$(echo "$CHANGED_SRC" | grep -c '.' || true)
 
           # Check for cross-crate changes (multiple dirs under src/crates/)
@@ -256,6 +302,13 @@ jobs:
             REASON="cross-crate changes (${CRATE_DIRS} crates)"
           elif [ "$HAS_VMM" -gt 0 ] && [ "$CRATE_DIRS" -gt 0 ]; then
             REASON="spans VMM and parser crate"
+          fi
+
+          # Check for Cargo.toml changes (possible new dependencies)
+          if [ -z "$REASON" ]; then
+            if echo "$CHANGED_SRC" | grep -q 'Cargo\.toml'; then
+              REASON="Cargo.toml modified (possible new dependency)"
+            fi
           fi
 
           if [ -n "$REASON" ]; then
@@ -380,12 +433,29 @@ jobs:
             ${GITHUB_WORKSPACE}/autofix-prompt-2.txt
           rm -f "$RETRY_PREAMBLE"
 
-          # Append issue-specific context
+          # Append issue context from validated JSON fields only
+          IJSON=${GITHUB_WORKSPACE}/issue-body.json
+          F_TARGET=$(jq -r '.target' "$IJSON")
+          F_SIG=$(jq -r '.signature' "$IJSON")
+          F_REPRO=$(jq -r '.reproducer' "$IJSON")
+          F_LOG=$(jq -r '.log_excerpt // empty' "$IJSON")
+          F_SIZE=$(jq -r '.crash_input_size // empty' "$IJSON")
+
           {
             echo ""
             echo "## Issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}"
             echo ""
-            cat ${GITHUB_WORKSPACE}/issue-body.txt
+            echo "Fuzz target: ${F_TARGET}"
+            echo "Crash signature: ${F_SIG}"
+            echo "Crash input size: ${F_SIZE}"
+            echo ""
+            echo "Reproduction command:"
+            echo "    ${F_REPRO}"
+            if [ -n "$F_LOG" ]; then
+              echo ""
+              echo "Log excerpt:"
+              echo "$F_LOG" | sed 's/^/    /'
+            fi
           } >> ${GITHUB_WORKSPACE}/autofix-prompt-2.txt
 
           echo "retry_ready=true" >> $GITHUB_OUTPUT
@@ -423,7 +493,15 @@ jobs:
         run: |
           cd ${GITHUB_WORKSPACE}/imago
           CHANGED_SRC=$(git diff --cached --name-only \
-            | grep -vE '(\.md$|^tests/|^docs/|manifest\.json$)')
+            | grep -vE '(\.md$|^tests/|^docs/|manifest\.json$)' \
+            || true)
+
+          if [ -z "$CHANGED_SRC" ]; then
+            echo "changed_files=0" >> $GITHUB_OUTPUT
+            echo "too_complex=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           CHANGED_FILES=$(echo "$CHANGED_SRC" | grep -c '.' || true)
           CRATE_DIRS=$(echo "$CHANGED_SRC" \
             | grep '^src/crates/' \
@@ -440,6 +518,12 @@ jobs:
             REASON="cross-crate changes (${CRATE_DIRS} crates)"
           elif [ "$HAS_VMM" -gt 0 ] && [ "$CRATE_DIRS" -gt 0 ]; then
             REASON="spans VMM and parser crate"
+          fi
+
+          if [ -z "$REASON" ]; then
+            if echo "$CHANGED_SRC" | grep -q 'Cargo\.toml'; then
+              REASON="Cargo.toml modified (possible new dependency)"
+            fi
           fi
 
           if [ -n "$REASON" ]; then
@@ -583,9 +667,9 @@ jobs:
             COMMIT_BODY="Automated fix for security-audit finding."
           fi
 
-          # Extract reproducer command from issue body
-          REPRODUCER=$(grep -E 'cargo fuzz run|differential-fuzz\.py' \
-            ${GITHUB_WORKSPACE}/issue-body.txt | head -3 || echo "See issue for details")
+          # Extract reproducer from validated JSON
+          REPRODUCER=$(jq -r '.reproducer // "See issue for details"' \
+            ${GITHUB_WORKSPACE}/issue-body.json)
 
           {
             echo "## Summary"
@@ -683,5 +767,5 @@ jobs:
             verify-test-*.txt
             commit-summary.txt
             commit-message.txt
-            issue-body.txt
+            issue-body.json
           retention-days: 14
