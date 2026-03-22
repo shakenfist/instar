@@ -53,5 +53,11 @@ RUN --mount=type=cache,target=/build/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/.cargo/git,sharing=locked \
     umask 0000 && cargo install cargo-binutils
 
+# Install cargo-fuzz for coverage-guided fuzzing of parser crates
+RUN --mount=type=cache,target=/build/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/.cargo/git,sharing=locked \
+    umask 0000 && cargo install cargo-fuzz
+
 # Verify installation
-RUN rustc --version && cargo --version && rust-objcopy --version && protoc --version
+RUN rustc --version && cargo --version && rust-objcopy --version \
+    && cargo fuzz --version && protoc --version

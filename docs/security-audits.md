@@ -494,6 +494,8 @@ hand-crafted minimal valid inputs for each format.
 - Corpus seeding: `scripts/extract-fuzz-corpus.py`
 - Corpus storage: `imago-testdata/custom/fuzz-corpus/`
 - Crash reporting: automatic GitHub Issue filing with `security-audit` label
+- Automated fixes: `.github/workflows/fuzz-autofix.yml` (daily at 06:00 UTC,
+  Claude Code with 30-turn limit, two attempts per issue)
 
 ### Findings
 

@@ -425,6 +425,8 @@ This allows reviewers to cherry-pick or drop individual fixes as needed.
 - `.github/workflows/pr-address-comments.yml` - Review comment addressing
 - `.github/workflows/test-drift-fix.yml` - Scheduled/on-demand test maintenance
 - `.github/workflows/differential-fuzz.yml` - On-demand differential fuzzing (imago vs qemu-img + libyal)
+- `.github/workflows/coverage-fuzz.yml` - Coverage-guided fuzzing of parser crates (nightly + PR)
+- `.github/workflows/fuzz-autofix.yml` - Automated fuzzer bug fix (daily Claude Code, 30-turn limit)
 
 ### Scripts
 

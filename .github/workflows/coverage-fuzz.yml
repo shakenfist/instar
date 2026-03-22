@@ -147,7 +147,6 @@ jobs:
             -w "/workspace/src/fuzz" \
             imago-build \
             bash -c "
-              cargo install cargo-fuzz 2>/dev/null || true
               cargo fuzz build 2>&1 | tee /workspace/coverage-fuzz-logs/build.log
             "
 
@@ -224,33 +223,31 @@ jobs:
                   coverage-fuzz-logs/${TARGET}.log 2>/dev/null \
                   | head -c 120 || echo "unknown crash")
 
-                # File GitHub issue immediately
+                # File GitHub issue with structured JSON body.
+                # The autofix workflow validates this schema before
+                # including any fields in the Claude prompt.
                 CRASH_SIZE=$(stat -c%s "$CRASH_FILE" 2>/dev/null || echo "unknown")
+                LOG_TAIL=$(tail -30 "coverage-fuzz-logs/${TARGET}.log" 2>/dev/null || true)
+                REPRO="cd src/fuzz && cargo fuzz run $TARGET artifacts/$TARGET/<crash-file>"
+
+                jq -n \
+                  --arg source "coverage-fuzz" \
+                  --arg target "$TARGET" \
+                  --arg signature "$SIGNATURE" \
+                  --arg reproducer "$REPRO" \
+                  --arg crash_input_size "$CRASH_SIZE bytes" \
+                  --arg log_excerpt "$LOG_TAIL" \
+                  --arg ci_run "$WORKFLOW_URL" \
+                  '{source: $source, target: $target,
+                    signature: $signature, reproducer: $reproducer,
+                    crash_input_size: $crash_input_size,
+                    log_excerpt: $log_excerpt, ci_run: $ci_run}' \
+                  > /tmp/issue-body.txt
+
                 gh issue create \
                   --label "security-audit" \
-                  --title "Coverage fuzz crash: ${TARGET}" \
-                  --body "$(cat <<ISSUE_EOF
-## Coverage-guided fuzzing crash
-
-**Target:** \`${TARGET}\`
-**Crash signature:** \`${SIGNATURE}\`
-**Crash input size:** ${CRASH_SIZE} bytes
-**CI run:** ${WORKFLOW_URL}
-
-### Reproduction
-
-\`\`\`bash
-cd src/fuzz
-cargo fuzz run ${TARGET} artifacts/${TARGET}/<crash-file>
-\`\`\`
-
-### Log excerpt
-
-\`\`\`
-$(tail -30 coverage-fuzz-logs/${TARGET}.log)
-\`\`\`
-ISSUE_EOF
-                )"
+                  --title "Coverage fuzz crash: $TARGET" \
+                  --body-file /tmp/issue-body.txt
               fi
             fi
 
