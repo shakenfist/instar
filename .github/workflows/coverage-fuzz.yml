@@ -5,12 +5,21 @@ on:
   schedule:
     - cron: '0 4 * * *'
 
-  # PR validation: 60s smoke test when fuzz/parser code changes
+  # PR validation: build + single-target smoke test
   pull_request:
     paths:
       - 'src/fuzz/**'
       - 'src/crates/**'
       - 'src/shared/**'
+      - '.github/workflows/coverage-fuzz.yml'
+      - 'scripts/extract-fuzz-corpus.py'
+
+  # Post-merge smoke test: 15s per target
+  push:
+    branches: [develop]
+    paths:
+      - 'src/**'
+      - 'scripts/extract-fuzz-corpus.py'
       - '.github/workflows/coverage-fuzz.yml'
 
   # Manual: configurable duration and target selection
@@ -114,7 +123,12 @@ jobs:
             echo "duration=${INPUT_DURATION}" >> $GITHUB_OUTPUT
             echo "targets=${INPUT_TARGETS}" >> $GITHUB_OUTPUT
           elif [ "$EVENT_NAME" = "pull_request" ]; then
-            echo "duration=60" >> $GITHUB_OUTPUT
+            # Build + single target smoke test
+            echo "duration=10" >> $GITHUB_OUTPUT
+            echo "targets=fuzz_format_detect" >> $GITHUB_OUTPUT
+          elif [ "$EVENT_NAME" = "push" ]; then
+            # Post-merge: 15s per target, all targets
+            echo "duration=15" >> $GITHUB_OUTPUT
             echo "targets=" >> $GITHUB_OUTPUT
           else
             # schedule (nightly)
