@@ -134,7 +134,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          mkdir -p coverage-fuzz-logs
+          mkdir -p coverage-fuzz-logs .cargo-cache/registry .cargo-cache/git
 
           # Build fuzz targets inside container
           docker run --rm \
@@ -147,6 +147,7 @@ jobs:
             -w "/workspace/src/fuzz" \
             imago-build \
             bash -c "
+              set -o pipefail
               cargo fuzz build 2>&1 | tee /workspace/coverage-fuzz-logs/build.log
             "
 
@@ -188,6 +189,7 @@ jobs:
               -w "/workspace/src/fuzz" \
               imago-build \
               bash -c "
+                set -o pipefail
                 cargo fuzz run $TARGET \
                   -- -max_total_time=$FUZZ_DURATION \
                      -max_len=4194304 \
@@ -213,6 +215,7 @@ jobs:
                   -w "/workspace/src/fuzz" \
                   imago-build \
                   bash -c "
+                    set -o pipefail
                     cargo fuzz tmin $TARGET /workspace/$CRASH_FILE \
                       -- -max_len=4194304 \
                       2>&1 | tee /workspace/coverage-fuzz-logs/${TARGET}-tmin.log
