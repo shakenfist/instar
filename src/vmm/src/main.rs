@@ -2275,6 +2275,17 @@ struct ConvertArgs {
     /// Without this flag, native LUKS v2 conversion will fail.
     #[arg(long, value_name = "SIZE")]
     max_guest_memory: Option<String>,
+
+    /// Output grain size for VMDK in bytes (default: 65536).
+    /// Must be a power of 2, 4096 to 65536. Only valid with -O vmdk.
+    #[arg(long, default_value = "65536")]
+    grain_size: u32,
+
+    /// Output block size for VHD/VHDX in bytes.
+    /// Defaults: 2097152 (2MB) for VHD, 33554432 (32MB) for VHDX.
+    /// Must be a power of 2. Only valid with -O vpc or -O vhdx.
+    #[arg(long, default_value = "0")]
+    block_size: u32,
 }
 
 #[derive(Args, Debug)]
@@ -4257,6 +4268,61 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         return Err("--extended-l2 is only supported with QCOW2 (-O qcow2) output".into());
     }
 
+    // Validate --grain-size for VMDK output
+    if is_vmdk_output
+        && (!(4096..=65536).contains(&args.grain_size)
+            || !args.grain_size.is_power_of_two())
+    {
+        return Err(format!(
+            "grain size must be a power of 2, \
+             4096 to 65536 (got {})",
+            args.grain_size
+        )
+        .into());
+    }
+    if args.grain_size != 65536 && !is_vmdk_output {
+        return Err(
+            "--grain-size is only supported with VMDK (-O vmdk) output"
+                .into(),
+        );
+    }
+
+    // Validate --block-size for VHD/VHDX output
+    if args.block_size != 0 {
+        if !is_vhd_output && !is_vhdx_output {
+            return Err(
+                "--block-size is only supported with \
+                 VHD (-O vpc) or VHDX (-O vhdx) output"
+                    .into(),
+            );
+        }
+        if !args.block_size.is_power_of_two() {
+            return Err(format!(
+                "block size must be a power of 2 (got {})",
+                args.block_size
+            )
+            .into());
+        }
+        if is_vhd_output && args.block_size < 512 * 1024 {
+            return Err(format!(
+                "VHD block size must be at least 524288 (got {})",
+                args.block_size
+            )
+            .into());
+        }
+        if is_vhdx_output
+            && (args.block_size < 1024 * 1024
+                || args.block_size > 256 * 1024 * 1024)
+        {
+            return Err(format!(
+                "VHDX block size must be 1048576 to \
+                 268435456 (got {})",
+                args.block_size
+            )
+            .into());
+        }
+    }
+
     // Resolve LUKS encrypt passphrase
     let luks_encrypt_passphrase = if let Some(ref pp) = args.luks_encrypt_passphrase {
         Some(pp.clone())
@@ -4651,14 +4717,21 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         );
     }
 
+    // Write grain size and block size at offsets 392 and 396
+    guest_mem.write_obj(args.grain_size, GuestAddress(OPERATION_CONFIG_ADDR + 392))?;
+    guest_mem.write_obj(args.block_size, GuestAddress(OPERATION_CONFIG_ADDR + 396))?;
+
     debug!(
         "Wrote convert config at 0x{:x} \
-         (flags=0x{:x}, chain={}, format={}, cluster_bits={}, argon2_mem_size={})",
+         (flags=0x{:x}, chain={}, format={}, cluster_bits={}, \
+         grain_size={}, block_size={}, argon2_mem_size={})",
         OPERATION_CONFIG_ADDR,
         convert_flags,
         input_device_count,
         target_format,
         output_cluster_bits,
+        args.grain_size,
+        args.block_size,
         argon2_mem_size,
     );
 
