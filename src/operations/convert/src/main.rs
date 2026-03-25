@@ -552,6 +552,7 @@ pub unsafe extern "C" fn _start() -> u64 {
             aes_key.as_ref(),
             luks_key,
             luks_sector_size,
+            config.output_block_size_vhdx(),
             &mut bytes_read,
             &layout,
         ),
@@ -1066,6 +1067,7 @@ unsafe fn convert_luks_wrapped_qcow2(
             None,
             None,
             512,
+            config.output_block_size_vhdx(),
             bytes_read,
             layout,
         ),
@@ -4042,14 +4044,13 @@ unsafe fn convert_to_vhdx(
     aes_key: Option<&[u8; 16]>,
     luks_key: Option<&[u8]>,
     luks_sector_size: u64,
+    block_size: u64,
     bytes_read: &mut u64,
     layout: &ScratchLayout,
 ) -> u64 {
     let oss = (call_table.get_output_sector_size)();
     let oc = (call_table.get_output_capacity)();
     let progress_interval = (call_table.get_progress_interval)();
-
-    let block_size = vhdx::DEFAULT_BLOCK_SIZE as u64; // 32 MiB
     let logical_sector_size: u32 = 512;
     let physical_sector_size: u32 = 4096;
 
