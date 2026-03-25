@@ -523,6 +523,8 @@ class ImagoTestBase(testtools.TestCase):
         luks_passphrase: str = None,
         snapshot: str = None,
         max_guest_memory: str = None,
+        grain_size: int = None,
+        block_size: int = None,
     ) -> tuple:
         """
         Run imago convert on an image.
@@ -576,6 +578,10 @@ class ImagoTestBase(testtools.TestCase):
             cmd.extend(
                 ['--max-guest-memory', max_guest_memory]
             )
+        if grain_size is not None:
+            cmd.extend(['--grain-size', str(grain_size)])
+        if block_size is not None:
+            cmd.extend(['--block-size', str(block_size)])
         cmd.extend([str(input_path), str(output_path)])
 
         try:
