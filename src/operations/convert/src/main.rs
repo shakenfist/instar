@@ -537,6 +537,7 @@ pub unsafe extern "C" fn _start() -> u64 {
             aes_key.as_ref(),
             luks_key,
             luks_sector_size,
+            config.output_block_size_vhd(),
             &mut bytes_read,
             &layout,
         ),
@@ -1050,6 +1051,7 @@ unsafe fn convert_luks_wrapped_qcow2(
             None,
             None,
             512,
+            config.output_block_size_vhd(),
             bytes_read,
             layout,
         ),
@@ -3612,14 +3614,13 @@ unsafe fn convert_to_vhd(
     aes_key: Option<&[u8; 16]>,
     luks_key: Option<&[u8]>,
     luks_sector_size: u64,
+    block_size: u64,
     bytes_read: &mut u64,
     layout: &ScratchLayout,
 ) -> u64 {
     let oss = (call_table.get_output_sector_size)();
     let oc = (call_table.get_output_capacity)();
     let progress_interval = (call_table.get_progress_interval)();
-
-    let block_size = vhd::DEFAULT_BLOCK_SIZE as u64; // 2 MiB
     let max_table_entries = ((virtual_size + block_size - 1) / block_size) as u32;
 
     // Sector bitmap: ceil(block_size / 512 / 8) rounded up to 512
