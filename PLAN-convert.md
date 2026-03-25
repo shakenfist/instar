@@ -166,10 +166,6 @@
 **Known gaps (not yet scheduled):**
 
 *Current limitations:*
-- VMDK output grain size: Fixed at 64KB (128 sectors), not
-  configurable. This is a VMDK format convention.
-- VHD output block size: Fixed at 2MB, not configurable.
-- VHDX output block size: Fixed at 32MB, not configurable.
 - Extended L2 subcluster-level I/O: The 32-bit subcluster
   allocation/zero bitmaps in extended L2 entries are parsed but
   each cluster is treated as fully allocated if any subcluster
@@ -186,6 +182,9 @@
   region table cross-check/fragmentation for VHDX.
 
 *Resolved in later phases (items formerly listed here):*
+- ~~VMDK output grain size~~ — Done (PLAN-grain-and-block.md)
+- ~~VHD output block size~~ — Done (PLAN-grain-and-block.md)
+- ~~VHDX output block size~~ — Done (PLAN-grain-and-block.md)
 - ~~VHD round-trip tests (TestConvertToVhd)~~ — Fixed
 - ~~VMDK compressed output (TestConvertToVmdkCompressed)~~ — Fixed
 - ~~VHD d2v-zerofilled conversion~~ — Fixed

@@ -210,11 +210,15 @@ provides a modular architecture with:
   use `--no-skip-zeros` for dense output. Optional compressed output
   (`-c` flag) packs clusters at sector granularity using raw deflate
   (via miniz_oxide), with fallback to uncompressed for incompressible
-  data. VHD writer emits dynamic VHD with 2 MiB blocks, sector bitmaps,
-  and BAT rewriting (blocks aligned to output sector size with carry-buffer
-  assembly to handle bitmap+data spanning sector boundaries). VHDX writer
-  emits dynamic VHDX with 32 MiB blocks,
-  1MB-aligned structures, CRC-32C checksums, and BAT rewriting.
+  data. VMDK writer emits monolithicSparse or streamOptimized output
+  with configurable grain size (4KB-64KB via `--grain-size`, default
+  64KB). VHD writer emits dynamic VHD with configurable block size
+  (512KB+ via `--block-size`, default 2MB), sector bitmaps, and BAT
+  rewriting (blocks aligned to output sector size with carry-buffer
+  assembly to handle bitmap+data spanning sector boundaries). VHDX
+  writer emits dynamic VHDX with configurable block size (1MB-256MB
+  via `--block-size`, default 32MB), 1MB-aligned structures, CRC-32C
+  checksums, and BAT rewriting.
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation,
