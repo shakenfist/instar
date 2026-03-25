@@ -28,8 +28,9 @@ First public release.
     AES-XTS decryption, inner format detection)
 - **Output formats:** raw, QCOW2 v3 (with optional zlib
   compression, configurable cluster size), VMDK
-  monolithicSparse (with optional DEFLATE compression),
-  VHD dynamic, VHDX dynamic
+  monolithicSparse (with optional DEFLATE compression,
+  configurable grain size), VHD dynamic (configurable
+  block size), VHDX dynamic (configurable block size)
 - **Security model:** all image parsing runs inside a KVM
   sandbox; the host only handles opaque byte streams
 - **Backing chain support:** chain discovery, flattening on

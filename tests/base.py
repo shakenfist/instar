@@ -595,6 +595,125 @@ class ImagoTestBase(testtools.TestCase):
         except subprocess.TimeoutExpired:
             return '', 'Timeout after {}s'.format(timeout), -1
 
+    def assert_size_roundtrip(
+        self, image_id, output_format, expected_format,
+        suffix, grain_size=None, block_size=None,
+        compress=False, timeout=120
+    ):
+        """Round-trip conversion with a specific grain/block size.
+
+        Converts image_id to output_format with the given
+        grain_size or block_size, verifies qemu-img can read
+        the result, converts back to raw, and compares against
+        a qemu-img baseline.
+        """
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+        self.skip_if_hash_mismatch(image)
+
+        size_label = (
+            f'grain={grain_size}' if grain_size
+            else f'block={block_size}'
+        )
+
+        with tempfile.NamedTemporaryFile(
+                suffix=suffix) as fmt_out, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as rt_raw, \
+                tempfile.NamedTemporaryFile(
+                suffix='.raw') as qemu_raw:
+            _, stderr, rc = self.run_imago_convert(
+                image.path, Path(fmt_out.name),
+                output_format=output_format,
+                compress=compress,
+                grain_size=grain_size,
+                block_size=block_size,
+                timeout=timeout
+            )
+            self.assertEqual(
+                rc, 0,
+                f'imago convert to {output_format} '
+                f'({size_label}) failed for '
+                f'{image_id}: {stderr}'
+            )
+
+            result = subprocess.run(
+                [
+                    'qemu-img', 'info', '--output=json',
+                    fmt_out.name,
+                ],
+                capture_output=True, text=True,
+                timeout=30
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img info failed ({size_label}): '
+                f'{result.stderr}'
+            )
+            info = json.loads(result.stdout)
+            self.assertEqual(
+                info.get('format'), expected_format
+            )
+
+            _, rt_stderr, rt_rc = \
+                self.run_imago_convert(
+                    Path(fmt_out.name),
+                    Path(rt_raw.name),
+                    timeout=timeout
+                )
+            self.assertEqual(
+                rt_rc, 0,
+                f'Round-trip failed ({size_label}): '
+                f'{rt_stderr}'
+            )
+
+            _, q_stderr, q_rc = \
+                self.run_qemu_img_convert(
+                    image.path, Path(qemu_raw.name),
+                    timeout=timeout
+                )
+            self.assertEqual(q_rc, 0, q_stderr)
+
+            cmp_out, _, cmp_rc = \
+                self.run_imago_compare(
+                    Path(rt_raw.name),
+                    Path(qemu_raw.name),
+                    timeout=timeout
+                )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Mismatch ({size_label}): {cmp_out}'
+            )
+
+    def assert_convert_rejects(
+        self, output_format, suffix, grain_size=None,
+        block_size=None
+    ):
+        """Assert that imago convert rejects invalid parameters."""
+        image = self.get_image('raw-mbr-partitioned')
+        if not image.path.exists():
+            self.skipTest(
+                f'Image not found: {image.path}'
+            )
+
+        with tempfile.NamedTemporaryFile(
+                suffix=suffix) as out:
+            _, stderr, rc = self.run_imago_convert(
+                image.path, Path(out.name),
+                output_format=output_format,
+                grain_size=grain_size,
+                block_size=block_size
+            )
+            self.assertNotEqual(
+                rc, 0,
+                f'Should have rejected '
+                f'grain_size={grain_size} '
+                f'block_size={block_size}'
+            )
+
     def run_qemu_img_convert(
         self,
         input_path: Path,

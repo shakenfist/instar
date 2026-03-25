@@ -4595,420 +4595,144 @@ class TestConvertLuksEncryptOutput(ImagoTestBase):
 class TestConvertVmdkGrainSize(ImagoTestBase):
     """Test VMDK output with configurable grain sizes."""
 
-    def _test_vmdk_grain_roundtrip(
-        self, image_id, grain, compress=False, timeout=120
-    ):
-        """Convert to VMDK with a specific grain size, round-trip."""
-        image = self.get_image(image_id)
-        if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
-        self.skip_if_hash_mismatch(image)
-
-        with tempfile.NamedTemporaryFile(
-                suffix='.vmdk') as vmdk_out, \
-                tempfile.NamedTemporaryFile(
-                suffix='.raw') as rt_raw, \
-                tempfile.NamedTemporaryFile(
-                suffix='.raw') as qemu_raw:
-            stdout, stderr, rc = self.run_imago_convert(
-                image.path, Path(vmdk_out.name),
-                output_format='vmdk',
-                compress=compress,
-                grain_size=grain,
-                timeout=timeout
-            )
-            self.assertEqual(
-                rc, 0,
-                f'imago convert to vmdk (grain={grain}) '
-                f'failed for {image_id}: {stderr}'
-            )
-
-            # Verify qemu-img can read the VMDK
-            result = subprocess.run(
-                [
-                    'qemu-img', 'info', '--output=json',
-                    vmdk_out.name,
-                ],
-                capture_output=True, text=True,
-                timeout=30
-            )
-            self.assertEqual(
-                result.returncode, 0,
-                f'qemu-img info failed on imago VMDK '
-                f'(grain={grain}): {result.stderr}'
-            )
-            info = json.loads(result.stdout)
-            self.assertEqual(
-                info.get('format'), 'vmdk'
-            )
-
-            # Round-trip back to raw
-            _, rt_stderr, rt_rc = \
-                self.run_imago_convert(
-                    Path(vmdk_out.name),
-                    Path(rt_raw.name),
-                    timeout=timeout
-                )
-            self.assertEqual(
-                rt_rc, 0,
-                f'Round-trip failed (grain={grain}): '
-                f'{rt_stderr}'
-            )
-
-            # qemu baseline
-            _, q_stderr, q_rc = \
-                self.run_qemu_img_convert(
-                    image.path, Path(qemu_raw.name),
-                    timeout=timeout
-                )
-            self.assertEqual(q_rc, 0, q_stderr)
-
-            # Compare
-            cmp_out, _, cmp_rc = \
-                self.run_imago_compare(
-                    Path(rt_raw.name),
-                    Path(qemu_raw.name),
-                    timeout=timeout
-                )
-            self.assertEqual(
-                cmp_rc, 0,
-                f'Mismatch (grain={grain}): {cmp_out}'
-            )
-
     def test_vmdk_grain_4k(self):
         """VMDK with 4KB grain size."""
-        self._test_vmdk_grain_roundtrip(
-            'raw-mbr-partitioned', 4096
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vmdk', 'vmdk',
+            '.vmdk', grain_size=4096
         )
 
     def test_vmdk_grain_8k(self):
         """VMDK with 8KB grain size."""
-        self._test_vmdk_grain_roundtrip(
-            'raw-mbr-partitioned', 8192
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vmdk', 'vmdk',
+            '.vmdk', grain_size=8192
         )
 
     def test_vmdk_grain_16k(self):
         """VMDK with 16KB grain size."""
-        self._test_vmdk_grain_roundtrip(
-            'raw-mbr-partitioned', 16384
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vmdk', 'vmdk',
+            '.vmdk', grain_size=16384
         )
 
     def test_vmdk_grain_32k(self):
         """VMDK with 32KB grain size."""
-        self._test_vmdk_grain_roundtrip(
-            'raw-mbr-partitioned', 32768
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vmdk', 'vmdk',
+            '.vmdk', grain_size=32768
         )
 
     def test_vmdk_grain_default_explicit(self):
         """VMDK with explicit default 64KB grain size."""
-        self._test_vmdk_grain_roundtrip(
-            'raw-mbr-partitioned', 65536
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vmdk', 'vmdk',
+            '.vmdk', grain_size=65536
         )
 
     def test_vmdk_compressed_grain_4k(self):
         """streamOptimized VMDK with 4KB grains."""
-        self._test_vmdk_grain_roundtrip(
-            'raw-mbr-partitioned', 4096,
-            compress=True
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vmdk', 'vmdk',
+            '.vmdk', grain_size=4096, compress=True
         )
 
     def test_vmdk_compressed_grain_16k(self):
         """streamOptimized VMDK with 16KB grains."""
-        self._test_vmdk_grain_roundtrip(
-            'raw-mbr-partitioned', 16384,
-            compress=True
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vmdk', 'vmdk',
+            '.vmdk', grain_size=16384, compress=True
         )
 
     def test_vmdk_grain_invalid_too_small(self):
         """Reject grain size smaller than 4096."""
-        image = self.get_image('raw-mbr-partitioned')
-        if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
-
-        with tempfile.NamedTemporaryFile(
-                suffix='.vmdk') as vmdk_out:
-            _, stderr, rc = self.run_imago_convert(
-                image.path, Path(vmdk_out.name),
-                output_format='vmdk',
-                grain_size=1024
-            )
-            self.assertNotEqual(
-                rc, 0,
-                'Should reject --grain-size 1024'
-            )
+        self.assert_convert_rejects(
+            'vmdk', '.vmdk', grain_size=1024
+        )
 
     def test_vmdk_grain_invalid_too_large(self):
         """Reject grain size larger than 65536."""
-        image = self.get_image('raw-mbr-partitioned')
-        if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
-
-        with tempfile.NamedTemporaryFile(
-                suffix='.vmdk') as vmdk_out:
-            _, stderr, rc = self.run_imago_convert(
-                image.path, Path(vmdk_out.name),
-                output_format='vmdk',
-                grain_size=131072
-            )
-            self.assertNotEqual(
-                rc, 0,
-                'Should reject --grain-size 131072'
-            )
+        self.assert_convert_rejects(
+            'vmdk', '.vmdk', grain_size=131072
+        )
 
 
 class TestConvertVhdBlockSize(ImagoTestBase):
     """Test VHD output with configurable block sizes."""
 
-    def _test_vhd_block_roundtrip(
-        self, image_id, block, timeout=120
-    ):
-        """Convert to VHD with a specific block size, round-trip."""
-        image = self.get_image(image_id)
-        if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
-        self.skip_if_hash_mismatch(image)
-
-        with tempfile.NamedTemporaryFile(
-                suffix='.vhd') as vhd_out, \
-                tempfile.NamedTemporaryFile(
-                suffix='.raw') as rt_raw, \
-                tempfile.NamedTemporaryFile(
-                suffix='.raw') as qemu_raw:
-            stdout, stderr, rc = self.run_imago_convert(
-                image.path, Path(vhd_out.name),
-                output_format='vpc',
-                block_size=block,
-                timeout=timeout
-            )
-            self.assertEqual(
-                rc, 0,
-                f'imago convert to VHD (block={block}) '
-                f'failed for {image_id}: {stderr}'
-            )
-
-            # Verify qemu-img can read it
-            result = subprocess.run(
-                [
-                    'qemu-img', 'info', '--output=json',
-                    vhd_out.name,
-                ],
-                capture_output=True, text=True,
-                timeout=30
-            )
-            self.assertEqual(
-                result.returncode, 0,
-                f'qemu-img info failed (block={block}): '
-                f'{result.stderr}'
-            )
-            info = json.loads(result.stdout)
-            self.assertEqual(
-                info.get('format'), 'vpc'
-            )
-
-            # Round-trip back to raw
-            _, rt_stderr, rt_rc = \
-                self.run_imago_convert(
-                    Path(vhd_out.name),
-                    Path(rt_raw.name),
-                    timeout=timeout
-                )
-            self.assertEqual(
-                rt_rc, 0,
-                f'Round-trip failed (block={block}): '
-                f'{rt_stderr}'
-            )
-
-            # qemu baseline
-            _, q_stderr, q_rc = \
-                self.run_qemu_img_convert(
-                    image.path, Path(qemu_raw.name),
-                    timeout=timeout
-                )
-            self.assertEqual(q_rc, 0, q_stderr)
-
-            # Compare
-            cmp_out, _, cmp_rc = \
-                self.run_imago_compare(
-                    Path(rt_raw.name),
-                    Path(qemu_raw.name),
-                    timeout=timeout
-                )
-            self.assertEqual(
-                cmp_rc, 0,
-                f'Mismatch (block={block}): {cmp_out}'
-            )
-
     def test_vhd_block_512k(self):
         """VHD with 512KB block size."""
-        self._test_vhd_block_roundtrip(
-            'raw-mbr-partitioned', 524288
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vpc', 'vpc',
+            '.vhd', block_size=524288
         )
 
     def test_vhd_block_1m(self):
         """VHD with 1MB block size."""
-        self._test_vhd_block_roundtrip(
-            'raw-mbr-partitioned', 1048576
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vpc', 'vpc',
+            '.vhd', block_size=1048576
         )
 
     def test_vhd_block_default_explicit(self):
         """VHD with explicit default 2MB block size."""
-        self._test_vhd_block_roundtrip(
-            'raw-mbr-partitioned', 2097152
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vpc', 'vpc',
+            '.vhd', block_size=2097152
         )
 
     def test_vhd_block_8m(self):
         """VHD with 8MB block size."""
-        self._test_vhd_block_roundtrip(
-            'raw-mbr-partitioned', 8388608
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vpc', 'vpc',
+            '.vhd', block_size=8388608
         )
 
     def test_vhd_block_invalid_not_power_of_2(self):
         """Reject non-power-of-2 VHD block size."""
-        image = self.get_image('raw-mbr-partitioned')
-        if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
+        self.assert_convert_rejects(
+            'vpc', '.vhd', block_size=3000000
+        )
 
-        with tempfile.NamedTemporaryFile(
-                suffix='.vhd') as vhd_out:
-            _, stderr, rc = self.run_imago_convert(
-                image.path, Path(vhd_out.name),
-                output_format='vpc',
-                block_size=3000000
-            )
-            self.assertNotEqual(
-                rc, 0,
-                'Should reject non-power-of-2 block size'
-            )
+    def test_vhd_block_invalid_too_large(self):
+        """Reject VHD block size above 256MB."""
+        self.assert_convert_rejects(
+            'vpc', '.vhd', block_size=536870912
+        )
 
 
 class TestConvertVhdxBlockSize(ImagoTestBase):
     """Test VHDX output with configurable block sizes."""
 
-    def _test_vhdx_block_roundtrip(
-        self, image_id, block, timeout=120
-    ):
-        """Convert to VHDX with specific block size, round-trip."""
-        image = self.get_image(image_id)
-        if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
-        self.skip_if_hash_mismatch(image)
-
-        with tempfile.NamedTemporaryFile(
-                suffix='.vhdx') as vhdx_out, \
-                tempfile.NamedTemporaryFile(
-                suffix='.raw') as rt_raw, \
-                tempfile.NamedTemporaryFile(
-                suffix='.raw') as qemu_raw:
-            stdout, stderr, rc = self.run_imago_convert(
-                image.path, Path(vhdx_out.name),
-                output_format='vhdx',
-                block_size=block,
-                timeout=timeout
-            )
-            self.assertEqual(
-                rc, 0,
-                f'imago convert to VHDX (block={block}) '
-                f'failed for {image_id}: {stderr}'
-            )
-
-            # Verify qemu-img can read it
-            result = subprocess.run(
-                [
-                    'qemu-img', 'info', '--output=json',
-                    vhdx_out.name,
-                ],
-                capture_output=True, text=True,
-                timeout=30
-            )
-            self.assertEqual(
-                result.returncode, 0,
-                f'qemu-img info failed (block={block}): '
-                f'{result.stderr}'
-            )
-            info = json.loads(result.stdout)
-            self.assertEqual(
-                info.get('format'), 'vhdx'
-            )
-
-            # Round-trip back to raw
-            _, rt_stderr, rt_rc = \
-                self.run_imago_convert(
-                    Path(vhdx_out.name),
-                    Path(rt_raw.name),
-                    timeout=timeout
-                )
-            self.assertEqual(
-                rt_rc, 0,
-                f'Round-trip failed (block={block}): '
-                f'{rt_stderr}'
-            )
-
-            # qemu baseline
-            _, q_stderr, q_rc = \
-                self.run_qemu_img_convert(
-                    image.path, Path(qemu_raw.name),
-                    timeout=timeout
-                )
-            self.assertEqual(q_rc, 0, q_stderr)
-
-            # Compare
-            cmp_out, _, cmp_rc = \
-                self.run_imago_compare(
-                    Path(rt_raw.name),
-                    Path(qemu_raw.name),
-                    timeout=timeout
-                )
-            self.assertEqual(
-                cmp_rc, 0,
-                f'Mismatch (block={block}): {cmp_out}'
-            )
-
     def test_vhdx_block_1m(self):
         """VHDX with 1MB block size."""
-        self._test_vhdx_block_roundtrip(
-            'raw-mbr-partitioned', 1048576
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vhdx', 'vhdx',
+            '.vhdx', block_size=1048576
         )
 
     def test_vhdx_block_4m(self):
         """VHDX with 4MB block size."""
-        self._test_vhdx_block_roundtrip(
-            'raw-mbr-partitioned', 4194304
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vhdx', 'vhdx',
+            '.vhdx', block_size=4194304
         )
 
     def test_vhdx_block_default_explicit(self):
         """VHDX with explicit default 32MB block size."""
-        self._test_vhdx_block_roundtrip(
-            'raw-mbr-partitioned', 33554432
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vhdx', 'vhdx',
+            '.vhdx', block_size=33554432
         )
 
     def test_vhdx_block_invalid_too_small(self):
         """Reject VHDX block size below 1MB."""
-        image = self.get_image('raw-mbr-partitioned')
-        if not image.path.exists():
-            self.skipTest(
-                f'Image not found: {image.path}'
-            )
+        self.assert_convert_rejects(
+            'vhdx', '.vhdx', block_size=524288
+        )
 
-        with tempfile.NamedTemporaryFile(
-                suffix='.vhdx') as vhdx_out:
-            _, stderr, rc = self.run_imago_convert(
-                image.path, Path(vhdx_out.name),
-                output_format='vhdx',
-                block_size=524288
-            )
-            self.assertNotEqual(
-                rc, 0,
-                'Should reject VHDX --block-size 524288'
-            )
+    def test_vhdx_block_invalid_too_large(self):
+        """Reject VHDX block size above 256MB."""
+        self.assert_convert_rejects(
+            'vhdx', '.vhdx', block_size=536870912
+        )

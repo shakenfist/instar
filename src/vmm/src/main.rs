@@ -4303,9 +4303,13 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
             )
             .into());
         }
-        if is_vhd_output && args.block_size < 512 * 1024 {
+        if is_vhd_output
+            && (args.block_size < 512 * 1024
+                || args.block_size > 256 * 1024 * 1024)
+        {
             return Err(format!(
-                "VHD block size must be at least 524288 (got {})",
+                "VHD block size must be 524288 to \
+                 268435456 (got {})",
                 args.block_size
             )
             .into());

@@ -360,7 +360,10 @@ Refcount table reading. Backing chain walking via `read_virtual_offset()`.
 from any supported input format (with backing chain flattening and
 decompression), writes to any supported output format (raw, QCOW2, VMDK,
 VHD, VHDX). QCOW2 output involves writing headers, L2 tables, refcount
-tables, and optionally compressed clusters.
+tables, and optionally compressed clusters. VMDK output uses a configurable
+grain size (4KB-64KB via `ConvertConfig.output_grain_size`). VHD and VHDX
+output use a configurable block size (via `ConvertConfig.output_block_size`)
+with format-specific defaults and validation ranges.
 
 **What to pay attention to:**
 

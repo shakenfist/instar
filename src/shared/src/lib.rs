@@ -1917,7 +1917,7 @@ impl ConvertConfig {
     /// Returns 2MB if unset or out of range.
     pub fn output_block_size_vhd(&self) -> u64 {
         let v = self.output_block_size;
-        if v != 0 && v.is_power_of_two() && v >= 512 * 1024 {
+        if v != 0 && v.is_power_of_two() && v >= 512 * 1024 && v <= 256 * 1024 * 1024 {
             v as u64
         } else {
             2 * 1024 * 1024
