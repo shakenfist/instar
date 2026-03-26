@@ -6,6 +6,7 @@ import os
 import re
 import resource
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Optional, Tuple
 
