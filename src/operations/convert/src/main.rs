@@ -3032,12 +3032,19 @@ unsafe fn convert_to_vmdk(
                 return *bytes_read;
             }
 
-            // When grain_size < sector_size, read_raw_sectors reads a
-            // full sector starting from the sector containing
-            // virtual_offset. Shift the relevant sub-grain portion
-            // to the buffer start so we use the correct grain data.
+            // When grain_size < input sector_size, read_raw_sectors
+            // reads one full input sector into buf_data. Shift the
+            // sub-grain portion at intra_sector to the buffer start.
+            // Both grain_size and sector_size are powers of two, so
+            // the grain never straddles a sector boundary and
+            // intra_sector + this_chunk <= sector_size <= buf capacity.
             let intra_sector = (virtual_offset % sector_size as u64) as usize;
             if intra_sector > 0 {
+                debug_assert!(
+                    intra_sector + this_chunk as usize <= scratch_layout.buf_size,
+                    "sub-grain copy would read past buffer: intra_sector={}, this_chunk={}, buf_size={}",
+                    intra_sector, this_chunk, scratch_layout.buf_size,
+                );
                 core::ptr::copy(buf_data.add(intra_sector), buf_data, this_chunk as usize);
             }
 
@@ -3328,12 +3335,19 @@ unsafe fn convert_to_vmdk_compressed(
                 return *bytes_read;
             }
 
-            // When grain_size < sector_size, read_raw_sectors reads a
-            // full sector starting from the sector containing
-            // virtual_offset. Shift the relevant sub-grain portion
-            // to the buffer start so we use the correct grain data.
+            // When grain_size < input sector_size, read_raw_sectors
+            // reads one full input sector into buf_data. Shift the
+            // sub-grain portion at intra_sector to the buffer start.
+            // Both grain_size and sector_size are powers of two, so
+            // the grain never straddles a sector boundary and
+            // intra_sector + this_chunk <= sector_size <= buf capacity.
             let intra_sector = (virtual_offset % sector_size as u64) as usize;
             if intra_sector > 0 {
+                debug_assert!(
+                    intra_sector + this_chunk as usize <= scratch_layout.buf_size,
+                    "sub-grain copy would read past buffer: intra_sector={}, this_chunk={}, buf_size={}",
+                    intra_sector, this_chunk, scratch_layout.buf_size,
+                );
                 core::ptr::copy(buf_data.add(intra_sector), buf_data, this_chunk as usize);
             }
 
