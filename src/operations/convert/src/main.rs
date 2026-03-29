@@ -3032,6 +3032,15 @@ unsafe fn convert_to_vmdk(
                 return *bytes_read;
             }
 
+            // When grain_size < sector_size, read_raw_sectors reads a
+            // full sector starting from the sector containing
+            // virtual_offset. Shift the relevant sub-grain portion
+            // to the buffer start so we use the correct grain data.
+            let intra_sector = (virtual_offset % sector_size as u64) as usize;
+            if intra_sector > 0 {
+                core::ptr::copy(buf_data.add(intra_sector), buf_data, this_chunk as usize);
+            }
+
             // Skip zero grains when configured
             if skip_zeros && is_all_zeros_ptr(buf_data, this_chunk as usize) {
                 grains_done += 1;
@@ -3318,6 +3327,16 @@ unsafe fn convert_to_vmdk_compressed(
                 (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                 return *bytes_read;
             }
+
+            // When grain_size < sector_size, read_raw_sectors reads a
+            // full sector starting from the sector containing
+            // virtual_offset. Shift the relevant sub-grain portion
+            // to the buffer start so we use the correct grain data.
+            let intra_sector = (virtual_offset % sector_size as u64) as usize;
+            if intra_sector > 0 {
+                core::ptr::copy(buf_data.add(intra_sector), buf_data, this_chunk as usize);
+            }
+
             // Skip zero grains
             if skip_zeros && is_all_zeros_ptr(buf_data, this_chunk as usize) {
                 grains_done += 1;
