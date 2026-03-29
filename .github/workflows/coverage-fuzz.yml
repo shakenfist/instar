@@ -131,8 +131,8 @@ jobs:
             echo "duration=15" >> $GITHUB_OUTPUT
             echo "targets=" >> $GITHUB_OUTPUT
           else
-            # schedule (nightly)
-            echo "duration=3600" >> $GITHUB_OUTPUT
+            # schedule (nightly) — 2000s × 13 targets ≈ 433 min, fits 480 min timeout
+            echo "duration=2000" >> $GITHUB_OUTPUT
             echo "targets=" >> $GITHUB_OUTPUT
           fi
 
