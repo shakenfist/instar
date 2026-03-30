@@ -772,14 +772,11 @@ pub fn build_v1_header(params: &LuksV1BuildParams, out: &mut [u8]) -> Option<usi
     // Magic
     out[0..6].copy_from_slice(&LUKS_MAGIC);
     // Version = 1
-    out[LUKS_VERSION_OFFSET..LUKS_VERSION_OFFSET + 2]
-        .copy_from_slice(&1u16.to_be_bytes());
+    out[LUKS_VERSION_OFFSET..LUKS_VERSION_OFFSET + 2].copy_from_slice(&1u16.to_be_bytes());
     // Cipher name: "aes"
-    out[LUKS_CIPHER_NAME_OFFSET..LUKS_CIPHER_NAME_OFFSET + 3]
-        .copy_from_slice(b"aes");
+    out[LUKS_CIPHER_NAME_OFFSET..LUKS_CIPHER_NAME_OFFSET + 3].copy_from_slice(b"aes");
     // Cipher mode: "xts-plain64"
-    out[LUKS_CIPHER_MODE_OFFSET..LUKS_CIPHER_MODE_OFFSET + 11]
-        .copy_from_slice(b"xts-plain64");
+    out[LUKS_CIPHER_MODE_OFFSET..LUKS_CIPHER_MODE_OFFSET + 11].copy_from_slice(b"xts-plain64");
     // Hash spec
     let hash_name = if params.use_sha256 {
         b"sha256\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
@@ -812,35 +809,27 @@ pub fn build_v1_header(params: &LuksV1BuildParams, out: &mut [u8]) -> Option<usi
         &mut mk_digest,
         params.use_sha256,
     );
-    out[LUKS_MK_DIGEST_OFFSET..LUKS_MK_DIGEST_OFFSET + 20]
-        .copy_from_slice(&mk_digest);
+    out[LUKS_MK_DIGEST_OFFSET..LUKS_MK_DIGEST_OFFSET + 20].copy_from_slice(&mk_digest);
 
     // UUID
-    out[LUKS_UUID_OFFSET..LUKS_UUID_OFFSET + 36]
-        .copy_from_slice(params.uuid);
+    out[LUKS_UUID_OFFSET..LUKS_UUID_OFFSET + 36].copy_from_slice(params.uuid);
 
     // ── Key slot 0 (active) ──
     let slot_base = LUKS_KEY_SLOT_BASE;
-    out[slot_base..slot_base + 4]
-        .copy_from_slice(&LUKS_KEY_SLOT_ACTIVE.to_be_bytes());
-    out[slot_base + LUKS_SLOT_ITERATIONS_OFFSET
-        ..slot_base + LUKS_SLOT_ITERATIONS_OFFSET + 4]
+    out[slot_base..slot_base + 4].copy_from_slice(&LUKS_KEY_SLOT_ACTIVE.to_be_bytes());
+    out[slot_base + LUKS_SLOT_ITERATIONS_OFFSET..slot_base + LUKS_SLOT_ITERATIONS_OFFSET + 4]
         .copy_from_slice(&params.iterations.to_be_bytes());
-    out[slot_base + LUKS_SLOT_SALT_OFFSET
-        ..slot_base + LUKS_SLOT_SALT_OFFSET + 32]
+    out[slot_base + LUKS_SLOT_SALT_OFFSET..slot_base + LUKS_SLOT_SALT_OFFSET + 32]
         .copy_from_slice(params.slot_salt);
-    out[slot_base + LUKS_SLOT_KEY_MATERIAL_OFFSET
-        ..slot_base + LUKS_SLOT_KEY_MATERIAL_OFFSET + 4]
+    out[slot_base + LUKS_SLOT_KEY_MATERIAL_OFFSET..slot_base + LUKS_SLOT_KEY_MATERIAL_OFFSET + 4]
         .copy_from_slice(&km_sector_offset.to_be_bytes());
-    out[slot_base + LUKS_SLOT_STRIPES_OFFSET
-        ..slot_base + LUKS_SLOT_STRIPES_OFFSET + 4]
+    out[slot_base + LUKS_SLOT_STRIPES_OFFSET..slot_base + LUKS_SLOT_STRIPES_OFFSET + 4]
         .copy_from_slice(&(stripes as u32).to_be_bytes());
 
     // ── Key slots 1-7 (inactive) ──
     for i in 1..LUKS_NUM_KEY_SLOTS {
         let base = LUKS_KEY_SLOT_BASE + i * LUKS_KEY_SLOT_SIZE;
-        out[base..base + 4]
-            .copy_from_slice(&LUKS_KEY_SLOT_DEAD.to_be_bytes());
+        out[base..base + 4].copy_from_slice(&LUKS_KEY_SLOT_DEAD.to_be_bytes());
     }
 
     // ── Prepare and encrypt key material ──
@@ -1162,10 +1151,9 @@ mod encrypt_tests {
     #[test]
     fn test_af_split_merge_roundtrip() {
         let master_key = [
-            0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04,
-            0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
-            0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
-            0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0xFF,
+            0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A,
+            0x0B, 0x0C, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0, 0xB0, 0xC0,
+            0xD0, 0xE0, 0xF0, 0xFF,
         ];
         let key_bytes = 32;
         let stripes = 10;
@@ -1174,7 +1162,8 @@ mod encrypt_tests {
         let mut recovered = [0u8; 64];
         af_merge(&km_buf, key_bytes, stripes, true, &mut recovered);
         assert_eq!(
-            &recovered[..key_bytes], &master_key[..],
+            &recovered[..key_bytes],
+            &master_key[..],
             "af_split then af_merge should recover master key"
         );
     }
@@ -1201,11 +1190,9 @@ mod encrypt_tests {
             use_sha256: true,
         };
         let mut out = vec![0u8; 4096 + key_bytes * stripes];
-        let total = build_v1_header(&params, &mut out)
-            .expect("build should succeed");
+        let total = build_v1_header(&params, &mut out).expect("build should succeed");
         assert!(total > LUKS_V1_HEADER_SIZE);
-        let parsed = parse_v1_header(&out)
-            .expect("parse should succeed");
+        let parsed = parse_v1_header(&out).expect("parse should succeed");
         assert_eq!(parsed.version, 1);
         assert_eq!(parsed.key_bytes as usize, key_bytes);
         assert!(v1_is_aes_xts(&parsed));

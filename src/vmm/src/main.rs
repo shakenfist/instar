@@ -4270,8 +4270,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 
     // Validate --grain-size for VMDK output
     if is_vmdk_output
-        && (!(4096..=65536).contains(&args.grain_size)
-            || !args.grain_size.is_power_of_two())
+        && (!(4096..=65536).contains(&args.grain_size) || !args.grain_size.is_power_of_two())
     {
         return Err(format!(
             "grain size must be a power of 2, \
@@ -4281,32 +4280,22 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         .into());
     }
     if args.grain_size != 65536 && !is_vmdk_output {
-        return Err(
-            "--grain-size is only supported with VMDK (-O vmdk) output"
-                .into(),
-        );
+        return Err("--grain-size is only supported with VMDK (-O vmdk) output".into());
     }
 
     // Validate --block-size for VHD/VHDX output
     if args.block_size != 0 {
         if !is_vhd_output && !is_vhdx_output {
-            return Err(
-                "--block-size is only supported with \
+            return Err("--block-size is only supported with \
                  VHD (-O vpc) or VHDX (-O vhdx) output"
-                    .into(),
-            );
+                .into());
         }
         if !args.block_size.is_power_of_two() {
-            return Err(format!(
-                "block size must be a power of 2 (got {})",
-                args.block_size
-            )
-            .into());
+            return Err(
+                format!("block size must be a power of 2 (got {})", args.block_size).into(),
+            );
         }
-        if is_vhd_output
-            && (args.block_size < 512 * 1024
-                || args.block_size > 256 * 1024 * 1024)
-        {
+        if is_vhd_output && (args.block_size < 512 * 1024 || args.block_size > 256 * 1024 * 1024) {
             return Err(format!(
                 "VHD block size must be 524288 to \
                  268435456 (got {})",
@@ -4314,9 +4303,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
             )
             .into());
         }
-        if is_vhdx_output
-            && (args.block_size < 1024 * 1024
-                || args.block_size > 256 * 1024 * 1024)
+        if is_vhdx_output && (args.block_size < 1024 * 1024 || args.block_size > 256 * 1024 * 1024)
         {
             return Err(format!(
                 "VHDX block size must be 1048576 to \
@@ -4349,9 +4336,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 
     // Validate --luks-encrypt-passphrase conflicts with -c
     if luks_encrypt_passphrase.is_some() && args.compress {
-        return Err(
-            "--luks-encrypt-passphrase cannot be combined with -c (compression)".into(),
-        );
+        return Err("--luks-encrypt-passphrase cannot be combined with -c (compression)".into());
     }
 
     // Auto-discover binaries
@@ -4681,12 +4666,10 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
             if i == 14 {
                 random_data[uuid_offset + i] = b'4'; // version
             } else if i == 19 {
-                random_data[uuid_offset + i] =
-                    hex_chars[(8 + (uuid_rand[ri] & 0x03)) as usize]; // variant
+                random_data[uuid_offset + i] = hex_chars[(8 + (uuid_rand[ri] & 0x03)) as usize]; // variant
                 ri += 1;
             } else {
-                random_data[uuid_offset + i] =
-                    hex_chars[(uuid_rand[ri] & 0x0F) as usize];
+                random_data[uuid_offset + i] = hex_chars[(uuid_rand[ri] & 0x0F) as usize];
                 ri += 1;
             }
         }
@@ -4696,8 +4679,10 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         let pp_bytes = encrypt_pp.as_bytes();
         let pp_len = pp_bytes.len().min(256);
         guest_mem.write_obj(pp_len as u32, GuestAddress(OPERATION_CONFIG_ADDR + 20))?;
-        guest_mem
-            .write_slice(&pp_bytes[..pp_len], GuestAddress(OPERATION_CONFIG_ADDR + 28))?;
+        guest_mem.write_slice(
+            &pp_bytes[..pp_len],
+            GuestAddress(OPERATION_CONFIG_ADDR + 28),
+        )?;
 
         // Write LUKS encrypt config fields
         guest_mem.write_obj(
