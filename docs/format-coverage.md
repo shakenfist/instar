@@ -56,9 +56,9 @@ The `imago convert` operation supports writing output in the following formats:
 |---------------|--------|--------------|
 | **raw** (default) | Supported | Flat byte-for-byte output, sparse by default (`--no-skip-zeros` for dense) |
 | **qcow2** | Supported | QCOW2 v3, 16-bit refcounts, configurable cluster size (512B-64KB), optional zlib compression (`-c`) |
-| **vmdk** | Supported | monolithicSparse (default), streamOptimized with `-c` (DEFLATE compressed) |
-| **vpc** (VHD) | Supported | Dynamic VHD with 2 MiB blocks, BAT-based allocation, skip-zeros support |
-| **vhdx** | Supported | Dynamic VHDX with 32 MiB blocks, CRC-32C checksums, 1MB-aligned structures |
+| **vmdk** | Supported | monolithicSparse (default), streamOptimized with `-c`, configurable grain size (4KB-64KB via `--grain-size`) |
+| **vpc** (VHD) | Supported | Dynamic VHD, configurable block size (512KB+ via `--block-size`, default 2MB), BAT-based allocation |
+| **vhdx** | Supported | Dynamic VHDX, configurable block size (1MB-256MB via `--block-size`, default 32MB), CRC-32C checksums |
 
 ### Input Format Support for Conversion
 

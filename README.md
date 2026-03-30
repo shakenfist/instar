@@ -250,6 +250,15 @@ imago convert --luks-passphrase 'secret' --max-guest-memory 1G encrypted.luks ou
 # Decrypt LUKS container wrapping a QCOW2 image
 imago convert --luks-passphrase 'secret' luks-wrapped.img output.raw
 
+# Specify VMDK grain size (4096 to 65536, default: 65536)
+imago convert -O vmdk --grain-size 4096 input.raw output.vmdk
+
+# Specify VHD block size (524288+, default: 2097152)
+imago convert -O vpc --block-size 1048576 input.raw output.vhd
+
+# Specify VHDX block size (1048576 to 268435456, default: 33554432)
+imago convert -O vhdx --block-size 4194304 input.raw output.vhdx
+
 # Progress reporting
 imago convert -p 5 input.qcow2 output.raw
 ```
@@ -275,9 +284,13 @@ Supported output formats:
 - **raw** (default) - Flat raw output
 - **qcow2** - QCOW2 v3 output with 16-bit refcounts, configurable cluster
   size (512 bytes to 64KB, default 64KB), optional zlib compression (`-c`)
-- **vmdk** - VMDK monolithicSparse output, optional DEFLATE compression (`-c`)
-- **vpc** - VHD dynamic output with 2 MiB blocks
-- **vhdx** - VHDX dynamic output with 32 MiB blocks
+- **vmdk** - VMDK monolithicSparse output, configurable grain size
+  (4KB-64KB, default 64KB via `--grain-size`), optional DEFLATE
+  compression (`-c`)
+- **vpc** - VHD dynamic output, configurable block size (512KB+,
+  default 2MB via `--block-size`)
+- **vhdx** - VHDX dynamic output, configurable block size (1MB-256MB,
+  default 32MB via `--block-size`)
 
 ### Version Compatibility
 

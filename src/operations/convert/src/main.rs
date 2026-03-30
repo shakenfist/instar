@@ -491,6 +491,7 @@ pub unsafe extern "C" fn _start() -> u64 {
             }
         }
         ImageFormat::Vmdk4 => {
+            let grain_size = config.output_grain_size();
             if config.should_compress() {
                 convert_to_vmdk_compressed(
                     call_table,
@@ -503,6 +504,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                     aes_key.as_ref(),
                     luks_key,
                     luks_sector_size,
+                    grain_size,
                     &mut bytes_read,
                     &layout,
                 )
@@ -518,6 +520,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                     aes_key.as_ref(),
                     luks_key,
                     luks_sector_size,
+                    grain_size,
                     &mut bytes_read,
                     &layout,
                 )
@@ -534,6 +537,7 @@ pub unsafe extern "C" fn _start() -> u64 {
             aes_key.as_ref(),
             luks_key,
             luks_sector_size,
+            config.output_block_size_vhd(),
             &mut bytes_read,
             &layout,
         ),
@@ -548,6 +552,7 @@ pub unsafe extern "C" fn _start() -> u64 {
             aes_key.as_ref(),
             luks_key,
             luks_sector_size,
+            config.output_block_size_vhdx(),
             &mut bytes_read,
             &layout,
         ),
@@ -1001,6 +1006,7 @@ unsafe fn convert_luks_wrapped_qcow2(
             }
         }
         ImageFormat::Vmdk4 => {
+            let grain_size = config.output_grain_size();
             if config.should_compress() {
                 convert_to_vmdk_compressed(
                     &wrapped_ct,
@@ -1013,6 +1019,7 @@ unsafe fn convert_luks_wrapped_qcow2(
                     None,
                     None,
                     512,
+                    grain_size,
                     bytes_read,
                     layout,
                 )
@@ -1028,6 +1035,7 @@ unsafe fn convert_luks_wrapped_qcow2(
                     None,
                     None,
                     512,
+                    grain_size,
                     bytes_read,
                     layout,
                 )
@@ -1044,6 +1052,7 @@ unsafe fn convert_luks_wrapped_qcow2(
             None,
             None,
             512,
+            config.output_block_size_vhd(),
             bytes_read,
             layout,
         ),
@@ -1058,6 +1067,7 @@ unsafe fn convert_luks_wrapped_qcow2(
             None,
             None,
             512,
+            config.output_block_size_vhdx(),
             bytes_read,
             layout,
         ),
@@ -2825,15 +2835,6 @@ unsafe fn convert_to_qcow2_compressed(
 // VMDK monolithicSparse output (Phase 8d)
 // ================================================================
 
-/// VMDK grain size in 512-byte sectors (64KB grains).
-const VMDK_GRAIN_SIZE_SECTORS: u64 = 128;
-/// VMDK grain size in bytes.
-const VMDK_GRAIN_SIZE_BYTES: u64 = VMDK_GRAIN_SIZE_SECTORS * 512;
-/// Number of grain table entries per grain table.
-const VMDK_GTES_PER_GT: u32 = 512;
-/// Grain table size in bytes (512 × 4-byte entries).
-const VMDK_GT_BYTES: u64 = VMDK_GTES_PER_GT as u64 * 4;
-
 /// Computed layout for VMDK output.
 struct VmdkOutputLayout {
     capacity_sectors: u64,
@@ -2842,6 +2843,14 @@ struct VmdkOutputLayout {
     output_sector_size: usize,
     output_capacity: u64,
     progress_interval: u32,
+    /// Grain size in 512-byte sectors.
+    grain_size_sectors: u64,
+    /// Grain size in bytes.
+    grain_size_bytes: u64,
+    /// Number of grain table entries per grain table (always 512).
+    gtes_per_gt: u32,
+    /// Grain table size in bytes (gtes_per_gt × 4).
+    gt_bytes: u64,
     /// Byte offset where grain data starts (after header+descriptor,
     /// aligned to output sector size).
     grain_data_start: u64,
@@ -2856,6 +2865,7 @@ unsafe fn init_vmdk_output_layout(
     call_table: &CallTable,
     input_device_count: usize,
     virtual_size: u64,
+    grain_size_bytes: u64,
     bytes_read: &mut u64,
     layout: &ScratchLayout,
 ) -> Option<VmdkOutputLayout> {
@@ -2863,11 +2873,15 @@ unsafe fn init_vmdk_output_layout(
     let output_capacity = (call_table.get_output_capacity)();
     let progress_interval = (call_table.get_progress_interval)();
 
+    let grain_size_sectors = grain_size_bytes / 512;
+    let gtes_per_gt = vmdk::DEFAULT_NUM_GTES_PER_GT;
+    let gt_bytes = gtes_per_gt as u64 * 4;
+
     let capacity_sectors = (virtual_size + 511) / 512;
-    let total_grains = (capacity_sectors + VMDK_GRAIN_SIZE_SECTORS - 1) / VMDK_GRAIN_SIZE_SECTORS;
+    let total_grains = (capacity_sectors + grain_size_sectors - 1) / grain_size_sectors;
 
     // Sectors covered by one grain table
-    let sectors_per_gt = VMDK_GTES_PER_GT as u64 * VMDK_GRAIN_SIZE_SECTORS;
+    let sectors_per_gt = gtes_per_gt as u64 * grain_size_sectors;
     let num_gd_entries = ((capacity_sectors + sectors_per_gt - 1) / sectors_per_gt) as u32;
 
     // Header (512 bytes) + descriptor (DESC_SECTORS × 512 bytes)
@@ -2898,6 +2912,10 @@ unsafe fn init_vmdk_output_layout(
         output_sector_size,
         output_capacity,
         progress_interval,
+        grain_size_sectors,
+        grain_size_bytes,
+        gtes_per_gt,
+        gt_bytes,
         grain_data_start,
         gd_buf,
         gd_bytes,
@@ -2923,6 +2941,7 @@ unsafe fn convert_to_vmdk(
     aes_key: Option<&[u8; 16]>,
     luks_key: Option<&[u8]>,
     luks_sector_size: u64,
+    grain_size_bytes: u64,
     bytes_read: &mut u64,
     scratch_layout: &ScratchLayout,
 ) -> u64 {
@@ -2930,6 +2949,7 @@ unsafe fn convert_to_vmdk(
         call_table,
         input_device_count,
         virtual_size,
+        grain_size_bytes,
         bytes_read,
         scratch_layout,
     ) {
@@ -2968,16 +2988,16 @@ unsafe fn convert_to_vmdk(
         let mut gt_byte_offset: u64 = 0;
 
         // Range of grains covered by this GD entry
-        let first_grain = gd_idx as u64 * VMDK_GTES_PER_GT as u64;
-        let last_grain = core::cmp::min(first_grain + VMDK_GTES_PER_GT as u64, layout.total_grains);
+        let first_grain = gd_idx as u64 * layout.gtes_per_gt as u64;
+        let last_grain = core::cmp::min(first_grain + layout.gtes_per_gt as u64, layout.total_grains);
 
         for grain in first_grain..last_grain {
-            let virtual_offset = grain * VMDK_GRAIN_SIZE_BYTES;
+            let virtual_offset = grain * layout.grain_size_bytes;
             let remaining = virtual_size - virtual_offset;
-            let this_chunk = if remaining < VMDK_GRAIN_SIZE_BYTES {
+            let this_chunk = if remaining < layout.grain_size_bytes {
                 remaining
             } else {
-                VMDK_GRAIN_SIZE_BYTES
+                layout.grain_size_bytes
             };
 
             // Reset bump allocator before ZSTD decompression
@@ -3012,6 +3032,22 @@ unsafe fn convert_to_vmdk(
                 return *bytes_read;
             }
 
+            // When grain_size < input sector_size, read_raw_sectors
+            // reads one full input sector into buf_data. Shift the
+            // sub-grain portion at intra_sector to the buffer start.
+            // Both grain_size and sector_size are powers of two, so
+            // the grain never straddles a sector boundary and
+            // intra_sector + this_chunk <= sector_size <= buf capacity.
+            let intra_sector = (virtual_offset % sector_size as u64) as usize;
+            if intra_sector > 0 {
+                debug_assert!(
+                    intra_sector + this_chunk as usize <= scratch_layout.buf_size,
+                    "sub-grain copy would read past buffer: intra_sector={}, this_chunk={}, buf_size={}",
+                    intra_sector, this_chunk, scratch_layout.buf_size,
+                );
+                core::ptr::copy(buf_data.add(intra_sector), buf_data, this_chunk as usize);
+            }
+
             // Skip zero grains when configured
             if skip_zeros && is_all_zeros_ptr(buf_data, this_chunk as usize) {
                 grains_done += 1;
@@ -3033,22 +3069,22 @@ unsafe fn convert_to_vmdk(
             if !gt_allocated {
                 // Align to output sector
                 gt_byte_offset = align_up(next_free_byte, oss);
-                let gt_alloc = align_up(VMDK_GT_BYTES, oss);
+                let gt_alloc = align_up(layout.gt_bytes, oss);
                 next_free_byte = gt_byte_offset + gt_alloc;
                 gt_allocated = true;
             }
 
             // Allocate grain
             let grain_byte_offset = align_up(next_free_byte, oss);
-            let grain_alloc = align_up(VMDK_GRAIN_SIZE_BYTES, oss);
+            let grain_alloc = align_up(layout.grain_size_bytes, oss);
             next_free_byte = grain_byte_offset + grain_alloc;
 
             // Zero-pad partial final grain
-            if this_chunk < VMDK_GRAIN_SIZE_BYTES {
+            if this_chunk < layout.grain_size_bytes {
                 core::ptr::write_bytes(
                     buf_data.add(this_chunk as usize),
                     0,
-                    (VMDK_GRAIN_SIZE_BYTES - this_chunk) as usize,
+                    (layout.grain_size_bytes - this_chunk) as usize,
                 );
             }
 
@@ -3057,7 +3093,7 @@ unsafe fn convert_to_vmdk(
                 call_table,
                 buf_data,
                 grain_byte_offset,
-                VMDK_GRAIN_SIZE_BYTES,
+                layout.grain_size_bytes,
                 oss,
                 oc,
             ) {
@@ -3073,7 +3109,7 @@ unsafe fn convert_to_vmdk(
 
             // Set GTE (sector offset in 512-byte sectors)
             let gt_idx = (grain - first_grain) as usize;
-            let gt_slice = core::slice::from_raw_parts_mut(buf_gt, VMDK_GT_BYTES as usize);
+            let gt_slice = core::slice::from_raw_parts_mut(buf_gt, layout.gt_bytes as usize);
             shared::write_le_u32(gt_slice, gt_idx * 4, (grain_byte_offset / 512) as u32);
 
             grains_done += 1;
@@ -3092,7 +3128,7 @@ unsafe fn convert_to_vmdk(
         // Flush GT if any grains were written
         if gt_allocated {
             // Write GT (padded to output sector size)
-            let gt_write_bytes = align_up(VMDK_GT_BYTES, oss);
+            let gt_write_bytes = align_up(layout.gt_bytes, oss);
             if !write_bytes_to_output(call_table, buf_gt, gt_byte_offset, gt_write_bytes, oss, oc) {
                 (call_table.send_error)(
                     b"convert\0".as_ptr(),
@@ -3133,8 +3169,8 @@ unsafe fn convert_to_vmdk(
     vmdk::build_sparse_header(
         hdr_slice,
         layout.capacity_sectors,
-        VMDK_GRAIN_SIZE_SECTORS,
-        VMDK_GTES_PER_GT,
+        layout.grain_size_sectors,
+        layout.gtes_per_gt,
         gd_byte_offset / 512,
         overhead_sectors,
     );
@@ -3195,6 +3231,7 @@ unsafe fn convert_to_vmdk_compressed(
     aes_key: Option<&[u8; 16]>,
     luks_key: Option<&[u8]>,
     luks_sector_size: u64,
+    grain_size_bytes: u64,
     bytes_read: &mut u64,
     scratch_layout: &ScratchLayout,
 ) -> u64 {
@@ -3202,6 +3239,7 @@ unsafe fn convert_to_vmdk_compressed(
         call_table,
         input_device_count,
         virtual_size,
+        grain_size_bytes,
         bytes_read,
         scratch_layout,
     ) {
@@ -3253,16 +3291,16 @@ unsafe fn convert_to_vmdk_compressed(
 
         let mut gt_has_data = false;
 
-        let first_grain = gd_idx as u64 * VMDK_GTES_PER_GT as u64;
-        let last_grain = core::cmp::min(first_grain + VMDK_GTES_PER_GT as u64, layout.total_grains);
+        let first_grain = gd_idx as u64 * layout.gtes_per_gt as u64;
+        let last_grain = core::cmp::min(first_grain + layout.gtes_per_gt as u64, layout.total_grains);
 
         for grain in first_grain..last_grain {
-            let virtual_offset = grain * VMDK_GRAIN_SIZE_BYTES;
+            let virtual_offset = grain * layout.grain_size_bytes;
             let remaining = virtual_size - virtual_offset;
-            let this_chunk = if remaining < VMDK_GRAIN_SIZE_BYTES {
+            let this_chunk = if remaining < layout.grain_size_bytes {
                 remaining
             } else {
-                VMDK_GRAIN_SIZE_BYTES
+                layout.grain_size_bytes
             };
 
             // Reset bump allocator before ZSTD decompression
@@ -3296,6 +3334,23 @@ unsafe fn convert_to_vmdk_compressed(
                 (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                 return *bytes_read;
             }
+
+            // When grain_size < input sector_size, read_raw_sectors
+            // reads one full input sector into buf_data. Shift the
+            // sub-grain portion at intra_sector to the buffer start.
+            // Both grain_size and sector_size are powers of two, so
+            // the grain never straddles a sector boundary and
+            // intra_sector + this_chunk <= sector_size <= buf capacity.
+            let intra_sector = (virtual_offset % sector_size as u64) as usize;
+            if intra_sector > 0 {
+                debug_assert!(
+                    intra_sector + this_chunk as usize <= scratch_layout.buf_size,
+                    "sub-grain copy would read past buffer: intra_sector={}, this_chunk={}, buf_size={}",
+                    intra_sector, this_chunk, scratch_layout.buf_size,
+                );
+                core::ptr::copy(buf_data.add(intra_sector), buf_data, this_chunk as usize);
+            }
+
             // Skip zero grains
             if skip_zeros && is_all_zeros_ptr(buf_data, this_chunk as usize) {
                 grains_done += 1;
@@ -3314,11 +3369,11 @@ unsafe fn convert_to_vmdk_compressed(
             }
 
             // Zero-pad partial final grain
-            if this_chunk < VMDK_GRAIN_SIZE_BYTES {
+            if this_chunk < layout.grain_size_bytes {
                 core::ptr::write_bytes(
                     buf_data.add(this_chunk as usize),
                     0,
-                    (VMDK_GRAIN_SIZE_BYTES - this_chunk) as usize,
+                    (layout.grain_size_bytes - this_chunk) as usize,
                 );
             }
 
@@ -3332,7 +3387,7 @@ unsafe fn convert_to_vmdk_compressed(
             let compressed_len = qcow2::compress_deflate_raw(
                 compressor_mem,
                 buf_data,
-                VMDK_GRAIN_SIZE_BYTES as usize,
+                layout.grain_size_bytes as usize,
                 compress_out,
                 compress_cap,
             );
@@ -3373,7 +3428,7 @@ unsafe fn convert_to_vmdk_compressed(
 
             // Record GTE: sector offset of grain marker
             let gt_idx = (grain - first_grain) as usize;
-            let gt_slice = core::slice::from_raw_parts_mut(buf_gt, VMDK_GT_BYTES as usize);
+            let gt_slice = core::slice::from_raw_parts_mut(buf_gt, layout.gt_bytes as usize);
             shared::write_le_u32(gt_slice, gt_idx * 4, (write_pos / 512) as u32);
 
             write_pos += padded;
@@ -3396,7 +3451,7 @@ unsafe fn convert_to_vmdk_compressed(
         if gt_has_data {
             write_pos = (write_pos + 511) & !511;
 
-            let gt_write_bytes = (VMDK_GT_BYTES + 511) & !511;
+            let gt_write_bytes = (layout.gt_bytes + 511) & !511;
             let gt_sectors = gt_write_bytes / 512;
 
             // Write GT marker before the GT data.
@@ -3511,8 +3566,8 @@ unsafe fn convert_to_vmdk_compressed(
     vmdk::build_streamoptimized_header(
         footer_slice,
         layout.capacity_sectors,
-        VMDK_GRAIN_SIZE_SECTORS,
-        VMDK_GTES_PER_GT,
+        layout.grain_size_sectors,
+        layout.gtes_per_gt,
         gd_byte_offset / 512, // Real GD offset in the footer
         overhead_sectors,
     );
@@ -3537,8 +3592,8 @@ unsafe fn convert_to_vmdk_compressed(
     vmdk::build_streamoptimized_header(
         hdr_slice,
         layout.capacity_sectors,
-        VMDK_GRAIN_SIZE_SECTORS,
-        VMDK_GTES_PER_GT,
+        layout.grain_size_sectors,
+        layout.gtes_per_gt,
         vmdk::GD_AT_END, // GD_AT_END sentinel (raw value)
         overhead_sectors,
     );
@@ -3594,14 +3649,13 @@ unsafe fn convert_to_vhd(
     aes_key: Option<&[u8; 16]>,
     luks_key: Option<&[u8]>,
     luks_sector_size: u64,
+    block_size: u64,
     bytes_read: &mut u64,
     layout: &ScratchLayout,
 ) -> u64 {
     let oss = (call_table.get_output_sector_size)();
     let oc = (call_table.get_output_capacity)();
     let progress_interval = (call_table.get_progress_interval)();
-
-    let block_size = vhd::DEFAULT_BLOCK_SIZE as u64; // 2 MiB
     let max_table_entries = ((virtual_size + block_size - 1) / block_size) as u32;
 
     // Sector bitmap: ceil(block_size / 512 / 8) rounded up to 512
@@ -4023,14 +4077,13 @@ unsafe fn convert_to_vhdx(
     aes_key: Option<&[u8; 16]>,
     luks_key: Option<&[u8]>,
     luks_sector_size: u64,
+    block_size: u64,
     bytes_read: &mut u64,
     layout: &ScratchLayout,
 ) -> u64 {
     let oss = (call_table.get_output_sector_size)();
     let oc = (call_table.get_output_capacity)();
     let progress_interval = (call_table.get_progress_interval)();
-
-    let block_size = vhdx::DEFAULT_BLOCK_SIZE as u64; // 32 MiB
     let logical_sector_size: u32 = 512;
     let physical_sector_size: u32 = 4096;
 

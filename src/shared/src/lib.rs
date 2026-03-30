@@ -1792,6 +1792,17 @@ pub struct ConvertConfig {
     /// Total size of the LUKS random data region.
     /// Offset: 384
     pub luks_random_data_size: u64,
+
+    /// Output grain size in bytes for VMDK output (0 = default 64KB).
+    /// Must be a power of 2, 4096..=65536.
+    /// Offset: 392
+    pub output_grain_size: u32,
+
+    /// Output block size in bytes for VHD/VHDX output (0 = default per format:
+    /// 2MB for VHD, 32MB for VHDX). Must be a power of 2.
+    /// VHD: 512KB..=256MB. VHDX: 1MB..=256MB.
+    /// Offset: 396
+    pub output_block_size: u32,
 }
 
 impl ConvertConfig {
@@ -1836,6 +1847,8 @@ impl ConvertConfig {
             luks_encrypt_key_bytes: 0,
             luks_random_data_addr: 0,
             luks_random_data_size: 0,
+            output_grain_size: 0,
+            output_block_size: 0,
         }
     }
 
@@ -1886,6 +1899,39 @@ impl ConvertConfig {
             self.output_cluster_bits
         } else {
             16
+        }
+    }
+
+    /// Output grain size in bytes for VMDK output.
+    /// Returns 65536 (64KB) if unset or out of range.
+    pub fn output_grain_size(&self) -> u64 {
+        let v = self.output_grain_size;
+        if v != 0 && v.is_power_of_two() && v >= 4096 && v <= 65536 {
+            v as u64
+        } else {
+            65536
+        }
+    }
+
+    /// Output block size in bytes for VHD output.
+    /// Returns 2MB if unset or out of range.
+    pub fn output_block_size_vhd(&self) -> u64 {
+        let v = self.output_block_size;
+        if v != 0 && v.is_power_of_two() && v >= 512 * 1024 && v <= 256 * 1024 * 1024 {
+            v as u64
+        } else {
+            2 * 1024 * 1024
+        }
+    }
+
+    /// Output block size in bytes for VHDX output.
+    /// Returns 32MB if unset or out of range.
+    pub fn output_block_size_vhdx(&self) -> u64 {
+        let v = self.output_block_size;
+        if v != 0 && v.is_power_of_two() && v >= 1024 * 1024 && v <= 256 * 1024 * 1024 {
+            v as u64
+        } else {
+            32 * 1024 * 1024
         }
     }
 

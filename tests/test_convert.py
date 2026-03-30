@@ -4590,3 +4590,149 @@ class TestConvertLuksEncryptOutput(ImagoTestBase):
                 rc, 0,
                 'Should reject LUKS encrypt with -O raw'
             )
+
+
+class TestConvertVmdkGrainSize(ImagoTestBase):
+    """Test VMDK output with configurable grain sizes."""
+
+    def test_vmdk_grain_4k(self):
+        """VMDK with 4KB grain size."""
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vmdk', 'vmdk',
+            '.vmdk', grain_size=4096
+        )
+
+    def test_vmdk_grain_8k(self):
+        """VMDK with 8KB grain size."""
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vmdk', 'vmdk',
+            '.vmdk', grain_size=8192
+        )
+
+    def test_vmdk_grain_16k(self):
+        """VMDK with 16KB grain size."""
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vmdk', 'vmdk',
+            '.vmdk', grain_size=16384
+        )
+
+    def test_vmdk_grain_32k(self):
+        """VMDK with 32KB grain size."""
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vmdk', 'vmdk',
+            '.vmdk', grain_size=32768
+        )
+
+    def test_vmdk_grain_default_explicit(self):
+        """VMDK with explicit default 64KB grain size."""
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vmdk', 'vmdk',
+            '.vmdk', grain_size=65536
+        )
+
+    def test_vmdk_compressed_grain_4k(self):
+        """streamOptimized VMDK with 4KB grains."""
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vmdk', 'vmdk',
+            '.vmdk', grain_size=4096, compress=True
+        )
+
+    def test_vmdk_compressed_grain_16k(self):
+        """streamOptimized VMDK with 16KB grains."""
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vmdk', 'vmdk',
+            '.vmdk', grain_size=16384, compress=True
+        )
+
+    def test_vmdk_grain_invalid_too_small(self):
+        """Reject grain size smaller than 4096."""
+        self.assert_convert_rejects(
+            'vmdk', '.vmdk', grain_size=1024
+        )
+
+    def test_vmdk_grain_invalid_too_large(self):
+        """Reject grain size larger than 65536."""
+        self.assert_convert_rejects(
+            'vmdk', '.vmdk', grain_size=131072
+        )
+
+
+class TestConvertVhdBlockSize(ImagoTestBase):
+    """Test VHD output with configurable block sizes."""
+
+    def test_vhd_block_512k(self):
+        """VHD with 512KB block size."""
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vpc', 'vpc',
+            '.vhd', block_size=524288
+        )
+
+    def test_vhd_block_1m(self):
+        """VHD with 1MB block size."""
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vpc', 'vpc',
+            '.vhd', block_size=1048576
+        )
+
+    def test_vhd_block_default_explicit(self):
+        """VHD with explicit default 2MB block size."""
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vpc', 'vpc',
+            '.vhd', block_size=2097152
+        )
+
+    def test_vhd_block_8m(self):
+        """VHD with 8MB block size."""
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vpc', 'vpc',
+            '.vhd', block_size=8388608
+        )
+
+    def test_vhd_block_invalid_not_power_of_2(self):
+        """Reject non-power-of-2 VHD block size."""
+        self.assert_convert_rejects(
+            'vpc', '.vhd', block_size=3000000
+        )
+
+    def test_vhd_block_invalid_too_large(self):
+        """Reject VHD block size above 256MB."""
+        self.assert_convert_rejects(
+            'vpc', '.vhd', block_size=536870912
+        )
+
+
+class TestConvertVhdxBlockSize(ImagoTestBase):
+    """Test VHDX output with configurable block sizes."""
+
+    def test_vhdx_block_1m(self):
+        """VHDX with 1MB block size."""
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vhdx', 'vhdx',
+            '.vhdx', block_size=1048576
+        )
+
+    def test_vhdx_block_4m(self):
+        """VHDX with 4MB block size."""
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vhdx', 'vhdx',
+            '.vhdx', block_size=4194304
+        )
+
+    def test_vhdx_block_default_explicit(self):
+        """VHDX with explicit default 32MB block size."""
+        self.assert_size_roundtrip(
+            'raw-mbr-partitioned', 'vhdx', 'vhdx',
+            '.vhdx', block_size=33554432
+        )
+
+    def test_vhdx_block_invalid_too_small(self):
+        """Reject VHDX block size below 1MB."""
+        self.assert_convert_rejects(
+            'vhdx', '.vhdx', block_size=524288
+        )
+
+    def test_vhdx_block_invalid_too_large(self):
+        """Reject VHDX block size above 256MB."""
+        self.assert_convert_rejects(
+            'vhdx', '.vhdx', block_size=536870912
+        )
