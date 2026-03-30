@@ -141,11 +141,10 @@
     unsupported for convert/compare (decompression buffer limit).
   - 15 new integration tests across check and convert operations.
 - Phase 8: VMDK input/output (monolithicSparse, streamOptimized,
-  compressed grains). See PLAN-convert-phases.md.
-- Phase 9: VHD input/output (dynamic, fixed, differencing). See
-  PLAN-convert-phases.md.
+  compressed grains).
+- Phase 9: VHD input/output (dynamic, fixed, differencing).
 - Phase 10: VHDX input/output (full support with CRC-32C,
-  skip-zeros optimization). See PLAN-convert-phases.md.
+  skip-zeros optimization).
 - Phase 11: oslo.utils format_inspector cross-validation testing.
 - Phase 12: LUKS container inspection (v1/v2, inner format
   detection).
@@ -171,41 +170,44 @@
   each cluster is treated as fully allocated if any subcluster
   is present. This is conservative and correct, but wastes I/O
   on partially-allocated clusters.
-- QCOW2 encrypted output: Decryption works (AES-128-CBC via
-  --qcow2-password, LUKS via --luks-passphrase) but writing
-  encrypted QCOW2 output is not supported.
-- ~~VMDK/VHD/VHDX structural validation in check~~ — Done
-  (PLAN-vmdk-vhd-vhdx-structural.md). All three formats now
-  have full structural validation: compressed grain marker
-  validation and RGD cross-check for VMDK, version/feature/
-  fragmentation/fixed size validation for VHD, file identifier/
-  region table cross-check/fragmentation for VHDX.
+- VMDK monolithicFlat input: Two-file format (text descriptor +
+  separate raw data file) requiring VMM-level format detection
+  changes. The descriptor starts with ASCII `# Disk DescriptorFile`
+  (no KDMV magic). Needs: extent line parsing, VMM detection of
+  text-only descriptors, two-file I/O (descriptor as device 0,
+  data as device 1 using the QCOW2 external data file pattern),
+  guest-side flat read support. Multi-extent split flat
+  (twoGbMaxExtentFlat) and flat output are further deferred.
 
-*Resolved in later phases (items formerly listed here):*
-- ~~VMDK output grain size~~ — Done (PLAN-grain-and-block.md)
-- ~~VHD output block size~~ — Done (PLAN-grain-and-block.md)
-- ~~VHDX output block size~~ — Done (PLAN-grain-and-block.md)
-- ~~VHD round-trip tests (TestConvertToVhd)~~ — Fixed
-- ~~VMDK compressed output (TestConvertToVmdkCompressed)~~ — Fixed
+*Additional qemu-img subcommands (not yet implemented):*
+- create: Create new empty disk images (raw via host-side
+  truncate, QCOW2/VMDK/VHD/VHDX via guest operation)
+- map: Display allocation map (reuses format parsing, reports
+  contiguous extents with start/length/depth/zero/data/offset)
+- measure: Pre-calculate space requirements for conversion
+- resize: Change virtual size (raw via host truncate, QCOW2/
+  VMDK/VHD/VHDX via guest L1/BAT extension)
+- snapshot: List/apply/create/delete internal QCOW2 snapshots
+- rebase: Change backing file references (unsafe metadata-only
+  and safe data-aware modes)
+- commit: Commit overlay changes into backing file
+
+*Resolved (items formerly listed here):*
+- ~~QCOW2 encrypted output~~ — Done (AES-CBC Phase 16b,
+  LUKS crypt_method=2 in PLAN-convert-limitations.md Phase 5)
+- ~~VMDK/VHD/VHDX structural validation in check~~ — Done
+- ~~VHD round-trip tests~~ — Fixed
+- ~~VMDK compressed output~~ — Fixed
 - ~~VHD d2v-zerofilled conversion~~ — Fixed
 - ~~Compressed clusters > 64KB (input)~~ — Done (Phase 16a)
 - ~~VMDK output format~~ — Done (Phase 8)
 - ~~VHD output format~~ — Done (Phase 9)
 - ~~VHDX output format~~ — Done (Phase 10)
-- ~~QCOW2 encryption~~ — Done (Phase 16b, 17c)
+- ~~QCOW2 encryption (input)~~ — Done (Phase 16b, 17c)
 - ~~External data file mode~~ — Done (Phase 13)
 - ~~Snapshot handling~~ — Done (Phase 16c)
 - ~~VMDK format in compare/check~~ — Done (Phase 8)
 - ~~VHD/VHDX format in compare/check~~ — Done (Phase 9, 10)
-
-*Additional qemu-img subcommands (not yet implemented):*
-- create: Create new disk images
-- resize: Change virtual size of images
-- snapshot: List/create/delete internal snapshots
-- rebase: Change backing file references
-- commit: Commit overlay changes to backing file
-- map: Dump block allocation map
-- measure: Pre-calculate space requirements for conversion
 
 **`imago info --chain` command:**
 - Iteratively runs sandboxed info operations to discover backing chain
