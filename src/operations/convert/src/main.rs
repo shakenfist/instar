@@ -2124,12 +2124,15 @@ unsafe fn convert_to_qcow2(
         let uuid_offset = slot_salt_offset + 32;
         let af_offset = uuid_offset + 36;
 
-        let mk_digest_salt: &[u8; 32] =
-            data_slice[mk_salt_offset..mk_salt_offset + 32].try_into().unwrap_or(&[0u8; 32]);
-        let slot_salt: &[u8; 32] =
-            data_slice[slot_salt_offset..slot_salt_offset + 32].try_into().unwrap_or(&[0u8; 32]);
-        let uuid: &[u8; 36] =
-            data_slice[uuid_offset..uuid_offset + 36].try_into().unwrap_or(&[0u8; 36]);
+        let mk_digest_salt: &[u8; 32] = data_slice[mk_salt_offset..mk_salt_offset + 32]
+            .try_into()
+            .unwrap_or(&[0u8; 32]);
+        let slot_salt: &[u8; 32] = data_slice[slot_salt_offset..slot_salt_offset + 32]
+            .try_into()
+            .unwrap_or(&[0u8; 32]);
+        let uuid: &[u8; 36] = data_slice[uuid_offset..uuid_offset + 36]
+            .try_into()
+            .unwrap_or(&[0u8; 36]);
 
         let pp_len = config.passphrase_len as usize;
         let passphrase = &config.passphrase[..pp_len];
@@ -2148,22 +2151,17 @@ unsafe fn convert_to_qcow2(
 
         // Build LUKS header into a fixed guest memory address
         // (not the stack — the header + key material is ~260KB)
-        let build_buf = core::slice::from_raw_parts_mut(
-            shared::LUKS_HEADER_BUILD_ADDR as *mut u8, 262144,
-        );
+        let build_buf =
+            core::slice::from_raw_parts_mut(shared::LUKS_HEADER_BUILD_ADDR as *mut u8, 262144);
         match luks::build_v1_header(&params, build_buf) {
             Some(len) => {
                 luks_hdr_len = len;
                 luks_clusters =
                     (luks_hdr_len as u64 + layout.cluster_size - 1) / layout.cluster_size;
-                (call_table.verbose_print)(
-                    b"convert: built LUKS v1 header\n\0".as_ptr(),
-                );
+                (call_table.verbose_print)(b"convert: built LUKS v1 header\n\0".as_ptr());
             }
             None => {
-                (call_table.debug_print)(
-                    b"convert: failed to build LUKS header\n\0".as_ptr(),
-                );
+                (call_table.debug_print)(b"convert: failed to build LUKS header\n\0".as_ptr());
                 (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                 return *bytes_read;
             }
@@ -2187,18 +2185,20 @@ unsafe fn convert_to_qcow2(
             let remaining = luks_hdr_len.saturating_sub(src_off);
             if remaining < layout.cluster_size as usize {
                 core::ptr::write_bytes(
-                    src_ptr.add(remaining), 0,
+                    src_ptr.add(remaining),
+                    0,
                     layout.cluster_size as usize - remaining,
                 );
             }
             if !write_cluster_to_output(
-                call_table, src_ptr, offset,
-                layout.cluster_size, layout.output_sector_size,
+                call_table,
+                src_ptr,
+                offset,
+                layout.cluster_size,
+                layout.output_sector_size,
                 layout.output_capacity,
             ) {
-                (call_table.send_complete)(
-                    b"convert\0".as_ptr(), *bytes_read, false,
-                );
+                (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                 return *bytes_read;
             }
         }
@@ -2309,9 +2309,7 @@ unsafe fn convert_to_qcow2(
             if luks_encrypt_key_len > 0 {
                 let physical_sector = data_offset / 512;
                 luks::aes_xts_encrypt(
-                    core::slice::from_raw_parts_mut(
-                        buf_data, layout.cluster_size as usize,
-                    ),
+                    core::slice::from_raw_parts_mut(buf_data, layout.cluster_size as usize),
                     &luks_encrypt_key[..luks_encrypt_key_len],
                     physical_sector,
                 );
@@ -2343,9 +2341,7 @@ unsafe fn convert_to_qcow2(
             let entry_byte = l2_entry_idx * layout.l2_entry_size as usize;
             shared::write_be_u64(l2_slice, entry_byte, data_offset | (1u64 << 63));
             if layout.extended_l2 {
-                shared::write_be_u64(
-                    l2_slice, entry_byte + 8, EXTENDED_L2_BITMAP_ALL_ALLOC,
-                );
+                shared::write_be_u64(l2_slice, entry_byte + 8, EXTENDED_L2_BITMAP_ALL_ALLOC);
             }
 
             clusters_done += 1;
@@ -2745,9 +2741,7 @@ unsafe fn convert_to_qcow2_compressed(
                 let entry_byte = l2_entry_idx * layout.l2_entry_size as usize;
                 shared::write_be_u64(l2_slice, entry_byte, write_pos | (1u64 << 63));
                 if layout.extended_l2 {
-                    shared::write_be_u64(
-                        l2_slice, entry_byte + 8, EXTENDED_L2_BITMAP_ALL_ALLOC,
-                    );
+                    shared::write_be_u64(l2_slice, entry_byte + 8, EXTENDED_L2_BITMAP_ALL_ALLOC);
                 }
 
                 inc_refcount(
@@ -2989,7 +2983,8 @@ unsafe fn convert_to_vmdk(
 
         // Range of grains covered by this GD entry
         let first_grain = gd_idx as u64 * layout.gtes_per_gt as u64;
-        let last_grain = core::cmp::min(first_grain + layout.gtes_per_gt as u64, layout.total_grains);
+        let last_grain =
+            core::cmp::min(first_grain + layout.gtes_per_gt as u64, layout.total_grains);
 
         for grain in first_grain..last_grain {
             let virtual_offset = grain * layout.grain_size_bytes;
@@ -3292,7 +3287,8 @@ unsafe fn convert_to_vmdk_compressed(
         let mut gt_has_data = false;
 
         let first_grain = gd_idx as u64 * layout.gtes_per_gt as u64;
-        let last_grain = core::cmp::min(first_grain + layout.gtes_per_gt as u64, layout.total_grains);
+        let last_grain =
+            core::cmp::min(first_grain + layout.gtes_per_gt as u64, layout.total_grains);
 
         for grain in first_grain..last_grain {
             let virtual_offset = grain * layout.grain_size_bytes;

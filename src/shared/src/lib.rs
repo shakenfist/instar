@@ -340,7 +340,7 @@ pub const CHAIN_CONFIG_ADDR: usize = 0x00082000;
 /// Address where LUKS encrypt random data is stored (set by VMM).
 /// Layout: master_key (64B) + mk_digest_salt (32B) + slot_salt (32B)
 /// + uuid (36B) + AF random stripes (key_bytes * (stripes-1)).
-/// Maximum size: 64 + 32 + 32 + 36 + 64*3999 = 256,100 bytes.
+///   Maximum size: 64 + 32 + 32 + 36 + 64*3999 = 256,100 bytes.
 pub const LUKS_ENCRYPT_DATA_ADDR: usize = 0x01800000;
 
 /// Address where the guest builds the LUKS v1 header output.
@@ -1786,7 +1786,7 @@ pub struct ConvertConfig {
     /// Address in guest memory where LUKS random data is stored.
     /// The VMM writes: master key (64 bytes) + MK digest salt (32 bytes)
     /// + slot salt (32 bytes) + UUID (36 bytes) + AF random stripes.
-    /// Offset: 376
+    ///   Offset: 376
     pub luks_random_data_addr: u64,
 
     /// Total size of the LUKS random data region.
@@ -1906,7 +1906,7 @@ impl ConvertConfig {
     /// Returns 65536 (64KB) if unset or out of range.
     pub fn output_grain_size(&self) -> u64 {
         let v = self.output_grain_size;
-        if v != 0 && v.is_power_of_two() && v >= 4096 && v <= 65536 {
+        if v != 0 && v.is_power_of_two() && (4096..=65536).contains(&v) {
             v as u64
         } else {
             65536
@@ -1917,7 +1917,7 @@ impl ConvertConfig {
     /// Returns 2MB if unset or out of range.
     pub fn output_block_size_vhd(&self) -> u64 {
         let v = self.output_block_size;
-        if v != 0 && v.is_power_of_two() && v >= 512 * 1024 && v <= 256 * 1024 * 1024 {
+        if v != 0 && v.is_power_of_two() && (512 * 1024..=256 * 1024 * 1024).contains(&v) {
             v as u64
         } else {
             2 * 1024 * 1024
@@ -1928,7 +1928,7 @@ impl ConvertConfig {
     /// Returns 32MB if unset or out of range.
     pub fn output_block_size_vhdx(&self) -> u64 {
         let v = self.output_block_size;
-        if v != 0 && v.is_power_of_two() && v >= 1024 * 1024 && v <= 256 * 1024 * 1024 {
+        if v != 0 && v.is_power_of_two() && (1024 * 1024..=256 * 1024 * 1024).contains(&v) {
             v as u64
         } else {
             32 * 1024 * 1024
