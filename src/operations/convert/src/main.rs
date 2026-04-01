@@ -1791,7 +1791,7 @@ unsafe fn write_qcow2_header(
         // to the LUKS binary data which lives at cluster 1+ in the file.
         shared::write_be_u32(hdr, ext_start, qcow2::EXT_ENCRYPT_HEADER);
         shared::write_be_u32(hdr, ext_start + 4, 16); // pointer is 16 bytes
-                                                      // LUKS data starts at cluster 1 (byte offset = cluster_size)
+        // LUKS data starts at cluster 1 (byte offset = cluster_size)
         shared::write_be_u64(hdr, ext_start + 8, cluster_size);
         shared::write_be_u64(hdr, ext_start + 16, luks_len as u64);
         // End-of-extensions marker
