@@ -28,7 +28,7 @@ on:
       duration:
         description: 'Fuzz duration per target (seconds)'
         required: false
-        default: '3600'
+        default: '1500'
         type: string
       targets:
         description: 'Comma-separated target names (empty = all)'
@@ -142,8 +142,25 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            echo "duration=${INPUT_DURATION}" >> $GITHUB_OUTPUT
-            echo "targets=${INPUT_TARGETS}" >> $GITHUB_OUTPUT
+            DURATION=${INPUT_DURATION}
+            TARGETS=${INPUT_TARGETS}
+
+            # Count targets (default 13 if all)
+            if [ -n "$TARGETS" ]; then
+              N_TARGETS=$(echo "$TARGETS" | tr ',' '\n' | wc -l)
+            else
+              N_TARGETS=13
+            fi
+
+            # Cap duration so total fits in 450 min (30 min headroom)
+            MAX_DURATION=$(( 450 * 60 / N_TARGETS ))
+            if [ "$DURATION" -gt "$MAX_DURATION" ]; then
+              echo "::warning::Capping duration from ${DURATION}s to ${MAX_DURATION}s to fit timeout"
+              DURATION=$MAX_DURATION
+            fi
+
+            echo "duration=${DURATION}" >> $GITHUB_OUTPUT
+            echo "targets=${TARGETS}" >> $GITHUB_OUTPUT
           elif [ "$EVENT_NAME" = "pull_request" ]; then
             # Build + single target smoke test
             echo "duration=10" >> $GITHUB_OUTPUT
