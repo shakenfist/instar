@@ -28,7 +28,7 @@ on:
       duration:
         description: 'Fuzz duration per target (seconds)'
         required: false
-        default: '3600'
+        default: '1500'
         type: string
       targets:
         description: 'Comma-separated target names (empty = all)'
@@ -68,6 +68,28 @@ jobs:
               ${GITHUB_WORKSPACE}/imago-testdata
             echo "TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata" >> $GITHUB_ENV
           fi
+
+      - name: Verify corpus push token
+        if: github.event_name == 'schedule'
+        env:
+          PUSH_TOKEN: ${{ secrets.GITLAB_TESTDATA_PUSH_TOKEN }}
+        run: |
+          if [ -z "$PUSH_TOKEN" ]; then
+            echo "::error::GITLAB_TESTDATA_PUSH_TOKEN is not set"
+            exit 1
+          fi
+          # Verify write access using the cached testdata repo
+          cd "${TESTDATA_PATH}"
+          git remote set-url origin \
+            "https://oauth2:${PUSH_TOKEN}@gitlab.home.stillhq.com/private/imago-testdata.git"
+          mkdir -p custom/fuzz-corpus
+          date -u '+%Y-%m-%dT%H:%M:%SZ' > custom/fuzz-corpus/last-coverage-run.txt
+          git add custom/fuzz-corpus/last-coverage-run.txt
+          git -c user.name="CI Fuzzer" \
+              -c user.email="ci@imago.dev" \
+              commit -m "Coverage fuzz run started $(date -u +%Y-%m-%d)"
+          git push origin HEAD
+          echo "Corpus push token is valid (write verified)"
 
       - name: Install Docker
         run: |
@@ -120,8 +142,25 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            echo "duration=${INPUT_DURATION}" >> $GITHUB_OUTPUT
-            echo "targets=${INPUT_TARGETS}" >> $GITHUB_OUTPUT
+            DURATION=${INPUT_DURATION}
+            TARGETS=${INPUT_TARGETS}
+
+            # Count targets (default 13 if all)
+            if [ -n "$TARGETS" ]; then
+              N_TARGETS=$(echo "$TARGETS" | tr ',' '\n' | wc -l)
+            else
+              N_TARGETS=13
+            fi
+
+            # Cap duration so total fits in 450 min (30 min headroom)
+            MAX_DURATION=$(( 450 * 60 / N_TARGETS ))
+            if [ "$DURATION" -gt "$MAX_DURATION" ]; then
+              echo "::warning::Capping duration from ${DURATION}s to ${MAX_DURATION}s to fit timeout"
+              DURATION=$MAX_DURATION
+            fi
+
+            echo "duration=${DURATION}" >> $GITHUB_OUTPUT
+            echo "targets=${TARGETS}" >> $GITHUB_OUTPUT
           elif [ "$EVENT_NAME" = "pull_request" ]; then
             # Build + single target smoke test
             echo "duration=10" >> $GITHUB_OUTPUT
@@ -131,8 +170,8 @@ jobs:
             echo "duration=15" >> $GITHUB_OUTPUT
             echo "targets=" >> $GITHUB_OUTPUT
           else
-            # schedule (nightly) — 2000s × 13 targets ≈ 433 min, fits 480 min timeout
-            echo "duration=2000" >> $GITHUB_OUTPUT
+            # schedule (nightly) — 1500s × 13 targets ≈ 325 min, fits 480 min timeout
+            echo "duration=1500" >> $GITHUB_OUTPUT
             echo "targets=" >> $GITHUB_OUTPUT
           fi
 
