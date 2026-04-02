@@ -415,6 +415,15 @@ When you trigger `@shakenfist-bot please address comments`:
 
 This allows reviewers to cherry-pick or drop individual fixes as needed.
 
+### CI Build Artifact Sharing
+
+The `build-and-test` job compiles imago once and uploads the binaries as a
+GitHub Actions artifact. The integration test jobs (`integration-core`,
+`integration-convert-qcow2`, `integration-convert-vhd`, `oslo-crossval-master`)
+download these pre-built binaries instead of recompiling, eliminating 4
+redundant Rust builds per CI run. They use `PREBUILT=1` when invoking
+Makefile test targets to skip the build dependency.
+
 ### Workflow Files
 
 - `.github/workflows/functional-tests.yml` - Main CI with automated review

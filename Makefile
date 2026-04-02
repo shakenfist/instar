@@ -106,6 +106,15 @@ SCRIPTS_DIR := scripts
 DEVCONTAINER_DIR := .devcontainer
 CARGO_CACHE_DIR := .cargo-cache
 
+# When PREBUILT=1, test-container targets skip the imago build step.
+# Use this in CI when binaries have been downloaded from a prior job.
+PREBUILT ?=
+ifdef PREBUILT
+_BUILD_DEPS := imago-devcontainer
+else
+_BUILD_DEPS := imago-devcontainer imago
+endif
+
 # =============================================================================
 # Main Imago Project Targets
 # =============================================================================
@@ -403,7 +412,7 @@ test-integration: imago test-venv
 
 # Run tests inside the devcontainer for consistent environment
 # This ensures consistent glibc, paths, and other system dependencies
-test-container: imago-devcontainer imago
+test-container: $(_BUILD_DEPS)
 	@echo "Running tests inside container..."
 	@if [ ! -d "$(TESTDATA_PATH)" ]; then \
 		echo "Error: Test data not found at $(TESTDATA_PATH)"; \
@@ -433,7 +442,7 @@ test-container: imago-devcontainer imago
 
 # Run core integration tests inside container (info, check, security, version, oslo-crossval)
 # Excludes convert and compare tests which are split into separate targets
-test-container-core: imago-devcontainer imago
+test-container-core: $(_BUILD_DEPS)
 	@echo "Running core integration tests inside container..."
 	@if [ ! -d "$(TESTDATA_PATH)" ]; then \
 		echo "Error: Test data not found at $(TESTDATA_PATH)"; \
@@ -462,7 +471,7 @@ test-container-core: imago-devcontainer imago
 		'
 
 # Run QCOW2/VMDK/RAW convert + compare tests inside container
-test-container-convert-qcow2: imago-devcontainer imago
+test-container-convert-qcow2: $(_BUILD_DEPS)
 	@echo "Running QCOW2/VMDK/RAW convert + compare tests inside container..."
 	@if [ ! -d "$(TESTDATA_PATH)" ]; then \
 		echo "Error: Test data not found at $(TESTDATA_PATH)"; \
@@ -492,7 +501,7 @@ test-container-convert-qcow2: imago-devcontainer imago
 		'
 
 # Run VHD/VHDX convert tests inside container
-test-container-convert-vhd: imago-devcontainer imago
+test-container-convert-vhd: $(_BUILD_DEPS)
 	@echo "Running VHD/VHDX convert tests inside container..."
 	@if [ ! -d "$(TESTDATA_PATH)" ]; then \
 		echo "Error: Test data not found at $(TESTDATA_PATH)"; \

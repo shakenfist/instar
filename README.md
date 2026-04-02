@@ -453,6 +453,9 @@ make test-container-core              # info, check, security, oslo-crossval
 make test-container-convert-qcow2    # QCOW2/VMDK/RAW convert + compare
 make test-container-convert-vhd      # VHD/VHDX convert (slowest)
 
+# Skip the imago build step (use pre-built binaries from a prior job)
+make test-container-core PREBUILT=1
+
 # Clean test artifacts
 make clean-tests
 ```

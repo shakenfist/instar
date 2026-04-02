@@ -91,6 +91,20 @@ jobs:
               --exclude compare \
               --exclude convert
 
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: imago-binaries
+          path: |
+            src/target/release/imago
+            src/target/release/core.bin
+            src/target/release/info.bin
+            src/target/release/copy.bin
+            src/target/release/check.bin
+            src/target/release/compare.bin
+            src/target/release/convert.bin
+          retention-days: 1
+
       - name: Test config commands in container
         run: |
           # Run all config tests inside the container to avoid glibc mismatch
@@ -283,27 +297,25 @@ jobs:
           sudo systemctl start docker
           sudo chmod 666 /var/run/docker.sock
 
-      - name: Remove previous devcontainers, if any
-        run: |
-          docker image rm -f imago-build 2>/dev/null || true
-
-      - name: Build imago
+      - name: Build devcontainer
         run: |
           cd ${GITHUB_WORKSPACE}/imago
-          set +e
-          make imago 2>&1 | tee ${GITHUB_WORKSPACE}/build-log.txt
-          build_exit_code=${PIPESTATUS[0]}
-          set -e
-          if [ ${build_exit_code} -ne 0 ]; then
-            echo "Build failed with exit code ${build_exit_code}"
-            exit ${build_exit_code}
-          fi
+          make imago-devcontainer
+
+      - name: Download pre-built binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: imago-binaries
+          path: imago/
+
+      - name: Fix binary permissions
+        run: chmod +x ${GITHUB_WORKSPACE}/imago/src/target/release/imago
 
       - name: Run core integration tests
         run: |
           cd ${GITHUB_WORKSPACE}/imago
           set +e
-          make test-container-core TESTDATA_PATH=${TESTDATA_PATH} 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
+          make test-container-core PREBUILT=1 TESTDATA_PATH=${TESTDATA_PATH} 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
           test_exit_code=${PIPESTATUS[0]}
           set -e
           if [ ${test_exit_code} -ne 0 ]; then
@@ -478,27 +490,25 @@ jobs:
           sudo systemctl start docker
           sudo chmod 666 /var/run/docker.sock
 
-      - name: Remove previous devcontainers, if any
-        run: |
-          docker image rm -f imago-build 2>/dev/null || true
-
-      - name: Build imago
+      - name: Build devcontainer
         run: |
           cd ${GITHUB_WORKSPACE}/imago
-          set +e
-          make imago 2>&1 | tee ${GITHUB_WORKSPACE}/build-log.txt
-          build_exit_code=${PIPESTATUS[0]}
-          set -e
-          if [ ${build_exit_code} -ne 0 ]; then
-            echo "Build failed with exit code ${build_exit_code}"
-            exit ${build_exit_code}
-          fi
+          make imago-devcontainer
+
+      - name: Download pre-built binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: imago-binaries
+          path: imago/
+
+      - name: Fix binary permissions
+        run: chmod +x ${GITHUB_WORKSPACE}/imago/src/target/release/imago
 
       - name: Run QCOW2/VMDK/RAW convert + compare tests
         run: |
           cd ${GITHUB_WORKSPACE}/imago
           set +e
-          make test-container-convert-qcow2 TESTDATA_PATH=${TESTDATA_PATH} 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
+          make test-container-convert-qcow2 PREBUILT=1 TESTDATA_PATH=${TESTDATA_PATH} 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
           test_exit_code=${PIPESTATUS[0]}
           set -e
           if [ ${test_exit_code} -ne 0 ]; then
@@ -572,27 +582,25 @@ jobs:
           sudo systemctl start docker
           sudo chmod 666 /var/run/docker.sock
 
-      - name: Remove previous devcontainers, if any
-        run: |
-          docker image rm -f imago-build 2>/dev/null || true
-
-      - name: Build imago
+      - name: Build devcontainer
         run: |
           cd ${GITHUB_WORKSPACE}/imago
-          set +e
-          make imago 2>&1 | tee ${GITHUB_WORKSPACE}/build-log.txt
-          build_exit_code=${PIPESTATUS[0]}
-          set -e
-          if [ ${build_exit_code} -ne 0 ]; then
-            echo "Build failed with exit code ${build_exit_code}"
-            exit ${build_exit_code}
-          fi
+          make imago-devcontainer
+
+      - name: Download pre-built binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: imago-binaries
+          path: imago/
+
+      - name: Fix binary permissions
+        run: chmod +x ${GITHUB_WORKSPACE}/imago/src/target/release/imago
 
       - name: Run VHD/VHDX convert tests
         run: |
           cd ${GITHUB_WORKSPACE}/imago
           set +e
-          make test-container-convert-vhd TESTDATA_PATH=${TESTDATA_PATH} 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
+          make test-container-convert-vhd PREBUILT=1 TESTDATA_PATH=${TESTDATA_PATH} 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
           test_exit_code=${PIPESTATUS[0]}
           set -e
           if [ ${test_exit_code} -ne 0 ]; then
@@ -673,14 +681,19 @@ jobs:
           sudo systemctl start docker
           sudo chmod 666 /var/run/docker.sock
 
-      - name: Remove previous devcontainers, if any
-        run: |
-          docker image rm -f imago-build 2>/dev/null || true
-
-      - name: Build imago
+      - name: Build devcontainer
         run: |
           cd ${GITHUB_WORKSPACE}/imago
-          make imago
+          make imago-devcontainer
+
+      - name: Download pre-built binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: imago-binaries
+          path: imago/
+
+      - name: Fix binary permissions
+        run: chmod +x ${GITHUB_WORKSPACE}/imago/src/target/release/imago
 
       - name: Run oslo crossval with oslo.utils master
         run: |
