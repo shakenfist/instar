@@ -52,21 +52,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Verify corpus push token
-        if: github.event_name == 'schedule'
-        env:
-          PUSH_TOKEN: ${{ secrets.GITLAB_TESTDATA_PUSH_TOKEN }}
-        run: |
-          if [ -z "$PUSH_TOKEN" ]; then
-            echo "::error::GITLAB_TESTDATA_PUSH_TOKEN is not set"
-            exit 1
-          fi
-          # Verify the token has push access before spending hours fuzzing
-          git ls-remote \
-            "https://oauth2:${PUSH_TOKEN}@gitlab.home.stillhq.com/private/imago-testdata.git" \
-            HEAD > /dev/null
-          echo "Corpus push token is valid"
-
       - name: Prepare imago-testdata
         env:
           TESTDATA_TOKEN: ${{ secrets.GITLAB_TESTDATA_TOKEN }}
@@ -83,6 +68,28 @@ jobs:
               ${GITHUB_WORKSPACE}/imago-testdata
             echo "TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata" >> $GITHUB_ENV
           fi
+
+      - name: Verify corpus push token
+        if: github.event_name == 'schedule'
+        env:
+          PUSH_TOKEN: ${{ secrets.GITLAB_TESTDATA_PUSH_TOKEN }}
+        run: |
+          if [ -z "$PUSH_TOKEN" ]; then
+            echo "::error::GITLAB_TESTDATA_PUSH_TOKEN is not set"
+            exit 1
+          fi
+          # Verify write access using the cached testdata repo
+          cd "${TESTDATA_PATH}"
+          git remote set-url origin \
+            "https://oauth2:${PUSH_TOKEN}@gitlab.home.stillhq.com/private/imago-testdata.git"
+          mkdir -p custom/fuzz-corpus
+          date -u '+%Y-%m-%dT%H:%M:%SZ' > custom/fuzz-corpus/last-coverage-run.txt
+          git add custom/fuzz-corpus/last-coverage-run.txt
+          git -c user.name="CI Fuzzer" \
+              -c user.email="ci@imago.dev" \
+              commit -m "Coverage fuzz run started $(date -u +%Y-%m-%d)"
+          git push origin HEAD
+          echo "Corpus push token is valid (write verified)"
 
       - name: Install Docker
         run: |
