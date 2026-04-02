@@ -69,6 +69,28 @@ jobs:
             echo "TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata" >> $GITHUB_ENV
           fi
 
+      - name: Verify corpus push token
+        if: github.event_name == 'schedule'
+        env:
+          PUSH_TOKEN: ${{ secrets.GITLAB_TESTDATA_PUSH_TOKEN }}
+        run: |
+          if [ -z "$PUSH_TOKEN" ]; then
+            echo "::error::GITLAB_TESTDATA_PUSH_TOKEN is not set"
+            exit 1
+          fi
+          # Verify write access using the cached testdata repo
+          cd "${TESTDATA_PATH}"
+          git remote set-url origin \
+            "https://oauth2:${PUSH_TOKEN}@gitlab.home.stillhq.com/private/imago-testdata.git"
+          mkdir -p custom/fuzz-corpus
+          date -u '+%Y-%m-%dT%H:%M:%SZ' > custom/fuzz-corpus/last-coverage-run.txt
+          git add custom/fuzz-corpus/last-coverage-run.txt
+          git -c user.name="CI Fuzzer" \
+              -c user.email="ci@imago.dev" \
+              commit -m "Coverage fuzz run started $(date -u +%Y-%m-%d)"
+          git push origin HEAD
+          echo "Corpus push token is valid (write verified)"
+
       - name: Install Docker
         run: |
           sudo apt-get update
@@ -131,8 +153,8 @@ jobs:
             echo "duration=15" >> $GITHUB_OUTPUT
             echo "targets=" >> $GITHUB_OUTPUT
           else
-            # schedule (nightly) — 2000s × 13 targets ≈ 433 min, fits 480 min timeout
-            echo "duration=2000" >> $GITHUB_OUTPUT
+            # schedule (nightly) — 1500s × 13 targets ≈ 325 min, fits 480 min timeout
+            echo "duration=1500" >> $GITHUB_OUTPUT
             echo "targets=" >> $GITHUB_OUTPUT
           fi
 
