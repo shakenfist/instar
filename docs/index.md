@@ -10,10 +10,6 @@ providing strong isolation from the host system. You can read the
 [announcement email I sent to the OpenStack mailing lists](openstack-announcement-email.md)
 if you're interested in my line of reasoning at the time.
 
-The name "instar" comes from Latin (meaning "image") and biology (the final
-adult stage of insect metamorphosis) - reflecting both the image handling
-and transformation aspects of the tool.
-
 The primary goal of `instar` is to be a safe drop in replacement for qemu-img.
 The current focus is on `qemu-img info`, `qemu-img check`, `qemu-img compare`,
 and `qemu-img convert` sub-commands, as the most painful parts in terms of

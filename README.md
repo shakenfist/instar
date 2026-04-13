@@ -8,10 +8,6 @@ Instar replaces unsafe calls to `qemu-img` with a safer, sandboxed approach.
 Image format conversions are performed within a KVM execution context,
 providing strong isolation from the host system.
 
-The name "instar" comes from Latin (meaning "image") and biology (the final
-adult stage of insect metamorphosis) - reflecting both the image handling
-and transformation aspects of the tool.
-
 Confused about how instar does these things? Perhaps read the
 [technology primer](docs/technology-primer.md). If you want a guided tour of
 the source code, the [Lions-style commentary](docs/commentary/index.md)

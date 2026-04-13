@@ -23,7 +23,7 @@ overflows, integer overflows, and other memory safety issues.
 │                        Host System                          │
 │                                                             │
 │  ┌─────────────┐     ┌─────────────────────────────────┐   │
-│  │   Instar     │     │        KVM Sandbox              │   │
+│  │   Instar    │     │        KVM Sandbox              │   │
 │  │   Client    │────▶│  ┌─────────────────────────┐    │   │
 │  │             │     │  │   Conversion Engine     │    │   │
 │  │ (handles    │◀────│  │   (parses formats,      │    │   │

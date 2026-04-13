@@ -86,7 +86,7 @@ jobs:
           date -u '+%Y-%m-%dT%H:%M:%SZ' > custom/fuzz-corpus/last-coverage-run.txt
           git add custom/fuzz-corpus/last-coverage-run.txt
           git -c user.name="CI Fuzzer" \
-              -c user.email="ci@instar.dev" \
+              -c user.email="bot@shakenfist.com" \
               commit -m "Coverage fuzz run started $(date -u +%Y-%m-%d)"
           git push origin HEAD
           echo "Corpus push token is valid (write verified)"
@@ -356,7 +356,7 @@ jobs:
             cd "$PUSH_DIR"
             git add custom/fuzz-corpus/
             git -c user.name="CI Fuzzer" \
-                -c user.email="ci@instar.dev" \
+                -c user.email="bot@shakenfist.com" \
                 commit -m "Add fuzz corpus entries from nightly run $(date -u +%Y-%m-%d)"
             git push origin HEAD
             echo "Pushed new corpus entries to instar-testdata"
