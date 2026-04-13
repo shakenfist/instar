@@ -1,12 +1,12 @@
-# Skill: Add Test Image to imago Test Suite
+# Skill: Add Test Image to instar Test Suite
 
-Add a new disk image to the imago integration test suite. This skill handles
+Add a new disk image to the instar integration test suite. This skill handles
 both safe images (compared against stored baseline outputs) and malicious images
 (compared against stored expected output files).
 
 ## When to Use
 
-- Adding a new test image to verify imago compatibility
+- Adding a new test image to verify instar compatibility
 - Adding a malicious/crafted image for security testing
 - Expanding test coverage for a specific format or edge case
 
@@ -15,7 +15,7 @@ both safe images (compared against stored baseline outputs) and malicious images
 ### Step 1: Gather Image Information
 
 Ask the user for:
-1. **Image location** - Path relative to imago-testdata root (e.g., `downloaded/edge-cases/myimage.qcow2`)
+1. **Image location** - Path relative to instar-testdata root (e.g., `downloaded/edge-cases/myimage.qcow2`)
 2. **Safety classification**:
    - `safe` - Known-good image, can run qemu-img on it
    - `caution` - Potentially problematic, test in isolation
@@ -36,7 +36,7 @@ Create a kebab-case ID from the description:
 Compute the SHA256 hash of the image file for integrity verification:
 
 ```bash
-sha256sum ../imago-testdata/<path-to-image>
+sha256sum ../instar-testdata/<path-to-image>
 ```
 
 This hash is stored in the manifest and verified at test time. If the image
@@ -67,12 +67,12 @@ For malicious images, also add:
 
 ### Step 5: For Safe Images - Generate Baseline Outputs
 
-Safe images are tested against stored baseline outputs in the `imago-testdata`
+Safe images are tested against stored baseline outputs in the `instar-testdata`
 repository. The test suite iterates all known output profiles (qemu-img version
-groups) and verifies that imago produces matching output for each profile.
+groups) and verifies that instar produces matching output for each profile.
 
 **Important**: Tests do NOT run qemu-img live. They compare against pre-generated
-baselines stored in `imago-testdata/expected-outputs/`.
+baselines stored in `instar-testdata/expected-outputs/`.
 
 1. **Add to test_images list** in `tests/test_info_safe.py`:
    ```python
@@ -83,14 +83,14 @@ baselines stored in `imago-testdata/expected-outputs/`.
    ]
    ```
 
-2. **Generate baseline outputs** in the `imago-testdata` repository:
+2. **Generate baseline outputs** in the `instar-testdata` repository:
    - For each profile (profile-6-0-0, profile-8-0-0), run qemu-img on the image
      using a qemu-img version that matches that profile
    - Store outputs in `expected-outputs/qemu-img-human/profiles/<profile>/<image-id>.stdout.txt`
 
-3. **Alternatively**, run the baseline generation scripts in imago-testdata:
+3. **Alternatively**, run the baseline generation scripts in instar-testdata:
    ```bash
-   cd ../imago-testdata
+   cd ../instar-testdata
    ./scripts/capture-outputs.sh
    ./scripts/generate-profiles.sh
    ```
@@ -99,9 +99,9 @@ baselines stored in `imago-testdata/expected-outputs/`.
 
 **CRITICAL**: Never run qemu-img on malicious images.
 
-1. Run `imago info` on the image to get output:
+1. Run `instar info` on the image to get output:
    ```bash
-   ./src/target/release/imago info <path-to-image>
+   ./src/target/release/instar info <path-to-image>
    ```
 
 2. Verify the output is correct (format detected, backing files reported, etc.)
@@ -128,28 +128,28 @@ make test-malicious
 
 ### Step 8: Verify Output Matches
 
-For safe images, the test iterates all output profiles and compares imago output
+For safe images, the test iterates all output profiles and compares instar output
 (when run with `--qemu-version X.Y`) against stored baseline outputs.
 Any difference fails the test.
 
-For malicious images, the test compares imago output against the stored
+For malicious images, the test compares instar output against the stored
 expected output file.
 
 ### Step 9: Document Any Quirks Discovered
 
 If the test reveals unexpected qemu-img behavior that required compatibility
-work in imago:
+work in instar:
 
 1. **Create image notes** in `docs/image_notes/<image-id>.md`:
    - Document the specific values that revealed the behavior
    - Explain how qemu-img handles the case
-   - Explain how imago now handles it
+   - Explain how instar now handles it
    - Link to relevant quirks documentation
 
 2. **Update docs/quirks.md** if this is a new quirk:
    - Document the observed behavior
    - Explain the root cause (if known)
-   - Document imago's default behavior
+   - Document instar's default behavior
    - Document `--ignore-quirks` behavior
 
 3. **Update docs/image_notes/README.md** to add the new image to the index
@@ -183,7 +183,7 @@ User: Add the CirrOS 0.6.3 image to the test suite
 Steps:
 1. Add to manifest.json
 2. Add image ID to test_images list in test_info_safe.py
-3. Generate baseline outputs in imago-testdata for all profiles
+3. Generate baseline outputs in instar-testdata for all profiles
 4. Run `make test` to verify
 
 ## Example: Adding a Malicious Image
@@ -200,13 +200,13 @@ User: Add a QCOW2 image with backing file pointing to /etc/passwd
 
 For malicious images:
 - Create the expected output file FIRST
-- Run imago (not qemu-img) to generate expected output
+- Run instar (not qemu-img) to generate expected output
 - Verify backing file path is correctly reported
 - Verify no actual file content from /etc/passwd appears
 
 ## Output Profiles
 
-The test suite verifies imago output against multiple qemu-img version profiles:
+The test suite verifies instar output against multiple qemu-img version profiles:
 
 | Profile | qemu-img Versions | Key Feature |
 |---------|-------------------|-------------|
@@ -227,12 +227,12 @@ See `docs/output-formats.md` for detailed profile documentation.
 | `docs/quirks.md` | qemu-img quirks and `--ignore-quirks` documentation |
 | `docs/image_notes/` | Per-image documentation of quirks discovered |
 | `docs/image_notes/README.md` | Index of image notes |
-| `imago-testdata/expected-outputs/` | Stored baseline outputs for all profiles |
-| `imago-testdata/expected-outputs/qemu-img-human/version-map.json` | Profile definitions |
+| `instar-testdata/expected-outputs/` | Stored baseline outputs for all profiles |
+| `instar-testdata/expected-outputs/qemu-img-human/version-map.json` | Profile definitions |
 
 ## Safety Reminders
 
-1. **Never run qemu-img on malicious images** - This defeats the purpose of imago
+1. **Never run qemu-img on malicious images** - This defeats the purpose of instar
 2. **Always verify expected output** - Malicious images should report dangerous
    references but not leak actual file contents
 3. **Mark CI appropriately** - Malicious images should have `run_in_ci: false`

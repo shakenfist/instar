@@ -415,7 +415,7 @@ for i in $(seq 1 "${item_count}"); do
 
     # Build Claude prompt for this specific item
     cat > "${output_dir}/claude-prompt-${i}.txt" << PROMPT_EOF
-You are addressing a specific review comment on PR #${pr_number} for the Shaken Fist imago project.
+You are addressing a specific review comment on PR #${pr_number} for the Shaken Fist instar project.
 
 ## Context
 
@@ -470,7 +470,7 @@ DISAGREEMENT_END
 ## Rules
 
 - Focus ONLY on this specific item - do not address other issues
-- Do NOT run cargo commands directly - use \`make imago\`, \`make test\`, \`make lint\`
+- Do NOT run cargo commands directly - use \`make instar\`, \`make test\`, \`make lint\`
 - Keep changes minimal and focused
 - If the fix requires changes you're unsure about, explain and skip
 PROMPT_EOF

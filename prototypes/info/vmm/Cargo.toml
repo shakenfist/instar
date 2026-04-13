@@ -1,12 +1,12 @@
 [package]
-name = "imago"
+name = "instar"
 version = "0.1.0"
 edition = "2021"
 description = "Safe, sandboxed disk image operations"
 license = "Apache-2.0"
 
 [[bin]]
-name = "imago"
+name = "instar"
 path = "src/main.rs"
 
 [dependencies]

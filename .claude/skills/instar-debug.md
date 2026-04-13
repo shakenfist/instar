@@ -1,11 +1,11 @@
-# /imago-debug - Troubleshooting Imago Operations
+# /instar-debug - Troubleshooting Instar Operations
 
-Diagnose and fix common issues when developing imago guest operations.
+Diagnose and fix common issues when developing instar guest operations.
 
 ## Usage
 
 ```
-/imago-debug [issue]
+/instar-debug [issue]
 ```
 
 Where `[issue]` can be: `build`, `boot`, `virtio`, `calltable`, `panic`, or omit for general guidance.
@@ -276,11 +276,11 @@ fn debug_u64(prefix: &str, value: u64) {
 ## Running with Verbose Output
 
 ```bash
-# Run imago with verbose flag for detailed VMM output
-sudo RUST_LOG=debug src/target/release/imago info image.qcow2
+# Run instar with verbose flag for detailed VMM output
+sudo RUST_LOG=debug src/target/release/instar info image.qcow2
 
 # Or with trace-level detail
-sudo RUST_LOG=trace src/target/release/imago info image.qcow2
+sudo RUST_LOG=trace src/target/release/instar info image.qcow2
 ```
 
 ---

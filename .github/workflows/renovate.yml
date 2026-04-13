@@ -21,4 +21,4 @@ jobs:
           token: ${{ secrets.RENOVATE_TOKEN }}
         env:
           RENOVATE_AUTODISCOVER: "true"
-          RENOVATE_AUTODISCOVER_FILTER: "shakenfist/imago"
+          RENOVATE_AUTODISCOVER_FILTER: "shakenfist/instar"

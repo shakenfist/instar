@@ -1,8 +1,8 @@
 """
-Cross-validation tests: imago vs oslo.utils format_inspector.
+Cross-validation tests: instar vs oslo.utils format_inspector.
 
 oslo.utils is the safety gate for image uploads in OpenStack
-(Glance, Nova, Cinder). These tests verify that imago's format
+(Glance, Nova, Cinder). These tests verify that instar's format
 detection and safety reporting agree with oslo.utils, documenting
 any intentional divergences.
 
@@ -13,7 +13,7 @@ import json
 
 import testscenarios
 
-from base import ImagoTestBase
+from base import InstarTestBase
 from helpers import load_manifest_images
 
 try:
@@ -96,28 +96,28 @@ OSLO_SKIP_IMAGES = {
     'cve-2024-4467-json-prefix',
 }
 
-# Format name mapping: imago -> oslo.utils.
+# Format name mapping: instar -> oslo.utils.
 # Most formats use the same name; only divergences listed.
-IMAGO_TO_OSLO_FORMAT = {
+INSTAR_TO_OSLO_FORMAT = {
     'vpc': 'vhd',
 }
 
 # Images where format detection intentionally diverges.
-# Maps image_id -> (imago_format, oslo_format).
+# Maps image_id -> (instar_format, oslo_format).
 KNOWN_FORMAT_DIVERGENCES = {
     # oslo.utils GPTInspector detects both MBR and GPT
-    # partitioned raw images as 'gpt'. imago reports 'raw'
+    # partitioned raw images as 'gpt'. instar reports 'raw'
     # (matching qemu-img behaviour).
     'raw-mbr-partitioned': ('raw', 'gpt'),
     'raw-gpt-partitioned': ('raw', 'gpt'),
-    # vmdk-multi-partition is detected as 'raw' by imago
+    # vmdk-multi-partition is detected as 'raw' by instar
     # and 'gpt' by oslo (the file appears to be a raw disk
     # with GPT partitions despite the .vmdk extension).
     'vmdk-multi-partition': ('raw', 'gpt'),
-    # imago reports ISO as 'raw' (with --unsafe-quirks);
+    # instar reports ISO as 'raw' (with --unsafe-quirks);
     # oslo detects as 'iso'.
     'iso-simple': ('raw', 'iso'),
-    # imago reports LUKS as 'unknown'; oslo detects
+    # instar reports LUKS as 'unknown'; oslo detects
     # as 'luks'.
     'luks-v1': ('unknown', 'luks'),
     'luks-v2': ('unknown', 'luks'),
@@ -126,11 +126,11 @@ KNOWN_FORMAT_DIVERGENCES = {
     'luks-v2-raw-gpt': ('unknown', 'luks'),
 }
 
-# Known safety divergences: images where imago does not
+# Known safety divergences: images where instar does not
 # expose certain safety-relevant fields in JSON output
 # (handled via KVM sandbox instead).
 KNOWN_SAFETY_DIVERGENCES = {
-    # No remaining divergences: imago now reports
+    # No remaining divergences: instar now reports
     # the data-file path in JSON output (Phase 13).
 }
 
@@ -194,14 +194,14 @@ class OsloCrossvalMixin:
 class TestOsloFormatDetection(
     testscenarios.WithScenarios,
     OsloCrossvalMixin,
-    ImagoTestBase,
+    InstarTestBase,
 ):
-    """Cross-validate format detection: imago vs oslo.utils."""
+    """Cross-validate format detection: instar vs oslo.utils."""
 
     scenarios = _generate_scenarios()
 
     def test_format_agrees(self):
-        """Verify imago and oslo.utils detect the same format."""
+        """Verify instar and oslo.utils detect the same format."""
         image, inspector = self._get_oslo_inspector()
         oslo_format = inspector.NAME
 
@@ -217,28 +217,28 @@ class TestOsloFormatDetection(
             )
             return
 
-        # Run imago to get its format detection
-        stdout, stderr, rc = self.run_imago_info(
+        # Run instar to get its format detection
+        stdout, stderr, rc = self.run_instar_info(
             image.path,
             output_format='json',
             unsafe_quirks=image.requires_unsafe_quirks,
         )
         if rc != 0:
             self.skipTest(
-                f'imago failed: {stderr.strip()}'
+                f'instar failed: {stderr.strip()}'
             )
 
-        imago_data = json.loads(stdout)
-        imago_format = imago_data.get('format')
+        instar_data = json.loads(stdout)
+        instar_format = instar_data.get('format')
 
-        # Map imago name to oslo convention
-        expected_oslo = IMAGO_TO_OSLO_FORMAT.get(
-            imago_format, imago_format
+        # Map instar name to oslo convention
+        expected_oslo = INSTAR_TO_OSLO_FORMAT.get(
+            instar_format, instar_format
         )
 
         self.assertEqual(
             expected_oslo, oslo_format,
-            f'{self.image_id}: imago={imago_format!r} '
+            f'{self.image_id}: instar={instar_format!r} '
             f'(mapped={expected_oslo!r}), '
             f'oslo={oslo_format!r}'
         )
@@ -247,9 +247,9 @@ class TestOsloFormatDetection(
 class TestOsloSafetyCheck(
     testscenarios.WithScenarios,
     OsloCrossvalMixin,
-    ImagoTestBase,
+    InstarTestBase,
 ):
-    """Cross-validate safety verdicts: imago vs oslo.utils."""
+    """Cross-validate safety verdicts: instar vs oslo.utils."""
 
     scenarios = _generate_scenarios()
 
@@ -270,7 +270,7 @@ class TestOsloSafetyCheck(
             oslo_safe = False
 
         # Known divergence: QED is always banned by oslo.utils
-        # but imago detects without rejecting (KVM sandbox
+        # but instar detects without rejecting (KVM sandbox
         # makes it safe to inspect).
         if image.format == 'qed':
             self.assertFalse(
@@ -281,38 +281,38 @@ class TestOsloSafetyCheck(
             return
 
         # Known divergence: oslo.utils rejects LUKS v2+
-        # (only supports v1). imago detects both.
+        # (only supports v1). instar detects both.
         if image.format == 'luks':
             return
 
-        # Run imago to get metadata
-        stdout, stderr, rc = self.run_imago_info(
+        # Run instar to get metadata
+        stdout, stderr, rc = self.run_instar_info(
             image.path,
             output_format='json',
             unsafe_quirks=image.requires_unsafe_quirks,
         )
 
-        # If imago rejects, both tools may agree on rejection
+        # If instar rejects, both tools may agree on rejection
         if rc != 0:
             return
 
-        imago_data = json.loads(stdout)
+        instar_data = json.loads(stdout)
 
         # Cross-validate backing file detection
-        imago_has_backing = 'backing-filename' in imago_data
+        instar_has_backing = 'backing-filename' in instar_data
         oslo_flags_backing = 'backing_file' in oslo_failures
 
         if oslo_flags_backing:
             self.assertTrue(
-                imago_has_backing,
+                instar_has_backing,
                 f'{self.image_id}: oslo flagged '
-                f'backing_file but imago has no '
+                f'backing_file but instar has no '
                 f'backing-filename'
             )
-        if imago_has_backing:
+        if instar_has_backing:
             self.assertTrue(
                 oslo_flags_backing,
-                f'{self.image_id}: imago reports '
+                f'{self.image_id}: instar reports '
                 f'backing-filename but oslo did not '
                 f'flag backing_file '
                 f'(oslo_failures={oslo_failures})'
@@ -324,25 +324,25 @@ class TestOsloSafetyCheck(
         )
         oslo_flags_data = 'data_file' in oslo_failures
         fmt_data = (
-            imago_data
+            instar_data
             .get('format-specific', {})
             .get('data', {})
         )
-        imago_has_data_file = bool(
+        instar_has_data_file = bool(
             fmt_data.get('data-file')
         )
 
         if oslo_flags_data and 'data_file' not in known:
             self.assertTrue(
-                imago_has_data_file,
+                instar_has_data_file,
                 f'{self.image_id}: oslo flagged '
-                f'data_file but imago has no '
+                f'data_file but instar has no '
                 f'data-file in format-specific'
             )
-        if imago_has_data_file:
+        if instar_has_data_file:
             self.assertTrue(
                 oslo_flags_data,
-                f'{self.image_id}: imago reports '
+                f'{self.image_id}: instar reports '
                 f'data-file but oslo did not flag '
                 f'data_file '
                 f'(oslo_failures={oslo_failures})'
@@ -352,9 +352,9 @@ class TestOsloSafetyCheck(
 class TestOsloVirtualSize(
     testscenarios.WithScenarios,
     OsloCrossvalMixin,
-    ImagoTestBase,
+    InstarTestBase,
 ):
-    """Cross-validate virtual size: imago vs oslo.utils."""
+    """Cross-validate virtual size: instar vs oslo.utils."""
 
     scenarios = _generate_scenarios(
         skip_formats=VSIZE_SKIP_FORMATS
@@ -380,22 +380,22 @@ class TestOsloVirtualSize(
                 f'for {self.image_id}'
             )
 
-        # Run imago to get virtual size
-        stdout, stderr, rc = self.run_imago_info(
+        # Run instar to get virtual size
+        stdout, stderr, rc = self.run_instar_info(
             image.path,
             output_format='json',
             unsafe_quirks=image.requires_unsafe_quirks,
         )
         if rc != 0:
             self.skipTest(
-                f'imago failed: {stderr.strip()}'
+                f'instar failed: {stderr.strip()}'
             )
 
-        imago_data = json.loads(stdout)
-        imago_vsize = imago_data.get('virtual-size')
-        if imago_vsize is None:
+        instar_data = json.loads(stdout)
+        instar_vsize = instar_data.get('virtual-size')
+        if instar_vsize is None:
             self.skipTest(
-                f'imago reports no virtual-size for '
+                f'instar reports no virtual-size for '
                 f'{self.image_id}'
             )
 
@@ -403,29 +403,29 @@ class TestOsloVirtualSize(
         # geometry rounding. Allow up to one cylinder
         # (255 * 63 * 512 = 8,225,280 bytes).
         if image.format == 'vpc':
-            delta = abs(oslo_vsize - imago_vsize)
+            delta = abs(oslo_vsize - instar_vsize)
             self.assertLessEqual(
                 delta, 8225280,
                 f'{self.image_id}: virtual size delta '
                 f'{delta} > 8225280 (CHS rounding) '
                 f'(oslo={oslo_vsize}, '
-                f'imago={imago_vsize})'
+                f'instar={instar_vsize})'
             )
         # Allow 512-byte delta for raw images due to
         # sector rounding differences between tools
         elif image.format == 'raw':
-            delta = abs(oslo_vsize - imago_vsize)
+            delta = abs(oslo_vsize - instar_vsize)
             self.assertLessEqual(
                 delta, 512,
                 f'{self.image_id}: virtual size delta '
                 f'{delta} > 512 bytes '
                 f'(oslo={oslo_vsize}, '
-                f'imago={imago_vsize})'
+                f'instar={instar_vsize})'
             )
         else:
             self.assertEqual(
-                oslo_vsize, imago_vsize,
+                oslo_vsize, instar_vsize,
                 f'{self.image_id}: '
                 f'oslo={oslo_vsize}, '
-                f'imago={imago_vsize}'
+                f'instar={instar_vsize}'
             )

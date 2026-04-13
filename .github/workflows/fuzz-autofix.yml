@@ -55,11 +55,11 @@ jobs:
         with:
           ref: develop
           fetch-depth: 0
-          path: imago
+          path: instar
 
       - name: Configure git
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
           git config user.name "shakenfist-bot"
           git config user.email "bot@shakenfist.com"
 
@@ -67,7 +67,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
           gh label create "security-audit" \
             --description "Findings from security audit and fuzzing" \
             --color "D93F0B" 2>/dev/null || true
@@ -87,7 +87,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INPUT_ISSUE: ${{ inputs.issue_number }}
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
 
           # Helper: check if issue body is valid fuzzer JSON.
           # Returns 0 if the body parses as JSON with required fields.
@@ -174,7 +174,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ISSUE_NUMBER: ${{ steps.find_issue.outputs.issue_number }}
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
           gh issue edit "$ISSUE_NUMBER" --add-label "autofix-attempted"
 
       - name: Create working branch
@@ -182,15 +182,15 @@ jobs:
         env:
           ISSUE_NUMBER: ${{ steps.find_issue.outputs.issue_number }}
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
           git checkout -b "autofix/issue-${ISSUE_NUMBER}" origin/develop
 
-      - name: Build imago
+      - name: Build instar
         if: steps.find_issue.outputs.found == 'true'
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
-          docker image rm -f imago-build 2>/dev/null || true
-          make imago 2>&1 | tee ${GITHUB_WORKSPACE}/build-log.txt
+          cd ${GITHUB_WORKSPACE}/instar
+          docker image rm -f instar-build 2>/dev/null || true
+          make instar 2>&1 | tee ${GITHUB_WORKSPACE}/build-log.txt
 
       - name: Construct prompt (attempt 1)
         if: steps.find_issue.outputs.found == 'true'
@@ -198,7 +198,7 @@ jobs:
           ISSUE_NUMBER: ${{ steps.find_issue.outputs.issue_number }}
           ISSUE_TITLE: ${{ steps.find_issue.outputs.issue_title }}
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
 
           # Shared prompt template (rules, task, output format)
           cp tools/autofix-prompt-base.txt \
@@ -236,7 +236,7 @@ jobs:
         if: steps.find_issue.outputs.found == 'true'
         continue-on-error: true
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
 
           if ! command -v claude &> /dev/null; then
             echo "Error: Claude Code CLI not found"
@@ -269,7 +269,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ISSUE_NUMBER: ${{ steps.find_issue.outputs.issue_number }}
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
 
           # Count changed source files (exclude docs, tests, manifests)
           CHANGED_SRC=$(git diff --cached --name-only \
@@ -332,7 +332,7 @@ jobs:
           steps.find_issue.outputs.found == 'true' &&
           steps.complexity1.outputs.too_complex != 'true'
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
 
           # Check if there are any staged changes at all
           if [ -z "$(git diff --cached --name-only)" ]; then
@@ -344,7 +344,7 @@ jobs:
           # Rebuild if Rust files changed
           if git diff --cached --name-only | grep -q '\.rs$'; then
             echo "Rust files changed, rebuilding..."
-            make imago 2>&1 | tee ${GITHUB_WORKSPACE}/verify-build-1.txt
+            make instar 2>&1 | tee ${GITHUB_WORKSPACE}/verify-build-1.txt
             if [ ${PIPESTATUS[0]} -ne 0 ]; then
               echo "Build failed"
               echo "fix_succeeded=false" >> $GITHUB_OUTPUT
@@ -376,7 +376,7 @@ jobs:
           ISSUE_TITLE: ${{ steps.find_issue.outputs.issue_title }}
           FAILURE_REASON: ${{ steps.verify1.outputs.failure_reason }}
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
 
           # Save the failed diff for context
           git diff --cached > ${GITHUB_WORKSPACE}/attempt1-diff.txt 2>&1
@@ -396,7 +396,7 @@ jobs:
           git clean -fd 2>/dev/null || true
 
           # Shared prompt template (same as attempt 1)
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
           cp tools/autofix-prompt-base.txt ${GITHUB_WORKSPACE}/autofix-prompt-2.txt
 
           # Prepend retry-specific context: previous attempt diff and
@@ -465,7 +465,7 @@ jobs:
         if: steps.prep_retry.outputs.retry_ready == 'true'
         continue-on-error: true
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
 
           start_time=$(date +%s)
 
@@ -491,7 +491,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ISSUE_NUMBER: ${{ steps.find_issue.outputs.issue_number }}
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
           CHANGED_SRC=$(git diff --cached --name-only \
             | grep -vE '(\.md$|^tests/|^docs/|manifest\.json$)' \
             || true)
@@ -546,7 +546,7 @@ jobs:
           steps.prep_retry.outputs.retry_ready == 'true' &&
           steps.complexity2.outputs.too_complex != 'true'
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
 
           if [ -z "$(git diff --cached --name-only)" ]; then
             echo "No changes staged by Claude"
@@ -556,7 +556,7 @@ jobs:
 
           if git diff --cached --name-only | grep -q '\.rs$'; then
             echo "Rust files changed, rebuilding..."
-            make imago 2>&1 | tee ${GITHUB_WORKSPACE}/verify-build-2.txt
+            make instar 2>&1 | tee ${GITHUB_WORKSPACE}/verify-build-2.txt
             if [ ${PIPESTATUS[0]} -ne 0 ]; then
               echo "Build failed"
               echo "fix_succeeded=false" >> $GITHUB_OUTPUT
@@ -619,7 +619,7 @@ jobs:
           ISSUE_NUMBER: ${{ steps.find_issue.outputs.issue_number }}
           ISSUE_TITLE: ${{ steps.find_issue.outputs.issue_title }}
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
 
           # Claude is instructed to stage files itself. Only stage
           # tracked modified files as a safety net (not -A which would
@@ -680,7 +680,7 @@ jobs:
             echo ""
             echo "## Verification"
             echo ""
-            echo "- Build succeeded (make imago)"
+            echo "- Build succeeded (make instar)"
             echo "- Core tests passed (make test-container-core)"
             echo ""
             echo "## Reproduction"
@@ -714,7 +714,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ISSUE_NUMBER: ${{ steps.find_issue.outputs.issue_number }}
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
 
           # Label as failed
           gh issue edit "$ISSUE_NUMBER" \

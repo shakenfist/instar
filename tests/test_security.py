@@ -1,10 +1,10 @@
 """
-Security-focused tests for imago.
+Security-focused tests for instar.
 
-These tests verify that imago correctly detects and reports security-relevant
+These tests verify that instar correctly detects and reports security-relevant
 features in disk images (backing files, external data files, etc.) without
 being exploited by them. The TestCVEReproduction class specifically validates
-that known qemu-img CVEs are mitigated by imago's architecture.
+that known qemu-img CVEs are mitigated by instar's architecture.
 """
 
 import json
@@ -14,19 +14,19 @@ import time
 
 import testtools
 
-from base import ImagoTestBase
+from base import InstarTestBase
 
 # Markers that indicate /etc/passwd or /etc/shadow content has leaked.
 # Used by assert_no_sensitive_content() across multiple test classes.
 _SENSITIVE_MARKERS = ['root:', 'daemon:', 'bin:']
 
 
-class TestSecurityFeatureDetection(ImagoTestBase):
+class TestSecurityFeatureDetection(InstarTestBase):
     """Tests for security feature detection."""
 
-    def test_imago_reports_backing_file_without_reading_content(self):
+    def test_instar_reports_backing_file_without_reading_content(self):
         """
-        Verify imago reports backing file path without leaking file contents.
+        Verify instar reports backing file path without leaking file contents.
 
         A QCOW2 with a backing file pointing to a text file should:
         1. Report the backing file reference in output
@@ -37,13 +37,13 @@ class TestSecurityFeatureDetection(ImagoTestBase):
         if not image.path.exists():
             self.skipTest(f'Test image not found: {image.path}')
 
-        # Run imago info on the QCOW2
-        stdout, stderr, rc = self.run_imago_info(image.path)
+        # Run instar info on the QCOW2
+        stdout, stderr, rc = self.run_instar_info(image.path)
 
         # Should succeed - the overlay QCOW2 itself is valid
         self.assertEqual(
             0, rc,
-            f'imago should process QCOW2 overlay successfully: {stderr}'
+            f'instar should process QCOW2 overlay successfully: {stderr}'
         )
 
         # Should report the backing file path
@@ -66,12 +66,12 @@ class TestSecurityFeatureDetection(ImagoTestBase):
             'Backing file content leaked in output!'
         )
 
-    def test_imago_reports_backing_file_to_etc_passwd(self):
+    def test_instar_reports_backing_file_to_etc_passwd(self):
         """
-        Verify imago reports backing file reference to /etc/passwd.
+        Verify instar reports backing file reference to /etc/passwd.
 
         This simulates CVE-2015-5163 where an attacker crafts a QCOW2 with
-        backing_file=/etc/passwd. imago should:
+        backing_file=/etc/passwd. instar should:
         1. Report the backing file path
         2. NOT read or leak /etc/passwd contents
         """
@@ -79,13 +79,13 @@ class TestSecurityFeatureDetection(ImagoTestBase):
         if not image.path.exists():
             self.skipTest(f'Test image not found: {image.path}')
 
-        # Run imago info on the QCOW2
-        stdout, stderr, rc = self.run_imago_info(image.path)
+        # Run instar info on the QCOW2
+        stdout, stderr, rc = self.run_instar_info(image.path)
 
         # Should succeed - the overlay QCOW2 itself is valid
         self.assertEqual(
             0, rc,
-            f'imago should process QCOW2 overlay successfully: {stderr}'
+            f'instar should process QCOW2 overlay successfully: {stderr}'
         )
 
         # Should report /etc/passwd as the backing file path
@@ -103,9 +103,9 @@ class TestSecurityFeatureDetection(ImagoTestBase):
             '/etc/passwd content leaked in output!'
         )
 
-    def test_imago_reports_external_data_file_without_reading_content(self):
+    def test_instar_reports_external_data_file_without_reading_content(self):
         """
-        Verify imago reports external data file path without reading its content.
+        Verify instar reports external data file path without reading its content.
 
         QCOW2 v3 supports external data files (CVE-2024-32498) which could
         reference sensitive system files. The info operation should report
@@ -116,13 +116,13 @@ class TestSecurityFeatureDetection(ImagoTestBase):
         if not image.path.exists():
             self.skipTest(f'Test image not found: {image.path}')
 
-        # Run imago info (without --chain, so no file opens)
-        stdout, stderr, rc = self.run_imago_info(image.path)
+        # Run instar info (without --chain, so no file opens)
+        stdout, stderr, rc = self.run_instar_info(image.path)
 
         # Should succeed — the QCOW2 metadata is valid
         self.assertEqual(
             0, rc,
-            f'imago should process QCOW2 with external data: {stderr}'
+            f'instar should process QCOW2 with external data: {stderr}'
         )
 
         # Should report the data file path
@@ -137,21 +137,21 @@ class TestSecurityFeatureDetection(ImagoTestBase):
             f'Expected external-data.raw in data file path: {stdout}'
         )
 
-    def test_imago_reports_external_data_file_in_json(self):
+    def test_instar_reports_external_data_file_in_json(self):
         """
-        Verify imago reports external data file in JSON format-specific data.
+        Verify instar reports external data file in JSON format-specific data.
         """
         image = self.get_image('qcow2-external-data-file')
         if not image.path.exists():
             self.skipTest(f'Test image not found: {image.path}')
 
-        stdout, stderr, rc = self.run_imago_info(
+        stdout, stderr, rc = self.run_instar_info(
             image.path, output_format='json'
         )
 
         self.assertEqual(
             0, rc,
-            f'imago should process QCOW2 with external data: {stderr}'
+            f'instar should process QCOW2 with external data: {stderr}'
         )
 
         data = json.loads(stdout)
@@ -166,25 +166,25 @@ class TestSecurityFeatureDetection(ImagoTestBase):
             f'Expected external-data.raw as data-file value: {fmt_data}'
         )
 
-    def test_imago_handles_vmdk_descriptor_safely(self):
+    def test_instar_handles_vmdk_descriptor_safely(self):
         """
-        Verify imago handles VMDK descriptors without following extent paths.
+        Verify instar handles VMDK descriptors without following extent paths.
 
         VMDK descriptor files can reference arbitrary files as extents
         (e.g. /etc/passwd). Text-only VMDK descriptors have no binary
-        magic, so imago rejects them as unknown format — extent paths
+        magic, so instar rejects them as unknown format — extent paths
         are never followed.
         """
         image = self.get_image('vmdk-path-traversal')
         if not image.path.exists():
             self.skipTest(f'Test image not found: {image.path}')
 
-        # Text-only descriptor has no binary magic, so imago
+        # Text-only descriptor has no binary magic, so instar
         # reports "unknown" format — extent paths never followed
-        stdout, stderr, rc = self.run_imago_info(image.path)
+        stdout, stderr, rc = self.run_instar_info(image.path)
         self.assertEqual(
             0, rc,
-            f'imago info failed unexpectedly: {stderr}'
+            f'instar info failed unexpectedly: {stderr}'
         )
         self.assertIn(
             'unknown', stdout.lower(),
@@ -199,7 +199,7 @@ class TestSecurityFeatureDetection(ImagoTestBase):
         )
 
         # With --unsafe-quirks, accepted as raw (still no leak)
-        stdout_u, stderr_u, rc_u = self.run_imago_info(
+        stdout_u, stderr_u, rc_u = self.run_instar_info(
             image.path, unsafe_quirks=True
         )
         self.assertEqual(
@@ -216,22 +216,22 @@ class TestSecurityFeatureDetection(ImagoTestBase):
             '/etc/passwd content leaked with --unsafe-quirks!'
         )
 
-    def test_imago_handles_vmdk_no_extents_safely(self):
+    def test_instar_handles_vmdk_no_extents_safely(self):
         """
-        Verify imago rejects VMDK descriptors with no extent declarations.
+        Verify instar rejects VMDK descriptors with no extent declarations.
 
         A VMDK descriptor with no RW/RDONLY/NOACCESS extent lines is
-        invalid. imago should reject it as unknown format (no binary
+        invalid. instar should reject it as unknown format (no binary
         magic).
         """
         image = self.get_image('vmdk-no-extents')
         if not image.path.exists():
             self.skipTest(f'Test image not found: {image.path}')
 
-        stdout, stderr, rc = self.run_imago_info(image.path)
+        stdout, stderr, rc = self.run_instar_info(image.path)
         self.assertEqual(
             0, rc,
-            f'imago info failed unexpectedly: {stderr}'
+            f'instar info failed unexpectedly: {stderr}'
         )
         self.assertIn(
             'unknown', stdout.lower(),
@@ -239,7 +239,7 @@ class TestSecurityFeatureDetection(ImagoTestBase):
         )
 
         # With --unsafe-quirks, accepted as raw
-        stdout_u, stderr_u, rc_u = self.run_imago_info(
+        stdout_u, stderr_u, rc_u = self.run_instar_info(
             image.path, unsafe_quirks=True
         )
         self.assertEqual(
@@ -252,10 +252,10 @@ class TestSecurityFeatureDetection(ImagoTestBase):
         )
 
 
-class TestBackingChainSecurity(ImagoTestBase):
+class TestBackingChainSecurity(InstarTestBase):
     """Tests for backing chain discovery security.
 
-    These tests verify that imago info --chain correctly handles invalid
+    These tests verify that instar info --chain correctly handles invalid
     or malicious backing files in the chain.
     """
 
@@ -276,8 +276,8 @@ class TestBackingChainSecurity(ImagoTestBase):
         if not backing.path.exists():
             self.skipTest(f'Backing image not found: {backing.path}')
 
-        # Run imago info --chain without --unsafe-quirks
-        stdout, stderr, rc = self.run_imago_info(
+        # Run instar info --chain without --unsafe-quirks
+        stdout, stderr, rc = self.run_instar_info(
             image.path, chain=True, unsafe_quirks=False
         )
 
@@ -306,8 +306,8 @@ class TestBackingChainSecurity(ImagoTestBase):
         if not image.path.exists():
             self.skipTest(f'Test image not found: {image.path}')
 
-        # Run imago info --chain
-        stdout, stderr, rc = self.run_imago_info(image.path, chain=True)
+        # Run instar info --chain
+        stdout, stderr, rc = self.run_instar_info(image.path, chain=True)
 
         # Should fail - /etc/passwd is outside the allowed path
         self.assertNotEqual(
@@ -325,10 +325,10 @@ class TestBackingChainSecurity(ImagoTestBase):
         )
 
 
-class TestRawFormatValidation(ImagoTestBase):
+class TestRawFormatValidation(InstarTestBase):
     """Tests for RAW format validation (partition table detection).
 
-    These tests verify imago's secure default behavior: files without valid
+    These tests verify instar's secure default behavior: files without valid
     format headers OR valid partition tables are rejected as 'unknown' format.
     This prevents arbitrary files (like /etc/passwd) from being accepted as
     disk images, which is the root cause of backing file disclosure attacks.
@@ -336,7 +336,7 @@ class TestRawFormatValidation(ImagoTestBase):
 
     def test_rejects_garbage_without_unsafe_quirks(self):
         """
-        Verify imago rejects random data without --unsafe-quirks.
+        Verify instar rejects random data without --unsafe-quirks.
 
         Files without valid format headers and without valid partition tables
         should be rejected as 'unknown' format in secure mode.
@@ -346,7 +346,7 @@ class TestRawFormatValidation(ImagoTestBase):
             self.skipTest(f'Test image not found: {image.path}')
 
         # Without --unsafe-quirks, should fail to detect format
-        stdout, stderr, rc = self.run_imago_info(
+        stdout, stderr, rc = self.run_instar_info(
             image.path,
             unsafe_quirks=False
         )
@@ -356,14 +356,14 @@ class TestRawFormatValidation(ImagoTestBase):
         self.assertIn(
             'unknown',
             stdout.lower() + stderr.lower(),
-            f'Expected imago to reject garbage file, got: {stdout}{stderr}'
+            f'Expected instar to reject garbage file, got: {stdout}{stderr}'
         )
 
     def test_accepts_garbage_with_unsafe_quirks(self):
         """
-        Verify imago accepts random data WITH --unsafe-quirks.
+        Verify instar accepts random data WITH --unsafe-quirks.
 
-        With --unsafe-quirks, imago should match qemu-img behavior and
+        With --unsafe-quirks, instar should match qemu-img behavior and
         accept any file as 'raw' format.
         """
         image = self.get_image('raw-random-garbage')
@@ -371,7 +371,7 @@ class TestRawFormatValidation(ImagoTestBase):
             self.skipTest(f'Test image not found: {image.path}')
 
         # With --unsafe-quirks, should accept as raw
-        stdout, stderr, rc = self.run_imago_info(
+        stdout, stderr, rc = self.run_instar_info(
             image.path,
             unsafe_quirks=True
         )
@@ -379,17 +379,17 @@ class TestRawFormatValidation(ImagoTestBase):
         # Should succeed and report as 'raw'
         self.assertEqual(
             0, rc,
-            f'imago with --unsafe-quirks should accept garbage file: {stderr}'
+            f'instar with --unsafe-quirks should accept garbage file: {stderr}'
         )
         self.assertIn(
             'raw',
             stdout.lower(),
-            f'Expected imago to report garbage as raw, got: {stdout}'
+            f'Expected instar to report garbage as raw, got: {stdout}'
         )
 
     def test_accepts_mbr_partitioned_without_unsafe_quirks(self):
         """
-        Verify imago accepts MBR-partitioned raw images without --unsafe-quirks.
+        Verify instar accepts MBR-partitioned raw images without --unsafe-quirks.
 
         RAW images with valid MBR partition tables should be accepted in
         secure mode because they are recognizably disk images.
@@ -399,7 +399,7 @@ class TestRawFormatValidation(ImagoTestBase):
             self.skipTest(f'Test image not found: {image.path}')
 
         # Should succeed without --unsafe-quirks
-        stdout, stderr, rc = self.run_imago_info(
+        stdout, stderr, rc = self.run_instar_info(
             image.path,
             unsafe_quirks=False
         )
@@ -407,17 +407,17 @@ class TestRawFormatValidation(ImagoTestBase):
         # Should succeed and report as 'raw'
         self.assertEqual(
             0, rc,
-            f'imago should accept MBR-partitioned image: {stderr}'
+            f'instar should accept MBR-partitioned image: {stderr}'
         )
         self.assertIn(
             'raw',
             stdout.lower(),
-            f'Expected imago to report MBR image as raw, got: {stdout}'
+            f'Expected instar to report MBR image as raw, got: {stdout}'
         )
 
     def test_accepts_gpt_partitioned_without_unsafe_quirks(self):
         """
-        Verify imago accepts GPT-partitioned raw images without --unsafe-quirks.
+        Verify instar accepts GPT-partitioned raw images without --unsafe-quirks.
 
         RAW images with valid GPT partition tables should be accepted in
         secure mode because they are recognizably disk images.
@@ -427,7 +427,7 @@ class TestRawFormatValidation(ImagoTestBase):
             self.skipTest(f'Test image not found: {image.path}')
 
         # Should succeed without --unsafe-quirks
-        stdout, stderr, rc = self.run_imago_info(
+        stdout, stderr, rc = self.run_instar_info(
             image.path,
             unsafe_quirks=False
         )
@@ -435,20 +435,20 @@ class TestRawFormatValidation(ImagoTestBase):
         # Should succeed and report as 'raw'
         self.assertEqual(
             0, rc,
-            f'imago should accept GPT-partitioned image: {stderr}'
+            f'instar should accept GPT-partitioned image: {stderr}'
         )
         self.assertIn(
             'raw',
             stdout.lower(),
-            f'Expected imago to report GPT image as raw, got: {stdout}'
+            f'Expected instar to report GPT image as raw, got: {stdout}'
         )
 
 
-class TestCVEReproduction(ImagoTestBase):
+class TestCVEReproduction(InstarTestBase):
     """CVE reproduction tests (Phase 4 of security audit).
 
     Each test uses a purpose-built reproducer image that mimics the attack
-    vector from a known qemu-img CVE. Tests verify that imago's mitigations
+    vector from a known qemu-img CVE. Tests verify that instar's mitigations
     (KVM sandbox, host-side path allowlist, bounded buffers, checked
     arithmetic) prevent exploitation.
     """
@@ -478,8 +478,8 @@ class TestCVEReproduction(ImagoTestBase):
     def test_cve_2024_32498_info_reports_data_file_path(self):
         """External data file path is reported without opening the file."""
         image = self.get_adversarial_image('cve-2024-32498-extdata-etc-passwd')
-        stdout, stderr, rc = self.run_imago_info(image.path, output_format='json')
-        self.assertEqual(rc, 0, f'imago info failed: {stderr}')
+        stdout, stderr, rc = self.run_instar_info(image.path, output_format='json')
+        self.assertEqual(rc, 0, f'instar info failed: {stderr}')
 
         data = json.loads(stdout)
         fmt_data = data.get('format-specific', {}).get('data', {})
@@ -491,14 +491,14 @@ class TestCVEReproduction(ImagoTestBase):
     def test_cve_2024_32498_no_passwd_content_leaked(self):
         """No /etc/passwd content appears in info output."""
         image = self.get_adversarial_image('cve-2024-32498-extdata-etc-passwd')
-        stdout, stderr, rc = self.run_imago_info(image.path)
-        self.assertEqual(rc, 0, f'imago info failed: {stderr}')
+        stdout, stderr, rc = self.run_instar_info(image.path)
+        self.assertEqual(rc, 0, f'instar info failed: {stderr}')
         self.assert_no_sensitive_content(stdout + stderr, 'CVE-2024-32498 info')
 
     def test_cve_2024_32498_chain_rejects_external_data_file(self):
         """Chain mode rejects external data file outside allowlist."""
         image = self.get_adversarial_image('cve-2024-32498-extdata-etc-passwd')
-        stdout, stderr, rc = self.run_imago_info(image.path, chain=True)
+        stdout, stderr, rc = self.run_instar_info(image.path, chain=True)
         self.assertNotEqual(
             rc, 0,
             f'Chain should reject /etc/passwd as external data file: {stdout}'
@@ -508,7 +508,7 @@ class TestCVEReproduction(ImagoTestBase):
         """Convert rejects image with external data file pointing to host path."""
         image = self.get_adversarial_image('cve-2024-32498-extdata-etc-passwd')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
-            stdout, stderr, rc = self.run_imago_convert(image.path, out.name)
+            stdout, stderr, rc = self.run_instar_convert(image.path, out.name)
             self.assertNotEqual(
                 rc, 0,
                 f'Convert should reject external data file: {stdout}'
@@ -527,8 +527,8 @@ class TestCVEReproduction(ImagoTestBase):
     def test_cve_2015_5163_dotdot_info_reports_path(self):
         """Info reports the ../../../etc/passwd backing path without reading it."""
         image = self.get_adversarial_image('cve-2015-5163-traversal-dotdot')
-        stdout, stderr, rc = self.run_imago_info(image.path)
-        self.assertEqual(rc, 0, f'imago info failed: {stderr}')
+        stdout, stderr, rc = self.run_instar_info(image.path)
+        self.assertEqual(rc, 0, f'instar info failed: {stderr}')
         self.assertIn(
             'etc/passwd', stdout,
             f'Expected backing file path in output: {stdout}'
@@ -538,14 +538,14 @@ class TestCVEReproduction(ImagoTestBase):
     def test_cve_2015_5163_dotdot_chain_rejects(self):
         """Chain mode rejects ../ traversal backing path."""
         image = self.get_adversarial_image('cve-2015-5163-traversal-dotdot')
-        _stdout, _stderr, rc = self.run_imago_info(image.path, chain=True)
+        _stdout, _stderr, rc = self.run_instar_info(image.path, chain=True)
         self.assertNotEqual(rc, 0, f'Chain should reject traversal path: {_stdout}')
 
     def test_cve_2015_5163_dotdot_convert_rejects(self):
         """Convert rejects image with ../ traversal backing path."""
         image = self.get_adversarial_image('cve-2015-5163-traversal-dotdot')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
-            _stdout, _stderr, rc = self.run_imago_convert(image.path, out.name)
+            _stdout, _stderr, rc = self.run_instar_convert(image.path, out.name)
             self.assertNotEqual(
                 rc, 0,
                 f'Convert should reject traversal backing path: {_stdout}'
@@ -554,8 +554,8 @@ class TestCVEReproduction(ImagoTestBase):
     def test_cve_2015_5163_null_byte_info(self):
         """Backing file path with embedded null byte is handled safely."""
         image = self.get_adversarial_image('cve-2015-5163-traversal-null')
-        stdout, stderr, rc = self.run_imago_info(image.path)
-        self.assertEqual(rc, 0, f'imago info failed: {stderr}')
+        stdout, stderr, rc = self.run_instar_info(image.path)
+        self.assertEqual(rc, 0, f'instar info failed: {stderr}')
         self.assert_no_sensitive_content(
             stdout + stderr, 'CVE-2015-5163 null byte info'
         )
@@ -563,7 +563,7 @@ class TestCVEReproduction(ImagoTestBase):
     def test_cve_2015_5163_null_byte_chain_rejects(self):
         """Chain mode rejects backing path with embedded null byte."""
         image = self.get_adversarial_image('cve-2015-5163-traversal-null')
-        _stdout, _stderr, rc = self.run_imago_info(image.path, chain=True)
+        _stdout, _stderr, rc = self.run_instar_info(image.path, chain=True)
         self.assertNotEqual(rc, 0, f'Chain should reject null-byte path: {_stdout}')
 
     # ----------------------------------------------------------------
@@ -573,8 +573,8 @@ class TestCVEReproduction(ImagoTestBase):
     def test_cve_2022_47951_info_no_shadow_content(self):
         """Binary VMDK with /etc/shadow extent does not leak file content."""
         image = self.get_adversarial_image('cve-2022-47951-vmdk-hostile-extent')
-        stdout, stderr, rc = self.run_imago_info(image.path)
-        self.assertEqual(rc, 0, f'imago info failed: {stderr}')
+        stdout, stderr, rc = self.run_instar_info(image.path)
+        self.assertEqual(rc, 0, f'instar info failed: {stderr}')
         self.assert_no_sensitive_content(
             stdout + stderr, 'CVE-2022-47951 info'
         )
@@ -583,7 +583,7 @@ class TestCVEReproduction(ImagoTestBase):
         """Converting VMDK with hostile extent does not produce /etc/shadow data."""
         image = self.get_adversarial_image('cve-2022-47951-vmdk-hostile-extent')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
-            _ = self.run_imago_convert(image.path, out.name)
+            _ = self.run_instar_convert(image.path, out.name)
             with open(out.name, 'rb') as f:
                 out_data = f.read(4096)
             for forbidden in [b'root:', b'daemon:', b'bin:']:
@@ -600,9 +600,9 @@ class TestCVEReproduction(ImagoTestBase):
         """Info on a tiny image claiming 1 PB completes within 5 seconds."""
         image = self.get_adversarial_image('cve-2015-5162-tiny-petabyte')
         start = time.monotonic()
-        stdout, stderr, rc = self.run_imago_info(image.path)
+        stdout, stderr, rc = self.run_instar_info(image.path)
         elapsed = time.monotonic() - start
-        self.assertEqual(rc, 0, f'imago info failed: {stderr}')
+        self.assertEqual(rc, 0, f'instar info failed: {stderr}')
         self.assertLess(
             elapsed, 5.0,
             f'Info took {elapsed:.1f}s on petabyte image (expected <5s)'
@@ -612,7 +612,7 @@ class TestCVEReproduction(ImagoTestBase):
         """Check on a tiny image claiming 1 PB completes within 10 seconds."""
         image = self.get_adversarial_image('cve-2015-5162-tiny-petabyte')
         start = time.monotonic()
-        self.run_imago_check(image.path)
+        self.run_instar_check(image.path)
         elapsed = time.monotonic() - start
         self.assertLess(
             elapsed, 10.0,
@@ -627,7 +627,7 @@ class TestCVEReproduction(ImagoTestBase):
         """Info on image with L1 overflow boundary does not crash."""
         image = self.get_adversarial_image('cve-2014-0223-l1-overflow-boundary')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'info', str(image.path)],
+            [str(self.get_instar_binary()), 'info', str(image.path)],
             timeout=10
         )
 
@@ -635,7 +635,7 @@ class TestCVEReproduction(ImagoTestBase):
         """Check on image with L1 overflow boundary does not crash."""
         image = self.get_adversarial_image('cve-2014-0223-l1-overflow-boundary')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', str(image.path)],
+            [str(self.get_instar_binary()), 'check', str(image.path)],
             timeout=10
         )
 
@@ -644,7 +644,7 @@ class TestCVEReproduction(ImagoTestBase):
         image = self.get_adversarial_image('cve-2014-0223-l1-overflow-boundary')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
             self.run_adversarial(
-                [str(self.get_imago_binary()), 'convert',
+                [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
             )
@@ -656,8 +656,8 @@ class TestCVEReproduction(ImagoTestBase):
     def test_cve_2024_4467_json_prefix_rejected(self):
         """File with json:{} content is rejected as unknown format."""
         image = self.get_adversarial_image('cve-2024-4467-json-prefix')
-        stdout, stderr, rc = self.run_imago_info(image.path)
-        self.assertEqual(rc, 0, f'imago info failed: {stderr}')
+        stdout, stderr, rc = self.run_instar_info(image.path)
+        self.assertEqual(rc, 0, f'instar info failed: {stderr}')
         self.assertIn(
             'unknown', stdout.lower(),
             f'Expected unknown format for json: content: {stdout}'
@@ -666,24 +666,24 @@ class TestCVEReproduction(ImagoTestBase):
     def test_cve_2024_4467_no_shadow_content(self):
         """File with json:{} referencing /etc/shadow does not leak content."""
         image = self.get_adversarial_image('cve-2024-4467-json-prefix')
-        stdout, stderr, rc = self.run_imago_info(image.path)
+        stdout, stderr, rc = self.run_instar_info(image.path)
         self.assert_no_sensitive_content(
             stdout + stderr, 'CVE-2024-4467 info'
         )
 
     def test_cve_2024_4467_cli_treats_json_as_filename(self):
-        """imago CLI does not interpret json:{} as a block device spec.
+        """instar CLI does not interpret json:{} as a block device spec.
 
         This tests that passing a literal 'json:{...}' string as an argument
         is treated as a filename, not parsed as a block driver specification.
         """
-        imago = self.get_imago_binary()
+        instar = self.get_instar_binary()
         json_arg = (
             'json:{"driver":"raw","file":'
             '{"driver":"file","filename":"/etc/shadow"}}'
         )
         result = subprocess.run(
-            [str(imago), 'info', json_arg],
+            [str(instar), 'info', json_arg],
             capture_output=True, text=True, timeout=10
         )
         # Should fail because the file doesn't exist (treated as literal path)

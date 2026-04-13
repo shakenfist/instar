@@ -1,4 +1,4 @@
-# Imago PR Preparation
+# Instar PR Preparation
 
 ## Overview
 
@@ -12,7 +12,7 @@ Before creating or updating a PR, complete ALL of these steps:
 ### 1. Build Successfully
 
 ```bash
-make imago
+make instar
 ```
 
 Must complete with no errors.
@@ -42,10 +42,10 @@ If there are failures:
 
 ### 4. Manual Smoke Test
 
-Run imago manually on a test image to verify basic functionality:
+Run instar manually on a test image to verify basic functionality:
 
 ```bash
-src/target/release/imago info /path/to/test.qcow2
+src/target/release/instar info /path/to/test.qcow2
 ```
 
 Verify:
@@ -92,7 +92,7 @@ Include in the PR body:
 [Brief description of changes]
 
 ## Testing
-- [ ] `make imago` builds successfully
+- [ ] `make instar` builds successfully
 - [ ] `pre-commit run --all-files` passes
 - [ ] `make test-ci` passes with 0 failures
 - [ ] Manual smoke test completed

@@ -10,7 +10,7 @@ def load_manifest_images():
     This is a module-level helper for use in scenario
     generation functions that run at import time (before
     any test class is instantiated). For TestImage objects
-    inside test methods, use ImagoTestBase.get_image().
+    inside test methods, use InstarTestBase.get_image().
 
     Returns:
         List of image dicts from the manifest, or [] if

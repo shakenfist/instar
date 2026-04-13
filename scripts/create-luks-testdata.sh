@@ -58,7 +58,7 @@ create_luks_container() {
         "$img"
 
     # Open the container
-    local dm_name="imago-test-$$-${output_name%.img}"
+    local dm_name="instar-test-$$-${output_name%.img}"
     echo -n "$PASSPHRASE" | cryptsetup open \
         --type "luks${luks_version}" \
         --key-file=- \

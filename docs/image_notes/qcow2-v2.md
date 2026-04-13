@@ -30,7 +30,7 @@ actual file is 196,616 bytes.
 - qemu-img calculation: ceil(196,616 / 512) × 512 = 197,120 bytes
 - qemu-img rounds the L1 table end to a 512-byte sector boundary
 
-**Implementation:** imago calculates the L1 table end and rounds to 512-byte
+**Implementation:** instar calculates the L1 table end and rounds to 512-byte
 sectors for the "file length" field. Uses `max(actual_size, calculated)` to
 handle files where actual content extends beyond the L1 table.
 
@@ -46,7 +46,7 @@ actual file is 196,616 bytes.
 - Block-rounded: ceil(196,616 / 4096) × 4096 = 49 × 4096 = 200,704 bytes
 - qemu-img rounds up to 4096-byte filesystem blocks
 
-**Implementation:** imago rounds file size up to 4096-byte blocks for the
+**Implementation:** instar rounds file size up to 4096-byte blocks for the
 "disk size" field.
 
 **Documentation:** [docs/quirks.md](../quirks.md#block-rounded-disk-size)
@@ -62,7 +62,7 @@ actual file is 196,616 bytes.
 - At exact midpoints, C rounds to the nearest even number (192, not 193)
 - Rust's `round()` uses "round half away from zero" and would give 193
 
-**Implementation:** imago uses banker's rounding (round half to even) for all
+**Implementation:** instar uses banker's rounding (round half to even) for all
 magnitude ranges to match qemu-img's observed behavior.
 
 **Documentation:** [docs/quirks.md](../quirks.md#human-readable-size-formatting)

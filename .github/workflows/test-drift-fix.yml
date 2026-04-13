@@ -80,30 +80,30 @@ jobs:
             echo "DATEPRETTY=$(date '+%-d %B %Y')"
           } >> $GITHUB_ENV
 
-      - name: Checkout imago
+      - name: Checkout instar
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || '' }}
-          path: imago
+          path: instar
           fetch-depth: 0
 
-      - name: Prepare imago-testdata
+      - name: Prepare instar-testdata
         run: |
-          CACHED=/srv/ci/cached/imago-testdata
+          CACHED=/srv/ci/cached/instar-testdata
           if [ -d "${CACHED}/.git" ]; then
             echo "Using cached testdata, updating in place..."
             cd "${CACHED}"
             git remote set-url origin \
-              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git"
+              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/instar-testdata.git"
             git fetch --depth 1 origin main
             git reset --hard origin/main
             echo "TESTDATA_PATH=${CACHED}" >> $GITHUB_ENV
           else
             echo "No cache found, cloning fresh..."
             git clone --depth 1 \
-              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git" \
-              ${GITHUB_WORKSPACE}/imago-testdata
-            echo "TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata" >> $GITHUB_ENV
+              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/instar-testdata.git" \
+              ${GITHUB_WORKSPACE}/instar-testdata
+            echo "TESTDATA_PATH=${GITHUB_WORKSPACE}/instar-testdata" >> $GITHUB_ENV
           fi
 
       - name: Resparsify test images
@@ -175,22 +175,22 @@ jobs:
       - name: Create working branch
         if: env.IS_PR_RUN != 'true'
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
           # Delete local branch if it exists from previous run
           git branch -D test-drift-fix-${DATESTAMP} 2>/dev/null || true
           git checkout -b test-drift-fix-${DATESTAMP}
 
       - name: Remove previous devcontainers, if any
         run: |
-          docker image rm -f imago-build 2>/dev/null || true
+          docker image rm -f instar-build 2>/dev/null || true
 
-      - name: Build imago
+      - name: Build instar
         env:
           DOCKER_BUILDKIT: 1
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
           set +e
-          make imago 2>&1 | tee ${GITHUB_WORKSPACE}/build-log.txt
+          make instar 2>&1 | tee ${GITHUB_WORKSPACE}/build-log.txt
           build_exit_code=${PIPESTATUS[0]}
           set -e
           if [ ${build_exit_code} -ne 0 ]; then
@@ -202,7 +202,7 @@ jobs:
         id: initial_test
         continue-on-error: true
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
 
           set +e
           # Run tests inside container for consistent environment
@@ -240,18 +240,18 @@ jobs:
           steps.prior_failures.outputs.has_prior_failures == 'true'
         run: |
           cat > ${GITHUB_WORKSPACE}/claude-prompt.txt << 'PROMPT_EOF'
-          The imago integration test suite needs attention. Please analyze and
+          The instar integration test suite needs attention. Please analyze and
           fix any issues.
 
           ## Context
 
-          imago is a safe drop-in replacement for qemu-img. The test suite
-          compares imago output against qemu-img output to verify compatibility.
+          instar is a safe drop-in replacement for qemu-img. The test suite
+          compares instar output against qemu-img output to verify compatibility.
 
           ## Before You Start
 
           1. Read AGENTS.md to understand the project structure and testing approach
-          2. Read the /imago-add-test-image skill at .claude/skills/imago-add-test-image.md
+          2. Read the /instar-add-test-image skill at .claude/skills/instar-add-test-image.md
           3. Read docs/quirks.md to understand known qemu-img compatibility quirks
 
           PROMPT_EOF
@@ -303,7 +303,7 @@ jobs:
           ## Your Task
 
           1. Diagnose what's causing test failures (if any)
-          2. Fix imago code if needed (src/vmm/src/main.rs, src/operations/info/)
+          2. Fix instar code if needed (src/vmm/src/main.rs, src/operations/info/)
           3. If fixing reveals a new qemu-img quirk:
              - Document in docs/quirks.md
              - Create docs/image_notes/<image-id>.md
@@ -364,17 +364,17 @@ jobs:
 
           **ALWAYS use these Makefile targets instead:**
 
-          - Build: `make imago`
+          - Build: `make instar`
           - Test: `make test` or `make test-container`
           - Lint: `make lint` or `make lint-fix`
 
-          The pre-built binary is at `src/target/release/imago` - use it directly
+          The pre-built binary is at `src/target/release/instar` - use it directly
           for testing without rebuilding.
 
           ## Important Notes
 
-          - The testdata is at $IMAGO_TESTDATA_PATH (set in environment)
-          - For malicious images, NEVER run qemu-img - use imago only
+          - The testdata is at $INSTAR_TESTDATA_PATH (set in environment)
+          - For malicious images, NEVER run qemu-img - use instar only
           - Follow the quirk documentation patterns in existing image_notes files
 
           ## CRITICAL: Do NOT Build Prototypes
@@ -388,25 +388,25 @@ jobs:
           - Any command involving the prototypes/ directory
 
           Building prototypes creates root-owned files that break CI cleanup.
-          Your task is ONLY to fix the main imago binary and tests.
+          Your task is ONLY to fix the main instar binary and tests.
 
-          ## CRITICAL: Do NOT Modify imago-testdata
+          ## CRITICAL: Do NOT Modify instar-testdata
 
-          The imago-testdata repository at $IMAGO_TESTDATA_PATH contains the
+          The instar-testdata repository at $INSTAR_TESTDATA_PATH contains the
           authoritative test baselines. NEVER modify any files in this directory:
 
           - Do NOT edit files in expected-outputs/
           - Do NOT regenerate baselines or profiles
           - Do NOT run generate-baselines.py or detect-profiles.py
 
-          If tests fail, the fix must be in the imago code (src/), NOT in the
+          If tests fail, the fix must be in the instar code (src/), NOT in the
           baseline data. The baselines represent what qemu-img actually outputs
-          and must not be changed to match imago's current behavior.
+          and must not be changed to match instar's current behavior.
 
           ## Reminder: Use Make Targets Only
 
           See "STOP: Read These Rules First" above. Running cargo/docker directly
-          creates root-owned files that break CI cleanup. Use `make imago`,
+          creates root-owned files that break CI cleanup. Use `make instar`,
           `make test`, and `make lint` exclusively.
           PROMPT_EOF
 
@@ -420,9 +420,9 @@ jobs:
           steps.prior_failures.outputs.has_prior_failures == 'true'
         continue-on-error: true
         env:
-          IMAGO_TESTDATA_PATH: ${{ env.TESTDATA_PATH }}
+          INSTAR_TESTDATA_PATH: ${{ env.TESTDATA_PATH }}
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
 
           if ! command -v claude &> /dev/null; then
             echo "claude_available=false" >> $GITHUB_OUTPUT
@@ -490,12 +490,12 @@ jobs:
         env:
           DOCKER_BUILDKIT: 1
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
 
-          # Rebuild if code changed (test-container depends on imago target)
+          # Rebuild if code changed (test-container depends on instar target)
           if git diff --cached --name-only | grep -q "\.rs$"; then
             echo "Rust code changed, rebuilding..."
-            make imago
+            make instar
           fi
 
           set +e
@@ -517,7 +517,7 @@ jobs:
           steps.verify.outputs.fix_succeeded == 'true' &&
           inputs.dry_run != true
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
 
           if [ -n "$(git status --porcelain)" ]; then
             git add -A
@@ -566,7 +566,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
           git push origin ${PR_REF}
 
           gh pr comment ${PR_NUMBER} \
@@ -583,7 +583,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
 
           git push -f origin test-drift-fix-${DATESTAMP}
           sleep 5

@@ -30,7 +30,7 @@ project.
 - qemu-img rounds to 1 decimal: 20.7 MiB
 - This contrasts with values >= 100 which truncate (see qcow2-v2)
 
-**Implementation:** imago uses `round()` for values in the 10-99 range to
+**Implementation:** instar uses `round()` for values in the 10-99 range to
 get 1 decimal place precision. Combined with `floor()` for >= 100 values,
 this matches qemu-img's observed behavior across all magnitudes.
 
@@ -38,7 +38,7 @@ this matches qemu-img's observed behavior across all magnitudes.
 
 ### 2. max(actual, calculated) for File Length
 
-**Observed:** Initially imago reported the wrong file length (192 KiB)
+**Observed:** Initially instar reported the wrong file length (192 KiB)
 because it was using the L1 table calculation from QCOW2 parsing, which
 is much smaller than the actual file size.
 
@@ -50,7 +50,7 @@ is much smaller than the actual file size.
 For this real-world image with actual data clusters, the file extends far
 beyond the L1 table. qemu-img reports `max(actual_file_size, L1_table_end)`.
 
-**Implementation:** imago now uses `max(file_size, info.actual_size)` for the
+**Implementation:** instar now uses `max(file_size, info.actual_size)` for the
 file length field, where `info.actual_size` is the L1 table calculation from
 the guest and `file_size` is the actual filesystem size from the VMM.
 

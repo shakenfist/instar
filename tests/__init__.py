@@ -1,1 +1,1 @@
-# Integration tests for imago
+# Integration tests for instar

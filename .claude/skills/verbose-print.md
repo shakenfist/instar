@@ -1,6 +1,6 @@
 # /verbose-print - Adding Diagnostic Output to Operations
 
-Guidelines for adding verbose_print() calls to imago guest operations for consistent, useful diagnostic output.
+Guidelines for adding verbose_print() calls to instar guest operations for consistent, useful diagnostic output.
 
 ## Usage
 
@@ -196,7 +196,7 @@ Don't repeat information that's already being reported:
 
 Run with `--verbose` to see all diagnostic output:
 ```bash
-sudo ./target/release/imago info --verbose image.qcow2
-sudo ./target/release/imago copy --verbose input.qcow2 output.raw
-sudo ./target/release/imago check --verbose image.qcow2
+sudo ./target/release/instar info --verbose image.qcow2
+sudo ./target/release/instar copy --verbose input.qcow2 output.raw
+sudo ./target/release/instar check --verbose image.qcow2
 ```

@@ -373,7 +373,7 @@ Virtio-vsock is ideal for:
 
 ## Comparison with Virtio-block
 
-For Imago's disk image processing use case:
+For Instar's disk image processing use case:
 
 | Aspect | Virtio-vsock | Virtio-block |
 |--------|--------------|--------------|

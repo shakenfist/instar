@@ -65,12 +65,12 @@ jobs:
 
       - name: Remove previous devcontainers, if any
         run: |
-          docker image rm -f imago-build 2>/dev/null || true
+          docker image rm -f instar-build 2>/dev/null || true
 
       - name: Build and test via devcontainer
         run: |
           # Build the devcontainer and run cargo build + test inside it
-          make imago
+          make instar
           # Run unit tests inside the container (all workspace crates
           # except no_main guest binaries)
           docker run --rm \
@@ -82,7 +82,7 @@ jobs:
             -v "$(pwd)/.cargo-cache/registry:/build/.cargo/registry" \
             -v "$(pwd)/.cargo-cache/git:/build/.cargo/git" \
             -w "/workspace/src" \
-            imago-build \
+            instar-build \
             cargo test --release --workspace \
               --exclude core \
               --exclude info \
@@ -97,14 +97,14 @@ jobs:
           docker run --rm \
             -v "$(pwd):/workspace" \
             -w "/workspace" \
-            imago-build \
+            instar-build \
             bash -c '
               set -e
 
               # Setup system config directory
-              mkdir -p /etc/imago
-              cat > /etc/imago/config << EOF
-          # System-wide imago configuration for CI testing
+              mkdir -p /etc/instar
+              cat > /etc/instar/config << EOF
+          # System-wide instar configuration for CI testing
 
           [global]
           verbose = false
@@ -127,9 +127,9 @@ jobs:
           EOF
 
               # Setup user config directory
-              mkdir -p ~/.config/imago
-              cat > ~/.config/imago/config << EOF
-          # User imago configuration for CI testing
+              mkdir -p ~/.config/instar
+              cat > ~/.config/instar/config << EOF
+          # User instar configuration for CI testing
 
           [global]
           verbose = true
@@ -145,23 +145,23 @@ jobs:
           skip-zeros = true
           EOF
 
-              echo "=== Testing: imago config ==="
-              ./src/target/release/imago config
+              echo "=== Testing: instar config ==="
+              ./src/target/release/instar config
 
               echo ""
-              echo "=== Testing: imago config --show-sources ==="
-              ./src/target/release/imago config --show-sources
+              echo "=== Testing: instar config --show-sources ==="
+              ./src/target/release/instar config --show-sources
 
               echo ""
-              echo "=== Testing: imago config --validate ==="
-              ./src/target/release/imago config --validate
+              echo "=== Testing: instar config --validate ==="
+              ./src/target/release/instar config --validate
 
               echo ""
               echo "=== Verifying config layering ==="
-              OUTPUT=$(./src/target/release/imago config --show-sources)
+              OUTPUT=$(./src/target/release/instar config --show-sources)
 
               # Verify verbose=true comes from user config (overrides system false)
-              if echo "$OUTPUT" | grep -q "verbose = true.*~/.config/imago/config"; then
+              if echo "$OUTPUT" | grep -q "verbose = true.*~/.config/instar/config"; then
                 echo "PASS: User config overrides system config for verbose"
               else
                 echo "FAIL: Expected verbose=true from user config"
@@ -170,7 +170,7 @@ jobs:
               fi
 
               # Verify backing-path-allowlist comes from user config
-              if echo "$OUTPUT" | grep -q "backing-path-allowlist.*~/.config/imago/config"; then
+              if echo "$OUTPUT" | grep -q "backing-path-allowlist.*~/.config/instar/config"; then
                 echo "PASS: User config overrides system config for backing-path-allowlist"
               else
                 echo "FAIL: Expected backing-path-allowlist from user config"
@@ -179,7 +179,7 @@ jobs:
               fi
 
               # Verify skip-zeros comes from user config
-              if echo "$OUTPUT" | grep -q "skip-zeros = true.*~/.config/imago/config"; then
+              if echo "$OUTPUT" | grep -q "skip-zeros = true.*~/.config/instar/config"; then
                 echo "PASS: User config overrides system config for skip-zeros"
               else
                 echo "FAIL: Expected skip-zeros=true from user config"
@@ -188,7 +188,7 @@ jobs:
               fi
 
               # Verify sparse comes from system config (not overridden by user)
-              if echo "$OUTPUT" | grep -q "sparse = true.*/etc/imago/config"; then
+              if echo "$OUTPUT" | grep -q "sparse = true.*/etc/instar/config"; then
                 echo "PASS: System config value preserved when not overridden"
               else
                 echo "FAIL: Expected sparse=true from system config"
@@ -205,15 +205,15 @@ jobs:
           verbose = true
           EOF
 
-              mv ~/.config/imago/config ~/.config/imago/config.bak
-              cp /tmp/bad-config ~/.config/imago/config
+              mv ~/.config/instar/config ~/.config/instar/config.bak
+              cp /tmp/bad-config ~/.config/instar/config
 
               set +e
-              ./src/target/release/imago config --validate
+              ./src/target/release/instar config --validate
               EXIT_CODE=$?
               set -e
 
-              mv ~/.config/imago/config.bak ~/.config/imago/config
+              mv ~/.config/instar/config.bak ~/.config/instar/config
 
               if [ $EXIT_CODE -ne 0 ]; then
                 echo "PASS: Invalid config correctly detected"
@@ -237,29 +237,29 @@ jobs:
       DOCKER_BUILDKIT: 1
 
     steps:
-      - name: Checkout imago
+      - name: Checkout instar
         uses: actions/checkout@v4
         with:
-          path: imago
+          path: instar
           fetch-depth: 0
 
-      - name: Prepare imago-testdata
+      - name: Prepare instar-testdata
         run: |
-          CACHED=/srv/ci/cached/imago-testdata
+          CACHED=/srv/ci/cached/instar-testdata
           if [ -d "${CACHED}/.git" ]; then
             echo "Using cached testdata, updating in place..."
             cd "${CACHED}"
             git remote set-url origin \
-              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git"
+              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/instar-testdata.git"
             git fetch --depth 1 origin main
             git reset --hard origin/main
             echo "TESTDATA_PATH=${CACHED}" >> $GITHUB_ENV
           else
             echo "No cache found, cloning fresh..."
             git clone --depth 1 \
-              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git" \
-              ${GITHUB_WORKSPACE}/imago-testdata
-            echo "TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata" >> $GITHUB_ENV
+              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/instar-testdata.git" \
+              ${GITHUB_WORKSPACE}/instar-testdata
+            echo "TESTDATA_PATH=${GITHUB_WORKSPACE}/instar-testdata" >> $GITHUB_ENV
           fi
 
       - name: Resparsify test images
@@ -285,13 +285,13 @@ jobs:
 
       - name: Remove previous devcontainers, if any
         run: |
-          docker image rm -f imago-build 2>/dev/null || true
+          docker image rm -f instar-build 2>/dev/null || true
 
-      - name: Build imago
+      - name: Build instar
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
           set +e
-          make imago 2>&1 | tee ${GITHUB_WORKSPACE}/build-log.txt
+          make instar 2>&1 | tee ${GITHUB_WORKSPACE}/build-log.txt
           build_exit_code=${PIPESTATUS[0]}
           set -e
           if [ ${build_exit_code} -ne 0 ]; then
@@ -301,7 +301,7 @@ jobs:
 
       - name: Run core integration tests
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
           set +e
           make test-container-core TESTDATA_PATH=${TESTDATA_PATH} 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
           test_exit_code=${PIPESTATUS[0]}
@@ -313,27 +313,27 @@ jobs:
 
       - name: Test --chain flag (backing chain discovery)
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
           TESTDATA=${TESTDATA_PATH}
 
-          # Helper function to run imago and capture output regardless of exit code
-          # We mount the entire release directory because imago needs core.bin and info.bin
-          # in the same directory as the imago binary for chain discovery
+          # Helper function to run instar and capture output regardless of exit code
+          # We mount the entire release directory because instar needs core.bin and info.bin
+          # in the same directory as the instar binary for chain discovery
           run_chain_test() {
             local image_path="$1"
             local mount_path="$2"
             set +e
             OUTPUT=$(docker run --rm \
               --device /dev/kvm \
-              -v "$(pwd)/src/target/release:/opt/imago:ro" \
+              -v "$(pwd)/src/target/release:/opt/instar:ro" \
               -v "${mount_path}:/images:ro" \
-              imago-build \
-              /opt/imago/imago info --chain "$image_path" 2>&1)
+              instar-build \
+              /opt/instar/instar info --chain "$image_path" 2>&1)
             local exit_code=$?
             set -e
             echo "$OUTPUT"
             if [ $exit_code -ne 0 ]; then
-              echo "WARNING: imago exited with code $exit_code"
+              echo "WARNING: instar exited with code $exit_code"
             fi
           }
 
@@ -432,29 +432,29 @@ jobs:
       DOCKER_BUILDKIT: 1
 
     steps:
-      - name: Checkout imago
+      - name: Checkout instar
         uses: actions/checkout@v4
         with:
-          path: imago
+          path: instar
           fetch-depth: 0
 
-      - name: Prepare imago-testdata
+      - name: Prepare instar-testdata
         run: |
-          CACHED=/srv/ci/cached/imago-testdata
+          CACHED=/srv/ci/cached/instar-testdata
           if [ -d "${CACHED}/.git" ]; then
             echo "Using cached testdata, updating in place..."
             cd "${CACHED}"
             git remote set-url origin \
-              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git"
+              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/instar-testdata.git"
             git fetch --depth 1 origin main
             git reset --hard origin/main
             echo "TESTDATA_PATH=${CACHED}" >> $GITHUB_ENV
           else
             echo "No cache found, cloning fresh..."
             git clone --depth 1 \
-              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git" \
-              ${GITHUB_WORKSPACE}/imago-testdata
-            echo "TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata" >> $GITHUB_ENV
+              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/instar-testdata.git" \
+              ${GITHUB_WORKSPACE}/instar-testdata
+            echo "TESTDATA_PATH=${GITHUB_WORKSPACE}/instar-testdata" >> $GITHUB_ENV
           fi
 
       - name: Resparsify test images
@@ -480,13 +480,13 @@ jobs:
 
       - name: Remove previous devcontainers, if any
         run: |
-          docker image rm -f imago-build 2>/dev/null || true
+          docker image rm -f instar-build 2>/dev/null || true
 
-      - name: Build imago
+      - name: Build instar
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
           set +e
-          make imago 2>&1 | tee ${GITHUB_WORKSPACE}/build-log.txt
+          make instar 2>&1 | tee ${GITHUB_WORKSPACE}/build-log.txt
           build_exit_code=${PIPESTATUS[0]}
           set -e
           if [ ${build_exit_code} -ne 0 ]; then
@@ -496,7 +496,7 @@ jobs:
 
       - name: Run QCOW2/VMDK/RAW convert + compare tests
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
           set +e
           make test-container-convert-qcow2 TESTDATA_PATH=${TESTDATA_PATH} 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
           test_exit_code=${PIPESTATUS[0]}
@@ -526,29 +526,29 @@ jobs:
       DOCKER_BUILDKIT: 1
 
     steps:
-      - name: Checkout imago
+      - name: Checkout instar
         uses: actions/checkout@v4
         with:
-          path: imago
+          path: instar
           fetch-depth: 0
 
-      - name: Prepare imago-testdata
+      - name: Prepare instar-testdata
         run: |
-          CACHED=/srv/ci/cached/imago-testdata
+          CACHED=/srv/ci/cached/instar-testdata
           if [ -d "${CACHED}/.git" ]; then
             echo "Using cached testdata, updating in place..."
             cd "${CACHED}"
             git remote set-url origin \
-              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git"
+              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/instar-testdata.git"
             git fetch --depth 1 origin main
             git reset --hard origin/main
             echo "TESTDATA_PATH=${CACHED}" >> $GITHUB_ENV
           else
             echo "No cache found, cloning fresh..."
             git clone --depth 1 \
-              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git" \
-              ${GITHUB_WORKSPACE}/imago-testdata
-            echo "TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata" >> $GITHUB_ENV
+              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/instar-testdata.git" \
+              ${GITHUB_WORKSPACE}/instar-testdata
+            echo "TESTDATA_PATH=${GITHUB_WORKSPACE}/instar-testdata" >> $GITHUB_ENV
           fi
 
       - name: Resparsify test images
@@ -574,13 +574,13 @@ jobs:
 
       - name: Remove previous devcontainers, if any
         run: |
-          docker image rm -f imago-build 2>/dev/null || true
+          docker image rm -f instar-build 2>/dev/null || true
 
-      - name: Build imago
+      - name: Build instar
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
           set +e
-          make imago 2>&1 | tee ${GITHUB_WORKSPACE}/build-log.txt
+          make instar 2>&1 | tee ${GITHUB_WORKSPACE}/build-log.txt
           build_exit_code=${PIPESTATUS[0]}
           set -e
           if [ ${build_exit_code} -ne 0 ]; then
@@ -590,7 +590,7 @@ jobs:
 
       - name: Run VHD/VHDX convert tests
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
           set +e
           make test-container-convert-vhd TESTDATA_PATH=${TESTDATA_PATH} 2>&1 | tee ${GITHUB_WORKSPACE}/test-output.txt
           test_exit_code=${PIPESTATUS[0]}
@@ -610,7 +610,7 @@ jobs:
             ${{ github.workspace }}/test-output.txt
           retention-days: 7
 
-  # Cross-validate imago against oslo.utils git master.
+  # Cross-validate instar against oslo.utils git master.
   # This catches drift from oslo.utils development before
   # it reaches PyPI. Allowed to fail (informational).
   oslo-crossval-master:
@@ -623,29 +623,29 @@ jobs:
       DOCKER_BUILDKIT: 1
 
     steps:
-      - name: Checkout imago
+      - name: Checkout instar
         uses: actions/checkout@v4
         with:
-          path: imago
+          path: instar
           fetch-depth: 0
 
-      - name: Prepare imago-testdata
+      - name: Prepare instar-testdata
         run: |
-          CACHED=/srv/ci/cached/imago-testdata
+          CACHED=/srv/ci/cached/instar-testdata
           if [ -d "${CACHED}/.git" ]; then
             echo "Using cached testdata, updating in place..."
             cd "${CACHED}"
             git remote set-url origin \
-              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git"
+              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/instar-testdata.git"
             git fetch --depth 1 origin main
             git reset --hard origin/main
             echo "TESTDATA_PATH=${CACHED}" >> $GITHUB_ENV
           else
             echo "No cache found, cloning fresh..."
             git clone --depth 1 \
-              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/imago-testdata.git" \
-              ${GITHUB_WORKSPACE}/imago-testdata
-            echo "TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata" >> $GITHUB_ENV
+              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/instar-testdata.git" \
+              ${GITHUB_WORKSPACE}/instar-testdata
+            echo "TESTDATA_PATH=${GITHUB_WORKSPACE}/instar-testdata" >> $GITHUB_ENV
           fi
 
       - name: Resparsify test images
@@ -675,26 +675,26 @@ jobs:
 
       - name: Remove previous devcontainers, if any
         run: |
-          docker image rm -f imago-build 2>/dev/null || true
+          docker image rm -f instar-build 2>/dev/null || true
 
-      - name: Build imago
+      - name: Build instar
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
-          make imago
+          cd ${GITHUB_WORKSPACE}/instar
+          make instar
 
       - name: Run oslo crossval with oslo.utils master
         run: |
-          cd ${GITHUB_WORKSPACE}/imago
+          cd ${GITHUB_WORKSPACE}/instar
           docker run --rm \
             --device=/dev/kvm \
             -u "$(id -u):$(id -g)" \
             --group-add "$(stat -c '%g' /dev/kvm)" \
             -e HOME=/build \
-            -e IMAGO_TESTDATA_PATH=/testdata \
+            -e INSTAR_TESTDATA_PATH=/testdata \
             -v "$(pwd):/workspace" \
             -v "${TESTDATA_PATH}:/testdata:ro" \
             -w "/workspace" \
-            imago-build \
+            instar-build \
             bash -c '
               python3 -m venv /build/test-venv &&
               /build/test-venv/bin/pip install -q \

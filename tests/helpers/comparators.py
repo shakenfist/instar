@@ -28,7 +28,7 @@ def substitute_testdata_root(text: str, testdata_root: str) -> str:
 
     Args:
         text: Text containing $TESTDATA_ROOT placeholders
-        testdata_root: The actual testdata root path (IMAGO_TESTDATA_PATH)
+        testdata_root: The actual testdata root path (INSTAR_TESTDATA_PATH)
 
     Returns:
         Text with placeholders substituted
@@ -40,7 +40,7 @@ def get_disk_size(path: str) -> int:
     """
     Get the actual disk allocation for a file.
 
-    This returns st_blocks * 512, which is what qemu-img and imago report
+    This returns st_blocks * 512, which is what qemu-img and instar report
     as "actual-size" (JSON) or "disk size" (human). This value reflects
     the actual disk space used, accounting for sparse files.
 
@@ -57,10 +57,10 @@ def get_disk_size(path: str) -> int:
 
 def _format_human_size(size_bytes: int) -> str:
     """
-    Format a size in bytes to human-readable format matching imago/qemu-img style.
+    Format a size in bytes to human-readable format matching instar/qemu-img style.
 
     Uses 3 significant figures like qemu-img's %0.3g format. This matches
-    imago's qemu_compat formatting mode.
+    instar's qemu_compat formatting mode.
 
     Args:
         size_bytes: Size in bytes
@@ -81,7 +81,7 @@ def _format_human_size(size_bytes: int) -> str:
         if size_bytes >= unit_bytes:
             value = size_bytes / unit_bytes
             # Use 3 significant figures like qemu-img's %0.3g format
-            # This matches imago's qemu_compat mode
+            # This matches instar's qemu_compat mode
             if value >= 100.0:
                 # For values >= 100, round to whole number (3 sig figs)
                 rounded = round(value)
@@ -207,9 +207,9 @@ def _parse_human_size(size_str: str) -> int:
     return -1
 
 
-def compare_outputs(imago_output: str, expected_output: str) -> tuple:
+def compare_outputs(instar_output: str, expected_output: str) -> tuple:
     """
-    Compare imago output against expected output.
+    Compare instar output against expected output.
 
     This performs exact string comparison. The caller should have already
     substituted environment-specific values (like actual-size) using
@@ -221,18 +221,18 @@ def compare_outputs(imago_output: str, expected_output: str) -> tuple:
                If matched is False, diff_text contains a human-readable diff
                with whitespace characters made visible.
     """
-    if imago_output == expected_output:
+    if instar_output == expected_output:
         return True, ''
 
     # Generate a unified diff with whitespace made visible
-    imago_visible = _make_whitespace_visible(imago_output)
+    instar_visible = _make_whitespace_visible(instar_output)
     expected_visible = _make_whitespace_visible(expected_output)
 
     diff = difflib.unified_diff(
         expected_visible.splitlines(keepends=True),
-        imago_visible.splitlines(keepends=True),
+        instar_visible.splitlines(keepends=True),
         fromfile='expected (qemu-img)',
-        tofile='actual (imago)',
+        tofile='actual (instar)',
         lineterm=''
     )
 
@@ -275,7 +275,7 @@ def _make_whitespace_visible(text: str) -> str:
 
 def format_failure_message(
     image_id: str,
-    imago_output: str,
+    instar_output: str,
     expected_output: str,
     diff_text: str
 ) -> str:
@@ -284,7 +284,7 @@ def format_failure_message(
 
     Args:
         image_id: The test image identifier
-        imago_output: Raw imago output
+        instar_output: Raw instar output
         expected_output: Raw expected output
         diff_text: The diff with visible whitespace
 
@@ -301,14 +301,14 @@ def format_failure_message(
     ]
 
     # Add raw outputs for debugging if they're not too long
-    if len(imago_output) < 2000 and len(expected_output) < 2000:
+    if len(instar_output) < 2000 and len(expected_output) < 2000:
         msg_parts.extend([
             '',
             '--- Raw expected output ---',
             repr(expected_output),
             '',
             '--- Raw actual output ---',
-            repr(imago_output),
+            repr(instar_output),
         ])
 
     return '\n'.join(msg_parts)

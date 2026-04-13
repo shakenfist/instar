@@ -1,10 +1,10 @@
 # Architectural Decisions
 
-*Why is imago built the way it is?*
+*Why is instar built the way it is?*
 
 Every non-trivial codebase embodies dozens of decisions that are obvious
 to the people who made them and invisible to everyone else. This document
-records the reasoning behind imago's major architectural choices. Where
+records the reasoning behind instar's major architectural choices. Where
 a decision was driven by constraints or tradeoffs, we explain what was
 considered and why the chosen path won.
 
@@ -15,7 +15,7 @@ considered and why the chosen path won.
 **The choice:** The guest runs as a flat binary on a single vCPU with
 no kernel, no standard library, and no system call interface.
 
-**Why not a Linux VM?** The whole point of imago is to isolate untrusted
+**Why not a Linux VM?** The whole point of instar is to isolate untrusted
 format parsing. A Linux guest kernel is hundreds of thousands of lines
 of code with its own history of exploitable bugs. If the guest kernel has
 vulnerabilities, an attacker who compromises the parser could then
@@ -29,11 +29,11 @@ full Linux guest, but it still includes a library OS with a memory
 allocator, a scheduler (even if trivial), and often a partial POSIX
 layer. Each of these is code that could contain bugs. More practically,
 unikernel frameworks (MirageOS, Unikraft, IncludeOS) each impose their
-own language constraints, build system, and runtime model. Imago would
+own language constraints, build system, and runtime model. Instar would
 become dependent on a third-party framework rather than owning its entire
 stack.
 
-**Why bare metal works:** Imago's guest has extremely limited needs:
+**Why bare metal works:** Instar's guest has extremely limited needs:
 read sectors from a virtio device, write sectors, send messages over a
 serial port, and do computation. It does not need processes, threads,
 memory protection, a filesystem, or a network stack. A flat binary that
@@ -52,7 +52,7 @@ operation binary (`info.bin`, `convert.bin`, etc.) is loaded at a
 separate address and does the actual work.
 
 **Why not a single binary?** Attack surface. If every operation were
-compiled into a single monolithic guest binary, then running `imago info`
+compiled into a single monolithic guest binary, then running `instar info`
 would load code for convert, check, and compare -- code that is not
 needed and that increases the amount of code available to an attacker
 who compromises the parser. By loading only the operation binary that is
@@ -141,10 +141,10 @@ and trick the VMM into opening arbitrary host files. Even with path
 validation, the interaction pattern (guest requests file opens) is
 inherently dangerous.
 
-**How it works instead:** The VMM iteratively runs `imago info` on the
+**How it works instead:** The VMM iteratively runs `instar info` on the
 primary image to extract its backing file path. It validates the path
 against a security allowlist *before* opening the file. Then it runs
-`imago info` on the backing file, and so on until the chain is complete.
+`instar info` on the backing file, and so on until the chain is complete.
 Each iteration launches a fresh KVM guest for isolation. Once the full
 chain is known and validated, the VMM opens all the files itself and
 presents them as multiple virtio-block devices (device 0 = top image,
@@ -261,27 +261,27 @@ through the general caching mechanism.
 
 ## Decision 10: qemu-img output compatibility as a hard requirement
 
-**The choice:** Imago's output is byte-for-byte identical to `qemu-img`
+**The choice:** Instar's output is byte-for-byte identical to `qemu-img`
 for all supported operations (`info`, `check`, `compare`). The test
-suite compares imago output against qemu-img output and fails on any
+suite compares instar output against qemu-img output and fails on any
 difference.
 
-**Why?** Imago is intended as a drop-in replacement for `qemu-img` in
+**Why?** Instar is intended as a drop-in replacement for `qemu-img` in
 OpenStack and similar platforms. These platforms parse `qemu-img` output
-programmatically. If imago's output differs in any way -- extra spaces,
+programmatically. If instar's output differs in any way -- extra spaces,
 different field order, different number formatting -- the integration
 will break. Byte-for-byte compatibility means operators can switch from
-`qemu-img` to `imago` without changing any parsing code.
+`qemu-img` to `instar` without changing any parsing code.
 
 **The cost:** This requirement drives complexity in the output formatting
 code. Different versions of `qemu-img` produce slightly different output
 (e.g., the "Child node '/file'" section appeared in qemu-img 8.0+).
-Imago detects the installed qemu-img version and emits matching output.
+Instar detects the installed qemu-img version and emits matching output.
 This version detection logic is non-trivial but necessary for true
 drop-in compatibility.
 
 **Where we diverge intentionally:** The `--extra-detail` flag enables
-imago-specific output (e.g., LUKS format detection) that qemu-img
+instar-specific output (e.g., LUKS format detection) that qemu-img
 does not support. The `--unsafe-quirks` flag matches qemu-img's less
 secure behavior for compatibility testing. These are opt-in departures
 from compatibility, not accidental differences.

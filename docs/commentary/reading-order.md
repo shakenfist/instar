@@ -1,6 +1,6 @@
 # Reading Order
 
-*In which order should you read the imago source code?*
+*In which order should you read the instar source code?*
 
 Lions organised his UNIX commentary around the logical flow of the system
 rather than alphabetical file order. We do the same here: the reading
@@ -116,7 +116,7 @@ allowlist. Circular reference and depth limit checks.
 **What to pay attention to:**
 
 - Chain discovery runs *on the host side*, iteratively. The VMM runs
-  `imago info` on each image in the chain (launching a fresh KVM guest
+  `instar info` on each image in the chain (launching a fresh KVM guest
   each time) to extract the backing file path. This is critical for
   security: the host validates paths *before* opening files, so a
   malicious image cannot trick the guest into reading arbitrary host files.
@@ -404,7 +404,7 @@ with format-specific defaults and validation ranges.
 
 **What you will find:** Python tests using `testtools` and `stestr`. The
 test base class in `base.py`. The manifest (`manifest.json`) that defines
-test images with their expected properties. Tests compare imago output
+test images with their expected properties. Tests compare instar output
 against `qemu-img` output to verify drop-in compatibility.
 
 **What to pay attention to:**
@@ -417,7 +417,7 @@ against `qemu-img` output to verify drop-in compatibility.
   (edge cases), `malicious` (CVE reproducers, opt-in only).
 
 - The oslo.utils cross-validation tests (`test_oslo_crossval.py`) verify
-  that imago's format detection agrees with OpenStack's `format_inspector`.
+  that instar's format detection agrees with OpenStack's `format_inspector`.
   This catches drift between the two implementations.
 
 ### Step 12: `src/fuzz/` -- Coverage-guided fuzzing
@@ -443,7 +443,7 @@ refcount traversal, decompression, BAT/grain lookup).
   fixed and fuzz-derived offsets.
 
 - The corpus seeding script (`scripts/extract-fuzz-corpus.py`) extracts
-  seed images from the separate `imago-testdata` repository, filtered by
+  seed images from the separate `instar-testdata` repository, filtered by
   format. No adversarial images are stored in the main repo.
 
 - The CI workflow (`coverage-fuzz.yml`) runs nightly and on PRs that touch
@@ -453,7 +453,7 @@ refcount traversal, decompression, BAT/grain lookup).
 ### Step 13: `scripts/differential-fuzz.py` -- Differential fuzzing
 
 **What you will find:** A Python script that generates random valid images
-and compares imago output against `qemu-img` (and optionally libyal tools).
+and compares instar output against `qemu-img` (and optionally libyal tools).
 This is complementary to coverage-guided fuzzing: differential fuzzing
 explores valid image space, while coverage fuzzing explores malformed input
 space.
@@ -481,7 +481,7 @@ crash, verifies the fix by rebuilding and running tests, and creates a PR.
 
 ## Summary: The Complete Data Flow
 
-To trace a single `imago info image.qcow2` from start to finish:
+To trace a single `instar info image.qcow2` from start to finish:
 
 1. **VMM `main()`** parses CLI args, opens `image.qcow2`
 2. **VMM** creates a KVM VM, allocates 32MB guest memory

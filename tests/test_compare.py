@@ -10,10 +10,10 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from base import ImagoTestBase
+from base import InstarTestBase
 
 
-class TestCompareRawIdentical(ImagoTestBase):
+class TestCompareRawIdentical(InstarTestBase):
     """Test comparing identical raw images."""
 
     def test_compare_identical_self(self):
@@ -23,7 +23,7 @@ class TestCompareRawIdentical(ImagoTestBase):
                 ['qemu-img', 'create', '-f', 'raw', f.name, '1M'],
                 capture_output=True
             )
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(f.name), Path(f.name)
             )
             self.assertEqual(rc, 0)
@@ -42,7 +42,7 @@ class TestCompareRawIdentical(ImagoTestBase):
                 ['qemu-img', 'create', '-f', 'raw', f2.name, '1M'],
                 capture_output=True
             )
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(f1.name), Path(f2.name)
             )
             self.assertEqual(rc, 0)
@@ -50,23 +50,23 @@ class TestCompareRawIdentical(ImagoTestBase):
             self.assertEqual(stderr, '')
 
     def test_compare_identical_matches_qemu(self):
-        """Imago output matches qemu-img compare for identical images."""
+        """Instar output matches qemu-img compare for identical images."""
         with tempfile.NamedTemporaryFile(suffix='.raw') as f:
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw', f.name, '1M'],
                 capture_output=True
             )
-            imago_out, imago_err, imago_rc = self.run_imago_compare(
+            instar_out, instar_err, instar_rc = self.run_instar_compare(
                 Path(f.name), Path(f.name)
             )
             qemu_out, qemu_err, qemu_rc = self.run_qemu_img_compare(
                 Path(f.name), Path(f.name)
             )
-            self.assertEqual(imago_out, qemu_out)
-            self.assertEqual(imago_rc, qemu_rc)
+            self.assertEqual(instar_out, qemu_out)
+            self.assertEqual(instar_rc, qemu_rc)
 
 
-class TestCompareRawDifferent(ImagoTestBase):
+class TestCompareRawDifferent(InstarTestBase):
     """Test comparing raw images with different content."""
 
     def test_compare_different_content(self):
@@ -87,7 +87,7 @@ class TestCompareRawDifferent(ImagoTestBase):
                  'write -P 0x42 0 4096', f2.name],
                 capture_output=True
             )
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(f1.name), Path(f2.name)
             )
             self.assertEqual(rc, 1)
@@ -114,7 +114,7 @@ class TestCompareRawDifferent(ImagoTestBase):
                  'write -P 0x42 524288 4096', f2.name],
                 capture_output=True
             )
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(f1.name), Path(f2.name)
             )
             self.assertEqual(rc, 1)
@@ -123,7 +123,7 @@ class TestCompareRawDifferent(ImagoTestBase):
             )
 
     def test_compare_different_matches_qemu(self):
-        """Imago output matches qemu-img compare for different images."""
+        """Instar output matches qemu-img compare for different images."""
         with tempfile.NamedTemporaryFile(suffix='.raw') as f1, \
                 tempfile.NamedTemporaryFile(suffix='.raw') as f2:
             subprocess.run(
@@ -139,17 +139,17 @@ class TestCompareRawDifferent(ImagoTestBase):
                  'write -P 0x42 0 4096', f2.name],
                 capture_output=True
             )
-            imago_out, imago_err, imago_rc = self.run_imago_compare(
+            instar_out, instar_err, instar_rc = self.run_instar_compare(
                 Path(f1.name), Path(f2.name)
             )
             qemu_out, qemu_err, qemu_rc = self.run_qemu_img_compare(
                 Path(f1.name), Path(f2.name)
             )
-            self.assertEqual(imago_out, qemu_out)
-            self.assertEqual(imago_rc, qemu_rc)
+            self.assertEqual(instar_out, qemu_out)
+            self.assertEqual(instar_rc, qemu_rc)
 
 
-class TestCompareRawSizeMismatch(ImagoTestBase):
+class TestCompareRawSizeMismatch(InstarTestBase):
     """Test comparing raw images with different sizes."""
 
     def test_size_mismatch_zeros_nonstrict(self):
@@ -164,7 +164,7 @@ class TestCompareRawSizeMismatch(ImagoTestBase):
                 ['qemu-img', 'create', '-f', 'raw', f2.name, '2M'],
                 capture_output=True
             )
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(f1.name), Path(f2.name)
             )
             self.assertEqual(rc, 0)
@@ -183,14 +183,14 @@ class TestCompareRawSizeMismatch(ImagoTestBase):
                 ['qemu-img', 'create', '-f', 'raw', f2.name, '2M'],
                 capture_output=True
             )
-            imago_out, _, imago_rc = self.run_imago_compare(
+            instar_out, _, instar_rc = self.run_instar_compare(
                 Path(f1.name), Path(f2.name)
             )
             qemu_out, _, qemu_rc = self.run_qemu_img_compare(
                 Path(f1.name), Path(f2.name)
             )
-            self.assertEqual(imago_out, qemu_out)
-            self.assertEqual(imago_rc, qemu_rc)
+            self.assertEqual(instar_out, qemu_out)
+            self.assertEqual(instar_rc, qemu_rc)
 
     def test_size_mismatch_nonzero_nonstrict(self):
         """Different sizes with non-zero extra data: mismatch."""
@@ -210,7 +210,7 @@ class TestCompareRawSizeMismatch(ImagoTestBase):
                  'write -P 0x42 1048576 4096', f2.name],
                 capture_output=True
             )
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(f1.name), Path(f2.name)
             )
             self.assertEqual(rc, 1)
@@ -236,14 +236,14 @@ class TestCompareRawSizeMismatch(ImagoTestBase):
                  'write -P 0x42 1048576 4096', f2.name],
                 capture_output=True
             )
-            imago_out, _, imago_rc = self.run_imago_compare(
+            instar_out, _, instar_rc = self.run_instar_compare(
                 Path(f1.name), Path(f2.name)
             )
             qemu_out, _, qemu_rc = self.run_qemu_img_compare(
                 Path(f1.name), Path(f2.name)
             )
-            self.assertEqual(imago_out, qemu_out)
-            self.assertEqual(imago_rc, qemu_rc)
+            self.assertEqual(instar_out, qemu_out)
+            self.assertEqual(instar_rc, qemu_rc)
 
     def test_size_mismatch_strict(self):
         """Strict mode: size mismatch alone causes failure."""
@@ -257,7 +257,7 @@ class TestCompareRawSizeMismatch(ImagoTestBase):
                 ['qemu-img', 'create', '-f', 'raw', f2.name, '2M'],
                 capture_output=True
             )
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(f1.name), Path(f2.name), strict=True
             )
             self.assertEqual(rc, 1)
@@ -277,17 +277,17 @@ class TestCompareRawSizeMismatch(ImagoTestBase):
                 ['qemu-img', 'create', '-f', 'raw', f2.name, '2M'],
                 capture_output=True
             )
-            imago_out, _, imago_rc = self.run_imago_compare(
+            instar_out, _, instar_rc = self.run_instar_compare(
                 Path(f1.name), Path(f2.name), strict=True
             )
             qemu_out, _, qemu_rc = self.run_qemu_img_compare(
                 Path(f1.name), Path(f2.name), strict=True
             )
-            self.assertEqual(imago_out, qemu_out)
-            self.assertEqual(imago_rc, qemu_rc)
+            self.assertEqual(instar_out, qemu_out)
+            self.assertEqual(instar_rc, qemu_rc)
 
 
-class TestCompareRawJson(ImagoTestBase):
+class TestCompareRawJson(InstarTestBase):
     """Test JSON output for compare operation."""
 
     def test_identical_json(self):
@@ -297,7 +297,7 @@ class TestCompareRawJson(ImagoTestBase):
                 ['qemu-img', 'create', '-f', 'raw', f.name, '1M'],
                 capture_output=True
             )
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(f.name), Path(f.name), output_format='json'
             )
             self.assertEqual(rc, 0)
@@ -323,7 +323,7 @@ class TestCompareRawJson(ImagoTestBase):
                  'write -P 0x42 0 4096', f2.name],
                 capture_output=True
             )
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(f1.name), Path(f2.name), output_format='json'
             )
             self.assertEqual(rc, 1)
@@ -344,7 +344,7 @@ class TestCompareRawJson(ImagoTestBase):
                 ['qemu-img', 'create', '-f', 'raw', f2.name, '2M'],
                 capture_output=True
             )
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(f1.name), Path(f2.name), output_format='json'
             )
             result = json.loads(stdout)
@@ -352,7 +352,7 @@ class TestCompareRawJson(ImagoTestBase):
             self.assertTrue(result['identical'])
 
 
-class TestCompareQcow2VsRaw(ImagoTestBase):
+class TestCompareQcow2VsRaw(InstarTestBase):
     """Test comparing QCOW2 images against raw images."""
 
     def _create_raw_with_data(self, path, size='1M', pattern=0xAA,
@@ -386,7 +386,7 @@ class TestCompareQcow2VsRaw(ImagoTestBase):
                 tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2:
             self._create_raw_with_data(raw.name)
             self._convert_to_qcow2(raw.name, qcow2.name)
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(raw.name), Path(qcow2.name)
             )
             self.assertEqual(rc, 0)
@@ -400,14 +400,14 @@ class TestCompareQcow2VsRaw(ImagoTestBase):
                 tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2:
             self._create_raw_with_data(raw.name)
             self._convert_to_qcow2(raw.name, qcow2.name)
-            imago_out, _, imago_rc = self.run_imago_compare(
+            instar_out, _, instar_rc = self.run_instar_compare(
                 Path(raw.name), Path(qcow2.name)
             )
             qemu_out, _, qemu_rc = self.run_qemu_img_compare(
                 Path(raw.name), Path(qcow2.name)
             )
-            self.assertEqual(imago_out, qemu_out)
-            self.assertEqual(imago_rc, qemu_rc)
+            self.assertEqual(instar_out, qemu_out)
+            self.assertEqual(instar_rc, qemu_rc)
 
     def test_qcow2_vs_raw_different(self):
         """QCOW2 and raw with different content report mismatch."""
@@ -419,7 +419,7 @@ class TestCompareQcow2VsRaw(ImagoTestBase):
             self._convert_to_qcow2(raw1.name, qcow2.name)
             # Create different raw with pattern 0xBB
             self._create_raw_with_data(raw2.name, pattern=0xBB)
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(raw2.name), Path(qcow2.name)
             )
             self.assertEqual(rc, 1)
@@ -435,14 +435,14 @@ class TestCompareQcow2VsRaw(ImagoTestBase):
             self._create_raw_with_data(raw1.name, pattern=0xAA)
             self._convert_to_qcow2(raw1.name, qcow2.name)
             self._create_raw_with_data(raw2.name, pattern=0xBB)
-            imago_out, _, imago_rc = self.run_imago_compare(
+            instar_out, _, instar_rc = self.run_instar_compare(
                 Path(raw2.name), Path(qcow2.name)
             )
             qemu_out, _, qemu_rc = self.run_qemu_img_compare(
                 Path(raw2.name), Path(qcow2.name)
             )
-            self.assertEqual(imago_out, qemu_out)
-            self.assertEqual(imago_rc, qemu_rc)
+            self.assertEqual(instar_out, qemu_out)
+            self.assertEqual(instar_rc, qemu_rc)
 
     def test_qcow2_vs_raw_all_zeros(self):
         """QCOW2 and raw with all-zero content are identical."""
@@ -454,7 +454,7 @@ class TestCompareQcow2VsRaw(ImagoTestBase):
                 capture_output=True, check=True
             )
             self._convert_to_qcow2(raw.name, qcow2.name)
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(raw.name), Path(qcow2.name)
             )
             self.assertEqual(rc, 0)
@@ -463,7 +463,7 @@ class TestCompareQcow2VsRaw(ImagoTestBase):
             )
 
 
-class TestCompareQcow2VsQcow2(ImagoTestBase):
+class TestCompareQcow2VsQcow2(InstarTestBase):
     """Test comparing two QCOW2 images."""
 
     def _create_raw_with_data(self, path, size='1M', pattern=0xAA,
@@ -499,7 +499,7 @@ class TestCompareQcow2VsQcow2(ImagoTestBase):
             self._create_raw_with_data(raw.name)
             self._convert_to_qcow2(raw.name, q1.name)
             self._convert_to_qcow2(raw.name, q2.name)
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(q1.name), Path(q2.name)
             )
             self.assertEqual(rc, 0)
@@ -515,14 +515,14 @@ class TestCompareQcow2VsQcow2(ImagoTestBase):
             self._create_raw_with_data(raw.name)
             self._convert_to_qcow2(raw.name, q1.name)
             self._convert_to_qcow2(raw.name, q2.name)
-            imago_out, _, imago_rc = self.run_imago_compare(
+            instar_out, _, instar_rc = self.run_instar_compare(
                 Path(q1.name), Path(q2.name)
             )
             qemu_out, _, qemu_rc = self.run_qemu_img_compare(
                 Path(q1.name), Path(q2.name)
             )
-            self.assertEqual(imago_out, qemu_out)
-            self.assertEqual(imago_rc, qemu_rc)
+            self.assertEqual(instar_out, qemu_out)
+            self.assertEqual(instar_rc, qemu_rc)
 
     def test_qcow2_vs_qcow2_different(self):
         """Two QCOW2 images with different content report mismatch."""
@@ -534,7 +534,7 @@ class TestCompareQcow2VsQcow2(ImagoTestBase):
             self._create_raw_with_data(r2.name, pattern=0xBB)
             self._convert_to_qcow2(r1.name, q1.name)
             self._convert_to_qcow2(r2.name, q2.name)
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(q1.name), Path(q2.name)
             )
             self.assertEqual(rc, 1)
@@ -552,14 +552,14 @@ class TestCompareQcow2VsQcow2(ImagoTestBase):
             self._create_raw_with_data(r2.name, pattern=0xBB)
             self._convert_to_qcow2(r1.name, q1.name)
             self._convert_to_qcow2(r2.name, q2.name)
-            imago_out, _, imago_rc = self.run_imago_compare(
+            instar_out, _, instar_rc = self.run_instar_compare(
                 Path(q1.name), Path(q2.name)
             )
             qemu_out, _, qemu_rc = self.run_qemu_img_compare(
                 Path(q1.name), Path(q2.name)
             )
-            self.assertEqual(imago_out, qemu_out)
-            self.assertEqual(imago_rc, qemu_rc)
+            self.assertEqual(instar_out, qemu_out)
+            self.assertEqual(instar_rc, qemu_rc)
 
     def test_qcow2_vs_qcow2_size_mismatch(self):
         """QCOW2 images with different virtual sizes."""
@@ -579,7 +579,7 @@ class TestCompareQcow2VsQcow2(ImagoTestBase):
             )
             self._convert_to_qcow2(r1.name, q1.name)
             self._convert_to_qcow2(r2.name, q2.name)
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(q1.name), Path(q2.name)
             )
             self.assertEqual(rc, 0)
@@ -604,17 +604,17 @@ class TestCompareQcow2VsQcow2(ImagoTestBase):
             )
             self._convert_to_qcow2(r1.name, q1.name)
             self._convert_to_qcow2(r2.name, q2.name)
-            imago_out, _, imago_rc = self.run_imago_compare(
+            instar_out, _, instar_rc = self.run_instar_compare(
                 Path(q1.name), Path(q2.name)
             )
             qemu_out, _, qemu_rc = self.run_qemu_img_compare(
                 Path(q1.name), Path(q2.name)
             )
-            self.assertEqual(imago_out, qemu_out)
-            self.assertEqual(imago_rc, qemu_rc)
+            self.assertEqual(instar_out, qemu_out)
+            self.assertEqual(instar_rc, qemu_rc)
 
 
-class TestCompareQcow2Compressed(ImagoTestBase):
+class TestCompareQcow2Compressed(InstarTestBase):
     """Test comparing compressed QCOW2 images."""
 
     def _create_raw_with_data(self, path, size='1M', pattern=0xAA,
@@ -650,7 +650,7 @@ class TestCompareQcow2Compressed(ImagoTestBase):
             self._convert_to_qcow2(
                 raw.name, qcow2.name, compressed=True
             )
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(raw.name), Path(qcow2.name)
             )
             self.assertEqual(rc, 0)
@@ -666,14 +666,14 @@ class TestCompareQcow2Compressed(ImagoTestBase):
             self._convert_to_qcow2(
                 raw.name, qcow2.name, compressed=True
             )
-            imago_out, _, imago_rc = self.run_imago_compare(
+            instar_out, _, instar_rc = self.run_instar_compare(
                 Path(raw.name), Path(qcow2.name)
             )
             qemu_out, _, qemu_rc = self.run_qemu_img_compare(
                 Path(raw.name), Path(qcow2.name)
             )
-            self.assertEqual(imago_out, qemu_out)
-            self.assertEqual(imago_rc, qemu_rc)
+            self.assertEqual(instar_out, qemu_out)
+            self.assertEqual(instar_rc, qemu_rc)
 
     def test_compressed_vs_uncompressed_qcow2_identical(self):
         """Compressed vs uncompressed QCOW2 with same content."""
@@ -685,7 +685,7 @@ class TestCompareQcow2Compressed(ImagoTestBase):
             self._convert_to_qcow2(
                 raw.name, q2.name, compressed=True
             )
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(q1.name), Path(q2.name)
             )
             self.assertEqual(rc, 0)
@@ -703,17 +703,17 @@ class TestCompareQcow2Compressed(ImagoTestBase):
             self._convert_to_qcow2(
                 raw.name, q2.name, compressed=True
             )
-            imago_out, _, imago_rc = self.run_imago_compare(
+            instar_out, _, instar_rc = self.run_instar_compare(
                 Path(q1.name), Path(q2.name)
             )
             qemu_out, _, qemu_rc = self.run_qemu_img_compare(
                 Path(q1.name), Path(q2.name)
             )
-            self.assertEqual(imago_out, qemu_out)
-            self.assertEqual(imago_rc, qemu_rc)
+            self.assertEqual(instar_out, qemu_out)
+            self.assertEqual(instar_rc, qemu_rc)
 
 
-class TestCompareBackingChain(ImagoTestBase):
+class TestCompareBackingChain(InstarTestBase):
     """Test comparing images with backing chains."""
 
     def _create_raw_with_data(self, path, size='1M', pattern=0xAA,
@@ -768,7 +768,7 @@ class TestCompareBackingChain(ImagoTestBase):
             self._create_overlay(base.name, ov.name)
             self._write_to_qcow2(ov.name)
             self._flatten_to_raw(ov.name, flat.name)
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(ov.name), Path(flat.name)
             )
             self.assertEqual(rc, 0)
@@ -785,14 +785,14 @@ class TestCompareBackingChain(ImagoTestBase):
             self._create_overlay(base.name, ov.name)
             self._write_to_qcow2(ov.name)
             self._flatten_to_raw(ov.name, flat.name)
-            imago_out, _, imago_rc = self.run_imago_compare(
+            instar_out, _, instar_rc = self.run_instar_compare(
                 Path(ov.name), Path(flat.name)
             )
             qemu_out, _, qemu_rc = self.run_qemu_img_compare(
                 Path(ov.name), Path(flat.name)
             )
-            self.assertEqual(imago_out, qemu_out)
-            self.assertEqual(imago_rc, qemu_rc)
+            self.assertEqual(instar_out, qemu_out)
+            self.assertEqual(instar_rc, qemu_rc)
 
     def test_qcow2_with_backing_vs_raw_different(self):
         """QCOW2 overlay vs different raw reports mismatch."""
@@ -805,7 +805,7 @@ class TestCompareBackingChain(ImagoTestBase):
             self._create_raw_with_data(
                 diff.name, pattern=0xFF
             )
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(ov.name), Path(diff.name)
             )
             self.assertEqual(rc, 1)
@@ -824,14 +824,14 @@ class TestCompareBackingChain(ImagoTestBase):
             self._create_raw_with_data(
                 diff.name, pattern=0xFF
             )
-            imago_out, _, imago_rc = self.run_imago_compare(
+            instar_out, _, instar_rc = self.run_instar_compare(
                 Path(ov.name), Path(diff.name)
             )
             qemu_out, _, qemu_rc = self.run_qemu_img_compare(
                 Path(ov.name), Path(diff.name)
             )
-            self.assertEqual(imago_out, qemu_out)
-            self.assertEqual(imago_rc, qemu_rc)
+            self.assertEqual(instar_out, qemu_out)
+            self.assertEqual(instar_rc, qemu_rc)
 
     def test_deep_chain_vs_raw_identical(self):
         """3-level chain vs flattened raw is identical."""
@@ -855,7 +855,7 @@ class TestCompareBackingChain(ImagoTestBase):
                 offset=131072, length=65536
             )
             self._flatten_to_raw(top.name, flat.name)
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(top.name), Path(flat.name)
             )
             self.assertEqual(rc, 0)
@@ -885,14 +885,14 @@ class TestCompareBackingChain(ImagoTestBase):
                 offset=131072, length=65536
             )
             self._flatten_to_raw(top.name, flat.name)
-            imago_out, _, imago_rc = self.run_imago_compare(
+            instar_out, _, instar_rc = self.run_instar_compare(
                 Path(top.name), Path(flat.name)
             )
             qemu_out, _, qemu_rc = self.run_qemu_img_compare(
                 Path(top.name), Path(flat.name)
             )
-            self.assertEqual(imago_out, qemu_out)
-            self.assertEqual(imago_rc, qemu_rc)
+            self.assertEqual(instar_out, qemu_out)
+            self.assertEqual(instar_rc, qemu_rc)
 
     def test_both_chains_identical(self):
         """Two chains with same virtual content are identical."""
@@ -917,7 +917,7 @@ class TestCompareBackingChain(ImagoTestBase):
                 ob.name, pattern=0xAA,
                 offset=0, length=65536
             )
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(oa.name), Path(ob.name)
             )
             self.assertEqual(rc, 0)
@@ -945,14 +945,14 @@ class TestCompareBackingChain(ImagoTestBase):
                 ob.name, pattern=0xAA,
                 offset=0, length=65536
             )
-            imago_out, _, imago_rc = self.run_imago_compare(
+            instar_out, _, instar_rc = self.run_instar_compare(
                 Path(oa.name), Path(ob.name)
             )
             qemu_out, _, qemu_rc = self.run_qemu_img_compare(
                 Path(oa.name), Path(ob.name)
             )
-            self.assertEqual(imago_out, qemu_out)
-            self.assertEqual(imago_rc, qemu_rc)
+            self.assertEqual(instar_out, qemu_out)
+            self.assertEqual(instar_rc, qemu_rc)
 
     def test_overlay_no_writes_vs_raw_identical(self):
         """Overlay with no writes (100% from backing) vs raw."""
@@ -965,7 +965,7 @@ class TestCompareBackingChain(ImagoTestBase):
             # Create overlay with NO writes - all data from backing
             self._create_overlay(base.name, ov.name)
             self._flatten_to_raw(ov.name, flat.name)
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(ov.name), Path(flat.name)
             )
             self.assertEqual(rc, 0)
@@ -983,14 +983,14 @@ class TestCompareBackingChain(ImagoTestBase):
             )
             self._create_overlay(base.name, ov.name)
             self._flatten_to_raw(ov.name, flat.name)
-            imago_out, _, imago_rc = self.run_imago_compare(
+            instar_out, _, instar_rc = self.run_instar_compare(
                 Path(ov.name), Path(flat.name)
             )
             qemu_out, _, qemu_rc = self.run_qemu_img_compare(
                 Path(ov.name), Path(flat.name)
             )
-            self.assertEqual(imago_out, qemu_out)
-            self.assertEqual(imago_rc, qemu_rc)
+            self.assertEqual(instar_out, qemu_out)
+            self.assertEqual(instar_rc, qemu_rc)
 
     def test_chains_different_virtual_sizes(self):
         """Two chains with different virtual sizes, zero-fill tail."""
@@ -1008,7 +1008,7 @@ class TestCompareBackingChain(ImagoTestBase):
                 b2.name, size='2M', pattern=0xAA
             )
             self._create_overlay(b2.name, o2.name, size='2M')
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(o1.name), Path(o2.name)
             )
             # Non-strict: size mismatch but zeros = identical
@@ -1032,14 +1032,14 @@ class TestCompareBackingChain(ImagoTestBase):
                 b2.name, size='2M', pattern=0xAA
             )
             self._create_overlay(b2.name, o2.name, size='2M')
-            imago_out, _, imago_rc = self.run_imago_compare(
+            instar_out, _, instar_rc = self.run_instar_compare(
                 Path(o1.name), Path(o2.name)
             )
             qemu_out, _, qemu_rc = self.run_qemu_img_compare(
                 Path(o1.name), Path(o2.name)
             )
-            self.assertEqual(imago_out, qemu_out)
-            self.assertEqual(imago_rc, qemu_rc)
+            self.assertEqual(instar_out, qemu_out)
+            self.assertEqual(instar_rc, qemu_rc)
 
     def test_passthrough_intermediate_vs_raw_identical(self):
         """Chain with empty intermediate overlay vs flattened raw."""
@@ -1061,7 +1061,7 @@ class TestCompareBackingChain(ImagoTestBase):
                 offset=131072, length=65536
             )
             self._flatten_to_raw(top.name, flat.name)
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(top.name), Path(flat.name)
             )
             self.assertEqual(rc, 0)
@@ -1087,14 +1087,14 @@ class TestCompareBackingChain(ImagoTestBase):
                 offset=131072, length=65536
             )
             self._flatten_to_raw(top.name, flat.name)
-            imago_out, _, imago_rc = self.run_imago_compare(
+            instar_out, _, instar_rc = self.run_instar_compare(
                 Path(top.name), Path(flat.name)
             )
             qemu_out, _, qemu_rc = self.run_qemu_img_compare(
                 Path(top.name), Path(flat.name)
             )
-            self.assertEqual(imago_out, qemu_out)
-            self.assertEqual(imago_rc, qemu_rc)
+            self.assertEqual(instar_out, qemu_out)
+            self.assertEqual(instar_rc, qemu_rc)
 
     def test_corrupt_backing_chain_image(self):
         """Corrupt QCOW2 header in backing file is handled."""
@@ -1115,14 +1115,14 @@ class TestCompareBackingChain(ImagoTestBase):
             with open(mid.name, 'r+b') as f:
                 f.seek(0)
                 f.write(b'\x00\x00\x00\x00')
-            # imago should fail gracefully (non-zero exit)
-            stdout, stderr, rc = self.run_imago_compare(
+            # instar should fail gracefully (non-zero exit)
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(top.name), Path(base.name)
             )
             self.assertNotEqual(rc, 0)
 
 
-class TestCompareLuksQcow2(ImagoTestBase):
+class TestCompareLuksQcow2(InstarTestBase):
     """Test compare with LUKS-encrypted QCOW2 images (crypt_method=2)."""
 
     def test_compare_luks_qcow2_vs_raw(self):
@@ -1132,8 +1132,8 @@ class TestCompareLuksQcow2(ImagoTestBase):
             self.skipTest(f'Image not found: {image.path}')
 
         with tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
-            # First convert LUKS-QCOW2 to raw using imago
-            stdout, stderr, rc = self.run_imago_convert(
+            # First convert LUKS-QCOW2 to raw using instar
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name),
                 luks_passphrase='test-passphrase'
             )
@@ -1144,7 +1144,7 @@ class TestCompareLuksQcow2(ImagoTestBase):
 
             # Now compare the original LUKS-QCOW2 directly against
             # the decrypted raw, using --luks-passphrase
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 image.path, Path(raw_out.name),
                 luks_passphrase='test-passphrase'
             )
@@ -1166,7 +1166,7 @@ class TestCompareLuksQcow2(ImagoTestBase):
                 f.write(b'\x00' * 1048576)
 
             # Compare without passphrase should fail
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 image.path, Path(raw_out.name)
             )
             self.assertNotEqual(rc, 0)
@@ -1183,7 +1183,7 @@ class TestCompareLuksQcow2(ImagoTestBase):
                 f.write(b'\x00' * 1048576)
 
             # Compare with wrong passphrase should fail
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 image.path, Path(raw_out.name),
                 luks_passphrase='wrong-passphrase'
             )

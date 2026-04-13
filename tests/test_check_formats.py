@@ -7,16 +7,16 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from base import ImagoTestBase
+from base import InstarTestBase
 
 
-class TestCheckFormatDetection(ImagoTestBase):
+class TestCheckFormatDetection(InstarTestBase):
     """Test that check operation correctly detects and validates formats."""
 
     def test_check_qcow2_corrupt_detected(self):
         """Check operation should detect corrupt flag in QCOW2 images."""
         image = self.get_image('qcow2-corrupt')
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             image.path, output_format='json'
         )
 
@@ -39,7 +39,7 @@ class TestCheckFormatDetection(ImagoTestBase):
         if not vmdk_path.exists():
             self.skipTest(f'VMDK test image not found: {vmdk_path}')
 
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             vmdk_path, output_format='json'
         )
 
@@ -58,7 +58,7 @@ class TestCheckFormatDetection(ImagoTestBase):
         if not vmdk_path.exists():
             self.skipTest(f'VMDK test image not found: {vmdk_path}')
 
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             vmdk_path, output_format='json', unsafe_quirks=True
         )
 
@@ -70,11 +70,11 @@ class TestCheckFormatDetection(ImagoTestBase):
         )
 
 
-class TestCheckCorruptImages(ImagoTestBase):
+class TestCheckCorruptImages(InstarTestBase):
     """Test check operation with deliberately corrupt images.
 
     TODO: These tests are placeholders pending creation of corrupt test images
-    in imago-testdata/custom/format-coverage/. The required images are:
+    in instar-testdata/custom/format-coverage/. The required images are:
     - vmdk-corrupt-version.vmdk: VMDK with invalid version (255)
     - vhdx-corrupt-region.vhdx: VHDX with invalid region table signature
     - vhd-corrupt-disktype.vhd: VHD with invalid disk type (255)
@@ -94,7 +94,7 @@ class TestCheckCorruptImages(ImagoTestBase):
         if not vmdk_path.exists():
             self.skipTest(f'Corrupt VMDK not found: {vmdk_path}')
 
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             vmdk_path, output_format='json'
         )
 
@@ -125,7 +125,7 @@ class TestCheckCorruptImages(ImagoTestBase):
                 f'Corrupt VMDK not found: {vmdk_path}'
             )
 
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             vmdk_path, output_format='json'
         )
 
@@ -153,7 +153,7 @@ class TestCheckCorruptImages(ImagoTestBase):
         if not vhdx_path.exists():
             self.skipTest(f'Corrupt VHDX not found: {vhdx_path}')
 
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             vhdx_path, output_format='json'
         )
 
@@ -182,7 +182,7 @@ class TestCheckCorruptImages(ImagoTestBase):
         if not vhd_path.exists():
             self.skipTest(f'Corrupt VHD not found: {vhd_path}')
 
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             vhd_path, output_format='json'
         )
 
@@ -201,11 +201,11 @@ class TestCheckCorruptImages(ImagoTestBase):
         )
 
 
-class TestCheckQcow2Validation(ImagoTestBase):
+class TestCheckQcow2Validation(InstarTestBase):
     """Test improved QCOW2 structural validation.
 
     Uses deliberately corrupt images from
-    imago-testdata/custom/check-validation/ to verify overlap
+    instar-testdata/custom/check-validation/ to verify overlap
     detection, refcount validation, and leak detection.
     """
 
@@ -227,7 +227,7 @@ class TestCheckQcow2Validation(ImagoTestBase):
         path = self._get_check_validation_path(
             'qcow2-clean-with-data.qcow2'
         )
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             path, output_format='json'
         )
 
@@ -244,7 +244,7 @@ class TestCheckQcow2Validation(ImagoTestBase):
         path = self._get_check_validation_path(
             'qcow2-clean-with-data.qcow2'
         )
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             path, output_format='json'
         )
 
@@ -261,7 +261,7 @@ class TestCheckQcow2Validation(ImagoTestBase):
         path = self._get_check_validation_path(
             'qcow2-overlapping-clusters.qcow2'
         )
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             path, output_format='json'
         )
 
@@ -277,7 +277,7 @@ class TestCheckQcow2Validation(ImagoTestBase):
         path = self._get_check_validation_path(
             'qcow2-refcount-zero.qcow2'
         )
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             path, output_format='json'
         )
 
@@ -293,7 +293,7 @@ class TestCheckQcow2Validation(ImagoTestBase):
         path = self._get_check_validation_path(
             'qcow2-leaked-cluster.qcow2'
         )
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             path, output_format='json'
         )
 
@@ -315,7 +315,7 @@ class TestCheckQcow2Validation(ImagoTestBase):
         )
 
         # Run both tools
-        imago_stdout, _, imago_rc = self.run_imago_check(
+        instar_stdout, _, instar_rc = self.run_instar_check(
             path, output_format='json'
         )
         qemu_stdout, _, qemu_rc = self.run_qemu_img_check(
@@ -327,17 +327,17 @@ class TestCheckQcow2Validation(ImagoTestBase):
                 f'qemu-img check failed unexpectedly: rc={qemu_rc}'
             )
 
-        imago_result = json.loads(imago_stdout)
+        instar_result = json.loads(instar_stdout)
         qemu_result = json.loads(qemu_stdout)
 
         self.assertEqual(
-            imago_result['image-end-offset'],
+            instar_result['image-end-offset'],
             qemu_result['image-end-offset'],
             'image-end-offset should match qemu-img check'
         )
 
 
-class TestCheckUnsafeQuirksMode(ImagoTestBase):
+class TestCheckUnsafeQuirksMode(InstarTestBase):
     """Test that unsafe_quirks mode matches qemu-img behavior.
 
     TODO: test_unsafe_quirks_skips_vmdk_validation depends on
@@ -356,7 +356,7 @@ class TestCheckUnsafeQuirksMode(ImagoTestBase):
         if not vmdk_path.exists():
             self.skipTest(f'Corrupt VMDK not found: {vmdk_path}')
 
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             vmdk_path, output_format='json', unsafe_quirks=True
         )
 
@@ -375,7 +375,7 @@ class TestCheckUnsafeQuirksMode(ImagoTestBase):
         )
 
 
-class TestIncompatibleFeatureBits(ImagoTestBase):
+class TestIncompatibleFeatureBits(InstarTestBase):
     """Test that operations reject QCOW2 images with unsupported
     incompatible feature bits.
 
@@ -406,7 +406,7 @@ class TestIncompatibleFeatureBits(ImagoTestBase):
     def test_check_rejects_unknown_feature_bit(self):
         """Check should reject images with unknown feature bit 5."""
         with self._create_patched_qcow2(1 << 5) as img:
-            stdout, stderr, rc = self.run_imago_check(
+            stdout, stderr, rc = self.run_instar_check(
                 Path(img.name), output_format='json'
             )
             self.assertNotEqual(
@@ -425,7 +425,7 @@ class TestIncompatibleFeatureBits(ImagoTestBase):
         whether cluster data is in an external file.
         """
         with self._create_patched_qcow2(1 << 2) as img:
-            stdout, stderr, rc = self.run_imago_check(
+            stdout, stderr, rc = self.run_instar_check(
                 Path(img.name), output_format='json'
             )
             result = json.loads(stdout)
@@ -437,7 +437,7 @@ class TestIncompatibleFeatureBits(ImagoTestBase):
     def test_check_accepts_extended_l2_bit(self):
         """Check should accept images with extended L2 (bit 4)."""
         with self._create_patched_qcow2(1 << 4) as img:
-            stdout, stderr, rc = self.run_imago_check(
+            stdout, stderr, rc = self.run_instar_check(
                 Path(img.name), output_format='json'
             )
             result = json.loads(stdout)
@@ -449,7 +449,7 @@ class TestIncompatibleFeatureBits(ImagoTestBase):
     def test_check_allows_dirty_bit(self):
         """Check should accept images with only the dirty bit set."""
         with self._create_patched_qcow2(1 << 0) as img:
-            stdout, stderr, rc = self.run_imago_check(
+            stdout, stderr, rc = self.run_instar_check(
                 Path(img.name), output_format='json'
             )
             result = json.loads(stdout)
@@ -461,7 +461,7 @@ class TestIncompatibleFeatureBits(ImagoTestBase):
     def test_info_accepts_unknown_feature_bit(self):
         """Info should still work on images with unknown bits."""
         with self._create_patched_qcow2(1 << 5) as img:
-            stdout, stderr, rc = self.run_imago_info(
+            stdout, stderr, rc = self.run_instar_info(
                 Path(img.name), output_format='json'
             )
             self.assertEqual(
@@ -478,7 +478,7 @@ class TestIncompatibleFeatureBits(ImagoTestBase):
                  raw.name, '1M'],
                 capture_output=True, check=True
             )
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(img.name), Path(raw.name)
             )
             self.assertNotEqual(
@@ -490,7 +490,7 @@ class TestIncompatibleFeatureBits(ImagoTestBase):
         """Convert should reject images with unknown feature bits."""
         with self._create_patched_qcow2(1 << 5) as img, \
                 tempfile.NamedTemporaryFile(suffix='.raw') as raw:
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(img.name), Path(raw.name)
             )
             self.assertNotEqual(
@@ -499,7 +499,7 @@ class TestIncompatibleFeatureBits(ImagoTestBase):
             )
 
 
-class TestZstdCompression(ImagoTestBase):
+class TestZstdCompression(InstarTestBase):
     """Test ZSTD-compressed QCOW2 image handling.
 
     QCOW2 v3 images with compression_type=zstd (1) and the
@@ -545,7 +545,7 @@ class TestZstdCompression(ImagoTestBase):
         with self._create_zstd_qcow2(
             data_pattern=b'\xaa' * 4096
         ) as img:
-            stdout, stderr, rc = self.run_imago_check(
+            stdout, stderr, rc = self.run_instar_check(
                 Path(img.name), output_format='json'
             )
             result = json.loads(stdout)
@@ -569,7 +569,7 @@ class TestZstdCompression(ImagoTestBase):
         with self._create_zstd_qcow2(
             data_pattern=b'\xbb' * 4096
         ) as img:
-            stdout, stderr, rc = self.run_imago_info(
+            stdout, stderr, rc = self.run_instar_info(
                 Path(img.name), output_format='json'
             )
             self.assertEqual(
@@ -584,12 +584,12 @@ class TestZstdCompression(ImagoTestBase):
             data_pattern=pattern
         ) as img, \
                 tempfile.NamedTemporaryFile(suffix='.raw') \
-                as imago_raw, \
+                as instar_raw, \
                 tempfile.NamedTemporaryFile(suffix='.raw') \
                 as qemu_raw:
-            # Convert with imago
-            stdout, stderr, rc = self.run_imago_convert(
-                Path(img.name), Path(imago_raw.name)
+            # Convert with instar
+            stdout, stderr, rc = self.run_instar_convert(
+                Path(img.name), Path(instar_raw.name)
             )
             self.assertEqual(
                 rc, 0,
@@ -604,8 +604,8 @@ class TestZstdCompression(ImagoTestBase):
             )
 
             # Compare outputs
-            stdout2, stderr2, rc2 = self.run_imago_compare(
-                Path(imago_raw.name), Path(qemu_raw.name)
+            stdout2, stderr2, rc2 = self.run_instar_compare(
+                Path(instar_raw.name), Path(qemu_raw.name)
             )
             self.assertEqual(
                 rc2, 0,
@@ -628,7 +628,7 @@ class TestZstdCompression(ImagoTestBase):
             )
 
             # Compare ZSTD qcow2 vs raw
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(img.name), Path(raw.name)
             )
             self.assertEqual(
@@ -637,7 +637,7 @@ class TestZstdCompression(ImagoTestBase):
             )
 
 
-class TestExtendedL2(ImagoTestBase):
+class TestExtendedL2(InstarTestBase):
     """Test QCOW2 v3 extended L2 entry support.
 
     QCOW2 v3 images with INCOMPAT_EXTENDED_L2 (bit 4) use 16-byte
@@ -675,7 +675,7 @@ class TestExtendedL2(ImagoTestBase):
         with self._create_extended_l2_qcow2(
             data_pattern=0xAA
         ) as img:
-            stdout, stderr, rc = self.run_imago_check(
+            stdout, stderr, rc = self.run_instar_check(
                 Path(img.name), output_format='json'
             )
             result = json.loads(stdout)
@@ -690,7 +690,7 @@ class TestExtendedL2(ImagoTestBase):
         with self._create_extended_l2_qcow2(
             data_pattern=0xBB
         ) as img:
-            stdout, stderr, rc = self.run_imago_info(
+            stdout, stderr, rc = self.run_instar_info(
                 Path(img.name), output_format='json'
             )
             self.assertEqual(
@@ -713,12 +713,12 @@ class TestExtendedL2(ImagoTestBase):
             data_pattern=0xCC
         ) as img, \
                 tempfile.NamedTemporaryFile(suffix='.raw') \
-                as imago_raw, \
+                as instar_raw, \
                 tempfile.NamedTemporaryFile(suffix='.raw') \
                 as qemu_raw:
-            # Convert with imago
-            stdout, stderr, rc = self.run_imago_convert(
-                Path(img.name), Path(imago_raw.name)
+            # Convert with instar
+            stdout, stderr, rc = self.run_instar_convert(
+                Path(img.name), Path(instar_raw.name)
             )
             self.assertEqual(
                 rc, 0,
@@ -733,8 +733,8 @@ class TestExtendedL2(ImagoTestBase):
             )
 
             # Compare outputs
-            stdout2, stderr2, rc2 = self.run_imago_compare(
-                Path(imago_raw.name), Path(qemu_raw.name)
+            stdout2, stderr2, rc2 = self.run_instar_compare(
+                Path(instar_raw.name), Path(qemu_raw.name)
             )
             self.assertEqual(
                 rc2, 0,
@@ -757,7 +757,7 @@ class TestExtendedL2(ImagoTestBase):
             )
 
             # Compare ext L2 qcow2 vs raw
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(img.name), Path(raw.name)
             )
             self.assertEqual(
@@ -781,7 +781,7 @@ class TestExtendedL2(ImagoTestBase):
                 ) as compressed, \
                 tempfile.NamedTemporaryFile(
                     suffix='.raw'
-                ) as imago_raw, \
+                ) as instar_raw, \
                 tempfile.NamedTemporaryFile(
                     suffix='.raw'
                 ) as qemu_raw:
@@ -794,10 +794,10 @@ class TestExtendedL2(ImagoTestBase):
                 capture_output=True, check=True
             )
 
-            # Convert with imago
-            stdout, stderr, rc = self.run_imago_convert(
+            # Convert with instar
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(compressed.name),
-                Path(imago_raw.name)
+                Path(instar_raw.name)
             )
             self.assertEqual(
                 rc, 0,
@@ -814,8 +814,8 @@ class TestExtendedL2(ImagoTestBase):
             )
 
             # Compare outputs
-            stdout2, stderr2, rc2 = self.run_imago_compare(
-                Path(imago_raw.name),
+            stdout2, stderr2, rc2 = self.run_instar_compare(
+                Path(instar_raw.name),
                 Path(qemu_raw.name)
             )
             self.assertEqual(
@@ -825,7 +825,7 @@ class TestExtendedL2(ImagoTestBase):
             )
 
 
-class TestExtendedL2Subclusters(ImagoTestBase):
+class TestExtendedL2Subclusters(InstarTestBase):
     """Test correct per-subcluster handling in extended L2 images.
 
     Creates QCOW2 images with partially-allocated subclusters and
@@ -876,11 +876,11 @@ class TestExtendedL2Subclusters(ImagoTestBase):
         correctly when compared against qemu-img."""
         with self._create_partial_subcluster_qcow2() as img, \
                 tempfile.NamedTemporaryFile(suffix='.raw') \
-                as imago_raw, \
+                as instar_raw, \
                 tempfile.NamedTemporaryFile(suffix='.raw') \
                 as qemu_raw:
-            stdout, stderr, rc = self.run_imago_convert(
-                Path(img.name), Path(imago_raw.name)
+            stdout, stderr, rc = self.run_instar_convert(
+                Path(img.name), Path(instar_raw.name)
             )
             self.assertEqual(
                 rc, 0,
@@ -894,8 +894,8 @@ class TestExtendedL2Subclusters(ImagoTestBase):
                 capture_output=True, check=True
             )
 
-            stdout2, stderr2, rc2 = self.run_imago_compare(
-                Path(imago_raw.name), Path(qemu_raw.name)
+            stdout2, stderr2, rc2 = self.run_instar_compare(
+                Path(instar_raw.name), Path(qemu_raw.name)
             )
             self.assertEqual(
                 rc2, 0,
@@ -908,13 +908,13 @@ class TestExtendedL2Subclusters(ImagoTestBase):
         host data may exist at the cluster offset."""
         with self._create_partial_subcluster_qcow2() as img, \
                 tempfile.NamedTemporaryFile(suffix='.raw') \
-                as imago_raw:
-            stdout, stderr, rc = self.run_imago_convert(
-                Path(img.name), Path(imago_raw.name)
+                as instar_raw:
+            stdout, stderr, rc = self.run_instar_convert(
+                Path(img.name), Path(instar_raw.name)
             )
             self.assertEqual(rc, 0, f'convert failed: {stderr}')
 
-            with open(imago_raw.name, 'rb') as f:
+            with open(instar_raw.name, 'rb') as f:
                 data = f.read()
 
             # First 32KB should be 0xAA (allocated subclusters)
@@ -950,7 +950,7 @@ class TestExtendedL2Subclusters(ImagoTestBase):
                 capture_output=True, check=True
             )
 
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(img.name), Path(raw.name)
             )
             self.assertEqual(
@@ -963,7 +963,7 @@ class TestExtendedL2Subclusters(ImagoTestBase):
         """Check should accept extended L2 images with partial
         subcluster allocation without reporting corruptions."""
         with self._create_partial_subcluster_qcow2() as img:
-            stdout, stderr, rc = self.run_imago_check(
+            stdout, stderr, rc = self.run_instar_check(
                 Path(img.name), output_format='json'
             )
             result = json.loads(stdout)
@@ -974,7 +974,7 @@ class TestExtendedL2Subclusters(ImagoTestBase):
             )
 
 
-class TestZstdBackingChain(ImagoTestBase):
+class TestZstdBackingChain(InstarTestBase):
     """Test ZSTD-compressed QCOW2 images with backing chains.
 
     Verifies that ZSTD decompression works correctly when the input
@@ -1009,7 +1009,7 @@ class TestZstdBackingChain(ImagoTestBase):
                 ) as overlay, \
                 tempfile.NamedTemporaryFile(
                     suffix='.raw'
-                ) as imago_raw, \
+                ) as instar_raw, \
                 tempfile.NamedTemporaryFile(
                     suffix='.raw'
                 ) as qemu_raw:
@@ -1047,10 +1047,10 @@ class TestZstdBackingChain(ImagoTestBase):
                 capture_output=True, check=True
             )
 
-            # Convert with imago (flattens chain)
-            stdout, stderr, rc = self.run_imago_convert(
+            # Convert with instar (flattens chain)
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(overlay.name),
-                Path(imago_raw.name)
+                Path(instar_raw.name)
             )
             self.assertEqual(
                 rc, 0,
@@ -1067,8 +1067,8 @@ class TestZstdBackingChain(ImagoTestBase):
             )
 
             # Compare outputs
-            stdout2, stderr2, rc2 = self.run_imago_compare(
-                Path(imago_raw.name),
+            stdout2, stderr2, rc2 = self.run_instar_compare(
+                Path(instar_raw.name),
                 Path(qemu_raw.name)
             )
             self.assertEqual(
@@ -1138,7 +1138,7 @@ class TestZstdBackingChain(ImagoTestBase):
             )
 
             # Compare ZSTD overlay vs flattened raw
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(overlay.name),
                 Path(flat_raw.name)
             )
@@ -1149,7 +1149,7 @@ class TestZstdBackingChain(ImagoTestBase):
             )
 
 
-class TestCheckCompressedLeaks(ImagoTestBase):
+class TestCheckCompressedLeaks(InstarTestBase):
     """Compressed clusters should not cause false leak reports."""
 
     def test_compressed_zlib_no_leaks(self):
@@ -1174,7 +1174,7 @@ class TestCheckCompressedLeaks(ImagoTestBase):
                 capture_output=True, check=True
             )
 
-            stdout, stderr, rc = self.run_imago_check(
+            stdout, stderr, rc = self.run_instar_check(
                 Path(comp.name), output_format='json'
             )
             result = json.loads(stdout)
@@ -1226,19 +1226,19 @@ class TestCheckCompressedLeaks(ImagoTestBase):
             qemu_leaks = qemu_data.get('leaks', 0)
             qemu_corruptions = qemu_data.get('corruptions', 0)
 
-            # Run imago check
-            stdout, stderr, rc = self.run_imago_check(
+            # Run instar check
+            stdout, stderr, rc = self.run_instar_check(
                 Path(comp.name), output_format='json'
             )
-            imago_data = json.loads(stdout)
+            instar_data = json.loads(stdout)
 
             self.assertEqual(
-                imago_data.get('corruptions', 0),
+                instar_data.get('corruptions', 0),
                 qemu_corruptions,
                 f'Corruption count mismatch: {stderr}'
             )
             self.assertEqual(
-                imago_data.get('leaks', 0),
+                instar_data.get('leaks', 0),
                 qemu_leaks,
                 f'Leak count mismatch: {stderr}'
             )
@@ -1266,7 +1266,7 @@ class TestCheckCompressedLeaks(ImagoTestBase):
                 capture_output=True, check=True
             )
 
-            stdout, stderr, rc = self.run_imago_check(
+            stdout, stderr, rc = self.run_instar_check(
                 Path(comp.name), output_format='json'
             )
             result = json.loads(stdout)
@@ -1285,7 +1285,7 @@ class TestCheckCompressedLeaks(ImagoTestBase):
             )
 
 
-class TestCheckRefcountWidths(ImagoTestBase):
+class TestCheckRefcountWidths(InstarTestBase):
     """Test check with non-16-bit refcount widths."""
 
     def _create_refcount_qcow2(self, refcount_bits):
@@ -1321,7 +1321,7 @@ class TestCheckRefcountWidths(ImagoTestBase):
                     f'{qemu_result.stderr}'
                 )
 
-            stdout, stderr, rc = self.run_imago_check(
+            stdout, stderr, rc = self.run_instar_check(
                 Path(img.name), output_format='json'
             )
             result = json.loads(stdout)
@@ -1376,7 +1376,7 @@ class TestCheckRefcountWidths(ImagoTestBase):
             self.skipTest(
                 f'Image not found: {image.path}'
             )
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             image.path, output_format='json'
         )
         result = json.loads(stdout)
@@ -1396,7 +1396,7 @@ class TestCheckRefcountWidths(ImagoTestBase):
             self.skipTest(
                 f'Image not found: {image.path}'
             )
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             image.path, output_format='json'
         )
         result = json.loads(stdout)
@@ -1410,7 +1410,7 @@ class TestCheckRefcountWidths(ImagoTestBase):
         )
 
 
-class TestCheckLargeCluster(ImagoTestBase):
+class TestCheckLargeCluster(InstarTestBase):
     """Test check operation with cluster sizes > 64KB.
 
     QCOW2 supports cluster_bits 9-21 (512B to 2MB). These tests
@@ -1456,8 +1456,8 @@ class TestCheckLargeCluster(ImagoTestBase):
                 f'qemu-img check failed: {qemu_result.stderr}'
             )
 
-            # Verify imago check passes
-            stdout, stderr, rc = self.run_imago_check(
+            # Verify instar check passes
+            stdout, stderr, rc = self.run_instar_check(
                 tmp, output_format='json'
             )
             result = json.loads(stdout)
@@ -1500,7 +1500,7 @@ class TestCheckLargeCluster(ImagoTestBase):
                 check=True, capture_output=True, timeout=30,
             )
 
-            stdout, stderr, rc = self.run_imago_check(
+            stdout, stderr, rc = self.run_instar_check(
                 tmp, output_format='json'
             )
             result = json.loads(stdout)
@@ -1526,7 +1526,7 @@ class TestCheckLargeCluster(ImagoTestBase):
             self.skipTest(
                 f'Image not found: {image.path}'
             )
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             image.path, output_format='json'
         )
         result = json.loads(stdout)
@@ -1546,7 +1546,7 @@ class TestCheckLargeCluster(ImagoTestBase):
             self.skipTest(
                 f'Image not found: {image.path}'
             )
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             image.path, output_format='json'
         )
         result = json.loads(stdout)
@@ -1560,7 +1560,7 @@ class TestCheckLargeCluster(ImagoTestBase):
         )
 
 
-class TestCheckExternalDataFile(ImagoTestBase):
+class TestCheckExternalDataFile(InstarTestBase):
     """Tests for check operation with QCOW2 external data files."""
 
     def test_check_external_data_no_errors_with_chain(self):
@@ -1573,7 +1573,7 @@ class TestCheckExternalDataFile(ImagoTestBase):
         if not image.path.exists():
             self.skipTest(f'Test image not found: {image.path}')
 
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             image.path, output_format='json', chain=True
         )
         self.assertEqual(
@@ -1597,7 +1597,7 @@ class TestCheckExternalDataFile(ImagoTestBase):
         if not image.path.exists():
             self.skipTest(f'Test image not found: {image.path}')
 
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             image.path, output_format='json'
         )
         self.assertEqual(
@@ -1611,7 +1611,7 @@ class TestCheckExternalDataFile(ImagoTestBase):
         )
 
 
-class TestCheckVhdFixed(ImagoTestBase):
+class TestCheckVhdFixed(InstarTestBase):
     """Tests for check operation with fixed VHD (disk_type=2)."""
 
     def test_check_vhd_fixed_detects_vpc(self):
@@ -1620,7 +1620,7 @@ class TestCheckVhdFixed(ImagoTestBase):
         if not image.path.exists():
             self.skipTest(f'Test image not found: {image.path}')
 
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             image.path, output_format='json'
         )
         self.assertEqual(
@@ -1639,7 +1639,7 @@ class TestCheckVhdFixed(ImagoTestBase):
         if not image.path.exists():
             self.skipTest(f'Test image not found: {image.path}')
 
-        stdout, stderr, rc = self.run_imago_info(image.path)
+        stdout, stderr, rc = self.run_instar_info(image.path)
         self.assertEqual(
             0, rc,
             f'info should succeed for fixed VHD: {stderr}'
@@ -1650,7 +1650,7 @@ class TestCheckVhdFixed(ImagoTestBase):
         )
 
 
-class TestCheckVhdDifferencing(ImagoTestBase):
+class TestCheckVhdDifferencing(InstarTestBase):
     """Tests for check operation with differencing VHD (disk_type=4)."""
 
     def test_check_vhd_differencing_detects_vpc(self):
@@ -1659,7 +1659,7 @@ class TestCheckVhdDifferencing(ImagoTestBase):
         if not image.path.exists():
             self.skipTest(f'Test image not found: {image.path}')
 
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             image.path, output_format='json'
         )
         self.assertEqual(
@@ -1682,7 +1682,7 @@ class TestCheckVhdDifferencing(ImagoTestBase):
         if not image.path.exists():
             self.skipTest(f'Test image not found: {image.path}')
 
-        stdout, stderr, rc = self.run_imago_info(image.path)
+        stdout, stderr, rc = self.run_instar_info(image.path)
         self.assertEqual(
             0, rc,
             f'info should succeed for differencing VHD: {stderr}'
@@ -1693,7 +1693,7 @@ class TestCheckVhdDifferencing(ImagoTestBase):
         )
 
 
-class TestCheckSecurityExternalData(ImagoTestBase):
+class TestCheckSecurityExternalData(InstarTestBase):
     """Tests for check with external data file security images."""
 
     def test_check_security_image_external_data(self):
@@ -1707,7 +1707,7 @@ class TestCheckSecurityExternalData(ImagoTestBase):
         if not image.path.exists():
             self.skipTest(f'Test image not found: {image.path}')
 
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             image.path, output_format='json'
         )
         self.assertEqual(
@@ -1721,7 +1721,7 @@ class TestCheckSecurityExternalData(ImagoTestBase):
         )
 
 
-class TestCheckVmdkMultiExtent(ImagoTestBase):
+class TestCheckVmdkMultiExtent(InstarTestBase):
     """Tests for check operation with multi-extent VMDK."""
 
     def test_check_vmdk_multi_extent_detected(self):
@@ -1730,7 +1730,7 @@ class TestCheckVmdkMultiExtent(ImagoTestBase):
         if not image.path.exists():
             self.skipTest(f'Test image not found: {image.path}')
 
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             image.path, output_format='json'
         )
         result = json.loads(stdout)
@@ -1751,7 +1751,7 @@ class TestCheckVmdkMultiExtent(ImagoTestBase):
             self.skipTest(f'Test image not found: {image.path}')
 
         # JSON output: early bail means 0 clusters checked
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             image.path, output_format='json'
         )
         result = json.loads(stdout)
@@ -1761,7 +1761,7 @@ class TestCheckVmdkMultiExtent(ImagoTestBase):
         )
 
         # Human output: "does not support checks"
-        stdout_h, stderr_h, rc_h = self.run_imago_check(
+        stdout_h, stderr_h, rc_h = self.run_instar_check(
             image.path, output_format='human'
         )
         self.assertIn(
@@ -1775,7 +1775,7 @@ class TestCheckVmdkMultiExtent(ImagoTestBase):
         if not image.path.exists():
             self.skipTest(f'Test image not found: {image.path}')
 
-        stdout, stderr, rc = self.run_imago_info(image.path)
+        stdout, stderr, rc = self.run_instar_info(image.path)
         self.assertEqual(
             0, rc,
             f'info should succeed for multi-extent VMDK: {stderr}'
@@ -1786,7 +1786,7 @@ class TestCheckVmdkMultiExtent(ImagoTestBase):
         )
 
 
-class TestCheckQcow2Snapshots(ImagoTestBase):
+class TestCheckQcow2Snapshots(InstarTestBase):
     """Test that info detects and reports QCOW2 snapshots."""
 
     def test_info_reports_snapshot_count(self):
@@ -1798,7 +1798,7 @@ class TestCheckQcow2Snapshots(ImagoTestBase):
                 f'Image not found: {image.path}'
             )
 
-        stdout, stderr, rc = self.run_imago_info(
+        stdout, stderr, rc = self.run_instar_info(
             image.path
         )
         self.assertEqual(
@@ -1820,7 +1820,7 @@ class TestCheckQcow2Snapshots(ImagoTestBase):
                 f'Image not found: {image.path}'
             )
 
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             image.path
         )
         # Leaked clusters are expected — snapshot metadata
@@ -1839,7 +1839,7 @@ class TestCheckQcow2Snapshots(ImagoTestBase):
                 f'Image not found: {image.path}'
             )
 
-        stdout, stderr, rc = self.run_imago_info(
+        stdout, stderr, rc = self.run_instar_info(
             image.path
         )
         self.assertEqual(

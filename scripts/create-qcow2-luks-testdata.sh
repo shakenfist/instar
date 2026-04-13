@@ -4,7 +4,7 @@
 # Usage:
 #   ./scripts/create-qcow2-luks-testdata.sh [output-dir]
 #
-# Default output: ../imago-testdata/custom/format-coverage/
+# Default output: ../instar-testdata/custom/format-coverage/
 #
 # Creates:
 #   qcow2-luks.qcow2 - 10MB QCOW2 v3 with LUKS encryption (crypt_method=2)
@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-OUTDIR="${1:-../imago-testdata/custom/format-coverage}"
+OUTDIR="${1:-../instar-testdata/custom/format-coverage}"
 mkdir -p "$OUTDIR"
 OUTPUT="$OUTDIR/qcow2-luks.qcow2"
 PASSWORD="test-passphrase"

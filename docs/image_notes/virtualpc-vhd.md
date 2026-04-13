@@ -29,7 +29,7 @@ not the 136,365,211,648 bytes stored in the footer's disk_size field.
 disk_size field may exceed what CHS can address, so qemu-img uses the CHS
 calculation to ensure compatibility with Virtual PC.
 
-**Implementation:** imago reads the creator_app field from the VHD footer
+**Implementation:** instar reads the creator_app field from the VHD footer
 and uses CHS calculation for "vpc " and "qemu" creators, falling back to
 disk_size for all others.
 
@@ -45,7 +45,7 @@ file that's 262,656 / 1024 = 256.5 KiB exactly.
 - qemu-img rounds to nearest even integer: 256 (not 257)
 - This is "round half to even" (banker's rounding) behavior
 
-**Implementation:** imago uses banker's rounding for human-readable size
+**Implementation:** instar uses banker's rounding for human-readable size
 formatting to match qemu-img output.
 
 **Documentation:** [docs/quirks.md](../quirks.md#human-readable-size-formatting)

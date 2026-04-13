@@ -1,12 +1,12 @@
 # Building Prototypes with Docker
 
-This document describes how to build imago prototypes using Docker from the
+This document describes how to build instar prototypes using Docker from the
 command line, without requiring VSCode or the devcontainer extension.
 
 ## Prerequisites
 
 - Docker installed and running
-- Access to the imago repository
+- Access to the instar repository
 
 ## Quick Start
 
@@ -14,7 +14,7 @@ Each prototype has a `.devcontainer/` directory with a Dockerfile. To build a
 prototype:
 
 ```bash
-cd /path/to/imago
+cd /path/to/instar
 
 # 1. Build the Docker image (one-time setup)
 docker build -t <prototype>-builder prototypes/<prototype>/.devcontainer/
@@ -31,7 +31,7 @@ docker run --rm \
 ## Example: Building virtio-block3
 
 ```bash
-cd /path/to/imago
+cd /path/to/instar
 
 # Build the Docker image
 docker build -t virtio-block3-builder prototypes/virtio-block3/.devcontainer/

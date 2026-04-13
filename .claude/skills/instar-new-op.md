@@ -1,11 +1,11 @@
-# /imago-new-op - Scaffold a New Imago Operation
+# /instar-new-op - Scaffold a New Instar Operation
 
-Create a new imago operation binary that runs inside the sandboxed VM.
+Create a new instar operation binary that runs inside the sandboxed VM.
 
 ## Usage
 
 ```
-/imago-new-op <operation-name> [description]
+/instar-new-op <operation-name> [description]
 ```
 
 ## What This Does
@@ -41,7 +41,7 @@ src/operations/<name>/
 name = "<name>"
 version = "0.1.0"
 edition = "2021"
-description = "<description or 'Imago <name> operation'>"
+description = "<description or 'Instar <name> operation'>"
 
 [dependencies]
 shared = { path = "../../shared" }
@@ -55,7 +55,7 @@ lto = true
 #### `src/operations/<name>/linker.ld`
 
 ```ld
-/* Linker script for imago operations */
+/* Linker script for instar operations */
 /* Operations are loaded at OPERATION_LOAD_ADDR (0x20000) */
 
 ENTRY(_start)
@@ -108,7 +108,7 @@ build-std-features = ["compiler-builtins-mem"]
 #### `src/operations/<name>/src/main.rs`
 
 ```rust
-//! Imago <name> operation.
+//! Instar <name> operation.
 //!
 //! <description>
 
@@ -251,7 +251,7 @@ unsafe { (ct.send_error)(op_name.as_ptr(), device.as_ptr(), sector, status_code)
 ## Example Invocations
 
 ```
-/imago-new-op checksum "Calculate checksums of disk images"
-/imago-new-op convert "Convert between disk image formats"
-/imago-new-op verify "Verify disk image integrity"
+/instar-new-op checksum "Calculate checksums of disk images"
+/instar-new-op convert "Convert between disk image formats"
+/instar-new-op verify "Verify disk image integrity"
 ```

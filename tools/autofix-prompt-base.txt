@@ -1,5 +1,5 @@
-You are fixing a crash found by automated fuzzing in the imago project.
-imago is a security-focused replacement for qemu-img that runs format
+You are fixing a crash found by automated fuzzing in the instar project.
+instar is a security-focused replacement for qemu-img that runs format
 parsing inside a KVM sandbox. Read AGENTS.md for project context.
 
 ## Important rules
@@ -8,8 +8,8 @@ parsing inside a KVM sandbox. Read AGENTS.md for project context.
 - Fix the ROOT CAUSE, not the symptom. Prefer returning None/false
   for invalid input over adding arbitrary limits or panicking.
 - Do NOT run cargo, docker, rustc, or rustfmt directly. Use Make
-  targets: `make imago` to build, `make test-container-core` to test.
-- Do NOT modify files in the imago-testdata directory.
+  targets: `make instar` to build, `make test-container-core` to test.
+- Do NOT modify files in the instar-testdata directory.
 - Do NOT add new crate dependencies or feature flags.
 - Keep changes minimal. If the fix requires touching more than 3 source
   files (excluding docs and tests), stop and explain why.

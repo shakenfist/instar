@@ -1,7 +1,7 @@
 # Backing Chain Discovery
 
-The `imago info --chain` command discovers and displays the complete backing
-file chain for disk images. This is an imago-specific feature that does not
+The `instar info --chain` command discovers and displays the complete backing
+file chain for disk images. This is an instar-specific feature that does not
 exist in `qemu-img`.
 
 ## Overview
@@ -21,7 +21,7 @@ top.qcow2 (overlay)
 
 ```bash
 # Discover and display the backing chain
-imago info --chain image.qcow2
+instar info --chain image.qcow2
 ```
 
 ### Example Output
@@ -66,7 +66,7 @@ as the input image are allowed.
 
 ```bash
 # This would fail if base.qcow2 tries to reference /etc/passwd
-imago info --chain malicious.qcow2
+instar info --chain malicious.qcow2
 # Error: Backing file '/etc/passwd' is outside allowed paths: ["/path/to/images"]
 ```
 
@@ -75,7 +75,7 @@ imago info --chain malicious.qcow2
 The allowlist can be configured via the config file:
 
 ```toml
-# ~/.config/imago/config
+# ~/.config/instar/config
 [security]
 # Directories allowed for backing file resolution
 # Special markers:
@@ -107,13 +107,13 @@ Error discovering backing chain: Circular reference detected: /path/to/A.qcow2
 
 ## How It Works
 
-Unlike host-side parsing approaches, imago's chain discovery maintains the
+Unlike host-side parsing approaches, instar's chain discovery maintains the
 security model by using the **sandboxed info operation** for all format parsing:
 
-1. Run `imago info` (inside KVM sandbox) on the top image
+1. Run `instar info` (inside KVM sandbox) on the top image
 2. Extract the backing file path from the result
 3. Validate the path against the security allowlist (on the host)
-4. If valid, run `imago info` on the backing file
+4. If valid, run `instar info` on the backing file
 5. Repeat until reaching an image with no backing file
 
 This ensures that all image header parsing happens inside the secure KVM
@@ -143,7 +143,7 @@ Chain discovery works with any format that supports backing files:
 3. **JSON output only for chain** - The `--backing-chain` flag requires
    `--output=json`
 
-Imago's `--chain` flag maintains security by parsing in the sandbox and
+Instar's `--chain` flag maintains security by parsing in the sandbox and
 validating paths before following them.
 
 ## Error Handling
@@ -160,19 +160,19 @@ validating paths before following them.
 
 The chain discovery infrastructure is used by the following operations:
 
-- **`imago info --chain`** - Discover and display the full backing chain
-- **`imago check --chain`** - Validate entire backing chains for consistency.
+- **`instar info --chain`** - Discover and display the full backing chain
+- **`instar check --chain`** - Validate entire backing chains for consistency.
   Each backing image is loaded as a separate virtio-block device in the KVM
   guest and checked for format consistency, non-zero virtual size, and QCOW2
   header integrity. Chain errors are reported separately from primary image
   errors.
-- **`imago compare`** - Automatically discovers backing chains for both images
+- **`instar compare`** - Automatically discovers backing chains for both images
   being compared. All chain images are loaded as separate virtio-block devices
   in the KVM guest. Unallocated QCOW2 clusters are resolved by walking the
   backing chain, so overlay images compare correctly against their flattened
   equivalents. Supports multi-level chains (e.g., top -> mid -> base) and
   chains on both sides of the comparison.
-- **`imago convert`** - Discovers backing chains for the input image and loads
+- **`instar convert`** - Discovers backing chains for the input image and loads
   all chain images as separate virtio-block devices for flattening. The guest
   walks the chain to resolve unallocated clusters, producing a standalone
   output image with no backing dependencies.

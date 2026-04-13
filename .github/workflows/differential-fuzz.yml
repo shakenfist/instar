@@ -68,11 +68,11 @@ jobs:
 
       - name: Remove previous devcontainers, if any
         run: |
-          docker image rm -f imago-build 2>/dev/null || true
+          docker image rm -f instar-build 2>/dev/null || true
 
-      - name: Build imago
+      - name: Build instar
         run: |
-          make imago
+          make instar
 
       - name: Install GitHub CLI on host
         run: |
@@ -143,7 +143,7 @@ jobs:
             FAIL_FAST_ARG="--fail-fast"
           fi
 
-          # The imago binary is built inside the Docker container
+          # The instar binary is built inside the Docker container
           # (nightly Rust, newer glibc) so it must also run inside
           # the container.  gh and qemu-utils are pre-installed in
           # the container image so the fuzzer can file issues and
@@ -159,10 +159,10 @@ jobs:
             -e WORKFLOW_URL="$WORKFLOW_URL" \
             -v "$(pwd):/workspace" \
             -w "/workspace" \
-            imago-build \
+            instar-build \
             bash -c "
               python3 /workspace/scripts/differential-fuzz.py \
-                --imago /workspace/src/target/release/imago \
+                --instar /workspace/src/target/release/instar \
                 --iterations $FUZZ_ITERATIONS \
                 --timeout $FUZZ_TIMEOUT \
                 --log-dir /workspace/fuzz-logs \

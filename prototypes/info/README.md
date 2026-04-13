@@ -8,7 +8,7 @@ the pluggable2 architecture. This prototype implements the equivalent of
 
 Image format auto-detection in `qemu-img` is considered unsafe because it
 exposes format-specific parsing code to potentially malicious inputs. However,
-imago's KVM sandbox architecture mitigates these risks by containing any
+instar's KVM sandbox architecture mitigates these risks by containing any
 parsing vulnerabilities within an isolated guest environment.
 
 See [docs/format-detection-safety.md](../../docs/format-detection-safety.md)
@@ -83,7 +83,7 @@ cd prototypes/info
 ./build.sh
 
 # Produces (all in target/release/):
-#   imago    - Safe, sandboxed disk image operations
+#   instar    - Safe, sandboxed disk image operations
 #   core.bin - Core guest binary
 #   info.bin - Info operation binary
 #   copy.bin - Copy operation binary
@@ -93,21 +93,21 @@ cd prototypes/info
 
 ```bash
 # Detect format of a disk image
-sudo ./target/release/imago info test.qcow2
+sudo ./target/release/instar info test.qcow2
 
 # With custom sector size
-sudo ./target/release/imago info --sector-size 4096 test.qcow2
+sudo ./target/release/instar info --sector-size 4096 test.qcow2
 
 # Copy a disk image
-sudo ./target/release/imago copy input.qcow2 output.raw
+sudo ./target/release/instar copy input.qcow2 output.raw
 
 # Copy with progress reporting every 5%
-sudo ./target/release/imago copy --progress-percent 5 input.qcow2 output.raw
+sudo ./target/release/instar copy --progress-percent 5 input.qcow2 output.raw
 
 # View help
-./target/release/imago --help
-./target/release/imago info --help
-./target/release/imago copy --help
+./target/release/instar --help
+./target/release/instar info --help
+./target/release/instar copy --help
 
 # Example info output:
 # Loaded core binary: 2048 bytes from /path/to/target/release/core.bin
@@ -121,18 +121,18 @@ sudo ./target/release/imago copy --progress-percent 5 input.qcow2 output.raw
 
 ## Command Line Interface
 
-The `imago` binary uses a qemu-img-compatible subcommand structure:
+The `instar` binary uses a qemu-img-compatible subcommand structure:
 
 ```
-imago info <INPUT>              Detect image format and display information
-imago copy <INPUT> <OUTPUT>     Copy/convert disk images
+instar info <INPUT>              Detect image format and display information
+instar copy <INPUT> <OUTPUT>     Copy/convert disk images
 ```
 
 ### Info Subcommand Options
 
 ```
 USAGE:
-    imago info [OPTIONS] <INPUT>
+    instar info [OPTIONS] <INPUT>
 
 ARGUMENTS:
     <INPUT>    Input image file
@@ -146,7 +146,7 @@ OPTIONS:
 
 ```
 USAGE:
-    imago copy [OPTIONS] <INPUT> <OUTPUT>
+    instar copy [OPTIONS] <INPUT> <OUTPUT>
 
 ARGUMENTS:
     <INPUT>     Input image file

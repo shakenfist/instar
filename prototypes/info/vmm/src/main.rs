@@ -323,7 +323,7 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
     format!("[{}] {}", level, payload_str)
 }
 
-/// Get the directory containing the imago executable
+/// Get the directory containing the instar executable
 fn get_binary_dir() -> std::path::PathBuf {
     std::env::current_exe()
         .expect("Failed to get executable path")
@@ -332,13 +332,13 @@ fn get_binary_dir() -> std::path::PathBuf {
         .to_path_buf()
 }
 
-/// Get the path to a binary in the same directory as imago
+/// Get the path to a binary in the same directory as instar
 fn get_binary_path(name: &str) -> std::path::PathBuf {
     get_binary_dir().join(name)
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "imago")]
+#[command(name = "instar")]
 #[command(about = "Safe, sandboxed disk image operations")]
 struct Cli {
     #[command(subcommand)]

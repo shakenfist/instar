@@ -1,4 +1,4 @@
-"""Base test class for imago integration tests."""
+"""Base test class for instar integration tests."""
 
 import hashlib
 import json
@@ -31,8 +31,8 @@ COMMAND_OUTPUT_DIRS = {
 }
 
 
-class ImagoTestBase(testtools.TestCase):
-    """Base class for imago integration tests."""
+class InstarTestBase(testtools.TestCase):
+    """Base class for instar integration tests."""
 
     # Class-level cache for manifest and images
     _manifest = None
@@ -61,17 +61,17 @@ class ImagoTestBase(testtools.TestCase):
             cls._manifest = json.load(f)
 
         # Resolve testdata root - can be overridden by environment variable
-        testdata_env = os.environ.get('IMAGO_TESTDATA_PATH')
+        testdata_env = os.environ.get('INSTAR_TESTDATA_PATH')
         if testdata_env:
             cls._testdata_root = Path(testdata_env)
         else:
-            cls._testdata_root = tests_dir.parent.parent / 'imago-testdata'
+            cls._testdata_root = tests_dir.parent.parent / 'instar-testdata'
 
         if not cls._testdata_root.exists():
             raise RuntimeError(
                 f'Test data directory not found: {cls._testdata_root}\n'
-                f'Set IMAGO_TESTDATA_PATH environment variable or ensure '
-                f'imago-testdata is a sibling directory.'
+                f'Set INSTAR_TESTDATA_PATH environment variable or ensure '
+                f'instar-testdata is a sibling directory.'
             )
 
         # Build lookup by image id
@@ -252,28 +252,28 @@ class ImagoTestBase(testtools.TestCase):
                 f'Image {image.id} has changed since baselines were captured.\n'
                 f'  Expected SHA256: {image.sha256}\n'
                 f'  Actual SHA256:   {actual_hash}\n'
-                f'Regenerate baselines in imago-testdata or update manifest hash.'
+                f'Regenerate baselines in instar-testdata or update manifest hash.'
             )
 
-    def get_imago_binary(self) -> Path:
-        """Get path to the imago binary."""
+    def get_instar_binary(self) -> Path:
+        """Get path to the instar binary."""
         # Can be overridden by environment variable
-        imago_env = os.environ.get('IMAGO_BINARY_PATH')
-        if imago_env:
-            return Path(imago_env)
+        instar_env = os.environ.get('INSTAR_BINARY_PATH')
+        if instar_env:
+            return Path(instar_env)
 
         # Default location relative to tests directory
         tests_dir = Path(__file__).parent
-        binary = tests_dir.parent / 'src' / 'target' / 'release' / 'imago'
+        binary = tests_dir.parent / 'src' / 'target' / 'release' / 'instar'
 
         if not binary.exists():
             self.skipTest(
-                f'imago binary not found at {binary}. Run "make imago" first.'
+                f'instar binary not found at {binary}. Run "make instar" first.'
             )
 
         return binary
 
-    def run_imago_info(
+    def run_instar_info(
         self,
         image_path: Path,
         timeout: int = 30,
@@ -283,7 +283,7 @@ class ImagoTestBase(testtools.TestCase):
         chain: bool = False,
     ) -> tuple:
         """
-        Run imago info on an image.
+        Run instar info on an image.
 
         Args:
             image_path: Path to the image file
@@ -299,9 +299,9 @@ class ImagoTestBase(testtools.TestCase):
         Returns:
             tuple: (stdout, stderr, return_code)
         """
-        imago = self.get_imago_binary()
+        instar = self.get_instar_binary()
 
-        cmd = [str(imago), 'info']
+        cmd = [str(instar), 'info']
         if chain:
             cmd.append('--chain')
         if qemu_version:
@@ -345,7 +345,7 @@ class ImagoTestBase(testtools.TestCase):
         except subprocess.TimeoutExpired:
             return '', 'Timeout after {}s'.format(timeout), -1
 
-    def run_imago_check(
+    def run_instar_check(
         self,
         image_path: Path,
         timeout: int = 30,
@@ -355,7 +355,7 @@ class ImagoTestBase(testtools.TestCase):
         chain: bool = False,
     ) -> tuple:
         """
-        Run imago check on an image.
+        Run instar check on an image.
 
         Args:
             image_path: Path to the image file
@@ -368,9 +368,9 @@ class ImagoTestBase(testtools.TestCase):
         Returns:
             tuple: (stdout, stderr, return_code)
         """
-        imago = self.get_imago_binary()
+        instar = self.get_instar_binary()
 
-        cmd = [str(imago), 'check']
+        cmd = [str(instar), 'check']
         if qemu_version:
             cmd.extend(['--qemu-version', qemu_version])
         if output_format:
@@ -425,7 +425,7 @@ class ImagoTestBase(testtools.TestCase):
         except subprocess.TimeoutExpired:
             return '', 'Timeout after {}s'.format(timeout), -1
 
-    def run_imago_compare(
+    def run_instar_compare(
         self,
         image1_path: Path,
         image2_path: Path,
@@ -436,7 +436,7 @@ class ImagoTestBase(testtools.TestCase):
         luks_passphrase: str = None,
     ) -> tuple:
         """
-        Run imago compare on two images.
+        Run instar compare on two images.
 
         Args:
             image1_path: Path to the first image file
@@ -450,9 +450,9 @@ class ImagoTestBase(testtools.TestCase):
         Returns:
             tuple: (stdout, stderr, return_code)
         """
-        imago = self.get_imago_binary()
+        instar = self.get_instar_binary()
 
-        cmd = [str(imago), 'compare']
+        cmd = [str(instar), 'compare']
         if output_format:
             cmd.extend(['--output', output_format])
         if strict:
@@ -509,7 +509,7 @@ class ImagoTestBase(testtools.TestCase):
         except subprocess.TimeoutExpired:
             return '', 'Timeout after {}s'.format(timeout), -1
 
-    def run_imago_convert(
+    def run_instar_convert(
         self,
         input_path: Path,
         output_path: Path,
@@ -528,7 +528,7 @@ class ImagoTestBase(testtools.TestCase):
         block_size: int = None,
     ) -> tuple:
         """
-        Run imago convert on an image.
+        Run instar convert on an image.
 
         Args:
             input_path: Path to the input image file
@@ -546,10 +546,10 @@ class ImagoTestBase(testtools.TestCase):
         Returns:
             tuple: (stdout, stderr, return_code)
         """
-        imago = self.get_imago_binary()
+        instar = self.get_instar_binary()
 
         cmd = [
-            str(imago), 'convert',
+            str(instar), 'convert',
             '-O', output_format,
         ]
         if skip_zeros is True:
@@ -626,7 +626,7 @@ class ImagoTestBase(testtools.TestCase):
                 suffix='.raw') as rt_raw, \
                 tempfile.NamedTemporaryFile(
                 suffix='.raw') as qemu_raw:
-            _, stderr, rc = self.run_imago_convert(
+            _, stderr, rc = self.run_instar_convert(
                 image.path, Path(fmt_out.name),
                 output_format=output_format,
                 compress=compress,
@@ -636,7 +636,7 @@ class ImagoTestBase(testtools.TestCase):
             )
             self.assertEqual(
                 rc, 0,
-                f'imago convert to {output_format} '
+                f'instar convert to {output_format} '
                 f'({size_label}) failed for '
                 f'{image_id}: {stderr}'
             )
@@ -660,7 +660,7 @@ class ImagoTestBase(testtools.TestCase):
             )
 
             _, rt_stderr, rt_rc = \
-                self.run_imago_convert(
+                self.run_instar_convert(
                     Path(fmt_out.name),
                     Path(rt_raw.name),
                     timeout=timeout
@@ -679,7 +679,7 @@ class ImagoTestBase(testtools.TestCase):
             self.assertEqual(q_rc, 0, q_stderr)
 
             cmp_out, _, cmp_rc = \
-                self.run_imago_compare(
+                self.run_instar_compare(
                     Path(rt_raw.name),
                     Path(qemu_raw.name),
                     timeout=timeout
@@ -693,7 +693,7 @@ class ImagoTestBase(testtools.TestCase):
         self, output_format, suffix, grain_size=None,
         block_size=None
     ):
-        """Assert that imago convert rejects invalid parameters."""
+        """Assert that instar convert rejects invalid parameters."""
         image = self.get_image('raw-mbr-partitioned')
         if not image.path.exists():
             self.skipTest(
@@ -702,7 +702,7 @@ class ImagoTestBase(testtools.TestCase):
 
         with tempfile.NamedTemporaryFile(
                 suffix=suffix) as out:
-            _, stderr, rc = self.run_imago_convert(
+            _, stderr, rc = self.run_instar_convert(
                 image.path, Path(out.name),
                 output_format=output_format,
                 grain_size=grain_size,
@@ -827,12 +827,12 @@ class ImagoTestBase(testtools.TestCase):
     def assert_outputs_match(
         self,
         image_id: str,
-        imago_output: str,
+        instar_output: str,
         expected_output: str,
         image_path: Optional[Path] = None
     ):
         """
-        Assert that imago output matches expected output exactly.
+        Assert that instar output matches expected output exactly.
 
         If image_path is provided, the actual disk size is looked up from the
         filesystem and substituted into the expected output. This ensures that
@@ -844,7 +844,7 @@ class ImagoTestBase(testtools.TestCase):
 
         Args:
             image_id: The test image identifier (for error messages)
-            imago_output: Output from running imago
+            instar_output: Output from running instar
             expected_output: Expected output (from baseline or qemu-img)
             image_path: Path to the image file (for disk size substitution)
         """
@@ -853,10 +853,10 @@ class ImagoTestBase(testtools.TestCase):
             disk_size = get_disk_size(str(image_path))
             expected_output = substitute_actual_size(expected_output, disk_size)
 
-        matched, diff_text = compare_outputs(imago_output, expected_output)
+        matched, diff_text = compare_outputs(instar_output, expected_output)
 
         if not matched:
             msg = format_failure_message(
-                image_id, imago_output, expected_output, diff_text
+                image_id, instar_output, expected_output, diff_text
             )
             self.fail(msg)

@@ -1,4 +1,4 @@
-# Imago Testing Discipline
+# Instar Testing Discipline
 
 ## Golden Rule
 
@@ -20,7 +20,7 @@ Before committing any changes, you MUST:
 Always establish a baseline before making changes:
 
 ```bash
-cd /srv/kasm_profiles/mikal/vscode/src/shakenfist/imago
+cd /srv/kasm_profiles/mikal/vscode/src/shakenfist/instar
 make test-ci 2>&1 | tail -20
 ```
 
@@ -32,7 +32,7 @@ Before committing, verify you haven't introduced regressions:
 
 ```bash
 # Rebuild with your changes
-make imago
+make instar
 
 # Run tests
 make test-ci 2>&1 | tail -20
@@ -52,7 +52,7 @@ If you suspect failures are pre-existing, verify by testing without your changes
 git stash
 
 # Rebuild clean
-make imago
+make instar
 
 # Test clean
 make test-ci 2>&1 | tail -20
@@ -95,7 +95,7 @@ Ran: 516 tests in 77.3567 sec.
 
 ## Test Data
 
-Tests compare `imago` output against baselines stored in `imago-testdata/`.
+Tests compare `instar` output against baselines stored in `instar-testdata/`.
 
 Key manifest properties:
 - `run_in_ci: false` - Excluded from CI tests
@@ -105,7 +105,7 @@ Key manifest properties:
 ## Important Notes
 
 - Tests run inside Docker (via Makefile) - don't run pytest directly
-- Test images are in sibling directory `imago-testdata/`
+- Test images are in sibling directory `instar-testdata/`
 - Some tests may fail due to missing test images - this is expected
 - VM crash messages in stderr don't indicate test failure (check exit code)
 
@@ -113,7 +113,7 @@ Key manifest properties:
 
 Before committing, verify:
 
-- [ ] `make imago` builds successfully
+- [ ] `make instar` builds successfully
 - [ ] `pre-commit run --all-files` passes
 - [ ] `make test-ci` shows same or fewer failures than baseline
 - [ ] Any new failures are understood and intentional

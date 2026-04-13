@@ -6,7 +6,7 @@ cryptsetup or root privileges. It creates the headers, derives key
 slots using PBKDF2 (v1) or Argon2id (v2), AFsplitter-encodes the
 master key, and encrypts known plaintext data using AES-XTS-plain64.
 
-The resulting images can be used to test imago's native LUKS decryption.
+The resulting images can be used to test instar's native LUKS decryption.
 
 Usage: python3 create-native-luks-testdata.py <output_dir>
 

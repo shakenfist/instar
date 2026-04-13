@@ -1,7 +1,7 @@
 """
-Adversarial image tests for imago.
+Adversarial image tests for instar.
 
-These tests verify that imago safely handles malicious and malformed images
+These tests verify that instar safely handles malicious and malformed images
 without crashing, hanging, or consuming excessive resources. Each test uses
 the run_adversarial() helper which enforces timeouts and memory limits.
 
@@ -11,17 +11,17 @@ See PLAN-adversarial-images.md for the full adversarial testing strategy.
 import tempfile
 from pathlib import Path
 
-from base import ImagoTestBase
+from base import InstarTestBase
 
 
-class TestAdversarialCompressionBomb(ImagoTestBase):
+class TestAdversarialCompressionBomb(InstarTestBase):
     """Verify compression bomb images are handled safely."""
 
 
     def test_info_compression_bomb_zlib(self):
         image = self.get_adversarial_image('qcow2-compression-bomb-zlib')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'info', str(image.path)],
+            [str(self.get_instar_binary()), 'info', str(image.path)],
             timeout=10
         )
         # info may succeed or fail — either is acceptable as long as
@@ -30,7 +30,7 @@ class TestAdversarialCompressionBomb(ImagoTestBase):
     def test_check_compression_bomb_zlib(self):
         image = self.get_adversarial_image('qcow2-compression-bomb-zlib')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', str(image.path)],
+            [str(self.get_instar_binary()), 'check', str(image.path)],
             timeout=30
         )
 
@@ -38,7 +38,7 @@ class TestAdversarialCompressionBomb(ImagoTestBase):
         image = self.get_adversarial_image('qcow2-compression-bomb-zlib')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
             self.run_adversarial(
-                [str(self.get_imago_binary()), 'convert',
+                [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=30
             )
@@ -52,14 +52,14 @@ class TestAdversarialCompressionBomb(ImagoTestBase):
     def test_info_compression_bomb_zstd(self):
         image = self.get_adversarial_image('qcow2-compression-bomb-zstd')
         _ = self.run_adversarial(
-            [str(self.get_imago_binary()), 'info', str(image.path)],
+            [str(self.get_instar_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_compression_bomb_zstd(self):
         image = self.get_adversarial_image('qcow2-compression-bomb-zstd')
         _ = self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', str(image.path)],
+            [str(self.get_instar_binary()), 'check', str(image.path)],
             timeout=30
         )
 
@@ -67,7 +67,7 @@ class TestAdversarialCompressionBomb(ImagoTestBase):
         image = self.get_adversarial_image('qcow2-compression-bomb-zstd')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
             _ = self.run_adversarial(
-                [str(self.get_imago_binary()), 'convert',
+                [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=30
             )
@@ -78,14 +78,14 @@ class TestAdversarialCompressionBomb(ImagoTestBase):
             )
 
 
-class TestAdversarialCircularChain(ImagoTestBase):
+class TestAdversarialCircularChain(InstarTestBase):
     """Verify circular backing chain images are detected and rejected."""
 
 
     def test_info_circular_2(self):
         image = self.get_adversarial_image('qcow2-circular-2')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'info', str(image.path)],
+            [str(self.get_instar_binary()), 'info', str(image.path)],
             timeout=10
         )
         # Info on the overlay itself should work (no chain traversal)
@@ -93,7 +93,7 @@ class TestAdversarialCircularChain(ImagoTestBase):
     def test_check_chain_circular_2(self):
         image = self.get_adversarial_image('qcow2-circular-2')
         _stdout, _stderr, rc = self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', '--chain',
+            [str(self.get_instar_binary()), 'check', '--chain',
              str(image.path)],
             timeout=10
         )
@@ -104,7 +104,7 @@ class TestAdversarialCircularChain(ImagoTestBase):
         image = self.get_adversarial_image('qcow2-circular-2')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
             _stdout, _stderr, rc = self.run_adversarial(
-                [str(self.get_imago_binary()), 'convert',
+                [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
             )
@@ -113,7 +113,7 @@ class TestAdversarialCircularChain(ImagoTestBase):
     def test_check_chain_circular_3(self):
         image = self.get_adversarial_image('qcow2-circular-3')
         _stdout, _stderr, rc = self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', '--chain',
+            [str(self.get_instar_binary()), 'check', '--chain',
              str(image.path)],
             timeout=10
         )
@@ -123,7 +123,7 @@ class TestAdversarialCircularChain(ImagoTestBase):
         image = self.get_adversarial_image('qcow2-circular-3')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
             _stdout, _stderr, rc = self.run_adversarial(
-                [str(self.get_imago_binary()), 'convert',
+                [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
             )
@@ -132,7 +132,7 @@ class TestAdversarialCircularChain(ImagoTestBase):
     def test_check_chain_self_referencing(self):
         image = self.get_adversarial_image('qcow2-self-referencing')
         stdout, stderr, rc = self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', '--chain',
+            [str(self.get_instar_binary()), 'check', '--chain',
              str(image.path)],
             timeout=10
         )
@@ -142,14 +142,14 @@ class TestAdversarialCircularChain(ImagoTestBase):
         image = self.get_adversarial_image('qcow2-self-referencing')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
             _stdout, _stderr, rc = self.run_adversarial(
-                [str(self.get_imago_binary()), 'convert',
+                [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
             )
             self.assertNotEqual(0, rc, 'Self-referencing chain should be rejected')
 
 
-class TestAdversarialDeepChain(ImagoTestBase):
+class TestAdversarialDeepChain(InstarTestBase):
     """Verify deep backing chains are handled correctly at the depth limit."""
 
 
@@ -162,7 +162,7 @@ class TestAdversarialDeepChain(ImagoTestBase):
         image = self.get_adversarial_image('qcow2-chain-depth-16')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
             stdout, stderr, rc = self.run_adversarial(
-                [str(self.get_imago_binary()), 'convert',
+                [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=30
             )
@@ -176,7 +176,7 @@ class TestAdversarialDeepChain(ImagoTestBase):
         image = self.get_adversarial_image('qcow2-chain-depth-17')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
             stdout, stderr, rc = self.run_adversarial(
-                [str(self.get_imago_binary()), 'convert',
+                [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
             )
@@ -188,7 +188,7 @@ class TestAdversarialDeepChain(ImagoTestBase):
     def test_check_chain_depth_16(self):
         image = self.get_adversarial_image('qcow2-chain-depth-16')
         stdout, stderr, rc = self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', '--chain',
+            [str(self.get_instar_binary()), 'check', '--chain',
              str(image.path)],
             timeout=30
         )
@@ -200,7 +200,7 @@ class TestAdversarialDeepChain(ImagoTestBase):
     def test_check_chain_depth_17(self):
         image = self.get_adversarial_image('qcow2-chain-depth-17')
         _stdout, _stderr, rc = self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', '--chain',
+            [str(self.get_instar_binary()), 'check', '--chain',
              str(image.path)],
             timeout=10
         )
@@ -210,35 +210,35 @@ class TestAdversarialDeepChain(ImagoTestBase):
         )
 
 
-class TestAdversarialIntegerOverflow(ImagoTestBase):
+class TestAdversarialIntegerOverflow(InstarTestBase):
     """Verify integer overflow triggers in header fields are handled safely."""
 
 
     def test_info_l1_overflow(self):
         image = self.get_adversarial_image('qcow2-l1-overflow')
         _, _, _ = self.run_adversarial(
-            [str(self.get_imago_binary()), 'info', str(image.path)],
+            [str(self.get_instar_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_l1_overflow(self):
         image = self.get_adversarial_image('qcow2-l1-overflow')
         _, _, _ = self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', str(image.path)],
+            [str(self.get_instar_binary()), 'check', str(image.path)],
             timeout=10
         )
 
     def test_info_l1_zero(self):
         image = self.get_adversarial_image('qcow2-l1-zero')
         _, _, _ = self.run_adversarial(
-            [str(self.get_imago_binary()), 'info', str(image.path)],
+            [str(self.get_instar_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_l1_zero(self):
         image = self.get_adversarial_image('qcow2-l1-zero')
         _, _, _ = self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', str(image.path)],
+            [str(self.get_instar_binary()), 'check', str(image.path)],
             timeout=10
         )
 
@@ -246,7 +246,7 @@ class TestAdversarialIntegerOverflow(ImagoTestBase):
         """Info reports header fields — no crash for cluster_bits=8 (below min 9)."""
         image = self.get_adversarial_image('qcow2-cluster-bits-low')
         _, _, _ = self.run_adversarial(
-            [str(self.get_imago_binary()), 'info', str(image.path)],
+            [str(self.get_instar_binary()), 'info', str(image.path)],
             timeout=10
         )
 
@@ -254,7 +254,7 @@ class TestAdversarialIntegerOverflow(ImagoTestBase):
         """Info reports header fields — no crash for cluster_bits=22 (above max 21)."""
         image = self.get_adversarial_image('qcow2-cluster-bits-high')
         _, _, _ = self.run_adversarial(
-            [str(self.get_imago_binary()), 'info', str(image.path)],
+            [str(self.get_instar_binary()), 'info', str(image.path)],
             timeout=10
         )
 
@@ -262,7 +262,7 @@ class TestAdversarialIntegerOverflow(ImagoTestBase):
         image = self.get_adversarial_image('qcow2-l1-overflow')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
             _, _, _ = self.run_adversarial(
-                [str(self.get_imago_binary()), 'convert',
+                [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
             )
@@ -271,47 +271,47 @@ class TestAdversarialIntegerOverflow(ImagoTestBase):
         image = self.get_adversarial_image('qcow2-cluster-bits-low')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
             _, _, rc = self.run_adversarial(
-                [str(self.get_imago_binary()), 'convert',
+                [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
             )
             self.assertNotEqual(0, rc, 'cluster_bits=8 should be rejected')
 
 
-class TestAdversarialRefcountOrder(ImagoTestBase):
+class TestAdversarialRefcountOrder(InstarTestBase):
     """Verify refcount_order edge cases are handled safely."""
 
 
     def test_info_refcount_order_7(self):
         image = self.get_adversarial_image('qcow2-refcount-order-7')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'info', str(image.path)],
+            [str(self.get_instar_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_refcount_order_7(self):
         image = self.get_adversarial_image('qcow2-refcount-order-7')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', str(image.path)],
+            [str(self.get_instar_binary()), 'check', str(image.path)],
             timeout=10
         )
 
     def test_info_refcount_order_255(self):
         image = self.get_adversarial_image('qcow2-refcount-order-255')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'info', str(image.path)],
+            [str(self.get_instar_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_refcount_order_255(self):
         image = self.get_adversarial_image('qcow2-refcount-order-255')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', str(image.path)],
+            [str(self.get_instar_binary()), 'check', str(image.path)],
             timeout=10
         )
 
 
-class TestAdversarialOversizedVsize(ImagoTestBase):
+class TestAdversarialOversizedVsize(InstarTestBase):
     """Verify oversized virtual size values are handled safely."""
 
 
@@ -319,19 +319,19 @@ class TestAdversarialOversizedVsize(ImagoTestBase):
         """Info should report the petabyte size without crashing."""
         image = self.get_adversarial_image('qcow2-vsize-petabyte')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'info', str(image.path)],
+            [str(self.get_instar_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_vsize_petabyte(self):
         image = self.get_adversarial_image('qcow2-vsize-petabyte')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', str(image.path)],
+            [str(self.get_instar_binary()), 'check', str(image.path)],
             timeout=30
         )
 
     # NOTE: convert with petabyte vsize is intentionally not tested here.
-    # Imago iterates the full virtual address space during conversion,
+    # Instar iterates the full virtual address space during conversion,
     # so a 1PB vsize would take unreasonably long. This is a known
     # resource exhaustion vector via oversized virtual size — tracked
     # as a potential future improvement (early termination when all
@@ -340,85 +340,85 @@ class TestAdversarialOversizedVsize(ImagoTestBase):
     def test_info_vsize_max(self):
         image = self.get_adversarial_image('qcow2-vsize-max')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'info', str(image.path)],
+            [str(self.get_instar_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_vsize_max(self):
         image = self.get_adversarial_image('qcow2-vsize-max')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', str(image.path)],
+            [str(self.get_instar_binary()), 'check', str(image.path)],
             timeout=30
         )
 
 
-class TestAdversarialVmdkGrainSize(ImagoTestBase):
+class TestAdversarialVmdkGrainSize(InstarTestBase):
     """Verify VMDK grain size boundary values are handled safely."""
 
 
     def test_info_grain_size_zero(self):
         image = self.get_adversarial_image('vmdk-grain-size-zero')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'info', str(image.path)],
+            [str(self.get_instar_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_grain_size_zero(self):
         image = self.get_adversarial_image('vmdk-grain-size-zero')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', str(image.path)],
+            [str(self.get_instar_binary()), 'check', str(image.path)],
             timeout=10
         )
 
     def test_info_grain_size_huge(self):
         image = self.get_adversarial_image('vmdk-grain-size-huge')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'info', str(image.path)],
+            [str(self.get_instar_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_grain_size_huge(self):
         image = self.get_adversarial_image('vmdk-grain-size-huge')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', str(image.path)],
+            [str(self.get_instar_binary()), 'check', str(image.path)],
             timeout=10
         )
 
 
-class TestAdversarialVhdxConflictingHeaders(ImagoTestBase):
+class TestAdversarialVhdxConflictingHeaders(InstarTestBase):
     """Verify VHDX with conflicting dual headers is handled correctly."""
 
 
     def test_info_conflicting_headers(self):
         image = self.get_adversarial_image('vhdx-conflicting-headers')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'info', str(image.path)],
+            [str(self.get_instar_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_conflicting_headers(self):
         image = self.get_adversarial_image('vhdx-conflicting-headers')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', str(image.path)],
+            [str(self.get_instar_binary()), 'check', str(image.path)],
             timeout=10
         )
 
 
-class TestAdversarialBatBeyondEof(ImagoTestBase):
+class TestAdversarialBatBeyondEof(InstarTestBase):
     """Verify BAT entries beyond EOF are handled safely."""
 
 
     def test_info_vhd_bat_beyond_eof(self):
         image = self.get_adversarial_image('vhd-bat-beyond-eof')
         _ = self.run_adversarial(
-            [str(self.get_imago_binary()), 'info', str(image.path)],
+            [str(self.get_instar_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_vhd_bat_beyond_eof(self):
         image = self.get_adversarial_image('vhd-bat-beyond-eof')
         _ = self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', str(image.path)],
+            [str(self.get_instar_binary()), 'check', str(image.path)],
             timeout=10
         )
 
@@ -426,7 +426,7 @@ class TestAdversarialBatBeyondEof(ImagoTestBase):
         image = self.get_adversarial_image('vhd-bat-beyond-eof')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
             self.run_adversarial(
-                [str(self.get_imago_binary()), 'convert',
+                [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
             )
@@ -434,14 +434,14 @@ class TestAdversarialBatBeyondEof(ImagoTestBase):
     def test_info_vhdx_bat_beyond_eof(self):
         image = self.get_adversarial_image('vhdx-bat-beyond-eof')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'info', str(image.path)],
+            [str(self.get_instar_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_vhdx_bat_beyond_eof(self):
         image = self.get_adversarial_image('vhdx-bat-beyond-eof')
         _ = self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', str(image.path)],
+            [str(self.get_instar_binary()), 'check', str(image.path)],
             timeout=10
         )
 
@@ -449,13 +449,13 @@ class TestAdversarialBatBeyondEof(ImagoTestBase):
         image = self.get_adversarial_image('vhdx-bat-beyond-eof')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
             self.run_adversarial(
-                [str(self.get_imago_binary()), 'convert',
+                [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
             )
 
 
-class TestAdversarialPolyglot(ImagoTestBase):
+class TestAdversarialPolyglot(InstarTestBase):
     """Verify polyglot files are handled safely.
 
     These files have valid magic bytes for one format but body content
@@ -468,14 +468,14 @@ class TestAdversarialPolyglot(ImagoTestBase):
         """QCOW2 magic with VMDK descriptor body — info should detect as QCOW2."""
         image = self.get_adversarial_image('polyglot-qcow2-vmdk')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'info', str(image.path)],
+            [str(self.get_instar_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_polyglot_qcow2_vmdk(self):
         image = self.get_adversarial_image('polyglot-qcow2-vmdk')
         _ = self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', str(image.path)],
+            [str(self.get_instar_binary()), 'check', str(image.path)],
             timeout=10
         )
 
@@ -483,7 +483,7 @@ class TestAdversarialPolyglot(ImagoTestBase):
         image = self.get_adversarial_image('polyglot-qcow2-vmdk')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
             _, stderr, rc = self.run_adversarial(
-                [str(self.get_imago_binary()), 'convert',
+                [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
             )
@@ -492,14 +492,14 @@ class TestAdversarialPolyglot(ImagoTestBase):
         """QCOW2 magic with ELF binary body — info should detect as QCOW2."""
         image = self.get_adversarial_image('polyglot-qcow2-elf')
         _ = self.run_adversarial(
-            [str(self.get_imago_binary()), 'info', str(image.path)],
+            [str(self.get_instar_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_polyglot_qcow2_elf(self):
         image = self.get_adversarial_image('polyglot-qcow2-elf')
         _, _, _ = self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', str(image.path)],
+            [str(self.get_instar_binary()), 'check', str(image.path)],
             timeout=10
         )
 
@@ -507,13 +507,13 @@ class TestAdversarialPolyglot(ImagoTestBase):
         image = self.get_adversarial_image('polyglot-qcow2-elf')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
             _ = self.run_adversarial(
-                [str(self.get_imago_binary()), 'convert',
+                [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
             )
 
 
-class TestAdversarialTruncatedHeader(ImagoTestBase):
+class TestAdversarialTruncatedHeader(InstarTestBase):
     """Verify truncated format headers fail gracefully.
 
     These files have valid magic bytes but are truncated mid-field,
@@ -525,14 +525,14 @@ class TestAdversarialTruncatedHeader(ImagoTestBase):
     def test_info_truncated_qcow2(self):
         image = self.get_adversarial_image('qcow2-truncated-header-v2')
         _ = self.run_adversarial(
-            [str(self.get_imago_binary()), 'info', str(image.path)],
+            [str(self.get_instar_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_truncated_qcow2(self):
         image = self.get_adversarial_image('qcow2-truncated-header-v2')
         _ = self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', str(image.path)],
+            [str(self.get_instar_binary()), 'check', str(image.path)],
             timeout=10
         )
 
@@ -540,7 +540,7 @@ class TestAdversarialTruncatedHeader(ImagoTestBase):
         image = self.get_adversarial_image('qcow2-truncated-header-v2')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
             self.run_adversarial(
-                [str(self.get_imago_binary()), 'convert',
+                [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
             )
@@ -548,14 +548,14 @@ class TestAdversarialTruncatedHeader(ImagoTestBase):
     def test_info_truncated_vmdk(self):
         image = self.get_adversarial_image('vmdk-truncated-after-magic')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'info', str(image.path)],
+            [str(self.get_instar_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_truncated_vmdk(self):
         image = self.get_adversarial_image('vmdk-truncated-after-magic')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', str(image.path)],
+            [str(self.get_instar_binary()), 'check', str(image.path)],
             timeout=10
         )
 
@@ -563,7 +563,7 @@ class TestAdversarialTruncatedHeader(ImagoTestBase):
         image = self.get_adversarial_image('vmdk-truncated-after-magic')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
             self.run_adversarial(
-                [str(self.get_imago_binary()), 'convert',
+                [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
             )
@@ -571,14 +571,14 @@ class TestAdversarialTruncatedHeader(ImagoTestBase):
     def test_info_truncated_vhd(self):
         image = self.get_adversarial_image('vhd-truncated-footer')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'info', str(image.path)],
+            [str(self.get_instar_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_truncated_vhd(self):
         image = self.get_adversarial_image('vhd-truncated-footer')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', str(image.path)],
+            [str(self.get_instar_binary()), 'check', str(image.path)],
             timeout=10
         )
 
@@ -586,13 +586,13 @@ class TestAdversarialTruncatedHeader(ImagoTestBase):
         image = self.get_adversarial_image('vhd-truncated-footer')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
             self.run_adversarial(
-                [str(self.get_imago_binary()), 'convert',
+                [str(self.get_instar_binary()), 'convert',
                  str(image.path), out.name],
                 timeout=10
             )
 
 
-class TestAdversarialVmdkDescriptor(ImagoTestBase):
+class TestAdversarialVmdkDescriptor(InstarTestBase):
     """Verify VMDK descriptor attacks are handled safely.
 
     These test the VMDK descriptor parser with adversarial input:
@@ -603,21 +603,21 @@ class TestAdversarialVmdkDescriptor(ImagoTestBase):
     def test_info_descriptor_null_bytes(self):
         image = self.get_adversarial_image('vmdk-descriptor-null-bytes')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'info', str(image.path)],
+            [str(self.get_instar_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_descriptor_null_bytes(self):
         image = self.get_adversarial_image('vmdk-descriptor-null-bytes')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', str(image.path)],
+            [str(self.get_instar_binary()), 'check', str(image.path)],
             timeout=10
         )
 
     def test_info_descriptor_multi_extent(self):
         image = self.get_adversarial_image('vmdk-descriptor-multi-extent')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'info', str(image.path)],
+            [str(self.get_instar_binary()), 'info', str(image.path)],
             timeout=10
         )
 
@@ -630,20 +630,20 @@ class TestAdversarialVmdkDescriptor(ImagoTestBase):
         """
         image = self.get_adversarial_image('vmdk-descriptor-multi-extent')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', str(image.path)],
+            [str(self.get_instar_binary()), 'check', str(image.path)],
             timeout=10
         )
 
     def test_info_descriptor_huge(self):
         image = self.get_adversarial_image('vmdk-descriptor-huge')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'info', str(image.path)],
+            [str(self.get_instar_binary()), 'info', str(image.path)],
             timeout=10
         )
 
     def test_check_descriptor_huge(self):
         image = self.get_adversarial_image('vmdk-descriptor-huge')
         self.run_adversarial(
-            [str(self.get_imago_binary()), 'check', str(image.path)],
+            [str(self.get_instar_binary()), 'check', str(image.path)],
             timeout=10
         )
