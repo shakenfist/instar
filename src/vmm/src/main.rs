@@ -46,8 +46,9 @@ use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use backing::BackingStore;
 use chain::{
-    check_chain_depth, check_circular_reference, validate_backing_path, BackingChain, ChainError,
-    ChainImage, ImageFormat, InfoOperationResult,
+    check_chain_depth, check_circular_reference, peek_is_vmdk_descriptor,
+    resolve_vmdk_flat_descriptor, validate_backing_path, BackingChain, ChainError, ChainImage,
+    ImageFormat, InfoOperationResult,
 };
 use io_thread::{DeviceRole, IoDevice};
 use ioevent::IoEvent;
@@ -1656,6 +1657,37 @@ fn discover_backing_chain(
 
         seen_paths.push(current.clone());
 
+        // VMDK monolithicFlat descriptor short-circuit: a descriptor
+        // is pure ASCII text (no binary magic) so the guest info
+        // operation has no meaningful parse path for it. Detect it
+        // on the host, resolve the flat extent file against the
+        // backing allowlist, and construct the chain entry directly.
+        // monolithicFlat-with-parent is explicitly out of scope, so
+        // a descriptor is always a terminal chain node.
+        if peek_is_vmdk_descriptor(&current).unwrap_or(false) {
+            let resolved = resolve_vmdk_flat_descriptor(&current, security_config)?;
+            debug!(
+                "VMDK descriptor resolved: {} -> flat {} ({} bytes virtual)",
+                current.display(),
+                resolved.flat_path.display(),
+                resolved.virtual_size
+            );
+
+            let descriptor_file_size = std::fs::metadata(&current).map(|m| m.len()).unwrap_or(0);
+
+            chain.push(ChainImage {
+                path: current.clone(),
+                format: ImageFormat::VmdkDescriptor,
+                virtual_size: resolved.virtual_size,
+                actual_size: descriptor_file_size,
+                cluster_size: 0,
+                backing_file_raw: None,
+                flags: 0,
+            });
+            chain.external_data_file = Some(resolved.flat_path);
+            break;
+        }
+
         // Run the sandboxed info operation
         // Always use secure mode (unsafe_quirks=false) for backing chain discovery
         let info_result = execute_info_operation(&current, sector_size, false)
@@ -3253,9 +3285,17 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
         operation_path.display()
     );
 
-    // Handle --chain flag: discover backing chain before launching guest
-    let chain = if args.chain {
-        let input_path = Path::new(&args.input);
+    // Handle --chain flag: discover backing chain before launching guest.
+    //
+    // Chain discovery is also forced when the top input is a VMDK
+    // monolithicFlat descriptor: that format inherently needs two
+    // devices (descriptor + flat extent) so the single-device fast
+    // path below can't represent it. The chain machinery then
+    // treats the descriptor as a terminal chain node with an
+    // external data file pointing at the flat extent.
+    let input_path = Path::new(&args.input);
+    let force_chain_for_descriptor = peek_is_vmdk_descriptor(input_path).unwrap_or(false);
+    let chain = if args.chain || force_chain_for_descriptor {
         let security_config = config::load_config().config.security;
         match discover_backing_chain(input_path, args.sector_size, &security_config) {
             Ok(chain) => {

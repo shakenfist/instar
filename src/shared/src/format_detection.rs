@@ -27,6 +27,12 @@ pub const VHDX_SIGNATURE: u64 = 0x656c696678646876;
 pub const VDI_SIGNATURE_OFFSET: usize = 64;
 /// LUKS magic: "LUKS\xba\xbe" (6 bytes at offset 0)
 pub const LUKS_MAGIC: [u8; 6] = [0x4c, 0x55, 0x4b, 0x53, 0xba, 0xbe];
+/// VMDK text descriptor leading comment. A monolithicFlat VMDK has
+/// a descriptor file (distinct from the flat extent file) whose
+/// first line is exactly this string — no binary magic. Detection
+/// is strict on this prefix so random text files can't be
+/// misidentified.
+pub const VMDK_DESCRIPTOR_MAGIC: &[u8] = b"# Disk DescriptorFile";
 
 // ISO 9660 format constants
 /// ISO 9660 Primary Volume Descriptor byte offset (sector 16 for 2048-byte CD sectors)
@@ -119,6 +125,16 @@ pub fn detect_format_from_header(buffer: &[u8], len: usize, _extra_detail: bool)
         return ImageFormat::Luks;
     }
 
+    // Check for a VMDK text descriptor (monolithicFlat and related
+    // two-file formats). Done after every binary magic check so
+    // real VMDK4 sparse files (which begin with KDMV) are never
+    // misclassified.
+    if len >= VMDK_DESCRIPTOR_MAGIC.len()
+        && &buffer[..VMDK_DESCRIPTOR_MAGIC.len()] == VMDK_DESCRIPTOR_MAGIC
+    {
+        return ImageFormat::VmdkDescriptor;
+    }
+
     // Fixed VHD has its signature only at the end, handled separately by caller
     // If no known format detected from header, assume raw (may be overridden)
     ImageFormat::Raw
@@ -171,4 +187,39 @@ pub fn detect_iso_at_offset(buffer: &[u8], offset: usize) -> ImageFormat {
         return ImageFormat::Iso;
     }
     ImageFormat::Raw
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_vmdk_descriptor_magic() {
+        let desc = b"# Disk DescriptorFile\nversion=1\nCID=abcd\n";
+        assert_eq!(
+            detect_format_from_header(desc, desc.len(), false),
+            ImageFormat::VmdkDescriptor
+        );
+    }
+
+    #[test]
+    fn does_not_misidentify_random_comment_file() {
+        let junk = b"# Some random text file\nfoo bar\n";
+        // Leading '#' isn't enough; the full descriptor prefix must match.
+        assert_eq!(
+            detect_format_from_header(junk, junk.len(), false),
+            ImageFormat::Raw
+        );
+    }
+
+    #[test]
+    fn vmdk_sparse_binary_still_detected_as_vmdk4() {
+        // KDMV magic at offset 0 (little-endian).
+        let mut buf = [0u8; 16];
+        buf[0..4].copy_from_slice(&VMDK4_MAGIC.to_le_bytes());
+        assert_eq!(
+            detect_format_from_header(&buf, buf.len(), false),
+            ImageFormat::Vmdk4
+        );
+    }
 }

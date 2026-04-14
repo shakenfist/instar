@@ -1083,6 +1083,11 @@ pub enum ImageFormat {
     Iso = 10,
     /// LUKS format (Linux encrypted container, magic: "LUKS\xba\xbe" at offset 0)
     Luks = 11,
+    /// VMDK monolithicFlat descriptor file (text, starts with
+    /// "# Disk DescriptorFile"). The descriptor itself holds no
+    /// content; content lives in a separate flat extent file
+    /// pointed to from the descriptor's extent line.
+    VmdkDescriptor = 12,
 }
 
 impl ImageFormat {
@@ -1100,6 +1105,7 @@ impl ImageFormat {
             9 => ImageFormat::Qed,
             10 => ImageFormat::Iso,
             11 => ImageFormat::Luks,
+            12 => ImageFormat::VmdkDescriptor,
             _ => ImageFormat::Unknown,
         }
     }
@@ -1119,6 +1125,10 @@ impl ImageFormat {
             ImageFormat::Qed => "qed",
             ImageFormat::Iso => "iso",
             ImageFormat::Luks => "luks",
+            // Reports as "vmdk" to match qemu-img info output for
+            // monolithicFlat — the user sees the container format,
+            // not the descriptor/flat split.
+            ImageFormat::VmdkDescriptor => "vmdk",
         }
     }
 }

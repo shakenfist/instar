@@ -474,6 +474,11 @@ fn format_to_str(format: ImageFormat) -> *const u8 {
         ImageFormat::Qed => b"qed\0".as_ptr(),
         ImageFormat::Iso => b"iso\0".as_ptr(),
         ImageFormat::Luks => b"luks\0".as_ptr(),
+        // VMDK monolithicFlat descriptor — reported as "vmdk" to
+        // match qemu-img info output. Full descriptor-specific
+        // info reporting (createType, extent filename) is handled
+        // in Phase 22c.
+        ImageFormat::VmdkDescriptor => b"vmdk\0".as_ptr(),
     }
 }
 

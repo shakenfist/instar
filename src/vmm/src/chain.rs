@@ -17,6 +17,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::config::{get_backing_allowlist, get_max_chain_depth, SecurityConfig};
+use shared::format_detection::VMDK_DESCRIPTOR_MAGIC;
 
 /// Image format detected by the sandboxed info operation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +38,9 @@ pub enum ImageFormat {
     Vhdx,
     /// LUKS encrypted container
     Luks,
+    /// VMDK monolithicFlat descriptor file (text, points to a
+    /// separate flat extent file that holds the actual content).
+    VmdkDescriptor,
     /// Unknown or unsupported format
     Unknown,
 }
@@ -78,6 +82,7 @@ impl ImageFormat {
             ImageFormat::Vhdx => 6,
             ImageFormat::Qcow1 => 7,
             ImageFormat::Luks => 11,
+            ImageFormat::VmdkDescriptor => 12,
         }
     }
 }
@@ -93,6 +98,10 @@ impl std::fmt::Display for ImageFormat {
             ImageFormat::Vhd => write!(f, "vpc"),
             ImageFormat::Vhdx => write!(f, "vhdx"),
             ImageFormat::Luks => write!(f, "luks"),
+            // Reports as "vmdk" to match qemu-img info output for
+            // monolithicFlat — matches the `name()` method on
+            // `shared::ImageFormat::VmdkDescriptor`.
+            ImageFormat::VmdkDescriptor => write!(f, "vmdk"),
             ImageFormat::Unknown => write!(f, "unknown"),
         }
     }
@@ -401,6 +410,148 @@ pub fn validate_backing_path(
     Ok(resolved)
 }
 
+/// Maximum bytes of descriptor text the VMM will read from disk
+/// when resolving a VMDK monolithicFlat descriptor. qemu-img emits
+/// descriptors well under 4 KB; capping small keeps the host-side
+/// parse cheap and bounds the memory taken by an untrusted file.
+pub const MAX_DESCRIPTOR_BYTES: usize = 8192;
+
+/// Result of resolving a VMDK monolithicFlat descriptor on the host.
+#[derive(Debug, Clone)]
+pub struct ResolvedVmdkDescriptor {
+    /// Absolute, allowlist-validated path to the flat extent file.
+    pub flat_path: PathBuf,
+    /// Virtual size in bytes (extent `size_sectors` × 512).
+    pub virtual_size: u64,
+}
+
+/// Read a VMDK monolithicFlat descriptor, validate it, and resolve
+/// its flat extent file against the backing-file allowlist.
+///
+/// The descriptor file is at `descriptor_path`. This function:
+/// - Reads up to [`MAX_DESCRIPTOR_BYTES`] of descriptor text.
+/// - Rejects descriptors with `parentFileNameHint=` (monolithicFlat
+///   with a backing parent is out of scope for Phase 22).
+/// - Parses the descriptor's extent lines.
+/// - Requires exactly one extent of kind `FLAT` with a non-empty
+///   filename and `offset_sectors == 0`. Anything else (multi-extent
+///   twoGbMaxExtentFlat, non-zero offset, sparse subformat mixed in)
+///   is rejected with a clear error so the caller can fall through
+///   to the "known gap" story.
+/// - Resolves the extent filename relative to the descriptor's
+///   directory and runs it through `validate_backing_path()`.
+///
+/// Returns the resolved flat path and virtual size on success.
+pub fn resolve_vmdk_flat_descriptor(
+    descriptor_path: &Path,
+    security_config: &SecurityConfig,
+) -> Result<ResolvedVmdkDescriptor, ChainError> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(descriptor_path)?;
+    let mut buf = [0u8; MAX_DESCRIPTOR_BYTES];
+    let n = file.read(&mut buf)?;
+    let text = core::str::from_utf8(&buf[..n]).map_err(|e| {
+        ChainError::PathResolutionError(format!(
+            "VMDK descriptor '{}' is not valid UTF-8: {}",
+            descriptor_path.display(),
+            e
+        ))
+    })?;
+
+    // Reject backing-parent hint outright. The Phase 22 mission
+    // explicitly scopes out monolithicFlat-with-parent; silently
+    // ignoring the hint would drop the parent from the chain and
+    // produce subtly wrong content.
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("parentFileNameHint=") {
+            return Err(ChainError::PathResolutionError(format!(
+                "VMDK descriptor '{}' has a parent hint (parentFileNameHint); \
+                 monolithicFlat with a backing parent is not yet supported",
+                descriptor_path.display()
+            )));
+        }
+    }
+
+    let extents = vmdk::parse_descriptor_extents(text).map_err(|e| {
+        ChainError::PathResolutionError(format!(
+            "VMDK descriptor '{}' has malformed extent lines: {:?}",
+            descriptor_path.display(),
+            e
+        ))
+    })?;
+
+    if extents.len() != 1 {
+        return Err(ChainError::PathResolutionError(format!(
+            "VMDK descriptor '{}' has {} extents; only single-extent \
+             monolithicFlat is supported (twoGbMaxExtentFlat is a \
+             known gap)",
+            descriptor_path.display(),
+            extents.len()
+        )));
+    }
+
+    let extent = extents.get(0).expect("len==1 checked above");
+
+    if extent.kind != vmdk::ExtentKind::Flat {
+        return Err(ChainError::PathResolutionError(format!(
+            "VMDK descriptor '{}' has a non-FLAT extent; only \
+             monolithicFlat is supported here",
+            descriptor_path.display()
+        )));
+    }
+
+    if extent.offset_sectors != 0 {
+        return Err(ChainError::PathResolutionError(format!(
+            "VMDK descriptor '{}' has a FLAT extent with non-zero \
+             offset ({} sectors); only offset-0 extents are \
+             supported",
+            descriptor_path.display(),
+            extent.offset_sectors
+        )));
+    }
+
+    if extent.filename.is_empty() {
+        return Err(ChainError::PathResolutionError(format!(
+            "VMDK descriptor '{}' has a FLAT extent with no filename",
+            descriptor_path.display()
+        )));
+    }
+
+    // Resolve the extent filename against the descriptor's directory
+    // and run it through the backing-file allowlist. This is the
+    // same security surface as a QCOW2 backing file pointer — the
+    // filename is untrusted data from an external file.
+    let flat_path = validate_backing_path(descriptor_path, extent.filename, security_config)?;
+
+    let virtual_size = extent.size_sectors.checked_mul(512).ok_or_else(|| {
+        ChainError::PathResolutionError(format!(
+            "VMDK descriptor '{}' extent size overflows u64",
+            descriptor_path.display()
+        ))
+    })?;
+
+    Ok(ResolvedVmdkDescriptor {
+        flat_path,
+        virtual_size,
+    })
+}
+
+/// Peek at `path` and return true if its first bytes match a VMDK
+/// descriptor prefix. Returns Ok(false) on short files or files the
+/// VMM can't open; callers should treat that as "not a descriptor"
+/// and proceed to existing format detection.
+pub fn peek_is_vmdk_descriptor(path: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = [0u8; 64];
+    let n = file.read(&mut buf)?;
+    Ok(n >= VMDK_DESCRIPTOR_MAGIC.len()
+        && &buf[..VMDK_DESCRIPTOR_MAGIC.len()] == VMDK_DESCRIPTOR_MAGIC)
+}
+
 /// Check chain depth and return error if exceeded.
 pub fn check_chain_depth(
     current_depth: usize,
@@ -624,6 +775,195 @@ mod tests {
             check_circular_reference(&path1, &seen),
             Err(ChainError::CircularReference(_))
         ));
+    }
+
+    // ====================================================================
+    // VMDK monolithicFlat descriptor resolution tests
+    // ====================================================================
+
+    fn make_flat_descriptor(filename: &str, size_sectors: u64) -> String {
+        format!(
+            "# Disk DescriptorFile\n\
+             version=1\n\
+             CID=abcdef01\n\
+             parentCID=ffffffff\n\
+             createType=\"monolithicFlat\"\n\
+             \n\
+             # Extent description\n\
+             RW {} FLAT \"{}\" 0\n\
+             \n\
+             # Disk Data Base\n\
+             ddb.adapterType = \"ide\"\n",
+            size_sectors, filename
+        )
+    }
+
+    /// Returns a SecurityConfig that treats the image's own directory
+    /// as the only allowed backing location. This matches the
+    /// default $IMAGE_DIR allowlist and keeps tests self-contained.
+    fn default_security_config() -> SecurityConfig {
+        SecurityConfig::default()
+    }
+
+    #[test]
+    fn peek_is_vmdk_descriptor_detects_descriptor() {
+        let tmp = TempDir::new().unwrap();
+        let desc = tmp.path().join("foo.vmdk");
+        std::fs::write(&desc, make_flat_descriptor("foo-flat.vmdk", 1024)).unwrap();
+
+        assert!(peek_is_vmdk_descriptor(&desc).unwrap());
+    }
+
+    #[test]
+    fn peek_is_vmdk_descriptor_rejects_random_file() {
+        let tmp = TempDir::new().unwrap();
+        let raw = tmp.path().join("foo.raw");
+        std::fs::write(&raw, b"random binary content goes here").unwrap();
+
+        assert!(!peek_is_vmdk_descriptor(&raw).unwrap());
+    }
+
+    #[test]
+    fn resolve_descriptor_happy_path() {
+        let tmp = TempDir::new().unwrap();
+        let desc = tmp.path().join("foo.vmdk");
+        let flat = tmp.path().join("foo-flat.vmdk");
+        std::fs::write(&desc, make_flat_descriptor("foo-flat.vmdk", 20971520)).unwrap();
+        std::fs::write(&flat, vec![0u8; 512]).unwrap();
+
+        let cfg = default_security_config();
+        let resolved = resolve_vmdk_flat_descriptor(&desc, &cfg).unwrap();
+
+        assert_eq!(resolved.virtual_size, 20971520 * 512);
+        assert_eq!(resolved.flat_path, flat.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_descriptor_rejects_parent_hint() {
+        let tmp = TempDir::new().unwrap();
+        let desc = tmp.path().join("foo.vmdk");
+        let flat = tmp.path().join("foo-flat.vmdk");
+        let text = format!(
+            "# Disk DescriptorFile\n\
+             version=1\n\
+             CID=1\n\
+             parentCID=2\n\
+             createType=\"monolithicFlat\"\n\
+             parentFileNameHint=\"parent.vmdk\"\n\
+             RW 1024 FLAT \"foo-flat.vmdk\" 0\n"
+        );
+        std::fs::write(&desc, text).unwrap();
+        std::fs::write(&flat, vec![0u8; 512]).unwrap();
+
+        let cfg = default_security_config();
+        let err = resolve_vmdk_flat_descriptor(&desc, &cfg).unwrap_err();
+        match err {
+            ChainError::PathResolutionError(msg) => {
+                assert!(msg.contains("parent hint"));
+            }
+            _ => panic!("expected PathResolutionError, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn resolve_descriptor_rejects_multi_extent() {
+        let tmp = TempDir::new().unwrap();
+        let desc = tmp.path().join("foo.vmdk");
+        let flat1 = tmp.path().join("foo-f001.vmdk");
+        let flat2 = tmp.path().join("foo-f002.vmdk");
+        let text = "# Disk DescriptorFile\n\
+                    version=1\n\
+                    CID=1\n\
+                    parentCID=ffffffff\n\
+                    createType=\"twoGbMaxExtentFlat\"\n\
+                    RW 4194304 FLAT \"foo-f001.vmdk\" 0\n\
+                    RW 4194304 FLAT \"foo-f002.vmdk\" 0\n";
+        std::fs::write(&desc, text).unwrap();
+        std::fs::write(&flat1, vec![0u8; 512]).unwrap();
+        std::fs::write(&flat2, vec![0u8; 512]).unwrap();
+
+        let cfg = default_security_config();
+        let err = resolve_vmdk_flat_descriptor(&desc, &cfg).unwrap_err();
+        match err {
+            ChainError::PathResolutionError(msg) => {
+                assert!(msg.contains("2 extents"));
+            }
+            _ => panic!("expected PathResolutionError, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn resolve_descriptor_rejects_non_flat_kind() {
+        let tmp = TempDir::new().unwrap();
+        let desc = tmp.path().join("foo.vmdk");
+        let sparse = tmp.path().join("foo-sparse.vmdk");
+        let text = "# Disk DescriptorFile\n\
+                    version=1\n\
+                    CID=1\n\
+                    createType=\"monolithicSparse\"\n\
+                    RW 1024 SPARSE \"foo-sparse.vmdk\"\n";
+        std::fs::write(&desc, text).unwrap();
+        std::fs::write(&sparse, vec![0u8; 512]).unwrap();
+
+        let cfg = default_security_config();
+        let err = resolve_vmdk_flat_descriptor(&desc, &cfg).unwrap_err();
+        match err {
+            ChainError::PathResolutionError(msg) => {
+                assert!(msg.contains("non-FLAT"));
+            }
+            _ => panic!("expected PathResolutionError, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn resolve_descriptor_rejects_nonzero_offset() {
+        let tmp = TempDir::new().unwrap();
+        let desc = tmp.path().join("foo.vmdk");
+        let flat = tmp.path().join("foo-flat.vmdk");
+        let text = "# Disk DescriptorFile\n\
+                    version=1\n\
+                    CID=1\n\
+                    createType=\"monolithicFlat\"\n\
+                    RW 1024 FLAT \"foo-flat.vmdk\" 100\n";
+        std::fs::write(&desc, text).unwrap();
+        std::fs::write(&flat, vec![0u8; 512]).unwrap();
+
+        let cfg = default_security_config();
+        let err = resolve_vmdk_flat_descriptor(&desc, &cfg).unwrap_err();
+        match err {
+            ChainError::PathResolutionError(msg) => {
+                assert!(msg.contains("non-zero") || msg.contains("offset"));
+            }
+            _ => panic!("expected PathResolutionError, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn resolve_descriptor_rejects_flat_outside_allowlist() {
+        let tmp = TempDir::new().unwrap();
+        let allowed = tmp.path().join("allowed");
+        let forbidden = tmp.path().join("forbidden");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&forbidden).unwrap();
+
+        let desc = allowed.join("foo.vmdk");
+        let flat = forbidden.join("foo-flat.vmdk");
+        // Relative path would resolve to allowed/foo-flat.vmdk,
+        // so use an absolute path that points outside.
+        let text = format!(
+            "# Disk DescriptorFile\n\
+             version=1\n\
+             CID=1\n\
+             createType=\"monolithicFlat\"\n\
+             RW 1024 FLAT \"{}\" 0\n",
+            flat.display()
+        );
+        std::fs::write(&desc, text).unwrap();
+        std::fs::write(&flat, vec![0u8; 512]).unwrap();
+
+        let cfg = default_security_config();
+        let err = resolve_vmdk_flat_descriptor(&desc, &cfg).unwrap_err();
+        assert!(matches!(err, ChainError::BackingFileNotAllowed { .. }));
     }
 
     // Tests for shared::ChainConfig and shared::ChainDeviceInfo structures
