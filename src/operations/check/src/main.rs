@@ -221,6 +221,18 @@ pub unsafe extern "C" fn _start() -> u64 {
             result.flags |= CheckResult::FLAG_NOT_SUPPORTED;
             result.image_end_offset = actual_size;
         }
+        ImageFormat::VmdkDescriptor => {
+            // VMDK monolithicFlat descriptor: content lives in a
+            // separate flat extent file (already opened as the data
+            // device by the VMM). There is no metadata to validate
+            // at this layer — match qemu-img check which reports
+            // "No errors were found" on flat images.
+            (call_table.verbose_print)(
+                b"check: vmdk monolithicFlat descriptor, no metadata\n\0".as_ptr(),
+            );
+            result.flags |= CheckResult::FLAG_NOT_SUPPORTED;
+            result.image_end_offset = actual_size;
+        }
         _ => {
             // Other formats: mark as not supported
             // Note: We still detect the correct format, but don't validate it yet
