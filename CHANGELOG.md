@@ -29,7 +29,8 @@ First public release.
     subclusters, AES-CBC and LUKS encryption, external data
     files, snapshots, backing chains)
   - VMDK (monolithicSparse, streamOptimized with DEFLATE
-    compression)
+    compression, monolithicFlat two-file format with strict
+    host-side descriptor validation)
   - VHD (fixed, dynamic, differencing with backing chains)
   - VHDX (dynamic, with CRC-32C validation)
   - LUKS v1/v2 containers (PBKDF2 and Argon2id KDF,

@@ -2180,6 +2180,57 @@ class TestConvertVmdkToRaw(InstarTestBase):
         """Convert backing chain base VMDK to raw."""
         self._test_vmdk_convert('chain-base-vmdk')
 
+    def test_convert_vmdk_flat_1m(self):
+        """Convert 1 MiB monolithicFlat VMDK to raw."""
+        self._test_vmdk_convert('vmdk-flat-1m')
+
+    def test_convert_vmdk_flat_10m(self):
+        """Convert 10 MiB monolithicFlat VMDK to raw."""
+        self._test_vmdk_convert('vmdk-flat-10m')
+
+
+class TestConvertVmdkFlatRejection(InstarTestBase):
+    """Phase 22 out-of-scope VMDK flat variants are rejected.
+
+    monolithicFlat with a parent hint, and twoGbMaxExtentFlat
+    multi-extent descriptors, must be refused with a clear
+    error message rather than silently mis-processed.
+    """
+
+    def _run_convert_expecting_error(self, image_id, marker):
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            stdout, stderr, rc = self.run_instar_convert(
+                image.path, Path(out.name), timeout=60
+            )
+            self.assertNotEqual(
+                rc, 0,
+                f'Expected convert to fail for {image_id}, '
+                f'got rc={rc} stdout={stdout}'
+            )
+            combined = (stdout or '') + (stderr or '')
+            self.assertIn(
+                marker, combined,
+                f'Expected error message to mention {marker!r}, '
+                f'got: {combined}'
+            )
+
+    def test_reject_monolithic_flat_with_parent(self):
+        """parentFileNameHint triggers explicit rejection."""
+        self._run_convert_expecting_error(
+            'vmdk-flat-with-parent', 'parent hint'
+        )
+
+    def test_reject_twogb_max_extent_flat(self):
+        """twoGbMaxExtentFlat multi-extent is rejected."""
+        self._run_convert_expecting_error(
+            'vmdk-twogb-flat', '2 extents'
+        )
+
 
 class TestConvertVmdkCompare(InstarTestBase):
     """Test comparing VMDK images against raw equivalents.

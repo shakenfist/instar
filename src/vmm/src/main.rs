@@ -2453,6 +2453,22 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
         operation_path.display()
     );
 
+    // VMDK monolithicFlat descriptor pre-flight validation.
+    //
+    // The guest info operation parses descriptor text directly
+    // (Phase 22c), but it can't run the security-sensitive
+    // rejections — backing allowlist, multi-extent, parent-hint,
+    // non-zero offset — because those all touch the host
+    // filesystem. Do that here so an unsupported descriptor
+    // fails cleanly before we launch the guest instead of
+    // silently producing misleading output.
+    let input_path_for_preflight = Path::new(&args.input);
+    if peek_is_vmdk_descriptor(input_path_for_preflight).unwrap_or(false) {
+        let security_config = config::load_config().config.security;
+        resolve_vmdk_flat_descriptor(input_path_for_preflight, &security_config)
+            .map_err(|e| format!("error resolving VMDK descriptor: {}", e))?;
+    }
+
     // Get input file metadata (size and disk blocks)
     let input_metadata = std::fs::metadata(&args.input)?;
     let input_size = input_metadata.len();

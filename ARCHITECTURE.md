@@ -301,11 +301,21 @@ Simple byte-for-byte disk representation. No metadata, just data.
 VMware Virtual Machine Disk. Supported sub-formats for input/output:
 - monolithicSparse (input, output, check)
 - streamOptimized (input, output with `-c`, check)
+- monolithicFlat (input only): two-file descriptor + flat extent.
+  The VMM detects the descriptor prefix on the host, parses the
+  extent line via `vmdk::parse_descriptor_extents`, validates
+  the flat path against the backing-file allowlist, and opens
+  the flat extent as a second virtio-block device. Guest
+  operations read content from that device through the same
+  `ChainConfig.data_device_idx` redirect used for QCOW2
+  external data files.
 
 Detected but not yet supported for I/O:
-- monolithicFlat
+- monolithicFlat output
 - twoGbMaxExtentSparse / twoGbMaxExtentFlat (multi-extent, detected and
   rejected gracefully)
+- monolithicFlat with `parentFileNameHint=` (rejected with a
+  clear error; flat-with-parent chain support is deferred)
 
 The check operation performs full structural validation: grain directory
 and grain table walk, grain offset bounds checking, compressed grain
