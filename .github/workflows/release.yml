@@ -1,4 +1,4 @@
-# Release workflow for Imago
+# Release workflow for Instar
 #
 # Triggers on version tags (v*). Requires approval from the 'release'
 # environment before publishing. Uses Sigstore for tag signing and
@@ -116,10 +116,10 @@ jobs:
 
       - name: Remove previous devcontainers, if any
         run: |
-          docker image rm -f imago-build 2>/dev/null || true
+          docker image rm -f instar-build 2>/dev/null || true
 
-      - name: Build imago (VMM + guest binaries)
-        run: make imago
+      - name: Build instar (VMM + guest binaries)
+        run: make instar
 
       - name: Package binary
         run: |
@@ -128,9 +128,9 @@ jobs:
           if [ -z "${TAG_NAME}" ] || [ "${TAG_NAME}" = "${GITHUB_REF}" ]; then
             TAG_NAME="dev"
           fi
-          ARCHIVE="imago-${TAG_NAME}-${{ matrix.target }}.tar.gz"
+          ARCHIVE="instar-${TAG_NAME}-${{ matrix.target }}.tar.gz"
           mkdir staging
-          cp src/target/release/imago staging/
+          cp src/target/release/instar staging/
           cp src/target/release/*.bin staging/
           cp LICENSE README.md staging/
           tar -czf "${ARCHIVE}" -C staging .

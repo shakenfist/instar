@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://shakenfist.com/imago/review-schema.json",
+  "$id": "https://shakenfist.com/instar/review-schema.json",
   "title": "PR Review Output",
   "description": "Structured output from the automated PR reviewer",
   "type": "object",

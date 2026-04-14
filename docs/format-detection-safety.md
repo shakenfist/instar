@@ -1,8 +1,8 @@
-# Format Auto-Detection Safety in Imago
+# Format Auto-Detection Safety in Instar
 
-This document explains why imago considers format auto-detection to be safe,
+This document explains why instar considers format auto-detection to be safe,
 despite `qemu-img` historically warning against it. Understanding this requires
-examining both the original security concerns and how imago's architecture
+examining both the original security concerns and how instar's architecture
 mitigates them.
 
 ## Background: Why qemu-img Warns About Auto-Detection
@@ -38,9 +38,9 @@ Even if you detect "this is format X", you still need to parse format X to
 validate it. The parsing step is where vulnerabilities live, so detection
 alone doesn't prevent exploitation.
 
-## How Imago Mitigates These Concerns
+## How Instar Mitigates These Concerns
 
-Imago's architecture addresses each of these concerns through **KVM sandbox
+Instar's architecture addresses each of these concerns through **KVM sandbox
 isolation**:
 
 ### KVM Sandbox Model
@@ -50,7 +50,7 @@ isolation**:
 │                         Host System                          │
 │                                                              │
 │  ┌──────────────┐     ┌──────────────────────────────────┐  │
-│  │    imago     │     │         KVM Sandbox               │  │
+│  │    instar     │     │         KVM Sandbox               │  │
 │  │    (VMM)     │     │  ┌────────────────────────────┐  │  │
 │  │              │     │  │     Guest (no_std Rust)    │  │  │
 │  │  - File I/O  │     │  │                            │  │  │
@@ -69,7 +69,7 @@ isolation**:
 
 ### Mitigation Analysis
 
-| Security Concern | qemu-img Risk | Imago Mitigation |
+| Security Concern | qemu-img Risk | Instar Mitigation |
 |-----------------|---------------|------------------|
 | Backing file path traversal | HIGH - Can read /etc/passwd | **NONE** - Guest has no filesystem access |
 | External data file attacks | HIGH - Can read arbitrary files | **NONE** - Guest has no filesystem access |
@@ -88,11 +88,11 @@ $ qemu-img info malicious.qcow2
 # qemu-img attempts to open /etc/shadow -> Information disclosure
 ```
 
-In imago:
+In instar:
 
 ```
 # Same malicious QCOW2
-$ imago info malicious.qcow2
+$ instar info malicious.qcow2
 # Guest parses QCOW2, sees backing_file="/etc/shadow"
 # Guest attempts to... do what exactly?
 # - Cannot call open("/etc/shadow") - no syscalls
@@ -122,7 +122,7 @@ If a malicious image exploits a parser bug in the guest:
 
 ## When Auto-Detection is Safe
 
-Based on this analysis, imago's auto-detection is safe when:
+Based on this analysis, instar's auto-detection is safe when:
 
 1. **Format parsing runs in the sandbox**: All header parsing, magic number
    checking, and metadata extraction happens inside the KVM guest.
@@ -136,7 +136,7 @@ Based on this analysis, imago's auto-detection is safe when:
 
 ## What We Report vs. What We Trust
 
-Imago's info operation will **report** information found in image headers:
+Instar's info operation will **report** information found in image headers:
 - Format type (QCOW2, VMDK, RAW, etc.)
 - Virtual size
 - Backing file paths (if present)
@@ -154,10 +154,10 @@ warnings for potentially dangerous features.
 
 ## Security Warnings in Output
 
-When imago detects potentially dangerous metadata, it should warn users:
+When instar detects potentially dangerous metadata, it should warn users:
 
 ```
-$ imago info suspicious.qcow2
+$ instar info suspicious.qcow2
 
 Format:         QCOW2 (version 3)
 Virtual size:   10 GiB
@@ -180,9 +180,9 @@ The standard advice for `qemu-img` is:
 > qemu-img info --format=qcow2 image.qcow2
 > ```
 
-With imago, this advice is **optional** rather than **required**:
+With instar, this advice is **optional** rather than **required**:
 
-| Approach | qemu-img | imago |
+| Approach | qemu-img | instar |
 |----------|----------|-------|
 | Auto-detect format | Unsafe | Safe (sandboxed) |
 | Explicit format | Safe | Safe (sandboxed) |
@@ -193,7 +193,7 @@ security benefit in doing so.
 
 ## Conclusion
 
-Imago's KVM sandbox architecture fundamentally changes the security model for
+Instar's KVM sandbox architecture fundamentally changes the security model for
 image processing. By isolating all format parsing and operations inside a
 hardware-enforced virtual machine:
 
@@ -206,7 +206,7 @@ hardware-enforced virtual machine:
 3. **Auto-detection becomes safe**: The attacker can choose which parser runs,
    but all parsers run in the sandbox.
 
-This is why imago enables format auto-detection by default, while providing
+This is why instar enables format auto-detection by default, while providing
 clear documentation of what information came from untrusted sources.
 
 ---

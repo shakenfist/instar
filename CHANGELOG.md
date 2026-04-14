@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 First public release.
 
+### Changed
+
+- **Project renamed** from `imago` to `instar` to avoid a
+  crates.io name collision with an unrelated existing crate.
+  The rename touches the binary name, crate names, environment
+  variables, CI workflows, and documentation; there are no
+  functional changes.
+
 ### Added (since v0.1)
 
 - **New operations:** check, compare, convert (v0.1 had only
@@ -56,5 +64,5 @@ Internal pre-release. Operations: info, copy. Format parsing
 was inline (no standalone crates). No check, compare, or
 convert operations. No public binary distribution.
 
-[0.2.0]: https://github.com/shakenfist/imago/releases/tag/v0.2.0
-[0.1]: https://github.com/shakenfist/imago/releases/tag/v0.1
+[0.2.0]: https://github.com/shakenfist/instar/releases/tag/v0.2.0
+[0.1]: https://github.com/shakenfist/instar/releases/tag/v0.1

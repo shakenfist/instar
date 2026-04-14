@@ -1,7 +1,7 @@
 # qemu-img Quirks
 
 This document describes known behaviors in qemu-img that differ from what one
-might expect, and how imago handles these cases.
+might expect, and how instar handles these cases.
 
 ## Quirk Classification: Safe vs Unsafe
 
@@ -16,7 +16,7 @@ security vulnerabilities. Examples include:
 - Number formatting (banker's rounding, significant figures)
 - VHD size calculation methods
 
-imago **mimics safe quirks by default** for qemu-img compatibility. Use
+instar **mimics safe quirks by default** for qemu-img compatibility. Use
 `--ignore-quirks` to get more intuitive behavior.
 
 ### Unsafe Quirks
@@ -29,7 +29,7 @@ reduce format identification accuracy. Examples include:
 - **ISO reported as RAW** - Not detecting ISO 9660 format, reducing format
   visibility for policy decisions
 
-imago **does NOT mimic unsafe quirks by default**. Instead, imago applies
+instar **does NOT mimic unsafe quirks by default**. Instead, instar applies
 additional validation (e.g., requiring MBR/GPT partition tables for raw images,
 detecting ISO 9660 format). Use `--unsafe-quirks` to match qemu-img's behavior
 for compatibility testing.
@@ -46,7 +46,7 @@ See [configuration.md](configuration.md) for full flag documentation.
 
 ## Extra Detail Mode
 
-imago can provide additional format-specific information that qemu-img does not
+instar can provide additional format-specific information that qemu-img does not
 output. This extra information is disabled by default for qemu-img compatibility,
 but can be enabled with the `--extra-detail` flag.
 
@@ -71,10 +71,10 @@ images, even though the format contains useful metadata:
 }
 ```
 
-**Default behavior**: imago matches qemu-img by not outputting VDI format-specific
+**Default behavior**: instar matches qemu-img by not outputting VDI format-specific
 information.
 
-**With `--extra-detail` flag**: imago outputs the VDI format-specific section,
+**With `--extra-detail` flag**: instar outputs the VDI format-specific section,
 providing additional metadata about the image structure.
 
 ### When to Use `--extra-detail`
@@ -129,18 +129,18 @@ image's internal structure, not the actual filesystem size. This calculation:
 This approach makes sense for images that might be sparse or have trailing
 allocations, but can report larger sizes than the actual file.
 
-### imago Behavior
+### instar Behavior
 
-**Default behavior**: imago matches qemu-img by calculating disk size based
+**Default behavior**: instar matches qemu-img by calculating disk size based
 on the image's internal metadata structure, rounded up to sector boundaries.
 This ensures drop-in replacement compatibility.
 
-**With `--ignore-quirks` flag**: imago reports the actual file size from the
+**With `--ignore-quirks` flag**: instar reports the actual file size from the
 underlying storage, matching what `stat` or `ls -l` reports.
 
 ### Why Match qemu-img?
 
-Since imago aims to be a drop-in replacement for `qemu-img info`, matching
+Since instar aims to be a drop-in replacement for `qemu-img info`, matching
 the output exactly (including this calculation) reduces friction for users
 migrating from qemu-img. Scripts and tools that parse qemu-img output will
 work unchanged.
@@ -150,7 +150,7 @@ true filesystem size.
 
 ### Test Implications
 
-The test file `qcow2_v2.qcow2` in imago-testdata was generated with qemu-img
+The test file `qcow2_v2.qcow2` in instar-testdata was generated with qemu-img
 (`qemu-img create -f qcow2 -o compat=0.10 ...`). By matching qemu-img's
 calculation, tests can perform exact output comparison.
 
@@ -168,12 +168,12 @@ For the QCOW2 v2 test file:
 - qemu-img disk size: 200704 bytes (196 KiB)
 - Calculation: ceil(196616 / 4096) * 4096 = 49 * 4096 = 200704
 
-### imago Behavior
+### instar Behavior
 
-**Default behavior**: imago matches qemu-img by rounding file size up to
+**Default behavior**: instar matches qemu-img by rounding file size up to
 4096-byte blocks.
 
-**With `--ignore-quirks` flag**: imago reports the actual file size.
+**With `--ignore-quirks` flag**: instar reports the actual file size.
 
 ## Human-Readable Size Formatting
 
@@ -209,15 +209,15 @@ This behavior stems from C printf's `%0.3g` format which:
 The key distinction is at exact midpoints (like 192.5): C rounds to the nearest
 even number (192), while Rust's default `round()` rounds away from zero (193).
 
-### imago Behavior
+### instar Behavior
 
-**Default behavior**: imago matches qemu-img's formatting using banker's rounding:
+**Default behavior**: instar matches qemu-img's formatting using banker's rounding:
 - Values >= 100: round to nearest integer (ties to even)
 - Values 10-99: round to 1 decimal place (ties to even)
 - Values 1-9: round to 2 decimal places (ties to even)
 - Values < 1: round to 3 decimal places (ties to even)
 
-**With `--ignore-quirks` flag**: imago uses consistent rounding with 1 decimal
+**With `--ignore-quirks` flag**: instar uses consistent rounding with 1 decimal
 place when the value is not a whole number (e.g., "192.5 KiB" instead of
 "192 KiB").
 
@@ -252,12 +252,12 @@ For a real disk image (cirros):
 - L1 table calculation: much smaller (metadata is at the start)
 - qemu-img file length: max(21692416, calc) = 21692416 bytes
 
-### imago Behavior
+### instar Behavior
 
-**Default behavior**: imago matches qemu-img by reporting the larger of the
+**Default behavior**: instar matches qemu-img by reporting the larger of the
 actual file size and the internal metadata calculation.
 
-**With `--ignore-quirks` flag**: imago reports the actual filesystem size.
+**With `--ignore-quirks` flag**: instar reports the actual filesystem size.
 
 ## Summary of `--ignore-quirks` Effects
 
@@ -343,8 +343,8 @@ output before comparison. This ensures:
 
 This approach is more scientifically correct than using tolerance, because:
 1. `actual-size` reflects filesystem allocation, not image content
-2. We're testing that imago correctly reports what the filesystem says
-3. Both imago and the test framework query the same filesystem state
+2. We're testing that instar correctly reports what the filesystem says
+3. Both instar and the test framework query the same filesystem state
 
 ### Note
 
@@ -411,9 +411,9 @@ regardless of creator application. This prevents truncation for large disks.
 | `CTXS`      | disk_size   | XenConverter |
 | `wa\0\0`    | disk_size   | Microsoft Azure |
 
-### imago Behavior
+### instar Behavior
 
-**Default behavior**: imago matches qemu-img by checking the creator_app field
+**Default behavior**: instar matches qemu-img by checking the creator_app field
 and using CHS calculation for "vpc " and "qemu" creators (unless CHS is at
 maximum), or disk_size field for all others.
 
@@ -483,7 +483,7 @@ exfiltration vulnerability. A more defensive design would require backing
 files to have recognizable disk image headers (QCOW2, VMDK, VHD, or at minimum
 a valid MBR/GPT partition table for raw images).
 
-**Note**: imago avoids this vulnerability entirely through its KVM sandbox
+**Note**: instar avoids this vulnerability entirely through its KVM sandbox
 architecture - the guest cannot open arbitrary files regardless of format
 detection behavior. See [format-detection-safety.md](format-detection-safety.md)
 for details.
@@ -512,9 +512,9 @@ oslo.utils can distinguish between "files with valid partition tables" (likely
 real disk images) and "files we don't recognize" (both labeled "raw" but with
 different confidence levels).
 
-### imago Behavior
+### instar Behavior
 
-**Default behavior (secure)**: imago requires files detected as "raw" to have
+**Default behavior (secure)**: instar requires files detected as "raw" to have
 a valid partition table (MBR or GPT). Files without recognized format headers
 AND without valid partition tables are rejected as "unknown format" rather
 than being silently accepted as raw images.
@@ -523,12 +523,12 @@ This prevents the backing file disclosure attacks described above, because
 `/etc/shadow` would be rejected as "not a valid disk image" rather than
 being treated as a raw disk.
 
-**With `--unsafe-quirks` flag**: imago matches qemu-img's behavior, treating
+**With `--unsafe-quirks` flag**: instar matches qemu-img's behavior, treating
 any unrecognized file as a valid raw image. This is required for exact
 qemu-img output compatibility but should only be used in controlled testing
 environments, never in production.
 
-**Partition table detection**: imago checks for:
+**Partition table detection**: instar checks for:
 - **MBR**: Valid 0xAA55 signature at offset 510-511, with at least one
   partition entry having a valid boot flag (0x00 or 0x80)
 - **GPT**: Protective MBR with partition type 0xEE, followed by valid
@@ -539,7 +539,7 @@ format_inspector.
 
 ### Test Images
 
-The imago-testdata repository includes several test cases for this behavior:
+The instar-testdata repository includes several test cases for this behavior:
 
 - `raw-random-garbage.raw` - Random bytes (detected as raw)
 - `raw-misleading-header.raw` - QCOW2 magic but invalid header (detected as raw)
@@ -574,16 +574,16 @@ Treating ISO files as "raw" means:
 2. Policy decisions (e.g., "reject ISO uploads") require external detection
 3. Format-specific handling (e.g., mount options) cannot be automated
 
-### imago Behavior
+### instar Behavior
 
-**Default behavior (secure)**: imago detects ISO 9660 format by checking for
+**Default behavior (secure)**: instar detects ISO 9660 format by checking for
 the "CD001" magic at byte offset 32769. ISO files are reported as `file format: iso`
 rather than raw. This allows:
 - OpenStack/Glance to identify and policy-control ISO uploads
 - Better format reporting for administrators
 - Accurate format statistics
 
-**With `--unsafe-quirks` flag**: imago matches qemu-img's behavior, treating
+**With `--unsafe-quirks` flag**: instar matches qemu-img's behavior, treating
 ISO files as "raw" disk images. This is required for exact qemu-img output
 compatibility but provides less information about the actual file format.
 
@@ -625,13 +625,13 @@ qemu-img does not attempt to detect the actual format when running check.
 2. **Reduced visibility**: Administrators cannot determine what format an image
    actually is using `qemu-img check`.
 
-#### imago Behavior
+#### instar Behavior
 
-**Default behavior (secure)**: imago detects the actual format of the image
-using the same detection logic as `imago info`. VMDK images are identified as
+**Default behavior (secure)**: instar detects the actual format of the image
+using the same detection logic as `instar info`. VMDK images are identified as
 "vmdk", VHDX as "vhdx", etc.
 
-**With `--unsafe-quirks` flag**: imago matches qemu-img's behavior, only
+**With `--unsafe-quirks` flag**: instar matches qemu-img's behavior, only
 detecting QCOW2 format. All other formats are reported as "raw".
 
 ### Quirk 2: Lack of Validation for Non-QCOW2 Formats
@@ -659,9 +659,9 @@ simply because qemu-img didn't actually examine it.
 2. **Missed corruptions**: Corrupt headers, invalid offsets, and malformed
    metadata are not detected for non-QCOW2 formats.
 
-#### imago Behavior
+#### instar Behavior
 
-**Default behavior (secure)**: imago performs format-appropriate validation for
+**Default behavior (secure)**: instar performs format-appropriate validation for
 supported formats:
 
 - **VMDK**: Validates header version (1-3), capacity > 0, grain size power of 2,
@@ -672,13 +672,13 @@ supported formats:
 Images with structural problems are marked with `FLAG_HAS_CORRUPTIONS` and
 report specific error counts. Images that pass validation are marked `FLAG_VALID`.
 
-**With `--unsafe-quirks` flag**: imago skips validation for non-QCOW2 formats,
+**With `--unsafe-quirks` flag**: instar skips validation for non-QCOW2 formats,
 matching qemu-img's behavior. Non-QCOW2 images are marked as
 `FLAG_NOT_SUPPORTED | FLAG_VALID` without examination.
 
 ### Test Images (Planned)
 
-The following corrupt test images are planned for imago-testdata to validate
+The following corrupt test images are planned for instar-testdata to validate
 corruption detection. Tests skip gracefully if these files do not exist:
 
 | Image | Format | Corruption |
@@ -744,9 +744,9 @@ They only appear when their values are greater than zero:
 3. **API contract ambiguity**: It is unclear whether a missing field
    means "zero errors" or "not checked".
 
-### imago Behavior
+### instar Behavior
 
-**Default behavior (consistent schema)**: imago always includes
+**Default behavior (consistent schema)**: instar always includes
 `corruptions`, `leaks`, and `refcount-errors` in JSON output,
 regardless of their values. This provides a predictable, fixed schema
 that callers can rely on:
@@ -766,13 +766,13 @@ that callers can rely on:
 }
 ```
 
-**With `--unsafe-quirks` flag**: imago matches qemu-img's behavior,
+**With `--unsafe-quirks` flag**: instar matches qemu-img's behavior,
 omitting `corruptions`, `leaks`, and `refcount-errors` when their
 values are zero.
 
 ### Current Validation Limitations
 
-imago's QCOW2 check implementation has the following limitations compared
+instar's QCOW2 check implementation has the following limitations compared
 to qemu-img:
 
 1. **Partial L2 table validation**: Only the first sector of each L2 table
@@ -784,7 +784,7 @@ to qemu-img:
    - `refcount-errors` will always be 0
    - `leaks` will always be 0
 
-Users comparing imago output against `qemu-img check` may notice these
+Users comparing instar output against `qemu-img check` may notice these
 discrepancies, particularly for images with refcount issues or extensive
 L2 table corruption beyond the first sector.
 

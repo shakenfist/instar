@@ -4,7 +4,7 @@
 # Usage:
 #   ./scripts/create-qcow2-snapshot-testdata.sh [output-dir]
 #
-# Default output: ../imago-testdata/custom/format-coverage/
+# Default output: ../instar-testdata/custom/format-coverage/
 #
 # Creates:
 #   qcow2-snapshots.qcow2 - 10MB QCOW2 with 2 internal snapshots
@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-OUTDIR="${1:-../imago-testdata/custom/format-coverage}"
+OUTDIR="${1:-../instar-testdata/custom/format-coverage}"
 mkdir -p "$OUTDIR"
 OUTPUT="$OUTDIR/qcow2-snapshots.qcow2"
 

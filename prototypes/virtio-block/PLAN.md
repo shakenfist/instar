@@ -96,7 +96,7 @@ The crate uses `micropb` for Protocol Buffers serialization - no_std and no_allo
 ## File Structure
 
 ```
-imago/
+instar/
 ├── crates/                         # Shared crates (project-level)
 │   └── guest-protocol/
 │       ├── Cargo.toml              # no_std by default, std feature for VMM

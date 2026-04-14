@@ -1,4 +1,4 @@
-# Imago Documentation Updates
+# Instar Documentation Updates
 
 ## Golden Rule
 
@@ -50,11 +50,11 @@ Brief description of what the flag does and why you'd use it.
 
 \`\`\`bash
 # Without flag
-imago info image.qcow2
+instar info image.qcow2
 # [output without flag]
 
 # With flag
-imago info --flag-name image.qcow2
+instar info --flag-name image.qcow2
 # [output with flag]
 \`\`\`
 ```

@@ -1,27 +1,23 @@
-# Imago Documentation
+# Instar Documentation
 
 A safe, sandboxed disk image format converter.
 
 ## Overview
 
-Imago replaces unsafe calls to `qemu-img` with a safer, sandboxed approach.
+Instar replaces unsafe calls to `qemu-img` with a safer, sandboxed approach.
 Image format conversions are performed within a KVM execution context,
 providing strong isolation from the host system. You can read the
 [announcement email I sent to the OpenStack mailing lists](openstack-announcement-email.md)
 if you're interested in my line of reasoning at the time.
 
-The name "imago" comes from Latin (meaning "image") and biology (the final
-adult stage of insect metamorphosis) - reflecting both the image handling
-and transformation aspects of the tool.
-
-The primary goal of `imago` is to be a safe drop in replacement for qemu-img.
+The primary goal of `instar` is to be a safe drop in replacement for qemu-img.
 The current focus is on `qemu-img info`, `qemu-img check`, `qemu-img compare`,
 and `qemu-img convert` sub-commands, as the most painful parts in terms of
 observed security exploits, but that will expand over time.
 We therefore have a test suite of images that we run against both tools,
 and any difference in output is considered a bug to be fixed -- if you
 observe such a difference please report it as a GitHub issue at
-https://github.com/shakenfist/imago. Obviously, providing an image which
+https://github.com/shakenfist/instar. Obviously, providing an image which
 demonstrates your concern, even if that image would otherwise be considered
 malicious, is extremely helpful in fixing the bug and ensuring that we don't
 regress later.
@@ -29,23 +25,23 @@ regress later.
 Along the pathway to complete equivalence, we have found a few examples of
 `qemu-img` behaviour that we found counter intuitive. These are documented
 on [our quirks page](quirks.md), and you can suppress `qemu-img`
-equivalence with the `--ignore-quirks` flag to `imago`.
+equivalence with the `--ignore-quirks` flag to `instar`.
 
-Confused about how `imago` does these things? Perhaps read the
+Confused about how `instar` does these things? Perhaps read the
 [technology primer](technology-primer.md).
 
 ---
 
 # Main Implementation Documentation
 
-## Imago-Specific Features
+## Instar-Specific Features
 
-Features unique to imago that do not exist in qemu-img.
+Features unique to instar that do not exist in qemu-img.
 
 | Document | Description |
 |----------|-------------|
 | [Configuration Guide](configuration.md) | Command-line flags, config files, quirk control |
-| [Chain Discovery](chain-discovery.md) | `imago info --chain` - secure backing chain discovery |
+| [Chain Discovery](chain-discovery.md) | `instar info --chain` - secure backing chain discovery |
 | [Chain Config Protocol](chain-config.md) | Chain config structure layout and VMM-to-guest data flow |
 
 ## Compatibility
@@ -53,15 +49,15 @@ Features unique to imago that do not exist in qemu-img.
 | Document | Description |
 |----------|-------------|
 | [Output Formats](output-formats.md) | qemu-img output formats (human, JSON) and version profiles |
-| [qemu-img Quirks](quirks.md) | Known differences between `imago` and qemu-img output |
+| [qemu-img Quirks](quirks.md) | Known differences between `instar` and qemu-img output |
 | [Image Notes](image_notes/README.md) | Test images and the quirks they exposed |
 
 ## Testing and Coverage
 
 | Document | Description |
 |----------|-------------|
-| [Integration Testing](testing.md) | Test suite comparing imago output against qemu-img |
-| [Differential Fuzzing](testing.md#differential-fuzzing) | Randomised imago vs qemu-img comparison |
+| [Integration Testing](testing.md) | Test suite comparing instar output against qemu-img |
+| [Differential Fuzzing](testing.md#differential-fuzzing) | Randomised instar vs qemu-img comparison |
 | [Format Coverage](format-coverage.md) | Comparison with oslo.utils format_inspector, test coverage gaps |
 
 ## Understanding the Codebase
@@ -77,7 +73,7 @@ Features unique to imago that do not exist in qemu-img.
 | Document | Description |
 |----------|-------------|
 | [Why Rust](rust-rationale.md) | Memory safety, bare-metal support, rust-vmm ecosystem |
-| [Format Detection Safety](format-detection-safety.md) | Why auto-detection is safe in imago's KVM sandbox |
+| [Format Detection Safety](format-detection-safety.md) | Why auto-detection is safe in instar's KVM sandbox |
 
 ## Platform Analysis
 
@@ -131,7 +127,7 @@ Documentation for VMware Virtual Machine Disk format.
 
 # Prototype and Research Documentation
 
-The content below documents the prototyping and research phase of imago
+The content below documents the prototyping and research phase of instar
 development. These documents are retained for historical context and may
 be useful for understanding design decisions, but the main implementation
 has evolved beyond these prototypes.
@@ -201,7 +197,7 @@ on how these crates affect implementation complexity.
 
 ## Shared Crates
 
-Reusable Rust crates for the `imago` project.
+Reusable Rust crates for the `instar` project.
 
 | Document | Description |
 |----------|-------------|

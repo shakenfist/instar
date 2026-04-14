@@ -12,10 +12,10 @@ fuzz_target!(|data: &[u8]| {
         None => return,
     };
 
-    imago_fuzz::set_fuzz_input(data);
-    let call_table = imago_fuzz::build_call_table();
+    instar_fuzz::set_fuzz_input(data);
+    let call_table = instar_fuzz::build_call_table();
     let sector_size = 512;
-    let input_capacity = imago_fuzz::input_capacity();
+    let input_capacity = instar_fuzz::input_capacity();
 
     let mut bytes_read = 0u64;
     let mut rt_cache = vec![0u8; shared::MAX_SECTOR_SIZE];
@@ -44,7 +44,7 @@ fuzz_target!(|data: &[u8]| {
         }
 
         // Fuzz-derived host offset
-        if let Some(dynamic_offset) = imago_fuzz::extract_fuzz_offset(data) {
+        if let Some(dynamic_offset) = instar_fuzz::extract_fuzz_offset(data) {
             let _ = qcow2::lookup_refcount(
                 &call_table,
                 0,

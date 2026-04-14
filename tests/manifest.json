@@ -1,8 +1,8 @@
 {
     "$schema": "http://json-schema.org/draft-07/schema#",
-    "title": "Imago Test Manifest",
+    "title": "Instar Test Manifest",
     "version": "1.0.0",
-    "description": "Test images for comparing imago info output against qemu-img info",
+    "description": "Test images for comparing instar info output against qemu-img info",
     "images": [
         {
             "id": "cirros-qcow2",
@@ -864,7 +864,7 @@
             "skip_qemu_img": true,
             "description": "QCOW2 v2 with zlib-compressed all-zero clusters (compression bomb)",
             "tags": ["qcow2", "adversarial", "compression-bomb", "zlib"],
-            "generated_by": "imago-testdata/scripts/create-compression-bomb-testdata.sh"
+            "generated_by": "instar-testdata/scripts/create-compression-bomb-testdata.sh"
         },
         {
             "id": "qcow2-compression-bomb-zstd",
@@ -875,7 +875,7 @@
             "skip_qemu_img": true,
             "description": "QCOW2 v3 with zstd-compressed all-zero clusters (compression bomb)",
             "tags": ["qcow2", "adversarial", "compression-bomb", "zstd"],
-            "generated_by": "imago-testdata/scripts/create-compression-bomb-testdata.sh"
+            "generated_by": "instar-testdata/scripts/create-compression-bomb-testdata.sh"
         },
 
         {
@@ -887,7 +887,7 @@
             "skip_qemu_img": true,
             "description": "QCOW2 in 2-level circular chain (A->B->A)",
             "tags": ["qcow2", "adversarial", "circular-chain", "backing-file"],
-            "generated_by": "imago-testdata/scripts/create-circular-chain-testdata.sh"
+            "generated_by": "instar-testdata/scripts/create-circular-chain-testdata.sh"
         },
         {
             "id": "qcow2-circular-3",
@@ -898,7 +898,7 @@
             "skip_qemu_img": true,
             "description": "QCOW2 in 3-level circular chain (A->B->C->A)",
             "tags": ["qcow2", "adversarial", "circular-chain", "backing-file"],
-            "generated_by": "imago-testdata/scripts/create-circular-chain-testdata.sh"
+            "generated_by": "instar-testdata/scripts/create-circular-chain-testdata.sh"
         },
         {
             "id": "qcow2-self-referencing",
@@ -909,7 +909,7 @@
             "skip_qemu_img": true,
             "description": "QCOW2 with backing file pointing to itself (A->A)",
             "tags": ["qcow2", "adversarial", "circular-chain", "self-reference"],
-            "generated_by": "imago-testdata/scripts/create-circular-chain-testdata.sh"
+            "generated_by": "instar-testdata/scripts/create-circular-chain-testdata.sh"
         },
 
         {
@@ -921,7 +921,7 @@
             "skip_qemu_img": true,
             "description": "QCOW2 at top of 16-level backing chain (at max depth, should succeed)",
             "tags": ["qcow2", "adversarial", "deep-chain", "depth-limit"],
-            "generated_by": "imago-testdata/scripts/create-deep-chain-testdata.sh"
+            "generated_by": "instar-testdata/scripts/create-deep-chain-testdata.sh"
         },
         {
             "id": "qcow2-chain-depth-17",
@@ -932,7 +932,7 @@
             "skip_qemu_img": true,
             "description": "QCOW2 at top of 17-level backing chain (exceeds max depth, should be rejected)",
             "tags": ["qcow2", "adversarial", "deep-chain", "depth-limit"],
-            "generated_by": "imago-testdata/scripts/create-deep-chain-testdata.sh"
+            "generated_by": "instar-testdata/scripts/create-deep-chain-testdata.sh"
         },
 
         {
@@ -944,7 +944,7 @@
             "skip_qemu_img": true,
             "description": "QCOW2 with l1_size near u32::MAX to trigger integer overflow checks",
             "tags": ["qcow2", "adversarial", "integer-overflow", "l1-table"],
-            "generated_by": "imago-testdata/scripts/create-overflow-testdata.sh"
+            "generated_by": "instar-testdata/scripts/create-overflow-testdata.sh"
         },
         {
             "id": "qcow2-l1-zero",
@@ -955,7 +955,7 @@
             "skip_qemu_img": true,
             "description": "QCOW2 with l1_size=0 (degenerate, no L1 table entries)",
             "tags": ["qcow2", "adversarial", "integer-overflow", "l1-table"],
-            "generated_by": "imago-testdata/scripts/create-overflow-testdata.sh"
+            "generated_by": "instar-testdata/scripts/create-overflow-testdata.sh"
         },
         {
             "id": "qcow2-cluster-bits-low",
@@ -966,7 +966,7 @@
             "skip_qemu_img": true,
             "description": "QCOW2 with cluster_bits=8 (below minimum valid value of 9)",
             "tags": ["qcow2", "adversarial", "boundary-value", "cluster-bits"],
-            "generated_by": "imago-testdata/scripts/create-overflow-testdata.sh"
+            "generated_by": "instar-testdata/scripts/create-overflow-testdata.sh"
         },
         {
             "id": "qcow2-cluster-bits-high",
@@ -977,7 +977,7 @@
             "skip_qemu_img": true,
             "description": "QCOW2 with cluster_bits=22 (above maximum valid value of 21)",
             "tags": ["qcow2", "adversarial", "boundary-value", "cluster-bits"],
-            "generated_by": "imago-testdata/scripts/create-overflow-testdata.sh"
+            "generated_by": "instar-testdata/scripts/create-overflow-testdata.sh"
         },
 
         {
@@ -989,7 +989,7 @@
             "skip_qemu_img": true,
             "description": "QCOW2 v3 with refcount_order=7 (above max 6, 128-bit refcounts)",
             "tags": ["qcow2", "adversarial", "boundary-value", "refcount"],
-            "generated_by": "imago-testdata/scripts/create-boundary-testdata.py"
+            "generated_by": "instar-testdata/scripts/create-boundary-testdata.py"
         },
         {
             "id": "qcow2-refcount-order-255",
@@ -1000,7 +1000,7 @@
             "skip_qemu_img": true,
             "description": "QCOW2 v3 with refcount_order=255 (extreme value)",
             "tags": ["qcow2", "adversarial", "boundary-value", "refcount"],
-            "generated_by": "imago-testdata/scripts/create-boundary-testdata.py"
+            "generated_by": "instar-testdata/scripts/create-boundary-testdata.py"
         },
         {
             "id": "qcow2-vsize-petabyte",
@@ -1011,7 +1011,7 @@
             "skip_qemu_img": true,
             "description": "QCOW2 v3 with virtual_size=2^50 (1 petabyte)",
             "tags": ["qcow2", "adversarial", "boundary-value", "virtual-size"],
-            "generated_by": "imago-testdata/scripts/create-boundary-testdata.py"
+            "generated_by": "instar-testdata/scripts/create-boundary-testdata.py"
         },
         {
             "id": "qcow2-vsize-max",
@@ -1022,7 +1022,7 @@
             "skip_qemu_img": true,
             "description": "QCOW2 v3 with virtual_size=2^63-1 (maximum possible)",
             "tags": ["qcow2", "adversarial", "boundary-value", "virtual-size"],
-            "generated_by": "imago-testdata/scripts/create-boundary-testdata.py"
+            "generated_by": "instar-testdata/scripts/create-boundary-testdata.py"
         },
         {
             "id": "vmdk-grain-size-zero",
@@ -1033,7 +1033,7 @@
             "skip_qemu_img": true,
             "description": "VMDK with grain_size_sectors=0 (division by zero trigger)",
             "tags": ["vmdk", "adversarial", "boundary-value", "grain-size"],
-            "generated_by": "imago-testdata/scripts/create-boundary-testdata.py"
+            "generated_by": "instar-testdata/scripts/create-boundary-testdata.py"
         },
         {
             "id": "vmdk-grain-size-huge",
@@ -1044,7 +1044,7 @@
             "skip_qemu_img": true,
             "description": "VMDK with grain_size_sectors near u64::MAX (overflow trigger)",
             "tags": ["vmdk", "adversarial", "boundary-value", "grain-size"],
-            "generated_by": "imago-testdata/scripts/create-boundary-testdata.py"
+            "generated_by": "instar-testdata/scripts/create-boundary-testdata.py"
         },
         {
             "id": "vhdx-conflicting-headers",
@@ -1055,7 +1055,7 @@
             "skip_qemu_img": true,
             "description": "VHDX with two valid headers having different sequence numbers",
             "tags": ["vhdx", "adversarial", "boundary-value", "dual-header"],
-            "generated_by": "imago-testdata/scripts/create-boundary-testdata.py"
+            "generated_by": "instar-testdata/scripts/create-boundary-testdata.py"
         },
         {
             "id": "vhd-bat-beyond-eof",
@@ -1066,7 +1066,7 @@
             "skip_qemu_img": true,
             "description": "VHD with BAT entry pointing to offset past end of file",
             "tags": ["vhd", "adversarial", "boundary-value", "bat-beyond-eof"],
-            "generated_by": "imago-testdata/scripts/create-boundary-testdata.py"
+            "generated_by": "instar-testdata/scripts/create-boundary-testdata.py"
         },
         {
             "id": "vhdx-bat-beyond-eof",
@@ -1077,7 +1077,7 @@
             "skip_qemu_img": true,
             "description": "VHDX with BAT entry pointing to offset past end of file",
             "tags": ["vhdx", "adversarial", "boundary-value", "bat-beyond-eof"],
-            "generated_by": "imago-testdata/scripts/create-boundary-testdata.py"
+            "generated_by": "instar-testdata/scripts/create-boundary-testdata.py"
         },
         {
             "id": "polyglot-qcow2-vmdk",
@@ -1088,7 +1088,7 @@
             "skip_qemu_img": true,
             "description": "QCOW2 magic header with VMDK descriptor body content",
             "tags": ["qcow2", "adversarial", "format-confusion", "polyglot"],
-            "generated_by": "imago-testdata/scripts/create-format-confusion-testdata.py"
+            "generated_by": "instar-testdata/scripts/create-format-confusion-testdata.py"
         },
         {
             "id": "polyglot-qcow2-elf",
@@ -1099,7 +1099,7 @@
             "skip_qemu_img": true,
             "description": "QCOW2 magic header with ELF binary content after header",
             "tags": ["qcow2", "adversarial", "format-confusion", "polyglot"],
-            "generated_by": "imago-testdata/scripts/create-format-confusion-testdata.py"
+            "generated_by": "instar-testdata/scripts/create-format-confusion-testdata.py"
         },
         {
             "id": "qcow2-truncated-header-v2",
@@ -1110,7 +1110,7 @@
             "skip_qemu_img": true,
             "description": "QCOW2 v2 header truncated at 32 bytes (mid-field)",
             "tags": ["qcow2", "adversarial", "format-confusion", "truncated"],
-            "generated_by": "imago-testdata/scripts/create-format-confusion-testdata.py"
+            "generated_by": "instar-testdata/scripts/create-format-confusion-testdata.py"
         },
         {
             "id": "vmdk-truncated-after-magic",
@@ -1121,7 +1121,7 @@
             "skip_qemu_img": true,
             "description": "VMDK sparse header with only magic and version (8 bytes)",
             "tags": ["vmdk", "adversarial", "format-confusion", "truncated"],
-            "generated_by": "imago-testdata/scripts/create-format-confusion-testdata.py"
+            "generated_by": "instar-testdata/scripts/create-format-confusion-testdata.py"
         },
         {
             "id": "vhd-truncated-footer",
@@ -1132,7 +1132,7 @@
             "skip_qemu_img": true,
             "description": "VHD footer truncated at 48 bytes (missing disk type and checksum)",
             "tags": ["vhd", "adversarial", "format-confusion", "truncated"],
-            "generated_by": "imago-testdata/scripts/create-format-confusion-testdata.py"
+            "generated_by": "instar-testdata/scripts/create-format-confusion-testdata.py"
         },
         {
             "id": "vmdk-descriptor-null-bytes",
@@ -1143,7 +1143,7 @@
             "skip_qemu_img": true,
             "description": "VMDK with null bytes embedded in descriptor text",
             "tags": ["vmdk", "adversarial", "format-confusion", "descriptor"],
-            "generated_by": "imago-testdata/scripts/create-format-confusion-testdata.py"
+            "generated_by": "instar-testdata/scripts/create-format-confusion-testdata.py"
         },
         {
             "id": "vmdk-descriptor-multi-extent",
@@ -1154,7 +1154,7 @@
             "skip_qemu_img": true,
             "description": "VMDK with multiple extent declarations in descriptor",
             "tags": ["vmdk", "adversarial", "format-confusion", "descriptor", "multi-extent"],
-            "generated_by": "imago-testdata/scripts/create-format-confusion-testdata.py"
+            "generated_by": "instar-testdata/scripts/create-format-confusion-testdata.py"
         },
         {
             "id": "vmdk-descriptor-huge",
@@ -1165,7 +1165,7 @@
             "skip_qemu_img": true,
             "description": "VMDK header claiming >1MB descriptor size with tiny actual file",
             "tags": ["vmdk", "adversarial", "format-confusion", "descriptor"],
-            "generated_by": "imago-testdata/scripts/create-format-confusion-testdata.py"
+            "generated_by": "instar-testdata/scripts/create-format-confusion-testdata.py"
         },
 
         {
@@ -1178,7 +1178,7 @@
             "description": "CVE-2024-32498: QCOW2 with external data file pointing to /etc/passwd",
             "tags": ["qcow2", "security", "cve", "external-data", "path-traversal"],
             "cve_references": ["CVE-2024-32498"],
-            "generated_by": "imago-testdata/scripts/create-cve-reproducer-testdata.py"
+            "generated_by": "instar-testdata/scripts/create-cve-reproducer-testdata.py"
         },
         {
             "id": "cve-2015-5163-traversal-dotdot",
@@ -1190,7 +1190,7 @@
             "description": "CVE-2015-5163: QCOW2 with backing file using ../ path traversal",
             "tags": ["qcow2", "security", "cve", "backing-file", "path-traversal"],
             "cve_references": ["CVE-2015-5163"],
-            "generated_by": "imago-testdata/scripts/create-cve-reproducer-testdata.py"
+            "generated_by": "instar-testdata/scripts/create-cve-reproducer-testdata.py"
         },
         {
             "id": "cve-2015-5163-traversal-null",
@@ -1202,7 +1202,7 @@
             "description": "CVE-2015-5163: QCOW2 with backing file containing embedded null byte",
             "tags": ["qcow2", "security", "cve", "backing-file", "null-byte"],
             "cve_references": ["CVE-2015-5163"],
-            "generated_by": "imago-testdata/scripts/create-cve-reproducer-testdata.py"
+            "generated_by": "instar-testdata/scripts/create-cve-reproducer-testdata.py"
         },
         {
             "id": "cve-2022-47951-vmdk-hostile-extent",
@@ -1214,7 +1214,7 @@
             "description": "CVE-2022-47951: Text VMDK descriptor referencing /etc/shadow as FLAT extent",
             "tags": ["vmdk", "security", "cve", "path-traversal", "descriptor"],
             "cve_references": ["CVE-2022-47951"],
-            "generated_by": "imago-testdata/scripts/create-cve-reproducer-testdata.py"
+            "generated_by": "instar-testdata/scripts/create-cve-reproducer-testdata.py"
         },
         {
             "id": "cve-2015-5162-tiny-petabyte",
@@ -1226,7 +1226,7 @@
             "description": "CVE-2015-5162: Minimal QCOW2 (192 KiB) with correct L1 table for 1 PiB virtual size",
             "tags": ["qcow2", "security", "cve", "resource-exhaustion", "oversized"],
             "cve_references": ["CVE-2015-5162"],
-            "generated_by": "imago-testdata/scripts/create-cve-reproducer-testdata.py"
+            "generated_by": "instar-testdata/scripts/create-cve-reproducer-testdata.py"
         },
         {
             "id": "cve-2014-0223-l1-overflow-boundary",
@@ -1238,7 +1238,7 @@
             "description": "CVE-2014-0223: QCOW2 with l1_size at integer overflow boundary (u32::MAX/8+1)",
             "tags": ["qcow2", "security", "cve", "integer-overflow", "l1-table"],
             "cve_references": ["CVE-2014-0223"],
-            "generated_by": "imago-testdata/scripts/create-cve-reproducer-testdata.py"
+            "generated_by": "instar-testdata/scripts/create-cve-reproducer-testdata.py"
         },
         {
             "id": "cve-2024-4467-json-prefix",
@@ -1250,7 +1250,7 @@
             "description": "CVE-2024-4467: File with json:{} block device specification content",
             "tags": ["raw", "security", "cve", "json", "format-confusion"],
             "cve_references": ["CVE-2024-4467"],
-            "generated_by": "imago-testdata/scripts/create-cve-reproducer-testdata.py"
+            "generated_by": "instar-testdata/scripts/create-cve-reproducer-testdata.py"
         }
     ]
 }

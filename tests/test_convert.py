@@ -6,10 +6,10 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from base import ImagoTestBase
+from base import InstarTestBase
 
 
-class TestConvertBasicQcow2ToRaw(ImagoTestBase):
+class TestConvertBasicQcow2ToRaw(InstarTestBase):
     """Test basic QCOW2 to raw conversion."""
 
     def test_convert_empty_qcow2(self):
@@ -21,7 +21,7 @@ class TestConvertBasicQcow2ToRaw(ImagoTestBase):
                  qcow2.name, '1M'],
                 capture_output=True
             )
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(qcow2.name), Path(raw.name)
             )
             self.assertEqual(rc, 0, f'stderr: {stderr}')
@@ -32,7 +32,7 @@ class TestConvertBasicQcow2ToRaw(ImagoTestBase):
                 self.run_qemu_img_convert(
                     Path(qcow2.name), Path(qemu_raw.name)
                 )
-                cmp_out, cmp_err, cmp_rc = self.run_imago_compare(
+                cmp_out, cmp_err, cmp_rc = self.run_instar_compare(
                     Path(raw.name), Path(qemu_raw.name)
                 )
                 self.assertEqual(
@@ -59,7 +59,7 @@ class TestConvertBasicQcow2ToRaw(ImagoTestBase):
                  'write -P 0xAB 524288 8192', qcow2.name],
                 capture_output=True
             )
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(qcow2.name), Path(raw.name)
             )
             self.assertEqual(rc, 0, f'stderr: {stderr}')
@@ -69,7 +69,7 @@ class TestConvertBasicQcow2ToRaw(ImagoTestBase):
                 self.run_qemu_img_convert(
                     Path(qcow2.name), Path(qemu_raw.name)
                 )
-                cmp_out, _, cmp_rc = self.run_imago_compare(
+                cmp_out, _, cmp_rc = self.run_instar_compare(
                     Path(raw.name), Path(qemu_raw.name)
                 )
                 self.assertEqual(
@@ -86,14 +86,14 @@ class TestConvertBasicQcow2ToRaw(ImagoTestBase):
                  qcow2.name, '2M'],
                 capture_output=True
             )
-            self.run_imago_convert(
+            self.run_instar_convert(
                 Path(qcow2.name), Path(raw.name)
             )
             raw_size = os.path.getsize(raw.name)
             self.assertEqual(raw_size, 2 * 1024 * 1024)
 
 
-class TestConvertCompressed(ImagoTestBase):
+class TestConvertCompressed(InstarTestBase):
     """Test conversion of compressed QCOW2 images."""
 
     def test_convert_compressed_qcow2(self):
@@ -119,13 +119,13 @@ class TestConvertCompressed(ImagoTestBase):
                 capture_output=True
             )
             # Convert back to raw
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(comp.name), Path(output.name)
             )
             self.assertEqual(rc, 0, f'stderr: {stderr}')
 
             # Compare with original raw
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(base.name), Path(output.name)
             )
             self.assertEqual(
@@ -134,7 +134,7 @@ class TestConvertCompressed(ImagoTestBase):
             )
 
 
-class TestConvertBackingChain(ImagoTestBase):
+class TestConvertBackingChain(InstarTestBase):
     """Test conversion of QCOW2 images with backing chains."""
 
     def test_convert_with_raw_backing(self):
@@ -170,8 +170,8 @@ class TestConvertBackingChain(ImagoTestBase):
                 capture_output=True
             )
 
-            # Convert with imago
-            stdout, stderr, rc = self.run_imago_convert(
+            # Convert with instar
+            stdout, stderr, rc = self.run_instar_convert(
                 overlay_path, output_path
             )
             self.assertEqual(rc, 0, f'stderr: {stderr}')
@@ -180,7 +180,7 @@ class TestConvertBackingChain(ImagoTestBase):
             self.run_qemu_img_convert(
                 overlay_path, qemu_path
             )
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 output_path, qemu_path
             )
             self.assertEqual(
@@ -234,7 +234,7 @@ class TestConvertBackingChain(ImagoTestBase):
             )
 
             # Convert
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 top_path, output_path
             )
             self.assertEqual(rc, 0, f'stderr: {stderr}')
@@ -245,7 +245,7 @@ class TestConvertBackingChain(ImagoTestBase):
                  '-O', 'raw', str(top_path), str(qemu_path)],
                 capture_output=True
             )
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 output_path, qemu_path
             )
             self.assertEqual(
@@ -254,7 +254,7 @@ class TestConvertBackingChain(ImagoTestBase):
             )
 
 
-class TestConvertRawToRaw(ImagoTestBase):
+class TestConvertRawToRaw(InstarTestBase):
     """Test raw-to-raw passthrough conversion."""
 
     def test_convert_raw_passthrough(self):
@@ -271,12 +271,12 @@ class TestConvertRawToRaw(ImagoTestBase):
                  'write -P 0x77 0 4096', src.name],
                 capture_output=True
             )
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(src.name), Path(dst.name)
             )
             self.assertEqual(rc, 0, f'stderr: {stderr}')
 
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(src.name), Path(dst.name)
             )
             self.assertEqual(
@@ -285,7 +285,7 @@ class TestConvertRawToRaw(ImagoTestBase):
             )
 
 
-class TestConvertErrors(ImagoTestBase):
+class TestConvertErrors(InstarTestBase):
     """Test error handling in convert."""
 
     def test_convert_unsupported_output_format(self):
@@ -297,7 +297,7 @@ class TestConvertErrors(ImagoTestBase):
                  src.name, '1M'],
                 capture_output=True
             )
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(src.name), Path(dst.name),
                 output_format='vdi'
             )
@@ -307,14 +307,14 @@ class TestConvertErrors(ImagoTestBase):
     def test_convert_nonexistent_input(self):
         """Converting a nonexistent file returns an error."""
         with tempfile.NamedTemporaryFile(suffix='.raw') as dst:
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path('/nonexistent/image.qcow2'),
                 Path(dst.name)
             )
             self.assertNotEqual(rc, 0)
 
 
-class TestConvertManifestImages(ImagoTestBase):
+class TestConvertManifestImages(InstarTestBase):
     """Test convert against manifest QCOW2 images.
 
     For each safe standalone QCOW2 image in the manifest,
@@ -431,17 +431,17 @@ class TestConvertManifestImages(ImagoTestBase):
         timeout = self._timeout_for_vsize(vsize)
 
         with tempfile.NamedTemporaryFile(suffix='.raw') \
-                as imago_raw, \
+                as instar_raw, \
                 tempfile.NamedTemporaryFile(suffix='.raw') \
                 as qemu_raw:
-            # Convert with imago
-            stdout, stderr, rc = self.run_imago_convert(
-                image.path, Path(imago_raw.name),
+            # Convert with instar
+            stdout, stderr, rc = self.run_instar_convert(
+                image.path, Path(instar_raw.name),
                 timeout=timeout
             )
             self.assertEqual(
                 rc, 0,
-                f'imago convert failed for {image_id}: '
+                f'instar convert failed for {image_id}: '
                 f'{stderr}'
             )
 
@@ -458,8 +458,8 @@ class TestConvertManifestImages(ImagoTestBase):
             )
 
             # Compare outputs
-            cmp_out, _, cmp_rc = self.run_imago_compare(
-                Path(imago_raw.name),
+            cmp_out, _, cmp_rc = self.run_instar_compare(
+                Path(instar_raw.name),
                 Path(qemu_raw.name),
                 timeout=timeout
             )
@@ -522,7 +522,7 @@ class TestConvertManifestImages(ImagoTestBase):
         self._test_manifest_convert('qcow2-max-cluster')
 
 
-class TestConvertRawToQcow2(ImagoTestBase):
+class TestConvertRawToQcow2(InstarTestBase):
     """Test raw to QCOW2 conversion."""
 
     def test_convert_empty_raw_to_qcow2(self):
@@ -534,7 +534,7 @@ class TestConvertRawToQcow2(ImagoTestBase):
                  raw.name, '1M'],
                 capture_output=True
             )
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(raw.name), Path(qcow2.name),
                 output_format='qcow2'
             )
@@ -569,7 +569,7 @@ class TestConvertRawToQcow2(ImagoTestBase):
                  'write -P 0xAB 524288 8192', raw.name],
                 capture_output=True
             )
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(raw.name), Path(qcow2.name),
                 output_format='qcow2'
             )
@@ -593,7 +593,7 @@ class TestConvertRawToQcow2(ImagoTestBase):
                  raw.name, '2M'],
                 capture_output=True
             )
-            self.run_imago_convert(
+            self.run_instar_convert(
                 Path(raw.name), Path(qcow2.name),
                 output_format='qcow2'
             )
@@ -622,7 +622,7 @@ class TestConvertRawToQcow2(ImagoTestBase):
                  'write -P 0x42 0 4096', raw.name],
                 capture_output=True
             )
-            self.run_imago_convert(
+            self.run_instar_convert(
                 Path(raw.name), Path(qcow2.name),
                 output_format='qcow2', skip_zeros=True
             )
@@ -636,7 +636,7 @@ class TestConvertRawToQcow2(ImagoTestBase):
             )
 
 
-class TestConvertRoundTrip(ImagoTestBase):
+class TestConvertRoundTrip(InstarTestBase):
     """Test round-trip conversions."""
 
     def test_roundtrip_empty(self):
@@ -651,20 +651,20 @@ class TestConvertRoundTrip(ImagoTestBase):
                 capture_output=True
             )
             # raw -> qcow2
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(src.name), Path(mid.name),
                 output_format='qcow2'
             )
             self.assertEqual(rc, 0, f'stderr: {stderr}')
 
             # qcow2 -> raw
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(mid.name), Path(dst.name)
             )
             self.assertEqual(rc, 0, f'stderr: {stderr}')
 
             # Compare
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(src.name), Path(dst.name)
             )
             self.assertEqual(
@@ -694,15 +694,15 @@ class TestConvertRoundTrip(ImagoTestBase):
                 capture_output=True
             )
 
-            self.run_imago_convert(
+            self.run_instar_convert(
                 Path(src.name), Path(mid.name),
                 output_format='qcow2'
             )
-            self.run_imago_convert(
+            self.run_instar_convert(
                 Path(mid.name), Path(dst.name)
             )
 
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(src.name), Path(dst.name)
             )
             self.assertEqual(
@@ -727,15 +727,15 @@ class TestConvertRoundTrip(ImagoTestBase):
                 capture_output=True
             )
 
-            self.run_imago_convert(
+            self.run_instar_convert(
                 Path(src.name), Path(mid.name),
                 output_format='qcow2', skip_zeros=True
             )
-            self.run_imago_convert(
+            self.run_instar_convert(
                 Path(mid.name), Path(dst.name)
             )
 
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(src.name), Path(dst.name)
             )
             self.assertEqual(
@@ -763,7 +763,7 @@ class TestConvertRoundTrip(ImagoTestBase):
             )
 
             # Re-encode qcow2 -> qcow2
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(src.name), Path(mid.name),
                 output_format='qcow2'
             )
@@ -780,13 +780,13 @@ class TestConvertRoundTrip(ImagoTestBase):
             )
 
             # Convert both to raw and compare
-            self.run_imago_convert(
+            self.run_instar_convert(
                 Path(src.name), Path(r1.name)
             )
-            self.run_imago_convert(
+            self.run_instar_convert(
                 Path(mid.name), Path(r2.name)
             )
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(r1.name), Path(r2.name)
             )
             self.assertEqual(
@@ -795,11 +795,11 @@ class TestConvertRoundTrip(ImagoTestBase):
             )
 
 
-class TestConvertToQcow2CrossValidation(ImagoTestBase):
+class TestConvertToQcow2CrossValidation(InstarTestBase):
     """Cross-validate QCOW2 output with qemu-img."""
 
     def test_qemu_img_check_passes(self):
-        """qemu-img check passes on imago QCOW2 output."""
+        """qemu-img check passes on instar QCOW2 output."""
         with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
                 tempfile.NamedTemporaryFile(suffix='.qcow2') as q:
             subprocess.run(
@@ -812,7 +812,7 @@ class TestConvertToQcow2CrossValidation(ImagoTestBase):
                  'write -P 0x42 0 65536', raw.name],
                 capture_output=True
             )
-            self.run_imago_convert(
+            self.run_instar_convert(
                 Path(raw.name), Path(q.name),
                 output_format='qcow2'
             )
@@ -826,12 +826,12 @@ class TestConvertToQcow2CrossValidation(ImagoTestBase):
             )
 
     def test_qemu_img_can_read_output(self):
-        """qemu-img can convert imago QCOW2 output back."""
+        """qemu-img can convert instar QCOW2 output back."""
         with tempfile.NamedTemporaryFile(suffix='.raw') as src, \
                 tempfile.NamedTemporaryFile(
                     suffix='.qcow2') as mid, \
                 tempfile.NamedTemporaryFile(
-                    suffix='.raw') as imago_raw, \
+                    suffix='.raw') as instar_raw, \
                 tempfile.NamedTemporaryFile(
                     suffix='.raw') as qemu_raw:
             subprocess.run(
@@ -845,29 +845,29 @@ class TestConvertToQcow2CrossValidation(ImagoTestBase):
                 capture_output=True
             )
 
-            # imago raw -> qcow2
-            self.run_imago_convert(
+            # instar raw -> qcow2
+            self.run_instar_convert(
                 Path(src.name), Path(mid.name),
                 output_format='qcow2'
             )
-            # imago qcow2 -> raw
-            self.run_imago_convert(
-                Path(mid.name), Path(imago_raw.name)
+            # instar qcow2 -> raw
+            self.run_instar_convert(
+                Path(mid.name), Path(instar_raw.name)
             )
             # qemu-img qcow2 -> raw
             self.run_qemu_img_convert(
                 Path(mid.name), Path(qemu_raw.name)
             )
-            cmp_out, _, cmp_rc = self.run_imago_compare(
-                Path(imago_raw.name), Path(qemu_raw.name)
+            cmp_out, _, cmp_rc = self.run_instar_compare(
+                Path(instar_raw.name), Path(qemu_raw.name)
             )
             self.assertEqual(
                 cmp_rc, 0,
                 f'qemu-img read differs: {cmp_out}'
             )
 
-    def test_imago_check_passes(self):
-        """imago check passes on imago QCOW2 output."""
+    def test_instar_check_passes(self):
+        """instar check passes on instar QCOW2 output."""
         with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
                 tempfile.NamedTemporaryFile(suffix='.qcow2') as q:
             subprocess.run(
@@ -880,20 +880,20 @@ class TestConvertToQcow2CrossValidation(ImagoTestBase):
                  'write -P 0x42 0 4096', raw.name],
                 capture_output=True
             )
-            self.run_imago_convert(
+            self.run_instar_convert(
                 Path(raw.name), Path(q.name),
                 output_format='qcow2'
             )
-            stdout, stderr, rc = self.run_imago_check(
+            stdout, stderr, rc = self.run_instar_check(
                 Path(q.name)
             )
             self.assertEqual(
                 rc, 0,
-                f'imago check failed: {stderr}'
+                f'instar check failed: {stderr}'
             )
 
 
-class TestConvertToQcow2BackingChain(ImagoTestBase):
+class TestConvertToQcow2BackingChain(InstarTestBase):
     """Test flattening backing chains to standalone QCOW2."""
 
     def test_chain_to_qcow2(self):
@@ -929,7 +929,7 @@ class TestConvertToQcow2BackingChain(ImagoTestBase):
             )
 
             # Flatten to standalone QCOW2
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 overlay, output, output_format='qcow2'
             )
             self.assertEqual(rc, 0, f'stderr: {stderr}')
@@ -954,9 +954,9 @@ class TestConvertToQcow2BackingChain(ImagoTestBase):
             self.assertNotIn('backing-filename', info)
 
             # Compare virtual content
-            self.run_imago_convert(overlay, raw1)
-            self.run_imago_convert(output, raw2)
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            self.run_instar_convert(overlay, raw1)
+            self.run_instar_convert(output, raw2)
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 raw1, raw2
             )
             self.assertEqual(
@@ -965,7 +965,7 @@ class TestConvertToQcow2BackingChain(ImagoTestBase):
             )
 
 
-class TestConvertToQcow2ManifestRaw(ImagoTestBase):
+class TestConvertToQcow2ManifestRaw(InstarTestBase):
     """Convert manifest raw images to QCOW2.
 
     For each raw image in the manifest, convert to QCOW2,
@@ -974,7 +974,7 @@ class TestConvertToQcow2ManifestRaw(ImagoTestBase):
     """
 
     # Images with QCOW2 magic bytes (raw-misleading-header) are
-    # excluded because imago's format detection interprets them
+    # excluded because instar's format detection interprets them
     # as QCOW2, resulting in zero virtual size.
     RAW_IMAGE_IDS = [
         'raw-mbr-partitioned',
@@ -1006,7 +1006,7 @@ class TestConvertToQcow2ManifestRaw(ImagoTestBase):
                 tempfile.NamedTemporaryFile(
                     suffix='.raw') as roundtrip:
             # Convert raw -> qcow2
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(qcow2.name),
                 output_format='qcow2',
                 compress=self._compress,
@@ -1014,7 +1014,7 @@ class TestConvertToQcow2ManifestRaw(ImagoTestBase):
             )
             self.assertEqual(
                 rc, 0,
-                f'imago convert failed for {image_id}: '
+                f'instar convert failed for {image_id}: '
                 f'{stderr}'
             )
 
@@ -1031,7 +1031,7 @@ class TestConvertToQcow2ManifestRaw(ImagoTestBase):
             )
 
             # Round-trip: qcow2 -> raw
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(qcow2.name), Path(roundtrip.name),
                 timeout=120
             )
@@ -1042,7 +1042,7 @@ class TestConvertToQcow2ManifestRaw(ImagoTestBase):
             )
 
             # Compare with original
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 image.path, Path(roundtrip.name),
                 timeout=120
             )
@@ -1099,7 +1099,7 @@ class TestConvertToQcow2ManifestRaw(ImagoTestBase):
         )
 
 
-class TestConvertCompressedOutput(ImagoTestBase):
+class TestConvertCompressedOutput(InstarTestBase):
     """Test compressed QCOW2 output (-c flag)."""
 
     def test_compress_raw_to_qcow2(self):
@@ -1117,7 +1117,7 @@ class TestConvertCompressedOutput(ImagoTestBase):
                  'write -P 0x42 0 65536', raw.name],
                 capture_output=True
             )
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(raw.name), Path(qcow2.name),
                 output_format='qcow2', compress=True
             )
@@ -1157,20 +1157,20 @@ class TestConvertCompressedOutput(ImagoTestBase):
             )
 
             # raw -> compressed qcow2
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(src.name), Path(mid.name),
                 output_format='qcow2', compress=True
             )
             self.assertEqual(rc, 0, f'stderr: {stderr}')
 
             # compressed qcow2 -> raw
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(mid.name), Path(dst.name)
             )
             self.assertEqual(rc, 0, f'stderr: {stderr}')
 
             # Compare with original
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(src.name), Path(dst.name)
             )
             self.assertEqual(
@@ -1198,12 +1198,12 @@ class TestConvertCompressedOutput(ImagoTestBase):
             )
 
             # Uncompressed qcow2
-            self.run_imago_convert(
+            self.run_instar_convert(
                 Path(raw.name), Path(uncomp.name),
                 output_format='qcow2'
             )
             # Compressed qcow2
-            self.run_imago_convert(
+            self.run_instar_convert(
                 Path(raw.name), Path(comp.name),
                 output_format='qcow2', compress=True
             )
@@ -1238,7 +1238,7 @@ class TestConvertCompressedOutput(ImagoTestBase):
             )
 
             # Re-encode with compression
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(src.name), Path(comp.name),
                 output_format='qcow2', compress=True
             )
@@ -1255,13 +1255,13 @@ class TestConvertCompressedOutput(ImagoTestBase):
             )
 
             # Compare virtual content via raw
-            self.run_imago_convert(
+            self.run_instar_convert(
                 Path(src.name), Path(r1.name)
             )
-            self.run_imago_convert(
+            self.run_instar_convert(
                 Path(comp.name), Path(r2.name)
             )
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(r1.name), Path(r2.name)
             )
             self.assertEqual(
@@ -1302,7 +1302,7 @@ class TestConvertCompressedOutput(ImagoTestBase):
             )
 
             # Flatten to compressed QCOW2
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 overlay, output,
                 output_format='qcow2', compress=True
             )
@@ -1328,9 +1328,9 @@ class TestConvertCompressedOutput(ImagoTestBase):
             self.assertNotIn('backing-filename', info)
 
             # Compare virtual content
-            self.run_imago_convert(overlay, raw1)
-            self.run_imago_convert(output, raw2)
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            self.run_instar_convert(overlay, raw1)
+            self.run_instar_convert(output, raw2)
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 raw1, raw2
             )
             self.assertEqual(
@@ -1360,7 +1360,7 @@ class TestConvertCompressedOutput(ImagoTestBase):
                 capture_output=True
             )
 
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(raw.name), Path(qcow2.name),
                 output_format='qcow2', compress=True
             )
@@ -1377,10 +1377,10 @@ class TestConvertCompressedOutput(ImagoTestBase):
             )
 
             # Round-trip must preserve data
-            self.run_imago_convert(
+            self.run_instar_convert(
                 Path(qcow2.name), Path(roundtrip.name)
             )
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(raw.name), Path(roundtrip.name)
             )
             self.assertEqual(
@@ -1399,7 +1399,7 @@ class TestConvertCompressedOutput(ImagoTestBase):
                 capture_output=True
             )
 
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(raw.name), Path(qcow2.name),
                 output_format='qcow2', compress=True
             )
@@ -1415,12 +1415,12 @@ class TestConvertCompressedOutput(ImagoTestBase):
             )
 
     def test_compress_cross_validate_with_qemu(self):
-        """Cross-validate imago compressed output with qemu."""
+        """Cross-validate instar compressed output with qemu."""
         with tempfile.NamedTemporaryFile(suffix='.raw') as src, \
                 tempfile.NamedTemporaryFile(
                     suffix='.qcow2') as mid, \
                 tempfile.NamedTemporaryFile(
-                    suffix='.raw') as imago_raw, \
+                    suffix='.raw') as instar_raw, \
                 tempfile.NamedTemporaryFile(
                     suffix='.raw') as qemu_raw:
             subprocess.run(
@@ -1434,21 +1434,21 @@ class TestConvertCompressedOutput(ImagoTestBase):
                 capture_output=True
             )
 
-            # imago raw -> compressed qcow2
-            self.run_imago_convert(
+            # instar raw -> compressed qcow2
+            self.run_instar_convert(
                 Path(src.name), Path(mid.name),
                 output_format='qcow2', compress=True
             )
-            # imago compressed qcow2 -> raw
-            self.run_imago_convert(
-                Path(mid.name), Path(imago_raw.name)
+            # instar compressed qcow2 -> raw
+            self.run_instar_convert(
+                Path(mid.name), Path(instar_raw.name)
             )
             # qemu-img compressed qcow2 -> raw
             self.run_qemu_img_convert(
                 Path(mid.name), Path(qemu_raw.name)
             )
-            cmp_out, _, cmp_rc = self.run_imago_compare(
-                Path(imago_raw.name), Path(qemu_raw.name)
+            cmp_out, _, cmp_rc = self.run_instar_compare(
+                Path(instar_raw.name), Path(qemu_raw.name)
             )
             self.assertEqual(
                 cmp_rc, 0,
@@ -1468,7 +1468,7 @@ class TestConvertCompressedManifestRaw(
     _compress = True
 
 
-class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
+class TestConvertToQcow2ManifestQcow2(InstarTestBase):
     """Re-encode manifest QCOW2 images to fresh QCOW2.
 
     For each standalone QCOW2 in the manifest, re-encode to
@@ -1587,7 +1587,7 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
                 tempfile.NamedTemporaryFile(
                     suffix='.raw') as raw_reenc:
             # Re-encode: qcow2 -> qcow2
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(reenc.name),
                 output_format='qcow2',
                 compress=self._compress,
@@ -1622,7 +1622,7 @@ class TestConvertToQcow2ManifestQcow2(ImagoTestBase):
             )
 
             # Compare virtual content
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(raw_orig.name),
                 Path(raw_reenc.name),
                 timeout=timeout
@@ -1698,7 +1698,7 @@ class TestConvertCompressedManifestQcow2(
     _compress = True
 
 
-class TestConvertLargeCluster(ImagoTestBase):
+class TestConvertLargeCluster(InstarTestBase):
     """Test convert and compare with cluster sizes > 64KB.
 
     Verifies that large-cluster QCOW2 images can be converted to
@@ -1734,21 +1734,21 @@ class TestConvertLargeCluster(ImagoTestBase):
 
             with tempfile.NamedTemporaryFile(
                 suffix='.raw', delete=False
-            ) as imago_f, tempfile.NamedTemporaryFile(
+            ) as instar_f, tempfile.NamedTemporaryFile(
                 suffix='.raw', delete=False
             ) as qemu_f:
-                imago_raw = imago_f.name
+                instar_raw = instar_f.name
                 qemu_raw = qemu_f.name
                 try:
-                    # Convert with imago
+                    # Convert with instar
                     stdout, stderr, rc = \
-                        self.run_imago_convert(
+                        self.run_instar_convert(
                             Path(qcow2_path),
-                            Path(imago_raw),
+                            Path(instar_raw),
                         )
                     self.assertEqual(
                         rc, 0,
-                        f'imago convert failed: {stderr}'
+                        f'instar convert failed: {stderr}'
                     )
 
                     # Convert with qemu-img
@@ -1764,8 +1764,8 @@ class TestConvertLargeCluster(ImagoTestBase):
 
                     # Compare outputs
                     cmp_out, _, cmp_rc = \
-                        self.run_imago_compare(
-                            Path(imago_raw),
+                        self.run_instar_compare(
+                            Path(instar_raw),
                             Path(qemu_raw),
                         )
                     self.assertEqual(
@@ -1774,7 +1774,7 @@ class TestConvertLargeCluster(ImagoTestBase):
                         f'qemu-img: {cmp_out}'
                     )
                 finally:
-                    os.unlink(imago_raw)
+                    os.unlink(instar_raw)
                     os.unlink(qemu_raw)
         finally:
             os.unlink(qcow2_path)
@@ -1817,8 +1817,8 @@ class TestConvertLargeCluster(ImagoTestBase):
                 check=True, capture_output=True, timeout=30,
             )
 
-            # Compare QCOW2 against raw with imago
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            # Compare QCOW2 against raw with instar
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(qcow2_path), Path(raw_path),
             )
             self.assertEqual(
@@ -1831,10 +1831,10 @@ class TestConvertLargeCluster(ImagoTestBase):
             os.unlink(raw_path)
 
 
-class TestConvertLargeClusterOutput(ImagoTestBase):
+class TestConvertLargeClusterOutput(InstarTestBase):
     """Test QCOW2 output with large cluster sizes (>64KB).
 
-    Verifies that imago can produce valid QCOW2 images with
+    Verifies that instar can produce valid QCOW2 images with
     cluster sizes of 128KB and 2MB, both uncompressed and
     compressed, and that round-trip fidelity is preserved.
     """
@@ -1869,7 +1869,7 @@ class TestConvertLargeClusterOutput(ImagoTestBase):
                 )
 
             # raw -> qcow2 with large cluster
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(src), Path(mid),
                 output_format='qcow2',
                 cluster_size=cluster_size,
@@ -1906,7 +1906,7 @@ class TestConvertLargeClusterOutput(ImagoTestBase):
             )
 
             # qcow2 -> raw
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(mid), Path(dst), timeout=120,
             )
             self.assertEqual(
@@ -1915,7 +1915,7 @@ class TestConvertLargeClusterOutput(ImagoTestBase):
             )
 
             # Compare round-trip
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(src), Path(dst),
             )
             self.assertEqual(
@@ -1975,7 +1975,7 @@ class TestConvertLargeClusterOutput(ImagoTestBase):
             )
 
             # Convert QCOW2 -> QCOW2 with 128KB clusters
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(src), Path(dst),
                 output_format='qcow2',
                 cluster_size=131072,
@@ -2005,7 +2005,7 @@ class TestConvertLargeClusterOutput(ImagoTestBase):
             self.assertEqual(info['cluster-size'], 131072)
 
             # Compare content against original raw
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(raw), Path(dst),
             )
             self.assertEqual(
@@ -2039,8 +2039,8 @@ class TestConvertLargeClusterOutput(ImagoTestBase):
                 check=True, capture_output=True, timeout=30,
             )
 
-            # Convert with imago, preserving 2MB cluster size
-            stdout, stderr, rc = self.run_imago_convert(
+            # Convert with instar, preserving 2MB cluster size
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(src), Path(dst),
                 output_format='qcow2',
                 cluster_size=2097152,
@@ -2070,7 +2070,7 @@ class TestConvertLargeClusterOutput(ImagoTestBase):
             self.assertEqual(info['cluster-size'], 2097152)
 
             # Compare content
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(src), Path(dst),
             )
             self.assertEqual(
@@ -2083,7 +2083,7 @@ class TestConvertLargeClusterOutput(ImagoTestBase):
                     os.unlink(p)
 
 
-class TestConvertVmdkToRaw(ImagoTestBase):
+class TestConvertVmdkToRaw(InstarTestBase):
     """Test VMDK monolithicSparse to raw conversion.
 
     Converts monolithicSparse VMDK images to raw and
@@ -2130,17 +2130,17 @@ class TestConvertVmdkToRaw(ImagoTestBase):
         timeout = self._timeout_for_vsize(vsize)
 
         with tempfile.NamedTemporaryFile(suffix='.raw') \
-                as imago_raw, \
+                as instar_raw, \
                 tempfile.NamedTemporaryFile(suffix='.raw') \
                 as qemu_raw:
-            # Convert with imago
-            stdout, stderr, rc = self.run_imago_convert(
-                image.path, Path(imago_raw.name),
+            # Convert with instar
+            stdout, stderr, rc = self.run_instar_convert(
+                image.path, Path(instar_raw.name),
                 timeout=timeout
             )
             self.assertEqual(
                 rc, 0,
-                f'imago convert failed for {image_id}: '
+                f'instar convert failed for {image_id}: '
                 f'{stderr}'
             )
 
@@ -2157,8 +2157,8 @@ class TestConvertVmdkToRaw(ImagoTestBase):
             )
 
             # Compare outputs
-            cmp_out, _, cmp_rc = self.run_imago_compare(
-                Path(imago_raw.name),
+            cmp_out, _, cmp_rc = self.run_instar_compare(
+                Path(instar_raw.name),
                 Path(qemu_raw.name),
                 timeout=timeout
             )
@@ -2181,10 +2181,10 @@ class TestConvertVmdkToRaw(ImagoTestBase):
         self._test_vmdk_convert('chain-base-vmdk')
 
 
-class TestConvertVmdkCompare(ImagoTestBase):
+class TestConvertVmdkCompare(InstarTestBase):
     """Test comparing VMDK images against raw equivalents.
 
-    Uses imago compare to verify VMDK virtual content matches
+    Uses instar compare to verify VMDK virtual content matches
     the qemu-img-converted raw baseline.
     """
 
@@ -2212,7 +2212,7 @@ class TestConvertVmdkCompare(ImagoTestBase):
             )
 
             # Compare VMDK directly against raw
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 image.path, Path(qemu_raw.name),
                 timeout=120
             )
@@ -2235,7 +2235,7 @@ class TestConvertVmdkCompare(ImagoTestBase):
         self._compare_vmdk_vs_raw('chain-base-vmdk')
 
 
-class TestConvertVmdkStreamOptimized(ImagoTestBase):
+class TestConvertVmdkStreamOptimized(InstarTestBase):
     """Test streamOptimized VMDK conversion and comparison.
 
     streamOptimized VMDKs use DEFLATE-compressed grains with
@@ -2277,17 +2277,17 @@ class TestConvertVmdkStreamOptimized(ImagoTestBase):
                                 / (1024 ** 3) * 10))
 
         with tempfile.NamedTemporaryFile(suffix='.raw') \
-                as imago_raw, \
+                as instar_raw, \
                 tempfile.NamedTemporaryFile(suffix='.raw') \
                 as qemu_raw:
-            # Convert with imago
-            stdout, stderr, rc = self.run_imago_convert(
-                image.path, Path(imago_raw.name),
+            # Convert with instar
+            stdout, stderr, rc = self.run_instar_convert(
+                image.path, Path(instar_raw.name),
                 timeout=timeout
             )
             self.assertEqual(
                 rc, 0,
-                f'imago convert failed for {image_id}: '
+                f'instar convert failed for {image_id}: '
                 f'{stderr}'
             )
 
@@ -2304,8 +2304,8 @@ class TestConvertVmdkStreamOptimized(ImagoTestBase):
             )
 
             # Compare outputs
-            cmp_out, _, cmp_rc = self.run_imago_compare(
-                Path(imago_raw.name),
+            cmp_out, _, cmp_rc = self.run_instar_compare(
+                Path(instar_raw.name),
                 Path(qemu_raw.name),
                 timeout=timeout
             )
@@ -2352,7 +2352,7 @@ class TestConvertVmdkStreamOptimized(ImagoTestBase):
                 f'{image_id}: {q_stderr}'
             )
 
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 image.path, Path(qemu_raw.name),
                 timeout=timeout
             )
@@ -2373,10 +2373,10 @@ class TestConvertVmdkStreamOptimized(ImagoTestBase):
         self._compare_streamopt_vs_raw('vmdk-v3')
 
 
-class TestConvertToVmdk(ImagoTestBase):
+class TestConvertToVmdk(InstarTestBase):
     """Test converting images to VMDK monolithicSparse output.
 
-    Converts images to VMDK with imago, then verifies the output
+    Converts images to VMDK with instar, then verifies the output
     by converting back to raw and comparing against qemu-img.
     """
 
@@ -2395,15 +2395,15 @@ class TestConvertToVmdk(ImagoTestBase):
                 suffix='.raw') as rt_raw, \
                 tempfile.NamedTemporaryFile(
                 suffix='.raw') as qemu_raw:
-            # Convert to VMDK with imago
-            stdout, stderr, rc = self.run_imago_convert(
+            # Convert to VMDK with instar
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(vmdk_out.name),
                 output_format='vmdk',
                 timeout=120
             )
             self.assertEqual(
                 rc, 0,
-                f'imago convert to vmdk failed for '
+                f'instar convert to vmdk failed for '
                 f'{image_id}: {stderr}'
             )
 
@@ -2418,7 +2418,7 @@ class TestConvertToVmdk(ImagoTestBase):
             )
             self.assertEqual(
                 result.returncode, 0,
-                f'qemu-img info failed on imago VMDK: '
+                f'qemu-img info failed on instar VMDK: '
                 f'{result.stderr}'
             )
             info = json.loads(result.stdout)
@@ -2430,7 +2430,7 @@ class TestConvertToVmdk(ImagoTestBase):
 
             # Round-trip: convert VMDK back to raw
             rt_stdout, rt_stderr, rt_rc = \
-                self.run_imago_convert(
+                self.run_instar_convert(
                     Path(vmdk_out.name),
                     Path(rt_raw.name),
                     timeout=120
@@ -2453,7 +2453,7 @@ class TestConvertToVmdk(ImagoTestBase):
             )
 
             # Compare round-tripped raw vs qemu-img raw
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(rt_raw.name),
                 Path(qemu_raw.name),
                 timeout=120
@@ -2477,7 +2477,7 @@ class TestConvertToVmdk(ImagoTestBase):
         self._test_to_vmdk_roundtrip('plaso-vmdk')
 
 
-class TestConvertToVmdkCompressed(ImagoTestBase):
+class TestConvertToVmdkCompressed(InstarTestBase):
     """Test converting images to streamOptimized VMDK output.
 
     Uses -O vmdk -c to produce compressed streamOptimized VMDKs,
@@ -2502,7 +2502,7 @@ class TestConvertToVmdkCompressed(ImagoTestBase):
                 tempfile.NamedTemporaryFile(
                 suffix='.raw') as qemu_raw:
             # Convert to streamOptimized VMDK
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(vmdk_out.name),
                 output_format='vmdk',
                 compress=True,
@@ -2510,7 +2510,7 @@ class TestConvertToVmdkCompressed(ImagoTestBase):
             )
             self.assertEqual(
                 rc, 0,
-                f'imago convert to streamOptimized vmdk '
+                f'instar convert to streamOptimized vmdk '
                 f'failed for {image_id}: {stderr}'
             )
 
@@ -2536,7 +2536,7 @@ class TestConvertToVmdkCompressed(ImagoTestBase):
 
             # Round-trip: streamOptimized VMDK -> raw
             rt_stdout, rt_stderr, rt_rc = \
-                self.run_imago_convert(
+                self.run_instar_convert(
                     Path(vmdk_out.name),
                     Path(rt_raw.name),
                     timeout=timeout
@@ -2559,7 +2559,7 @@ class TestConvertToVmdkCompressed(ImagoTestBase):
             )
 
             # Compare round-tripped raw vs qemu-img raw
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(rt_raw.name),
                 Path(qemu_raw.name),
                 timeout=timeout
@@ -2587,10 +2587,10 @@ class TestConvertToVmdkCompressed(ImagoTestBase):
         self._test_to_vmdk_compressed_roundtrip('plaso-vmdk')
 
 
-class TestConvertVmdkToQcow2Roundtrip(ImagoTestBase):
+class TestConvertVmdkToQcow2Roundtrip(InstarTestBase):
     """Test VMDK -> QCOW2 -> raw roundtrip conversions.
 
-    Converts VMDK images to QCOW2 with imago, then back to raw,
+    Converts VMDK images to QCOW2 with instar, then back to raw,
     and cross-validates against qemu-img.
     """
 
@@ -2610,20 +2610,20 @@ class TestConvertVmdkToQcow2Roundtrip(ImagoTestBase):
                 tempfile.NamedTemporaryFile(
                 suffix='.raw') as qemu_raw:
             # Convert VMDK to QCOW2
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(qcow2_out.name),
                 output_format='qcow2',
                 timeout=120
             )
             self.assertEqual(
                 rc, 0,
-                f'imago convert vmdk->qcow2 failed for '
+                f'instar convert vmdk->qcow2 failed for '
                 f'{image_id}: {stderr}'
             )
 
             # Round-trip: QCOW2 -> raw
             rt_stdout, rt_stderr, rt_rc = \
-                self.run_imago_convert(
+                self.run_instar_convert(
                     Path(qcow2_out.name),
                     Path(rt_raw.name),
                     timeout=120
@@ -2646,7 +2646,7 @@ class TestConvertVmdkToQcow2Roundtrip(ImagoTestBase):
             )
 
             # Compare round-tripped raw vs qemu-img raw
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(rt_raw.name),
                 Path(qemu_raw.name),
                 timeout=120
@@ -2674,10 +2674,10 @@ class TestConvertVmdkToQcow2Roundtrip(ImagoTestBase):
         )
 
 
-class TestConvertVmdkCheckOutput(ImagoTestBase):
-    """Test that imago-produced VMDK output passes check.
+class TestConvertVmdkCheckOutput(InstarTestBase):
+    """Test that instar-produced VMDK output passes check.
 
-    Converts images to VMDK, then runs imago check to verify
+    Converts images to VMDK, then runs instar check to verify
     structural integrity of our own output.
     """
 
@@ -2695,7 +2695,7 @@ class TestConvertVmdkCheckOutput(ImagoTestBase):
         with tempfile.NamedTemporaryFile(
                 suffix='.vmdk') as vmdk_out:
             # Convert to VMDK
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(vmdk_out.name),
                 output_format='vmdk',
                 compress=compress,
@@ -2703,13 +2703,13 @@ class TestConvertVmdkCheckOutput(ImagoTestBase):
             )
             self.assertEqual(
                 rc, 0,
-                f'imago convert to vmdk failed for '
+                f'instar convert to vmdk failed for '
                 f'{image_id}: {stderr}'
             )
 
             # Check the output VMDK
             chk_stdout, chk_stderr, chk_rc = \
-                self.run_imago_check(
+                self.run_instar_check(
                     Path(vmdk_out.name),
                     output_format='json'
                 )
@@ -2721,32 +2721,32 @@ class TestConvertVmdkCheckOutput(ImagoTestBase):
             )
             self.assertEqual(
                 result.get('check-errors', -1), 0,
-                f'imago VMDK output should have 0 errors: '
+                f'instar VMDK output should have 0 errors: '
                 f'{chk_stdout}'
             )
 
     def test_check_monolithic_sparse_output(self):
-        """Check imago monolithicSparse VMDK output."""
+        """Check instar monolithicSparse VMDK output."""
         self._test_vmdk_output_check(
             'raw-mbr-partitioned'
         )
 
     def test_check_streamoptimized_output(self):
-        """Check imago streamOptimized VMDK output."""
+        """Check instar streamOptimized VMDK output."""
         self._test_vmdk_output_check(
             'raw-mbr-partitioned', compress=True
         )
 
     def test_check_qcow2_to_vmdk_output(self):
-        """Check imago VMDK output from QCOW2 input."""
+        """Check instar VMDK output from QCOW2 input."""
         self._test_vmdk_output_check('cirros-qcow2')
 
     def test_check_vmdk_to_vmdk_output(self):
-        """Check imago VMDK output from VMDK input."""
+        """Check instar VMDK output from VMDK input."""
         self._test_vmdk_output_check('plaso-vmdk')
 
 
-class TestConvertVhdxToRaw(ImagoTestBase):
+class TestConvertVhdxToRaw(InstarTestBase):
     """Test VHDX to raw conversion.
 
     Converts VHDX images to raw and cross-validates against
@@ -2792,17 +2792,17 @@ class TestConvertVhdxToRaw(ImagoTestBase):
         timeout = self._timeout_for_vsize(vsize)
 
         with tempfile.NamedTemporaryFile(suffix='.raw') \
-                as imago_raw, \
+                as instar_raw, \
                 tempfile.NamedTemporaryFile(suffix='.raw') \
                 as qemu_raw:
-            # Convert with imago
-            stdout, stderr, rc = self.run_imago_convert(
-                image.path, Path(imago_raw.name),
+            # Convert with instar
+            stdout, stderr, rc = self.run_instar_convert(
+                image.path, Path(instar_raw.name),
                 timeout=timeout
             )
             self.assertEqual(
                 rc, 0,
-                f'imago convert failed for {image_id}: '
+                f'instar convert failed for {image_id}: '
                 f'{stderr}'
             )
 
@@ -2819,8 +2819,8 @@ class TestConvertVhdxToRaw(ImagoTestBase):
             )
 
             # Compare outputs
-            cmp_out, _, cmp_rc = self.run_imago_compare(
-                Path(imago_raw.name),
+            cmp_out, _, cmp_rc = self.run_instar_compare(
+                Path(instar_raw.name),
                 Path(qemu_raw.name),
                 timeout=timeout
             )
@@ -2839,10 +2839,10 @@ class TestConvertVhdxToRaw(ImagoTestBase):
         self._test_vhdx_convert('vhdx-disk2vhd')
 
 
-class TestConvertVhdxCompare(ImagoTestBase):
+class TestConvertVhdxCompare(InstarTestBase):
     """Test comparing VHDX images against raw equivalents.
 
-    Uses imago compare to verify VHDX virtual content matches
+    Uses instar compare to verify VHDX virtual content matches
     the qemu-img-converted raw baseline.
     """
 
@@ -2870,7 +2870,7 @@ class TestConvertVhdxCompare(ImagoTestBase):
             )
 
             # Compare VHDX directly against raw
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 image.path, Path(qemu_raw.name),
                 timeout=120
             )
@@ -2889,10 +2889,10 @@ class TestConvertVhdxCompare(ImagoTestBase):
         self._compare_vhdx_vs_raw('vhdx-disk2vhd')
 
 
-class TestConvertToVhdx(ImagoTestBase):
+class TestConvertToVhdx(InstarTestBase):
     """Test converting images to VHDX output.
 
-    Converts images to VHDX with imago, then verifies the output
+    Converts images to VHDX with instar, then verifies the output
     by converting back to raw and comparing against qemu-img.
     """
 
@@ -2911,15 +2911,15 @@ class TestConvertToVhdx(ImagoTestBase):
                 suffix='.raw') as rt_raw, \
                 tempfile.NamedTemporaryFile(
                 suffix='.raw') as qemu_raw:
-            # Convert to VHDX with imago
-            stdout, stderr, rc = self.run_imago_convert(
+            # Convert to VHDX with instar
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(vhdx_out.name),
                 output_format='vhdx',
                 timeout=120
             )
             self.assertEqual(
                 rc, 0,
-                f'imago convert to vhdx failed for '
+                f'instar convert to vhdx failed for '
                 f'{image_id}: {stderr}'
             )
 
@@ -2934,7 +2934,7 @@ class TestConvertToVhdx(ImagoTestBase):
             )
             self.assertEqual(
                 result.returncode, 0,
-                f'qemu-img info failed on imago VHDX: '
+                f'qemu-img info failed on instar VHDX: '
                 f'{result.stderr}'
             )
             info = json.loads(result.stdout)
@@ -2946,7 +2946,7 @@ class TestConvertToVhdx(ImagoTestBase):
 
             # Round-trip: convert VHDX back to raw
             rt_stdout, rt_stderr, rt_rc = \
-                self.run_imago_convert(
+                self.run_instar_convert(
                     Path(vhdx_out.name),
                     Path(rt_raw.name),
                     timeout=120
@@ -2969,7 +2969,7 @@ class TestConvertToVhdx(ImagoTestBase):
             )
 
             # Compare round-tripped raw vs qemu-img raw
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(rt_raw.name),
                 Path(qemu_raw.name),
                 timeout=120
@@ -2993,10 +2993,10 @@ class TestConvertToVhdx(ImagoTestBase):
         self._test_to_vhdx_roundtrip('qemu-vhdx')
 
 
-class TestConvertVhdxCheckOutput(ImagoTestBase):
-    """Test that imago-produced VHDX output passes check.
+class TestConvertVhdxCheckOutput(InstarTestBase):
+    """Test that instar-produced VHDX output passes check.
 
-    Converts images to VHDX, then runs imago check to verify
+    Converts images to VHDX, then runs instar check to verify
     structural integrity of our own output.
     """
 
@@ -3012,20 +3012,20 @@ class TestConvertVhdxCheckOutput(ImagoTestBase):
         with tempfile.NamedTemporaryFile(
                 suffix='.vhdx') as vhdx_out:
             # Convert to VHDX
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(vhdx_out.name),
                 output_format='vhdx',
                 timeout=120
             )
             self.assertEqual(
                 rc, 0,
-                f'imago convert to vhdx failed for '
+                f'instar convert to vhdx failed for '
                 f'{image_id}: {stderr}'
             )
 
             # Check the output VHDX
             chk_stdout, chk_stderr, chk_rc = \
-                self.run_imago_check(
+                self.run_instar_check(
                     Path(vhdx_out.name),
                     output_format='json'
                 )
@@ -3038,26 +3038,26 @@ class TestConvertVhdxCheckOutput(ImagoTestBase):
             )
             self.assertEqual(
                 result.get('check-errors', -1), 0,
-                f'imago VHDX output should have 0 '
+                f'instar VHDX output should have 0 '
                 f'errors: {chk_stdout}'
             )
 
     def test_check_raw_to_vhdx_output(self):
-        """Check imago VHDX output from raw input."""
+        """Check instar VHDX output from raw input."""
         self._test_vhdx_output_check(
             'raw-mbr-partitioned'
         )
 
     def test_check_qcow2_to_vhdx_output(self):
-        """Check imago VHDX output from QCOW2 input."""
+        """Check instar VHDX output from QCOW2 input."""
         self._test_vhdx_output_check('cirros-qcow2')
 
     def test_check_vhdx_to_vhdx_output(self):
-        """Check imago VHDX output from VHDX input."""
+        """Check instar VHDX output from VHDX input."""
         self._test_vhdx_output_check('qemu-vhdx')
 
 
-class TestConvertVhdToRaw(ImagoTestBase):
+class TestConvertVhdToRaw(InstarTestBase):
     """Test VHD to raw conversion.
 
     Converts dynamic VHD images to raw and cross-validates
@@ -3105,16 +3105,16 @@ class TestConvertVhdToRaw(ImagoTestBase):
             timeout = 120
 
         with tempfile.NamedTemporaryFile(suffix='.raw') \
-                as imago_raw, \
+                as instar_raw, \
                 tempfile.NamedTemporaryFile(suffix='.raw') \
                 as qemu_raw:
-            stdout, stderr, rc = self.run_imago_convert(
-                image.path, Path(imago_raw.name),
+            stdout, stderr, rc = self.run_instar_convert(
+                image.path, Path(instar_raw.name),
                 timeout=timeout
             )
             self.assertEqual(
                 rc, 0,
-                f'imago convert failed for {image_id}: '
+                f'instar convert failed for {image_id}: '
                 f'{stderr}'
             )
 
@@ -3129,8 +3129,8 @@ class TestConvertVhdToRaw(ImagoTestBase):
                 f'{image_id}: {q_stderr}'
             )
 
-            cmp_out, _, cmp_rc = self.run_imago_compare(
-                Path(imago_raw.name),
+            cmp_out, _, cmp_rc = self.run_instar_compare(
+                Path(instar_raw.name),
                 Path(qemu_raw.name),
                 timeout=timeout
             )
@@ -3164,12 +3164,12 @@ class TestConvertVhdToRaw(ImagoTestBase):
             self.skipTest(f'Image not found: {image.path}')
 
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(out.name), timeout=60
             )
             self.assertEqual(
                 rc, 0,
-                f'imago convert failed for vhd-fixed: {stderr}'
+                f'instar convert failed for vhd-fixed: {stderr}'
             )
 
             # Output should be 10 MiB (no footer)
@@ -3188,10 +3188,10 @@ class TestConvertVhdToRaw(ImagoTestBase):
             )
 
 
-class TestConvertVhdCompare(ImagoTestBase):
+class TestConvertVhdCompare(InstarTestBase):
     """Test comparing VHD images against raw equivalents.
 
-    Uses imago compare to verify VHD virtual content matches
+    Uses instar compare to verify VHD virtual content matches
     the qemu-img-converted raw baseline.
     """
 
@@ -3237,7 +3237,7 @@ class TestConvertVhdCompare(ImagoTestBase):
                 f'qemu-img convert failed: {q_stderr}'
             )
 
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 image.path, Path(qemu_raw.name),
                 timeout=timeout
             )
@@ -3260,10 +3260,10 @@ class TestConvertVhdCompare(ImagoTestBase):
         self._compare_vhd_vs_raw('vhd-d2v-zerofilled')
 
 
-class TestConvertToVhd(ImagoTestBase):
+class TestConvertToVhd(InstarTestBase):
     """Test converting images to VHD output.
 
-    Converts images to VHD with imago, then verifies the output
+    Converts images to VHD with instar, then verifies the output
     by converting back to raw and comparing against qemu-img.
     """
 
@@ -3303,15 +3303,15 @@ class TestConvertToVhd(ImagoTestBase):
                 suffix='.raw') as rt_raw, \
                 tempfile.NamedTemporaryFile(
                 suffix='.raw') as qemu_raw:
-            # Convert to VHD with imago
-            stdout, stderr, rc = self.run_imago_convert(
+            # Convert to VHD with instar
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(vhd_out.name),
                 output_format='vpc',
                 timeout=timeout
             )
             self.assertEqual(
                 rc, 0,
-                f'imago convert to vpc failed for '
+                f'instar convert to vpc failed for '
                 f'{image_id}: {stderr}'
             )
 
@@ -3326,7 +3326,7 @@ class TestConvertToVhd(ImagoTestBase):
             )
             self.assertEqual(
                 result.returncode, 0,
-                f'qemu-img info failed on imago VHD: '
+                f'qemu-img info failed on instar VHD: '
                 f'{result.stderr}'
             )
             info = json.loads(result.stdout)
@@ -3338,7 +3338,7 @@ class TestConvertToVhd(ImagoTestBase):
 
             # Round-trip: convert VHD back to raw
             rt_stdout, rt_stderr, rt_rc = \
-                self.run_imago_convert(
+                self.run_instar_convert(
                     Path(vhd_out.name),
                     Path(rt_raw.name),
                     timeout=timeout
@@ -3362,7 +3362,7 @@ class TestConvertToVhd(ImagoTestBase):
             )
 
             # Compare round-trip against baseline
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(rt_raw.name),
                 Path(qemu_raw.name),
                 timeout=timeout
@@ -3390,10 +3390,10 @@ class TestConvertToVhd(ImagoTestBase):
         )
 
 
-class TestConvertVhdCheckOutput(ImagoTestBase):
-    """Test that imago-produced VHD output passes check.
+class TestConvertVhdCheckOutput(InstarTestBase):
+    """Test that instar-produced VHD output passes check.
 
-    Converts images to VHD, then runs imago check to verify
+    Converts images to VHD, then runs instar check to verify
     structural integrity of our own output.
     """
 
@@ -3409,20 +3409,20 @@ class TestConvertVhdCheckOutput(ImagoTestBase):
         with tempfile.NamedTemporaryFile(
                 suffix='.vhd') as vhd_out:
             # Convert to VHD
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(vhd_out.name),
                 output_format='vpc',
                 timeout=120
             )
             self.assertEqual(
                 rc, 0,
-                f'imago convert to vpc failed for '
+                f'instar convert to vpc failed for '
                 f'{image_id}: {stderr}'
             )
 
             # Check the output VHD
             chk_stdout, chk_stderr, chk_rc = \
-                self.run_imago_check(
+                self.run_instar_check(
                     Path(vhd_out.name),
                     output_format='json'
                 )
@@ -3434,28 +3434,28 @@ class TestConvertVhdCheckOutput(ImagoTestBase):
             )
             self.assertEqual(
                 result.get('check-errors', -1), 0,
-                f'imago VHD output should have 0 '
+                f'instar VHD output should have 0 '
                 f'errors: {chk_stdout}'
             )
 
     def test_check_raw_to_vhd_output(self):
-        """Check imago VHD output from raw input."""
+        """Check instar VHD output from raw input."""
         self._test_vhd_output_check(
             'raw-mbr-partitioned'
         )
 
     def test_check_qcow2_to_vhd_output(self):
-        """Check imago VHD output from QCOW2 input."""
+        """Check instar VHD output from QCOW2 input."""
         self._test_vhd_output_check('cirros-qcow2')
 
     def test_check_vhd_to_vhd_output(self):
-        """Check imago VHD output from VHD input."""
+        """Check instar VHD output from VHD input."""
         self._test_vhd_output_check(
             'vhd-d2v-zerofilled'
         )
 
 
-class TestConvertVhdToQcow2Roundtrip(ImagoTestBase):
+class TestConvertVhdToQcow2Roundtrip(InstarTestBase):
     """Test VHD -> QCOW2 -> raw round-trip conversion.
 
     Converts VHD to QCOW2, then to raw, and compares
@@ -3499,7 +3499,7 @@ class TestConvertVhdToQcow2Roundtrip(ImagoTestBase):
                 tempfile.NamedTemporaryFile(
                 suffix='.raw') as qemu_raw:
             # VHD -> QCOW2
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(qcow2_out.name),
                 output_format='qcow2',
                 timeout=timeout
@@ -3512,7 +3512,7 @@ class TestConvertVhdToQcow2Roundtrip(ImagoTestBase):
 
             # QCOW2 -> raw
             rt_stdout, rt_stderr, rt_rc = \
-                self.run_imago_convert(
+                self.run_instar_convert(
                     Path(qcow2_out.name),
                     Path(rt_raw.name),
                     timeout=timeout
@@ -3536,7 +3536,7 @@ class TestConvertVhdToQcow2Roundtrip(ImagoTestBase):
             )
 
             # Compare round-trip against baseline
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(rt_raw.name),
                 Path(qemu_raw.name),
                 timeout=timeout
@@ -3558,7 +3558,7 @@ class TestConvertVhdToQcow2Roundtrip(ImagoTestBase):
         self._test_vhd_qcow2_roundtrip('virtualpc-vhd')
 
 
-class TestConvertSnapshot(ImagoTestBase):
+class TestConvertSnapshot(InstarTestBase):
     """Test conversion of specific QCOW2 snapshots."""
 
     def test_convert_snap1(self):
@@ -3573,8 +3573,8 @@ class TestConvertSnapshot(ImagoTestBase):
                 suffix='.raw') as raw_out, \
                 tempfile.NamedTemporaryFile(
                 suffix='.raw') as qemu_raw:
-            # Convert snap1 with imago
-            stdout, stderr, rc = self.run_imago_convert(
+            # Convert snap1 with instar
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name),
                 snapshot='snap1'
             )
@@ -3597,7 +3597,7 @@ class TestConvertSnapshot(ImagoTestBase):
             )
 
             # Compare outputs
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(raw_out.name),
                 Path(qemu_raw.name)
             )
@@ -3619,8 +3619,8 @@ class TestConvertSnapshot(ImagoTestBase):
                 suffix='.raw') as raw_out, \
                 tempfile.NamedTemporaryFile(
                 suffix='.raw') as qemu_raw:
-            # Convert snap2 with imago
-            stdout, stderr, rc = self.run_imago_convert(
+            # Convert snap2 with instar
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name),
                 snapshot='snap2'
             )
@@ -3643,7 +3643,7 @@ class TestConvertSnapshot(ImagoTestBase):
             )
 
             # Compare outputs
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(raw_out.name),
                 Path(qemu_raw.name)
             )
@@ -3666,8 +3666,8 @@ class TestConvertSnapshot(ImagoTestBase):
                 suffix='.raw') as raw_out, \
                 tempfile.NamedTemporaryFile(
                 suffix='.raw') as qemu_raw:
-            # Convert snapshot ID "1" with imago
-            stdout, stderr, rc = self.run_imago_convert(
+            # Convert snapshot ID "1" with instar
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name),
                 snapshot='1'
             )
@@ -3691,7 +3691,7 @@ class TestConvertSnapshot(ImagoTestBase):
             )
 
             # Compare outputs — ID "1" should match snap1
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(raw_out.name),
                 Path(qemu_raw.name)
             )
@@ -3711,7 +3711,7 @@ class TestConvertSnapshot(ImagoTestBase):
 
         with tempfile.NamedTemporaryFile(
                 suffix='.raw') as raw_out:
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name),
                 snapshot='nonexistent'
             )
@@ -3721,7 +3721,7 @@ class TestConvertSnapshot(ImagoTestBase):
             )
 
 
-class TestConvertEncryptedQcow2(ImagoTestBase):
+class TestConvertEncryptedQcow2(InstarTestBase):
     """Test conversion of AES-encrypted QCOW2 images."""
 
     def test_convert_encrypted_aes_to_raw(self):
@@ -3736,8 +3736,8 @@ class TestConvertEncryptedQcow2(ImagoTestBase):
                 suffix='.raw') as raw_out, \
                 tempfile.NamedTemporaryFile(
                 suffix='.raw') as qemu_raw:
-            # Convert with imago using password
-            stdout, stderr, rc = self.run_imago_convert(
+            # Convert with instar using password
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name),
                 qcow2_password='testpass'
             )
@@ -3764,7 +3764,7 @@ class TestConvertEncryptedQcow2(ImagoTestBase):
             )
 
             # Compare outputs
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(raw_out.name),
                 Path(qemu_raw.name)
             )
@@ -3787,7 +3787,7 @@ class TestConvertEncryptedQcow2(ImagoTestBase):
                 suffix='.raw') as raw_out:
             # Convert without password - should still
             # produce output but data will be encrypted
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name)
             )
             # The conversion may succeed (data is just
@@ -3812,21 +3812,21 @@ class TestConvertEncryptedQcow2(ImagoTestBase):
                 tempfile.NamedTemporaryFile(
                 suffix='.raw') as wrong_raw:
             # Convert with correct password
-            _, _, rc1 = self.run_imago_convert(
+            _, _, rc1 = self.run_instar_convert(
                 image.path, Path(correct_raw.name),
                 qcow2_password='testpass'
             )
             self.assertEqual(rc1, 0)
 
             # Convert with wrong password
-            _, _, rc2 = self.run_imago_convert(
+            _, _, rc2 = self.run_instar_convert(
                 image.path, Path(wrong_raw.name),
                 qcow2_password='wrongpass'
             )
             self.assertEqual(rc2, 0)
 
             # Outputs should differ
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(correct_raw.name),
                 Path(wrong_raw.name)
             )
@@ -3837,7 +3837,7 @@ class TestConvertEncryptedQcow2(ImagoTestBase):
             )
 
 
-class TestConvertLuksQcow2(ImagoTestBase):
+class TestConvertLuksQcow2(InstarTestBase):
     """Test conversion of LUKS-encrypted QCOW2 images
     (crypt_method=2)."""
 
@@ -3853,8 +3853,8 @@ class TestConvertLuksQcow2(ImagoTestBase):
                 suffix='.raw') as raw_out, \
                 tempfile.NamedTemporaryFile(
                 suffix='.raw') as qemu_raw:
-            # Convert with imago using LUKS passphrase
-            stdout, stderr, rc = self.run_imago_convert(
+            # Convert with instar using LUKS passphrase
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name),
                 luks_passphrase='test-passphrase'
             )
@@ -3882,7 +3882,7 @@ class TestConvertLuksQcow2(ImagoTestBase):
             )
 
             # Compare outputs
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(raw_out.name),
                 Path(qemu_raw.name)
             )
@@ -3903,7 +3903,7 @@ class TestConvertLuksQcow2(ImagoTestBase):
 
         with tempfile.NamedTemporaryFile(
                 suffix='.raw') as raw_out:
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name)
             )
             # Should fail or produce encrypted data
@@ -3922,7 +3922,7 @@ class TestConvertLuksQcow2(ImagoTestBase):
 
         with tempfile.NamedTemporaryFile(
                 suffix='.raw') as raw_out:
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name),
                 luks_passphrase='wrong-passphrase'
             )
@@ -3933,7 +3933,7 @@ class TestConvertLuksQcow2(ImagoTestBase):
             )
 
 
-class TestConvertNativeLuks(ImagoTestBase):
+class TestConvertNativeLuks(InstarTestBase):
     """Test conversion of native LUKS containers (not wrapped in
     QCOW2)."""
 
@@ -3955,7 +3955,7 @@ class TestConvertNativeLuks(ImagoTestBase):
 
         with tempfile.NamedTemporaryFile(
                 suffix='.raw') as raw_out:
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name),
                 luks_passphrase='test-passphrase'
             )
@@ -3965,7 +3965,7 @@ class TestConvertNativeLuks(ImagoTestBase):
             )
 
             # Compare against known expected content
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(raw_out.name),
                 expected_raw
             )
@@ -3986,7 +3986,7 @@ class TestConvertNativeLuks(ImagoTestBase):
 
         with tempfile.NamedTemporaryFile(
                 suffix='.raw') as raw_out:
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name)
             )
             # Should fail because no passphrase provided
@@ -4006,7 +4006,7 @@ class TestConvertNativeLuks(ImagoTestBase):
 
         with tempfile.NamedTemporaryFile(
                 suffix='.raw') as raw_out:
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name),
                 luks_passphrase='wrong-passphrase'
             )
@@ -4017,7 +4017,7 @@ class TestConvertNativeLuks(ImagoTestBase):
             )
 
 
-class TestConvertNativeLuksV2(ImagoTestBase):
+class TestConvertNativeLuksV2(InstarTestBase):
     """Test conversion of native LUKS v2 containers (Argon2id
     KDF)."""
 
@@ -4039,7 +4039,7 @@ class TestConvertNativeLuksV2(ImagoTestBase):
 
         with tempfile.NamedTemporaryFile(
                 suffix='.raw') as raw_out:
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name),
                 luks_passphrase='test-passphrase',
                 max_guest_memory='64M',
@@ -4050,7 +4050,7 @@ class TestConvertNativeLuksV2(ImagoTestBase):
             )
 
             # Compare against known expected content
-            cmp_out, _, cmp_rc = self.run_imago_compare(
+            cmp_out, _, cmp_rc = self.run_instar_compare(
                 Path(raw_out.name),
                 expected_raw
             )
@@ -4070,7 +4070,7 @@ class TestConvertNativeLuksV2(ImagoTestBase):
 
         with tempfile.NamedTemporaryFile(
                 suffix='.raw') as raw_out:
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name),
                 luks_passphrase='test-passphrase',
             )
@@ -4089,7 +4089,7 @@ class TestConvertNativeLuksV2(ImagoTestBase):
 
         with tempfile.NamedTemporaryFile(
                 suffix='.raw') as raw_out:
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name),
                 luks_passphrase='wrong-passphrase',
                 max_guest_memory='64M',
@@ -4100,7 +4100,7 @@ class TestConvertNativeLuksV2(ImagoTestBase):
             )
 
 
-class TestConvertLuksWrappedQcow2(ImagoTestBase):
+class TestConvertLuksWrappedQcow2(InstarTestBase):
     """Test conversion of LUKS containers wrapping QCOW2 images."""
 
     def test_convert_luks_wrapped_qcow2_to_raw(self):
@@ -4122,7 +4122,7 @@ class TestConvertLuksWrappedQcow2(ImagoTestBase):
 
         with tempfile.NamedTemporaryFile(
                 suffix='.raw') as raw_out:
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name),
                 luks_passphrase='test-passphrase',
             )
@@ -4168,7 +4168,7 @@ class TestConvertLuksWrappedQcow2(ImagoTestBase):
 
         with tempfile.NamedTemporaryFile(
                 suffix='.raw') as raw_out:
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 image.path, Path(raw_out.name),
             )
             self.assertNotEqual(
@@ -4177,7 +4177,7 @@ class TestConvertLuksWrappedQcow2(ImagoTestBase):
             )
 
 
-class TestConvertExtendedL2Output(ImagoTestBase):
+class TestConvertExtendedL2Output(InstarTestBase):
     """Test QCOW2 output with extended L2 entries."""
 
     def test_convert_extended_l2_raw_to_qcow2(self):
@@ -4194,7 +4194,7 @@ class TestConvertExtendedL2Output(ImagoTestBase):
                  'write -P 0x42 0 4096', raw.name],
                 capture_output=True
             )
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(raw.name), Path(qcow2.name),
                 output_format='qcow2', extended_l2=True
             )
@@ -4249,21 +4249,21 @@ class TestConvertExtendedL2Output(ImagoTestBase):
             )
 
             # raw -> extended L2 QCOW2
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(raw_in.name), Path(qcow2.name),
                 output_format='qcow2', extended_l2=True
             )
             self.assertEqual(rc, 0, f'stderr: {stderr}')
 
             # extended L2 QCOW2 -> raw
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(qcow2.name), Path(raw_out.name),
                 output_format='raw'
             )
             self.assertEqual(rc, 0, f'stderr: {stderr}')
 
             # Compare original and round-tripped
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(raw_in.name), Path(raw_out.name)
             )
             self.assertEqual(rc, 0, f'stderr: {stderr}')
@@ -4286,7 +4286,7 @@ class TestConvertExtendedL2Output(ImagoTestBase):
             )
 
             # standard QCOW2 -> extended L2 QCOW2
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(q_in.name), Path(q_out.name),
                 output_format='qcow2', extended_l2=True
             )
@@ -4303,15 +4303,15 @@ class TestConvertExtendedL2Output(ImagoTestBase):
             )
 
             # Both to raw, then compare
-            self.run_imago_convert(
+            self.run_instar_convert(
                 Path(q_in.name), Path(raw1.name),
                 output_format='raw'
             )
-            self.run_imago_convert(
+            self.run_instar_convert(
                 Path(q_out.name), Path(raw2.name),
                 output_format='raw'
             )
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(raw1.name), Path(raw2.name)
             )
             self.assertEqual(rc, 0, f'stderr: {stderr}')
@@ -4333,7 +4333,7 @@ class TestConvertExtendedL2Output(ImagoTestBase):
             )
 
             # raw -> compressed extended L2 QCOW2
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(raw_in.name), Path(qcow2.name),
                 output_format='qcow2', compress=True,
                 extended_l2=True
@@ -4351,12 +4351,12 @@ class TestConvertExtendedL2Output(ImagoTestBase):
             )
 
             # Round-trip to raw and compare
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(qcow2.name), Path(raw_out.name),
                 output_format='raw'
             )
             self.assertEqual(rc, 0, f'stderr: {stderr}')
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(raw_in.name), Path(raw_out.name)
             )
             self.assertEqual(rc, 0, f'stderr: {stderr}')
@@ -4370,7 +4370,7 @@ class TestConvertExtendedL2Output(ImagoTestBase):
                  raw_in.name, '1M'],
                 capture_output=True
             )
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(raw_in.name), Path(raw_out.name),
                 output_format='raw', extended_l2=True
             )
@@ -4397,7 +4397,7 @@ class TestConvertExtendedL2Output(ImagoTestBase):
             )
 
             # Convert with skip-zeros
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(raw_in.name), Path(qcow2.name),
                 output_format='qcow2', extended_l2=True,
                 skip_zeros=True
@@ -4422,18 +4422,18 @@ class TestConvertExtendedL2Output(ImagoTestBase):
             )
 
             # Round-trip and compare
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(qcow2.name), Path(raw_out.name),
                 output_format='raw'
             )
             self.assertEqual(rc, 0, f'stderr: {stderr}')
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(raw_in.name), Path(raw_out.name)
             )
             self.assertEqual(rc, 0, f'stderr: {stderr}')
 
 
-class TestConvertLuksEncryptOutput(ImagoTestBase):
+class TestConvertLuksEncryptOutput(InstarTestBase):
     """Test LUKS-encrypted QCOW2 output (crypt_method=2)."""
 
     def test_convert_luks_encrypt_raw_to_qcow2(self):
@@ -4453,7 +4453,7 @@ class TestConvertLuksEncryptOutput(ImagoTestBase):
             )
 
             # Encrypt
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(raw_in.name), Path(qcow2.name),
                 output_format='qcow2',
                 luks_encrypt_passphrase='testpass123'
@@ -4461,7 +4461,7 @@ class TestConvertLuksEncryptOutput(ImagoTestBase):
             self.assertEqual(rc, 0, f'Encrypt failed: {stderr}')
 
             # Decrypt back to raw
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(qcow2.name), Path(raw_out.name),
                 output_format='raw',
                 luks_passphrase='testpass123'
@@ -4469,7 +4469,7 @@ class TestConvertLuksEncryptOutput(ImagoTestBase):
             self.assertEqual(rc, 0, f'Decrypt failed: {stderr}')
 
             # Compare
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(raw_in.name), Path(raw_out.name)
             )
             self.assertEqual(
@@ -4499,21 +4499,21 @@ class TestConvertLuksEncryptOutput(ImagoTestBase):
                 capture_output=True
             )
 
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(raw_in.name), Path(qcow2.name),
                 output_format='qcow2',
                 luks_encrypt_passphrase='roundtrip'
             )
             self.assertEqual(rc, 0, f'Encrypt failed: {stderr}')
 
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(qcow2.name), Path(raw_out.name),
                 output_format='raw',
                 luks_passphrase='roundtrip'
             )
             self.assertEqual(rc, 0, f'Decrypt failed: {stderr}')
 
-            stdout, stderr, rc = self.run_imago_compare(
+            stdout, stderr, rc = self.run_instar_compare(
                 Path(raw_in.name), Path(raw_out.name)
             )
             self.assertEqual(
@@ -4536,14 +4536,14 @@ class TestConvertLuksEncryptOutput(ImagoTestBase):
                 capture_output=True
             )
 
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(raw_in.name), Path(qcow2.name),
                 output_format='qcow2',
                 luks_encrypt_passphrase='correctpass'
             )
             self.assertEqual(rc, 0, f'Encrypt failed: {stderr}')
 
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(qcow2.name), Path(raw_out.name),
                 output_format='raw',
                 luks_passphrase='wrongpass'
@@ -4562,7 +4562,7 @@ class TestConvertLuksEncryptOutput(ImagoTestBase):
                  raw_in.name, '1M'],
                 capture_output=True
             )
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(raw_in.name), Path(qcow2.name),
                 output_format='qcow2', compress=True,
                 luks_encrypt_passphrase='test'
@@ -4581,7 +4581,7 @@ class TestConvertLuksEncryptOutput(ImagoTestBase):
                  raw_in.name, '1M'],
                 capture_output=True
             )
-            stdout, stderr, rc = self.run_imago_convert(
+            stdout, stderr, rc = self.run_instar_convert(
                 Path(raw_in.name), Path(raw_out.name),
                 output_format='raw',
                 luks_encrypt_passphrase='test'
@@ -4592,7 +4592,7 @@ class TestConvertLuksEncryptOutput(ImagoTestBase):
             )
 
 
-class TestConvertVmdkGrainSize(ImagoTestBase):
+class TestConvertVmdkGrainSize(InstarTestBase):
     """Test VMDK output with configurable grain sizes."""
 
     def test_vmdk_grain_4k(self):
@@ -4657,7 +4657,7 @@ class TestConvertVmdkGrainSize(ImagoTestBase):
         )
 
 
-class TestConvertVhdBlockSize(ImagoTestBase):
+class TestConvertVhdBlockSize(InstarTestBase):
     """Test VHD output with configurable block sizes."""
 
     def test_vhd_block_512k(self):
@@ -4701,7 +4701,7 @@ class TestConvertVhdBlockSize(ImagoTestBase):
         )
 
 
-class TestConvertVhdxBlockSize(ImagoTestBase):
+class TestConvertVhdxBlockSize(InstarTestBase):
     """Test VHDX output with configurable block sizes."""
 
     def test_vhdx_block_1m(self):

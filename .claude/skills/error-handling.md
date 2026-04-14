@@ -1,6 +1,6 @@
-# /error-handling - Consistent Error Reporting in Imago
+# /error-handling - Consistent Error Reporting in Instar
 
-Guidelines for ensuring all error conditions in imago return proper error codes with descriptive messages.
+Guidelines for ensuring all error conditions in instar return proper error codes with descriptive messages.
 
 ## Usage
 

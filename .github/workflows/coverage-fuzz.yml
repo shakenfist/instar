@@ -52,21 +52,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare imago-testdata
+      - name: Prepare instar-testdata
         env:
           TESTDATA_TOKEN: ${{ secrets.GITLAB_TESTDATA_TOKEN }}
         run: |
-          CACHED=/srv/ci/cached/imago-testdata
+          CACHED=/srv/ci/cached/instar-testdata
           if [ -d "$CACHED/.git" ]; then
             cd "$CACHED" && git pull --ff-only \
-              "https://oauth2:${TESTDATA_TOKEN}@gitlab.home.stillhq.com/private/imago-testdata.git" \
+              "https://oauth2:${TESTDATA_TOKEN}@gitlab.home.stillhq.com/private/instar-testdata.git" \
               2>/dev/null || true
             echo "TESTDATA_PATH=${CACHED}" >> $GITHUB_ENV
           else
             git clone --depth 1 \
-              "https://oauth2:${TESTDATA_TOKEN}@gitlab.home.stillhq.com/private/imago-testdata.git" \
-              ${GITHUB_WORKSPACE}/imago-testdata
-            echo "TESTDATA_PATH=${GITHUB_WORKSPACE}/imago-testdata" >> $GITHUB_ENV
+              "https://oauth2:${TESTDATA_TOKEN}@gitlab.home.stillhq.com/private/instar-testdata.git" \
+              ${GITHUB_WORKSPACE}/instar-testdata
+            echo "TESTDATA_PATH=${GITHUB_WORKSPACE}/instar-testdata" >> $GITHUB_ENV
           fi
 
       - name: Verify corpus push token
@@ -81,12 +81,12 @@ jobs:
           # Verify write access using the cached testdata repo
           cd "${TESTDATA_PATH}"
           git remote set-url origin \
-            "https://oauth2:${PUSH_TOKEN}@gitlab.home.stillhq.com/private/imago-testdata.git"
+            "https://oauth2:${PUSH_TOKEN}@gitlab.home.stillhq.com/private/instar-testdata.git"
           mkdir -p custom/fuzz-corpus
           date -u '+%Y-%m-%dT%H:%M:%SZ' > custom/fuzz-corpus/last-coverage-run.txt
           git add custom/fuzz-corpus/last-coverage-run.txt
           git -c user.name="CI Fuzzer" \
-              -c user.email="ci@imago.dev" \
+              -c user.email="bot@shakenfist.com" \
               commit -m "Coverage fuzz run started $(date -u +%Y-%m-%d)"
           git push origin HEAD
           echo "Corpus push token is valid (write verified)"
@@ -100,11 +100,11 @@ jobs:
 
       - name: Remove previous devcontainers, if any
         run: |
-          docker image rm -f imago-build 2>/dev/null || true
+          docker image rm -f instar-build 2>/dev/null || true
 
       - name: Build devcontainer
         run: |
-          make imago-devcontainer
+          make instar-devcontainer
 
       - name: Install GitHub CLI on host
         run: |
@@ -198,7 +198,7 @@ jobs:
             -v "$(pwd)/.cargo-cache/registry:/build/.cargo/registry" \
             -v "$(pwd)/.cargo-cache/git:/build/.cargo/git" \
             -w "/workspace/src/fuzz" \
-            imago-build \
+            instar-build \
             bash -c "
               set -o pipefail
               cargo fuzz build 2>&1 | tee /workspace/coverage-fuzz-logs/build.log
@@ -240,7 +240,7 @@ jobs:
               -v "$(pwd)/.cargo-cache/registry:/build/.cargo/registry" \
               -v "$(pwd)/.cargo-cache/git:/build/.cargo/git" \
               -w "/workspace/src/fuzz" \
-              imago-build \
+              instar-build \
               bash -c "
                 set -o pipefail
                 cargo fuzz run $TARGET \
@@ -266,7 +266,7 @@ jobs:
                   -v "$(pwd)/.cargo-cache/registry:/build/.cargo/registry" \
                   -v "$(pwd)/.cargo-cache/git:/build/.cargo/git" \
                   -w "/workspace/src/fuzz" \
-                  imago-build \
+                  instar-build \
                   bash -c "
                     set -o pipefail
                     cargo fuzz tmin $TARGET /workspace/$CRASH_FILE \
@@ -313,7 +313,7 @@ jobs:
           echo "Total crashes found: $CRASHES_FOUND"
           echo "crashes_found=$CRASHES_FOUND" >> $GITHUB_ENV
 
-      - name: Push corpus to imago-testdata
+      - name: Push corpus to instar-testdata
         if: github.event_name == 'schedule'
         env:
           PUSH_TOKEN: ${{ secrets.GITLAB_TESTDATA_PUSH_TOKEN }}
@@ -333,7 +333,7 @@ jobs:
           # Clone with push token
           PUSH_DIR=$(mktemp -d)
           git clone --depth 1 \
-            "https://oauth2:${PUSH_TOKEN}@gitlab.home.stillhq.com/private/imago-testdata.git" \
+            "https://oauth2:${PUSH_TOKEN}@gitlab.home.stillhq.com/private/instar-testdata.git" \
             "$PUSH_DIR"
 
           # Merge corpus entries
@@ -356,10 +356,10 @@ jobs:
             cd "$PUSH_DIR"
             git add custom/fuzz-corpus/
             git -c user.name="CI Fuzzer" \
-                -c user.email="ci@imago.dev" \
+                -c user.email="bot@shakenfist.com" \
                 commit -m "Add fuzz corpus entries from nightly run $(date -u +%Y-%m-%d)"
             git push origin HEAD
-            echo "Pushed new corpus entries to imago-testdata"
+            echo "Pushed new corpus entries to instar-testdata"
           else
             echo "No new corpus entries to push"
           fi

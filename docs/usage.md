@@ -2,7 +2,7 @@
 
 Analysis of qemu-img usage patterns across oVirt, Proxmox, and OpenStack
 codebases, identifying operations, parameters, and abstraction layers that
-imago would need to support.
+instar would need to support.
 
 ## Overall Summary
 
@@ -91,7 +91,7 @@ qemu-img convert -f SRC_FMT -O DST_FMT [-p] [-t none] [-T none] \
 qemu-img check --output json -f FORMAT <image>
 ```
 - Return code 3 (leaked clusters) is non-fatal
-- **Imago extension**: `imago check --chain` validates the entire backing
+- **Instar extension**: `instar check --chain` validates the entire backing
   chain by discovering all backing images, loading them as separate
   virtio-block devices, and checking format consistency, virtual size
   validity, and QCOW2 header integrity for each backing image
@@ -226,7 +226,7 @@ qemu-img measure -f <src_fmt> -O <dst_fmt> --output json <image>
 qemu-img convert -n -O raw <src> <dst>
 ```
 
-## Key Patterns for Imago
+## Key Patterns for Instar
 
 ### Must Support
 
@@ -518,7 +518,7 @@ def compare_images(img1, img2):
     return qemu_img('compare', '-f', imgfmt, '-F', imgfmt, img1, img2) == 0
 ```
 
-## Key Patterns for Imago (Proxmox)
+## Key Patterns for Instar (Proxmox)
 
 ### Must Support
 
@@ -837,7 +837,7 @@ class LuksEncryptor(base.VolumeEncryptor):
                       run_as_root=True)
 ```
 
-## Key Patterns for Imago (OpenStack)
+## Key Patterns for Instar (OpenStack)
 
 ### Must Support
 
@@ -873,7 +873,7 @@ qemu-img_convert: CommandFilter, qemu-img, root
 
 ---
 
-# Combined Requirements for Imago
+# Combined Requirements for Instar
 
 ## Operations Matrix
 

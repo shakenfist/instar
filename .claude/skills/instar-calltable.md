@@ -1,11 +1,11 @@
-# /imago-calltable - Call Table API Reference
+# /instar-calltable - Call Table API Reference
 
-Complete reference for the call table API used by imago operations to communicate with the core.
+Complete reference for the call table API used by instar operations to communicate with the core.
 
 ## Usage
 
 ```
-/imago-calltable [function]
+/instar-calltable [function]
 ```
 
 Where `[function]` can be: `io`, `progress`, `config`, or omit for full reference.

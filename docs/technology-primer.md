@@ -1,6 +1,6 @@
 # Technology Primer
 
-There is a fair bit of assumed knowledge embodied in imago that needs to be
+There is a fair bit of assumed knowledge embodied in instar that needs to be
 explained in order to really explain what is happening here. This page
 attempts to walk through the background steps in a relatively complete way,
 but as a result is fairly long. My apologies if this is too detailed an
@@ -423,7 +423,7 @@ as devices can DMA to arbitrary addresses, they can also send interrupts
 that could be used to attack the host. The IOMMU can filter and remap device
 interrupts, ensuring they're delivered only to the appropriate VM.
 
-For imago's use case with virtio devices, IOMMU protection is less critical
+For instar's use case with virtio devices, IOMMU protection is less critical
 because virtio devices are emulated in userspace - they don't have direct
 hardware DMA capabilities. But understanding the IOMMU completes the picture
 of how modern systems achieve full memory isolation in virtualized
@@ -732,10 +732,10 @@ extreme (minimal isolation overhead, shared kernel). Traditional VMs sit in
 the middle. The right choice depends on the workload's security requirements,
 performance constraints, and operational reality.
 
-## And Then Finally... Imago
+## And Then Finally... Instar
 
-Imago takes a different approach from all of the above. Rather than running
-a full OS, a container, or even a unikernel inside a VM, imago runs
+Instar takes a different approach from all of the above. Rather than running
+a full OS, a container, or even a unikernel inside a VM, instar runs
 **bare-metal code with no kernel at all**. The guest is compiled in
 "freestanding" mode - no standard library, no system calls, no kernel
 interface whatsoever.
@@ -754,7 +754,7 @@ shares DNA with several concepts:
 
 **Why no kernel?**
 
-Imago exists to solve a specific problem: safely parsing and converting
+Instar exists to solve a specific problem: safely parsing and converting
 disk image formats. Image formats like qcow2 and VMDK have complex,
 feature-rich structures - compression, encryption, snapshots, backing
 files, sparse allocation. Parsing these formats has historically been a
@@ -766,7 +766,7 @@ host. But a vulnerability in that parser gives the attacker access to the
 host system - exactly what we want to prevent when handling untrusted
 images.
 
-Imago's insight is to separate the concerns:
+Instar's insight is to separate the concerns:
 
 1. **Untrusted code** (image format parsing) runs inside a KVM sandbox
    with no access to host resources
@@ -800,12 +800,12 @@ then a bootloader (GRUB, systemd-boot) loads the kernel, which then sets up
 paging, interrupts, and drivers before reaching userspace. That's a lot of
 machinery.
 
-Imago takes a shortcut: the VMM (running on the host) configures the virtual
+Instar takes a shortcut: the VMM (running on the host) configures the virtual
 CPU's initial state directly via KVM ioctls. Instead of emulating a BIOS boot,
 the VMM can set the vCPU's registers to whatever state it wants before starting
 execution.
 
-Imago skips real mode and protected mode entirely, starting the guest directly
+Instar skips real mode and protected mode entirely, starting the guest directly
 in 64-bit long mode with paging already enabled. The VMM sets up:
 
 - **Initial page tables**: A simple identity mapping where virtual addresses
@@ -827,15 +827,15 @@ When `KVM_RUN` executes, the vCPU begins executing at `_start` in 64-bit mode
 with a working stack and identity-mapped memory. No BIOS, no bootloader, no
 mode transitions - the guest code runs immediately.
 
-This is why imago's boot time is measured in microseconds rather than seconds.
+This is why instar's boot time is measured in microseconds rather than seconds.
 A traditional VM boot involves: firmware initialization → bootloader → kernel
 decompression → kernel initialization → init system → application startup.
-Imago skips all of that. The "boot" is just: set registers → run.
+Instar skips all of that. The "boot" is just: set registers → run.
 
 The tradeoff is that this requires careful coordination between the VMM and
 the guest. The guest must be compiled to expect the specific memory layout and
 initial state that the VMM provides. There's no flexibility to boot different
-operating systems or use standard boot protocols - but for imago's single-
+operating systems or use standard boot protocols - but for instar's single-
 purpose use case, that flexibility isn't needed.
 
 Instead of system calls, the guest uses two communication mechanisms:
@@ -856,7 +856,7 @@ hardware (virtual hardware provided by the VMM) directly.
 
 **How virtio actually works:**
 
-Virtio deserves a closer look since it's central to imago's I/O. The protocol
+Virtio deserves a closer look since it's central to instar's I/O. The protocol
 is designed for efficient communication between a guest and a hypervisor,
 avoiding the overhead of emulating real hardware.
 
@@ -910,7 +910,7 @@ injecting an interrupt. The shared memory model means data doesn't need to be
 copied between address spaces - the host directly accesses guest memory
 through the descriptor addresses (translated via EPT).
 
-For imago, each virtio-block device represents a file on the host. The input
+For instar, each virtio-block device represents a file on the host. The input
 device exposes the source disk image; the output device exposes the destination.
 The guest reads from one and writes to the other, with the VMM translating
 virtqueue operations into actual file I/O.
@@ -957,28 +957,28 @@ interrupt directly. Combined with ioeventfd, this means the entire virtio
 notification path - guest to host and back - can happen without expensive
 transitions.
 
-Imago uses ioeventfd for its virtio doorbell notifications. When the guest
+Instar uses ioeventfd for its virtio doorbell notifications. When the guest
 submits an I/O request, the VMM receives an eventfd signal and can process
 the request while the guest continues running. This is particularly valuable
-for imago's workload, which involves streaming large amounts of data between
+for instar's workload, which involves streaming large amounts of data between
 virtio-block devices - minimizing per-request overhead directly improves
 throughput.
 
 **Where KVM fits in:**
 
-Imago uses Linux's KVM (Kernel-based Virtual Machine) for hardware
+Instar uses Linux's KVM (Kernel-based Virtual Machine) for hardware
 virtualization. KVM is a kernel module that exposes VT-x/AMD-V capabilities
 through `/dev/kvm`. The architecture has two components:
 
 1. **KVM kernel module**: Handles the hardware virtualization - creating VMs,
    managing vCPUs, configuring EPT, and processing VM exits that require
    kernel involvement
-2. **Userspace VMM**: Imago implements its own minimal VMM that uses KVM's
+2. **Userspace VMM**: Instar implements its own minimal VMM that uses KVM's
    ioctl interface to configure the VM and handles device emulation (the
    virtio-block and serial devices) in userspace
 
 Unlike qemu (which provides a full-featured VMM with dozens of emulated
-devices), imago's VMM exposes only the devices the guest needs: two
+devices), instar's VMM exposes only the devices the guest needs: two
 virtio-block devices and a serial port. This minimal device model is part
 of the security story - fewer emulated devices means less code that could
 contain vulnerabilities.
@@ -1032,7 +1032,7 @@ devices, does its work, and halts.
 
 **Comparison with other approaches:**
 
-| Aspect            | Container      | VM + Linux    | Unikernel     | Imago         |
+| Aspect            | Container      | VM + Linux    | Unikernel     | Instar         |
 |-------------------|----------------|---------------|---------------|---------------|
 | Kernel            | Shared host    | Full guest    | Library OS    | None          |
 | Syscall interface | Yes (host)     | Yes (guest)   | Function calls| None          |
@@ -1082,14 +1082,14 @@ This extreme minimalism has costs:
 - **Single-purpose**: Each guest binary does one thing; no general-purpose
   computing
 
-But for imago's use case - safely converting potentially malicious disk
+But for instar's use case - safely converting potentially malicious disk
 images - these tradeoffs are worthwhile. The goal isn't to replace
 containers or VMs for general workloads; it's to provide the strongest
 possible isolation for a specific, dangerous operation.
 
 **Operational considerations:**
 
-A few questions naturally arise about running imago in practice:
+A few questions naturally arise about running instar in practice:
 
 - **Error handling**: If the guest encounters a malformed image or I/O error,
   it sends an error message over the serial port and halts. The VMM detects
@@ -1102,8 +1102,8 @@ A few questions naturally arise about running imago in practice:
   access and limited resources (only the memory allocated to the VM), the
   DoS impact is bounded to the resources explicitly granted.
 
-- **Attestation**: Unlike Nitro Enclaves, imago doesn't currently implement
-  cryptographic attestation. For imago's threat model (protecting the host
+- **Attestation**: Unlike Nitro Enclaves, instar doesn't currently implement
+  cryptographic attestation. For instar's threat model (protecting the host
   from malicious input, not protecting secrets from the host), attestation
   is less critical - we control both sides of the trust boundary. However,
   attestation could be valuable for verifying that a specific guest binary
@@ -1111,14 +1111,14 @@ A few questions naturally arise about running imago in practice:
 
 ## Prior Art and Related Approaches
 
-Imago's architecture - an isolated VM with restricted I/O channels and
+Instar's architecture - an isolated VM with restricted I/O channels and
 minimal attack surface - has precedents in the industry. The most notable
 is AWS Nitro Enclaves, though the threat model is interestingly inverted.
 
 ### AWS Nitro Enclaves
 
 Nitro Enclaves are isolated compute environments that run alongside EC2
-instances. They share several architectural properties with imago:
+instances. They share several architectural properties with instar:
 
 - **Hardware-enforced isolation**: Built on the Nitro Hypervisor, enclaves
   are fully isolated VMs with dedicated vCPUs and memory
@@ -1128,16 +1128,16 @@ instances. They share several architectural properties with imago:
 - **Single communication channel**: A vsock (virtual socket) provides the
   only path between the enclave and its parent instance
 
-The vsock channel is conceptually similar to imago's virtio-block and serial
+The vsock channel is conceptually similar to instar's virtio-block and serial
 port combination - a restricted, well-defined interface that limits what can
 flow between isolated and non-isolated code.
 
 **The inverted threat model:**
 
-Despite the architectural similarities, Nitro Enclaves and imago address
+Despite the architectural similarities, Nitro Enclaves and instar address
 opposite threat scenarios:
 
-| Aspect              | AWS Nitro Enclaves           | Imago                        |
+| Aspect              | AWS Nitro Enclaves           | Instar                        |
 |---------------------|------------------------------|------------------------------|
 | **Protects**        | Sensitive data in enclave    | Host from malicious data     |
 | **Threat**          | Compromised parent instance  | Malicious input files        |
@@ -1150,7 +1150,7 @@ sensitive data (private keys, PII, healthcare records) such that even a
 compromised parent instance or malicious administrator cannot access it.
 The enclave protects its contents from the outside world.
 
-Imago inverts this: the **host** is what we're protecting. The guest
+Instar inverts this: the **host** is what we're protecting. The guest
 processes untrusted, potentially malicious data, and we want to ensure that
 even a complete compromise of the guest cannot affect the host. The sandbox
 protects the outside world from its contents.
@@ -1162,11 +1162,11 @@ enclave. The enclave image includes a kernel, and applications make system
 calls normally. The isolation comes from the hypervisor boundary and the
 lack of I/O channels, not from the absence of a kernel.
 
-Imago goes further by eliminating the kernel entirely. There's no system
+Instar goes further by eliminating the kernel entirely. There's no system
 call interface to potentially exploit, no kernel code that could contain
 vulnerabilities. The guest is truly bare-metal.
 
-| Aspect            | Nitro Enclaves         | Imago                  |
+| Aspect            | Nitro Enclaves         | Instar                  |
 |-------------------|------------------------|------------------------|
 | Guest kernel      | Minimal Linux          | None                   |
 | System calls      | Yes (to guest kernel)  | None                   |
@@ -1191,7 +1191,7 @@ Several other projects explore similar territory:
   Firecracker's device model is deliberately minimal.
 
 - **Solo5**: A "unikernel monitor" that provides a minimal interface for
-  unikernels, similar in spirit to imago's approach but targeting library
+  unikernels, similar in spirit to instar's approach but targeting library
   OS workloads.
 
 ### Does this count as prior art?
@@ -1208,7 +1208,7 @@ What's less common is the combination of:
    computing)
 3. **Virtio-block as the data channel** rather than a socket-based protocol
 
-Imago draws inspiration from these prior systems while adapting the approach
+Instar draws inspiration from these prior systems while adapting the approach
 to its specific threat model: safely handling data that might be actively
 trying to exploit the parser.
 
@@ -1233,7 +1233,7 @@ This document has traced a path through the landscape of compute isolation:
    resource duplication
 8. **Unikernels** reduce the overhead by eliminating the general-purpose OS,
    leaving only application-specific components
-9. **Imago** takes this further by eliminating the kernel entirely, running
+9. **Instar** takes this further by eliminating the kernel entirely, running
    bare-metal code that communicates only through carefully constrained
    channels
 
@@ -1242,7 +1242,7 @@ performance, flexibility, and operational complexity. There is no universally
 "right" choice - the appropriate level of isolation depends on the threat
 model, the workload, and the operational constraints.
 
-For imago's specific problem - safely handling untrusted disk images that
+For instar's specific problem - safely handling untrusted disk images that
 might be crafted to exploit parser vulnerabilities - the extreme end of the
 spectrum makes sense. The narrow interface (virtio-block devices and serial
 port), the absence of any kernel attack surface in the guest, and the

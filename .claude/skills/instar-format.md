@@ -1,11 +1,11 @@
-# /imago-format - Disk Image Format Reference
+# /instar-format - Disk Image Format Reference
 
 Quick reference for disk image format structures, magic numbers, and parsing details.
 
 ## Usage
 
 ```
-/imago-format [format]
+/instar-format [format]
 ```
 
 Where `[format]` is optional: `qcow2`, `vmdk`, `raw`, or omit for overview.

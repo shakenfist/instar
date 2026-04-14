@@ -1,18 +1,18 @@
 [package]
-name = "imago"
+name = "instar"
 version = "0.1.0"
 edition = "2021"
 description = "Safe, sandboxed disk image operations using KVM isolation"
 license = "Apache-2.0"
-repository = "https://github.com/shakenfist/imago"
-homepage = "https://github.com/shakenfist/imago"
+repository = "https://github.com/shakenfist/instar"
+homepage = "https://github.com/shakenfist/instar"
 readme = "../../README.md"
 authors = ["Michael Still <mikal@stillhq.com>"]
 keywords = ["disk-image", "qcow2", "kvm", "vmdk", "vhd"]
 categories = ["command-line-utilities", "virtualization"]
 
 [[bin]]
-name = "imago"
+name = "instar"
 path = "src/main.rs"
 
 [dependencies]

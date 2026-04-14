@@ -1,4 +1,4 @@
-"""Type definitions for imago test framework."""
+"""Type definitions for instar test framework."""
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,7 +45,7 @@ class TestImage:
         """Return True if this image requires --unsafe-quirks mode for testing.
 
         Images without valid partition tables or format headers need this flag
-        to be accepted as RAW disk images. Without the flag, imago rejects them
+        to be accepted as RAW disk images. Without the flag, instar rejects them
         as unknown format (secure default behavior).
         """
         return self.unsafe_quirks_required

@@ -891,8 +891,8 @@ impl VhdxState {
 pub fn build_file_identifier(buf: &mut [u8]) {
     // Signature: "vhdxfile" at offset 0 (LE u64)
     write_le_u64(buf, 0, FILE_IDENTIFIER_SIGNATURE);
-    // Creator: UTF-16LE "imago" starting at offset 8
-    let creator = b"imago";
+    // Creator: UTF-16LE "instar" starting at offset 8
+    let creator = b"instar";
     for (i, &ch) in creator.iter().enumerate() {
         buf[8 + i * 2] = ch;
         buf[8 + i * 2 + 1] = 0;
@@ -1311,11 +1311,13 @@ mod tests {
         build_file_identifier(&mut buf);
         let sig = le_u64(&buf, 0);
         assert_eq!(sig, FILE_IDENTIFIER_SIGNATURE);
-        // Check creator "imago" in UTF-16LE
-        assert_eq!(buf[8], b'i');
-        assert_eq!(buf[9], 0);
-        assert_eq!(buf[10], b'm');
-        assert_eq!(buf[11], 0);
+        // Check creator "instar" in UTF-16LE (6 chars, each followed
+        // by a zero byte)
+        let creator = b"instar";
+        for (i, &ch) in creator.iter().enumerate() {
+            assert_eq!(buf[8 + i * 2], ch);
+            assert_eq!(buf[8 + i * 2 + 1], 0);
+        }
     }
 
     #[test]

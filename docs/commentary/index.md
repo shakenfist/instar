@@ -1,8 +1,8 @@
-# Imago Commentary
+# Instar Commentary
 
-*A Lions-style commentary on the imago codebase.*
+*A Lions-style commentary on the instar codebase.*
 
-This directory contains an annotated walkthrough of imago's source code,
+This directory contains an annotated walkthrough of instar's source code,
 inspired by John Lions' *Commentary on UNIX 6th Edition* (1977). Lions
 annotated the ~9,000 lines of the V6 UNIX kernel so that students could
 understand not just *what* the code did, but *why* it was written that way.

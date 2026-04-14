@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Fuzzer Issue Body",
-  "description": "Structured issue body for security-audit issues filed by imago fuzzers",
+  "description": "Structured issue body for security-audit issues filed by instar fuzzers",
   "type": "object",
   "required": ["source", "target", "signature", "reproducer"],
   "properties": {

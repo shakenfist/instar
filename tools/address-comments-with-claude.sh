@@ -206,8 +206,25 @@ if ! command -v gh &> /dev/null; then
     exit 1
 fi
 
-if ! command -v claude &> /dev/null; then
-    echo -e "${RED}Error: Claude Code CLI not found${NC}"
+# Locate the claude binary. Honour CLAUDE_BIN if set, then look on PATH,
+# then fall back to the default install location used by the official
+# installer (~/.local/bin/claude is not always on PATH for non-login
+# shells like the GitHub Actions runner).
+if [ -n "${CLAUDE_BIN:-}" ]; then
+    claude_bin="${CLAUDE_BIN}"
+elif command -v claude &> /dev/null; then
+    claude_bin="claude"
+elif [ -x "${HOME}/.local/bin/claude" ]; then
+    claude_bin="${HOME}/.local/bin/claude"
+else
+    claude_bin=""
+fi
+if [ -z "${claude_bin}" ] || \
+        { ! command -v "${claude_bin}" &> /dev/null && \
+          ! [ -x "${claude_bin}" ]; }; then
+    echo -e "${RED}Error: Claude Code CLI not found (${claude_bin:-not set})${NC}"
+    echo "Install with: npm install -g @anthropic-ai/claude-code"
+    echo "Or set CLAUDE_BIN to the path of an existing install."
     exit 1
 fi
 
@@ -415,7 +432,7 @@ for i in $(seq 1 "${item_count}"); do
 
     # Build Claude prompt for this specific item
     cat > "${output_dir}/claude-prompt-${i}.txt" << PROMPT_EOF
-You are addressing a specific review comment on PR #${pr_number} for the Shaken Fist imago project.
+You are addressing a specific review comment on PR #${pr_number} for the Shaken Fist instar project.
 
 ## Context
 
@@ -470,7 +487,7 @@ DISAGREEMENT_END
 ## Rules
 
 - Focus ONLY on this specific item - do not address other issues
-- Do NOT run cargo commands directly - use \`make imago\`, \`make test\`, \`make lint\`
+- Do NOT run cargo commands directly - use \`make instar\`, \`make test\`, \`make lint\`
 - Keep changes minimal and focused
 - If the fix requires changes you're unsure about, explain and skip
 PROMPT_EOF
@@ -479,7 +496,7 @@ PROMPT_EOF
     echo "Running Claude Code..."
     claude_output_file="${output_dir}/claude-output-${i}.txt"
 
-    if ! claude -p "$(cat "${output_dir}/claude-prompt-${i}.txt")" \
+    if ! "${claude_bin}" -p "$(cat "${output_dir}/claude-prompt-${i}.txt")" \
         --dangerously-skip-permissions \
         --max-turns "${max_turns}" \
         --output-format text > "${claude_output_file}" 2>&1; then

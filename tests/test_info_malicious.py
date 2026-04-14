@@ -1,7 +1,7 @@
 """
 Integration tests for malicious images using expected output overrides.
 
-These tests verify that imago correctly handles malicious disk images.
+These tests verify that instar correctly handles malicious disk images.
 Instead of running qemu-img (which could be exploited), we compare against
 stored expected output files.
 
@@ -11,11 +11,11 @@ run in isolated test environments.
 
 import testscenarios
 
-from base import ImagoTestBase
+from base import InstarTestBase
 
 
-class TestInfoMalicious(testscenarios.WithScenarios, ImagoTestBase):
-    """Test imago info against malicious images with expected overrides."""
+class TestInfoMalicious(testscenarios.WithScenarios, InstarTestBase):
+    """Test instar info against malicious images with expected overrides."""
 
     # Scenarios for malicious images - add entries as we create override files
     # Each scenario needs a corresponding expected output file
@@ -25,7 +25,7 @@ class TestInfoMalicious(testscenarios.WithScenarios, ImagoTestBase):
     ]
 
     def test_output_matches_expected(self):
-        """Test that imago output matches expected override for malicious image."""
+        """Test that instar output matches expected override for malicious image."""
         if not self.scenarios:
             self.skipTest('No malicious image scenarios configured yet')
 
@@ -49,14 +49,14 @@ class TestInfoMalicious(testscenarios.WithScenarios, ImagoTestBase):
                 f'Expected override file not found: {image.expected_override}'
             )
 
-        # Run imago (but NOT qemu-img - that would be dangerous)
-        imago_stdout, imago_stderr, imago_rc = self.run_imago_info(image.path)
+        # Run instar (but NOT qemu-img - that would be dangerous)
+        instar_stdout, instar_stderr, instar_rc = self.run_instar_info(image.path)
 
-        # imago should succeed
+        # instar should succeed
         self.assertEqual(
-            0, imago_rc,
-            f'imago failed for {image.id}: {imago_stderr}'
+            0, instar_rc,
+            f'instar failed for {image.id}: {instar_stderr}'
         )
 
         # Output should match expected
-        self.assert_outputs_match(image.id, imago_stdout, expected_output)
+        self.assert_outputs_match(image.id, instar_stdout, expected_output)

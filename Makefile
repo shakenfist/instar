@@ -1,9 +1,9 @@
-# Imago Project Makefile
+# Instar Project Makefile
 #
 # Usage: make <target> [PROTOTYPE=<name>]
 #
 # Examples:
-#   make imago                            # Build the main imago project
+#   make instar                            # Build the main instar project
 #   make build-prototype PROTOTYPE=info   # Build a specific prototype
 #   make clean-all
 #   make lint
@@ -12,14 +12,14 @@
 .PHONY: help list-prototypes build-prototype build-all clean-prototype clean-all \
         clean-devcontainers lint lint-fix build-lint-container \
         install-hooks run-prototype guest-protocol \
-        imago imago-devcontainer clean-imago run-imago check-binary-sizes \
+        instar instar-devcontainer clean-instar run-instar check-binary-sizes \
         test-venv test test-rust test-integration test-ci test-malicious test-report clean-tests \
         test-container test-container-core test-container-convert-qcow2 test-container-convert-vhd \
         clean-cargo-cache release check-version
 
 # Default target
 help:
-	@echo "Imago Project Makefile"
+	@echo "Instar Project Makefile"
 	@echo ""
 	@echo "Usage: make <target> [PROTOTYPE=<name>]"
 	@echo ""
@@ -28,10 +28,10 @@ help:
 	@echo "  list-prototypes      List all available prototypes"
 	@echo ""
 	@echo "Main Project (src/):"
-	@echo "  imago                Build the main imago project"
-	@echo "  imago-devcontainer   Build devcontainer for main imago"
-	@echo "  clean-imago          Clean the main imago build"
-	@echo "  run-imago            Show how to run imago"
+	@echo "  instar                Build the main instar project"
+	@echo "  instar-devcontainer   Build devcontainer for main instar"
+	@echo "  clean-instar          Clean the main instar build"
+	@echo "  run-instar            Show how to run instar"
 	@echo "  check-binary-sizes   Verify binaries fit within memory regions"
 	@echo ""
 	@echo "Prototypes:"
@@ -75,7 +75,7 @@ help:
 	@echo "  clean-tests          Clean test artifacts"
 	@echo ""
 	@echo "Examples:"
-	@echo "  make imago"
+	@echo "  make instar"
 	@echo "  make build-prototype PROTOTYPE=virtio-block5"
 	@echo "  make run-prototype PROTOTYPE=virtio-block5"
 	@echo "  make clean-prototype PROTOTYPE=helloworld"
@@ -96,8 +96,8 @@ PROTOTYPES := \
 	info
 
 # Docker image names
-LINT_IMAGE := imago-rust-lint
-IMAGO_IMAGE := imago-build
+LINT_IMAGE := instar-rust-lint
+INSTAR_IMAGE := instar-build
 
 # Paths
 SRC_DIR := src
@@ -107,12 +107,12 @@ DEVCONTAINER_DIR := .devcontainer
 CARGO_CACHE_DIR := .cargo-cache
 
 # =============================================================================
-# Main Imago Project Targets
+# Main Instar Project Targets
 # =============================================================================
 
-# Build the main imago project (runs inside devcontainer)
-imago: imago-devcontainer
-	@echo "Building imago..."
+# Build the main instar project (runs inside devcontainer)
+instar: instar-devcontainer
+	@echo "Building instar..."
 	@mkdir -p "$(CURDIR)/$(CARGO_CACHE_DIR)/registry" "$(CURDIR)/$(CARGO_CACHE_DIR)/git"
 	docker run --rm \
 		-u "$(shell id -u):$(shell id -g)" \
@@ -122,25 +122,25 @@ imago: imago-devcontainer
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
 		-w "/workspace/$(SRC_DIR)" \
-		"$(IMAGO_IMAGE)" \
+		"$(INSTAR_IMAGE)" \
 		bash build.sh
 
-# Build the imago devcontainer
-imago-devcontainer:
-	@if ! docker image inspect "$(IMAGO_IMAGE)" >/dev/null 2>&1; then \
-		echo "Building imago devcontainer image..."; \
-		docker build -t "$(IMAGO_IMAGE)" "$(SRC_DIR)/$(DEVCONTAINER_DIR)"; \
+# Build the instar devcontainer
+instar-devcontainer:
+	@if ! docker image inspect "$(INSTAR_IMAGE)" >/dev/null 2>&1; then \
+		echo "Building instar devcontainer image..."; \
+		docker build -t "$(INSTAR_IMAGE)" "$(SRC_DIR)/$(DEVCONTAINER_DIR)"; \
 	fi
 
-# Clean the main imago build
-clean-imago:
-	@echo "Cleaning imago build..."
-	@if docker image inspect "$(IMAGO_IMAGE)" >/dev/null 2>&1; then \
+# Clean the main instar build
+clean-instar:
+	@echo "Cleaning instar build..."
+	@if docker image inspect "$(INSTAR_IMAGE)" >/dev/null 2>&1; then \
 		echo "Using container to clean (handles root-owned files)..."; \
 		docker run --rm \
 			-v "$(CURDIR):/workspace" \
 			-w "/workspace/$(SRC_DIR)" \
-			"$(IMAGO_IMAGE)" \
+			"$(INSTAR_IMAGE)" \
 			sh -c "rm -rf target *.bin"; \
 	else \
 		rm -rf "$(SRC_DIR)/target" 2>/dev/null || true; \
@@ -148,22 +148,22 @@ clean-imago:
 	fi
 	@echo "Clean complete."
 
-# Show how to run imago
-run-imago:
-	@echo "Running imago"
+# Show how to run instar
+run-instar:
+	@echo "Running instar"
 	@echo ""
-	@if [ ! -f "$(SRC_DIR)/target/release/imago" ]; then \
-		echo "Error: imago not built. Run 'make imago' first."; \
+	@if [ ! -f "$(SRC_DIR)/target/release/instar" ]; then \
+		echo "Error: instar not built. Run 'make instar' first."; \
 		exit 1; \
 	fi
 	@echo "Note: Running requires KVM access (sudo or kvm group membership)"
 	@echo ""
 	@echo "Usage:"
-	@echo "  sudo $(SRC_DIR)/target/release/imago info <IMAGE>"
-	@echo "  sudo $(SRC_DIR)/target/release/imago copy <INPUT> <OUTPUT>"
+	@echo "  sudo $(SRC_DIR)/target/release/instar info <IMAGE>"
+	@echo "  sudo $(SRC_DIR)/target/release/instar copy <INPUT> <OUTPUT>"
 	@echo ""
 	@echo "For help:"
-	@echo "  $(SRC_DIR)/target/release/imago --help"
+	@echo "  $(SRC_DIR)/target/release/instar --help"
 
 # Check that guest binaries fit within their memory regions
 # This prevents memory overlap bugs that cause VM crashes
@@ -194,7 +194,7 @@ ifeq ($(filter $(PROTOTYPE),$(PROTOTYPES)),)
 endif
 
 # Build a specific prototype (uses shared devcontainer)
-build-prototype: check-prototype imago-devcontainer
+build-prototype: check-prototype instar-devcontainer
 	@echo "Building prototype: $(PROTOTYPE)"
 	@if [ ! -f "$(PROTO_DIR)/$(PROTOTYPE)/build.sh" ]; then \
 		echo "Error: build.sh not found for $(PROTOTYPE)"; \
@@ -209,7 +209,7 @@ build-prototype: check-prototype imago-devcontainer
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
 		-w "/workspace/$(PROTO_DIR)/$(PROTOTYPE)" \
-		"$(IMAGO_IMAGE)" \
+		"$(INSTAR_IMAGE)" \
 		bash build.sh
 
 # Build all prototypes (uses shared devcontainer)
@@ -239,12 +239,12 @@ build-lint-container:
 # Uses shared devcontainer to handle root-owned files from builds
 clean-prototype: check-prototype
 	@echo "Cleaning target directory for: $(PROTOTYPE)"
-	@if docker image inspect "$(IMAGO_IMAGE)" >/dev/null 2>&1; then \
+	@if docker image inspect "$(INSTAR_IMAGE)" >/dev/null 2>&1; then \
 		echo "Using container to clean (handles root-owned files)..."; \
 		docker run --rm \
 			-v "$(CURDIR):/workspace" \
 			-w "/workspace/$(PROTO_DIR)/$(PROTOTYPE)" \
-			"$(IMAGO_IMAGE)" \
+			"$(INSTAR_IMAGE)" \
 			sh -c "rm -rf target *.bin"; \
 		echo "Cleaned $(PROTO_DIR)/$(PROTOTYPE)"; \
 	else \
@@ -257,18 +257,18 @@ clean-prototype: check-prototype
 		find "$(PROTO_DIR)/$(PROTOTYPE)" -maxdepth 1 -name "*.bin" -delete 2>/dev/null || true; \
 	fi
 
-# Clean all build directories (main imago + prototypes)
+# Clean all build directories (main instar + prototypes)
 # Uses shared devcontainer to handle root-owned files
-clean-all: clean-imago
+clean-all: clean-instar
 	@echo "Cleaning all prototype target directories..."
-	@if docker image inspect "$(IMAGO_IMAGE)" >/dev/null 2>&1; then \
+	@if docker image inspect "$(INSTAR_IMAGE)" >/dev/null 2>&1; then \
 		for p in $(PROTOTYPES); do \
 			if [ -d "$(PROTO_DIR)/$$p" ]; then \
 				echo "Cleaning $$p (via container)..."; \
 				docker run --rm \
 					-v "$(CURDIR):/workspace" \
 					-w "/workspace/$(PROTO_DIR)/$$p" \
-					"$(IMAGO_IMAGE)" \
+					"$(INSTAR_IMAGE)" \
 					sh -c "rm -rf target *.bin" 2>/dev/null || true; \
 			fi; \
 		done; \
@@ -286,11 +286,11 @@ clean-all: clean-imago
 # Remove devcontainer image
 clean-devcontainers:
 	@echo "Removing devcontainer image..."
-	@if docker image inspect "$(IMAGO_IMAGE)" >/dev/null 2>&1; then \
-		docker rmi "$(IMAGO_IMAGE)" || true; \
-		echo "Removed $(IMAGO_IMAGE)"; \
+	@if docker image inspect "$(INSTAR_IMAGE)" >/dev/null 2>&1; then \
+		docker rmi "$(INSTAR_IMAGE)" || true; \
+		echo "Removed $(INSTAR_IMAGE)"; \
 	else \
-		echo "$(IMAGO_IMAGE) not found"; \
+		echo "$(INSTAR_IMAGE) not found"; \
 	fi
 
 # Remove the rust-lint Docker image
@@ -359,8 +359,8 @@ TESTS_DIR := tests
 PYTHON := python3
 VENV_DIR := $(TESTS_DIR)/.venv
 
-# Testdata location - can be overridden with IMAGO_TESTDATA_PATH env var
-TESTDATA_PATH ?= $(CURDIR)/../imago-testdata
+# Testdata location - can be overridden with INSTAR_TESTDATA_PATH env var
+TESTDATA_PATH ?= $(CURDIR)/../instar-testdata
 
 # Create virtual environment for tests
 test-venv:
@@ -375,7 +375,7 @@ test-venv:
 test: test-rust test-integration
 
 # Run Rust unit tests (all workspace crates except no_main guest binaries)
-test-rust: imago-devcontainer
+test-rust: instar-devcontainer
 	@echo "Running Rust unit tests..."
 	docker run --rm \
 		-u "$(shell id -u):$(shell id -g)" \
@@ -385,7 +385,7 @@ test-rust: imago-devcontainer
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
 		-w "/workspace/src" \
-		"$(IMAGO_IMAGE)" \
+		"$(INSTAR_IMAGE)" \
 		bash -c 'cargo test --release --workspace \
 			--exclude core \
 			--exclude info \
@@ -397,17 +397,17 @@ test-rust: imago-devcontainer
 
 # Run Python integration tests only (on host)
 # Runs all test files except malicious image tests (explicit opt-in via test-malicious)
-test-integration: imago test-venv
+test-integration: instar test-venv
 	@echo "Running Python integration tests..."
 	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run --exclude-regex test_info_malicious
 
 # Run tests inside the devcontainer for consistent environment
 # This ensures consistent glibc, paths, and other system dependencies
-test-container: imago-devcontainer imago
+test-container: instar-devcontainer instar
 	@echo "Running tests inside container..."
 	@if [ ! -d "$(TESTDATA_PATH)" ]; then \
 		echo "Error: Test data not found at $(TESTDATA_PATH)"; \
-		echo "Set IMAGO_TESTDATA_PATH or ensure imago-testdata is a sibling directory."; \
+		echo "Set INSTAR_TESTDATA_PATH or ensure instar-testdata is a sibling directory."; \
 		exit 1; \
 	fi
 	docker run --rm \
@@ -415,11 +415,11 @@ test-container: imago-devcontainer imago
 		-u "$(shell id -u):$(shell id -g)" \
 		--group-add "$$(stat -c '%g' /dev/kvm)" \
 		-e HOME=/build \
-		-e IMAGO_TESTDATA_PATH=/testdata \
+		-e INSTAR_TESTDATA_PATH=/testdata \
 		-v "$(CURDIR):/workspace" \
 		-v "$(TESTDATA_PATH):/testdata:ro" \
 		-w "/workspace" \
-		"$(IMAGO_IMAGE)" \
+		"$(INSTAR_IMAGE)" \
 		bash -c '\
 			echo "Setting up test environment..."; \
 			python3 -m venv /build/test-venv && \
@@ -433,11 +433,11 @@ test-container: imago-devcontainer imago
 
 # Run core integration tests inside container (info, check, security, version, oslo-crossval)
 # Excludes convert and compare tests which are split into separate targets
-test-container-core: imago-devcontainer imago
+test-container-core: instar-devcontainer instar
 	@echo "Running core integration tests inside container..."
 	@if [ ! -d "$(TESTDATA_PATH)" ]; then \
 		echo "Error: Test data not found at $(TESTDATA_PATH)"; \
-		echo "Set IMAGO_TESTDATA_PATH or ensure imago-testdata is a sibling directory."; \
+		echo "Set INSTAR_TESTDATA_PATH or ensure instar-testdata is a sibling directory."; \
 		exit 1; \
 	fi
 	docker run --rm \
@@ -445,11 +445,11 @@ test-container-core: imago-devcontainer imago
 		-u "$(shell id -u):$(shell id -g)" \
 		--group-add "$$(stat -c '%g' /dev/kvm)" \
 		-e HOME=/build \
-		-e IMAGO_TESTDATA_PATH=/testdata \
+		-e INSTAR_TESTDATA_PATH=/testdata \
 		-v "$(CURDIR):/workspace" \
 		-v "$(TESTDATA_PATH):/testdata:ro" \
 		-w "/workspace" \
-		"$(IMAGO_IMAGE)" \
+		"$(INSTAR_IMAGE)" \
 		bash -c '\
 			echo "Setting up test environment..."; \
 			python3 -m venv /build/test-venv && \
@@ -462,11 +462,11 @@ test-container-core: imago-devcontainer imago
 		'
 
 # Run QCOW2/VMDK/RAW convert + compare tests inside container
-test-container-convert-qcow2: imago-devcontainer imago
+test-container-convert-qcow2: instar-devcontainer instar
 	@echo "Running QCOW2/VMDK/RAW convert + compare tests inside container..."
 	@if [ ! -d "$(TESTDATA_PATH)" ]; then \
 		echo "Error: Test data not found at $(TESTDATA_PATH)"; \
-		echo "Set IMAGO_TESTDATA_PATH or ensure imago-testdata is a sibling directory."; \
+		echo "Set INSTAR_TESTDATA_PATH or ensure instar-testdata is a sibling directory."; \
 		exit 1; \
 	fi
 	docker run --rm \
@@ -474,11 +474,11 @@ test-container-convert-qcow2: imago-devcontainer imago
 		-u "$(shell id -u):$(shell id -g)" \
 		--group-add "$$(stat -c '%g' /dev/kvm)" \
 		-e HOME=/build \
-		-e IMAGO_TESTDATA_PATH=/testdata \
+		-e INSTAR_TESTDATA_PATH=/testdata \
 		-v "$(CURDIR):/workspace" \
 		-v "$(TESTDATA_PATH):/testdata:ro" \
 		-w "/workspace" \
-		"$(IMAGO_IMAGE)" \
+		"$(INSTAR_IMAGE)" \
 		bash -c '\
 			echo "Setting up test environment..."; \
 			python3 -m venv /build/test-venv && \
@@ -492,11 +492,11 @@ test-container-convert-qcow2: imago-devcontainer imago
 		'
 
 # Run VHD/VHDX convert tests inside container
-test-container-convert-vhd: imago-devcontainer imago
+test-container-convert-vhd: instar-devcontainer instar
 	@echo "Running VHD/VHDX convert tests inside container..."
 	@if [ ! -d "$(TESTDATA_PATH)" ]; then \
 		echo "Error: Test data not found at $(TESTDATA_PATH)"; \
-		echo "Set IMAGO_TESTDATA_PATH or ensure imago-testdata is a sibling directory."; \
+		echo "Set INSTAR_TESTDATA_PATH or ensure instar-testdata is a sibling directory."; \
 		exit 1; \
 	fi
 	docker run --rm \
@@ -504,11 +504,11 @@ test-container-convert-vhd: imago-devcontainer imago
 		-u "$(shell id -u):$(shell id -g)" \
 		--group-add "$$(stat -c '%g' /dev/kvm)" \
 		-e HOME=/build \
-		-e IMAGO_TESTDATA_PATH=/testdata \
+		-e INSTAR_TESTDATA_PATH=/testdata \
 		-v "$(CURDIR):/workspace" \
 		-v "$(TESTDATA_PATH):/testdata:ro" \
 		-w "/workspace" \
-		"$(IMAGO_IMAGE)" \
+		"$(INSTAR_IMAGE)" \
 		bash -c '\
 			echo "Setting up test environment..."; \
 			python3 -m venv /build/test-venv && \
@@ -522,19 +522,19 @@ test-container-convert-vhd: imago-devcontainer imago
 
 # Run CI-suitable tests (safe + caution)
 # Runs all test files except malicious image tests
-test-ci: imago test-venv
+test-ci: instar test-venv
 	@echo "Running CI tests (safe images)..."
 	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run --exclude-regex test_info_malicious
 
 # Run all tests including malicious (explicit opt-in)
-test-malicious: imago test-venv
+test-malicious: instar test-venv
 	@echo "WARNING: Running tests including malicious images"
 	@echo "This will process known malicious disk images."
 	@echo ""
 	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run
 
 # Run tests and show output (useful for seeing diffs during development)
-test-report: imago test-venv
+test-report: instar test-venv
 	@echo "Running tests with verbose output..."
 	cd $(TESTS_DIR) && ../$(VENV_DIR)/bin/stestr run --serial -- --verbose
 

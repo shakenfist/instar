@@ -1,4 +1,4 @@
-//! Fuzz harness support for imago parser crates.
+//! Fuzz harness support for instar parser crates.
 //!
 //! Provides a mock CallTable backed by fuzzer input, allowing
 //! coverage-guided fuzzing of the no_std parser crates without

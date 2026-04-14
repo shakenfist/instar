@@ -1,7 +1,7 @@
 # Image Notes
 
 This directory contains notes about test images that exposed specific quirks
-or implementation details during imago development.
+or implementation details during instar development.
 
 Each file documents:
 - What quirks the image exposed

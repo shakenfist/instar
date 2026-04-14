@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Differential fuzzing: compare imago vs qemu-img on random images.
+"""Differential fuzzing: compare instar vs qemu-img on random images.
 
 For each iteration this script:
   1. Picks a random seed (logged for reproducibility).
   2. Generates a random disk image with qemu-img create.
   3. Runs a random set of operations (info, check, convert)
-     independently against both imago and qemu-img on separate
+     independently against both instar and qemu-img on separate
      copies of the same input image.
   4. Compares outputs at each stage; exits with details on the
      first unexplained divergence.
 
 Usage:
     python3 scripts/differential-fuzz.py \
-        --imago src/target/release/imago \
+        --instar src/target/release/instar \
         --iterations 1000 \
         [--seed 42] \
         [--workdir /tmp/fuzz] \
@@ -53,7 +53,7 @@ KNOWN_DIVERGENCE_FIELDS = {
     # disk size varies by filesystem allocation
     'actual-size',
     'disk size',
-    # imago uses consistent JSON schema; qemu-img omits zero fields
+    # instar uses consistent JSON schema; qemu-img omits zero fields
     'image-clusters',
     'fragmented-clusters',
     'allocated-clusters',
@@ -165,9 +165,9 @@ def _write_random_data(rng, image_path, fmt):
 # Tool runners
 # ---------------------------------------------------------------------------
 
-def run_imago(imago_bin, subcmd, args, timeout=30):
-    """Run an imago subcommand. Returns (stdout, stderr, rc)."""
-    cmd = [str(imago_bin)] + subcmd + args
+def run_instar(instar_bin, subcmd, args, timeout=30):
+    """Run an instar subcommand. Returns (stdout, stderr, rc)."""
+    cmd = [str(instar_bin)] + subcmd + args
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout
@@ -283,7 +283,7 @@ def _extract_libyal_fields(kv, field_specs):
     return result
 
 
-# Field mappings per libyal tool: (libyal_key, imago_key, type)
+# Field mappings per libyal tool: (libyal_key, instar_key, type)
 _VMDKINFO_FIELDS = [
     ('media size', 'virtual-size', 'int'),
     ('format version', 'format-version', 'str'),
@@ -329,36 +329,36 @@ LIBYAL_PARSERS = {
 }
 
 
-def compare_libyal_info(imago_json, libyal_fields, fmt, tool_name):
-    """Compare imago info JSON against libyal parsed fields.
+def compare_libyal_info(instar_json, libyal_fields, fmt, tool_name):
+    """Compare instar info JSON against libyal parsed fields.
 
     Only compares fields that both tools report. Returns a
     divergence dict or None.
     """
     try:
-        imago_data = json.loads(imago_json)
+        instar_data = json.loads(instar_json)
     except (json.JSONDecodeError, ValueError):
         return None
 
     divergences = {}
     for field, libyal_val in libyal_fields.items():
-        if field not in imago_data:
+        if field not in instar_data:
             continue
 
-        imago_val = imago_data[field]
+        instar_val = instar_data[field]
 
         # Numeric comparison with tolerance
-        if isinstance(imago_val, (int, float)) and isinstance(libyal_val, (int, float)):
-            if imago_val != libyal_val:
+        if isinstance(instar_val, (int, float)) and isinstance(libyal_val, (int, float)):
+            if instar_val != libyal_val:
                 divergences[field] = {
-                    'imago': imago_val,
+                    'instar': instar_val,
                     'libyal': libyal_val,
                 }
         else:
             # String comparison (case-insensitive for text fields)
-            if str(imago_val).lower() != str(libyal_val).lower():
+            if str(instar_val).lower() != str(libyal_val).lower():
                 divergences[field] = {
-                    'imago': str(imago_val),
+                    'instar': str(instar_val),
                     'libyal': str(libyal_val),
                 }
 
@@ -374,34 +374,34 @@ def compare_libyal_info(imago_json, libyal_fields, fmt, tool_name):
 
 
 def check_libyal_parse_consistency(
-    imago_rc, libyal_rc, fmt, tool_name, image_path,
-    imago_stderr='', libyal_stderr='',
+    instar_rc, libyal_rc, fmt, tool_name, image_path,
+    instar_stderr='', libyal_stderr='',
 ):
-    """Compare parse-success consistency between imago and a libyal tool.
+    """Compare parse-success consistency between instar and a libyal tool.
 
     Returns a divergence dict if the tools disagree on whether
     the image is valid, or None if they agree.
     """
-    imago_ok = (imago_rc == 0)
+    instar_ok = (instar_rc == 0)
     libyal_ok = (libyal_rc == 0)
 
-    if imago_ok == libyal_ok:
+    if instar_ok == libyal_ok:
         return None
 
     return {
         'type': 'libyal_check_divergence',
         'tool': tool_name,
         'format': fmt,
-        'imago_rc': imago_rc,
+        'instar_rc': instar_rc,
         'libyal_rc': libyal_rc,
-        'imago_ok': imago_ok,
+        'instar_ok': instar_ok,
         'libyal_ok': libyal_ok,
         'note': (
-            'libyal parsed OK but imago found errors'
+            'libyal parsed OK but instar found errors'
             if libyal_ok
-            else 'imago found no errors but libyal failed to parse'
+            else 'instar found no errors but libyal failed to parse'
         ),
-        'imago_stderr': imago_stderr[:500],
+        'instar_stderr': instar_stderr[:500],
         'libyal_stderr': libyal_stderr[:500],
     }
 
@@ -418,7 +418,7 @@ def _strip_divergent_fields(obj):
     filename, actual-size, etc.
     """
     if isinstance(obj, dict):
-        # Fields that differ because imago and qemu-img operate
+        # Fields that differ because instar and qemu-img operate
         # on separate copies with different paths
         for field in ('filename',):
             obj.pop(field, None)
@@ -439,7 +439,7 @@ def _strip_divergent_fields(obj):
 def normalize_info_json(raw_json):
     """Parse and normalize info JSON for comparison.
 
-    Removes fields known to differ between imago and qemu-img
+    Removes fields known to differ between instar and qemu-img
     (filenames, disk size, allocation details) and sorts keys
     for stable comparison. Handles nested children objects.
     """
@@ -453,38 +453,38 @@ def normalize_info_json(raw_json):
     return json.dumps(data, sort_keys=True, indent=2)
 
 
-def compare_exit_codes(imago_rc, qemu_rc, operation, context):
+def compare_exit_codes(instar_rc, qemu_rc, operation, context):
     """Compare exit codes, returning a divergence dict or None."""
     # Both succeed or both fail = OK
-    imago_ok = (imago_rc == 0)
+    instar_ok = (instar_rc == 0)
     qemu_ok = (qemu_rc == 0)
 
-    if imago_ok == qemu_ok:
+    if instar_ok == qemu_ok:
         return None
 
     return {
         'type': 'exit_code_divergence',
         'operation': operation,
-        'imago_rc': imago_rc,
+        'instar_rc': instar_rc,
         'qemu_rc': qemu_rc,
         'context': context,
     }
 
 
-def compare_info_outputs(imago_stdout, qemu_stdout):
+def compare_info_outputs(instar_stdout, qemu_stdout):
     """Compare info JSON outputs after normalisation.
 
     Returns a divergence dict or None.
     """
-    imago_norm = normalize_info_json(imago_stdout)
+    instar_norm = normalize_info_json(instar_stdout)
     qemu_norm = normalize_info_json(qemu_stdout)
 
-    if imago_norm == qemu_norm:
+    if instar_norm == qemu_norm:
         return None
 
     return {
         'type': 'info_output_divergence',
-        'imago_normalized': imago_norm[:2000],
+        'instar_normalized': instar_norm[:2000],
         'qemu_normalized': qemu_norm[:2000],
     }
 
@@ -508,22 +508,22 @@ def _file_sha256(path):
 # Operation executors
 # ---------------------------------------------------------------------------
 
-def op_info(imago_bin, imago_copy, qemu_copy, fmt, timeout,
+def op_info(instar_bin, instar_copy, qemu_copy, fmt, timeout,
             libyal_tools=None):
     """Run info on both copies and compare JSON output.
 
     When libyal tools are available, also runs the corresponding
-    libyal info tool and compares extracted fields against imago.
+    libyal info tool and compares extracted fields against instar.
     """
     # Raw images created by the fuzzer have no partition table,
-    # so imago intentionally rejects them as "unknown format"
+    # so instar intentionally rejects them as "unknown format"
     # while qemu-img reports "raw".  This is a documented
     # unsafe quirk (see docs/quirks.md), not a bug.
     if fmt == 'raw':
         return None
 
-    i_out, i_err, i_rc = run_imago(
-        imago_bin, ['info'], ['--output', 'json', str(imago_copy)],
+    i_out, i_err, i_rc = run_instar(
+        instar_bin, ['info'], ['--output', 'json', str(instar_copy)],
         timeout=timeout,
     )
     q_out, q_err, q_rc = run_qemu_img(
@@ -532,7 +532,7 @@ def op_info(imago_bin, imago_copy, qemu_copy, fmt, timeout,
     )
 
     div = compare_exit_codes(i_rc, q_rc, 'info', {
-        'imago_stderr': i_err[:500],
+        'instar_stderr': i_err[:500],
         'qemu_stderr': q_err[:500],
     })
     if div:
@@ -544,13 +544,13 @@ def op_info(imago_bin, imago_copy, qemu_copy, fmt, timeout,
         if div:
             return div
 
-    # libyal cross-check: compare imago info against libyal parser
+    # libyal cross-check: compare instar info against libyal parser
     if libyal_tools and i_rc == 0:
         tool_name = LIBYAL_TOOLS.get(fmt)
         if tool_name and tool_name in libyal_tools:
             parser = LIBYAL_PARSERS[tool_name]
             l_out, l_err, l_rc = run_libyal_tool(
-                libyal_tools[tool_name], imago_copy, timeout=timeout,
+                libyal_tools[tool_name], instar_copy, timeout=timeout,
             )
             if l_rc == 0:
                 libyal_fields = parser(l_out)
@@ -564,17 +564,17 @@ def op_info(imago_bin, imago_copy, qemu_copy, fmt, timeout,
     return None
 
 
-def op_check(imago_bin, imago_copy, qemu_copy, fmt, timeout,
+def op_check(instar_bin, instar_copy, qemu_copy, fmt, timeout,
              libyal_tools=None):
     """Run check on both copies and compare exit codes.
 
-    For QCOW2, compares imago vs qemu-img exit codes. For all
+    For QCOW2, compares instar vs qemu-img exit codes. For all
     formats with an available libyal tool, also checks
-    parse-success consistency between imago check and the libyal
+    parse-success consistency between instar check and the libyal
     info tool (which fails on structurally broken images).
     """
-    i_out, i_err, i_rc = run_imago(
-        imago_bin, ['check'], [str(imago_copy)],
+    i_out, i_err, i_rc = run_instar(
+        instar_bin, ['check'], [str(instar_copy)],
         timeout=timeout,
     )
 
@@ -586,9 +586,9 @@ def op_check(imago_bin, imago_copy, qemu_copy, fmt, timeout,
         )
 
         div = compare_exit_codes(i_rc, q_rc, 'check', {
-            'imago_stderr': i_err[:500],
+            'instar_stderr': i_err[:500],
             'qemu_stderr': q_err[:500],
-            'imago_stdout': i_out[:500],
+            'instar_stdout': i_out[:500],
             'qemu_stdout': q_out[:500],
         })
         if div:
@@ -596,16 +596,16 @@ def op_check(imago_bin, imago_copy, qemu_copy, fmt, timeout,
 
     # libyal parse-success consistency: if a libyal tool can
     # parse the image, it should be structurally valid; if it
-    # can't, imago check should also report errors.
+    # can't, instar check should also report errors.
     if libyal_tools:
         tool_name = LIBYAL_TOOLS.get(fmt)
         if tool_name and tool_name in libyal_tools:
             l_out, l_err, l_rc = run_libyal_tool(
-                libyal_tools[tool_name], imago_copy, timeout=timeout,
+                libyal_tools[tool_name], instar_copy, timeout=timeout,
             )
             div = check_libyal_parse_consistency(
-                i_rc, l_rc, fmt, tool_name, imago_copy,
-                imago_stderr=i_err, libyal_stderr=l_err,
+                i_rc, l_rc, fmt, tool_name, instar_copy,
+                instar_stderr=i_err, libyal_stderr=l_err,
             )
             if div:
                 return div
@@ -613,7 +613,7 @@ def op_check(imago_bin, imago_copy, qemu_copy, fmt, timeout,
     return None
 
 
-def op_convert(imago_bin, imago_copy, qemu_copy, fmt,
+def op_convert(instar_bin, instar_copy, qemu_copy, fmt,
                timeout, rng, compress=False):
     """Convert both copies to a random output format; compare results.
 
@@ -623,17 +623,17 @@ def op_convert(imago_bin, imago_copy, qemu_copy, fmt,
     # Pick a target format for the convert
     target_fmt = rng.choice(['raw', 'qcow2'])
 
-    imago_out = imago_copy.parent / f'{imago_copy.stem}-conv.{target_fmt}'
+    instar_out = instar_copy.parent / f'{instar_copy.stem}-conv.{target_fmt}'
     qemu_out = qemu_copy.parent / f'{qemu_copy.stem}-conv.{target_fmt}'
 
-    # Convert with imago
-    imago_args = ['-O', target_fmt]
+    # Convert with instar
+    instar_args = ['-O', target_fmt]
     if compress and target_fmt == 'qcow2':
-        imago_args.append('--compress')
-    imago_args.extend([str(imago_copy), str(imago_out)])
+        instar_args.append('--compress')
+    instar_args.extend([str(instar_copy), str(instar_out)])
 
-    i_out, i_err, i_rc = run_imago(
-        imago_bin, ['convert'], imago_args, timeout=timeout,
+    i_out, i_err, i_rc = run_instar(
+        instar_bin, ['convert'], instar_args, timeout=timeout,
     )
 
     # Convert with qemu-img
@@ -649,7 +649,7 @@ def op_convert(imago_bin, imago_copy, qemu_copy, fmt,
     div = compare_exit_codes(i_rc, q_rc, 'convert', {
         'target_format': target_fmt,
         'compress': compress,
-        'imago_stderr': i_err[:500],
+        'instar_stderr': i_err[:500],
         'qemu_stderr': q_err[:500],
     })
     if div:
@@ -661,24 +661,24 @@ def op_convert(imago_bin, imago_copy, qemu_copy, fmt,
 
     # Compare content: convert both outputs to raw and hash
     if target_fmt == 'raw':
-        if not files_match(imago_out, qemu_out):
+        if not files_match(instar_out, qemu_out):
             return {
                 'type': 'convert_content_divergence',
                 'target_format': target_fmt,
                 'compress': compress,
-                'imago_sha256': _file_sha256(imago_out),
+                'instar_sha256': _file_sha256(instar_out),
                 'qemu_sha256': _file_sha256(qemu_out),
             }
     else:
         # For non-raw targets, convert both to raw and compare
-        imago_raw = imago_copy.parent / f'{imago_copy.stem}-verify.raw'
+        instar_raw = instar_copy.parent / f'{instar_copy.stem}-verify.raw'
         qemu_raw = qemu_copy.parent / f'{qemu_copy.stem}-verify.raw'
 
         # Use qemu-img to flatten both to raw for comparison
         # (neutral ground — neither tool is favoured)
         subprocess.run(
             ['qemu-img', 'convert', '-O', 'raw',
-             str(imago_out), str(imago_raw)],
+             str(instar_out), str(instar_raw)],
             capture_output=True, timeout=timeout,
         )
         subprocess.run(
@@ -687,14 +687,14 @@ def op_convert(imago_bin, imago_copy, qemu_copy, fmt,
             capture_output=True, timeout=timeout,
         )
 
-        if imago_raw.exists() and qemu_raw.exists():
-            if not files_match(imago_raw, qemu_raw):
+        if instar_raw.exists() and qemu_raw.exists():
+            if not files_match(instar_raw, qemu_raw):
                 return {
                     'type': 'convert_content_divergence',
                     'target_format': target_fmt,
                     'compress': compress,
                     'note': 'raw-flattened content differs',
-                    'imago_sha256': _file_sha256(imago_raw),
+                    'instar_sha256': _file_sha256(instar_raw),
                     'qemu_sha256': _file_sha256(qemu_raw),
                 }
 
@@ -705,7 +705,7 @@ def op_convert(imago_bin, imago_copy, qemu_copy, fmt,
 # Single iteration
 # ---------------------------------------------------------------------------
 
-def run_iteration(imago_bin, workdir, rng, iteration, timeout,
+def run_iteration(instar_bin, workdir, rng, iteration, timeout,
                    libyal_tools=None):
     """Run one fuzzing iteration. Returns (divergence_dict, attrs) or
     (None, attrs) on success.
@@ -717,10 +717,10 @@ def run_iteration(imago_bin, workdir, rng, iteration, timeout,
         # Generate a random image
         image_path, fmt, attrs = generate_image(rng, iter_dir, iteration)
 
-        # Create separate copies for imago and qemu-img
-        imago_copy = iter_dir / f'imago-{image_path.name}'
+        # Create separate copies for instar and qemu-img
+        instar_copy = iter_dir / f'instar-{image_path.name}'
         qemu_copy = iter_dir / f'qemu-{image_path.name}'
-        shutil.copy2(image_path, imago_copy)
+        shutil.copy2(image_path, instar_copy)
         shutil.copy2(image_path, qemu_copy)
 
         # Pick a random set of 2-4 operations to run independently
@@ -732,22 +732,22 @@ def run_iteration(imago_bin, workdir, rng, iteration, timeout,
         for op in ops:
             if op == 'info':
                 div = op_info(
-                    imago_bin, imago_copy, qemu_copy, fmt, timeout,
+                    instar_bin, instar_copy, qemu_copy, fmt, timeout,
                     libyal_tools=libyal_tools,
                 )
             elif op == 'check':
                 div = op_check(
-                    imago_bin, imago_copy, qemu_copy, fmt, timeout,
+                    instar_bin, instar_copy, qemu_copy, fmt, timeout,
                     libyal_tools=libyal_tools,
                 )
             elif op == 'convert':
                 div = op_convert(
-                    imago_bin, imago_copy, qemu_copy, fmt,
+                    instar_bin, instar_copy, qemu_copy, fmt,
                     timeout, rng, compress=False,
                 )
             elif op == 'convert_compressed':
                 div = op_convert(
-                    imago_bin, imago_copy, qemu_copy, fmt,
+                    instar_bin, instar_copy, qemu_copy, fmt,
                     timeout, rng, compress=True,
                 )
             else:
@@ -840,7 +840,7 @@ def file_github_issue(seed, iteration, attrs, divergence, workflow_url):
         f'### Reproduction\n'
         f'```bash\n'
         f'python3 scripts/differential-fuzz.py \\\n'
-        f'  --imago src/target/release/imago \\\n'
+        f'  --instar src/target/release/instar \\\n'
         f'  --iterations {iteration + 1} \\\n'
         f'  --seed {seed} \\\n'
         f'  --fail-fast\n'
@@ -883,11 +883,11 @@ def file_github_issue(seed, iteration, attrs, divergence, workflow_url):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Differential fuzzing: imago vs qemu-img',
+        description='Differential fuzzing: instar vs qemu-img',
     )
     parser.add_argument(
-        '--imago', required=True,
-        help='Path to imago binary',
+        '--instar', required=True,
+        help='Path to instar binary',
     )
     parser.add_argument(
         '--iterations', type=int, default=1000,
@@ -925,9 +925,9 @@ def main():
     args = parser.parse_args()
 
     # Resolve paths
-    imago_bin = Path(args.imago).resolve()
-    if not imago_bin.exists():
-        print(f'Error: imago binary not found: {imago_bin}', file=sys.stderr)
+    instar_bin = Path(args.instar).resolve()
+    if not instar_bin.exists():
+        print(f'Error: instar binary not found: {instar_bin}', file=sys.stderr)
         sys.exit(1)
 
     log_dir = Path(args.log_dir).resolve()
@@ -947,7 +947,7 @@ def main():
     logger.info('Differential fuzzing started')
     logger.info('  seed:       %d', seed)
     logger.info('  iterations: %d', args.iterations)
-    logger.info('  imago:      %s', imago_bin)
+    logger.info('  instar:      %s', instar_bin)
     logger.info('  timeout:    %ds', args.timeout)
     logger.info('  log file:   %s', log_file)
 
@@ -960,7 +960,7 @@ def main():
         workdir.mkdir(parents=True, exist_ok=True)
         cleanup_workdir = False
     else:
-        workdir = Path(tempfile.mkdtemp(prefix='imago-fuzz-'))
+        workdir = Path(tempfile.mkdtemp(prefix='instar-fuzz-'))
         cleanup_workdir = True
 
     logger.info('  workdir:    %s', workdir)
@@ -986,7 +986,7 @@ def main():
 
             try:
                 div, attrs = run_iteration(
-                    imago_bin, workdir, iter_rng, i, args.timeout,
+                    instar_bin, workdir, iter_rng, i, args.timeout,
                     libyal_tools=libyal_tools,
                 )
             except Exception as exc:

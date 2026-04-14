@@ -1,4 +1,4 @@
-# Imago Architecture
+# Instar Architecture
 
 ## Design Goals
 
@@ -16,14 +16,14 @@ processing untrusted disk images, any vulnerability in format parsing code
 could lead to host compromise. Historical CVEs in qemu-img include buffer
 overflows, integer overflows, and other memory safety issues.
 
-### Imago's Approach
+### Instar's Approach
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        Host System                          │
 │                                                             │
 │  ┌─────────────┐     ┌─────────────────────────────────┐   │
-│  │   Imago     │     │        KVM Sandbox              │   │
+│  │   Instar    │     │        KVM Sandbox              │   │
 │  │   Client    │────▶│  ┌─────────────────────────┐    │   │
 │  │             │     │  │   Conversion Engine     │    │   │
 │  │ (handles    │◀────│  │   (parses formats,      │    │   │
@@ -50,7 +50,7 @@ format detection. qemu-img treats any unrecognized file as a valid RAW disk
 image, which is the root cause of backing file disclosure attacks (CVE-2015-5163,
 CVE-2024-32498).
 
-**Imago's default behavior (secure):** Files without recognized format headers
+**Instar's default behavior (secure):** Files without recognized format headers
 must have a valid partition table (MBR or GPT) to be accepted as RAW disk images.
 Files without valid partition tables are rejected as "unknown format."
 
@@ -227,7 +227,7 @@ provides a modular architecture with:
 
 **Chain validation in check (`--chain`):**
 The check operation supports an optional `--chain` flag that uses the host-side
-chain discovery infrastructure (same as `imago info --chain`) to discover the
+chain discovery infrastructure (same as `instar info --chain`) to discover the
 full backing chain, then sets up each image as a separate virtio-block device
 in the KVM guest. The guest validates each backing image for format consistency,
 non-zero virtual size, and QCOW2 header integrity (magic, version,
@@ -382,19 +382,19 @@ by scripts in `scripts/`:
 - `create-qcow2-luks-testdata.sh` — QCOW2 with LUKS encryption (crypt_method=2)
 - `create-check-testdata.sh` — QCOW2 images with specific corruptions
 Adversarial and CVE-reproducer image generation scripts live in
-`imago-testdata/scripts/` (the private testdata repository), not in
-the public `imago/scripts/` directory. This includes scripts for
+`instar-testdata/scripts/` (the private testdata repository), not in
+the public `instar/scripts/` directory. This includes scripts for
 compression bombs, circular/deep chains, integer overflow headers,
 boundary values, format confusion, and CVE reproducers.
 
-Generated images live in `../imago-testdata/custom/format-coverage/`
-and `../imago-testdata/custom/audit/` (adversarial images).
+Generated images live in `../instar-testdata/custom/format-coverage/`
+and `../instar-testdata/custom/audit/` (adversarial images).
 The test manifest (`tests/manifest.json`) references them with
 `generated_by` and `skip_qemu_img: true`.
 
 ## oslo.utils Cross-Validation
 
-`tests/test_oslo_crossval.py` runs both imago and oslo.utils
+`tests/test_oslo_crossval.py` runs both instar and oslo.utils
 `format_inspector` against every test image, comparing format
 detection, safety verdicts, and virtual size. Known divergences
 (GPT detection for raw images, QED banning, LUKS v2 rejection)
@@ -410,7 +410,7 @@ For each iteration it:
 
 1. Generates a random disk image using qemu-img (varying format, virtual size,
    cluster size, compression, and data patterns).
-2. Creates separate copies for imago and qemu-img.
+2. Creates separate copies for instar and qemu-img.
 3. Runs a random chain of 2-4 operations (info, check, convert, compressed
    convert) against both tools.
 4. Compares outputs: exit codes, JSON info output (after normalisation to
@@ -427,10 +427,10 @@ When libyal tools are installed (`libvmdk-utils`, `libvhdi-utils`,
 `libqcow-utils`), the fuzzer adds two additional layers of comparison:
 
 1. **Info cross-check**: Parsed fields from libyal tools (virtual size,
-   format version, cluster size, etc.) are compared against imago's JSON
+   format version, cluster size, etc.) are compared against instar's JSON
    output for the same image.
 2. **Parse-success consistency**: For each format, if the libyal tool
-   successfully parses the image, imago check should report no errors
+   successfully parses the image, instar check should report no errors
    (and vice versa). Disagreements are flagged as divergences.
 
 This closes the gap where VMDK/VHD/VHDX had no differential reference for
@@ -457,7 +457,7 @@ parsing (QCOW2, VMDK, VHD, VHDX, RAW, LUKS), L1/L2 cluster lookup,
 refcount table traversal, zlib decompression, grain directory lookup,
 BAT traversal, and VHDX metadata parsing.
 
-The seed corpus is extracted from `imago-testdata` by
+The seed corpus is extracted from `instar-testdata` by
 `scripts/extract-fuzz-corpus.py`, which filters images by format and
 generates hand-crafted minimal valid inputs. The CI workflow
 (`.github/workflows/coverage-fuzz.yml`) runs nightly at 04:00 UTC

@@ -1356,7 +1356,7 @@ fn escape_json_string(s: &str) -> String {
     result
 }
 
-/// Get the directory containing the imago executable
+/// Get the directory containing the instar executable
 fn get_binary_dir() -> std::path::PathBuf {
     std::env::current_exe()
         .expect("Failed to get executable path")
@@ -1365,7 +1365,7 @@ fn get_binary_dir() -> std::path::PathBuf {
         .to_path_buf()
 }
 
-/// Get the path to a binary in the same directory as imago
+/// Get the path to a binary in the same directory as instar
 fn get_binary_path(name: &str) -> std::path::PathBuf {
     get_binary_dir().join(name)
 }
@@ -1981,7 +1981,7 @@ fn create_single_image_chain(
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "imago")]
+#[command(name = "instar")]
 #[command(about = "Safe, sandboxed disk image operations")]
 struct Cli {
     /// Enable verbose output (debug information about KVM setup, memory, etc.)
@@ -2029,7 +2029,7 @@ struct InfoArgs {
     unsafe_quirks: bool,
 
     /// Target qemu-img version for output compatibility (e.g., "7.2", "8.0", "10.0").
-    /// By default, imago detects the installed qemu-img version and matches its output format.
+    /// By default, instar detects the installed qemu-img version and matches its output format.
     #[arg(long, value_name = "VERSION")]
     qemu_version: Option<String>,
 
@@ -2048,7 +2048,7 @@ struct InfoArgs {
     extra_detail: bool,
 
     /// LUKS passphrase for decrypting the first payload sector to detect
-    /// the inner format. When provided, imago decrypts and reports the
+    /// the inner format. When provided, instar decrypts and reports the
     /// format inside the LUKS container (e.g., qcow2, raw).
     #[arg(long, value_name = "PASSPHRASE")]
     luks_passphrase: Option<String>,

@@ -1,7 +1,7 @@
 # KVM Performance Counters and Resource Monitoring
 
 This document describes the performance monitoring and resource limiting options
-available when building custom VMMs with KVM, with specific focus on the imago
+available when building custom VMMs with KVM, with specific focus on the instar
 use case of sandboxed image conversion.
 
 ## Why Performance Monitoring Matters
@@ -21,7 +21,7 @@ or suboptimal sector sizes.
 
 ## Available Monitoring Options
 
-### Option A: Internal VMM Counters (Recommended for imago)
+### Option A: Internal VMM Counters (Recommended for instar)
 
 The simplest and most portable approach is to track statistics directly in the
 VMM's main loop. Since the VMM already processes every VM exit, adding counters
@@ -269,7 +269,7 @@ be available in production environments or containers.
 
 ### AMD-V (SVM) Exit Reasons
 
-The imago development environment uses AMD processors with the `kvm_amd` module.
+The instar development environment uses AMD processors with the `kvm_amd` module.
 Common SVM exit reasons:
 
 | Exit Code | Name | Description |
@@ -301,7 +301,7 @@ For Intel processors with the `kvm_intel` module:
 | 32 | WRMSR | MSR write |
 | 48 | EPT_VIOLATION | EPT violation (used for MMIO) |
 
-## Recommendations for imago
+## Recommendations for instar
 
 ### For Development and Benchmarking
 

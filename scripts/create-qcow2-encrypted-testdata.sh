@@ -4,7 +4,7 @@
 # Usage:
 #   ./scripts/create-qcow2-encrypted-testdata.sh [output-dir]
 #
-# Default output: ../imago-testdata/custom/format-coverage/
+# Default output: ../instar-testdata/custom/format-coverage/
 #
 # Creates:
 #   qcow2-encrypted-aes.qcow2 - 1MB QCOW2 v2 with AES-128-CBC encryption
@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-OUTDIR="${1:-../imago-testdata/custom/format-coverage}"
+OUTDIR="${1:-../instar-testdata/custom/format-coverage}"
 mkdir -p "$OUTDIR"
 OUTPUT="$OUTDIR/qcow2-encrypted-aes.qcow2"
 PASSWORD="testpass"

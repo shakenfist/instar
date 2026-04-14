@@ -5,7 +5,7 @@
 //! - qemu-img 8.0+ (Debian 13 trixie): Includes "Child node '/file'" section
 //!
 //! This module provides runtime version detection and profile selection to
-//! ensure imago's output matches the installed qemu-img version.
+//! ensure instar's output matches the installed qemu-img version.
 
 use std::process::Command;
 use std::sync::OnceLock;

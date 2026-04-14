@@ -2,7 +2,7 @@
 
 ## Philosophy
 
-Imago is a security-focused project. **Always prefer the correct fix over the
+Instar is a security-focused project. **Always prefer the correct fix over the
 easy fix.** Quick workarounds may hide deeper issues, introduce technical debt,
 or create security vulnerabilities.
 
@@ -106,7 +106,7 @@ Sometimes the easy fix IS the right fix:
 
 The key distinction: Does the fix address the actual problem, or does it hide it?
 
-## Examples in Imago Context
+## Examples in Instar Context
 
 ### Format Detection
 

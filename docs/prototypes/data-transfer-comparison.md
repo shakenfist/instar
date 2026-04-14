@@ -5,7 +5,7 @@ bare-metal KVM guests, helping you choose the right approach for your use case.
 
 ## Large File Considerations
 
-For Imago, we must handle disk images ranging from tens of gigabytes to
+For Instar, we must handle disk images ranging from tens of gigabytes to
 hundreds of gigabytes. This significantly constrains our options:
 
 - **Direct memory mapping of entire files is impractical** - A 100GB image
@@ -149,7 +149,7 @@ clear winner for production use.
 
 ## Architecture Recommendations
 
-### For Imago (Disk Image Processing)
+### For Instar (Disk Image Processing)
 
 **Primary recommendation: Virtio-block**
 
@@ -279,7 +279,7 @@ For optimal performance:
 | Port I/O | High | Simple |
 | VFIO | Medium | Hardware dependent |
 
-For security-sensitive workloads (like Imago):
+For security-sensitive workloads (like Instar):
 
 1. Use read-only memory regions for input
 2. Validate output size before reading
@@ -288,7 +288,7 @@ For security-sensitive workloads (like Imago):
 
 ## Summary Recommendations
 
-### For Imago Project
+### For Instar Project
 
 | Phase | Mechanism | Rationale |
 |-------|-----------|-----------|
@@ -354,7 +354,7 @@ shrinks dramatically:
 | Custom MMIO | ~600 lines | ~550 lines | 8% |
 
 **Recommendation**: The rust-vmm ecosystem makes virtio-block the clear choice
-for Imago. The implementation effort is now comparable to custom solutions,
+for Instar. The implementation effort is now comparable to custom solutions,
 while gaining batching, scatter-gather, error handling, and tooling for free.
 
 ### Example: VMM with rust-vmm

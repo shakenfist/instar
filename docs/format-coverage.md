@@ -1,8 +1,8 @@
 # Format Detection and Safety Check Coverage
 
-This document compares imago's format detection and safety reporting capabilities
+This document compares instar's format detection and safety reporting capabilities
 against OpenStack's oslo.utils `format_inspector` module. The goal is to ensure
-imago can detect all the same security-relevant metadata that OpenStack uses for
+instar can detect all the same security-relevant metadata that OpenStack uses for
 image safety validation.
 
 ## Important Distinction: Detection vs Rejection
@@ -10,8 +10,8 @@ image safety validation.
 **oslo.utils format_inspector** performs **safety validation** - it rejects images
 that fail safety checks (e.g., QCOW2 with backing files, VMDK with path traversal).
 
-**imago** performs **safety detection** - it reports security-relevant metadata
-to the caller but does not reject images. This is because imago's KVM sandbox
+**instar** performs **safety detection** - it reports security-relevant metadata
+to the caller but does not reject images. This is because instar's KVM sandbox
 architecture makes following these references impossible, so detection and
 reporting is sufficient. See [format-detection-safety.md](format-detection-safety.md)
 for details on why this approach is secure.
@@ -20,7 +20,7 @@ for details on why this approach is secure.
 
 ## Format Detection Comparison
 
-| Format | oslo.utils | imago | Test Images |
+| Format | oslo.utils | instar | Test Images |
 |--------|------------|-------|-------------|
 | QCOW2 (v2/v3) | Yes | Yes | cirros-qcow2, qcow2-v2, many edge-cases |
 | QCOW1 | No | Yes | (none - deprecated format) |
@@ -40,17 +40,17 @@ for details on why this approach is secure.
 | Bochs | No | **No** | empty.bochs (in testdata, not tested) |
 | cloop | No | **No** | simple-pattern.cloop (in testdata, not tested) |
 
-*\* ISO detection is controlled by `--unsafe-quirks` flag: by default imago reports "iso", but with `--unsafe-quirks` it reports "raw" to match qemu-img behavior. See [quirks.md](quirks.md) for details.*
+*\* ISO detection is controlled by `--unsafe-quirks` flag: by default instar reports "iso", but with `--unsafe-quirks` it reports "raw" to match qemu-img behavior. See [quirks.md](quirks.md) for details.*
 
-### Formats Not Yet Detected by Imago
+### Formats Not Yet Detected by Instar
 
-All formats detected by oslo.utils are now also detected by imago.
+All formats detected by oslo.utils are now also detected by instar.
 
 ---
 
 ## Conversion Output Format Support
 
-The `imago convert` operation supports writing output in the following formats:
+The `instar convert` operation supports writing output in the following formats:
 
 | Output Format | Status | Key Features |
 |---------------|--------|--------------|
@@ -91,7 +91,7 @@ The `imago convert` operation supports writing output in the following formats:
   conversion source.
 - QCOW2 snapshots: snapshot table parsing and extraction via
   `convert --snapshot <ID|name>` are supported (up to 16 snapshots).
-- `imago compare` supports LUKS-in-QCOW2 decryption
+- `instar compare` supports LUKS-in-QCOW2 decryption
   (crypt_method=2) via `--luks-passphrase`, matching the
   convert operation. This allows comparing encrypted QCOW2
   images directly against their decrypted equivalents.
@@ -112,7 +112,7 @@ The `imago convert` operation supports writing output in the following formats:
 
 ### QCOW2 Safety Checks
 
-| Check | Description | oslo.utils | imago | Test Images |
+| Check | Description | oslo.utils | instar | Test Images |
 |-------|-------------|------------|-------|-------------|
 | backing_file | Detects external backing file reference | Rejects | Reports (FLAG_HAS_BACKING_FILE) | qcow2-overlay-chain, sf-vda, qcow2-backing-* |
 | data_file | Detects external data file feature | Rejects | Reports (FLAG_HAS_EXTERNAL_DATA) | qcow2-external-data-file |
@@ -123,7 +123,7 @@ The `imago convert` operation supports writing output in the following formats:
 
 #### QCOW2 Incompatible Feature Bits
 
-| Bit | Name | oslo.utils | imago |
+| Bit | Name | oslo.utils | instar |
 |-----|------|------------|-------|
 | 0 | Dirty bit | N/A | QCOW2_INCOMPAT_DIRTY |
 | 1 | Corrupt bit | N/A | QCOW2_INCOMPAT_CORRUPT |
@@ -134,7 +134,7 @@ The `imago convert` operation supports writing output in the following formats:
 
 ### VMDK Safety Checks
 
-| Check | Description | oslo.utils | imago | Test Images |
+| Check | Description | oslo.utils | instar | Test Images |
 |-------|-------------|------------|-------|-------------|
 | descriptor path traversal | Extent paths with `/` | Rejects | Detects multi-extent (FLAG_NOT_SUPPORTED) | vmdk-path-traversal |
 | descriptor missing extents | No extent declarations | Rejects | Validated via GD/GT walk | vmdk-no-extents |
@@ -151,7 +151,7 @@ The `imago convert` operation supports writing output in the following formats:
 
 ### RAW/Partition Table Safety Checks
 
-| Check | Description | oslo.utils | imago | Test Images |
+| Check | Description | oslo.utils | instar | Test Images |
 |-------|-------------|------------|-------|-------------|
 | MBR signature | 0xAA55 at offset 510 | Yes | Yes | raw-mbr-partitioned |
 | MBR boot flag validity | Must be 0x00 or 0x80 | Rejects | Yes | raw-mbr-partitioned |
@@ -160,7 +160,7 @@ The `imago convert` operation supports writing output in the following formats:
 
 ### Other Format Safety Checks
 
-| Format | Check | oslo.utils | imago |
+| Format | Check | oslo.utils | instar |
 |--------|-------|------------|-------|
 | QED | Banned entirely | Rejects | Detects format |
 | LUKS | Version check (only v1) | Rejects v2+ | Detects format, version, cipher, hash, UUID, payload offset, key slots, inner format (with passphrase); convert decrypts v1/v2 containers |
@@ -417,7 +417,7 @@ None currently outstanding. All VMDK safety checks are now implemented.
 
 ## oslo.utils Cross-Validation Testing
 
-Automated tests in `tests/test_oslo_crossval.py` run both imago and
+Automated tests in `tests/test_oslo_crossval.py` run both instar and
 oslo.utils `format_inspector` against every test image and compare
 results. Three test classes cover format detection, safety checks,
 and virtual size.
@@ -433,14 +433,14 @@ cd tests && ../.venv/bin/stestr run test_oslo_crossval
 
 ### Documented Divergences
 
-| Area | Image(s) | imago | oslo.utils | Reason |
+| Area | Image(s) | instar | oslo.utils | Reason |
 |------|----------|-------|-----------|--------|
-| Format | raw-mbr-partitioned, raw-gpt-partitioned | raw | gpt | oslo GPTInspector detects partition tables; imago matches qemu-img |
+| Format | raw-mbr-partitioned, raw-gpt-partitioned | raw | gpt | oslo GPTInspector detects partition tables; instar matches qemu-img |
 | Format | vmdk-multi-partition | raw | gpt | File is raw with GPT despite .vmdk extension |
-| Format | iso-simple | raw | iso | imago reports ISO as raw with --unsafe-quirks |
-| Format | luks-v1, luks-v2 | luks | luks | Match (imago now reports LUKS format with full metadata) |
-| Safety | QED images | pass | reject | oslo bans QED; imago uses KVM sandbox |
-| Safety | LUKS v2 | pass | reject | oslo rejects LUKS v2+; imago detects both |
+| Format | iso-simple | raw | iso | instar reports ISO as raw with --unsafe-quirks |
+| Format | luks-v1, luks-v2 | luks | luks | Match (instar now reports LUKS format with full metadata) |
+| Safety | QED images | pass | reject | oslo bans QED; instar uses KVM sandbox |
+| Safety | LUKS v2 | pass | reject | oslo rejects LUKS v2+; instar detects both |
 | Safety | qcow2-external-data-file | reports data-file | flags data_file | Match: both detect external data file path |
 | Vsize | VPC/VHD images | - | - | CHS geometry rounding (up to 8 MB delta allowed) |
 
@@ -457,7 +457,7 @@ are surfaced as warnings rather than blocking PRs.
 
 - [oslo.utils format_inspector.py](https://github.com/openstack/oslo.utils/blob/master/oslo_utils/imageutils/format_inspector.py)
 - [Glance format inspector module](https://docs.openstack.org/glance/latest/_modules/glance/common/format_inspector.html)
-- [format-detection-safety.md](format-detection-safety.md) - Why imago's detection-only approach is secure
+- [format-detection-safety.md](format-detection-safety.md) - Why instar's detection-only approach is secure
 - [security.md](security.md) - CVE analysis and threat model
 - [testing.md](testing.md) - Test framework documentation
 - [quirks.md](quirks.md) - Safe vs unsafe quirks classification

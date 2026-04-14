@@ -1,11 +1,11 @@
 """
-Integration tests verifying imago info output matches stored baselines.
+Integration tests verifying instar info output matches stored baselines.
 
 These tests iterate over all known output profiles (qemu-img version groups) and
-verify that imago produces correct output when given the --qemu-version flag.
-This ensures imago can correctly emulate any supported qemu-img version.
+verify that instar produces correct output when given the --qemu-version flag.
+This ensures instar can correctly emulate any supported qemu-img version.
 
-Tests compare against pre-generated baselines stored in imago-testdata, so
+Tests compare against pre-generated baselines stored in instar-testdata, so
 qemu-img does not need to be installed.
 """
 
@@ -15,7 +15,7 @@ from pathlib import Path
 
 import testscenarios
 
-from base import ImagoTestBase
+from base import InstarTestBase
 from helpers import load_manifest_images
 
 
@@ -39,11 +39,11 @@ def _generate_scenarios():
     tests_dir = Path(__file__).parent
 
     # Resolve testdata root - can be overridden by environment variable
-    testdata_env = os.environ.get('IMAGO_TESTDATA_PATH')
+    testdata_env = os.environ.get('INSTAR_TESTDATA_PATH')
     if testdata_env:
         testdata_root = Path(testdata_env)
     else:
-        testdata_root = tests_dir.parent.parent / 'imago-testdata'
+        testdata_root = tests_dir.parent.parent / 'instar-testdata'
 
     if not testdata_root.exists():
         # Return empty scenarios if testdata not available
@@ -85,14 +85,14 @@ def _generate_scenarios():
     return scenarios
 
 
-class TestInfoSafe(testscenarios.WithScenarios, ImagoTestBase):
-    """Test imago info output against stored baselines for all profiles."""
+class TestInfoSafe(testscenarios.WithScenarios, InstarTestBase):
+    """Test instar info output against stored baselines for all profiles."""
 
     # Scenarios must be populated at class definition time for testscenarios
     scenarios = _generate_scenarios()
 
     def test_output_matches_baseline(self):
-        """Test that imago output matches the stored baseline for this profile."""
+        """Test that instar output matches the stored baseline for this profile."""
         image = self.get_image(self.image_id)
 
         # Skip if image file doesn't exist
@@ -105,13 +105,13 @@ class TestInfoSafe(testscenarios.WithScenarios, ImagoTestBase):
         # Get the qemu version string for this profile
         qemu_version = self.get_qemu_version_for_profile(self.profile)
 
-        # Map output_type to imago --output flag value
+        # Map output_type to instar --output flag value
         output_format = self.output_type if self.output_type != 'human' else None
 
-        # Run imago with explicit --qemu-version and output format
+        # Run instar with explicit --qemu-version and output format
         # Use --unsafe-quirks for images that require it (e.g., raw files without
-        # partition tables that qemu-img would accept but imago rejects by default)
-        imago_stdout, imago_stderr, imago_rc = self.run_imago_info(
+        # partition tables that qemu-img would accept but instar rejects by default)
+        instar_stdout, instar_stderr, instar_rc = self.run_instar_info(
             image.path,
             qemu_version=qemu_version,
             output_format=output_format,
@@ -120,9 +120,9 @@ class TestInfoSafe(testscenarios.WithScenarios, ImagoTestBase):
 
         # Should succeed
         self.assertEqual(
-            0, imago_rc,
-            f'imago failed for {self.image_id} with --qemu-version {qemu_version}: '
-            f'{imago_stderr}'
+            0, instar_rc,
+            f'instar failed for {self.image_id} with --qemu-version {qemu_version}: '
+            f'{instar_stderr}'
         )
 
         # Load expected output from baseline
@@ -134,5 +134,5 @@ class TestInfoSafe(testscenarios.WithScenarios, ImagoTestBase):
 
         # Outputs should match (with actual disk size substituted from filesystem)
         self.assert_outputs_match(
-            self.image_id, imago_stdout, expected, image_path=image.path
+            self.image_id, instar_stdout, expected, image_path=image.path
         )

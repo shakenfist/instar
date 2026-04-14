@@ -2,9 +2,9 @@
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability in imago, please report
+If you discover a security vulnerability in instar, please report
 it responsibly via
-[GitHub Security Advisories](https://github.com/shakenfist/imago/security/advisories/new).
+[GitHub Security Advisories](https://github.com/shakenfist/instar/security/advisories/new).
 
 Please **do not** open a public issue for security vulnerabilities.
 
@@ -20,7 +20,7 @@ mitigation plan within 7 days for confirmed vulnerabilities.
 
 ## Security Model
 
-Imago's core security principle is that untrusted disk images are
+Instar's core security principle is that untrusted disk images are
 never parsed by code running with host privileges. All format
 parsing and data transformation happens inside a KVM-isolated
 guest. The host VMM only handles opaque byte streams via
@@ -49,4 +49,4 @@ The following are **not** in scope:
 - Crashes or hangs inside the KVM guest (these are contained by
   the sandbox and do not affect the host)
 - Issues requiring root access to the host
-- Issues in dependencies that do not affect imago's usage of them
+- Issues in dependencies that do not affect instar's usage of them

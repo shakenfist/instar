@@ -1,17 +1,17 @@
 #!/bin/bash
-# Generate synthetic VMDK test images for imago integration tests.
+# Generate synthetic VMDK test images for instar integration tests.
 #
 # Usage:
 #   ./scripts/create-vmdk-testdata.sh [output-dir]
 #
-# Default output: ../imago-testdata/custom/format-coverage/
+# Default output: ../instar-testdata/custom/format-coverage/
 #
 # Creates:
 #   vmdk-multi-extent.vmdk  - Binary VMDK4 with two extent lines
 
 set -euo pipefail
 
-OUTDIR="${1:-../imago-testdata/custom/format-coverage}"
+OUTDIR="${1:-../instar-testdata/custom/format-coverage}"
 mkdir -p "$OUTDIR"
 
 echo "Creating VMDK test images in $OUTDIR..."

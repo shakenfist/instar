@@ -1,11 +1,11 @@
-# Why Rust for Imago
+# Why Rust for Instar
 
 This document explains why Rust is the chosen implementation language for
-Imago's secure disk image processing.
+Instar's secure disk image processing.
 
 ## Executive Summary
 
-Rust is uniquely suited for Imago because it:
+Rust is uniquely suited for Instar because it:
 
 1. **Provides memory safety** - Critical when parsing untrusted disk images
 2. **Supports bare-metal guests** - Can run without an OS in KVM VMs
@@ -16,7 +16,7 @@ No other language offers this combination.
 
 ## Security: Memory Safety Without Runtime
 
-Imago processes untrusted disk images from potentially malicious sources.
+Instar processes untrusted disk images from potentially malicious sources.
 Memory corruption vulnerabilities in image parsers have been a recurring
 security issue:
 
@@ -58,7 +58,7 @@ fn example() {
 
 ## Bare-Metal Guest Support
 
-Imago runs image processing code inside isolated KVM virtual machines with
+Instar runs image processing code inside isolated KVM virtual machines with
 no operating system - just raw code on virtual hardware. This requires a
 language that can:
 
@@ -250,7 +250,7 @@ let sum: u64 = sectors.iter()
 
 ## Conclusion
 
-Rust is the optimal choice for Imago because:
+Rust is the optimal choice for Instar because:
 
 1. **Security**: Memory safety prevents the vulnerability classes that plague
    image parsers, without runtime overhead

@@ -2,7 +2,7 @@
 # Build script for info prototype (image format detection and copy)
 #
 # This prototype provides safe, sandboxed disk image operations.
-# The imago binary loads:
+# The instar binary loads:
 #   - core.bin at 0x10000 (device initialization, call table)
 #   - info.bin at 0x20000 (format detection operation)
 #   - copy.bin at 0x20000 (copy operation, same address as info)
@@ -69,12 +69,12 @@ else
 fi
 
 echo ""
-echo "=== Building imago ==="
+echo "=== Building instar ==="
 cd vmm
 cargo build --release
 cd ..
 
-# Copy binaries to target/release/ so they're co-located with imago
+# Copy binaries to target/release/ so they're co-located with instar
 echo ""
 echo "=== Copying binaries to target/release/ ==="
 cp "$CORE_BIN" target/release/
@@ -86,18 +86,18 @@ echo ""
 echo "=== Build complete ==="
 echo ""
 echo "Binaries (all in target/release/):"
-echo "  - imago          Safe, sandboxed disk image operations"
+echo "  - instar          Safe, sandboxed disk image operations"
 echo "  - core.bin       Core guest (device init, call table) - loaded at 0x10000"
 echo "  - info.bin       Info operation (format detection) - loaded at 0x20000"
 echo "  - copy.bin       Copy operation (file copy) - loaded at 0x20000"
 echo ""
 echo "To run:"
-echo "  sudo ./target/release/imago info image.qcow2"
-echo "  sudo ./target/release/imago copy input.qcow2 output.raw"
+echo "  sudo ./target/release/instar info image.qcow2"
+echo "  sudo ./target/release/instar copy input.qcow2 output.raw"
 echo ""
 echo "For help:"
-echo "  ./target/release/imago --help"
-echo "  ./target/release/imago info --help"
-echo "  ./target/release/imago copy --help"
+echo "  ./target/release/instar --help"
+echo "  ./target/release/instar info --help"
+echo "  ./target/release/instar copy --help"
 echo ""
 echo "Note: Running requires /dev/kvm access (root or kvm group)"

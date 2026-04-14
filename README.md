@@ -1,18 +1,14 @@
-# Imago
+# Instar
 
 A safe, sandboxed disk image format converter.
 
 ## Overview
 
-Imago replaces unsafe calls to `qemu-img` with a safer, sandboxed approach.
+Instar replaces unsafe calls to `qemu-img` with a safer, sandboxed approach.
 Image format conversions are performed within a KVM execution context,
 providing strong isolation from the host system.
 
-The name "imago" comes from Latin (meaning "image") and biology (the final
-adult stage of insect metamorphosis) - reflecting both the image handling
-and transformation aspects of the tool.
-
-Confused about how imago does these things? Perhaps read the
+Confused about how instar does these things? Perhaps read the
 [technology primer](docs/technology-primer.md). If you want a guided tour of
 the source code, the [Lions-style commentary](docs/commentary/index.md)
 provides a reading order and annotated walkthrough of the codebase.
@@ -30,7 +26,7 @@ Initial target formats:
 ## Project Status
 
 **Initial implementation** - The `info` prototype has been promoted to the main
-imago implementation in `src/`. Operations include `info`, `copy`, `check`,
+instar implementation in `src/`. Operations include `info`, `copy`, `check`,
 `compare`, and `convert`. Prototypes remain available for reference.
 
 ## Installation
@@ -38,40 +34,40 @@ imago implementation in `src/`. Operations include `info`, `copy`, `check`,
 ### Pre-compiled binary (recommended)
 
 Download the latest release from
-[GitHub Releases](https://github.com/shakenfist/imago/releases):
+[GitHub Releases](https://github.com/shakenfist/instar/releases):
 
 ```bash
 # Download and extract
 # Replace VERSION with the desired release (e.g. v0.2.0)
 VERSION=v0.2.0
-curl -sL "https://github.com/shakenfist/imago/releases/download/${VERSION}/imago-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+curl -sL "https://github.com/shakenfist/instar/releases/download/${VERSION}/instar-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
   | tar xz -C /usr/local/bin/
 
 # Verify it works
-imago --help
+instar --help
 ```
 
 ### System requirements
 
-- **Linux** (imago uses KVM for sandboxed image processing)
+- **Linux** (instar uses KVM for sandboxed image processing)
 - **KVM access**: `/dev/kvm` must be accessible
 - Your user must be in the `kvm` group (`sudo usermod -aG kvm $USER`)
 
 ### Build from source
 
-If you prefer to build from source, see [Building Imago](#building-imago)
+If you prefer to build from source, see [Building Instar](#building-instar)
 below. This requires Docker and a nightly Rust toolchain (handled
 automatically by the build container).
 
-## Building Imago
+## Building Instar
 
 ```bash
-# Build the main imago project
-make imago
+# Build the main instar project
+make instar
 
 # The binaries will be in src/target/release/
-sudo src/target/release/imago info <IMAGE>
-sudo src/target/release/imago copy <INPUT> <OUTPUT>
+sudo src/target/release/instar info <IMAGE>
+sudo src/target/release/instar copy <INPUT> <OUTPUT>
 ```
 
 ## Usage
@@ -80,13 +76,13 @@ sudo src/target/release/imago copy <INPUT> <OUTPUT>
 
 ```bash
 # Display image format information (matches qemu-img info output)
-imago info image.qcow2
+instar info image.qcow2
 
 # Discover and display the complete backing file chain
-imago info --chain image.qcow2
+instar info --chain image.qcow2
 
 # Inspect LUKS container with inner format detection
-imago info --luks-passphrase 'secret' encrypted.luks
+instar info --luks-passphrase 'secret' encrypted.luks
 ```
 
 The `--chain` flag iteratively runs the sandboxed info operation on each image
@@ -97,16 +93,16 @@ directory traversal attacks.
 
 ```bash
 # Compare two images for identical content (matches qemu-img compare output)
-imago compare image1.raw image2.raw
+instar compare image1.raw image2.raw
 
 # Strict mode: fail if images differ in size (even if content matches)
-imago compare -s image1.raw image2.raw
+instar compare -s image1.raw image2.raw
 
 # JSON output for programmatic consumption
-imago compare --output json image1.raw image2.raw
+instar compare --output json image1.raw image2.raw
 
 # Compare LUKS-encrypted QCOW2 against decrypted raw
-imago compare --luks-passphrase secret encrypted.qcow2 decrypted.raw
+instar compare --luks-passphrase secret encrypted.qcow2 decrypted.raw
 ```
 
 Exit codes: 0 = identical, 1 = content differs.
@@ -131,13 +127,13 @@ Output is byte-for-byte identical with `qemu-img compare`.
 
 ```bash
 # Validate image structural integrity (matches qemu-img check output)
-imago check image.qcow2
+instar check image.qcow2
 
 # JSON output for programmatic consumption
-imago check --output json image.qcow2
+instar check --output json image.qcow2
 
 # Validate the entire backing chain
-imago check --chain image.qcow2
+instar check --chain image.qcow2
 ```
 
 For QCOW2 images, check validates:
@@ -191,7 +187,7 @@ For VHDX images, check validates:
 - Fragmentation tracking (non-sequential block allocation)
 
 The `--chain` flag discovers the full backing chain (using the same chain
-discovery infrastructure as `imago info --chain`), sets up each image as a
+discovery infrastructure as `instar info --chain`), sets up each image as a
 separate virtio-block device in the KVM guest, and validates:
 - Format consistency: each backing image's format matches what chain
   discovery found
@@ -211,56 +207,56 @@ previous versions.
 
 ```bash
 # Convert QCOW2 to raw (flattens backing chains)
-imago convert input.qcow2 output.raw
+instar convert input.qcow2 output.raw
 
 # Convert any input to QCOW2 v3 output
-imago convert -O qcow2 input.raw output.qcow2
+instar convert -O qcow2 input.raw output.qcow2
 
 # Convert QCOW2 with backing chain to standalone QCOW2
-imago convert -O qcow2 overlay.qcow2 standalone.qcow2
+instar convert -O qcow2 overlay.qcow2 standalone.qcow2
 
 # Convert with compressed QCOW2 output (zlib/deflate compression)
-imago convert -c -O qcow2 input.raw output.qcow2
+instar convert -c -O qcow2 input.raw output.qcow2
 
 # Convert with dense output (write all clusters including zeros)
-imago convert --no-skip-zeros input.qcow2 output.raw
+instar convert --no-skip-zeros input.qcow2 output.raw
 
 # Specify output cluster size for QCOW2 (512 to 2097152, default: 65536)
-imago convert -O qcow2 --cluster-size 4096 input.raw output.qcow2
-imago convert -O qcow2 --cluster-size 2097152 input.raw output.qcow2
+instar convert -O qcow2 --cluster-size 4096 input.raw output.qcow2
+instar convert -O qcow2 --cluster-size 2097152 input.raw output.qcow2
 
 # Write QCOW2 output with extended L2 entries (16-byte entries with subcluster bitmaps)
-imago convert -O qcow2 --extended-l2 input.raw output.qcow2
+instar convert -O qcow2 --extended-l2 input.raw output.qcow2
 
 # Write LUKS-encrypted QCOW2 output (AES-256-XTS, crypt_method=2)
-imago convert -O qcow2 --luks-encrypt-passphrase 'secret' input.raw encrypted.qcow2
+instar convert -O qcow2 --luks-encrypt-passphrase 'secret' input.raw encrypted.qcow2
 
 # Decrypt LUKS-encrypted QCOW2 back to raw
-imago convert --luks-passphrase 'secret' encrypted.qcow2 output.raw
+instar convert --luks-passphrase 'secret' encrypted.qcow2 output.raw
 
 # Convert to VHD dynamic format
-imago convert -O vpc input.qcow2 output.vhd
+instar convert -O vpc input.qcow2 output.vhd
 
 # Convert to VHDX dynamic format
-imago convert -O vhdx input.qcow2 output.vhdx
+instar convert -O vhdx input.qcow2 output.vhdx
 
 # Decrypt native LUKS v2 container (Argon2id KDF)
-imago convert --luks-passphrase 'secret' --max-guest-memory 1G encrypted.luks output.raw
+instar convert --luks-passphrase 'secret' --max-guest-memory 1G encrypted.luks output.raw
 
 # Decrypt LUKS container wrapping a QCOW2 image
-imago convert --luks-passphrase 'secret' luks-wrapped.img output.raw
+instar convert --luks-passphrase 'secret' luks-wrapped.img output.raw
 
 # Specify VMDK grain size (4096 to 65536, default: 65536)
-imago convert -O vmdk --grain-size 4096 input.raw output.vmdk
+instar convert -O vmdk --grain-size 4096 input.raw output.vmdk
 
 # Specify VHD block size (524288+, default: 2097152)
-imago convert -O vpc --block-size 1048576 input.raw output.vhd
+instar convert -O vpc --block-size 1048576 input.raw output.vhd
 
 # Specify VHDX block size (1048576 to 268435456, default: 33554432)
-imago convert -O vhdx --block-size 4194304 input.raw output.vhdx
+instar convert -O vhdx --block-size 4194304 input.raw output.vhdx
 
 # Progress reporting
-imago convert -p 5 input.qcow2 output.raw
+instar convert -p 5 input.qcow2 output.raw
 ```
 
 The convert operation reads the virtual content of an input image (including
@@ -298,17 +294,17 @@ Different qemu-img versions produce slightly different output formats:
 - **qemu-img 6.0-7.2** (Debian 12 bookworm): No "Child node '/file'" section
 - **qemu-img 8.0+** (Debian 13 trixie): Includes "Child node '/file'" section
 
-By default, imago detects the installed qemu-img version and emits matching output.
+By default, instar detects the installed qemu-img version and emits matching output.
 This ensures true drop-in replacement compatibility.
 
 To explicitly specify which qemu-img version's output format to use:
 
 ```bash
 # Emit output compatible with qemu-img 7.2 (no Child node section)
-imago info --qemu-version 7.2 image.qcow2
+instar info --qemu-version 7.2 image.qcow2
 
 # Emit output compatible with qemu-img 10.0 (includes Child node section)
-imago info --qemu-version 10.0 image.qcow2
+instar info --qemu-version 10.0 image.qcow2
 ```
 
 See [docs/output-formats.md](docs/output-formats.md) for detailed documentation on
@@ -371,16 +367,16 @@ make help
 make list-prototypes
 ```
 
-**Main Imago Project:**
+**Main Instar Project:**
 ```bash
-# Build imago
-make imago
+# Build instar
+make instar
 
-# Clean imago build
-make clean-imago
+# Clean instar build
+make clean-instar
 
-# Show how to run imago
-make run-imago
+# Show how to run instar
+make run-instar
 ```
 
 **Prototypes:**
@@ -457,12 +453,12 @@ make test-container-convert-vhd      # VHD/VHDX convert (slowest)
 make clean-tests
 ```
 
-The integration tests compare `imago info` output against `qemu-img info` to
-verify drop-in replacement compatibility, validate `imago check` against
-deliberately corrupt test images, cross-validate `imago compare` output
-against `qemu-img compare`, and cross-validate `imago convert` output against
+The integration tests compare `instar info` output against `qemu-img info` to
+verify drop-in replacement compatibility, validate `instar check` against
+deliberately corrupt test images, cross-validate `instar compare` output
+against `qemu-img compare`, and cross-validate `instar convert` output against
 `qemu-img convert`. oslo.utils `format_inspector` cross-validation tests
-verify that imago's format detection, safety checks, and virtual size
+verify that instar's format detection, safety checks, and virtual size
 reporting agree with OpenStack's image safety gate. Adversarial image tests
 verify safe handling of compression bombs, circular/deep backing chains,
 integer overflow headers, boundary value edge cases (refcount order,
@@ -470,8 +466,8 @@ oversized virtual sizes, VMDK grain sizes, VHDX dual headers, BAT beyond EOF),
 and format confusion attacks (polyglot files, truncated headers, VMDK
 descriptor attacks). CVE reproduction tests verify that 6 known qemu-img CVEs
 (CVE-2024-32498, CVE-2015-5163, CVE-2022-47951, CVE-2015-5162, CVE-2014-0223,
-CVE-2024-4467) are fully mitigated by imago's architecture. Test images are in
-the sibling `imago-testdata/` repository.
+CVE-2024-4467) are fully mitigated by instar's architecture. Test images are in
+the sibling `instar-testdata/` repository.
 
 **Running:**
 ```bash
@@ -482,10 +478,10 @@ make run PROTOTYPE=virtio-block5
 ## Directory Structure
 
 ```
-imago/
+instar/
 ├── .devcontainer/  # Development containers
 │   └── rust-lint/  # Stable Rust for linting
-├── src/            # Main imago implementation
+├── src/            # Main instar implementation
 │   ├── vmm/        # Virtual machine monitor (host-side)
 │   ├── core/       # Core guest initialization
 │   ├── shared/     # Shared library code
@@ -546,18 +542,18 @@ parsed or manipulated by code running with host privileges. Instead:
 
 ### Secure RAW Format Detection
 
-Unlike qemu-img, imago validates RAW format detection by requiring a valid
+Unlike qemu-img, instar validates RAW format detection by requiring a valid
 partition table (MBR or GPT). This prevents arbitrary files from being accepted
 as disk images, which is the root cause of backing file disclosure attacks
 (CVE-2015-5163, CVE-2024-32498).
 
 ```bash
 # Default (secure): rejects files without valid format or partition table
-imago info /etc/passwd
+instar info /etc/passwd
 # Error: Unknown format (no valid disk image header or partition table)
 
 # Unsafe mode: matches qemu-img behavior (for compatibility testing only)
-imago info --unsafe-quirks /etc/passwd
+instar info --unsafe-quirks /etc/passwd
 # file format: raw
 ```
 
@@ -599,7 +595,7 @@ See `testdata/README.md` for full documentation.
 See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 Release artifacts (pre-compiled Linux binaries) are published to
-[GitHub Releases](https://github.com/shakenfist/imago/releases)
+[GitHub Releases](https://github.com/shakenfist/instar/releases)
 via the release workflow (`.github/workflows/release.yml`). Tags
 are signed with Sigstore. To cut a release:
 
@@ -655,13 +651,13 @@ See `.github/workflows/` for implementation details.
 
 ### Differential Fuzzing
 
-On-demand differential fuzzing compares imago against qemu-img on randomly
+On-demand differential fuzzing compares instar against qemu-img on randomly
 generated images to find behavioral divergences:
 
 ```bash
-# Run locally (requires imago binary and qemu-img)
+# Run locally (requires instar binary and qemu-img)
 python3 scripts/differential-fuzz.py \
-    --imago src/target/release/imago \
+    --instar src/target/release/instar \
     --iterations 100 \
     --seed 42
 
@@ -676,7 +672,7 @@ compression, data patterns), runs chains of operations (info, check, convert)
 against both tools, and reports divergences with full reproduction details.
 
 When libyal tools are available (`vmdkinfo`, `vhdiinfo`, `qcowinfo`), the
-fuzzer also cross-checks imago output against these independent forensic-grade
+fuzzer also cross-checks instar output against these independent forensic-grade
 parsers. This provides a third opinion for QCOW2 (alongside qemu-img) and
 fills the gap for VMDK/VHD/VHDX where qemu-img check is unavailable.
 
@@ -688,17 +684,17 @@ Coverage-guided fuzzing uses `cargo-fuzz` (libFuzzer) to exercise the
 parser crates directly without the VMM/KVM stack:
 
 ```bash
-# Inside the imago-build container:
+# Inside the instar-build container:
 cd src/fuzz
 cargo fuzz run fuzz_qcow2_header -- -max_total_time=60
 ```
 
 13 fuzz targets cover all parser crates (QCOW2, VMDK, VHD, VHDX, RAW,
 LUKS) including header parsing, L1/L2 lookup, refcount traversal, and
-decompression. Seed the corpus from `imago-testdata`:
+decompression. Seed the corpus from `instar-testdata`:
 
 ```bash
-python3 scripts/extract-fuzz-corpus.py --testdata /path/to/imago-testdata
+python3 scripts/extract-fuzz-corpus.py --testdata /path/to/instar-testdata
 ```
 
 The CI workflow runs nightly at 04:00 UTC. Crashes are minimized and
@@ -709,17 +705,17 @@ See `src/fuzz/` for target implementations.
 
 This project includes Claude Code skills for common development tasks:
 
-- `/imago-new-op <name>` - Scaffold a new operation binary
-- `/imago-format [format]` - Disk image format reference (qcow2, vmdk, raw)
-- `/imago-debug [issue]` - Troubleshooting guide for guest operations
-- `/imago-calltable [function]` - Call table API documentation
-- `/imago-add-test-image` - Add a new image to the integration test suite
+- `/instar-new-op <name>` - Scaffold a new operation binary
+- `/instar-format [format]` - Disk image format reference (qcow2, vmdk, raw)
+- `/instar-debug [issue]` - Troubleshooting guide for guest operations
+- `/instar-calltable [function]` - Call table API documentation
+- `/instar-add-test-image` - Add a new image to the integration test suite
 - `/verbose-print` - Guidelines for adding diagnostic verbose_print() calls
 - `/error-handling` - Ensure all error conditions return proper exit codes
 
 Additional development skills:
 - `.claude/skills/build-and-test.md` - Correct build/test patterns (always use
-  Makefile targets like `make imago`, `make test-ci`)
+  Makefile targets like `make instar`, `make test-ci`)
 - `.claude/skills/testing-discipline.md` - Test verification workflow (never
   accept failures as "pre-existing" without verification)
 - `.claude/skills/pr-preparation.md` - PR readiness checklist (zero test

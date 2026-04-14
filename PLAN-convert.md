@@ -1,4 +1,4 @@
-# Plan: Implementing `imago convert` (and Prerequisites)
+# Plan: Implementing `instar convert` (and Prerequisites)
 
 ## Status: Phase 21 Complete - Large Cluster Output
 
@@ -9,7 +9,7 @@
 - Phase 0c: Multi-device VMM support (N input devices)
 - Phase 0d: Device-indexed call table functions for backing chain I/O
 - Phase 0e: Chain configuration passing to guest
-- Phase 1a: `imago check` QCOW2 structural validation
+- Phase 1a: `instar check` QCOW2 structural validation
   - Full L2 table validation (all sectors, not just first)
   - Overlap detection via bitmap in scratch memory
   - Refcount validation (referenced clusters must have refcount > 0)
@@ -19,8 +19,8 @@
   - Dirty/corrupt flag detection and JSON reporting
   - Hardened arithmetic (checked/saturating ops, DoS prevention)
   - Corrupt test images and integration tests
-- Phase 1b: Backing chain validation in `imago check --chain`
-- Phase 2a: `imago compare` raw-vs-raw comparison
+- Phase 1b: Backing chain validation in `instar check --chain`
+- Phase 2a: `instar compare` raw-vs-raw comparison
   - Full pipeline: CLI -> VMM -> KVM guest -> protobuf result -> output
   - CompareResultMessage protobuf, CompareConfig/CompareResult in shared
   - Guest binary: sector-by-sector comparison with size mismatch handling
@@ -30,9 +30,9 @@
   - 15 integration tests with qemu-img cross-validation
   - CallTable VERSION bumped to 12
 
-- Phase 2b: `imago compare` QCOW2 support - L1/L2 reader, zlib
+- Phase 2b: `instar compare` QCOW2 support - L1/L2 reader, zlib
   decompression
-- Phase 2c: `imago compare` backing chain resolution - Flatten backing
+- Phase 2c: `instar compare` backing chain resolution - Flatten backing
   chains before comparison so images with backing files compare correctly.
   Both images' chains are discovered via `discover_backing_chain()`, all
   chain images are loaded as separate virtio-block devices, and a
@@ -69,7 +69,7 @@
     version strings like "1.2.3.4" (now rejects them).
 
   All 596 tests pass. Pre-commit clean. Binary sizes within limits.
-- Phase 3: `imago convert` qcow2→raw with backing chain flattening
+- Phase 3: `instar convert` qcow2→raw with backing chain flattening
   - ConvertConfig in shared crate, vmm_config_chain_with_output() in
     guest-protocol
   - Convert guest binary: reads virtual content via chain-walking
@@ -84,7 +84,7 @@
   - Fixed output device MMIO placement for chain operations
   - 19 integration tests (14 pass, 5 skip for cluster_size/space)
   - All 615+ tests pass. Pre-commit clean.
-- Phase 4: `imago convert` QCOW2 output - Write valid QCOW2 v3
+- Phase 4: `instar convert` QCOW2 output - Write valid QCOW2 v3
   output from any supported input (raw, qcow2, qcow2 with backing
   chains). Linear cluster allocation with OFLAG_COPIED, 16-bit
   refcounts, iterative convergence for refcount metadata sizing.
@@ -209,7 +209,7 @@
 - ~~VMDK format in compare/check~~ — Done (Phase 8)
 - ~~VHD/VHDX format in compare/check~~ — Done (Phase 9, 10)
 
-**`imago info --chain` command:**
+**`instar info --chain` command:**
 - Iteratively runs sandboxed info operations to discover backing chain
 - Validates backing file paths against security allowlist
 - Enforces maximum chain depth (configurable, default 16)
@@ -244,7 +244,7 @@
   `ChainConfig`
 - Infrastructure ready for Phase 1+ operations (check, compare, convert)
 
-**Phase 1a: `imago check` QCOW2 validation:**
+**Phase 1a: `instar check` QCOW2 validation:**
 - Full L2 table scan (all sectors, not just first 512 entries)
 - Overlap detection via 1-bit-per-cluster bitmap in scratch memory
 - Refcount validation: ensures referenced clusters have refcount > 0
@@ -256,8 +256,8 @@
 - Non-QCOW2 formats: detects format, reports "not supported" gracefully
 
 **Phase 1b: Backing chain validation in check:**
-- `imago check --chain` discovers the full backing chain (reuses chain
-  discovery from `imago info --chain`), loads each image as a separate
+- `instar check --chain` discovers the full backing chain (reuses chain
+  discovery from `instar info --chain`), loads each image as a separate
   virtio-block device, and validates:
   - Format consistency: backing image format matches chain discovery
   - Virtual size validity: backing images must have non-zero virtual size
@@ -312,25 +312,25 @@
 
 ## Executive Summary
 
-Implement `imago convert` to enable format-aware disk image conversion
+Implement `instar convert` to enable format-aware disk image conversion
 within the secure KVM sandbox. Before convert, we'll implement
-`imago check` and `imago compare` to provide verification tools.
-Testing will use both imago and qemu-img for validation.
+`instar check` and `instar compare` to provide verification tools.
+Testing will use both instar and qemu-img for validation.
 
 ## Implementation Order
 
-1. **Phase -1: Configuration File Support** - Layered config: /etc/imago → ~/.config/imago → CLI
+1. **Phase -1: Configuration File Support** - Layered config: /etc/instar → ~/.config/instar → CLI
 2. **Phase 0: Multi-device VMM & Chain Discovery** - Support N input devices, recursive backing file discovery
-3. **Phase 1: `imago check`** - Validate image integrity (including backing chain validation)
-4. **Phase 2: `imago compare`** - Compare two images for logical equivalence
-5. **Phase 3: `imago convert` qcow2→raw** - With zlib decompression and backing chain flattening
-6. **Phase 4: `imago convert` QCOW2 output** - Write valid qcow2 v3 output
+3. **Phase 1: `instar check`** - Validate image integrity (including backing chain validation)
+4. **Phase 2: `instar compare`** - Compare two images for logical equivalence
+5. **Phase 3: `instar convert` qcow2→raw** - With zlib decompression and backing chain flattening
+6. **Phase 4: `instar convert` QCOW2 output** - Write valid qcow2 v3 output
 
 ## Background
 
-### Imago Architecture
+### Instar Architecture
 
-Imago uses a sandboxed architecture for security:
+Instar uses a sandboxed architecture for security:
 - **Host VMM** (`src/vmm/src/main.rs`): CLI, KVM setup, device emulation
 - **KVM Guest**: Minimal x86-64 environment running operations
 - **Operations**: `no_std` binaries loaded at 0x20000, communicate via call table
@@ -348,15 +348,15 @@ Imago uses a sandboxed architecture for security:
 
 ## Phase -1: Configuration File Support
 
-**Goal**: Allow persistent configuration of imago options via config
+**Goal**: Allow persistent configuration of instar options via config
 files, reducing command-line verbosity for repeated operations.
 
 ### Configuration Hierarchy
 
 Config files are read in order, with later values overriding earlier ones:
 
-1. `/etc/imago/config` - System-wide defaults (set by admin)
-2. `~/.config/imago/config` - User defaults
+1. `/etc/instar/config` - System-wide defaults (set by admin)
+2. `~/.config/instar/config` - User defaults
 3. Command-line arguments - Per-invocation overrides
 
 ### Config File Format
@@ -364,7 +364,7 @@ Config files are read in order, with later values overriding earlier ones:
 Use TOML for readability and Rust ecosystem support:
 
 ```toml
-# /etc/imago/config or ~/.config/imago/config
+# /etc/instar/config or ~/.config/instar/config
 
 [global]
 # Default output format for convert
@@ -424,7 +424,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 #[derive(Deserialize, Default)]
-struct ImagoConfig {
+struct InstarConfig {
     global: GlobalConfig,
     security: SecurityConfig,
     convert: ConvertConfig,
@@ -474,11 +474,11 @@ fn get_backing_allowlist(
     expand_allowlist(allowlist, image_path, &cwd)
 }
 
-fn load_config() -> ImagoConfig {
-    let mut config = ImagoConfig::default();
+fn load_config() -> InstarConfig {
+    let mut config = InstarConfig::default();
 
     // Layer 1: System config
-    if let Ok(sys) = std::fs::read_to_string("/etc/imago/config") {
+    if let Ok(sys) = std::fs::read_to_string("/etc/instar/config") {
         if let Ok(parsed) = toml::from_str(&sys) {
             config = merge_config(config, parsed);
         }
@@ -486,7 +486,7 @@ fn load_config() -> ImagoConfig {
 
     // Layer 2: User config
     if let Some(home) = dirs::home_dir() {
-        let user_config = home.join(".config/imago/config");
+        let user_config = home.join(".config/instar/config");
         if let Ok(user) = std::fs::read_to_string(&user_config) {
             if let Ok(parsed) = toml::from_str(&user) {
                 config = merge_config(config, parsed);
@@ -507,7 +507,7 @@ use clap::Parser;
 
 #[derive(Parser)]
 struct Cli {
-    #[arg(long, env = "IMAGO_VERBOSE")]
+    #[arg(long, env = "INSTAR_VERBOSE")]
     verbose: bool,
 
     // ... other args get defaults from config
@@ -527,28 +527,28 @@ fn main() {
 
 ### Config Introspection Command
 
-Add `imago config` subcommand to inspect effective configuration:
+Add `instar config` subcommand to inspect effective configuration:
 
 ```bash
-$ imago config
+$ instar config
 # Effective configuration (merged from all sources)
 
 [global]
-output-format = "raw"          # from: ~/.config/imago/config
-ignore-quirks = true           # from: /etc/imago/config
+output-format = "raw"          # from: ~/.config/instar/config
+ignore-quirks = true           # from: /etc/instar/config
 qemu-version = "8.0"           # from: (default)
 verbose = false                # from: (default)
 
 [security]
-backing-path-allowlist = [     # from: ~/.config/imago/config
+backing-path-allowlist = [     # from: ~/.config/instar/config
     "/var/lib/libvirt/images",
     "/home/user/vm-images",
 ]
 
-$ imago config --show-sources
+$ instar config --show-sources
 # Shows which file each value came from
 
-$ imago config --validate
+$ instar config --validate
 # Validates all config files for syntax errors
 ```
 
@@ -558,7 +558,7 @@ $ imago config --validate
 2. **Config merging** logic (later overrides earlier)
 3. **TOML parsing** with serde
 4. **CLI integration** - config provides defaults, CLI overrides
-5. **`imago config`** subcommand for introspection
+5. **`instar config`** subcommand for introspection
 6. **Documentation** of all config options
 
 ### New Dependencies
@@ -574,8 +574,8 @@ dirs = "5.0"
 
 ```bash
 # Create system config
-sudo mkdir -p /etc/imago
-sudo tee /etc/imago/config << 'EOF'
+sudo mkdir -p /etc/instar
+sudo tee /etc/instar/config << 'EOF'
 [global]
 verbose = false
 
@@ -584,8 +584,8 @@ backing-path-allowlist = ["/var/lib/libvirt/images"]
 EOF
 
 # Create user config
-mkdir -p ~/.config/imago
-cat > ~/.config/imago/config << 'EOF'
+mkdir -p ~/.config/instar
+cat > ~/.config/instar/config << 'EOF'
 [global]
 verbose = true
 
@@ -594,11 +594,11 @@ backing-path-allowlist = ["/home/user/images", "/tmp/test"]
 EOF
 
 # Test effective config
-imago config
+instar config
 # Should show verbose=true (user override) and combined allowlist
 
 # Test CLI override
-imago info --verbose=false test.qcow2
+instar info --verbose=false test.qcow2
 # Should use verbose=false despite config saying true
 ```
 
@@ -630,7 +630,7 @@ When reading cluster N from top.qcow2:
 
 Before launching the KVM guest, the host must:
 
-1. **Run `imago info`** on the top image to get backing file path
+1. **Run `instar info`** on the top image to get backing file path
 2. **Validate the backing file**:
    - Path is within allowed directories (security!)
    - File exists and is readable
@@ -655,7 +655,7 @@ fn discover_chain(top_image: &Path, allowed_paths: &[PathBuf]) -> Result<Backing
     let mut current = top_image.to_path_buf();
 
     loop {
-        // Run imago info on current image
+        // Run instar info on current image
         let info = run_info(&current)?;
 
         // Validate path is allowed
@@ -798,7 +798,7 @@ qemu-img create -f qcow2 -b base.raw -F raw middle.qcow2 100M
 qemu-img create -f qcow2 -b middle.qcow2 -F qcow2 top.qcow2 100M
 
 # Test chain discovery
-imago info --chain top.qcow2
+instar info --chain top.qcow2
 # Should output:
 # Chain: 3 images
 #   [0] top.qcow2 (qcow2) -> middle.qcow2
@@ -807,13 +807,13 @@ imago info --chain top.qcow2
 
 # Test with disallowed backing path (should fail)
 qemu-img create -f qcow2 -b /etc/passwd evil.qcow2 100M
-imago info evil.qcow2
+instar info evil.qcow2
 # ERROR: Backing file /etc/passwd is outside allowed paths
 ```
 
 ---
 
-## Phase 1: `imago check`
+## Phase 1: `instar check`
 
 **Goal**: Validate image structural integrity (equivalent to `qemu-img check`).
 
@@ -924,8 +924,8 @@ struct CheckArgs {
 ### Testing check
 
 ```bash
-# Test with imago
-imago check test.qcow2
+# Test with instar
+instar check test.qcow2
 
 # Cross-validate with qemu-img
 qemu-img check test.qcow2
@@ -935,7 +935,7 @@ qemu-img check test.qcow2
 
 ---
 
-## Phase 2: `imago compare`
+## Phase 2: `instar compare`
 
 **Goal**: Compare two images for logical data equivalence (like `qemu-img compare`).
 
@@ -1084,8 +1084,8 @@ qemu-img create -f raw b.raw 100M
 qemu-io -c 'write -P 0x42 0 1M' a.qcow2
 qemu-io -c 'write -P 0x42 0 1M' b.raw
 
-# Compare with imago
-imago compare a.qcow2 b.raw
+# Compare with instar
+instar compare a.qcow2 b.raw
 
 # Cross-validate with qemu-img
 qemu-img compare a.qcow2 b.raw
@@ -1095,7 +1095,7 @@ qemu-img compare a.qcow2 b.raw
 
 ---
 
-## Phase 3: `imago convert` qcow2→raw
+## Phase 3: `instar convert` qcow2→raw
 
 **Goal**: Convert qcow2 to raw format, leveraging the QCOW2 reader from compare.
 
@@ -1182,7 +1182,7 @@ struct ConvertArgs {
 
 ---
 
-## Phase 4: `imago convert` QCOW2 output
+## Phase 4: `instar convert` QCOW2 output
 
 **Goal**: Write valid QCOW2 v3 output from any supported input.
 
@@ -1256,31 +1256,31 @@ Cluster ...:    Data clusters
 
 ### Cross-Validation Approach
 
-Every test runs both imago and qemu-img, comparing results:
+Every test runs both instar and qemu-img, comparing results:
 
 ```python
 def test_check_valid_qcow2(self):
-    # Run imago check
-    imago_rc, imago_out = run_imago('check', image_path)
+    # Run instar check
+    instar_rc, instar_out = run_instar('check', image_path)
 
     # Run qemu-img check
     qemu_rc, qemu_out = run_qemu_img('check', image_path)
 
     # Both should succeed
-    self.assertEqual(0, imago_rc)
+    self.assertEqual(0, instar_rc)
     self.assertEqual(0, qemu_rc)
 
     # Compare error counts (may differ in wording)
     self.assertEqual(
-        parse_error_count(imago_out),
+        parse_error_count(instar_out),
         parse_error_count(qemu_out)
     )
 
 def test_compare_identical(self):
     # Both tools should return 0 for identical images
-    imago_rc = run_imago('compare', img1, img2)
+    instar_rc = run_instar('compare', img1, img2)
     qemu_rc = run_qemu_img('compare', img1, img2)
-    self.assertEqual(imago_rc, qemu_rc)
+    self.assertEqual(instar_rc, qemu_rc)
 ```
 
 ### Test Cases by Phase
@@ -1316,7 +1316,7 @@ def test_compare_identical(self):
 
 | Risk | Mitigation |
 |------|------------|
-| Config file parsing errors | Graceful fallback to defaults; `imago config --validate` |
+| Config file parsing errors | Graceful fallback to defaults; `instar config --validate` |
 | Conflicting config values | Clear precedence: CLI > user > system; show sources |
 | Guest memory limits (32MB) | Stream data, small L2 cache, careful allocation |
 | Zlib in no_std | Use miniz (public domain, well-tested) |

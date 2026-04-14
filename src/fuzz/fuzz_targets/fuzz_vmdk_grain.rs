@@ -6,11 +6,11 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
 
-    imago_fuzz::set_fuzz_input(data);
-    let call_table = imago_fuzz::build_call_table();
+    instar_fuzz::set_fuzz_input(data);
+    let call_table = instar_fuzz::build_call_table();
     let sector_size = 512;
-    let input_capacity = imago_fuzz::input_capacity();
-    let actual_file_size = imago_fuzz::input_size_bytes();
+    let input_capacity = instar_fuzz::input_capacity();
+    let actual_file_size = instar_fuzz::input_size_bytes();
 
     let mut bytes_read = 0u64;
     let mut gd_cache = vec![0u8; shared::MAX_SECTOR_SIZE];
@@ -41,7 +41,7 @@ fuzz_target!(|data: &[u8]| {
             }
 
             // Fuzz-derived offset
-            if let Some(dynamic_offset) = imago_fuzz::extract_fuzz_offset(data) {
+            if let Some(dynamic_offset) = instar_fuzz::extract_fuzz_offset(data) {
                 let _ = state.grain_lookup(
                     &call_table,
                     dynamic_offset,

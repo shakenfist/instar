@@ -1,6 +1,6 @@
-# Binary dependencies for imago
+# Binary dependencies for instar
 #
-# This file lists OS-level packages required to build and test imago.
+# This file lists OS-level packages required to build and test instar.
 # Use bindep (pip install bindep) to install: bindep -b | xargs sudo apt install
 #
 # Format: package [platform:selector] [profile:tag]
@@ -31,7 +31,7 @@ git [platform:dpkg]
 git [platform:rpm]
 pre-commit [platform:dpkg]
 
-# KVM access for running imago
+# KVM access for running instar
 qemu-kvm [platform:dpkg]
 qemu-kvm [platform:rpm]
 

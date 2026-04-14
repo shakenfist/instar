@@ -6,10 +6,10 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
 
-    imago_fuzz::set_fuzz_input(data);
-    let call_table = imago_fuzz::build_call_table();
+    instar_fuzz::set_fuzz_input(data);
+    let call_table = instar_fuzz::build_call_table();
     let sector_size = 512;
-    let input_capacity = imago_fuzz::input_capacity();
+    let input_capacity = instar_fuzz::input_capacity();
 
     // Extract l2_entry from first 8 bytes and force compressed flag
     let l2_entry = u64::from_le_bytes([

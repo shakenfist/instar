@@ -1,6 +1,6 @@
 # Configuration Guide
 
-This document describes imago's configuration options, including command-line
+This document describes instar's configuration options, including command-line
 flags and configuration files.
 
 ## Command-Line Flags
@@ -26,10 +26,10 @@ Currently supported extra details:
 
 ```bash
 # Default: matches qemu-img output
-imago info image.vdi
+instar info image.vdi
 
 # With --extra-detail: includes VDI-specific fields
-imago info --extra-detail image.vdi
+instar info --extra-detail image.vdi
 # format specific information:
 #     image-type: dynamic
 #     block-size: 1048576
@@ -42,21 +42,21 @@ imago info --extra-detail image.vdi
 
 LUKS (Linux Unified Key Setup) encrypted volumes are detected by their magic
 bytes but qemu-img does not recognize them, reporting them as "raw" format.
-With `--extra-detail`, imago correctly identifies LUKS volumes:
+With `--extra-detail`, instar correctly identifies LUKS volumes:
 
 ```bash
 # Default: matches qemu-img (reports as unknown due to no partition table)
-imago info encrypted.luks
+instar info encrypted.luks
 # file format: unknown
 
 # With --extra-detail: detects LUKS format
-imago info --extra-detail encrypted.luks
+instar info --extra-detail encrypted.luks
 # file format: luks
 ```
 
 ### Quirk Control
 
-imago categorizes qemu-img behaviors as "safe quirks" (formatting differences)
+instar categorizes qemu-img behaviors as "safe quirks" (formatting differences)
 and "unsafe quirks" (security-affecting behaviors). See [quirks.md](quirks.md)
 for the full classification.
 
@@ -79,11 +79,11 @@ than qemu-img-compatible output.
 
 ```bash
 # Default: matches qemu-img output
-imago info image.qcow2
+instar info image.qcow2
 # disk size: 196 KiB (rounded to 4K blocks)
 
 # With --ignore-quirks: actual values
-imago info --ignore-quirks image.qcow2
+instar info --ignore-quirks image.qcow2
 # disk size: 191.2 KiB (actual file size)
 ```
 
@@ -98,11 +98,11 @@ enables backing file disclosure attacks (CVE-2015-5163, CVE-2024-32498).
 
 ```bash
 # Default: rejects files without valid format or partition table
-imago info /etc/passwd
+instar info /etc/passwd
 # Error: Unknown format (no valid disk image header or partition table)
 
 # With --unsafe-quirks: matches qemu-img (insecure)
-imago info --unsafe-quirks /etc/passwd
+instar info --unsafe-quirks /etc/passwd
 # file format: raw
 # virtual size: 2.5 KiB
 ```
@@ -116,11 +116,11 @@ It exists solely for verifying qemu-img output compatibility in test suites.
 |------|-------------|
 | `-f FORMAT` / `--format=FORMAT` | Explicitly specify input format |
 
-When format is specified explicitly, imago skips format auto-detection and
+When format is specified explicitly, instar skips format auto-detection and
 parses the file using the specified format's parser directly.
 
 ```bash
-imago info --format=qcow2 image.qcow2
+instar info --format=qcow2 image.qcow2
 ```
 
 ### Convert Options
@@ -143,10 +143,10 @@ than the cluster size are written uncompressed as a fallback.
 
 ```bash
 # Compressed QCOW2 output
-imago convert -c -O qcow2 input.raw output.qcow2
+instar convert -c -O qcow2 input.raw output.qcow2
 
 # Requires -O qcow2 (compression only applies to QCOW2 output)
-imago convert -c input.raw output.raw  # Error: -c requires -O qcow2
+instar convert -c input.raw output.raw  # Error: -c requires -O qcow2
 ```
 
 #### `-S` / `--skip-zeros` (default)
@@ -193,14 +193,14 @@ chain discovery.
 
 ## Configuration File
 
-imago can read configuration from a TOML file at:
-- `~/.config/imago/config.toml` (user configuration)
-- `/etc/imago/config.toml` (system configuration)
+instar can read configuration from a TOML file at:
+- `~/.config/instar/config.toml` (user configuration)
+- `/etc/instar/config.toml` (system configuration)
 
 ### Example Configuration
 
 ```toml
-# ~/.config/imago/config.toml
+# ~/.config/instar/config.toml
 
 [output]
 # Default output format: "human" or "json"
@@ -220,8 +220,8 @@ enable_unsafe = false
 Command-line flags override configuration file settings:
 
 1. Command-line flags (highest priority)
-2. User configuration (`~/.config/imago/config.toml`)
-3. System configuration (`/etc/imago/config.toml`)
+2. User configuration (`~/.config/instar/config.toml`)
+3. System configuration (`/etc/instar/config.toml`)
 4. Built-in defaults (lowest priority)
 
 ---
@@ -230,9 +230,9 @@ Command-line flags override configuration file settings:
 
 | Variable | Description |
 |----------|-------------|
-| `IMAGO_CONFIG` | Override configuration file path |
-| `IMAGO_TESTDATA_PATH` | Test data directory (for development) |
-| `IMAGO_BINARY_PATH` | Override imago binary path (for testing) |
+| `INSTAR_CONFIG` | Override configuration file path |
+| `INSTAR_TESTDATA_PATH` | Test data directory (for development) |
+| `INSTAR_BINARY_PATH` | Override instar binary path (for testing) |
 
 ---
 
@@ -240,7 +240,7 @@ Command-line flags override configuration file settings:
 
 ### Default Secure Configuration
 
-imago's defaults are chosen for security:
+instar's defaults are chosen for security:
 
 1. **Format validation**: Files must have recognized format headers or valid
    partition tables to be accepted as disk images
@@ -257,10 +257,10 @@ The only legitimate use case for `--unsafe-quirks` is compatibility testing
 against qemu-img output. For example:
 
 ```bash
-# In test suite: verify imago matches qemu-img for arbitrary files
-imago info --unsafe-quirks test-file.bin > imago.out
+# In test suite: verify instar matches qemu-img for arbitrary files
+instar info --unsafe-quirks test-file.bin > instar.out
 qemu-img info test-file.bin > qemu.out
-diff imago.out qemu.out
+diff instar.out qemu.out
 ```
 
 Never use `--unsafe-quirks` when:

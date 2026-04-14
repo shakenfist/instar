@@ -1370,7 +1370,7 @@ impl CheckConfig {
     /// Flag: Enable unsafe quirks mode (qemu-img compatible behavior).
     /// When enabled, non-QCOW2 formats are treated as "raw" and validation
     /// is skipped for non-QCOW2 formats (matching qemu-img check behavior).
-    /// When disabled (default), imago detects the real format and performs
+    /// When disabled (default), instar detects the real format and performs
     /// format-appropriate validation.
     pub const FLAG_UNSAFE_QUIRKS: u32 = 1 << 2;
 

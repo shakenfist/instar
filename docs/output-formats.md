@@ -1,7 +1,7 @@
 # qemu-img Output Formats
 
 This document describes the output formats supported by `qemu-img info` and how
-imago handles version differences across qemu releases.
+instar handles version differences across qemu releases.
 
 ## Overview
 
@@ -12,7 +12,7 @@ imago handles version differences across qemu releases.
 | Human-readable | `--output=human` (default) | Formatted text for terminal display |
 | JSON | `--output=json` | Machine-parseable JSON structure |
 
-imago supports both formats and can be configured to match the output of specific
+instar supports both formats and can be configured to match the output of specific
 qemu-img versions.
 
 ## Output Profiles
@@ -145,18 +145,18 @@ Child node '/file':
 
 ## Version Detection
 
-imago can detect the installed qemu-img version at runtime and automatically
+instar can detect the installed qemu-img version at runtime and automatically
 emit output matching that version's format. This ensures true drop-in
 replacement compatibility.
 
 ### Automatic Detection
 
-By default, imago detects the qemu-img version by running `qemu-img --version`
+By default, instar detects the qemu-img version by running `qemu-img --version`
 and parsing the version string. It then selects the appropriate output profile.
 
 ```bash
 # Automatic version detection (matches installed qemu-img)
-imago info image.qcow2
+instar info image.qcow2
 ```
 
 ### Explicit Version Override
@@ -165,10 +165,10 @@ The `--qemu-version` flag allows forcing a specific output format:
 
 ```bash
 # Force qemu-img 7.2 compatible output (no Child node section)
-imago info --qemu-version 7.2 image.qcow2
+instar info --qemu-version 7.2 image.qcow2
 
 # Force qemu-img 10.0 compatible output (includes Child node section)
-imago info --qemu-version 10.0 image.qcow2
+instar info --qemu-version 10.0 image.qcow2
 ```
 
 ### Version Mapping
@@ -183,7 +183,7 @@ imago info --qemu-version 10.0 image.qcow2
 JSON output is enabled with the `--output=json` flag:
 
 ```bash
-imago info --output=json image.qcow2
+instar info --output=json image.qcow2
 ```
 
 The JSON structure matches qemu-img exactly, including:
@@ -201,7 +201,7 @@ import json
 import subprocess
 
 result = subprocess.run(
-    ['imago', 'info', '--output=json', 'image.qcow2'],
+    ['instar', 'info', '--output=json', 'image.qcow2'],
     capture_output=True,
     text=True
 )
@@ -214,18 +214,18 @@ print(f"Actual size: {info['actual-size']} bytes")
 
 ## Testing and Validation
 
-The [imago-testdata](https://github.com/shakenfist/imago-testdata) repository
+The [instar-testdata](https://github.com/shakenfist/instar-testdata) repository
 contains baseline outputs for multiple qemu-img versions and output formats.
 This enables:
 
 1. **Profile detection**: Grouping versions that produce identical output
-2. **Regression testing**: Ensuring imago matches expected baselines
-3. **Drift detection**: CI jobs that compare imago output against stored baselines
+2. **Regression testing**: Ensuring instar matches expected baselines
+3. **Drift detection**: CI jobs that compare instar output against stored baselines
 
 ### Baseline Structure
 
 ```
-imago-testdata/expected-outputs/
+instar-testdata/expected-outputs/
   qemu-img-human/
     raw/<version>/          # Raw captured outputs per version
     profiles/<profile>/     # Deduplicated profile outputs
@@ -257,7 +257,7 @@ directly. The addition improves transparency for debugging and scripting.
 
 ### Compatibility Considerations
 
-When writing scripts that parse qemu-img/imago output:
+When writing scripts that parse qemu-img/instar output:
 
 1. **Human-readable format**: Use regex patterns that handle optional sections
 2. **JSON format**: Check for `children` key existence before accessing

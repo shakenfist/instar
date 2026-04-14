@@ -19,8 +19,8 @@ before I push:
    copying the script to the target node.
  * Please confirm that any potentially mis-usable scripting and
    images, such as adversarial images and CVE reproductions, are
-   in the `shakenfist/imago-testdata` repository, not the
-   `shakenfist/imago` repository.
+   in the `shakenfist/instar-testdata` repository, not the
+   `shakenfist/instar` repository.
 
 ## Tests
 
@@ -35,7 +35,7 @@ before I push:
  * Run `make lint` (or `./scripts/check-rust.sh check`) and
    confirm clean output.
  * Run `pre-commit run --all-files` and confirm all hooks pass.
- * Are there any changes in `shakenfist/imago-testdata` that we
+ * Are there any changes in `shakenfist/instar-testdata` that we
    need to commit?
 
 ## Documentation
@@ -68,7 +68,7 @@ before I push:
 
 ## Build verification
 
- * Does `make imago` build successfully?
+ * Does `make instar` build successfully?
  * Does `make check-binary-sizes` pass? Guest binaries must fit
    within the 384KB memory region.
  * If `.devcontainer/` was modified, does the devcontainer still

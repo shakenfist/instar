@@ -2,10 +2,10 @@
 
 import json
 
-from base import ImagoTestBase
+from base import InstarTestBase
 
 
-class TestCheckChain(ImagoTestBase):
+class TestCheckChain(InstarTestBase):
     """Test backing chain validation with check --chain."""
 
     def _get_chain_image(self, subpath):
@@ -20,7 +20,7 @@ class TestCheckChain(ImagoTestBase):
         image = self._get_chain_image(
             'downloaded/shakenfist/vda'
         )
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             image, output_format='json', chain=True
         )
         result = json.loads(stdout)
@@ -39,7 +39,7 @@ class TestCheckChain(ImagoTestBase):
         image = self._get_chain_image(
             'downloaded/shakenfist/vda'
         )
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             image, output_format='json', chain=True
         )
         result = json.loads(stdout)
@@ -53,7 +53,7 @@ class TestCheckChain(ImagoTestBase):
         image = self._get_chain_image(
             'downloaded/shakenfist/vda-backing'
         )
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             image, output_format='json', chain=True
         )
         result = json.loads(stdout)
@@ -68,7 +68,7 @@ class TestCheckChain(ImagoTestBase):
         image = self._get_chain_image(
             'downloaded/shakenfist/vda'
         )
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             image, output_format='json'
         )
         result = json.loads(stdout)
@@ -83,7 +83,7 @@ class TestCheckChain(ImagoTestBase):
         image = self._get_chain_image(
             'custom/security/qcow2-backing-etc-passwd.qcow2'
         )
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             image, chain=True
         )
         self.assertNotEqual(
@@ -100,7 +100,7 @@ class TestCheckChain(ImagoTestBase):
         image = self._get_chain_image(
             'custom/backing-layers-format-change/top.qcow2'
         )
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             image, output_format='json', chain=True
         )
         result = json.loads(stdout)
@@ -118,7 +118,7 @@ class TestCheckChain(ImagoTestBase):
         image = self._get_chain_image(
             'downloaded/shakenfist/vda'
         )
-        stdout, stderr, rc = self.run_imago_check(
+        stdout, stderr, rc = self.run_instar_check(
             image, output_format='human', chain=True
         )
         self.assertIn(

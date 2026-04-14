@@ -1,8 +1,8 @@
-//! Configuration file support for imago.
+//! Configuration file support for instar.
 //!
 //! Configuration files are read in order, with later values overriding earlier:
-//! 1. /etc/imago/config - System-wide defaults
-//! 2. ~/.config/imago/config - User defaults
+//! 1. /etc/instar/config - System-wide defaults
+//! 2. ~/.config/instar/config - User defaults
 //! 3. Command-line arguments - Per-invocation overrides
 //!
 //! Config files use TOML format.
@@ -14,10 +14,10 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 /// System-wide config file path
-pub const SYSTEM_CONFIG_PATH: &str = "/etc/imago/config";
+pub const SYSTEM_CONFIG_PATH: &str = "/etc/instar/config";
 
 /// User config file path relative to home directory
-pub const USER_CONFIG_RELATIVE: &str = ".config/imago/config";
+pub const USER_CONFIG_RELATIVE: &str = ".config/instar/config";
 
 /// Special marker for the directory containing the input image
 pub const MARKER_IMAGE_DIR: &str = "$IMAGE_DIR";
@@ -28,7 +28,7 @@ pub const MARKER_CWD: &str = "$CWD";
 /// Root configuration structure
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
-pub struct ImagoConfig {
+pub struct InstarConfig {
     /// Global settings
     pub global: GlobalConfig,
     /// Security settings
@@ -93,9 +93,9 @@ pub enum ConfigSource {
     /// Built-in default value
     #[default]
     Default,
-    /// From system config file (/etc/imago/config)
+    /// From system config file (/etc/instar/config)
     System,
-    /// From user config file (~/.config/imago/config)
+    /// From user config file (~/.config/instar/config)
     User,
     /// From command-line argument
     CommandLine,
@@ -105,8 +105,8 @@ impl std::fmt::Display for ConfigSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConfigSource::Default => write!(f, "(default)"),
-            ConfigSource::System => write!(f, "/etc/imago/config"),
-            ConfigSource::User => write!(f, "~/.config/imago/config"),
+            ConfigSource::System => write!(f, "/etc/instar/config"),
+            ConfigSource::User => write!(f, "~/.config/instar/config"),
             ConfigSource::CommandLine => write!(f, "(command line)"),
         }
     }
@@ -115,7 +115,7 @@ impl std::fmt::Display for ConfigSource {
 /// Configuration with source tracking for introspection
 #[derive(Debug, Clone, Default)]
 pub struct TrackedConfig {
-    pub config: ImagoConfig,
+    pub config: InstarConfig,
     pub sources: ConfigSources,
 }
 
@@ -157,13 +157,13 @@ pub fn load_config() -> TrackedConfig {
 }
 
 /// Load and parse a single config file
-fn load_config_file(path: &Path) -> Option<ImagoConfig> {
+fn load_config_file(path: &Path) -> Option<InstarConfig> {
     let content = std::fs::read_to_string(path).ok()?;
     toml::from_str(&content).ok()
 }
 
 /// Merge a loaded config into the tracked config, updating sources
-fn merge_config(tracked: &mut TrackedConfig, loaded: ImagoConfig, source: ConfigSource) {
+fn merge_config(tracked: &mut TrackedConfig, loaded: InstarConfig, source: ConfigSource) {
     // Global settings
     if loaded.global.output_format.is_some() {
         tracked.config.global.output_format = loaded.global.output_format;
@@ -281,7 +281,7 @@ fn validate_config_file(path: &Path) -> Result<(), String> {
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("Failed to read file: {}", e))?;
 
-    let _: ImagoConfig = toml::from_str(&content).map_err(|e| format!("Invalid TOML: {}", e))?;
+    let _: InstarConfig = toml::from_str(&content).map_err(|e| format!("Invalid TOML: {}", e))?;
 
     Ok(())
 }

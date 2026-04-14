@@ -3,7 +3,7 @@
 ## Prompt
 
 Before responding to questions or discussion points in this
-document, explore the imago codebase thoroughly. Read relevant
+document, explore the instar codebase thoroughly. Read relevant
 source files, understand existing patterns (VMM structure, guest
 operation layout, shared crate conventions, call table ABI,
 format parsing, test infrastructure), and ground your answers in
@@ -62,7 +62,7 @@ and have a clear commit message explaining what changed and why.
 We will know when this plan has been successfully implemented
 because the following statements will be true:
 
-* `make imago` builds and `make lint` is clean.
+* `make instar` builds and `make lint` is clean.
 * Guest binaries pass `make check-binary-sizes` (384KB limit).
 * All Rust unit tests pass (`make test-rust`).
 * All Python integration tests pass (`make test-integration`).

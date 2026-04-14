@@ -1,10 +1,10 @@
 #!/bin/bash
-# Generate synthetic VHD test images for imago integration tests.
+# Generate synthetic VHD test images for instar integration tests.
 #
 # Usage:
 #   ./scripts/create-vhd-testdata.sh [output-dir]
 #
-# Default output: ../imago-testdata/custom/format-coverage/
+# Default output: ../instar-testdata/custom/format-coverage/
 #
 # Creates:
 #   vhd-fixed.vhd         - 10 MiB fixed VHD (disk_type=2)
@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-OUTDIR="${1:-../imago-testdata/custom/format-coverage}"
+OUTDIR="${1:-../instar-testdata/custom/format-coverage}"
 mkdir -p "$OUTDIR"
 
 echo "Creating VHD test images in $OUTDIR..."
@@ -20,7 +20,7 @@ echo "Creating VHD test images in $OUTDIR..."
 # --- Fixed VHD (disk_type=2) ---
 #
 # Structure: raw data (10 MiB) + 512-byte footer at EOF.
-# MBR signature at bytes 510-511 so imago detects as vpc.
+# MBR signature at bytes 510-511 so instar detects as vpc.
 # Recognizable 0xBE pattern at 1 MiB offset for content verification.
 
 python3 -c '

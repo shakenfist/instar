@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 # Docker image to use for linting (stable Rust)
-IMAGE="imago-rust-lint"
+IMAGE="instar-rust-lint"
 
 # Check if docker image exists
 if ! docker image inspect "$IMAGE" &>/dev/null; then
@@ -33,9 +33,9 @@ FAILED=0
 # Note: guest-protocol crate is not in the workspace yet (micropb API issues).
 # TODO: Fix micropb compatibility and add to src/Cargo.toml workspace members.
 
-# Check main imago implementation (src/)
+# Check main instar implementation (src/)
 if [ -d "$PROJECT_ROOT/src" ]; then
-    echo "=== Checking src (main imago) ==="
+    echo "=== Checking src (main instar) ==="
 
     # Run rustfmt on all crates
     echo "Running rustfmt..."
@@ -82,10 +82,10 @@ for prototype in prototypes/helloworld prototypes/helloworld2 \
     fi
 
     # Run clippy only on VMM crate (guest crates are no_std and don't support clippy)
-    # Note: info uses "imago" as the package name, others use "vmm"
+    # Note: info uses "instar" as the package name, others use "vmm"
     echo "Running clippy on vmm..."
     if [ "$prototype" = "prototypes/info" ]; then
-        run_in_docker "$prototype" cargo clippy -p imago -- -D warnings || FAILED=1
+        run_in_docker "$prototype" cargo clippy -p instar -- -D warnings || FAILED=1
     else
         run_in_docker "$prototype" cargo clippy -p vmm -- -D warnings || FAILED=1
     fi

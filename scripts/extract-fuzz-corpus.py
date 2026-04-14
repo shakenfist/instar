@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Extract seed corpus for coverage-guided fuzzing from imago-testdata.
+"""Extract seed corpus for coverage-guided fuzzing from instar-testdata.
 
-Copies test images from the imago-testdata repository into per-target
+Copies test images from the instar-testdata repository into per-target
 corpus directories under src/fuzz/corpus/. Images are filtered by
 format and optionally truncated for header-only targets.
 
 Usage:
-    python3 scripts/extract-fuzz-corpus.py --testdata /path/to/imago-testdata
+    python3 scripts/extract-fuzz-corpus.py --testdata /path/to/instar-testdata
 
 The script reads tests/manifest.json to find images and their formats.
 """
@@ -180,7 +180,7 @@ def main():
     parser.add_argument(
         '--testdata',
         required=True,
-        help='Path to imago-testdata repository',
+        help='Path to instar-testdata repository',
     )
     parser.add_argument(
         '--corpus-dir',
