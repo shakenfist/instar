@@ -139,6 +139,26 @@ KNOWN_SAFETY_DIVERGENCES = {
 # may not parse its virtual size correctly.
 VSIZE_SKIP_FORMATS = {'iso', 'luks', 'qed'}
 
+# Images where virtual size cross-validation is
+# intentionally skipped even though format detection
+# agrees. Maps image_id -> skip reason.
+KNOWN_VSIZE_DIVERGENCES = {
+    # VMDK monolithicFlat: the descriptor file carries
+    # the extent's sector count, and instar honours it.
+    # oslo.utils' VMDK inspector parses the binary sparse
+    # header only and reports virtual_size=0 for plain
+    # descriptor files, so the two tools are not directly
+    # comparable here.
+    'vmdk-flat-1m': (
+        'oslo.utils VMDK inspector reports virtual_size=0 '
+        'for monolithicFlat descriptors'
+    ),
+    'vmdk-flat-10m': (
+        'oslo.utils VMDK inspector reports virtual_size=0 '
+        'for monolithicFlat descriptors'
+    ),
+}
+
 
 def _generate_scenarios(skip_formats=None):
     """Generate test scenarios from manifest.
@@ -371,6 +391,11 @@ class TestOsloVirtualSize(
             self.skipTest(
                 f'{self.image_id}: format diverges, '
                 f'virtual size not comparable'
+            )
+        if self.image_id in KNOWN_VSIZE_DIVERGENCES:
+            self.skipTest(
+                f'{self.image_id}: '
+                f'{KNOWN_VSIZE_DIVERGENCES[self.image_id]}'
             )
 
         oslo_vsize = inspector.virtual_size
