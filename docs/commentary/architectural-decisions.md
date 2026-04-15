@@ -155,6 +155,28 @@ memory that describes the chain (format, virtual size, cluster size of
 each device). It uses the call table to read from specific devices by
 index. It never knows or cares about file paths.
 
+**Exception for VMDK monolithicFlat descriptors:** A
+monolithicFlat VMDK is an ASCII descriptor file plus a separate
+raw flat extent file. The descriptor has no binary magic for the
+guest's format detector to latch onto, and its only purpose is to
+name the flat extent. Running it through the guest info operation
+would mean either (a) teaching the guest about every two-file
+format as a special case, or (b) producing a "format=raw" report
+that discards the extent information. Instead, the VMM recognises
+the `# Disk DescriptorFile` prefix on the host, parses the extent
+line via `vmdk::parse_descriptor_extents` (the same alloc-free
+parser the guest would use), runs the extent filename through
+the existing backing-file allowlist, and opens the flat extent as
+device 1. The `ChainConfig` on device 0 is then marked
+`VmdkDescriptor` with `data_device_idx = 1`, letting guest
+operations reuse the QCOW2 external-data-file redirect for
+content reads. This keeps the guest's role unchanged (still just
+reads devices by index) while acknowledging that a plain-text
+two-file format is the one case where host-side parsing is
+simpler and no less safe — the descriptor is pure ASCII with no
+state, and every path it names still flows through the same
+allowlist as a QCOW2 backing file.
+
 ---
 
 ## Decision 6: `no_std` format crates with feature flags
