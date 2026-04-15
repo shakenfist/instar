@@ -139,24 +139,21 @@ KNOWN_SAFETY_DIVERGENCES = {
 # may not parse its virtual size correctly.
 VSIZE_SKIP_FORMATS = {'iso', 'luks', 'qed'}
 
-# Images where virtual size cross-validation is
-# intentionally skipped even though format detection
-# agrees. Maps image_id -> skip reason.
+# Images where instar and oslo.utils are known to report
+# different virtual sizes by design. Maps image_id to
+# (expected_oslo_vsize, expected_instar_vsize). The test
+# asserts both tools still report these exact values, so
+# that any future convergence (e.g. oslo learning to read
+# VMDK descriptor extents) fails loudly and forces us to
+# re-evaluate the special case instead of silently skipping.
+#
+# VMDK monolithicFlat: the descriptor carries the extent's
+# sector count, and instar honours it. oslo.utils' VMDK
+# inspector parses only the binary sparse header and
+# reports virtual_size=0 for plain descriptor files.
 KNOWN_VSIZE_DIVERGENCES = {
-    # VMDK monolithicFlat: the descriptor file carries
-    # the extent's sector count, and instar honours it.
-    # oslo.utils' VMDK inspector parses the binary sparse
-    # header only and reports virtual_size=0 for plain
-    # descriptor files, so the two tools are not directly
-    # comparable here.
-    'vmdk-flat-1m': (
-        'oslo.utils VMDK inspector reports virtual_size=0 '
-        'for monolithicFlat descriptors'
-    ),
-    'vmdk-flat-10m': (
-        'oslo.utils VMDK inspector reports virtual_size=0 '
-        'for monolithicFlat descriptors'
-    ),
+    'vmdk-flat-1m': (0, 1 * 1024 * 1024),
+    'vmdk-flat-10m': (0, 10 * 1024 * 1024),
 }
 
 
@@ -392,11 +389,6 @@ class TestOsloVirtualSize(
                 f'{self.image_id}: format diverges, '
                 f'virtual size not comparable'
             )
-        if self.image_id in KNOWN_VSIZE_DIVERGENCES:
-            self.skipTest(
-                f'{self.image_id}: '
-                f'{KNOWN_VSIZE_DIVERGENCES[self.image_id]}'
-            )
 
         oslo_vsize = inspector.virtual_size
         if oslo_vsize is None:
@@ -423,6 +415,29 @@ class TestOsloVirtualSize(
                 f'instar reports no virtual-size for '
                 f'{self.image_id}'
             )
+
+        # Known divergence: assert both sides still report
+        # the expected values so that a future change in
+        # either tool fails this test and forces a review.
+        if self.image_id in KNOWN_VSIZE_DIVERGENCES:
+            exp_oslo, exp_instar = (
+                KNOWN_VSIZE_DIVERGENCES[self.image_id]
+            )
+            self.assertEqual(
+                oslo_vsize, exp_oslo,
+                f'{self.image_id}: oslo virtual_size '
+                f'changed (expected {exp_oslo}, got '
+                f'{oslo_vsize}); re-evaluate '
+                f'KNOWN_VSIZE_DIVERGENCES entry'
+            )
+            self.assertEqual(
+                instar_vsize, exp_instar,
+                f'{self.image_id}: instar virtual-size '
+                f'changed (expected {exp_instar}, got '
+                f'{instar_vsize}); re-evaluate '
+                f'KNOWN_VSIZE_DIVERGENCES entry'
+            )
+            return
 
         # VPC/VHD virtual size may differ due to CHS
         # geometry rounding. Allow up to one cylinder
