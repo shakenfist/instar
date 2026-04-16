@@ -129,6 +129,19 @@ pub struct ChainImage {
     pub flags: u32,
 }
 
+/// A single external data file (flat extent or QCOW2 external data
+/// file) to be opened as a separate virtio-block device.
+#[derive(Debug, Clone)]
+pub struct ExternalDataFile {
+    /// Absolute, validated path to the file.
+    pub path: PathBuf,
+    /// Size of this file's virtual address space contribution in
+    /// bytes. For QCOW2 external data files this equals the file
+    /// size; for VMDK flat extents it equals the extent size from
+    /// the descriptor.
+    pub extent_size: u64,
+}
+
 /// Complete backing chain for an image.
 ///
 /// The chain is ordered from top (index 0) to base (last index).
@@ -138,10 +151,12 @@ pub struct ChainImage {
 pub struct BackingChain {
     /// Images in the chain, from top (index 0) to base (last index)
     pub images: Vec<ChainImage>,
-    /// Validated path to external data file for the top image (QCOW2 v3).
-    /// When present, the data file is opened as a separate virtio-block
-    /// device between the top image (device 0) and the backing chain.
-    pub external_data_file: Option<PathBuf>,
+    /// External data files for the top image (QCOW2 v3 external data
+    /// file or VMDK flat extent files). Inserted as separate
+    /// virtio-block devices between the top image (device 0) and the
+    /// backing chain. Single-element for QCOW2 data files and
+    /// monolithicFlat; multi-element for twoGbMaxExtentFlat.
+    pub external_data_files: Vec<ExternalDataFile>,
 }
 
 impl BackingChain {
@@ -149,7 +164,7 @@ impl BackingChain {
     pub fn new() -> Self {
         Self {
             images: Vec::new(),
-            external_data_file: None,
+            external_data_files: Vec::new(),
         }
     }
 
@@ -159,14 +174,9 @@ impl BackingChain {
     }
 
     /// Total number of virtio-block devices needed for this chain.
-    /// Includes the external data file device if present.
+    /// Includes external data file devices if present.
     pub fn total_devices(&self) -> usize {
-        self.images.len()
-            + if self.external_data_file.is_some() {
-                1
-            } else {
-                0
-            }
+        self.images.len() + self.external_data_files.len()
     }
 
     /// Check if the chain is empty
@@ -416,32 +426,41 @@ pub fn validate_backing_path(
 /// parse cheap and bounds the memory taken by an untrusted file.
 pub const MAX_DESCRIPTOR_BYTES: usize = 8192;
 
-/// Result of resolving a VMDK monolithicFlat descriptor on the host.
+/// A single resolved flat extent within a VMDK descriptor.
 #[derive(Debug, Clone)]
-pub struct ResolvedVmdkDescriptor {
+pub struct ResolvedVmdkExtent {
     /// Absolute, allowlist-validated path to the flat extent file.
     pub flat_path: PathBuf,
-    /// Virtual size in bytes (extent `size_sectors` × 512).
-    pub virtual_size: u64,
+    /// Size of this extent in bytes (extent `size_sectors` × 512).
+    pub extent_size: u64,
 }
 
-/// Read a VMDK monolithicFlat descriptor, validate it, and resolve
-/// its flat extent file against the backing-file allowlist.
+/// Result of resolving a VMDK flat descriptor on the host.
+#[derive(Debug, Clone)]
+pub struct ResolvedVmdkDescriptor {
+    /// Ordered flat extent files. For monolithicFlat, length 1;
+    /// for twoGbMaxExtentFlat, length N.
+    pub flat_extents: Vec<ResolvedVmdkExtent>,
+    /// Total virtual size across all extents in bytes.
+    pub virtual_size: u64,
+    /// Parent filename hint from descriptor, if present.
+    /// Analogous to QCOW2 backing-filename.
+    pub parent_hint: Option<String>,
+}
+
+/// Read a VMDK flat descriptor, validate it, and resolve its flat
+/// extent file(s) against the backing-file allowlist.
 ///
-/// The descriptor file is at `descriptor_path`. This function:
-/// - Reads up to [`MAX_DESCRIPTOR_BYTES`] of descriptor text.
-/// - Rejects descriptors with `parentFileNameHint=` (monolithicFlat
-///   with a backing parent is out of scope for Phase 22).
-/// - Parses the descriptor's extent lines.
-/// - Requires exactly one extent of kind `FLAT` with a non-empty
-///   filename and `offset_sectors == 0`. Anything else (multi-extent
-///   twoGbMaxExtentFlat, non-zero offset, sparse subformat mixed in)
-///   is rejected with a clear error so the caller can fall through
-///   to the "known gap" story.
-/// - Resolves the extent filename relative to the descriptor's
-///   directory and runs it through `validate_backing_path()`.
+/// Supports both monolithicFlat (single extent) and
+/// twoGbMaxExtentFlat (multiple extents). All extents must be of
+/// kind `FLAT` with `offset_sectors == 0`.
 ///
-/// Returns the resolved flat path and virtual size on success.
+/// If the descriptor contains a `parentFileNameHint=` line, the
+/// hint is returned in `parent_hint` so the caller can continue
+/// chain discovery.
+///
+/// Each extent filename is resolved relative to the descriptor's
+/// directory and validated against the security allowlist.
 pub fn resolve_vmdk_flat_descriptor(
     descriptor_path: &Path,
     security_config: &SecurityConfig,
@@ -459,18 +478,15 @@ pub fn resolve_vmdk_flat_descriptor(
         ))
     })?;
 
-    // Reject backing-parent hint outright. The Phase 22 mission
-    // explicitly scopes out monolithicFlat-with-parent; silently
-    // ignoring the hint would drop the parent from the chain and
-    // produce subtly wrong content.
+    // Extract parentFileNameHint if present.
+    let mut parent_hint: Option<String> = None;
     for line in text.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("parentFileNameHint=") {
-            return Err(ChainError::PathResolutionError(format!(
-                "VMDK descriptor '{}' has a parent hint (parentFileNameHint); \
-                 monolithicFlat with a backing parent is not yet supported",
-                descriptor_path.display()
-            )));
+        if let Some(rest) = trimmed.strip_prefix("parentFileNameHint=") {
+            let hint = rest.trim_matches('"').trim();
+            if !hint.is_empty() {
+                parent_hint = Some(hint.to_string());
+            }
         }
     }
 
@@ -482,59 +498,68 @@ pub fn resolve_vmdk_flat_descriptor(
         ))
     })?;
 
-    if extents.len() != 1 {
-        return Err(ChainError::PathResolutionError(format!(
-            "VMDK descriptor '{}' has {} extents; only single-extent \
-             monolithicFlat is supported (twoGbMaxExtentFlat is a \
-             known gap)",
-            descriptor_path.display(),
-            extents.len()
-        )));
+    let mut flat_extents = Vec::with_capacity(extents.len());
+    let mut virtual_size: u64 = 0;
+
+    for i in 0..extents.len() {
+        let extent = extents.get(i).expect("index < len");
+
+        if extent.kind != vmdk::ExtentKind::Flat {
+            return Err(ChainError::PathResolutionError(format!(
+                "VMDK descriptor '{}' extent {} has kind {:?}; \
+                 only FLAT extents are supported",
+                descriptor_path.display(),
+                i,
+                extent.kind
+            )));
+        }
+
+        if extent.offset_sectors != 0 {
+            return Err(ChainError::PathResolutionError(format!(
+                "VMDK descriptor '{}' extent {} has non-zero \
+                 offset ({} sectors); only offset-0 extents \
+                 are supported",
+                descriptor_path.display(),
+                i,
+                extent.offset_sectors
+            )));
+        }
+
+        if extent.filename.is_empty() {
+            return Err(ChainError::PathResolutionError(format!(
+                "VMDK descriptor '{}' extent {} has no filename",
+                descriptor_path.display(),
+                i,
+            )));
+        }
+
+        let flat_path = validate_backing_path(descriptor_path, extent.filename, security_config)?;
+
+        let extent_size = extent.size_sectors.checked_mul(512).ok_or_else(|| {
+            ChainError::PathResolutionError(format!(
+                "VMDK descriptor '{}' extent {} size overflows u64",
+                descriptor_path.display(),
+                i,
+            ))
+        })?;
+
+        virtual_size = virtual_size.checked_add(extent_size).ok_or_else(|| {
+            ChainError::PathResolutionError(format!(
+                "VMDK descriptor '{}' total virtual size overflows u64",
+                descriptor_path.display()
+            ))
+        })?;
+
+        flat_extents.push(ResolvedVmdkExtent {
+            flat_path,
+            extent_size,
+        });
     }
-
-    let extent = extents.get(0).expect("len==1 checked above");
-
-    if extent.kind != vmdk::ExtentKind::Flat {
-        return Err(ChainError::PathResolutionError(format!(
-            "VMDK descriptor '{}' has a non-FLAT extent; only \
-             monolithicFlat is supported here",
-            descriptor_path.display()
-        )));
-    }
-
-    if extent.offset_sectors != 0 {
-        return Err(ChainError::PathResolutionError(format!(
-            "VMDK descriptor '{}' has a FLAT extent with non-zero \
-             offset ({} sectors); only offset-0 extents are \
-             supported",
-            descriptor_path.display(),
-            extent.offset_sectors
-        )));
-    }
-
-    if extent.filename.is_empty() {
-        return Err(ChainError::PathResolutionError(format!(
-            "VMDK descriptor '{}' has a FLAT extent with no filename",
-            descriptor_path.display()
-        )));
-    }
-
-    // Resolve the extent filename against the descriptor's directory
-    // and run it through the backing-file allowlist. This is the
-    // same security surface as a QCOW2 backing file pointer — the
-    // filename is untrusted data from an external file.
-    let flat_path = validate_backing_path(descriptor_path, extent.filename, security_config)?;
-
-    let virtual_size = extent.size_sectors.checked_mul(512).ok_or_else(|| {
-        ChainError::PathResolutionError(format!(
-            "VMDK descriptor '{}' extent size overflows u64",
-            descriptor_path.display()
-        ))
-    })?;
 
     Ok(ResolvedVmdkDescriptor {
-        flat_path,
+        flat_extents,
         virtual_size,
+        parent_hint,
     })
 }
 
@@ -835,11 +860,17 @@ mod tests {
         let resolved = resolve_vmdk_flat_descriptor(&desc, &cfg).unwrap();
 
         assert_eq!(resolved.virtual_size, 20971520 * 512);
-        assert_eq!(resolved.flat_path, flat.canonicalize().unwrap());
+        assert_eq!(resolved.flat_extents.len(), 1);
+        assert_eq!(
+            resolved.flat_extents[0].flat_path,
+            flat.canonicalize().unwrap()
+        );
+        assert_eq!(resolved.flat_extents[0].extent_size, 20971520 * 512);
+        assert!(resolved.parent_hint.is_none());
     }
 
     #[test]
-    fn resolve_descriptor_rejects_parent_hint() {
+    fn resolve_descriptor_returns_parent_hint() {
         let tmp = TempDir::new().unwrap();
         let desc = tmp.path().join("foo.vmdk");
         let flat = tmp.path().join("foo-flat.vmdk");
@@ -856,17 +887,13 @@ mod tests {
         std::fs::write(&flat, vec![0u8; 512]).unwrap();
 
         let cfg = default_security_config();
-        let err = resolve_vmdk_flat_descriptor(&desc, &cfg).unwrap_err();
-        match err {
-            ChainError::PathResolutionError(msg) => {
-                assert!(msg.contains("parent hint"));
-            }
-            _ => panic!("expected PathResolutionError, got {:?}", err),
-        }
+        let resolved = resolve_vmdk_flat_descriptor(&desc, &cfg).unwrap();
+        assert_eq!(resolved.parent_hint.as_deref(), Some("parent.vmdk"));
+        assert_eq!(resolved.flat_extents.len(), 1);
     }
 
     #[test]
-    fn resolve_descriptor_rejects_multi_extent() {
+    fn resolve_descriptor_multi_extent() {
         let tmp = TempDir::new().unwrap();
         let desc = tmp.path().join("foo.vmdk");
         let flat1 = tmp.path().join("foo-f001.vmdk");
@@ -883,13 +910,20 @@ mod tests {
         std::fs::write(&flat2, vec![0u8; 512]).unwrap();
 
         let cfg = default_security_config();
-        let err = resolve_vmdk_flat_descriptor(&desc, &cfg).unwrap_err();
-        match err {
-            ChainError::PathResolutionError(msg) => {
-                assert!(msg.contains("2 extents"));
-            }
-            _ => panic!("expected PathResolutionError, got {:?}", err),
-        }
+        let resolved = resolve_vmdk_flat_descriptor(&desc, &cfg).unwrap();
+        assert_eq!(resolved.flat_extents.len(), 2);
+        assert_eq!(
+            resolved.flat_extents[0].flat_path,
+            flat1.canonicalize().unwrap()
+        );
+        assert_eq!(
+            resolved.flat_extents[1].flat_path,
+            flat2.canonicalize().unwrap()
+        );
+        assert_eq!(resolved.flat_extents[0].extent_size, 4194304 * 512);
+        assert_eq!(resolved.flat_extents[1].extent_size, 4194304 * 512);
+        assert_eq!(resolved.virtual_size, 2 * 4194304 * 512);
+        assert!(resolved.parent_hint.is_none());
     }
 
     #[test]
@@ -909,7 +943,11 @@ mod tests {
         let err = resolve_vmdk_flat_descriptor(&desc, &cfg).unwrap_err();
         match err {
             ChainError::PathResolutionError(msg) => {
-                assert!(msg.contains("non-FLAT"));
+                assert!(
+                    msg.contains("FLAT"),
+                    "expected error about FLAT kind, got: {}",
+                    msg
+                );
             }
             _ => panic!("expected PathResolutionError, got {:?}", err),
         }

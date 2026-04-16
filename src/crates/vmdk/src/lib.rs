@@ -246,6 +246,49 @@ pub fn build_descriptor(buf: &mut [u8], offset: usize, capacity_sectors: u64) ->
     pos - offset
 }
 
+/// Build a monolithicFlat descriptor into `buf` starting at
+/// `offset`. Returns the number of bytes written.
+///
+/// `flat_filename` is the bare filename of the flat extent file
+/// (e.g. `b"output-flat.vmdk"`). The descriptor is written as
+/// pure ASCII text — no binary header is needed for flat images.
+pub fn build_flat_descriptor(
+    buf: &mut [u8],
+    offset: usize,
+    capacity_sectors: u64,
+    flat_filename: &[u8],
+) -> usize {
+    let mut pos = offset;
+
+    let mut put = |bytes: &[u8]| {
+        let end = pos + bytes.len();
+        if end <= buf.len() {
+            buf[pos..end].copy_from_slice(bytes);
+        }
+        pos = end;
+    };
+
+    put(b"# Disk DescriptorFile\n");
+    put(b"version=1\n");
+    put(b"CID=fffffffe\n");
+    put(b"parentCID=ffffffff\n");
+    put(b"createType=\"monolithicFlat\"\n\n");
+    put(b"# Extent description\n");
+    put(b"RW ");
+
+    let mut num_buf = [0u8; 20];
+    let num_str = format_u64(capacity_sectors, &mut num_buf);
+    put(num_str);
+
+    put(b" FLAT \"");
+    put(flat_filename);
+    put(b"\" 0\n\n");
+    put(b"# The Disk Data Base\n");
+    put(b"#DDB\n");
+
+    pos - offset
+}
+
 /// Format a u64 as a decimal string in a fixed buffer.
 /// Returns a slice of the formatted digits.
 fn format_u64(mut val: u64, buf: &mut [u8; 20]) -> &[u8] {

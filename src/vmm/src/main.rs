@@ -48,7 +48,7 @@ use backing::BackingStore;
 use chain::{
     check_chain_depth, check_circular_reference, peek_is_vmdk_descriptor,
     resolve_vmdk_flat_descriptor, validate_backing_path, BackingChain, ChainError, ChainImage,
-    ImageFormat, InfoOperationResult,
+    ExternalDataFile, ImageFormat, InfoOperationResult,
 };
 use io_thread::{DeviceRole, IoDevice};
 use ioevent::IoEvent;
@@ -1657,19 +1657,19 @@ fn discover_backing_chain(
 
         seen_paths.push(current.clone());
 
-        // VMDK monolithicFlat descriptor short-circuit: a descriptor
-        // is pure ASCII text (no binary magic) so the guest info
-        // operation has no meaningful parse path for it. Detect it
-        // on the host, resolve the flat extent file against the
-        // backing allowlist, and construct the chain entry directly.
-        // monolithicFlat-with-parent is explicitly out of scope, so
-        // a descriptor is always a terminal chain node.
+        // VMDK flat descriptor short-circuit: a descriptor is pure
+        // ASCII text (no binary magic) so the guest info operation
+        // has no meaningful parse path for it. Detect it on the
+        // host, resolve the flat extent file(s) against the backing
+        // allowlist, and construct the chain entry directly.
+        // If the descriptor has a parentFileNameHint, continue
+        // chain discovery with the parent.
         if peek_is_vmdk_descriptor(&current).unwrap_or(false) {
             let resolved = resolve_vmdk_flat_descriptor(&current, security_config)?;
             debug!(
-                "VMDK descriptor resolved: {} -> flat {} ({} bytes virtual)",
+                "VMDK descriptor resolved: {} -> {} extent(s) ({} bytes virtual)",
                 current.display(),
-                resolved.flat_path.display(),
+                resolved.flat_extents.len(),
                 resolved.virtual_size
             );
 
@@ -1681,10 +1681,24 @@ fn discover_backing_chain(
                 virtual_size: resolved.virtual_size,
                 actual_size: descriptor_file_size,
                 cluster_size: 0,
-                backing_file_raw: None,
+                backing_file_raw: resolved.parent_hint.clone(),
                 flags: 0,
             });
-            chain.external_data_file = Some(resolved.flat_path);
+            chain.external_data_files = resolved
+                .flat_extents
+                .iter()
+                .map(|e| ExternalDataFile {
+                    path: e.flat_path.clone(),
+                    extent_size: e.extent_size,
+                })
+                .collect();
+
+            // If the descriptor has a parent hint, continue
+            // chain discovery with the parent image.
+            if let Some(ref hint) = resolved.parent_hint {
+                current = validate_backing_path(&current, hint, security_config)?;
+                continue;
+            }
             break;
         }
 
@@ -1713,12 +1727,18 @@ fn discover_backing_chain(
         if chain.images.is_empty() {
             if let Some(ref data_path) = info_result.external_data_file {
                 let data_resolved = validate_backing_path(&current, data_path, security_config)?;
+                let data_size = std::fs::metadata(&data_resolved)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
                 debug!(
                     "External data file validated: {} -> {}",
                     data_path,
                     data_resolved.display()
                 );
-                chain.external_data_file = Some(data_resolved);
+                chain.external_data_files = vec![ExternalDataFile {
+                    path: data_resolved,
+                    extent_size: data_size,
+                }];
             }
         }
 
@@ -1756,8 +1776,8 @@ fn discover_backing_chain(
 /// Print the backing chain in human-readable format
 fn print_backing_chain(chain: &BackingChain) {
     println!("Chain: {} image(s)", chain.len());
-    if let Some(ref data_file) = chain.external_data_file {
-        println!("  External data file: {}", data_file.display());
+    for data_file in &chain.external_data_files {
+        println!("  External data file: {}", data_file.path.display());
     }
     for (i, image) in chain.images().iter().enumerate() {
         let backing_info = match &image.backing_file_raw {
@@ -1800,7 +1820,7 @@ fn write_chain_device_entries(
     devices_base: u64,
     start_idx: usize,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let has_data_file = chain.external_data_file.is_some();
+    let has_data_files = !chain.external_data_files.is_empty();
     let mut idx = start_idx;
 
     for (chain_pos, image) in chain.images().iter().enumerate() {
@@ -1816,10 +1836,11 @@ fn write_chain_device_entries(
         guest_mem.write_obj(image.flags, GuestAddress(dev_offset + 4))?;
         guest_mem.write_obj(image.virtual_size, GuestAddress(dev_offset + 8))?;
         guest_mem.write_obj(image.actual_size, GuestAddress(dev_offset + 16))?;
+
         guest_mem.write_obj(image.cluster_size, GuestAddress(dev_offset + 24))?;
 
-        // For top image with external data file, point to the next device
-        let data_dev_idx: u32 = if chain_pos == 0 && has_data_file {
+        // For top image with external data files, point to the next device
+        let data_dev_idx: u32 = if chain_pos == 0 && has_data_files {
             (idx + 1) as u32
         } else {
             0 // data is in self
@@ -1827,21 +1848,29 @@ fn write_chain_device_entries(
         guest_mem.write_obj(data_dev_idx, GuestAddress(dev_offset + 28))?;
         idx += 1;
 
-        // After the top image, insert the external data file device entry
-        if chain_pos == 0 && has_data_file && idx < MAX_CHAIN_DEVICES {
-            let data_path = chain.external_data_file.as_ref().unwrap();
-            let data_size = std::fs::metadata(data_path).map(|m| m.len()).unwrap_or(0);
-            let dev_offset = devices_base + (idx as u64 * 32);
-            guest_mem.write_obj(
-                ImageFormat::Raw.to_shared_format_u32(),
-                GuestAddress(dev_offset),
-            )?;
-            guest_mem.write_obj(0u32, GuestAddress(dev_offset + 4))?; // no flags
-            guest_mem.write_obj(data_size, GuestAddress(dev_offset + 8))?;
-            guest_mem.write_obj(data_size, GuestAddress(dev_offset + 16))?;
-            guest_mem.write_obj(0u32, GuestAddress(dev_offset + 24))?; // no cluster size
-            guest_mem.write_obj(0u32, GuestAddress(dev_offset + 28))?; // data in self
-            idx += 1;
+        // After the top image, insert external data file device entries
+        if chain_pos == 0 && has_data_files {
+            for data_file in &chain.external_data_files {
+                if idx >= MAX_CHAIN_DEVICES {
+                    break;
+                }
+                let data_size = std::fs::metadata(&data_file.path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let dev_offset = devices_base + (idx as u64 * 32);
+                guest_mem.write_obj(
+                    ImageFormat::Raw.to_shared_format_u32(),
+                    GuestAddress(dev_offset),
+                )?;
+                guest_mem.write_obj(0u32, GuestAddress(dev_offset + 4))?;
+                // virtual_size = extent's logical size from descriptor
+                guest_mem.write_obj(data_file.extent_size, GuestAddress(dev_offset + 8))?;
+                // actual_size = file size on disk
+                guest_mem.write_obj(data_size, GuestAddress(dev_offset + 16))?;
+                guest_mem.write_obj(0u32, GuestAddress(dev_offset + 24))?;
+                guest_mem.write_obj(0u32, GuestAddress(dev_offset + 28))?;
+                idx += 1;
+            }
         }
     }
 
@@ -1889,11 +1918,11 @@ fn open_chain_devices(
         io_events.push(IoEvent::new(mmio)?);
         idx += 1;
 
-        // After the top image, insert the external data file device
+        // After the top image, insert external data file devices
         if chain_pos == 0 {
-            if let Some(ref data_path) = chain.external_data_file {
-                let data_backing = BackingStore::open(data_path, true, None, false)?;
-                let data_size = std::fs::metadata(data_path)?.len();
+            for data_file in &chain.external_data_files {
+                let data_backing = BackingStore::open(&data_file.path, true, None, false)?;
+                let data_size = std::fs::metadata(&data_file.path)?.len();
                 let mmio = device_mmio_base(idx);
                 let vq = device_vq_base(idx);
                 let device = VirtioBlockDevice::new(
@@ -1909,7 +1938,7 @@ fn open_chain_devices(
                     label,
                     idx,
                     mmio,
-                    data_path.display()
+                    data_file.path.display()
                 );
                 let device = Arc::new(Mutex::new(device));
                 device_set.add_device(Arc::clone(&device), true);
@@ -2307,6 +2336,12 @@ struct ConvertArgs {
     /// Without this flag, native LUKS v2 conversion will fail.
     #[arg(long, value_name = "SIZE")]
     max_guest_memory: Option<String>,
+
+    /// VMDK subformat for -O vmdk output. "monolithicSparse" (default),
+    /// "streamOptimized" (when -c), or "monolithicFlat" (descriptor +
+    /// raw extent file). Only valid with -O vmdk.
+    #[arg(long, default_value = "")]
+    subformat: String,
 
     /// Output grain size for VMDK in bytes (default: 65536).
     /// Must be a power of 2, 4096 to 65536. Only valid with -O vmdk.
@@ -4339,6 +4374,35 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         return Err("--grain-size is only supported with VMDK (-O vmdk) output".into());
     }
 
+    // Validate --subformat for VMDK output
+    let is_vmdk_flat_output = if !args.subformat.is_empty() {
+        if !is_vmdk_output {
+            return Err("--subformat is only supported with VMDK (-O vmdk) output".into());
+        }
+        match args.subformat.as_str() {
+            "monolithicFlat" => {
+                if args.compress {
+                    return Err(
+                        "compression (-c) is not supported with monolithicFlat subformat".into(),
+                    );
+                }
+                true
+            }
+            "monolithicSparse" | "streamOptimized" => false,
+            other => {
+                return Err(format!(
+                    "unsupported VMDK subformat '{}' (supported: \
+                     'monolithicSparse', 'streamOptimized', \
+                     'monolithicFlat')",
+                    other
+                )
+                .into());
+            }
+        }
+    } else {
+        false
+    };
+
     // Validate --block-size for VHD/VHDX output
     if args.block_size != 0 {
         if !is_vhd_output && !is_vhdx_output {
@@ -4477,7 +4541,26 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // For QCOW2 output the file is always sparse (the guest
     // writes clusters on demand) and the capacity needs headroom
     // for metadata (L1/L2 tables, refcount structures).
-    let is_structured_output = is_qcow2_output || is_vmdk_output || is_vhd_output || is_vhdx_output;
+    // For monolithicFlat output, the guest writes raw sectors and
+    // the host writes the descriptor afterwards. Override target
+    // format to Raw and derive the flat extent filename.
+    let (effective_target_format, flat_extent_path) = if is_vmdk_flat_output {
+        // Derive flat extent filename: "foo.vmdk" -> "foo-flat.vmdk"
+        let out_path = Path::new(&args.output);
+        let stem = out_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("output");
+        let flat_name = format!("{}-flat.vmdk", stem);
+        let flat_path = out_path.with_file_name(&flat_name);
+        (1u32, Some((flat_path, flat_name))) // ImageFormat::Raw
+    } else {
+        (target_format, None)
+    };
+
+    let is_structured_output =
+        (is_qcow2_output || is_vmdk_output || is_vhd_output || is_vhdx_output)
+            && !is_vmdk_flat_output;
     let output_capacity = if is_vhdx_output {
         // VHDX uses 32MB blocks — data is rounded up to block_size
         // boundaries, plus ~4MB metadata overhead (file identifier,
@@ -4497,18 +4580,25 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         virtual_size
     };
 
+    // For monolithicFlat, the output device is the flat extent file.
+    let output_file_path = if let Some((ref flat_path, _)) = flat_extent_path {
+        flat_path.clone()
+    } else {
+        Path::new(&args.output).to_path_buf()
+    };
+
     let output_backing = if args.no_create {
-        BackingStore::open(Path::new(&args.output), false, None, false)?
+        BackingStore::open(&output_file_path, false, None, false)?
     } else if is_structured_output {
         BackingStore::open(
-            Path::new(&args.output),
+            &output_file_path,
             false,
             Some(output_capacity),
             true, // always sparse for structured formats
         )?
     } else {
         BackingStore::open(
-            Path::new(&args.output),
+            &output_file_path,
             false,
             Some(virtual_size),
             // sparse when skipping zeros (default: true)
@@ -4518,7 +4608,8 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 
     debug!(
         "Output file: {} (capacity {} bytes)",
-        args.output, output_capacity
+        output_file_path.display(),
+        output_capacity
     );
 
     // Parse --max-guest-memory for LUKS v2 Argon2id support
@@ -4614,7 +4705,10 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         input_device_count as u32,
         GuestAddress(OPERATION_CONFIG_ADDR + 8),
     )?;
-    guest_mem.write_obj(target_format, GuestAddress(OPERATION_CONFIG_ADDR + 12))?;
+    guest_mem.write_obj(
+        effective_target_format,
+        GuestAddress(OPERATION_CONFIG_ADDR + 12),
+    )?;
     guest_mem.write_obj(
         output_cluster_bits,
         GuestAddress(OPERATION_CONFIG_ADDR + 16),
@@ -5027,11 +5121,34 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         return Err("convert operation failed".into());
     }
 
+    // For monolithicFlat output, write the descriptor file on the
+    // host. The guest already wrote raw sectors to the flat extent
+    // file; now we create the small text descriptor that points at
+    // the flat file.
+    if let Some((ref _flat_path, ref flat_name)) = flat_extent_path {
+        let capacity_sectors = virtual_size / 512;
+        let mut desc_buf = [0u8; 1024];
+        let n =
+            vmdk::build_flat_descriptor(&mut desc_buf, 0, capacity_sectors, flat_name.as_bytes());
+        std::fs::write(&args.output, &desc_buf[..n])?;
+        debug!(
+            "Wrote monolithicFlat descriptor: {} ({} bytes)",
+            args.output, n
+        );
+    }
+
     // For sparse raw output, truncate to virtual size so the
     // apparent file size matches the image's virtual size (same
     // as qemu-img convert behavior).
-    if skip_zeros && !is_structured_output {
+    if skip_zeros && !is_structured_output && flat_extent_path.is_none() {
         let f = std::fs::OpenOptions::new().write(true).open(&args.output)?;
+        f.set_len(virtual_size)?;
+    }
+
+    // For monolithicFlat output, truncate the flat extent file to
+    // the virtual size (matching qemu-img behavior).
+    if let Some((ref flat_path, _)) = flat_extent_path {
+        let f = std::fs::OpenOptions::new().write(true).open(flat_path)?;
         f.set_len(virtual_size)?;
     }
 

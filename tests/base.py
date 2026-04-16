@@ -526,6 +526,7 @@ class InstarTestBase(testtools.TestCase):
         max_guest_memory: str = None,
         grain_size: int = None,
         block_size: int = None,
+        subformat: str = None,
     ) -> tuple:
         """
         Run instar convert on an image.
@@ -542,6 +543,7 @@ class InstarTestBase(testtools.TestCase):
             qcow2_password: Password for AES-encrypted QCOW2
             luks_passphrase: Passphrase for LUKS-encrypted images
             snapshot: Snapshot ID or name to extract
+            subformat: VMDK subformat (monolithicFlat, etc.)
 
         Returns:
             tuple: (stdout, stderr, return_code)
@@ -583,6 +585,8 @@ class InstarTestBase(testtools.TestCase):
             cmd.extend(['--grain-size', str(grain_size)])
         if block_size is not None:
             cmd.extend(['--block-size', str(block_size)])
+        if subformat is not None:
+            cmd.extend(['--subformat', subformat])
         cmd.extend([str(input_path), str(output_path)])
 
         try:

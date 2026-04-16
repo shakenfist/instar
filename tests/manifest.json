@@ -254,8 +254,19 @@
             "safety": "safe",
             "run_in_ci": true,
             "skip_qemu_img": true,
-            "description": "VMDK twoGbMaxExtentFlat descriptor with two extents — must be rejected by instar (multi-extent flat is a known gap)",
-            "tags": ["vmdk", "twoGbMaxExtentFlat", "rejection", "format-coverage"],
+            "description": "VMDK twoGbMaxExtentFlat descriptor with two extents (flat files deleted, descriptor-only reference)",
+            "tags": ["vmdk", "twoGbMaxExtentFlat", "format-coverage"],
+            "generated_by": "scripts/create-vmdk-flat-testdata.sh"
+        },
+        {
+            "id": "vmdk-multi-flat",
+            "path": "custom/format-coverage/vmdk-multi-flat.vmdk",
+            "format": "vmdk",
+            "safety": "safe",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "VMDK twoGbMaxExtentFlat descriptor with 3 small extents (3 x 512 KiB, fill patterns 0xAA/0xBB/0xCC)",
+            "tags": ["vmdk", "twoGbMaxExtentFlat", "multi-extent", "format-coverage"],
             "generated_by": "scripts/create-vmdk-flat-testdata.sh"
         },
         {

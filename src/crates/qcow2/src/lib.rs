@@ -2750,28 +2750,46 @@ pub unsafe fn read_chain_virtual_cluster(
                 }
             }
             ImageFormat::VmdkDescriptor => {
-                // A VMDK monolithicFlat descriptor holds no content
-                // of its own; the flat extent lives on the data
-                // device wired up by the VMM (Phase 22b). Redirect
-                // the raw read to that device. The FLAT extent is
-                // byte-for-byte raw content so this is a plain
-                // sector read — `offset_sectors=0` was already
-                // enforced host-side.
-                let read_dev = chain_config.devices[dev_idx].data_device_idx;
-                if read_dev == 0 {
+                // A VMDK flat descriptor holds no content of its
+                // own; the flat extent(s) live on data device(s)
+                // wired up by the VMM. Walk consecutive data
+                // devices starting at data_device_idx, using each
+                // device's virtual_size (= extent size from
+                // descriptor) to map the virtual offset to the
+                // correct extent and offset within it.
+                let first_data_dev = chain_config.devices[dev_idx].data_device_idx;
+                if first_data_dev == 0 {
                     return false;
                 }
-                let data_cap = (call_table.get_input_capacity)(read_dev);
-                return read_raw_sectors(
-                    call_table,
-                    read_dev,
-                    virtual_offset,
-                    buf,
-                    chunk_size,
-                    sector_size,
-                    data_cap,
-                    bytes_read,
-                );
+
+                // Walk data devices to find which extent holds
+                // the requested virtual offset.
+                let mut remaining = virtual_offset;
+                let mut d = first_data_dev;
+                while (d as usize) < chain_config.device_count as usize {
+                    let ext_size = chain_config.devices[d as usize].virtual_size;
+                    if ext_size == 0 {
+                        break; // End of data devices
+                    }
+                    if remaining < ext_size {
+                        let data_cap = (call_table.get_input_capacity)(d);
+                        return read_raw_sectors(
+                            call_table,
+                            d,
+                            remaining,
+                            buf,
+                            chunk_size,
+                            sector_size,
+                            data_cap,
+                            bytes_read,
+                        );
+                    }
+                    remaining -= ext_size;
+                    d += 1;
+                }
+                // Offset beyond all extents: zeros
+                core::ptr::write_bytes(buf, 0, chunk_size as usize);
+                return true;
             }
             _ => {
                 return read_raw_sectors(

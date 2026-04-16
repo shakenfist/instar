@@ -210,9 +210,10 @@ provides a modular architecture with:
   use `--no-skip-zeros` for dense output. Optional compressed output
   (`-c` flag) packs clusters at sector granularity using raw deflate
   (via miniz_oxide), with fallback to uncompressed for incompressible
-  data. VMDK writer emits monolithicSparse or streamOptimized output
-  with configurable grain size (4KB-64KB via `--grain-size`, default
-  64KB). VHD writer emits dynamic VHD with configurable block size
+  data. VMDK writer emits monolithicSparse, streamOptimized, or
+  monolithicFlat output (via `--subformat monolithicFlat`) with
+  configurable grain size (4KB-64KB via `--grain-size`, default
+  64KB) for sparse/streamOptimized. VHD writer emits dynamic VHD with configurable block size
   (512KB+ via `--block-size`, default 2MB), sector bitmaps, and BAT
   rewriting (blocks aligned to output sector size with carry-buffer
   assembly to handle bitmap+data spanning sector boundaries). VHDX
@@ -301,21 +302,25 @@ Simple byte-for-byte disk representation. No metadata, just data.
 VMware Virtual Machine Disk. Supported sub-formats for input/output:
 - monolithicSparse (input, output, check)
 - streamOptimized (input, output with `-c`, check)
-- monolithicFlat (input only): two-file descriptor + flat extent.
+- monolithicFlat (input and output): two-file descriptor + flat extent.
   The VMM detects the descriptor prefix on the host, parses the
   extent line via `vmdk::parse_descriptor_extents`, validates
   the flat path against the backing-file allowlist, and opens
   the flat extent as a second virtio-block device. Guest
   operations read content from that device through the same
   `ChainConfig.data_device_idx` redirect used for QCOW2
-  external data files.
+  external data files. Output via `--subformat monolithicFlat`.
+- twoGbMaxExtentFlat (input): multi-extent flat descriptors with
+  multiple flat extent files. Each extent is opened as a separate
+  virtio-block device and reads are dispatched to the correct
+  device based on the extent offset map.
+- monolithicFlat with `parentFileNameHint=` (input): descriptors
+  referencing a parent are followed as a backing chain, enabling
+  flat images in overlay hierarchies.
 
 Detected but not yet supported for I/O:
-- monolithicFlat output
-- twoGbMaxExtentSparse / twoGbMaxExtentFlat (multi-extent, detected and
-  rejected gracefully)
-- monolithicFlat with `parentFileNameHint=` (rejected with a
-  clear error; flat-with-parent chain support is deferred)
+- twoGbMaxExtentSparse (multi-extent sparse, detected and rejected
+  gracefully)
 
 The check operation performs full structural validation: grain directory
 and grain table walk, grain offset bounds checking, compressed grain

@@ -55,6 +55,8 @@ OSLO_SKIP_IMAGES = {
     # Malformed VMDK descriptors
     'vmdk-no-extents',
     'vmdk-path-traversal',
+    # Multi-extent flat — oslo.utils cannot parse descriptor text
+    'vmdk-multi-flat',
     # Adversarial images — deliberately malformed, not suitable for
     # cross-validation against oslo.utils format_inspector
     'qcow2-compression-bomb-zlib',
