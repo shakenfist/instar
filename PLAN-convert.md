@@ -1,6 +1,6 @@
 # Plan: Implementing `instar convert` (and Prerequisites)
 
-## Status: Phase 21 Complete - Large Cluster Output
+## Status: Phase 22 Complete - VMDK monolithicFlat Input
 
 **Completed:**
 - Phase -1: Configuration file support
@@ -161,6 +161,12 @@
   buffer layout via ScratchLayout struct, lifted VMM validation
   from 64KB to 2MB, 6 integration tests. See
   PLAN-convert-phase21.md.
+- Phase 22: VMDK monolithicFlat input support. Descriptor
+  extent parser in `crates/vmdk` (22a), host-side detection
+  and device-1 wiring via the existing QCOW2 external-data-
+  file pattern (22b), guest-side `VmdkDescriptor` dispatch
+  through `data_device_idx` (22c), fixtures + integration
+  tests (22d). See PLAN-convert-phase-22-vmdk-flat.md.
 
 **Known gaps (not yet scheduled):**
 
@@ -170,14 +176,21 @@
   each cluster is treated as fully allocated if any subcluster
   is present. This is conservative and correct, but wastes I/O
   on partially-allocated clusters.
-- VMDK monolithicFlat input: Two-file format (text descriptor +
-  separate raw data file) requiring VMM-level format detection
-  changes. The descriptor starts with ASCII `# Disk DescriptorFile`
-  (no KDMV magic). Needs: extent line parsing, VMM detection of
-  text-only descriptors, two-file I/O (descriptor as device 0,
-  data as device 1 using the QCOW2 external data file pattern),
-  guest-side flat read support. Multi-extent split flat
-  (twoGbMaxExtentFlat) and flat output are further deferred.
+- VMDK `twoGbMaxExtentFlat` input (multi-extent split flat):
+  descriptor with multiple FLAT extents, each capped at 2 GiB.
+  Still a known gap after Phase 22 — single-extent
+  monolithicFlat is supported, multi-extent is rejected with a
+  clear error.
+- VMDK flat output (`-O vmdk` with `subformat=monolithicFlat`):
+  only sparse/streamOptimized/twoGbMaxExtentSparse output is
+  supported.
+- `monolithicFlat` as a backing file inside a larger backing
+  chain: the current resolver rejects any descriptor carrying
+  `parentFileNameHint=`. Supporting flat-with-parent needs
+  chain-discovery work on top of 22b's flat extent machinery.
+- (Done in Phase 22: single-extent VMDK monolithicFlat input
+  for info / check / compare / convert. See
+  PLAN-convert-phase-22-vmdk-flat.md.)
 
 *Additional qemu-img subcommands (not yet implemented):*
 - create: Create new empty disk images (raw via host-side

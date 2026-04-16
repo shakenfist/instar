@@ -303,6 +303,49 @@ pub unsafe extern "C" fn _start() -> u64 {
                 &vmdk_info,
             );
         }
+        ImageFormat::VmdkDescriptor => {
+            // VMDK monolithicFlat: the descriptor file itself is
+            // ASCII text pointing at a separate flat extent. Parse
+            // the text in-guest (the VMM refuses to do format
+            // parsing on untrusted bytes — architecture principle)
+            // and report a `vmdk` result with the extent's virtual
+            // size and the descriptor-level metadata.
+            let mut vmdk_info = VmdkInfo::new();
+
+            // `buffer` already holds the first input sector.
+            // Descriptors emitted by qemu-img are well under 512
+            // bytes, so a single sector covers the extent line.
+            // Parse legacy fields (CID, parentCID, createType).
+            vmdk::parse_descriptor(&buffer, buffer.len(), &mut vmdk_info);
+
+            // Parse the extent line to recover the virtual size.
+            // Failure here means the descriptor was malformed — the
+            // VMM would already have rejected it on the host, but
+            // we double-check so untrusted input never escapes as
+            // "virtual_size = 0".
+            if let Ok(text) = core::str::from_utf8(&buffer) {
+                if let Ok(extents) = vmdk::parse_descriptor_extents(text) {
+                    if let Some(extent) = extents.get(0) {
+                        // size_sectors is capped at u64::MAX / 512
+                        // in practice; use saturating_mul to stay
+                        // safe against malicious descriptors.
+                        result.virtual_size = extent.size_sectors.saturating_mul(512);
+                    }
+                }
+            }
+
+            (call_table.send_info_result_vmdk)(
+                format_str,
+                result.version,
+                result.virtual_size,
+                result.actual_size,
+                result.cluster_size,
+                result.flags,
+                b"\0".as_ptr(),
+                b"\0".as_ptr(),
+                &vmdk_info,
+            );
+        }
         ImageFormat::Vdi => {
             let mut vdi_info = VdiInfo::new();
 
@@ -474,6 +517,11 @@ fn format_to_str(format: ImageFormat) -> *const u8 {
         ImageFormat::Qed => b"qed\0".as_ptr(),
         ImageFormat::Iso => b"iso\0".as_ptr(),
         ImageFormat::Luks => b"luks\0".as_ptr(),
+        // VMDK monolithicFlat descriptor — reported as "vmdk" to
+        // match qemu-img info output. Full descriptor-specific
+        // info reporting (createType, extent filename) is handled
+        // in Phase 22c.
+        ImageFormat::VmdkDescriptor => b"vmdk\0".as_ptr(),
     }
 }
 

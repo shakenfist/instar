@@ -955,6 +955,296 @@ pub fn parse_hex_value(bytes: &[u8]) -> Option<u32> {
 }
 
 // ============================================================================
+// Descriptor extent parsing
+// ============================================================================
+//
+// A VMDK text descriptor contains one or more extent lines of the form:
+//
+//     RW 20971520 FLAT "foo-flat.vmdk" 0
+//
+// Fields, in order:
+//   1. access    — RW, RDONLY, or NOACCESS
+//   2. size      — extent size in sectors (decimal)
+//   3. kind      — FLAT, SPARSE, ZERO, VMFS, VMFSSPARSE
+//   4. filename  — quoted backing file (absent for ZERO extents)
+//   5. offset    — starting sector within the backing file (decimal,
+//                  optional; defaults to 0)
+//
+// The parser below is strict: any field it cannot positionally
+// identify is an error. It only parses what monolithicFlat and
+// monolithicSparse descriptors actually emit.
+
+/// Maximum number of extent lines accepted in a descriptor.
+///
+/// Real-world monolithicFlat uses a single extent;
+/// twoGbMaxExtentFlat caps at ~1TB/2GB extents per file so this
+/// limit comfortably covers any legitimate descriptor.
+pub const MAX_EXTENTS: usize = 32;
+
+/// Access mode declared on an extent line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtentAccess {
+    Rw,
+    RdOnly,
+    NoAccess,
+}
+
+/// Storage kind declared on an extent line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtentKind {
+    /// Raw sector data (monolithicFlat, twoGbMaxExtentFlat).
+    Flat,
+    /// Sparse grain-indexed extent (monolithicSparse).
+    Sparse,
+    /// Zero-filled extent (no backing file).
+    Zero,
+    /// VMFS-backed flat extent.
+    Vmfs,
+    /// VMFS-backed sparse extent.
+    VmfsSparse,
+}
+
+/// A single parsed extent line.
+#[derive(Clone, Copy, Debug)]
+pub struct VmdkExtent<'a> {
+    pub access: ExtentAccess,
+    pub size_sectors: u64,
+    pub kind: ExtentKind,
+    /// Filename as it appears in the descriptor (unquoted). Empty for
+    /// `ZERO` extents, which have no backing file.
+    pub filename: &'a str,
+    pub offset_sectors: u64,
+}
+
+/// Errors returned by [`parse_descriptor_extents`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtentParseError {
+    /// No extent lines were found in the descriptor text.
+    NoExtents,
+    /// The descriptor contains more than [`MAX_EXTENTS`] extents.
+    TooManyExtents,
+    /// An extent line is missing a required field.
+    MissingField,
+    /// The access mode token is not RW/RDONLY/NOACCESS.
+    UnknownAccess,
+    /// The extent kind token is unknown or unsupported.
+    UnknownKind,
+    /// A numeric field (size or offset) could not be parsed.
+    InvalidNumber,
+    /// The filename field is not a double-quoted string.
+    UnquotedFilename,
+    /// A non-ZERO extent has no filename.
+    MissingFilename,
+}
+
+/// Fixed-capacity result of parsing a descriptor's extent lines.
+///
+/// Borrows filename slices directly from the input descriptor text —
+/// the lifetime `'a` is tied to that input. Avoids an `alloc`
+/// dependency in the `vmdk` crate so guest binaries stay lean.
+pub struct ParsedExtents<'a> {
+    count: usize,
+    extents: [Option<VmdkExtent<'a>>; MAX_EXTENTS],
+}
+
+impl<'a> ParsedExtents<'a> {
+    const EMPTY: Option<VmdkExtent<'a>> = None;
+
+    /// Construct an empty collection.
+    pub const fn new() -> Self {
+        Self {
+            count: 0,
+            extents: [Self::EMPTY; MAX_EXTENTS],
+        }
+    }
+
+    /// Number of parsed extents.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Whether no extents were parsed.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Get extent by index.
+    pub fn get(&self, idx: usize) -> Option<&VmdkExtent<'a>> {
+        if idx < self.count {
+            self.extents[idx].as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// Iterate over the parsed extents in descriptor order.
+    pub fn iter(&self) -> impl Iterator<Item = &VmdkExtent<'a>> {
+        self.extents[..self.count].iter().filter_map(|o| o.as_ref())
+    }
+}
+
+impl Default for ParsedExtents<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Parse extent lines out of a VMDK descriptor's text.
+///
+/// Walks the descriptor line-by-line; any line whose first whitespace-
+/// separated token is `RW`, `RDONLY`, or `NOACCESS` is treated as an
+/// extent line and fully parsed. All other lines (comments, key=value
+/// pairs, DDB entries) are ignored.
+///
+/// Returns `NoExtents` if no extent lines were found — an empty
+/// descriptor is never valid for monolithicFlat.
+pub fn parse_descriptor_extents(text: &str) -> Result<ParsedExtents<'_>, ExtentParseError> {
+    let mut out = ParsedExtents::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        // Peek at the first token to decide whether this is an
+        // extent line. Non-extent lines (ddb.*, version=, CID=, etc.)
+        // are silently ignored.
+        let first = match trimmed.split_ascii_whitespace().next() {
+            Some(t) => t,
+            None => continue,
+        };
+        if !matches!(first, "RW" | "RDONLY" | "NOACCESS") {
+            continue;
+        }
+
+        if out.count >= MAX_EXTENTS {
+            return Err(ExtentParseError::TooManyExtents);
+        }
+
+        let extent = parse_extent_line(trimmed)?;
+        out.extents[out.count] = Some(extent);
+        out.count += 1;
+    }
+
+    if out.count == 0 {
+        return Err(ExtentParseError::NoExtents);
+    }
+
+    Ok(out)
+}
+
+/// Parse a single extent line into a [`VmdkExtent`].
+///
+/// Exposed for callers that already have a single line in hand
+/// (e.g., iterator-style consumers). Returns an error for any
+/// positional field that cannot be parsed.
+pub fn parse_extent_line(line: &str) -> Result<VmdkExtent<'_>, ExtentParseError> {
+    // Access token.
+    let (access_tok, rest) = split_token(line).ok_or(ExtentParseError::MissingField)?;
+    let access = match access_tok {
+        "RW" => ExtentAccess::Rw,
+        "RDONLY" => ExtentAccess::RdOnly,
+        "NOACCESS" => ExtentAccess::NoAccess,
+        _ => return Err(ExtentParseError::UnknownAccess),
+    };
+
+    // Size token (sectors).
+    let (size_tok, rest) = split_token(rest).ok_or(ExtentParseError::MissingField)?;
+    let size_sectors: u64 = parse_decimal_u64(size_tok)?;
+
+    // Kind token.
+    let (kind_tok, rest) = split_token(rest).ok_or(ExtentParseError::MissingField)?;
+    let kind = match kind_tok {
+        "FLAT" => ExtentKind::Flat,
+        "SPARSE" => ExtentKind::Sparse,
+        "ZERO" => ExtentKind::Zero,
+        "VMFS" => ExtentKind::Vmfs,
+        "VMFSSPARSE" => ExtentKind::VmfsSparse,
+        _ => return Err(ExtentParseError::UnknownKind),
+    };
+
+    // Filename (quoted). ZERO extents are allowed to omit the filename
+    // entirely.
+    let rest = rest.trim_start();
+    let (filename, rest_after_name) = if rest.is_empty() {
+        if kind == ExtentKind::Zero {
+            ("", rest)
+        } else {
+            return Err(ExtentParseError::MissingFilename);
+        }
+    } else if let Some(stripped) = rest.strip_prefix('"') {
+        let end = stripped
+            .find('"')
+            .ok_or(ExtentParseError::UnquotedFilename)?;
+        (&stripped[..end], &stripped[end + 1..])
+    } else {
+        return Err(ExtentParseError::UnquotedFilename);
+    };
+
+    if kind != ExtentKind::Zero && filename.is_empty() {
+        return Err(ExtentParseError::MissingFilename);
+    }
+
+    // Optional starting-sector offset inside the backing file.
+    // Whitespace + decimal; absence means 0.
+    let offset_sectors = {
+        let tail = rest_after_name.trim_start();
+        if tail.is_empty() {
+            0
+        } else {
+            let (off_tok, tail_after) = split_token(tail).ok_or(ExtentParseError::MissingField)?;
+            // Reject unknown trailing garbage.
+            if !tail_after.trim().is_empty() {
+                return Err(ExtentParseError::MissingField);
+            }
+            parse_decimal_u64(off_tok)?
+        }
+    };
+
+    Ok(VmdkExtent {
+        access,
+        size_sectors,
+        kind,
+        filename,
+        offset_sectors,
+    })
+}
+
+/// Split off the first whitespace-delimited token from `s`.
+/// Returns `(token, rest)` where `rest` has leading whitespace
+/// intact (the caller trims as needed).
+fn split_token(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_start();
+    if s.is_empty() {
+        return None;
+    }
+    match s.find(|c: char| c.is_ascii_whitespace()) {
+        Some(i) => Some((&s[..i], &s[i..])),
+        None => Some((s, "")),
+    }
+}
+
+/// Parse an ASCII decimal `u64`. Empty strings and any non-digit byte
+/// are errors.
+fn parse_decimal_u64(s: &str) -> Result<u64, ExtentParseError> {
+    if s.is_empty() {
+        return Err(ExtentParseError::InvalidNumber);
+    }
+    let mut out: u64 = 0;
+    for b in s.bytes() {
+        if !b.is_ascii_digit() {
+            return Err(ExtentParseError::InvalidNumber);
+        }
+        out = out
+            .checked_mul(10)
+            .and_then(|v| v.checked_add((b - b'0') as u64))
+            .ok_or(ExtentParseError::InvalidNumber)?;
+    }
+    Ok(out)
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1268,5 +1558,247 @@ mod tests {
         parse_descriptor(desc, desc.len(), &mut info);
         assert_eq!(info.cid, 1);
         assert_eq!(info.parent_cid, 0xFFFFFFFF);
+    }
+
+    // ====================================================================
+    // parse_descriptor_extents tests
+    // ====================================================================
+
+    /// Canonical monolithicFlat descriptor emitted by qemu-img.
+    const FLAT_DESCRIPTOR: &str = "\
+# Disk DescriptorFile
+version=1
+CID=abcdef01
+parentCID=ffffffff
+createType=\"monolithicFlat\"
+
+# Extent description
+RW 20971520 FLAT \"test-flat.vmdk\" 0
+
+# The Disk Data Base
+#DDB
+
+ddb.adapterType = \"ide\"
+ddb.geometry.sectors = \"63\"
+ddb.geometry.heads = \"16\"
+ddb.geometry.cylinders = \"20805\"
+";
+
+    /// Canonical monolithicSparse descriptor.
+    const SPARSE_DESCRIPTOR: &str = "\
+# Disk DescriptorFile
+version=1
+CID=12345678
+parentCID=ffffffff
+createType=\"monolithicSparse\"
+
+# Extent description
+RW 2097152 SPARSE \"test.vmdk\"
+
+# The Disk Data Base
+#DDB
+ddb.geometry.sectors = \"63\"
+";
+
+    /// twoGbMaxExtentFlat descriptor (three extents).
+    const MULTI_FLAT_DESCRIPTOR: &str = "\
+# Disk DescriptorFile
+version=1
+CID=deadbeef
+parentCID=ffffffff
+createType=\"twoGbMaxExtentFlat\"
+
+# Extent description
+RW 4194304 FLAT \"disk-f001.vmdk\" 0
+RW 4194304 FLAT \"disk-f002.vmdk\" 0
+RW 2097152 FLAT \"disk-f003.vmdk\" 0
+";
+
+    #[test]
+    fn extents_parse_monolithic_flat() {
+        let parsed = parse_descriptor_extents(FLAT_DESCRIPTOR).unwrap();
+        assert_eq!(parsed.len(), 1);
+        let e = parsed.get(0).unwrap();
+        assert_eq!(e.access, ExtentAccess::Rw);
+        assert_eq!(e.size_sectors, 20971520);
+        assert_eq!(e.kind, ExtentKind::Flat);
+        assert_eq!(e.filename, "test-flat.vmdk");
+        assert_eq!(e.offset_sectors, 0);
+    }
+
+    #[test]
+    fn extents_parse_monolithic_sparse() {
+        let parsed = parse_descriptor_extents(SPARSE_DESCRIPTOR).unwrap();
+        assert_eq!(parsed.len(), 1);
+        let e = parsed.get(0).unwrap();
+        assert_eq!(e.kind, ExtentKind::Sparse);
+        assert_eq!(e.filename, "test.vmdk");
+        // Offset is absent (monolithicSparse omits the trailing 0).
+        assert_eq!(e.offset_sectors, 0);
+    }
+
+    #[test]
+    fn extents_parse_two_gb_max_extent_flat() {
+        let parsed = parse_descriptor_extents(MULTI_FLAT_DESCRIPTOR).unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed.get(0).unwrap().filename, "disk-f001.vmdk");
+        assert_eq!(parsed.get(1).unwrap().filename, "disk-f002.vmdk");
+        assert_eq!(parsed.get(2).unwrap().filename, "disk-f003.vmdk");
+        for i in 0..3 {
+            assert_eq!(parsed.get(i).unwrap().kind, ExtentKind::Flat);
+        }
+    }
+
+    #[test]
+    fn extents_iter_returns_all_extents() {
+        let parsed = parse_descriptor_extents(MULTI_FLAT_DESCRIPTOR).unwrap();
+        let names: heapless_collect::Names = heapless_collect::Names::collect(&parsed);
+        assert_eq!(
+            names.as_slice(),
+            &["disk-f001.vmdk", "disk-f002.vmdk", "disk-f003.vmdk"]
+        );
+    }
+
+    #[test]
+    fn extents_zero_kind_allows_missing_filename() {
+        let desc = "# Disk DescriptorFile\nRW 1024 ZERO\n";
+        let parsed = parse_descriptor_extents(desc).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed.get(0).unwrap().kind, ExtentKind::Zero);
+        assert_eq!(parsed.get(0).unwrap().filename, "");
+    }
+
+    #[test]
+    fn extents_reject_unknown_kind() {
+        let desc = "RW 1024 BOGUS \"file.vmdk\"\n";
+        assert!(matches!(
+            parse_descriptor_extents(desc),
+            Err(ExtentParseError::UnknownKind)
+        ));
+    }
+
+    #[test]
+    fn extents_reject_unknown_access() {
+        let desc = "XYZ 1024 FLAT \"file.vmdk\" 0\n";
+        // XYZ isn't one of our recognized leading tokens, so the line
+        // is skipped entirely and we see NoExtents instead.
+        assert!(matches!(
+            parse_descriptor_extents(desc),
+            Err(ExtentParseError::NoExtents)
+        ));
+    }
+
+    #[test]
+    fn extents_reject_unquoted_filename() {
+        let desc = "RW 1024 FLAT file.vmdk 0\n";
+        assert!(matches!(
+            parse_descriptor_extents(desc),
+            Err(ExtentParseError::UnquotedFilename)
+        ));
+    }
+
+    #[test]
+    fn extents_reject_missing_quote_close() {
+        let desc = "RW 1024 FLAT \"file.vmdk\n";
+        assert!(matches!(
+            parse_descriptor_extents(desc),
+            Err(ExtentParseError::UnquotedFilename)
+        ));
+    }
+
+    #[test]
+    fn extents_reject_missing_filename_on_non_zero_kind() {
+        let desc = "RW 1024 FLAT\n";
+        assert!(matches!(
+            parse_descriptor_extents(desc),
+            Err(ExtentParseError::MissingFilename)
+        ));
+    }
+
+    #[test]
+    fn extents_reject_negative_or_nondecimal_size() {
+        let desc = "RW -1024 FLAT \"file.vmdk\" 0\n";
+        assert!(matches!(
+            parse_descriptor_extents(desc),
+            Err(ExtentParseError::InvalidNumber)
+        ));
+    }
+
+    #[test]
+    fn extents_reject_trailing_garbage_after_offset() {
+        let desc = "RW 1024 FLAT \"file.vmdk\" 0 extra-token\n";
+        assert!(matches!(
+            parse_descriptor_extents(desc),
+            Err(ExtentParseError::MissingField)
+        ));
+    }
+
+    #[test]
+    fn extents_reject_empty_descriptor() {
+        assert!(matches!(
+            parse_descriptor_extents(""),
+            Err(ExtentParseError::NoExtents)
+        ));
+        assert!(matches!(
+            parse_descriptor_extents("# just a comment\nversion=1\n"),
+            Err(ExtentParseError::NoExtents)
+        ));
+    }
+
+    #[test]
+    fn extents_cap_at_max_extents() {
+        // Build MAX_EXTENTS + 1 identical extent lines in a fixed-size
+        // buffer to avoid depending on `alloc` in the test harness.
+        const LINE: &[u8] = b"RW 1024 FLAT \"f.vmdk\" 0\n";
+        const LINES: usize = MAX_EXTENTS + 1;
+        let mut buf = [0u8; LINE.len() * LINES];
+        for i in 0..LINES {
+            let off = i * LINE.len();
+            buf[off..off + LINE.len()].copy_from_slice(LINE);
+        }
+        let desc = core::str::from_utf8(&buf).unwrap();
+        assert!(matches!(
+            parse_descriptor_extents(desc),
+            Err(ExtentParseError::TooManyExtents)
+        ));
+    }
+
+    #[test]
+    fn extents_ignore_comments_and_blank_lines() {
+        let desc = "\n\n# comment\n\nRW 10 FLAT \"a.vmdk\" 0\n# another\nRW 20 FLAT \"b.vmdk\" 0\n";
+        let parsed = parse_descriptor_extents(desc).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed.get(0).unwrap().size_sectors, 10);
+        assert_eq!(parsed.get(1).unwrap().size_sectors, 20);
+    }
+}
+
+#[cfg(test)]
+mod heapless_collect {
+    //! Minimal fixed-capacity collector for iterator tests, to avoid
+    //! pulling `alloc` into the crate for the sake of one assertion.
+    use super::ParsedExtents;
+
+    pub struct Names {
+        buf: [&'static str; 8],
+        len: usize,
+    }
+
+    impl Names {
+        pub fn collect(parsed: &ParsedExtents<'static>) -> Self {
+            let mut out = Names {
+                buf: [""; 8],
+                len: 0,
+            };
+            for e in parsed.iter() {
+                out.buf[out.len] = e.filename;
+                out.len += 1;
+            }
+            out
+        }
+
+        pub fn as_slice(&self) -> &[&'static str] {
+            &self.buf[..self.len]
+        }
     }
 }

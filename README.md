@@ -147,7 +147,9 @@ For QCOW2 images, check validates:
 - Cluster sizes from 512B to 2MB (cluster_bits 9-21)
 - Dirty/corrupt incompatible feature flags
 
-For VMDK images (monolithicSparse and streamOptimized), check validates:
+For VMDK images (monolithicSparse, streamOptimized, and
+monolithicFlat — the latter with two-file descriptor + flat
+extent input), check validates:
 - Full header parsing (version, capacity, grain size, flags, compression)
 - Descriptor bounds and multi-extent detection (graceful rejection)
 - Grain directory offset within file bounds

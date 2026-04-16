@@ -28,6 +28,7 @@ log = "0.4"
 env_logger = "0.11"
 guest-protocol = { path = "../../crates/guest-protocol", features = ["std"] }
 shared = { path = "../shared" }
+vmdk = { path = "../crates/vmdk" }
 toml = "0.8"
 dirs = "5.0"
 serde = { version = "1.0", features = ["derive"] }

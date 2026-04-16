@@ -68,6 +68,7 @@ The `instar convert` operation supports writing output in the following formats:
 | qcow2 (v2/v3) | Supported | Including compressed clusters (zlib and ZSTD), extended L2 entries, backing chain flattening |
 | vmdk (monolithicSparse) | Supported | Grain directory/table two-level lookup, sector-cached reads |
 | vmdk (streamOptimized) | Supported | DEFLATE decompression, footer-based GD offset resolution |
+| vmdk (monolithicFlat) | Supported | Two-file descriptor + raw flat extent; descriptor is parsed host-side for extent discovery and allowlist validation, flat extent is opened as a second virtio-block device and reads are redirected via `ChainConfig.data_device_idx`. twoGbMaxExtentFlat and monolithicFlat-with-parent are rejected with a clear error. |
 | vhd (fixed) | Supported | Raw sector reads with footer validation |
 | vhd (dynamic) | Supported | BAT-based block lookup, sector-cached reads |
 | vhdx (dynamic) | Supported | 64-bit BAT with interleaved SB entries, GUID-based metadata, CRC-32C validation |

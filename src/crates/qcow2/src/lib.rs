@@ -2749,6 +2749,30 @@ pub unsafe fn read_chain_virtual_cluster(
                     None => return false,
                 }
             }
+            ImageFormat::VmdkDescriptor => {
+                // A VMDK monolithicFlat descriptor holds no content
+                // of its own; the flat extent lives on the data
+                // device wired up by the VMM (Phase 22b). Redirect
+                // the raw read to that device. The FLAT extent is
+                // byte-for-byte raw content so this is a plain
+                // sector read — `offset_sectors=0` was already
+                // enforced host-side.
+                let read_dev = chain_config.devices[dev_idx].data_device_idx;
+                if read_dev == 0 {
+                    return false;
+                }
+                let data_cap = (call_table.get_input_capacity)(read_dev);
+                return read_raw_sectors(
+                    call_table,
+                    read_dev,
+                    virtual_offset,
+                    buf,
+                    chunk_size,
+                    sector_size,
+                    data_cap,
+                    bytes_read,
+                );
+            }
             _ => {
                 return read_raw_sectors(
                     call_table,
