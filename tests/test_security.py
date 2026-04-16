@@ -168,27 +168,26 @@ class TestSecurityFeatureDetection(InstarTestBase):
 
     def test_instar_handles_vmdk_descriptor_safely(self):
         """
-        Verify instar handles VMDK descriptors without following extent paths.
+        Verify instar rejects VMDK descriptors with non-FLAT extents.
 
         VMDK descriptor files can reference arbitrary files as extents
-        (e.g. /etc/passwd). Text-only VMDK descriptors have no binary
-        magic, so instar rejects them as unknown format — extent paths
-        are never followed.
+        (e.g. /etc/passwd). Phase 22 added host-side descriptor
+        recognition: instar now detects the ``# Disk DescriptorFile``
+        prefix and validates the descriptor before launching the guest.
+        A descriptor with a SPARSE extent (instead of FLAT) is rejected
+        outright — extent paths are never followed.
         """
         image = self.get_image('vmdk-path-traversal')
         if not image.path.exists():
             self.skipTest(f'Test image not found: {image.path}')
 
-        # Text-only descriptor has no binary magic, so instar
-        # reports "unknown" format — extent paths never followed
+        # Descriptor has a SPARSE extent pointing to /etc/passwd.
+        # The host-side pre-flight rejects non-FLAT extents, so
+        # instar exits with an error without following any paths.
         stdout, stderr, rc = self.run_instar_info(image.path)
-        self.assertEqual(
+        self.assertNotEqual(
             0, rc,
-            f'instar info failed unexpectedly: {stderr}'
-        )
-        self.assertIn(
-            'unknown', stdout.lower(),
-            f'Expected unknown format for text descriptor: {stdout}'
+            'instar should reject VMDK descriptor with non-FLAT extent'
         )
 
         # No /etc/passwd content should appear in output
@@ -198,57 +197,23 @@ class TestSecurityFeatureDetection(InstarTestBase):
             '/etc/passwd content leaked in output!'
         )
 
-        # With --unsafe-quirks, accepted as raw (still no leak)
-        stdout_u, stderr_u, rc_u = self.run_instar_info(
-            image.path, unsafe_quirks=True
-        )
-        self.assertEqual(
-            0, rc_u,
-            f'--unsafe-quirks should accept as raw: {stderr_u}'
-        )
-        self.assertIn(
-            'raw', stdout_u.lower(),
-            'Expected raw format with --unsafe-quirks'
-        )
-        combined_u = stdout_u.lower() + stderr_u.lower()
-        self.assertNotIn(
-            'root:', combined_u,
-            '/etc/passwd content leaked with --unsafe-quirks!'
-        )
-
     def test_instar_handles_vmdk_no_extents_safely(self):
         """
         Verify instar rejects VMDK descriptors with no extent declarations.
 
         A VMDK descriptor with no RW/RDONLY/NOACCESS extent lines is
-        invalid. instar should reject it as unknown format (no binary
-        magic).
+        invalid. The host-side descriptor pre-flight detects the
+        ``# Disk DescriptorFile`` prefix and rejects the file when
+        extent parsing fails.
         """
         image = self.get_image('vmdk-no-extents')
         if not image.path.exists():
             self.skipTest(f'Test image not found: {image.path}')
 
         stdout, stderr, rc = self.run_instar_info(image.path)
-        self.assertEqual(
+        self.assertNotEqual(
             0, rc,
-            f'instar info failed unexpectedly: {stderr}'
-        )
-        self.assertIn(
-            'unknown', stdout.lower(),
-            f'Expected unknown format for no-extent descriptor: {stdout}'
-        )
-
-        # With --unsafe-quirks, accepted as raw
-        stdout_u, stderr_u, rc_u = self.run_instar_info(
-            image.path, unsafe_quirks=True
-        )
-        self.assertEqual(
-            0, rc_u,
-            f'--unsafe-quirks should accept as raw: {stderr_u}'
-        )
-        self.assertIn(
-            'raw', stdout_u.lower(),
-            'Expected raw format with --unsafe-quirks'
+            'instar should reject VMDK descriptor with no extents'
         )
 
 
@@ -571,10 +536,20 @@ class TestCVEReproduction(InstarTestBase):
     # ----------------------------------------------------------------
 
     def test_cve_2022_47951_info_no_shadow_content(self):
-        """Binary VMDK with /etc/shadow extent does not leak file content."""
+        """VMDK descriptor with /etc/shadow extent does not leak file content.
+
+        The descriptor references /etc/shadow as a FLAT extent. The
+        host-side pre-flight rejects the extent path via the backing
+        allowlist, so instar exits with an error. The key security
+        property is that no /etc/shadow content appears in the output.
+        """
         image = self.get_adversarial_image('cve-2022-47951-vmdk-hostile-extent')
         stdout, stderr, rc = self.run_instar_info(image.path)
-        self.assertEqual(rc, 0, f'instar info failed: {stderr}')
+        self.assertNotEqual(
+            rc, 0,
+            'instar should reject VMDK descriptor with '
+            '/etc/shadow extent (allowlist violation)'
+        )
         self.assert_no_sensitive_content(
             stdout + stderr, 'CVE-2022-47951 info'
         )
