@@ -2460,7 +2460,6 @@ class TestConvertVmdkFlatOutput(InstarTestBase):
 
             # Step 2: raw -> flat
             flat2_desc = Path(tmpdir) / 'step2.vmdk'
-            flat2_data = Path(tmpdir) / 'step2-flat.vmdk'
             stdout, stderr, rc = self.run_instar_convert(
                 raw_path, flat2_desc,
                 output_format='vmdk',
