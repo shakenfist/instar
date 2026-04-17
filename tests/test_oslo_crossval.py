@@ -157,6 +157,7 @@ VSIZE_SKIP_FORMATS = {'iso', 'luks', 'qed'}
 KNOWN_VSIZE_DIVERGENCES = {
     'vmdk-flat-1m': (0, 1 * 1024 * 1024),
     'vmdk-flat-10m': (0, 10 * 1024 * 1024),
+    'vmdk-flat-with-parent': (0, 1 * 1024 * 1024),
 }
 
 
