@@ -29,8 +29,9 @@ First public release.
     subclusters, AES-CBC and LUKS encryption, external data
     files, snapshots, backing chains)
   - VMDK (monolithicSparse, streamOptimized with DEFLATE
-    compression, monolithicFlat two-file format with strict
-    host-side descriptor validation)
+    compression, monolithicFlat and twoGbMaxExtentFlat
+    multi-extent input, flat-in-backing-chain via
+    parentFileNameHint)
   - VHD (fixed, dynamic, differencing with backing chains)
   - VHDX (dynamic, with CRC-32C validation)
   - LUKS v1/v2 containers (PBKDF2 and Argon2id KDF,
@@ -38,7 +39,8 @@ First public release.
 - **Output formats:** raw, QCOW2 v3 (with optional zlib
   compression, configurable cluster size), VMDK
   monolithicSparse (with optional DEFLATE compression,
-  configurable grain size), VHD dynamic (configurable
+  configurable grain size) and monolithicFlat (via
+  `--subformat monolithicFlat`), VHD dynamic (configurable
   block size), VHDX dynamic (configurable block size)
 - **Security model:** all image parsing runs inside a KVM
   sandbox; the host only handles opaque byte streams
