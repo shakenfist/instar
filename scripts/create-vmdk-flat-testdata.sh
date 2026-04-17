@@ -39,9 +39,38 @@ with open(sys.argv[1], "wb") as f:
     f.write(pattern)
 ' "$OUTDIR/vmdk-flat-10m-flat.vmdk"
 
-# --- monolithicFlat with parentFileNameHint (must be rejected) ---
+# --- monolithicFlat parent (base of a flat-with-parent chain) ---
+# The parent is a simple monolithicFlat descriptor pointing at
+# its own flat extent file, filled with 0xDD. The child (below)
+# references this parent via parentFileNameHint and is filled
+# with 0xEE. Because flat extents are fully allocated, the
+# conversion output should contain only the child's data (0xEE).
+cat > "$OUTDIR/vmdk-flat-parent.vmdk" <<'EOF'
+# Disk DescriptorFile
+version=1
+CID=cafefeed
+parentCID=ffffffff
+createType="monolithicFlat"
+
+# Extent description
+RW 2048 FLAT "vmdk-flat-parent-flat.vmdk" 0
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = "4"
+ddb.adapterType = "ide"
+EOF
+python3 -c "
+import sys
+with open(sys.argv[1] + '/vmdk-flat-parent-flat.vmdk', 'wb') as f:
+    f.write(b'\xDD' * (2048 * 512))
+" "$OUTDIR"
+
+# --- monolithicFlat with parentFileNameHint ---
 # Hand-built: qemu-img won't emit parentFileNameHint for a
 # flat subformat, so we synthesise the descriptor by hand.
+# The child's flat extent is filled with 0xEE.
 cat > "$OUTDIR/vmdk-flat-with-parent.vmdk" <<'EOF'
 # Disk DescriptorFile
 version=1
@@ -62,17 +91,16 @@ ddb.geometry.heads = "16"
 ddb.geometry.sectors = "63"
 ddb.adapterType = "ide"
 EOF
-dd if=/dev/zero of="$OUTDIR/vmdk-flat-with-parent-flat.vmdk" \
-    bs=512 count=2048 status=none
+python3 -c "
+import sys
+with open(sys.argv[1] + '/vmdk-flat-with-parent-flat.vmdk', 'wb') as f:
+    f.write(b'\xEE' * (2048 * 512))
+" "$OUTDIR"
 
-# --- twoGbMaxExtentFlat multi-extent (must be rejected) ---
-# A 3 GiB input forces qemu-img to split into two extents
-# because each twoGbMaxExtent* subformat caps an extent at 2 GiB.
-# We keep only the descriptor file in testdata: the VMM's
-# descriptor resolver rejects multi-extent descriptors before
-# touching the individual flat files, so the fixtures don't
-# need them and shipping 3 GiB of flat extents to the
-# testdata repo would be wasteful.
+# --- twoGbMaxExtentFlat multi-extent (descriptor-only reference) ---
+# A 3 GiB input forces qemu-img to split into two extents.
+# We keep only the descriptor file for reference (the real
+# multi-extent test uses the hand-built small fixture below).
 rm -f "$OUTDIR/vmdk-twogb-flat.vmdk" \
       "$OUTDIR/vmdk-twogb-flat-f001.vmdk" \
       "$OUTDIR/vmdk-twogb-flat-f002.vmdk"
@@ -81,5 +109,43 @@ qemu-img create -f vmdk -o subformat=twoGbMaxExtentFlat \
 rm -f "$OUTDIR/vmdk-twogb-flat-f001.vmdk" \
       "$OUTDIR/vmdk-twogb-flat-f002.vmdk"
 
+# --- Small multi-extent flat (3 × 512 KiB = 1.5 MiB total) ---
+# Hand-built descriptor with three FLAT extents and small flat
+# files, suitable for integration testing without shipping GiBs
+# of flat data. Each flat file gets a distinct fill pattern so
+# convert/compare can verify correct extent stitching.
+cat > "$OUTDIR/vmdk-multi-flat.vmdk" <<'EOF'
+# Disk DescriptorFile
+version=1
+CID=aabbccdd
+parentCID=ffffffff
+createType="twoGbMaxExtentFlat"
+
+# Extent description
+RW 1024 FLAT "vmdk-multi-flat-f001.vmdk" 0
+RW 1024 FLAT "vmdk-multi-flat-f002.vmdk" 0
+RW 1024 FLAT "vmdk-multi-flat-f003.vmdk" 0
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = "4"
+ddb.adapterType = "ide"
+EOF
+
+# 1024 sectors × 512 bytes = 512 KiB each
+python3 -c '
+import sys
+# Extent 1: fill with 0xAA
+with open(sys.argv[1] + "/vmdk-multi-flat-f001.vmdk", "wb") as f:
+    f.write(b"\xAA" * (1024 * 512))
+# Extent 2: fill with 0xBB
+with open(sys.argv[1] + "/vmdk-multi-flat-f002.vmdk", "wb") as f:
+    f.write(b"\xBB" * (1024 * 512))
+# Extent 3: fill with 0xCC
+with open(sys.argv[1] + "/vmdk-multi-flat-f003.vmdk", "wb") as f:
+    f.write(b"\xCC" * (1024 * 512))
+' "$OUTDIR"
+
 echo "Done."
-ls -la "$OUTDIR"/vmdk-flat-* "$OUTDIR"/vmdk-twogb-flat*
+ls -la "$OUTDIR"/vmdk-flat-* "$OUTDIR"/vmdk-twogb-flat* "$OUTDIR"/vmdk-multi-flat*

@@ -55,6 +55,9 @@ OSLO_SKIP_IMAGES = {
     # Malformed VMDK descriptors
     'vmdk-no-extents',
     'vmdk-path-traversal',
+    # Flat descriptors — oslo.utils cannot parse descriptor text
+    'vmdk-multi-flat',
+    'vmdk-flat-parent',
     # Adversarial images — deliberately malformed, not suitable for
     # cross-validation against oslo.utils format_inspector
     'qcow2-compression-bomb-zlib',
@@ -154,6 +157,7 @@ VSIZE_SKIP_FORMATS = {'iso', 'luks', 'qed'}
 KNOWN_VSIZE_DIVERGENCES = {
     'vmdk-flat-1m': (0, 1 * 1024 * 1024),
     'vmdk-flat-10m': (0, 10 * 1024 * 1024),
+    'vmdk-flat-with-parent': (0, 1 * 1024 * 1024),
 }
 
 

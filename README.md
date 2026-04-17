@@ -148,8 +148,8 @@ For QCOW2 images, check validates:
 - Dirty/corrupt incompatible feature flags
 
 For VMDK images (monolithicSparse, streamOptimized, and
-monolithicFlat — the latter with two-file descriptor + flat
-extent input), check validates:
+monolithicFlat — including multi-extent twoGbMaxExtentFlat
+and flat-in-backing-chain via parentFileNameHint), check validates:
 - Full header parsing (version, capacity, grain size, flags, compression)
 - Descriptor bounds and multi-extent detection (graceful rejection)
 - Grain directory offset within file bounds
@@ -282,9 +282,10 @@ Supported output formats:
 - **raw** (default) - Flat raw output
 - **qcow2** - QCOW2 v3 output with 16-bit refcounts, configurable cluster
   size (512 bytes to 64KB, default 64KB), optional zlib compression (`-c`)
-- **vmdk** - VMDK monolithicSparse output, configurable grain size
-  (4KB-64KB, default 64KB via `--grain-size`), optional DEFLATE
-  compression (`-c`)
+- **vmdk** - VMDK monolithicSparse output (default), streamOptimized
+  with `-c`, or monolithicFlat with `--subformat monolithicFlat`.
+  Configurable grain size (4KB-64KB, default 64KB via `--grain-size`)
+  for sparse/streamOptimized output
 - **vpc** - VHD dynamic output, configurable block size (512KB+,
   default 2MB via `--block-size`)
 - **vhdx** - VHDX dynamic output, configurable block size (1MB-256MB,

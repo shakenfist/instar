@@ -2190,15 +2190,11 @@ class TestConvertVmdkToRaw(InstarTestBase):
 
 
 class TestConvertVmdkFlatRejection(InstarTestBase):
-    """Phase 22 out-of-scope VMDK flat variants are rejected.
+    """VMDK flat variants fail when referenced files are missing."""
 
-    monolithicFlat with a parent hint, and twoGbMaxExtentFlat
-    multi-extent descriptors, must be refused with a clear
-    error message rather than silently mis-processed.
-    """
-
-    def _run_convert_expecting_error(self, image_id, marker):
-        image = self.get_image(image_id)
+    def test_reject_twogb_max_extent_flat_missing_files(self):
+        """twoGbMaxExtentFlat extent files are missing."""
+        image = self.get_image('vmdk-twogb-flat')
         if not image.path.exists():
             self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
@@ -2209,27 +2205,283 @@ class TestConvertVmdkFlatRejection(InstarTestBase):
             )
             self.assertNotEqual(
                 rc, 0,
-                f'Expected convert to fail for {image_id}, '
-                f'got rc={rc} stdout={stdout}'
+                f'Expected convert to fail, got rc={rc}'
             )
             combined = (stdout or '') + (stderr or '')
             self.assertIn(
-                marker, combined,
-                f'Expected error message to mention {marker!r}, '
-                f'got: {combined}'
+                'not found', combined,
+                f'Expected "not found", got: {combined}'
             )
 
-    def test_reject_monolithic_flat_with_parent(self):
-        """parentFileNameHint triggers explicit rejection."""
-        self._run_convert_expecting_error(
-            'vmdk-flat-with-parent', 'parent hint'
+
+class TestConvertVmdkFlatChain(InstarTestBase):
+    """Phase 23b: monolithicFlat in backing chains.
+
+    The child descriptor has parentFileNameHint pointing at a
+    parent monolithicFlat. Chain discovery follows the hint,
+    validates the parent path, and wires both images as
+    devices. Because the child's flat extent is fully
+    allocated, the conversion output should match the child's
+    content (0xEE), not the parent's (0xDD).
+    """
+
+    def test_convert_flat_with_parent_chain(self):
+        """Convert flat-with-parent chain to raw."""
+        image = self.get_image('vmdk-flat-with-parent')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            stdout, stderr, rc = self.run_instar_convert(
+                image.path, Path(out.name), timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'Convert failed: rc={rc} stderr={stderr}'
+            )
+
+            data = Path(out.name).read_bytes()
+            expected_size = 2048 * 512  # 1 MiB
+            self.assertEqual(
+                len(data), expected_size,
+                f'Expected {expected_size} bytes, '
+                f'got {len(data)}'
+            )
+            # Child flat extent is filled with 0xEE; parent
+            # is 0xDD. Conversion should produce child data.
+            self.assertTrue(
+                all(b == 0xEE for b in data),
+                f'Expected all 0xEE (child data), first '
+                f'mismatch at byte '
+                f'{next((i for i, b in enumerate(data) if b != 0xEE), -1)}'
+            )
+
+    def test_info_chain_flat_with_parent(self):
+        """Info --chain discovers the flat parent chain."""
+        image = self.get_image('vmdk-flat-with-parent')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+
+        stdout, stderr, rc = self.run_instar_info(
+            image.path, chain=True
+        )
+        self.assertEqual(
+            rc, 0,
+            f'Info --chain failed: rc={rc} stderr={stderr}'
+        )
+        # Chain output should mention both images
+        self.assertIn(
+            '2 image', stdout,
+            f'Expected 2-image chain, got: {stdout}'
         )
 
-    def test_reject_twogb_max_extent_flat(self):
-        """twoGbMaxExtentFlat multi-extent is rejected."""
-        self._run_convert_expecting_error(
-            'vmdk-twogb-flat', '2 extents'
+
+class TestConvertVmdkMultiExtent(InstarTestBase):
+    """Phase 23a: twoGbMaxExtentFlat multi-extent input."""
+
+    def test_convert_multi_extent_flat_to_raw(self):
+        """Convert 3-extent flat VMDK to raw and verify content."""
+        image = self.get_image('vmdk-multi-flat')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            stdout, stderr, rc = self.run_instar_convert(
+                image.path, Path(out.name), timeout=60
+            )
+            self.assertEqual(
+                rc, 0,
+                f'Convert failed: rc={rc} stderr={stderr}'
+            )
+
+            # Verify content: 3 × 512 KiB with fill patterns
+            data = Path(out.name).read_bytes()
+            expected_size = 3 * 1024 * 512
+            self.assertEqual(
+                len(data), expected_size,
+                f'Expected {expected_size} bytes, '
+                f'got {len(data)}'
+            )
+            # Check fill patterns without comparing huge byte
+            # strings (subunit can't serialise large mismatches).
+            extent_size = 524288
+            for i, (offset, pattern) in enumerate([
+                (0, 0xAA),
+                (extent_size, 0xBB),
+                (2 * extent_size, 0xCC),
+            ]):
+                chunk = data[offset:offset + extent_size]
+                self.assertTrue(
+                    all(b == pattern for b in chunk),
+                    f'Extent {i} at offset {offset} should '
+                    f'be 0x{pattern:02X}, first mismatch at '
+                    f'byte {next((j for j, b in enumerate(chunk) if b != pattern), -1)}'
+                )
+
+    def test_info_multi_extent_flat(self):
+        """Info reports correct virtual size for multi-extent."""
+        image = self.get_image('vmdk-multi-flat')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+
+        stdout, stderr, rc = self.run_instar_info(
+            image.path, output_format='json'
         )
+        self.assertEqual(
+            rc, 0,
+            f'Info failed: rc={rc} stderr={stderr}'
+        )
+
+        info = json.loads(stdout)
+        # 3 × 1024 sectors × 512 bytes = 1572864
+        expected_vsize = 3 * 1024 * 512
+        self.assertEqual(
+            info.get('virtual-size'), expected_vsize,
+            f'Expected virtual-size {expected_vsize}, '
+            f'got {info.get("virtual-size")}'
+        )
+
+
+class TestConvertVmdkFlatOutput(InstarTestBase):
+    """Phase 23c: monolithicFlat VMDK output."""
+
+    def test_convert_raw_to_vmdk_flat(self):
+        """Convert raw input to monolithicFlat VMDK output."""
+        # Use vmdk-flat-1m as input (convert to raw, then to flat)
+        image = self.get_image('vmdk-flat-1m')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # First convert to raw
+            raw_path = Path(tmpdir) / 'input.raw'
+            stdout, stderr, rc = self.run_instar_convert(
+                image.path, raw_path, timeout=60
+            )
+            self.assertEqual(
+                rc, 0,
+                f'Raw convert failed: rc={rc} stderr={stderr}'
+            )
+
+            # Now convert raw to monolithicFlat
+            flat_desc = Path(tmpdir) / 'output.vmdk'
+            flat_data = Path(tmpdir) / 'output-flat.vmdk'
+            stdout, stderr, rc = self.run_instar_convert(
+                raw_path, flat_desc,
+                output_format='vmdk',
+                subformat='monolithicFlat',
+                timeout=60,
+            )
+            self.assertEqual(
+                rc, 0,
+                f'Flat convert failed: rc={rc} stderr={stderr}'
+            )
+
+            # Verify descriptor exists and is text
+            self.assertTrue(
+                flat_desc.exists(),
+                'Descriptor file should exist'
+            )
+            desc_text = flat_desc.read_text()
+            self.assertIn(
+                'monolithicFlat', desc_text,
+                'Descriptor should mention monolithicFlat'
+            )
+            self.assertIn(
+                'output-flat.vmdk', desc_text,
+                'Descriptor should reference flat extent file'
+            )
+
+            # Verify flat extent exists with correct size
+            self.assertTrue(
+                flat_data.exists(),
+                'Flat extent file should exist'
+            )
+            self.assertEqual(
+                flat_data.stat().st_size, 1048576,
+                'Flat extent should be 1 MiB'
+            )
+
+            # Verify content matches raw input
+            raw_data = raw_path.read_bytes()
+            flat_bytes = flat_data.read_bytes()
+            self.assertEqual(
+                raw_data, flat_bytes,
+                'Flat extent content should match raw input'
+            )
+
+    def test_convert_flat_to_vmdk_flat(self):
+        """Convert flat VMDK input to monolithicFlat VMDK output."""
+        image = self.get_image('vmdk-flat-1m')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            flat_desc = Path(tmpdir) / 'out.vmdk'
+            flat_data = Path(tmpdir) / 'out-flat.vmdk'
+            stdout, stderr, rc = self.run_instar_convert(
+                image.path, flat_desc,
+                output_format='vmdk',
+                subformat='monolithicFlat',
+                timeout=120,
+            )
+            self.assertEqual(
+                rc, 0,
+                f'Flat convert failed: rc={rc} stderr={stderr}'
+            )
+
+            self.assertTrue(flat_desc.exists())
+            self.assertTrue(flat_data.exists())
+
+            # Verify round-trip: the output flat should have
+            # same content as the original flat extent
+            orig_flat = image.path.parent / 'vmdk-flat-1m-flat.vmdk'
+            if orig_flat.exists():
+                orig_data = orig_flat.read_bytes()
+                flat_bytes = flat_data.read_bytes()
+                self.assertEqual(
+                    orig_data, flat_bytes,
+                    'Round-trip content mismatch'
+                )
+
+    def test_convert_vmdk_flat_roundtrip(self):
+        """monolithicFlat -> raw -> monolithicFlat roundtrip."""
+        image = self.get_image('vmdk-flat-1m')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Step 1: flat -> raw
+            raw_path = Path(tmpdir) / 'step1.raw'
+            stdout, stderr, rc = self.run_instar_convert(
+                image.path, raw_path, timeout=60
+            )
+            self.assertEqual(rc, 0, f'Step 1 failed: {stderr}')
+
+            # Step 2: raw -> flat
+            flat2_desc = Path(tmpdir) / 'step2.vmdk'
+            stdout, stderr, rc = self.run_instar_convert(
+                raw_path, flat2_desc,
+                output_format='vmdk',
+                subformat='monolithicFlat',
+                timeout=60,
+            )
+            self.assertEqual(rc, 0, f'Step 2 failed: {stderr}')
+
+            # Step 3: flat -> raw again
+            raw2_path = Path(tmpdir) / 'step3.raw'
+            stdout, stderr, rc = self.run_instar_convert(
+                flat2_desc, raw2_path, timeout=60
+            )
+            self.assertEqual(rc, 0, f'Step 3 failed: {stderr}')
+
+            # Verify: step1.raw == step3.raw
+            raw1 = raw_path.read_bytes()
+            raw2 = raw2_path.read_bytes()
+            self.assertEqual(
+                raw1, raw2,
+                'Round-trip content mismatch'
+            )
 
 
 class TestConvertVmdkCompare(InstarTestBase):

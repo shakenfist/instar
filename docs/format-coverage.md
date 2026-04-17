@@ -56,7 +56,7 @@ The `instar convert` operation supports writing output in the following formats:
 |---------------|--------|--------------|
 | **raw** (default) | Supported | Flat byte-for-byte output, sparse by default (`--no-skip-zeros` for dense) |
 | **qcow2** | Supported | QCOW2 v3, 16-bit refcounts, configurable cluster size (512B-64KB), optional zlib compression (`-c`) |
-| **vmdk** | Supported | monolithicSparse (default), streamOptimized with `-c`, configurable grain size (4KB-64KB via `--grain-size`) |
+| **vmdk** | Supported | monolithicSparse (default), streamOptimized with `-c`, monolithicFlat with `--subformat monolithicFlat`, configurable grain size (4KB-64KB via `--grain-size`) for sparse/streamOptimized |
 | **vpc** (VHD) | Supported | Dynamic VHD, configurable block size (512KB+ via `--block-size`, default 2MB), BAT-based allocation |
 | **vhdx** | Supported | Dynamic VHDX, configurable block size (1MB-256MB via `--block-size`, default 32MB), CRC-32C checksums |
 
@@ -68,7 +68,8 @@ The `instar convert` operation supports writing output in the following formats:
 | qcow2 (v2/v3) | Supported | Including compressed clusters (zlib and ZSTD), extended L2 entries, backing chain flattening |
 | vmdk (monolithicSparse) | Supported | Grain directory/table two-level lookup, sector-cached reads |
 | vmdk (streamOptimized) | Supported | DEFLATE decompression, footer-based GD offset resolution |
-| vmdk (monolithicFlat) | Supported | Two-file descriptor + raw flat extent; descriptor is parsed host-side for extent discovery and allowlist validation, flat extent is opened as a second virtio-block device and reads are redirected via `ChainConfig.data_device_idx`. twoGbMaxExtentFlat and monolithicFlat-with-parent are rejected with a clear error. |
+| vmdk (monolithicFlat) | Supported | Two-file descriptor + raw flat extent; descriptor is parsed host-side for extent discovery and allowlist validation, flat extent is opened as a second virtio-block device and reads are redirected via `ChainConfig.data_device_idx`. Descriptors with `parentFileNameHint` are followed as a backing chain. |
+| vmdk (twoGbMaxExtentFlat) | Supported | Multi-extent flat descriptors with multiple flat extent files; each extent is opened as a separate virtio-block device with reads dispatched by offset. |
 | vhd (fixed) | Supported | Raw sector reads with footer validation |
 | vhd (dynamic) | Supported | BAT-based block lookup, sector-cached reads |
 | vhdx (dynamic) | Supported | 64-bit BAT with interleaved SB entries, GUID-based metadata, CRC-32C validation |
@@ -147,7 +148,7 @@ The `instar convert` operation supports writing output in the following formats:
 | grain overlap | Two grains at same offset | N/A | 1-bit-per-grain bitmap | plaso-vmdk, vmdk-multi-partition |
 | compressed grain markers | Validate LBA, size, bounds | N/A | Marker structure validated per compressed GTE | vmdk-streamoptimized |
 | redundant GD (RGD) | Cross-check against primary GD | N/A | Entry-by-entry comparison when FLAG_USE_RGD set | qemu-img-created VMDKs |
-| multi-extent detection | Multiple extents in descriptor | N/A | Reports FLAG_NOT_SUPPORTED | vmdk-multi-extent |
+| multi-extent detection | Multiple extents in descriptor | N/A | Supported for twoGbMaxExtentFlat; sparse multi-extent reports FLAG_NOT_SUPPORTED | vmdk-multi-extent |
 | fragmentation | Non-sequential grain layout | N/A | Reports fragmentation count | plaso-vmdk, vmdk-multi-partition |
 
 ### RAW/Partition Table Safety Checks
@@ -465,4 +466,4 @@ are surfaced as warnings rather than blocking PRs.
 
 ---
 
-*Document updated: March 2026*
+*Document updated: April 2026*

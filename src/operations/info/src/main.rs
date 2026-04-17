@@ -325,12 +325,16 @@ pub unsafe extern "C" fn _start() -> u64 {
             // "virtual_size = 0".
             if let Ok(text) = core::str::from_utf8(&buffer) {
                 if let Ok(extents) = vmdk::parse_descriptor_extents(text) {
-                    if let Some(extent) = extents.get(0) {
-                        // size_sectors is capped at u64::MAX / 512
-                        // in practice; use saturating_mul to stay
-                        // safe against malicious descriptors.
-                        result.virtual_size = extent.size_sectors.saturating_mul(512);
+                    // Sum all extent sizes for total virtual size
+                    // (single-extent for monolithicFlat, N extents
+                    // for twoGbMaxExtentFlat).
+                    let mut total: u64 = 0;
+                    for i in 0..extents.len() {
+                        if let Some(extent) = extents.get(i) {
+                            total = total.saturating_add(extent.size_sectors.saturating_mul(512));
+                        }
                     }
+                    result.virtual_size = total;
                 }
             }
 
