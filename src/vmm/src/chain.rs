@@ -107,6 +107,19 @@ impl std::fmt::Display for ImageFormat {
     }
 }
 
+/// A single external data file (flat extent or QCOW2 external data
+/// file) to be opened as a separate virtio-block device.
+#[derive(Debug, Clone)]
+pub struct ExternalDataFile {
+    /// Absolute, validated path to the file.
+    pub path: PathBuf,
+    /// Size of this file's virtual address space contribution in
+    /// bytes. For QCOW2 external data files this equals the file
+    /// size; for VMDK flat extents it equals the extent size from
+    /// the descriptor.
+    pub extent_size: u64,
+}
+
 /// Information about a single image in the backing chain.
 ///
 /// This information comes from the sandboxed info operation.
@@ -127,19 +140,10 @@ pub struct ChainImage {
     /// Feature flags from the info operation
     #[allow(dead_code)]
     pub flags: u32,
-}
-
-/// A single external data file (flat extent or QCOW2 external data
-/// file) to be opened as a separate virtio-block device.
-#[derive(Debug, Clone)]
-pub struct ExternalDataFile {
-    /// Absolute, validated path to the file.
-    pub path: PathBuf,
-    /// Size of this file's virtual address space contribution in
-    /// bytes. For QCOW2 external data files this equals the file
-    /// size; for VMDK flat extents it equals the extent size from
-    /// the descriptor.
-    pub extent_size: u64,
+    /// External data files for this image (QCOW2 v3 external data
+    /// file or VMDK flat extent files). Inserted as separate
+    /// virtio-block devices immediately after this image's device.
+    pub external_data_files: Vec<ExternalDataFile>,
 }
 
 /// Complete backing chain for an image.
@@ -151,21 +155,12 @@ pub struct ExternalDataFile {
 pub struct BackingChain {
     /// Images in the chain, from top (index 0) to base (last index)
     pub images: Vec<ChainImage>,
-    /// External data files for the top image (QCOW2 v3 external data
-    /// file or VMDK flat extent files). Inserted as separate
-    /// virtio-block devices between the top image (device 0) and the
-    /// backing chain. Single-element for QCOW2 data files and
-    /// monolithicFlat; multi-element for twoGbMaxExtentFlat.
-    pub external_data_files: Vec<ExternalDataFile>,
 }
 
 impl BackingChain {
     /// Create a new empty backing chain
     pub fn new() -> Self {
-        Self {
-            images: Vec::new(),
-            external_data_files: Vec::new(),
-        }
+        Self { images: Vec::new() }
     }
 
     /// Get the number of images in the chain
@@ -174,9 +169,12 @@ impl BackingChain {
     }
 
     /// Total number of virtio-block devices needed for this chain.
-    /// Includes external data file devices if present.
+    /// Includes external data file devices for each image.
     pub fn total_devices(&self) -> usize {
-        self.images.len() + self.external_data_files.len()
+        self.images
+            .iter()
+            .map(|img| 1 + img.external_data_files.len())
+            .sum()
     }
 
     /// Check if the chain is empty
@@ -639,6 +637,7 @@ mod tests {
             cluster_size: 65536,
             backing_file_raw: Some("base.qcow2".to_string()),
             flags: 0,
+            external_data_files: Vec::new(),
         });
 
         chain.push(ChainImage {
@@ -649,6 +648,7 @@ mod tests {
             cluster_size: 65536,
             backing_file_raw: None,
             flags: 0,
+            external_data_files: Vec::new(),
         });
 
         assert!(!chain.is_empty());

@@ -1683,15 +1683,15 @@ fn discover_backing_chain(
                 cluster_size: 0,
                 backing_file_raw: resolved.parent_hint.clone(),
                 flags: 0,
+                external_data_files: resolved
+                    .flat_extents
+                    .iter()
+                    .map(|e| ExternalDataFile {
+                        path: e.flat_path.clone(),
+                        extent_size: e.extent_size,
+                    })
+                    .collect(),
             });
-            chain.external_data_files = resolved
-                .flat_extents
-                .iter()
-                .map(|e| ExternalDataFile {
-                    path: e.flat_path.clone(),
-                    extent_size: e.extent_size,
-                })
-                .collect();
 
             // If the descriptor has a parent hint, continue
             // chain discovery with the parent image.
@@ -1724,6 +1724,8 @@ fn discover_backing_chain(
         // only the top image's data file is discovered and passed to the guest.
         // The data file path is untrusted (parsed from the QCOW2 header
         // inside the sandbox), so we validate it against the allowlist.
+        // For the top image only, check for QCOW2 external data file.
+        let mut data_files = Vec::new();
         if chain.images.is_empty() {
             if let Some(ref data_path) = info_result.external_data_file {
                 let data_resolved = validate_backing_path(&current, data_path, security_config)?;
@@ -1735,10 +1737,10 @@ fn discover_backing_chain(
                     data_path,
                     data_resolved.display()
                 );
-                chain.external_data_files = vec![ExternalDataFile {
+                data_files.push(ExternalDataFile {
                     path: data_resolved,
                     extent_size: data_size,
-                }];
+                });
             }
         }
 
@@ -1751,6 +1753,7 @@ fn discover_backing_chain(
             cluster_size: info_result.cluster_size,
             backing_file_raw: info_result.backing_file.clone(),
             flags: info_result.flags,
+            external_data_files: data_files,
         };
 
         chain.push(chain_image);
@@ -1776,8 +1779,10 @@ fn discover_backing_chain(
 /// Print the backing chain in human-readable format
 fn print_backing_chain(chain: &BackingChain) {
     println!("Chain: {} image(s)", chain.len());
-    for data_file in &chain.external_data_files {
-        println!("  External data file: {}", data_file.path.display());
+    for image in chain.images() {
+        for data_file in &image.external_data_files {
+            println!("  External data file: {}", data_file.path.display());
+        }
     }
     for (i, image) in chain.images().iter().enumerate() {
         let backing_info = match &image.backing_file_raw {
@@ -1820,14 +1825,14 @@ fn write_chain_device_entries(
     devices_base: u64,
     start_idx: usize,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let has_data_files = !chain.external_data_files.is_empty();
     let mut idx = start_idx;
 
-    for (chain_pos, image) in chain.images().iter().enumerate() {
+    for image in chain.images().iter() {
         if idx >= MAX_CHAIN_DEVICES {
             break;
         }
 
+        let has_data_files = !image.external_data_files.is_empty();
         let dev_offset = devices_base + (idx as u64 * 32);
         guest_mem.write_obj(
             image.format.to_shared_format_u32(),
@@ -1836,11 +1841,10 @@ fn write_chain_device_entries(
         guest_mem.write_obj(image.flags, GuestAddress(dev_offset + 4))?;
         guest_mem.write_obj(image.virtual_size, GuestAddress(dev_offset + 8))?;
         guest_mem.write_obj(image.actual_size, GuestAddress(dev_offset + 16))?;
-
         guest_mem.write_obj(image.cluster_size, GuestAddress(dev_offset + 24))?;
 
-        // For top image with external data files, point to the next device
-        let data_dev_idx: u32 = if chain_pos == 0 && has_data_files {
+        // If this image has external data files, point to the next device
+        let data_dev_idx: u32 = if has_data_files {
             (idx + 1) as u32
         } else {
             0 // data is in self
@@ -1848,29 +1852,25 @@ fn write_chain_device_entries(
         guest_mem.write_obj(data_dev_idx, GuestAddress(dev_offset + 28))?;
         idx += 1;
 
-        // After the top image, insert external data file device entries
-        if chain_pos == 0 && has_data_files {
-            for data_file in &chain.external_data_files {
-                if idx >= MAX_CHAIN_DEVICES {
-                    break;
-                }
-                let data_size = std::fs::metadata(&data_file.path)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-                let dev_offset = devices_base + (idx as u64 * 32);
-                guest_mem.write_obj(
-                    ImageFormat::Raw.to_shared_format_u32(),
-                    GuestAddress(dev_offset),
-                )?;
-                guest_mem.write_obj(0u32, GuestAddress(dev_offset + 4))?;
-                // virtual_size = extent's logical size from descriptor
-                guest_mem.write_obj(data_file.extent_size, GuestAddress(dev_offset + 8))?;
-                // actual_size = file size on disk
-                guest_mem.write_obj(data_size, GuestAddress(dev_offset + 16))?;
-                guest_mem.write_obj(0u32, GuestAddress(dev_offset + 24))?;
-                guest_mem.write_obj(0u32, GuestAddress(dev_offset + 28))?;
-                idx += 1;
+        // Insert external data file device entries after this image
+        for data_file in &image.external_data_files {
+            if idx >= MAX_CHAIN_DEVICES {
+                break;
             }
+            let data_size = std::fs::metadata(&data_file.path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let dev_offset = devices_base + (idx as u64 * 32);
+            guest_mem.write_obj(
+                ImageFormat::Raw.to_shared_format_u32(),
+                GuestAddress(dev_offset),
+            )?;
+            guest_mem.write_obj(0u32, GuestAddress(dev_offset + 4))?;
+            guest_mem.write_obj(data_file.extent_size, GuestAddress(dev_offset + 8))?;
+            guest_mem.write_obj(data_size, GuestAddress(dev_offset + 16))?;
+            guest_mem.write_obj(0u32, GuestAddress(dev_offset + 24))?;
+            guest_mem.write_obj(0u32, GuestAddress(dev_offset + 28))?;
+            idx += 1;
         }
     }
 
@@ -1893,7 +1893,7 @@ fn open_chain_devices(
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let mut idx = start_idx;
 
-    for (chain_pos, image) in chain.images().iter().enumerate() {
+    for image in chain.images().iter() {
         let backing = BackingStore::open(&image.path, true, None, false)?;
         let file_size = std::fs::metadata(&image.path)?.len();
         let mmio = device_mmio_base(idx);
@@ -1918,33 +1918,31 @@ fn open_chain_devices(
         io_events.push(IoEvent::new(mmio)?);
         idx += 1;
 
-        // After the top image, insert external data file devices
-        if chain_pos == 0 {
-            for data_file in &chain.external_data_files {
-                let data_backing = BackingStore::open(&data_file.path, true, None, false)?;
-                let data_size = std::fs::metadata(&data_file.path)?.len();
-                let mmio = device_mmio_base(idx);
-                let vq = device_vq_base(idx);
-                let device = VirtioBlockDevice::new(
-                    data_backing,
-                    data_size,
-                    sector_size,
-                    true, // read-only
-                    mmio,
-                    vq,
-                );
-                debug!(
-                    "Created {} data file device [{}] at MMIO 0x{:x}: {}",
-                    label,
-                    idx,
-                    mmio,
-                    data_file.path.display()
-                );
-                let device = Arc::new(Mutex::new(device));
-                device_set.add_device(Arc::clone(&device), true);
-                io_events.push(IoEvent::new(mmio)?);
-                idx += 1;
-            }
+        // Insert external data file devices after this image
+        for data_file in &image.external_data_files {
+            let data_backing = BackingStore::open(&data_file.path, true, None, false)?;
+            let data_size = std::fs::metadata(&data_file.path)?.len();
+            let mmio = device_mmio_base(idx);
+            let vq = device_vq_base(idx);
+            let device = VirtioBlockDevice::new(
+                data_backing,
+                data_size,
+                sector_size,
+                true, // read-only
+                mmio,
+                vq,
+            );
+            debug!(
+                "Created {} data file device [{}] at MMIO 0x{:x}: {}",
+                label,
+                idx,
+                mmio,
+                data_file.path.display()
+            );
+            let device = Arc::new(Mutex::new(device));
+            device_set.add_device(Arc::clone(&device), true);
+            io_events.push(IoEvent::new(mmio)?);
+            idx += 1;
         }
     }
 
@@ -2037,6 +2035,7 @@ fn create_single_image_chain(
         cluster_size,
         backing_file_raw: None,
         flags,
+        external_data_files: Vec::new(),
     });
     chain
 }

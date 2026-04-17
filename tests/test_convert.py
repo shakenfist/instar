@@ -2190,16 +2190,11 @@ class TestConvertVmdkToRaw(InstarTestBase):
 
 
 class TestConvertVmdkFlatRejection(InstarTestBase):
-    """VMDK flat variants fail when referenced files are missing.
+    """VMDK flat variants fail when referenced files are missing."""
 
-    The descriptor resolver now accepts parent hints and
-    multi-extent descriptors, but these fixtures have missing
-    backing/extent files. The errors are about missing files,
-    not unsupported features.
-    """
-
-    def _run_convert_expecting_error(self, image_id, marker):
-        image = self.get_image(image_id)
+    def test_reject_twogb_max_extent_flat_missing_files(self):
+        """twoGbMaxExtentFlat extent files are missing."""
+        image = self.get_image('vmdk-twogb-flat')
         if not image.path.exists():
             self.skipTest(f'Image not found: {image.path}')
         self.skip_if_hash_mismatch(image)
@@ -2210,26 +2205,74 @@ class TestConvertVmdkFlatRejection(InstarTestBase):
             )
             self.assertNotEqual(
                 rc, 0,
-                f'Expected convert to fail for {image_id}, '
-                f'got rc={rc} stdout={stdout}'
+                f'Expected convert to fail, got rc={rc}'
             )
             combined = (stdout or '') + (stderr or '')
             self.assertIn(
-                marker, combined,
-                f'Expected error message to mention {marker!r}, '
-                f'got: {combined}'
+                'not found', combined,
+                f'Expected "not found", got: {combined}'
             )
 
-    def test_reject_monolithic_flat_with_parent(self):
-        """parentFileNameHint accepted, but parent file is missing."""
-        self._run_convert_expecting_error(
-            'vmdk-flat-with-parent', 'not found'
-        )
 
-    def test_reject_twogb_max_extent_flat_missing_files(self):
-        """twoGbMaxExtentFlat extents files are missing."""
-        self._run_convert_expecting_error(
-            'vmdk-twogb-flat', 'not found'
+class TestConvertVmdkFlatChain(InstarTestBase):
+    """Phase 23b: monolithicFlat in backing chains.
+
+    The child descriptor has parentFileNameHint pointing at a
+    parent monolithicFlat. Chain discovery follows the hint,
+    validates the parent path, and wires both images as
+    devices. Because the child's flat extent is fully
+    allocated, the conversion output should match the child's
+    content (0xEE), not the parent's (0xDD).
+    """
+
+    def test_convert_flat_with_parent_chain(self):
+        """Convert flat-with-parent chain to raw."""
+        image = self.get_image('vmdk-flat-with-parent')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            stdout, stderr, rc = self.run_instar_convert(
+                image.path, Path(out.name), timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'Convert failed: rc={rc} stderr={stderr}'
+            )
+
+            data = Path(out.name).read_bytes()
+            expected_size = 2048 * 512  # 1 MiB
+            self.assertEqual(
+                len(data), expected_size,
+                f'Expected {expected_size} bytes, '
+                f'got {len(data)}'
+            )
+            # Child flat extent is filled with 0xEE; parent
+            # is 0xDD. Conversion should produce child data.
+            self.assertTrue(
+                all(b == 0xEE for b in data),
+                f'Expected all 0xEE (child data), first '
+                f'mismatch at byte '
+                f'{next((i for i, b in enumerate(data) if b != 0xEE), -1)}'
+            )
+
+    def test_info_chain_flat_with_parent(self):
+        """Info --chain discovers the flat parent chain."""
+        image = self.get_image('vmdk-flat-with-parent')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+
+        stdout, stderr, rc = self.run_instar_info(
+            image.path, chain=True
+        )
+        self.assertEqual(
+            rc, 0,
+            f'Info --chain failed: rc={rc} stderr={stderr}'
+        )
+        # Chain output should mention both images
+        self.assertIn(
+            '2 image', stdout,
+            f'Expected 2-image chain, got: {stdout}'
         )
 
 

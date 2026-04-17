@@ -39,9 +39,38 @@ with open(sys.argv[1], "wb") as f:
     f.write(pattern)
 ' "$OUTDIR/vmdk-flat-10m-flat.vmdk"
 
-# --- monolithicFlat with parentFileNameHint (must be rejected) ---
+# --- monolithicFlat parent (base of a flat-with-parent chain) ---
+# The parent is a simple monolithicFlat descriptor pointing at
+# its own flat extent file, filled with 0xDD. The child (below)
+# references this parent via parentFileNameHint and is filled
+# with 0xEE. Because flat extents are fully allocated, the
+# conversion output should contain only the child's data (0xEE).
+cat > "$OUTDIR/vmdk-flat-parent.vmdk" <<'EOF'
+# Disk DescriptorFile
+version=1
+CID=cafefeed
+parentCID=ffffffff
+createType="monolithicFlat"
+
+# Extent description
+RW 2048 FLAT "vmdk-flat-parent-flat.vmdk" 0
+
+# The Disk Data Base
+#DDB
+
+ddb.virtualHWVersion = "4"
+ddb.adapterType = "ide"
+EOF
+python3 -c "
+import sys
+with open(sys.argv[1] + '/vmdk-flat-parent-flat.vmdk', 'wb') as f:
+    f.write(b'\xDD' * (2048 * 512))
+" "$OUTDIR"
+
+# --- monolithicFlat with parentFileNameHint ---
 # Hand-built: qemu-img won't emit parentFileNameHint for a
 # flat subformat, so we synthesise the descriptor by hand.
+# The child's flat extent is filled with 0xEE.
 cat > "$OUTDIR/vmdk-flat-with-parent.vmdk" <<'EOF'
 # Disk DescriptorFile
 version=1
@@ -62,8 +91,11 @@ ddb.geometry.heads = "16"
 ddb.geometry.sectors = "63"
 ddb.adapterType = "ide"
 EOF
-dd if=/dev/zero of="$OUTDIR/vmdk-flat-with-parent-flat.vmdk" \
-    bs=512 count=2048 status=none
+python3 -c "
+import sys
+with open(sys.argv[1] + '/vmdk-flat-with-parent-flat.vmdk', 'wb') as f:
+    f.write(b'\xEE' * (2048 * 512))
+" "$OUTDIR"
 
 # --- twoGbMaxExtentFlat multi-extent (descriptor-only reference) ---
 # A 3 GiB input forces qemu-img to split into two extents.
