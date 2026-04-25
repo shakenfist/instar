@@ -482,6 +482,7 @@ pub fn send_check_result(result: &shared::CheckResult) {
         result.fragmentation,
         result.flags,
         result.chain_errors,
+        result.subcluster_errors,
     );
     send_message(&msg);
 }
