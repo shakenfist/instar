@@ -891,6 +891,84 @@ pub enum ClusterLookup {
     Compressed(u64),
 }
 
+// ============================================================================
+// Extended L2 subcluster bitmap validation
+// ============================================================================
+
+/// Verdict for an extended-L2 entry's subcluster bitmap.
+/// `Ok` means the bitmap is self-consistent per the QCOW2 spec.
+/// Other variants identify which invariant failed so callers
+/// can log specifically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubclusterBitmapStatus {
+    /// Bitmap is consistent.
+    Ok,
+    /// Compressed entry but bitmap is non-zero (spec reserves 0).
+    /// We also accept the legacy QEMU pattern alloc_bits=0xFFFF_FFFF
+    /// with zero_bits=0; anything else is flagged.
+    CompressedNonZero,
+    /// `alloc_bits & zero_bits != 0` — subcluster simultaneously
+    /// allocated and all-zero without a host cluster.
+    AllocAndZeroOverlap,
+    /// `host_offset == 0 && alloc_bits != 0` — bitmap claims
+    /// subclusters are allocated but no host cluster to hold them.
+    AllocWithoutHost,
+    /// `host_offset != 0 && alloc_bits == 0 && zero_bits == 0` —
+    /// host cluster allocated but no subcluster references it.
+    HostWithoutRef,
+}
+
+/// Validate an extended-L2 entry's subcluster bitmap against the
+/// QCOW2 spec's invalid-combination rules.
+///
+/// `compressed` must be the result of `(l2e & OFLAG_COMPRESSED) != 0`.
+/// `host_offset` is `l2e & L2_OFFSET_MASK` for standard entries
+/// (ignored for compressed).
+///
+/// For compressed entries the spec requires `sc_bitmap == 0`; we
+/// also accept `alloc_bits == 0xFFFF_FFFF && zero_bits == 0` for
+/// compatibility with images produced by older QEMU versions.
+///
+/// For standard (non-compressed) entries the following are invalid:
+/// - I1: `alloc_bits & zero_bits != 0`
+/// - I2: `host_offset == 0 && alloc_bits != 0`
+/// - I3: `host_offset != 0 && alloc_bits == 0 && zero_bits == 0`
+pub fn validate_subcluster_bitmap(
+    compressed: bool,
+    host_offset: u64,
+    sc_bitmap: u64,
+) -> SubclusterBitmapStatus {
+    let alloc_bits = sc_bitmap as u32;
+    let zero_bits = (sc_bitmap >> 32) as u32;
+
+    if compressed {
+        // Spec says bitmap must be 0 for compressed entries.
+        // Accept alloc_bits == 0xFFFF_FFFF with zero_bits == 0
+        // for compatibility with older QEMU versions.
+        if sc_bitmap == 0 || (alloc_bits == 0xFFFF_FFFF && zero_bits == 0) {
+            return SubclusterBitmapStatus::Ok;
+        }
+        return SubclusterBitmapStatus::CompressedNonZero;
+    }
+
+    // I1: subcluster simultaneously allocated and all-zero
+    if alloc_bits & zero_bits != 0 {
+        return SubclusterBitmapStatus::AllocAndZeroOverlap;
+    }
+
+    // I2: bitmap claims allocated subclusters but no host cluster
+    if host_offset == 0 && alloc_bits != 0 {
+        return SubclusterBitmapStatus::AllocWithoutHost;
+    }
+
+    // I3: host cluster allocated but no subcluster references it
+    if host_offset != 0 && alloc_bits == 0 && zero_bits == 0 {
+        return SubclusterBitmapStatus::HostWithoutRef;
+    }
+
+    SubclusterBitmapStatus::Ok
+}
+
 /// State for reading QCOW2 virtual content from a device.
 ///
 /// Bundles the parsed header fields needed for L1/L2 lookup together
@@ -1926,6 +2004,152 @@ mod tests {
         assert_eq!(
             parse_header_extensions(&buf, &hdr).backing_format,
             BackingFormat::None,
+        );
+    }
+
+    // ---- validate_subcluster_bitmap ----
+
+    #[test]
+    fn sc_bitmap_ok_all_allocated() {
+        // All 32 subclusters allocated, none zeroed, host != 0
+        let bitmap: u64 = 0x00000000_FFFFFFFF;
+        assert_eq!(
+            validate_subcluster_bitmap(false, 0x10000, bitmap),
+            SubclusterBitmapStatus::Ok,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_ok_all_zero_plain() {
+        // All 32 subclusters zero-plain (l2e == 0, host == 0)
+        let bitmap: u64 = 0xFFFFFFFF_00000000;
+        assert_eq!(
+            validate_subcluster_bitmap(false, 0, bitmap),
+            SubclusterBitmapStatus::Ok,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_ok_mixed_alloc_zero() {
+        // First 16 subclusters allocated, next 8 zero, last 8 unallocated
+        // alloc_bits = 0x0000FFFF, zero_bits = 0x00FF0000
+        let alloc_bits: u64 = 0x0000FFFF;
+        let zero_bits: u64 = 0x00FF0000;
+        let bitmap = (zero_bits << 32) | alloc_bits;
+        assert_eq!(
+            validate_subcluster_bitmap(false, 0x10000, bitmap),
+            SubclusterBitmapStatus::Ok,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_ok_all_unallocated() {
+        // l2e == 0, bitmap == 0 → unallocated (not reached via validator
+        // in practice, but should be Ok)
+        assert_eq!(
+            validate_subcluster_bitmap(false, 0, 0),
+            SubclusterBitmapStatus::Ok,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_ok_host_with_zero_only() {
+        // Host cluster present, all subclusters are zero-plain
+        // (data was written then zeroed; host not yet freed)
+        let bitmap: u64 = 0xFFFFFFFF_00000000;
+        assert_eq!(
+            validate_subcluster_bitmap(false, 0x10000, bitmap),
+            SubclusterBitmapStatus::Ok,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_ok_compressed_zero() {
+        // Compressed entry with bitmap == 0 (spec-compliant)
+        assert_eq!(
+            validate_subcluster_bitmap(true, 0, 0),
+            SubclusterBitmapStatus::Ok,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_ok_compressed_legacy_qemu() {
+        // Compressed entry with alloc_bits == 0xFFFF_FFFF, zero_bits == 0
+        // (legacy QEMU pattern, accepted for compatibility)
+        let bitmap: u64 = 0x00000000_FFFFFFFF;
+        assert_eq!(
+            validate_subcluster_bitmap(true, 0, bitmap),
+            SubclusterBitmapStatus::Ok,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_err_alloc_and_zero_overlap() {
+        // I1: subcluster 0 is both allocated and zero
+        let bitmap: u64 = (1u64 << 32) | 1; // zero_bits bit 0 + alloc_bits bit 0
+        assert_eq!(
+            validate_subcluster_bitmap(false, 0x10000, bitmap),
+            SubclusterBitmapStatus::AllocAndZeroOverlap,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_err_alloc_and_zero_overlap_no_host() {
+        // I5/I1: l2e == 0, subcluster simultaneously alloc+zero
+        let bitmap: u64 = (1u64 << 32) | 1;
+        assert_eq!(
+            validate_subcluster_bitmap(false, 0, bitmap),
+            SubclusterBitmapStatus::AllocAndZeroOverlap,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_err_alloc_without_host() {
+        // I2: alloc bits set but host_offset == 0
+        let bitmap: u64 = 0x0000FFFF;
+        assert_eq!(
+            validate_subcluster_bitmap(false, 0, bitmap),
+            SubclusterBitmapStatus::AllocWithoutHost,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_err_host_without_ref() {
+        // I3: host cluster present but both bitmap halves are 0
+        assert_eq!(
+            validate_subcluster_bitmap(false, 0x10000, 0),
+            SubclusterBitmapStatus::HostWithoutRef,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_err_compressed_nonzero() {
+        // C1: compressed entry with a partial alloc bitmap
+        let bitmap: u64 = 0x0000000F;
+        assert_eq!(
+            validate_subcluster_bitmap(true, 0, bitmap),
+            SubclusterBitmapStatus::CompressedNonZero,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_err_compressed_zero_bits_set() {
+        // C1: compressed entry with zero_bits set (even though alloc_bits == 0)
+        let bitmap: u64 = 0x00010000_00000000;
+        assert_eq!(
+            validate_subcluster_bitmap(true, 0, bitmap),
+            SubclusterBitmapStatus::CompressedNonZero,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_err_compressed_legacy_plus_zero_bits() {
+        // C1: compressed entry with legacy alloc pattern BUT
+        // also has zero_bits set — should be flagged
+        let bitmap: u64 = 0x00010000_FFFFFFFF;
+        assert_eq!(
+            validate_subcluster_bitmap(true, 0, bitmap),
+            SubclusterBitmapStatus::CompressedNonZero,
         );
     }
 }
