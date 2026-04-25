@@ -382,9 +382,9 @@ with format-specific defaults and validation ranges.
   The `--extended-l2` flag switches from 8-byte to 16-byte L2 entries
   with subcluster allocation/zero bitmaps. This halves the entries per
   L2 table (requiring more L1 entries) and sets `incompatible_features`
-  bit 4 in the output header. Written data clusters are marked fully
-  allocated (`EXTENDED_L2_BITMAP_ALL_ALLOC`); compressed clusters use
-  a zero bitmap per the QCOW2 spec. The `--luks-encrypt-passphrase`
+  bit 4 in the output header. Written data clusters have their subcluster bitmaps computed by
+  scanning each 2 KiB range for zeros (`compute_subcluster_bitmap()`);
+  compressed clusters use a zero bitmap per the QCOW2 spec. The `--luks-encrypt-passphrase`
   flag enables LUKS-encrypted output (crypt_method=2). The VMM generates
   random key material and passes it to the guest at a dedicated memory
   region. The guest builds a LUKS v1 header (PBKDF2 + AFsplitter +
