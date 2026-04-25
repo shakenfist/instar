@@ -27,6 +27,9 @@ First public release.
 - **convert:** write sparse subcluster bitmaps in QCOW2 extended-L2
   output (previously all subclusters were marked as allocated even
   when some contained only zeros).
+- **qcow2 read:** narrow I/O for extended-L2 mixed subclusters when
+  sector_size ≤ subcluster_size (skips disk reads for zero and
+  unallocated subcluster ranges).
 
 ### Added (since v0.1)
 
