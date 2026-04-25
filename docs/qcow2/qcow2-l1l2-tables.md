@@ -246,6 +246,36 @@ typedef enum QCow2SubclusterType {
 - Extended L2 requires cluster_bits >= 14 (minimum 16 KB clusters)
 - Minimum subcluster size is 512 bytes
 
+### Subcluster Bitmap Validation (check operation)
+
+The `instar check` operation validates extended-L2 subcluster bitmaps
+against the QCOW2 spec's invalid-combination rules. The following
+invariants are enforced:
+
+**Standard (non-compressed) entries:**
+
+| # | Condition | Meaning |
+|---|-----------|---------|
+| I1 | `alloc_bits & zero_bits != 0` | Subcluster simultaneously allocated and all-zero |
+| I2 | `host_offset == 0 && alloc_bits != 0` | Bitmap claims subclusters allocated but no host cluster |
+| I3 | `host_offset != 0 && alloc_bits == 0 && zero_bits == 0` | Host cluster allocated but no subcluster references it |
+
+**Compressed entries:**
+
+| # | Condition | Meaning |
+|---|-----------|---------|
+| C1 | `sc_bitmap != 0` (excluding legacy `alloc_bits=0xFFFF_FFFF`) | Spec reserves all 64 bitmap bits as zero |
+
+Note: C1 accepts `alloc_bits == 0xFFFF_FFFF` with `zero_bits == 0`
+for compatibility with images produced by older QEMU versions.
+
+Each violation increments `corruptions`, `total_errors`, and
+`subcluster_errors` in the check result. Detailed messages are
+emitted via `debug_print` (visible with `--verbose`).
+
+Implemented by `qcow2::validate_subcluster_bitmap()` in the qcow2
+crate, called from the L2 walk in the check operation.
+
 ## The COPIED Flag
 
 The COPIED flag (bit 63) is an optimization hint:

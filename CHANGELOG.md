@@ -17,6 +17,14 @@ First public release.
   variables, CI workflows, and documentation; there are no
   functional changes.
 
+### Fixed
+
+- **check:** validate extended L2 subcluster bitmaps against QCOW2
+  spec invalid-combination rules. Detects: alloc/zero bit overlap,
+  alloc-without-host, host-without-ref, and compressed non-zero
+  bitmap. Reports via new `subcluster-errors` JSON field and
+  `debug_print` per variant.
+
 ### Added (since v0.1)
 
 - **New operations:** check, compare, convert (v0.1 had only

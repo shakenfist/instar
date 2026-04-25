@@ -151,15 +151,16 @@ provides a modular architecture with:
 - **core/** - Guest initialization (device init, call table)
 - **crates/qcow2/** - Shared QCOW2 format crate: header parsing, L1/L2
   cluster lookup (including extended L2 with 16-byte entries
-  and full subcluster bitmap parsing), compressed
-  cluster decompression (zlib via `decompress` feature, ZSTD via
-  `decompress-zstd` feature using ruzstd), cluster compression (behind
-  `compress` feature flag using raw deflate via miniz_oxide), refcount
-  table reading (all widths: 1/2/4/8/16/32/64-bit), compressed L2 entry
-  parsing, backing file extraction, header extension parsing,
-  incompatible feature bit validation. Supports cluster sizes from 512B
-  to 2MB (cluster_bits 9-21). Used by info, check, compare, and convert
-  operations.
+  and full subcluster bitmap parsing), subcluster bitmap validation
+  (`validate_subcluster_bitmap()` enforcing QCOW2 spec
+  invalid-combination rules), compressed cluster decompression (zlib
+  via `decompress` feature, ZSTD via `decompress-zstd` feature using
+  ruzstd), cluster compression (behind `compress` feature flag using
+  raw deflate via miniz_oxide), refcount table reading (all widths:
+  1/2/4/8/16/32/64-bit), compressed L2 entry parsing, backing file
+  extraction, header extension parsing, incompatible feature bit
+  validation. Supports cluster sizes from 512B to 2MB (cluster_bits
+  9-21). Used by info, check, compare, and convert operations.
 - **crates/raw/** - Shared RAW format crate: MBR/GPT partition table
   detection. Used by info operation.
 - **crates/vmdk/** - Shared VMDK format crate: VMDK4 binary header parsing
