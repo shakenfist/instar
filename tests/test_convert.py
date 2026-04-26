@@ -4736,6 +4736,145 @@ class TestConvertExtendedL2Output(InstarTestBase):
             self.assertEqual(rc, 0, f'stderr: {stderr}')
 
 
+class TestExtendedL2SparseOutput(InstarTestBase):
+    """Test instar's sparse subcluster bitmap output.
+
+    Phase 24b: when instar writes extended-L2 QCOW2, the
+    subcluster bitmap should mark zero 2 KiB ranges as zero
+    (not all-allocated). These tests convert with instar,
+    then validate that qemu-img accepts the bitmap encoding
+    and the logical content round-trips correctly.
+    """
+
+    def test_sparse_bitmap_roundtrip(self):
+        """Raw with mixed zero/data at subcluster granularity
+        round-trips through instar ext-l2 QCOW2."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw_in, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as raw_out:
+            # Create a 1M raw with mixed zero/data at 2KB
+            # subcluster boundaries:
+            # - subcluster 0 (0-2KB): 0xAA
+            # - subclusters 1-15 (2KB-32KB): zeros
+            # - subcluster 16 (32KB-34KB): 0xBB
+            # - subclusters 17-31 (34KB-64KB): zeros
+            # - cluster 1 (64KB-128KB): 0xCC
+            # - rest: zeros
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw_in.name, '1M'],
+                capture_output=True, check=True
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'raw', '-c',
+                 'write -P 0xAA 0 2048', raw_in.name],
+                capture_output=True, check=True
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'raw', '-c',
+                 'write -P 0xBB 32768 2048', raw_in.name],
+                capture_output=True, check=True
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'raw', '-c',
+                 'write -P 0xCC 65536 65536', raw_in.name],
+                capture_output=True, check=True
+            )
+
+            # Convert with instar (exercises
+            # compute_subcluster_bitmap)
+            stdout, stderr, rc = self.run_instar_convert(
+                Path(raw_in.name), Path(qcow2.name),
+                output_format='qcow2', extended_l2=True
+            )
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+
+            # qemu-img check must accept instar's bitmap
+            result = subprocess.run(
+                ['qemu-img', 'check', qcow2.name],
+                capture_output=True, text=True
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img check failed on instar output: '
+                f'{result.stderr}'
+            )
+
+            # Round-trip back to raw
+            stdout, stderr, rc = self.run_instar_convert(
+                Path(qcow2.name), Path(raw_out.name),
+                output_format='raw'
+            )
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+
+            # Byte-compare original vs round-tripped
+            stdout, stderr, rc = self.run_instar_compare(
+                Path(raw_in.name), Path(raw_out.name)
+            )
+            self.assertEqual(
+                rc, 0,
+                f'sparse bitmap round-trip mismatch: {stderr}'
+            )
+
+    def test_sparse_bitmap_compare_vs_raw(self):
+        """Ext-l2 QCOW2 with alternating zero/data subclusters
+        compares identical to its raw equivalent."""
+        with tempfile.NamedTemporaryFile(suffix='.raw') as raw, \
+                tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2:
+            # 128KB raw (2 clusters at 64KB): cluster 0 has
+            # alternating 2KB data / 2KB zeros (even
+            # subclusters get 0xDD, odd stay zero); cluster 1
+            # is all zeros.
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw',
+                 raw.name, '128K'],
+                capture_output=True, check=True
+            )
+            for sc in range(0, 32, 2):
+                offset = sc * 2048
+                subprocess.run(
+                    ['qemu-io', '-f', 'raw', '-c',
+                     f'write -P 0xDD {offset} 2048',
+                     raw.name],
+                    capture_output=True, check=True
+                )
+
+            # Convert with instar
+            stdout, stderr, rc = self.run_instar_convert(
+                Path(raw.name), Path(qcow2.name),
+                output_format='qcow2', extended_l2=True
+            )
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+
+            # qemu-img check must accept
+            result = subprocess.run(
+                ['qemu-img', 'check', qcow2.name],
+                capture_output=True, text=True
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img check failed: {result.stderr}'
+            )
+
+            # instar compare: QCOW2 vs raw identical
+            stdout, stderr, rc = self.run_instar_compare(
+                Path(qcow2.name), Path(raw.name)
+            )
+            self.assertEqual(
+                rc, 0,
+                f'instar compare mismatch: {stderr}'
+            )
+
+            # qemu-img compare: QCOW2 vs raw identical
+            stdout, stderr, rc = self.run_qemu_img_compare(
+                Path(qcow2.name), Path(raw.name)
+            )
+            self.assertEqual(
+                rc, 0,
+                f'qemu-img compare mismatch: {stderr}'
+            )
+
+
 class TestConvertLuksEncryptOutput(InstarTestBase):
     """Test LUKS-encrypted QCOW2 output (crypt_method=2)."""
 

@@ -284,8 +284,11 @@ QEMU Copy-On-Write version 2/3. Supported features:
 - Extended L2 entries (16-byte with subcluster bitmaps;
   full subcluster support — the bitmap is parsed for
   per-subcluster data reading: Normal, Zero, and
-  Unallocated states). Output with `--extended-l2` writes
-  16-byte L2 entries with `incompatible_features` bit 4.
+  Unallocated states; the read path narrows I/O for mixed-
+  subcluster clusters when sector_size ≤ subcluster_size).
+  Output with `--extended-l2` writes 16-byte L2 entries with
+  `incompatible_features` bit 4 and per-subcluster sparse
+  bitmaps (`compute_subcluster_bitmap()`).
 - Incompatible feature bit validation
 - External data files (metadata/data separation, chain discovery with allowlist)
 - Legacy AES-128-CBC encryption (crypt_method=1) decryption via `--qcow2-password`
