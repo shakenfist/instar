@@ -70,7 +70,7 @@ jobs:
           fi
 
       - name: Verify corpus push token
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         env:
           PUSH_TOKEN: ${{ secrets.GITLAB_TESTDATA_PUSH_TOKEN }}
         run: |
@@ -314,7 +314,7 @@ jobs:
           echo "crashes_found=$CRASHES_FOUND" >> $GITHUB_ENV
 
       - name: Push corpus to instar-testdata
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         env:
           PUSH_TOKEN: ${{ secrets.GITLAB_TESTDATA_PUSH_TOKEN }}
         run: |
