@@ -175,18 +175,19 @@
 
 **Known gaps (not yet scheduled):**
 
-*Current limitations:*
-- Extended L2 subcluster-level I/O: The 32-bit subcluster
-  allocation/zero bitmaps in extended L2 entries are parsed but
-  each cluster is treated as fully allocated if any subcluster
-  is present. This is conservative and correct, but wastes I/O
-  on partially-allocated clusters.
+*Completed limitations:*
 - (Done in Phase 22: single-extent VMDK monolithicFlat input
   for info / check / compare / convert. See
   PLAN-convert-phase-22-vmdk-flat.md.)
 - (Done in Phase 23: twoGbMaxExtentFlat multi-extent input,
   monolithicFlat in backing chains, monolithicFlat output. See
   PLAN-convert-phase-23-vmdk-flat-gaps.md.)
+- (Done in Phase 24: extended L2 subcluster-level I/O. The
+  32-bit subcluster allocation/zero bitmaps are fully handled:
+  check validates bitmap invariants (24a), convert output writes
+  sparse subcluster bitmaps (24b), and the read path issues
+  narrow I/O when sector_size ≤ subcluster_size (24c). See
+  PLAN-convert-phase-24-extended-l2-subcluster-io.md.)
 
 *Additional qemu-img subcommands (not yet implemented):*
 - create: Create new empty disk images (raw via host-side

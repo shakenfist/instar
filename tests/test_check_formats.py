@@ -974,6 +974,225 @@ class TestExtendedL2Subclusters(InstarTestBase):
             )
 
 
+class TestExtendedL2BitmapValidation(InstarTestBase):
+    """Check detects malformed extended-L2 subcluster bitmaps.
+
+    Constructs QCOW2 images with valid structure, then patches the
+    subcluster bitmap in the first L2 entry to trigger each invariant
+    violation. Asserts that check reports corruption.
+    """
+
+    # QCOW2 header field offsets
+    _L1_TABLE_OFFSET = 40   # 8 bytes, big-endian
+    _L2_OFFSET_MASK = 0x00fffffffffffe00
+
+    def _find_l2_entry_offset(self, path):
+        """Find the file offset of the first L2 entry.
+
+        Reads the L1 table offset from the header, then reads the
+        first L1 entry to get the L2 table offset. Returns the byte
+        offset of the first 16-byte extended L2 entry.
+        """
+        with open(path, 'rb') as fh:
+            # Read L1 table offset from header
+            fh.seek(self._L1_TABLE_OFFSET)
+            l1_offset = struct.unpack('>Q', fh.read(8))[0]
+
+            # Read first L1 entry (points to L2 table)
+            fh.seek(l1_offset)
+            l1e = struct.unpack('>Q', fh.read(8))[0]
+            l2_offset = l1e & self._L2_OFFSET_MASK
+
+        return l2_offset
+
+    def _make_allocated_ext_l2(self):
+        """Create an extended-L2 QCOW2 with one allocated cluster.
+
+        Returns a NamedTemporaryFile with a clean image where cluster
+        0 has data written (0xFF pattern). The first L2 entry will
+        have a valid host offset and alloc_bits set by QEMU.
+        """
+        img = tempfile.NamedTemporaryFile(suffix='.qcow2')
+        subprocess.run(
+            ['qemu-img', 'create', '-f', 'qcow2',
+             '-o', 'extended_l2=on,cluster_size=65536',
+             img.name, '1M'],
+            capture_output=True, check=True
+        )
+        # Write full cluster 0 so the L2 entry has a host offset
+        subprocess.run(
+            ['qemu-io', '-c', 'write -P 0xFF 0 65536',
+             img.name],
+            capture_output=True, check=True
+        )
+        return img
+
+    def _patch_l2_bitmap(self, path, sc_bitmap):
+        """Patch the subcluster bitmap (bytes 8-15) of the first L2
+        entry, leaving the L2 entry descriptor (bytes 0-7) intact."""
+        l2_off = self._find_l2_entry_offset(path)
+        with open(path, 'r+b') as fh:
+            fh.seek(l2_off + 8)
+            fh.write(struct.pack('>Q', sc_bitmap))
+
+    def _patch_l2_entry_and_bitmap(self, path, l2e, sc_bitmap):
+        """Patch both the L2 entry descriptor and bitmap."""
+        l2_off = self._find_l2_entry_offset(path)
+        with open(path, 'r+b') as fh:
+            fh.seek(l2_off)
+            fh.write(struct.pack('>Q', l2e))
+            fh.write(struct.pack('>Q', sc_bitmap))
+
+    def test_check_flags_alloc_and_zero_overlap(self):
+        """I1: alloc_bits & zero_bits != 0 is corruption."""
+        with self._make_allocated_ext_l2() as img:
+            # Set subcluster 0 as both allocated and zero
+            # alloc_bits = 0x00000001, zero_bits = 0x00000001
+            bitmap = (1 << 32) | 1
+            self._patch_l2_bitmap(img.name, bitmap)
+
+            stdout, stderr, rc = self.run_instar_check(
+                Path(img.name), output_format='json'
+            )
+            result = json.loads(stdout)
+            self.assertGreater(
+                result.get('corruptions', 0), 0,
+                f'alloc+zero overlap should be corruption: '
+                f'{stdout}'
+            )
+            self.assertGreater(
+                result.get('subcluster-errors', 0), 0,
+                f'should report subcluster-errors: {stdout}'
+            )
+
+    def test_check_flags_alloc_without_host(self):
+        """I2: host_offset == 0 but alloc_bits != 0 is corruption."""
+        with self._make_allocated_ext_l2() as img:
+            # Clear the L2 entry (host offset = 0) but set alloc
+            # bits in the bitmap
+            bitmap = 0x0000FFFF  # alloc_bits for subclusters 0-15
+            self._patch_l2_entry_and_bitmap(img.name, 0, bitmap)
+
+            stdout, stderr, rc = self.run_instar_check(
+                Path(img.name), output_format='json'
+            )
+            result = json.loads(stdout)
+            self.assertGreater(
+                result.get('corruptions', 0), 0,
+                f'alloc without host should be corruption: '
+                f'{stdout}'
+            )
+            self.assertGreater(
+                result.get('subcluster-errors', 0), 0,
+                f'should report subcluster-errors: {stdout}'
+            )
+
+    def test_check_flags_host_without_ref(self):
+        """I3: host_offset != 0 but alloc_bits == 0 and
+        zero_bits == 0 is corruption."""
+        with self._make_allocated_ext_l2() as img:
+            # Keep the L2 entry (host offset present) but clear
+            # both bitmap halves
+            self._patch_l2_bitmap(img.name, 0)
+
+            stdout, stderr, rc = self.run_instar_check(
+                Path(img.name), output_format='json'
+            )
+            result = json.loads(stdout)
+            self.assertGreater(
+                result.get('corruptions', 0), 0,
+                f'host without ref should be corruption: '
+                f'{stdout}'
+            )
+            self.assertGreater(
+                result.get('subcluster-errors', 0), 0,
+                f'should report subcluster-errors: {stdout}'
+            )
+
+    def test_check_flags_compressed_nonzero_bitmap(self):
+        """C1: compressed entry with any bitmap bit set is
+        corruption."""
+        with self._make_allocated_ext_l2() as img:
+            # Create a compressed cluster first via qemu-io
+            img2 = tempfile.NamedTemporaryFile(suffix='.qcow2')
+            subprocess.run(
+                ['qemu-img', 'convert', '-f', 'qcow2',
+                 '-O', 'qcow2',
+                 '-o', 'extended_l2=on,cluster_size=65536,compression_type=zlib',
+                 '-c', img.name, img2.name],
+                capture_output=True, check=True
+            )
+
+            # Patch the bitmap of the compressed entry
+            # (spec says all 64 bits must be 0)
+            bitmap = 0x0000000F  # partial alloc bits
+            self._patch_l2_bitmap(img2.name, bitmap)
+
+            stdout, stderr, rc = self.run_instar_check(
+                Path(img2.name), output_format='json'
+            )
+            result = json.loads(stdout)
+            self.assertGreater(
+                result.get('corruptions', 0), 0,
+                f'compressed non-zero bitmap should be '
+                f'corruption: {stdout}'
+            )
+            self.assertGreater(
+                result.get('subcluster-errors', 0), 0,
+                f'should report subcluster-errors: {stdout}'
+            )
+            img2.close()
+
+    def test_check_accepts_zero_plain_only(self):
+        """Ok: l2e==0 with zero_bits set and alloc_bits clear
+        should NOT be reported as corruption."""
+        with self._make_allocated_ext_l2() as img:
+            # Set L2 entry to 0 (no host offset) and bitmap to
+            # zero_bits only (zero-plain subclusters)
+            bitmap = 0xFFFFFFFF_00000000  # all zero_bits set
+            self._patch_l2_entry_and_bitmap(img.name, 0, bitmap)
+
+            stdout, stderr, rc = self.run_instar_check(
+                Path(img.name), output_format='json'
+            )
+            result = json.loads(stdout)
+            # This entry is valid — not a corruption
+            self.assertEqual(
+                result.get('subcluster-errors', 0), 0,
+                f'zero-plain entry should not be a subcluster '
+                f'error: {stdout}'
+            )
+
+    def test_check_accepts_compressed_legacy_qemu(self):
+        """Ok: compressed entry with alloc_bits=0xFFFF_FFFF and
+        zero_bits=0 (legacy QEMU pattern) should NOT be
+        corruption."""
+        with self._make_allocated_ext_l2() as img:
+            img2 = tempfile.NamedTemporaryFile(suffix='.qcow2')
+            subprocess.run(
+                ['qemu-img', 'convert', '-f', 'qcow2',
+                 '-O', 'qcow2',
+                 '-o', 'extended_l2=on,cluster_size=65536,compression_type=zlib',
+                 '-c', img.name, img2.name],
+                capture_output=True, check=True
+            )
+
+            # Patch bitmap to the legacy QEMU pattern
+            bitmap = 0x00000000_FFFFFFFF
+            self._patch_l2_bitmap(img2.name, bitmap)
+
+            stdout, stderr, rc = self.run_instar_check(
+                Path(img2.name), output_format='json'
+            )
+            result = json.loads(stdout)
+            self.assertEqual(
+                result.get('subcluster-errors', 0), 0,
+                f'compressed legacy QEMU bitmap should not be '
+                f'a subcluster error: {stdout}'
+            )
+            img2.close()
+
+
 class TestZstdBackingChain(InstarTestBase):
     """Test ZSTD-compressed QCOW2 images with backing chains.
 

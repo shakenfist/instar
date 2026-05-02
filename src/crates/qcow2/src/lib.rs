@@ -891,6 +891,84 @@ pub enum ClusterLookup {
     Compressed(u64),
 }
 
+// ============================================================================
+// Extended L2 subcluster bitmap validation
+// ============================================================================
+
+/// Verdict for an extended-L2 entry's subcluster bitmap.
+/// `Ok` means the bitmap is self-consistent per the QCOW2 spec.
+/// Other variants identify which invariant failed so callers
+/// can log specifically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubclusterBitmapStatus {
+    /// Bitmap is consistent.
+    Ok,
+    /// Compressed entry but bitmap is non-zero (spec reserves 0).
+    /// We also accept the legacy QEMU pattern alloc_bits=0xFFFF_FFFF
+    /// with zero_bits=0; anything else is flagged.
+    CompressedNonZero,
+    /// `alloc_bits & zero_bits != 0` — subcluster simultaneously
+    /// allocated and all-zero without a host cluster.
+    AllocAndZeroOverlap,
+    /// `host_offset == 0 && alloc_bits != 0` — bitmap claims
+    /// subclusters are allocated but no host cluster to hold them.
+    AllocWithoutHost,
+    /// `host_offset != 0 && alloc_bits == 0 && zero_bits == 0` —
+    /// host cluster allocated but no subcluster references it.
+    HostWithoutRef,
+}
+
+/// Validate an extended-L2 entry's subcluster bitmap against the
+/// QCOW2 spec's invalid-combination rules.
+///
+/// `compressed` must be the result of `(l2e & OFLAG_COMPRESSED) != 0`.
+/// `host_offset` is `l2e & L2_OFFSET_MASK` for standard entries
+/// (ignored for compressed).
+///
+/// For compressed entries the spec requires `sc_bitmap == 0`; we
+/// also accept `alloc_bits == 0xFFFF_FFFF && zero_bits == 0` for
+/// compatibility with images produced by older QEMU versions.
+///
+/// For standard (non-compressed) entries the following are invalid:
+/// - I1: `alloc_bits & zero_bits != 0`
+/// - I2: `host_offset == 0 && alloc_bits != 0`
+/// - I3: `host_offset != 0 && alloc_bits == 0 && zero_bits == 0`
+pub fn validate_subcluster_bitmap(
+    compressed: bool,
+    host_offset: u64,
+    sc_bitmap: u64,
+) -> SubclusterBitmapStatus {
+    let alloc_bits = sc_bitmap as u32;
+    let zero_bits = (sc_bitmap >> 32) as u32;
+
+    if compressed {
+        // Spec says bitmap must be 0 for compressed entries.
+        // Accept alloc_bits == 0xFFFF_FFFF with zero_bits == 0
+        // for compatibility with older QEMU versions.
+        if sc_bitmap == 0 || (alloc_bits == 0xFFFF_FFFF && zero_bits == 0) {
+            return SubclusterBitmapStatus::Ok;
+        }
+        return SubclusterBitmapStatus::CompressedNonZero;
+    }
+
+    // I1: subcluster simultaneously allocated and all-zero
+    if alloc_bits & zero_bits != 0 {
+        return SubclusterBitmapStatus::AllocAndZeroOverlap;
+    }
+
+    // I2: bitmap claims allocated subclusters but no host cluster
+    if host_offset == 0 && alloc_bits != 0 {
+        return SubclusterBitmapStatus::AllocWithoutHost;
+    }
+
+    // I3: host cluster allocated but no subcluster references it
+    if host_offset != 0 && alloc_bits == 0 && zero_bits == 0 {
+        return SubclusterBitmapStatus::HostWithoutRef;
+    }
+
+    SubclusterBitmapStatus::Ok
+}
+
 /// State for reading QCOW2 virtual content from a device.
 ///
 /// Bundles the parsed header fields needed for L1/L2 lookup together
@@ -1928,6 +2006,152 @@ mod tests {
             BackingFormat::None,
         );
     }
+
+    // ---- validate_subcluster_bitmap ----
+
+    #[test]
+    fn sc_bitmap_ok_all_allocated() {
+        // All 32 subclusters allocated, none zeroed, host != 0
+        let bitmap: u64 = 0x00000000_FFFFFFFF;
+        assert_eq!(
+            validate_subcluster_bitmap(false, 0x10000, bitmap),
+            SubclusterBitmapStatus::Ok,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_ok_all_zero_plain() {
+        // All 32 subclusters zero-plain (l2e == 0, host == 0)
+        let bitmap: u64 = 0xFFFFFFFF_00000000;
+        assert_eq!(
+            validate_subcluster_bitmap(false, 0, bitmap),
+            SubclusterBitmapStatus::Ok,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_ok_mixed_alloc_zero() {
+        // First 16 subclusters allocated, next 8 zero, last 8 unallocated
+        // alloc_bits = 0x0000FFFF, zero_bits = 0x00FF0000
+        let alloc_bits: u64 = 0x0000FFFF;
+        let zero_bits: u64 = 0x00FF0000;
+        let bitmap = (zero_bits << 32) | alloc_bits;
+        assert_eq!(
+            validate_subcluster_bitmap(false, 0x10000, bitmap),
+            SubclusterBitmapStatus::Ok,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_ok_all_unallocated() {
+        // l2e == 0, bitmap == 0 → unallocated (not reached via validator
+        // in practice, but should be Ok)
+        assert_eq!(
+            validate_subcluster_bitmap(false, 0, 0),
+            SubclusterBitmapStatus::Ok,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_ok_host_with_zero_only() {
+        // Host cluster present, all subclusters are zero-plain
+        // (data was written then zeroed; host not yet freed)
+        let bitmap: u64 = 0xFFFFFFFF_00000000;
+        assert_eq!(
+            validate_subcluster_bitmap(false, 0x10000, bitmap),
+            SubclusterBitmapStatus::Ok,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_ok_compressed_zero() {
+        // Compressed entry with bitmap == 0 (spec-compliant)
+        assert_eq!(
+            validate_subcluster_bitmap(true, 0, 0),
+            SubclusterBitmapStatus::Ok,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_ok_compressed_legacy_qemu() {
+        // Compressed entry with alloc_bits == 0xFFFF_FFFF, zero_bits == 0
+        // (legacy QEMU pattern, accepted for compatibility)
+        let bitmap: u64 = 0x00000000_FFFFFFFF;
+        assert_eq!(
+            validate_subcluster_bitmap(true, 0, bitmap),
+            SubclusterBitmapStatus::Ok,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_err_alloc_and_zero_overlap() {
+        // I1: subcluster 0 is both allocated and zero
+        let bitmap: u64 = (1u64 << 32) | 1; // zero_bits bit 0 + alloc_bits bit 0
+        assert_eq!(
+            validate_subcluster_bitmap(false, 0x10000, bitmap),
+            SubclusterBitmapStatus::AllocAndZeroOverlap,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_err_alloc_and_zero_overlap_no_host() {
+        // I5/I1: l2e == 0, subcluster simultaneously alloc+zero
+        let bitmap: u64 = (1u64 << 32) | 1;
+        assert_eq!(
+            validate_subcluster_bitmap(false, 0, bitmap),
+            SubclusterBitmapStatus::AllocAndZeroOverlap,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_err_alloc_without_host() {
+        // I2: alloc bits set but host_offset == 0
+        let bitmap: u64 = 0x0000FFFF;
+        assert_eq!(
+            validate_subcluster_bitmap(false, 0, bitmap),
+            SubclusterBitmapStatus::AllocWithoutHost,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_err_host_without_ref() {
+        // I3: host cluster present but both bitmap halves are 0
+        assert_eq!(
+            validate_subcluster_bitmap(false, 0x10000, 0),
+            SubclusterBitmapStatus::HostWithoutRef,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_err_compressed_nonzero() {
+        // C1: compressed entry with a partial alloc bitmap
+        let bitmap: u64 = 0x0000000F;
+        assert_eq!(
+            validate_subcluster_bitmap(true, 0, bitmap),
+            SubclusterBitmapStatus::CompressedNonZero,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_err_compressed_zero_bits_set() {
+        // C1: compressed entry with zero_bits set (even though alloc_bits == 0)
+        let bitmap: u64 = 0x00010000_00000000;
+        assert_eq!(
+            validate_subcluster_bitmap(true, 0, bitmap),
+            SubclusterBitmapStatus::CompressedNonZero,
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_err_compressed_legacy_plus_zero_bits() {
+        // C1: compressed entry with legacy alloc pattern BUT
+        // also has zero_bits set — should be flagged
+        let bitmap: u64 = 0x00010000_FFFFFFFF;
+        assert_eq!(
+            validate_subcluster_bitmap(true, 0, bitmap),
+            SubclusterBitmapStatus::CompressedNonZero,
+        );
+    }
 }
 
 /// Look up the refcount for a host cluster via two-level table indirection.
@@ -2328,86 +2552,232 @@ pub unsafe fn read_chain_virtual_cluster(
                             dev_idx as u32
                         };
 
-                        // Read the entire cluster chunk from disk first.
-                        // We read the full chunk rather than per-subcluster
-                        // because subclusters (2KB) may be smaller than the
-                        // I/O sector size (up to 64KB), which would cause
-                        // read_cluster_sectors to overrun the buffer.
-                        if host_offset != 0 {
-                            let read_offset = host_offset + intra_offset;
-                            if !read_cluster_sectors(
-                                call_table,
-                                read_dev,
-                                read_offset,
-                                buf,
-                                read_size,
-                                sector_size,
-                                bytes_read,
-                            ) {
-                                return false;
-                            }
-                            #[cfg(feature = "aes-decrypt")]
-                            if crypt_method == 1 {
-                                if let Some(key) = aes_key {
-                                    decrypt_cluster_aes_cbc(buf, read_size, virtual_offset, key);
-                                }
-                            }
-                            #[cfg(feature = "luks-decrypt")]
-                            if crypt_method == 2 {
-                                if let Some(key) = luks_key {
-                                    decrypt_cluster_aes_xts(
-                                        buf,
-                                        read_size,
-                                        host_offset + intra_offset,
-                                        key,
-                                        luks_sector_size,
-                                    );
-                                }
-                            }
-                        }
+                        // When sector_size <= subcluster_size, we can
+                        // read only the allocated subcluster runs and
+                        // skip I/O for zero/unallocated ranges. When
+                        // sector_size > subcluster_size, we must read
+                        // the full chunk first (a per-subcluster read
+                        // would read an entire sector for each 2 KB
+                        // subcluster, wasting I/O or overrunning the
+                        // buffer).
+                        if sector_size as u64 <= sc_size {
+                            // ---- NARROW I/O PATH ----
+                            // Read only allocated runs; zero-fill and
+                            // backing-chain-recurse the rest.
+                            let mut i = 0u64;
+                            while i < sc_count {
+                                let sc_idx = (sc_start + i) as u32;
+                                let is_zero = (zero_bits >> sc_idx) & 1 != 0;
+                                let is_alloc = (alloc_bits >> sc_idx) & 1 != 0;
 
-                        // Now selectively fill non-allocated subclusters:
-                        // - Zero subclusters: always zero
-                        // - Unallocated subclusters: fill from backing
-                        //   chain or zero at bottom of chain
-                        for i in 0..sc_count {
-                            let sc_idx = (sc_start + i) as u32;
-                            let is_zero = (zero_bits >> sc_idx) & 1 != 0;
-                            let is_alloc = (alloc_bits >> sc_idx) & 1 != 0;
-                            let buf_off = (i * sc_size) as usize;
-
-                            if is_zero || (!is_alloc && host_offset == 0) {
-                                core::ptr::write_bytes(buf.add(buf_off), 0, sc_size as usize);
-                            } else if !is_alloc {
-                                // Unallocated subcluster with a backing chain
-                                let remaining = chain_len - dev_offset - 1;
-                                if remaining > 0 {
-                                    if !read_chain_virtual_cluster(
-                                        call_table,
-                                        chain_start + dev_offset + 1,
-                                        remaining,
-                                        virtual_offset + i * sc_size,
-                                        buf.add(buf_off),
-                                        sc_size,
-                                        sector_size,
-                                        chain_config,
-                                        chain_states,
-                                        compressed_buf,
-                                        staging_buf,
-                                        staging_cluster_offset,
-                                        aes_key,
-                                        luks_key,
-                                        luks_sector_size,
-                                        bytes_read,
-                                    ) {
-                                        return false;
+                                if is_zero || (!is_alloc && host_offset == 0) {
+                                    // ZERO RUN: coalesce contiguous zero subclusters
+                                    let run_start = i;
+                                    let mut run_len = 1u64;
+                                    while i + run_len < sc_count {
+                                        let next = (sc_start + i + run_len) as u32;
+                                        let nz = (zero_bits >> next) & 1 != 0;
+                                        let na = (alloc_bits >> next) & 1 != 0;
+                                        if nz || (!na && host_offset == 0) {
+                                            run_len += 1;
+                                        } else {
+                                            break;
+                                        }
                                     }
+                                    core::ptr::write_bytes(
+                                        buf.add((run_start * sc_size) as usize),
+                                        0,
+                                        (run_len * sc_size) as usize,
+                                    );
+                                    i += run_len;
+                                } else if is_alloc {
+                                    // ALLOC RUN: coalesce contiguous allocated subclusters
+                                    let run_start = i;
+                                    let mut run_len = 1u64;
+                                    while i + run_len < sc_count {
+                                        let next = (sc_start + i + run_len) as u32;
+                                        let nz = (zero_bits >> next) & 1 != 0;
+                                        let na = (alloc_bits >> next) & 1 != 0;
+                                        if na && !nz {
+                                            run_len += 1;
+                                        } else {
+                                            break;
+                                        }
+                                    }
+
+                                    let run_buf_off = (run_start * sc_size) as usize;
+                                    let run_host = host_offset + (sc_start + run_start) * sc_size;
+                                    let run_bytes = run_len * sc_size;
+
+                                    if host_offset != 0 {
+                                        if !read_cluster_sectors(
+                                            call_table,
+                                            read_dev,
+                                            run_host,
+                                            buf.add(run_buf_off),
+                                            run_bytes,
+                                            sector_size,
+                                            bytes_read,
+                                        ) {
+                                            return false;
+                                        }
+                                        #[cfg(feature = "aes-decrypt")]
+                                        if crypt_method == 1 {
+                                            if let Some(key) = aes_key {
+                                                let virt = virtual_offset + run_start * sc_size;
+                                                decrypt_cluster_aes_cbc(
+                                                    buf.add(run_buf_off),
+                                                    run_bytes,
+                                                    virt,
+                                                    key,
+                                                );
+                                            }
+                                        }
+                                        #[cfg(feature = "luks-decrypt")]
+                                        if crypt_method == 2 {
+                                            if let Some(key) = luks_key {
+                                                decrypt_cluster_aes_xts(
+                                                    buf.add(run_buf_off),
+                                                    run_bytes,
+                                                    run_host,
+                                                    key,
+                                                    luks_sector_size,
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        // host_offset == 0 but alloc set:
+                                        // malformed (I2), zero-fill defensively
+                                        core::ptr::write_bytes(
+                                            buf.add(run_buf_off),
+                                            0,
+                                            run_bytes as usize,
+                                        );
+                                    }
+                                    i += run_len;
                                 } else {
-                                    // Bottom of chain: zero
-                                    core::ptr::write_bytes(buf.add(buf_off), 0, sc_size as usize);
+                                    // UNALLOC: recurse into backing chain
+                                    let buf_off = (i * sc_size) as usize;
+                                    let remaining = chain_len - dev_offset - 1;
+                                    if remaining > 0 {
+                                        if !read_chain_virtual_cluster(
+                                            call_table,
+                                            chain_start + dev_offset + 1,
+                                            remaining,
+                                            virtual_offset + i * sc_size,
+                                            buf.add(buf_off),
+                                            sc_size,
+                                            sector_size,
+                                            chain_config,
+                                            chain_states,
+                                            compressed_buf,
+                                            staging_buf,
+                                            staging_cluster_offset,
+                                            aes_key,
+                                            luks_key,
+                                            luks_sector_size,
+                                            bytes_read,
+                                        ) {
+                                            return false;
+                                        }
+                                    } else {
+                                        // Bottom of chain: zero
+                                        core::ptr::write_bytes(
+                                            buf.add(buf_off),
+                                            0,
+                                            sc_size as usize,
+                                        );
+                                    }
+                                    i += 1;
                                 }
                             }
-                            // Allocated subclusters: already read above
+                        } else {
+                            // ---- WIDE I/O PATH ----
+                            // Sector is larger than a subcluster; read the
+                            // full chunk, decrypt, then selectively overwrite.
+                            if host_offset != 0 {
+                                let read_offset = host_offset + intra_offset;
+                                if !read_cluster_sectors(
+                                    call_table,
+                                    read_dev,
+                                    read_offset,
+                                    buf,
+                                    read_size,
+                                    sector_size,
+                                    bytes_read,
+                                ) {
+                                    return false;
+                                }
+                                #[cfg(feature = "aes-decrypt")]
+                                if crypt_method == 1 {
+                                    if let Some(key) = aes_key {
+                                        decrypt_cluster_aes_cbc(
+                                            buf,
+                                            read_size,
+                                            virtual_offset,
+                                            key,
+                                        );
+                                    }
+                                }
+                                #[cfg(feature = "luks-decrypt")]
+                                if crypt_method == 2 {
+                                    if let Some(key) = luks_key {
+                                        decrypt_cluster_aes_xts(
+                                            buf,
+                                            read_size,
+                                            host_offset + intra_offset,
+                                            key,
+                                            luks_sector_size,
+                                        );
+                                    }
+                                }
+                            }
+
+                            // Selectively fill non-allocated subclusters:
+                            // zero subclusters get zeroed, unallocated
+                            // subclusters come from backing chain or zero
+                            // at bottom of chain.
+                            for i in 0..sc_count {
+                                let sc_idx = (sc_start + i) as u32;
+                                let is_zero = (zero_bits >> sc_idx) & 1 != 0;
+                                let is_alloc = (alloc_bits >> sc_idx) & 1 != 0;
+                                let buf_off = (i * sc_size) as usize;
+
+                                if is_zero || (!is_alloc && host_offset == 0) {
+                                    core::ptr::write_bytes(buf.add(buf_off), 0, sc_size as usize);
+                                } else if !is_alloc {
+                                    let remaining = chain_len - dev_offset - 1;
+                                    if remaining > 0 {
+                                        if !read_chain_virtual_cluster(
+                                            call_table,
+                                            chain_start + dev_offset + 1,
+                                            remaining,
+                                            virtual_offset + i * sc_size,
+                                            buf.add(buf_off),
+                                            sc_size,
+                                            sector_size,
+                                            chain_config,
+                                            chain_states,
+                                            compressed_buf,
+                                            staging_buf,
+                                            staging_cluster_offset,
+                                            aes_key,
+                                            luks_key,
+                                            luks_sector_size,
+                                            bytes_read,
+                                        ) {
+                                            return false;
+                                        }
+                                    } else {
+                                        core::ptr::write_bytes(
+                                            buf.add(buf_off),
+                                            0,
+                                            sc_size as usize,
+                                        );
+                                    }
+                                }
+                                // Allocated subclusters: already read above
+                            }
                         }
                         return true;
                     }

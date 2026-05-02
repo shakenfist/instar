@@ -2526,18 +2526,68 @@ unsafe fn check_qcow2(
                     result.clusters_checked += 1;
 
                     if l2e == 0 {
+                        // For extended L2, l2e==0 can still have a meaningful
+                        // bitmap (e.g. zero-plain subclusters with zero_bits
+                        // set). Validate the bitmap before skipping.
+                        if hdr.extended_l2 && sc_bitmap != 0 {
+                            let status = qcow2::validate_subcluster_bitmap(
+                                false, // not compressed (l2e == 0)
+                                0,     // host_offset == 0
+                                sc_bitmap,
+                            );
+                            if status != qcow2::SubclusterBitmapStatus::Ok {
+                                result.corruptions += 1;
+                                result.total_errors += 1;
+                                result.subcluster_errors += 1;
+                                (call_table.debug_print)(match status {
+                                    qcow2::SubclusterBitmapStatus::AllocAndZeroOverlap => {
+                                        b"check: ext-L2 bitmap alloc+zero overlap (l2e=0)\n\0"
+                                            .as_ptr()
+                                    }
+                                    qcow2::SubclusterBitmapStatus::AllocWithoutHost => {
+                                        b"check: ext-L2 bitmap alloc without host (l2e=0)\n\0"
+                                            .as_ptr()
+                                    }
+                                    _ => b"check: ext-L2 bitmap invalid (l2e=0)\n\0".as_ptr(),
+                                });
+                            }
+                        }
                         continue;
                     }
 
                     let compressed = (l2e & qcow2::OFLAG_COMPRESSED) != 0;
 
-                    // Validate: compressed entries must not have
-                    // a non-trivial subcluster bitmap
-                    if compressed && hdr.extended_l2 {
-                        let alloc_bits = sc_bitmap as u32;
-                        if alloc_bits != 0 && alloc_bits != 0xFFFF_FFFF {
+                    // Validate extended-L2 subcluster bitmap
+                    if hdr.extended_l2 {
+                        let host_offset_for_check = if compressed {
+                            0 // Not meaningful for compressed; validator ignores it.
+                        } else {
+                            l2e & qcow2::L2_OFFSET_MASK
+                        };
+                        let status = qcow2::validate_subcluster_bitmap(
+                            compressed,
+                            host_offset_for_check,
+                            sc_bitmap,
+                        );
+                        if status != qcow2::SubclusterBitmapStatus::Ok {
                             result.corruptions += 1;
                             result.total_errors += 1;
+                            result.subcluster_errors += 1;
+                            (call_table.debug_print)(match status {
+                                qcow2::SubclusterBitmapStatus::CompressedNonZero => {
+                                    b"check: ext-L2 compressed non-zero bitmap\n\0".as_ptr()
+                                }
+                                qcow2::SubclusterBitmapStatus::AllocAndZeroOverlap => {
+                                    b"check: ext-L2 bitmap alloc+zero overlap\n\0".as_ptr()
+                                }
+                                qcow2::SubclusterBitmapStatus::AllocWithoutHost => {
+                                    b"check: ext-L2 bitmap alloc without host\n\0".as_ptr()
+                                }
+                                qcow2::SubclusterBitmapStatus::HostWithoutRef => {
+                                    b"check: ext-L2 bitmap host without ref\n\0".as_ptr()
+                                }
+                                _ => b"check: ext-L2 bitmap invalid\n\0".as_ptr(),
+                            });
                         }
                     }
 

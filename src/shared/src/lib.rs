@@ -933,8 +933,8 @@ impl CallTable {
     /// Magic value indicating a valid call table
     pub const MAGIC: u32 = 0x494D4147; // "IMAG"
 
-    /// Current ABI version (bumped: added send_compare_result)
-    pub const VERSION: u32 = 12;
+    /// Current ABI version (bumped: added subcluster_errors to CheckResult)
+    pub const VERSION: u32 = 13;
 }
 
 // ============================================================================
@@ -1448,6 +1448,9 @@ pub struct CheckResult {
     /// Number of backing chain validation errors
     pub chain_errors: u32,
 
+    /// Number of subcluster bitmap validation errors (extended L2)
+    pub subcluster_errors: u32,
+
     /// Image end offset (highest byte offset in use)
     pub image_end_offset: u64,
 
@@ -1508,6 +1511,7 @@ impl CheckResult {
             leaks: 0,
             refcount_errors: 0,
             chain_errors: 0,
+            subcluster_errors: 0,
             image_end_offset: 0,
             clusters_checked: 0,
             clusters_allocated: 0,

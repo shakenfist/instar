@@ -1814,11 +1814,39 @@ unsafe fn write_qcow2_header(
 // Shared QCOW2 output helpers
 // ================================================================
 
-/// Extended L2 bitmap for a fully-allocated, non-zero cluster:
-/// all 32 subclusters allocated (bits 0-31 = 1), none zero
-/// (bits 32-63 = 0). Used when writing data clusters with
-/// --extended-l2.
-const EXTENDED_L2_BITMAP_ALL_ALLOC: u64 = 0x00000000_FFFFFFFFu64;
+/// Scan a cluster buffer and return the extended-L2 bitmap
+/// that marks each subcluster's allocation/zero status.
+///
+/// For each of the 32 subclusters: if the range is all
+/// zeros, set the zero bit (bit i+32); otherwise set the
+/// alloc bit (bit i).
+///
+/// Returns `(bitmap, any_data)`. When `!any_data` the caller
+/// may skip writing the cluster entirely (the outer all-zeros
+/// path already handles this; this is a safety net).
+///
+/// # Safety
+///
+/// `buf` must point to at least `cluster_size` readable bytes.
+/// `cluster_size` must be divisible by 32.
+unsafe fn compute_subcluster_bitmap(buf: *const u8, cluster_size: u64) -> (u64, bool) {
+    let sc_size = (cluster_size / 32) as usize;
+    let mut alloc_bits: u32 = 0;
+    let mut zero_bits: u32 = 0;
+
+    for i in 0..32u32 {
+        let offset = i as usize * sc_size;
+        if shared::is_all_zeros_ptr(buf.add(offset), sc_size) {
+            zero_bits |= 1 << i;
+        } else {
+            alloc_bits |= 1 << i;
+        }
+    }
+
+    let bitmap = ((zero_bits as u64) << 32) | (alloc_bits as u64);
+    let any_data = alloc_bits != 0;
+    (bitmap, any_data)
+}
 
 /// Computed layout parameters for QCOW2 output. Used by both
 /// uncompressed and compressed paths to avoid duplicating the
@@ -2306,6 +2334,16 @@ unsafe fn convert_to_qcow2(
                 );
             }
 
+            // Compute subcluster bitmap from plaintext data
+            // BEFORE encryption (encrypted data is not meaningful
+            // for zero detection).
+            let sc_bitmap = if layout.extended_l2 {
+                let (bm, _) = compute_subcluster_bitmap(buf_data, layout.cluster_size);
+                bm
+            } else {
+                0
+            };
+
             // Encrypt data cluster if LUKS output is enabled
             if luks_encrypt_key_len > 0 {
                 let physical_sector = data_offset / 512;
@@ -2342,7 +2380,7 @@ unsafe fn convert_to_qcow2(
             let entry_byte = l2_entry_idx * layout.l2_entry_size as usize;
             shared::write_be_u64(l2_slice, entry_byte, data_offset | (1u64 << 63));
             if layout.extended_l2 {
-                shared::write_be_u64(l2_slice, entry_byte + 8, EXTENDED_L2_BITMAP_ALL_ALLOC);
+                shared::write_be_u64(l2_slice, entry_byte + 8, sc_bitmap);
             }
 
             clusters_done += 1;
@@ -2742,7 +2780,8 @@ unsafe fn convert_to_qcow2_compressed(
                 let entry_byte = l2_entry_idx * layout.l2_entry_size as usize;
                 shared::write_be_u64(l2_slice, entry_byte, write_pos | (1u64 << 63));
                 if layout.extended_l2 {
-                    shared::write_be_u64(l2_slice, entry_byte + 8, EXTENDED_L2_BITMAP_ALL_ALLOC);
+                    let (sc_bitmap, _) = compute_subcluster_bitmap(buf_data, layout.cluster_size);
+                    shared::write_be_u64(l2_slice, entry_byte + 8, sc_bitmap);
                 }
 
                 inc_refcount(

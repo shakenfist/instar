@@ -502,6 +502,7 @@ pub fn info_result_message_with_luks(
 /// * `fragmentation` - Fragmentation percentage (0-100)
 /// * `flags` - Status flags bitfield
 /// * `chain_errors` - Number of backing chain validation errors
+/// * `subcluster_errors` - Number of subcluster bitmap validation errors
 #[allow(clippy::too_many_arguments)]
 pub fn check_result_message(
     format: &str,
@@ -515,6 +516,7 @@ pub fn check_result_message(
     fragmentation: u32,
     flags: u32,
     chain_errors: u32,
+    subcluster_errors: u32,
 ) -> guest_::GuestMessage {
     let mut msg = guest_::GuestMessage::default();
     msg.level = guest_::Level::Info;
@@ -531,6 +533,7 @@ pub fn check_result_message(
     result.fragmentation = fragmentation;
     result.flags = flags;
     result.chain_errors = chain_errors;
+    result.subcluster_errors = subcluster_errors;
 
     msg.payload = Some(guest_::GuestMessage_::Payload::CheckResult(result));
     msg

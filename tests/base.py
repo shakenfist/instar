@@ -434,6 +434,7 @@ class InstarTestBase(testtools.TestCase):
         strict: bool = False,
         quiet: bool = False,
         luks_passphrase: str = None,
+        sector_size: int = None,
     ) -> tuple:
         """
         Run instar compare on two images.
@@ -461,6 +462,8 @@ class InstarTestBase(testtools.TestCase):
             cmd.append('--quiet')
         if luks_passphrase is not None:
             cmd.extend(['--luks-passphrase', luks_passphrase])
+        if sector_size is not None:
+            cmd.extend(['--sector-size', str(sector_size)])
         cmd.extend([str(image1_path), str(image2_path)])
 
         try:
@@ -527,6 +530,7 @@ class InstarTestBase(testtools.TestCase):
         grain_size: int = None,
         block_size: int = None,
         subformat: str = None,
+        sector_size: int = None,
     ) -> tuple:
         """
         Run instar convert on an image.
@@ -587,6 +591,8 @@ class InstarTestBase(testtools.TestCase):
             cmd.extend(['--block-size', str(block_size)])
         if subformat is not None:
             cmd.extend(['--subformat', subformat])
+        if sector_size is not None:
+            cmd.extend(['--sector-size', str(sector_size)])
         cmd.extend([str(input_path), str(output_path)])
 
         try:

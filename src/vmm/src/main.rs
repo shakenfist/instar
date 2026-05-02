@@ -3778,6 +3778,13 @@ fn print_check_result(
             println!("{} backing chain error(s) were found.", result.chain_errors);
         }
 
+        if result.subcluster_errors > 0 {
+            println!(
+                "{} subcluster bitmap error(s) were found.",
+                result.subcluster_errors
+            );
+        }
+
         // Show statistics
         if result.clusters_checked > 0 || result.clusters_allocated > 0 {
             println!(
@@ -3838,7 +3845,8 @@ fn print_check_result_json(
     // QCOW2-specific flags (dirty bit = unclean shutdown, corrupt bit = known corruption)
     println!("    \"dirty\": {},", is_dirty);
     println!("    \"corrupt\": {},", is_corrupt);
-    println!("    \"chain-errors\": {}", result.chain_errors);
+    println!("    \"chain-errors\": {},", result.chain_errors);
+    println!("    \"subcluster-errors\": {}", result.subcluster_errors);
     println!("}}");
 }
 

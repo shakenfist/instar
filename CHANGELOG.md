@@ -17,6 +17,20 @@ First public release.
   variables, CI workflows, and documentation; there are no
   functional changes.
 
+### Fixed
+
+- **check:** validate extended L2 subcluster bitmaps against QCOW2
+  spec invalid-combination rules. Detects: alloc/zero bit overlap,
+  alloc-without-host, host-without-ref, and compressed non-zero
+  bitmap. Reports via new `subcluster-errors` JSON field and
+  `debug_print` per variant.
+- **convert:** write sparse subcluster bitmaps in QCOW2 extended-L2
+  output (previously all subclusters were marked as allocated even
+  when some contained only zeros).
+- **qcow2 read:** narrow I/O for extended-L2 mixed subclusters when
+  sector_size ≤ subcluster_size (skips disk reads for zero and
+  unallocated subcluster ranges).
+
 ### Added (since v0.1)
 
 - **New operations:** check, compare, convert (v0.1 had only

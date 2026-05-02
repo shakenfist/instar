@@ -173,6 +173,8 @@ message CheckResultMessage {
   uint32 flags = 10;
   // Number of backing chain validation errors
   uint32 chain_errors = 11;
+  // Number of subcluster bitmap validation errors (extended L2)
+  uint32 subcluster_errors = 12;
 }
 
 // Image comparison result (from compare operation)
