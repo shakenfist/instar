@@ -1118,8 +1118,7 @@ class TestExtendedL2BitmapValidation(InstarTestBase):
             subprocess.run(
                 ['qemu-img', 'convert', '-f', 'qcow2',
                  '-O', 'qcow2',
-                 '-o', 'extended_l2=on,cluster_size=65536,'
-                       'compression_type=zlib',
+                 '-o', 'extended_l2=on,cluster_size=65536,compression_type=zlib',
                  '-c', img.name, img2.name],
                 capture_output=True, check=True
             )
@@ -1173,8 +1172,7 @@ class TestExtendedL2BitmapValidation(InstarTestBase):
             subprocess.run(
                 ['qemu-img', 'convert', '-f', 'qcow2',
                  '-O', 'qcow2',
-                 '-o', 'extended_l2=on,cluster_size=65536,'
-                       'compression_type=zlib',
+                 '-o', 'extended_l2=on,cluster_size=65536,compression_type=zlib',
                  '-c', img.name, img2.name],
                 capture_output=True, check=True
             )
