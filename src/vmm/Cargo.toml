@@ -16,12 +16,12 @@ name = "instar"
 path = "src/main.rs"
 
 [dependencies]
-kvm-ioctls = "0.19"
-kvm-bindings = "0.10"
+kvm-ioctls = "0.24"
+kvm-bindings = "0.14"
 vm-memory = { version = "0.15", features = ["backend-mmap"] }
-virtio-queue = "0.14"
+virtio-queue = "0.17"
 virtio-bindings = "0.2"
-vmm-sys-util = "0.12"
+vmm-sys-util = "0.15"
 clap = { version = "4.5", features = ["derive"] }
 libc = "0.2"
 log = "0.4"

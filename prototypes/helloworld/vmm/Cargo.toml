@@ -4,5 +4,5 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-kvm-ioctls = "0.19"
-kvm-bindings = "0.10"
+kvm-ioctls = "0.24"
+kvm-bindings = "0.14"
