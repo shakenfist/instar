@@ -6,7 +6,7 @@
 //!
 //! # Current Status
 //!
-//! As of kvm-ioctls 0.19, the `KVM_GET_STATS_FD` ioctl is not yet exposed
+//! As of kvm-ioctls 0.24, the `KVM_GET_STATS_FD` ioctl is not yet exposed
 //! through the safe Rust API. This module provides:
 //!
 //! 1. Capability checking to detect if the kernel supports binary stats
@@ -140,7 +140,7 @@ impl KvmStatsChecker {
     pub fn display_status(&self) {
         if self.supported {
             debug!("KVM binary statistics: supported");
-            debug!("  Note: kvm-ioctls 0.19 does not expose stats_fd() yet.");
+            debug!("  Note: kvm-ioctls 0.24 does not expose stats_fd() yet.");
             debug!("  Using internal VMM counters for statistics.");
         } else {
             debug!("KVM binary statistics: not supported by kernel");
