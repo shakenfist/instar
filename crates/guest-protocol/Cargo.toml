@@ -12,7 +12,7 @@ std = []  # Enable for VMM parsing support
 
 [dependencies]
 micropb = { version = "0.6", features = ["container-heapless-0-8"] }
-heapless = "0.8"
+heapless = "0.9"
 
 [build-dependencies]
 micropb-gen = "0.6"
