@@ -32,6 +32,36 @@
         "micropb-gen"
       ],
       "groupName": "micropb"
+    },
+    {
+      "description": "Group rust-vmm crates: virtio-queue is built on vm-memory, kvm-ioctls re-exports types from kvm-bindings, and vmm-sys-util is a shared substrate. Major bumps from the rust-vmm org typically land together and fail to compile individually.",
+      "matchPackageNames": [
+        "kvm-ioctls",
+        "kvm-bindings",
+        "vm-memory",
+        "virtio-queue",
+        "virtio-bindings",
+        "vmm-sys-util"
+      ],
+      "groupName": "rust-vmm"
+    },
+    {
+      "description": "Group RustCrypto hash/MAC/KDF crates: sha1, sha2, hmac, and pbkdf2 share the digest and crypto-common trait crates and must be major-bumped together to keep trait versions consistent.",
+      "matchPackageNames": [
+        "sha1",
+        "sha2",
+        "hmac",
+        "pbkdf2"
+      ],
+      "groupName": "rustcrypto-hashes"
+    },
+    {
+      "description": "Group RustCrypto cipher crates: aes and xts-mode share the cipher trait crate. aes is currently pinned to <0.9 because xts-mode 0.5 is stuck at cipher 0.4; when we unpin or replace xts-mode they will need to bump together.",
+      "matchPackageNames": [
+        "aes",
+        "xts-mode"
+      ],
+      "groupName": "rustcrypto-ciphers"
     }
   ],
   "minimumReleaseAge": "3 days",
