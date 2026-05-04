@@ -32,6 +32,14 @@
         "micropb-gen"
       ],
       "groupName": "micropb"
+    },
+    {
+      "description": "Group kvm-ioctls and kvm-bindings: kvm-ioctls exposes kvm-bindings types in its public API, so they must be bumped together.",
+      "matchPackageNames": [
+        "kvm-ioctls",
+        "kvm-bindings"
+      ],
+      "groupName": "kvm-rust-vmm"
     }
   ],
   "minimumReleaseAge": "3 days",
