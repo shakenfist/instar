@@ -8,7 +8,7 @@ license = "Apache-2.0"
 [dependencies]
 kvm-ioctls = "0.24"
 kvm-bindings = "0.14"
-vm-memory = { version = "0.15", features = ["backend-mmap"] }
+vm-memory = { version = "0.18", features = ["backend-mmap"] }
 virtio-queue = "0.17"
 virtio-bindings = "0.2"
 vmm-sys-util = "0.12"
