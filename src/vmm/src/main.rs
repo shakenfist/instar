@@ -4791,8 +4791,8 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 
     // Write LUKS encrypt config fields (offsets 368-391)
     if let Some(ref encrypt_pp) = luks_encrypt_passphrase {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
 
         let key_bytes: usize = 64; // AES-256-XTS
         let stripes: usize = 4000;
