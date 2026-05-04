@@ -13,7 +13,7 @@ path = "src/main.rs"
 kvm-ioctls = "0.19"
 kvm-bindings = "0.10"
 vm-memory = { version = "0.15", features = ["backend-mmap"] }
-virtio-queue = "0.14"
+virtio-queue = "0.17"
 virtio-bindings = "0.2"
 vmm-sys-util = "0.12"
 clap = { version = "4.5", features = ["derive"] }
