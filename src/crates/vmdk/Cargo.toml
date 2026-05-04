@@ -14,7 +14,7 @@ decompress = ["miniz_oxide"]
 
 [dependencies]
 shared = { path = "../../shared" }
-miniz_oxide = { version = "0.8", default-features = false, optional = true }
+miniz_oxide = { version = "0.9", default-features = false, optional = true }
 
 [lib]
 # No std, this is used by bare-metal code
