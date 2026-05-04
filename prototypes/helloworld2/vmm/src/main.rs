@@ -70,10 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create guest memory using vm-memory crate
     // This handles mmap allocation, page alignment, and cleanup automatically
     let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
-    println!(
-        "Allocated {} bytes of guest memory via vm-memory",
-        GUEST_MEM_SIZE
-    );
+    println!("Allocated {GUEST_MEM_SIZE} bytes of guest memory via vm-memory");
 
     // Get the memory region for KVM registration
     let region = guest_mem.find_region(GuestAddress(0)).unwrap();
@@ -94,15 +91,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Set up GDT using vm-memory's type-safe writes
     setup_gdt(&guest_mem)?;
-    println!("Set up GDT at 0x{:x}", GDT_BASE);
+    println!("Set up GDT at 0x{GDT_BASE:x}");
 
     // Set up page tables
     setup_page_tables(&guest_mem)?;
-    println!("Set up page tables at 0x{:x}", PAGE_TABLE_BASE);
+    println!("Set up page tables at 0x{PAGE_TABLE_BASE:x}");
 
     // Load guest code
     guest_mem.write_slice(&guest_code, GuestAddress(GUEST_CODE_BASE))?;
-    println!("Loaded guest code at 0x{:x}", GUEST_CODE_BASE);
+    println!("Loaded guest code at 0x{GUEST_CODE_BASE:x}");
 
     // Create vCPU
     let mut vcpu = vm.create_vcpu(0)?;
@@ -139,7 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     std::io::Write::flush(&mut std::io::stdout())?;
                 } else {
-                    println!("IO OUT: port=0x{:x}, data={:?}", port, data);
+                    println!("IO OUT: port=0x{port:x}, data={data:?}");
                 }
             }
             VcpuExit::IoIn(port, data) => {
@@ -160,11 +157,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
-                println!("VM Entry Failed! reason=0x{:x}, cpu={}", reason, cpu);
+                println!("VM Entry Failed! reason=0x{reason:x}, cpu={cpu}");
                 break;
             }
             exit => {
-                println!("Unexpected VM exit: {:?}", exit);
+                println!("Unexpected VM exit: {exit:?}");
                 break;
             }
         }

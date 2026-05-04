@@ -47,14 +47,25 @@ if [ -d "$PROJECT_ROOT/src" ]; then
 
     # Run clippy on all workspace crates except no_main guest binaries
     echo "Running clippy on workspace..."
-    run_in_docker "src" cargo clippy --workspace \
-        --exclude core \
-        --exclude info \
-        --exclude copy \
-        --exclude check \
-        --exclude compare \
-        --exclude convert \
-        -- -D warnings || FAILED=1
+    if [ "$MODE" = "fix" ]; then
+        run_in_docker "src" cargo clippy --fix --allow-dirty --allow-staged --allow-no-vcs --workspace \
+            --exclude core \
+            --exclude info \
+            --exclude copy \
+            --exclude check \
+            --exclude compare \
+            --exclude convert \
+            -- -D warnings || FAILED=1
+    else
+        run_in_docker "src" cargo clippy --workspace \
+            --exclude core \
+            --exclude info \
+            --exclude copy \
+            --exclude check \
+            --exclude compare \
+            --exclude convert \
+            -- -D warnings || FAILED=1
+    fi
 
     echo ""
 fi
@@ -84,10 +95,20 @@ for prototype in prototypes/helloworld prototypes/helloworld2 \
     # Run clippy only on VMM crate (guest crates are no_std and don't support clippy)
     # Note: info uses "instar" as the package name, others use "vmm"
     echo "Running clippy on vmm..."
-    if [ "$prototype" = "prototypes/info" ]; then
-        run_in_docker "$prototype" cargo clippy -p instar -- -D warnings || FAILED=1
+    if [ "$MODE" = "fix" ]; then
+        if [ "$prototype" = "prototypes/info" ]; then
+            run_in_docker "$prototype" cargo clippy --fix --allow-dirty --allow-staged --allow-no-vcs \
+                -p instar -- -D warnings || FAILED=1
+        else
+            run_in_docker "$prototype" cargo clippy --fix --allow-dirty --allow-staged --allow-no-vcs \
+                -p vmm -- -D warnings || FAILED=1
+        fi
     else
-        run_in_docker "$prototype" cargo clippy -p vmm -- -D warnings || FAILED=1
+        if [ "$prototype" = "prototypes/info" ]; then
+            run_in_docker "$prototype" cargo clippy -p instar -- -D warnings || FAILED=1
+        else
+            run_in_docker "$prototype" cargo clippy -p vmm -- -D warnings || FAILED=1
+        fi
     fi
 
     echo ""

@@ -238,7 +238,7 @@ impl std::fmt::Display for ChainError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ChainError::InfoOperationFailed(msg) => {
-                write!(f, "Info operation failed: {}", msg)
+                write!(f, "Info operation failed: {msg}")
             }
             ChainError::BackingFileNotAllowed { path, allowed } => {
                 write!(
@@ -252,19 +252,15 @@ impl std::fmt::Display for ChainError {
                 write!(f, "Backing file not found: {}", path.display())
             }
             ChainError::ChainTooDeep { depth, max } => {
-                write!(
-                    f,
-                    "Backing chain depth {} exceeds maximum of {}",
-                    depth, max
-                )
+                write!(f, "Backing chain depth {depth} exceeds maximum of {max}")
             }
             ChainError::CircularReference(path) => {
                 write!(f, "Circular reference detected: {}", path.display())
             }
             ChainError::PathResolutionError(msg) => {
-                write!(f, "Path resolution error: {}", msg)
+                write!(f, "Path resolution error: {msg}")
             }
-            ChainError::IoError(e) => write!(f, "I/O error: {}", e),
+            ChainError::IoError(e) => write!(f, "I/O error: {e}"),
         }
     }
 }
@@ -815,11 +811,10 @@ mod tests {
              createType=\"monolithicFlat\"\n\
              \n\
              # Extent description\n\
-             RW {} FLAT \"{}\" 0\n\
+             RW {size_sectors} FLAT \"{filename}\" 0\n\
              \n\
              # Disk Data Base\n\
-             ddb.adapterType = \"ide\"\n",
-            size_sectors, filename
+             ddb.adapterType = \"ide\"\n"
         )
     }
 
@@ -874,15 +869,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let desc = tmp.path().join("foo.vmdk");
         let flat = tmp.path().join("foo-flat.vmdk");
-        let text = format!(
-            "# Disk DescriptorFile\n\
+        let text = "# Disk DescriptorFile\n\
              version=1\n\
              CID=1\n\
              parentCID=2\n\
              createType=\"monolithicFlat\"\n\
              parentFileNameHint=\"parent.vmdk\"\n\
              RW 1024 FLAT \"foo-flat.vmdk\" 0\n"
-        );
+            .to_string();
         std::fs::write(&desc, text).unwrap();
         std::fs::write(&flat, vec![0u8; 512]).unwrap();
 
@@ -945,11 +939,10 @@ mod tests {
             ChainError::PathResolutionError(msg) => {
                 assert!(
                     msg.contains("FLAT"),
-                    "expected error about FLAT kind, got: {}",
-                    msg
+                    "expected error about FLAT kind, got: {msg}"
                 );
             }
-            _ => panic!("expected PathResolutionError, got {:?}", err),
+            _ => panic!("expected PathResolutionError, got {err:?}"),
         }
     }
 
@@ -972,7 +965,7 @@ mod tests {
             ChainError::PathResolutionError(msg) => {
                 assert!(msg.contains("non-zero") || msg.contains("offset"));
             }
-            _ => panic!("expected PathResolutionError, got {:?}", err),
+            _ => panic!("expected PathResolutionError, got {err:?}"),
         }
     }
 

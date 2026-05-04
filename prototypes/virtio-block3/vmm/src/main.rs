@@ -244,7 +244,7 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
         None => "empty payload".to_string(),
     };
 
-    format!("[{}] {}", level, payload_str)
+    format!("[{level}] {payload_str}")
 }
 
 #[derive(Parser, Debug)]
@@ -285,8 +285,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ] {
         if !(512..=MAX_SECTOR_SIZE).contains(&size) || !size.is_power_of_two() {
             eprintln!(
-                "Error: {} sector size must be a power of 2, 512 to {} (got {})",
-                name, MAX_SECTOR_SIZE, size
+                "Error: {name} sector size must be a power of 2, 512 to {MAX_SECTOR_SIZE} (got {size})"
             );
             std::process::exit(1);
         }
@@ -338,7 +337,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create guest memory
     let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
-    println!("Allocated {} bytes of guest memory", GUEST_MEM_SIZE);
+    println!("Allocated {GUEST_MEM_SIZE} bytes of guest memory");
 
     // Get the memory region for KVM registration
     let region = guest_mem.find_region(GuestAddress(0)).unwrap();
@@ -359,15 +358,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Set up GDT
     setup_gdt(&guest_mem)?;
-    println!("Set up GDT at 0x{:x}", GDT_BASE);
+    println!("Set up GDT at 0x{GDT_BASE:x}");
 
     // Set up page tables (identity map 8MB)
     setup_page_tables(&guest_mem)?;
-    println!("Set up page tables at 0x{:x}", PAGE_TABLE_BASE);
+    println!("Set up page tables at 0x{PAGE_TABLE_BASE:x}");
 
     // Load guest code
     guest_mem.write_slice(&guest_code, GuestAddress(GUEST_CODE_BASE))?;
-    println!("Loaded guest code at 0x{:x}", GUEST_CODE_BASE);
+    println!("Loaded guest code at 0x{GUEST_CODE_BASE:x}");
 
     // Create virtio-block devices with configurable sector sizes
     let mut input_device = VirtioBlockDevice::new(
@@ -387,8 +386,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         OUTPUT_VQ_BASE,
     );
     println!(
-        "Created virtio-block devices at MMIO 0x{:x} and 0x{:x}",
-        INPUT_MMIO_BASE, OUTPUT_MMIO_BASE
+        "Created virtio-block devices at MMIO 0x{INPUT_MMIO_BASE:x} and 0x{OUTPUT_MMIO_BASE:x}"
     );
     println!(
         "  Input sector size: {} bytes, Output sector size: {} bytes",
@@ -433,7 +431,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let progress_desc = match args.progress_percent {
         0 => "every 10 sectors (legacy)".to_string(),
         100 => "none".to_string(),
-        n => format!("every {}%", n),
+        n => format!("every {n}%"),
     };
     println!(
         "Queued configuration message ({} bytes) for guest, progress: {}",
@@ -462,11 +460,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Debug output from guest (COM2) - buffer until newline
                     for &byte in data {
                         if let Some(line) = debug_buffer.add_byte(byte) {
-                            println!("[DEBUG] {}", line);
+                            println!("[DEBUG] {line}");
                         }
                     }
                 } else {
-                    println!("IO OUT: port=0x{:x}, data={:?}", port, data);
+                    println!("IO OUT: port=0x{port:x}, data={data:?}");
                 }
             }
             VcpuExit::IoIn(port, data) => {
@@ -499,7 +497,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else if output_range.contains(&addr) {
                     output_device.mmio_read((addr - OUTPUT_MMIO_BASE) as u32)
                 } else {
-                    println!("Unknown MMIO read at 0x{:x}", addr);
+                    println!("Unknown MMIO read at 0x{addr:x}");
                     0
                 };
                 write_mmio_data(data, value);
@@ -519,7 +517,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         output_device.process_queue(&guest_mem)?;
                     }
                 } else {
-                    println!("Unknown MMIO write at 0x{:x}", addr);
+                    println!("Unknown MMIO write at 0x{addr:x}");
                 }
             }
             VcpuExit::Shutdown => {
@@ -534,11 +532,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
-                println!("VM Entry Failed! reason=0x{:x}, cpu={}", reason, cpu);
+                println!("VM Entry Failed! reason=0x{reason:x}, cpu={cpu}");
                 break;
             }
             exit => {
-                println!("Unexpected VM exit: {:?}", exit);
+                println!("Unexpected VM exit: {exit:?}");
                 break;
             }
         }

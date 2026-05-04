@@ -117,10 +117,7 @@ impl IoEvent {
     ///
     /// Returns the number of signals if any, or None if no signal pending.
     pub fn poll(&self) -> Option<u64> {
-        match self.eventfd.read() {
-            Ok(count) => Some(count),
-            Err(_) => None,
-        }
+        self.eventfd.read().ok()
     }
 
     /// Get the raw file descriptor for use with poll/epoll.
@@ -230,10 +227,7 @@ impl IoEventWithMatch {
 
     /// Check if the eventfd has been signaled.
     pub fn poll(&self) -> Option<u64> {
-        match self.eventfd.read() {
-            Ok(count) => Some(count),
-            Err(_) => None,
-        }
+        self.eventfd.read().ok()
     }
 
     /// Get the raw file descriptor.

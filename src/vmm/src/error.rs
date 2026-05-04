@@ -25,11 +25,11 @@ pub enum VmmError {
 impl fmt::Display for VmmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            VmmError::Kvm(e) => write!(f, "KVM error: {}", e),
-            VmmError::Virtio(e) => write!(f, "virtio error: {}", e),
-            VmmError::Config(e) => write!(f, "configuration error: {}", e),
-            VmmError::Io(e) => write!(f, "I/O error: {}", e),
-            VmmError::GuestBinary(msg) => write!(f, "guest binary error: {}", msg),
+            VmmError::Kvm(e) => write!(f, "KVM error: {e}"),
+            VmmError::Virtio(e) => write!(f, "virtio error: {e}"),
+            VmmError::Config(e) => write!(f, "configuration error: {e}"),
+            VmmError::Io(e) => write!(f, "I/O error: {e}"),
+            VmmError::GuestBinary(msg) => write!(f, "guest binary error: {msg}"),
         }
     }
 }
@@ -95,20 +95,20 @@ pub enum KvmError {
 impl fmt::Display for KvmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            KvmError::Open(e) => write!(f, "failed to open /dev/kvm: {}", e),
-            KvmError::CreateVm(e) => write!(f, "failed to create VM: {}", e),
-            KvmError::CreateVcpu(e) => write!(f, "failed to create vCPU: {}", e),
+            KvmError::Open(e) => write!(f, "failed to open /dev/kvm: {e}"),
+            KvmError::CreateVm(e) => write!(f, "failed to create VM: {e}"),
+            KvmError::CreateVcpu(e) => write!(f, "failed to create vCPU: {e}"),
             KvmError::SetUserMemoryRegion(e) => {
-                write!(f, "failed to set user memory region: {}", e)
+                write!(f, "failed to set user memory region: {e}")
             }
-            KvmError::SetRegisters(e) => write!(f, "failed to set registers: {}", e),
+            KvmError::SetRegisters(e) => write!(f, "failed to set registers: {e}"),
             KvmError::SetSpecialRegisters(e) => {
-                write!(f, "failed to set special registers: {}", e)
+                write!(f, "failed to set special registers: {e}")
             }
             KvmError::VmEntryFailed { reason, cpu } => {
-                write!(f, "VM entry failed: reason=0x{:x}, cpu={}", reason, cpu)
+                write!(f, "VM entry failed: reason=0x{reason:x}, cpu={cpu}")
             }
-            KvmError::UnexpectedExit(desc) => write!(f, "unexpected VM exit: {}", desc),
+            KvmError::UnexpectedExit(desc) => write!(f, "unexpected VM exit: {desc}"),
         }
     }
 }
@@ -152,23 +152,21 @@ impl fmt::Display for VirtioError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             VirtioError::MissingDescriptor(name) => {
-                write!(f, "missing {} descriptor", name)
+                write!(f, "missing {name} descriptor")
             }
             VirtioError::InvalidDescriptorFlags { expected, desc_idx } => {
                 write!(
                     f,
-                    "invalid descriptor flags: expected {} at index {}",
-                    expected, desc_idx
+                    "invalid descriptor flags: expected {expected} at index {desc_idx}"
                 )
             }
-            VirtioError::GuestMemory(msg) => write!(f, "guest memory error: {}", msg),
-            VirtioError::BackingIo(e) => write!(f, "backing store I/O: {}", e),
+            VirtioError::GuestMemory(msg) => write!(f, "guest memory error: {msg}"),
+            VirtioError::BackingIo(e) => write!(f, "backing store I/O: {e}"),
             VirtioError::ReadOnlyDevice => write!(f, "device is read-only"),
             VirtioError::InvalidSector { sector, capacity } => {
                 write!(
                     f,
-                    "invalid sector {}: device capacity is {} sectors",
-                    sector, capacity
+                    "invalid sector {sector}: device capacity is {capacity} sectors"
                 )
             }
         }
@@ -208,19 +206,15 @@ impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConfigError::InvalidSectorSize { value, min, max } => {
-                write!(
-                    f,
-                    "sector size {} is out of range [{}, {}]",
-                    value, min, max
-                )
+                write!(f, "sector size {value} is out of range [{min}, {max}]")
             }
             ConfigError::SectorSizeNotPowerOfTwo(value) => {
-                write!(f, "sector size {} is not a power of 2", value)
+                write!(f, "sector size {value} is not a power of 2")
             }
             ConfigError::MissingFile { kind, path } => {
-                write!(f, "missing {} file: {}", kind, path)
+                write!(f, "missing {kind} file: {path}")
             }
-            ConfigError::FileNotFound(path) => write!(f, "file not found: {}", path),
+            ConfigError::FileNotFound(path) => write!(f, "file not found: {path}"),
         }
     }
 }

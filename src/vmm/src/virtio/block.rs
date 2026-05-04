@@ -361,9 +361,7 @@ impl VirtioBlockDevice {
         queue_size: u16,
     ) -> Result<VirtqDesc, Box<dyn std::error::Error>> {
         if desc_idx >= queue_size {
-            return Err(
-                format!("descriptor index {} >= queue size {}", desc_idx, queue_size).into(),
-            );
+            return Err(format!("descriptor index {desc_idx} >= queue size {queue_size}").into());
         }
         Ok(guest_mem.read_obj(GuestAddress(desc_table_addr + (desc_idx as u64 * 16)))?)
     }
@@ -626,7 +624,7 @@ mod tests {
         // validation is tested via the integration tests.
         // This test verifies the guard condition directly.
         assert!(0u16 < 128u16); // valid index
-        assert!(!(128u16 < 128u16)); // invalid: index == queue_size
-        assert!(!(255u16 < 128u16)); // invalid: index > queue_size
+        assert!((128u16 >= 128u16)); // invalid: index == queue_size
+        assert!((255u16 >= 128u16)); // invalid: index > queue_size
     }
 }

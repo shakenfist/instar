@@ -288,9 +288,9 @@ fn parse_memory_size(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
     };
     let num: u64 = num_str
         .parse()
-        .map_err(|_| format!("invalid memory size: '{}'", s))?;
+        .map_err(|_| format!("invalid memory size: '{s}'"))?;
     num.checked_mul(multiplier)
-        .ok_or_else(|| format!("memory size overflow: '{}'", s).into())
+        .ok_or_else(|| format!("memory size overflow: '{s}'").into())
 }
 
 // ============================================================================
@@ -352,8 +352,7 @@ impl DeviceSet {
     fn add_device(&mut self, device: Arc<Mutex<VirtioBlockDevice>>, is_input: bool) -> usize {
         assert!(
             self.devices.len() < MAX_CHAIN_DEPTH,
-            "Maximum chain depth ({}) exceeded",
-            MAX_CHAIN_DEPTH
+            "Maximum chain depth ({MAX_CHAIN_DEPTH}) exceeded"
         );
         let index = self.devices.len();
         let mmio_base = device_mmio_base(index);
@@ -405,7 +404,7 @@ impl DeviceSet {
         if let Some((index, offset)) = self.find_device_for_mmio(addr) {
             self.devices[index].device.lock().unwrap().mmio_read(offset)
         } else {
-            log::debug!("Unknown MMIO read at 0x{:x}", addr);
+            log::debug!("Unknown MMIO read at 0x{addr:x}");
             0
         }
     }
@@ -418,7 +417,7 @@ impl DeviceSet {
             device.mmio_write(offset, value);
             Some((index, device.should_process_queue()))
         } else {
-            log::debug!("Unknown MMIO write at 0x{:x}", addr);
+            log::debug!("Unknown MMIO write at 0x{addr:x}");
             None
         }
     }
@@ -672,7 +671,7 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
         None => "empty payload".to_string(),
     };
 
-    format!("[{}] {}", level, payload_str)
+    format!("[{level}] {payload_str}")
 }
 
 /// Format a byte size as human-readable string
@@ -700,7 +699,7 @@ fn format_size_human(bytes: u64, qemu_compat: bool) -> String {
         "0".to_string()
     } else {
         // qemu-img uses "B" for byte unit, not "bytes"
-        format!("{} B", bytes)
+        format!("{bytes} B")
     }
 }
 
@@ -744,9 +743,9 @@ fn format_size_value(value: f64, unit: &str, qemu_compat: bool) -> String {
             format!("{} {}", rounded as u64, unit)
         } else {
             // Format and trim trailing zeros
-            let s = format!("{}", rounded);
+            let s = format!("{rounded}");
             let trimmed = s.trim_end_matches('0').trim_end_matches('.');
-            format!("{} {}", trimmed, unit)
+            format!("{trimmed} {unit}")
         }
     } else {
         // Accurate formatting: round to one decimal place
@@ -754,7 +753,7 @@ fn format_size_value(value: f64, unit: &str, qemu_compat: bool) -> String {
         if rounded.fract() == 0.0 {
             format!("{} {}", rounded as u64, unit)
         } else {
-            format!("{:.1} {}", rounded, unit)
+            format!("{rounded:.1} {unit}")
         }
     }
 }
@@ -812,7 +811,7 @@ fn print_info_result(
         }
 
         // Line 1: image path
-        println!("image: {}", abs_path);
+        println!("image: {abs_path}");
 
         // Line 2: file format
         println!("file format: {}", info.format);
@@ -874,12 +873,9 @@ fn print_info_result(
                     .join(backing_file_str)
                     .to_string_lossy()
                     .to_string();
-                println!(
-                    "backing file: {} (actual path: {})",
-                    backing_file_str, actual_path
-                );
+                println!("backing file: {backing_file_str} (actual path: {actual_path})");
             } else {
-                println!("backing file: {}", backing_file_str);
+                println!("backing file: {backing_file_str}");
             }
             // Show backing file format if available
             if !info.qcow2_info.backing_format.is_empty() {
@@ -905,7 +901,7 @@ fn print_info_result(
                 info.qcow2_info.compat.as_str()
             };
             let is_v3 = compat == "1.1";
-            println!("    compat: {}", compat);
+            println!("    compat: {compat}");
 
             // compression type (always shown)
             let compression = if info.qcow2_info.compression_type.is_empty() {
@@ -913,7 +909,7 @@ fn print_info_result(
             } else {
                 info.qcow2_info.compression_type.as_str()
             };
-            println!("    compression type: {}", compression);
+            println!("    compression type: {compression}");
 
             // lazy refcounts (only for v3/1.1 compat)
             if is_v3 {
@@ -926,7 +922,7 @@ fn print_info_result(
             } else {
                 info.qcow2_info.refcount_bits
             };
-            println!("    refcount bits: {}", refcount_bits);
+            println!("    refcount bits: {refcount_bits}");
 
             // corrupt flag (only for v3/1.1 compat)
             if is_v3 {
@@ -960,7 +956,7 @@ fn print_info_result(
                 println!("            compressed: true");
             }
             println!("            virtual size: {}", info.virtual_size);
-            println!("            filename: {}", abs_path);
+            println!("            filename: {abs_path}");
             println!("            cluster size: {}", info.cluster_size);
             // qemu-img outputs "format: " with trailing space for empty format
             print!("            format: ");
@@ -977,7 +973,7 @@ fn print_info_result(
                 2 => "fixed",
                 _ => "unknown",
             };
-            println!("    image type: {}", image_type_str);
+            println!("    image type: {image_type_str}");
             println!("    block size: {}", info.vdi_info.block_size);
             println!("    blocks in image: {}", info.vdi_info.blocks_in_image);
             println!("    blocks allocated: {}", info.vdi_info.blocks_allocated);
@@ -1007,7 +1003,7 @@ fn print_info_result(
                 child_file_length
             };
             println!("Child node '/file':");
-            println!("    filename: {}", abs_path);
+            println!("    filename: {abs_path}");
             println!("    protocol type: file");
             println!(
                 "    file length: {} ({} bytes)",
@@ -1068,16 +1064,13 @@ fn print_info_result_json(
         println!("            \"name\": \"file\",");
         println!("            \"info\": {{");
         println!("                \"children\": [],");
-        println!(
-            "                \"virtual-size\": {},",
-            effective_child_file_length
-        );
+        println!("                \"virtual-size\": {effective_child_file_length},");
         println!(
             "                \"filename\": \"{}\",",
             escape_json_string(abs_path)
         );
         println!("                \"format\": \"file\",");
-        println!("                \"actual-size\": {},", disk_size);
+        println!("                \"actual-size\": {disk_size},");
         println!("                \"format-specific\": {{");
         println!("                    \"type\": \"file\",");
         println!("                    \"data\": {{}}");
@@ -1097,10 +1090,10 @@ fn print_info_result_json(
         } else {
             "qcow2"
         };
-        println!("    \"backing-filename-format\": \"{}\",", backing_format);
+        println!("    \"backing-filename-format\": \"{backing_format}\",");
     }
 
-    println!("    \"virtual-size\": {},", effective_virtual_size);
+    println!("    \"virtual-size\": {effective_virtual_size},");
     println!("    \"filename\": \"{}\",", escape_json_string(abs_path));
 
     if info.cluster_size > 0 {
@@ -1108,7 +1101,7 @@ fn print_info_result_json(
     }
 
     println!("    \"format\": \"{}\",", info.format);
-    println!("    \"actual-size\": {},", disk_size);
+    println!("    \"actual-size\": {disk_size},");
 
     // Format-specific section
     if info.format == "qcow2" {
@@ -1123,14 +1116,14 @@ fn print_info_result_json(
         };
         let is_v3 = compat == "1.1";
 
-        println!("            \"compat\": \"{}\",", compat);
+        println!("            \"compat\": \"{compat}\",");
 
         let compression = if info.qcow2_info.compression_type.is_empty() {
             "zlib"
         } else {
             info.qcow2_info.compression_type.as_str()
         };
-        println!("            \"compression-type\": \"{}\",", compression);
+        println!("            \"compression-type\": \"{compression}\",");
 
         if is_v3 {
             println!(
@@ -1149,7 +1142,7 @@ fn print_info_result_json(
             && !info.external_data_file.is_empty();
 
         if is_v3 {
-            println!("            \"refcount-bits\": {},", refcount_bits);
+            println!("            \"refcount-bits\": {refcount_bits},");
             println!("            \"corrupt\": {},", info.qcow2_info.corrupt);
             if has_data_file {
                 println!(
@@ -1168,7 +1161,7 @@ fn print_info_result_json(
             }
         } else {
             // For v2, refcount-bits is the last field (no trailing comma)
-            println!("            \"refcount-bits\": {}", refcount_bits);
+            println!("            \"refcount-bits\": {refcount_bits}");
         }
 
         println!("        }}");
@@ -1220,7 +1213,7 @@ fn print_info_result_json(
             2 => "fixed",
             _ => "unknown",
         };
-        println!("            \"image-type\": \"{}\",", image_type_str);
+        println!("            \"image-type\": \"{image_type_str}\",");
         println!("            \"block-size\": {},", info.vdi_info.block_size);
         println!(
             "            \"blocks-in-image\": {},",
@@ -1334,7 +1327,7 @@ fn print_info_result_json(
     } else {
         false
     };
-    println!("    \"dirty-flag\": {}", dirty_flag);
+    println!("    \"dirty-flag\": {dirty_flag}");
     println!("}}");
 }
 
@@ -1607,10 +1600,10 @@ fn execute_info_operation(
                 return Err("VM shutdown (possible triple fault)".into());
             }
             VcpuExit::FailEntry(reason, cpu) => {
-                return Err(format!("VM entry failed: reason=0x{:x}, cpu={}", reason, cpu).into());
+                return Err(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}").into());
             }
             exit => {
-                return Err(format!("unexpected VM exit: {:?}", exit).into());
+                return Err(format!("unexpected VM exit: {exit:?}").into());
             }
         }
     }
@@ -1786,7 +1779,7 @@ fn print_backing_chain(chain: &BackingChain) {
     }
     for (i, image) in chain.images().iter().enumerate() {
         let backing_info = match &image.backing_file_raw {
-            Some(bf) => format!(" -> {}", bf),
+            Some(bf) => format!(" -> {bf}"),
             None => String::new(),
         };
         println!(
@@ -2005,10 +1998,7 @@ fn write_chain_config(
     let devices_base = CHAIN_CONFIG_ADDR + 16;
     write_chain_device_entries(guest_mem, chain, devices_base, 0)?;
 
-    debug!(
-        "Wrote chain config at 0x{:x} ({} devices)",
-        CHAIN_CONFIG_ADDR, device_count
-    );
+    debug!("Wrote chain config at 0x{CHAIN_CONFIG_ADDR:x} ({device_count} devices)");
 
     Ok(())
 }
@@ -2407,7 +2397,7 @@ fn run_config(args: ConfigArgs) -> Result<(), Box<dyn std::error::Error>> {
         // Display effective configuration
         let tracked = config::load_config();
         let output = config::format_config(&tracked, args.show_sources);
-        print!("{}", output);
+        print!("{output}");
         Ok(())
     }
 }
@@ -2434,7 +2424,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
                 return Ok(());
             }
             Err(e) => {
-                return Err(format!("error discovering backing chain: {}", e).into());
+                return Err(format!("error discovering backing chain: {e}").into());
             }
         }
     }
@@ -2443,24 +2433,19 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     let profile = if let Some(ref version_str) = args.qemu_version {
         match version::profile_for_version_str(version_str) {
             Some(p) => {
-                debug!("Using output profile for qemu-img version {}", version_str);
+                debug!("Using output profile for qemu-img version {version_str}");
                 p
             }
             None => {
-                return Err(format!(
-                    "invalid qemu version '{}' (expected format: X.Y)",
-                    version_str
-                )
-                .into());
+                return Err(
+                    format!("invalid qemu version '{version_str}' (expected format: X.Y)").into(),
+                );
             }
         }
     } else {
         let p = version::get_profile();
         if let Some(v) = &p.version {
-            debug!(
-                "Detected qemu-img version {}, using matching output profile",
-                v
-            );
+            debug!("Detected qemu-img version {v}, using matching output profile");
         } else {
             debug!("qemu-img not found, using newest output profile");
         }
@@ -2500,7 +2485,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     if peek_is_vmdk_descriptor(input_path_for_preflight).unwrap_or(false) {
         let security_config = config::load_config().config.security;
         resolve_vmdk_flat_descriptor(input_path_for_preflight, &security_config)
-            .map_err(|e| format!("error resolving VMDK descriptor: {}", e))?;
+            .map_err(|e| format!("error resolving VMDK descriptor: {e}"))?;
     }
 
     // Get input file metadata (size and disk blocks)
@@ -2536,10 +2521,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
             )
             .into());
         }
-        debug!(
-            "Using {} bytes of guest memory (--max-guest-memory {})",
-            requested, mem_str
-        );
+        debug!("Using {requested} bytes of guest memory (--max-guest-memory {mem_str})");
         requested
     } else {
         GUEST_MEM_SIZE
@@ -2559,7 +2541,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
 
     // Create guest memory
     let guest_mem = create_guest_memory(guest_mem_size)?;
-    debug!("Allocated {} bytes of guest memory", guest_mem_size);
+    debug!("Allocated {guest_mem_size} bytes of guest memory");
 
     // Get the memory region for KVM registration
     let region = guest_mem.find_region(GuestAddress(0)).unwrap();
@@ -2590,23 +2572,23 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     // never modified after initialization. Read-only access is safe.
     let mmio_base = unsafe { ACTIVE_MMIO_BASE };
     guest_mem.write_obj(mmio_base, GuestAddress(VMM_PARAMS_ADDR))?;
-    debug!("Wrote MMIO base 0x{:x} to VMM_PARAMS_ADDR", mmio_base);
+    debug!("Wrote MMIO base 0x{mmio_base:x} to VMM_PARAMS_ADDR");
 
     // Set up GDT
     setup_gdt(&guest_mem)?;
-    debug!("Set up GDT at 0x{:x}", GDT_BASE);
+    debug!("Set up GDT at 0x{GDT_BASE:x}");
 
     // Set up page tables (identity map, covers guest memory + MMIO region)
     setup_page_tables(&guest_mem, guest_mem_size)?;
-    debug!("Set up page tables at 0x{:x}", PAGE_TABLE_BASE);
+    debug!("Set up page tables at 0x{PAGE_TABLE_BASE:x}");
 
     // Load core binary at GUEST_CODE_BASE (0x10000)
     guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
-    debug!("Loaded core binary at 0x{:x}", GUEST_CODE_BASE);
+    debug!("Loaded core binary at 0x{GUEST_CODE_BASE:x}");
 
     // Load operation binary at OPERATION_LOAD_ADDR (0x20000)
     guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
-    debug!("Loaded operation binary at 0x{:x}", OPERATION_LOAD_ADDR);
+    debug!("Loaded operation binary at 0x{OPERATION_LOAD_ADDR:x}");
 
     // Write InfoConfig at OPERATION_CONFIG_ADDR
     // Layout: magic (u32), flags (u32), passphrase_len (u32), _pad (u32), passphrase (256 bytes)
@@ -2628,7 +2610,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
         Some(pp.clone())
     } else if let Some(ref path) = args.luks_passphrase_file {
         let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("failed to read passphrase file '{}': {}", path, e))?;
+            .map_err(|e| format!("failed to read passphrase file '{path}': {e}"))?;
         // Strip trailing newline (like how most tools read key files)
         Some(content.trim_end_matches('\n').to_string())
     } else {
@@ -2652,7 +2634,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
         )?;
         guest_mem
             .write_slice(pp_bytes, GuestAddress(OPERATION_CONFIG_ADDR + 16))
-            .map_err(|e| format!("failed to write passphrase to guest memory: {}", e))?;
+            .map_err(|e| format!("failed to write passphrase to guest memory: {e}"))?;
         debug!(
             "Wrote LUKS passphrase ({} bytes) to guest config",
             pp_bytes.len()
@@ -2664,8 +2646,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     guest_mem.write_obj(argon2_mem_size, GuestAddress(OPERATION_CONFIG_ADDR + 272))?;
 
     debug!(
-        "Wrote info config at 0x{:x} (flags=0x{:x}, argon2_mem_size={})",
-        OPERATION_CONFIG_ADDR, info_flags, argon2_mem_size
+        "Wrote info config at 0x{OPERATION_CONFIG_ADDR:x} (flags=0x{info_flags:x}, argon2_mem_size={argon2_mem_size})"
     );
 
     // Create device set for managing virtio-block devices
@@ -2683,10 +2664,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
         input_mmio,
         input_vq,
     );
-    debug!(
-        "Created virtio-block device at MMIO 0x{:x}, VQ 0x{:x}",
-        input_mmio, input_vq
-    );
+    debug!("Created virtio-block device at MMIO 0x{input_mmio:x}, VQ 0x{input_vq:x}");
     debug!("  Sector size: {} bytes", input_device.sector_size());
 
     // Wrap device in Arc<Mutex<>> and add to device set
@@ -2718,10 +2696,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
             ));
         }
         Err(e) => {
-            debug!(
-                "ioeventfd: failed to register ({:?}), falling back to VM exits",
-                e
-            );
+            debug!("ioeventfd: failed to register ({e:?}), falling back to VM exits");
         }
     }
 
@@ -2803,11 +2778,11 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
                 } else if port == DEBUG_PORT {
                     for &byte in data {
                         if let Some(line) = debug_buffer.add_byte(byte) {
-                            debug!("[GUEST] {}", line);
+                            debug!("[GUEST] {line}");
                         }
                     }
                 } else {
-                    debug!("IO OUT: port=0x{:x}, data={:?}", port, data);
+                    debug!("IO OUT: port=0x{port:x}, data={data:?}");
                 }
             }
             VcpuExit::IoIn(port, data) => {
@@ -2864,8 +2839,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
                     eprintln!("*** LIKELY STACK OVERFLOW ***");
                     eprintln!("  RSP (0x{:x}) is outside stack region", regs.rsp);
                     eprintln!(
-                        "  Stack region: 0x{:x} - 0x{:x} ({} bytes)",
-                        STACK_BASE, STACK_TOP, STACK_SIZE
+                        "  Stack region: 0x{STACK_BASE:x} - 0x{STACK_TOP:x} ({STACK_SIZE} bytes)"
                     );
                 }
                 vm_error = Some("VM shutdown (triple fault)".to_string());
@@ -2873,17 +2847,14 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
             }
             VcpuExit::FailEntry(reason, cpu) => {
                 vmm_stats.lock().unwrap().record_fail_entry();
-                eprintln!("VM Entry Failed! reason=0x{:x}, cpu={}", reason, cpu);
-                vm_error = Some(format!(
-                    "VM entry failed: reason=0x{:x}, cpu={}",
-                    reason, cpu
-                ));
+                eprintln!("VM Entry Failed! reason=0x{reason:x}, cpu={cpu}");
+                vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
                 break;
             }
             exit => {
                 vmm_stats.lock().unwrap().record_unknown();
-                eprintln!("Unexpected VM exit: {:?}", exit);
-                vm_error = Some(format!("unexpected VM exit: {:?}", exit));
+                eprintln!("Unexpected VM exit: {exit:?}");
+                vm_error = Some(format!("unexpected VM exit: {exit:?}"));
                 break;
             }
         }
@@ -2914,8 +2885,7 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     ] {
         if !(512..=MAX_SECTOR_SIZE).contains(&size) || !size.is_power_of_two() {
             return Err(format!(
-                "{} sector size must be a power of 2, 512 to {} (got {})",
-                name, MAX_SECTOR_SIZE, size
+                "{name} sector size must be a power of 2, 512 to {MAX_SECTOR_SIZE} (got {size})"
             )
             .into());
         }
@@ -2992,7 +2962,7 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     debug!("Created VM");
 
     let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
-    debug!("Allocated {} bytes of guest memory", GUEST_MEM_SIZE);
+    debug!("Allocated {GUEST_MEM_SIZE} bytes of guest memory");
 
     let region = guest_mem.find_region(GuestAddress(0)).unwrap();
     let host_addr = region.as_ptr() as u64;
@@ -3014,16 +2984,16 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     debug!("Configured memory region");
 
     setup_gdt(&guest_mem)?;
-    debug!("Set up GDT at 0x{:x}", GDT_BASE);
+    debug!("Set up GDT at 0x{GDT_BASE:x}");
 
     setup_page_tables(&guest_mem, GUEST_MEM_SIZE)?;
-    debug!("Set up page tables at 0x{:x}", PAGE_TABLE_BASE);
+    debug!("Set up page tables at 0x{PAGE_TABLE_BASE:x}");
 
     guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
-    debug!("Loaded core binary at 0x{:x}", GUEST_CODE_BASE);
+    debug!("Loaded core binary at 0x{GUEST_CODE_BASE:x}");
 
     guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
-    debug!("Loaded operation binary at 0x{:x}", OPERATION_LOAD_ADDR);
+    debug!("Loaded operation binary at 0x{OPERATION_LOAD_ADDR:x}");
 
     // Write CopyConfig at OPERATION_CONFIG_ADDR
     let mut copy_flags: u32 = 0;
@@ -3073,10 +3043,7 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
         output_mmio,
         output_vq,
     );
-    debug!(
-        "Created virtio-block devices at MMIO 0x{:x} and 0x{:x}",
-        input_mmio, output_mmio
-    );
+    debug!("Created virtio-block devices at MMIO 0x{input_mmio:x} and 0x{output_mmio:x}");
     debug!(
         "  Input sector size: {} bytes, Output sector size: {} bytes",
         input_device.sector_size(),
@@ -3112,10 +3079,7 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
             ));
         }
         (Err(e), _) | (_, Err(e)) => {
-            debug!(
-                "ioeventfd: failed to register ({:?}), falling back to VM exits",
-                e
-            );
+            debug!("ioeventfd: failed to register ({e:?}), falling back to VM exits");
         }
     }
 
@@ -3148,7 +3112,7 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     let progress_desc = match args.progress_percent {
         0 => "every 10 sectors (legacy)".to_string(),
         100 => "none".to_string(),
-        n => format!("every {}%", n),
+        n => format!("every {n}%"),
     };
     debug!(
         "Queued configuration message ({} bytes) for guest, progress: {}",
@@ -3181,11 +3145,11 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
                 } else if port == DEBUG_PORT {
                     for &byte in data {
                         if let Some(line) = debug_buffer.add_byte(byte) {
-                            debug!("[GUEST] {}", line);
+                            debug!("[GUEST] {line}");
                         }
                     }
                 } else {
-                    debug!("IO OUT: port=0x{:x}, data={:?}", port, data);
+                    debug!("IO OUT: port=0x{port:x}, data={data:?}");
                 }
             }
             VcpuExit::IoIn(port, data) => {
@@ -3242,47 +3206,37 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
                     eprintln!("*** LIKELY STACK OVERFLOW ***");
                     eprintln!("  RSP (0x{:x}) is outside stack region", regs.rsp);
                     eprintln!(
-                        "  Stack region: 0x{:x} - 0x{:x} ({} bytes)",
-                        STACK_BASE, STACK_TOP, STACK_SIZE
+                        "  Stack region: 0x{STACK_BASE:x} - 0x{STACK_TOP:x} ({STACK_SIZE} bytes)"
                     );
                     if regs.rsp < STACK_BASE {
                         let underflow = STACK_BASE - regs.rsp;
-                        eprintln!("  Stack underflowed by {} bytes", underflow);
+                        eprintln!("  Stack underflowed by {underflow} bytes");
                     }
                 } else {
                     let stack_used = STACK_TOP - regs.rsp;
                     let stack_percent = (stack_used * 100) / STACK_SIZE;
                     eprintln!();
-                    eprintln!(
-                        "Stack usage: {} / {} bytes ({}%)",
-                        stack_used, STACK_SIZE, stack_percent
-                    );
+                    eprintln!("Stack usage: {stack_used} / {STACK_SIZE} bytes ({stack_percent}%)");
                     if stack_percent > 90 {
                         eprintln!("*** WARNING: Stack was nearly exhausted ***");
                     }
                 }
                 eprintln!();
-                eprintln!(
-                    "Guest memory: {} bytes (0x{:x})",
-                    GUEST_MEM_SIZE, GUEST_MEM_SIZE
-                );
-                eprintln!("Code base: 0x{:x}", GUEST_CODE_BASE);
+                eprintln!("Guest memory: {GUEST_MEM_SIZE} bytes (0x{GUEST_MEM_SIZE:x})");
+                eprintln!("Code base: 0x{GUEST_CODE_BASE:x}");
                 vm_error = Some("VM shutdown (triple fault)".to_string());
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
                 vmm_stats.lock().unwrap().record_fail_entry();
-                eprintln!("VM Entry Failed! reason=0x{:x}, cpu={}", reason, cpu);
-                vm_error = Some(format!(
-                    "VM entry failed: reason=0x{:x}, cpu={}",
-                    reason, cpu
-                ));
+                eprintln!("VM Entry Failed! reason=0x{reason:x}, cpu={cpu}");
+                vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
                 break;
             }
             exit => {
                 vmm_stats.lock().unwrap().record_unknown();
-                eprintln!("Unexpected VM exit: {:?}", exit);
-                vm_error = Some(format!("unexpected VM exit: {:?}", exit));
+                eprintln!("Unexpected VM exit: {exit:?}");
+                vm_error = Some(format!("unexpected VM exit: {exit:?}"));
                 break;
             }
         }
@@ -3355,7 +3309,7 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
                 Some(chain)
             }
             Err(e) => {
-                return Err(format!("error discovering backing chain: {}", e).into());
+                return Err(format!("error discovering backing chain: {e}").into());
             }
         }
     } else {
@@ -3387,7 +3341,7 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
 
     // Create guest memory
     let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
-    debug!("Allocated {} bytes of guest memory", GUEST_MEM_SIZE);
+    debug!("Allocated {GUEST_MEM_SIZE} bytes of guest memory");
 
     // Get the memory region for KVM registration
     let region = guest_mem.find_region(GuestAddress(0)).unwrap();
@@ -3412,19 +3366,19 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
 
     // Set up GDT
     setup_gdt(&guest_mem)?;
-    debug!("Set up GDT at 0x{:x}", GDT_BASE);
+    debug!("Set up GDT at 0x{GDT_BASE:x}");
 
     // Set up page tables (identity map)
     setup_page_tables(&guest_mem, GUEST_MEM_SIZE)?;
-    debug!("Set up page tables at 0x{:x}", PAGE_TABLE_BASE);
+    debug!("Set up page tables at 0x{PAGE_TABLE_BASE:x}");
 
     // Load core binary at GUEST_CODE_BASE (0x10000)
     guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
-    debug!("Loaded core binary at 0x{:x}", GUEST_CODE_BASE);
+    debug!("Loaded core binary at 0x{GUEST_CODE_BASE:x}");
 
     // Load operation binary at OPERATION_LOAD_ADDR (0x20000)
     guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
-    debug!("Loaded operation binary at 0x{:x}", OPERATION_LOAD_ADDR);
+    debug!("Loaded operation binary at 0x{OPERATION_LOAD_ADDR:x}");
 
     // Write CheckConfig at OPERATION_CONFIG_ADDR
     // Layout: magic (u32), flags (u32)
@@ -3443,10 +3397,7 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     }
     guest_mem.write_obj(CHECK_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
     guest_mem.write_obj(check_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
-    debug!(
-        "Wrote check config at 0x{:x} (flags=0x{:x})",
-        OPERATION_CONFIG_ADDR, check_flags
-    );
+    debug!("Wrote check config at 0x{OPERATION_CONFIG_ADDR:x} (flags=0x{check_flags:x})");
 
     // Create device set for managing virtio-block devices
     let mut device_set = DeviceSet::new();
@@ -3486,10 +3437,7 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
             input_mmio,
             input_vq,
         );
-        debug!(
-            "Created virtio-block device at MMIO 0x{:x}, VQ 0x{:x}",
-            input_mmio, input_vq
-        );
+        debug!("Created virtio-block device at MMIO 0x{input_mmio:x}, VQ 0x{input_vq:x}");
         debug!("  Sector size: {} bytes", input_device.sector_size());
         let input_device = Arc::new(Mutex::new(input_device));
         device_set.add_device(Arc::clone(&input_device), true);
@@ -3511,10 +3459,7 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     let mut registration_failed = false;
     for evt in io_events.iter_mut() {
         if let Err(e) = evt.register(&vm) {
-            debug!(
-                "ioeventfd: failed to register ({:?}), falling back to VM exits",
-                e
-            );
+            debug!("ioeventfd: failed to register ({e:?}), falling back to VM exits");
             registration_failed = true;
             break;
         }
@@ -3527,7 +3472,7 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     if registration_failed {
         for evt in io_events.iter_mut().take(registered_count) {
             if let Err(e) = evt.unregister(&vm) {
-                warn!("ioeventfd: failed to unregister during rollback: {:?}", e);
+                warn!("ioeventfd: failed to unregister during rollback: {e:?}");
             }
         }
     }
@@ -3642,11 +3587,11 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
                 } else if port == DEBUG_PORT {
                     for &byte in data {
                         if let Some(line) = debug_buffer.add_byte(byte) {
-                            debug!("[GUEST] {}", line);
+                            debug!("[GUEST] {line}");
                         }
                     }
                 } else {
-                    debug!("IO OUT: port=0x{:x}, data={:?}", port, data);
+                    debug!("IO OUT: port=0x{port:x}, data={data:?}");
                 }
             }
             VcpuExit::IoIn(port, data) => {
@@ -3693,17 +3638,14 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
             }
             VcpuExit::FailEntry(reason, cpu) => {
                 vmm_stats.lock().unwrap().record_fail_entry();
-                eprintln!("VM Entry Failed! reason=0x{:x}, cpu={}", reason, cpu);
-                vm_error = Some(format!(
-                    "VM entry failed: reason=0x{:x}, cpu={}",
-                    reason, cpu
-                ));
+                eprintln!("VM Entry Failed! reason=0x{reason:x}, cpu={cpu}");
+                vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
                 break;
             }
             exit => {
                 vmm_stats.lock().unwrap().record_unknown();
-                eprintln!("Unexpected VM exit: {:?}", exit);
-                vm_error = Some(format!("unexpected VM exit: {:?}", exit));
+                eprintln!("Unexpected VM exit: {exit:?}");
+                vm_error = Some(format!("unexpected VM exit: {exit:?}"));
                 break;
             }
         }
@@ -3843,8 +3785,8 @@ fn print_check_result_json(
     println!("    \"allocated-clusters\": {},", result.clusters_allocated);
     println!("    \"fragmented-clusters\": {},", result.fragmentation);
     // QCOW2-specific flags (dirty bit = unclean shutdown, corrupt bit = known corruption)
-    println!("    \"dirty\": {},", is_dirty);
-    println!("    \"corrupt\": {},", is_corrupt);
+    println!("    \"dirty\": {is_dirty},");
+    println!("    \"corrupt\": {is_corrupt},");
     println!("    \"chain-errors\": {},", result.chain_errors);
     println!("    \"subcluster-errors\": {}", result.subcluster_errors);
     println!("}}");
@@ -3929,7 +3871,7 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 
     // Create guest memory
     let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
-    debug!("Allocated {} bytes of guest memory", GUEST_MEM_SIZE);
+    debug!("Allocated {GUEST_MEM_SIZE} bytes of guest memory");
 
     // Get the memory region for KVM registration
     let region = guest_mem.find_region(GuestAddress(0)).unwrap();
@@ -3954,19 +3896,19 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 
     // Set up GDT
     setup_gdt(&guest_mem)?;
-    debug!("Set up GDT at 0x{:x}", GDT_BASE);
+    debug!("Set up GDT at 0x{GDT_BASE:x}");
 
     // Set up page tables (identity map)
     setup_page_tables(&guest_mem, GUEST_MEM_SIZE)?;
-    debug!("Set up page tables at 0x{:x}", PAGE_TABLE_BASE);
+    debug!("Set up page tables at 0x{PAGE_TABLE_BASE:x}");
 
     // Load core binary at GUEST_CODE_BASE (0x10000)
     guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
-    debug!("Loaded core binary at 0x{:x}", GUEST_CODE_BASE);
+    debug!("Loaded core binary at 0x{GUEST_CODE_BASE:x}");
 
     // Load operation binary at OPERATION_LOAD_ADDR (0x20000)
     guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
-    debug!("Loaded operation binary at 0x{:x}", OPERATION_LOAD_ADDR);
+    debug!("Loaded operation binary at 0x{OPERATION_LOAD_ADDR:x}");
 
     // Write CompareConfig at OPERATION_CONFIG_ADDR
     // Layout: magic (u32), flags (u32), image1_device_count (u32), image2_device_count (u32)
@@ -4009,7 +3951,7 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         Some(pp.clone())
     } else if let Some(ref path) = args.luks_passphrase_file {
         let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("failed to read LUKS passphrase file '{}': {}", path, e))?;
+            .map_err(|e| format!("failed to read LUKS passphrase file '{path}': {e}"))?;
         Some(content.trim_end_matches('\n').to_string())
     } else {
         None
@@ -4100,10 +4042,7 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     let mut registration_failed = false;
     for evt in io_events.iter_mut() {
         if let Err(e) = evt.register(&vm) {
-            debug!(
-                "ioeventfd: failed to register ({:?}), falling back to VM exits",
-                e
-            );
+            debug!("ioeventfd: failed to register ({e:?}), falling back to VM exits");
             registration_failed = true;
             break;
         }
@@ -4113,7 +4052,7 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     if registration_failed {
         for evt in io_events.iter_mut().take(registered_count) {
             if let Err(e) = evt.unregister(&vm) {
-                warn!("ioeventfd: failed to unregister during rollback: {:?}", e);
+                warn!("ioeventfd: failed to unregister during rollback: {e:?}");
             }
         }
     }
@@ -4217,11 +4156,11 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                 } else if port == DEBUG_PORT {
                     for &byte in data {
                         if let Some(line) = debug_buffer.add_byte(byte) {
-                            debug!("[GUEST] {}", line);
+                            debug!("[GUEST] {line}");
                         }
                     }
                 } else {
-                    debug!("IO OUT: port=0x{:x}, data={:?}", port, data);
+                    debug!("IO OUT: port=0x{port:x}, data={data:?}");
                 }
             }
             VcpuExit::IoIn(port, data) => {
@@ -4268,17 +4207,14 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
             }
             VcpuExit::FailEntry(reason, cpu) => {
                 vmm_stats.lock().unwrap().record_fail_entry();
-                eprintln!("VM Entry Failed! reason=0x{:x}, cpu={}", reason, cpu);
-                vm_error = Some(format!(
-                    "VM entry failed: reason=0x{:x}, cpu={}",
-                    reason, cpu
-                ));
+                eprintln!("VM Entry Failed! reason=0x{reason:x}, cpu={cpu}");
+                vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
                 break;
             }
             exit => {
                 vmm_stats.lock().unwrap().record_unknown();
-                eprintln!("Unexpected VM exit: {:?}", exit);
-                vm_error = Some(format!("unexpected VM exit: {:?}", exit));
+                eprintln!("Unexpected VM exit: {exit:?}");
+                vm_error = Some(format!("unexpected VM exit: {exit:?}"));
                 break;
             }
         }
@@ -4321,9 +4257,8 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         "vhdx" => 6u32,  // ImageFormat::Vhdx
         other => {
             return Err(format!(
-                "unsupported output format '{}' \
-                 (supported: 'raw', 'qcow2', 'vmdk', 'vpc', 'vhdx')",
-                other
+                "unsupported output format '{other}' \
+                 (supported: 'raw', 'qcow2', 'vmdk', 'vpc', 'vhdx')"
             )
             .into());
         }
@@ -4398,10 +4333,9 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
             "monolithicSparse" | "streamOptimized" => false,
             other => {
                 return Err(format!(
-                    "unsupported VMDK subformat '{}' (supported: \
+                    "unsupported VMDK subformat '{other}' (supported: \
                      'monolithicSparse', 'streamOptimized', \
-                     'monolithicFlat')",
-                    other
+                     'monolithicFlat')"
                 )
                 .into());
             }
@@ -4494,7 +4428,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     } else {
         tracked_config.config.convert.sparse.unwrap_or(true)
     };
-    debug!("skip_zeros = {}", skip_zeros);
+    debug!("skip_zeros = {skip_zeros}");
 
     // Discover input backing chain
     let security_config = tracked_config.config.security;
@@ -4511,8 +4445,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // memory from colliding with DMA_POOL_BASE.
     if input_device_count + 1 > MAX_CHAIN_DEVICES {
         return Err(format!(
-            "chain depth {} plus output device exceeds maximum of {} devices",
-            input_device_count, MAX_CHAIN_DEVICES
+            "chain depth {input_device_count} plus output device exceeds maximum of {MAX_CHAIN_DEVICES} devices"
         )
         .into());
     }
@@ -4558,7 +4491,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("output");
-        let flat_name = format!("{}-flat.vmdk", stem);
+        let flat_name = format!("{stem}-flat.vmdk");
         let flat_path = out_path.with_file_name(&flat_name);
         (1u32, Some((flat_path, flat_name))) // ImageFormat::Raw
     } else {
@@ -4630,10 +4563,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
             )
             .into());
         }
-        debug!(
-            "Using {} bytes of guest memory (--max-guest-memory {})",
-            requested, mem_str
-        );
+        debug!("Using {requested} bytes of guest memory (--max-guest-memory {mem_str})");
         requested
     } else {
         GUEST_MEM_SIZE
@@ -4650,7 +4580,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     debug!("Created VM");
 
     let guest_mem = create_guest_memory(guest_mem_size)?;
-    debug!("Allocated {} bytes of guest memory", guest_mem_size);
+    debug!("Allocated {guest_mem_size} bytes of guest memory");
 
     let region = guest_mem.find_region(GuestAddress(0)).unwrap();
     let host_addr = region.as_ptr() as u64;
@@ -4672,16 +4602,16 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     debug!("Configured memory region");
 
     setup_gdt(&guest_mem)?;
-    debug!("Set up GDT at 0x{:x}", GDT_BASE);
+    debug!("Set up GDT at 0x{GDT_BASE:x}");
 
     setup_page_tables(&guest_mem, guest_mem_size)?;
-    debug!("Set up page tables at 0x{:x}", PAGE_TABLE_BASE);
+    debug!("Set up page tables at 0x{PAGE_TABLE_BASE:x}");
 
     guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
-    debug!("Loaded core binary at 0x{:x}", GUEST_CODE_BASE);
+    debug!("Loaded core binary at 0x{GUEST_CODE_BASE:x}");
 
     guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
-    debug!("Loaded operation binary at 0x{:x}", OPERATION_LOAD_ADDR);
+    debug!("Loaded operation binary at 0x{OPERATION_LOAD_ADDR:x}");
 
     // Write ConvertConfig at OPERATION_CONFIG_ADDR
     let mut convert_flags: u32 = 0;
@@ -4739,7 +4669,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         Some(pp.clone())
     } else if let Some(ref path) = args.luks_passphrase_file {
         let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("failed to read LUKS passphrase file '{}': {}", path, e))?;
+            .map_err(|e| format!("failed to read LUKS passphrase file '{path}': {e}"))?;
         Some(content.trim_end_matches('\n').to_string())
     } else {
         None
@@ -4941,10 +4871,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     let mut registration_failed = false;
     for evt in io_events.iter_mut() {
         if let Err(e) = evt.register(&vm) {
-            debug!(
-                "ioeventfd: failed to register ({:?}), falling back to VM exits",
-                e
-            );
+            debug!("ioeventfd: failed to register ({e:?}), falling back to VM exits");
             registration_failed = true;
             break;
         }
@@ -4954,7 +4881,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     if registration_failed {
         for evt in io_events.iter_mut().take(registered_count) {
             if let Err(e) = evt.unregister(&vm) {
-                warn!("ioeventfd: failed to unregister during rollback: {:?}", e);
+                warn!("ioeventfd: failed to unregister during rollback: {e:?}");
             }
         }
     }
@@ -5045,11 +4972,11 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                 } else if port == DEBUG_PORT {
                     for &byte in data {
                         if let Some(line) = debug_buffer.add_byte(byte) {
-                            debug!("[GUEST] {}", line);
+                            debug!("[GUEST] {line}");
                         }
                     }
                 } else {
-                    debug!("IO OUT: port=0x{:x}, data={:?}", port, data);
+                    debug!("IO OUT: port=0x{port:x}, data={data:?}");
                 }
             }
             VcpuExit::IoIn(port, data) => {
@@ -5096,17 +5023,14 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
             }
             VcpuExit::FailEntry(reason, cpu) => {
                 vmm_stats.lock().unwrap().record_fail_entry();
-                eprintln!("VM Entry Failed! reason=0x{:x}, cpu={}", reason, cpu);
-                vm_error = Some(format!(
-                    "VM entry failed: reason=0x{:x}, cpu={}",
-                    reason, cpu
-                ));
+                eprintln!("VM Entry Failed! reason=0x{reason:x}, cpu={cpu}");
+                vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
                 break;
             }
             exit => {
                 vmm_stats.lock().unwrap().record_unknown();
-                eprintln!("Unexpected VM exit: {:?}", exit);
-                vm_error = Some(format!("unexpected VM exit: {:?}", exit));
+                eprintln!("Unexpected VM exit: {exit:?}");
+                vm_error = Some(format!("unexpected VM exit: {exit:?}"));
                 break;
             }
         }
@@ -5215,7 +5139,7 @@ fn print_compare_result_json(result: &guest_protocol::guest_::CompareResultMessa
         "    \"total-bytes-compared\": {},",
         result.total_bytes_compared
     );
-    println!("    \"size-mismatch\": {}", size_mismatch);
+    println!("    \"size-mismatch\": {size_mismatch}");
     println!("}}");
 }
 
@@ -5272,8 +5196,7 @@ fn setup_page_tables(
     let max_pd_pages = (GUEST_CODE_BASE - pd_base) / 0x1000;
     if num_pd_pages > max_pd_pages {
         return Err(format!(
-            "guest memory {}GB requires {} PD pages, max {} ({}GB)",
-            num_gb, num_pd_pages, max_pd_pages, max_pd_pages
+            "guest memory {num_gb}GB requires {num_pd_pages} PD pages, max {max_pd_pages} ({max_pd_pages}GB)"
         )
         .into());
     }

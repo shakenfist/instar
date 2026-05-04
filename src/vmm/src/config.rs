@@ -278,10 +278,9 @@ pub fn validate_config_files() -> Vec<(PathBuf, String)> {
 
 /// Validate a single config file
 fn validate_config_file(path: &Path) -> Result<(), String> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("Failed to read file: {}", e))?;
+    let content = std::fs::read_to_string(path).map_err(|e| format!("Failed to read file: {e}"))?;
 
-    let _: InstarConfig = toml::from_str(&content).map_err(|e| format!("Invalid TOML: {}", e))?;
+    let _: InstarConfig = toml::from_str(&content).map_err(|e| format!("Invalid TOML: {e}"))?;
 
     Ok(())
 }
@@ -386,14 +385,14 @@ fn format_option<T: std::fmt::Display>(
     show_sources: bool,
 ) {
     let value_str = match value {
-        Some(v) => format!("{}", v),
+        Some(v) => format!("{v}"),
         None => "(not set)".to_string(),
     };
 
     if show_sources {
-        output.push_str(&format!("{} = {}  # from: {}\n", name, value_str, source));
+        output.push_str(&format!("{name} = {value_str}  # from: {source}\n"));
     } else {
-        output.push_str(&format!("{} = {}\n", name, value_str));
+        output.push_str(&format!("{name} = {value_str}\n"));
     }
 }
 
@@ -407,20 +406,20 @@ fn format_list_option(
     match value {
         Some(list) => {
             if show_sources {
-                output.push_str(&format!("{} = [  # from: {}\n", name, source));
+                output.push_str(&format!("{name} = [  # from: {source}\n"));
             } else {
-                output.push_str(&format!("{} = [\n", name));
+                output.push_str(&format!("{name} = [\n"));
             }
             for item in list {
-                output.push_str(&format!("    \"{}\",\n", item));
+                output.push_str(&format!("    \"{item}\",\n"));
             }
             output.push_str("]\n");
         }
         None => {
             if show_sources {
-                output.push_str(&format!("{} = (not set)  # from: {}\n", name, source));
+                output.push_str(&format!("{name} = (not set)  # from: {source}\n"));
             } else {
-                output.push_str(&format!("{} = (not set)\n", name));
+                output.push_str(&format!("{name} = (not set)\n"));
             }
         }
     }
