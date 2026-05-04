@@ -1,4 +1,4 @@
-testtools>=2.5.0,<2.7.0
+testtools>=2.9.1,<2.10.0
 python-subunit>=1.4.0,<1.4.5
 testscenarios>=0.5.0
 stestr>=4.0.0
