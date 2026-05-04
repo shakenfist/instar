@@ -266,7 +266,7 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
         None => "empty payload".to_string(),
     };
 
-    format!("[{}] {}", level, payload_str)
+    format!("[{level}] {payload_str}")
 }
 
 #[derive(Parser, Debug)]
@@ -342,8 +342,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ] {
         if !(512..=MAX_SECTOR_SIZE).contains(&size) || !size.is_power_of_two() {
             eprintln!(
-                "Error: {} sector size must be a power of 2, 512 to {} (got {})",
-                name, MAX_SECTOR_SIZE, size
+                "Error: {name} sector size must be a power of 2, 512 to {MAX_SECTOR_SIZE} (got {size})"
             );
             std::process::exit(1);
         }
@@ -421,7 +420,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create guest memory
     let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
-    println!("Allocated {} bytes of guest memory", GUEST_MEM_SIZE);
+    println!("Allocated {GUEST_MEM_SIZE} bytes of guest memory");
 
     // Get the memory region for KVM registration
     let region = guest_mem.find_region(GuestAddress(0)).unwrap();
@@ -442,19 +441,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Set up GDT
     setup_gdt(&guest_mem)?;
-    println!("Set up GDT at 0x{:x}", GDT_BASE);
+    println!("Set up GDT at 0x{GDT_BASE:x}");
 
     // Set up page tables (identity map 8MB)
     setup_page_tables(&guest_mem)?;
-    println!("Set up page tables at 0x{:x}", PAGE_TABLE_BASE);
+    println!("Set up page tables at 0x{PAGE_TABLE_BASE:x}");
 
     // Load core binary at GUEST_CODE_BASE (0x10000)
     guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
-    println!("Loaded core binary at 0x{:x}", GUEST_CODE_BASE);
+    println!("Loaded core binary at 0x{GUEST_CODE_BASE:x}");
 
     // Load operation binary at OPERATION_LOAD_ADDR (0x20000)
     guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
-    println!("Loaded operation binary at 0x{:x}", OPERATION_LOAD_ADDR);
+    println!("Loaded operation binary at 0x{OPERATION_LOAD_ADDR:x}");
 
     // Write operation config at OPERATION_CONFIG_ADDR (0x19000)
     // Build flags from CLI arguments
@@ -495,8 +494,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         OUTPUT_VQ_BASE,
     );
     println!(
-        "Created virtio-block devices at MMIO 0x{:x} and 0x{:x}",
-        INPUT_MMIO_BASE, OUTPUT_MMIO_BASE
+        "Created virtio-block devices at MMIO 0x{INPUT_MMIO_BASE:x} and 0x{OUTPUT_MMIO_BASE:x}"
     );
     println!(
         "  Input sector size: {} bytes, Output sector size: {} bytes",
@@ -537,10 +535,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ));
             }
             (Err(e), _) | (_, Err(e)) => {
-                println!(
-                    "ioeventfd: failed to register ({:?}), falling back to VM exits",
-                    e
-                );
+                println!("ioeventfd: failed to register ({e:?}), falling back to VM exits");
             }
         }
     } else {
@@ -584,7 +579,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let progress_desc = match args.progress_percent {
         0 => "every 10 sectors (legacy)".to_string(),
         100 => "none".to_string(),
-        n => format!("every {}%", n),
+        n => format!("every {n}%"),
     };
     println!(
         "Queued configuration message ({} bytes) for guest, progress: {}",
@@ -617,11 +612,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Debug output from guest (COM2) - buffer until newline
                     for &byte in data {
                         if let Some(line) = debug_buffer.add_byte(byte) {
-                            println!("[DEBUG] {}", line);
+                            println!("[DEBUG] {line}");
                         }
                     }
                 } else {
-                    println!("IO OUT: port=0x{:x}, data={:?}", port, data);
+                    println!("IO OUT: port=0x{port:x}, data={data:?}");
                 }
             }
             VcpuExit::IoIn(port, data) => {
@@ -662,7 +657,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap()
                         .mmio_read((addr - OUTPUT_MMIO_BASE) as u32)
                 } else {
-                    println!("Unknown MMIO read at 0x{:x}", addr);
+                    println!("Unknown MMIO read at 0x{addr:x}");
                     0
                 };
                 write_mmio_data(data, value);
@@ -695,7 +690,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .record_write(io_stats.bytes_written, io_stats.sectors_written);
                     }
                 } else {
-                    println!("Unknown MMIO write at 0x{:x}", addr);
+                    println!("Unknown MMIO write at 0x{addr:x}");
                 }
             }
             VcpuExit::Shutdown => {
@@ -718,22 +713,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("*** LIKELY STACK OVERFLOW ***");
                     println!("  RSP (0x{:x}) is outside stack region", regs.rsp);
                     println!(
-                        "  Stack region: 0x{:x} - 0x{:x} ({} bytes)",
-                        STACK_BASE, STACK_TOP, STACK_SIZE
+                        "  Stack region: 0x{STACK_BASE:x} - 0x{STACK_TOP:x} ({STACK_SIZE} bytes)"
                     );
                     if regs.rsp < STACK_BASE {
                         let underflow = STACK_BASE - regs.rsp;
-                        println!("  Stack underflowed by {} bytes", underflow);
+                        println!("  Stack underflowed by {underflow} bytes");
                     }
                 } else {
                     // RSP is in range - show stack usage
                     let stack_used = STACK_TOP - regs.rsp;
                     let stack_percent = (stack_used * 100) / STACK_SIZE;
                     println!();
-                    println!(
-                        "Stack usage: {} / {} bytes ({}%)",
-                        stack_used, STACK_SIZE, stack_percent
-                    );
+                    println!("Stack usage: {stack_used} / {STACK_SIZE} bytes ({stack_percent}%)");
                     if stack_percent > 90 {
                         println!("*** WARNING: Stack was nearly exhausted ***");
                     }
@@ -741,21 +732,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Additional diagnostic info
                 println!();
-                println!(
-                    "Guest memory: {} bytes (0x{:x})",
-                    GUEST_MEM_SIZE, GUEST_MEM_SIZE
-                );
-                println!("Code base: 0x{:x}", GUEST_CODE_BASE);
+                println!("Guest memory: {GUEST_MEM_SIZE} bytes (0x{GUEST_MEM_SIZE:x})");
+                println!("Code base: 0x{GUEST_CODE_BASE:x}");
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
                 vmm_stats.lock().unwrap().record_fail_entry();
-                println!("VM Entry Failed! reason=0x{:x}, cpu={}", reason, cpu);
+                println!("VM Entry Failed! reason=0x{reason:x}, cpu={cpu}");
                 break;
             }
             exit => {
                 vmm_stats.lock().unwrap().record_unknown();
-                println!("Unexpected VM exit: {:?}", exit);
+                println!("Unexpected VM exit: {exit:?}");
                 break;
             }
         }

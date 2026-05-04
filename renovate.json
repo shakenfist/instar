@@ -24,6 +24,14 @@
         "aes"
       ],
       "allowedVersions": "<0.9"
+    },
+    {
+      "description": "Group micropb and micropb-gen: released in lockstep from the same upstream repo and must be bumped together.",
+      "matchPackageNames": [
+        "micropb",
+        "micropb-gen"
+      ],
+      "groupName": "micropb"
     }
   ],
   "minimumReleaseAge": "3 days",

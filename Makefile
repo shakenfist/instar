@@ -226,9 +226,19 @@ build-all:
 	@echo "All prototypes built successfully."
 
 # Build the shared guest-protocol crate
-guest-protocol:
+guest-protocol: instar-devcontainer
 	@echo "Building guest-protocol crate..."
-	cd crates/guest-protocol && cargo build --release
+	@mkdir -p "$(CURDIR)/$(CARGO_CACHE_DIR)/registry" "$(CURDIR)/$(CARGO_CACHE_DIR)/git"
+	docker run --rm \
+		-u "$(shell id -u):$(shell id -g)" \
+		-e HOME=/build \
+		-e CARGO_HOME=/build/.cargo \
+		-v "$(CURDIR):/workspace" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
+		-w "/workspace/crates/guest-protocol" \
+		"$(INSTAR_IMAGE)" \
+		cargo build --release
 
 # Build the rust-lint container
 build-lint-container:

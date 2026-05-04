@@ -89,7 +89,7 @@ impl IoThread {
         let epoll_fd = match Self::setup_epoll(&input_ioevent, &output_ioevent) {
             Ok(fd) => fd,
             Err(e) => {
-                eprintln!("Failed to set up epoll: {:?}", e);
+                eprintln!("Failed to set up epoll: {e:?}");
                 return;
             }
         };
@@ -107,7 +107,7 @@ impl IoThread {
                 if err.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
-                eprintln!("epoll_wait error: {:?}", err);
+                eprintln!("epoll_wait error: {err:?}");
                 break;
             }
 

@@ -218,7 +218,7 @@ impl VmmStats {
         } else if bytes >= KB {
             format!("{:.2} KB", bytes as f64 / KB as f64)
         } else {
-            format!("{} B", bytes)
+            format!("{bytes} B")
         }
     }
 
@@ -235,7 +235,7 @@ impl VmmStats {
         } else if bytes_per_sec >= KB {
             format!("{:.2} KB/s", bytes_per_sec / KB)
         } else {
-            format!("{:.2} B/s", bytes_per_sec)
+            format!("{bytes_per_sec:.2} B/s")
         }
     }
 
@@ -271,7 +271,7 @@ impl VmmStats {
         println!();
 
         // Runtime
-        println!("Runtime:        {:.3} seconds", elapsed);
+        println!("Runtime:        {elapsed:.3} seconds");
         println!();
 
         // Exit counts
