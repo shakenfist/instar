@@ -13,6 +13,7 @@
         clean-devcontainers lint lint-fix build-lint-container \
         install-hooks run-prototype guest-protocol \
         instar instar-devcontainer clean-instar run-instar check-binary-sizes \
+        metadata \
         test-venv test test-rust test-integration test-ci test-malicious test-report clean-tests \
         test-container test-container-core test-container-convert-qcow2 test-container-convert-vhd \
         clean-cargo-cache release check-version
@@ -33,6 +34,7 @@ help:
 	@echo "  clean-instar          Clean the main instar build"
 	@echo "  run-instar            Show how to run instar"
 	@echo "  check-binary-sizes   Verify binaries fit within memory regions"
+	@echo "  metadata             Validate workspace Cargo.toml manifests parse"
 	@echo ""
 	@echo "Prototypes:"
 	@echo "  build-prototype              Build a prototype (requires PROTOTYPE=<name>)"
@@ -131,6 +133,24 @@ instar-devcontainer:
 		echo "Building instar devcontainer image..."; \
 		docker build -t "$(INSTAR_IMAGE)" "$(SRC_DIR)/$(DEVCONTAINER_DIR)"; \
 	fi
+
+# Validate workspace Cargo.toml manifests parse cleanly. Fast manifest-only
+# check (no compilation) suitable for quick local validation after editing
+# Cargo.toml files.
+metadata: instar-devcontainer
+	@echo "Validating workspace manifests..."
+	@mkdir -p "$(CURDIR)/$(CARGO_CACHE_DIR)/registry" "$(CURDIR)/$(CARGO_CACHE_DIR)/git"
+	docker run --rm \
+		-u "$(shell id -u):$(shell id -g)" \
+		-e HOME=/build \
+		-e CARGO_HOME=/build/.cargo \
+		-v "$(CURDIR):/workspace" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
+		-w "/workspace/$(SRC_DIR)" \
+		"$(INSTAR_IMAGE)" \
+		cargo metadata --format-version 1 --no-deps >/dev/null
+	@echo "Workspace manifests OK."
 
 # Clean the main instar build
 clean-instar:

@@ -8,6 +8,8 @@ repository = "https://github.com/shakenfist/instar"
 authors = ["Michael Still <mikal@stillhq.com>"]
 keywords = ["vmdk", "disk-image", "no-std", "parser"]
 categories = ["no-std", "parser-implementations"]
+# Not published to crates.io: internal to instar's bare-metal sandbox.
+publish = false
 
 [features]
 decompress = ["miniz_oxide"]

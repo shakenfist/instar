@@ -8,6 +8,8 @@ repository = "https://github.com/shakenfist/instar"
 authors = ["Michael Still <mikal@stillhq.com>"]
 keywords = ["raw", "disk-image", "mbr", "gpt", "no-std"]
 categories = ["no-std", "parser-implementations"]
+# Not published to crates.io: internal to instar's bare-metal sandbox.
+publish = false
 
 [lib]
 # No std, this is used by bare-metal code
