@@ -2368,7 +2368,7 @@ pub unsafe fn decrypt_cluster_aes_cbc(
     virtual_offset: u64,
     aes_key: &[u8; 16],
 ) {
-    use aes::cipher::{BlockDecrypt, KeyInit};
+    use aes::cipher::{Array, BlockCipherDecrypt, KeyInit};
     use aes::Aes128;
 
     let cipher = Aes128::new(aes_key.into());
@@ -2396,7 +2396,7 @@ pub unsafe fn decrypt_cluster_aes_cbc(
             core::ptr::copy_nonoverlapping(block_ptr, ct.as_mut_ptr(), 16);
 
             // Decrypt the block in-place
-            let block = &mut *(block_ptr as *mut aes::cipher::generic_array::GenericArray<u8, _>);
+            let block = &mut *(block_ptr as *mut Array<u8, aes::cipher::consts::U16>);
             cipher.decrypt_block(block);
 
             // XOR with previous ciphertext (or IV)
@@ -2429,8 +2429,7 @@ pub unsafe fn decrypt_cluster_aes_xts(
     luks_key: &[u8],
     luks_sector_size: u64,
 ) {
-    use aes::cipher::generic_array::GenericArray;
-    use aes::cipher::KeyInit;
+    use aes::cipher::{Array, KeyInit};
     use aes::{Aes128, Aes256};
 
     let data = core::slice::from_raw_parts_mut(buf, len as usize);
@@ -2438,9 +2437,9 @@ pub unsafe fn decrypt_cluster_aes_xts(
     let half = luks_key.len() / 2;
 
     if half == 16 {
-        let c1 = Aes128::new(GenericArray::from_slice(&luks_key[..16]));
-        let c2 = Aes128::new(GenericArray::from_slice(&luks_key[16..32]));
-        let xts = xts_mode::Xts128::new(c1, c2);
+        let c1 = Aes128::new(<&Array<u8, _>>::try_from(&luks_key[..16]).unwrap());
+        let c2 = Aes128::new(<&Array<u8, _>>::try_from(&luks_key[16..32]).unwrap());
+        let xts = xts_mode::Xts128::<Aes128>::new(c1, c2);
         xts.decrypt_area(
             data,
             luks_sector_size as usize,
@@ -2448,9 +2447,9 @@ pub unsafe fn decrypt_cluster_aes_xts(
             xts_mode::get_tweak_default,
         );
     } else if half == 32 {
-        let c1 = Aes256::new(GenericArray::from_slice(&luks_key[..32]));
-        let c2 = Aes256::new(GenericArray::from_slice(&luks_key[32..64]));
-        let xts = xts_mode::Xts128::new(c1, c2);
+        let c1 = Aes256::new(<&Array<u8, _>>::try_from(&luks_key[..32]).unwrap());
+        let c2 = Aes256::new(<&Array<u8, _>>::try_from(&luks_key[32..64]).unwrap());
+        let xts = xts_mode::Xts128::<Aes256>::new(c1, c2);
         xts.decrypt_area(
             data,
             luks_sector_size as usize,
