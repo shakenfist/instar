@@ -30,7 +30,7 @@ guest-protocol = { path = "../../crates/guest-protocol", features = ["std"] }
 shared = { path = "../shared" }
 vmdk = { path = "../crates/vmdk" }
 toml = "0.9"
-dirs = "5.0"
+dirs = "6.0"
 serde = { version = "1.0", features = ["derive"] }
 rand = "0.10"
 
