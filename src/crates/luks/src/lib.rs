@@ -868,9 +868,7 @@ pub fn build_v1_header(params: &LuksV1BuildParams, out: &mut [u8]) -> Option<usi
 // ─── Key derivation ─────────────────────────────────────────────────
 
 #[cfg(any(feature = "decrypt", feature = "encrypt"))]
-use aes::cipher::generic_array::GenericArray;
-#[cfg(any(feature = "decrypt", feature = "encrypt"))]
-use aes::cipher::KeyInit;
+use aes::cipher::{Array, KeyInit};
 #[cfg(any(feature = "decrypt", feature = "encrypt"))]
 use aes::{Aes128, Aes256};
 #[cfg(any(feature = "decrypt", feature = "encrypt"))]
@@ -886,14 +884,14 @@ use pbkdf2::pbkdf2;
 pub fn aes_xts_decrypt(buf: &mut [u8], key: &[u8], start_sector: u64) {
     let half = key.len() / 2;
     if half == 16 {
-        let c1 = Aes128::new(GenericArray::from_slice(&key[..16]));
-        let c2 = Aes128::new(GenericArray::from_slice(&key[16..32]));
-        let xts = xts_mode::Xts128::new(c1, c2);
+        let c1 = Aes128::new(<&Array<u8, _>>::try_from(&key[..16]).unwrap());
+        let c2 = Aes128::new(<&Array<u8, _>>::try_from(&key[16..32]).unwrap());
+        let xts = xts_mode::Xts128::<Aes128>::new(c1, c2);
         xts.decrypt_area(buf, 512, start_sector as u128, xts_mode::get_tweak_default);
     } else if half == 32 {
-        let c1 = Aes256::new(GenericArray::from_slice(&key[..32]));
-        let c2 = Aes256::new(GenericArray::from_slice(&key[32..64]));
-        let xts = xts_mode::Xts128::new(c1, c2);
+        let c1 = Aes256::new(<&Array<u8, _>>::try_from(&key[..32]).unwrap());
+        let c2 = Aes256::new(<&Array<u8, _>>::try_from(&key[32..64]).unwrap());
+        let xts = xts_mode::Xts128::<Aes256>::new(c1, c2);
         xts.decrypt_area(buf, 512, start_sector as u128, xts_mode::get_tweak_default);
     }
 }
@@ -907,14 +905,14 @@ pub fn aes_xts_decrypt(buf: &mut [u8], key: &[u8], start_sector: u64) {
 pub fn aes_xts_encrypt(buf: &mut [u8], key: &[u8], start_sector: u64) {
     let half = key.len() / 2;
     if half == 16 {
-        let c1 = Aes128::new(GenericArray::from_slice(&key[..16]));
-        let c2 = Aes128::new(GenericArray::from_slice(&key[16..32]));
-        let xts = xts_mode::Xts128::new(c1, c2);
+        let c1 = Aes128::new(<&Array<u8, _>>::try_from(&key[..16]).unwrap());
+        let c2 = Aes128::new(<&Array<u8, _>>::try_from(&key[16..32]).unwrap());
+        let xts = xts_mode::Xts128::<Aes128>::new(c1, c2);
         xts.encrypt_area(buf, 512, start_sector as u128, xts_mode::get_tweak_default);
     } else if half == 32 {
-        let c1 = Aes256::new(GenericArray::from_slice(&key[..32]));
-        let c2 = Aes256::new(GenericArray::from_slice(&key[32..64]));
-        let xts = xts_mode::Xts128::new(c1, c2);
+        let c1 = Aes256::new(<&Array<u8, _>>::try_from(&key[..32]).unwrap());
+        let c2 = Aes256::new(<&Array<u8, _>>::try_from(&key[32..64]).unwrap());
+        let xts = xts_mode::Xts128::<Aes256>::new(c1, c2);
         xts.encrypt_area(buf, 512, start_sector as u128, xts_mode::get_tweak_default);
     }
 }

@@ -19,13 +19,6 @@
       "automerge": false
     },
     {
-      "description": "Pin aes to 0.8.x: xts-mode 0.5.1 is unmaintained and requires aes 0.8 / cipher 0.4. Re-enable when xts-mode supports cipher 0.5 or we replace it.",
-      "matchPackageNames": [
-        "aes"
-      ],
-      "allowedVersions": "<0.9"
-    },
-    {
       "description": "Group micropb and micropb-gen: released in lockstep from the same upstream repo and must be bumped together.",
       "matchPackageNames": [
         "micropb",
@@ -56,7 +49,7 @@
       "groupName": "rustcrypto-hashes"
     },
     {
-      "description": "Group RustCrypto cipher crates: aes and xts-mode share the cipher trait crate. aes is currently pinned to <0.9 because xts-mode 0.5 is stuck at cipher 0.4; when we unpin or replace xts-mode they will need to bump together.",
+      "description": "Group RustCrypto cipher crates: aes and xts-mode share the cipher trait crate, so major bumps must land together to keep trait versions consistent.",
       "matchPackageNames": [
         "aes",
         "xts-mode"
