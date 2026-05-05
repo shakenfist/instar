@@ -13,7 +13,7 @@ use kvm_bindings::{kvm_regs, kvm_segment, kvm_sregs, kvm_userspace_memory_region
 use kvm_ioctls::{Kvm, VcpuExit};
 use std::fs::File;
 use std::io::Read;
-use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
 // Memory layout constants (matching the handoff document)
 const GDT_BASE: u64 = 0x1000;
