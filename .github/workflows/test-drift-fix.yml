@@ -653,7 +653,7 @@ jobs:
            steps.prior_failures.outputs.has_prior_failures == 'true') &&
           (steps.claude_fix.outputs.claude_available != 'true' ||
            steps.verify.outputs.fix_succeeded == 'false')
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');
