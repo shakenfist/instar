@@ -753,7 +753,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-autofix-logs-${{ github.run_id }}
           path: |
