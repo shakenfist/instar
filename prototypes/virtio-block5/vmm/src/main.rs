@@ -29,7 +29,7 @@ use guest_protocol::{
 };
 use kvm_bindings::{kvm_regs, kvm_segment, kvm_sregs, kvm_userspace_memory_region};
 use kvm_ioctls::{Kvm, VcpuExit};
-use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
 use backing::{BackingMode, BackingStore};
 use ioevent::IoEvent;
