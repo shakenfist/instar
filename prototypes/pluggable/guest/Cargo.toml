@@ -7,7 +7,7 @@ license = "Apache-2.0"
 
 [dependencies]
 guest-protocol = { path = "../../../crates/guest-protocol" }
-heapless = "0.8"
+heapless = "0.9"
 
 [profile.release]
 panic = "abort"
