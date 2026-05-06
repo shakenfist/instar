@@ -1,0 +1,42 @@
+name: Lint
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'crates/**'
+      - '.devcontainer/rust-lint/**'
+      - 'scripts/check-rust.sh'
+      - 'Makefile'
+      - '.github/workflows/lint.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: [self-hosted, debian-12, s]
+    timeout-minutes: 30
+
+    env:
+      DOCKER_BUILDKIT: 1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Docker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y docker.io
+          sudo systemctl start docker
+          sudo chmod 666 /var/run/docker.sock
+
+      - name: Remove previous lint container, if any
+        run: |
+          docker image rm -f instar-rust-lint 2>/dev/null || true
+
+      - name: Run rustfmt and clippy
+        run: |
+          make lint

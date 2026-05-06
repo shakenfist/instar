@@ -30,6 +30,7 @@
 #![allow(non_upper_case_globals)]
 #![allow(unused_imports)]
 #![allow(unused_parens)]
+#![allow(unused_variables)]
 
 // Include the generated protobuf code
 include!(concat!(env!("OUT_DIR"), "/guest.rs"));
