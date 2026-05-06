@@ -11,7 +11,7 @@ default = []
 std = []  # Enable for VMM parsing support
 
 [dependencies]
-micropb = { version = "0.6", features = ["container-heapless-0-8"] }
+micropb = { version = "0.6", features = ["container-heapless-0-9"] }
 heapless = "0.9"
 
 [build-dependencies]
