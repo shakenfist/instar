@@ -283,7 +283,7 @@ impl DirectBacking {
         self.ensure_buffer_size(write_len);
 
         // If not aligned, we need to read-modify-write
-        if offset_in_block != 0 || buf.len() % DIRECT_IO_ALIGNMENT != 0 {
+        if offset_in_block != 0 || !buf.len().is_multiple_of(DIRECT_IO_ALIGNMENT) {
             self.file.seek(SeekFrom::Start(aligned_offset))?;
             // Read existing data first (to preserve unwritten portions)
             let _ = self.file.read(&mut self.aligned_buf[..write_len]);
