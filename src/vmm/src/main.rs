@@ -1350,16 +1350,41 @@ fn escape_json_string(s: &str) -> String {
     result
 }
 
-/// Get the directory containing the instar executable
+/// Get the directory containing the instar guest binaries (.bin files).
+///
+/// Resolution order:
+///   1. `INSTAR_BIN_DIR` environment variable, if set (testing/override).
+///   2. The directory containing the instar executable (developer mode:
+///      `make instar` writes the binaries alongside the VMM at
+///      `src/target/release/`).
+///   3. `/usr/lib/instar` (system install via .deb/.rpm).
+///
+/// The first candidate that contains `core.bin` wins. If none does,
+/// the executable directory is returned so the subsequent load error
+/// reports the developer-mode path that most users expect.
 fn get_binary_dir() -> std::path::PathBuf {
-    std::env::current_exe()
+    if let Ok(dir) = std::env::var("INSTAR_BIN_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
+
+    let exe_dir = std::env::current_exe()
         .expect("Failed to get executable path")
         .parent()
         .expect("Failed to get executable directory")
-        .to_path_buf()
+        .to_path_buf();
+
+    let system_dir = std::path::PathBuf::from("/usr/lib/instar");
+
+    for candidate in [&exe_dir, &system_dir] {
+        if candidate.join("core.bin").exists() {
+            return candidate.clone();
+        }
+    }
+
+    exe_dir
 }
 
-/// Get the path to a binary in the same directory as instar
+/// Get the path to a guest binary by file name.
 fn get_binary_path(name: &str) -> std::path::PathBuf {
     get_binary_dir().join(name)
 }

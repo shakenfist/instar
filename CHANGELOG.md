@@ -16,6 +16,21 @@ First public release.
   The rename touches the binary name, crate names, environment
   variables, CI workflows, and documentation; there are no
   functional changes.
+- **Guest binary resolver** now probes `INSTAR_BIN_DIR`, the
+  executable directory, and `/usr/lib/instar/` in that order.
+  Developer mode (binaries alongside the VMM in
+  `src/target/release/`) keeps working as before; system
+  installs from the new .deb/.rpm packages place the guest
+  binaries under `/usr/lib/instar/` per FHS.
+
+### Packaging
+
+- **.deb and .rpm packages** are now produced for x86_64
+  Linux as part of the release workflow. The VMM is installed
+  at `/usr/bin/instar` and the six guest binaries
+  (`core.bin`, `info.bin`, `copy.bin`, `check.bin`,
+  `compare.bin`, `convert.bin`) at `/usr/lib/instar/`.
+  Local builds: `make deb`, `make rpm`, or `make package`.
 
 ### Fixed
 

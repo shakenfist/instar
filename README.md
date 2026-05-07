@@ -31,21 +31,43 @@ instar implementation in `src/`. Operations include `info`, `copy`, `check`,
 
 ## Installation
 
-### Pre-compiled binary (recommended)
+Pre-built x86_64 Linux artifacts are published on every release at
+[GitHub Releases](https://github.com/shakenfist/instar/releases). Pick
+the format that matches your distro.
 
-Download the latest release from
-[GitHub Releases](https://github.com/shakenfist/instar/releases):
+### Debian / Ubuntu (.deb)
 
 ```bash
-# Download and extract
-# Replace VERSION with the desired release (e.g. v0.2.0)
-VERSION=v0.2.0
-curl -sL "https://github.com/shakenfist/instar/releases/download/${VERSION}/instar-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
-  | tar xz -C /usr/local/bin/
-
-# Verify it works
+VERSION=0.2.0
+curl -sLO "https://github.com/shakenfist/instar/releases/download/v${VERSION}/instar_${VERSION}-1_amd64.deb"
+sudo apt install "./instar_${VERSION}-1_amd64.deb"
 instar --help
 ```
+
+### Fedora / RHEL / SUSE (.rpm)
+
+```bash
+VERSION=0.2.0
+curl -sLO "https://github.com/shakenfist/instar/releases/download/v${VERSION}/instar-${VERSION}-1.x86_64.rpm"
+sudo dnf install "./instar-${VERSION}-1.x86_64.rpm"
+instar --help
+```
+
+The packages install the VMM at `/usr/bin/instar` and the six guest
+binaries (loaded into the KVM sandbox at runtime) at
+`/usr/lib/instar/`.
+
+### Tarball (any Linux)
+
+```bash
+VERSION=v0.2.0
+curl -sL "https://github.com/shakenfist/instar/releases/download/${VERSION}/instar-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+  | sudo tar xz -C /usr/local/bin/
+instar --help
+```
+
+The tarball contains the VMM and guest `.bin` files together; instar
+finds them by looking in the directory containing the executable.
 
 ### System requirements
 
