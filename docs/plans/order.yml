@@ -1,0 +1,9 @@
+---
+# This file defines the ordering and page titles for the import of
+# this content into `shakenfist/docs/components/instar/plans/`. Only
+# master plans and the index are listed here; phase-specific plan
+# files are linked from the index and from each master plan's
+# execution table.
+
+- index.md: Plans index
+- PLAN-distro-matrix-ci.md: Distro matrix CI
