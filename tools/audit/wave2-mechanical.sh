@@ -68,7 +68,7 @@ echo
 
 bold "=== wave 2d: VMM unsafe blocks added (host-side, higher risk) ==="
 if git rev-parse --verify develop >/dev/null 2>&1; then
-    VMM_UNSAFE=$(git diff develop...HEAD -- 'src/vmm/**' '*.rs' \
+    VMM_UNSAFE=$(git diff develop...HEAD -- 'src/vmm/**/*.rs' \
         | grep -nE '^\+.*\bunsafe\b' \
         || true)
     if [[ -n "$VMM_UNSAFE" ]]; then
@@ -82,7 +82,11 @@ echo
 
 bold "=== wave 2d: guest-side unsafe blocks added (sandboxed, lower risk) ==="
 if git rev-parse --verify develop >/dev/null 2>&1; then
-    GUEST_UNSAFE=$(git diff develop...HEAD -- 'src/core/**' 'src/operations/**' 'src/crates/**' 'src/shared/**' '*.rs' \
+    GUEST_UNSAFE=$(git diff develop...HEAD -- \
+            'src/core/**/*.rs' \
+            'src/operations/**/*.rs' \
+            'src/crates/**/*.rs' \
+            'src/shared/**/*.rs' \
         | grep -nE '^\+.*\bunsafe\b' \
         || true)
     if [[ -n "$GUEST_UNSAFE" ]]; then

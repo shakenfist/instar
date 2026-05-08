@@ -71,8 +71,10 @@ bold "=== wave 1b: mechanical style checks ==="
 #    informational. Skip if develop is not a known ref (e.g. shallow
 #    clone in CI).
 if git rev-parse --verify develop >/dev/null 2>&1; then
-    LONG_LINES=$(git diff develop...HEAD --name-only -- '*.rs' \
-        | xargs -r awk 'length > 120 {print FILENAME":"NR": "length" chars"}' \
+    # -z / -0: NUL-delimited so filenames with spaces or special
+    # characters survive the xargs split.
+    LONG_LINES=$(git diff develop...HEAD -z --name-only -- '*.rs' \
+        | xargs -r -0 awk 'length > 120 {print FILENAME":"NR": "length" chars"}' \
         2>/dev/null || true)
     if [[ -n "$LONG_LINES" ]]; then
         echo "ADVISORY: lines over 120 chars in changed Rust files:"

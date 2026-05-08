@@ -147,17 +147,25 @@ jobs:
         run: |
           # Move the .deb and .rpm next to the tarball for a single
           # upload-artifact pattern.
-          cp src/target/debian/*.deb .
-          cp src/target/generate-rpm/*.rpm .
+          cp src/target/debian/instar_*.deb .
+          cp src/target/generate-rpm/instar-*.rpm .
 
+      # Multi-line `path:` is OR-semantics in upload-artifact@v7
+      # (the action uploads the union of files matched by any
+      # pattern, and `if-no-files-found: error` only fires when
+      # zero files match across all patterns). Non-Linux matrix
+      # entries therefore upload just the tarball; the deb/rpm
+      # globs match nothing and that's fine. Filename-prefixed
+      # globs avoid pulling in unrelated artifacts that may exist
+      # in the working directory.
       - name: Upload distribution artifact
         uses: actions/upload-artifact@v7
         with:
           name: binary-${{ matrix.target }}
           path: |
             ${{ env.ARCHIVE }}
-            *.deb
-            *.rpm
+            instar_*.deb
+            instar-*.rpm
           if-no-files-found: error
 
   sign-tag:
@@ -223,8 +231,8 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            *.tar.gz
-            *.deb
-            *.rpm
+            instar-*.tar.gz
+            instar_*.deb
+            instar-*.rpm
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -66,8 +66,8 @@ binaries (loaded into the KVM sandbox at runtime) at
 ### Tarball (any Linux)
 
 ```bash
-VERSION=v0.2.0
-curl -sL "https://github.com/shakenfist/instar/releases/download/${VERSION}/instar-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+VERSION=0.2.0
+curl -sL "https://github.com/shakenfist/instar/releases/download/v${VERSION}/instar-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
   | sudo tar xz -C /usr/local/bin/
 instar --help
 ```
