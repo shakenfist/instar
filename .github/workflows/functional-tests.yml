@@ -226,6 +226,49 @@ jobs:
               echo "All config tests passed!"
             '
 
+  # Smoke-test the .deb package: install in a clean Debian container,
+  # verify the file layout, and exercise an actual KVM operation. This
+  # catches packaging regressions (asset paths, runtime deps, mode
+  # bits, the /usr/lib/instar/ resolver fallback) on every PR.
+  #
+  # Only the .deb on debian:trixie is exercised here. Broader distro
+  # coverage (Ubuntu, Fedora, Rocky 9/10, .rpm) lives in the merge
+  # queue matrix; see docs/plans/PLAN-distro-matrix-ci.md for the
+  # full design.
+  package-smoke:
+    needs: build-and-test
+    runs-on: [self-hosted, debian-12, xl]
+    timeout-minutes: 30
+
+    env:
+      DOCKER_BUILDKIT: 1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Docker and qemu-utils
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y docker.io qemu-utils
+          sudo systemctl start docker
+          sudo chmod 666 /var/run/docker.sock
+
+      - name: Remove previous devcontainers, if any
+        run: |
+          docker image rm -f instar-build 2>/dev/null || true
+
+      - name: Build instar and the .deb package
+        run: |
+          make instar
+          make deb
+
+      - name: Run install smoke test on debian:trixie
+        run: |
+          tools/test-package-install.sh \
+            src/target/debian/instar_*.deb \
+            debian:trixie
+
   # Core integration tests: info, check, security, version-detection, oslo-crossval
   # These are fast (header-parsing only, no full image conversion)
   integration-core:
