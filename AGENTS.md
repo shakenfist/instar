@@ -66,15 +66,28 @@ vhdx (VHDX), luks (info + convert with decryption)
 
 ### Planning Documents
 
-Implementation plans are kept as local-only files using the naming convention
-`PLAN-*.md` (e.g., `PLAN-convert.md`). These files are excluded from version
-control via `.gitignore` to allow developers to maintain detailed planning
-notes without cluttering the repository.
+Tracked planning documents live in `docs/plans/` and follow the structure
+in `PLAN-TEMPLATE.md` at the repo root. Each tracked plan is committed
+alongside the work it describes, with phase plans named
+`PLAN-<feature>-phase-NN-<descriptive>.md` next to the master plan.
+`docs/plans/index.md` summarises every master plan; `docs/plans/order.yml`
+controls the documentation navigation order.
+
+Drafts dropped at the repo root (`PLAN-<feature>.md`) remain local-only
+via the anchored `.gitignore` rule (`/PLAN-*.md`). Use repo-root drafts
+for early scribbling that is not yet ready to commit; promote to
+`docs/plans/` when the plan is shareable.
 
 When starting a major feature:
-1. Create a `PLAN-<feature>.md` file in the repository root
-2. Document the implementation phases and approach
-3. The file stays local - it won't be committed
+1. Sketch a draft in the repo root (gitignored) if you want to iterate
+   privately, or skip straight to step 2 once you know the shape.
+2. Create `docs/plans/PLAN-<feature>.md` from `PLAN-TEMPLATE.md`,
+   commit it on the same branch as the implementation work, and add a
+   row to `docs/plans/index.md` plus an entry in
+   `docs/plans/order.yml`.
+3. For phased work, add `docs/plans/PLAN-<feature>-phase-NN-<descriptive>.md`
+   files alongside the master plan and link them from the master's
+   Execution table.
 
 ### Code Style
 

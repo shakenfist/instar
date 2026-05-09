@@ -58,6 +58,13 @@ RUN --mount=type=cache,target=/build/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/.cargo/git,sharing=locked \
     umask 0000 && cargo install cargo-fuzz
 
+# Install packaging tools for `make deb` / `make rpm`. Both run with
+# --no-build against artifacts produced by `make instar`.
+RUN --mount=type=cache,target=/build/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/.cargo/git,sharing=locked \
+    umask 0000 && cargo install cargo-deb cargo-generate-rpm
+
 # Verify installation
 RUN rustc --version && cargo --version && rust-objcopy --version \
-    && cargo fuzz --version && protoc --version
+    && cargo fuzz --version && cargo deb --version \
+    && cargo generate-rpm --version && protoc --version

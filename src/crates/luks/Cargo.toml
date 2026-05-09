@@ -8,6 +8,8 @@ repository = "https://github.com/shakenfist/instar"
 authors = ["Michael Still <mikal@stillhq.com>"]
 keywords = ["luks", "encryption", "disk-image", "no-std", "parser"]
 categories = ["no-std", "parser-implementations"]
+# Not published to crates.io: internal to instar's bare-metal sandbox.
+publish = false
 
 [features]
 kdf-pbkdf2 = ["pbkdf2", "hmac", "sha1", "sha2"]

@@ -16,6 +16,39 @@ First public release.
   The rename touches the binary name, crate names, environment
   variables, CI workflows, and documentation; there are no
   functional changes.
+- **Guest binary resolver** now probes `INSTAR_BIN_DIR`, the
+  executable directory, and `/usr/lib/instar/` in that order.
+  Developer mode (binaries alongside the VMM in
+  `src/target/release/`) keeps working as before; system
+  installs from the new .deb/.rpm packages place the guest
+  binaries under `/usr/lib/instar/` per FHS.
+
+### Packaging
+
+- **.deb and .rpm packages** are now produced for x86_64
+  Linux as part of the release workflow. The VMM is installed
+  at `/usr/bin/instar` and the six guest binaries
+  (`core.bin`, `info.bin`, `copy.bin`, `check.bin`,
+  `compare.bin`, `convert.bin`) at `/usr/lib/instar/`.
+  Local builds: `make deb`, `make rpm`, or `make package`.
+  The packages require **glibc 2.39 or newer** because the
+  build container is based on Debian trixie. Compatible
+  distributions include Debian 13, Ubuntu 24.04 LTS, Fedora
+  40+, and Rocky/RHEL 10. Lowering the baseline to cover
+  Rocky/RHEL 9, Debian 12, and Ubuntu 22.04 is tracked in
+  docs/plans/PLAN-distro-matrix-ci.md.
+
+### CI
+
+- **Package smoke test** runs on every PR, building the .deb
+  inside the devcontainer and installing it in a fresh
+  debian:trixie container with `/dev/kvm` passthrough. The
+  test verifies file layout under `/usr/bin` and
+  `/usr/lib/instar/`, exercises the runtime resolver's
+  fallback path, and runs a live `instar info` operation
+  against KVM. Multi-distro and qemu-img differential
+  coverage is planned for the merge queue (see
+  docs/plans/PLAN-distro-matrix-ci.md).
 
 ### Fixed
 

@@ -13,6 +13,7 @@
         clean-devcontainers lint lint-fix build-lint-container \
         install-hooks run-prototype guest-protocol \
         instar instar-devcontainer clean-instar run-instar check-binary-sizes \
+        metadata deb rpm package \
         test-venv test test-rust test-integration test-ci test-malicious test-report clean-tests \
         test-container test-container-core test-container-convert-qcow2 test-container-convert-vhd \
         clean-cargo-cache release check-version
@@ -33,6 +34,10 @@ help:
 	@echo "  clean-instar          Clean the main instar build"
 	@echo "  run-instar            Show how to run instar"
 	@echo "  check-binary-sizes   Verify binaries fit within memory regions"
+	@echo "  metadata             Validate workspace Cargo.toml manifests parse"
+	@echo "  deb                  Build a Debian (.deb) package (requires 'make instar' first)"
+	@echo "  rpm                  Build an RPM (.rpm) package (requires 'make instar' first)"
+	@echo "  package              Build both .deb and .rpm packages"
 	@echo ""
 	@echo "Prototypes:"
 	@echo "  build-prototype              Build a prototype (requires PROTOTYPE=<name>)"
@@ -131,6 +136,77 @@ instar-devcontainer:
 		echo "Building instar devcontainer image..."; \
 		docker build -t "$(INSTAR_IMAGE)" "$(SRC_DIR)/$(DEVCONTAINER_DIR)"; \
 	fi
+
+# Validate workspace Cargo.toml manifests parse cleanly. Fast manifest-only
+# check (no compilation) suitable for quick local validation after editing
+# Cargo.toml files.
+metadata: instar-devcontainer
+	@echo "Validating workspace manifests..."
+	@mkdir -p "$(CURDIR)/$(CARGO_CACHE_DIR)/registry" "$(CURDIR)/$(CARGO_CACHE_DIR)/git"
+	docker run --rm \
+		-u "$(shell id -u):$(shell id -g)" \
+		-e HOME=/build \
+		-e CARGO_HOME=/build/.cargo \
+		-v "$(CURDIR):/workspace" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
+		-w "/workspace/$(SRC_DIR)" \
+		"$(INSTAR_IMAGE)" \
+		cargo metadata --format-version 1 --no-deps >/dev/null
+	@echo "Workspace manifests OK."
+
+# Build a Debian package from the artifacts produced by `make instar`.
+# Runs cargo-deb inside the devcontainer with --no-build so no
+# compilation happens here -- run `make instar` first. Output:
+# src/target/debian/instar_*.deb
+deb: instar-devcontainer
+	@if [ ! -f "$(SRC_DIR)/target/release/instar" ] || \
+	    [ ! -f "$(SRC_DIR)/target/release/core.bin" ]; then \
+	    echo "Error: build artifacts missing. Run 'make instar' first."; \
+	    exit 1; \
+	fi
+	@echo "Building .deb package..."
+	@mkdir -p "$(CURDIR)/$(CARGO_CACHE_DIR)/registry" "$(CURDIR)/$(CARGO_CACHE_DIR)/git"
+	docker run --rm \
+		-u "$(shell id -u):$(shell id -g)" \
+		-e HOME=/build \
+		-e CARGO_HOME=/build/.cargo \
+		-v "$(CURDIR):/workspace" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
+		-w "/workspace/$(SRC_DIR)" \
+		"$(INSTAR_IMAGE)" \
+		cargo deb --no-build -p instar
+	@echo ""
+	@ls -la "$(SRC_DIR)/target/debian/"*.deb
+
+# Build an RPM package from the artifacts produced by `make instar`.
+# Runs cargo-generate-rpm inside the devcontainer; like cargo-deb it
+# does not compile, only package. Output:
+# src/target/generate-rpm/instar-*.rpm
+rpm: instar-devcontainer
+	@if [ ! -f "$(SRC_DIR)/target/release/instar" ] || \
+	    [ ! -f "$(SRC_DIR)/target/release/core.bin" ]; then \
+	    echo "Error: build artifacts missing. Run 'make instar' first."; \
+	    exit 1; \
+	fi
+	@echo "Building .rpm package..."
+	@mkdir -p "$(CURDIR)/$(CARGO_CACHE_DIR)/registry" "$(CURDIR)/$(CARGO_CACHE_DIR)/git"
+	docker run --rm \
+		-u "$(shell id -u):$(shell id -g)" \
+		-e HOME=/build \
+		-e CARGO_HOME=/build/.cargo \
+		-v "$(CURDIR):/workspace" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
+		-w "/workspace/$(SRC_DIR)" \
+		"$(INSTAR_IMAGE)" \
+		cargo generate-rpm -p vmm
+	@echo ""
+	@ls -la "$(SRC_DIR)/target/generate-rpm/"*.rpm
+
+# Build both Linux package formats.
+package: deb rpm
 
 # Clean the main instar build
 clean-instar:
