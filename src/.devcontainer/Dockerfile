@@ -64,7 +64,14 @@ RUN --mount=type=cache,target=/build/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/.cargo/git,sharing=locked \
     umask 0000 && cargo install cargo-deb cargo-generate-rpm
 
+# Install cargo-audit for `make audit` (RUSTSEC advisory check
+# against the workspace dependency tree).
+RUN --mount=type=cache,target=/build/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/.cargo/git,sharing=locked \
+    umask 0000 && cargo install cargo-audit
+
 # Verify installation
 RUN rustc --version && cargo --version && rust-objcopy --version \
     && cargo fuzz --version && cargo deb --version \
-    && cargo generate-rpm --version && protoc --version
+    && cargo generate-rpm --version && cargo audit --version \
+    && protoc --version
