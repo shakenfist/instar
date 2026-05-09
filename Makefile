@@ -13,7 +13,7 @@
         clean-devcontainers lint lint-fix build-lint-container \
         install-hooks run-prototype guest-protocol \
         instar instar-devcontainer clean-instar run-instar check-binary-sizes \
-        metadata deb rpm package \
+        metadata audit deb rpm package \
         test-venv test test-rust test-integration test-ci test-malicious test-report clean-tests \
         test-container test-container-core test-container-convert-qcow2 test-container-convert-vhd \
         clean-cargo-cache release check-version
@@ -35,6 +35,7 @@ help:
 	@echo "  run-instar            Show how to run instar"
 	@echo "  check-binary-sizes   Verify binaries fit within memory regions"
 	@echo "  metadata             Validate workspace Cargo.toml manifests parse"
+	@echo "  audit                Run cargo audit against the workspace"
 	@echo "  deb                  Build a Debian (.deb) package (requires 'make instar' first)"
 	@echo "  rpm                  Build an RPM (.rpm) package (requires 'make instar' first)"
 	@echo "  package              Build both .deb and .rpm packages"
@@ -154,6 +155,23 @@ metadata: instar-devcontainer
 		"$(INSTAR_IMAGE)" \
 		cargo metadata --format-version 1 --no-deps >/dev/null
 	@echo "Workspace manifests OK."
+
+# Run cargo audit against the workspace dependency tree. Reports
+# any open RUSTSEC advisories, exits non-zero on any vulnerability.
+# Used as part of the pre-release audit checklist.
+audit: instar-devcontainer
+	@echo "Running cargo audit..."
+	@mkdir -p "$(CURDIR)/$(CARGO_CACHE_DIR)/registry" "$(CURDIR)/$(CARGO_CACHE_DIR)/git"
+	docker run --rm \
+		-u "$(shell id -u):$(shell id -g)" \
+		-e HOME=/build \
+		-e CARGO_HOME=/build/.cargo \
+		-v "$(CURDIR):/workspace" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
+		-w "/workspace/$(SRC_DIR)" \
+		"$(INSTAR_IMAGE)" \
+		cargo audit
 
 # Build a Debian package from the artifacts produced by `make instar`.
 # Runs cargo-deb inside the devcontainer with --no-build so no
