@@ -11,5 +11,8 @@ categories = ["no-std", "parser-implementations"]
 # Not published to crates.io: internal to instar's bare-metal sandbox.
 publish = false
 
+[dependencies]
+shared = { path = "../../shared" }
+
 [lib]
 # No std, this is used by bare-metal code

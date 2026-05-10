@@ -29,6 +29,19 @@ pub enum PartitionTableType {
     Gpt,
 }
 
+/// Compute an allocation summary for a raw image.
+///
+/// Raw images carry no allocation metadata — every byte in the
+/// virtual range is treated as allocated. This mirrors how
+/// `qemu-img measure` treats raw input: it reports
+/// `fully-allocated == virtual_size`.
+pub fn scan_allocation(virtual_size: u64) -> shared::AllocationSummary {
+    shared::AllocationSummary {
+        virtual_size,
+        allocated_bytes: virtual_size,
+    }
+}
+
 /// Detect partition table type from the first sector.
 ///
 /// Detection logic:
@@ -97,6 +110,37 @@ mod tests {
         buf[510] = 0x55;
         buf[511] = 0xAA;
         buf
+    }
+
+    // ---- scan_allocation ----
+
+    #[test]
+    fn raw_scan_zero() {
+        let s = scan_allocation(0);
+        assert_eq!(s.virtual_size, 0);
+        assert_eq!(s.allocated_bytes, 0);
+    }
+
+    #[test]
+    fn raw_scan_one_sector() {
+        let s = scan_allocation(512);
+        assert_eq!(s.allocated_bytes, 512);
+    }
+
+    #[test]
+    fn raw_scan_one_gib() {
+        let s = scan_allocation(1024 * 1024 * 1024);
+        assert_eq!(s.virtual_size, s.allocated_bytes);
+        assert_eq!(s.allocated_bytes, 1 << 30);
+    }
+
+    #[test]
+    fn raw_scan_max_u64() {
+        // raw treats every byte as allocated, so the calculation is
+        // saturating-safe even at u64::MAX.
+        let s = scan_allocation(u64::MAX);
+        assert_eq!(s.virtual_size, u64::MAX);
+        assert_eq!(s.allocated_bytes, u64::MAX);
     }
 
     // ---- Buffer too short ----
