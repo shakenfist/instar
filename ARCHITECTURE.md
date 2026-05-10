@@ -190,6 +190,14 @@ provides a modular architecture with:
   derivation (behind `kdf-argon2` feature), AFsplitter key recovery,
   master key verification, and AES-XTS payload decryption (behind
   `decrypt` feature). Used by info and convert operations.
+- **crates/measure/** - Shared size-calculator crate (`no_std`, no I/O):
+  per-output-format estimators (raw / qcow2 / vmdk / vhd / vhdx) for the
+  `required` and `fully-allocated` byte counts that `qemu-img measure`
+  emits. The qcow2 estimator matches qemu-img's worst-case sizing
+  semantics (L2 tables sized for the full virtual range; refcount layout
+  sized once for the fully-allocated cluster count and reused for the
+  sparse case). Intended to be reused by the upcoming `measure` operation
+  (phase 3+ of `PLAN-measure.md`) and by `create` / `resize`.
 - **operations/info/** - Format detection operation
 - **operations/copy/** - File copy operation
 - **operations/check/** - Image integrity validation operation (with

@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Added `crates/measure/`: a `no_std` size-calculator library with
+  per-format estimators (raw, qcow2, vmdk, vhd, vhdx). Foundation for
+  the upcoming `measure` operation.
+  (PLAN-measure-phase-01-calculators.md)
+
 ## [0.2.0] - 2026-05-09
 
 First public release.
