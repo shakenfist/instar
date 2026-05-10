@@ -15,19 +15,7 @@
 
 #![no_std]
 
-/// Summary of source-side allocation as seen by a parser.
-///
-/// Phase 2 produces this from a parsed source image; phase 1 only
-/// consumes it as input to the measure functions.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct AllocationSummary {
-    /// Total addressable size of the source image in bytes.
-    pub virtual_size: u64,
-    /// Bytes that the source has marked as allocated (whether or not they
-    /// contain non-zero data). For raw input this equals `virtual_size`.
-    /// For sparse inputs it may be less.
-    pub allocated_bytes: u64,
-}
+pub use shared::AllocationSummary;
 
 /// The measured output sizes for a target format.
 ///

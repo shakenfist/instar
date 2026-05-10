@@ -433,6 +433,21 @@ pub const MAX_CLUSTER_SIZE: usize = 2 * 1024 * 1024;
 /// sector boundary.
 pub const COMPRESSED_BUF_SIZE: usize = MAX_CLUSTER_SIZE + MAX_SECTOR_SIZE;
 
+/// Summary of source-side allocation as seen by a parser.
+///
+/// Phase 2 of `PLAN-measure.md` produces this from a parsed source
+/// image; the `measure` crate consumes it as input to the per-format
+/// size calculators.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AllocationSummary {
+    /// Total addressable size of the source image in bytes.
+    pub virtual_size: u64,
+    /// Bytes that the source has marked as allocated (whether or not they
+    /// contain non-zero data). For raw input this equals `virtual_size`.
+    /// For sparse inputs it may be less.
+    pub allocated_bytes: u64,
+}
+
 /// Result from get_operation_config (FFI-safe alternative to tuple)
 #[repr(C)]
 #[derive(Clone, Copy)]
