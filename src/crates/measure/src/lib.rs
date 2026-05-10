@@ -425,8 +425,319 @@ impl Default for VmdkOpts {
 ///
 /// Supports `MonolithicSparse`, `StreamOptimized`, and `MonolithicFlat`
 /// sub-formats. Constants are sourced from the `vmdk` crate.
-pub fn measure_vmdk(_s: &AllocationSummary, _opts: &VmdkOpts) -> MeasureResult {
-    unimplemented!("step 1d")
+///
+/// # Formula sources
+///
+/// - `vmdk::DEFAULT_NUM_GTES_PER_GT` (= 512) — grain table entries per GT.
+/// - `vmdk::DESC_SECTORS` (= 20) — descriptor sectors reserved after the
+///   512-byte binary header. Sourced from `src/crates/vmdk/src/lib.rs`.
+/// - `vmdk::GRAIN_MARKER_SIZE` (= 12) — per-grain marker header for
+///   `StreamOptimized`. Sourced from `src/crates/vmdk/src/lib.rs`.
+/// - `vmdk::METADATA_MARKER_SIZE` (= 512) — metadata marker sector size.
+/// - `shared::MAX_SECTOR_SIZE` (= 65536) — alignment boundary used by the
+///   `StreamOptimized` writer to pad before the footer tail. Sourced from
+///   `src/operations/convert/src/main.rs:convert_to_vmdk_compressed`.
+///
+/// # MonolithicSparse layout (sourced from `init_vmdk_output_layout` /
+/// `convert_to_vmdk` in `src/operations/convert/src/main.rs`)
+///
+/// ```text
+/// header (512) | descriptor (DESC_SECTORS×512) | grain data | GTs | GD
+/// ```
+///
+/// GTs are allocated interleaved with grain data in the actual writer
+/// (one GT per GD entry that has ≥ 1 grain), but for measurement purposes we
+/// conservatively count `num_gd_entries` GTs in both `required` and
+/// `fully_allocated`. This is a strict upper bound for `required` (the real
+/// writer skips GTs for GD entries with no allocated grains), which ensures
+/// `measure_vmdk` is always ≥ the actual writer output size.
+///
+/// # StreamOptimized layout (sourced from `convert_to_vmdk_compressed`)
+///
+/// ```text
+/// header (512) | descriptor (DESC_SECTORS×512)
+/// | [grain_marker(12) + compressed_data, padded to 512] × allocated_grains
+/// | [GT_marker(512) + GT_data(padded to 512)] × num_gd_entries
+/// | GD_marker(512) + GD_data(padded to 512, min 512)
+/// | padding to MAX_SECTOR_SIZE boundary
+/// | footer_marker(512) + footer(512) + EOS(512)
+/// ```
+///
+/// Compressed size is bounded by `grain_size` (incompressible worst case),
+/// so each grain costs `grain_size + 512` bytes after the 12-byte marker
+/// bleeds into an additional 512-byte sector.
+///
+/// # MonolithicFlat layout
+///
+/// Two-file layout in the VMDK spec: a text descriptor file + a flat extent
+/// file. For measurement purposes we report `descriptor + extent` summed
+/// together so that both `required` and `fully_allocated` represent the total
+/// disk consumption. The descriptor is bounded to 1 sector (512 bytes); in
+/// practice it is smaller, making this a safe upper bound.
+pub fn measure_vmdk(s: &AllocationSummary, opts: &VmdkOpts) -> MeasureResult {
+    // ---- Validate options. -------------------------------------------------
+    let grain_size = opts.grain_size as u64;
+    if !(4096..=65536).contains(&grain_size) || !opts.grain_size.is_power_of_two() {
+        return Err(MeasureError::InvalidOption);
+    }
+
+    // ---- Validate sizes. ---------------------------------------------------
+    if s.allocated_bytes > s.virtual_size {
+        return Err(MeasureError::InvalidSize);
+    }
+
+    match opts.subformat {
+        VmdkSubformat::MonolithicSparse | VmdkSubformat::StreamOptimized => {
+            measure_vmdk_sparse_or_stream(s, opts, grain_size)
+        }
+        VmdkSubformat::MonolithicFlat => measure_vmdk_flat(s),
+    }
+}
+
+/// Internal helper for `MonolithicSparse` and `StreamOptimized`.
+fn measure_vmdk_sparse_or_stream(
+    s: &AllocationSummary,
+    opts: &VmdkOpts,
+    grain_size: u64,
+) -> MeasureResult {
+    // Constants from the vmdk crate.
+    // vmdk::DEFAULT_NUM_GTES_PER_GT = 512  (grain table entries per GT)
+    // vmdk::DESC_SECTORS = 20              (descriptor sectors, verified in
+    //                                      src/crates/vmdk/src/lib.rs:103)
+    let gtes_per_gt = vmdk::DEFAULT_NUM_GTES_PER_GT as u64;
+    let gt_bytes = gtes_per_gt.checked_mul(4).ok_or(MeasureError::Overflow)?; // = 2048
+
+    // ---- Grain/directory geometry. -----------------------------------------
+    let capacity_sectors = ceil_div(s.virtual_size, 512);
+    let grain_size_sectors = grain_size / 512; // grain_size is ≥ 4096, always > 0
+    let total_grains = ceil_div(capacity_sectors, grain_size_sectors);
+    let num_gd_entries = ceil_div(total_grains, gtes_per_gt);
+    let gd_bytes = num_gd_entries
+        .checked_mul(4)
+        .ok_or(MeasureError::Overflow)?;
+
+    // ---- Allocated grain counts. -------------------------------------------
+    let allocated_grains_required = ceil_div(s.allocated_bytes, grain_size);
+    let allocated_grains_full = total_grains;
+
+    // ---- Per-sub-format calculation. ----------------------------------------
+    match opts.subformat {
+        VmdkSubformat::MonolithicSparse => measure_vmdk_monolithic_sparse(
+            grain_size,
+            allocated_grains_required,
+            allocated_grains_full,
+            num_gd_entries,
+            gt_bytes,
+            gd_bytes,
+        ),
+        VmdkSubformat::StreamOptimized => measure_vmdk_stream_optimized(
+            grain_size,
+            allocated_grains_required,
+            allocated_grains_full,
+            num_gd_entries,
+            gt_bytes,
+            gd_bytes,
+        ),
+        VmdkSubformat::MonolithicFlat => unreachable!(),
+    }
+}
+
+/// Compute grain-data-start offset (= header + descriptor, aligned to 512).
+///
+/// header = 512 bytes
+/// descriptor = vmdk::DESC_SECTORS × 512 bytes
+///
+/// With output_sector_size = 512 (the on-disk grain alignment used for
+/// measure purposes), the result is exactly 512 + DESC_SECTORS * 512.
+#[inline]
+fn vmdk_grain_data_start() -> Result<u64, MeasureError> {
+    // 512 (header) + DESC_SECTORS * 512 (descriptor)
+    // vmdk::DESC_SECTORS = 20, so this is 512 + 10240 = 10752.
+    let desc_bytes = vmdk::DESC_SECTORS
+        .checked_mul(512)
+        .ok_or(MeasureError::Overflow)?;
+    let start = 512u64
+        .checked_add(desc_bytes)
+        .ok_or(MeasureError::Overflow)?;
+    Ok(start)
+}
+
+/// MonolithicSparse size calculation.
+///
+/// Layout: header | descriptor | [GT | grains]* | GD
+///
+/// For measurement, all `num_gd_entries` GTs are counted even for
+/// `required`, providing a safe upper bound.
+fn measure_vmdk_monolithic_sparse(
+    grain_size: u64,
+    allocated_grains_required: u64,
+    allocated_grains_full: u64,
+    num_gd_entries: u64,
+    gt_bytes: u64,
+    gd_bytes: u64,
+) -> MeasureResult {
+    let grain_data_start = vmdk_grain_data_start()?;
+
+    // GT overhead: each GT is padded to 512 bytes.
+    // round_up(gt_bytes=2048, 512) = 2048
+    let gt_padded = round_up_u64(gt_bytes, 512)?;
+    let all_gts = num_gd_entries
+        .checked_mul(gt_padded)
+        .ok_or(MeasureError::Overflow)?;
+
+    // GD overhead: padded to 512 bytes, minimum 512.
+    let gd_padded = round_up_u64(gd_bytes, 512)?.max(512);
+
+    // required
+    let grains_bytes_required = allocated_grains_required
+        .checked_mul(grain_size)
+        .ok_or(MeasureError::Overflow)?;
+    let required = checked_sum(&[grain_data_start, grains_bytes_required, all_gts, gd_padded])?;
+
+    // fully_allocated
+    let grains_bytes_full = allocated_grains_full
+        .checked_mul(grain_size)
+        .ok_or(MeasureError::Overflow)?;
+    let fully_allocated = checked_sum(&[grain_data_start, grains_bytes_full, all_gts, gd_padded])?;
+
+    Ok(MeasureOutput {
+        required,
+        fully_allocated,
+    })
+}
+
+/// StreamOptimized size calculation.
+///
+/// Layout: header | descriptor
+///         | [grain_marker(12) + compressed_data, padded to 512] × grains
+///         | [GT_marker(512) + GT_data(padded to 512)] × num_gd_entries
+///         | GD_marker(512) + GD_data(padded to 512, min 512)
+///         | padding to MAX_SECTOR_SIZE
+///         | footer_marker(512) + footer(512) + EOS(512)
+///
+/// Compressed size is bounded by grain_size (incompressible worst case),
+/// so each grain marker + data costs:
+///   round_up(12 + grain_size, 512) = grain_size + 512
+/// (the 12-byte preamble causes one extra 512-byte sector to be consumed).
+///
+/// The padding before the footer tail (3 × 512 = 1536 bytes) aligns the
+/// total file to a `MAX_SECTOR_SIZE` (65536-byte) boundary. This matches
+/// `convert_to_vmdk_compressed` in `src/operations/convert/src/main.rs`
+/// (lines 3561-3579).
+fn measure_vmdk_stream_optimized(
+    grain_size: u64,
+    allocated_grains_required: u64,
+    allocated_grains_full: u64,
+    num_gd_entries: u64,
+    gt_bytes: u64,
+    gd_bytes: u64,
+) -> MeasureResult {
+    let grain_data_start = vmdk_grain_data_start()?;
+
+    // Each grain: marker_preamble (12 bytes) + compressed_data, padded to 512.
+    // Worst case (incompressible): round_up(12 + grain_size, 512) = grain_size + 512
+    // because grain_size is already a multiple of 512 and 12 > 0 pushes into
+    // the next sector.
+    let per_grain_cost = grain_size.checked_add(512).ok_or(MeasureError::Overflow)?;
+
+    // GT overhead: GT marker (512) + GT data padded to 512.
+    // round_up(gt_bytes=2048, 512) = 2048
+    let gt_padded = round_up_u64(gt_bytes, 512)?;
+    // 512-byte GT marker per GD entry that has grain data; conservatively
+    // count all num_gd_entries (upper bound).
+    let gt_marker_cost = 512u64;
+    let per_gt_cost = gt_marker_cost
+        .checked_add(gt_padded)
+        .ok_or(MeasureError::Overflow)?;
+    let all_gts_cost = num_gd_entries
+        .checked_mul(per_gt_cost)
+        .ok_or(MeasureError::Overflow)?;
+
+    // GD overhead: GD marker (512) + GD data padded to 512, minimum 512.
+    let gd_data_padded = round_up_u64(gd_bytes, 512)?.max(512);
+    let gd_cost = 512u64
+        .checked_add(gd_data_padded)
+        .ok_or(MeasureError::Overflow)?;
+
+    // Footer tail: footer_marker(512) + footer(512) + EOS(512) = 1536 bytes.
+    // The writer pads (write_pos + 1536) to a MAX_SECTOR_SIZE boundary.
+    // MAX_SECTOR_SIZE = 65536, sourced from shared::MAX_SECTOR_SIZE.
+    let footer_tail: u64 = 3 * 512;
+    let max_sector_size: u64 = shared::MAX_SECTOR_SIZE as u64;
+
+    // required
+    let grains_cost_required = allocated_grains_required
+        .checked_mul(per_grain_cost)
+        .ok_or(MeasureError::Overflow)?;
+    let pre_footer_required = checked_sum(&[
+        grain_data_start,
+        grains_cost_required,
+        all_gts_cost,
+        gd_cost,
+    ])?;
+    let required = round_up_u64(
+        pre_footer_required
+            .checked_add(footer_tail)
+            .ok_or(MeasureError::Overflow)?,
+        max_sector_size,
+    )?;
+
+    // fully_allocated
+    let grains_cost_full = allocated_grains_full
+        .checked_mul(per_grain_cost)
+        .ok_or(MeasureError::Overflow)?;
+    let pre_footer_full =
+        checked_sum(&[grain_data_start, grains_cost_full, all_gts_cost, gd_cost])?;
+    let fully_allocated = round_up_u64(
+        pre_footer_full
+            .checked_add(footer_tail)
+            .ok_or(MeasureError::Overflow)?,
+        max_sector_size,
+    )?;
+
+    Ok(MeasureOutput {
+        required,
+        fully_allocated,
+    })
+}
+
+/// MonolithicFlat size calculation.
+///
+/// Two-file layout (descriptor + extent), but for measurement we report the
+/// sum of both files so the result is the total disk consumption. The
+/// descriptor is bounded to 1 sector (512 bytes) — an upper bound since in
+/// practice the descriptor is a short text file smaller than one sector.
+/// The extent is exactly `virtual_size` bytes (flat, no overhead).
+///
+/// For flat VMDK, `required == fully_allocated` regardless of allocation
+/// because the extent is always a dense file equal to `virtual_size`.
+fn measure_vmdk_flat(s: &AllocationSummary) -> MeasureResult {
+    // descriptor_size = 512 bytes (one sector, upper bound)
+    // extent_size = virtual_size (flat / dense, no sparseness)
+    let total = 512u64
+        .checked_add(s.virtual_size)
+        .ok_or(MeasureError::Overflow)?;
+    Ok(MeasureOutput {
+        required: total,
+        fully_allocated: total,
+    })
+}
+
+/// Round `a` up to the nearest multiple of `b`. Caller guarantees `b > 0`.
+#[inline]
+fn round_up_u64(a: u64, b: u64) -> Result<u64, MeasureError> {
+    if b == 0 {
+        return Err(MeasureError::Overflow);
+    }
+    if a == 0 {
+        return Ok(0);
+    }
+    let remainder = a % b;
+    if remainder == 0 {
+        Ok(a)
+    } else {
+        a.checked_add(b - remainder).ok_or(MeasureError::Overflow)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1423,5 +1734,395 @@ mod tests {
         let m_full = measure_qcow2(&s, &full).unwrap();
         assert_eq!(m_falloc, m_full);
         assert_eq!(m_falloc.required, m_falloc.fully_allocated);
+    }
+
+    // -----------------------------------------------------------------------
+    // VMDK tests
+    //
+    // All expected values are formula-derived (qemu-img does not support
+    // `measure -O vmdk`). See `measure_vmdk` doc-comment for the formula.
+    //
+    // Constants used throughout:
+    //   DESC_SECTORS = 20  → descriptor = 20 × 512 = 10240 bytes
+    //   header = 512 bytes
+    //   grain_data_start = 512 + 10240 = 10752 bytes
+    //   gtes_per_gt = 512
+    //   gt_bytes = 512 × 4 = 2048 bytes; round_up(2048, 512) = 2048
+    //
+    // -----------------------------------------------------------------------
+
+    // --- MonolithicSparse cases ---
+
+    #[test]
+    fn vmdk_mono_sparse_1m_64k_empty() {
+        // MonolithicSparse, 1M virtual, 64K grain, empty (allocated=0).
+        //
+        // capacity_sectors = ceil(1M / 512) = 2048
+        // grain_size_sectors = 65536 / 512 = 128
+        // total_grains = ceil(2048 / 128) = 16
+        // num_gd_entries = ceil(16 / 512) = 1
+        // gd_bytes = 1×4 = 4; round_up(4, 512) = 512
+        // allocated_grains_required = ceil(0 / 65536) = 0
+        //
+        // required = 10752 + 0×65536 + 1×2048 + 512
+        //          = 10752 + 2048 + 512 = 13312
+        //
+        // allocated_grains_full = 16
+        // fully_allocated = 10752 + 16×65536 + 1×2048 + 512
+        //                 = 10752 + 1048576 + 2048 + 512 = 1061888
+        let s = AllocationSummary {
+            virtual_size: MIB,
+            allocated_bytes: 0,
+        };
+        let opts = VmdkOpts {
+            subformat: VmdkSubformat::MonolithicSparse,
+            grain_size: 65536,
+        };
+        let m = measure_vmdk(&s, &opts).unwrap();
+        assert_eq!(m.required, 13312, "required");
+        assert_eq!(m.fully_allocated, 1061888, "fully_allocated");
+    }
+
+    #[test]
+    fn vmdk_mono_sparse_1g_64k_empty() {
+        // MonolithicSparse, 1G virtual, 64K grain, empty (allocated=0).
+        //
+        // capacity_sectors = ceil(1G / 512) = 2097152
+        // grain_size_sectors = 128
+        // total_grains = ceil(2097152 / 128) = 16384
+        // num_gd_entries = ceil(16384 / 512) = 32
+        // gd_bytes = 32×4 = 128; round_up(128, 512) = 512
+        // allocated_grains_required = 0
+        //
+        // required = 10752 + 0 + 32×2048 + 512
+        //          = 10752 + 65536 + 512 = 76800
+        //
+        // allocated_grains_full = 16384
+        // fully_allocated = 10752 + 16384×65536 + 32×2048 + 512
+        //                 = 10752 + 1073741824 + 65536 + 512 = 1073818624
+        let s = AllocationSummary {
+            virtual_size: GIB,
+            allocated_bytes: 0,
+        };
+        let opts = VmdkOpts {
+            subformat: VmdkSubformat::MonolithicSparse,
+            grain_size: 65536,
+        };
+        let m = measure_vmdk(&s, &opts).unwrap();
+        assert_eq!(m.required, 76800, "required");
+        assert_eq!(m.fully_allocated, 1073818624, "fully_allocated");
+    }
+
+    #[test]
+    fn vmdk_mono_sparse_1g_4k_full() {
+        // MonolithicSparse, 1G virtual, 4K grain, fully allocated.
+        //
+        // capacity_sectors = 2097152
+        // grain_size_sectors = 4096 / 512 = 8
+        // total_grains = ceil(2097152 / 8) = 262144
+        // num_gd_entries = ceil(262144 / 512) = 512
+        // gd_bytes = 512×4 = 2048; round_up(2048, 512) = 2048
+        // allocated_grains_required = ceil(1G / 4096) = 262144
+        //
+        // required = 10752 + 262144×4096 + 512×2048 + 2048
+        //          = 10752 + 1073741824 + 1048576 + 2048 = 1074803200
+        // fully_allocated = required (all grains allocated)
+        let s = AllocationSummary {
+            virtual_size: GIB,
+            allocated_bytes: GIB,
+        };
+        let opts = VmdkOpts {
+            subformat: VmdkSubformat::MonolithicSparse,
+            grain_size: 4096,
+        };
+        let m = measure_vmdk(&s, &opts).unwrap();
+        assert_eq!(m.required, 1074803200, "required");
+        assert_eq!(m.fully_allocated, 1074803200, "fully_allocated");
+        assert_eq!(m.required, m.fully_allocated);
+    }
+
+    // --- StreamOptimized cases ---
+    //
+    // Per-grain cost (worst-case incompressible):
+    //   round_up(GRAIN_MARKER_SIZE(12) + grain_size, 512) = grain_size + 512
+    //   (because grain_size is ≥ 512 and a multiple of 512, so the 12-byte
+    //   preamble pushes into an extra sector)
+    //
+    // Per-GT cost: GT_marker(512) + round_up(gt_bytes=2048, 512) = 512+2048 = 2560
+    //
+    // GD cost: GD_marker(512) + max(round_up(gd_bytes, 512), 512)
+    //
+    // Total = round_up(grain_data_start + grains_cost + all_gts_cost + gd_cost
+    //                  + 1536 [footer tail], 65536 [MAX_SECTOR_SIZE])
+
+    #[test]
+    fn vmdk_stream_optimized_1m_64k_empty() {
+        // StreamOptimized, 1M virtual, 64K grain, empty (allocated=0).
+        //
+        // grain_data_start = 10752
+        // num_gd_entries = 1; gd_bytes=4; round_up(4,512)=512
+        // grains_cost = 0×(65536+512) = 0
+        // all_gts_cost = 1×(512+2048) = 2560
+        // gd_cost = 512 + 512 = 1024
+        //
+        // pre_footer = 10752 + 0 + 2560 + 1024 = 14336
+        // total = round_up(14336 + 1536, 65536) = round_up(15872, 65536) = 65536
+        let s = AllocationSummary {
+            virtual_size: MIB,
+            allocated_bytes: 0,
+        };
+        let opts = VmdkOpts {
+            subformat: VmdkSubformat::StreamOptimized,
+            grain_size: 65536,
+        };
+        let m = measure_vmdk(&s, &opts).unwrap();
+        assert_eq!(m.required, 65536, "required");
+        // fully_allocated:
+        // allocated_grains_full = 16
+        // grains_cost_full = 16×(65536+512) = 16×66048 = 1056768
+        // pre_footer_full = 10752 + 1056768 + 2560 + 1024 = 1071104
+        // total_full = round_up(1071104+1536, 65536) = round_up(1072640, 65536)
+        //   1072640 / 65536 = 16.366... → ceil = 17 → 17×65536 = 1114112
+        assert_eq!(m.fully_allocated, 1114112, "fully_allocated");
+    }
+
+    #[test]
+    fn vmdk_stream_optimized_1g_64k_partial() {
+        // StreamOptimized, 1G virtual, 64K grain, partial (allocated=512K).
+        //
+        // grain_data_start = 10752
+        // capacity_sectors = 2097152; total_grains = 16384
+        // num_gd_entries = 32; gd_bytes=128; round_up(128,512)=512
+        // allocated_grains_required = ceil(512K / 64K) = 8
+        // grains_cost_required = 8×(65536+512) = 8×66048 = 528384
+        // all_gts_cost = 32×(512+2048) = 32×2560 = 81920
+        // gd_cost = 512 + 512 = 1024
+        //
+        // pre_footer_required = 10752 + 528384 + 81920 + 1024 = 622080
+        // required = round_up(622080+1536, 65536) = round_up(623616, 65536)
+        //   623616 / 65536 = 9.51... → ceil = 10 → 10×65536 = 655360
+        //
+        // allocated_grains_full = 16384
+        // grains_cost_full = 16384×(65536+512) = 16384×66048 = 1082130432
+        // pre_footer_full = 10752 + 1082130432 + 81920 + 1024 = 1082224128
+        // fully_allocated = round_up(1082224128+1536, 65536)
+        //   = round_up(1082225664, 65536)
+        //   1082225664 / 65536 = 16513.0... let's check: 16513×65536 = ?
+        //   16000×65536 = 1048576000; 513×65536 = 33619968
+        //   16513×65536 = 1048576000+33619968 = 1082195968 ≠ 1082225664
+        //   1082225664 / 65536 = 16513.49... → ceil = 16514
+        //   16514×65536 = 1082195968 + 65536 = 1082261504
+        let s = AllocationSummary {
+            virtual_size: GIB,
+            allocated_bytes: 512 * KIB,
+        };
+        let opts = VmdkOpts {
+            subformat: VmdkSubformat::StreamOptimized,
+            grain_size: 65536,
+        };
+        let m = measure_vmdk(&s, &opts).unwrap();
+        assert_eq!(m.required, 655360, "required");
+        assert_eq!(m.fully_allocated, 1082261504, "fully_allocated");
+    }
+
+    #[test]
+    fn vmdk_stream_optimized_1g_4k_full() {
+        // StreamOptimized, 1G virtual, 4K grain, fully allocated.
+        //
+        // grain_data_start = 10752
+        // capacity_sectors = 2097152
+        // grain_size_sectors = 8; total_grains = 262144
+        // num_gd_entries = 512; gd_bytes=2048; round_up(2048,512)=2048
+        // allocated_grains = 262144 (full)
+        // grains_cost = 262144×(4096+512) = 262144×4608 = 1207959552
+        // all_gts_cost = 512×(512+2048) = 512×2560 = 1310720
+        // gd_cost = 512 + 2048 = 2560
+        //
+        // pre_footer = 10752 + 1207959552 + 1310720 + 2560 = 1209283584
+        // total = round_up(1209283584+1536, 65536) = round_up(1209285120, 65536)
+        //   1209285120 / 65536 = ?
+        //   65536 × 18452 = 65536 × 18000 + 65536 × 452
+        //                 = 1179648000 + 29622272 = 1209270272
+        //   1209270272 < 1209285120 → need 18453
+        //   18453 × 65536 = 1209270272 + 65536 = 1209335808
+        //   1209335808 >= 1209285120+1536=1209286656 ✓
+        let s = AllocationSummary {
+            virtual_size: GIB,
+            allocated_bytes: GIB,
+        };
+        let opts = VmdkOpts {
+            subformat: VmdkSubformat::StreamOptimized,
+            grain_size: 4096,
+        };
+        let m = measure_vmdk(&s, &opts).unwrap();
+        assert_eq!(m.required, 1209335808, "required");
+        assert_eq!(m.fully_allocated, 1209335808, "fully_allocated");
+        assert_eq!(m.required, m.fully_allocated);
+    }
+
+    // --- MonolithicFlat cases ---
+
+    #[test]
+    fn vmdk_mono_flat_1m() {
+        // MonolithicFlat, 1M virtual (grain_size irrelevant for flat).
+        //
+        // required = descriptor(512) + virtual_size(1M)
+        //          = 512 + 1048576 = 1049088
+        // fully_allocated = required (flat is always dense)
+        let s = AllocationSummary {
+            virtual_size: MIB,
+            allocated_bytes: 0,
+        };
+        let opts = VmdkOpts {
+            subformat: VmdkSubformat::MonolithicFlat,
+            grain_size: 65536,
+        };
+        let m = measure_vmdk(&s, &opts).unwrap();
+        assert_eq!(m.required, 1049088);
+        assert_eq!(m.fully_allocated, 1049088);
+        assert_eq!(m.required, m.fully_allocated);
+    }
+
+    #[test]
+    fn vmdk_mono_flat_1g() {
+        // MonolithicFlat, 1G virtual.
+        //
+        // required = 512 + 1G = 512 + 1073741824 = 1073742336
+        let s = AllocationSummary {
+            virtual_size: GIB,
+            allocated_bytes: GIB,
+        };
+        let opts = VmdkOpts {
+            subformat: VmdkSubformat::MonolithicFlat,
+            grain_size: 65536,
+        };
+        let m = measure_vmdk(&s, &opts).unwrap();
+        assert_eq!(m.required, 1073742336);
+        assert_eq!(m.fully_allocated, 1073742336);
+    }
+
+    #[test]
+    fn vmdk_mono_flat_64m() {
+        // MonolithicFlat, 64M virtual, 4K grain (grain_size irrelevant).
+        //
+        // required = 512 + 64M = 512 + 67108864 = 67109376
+        let s = AllocationSummary {
+            virtual_size: 64 * MIB,
+            allocated_bytes: 32 * MIB,
+        };
+        let opts = VmdkOpts {
+            subformat: VmdkSubformat::MonolithicFlat,
+            grain_size: 4096,
+        };
+        let m = measure_vmdk(&s, &opts).unwrap();
+        assert_eq!(m.required, 67109376);
+        assert_eq!(m.fully_allocated, 67109376);
+    }
+
+    // --- VMDK option validation tests ---
+
+    #[test]
+    fn vmdk_grain_size_8192_is_valid() {
+        // 8192 is in [4096, 65536] and is a power of two — must succeed.
+        let s = AllocationSummary {
+            virtual_size: MIB,
+            allocated_bytes: 0,
+        };
+        let opts = VmdkOpts {
+            subformat: VmdkSubformat::MonolithicSparse,
+            grain_size: 8192,
+        };
+        assert!(measure_vmdk(&s, &opts).is_ok());
+    }
+
+    #[test]
+    fn vmdk_grain_size_2048_is_invalid() {
+        // 2048 < 4096 — below the floor.
+        let s = AllocationSummary {
+            virtual_size: MIB,
+            allocated_bytes: 0,
+        };
+        let opts = VmdkOpts {
+            subformat: VmdkSubformat::MonolithicSparse,
+            grain_size: 2048,
+        };
+        assert_eq!(measure_vmdk(&s, &opts), Err(MeasureError::InvalidOption));
+    }
+
+    #[test]
+    fn vmdk_grain_size_131072_is_invalid() {
+        // 131072 > 65536 — above the ceiling.
+        let s = AllocationSummary {
+            virtual_size: MIB,
+            allocated_bytes: 0,
+        };
+        let opts = VmdkOpts {
+            subformat: VmdkSubformat::MonolithicSparse,
+            grain_size: 131072,
+        };
+        assert_eq!(measure_vmdk(&s, &opts), Err(MeasureError::InvalidOption));
+    }
+
+    #[test]
+    fn vmdk_grain_size_12288_is_invalid() {
+        // 12288 is in [4096, 65536] but is NOT a power of two.
+        let s = AllocationSummary {
+            virtual_size: MIB,
+            allocated_bytes: 0,
+        };
+        let opts = VmdkOpts {
+            subformat: VmdkSubformat::MonolithicSparse,
+            grain_size: 12288,
+        };
+        assert_eq!(measure_vmdk(&s, &opts), Err(MeasureError::InvalidOption));
+    }
+
+    #[test]
+    fn vmdk_allocated_above_virtual_is_invalid() {
+        let s = AllocationSummary {
+            virtual_size: MIB,
+            allocated_bytes: MIB + 1,
+        };
+        let opts = VmdkOpts::default();
+        assert_eq!(measure_vmdk(&s, &opts), Err(MeasureError::InvalidSize));
+    }
+
+    // --- VMDK invariant checks ---
+
+    #[test]
+    fn vmdk_invariant_required_le_fully_allocated() {
+        // For all subformats and a spread of sizes/allocations,
+        // required <= fully_allocated must hold.
+        let sizes = [MIB, 64 * MIB, GIB];
+        let grains = [4096u32, 8192, 16384, 32768, 65536];
+        let subformats = [
+            VmdkSubformat::MonolithicSparse,
+            VmdkSubformat::StreamOptimized,
+            VmdkSubformat::MonolithicFlat,
+        ];
+        for &vs in &sizes {
+            for &gs in &grains {
+                for &sf in &subformats {
+                    let s = AllocationSummary {
+                        virtual_size: vs,
+                        allocated_bytes: vs / 2,
+                    };
+                    let opts = VmdkOpts {
+                        subformat: sf,
+                        grain_size: gs,
+                    };
+                    let m = measure_vmdk(&s, &opts)
+                        .unwrap_or_else(|e| panic!("vmdk invariant vs={vs} gs={gs}: {e:?}"));
+                    assert!(
+                        m.required <= m.fully_allocated,
+                        "required > fully_allocated: vs={vs} gs={gs}"
+                    );
+                    assert!(
+                        m.fully_allocated >= vs,
+                        "fully_allocated < virtual_size: vs={vs} gs={gs}"
+                    );
+                }
+            }
+        }
     }
 }
