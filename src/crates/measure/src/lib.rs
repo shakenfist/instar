@@ -938,10 +938,120 @@ impl Default for VhdxOpts {
 /// Measure a VHDX output image.
 ///
 /// Uses `vhdx::calculate_bat_layout()` directly for the BAT entry count
-/// rather than re-deriving the chunk-ratio formula. Constants (`MB_ALIGN`,
-/// `HEADER_SIZE`) are sourced from the `vhdx` crate.
-pub fn measure_vhdx(_s: &AllocationSummary, _opts: &VhdxOpts) -> MeasureResult {
-    unimplemented!("step 1f")
+/// rather than re-deriving the chunk-ratio / interleaved-sector-bitmap
+/// formula. The crate's `vhdx::MB_ALIGN` (= 1 MiB) constant defines the
+/// 1 MiB alignment that the VHDX spec mandates for every region.
+///
+/// # Layout (verified against the writer in
+/// `src/operations/convert/src/main.rs:4140-4602`)
+///
+/// ```text
+/// file_id      offset 0          (64 KiB region)
+/// header1      offset 0x10000    (64 KiB region, 4 KiB header)
+/// header2      offset 0x20000    (64 KiB region)
+/// region_t1    offset 0x30000    (64 KiB region)
+/// region_t2    offset 0x40000    (64 KiB region)
+/// log          offset 0x10_0000  (1 MiB region)
+/// bat          offset 0x20_0000  (round_up(bat_bytes, 1 MiB))
+/// metadata     follows BAT       (1 MiB region)
+/// payload      follows metadata  (each block round_up(block_size, 1 MiB))
+/// ```
+///
+/// The fixed pre-BAT overhead is exactly 2 MiB. The file id, both headers,
+/// and both region tables share the `[0, 0x10_0000)` range, then the log
+/// region occupies `[0x10_0000, 0x20_0000)`. After that the writer places
+/// the BAT at `0x20_0000` and the metadata region immediately following.
+/// VHDX has no trailing footer: the file ends after the last allocated
+/// payload block. The writer at
+/// `src/operations/convert/src/main.rs:4567` does not append a footer; it
+/// only rewrites the BAT in place.
+///
+/// # Formula
+///
+/// ```text
+/// fixed_pre_bat   = 2 * MB_ALIGN
+/// bat_region      = round_up(total_bat_entries * 8, MB_ALIGN)
+/// metadata_region = MB_ALIGN
+/// payload_start   = fixed_pre_bat + bat_region + metadata_region
+///
+/// block_alloc     = round_up(block_size, MB_ALIGN)
+///                   (== block_size when block_size is itself a power-of-two
+///                    >= 1 MiB, which is enforced by option validation)
+///
+/// required        = payload_start + ceil_div(allocated_bytes, block_size)
+///                                    * block_alloc
+/// fully_allocated = payload_start + total_payload_blocks * block_alloc
+/// ```
+///
+/// `total_payload_blocks` and `total_bat_entries` come from
+/// `vhdx::calculate_bat_layout(virtual_size, block_size, 512)`.
+/// `total_bat_entries` already accounts for the chunk-ratio interleaving
+/// (one sector-bitmap BAT entry every `chunk_ratio` payload entries) so
+/// no manual interleaving is needed here.
+pub fn measure_vhdx(s: &AllocationSummary, opts: &VhdxOpts) -> MeasureResult {
+    // ---- Validate options. -------------------------------------------------
+    // block_size: power of two in [1 MiB, 256 MiB].
+    let bs = opts.block_size as u64;
+    let min_bs: u64 = 1024 * 1024; // 1 MiB
+    let max_bs: u64 = 256 * 1024 * 1024; // 256 MiB
+    if bs < min_bs || bs > max_bs || !opts.block_size.is_power_of_two() {
+        return Err(MeasureError::InvalidOption);
+    }
+
+    // ---- Validate sizes. ---------------------------------------------------
+    if s.allocated_bytes > s.virtual_size {
+        return Err(MeasureError::InvalidSize);
+    }
+
+    // ---- BAT layout via the writer's helper. ------------------------------
+    // logical_sector_size = 512 (instar's writer hard-codes 512 for VHDX).
+    let (total_bat_entries, _chunk_ratio, total_payload_blocks) =
+        vhdx::calculate_bat_layout(s.virtual_size, opts.block_size, 512)
+            .ok_or(MeasureError::Overflow)?;
+
+    let total_bat_entries = total_bat_entries as u64;
+    let total_payload_blocks = total_payload_blocks as u64;
+
+    // ---- Pre-payload region sizes. ----------------------------------------
+    let mb_align = vhdx::MB_ALIGN; // 1 MiB
+    let fixed_pre_bat = mb_align.checked_mul(2).ok_or(MeasureError::Overflow)?;
+    let bat_size_bytes = total_bat_entries
+        .checked_mul(8)
+        .ok_or(MeasureError::Overflow)?;
+    let bat_region = round_up_u64(bat_size_bytes, mb_align)?;
+    let metadata_region = mb_align;
+    let payload_start = checked_sum(&[fixed_pre_bat, bat_region, metadata_region])?;
+
+    // ---- Per-block allocation cost. ---------------------------------------
+    // VHDX spec requires each payload block to start on a 1 MiB boundary, so
+    // each occupies round_up(block_size, MB_ALIGN). For the validated range
+    // [1 MiB, 256 MiB] this equals block_size, but the formula does not
+    // assume that.
+    let block_alloc = round_up_u64(bs, mb_align)?;
+
+    // ---- Allocated block counts. ------------------------------------------
+    let allocated_blocks_required = ceil_div(s.allocated_bytes, bs);
+    let allocated_blocks_full = total_payload_blocks;
+
+    // ---- Final sizes. ------------------------------------------------------
+    let payload_required = allocated_blocks_required
+        .checked_mul(block_alloc)
+        .ok_or(MeasureError::Overflow)?;
+    let payload_full = allocated_blocks_full
+        .checked_mul(block_alloc)
+        .ok_or(MeasureError::Overflow)?;
+
+    let required = payload_start
+        .checked_add(payload_required)
+        .ok_or(MeasureError::Overflow)?;
+    let fully_allocated = payload_start
+        .checked_add(payload_full)
+        .ok_or(MeasureError::Overflow)?;
+
+    Ok(MeasureOutput {
+        required,
+        fully_allocated,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2519,6 +2629,299 @@ mod tests {
                         "required > fully_allocated: vs={vs} bs={bs} alloc={alloc}"
                     );
                 }
+            }
+        }
+    }
+
+    // ====================================================================
+    // VHDX
+    // ====================================================================
+    //
+    // Layout of every VHDX dynamic image (verified against
+    // `convert_to_vhdx` in `src/operations/convert/src/main.rs:4140-4602`):
+    //
+    //   fixed_pre_bat   = 2 MiB        (file id + 2 headers + 2 region tables
+    //                                   share [0, 1 MiB); log region is
+    //                                   [1 MiB, 2 MiB))
+    //   bat_region      = round_up(total_bat_entries * 8, 1 MiB)
+    //   metadata_region = 1 MiB
+    //   payload_start   = fixed_pre_bat + bat_region + metadata_region
+    //
+    // total_bat_entries / total_payload_blocks come from
+    // `vhdx::calculate_bat_layout(virtual_size, block_size, 512)`, which is
+    // the same helper the writer uses, so the two cannot drift.
+
+    #[test]
+    fn vhdx_1gib_32mib_block_empty() {
+        // virtual_size = 1 GiB, block_size = 32 MiB, allocated = 0
+        //
+        // total_blocks = ceil(1 GiB / 32 MiB) = 32
+        // chunk_ratio  = (1<<23) * 512 / (32 MiB)
+        //              = 4 294 967 296 / 33 554 432 = 128
+        // sb_entries   = ceil(32 / 128) = 1
+        // total_bat_entries = 32 + 1 = 33
+        // bat_size_bytes    = 33 * 8 = 264
+        // bat_region        = round_up(264, 1 MiB) = 1 MiB
+        // payload_start     = 2 MiB + 1 MiB + 1 MiB = 4 MiB
+        // required          = 4 MiB + 0 = 4 194 304
+        // fully_allocated   = 4 MiB + 32 * 32 MiB
+        //                   = 4 MiB + 1024 MiB = 1028 MiB = 1 077 936 128
+        let s = AllocationSummary {
+            virtual_size: GIB,
+            allocated_bytes: 0,
+        };
+        let opts = VhdxOpts {
+            block_size: 32 * MIB as u32,
+        };
+        assert_eq!(
+            measure_vhdx(&s, &opts),
+            Ok(MeasureOutput {
+                required: 4 * MIB,
+                fully_allocated: 4 * MIB + 32 * 32 * MIB,
+            })
+        );
+    }
+
+    #[test]
+    fn vhdx_1gib_32mib_block_full() {
+        // virtual_size = 1 GiB, block_size = 32 MiB, allocated = 1 GiB
+        //
+        // allocated_blocks_required = ceil(1 GiB / 32 MiB) = 32
+        // required        = 4 MiB + 32 * 32 MiB = 1028 MiB = 1 077 936 128
+        // fully_allocated = same (whole image is allocated)
+        let s = AllocationSummary {
+            virtual_size: GIB,
+            allocated_bytes: GIB,
+        };
+        let opts = VhdxOpts {
+            block_size: 32 * MIB as u32,
+        };
+        let expected = 4 * MIB + 32 * 32 * MIB;
+        assert_eq!(
+            measure_vhdx(&s, &opts),
+            Ok(MeasureOutput {
+                required: expected,
+                fully_allocated: expected,
+            })
+        );
+    }
+
+    #[test]
+    fn vhdx_1gib_1mib_block_empty() {
+        // virtual_size = 1 GiB, block_size = 1 MiB, allocated = 0
+        //
+        // total_blocks = ceil(1 GiB / 1 MiB) = 1024
+        // chunk_ratio  = (1<<23) * 512 / (1 MiB) = 4 294 967 296 / 1 048 576
+        //              = 4096
+        // sb_entries   = ceil(1024 / 4096) = 1
+        // total_bat_entries = 1024 + 1 = 1025
+        // bat_size_bytes    = 1025 * 8 = 8200
+        // bat_region        = round_up(8200, 1 MiB) = 1 MiB
+        // payload_start     = 2 + 1 + 1 = 4 MiB
+        // required          = 4 MiB
+        // fully_allocated   = 4 MiB + 1024 * 1 MiB = 1028 MiB
+        let s = AllocationSummary {
+            virtual_size: GIB,
+            allocated_bytes: 0,
+        };
+        let opts = VhdxOpts {
+            block_size: MIB as u32,
+        };
+        assert_eq!(
+            measure_vhdx(&s, &opts),
+            Ok(MeasureOutput {
+                required: 4 * MIB,
+                fully_allocated: 4 * MIB + 1024 * MIB,
+            })
+        );
+    }
+
+    #[test]
+    fn vhdx_64gib_256mib_block_empty() {
+        // virtual_size = 64 GiB, block_size = 256 MiB (upper limit), alloc = 0
+        //
+        // total_blocks = ceil(64 GiB / 256 MiB) = 256
+        // chunk_ratio  = (1<<23) * 512 / (256 MiB)
+        //              = 4 294 967 296 / 268 435 456 = 16
+        // sb_entries   = ceil(256 / 16) = 16
+        // total_bat_entries = 256 + 16 = 272
+        // bat_size_bytes    = 272 * 8 = 2176
+        // bat_region        = round_up(2176, 1 MiB) = 1 MiB
+        // payload_start     = 4 MiB
+        // required          = 4 MiB
+        // fully_allocated   = 4 MiB + 256 * 256 MiB = 65540 MiB
+        let s = AllocationSummary {
+            virtual_size: 64 * GIB,
+            allocated_bytes: 0,
+        };
+        let opts = VhdxOpts {
+            block_size: 256 * MIB as u32,
+        };
+        assert_eq!(
+            measure_vhdx(&s, &opts),
+            Ok(MeasureOutput {
+                required: 4 * MIB,
+                fully_allocated: 4 * MIB + 256 * 256 * MIB,
+            })
+        );
+    }
+
+    // --- VHDX option validation tests ---
+
+    #[test]
+    fn vhdx_block_size_below_floor_is_invalid() {
+        // 512 KiB < 1 MiB — below the floor.
+        let s = AllocationSummary {
+            virtual_size: GIB,
+            allocated_bytes: 0,
+        };
+        let opts = VhdxOpts {
+            block_size: 512 * 1024,
+        };
+        assert_eq!(measure_vhdx(&s, &opts), Err(MeasureError::InvalidOption));
+    }
+
+    #[test]
+    fn vhdx_block_size_above_ceiling_is_invalid() {
+        // 512 MiB > 256 MiB — above the ceiling.
+        let s = AllocationSummary {
+            virtual_size: GIB,
+            allocated_bytes: 0,
+        };
+        let opts = VhdxOpts {
+            block_size: 512 * 1024 * 1024,
+        };
+        assert_eq!(measure_vhdx(&s, &opts), Err(MeasureError::InvalidOption));
+    }
+
+    #[test]
+    fn vhdx_block_size_not_power_of_two_is_invalid() {
+        // 3 MiB is in [1 MiB, 256 MiB] but is NOT a power of two.
+        let s = AllocationSummary {
+            virtual_size: GIB,
+            allocated_bytes: 0,
+        };
+        let opts = VhdxOpts {
+            block_size: 3 * 1024 * 1024,
+        };
+        assert_eq!(measure_vhdx(&s, &opts), Err(MeasureError::InvalidOption));
+    }
+
+    #[test]
+    fn vhdx_allocated_above_virtual_is_invalid() {
+        let s = AllocationSummary {
+            virtual_size: GIB,
+            allocated_bytes: GIB + 1,
+        };
+        let opts = VhdxOpts::default();
+        assert_eq!(measure_vhdx(&s, &opts), Err(MeasureError::InvalidSize));
+    }
+
+    // ====================================================================
+    // Format-wide invariants
+    // ====================================================================
+    //
+    // Per the phase plan: every measure function, for a small set of
+    // (virtual_size, allocated_bytes) combos with default options, must
+    // return Ok and satisfy the cross-format invariants
+    //
+    //   required <= fully_allocated
+    //   fully_allocated >= virtual_size  (raw + qcow2; the sparse formats'
+    //                                     fully_allocated also satisfies it
+    //                                     by construction but we only assert
+    //                                     it where it's a meaningful bound)
+    //   measure_*(allocated=0).required > 0  for non-empty virtual sizes
+    //                                        (every format has at least
+    //                                         header overhead).
+
+    #[test]
+    fn all_formats_invariants() {
+        // A small but spread-out set of sizes. Keep them above 0 so the
+        // "required > 0 for empty allocation" bound is meaningful, and
+        // include sizes that exercise multi-cluster / multi-block layouts.
+        // VHDX needs at least 1 MiB to produce >= 1 BAT entry.
+        let cases = [
+            (MIB, 0u64),
+            (MIB, MIB),
+            (64 * MIB, 0),
+            (64 * MIB, 16 * MIB),
+            (64 * MIB, 64 * MIB),
+            (GIB, 0),
+            (GIB, GIB / 4),
+            (GIB, GIB),
+        ];
+
+        for &(vs, alloc) in &cases {
+            let s = AllocationSummary {
+                virtual_size: vs,
+                allocated_bytes: alloc,
+            };
+
+            // raw
+            let m = measure_raw(vs).unwrap_or_else(|e| panic!("raw vs={vs}: {e:?}"));
+            assert!(m.required <= m.fully_allocated, "raw R<=F vs={vs}");
+            assert!(m.fully_allocated >= vs, "raw F>=V vs={vs}");
+
+            // qcow2 (default opts)
+            let m = measure_qcow2(&s, &Qcow2Opts::default())
+                .unwrap_or_else(|e| panic!("qcow2 vs={vs} alloc={alloc}: {e:?}"));
+            assert!(
+                m.required <= m.fully_allocated,
+                "qcow2 R<=F vs={vs} alloc={alloc}"
+            );
+            // qcow2 fully_allocated is always > virtual_size (header + L1 +
+            // L2 + refcount overhead).
+            assert!(
+                m.fully_allocated > vs,
+                "qcow2 F>V vs={vs} alloc={alloc} F={}",
+                m.fully_allocated
+            );
+
+            // vmdk (default opts: MonolithicSparse, 64 KiB grain)
+            let m = measure_vmdk(&s, &VmdkOpts::default())
+                .unwrap_or_else(|e| panic!("vmdk vs={vs} alloc={alloc}: {e:?}"));
+            assert!(
+                m.required <= m.fully_allocated,
+                "vmdk R<=F vs={vs} alloc={alloc}"
+            );
+
+            // vhd (default opts: Dynamic, 2 MiB block)
+            let m = measure_vhd(&s, &VhdOpts::default())
+                .unwrap_or_else(|e| panic!("vhd vs={vs} alloc={alloc}: {e:?}"));
+            assert!(
+                m.required <= m.fully_allocated,
+                "vhd R<=F vs={vs} alloc={alloc}"
+            );
+
+            // vhdx (default opts: 32 MiB block)
+            let m = measure_vhdx(&s, &VhdxOpts::default())
+                .unwrap_or_else(|e| panic!("vhdx vs={vs} alloc={alloc}: {e:?}"));
+            assert!(
+                m.required <= m.fully_allocated,
+                "vhdx R<=F vs={vs} alloc={alloc}"
+            );
+
+            // For allocated == 0, every format has non-trivial header
+            // overhead (raw is the exception: required == virtual_size,
+            // which is > 0 for all our non-empty sizes).
+            if alloc == 0 {
+                assert!(measure_raw(vs).unwrap().required > 0, "raw R>0 vs={vs}");
+                assert!(
+                    measure_qcow2(&s, &Qcow2Opts::default()).unwrap().required > 0,
+                    "qcow2 R>0 vs={vs}"
+                );
+                assert!(
+                    measure_vmdk(&s, &VmdkOpts::default()).unwrap().required > 0,
+                    "vmdk R>0 vs={vs}"
+                );
+                assert!(
+                    measure_vhd(&s, &VhdOpts::default()).unwrap().required > 0,
+                    "vhd R>0 vs={vs}"
+                );
+                assert!(
+                    measure_vhdx(&s, &VhdxOpts::default()).unwrap().required > 0,
+                    "vhdx R>0 vs={vs}"
+                );
             }
         }
     }
