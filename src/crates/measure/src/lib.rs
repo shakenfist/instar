@@ -114,8 +114,11 @@ pub enum VhdSubformat {
 ///
 /// For raw images `required` and `fully_allocated` are both equal to
 /// `virtual_size`; there is no format overhead.
-pub fn measure_raw(_virtual_size: u64) -> MeasureResult {
-    unimplemented!("step 1b")
+pub fn measure_raw(virtual_size: u64) -> MeasureResult {
+    Ok(MeasureOutput {
+        required: virtual_size,
+        fully_allocated: virtual_size,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -266,4 +269,83 @@ impl Default for VhdxOpts {
 /// `HEADER_SIZE`) are sourced from the `vhdx` crate.
 pub fn measure_vhdx(_s: &AllocationSummary, _opts: &VhdxOpts) -> MeasureResult {
     unimplemented!("step 1f")
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_zero() {
+        assert_eq!(
+            measure_raw(0),
+            Ok(MeasureOutput {
+                required: 0,
+                fully_allocated: 0
+            })
+        );
+    }
+
+    #[test]
+    fn raw_one_byte() {
+        assert_eq!(
+            measure_raw(1),
+            Ok(MeasureOutput {
+                required: 1,
+                fully_allocated: 1
+            })
+        );
+    }
+
+    #[test]
+    fn raw_511_bytes() {
+        // raw has no sector rounding; 511 bytes in → 511 bytes out
+        assert_eq!(
+            measure_raw(511),
+            Ok(MeasureOutput {
+                required: 511,
+                fully_allocated: 511
+            })
+        );
+    }
+
+    #[test]
+    fn raw_one_sector() {
+        assert_eq!(
+            measure_raw(512),
+            Ok(MeasureOutput {
+                required: 512,
+                fully_allocated: 512
+            })
+        );
+    }
+
+    #[test]
+    fn raw_one_mib() {
+        assert_eq!(
+            measure_raw(1024 * 1024),
+            Ok(MeasureOutput {
+                required: 1_048_576,
+                fully_allocated: 1_048_576
+            }),
+        );
+    }
+
+    #[test]
+    fn raw_max_u64() {
+        // u64::MAX as a virtual_size is hypothetical (qemu-img measure --size
+        // 18446744073709551615 -O raw errors at the CLI level), but raw output
+        // cannot overflow: both fields simply equal the input.
+        assert_eq!(
+            measure_raw(u64::MAX),
+            Ok(MeasureOutput {
+                required: u64::MAX,
+                fully_allocated: u64::MAX
+            }),
+        );
+    }
 }
