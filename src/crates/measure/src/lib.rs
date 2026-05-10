@@ -767,8 +767,152 @@ impl Default for VhdOpts {
 ///
 /// Supports `Dynamic` and `Fixed` sub-formats. Constants (`FOOTER_SIZE`,
 /// `DYNAMIC_HEADER_SIZE`) are sourced from the `vhd` crate.
-pub fn measure_vhd(_s: &AllocationSummary, _opts: &VhdOpts) -> MeasureResult {
-    unimplemented!("step 1e")
+///
+/// # Leading-footer question (answered by reading the writer)
+///
+/// The VHD specification says that dynamic VHDs have a copy of the footer
+/// at byte offset 0, followed by the dynamic header at offset 512.  The
+/// trailing (canonical) footer is appended after the last data block.
+///
+/// Instar's writer (`convert_to_vhd_dynamic` in
+/// `src/operations/convert/src/main.rs`) confirms this:
+///
+/// - Line 3702: `let footer_copy_offset: u64 = 0;`
+/// - Lines 3738-3761: "Write initial footer copy at offset 0" — calls
+///   `vhd::build_footer` then `write_bytes_to_output` at
+///   `footer_copy_offset = 0`, writing `align_up(FOOTER_SIZE, oss)` bytes.
+/// - Lines 4060-4075: writes the trailing (canonical) footer at
+///   `align_up(next_free_byte, oss)`.
+///
+/// With `oss = 512` (the on-disk sector size used during measurement),
+/// `align_up(FOOTER_SIZE=512, 512) = 512`, so the leading footer occupies
+/// exactly 512 bytes at offset 0.  The dynamic header follows at offset 512,
+/// the BAT follows at offset 1536 (512 + 1024), and so on.
+///
+/// # Fixed VHD layout
+///
+/// ```text
+/// [raw data, round_up(virtual_size, 512) bytes] | footer (512)
+/// ```
+///
+/// # Dynamic VHD layout
+///
+/// ```text
+/// footer_copy (512)
+/// | dynamic_header (1024)
+/// | BAT (bat_entries × 4, padded to 512)
+/// | [sector_bitmap + block_data] × allocated_blocks
+/// | trailing_footer (512)
+/// ```
+pub fn measure_vhd(s: &AllocationSummary, opts: &VhdOpts) -> MeasureResult {
+    // ---- Validate sizes. ---------------------------------------------------
+    if s.allocated_bytes > s.virtual_size {
+        return Err(MeasureError::InvalidSize);
+    }
+
+    match opts.subformat {
+        VhdSubformat::Fixed => measure_vhd_fixed(s),
+        VhdSubformat::Dynamic => {
+            // ---- Validate block_size for Dynamic. --------------------------
+            // Must be a power of two in [512 KiB, 2 GiB].
+            let bs = opts.block_size as u64;
+            let min_bs: u64 = 512 * 1024; // 512 KiB
+            let max_bs: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+            if bs < min_bs || bs > max_bs || !opts.block_size.is_power_of_two() {
+                return Err(MeasureError::InvalidOption);
+            }
+            measure_vhd_dynamic(s, bs)
+        }
+    }
+}
+
+/// Fixed VHD size calculation.
+///
+/// Layout: `[raw data, round_up(virtual_size, 512) bytes] | footer (512)`.
+///
+/// Fixed VHDs are dense; `required == fully_allocated` regardless of
+/// `allocated_bytes`.
+fn measure_vhd_fixed(s: &AllocationSummary) -> MeasureResult {
+    // Data region: round_up(virtual_size, 512).
+    let data_size = round_up_u64(s.virtual_size, 512)?;
+    // Trailing footer: vhd::FOOTER_SIZE = 512.
+    let total = data_size
+        .checked_add(vhd::FOOTER_SIZE as u64)
+        .ok_or(MeasureError::Overflow)?;
+    Ok(MeasureOutput {
+        required: total,
+        fully_allocated: total,
+    })
+}
+
+/// Dynamic VHD size calculation.
+///
+/// `block_size` has already been validated (power of two, [512 KiB, 2 GiB]).
+fn measure_vhd_dynamic(s: &AllocationSummary, block_size: u64) -> MeasureResult {
+    // ---- Header region. ---------------------------------------------------
+    // leading_footer  = 512  (footer copy at offset 0, verified in writer)
+    // dynamic_header  = 1024 (vhd::DYNAMIC_HEADER_SIZE)
+    let leading_footer = vhd::FOOTER_SIZE as u64; // 512
+    let dyn_header = vhd::DYNAMIC_HEADER_SIZE as u64; // 1024
+
+    // ---- BAT. -------------------------------------------------------------
+    let bat_entries = ceil_div(s.virtual_size, block_size);
+    let bat_bytes = bat_entries.checked_mul(4).ok_or(MeasureError::Overflow)?;
+    let bat_padded = round_up_u64(bat_bytes, 512)?;
+
+    // ---- Per-block overhead. -----------------------------------------------
+    // sector_bitmap_per_block = round_up(block_size / 512 / 8, 512)
+    //
+    // For block_size = 2 MiB (default):
+    //   2*1024*1024 / 512 / 8 = 512 → round_up(512, 512) = 512
+    // For block_size = 512 KiB:
+    //   512*1024 / 512 / 8 = 128 → round_up(128, 512) = 512
+    // For block_size = 4 MiB:
+    //   4*1024*1024 / 512 / 8 = 1024 → round_up(1024, 512) = 1024
+    // bitmap_bits = block_size / 512  (one bit per 512-byte logical sector)
+    let bitmap_bits = block_size / 512;
+    let bitmap_bytes_raw = ceil_div(bitmap_bits, 8); // bytes needed for the bitmap
+    let sector_bitmap = round_up_u64(bitmap_bytes_raw, 512)?; // rounded to 512
+
+    let block_overhead = sector_bitmap
+        .checked_add(block_size)
+        .ok_or(MeasureError::Overflow)?;
+
+    // ---- Allocated block counts. ------------------------------------------
+    let allocated_blocks_required = ceil_div(s.allocated_bytes, block_size);
+    let allocated_blocks_full = bat_entries; // every block in the virtual range
+
+    // ---- required. ---------------------------------------------------------
+    // leading_footer + dynamic_header + bat_padded
+    // + allocated_blocks_required * block_overhead
+    // + trailing_footer (512)
+    let data_required = allocated_blocks_required
+        .checked_mul(block_overhead)
+        .ok_or(MeasureError::Overflow)?;
+    let required = checked_sum(&[
+        leading_footer,
+        dyn_header,
+        bat_padded,
+        data_required,
+        vhd::FOOTER_SIZE as u64, // trailing footer
+    ])?;
+
+    // ---- fully_allocated. --------------------------------------------------
+    let data_full = allocated_blocks_full
+        .checked_mul(block_overhead)
+        .ok_or(MeasureError::Overflow)?;
+    let fully_allocated = checked_sum(&[
+        leading_footer,
+        dyn_header,
+        bat_padded,
+        data_full,
+        vhd::FOOTER_SIZE as u64, // trailing footer
+    ])?;
+
+    Ok(MeasureOutput {
+        required,
+        fully_allocated,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2085,6 +2229,298 @@ mod tests {
         };
         let opts = VmdkOpts::default();
         assert_eq!(measure_vmdk(&s, &opts), Err(MeasureError::InvalidSize));
+    }
+
+    // -----------------------------------------------------------------------
+    // VHD tests
+    //
+    // All expected values are formula-derived (qemu-img does not support
+    // `measure -O vpc`). The layout is verified by reading the writer code
+    // in `src/operations/convert/src/main.rs:convert_to_vhd_dynamic` which
+    // emits a real footer copy at offset 0 (see measure_vhd doc-comment).
+    //
+    // Constants used throughout:
+    //   FOOTER_SIZE            = 512  (vhd::FOOTER_SIZE)
+    //   DYNAMIC_HEADER_SIZE    = 1024 (vhd::DYNAMIC_HEADER_SIZE)
+    //   DEFAULT_BLOCK_SIZE     = 2 MiB = 2097152
+    //
+    // Dynamic VHD layout:
+    //   leading_footer (512) | dynamic_header (1024)
+    //   | BAT (bat_entries×4, padded to 512)
+    //   | [sector_bitmap + block_data] × allocated_blocks
+    //   | trailing_footer (512)
+    //
+    // sector_bitmap_per_block = round_up(block_size / 512 / 8, 512)
+    //   With block_size = 2 MiB:  2097152/512/8 = 512 → bitmap = 512
+    //   With block_size = 512 KiB: 524288/512/8 = 128 → bitmap = 512
+    //   With block_size = 2 GiB: 2147483648/512/8 = 524288 → bitmap = 524288
+    //
+    // block_overhead = sector_bitmap + block_size
+    //   With 2 MiB blocks:   512 + 2097152 = 2097664
+    //   With 512 KiB blocks: 512 +  524288 =  524800
+    //   With 2 GiB blocks: 524288 + 2147483648 = 2148007936
+    //
+    // Fixed VHD layout:
+    //   [raw data, round_up(virtual_size, 512)] | footer (512)
+    //
+    // -----------------------------------------------------------------------
+
+    // --- Fixed VHD ---
+
+    #[test]
+    fn vhd_fixed_1gib() {
+        // Fixed VHD, 1 GiB virtual.
+        //
+        // data = round_up(1G, 512) = 1G (already 512-aligned)
+        //      = 1073741824
+        // total = 1073741824 + 512 = 1073742336
+        // required == fully_allocated (fixed is always dense)
+        let s = AllocationSummary {
+            virtual_size: GIB,
+            allocated_bytes: GIB / 2,
+        };
+        let opts = VhdOpts {
+            subformat: VhdSubformat::Fixed,
+            block_size: 2 * 1024 * 1024,
+        };
+        let m = measure_vhd(&s, &opts).unwrap();
+        assert_eq!(m.required, 1_073_742_336, "required");
+        assert_eq!(m.fully_allocated, 1_073_742_336, "fully_allocated");
+        assert_eq!(m.required, m.fully_allocated);
+    }
+
+    // --- Dynamic VHD ---
+
+    #[test]
+    fn vhd_dynamic_1mib_2mib_block_empty() {
+        // Dynamic VHD, 1 MiB virtual, 2 MiB block_size, empty (allocated=0).
+        //
+        // bat_entries = ceil(1M / 2M) = 1
+        // bat_bytes = 1×4 = 4; bat_padded = round_up(4, 512) = 512
+        // sector_bitmap = round_up(2M/512/8, 512) = round_up(512, 512) = 512
+        // block_overhead = 512 + 2M = 512 + 2097152 = 2097664
+        //
+        // allocated_blocks_required = ceil(0 / 2M) = 0
+        // required = 512 + 1024 + 512 + 0×2097664 + 512
+        //          = 512 + 1024 + 512 + 0 + 512 = 2560
+        //
+        // allocated_blocks_full = bat_entries = 1
+        // fully_allocated = 512 + 1024 + 512 + 1×2097664 + 512
+        //                 = 512 + 1024 + 512 + 2097664 + 512 = 2100224
+        let s = AllocationSummary {
+            virtual_size: MIB,
+            allocated_bytes: 0,
+        };
+        let opts = VhdOpts {
+            subformat: VhdSubformat::Dynamic,
+            block_size: 2 * 1024 * 1024,
+        };
+        let m = measure_vhd(&s, &opts).unwrap();
+        assert_eq!(m.required, 2560, "required");
+        assert_eq!(m.fully_allocated, 2_100_224, "fully_allocated");
+    }
+
+    #[test]
+    fn vhd_dynamic_1gib_2mib_block_empty() {
+        // Dynamic VHD, 1 GiB virtual, 2 MiB block_size, empty (allocated=0).
+        //
+        // bat_entries = ceil(1G / 2M) = ceil(1073741824 / 2097152) = 512
+        // bat_bytes = 512×4 = 2048; bat_padded = round_up(2048, 512) = 2048
+        // sector_bitmap = round_up(2M/512/8, 512) = 512
+        // block_overhead = 512 + 2097152 = 2097664
+        //
+        // allocated_blocks_required = ceil(0 / 2M) = 0
+        // required = 512 + 1024 + 2048 + 0×2097664 + 512
+        //          = 512 + 1024 + 2048 + 0 + 512 = 4096
+        //
+        // allocated_blocks_full = 512
+        // fully_allocated = 512 + 1024 + 2048 + 512×2097664 + 512
+        //                 = 512 + 1024 + 2048 + 1074003968 + 512 = 1074008064
+        let s = AllocationSummary {
+            virtual_size: GIB,
+            allocated_bytes: 0,
+        };
+        let opts = VhdOpts {
+            subformat: VhdSubformat::Dynamic,
+            block_size: 2 * 1024 * 1024,
+        };
+        let m = measure_vhd(&s, &opts).unwrap();
+        assert_eq!(m.required, 4096, "required");
+        assert_eq!(m.fully_allocated, 1_074_008_064, "fully_allocated");
+    }
+
+    #[test]
+    fn vhd_dynamic_1gib_2mib_block_full() {
+        // Dynamic VHD, 1 GiB virtual, 2 MiB block_size, fully allocated.
+        //
+        // bat_entries = 512; bat_padded = 2048
+        // sector_bitmap = 512; block_overhead = 2097664
+        //
+        // allocated_blocks_required = ceil(1G / 2M) = 512
+        // required = 512 + 1024 + 2048 + 512×2097664 + 512
+        //          = 512 + 1024 + 2048 + 1074003968 + 512 = 1074008064
+        //
+        // fully_allocated = required (all blocks allocated)
+        let s = AllocationSummary {
+            virtual_size: GIB,
+            allocated_bytes: GIB,
+        };
+        let opts = VhdOpts {
+            subformat: VhdSubformat::Dynamic,
+            block_size: 2 * 1024 * 1024,
+        };
+        let m = measure_vhd(&s, &opts).unwrap();
+        assert_eq!(m.required, 1_074_008_064, "required");
+        assert_eq!(m.fully_allocated, 1_074_008_064, "fully_allocated");
+        assert_eq!(m.required, m.fully_allocated);
+    }
+
+    #[test]
+    fn vhd_dynamic_1gib_512kib_block_empty() {
+        // Dynamic VHD, 1 GiB virtual, 512 KiB block_size, empty.
+        //
+        // bat_entries = ceil(1G / 512K) = ceil(1073741824 / 524288) = 2048
+        // bat_bytes = 2048×4 = 8192; bat_padded = round_up(8192, 512) = 8192
+        // sector_bitmap = round_up(512K/512/8, 512) = round_up(128, 512) = 512
+        // block_overhead = 512 + 524288 = 524800
+        //
+        // allocated_blocks_required = ceil(0 / 512K) = 0
+        // required = 512 + 1024 + 8192 + 0×524800 + 512
+        //          = 512 + 1024 + 8192 + 0 + 512 = 10240
+        //
+        // allocated_blocks_full = 2048
+        // fully_allocated = 512 + 1024 + 8192 + 2048×524800 + 512
+        //                 = 512 + 1024 + 8192 + 1074790400 + 512 = 1074800640
+        let s = AllocationSummary {
+            virtual_size: GIB,
+            allocated_bytes: 0,
+        };
+        let opts = VhdOpts {
+            subformat: VhdSubformat::Dynamic,
+            block_size: 512 * 1024,
+        };
+        let m = measure_vhd(&s, &opts).unwrap();
+        assert_eq!(m.required, 10240, "required");
+        assert_eq!(m.fully_allocated, 1_074_800_640, "fully_allocated");
+    }
+
+    #[test]
+    fn vhd_dynamic_64gib_2gib_block_empty() {
+        // Dynamic VHD, 64 GiB virtual, 2 GiB block_size, empty.
+        // (This exercises the upper block_size limit of 2 GiB.)
+        //
+        // block_size = 2 GiB = 2147483648
+        // bat_entries = ceil(64G / 2G) = ceil(68719476736 / 2147483648) = 32
+        // bat_bytes = 32×4 = 128; bat_padded = round_up(128, 512) = 512
+        // sector_bitmap = round_up(2G/512/8, 512)
+        //               = round_up(2147483648/512/8, 512)
+        //               = round_up(524288, 512) = 524288
+        // block_overhead = 524288 + 2147483648 = 2148007936
+        //
+        // allocated_blocks_required = ceil(0 / 2G) = 0
+        // required = 512 + 1024 + 512 + 0×2148007936 + 512
+        //          = 512 + 1024 + 512 + 0 + 512 = 2560
+        //
+        // allocated_blocks_full = 32
+        // fully_allocated = 512 + 1024 + 512 + 32×2148007936 + 512
+        //                 = 512 + 1024 + 512 + 68736253952 + 512 = 68736256512
+        let s = AllocationSummary {
+            virtual_size: 64 * GIB,
+            allocated_bytes: 0,
+        };
+        let opts = VhdOpts {
+            subformat: VhdSubformat::Dynamic,
+            block_size: 2 * 1024 * 1024 * 1024,
+        };
+        let m = measure_vhd(&s, &opts).unwrap();
+        assert_eq!(m.required, 2560, "required");
+        assert_eq!(m.fully_allocated, 68_736_256_512, "fully_allocated");
+    }
+
+    // --- VHD option validation tests ---
+
+    #[test]
+    fn vhd_dynamic_block_size_4096_is_invalid() {
+        // 4096 < 512 KiB — below the floor.
+        let s = AllocationSummary {
+            virtual_size: GIB,
+            allocated_bytes: 0,
+        };
+        let opts = VhdOpts {
+            subformat: VhdSubformat::Dynamic,
+            block_size: 4096,
+        };
+        assert_eq!(measure_vhd(&s, &opts), Err(MeasureError::InvalidOption));
+    }
+
+    #[test]
+    fn vhd_dynamic_block_size_4gib_is_invalid() {
+        // 4 GiB > 2 GiB — above the ceiling.
+        // 4 GiB = 4294967296 which overflows u32, so we use a u32 that wraps:
+        // 4294967295 = u32::MAX, which is also > 2 GiB and thus invalid.
+        let s = AllocationSummary {
+            virtual_size: GIB,
+            allocated_bytes: 0,
+        };
+        let opts = VhdOpts {
+            subformat: VhdSubformat::Dynamic,
+            block_size: u32::MAX, // > 2 GiB
+        };
+        assert_eq!(measure_vhd(&s, &opts), Err(MeasureError::InvalidOption));
+    }
+
+    #[test]
+    fn vhd_dynamic_block_size_768k_not_power_of_two() {
+        // 768 KiB = 786432 is in [512 KiB, 2 GiB] but is NOT a power of two.
+        let s = AllocationSummary {
+            virtual_size: GIB,
+            allocated_bytes: 0,
+        };
+        let opts = VhdOpts {
+            subformat: VhdSubformat::Dynamic,
+            block_size: 768 * 1024,
+        };
+        assert_eq!(measure_vhd(&s, &opts), Err(MeasureError::InvalidOption));
+    }
+
+    #[test]
+    fn vhd_allocated_above_virtual_is_invalid() {
+        let s = AllocationSummary {
+            virtual_size: GIB,
+            allocated_bytes: GIB + 1,
+        };
+        let opts = VhdOpts::default();
+        assert_eq!(measure_vhd(&s, &opts), Err(MeasureError::InvalidSize));
+    }
+
+    // --- VHD invariant checks ---
+
+    #[test]
+    fn vhd_invariant_required_le_fully_allocated() {
+        // For both subformats and a spread of sizes/allocations,
+        // required <= fully_allocated must hold.
+        let sizes = [MIB, 64 * MIB, GIB];
+        let block_sizes = [512 * 1024u32, 1024 * 1024, 2 * 1024 * 1024];
+        for &vs in &sizes {
+            for &bs in &block_sizes {
+                for &alloc in &[0u64, vs / 2, vs] {
+                    let s = AllocationSummary {
+                        virtual_size: vs,
+                        allocated_bytes: alloc,
+                    };
+                    let opts = VhdOpts {
+                        subformat: VhdSubformat::Dynamic,
+                        block_size: bs,
+                    };
+                    let m = measure_vhd(&s, &opts)
+                        .unwrap_or_else(|e| panic!("vhd invariant vs={vs} bs={bs}: {e:?}"));
+                    assert!(
+                        m.required <= m.fully_allocated,
+                        "required > fully_allocated: vs={vs} bs={bs} alloc={alloc}"
+                    );
+                }
+            }
+        }
     }
 
     // --- VMDK invariant checks ---
