@@ -423,7 +423,7 @@ where the logic overlaps; that is captured under Future work.
 
 | Phase | Plan | Status |
 |-------|------|--------|
-| 1. Per-format size calculators (`crates/measure/`) | PLAN-measure-phase-01-calculators.md (not yet written) | Not started |
+| 1. Per-format size calculators (`crates/measure/`) | [PLAN-measure-phase-01-calculators.md](PLAN-measure-phase-01-calculators.md) | Not started |
 | 2. Source-allocation scanners on parser crates | PLAN-measure-phase-02-allocation-scanners.md (not yet written) | Not started |
 | 3. Guest `measure` operation + protobuf | PLAN-measure-phase-03-guest-op.md (not yet written) | Not started |
 | 4. Host VMM subcommand + clap surface | PLAN-measure-phase-04-host-cli.md (not yet written) | Not started |
