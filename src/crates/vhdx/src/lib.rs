@@ -12,7 +12,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use shared::{
-    le_u16, le_u32, le_u64, write_le_u16, write_le_u32, write_le_u64, CallTable, MAX_SECTOR_SIZE,
+    le_u16, le_u32, le_u64, write_le_u16, write_le_u32, write_le_u64, AllocationSummary, CallTable,
+    MAX_SECTOR_SIZE,
 };
 
 // ============================================================================
@@ -528,6 +529,89 @@ pub unsafe fn parse_metadata(
 }
 
 // ============================================================================
+// Allocation scanner (pure helper)
+// ============================================================================
+
+/// Count VHDX payload-block entries that are FULLY_PRESENT or
+/// PARTIALLY_PRESENT in a BAT byte slice, skipping the interleaved
+/// sector-bitmap entries.
+///
+/// Each entry is a little-endian u64 with the state in the low
+/// 3 bits. The BAT layout is repeating groups of `chunk_ratio`
+/// payload-block entries followed by one sector-bitmap entry. The
+/// helper stops counting once it has visited `total_payload_blocks`
+/// payload entries (later entries are unused tail; some images may
+/// allocate extra BAT space and zero-fill the unused region).
+///
+/// `bat_bytes` may have a trailing partial entry — incomplete u64
+/// entries at the tail are ignored.
+///
+/// `chunk_ratio == 0` is invalid; the helper returns 0 in that case
+/// rather than dividing by zero.
+///
+/// Note: `PARTIALLY_PRESENT` is counted as one full block here. That
+/// is a slight overcount for adversarial input (the exact answer
+/// would sum the sector-bitmap bits), but matches qemu-img-compatible
+/// upper-bound semantics that `required` is allowed to honor. instar's
+/// writer only emits `FULLY_PRESENT` or `NOT_PRESENT`, so this only
+/// affects externally-produced images.
+pub fn count_allocated_in_bat(
+    bat_bytes: &[u8],
+    chunk_ratio: u32,
+    total_payload_blocks: u32,
+) -> u64 {
+    let (count, _) =
+        count_allocated_in_bat_chunk(bat_bytes, chunk_ratio, total_payload_blocks, 0, 0);
+    count
+}
+
+/// Incremental variant of `count_allocated_in_bat` for chunked BAT
+/// walks across multiple cached sector reads.
+///
+/// `start_entry_index` is the global BAT entry index (counting both
+/// payload and sector-bitmap slots) of the first u64 in `bat_bytes`.
+/// `payload_seen` is the number of payload entries already visited
+/// before this chunk. Returns `(count_in_this_chunk,
+/// payload_seen_after_this_chunk)`.
+pub(crate) fn count_allocated_in_bat_chunk(
+    bat_bytes: &[u8],
+    chunk_ratio: u32,
+    total_payload_blocks: u32,
+    start_entry_index: u64,
+    payload_seen_in: u64,
+) -> (u64, u64) {
+    if chunk_ratio == 0 {
+        return (0, payload_seen_in);
+    }
+    let group = chunk_ratio as u64 + 1;
+    let total_payload = total_payload_blocks as u64;
+    let mut count: u64 = 0;
+    let mut payload_seen = payload_seen_in;
+    for (offset, chunk) in bat_bytes.chunks_exact(8).enumerate() {
+        let i = start_entry_index + offset as u64;
+        let slot_in_group = i % group;
+        if slot_in_group < chunk_ratio as u64 {
+            // Payload-block entry.
+            if payload_seen >= total_payload {
+                // Cap reached; the rest of the BAT is unused tail.
+                // Once capped we will never count again.
+                break;
+            }
+            payload_seen += 1;
+            let entry = u64::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ]);
+            let state = entry & BAT_ENTRY_STATE_MASK;
+            if state == PAYLOAD_BLOCK_FULLY_PRESENT || state == PAYLOAD_BLOCK_PARTIALLY_PRESENT {
+                count += 1;
+            }
+        }
+        // slot_in_group == chunk_ratio: sector-bitmap entry — skip.
+    }
+    (count, payload_seen)
+}
+
+// ============================================================================
 // Block lookup result
 // ============================================================================
 
@@ -877,6 +961,140 @@ impl VhdxState {
             // differencing disks in init, so treat as error.
             _ => None,
         }
+    }
+
+    /// Walk the BAT and produce an `AllocationSummary`.
+    ///
+    /// Reads the BAT region in `MAX_SECTOR_SIZE`-sized cached sector
+    /// chunks, threads a running BAT entry index through
+    /// [`count_allocated_in_bat_chunk`] so interleaved sector-bitmap
+    /// entries are correctly skipped across chunk boundaries, and
+    /// multiplies the resulting payload-block count by `block_size`.
+    ///
+    /// Returns `None` if any I/O call fails. The caller treats `None`
+    /// as an unrecoverable format error.
+    ///
+    /// # Safety
+    ///
+    /// `call_table` must be valid. `bat_cache_buf` must still be valid
+    /// and point to at least `MAX_SECTOR_SIZE` writable bytes.
+    pub unsafe fn scan_allocation(
+        &mut self,
+        call_table: &CallTable,
+        sector_size: usize,
+        input_capacity: u64,
+        bytes_read: &mut u64,
+    ) -> Option<AllocationSummary> {
+        let virtual_size = self.virtual_disk_size;
+        // Guard against degenerate input: zero virtual size or zero
+        // BAT entries means nothing to scan.
+        if virtual_size == 0 || self.total_bat_entries == 0 || self.chunk_ratio == 0 {
+            return Some(AllocationSummary {
+                virtual_size,
+                allocated_bytes: 0,
+            });
+        }
+
+        let total_payload_blocks_u64 = virtual_size.div_ceil(self.block_size as u64);
+        // Already validated to fit u32 in init.
+        let total_payload_blocks = u32::try_from(total_payload_blocks_u64).ok()?;
+
+        let total_bat_bytes = (self.total_bat_entries as u64).checked_mul(8)?;
+        let bat_start_sector = self.bat_offset / sector_size as u64;
+        let bat_end_byte = self.bat_offset.checked_add(total_bat_bytes)?;
+        // Round up to the next sector boundary so we cover any partial
+        // sector at the end of the BAT.
+        let bat_end_sector = bat_end_byte.checked_add(sector_size as u64 - 1)? / sector_size as u64;
+
+        let mut allocated_blocks: u64 = 0;
+        // Global BAT entry index (counts both payload and sector-bitmap
+        // slots) of the next u64 to be visited.
+        let mut entry_index: u64 = 0;
+        let mut payload_seen: u64 = 0;
+        // Bytes of BAT we have logically consumed so far (used to bound
+        // the slice handed to the helper so sector padding is ignored).
+        let mut bat_bytes_consumed: u64 = 0;
+
+        let mut sector = bat_start_sector;
+        while sector < bat_end_sector {
+            if sector >= input_capacity {
+                return None;
+            }
+            if !(call_table.read_input_sector)(
+                self.device_idx,
+                sector,
+                self.bat_cache_buf,
+                sector_size,
+            ) {
+                return None;
+            }
+            // Invalidate the byte-level BAT cache: scan_allocation
+            // overwrites bat_cache_buf with its own raw reads, so any
+            // future read_u64_le_cached must reload from disk.
+            self.bat_cached_sector = u64::MAX;
+            *bytes_read += sector_size as u64;
+
+            let sector_byte_start = sector * sector_size as u64;
+            // Offset of the first BAT byte within this sector's buffer.
+            let buf_start = if sector_byte_start < self.bat_offset {
+                (self.bat_offset - sector_byte_start) as usize
+            } else {
+                0
+            };
+            let buf_end =
+                sector_size.min((bat_end_byte.saturating_sub(sector_byte_start)) as usize);
+            if buf_end <= buf_start {
+                sector += 1;
+                continue;
+            }
+            let chunk =
+                core::slice::from_raw_parts(self.bat_cache_buf.add(buf_start), buf_end - buf_start);
+
+            // Clamp to the meaningful BAT bytes (ignore sector padding
+            // at the tail of the final sector).
+            let meaningful_len =
+                (total_bat_bytes - bat_bytes_consumed).min((buf_end - buf_start) as u64) as usize;
+            let meaningful = &chunk[..meaningful_len];
+
+            // Trim to an 8-byte boundary — the global entry rotation
+            // requires that each chunk processed by the helper start
+            // on a BAT entry boundary. The BAT itself is u64-aligned
+            // by construction (offset is 1MB-aligned, length is a
+            // multiple of 8), but a sector may end mid-entry.
+            let aligned_len = meaningful_len - (meaningful_len % 8);
+            let aligned = &meaningful[..aligned_len];
+
+            let (chunk_count, new_payload_seen) = count_allocated_in_bat_chunk(
+                aligned,
+                self.chunk_ratio,
+                total_payload_blocks,
+                entry_index,
+                payload_seen,
+            );
+            allocated_blocks += chunk_count;
+            // Advance the global entry index by the number of complete
+            // entries we processed.
+            entry_index += (aligned_len / 8) as u64;
+            payload_seen = new_payload_seen;
+            bat_bytes_consumed += aligned_len as u64;
+
+            // If we trimmed bytes off this sector (mid-entry tail),
+            // we must NOT advance to the next sector — we need to
+            // re-read so the trailing bytes are included. But because
+            // sector_size is a multiple of 8 in practice (>= 512) and
+            // the BAT is u64-aligned, aligned_len == meaningful_len in
+            // all real cases. Still, be defensive: if aligned_len <
+            // meaningful_len we skip the trailing partial entry, since
+            // it cannot be a complete BAT entry by definition.
+            sector += 1;
+        }
+
+        let allocated_bytes = allocated_blocks.saturating_mul(self.block_size as u64);
+
+        Some(AllocationSummary {
+            virtual_size,
+            allocated_bytes,
+        })
     }
 }
 
@@ -1345,6 +1563,185 @@ mod tests {
         let stored_crc = le_u32(&buf, REGION_TABLE_CHECKSUM_OFFSET);
         let computed_crc = compute_crc32c(&buf, REGION_TABLE_CHECKSUM_OFFSET);
         assert_eq!(stored_crc, computed_crc);
+    }
+
+    // ====================================================================
+    // count_allocated_in_bat tests (phase 2d)
+    // ====================================================================
+
+    /// Build an 8-byte LE BAT entry with the given state and a deterministic
+    /// nonzero offset (so we can detect accidental state/offset confusion).
+    fn make_bat_entry(state: u64, offset_mb: u64) -> [u8; 8] {
+        let entry = (state & BAT_ENTRY_STATE_MASK) | ((offset_mb << 20) & BAT_ENTRY_OFFSET_MASK);
+        entry.to_le_bytes()
+    }
+
+    #[test]
+    fn count_allocated_in_bat_empty() {
+        assert_eq!(count_allocated_in_bat(&[], 128, 0), 0);
+    }
+
+    #[test]
+    fn count_allocated_in_bat_single_fully_present() {
+        let buf = make_bat_entry(PAYLOAD_BLOCK_FULLY_PRESENT, 4);
+        assert_eq!(count_allocated_in_bat(&buf, 128, 1), 1);
+    }
+
+    #[test]
+    fn count_allocated_in_bat_total_zero_caps_count() {
+        // One fully-present entry but the caller says zero payload blocks;
+        // the cap clips the count to zero.
+        let buf = make_bat_entry(PAYLOAD_BLOCK_FULLY_PRESENT, 4);
+        assert_eq!(count_allocated_in_bat(&buf, 128, 0), 0);
+    }
+
+    /// Write an 8-byte LE BAT entry into `buf` at position `i * 8`.
+    fn put_bat_entry(buf: &mut [u8], i: usize, state: u64, offset_mb: u64) {
+        let bytes = make_bat_entry(state, offset_mb);
+        buf[i * 8..i * 8 + 8].copy_from_slice(&bytes);
+    }
+
+    #[test]
+    fn count_allocated_in_bat_group_with_bitmap_skipped() {
+        // chunk_ratio=8: layout is 8 payload entries then 1 bitmap.
+        // All 8 payload entries are FULLY_PRESENT. The bitmap entry
+        // (deliberately set to FULLY_PRESENT to verify it is skipped
+        // by position, not by state) must not be counted.
+        let mut buf = [0u8; 9 * 8];
+        for i in 0..8 {
+            put_bat_entry(&mut buf, i, PAYLOAD_BLOCK_FULLY_PRESENT, (i + 1) as u64);
+        }
+        put_bat_entry(&mut buf, 8, PAYLOAD_BLOCK_FULLY_PRESENT, 99);
+        assert_eq!(count_allocated_in_bat(&buf, 8, 8), 8);
+    }
+
+    #[test]
+    fn count_allocated_in_bat_mixed_states() {
+        // chunk_ratio=8: 3 FULLY_PRESENT + 1 PARTIALLY_PRESENT + 2 ZERO
+        // + 1 NOT_PRESENT + 1 UNDEFINED, then a bitmap entry.
+        let mut buf = [0u8; 9 * 8];
+        put_bat_entry(&mut buf, 0, PAYLOAD_BLOCK_FULLY_PRESENT, 1);
+        put_bat_entry(&mut buf, 1, PAYLOAD_BLOCK_FULLY_PRESENT, 2);
+        put_bat_entry(&mut buf, 2, PAYLOAD_BLOCK_FULLY_PRESENT, 3);
+        put_bat_entry(&mut buf, 3, PAYLOAD_BLOCK_PARTIALLY_PRESENT, 4);
+        put_bat_entry(&mut buf, 4, PAYLOAD_BLOCK_ZERO, 0);
+        put_bat_entry(&mut buf, 5, PAYLOAD_BLOCK_ZERO, 0);
+        put_bat_entry(&mut buf, 6, PAYLOAD_BLOCK_NOT_PRESENT, 0);
+        put_bat_entry(&mut buf, 7, PAYLOAD_BLOCK_UNDEFINED, 0);
+        // Bitmap entry slot (the 9th, slot_in_group == chunk_ratio).
+        put_bat_entry(&mut buf, 8, PAYLOAD_BLOCK_FULLY_PRESENT, 99);
+        // 3 FULLY_PRESENT + 1 PARTIALLY_PRESENT = 4
+        assert_eq!(count_allocated_in_bat(&buf, 8, 8), 4);
+    }
+
+    #[test]
+    fn count_allocated_in_bat_chunk_ratio_zero_returns_zero() {
+        let buf = make_bat_entry(PAYLOAD_BLOCK_FULLY_PRESENT, 1);
+        // Bogus input — must not panic, must not divide by zero.
+        assert_eq!(count_allocated_in_bat(&buf, 0, 1), 0);
+        assert_eq!(count_allocated_in_bat(&[], 0, 0), 0);
+    }
+
+    #[test]
+    fn count_allocated_in_bat_total_payload_blocks_clips() {
+        // 10 payload entries all FULLY_PRESENT, chunk_ratio large enough
+        // that no bitmap entry is interleaved within the first 10 slots.
+        // Pass total_payload_blocks=5 → expect exactly 5.
+        let mut buf = [0u8; 10 * 8];
+        for i in 0..10 {
+            put_bat_entry(&mut buf, i, PAYLOAD_BLOCK_FULLY_PRESENT, (i + 1) as u64);
+        }
+        assert_eq!(count_allocated_in_bat(&buf, 128, 5), 5);
+    }
+
+    #[test]
+    fn count_allocated_in_bat_trailing_partial_entry_ignored() {
+        // One complete FULLY_PRESENT entry, then 7 trailing bytes that
+        // cannot form a u64. chunks_exact(8) drops the tail.
+        let mut buf = [0u8; 8 + 7];
+        let entry = make_bat_entry(PAYLOAD_BLOCK_FULLY_PRESENT, 1);
+        buf[..8].copy_from_slice(&entry);
+        for b in &mut buf[8..] {
+            *b = 0xFF;
+        }
+        assert_eq!(count_allocated_in_bat(&buf, 128, 1), 1);
+    }
+
+    #[test]
+    fn count_allocated_in_bat_partially_present_counts_as_one() {
+        // Pin the documented overcount semantics: PARTIALLY_PRESENT
+        // counts as one full block (not as a fraction of one).
+        let buf = make_bat_entry(PAYLOAD_BLOCK_PARTIALLY_PRESENT, 7);
+        assert_eq!(count_allocated_in_bat(&buf, 128, 1), 1);
+    }
+
+    #[test]
+    fn count_allocated_in_bat_unmapped_and_reserved_states_do_not_count() {
+        // UNMAPPED (3) and reserved states (4, 5) all count as 0 bytes.
+        let mut buf = [0u8; 3 * 8];
+        put_bat_entry(&mut buf, 0, PAYLOAD_BLOCK_UNMAPPED, 0);
+        put_bat_entry(&mut buf, 1, 4, 0);
+        put_bat_entry(&mut buf, 2, 5, 0);
+        assert_eq!(count_allocated_in_bat(&buf, 128, 3), 0);
+    }
+
+    #[test]
+    fn count_allocated_in_bat_two_full_groups() {
+        // chunk_ratio=2: two groups of 2 payload + 1 bitmap = 6 entries.
+        // Group 0 payload[0] = FULLY, payload[1] = ZERO, bitmap = whatever.
+        // Group 1 payload[0] = FULLY, payload[1] = FULLY, bitmap = whatever.
+        let mut buf = [0u8; 6 * 8];
+        put_bat_entry(&mut buf, 0, PAYLOAD_BLOCK_FULLY_PRESENT, 1);
+        put_bat_entry(&mut buf, 1, PAYLOAD_BLOCK_ZERO, 0);
+        // Slot 2 is the bitmap (group 0, slot_in_group == chunk_ratio).
+        put_bat_entry(&mut buf, 2, PAYLOAD_BLOCK_FULLY_PRESENT, 99);
+        put_bat_entry(&mut buf, 3, PAYLOAD_BLOCK_FULLY_PRESENT, 2);
+        put_bat_entry(&mut buf, 4, PAYLOAD_BLOCK_FULLY_PRESENT, 3);
+        // Slot 5 is the second-group bitmap.
+        put_bat_entry(&mut buf, 5, PAYLOAD_BLOCK_FULLY_PRESENT, 99);
+        // Three FULLY_PRESENT payloads at positions 0, 3, 4. The two
+        // bitmap-slot entries are skipped despite their state.
+        let count = count_allocated_in_bat(&buf, 2, 4);
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn count_allocated_in_bat_chunk_incremental_matches_whole() {
+        // Build a BAT spanning multiple "sector"-sized chunks and check
+        // that incremental processing yields the same answer as a
+        // whole-buffer call. chunk_ratio=4 → group of 5. Build 3 groups
+        // (15 entries, 120 bytes).
+        let mut buf = [0u8; 15 * 8];
+        for group in 0..3 {
+            for p in 0..4 {
+                // Alternate FULLY_PRESENT and ZERO.
+                let state = if (group + p) % 2 == 0 {
+                    PAYLOAD_BLOCK_FULLY_PRESENT
+                } else {
+                    PAYLOAD_BLOCK_ZERO
+                };
+                put_bat_entry(&mut buf, group * 5 + p, state, (group * 4 + p + 1) as u64);
+            }
+            // Bitmap entry.
+            put_bat_entry(&mut buf, group * 5 + 4, PAYLOAD_BLOCK_FULLY_PRESENT, 99);
+        }
+        let chunk_ratio = 4u32;
+        let total_payload_blocks = 12u32;
+        let whole = count_allocated_in_bat(&buf, chunk_ratio, total_payload_blocks);
+
+        // Now process incrementally, splitting at an 8-byte boundary
+        // mid-group (5 entries / 40 bytes — past one bitmap slot).
+        let split = 5 * 8;
+        let (count_a, payload_seen_a) =
+            count_allocated_in_bat_chunk(&buf[..split], chunk_ratio, total_payload_blocks, 0, 0);
+        let (count_b, _) = count_allocated_in_bat_chunk(
+            &buf[split..],
+            chunk_ratio,
+            total_payload_blocks,
+            (split / 8) as u64,
+            payload_seen_a,
+        );
+        assert_eq!(count_a + count_b, whole);
     }
 
     #[test]
