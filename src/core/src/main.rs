@@ -283,6 +283,7 @@ fn setup_call_table() {
         send_info_result_luks: ct_send_info_result_luks,
         send_check_result: ct_send_check_result,
         send_compare_result: ct_send_compare_result,
+        send_measure_result: ct_send_measure_result,
     };
 
     unsafe {
@@ -641,6 +642,12 @@ unsafe extern "C" fn ct_send_compare_result(result: *const CompareResult) {
     if !result.is_null() {
         send_compare_result(&*result);
     }
+}
+
+/// Send measure result message (temporary stub - replaced in step 3d).
+unsafe extern "C" fn ct_send_measure_result(_result: *const shared::MeasureResult) {
+    // TODO(phase 3d): replace this stub with a real call into
+    // serial::send_measure_result.
 }
 
 /// Convert null-terminated C string to &str.

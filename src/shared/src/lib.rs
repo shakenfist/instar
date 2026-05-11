@@ -629,6 +629,11 @@ pub struct CallTable {
     /// Send compare result message.
     /// Args: compare_result pointer containing comparison results
     pub send_compare_result: unsafe extern "C" fn(*const CompareResult),
+
+    /// Send measure result message.
+    /// Args: measure_result pointer containing required +
+    /// fully_allocated bytes for the target format.
+    pub send_measure_result: unsafe extern "C" fn(*const MeasureResult),
 }
 
 /// Backing format type for QCOW2 header extension
@@ -949,7 +954,7 @@ impl CallTable {
     pub const MAGIC: u32 = 0x494D4147; // "IMAG"
 
     /// Current ABI version (bumped: added subcluster_errors to CheckResult)
-    pub const VERSION: u32 = 13;
+    pub const VERSION: u32 = 14;
 }
 
 // ============================================================================
