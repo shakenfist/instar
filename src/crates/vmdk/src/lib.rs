@@ -10,8 +10,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use shared::{
-    le_u16, le_u32, le_u64, write_le_u16, write_le_u32, write_le_u64, CallTable, VmdkInfo,
-    MAX_SECTOR_SIZE,
+    le_u16, le_u32, le_u64, write_le_u16, write_le_u32, write_le_u64, AllocationSummary, CallTable,
+    VmdkInfo, MAX_SECTOR_SIZE,
 };
 
 // ============================================================================
@@ -60,6 +60,12 @@ pub const FLAG_MARKER: u32 = 1 << 17;
 /// Grain directory offset indicating GD is at end of file
 /// (streamOptimized).
 pub const GD_AT_END: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
+/// Grain table entry marker for an explicit zero grain, as written
+/// by qemu-img for monolithicSparse output (VMDK spec / qemu-img
+/// block/vmdk.c). Distinct from `GTE_UNALLOCATED` (0) — the grain
+/// exists on disk but contains all zeros.
+pub const ZERO_GRAIN_MARKER: u32 = 0xFFFF_FFFE;
 
 /// Grain table entry: not allocated.
 pub const GTE_UNALLOCATED: u32 = 0;
@@ -474,6 +480,44 @@ pub enum GrainLookup {
 }
 
 // ============================================================================
+// Allocation-counting pure helpers
+// ============================================================================
+
+/// Count non-zero entries in a VMDK grain-directory byte slice.
+///
+/// Each entry is a little-endian u32 grain-table sector pointer.
+/// A zero entry indicates the GT is unallocated. Returns the
+/// count of populated GTs.
+///
+/// `gd_bytes` may have a trailing partial entry; incomplete u32
+/// entries at the tail are ignored.
+pub fn count_populated_gd_entries(gd_bytes: &[u8]) -> u64 {
+    gd_bytes
+        .chunks_exact(4)
+        .filter(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) != 0)
+        .count() as u64
+}
+
+/// Count allocated entries in a VMDK grain-table byte slice.
+///
+/// Each entry is a little-endian u32 grain sector pointer. Entries
+/// that are 0 or `ZERO_GRAIN_MARKER` (0xFFFFFFFE — an explicit
+/// zero-grain marker used by qemu-img for monolithicSparse output)
+/// count as unallocated. Any other value indicates an allocated grain.
+///
+/// `gt_bytes` may have a trailing partial entry; incomplete u32
+/// entries at the tail are ignored.
+pub fn count_allocated_in_gt(gt_bytes: &[u8]) -> u64 {
+    gt_bytes
+        .chunks_exact(4)
+        .filter(|c| {
+            let v = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            v != 0 && v != ZERO_GRAIN_MARKER
+        })
+        .count() as u64
+}
+
+// ============================================================================
 // VMDK state for grain table I/O
 // ============================================================================
 
@@ -756,6 +800,120 @@ impl VmdkState {
             let host_byte_offset = (gte as u64).checked_mul(512)?;
             Some(GrainLookup::Standard(host_byte_offset))
         }
+    }
+
+    /// Walk the grain directory and per-GD-entry grain tables, and
+    /// produce an `AllocationSummary`.
+    ///
+    /// `virtual_size = capacity_sectors * 512`. `allocated_bytes` is
+    /// the number of allocated grains across all populated grain tables,
+    /// multiplied by `grain_size_bytes`.
+    ///
+    /// # Safety
+    ///
+    /// `call_table` must be valid. `gd_cache_buf` and `gt_cache_buf`
+    /// must still be valid and each point to at least `MAX_SECTOR_SIZE`
+    /// writable bytes.
+    pub unsafe fn scan_allocation(
+        &mut self,
+        call_table: &CallTable,
+        sector_size: usize,
+        input_capacity: u64,
+        bytes_read: &mut u64,
+    ) -> Option<AllocationSummary> {
+        let virtual_size = self.capacity_sectors.checked_mul(512)?;
+
+        // The grain table for one GD entry is num_gtes_per_gt u32-LE
+        // entries, i.e. num_gtes_per_gt * 4 bytes.
+        let gt_size_bytes = (self.num_gtes_per_gt as u64).checked_mul(4)?;
+
+        let mut allocated_grains: u64 = 0;
+
+        for gd_index in 0..self.num_gd_entries as u64 {
+            // Compute byte offset of this GD entry.
+            let gd_byte_offset = self
+                .gd_offset_sectors
+                .checked_mul(512)?
+                .checked_add(gd_index.checked_mul(4)?)?;
+
+            let gd_entry = read_u32_le_cached(
+                call_table,
+                self.device_idx,
+                gd_byte_offset,
+                sector_size,
+                input_capacity,
+                &mut self.gd_cached_sector,
+                self.gd_cache_buf,
+                bytes_read,
+            )?;
+
+            if gd_entry == 0 {
+                // GT is unallocated; all grains in it are unallocated.
+                continue;
+            }
+
+            // The GT starts at byte offset gd_entry * 512.
+            let gt_start_byte = (gd_entry as u64).checked_mul(512)?;
+            let gt_end_byte = gt_start_byte.checked_add(gt_size_bytes)?;
+
+            // Walk the GT in MAX_SECTOR_SIZE-sized chunks.
+            let gt_start_sector = gt_start_byte / sector_size as u64;
+            let gt_end_sector =
+                gt_end_byte.checked_add(sector_size as u64 - 1)? / sector_size as u64;
+
+            let mut gt_bytes_consumed: u64 = 0;
+
+            let mut sector = gt_start_sector;
+            while sector < gt_end_sector {
+                if sector >= input_capacity {
+                    return None;
+                }
+                if !(call_table.read_input_sector)(
+                    self.device_idx,
+                    sector,
+                    self.gt_cache_buf,
+                    sector_size,
+                ) {
+                    return None;
+                }
+                *bytes_read += sector_size as u64;
+                self.gt_cached_sector = sector;
+
+                let sector_byte_start = sector * sector_size as u64;
+                let buf_start = if sector_byte_start < gt_start_byte {
+                    (gt_start_byte - sector_byte_start) as usize
+                } else {
+                    0
+                };
+                let buf_end =
+                    sector_size.min((gt_end_byte.saturating_sub(sector_byte_start)) as usize);
+                if buf_end <= buf_start {
+                    sector += 1;
+                    continue;
+                }
+
+                let chunk = core::slice::from_raw_parts(
+                    self.gt_cache_buf.add(buf_start),
+                    buf_end - buf_start,
+                );
+
+                // Clamp to the meaningful GT bytes (ignore sector padding).
+                let meaningful_len =
+                    (gt_size_bytes - gt_bytes_consumed).min((buf_end - buf_start) as u64) as usize;
+                let meaningful = &chunk[..meaningful_len];
+
+                allocated_grains += count_allocated_in_gt(meaningful);
+                gt_bytes_consumed += meaningful_len as u64;
+
+                sector += 1;
+            }
+        }
+
+        let allocated_bytes = allocated_grains.saturating_mul(self.grain_size_bytes);
+        Some(AllocationSummary {
+            virtual_size,
+            allocated_bytes,
+        })
     }
 }
 
@@ -1813,6 +1971,106 @@ RW 2097152 FLAT \"disk-f003.vmdk\" 0
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed.get(0).unwrap().size_sectors, 10);
         assert_eq!(parsed.get(1).unwrap().size_sectors, 20);
+    }
+
+    // ====================================================================
+    // count_populated_gd_entries tests
+    // ====================================================================
+
+    #[test]
+    fn gd_empty_slice_returns_zero() {
+        assert_eq!(count_populated_gd_entries(&[]), 0);
+    }
+
+    #[test]
+    fn gd_three_of_eight_populated() {
+        // Build 8 u32-LE entries: entries 1, 4, 7 are non-zero.
+        let mut buf = [0u8; 32];
+        let set = |buf: &mut [u8; 32], idx: usize, val: u32| {
+            buf[idx * 4..idx * 4 + 4].copy_from_slice(&val.to_le_bytes());
+        };
+        set(&mut buf, 1, 0x0000_0080);
+        set(&mut buf, 4, 0x0000_1000);
+        set(&mut buf, 7, 0xFFFF_FFFD);
+        assert_eq!(count_populated_gd_entries(&buf), 3);
+    }
+
+    #[test]
+    fn gd_trailing_partial_entry_is_ignored() {
+        // 5 bytes: one complete u32-LE entry (non-zero) + 1 byte tail.
+        let mut buf = [0u8; 5];
+        buf[0..4].copy_from_slice(&42u32.to_le_bytes());
+        buf[4] = 0xFF; // partial — should be dropped
+        assert_eq!(count_populated_gd_entries(&buf), 1);
+    }
+
+    // ====================================================================
+    // count_allocated_in_gt tests
+    // ====================================================================
+
+    #[test]
+    fn gt_all_zeros_returns_zero() {
+        let buf = [0u8; 16]; // 4 entries, all zero
+        assert_eq!(count_allocated_in_gt(&buf), 0);
+    }
+
+    #[test]
+    fn gt_all_allocated_returns_entry_count() {
+        // 4 non-zero, non-marker entries
+        let mut buf = [0u8; 16];
+        for (i, val) in [0x0000_0002u32, 0x0000_0100, 0x0000_1000, 0x00FF_0000]
+            .iter()
+            .enumerate()
+        {
+            buf[i * 4..i * 4 + 4].copy_from_slice(&val.to_le_bytes());
+        }
+        assert_eq!(count_allocated_in_gt(&buf), 4);
+    }
+
+    #[test]
+    fn gt_zero_grain_marker_excluded() {
+        // Mix: 0, ZERO_GRAIN_MARKER, and two allocated entries.
+        let mut buf = [0u8; 16];
+        buf[0..4].copy_from_slice(&0u32.to_le_bytes());
+        buf[4..8].copy_from_slice(&ZERO_GRAIN_MARKER.to_le_bytes());
+        buf[8..12].copy_from_slice(&0x0000_0010u32.to_le_bytes());
+        buf[12..16].copy_from_slice(&0x0000_0020u32.to_le_bytes());
+        assert_eq!(count_allocated_in_gt(&buf), 2);
+    }
+
+    #[test]
+    fn gt_pure_zero_grain_marker_entries_return_zero() {
+        // All four entries are ZERO_GRAIN_MARKER — none are allocated.
+        let mut buf = [0u8; 16];
+        for i in 0..4 {
+            buf[i * 4..i * 4 + 4].copy_from_slice(&ZERO_GRAIN_MARKER.to_le_bytes());
+        }
+        assert_eq!(count_allocated_in_gt(&buf), 0);
+    }
+
+    #[test]
+    fn gt_adversarial_5_byte_tail_is_dropped() {
+        // 1 complete non-zero entry (4 bytes) + 1 byte tail; tail must
+        // be ignored, count must be 1.
+        let mut buf = [0u8; 5];
+        buf[0..4].copy_from_slice(&0x0000_00FFu32.to_le_bytes());
+        buf[4] = 0xAB; // partial — should be dropped
+        assert_eq!(count_allocated_in_gt(&buf), 1);
+    }
+
+    #[test]
+    fn gt_large_every_seventh_allocated() {
+        // 512 entries (2048 bytes), every 7th is allocated.
+        let mut buf = [0u8; 512 * 4];
+        let mut expected: u64 = 0;
+        for i in 0..512usize {
+            let val: u32 = if i % 7 == 0 { (i as u32) + 2 } else { 0 };
+            buf[i * 4..i * 4 + 4].copy_from_slice(&val.to_le_bytes());
+            if val != 0 {
+                expected += 1;
+            }
+        }
+        assert_eq!(count_allocated_in_gt(&buf), expected);
     }
 }
 
