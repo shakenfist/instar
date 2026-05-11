@@ -2487,6 +2487,14 @@ struct MeasureArgs {
     /// vhdx: [1 MiB, 256 MiB]. Default (when -O vpc): 2 MiB; default (when -O vhdx): 32 MiB.
     #[arg(long, default_value = "0")]
     block_size: u32,
+
+    /// qemu-img-style options as comma-separated key=value pairs
+    /// (e.g. -o cluster_size=64k,extended_l2=on). Values override
+    /// the matching individual flags. Repeatable: each invocation
+    /// contributes more keys.
+    #[arg(short = 'o', long = "options", action = clap::ArgAction::Append,
+          value_name = "KEY=VALUE,...")]
+    option: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -5269,6 +5277,258 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     }
 
     Ok(())
+}
+
+/// Parsed values for the size-relevant subset of `-o key=value,...`.
+/// Each field is `Some(v)` if the user explicitly supplied that key,
+/// `None` otherwise. Applied last in run_measure (after individual
+/// clap flags) so `-o` wins on conflict.
+#[derive(Default, Debug)]
+#[allow(dead_code)] // Fields read in step 5b.
+struct MeasureOptionOverrides {
+    cluster_size: Option<u32>,
+    refcount_bits: Option<u8>,
+    extended_l2: Option<bool>,
+    lazy_refcounts: Option<bool>,
+    compat_v3: Option<bool>,
+    compression_used: Option<bool>,
+    preallocation: Option<&'static str>,
+    vmdk_subformat: Option<u8>,
+    grain_size: Option<u32>,
+    vhd_subformat: Option<u8>,
+    block_size: Option<u32>,
+}
+
+/// Parse a boolean value in qemu-img -o syntax. Accepts (case-insensitive):
+/// on / off / true / false / yes / no. Other inputs return an error.
+#[allow(dead_code)] // Used in step 5b via parse_o_options.
+fn parse_o_bool(key: &str, value: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    match value.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" => Ok(true),
+        "off" | "false" | "no" => Ok(false),
+        _ => Err(format!(
+            "measure: bad value '{}' for -o key '{}' (expected on/off)",
+            value, key
+        )
+        .into()),
+    }
+}
+
+/// Parse a size value (K/M/G/T suffixes) and bounds-check to u32.
+#[allow(dead_code)] // Used in step 5b via parse_o_options.
+fn parse_o_size_u32(key: &str, value: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    let n = parse_memory_size(value)
+        .map_err(|e| format!("measure: bad size '{}' for -o key '{}' ({})", value, key, e))?;
+    if n > u32::MAX as u64 {
+        return Err(format!("measure: size {} for -o key '{}' exceeds u32::MAX", n, key).into());
+    }
+    Ok(n as u32)
+}
+
+/// Parse a decimal numeric value (u32).
+#[allow(dead_code)] // Used in step 5b via parse_o_options.
+fn parse_o_u32(key: &str, value: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    value
+        .parse::<u32>()
+        .map_err(|_| -> Box<dyn std::error::Error> {
+            format!("measure: bad number '{}' for -o key '{}'", value, key).into()
+        })
+}
+
+/// Parse a decimal numeric value (u8).
+#[allow(dead_code)] // Used in step 5b via parse_o_options.
+fn parse_o_u8(key: &str, value: &str) -> Result<u8, Box<dyn std::error::Error>> {
+    value
+        .parse::<u8>()
+        .map_err(|_| -> Box<dyn std::error::Error> {
+            format!("measure: bad number '{}' for -o key '{}'", value, key).into()
+        })
+}
+
+/// Parse a vector of `-o key=value,...` strings into a
+/// MeasureOptionOverrides for the given target format.
+///
+/// Returns an error on unknown keys, invalid values, or unsupported
+/// features. Last-wins for repeated keys across all `-o` invocations.
+#[allow(dead_code)] // Wired into run_measure in step 5b.
+fn parse_o_options(
+    target: &str,
+    raw: &[String],
+) -> Result<MeasureOptionOverrides, Box<dyn std::error::Error>> {
+    let mut out = MeasureOptionOverrides::default();
+
+    // Raw target rejects any -o.
+    if target == "raw" && !raw.is_empty() {
+        return Err("measure: raw output does not support -o options".into());
+    }
+
+    for input in raw {
+        for piece in input.split(',') {
+            let piece = piece.trim();
+            if piece.is_empty() {
+                continue;
+            }
+            let (key, value) = match piece.split_once('=') {
+                Some((k, v)) => (k.trim(), v),
+                None => {
+                    return Err(format!(
+                        "measure: -o option '{}' is missing a value (expected KEY=VALUE)",
+                        piece
+                    )
+                    .into())
+                }
+            };
+
+            // Per-target whitelist with explicit key handling.
+            match (target, key) {
+                // -------- qcow2 --------
+                ("qcow2", "cluster_size") => {
+                    out.cluster_size = Some(parse_o_size_u32(key, value)?);
+                }
+                ("qcow2", "compat") => match value {
+                    "0.10" => out.compat_v3 = Some(false),
+                    "1.1" => out.compat_v3 = Some(true),
+                    _ => {
+                        return Err(format!(
+                            "measure: bad value '{}' for -o key 'compat' \
+                            (expected 0.10 or 1.1)",
+                            value
+                        )
+                        .into())
+                    }
+                },
+                ("qcow2", "refcount_bits") => {
+                    out.refcount_bits = Some(parse_o_u8(key, value)?);
+                }
+                ("qcow2", "extended_l2") => {
+                    out.extended_l2 = Some(parse_o_bool(key, value)?);
+                }
+                ("qcow2", "lazy_refcounts") => {
+                    out.lazy_refcounts = Some(parse_o_bool(key, value)?);
+                }
+                ("qcow2", "compression_type") => match value {
+                    "zlib" | "zstd" => out.compression_used = Some(false),
+                    _ => {
+                        return Err(format!(
+                            "measure: bad value '{}' for -o key 'compression_type'",
+                            value
+                        )
+                        .into())
+                    }
+                },
+                ("qcow2", "preallocation") => match value {
+                    "off" => out.preallocation = Some("off"),
+                    "metadata" => out.preallocation = Some("metadata"),
+                    "falloc" => out.preallocation = Some("falloc"),
+                    "full" => out.preallocation = Some("full"),
+                    _ => {
+                        return Err(format!(
+                            "measure: bad value '{}' for -o key 'preallocation'",
+                            value
+                        )
+                        .into())
+                    }
+                },
+
+                // qcow2 reject list
+                ("qcow2", "backing_file")
+                | ("qcow2", "backing_fmt")
+                | ("qcow2", "data_file")
+                | ("qcow2", "data_file_raw") => {
+                    return Err(format!(
+                        "measure: -o key '{}' is not supported \
+                        (chain/external-data measurement not implemented)",
+                        key
+                    )
+                    .into());
+                }
+                ("qcow2", k) if k.starts_with("encrypt.") => {
+                    return Err(format!(
+                        "measure: -o key '{}' is not yet supported \
+                        (LUKS-aware measurement is future work)",
+                        k
+                    )
+                    .into());
+                }
+
+                // -------- vmdk --------
+                ("vmdk", "subformat") => match value {
+                    "monolithicSparse" => out.vmdk_subformat = Some(0),
+                    "streamOptimized" => out.vmdk_subformat = Some(1),
+                    "monolithicFlat" => out.vmdk_subformat = Some(2),
+                    _ => {
+                        return Err(format!(
+                            "measure: bad value '{}' for -o key 'subformat' \
+                            (expected monolithicSparse / streamOptimized / monolithicFlat)",
+                            value
+                        )
+                        .into())
+                    }
+                },
+                ("vmdk", "grain_size") => {
+                    out.grain_size = Some(parse_o_size_u32(key, value)?);
+                }
+                ("vmdk", "adapter_type")
+                | ("vmdk", "hwversion")
+                | ("vmdk", "toolsversion")
+                | ("vmdk", "zeroed_grain") => {
+                    // accept-ignore — no size effect
+                }
+
+                // -------- vpc (VHD) --------
+                ("vpc", "subformat") => match value {
+                    "dynamic" => out.vhd_subformat = Some(0),
+                    "fixed" => out.vhd_subformat = Some(1),
+                    _ => {
+                        return Err(format!(
+                            "measure: bad value '{}' for -o key 'subformat' \
+                            (expected dynamic or fixed)",
+                            value
+                        )
+                        .into())
+                    }
+                },
+                ("vpc", "force_size") | ("vpc", "force_size_calc") => {
+                    // accept-ignore
+                }
+
+                // -------- vhdx --------
+                ("vhdx", "subformat") => match value {
+                    "dynamic" => { /* default */ }
+                    "fixed" => {
+                        return Err(
+                            "measure: -O vhdx -o subformat=fixed is not yet supported".into()
+                        );
+                    }
+                    _ => {
+                        return Err(format!(
+                            "measure: bad value '{}' for -o key 'subformat' \
+                            (expected dynamic or fixed)",
+                            value
+                        )
+                        .into())
+                    }
+                },
+                ("vhdx", "block_size") => {
+                    out.block_size = Some(parse_o_size_u32(key, value)?);
+                }
+                ("vhdx", "log_size") | ("vhdx", "block_state_zero") => {
+                    // accept-ignore
+                }
+
+                // -------- catch-all: unknown key for this target --------
+                _ => {
+                    return Err(format!(
+                        "measure: unrecognised -o key '{}' for target {}",
+                        key, target
+                    )
+                    .into())
+                }
+            }
+        }
+    }
+
+    Ok(out)
 }
 
 /// Run the measure operation (predict output size for a target format).
