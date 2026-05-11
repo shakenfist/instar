@@ -131,3 +131,205 @@ class TestMeasureSmoke(InstarTestBase):
         self.assertNotEqual(rc, 0)
         # Our run_measure validation surfaces the message.
         self.assertIn('measure:', stderr.lower())
+
+
+class TestMeasureOptions(TestMeasureSmoke):
+    """Tests for the -o key=value option-passing mechanism."""
+
+    # --- cluster_size ---
+
+    def test_o_cluster_size_numeric(self):
+        """``-o cluster_size=512`` produces the phase-1 fixture values.
+
+        qemu-img: measure --size 1M -O qcow2 -o cluster_size=512 --output=json
+        => required=22528, fully-allocated=1071104
+        """
+        stdout, stderr, rc = self.run_instar_measure(
+            '--size', '1M', '-O', 'qcow2', '-o', 'cluster_size=512'
+        )
+        self.assertEqual(rc, 0, f'stderr: {stderr}')
+        self.assertEqual(
+            stdout,
+            'required size: 22528\nfully allocated size: 1071104\n',
+        )
+
+    def test_o_cluster_size_suffixed(self):
+        """``-o cluster_size=64k`` produces the default 64 KiB cluster values.
+
+        qemu-img: measure --size 1M -O qcow2 -o cluster_size=64k --output=json
+        => required=327680, fully-allocated=1376256
+        """
+        stdout, stderr, rc = self.run_instar_measure(
+            '--size', '1M', '-O', 'qcow2', '-o', 'cluster_size=64k'
+        )
+        self.assertEqual(rc, 0, f'stderr: {stderr}')
+        self.assertEqual(
+            stdout,
+            'required size: 327680\nfully allocated size: 1376256\n',
+        )
+
+    # --- options with no size effect ---
+
+    def test_o_refcount_bits(self):
+        """``-o refcount_bits=8`` has no size effect for 1M; matches default.
+
+        qemu-img: measure --size 1M -O qcow2 -o refcount_bits=8 --output=json
+        => required=327680, fully-allocated=1376256
+        """
+        stdout, stderr, rc = self.run_instar_measure(
+            '--size', '1M', '-O', 'qcow2', '-o', 'refcount_bits=8'
+        )
+        self.assertEqual(rc, 0, f'stderr: {stderr}')
+        self.assertEqual(
+            stdout,
+            'required size: 327680\nfully allocated size: 1376256\n',
+        )
+
+    def test_o_extended_l2_with_cluster(self):
+        """``-o extended_l2=on,cluster_size=64k`` has no size effect for 1M.
+
+        qemu-img: measure --size 1M -O qcow2 -o extended_l2=on,cluster_size=64k --output=json
+        => required=327680, fully-allocated=1376256
+        """
+        stdout, stderr, rc = self.run_instar_measure(
+            '--size', '1M', '-O', 'qcow2', '-o', 'extended_l2=on,cluster_size=64k'
+        )
+        self.assertEqual(rc, 0, f'stderr: {stderr}')
+        self.assertEqual(
+            stdout,
+            'required size: 327680\nfully allocated size: 1376256\n',
+        )
+
+    def test_o_lazy_refcounts_no_size_effect(self):
+        """``-o lazy_refcounts=on`` does not change the measured sizes.
+
+        qemu-img: measure --size 1M -O qcow2 -o lazy_refcounts=on --output=json
+        => required=327680, fully-allocated=1376256
+        """
+        stdout, stderr, rc = self.run_instar_measure(
+            '--size', '1M', '-O', 'qcow2', '-o', 'lazy_refcounts=on'
+        )
+        self.assertEqual(rc, 0, f'stderr: {stderr}')
+        self.assertEqual(
+            stdout,
+            'required size: 327680\nfully allocated size: 1376256\n',
+        )
+
+    def test_o_compression_type_no_size_effect(self):
+        """``-o compression_type=zlib`` does not change the measured sizes.
+
+        qemu-img: measure --size 1M -O qcow2 -o compression_type=zlib --output=json
+        => required=327680, fully-allocated=1376256
+        """
+        stdout, stderr, rc = self.run_instar_measure(
+            '--size', '1M', '-O', 'qcow2', '-o', 'compression_type=zlib'
+        )
+        self.assertEqual(rc, 0, f'stderr: {stderr}')
+        self.assertEqual(
+            stdout,
+            'required size: 327680\nfully allocated size: 1376256\n',
+        )
+
+    def test_o_preallocation_metadata(self):
+        """``-o preallocation=metadata`` equals the off-mode required for 1M.
+
+        qemu-img: measure --size 1M -O qcow2 -o preallocation=metadata --output=json
+        => required=327680, fully-allocated=1376256
+        """
+        stdout, stderr, rc = self.run_instar_measure(
+            '--size', '1M', '-O', 'qcow2', '-o', 'preallocation=metadata'
+        )
+        self.assertEqual(rc, 0, f'stderr: {stderr}')
+        self.assertEqual(
+            stdout,
+            'required size: 327680\nfully allocated size: 1376256\n',
+        )
+
+    # --- multiple -o flags ---
+
+    def test_o_multiple_invocations_combine(self):
+        """Two separate ``-o`` flags combine: ``-o cluster_size=64k -o refcount_bits=8``.
+
+        qemu-img: measure --size 1M -O qcow2 -o cluster_size=64k,refcount_bits=8 --output=json
+        => required=327680, fully-allocated=1376256
+        """
+        stdout, stderr, rc = self.run_instar_measure(
+            '--size', '1M', '-O', 'qcow2',
+            '-o', 'cluster_size=64k',
+            '-o', 'refcount_bits=8',
+        )
+        self.assertEqual(rc, 0, f'stderr: {stderr}')
+        self.assertEqual(
+            stdout,
+            'required size: 327680\nfully allocated size: 1376256\n',
+        )
+
+    def test_o_repeated_key_last_wins(self):
+        """Last value wins when the same key appears in multiple ``-o`` flags.
+
+        ``-o cluster_size=64k -o cluster_size=512`` should resolve to 512,
+        producing the pinned 512-byte-cluster values.
+        """
+        stdout, stderr, rc = self.run_instar_measure(
+            '--size', '1M', '-O', 'qcow2',
+            '-o', 'cluster_size=64k',
+            '-o', 'cluster_size=512',
+        )
+        self.assertEqual(rc, 0, f'stderr: {stderr}')
+        self.assertEqual(
+            stdout,
+            'required size: 22528\nfully allocated size: 1071104\n',
+        )
+
+    # --- error paths ---
+
+    def test_o_unknown_key_rejected(self):
+        """``-o nosuchkey=1`` exits non-zero with a clear diagnostic."""
+        stdout, stderr, rc = self.run_instar_measure(
+            '--size', '1M', '-O', 'qcow2', '-o', 'nosuchkey=1'
+        )
+        self.assertNotEqual(rc, 0, 'expected non-zero exit for unknown key')
+        self.assertIn("unrecognised -o key 'nosuchkey'", stderr)
+
+    def test_o_encrypt_format_rejected(self):
+        """``-o encrypt.format=luks`` exits non-zero; LUKS is not yet supported."""
+        stdout, stderr, rc = self.run_instar_measure(
+            '--size', '1M', '-O', 'qcow2', '-o', 'encrypt.format=luks'
+        )
+        self.assertNotEqual(rc, 0, 'expected non-zero exit for encrypt.format')
+        self.assertIn('encrypt.format', stderr.lower())
+        self.assertIn('not yet supported', stderr.lower())
+
+    def test_o_raw_target_rejects_options(self):
+        """``-O raw -o cluster_size=512`` exits non-zero; raw has no -o options."""
+        stdout, stderr, rc = self.run_instar_measure(
+            '--size', '1M', '-O', 'raw', '-o', 'cluster_size=512'
+        )
+        self.assertNotEqual(rc, 0, 'expected non-zero exit for raw with -o')
+        self.assertIn('raw output does not support -o options', stderr)
+
+    def test_o_overrides_individual_flag(self):
+        """``-o cluster_size=512`` overrides ``--cluster-size 4096``.
+
+        The last value seen (the -o key) wins; result matches 512-cluster pins.
+        """
+        stdout, stderr, rc = self.run_instar_measure(
+            '--size', '1M', '-O', 'qcow2',
+            '--cluster-size', '4096',
+            '-o', 'cluster_size=512',
+        )
+        self.assertEqual(rc, 0, f'stderr: {stderr}')
+        self.assertEqual(
+            stdout,
+            'required size: 22528\nfully allocated size: 1071104\n',
+        )
+
+    def test_o_bad_value_rejected(self):
+        """``-o cluster_size=hello`` exits non-zero with a bad-value diagnostic."""
+        stdout, stderr, rc = self.run_instar_measure(
+            '--size', '1M', '-O', 'qcow2', '-o', 'cluster_size=hello'
+        )
+        self.assertNotEqual(rc, 0, 'expected non-zero exit for bad cluster_size value')
+        # Error message names the key and the bad value
+        self.assertIn('cluster_size', stderr)
+        self.assertIn('hello', stderr)
