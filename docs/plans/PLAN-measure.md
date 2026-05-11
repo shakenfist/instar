@@ -426,7 +426,7 @@ where the logic overlaps; that is captured under Future work.
 | 1. Per-format size calculators (`crates/measure/`) | [PLAN-measure-phase-01-calculators.md](PLAN-measure-phase-01-calculators.md) | Not started |
 | 2. Source-allocation scanners on parser crates | [PLAN-measure-phase-02-allocation-scanners.md](PLAN-measure-phase-02-allocation-scanners.md) | Not started |
 | 3. Guest `measure` operation + protobuf | [PLAN-measure-phase-03-guest-op.md](PLAN-measure-phase-03-guest-op.md) | Not started |
-| 4. Host VMM subcommand + clap surface | PLAN-measure-phase-04-host-cli.md (not yet written) | Not started |
+| 4. Host VMM subcommand + clap surface | [PLAN-measure-phase-04-host-cli.md](PLAN-measure-phase-04-host-cli.md) | Not started |
 | 5. `-o` option parsing and per-target options | PLAN-measure-phase-05-target-options.md (not yet written) | Not started |
 | 6. Cross-version baseline generation in `instar-testdata` | PLAN-measure-phase-06-baselines.md (not yet written) | Not started |
 | 7. Integration tests (`tests/test_measure.py`) | PLAN-measure-phase-07-integration-tests.md (not yet written) | Not started |
