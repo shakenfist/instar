@@ -3938,6 +3938,45 @@ fn print_check_result_json(
     println!("}}");
 }
 
+#[allow(dead_code)] // Wired in step 4c
+/// Print measure result in human-readable or JSON format.
+fn print_measure_result(msg: &guest_::GuestMessage, output_format: &str) {
+    if let Some(guest_::GuestMessage_::Payload::MeasureResult(result)) = &msg.payload {
+        // Error path: emit a clear stderr message; print nothing on stdout.
+        if result.error != MEASURE_RESULT_ERROR_OK {
+            let msg = match result.error {
+                MEASURE_RESULT_ERROR_OVERFLOW => "measure: overflow computing target size",
+                MEASURE_RESULT_ERROR_INVALID_OPTION => "measure: invalid option for target format",
+                MEASURE_RESULT_ERROR_INVALID_SIZE => "measure: source image is unsupported format",
+                _ => "measure: unknown error",
+            };
+            eprintln!("{}", msg);
+            return;
+        }
+
+        if output_format == "json" {
+            print_measure_result_json(result);
+        } else {
+            // Human format must match qemu-img byte-for-byte:
+            //   required size: <N>\n
+            //   fully allocated size: <N>\n
+            println!("required size: {}", result.required);
+            println!("fully allocated size: {}", result.fully_allocated);
+        }
+    }
+}
+
+#[allow(dead_code)] // Wired in step 4c
+/// Print measure result in JSON format matching qemu-img byte-for-byte.
+///
+/// 4-space indent, hyphenated `fully-allocated` key.
+fn print_measure_result_json(result: &guest_::MeasureResultMessage) {
+    println!("{{");
+    println!("    \"required\": {},", result.required);
+    println!("    \"fully-allocated\": {}", result.fully_allocated);
+    println!("}}");
+}
+
 fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Validate sector size (must be power of 2, 512 to 64KB)
     if !(512..=MAX_SECTOR_SIZE).contains(&args.sector_size) || !args.sector_size.is_power_of_two() {
