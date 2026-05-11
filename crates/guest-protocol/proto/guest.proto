@@ -190,6 +190,22 @@ message CompareResultMessage {
   uint32 flags = 4;
 }
 
+// Image size measurement result (from measure operation).
+message MeasureResultMessage {
+  // Target output format echoed back (e.g. "raw", "qcow2", "vmdk",
+  // "vhd", "vhdx").
+  string target_format = 1;
+  // Bytes required when only allocated extents are written.
+  uint64 required = 2;
+  // Bytes required when every cluster/grain/block is allocated.
+  uint64 fully_allocated = 3;
+  // Cluster / grain / block size actually used. 0 for raw output.
+  uint32 resolved_unit_size = 4;
+  // Error code: 0 = ok, 1 = overflow, 2 = invalid option, 3 = invalid size.
+  // Matches MeasureResult::ERROR_* in src/shared/src/lib.rs.
+  uint32 error = 5;
+}
+
 // Main message wrapper with level and payload
 message GuestMessage {
   Level level = 1;
@@ -202,5 +218,6 @@ message GuestMessage {
     InfoResultMessage info_result = 7;
     CheckResultMessage check_result = 8;
     CompareResultMessage compare_result = 9;
+    MeasureResultMessage measure_result = 10;
   }
 }
