@@ -20,15 +20,15 @@ use core::panic::PanicInfo;
 use core::ptr::write_volatile;
 
 use shared::{
-    CallTable, ChainConfig, CheckResult, CompareResult, LuksInfo, Qcow2Info, VdiInfo, VmdkInfo,
-    CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR, CHAIN_CONFIG_MAX_SIZE, OPERATION_CONFIG_ADDR,
-    OPERATION_CONFIG_MAX_SIZE, OPERATION_LOAD_ADDR, VMM_PARAMS_ADDR,
+    CallTable, ChainConfig, CheckResult, CompareResult, LuksInfo, MeasureResult, Qcow2Info,
+    VdiInfo, VmdkInfo, CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR, CHAIN_CONFIG_MAX_SIZE,
+    OPERATION_CONFIG_ADDR, OPERATION_CONFIG_MAX_SIZE, OPERATION_LOAD_ADDR, VMM_PARAMS_ADDR,
 };
 
 use crate::serial::{
     debug_print, read_config, send_check_result, send_compare_result, send_complete, send_error,
     send_info_result, send_info_result_luks, send_info_result_qcow2, send_info_result_vdi,
-    send_info_result_vmdk, send_init, send_progress, DeviceConfig,
+    send_info_result_vmdk, send_init, send_measure_result, send_progress, DeviceConfig,
 };
 use crate::virtio::VirtioBlock;
 
@@ -644,10 +644,11 @@ unsafe extern "C" fn ct_send_compare_result(result: *const CompareResult) {
     }
 }
 
-/// Send measure result message (temporary stub - replaced in step 3d).
-unsafe extern "C" fn ct_send_measure_result(_result: *const shared::MeasureResult) {
-    // TODO(phase 3d): replace this stub with a real call into
-    // serial::send_measure_result.
+/// Send measure result message.
+unsafe extern "C" fn ct_send_measure_result(result: *const MeasureResult) {
+    if !result.is_null() {
+        send_measure_result(&*result);
+    }
 }
 
 /// Convert null-terminated C string to &str.

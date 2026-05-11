@@ -497,3 +497,20 @@ pub fn send_compare_result(result: &shared::CompareResult) {
     );
     send_message(&msg);
 }
+
+/// Send a measure result message.
+///
+/// Maps the target_format field (numeric ImageFormat) to its name
+/// via `ImageFormat::from_u32(...).name()` so the host receives the
+/// same string form as the other `*_result` messages.
+pub fn send_measure_result(result: &shared::MeasureResult) {
+    let target_name = shared::ImageFormat::from_u32(result.target_format).name();
+    let msg = guest_protocol::measure_result_message(
+        target_name,
+        result.required,
+        result.fully_allocated,
+        result.resolved_unit_size,
+        result.error,
+    );
+    send_message(&msg);
+}
