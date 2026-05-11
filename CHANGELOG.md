@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   MeasureResultMessage over the serial channel given a source image
   (or `virtual_size_override`) and a target format. CLI surface ships
   in phase 4. (PLAN-measure-phase-03-guest-op.md)
+- `instar measure` subcommand: predict the file size required to
+  convert a source image (or hypothetical `--size N` image) to a
+  target format. Output matches `qemu-img measure` byte-for-byte for
+  raw and qcow2 targets; vmdk, vpc, vhdx are instar-only.
+  (PLAN-measure-phase-04-host-cli.md)
 - Added `MeasureConfig` and `MeasureResult` structs to `shared`, and
   `MeasureResultMessage` (field 10) to the GuestMessage protobuf oneof,
   plus the `measure_result_message` helper in `crates/guest-protocol`.

@@ -244,11 +244,20 @@ provides a modular architecture with:
   writer emits dynamic VHDX with configurable block size (1MB-256MB
   via `--block-size`, default 32MB), 1MB-aligned structures, CRC-32C
   checksums, and BAT rewriting.
-- **operations/measure/** - Image-size measurement operation (predicts
-  required and fully-allocated byte counts for a target output format;
-  consumes `crates/measure/` calculators and each parser crate's
-  `scan_allocation`). Wired through CallTable v14's `send_measure_result`
-  callback. CLI surface ships in phase 4.
+- **operations/measure/** - Image-size measurement operation. Predicts
+  `required` (sparse, holes skipped) and `fully-allocated` (every
+  cluster/grain/block written) byte counts for a target output format.
+  Supported targets: raw, qcow2, vmdk, vpc (VHD), vhdx. For raw and
+  qcow2 targets the host CLI's output (human and `--output=json`)
+  matches `qemu-img measure` byte-for-byte; vmdk, vpc, and vhdx are
+  instar-only because `qemu-img measure` does not support them. CLI
+  flags mirror qemu-img (`--size SIZE | FILENAME`, `-O target-format`,
+  `-f source-format`, `--output {human,json}`) plus per-target options
+  as individual flags (`--cluster-size`, `--refcount-bits`,
+  `--extended-l2`, `--compat`, `--preallocation`, `--subformat`,
+  `--grain-size`, `--block-size`). `-o key=value,...` ships in phase 5.
+  Single-source-device only; backing-chain composition and VMDK
+  monolithicFlat sources are deferred.
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation,
