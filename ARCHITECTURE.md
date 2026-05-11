@@ -255,7 +255,9 @@ provides a modular architecture with:
   `-f source-format`, `--output {human,json}`) plus per-target options
   as individual flags (`--cluster-size`, `--refcount-bits`,
   `--extended-l2`, `--compat`, `--preallocation`, `--subformat`,
-  `--grain-size`, `--block-size`). `-o key=value,...` ships in phase 5.
+  `--grain-size`, `--block-size`). Accepts both individual flags and
+  `-o key=value,...` (qemu-img parity); `-o` values override individual
+  flags when both are given.
   Single-source-device only; backing-chain composition and VMDK
   monolithicFlat sources are deferred.
 - **shared/** - Shared library code between components (call table, configs,

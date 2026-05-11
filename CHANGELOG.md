@@ -34,6 +34,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `MeasureResultMessage` (field 10) to the GuestMessage protobuf oneof,
   plus the `measure_result_message` helper in `crates/guest-protocol`.
   (PLAN-measure-phase-03-guest-op.md)
+- `instar measure` now accepts the qemu-img `-o key=value,...` option
+  syntax in addition to individual flags. Honoured keys per target:
+  qcow2 (cluster_size, compat, refcount_bits, extended_l2,
+  lazy_refcounts, compression_type, preallocation), vmdk (subformat,
+  grain_size), vpc (subformat), vhdx (subformat, block_size). `-o`
+  values override matching individual flags. backing_file, data_file,
+  and encrypt.* keys are rejected pending future work.
+  (PLAN-measure-phase-05-target-options.md)
 
 ### Changed
 
