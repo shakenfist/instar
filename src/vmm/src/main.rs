@@ -113,6 +113,35 @@ const CONVERT_CONFIG_FLAG_ENCRYPT_LUKS: u32 = 1 << 4;
 #[allow(dead_code)]
 const CONVERT_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
 
+// MeasureConfig constants (must match shared crate)
+const MEASURE_CONFIG_MAGIC: u32 = 0x4D454153; // "MEAS"
+#[allow(dead_code)]
+const MEASURE_CONFIG_FLAG_EXTENDED_L2: u32 = 1 << 0;
+#[allow(dead_code)]
+const MEASURE_CONFIG_FLAG_LAZY_REFCOUNTS: u32 = 1 << 1;
+#[allow(dead_code)]
+const MEASURE_CONFIG_FLAG_COMPAT_V3: u32 = 1 << 2;
+#[allow(dead_code)]
+const MEASURE_CONFIG_FLAG_COMPRESS: u32 = 1 << 3;
+#[allow(dead_code)]
+const MEASURE_CONFIG_PREALLOC_OFF: u32 = 0 << 4;
+#[allow(dead_code)]
+const MEASURE_CONFIG_PREALLOC_METADATA: u32 = 1 << 4;
+#[allow(dead_code)]
+const MEASURE_CONFIG_PREALLOC_FALLOC: u32 = 2 << 4;
+#[allow(dead_code)]
+const MEASURE_CONFIG_PREALLOC_FULL: u32 = 3 << 4;
+
+// MeasureResult constants (must match shared crate)
+const MEASURE_RESULT_MAGIC: u32 = 0x4D524553; // "MRES"
+const MEASURE_RESULT_ERROR_OK: u32 = 0;
+#[allow(dead_code)]
+const MEASURE_RESULT_ERROR_OVERFLOW: u32 = 1;
+#[allow(dead_code)]
+const MEASURE_RESULT_ERROR_INVALID_OPTION: u32 = 2;
+#[allow(dead_code)]
+const MEASURE_RESULT_ERROR_INVALID_SIZE: u32 = 3;
+
 // CheckResult flag constants (must match shared crate)
 const CHECK_RESULT_FLAG_VALID: u32 = 1 << 0;
 #[allow(dead_code)]
@@ -2086,6 +2115,8 @@ enum Commands {
     Compare(CompareArgs),
     /// Convert a disk image to a different format (qcow2 -> raw)
     Convert(ConvertArgs),
+    /// Measure the size required to convert an image to a target format
+    Measure(MeasureArgs),
     /// Display or validate configuration
     Config(ConfigArgs),
 }
@@ -2377,6 +2408,88 @@ struct ConvertArgs {
 }
 
 #[derive(Args, Debug)]
+struct MeasureArgs {
+    /// Source image file. Mutually exclusive with --size.
+    #[arg(conflicts_with = "size")]
+    input: Option<String>,
+
+    /// Compute the measure for a hypothetical empty image of this size.
+    /// Mutually exclusive with FILENAME.
+    /// Accepts suffixes K, M, G, T (parsed by parse_memory_size).
+    #[arg(long, short = 's', value_name = "SIZE", conflicts_with = "input")]
+    size: Option<String>,
+
+    /// Target output format. Supported: raw, qcow2, vmdk, vpc (VHD), vhdx.
+    /// Default: raw (matching qemu-img).
+    #[arg(short = 'O', long = "target-format", default_value = "raw",
+          value_parser = ["raw", "qcow2", "vmdk", "vpc", "vhdx"])]
+    target_format: String,
+
+    /// Source format override (rare; usually auto-detected).
+    /// Accepted for parity with qemu-img -f.
+    #[arg(short = 'f', long = "format")]
+    source_format: Option<String>,
+
+    /// Output format: human (default) or json.
+    #[arg(long, default_value = "human", value_parser = ["human", "json"])]
+    output: String,
+
+    /// Sector size for source I/O. Default: 65536.
+    #[arg(long, default_value = "65536")]
+    sector_size: u32,
+
+    // --- per-target qcow2 options ---
+    /// qcow2 cluster size in bytes. Power of two in [512, 2 MiB].
+    /// Default (when -O qcow2): 65536.
+    #[arg(long, default_value = "0")]
+    cluster_size: u32,
+
+    /// qcow2 refcount entry width in bits. Must be in {1,2,4,8,16,32,64}.
+    /// Default (when -O qcow2): 16.
+    #[arg(long, default_value = "0")]
+    refcount_bits: u8,
+
+    /// qcow2 extended L2 entries (16-byte with subcluster bitmaps).
+    #[arg(long)]
+    extended_l2: bool,
+
+    /// qcow2 lazy refcounts. Accepted but does not affect required size.
+    #[arg(long)]
+    lazy_refcounts: bool,
+
+    /// qcow2 compat level: "0.10" (v2) or "1.1" (v3, default).
+    #[arg(long, default_value = "1.1", value_parser = ["0.10", "1.1"])]
+    compat: String,
+
+    /// qcow2 compression flag (does not change required; accepted for parity).
+    #[arg(long)]
+    compress: bool,
+
+    /// qcow2 preallocation mode.
+    #[arg(long, default_value = "off",
+          value_parser = ["off", "metadata", "falloc", "full"])]
+    preallocation: String,
+
+    // --- per-target vmdk options ---
+    /// vmdk subformat. Default (when -O vmdk): monolithicSparse.
+    #[arg(long, default_value = "",
+          value_parser = ["", "monolithicSparse", "streamOptimized",
+                          "monolithicFlat"])]
+    subformat: String,
+
+    /// vmdk grain size in bytes. Power of two in [4 KiB, 64 KiB].
+    /// Default (when -O vmdk): 65536.
+    #[arg(long, default_value = "0")]
+    grain_size: u32,
+
+    // --- per-target vhd / vhdx options ---
+    /// vhd / vhdx block size in bytes. Power of two; vhd: [512 KiB, 2 GiB],
+    /// vhdx: [1 MiB, 256 MiB]. Default (when -O vpc): 2 MiB; default (when -O vhdx): 32 MiB.
+    #[arg(long, default_value = "0")]
+    block_size: u32,
+}
+
+#[derive(Args, Debug)]
 struct ConfigArgs {
     /// Show which file each config value came from
     #[arg(long)]
@@ -2406,6 +2519,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Check(args) => run_check(args, verbose),
         Commands::Compare(args) => run_compare(args, verbose),
         Commands::Convert(args) => run_convert(args, verbose),
+        Commands::Measure(args) => run_measure(args, verbose),
         Commands::Config(args) => run_config(args),
     }
 }
@@ -5116,6 +5230,17 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     }
 
     Ok(())
+}
+
+/// Run the measure operation (predict output size for a target format).
+///
+/// Stub for phase 4a — phase 4c fills in the body.
+fn run_measure(_args: MeasureArgs, _verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Suppress "unused constant" warnings for constants used in phase 4c.
+    let _ = MEASURE_CONFIG_MAGIC;
+    let _ = MEASURE_RESULT_MAGIC;
+    let _ = MEASURE_RESULT_ERROR_OK;
+    Err("measure: not yet implemented".into())
 }
 
 /// Print compare result in human-readable or JSON format.
