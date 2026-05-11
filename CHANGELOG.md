@@ -21,12 +21,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `count_allocated_in_gt`) are exposed for direct unit testing and
   future fuzzing.
   (PLAN-measure-phase-02-allocation-scanners.md)
+- Added `operations/measure/` guest binary that produces a
+  MeasureResultMessage over the serial channel given a source image
+  (or `virtual_size_override`) and a target format. CLI surface ships
+  in phase 4. (PLAN-measure-phase-03-guest-op.md)
+- Added `MeasureConfig` and `MeasureResult` structs to `shared`, and
+  `MeasureResultMessage` (field 10) to the GuestMessage protobuf oneof,
+  plus the `measure_result_message` helper in `crates/guest-protocol`.
+  (PLAN-measure-phase-03-guest-op.md)
 
 ### Changed
 
 - Moved `AllocationSummary` from `crates/measure` to `crates/shared`
   (with a back-compat re-export from `measure`) so format crates can
   produce values of the type without depending on `measure`.
+- Bumped `CallTable::VERSION` from 13 to 14, adding
+  `send_measure_result` as the last function pointer. Operation
+  binaries built against the older version will fail-stop in
+  `validate_call_table!` rather than silently miscompile.
 
 ## [0.2.0] - 2026-05-09
 

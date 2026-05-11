@@ -244,6 +244,11 @@ provides a modular architecture with:
   writer emits dynamic VHDX with configurable block size (1MB-256MB
   via `--block-size`, default 32MB), 1MB-aligned structures, CRC-32C
   checksums, and BAT rewriting.
+- **operations/measure/** - Image-size measurement operation (predicts
+  required and fully-allocated byte counts for a target output format;
+  consumes `crates/measure/` calculators and each parser crate's
+  `scan_allocation`). Wired through CallTable v14's `send_measure_result`
+  callback. CLI surface ships in phase 4.
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation,
@@ -251,7 +256,10 @@ provides a modular architecture with:
   `write_be_u16/32/64`, `write_le_u16/32/64`). Also defines
   `AllocationSummary`, the common result type produced by each format
   crate's `scan_allocation` function and consumed by the upcoming
-  `measure` subcommand.
+  `measure` subcommand. MeasureConfig and MeasureResult structs were
+  added in phase 3 of PLAN-measure.md to carry options and results
+  across OPERATION_CONFIG_ADDR and the new send_measure_result CallTable
+  callback (CallTable VERSION bumped 13 → 14).
 
 **Chain validation in check (`--chain`):**
 The check operation supports an optional `--chain` flag that uses the host-side
