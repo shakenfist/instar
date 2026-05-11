@@ -5272,14 +5272,505 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 }
 
 /// Run the measure operation (predict output size for a target format).
-///
-/// Stub for phase 4a — phase 4c fills in the body.
-fn run_measure(_args: MeasureArgs, _verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
-    // Suppress "unused constant" warnings for constants used in phase 4c.
-    let _ = MEASURE_CONFIG_MAGIC;
+fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Touch the result magic constant so its presence is preserved for
+    // future host-side validation; the magic is also checked by the guest.
     let _ = MEASURE_RESULT_MAGIC;
-    let _ = MEASURE_RESULT_ERROR_OK;
-    Err("measure: not yet implemented".into())
+
+    // --- Validate args ---------------------------------------------------
+    if args.input.is_none() && args.size.is_none() {
+        return Err("measure: either --size or FILENAME must be provided".into());
+    }
+
+    if !(512..=MAX_SECTOR_SIZE).contains(&args.sector_size) || !args.sector_size.is_power_of_two() {
+        return Err(format!(
+            "sector size must be a power of 2, 512 to {} (got {})",
+            MAX_SECTOR_SIZE, args.sector_size
+        )
+        .into());
+    }
+
+    // Light host-side sanity checks for obvious bogus options. The guest
+    // performs full validation against the target format; here we just
+    // catch trivial mistakes early.
+    if args.cluster_size != 0 && (args.cluster_size < 512 || !args.cluster_size.is_power_of_two()) {
+        return Err(format!(
+            "measure: --cluster-size must be a power of 2 >= 512 (got {})",
+            args.cluster_size
+        )
+        .into());
+    }
+    if args.refcount_bits != 0 && !matches!(args.refcount_bits, 1 | 2 | 4 | 8 | 16 | 32 | 64) {
+        return Err(format!(
+            "measure: --refcount-bits must be one of 1,2,4,8,16,32,64 (got {})",
+            args.refcount_bits
+        )
+        .into());
+    }
+    if args.grain_size != 0 && (args.grain_size < 512 || !args.grain_size.is_power_of_two()) {
+        return Err(format!(
+            "measure: --grain-size must be a power of 2 >= 512 (got {})",
+            args.grain_size
+        )
+        .into());
+    }
+    if args.block_size != 0 && (args.block_size < 512 || !args.block_size.is_power_of_two()) {
+        return Err(format!(
+            "measure: --block-size must be a power of 2 >= 512 (got {})",
+            args.block_size
+        )
+        .into());
+    }
+
+    // Map the target format string to the numeric ImageFormat. Clap
+    // already restricts the accepted set; this is defence-in-depth.
+    let target_format: u32 = match args.target_format.as_str() {
+        "raw" => IMAGE_FORMAT_RAW,
+        "qcow2" => IMAGE_FORMAT_QCOW2,
+        "vmdk" => IMAGE_FORMAT_VMDK4,
+        "vpc" => IMAGE_FORMAT_VHD,
+        "vhdx" => IMAGE_FORMAT_VHDX,
+        other => {
+            return Err(format!("measure: unsupported target format '{}'", other).into());
+        }
+    };
+
+    // Resolve flags + per-format byte fields from CLI options.
+    let mut measure_flags: u32 = 0;
+    if args.extended_l2 {
+        measure_flags |= MEASURE_CONFIG_FLAG_EXTENDED_L2;
+    }
+    if args.lazy_refcounts {
+        measure_flags |= MEASURE_CONFIG_FLAG_LAZY_REFCOUNTS;
+    }
+    // qcow2 compat: default is v3 (1.1). v2 (0.10) clears the bit.
+    if args.compat == "1.1" {
+        measure_flags |= MEASURE_CONFIG_FLAG_COMPAT_V3;
+    }
+    if args.compress {
+        measure_flags |= MEASURE_CONFIG_FLAG_COMPRESS;
+    }
+    let prealloc_bits: u32 = match args.preallocation.as_str() {
+        "" | "off" => MEASURE_CONFIG_PREALLOC_OFF,
+        "metadata" => MEASURE_CONFIG_PREALLOC_METADATA,
+        "falloc" => MEASURE_CONFIG_PREALLOC_FALLOC,
+        "full" => MEASURE_CONFIG_PREALLOC_FULL,
+        other => {
+            return Err(format!("measure: unsupported preallocation mode '{}'", other).into());
+        }
+    };
+    measure_flags |= prealloc_bits;
+
+    let vmdk_subformat: u8 = match args.subformat.as_str() {
+        "" | "monolithicSparse" => 0,
+        "streamOptimized" => 1,
+        "monolithicFlat" => 2,
+        other => {
+            return Err(format!("measure: unsupported vmdk subformat '{}'", other).into());
+        }
+    };
+    let vhd_subformat: u8 = 0; // Dynamic only in phase 4.
+
+    // Resolve --size into a u64 virtual size override; 0 means "scan source".
+    let virtual_size_override: u64 = if let Some(ref s) = args.size {
+        parse_memory_size(s)?
+    } else {
+        0
+    };
+
+    // --- VMDK monolithicFlat source rejection (FILENAME mode only) -------
+    if let Some(ref input_str) = args.input {
+        let input_path = Path::new(input_str);
+        if peek_is_vmdk_descriptor(input_path).unwrap_or(false) {
+            return Err(
+                "measure: monolithicFlat source images are not yet supported \
+                 (use convert -f / qemu-img instead)"
+                    .into(),
+            );
+        }
+    }
+
+    // --- Load guest binaries --------------------------------------------
+    let core_path = get_binary_path("core.bin");
+    let operation_path = get_binary_path("measure.bin");
+
+    let core_code = load_guest_binary(core_path.to_str().unwrap())?;
+    debug!(
+        "Loaded core binary: {} bytes from {}",
+        core_code.len(),
+        core_path.display()
+    );
+
+    let operation_code = load_guest_binary(operation_path.to_str().unwrap())?;
+    debug!(
+        "Loaded operation binary: {} bytes from {}",
+        operation_code.len(),
+        operation_path.display()
+    );
+
+    // --- KVM / VM / guest memory setup ----------------------------------
+    let kvm = Kvm::new()?;
+    debug!("KVM API version: {}", kvm.get_api_version());
+
+    let kvm_stats_checker = kvm_stats::KvmStatsChecker::new(&kvm);
+    kvm_stats_checker.display_status();
+
+    let vm = kvm.create_vm()?;
+    debug!("Created VM");
+
+    let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
+    debug!("Allocated {GUEST_MEM_SIZE} bytes of guest memory");
+
+    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let host_addr = region.as_ptr() as u64;
+
+    let mem_region = kvm_userspace_memory_region {
+        slot: 0,
+        guest_phys_addr: 0,
+        memory_size: GUEST_MEM_SIZE,
+        userspace_addr: host_addr,
+        flags: 0,
+    };
+    // SAFETY: mem_region.userspace_addr points to a valid GuestMemoryMmap
+    // allocation that outlives the VM. The slot/guest_phys_addr are unique
+    // per operation entry point.
+    unsafe {
+        vm.set_user_memory_region(mem_region)?;
+    }
+    debug!("Configured memory region");
+
+    setup_gdt(&guest_mem)?;
+    debug!("Set up GDT at 0x{GDT_BASE:x}");
+
+    setup_page_tables(&guest_mem, GUEST_MEM_SIZE)?;
+    debug!("Set up page tables at 0x{PAGE_TABLE_BASE:x}");
+
+    guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
+    debug!("Loaded core binary at 0x{GUEST_CODE_BASE:x}");
+
+    guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
+    debug!("Loaded operation binary at 0x{OPERATION_LOAD_ADDR:x}");
+
+    // --- Write MeasureConfig (per-field at known offsets) ---------------
+    // Layout (must match shared::MeasureConfig exactly, 56 bytes total):
+    //   0:  magic               u32
+    //   4:  target_format       u32
+    //   8:  flags               u32
+    //  12:  sector_size         u32
+    //  16:  virtual_size_override u64
+    //  24:  qcow2_cluster_size  u32
+    //  28:  qcow2_refcount_bits u8
+    //  29:  vmdk_subformat      u8
+    //  30:  _pad2               u16
+    //  32:  vmdk_grain_size     u32
+    //  36:  vhd_subformat       u8
+    //  37:  _pad3               [u8; 3]
+    //  40:  block_size          u32
+    //  44:  _pad4               u32
+    //  48:  luks_header_overhead u64
+    guest_mem.write_obj(MEASURE_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
+    guest_mem.write_obj(target_format, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
+    guest_mem.write_obj(measure_flags, GuestAddress(OPERATION_CONFIG_ADDR + 8))?;
+    guest_mem.write_obj(args.sector_size, GuestAddress(OPERATION_CONFIG_ADDR + 12))?;
+    guest_mem.write_obj(
+        virtual_size_override,
+        GuestAddress(OPERATION_CONFIG_ADDR + 16),
+    )?;
+    guest_mem.write_obj(args.cluster_size, GuestAddress(OPERATION_CONFIG_ADDR + 24))?;
+    guest_mem.write_obj(args.refcount_bits, GuestAddress(OPERATION_CONFIG_ADDR + 28))?;
+    guest_mem.write_obj(vmdk_subformat, GuestAddress(OPERATION_CONFIG_ADDR + 29))?;
+    // _pad2 (offset 30, u16) intentionally left zero from page-zeroed memory.
+    guest_mem.write_obj(args.grain_size, GuestAddress(OPERATION_CONFIG_ADDR + 32))?;
+    guest_mem.write_obj(vhd_subformat, GuestAddress(OPERATION_CONFIG_ADDR + 36))?;
+    // _pad3 (offsets 37..40) left zero.
+    guest_mem.write_obj(args.block_size, GuestAddress(OPERATION_CONFIG_ADDR + 40))?;
+    // _pad4 (offset 44, u32) left zero.
+    // luks_header_overhead (offset 48): phase 4 does not expose LUKS measure;
+    // leave at zero (no LUKS overhead added).
+    debug!(
+        "Wrote measure config at 0x{:x} (target={}, flags=0x{:x}, sector_size={}, \
+         virtual_size_override={}, cluster_size={}, refcount_bits={}, \
+         vmdk_subformat={}, grain_size={}, vhd_subformat={}, block_size={})",
+        OPERATION_CONFIG_ADDR,
+        target_format,
+        measure_flags,
+        args.sector_size,
+        virtual_size_override,
+        args.cluster_size,
+        args.refcount_bits,
+        vmdk_subformat,
+        args.grain_size,
+        vhd_subformat,
+        args.block_size,
+    );
+
+    // --- Set up source device 0 -----------------------------------------
+    // For FILENAME mode the source is the user's image. For --size mode
+    // the guest short-circuits the scan path on virtual_size_override != 0
+    // and never reads the device, but core's boot path still expects
+    // device 0 to be present, so we attach a tiny tempfile as a stub.
+    let mut device_set = DeviceSet::new();
+    let mut io_events: Vec<IoEvent> = Vec::new();
+
+    // Keep the stub file (if any) alive for the duration of the run so the
+    // backing path remains valid until the VM exits. SizeModeStub deletes
+    // its backing path on drop.
+    struct SizeModeStub(std::path::PathBuf);
+    impl Drop for SizeModeStub {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _size_mode_stub: Option<SizeModeStub>;
+
+    let (input_path_buf, input_size) = if let Some(ref input_str) = args.input {
+        let p = std::path::PathBuf::from(input_str);
+        let md = std::fs::metadata(&p)?;
+        let sz = md.len();
+        _size_mode_stub = None;
+        (p, sz)
+    } else {
+        // --size mode: create a 1-sector stub file as device 0. The guest's
+        // measure binary short-circuits the scan path on
+        // virtual_size_override != 0, so the device is never read; core's
+        // boot path only needs the device to exist with a valid capacity.
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let p = std::env::temp_dir().join(format!("instar-measure-stub-{}-{}", pid, nanos));
+        let f = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&p)?;
+        f.set_len(args.sector_size as u64)?;
+        drop(f);
+        let sz = args.sector_size as u64;
+        _size_mode_stub = Some(SizeModeStub(p.clone()));
+        (p, sz)
+    };
+
+    let input_backing = BackingStore::open(&input_path_buf, true, None, false)?;
+    let input_mmio = device_mmio_base(0);
+    let input_vq = device_vq_base(0);
+    let input_device = VirtioBlockDevice::new(
+        input_backing,
+        input_size,
+        args.sector_size as u64,
+        true, // read-only
+        input_mmio,
+        input_vq,
+    );
+    debug!(
+        "Created source virtio-block device at MMIO 0x{input_mmio:x}, VQ 0x{input_vq:x} ({} bytes)",
+        input_size
+    );
+    let input_device = Arc::new(Mutex::new(input_device));
+    device_set.add_device(Arc::clone(&input_device), true);
+    io_events.push(IoEvent::new(input_mmio)?);
+
+    // Wrap guest memory in Arc for sharing with the I/O thread.
+    let guest_mem = Arc::new(guest_mem);
+
+    // Shared statistics tracker.
+    let vmm_stats = Arc::new(Mutex::new(VmmStats::new()));
+
+    // Try to register ioeventfds; fall back to VM exits on failure.
+    let mut io_thread: Option<io_thread::IoThread> = None;
+    let mut registered_count = 0usize;
+    let mut registration_failed = false;
+    for evt in io_events.iter_mut() {
+        if let Err(e) = evt.register(&vm) {
+            debug!("ioeventfd: failed to register ({e:?}), falling back to VM exits");
+            registration_failed = true;
+            break;
+        }
+        registered_count += 1;
+    }
+    if registration_failed {
+        for evt in io_events.iter_mut().take(registered_count) {
+            if let Err(e) = evt.unregister(&vm) {
+                warn!("ioeventfd: failed to unregister during rollback: {e:?}");
+            }
+        }
+    }
+    let all_registered = !registration_failed;
+
+    if all_registered && !io_events.is_empty() {
+        debug!(
+            "ioeventfd: enabled for {} device(s) (with I/O thread)",
+            io_events.len()
+        );
+        let io_devices = device_set.create_io_devices(io_events);
+        io_thread = Some(io_thread::IoThread::new(
+            io_devices,
+            Arc::clone(&guest_mem),
+            Arc::clone(&vmm_stats),
+        ));
+    }
+
+    // --- vCPU setup ------------------------------------------------------
+    let mut vcpu = vm.create_vcpu(0)?;
+    debug!("Created vCPU");
+
+    let mut sregs = vcpu.get_sregs()?;
+    setup_sregs(&mut sregs);
+    vcpu.set_sregs(&sregs)?;
+    debug!("Configured special registers for long mode");
+
+    let mut regs = vcpu.get_regs()?;
+    setup_regs(&mut regs);
+    vcpu.set_regs(&regs)?;
+    debug!(
+        "Configured general registers (RIP=0x{:x}, RSP=0x{:x})",
+        regs.rip, regs.rsp
+    );
+
+    // --- Serial decoders / transmitter / debug buffer -------------------
+    let mut serial_decoder = SerialDecoder::new();
+    let mut serial_transmitter = SerialTransmitter::new();
+    let mut debug_buffer = DebugBuffer::new();
+
+    let config = vmm_config_input_only(args.sector_size);
+    serial_transmitter.queue_config(&config);
+    debug!(
+        "Queued configuration message ({} bytes) for guest",
+        serial_transmitter.buffer.len()
+    );
+
+    // --- Run the vCPU loop ----------------------------------------------
+    let mut measure_error: u32 = MEASURE_RESULT_ERROR_OK;
+    let mut measure_result_seen = false;
+    let mut vm_error: Option<String> = None;
+
+    debug!("Starting guest execution");
+
+    loop {
+        match vcpu.run()? {
+            VcpuExit::Hlt => {
+                vmm_stats.lock().unwrap().record_hlt();
+                info!("Guest executed HLT");
+                debug!("Measure operation completed");
+                break;
+            }
+            VcpuExit::IoOut(port, data) => {
+                vmm_stats.lock().unwrap().record_io_out();
+                if port == SERIAL_PORT {
+                    for &byte in data {
+                        if let Some(msg) = serial_decoder.add_byte(byte) {
+                            let is_measure_result = matches!(
+                                &msg.payload,
+                                Some(guest_::GuestMessage_::Payload::MeasureResult(_))
+                            );
+                            if is_measure_result {
+                                if let Some(guest_::GuestMessage_::Payload::MeasureResult(m)) =
+                                    &msg.payload
+                                {
+                                    measure_error = m.error;
+                                    measure_result_seen = true;
+                                }
+                                print_measure_result(&msg, &args.output);
+                            } else if verbose {
+                                debug!("{}", format_message(&msg));
+                            }
+                        }
+                    }
+                } else if port == DEBUG_PORT {
+                    for &byte in data {
+                        if let Some(line) = debug_buffer.add_byte(byte) {
+                            debug!("[GUEST] {line}");
+                        }
+                    }
+                } else {
+                    debug!("IO OUT: port=0x{port:x}, data={data:?}");
+                }
+            }
+            VcpuExit::IoIn(port, data) => {
+                vmm_stats.lock().unwrap().record_io_in();
+                if port == SERIAL_PORT {
+                    for byte in data.iter_mut() {
+                        *byte = serial_transmitter.next_byte().unwrap_or(0);
+                    }
+                } else if port == SERIAL_PORT + 5 {
+                    let mut lsr = 0x60u8;
+                    if serial_transmitter.has_data() {
+                        lsr |= 0x01;
+                    }
+                    data[0] = lsr;
+                } else {
+                    for byte in data {
+                        *byte = 0;
+                    }
+                }
+            }
+            VcpuExit::MmioRead(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_read();
+                let value = device_set.mmio_read(addr);
+                write_mmio_data(data, value);
+            }
+            VcpuExit::MmioWrite(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_write();
+                let value = read_mmio_data(data);
+                if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
+                    if io_thread.is_none() && should_process {
+                        device_set.process_queue_for_device(
+                            device_index,
+                            &guest_mem,
+                            &vmm_stats,
+                        )?;
+                    }
+                }
+            }
+            VcpuExit::Shutdown => {
+                vmm_stats.lock().unwrap().record_shutdown();
+                eprintln!("\n--- VM Shutdown (triple fault?) ---");
+                vm_error = Some("VM shutdown (triple fault)".to_string());
+                break;
+            }
+            VcpuExit::FailEntry(reason, cpu) => {
+                vmm_stats.lock().unwrap().record_fail_entry();
+                eprintln!("VM Entry Failed! reason=0x{reason:x}, cpu={cpu}");
+                vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
+                break;
+            }
+            exit => {
+                vmm_stats.lock().unwrap().record_unknown();
+                eprintln!("Unexpected VM exit: {exit:?}");
+                vm_error = Some(format!("unexpected VM exit: {exit:?}"));
+                break;
+            }
+        }
+    }
+
+    if let Some(mut thread) = io_thread {
+        thread.stop();
+    }
+
+    if log::log_enabled!(log::Level::Debug) {
+        vmm_stats.lock().unwrap().display();
+    }
+
+    if let Some(error) = vm_error {
+        return Err(error.into());
+    }
+
+    if !measure_result_seen {
+        return Err("measure: guest did not return a result".into());
+    }
+
+    if measure_error != MEASURE_RESULT_ERROR_OK {
+        let detail = match measure_error {
+            MEASURE_RESULT_ERROR_OVERFLOW => "overflow computing target size",
+            MEASURE_RESULT_ERROR_INVALID_OPTION => "invalid option for target format",
+            MEASURE_RESULT_ERROR_INVALID_SIZE => "source image is unsupported format",
+            _ => "unknown error",
+        };
+        return Err(format!("measure failed: {}", detail).into());
+    }
+
+    Ok(())
 }
 
 /// Print compare result in human-readable or JSON format.
