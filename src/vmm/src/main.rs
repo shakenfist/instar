@@ -5284,7 +5284,6 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 /// `None` otherwise. Applied last in run_measure (after individual
 /// clap flags) so `-o` wins on conflict.
 #[derive(Default, Debug)]
-#[allow(dead_code)] // Fields read in step 5b.
 struct MeasureOptionOverrides {
     cluster_size: Option<u32>,
     refcount_bits: Option<u8>,
@@ -5301,7 +5300,6 @@ struct MeasureOptionOverrides {
 
 /// Parse a boolean value in qemu-img -o syntax. Accepts (case-insensitive):
 /// on / off / true / false / yes / no. Other inputs return an error.
-#[allow(dead_code)] // Used in step 5b via parse_o_options.
 fn parse_o_bool(key: &str, value: &str) -> Result<bool, Box<dyn std::error::Error>> {
     match value.to_ascii_lowercase().as_str() {
         "on" | "true" | "yes" => Ok(true),
@@ -5315,7 +5313,6 @@ fn parse_o_bool(key: &str, value: &str) -> Result<bool, Box<dyn std::error::Erro
 }
 
 /// Parse a size value (K/M/G/T suffixes) and bounds-check to u32.
-#[allow(dead_code)] // Used in step 5b via parse_o_options.
 fn parse_o_size_u32(key: &str, value: &str) -> Result<u32, Box<dyn std::error::Error>> {
     let n = parse_memory_size(value)
         .map_err(|e| format!("measure: bad size '{}' for -o key '{}' ({})", value, key, e))?;
@@ -5325,18 +5322,7 @@ fn parse_o_size_u32(key: &str, value: &str) -> Result<u32, Box<dyn std::error::E
     Ok(n as u32)
 }
 
-/// Parse a decimal numeric value (u32).
-#[allow(dead_code)] // Used in step 5b via parse_o_options.
-fn parse_o_u32(key: &str, value: &str) -> Result<u32, Box<dyn std::error::Error>> {
-    value
-        .parse::<u32>()
-        .map_err(|_| -> Box<dyn std::error::Error> {
-            format!("measure: bad number '{}' for -o key '{}'", value, key).into()
-        })
-}
-
 /// Parse a decimal numeric value (u8).
-#[allow(dead_code)] // Used in step 5b via parse_o_options.
 fn parse_o_u8(key: &str, value: &str) -> Result<u8, Box<dyn std::error::Error>> {
     value
         .parse::<u8>()
@@ -5350,7 +5336,6 @@ fn parse_o_u8(key: &str, value: &str) -> Result<u8, Box<dyn std::error::Error>> 
 ///
 /// Returns an error on unknown keys, invalid values, or unsupported
 /// features. Last-wins for repeated keys across all `-o` invocations.
-#[allow(dead_code)] // Wired into run_measure in step 5b.
 fn parse_o_options(
     target: &str,
     raw: &[String],
@@ -5595,22 +5580,65 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         }
     };
 
-    // Resolve flags + per-format byte fields from CLI options.
+    // Parse -o key=value options; last-wins and overrides individual flags.
+    let overrides = parse_o_options(&args.target_format, &args.option)?;
+
+    // Local mutable copies of per-format scalars so -o can override them.
+    let mut cluster_size: u32 = args.cluster_size;
+    let mut refcount_bits: u8 = args.refcount_bits;
+    let mut extended_l2: bool = args.extended_l2;
+    let mut lazy_refcounts: bool = args.lazy_refcounts;
+    let mut compat_v3: bool = args.compat == "1.1";
+    let mut compress: bool = args.compress;
+    let mut preallocation_str: String = args.preallocation.clone();
+    let mut grain_size: u32 = args.grain_size;
+    let mut block_size: u32 = args.block_size;
+
+    // Apply -o overrides (last-wins over individual flags).
+    if let Some(v) = overrides.cluster_size {
+        cluster_size = v;
+    }
+    if let Some(v) = overrides.refcount_bits {
+        refcount_bits = v;
+    }
+    if let Some(v) = overrides.extended_l2 {
+        extended_l2 = v;
+    }
+    if let Some(v) = overrides.lazy_refcounts {
+        lazy_refcounts = v;
+    }
+    if let Some(v) = overrides.compat_v3 {
+        compat_v3 = v;
+    }
+    if let Some(v) = overrides.compression_used {
+        compress = v;
+    }
+    if let Some(prealloc) = overrides.preallocation {
+        preallocation_str = prealloc.to_string();
+    }
+    if let Some(v) = overrides.grain_size {
+        grain_size = v;
+    }
+    if let Some(v) = overrides.block_size {
+        block_size = v;
+    }
+
+    // Resolve flags + per-format byte fields from local (possibly overridden) values.
     let mut measure_flags: u32 = 0;
-    if args.extended_l2 {
+    if extended_l2 {
         measure_flags |= MEASURE_CONFIG_FLAG_EXTENDED_L2;
     }
-    if args.lazy_refcounts {
+    if lazy_refcounts {
         measure_flags |= MEASURE_CONFIG_FLAG_LAZY_REFCOUNTS;
     }
     // qcow2 compat: default is v3 (1.1). v2 (0.10) clears the bit.
-    if args.compat == "1.1" {
+    if compat_v3 {
         measure_flags |= MEASURE_CONFIG_FLAG_COMPAT_V3;
     }
-    if args.compress {
+    if compress {
         measure_flags |= MEASURE_CONFIG_FLAG_COMPRESS;
     }
-    let prealloc_bits: u32 = match args.preallocation.as_str() {
+    let prealloc_bits: u32 = match preallocation_str.as_str() {
         "" | "off" => MEASURE_CONFIG_PREALLOC_OFF,
         "metadata" => MEASURE_CONFIG_PREALLOC_METADATA,
         "falloc" => MEASURE_CONFIG_PREALLOC_FALLOC,
@@ -5621,7 +5649,7 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     };
     measure_flags |= prealloc_bits;
 
-    let vmdk_subformat: u8 = match args.subformat.as_str() {
+    let mut vmdk_subformat: u8 = match args.subformat.as_str() {
         "" | "monolithicSparse" => 0,
         "streamOptimized" => 1,
         "monolithicFlat" => 2,
@@ -5629,7 +5657,13 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
             return Err(format!("measure: unsupported vmdk subformat '{}'", other).into());
         }
     };
-    let vhd_subformat: u8 = 0; // Dynamic only in phase 4.
+    if let Some(v) = overrides.vmdk_subformat {
+        vmdk_subformat = v;
+    }
+    let mut vhd_subformat: u8 = 0; // Dynamic only in phase 4.
+    if let Some(v) = overrides.vhd_subformat {
+        vhd_subformat = v;
+    }
 
     // Resolve --size into a u64 virtual size override; 0 means "scan source".
     let virtual_size_override: u64 = if let Some(ref s) = args.size {
@@ -5736,14 +5770,14 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         virtual_size_override,
         GuestAddress(OPERATION_CONFIG_ADDR + 16),
     )?;
-    guest_mem.write_obj(args.cluster_size, GuestAddress(OPERATION_CONFIG_ADDR + 24))?;
-    guest_mem.write_obj(args.refcount_bits, GuestAddress(OPERATION_CONFIG_ADDR + 28))?;
+    guest_mem.write_obj(cluster_size, GuestAddress(OPERATION_CONFIG_ADDR + 24))?;
+    guest_mem.write_obj(refcount_bits, GuestAddress(OPERATION_CONFIG_ADDR + 28))?;
     guest_mem.write_obj(vmdk_subformat, GuestAddress(OPERATION_CONFIG_ADDR + 29))?;
     // _pad2 (offset 30, u16) intentionally left zero from page-zeroed memory.
-    guest_mem.write_obj(args.grain_size, GuestAddress(OPERATION_CONFIG_ADDR + 32))?;
+    guest_mem.write_obj(grain_size, GuestAddress(OPERATION_CONFIG_ADDR + 32))?;
     guest_mem.write_obj(vhd_subformat, GuestAddress(OPERATION_CONFIG_ADDR + 36))?;
     // _pad3 (offsets 37..40) left zero.
-    guest_mem.write_obj(args.block_size, GuestAddress(OPERATION_CONFIG_ADDR + 40))?;
+    guest_mem.write_obj(block_size, GuestAddress(OPERATION_CONFIG_ADDR + 40))?;
     // _pad4 (offset 44, u32) left zero.
     // luks_header_overhead (offset 48): phase 4 does not expose LUKS measure;
     // leave at zero (no LUKS overhead added).
@@ -5756,12 +5790,12 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         measure_flags,
         args.sector_size,
         virtual_size_override,
-        args.cluster_size,
-        args.refcount_bits,
+        cluster_size,
+        refcount_bits,
         vmdk_subformat,
-        args.grain_size,
+        grain_size,
         vhd_subformat,
-        args.block_size,
+        block_size,
     );
 
     // --- Set up source device 0 -----------------------------------------
