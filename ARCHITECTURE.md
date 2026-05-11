@@ -160,15 +160,23 @@ provides a modular architecture with:
   1/2/4/8/16/32/64-bit), compressed L2 entry parsing, backing file
   extraction, header extension parsing, incompatible feature bit
   validation. Supports cluster sizes from 512B to 2MB (cluster_bits
-  9-21). Used by info, check, compare, and convert operations.
+  9-21). Used by info, check, compare, and convert operations. Also
+  exposes `Qcow2State::scan_allocation` plus the pure helpers
+  `count_allocated_in_l2_standard` / `count_allocated_in_l2_extended`
+  to produce a `shared::AllocationSummary` for use by the upcoming
+  `measure` subcommand.
 - **crates/raw/** - Shared RAW format crate: MBR/GPT partition table
-  detection. Used by info operation.
+  detection. Used by info operation. Also exposes a trivial
+  `scan_allocation` (allocated_bytes == virtual_size) for the measure
+  subcommand.
 - **crates/vmdk/** - Shared VMDK format crate: VMDK4 binary header parsing
   (basic and full), descriptor I/O and text parsing, grain directory/table
   reading with sector-cached lookups, streamOptimized footer reading,
   grain marker handling, and write helpers for monolithicSparse and
   streamOptimized output. Used by info, check, convert, and compare
-  operations.
+  operations. Also exposes `VmdkState::scan_allocation` plus
+  `count_populated_gd_entries` / `count_allocated_in_gt` for the measure
+  subcommand.
 - **crates/vhd/** - Shared VHD/VPC format crate: footer parsing and
   validation (conectix cookie, CHS geometry, disk type), dynamic header
   parsing (cxsparse cookie, BAT offset, block size), BAT reading with
@@ -177,14 +185,18 @@ provides a modular architecture with:
   (`read_offset_sectors` for VHD data spanning device sector boundaries),
   and write helpers (build_footer, build_dynamic_header,
   compute_vhd_geometry). Used by info, check, convert, and compare
-  operations.
+  operations. Also exposes `VhdState::scan_allocation` plus the pure
+  helper `count_allocated_in_bat` for the measure subcommand.
 - **crates/vhdx/** - Shared VHDX format crate: CRC-32C (Castagnoli)
   checksum implementation, dual header parsing with sequence number
   selection, region table parsing with CRC validation, GUID-based
   metadata item lookup, 64-bit BAT reading with interleaved sector
   bitmap entry handling, VhdxState for stateful block I/O, and output
   builders (file identifier, headers, region table, metadata, BAT
-  entries). Used by check, convert, and compare operations.
+  entries). Used by check, convert, and compare operations. Also
+  exposes `VhdxState::scan_allocation` plus `count_allocated_in_bat`
+  (which handles the chunk_ratio bitmap interleaving) for the measure
+  subcommand.
 - **crates/luks/** - Shared LUKS format crate: LUKS v1/v2 header
   constants, header parsing, PBKDF2 key derivation, Argon2id key
   derivation (behind `kdf-argon2` feature), AFsplitter key recovery,
@@ -196,8 +208,11 @@ provides a modular architecture with:
   emits. The qcow2 estimator matches qemu-img's worst-case sizing
   semantics (L2 tables sized for the full virtual range; refcount layout
   sized once for the fully-allocated cluster count and reused for the
-  sparse case). Intended to be reused by the upcoming `measure` operation
-  (phase 3+ of `PLAN-measure.md`) and by `create` / `resize`.
+  sparse case). `AllocationSummary` has been moved to `crates/shared` so
+  format crates can produce it without depending on `measure`; a
+  back-compat re-export remains in this crate. Intended to be reused by
+  the upcoming `measure` operation (phase 3+ of `PLAN-measure.md`) and
+  by `create` / `resize`.
 - **operations/info/** - Format detection operation
 - **operations/copy/** - File copy operation
 - **operations/check/** - Image integrity validation operation (with
@@ -233,7 +248,10 @@ provides a modular architecture with:
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation,
   centralized byte-order helpers: `be_u16/32/64`, `le_u16/32/64`,
-  `write_be_u16/32/64`, `write_le_u16/32/64`)
+  `write_be_u16/32/64`, `write_le_u16/32/64`). Also defines
+  `AllocationSummary`, the common result type produced by each format
+  crate's `scan_allocation` function and consumed by the upcoming
+  `measure` subcommand.
 
 **Chain validation in check (`--chain`):**
 The check operation supports an optional `--chain` flag that uses the host-side

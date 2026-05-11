@@ -13,6 +13,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   per-format estimators (raw, qcow2, vmdk, vhd, vhdx). Foundation for
   the upcoming `measure` operation.
   (PLAN-measure-phase-01-calculators.md)
+- Added `scan_allocation()` to each format crate (raw, qcow2, vmdk,
+  vhd, vhdx), producing `shared::AllocationSummary` for the measure
+  subcommand. Pure slice-walking helpers
+  (`count_allocated_in_l2_standard`, `count_allocated_in_l2_extended`,
+  `count_allocated_in_bat`, `count_populated_gd_entries`,
+  `count_allocated_in_gt`) are exposed for direct unit testing and
+  future fuzzing.
+  (PLAN-measure-phase-02-allocation-scanners.md)
+
+### Changed
+
+- Moved `AllocationSummary` from `crates/measure` to `crates/shared`
+  (with a back-compat re-export from `measure`) so format crates can
+  produce values of the type without depending on `measure`.
 
 ## [0.2.0] - 2026-05-09
 
