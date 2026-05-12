@@ -29,6 +29,16 @@ class TestMeasureSmoke(InstarTestBase):
         except subprocess.TimeoutExpired:
             return '', f'Timeout after {timeout}s', -1
 
+    def test_measure_baselines_present(self):
+        """Phase 6's baselines must be reachable via get_output_profiles."""
+        profiles = self.get_output_profiles(output_type='json', command='measure')
+        self.assertIn('profiles', profiles)
+        self.assertGreater(len(profiles['profiles']), 0,
+                           'expected at least one measure-json profile')
+        self.assertIn('version_to_profile', profiles)
+        self.assertGreater(len(profiles['version_to_profile']), 0,
+                           'expected at least one qemu version in the map')
+
     # --- --size mode, raw target ---
 
     def test_size_raw_human(self):

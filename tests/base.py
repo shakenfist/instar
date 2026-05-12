@@ -28,6 +28,7 @@ COMMAND_OUTPUT_DIRS = {
     'info': 'qemu-img',      # qemu-img-human, qemu-img-json
     'check': 'check',        # check-human, check-json
     'compare': 'compare',    # compare-human, compare-json
+    'measure': 'measure',    # measure-human, measure-json
 }
 
 
