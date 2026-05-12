@@ -42,6 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   values override matching individual flags. backing_file, data_file,
   and encrypt.* keys are rejected pending future work.
   (PLAN-measure-phase-05-target-options.md)
+- Cross-version `qemu-img measure` baselines committed to
+  `instar-testdata/expected-outputs/measure-{human,json}/`. Generated
+  via `make baselines-measure` against every qemu-img binary in
+  `qemu-img-binaries/x86_64/` (80 versions, 6.0.0 through 10.2.0).
+  Covers 21 `--size` cases per version (sizes 1M / 64M / 1G / 1T
+  crossed with raw, qcow2 default, and qcow2 option sweeps) plus
+  every safe-tier image × both raw and qcow2 targets. Consumed by
+  phase 7's integration tests. (PLAN-measure-phase-06-baselines.md)
 
 ### Changed
 
