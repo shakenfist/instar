@@ -429,7 +429,7 @@ where the logic overlaps; that is captured under Future work.
 | 4. Host VMM subcommand + clap surface | [PLAN-measure-phase-04-host-cli.md](PLAN-measure-phase-04-host-cli.md) | Complete |
 | 5. `-o` option parsing and per-target options | [PLAN-measure-phase-05-target-options.md](PLAN-measure-phase-05-target-options.md) | Complete |
 | 6. Cross-version baseline generation in `instar-testdata` | [PLAN-measure-phase-06-baselines.md](PLAN-measure-phase-06-baselines.md) | Complete |
-| 7. Integration tests (`tests/test_measure.py`) | PLAN-measure-phase-07-integration-tests.md (not yet written) | Not started |
+| 7. Integration tests (`tests/test_measure.py`) | [PLAN-measure-phase-07-integration-tests.md](PLAN-measure-phase-07-integration-tests.md) | Not started |
 | 8. Coverage-guided fuzz harnesses | PLAN-measure-phase-08-fuzz-coverage.md (not yet written) | Not started |
 | 9. Differential fuzzing extension | PLAN-measure-phase-09-fuzz-differential.md (not yet written) | Not started |
 | 10. Documentation, CHANGELOG, follow-ups | PLAN-measure-phase-10-docs.md (not yet written) | Not started |
