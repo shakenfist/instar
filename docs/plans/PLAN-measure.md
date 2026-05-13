@@ -431,7 +431,7 @@ where the logic overlaps; that is captured under Future work.
 | 6. Cross-version baseline generation in `instar-testdata` | [PLAN-measure-phase-06-baselines.md](PLAN-measure-phase-06-baselines.md) | Complete |
 | 7. Integration tests (`tests/test_measure.py`) | [PLAN-measure-phase-07-integration-tests.md](PLAN-measure-phase-07-integration-tests.md) | Complete |
 | 8. Coverage-guided fuzz harnesses | [PLAN-measure-phase-08-fuzz-coverage.md](PLAN-measure-phase-08-fuzz-coverage.md) | Complete |
-| 9. Differential fuzzing extension | PLAN-measure-phase-09-fuzz-differential.md (not yet written) | Not started |
+| 9. Differential fuzzing extension | [PLAN-measure-phase-09-fuzz-differential.md](PLAN-measure-phase-09-fuzz-differential.md) | Not started |
 | 10. Documentation, CHANGELOG, follow-ups | PLAN-measure-phase-10-docs.md (not yet written) | Not started |
 
 ### Phase notes (not yet detailed plans)
