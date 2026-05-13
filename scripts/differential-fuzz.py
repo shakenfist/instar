@@ -45,7 +45,7 @@ QCOW2_CLUSTER_SIZES = [512, 4096, 65536, 262144, 2097152]
 DATA_PATTERNS = ['zeros', 'random', 'sparse', 'mbr']
 
 # Operations that the fuzzer can chain together
-OPERATIONS = ['info', 'check', 'convert', 'convert_compressed']
+OPERATIONS = ['info', 'check', 'convert', 'convert_compressed', 'measure']
 
 # Known divergence categories to skip (unsafe quirks)
 # See docs/quirks.md for rationale
@@ -701,6 +701,154 @@ def op_convert(instar_bin, instar_copy, qemu_copy, fmt,
     return None
 
 
+def op_measure(instar_bin, instar_copy, qemu_copy, fmt,
+               timeout, rng):
+    """Run instar measure and compare to qemu-img measure (raw/qcow2)
+    or instar convert's actual output size (vmdk/vpc/vhdx).
+    """
+    # Pick a target format.
+    target_fmt = rng.choice(['raw', 'qcow2', 'vmdk', 'vpc', 'vhdx'])
+
+    instar_args = ['-O', target_fmt, '--output', 'json',
+                   str(instar_copy)]
+    i_out, i_err, i_rc = run_instar(
+        instar_bin, ['measure'], instar_args, timeout=timeout,
+    )
+
+    if target_fmt in ('raw', 'qcow2'):
+        # qemu-img supports these targets — numeric comparison.
+        qemu_args = ['-O', target_fmt, '--output=json',
+                     str(qemu_copy)]
+        q_out, q_err, q_rc = run_qemu_img(
+            ['measure'], qemu_args, timeout=timeout,
+        )
+
+        div = compare_exit_codes(
+            i_rc, q_rc, 'measure',
+            {'target_format': target_fmt,
+             'instar_stderr': i_err[:500],
+             'qemu_stderr': q_err[:500]},
+        )
+        if div:
+            return div
+        if i_rc != 0:
+            return None  # both failed, nothing to compare
+
+        # Parse JSON, compare numeric fields.
+        try:
+            i_json = json.loads(i_out)
+            q_json = json.loads(q_out)
+        except json.JSONDecodeError as e:
+            return {
+                'type': 'measure_json_parse_failure',
+                'target_format': target_fmt,
+                'error': str(e),
+                'instar_stdout': i_out[:500],
+                'qemu_stdout': q_out[:500],
+            }
+
+        # `bitmaps` field comparison: both sides should agree on
+        # presence (instar emits "bitmaps": 0 only for qcow2 v3
+        # sources targeting qcow2; phase 7c verified parity).
+        # required / fully-allocated must match exactly.
+        for key in ('required', 'fully-allocated'):
+            if i_json.get(key) != q_json.get(key):
+                return {
+                    'type': 'measure_numeric_divergence',
+                    'target_format': target_fmt,
+                    'field': key,
+                    'instar_value': i_json.get(key),
+                    'qemu_value': q_json.get(key),
+                    'instar_stdout': i_out,
+                    'qemu_stdout': q_out,
+                }
+
+        # Check the bitmaps field is consistent: emitted on
+        # both sides or neither.
+        i_has_bitmaps = 'bitmaps' in i_json
+        q_has_bitmaps = 'bitmaps' in q_json
+        if i_has_bitmaps != q_has_bitmaps:
+            return {
+                'type': 'measure_bitmaps_presence_divergence',
+                'target_format': target_fmt,
+                'instar_has_bitmaps': i_has_bitmaps,
+                'qemu_has_bitmaps': q_has_bitmaps,
+                'instar_stdout': i_out,
+                'qemu_stdout': q_out,
+            }
+
+        return None
+
+    # vmdk / vpc / vhdx: qemu-img can't measure, so self-consistency
+    # against instar convert.
+    if i_rc != 0:
+        # measure failed; can't compare bounds. Not necessarily a
+        # bug (e.g. unsupported source format).
+        return None
+
+    try:
+        i_json = json.loads(i_out)
+        required = i_json['required']
+        fully_allocated = i_json['fully-allocated']
+    except (json.JSONDecodeError, KeyError) as e:
+        return {
+            'type': 'measure_json_parse_failure',
+            'target_format': target_fmt,
+            'error': str(e),
+            'instar_stdout': i_out[:500],
+        }
+
+    # Convert the instar copy to the target format.
+    out_path = instar_copy.parent / f'{instar_copy.stem}-meas.{target_fmt}'
+    conv_args = ['-O', target_fmt, str(instar_copy), str(out_path)]
+    c_out, c_err, c_rc = run_instar(
+        instar_bin, ['convert'], conv_args, timeout=timeout,
+    )
+
+    if c_rc != 0:
+        # convert failed. Skip the bound check; some inputs are
+        # genuinely unconvertible. measure-side success doesn't
+        # imply convert-side success.
+        return None
+
+    actual = out_path.stat().st_size
+
+    # Cushion absorbs writer-side alignment artefacts that measure
+    # doesn't model. The dominant source is the convert writer's
+    # per-block sector alignment (each allocated block + metadata
+    # region is padded to the output sector size, typically 64 KiB).
+    # For VHD / VHDX the cumulative slack scales with the number of
+    # allocated blocks, so the cushion needs to scale with the image
+    # size. Choose max(1 MiB absolute floor, 1/16 of fully_allocated)
+    # — a generous bound that covers realistic alignment overhead
+    # without admitting wholesale measure-vs-convert disagreement.
+    cushion = max(1 << 20, fully_allocated >> 4)
+
+    # Only the upper bound is a hard invariant.
+    #
+    # `required` is an *upper bound* on what convert produces for an
+    # image with the given source-side AllocationSummary — not a
+    # lower bound. instar's parser scanners can over-report
+    # allocated_bytes (known phase 7c scanner divergences: raw lacks
+    # SEEK_HOLE detection, vhdx scanner treats every block as fully
+    # allocated, etc.), which inflates `required`. convert's
+    # zero-skipping then produces a smaller-than-`required` output
+    # that is still semantically correct. So we only assert
+    # `actual <= fully_allocated + cushion` here; the
+    # `actual >= required` direction is permissive.
+    if actual > fully_allocated + cushion:
+        return {
+            'type': 'measure_above_fully_allocated_bound',
+            'target_format': target_fmt,
+            'measured_required': required,
+            'measured_fully_allocated': fully_allocated,
+            'convert_actual_size': actual,
+            'cushion': cushion,
+        }
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Single iteration
 # ---------------------------------------------------------------------------
@@ -749,6 +897,11 @@ def run_iteration(instar_bin, workdir, rng, iteration, timeout,
                 div = op_convert(
                     instar_bin, instar_copy, qemu_copy, fmt,
                     timeout, rng, compress=True,
+                )
+            elif op == 'measure':
+                div = op_measure(
+                    instar_bin, instar_copy, qemu_copy, fmt,
+                    timeout, rng,
                 )
             else:
                 continue
