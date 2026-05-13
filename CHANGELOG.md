@@ -66,6 +66,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `"bitmaps": 0` field when the source is a qcow2 v3 (compat=1.1)
   image, matching qemu-img's behaviour. Equivalent `bitmaps size: 0`
   trailing line in `--output=human` mode.
+- Coverage-guided fuzz targets for `crates/measure/`
+  (`fuzz_measure_calc`) and the per-parser `scan_allocation` entry
+  points (`fuzz_measure_scan`). Registered alongside the existing
+  13 targets in the nightly coverage-fuzz workflow; total now 15.
+  (PLAN-measure-phase-08-fuzz-coverage.md)
 
 ### Changed
 
