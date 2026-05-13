@@ -108,3 +108,9 @@ name = "fuzz_measure_calc"
 path = "fuzz_targets/fuzz_measure_calc.rs"
 doc = false
 test = false
+
+[[bin]]
+name = "fuzz_measure_scan"
+path = "fuzz_targets/fuzz_measure_scan.rs"
+doc = false
+test = false
