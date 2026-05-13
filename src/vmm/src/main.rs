@@ -310,6 +310,7 @@ fn parse_memory_size(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
         return Err("empty memory size string".into());
     }
     let (num_str, multiplier) = match s.as_bytes().last() {
+        Some(b'T' | b't') => (&s[..s.len() - 1], 1u64 << 40),
         Some(b'G' | b'g') => (&s[..s.len() - 1], 1u64 << 30),
         Some(b'M' | b'm') => (&s[..s.len() - 1], 1u64 << 20),
         Some(b'K' | b'k') => (&s[..s.len() - 1], 1u64 << 10),
