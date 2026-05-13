@@ -46,7 +46,7 @@ use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
 use backing::BackingStore;
 use chain::{
-    check_chain_depth, check_circular_reference, peek_is_vmdk_descriptor,
+    check_chain_depth, check_circular_reference, peek_is_qcow2_v3, peek_is_vmdk_descriptor,
     resolve_vmdk_flat_descriptor, validate_backing_path, BackingChain, ChainError, ChainImage,
     ExternalDataFile, ImageFormat, InfoOperationResult,
 };
@@ -3979,8 +3979,12 @@ fn print_measure_result(
             // Human format must match qemu-img byte-for-byte:
             //   required size: <N>\n
             //   fully allocated size: <N>\n
+            //   bitmaps size: 0\n              (qcow2 target + source only)
             println!("required size: {}", result.required);
             println!("fully allocated size: {}", result.fully_allocated);
+            if target_qcow2_with_source {
+                println!("bitmaps size: 0");
+            }
         }
     }
 }
@@ -5983,12 +5987,17 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                                     measure_error = m.error;
                                     measure_result_seen = true;
                                 }
-                                let target_qcow2_with_source =
-                                    args.target_format == "qcow2" && args.input.is_some();
+                                // qemu-img emits "bitmaps" only when the source
+                                // is qcow2 v3 (persistent bitmaps are a v3
+                                // feature; qcow2 v2 sources do not emit the
+                                // field even though they share the magic).
+                                let target_qcow2_with_qcow2v3_source =
+                                    args.target_format == "qcow2"
+                                        && args.input.as_deref().is_some_and(peek_is_qcow2_v3);
                                 print_measure_result(
                                     &msg,
                                     &args.output,
-                                    target_qcow2_with_source,
+                                    target_qcow2_with_qcow2v3_source,
                                 );
                             } else if verbose {
                                 debug!("{}", format_message(&msg));

@@ -571,6 +571,32 @@ pub fn peek_is_vmdk_descriptor(path: &Path) -> std::io::Result<bool> {
         && &buf[..VMDK_DESCRIPTOR_MAGIC.len()] == VMDK_DESCRIPTOR_MAGIC)
 }
 
+/// Peek at `path` and return true if it is a qcow2 v3 image
+/// (magic = "QFI\xfb", version = 3). Used host-side to decide
+/// whether `measure -O qcow2` should emit the `bitmaps` field —
+/// qemu-img only emits it for qcow2 v3 sources because persistent
+/// bitmaps are a v3 feature. Returns false on short files, files
+/// we can't open, non-qcow2 files, or qcow2 v2 files.
+pub fn peek_is_qcow2_v3(path: &str) -> bool {
+    use std::io::Read;
+
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    // Header layout: magic[4] | version[4] (big-endian u32).
+    let mut buf = [0u8; 8];
+    if file.read(&mut buf).unwrap_or(0) < 8 {
+        return false;
+    }
+    // QCOW2 magic: "QFI\xfb" = 0x51_46_49_FB.
+    if buf[..4] != [0x51, 0x46, 0x49, 0xfb] {
+        return false;
+    }
+    let version = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    version == 3
+}
+
 /// Check chain depth and return error if exceeded.
 pub fn check_chain_depth(
     current_depth: usize,
