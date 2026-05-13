@@ -5991,9 +5991,9 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                                 // is qcow2 v3 (persistent bitmaps are a v3
                                 // feature; qcow2 v2 sources do not emit the
                                 // field even though they share the magic).
-                                let target_qcow2_with_qcow2v3_source =
-                                    args.target_format == "qcow2"
-                                        && args.input.as_deref().is_some_and(peek_is_qcow2_v3);
+                                let target_qcow2_with_qcow2v3_source = args.target_format
+                                    == "qcow2"
+                                    && args.input.as_deref().is_some_and(peek_is_qcow2_v3);
                                 print_measure_result(
                                     &msg,
                                     &args.output,

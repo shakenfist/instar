@@ -684,3 +684,192 @@ for _img in _safe_tier_images():
                 _name,
                 _make_source_test(_img, _target, _ot)
             )
+
+
+class TestMeasureRoundTrip(TestMeasureSmoke):
+    """Round-trip size-bound checks for vmdk / vpc / vhdx target formats.
+
+    qemu-img cannot measure these formats, so instead we verify that
+    `instar convert` output file size lies within instar's own predicted
+    [required, fully_allocated] range. Two test flavours:
+
+    - --size mode: create an empty raw tmpfile, measure -O <fmt>, convert to
+      <fmt>, assert actual size is within bounds.
+    - source-image mode: use an existing safe-tier qcow2 image as source,
+      measure + convert, same bound assertion.
+
+    Cushion: one output sector (65536 bytes) to absorb writer-side alignment
+    artefacts (e.g. VHD's leading-footer sector-alignment gap from phase 1e).
+    For vhdx the cushion is widened to 1 MiB (vhdx::MB_ALIGN) because the
+    VHDX writer aligns metadata to 1 MiB boundaries.
+    """
+
+    # Map from target format name to output file extension.
+    _EXT = {'vmdk': 'vmdk', 'vpc': 'vhd', 'vhdx': 'vhdx'}
+
+    # Alignment cushion per target: absorbs writer-side padding that measure
+    # doesn't account for.
+    # - vmdk/vpc: one output sector = 65536 bytes.
+    # - vhdx: 1 MiB (vhdx::MB_ALIGN), the metadata-alignment boundary.
+    _CUSHION = {'vmdk': 65536, 'vpc': 65536, 'vhdx': 1024 * 1024}
+
+    def _size_round_trip(self, target, size_str, size_bytes):
+        """Create an empty raw tmpfile, measure -O target, convert to target,
+        assert convert output size is in [required, fully_allocated] (with a
+        per-format cushion to absorb writer-side alignment artefacts).
+        """
+        import os
+        import tempfile
+
+        cushion = self._CUSHION[target]
+        ext = self._EXT[target]
+
+        with tempfile.NamedTemporaryFile(suffix='.raw', delete=False) as src_f:
+            src_path = src_f.name
+
+        # Register cleanup before anything that might raise.
+        self.addCleanup(lambda p=src_path: os.unlink(p) if os.path.exists(p) else None)
+
+        # Create an empty raw file of the given size.
+        subprocess.run(
+            ['qemu-img', 'create', '-f', 'raw', src_path, size_str],
+            check=True, capture_output=True
+        )
+
+        # 1. instar measure --size SIZE -O target --output=json
+        stdout, _, rc = self.run_instar_measure(
+            '--size', size_str, '-O', target, '--output', 'json'
+        )
+        self.assertEqual(rc, 0, f'measure failed: rc={rc}')
+        m = json.loads(stdout)
+        required = m['required']
+        fully_allocated = m['fully-allocated']
+
+        # 2. instar convert <empty raw> -O target out.<ext>
+        with tempfile.NamedTemporaryFile(suffix=f'.{ext}', delete=False) as out_f:
+            out_path = out_f.name
+        self.addCleanup(lambda p=out_path: os.unlink(p) if os.path.exists(p) else None)
+
+        _, conv_stderr, conv_rc = self.run_instar_convert(
+            Path(src_path), Path(out_path), output_format=target
+        )
+        self.assertEqual(
+            conv_rc, 0, f'convert failed: stderr={conv_stderr}'
+        )
+
+        # 3. Compare actual size to predicted bounds.
+        actual = os.path.getsize(out_path)
+        self.assertGreaterEqual(
+            actual, required - cushion,
+            f'{target} convert output ({actual}) below predicted '
+            f'required ({required}) for size {size_str}'
+        )
+        self.assertLessEqual(
+            actual, fully_allocated + cushion,
+            f'{target} convert output ({actual}) above predicted '
+            f'fully_allocated ({fully_allocated}) for size {size_str}'
+        )
+
+    def _source_round_trip(self, target, image_id):
+        """Run instar measure + instar convert on an existing source image,
+        assert convert output size is in [required, fully_allocated] (with a
+        per-format cushion).
+        """
+        import os
+        import tempfile
+
+        cushion = self._CUSHION[target]
+        ext = self._EXT[target]
+
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(f'image not found: {image.path}')
+
+        # 1. instar measure <image> -O target --output=json
+        stdout, _, rc = self.run_instar_measure(
+            str(image.path), '-O', target, '--output', 'json'
+        )
+        self.assertEqual(rc, 0, f'measure failed for {image_id}')
+        m = json.loads(stdout)
+        required = m['required']
+        fully_allocated = m['fully-allocated']
+
+        # 2. instar convert <image> -O target out.<ext>
+        with tempfile.NamedTemporaryFile(suffix=f'.{ext}', delete=False) as out_f:
+            out_path = out_f.name
+        self.addCleanup(lambda p=out_path: os.unlink(p) if os.path.exists(p) else None)
+
+        _, conv_stderr, conv_rc = self.run_instar_convert(
+            image.path, Path(out_path), output_format=target
+        )
+        self.assertEqual(
+            conv_rc, 0, f'convert failed for {image_id}->{target}: {conv_stderr}'
+        )
+
+        # 3. Compare actual size to bounds.
+        actual = os.path.getsize(out_path)
+        self.assertGreaterEqual(
+            actual, required - cushion,
+            f'{target} convert from {image_id} ({actual}) below predicted '
+            f'required ({required})'
+        )
+        self.assertLessEqual(
+            actual, fully_allocated + cushion,
+            f'{target} convert from {image_id} ({actual}) above predicted '
+            f'fully_allocated ({fully_allocated})'
+        )
+
+    # --- --size mode round-trip tests ---
+
+    def test_size_round_trip_vmdk_1m(self):
+        """Empty raw 1 MiB -> vmdk: convert output in measure's predicted range."""
+        self._size_round_trip('vmdk', '1M', 1024 * 1024)
+
+    def test_size_round_trip_vmdk_16m(self):
+        """Empty raw 16 MiB -> vmdk: convert output in measure's predicted range."""
+        self._size_round_trip('vmdk', '16M', 16 * 1024 * 1024)
+
+    def test_size_round_trip_vmdk_64m(self):
+        """Empty raw 64 MiB -> vmdk: convert output in measure's predicted range."""
+        self._size_round_trip('vmdk', '64M', 64 * 1024 * 1024)
+
+    def test_size_round_trip_vpc_1m(self):
+        """Empty raw 1 MiB -> vpc (vhd): convert output in measure's predicted range."""
+        self._size_round_trip('vpc', '1M', 1024 * 1024)
+
+    def test_size_round_trip_vpc_16m(self):
+        """Empty raw 16 MiB -> vpc (vhd): convert output in measure's predicted range."""
+        self._size_round_trip('vpc', '16M', 16 * 1024 * 1024)
+
+    def test_size_round_trip_vpc_64m(self):
+        """Empty raw 64 MiB -> vpc (vhd): convert output in measure's predicted range."""
+        self._size_round_trip('vpc', '64M', 64 * 1024 * 1024)
+
+    # vhdx default block_size is 32 MiB, so the smallest meaningful sizes are
+    # multiples of 32 MiB. Use 64 MiB (1 block), 128 MiB (2 blocks), 256 MiB
+    # (4 blocks) to avoid triggering block-size-alignment edge cases.
+    def test_size_round_trip_vhdx_64m(self):
+        """Empty raw 64 MiB -> vhdx: convert output in measure's predicted range."""
+        self._size_round_trip('vhdx', '64M', 64 * 1024 * 1024)
+
+    def test_size_round_trip_vhdx_128m(self):
+        """Empty raw 128 MiB -> vhdx: convert output in measure's predicted range."""
+        self._size_round_trip('vhdx', '128M', 128 * 1024 * 1024)
+
+    def test_size_round_trip_vhdx_256m(self):
+        """Empty raw 256 MiB -> vhdx: convert output in measure's predicted range."""
+        self._size_round_trip('vhdx', '256M', 256 * 1024 * 1024)
+
+    # --- source-image mode round-trip tests ---
+
+    def test_source_round_trip_vmdk_cirros(self):
+        """cirros-qcow2 -> vmdk: convert output in measure's predicted range."""
+        self._source_round_trip('vmdk', 'cirros-qcow2')
+
+    def test_source_round_trip_vpc_cirros(self):
+        """cirros-qcow2 -> vpc (vhd): convert output in measure's predicted range."""
+        self._source_round_trip('vpc', 'cirros-qcow2')
+
+    def test_source_round_trip_vhdx_cirros(self):
+        """cirros-qcow2 -> vhdx: convert output in measure's predicted range."""
+        self._source_round_trip('vhdx', 'cirros-qcow2')
