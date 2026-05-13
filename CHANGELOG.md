@@ -50,6 +50,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   crossed with raw, qcow2 default, and qcow2 option sweeps) plus
   every safe-tier image × both raw and qcow2 targets. Consumed by
   phase 7's integration tests. (PLAN-measure-phase-06-baselines.md)
+- Comprehensive integration tests for `instar measure`: cross-version
+  baseline comparison for raw and qcow2 targets across every safe-tier
+  test image, plus round-trip size-bound checks for vmdk / vpc / vhdx
+  targets where qemu-img cannot validate. 345-test module covers the
+  CLI surface (smoke), `-o` parsing, `--size`-mode baselines,
+  source-image baselines, and convert-based round-trip. Known scanner
+  divergences (raw SEEK_HOLE detection; qcow2/vhdx/vmdk allocated-byte
+  overcounts on a small set of images; VHD CHS rounding) are skipped
+  with documented reasons pending follow-up.
+  (PLAN-measure-phase-07-integration-tests.md)
+- `parse_memory_size` accepts the T (terabyte) suffix in addition to
+  K/M/G, enabling `--size 1T` for the matching baseline cases.
+- `instar measure --output=json -O qcow2` emits a leading
+  `"bitmaps": 0` field when the source is a qcow2 v3 (compat=1.1)
+  image, matching qemu-img's behaviour. Equivalent `bitmaps size: 0`
+  trailing line in `--output=human` mode.
 
 ### Changed
 

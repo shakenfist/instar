@@ -259,7 +259,16 @@ provides a modular architecture with:
   `-o key=value,...` (qemu-img parity); `-o` values override individual
   flags when both are given.
   Single-source-device only; backing-chain composition and VMDK
-  monolithicFlat sources are deferred.
+  monolithicFlat sources are deferred. Integration tests in
+  `tests/test_measure.py` cross-validate `instar measure` against
+  the `qemu-img measure` baselines in
+  `instar-testdata/expected-outputs/measure-*` for every safe-tier
+  image and every curated `--size` case, plus round-trip the
+  vmdk / vpc / vhdx outputs through `instar convert` to verify the
+  predicted size bounds. Known scanner-divergence cases (raw
+  SEEK_HOLE detection, qcow2/vhdx/vmdk overcounts on some real-world
+  images, VHD CHS rounding) are skipped with documented reasons
+  pending follow-up work.
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation,
