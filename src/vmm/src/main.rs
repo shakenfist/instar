@@ -3947,9 +3947,19 @@ fn print_check_result_json(
     println!("}}");
 }
 
-#[allow(dead_code)] // Wired in step 4c
 /// Print measure result in human-readable or JSON format.
-fn print_measure_result(msg: &guest_::GuestMessage, output_format: &str) {
+///
+/// `target_qcow2_with_source` is true when the target format is qcow2
+/// AND there is a real source image (not `--size` mode). qemu-img emits
+/// a `bitmaps` field in that case to report the count of persistent
+/// QCOW2 bitmaps that the conversion would carry across; for our
+/// purposes the value is always 0 because instar's source-scanning
+/// path does not load bitmap metadata.
+fn print_measure_result(
+    msg: &guest_::GuestMessage,
+    output_format: &str,
+    target_qcow2_with_source: bool,
+) {
     if let Some(guest_::GuestMessage_::Payload::MeasureResult(result)) = &msg.payload {
         // Error path: emit a clear stderr message; print nothing on stdout.
         if result.error != MEASURE_RESULT_ERROR_OK {
@@ -3964,7 +3974,7 @@ fn print_measure_result(msg: &guest_::GuestMessage, output_format: &str) {
         }
 
         if output_format == "json" {
-            print_measure_result_json(result);
+            print_measure_result_json(result, target_qcow2_with_source);
         } else {
             // Human format must match qemu-img byte-for-byte:
             //   required size: <N>\n
@@ -3975,12 +3985,19 @@ fn print_measure_result(msg: &guest_::GuestMessage, output_format: &str) {
     }
 }
 
-#[allow(dead_code)] // Wired in step 4c
 /// Print measure result in JSON format matching qemu-img byte-for-byte.
 ///
-/// 4-space indent, hyphenated `fully-allocated` key.
-fn print_measure_result_json(result: &guest_::MeasureResultMessage) {
+/// 4-space indent, hyphenated `fully-allocated` key. When
+/// `target_qcow2_with_source` is true, a leading `"bitmaps": 0,` field
+/// is emitted to match `qemu-img measure -O qcow2 <source>`.
+fn print_measure_result_json(
+    result: &guest_::MeasureResultMessage,
+    target_qcow2_with_source: bool,
+) {
     println!("{{");
+    if target_qcow2_with_source {
+        println!("    \"bitmaps\": 0,");
+    }
     println!("    \"required\": {},", result.required);
     println!("    \"fully-allocated\": {}", result.fully_allocated);
     println!("}}");
@@ -5966,7 +5983,13 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                                     measure_error = m.error;
                                     measure_result_seen = true;
                                 }
-                                print_measure_result(&msg, &args.output);
+                                let target_qcow2_with_source =
+                                    args.target_format == "qcow2" && args.input.is_some();
+                                print_measure_result(
+                                    &msg,
+                                    &args.output,
+                                    target_qcow2_with_source,
+                                );
                             } else if verbose {
                                 debug!("{}", format_message(&msg));
                             }
