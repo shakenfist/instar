@@ -71,6 +71,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   points (`fuzz_measure_scan`). Registered alongside the existing
   13 targets in the nightly coverage-fuzz workflow; total now 15.
   (PLAN-measure-phase-08-fuzz-coverage.md)
+- Differential fuzzer (`scripts/differential-fuzz.py`) now
+  exercises `instar measure` as one of its random operations:
+  numeric comparison against `qemu-img measure` for raw and qcow2
+  targets (required, fully-allocated, bitmaps), self-consistency
+  upper-bound check against `instar convert` output size for vmdk
+  / vpc / vhdx targets (cushion scales as max(1 MiB,
+  fully_allocated / 16) to absorb convert's per-block sector
+  alignment slack). Picked up automatically by the existing
+  differential-fuzz workflow.
+  (PLAN-measure-phase-09-fuzz-differential.md)
 
 ### Changed
 

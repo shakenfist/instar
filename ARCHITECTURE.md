@@ -502,10 +502,21 @@ For each iteration it:
    cluster size, compression, and data patterns).
 2. Creates separate copies for instar and qemu-img.
 3. Runs a random chain of 2-4 operations (info, check, convert, compressed
-   convert) against both tools.
+   convert, measure) against both tools.
 4. Compares outputs: exit codes, JSON info output (after normalisation to
    remove known-divergent fields like disk size), and converted file content
    (via SHA-256 of raw-flattened output).
+
+The `measure` operation uses two oracles depending on target. For
+`raw` and `qcow2` targets, the fuzzer parses both `instar measure
+--output=json` and `qemu-img measure --output=json` outputs and
+compares the numeric `required`, `fully-allocated`, and `bitmaps`
+fields. For `vmdk`, `vpc`, and `vhdx` targets (which qemu-img
+measure does not support), it asserts a self-consistency bound:
+`instar convert -O <target>` output file size must lie at or below
+`fully_allocated + cushion`, with the cushion scaled to absorb
+the convert writer's per-block sector alignment slack
+(`max(1 MiB, fully_allocated / 16)`).
 
 Known quirks (see `docs/quirks.md`) are excluded from comparison: non-QCOW2
 formats for `check` (qemu-img only checks QCOW2), disk size fields, and
