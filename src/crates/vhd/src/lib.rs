@@ -647,6 +647,17 @@ impl VhdState {
     ///
     /// `call_table` must be valid. `bat_cache_buf` must still be valid
     /// and point to at least `MAX_SECTOR_SIZE` writable bytes.
+    // NOTE: The sector-walking loop below (buf_start / buf_end /
+    // meaningful_len / per-sector read) is duplicated near-verbatim in
+    // `vhdx::VhdxState::scan_allocation`. The two formats walk single
+    // contiguous BAT tables; the only differences are the entry
+    // decoder (`count_allocated_in_bat` vs the vhdx chunk_ratio-aware
+    // variant) and one cache-invalidation line. Extracting a shared
+    // `walk_table_sectors(call_table, byte_offset, byte_len, ...,
+    // FnMut(&[u8]))` helper into `shared` is captured as future work
+    // in PLAN-measure.md; deferred because the FnMut + &mut self
+    // borrow interaction adds non-trivial complexity for marginal
+    // line-count reduction.
     pub unsafe fn scan_allocation(
         &mut self,
         call_table: &CallTable,

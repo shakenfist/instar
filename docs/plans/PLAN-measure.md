@@ -738,6 +738,24 @@ The plan is complete when:
 
 ### Future work
 
+* **Extract a shared sector-walking helper for the parser
+  `scan_allocation` methods.** The pre-push wave-2a code-quality
+  review flagged near-verbatim duplication of the buf_start /
+  buf_end / meaningful_len / per-sector-read loop between
+  `vhd::VhdState::scan_allocation` and
+  `vhdx::VhdxState::scan_allocation`. Both walk a contiguous BAT
+  table; only the entry decoder and one cache-invalidation line
+  differ. A shared `walk_table_sectors(call_table, byte_offset,
+  byte_len, ..., FnMut(&[u8]))` helper in `shared` would
+  eliminate ~80 LoC. Deferred because the `FnMut` closure + `&mut
+  self` borrow interaction on `bat_cached_sector` adds
+  non-trivial complexity for the marginal line-count win, and
+  the existing direct loops are already test-covered and
+  fuzz-exercised. The vmdk and qcow2 scanners have a two-level
+  walk (GD→GT, L1→L2) that doesn't fit the same shape and would
+  remain unrefactored. NOTE comments inline at both
+  `scan_allocation` sites cross-reference each other.
+
 * **Raw-source `SEEK_HOLE`/`SEEK_DATA` detection.** instar's
   no_std raw scanner returns `allocated_bytes = virtual_size`
   unconditionally. qemu-img scans the file's on-disk extents

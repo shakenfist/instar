@@ -978,6 +978,12 @@ impl VhdxState {
     ///
     /// `call_table` must be valid. `bat_cache_buf` must still be valid
     /// and point to at least `MAX_SECTOR_SIZE` writable bytes.
+    // NOTE: Single-table sector-walking loop below is duplicated
+    // near-verbatim in `vhd::VhdState::scan_allocation`. See the
+    // matching NOTE there for the rationale on deferring the
+    // shared helper extraction. The qcow2 and vmdk scanners have
+    // a two-level walk structure (L1→L2, GD→GT) that doesn't fit
+    // the same shape.
     pub unsafe fn scan_allocation(
         &mut self,
         call_table: &CallTable,
