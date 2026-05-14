@@ -160,11 +160,11 @@ provides a modular architecture with:
   1/2/4/8/16/32/64-bit), compressed L2 entry parsing, backing file
   extraction, header extension parsing, incompatible feature bit
   validation. Supports cluster sizes from 512B to 2MB (cluster_bits
-  9-21). Used by info, check, compare, and convert operations. Also
-  exposes `Qcow2State::scan_allocation` plus the pure helpers
-  `count_allocated_in_l2_standard` / `count_allocated_in_l2_extended`
-  to produce a `shared::AllocationSummary` for use by the upcoming
-  `measure` subcommand.
+  9-21). Used by info, check, compare, convert, and measure
+  operations. Also exposes `Qcow2State::scan_allocation` plus the
+  pure helpers `count_allocated_in_l2_standard` /
+  `count_allocated_in_l2_extended` to produce a
+  `shared::AllocationSummary` consumed by the `measure` subcommand.
 - **crates/raw/** - Shared RAW format crate: MBR/GPT partition table
   detection. Used by info operation. Also exposes a trivial
   `scan_allocation` (allocated_bytes == virtual_size) for the measure
@@ -210,9 +210,9 @@ provides a modular architecture with:
   sized once for the fully-allocated cluster count and reused for the
   sparse case). `AllocationSummary` has been moved to `crates/shared` so
   format crates can produce it without depending on `measure`; a
-  back-compat re-export remains in this crate. Intended to be reused by
-  the upcoming `measure` operation (phase 3+ of `PLAN-measure.md`) and
-  by `create` / `resize`.
+  back-compat re-export remains in this crate. Consumed by the
+  `measure` operation in `src/operations/measure/`; intended for
+  later reuse by `create` / `resize` once those subcommands ship.
 - **operations/info/** - Format detection operation
 - **operations/copy/** - File copy operation
 - **operations/check/** - Image integrity validation operation (with
@@ -275,11 +275,10 @@ provides a modular architecture with:
   centralized byte-order helpers: `be_u16/32/64`, `le_u16/32/64`,
   `write_be_u16/32/64`, `write_le_u16/32/64`). Also defines
   `AllocationSummary`, the common result type produced by each format
-  crate's `scan_allocation` function and consumed by the upcoming
-  `measure` subcommand. MeasureConfig and MeasureResult structs were
-  added in phase 3 of PLAN-measure.md to carry options and results
-  across OPERATION_CONFIG_ADDR and the new send_measure_result CallTable
-  callback (CallTable VERSION bumped 13 → 14).
+  crate's `scan_allocation` function and consumed by the `measure`
+  subcommand. `MeasureConfig` and `MeasureResult` structs carry
+  options and results across OPERATION_CONFIG_ADDR and the
+  `send_measure_result` CallTable callback (CallTable VERSION 14).
 
 **Chain validation in check (`--chain`):**
 The check operation supports an optional `--chain` flag that uses the host-side
