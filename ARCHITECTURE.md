@@ -328,6 +328,10 @@ structure layout and VMM-to-guest data flow.
 
 ## Format Support
 
+**Measurable target formats**: raw, qcow2 (qemu-img-parity),
+vmdk, vpc (VHD), vhdx (instar-only — qemu-img does not
+implement `measure` for these targets).
+
 ### qcow2
 
 QEMU Copy-On-Write version 2/3. Supported features:
