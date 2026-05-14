@@ -2806,6 +2806,70 @@ mod tests {
     }
 
     // ====================================================================
+    // Overflow boundaries
+    // ====================================================================
+    //
+    // Deterministic overflow tests for the three non-raw non-qcow2
+    // formats. (qcow2 has its own qcow2_overflow_* tests above; raw
+    // simply returns Ok(virtual_size, virtual_size) for any u64 so
+    // there's no overflow path.)
+    //
+    // The fuzz harness in src/fuzz/fuzz_targets/fuzz_measure_calc.rs
+    // also exercises these paths randomly; the explicit tests below
+    // are the deterministic regression net.
+
+    #[test]
+    fn vmdk_overflow_at_u64_max_virtual_size() {
+        // virtual_size = u64::MAX with the default 64 KiB grain produces
+        // an unbounded grain count whose product with grain_size overflows.
+        // The calculator must report Overflow rather than wrap or panic.
+        let s = AllocationSummary {
+            virtual_size: u64::MAX,
+            allocated_bytes: 0,
+        };
+        let opts = VmdkOpts::default();
+        assert_eq!(measure_vmdk(&s, &opts), Err(MeasureError::Overflow));
+    }
+
+    #[test]
+    fn vhd_dynamic_overflow_at_u64_max_virtual_size() {
+        let s = AllocationSummary {
+            virtual_size: u64::MAX,
+            allocated_bytes: 0,
+        };
+        let opts = VhdOpts {
+            subformat: VhdSubformat::Dynamic,
+            block_size: 512 * 1024, // smallest valid block_size maximises bat_entries
+        };
+        assert_eq!(measure_vhd(&s, &opts), Err(MeasureError::Overflow));
+    }
+
+    #[test]
+    fn vhd_fixed_overflow_at_u64_max_virtual_size() {
+        // Fixed VHD adds a 512-byte footer to virtual_size; u64::MAX as
+        // virtual_size triggers a checked_add overflow.
+        let s = AllocationSummary {
+            virtual_size: u64::MAX,
+            allocated_bytes: u64::MAX,
+        };
+        let opts = VhdOpts {
+            subformat: VhdSubformat::Fixed,
+            block_size: 0,
+        };
+        assert_eq!(measure_vhd(&s, &opts), Err(MeasureError::Overflow));
+    }
+
+    #[test]
+    fn vhdx_overflow_at_u64_max_virtual_size() {
+        let s = AllocationSummary {
+            virtual_size: u64::MAX,
+            allocated_bytes: 0,
+        };
+        let opts = VhdxOpts::default();
+        assert_eq!(measure_vhdx(&s, &opts), Err(MeasureError::Overflow));
+    }
+
+    // ====================================================================
     // Format-wide invariants
     // ====================================================================
     //
