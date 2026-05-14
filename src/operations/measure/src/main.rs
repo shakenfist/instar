@@ -63,6 +63,19 @@ fn panic(_info: &PanicInfo) -> ! {
 
 /// Entry point. Returns the number of bytes read from the source
 /// device, matching the convention of the other operation binaries.
+///
+/// # Safety
+///
+/// Called by `core.bin` after the VMM has:
+/// - Written a populated [`CallTable`] at [`CALL_TABLE_ADDR`].
+/// - Written a populated [`MeasureConfig`] at
+///   [`OPERATION_CONFIG_ADDR`].
+/// - Initialised at least input device 0 (or a stub for `--size`
+///   mode) and routed virtio-block I/O through the call table.
+///
+/// These invariants hold by construction of the host-side VMM
+/// (`src/vmm/src/main.rs::run_measure`); no other caller is
+/// architecturally possible.
 #[no_mangle]
 pub unsafe extern "C" fn _start() -> u64 {
     let call_table = get_call_table();
@@ -151,6 +164,13 @@ fn map_error(e: MeasureError) -> u32 {
     }
 }
 
+/// Build a [`MeasureResult`] and emit it through the call table.
+///
+/// # Safety
+///
+/// `call_table` must be a valid initialised [`CallTable`] — the
+/// architectural invariant established by `_start` (see its
+/// `Safety` doc).
 unsafe fn send_result(
     call_table: &CallTable,
     target: u32,
@@ -250,6 +270,17 @@ fn vhdx_opts_from(c: &MeasureConfig) -> VhdxOpts {
 /// Detect the source format from the first sector and dispatch to
 /// the matching parser's `scan_allocation`. Returns `None` if the
 /// format is unrecognised or the parser rejects the image.
+/// Detect the source format on device 0 and run the matching
+/// parser's `scan_allocation` to produce an [`AllocationSummary`].
+///
+/// # Safety
+///
+/// `call_table` must be a valid initialised [`CallTable`] — the
+/// architectural invariant established by `_start` (see its
+/// `Safety` doc). Input device 0 must be attached and have a
+/// non-zero capacity; the function delegates to each parser
+/// crate's `*State::init` + `scan_allocation` which carry their
+/// own safety preconditions on the cache buffers passed in.
 unsafe fn detect_and_scan(
     call_table: &CallTable,
     config: &MeasureConfig,
