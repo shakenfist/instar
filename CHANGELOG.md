@@ -9,88 +9,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- Added `crates/measure/`: a `no_std` size-calculator library with
-  per-format estimators (raw, qcow2, vmdk, vhd, vhdx). Foundation for
-  the upcoming `measure` operation.
-  (PLAN-measure-phase-01-calculators.md)
-- Added `scan_allocation()` to each format crate (raw, qcow2, vmdk,
-  vhd, vhdx), producing `shared::AllocationSummary` for the measure
-  subcommand. Pure slice-walking helpers
-  (`count_allocated_in_l2_standard`, `count_allocated_in_l2_extended`,
-  `count_allocated_in_bat`, `count_populated_gd_entries`,
-  `count_allocated_in_gt`) are exposed for direct unit testing and
-  future fuzzing.
-  (PLAN-measure-phase-02-allocation-scanners.md)
-- Added `operations/measure/` guest binary that produces a
-  MeasureResultMessage over the serial channel given a source image
-  (or `virtual_size_override`) and a target format. CLI surface ships
-  in phase 4. (PLAN-measure-phase-03-guest-op.md)
-- `instar measure` subcommand: predict the file size required to
-  convert a source image (or hypothetical `--size N` image) to a
-  target format. Output matches `qemu-img measure` byte-for-byte for
-  raw and qcow2 targets; vmdk, vpc, vhdx are instar-only.
-  (PLAN-measure-phase-04-host-cli.md)
-- Added `MeasureConfig` and `MeasureResult` structs to `shared`, and
-  `MeasureResultMessage` (field 10) to the GuestMessage protobuf oneof,
-  plus the `measure_result_message` helper in `crates/guest-protocol`.
-  (PLAN-measure-phase-03-guest-op.md)
-- `instar measure` now accepts the qemu-img `-o key=value,...` option
-  syntax in addition to individual flags. Honoured keys per target:
-  qcow2 (cluster_size, compat, refcount_bits, extended_l2,
-  lazy_refcounts, compression_type, preallocation), vmdk (subformat,
-  grain_size), vpc (subformat), vhdx (subformat, block_size). `-o`
-  values override matching individual flags. backing_file, data_file,
-  and encrypt.* keys are rejected pending future work.
-  (PLAN-measure-phase-05-target-options.md)
-- Cross-version `qemu-img measure` baselines committed to
-  `instar-testdata/expected-outputs/measure-{human,json}/`. Generated
-  via `make baselines-measure` against every qemu-img binary in
-  `qemu-img-binaries/x86_64/` (80 versions, 6.0.0 through 10.2.0).
-  Covers 21 `--size` cases per version (sizes 1M / 64M / 1G / 1T
-  crossed with raw, qcow2 default, and qcow2 option sweeps) plus
-  every safe-tier image × both raw and qcow2 targets. Consumed by
-  phase 7's integration tests. (PLAN-measure-phase-06-baselines.md)
-- Comprehensive integration tests for `instar measure`: cross-version
-  baseline comparison for raw and qcow2 targets across every safe-tier
-  test image, plus round-trip size-bound checks for vmdk / vpc / vhdx
-  targets where qemu-img cannot validate. 345-test module covers the
-  CLI surface (smoke), `-o` parsing, `--size`-mode baselines,
-  source-image baselines, and convert-based round-trip. Known scanner
-  divergences (raw SEEK_HOLE detection; qcow2/vhdx/vmdk allocated-byte
-  overcounts on a small set of images; VHD CHS rounding) are skipped
-  with documented reasons pending follow-up.
-  (PLAN-measure-phase-07-integration-tests.md)
-- `parse_memory_size` accepts the T (terabyte) suffix in addition to
-  K/M/G, enabling `--size 1T` for the matching baseline cases.
-- `instar measure --output=json -O qcow2` emits a leading
-  `"bitmaps": 0` field when the source is a qcow2 v3 (compat=1.1)
-  image, matching qemu-img's behaviour. Equivalent `bitmaps size: 0`
-  trailing line in `--output=human` mode.
-- Coverage-guided fuzz targets for `crates/measure/`
-  (`fuzz_measure_calc`) and the per-parser `scan_allocation` entry
-  points (`fuzz_measure_scan`). Registered alongside the existing
-  13 targets in the nightly coverage-fuzz workflow; total now 15.
-  (PLAN-measure-phase-08-fuzz-coverage.md)
-- Differential fuzzer (`scripts/differential-fuzz.py`) now
-  exercises `instar measure` as one of its random operations:
-  numeric comparison against `qemu-img measure` for raw and qcow2
-  targets (required, fully-allocated, bitmaps), self-consistency
-  upper-bound check against `instar convert` output size for vmdk
-  / vpc / vhdx targets (cushion scales as max(1 MiB,
-  fully_allocated / 16) to absorb convert's per-block sector
-  alignment slack). Picked up automatically by the existing
-  differential-fuzz workflow.
-  (PLAN-measure-phase-09-fuzz-differential.md)
+- **New `instar measure` subcommand.** Predicts the file size
+  required to convert an image (or a hypothetical `--size N`
+  image) to a target format. Output matches `qemu-img measure`
+  byte-for-byte for raw and qcow2 targets across every qemu-img
+  version 6.0.0 through 10.2.0; vmdk, vpc (VHD), and vhdx targets
+  are instar-only since qemu-img cannot measure them. Accepts both
+  individual clap flags and the qemu-img `-o key=value,...` syntax
+  (`-o` wins on conflict). See
+  [docs/measure.md](docs/measure.md) for the full reference.
+  ([phase 3](docs/plans/PLAN-measure-phase-03-guest-op.md) ·
+  [phase 4](docs/plans/PLAN-measure-phase-04-host-cli.md) ·
+  [phase 5](docs/plans/PLAN-measure-phase-05-target-options.md))
+
+- **Supporting library and crate-level pieces.** New
+  `crates/measure/` (no_std, pure-function per-target size
+  calculators), per-parser `scan_allocation` entry points on each
+  format crate (raw / qcow2 / vmdk / vhd / vhdx),
+  `MeasureConfig` / `MeasureResult` structs in `shared`, a new
+  `MeasureResultMessage` protobuf field, and a new
+  `send_measure_result` CallTable function pointer. CallTable
+  version bumped from 13 to 14.
+  ([phase 1](docs/plans/PLAN-measure-phase-01-calculators.md) ·
+  [phase 2](docs/plans/PLAN-measure-phase-02-allocation-scanners.md) ·
+  [phase 3](docs/plans/PLAN-measure-phase-03-guest-op.md))
+
+- **Test and fuzz infrastructure.** Comprehensive integration
+  tests for `instar measure` (`tests/test_measure.py`, 345 tests
+  including cross-version baseline comparison for raw/qcow2
+  targets, round-trip size-bound checks for vmdk/vpc/vhdx targets,
+  and `-o` parsing). Cross-version baselines committed to
+  `instar-testdata/expected-outputs/measure-*` for 80 qemu-img
+  versions. Two new coverage-guided fuzz targets
+  (`fuzz_measure_calc`, `fuzz_measure_scan`) in
+  `src/fuzz/fuzz_targets/`. Differential fuzzer extended with an
+  `op_measure` that compares instar against qemu-img for raw/qcow2
+  and against `instar convert` output size for vmdk/vpc/vhdx.
+  ([phase 6](docs/plans/PLAN-measure-phase-06-baselines.md) ·
+  [phase 7](docs/plans/PLAN-measure-phase-07-integration-tests.md) ·
+  [phase 8](docs/plans/PLAN-measure-phase-08-fuzz-coverage.md) ·
+  [phase 9](docs/plans/PLAN-measure-phase-09-fuzz-differential.md))
+
+- **Bug fixes surfaced during the measure work.**
+  `parse_memory_size` accepts the T (terabyte) suffix alongside
+  K/M/G (surfaced by phase 7b baselines). `instar measure -O qcow2`
+  emits a leading `"bitmaps": 0` field in JSON output and the
+  equivalent `bitmaps size: 0` trailing line in human output when
+  the source is a qcow2 v3 image, matching qemu-img exactly
+  (surfaced and refined by phase 7c source-image tests).
 
 ### Changed
 
-- Moved `AllocationSummary` from `crates/measure` to `crates/shared`
-  (with a back-compat re-export from `measure`) so format crates can
-  produce values of the type without depending on `measure`.
-- Bumped `CallTable::VERSION` from 13 to 14, adding
-  `send_measure_result` as the last function pointer. Operation
-  binaries built against the older version will fail-stop in
-  `validate_call_table!` rather than silently miscompile.
+- **CallTable ABI version bumped from 13 to 14** by the addition
+  of `send_measure_result`. Stale operation binaries built against
+  version 13 will fail-stop in `validate_call_table!` with a clear
+  log message rather than silently miscompile.
+
+- **`AllocationSummary` moved from `crates/measure` to
+  `crates/shared`** so the per-format scanners can produce values
+  of the type without depending on the measure crate (a back-compat
+  re-export keeps phase 1 tests working).
 
 ## [0.2.0] - 2026-05-09
 

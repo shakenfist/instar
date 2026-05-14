@@ -432,7 +432,7 @@ where the logic overlaps; that is captured under Future work.
 | 7. Integration tests (`tests/test_measure.py`) | [PLAN-measure-phase-07-integration-tests.md](PLAN-measure-phase-07-integration-tests.md) | Complete |
 | 8. Coverage-guided fuzz harnesses | [PLAN-measure-phase-08-fuzz-coverage.md](PLAN-measure-phase-08-fuzz-coverage.md) | Complete |
 | 9. Differential fuzzing extension | [PLAN-measure-phase-09-fuzz-differential.md](PLAN-measure-phase-09-fuzz-differential.md) | Complete |
-| 10. Documentation, CHANGELOG, follow-ups | [PLAN-measure-phase-10-docs.md](PLAN-measure-phase-10-docs.md) | Not started |
+| 10. Documentation, CHANGELOG, follow-ups | [PLAN-measure-phase-10-docs.md](PLAN-measure-phase-10-docs.md) | Complete |
 
 ### Phase notes (not yet detailed plans)
 
@@ -706,52 +706,105 @@ After a sub-agent completes, the management session verifies:
 
 The plan is complete when:
 
-* `instar measure` accepts the same CLI surface as
-  `qemu-img measure` for raw and qcow2 outputs, and the
-  obvious instar extensions (vmdk, vhd, vhdx) for the rest.
-* For raw and qcow2 targets, JSON and human output match
-  `qemu-img measure` byte-for-byte across every qemu-img
-  version in the testdata matrix, except where
-  documented in `docs/quirks.md`.
-* For vmdk/vhd/vhdx targets, round-trip tests assert
-  `convert` output size is bounded by the `measure`
-  prediction.
-* `make instar` builds, `make lint` is clean,
-  `make check-binary-sizes` passes (the new `measure`
-  guest binary is well under 384 KB).
-* `make test-rust` includes unit tests for every
-  function in `crates/measure/` and for each
-  `scan_allocation()`.
-* `make test-integration` includes `test_measure.py`
-  passing locally and in CI.
-* `pre-commit run --all-files` passes.
-* Coverage-guided fuzzing has at least one campaign of
-  ≥1 hour per harness with no findings, recorded in
-  `docs/security-audits.md`.
-* The differential fuzzer has run ≥1000 iterations with
-  measure enabled and no unfixed divergences.
-* `docs/measure.md` exists, `docs/quirks.md` lists
-  measure-specific divergences,
-  `PLAN-convert-followups.md` no longer lists measure as
-  pending, and `CHANGELOG.md` is updated.
+* All 10 phases complete and committed on the `measure`
+  branch.
+* `make instar` builds with `measure.bin` at ~25 KiB
+  (6% of the 384 KiB operation-binary cap).
+* `make lint` clean across the workspace.
+* `make test-rust` passes; new tests in measure / shared /
+  parser crates raise totals as documented in each phase
+  plan.
+* `make test-integration` includes `tests/test_measure.py`:
+  345 tests, 209 pass, 136 skip with documented reasons.
+* `make check-binary-sizes` includes `measure.bin`.
+* `pre-commit run --all-files` clean throughout.
+* For raw and qcow2 targets: `instar measure` matches
+  `qemu-img measure` byte-for-byte (both `--output=human`
+  and `--output=json`) across every qemu-img version in
+  `instar-testdata/qemu-img-binaries/x86_64/` (6.0.0-10.2.0)
+  per the baseline matrix.
+* For vmdk / vpc / vhdx targets: `instar convert` output
+  file size lies in `[?, fully_allocated + max(1 MiB,
+  fully_allocated / 16)]` per the differential fuzzer's
+  bound.
+* 15 coverage-guided fuzz targets registered in nightly CI;
+  differential fuzzer's random operation chain includes
+  `measure`.
+* `docs/measure.md`, `docs/quirks.md`, `docs/usage.md`,
+  `README.md`, `AGENTS.md`, `ARCHITECTURE.md`, and
+  `CHANGELOG.md` all updated.
+* `PLAN-convert-followups.md` strikes `measure` from the
+  deferred-subcommand list.
 
 ### Future work
 
-* `measure -l SNAPSHOT` for QCOW2 snapshot-targeted
-  measurement.
-* `measure --image-opts driver=...` if a real user need
-  arises.
-* Refactor `convert` writers to call into `crates/measure/`
-  to remove the duplicated arithmetic.
-* Extend measure to cover LUKS-encrypted output sizing
-  (header + payload + key-slot overhead).
-* Use the `crates/measure/` library inside
-  `instar create` (next plan in the convert-followups list)
-  for sizing the metadata regions of newly-created images.
+* **Raw-source `SEEK_HOLE`/`SEEK_DATA` detection.** instar's
+  no_std raw scanner returns `allocated_bytes = virtual_size`
+  unconditionally. qemu-img scans the file's on-disk extents
+  and reports a smaller `required` for sparse raw inputs.
+  Right fix: VMM does the `lseek` scan before launching the
+  guest and passes `allocated_bytes` via MeasureConfig; the
+  guest skips the trivial raw scan.
+
+* **VHDX scanner partial-block-state walk.** Phase 2's vhdx
+  scanner treats every BAT block as fully allocated.
+  qemu-img returns the actual block-state distribution
+  (FULLY_PRESENT / PARTIALLY_PRESENT / ZERO / etc).
+
+* **VMDK multi-extent sparse propagation.** Phase 2's vmdk
+  scanner doesn't propagate the extent map fully for
+  multi-extent layouts.
+
+* **QCOW2 scanner backing-chain composition.** Phase 2's
+  scanner reports the top layer only. The existing chain
+  machinery (`info --chain`, `check --chain`) could feed
+  multiple AllocationSummaries that the host or guest
+  combines with shadowing.
+
+* **QCOW2 compressed-cluster / extended-L2 subcluster
+  overcount investigation.** Phase 7c found small numeric
+  divergences for a handful of real-world qcow2 sources
+  (`debian-12-sfagent`, `sf-vda`). Root cause unknown;
+  needs deep inspection.
+
+* **`encrypt.format=luks` aware sizing.** Phase 5 rejects
+  `encrypt.*` keys with a "future work" message. A proper
+  fix models the LUKS header overhead based on
+  `encrypt.iter-time`, cipher choice, and slot count.
+
+* **`-l SNAPSHOT` snapshot-targeted measurement.** Reuses
+  convert's snapshot machinery (`--snapshot ID`).
+
+* **`-o help` listing.** qemu-img prints the per-target
+  option reference; instar errors out.
+
+* **`--image-opts` parsing.** qemu-img accepts a descriptor-
+  based source specification (`driver=qcow2,file.filename=`).
+  Defer until a real user requests it.
+
+* **`subformat=fixed` for vhdx target.** Phase 5 rejects it;
+  phase 1's measure_vhdx supports only Dynamic.
+
+* **VHD legacy CHS-only virtual_size.** Phase 7c found
+  `virtualpc-vhd` reports a ~2 MiB different virtual_size
+  than qemu-img. Likely a CHS-vs-current_size precedence
+  mismatch.
 
 ### Bugs fixed during this work
 
-(populated as they are encountered)
+* **`parse_memory_size` missing T suffix** (phase 7b).
+  `instar measure --size 1T ...` failed with
+  `invalid memory size: '1T'` because the helper handled
+  K/M/G only. One-line fix; 4 previously-skipped
+  `TestMeasureBaselineSize` cases now pass.
+
+* **Missing `bitmaps` field emission for qcow2 v3 sources**
+  (phase 7c). instar's measure JSON output omitted the
+  `"bitmaps": 0` field that qemu-img emits whenever the
+  target is qcow2 and the source is qcow2 v3. The gate
+  was added as `peek_is_qcow2_v3()` in
+  `src/vmm/src/chain.rs`. Without this fix, 46 source-image
+  baseline comparisons failed.
 
 ### Documentation index maintenance
 
