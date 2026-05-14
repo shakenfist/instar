@@ -563,10 +563,12 @@ class TestMeasureBaselineSource(TestMeasureSmoke):
 # Future Work section for follow-up.
 KNOWN_SOURCE_SCANNER_DIVERGENCES = {
     # raw scanner does not call SEEK_HOLE/SEEK_DATA on the underlying file,
-    # so genuinely-sparse raw images count every byte as allocated whereas
-    # qemu-img reports the on-disk extent count.
+    # so genuinely-sparse raw images (with on-disk fallocate holes) count
+    # every byte as allocated whereas qemu-img reports the actual extent
+    # count. raw-zeros-1mb is NOT in this list: it's 1 MiB of explicit
+    # zero bytes on disk, not a fallocate sparse file, so instar and
+    # qemu-img both report fully-allocated == virtual_size for it.
     'raw-sparse-empty': ('*', 'instar raw scanner does not detect SEEK_HOLE extents'),
-    'raw-zeros-1mb':    ('*', 'instar raw scanner does not detect SEEK_HOLE extents'),
 
     # qcow2 scanner counts allocated bytes slightly differently than qemu-img
     # for some real-world images — likely a compressed-cluster or
@@ -684,6 +686,121 @@ for _img in _safe_tier_images():
                 _name,
                 _make_source_test(_img, _target, _ot)
             )
+
+
+class TestMeasureDivergenceRegression(TestMeasureSmoke):
+    """Assert each KNOWN_SOURCE_SCANNER_DIVERGENCES entry still diverges.
+
+    If a future change fixes one of the underlying scanner gaps,
+    instar's output will start matching the baseline, the
+    corresponding test below will fail, and the operator will
+    know to remove the entry from KNOWN_SOURCE_SCANNER_DIVERGENCES
+    in TestMeasureBaselineSource so the case is covered again.
+
+    Without this guard the skip-list silently masks bug fixes.
+    """
+
+
+def _make_divergence_regression_test(image_id, target, reason):
+    """Factory: return a test method that asserts instar's measure
+    output for (image_id, target) still differs from the recorded
+    qemu-img baseline.
+
+    Compared via --output=json since that's the format with the
+    least incidental variance (no banker's-rounding human strings).
+    """
+    def test(self):
+        # Resolve the image; skip if missing locally.
+        image_path = self._testdata_root
+        try:
+            for img in self._manifest.get('images', []):
+                if img.get('id') == image_id:
+                    image_path = self._testdata_root / img['path']
+                    break
+            else:
+                self.skipTest(f'image {image_id} not in manifest')
+        except Exception:
+            self.skipTest(f'manifest lookup failed for {image_id}')
+
+        if not image_path.exists():
+            self.skipTest(f'image not present: {image_path}')
+
+        # Load the baseline (single profile bucket post-dedup).
+        profiles = self.get_output_profiles(
+            output_type='json', command='measure'
+        )
+        profile_name = next(iter(profiles['profiles']))
+        composed_id = f'{image_id}__{target}'
+        try:
+            expected = self.get_expected_output(
+                composed_id, profile_name,
+                output_type='json', command='measure'
+            )
+        except FileNotFoundError:
+            self.skipTest(f'no baseline for {composed_id}')
+
+        # Skip if baseline has non-zero exit (matches the
+        # TestMeasureBaselineSource skip rule).
+        any_version = next(iter(profiles['version_to_profile']))
+        for img in self._manifest.get('images', []):
+            if img.get('id') == image_id:
+                src_format = img.get('format', 'unknown')
+                break
+        else:
+            src_format = 'unknown'
+        meta_path = (
+            self._testdata_root / 'expected-outputs' /
+            'measure-json' / src_format / any_version /
+            f'{composed_id}.meta.json'
+        )
+        if meta_path.exists():
+            with meta_path.open() as f:
+                meta = json.load(f)
+            if meta.get('return_code', 0) != 0:
+                self.skipTest(
+                    f'baseline has non-zero exit '
+                    f'({meta.get("return_code")}); divergence is '
+                    f'not a numeric one'
+                )
+
+        # Run instar measure.
+        stdout, stderr, rc = self.run_instar_measure(
+            str(image_path), '-O', target, '--output', 'json'
+        )
+        if rc != 0:
+            # instar still fails on this case — the divergence is at
+            # the "won't run" level, which is itself a divergence.
+            return
+
+        # The point of the regression guard: assert NOT equal. If
+        # instar's output now matches the baseline, the scanner has
+        # been fixed; remove the entry from
+        # KNOWN_SOURCE_SCANNER_DIVERGENCES so the normal byte-equality
+        # test re-engages.
+        self.assertNotEqual(
+            stdout, expected,
+            f'{composed_id}: instar output now MATCHES qemu-img '
+            f'baseline. The underlying scanner gap '
+            f'({reason}) appears to be fixed. Remove '
+            f"'{image_id}' from KNOWN_SOURCE_SCANNER_DIVERGENCES "
+            f'so the normal byte-equality test re-engages.'
+        )
+    return test
+
+
+# Register one regression-guard test per known-divergence entry.
+for _img_id, (_target_pat, _reason) in KNOWN_SOURCE_SCANNER_DIVERGENCES.items():
+    # Wildcard target → assert divergence in the qcow2 case (it's the
+    # one all entries have a baseline for).
+    _t = 'qcow2' if _target_pat == '*' else _target_pat
+    _name = (
+        f'test_still_diverges_{_img_id.replace("-", "_")}_{_t}'
+    )
+    setattr(
+        TestMeasureDivergenceRegression,
+        _name,
+        _make_divergence_regression_test(_img_id, _t, _reason)
+    )
 
 
 class TestMeasureRoundTrip(TestMeasureSmoke):
