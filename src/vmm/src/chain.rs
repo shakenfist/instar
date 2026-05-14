@@ -869,6 +869,58 @@ mod tests {
         assert!(!peek_is_vmdk_descriptor(&raw).unwrap());
     }
 
+    /// Build the first 8 bytes of a qcow2 header (magic + u32 BE version).
+    fn qcow2_magic_bytes(version: u32) -> [u8; 8] {
+        let mut buf = [0u8; 8];
+        buf[0..4].copy_from_slice(&[0x51, 0x46, 0x49, 0xfb]); // "QFI\xfb"
+        buf[4..8].copy_from_slice(&version.to_be_bytes());
+        buf
+    }
+
+    #[test]
+    fn peek_is_qcow2_v3_accepts_v3() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("v3.qcow2");
+        std::fs::write(&path, qcow2_magic_bytes(3)).unwrap();
+        assert!(peek_is_qcow2_v3(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn peek_is_qcow2_v3_rejects_v2() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("v2.qcow2");
+        std::fs::write(&path, qcow2_magic_bytes(2)).unwrap();
+        assert!(!peek_is_qcow2_v3(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn peek_is_qcow2_v3_rejects_non_qcow2_magic() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("notqcow.bin");
+        // Use a magic that is decidedly not "QFI\xfb".
+        std::fs::write(&path, b"NOPE\x00\x00\x00\x03").unwrap();
+        assert!(!peek_is_qcow2_v3(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn peek_is_qcow2_v3_rejects_short_file() {
+        // Files shorter than 8 bytes cannot encode the magic + version
+        // pair and must be rejected.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("tiny.bin");
+        std::fs::write(&path, b"QFI\xfb").unwrap(); // 4 bytes only
+        assert!(!peek_is_qcow2_v3(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn peek_is_qcow2_v3_rejects_missing_file() {
+        // A path that doesn't exist returns false rather than
+        // panicking — same defensive contract as peek_is_vmdk_descriptor.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("does-not-exist.qcow2");
+        assert!(!peek_is_qcow2_v3(path.to_str().unwrap()));
+    }
+
     #[test]
     fn resolve_descriptor_happy_path() {
         let tmp = TempDir::new().unwrap();
