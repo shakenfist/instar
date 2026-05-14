@@ -121,6 +121,13 @@ pub const QCOW2_HEADER_LENGTH_V3: u32 = 104;
 /// Default refcount order (4 = 16-bit refcounts)
 pub const QCOW2_DEFAULT_REFCOUNT_ORDER: u32 = 4;
 
+/// Maximum sane `l1_size` (in u64 entries). Matches qemu's
+/// `QCOW_MAX_L1_SIZE = 32 MiB` (= 4 Mi × 8 bytes/entry). Any
+/// header reporting more is either corrupt or hostile; reject
+/// it in `QcowHeader::parse` so downstream `scan_allocation`
+/// loops are bounded by construction.
+pub const QCOW2_MAX_L1_SIZE_ENTRIES: u32 = 4 * 1024 * 1024;
+
 /// Offset of nb_snapshots field in the header
 pub const NB_SNAPSHOTS_OFFSET: usize = 60;
 /// Offset of snapshots_offset field in the header
@@ -334,6 +341,13 @@ impl QcowHeader {
 
         let virtual_size = be_u64(header, SIZE_OFFSET);
         let l1_size = be_u32(header, L1_SIZE_OFFSET);
+        // Reject grossly oversized L1 tables. Matches qemu's
+        // QCOW_MAX_L1_SIZE absolute cap. An untrusted image cannot
+        // force the scan_allocation / cluster_lookup loops to walk
+        // an unbounded L1 region.
+        if l1_size > QCOW2_MAX_L1_SIZE_ENTRIES {
+            return None;
+        }
         let l1_table_offset = be_u64(header, L1_TABLE_OFFSET_OFFSET);
         let backing_file_offset = be_u64(header, BACKING_FILE_OFFSET_OFFSET);
         let backing_file_size = be_u32(header, BACKING_FILE_SIZE_OFFSET);
@@ -2052,6 +2066,26 @@ mod tests {
         assert_eq!(hdr.l1_size, 256);
         assert_eq!(hdr.l1_table_offset, 0x30000);
         assert_eq!(hdr.refcount_bits, 16);
+    }
+
+    #[test]
+    fn parse_rejects_oversized_l1() {
+        // Header claims l1_size = 4 * 1024 * 1024 + 1 entries, exceeding
+        // the absolute QCOW2_MAX_L1_SIZE_ENTRIES cap.
+        let mut buf = make_qcow2_header();
+        let bad_l1 = QCOW2_MAX_L1_SIZE_ENTRIES + 1;
+        buf[L1_SIZE_OFFSET..L1_SIZE_OFFSET + 4].copy_from_slice(&bad_l1.to_be_bytes());
+        assert!(QcowHeader::parse(&buf).is_none());
+    }
+
+    #[test]
+    fn parse_accepts_l1_at_cap() {
+        // Boundary: exactly QCOW2_MAX_L1_SIZE_ENTRIES is accepted.
+        let mut buf = make_qcow2_header();
+        buf[L1_SIZE_OFFSET..L1_SIZE_OFFSET + 4]
+            .copy_from_slice(&QCOW2_MAX_L1_SIZE_ENTRIES.to_be_bytes());
+        let hdr = QcowHeader::parse(&buf).unwrap();
+        assert_eq!(hdr.l1_size, QCOW2_MAX_L1_SIZE_ENTRIES);
     }
 
     #[test]
