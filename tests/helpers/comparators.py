@@ -156,14 +156,16 @@ def _substitute_json_actual_size(data: dict, disk_size: int) -> dict:
     """
     if isinstance(data, dict):
         # If this dict references its own file, use that file's
-        # actual disk size rather than the passed-in default.
+        # actual disk size rather than the passed-in default. Any
+        # OSError from get_disk_size is intentionally allowed to
+        # propagate: after os.path.exists returned True, a stat
+        # failure indicates a real test-environment problem (race,
+        # permission, broken testdata) that should fail loud rather
+        # than silently fall back to the wrong actual-size.
         effective_size = disk_size
         filename = data.get('filename')
         if isinstance(filename, str) and os.path.exists(filename):
-            try:
-                effective_size = get_disk_size(filename)
-            except OSError:
-                pass
+            effective_size = get_disk_size(filename)
         result = {}
         for key, value in data.items():
             if key == 'actual-size':
