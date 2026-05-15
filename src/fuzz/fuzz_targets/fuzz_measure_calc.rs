@@ -65,7 +65,11 @@ fuzz_target!(|data: &[u8]| {
         _ => VhdSubformat::Dynamic,
     };
 
-    let summary = AllocationSummary { virtual_size, allocated_bytes };
+    let summary = AllocationSummary {
+        virtual_size,
+        allocated_bytes,
+        target_units_with_data: 0,
+    };
     let result: Option<MeasureOutput> = match target_sel {
         0 => measure_raw(virtual_size).ok(),
         1 => {

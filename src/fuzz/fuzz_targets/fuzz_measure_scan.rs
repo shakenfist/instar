@@ -15,11 +15,20 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    if data.len() < 2 {
+    if data.len() < 3 {
         return;
     }
     let format = data[0] % 4;
-    let image_data = &data[1..];
+    // Pick a target unit size from a small set so the new bug-#286
+    // target-aware scan path is exercised on every iteration. `0`
+    // selects the legacy code path (no target-unit tracking).
+    let target_unit_size: u64 = match data[1] & 0x3 {
+        0 => 0,
+        1 => 4096,
+        2 => 65536,
+        _ => 1 << 20,
+    };
+    let image_data = &data[2..];
 
     instar_fuzz::set_fuzz_input(image_data);
     let call_table = instar_fuzz::build_call_table();
@@ -59,6 +68,7 @@ fuzz_target!(|data: &[u8]| {
                                 sector_size,
                                 input_capacity,
                                 h.virtual_size,
+                                target_unit_size,
                                 &mut bytes_read,
                             ) {
                                 assert!(
@@ -67,6 +77,21 @@ fuzz_target!(|data: &[u8]| {
                                     s.allocated_bytes,
                                     s.virtual_size
                                 );
+                                // Bug #286 invariant: when target-unit
+                                // tracking is enabled and any source data
+                                // is allocated, the count must also fit
+                                // within the target's view of virtual size.
+                                if target_unit_size > 0 && s.virtual_size > 0 {
+                                    let cap = s
+                                        .virtual_size
+                                        .div_ceil(target_unit_size);
+                                    assert!(
+                                        s.target_units_with_data <= cap,
+                                        "qcow2 target_units {} > cap {}",
+                                        s.target_units_with_data,
+                                        cap
+                                    );
+                                }
                             }
                         }
                     }
