@@ -806,6 +806,7 @@ fn print_info_result(
     extra_detail: bool,
     profile: &version::OutputProfile,
     output_format: &str,
+    vmdk_flat: Option<&crate::chain::ResolvedVmdkDescriptor>,
 ) {
     if let Some(guest_::GuestMessage_::Payload::InfoResult(info)) = &msg.payload {
         // Get absolute path for filename
@@ -843,6 +844,7 @@ fn print_info_result(
                 disk_size,
                 extra_detail,
                 profile,
+                vmdk_flat,
             );
             return;
         }
@@ -1063,6 +1065,7 @@ fn print_info_result_json(
     disk_size: u64,
     extra_detail: bool,
     profile: &version::OutputProfile,
+    vmdk_flat: Option<&crate::chain::ResolvedVmdkDescriptor>,
 ) {
     // Build JSON output to match qemu-img's format exactly
     // qemu-img uses 4-space indentation
@@ -1094,14 +1097,73 @@ fn print_info_result_json(
     let has_backing_file =
         info.flags & INFO_RESULT_FLAG_HAS_BACKING_FILE != 0 && !info.backing_file.is_empty();
 
-    // Children section (qemu-img 8.0+ only)
-    if profile.include_child_node {
+    // Children section (qemu-img 8.0+ generally).
+    //
+    // VMDK monolithicFlat (and twoGbMaxExtentFlat in future) is the
+    // exception — qemu-img has emitted per-extent children for these
+    // images since at least 6.0 because they genuinely are multi-file
+    // images. Emit children whenever we have resolved flat extents,
+    // regardless of profile. The descriptor's virtual-size is rounded
+    // up to the 512-byte sector boundary (qemu treats it as an
+    // unstructured file). See bug #286 PR follow-up.
+    if profile.include_child_node || vmdk_flat.is_some() {
         println!("    \"children\": [");
+        let mut emitted_any_child = false;
+        if let Some(resolved) = vmdk_flat {
+            for (i, extent) in resolved.flat_extents.iter().enumerate() {
+                let extent_disk = std::fs::metadata(&extent.flat_path)
+                    .map(|m| {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::MetadataExt;
+                            m.blocks() * 512
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            m.len()
+                        }
+                    })
+                    .unwrap_or(extent.extent_size);
+                let extent_path = extent.flat_path.to_string_lossy();
+                if emitted_any_child {
+                    println!("        }},");
+                }
+                println!("        {{");
+                println!("            \"name\": \"extents.{i}\",");
+                println!("            \"info\": {{");
+                println!("                \"children\": [],");
+                println!("                \"virtual-size\": {},", extent.extent_size);
+                println!(
+                    "                \"filename\": \"{}\",",
+                    escape_json_string(&extent_path)
+                );
+                println!("                \"format\": \"file\",");
+                println!("                \"actual-size\": {extent_disk},");
+                println!("                \"format-specific\": {{");
+                println!("                    \"type\": \"file\",");
+                println!("                    \"data\": {{}}");
+                println!("                }},");
+                println!("                \"dirty-flag\": false");
+                println!("            }}");
+                emitted_any_child = true;
+            }
+        }
+        // Descriptor / file child. For VMDK flat we treat the
+        // descriptor file as unstructured (qemu-img does) and round
+        // its virtual-size up to a sector.
+        let descriptor_vsize = if vmdk_flat.is_some() {
+            effective_child_file_length.div_ceil(512) * 512
+        } else {
+            effective_child_file_length
+        };
+        if emitted_any_child {
+            println!("        }},");
+        }
         println!("        {{");
         println!("            \"name\": \"file\",");
         println!("            \"info\": {{");
         println!("                \"children\": [],");
-        println!("                \"virtual-size\": {effective_child_file_length},");
+        println!("                \"virtual-size\": {descriptor_vsize},");
         println!(
             "                \"filename\": \"{}\",",
             escape_json_string(abs_path)
@@ -1213,27 +1275,49 @@ fn print_info_result_json(
             "            \"create-type\": \"{}\",",
             info.vmdk_info.create_type.as_str()
         );
-        // Extents array - for monolithicSparse, there's one extent with the disk info
         println!("            \"extents\": [");
-        println!("                {{");
-        // Output compressed: true if the extent is compressed (e.g., streamOptimized)
-        if info.flags & INFO_RESULT_FLAG_COMPRESSED != 0 {
-            println!("                    \"compressed\": true,");
+        if let Some(resolved) = vmdk_flat {
+            // monolithicFlat / twoGbMaxExtentFlat — one entry per
+            // resolved flat extent, "FLAT" format, no cluster-size.
+            // Matches qemu-img info --output=json.
+            for (idx, extent) in resolved.flat_extents.iter().enumerate() {
+                if idx > 0 {
+                    println!("                }},");
+                }
+                println!("                {{");
+                println!(
+                    "                    \"virtual-size\": {},",
+                    extent.extent_size
+                );
+                println!(
+                    "                    \"filename\": \"{}\",",
+                    escape_json_string(&extent.flat_path.to_string_lossy())
+                );
+                println!("                    \"format\": \"FLAT\"");
+            }
+            println!("                }}");
+        } else {
+            // monolithicSparse / streamOptimized — single self-extent
+            // record, format left blank to match qemu-img.
+            println!("                {{");
+            if info.flags & INFO_RESULT_FLAG_COMPRESSED != 0 {
+                println!("                    \"compressed\": true,");
+            }
+            println!(
+                "                    \"virtual-size\": {},",
+                info.virtual_size
+            );
+            println!(
+                "                    \"filename\": \"{}\",",
+                escape_json_string(abs_path)
+            );
+            println!(
+                "                    \"cluster-size\": {},",
+                info.cluster_size
+            );
+            println!("                    \"format\": \"\"");
+            println!("                }}");
         }
-        println!(
-            "                    \"virtual-size\": {},",
-            info.virtual_size
-        );
-        println!(
-            "                    \"filename\": \"{}\",",
-            escape_json_string(abs_path)
-        );
-        println!(
-            "                    \"cluster-size\": {},",
-            info.cluster_size
-        );
-        println!("                    \"format\": \"\"");
-        println!("                }}");
         println!("            ]");
         println!("        }}");
         println!("    }},");
@@ -2636,12 +2720,21 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     // filesystem. Do that here so an unsupported descriptor
     // fails cleanly before we launch the guest instead of
     // silently producing misleading output.
+    //
+    // The resolved descriptor (when present) is also threaded into
+    // JSON info output so each flat extent appears as a separate
+    // child entry, matching qemu-img.
     let input_path_for_preflight = Path::new(&args.input);
-    if peek_is_vmdk_descriptor(input_path_for_preflight).unwrap_or(false) {
-        let security_config = config::load_config().config.security;
-        resolve_vmdk_flat_descriptor(input_path_for_preflight, &security_config)
-            .map_err(|e| format!("error resolving VMDK descriptor: {e}"))?;
-    }
+    let vmdk_flat_resolved: Option<crate::chain::ResolvedVmdkDescriptor> =
+        if peek_is_vmdk_descriptor(input_path_for_preflight).unwrap_or(false) {
+            let security_config = config::load_config().config.security;
+            Some(
+                resolve_vmdk_flat_descriptor(input_path_for_preflight, &security_config)
+                    .map_err(|e| format!("error resolving VMDK descriptor: {e}"))?,
+            )
+        } else {
+            None
+        };
 
     // Get input file metadata (size and disk blocks)
     let input_metadata = std::fs::metadata(&args.input)?;
@@ -2924,6 +3017,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
                                     args.extra_detail,
                                     &profile,
                                     &args.output,
+                                    vmdk_flat_resolved.as_ref(),
                                 );
                             } else {
                                 debug!("{}", format_message(&msg));
