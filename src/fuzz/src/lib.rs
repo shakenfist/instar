@@ -80,6 +80,7 @@ pub fn build_call_table() -> shared::CallTable {
         send_info_result_luks: mock_send_info_result_luks,
         send_check_result: mock_send_check_result,
         send_compare_result: mock_send_compare_result,
+        send_measure_result: mock_send_measure_result,
     }
 }
 
@@ -255,6 +256,8 @@ unsafe extern "C" fn mock_send_info_result_luks(
 unsafe extern "C" fn mock_send_check_result(_result: *const shared::CheckResult) {}
 
 unsafe extern "C" fn mock_send_compare_result(_result: *const shared::CompareResult) {}
+
+unsafe extern "C" fn mock_send_measure_result(_result: *const shared::MeasureResult) {}
 
 // ---------------------------------------------------------------------------
 // Unit tests

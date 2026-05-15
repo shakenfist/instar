@@ -8,7 +8,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use shared::{
-    be_u16, be_u32, be_u64, write_be_u16, write_be_u32, write_be_u64, CallTable, MAX_SECTOR_SIZE,
+    be_u16, be_u32, be_u64, write_be_u16, write_be_u32, write_be_u64, AllocationSummary, CallTable,
+    MAX_SECTOR_SIZE,
 };
 
 // ============================================================================
@@ -294,6 +295,27 @@ pub fn compute_vhd_geometry(size: u64) -> (u16, u8, u8) {
     let cylinders = cyl_times_heads / heads;
 
     (cylinders as u16, heads as u8, sectors_per_track as u8)
+}
+
+// ============================================================================
+// Allocation scanning — pure helper
+// ============================================================================
+
+/// Count allocated entries in a dynamic-VHD BAT byte slice.
+///
+/// Each entry is a big-endian u32 sector pointer. The unallocated
+/// marker is `0xFFFF_FFFF`. Any other value indicates an allocated
+/// block.
+///
+/// `bat_bytes` may have a trailing partial entry (length not a
+/// multiple of 4); the trailing bytes are ignored. The caller is
+/// expected to pass a slice covering exactly `total_blocks * 4`
+/// bytes after BAT padding.
+pub fn count_allocated_in_bat(bat_bytes: &[u8]) -> u64 {
+    bat_bytes
+        .chunks_exact(4)
+        .filter(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]) != BAT_UNALLOCATED)
+        .count() as u64
 }
 
 // ============================================================================
@@ -610,6 +632,120 @@ impl VhdState {
             host_byte_offset: data_start + intra_block_offset,
         })
     }
+
+    /// Walk the BAT and produce an `AllocationSummary`.
+    ///
+    /// For Fixed VHDs (no BAT), `allocated_bytes == virtual_size`.
+    /// For Dynamic VHDs, walks the BAT in `MAX_SECTOR_SIZE`-sized cached
+    /// chunks and counts entries != `0xFFFF_FFFF`, multiplying by
+    /// `block_size`.
+    ///
+    /// Returns `None` if any I/O call fails. The caller treats `None`
+    /// as an unrecoverable format error.
+    ///
+    /// # Safety
+    ///
+    /// `call_table` must be valid. `bat_cache_buf` must still be valid
+    /// and point to at least `MAX_SECTOR_SIZE` writable bytes.
+    // NOTE: The sector-walking loop below (buf_start / buf_end /
+    // meaningful_len / per-sector read) is duplicated near-verbatim in
+    // `vhdx::VhdxState::scan_allocation`. The two formats walk single
+    // contiguous BAT tables; the only differences are the entry
+    // decoder (`count_allocated_in_bat` vs the vhdx chunk_ratio-aware
+    // variant) and one cache-invalidation line. Extracting a shared
+    // `walk_table_sectors(call_table, byte_offset, byte_len, ...,
+    // FnMut(&[u8]))` helper into `shared` is captured as future work
+    // in PLAN-measure.md; deferred because the FnMut + &mut self
+    // borrow interaction adds non-trivial complexity for marginal
+    // line-count reduction.
+    pub unsafe fn scan_allocation(
+        &mut self,
+        call_table: &CallTable,
+        sector_size: usize,
+        input_capacity: u64,
+        bytes_read: &mut u64,
+    ) -> Option<AllocationSummary> {
+        // Fixed VHDs: every byte is allocated — no BAT to walk.
+        if self.disk_type == DISK_TYPE_FIXED {
+            return Some(AllocationSummary {
+                virtual_size: self.current_size,
+                allocated_bytes: self.current_size,
+                // TODO(#286): populate from target_unit_size when this
+                // scanner is converted to target-aware accounting.
+                target_units_with_data: 0,
+            });
+        }
+
+        // Dynamic (and Differencing) VHDs: walk the BAT.
+        // The BAT is a contiguous u32-be array of `max_table_entries`
+        // entries starting at `table_offset` (byte offset).
+        let total_bat_bytes = (self.max_table_entries as u64).checked_mul(4)?;
+        let bat_start_sector = self.table_offset / sector_size as u64;
+        let bat_end_byte = self.table_offset.checked_add(total_bat_bytes)?;
+        // Round up to the next sector boundary so we cover any partial
+        // sector at the end of the BAT.
+        let bat_end_sector = bat_end_byte.checked_add(sector_size as u64 - 1)? / sector_size as u64;
+
+        let mut allocated_blocks: u64 = 0;
+        // Bytes of BAT we have logically consumed so far (used to bound
+        // the count so padding at the end of the last sector is ignored).
+        let mut bat_bytes_consumed: u64 = 0;
+
+        let mut sector = bat_start_sector;
+        while sector < bat_end_sector {
+            if sector >= input_capacity {
+                return None;
+            }
+            if !(call_table.read_input_sector)(
+                self.device_idx,
+                sector,
+                self.bat_cache_buf,
+                sector_size,
+            ) {
+                return None;
+            }
+            *bytes_read += sector_size as u64;
+
+            // Determine the byte range within this sector that belongs
+            // to the BAT (accounting for the first sector's intra-sector
+            // offset and clamping to `total_bat_bytes`).
+            let sector_byte_start = sector * sector_size as u64;
+            // Offset of the first BAT byte within this sector's buffer.
+            let buf_start = if sector_byte_start < self.table_offset {
+                (self.table_offset - sector_byte_start) as usize
+            } else {
+                0
+            };
+            let buf_end =
+                sector_size.min((bat_end_byte.saturating_sub(sector_byte_start)) as usize);
+            if buf_end <= buf_start {
+                sector += 1;
+                continue;
+            }
+            let chunk =
+                core::slice::from_raw_parts(self.bat_cache_buf.add(buf_start), buf_end - buf_start);
+
+            // Clamp to the meaningful BAT bytes (ignore sector padding).
+            let meaningful_len =
+                (total_bat_bytes - bat_bytes_consumed).min((buf_end - buf_start) as u64) as usize;
+            let meaningful = &chunk[..meaningful_len];
+
+            allocated_blocks += count_allocated_in_bat(meaningful);
+            bat_bytes_consumed += meaningful_len as u64;
+
+            sector += 1;
+        }
+
+        let allocated_bytes = allocated_blocks.saturating_mul(self.block_size as u64);
+
+        Some(AllocationSummary {
+            virtual_size: self.current_size,
+            allocated_bytes,
+            // TODO(#286): populate from target_unit_size when this
+            // scanner is converted to target-aware accounting.
+            target_units_with_data: 0,
+        })
+    }
 }
 
 // ============================================================================
@@ -918,5 +1054,90 @@ mod tests {
         // Verify checksum
         let computed = compute_checksum(&buf, DYN_CHECKSUM_OFFSET);
         assert_eq!(hdr.checksum, computed);
+    }
+
+    // ====================================================================
+    // count_allocated_in_bat tests
+    // ====================================================================
+
+    /// Helper: encode a u32 as 4 big-endian bytes.
+    fn be32(v: u32) -> [u8; 4] {
+        v.to_be_bytes()
+    }
+
+    #[test]
+    fn bat_count_empty() {
+        // Empty slice → 0 allocated entries.
+        assert_eq!(count_allocated_in_bat(&[]), 0);
+    }
+
+    #[test]
+    fn bat_count_all_allocated() {
+        // 4 entries, all with small non-0xFFFFFFFF values → all allocated.
+        let mut buf = [0u8; 16];
+        buf[0..4].copy_from_slice(&be32(0x0000_0001));
+        buf[4..8].copy_from_slice(&be32(0x0000_0002));
+        buf[8..12].copy_from_slice(&be32(0x0000_0003));
+        buf[12..16].copy_from_slice(&be32(0x0000_0004));
+        assert_eq!(count_allocated_in_bat(&buf), 4);
+    }
+
+    #[test]
+    fn bat_count_all_unallocated() {
+        // 4 entries, all 0xFFFFFFFF → 0 allocated.
+        let buf = [0xFF_u8; 16];
+        assert_eq!(count_allocated_in_bat(&buf), 0);
+    }
+
+    #[test]
+    fn bat_count_mixed() {
+        // 5 entries: entries 0 and 3 are allocated, entries 1, 2, 4 are not.
+        // Expected: 2.
+        let mut buf = [0u8; 20];
+        buf[0..4].copy_from_slice(&be32(0x0000_0010)); // allocated
+        buf[4..8].copy_from_slice(&be32(BAT_UNALLOCATED)); // unallocated
+        buf[8..12].copy_from_slice(&be32(BAT_UNALLOCATED)); // unallocated
+        buf[12..16].copy_from_slice(&be32(0x0000_0020)); // allocated
+        buf[16..20].copy_from_slice(&be32(BAT_UNALLOCATED)); // unallocated
+        assert_eq!(count_allocated_in_bat(&buf), 2);
+    }
+
+    #[test]
+    fn bat_count_trailing_partial_entry() {
+        // 3 complete entries + 1 trailing byte (13 bytes total).
+        // chunks_exact(4) must discard the tail and count only 3 entries.
+        // Entries: allocated, unallocated, allocated → expected 2.
+        let mut buf = [0u8; 13];
+        buf[0..4].copy_from_slice(&be32(0x0000_0001)); // allocated
+        buf[4..8].copy_from_slice(&be32(BAT_UNALLOCATED)); // unallocated
+        buf[8..12].copy_from_slice(&be32(0x0000_0002)); // allocated
+        buf[12] = 0x00; // trailing garbage byte — must be ignored
+        assert_eq!(count_allocated_in_bat(&buf), 2);
+    }
+
+    #[test]
+    fn bat_count_large_every_seventh_allocated() {
+        // 1024 entries, with every 7th entry allocated (indices 0, 7, 14, ...).
+        // Count = number of i in 0..1024 where i % 7 == 0.
+        let mut buf = [0xFF_u8; 1024 * 4];
+        let mut expected: u64 = 0;
+        for i in 0usize..1024 {
+            if i % 7 == 0 {
+                let off = i * 4;
+                buf[off..off + 4].copy_from_slice(&be32(i as u32));
+                expected += 1;
+            }
+        }
+        // Verify expected: ceil(1023 / 7) + 1 = 146 + 1 = 147.
+        assert_eq!(expected, 147);
+        assert_eq!(count_allocated_in_bat(&buf), 147);
+    }
+
+    #[test]
+    fn bat_count_zero_value_is_allocated() {
+        // BAT entry value 0 is a valid sector pointer → must count as allocated.
+        // Only 0xFFFFFFFF is the unallocated sentinel.
+        let buf = be32(0x0000_0000);
+        assert_eq!(count_allocated_in_bat(&buf), 1);
     }
 }

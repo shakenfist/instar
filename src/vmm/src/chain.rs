@@ -571,6 +571,32 @@ pub fn peek_is_vmdk_descriptor(path: &Path) -> std::io::Result<bool> {
         && &buf[..VMDK_DESCRIPTOR_MAGIC.len()] == VMDK_DESCRIPTOR_MAGIC)
 }
 
+/// Peek at `path` and return true if it is a qcow2 v3 image
+/// (magic = "QFI\xfb", version = 3). Used host-side to decide
+/// whether `measure -O qcow2` should emit the `bitmaps` field —
+/// qemu-img only emits it for qcow2 v3 sources because persistent
+/// bitmaps are a v3 feature. Returns false on short files, files
+/// we can't open, non-qcow2 files, or qcow2 v2 files.
+pub fn peek_is_qcow2_v3(path: &str) -> bool {
+    use std::io::Read;
+
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    // Header layout: magic[4] | version[4] (big-endian u32).
+    let mut buf = [0u8; 8];
+    if file.read(&mut buf).unwrap_or(0) < 8 {
+        return false;
+    }
+    // QCOW2 magic: "QFI\xfb" = 0x51_46_49_FB.
+    if buf[..4] != [0x51, 0x46, 0x49, 0xfb] {
+        return false;
+    }
+    let version = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    version == 3
+}
+
 /// Check chain depth and return error if exceeded.
 pub fn check_chain_depth(
     current_depth: usize,
@@ -841,6 +867,58 @@ mod tests {
         std::fs::write(&raw, b"random binary content goes here").unwrap();
 
         assert!(!peek_is_vmdk_descriptor(&raw).unwrap());
+    }
+
+    /// Build the first 8 bytes of a qcow2 header (magic + u32 BE version).
+    fn qcow2_magic_bytes(version: u32) -> [u8; 8] {
+        let mut buf = [0u8; 8];
+        buf[0..4].copy_from_slice(&[0x51, 0x46, 0x49, 0xfb]); // "QFI\xfb"
+        buf[4..8].copy_from_slice(&version.to_be_bytes());
+        buf
+    }
+
+    #[test]
+    fn peek_is_qcow2_v3_accepts_v3() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("v3.qcow2");
+        std::fs::write(&path, qcow2_magic_bytes(3)).unwrap();
+        assert!(peek_is_qcow2_v3(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn peek_is_qcow2_v3_rejects_v2() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("v2.qcow2");
+        std::fs::write(&path, qcow2_magic_bytes(2)).unwrap();
+        assert!(!peek_is_qcow2_v3(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn peek_is_qcow2_v3_rejects_non_qcow2_magic() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("notqcow.bin");
+        // Use a magic that is decidedly not "QFI\xfb".
+        std::fs::write(&path, b"NOPE\x00\x00\x00\x03").unwrap();
+        assert!(!peek_is_qcow2_v3(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn peek_is_qcow2_v3_rejects_short_file() {
+        // Files shorter than 8 bytes cannot encode the magic + version
+        // pair and must be rejected.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("tiny.bin");
+        std::fs::write(&path, b"QFI\xfb").unwrap(); // 4 bytes only
+        assert!(!peek_is_qcow2_v3(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn peek_is_qcow2_v3_rejects_missing_file() {
+        // A path that doesn't exist returns false rather than
+        // panicking — same defensive contract as peek_is_vmdk_descriptor.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("does-not-exist.qcow2");
+        assert!(!peek_is_qcow2_v3(path.to_str().unwrap()));
     }
 
     #[test]

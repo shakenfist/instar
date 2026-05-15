@@ -5,6 +5,71 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **New `instar measure` subcommand.** Predicts the file size
+  required to convert an image (or a hypothetical `--size N`
+  image) to a target format. Output matches `qemu-img measure`
+  byte-for-byte for raw and qcow2 targets across every qemu-img
+  version 6.0.0 through 10.2.0; vmdk, vpc (VHD), and vhdx targets
+  are instar-only since qemu-img cannot measure them. Accepts both
+  individual clap flags and the qemu-img `-o key=value,...` syntax
+  (`-o` wins on conflict). See
+  [docs/measure.md](docs/measure.md) for the full reference.
+  ([phase 3](docs/plans/PLAN-measure-phase-03-guest-op.md) ·
+  [phase 4](docs/plans/PLAN-measure-phase-04-host-cli.md) ·
+  [phase 5](docs/plans/PLAN-measure-phase-05-target-options.md))
+
+- **Supporting library and crate-level pieces.** New
+  `crates/measure/` (no_std, pure-function per-target size
+  calculators), per-parser `scan_allocation` entry points on each
+  format crate (raw / qcow2 / vmdk / vhd / vhdx),
+  `MeasureConfig` / `MeasureResult` structs in `shared`, a new
+  `MeasureResultMessage` protobuf field, and a new
+  `send_measure_result` CallTable function pointer. CallTable
+  version bumped from 13 to 14.
+  ([phase 1](docs/plans/PLAN-measure-phase-01-calculators.md) ·
+  [phase 2](docs/plans/PLAN-measure-phase-02-allocation-scanners.md) ·
+  [phase 3](docs/plans/PLAN-measure-phase-03-guest-op.md))
+
+- **Test and fuzz infrastructure.** Comprehensive integration
+  tests for `instar measure` (`tests/test_measure.py`, 345 tests
+  including cross-version baseline comparison for raw/qcow2
+  targets, round-trip size-bound checks for vmdk/vpc/vhdx targets,
+  and `-o` parsing). Cross-version baselines committed to
+  `instar-testdata/expected-outputs/measure-*` for 80 qemu-img
+  versions. Two new coverage-guided fuzz targets
+  (`fuzz_measure_calc`, `fuzz_measure_scan`) in
+  `src/fuzz/fuzz_targets/`. Differential fuzzer extended with an
+  `op_measure` that compares instar against qemu-img for raw/qcow2
+  and against `instar convert` output size for vmdk/vpc/vhdx.
+  ([phase 6](docs/plans/PLAN-measure-phase-06-baselines.md) ·
+  [phase 7](docs/plans/PLAN-measure-phase-07-integration-tests.md) ·
+  [phase 8](docs/plans/PLAN-measure-phase-08-fuzz-coverage.md) ·
+  [phase 9](docs/plans/PLAN-measure-phase-09-fuzz-differential.md))
+
+- **Bug fixes surfaced during the measure work.**
+  `parse_memory_size` accepts the T (terabyte) suffix alongside
+  K/M/G (surfaced by phase 7b baselines). `instar measure -O qcow2`
+  emits a leading `"bitmaps": 0` field in JSON output and the
+  equivalent `bitmaps size: 0` trailing line in human output when
+  the source is a qcow2 v3 image, matching qemu-img exactly
+  (surfaced and refined by phase 7c source-image tests).
+
+### Changed
+
+- **CallTable ABI version bumped from 13 to 14** by the addition
+  of `send_measure_result`. Stale operation binaries built against
+  version 13 will fail-stop in `validate_call_table!` with a clear
+  log message rather than silently miscompile.
+
+- **`AllocationSummary` moved from `crates/measure` to
+  `crates/shared`** so the per-format scanners can produce values
+  of the type without depending on the measure crate (a back-compat
+  re-export keeps phase 1 tests working).
+
 ## [0.2.0] - 2026-05-09
 
 First public release.

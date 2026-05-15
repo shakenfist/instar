@@ -433,6 +433,36 @@ pub const MAX_CLUSTER_SIZE: usize = 2 * 1024 * 1024;
 /// sector boundary.
 pub const COMPRESSED_BUF_SIZE: usize = MAX_CLUSTER_SIZE + MAX_SECTOR_SIZE;
 
+/// Summary of source-side allocation as seen by a parser.
+///
+/// Phase 2 of `PLAN-measure.md` produces this from a parsed source
+/// image; the `measure` crate consumes it as input to the per-format
+/// size calculators.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AllocationSummary {
+    /// Total addressable size of the source image in bytes.
+    pub virtual_size: u64,
+    /// Bytes that the source has marked as allocated (whether or not they
+    /// contain non-zero data). For raw input this equals `virtual_size`.
+    /// For sparse inputs it may be less.
+    pub allocated_bytes: u64,
+    /// Count of target-aligned regions that contain at least one byte of
+    /// allocated source data, computed against a `target_unit_size`
+    /// supplied at scan time.
+    ///
+    /// Required to correctly size the data area of formats whose target
+    /// unit (qcow2 cluster, vhd/vhdx block, vmdk grain) is larger than
+    /// the source unit: a fragmented source with N allocated source
+    /// clusters spread across the address space needs the count of
+    /// *target* units that touch those clusters, not
+    /// `ceil(allocated_bytes / target_unit_size)`. See bug #286.
+    ///
+    /// `0` is a sentinel meaning "scanner did not compute this"; the
+    /// measure calculators fall back to `ceil(allocated_bytes /
+    /// target_unit)`. New scanners should always populate it.
+    pub target_units_with_data: u64,
+}
+
 /// Result from get_operation_config (FFI-safe alternative to tuple)
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -614,6 +644,11 @@ pub struct CallTable {
     /// Send compare result message.
     /// Args: compare_result pointer containing comparison results
     pub send_compare_result: unsafe extern "C" fn(*const CompareResult),
+
+    /// Send measure result message.
+    /// Args: measure_result pointer containing required +
+    /// fully_allocated bytes for the target format.
+    pub send_measure_result: unsafe extern "C" fn(*const MeasureResult),
 }
 
 /// Backing format type for QCOW2 header extension
@@ -934,7 +969,7 @@ impl CallTable {
     pub const MAGIC: u32 = 0x494D4147; // "IMAG"
 
     /// Current ABI version (bumped: added subcluster_errors to CheckResult)
-    pub const VERSION: u32 = 13;
+    pub const VERSION: u32 = 14;
 }
 
 // ============================================================================
@@ -1973,6 +2008,122 @@ impl ConvertConfig {
 }
 
 // ============================================================================
+// Measure configuration and result structures
+// ============================================================================
+
+/// Configuration for the measure operation.
+///
+/// Written to `OPERATION_CONFIG_ADDR` by the VMM before launching the
+/// measure guest binary. The guest reads this directly via
+/// `&*(OPERATION_CONFIG_ADDR as *const MeasureConfig)`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MeasureConfig {
+    /// Magic number (`0x4D454153` = "MEAS").
+    pub magic: u32,
+    /// Target output format (`ImageFormat as u32`). Only RAW, QCOW2,
+    /// VMDK, VHD, and VHDX are valid for measure.
+    pub target_format: u32,
+    /// Configuration flags (see `FLAG_*` / `PREALLOC_*` constants).
+    pub flags: u32,
+    /// Sector size for input I/O (typically 65536).
+    pub sector_size: u32,
+
+    /// Non-zero virtual size in `--size` mode (skip source scan).
+    /// Zero means "scan source device".
+    pub virtual_size_override: u64,
+
+    /// qcow2 output cluster size in bytes. 0 = default (65536).
+    pub qcow2_cluster_size: u32,
+    /// qcow2 refcount entry width in bits. 0 = default (16).
+    pub qcow2_refcount_bits: u8,
+    /// vmdk subformat: 0=MonolithicSparse, 1=StreamOptimized, 2=MonolithicFlat.
+    pub vmdk_subformat: u8,
+    /// Reserved padding.
+    pub _pad2: u16,
+    /// vmdk grain size in bytes. 0 = default (65536).
+    pub vmdk_grain_size: u32,
+    /// vhd subformat: 0=Dynamic, 1=Fixed.
+    pub vhd_subformat: u8,
+    /// Reserved padding.
+    pub _pad3: [u8; 3],
+    /// vhd / vhdx block size in bytes. 0 = format default.
+    pub block_size: u32,
+    /// Reserved padding for 8-byte alignment of luks_header_overhead.
+    pub _pad4: u32,
+    /// LUKS-in-qcow2 header overhead in bytes. 0 = no LUKS.
+    pub luks_header_overhead: u64,
+}
+
+impl MeasureConfig {
+    /// Magic value for measure config.
+    pub const MAGIC: u32 = 0x4D454153; // "MEAS"
+
+    /// Flag: write extended-L2 entries in qcow2 output.
+    pub const FLAG_EXTENDED_L2: u32 = 1 << 0;
+    /// Flag: qcow2 lazy refcounts (accepted, no size effect).
+    pub const FLAG_LAZY_REFCOUNTS: u32 = 1 << 1;
+    /// Flag: produce qcow2 v3 (compat 1.1). Default true; clear for v2.
+    pub const FLAG_COMPAT_V3: u32 = 1 << 2;
+    /// Flag: qcow2 compressed output (no size effect, matches qemu-img).
+    pub const FLAG_COMPRESS: u32 = 1 << 3;
+
+    /// Preallocation mode is encoded in flags bits 4-5.
+    pub const PREALLOC_MASK: u32 = 0b11 << 4;
+    pub const PREALLOC_OFF: u32 = 0 << 4;
+    pub const PREALLOC_METADATA: u32 = 1 << 4;
+    pub const PREALLOC_FALLOC: u32 = 2 << 4;
+    pub const PREALLOC_FULL: u32 = 3 << 4;
+
+    /// True if magic matches.
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+
+    /// Extract the preallocation bits from `flags`.
+    pub fn preallocation(&self) -> u32 {
+        self.flags & Self::PREALLOC_MASK
+    }
+}
+
+/// Result structure for the measure operation.
+///
+/// Returned via the `send_measure_result` call table function.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MeasureResult {
+    /// Magic value (`0x4D524553` = "MRES").
+    pub magic: u32,
+    /// Target format echoed back so the host can render the right output.
+    pub target_format: u32,
+    /// Bytes required when only allocated extents are written.
+    pub required: u64,
+    /// Bytes required when every cluster/grain/block is allocated.
+    pub fully_allocated: u64,
+    /// Cluster / grain / block size actually used after resolving defaults
+    /// (host renders this in JSON output where qemu-img varies).
+    /// Zero for raw output (no unit).
+    pub resolved_unit_size: u32,
+    /// Error code: 0 = ok, non-zero mirrors `MeasureError`.
+    pub error: u32,
+}
+
+impl MeasureResult {
+    /// Magic value for measure result.
+    pub const MAGIC: u32 = 0x4D524553; // "MRES"
+
+    pub const ERROR_OK: u32 = 0;
+    pub const ERROR_OVERFLOW: u32 = 1;
+    pub const ERROR_INVALID_OPTION: u32 = 2;
+    pub const ERROR_INVALID_SIZE: u32 = 3;
+
+    /// True if magic matches.
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+}
+
+// ============================================================================
 // Chain configuration structures (for multi-device/backing chain operations)
 // ============================================================================
 
@@ -2204,3 +2355,71 @@ pub unsafe fn verify_sector_sizes(call_table: &CallTable, device_count: usize) -
 ///
 /// Returns: bytes processed (used for completion message)
 pub type OperationEntry = unsafe extern "C" fn() -> u64;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn measure_config_magic_uniqueness() {
+        assert_ne!(MeasureConfig::MAGIC, InfoConfig::MAGIC);
+        assert_ne!(MeasureConfig::MAGIC, CopyConfig::MAGIC);
+        assert_ne!(MeasureConfig::MAGIC, CheckConfig::MAGIC);
+        assert_ne!(MeasureConfig::MAGIC, CompareConfig::MAGIC);
+        assert_ne!(MeasureConfig::MAGIC, ConvertConfig::MAGIC);
+        assert_ne!(MeasureConfig::MAGIC, MeasureResult::MAGIC);
+    }
+
+    #[test]
+    fn measure_result_magic_uniqueness() {
+        assert_ne!(MeasureResult::MAGIC, InfoResult::MAGIC);
+        assert_ne!(MeasureResult::MAGIC, CheckResult::MAGIC);
+        assert_ne!(MeasureResult::MAGIC, CompareResult::MAGIC);
+    }
+
+    #[test]
+    fn measure_config_is_valid() {
+        let mut cfg = MeasureConfig {
+            magic: MeasureConfig::MAGIC,
+            target_format: 0,
+            flags: 0,
+            sector_size: 0,
+            virtual_size_override: 0,
+            qcow2_cluster_size: 0,
+            qcow2_refcount_bits: 0,
+            vmdk_subformat: 0,
+            _pad2: 0,
+            vmdk_grain_size: 0,
+            vhd_subformat: 0,
+            _pad3: [0; 3],
+            block_size: 0,
+            _pad4: 0,
+            luks_header_overhead: 0,
+        };
+        assert!(cfg.is_valid());
+        cfg.magic = 0;
+        assert!(!cfg.is_valid());
+    }
+
+    #[test]
+    fn measure_preallocation_bits() {
+        let cfg = MeasureConfig {
+            magic: MeasureConfig::MAGIC,
+            target_format: 0,
+            flags: MeasureConfig::FLAG_EXTENDED_L2 | MeasureConfig::PREALLOC_FALLOC,
+            sector_size: 0,
+            virtual_size_override: 0,
+            qcow2_cluster_size: 0,
+            qcow2_refcount_bits: 0,
+            vmdk_subformat: 0,
+            _pad2: 0,
+            vmdk_grain_size: 0,
+            vhd_subformat: 0,
+            _pad3: [0; 3],
+            block_size: 0,
+            _pad4: 0,
+            luks_header_overhead: 0,
+        };
+        assert_eq!(cfg.preallocation(), MeasureConfig::PREALLOC_FALLOC);
+    }
+}

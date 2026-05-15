@@ -263,6 +263,13 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
                 cmp.identical, cmp.first_mismatch_offset, cmp.total_bytes_compared, cmp.flags
             )
         }
+        Some(guest_::GuestMessage_::Payload::MeasureResult(m)) => {
+            format!(
+                "measure_result target_format={} required={} fully_allocated={} \
+                resolved_unit_size={} error={}",
+                m.target_format, m.required, m.fully_allocated, m.resolved_unit_size, m.error
+            )
+        }
         None => "empty payload".to_string(),
     };
 

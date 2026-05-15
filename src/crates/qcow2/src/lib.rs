@@ -22,8 +22,8 @@ extern crate alloc;
 ))]
 use shared::COMPRESSED_BUF_SIZE;
 use shared::{
-    be_u32, be_u64, l1_cache_addr, l2_cache_addr, BackingFormat, CallTable, ChainConfig,
-    ImageFormat, MAX_CHAIN_DEVICES, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE,
+    be_u32, be_u64, l1_cache_addr, l2_cache_addr, AllocationSummary, BackingFormat, CallTable,
+    ChainConfig, ImageFormat, MAX_CHAIN_DEVICES, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE,
 };
 #[cfg(feature = "vhd-input")]
 use vhd::{BlockLookup, VhdState};
@@ -120,6 +120,13 @@ pub const QCOW2_VERSION_3: u32 = 3;
 pub const QCOW2_HEADER_LENGTH_V3: u32 = 104;
 /// Default refcount order (4 = 16-bit refcounts)
 pub const QCOW2_DEFAULT_REFCOUNT_ORDER: u32 = 4;
+
+/// Maximum sane `l1_size` (in u64 entries). Matches qemu's
+/// `QCOW_MAX_L1_SIZE = 32 MiB` (= 4 Mi × 8 bytes/entry). Any
+/// header reporting more is either corrupt or hostile; reject
+/// it in `QcowHeader::parse` so downstream `scan_allocation`
+/// loops are bounded by construction.
+pub const QCOW2_MAX_L1_SIZE_ENTRIES: u32 = 4 * 1024 * 1024;
 
 /// Offset of nb_snapshots field in the header
 pub const NB_SNAPSHOTS_OFFSET: usize = 60;
@@ -334,6 +341,13 @@ impl QcowHeader {
 
         let virtual_size = be_u64(header, SIZE_OFFSET);
         let l1_size = be_u32(header, L1_SIZE_OFFSET);
+        // Reject grossly oversized L1 tables. Matches qemu's
+        // QCOW_MAX_L1_SIZE absolute cap. An untrusted image cannot
+        // force the scan_allocation / cluster_lookup loops to walk
+        // an unbounded L1 region.
+        if l1_size > QCOW2_MAX_L1_SIZE_ENTRIES {
+            return None;
+        }
         let l1_table_offset = be_u64(header, L1_TABLE_OFFSET_OFFSET);
         let backing_file_offset = be_u64(header, BACKING_FILE_OFFSET_OFFSET);
         let backing_file_size = be_u32(header, BACKING_FILE_SIZE_OFFSET);
@@ -1001,6 +1015,176 @@ pub struct Qcow2State {
     pub l2_cache_buf: *mut u8,
 }
 
+// ============================================================================
+// Pure allocation-counting helpers (no I/O, no_std)
+// ============================================================================
+
+/// Count allocated source bytes in a standard (non-extended-L2) L2 table
+/// byte slice. Each entry is an 8-byte big-endian u64.
+///
+/// Counting rules (mirroring `Qcow2State::cluster_lookup` for the
+/// non-extended-L2 case):
+/// - `entry == 0` → unallocated (counts as 0).
+/// - `entry != 0` → allocated (counts as `cluster_size`, whether the
+///   entry is a standard or compressed cluster; the measure semantics
+///   are "is there data here", not "how many host bytes does it cost").
+///
+/// `l2_bytes` may have a trailing partial entry; incomplete 8-byte
+/// entries at the tail are ignored. `cluster_size == 0` defensively
+/// returns 0 (the parser rejects such images in `Qcow2State::init`).
+pub fn count_allocated_in_l2_standard(l2_bytes: &[u8], cluster_size: u64) -> u64 {
+    if cluster_size == 0 {
+        return 0;
+    }
+    let allocated = l2_bytes
+        .chunks_exact(8)
+        .filter(|c| u64::from_be_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) != 0)
+        .count() as u64;
+    allocated.saturating_mul(cluster_size)
+}
+
+/// Per-scan tracker for "number of target-aligned units touched by
+/// allocated source data". Walk the source in virtual-offset order
+/// and call [`TargetUnitTracker::observe_allocated`] once per
+/// allocated source extent; the running count is in
+/// [`TargetUnitTracker::target_units_with_data`].
+///
+/// `target_unit_size == 0` disables tracking — every method is a
+/// no-op and the count stays at zero (the legacy
+/// `ceil(allocated_bytes / target_unit_size)` fallback in
+/// `measure_qcow2` etc. is used in that case). See bug #286.
+pub struct TargetUnitTracker {
+    pub target_unit_size: u64,
+    /// Index of the last target unit seen, or `u64::MAX` if none yet.
+    pub last_unit_idx: u64,
+    pub target_units_with_data: u64,
+}
+
+impl TargetUnitTracker {
+    pub fn new(target_unit_size: u64) -> Self {
+        Self {
+            target_unit_size,
+            last_unit_idx: u64::MAX,
+            target_units_with_data: 0,
+        }
+    }
+
+    /// Note that the byte range `[virtual_offset, virtual_offset+len)`
+    /// contains allocated source data. Adds the count of target units
+    /// that range covers but which haven't been seen before. Caller
+    /// must walk the source in non-decreasing virtual-offset order.
+    pub fn observe_allocated(&mut self, virtual_offset: u64, len: u64) {
+        if self.target_unit_size == 0 || len == 0 {
+            return;
+        }
+        let unit = self.target_unit_size;
+        let first = virtual_offset / unit;
+        let last = virtual_offset.saturating_add(len - 1) / unit;
+        let new_units = if self.last_unit_idx == u64::MAX || first > self.last_unit_idx {
+            last - first + 1
+        } else {
+            last.saturating_sub(self.last_unit_idx)
+        };
+        self.target_units_with_data = self.target_units_with_data.saturating_add(new_units);
+        if last > self.last_unit_idx || self.last_unit_idx == u64::MAX {
+            self.last_unit_idx = last;
+        }
+    }
+}
+
+/// Like [`count_allocated_in_l2_standard`] but also feeds each
+/// allocated entry's virtual range into `tracker`, so the scan can
+/// count target units touched without a second pass.
+///
+/// `base_virtual_offset` is the virtual address covered by the first
+/// entry in `l2_bytes`.
+pub fn walk_l2_standard(
+    l2_bytes: &[u8],
+    cluster_size: u64,
+    base_virtual_offset: u64,
+    tracker: &mut TargetUnitTracker,
+) -> u64 {
+    if cluster_size == 0 {
+        return 0;
+    }
+    let mut allocated_bytes: u64 = 0;
+    for (i, chunk) in l2_bytes.chunks_exact(8).enumerate() {
+        let entry = u64::from_be_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ]);
+        if entry == 0 {
+            continue;
+        }
+        allocated_bytes = allocated_bytes.saturating_add(cluster_size);
+        let v = base_virtual_offset.saturating_add((i as u64).saturating_mul(cluster_size));
+        tracker.observe_allocated(v, cluster_size);
+    }
+    allocated_bytes
+}
+
+/// Count allocated source bytes in an extended-L2 (16-byte entry) L2
+/// table byte slice. Each entry is two big-endian u64s: `l2_entry`
+/// followed by `sc_bitmap`.
+///
+/// Subcluster bitmap layout (32 subclusters per cluster):
+/// - `alloc_bits = sc_bitmap as u32`
+/// - `zero_bits  = (sc_bitmap >> 32) as u32`
+///
+/// Counting rules (mirroring `Qcow2State::cluster_lookup` for the
+/// extended-L2 case):
+/// - `l2_entry == 0` and `(sc_bitmap >> 32) == 0` → unallocated (0).
+/// - `l2_entry == 0` with any `zero_bits` set → logically zero (0).
+/// - `l2_entry & OFLAG_COMPRESSED != 0` → allocated, counts as
+///   `cluster_size` (compressed clusters carry one full cluster's
+///   worth of decompressed data; see PLAN open-question 1).
+/// - `l2_entry != 0` (standard, non-compressed):
+///     - `alloc_bits == 0xFFFF_FFFF && zero_bits == 0` → counts as
+///       `cluster_size` (whole cluster allocated, matches
+///       `ClusterLookup::Standard`).
+///     - otherwise → counts as
+///       `popcount(alloc_bits) * (cluster_size / 32)`.
+///
+/// `l2_bytes` may have a trailing partial entry; incomplete 16-byte
+/// pairs at the tail are ignored. `cluster_size == 0` defensively
+/// returns 0 (the parser rejects such images in `Qcow2State::init`).
+pub fn count_allocated_in_l2_extended(l2_bytes: &[u8], cluster_size: u64) -> u64 {
+    if cluster_size == 0 {
+        return 0;
+    }
+    let subcluster_size = cluster_size / 32;
+    let mut total: u64 = 0;
+    for chunk in l2_bytes.chunks_exact(16) {
+        let l2_entry = u64::from_be_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ]);
+        let sc_bitmap = u64::from_be_bytes([
+            chunk[8], chunk[9], chunk[10], chunk[11], chunk[12], chunk[13], chunk[14], chunk[15],
+        ]);
+
+        if l2_entry == 0 {
+            // l2_entry==0 is unallocated regardless of zero_bits — zero
+            // subclusters consume no source bytes (logically zero).
+            continue;
+        }
+
+        if (l2_entry & OFLAG_COMPRESSED) != 0 {
+            // Compressed cluster counts as one full cluster's worth.
+            total = total.saturating_add(cluster_size);
+            continue;
+        }
+
+        let alloc_bits = sc_bitmap as u32;
+        let zero_bits = (sc_bitmap >> 32) as u32;
+        if alloc_bits == 0xFFFF_FFFF && zero_bits == 0 {
+            total = total.saturating_add(cluster_size);
+        } else {
+            let popcount = alloc_bits.count_ones() as u64;
+            total = total.saturating_add(popcount.saturating_mul(subcluster_size));
+        }
+    }
+    total
+}
+
 impl Qcow2State {
     /// Return the bitmask of incompatible features that are set but
     /// not in `supported_mask`. Returns 0 if all set features are
@@ -1404,6 +1588,162 @@ impl Qcow2State {
                 Some(ClusterLookup::Standard(host_offset))
             }
         }
+    }
+
+    /// Walk the L1 / L2 tables and produce an `AllocationSummary` for
+    /// the active image.
+    ///
+    /// Reports allocations in the top layer only; backing-chain
+    /// composition (shadowing across layers) is the caller's
+    /// responsibility (see phase 3 host code in `PLAN-measure.md`).
+    ///
+    /// `virtual_size` must be supplied by the caller because
+    /// `Qcow2State` does not store it.
+    ///
+    /// For each non-zero L1 entry, the L2 table at the masked host
+    /// offset is read in `MAX_SECTOR_SIZE`-aligned chunks and counted
+    /// via `count_allocated_in_l2_standard` or
+    /// `count_allocated_in_l2_extended` depending on
+    /// `self.extended_l2`. The per-chunk byte slice is always an
+    /// entry-aligned multiple (8 divides every sector size we
+    /// support, and 16 divides `MAX_SECTOR_SIZE = 65536`), so the
+    /// pure helpers always see whole entries.
+    ///
+    /// # Safety
+    ///
+    /// `call_table` must be valid. `l1_cache_buf` and `l2_cache_buf`
+    /// must still be valid and each point to at least
+    /// `MAX_SECTOR_SIZE` writable bytes.
+    pub unsafe fn scan_allocation(
+        &mut self,
+        call_table: &CallTable,
+        sector_size: usize,
+        input_capacity: u64,
+        virtual_size: u64,
+        target_unit_size: u64,
+        bytes_read: &mut u64,
+    ) -> Option<AllocationSummary> {
+        let cluster_size = self.cluster_size;
+        let extended_l2 = self.extended_l2;
+        let l1_size = self.l1_size as u64;
+        let l1_table_offset = self.l1_table_offset;
+
+        let mut allocated_bytes: u64 = 0;
+        // Target-unit tracker. Only meaningful for the standard-L2
+        // walk path; extended L2 leaves the tracker untouched and
+        // `target_units_with_data` ends up at 0, which makes
+        // `measure_*` fall back to the legacy approximation. See
+        // bug #286 for the standard-L2 fix; extended-L2 target-aware
+        // accounting is tracked as follow-up.
+        let mut tracker = TargetUnitTracker::new(if extended_l2 { 0 } else { target_unit_size });
+        // Virtual address covered by one L2 table (entries_per_l2 *
+        // cluster_size). Bytes 0..l2_coverage of the source virtual
+        // address space map to L1 entry 0, l2_coverage..2*l2_coverage
+        // to L1 entry 1, and so on.
+        let entries_per_l2: u64 = cluster_size / if extended_l2 { 16 } else { 8 };
+        let l2_coverage = cluster_size.checked_mul(entries_per_l2)?;
+
+        for l1_index in 0..l1_size {
+            let l1_byte_offset = l1_table_offset.checked_add(l1_index.checked_mul(8)?)?;
+            let l1_entry = read_u64_be_cached(
+                call_table,
+                self.device_idx,
+                l1_byte_offset,
+                sector_size,
+                input_capacity,
+                &mut self.l1_cached_sector,
+                self.l1_cache_buf,
+                bytes_read,
+            )?;
+
+            let l2_table_offset = l1_entry & L2_OFFSET_MASK;
+            if l2_table_offset == 0 {
+                // L2 table not allocated; all clusters in its
+                // coverage range are unallocated.
+                continue;
+            }
+
+            // Walk the L2 table (cluster_size bytes) in sector-sized
+            // chunks. The L2 cache is per-sector, so invalidate it
+            // before each new L2 so the cached_sector tracker doesn't
+            // serve a stale sector from a previous L2.
+            self.l2_cached_sector = u64::MAX;
+
+            let l2_end_byte = l2_table_offset.checked_add(cluster_size)?;
+            let l2_start_sector = l2_table_offset / sector_size as u64;
+            let l2_end_sector =
+                l2_end_byte.checked_add(sector_size as u64 - 1)? / sector_size as u64;
+
+            let mut l2_bytes_consumed: u64 = 0;
+
+            let mut sector = l2_start_sector;
+            while sector < l2_end_sector {
+                if sector >= input_capacity {
+                    return None;
+                }
+                if !(call_table.read_input_sector)(
+                    self.device_idx,
+                    sector,
+                    self.l2_cache_buf,
+                    sector_size,
+                ) {
+                    return None;
+                }
+                *bytes_read += sector_size as u64;
+                self.l2_cached_sector = sector;
+
+                let sector_byte_start = sector * sector_size as u64;
+                let buf_start = if sector_byte_start < l2_table_offset {
+                    (l2_table_offset - sector_byte_start) as usize
+                } else {
+                    0
+                };
+                let buf_end =
+                    sector_size.min((l2_end_byte.saturating_sub(sector_byte_start)) as usize);
+                if buf_end <= buf_start {
+                    sector += 1;
+                    continue;
+                }
+
+                let chunk = core::slice::from_raw_parts(
+                    self.l2_cache_buf.add(buf_start),
+                    buf_end - buf_start,
+                );
+
+                // Clamp to the L2 table's remaining meaningful bytes
+                // (ignore any sector-padding tail at the end).
+                let meaningful_len =
+                    (cluster_size - l2_bytes_consumed).min((buf_end - buf_start) as u64) as usize;
+                let meaningful = &chunk[..meaningful_len];
+
+                // Virtual offset covered by the first entry of `meaningful`:
+                // each L1 entry maps a contiguous `l2_coverage` range, and
+                // within that range, the n-th 8-byte L2 entry covers
+                // `n * cluster_size` of virtual space. `l2_bytes_consumed`
+                // counts the L2-table bytes we've already walked, so its
+                // entry-stride equivalent times `cluster_size` is the
+                // offset of the first entry in this chunk.
+                let entry_size_bytes: u64 = if extended_l2 { 16 } else { 8 };
+                let base_virtual_offset = l1_index.saturating_mul(l2_coverage).saturating_add(
+                    (l2_bytes_consumed / entry_size_bytes).saturating_mul(cluster_size),
+                );
+
+                allocated_bytes = allocated_bytes.saturating_add(if extended_l2 {
+                    count_allocated_in_l2_extended(meaningful, cluster_size)
+                } else {
+                    walk_l2_standard(meaningful, cluster_size, base_virtual_offset, &mut tracker)
+                });
+
+                l2_bytes_consumed += meaningful_len as u64;
+                sector += 1;
+            }
+        }
+
+        Some(AllocationSummary {
+            virtual_size,
+            allocated_bytes,
+            target_units_with_data: tracker.target_units_with_data,
+        })
     }
 }
 
@@ -1835,6 +2175,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_oversized_l1() {
+        // Header claims l1_size = 4 * 1024 * 1024 + 1 entries, exceeding
+        // the absolute QCOW2_MAX_L1_SIZE_ENTRIES cap.
+        let mut buf = make_qcow2_header();
+        let bad_l1 = QCOW2_MAX_L1_SIZE_ENTRIES + 1;
+        buf[L1_SIZE_OFFSET..L1_SIZE_OFFSET + 4].copy_from_slice(&bad_l1.to_be_bytes());
+        assert!(QcowHeader::parse(&buf).is_none());
+    }
+
+    #[test]
+    fn parse_accepts_l1_at_cap() {
+        // Boundary: exactly QCOW2_MAX_L1_SIZE_ENTRIES is accepted.
+        let mut buf = make_qcow2_header();
+        buf[L1_SIZE_OFFSET..L1_SIZE_OFFSET + 4]
+            .copy_from_slice(&QCOW2_MAX_L1_SIZE_ENTRIES.to_be_bytes());
+        let hdr = QcowHeader::parse(&buf).unwrap();
+        assert_eq!(hdr.l1_size, QCOW2_MAX_L1_SIZE_ENTRIES);
+    }
+
+    #[test]
     fn parse_valid_v2_header() {
         let mut buf = make_qcow2_header();
         buf[VERSION_OFFSET..VERSION_OFFSET + 4].copy_from_slice(&2u32.to_be_bytes());
@@ -2151,6 +2511,283 @@ mod tests {
             validate_subcluster_bitmap(true, 0, bitmap),
             SubclusterBitmapStatus::CompressedNonZero,
         );
+    }
+
+    // ---- count_allocated_in_l2_standard ----
+
+    /// Write a u64-be entry into `buf` at entry index `i`.
+    fn put_std_entry(buf: &mut [u8], i: usize, entry: u64) {
+        buf[i * 8..i * 8 + 8].copy_from_slice(&entry.to_be_bytes());
+    }
+
+    /// Write an extended-L2 pair (l2_entry, sc_bitmap) at index `i`.
+    fn put_ext_entry(buf: &mut [u8], i: usize, l2_entry: u64, sc_bitmap: u64) {
+        buf[i * 16..i * 16 + 8].copy_from_slice(&l2_entry.to_be_bytes());
+        buf[i * 16 + 8..i * 16 + 16].copy_from_slice(&sc_bitmap.to_be_bytes());
+    }
+
+    #[test]
+    fn count_l2_standard_empty_slice() {
+        assert_eq!(count_allocated_in_l2_standard(&[], 65536), 0);
+    }
+
+    #[test]
+    fn count_l2_standard_all_zero_entries() {
+        let buf = [0u8; 64]; // 8 entries, all zero
+        assert_eq!(count_allocated_in_l2_standard(&buf, 65536), 0);
+    }
+
+    #[test]
+    fn count_l2_standard_three_of_four_allocated() {
+        // cluster_size = 64 KiB; 3 of 4 entries allocated → 3 * 65536.
+        let mut buf = [0u8; 32];
+        put_std_entry(&mut buf, 0, 0x50000);
+        put_std_entry(&mut buf, 1, 0);
+        put_std_entry(&mut buf, 2, 0x60000);
+        put_std_entry(&mut buf, 3, 0x70000);
+        assert_eq!(count_allocated_in_l2_standard(&buf, 65536), 3 * 65536);
+    }
+
+    #[test]
+    fn count_l2_standard_compressed_entry_counts_as_allocated() {
+        // OFLAG_COMPRESSED set; the standard helper treats any non-zero
+        // entry as allocated (mirrors `cluster_lookup`'s Compressed
+        // branch, which is also "data here").
+        let mut buf = [0u8; 8];
+        put_std_entry(&mut buf, 0, OFLAG_COMPRESSED | 0xDEAD);
+        assert_eq!(count_allocated_in_l2_standard(&buf, 65536), 65536);
+    }
+
+    #[test]
+    fn count_l2_standard_cluster_size_512() {
+        // Boundary: small but legal cluster_size. 1 entry × 512.
+        let mut buf = [0u8; 8];
+        put_std_entry(&mut buf, 0, 0x1000);
+        assert_eq!(count_allocated_in_l2_standard(&buf, 512), 512);
+    }
+
+    #[test]
+    fn count_l2_standard_cluster_size_2mib() {
+        // Boundary: maximum cluster_size, single allocated entry.
+        let mut buf = [0u8; 8];
+        put_std_entry(&mut buf, 0, 0x80000);
+        assert_eq!(
+            count_allocated_in_l2_standard(&buf, 2 * 1024 * 1024),
+            2 * 1024 * 1024,
+        );
+    }
+
+    #[test]
+    fn count_l2_standard_trailing_partial_entry_ignored() {
+        // 1 complete 8-byte entry (allocated) + 1 zero entry +
+        // 1 byte tail — the tail must be ignored.
+        let mut buf = [0u8; 17];
+        put_std_entry(&mut buf, 0, 0x1234);
+        // entry 1 stays zero
+        buf[16] = 0xAB; // partial tail — must be dropped
+        assert_eq!(count_allocated_in_l2_standard(&buf, 65536), 65536);
+    }
+
+    #[test]
+    fn count_l2_standard_zero_cluster_size_defensive() {
+        let mut buf = [0u8; 16];
+        put_std_entry(&mut buf, 0, 0x1234);
+        put_std_entry(&mut buf, 1, 0x5678);
+        assert_eq!(count_allocated_in_l2_standard(&buf, 0), 0);
+    }
+
+    // ---- count_allocated_in_l2_extended ----
+
+    #[test]
+    fn count_l2_extended_empty_slice() {
+        assert_eq!(count_allocated_in_l2_extended(&[], 65536), 0);
+    }
+
+    #[test]
+    fn count_l2_extended_all_zero_entries() {
+        // 3 pairs, all l2_entry=0, sc_bitmap=0 → unallocated.
+        let buf = [0u8; 48];
+        assert_eq!(count_allocated_in_l2_extended(&buf, 65536), 0);
+    }
+
+    #[test]
+    fn count_l2_extended_zero_entry_with_all_zero_subclusters() {
+        // l2_entry=0, alloc_bits=0, zero_bits=0xFFFF_FFFF → all
+        // explicit zero subclusters. Source-byte count is 0 (logically
+        // zero, no host bytes).
+        let bitmap: u64 = (0xFFFF_FFFFu64) << 32;
+        let mut buf = [0u8; 16];
+        put_ext_entry(&mut buf, 0, 0, bitmap);
+        assert_eq!(count_allocated_in_l2_extended(&buf, 65536), 0);
+    }
+
+    #[test]
+    fn count_l2_extended_full_subcluster_alloc_counts_as_cluster() {
+        // alloc_bits = 0xFFFF_FFFF, zero_bits = 0 → whole cluster.
+        let bitmap: u64 = 0x0000_0000_FFFF_FFFF;
+        let mut buf = [0u8; 16];
+        put_ext_entry(&mut buf, 0, 0x50000, bitmap);
+        assert_eq!(count_allocated_in_l2_extended(&buf, 65536), 65536);
+    }
+
+    #[test]
+    fn count_l2_extended_partial_subcluster_alloc() {
+        // alloc_bits = 0x0000_00FF (8 subclusters set) with
+        // cluster_size = 65536 → subcluster_size = 2048. Expected:
+        // 8 * 2048 = 16384.
+        let bitmap: u64 = 0x0000_0000_0000_00FF;
+        let mut buf = [0u8; 16];
+        put_ext_entry(&mut buf, 0, 0x50000, bitmap);
+        assert_eq!(count_allocated_in_l2_extended(&buf, 65536), 8 * 2048);
+    }
+
+    #[test]
+    fn count_l2_extended_compressed_entry_counts_as_cluster() {
+        // OFLAG_COMPRESSED set → counts as full cluster regardless of
+        // bitmap (compressed entries carry whole-cluster data).
+        let mut buf = [0u8; 16];
+        put_ext_entry(&mut buf, 0, OFLAG_COMPRESSED | 0xDEAD, 0);
+        assert_eq!(count_allocated_in_l2_extended(&buf, 65536), 65536);
+    }
+
+    #[test]
+    fn count_l2_extended_mixed_entries() {
+        // Four entries: unallocated, fully allocated, partial (4 sc),
+        // compressed.
+        let full: u64 = 0x0000_0000_FFFF_FFFF;
+        let partial: u64 = 0x0000_0000_0000_000F; // 4 subclusters
+        let mut buf = [0u8; 64];
+        put_ext_entry(&mut buf, 0, 0, 0);
+        put_ext_entry(&mut buf, 1, 0x10000, full);
+        put_ext_entry(&mut buf, 2, 0x20000, partial);
+        put_ext_entry(&mut buf, 3, OFLAG_COMPRESSED | 0xCAFE, 0);
+        // 0 + 65536 + (4 * 2048) + 65536 = 139264.
+        assert_eq!(
+            count_allocated_in_l2_extended(&buf, 65536),
+            65536 + 4 * 2048 + 65536,
+        );
+    }
+
+    #[test]
+    fn count_l2_extended_partial_with_cluster_size_2mib() {
+        // 2 MiB cluster, subcluster_size = 65536. alloc_bits with 16
+        // bits set → 16 * 65536 = 1 MiB.
+        let bitmap: u64 = 0x0000_0000_0000_FFFF;
+        let mut buf = [0u8; 16];
+        put_ext_entry(&mut buf, 0, 0x100000, bitmap);
+        assert_eq!(
+            count_allocated_in_l2_extended(&buf, 2 * 1024 * 1024),
+            16 * 65536,
+        );
+    }
+
+    #[test]
+    fn count_l2_extended_trailing_partial_pair_ignored() {
+        // One complete 16-byte pair (fully allocated) plus a 2-byte
+        // tail — the tail must be ignored.
+        let full: u64 = 0x0000_0000_FFFF_FFFF;
+        let mut buf = [0u8; 18];
+        put_ext_entry(&mut buf, 0, 0x50000, full);
+        buf[16] = 0xAB; // partial tail
+        buf[17] = 0xCD;
+        assert_eq!(count_allocated_in_l2_extended(&buf, 65536), 65536);
+    }
+
+    #[test]
+    fn count_l2_extended_zero_cluster_size_defensive() {
+        let full: u64 = 0x0000_0000_FFFF_FFFF;
+        let mut buf = [0u8; 16];
+        put_ext_entry(&mut buf, 0, 0x50000, full);
+        assert_eq!(count_allocated_in_l2_extended(&buf, 0), 0);
+    }
+
+    #[test]
+    fn count_l2_extended_zero_entry_with_partial_zero_bits() {
+        // l2_entry == 0 with some zero_bits set (and alloc_bits == 0):
+        // matches the "StandardSubclusters(0, bitmap)" cluster_lookup
+        // branch — but logically zero, so 0 source bytes.
+        let bitmap: u64 = 0x0000_FFFF_0000_0000; // 16 zero subclusters
+        let mut buf = [0u8; 16];
+        put_ext_entry(&mut buf, 0, 0, bitmap);
+        assert_eq!(count_allocated_in_l2_extended(&buf, 65536), 0);
+    }
+
+    // ---- TargetUnitTracker / walk_l2_standard (bug #286) ----
+
+    #[test]
+    fn tracker_disabled_when_unit_size_zero() {
+        let mut t = TargetUnitTracker::new(0);
+        t.observe_allocated(0, 4096);
+        t.observe_allocated(4096, 4096);
+        assert_eq!(t.target_units_with_data, 0);
+    }
+
+    #[test]
+    fn tracker_counts_distinct_target_units() {
+        // Two source clusters at offsets 8192 and 65536, target 64K.
+        // Reproduces the qcow2-source half of the seed-37 failure
+        // described in issue #286: each falls in a different target
+        // cluster, so the count is 2 (not the 1 you would get from
+        // ceil_div(8192, 65536)).
+        let mut t = TargetUnitTracker::new(65536);
+        t.observe_allocated(8192, 4096);
+        t.observe_allocated(65536, 4096);
+        assert_eq!(t.target_units_with_data, 2);
+    }
+
+    #[test]
+    fn tracker_does_not_double_count_within_one_target_unit() {
+        // Two adjacent 4K source clusters in the same 64K target unit.
+        let mut t = TargetUnitTracker::new(65536);
+        t.observe_allocated(0, 4096);
+        t.observe_allocated(4096, 4096);
+        assert_eq!(t.target_units_with_data, 1);
+    }
+
+    #[test]
+    fn tracker_counts_partial_overlap_into_next_target_unit() {
+        // One large source extent that straddles a target boundary.
+        let mut t = TargetUnitTracker::new(65536);
+        t.observe_allocated(60000, 10000); // crosses 65536
+        assert_eq!(t.target_units_with_data, 2);
+    }
+
+    #[test]
+    fn tracker_handles_target_smaller_than_source() {
+        // Target unit smaller than source: each 64K source cluster
+        // spans 16 target 4K units.
+        let mut t = TargetUnitTracker::new(4096);
+        t.observe_allocated(0, 65536);
+        assert_eq!(t.target_units_with_data, 16);
+    }
+
+    #[test]
+    fn walk_l2_standard_records_target_units() {
+        // L2 with 3 non-zero entries at index 0, 16, 17 (cluster_size 4K,
+        // target unit 64K → entry 0 → unit 0; entries 16,17 → unit 1).
+        let mut buf = [0u8; 64 * 8];
+        put_std_entry(&mut buf, 0, 0x1);
+        put_std_entry(&mut buf, 16, 0x2);
+        put_std_entry(&mut buf, 17, 0x3);
+        let mut t = TargetUnitTracker::new(65536);
+        let allocated = walk_l2_standard(&buf, 4096, 0, &mut t);
+        assert_eq!(allocated, 3 * 4096);
+        // Entry 0 covers virtual [0, 4096) → unit 0.
+        // Entry 16 covers virtual [65536, 69632) → unit 1.
+        // Entry 17 covers virtual [69632, 73728) → unit 1 (same as prev).
+        assert_eq!(t.target_units_with_data, 2);
+    }
+
+    #[test]
+    fn walk_l2_standard_with_base_offset() {
+        // Same buffer but starting at an L1-offset of 1 GiB. The base
+        // offset must shift the per-entry virtual ranges.
+        let mut buf = [0u8; 8 * 8];
+        put_std_entry(&mut buf, 0, 0x1);
+        let mut t = TargetUnitTracker::new(65536);
+        let _ = walk_l2_standard(&buf, 4096, 1 << 30, &mut t);
+        // After the call, last_unit_idx should reflect the high offset.
+        assert_eq!(t.last_unit_idx, (1u64 << 30) / 65536);
     }
 }
 

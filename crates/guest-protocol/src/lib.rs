@@ -567,6 +567,37 @@ pub fn compare_result_message(
     msg
 }
 
+/// Helper to create a measure result message.
+///
+/// # Arguments
+///
+/// * `target_format` - Target output format name (echoed back to host)
+/// * `required` - Bytes required when only allocated extents are written
+/// * `fully_allocated` - Bytes required when every cluster/grain/block
+///   is allocated
+/// * `resolved_unit_size` - Cluster / grain / block size used; 0 for raw
+/// * `error` - 0 = ok, non-zero mirrors MeasureResult::ERROR_* in shared
+pub fn measure_result_message(
+    target_format: &str,
+    required: u64,
+    fully_allocated: u64,
+    resolved_unit_size: u32,
+    error: u32,
+) -> guest_::GuestMessage {
+    let mut msg = guest_::GuestMessage::default();
+    msg.level = guest_::Level::Info;
+
+    let mut result = guest_::MeasureResultMessage::default();
+    push_str(&mut result.target_format, target_format);
+    result.required = required;
+    result.fully_allocated = fully_allocated;
+    result.resolved_unit_size = resolved_unit_size;
+    result.error = error;
+
+    msg.payload = Some(guest_::GuestMessage_::Payload::MeasureResult(result));
+    msg
+}
+
 // =============================================================================
 // VMM -> Guest configuration message support
 // =============================================================================

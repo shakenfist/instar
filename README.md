@@ -27,7 +27,7 @@ Initial target formats:
 
 **Initial implementation** - The `info` prototype has been promoted to the main
 instar implementation in `src/`. Operations include `info`, `copy`, `check`,
-`compare`, and `convert`. Prototypes remain available for reference.
+`compare`, `convert`, and `measure`. Prototypes remain available for reference.
 
 ## Installation
 

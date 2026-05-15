@@ -160,15 +160,23 @@ provides a modular architecture with:
   1/2/4/8/16/32/64-bit), compressed L2 entry parsing, backing file
   extraction, header extension parsing, incompatible feature bit
   validation. Supports cluster sizes from 512B to 2MB (cluster_bits
-  9-21). Used by info, check, compare, and convert operations.
+  9-21). Used by info, check, compare, convert, and measure
+  operations. Also exposes `Qcow2State::scan_allocation` plus the
+  pure helpers `count_allocated_in_l2_standard` /
+  `count_allocated_in_l2_extended` to produce a
+  `shared::AllocationSummary` consumed by the `measure` subcommand.
 - **crates/raw/** - Shared RAW format crate: MBR/GPT partition table
-  detection. Used by info operation.
+  detection. Used by info operation. Also exposes a trivial
+  `scan_allocation` (allocated_bytes == virtual_size) for the measure
+  subcommand.
 - **crates/vmdk/** - Shared VMDK format crate: VMDK4 binary header parsing
   (basic and full), descriptor I/O and text parsing, grain directory/table
   reading with sector-cached lookups, streamOptimized footer reading,
   grain marker handling, and write helpers for monolithicSparse and
   streamOptimized output. Used by info, check, convert, and compare
-  operations.
+  operations. Also exposes `VmdkState::scan_allocation` plus
+  `count_populated_gd_entries` / `count_allocated_in_gt` for the measure
+  subcommand.
 - **crates/vhd/** - Shared VHD/VPC format crate: footer parsing and
   validation (conectix cookie, CHS geometry, disk type), dynamic header
   parsing (cxsparse cookie, BAT offset, block size), BAT reading with
@@ -177,19 +185,34 @@ provides a modular architecture with:
   (`read_offset_sectors` for VHD data spanning device sector boundaries),
   and write helpers (build_footer, build_dynamic_header,
   compute_vhd_geometry). Used by info, check, convert, and compare
-  operations.
+  operations. Also exposes `VhdState::scan_allocation` plus the pure
+  helper `count_allocated_in_bat` for the measure subcommand.
 - **crates/vhdx/** - Shared VHDX format crate: CRC-32C (Castagnoli)
   checksum implementation, dual header parsing with sequence number
   selection, region table parsing with CRC validation, GUID-based
   metadata item lookup, 64-bit BAT reading with interleaved sector
   bitmap entry handling, VhdxState for stateful block I/O, and output
   builders (file identifier, headers, region table, metadata, BAT
-  entries). Used by check, convert, and compare operations.
+  entries). Used by check, convert, and compare operations. Also
+  exposes `VhdxState::scan_allocation` plus `count_allocated_in_bat`
+  (which handles the chunk_ratio bitmap interleaving) for the measure
+  subcommand.
 - **crates/luks/** - Shared LUKS format crate: LUKS v1/v2 header
   constants, header parsing, PBKDF2 key derivation, Argon2id key
   derivation (behind `kdf-argon2` feature), AFsplitter key recovery,
   master key verification, and AES-XTS payload decryption (behind
   `decrypt` feature). Used by info and convert operations.
+- **crates/measure/** - Shared size-calculator crate (`no_std`, no I/O):
+  per-output-format estimators (raw / qcow2 / vmdk / vhd / vhdx) for the
+  `required` and `fully-allocated` byte counts that `qemu-img measure`
+  emits. The qcow2 estimator matches qemu-img's worst-case sizing
+  semantics (L2 tables sized for the full virtual range; refcount layout
+  sized once for the fully-allocated cluster count and reused for the
+  sparse case). `AllocationSummary` has been moved to `crates/shared` so
+  format crates can produce it without depending on `measure`; a
+  back-compat re-export remains in this crate. Consumed by the
+  `measure` operation in `src/operations/measure/`; intended for
+  later reuse by `create` / `resize` once those subcommands ship.
 - **operations/info/** - Format detection operation
 - **operations/copy/** - File copy operation
 - **operations/check/** - Image integrity validation operation (with
@@ -221,11 +244,41 @@ provides a modular architecture with:
   writer emits dynamic VHDX with configurable block size (1MB-256MB
   via `--block-size`, default 32MB), 1MB-aligned structures, CRC-32C
   checksums, and BAT rewriting.
+- **operations/measure/** - Image-size measurement operation. Predicts
+  `required` (sparse, holes skipped) and `fully-allocated` (every
+  cluster/grain/block written) byte counts for a target output format.
+  Supported targets: raw, qcow2, vmdk, vpc (VHD), vhdx. For raw and
+  qcow2 targets the host CLI's output (human and `--output=json`)
+  matches `qemu-img measure` byte-for-byte; vmdk, vpc, and vhdx are
+  instar-only because `qemu-img measure` does not support them. CLI
+  flags mirror qemu-img (`--size SIZE | FILENAME`, `-O target-format`,
+  `-f source-format`, `--output {human,json}`) plus per-target options
+  as individual flags (`--cluster-size`, `--refcount-bits`,
+  `--extended-l2`, `--compat`, `--preallocation`, `--subformat`,
+  `--grain-size`, `--block-size`). Accepts both individual flags and
+  `-o key=value,...` (qemu-img parity); `-o` values override individual
+  flags when both are given.
+  Single-source-device only; backing-chain composition and VMDK
+  monolithicFlat sources are deferred. Integration tests in
+  `tests/test_measure.py` cross-validate `instar measure` against
+  the `qemu-img measure` baselines in
+  `instar-testdata/expected-outputs/measure-*` for every safe-tier
+  image and every curated `--size` case, plus round-trip the
+  vmdk / vpc / vhdx outputs through `instar convert` to verify the
+  predicted size bounds. Known scanner-divergence cases (raw
+  SEEK_HOLE detection, qcow2/vhdx/vmdk overcounts on some real-world
+  images, VHD CHS rounding) are skipped with documented reasons
+  pending follow-up work.
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation,
   centralized byte-order helpers: `be_u16/32/64`, `le_u16/32/64`,
-  `write_be_u16/32/64`, `write_le_u16/32/64`)
+  `write_be_u16/32/64`, `write_le_u16/32/64`). Also defines
+  `AllocationSummary`, the common result type produced by each format
+  crate's `scan_allocation` function and consumed by the `measure`
+  subcommand. `MeasureConfig` and `MeasureResult` structs carry
+  options and results across OPERATION_CONFIG_ADDR and the
+  `send_measure_result` CallTable callback (CallTable VERSION 14).
 
 **Chain validation in check (`--chain`):**
 The check operation supports an optional `--chain` flag that uses the host-side
@@ -273,6 +326,10 @@ See [docs/chain-config.md](docs/chain-config.md) for the chain config
 structure layout and VMM-to-guest data flow.
 
 ## Format Support
+
+**Measurable target formats**: raw, qcow2 (qemu-img-parity),
+vmdk, vpc (VHD), vhdx (instar-only — qemu-img does not
+implement `measure` for these targets).
 
 ### qcow2
 
@@ -411,6 +468,23 @@ and `../instar-testdata/custom/audit/` (adversarial images).
 The test manifest (`tests/manifest.json`) references them with
 `generated_by` and `skip_qemu_img: true`.
 
+### Cross-version qemu-img baselines
+
+`instar-testdata` ships a per-qemu-version baseline matrix
+generated by `make baselines-info` / `make baselines-check` /
+`make baselines-measure` (and aggregated via `make baselines`).
+Each command writes recorded stdout / stderr / exit-code triples
+to `expected-outputs/<output-type>/[bucket/]<version>/<image-id>.{stdout,
+stderr,meta.json}`, then `make profiles` deduplicates them into
+profile buckets via `scripts/detect-profiles.py`. instar's
+integration tests select the matching baseline for the locally
+installed qemu-img version. Currently 80 versions are covered
+(6.0.0 through 10.2.0). The measure baselines additionally use
+a `_size/` pseudo-bucket for `--size`-mode invocations that have
+no source image, and a `__<target>` suffix on source-image
+filenames to record both `-O raw` and `-O qcow2` measurements
+of the same image.
+
 ## oslo.utils Cross-Validation
 
 `tests/test_oslo_crossval.py` runs both instar and oslo.utils
@@ -431,10 +505,21 @@ For each iteration it:
    cluster size, compression, and data patterns).
 2. Creates separate copies for instar and qemu-img.
 3. Runs a random chain of 2-4 operations (info, check, convert, compressed
-   convert) against both tools.
+   convert, measure) against both tools.
 4. Compares outputs: exit codes, JSON info output (after normalisation to
    remove known-divergent fields like disk size), and converted file content
    (via SHA-256 of raw-flattened output).
+
+The `measure` operation uses two oracles depending on target. For
+`raw` and `qcow2` targets, the fuzzer parses both `instar measure
+--output=json` and `qemu-img measure --output=json` outputs and
+compares the numeric `required`, `fully-allocated`, and `bitmaps`
+fields. For `vmdk`, `vpc`, and `vhdx` targets (which qemu-img
+measure does not support), it asserts a self-consistency bound:
+`instar convert -O <target>` output file size must lie at or below
+`fully_allocated + cushion`, with the cushion scaled to absorb
+the convert writer's per-block sector alignment slack
+(`max(1 MiB, fully_allocated / 16)`).
 
 Known quirks (see `docs/quirks.md`) are excluded from comparison: non-QCOW2
 formats for `check` (qemu-img only checks QCOW2), disk size fields, and
@@ -471,10 +556,12 @@ A mock `CallTable` (in `src/fuzz/src/lib.rs`) backed by thread-local
 fuzzer input provides sector-based I/O, allowing libFuzzer to explore
 deeply malformed inputs.
 
-13 fuzz targets cover all parser crates: format detection, header
+15 fuzz targets cover all parser crates: format detection, header
 parsing (QCOW2, VMDK, VHD, VHDX, RAW, LUKS), L1/L2 cluster lookup,
 refcount table traversal, zlib decompression, grain directory lookup,
-BAT traversal, and VHDX metadata parsing.
+BAT traversal, VHDX metadata parsing, plus the measure subcommand's
+calculator math (`fuzz_measure_calc`) and the per-parser
+`scan_allocation` entry points (`fuzz_measure_scan`).
 
 The seed corpus is extracted from `instar-testdata` by
 `scripts/extract-fuzz-corpus.py`, which filters images by format and

@@ -140,18 +140,36 @@ def _substitute_json_actual_size(data: dict, disk_size: int) -> dict:
     """
     Recursively substitute actual-size values in JSON data.
 
+    For dicts that carry their own 'filename', the disk_size lookup is
+    redone per-file (e.g. VMDK monolithicFlat has separate descriptor
+    and extent files with different on-disk sizes). Dicts without a
+    filename fall back to the passed-in disk_size, preserving the
+    single-file behaviour used by every other format.
+
     Args:
         data: Parsed JSON data (dict or list)
-        disk_size: Actual disk allocation in bytes
+        disk_size: Actual disk allocation in bytes (the fallback when
+            a dict has no filename of its own)
 
     Returns:
         JSON data with actual-size values replaced
     """
     if isinstance(data, dict):
+        # If this dict references its own file, use that file's
+        # actual disk size rather than the passed-in default. Any
+        # OSError from get_disk_size is intentionally allowed to
+        # propagate: after os.path.exists returned True, a stat
+        # failure indicates a real test-environment problem (race,
+        # permission, broken testdata) that should fail loud rather
+        # than silently fall back to the wrong actual-size.
+        effective_size = disk_size
+        filename = data.get('filename')
+        if isinstance(filename, str) and os.path.exists(filename):
+            effective_size = get_disk_size(filename)
         result = {}
         for key, value in data.items():
             if key == 'actual-size':
-                result[key] = disk_size
+                result[key] = effective_size
             elif isinstance(value, (dict, list)):
                 result[key] = _substitute_json_actual_size(value, disk_size)
             else:

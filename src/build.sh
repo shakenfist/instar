@@ -9,6 +9,7 @@
 #   - check.bin at 0x20000 (integrity check operation, same address as info)
 #   - compare.bin at 0x20000 (image comparison operation, same address as info)
 #   - convert.bin at 0x20000 (image conversion operation, same address as info)
+#   - measure.bin at 0x20000 (disk measurement operation, same address as info)
 
 set -e
 
@@ -129,6 +130,25 @@ else
 fi
 
 echo ""
+echo "=== Building measure operation ==="
+cd operations/measure
+cargo +nightly build --release
+cd ../..
+
+# Convert measure ELF to flat binary
+echo "=== Converting measure ELF to flat binary ==="
+MEASURE_ELF="target/x86_64-unknown-none/release/measure"
+MEASURE_BIN="measure.bin"
+
+if [ -f "$MEASURE_ELF" ]; then
+    rust-objcopy -O binary "$MEASURE_ELF" "$MEASURE_BIN"
+    echo "Created $MEASURE_BIN ($(wc -c < "$MEASURE_BIN") bytes)"
+else
+    echo "Error: Measure ELF not found at $MEASURE_ELF"
+    exit 1
+fi
+
+echo ""
 echo "=== Building instar ==="
 cd vmm
 cargo build --release
@@ -143,7 +163,8 @@ cp "$COPY_BIN" target/release/
 cp "$CHECK_BIN" target/release/
 cp "$COMPARE_BIN" target/release/
 cp "$CONVERT_BIN" target/release/
-echo "Copied core.bin, info.bin, copy.bin, check.bin, compare.bin, and convert.bin to target/release/"
+cp "$MEASURE_BIN" target/release/
+echo "Copied core.bin, info.bin, copy.bin, check.bin, compare.bin, convert.bin, and measure.bin to target/release/"
 
 # Check binary sizes against memory layout limits
 # Memory layout (from shared/src/lib.rs):
@@ -180,6 +201,7 @@ check_size "copy.bin" "target/release/$COPY_BIN" "$OP_MAX" || FAILED=1
 check_size "check.bin" "target/release/$CHECK_BIN" "$OP_MAX" || FAILED=1
 check_size "compare.bin" "target/release/$COMPARE_BIN" "$OP_MAX" || FAILED=1
 check_size "convert.bin" "target/release/$CONVERT_BIN" "$OP_MAX" || FAILED=1
+check_size "measure.bin" "target/release/$MEASURE_BIN" "$OP_MAX" || FAILED=1
 
 if [ "$FAILED" -eq 1 ]; then
     echo ""
@@ -199,6 +221,7 @@ echo "  - copy.bin       Copy operation (file copy) - loaded at 0x20000"
 echo "  - check.bin      Check operation (integrity validation) - loaded at 0x20000"
 echo "  - compare.bin    Compare operation (image comparison) - loaded at 0x20000"
 echo "  - convert.bin    Convert operation (image conversion) - loaded at 0x20000"
+echo "  - measure.bin    Measure operation (disk measurement) - loaded at 0x20000"
 echo ""
 echo "To run:"
 echo "  sudo ./target/release/instar info image.qcow2"
@@ -206,6 +229,7 @@ echo "  sudo ./target/release/instar copy input.qcow2 output.raw"
 echo "  sudo ./target/release/instar check image.qcow2"
 echo "  sudo ./target/release/instar compare image1.raw image2.raw"
 echo "  sudo ./target/release/instar convert input.qcow2 output.raw"
+echo "  sudo ./target/release/instar measure image.qcow2"
 echo ""
 echo "For help:"
 echo "  ./target/release/instar --help"
@@ -214,5 +238,6 @@ echo "  ./target/release/instar copy --help"
 echo "  ./target/release/instar check --help"
 echo "  ./target/release/instar compare --help"
 echo "  ./target/release/instar convert --help"
+echo "  ./target/release/instar measure --help"
 echo ""
 echo "Note: Running requires /dev/kvm access (root or kvm group)"

@@ -29,6 +29,32 @@ pub enum PartitionTableType {
     Gpt,
 }
 
+/// Compute an allocation summary for a raw image.
+///
+/// Raw images carry no allocation metadata — every byte in the
+/// virtual range is treated as allocated. This mirrors how
+/// `qemu-img measure` treats raw input: it reports
+/// `fully-allocated == virtual_size`.
+///
+/// `target_unit_size` is the unit size of the target format (qcow2
+/// cluster, vhd/vhdx block, vmdk grain) so that the measure
+/// calculators can compute `data_units_required` directly without
+/// re-deriving it from `allocated_bytes`. Pass `0` to skip
+/// `target_units_with_data` population (callers that don't yet pass
+/// a target unit size). See bug #286.
+pub fn scan_allocation(virtual_size: u64, target_unit_size: u64) -> shared::AllocationSummary {
+    let target_units_with_data = if target_unit_size == 0 || virtual_size == 0 {
+        0
+    } else {
+        virtual_size.saturating_add(target_unit_size - 1) / target_unit_size
+    };
+    shared::AllocationSummary {
+        virtual_size,
+        allocated_bytes: virtual_size,
+        target_units_with_data,
+    }
+}
+
 /// Detect partition table type from the first sector.
 ///
 /// Detection logic:
@@ -97,6 +123,37 @@ mod tests {
         buf[510] = 0x55;
         buf[511] = 0xAA;
         buf
+    }
+
+    // ---- scan_allocation ----
+
+    #[test]
+    fn raw_scan_zero() {
+        let s = scan_allocation(0, 0);
+        assert_eq!(s.virtual_size, 0);
+        assert_eq!(s.allocated_bytes, 0);
+    }
+
+    #[test]
+    fn raw_scan_one_sector() {
+        let s = scan_allocation(512, 0);
+        assert_eq!(s.allocated_bytes, 512);
+    }
+
+    #[test]
+    fn raw_scan_one_gib() {
+        let s = scan_allocation(1024 * 1024 * 1024, 0);
+        assert_eq!(s.virtual_size, s.allocated_bytes);
+        assert_eq!(s.allocated_bytes, 1 << 30);
+    }
+
+    #[test]
+    fn raw_scan_max_u64() {
+        // raw treats every byte as allocated, so the calculation is
+        // saturating-safe even at u64::MAX.
+        let s = scan_allocation(u64::MAX, 0);
+        assert_eq!(s.virtual_size, u64::MAX);
+        assert_eq!(s.allocated_bytes, u64::MAX);
     }
 
     // ---- Buffer too short ----

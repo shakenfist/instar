@@ -13,3 +13,4 @@
 - PLAN-coverage-fuzzing.md: Coverage-guided fuzzing
 - PLAN-fuzz-autofix.md: Fuzz autofix workflow
 - PLAN-convert-followups.md: Convert follow-ups
+- PLAN-measure.md: instar measure subcommand

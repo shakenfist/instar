@@ -1,0 +1,14 @@
+[package]
+name = "measure"
+version = "0.2.0"
+edition = "2021"
+description = "Pre-calculate disk image file size for given format options"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+shared = { path = "../../shared" }
+qcow2 = { path = "../qcow2", default-features = false }
+vmdk  = { path = "../vmdk",  default-features = false }
+vhd   = { path = "../vhd",   default-features = false }
+vhdx  = { path = "../vhdx",  default-features = false }

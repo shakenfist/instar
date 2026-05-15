@@ -17,7 +17,7 @@ instar/
 │   ├── core/       # Core guest initialization
 │   ├── crates/     # Shared format crates (qcow2, raw, vmdk, vhd, vhdx, luks)
 │   ├── shared/     # Shared library code (byte-order helpers, configs)
-│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert)
+│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, measure)
 │   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates (guest-protocol)
 ├── prototypes/     # Experimental implementations (11 KVM prototypes)
@@ -55,6 +55,16 @@ The core principle: **never parse untrusted data with host privileges**.
 
 Target formats: qcow2 (including external data files), raw, vmdk, vpc (VHD),
 vhdx (VHDX), luks (info + convert with decryption)
+
+### Operations
+
+- `info`: report format, virtual size, and metadata for a disk image
+- `copy`: raw byte-for-byte copy of a disk image
+- `check`: validate image structure and integrity
+- `compare`: byte-identical virtual-content comparison between two images
+- `convert`: convert a disk image from one format to another
+- `measure`: predict file size required to convert an image to a target
+  format. See [docs/measure.md](docs/measure.md) for the full reference.
 
 ## Working on This Project
 
@@ -165,8 +175,9 @@ sudo src/target/release/instar copy <INPUT> <OUTPUT>
 Integration tests compare `instar info` output against `qemu-img info` to verify
 drop-in replacement compatibility, validate `instar check` against deliberately
 corrupt test images, cross-validate `instar compare` output against
-`qemu-img compare`, and cross-validate `instar convert` output against
-`qemu-img convert`. Tests use Python testtools/stestr.
+`qemu-img compare`, cross-validate `instar convert` output against
+`qemu-img convert`, and cross-validate `instar measure` output against
+`qemu-img measure` for raw and qcow2 targets. Tests use Python testtools/stestr.
 
 ```bash
 # Set up test environment

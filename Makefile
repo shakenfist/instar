@@ -496,7 +496,8 @@ test-rust: instar-devcontainer
 			--exclude copy \
 			--exclude check \
 			--exclude compare \
-			--exclude convert && \
+			--exclude convert \
+			--exclude measure-op && \
 		cargo test --release -p luks --features "decrypt,encrypt"'
 
 # Run Python integration tests only (on host)
