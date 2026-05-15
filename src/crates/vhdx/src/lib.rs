@@ -998,6 +998,9 @@ impl VhdxState {
             return Some(AllocationSummary {
                 virtual_size,
                 allocated_bytes: 0,
+                // TODO(#286): populate from target_unit_size when this
+                // scanner is converted to target-aware accounting.
+                target_units_with_data: 0,
             });
         }
 
@@ -1100,6 +1103,9 @@ impl VhdxState {
         Some(AllocationSummary {
             virtual_size,
             allocated_bytes,
+            // TODO(#286): populate from target_unit_size when this
+            // scanner is converted to target-aware accounting.
+            target_units_with_data: 0,
         })
     }
 }

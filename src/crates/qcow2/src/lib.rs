@@ -1043,6 +1043,85 @@ pub fn count_allocated_in_l2_standard(l2_bytes: &[u8], cluster_size: u64) -> u64
     allocated.saturating_mul(cluster_size)
 }
 
+/// Per-scan tracker for "number of target-aligned units touched by
+/// allocated source data". Walk the source in virtual-offset order
+/// and call [`TargetUnitTracker::observe_allocated`] once per
+/// allocated source extent; the running count is in
+/// [`TargetUnitTracker::target_units_with_data`].
+///
+/// `target_unit_size == 0` disables tracking — every method is a
+/// no-op and the count stays at zero (the legacy
+/// `ceil(allocated_bytes / target_unit_size)` fallback in
+/// `measure_qcow2` etc. is used in that case). See bug #286.
+pub struct TargetUnitTracker {
+    pub target_unit_size: u64,
+    /// Index of the last target unit seen, or `u64::MAX` if none yet.
+    pub last_unit_idx: u64,
+    pub target_units_with_data: u64,
+}
+
+impl TargetUnitTracker {
+    pub fn new(target_unit_size: u64) -> Self {
+        Self {
+            target_unit_size,
+            last_unit_idx: u64::MAX,
+            target_units_with_data: 0,
+        }
+    }
+
+    /// Note that the byte range `[virtual_offset, virtual_offset+len)`
+    /// contains allocated source data. Adds the count of target units
+    /// that range covers but which haven't been seen before. Caller
+    /// must walk the source in non-decreasing virtual-offset order.
+    pub fn observe_allocated(&mut self, virtual_offset: u64, len: u64) {
+        if self.target_unit_size == 0 || len == 0 {
+            return;
+        }
+        let unit = self.target_unit_size;
+        let first = virtual_offset / unit;
+        let last = virtual_offset.saturating_add(len - 1) / unit;
+        let new_units = if self.last_unit_idx == u64::MAX || first > self.last_unit_idx {
+            last - first + 1
+        } else {
+            last.saturating_sub(self.last_unit_idx)
+        };
+        self.target_units_with_data = self.target_units_with_data.saturating_add(new_units);
+        if last > self.last_unit_idx || self.last_unit_idx == u64::MAX {
+            self.last_unit_idx = last;
+        }
+    }
+}
+
+/// Like [`count_allocated_in_l2_standard`] but also feeds each
+/// allocated entry's virtual range into `tracker`, so the scan can
+/// count target units touched without a second pass.
+///
+/// `base_virtual_offset` is the virtual address covered by the first
+/// entry in `l2_bytes`.
+pub fn walk_l2_standard(
+    l2_bytes: &[u8],
+    cluster_size: u64,
+    base_virtual_offset: u64,
+    tracker: &mut TargetUnitTracker,
+) -> u64 {
+    if cluster_size == 0 {
+        return 0;
+    }
+    let mut allocated_bytes: u64 = 0;
+    for (i, chunk) in l2_bytes.chunks_exact(8).enumerate() {
+        let entry = u64::from_be_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ]);
+        if entry == 0 {
+            continue;
+        }
+        allocated_bytes = allocated_bytes.saturating_add(cluster_size);
+        let v = base_virtual_offset.saturating_add((i as u64).saturating_mul(cluster_size));
+        tracker.observe_allocated(v, cluster_size);
+    }
+    allocated_bytes
+}
+
 /// Count allocated source bytes in an extended-L2 (16-byte entry) L2
 /// table byte slice. Each entry is two big-endian u64s: `l2_entry`
 /// followed by `sc_bitmap`.
@@ -1541,6 +1620,7 @@ impl Qcow2State {
         sector_size: usize,
         input_capacity: u64,
         virtual_size: u64,
+        target_unit_size: u64,
         bytes_read: &mut u64,
     ) -> Option<AllocationSummary> {
         let cluster_size = self.cluster_size;
@@ -1549,6 +1629,19 @@ impl Qcow2State {
         let l1_table_offset = self.l1_table_offset;
 
         let mut allocated_bytes: u64 = 0;
+        // Target-unit tracker. Only meaningful for the standard-L2
+        // walk path; extended L2 leaves the tracker untouched and
+        // `target_units_with_data` ends up at 0, which makes
+        // `measure_*` fall back to the legacy approximation. See
+        // bug #286 for the standard-L2 fix; extended-L2 target-aware
+        // accounting is tracked as follow-up.
+        let mut tracker = TargetUnitTracker::new(if extended_l2 { 0 } else { target_unit_size });
+        // Virtual address covered by one L2 table (entries_per_l2 *
+        // cluster_size). Bytes 0..l2_coverage of the source virtual
+        // address space map to L1 entry 0, l2_coverage..2*l2_coverage
+        // to L1 entry 1, and so on.
+        let entries_per_l2: u64 = cluster_size / if extended_l2 { 16 } else { 8 };
+        let l2_coverage = cluster_size.checked_mul(entries_per_l2)?;
 
         for l1_index in 0..l1_size {
             let l1_byte_offset = l1_table_offset.checked_add(l1_index.checked_mul(8)?)?;
@@ -1623,10 +1716,22 @@ impl Qcow2State {
                     (cluster_size - l2_bytes_consumed).min((buf_end - buf_start) as u64) as usize;
                 let meaningful = &chunk[..meaningful_len];
 
+                // Virtual offset covered by the first entry of `meaningful`:
+                // each L1 entry maps a contiguous `l2_coverage` range, and
+                // within that range, the n-th 8-byte L2 entry covers
+                // `n * cluster_size` of virtual space. `l2_bytes_consumed`
+                // counts the L2-table bytes we've already walked, so its
+                // entry-stride equivalent times `cluster_size` is the
+                // offset of the first entry in this chunk.
+                let entry_size_bytes: u64 = if extended_l2 { 16 } else { 8 };
+                let base_virtual_offset = l1_index.saturating_mul(l2_coverage).saturating_add(
+                    (l2_bytes_consumed / entry_size_bytes).saturating_mul(cluster_size),
+                );
+
                 allocated_bytes = allocated_bytes.saturating_add(if extended_l2 {
                     count_allocated_in_l2_extended(meaningful, cluster_size)
                 } else {
-                    count_allocated_in_l2_standard(meaningful, cluster_size)
+                    walk_l2_standard(meaningful, cluster_size, base_virtual_offset, &mut tracker)
                 });
 
                 l2_bytes_consumed += meaningful_len as u64;
@@ -1637,6 +1742,7 @@ impl Qcow2State {
         Some(AllocationSummary {
             virtual_size,
             allocated_bytes,
+            target_units_with_data: tracker.target_units_with_data,
         })
     }
 }
@@ -2604,6 +2710,84 @@ mod tests {
         let mut buf = [0u8; 16];
         put_ext_entry(&mut buf, 0, 0, bitmap);
         assert_eq!(count_allocated_in_l2_extended(&buf, 65536), 0);
+    }
+
+    // ---- TargetUnitTracker / walk_l2_standard (bug #286) ----
+
+    #[test]
+    fn tracker_disabled_when_unit_size_zero() {
+        let mut t = TargetUnitTracker::new(0);
+        t.observe_allocated(0, 4096);
+        t.observe_allocated(4096, 4096);
+        assert_eq!(t.target_units_with_data, 0);
+    }
+
+    #[test]
+    fn tracker_counts_distinct_target_units() {
+        // Two source clusters at offsets 8192 and 65536, target 64K.
+        // Reproduces the qcow2-source half of the seed-37 failure
+        // described in issue #286: each falls in a different target
+        // cluster, so the count is 2 (not the 1 you would get from
+        // ceil_div(8192, 65536)).
+        let mut t = TargetUnitTracker::new(65536);
+        t.observe_allocated(8192, 4096);
+        t.observe_allocated(65536, 4096);
+        assert_eq!(t.target_units_with_data, 2);
+    }
+
+    #[test]
+    fn tracker_does_not_double_count_within_one_target_unit() {
+        // Two adjacent 4K source clusters in the same 64K target unit.
+        let mut t = TargetUnitTracker::new(65536);
+        t.observe_allocated(0, 4096);
+        t.observe_allocated(4096, 4096);
+        assert_eq!(t.target_units_with_data, 1);
+    }
+
+    #[test]
+    fn tracker_counts_partial_overlap_into_next_target_unit() {
+        // One large source extent that straddles a target boundary.
+        let mut t = TargetUnitTracker::new(65536);
+        t.observe_allocated(60000, 10000); // crosses 65536
+        assert_eq!(t.target_units_with_data, 2);
+    }
+
+    #[test]
+    fn tracker_handles_target_smaller_than_source() {
+        // Target unit smaller than source: each 64K source cluster
+        // spans 16 target 4K units.
+        let mut t = TargetUnitTracker::new(4096);
+        t.observe_allocated(0, 65536);
+        assert_eq!(t.target_units_with_data, 16);
+    }
+
+    #[test]
+    fn walk_l2_standard_records_target_units() {
+        // L2 with 3 non-zero entries at index 0, 16, 17 (cluster_size 4K,
+        // target unit 64K → entry 0 → unit 0; entries 16,17 → unit 1).
+        let mut buf = [0u8; 64 * 8];
+        put_std_entry(&mut buf, 0, 0x1);
+        put_std_entry(&mut buf, 16, 0x2);
+        put_std_entry(&mut buf, 17, 0x3);
+        let mut t = TargetUnitTracker::new(65536);
+        let allocated = walk_l2_standard(&buf, 4096, 0, &mut t);
+        assert_eq!(allocated, 3 * 4096);
+        // Entry 0 covers virtual [0, 4096) → unit 0.
+        // Entry 16 covers virtual [65536, 69632) → unit 1.
+        // Entry 17 covers virtual [69632, 73728) → unit 1 (same as prev).
+        assert_eq!(t.target_units_with_data, 2);
+    }
+
+    #[test]
+    fn walk_l2_standard_with_base_offset() {
+        // Same buffer but starting at an L1-offset of 1 GiB. The base
+        // offset must shift the per-entry virtual ranges.
+        let mut buf = [0u8; 8 * 8];
+        put_std_entry(&mut buf, 0, 0x1);
+        let mut t = TargetUnitTracker::new(65536);
+        let _ = walk_l2_standard(&buf, 4096, 1 << 30, &mut t);
+        // After the call, last_unit_idx should reflect the high offset.
+        assert_eq!(t.last_unit_idx, (1u64 << 30) / 65536);
     }
 }
 

@@ -236,7 +236,17 @@ pub fn measure_qcow2(s: &AllocationSummary, opts: &Qcow2Opts) -> MeasureResult {
     let l2_clusters_required = l2_clusters_full;
 
     // ---- Data cluster counts. ---------------------------------------------
-    let data_clusters_required = ceil_div(s.allocated_bytes, cluster_size);
+    // Prefer the spatial count from the source scanner when available;
+    // `ceil_div(allocated_bytes, cluster_size)` collapses fragmented
+    // sources into one contiguous run and under-counts target clusters
+    // when allocations straddle target-cluster boundaries (bug #286).
+    // Sentinel `0` means the scanner did not populate the field, so
+    // fall back to the legacy approximation.
+    let data_clusters_required = if s.target_units_with_data != 0 {
+        s.target_units_with_data
+    } else {
+        ceil_div(s.allocated_bytes, cluster_size)
+    };
     let data_clusters_full = if s.virtual_size == 0 {
         0
     } else {
@@ -505,7 +515,13 @@ fn measure_vmdk_sparse_or_stream(
         .ok_or(MeasureError::Overflow)?;
 
     // ---- Allocated grain counts. -------------------------------------------
-    let allocated_grains_required = ceil_div(s.allocated_bytes, grain_size);
+    // See bug #286 — prefer scanner-supplied target-unit count so a
+    // fragmented source is not collapsed into a contiguous run.
+    let allocated_grains_required = if s.target_units_with_data != 0 {
+        s.target_units_with_data
+    } else {
+        ceil_div(s.allocated_bytes, grain_size)
+    };
     let allocated_grains_full = total_grains;
 
     // ---- Per-sub-format calculation. ----------------------------------------
@@ -867,7 +883,13 @@ fn measure_vhd_dynamic(s: &AllocationSummary, block_size: u64) -> MeasureResult 
         .ok_or(MeasureError::Overflow)?;
 
     // ---- Allocated block counts. ------------------------------------------
-    let allocated_blocks_required = ceil_div(s.allocated_bytes, block_size);
+    // See bug #286 — prefer scanner-supplied target-unit count so a
+    // fragmented source is not collapsed into a contiguous run.
+    let allocated_blocks_required = if s.target_units_with_data != 0 {
+        s.target_units_with_data
+    } else {
+        ceil_div(s.allocated_bytes, block_size)
+    };
     let allocated_blocks_full = bat_entries; // every block in the virtual range
 
     // ---- required. ---------------------------------------------------------
@@ -1018,7 +1040,13 @@ pub fn measure_vhdx(s: &AllocationSummary, opts: &VhdxOpts) -> MeasureResult {
     let block_alloc = round_up_u64(bs, mb_align)?;
 
     // ---- Allocated block counts. ------------------------------------------
-    let allocated_blocks_required = ceil_div(s.allocated_bytes, bs);
+    // See bug #286 — prefer scanner-supplied target-unit count so a
+    // fragmented source is not collapsed into a contiguous run.
+    let allocated_blocks_required = if s.target_units_with_data != 0 {
+        s.target_units_with_data
+    } else {
+        ceil_div(s.allocated_bytes, bs)
+    };
     let allocated_blocks_full = total_payload_blocks;
 
     // ---- Final sizes. ------------------------------------------------------
@@ -1644,6 +1672,7 @@ mod tests {
             let s = AllocationSummary {
                 virtual_size: c.virtual_size,
                 allocated_bytes: c.allocated_bytes,
+                target_units_with_data: 0,
             };
             let opts = Qcow2Opts {
                 cluster_size: c.cluster_size,
@@ -1691,6 +1720,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: MIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = Qcow2Opts {
             cluster_size: 1023,
@@ -1704,6 +1734,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: MIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = Qcow2Opts {
             cluster_size: 256,
@@ -1717,6 +1748,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: MIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = Qcow2Opts {
             cluster_size: 4 * 1024 * 1024,
@@ -1730,6 +1762,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: MIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = Qcow2Opts {
             refcount_bits: 3,
@@ -1743,6 +1776,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: MIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = Qcow2Opts {
             refcount_bits: 0,
@@ -1756,6 +1790,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: MIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = Qcow2Opts {
             extended_l2: true,
@@ -1770,6 +1805,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: (1u64 << 63) + 1,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = Qcow2Opts::default();
         assert_eq!(measure_qcow2(&s, &opts), Err(MeasureError::InvalidSize));
@@ -1784,6 +1820,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: 1u64 << 63,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = Qcow2Opts::default();
         // The default 64 KiB cluster yields a manageable total here.
@@ -1796,6 +1833,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: MIB,
             allocated_bytes: MIB + 1,
+            target_units_with_data: 0,
         };
         let opts = Qcow2Opts::default();
         assert_eq!(measure_qcow2(&s, &opts), Err(MeasureError::InvalidSize));
@@ -1810,6 +1848,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: u64::MAX,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = Qcow2Opts {
             cluster_size: 512,
@@ -1826,6 +1865,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: 1u64 << 63,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = Qcow2Opts {
             cluster_size: 512,
@@ -1845,12 +1885,41 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: 0,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = Qcow2Opts::default();
         let m = measure_qcow2(&s, &opts).expect("zero-virtual-size must compute");
         // header(1) + refblock(1) + reftable(1) = 3 clusters at default 64 KiB.
         assert_eq!(m.required, 3 * 65536);
         assert_eq!(m.fully_allocated, 3 * 65536);
+    }
+
+    #[test]
+    fn qcow2_required_uses_target_units_with_data_when_set() {
+        // Regression for bug #286. Same `allocated_bytes` (2 source
+        // clusters × 4096 = 8192), but two scenarios that produce
+        // different correct answers depending on the *spatial*
+        // distribution of those bytes. The legacy
+        // `ceil(allocated_bytes / target_cluster)` formula can't
+        // distinguish them; the new `target_units_with_data` field can.
+        let opts = Qcow2Opts::default(); // target cluster = 64 KiB
+        let baseline = AllocationSummary {
+            virtual_size: 16 * MIB,
+            allocated_bytes: 8192,
+            target_units_with_data: 0, // legacy path
+        };
+        let fragmented = AllocationSummary {
+            virtual_size: 16 * MIB,
+            allocated_bytes: 8192,
+            target_units_with_data: 2, // two distinct target clusters touched
+        };
+        let m_baseline = measure_qcow2(&baseline, &opts).unwrap();
+        let m_fragmented = measure_qcow2(&fragmented, &opts).unwrap();
+        // Fragmented case needs one extra 64 KiB target cluster.
+        assert_eq!(
+            m_fragmented.required,
+            m_baseline.required + opts.cluster_size as u64,
+        );
     }
 
     #[test]
@@ -1861,6 +1930,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: 64 * MIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let baseline_opts = Qcow2Opts::default();
         let baseline = measure_qcow2(&s, &baseline_opts).unwrap();
@@ -1888,6 +1958,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: 64 * MIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let baseline = measure_qcow2(&s, &Qcow2Opts::default()).unwrap();
         let opts = Qcow2Opts {
@@ -1904,6 +1975,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: 64 * MIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let baseline = measure_qcow2(&s, &Qcow2Opts::default()).unwrap();
         let opts = Qcow2Opts {
@@ -1919,6 +1991,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: 64 * MIB,
             allocated_bytes: 16 * MIB,
+            target_units_with_data: 0,
         };
         let off = Qcow2Opts::default();
         let on = Qcow2Opts {
@@ -1933,6 +2006,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: 64 * MIB,
             allocated_bytes: 16 * MIB,
+            target_units_with_data: 0,
         };
         let off = Qcow2Opts::default();
         let on = Qcow2Opts {
@@ -1949,6 +2023,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: GIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let off = Qcow2Opts::default();
         let meta = Qcow2Opts {
@@ -1963,6 +2038,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: GIB,
             allocated_bytes: 256 * MIB,
+            target_units_with_data: 0,
         };
         let falloc = Qcow2Opts {
             preallocation: Preallocation::Falloc,
@@ -2015,6 +2091,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: MIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = VmdkOpts {
             subformat: VmdkSubformat::MonolithicSparse,
@@ -2045,6 +2122,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: GIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = VmdkOpts {
             subformat: VmdkSubformat::MonolithicSparse,
@@ -2072,6 +2150,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: GIB,
             allocated_bytes: GIB,
+            target_units_with_data: 0,
         };
         let opts = VmdkOpts {
             subformat: VmdkSubformat::MonolithicSparse,
@@ -2112,6 +2191,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: MIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = VmdkOpts {
             subformat: VmdkSubformat::StreamOptimized,
@@ -2157,6 +2237,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: GIB,
             allocated_bytes: 512 * KIB,
+            target_units_with_data: 0,
         };
         let opts = VmdkOpts {
             subformat: VmdkSubformat::StreamOptimized,
@@ -2191,6 +2272,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: GIB,
             allocated_bytes: GIB,
+            target_units_with_data: 0,
         };
         let opts = VmdkOpts {
             subformat: VmdkSubformat::StreamOptimized,
@@ -2214,6 +2296,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: MIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = VmdkOpts {
             subformat: VmdkSubformat::MonolithicFlat,
@@ -2233,6 +2316,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: GIB,
             allocated_bytes: GIB,
+            target_units_with_data: 0,
         };
         let opts = VmdkOpts {
             subformat: VmdkSubformat::MonolithicFlat,
@@ -2251,6 +2335,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: 64 * MIB,
             allocated_bytes: 32 * MIB,
+            target_units_with_data: 0,
         };
         let opts = VmdkOpts {
             subformat: VmdkSubformat::MonolithicFlat,
@@ -2269,6 +2354,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: MIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = VmdkOpts {
             subformat: VmdkSubformat::MonolithicSparse,
@@ -2283,6 +2369,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: MIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = VmdkOpts {
             subformat: VmdkSubformat::MonolithicSparse,
@@ -2297,6 +2384,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: MIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = VmdkOpts {
             subformat: VmdkSubformat::MonolithicSparse,
@@ -2311,6 +2399,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: MIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = VmdkOpts {
             subformat: VmdkSubformat::MonolithicSparse,
@@ -2324,6 +2413,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: MIB,
             allocated_bytes: MIB + 1,
+            target_units_with_data: 0,
         };
         let opts = VmdkOpts::default();
         assert_eq!(measure_vmdk(&s, &opts), Err(MeasureError::InvalidSize));
@@ -2376,6 +2466,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: GIB,
             allocated_bytes: GIB / 2,
+            target_units_with_data: 0,
         };
         let opts = VhdOpts {
             subformat: VhdSubformat::Fixed,
@@ -2408,6 +2499,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: MIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = VhdOpts {
             subformat: VhdSubformat::Dynamic,
@@ -2437,6 +2529,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: GIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = VhdOpts {
             subformat: VhdSubformat::Dynamic,
@@ -2462,6 +2555,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: GIB,
             allocated_bytes: GIB,
+            target_units_with_data: 0,
         };
         let opts = VhdOpts {
             subformat: VhdSubformat::Dynamic,
@@ -2492,6 +2586,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: GIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = VhdOpts {
             subformat: VhdSubformat::Dynamic,
@@ -2525,6 +2620,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: 64 * GIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = VhdOpts {
             subformat: VhdSubformat::Dynamic,
@@ -2543,6 +2639,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: GIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = VhdOpts {
             subformat: VhdSubformat::Dynamic,
@@ -2559,6 +2656,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: GIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = VhdOpts {
             subformat: VhdSubformat::Dynamic,
@@ -2573,6 +2671,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: GIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = VhdOpts {
             subformat: VhdSubformat::Dynamic,
@@ -2586,6 +2685,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: GIB,
             allocated_bytes: GIB + 1,
+            target_units_with_data: 0,
         };
         let opts = VhdOpts::default();
         assert_eq!(measure_vhd(&s, &opts), Err(MeasureError::InvalidSize));
@@ -2605,6 +2705,7 @@ mod tests {
                     let s = AllocationSummary {
                         virtual_size: vs,
                         allocated_bytes: alloc,
+                        target_units_with_data: 0,
                     };
                     let opts = VhdOpts {
                         subformat: VhdSubformat::Dynamic,
@@ -2657,6 +2758,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: GIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = VhdxOpts {
             block_size: 32 * MIB as u32,
@@ -2680,6 +2782,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: GIB,
             allocated_bytes: GIB,
+            target_units_with_data: 0,
         };
         let opts = VhdxOpts {
             block_size: 32 * MIB as u32,
@@ -2711,6 +2814,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: GIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = VhdxOpts {
             block_size: MIB as u32,
@@ -2741,6 +2845,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: 64 * GIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = VhdxOpts {
             block_size: 256 * MIB as u32,
@@ -2762,6 +2867,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: GIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = VhdxOpts {
             block_size: 512 * 1024,
@@ -2775,6 +2881,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: GIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = VhdxOpts {
             block_size: 512 * 1024 * 1024,
@@ -2788,6 +2895,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: GIB,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = VhdxOpts {
             block_size: 3 * 1024 * 1024,
@@ -2800,6 +2908,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: GIB,
             allocated_bytes: GIB + 1,
+            target_units_with_data: 0,
         };
         let opts = VhdxOpts::default();
         assert_eq!(measure_vhdx(&s, &opts), Err(MeasureError::InvalidSize));
@@ -2826,6 +2935,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: u64::MAX,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = VmdkOpts::default();
         assert_eq!(measure_vmdk(&s, &opts), Err(MeasureError::Overflow));
@@ -2836,6 +2946,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: u64::MAX,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = VhdOpts {
             subformat: VhdSubformat::Dynamic,
@@ -2851,6 +2962,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: u64::MAX,
             allocated_bytes: u64::MAX,
+            target_units_with_data: 0,
         };
         let opts = VhdOpts {
             subformat: VhdSubformat::Fixed,
@@ -2864,6 +2976,7 @@ mod tests {
         let s = AllocationSummary {
             virtual_size: u64::MAX,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         };
         let opts = VhdxOpts::default();
         assert_eq!(measure_vhdx(&s, &opts), Err(MeasureError::Overflow));
@@ -2907,6 +3020,7 @@ mod tests {
             let s = AllocationSummary {
                 virtual_size: vs,
                 allocated_bytes: alloc,
+                target_units_with_data: 0,
             };
 
             // raw
@@ -2997,6 +3111,7 @@ mod tests {
                     let s = AllocationSummary {
                         virtual_size: vs,
                         allocated_bytes: vs / 2,
+                        target_units_with_data: 0,
                     };
                     let opts = VmdkOpts {
                         subformat: sf,

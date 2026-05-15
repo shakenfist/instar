@@ -446,6 +446,21 @@ pub struct AllocationSummary {
     /// contain non-zero data). For raw input this equals `virtual_size`.
     /// For sparse inputs it may be less.
     pub allocated_bytes: u64,
+    /// Count of target-aligned regions that contain at least one byte of
+    /// allocated source data, computed against a `target_unit_size`
+    /// supplied at scan time.
+    ///
+    /// Required to correctly size the data area of formats whose target
+    /// unit (qcow2 cluster, vhd/vhdx block, vmdk grain) is larger than
+    /// the source unit: a fragmented source with N allocated source
+    /// clusters spread across the address space needs the count of
+    /// *target* units that touch those clusters, not
+    /// `ceil(allocated_bytes / target_unit_size)`. See bug #286.
+    ///
+    /// `0` is a sentinel meaning "scanner did not compute this"; the
+    /// measure calculators fall back to `ceil(allocated_bytes /
+    /// target_unit)`. New scanners should always populate it.
+    pub target_units_with_data: u64,
 }
 
 /// Result from get_operation_config (FFI-safe alternative to tuple)

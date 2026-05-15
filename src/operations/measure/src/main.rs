@@ -100,13 +100,20 @@ pub unsafe extern "C" fn _start() -> u64 {
     let mut bytes_read: u64 = 0;
 
     // 1. Build AllocationSummary.
+    // Target unit size is the cluster/block/grain size of the chosen
+    // target format. The source scanner needs it to correctly count
+    // *target* units that contain allocated source data — without it,
+    // a fragmented source would be collapsed into one contiguous run
+    // and under-count required data clusters (bug #286).
+    let target_unit_size = target_unit_size_for(config);
     let summary = if config.virtual_size_override != 0 {
         AllocationSummary {
             virtual_size: config.virtual_size_override,
             allocated_bytes: 0,
+            target_units_with_data: 0,
         }
     } else {
-        match detect_and_scan(call_table, config, &mut bytes_read) {
+        match detect_and_scan(call_table, config, target_unit_size, &mut bytes_read) {
             Some(s) => s,
             None => {
                 send_result(
@@ -267,6 +274,24 @@ fn vhdx_opts_from(c: &MeasureConfig) -> VhdxOpts {
     opts
 }
 
+/// Resolve the target unit size (qcow2 cluster, vhd/vhdx block, vmdk
+/// grain) for the configured target format. Returned to the source
+/// scanner so it can populate `AllocationSummary::target_units_with_data`
+/// — see bug #286. Returns `0` when the target format has no
+/// per-cluster sizing (raw, or unknown / unsupported).
+fn target_unit_size_for(c: &MeasureConfig) -> u64 {
+    match ImageFormat::from_u32(c.target_format) {
+        ImageFormat::Qcow2 => qcow2_opts_from(c).cluster_size as u64,
+        ImageFormat::Vmdk4 => vmdk_opts_from(c).grain_size as u64,
+        ImageFormat::Vhd => match vhd_opts_from(c).subformat {
+            VhdSubformat::Fixed => 0,
+            VhdSubformat::Dynamic => vhd_opts_from(c).block_size as u64,
+        },
+        ImageFormat::Vhdx => vhdx_opts_from(c).block_size as u64,
+        _ => 0,
+    }
+}
+
 /// Detect the source format from the first sector and dispatch to
 /// the matching parser's `scan_allocation`. Returns `None` if the
 /// format is unrecognised or the parser rejects the image.
@@ -284,6 +309,7 @@ fn vhdx_opts_from(c: &MeasureConfig) -> VhdxOpts {
 unsafe fn detect_and_scan(
     call_table: &CallTable,
     config: &MeasureConfig,
+    target_unit_size: u64,
     bytes_read: &mut u64,
 ) -> Option<AllocationSummary> {
     let sector_size = config.sector_size as usize;
@@ -309,7 +335,7 @@ unsafe fn detect_and_scan(
             // Raw images carry no allocation metadata — treat every byte
             // as allocated. Virtual size is the device capacity.
             let virtual_size = input_capacity.checked_mul(sector_size as u64)?;
-            Some(raw::scan_allocation(virtual_size))
+            Some(raw::scan_allocation(virtual_size, target_unit_size))
         }
         ImageFormat::Qcow2 => {
             // Parse the header from the sector we already read to
@@ -329,6 +355,7 @@ unsafe fn detect_and_scan(
                 sector_size,
                 input_capacity,
                 parsed.virtual_size,
+                target_unit_size,
                 bytes_read,
             )
         }
