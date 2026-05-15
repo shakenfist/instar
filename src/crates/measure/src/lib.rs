@@ -325,10 +325,19 @@ pub fn measure_qcow2(s: &AllocationSummary, opts: &Qcow2Opts) -> MeasureResult {
 /// Ceiling division for `u64`. Caller guarantees `b > 0`.
 #[inline]
 fn ceil_div(a: u64, b: u64) -> u64 {
-    // Saturating add prevents overflow when `a` is very close to `u64::MAX`;
-    // callers feed only validated, in-range values so this branch is mostly
-    // defensive against fuzzing.
-    a.saturating_add(b - 1) / b
+    // (a - 1) / b + 1 is exact for every non-zero `a` and avoids the
+    // `a + (b-1)` overflow that the obvious formula has. The previous
+    // implementation used `saturating_add`, which silently produced
+    // an off-by-one (under-counting by 1) when the sum saturated near
+    // u64::MAX — a corner unreachable in practice today because the
+    // qcow2 size cap is 2^63 and the other formats reject u64::MAX
+    // before reaching ceil_div, but defence-in-depth against future
+    // callers and fuzz inputs.
+    if a == 0 {
+        0
+    } else {
+        (a - 1) / b + 1
+    }
 }
 
 /// Sum a slice of `u64`s with overflow checking.
