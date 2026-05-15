@@ -84,7 +84,16 @@ pub unsafe extern "C" fn _start() -> u64 {
     (call_table.verbose_print)(b"measure: start\n\0".as_ptr());
 
     let config = &*(OPERATION_CONFIG_ADDR as *const MeasureConfig);
-    if !config.is_valid() {
+    // `is_valid` only checks the magic field; explicitly validate
+    // `sector_size` too. The host (`src/vmm/src/main.rs`) is the only
+    // legitimate writer and already enforces this, but defence-in-depth
+    // against a corrupted or malicious MeasureConfig: a zero
+    // `sector_size` would produce zero-length slices and confuse the
+    // capacity arithmetic in `detect_and_scan`.
+    let sector_size_ok = config.sector_size >= 512
+        && config.sector_size as usize <= MAX_SECTOR_SIZE
+        && config.sector_size.is_power_of_two();
+    if !config.is_valid() || !sector_size_ok {
         send_result(
             call_table,
             ImageFormat::Unknown as u32,

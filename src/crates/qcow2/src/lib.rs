@@ -1669,6 +1669,17 @@ impl Qcow2State {
             // serve a stale sector from a previous L2.
             self.l2_cached_sector = u64::MAX;
 
+            // Reject obviously-invalid L2 offsets up front: an L2
+            // table that starts past the end of the device cannot
+            // possibly hold valid entries. The sector-level capacity
+            // check inside the read loop also catches OOB reads,
+            // but short-circuiting here avoids computing very large
+            // sector counts for adversarial L1 entries (mirrors the
+            // pattern in `cluster_lookup`).
+            let device_byte_capacity = input_capacity.checked_mul(sector_size as u64)?;
+            if l2_table_offset >= device_byte_capacity {
+                return None;
+            }
             let l2_end_byte = l2_table_offset.checked_add(cluster_size)?;
             let l2_start_sector = l2_table_offset / sector_size as u64;
             let l2_end_sector =

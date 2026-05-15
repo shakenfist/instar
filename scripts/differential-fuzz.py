@@ -814,14 +814,24 @@ def op_measure(instar_bin, instar_copy, qemu_copy, fmt,
     actual = out_path.stat().st_size
 
     # Cushion absorbs writer-side alignment artefacts that measure
-    # doesn't model. The dominant source is the convert writer's
-    # per-block sector alignment (each allocated block + metadata
-    # region is padded to the output sector size, typically 64 KiB).
-    # For VHD / VHDX the cumulative slack scales with the number of
-    # allocated blocks, so the cushion needs to scale with the image
-    # size. Choose max(1 MiB absolute floor, 1/16 of fully_allocated)
-    # — a generous bound that covers realistic alignment overhead
-    # without admitting wholesale measure-vs-convert disagreement.
+    # doesn't model. The dominant sources are:
+    #
+    # 1. Per-block sector alignment in the convert writer — each
+    #    allocated block plus its metadata region is padded to the
+    #    output sector size (typically 64 KiB).
+    # 2. VHDX's 1 MiB block-region alignment — every payload block
+    #    starts on a 1 MiB boundary, so the absolute slack on a
+    #    ~MB-scale image can be a full MiB even when relative
+    #    overhead is small. This is why the floor is 1 MiB rather
+    #    than 64 KiB.
+    #
+    # tests/test_measure.py::TestMeasureRoundTrip uses tighter
+    # per-target floors (vmdk/vpc 64 KiB, vhdx 1 MiB) on a curated
+    # fixture set. The fuzzer's floor is deliberately the looser
+    # of the three so that random small images don't produce
+    # false-positive divergences from format-level alignment alone
+    # — its purpose is to find *large* disagreements, with the
+    # round-trip integration suite catching the smaller ones.
     cushion = max(1 << 20, fully_allocated >> 4)
 
     # Only the upper bound is a hard invariant.
