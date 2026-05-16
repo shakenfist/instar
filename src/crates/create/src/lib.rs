@@ -419,14 +419,217 @@ fn image_format_name_bytes(fmt: ImageFormat) -> &'static [u8] {
     }
 }
 
-/// Build a metadata plan for a VMDK image.
+/// Build a metadata plan for a VMDK image (monolithicSparse or
+/// streamOptimized).
 ///
-/// Stub: returns [`CreateError::ScratchTooSmall`] until phase-1d.
+/// Layout written into `scratch`:
+///
+/// 1. Binary header (1 sector).
+/// 2. Descriptor text (DESC_SECTORS sectors, zero-padded).
+/// 3. Grain directory (rounded up to a sector, all zero entries for
+///    an empty image).
+/// 4. For `StreamOptimized` only: an end-of-stream marker (1 sector).
 pub fn plan_vmdk<'a>(
-    _opts: &VmdkCreateOpts<'_>,
-    _scratch: &'a mut [u8],
+    opts: &VmdkCreateOpts<'_>,
+    scratch: &'a mut [u8],
 ) -> Result<MetadataPlan<'a>, CreateError> {
-    Err(CreateError::ScratchTooSmall)
+    // Subformat support check.
+    let stream_optimized = match opts.subformat {
+        VmdkSubformat::MonolithicSparse => false,
+        VmdkSubformat::StreamOptimized => true,
+        VmdkSubformat::MonolithicFlat
+        | VmdkSubformat::TwoGbMaxExtentSparse
+        | VmdkSubformat::TwoGbMaxExtentFlat => return Err(CreateError::InvalidSubformat),
+    };
+
+    if opts.virtual_size == 0 {
+        return Err(CreateError::InvalidVirtualSize);
+    }
+    if opts.grain_size == 0
+        || !opts.grain_size.is_power_of_two()
+        || opts.grain_size < 4096
+        || opts.grain_size > 65536
+    {
+        return Err(CreateError::InvalidGrainSize);
+    }
+
+    let backing_path = match &opts.backing {
+        Some(b) => {
+            if b.path.len() > MAX_BACKING_FILE_LEN {
+                return Err(CreateError::BackingFileTooLong);
+            }
+            Some(b.path)
+        }
+        None => None,
+    };
+
+    const SECTOR: u64 = 512;
+    let grain_size_sectors: u64 = opts.grain_size as u64 / SECTOR;
+    let gtes_per_gt: u32 = vmdk::DEFAULT_NUM_GTES_PER_GT;
+
+    // Capacity (round up virtual_size to grain boundary, then to sector).
+    let grain_size_bytes = opts.grain_size as u64;
+    let capacity_bytes = opts.virtual_size.div_ceil(grain_size_bytes) * grain_size_bytes;
+    let capacity_sectors = capacity_bytes / SECTOR;
+
+    // GD entries cover the full virtual size.
+    let sectors_per_gt = gtes_per_gt as u64 * grain_size_sectors;
+    let num_gd_entries: u32 = capacity_sectors.div_ceil(sectors_per_gt) as u32;
+    let gd_bytes: usize = num_gd_entries as usize * 4;
+    let gd_sectors: u64 = (gd_bytes as u64).div_ceil(SECTOR);
+
+    // Layout:
+    //   sector 0:                              header (1)
+    //   sector 1..=DESC_SECTORS:               descriptor
+    //   sector DESC_SECTORS+1 ..:              GD (gd_sectors)
+    //   sector DESC_SECTORS+1+gd_sectors ..:   EOS marker (StreamOptimized only)
+    let header_sector: u64 = 0;
+    let desc_sector: u64 = 1;
+    let gd_sector: u64 = 1 + vmdk::DESC_SECTORS;
+    let eos_sector: u64 = gd_sector + gd_sectors;
+
+    let total_sectors: u64 = if stream_optimized {
+        eos_sector + 1
+    } else {
+        gd_sector + gd_sectors
+    };
+    let total_bytes: usize = (total_sectors * SECTOR) as usize;
+    if scratch.len() < total_bytes {
+        return Err(CreateError::ScratchTooSmall);
+    }
+
+    let (header_region, rest) = scratch.split_at_mut(SECTOR as usize);
+    let (desc_region, rest) = rest.split_at_mut((vmdk::DESC_SECTORS * SECTOR) as usize);
+    let (gd_region, rest) = rest.split_at_mut((gd_sectors * SECTOR) as usize);
+
+    // Header.
+    header_region.fill(0);
+    if stream_optimized {
+        vmdk::build_streamoptimized_header(
+            header_region,
+            capacity_sectors,
+            grain_size_sectors,
+            gtes_per_gt,
+            gd_sector,
+            gd_sector + gd_sectors,
+        );
+    } else {
+        vmdk::build_sparse_header(
+            header_region,
+            capacity_sectors,
+            grain_size_sectors,
+            gtes_per_gt,
+            gd_sector,
+            gd_sector + gd_sectors,
+        );
+    }
+
+    // Descriptor: vmdk::build_descriptor for no-backing case, or a
+    // locally-built variant for the backing case (the stock builder
+    // hardcodes parentCID=ffffffff and has no slot for
+    // parentFileNameHint).
+    desc_region.fill(0);
+    let _desc_len = if let Some(path) = backing_path {
+        build_vmdk_descriptor_with_backing(desc_region, capacity_sectors, stream_optimized, path)
+    } else if stream_optimized {
+        vmdk::build_streamoptimized_descriptor(desc_region, 0, capacity_sectors)
+    } else {
+        vmdk::build_descriptor(desc_region, 0, capacity_sectors)
+    };
+
+    // Grain directory (all zero entries — no GTs allocated yet).
+    gd_region.fill(0);
+
+    let mut plan = MetadataPlan::new();
+    plan.push(MetadataWrite {
+        byte_offset: header_sector * SECTOR,
+        bytes: &header_region[..SECTOR as usize],
+    })?;
+    plan.push(MetadataWrite {
+        byte_offset: desc_sector * SECTOR,
+        bytes: desc_region,
+    })?;
+    plan.push(MetadataWrite {
+        byte_offset: gd_sector * SECTOR,
+        bytes: gd_region,
+    })?;
+
+    if stream_optimized {
+        let (eos_region, _) = rest.split_at_mut(SECTOR as usize);
+        eos_region.fill(0);
+        vmdk::build_metadata_marker(eos_region, 0, vmdk::MARKER_EOS);
+        plan.push(MetadataWrite {
+            byte_offset: eos_sector * SECTOR,
+            bytes: eos_region,
+        })?;
+    }
+
+    Ok(plan)
+}
+
+/// Build a monolithicSparse or streamOptimized descriptor with a
+/// `parentFileNameHint` line populated. Returns the byte length
+/// written. We re-implement rather than call `vmdk::build_descriptor`
+/// because the stock builder hardcodes parentCID=FFFFFFFF and has no
+/// hook for the parent filename.
+fn build_vmdk_descriptor_with_backing(
+    buf: &mut [u8],
+    capacity_sectors: u64,
+    stream_optimized: bool,
+    parent_path: &[u8],
+) -> usize {
+    let mut pos: usize = 0;
+    let mut put = |bytes: &[u8], pos: &mut usize| {
+        let end = *pos + bytes.len();
+        if end <= buf.len() {
+            buf[*pos..end].copy_from_slice(bytes);
+        }
+        *pos = end;
+    };
+
+    put(b"# Disk DescriptorFile\n", &mut pos);
+    put(b"version=1\n", &mut pos);
+    put(b"CID=fffffffe\n", &mut pos);
+    // Use a fixed nonzero parentCID. qemu-img normally uses the
+    // parent's own CID — we don't read the parent in phase 1, so a
+    // sentinel value is the best we can do; phase 5 can compute the
+    // real parent CID once it reads the parent header.
+    put(b"parentCID=deadbeef\n", &mut pos);
+    if stream_optimized {
+        put(b"createType=\"streamOptimized\"\n", &mut pos);
+    } else {
+        put(b"createType=\"monolithicSparse\"\n", &mut pos);
+    }
+    put(b"parentFileNameHint=\"", &mut pos);
+    put(parent_path, &mut pos);
+    put(b"\"\n\n", &mut pos);
+    put(b"# Extent description\n", &mut pos);
+    put(b"RW ", &mut pos);
+
+    // Decimal capacity_sectors.
+    let mut num_buf = [0u8; 20];
+    let num_str = format_u64_decimal(capacity_sectors, &mut num_buf);
+    put(num_str, &mut pos);
+
+    put(b" SPARSE \"output.vmdk\"\n\n", &mut pos);
+    put(b"# The Disk Data Base\n", &mut pos);
+    put(b"#DDB\n", &mut pos);
+
+    pos
+}
+
+fn format_u64_decimal(mut val: u64, buf: &mut [u8; 20]) -> &[u8] {
+    if val == 0 {
+        buf[19] = b'0';
+        return &buf[19..20];
+    }
+    let mut pos = 20;
+    while val > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (val % 10) as u8;
+        val /= 10;
+    }
+    &buf[pos..20]
 }
 
 /// Build a metadata plan for a VHD image.
@@ -624,6 +827,129 @@ mod qcow2_plan_tests {
                 prev.byte_offset + prev.bytes.len() as u64 <= next.byte_offset,
                 "overlap between writes",
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod vmdk_plan_tests {
+    use super::*;
+    use std::vec;
+
+    fn materialise(plan: &MetadataPlan<'_>) -> std::vec::Vec<u8> {
+        let mut buf = std::vec![0u8; plan.minimum_file_size as usize];
+        for w in plan.writes() {
+            let start = w.byte_offset as usize;
+            let end = start + w.bytes.len();
+            buf[start..end].copy_from_slice(w.bytes);
+        }
+        buf
+    }
+
+    fn default_opts(virtual_size: u64) -> VmdkCreateOpts<'static> {
+        VmdkCreateOpts {
+            virtual_size,
+            subformat: VmdkSubformat::MonolithicSparse,
+            grain_size: 65536,
+            backing: None,
+        }
+    }
+
+    fn run(opts: &VmdkCreateOpts<'_>) -> std::vec::Vec<u8> {
+        let mut scratch = vec![0u8; VMDK_MAX_METADATA_SCRATCH];
+        let plan = plan_vmdk(opts, &mut scratch).expect("plan");
+        let sum: u64 = plan.writes().iter().map(|w| w.bytes.len() as u64).sum();
+        assert_eq!(plan.total_metadata_bytes, sum);
+        let max_end: u64 = plan
+            .writes()
+            .iter()
+            .map(|w| w.byte_offset + w.bytes.len() as u64)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(plan.minimum_file_size, max_end);
+        materialise(&plan)
+    }
+
+    #[test]
+    fn plan_vmdk_monolithic_sparse_1mib_round_trips() {
+        let opts = default_opts(1 << 20);
+        let bytes = run(&opts);
+        let parsed = vmdk::Vmdk4Header::parse(&bytes).expect("parse header");
+        assert_eq!(parsed.virtual_size, 1 << 20);
+        assert_eq!(parsed.grain_size_sectors * 512, 65536);
+    }
+
+    #[test]
+    fn plan_vmdk_monolithic_sparse_1gib_grain_4k() {
+        let mut opts = default_opts(1 << 30);
+        opts.grain_size = 4096;
+        let bytes = run(&opts);
+        let parsed = vmdk::Vmdk4Header::parse(&bytes).expect("parse header");
+        assert_eq!(parsed.virtual_size, 1 << 30);
+        assert_eq!(parsed.cluster_size, 4096);
+    }
+
+    #[test]
+    fn plan_vmdk_stream_optimized_round_trips() {
+        let mut opts = default_opts(1 << 20);
+        opts.subformat = VmdkSubformat::StreamOptimized;
+        let bytes = run(&opts);
+        let parsed = vmdk::Vmdk4Header::parse(&bytes).expect("parse header");
+        assert_eq!(parsed.virtual_size, 1 << 20);
+        assert_eq!(parsed.version, 3);
+    }
+
+    #[test]
+    fn plan_vmdk_with_backing_embeds_path_in_descriptor() {
+        let mut opts = default_opts(1 << 20);
+        let path = b"../parent.vmdk";
+        opts.backing = Some(BackingRef {
+            path,
+            format: Some(ImageFormat::Vmdk4),
+        });
+        let bytes = run(&opts);
+        // Locate the descriptor (starts at sector 1).
+        let desc = &bytes[512..512 + (vmdk::DESC_SECTORS * 512) as usize];
+        let needle = b"parentFileNameHint=\"../parent.vmdk\"";
+        assert!(
+            desc.windows(needle.len()).any(|w| w == needle),
+            "descriptor missing parentFileNameHint",
+        );
+    }
+
+    #[test]
+    fn plan_vmdk_rejects_deferred_subformat() {
+        let mut opts = default_opts(1 << 20);
+        opts.subformat = VmdkSubformat::MonolithicFlat;
+        let mut scratch = vec![0u8; VMDK_MAX_METADATA_SCRATCH];
+        assert!(matches!(
+            plan_vmdk(&opts, &mut scratch),
+            Err(CreateError::InvalidSubformat)
+        ));
+    }
+
+    #[test]
+    fn plan_vmdk_rejects_bad_grain_size() {
+        let mut opts = default_opts(1 << 20);
+        opts.grain_size = 1000; // not power of two
+        let mut scratch = vec![0u8; VMDK_MAX_METADATA_SCRATCH];
+        assert!(matches!(
+            plan_vmdk(&opts, &mut scratch),
+            Err(CreateError::InvalidGrainSize)
+        ));
+    }
+
+    #[test]
+    fn plan_vmdk_writes_dont_overlap() {
+        let opts = default_opts(1 << 30);
+        let mut scratch = vec![0u8; VMDK_MAX_METADATA_SCRATCH];
+        let plan = plan_vmdk(&opts, &mut scratch).expect("plan");
+        let mut sorted: std::vec::Vec<&MetadataWrite<'_>> = plan.writes().iter().collect();
+        sorted.sort_by_key(|w| w.byte_offset);
+        for pair in sorted.windows(2) {
+            let prev = pair[0];
+            let next = pair[1];
+            assert!(prev.byte_offset + prev.bytes.len() as u64 <= next.byte_offset);
         }
     }
 }
