@@ -1,0 +1,10 @@
+[package]
+name = "create"
+version = "0.2.0"
+edition = "2021"
+description = "Build empty disk image metadata layouts (no I/O)"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+shared = { path = "../../shared" }
