@@ -15,6 +15,9 @@
 #[cfg(feature = "decompress-zstd")]
 extern crate alloc;
 
+#[cfg(feature = "create")]
+pub mod create;
+
 #[cfg(any(
     feature = "decompress",
     feature = "decompress-zstd",
