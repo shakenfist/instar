@@ -140,7 +140,7 @@ pub fn compute_layout(
     let l1_size_bytes: u64 = (l1_entries as u64)
         .checked_mul(8)
         .ok_or(Qcow2CreateError::Overflow)?;
-    let l1_clusters: u64 = ((l1_size_bytes + cluster_size - 1) / cluster_size).max(1);
+    let l1_clusters: u64 = l1_size_bytes.div_ceil(cluster_size).max(1);
 
     // Header is cluster 0, L1 starts at cluster 1.
     let l1_offset: u64 = cluster_size;
@@ -153,9 +153,9 @@ pub fn compute_layout(
     let mut refblock_count: u64 = 1;
     for _ in 0..REFCOUNT_FIXED_POINT_ITERATIONS {
         let total = used_clusters_before_refcount + reftable_clusters + refblock_count;
-        let new_refblock_count = (total + entries_per_refblock - 1) / entries_per_refblock;
+        let new_refblock_count = total.div_ceil(entries_per_refblock);
         let reftable_entries = new_refblock_count;
-        let new_reftable_clusters = (reftable_entries * 8 + cluster_size - 1) / cluster_size;
+        let new_reftable_clusters = (reftable_entries * 8).div_ceil(cluster_size);
         if new_refblock_count == refblock_count && new_reftable_clusters == reftable_clusters {
             break;
         }
@@ -399,7 +399,7 @@ fn set_refcount_to_one(block: &mut [u8], idx: u64, refcount_bits: u32) {
         4 => {
             // 2 entries per byte; MSB-first nibbles.
             let byte = (idx / 2) as usize;
-            let shift = if idx % 2 == 0 { 4 } else { 0 };
+            let shift = if idx.is_multiple_of(2) { 4 } else { 0 };
             block[byte] |= 0b0001 << shift;
         }
         8 => {

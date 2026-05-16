@@ -8,3 +8,4 @@ publish = false
 
 [dependencies]
 shared = { path = "../../shared" }
+qcow2  = { path = "../qcow2", features = ["create"], default-features = false }
