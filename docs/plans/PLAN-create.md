@@ -558,7 +558,7 @@ currently have any, so this set may stay empty.
 | 3. Host VMM subcommand + clap surface | [PLAN-create-phase-03-host-cli.md](PLAN-create-phase-03-host-cli.md) | Complete |
 | 4. `-o` option parsing for create | [PLAN-create-phase-04-target-options.md](PLAN-create-phase-04-target-options.md) | Complete |
 | 5. Backing-file support (`-b` / `-F` / `-u`) | [PLAN-create-phase-05-backing-file.md](PLAN-create-phase-05-backing-file.md) | Complete |
-| 6. Preallocation modes (`off`/`metadata`/`falloc`/`full`) | PLAN-create-phase-06-preallocation.md (not yet written) | Not started |
+| 6. Preallocation modes (`off`/`metadata`/`falloc`/`full`) | [PLAN-create-phase-06-preallocation.md](PLAN-create-phase-06-preallocation.md) | Not started |
 | 7. Cross-version baseline generation in `instar-testdata` | PLAN-create-phase-07-baselines.md (not yet written) | Not started |
 | 8. Integration tests (`tests/test_create.py`) | PLAN-create-phase-08-integration-tests.md (not yet written) | Not started |
 | 9. Coverage-guided fuzz harnesses for the emitters | PLAN-create-phase-09-fuzz-coverage.md (not yet written) | Not started |
