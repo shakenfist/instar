@@ -421,6 +421,22 @@ pub const ARGON2_MEM_BASE: usize = 0x02000000; // 32 MiB
 /// Maximum sector size supported
 pub const MAX_SECTOR_SIZE: usize = 65536;
 
+/// Guest-side scratch limit for the create operation (phase 2).
+///
+/// The create guest binary statically reserves this many bytes inside
+/// the guest scratch region for the [`MetadataPlan`] returned by
+/// [`crates/create`]'s `plan_*` functions. Most option combinations
+/// fit comfortably; combinations that need more (notably qcow2 at
+/// `cluster_size=512` with very large virtual sizes) are rejected
+/// by the guest with `CreateResult::ERROR_SCRATCH_TOO_SMALL`.
+///
+/// Smaller than `crates/create::QCOW2_MAX_METADATA_SCRATCH` because
+/// the guest cannot afford the theoretical worst case inside its
+/// ~12 MiB scratch budget — `crates/create`'s const is the library's
+/// upper bound for host-side allocations and tests, not the
+/// constraint the guest enforces at runtime.
+pub const GUEST_CREATE_SCRATCH_LIMIT: usize = 8 * 1024 * 1024;
+
 /// Maximum QCOW2 cluster size supported.
 /// QCOW2 allows cluster_bits 9-21 (512B to 2MB). Large clusters
 /// are processed in MAX_SECTOR_SIZE-sized chunks rather than
