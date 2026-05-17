@@ -142,6 +142,31 @@ const MEASURE_RESULT_ERROR_INVALID_OPTION: u32 = 2;
 #[allow(dead_code)]
 const MEASURE_RESULT_ERROR_INVALID_SIZE: u32 = 3;
 
+// CreateConfig constants (must match shared crate)
+const CREATE_CONFIG_MAGIC: u32 = 0x43524541; // "CREA"
+#[allow(dead_code)]
+const CREATE_CONFIG_FLAG_EXTENDED_L2: u32 = 1 << 0;
+#[allow(dead_code)]
+const CREATE_CONFIG_FLAG_LAZY_REFCOUNTS: u32 = 1 << 1;
+#[allow(dead_code)]
+const CREATE_CONFIG_FLAG_COMPAT_V3: u32 = 1 << 2;
+#[allow(dead_code)]
+const CREATE_CONFIG_FLAG_BACKING_UNSAFE: u32 = 1 << 3;
+const CREATE_CONFIG_MAX_BACKING_FILE: usize = 1024;
+
+// CreateResult constants (must match shared crate)
+#[allow(dead_code)]
+const CREATE_RESULT_MAGIC: u32 = 0x43524553; // "CRES"
+const CREATE_RESULT_ERROR_OK: u32 = 0;
+const CREATE_RESULT_ERROR_INVALID_OPTION: u32 = 1;
+const CREATE_RESULT_ERROR_INVALID_SIZE: u32 = 2;
+const CREATE_RESULT_ERROR_SCRATCH_TOO_SMALL: u32 = 3;
+const CREATE_RESULT_ERROR_BACKING_READ_FAILED: u32 = 4;
+const CREATE_RESULT_ERROR_BACKING_PARSE_FAILED: u32 = 5;
+const CREATE_RESULT_ERROR_BACKING_TOO_LONG: u32 = 6;
+const CREATE_RESULT_ERROR_WRITE_FAILED: u32 = 7;
+const CREATE_RESULT_ERROR_UNSUPPORTED_FORMAT: u32 = 8;
+
 // CheckResult flag constants (must match shared crate)
 const CHECK_RESULT_FLAG_VALID: u32 = 1 << 0;
 #[allow(dead_code)]
@@ -2635,8 +2660,12 @@ struct CreateArgs {
     #[arg(long, default_value = "human", value_parser = ["human", "json"])]
     output: String,
 
-    /// Host I/O sector size. Power of two in 512..=65536.
-    #[arg(long, default_value = "65536")]
+    /// Host I/O sector size. Phase 3 only supports 512 because the
+    /// metadata layouts in `crates/create` are 512-byte aligned but
+    /// not always aligned to larger sector sizes — multi-write
+    /// metadata would clobber itself in a single bigger sector.
+    /// Documented; phase 5 may relax this.
+    #[arg(long, default_value = "512")]
     sector_size: u32,
 
     /// qcow2 cluster size in bytes. Power of two in [512, 2 MiB].
@@ -6323,12 +6352,551 @@ fn run_create(args: CreateArgs, _verbose: bool) -> Result<(), Box<dyn std::error
         return run_create_raw(&args);
     }
 
-    Err(
-        "create: non-raw KVM dispatch is not yet implemented (phase 3c \
-         implements the guest dispatch — see \
-         docs/plans/PLAN-create-phase-03-host-cli.md)"
-            .into(),
-    )
+    // Backing-file plumbing lands in step 3d. Until then, reject -b
+    // up front so phase 3c smoke tests don't silently launch a guest
+    // with virtual_size = 0 and no source to infer from.
+    if args.backing.is_some() {
+        return Err(
+            "create: -b BACKING is not yet implemented for non-raw targets \
+             (lands in phase 3d of PLAN-create-phase-03-host-cli.md)"
+                .into(),
+        );
+    }
+
+    run_create_nonraw(&args, _verbose)
+}
+
+/// Non-raw create dispatch: open the output, attach as a virtio
+/// device, populate `CreateConfig`, launch the create guest binary,
+/// and wait for the result.
+///
+/// Phase 3c ships the no-backing path. Phase 3d adds the backing
+/// attach; phase 3e replaces the minimal error reporting here with
+/// the full human / json / quiet renderer.
+fn run_create_nonraw(args: &CreateArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // --- Resolve fields from args ---------------------------------------
+    let target_format = create_target_format(&args.target_format)?;
+    let virtual_size = args
+        .size
+        .as_ref()
+        .map(|s| parse_memory_size(s))
+        .transpose()?
+        .unwrap_or(0);
+
+    let mut flags: u32 = 0;
+    if args.extended_l2 {
+        flags |= CREATE_CONFIG_FLAG_EXTENDED_L2;
+    }
+    if args.lazy_refcounts {
+        flags |= CREATE_CONFIG_FLAG_LAZY_REFCOUNTS;
+    }
+    if args.compat == "1.1" {
+        flags |= CREATE_CONFIG_FLAG_COMPAT_V3;
+    }
+    if args.backing_unsafe {
+        flags |= CREATE_CONFIG_FLAG_BACKING_UNSAFE;
+    }
+
+    let vmdk_subformat: u8 = match args.subformat.as_str() {
+        "streamOptimized" => 1,
+        _ => 0, // monolithicSparse default
+    };
+    let vhd_subformat: u8 = match args.subformat.as_str() {
+        "fixed" => 1,
+        _ => 0, // dynamic default
+    };
+
+    let cluster_size = args.cluster_size;
+    let refcount_bits = args.refcount_bits;
+    let grain_size = args.grain_size;
+    let block_size = args.block_size;
+
+    // --- Load guest binaries --------------------------------------------
+    let core_path = get_binary_path("core.bin");
+    let operation_path = get_binary_path("create.bin");
+    let core_code = load_guest_binary(core_path.to_str().unwrap())?;
+    debug!(
+        "Loaded core binary: {} bytes from {}",
+        core_code.len(),
+        core_path.display()
+    );
+    let operation_code = load_guest_binary(operation_path.to_str().unwrap())?;
+    debug!(
+        "Loaded operation binary: {} bytes from {}",
+        operation_code.len(),
+        operation_path.display()
+    );
+
+    // --- Open and attach output device ----------------------------------
+    let output_path = Path::new(&args.filename);
+    // The output is sparse — the on-disk size is just the metadata
+    // footprint (kilobytes typically), but virtio needs a capacity to
+    // expose. Pass a generous upper bound (virtual_size + 64 MiB)
+    // and let the file stay sparse. For the inferred-from-backing
+    // path (virtual_size == 0; phase 3d) we fall back to 64 MiB —
+    // the BAT/L1/refcount metadata is far smaller than that.
+    let output_capacity_hint = virtual_size
+        .saturating_add(64 * 1024 * 1024)
+        .max(64 * 1024 * 1024);
+
+    let output_backing =
+        BackingStore::open(output_path, false, Some(output_capacity_hint), true)
+            .map_err(|e| format!("create: open '{}' for write failed: {}", args.filename, e))?;
+
+    // core unconditionally initialises input device 0 and places the
+    // output device at MMIO index = active_input_count. For the
+    // no-backing path we still need an input stub at index 0 so the
+    // output lands at index 1 where core expects it; the guest
+    // ignores the stub because no plan_*-driven write reads from
+    // input. measure --size mode uses the same pattern.
+    struct CreateStubInput(std::path::PathBuf);
+    impl Drop for CreateStubInput {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let stub_path = std::env::temp_dir().join(format!("instar-create-stub-{}-{}", pid, nanos));
+    let stub_file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&stub_path)?;
+    stub_file.set_len(args.sector_size as u64)?;
+    drop(stub_file);
+    let _stub_input = CreateStubInput(stub_path.clone());
+    let stub_backing = BackingStore::open(&stub_path, true, None, false)?;
+
+    // Build the device-attach + guest-launch closure so any failure
+    // along the way can hit the partial-output cleanup path.
+    let result = run_create_guest(
+        &core_code,
+        &operation_code,
+        args,
+        target_format,
+        flags,
+        virtual_size,
+        cluster_size,
+        refcount_bits,
+        vmdk_subformat,
+        vhd_subformat,
+        grain_size,
+        block_size,
+        stub_backing,
+        output_backing,
+        output_capacity_hint,
+        verbose,
+    );
+
+    match result {
+        Ok(create_result) => {
+            if create_result.error != CREATE_RESULT_ERROR_OK {
+                let _ = std::fs::remove_file(output_path);
+                return Err(format!(
+                    "create failed: {}",
+                    create_error_detail(create_result.error)
+                )
+                .into());
+            }
+            if !args.quiet {
+                render_create_success(
+                    args,
+                    create_result.resolved_virtual_size,
+                    create_result.metadata_bytes_written,
+                    create_result.file_size_after,
+                    create_result.resolved_unit_size,
+                );
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(output_path);
+            Err(e)
+        }
+    }
+}
+
+/// Decode a target-format string into its numeric `ImageFormat`.
+/// Errors on unsupported values; clap's value_parser already rules
+/// out completely unknown strings.
+fn create_target_format(s: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    match s {
+        "raw" => Ok(IMAGE_FORMAT_RAW),
+        "qcow2" => Ok(IMAGE_FORMAT_QCOW2),
+        "vmdk" => Ok(IMAGE_FORMAT_VMDK4),
+        "vpc" => Ok(IMAGE_FORMAT_VHD),
+        "vhdx" => Ok(IMAGE_FORMAT_VHDX),
+        other => Err(format!("create: unsupported target format '{}'", other).into()),
+    }
+}
+
+/// Numeric host-side mirror of `CreateResult` populated by the guest
+/// dispatch. We only need the fields the host renders.
+struct CreateRunResult {
+    resolved_virtual_size: u64,
+    metadata_bytes_written: u64,
+    file_size_after: u64,
+    resolved_unit_size: u32,
+    error: u32,
+}
+
+/// Build CreateConfig, set up KVM + virtio, launch the create guest
+/// binary, and harvest the resulting `CreateResultMessage`.
+///
+/// Pulled out of `run_create_nonraw` so the partial-output cleanup
+/// in the caller is a single match arm.
+#[allow(clippy::too_many_arguments)]
+fn run_create_guest(
+    core_code: &[u8],
+    operation_code: &[u8],
+    args: &CreateArgs,
+    target_format: u32,
+    flags: u32,
+    virtual_size: u64,
+    cluster_size: u32,
+    refcount_bits: u8,
+    vmdk_subformat: u8,
+    vhd_subformat: u8,
+    grain_size: u32,
+    block_size: u32,
+    input_backing: BackingStore,
+    output_backing: BackingStore,
+    output_capacity_hint: u64,
+    verbose: bool,
+) -> Result<CreateRunResult, Box<dyn std::error::Error>> {
+    // --- KVM / VM / guest memory setup ----------------------------------
+    let kvm = Kvm::new()?;
+    debug!("KVM API version: {}", kvm.get_api_version());
+
+    let kvm_stats_checker = kvm_stats::KvmStatsChecker::new(&kvm);
+    kvm_stats_checker.display_status();
+
+    let vm = kvm.create_vm()?;
+    debug!("Created VM");
+
+    let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
+    debug!("Allocated {GUEST_MEM_SIZE} bytes of guest memory");
+
+    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let host_addr = region.as_ptr() as u64;
+
+    let mem_region = kvm_userspace_memory_region {
+        slot: 0,
+        guest_phys_addr: 0,
+        memory_size: GUEST_MEM_SIZE,
+        userspace_addr: host_addr,
+        flags: 0,
+    };
+    // SAFETY: mem_region.userspace_addr points to a valid
+    // GuestMemoryMmap allocation that outlives the VM.
+    unsafe {
+        vm.set_user_memory_region(mem_region)?;
+    }
+    debug!("Configured memory region");
+
+    setup_gdt(&guest_mem)?;
+    setup_page_tables(&guest_mem, GUEST_MEM_SIZE)?;
+
+    guest_mem.write_slice(core_code, GuestAddress(GUEST_CODE_BASE))?;
+    guest_mem.write_slice(operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
+
+    // --- Write CreateConfig at OPERATION_CONFIG_ADDR --------------------
+    // Layout (must match shared::CreateConfig exactly):
+    //    0: magic                u32
+    //    4: target_format        u32
+    //    8: flags                u32
+    //   12: sector_size          u32
+    //   16: virtual_size         u64
+    //   24: qcow2_cluster_size   u32
+    //   28: qcow2_refcount_bits  u8
+    //   29: vmdk_subformat       u8
+    //   30: vhd_subformat        u8
+    //   31: _pad                 u8
+    //   32: vmdk_grain_size      u32
+    //   36: block_size           u32
+    //   40: backing_file_len     u32
+    //   44: backing_file         [u8; 1024]
+    // 1068: backing_format       u32
+    // 1072: _reserved            [u8; 64]
+    guest_mem.write_obj(CREATE_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
+    guest_mem.write_obj(target_format, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
+    guest_mem.write_obj(flags, GuestAddress(OPERATION_CONFIG_ADDR + 8))?;
+    guest_mem.write_obj(args.sector_size, GuestAddress(OPERATION_CONFIG_ADDR + 12))?;
+    guest_mem.write_obj(virtual_size, GuestAddress(OPERATION_CONFIG_ADDR + 16))?;
+    guest_mem.write_obj(cluster_size, GuestAddress(OPERATION_CONFIG_ADDR + 24))?;
+    guest_mem.write_obj(refcount_bits, GuestAddress(OPERATION_CONFIG_ADDR + 28))?;
+    guest_mem.write_obj(vmdk_subformat, GuestAddress(OPERATION_CONFIG_ADDR + 29))?;
+    guest_mem.write_obj(vhd_subformat, GuestAddress(OPERATION_CONFIG_ADDR + 30))?;
+    // _pad (offset 31) left zero from page-zeroed memory.
+    guest_mem.write_obj(grain_size, GuestAddress(OPERATION_CONFIG_ADDR + 32))?;
+    guest_mem.write_obj(block_size, GuestAddress(OPERATION_CONFIG_ADDR + 36))?;
+    // backing_file_len + backing_file + backing_format land in phase 3d.
+    // Leaving them zero is the "no backing" state, which is the only path
+    // 3c supports.
+    guest_mem.write_obj(0u32, GuestAddress(OPERATION_CONFIG_ADDR + 40))?;
+    let zero_backing = [0u8; CREATE_CONFIG_MAX_BACKING_FILE];
+    guest_mem.write_slice(&zero_backing, GuestAddress(OPERATION_CONFIG_ADDR + 44))?;
+    guest_mem.write_obj(0u32, GuestAddress(OPERATION_CONFIG_ADDR + 1068))?;
+
+    debug!(
+        "Wrote create config at 0x{:x} (target={}, flags=0x{:x}, sector_size={}, \
+         virtual_size={}, cluster_size={}, refcount_bits={}, vmdk_subformat={}, \
+         vhd_subformat={}, grain_size={}, block_size={})",
+        OPERATION_CONFIG_ADDR,
+        target_format,
+        flags,
+        args.sector_size,
+        virtual_size,
+        cluster_size,
+        refcount_bits,
+        vmdk_subformat,
+        vhd_subformat,
+        grain_size,
+        block_size,
+    );
+
+    // --- Set up devices --------------------------------------------------
+    // core unconditionally initialises input device 0 (see core/src/
+    // main.rs::_start), so even though phase 3c has no real backing we
+    // attach a tiny stub at device index 0 and place the output at
+    // index 1. The guest never reads from the stub.
+    let mut device_set = DeviceSet::new();
+    let mut io_events: Vec<IoEvent> = Vec::new();
+
+    let input_mmio = device_mmio_base(0);
+    let input_vq = device_vq_base(0);
+    let input_device = VirtioBlockDevice::new(
+        input_backing,
+        args.sector_size as u64, // stub is exactly one sector
+        args.sector_size as u64,
+        true, // read-only
+        input_mmio,
+        input_vq,
+    );
+    let input_device = Arc::new(Mutex::new(input_device));
+    device_set.add_device(Arc::clone(&input_device), true);
+    io_events.push(IoEvent::new(input_mmio)?);
+
+    let output_mmio = device_mmio_base(1);
+    let output_vq = device_vq_base(1);
+    let output_device = VirtioBlockDevice::new(
+        output_backing,
+        output_capacity_hint,
+        args.sector_size as u64,
+        false, // writable
+        output_mmio,
+        output_vq,
+    );
+    debug!(
+        "Created output virtio-block device at MMIO 0x{output_mmio:x}, VQ 0x{output_vq:x} \
+         (capacity hint {output_capacity_hint} bytes)"
+    );
+    let output_device = Arc::new(Mutex::new(output_device));
+    device_set.add_device(Arc::clone(&output_device), false);
+    io_events.push(IoEvent::new(output_mmio)?);
+
+    let guest_mem = Arc::new(guest_mem);
+    let vmm_stats = Arc::new(Mutex::new(VmmStats::new()));
+
+    // Try to register ioeventfds; fall back to VM exits on failure.
+    let mut io_thread: Option<io_thread::IoThread> = None;
+    let mut registered_count = 0usize;
+    let mut registration_failed = false;
+    for evt in io_events.iter_mut() {
+        if let Err(e) = evt.register(&vm) {
+            debug!("ioeventfd: failed to register ({e:?}), falling back to VM exits");
+            registration_failed = true;
+            break;
+        }
+        registered_count += 1;
+    }
+    if registration_failed {
+        for evt in io_events.iter_mut().take(registered_count) {
+            let _ = evt.unregister(&vm);
+        }
+    }
+    let all_registered = !registration_failed;
+
+    if all_registered && !io_events.is_empty() {
+        debug!(
+            "ioeventfd: enabled for {} device(s) (with I/O thread)",
+            io_events.len()
+        );
+        let io_devices = device_set.create_io_devices(io_events);
+        io_thread = Some(io_thread::IoThread::new(
+            io_devices,
+            Arc::clone(&guest_mem),
+            Arc::clone(&vmm_stats),
+        ));
+    }
+
+    // --- vCPU setup ------------------------------------------------------
+    let mut vcpu = vm.create_vcpu(0)?;
+    let mut sregs = vcpu.get_sregs()?;
+    setup_sregs(&mut sregs);
+    vcpu.set_sregs(&sregs)?;
+    let mut regs = vcpu.get_regs()?;
+    setup_regs(&mut regs);
+    vcpu.set_regs(&regs)?;
+
+    // --- Serial decoders / transmitter / debug buffer -------------------
+    let mut serial_decoder = SerialDecoder::new();
+    let mut serial_transmitter = SerialTransmitter::new();
+    let mut debug_buffer = DebugBuffer::new();
+
+    // 1 stub input + 1 output, no progress events (the metadata write
+    // is tiny and instant). Phase 3d replaces the stub with the real
+    // backing image when -b is given.
+    let config = vmm_config(args.sector_size, args.sector_size, 100);
+    serial_transmitter.queue_config(&config);
+    debug!(
+        "Queued configuration message ({} bytes) for guest",
+        serial_transmitter.buffer.len()
+    );
+
+    // --- Run the vCPU loop ----------------------------------------------
+    let mut create_result_seen = false;
+    let mut harvested = CreateRunResult {
+        resolved_virtual_size: 0,
+        metadata_bytes_written: 0,
+        file_size_after: 0,
+        resolved_unit_size: 0,
+        error: CREATE_RESULT_ERROR_OK,
+    };
+    let mut vm_error: Option<String> = None;
+
+    debug!("Starting guest execution");
+
+    loop {
+        match vcpu.run()? {
+            VcpuExit::Hlt => {
+                vmm_stats.lock().unwrap().record_hlt();
+                debug!("Create operation completed (HLT)");
+                break;
+            }
+            VcpuExit::IoOut(port, data) => {
+                vmm_stats.lock().unwrap().record_io_out();
+                if port == SERIAL_PORT {
+                    for &byte in data {
+                        if let Some(msg) = serial_decoder.add_byte(byte) {
+                            if let Some(guest_::GuestMessage_::Payload::CreateResult(c)) =
+                                &msg.payload
+                            {
+                                harvested.resolved_virtual_size = c.resolved_virtual_size;
+                                harvested.metadata_bytes_written = c.metadata_bytes_written;
+                                harvested.file_size_after = c.file_size_after;
+                                harvested.resolved_unit_size = c.resolved_unit_size;
+                                harvested.error = c.error;
+                                create_result_seen = true;
+                            } else if verbose {
+                                debug!("{}", format_message(&msg));
+                            }
+                        }
+                    }
+                } else if port == DEBUG_PORT {
+                    for &byte in data {
+                        if let Some(line) = debug_buffer.add_byte(byte) {
+                            debug!("[GUEST] {line}");
+                        }
+                    }
+                } else {
+                    debug!("IO OUT: port=0x{port:x}, data={data:?}");
+                }
+            }
+            VcpuExit::IoIn(port, data) => {
+                vmm_stats.lock().unwrap().record_io_in();
+                if port == SERIAL_PORT {
+                    for byte in data.iter_mut() {
+                        *byte = serial_transmitter.next_byte().unwrap_or(0);
+                    }
+                } else if port == SERIAL_PORT + 5 {
+                    let mut lsr = 0x60u8;
+                    if serial_transmitter.has_data() {
+                        lsr |= 0x01;
+                    }
+                    data[0] = lsr;
+                } else {
+                    for byte in data {
+                        *byte = 0;
+                    }
+                }
+            }
+            VcpuExit::MmioRead(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_read();
+                let value = device_set.mmio_read(addr);
+                write_mmio_data(data, value);
+            }
+            VcpuExit::MmioWrite(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_write();
+                let value = read_mmio_data(data);
+                if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
+                    if io_thread.is_none() && should_process {
+                        device_set.process_queue_for_device(
+                            device_index,
+                            &guest_mem,
+                            &vmm_stats,
+                        )?;
+                    }
+                }
+            }
+            VcpuExit::Shutdown => {
+                vmm_stats.lock().unwrap().record_shutdown();
+                vm_error = Some("VM shutdown (triple fault)".to_string());
+                break;
+            }
+            VcpuExit::FailEntry(reason, cpu) => {
+                vmm_stats.lock().unwrap().record_fail_entry();
+                vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
+                break;
+            }
+            exit => {
+                vmm_stats.lock().unwrap().record_unknown();
+                vm_error = Some(format!("unexpected VM exit: {exit:?}"));
+                break;
+            }
+        }
+    }
+
+    if let Some(mut thread) = io_thread {
+        thread.stop();
+    }
+
+    if log::log_enabled!(log::Level::Debug) {
+        vmm_stats.lock().unwrap().display();
+    }
+
+    if let Some(error) = vm_error {
+        return Err(error.into());
+    }
+    if !create_result_seen {
+        return Err("create: guest did not return a result".into());
+    }
+
+    Ok(harvested)
+}
+
+/// User-facing message for each `CreateResult::ERROR_*` code.
+fn create_error_detail(code: u32) -> &'static str {
+    match code {
+        CREATE_RESULT_ERROR_INVALID_OPTION => "invalid option for target format",
+        CREATE_RESULT_ERROR_INVALID_SIZE => "virtual size out of range for format",
+        CREATE_RESULT_ERROR_SCRATCH_TOO_SMALL => {
+            "option combination exceeds guest scratch (try a larger cluster size)"
+        }
+        CREATE_RESULT_ERROR_BACKING_READ_FAILED => "failed to read backing file header",
+        CREATE_RESULT_ERROR_BACKING_PARSE_FAILED => {
+            "backing file format not supported \
+             (vhdx as backing is deferred — see PLAN-create.md phase 5)"
+        }
+        CREATE_RESULT_ERROR_BACKING_TOO_LONG => "backing file path too long (max 1024 bytes)",
+        CREATE_RESULT_ERROR_WRITE_FAILED => "write to output device failed",
+        CREATE_RESULT_ERROR_UNSUPPORTED_FORMAT => "target format not supported",
+        _ => "unknown error",
+    }
 }
 
 /// Host-side raw image creation: `open(O_CREAT|O_TRUNC|O_RDWR)` +
@@ -6442,10 +7010,19 @@ fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
         return Err("create: either SIZE or -b BACKING must be provided".into());
     }
 
-    // Sector size: power of 2, 512..=MAX_SECTOR_SIZE.
-    if !(512..=MAX_SECTOR_SIZE).contains(&args.sector_size) || !args.sector_size.is_power_of_two() {
+    // Sector size: phase 3 only supports 512. Larger sector sizes
+    // are valid per the call-table ABI but the create metadata
+    // layouts in `crates/create` were sized for 512-byte alignment
+    // (per-format header / descriptor / footer offsets), and the
+    // guest's sector-by-sector write loop would conflate multiple
+    // metadata regions into a single big sector if asked. Phase 5
+    // may relax this once the planner emits coalesced sector-sized
+    // writes.
+    if args.sector_size != 512 {
         return Err(format!(
-            "create: --sector-size must be a power of 2 in 512..={MAX_SECTOR_SIZE} (got {})",
+            "create: --sector-size must be 512 in phase 3 \
+             (larger sector sizes are deferred — see PLAN-create.md \
+             phase 5; got {})",
             args.sector_size
         )
         .into());
