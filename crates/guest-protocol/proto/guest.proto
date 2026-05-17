@@ -206,6 +206,32 @@ message MeasureResultMessage {
   uint32 error = 5;
 }
 
+// Image creation result (from create operation).
+message CreateResultMessage {
+  // Target output format echoed back (e.g. "raw", "qcow2", "vmdk",
+  // "vhd", "vhdx").
+  string target_format = 1;
+  // Resolved virtual disk size in bytes. Equal to the requested size
+  // when the host supplied an explicit virtual_size, or the backing
+  // file's virtual size when the size was inferred from the backing.
+  uint64 resolved_virtual_size = 2;
+  // Bytes the guest actually wrote to the output device (sum of
+  // MetadataWrite lengths in the plan).
+  uint64 metadata_bytes_written = 3;
+  // File size after the guest finishes (max byte_offset + len across
+  // the plan). The host may grow the file beyond this for
+  // preallocation in phase 6.
+  uint64 file_size_after = 4;
+  // Cluster / grain / block size actually used. 0 for raw output.
+  uint32 resolved_unit_size = 5;
+  // Error code: 0 = ok, non-zero mirrors CreateResult::ERROR_* in
+  // src/shared/src/lib.rs (1=invalid_option, 2=invalid_size,
+  // 3=scratch_too_small, 4=backing_read_failed,
+  // 5=backing_parse_failed, 6=backing_too_long, 7=write_failed,
+  // 8=unsupported_format).
+  uint32 error = 6;
+}
+
 // Main message wrapper with level and payload
 message GuestMessage {
   Level level = 1;
@@ -219,5 +245,6 @@ message GuestMessage {
     CheckResultMessage check_result = 8;
     CompareResultMessage compare_result = 9;
     MeasureResultMessage measure_result = 10;
+    CreateResultMessage create_result = 11;
   }
 }

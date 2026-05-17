@@ -270,6 +270,18 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
                 m.target_format, m.required, m.fully_allocated, m.resolved_unit_size, m.error
             )
         }
+        Some(guest_::GuestMessage_::Payload::CreateResult(c)) => {
+            format!(
+                "create_result target_format={} resolved_virtual_size={} \
+                metadata_bytes_written={} file_size_after={} resolved_unit_size={} error={}",
+                c.target_format,
+                c.resolved_virtual_size,
+                c.metadata_bytes_written,
+                c.file_size_after,
+                c.resolved_unit_size,
+                c.error
+            )
+        }
         None => "empty payload".to_string(),
     };
 

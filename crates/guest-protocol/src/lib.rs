@@ -598,6 +598,32 @@ pub fn measure_result_message(
     msg
 }
 
+/// Build a CreateResultMessage envelope from the create operation's
+/// fields. Mirrors `measure_result_message` — the host treats both
+/// the same way after framing.
+pub fn create_result_message(
+    target_format: &str,
+    resolved_virtual_size: u64,
+    metadata_bytes_written: u64,
+    file_size_after: u64,
+    resolved_unit_size: u32,
+    error: u32,
+) -> guest_::GuestMessage {
+    let mut msg = guest_::GuestMessage::default();
+    msg.level = guest_::Level::Info;
+
+    let mut result = guest_::CreateResultMessage::default();
+    push_str(&mut result.target_format, target_format);
+    result.resolved_virtual_size = resolved_virtual_size;
+    result.metadata_bytes_written = metadata_bytes_written;
+    result.file_size_after = file_size_after;
+    result.resolved_unit_size = resolved_unit_size;
+    result.error = error;
+
+    msg.payload = Some(guest_::GuestMessage_::Payload::CreateResult(result));
+    msg
+}
+
 // =============================================================================
 // VMM -> Guest configuration message support
 // =============================================================================
