@@ -6310,18 +6310,113 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 
 /// Entry point for the `create` subcommand.
 ///
-/// Phase 3a: argument-level validation only. The raw short-circuit
-/// lands in step 3b; the non-raw KVM dispatch lands in step 3c.
-/// Until then `run_create` validates inputs and returns a clear
-/// "phase 3b/3c will implement this" error.
+/// Phase 3a validated the args. Phase 3b adds the raw short-circuit
+/// (host-side open + ftruncate + optional posix_fallocate). The
+/// non-raw KVM dispatch lands in step 3c.
 fn run_create(args: CreateArgs, _verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     validate_create_args(&args)?;
+
+    // Raw output bypasses the guest entirely — there is no metadata
+    // to emit. Open + ftruncate (+ optional posix_fallocate for the
+    // falloc preallocation mode) is the whole job.
+    if args.target_format == "raw" {
+        return run_create_raw(&args);
+    }
+
     Err(
-        "create: KVM dispatch is not yet implemented (phase 3b implements \
-         the raw short-circuit; phase 3c implements the guest dispatch \
-         — see docs/plans/PLAN-create-phase-03-host-cli.md)"
+        "create: non-raw KVM dispatch is not yet implemented (phase 3c \
+         implements the guest dispatch — see \
+         docs/plans/PLAN-create-phase-03-host-cli.md)"
             .into(),
     )
+}
+
+/// Host-side raw image creation: `open(O_CREAT|O_TRUNC|O_RDWR)` +
+/// `ftruncate(SIZE)`, plus `posix_fallocate` when the user asked
+/// for preallocation=falloc. On any failure the partial output
+/// file is removed before propagating the error.
+fn run_create_raw(args: &CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let size_str = args.size.as_ref().ok_or("create: -f raw requires SIZE")?;
+    let virtual_size = parse_memory_size(size_str)?;
+    let preallocate = args.preallocation == "falloc";
+
+    let path = Path::new(&args.filename);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .read(true)
+        .mode(0o644)
+        .open(path)
+        .map_err(|e| format!("create: open '{}' failed: {}", args.filename, e))?;
+
+    if let Err(e) = create_raw_finalize(&file, virtual_size, preallocate) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    drop(file);
+
+    if !args.quiet {
+        render_create_success(args, virtual_size, 0, virtual_size, 0);
+    }
+    Ok(())
+}
+
+/// Apply ftruncate + (optional) posix_fallocate and fsync. Split
+/// out so `run_create_raw` can handle cleanup uniformly on any
+/// failure.
+fn create_raw_finalize(
+    file: &std::fs::File,
+    virtual_size: u64,
+    preallocate: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    file.set_len(virtual_size)
+        .map_err(|e| format!("create: ftruncate failed: {}", e))?;
+
+    if preallocate {
+        use std::os::fd::AsRawFd;
+        let fd = file.as_raw_fd();
+        // posix_fallocate returns 0 on success, errno on failure
+        // (does not set errno; the return value IS the errno).
+        let rc = unsafe { libc::posix_fallocate(fd, 0, virtual_size as libc::off_t) };
+        if rc != 0 {
+            return Err(format!(
+                "create: posix_fallocate failed: {}",
+                std::io::Error::from_raw_os_error(rc)
+            )
+            .into());
+        }
+    }
+
+    file.sync_all()
+        .map_err(|e| format!("create: sync failed: {}", e))?;
+    Ok(())
+}
+
+/// Minimal success-line renderer for phase 3b. Phase 3e replaces
+/// this with the full human / json / quiet rendering machinery.
+fn render_create_success(
+    args: &CreateArgs,
+    virtual_size: u64,
+    metadata_bytes_written: u64,
+    _file_size_after: u64,
+    resolved_unit_size: u32,
+) {
+    let _ = metadata_bytes_written; // unused until phase 3e
+    if resolved_unit_size == 0 {
+        println!(
+            "Created: {} (format={}, virtual_size={})",
+            args.filename, args.target_format, virtual_size
+        );
+    } else {
+        println!(
+            "Created: {} (format={}, virtual_size={}, unit_size={})",
+            args.filename, args.target_format, virtual_size, resolved_unit_size
+        );
+    }
 }
 
 /// Host-side defensive validation of `CreateArgs`. The guest
