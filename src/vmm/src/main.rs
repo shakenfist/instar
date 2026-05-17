@@ -5853,12 +5853,6 @@ fn parse_create_o_u8(key: &str, value: &str) -> Result<u8, Box<dyn std::error::E
 /// Returns an error on unknown keys, invalid values, or
 /// not-yet-supported features. Repeated keys across all `-o`
 /// invocations are last-wins.
-//
-// `#[allow(dead_code)]` lives here for phase 4a only — the
-// integration into `run_create` lands in phase 4b. The unit
-// tests in `create_option_tests` exercise it via the cfg(test)
-// build until then.
-#[allow(dead_code)]
 fn parse_create_o_options(
     target: &str,
     raw: &[String],
@@ -6663,10 +6657,15 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 
 /// Entry point for the `create` subcommand.
 ///
-/// Phase 3a validated the args. Phase 3b adds the raw short-circuit
-/// (host-side open + ftruncate + optional posix_fallocate). The
-/// non-raw KVM dispatch lands in step 3c.
-fn run_create(args: CreateArgs, _verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+/// Phase 4 wires `-o KEY=VAL,...` parsing on top of the phase-3
+/// individual flags: parse `-o` first, then apply the overrides
+/// to a mutable copy of the args (last-wins, matches qemu-img
+/// and measure), then run the full validator. Raw output bypasses
+/// the guest entirely; everything else dispatches into
+/// `run_create_nonraw`.
+fn run_create(mut args: CreateArgs, _verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let overrides = parse_create_o_options(&args.target_format, &args.option)?;
+    apply_create_overrides(&mut args, overrides);
     validate_create_args(&args)?;
 
     // Raw output bypasses the guest entirely — there is no metadata
@@ -6677,6 +6676,67 @@ fn run_create(args: CreateArgs, _verbose: bool) -> Result<(), Box<dyn std::error
     }
 
     run_create_nonraw(&args, _verbose)
+}
+
+/// Apply parsed `-o` overrides on top of the individual `--flag`
+/// values. Overrides always win (last-wins on the command line,
+/// matching qemu-img). Mutating `CreateArgs` in place keeps the
+/// rest of `run_create_raw` / `run_create_nonraw` unchanged —
+/// they read the same field set as before.
+fn apply_create_overrides(args: &mut CreateArgs, overrides: CreateOptionOverrides) {
+    if let Some(v) = overrides.cluster_size {
+        args.cluster_size = v;
+    }
+    if let Some(v) = overrides.refcount_bits {
+        args.refcount_bits = v;
+    }
+    if let Some(v) = overrides.extended_l2 {
+        args.extended_l2 = v;
+    }
+    if let Some(v) = overrides.lazy_refcounts {
+        args.lazy_refcounts = v;
+    }
+    if let Some(v) = overrides.compat_v3 {
+        args.compat = if v { "1.1" } else { "0.10" }.to_string();
+    }
+    if let Some(v) = overrides.vmdk_subformat {
+        args.subformat = match v {
+            0 => "monolithicSparse",
+            1 => "streamOptimized",
+            2 => "monolithicFlat",
+            _ => "monolithicSparse",
+        }
+        .to_string();
+    }
+    if let Some(v) = overrides.grain_size {
+        args.grain_size = v;
+    }
+    if let Some(v) = overrides.vhd_subformat {
+        args.subformat = match v {
+            0 => "dynamic",
+            1 => "fixed",
+            _ => "dynamic",
+        }
+        .to_string();
+    }
+    if let Some(v) = overrides.block_size {
+        args.block_size = v;
+    }
+    if let Some(v) = overrides.preallocation {
+        args.preallocation = v.to_string();
+    }
+    if let Some(v) = overrides.size {
+        // Encode the override as a decimal-bytes string so the
+        // existing parse_memory_size call site picks it up
+        // unchanged. -o size wins over the positional SIZE.
+        args.size = Some(v.to_string());
+    }
+    if let Some(v) = overrides.backing_file {
+        args.backing = Some(v);
+    }
+    if let Some(v) = overrides.backing_fmt {
+        args.backing_format = Some(v.to_string());
+    }
 }
 
 /// Map a backing-format string (the `-F` argument) to its numeric
@@ -7465,17 +7525,6 @@ fn json_escape_string(s: &str) -> String {
 /// re-checks every critical field, but failing early at the host
 /// gives a clearer user-facing error before any I/O or KVM setup.
 fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
-    // -o key=value parser lands in phase 4; reject any -o in phase 3
-    // with a hint pointing at the individual flags.
-    if !args.option.is_empty() {
-        return Err("create: -o key=value parsing lands in phase 4 of \
-                    PLAN-create.md. Use the individual --cluster-size / \
-                    --refcount-bits / --extended-l2 / --grain-size / \
-                    --block-size / --subformat / --compat / \
-                    --preallocation flags instead."
-            .into());
-    }
-
     // Filename + (size or backing).
     if args.filename.is_empty() {
         return Err("create: FILENAME is required".into());
