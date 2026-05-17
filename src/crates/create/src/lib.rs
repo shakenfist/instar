@@ -632,14 +632,138 @@ fn format_u64_decimal(mut val: u64, buf: &mut [u8; 20]) -> &[u8] {
     &buf[pos..20]
 }
 
-/// Build a metadata plan for a VHD image.
+/// Build a metadata plan for a VHD image (Dynamic or Fixed).
 ///
-/// Stub: returns [`CreateError::ScratchTooSmall`] until phase-1e.
+/// Dynamic layout:
+///
+///   bytes 0..512:                  head footer copy
+///   bytes 512..1536:               dynamic header
+///   bytes 1536..1536+bat_padded:   BAT (entries = 0xFFFF_FFFF)
+///   bytes total-512..total:        tail footer
+///
+/// Fixed layout: phase 1 emits only the footer at byte
+/// `virtual_size`. The data region is left as a sparse hole; phase 6
+/// handles `preallocation=full` by writing zeros.
 pub fn plan_vhd<'a>(
-    _opts: &VhdCreateOpts<'_>,
-    _scratch: &'a mut [u8],
+    opts: &VhdCreateOpts<'_>,
+    scratch: &'a mut [u8],
 ) -> Result<MetadataPlan<'a>, CreateError> {
-    Err(CreateError::ScratchTooSmall)
+    if opts.virtual_size == 0 {
+        return Err(CreateError::InvalidVirtualSize);
+    }
+    if opts.backing.is_some() {
+        // Differencing VHD (DISK_TYPE_DIFFERENCING + parent locators)
+        // is deferred — too complex for phase 1.
+        return Err(CreateError::BackingFileUnsupported);
+    }
+
+    const SECTOR: u64 = 512;
+    const FOOTER_BYTES: usize = vhd::FOOTER_SIZE;
+    const DYN_HEADER_BYTES: usize = vhd::DYNAMIC_HEADER_SIZE;
+    const UUID_ZERO: [u8; 16] = [0; 16];
+
+    match opts.subformat {
+        VhdSubformat::Dynamic => {
+            if opts.block_size == 0
+                || !opts.block_size.is_power_of_two()
+                || opts.block_size < 512 * 1024
+                || opts.block_size > 256 * 1024 * 1024
+            {
+                return Err(CreateError::InvalidBlockSize);
+            }
+            let block_size = opts.block_size as u64;
+            let max_table_entries: u32 = opts.virtual_size.div_ceil(block_size) as u32;
+            let bat_bytes: u64 = max_table_entries as u64 * 4;
+            let bat_padded: u64 = bat_bytes.div_ceil(SECTOR) * SECTOR;
+
+            let head_footer_off: u64 = 0;
+            let dyn_header_off: u64 = SECTOR; // sector 1
+            let bat_off: u64 = SECTOR + DYN_HEADER_BYTES as u64;
+            let tail_footer_off: u64 = bat_off + bat_padded;
+            let total_file_size: u64 = tail_footer_off + FOOTER_BYTES as u64;
+
+            let total_bytes_needed: usize =
+                FOOTER_BYTES * 2 + DYN_HEADER_BYTES + bat_padded as usize;
+            if scratch.len() < total_bytes_needed {
+                return Err(CreateError::ScratchTooSmall);
+            }
+
+            let (head_footer_region, rest) = scratch.split_at_mut(FOOTER_BYTES);
+            let (dyn_header_region, rest) = rest.split_at_mut(DYN_HEADER_BYTES);
+            let (bat_region, rest) = rest.split_at_mut(bat_padded as usize);
+            let (tail_footer_region, _) = rest.split_at_mut(FOOTER_BYTES);
+
+            head_footer_region.fill(0);
+            vhd::build_footer(
+                head_footer_region,
+                opts.virtual_size,
+                vhd::DISK_TYPE_DYNAMIC,
+                dyn_header_off,
+                &UUID_ZERO,
+            );
+
+            dyn_header_region.fill(0);
+            vhd::build_dynamic_header(
+                dyn_header_region,
+                bat_off,
+                max_table_entries,
+                opts.block_size,
+            );
+
+            // BAT: meaningful entries are 0xFF, padding is zero.
+            bat_region[..bat_bytes as usize].fill(0xFF);
+            bat_region[bat_bytes as usize..bat_padded as usize].fill(0);
+
+            tail_footer_region.fill(0);
+            vhd::build_footer(
+                tail_footer_region,
+                opts.virtual_size,
+                vhd::DISK_TYPE_DYNAMIC,
+                dyn_header_off,
+                &UUID_ZERO,
+            );
+
+            let mut plan = MetadataPlan::new();
+            plan.push(MetadataWrite {
+                byte_offset: head_footer_off,
+                bytes: head_footer_region,
+            })?;
+            plan.push(MetadataWrite {
+                byte_offset: dyn_header_off,
+                bytes: dyn_header_region,
+            })?;
+            plan.push(MetadataWrite {
+                byte_offset: bat_off,
+                bytes: bat_region,
+            })?;
+            plan.push(MetadataWrite {
+                byte_offset: tail_footer_off,
+                bytes: tail_footer_region,
+            })?;
+            debug_assert_eq!(plan.minimum_file_size, total_file_size);
+            Ok(plan)
+        }
+        VhdSubformat::Fixed => {
+            if scratch.len() < FOOTER_BYTES {
+                return Err(CreateError::ScratchTooSmall);
+            }
+            let (footer_region, _) = scratch.split_at_mut(FOOTER_BYTES);
+            footer_region.fill(0);
+            vhd::build_footer(
+                footer_region,
+                opts.virtual_size,
+                vhd::DISK_TYPE_FIXED,
+                0xFFFF_FFFF_FFFF_FFFF,
+                &UUID_ZERO,
+            );
+            let mut plan = MetadataPlan::new();
+            plan.push(MetadataWrite {
+                byte_offset: opts.virtual_size,
+                bytes: footer_region,
+            })?;
+            Ok(plan)
+        }
+    }
 }
 
 /// Build a metadata plan for a VHDX image.
@@ -944,6 +1068,143 @@ mod vmdk_plan_tests {
         let opts = default_opts(1 << 30);
         let mut scratch = vec![0u8; VMDK_MAX_METADATA_SCRATCH];
         let plan = plan_vmdk(&opts, &mut scratch).expect("plan");
+        let mut sorted: std::vec::Vec<&MetadataWrite<'_>> = plan.writes().iter().collect();
+        sorted.sort_by_key(|w| w.byte_offset);
+        for pair in sorted.windows(2) {
+            let prev = pair[0];
+            let next = pair[1];
+            assert!(prev.byte_offset + prev.bytes.len() as u64 <= next.byte_offset);
+        }
+    }
+}
+
+#[cfg(test)]
+mod vhd_plan_tests {
+    use super::*;
+    use std::vec;
+
+    fn materialise(plan: &MetadataPlan<'_>) -> std::vec::Vec<u8> {
+        let mut buf = std::vec![0u8; plan.minimum_file_size as usize];
+        for w in plan.writes() {
+            let start = w.byte_offset as usize;
+            let end = start + w.bytes.len();
+            buf[start..end].copy_from_slice(w.bytes);
+        }
+        buf
+    }
+
+    fn default_dynamic(virtual_size: u64) -> VhdCreateOpts<'static> {
+        VhdCreateOpts {
+            virtual_size,
+            subformat: VhdSubformat::Dynamic,
+            block_size: 2 * 1024 * 1024, // 2 MiB
+            backing: None,
+        }
+    }
+
+    fn default_fixed(virtual_size: u64) -> VhdCreateOpts<'static> {
+        VhdCreateOpts {
+            virtual_size,
+            subformat: VhdSubformat::Fixed,
+            block_size: 0,
+            backing: None,
+        }
+    }
+
+    fn run(opts: &VhdCreateOpts<'_>) -> std::vec::Vec<u8> {
+        let mut scratch = vec![0u8; VHD_MAX_METADATA_SCRATCH];
+        let plan = plan_vhd(opts, &mut scratch).expect("plan");
+        let sum: u64 = plan.writes().iter().map(|w| w.bytes.len() as u64).sum();
+        assert_eq!(plan.total_metadata_bytes, sum);
+        let max_end: u64 = plan
+            .writes()
+            .iter()
+            .map(|w| w.byte_offset + w.bytes.len() as u64)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(plan.minimum_file_size, max_end);
+        materialise(&plan)
+    }
+
+    #[test]
+    fn plan_vhd_dynamic_1mib_round_trips() {
+        let opts = default_dynamic(1 << 20);
+        let bytes = run(&opts);
+        // Tail footer should parse.
+        let footer = vhd::VhdFooter::parse(&bytes[bytes.len() - 512..]).expect("parse footer");
+        assert_eq!(footer.current_size, 1 << 20);
+        assert_eq!(footer.disk_type, vhd::DISK_TYPE_DYNAMIC);
+    }
+
+    #[test]
+    fn plan_vhd_dynamic_1gib_round_trips() {
+        let opts = default_dynamic(1 << 30);
+        let bytes = run(&opts);
+        let footer = vhd::VhdFooter::parse(&bytes[bytes.len() - 512..]).expect("parse footer");
+        assert_eq!(footer.current_size, 1 << 30);
+        // Head copy should also parse identically.
+        let head = vhd::VhdFooter::parse(&bytes[..512]).expect("parse head footer");
+        assert_eq!(head.current_size, 1 << 30);
+        assert_eq!(head.disk_type, vhd::DISK_TYPE_DYNAMIC);
+    }
+
+    #[test]
+    fn plan_vhd_fixed_round_trips() {
+        let opts = default_fixed(1 << 20);
+        let bytes = run(&opts);
+        // File size should be virtual_size + 512.
+        assert_eq!(bytes.len() as u64, (1 << 20) + 512);
+        let footer = vhd::VhdFooter::parse(&bytes[bytes.len() - 512..]).expect("parse footer");
+        assert_eq!(footer.current_size, 1 << 20);
+        assert_eq!(footer.disk_type, vhd::DISK_TYPE_FIXED);
+    }
+
+    #[test]
+    fn plan_vhd_dynamic_bat_all_unallocated() {
+        let opts = default_dynamic(1 << 20);
+        let bytes = run(&opts);
+        // BAT begins at offset 1536 (sector 3).
+        let bat_start = 1536;
+        // virtual_size 1 MiB / block_size 2 MiB = 1 entry
+        let entry = u32::from_be_bytes([
+            bytes[bat_start],
+            bytes[bat_start + 1],
+            bytes[bat_start + 2],
+            bytes[bat_start + 3],
+        ]);
+        assert_eq!(entry, 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn plan_vhd_rejects_backing() {
+        let mut opts = default_dynamic(1 << 20);
+        opts.backing = Some(BackingRef {
+            path: b"parent.vhd",
+            format: Some(ImageFormat::Vhd),
+        });
+        let mut scratch = vec![0u8; VHD_MAX_METADATA_SCRATCH];
+        assert!(matches!(
+            plan_vhd(&opts, &mut scratch),
+            Err(CreateError::BackingFileUnsupported)
+        ));
+    }
+
+    #[test]
+    fn plan_vhd_rejects_bad_block_size() {
+        let mut opts = default_dynamic(1 << 20);
+        opts.block_size = 1000;
+        let mut scratch = vec![0u8; VHD_MAX_METADATA_SCRATCH];
+        assert!(matches!(
+            plan_vhd(&opts, &mut scratch),
+            Err(CreateError::InvalidBlockSize)
+        ));
+    }
+
+    #[test]
+    fn plan_vhd_writes_dont_overlap() {
+        let opts = default_dynamic(1 << 30);
+        let mut scratch = vec![0u8; VHD_MAX_METADATA_SCRATCH];
+        let plan = plan_vhd(&opts, &mut scratch).expect("plan");
         let mut sorted: std::vec::Vec<&MetadataWrite<'_>> = plan.writes().iter().collect();
         sorted.sort_by_key(|w| w.byte_offset);
         for pair in sorted.windows(2) {

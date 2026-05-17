@@ -10,3 +10,4 @@ publish = false
 shared = { path = "../../shared" }
 qcow2  = { path = "../qcow2", features = ["create"], default-features = false }
 vmdk   = { path = "../vmdk",  default-features = false }
+vhd    = { path = "../vhd",   default-features = false }
