@@ -251,3 +251,163 @@ class TestCreateSmoke(InstarTestBase):
         if backing_file is not None:
             self.assertEqual(info.get('backing-filename'), backing_file,
                              f'backing-filename mismatch for {path}')
+
+
+class TestCreateOOptions(InstarTestBase):
+    """Integration tests for `-o key=value,...` parsing wired through to run_create."""
+
+    def run_instar_create(self, *args, timeout=60):
+        instar = self.get_instar_binary()
+        cmd = [str(instar), 'create', *[str(a) for a in args]]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            return r.stdout, r.stderr, r.returncode
+        except subprocess.TimeoutExpired:
+            return '', f'Timeout after {timeout}s', -1
+
+    def run_instar_info(self, path, *, timeout=30):
+        instar = self.get_instar_binary()
+        cmd = [str(instar), 'info', '--output', 'json', str(path)]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            return r.stdout, r.stderr, r.returncode
+        except subprocess.TimeoutExpired:
+            return '', f'Timeout after {timeout}s', -1
+
+    def _info_json(self, path):
+        stdout, stderr, rc = self.run_instar_info(path)
+        self.assertEqual(rc, 0, f'info on {path} failed: {stderr}')
+        return json.loads(stdout)
+
+    # ------------------------------------------------------------------
+    # Happy paths
+    # ------------------------------------------------------------------
+
+    def test_o_cluster_size_round_trips(self):
+        """`-o cluster_size=4k` round-trips through info."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'foo.qcow2'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2', '-o', 'cluster_size=4k', str(path), '16M')
+            self.assertEqual(rc, 0, f'create failed: {stderr}')
+            info = self._info_json(path)
+            self.assertEqual(info['cluster-size'], 4096)
+
+    def test_o_extended_l2_round_trips(self):
+        """`-o extended_l2=on` sets the bit."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'foo.qcow2'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2', '-o', 'extended_l2=on', str(path), '16M')
+            self.assertEqual(rc, 0, f'create failed: {stderr}')
+            info = self._info_json(path)
+            self.assertTrue(info.get('format-specific', {})
+                            .get('data', {}).get('extended-l2', False),
+                            f'extended_l2 should be set; got info={info!r}')
+
+    def test_o_size_alone_works_without_positional(self):
+        """`-o size=16M` works as the only size source."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'foo.qcow2'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2', '-o', 'size=16M', str(path))
+            self.assertEqual(rc, 0, f'create -o size failed: {stderr}')
+            info = self._info_json(path)
+            self.assertEqual(info['virtual-size'], 16 * 1024 * 1024)
+
+    def test_o_size_overrides_positional(self):
+        """`-o size=64M` wins over positional SIZE=16M."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'foo.qcow2'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2', '-o', 'size=64M', str(path), '16M')
+            self.assertEqual(rc, 0, f'override failed: {stderr}')
+            info = self._info_json(path)
+            self.assertEqual(info['virtual-size'], 64 * 1024 * 1024,
+                             f'-o size should win; got {info}')
+
+    def test_o_backing_file_and_fmt(self):
+        """`-o backing_file=...,backing_fmt=qcow2` as an alternative to -b -F."""
+        with tempfile.TemporaryDirectory() as td:
+            parent = Path(td) / 'parent.qcow2'
+            child = Path(td) / 'child.qcow2'
+            _, _, rc = self.run_instar_create('-f', 'qcow2', str(parent), '32M')
+            self.assertEqual(rc, 0, 'parent create failed')
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2',
+                '-o', 'backing_file=parent.qcow2,backing_fmt=qcow2',
+                str(child))
+            self.assertEqual(rc, 0, f'-o backing create failed: {stderr}')
+            info = self._info_json(child)
+            self.assertEqual(info.get('backing-filename'), 'parent.qcow2')
+            self.assertEqual(info['virtual-size'], 32 * 1024 * 1024)
+
+    def test_o_compound_value_with_multiple_keys(self):
+        """Comma-separated values parse multiple keys in one -o.
+
+        Uses cluster_size + extended_l2 because both round-trip
+        through `instar info`. Note: refcount_bits != 16 currently
+        does *not* round-trip — qcow2::create::build_header
+        hardcodes refcount_order=4 to match convert's behaviour.
+        Phase-1's unit tests document this limitation.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'foo.qcow2'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2',
+                '-o', 'cluster_size=4k,extended_l2=on',
+                str(path), '16M')
+            self.assertEqual(rc, 0, f'compound -o failed: {stderr}')
+            info = self._info_json(path)
+            self.assertEqual(info['cluster-size'], 4096)
+            self.assertTrue(info.get('format-specific', {})
+                            .get('data', {}).get('extended-l2', False))
+
+    def test_o_wins_over_individual_flag(self):
+        """When both --cluster-size and -o cluster_size are given, -o wins."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'foo.qcow2'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2',
+                '--cluster-size', '65536',
+                '-o', 'cluster_size=4k',
+                str(path), '16M')
+            self.assertEqual(rc, 0, f'override-flag failed: {stderr}')
+            info = self._info_json(path)
+            self.assertEqual(info['cluster-size'], 4096,
+                             '-o should win over --cluster-size')
+
+    # ------------------------------------------------------------------
+    # Error paths
+    # ------------------------------------------------------------------
+
+    def test_o_unknown_key_errors(self):
+        """`-o nonsense=1` returns non-zero with the unknown-key message."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'foo.qcow2'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2', '-o', 'nonsense=1', str(path), '16M')
+            self.assertNotEqual(rc, 0)
+            self.assertIn('nonsense', stderr)
+            self.assertIn('qcow2', stderr)
+
+    def test_o_encrypt_key_errors_with_future_work(self):
+        """`-o encrypt.cipher=aes` returns the deferred message."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'foo.qcow2'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2', '-o', 'encrypt.cipher=aes', str(path), '16M')
+            self.assertNotEqual(rc, 0)
+            self.assertIn('encrypt', stderr)
+            self.assertIn('deferred', stderr)
+
+    def test_o_preallocation_metadata_phase6_gated(self):
+        """`-o preallocation=metadata` returns the phase-6 deferred message."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'foo.qcow2'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2', '-o', 'preallocation=metadata',
+                str(path), '16M')
+            self.assertNotEqual(rc, 0)
+            self.assertIn('preallocation', stderr)
+            self.assertIn('phase 6', stderr)
