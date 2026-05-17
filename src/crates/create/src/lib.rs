@@ -243,6 +243,14 @@ pub struct VmdkCreateOpts<'a> {
     pub grain_size: u32,
     /// Optional backing image to chain to.
     pub backing: Option<BackingRef<'a>>,
+    /// When the backing is a VMDK, the parent's `CID` value to write
+    /// into the new descriptor's `parentCID=` line. `None` falls back
+    /// to a fixed sentinel (`0xdeadbeef`) — used when the backing
+    /// isn't a VMDK or the caller couldn't extract the CID (e.g.
+    /// parent descriptor unreadable). Phase 5b wires this through
+    /// from the create guest's
+    /// [`vmdk::read_and_parse_descriptor`] call.
+    pub parent_cid: Option<u32>,
 }
 
 /// VHD subformat selector.
@@ -548,7 +556,13 @@ pub fn plan_vmdk<'a>(
     // parentFileNameHint).
     desc_region.fill(0);
     let _desc_len = if let Some(path) = backing_path {
-        build_vmdk_descriptor_with_backing(desc_region, capacity_sectors, stream_optimized, path)
+        build_vmdk_descriptor_with_backing(
+            desc_region,
+            capacity_sectors,
+            stream_optimized,
+            path,
+            opts.parent_cid,
+        )
     } else if stream_optimized {
         vmdk::build_streamoptimized_descriptor(desc_region, 0, capacity_sectors)
     } else {
@@ -590,11 +604,18 @@ pub fn plan_vmdk<'a>(
 /// written. We re-implement rather than call `vmdk::build_descriptor`
 /// because the stock builder hardcodes parentCID=FFFFFFFF and has no
 /// hook for the parent filename.
+///
+/// `parent_cid` carries the parent's `CID` value when the caller
+/// could extract it (vmdk-from-vmdk path; phase 5b wires this via
+/// `vmdk::read_and_parse_descriptor`). `None` falls back to the
+/// fixed sentinel `0xdeadbeef` — used when the backing is non-vmdk
+/// (no CID concept) or descriptor extraction fails.
 fn build_vmdk_descriptor_with_backing(
     buf: &mut [u8],
     capacity_sectors: u64,
     stream_optimized: bool,
     parent_path: &[u8],
+    parent_cid: Option<u32>,
 ) -> usize {
     let mut pos: usize = 0;
     let mut put = |bytes: &[u8], pos: &mut usize| {
@@ -608,11 +629,14 @@ fn build_vmdk_descriptor_with_backing(
     put(b"# Disk DescriptorFile\n", &mut pos);
     put(b"version=1\n", &mut pos);
     put(b"CID=fffffffe\n", &mut pos);
-    // Use a fixed nonzero parentCID. qemu-img normally uses the
-    // parent's own CID — we don't read the parent in phase 1, so a
-    // sentinel value is the best we can do; phase 5 can compute the
-    // real parent CID once it reads the parent header.
-    put(b"parentCID=deadbeef\n", &mut pos);
+    // parentCID line: use the real value when supplied, fall back
+    // to a fixed sentinel otherwise.
+    let parent_cid_val = parent_cid.unwrap_or(0xdead_beef);
+    let mut cid_buf = [0u8; 16];
+    let cid_hex = format_u32_hex8(parent_cid_val, &mut cid_buf);
+    put(b"parentCID=", &mut pos);
+    put(cid_hex, &mut pos);
+    put(b"\n", &mut pos);
     if stream_optimized {
         put(b"createType=\"streamOptimized\"\n", &mut pos);
     } else {
@@ -634,6 +658,18 @@ fn build_vmdk_descriptor_with_backing(
     put(b"#DDB\n", &mut pos);
 
     pos
+}
+
+/// Format a u32 as a fixed-width 8-character lowercase hex string
+/// (matches qemu-img's parentCID format). The output buffer must
+/// be at least 8 bytes.
+fn format_u32_hex8(val: u32, buf: &mut [u8; 16]) -> &[u8] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for (i, slot) in buf.iter_mut().take(8).enumerate() {
+        let nibble = (val >> ((7 - i) * 4)) & 0xf;
+        *slot = HEX[nibble as usize];
+    }
+    &buf[..8]
 }
 
 fn format_u64_decimal(mut val: u64, buf: &mut [u8; 20]) -> &[u8] {
@@ -1138,6 +1174,7 @@ mod vmdk_plan_tests {
             subformat: VmdkSubformat::MonolithicSparse,
             grain_size: 65536,
             backing: None,
+            parent_cid: None,
         }
     }
 

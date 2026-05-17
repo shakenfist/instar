@@ -198,6 +198,7 @@ fn vmdk_opts_from<'a>(
     config: &CreateConfig,
     virtual_size: u64,
     backing: Option<BackingRef<'a>>,
+    parent_cid: Option<u32>,
 ) -> VmdkCreateOpts<'a> {
     VmdkCreateOpts {
         virtual_size,
@@ -211,7 +212,47 @@ fn vmdk_opts_from<'a>(
             config.vmdk_grain_size
         },
         backing,
+        parent_cid,
     }
+}
+
+/// Read the parent vmdk's descriptor and extract its CID for the
+/// new image's `parentCID=` line. Returns `None` if the backing
+/// isn't a vmdk binary header, the descriptor can't be read, or
+/// parsing fails. In every `None` case the caller falls back to
+/// the `0xdeadbeef` sentinel in `build_vmdk_descriptor_with_backing`.
+///
+/// The vmdk crate's `read_and_parse_descriptor` does the heavy
+/// lifting; this helper only reads the binary header to recover the
+/// descriptor's sector offset / length, then forwards.
+///
+/// # Safety
+///
+/// `call_table` must be valid and input device 0 must be attached
+/// with non-zero capacity.
+unsafe fn read_vmdk_parent_cid(call_table: &CallTable, sector_size: usize) -> Option<u32> {
+    let header_ptr = HEADER_BUF as *mut u8;
+    if !(call_table.read_input_sector)(0, 0, header_ptr, sector_size) {
+        return None;
+    }
+    let header = core::slice::from_raw_parts(header_ptr, sector_size);
+    let parsed = vmdk::Vmdk4Header::parse(header)?;
+
+    // The descriptor lives at `desc_offset_sectors * 512` for
+    // `desc_size_sectors * 512` bytes. Cap at MAX_SECTOR_SIZE so a
+    // bogus parent can't push us past the scratch slot — the real
+    // descriptor we wrote in phase 1d is well under 10 KiB so a
+    // single sector covers the populated portion.
+    if parsed.desc_offset_sectors == 0 {
+        return None;
+    }
+    if !(call_table.read_input_sector)(0, parsed.desc_offset_sectors, header_ptr, sector_size) {
+        return None;
+    }
+    let desc_bytes = core::slice::from_raw_parts(header_ptr, sector_size);
+    let mut info = shared::VmdkInfo::new();
+    vmdk::parse_descriptor(desc_bytes, sector_size, &mut info);
+    Some(info.cid)
 }
 
 fn vhd_opts_from<'a>(
@@ -424,7 +465,20 @@ pub unsafe extern "C" fn _start() -> u64 {
             }
         }
         ImageFormat::Vmdk4 => {
-            let opts = vmdk_opts_from(config, virtual_size, backing_ref);
+            // When the parent is itself a vmdk, extract its CID so
+            // the new descriptor's parentCID matches. For non-vmdk
+            // parents we pass None and the descriptor falls back to
+            // the sentinel.
+            let parent_cid = if config.has_backing()
+                && matches!(
+                    ImageFormat::from_u32(config.backing_format),
+                    ImageFormat::Vmdk4
+                ) {
+                read_vmdk_parent_cid(call_table, config.sector_size as usize)
+            } else {
+                None
+            };
+            let opts = vmdk_opts_from(config, virtual_size, backing_ref, parent_cid);
             let unit = opts.grain_size;
             match plan_vmdk(&opts, scratch) {
                 Ok(p) => (p, unit),

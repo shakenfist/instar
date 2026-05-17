@@ -170,6 +170,7 @@ fn sweep_vmdk() {
                     subformat,
                     grain_size,
                     backing: None,
+                    parent_cid: None,
                 };
                 let mut scratch = vec![0u8; VMDK_MAX_METADATA_SCRATCH];
                 let plan = plan_vmdk(&opts, &mut scratch).expect("plan");
@@ -192,6 +193,7 @@ fn sweep_vmdk() {
             path: b"parent.vmdk",
             format: Some(ImageFormat::Vmdk4),
         }),
+        parent_cid: Some(0x12345678),
     };
     let mut scratch = vec![0u8; VMDK_MAX_METADATA_SCRATCH];
     let plan = plan_vmdk(&opts, &mut scratch).expect("plan");
