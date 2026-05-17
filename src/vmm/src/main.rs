@@ -2214,6 +2214,8 @@ enum Commands {
     Convert(ConvertArgs),
     /// Measure the size required to convert an image to a target format
     Measure(MeasureArgs),
+    /// Create a new empty disk image of the given format and size
+    Create(CreateArgs),
     /// Display or validate configuration
     Config(ConfigArgs),
 }
@@ -2595,6 +2597,105 @@ struct MeasureArgs {
 }
 
 #[derive(Args, Debug)]
+struct CreateArgs {
+    /// Path to the new image file to create. Overwrites if it
+    /// already exists (matches qemu-img).
+    filename: String,
+
+    /// Virtual disk size (e.g. "1G", "512M", "1T"). Required unless
+    /// -b BACKING is given, in which case it defaults to the backing
+    /// file's virtual size.
+    #[arg(value_name = "SIZE")]
+    size: Option<String>,
+
+    /// Target output format. Supported: raw, qcow2, vmdk, vpc (VHD), vhdx.
+    #[arg(short = 'f', long = "format", default_value = "raw",
+          value_parser = ["raw", "qcow2", "vmdk", "vpc", "vhdx"])]
+    target_format: String,
+
+    /// Backing file path. The path is embedded verbatim into the
+    /// resulting image (so the metadata is portable) and resolved
+    /// relative to the new image's directory for opening.
+    #[arg(short = 'b', long = "backing", value_name = "BACKING")]
+    backing: Option<String>,
+
+    /// Backing file format hint (qcow2 / raw / vmdk / ...).
+    #[arg(short = 'F', long = "backing-format", value_name = "FMT")]
+    backing_format: Option<String>,
+
+    /// Don't fail if the backing file isn't accessible / parseable.
+    #[arg(short = 'u', long = "backing-unsafe")]
+    backing_unsafe: bool,
+
+    /// Suppress the "Created: ..." line on success (matches qemu-img -q).
+    #[arg(short = 'q', long)]
+    quiet: bool,
+
+    /// Result rendering: human (default) or json.
+    #[arg(long, default_value = "human", value_parser = ["human", "json"])]
+    output: String,
+
+    /// Host I/O sector size. Power of two in 512..=65536.
+    #[arg(long, default_value = "65536")]
+    sector_size: u32,
+
+    /// qcow2 cluster size in bytes. Power of two in [512, 2 MiB].
+    /// Default (when -f qcow2): 65536.
+    #[arg(long, default_value = "0")]
+    cluster_size: u32,
+
+    /// qcow2 refcount entry width in bits. Must be in {1,2,4,8,16,32,64}.
+    /// Default (when -f qcow2): 16.
+    #[arg(long, default_value = "0")]
+    refcount_bits: u8,
+
+    /// qcow2: emit extended-L2 entries (16-byte with subcluster bitmaps).
+    #[arg(long)]
+    extended_l2: bool,
+
+    /// qcow2: enable the lazy-refcounts compat bit.
+    #[arg(long)]
+    lazy_refcounts: bool,
+
+    /// qcow2 compat level: "0.10" (v2) or "1.1" (v3, default).
+    #[arg(long, default_value = "1.1", value_parser = ["0.10", "1.1"])]
+    compat: String,
+
+    /// vmdk subformat (default: monolithicSparse). vhd subformat
+    /// (default: dynamic). Other subformats are accepted in this
+    /// argument name and validated against the chosen --format.
+    #[arg(long, default_value = "",
+          value_parser = ["", "monolithicSparse", "streamOptimized",
+                          "monolithicFlat", "dynamic", "fixed"])]
+    subformat: String,
+
+    /// vmdk grain size in bytes. Power of two in [4 KiB, 64 KiB].
+    /// Default (when -f vmdk): 65536.
+    #[arg(long, default_value = "0")]
+    grain_size: u32,
+
+    /// vhd / vhdx block size in bytes. Power of two.
+    /// vhd default: 2 MiB; vhdx default: 32 MiB.
+    #[arg(long, default_value = "0")]
+    block_size: u32,
+
+    /// Preallocation mode. Phase 3 accepts "off" (default) and
+    /// "falloc" (raw only); other modes return a clear "not yet
+    /// supported" error pointing at phase 6 of PLAN-create.md.
+    #[arg(long, default_value = "off",
+          value_parser = ["off", "metadata", "falloc", "full"])]
+    preallocation: String,
+
+    /// qemu-img-style options as comma-separated key=value pairs.
+    /// Phase 3 placeholder — the full parser ships in phase 4 of
+    /// PLAN-create.md. Passing any -o option returns an error
+    /// pointing users at the individual flags for now.
+    #[arg(short = 'o', long = "options", action = clap::ArgAction::Append,
+          value_name = "KEY=VALUE,...")]
+    option: Vec<String>,
+}
+
+#[derive(Args, Debug)]
 struct ConfigArgs {
     /// Show which file each config value came from
     #[arg(long)]
@@ -2625,6 +2726,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Compare(args) => run_compare(args, verbose),
         Commands::Convert(args) => run_convert(args, verbose),
         Commands::Measure(args) => run_measure(args, verbose),
+        Commands::Create(args) => run_create(args, verbose),
         Commands::Config(args) => run_config(args),
     }
 }
@@ -6201,6 +6303,177 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
             _ => "unknown error",
         };
         return Err(format!("measure failed: {}", detail).into());
+    }
+
+    Ok(())
+}
+
+/// Entry point for the `create` subcommand.
+///
+/// Phase 3a: argument-level validation only. The raw short-circuit
+/// lands in step 3b; the non-raw KVM dispatch lands in step 3c.
+/// Until then `run_create` validates inputs and returns a clear
+/// "phase 3b/3c will implement this" error.
+fn run_create(args: CreateArgs, _verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    validate_create_args(&args)?;
+    Err(
+        "create: KVM dispatch is not yet implemented (phase 3b implements \
+         the raw short-circuit; phase 3c implements the guest dispatch \
+         — see docs/plans/PLAN-create-phase-03-host-cli.md)"
+            .into(),
+    )
+}
+
+/// Host-side defensive validation of `CreateArgs`. The guest
+/// re-checks every critical field, but failing early at the host
+/// gives a clearer user-facing error before any I/O or KVM setup.
+fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // -o key=value parser lands in phase 4; reject any -o in phase 3
+    // with a hint pointing at the individual flags.
+    if !args.option.is_empty() {
+        return Err("create: -o key=value parsing lands in phase 4 of \
+                    PLAN-create.md. Use the individual --cluster-size / \
+                    --refcount-bits / --extended-l2 / --grain-size / \
+                    --block-size / --subformat / --compat / \
+                    --preallocation flags instead."
+            .into());
+    }
+
+    // Filename + (size or backing).
+    if args.filename.is_empty() {
+        return Err("create: FILENAME is required".into());
+    }
+    if args.size.is_none() && args.backing.is_none() {
+        return Err("create: either SIZE or -b BACKING must be provided".into());
+    }
+
+    // Sector size: power of 2, 512..=MAX_SECTOR_SIZE.
+    if !(512..=MAX_SECTOR_SIZE).contains(&args.sector_size) || !args.sector_size.is_power_of_two() {
+        return Err(format!(
+            "create: --sector-size must be a power of 2 in 512..={MAX_SECTOR_SIZE} (got {})",
+            args.sector_size
+        )
+        .into());
+    }
+
+    // Per-format option validation. Each ignores the default 0
+    // sentinel (filled in by the per-format handler later).
+    if args.cluster_size != 0
+        && (args.cluster_size < 512
+            || args.cluster_size > (2 << 20)
+            || !args.cluster_size.is_power_of_two())
+    {
+        return Err(format!(
+            "create: --cluster-size must be a power of 2 in 512..=2 MiB (got {})",
+            args.cluster_size
+        )
+        .into());
+    }
+    if args.refcount_bits != 0 && !matches!(args.refcount_bits, 1 | 2 | 4 | 8 | 16 | 32 | 64) {
+        return Err(format!(
+            "create: --refcount-bits must be one of 1,2,4,8,16,32,64 (got {})",
+            args.refcount_bits
+        )
+        .into());
+    }
+    if args.grain_size != 0
+        && (args.grain_size < 4096 || args.grain_size > 65536 || !args.grain_size.is_power_of_two())
+    {
+        return Err(format!(
+            "create: --grain-size must be a power of 2 in [4 KiB, 64 KiB] (got {})",
+            args.grain_size
+        )
+        .into());
+    }
+    if args.block_size != 0 && !args.block_size.is_power_of_two() {
+        return Err(format!(
+            "create: --block-size must be a power of 2 (got {})",
+            args.block_size
+        )
+        .into());
+    }
+
+    // Subformat must be valid for the chosen target.
+    match args.target_format.as_str() {
+        "vmdk" => {
+            if !matches!(
+                args.subformat.as_str(),
+                "" | "monolithicSparse" | "streamOptimized" | "monolithicFlat"
+            ) {
+                return Err(format!(
+                    "create: --subformat '{}' is not valid for vmdk \
+                     (expected monolithicSparse, streamOptimized, or monolithicFlat)",
+                    args.subformat
+                )
+                .into());
+            }
+            if args.subformat == "monolithicFlat" {
+                return Err("create: vmdk monolithicFlat is not yet supported \
+                            (multi-file subformats land in phase 5 of \
+                            PLAN-create.md; use instar convert -O vmdk for now)"
+                    .into());
+            }
+        }
+        "vpc" => {
+            if !matches!(args.subformat.as_str(), "" | "dynamic" | "fixed") {
+                return Err(format!(
+                    "create: --subformat '{}' is not valid for vpc (expected dynamic or fixed)",
+                    args.subformat
+                )
+                .into());
+            }
+        }
+        _ => {
+            if !args.subformat.is_empty() {
+                return Err(format!(
+                    "create: --subformat is only valid with -f vmdk or -f vpc (got -f {})",
+                    args.target_format
+                )
+                .into());
+            }
+        }
+    }
+
+    // Preallocation: phase 3 only accepts "off" (any format) and
+    // "falloc" (raw only). Other modes return a phase-6-deferred
+    // error.
+    match args.preallocation.as_str() {
+        "off" => {}
+        "falloc" if args.target_format == "raw" => {}
+        "metadata" | "falloc" | "full" => {
+            return Err(format!(
+                "create: --preallocation={} is not yet supported \
+                 (preallocation modes land in phase 6 of PLAN-create.md)",
+                args.preallocation
+            )
+            .into());
+        }
+        other => {
+            return Err(format!("create: unknown --preallocation '{}'", other).into());
+        }
+    }
+
+    // Raw doesn't support backing. Reject explicitly.
+    if args.target_format == "raw" && args.backing.is_some() {
+        return Err("create: -f raw does not support -b BACKING (raw images \
+                    have no backing-file concept)"
+            .into());
+    }
+
+    // Backing without -F and without -u: match modern qemu-img and refuse.
+    if args.backing.is_some() && args.backing_format.is_none() && !args.backing_unsafe {
+        return Err("create: -b BACKING requires either -F BACKING_FORMAT or \
+                    -u (backing-unsafe). Refusing to guess the backing format \
+                    matches modern qemu-img."
+            .into());
+    }
+
+    // Size, when provided, must parse to a non-zero value.
+    if let Some(ref s) = args.size {
+        let parsed = parse_memory_size(s)?;
+        if parsed == 0 {
+            return Err("create: SIZE must be greater than zero".into());
+        }
     }
 
     Ok(())
