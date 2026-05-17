@@ -2124,6 +2124,146 @@ impl MeasureResult {
 }
 
 // ============================================================================
+// Create configuration and result structures
+// ============================================================================
+
+/// Maximum permitted length of the backing-file path embedded in a
+/// [`CreateConfig`]. Must match `create::MAX_BACKING_FILE_LEN` so the
+/// host CLI, the call-table struct, and the create library all agree
+/// on the cap.
+pub const CREATE_CONFIG_MAX_BACKING_FILE: usize = 1024;
+
+/// Configuration for the create operation.
+///
+/// Written to `OPERATION_CONFIG_ADDR` by the VMM before launching the
+/// create guest binary. The guest reads this directly via
+/// `&*(OPERATION_CONFIG_ADDR as *const CreateConfig)`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CreateConfig {
+    /// Magic (`0x43524541` = "CREA").
+    pub magic: u32,
+    /// Target output format (`ImageFormat as u32`).
+    pub target_format: u32,
+    /// Flags. See `FLAG_*` constants.
+    pub flags: u32,
+    /// Sector size for I/O (matches host sector_size).
+    pub sector_size: u32,
+
+    /// Virtual disk size in bytes. Zero means "infer from backing
+    /// file" — the guest reads input device 0's header to recover the
+    /// backing virtual size. Explicit non-zero values always win over
+    /// backing inference, matching qemu-img's `-b BACKING SIZE`
+    /// precedence.
+    pub virtual_size: u64,
+
+    /// qcow2 cluster size in bytes. 0 = default (65536).
+    pub qcow2_cluster_size: u32,
+    /// qcow2 refcount entry width in bits. 0 = default (16).
+    pub qcow2_refcount_bits: u8,
+    /// vmdk subformat: 0=MonolithicSparse, 1=StreamOptimized.
+    pub vmdk_subformat: u8,
+    /// vhd subformat: 0=Dynamic, 1=Fixed.
+    pub vhd_subformat: u8,
+    /// Reserved padding.
+    pub _pad: u8,
+    /// vmdk grain size in bytes. 0 = default (65536).
+    pub vmdk_grain_size: u32,
+    /// vhd/vhdx block size in bytes. 0 = format default.
+    pub block_size: u32,
+
+    /// Length of the backing-file path in bytes. 0 = no backing.
+    pub backing_file_len: u32,
+    /// Backing-file path (locale-bytes, no NUL terminator). Only the
+    /// first `backing_file_len` bytes are valid.
+    pub backing_file: [u8; CREATE_CONFIG_MAX_BACKING_FILE],
+    /// Backing-file format (`ImageFormat as u32`). 0 = unset.
+    pub backing_format: u32,
+
+    /// Reserved padding for forward compatibility (zero-init).
+    pub _reserved: [u8; 64],
+}
+
+impl CreateConfig {
+    /// Magic value for create config.
+    pub const MAGIC: u32 = 0x43524541; // "CREA"
+
+    /// Flag: write extended-L2 entries in qcow2 output.
+    pub const FLAG_EXTENDED_L2: u32 = 1 << 0;
+    /// Flag: enable the qcow2 lazy-refcounts compat bit.
+    pub const FLAG_LAZY_REFCOUNTS: u32 = 1 << 1;
+    /// Flag: produce qcow2 v3 (compat 1.1). Default-on: when the
+    /// entire flags word is zero the guest treats compat_v3 as set.
+    /// Clear this bit explicitly to request qcow2 v2 (compat 0.10).
+    pub const FLAG_COMPAT_V3: u32 = 1 << 2;
+    /// Flag: backing-file existence/format check should be skipped
+    /// (qemu-img's `-u` / `--backing-unsafe`). Phase 5 wires this up.
+    pub const FLAG_BACKING_UNSAFE: u32 = 1 << 3;
+
+    /// True if magic matches.
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+
+    /// Slice view over the populated portion of `backing_file`.
+    pub fn backing_file_bytes(&self) -> &[u8] {
+        let len = (self.backing_file_len as usize).min(CREATE_CONFIG_MAX_BACKING_FILE);
+        &self.backing_file[..len]
+    }
+
+    /// True if a backing-file reference was supplied.
+    pub fn has_backing(&self) -> bool {
+        self.backing_file_len > 0
+    }
+}
+
+/// Result structure for the create operation.
+///
+/// Passed by the guest into `call_table.send_create_result`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CreateResult {
+    /// Magic value (`0x43524553` = "CRES").
+    pub magic: u32,
+    /// Target format echoed back so the host can render the right output.
+    pub target_format: u32,
+    /// Resolved virtual size in bytes (echoes the config, or the
+    /// backing-file-derived size when the config had `virtual_size == 0`).
+    pub resolved_virtual_size: u64,
+    /// Bytes the guest wrote to the output device (sum of MetadataWrite
+    /// lengths in the plan).
+    pub metadata_bytes_written: u64,
+    /// File size after the guest finishes (max byte_offset + len across
+    /// the plan; the host may grow the file beyond this for
+    /// preallocation in phase 6).
+    pub file_size_after: u64,
+    /// Resolved cluster/grain/block size. 0 for raw output.
+    pub resolved_unit_size: u32,
+    /// Error code: 0 = ok, non-zero mirrors `ERROR_*`.
+    pub error: u32,
+}
+
+impl CreateResult {
+    /// Magic value for create result.
+    pub const MAGIC: u32 = 0x43524553; // "CRES"
+
+    pub const ERROR_OK: u32 = 0;
+    pub const ERROR_INVALID_OPTION: u32 = 1;
+    pub const ERROR_INVALID_SIZE: u32 = 2;
+    pub const ERROR_SCRATCH_TOO_SMALL: u32 = 3;
+    pub const ERROR_BACKING_READ_FAILED: u32 = 4;
+    pub const ERROR_BACKING_PARSE_FAILED: u32 = 5;
+    pub const ERROR_BACKING_TOO_LONG: u32 = 6;
+    pub const ERROR_WRITE_FAILED: u32 = 7;
+    pub const ERROR_UNSUPPORTED_FORMAT: u32 = 8;
+
+    /// True if magic matches.
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+}
+
+// ============================================================================
 // Chain configuration structures (for multi-device/backing chain operations)
 // ============================================================================
 
@@ -2399,6 +2539,108 @@ mod tests {
         assert!(cfg.is_valid());
         cfg.magic = 0;
         assert!(!cfg.is_valid());
+    }
+
+    #[test]
+    fn create_config_magic_uniqueness() {
+        assert_ne!(CreateConfig::MAGIC, InfoConfig::MAGIC);
+        assert_ne!(CreateConfig::MAGIC, CopyConfig::MAGIC);
+        assert_ne!(CreateConfig::MAGIC, CheckConfig::MAGIC);
+        assert_ne!(CreateConfig::MAGIC, CompareConfig::MAGIC);
+        assert_ne!(CreateConfig::MAGIC, ConvertConfig::MAGIC);
+        assert_ne!(CreateConfig::MAGIC, MeasureConfig::MAGIC);
+        assert_ne!(CreateConfig::MAGIC, CreateResult::MAGIC);
+    }
+
+    #[test]
+    fn create_result_magic_uniqueness() {
+        assert_ne!(CreateResult::MAGIC, InfoResult::MAGIC);
+        assert_ne!(CreateResult::MAGIC, CheckResult::MAGIC);
+        assert_ne!(CreateResult::MAGIC, CompareResult::MAGIC);
+        assert_ne!(CreateResult::MAGIC, MeasureResult::MAGIC);
+    }
+
+    fn create_config_with(magic: u32) -> CreateConfig {
+        CreateConfig {
+            magic,
+            target_format: 0,
+            flags: 0,
+            sector_size: 0,
+            virtual_size: 0,
+            qcow2_cluster_size: 0,
+            qcow2_refcount_bits: 0,
+            vmdk_subformat: 0,
+            vhd_subformat: 0,
+            _pad: 0,
+            vmdk_grain_size: 0,
+            block_size: 0,
+            backing_file_len: 0,
+            backing_file: [0; CREATE_CONFIG_MAX_BACKING_FILE],
+            backing_format: 0,
+            _reserved: [0; 64],
+        }
+    }
+
+    #[test]
+    fn create_config_is_valid() {
+        let cfg = create_config_with(CreateConfig::MAGIC);
+        assert!(cfg.is_valid());
+        let bad = create_config_with(0);
+        assert!(!bad.is_valid());
+    }
+
+    #[test]
+    fn create_config_backing_helpers() {
+        let mut cfg = create_config_with(CreateConfig::MAGIC);
+        assert!(!cfg.has_backing());
+        assert_eq!(cfg.backing_file_bytes(), b"");
+
+        let path = b"backing.qcow2";
+        cfg.backing_file[..path.len()].copy_from_slice(path);
+        cfg.backing_file_len = path.len() as u32;
+        assert!(cfg.has_backing());
+        assert_eq!(cfg.backing_file_bytes(), path);
+
+        // Defensive: an over-large backing_file_len gets clamped.
+        cfg.backing_file_len = (CREATE_CONFIG_MAX_BACKING_FILE as u32) + 100;
+        assert_eq!(
+            cfg.backing_file_bytes().len(),
+            CREATE_CONFIG_MAX_BACKING_FILE
+        );
+    }
+
+    #[test]
+    fn create_config_flag_bits() {
+        let cfg = CreateConfig {
+            flags: CreateConfig::FLAG_EXTENDED_L2 | CreateConfig::FLAG_BACKING_UNSAFE,
+            ..create_config_with(CreateConfig::MAGIC)
+        };
+        assert_eq!(
+            cfg.flags & CreateConfig::FLAG_EXTENDED_L2,
+            CreateConfig::FLAG_EXTENDED_L2
+        );
+        assert_eq!(cfg.flags & CreateConfig::FLAG_LAZY_REFCOUNTS, 0);
+        assert_eq!(cfg.flags & CreateConfig::FLAG_COMPAT_V3, 0);
+        assert_eq!(
+            cfg.flags & CreateConfig::FLAG_BACKING_UNSAFE,
+            CreateConfig::FLAG_BACKING_UNSAFE
+        );
+    }
+
+    #[test]
+    fn create_result_is_valid() {
+        let mut r = CreateResult {
+            magic: CreateResult::MAGIC,
+            target_format: 0,
+            resolved_virtual_size: 0,
+            metadata_bytes_written: 0,
+            file_size_after: 0,
+            resolved_unit_size: 0,
+            error: 0,
+        };
+        assert!(r.is_valid());
+        r.magic = 0;
+        assert!(!r.is_valid());
     }
 
     #[test]
