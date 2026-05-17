@@ -28,8 +28,14 @@ pub const MAX_BACKING_FILE_LEN: usize = 1024;
 // once the planners' real memory requirements are known.
 
 /// Worst-case scratch buffer size required by [`plan_qcow2`].
-// TODO(phase-1c): tighten
-pub const QCOW2_MAX_METADATA_SCRATCH: usize = 4 * 1024 * 1024;
+///
+/// The dominant term is the L1 table for sparse layouts: at
+/// `cluster_size=512` with `extended_l2=true` (16-byte L2 entries),
+/// L2 coverage drops to 16 KiB and L1 grows toward 16 MiB long
+/// before hitting the `QCOW2_MAX_L1_SIZE` cap. 32 MiB covers every
+/// option combination within the supported virtual-size range; the
+/// guest binary (phase 2) only needs to allocate this once.
+pub const QCOW2_MAX_METADATA_SCRATCH: usize = 32 * 1024 * 1024;
 
 /// Worst-case scratch buffer size required by [`plan_vmdk`].
 // TODO(phase-1d): tighten
@@ -374,17 +380,29 @@ pub fn plan_qcow2<'a>(
         bytes: reftable_slice,
     })?;
 
-    let mut remaining = refblocks_region;
+    // Refcount blocks are laid out back-to-back at
+    // `refcount_blocks_base_offset` and each is one cluster long.
+    // Build each in place and emit a single coalesced write covering
+    // all of them — keeping them as one entry stops MetadataPlan's
+    // inline write storage from filling up on sparse images with
+    // many refcount blocks (the contiguous-region count can reach
+    // 100+ at small cluster sizes with extended_l2).
+    let refblocks_total_bytes = (layout.refcount_block_count as usize) * cluster_size;
+    let refblocks_combined = &mut refblocks_region[..refblocks_total_bytes];
     for block_index in 0..layout.refcount_block_count {
-        let (this_block, rest) = remaining.split_at_mut(cluster_size);
-        let block_slice = qcow2::create::build_refcount_block(this_block, &layout, block_index)
-            .map_err(map_qcow2_error)?;
-        plan.push(MetadataWrite {
-            byte_offset: layout.refcount_blocks_base_offset + block_index * layout.cluster_size,
-            bytes: block_slice,
-        })?;
-        remaining = rest;
+        let start = (block_index as usize) * cluster_size;
+        let end = start + cluster_size;
+        qcow2::create::build_refcount_block(
+            &mut refblocks_combined[start..end],
+            &layout,
+            block_index,
+        )
+        .map_err(map_qcow2_error)?;
     }
+    plan.push(MetadataWrite {
+        byte_offset: layout.refcount_blocks_base_offset,
+        bytes: refblocks_combined,
+    })?;
 
     debug_assert_eq!(plan.minimum_file_size, layout.total_file_size);
     Ok(plan)
@@ -1058,6 +1076,27 @@ mod qcow2_plan_tests {
             plan_qcow2(&opts, &mut scratch),
             Err(CreateError::ScratchTooSmall)
         ));
+    }
+
+    #[test]
+    fn plan_qcow2_handles_many_refcount_blocks() {
+        // virtual_size=32 GiB with cluster_size=512 and extended_l2
+        // forces ~130 refcount blocks. They must coalesce into a
+        // single MetadataWrite so the plan's inline write storage
+        // doesn't overflow.
+        let opts = Qcow2CreateOpts {
+            virtual_size: 1u64 << 35,
+            cluster_size: 512,
+            refcount_bits: 16,
+            extended_l2: true,
+            lazy_refcounts: false,
+            compat_v3: true,
+            backing: None,
+        };
+        let mut scratch = vec![0u8; QCOW2_MAX_METADATA_SCRATCH];
+        let plan = plan_qcow2(&opts, &mut scratch).expect("plan");
+        // Header + L1 + reftable + one coalesced refblocks region = 4.
+        assert_eq!(plan.writes().len(), 4);
     }
 
     #[test]

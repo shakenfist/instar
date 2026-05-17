@@ -12,3 +12,12 @@ qcow2  = { path = "../qcow2", features = ["create"], default-features = false }
 vmdk   = { path = "../vmdk",  default-features = false }
 vhd    = { path = "../vhd",   default-features = false }
 vhdx   = { path = "../vhdx",  default-features = false }
+
+[dev-dependencies]
+# Integration tests in tests/ exercise the parser crates directly to
+# verify round-trip parsing.
+shared = { path = "../../shared" }
+qcow2  = { path = "../qcow2", features = ["create"], default-features = false }
+vmdk   = { path = "../vmdk",  default-features = false }
+vhd    = { path = "../vhd",   default-features = false }
+vhdx   = { path = "../vhdx",  default-features = false }
