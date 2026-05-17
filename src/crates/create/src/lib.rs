@@ -766,14 +766,137 @@ pub fn plan_vhd<'a>(
     }
 }
 
-/// Build a metadata plan for a VHDX image.
+/// Build a metadata plan for an empty Dynamic VHDX image.
 ///
-/// Stub: returns [`CreateError::ScratchTooSmall`] until phase-1f.
+/// Layout (all offsets MB-aligned per the VHDX spec):
+///
+///   bytes 0..0x10000:                file identifier
+///   bytes 0x10000..0x11000:          header 1
+///   bytes 0x20000..0x21000:          header 2
+///   bytes 0x30000..0x40000:          region table 1
+///   bytes 0x40000..0x50000:          region table 2
+///   bytes 0x100000..0x200000:        log region (sparse zero hole)
+///   bytes 0x200000..bat_end:         BAT region (sparse zero hole)
+///   bytes bat_end..bat_end+0x100000: metadata region
+///
+/// The log region and BAT region are left as sparse zero holes —
+/// reading zeros from a hole is equivalent to `PAYLOAD_BLOCK_NOT_PRESENT`
+/// (state 0) for every BAT entry, and the log region is unused for a
+/// freshly-created clean image. minimum_file_size extends to the end
+/// of the metadata region.
 pub fn plan_vhdx<'a>(
-    _opts: &VhdxCreateOpts<'_>,
-    _scratch: &'a mut [u8],
+    opts: &VhdxCreateOpts<'_>,
+    scratch: &'a mut [u8],
 ) -> Result<MetadataPlan<'a>, CreateError> {
-    Err(CreateError::ScratchTooSmall)
+    if opts.virtual_size == 0 {
+        return Err(CreateError::InvalidVirtualSize);
+    }
+    if opts.block_size == 0
+        || !opts.block_size.is_power_of_two()
+        || opts.block_size < 1024 * 1024
+        || opts.block_size > 256 * 1024 * 1024
+    {
+        return Err(CreateError::InvalidBlockSize);
+    }
+    if opts.backing.is_some() {
+        // VHDX parent locators are deferred — too complex for phase 1.
+        return Err(CreateError::BackingFileUnsupported);
+    }
+
+    const LOGICAL_SECTOR_SIZE: u32 = 512;
+    const PHYSICAL_SECTOR_SIZE: u32 = 4096;
+    const FILE_ID_LEN: usize = 4096;
+    const REGION_TABLE_LEN: usize = 65536;
+    const METADATA_REGION_LEN: usize = 1024 * 1024;
+
+    let (total_bat_entries, _chunk_ratio, _payload_blocks) =
+        vhdx::calculate_bat_layout(opts.virtual_size, opts.block_size, LOGICAL_SECTOR_SIZE)
+            .ok_or(CreateError::Overflow)?;
+    let bat_size_bytes: u64 = total_bat_entries as u64 * 8;
+    let bat_region_size: u64 = bat_size_bytes.div_ceil(vhdx::MB_ALIGN) * vhdx::MB_ALIGN;
+
+    let file_id_off: u64 = 0;
+    let header1_off: u64 = vhdx::HEADER1_OFFSET;
+    let header2_off: u64 = vhdx::HEADER2_OFFSET;
+    let rt1_off: u64 = vhdx::REGION_TABLE1_OFFSET;
+    let rt2_off: u64 = vhdx::REGION_TABLE2_OFFSET;
+    let bat_off: u64 = 0x20_0000;
+    let metadata_off: u64 = bat_off + bat_region_size;
+    let total_file_size: u64 = metadata_off + METADATA_REGION_LEN as u64;
+
+    let total_scratch_needed: usize = FILE_ID_LEN
+        + vhdx::HEADER_SIZE
+        + vhdx::HEADER_SIZE
+        + REGION_TABLE_LEN
+        + METADATA_REGION_LEN;
+    if scratch.len() < total_scratch_needed {
+        return Err(CreateError::ScratchTooSmall);
+    }
+
+    let (file_id_region, rest) = scratch.split_at_mut(FILE_ID_LEN);
+    let (header1_region, rest) = rest.split_at_mut(vhdx::HEADER_SIZE);
+    let (header2_region, rest) = rest.split_at_mut(vhdx::HEADER_SIZE);
+    let (rt_region, rest) = rest.split_at_mut(REGION_TABLE_LEN);
+    let (metadata_region, _) = rest.split_at_mut(METADATA_REGION_LEN);
+
+    file_id_region.fill(0);
+    vhdx::build_file_identifier(file_id_region);
+
+    header1_region.fill(0);
+    vhdx::build_header(header1_region, 1);
+    header2_region.fill(0);
+    vhdx::build_header(header2_region, 2);
+
+    rt_region.fill(0);
+    vhdx::build_region_table(
+        rt_region,
+        bat_off,
+        bat_region_size as u32,
+        metadata_off,
+        METADATA_REGION_LEN as u32,
+    );
+
+    metadata_region.fill(0);
+    vhdx::build_metadata(
+        metadata_region,
+        opts.block_size,
+        opts.virtual_size,
+        LOGICAL_SECTOR_SIZE,
+        PHYSICAL_SECTOR_SIZE,
+        false,
+    );
+
+    // Region table is identical at both offsets, so both writes
+    // reference the same slice.
+    let rt_slice: &[u8] = rt_region;
+
+    let mut plan = MetadataPlan::new();
+    plan.push(MetadataWrite {
+        byte_offset: file_id_off,
+        bytes: file_id_region,
+    })?;
+    plan.push(MetadataWrite {
+        byte_offset: header1_off,
+        bytes: header1_region,
+    })?;
+    plan.push(MetadataWrite {
+        byte_offset: header2_off,
+        bytes: header2_region,
+    })?;
+    plan.push(MetadataWrite {
+        byte_offset: rt1_off,
+        bytes: rt_slice,
+    })?;
+    plan.push(MetadataWrite {
+        byte_offset: rt2_off,
+        bytes: rt_slice,
+    })?;
+    plan.push(MetadataWrite {
+        byte_offset: metadata_off,
+        bytes: metadata_region,
+    })?;
+    debug_assert_eq!(plan.minimum_file_size, total_file_size);
+    Ok(plan)
 }
 
 #[cfg(test)]
@@ -1205,6 +1328,136 @@ mod vhd_plan_tests {
         let opts = default_dynamic(1 << 30);
         let mut scratch = vec![0u8; VHD_MAX_METADATA_SCRATCH];
         let plan = plan_vhd(&opts, &mut scratch).expect("plan");
+        let mut sorted: std::vec::Vec<&MetadataWrite<'_>> = plan.writes().iter().collect();
+        sorted.sort_by_key(|w| w.byte_offset);
+        for pair in sorted.windows(2) {
+            let prev = pair[0];
+            let next = pair[1];
+            assert!(prev.byte_offset + prev.bytes.len() as u64 <= next.byte_offset);
+        }
+    }
+}
+
+#[cfg(test)]
+mod vhdx_plan_tests {
+    use super::*;
+    use std::vec;
+
+    fn materialise(plan: &MetadataPlan<'_>) -> std::vec::Vec<u8> {
+        let mut buf = std::vec![0u8; plan.minimum_file_size as usize];
+        for w in plan.writes() {
+            let start = w.byte_offset as usize;
+            let end = start + w.bytes.len();
+            buf[start..end].copy_from_slice(w.bytes);
+        }
+        buf
+    }
+
+    fn default_opts(virtual_size: u64) -> VhdxCreateOpts<'static> {
+        VhdxCreateOpts {
+            virtual_size,
+            block_size: 32 * 1024 * 1024,
+            backing: None,
+        }
+    }
+
+    fn run(opts: &VhdxCreateOpts<'_>) -> std::vec::Vec<u8> {
+        let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
+        let plan = plan_vhdx(opts, &mut scratch).expect("plan");
+        let sum: u64 = plan.writes().iter().map(|w| w.bytes.len() as u64).sum();
+        assert_eq!(plan.total_metadata_bytes, sum);
+        let max_end: u64 = plan
+            .writes()
+            .iter()
+            .map(|w| w.byte_offset + w.bytes.len() as u64)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(plan.minimum_file_size, max_end);
+        materialise(&plan)
+    }
+
+    #[test]
+    fn plan_vhdx_dynamic_1mib_round_trips() {
+        let opts = default_opts(1 << 20);
+        let bytes = run(&opts);
+        // File identifier signature at offset 0.
+        let sig = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        assert_eq!(sig, vhdx::FILE_IDENTIFIER_SIGNATURE);
+        // Header 1 parses.
+        let h1 = &bytes
+            [vhdx::HEADER1_OFFSET as usize..vhdx::HEADER1_OFFSET as usize + vhdx::HEADER_SIZE];
+        let hdr = vhdx::VhdxHeader::parse(h1).expect("parse header 1");
+        assert_eq!(hdr.sequence_number, 1);
+        // Header 2 has sequence 2.
+        let h2 = &bytes
+            [vhdx::HEADER2_OFFSET as usize..vhdx::HEADER2_OFFSET as usize + vhdx::HEADER_SIZE];
+        let hdr2 = vhdx::VhdxHeader::parse(h2).expect("parse header 2");
+        assert_eq!(hdr2.sequence_number, 2);
+    }
+
+    #[test]
+    fn plan_vhdx_region_table_points_at_bat_and_metadata() {
+        let opts = default_opts(1 << 30);
+        let bytes = run(&opts);
+        let rt = &bytes
+            [vhdx::REGION_TABLE1_OFFSET as usize..vhdx::REGION_TABLE1_OFFSET as usize + 65536];
+        let (entries, _count) = vhdx::parse_region_table(rt).expect("parse region table");
+        // One BAT entry, one metadata entry — in some order.
+        let mut have_bat = false;
+        let mut have_meta = false;
+        for e in &entries {
+            if e.file_offset == 0x20_0000 {
+                have_bat = true;
+            }
+            if e.file_offset > 0x20_0000 && e.length == 1024 * 1024 {
+                have_meta = true;
+            }
+        }
+        assert!(have_bat, "no BAT region pointer");
+        assert!(have_meta, "no metadata region pointer");
+    }
+
+    #[test]
+    fn plan_vhdx_region_table_duplicated() {
+        let opts = default_opts(1 << 20);
+        let bytes = run(&opts);
+        let rt1 = &bytes
+            [vhdx::REGION_TABLE1_OFFSET as usize..vhdx::REGION_TABLE1_OFFSET as usize + 65536];
+        let rt2 = &bytes
+            [vhdx::REGION_TABLE2_OFFSET as usize..vhdx::REGION_TABLE2_OFFSET as usize + 65536];
+        assert_eq!(rt1, rt2);
+    }
+
+    #[test]
+    fn plan_vhdx_rejects_backing() {
+        let mut opts = default_opts(1 << 20);
+        opts.backing = Some(BackingRef {
+            path: b"parent.vhdx",
+            format: Some(ImageFormat::Vhdx),
+        });
+        let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
+        assert!(matches!(
+            plan_vhdx(&opts, &mut scratch),
+            Err(CreateError::BackingFileUnsupported)
+        ));
+    }
+
+    #[test]
+    fn plan_vhdx_rejects_bad_block_size() {
+        let mut opts = default_opts(1 << 20);
+        opts.block_size = 1000;
+        let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
+        assert!(matches!(
+            plan_vhdx(&opts, &mut scratch),
+            Err(CreateError::InvalidBlockSize)
+        ));
+    }
+
+    #[test]
+    fn plan_vhdx_writes_dont_overlap() {
+        let opts = default_opts(1 << 30);
+        let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
+        let plan = plan_vhdx(&opts, &mut scratch).expect("plan");
         let mut sorted: std::vec::Vec<&MetadataWrite<'_>> = plan.writes().iter().collect();
         sorted.sort_by_key(|w| w.byte_offset);
         for pair in sorted.windows(2) {
