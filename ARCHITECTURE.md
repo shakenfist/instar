@@ -286,7 +286,13 @@ provides a modular architecture with:
   backing file as input device 0, populates `CreateConfig`, and
   launches `create.bin`. Result rendering supports human
   ("Created: ..."), JSON (`--output=json`), and quiet (`-q`)
-  modes. The host enforces `--sector-size=512` in phase 3 because
+  modes. Phase 4 wires the qemu-img-style
+  `-o KEY=VAL,...` parser (`parse_create_o_options` +
+  `apply_create_overrides` in `src/vmm/src/main.rs`) so the
+  full per-format option matrix is reachable via either
+  individual `--flag` forms or qemu-img-compatible `-o`
+  syntax; `-o` wins on conflict. The host enforces
+  `--sector-size=512` in phase 3 because
   the `crates/create` MetadataPlan entries are 512-byte aligned
   but not always to larger sector sizes — phase 5 may relax this
   once the planner emits coalesced sector-sized writes. The

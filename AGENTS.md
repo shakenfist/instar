@@ -68,10 +68,10 @@ vhdx (VHDX), luks (info + convert with decryption)
 - `create`: create a new empty disk image of a given format and size.
   Raw output is host-only (open + ftruncate + optional falloc); every
   other format runs `crates/create` in the KVM sandbox and writes the
-  metadata via virtio. Supports backing files (`-b BACKING [-F FMT]`).
-  Phase 3 ships individual option flags; the qemu-img `-o key=value`
-  parser lands in phase 4. Full preallocation modes (metadata, full)
-  land in phase 6.
+  metadata via virtio. Supports backing files (`-b BACKING [-F FMT]`)
+  and the full qemu-img-style `-o KEY=VAL,...` option matrix
+  (`-o` wins over individual flags on conflict). Full preallocation
+  modes (metadata, full) land in phase 6.
 
 ## Working on This Project
 

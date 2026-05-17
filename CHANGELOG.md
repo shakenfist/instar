@@ -22,15 +22,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   image's directory when opening it. Per-format option flags
   (`--cluster-size`, `--refcount-bits`, `--extended-l2`,
   `--lazy-refcounts`, `--compat`, `--subformat`, `--grain-size`,
-  `--block-size`). Output rendering: human one-liner (default),
-  `--output=json`, or `-q` quiet.
+  `--block-size`), plus qemu-img-style
+  `-o KEY=VAL,KEY=VAL,...` syntax that mirrors the same option
+  matrix (`-o` wins on conflict). Recognises every key
+  `qemu-img create -o` accepts for the supported formats —
+  `size`, `backing_file`, `backing_fmt`, `cluster_size`,
+  `compat`, `refcount_bits`, `extended_l2`, `lazy_refcounts`,
+  `compression_type`, `subformat`, `grain_size`, and
+  `block_size`. Unknown keys, encrypted-create (`encrypt.*`),
+  external data files (`data_file*`), and deferred
+  preallocation modes (`metadata` / `full`) return clear
+  "deferred" errors with phase pointers. Output rendering:
+  human one-liner (default), `--output=json`, or `-q` quiet.
   ([phase 1](docs/plans/PLAN-create-phase-01-emitters.md) ·
   [phase 2](docs/plans/PLAN-create-phase-02-guest-op.md) ·
-  [phase 3](docs/plans/PLAN-create-phase-03-host-cli.md))
+  [phase 3](docs/plans/PLAN-create-phase-03-host-cli.md) ·
+  [phase 4](docs/plans/PLAN-create-phase-04-target-options.md))
 
   Deferred to later phases:
-  qemu-img-style `-o key=value` parser
-  ([phase 4](docs/plans/PLAN-create.md)),
   backing-file polish including vhdx-as-backing and multi-file
   vmdk subformats
   ([phase 5](docs/plans/PLAN-create.md)),
