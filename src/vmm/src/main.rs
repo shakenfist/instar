@@ -6352,18 +6352,29 @@ fn run_create(args: CreateArgs, _verbose: bool) -> Result<(), Box<dyn std::error
         return run_create_raw(&args);
     }
 
-    // Backing-file plumbing lands in step 3d. Until then, reject -b
-    // up front so phase 3c smoke tests don't silently launch a guest
-    // with virtual_size = 0 and no source to infer from.
-    if args.backing.is_some() {
-        return Err(
-            "create: -b BACKING is not yet implemented for non-raw targets \
-             (lands in phase 3d of PLAN-create-phase-03-host-cli.md)"
-                .into(),
-        );
-    }
-
     run_create_nonraw(&args, _verbose)
+}
+
+/// Map a backing-format string (the `-F` argument) to its numeric
+/// ImageFormat code. Returns 0 ("Unknown") for an empty hint so the
+/// guest sees "no format hint" rather than a bogus enum value.
+fn create_backing_format_code(s: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    Ok(match s {
+        "" => IMAGE_FORMAT_UNKNOWN,
+        "raw" => IMAGE_FORMAT_RAW,
+        "qcow2" => IMAGE_FORMAT_QCOW2,
+        "vmdk" => IMAGE_FORMAT_VMDK4,
+        "vpc" | "vhd" => IMAGE_FORMAT_VHD,
+        "vhdx" => IMAGE_FORMAT_VHDX,
+        other => {
+            return Err(format!(
+                "create: -F {} is not a recognised backing format \
+                 (expected raw, qcow2, vmdk, vpc, or vhdx)",
+                other
+            )
+            .into());
+        }
+    })
 }
 
 /// Non-raw create dispatch: open the output, attach as a virtio
@@ -6444,32 +6455,97 @@ fn run_create_nonraw(args: &CreateArgs, verbose: bool) -> Result<(), Box<dyn std
             .map_err(|e| format!("create: open '{}' for write failed: {}", args.filename, e))?;
 
     // core unconditionally initialises input device 0 and places the
-    // output device at MMIO index = active_input_count. For the
-    // no-backing path we still need an input stub at index 0 so the
-    // output lands at index 1 where core expects it; the guest
-    // ignores the stub because no plan_*-driven write reads from
-    // input. measure --size mode uses the same pattern.
+    // output device at MMIO index = active_input_count. The input
+    // device 0 is either the real backing file (when -b is given) or
+    // a 1-sector tempfile stub the guest ignores.
     struct CreateStubInput(std::path::PathBuf);
     impl Drop for CreateStubInput {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
     }
-    let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let stub_path = std::env::temp_dir().join(format!("instar-create-stub-{}-{}", pid, nanos));
-    let stub_file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .open(&stub_path)?;
-    stub_file.set_len(args.sector_size as u64)?;
-    drop(stub_file);
-    let _stub_input = CreateStubInput(stub_path.clone());
-    let stub_backing = BackingStore::open(&stub_path, true, None, false)?;
+    let mut backing_file_bytes: Vec<u8> = Vec::new();
+    let mut backing_format_code: u32 = IMAGE_FORMAT_UNKNOWN;
+    let _stub_input: Option<CreateStubInput>;
+
+    let (input_backing, input_capacity) = if let Some(ref typed_backing) = args.backing {
+        // Resolve the backing path relative to the output's parent
+        // directory, matching qemu-img. The path the user typed is
+        // embedded verbatim into the new image's metadata so the
+        // backing reference stays portable across moves.
+        let resolved = if Path::new(typed_backing).is_absolute() {
+            Path::new(typed_backing).to_path_buf()
+        } else {
+            output_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(typed_backing)
+        };
+
+        if !args.backing_unsafe {
+            let md = std::fs::metadata(&resolved).map_err(|e| {
+                format!(
+                    "create: backing file '{}' (resolved to '{}') not accessible: {} \
+                     (pass -u to skip this check)",
+                    typed_backing,
+                    resolved.display(),
+                    e
+                )
+            })?;
+            if !md.is_file() {
+                return Err(format!(
+                    "create: backing path '{}' is not a regular file",
+                    resolved.display()
+                )
+                .into());
+            }
+        }
+
+        let backing_md_size = std::fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
+        let real_backing = BackingStore::open(&resolved, true, None, false).map_err(|e| {
+            format!(
+                "create: open backing '{}' failed: {}",
+                resolved.display(),
+                e
+            )
+        })?;
+
+        // Embed the user-typed bytes verbatim. The host-resolved
+        // path is *not* what ends up in the metadata.
+        let typed_bytes = typed_backing.as_bytes();
+        if typed_bytes.len() > CREATE_CONFIG_MAX_BACKING_FILE {
+            return Err(format!(
+                "create: backing path too long ({} bytes; max {})",
+                typed_bytes.len(),
+                CREATE_CONFIG_MAX_BACKING_FILE
+            )
+            .into());
+        }
+        backing_file_bytes = typed_bytes.to_vec();
+
+        if let Some(ref fmt) = args.backing_format {
+            backing_format_code = create_backing_format_code(fmt)?;
+        }
+        _stub_input = None;
+        (real_backing, backing_md_size)
+    } else {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let stub_path = std::env::temp_dir().join(format!("instar-create-stub-{}-{}", pid, nanos));
+        let stub_file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&stub_path)?;
+        stub_file.set_len(args.sector_size as u64)?;
+        drop(stub_file);
+        _stub_input = Some(CreateStubInput(stub_path.clone()));
+        let stub_backing = BackingStore::open(&stub_path, true, None, false)?;
+        (stub_backing, args.sector_size as u64)
+    };
 
     // Build the device-attach + guest-launch closure so any failure
     // along the way can hit the partial-output cleanup path.
@@ -6486,7 +6562,10 @@ fn run_create_nonraw(args: &CreateArgs, verbose: bool) -> Result<(), Box<dyn std
         vhd_subformat,
         grain_size,
         block_size,
-        stub_backing,
+        input_backing,
+        input_capacity,
+        &backing_file_bytes,
+        backing_format_code,
         output_backing,
         output_capacity_hint,
         verbose,
@@ -6564,6 +6643,9 @@ fn run_create_guest(
     grain_size: u32,
     block_size: u32,
     input_backing: BackingStore,
+    input_capacity: u64,
+    backing_file_bytes: &[u8],
+    backing_format_code: u32,
     output_backing: BackingStore,
     output_capacity_hint: u64,
     verbose: bool,
@@ -6634,13 +6716,20 @@ fn run_create_guest(
     // _pad (offset 31) left zero from page-zeroed memory.
     guest_mem.write_obj(grain_size, GuestAddress(OPERATION_CONFIG_ADDR + 32))?;
     guest_mem.write_obj(block_size, GuestAddress(OPERATION_CONFIG_ADDR + 36))?;
-    // backing_file_len + backing_file + backing_format land in phase 3d.
-    // Leaving them zero is the "no backing" state, which is the only path
-    // 3c supports.
-    guest_mem.write_obj(0u32, GuestAddress(OPERATION_CONFIG_ADDR + 40))?;
-    let zero_backing = [0u8; CREATE_CONFIG_MAX_BACKING_FILE];
-    guest_mem.write_slice(&zero_backing, GuestAddress(OPERATION_CONFIG_ADDR + 44))?;
-    guest_mem.write_obj(0u32, GuestAddress(OPERATION_CONFIG_ADDR + 1068))?;
+    // Backing-file fields. backing_file_bytes is empty when no -b
+    // was given (phase 3c's stub-input path); otherwise it holds the
+    // user-typed path bytes and the guest reads input device 0 to
+    // recover the backing's virtual size when CreateConfig.virtual_size
+    // is zero.
+    let backing_len = backing_file_bytes.len() as u32;
+    guest_mem.write_obj(backing_len, GuestAddress(OPERATION_CONFIG_ADDR + 40))?;
+    let mut backing_buf = [0u8; CREATE_CONFIG_MAX_BACKING_FILE];
+    backing_buf[..backing_file_bytes.len()].copy_from_slice(backing_file_bytes);
+    guest_mem.write_slice(&backing_buf, GuestAddress(OPERATION_CONFIG_ADDR + 44))?;
+    guest_mem.write_obj(
+        backing_format_code,
+        GuestAddress(OPERATION_CONFIG_ADDR + 1068),
+    )?;
 
     debug!(
         "Wrote create config at 0x{:x} (target={}, flags=0x{:x}, sector_size={}, \
@@ -6671,7 +6760,7 @@ fn run_create_guest(
     let input_vq = device_vq_base(0);
     let input_device = VirtioBlockDevice::new(
         input_backing,
-        args.sector_size as u64, // stub is exactly one sector
+        input_capacity,
         args.sector_size as u64,
         true, // read-only
         input_mmio,
