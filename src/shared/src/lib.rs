@@ -649,6 +649,14 @@ pub struct CallTable {
     /// Args: measure_result pointer containing required +
     /// fully_allocated bytes for the target format.
     pub send_measure_result: unsafe extern "C" fn(*const MeasureResult),
+
+    /// Send create result message.
+    /// Args: create_result pointer containing the resolved virtual
+    /// size, bytes written, file size after, and resolved unit size
+    /// for the target format. Appended at the end of CallTable so
+    /// existing operation binaries do not need to recompile against
+    /// shifted offsets to keep working.
+    pub send_create_result: unsafe extern "C" fn(*const CreateResult),
 }
 
 /// Backing format type for QCOW2 header extension

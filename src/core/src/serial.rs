@@ -514,3 +514,21 @@ pub fn send_measure_result(result: &shared::MeasureResult) {
     );
     send_message(&msg);
 }
+
+/// Send a create result message.
+///
+/// Mirrors [`send_measure_result`]: maps the numeric target_format
+/// to its ImageFormat name string so the host receives the same
+/// representation as the other `*_result` messages.
+pub fn send_create_result(result: &shared::CreateResult) {
+    let target_name = shared::ImageFormat::from_u32(result.target_format).name();
+    let msg = guest_protocol::create_result_message(
+        target_name,
+        result.resolved_virtual_size,
+        result.metadata_bytes_written,
+        result.file_size_after,
+        result.resolved_unit_size,
+        result.error,
+    );
+    send_message(&msg);
+}
