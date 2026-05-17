@@ -2271,6 +2271,9 @@ impl CreateResult {
     /// Magic value for create result.
     pub const MAGIC: u32 = 0x43524553; // "CRES"
 
+    // Error codes are stable: only appended, never reordered.
+    // Existing operation binaries depend on the numeric values
+    // matching what the host renders.
     pub const ERROR_OK: u32 = 0;
     pub const ERROR_INVALID_OPTION: u32 = 1;
     pub const ERROR_INVALID_SIZE: u32 = 2;
@@ -2280,6 +2283,18 @@ impl CreateResult {
     pub const ERROR_BACKING_TOO_LONG: u32 = 6;
     pub const ERROR_WRITE_FAILED: u32 = 7;
     pub const ERROR_UNSUPPORTED_FORMAT: u32 = 8;
+    /// Backing format was recognised but the guest can't extract
+    /// `virtual_size` from it (e.g. a future regression breaks the
+    /// vhdx walk). Distinguished from BACKING_PARSE_FAILED so the
+    /// host can render "format X as backing is not supported"
+    /// rather than "couldn't parse the backing header".
+    pub const ERROR_BACKING_FORMAT_UNSUPPORTED: u32 = 9;
+    /// Backing image's `virtual_size` exceeds the target format's
+    /// addressable range with the chosen options. Surfaced by the
+    /// guest's pre-flight ceiling check before plan_* runs, so the
+    /// host can suggest "try a larger cluster size or a different
+    /// target format" rather than the generic INVALID_SIZE.
+    pub const ERROR_BACKING_SIZE_TOO_LARGE: u32 = 10;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {

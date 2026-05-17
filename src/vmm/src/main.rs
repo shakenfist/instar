@@ -166,6 +166,8 @@ const CREATE_RESULT_ERROR_BACKING_PARSE_FAILED: u32 = 5;
 const CREATE_RESULT_ERROR_BACKING_TOO_LONG: u32 = 6;
 const CREATE_RESULT_ERROR_WRITE_FAILED: u32 = 7;
 const CREATE_RESULT_ERROR_UNSUPPORTED_FORMAT: u32 = 8;
+const CREATE_RESULT_ERROR_BACKING_FORMAT_UNSUPPORTED: u32 = 9;
+const CREATE_RESULT_ERROR_BACKING_SIZE_TOO_LARGE: u32 = 10;
 
 // CheckResult flag constants (must match shared crate)
 const CHECK_RESULT_FLAG_VALID: u32 = 1 << 0;
@@ -7362,12 +7364,22 @@ fn create_error_detail(code: u32) -> &'static str {
         }
         CREATE_RESULT_ERROR_BACKING_READ_FAILED => "failed to read backing file header",
         CREATE_RESULT_ERROR_BACKING_PARSE_FAILED => {
-            "backing file format not supported \
-             (vhdx as backing is deferred — see PLAN-create.md phase 5)"
+            "backing file header could not be parsed \
+             (file may be truncated, corrupted, or an unrecognised format)"
         }
         CREATE_RESULT_ERROR_BACKING_TOO_LONG => "backing file path too long (max 1024 bytes)",
         CREATE_RESULT_ERROR_WRITE_FAILED => "write to output device failed",
         CREATE_RESULT_ERROR_UNSUPPORTED_FORMAT => "target format not supported",
+        CREATE_RESULT_ERROR_BACKING_FORMAT_UNSUPPORTED => {
+            "backing file format is recognised but virtual_size \
+             extraction is not yet implemented for it"
+        }
+        CREATE_RESULT_ERROR_BACKING_SIZE_TOO_LARGE => {
+            "backing file is too large for the target format with the \
+             requested options (try a larger cluster size, switch to \
+             a target format with greater virtual-size headroom, or \
+             pass an explicit SIZE that fits)"
+        }
         _ => "unknown error",
     }
 }

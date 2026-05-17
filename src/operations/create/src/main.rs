@@ -291,6 +291,53 @@ fn vhdx_opts_from<'a>(
     }
 }
 
+/// Pre-flight check: can the target format address `virtual_size`
+/// with the requested per-target options? Returns `true` when the
+/// combination is at least plausibly supported; `false` only when
+/// we can rule it out cheaply (e.g. qcow2 cluster_size + virtual
+/// would exceed `QCOW2_MAX_L1_SIZE_ENTRIES`). Anything that returns
+/// `true` here may still hit a deeper limit inside `plan_*`; this
+/// is a clearer-message gate for the common case, not a complete
+/// substitute for the planner's validation.
+fn target_can_address(target: ImageFormat, virtual_size: u64, config: &CreateConfig) -> bool {
+    match target {
+        // Raw: no metadata, file is just `virtual_size` bytes.
+        // No practical ceiling here; the host's ftruncate will
+        // succeed up to the filesystem limit.
+        ImageFormat::Raw => true,
+        ImageFormat::Qcow2 => {
+            let cluster_size: u64 = if config.qcow2_cluster_size == 0 {
+                65536
+            } else {
+                config.qcow2_cluster_size as u64
+            };
+            // L2 entry size: 16 bytes for extended_l2, otherwise 8.
+            let extended_l2 = (config.flags & CreateConfig::FLAG_EXTENDED_L2) != 0;
+            let l2_entry_size: u64 = if extended_l2 { 16 } else { 8 };
+            let entries_per_l2 = cluster_size / l2_entry_size;
+            let l2_coverage = match cluster_size.checked_mul(entries_per_l2) {
+                Some(v) if v > 0 => v,
+                _ => return false,
+            };
+            let l1_entries = virtual_size.div_ceil(l2_coverage);
+            // QCOW2_MAX_L1_SIZE_ENTRIES is 4 M per the qcow2 spec
+            // and the parser cap.
+            l1_entries <= qcow2::QCOW2_MAX_L1_SIZE_ENTRIES as u64
+        }
+        // VMDK / VHD / VHDX: per-format ceilings are far above any
+        // practical virtual_size (vmdk's grain count is the dominant
+        // cap and the supported grain sizes leave petabytes of
+        // headroom). Accept and let the planner catch any pathological
+        // case.
+        ImageFormat::Vmdk4 | ImageFormat::Vhd | ImageFormat::Vhdx => true,
+        // Any other target was already rejected by validate_create_args
+        // / parse_create_o_options; treat as not addressable so we
+        // surface a clear "unsupported format" error rather than
+        // crashing the planner.
+        _ => false,
+    }
+}
+
 /// Write every entry in `plan` to the output device, one sector at
 /// a time. Returns the total bytes written or `None` on I/O failure.
 ///
@@ -418,6 +465,32 @@ pub unsafe extern "C" fn _start() -> u64 {
         (call_table.send_complete)(b"create\0".as_ptr(), 0, false);
         return 0;
     };
+
+    // Pre-flight ceiling check: a backing-derived virtual_size may
+    // exceed the target's addressable range with the requested
+    // options (e.g. qcow2 cluster_size=512 caps at QCOW2_MAX_L1
+    // entries × L2 coverage). plan_*'s InvalidVirtualSize would
+    // catch this too, but mapping it to a dedicated
+    // ERROR_BACKING_SIZE_TOO_LARGE lets the host render a clearer
+    // "try a larger cluster size" hint. Only runs in the
+    // backing-derived path; user-supplied SIZE already passed the
+    // host's pre-flight checks.
+    if config.virtual_size == 0
+        && config.has_backing()
+        && !target_can_address(target, virtual_size, config)
+    {
+        send_result(
+            call_table,
+            config.target_format,
+            virtual_size,
+            0,
+            0,
+            0,
+            CreateResult::ERROR_BACKING_SIZE_TOO_LARGE,
+        );
+        (call_table.send_complete)(b"create\0".as_ptr(), 0, false);
+        return 0;
+    }
 
     // Raw short-circuit: no metadata to emit. The host already
     // truncated the output file; we just confirm completion.
