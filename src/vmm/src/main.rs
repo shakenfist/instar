@@ -7053,16 +7053,34 @@ fn create_raw_finalize(
     Ok(())
 }
 
-/// Minimal success-line renderer for phase 3b. Phase 3e replaces
-/// this with the full human / json / quiet rendering machinery.
+/// Render a successful create to stdout in the user's chosen
+/// format.
+///
+/// `human` (default) emits a qemu-img-style one-liner:
+///     Created: foo.qcow2 (format=qcow2, virtual_size=1073741824, cluster_size=65536)
+/// `json` emits a 4-space-indented object with a fixed key order.
+/// `-q` (args.quiet) suppresses the human line; JSON output is
+/// always emitted regardless of -q so scripts can rely on it.
 fn render_create_success(
     args: &CreateArgs,
     virtual_size: u64,
     metadata_bytes_written: u64,
-    _file_size_after: u64,
+    file_size_after: u64,
     resolved_unit_size: u32,
 ) {
-    let _ = metadata_bytes_written; // unused until phase 3e
+    if args.output == "json" {
+        render_create_success_json(
+            args,
+            virtual_size,
+            metadata_bytes_written,
+            file_size_after,
+            resolved_unit_size,
+        );
+        return;
+    }
+    if args.quiet {
+        return;
+    }
     if resolved_unit_size == 0 {
         println!(
             "Created: {} (format={}, virtual_size={})",
@@ -7074,6 +7092,49 @@ fn render_create_success(
             args.filename, args.target_format, virtual_size, resolved_unit_size
         );
     }
+}
+
+/// JSON object companion to the human-readable success line.
+///
+/// 4-space indent, key order: filename, format, virtual_size,
+/// metadata_bytes_written, file_size_after, resolved_unit_size.
+/// The escape pass on `filename` matches measure's JSON output for
+/// strings containing backslashes or quotes.
+fn render_create_success_json(
+    args: &CreateArgs,
+    virtual_size: u64,
+    metadata_bytes_written: u64,
+    file_size_after: u64,
+    resolved_unit_size: u32,
+) {
+    let escaped = json_escape_string(&args.filename);
+    println!("{{");
+    println!("    \"filename\": \"{}\",", escaped);
+    println!("    \"format\": \"{}\",", args.target_format);
+    println!("    \"virtual_size\": {},", virtual_size);
+    println!(
+        "    \"metadata_bytes_written\": {},",
+        metadata_bytes_written
+    );
+    println!("    \"file_size_after\": {},", file_size_after);
+    println!("    \"resolved_unit_size\": {}", resolved_unit_size);
+    println!("}}");
+}
+
+/// Minimal JSON-string escaping for `"` and `\`. Filenames may
+/// contain either; the rest of the renderer assumes ASCII-safe
+/// values for the other fields (numeric or controlled strings).
+fn json_escape_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Host-side defensive validation of `CreateArgs`. The guest
