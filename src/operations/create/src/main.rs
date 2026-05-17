@@ -103,6 +103,13 @@ fn map_create_error(e: CreateError) -> u32 {
         CreateError::BackingFileUnsupported => CreateResult::ERROR_INVALID_OPTION,
         CreateError::Overflow => CreateResult::ERROR_INVALID_SIZE,
         CreateError::ScratchTooSmall => CreateResult::ERROR_SCRATCH_TOO_SMALL,
+        // PreallocationUnsupported reuses INVALID_OPTION until 6c
+        // adds a dedicated host-side message; the host already
+        // rejects unsupported (target, mode) combinations at the
+        // validator so this path is reached only from
+        // qcow2 + extended_l2 + non-Off mode, which the validator
+        // also catches via the per-target ceiling check.
+        CreateError::PreallocationUnsupported => CreateResult::ERROR_INVALID_OPTION,
     }
 }
 

@@ -73,6 +73,12 @@ pub enum CreateError {
     /// requested layout. The required size is bounded above by the
     /// per-format `*_MAX_METADATA_SCRATCH` constant.
     ScratchTooSmall,
+    /// The requested preallocation mode isn't supported for this
+    /// option combination (e.g. metadata-mode + extended_l2; or
+    /// any preallocation other than `Off` for a target format
+    /// whose phase-6 emitter doesn't yet populate metadata for
+    /// the data region).
+    PreallocationUnsupported,
 }
 
 /// A reference to a backing image that the new image should chain to.
@@ -320,6 +326,7 @@ pub fn plan_qcow2<'a>(
         cluster_bits,
         opts.refcount_bits as u32,
         opts.extended_l2,
+        qcow2::create::Preallocation::Off,
     )
     .map_err(map_qcow2_error)?;
 
@@ -424,6 +431,9 @@ fn map_qcow2_error(e: qcow2::create::Qcow2CreateError) -> CreateError {
         qcow2::create::Qcow2CreateError::Overflow => CreateError::Overflow,
         qcow2::create::Qcow2CreateError::BufferTooSmall => CreateError::ScratchTooSmall,
         qcow2::create::Qcow2CreateError::BackingMetadataTooLarge => CreateError::BackingFileTooLong,
+        qcow2::create::Qcow2CreateError::PreallocationUnsupported => {
+            CreateError::PreallocationUnsupported
+        }
     }
 }
 
@@ -1079,7 +1089,14 @@ mod qcow2_plan_tests {
         let plan = plan_qcow2(&opts, &mut scratch).expect("plan");
         // The layout's total_file_size and the plan's
         // minimum_file_size should agree.
-        let layout = qcow2::create::compute_layout(opts.virtual_size, 16, 16, false).unwrap();
+        let layout = qcow2::create::compute_layout(
+            opts.virtual_size,
+            16,
+            16,
+            false,
+            qcow2::create::Preallocation::Off,
+        )
+        .unwrap();
         assert_eq!(plan.minimum_file_size, layout.total_file_size);
     }
 

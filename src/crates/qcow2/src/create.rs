@@ -22,9 +22,50 @@ extern crate std;
 use shared::{write_be_u32, write_be_u64};
 
 use crate::{
-    EXT_BACKING_FORMAT, EXT_END, INCOMPAT_EXTENDED_L2, QCOW2_DEFAULT_REFCOUNT_ORDER,
+    EXT_BACKING_FORMAT, EXT_END, INCOMPAT_EXTENDED_L2, OFLAG_COPIED, QCOW2_DEFAULT_REFCOUNT_ORDER,
     QCOW2_HEADER_LENGTH_V3, QCOW2_MAGIC, QCOW2_VERSION_3,
 };
+
+/// Preallocation mode for a qcow2 image being emitted.
+///
+/// `Off` produces the minimal empty image: header + L1 (empty) +
+/// refcount tables. Reads of any virtual cluster return zero via
+/// qcow2's read-as-zero default.
+///
+/// `Metadata` / `Falloc` / `Full` all share the same on-disk
+/// metadata shape: L1 entries point at populated L2 tables, L2
+/// entries point at sequentially-laid-out data clusters, and the
+/// refcount blocks cover every used cluster (metadata + data).
+/// The three variants differ only in how the *host* treats the
+/// data region after the guest finishes:
+///   - `Metadata` — file is extended via `ftruncate`; data region
+///     is sparse (FS-dependent zero-fill on read).
+///   - `Falloc` — host calls `posix_fallocate` on the data region
+///     so blocks are reserved.
+///   - `Full` — host writes zeros across the data region.
+///
+/// From the qcow2 emitter's perspective the three variants are
+/// indistinguishable; the host applies the appropriate
+/// preallocation post-pass. Encoding all four here keeps the
+/// shape symmetric with `crates/measure::Preallocation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Preallocation {
+    #[default]
+    Off,
+    Metadata,
+    Falloc,
+    Full,
+}
+
+impl Preallocation {
+    /// True when the layout should populate L1 + L2 + refcount for
+    /// the full virtual range. All non-`Off` modes share the same
+    /// emitted metadata; the host distinguishes them in its
+    /// post-pass.
+    pub fn populates_data_metadata(self) -> bool {
+        !matches!(self, Preallocation::Off)
+    }
+}
 
 /// Cap on `cluster_bits` (matches the parser's accept range).
 const MIN_CLUSTER_BITS: u32 = 9;
@@ -57,13 +98,31 @@ pub enum Qcow2CreateError {
     /// Backing-file metadata (path + extensions) does not fit in the
     /// header cluster.
     BackingMetadataTooLarge,
+    /// Preallocation is requested but the option combination is
+    /// not supported (e.g. metadata-mode + extended_l2 — the
+    /// subcluster bitmap layout adds complexity phase 6 doesn't
+    /// implement).
+    PreallocationUnsupported,
 }
 
-/// Computed layout for an empty QCOW2 image.
+/// Computed layout for a QCOW2 image being emitted.
 ///
-/// Every offset and size is derived from `(virtual_size, cluster_bits,
-/// refcount_bits, extended_l2)`. There is no data region — `total_file_size`
-/// covers header, L1 table, refcount table, and refcount blocks only.
+/// Every offset and size is derived from
+/// `(virtual_size, cluster_bits, refcount_bits, extended_l2,
+/// preallocation)`. In `Preallocation::Off` mode the data region
+/// is absent (`data_clusters == 0`); in any other mode the layout
+/// covers L2 tables and data clusters too.
+///
+/// File layout (in cluster order):
+///
+///   * Cluster 0: header
+///   * Clusters 1..1+l1_clusters: L1 table
+///   * Refcount table (`refcount_table_clusters` clusters)
+///   * Refcount blocks (`refcount_block_count` clusters)
+///   * **Non-Off only**: L2 tables (`l2_clusters` clusters, one per
+///     L1 entry)
+///   * **Non-Off only**: data region (`data_clusters` clusters,
+///     `virtual_size / cluster_size` rounded up)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Qcow2Layout {
     /// `1u64 << cluster_bits`.
@@ -77,6 +136,8 @@ pub struct Qcow2Layout {
     /// Whether extended L2 entries (16-byte) are in use (sets
     /// INCOMPAT_EXTENDED_L2 and uses a 16-byte L2 entry size).
     pub extended_l2: bool,
+    /// Preallocation mode the layout was computed for.
+    pub preallocation: Preallocation,
     /// Number of L1 entries needed to cover `virtual_size`.
     pub l1_entries: u32,
     /// `l1_entries * 8`, the on-disk size of the L1 table in bytes.
@@ -95,23 +156,44 @@ pub struct Qcow2Layout {
     /// Byte offset of the first refcount block. Successive blocks are
     /// laid out contiguously at this offset + (i * cluster_size).
     pub refcount_blocks_base_offset: u64,
-    /// Total number of clusters in the empty image (header + L1 +
-    /// reftable + refblocks).
+    /// Number of L2-table clusters (one per L1 entry in non-Off
+    /// modes; 0 in Off mode).
+    pub l2_clusters: u64,
+    /// Byte offset of the first L2 table. Successive L2 tables are
+    /// at offset `l2_base_offset + l1_index * cluster_size`. Only
+    /// meaningful when `l2_clusters > 0`.
+    pub l2_base_offset: u64,
+    /// Number of data clusters (`virtual_size / cluster_size` rounded
+    /// up in non-Off modes; 0 in Off mode).
+    pub data_clusters: u64,
+    /// Byte offset of the first data cluster. Only meaningful when
+    /// `data_clusters > 0`.
+    pub data_base_offset: u64,
+    /// Total number of clusters in the image (header + L1 +
+    /// reftable + refblocks + l2 + data).
     pub total_clusters: u64,
     /// Total file size in bytes (`total_clusters * cluster_size`).
     pub total_file_size: u64,
 }
 
-/// Compute the layout for an empty image with the given parameters.
+/// Compute the layout for an image with the given parameters.
 ///
-/// Mirrors `calculate_refcount_layout` in convert plus the
-/// `init_qcow2_output_layout` sizing logic, but generalised to
-/// arbitrary refcount widths and with no input dependence.
+/// `Preallocation::Off` produces a layout that covers header + L1 +
+/// refcount only (no L2 tables, no data region). Any other mode
+/// extends the layout to include L2 tables (one per L1 entry) and
+/// the data region (virtual_size rounded up to cluster boundary).
+///
+/// Combining `Preallocation::Metadata`/`Falloc`/`Full` with
+/// `extended_l2` returns `PreallocationUnsupported` because
+/// populating extended-L2 subcluster bitmaps for the full virtual
+/// range is non-trivial (every subcluster has to be marked
+/// allocated) and the combination is rare in practice.
 pub fn compute_layout(
     virtual_size: u64,
     cluster_bits: u32,
     refcount_bits: u32,
     extended_l2: bool,
+    preallocation: Preallocation,
 ) -> Result<Qcow2Layout, Qcow2CreateError> {
     if virtual_size == 0 {
         return Err(Qcow2CreateError::InvalidVirtualSize);
@@ -121,6 +203,9 @@ pub fn compute_layout(
     }
     if !matches!(refcount_bits, 1 | 2 | 4 | 8 | 16 | 32 | 64) {
         return Err(Qcow2CreateError::InvalidRefcountBits);
+    }
+    if extended_l2 && preallocation.populates_data_metadata() {
+        return Err(Qcow2CreateError::PreallocationUnsupported);
     }
 
     let cluster_size: u64 = 1u64 << cluster_bits;
@@ -144,7 +229,23 @@ pub fn compute_layout(
 
     // Header is cluster 0, L1 starts at cluster 1.
     let l1_offset: u64 = cluster_size;
-    let used_clusters_before_refcount: u64 = 1u64 + l1_clusters;
+
+    // Non-Off modes pre-allocate L2 tables (one per L1 entry) and
+    // the data region (virtual_size rounded up to cluster). They
+    // sit *after* the refcount metadata in the file so the
+    // refcount layout can be computed once and used to derive the
+    // L2/data base offsets.
+    let (l2_clusters, data_clusters): (u64, u64) = if preallocation.populates_data_metadata() {
+        let data = virtual_size.div_ceil(cluster_size);
+        (l1_entries as u64, data)
+    } else {
+        (0, 0)
+    };
+
+    // Clusters covered by refcount blocks: header + L1 + reftable +
+    // refblocks + L2 + data. Refcount's fixed-point iteration
+    // includes itself.
+    let used_clusters_before_refcount: u64 = 1u64 + l1_clusters + l2_clusters + data_clusters;
 
     // refcount blocks pack `cluster_size * 8 / refcount_bits` entries
     // each; refcount table entries are 8 bytes (u64 offset).
@@ -163,9 +264,12 @@ pub fn compute_layout(
         reftable_clusters = new_reftable_clusters;
     }
 
-    let refcount_table_offset: u64 = used_clusters_before_refcount * cluster_size;
+    let refcount_table_offset: u64 = (1u64 + l1_clusters) * cluster_size;
     let refcount_blocks_base_offset: u64 = refcount_table_offset + reftable_clusters * cluster_size;
-    let total_clusters: u64 = used_clusters_before_refcount + reftable_clusters + refblock_count;
+    let l2_base_offset: u64 = refcount_blocks_base_offset + refblock_count * cluster_size;
+    let data_base_offset: u64 = l2_base_offset + l2_clusters * cluster_size;
+    let total_clusters: u64 =
+        1u64 + l1_clusters + reftable_clusters + refblock_count + l2_clusters + data_clusters;
     let total_file_size: u64 = total_clusters * cluster_size;
 
     Ok(Qcow2Layout {
@@ -174,6 +278,7 @@ pub fn compute_layout(
         virtual_size,
         refcount_bits,
         extended_l2,
+        preallocation,
         l1_entries,
         l1_size_bytes,
         l1_clusters,
@@ -182,6 +287,10 @@ pub fn compute_layout(
         refcount_table_clusters: reftable_clusters,
         refcount_block_count: refblock_count,
         refcount_blocks_base_offset,
+        l2_clusters,
+        l2_base_offset,
+        data_clusters,
+        data_base_offset,
         total_clusters,
         total_file_size,
     })
@@ -305,9 +414,13 @@ pub fn build_header<'a>(
     Ok(hdr)
 }
 
-/// Populate `buf` with an empty L1 table (all entries zero), returning
-/// the populated slice. `buf` must be at least
-/// `layout.l1_clusters * layout.cluster_size` bytes.
+/// Populate `buf` with the L1 table, returning the populated slice.
+///
+/// `buf` must be at least `layout.l1_clusters * layout.cluster_size`
+/// bytes. In `Preallocation::Off` mode every L1 entry is zero (no L2
+/// tables exist). In any other mode each L1 entry points at the
+/// corresponding L2 table offset with `OFLAG_COPIED` set (preallocated
+/// L2 tables have refcount=1 so writes can modify in place).
 pub fn build_l1_table<'a>(
     buf: &'a mut [u8],
     layout: &Qcow2Layout,
@@ -318,6 +431,79 @@ pub fn build_l1_table<'a>(
     }
     let slice = &mut buf[..needed];
     slice.fill(0);
+
+    if layout.preallocation.populates_data_metadata() {
+        // Populate one entry per L1 slot, each pointing at the
+        // matching L2 table offset with OFLAG_COPIED set.
+        for i in 0..layout.l1_entries as u64 {
+            let l2_offset = layout.l2_base_offset + i * layout.cluster_size;
+            let entry = l2_offset | OFLAG_COPIED;
+            let off = (i as usize) * 8;
+            write_be_u64(slice, off, entry);
+        }
+    }
+    Ok(slice)
+}
+
+/// Populate `buf` with one L2 table for the given L1 index, returning
+/// the populated cluster-sized slice.
+///
+/// Only meaningful when `layout.preallocation.populates_data_metadata()`
+/// is true. Each L2 entry points at a sequentially-laid-out data
+/// cluster offset with `OFLAG_COPIED` set. Entries past the virtual
+/// range (the last L2 table may have unused tail entries) stay zero.
+///
+/// Phase 6 rejects `extended_l2 + preallocation != Off` in
+/// `compute_layout` so this function only needs to handle the
+/// 8-byte L2 entry layout.
+pub fn build_l2_table<'a>(
+    buf: &'a mut [u8],
+    layout: &Qcow2Layout,
+    l1_index: u64,
+) -> Result<&'a [u8], Qcow2CreateError> {
+    let needed = layout.cluster_size as usize;
+    if buf.len() < needed {
+        return Err(Qcow2CreateError::BufferTooSmall);
+    }
+    let slice = &mut buf[..needed];
+    slice.fill(0);
+
+    if !layout.preallocation.populates_data_metadata() {
+        // Caller asked for an L2 table in Off mode — shouldn't
+        // happen via the documented API surface but return an
+        // empty cluster so misuse fails closed instead of writing
+        // garbage entries.
+        return Ok(slice);
+    }
+    if layout.extended_l2 {
+        // Defence in depth — compute_layout already rejected this
+        // combination; reaching here means the caller built a
+        // layout struct by hand.
+        return Err(Qcow2CreateError::PreallocationUnsupported);
+    }
+    if l1_index >= layout.l1_entries as u64 {
+        return Ok(slice);
+    }
+
+    // L2 entry size is 8 bytes (extended_l2 is rejected above).
+    let entries_per_l2: u64 = layout.cluster_size / 8;
+    let first_virtual_cluster = l1_index * entries_per_l2;
+    let mut entries_in_table = entries_per_l2;
+    if first_virtual_cluster >= layout.data_clusters {
+        return Ok(slice);
+    }
+    let remaining = layout.data_clusters - first_virtual_cluster;
+    if remaining < entries_in_table {
+        entries_in_table = remaining;
+    }
+
+    for local in 0..entries_in_table {
+        let data_offset =
+            layout.data_base_offset + (first_virtual_cluster + local) * layout.cluster_size;
+        let entry = data_offset | OFLAG_COPIED;
+        write_be_u64(slice, (local as usize) * 8, entry);
+    }
+
     Ok(slice)
 }
 
@@ -461,7 +647,14 @@ mod tests {
     }
 
     fn assert_layout_matches_convert(virtual_size: u64, cluster_bits: u32, extended_l2: bool) {
-        let layout = compute_layout(virtual_size, cluster_bits, 16, extended_l2).unwrap();
+        let layout = compute_layout(
+            virtual_size,
+            cluster_bits,
+            16,
+            extended_l2,
+            Preallocation::Off,
+        )
+        .unwrap();
         let cluster_size = 1u64 << cluster_bits;
         let l2_entry_size: u64 = if extended_l2 { 16 } else { 8 };
         let entries_per_l2 = cluster_size / l2_entry_size;
@@ -517,7 +710,7 @@ mod tests {
     #[test]
     fn invalid_virtual_size_zero_rejected() {
         assert_eq!(
-            compute_layout(0, 16, 16, false),
+            compute_layout(0, 16, 16, false, Preallocation::Off),
             Err(Qcow2CreateError::InvalidVirtualSize),
         );
     }
@@ -525,11 +718,11 @@ mod tests {
     #[test]
     fn invalid_cluster_bits_rejected() {
         assert_eq!(
-            compute_layout(1 << 20, 8, 16, false),
+            compute_layout(1 << 20, 8, 16, false, Preallocation::Off),
             Err(Qcow2CreateError::InvalidClusterBits),
         );
         assert_eq!(
-            compute_layout(1 << 20, 22, 16, false),
+            compute_layout(1 << 20, 22, 16, false, Preallocation::Off),
             Err(Qcow2CreateError::InvalidClusterBits),
         );
     }
@@ -537,7 +730,7 @@ mod tests {
     #[test]
     fn invalid_refcount_bits_rejected() {
         assert_eq!(
-            compute_layout(1 << 20, 16, 3, false),
+            compute_layout(1 << 20, 16, 3, false, Preallocation::Off),
             Err(Qcow2CreateError::InvalidRefcountBits),
         );
     }
@@ -551,14 +744,14 @@ mod tests {
         let l2_coverage = cluster_size * (cluster_size / 8);
         let too_many_l1 = (crate::QCOW2_MAX_L1_SIZE_ENTRIES as u64 + 1) * l2_coverage;
         assert_eq!(
-            compute_layout(too_many_l1, bits, 16, false),
+            compute_layout(too_many_l1, bits, 16, false, Preallocation::Off),
             Err(Qcow2CreateError::InvalidVirtualSize),
         );
     }
 
     #[test]
     fn header_round_trips_through_parser() {
-        let layout = compute_layout(1 << 30, 16, 16, false).unwrap();
+        let layout = compute_layout(1 << 30, 16, 16, false, Preallocation::Off).unwrap();
         let cluster_size = layout.cluster_size as usize;
         let mut buf = [0u8; 1 << 16]; // 64 KiB
         let opts = BuildHeaderOptions {
@@ -591,7 +784,7 @@ mod tests {
 
     #[test]
     fn header_with_extended_l2_sets_incompat_bit() {
-        let layout = compute_layout(1 << 30, 16, 16, true).unwrap();
+        let layout = compute_layout(1 << 30, 16, 16, true, Preallocation::Off).unwrap();
         let cluster_size = layout.cluster_size as usize;
         let mut buf = [0u8; 1 << 16];
         let opts = BuildHeaderOptions {
@@ -612,7 +805,7 @@ mod tests {
 
     #[test]
     fn header_with_lazy_refcounts_sets_compat_bit() {
-        let layout = compute_layout(1 << 30, 16, 16, false).unwrap();
+        let layout = compute_layout(1 << 30, 16, 16, false, Preallocation::Off).unwrap();
         let cluster_size = layout.cluster_size as usize;
         let mut buf = [0u8; 1 << 16];
         let opts = BuildHeaderOptions {
@@ -629,7 +822,7 @@ mod tests {
 
     #[test]
     fn header_with_backing_file_round_trips() {
-        let layout = compute_layout(1 << 30, 16, 16, false).unwrap();
+        let layout = compute_layout(1 << 30, 16, 16, false, Preallocation::Off).unwrap();
         let cluster_size = layout.cluster_size as usize;
         let mut buf = [0u8; 1 << 16];
         let path = b"backing.qcow2";
@@ -652,7 +845,7 @@ mod tests {
 
     #[test]
     fn l1_table_is_zero_filled() {
-        let layout = compute_layout(1 << 30, 16, 16, false).unwrap();
+        let layout = compute_layout(1 << 30, 16, 16, false, Preallocation::Off).unwrap();
         let needed = (layout.l1_clusters * layout.cluster_size) as usize;
         let mut buf = vec![0xffu8; needed];
         let l1 = build_l1_table(&mut buf, &layout).unwrap();
@@ -661,7 +854,7 @@ mod tests {
 
     #[test]
     fn refcount_table_points_at_blocks() {
-        let layout = compute_layout(1 << 30, 16, 16, false).unwrap();
+        let layout = compute_layout(1 << 30, 16, 16, false, Preallocation::Off).unwrap();
         let cs = layout.cluster_size as usize;
         let mut buf = vec![0u8; cs * layout.refcount_table_clusters as usize];
         let rt = build_refcount_table(&mut buf, &layout).unwrap();
@@ -675,7 +868,7 @@ mod tests {
 
     #[test]
     fn refcount_block_marks_all_used_clusters_16bit() {
-        let layout = compute_layout(1 << 20, 16, 16, false).unwrap();
+        let layout = compute_layout(1 << 20, 16, 16, false, Preallocation::Off).unwrap();
         let cs = layout.cluster_size as usize;
         let mut buf = vec![0u8; cs];
         let rb = build_refcount_block(&mut buf, &layout, 0).unwrap();
@@ -692,7 +885,7 @@ mod tests {
 
     #[test]
     fn refcount_block_marks_all_used_clusters_8bit() {
-        let layout = compute_layout(1 << 20, 16, 8, false).unwrap();
+        let layout = compute_layout(1 << 20, 16, 8, false, Preallocation::Off).unwrap();
         let cs = layout.cluster_size as usize;
         let mut buf = vec![0u8; cs];
         let rb = build_refcount_block(&mut buf, &layout, 0).unwrap();
@@ -706,7 +899,7 @@ mod tests {
 
     #[test]
     fn refcount_block_marks_all_used_clusters_1bit() {
-        let layout = compute_layout(1 << 20, 16, 1, false).unwrap();
+        let layout = compute_layout(1 << 20, 16, 1, false, Preallocation::Off).unwrap();
         let cs = layout.cluster_size as usize;
         let mut buf = vec![0u8; cs];
         let rb = build_refcount_block(&mut buf, &layout, 0).unwrap();
@@ -719,7 +912,7 @@ mod tests {
 
     #[test]
     fn build_with_too_small_buffer_errors() {
-        let layout = compute_layout(1 << 20, 16, 16, false).unwrap();
+        let layout = compute_layout(1 << 20, 16, 16, false, Preallocation::Off).unwrap();
         let mut buf = [0u8; 32];
         let opts = BuildHeaderOptions {
             layout: &layout,
@@ -732,5 +925,114 @@ mod tests {
             build_header(&mut buf, &opts),
             Err(Qcow2CreateError::BufferTooSmall),
         );
+    }
+
+    // ---- Preallocation (metadata mode) tests -----------------
+
+    #[test]
+    fn metadata_mode_layout_grows_to_cover_data_region() {
+        // 1 GiB virtual + default 64 KiB clusters: 16384 data clusters
+        // + L2 tables (2 L1 entries → 2 L2 clusters, since
+        // L2 coverage = 64K * 8K = 512 MiB and 1 GiB / 512 MiB = 2)
+        // + header + L1 + refcount.
+        let layout = compute_layout(1 << 30, 16, 16, false, Preallocation::Metadata).unwrap();
+        assert_eq!(layout.preallocation, Preallocation::Metadata);
+        assert_eq!(layout.l1_entries, 2);
+        assert_eq!(layout.l2_clusters, 2);
+        assert_eq!(layout.data_clusters, 16384);
+        // total_file_size should cover the data region: well over
+        // 1 GiB (1 GiB data + a few hundred KiB of metadata).
+        assert!(layout.total_file_size >= (1u64 << 30));
+        // l2_base_offset comes after the refcount blocks; data_base
+        // comes after L2 tables.
+        assert!(layout.l2_base_offset > layout.refcount_blocks_base_offset);
+        assert_eq!(
+            layout.data_base_offset,
+            layout.l2_base_offset + layout.l2_clusters * layout.cluster_size,
+        );
+    }
+
+    #[test]
+    fn metadata_mode_off_keeps_existing_layout() {
+        // Sanity: existing Off-mode layouts are unaffected by the
+        // phase-6 extension.
+        let off = compute_layout(1 << 30, 16, 16, false, Preallocation::Off).unwrap();
+        assert_eq!(off.l2_clusters, 0);
+        assert_eq!(off.data_clusters, 0);
+        // total_file_size still tiny (~256 KiB for 1 GiB virtual).
+        assert!(off.total_file_size < (1u64 << 20));
+    }
+
+    #[test]
+    fn metadata_mode_with_extended_l2_rejected() {
+        let err = compute_layout(1 << 30, 16, 16, true, Preallocation::Metadata).unwrap_err();
+        assert_eq!(err, Qcow2CreateError::PreallocationUnsupported);
+    }
+
+    #[test]
+    fn metadata_mode_l1_table_points_at_l2_tables() {
+        let layout = compute_layout(1 << 30, 16, 16, false, Preallocation::Metadata).unwrap();
+        let cs = layout.cluster_size as usize;
+        let mut buf = vec![0u8; cs];
+        let l1 = build_l1_table(&mut buf, &layout).unwrap();
+        for i in 0..layout.l1_entries as u64 {
+            let val = shared::be_u64(l1, (i as usize) * 8);
+            let l2_off = layout.l2_base_offset + i * layout.cluster_size;
+            let expected = l2_off | OFLAG_COPIED;
+            assert_eq!(val, expected, "L1 entry {} mismatch", i);
+        }
+    }
+
+    #[test]
+    fn metadata_mode_l2_table_points_at_data_clusters() {
+        let layout = compute_layout(1 << 30, 16, 16, false, Preallocation::Metadata).unwrap();
+        let cs = layout.cluster_size as usize;
+        let mut buf = vec![0u8; cs];
+        let entries_per_l2 = layout.cluster_size / 8;
+        // Check the first L2 table.
+        let l2 = build_l2_table(&mut buf, &layout, 0).unwrap();
+        for i in 0..entries_per_l2.min(layout.data_clusters) {
+            let val = shared::be_u64(l2, (i as usize) * 8);
+            let data_off = layout.data_base_offset + i * layout.cluster_size;
+            assert_eq!(val, data_off | OFLAG_COPIED, "L2 entry {} mismatch", i);
+        }
+    }
+
+    #[test]
+    fn metadata_mode_l2_tail_entries_zero_when_below_full() {
+        // virtual_size = 1 MiB at 64 KiB clusters = 16 data clusters,
+        // far less than entries_per_l2 (8192). The single L2 table's
+        // tail entries (16..8192) should be zero.
+        let layout = compute_layout(1 << 20, 16, 16, false, Preallocation::Metadata).unwrap();
+        assert_eq!(layout.l1_entries, 1);
+        assert_eq!(layout.data_clusters, 16);
+        let cs = layout.cluster_size as usize;
+        let mut buf = vec![0u8; cs];
+        let l2 = build_l2_table(&mut buf, &layout, 0).unwrap();
+        for i in 16..32 {
+            assert_eq!(
+                shared::be_u64(l2, i * 8),
+                0,
+                "L2 entry {} should be zero (past data range)",
+                i,
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_mode_refcount_block_covers_data_region() {
+        // Refcount blocks in metadata mode mark every cluster up to
+        // total_clusters (which now includes L2 + data).
+        let layout = compute_layout(1 << 20, 16, 16, false, Preallocation::Metadata).unwrap();
+        let cs = layout.cluster_size as usize;
+        let mut buf = vec![0u8; cs];
+        let rb = build_refcount_block(&mut buf, &layout, 0).unwrap();
+        // total_clusters includes header + L1 + reftable + refblocks
+        // + L2 + data; every entry up to total_clusters should be 1.
+        for i in 0..layout.total_clusters as usize {
+            let off = i * 2;
+            let val = shared::be_u16(rb, off);
+            assert_eq!(val, 1, "cluster {} refcount mismatch", i);
+        }
     }
 }
