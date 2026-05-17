@@ -17,7 +17,7 @@ instar/
 │   ├── core/       # Core guest initialization
 │   ├── crates/     # Shared format crates (qcow2, raw, vmdk, vhd, vhdx, luks)
 │   ├── shared/     # Shared library code (byte-order helpers, configs)
-│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, measure)
+│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, measure, create)
 │   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates (guest-protocol)
 ├── prototypes/     # Experimental implementations (11 KVM prototypes)
@@ -65,6 +65,10 @@ vhdx (VHDX), luks (info + convert with decryption)
 - `convert`: convert a disk image from one format to another
 - `measure`: predict file size required to convert an image to a target
   format. See [docs/measure.md](docs/measure.md) for the full reference.
+- `create`: emit empty-image metadata for a target format. Guest binary
+  shipped in phase 2 of `PLAN-create.md`; the host CLI subcommand
+  (`run_create`) lands in phase 3 — until then the binary is built but
+  unwired.
 
 ## Working on This Project
 

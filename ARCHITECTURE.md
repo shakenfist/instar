@@ -269,6 +269,21 @@ provides a modular architecture with:
   SEEK_HOLE detection, qcow2/vhdx/vmdk overcounts on some real-world
   images, VHD CHS rounding) are skipped with documented reasons
   pending follow-up work.
+- **operations/create/** - Empty-image creation operation. Reads a
+  `CreateConfig` (target format, virtual size, per-format options,
+  optional backing reference) from `OPERATION_CONFIG_ADDR`, optionally
+  recovers the virtual size from a backing image's header on input
+  device 0, calls the matching `crates/create::plan_*` to build a
+  `MetadataPlan`, and writes every entry to the output device via
+  `write_output_sector`. Raw output short-circuits (no metadata to
+  emit; host ftruncates). Backing-file lookup currently supports raw,
+  qcow2, vmdk, and vhd source headers — VHDX-as-backing is deferred
+  to phase 5 because VHDX stores virtual_size in a metadata-region
+  item rather than in the first-sector header. The guest binary is
+  shipped in phase 2 of `PLAN-create.md` but the host CLI subcommand
+  is not wired until phase 3 — the binary builds and fits the 384 KiB
+  cap (~29 KiB) and is excluded from `cargo test --workspace` like
+  the other `no_main` operation binaries.
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation,
@@ -279,6 +294,10 @@ provides a modular architecture with:
   subcommand. `MeasureConfig` and `MeasureResult` structs carry
   options and results across OPERATION_CONFIG_ADDR and the
   `send_measure_result` CallTable callback (CallTable VERSION 14).
+  Phase 2 of `PLAN-create.md` adds `CreateConfig` / `CreateResult` /
+  `GUEST_CREATE_SCRATCH_LIMIT` here and a new `send_create_result`
+  CallTable function pointer (appended at the end of the struct so
+  existing operation binaries keep working unchanged).
 
 **Chain validation in check (`--chain`):**
 The check operation supports an optional `--chain` flag that uses the host-side

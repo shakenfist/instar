@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`instar create` subcommand groundwork (internal).** Phases 1
+  and 2 of [PLAN-create.md](docs/plans/PLAN-create.md) land the
+  per-format empty-image metadata emitters (`crates/create/` with
+  `plan_qcow2` / `plan_vmdk` / `plan_vhd` / `plan_vhdx`) plus a new
+  `src/operations/create/` guest binary that reads a `CreateConfig`,
+  optionally infers virtual size from a backing image's header, and
+  writes the resulting `MetadataPlan` to the output device. The
+  host CLI subcommand is not yet wired — phase 3 adds
+  `Commands::Create` / `run_create`. Until then the binary is
+  shipped but unreachable by end users.
+  ([phase 1](docs/plans/PLAN-create-phase-01-emitters.md) ·
+  [phase 2](docs/plans/PLAN-create-phase-02-guest-op.md))
+
 - **New `instar measure` subcommand.** Predicts the file size
   required to convert an image (or a hypothetical `--size N`
   image) to a target format. Output matches `qemu-img measure`
