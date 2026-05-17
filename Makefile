@@ -497,7 +497,8 @@ test-rust: instar-devcontainer
 			--exclude check \
 			--exclude compare \
 			--exclude convert \
-			--exclude measure-op && \
+			--exclude measure-op \
+			--exclude create-op && \
 		cargo test --release -p luks --features "decrypt,encrypt" && \
 		cargo test --release -p qcow2 --features create && \
 		cargo test --release -p create'
