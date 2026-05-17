@@ -411,3 +411,165 @@ class TestCreateOOptions(InstarTestBase):
             self.assertNotEqual(rc, 0)
             self.assertIn('preallocation', stderr)
             self.assertIn('phase 6', stderr)
+
+
+class TestCreateBackingChain(InstarTestBase):
+    """Phase-5 backing-file polish tests.
+
+    Covers cases the master plan explicitly called out: vhdx-as-
+    backing (phase 5a), vmdk-from-vmdk CID round-trip (phase 5b),
+    non-recursion through grandparent chains, format-mismatch
+    auto-detect, and the new BACKING_SIZE_TOO_LARGE error.
+    """
+
+    def run_instar_create(self, *args, timeout=60):
+        instar = self.get_instar_binary()
+        cmd = [str(instar), 'create', *[str(a) for a in args]]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            return r.stdout, r.stderr, r.returncode
+        except subprocess.TimeoutExpired:
+            return '', f'Timeout after {timeout}s', -1
+
+    def run_instar_info(self, path, *, timeout=30):
+        instar = self.get_instar_binary()
+        cmd = [str(instar), 'info', '--output', 'json', str(path)]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            return r.stdout, r.stderr, r.returncode
+        except subprocess.TimeoutExpired:
+            return '', f'Timeout after {timeout}s', -1
+
+    def _info_json(self, path):
+        stdout, stderr, rc = self.run_instar_info(path)
+        self.assertEqual(rc, 0, f'info on {path} failed: {stderr}')
+        return json.loads(stdout)
+
+    def test_vhdx_as_backing(self):
+        """Phase 5a: create a vhdx parent, use it as backing for a qcow2 child.
+
+        The child's virtual_size should be inferred from the parent
+        via VhdxState::init's metadata-region walk.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            parent = Path(td) / 'parent.vhdx'
+            child = Path(td) / 'child.qcow2'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'vhdx', str(parent), '32M')
+            self.assertEqual(rc, 0, f'vhdx parent failed: {stderr}')
+
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2', '-b', 'parent.vhdx', '-F', 'vhdx', str(child))
+            self.assertEqual(rc, 0, f'qcow2-with-vhdx-backing failed: {stderr}')
+
+            info = self._info_json(child)
+            self.assertEqual(info['virtual-size'], 32 * 1024 * 1024,
+                             f'child should inherit parent size; got {info!r}')
+            self.assertEqual(info.get('backing-filename'), 'parent.vhdx')
+            self.assertEqual(info.get('backing-filename-format'), 'vhdx')
+
+    def test_vmdk_from_vmdk_parentcid(self):
+        """Phase 5b: vmdk-from-vmdk reads the parent's CID into parentCID."""
+        with tempfile.TemporaryDirectory() as td:
+            parent = Path(td) / 'parent.vmdk'
+            child = Path(td) / 'child.vmdk'
+            _, _, rc = self.run_instar_create('-f', 'vmdk', str(parent), '32M')
+            self.assertEqual(rc, 0)
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'vmdk', '-b', 'parent.vmdk', '-F', 'vmdk', str(child))
+            self.assertEqual(rc, 0, f'vmdk-from-vmdk failed: {stderr}')
+
+            # The descriptor's parentCID should match the parent's CID,
+            # not the old 0xdeadbeef sentinel.
+            parent_bytes = parent.read_bytes()[:1024]
+            child_bytes = child.read_bytes()[:1024]
+            # Extract CID= from the parent (first 8 hex chars).
+            parent_cid = None
+            for line in parent_bytes.split(b'\n'):
+                if line.startswith(b'CID='):
+                    parent_cid = line[4:12]
+                    break
+            self.assertIsNotNone(parent_cid, 'parent CID line not found')
+            # Extract parentCID= from the child.
+            child_parent_cid = None
+            for line in child_bytes.split(b'\n'):
+                if line.startswith(b'parentCID='):
+                    child_parent_cid = line[10:18]
+                    break
+            self.assertIsNotNone(child_parent_cid, 'child parentCID line not found')
+            self.assertEqual(
+                child_parent_cid, parent_cid,
+                f"child's parentCID={child_parent_cid!r} should match "
+                f"parent's CID={parent_cid!r} (not deadbeef sentinel)")
+            self.assertNotEqual(child_parent_cid, b'deadbeef',
+                                'parentCID should no longer be the sentinel')
+
+    def test_backing_chain_non_recursion(self):
+        """Three-level chain: child references its immediate parent only.
+
+        instar (like qemu-img) records one backing reference per
+        image. info on the child should report `backing-filename=
+        parent.qcow2` — not `grandparent.qcow2`.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            grand = Path(td) / 'grandparent.qcow2'
+            parent = Path(td) / 'parent.qcow2'
+            child = Path(td) / 'child.qcow2'
+
+            _, _, rc = self.run_instar_create('-f', 'qcow2', str(grand), '32M')
+            self.assertEqual(rc, 0)
+            _, _, rc = self.run_instar_create(
+                '-f', 'qcow2', '-b', 'grandparent.qcow2', '-F', 'qcow2',
+                str(parent))
+            self.assertEqual(rc, 0)
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2', '-b', 'parent.qcow2', '-F', 'qcow2', str(child))
+            self.assertEqual(rc, 0, f'child create failed: {stderr}')
+
+            info = self._info_json(child)
+            self.assertEqual(info.get('backing-filename'), 'parent.qcow2',
+                             'child should reference the immediate parent only')
+            # virtual_size inherits up the chain via the same lookup.
+            self.assertEqual(info['virtual-size'], 32 * 1024 * 1024)
+
+    def test_backing_format_mismatch_auto_detect_wins(self):
+        """When -F lies, auto-detect picks the real format from the magic.
+
+        Create a qcow2 file, then `create -b foo.qcow2 -F raw child.qcow2`
+        — the guest's first-sector detect-format helper returns qcow2
+        from the magic, ignoring the wrong -F hint. The child still
+        inherits the parent's virtual_size.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            parent = Path(td) / 'parent.qcow2'
+            child = Path(td) / 'child.qcow2'
+            _, _, rc = self.run_instar_create('-f', 'qcow2', str(parent), '32M')
+            self.assertEqual(rc, 0)
+
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2', '-b', 'parent.qcow2', '-F', 'raw', str(child))
+            self.assertEqual(rc, 0,
+                             f'auto-detect should override wrong -F: {stderr}')
+            info = self._info_json(child)
+            self.assertEqual(info['virtual-size'], 32 * 1024 * 1024,
+                             'child should inherit real virtual_size')
+
+    def test_backing_too_large_for_target(self):
+        """A 4 TiB raw backing exceeds qcow2 cluster_size=512 addressable range.
+
+        Phase 5c's ceiling check should fire, returning
+        ERROR_BACKING_SIZE_TOO_LARGE with the actionable hint in
+        stderr.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            parent = Path(td) / 'big.raw'
+            # truncate is the cheapest way to make a 4 TiB sparse file
+            with open(parent, 'wb') as f:
+                f.truncate(4 * 1024 * 1024 * 1024 * 1024)
+            child = Path(td) / 'small.qcow2'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2', '-b', 'big.raw', '-F', 'raw',
+                '--cluster-size', '512', str(child))
+            self.assertNotEqual(rc, 0, 'expected failure for backing-too-large')
+            self.assertIn('too large', stderr.lower())
+            self.assertIn('cluster size', stderr.lower())
