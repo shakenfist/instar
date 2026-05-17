@@ -275,10 +275,13 @@ provides a modular architecture with:
   recovers the virtual size from a backing image's header on input
   device 0, calls the matching `crates/create::plan_*` to build a
   `MetadataPlan`, and writes every entry to the output device via
-  `write_output_sector`. Backing-file lookup currently supports raw,
-  qcow2, vmdk, and vhd source headers — VHDX-as-backing is deferred
-  to phase 5 because VHDX stores virtual_size in a metadata-region
-  item rather than in the first-sector header. The host CLI
+  `write_output_sector`. Backing-file lookup supports raw, qcow2,
+  vmdk, vhd, and vhdx source headers (phase 5 added the vhdx path
+  via `vhdx::VhdxState::init`'s metadata-region walk). When the
+  target and backing are both vmdk, the guest also reads the
+  parent's descriptor via `vmdk::read_and_parse_descriptor` and
+  plumbs the real `parentCID` into the new image's descriptor
+  (no longer the phase-1d deadbeef sentinel). The host CLI
   (`run_create` in `src/vmm/src/main.rs`, wired in phase 3) handles
   the raw target entirely host-side via open + ftruncate +
   optional posix_fallocate; for every other format it opens the
@@ -291,14 +294,19 @@ provides a modular architecture with:
   `apply_create_overrides` in `src/vmm/src/main.rs`) so the
   full per-format option matrix is reachable via either
   individual `--flag` forms or qemu-img-compatible `-o`
-  syntax; `-o` wins on conflict. The host enforces
-  `--sector-size=512` in phase 3 because
-  the `crates/create` MetadataPlan entries are 512-byte aligned
-  but not always to larger sector sizes — phase 5 may relax this
-  once the planner emits coalesced sector-sized writes. The
-  binary builds at ~29 KiB / 384 KiB and is excluded from
-  `cargo test --workspace` like the other `no_main` operation
-  binaries.
+  syntax; `-o` wins on conflict. Phase 5 added two error codes —
+  `ERROR_BACKING_FORMAT_UNSUPPORTED` (recognised format but
+  size extraction not implemented) and
+  `ERROR_BACKING_SIZE_TOO_LARGE` (pre-flight ceiling check
+  surfaces a clearer "try a larger cluster size" hint instead
+  of plan_*'s generic `InvalidVirtualSize`). The host enforces
+  `--sector-size=512` because the `crates/create` MetadataPlan
+  entries are 512-byte aligned but not always to larger sector
+  sizes — relaxing this needs a planner-side change to emit
+  coalesced sector-sized writes; tracked in PLAN-create.md's
+  Future-work section. The binary builds at ~36 KiB / 384 KiB
+  and is excluded from `cargo test --workspace` like the
+  other `no_main` operation binaries.
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation,

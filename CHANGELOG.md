@@ -34,20 +34,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   preallocation modes (`metadata` / `full`) return clear
   "deferred" errors with phase pointers. Output rendering:
   human one-liner (default), `--output=json`, or `-q` quiet.
+  Backing-file polish (phase 5): backing virtual_size is now
+  recovered correctly for vhdx parents via
+  `vhdx::VhdxState::init`'s metadata-region walk (previously
+  returned BACKING_PARSE_FAILED with a phase-5 pointer);
+  vmdk-from-vmdk chains now embed the real parent CID in the
+  child's descriptor `parentCID=` line (previously a fixed
+  `deadbeef` sentinel). Two new error codes —
+  `ERROR_BACKING_FORMAT_UNSUPPORTED` and
+  `ERROR_BACKING_SIZE_TOO_LARGE` — surface clearer messages
+  for the corner cases; the latter fires a pre-flight ceiling
+  check that suggests "try a larger cluster size" when a
+  backing-derived virtual_size exceeds the target's
+  addressable range.
   ([phase 1](docs/plans/PLAN-create-phase-01-emitters.md) ·
   [phase 2](docs/plans/PLAN-create-phase-02-guest-op.md) ·
   [phase 3](docs/plans/PLAN-create-phase-03-host-cli.md) ·
-  [phase 4](docs/plans/PLAN-create-phase-04-target-options.md))
+  [phase 4](docs/plans/PLAN-create-phase-04-target-options.md) ·
+  [phase 5](docs/plans/PLAN-create-phase-05-backing-file.md))
 
   Deferred to later phases:
-  backing-file polish including vhdx-as-backing and multi-file
-  vmdk subformats
-  ([phase 5](docs/plans/PLAN-create.md)),
   preallocation modes beyond `off` and raw's `falloc`
   ([phase 6](docs/plans/PLAN-create.md)),
   comprehensive integration matrix and cross-version
   info-equivalence
   ([phase 8](docs/plans/PLAN-create.md)).
+  Multi-file VMDK subformats (`monolithicFlat`,
+  `twoGbMaxExtent*`), differencing VHD / VHDX as the *output*
+  target, and `--sector-size > 512` remain deferred to future
+  work (see PLAN-create.md's Future-work section).
 
 - **New `instar measure` subcommand.** Predicts the file size
   required to convert an image (or a hypothetical `--size N`
