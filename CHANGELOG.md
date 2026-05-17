@@ -9,18 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **`instar create` subcommand groundwork (internal).** Phases 1
-  and 2 of [PLAN-create.md](docs/plans/PLAN-create.md) land the
-  per-format empty-image metadata emitters (`crates/create/` with
-  `plan_qcow2` / `plan_vmdk` / `plan_vhd` / `plan_vhdx`) plus a new
-  `src/operations/create/` guest binary that reads a `CreateConfig`,
-  optionally infers virtual size from a backing image's header, and
-  writes the resulting `MetadataPlan` to the output device. The
-  host CLI subcommand is not yet wired — phase 3 adds
-  `Commands::Create` / `run_create`. Until then the binary is
-  shipped but unreachable by end users.
+- **New `instar create` subcommand.** Creates a new empty disk
+  image of a given format and size:
+  `instar create [-f FMT] [OPTIONS] FILENAME [SIZE]`. Raw output
+  is host-only (open + ftruncate + optional `--preallocation
+  falloc`); qcow2 / vmdk / vpc (VHD) / vhdx run the new
+  `create.bin` guest in the KVM sandbox and write the metadata
+  via virtio. Supports backing files via
+  `-b BACKING [-F FMT] [-u]` — the user-typed backing path is
+  embedded verbatim into the new image so the reference stays
+  portable, and the host resolves the path relative to the new
+  image's directory when opening it. Per-format option flags
+  (`--cluster-size`, `--refcount-bits`, `--extended-l2`,
+  `--lazy-refcounts`, `--compat`, `--subformat`, `--grain-size`,
+  `--block-size`). Output rendering: human one-liner (default),
+  `--output=json`, or `-q` quiet.
   ([phase 1](docs/plans/PLAN-create-phase-01-emitters.md) ·
-  [phase 2](docs/plans/PLAN-create-phase-02-guest-op.md))
+  [phase 2](docs/plans/PLAN-create-phase-02-guest-op.md) ·
+  [phase 3](docs/plans/PLAN-create-phase-03-host-cli.md))
+
+  Deferred to later phases:
+  qemu-img-style `-o key=value` parser
+  ([phase 4](docs/plans/PLAN-create.md)),
+  backing-file polish including vhdx-as-backing and multi-file
+  vmdk subformats
+  ([phase 5](docs/plans/PLAN-create.md)),
+  preallocation modes beyond `off` and raw's `falloc`
+  ([phase 6](docs/plans/PLAN-create.md)),
+  comprehensive integration matrix and cross-version
+  info-equivalence
+  ([phase 8](docs/plans/PLAN-create.md)).
 
 - **New `instar measure` subcommand.** Predicts the file size
   required to convert an image (or a hypothetical `--size N`

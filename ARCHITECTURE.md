@@ -275,15 +275,24 @@ provides a modular architecture with:
   recovers the virtual size from a backing image's header on input
   device 0, calls the matching `crates/create::plan_*` to build a
   `MetadataPlan`, and writes every entry to the output device via
-  `write_output_sector`. Raw output short-circuits (no metadata to
-  emit; host ftruncates). Backing-file lookup currently supports raw,
+  `write_output_sector`. Backing-file lookup currently supports raw,
   qcow2, vmdk, and vhd source headers — VHDX-as-backing is deferred
   to phase 5 because VHDX stores virtual_size in a metadata-region
-  item rather than in the first-sector header. The guest binary is
-  shipped in phase 2 of `PLAN-create.md` but the host CLI subcommand
-  is not wired until phase 3 — the binary builds and fits the 384 KiB
-  cap (~29 KiB) and is excluded from `cargo test --workspace` like
-  the other `no_main` operation binaries.
+  item rather than in the first-sector header. The host CLI
+  (`run_create` in `src/vmm/src/main.rs`, wired in phase 3) handles
+  the raw target entirely host-side via open + ftruncate +
+  optional posix_fallocate; for every other format it opens the
+  output as a writable virtio device, optionally attaches the
+  backing file as input device 0, populates `CreateConfig`, and
+  launches `create.bin`. Result rendering supports human
+  ("Created: ..."), JSON (`--output=json`), and quiet (`-q`)
+  modes. The host enforces `--sector-size=512` in phase 3 because
+  the `crates/create` MetadataPlan entries are 512-byte aligned
+  but not always to larger sector sizes — phase 5 may relax this
+  once the planner emits coalesced sector-sized writes. The
+  binary builds at ~29 KiB / 384 KiB and is excluded from
+  `cargo test --workspace` like the other `no_main` operation
+  binaries.
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation,

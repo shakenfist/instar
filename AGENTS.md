@@ -65,10 +65,13 @@ vhdx (VHDX), luks (info + convert with decryption)
 - `convert`: convert a disk image from one format to another
 - `measure`: predict file size required to convert an image to a target
   format. See [docs/measure.md](docs/measure.md) for the full reference.
-- `create`: emit empty-image metadata for a target format. Guest binary
-  shipped in phase 2 of `PLAN-create.md`; the host CLI subcommand
-  (`run_create`) lands in phase 3 — until then the binary is built but
-  unwired.
+- `create`: create a new empty disk image of a given format and size.
+  Raw output is host-only (open + ftruncate + optional falloc); every
+  other format runs `crates/create` in the KVM sandbox and writes the
+  metadata via virtio. Supports backing files (`-b BACKING [-F FMT]`).
+  Phase 3 ships individual option flags; the qemu-img `-o key=value`
+  parser lands in phase 4. Full preallocation modes (metadata, full)
+  land in phase 6.
 
 ## Working on This Project
 
