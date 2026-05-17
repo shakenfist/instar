@@ -7,11 +7,15 @@
 //! `MetadataPlan`, then writes every plan entry to the output device.
 //! Emits a `CreateResult` at completion describing what was written.
 //!
-//! Out of scope for phase 2:
+//! Out of scope:
 //!  - Preallocation modes (phase 6 handles host-side).
-//!  - Backing-chain composition beyond a single immediate backing.
-//!  - Reading VHDX-as-backing virtual_size (deferred to phase 5).
+//!  - Backing-chain composition beyond a single immediate backing
+//!    (matches qemu-img — only the immediate parent reference is
+//!    recorded; the runtime opener resolves the chain).
 //!  - LUKS / encryption.
+//!
+//! Phase 5 added VHDX-as-backing virtual_size extraction via
+//! `vhdx::VhdxState::init`.
 //!
 //! Raw output short-circuits: the guest emits no writes (the host
 //! ftruncates in phase 3); a defensive invocation returns a success
@@ -42,6 +46,14 @@ const HEADER_BUF: usize = SCRATCH_MEM_BASE;
 /// Create planner scratch region (GUEST_CREATE_SCRATCH_LIMIT bytes,
 /// starting one sector after the header probe).
 const CREATE_SCRATCH: usize = HEADER_BUF + MAX_SECTOR_SIZE;
+
+/// VHDX cache buffers (phase 5a). `VhdxState::init` needs two
+/// `MAX_SECTOR_SIZE` scratch slots for its BAT and data caches.
+/// Reuses the first two sector-sized chunks of `CREATE_SCRATCH`
+/// because the planner doesn't run until after the backing-header
+/// lookup returns — the two regions are mutually exclusive in time.
+const VHDX_CACHE_A: usize = CREATE_SCRATCH;
+const VHDX_CACHE_B: usize = CREATE_SCRATCH + MAX_SECTOR_SIZE;
 
 fn get_call_table() -> &'static CallTable {
     unsafe { &*(CALL_TABLE_ADDR as *const CallTable) }
@@ -99,9 +111,12 @@ fn map_create_error(e: CreateError) -> u32 {
 /// unrecognised or the parse fails; the caller maps `None` to
 /// `ERROR_BACKING_PARSE_FAILED`.
 ///
-/// VHDX-as-backing is deferred to phase 5: VHDX stores `virtual_size`
-/// in a metadata-table item that requires walking three regions, not
-/// in the first-sector header.
+/// VHDX walks header → region table → metadata region via the
+/// vhdx crate's `VhdxState::init`, which exposes
+/// `virtual_disk_size` directly. The two cache buffers it needs
+/// reuse `VHDX_CACHE_A` / `VHDX_CACHE_B` (overlapping with the
+/// create scratch — safe because the planner doesn't run until
+/// after this function returns).
 ///
 /// # Safety
 ///
@@ -114,17 +129,14 @@ unsafe fn read_backing_virtual_size(call_table: &CallTable, sector_size: usize) 
     }
     let header = core::slice::from_raw_parts(header_ptr, sector_size);
     let format = detect_format_from_header(header, sector_size, false);
+    let capacity = (call_table.get_input_capacity)(0);
     match format {
-        ImageFormat::Raw => {
-            let capacity = (call_table.get_input_capacity)(0);
-            capacity.checked_mul(sector_size as u64)
-        }
+        ImageFormat::Raw => capacity.checked_mul(sector_size as u64),
         ImageFormat::Qcow2 => qcow2::QcowHeader::parse(header).map(|h| h.virtual_size),
         ImageFormat::Vmdk4 => vmdk::Vmdk4Header::parse(header).map(|h| h.virtual_size),
         ImageFormat::Vhd => {
             // VHD's footer lives at the *end* of the file; read the
             // last sector and parse from there.
-            let capacity = (call_table.get_input_capacity)(0);
             if capacity == 0 {
                 return None;
             }
@@ -134,8 +146,23 @@ unsafe fn read_backing_virtual_size(call_table: &CallTable, sector_size: usize) 
             let last_sector = core::slice::from_raw_parts(header_ptr, sector_size);
             vhd::VhdFooter::parse(last_sector).map(|f| f.current_size)
         }
-        // Vhdx / Vdi / Qcow1 / Qed / Iso / Luks: deferred or
-        // unsupported as backing in phase 2.
+        ImageFormat::Vhdx => {
+            if capacity == 0 {
+                return None;
+            }
+            let mut bytes_read: u64 = 0;
+            let state = vhdx::VhdxState::init(
+                call_table,
+                0,
+                sector_size,
+                capacity,
+                VHDX_CACHE_A as *mut u8,
+                VHDX_CACHE_B as *mut u8,
+                &mut bytes_read,
+            )?;
+            Some(state.virtual_disk_size)
+        }
+        // Vdi / Qcow1 / Qed / Iso / Luks: unsupported as backing.
         _ => None,
     }
 }
