@@ -5775,6 +5775,330 @@ fn parse_o_options(
     Ok(out)
 }
 
+// ============================================================================
+// Create -o key=value parsing
+// ============================================================================
+
+/// Overrides parsed from `-o` for the create operation.
+///
+/// Mirrors `MeasureOptionOverrides` in shape: every field is
+/// `Option<T>` so "user didn't set this key" is distinguishable
+/// from "user set it to the default value". Overrides win over
+/// the matching individual flag (last-wins, matches measure and
+/// qemu-img).
+#[derive(Default, Debug)]
+struct CreateOptionOverrides {
+    cluster_size: Option<u32>,
+    refcount_bits: Option<u8>,
+    extended_l2: Option<bool>,
+    lazy_refcounts: Option<bool>,
+    compat_v3: Option<bool>,
+    vmdk_subformat: Option<u8>,
+    grain_size: Option<u32>,
+    vhd_subformat: Option<u8>,
+    block_size: Option<u32>,
+    preallocation: Option<&'static str>,
+
+    // Create-specific keys with no individual-flag analogue.
+    size: Option<u64>,
+    backing_file: Option<String>,
+    backing_fmt: Option<&'static str>,
+}
+
+/// Boolean parser for `-o key=value` (create variant of measure's helper).
+/// Accepts on/off/true/false/yes/no, case-insensitive.
+fn parse_create_o_bool(key: &str, value: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    match value.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" => Ok(true),
+        "off" | "false" | "no" => Ok(false),
+        _ => Err(format!(
+            "create: bad value '{}' for -o key '{}' (expected on/off)",
+            value, key
+        )
+        .into()),
+    }
+}
+
+/// Parse a size value (K/M/G/T) and bounds-check to u32. Used for
+/// cluster_size, grain_size, block_size, refcount-related fields.
+fn parse_create_o_size_u32(key: &str, value: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    let n = parse_memory_size(value)
+        .map_err(|e| format!("create: bad size '{}' for -o key '{}' ({})", value, key, e))?;
+    if n > u32::MAX as u64 {
+        return Err(format!("create: size {} for -o key '{}' exceeds u32::MAX", n, key).into());
+    }
+    Ok(n as u32)
+}
+
+/// Parse a size value (K/M/G/T) as a u64 — used for `-o size=N`
+/// where virtual disk sizes can comfortably exceed u32.
+fn parse_create_o_size_u64(key: &str, value: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    parse_memory_size(value)
+        .map_err(|e| format!("create: bad size '{}' for -o key '{}' ({})", value, key, e).into())
+}
+
+/// Parse a decimal u8 — used for refcount_bits.
+fn parse_create_o_u8(key: &str, value: &str) -> Result<u8, Box<dyn std::error::Error>> {
+    value
+        .parse::<u8>()
+        .map_err(|_| -> Box<dyn std::error::Error> {
+            format!("create: bad number '{}' for -o key '{}'", value, key).into()
+        })
+}
+
+/// Parse one or more qemu-img-style `-o KEY=VAL,KEY=VAL,...`
+/// strings into a [`CreateOptionOverrides`] for the given target
+/// format.
+///
+/// Returns an error on unknown keys, invalid values, or
+/// not-yet-supported features. Repeated keys across all `-o`
+/// invocations are last-wins.
+//
+// `#[allow(dead_code)]` lives here for phase 4a only — the
+// integration into `run_create` lands in phase 4b. The unit
+// tests in `create_option_tests` exercise it via the cfg(test)
+// build until then.
+#[allow(dead_code)]
+fn parse_create_o_options(
+    target: &str,
+    raw: &[String],
+) -> Result<CreateOptionOverrides, Box<dyn std::error::Error>> {
+    let mut out = CreateOptionOverrides::default();
+
+    for input in raw {
+        for piece in input.split(',') {
+            let piece = piece.trim();
+            if piece.is_empty() {
+                continue;
+            }
+            let (key, value) = match piece.split_once('=') {
+                Some((k, v)) => (k.trim(), v),
+                None => {
+                    return Err(format!(
+                        "create: -o option '{}' is missing a value (expected KEY=VALUE)",
+                        piece
+                    )
+                    .into())
+                }
+            };
+
+            match (target, key) {
+                // -------- common keys (every non-raw target) --------
+                (_, "size") => {
+                    out.size = Some(parse_create_o_size_u64(key, value)?);
+                }
+                ("qcow2" | "vmdk" | "vpc" | "vhdx", "backing_file") => {
+                    out.backing_file = Some(value.to_string());
+                }
+                ("qcow2" | "vmdk" | "vpc" | "vhdx", "backing_fmt") => {
+                    out.backing_fmt = Some(match value {
+                        "raw" => "raw",
+                        "qcow2" => "qcow2",
+                        "vmdk" => "vmdk",
+                        "vpc" | "vhd" => "vpc",
+                        "vhdx" => "vhdx",
+                        _ => {
+                            return Err(format!(
+                                "create: bad value '{}' for -o key 'backing_fmt' \
+                                 (expected raw, qcow2, vmdk, vpc, or vhdx)",
+                                value
+                            )
+                            .into())
+                        }
+                    });
+                }
+
+                // -------- raw --------
+                ("raw", "preallocation") => match value {
+                    "off" | "falloc" => {
+                        out.preallocation = Some(match value {
+                            "off" => "off",
+                            "falloc" => "falloc",
+                            _ => unreachable!(),
+                        })
+                    }
+                    "metadata" | "full" => {
+                        return Err(format!(
+                            "create: -o preallocation={} is not yet supported \
+                             (preallocation modes land in phase 6 of PLAN-create.md)",
+                            value
+                        )
+                        .into())
+                    }
+                    _ => {
+                        return Err(format!(
+                            "create: bad value '{}' for -o key 'preallocation' \
+                             (expected off, metadata, falloc, or full)",
+                            value
+                        )
+                        .into())
+                    }
+                },
+
+                // -------- qcow2 --------
+                ("qcow2", "cluster_size") => {
+                    out.cluster_size = Some(parse_create_o_size_u32(key, value)?);
+                }
+                ("qcow2", "compat") => match value {
+                    "0.10" => out.compat_v3 = Some(false),
+                    "1.1" => out.compat_v3 = Some(true),
+                    _ => {
+                        return Err(format!(
+                            "create: bad value '{}' for -o key 'compat' \
+                             (expected 0.10 or 1.1)",
+                            value
+                        )
+                        .into())
+                    }
+                },
+                ("qcow2", "refcount_bits") => {
+                    out.refcount_bits = Some(parse_create_o_u8(key, value)?);
+                }
+                ("qcow2", "extended_l2") => {
+                    out.extended_l2 = Some(parse_create_o_bool(key, value)?);
+                }
+                ("qcow2", "lazy_refcounts") => {
+                    out.lazy_refcounts = Some(parse_create_o_bool(key, value)?);
+                }
+                ("qcow2", "compression_type") => match value {
+                    // No CreateConfig flag bit yet — accept-ignore so qemu-img
+                    // command lines copy-paste. Phase 6 may wire this through
+                    // when preallocation lands.
+                    "zlib" | "zstd" => {}
+                    _ => {
+                        return Err(format!(
+                            "create: bad value '{}' for -o key 'compression_type' \
+                             (expected zlib or zstd)",
+                            value
+                        )
+                        .into())
+                    }
+                },
+                ("qcow2", "preallocation") => match value {
+                    "off" => out.preallocation = Some("off"),
+                    "metadata" | "falloc" | "full" => {
+                        return Err(format!(
+                            "create: -o preallocation={} is not yet supported \
+                             (preallocation modes land in phase 6 of PLAN-create.md)",
+                            value
+                        )
+                        .into())
+                    }
+                    _ => {
+                        return Err(format!(
+                            "create: bad value '{}' for -o key 'preallocation' \
+                             (expected off, metadata, falloc, or full)",
+                            value
+                        )
+                        .into())
+                    }
+                },
+
+                // qcow2 reject list (data files / encryption deferred).
+                ("qcow2", "data_file") | ("qcow2", "data_file_raw") => {
+                    return Err(format!(
+                        "create: -o key '{}' is not yet supported \
+                         (external data files are deferred — see \
+                         PLAN-convert-followups.md and PLAN-create.md future work)",
+                        key
+                    )
+                    .into());
+                }
+                ("qcow2", k) if k.starts_with("encrypt.") => {
+                    return Err(format!(
+                        "create: -o key '{}' is not yet supported \
+                         (encrypted create is deferred — see PLAN-create.md future work)",
+                        k
+                    )
+                    .into());
+                }
+
+                // -------- vmdk --------
+                ("vmdk", "subformat") => match value {
+                    "monolithicSparse" => out.vmdk_subformat = Some(0),
+                    "streamOptimized" => out.vmdk_subformat = Some(1),
+                    "monolithicFlat" => out.vmdk_subformat = Some(2),
+                    _ => {
+                        return Err(format!(
+                            "create: bad value '{}' for -o key 'subformat' \
+                             (expected monolithicSparse / streamOptimized / monolithicFlat)",
+                            value
+                        )
+                        .into())
+                    }
+                },
+                ("vmdk", "grain_size") => {
+                    out.grain_size = Some(parse_create_o_size_u32(key, value)?);
+                }
+                ("vmdk", "adapter_type")
+                | ("vmdk", "hwversion")
+                | ("vmdk", "toolsversion")
+                | ("vmdk", "zeroed_grain") => {
+                    // accept-ignore — no effect on the empty-image bytes
+                    // we emit
+                }
+
+                // -------- vpc (VHD) --------
+                ("vpc", "subformat") => match value {
+                    "dynamic" => out.vhd_subformat = Some(0),
+                    "fixed" => out.vhd_subformat = Some(1),
+                    _ => {
+                        return Err(format!(
+                            "create: bad value '{}' for -o key 'subformat' \
+                             (expected dynamic or fixed)",
+                            value
+                        )
+                        .into())
+                    }
+                },
+                ("vpc", "block_size") => {
+                    out.block_size = Some(parse_create_o_size_u32(key, value)?);
+                }
+                ("vpc", "force_size") | ("vpc", "force_size_calc") => {
+                    // accept-ignore
+                }
+
+                // -------- vhdx --------
+                ("vhdx", "subformat") => match value {
+                    "dynamic" => { /* default */ }
+                    "fixed" => {
+                        return Err("create: -O vhdx -o subformat=fixed is not yet supported \
+                                    (vhdx-fixed lands in phase 5 of PLAN-create.md)"
+                            .into())
+                    }
+                    _ => {
+                        return Err(format!(
+                            "create: bad value '{}' for -o key 'subformat' \
+                             (expected dynamic or fixed)",
+                            value
+                        )
+                        .into())
+                    }
+                },
+                ("vhdx", "block_size") => {
+                    out.block_size = Some(parse_create_o_size_u32(key, value)?);
+                }
+                ("vhdx", "log_size") | ("vhdx", "block_state_zero") => {
+                    // accept-ignore
+                }
+
+                // -------- catch-all --------
+                _ => {
+                    return Err(format!(
+                        "create: unrecognised -o key '{}' for target {} \
+                         (run with --help for the accepted flag set; \
+                         qemu-img -o keys map 1:1 to the --flag form)",
+                        key, target
+                    )
+                    .into())
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 /// Run the measure operation (predict output size for a target format).
 fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Touch the result magic constant so its presence is preserved for
@@ -7524,5 +7848,204 @@ fn write_mmio_data(data: &mut [u8], value: u32) {
             data[..8].copy_from_slice(&bytes);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod create_option_tests {
+    //! Unit tests for `parse_create_o_options` and its helpers.
+    //!
+    //! Tests live next to the parser rather than in tests/ so they
+    //! don't require the integration-test harness (no KVM, no
+    //! testdata). Integration coverage of the wired path lives in
+    //! tests/test_create.py.
+    use super::*;
+
+    fn s(v: &str) -> Vec<String> {
+        vec![v.to_string()]
+    }
+
+    #[test]
+    fn empty_overrides_parse_cleanly() {
+        let o = parse_create_o_options("qcow2", &[]).unwrap();
+        assert!(o.cluster_size.is_none());
+        assert!(o.size.is_none());
+        assert!(o.backing_file.is_none());
+    }
+
+    #[test]
+    fn qcow2_all_keys_parse() {
+        let o = parse_create_o_options(
+            "qcow2",
+            &s(
+                "cluster_size=4k,refcount_bits=8,extended_l2=on,lazy_refcounts=yes,\
+                compat=0.10,preallocation=off,size=64M,backing_file=p.qcow2,\
+                backing_fmt=qcow2,compression_type=zlib",
+            ),
+        )
+        .unwrap();
+        assert_eq!(o.cluster_size, Some(4096));
+        assert_eq!(o.refcount_bits, Some(8));
+        assert_eq!(o.extended_l2, Some(true));
+        assert_eq!(o.lazy_refcounts, Some(true));
+        assert_eq!(o.compat_v3, Some(false));
+        assert_eq!(o.preallocation, Some("off"));
+        assert_eq!(o.size, Some(64 * 1024 * 1024));
+        assert_eq!(o.backing_file.as_deref(), Some("p.qcow2"));
+        assert_eq!(o.backing_fmt, Some("qcow2"));
+    }
+
+    #[test]
+    fn vmdk_subformat_and_grain() {
+        let o =
+            parse_create_o_options("vmdk", &s("subformat=streamOptimized,grain_size=16k")).unwrap();
+        assert_eq!(o.vmdk_subformat, Some(1));
+        assert_eq!(o.grain_size, Some(16 * 1024));
+    }
+
+    #[test]
+    fn vmdk_monolithic_flat_parses_but_host_will_reject() {
+        // Phase 1's library and phase 3's host validator reject
+        // monolithicFlat; the parser is permissive so the user gets
+        // the more specific "deferred" error from the host pass.
+        let o = parse_create_o_options("vmdk", &s("subformat=monolithicFlat")).unwrap();
+        assert_eq!(o.vmdk_subformat, Some(2));
+    }
+
+    #[test]
+    fn vpc_subformat_fixed() {
+        let o = parse_create_o_options("vpc", &s("subformat=fixed")).unwrap();
+        assert_eq!(o.vhd_subformat, Some(1));
+    }
+
+    #[test]
+    fn vhdx_block_size() {
+        let o = parse_create_o_options("vhdx", &s("block_size=8M")).unwrap();
+        assert_eq!(o.block_size, Some(8 * 1024 * 1024));
+    }
+
+    #[test]
+    fn raw_size_and_preallocation() {
+        let o = parse_create_o_options("raw", &s("size=4M,preallocation=falloc")).unwrap();
+        assert_eq!(o.size, Some(4 * 1024 * 1024));
+        assert_eq!(o.preallocation, Some("falloc"));
+    }
+
+    #[test]
+    fn unknown_key_errors_with_target_name() {
+        let err = parse_create_o_options("qcow2", &s("nonsense=1"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nonsense"), "error did not mention key: {err}");
+        assert!(err.contains("qcow2"), "error did not mention target: {err}");
+    }
+
+    #[test]
+    fn bad_cluster_size_value_errors() {
+        let err = parse_create_o_options("qcow2", &s("cluster_size=zzz"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cluster_size"), "error mentions key: {err}");
+    }
+
+    #[test]
+    fn bad_compat_value_errors() {
+        let err = parse_create_o_options("qcow2", &s("compat=2.0"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("compat"));
+    }
+
+    #[test]
+    fn last_wins_across_multiple_o_invocations() {
+        let raw = vec![
+            "cluster_size=512".to_string(),
+            "cluster_size=4k".to_string(),
+        ];
+        let o = parse_create_o_options("qcow2", &raw).unwrap();
+        assert_eq!(o.cluster_size, Some(4096));
+    }
+
+    #[test]
+    fn last_wins_within_single_o_invocation() {
+        let o = parse_create_o_options("qcow2", &s("cluster_size=512,cluster_size=4k")).unwrap();
+        assert_eq!(o.cluster_size, Some(4096));
+    }
+
+    #[test]
+    fn encrypt_keys_return_deferred_error() {
+        let err = parse_create_o_options("qcow2", &s("encrypt.cipher=aes"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("encrypt"));
+        assert!(err.contains("deferred"));
+    }
+
+    #[test]
+    fn data_file_returns_deferred_error() {
+        let err = parse_create_o_options("qcow2", &s("data_file=ext.bin"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("data_file"));
+        assert!(err.contains("deferred"));
+    }
+
+    #[test]
+    fn qcow2_preallocation_metadata_returns_phase6_error() {
+        let err = parse_create_o_options("qcow2", &s("preallocation=metadata"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("preallocation"));
+        assert!(err.contains("phase 6"));
+    }
+
+    #[test]
+    fn raw_rejects_qcow2_keys() {
+        let err = parse_create_o_options("raw", &s("cluster_size=4k"))
+            .unwrap_err()
+            .to_string();
+        // raw target doesn't accept cluster_size; the catch-all
+        // produces an "unrecognised -o key" error mentioning raw.
+        assert!(err.contains("cluster_size"));
+        assert!(err.contains("raw"));
+    }
+
+    #[test]
+    fn boolean_accepts_off_on_true_false_yes_no() {
+        for v in ["on", "ON", "True", "yes"] {
+            assert_eq!(parse_create_o_bool("k", v).unwrap(), true);
+        }
+        for v in ["off", "OFF", "False", "no"] {
+            assert_eq!(parse_create_o_bool("k", v).unwrap(), false);
+        }
+        assert!(parse_create_o_bool("k", "maybe").is_err());
+    }
+
+    #[test]
+    fn size_u64_accepts_t_suffix() {
+        assert_eq!(parse_create_o_size_u64("size", "1T").unwrap(), 1u64 << 40);
+    }
+
+    #[test]
+    fn missing_value_errors_with_helpful_message() {
+        let err = parse_create_o_options("qcow2", &s("cluster_size"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing a value"));
+    }
+
+    #[test]
+    fn empty_pieces_are_skipped() {
+        // Trailing or empty comma-separated pieces are ignored.
+        let o = parse_create_o_options("qcow2", &s(",cluster_size=4k,,")).unwrap();
+        assert_eq!(o.cluster_size, Some(4096));
+    }
+
+    #[test]
+    fn backing_fmt_accepts_vhd_alias() {
+        let o = parse_create_o_options("qcow2", &s("backing_fmt=vhd")).unwrap();
+        // qemu-img uses "vpc" canonically for VHD; we accept "vhd"
+        // as an alias and normalise to "vpc".
+        assert_eq!(o.backing_fmt, Some("vpc"));
     }
 }
