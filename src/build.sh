@@ -10,6 +10,7 @@
 #   - compare.bin at 0x20000 (image comparison operation, same address as info)
 #   - convert.bin at 0x20000 (image conversion operation, same address as info)
 #   - measure.bin at 0x20000 (disk measurement operation, same address as info)
+#   - create.bin at 0x20000 (image creation operation, same address as info)
 
 set -e
 
@@ -149,6 +150,25 @@ else
 fi
 
 echo ""
+echo "=== Building create operation ==="
+cd operations/create
+cargo +nightly build --release
+cd ../..
+
+# Convert create ELF to flat binary
+echo "=== Converting create ELF to flat binary ==="
+CREATE_ELF="target/x86_64-unknown-none/release/create"
+CREATE_BIN="create.bin"
+
+if [ -f "$CREATE_ELF" ]; then
+    rust-objcopy -O binary "$CREATE_ELF" "$CREATE_BIN"
+    echo "Created $CREATE_BIN ($(wc -c < "$CREATE_BIN") bytes)"
+else
+    echo "Error: Create ELF not found at $CREATE_ELF"
+    exit 1
+fi
+
+echo ""
 echo "=== Building instar ==="
 cd vmm
 cargo build --release
@@ -164,7 +184,8 @@ cp "$CHECK_BIN" target/release/
 cp "$COMPARE_BIN" target/release/
 cp "$CONVERT_BIN" target/release/
 cp "$MEASURE_BIN" target/release/
-echo "Copied core.bin, info.bin, copy.bin, check.bin, compare.bin, convert.bin, and measure.bin to target/release/"
+cp "$CREATE_BIN" target/release/
+echo "Copied core.bin, info.bin, copy.bin, check.bin, compare.bin, convert.bin, measure.bin, and create.bin to target/release/"
 
 # Check binary sizes against memory layout limits
 # Memory layout (from shared/src/lib.rs):
@@ -202,6 +223,7 @@ check_size "check.bin" "target/release/$CHECK_BIN" "$OP_MAX" || FAILED=1
 check_size "compare.bin" "target/release/$COMPARE_BIN" "$OP_MAX" || FAILED=1
 check_size "convert.bin" "target/release/$CONVERT_BIN" "$OP_MAX" || FAILED=1
 check_size "measure.bin" "target/release/$MEASURE_BIN" "$OP_MAX" || FAILED=1
+check_size "create.bin" "target/release/$CREATE_BIN" "$OP_MAX" || FAILED=1
 
 if [ "$FAILED" -eq 1 ]; then
     echo ""
@@ -222,6 +244,7 @@ echo "  - check.bin      Check operation (integrity validation) - loaded at 0x20
 echo "  - compare.bin    Compare operation (image comparison) - loaded at 0x20000"
 echo "  - convert.bin    Convert operation (image conversion) - loaded at 0x20000"
 echo "  - measure.bin    Measure operation (disk measurement) - loaded at 0x20000"
+echo "  - create.bin     Create operation (empty image creation) - loaded at 0x20000"
 echo ""
 echo "To run:"
 echo "  sudo ./target/release/instar info image.qcow2"
