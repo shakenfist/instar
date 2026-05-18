@@ -17,7 +17,15 @@
 //! `ScratchTooSmall`, `PreallocationUnsupported`) are silently
 //! ignored; libFuzzer's only oracle is panic.
 //!
-//! Phase 9b extends this with a header re-parse invariant.
+//! Phase 9b layers a header re-parse round-trip on top: when the
+//! plan's `minimum_file_size` fits within `REPARSE_BUFFER_CAP`
+//! (16 MiB), the harness assembles the emitted writes into a
+//! contiguous buffer and re-parses the relevant header slice with
+//! the matching parser crate (`qcow2::QcowHeader`, `vmdk::Vmdk4Header`,
+//! `vhd::VhdFooter`, `vhdx::VhdxHeader`). Validates that:
+//!   - the parser recognises the bytes the planner emitted
+//!   - the parser-reported virtual_size / current_size matches
+//!     the planner's input (where the header surfaces it).
 
 #![no_main]
 use libfuzzer_sys::fuzz_target;
@@ -33,12 +41,25 @@ use shared::ImageFormat;
 
 const HEADER_BYTES: usize = 24;
 
+/// Maximum `plan.minimum_file_size` for which the harness assembles
+/// the emitted writes and runs the re-parse round-trip. Above this
+/// cap the re-parse step is skipped (the plan-level invariants
+/// still hold). 16 MiB comfortably covers qcow2 / vmdk / vhd / vhdx
+/// images up to ~1 GiB virtual; larger virtual_size values are
+/// typically the fuzzer probing extreme inputs where re-parse
+/// coverage saturates anyway.
+const REPARSE_BUFFER_CAP: u64 = 16 * 1024 * 1024;
+
 thread_local! {
     /// Reusable scratch buffer for plan_*. Sized to the largest
     /// per-format worst case (qcow2 = 32 MiB) so every plan_* call
     /// can share the same allocation.
     static SCRATCH: RefCell<Vec<u8>> =
         RefCell::new(vec![0u8; QCOW2_MAX_METADATA_SCRATCH]);
+
+    /// Reusable buffer for re-parse assembly. Grown on demand up to
+    /// `REPARSE_BUFFER_CAP`; cleared (not freed) between iterations.
+    static REPARSE: RefCell<Vec<u8>> = RefCell::new(Vec::new());
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -171,6 +192,9 @@ fuzz_target!(|data: &[u8]| {
 
         if let Ok(plan) = result {
             assert_invariants(&plan, target_sel);
+            if plan.minimum_file_size <= REPARSE_BUFFER_CAP {
+                assert_reparse(&plan, target_sel, virtual_size);
+            }
         }
     });
 });
@@ -214,4 +238,89 @@ fn assert_invariants(plan: &MetadataPlan<'_>, target_sel: u8) {
         plan.writes().len(),
         MAX_METADATA_WRITES
     );
+}
+
+/// Each format rounds an arbitrary input virtual_size up to its
+/// own alignment boundary (cluster_size / grain_size / sector /
+/// block_size). The planner records the rounded value in the
+/// header, so the re-parse must accept any rounded-up value
+/// within a generous bound rather than demanding strict equality.
+///
+/// The largest legal block_size across all formats is 256 MiB
+/// (vhd / vhdx); add a comfortable margin for any future
+/// geometry-rounding to keep the assertion stable. A genuine
+/// endianness / offset bug would produce a wildly mismatched
+/// value (orders of magnitude off), so this loose bound still
+/// catches the real failure modes.
+const VIRTUAL_SIZE_ROUNDUP_BOUND: u64 = 512 * 1024 * 1024;
+
+fn assert_virtual_size_rounded_up(label: &str, parsed: u64, requested: u64) {
+    assert!(
+        parsed >= requested,
+        "{}: parsed virtual_size {} < requested {}",
+        label, parsed, requested
+    );
+    assert!(
+        parsed - requested < VIRTUAL_SIZE_ROUNDUP_BOUND,
+        "{}: parsed virtual_size {} rounded up by {} bytes from {} \
+         (exceeds {} bound)",
+        label,
+        parsed,
+        parsed - requested,
+        requested,
+        VIRTUAL_SIZE_ROUNDUP_BOUND
+    );
+}
+
+/// Invariant 5: assemble the emitted bytes into a contiguous buffer
+/// and re-parse with the matching format's first-stage parser.
+fn assert_reparse(plan: &MetadataPlan<'_>, target_sel: u8, virtual_size: u64) {
+    let size = plan.minimum_file_size as usize;
+    REPARSE.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        buf.clear();
+        buf.resize(size, 0u8);
+        for w in plan.writes() {
+            let start = w.byte_offset as usize;
+            let end = start + w.bytes.len();
+            buf[start..end].copy_from_slice(w.bytes);
+        }
+        match target_sel {
+            0 => {
+                let header = qcow2::QcowHeader::parse(&buf[..size.min(512)])
+                    .expect("qcow2 emitter produced unparseable header");
+                assert_virtual_size_rounded_up(
+                    "qcow2", header.virtual_size, virtual_size);
+            }
+            1 => {
+                let header = vmdk::Vmdk4Header::parse(&buf[..size.min(512)])
+                    .expect("vmdk emitter produced unparseable header");
+                assert_virtual_size_rounded_up(
+                    "vmdk", header.virtual_size, virtual_size);
+            }
+            2 => {
+                // VHD footer lives in the last 512 bytes of the file.
+                let footer = vhd::VhdFooter::parse(&buf[size - 512..])
+                    .expect("vhd emitter produced unparseable footer");
+                assert_virtual_size_rounded_up(
+                    "vhd", footer.current_size, virtual_size);
+            }
+            _ => {
+                // VHDX Header 1 lives at file offset 64 KiB; the parser
+                // wants a 4 KiB window of context for the CRC validation.
+                let hdr_start = 64 * 1024;
+                let hdr_end = hdr_start + 4096;
+                assert!(
+                    hdr_end <= size,
+                    "vhdx minimum_file_size ({}) below header end ({})",
+                    size, hdr_end
+                );
+                vhdx::VhdxHeader::parse(&buf[hdr_start..hdr_end])
+                    .expect("vhdx emitter produced unparseable header");
+                // VHDX virtual_size lives in the metadata region, not the
+                // header itself; deeper validation needs a CallTable walk
+                // and is left to fuzz_vhdx_metadata.
+            }
+        }
+    });
 }
