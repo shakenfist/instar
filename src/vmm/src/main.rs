@@ -7001,15 +7001,44 @@ fn run_create_nonraw(args: &CreateArgs, verbose: bool) -> Result<(), Box<dyn std
             //     data_offset = file_size_after - data_len
             // where data_len is the virtual size rounded up to the
             // cluster boundary.
+            //
+            // Defence-in-depth: the size inputs come from the guest
+            // (CreateResultMessage) and the host has its own
+            // authoritative knowledge of virtual_size (when set via
+            // --size) and the on-disk file length (via stat). We
+            // clamp `data_len` against the host-known virtual_size
+            // when available, fall back to the guest report bounded
+            // by a sanity ceiling otherwise, and refuse to apply
+            // preallocation past the observed end-of-file.
             if args.target_format == "qcow2"
                 && matches!(args.preallocation.as_str(), "falloc" | "full")
             {
+                // Use the host's own knowledge of virtual_size where
+                // we have it; for backing-defaulted sizes (host saw
+                // virtual_size=0 and the guest filled it in) fall
+                // back to the guest report bounded by a sanity
+                // ceiling (2^57 bytes = 128 PiB; comfortably above
+                // any plausible image but below i64::MAX).
+                const VIRTUAL_SIZE_SANITY_CEILING: u64 = 1u64 << 57;
+                let trusted_virtual_size = if virtual_size != 0 {
+                    virtual_size
+                } else {
+                    let reported = create_result.resolved_virtual_size;
+                    if reported > VIRTUAL_SIZE_SANITY_CEILING {
+                        return Err(format!(
+                            "create: guest reported resolved_virtual_size={} \
+                             exceeding the sanity ceiling ({} bytes); \
+                             refusing preallocation",
+                            reported, VIRTUAL_SIZE_SANITY_CEILING
+                        )
+                        .into());
+                    }
+                    reported
+                };
                 let cluster = cluster_size.max(1) as u64;
-                let data_len = create_result
-                    .resolved_virtual_size
+                let data_len = trusted_virtual_size
                     .div_ceil(cluster)
                     .saturating_mul(cluster);
-                let data_offset = create_result.file_size_after.saturating_sub(data_len);
                 if let Err(e) = (|| -> Result<(), Box<dyn std::error::Error>> {
                     let postpass_file = std::fs::OpenOptions::new()
                         .write(true)
@@ -7017,6 +7046,26 @@ fn run_create_nonraw(args: &CreateArgs, verbose: bool) -> Result<(), Box<dyn std
                         .map_err(|e| {
                         format!("create: reopen for preallocation failed: {}", e)
                     })?;
+                    // Anchor the preallocation range to the file's
+                    // actual length on disk, not the guest's report.
+                    let observed_file_size = postpass_file
+                        .metadata()
+                        .map_err(|e| {
+                            format!("create: stat for preallocation bounds failed: {}", e)
+                        })?
+                        .len();
+                    let data_offset = observed_file_size.saturating_sub(data_len);
+                    let range_end = data_offset
+                        .checked_add(data_len)
+                        .ok_or("create: preallocation range overflows u64")?;
+                    if range_end > observed_file_size {
+                        return Err(format!(
+                            "create: preallocation range [{}, {}) exceeds \
+                             observed file size {}; refusing",
+                            data_offset, range_end, observed_file_size
+                        )
+                        .into());
+                    }
                     apply_preallocation(
                         &postpass_file,
                         &args.preallocation,
@@ -7505,6 +7554,10 @@ fn create_raw_finalize(
         "falloc" => {
             // posix_fallocate returns 0 on success, errno on failure
             // (does not set errno; the return value IS the errno).
+            // SAFETY: fd is the raw fd of `file`, which the caller
+            // owns for the duration of this block. virtual_size has
+            // been bounded to <= i64::MAX by validate_create_args, so
+            // the cast to off_t (i64) is in-range.
             let rc = unsafe { libc::posix_fallocate(fd, 0, virtual_size as libc::off_t) };
             if rc != 0 {
                 return Err(format!(
@@ -7538,6 +7591,12 @@ fn fill_zeros(fd: libc::c_int, offset: u64, length: u64) -> std::io::Result<()> 
         return Ok(());
     }
 
+    // SAFETY: fd is a valid open file descriptor owned by the caller
+    // (passed in by every call site as `file.as_raw_fd()` on a still-
+    // live File). FALLOC_FL_ZERO_RANGE is a kernel constant. offset
+    // and length are non-negative u64 values cast to off_t; an
+    // out-of-range cast surfaces as EINVAL from the syscall rather
+    // than UB.
     let rc = unsafe {
         libc::fallocate(
             fd,
@@ -7563,6 +7622,10 @@ fn fill_zeros(fd: libc::c_int, offset: u64, length: u64) -> std::io::Result<()> 
     while written < length {
         let remaining = length - written;
         let chunk = remaining.min(zeros.len() as u64) as usize;
+        // SAFETY: `zeros` is a stack-allocated [u8; 65536] live for
+        // the duration of this call. `chunk` is bounded by
+        // `zeros.len()` via the preceding .min(), so pwrite reads at
+        // most that many bytes from the buffer. fd is caller-owned.
         let rc = unsafe {
             libc::pwrite(
                 fd,
@@ -7609,6 +7672,12 @@ fn apply_preallocation(
     let fd = file.as_raw_fd();
     match mode {
         "falloc" => {
+            // SAFETY: fd is the raw fd of `file`, caller-owned for
+            // the duration of this call. data_offset and data_len
+            // are validated against the file's observed length by
+            // run_create's clamping step before this function is
+            // entered. Out-of-range casts surface as EINVAL from
+            // posix_fallocate rather than UB.
             let rc = unsafe {
                 libc::posix_fallocate(fd, data_offset as libc::off_t, data_len as libc::off_t)
             };
@@ -7865,11 +7934,23 @@ fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
             .into());
     }
 
-    // Size, when provided, must parse to a non-zero value.
+    // Size, when provided, must parse to a non-zero value and stay
+    // within the host's off_t range — the preallocation path casts
+    // virtual_size to libc::off_t (i64), and values above i64::MAX
+    // wrap to negative offsets, which would fail with EINVAL but
+    // shouldn't reach the syscall in the first place.
     if let Some(ref s) = args.size {
         let parsed = parse_memory_size(s)?;
         if parsed == 0 {
             return Err("create: SIZE must be greater than zero".into());
+        }
+        if parsed > i64::MAX as u64 {
+            return Err(format!(
+                "create: SIZE {parsed} exceeds the maximum representable \
+                 size ({})",
+                i64::MAX
+            )
+            .into());
         }
     }
 

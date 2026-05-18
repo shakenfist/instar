@@ -947,6 +947,43 @@ branch). The plan was complete when:
   names at generation time for symmetry with measure) is
   queued for the next testdata regeneration in
   `instar-testdata`.
+* **File a tracking issue for the qcow2 `1G-rb-64` check
+  failure** (`tests/test_create.py::KNOWN_CHECK_FAILURES`).
+  Surfaced by the wave 2b pre-push audit: this is a real
+  writer bug (the header records the user's requested
+  `refcount_bits` but the on-disk entries are always 16-bit
+  because `crates/qcow2::create::build_header` hardcodes
+  `refcount_order=4`). The bug is already tracked
+  conceptually under the broader "qcow2 refcount_bits
+  parameterisation" item above; the follow-up is just to
+  add an issue link to the `KNOWN_CHECK_FAILURES` rationale
+  so the skip points at a tracking number rather than
+  a comment.
+* **Named unit tests for the `CreateError::BackingFileTooLong`
+  and `CreateError::Overflow` rejection paths.** Wave 2b
+  flagged that both are currently exercised only by
+  `fuzz_create_emitters`. The fuzz coverage is solid, but a
+  named test in `src/crates/create/tests/round_trip.rs` (or
+  the per-format inline test modules in
+  `src/crates/create/src/lib.rs`) would give
+  self-describing test failures if either rejection path
+  ever regresses. Low priority — fuzz catches it either way.
+* **Named rejection unit tests for the two deferred VMDK
+  subformats** (`TwoGbMaxExtentSparse`,
+  `TwoGbMaxExtentFlat`). The existing
+  `plan_vmdk_rejects_deferred_subformat` test only
+  exercises `MonolithicFlat`; the other two variants are
+  fuzz-covered only. Same low-priority rationale as the
+  `BackingFileTooLong` item above.
+* **Spec citations on stable-offset assertions.** Wave 2b
+  noted that
+  `plan_vhd_dynamic_bat_all_unallocated` hardcodes
+  `bat_start = 1536` and
+  `plan_vhdx_region_table_points_at_bat_and_metadata`
+  asserts `e.file_offset == 0x20_0000` without comments
+  citing the VHD / VHDX specs. The offsets are
+  spec-mandated, but a one-line comment per assertion would
+  keep the tests grep-friendly for future spec readers.
 
 ### Bugs fixed during this work
 
