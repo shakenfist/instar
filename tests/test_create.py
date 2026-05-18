@@ -17,6 +17,7 @@ import tempfile
 from pathlib import Path
 
 from base import InstarTestBase
+from helpers.info_json import assert_info_equivalent
 
 
 class TestCreateSmoke(InstarTestBase):
@@ -698,3 +699,314 @@ class TestCreatePreallocation(InstarTestBase):
                 '-f', 'vmdk', '-o', 'preallocation=metadata', str(path), '4M')
             self.assertNotEqual(rc, 0)
             self.assertIn('non-qcow2 preallocation is future work', stderr)
+
+
+# ----------------------------------------------------------------------
+# Phase 8b: cross-version baseline matrix
+# ----------------------------------------------------------------------
+#
+# Mirror of instar-testdata/scripts/generate-baselines.py:CREATE_CASES.
+# Each entry: (case_name, size_str, options_list).
+#
+# Drift between this mirror and the generator is caught by
+# TestCreateBaselineMatrix.test_create_cases_match_baselines.
+CREATE_CASES = {
+    'qcow2': [
+        ('1M-default',              '1M',  []),
+        ('64M-default',             '64M', []),
+        ('1G-default',              '1G',  []),
+        ('1G-cs-512',               '1G',  ['cluster_size=512']),
+        ('1G-cs-4k',                '1G',  ['cluster_size=4k']),
+        ('1G-cs-64k',               '1G',  ['cluster_size=64k']),
+        ('1G-cs-1M',                '1G',  ['cluster_size=1M']),
+        ('1G-cs-2M',                '1G',  ['cluster_size=2M']),
+        ('1G-rb-1',                 '1G',  ['refcount_bits=1']),
+        ('1G-rb-8',                 '1G',  ['refcount_bits=8']),
+        ('1G-rb-64',                '1G',  ['refcount_bits=64']),
+        ('1G-extended-l2',          '1G',  ['extended_l2=on,cluster_size=64k']),
+        ('64M-extended-l2',         '64M', ['extended_l2=on,cluster_size=64k']),
+        ('1G-compat-v2',            '1G',  ['compat=0.10']),
+        ('1G-lazy-refcounts',       '1G',  ['lazy_refcounts=on']),
+        ('1G-zstd',                 '1G',  ['compression_type=zstd']),
+        ('1M-prealloc-metadata',    '1M',  ['preallocation=metadata']),
+        ('1M-prealloc-falloc',      '1M',  ['preallocation=falloc']),
+        ('1M-prealloc-full',        '1M',  ['preallocation=full']),
+    ],
+    'vmdk': [
+        ('1M-default',              '1M',  []),
+        ('64M-default',             '64M', []),
+        ('1G-default',              '1G',  []),
+        ('1G-stream-optimized',     '1G',  ['subformat=streamOptimized']),
+        ('1G-monolithic-sparse',    '1G',  ['subformat=monolithicSparse']),
+    ],
+    'vhd': [
+        ('1M-default',              '1M',  []),
+        ('64M-default',             '64M', []),
+        ('1G-default',              '1G',  []),
+        ('1M-fixed',                '1M',  ['subformat=fixed']),
+        ('16M-fixed',               '16M', ['subformat=fixed']),
+    ],
+    'vhdx': [
+        ('1M-default',              '1M',  []),
+        ('64M-default',             '64M', []),
+        ('1G-default',              '1G',  []),
+        ('1G-block-16M',            '1G',  ['block_size=16M']),
+        ('1G-block-32M',            '1G',  ['block_size=32M']),
+    ],
+    'raw': [
+        ('1M-default',              '1M',  []),
+        ('1G-default',              '1G',  []),
+    ],
+}
+
+
+def _version_key(v):
+    """Sort key for semver-shape version strings like '10.2.0'."""
+    return tuple(int(p) for p in v.split('.'))
+
+
+def _instar_target_name(target):
+    """Translate the CREATE_CASES key to instar's CLI -f value.
+
+    The case-dict key follows the on-disk baseline directory name
+    (which mirrors instar's user-facing format vocabulary). instar
+    itself accepts 'vpc' for the VHD format, matching qemu-img's
+    canonical name; the dict uses 'vhd' for symmetry with
+    PLAN-create-phase-07-baselines.md.
+    """
+    return 'vpc' if target == 'vhd' else target
+
+
+# Cases where instar's writer is known to diverge from qemu-img's writer
+# in a documented way. Each entry maps (target, case_name) to a reason
+# the test skips. These should shrink over time as instar gains feature
+# parity; in the meantime the divergence is on the record.
+#
+# A case NOT in this dict that fails baseline comparison is a real
+# regression (a new divergence between instar and qemu-img) and must
+# be investigated rather than added to the dict to make CI green.
+KNOWN_WRITER_DIVERGENCES = {
+    # qcow2: build_header hardcodes refcount_order=4 (=> refcount_bits=16),
+    # ignoring -o refcount_bits. Documented in test_create.py:351 and
+    # in PLAN-create-phase-01-emitters.md.
+    ('qcow2', '1G-rb-1'):  'instar hardcodes refcount_bits=16',
+    ('qcow2', '1G-rb-8'):  'instar hardcodes refcount_bits=16',
+    ('qcow2', '1G-rb-64'): 'instar hardcodes refcount_bits=16',
+    # qcow2: build_header hardcodes compat=1.1; -o compat=0.10 is ignored.
+    ('qcow2', '1G-compat-v2'): 'instar hardcodes compat=1.1',
+    # qcow2: compression_type=zstd is accept-ignored, header records zlib.
+    ('qcow2', '1G-zstd'): 'instar accept-ignores compression_type=zstd',
+    # vhdx: default block_size differs (instar 8 MiB vs qemu 32 MiB) for
+    # virtual sizes ≤ 1 GiB. Explicit block_size cases (1G-block-16M,
+    # 1G-block-32M) round-trip correctly.
+    ('vhdx', '1M-default'):  'instar default block_size differs from qemu',
+    ('vhdx', '64M-default'): 'instar default block_size differs from qemu',
+    ('vhdx', '1G-default'):  'instar default block_size differs from qemu',
+    # vhd: qemu-img rounds virtual_size up to the next CHS-aligned
+    # multiple (legacy geometry layout); instar uses the exact byte
+    # count. Both files are valid VHDs but report different
+    # virtual-size values in qemu-img info.
+    ('vhd', '1M-default'):  'qemu rounds VHD virtual_size to CHS geometry',
+    ('vhd', '64M-default'): 'qemu rounds VHD virtual_size to CHS geometry',
+    ('vhd', '1G-default'):  'qemu rounds VHD virtual_size to CHS geometry',
+    ('vhd', '1M-fixed'):    'qemu rounds VHD virtual_size to CHS geometry',
+    ('vhd', '16M-fixed'):   'qemu rounds VHD virtual_size to CHS geometry',
+}
+
+
+class TestCreateBaselineMatrix(TestCreateSmoke):
+    """Cross-version baseline comparison for every (target, case) pair.
+
+    For each entry in CREATE_CASES the test runs ``instar create`` then
+    ``qemu-img info --output=json`` on the produced file, normalises both
+    sides via the divergence whitelist, and asserts byte-equivalence
+    against the version-matched baseline recorded in instar-testdata.
+
+    Bypasses ``get_expected_output()`` and reads
+    ``expected-outputs/create-info-json/<target>/<version>/<case>.stdout.txt``
+    directly — phase 7's ``detect-profiles.py`` flat-copies into
+    ``profiles/profile-NN/`` keyed by case-name only, so collisions
+    between targets (1M-default, 64M-default, 1G-default) silently
+    overwrite. Reading the raw per-target bucket sidesteps the bug.
+    The fix is logged as a phase-7 follow-up in phase 8's plan.
+    """
+
+    @classmethod
+    def _baseline_root(cls, target):
+        return (cls._testdata_root / 'expected-outputs' /
+                'create-info-json' / target)
+
+    def _baseline_version_dir(self, target):
+        """Pick the version dir under <target>/ matching the installed
+        qemu-img. Falls back to the most-recent recorded version.
+
+        Returns the Path, or None if the matrix isn't populated for
+        this target.
+        """
+        root = self._baseline_root(target)
+        if not root.exists():
+            return None
+        names = [p.name for p in root.iterdir() if p.is_dir()]
+        if not names:
+            return None
+        names.sort(key=_version_key)
+        if self._qemu_version is not None:
+            major, minor = self._qemu_version
+            prefix = f'{major}.{minor}.'
+            matches = [n for n in names if n.startswith(prefix)]
+            if matches:
+                return root / matches[0]
+        return root / names[-1]
+
+    def _baseline_stdout(self, target, case_name):
+        v_dir = self._baseline_version_dir(target)
+        if v_dir is None:
+            return None
+        p = v_dir / f'{case_name}.stdout.txt'
+        return p if p.exists() else None
+
+    def _baseline_meta(self, target, case_name):
+        v_dir = self._baseline_version_dir(target)
+        if v_dir is None:
+            return None
+        p = v_dir / f'{case_name}.meta.json'
+        if not p.exists():
+            return None
+        with open(p) as f:
+            return json.load(f)
+
+    @staticmethod
+    def _args_for_case(target, case):
+        case_name, size_str, options_list = case
+        # instar's CLI uses 'vpc' for VHD; the CREATE_CASES key uses
+        # 'vhd' for symmetry with the baseline directory layout.
+        args = ['-f', _instar_target_name(target)]
+        for opt in options_list:
+            args.extend(['-o', opt])
+        # Filename + size positional — appended by caller (needs tempdir).
+        return args, case_name, size_str
+
+    @staticmethod
+    def _run_qemu_img_info(path, timeout=30):
+        """Run system qemu-img info --output=json. No -f flag so the
+        auto-detect path matches what phase 7's generator recorded.
+        Returns (stdout, stderr, rc).
+        """
+        try:
+            r = subprocess.run(
+                ['qemu-img', 'info', '--output=json', str(path)],
+                capture_output=True, text=True, timeout=timeout,
+            )
+            return r.stdout, r.stderr, r.returncode
+        except FileNotFoundError:
+            return '', 'qemu-img not installed', -1
+        except subprocess.TimeoutExpired:
+            return '', f'qemu-img info timeout after {timeout}s', -1
+
+    def test_create_cases_match_baselines(self):
+        """Every baseline on disk must have a matching CREATE_CASES entry.
+
+        Walks <testdata>/expected-outputs/create-info-json/<target>/<version>/
+        for each known target and asserts the set of <case>.stdout.txt
+        filenames matches the case-name set in CREATE_CASES[target].
+        Catches drift between this mirror and the generator.
+        """
+        for target, cases in CREATE_CASES.items():
+            v_dir = self._baseline_version_dir(target)
+            if v_dir is None:
+                self.skipTest(f'no baseline dir for target {target}')
+            on_disk = {
+                p.stem.rsplit('.stdout', 1)[0]
+                for p in v_dir.glob('*.stdout.txt')
+            }
+            in_mirror = {c[0] for c in cases}
+            missing_from_mirror = on_disk - in_mirror
+            missing_from_disk = in_mirror - on_disk
+            self.assertEqual(
+                missing_from_mirror, set(),
+                f'{target}: baselines on disk not in CREATE_CASES: '
+                f'{missing_from_mirror}'
+            )
+            self.assertEqual(
+                missing_from_disk, set(),
+                f'{target}: CREATE_CASES entries with no baseline: '
+                f'{missing_from_disk}. Regenerate baselines via '
+                f'instar-testdata.'
+            )
+
+
+def _make_baseline_test(target, case):
+    """Factory: one test method per (target, case)."""
+    case_name = case[0]
+
+    def test(self):
+        known = KNOWN_WRITER_DIVERGENCES.get((target, case_name))
+        if known is not None:
+            self.skipTest(f'known writer divergence: {known}')
+        baseline_path = self._baseline_stdout(target, case_name)
+        if baseline_path is None:
+            self.skipTest(
+                f'no baseline for {target}/{case_name} '
+                f'(installed qemu version not in matrix?)'
+            )
+        meta = self._baseline_meta(target, case_name)
+        if meta is None:
+            self.skipTest(f'no meta.json for {target}/{case_name}')
+        if meta.get('create_return_code', 0) != 0:
+            self.skipTest(
+                f'baseline has create_return_code='
+                f'{meta["create_return_code"]} (qemu-img rejected case)'
+            )
+        if meta.get('info_return_code', 0) != 0:
+            self.skipTest(
+                f'baseline has info_return_code='
+                f'{meta["info_return_code"]} (no comparable JSON)'
+            )
+
+        args, _, size_str = self._args_for_case(target, case)
+        with tempfile.TemporaryDirectory() as td:
+            ext = {'qcow2': 'qcow2', 'vmdk': 'vmdk', 'vhd': 'vhd',
+                   'vhdx': 'vhdx', 'raw': 'raw'}[target]
+            tmp_path = Path(td) / f'image.{ext}'
+            full_args = [*args, str(tmp_path), size_str]
+            stdout, stderr, rc = self.run_instar_create(*full_args)
+            self.assertEqual(
+                rc, 0,
+                f'instar create failed for {target}/{case_name}: '
+                f'stderr={stderr}'
+            )
+            info_stdout, info_stderr, info_rc = self._run_qemu_img_info(
+                tmp_path)
+            if info_rc == -1 and 'not installed' in info_stderr:
+                self.skipTest('system qemu-img not installed')
+            self.assertEqual(
+                info_rc, 0,
+                f'qemu-img info failed on instar output for '
+                f'{target}/{case_name}: stderr={info_stderr}'
+            )
+            expected = baseline_path.read_text()
+            assert_info_equivalent(
+                self, info_stdout, expected, target,
+                tmp_path=str(tmp_path),
+                msg=f'{target}/{case_name}',
+            )
+
+    test.__name__ = (
+        f'test_baseline_{target}_{case_name.replace("-", "_")}'
+    )
+    test.__doc__ = (
+        f'instar create -f {target} {" ".join(case[2])} {case[1]} '
+        f'matches phase-7 baseline.'
+    )
+    return test
+
+
+for _target, _cases in CREATE_CASES.items():
+    for _case in _cases:
+        _name = (
+            f'test_baseline_{_target}_{_case[0].replace("-", "_")}'
+        )
+        setattr(
+            TestCreateBaselineMatrix, _name,
+            _make_baseline_test(_target, _case),
+        )

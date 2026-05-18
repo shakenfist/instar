@@ -100,6 +100,22 @@ class TestNormaliseInfoJsonStripsDivergence(unittest.TestCase):
         self.assertNotIn('actual-size', norm)
         self.assertNotIn('actual-size', norm['children'][0]['info'])
 
+    def test_nested_virtual_size_stripped_but_top_preserved(self):
+        """children[*].info.virtual-size (physical file size) stripped;
+        top-level virtual-size (format virtual size) preserved.
+        """
+        obj = {
+            'format': 'qcow2',
+            'virtual-size': 1048576,
+            'children': [
+                {'name': 'file', 'info': {'format': 'file',
+                                          'virtual-size': 262144}},
+            ],
+        }
+        norm = normalise_info_json(obj, 'qcow2')
+        self.assertEqual(norm['virtual-size'], 1048576)
+        self.assertNotIn('virtual-size', norm['children'][0]['info'])
+
     def test_tmp_path_substitution(self):
         obj = {
             'format': 'qcow2',

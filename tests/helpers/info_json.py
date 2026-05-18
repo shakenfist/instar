@@ -22,6 +22,15 @@ UNIVERSAL_DIVERGENCE = {
     'dirty-flag',
 }
 
+# Additional fields stripped from children[*].info nodes only.
+# The wrapping-file `virtual-size` there is the physical file length,
+# which depends on the writer's metadata layout choices (e.g. refcount
+# table sizing); it is not the format's virtual disk size, which lives
+# at the top level and must match exactly.
+NESTED_INFO_DIVERGENCE = {
+    'virtual-size',
+}
+
 # Per-target additional divergence sets (random per-invocation IDs).
 TARGET_DIVERGENCE = {
     'vmdk': {'cid', 'parent-cid'},
@@ -96,6 +105,18 @@ def normalise_info_json(obj, target, tmp_path=None):
 
     _strip_keys(result, strip)
 
+    # Children's nested file-info: strip the physical-file virtual-size
+    # (writer-dependent layout artefact, not the qcow2 virtual size).
+    if isinstance(result, dict):
+        children = result.get('children')
+        if isinstance(children, list):
+            for child in children:
+                if isinstance(child, dict):
+                    info = child.get('info')
+                    if isinstance(info, dict):
+                        for k in NESTED_INFO_DIVERGENCE:
+                            info.pop(k, None)
+
     if tmp_path is not None:
         _substitute_path(result, tmp_path)
 
@@ -133,4 +154,5 @@ def assert_info_equivalent(test_case, actual_json_str, expected_json_str,
             f'--- expected (normalised) ---\n'
             f'{json.dumps(expected_norm, indent=2, sort_keys=True)}'
         )
-        test_case.assertEqual(actual_norm, expected_norm, diff_msg)
+        # testtools' assertEqual signature is (expected, observed, msg).
+        test_case.assertEqual(expected_norm, actual_norm, diff_msg)
