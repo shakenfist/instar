@@ -60,7 +60,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   [phase 3](docs/plans/PLAN-create-phase-03-host-cli.md) ·
   [phase 4](docs/plans/PLAN-create-phase-04-target-options.md) ·
   [phase 5](docs/plans/PLAN-create-phase-05-backing-file.md) ·
-  [phase 6](docs/plans/PLAN-create-phase-06-preallocation.md))
+  [phase 6](docs/plans/PLAN-create-phase-06-preallocation.md) ·
+  [phase 7](docs/plans/PLAN-create-phase-07-baselines.md))
 
   Deferred to later phases:
   comprehensive integration matrix and cross-version
@@ -98,6 +99,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   ([phase 1](docs/plans/PLAN-measure-phase-01-calculators.md) ·
   [phase 2](docs/plans/PLAN-measure-phase-02-allocation-scanners.md) ·
   [phase 3](docs/plans/PLAN-measure-phase-03-guest-op.md))
+
+- **Cross-version `qemu-img create` baselines** committed to
+  `instar-testdata/expected-outputs/create-info-json/` for 80
+  qemu-img versions (6.0.0 through 10.2.0). For each `(target,
+  options, size)` case in a 36-entry per-version matrix the
+  generator runs `qemu-img create` followed by `qemu-img info
+  --output=json` and records the info JSON as the comparable
+  artefact. Consumed by phase 8's integration tests, which
+  compare instar's info JSON output against the version-matched
+  qemu baseline modulo a documented divergence whitelist
+  (filename, actual-size, vmdk cid + parent-cid, vhdx
+  header-id). `instar-testdata`'s `scripts/generate-baselines.py`
+  and `scripts/detect-profiles.py` learn a new `create` command
+  + `create-info-json` output type.
+  ([phase 7](docs/plans/PLAN-create-phase-07-baselines.md))
 
 - **Test and fuzz infrastructure.** Comprehensive integration
   tests for `instar measure` (`tests/test_measure.py`, 345 tests
