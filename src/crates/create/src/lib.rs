@@ -214,7 +214,13 @@ pub struct Qcow2CreateOpts<'a> {
     pub compat_v3: bool,
     /// Optional backing image to chain to.
     pub backing: Option<BackingRef<'a>>,
-    // preallocation handled by phase 6; phase 1 supports `off` only.
+    /// Preallocation mode (phase 6). `Off` (default) emits header +
+    /// L1 (empty) + refcount only. `Metadata` / `Falloc` / `Full`
+    /// populate L1 + L2 + refcount for the full virtual range; the
+    /// host applies the matching post-pass (truncate / fallocate /
+    /// zero-write) after `plan_qcow2`'s metadata bytes have been
+    /// written.
+    pub preallocation: qcow2::create::Preallocation,
 }
 
 /// VMDK subformat selector.
@@ -326,7 +332,7 @@ pub fn plan_qcow2<'a>(
         cluster_bits,
         opts.refcount_bits as u32,
         opts.extended_l2,
-        qcow2::create::Preallocation::Off,
+        opts.preallocation,
     )
     .map_err(map_qcow2_error)?;
 
@@ -419,7 +425,19 @@ pub fn plan_qcow2<'a>(
         bytes: refblocks_combined,
     })?;
 
-    debug_assert_eq!(plan.minimum_file_size, layout.total_file_size);
+    // In Off mode the pushes above reach total_file_size already.
+    // In non-Off modes L2 tables + the data region come after the
+    // refcount blocks but are *not* emitted in the plan (the guest
+    // streams L2 tables outside the inline-writes array because
+    // they can sum to far more than the plan's storage; the host
+    // then extends the file via fill_zeros / posix_fallocate to
+    // cover the data region). Override minimum_file_size so the
+    // host sees the eventual on-disk size.
+    if opts.preallocation.populates_data_metadata() {
+        plan.minimum_file_size = layout.total_file_size;
+    } else {
+        debug_assert_eq!(plan.minimum_file_size, layout.total_file_size);
+    }
     Ok(plan)
 }
 
@@ -992,6 +1010,7 @@ mod qcow2_plan_tests {
             lazy_refcounts: false,
             compat_v3: true,
             backing: None,
+            preallocation: qcow2::create::Preallocation::Off,
         }
     }
 
@@ -1145,6 +1164,7 @@ mod qcow2_plan_tests {
             lazy_refcounts: false,
             compat_v3: true,
             backing: None,
+            preallocation: qcow2::create::Preallocation::Off,
         };
         let mut scratch = vec![0u8; QCOW2_MAX_METADATA_SCRATCH];
         let plan = plan_qcow2(&opts, &mut scratch).expect("plan");

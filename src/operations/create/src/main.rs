@@ -180,6 +180,13 @@ fn qcow2_opts_from<'a>(
     virtual_size: u64,
     backing: Option<BackingRef<'a>>,
 ) -> Qcow2CreateOpts<'a> {
+    use qcow2::create::Preallocation;
+    let preallocation = match config.preallocation() {
+        CreateConfig::PREALLOC_METADATA => Preallocation::Metadata,
+        CreateConfig::PREALLOC_FALLOC => Preallocation::Falloc,
+        CreateConfig::PREALLOC_FULL => Preallocation::Full,
+        _ => Preallocation::Off,
+    };
     Qcow2CreateOpts {
         virtual_size,
         cluster_size: if config.qcow2_cluster_size == 0 {
@@ -198,6 +205,7 @@ fn qcow2_opts_from<'a>(
         // default of compat=1.1. Clear the bit explicitly for v2.
         compat_v3: config.flags == 0 || (config.flags & CreateConfig::FLAG_COMPAT_V3) != 0,
         backing,
+        preallocation,
     }
 }
 
@@ -594,7 +602,7 @@ pub unsafe extern "C" fn _start() -> u64 {
     };
 
     let file_size_after = plan.minimum_file_size;
-    let bytes_written = match write_plan(call_table, &plan) {
+    let mut bytes_written = match write_plan(call_table, &plan) {
         Some(n) => n,
         None => {
             return fail_with(
@@ -604,6 +612,27 @@ pub unsafe extern "C" fn _start() -> u64 {
             )
         }
     };
+
+    // qcow2 + non-Off preallocation: L2 tables are NOT in the
+    // MetadataPlan because they can sum to more than the guest's
+    // scratch budget at large virtual sizes (e.g. 128 MiB at
+    // 1 TiB virtual with default cluster size). Stream them
+    // here using a reusable single-cluster scratch slot at
+    // CREATE_SCRATCH, then extend the file to file_size_after by
+    // writing a final zero sector at the last sector position.
+    if matches!(target, ImageFormat::Qcow2) && config.preallocation() != CreateConfig::PREALLOC_OFF
+    {
+        match emit_qcow2_l2_and_extend(call_table, config, virtual_size, file_size_after) {
+            Some(extra) => bytes_written = bytes_written.saturating_add(extra),
+            None => {
+                return fail_with(
+                    call_table,
+                    config.target_format,
+                    CreateResult::ERROR_WRITE_FAILED,
+                )
+            }
+        }
+    }
 
     send_result(
         call_table,
@@ -616,6 +645,132 @@ pub unsafe extern "C" fn _start() -> u64 {
     );
     (call_table.send_complete)(b"create\0".as_ptr(), bytes_written, true);
     bytes_written
+}
+
+/// Emit the L2 tables for a preallocated qcow2 image and extend the
+/// output file to `file_size_after` by writing a zero sector at the
+/// last sector position. Used only when qcow2 + preallocation !=
+/// Off; for Off mode no L2 tables exist and the plan's writes
+/// already cover the (much smaller) total file size.
+///
+/// Returns `Some(bytes_written)` for the L2 + extension passes, or
+/// `None` on I/O failure. The L2 buffer is a single cluster carved
+/// out of `CREATE_SCRATCH` and reused across L1 entries.
+///
+/// # Safety
+///
+/// `call_table` must be valid and the output device attached.
+unsafe fn emit_qcow2_l2_and_extend(
+    call_table: &CallTable,
+    config: &CreateConfig,
+    virtual_size: u64,
+    file_size_after: u64,
+) -> Option<u64> {
+    use qcow2::create::Preallocation;
+    let prealloc = match config.preallocation() {
+        CreateConfig::PREALLOC_METADATA => Preallocation::Metadata,
+        CreateConfig::PREALLOC_FALLOC => Preallocation::Falloc,
+        CreateConfig::PREALLOC_FULL => Preallocation::Full,
+        _ => return Some(0),
+    };
+    let cluster_size = if config.qcow2_cluster_size == 0 {
+        65536
+    } else {
+        config.qcow2_cluster_size
+    };
+    let refcount_bits = if config.qcow2_refcount_bits == 0 {
+        16
+    } else {
+        config.qcow2_refcount_bits as u32
+    };
+    let cluster_bits = cluster_size.trailing_zeros();
+    let layout = qcow2::create::compute_layout(
+        virtual_size,
+        cluster_bits,
+        refcount_bits,
+        (config.flags & CreateConfig::FLAG_EXTENDED_L2) != 0,
+        prealloc,
+    )
+    .ok()?;
+
+    let output_sector_size = (call_table.get_output_sector_size)();
+    let output_capacity = (call_table.get_output_capacity)();
+    let cluster_size_u = layout.cluster_size as usize;
+    let l2_buf = core::slice::from_raw_parts_mut(CREATE_SCRATCH as *mut u8, cluster_size_u);
+    let mut bytes_written: u64 = 0;
+
+    for l1_index in 0..layout.l1_entries as u64 {
+        qcow2::create::build_l2_table(l2_buf, &layout, l1_index).ok()?;
+        let byte_offset = layout.l2_base_offset + l1_index * layout.cluster_size;
+        if !write_sector_aligned(
+            call_table,
+            byte_offset,
+            l2_buf,
+            output_sector_size,
+            output_capacity,
+        )? {
+            return None;
+        }
+        bytes_written += layout.cluster_size;
+    }
+
+    // Extend the file: write a zero sector at file_size_after -
+    // sector_size so the file reaches the post-preallocation size.
+    // The data region itself is sparse here; the host fill_zeros
+    // pass in step 6c materialises it for falloc / full modes.
+    if file_size_after > 0 {
+        let zero_sector =
+            core::slice::from_raw_parts_mut(CREATE_SCRATCH as *mut u8, output_sector_size);
+        zero_sector.fill(0);
+        let tail_offset = file_size_after - output_sector_size as u64;
+        if !write_sector_aligned(
+            call_table,
+            tail_offset,
+            zero_sector,
+            output_sector_size,
+            output_capacity,
+        )? {
+            return None;
+        }
+        bytes_written = bytes_written.saturating_add(output_sector_size as u64);
+    }
+
+    Some(bytes_written)
+}
+
+/// Write `bytes` (a multiple of `sector_size` long, starting at a
+/// sector-aligned `byte_offset`) to the output device via repeated
+/// `write_output_sector` calls. Returns `Some(true)` on success,
+/// `Some(false)` on a per-sector write failure (caller maps to
+/// ERROR_WRITE_FAILED), `None` only if the math overflows.
+///
+/// # Safety
+///
+/// `call_table` must be valid and the output device attached.
+/// `bytes.len()` must be a multiple of `sector_size` and
+/// `byte_offset` must be sector-aligned (debug-asserted).
+unsafe fn write_sector_aligned(
+    call_table: &CallTable,
+    byte_offset: u64,
+    bytes: &[u8],
+    sector_size: usize,
+    output_capacity: u64,
+) -> Option<bool> {
+    debug_assert_eq!(byte_offset % sector_size as u64, 0);
+    debug_assert_eq!(bytes.len() % sector_size, 0);
+    let first_sector = byte_offset / sector_size as u64;
+    let sectors = (bytes.len() as u64).div_ceil(sector_size as u64);
+    for i in 0..sectors {
+        let sector = first_sector + i;
+        if sector >= output_capacity {
+            return Some(false);
+        }
+        let src = bytes.as_ptr().add((i as usize) * sector_size);
+        if !(call_table.write_output_sector)(sector, src, sector_size) {
+            return Some(false);
+        }
+    }
+    Some(true)
 }
 
 /// Emit a failure result + send_complete and return 0. Pulled out so

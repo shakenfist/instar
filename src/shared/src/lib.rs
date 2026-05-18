@@ -2224,9 +2224,22 @@ impl CreateConfig {
     /// (qemu-img's `-u` / `--backing-unsafe`). Phase 5 wires this up.
     pub const FLAG_BACKING_UNSAFE: u32 = 1 << 3;
 
+    /// Preallocation mode encoded in flags bits 4-5 (phase 6).
+    /// Mirrors `MeasureConfig::PREALLOC_*`'s layout exactly.
+    pub const PREALLOC_MASK: u32 = 0b11 << 4;
+    pub const PREALLOC_OFF: u32 = 0 << 4;
+    pub const PREALLOC_METADATA: u32 = 1 << 4;
+    pub const PREALLOC_FALLOC: u32 = 2 << 4;
+    pub const PREALLOC_FULL: u32 = 3 << 4;
+
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
         self.magic == Self::MAGIC
+    }
+
+    /// Extract the preallocation mode from `flags`.
+    pub fn preallocation(&self) -> u32 {
+        self.flags & Self::PREALLOC_MASK
     }
 
     /// Slice view over the populated portion of `backing_file`.

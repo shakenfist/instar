@@ -91,6 +91,7 @@ fn sweep_qcow2() {
                     lazy_refcounts: false,
                     compat_v3: true,
                     backing: None,
+                    preallocation: qcow2::create::Preallocation::Off,
                 };
                 let mut scratch = vec![0u8; QCOW2_MAX_METADATA_SCRATCH];
                 let scratch_len = scratch.len();
@@ -131,6 +132,7 @@ fn sweep_qcow2() {
             path: b"backing.qcow2",
             format: Some(ImageFormat::Qcow2),
         }),
+        preallocation: qcow2::create::Preallocation::Off,
     };
     let mut scratch = vec![0u8; QCOW2_MAX_METADATA_SCRATCH];
     let plan = plan_qcow2(&opts, &mut scratch).expect("plan");
