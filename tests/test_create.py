@@ -401,16 +401,6 @@ class TestCreateOOptions(InstarTestBase):
             self.assertIn('encrypt', stderr)
             self.assertIn('deferred', stderr)
 
-    def test_o_preallocation_metadata_phase6_gated(self):
-        """`-o preallocation=metadata` returns the phase-6 deferred message."""
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / 'foo.qcow2'
-            _, stderr, rc = self.run_instar_create(
-                '-f', 'qcow2', '-o', 'preallocation=metadata',
-                str(path), '16M')
-            self.assertNotEqual(rc, 0)
-            self.assertIn('preallocation', stderr)
-            self.assertIn('phase 6', stderr)
 
 
 class TestCreateBackingChain(InstarTestBase):
@@ -573,3 +563,124 @@ class TestCreateBackingChain(InstarTestBase):
             self.assertNotEqual(rc, 0, 'expected failure for backing-too-large')
             self.assertIn('too large', stderr.lower())
             self.assertIn('cluster size', stderr.lower())
+
+
+class TestCreatePreallocation(InstarTestBase):
+    """Phase-6 preallocation tests.
+
+    Covers the new accept set: raw + falloc/full, qcow2 +
+    metadata/falloc/full, plus rejections for raw+metadata and
+    vmdk/vpc/vhdx + non-`off`.
+    """
+
+    def run_instar_create(self, *args, timeout=120):
+        instar = self.get_instar_binary()
+        cmd = [str(instar), 'create', *[str(a) for a in args]]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            return r.stdout, r.stderr, r.returncode
+        except subprocess.TimeoutExpired:
+            return '', f'Timeout after {timeout}s', -1
+
+    def test_raw_full_writes_zeros(self):
+        """`-f raw --preallocation full` allocates blocks and content is zero."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'r.raw'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'raw', '--preallocation', 'full', str(path), '4M')
+            self.assertEqual(rc, 0, f'raw + full failed: {stderr}')
+            st = path.stat()
+            self.assertEqual(st.st_size, 4 * 1024 * 1024)
+            # st_blocks counts 512-byte units; expect ≈ size/512.
+            self.assertGreaterEqual(st.st_blocks * 512, 4 * 1024 * 1024,
+                                    f'raw + full should allocate blocks; '
+                                    f'got st_blocks={st.st_blocks}')
+            # Whole file should be zero.
+            with open(path, 'rb') as f:
+                data = f.read()
+            self.assertEqual(data, b'\x00' * (4 * 1024 * 1024),
+                             'raw + full content should be all zero')
+
+    def test_qcow2_off_stays_sparse(self):
+        """`-f qcow2` default (off) produces a small sparse file."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'q.qcow2'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2', str(path), '64M')
+            self.assertEqual(rc, 0, f'qcow2 default failed: {stderr}')
+            st = path.stat()
+            # Off-mode qcow2 file is just header + L1 + refcount —
+            # well under 1 MiB for 64 MiB virtual.
+            self.assertLess(st.st_size, 1 * 1024 * 1024,
+                            f'qcow2 off should be tiny; got {st.st_size}')
+
+    def test_qcow2_metadata_extends_file(self):
+        """`-o preallocation=metadata` extends the file past the data region."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'q.qcow2'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2', '-o', 'preallocation=metadata',
+                str(path), '64M')
+            self.assertEqual(rc, 0, f'qcow2 metadata failed: {stderr}')
+            st = path.stat()
+            # File must cover header + metadata + 64 MiB data region.
+            self.assertGreaterEqual(st.st_size, 64 * 1024 * 1024,
+                                    f'qcow2 metadata file_size={st.st_size} '
+                                    f'should cover 64 MiB data region')
+            # No host falloc/zero pass — file stays sparse on the data
+            # region (single trailing-sector write on most filesystems).
+            self.assertLess(st.st_blocks * 512, 64 * 1024 * 1024,
+                            f'qcow2 metadata should be sparse; '
+                            f'st_blocks={st.st_blocks}')
+
+    def test_qcow2_falloc_reserves_blocks(self):
+        """`-o preallocation=falloc` reserves the data region via posix_fallocate."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'q.qcow2'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2', '-o', 'preallocation=falloc',
+                str(path), '4M')
+            self.assertEqual(rc, 0, f'qcow2 falloc failed: {stderr}')
+            st = path.stat()
+            self.assertGreaterEqual(st.st_size, 4 * 1024 * 1024)
+            # Falloc should reserve ≈ 4 MiB on disk.
+            self.assertGreaterEqual(st.st_blocks * 512, 4 * 1024 * 1024,
+                                    f'qcow2 falloc should allocate blocks; '
+                                    f'st_blocks={st.st_blocks}')
+
+    def test_qcow2_full_writes_zeros(self):
+        """`-o preallocation=full` reserves blocks and the data region is zero."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'q.qcow2'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2', '-o', 'preallocation=full',
+                str(path), '4M')
+            self.assertEqual(rc, 0, f'qcow2 full failed: {stderr}')
+            st = path.stat()
+            self.assertGreaterEqual(st.st_blocks * 512, 4 * 1024 * 1024,
+                                    f'qcow2 full should allocate blocks; '
+                                    f'st_blocks={st.st_blocks}')
+            # The trailing 4 MiB data region should be all zero.
+            with open(path, 'rb') as f:
+                f.seek(st.st_size - 4 * 1024 * 1024)
+                data = f.read(4 * 1024 * 1024)
+            self.assertEqual(data, b'\x00' * (4 * 1024 * 1024),
+                             'qcow2 full data region should be all zero')
+
+    def test_raw_metadata_rejected(self):
+        """`-f raw --preallocation metadata` is rejected (raw has no metadata)."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'r.raw'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'raw', '--preallocation', 'metadata', str(path), '4M')
+            self.assertNotEqual(rc, 0)
+            self.assertIn('raw has no metadata', stderr)
+
+    def test_vmdk_metadata_deferred(self):
+        """`-f vmdk -o preallocation=metadata` returns the future-work error."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'v.vmdk'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'vmdk', '-o', 'preallocation=metadata', str(path), '4M')
+            self.assertNotEqual(rc, 0)
+            self.assertIn('non-qcow2 preallocation is future work', stderr)

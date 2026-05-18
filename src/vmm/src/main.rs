@@ -5916,25 +5916,18 @@ fn parse_create_o_options(
 
                 // -------- raw --------
                 ("raw", "preallocation") => match value {
-                    "off" | "falloc" => {
-                        out.preallocation = Some(match value {
-                            "off" => "off",
-                            "falloc" => "falloc",
-                            _ => unreachable!(),
-                        })
-                    }
-                    "metadata" | "full" => {
-                        return Err(format!(
-                            "create: -o preallocation={} is not yet supported \
-                             (preallocation modes land in phase 6 of PLAN-create.md)",
-                            value
-                        )
-                        .into())
+                    "off" => out.preallocation = Some("off"),
+                    "falloc" => out.preallocation = Some("falloc"),
+                    "full" => out.preallocation = Some("full"),
+                    "metadata" => {
+                        return Err("create: -o preallocation=metadata is not valid for raw \
+                             (raw has no metadata to preallocate)"
+                            .into())
                     }
                     _ => {
                         return Err(format!(
                             "create: bad value '{}' for -o key 'preallocation' \
-                             (expected off, metadata, falloc, or full)",
+                             (expected off, falloc, or full)",
                             value
                         )
                         .into())
@@ -5982,14 +5975,9 @@ fn parse_create_o_options(
                 },
                 ("qcow2", "preallocation") => match value {
                     "off" => out.preallocation = Some("off"),
-                    "metadata" | "falloc" | "full" => {
-                        return Err(format!(
-                            "create: -o preallocation={} is not yet supported \
-                             (preallocation modes land in phase 6 of PLAN-create.md)",
-                            value
-                        )
-                        .into())
-                    }
+                    "metadata" => out.preallocation = Some("metadata"),
+                    "falloc" => out.preallocation = Some("falloc"),
+                    "full" => out.preallocation = Some("full"),
                     _ => {
                         return Err(format!(
                             "create: bad value '{}' for -o key 'preallocation' \
@@ -6087,6 +6075,27 @@ fn parse_create_o_options(
                 ("vhdx", "log_size") | ("vhdx", "block_state_zero") => {
                     // accept-ignore
                 }
+
+                // -------- non-qcow2 preallocation: deferred --------
+                ("vmdk" | "vpc" | "vhdx", "preallocation") => match value {
+                    "off" => out.preallocation = Some("off"),
+                    "metadata" | "falloc" | "full" => {
+                        return Err(format!(
+                            "create: -o preallocation={} is not yet supported for {} \
+                             (non-qcow2 preallocation is future work — see PLAN-create.md)",
+                            value, target
+                        )
+                        .into())
+                    }
+                    _ => {
+                        return Err(format!(
+                            "create: bad value '{}' for -o key 'preallocation' \
+                             (expected off, metadata, falloc, or full)",
+                            value
+                        )
+                        .into())
+                    }
+                },
 
                 // -------- catch-all --------
                 _ => {
@@ -7812,21 +7821,31 @@ fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
         }
     }
 
-    // Preallocation: phase 3 only accepts "off" (any format) and
-    // "falloc" (raw only). Other modes return a phase-6-deferred
-    // error.
-    match args.preallocation.as_str() {
-        "off" => {}
-        "falloc" if args.target_format == "raw" => {}
-        "metadata" | "falloc" | "full" => {
+    // Preallocation accept set (phase 6):
+    //   off       — any format (default)
+    //   metadata  — qcow2 only (raw has no metadata to preallocate;
+    //               vmdk/vpc/vhdx deferred)
+    //   falloc    — raw or qcow2
+    //   full      — raw or qcow2
+    // Non-qcow2 sparse formats (vmdk/vpc/vhdx) reject all non-`off`
+    // modes with a clear "future work" pointer.
+    match (args.target_format.as_str(), args.preallocation.as_str()) {
+        (_, "off") => {}
+        ("raw", "metadata") => {
+            return Err("create: --preallocation=metadata is not valid for raw \
+                 (raw has no metadata to preallocate)"
+                .into());
+        }
+        ("qcow2", "metadata") | ("raw" | "qcow2", "falloc") | ("raw" | "qcow2", "full") => {}
+        ("vmdk" | "vpc" | "vhdx", mode @ ("metadata" | "falloc" | "full")) => {
             return Err(format!(
-                "create: --preallocation={} is not yet supported \
-                 (preallocation modes land in phase 6 of PLAN-create.md)",
-                args.preallocation
+                "create: --preallocation={} is not yet supported for {} \
+                 (non-qcow2 preallocation is future work — see PLAN-create.md)",
+                mode, args.target_format
             )
             .into());
         }
-        other => {
+        (_, other) => {
             return Err(format!("create: unknown --preallocation '{}'", other).into());
         }
     }
@@ -8223,12 +8242,43 @@ mod create_option_tests {
     }
 
     #[test]
-    fn qcow2_preallocation_metadata_returns_phase6_error() {
-        let err = parse_create_o_options("qcow2", &s("preallocation=metadata"))
+    fn qcow2_preallocation_metadata_accepted() {
+        let o = parse_create_o_options("qcow2", &s("preallocation=metadata")).unwrap();
+        assert_eq!(o.preallocation, Some("metadata"));
+    }
+
+    #[test]
+    fn qcow2_preallocation_falloc_accepted() {
+        let o = parse_create_o_options("qcow2", &s("preallocation=falloc")).unwrap();
+        assert_eq!(o.preallocation, Some("falloc"));
+    }
+
+    #[test]
+    fn qcow2_preallocation_full_accepted() {
+        let o = parse_create_o_options("qcow2", &s("preallocation=full")).unwrap();
+        assert_eq!(o.preallocation, Some("full"));
+    }
+
+    #[test]
+    fn raw_preallocation_metadata_rejected() {
+        let err = parse_create_o_options("raw", &s("preallocation=metadata"))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("preallocation"));
-        assert!(err.contains("phase 6"));
+        assert!(err.contains("raw has no metadata"));
+    }
+
+    #[test]
+    fn raw_preallocation_full_accepted() {
+        let o = parse_create_o_options("raw", &s("preallocation=full")).unwrap();
+        assert_eq!(o.preallocation, Some("full"));
+    }
+
+    #[test]
+    fn vmdk_preallocation_metadata_deferred() {
+        let err = parse_create_o_options("vmdk", &s("preallocation=metadata"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-qcow2 preallocation is future work"));
     }
 
     #[test]
