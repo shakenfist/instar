@@ -412,6 +412,18 @@ structure layout and VMM-to-guest data flow.
 vmdk, vpc (VHD), vhdx (instar-only — qemu-img does not
 implement `measure` for these targets).
 
+**Creatable target formats**: raw (host-only —
+`open + ftruncate + posix_fallocate`), qcow2 (qemu-img
+info-equivalent modulo `refcount_bits` / `compat` / `zstd`
+hardcodes), vmdk monolithicSparse + streamOptimized, vpc
+dynamic + fixed (modulo CHS `virtual_size` rounding), vhdx
+dynamic (modulo default `block_size` when unspecified).
+Backing-file references supported on qcow2, vmdk, vpc, vhdx
+(matches qemu-img's permission set). See
+[docs/create.md](docs/create.md) for the user reference and
+[docs/quirks.md](docs/quirks.md) for the documented writer
+divergences.
+
 ### qcow2
 
 QEMU Copy-On-Write version 2/3. Supported features:

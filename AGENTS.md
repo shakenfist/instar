@@ -75,6 +75,7 @@ vhdx (VHDX), luks (info + convert with decryption)
   `metadata` / `falloc` / `full` (qcow2; raw also accepts
   `falloc` / `full`). Non-qcow2 sparse formats (vmdk / vpc / vhdx)
   reject non-`off` preallocation with a "future work" pointer.
+  See [docs/create.md](docs/create.md) for the full reference.
 
 ## Working on This Project
 
