@@ -62,7 +62,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   [phase 5](docs/plans/PLAN-create-phase-05-backing-file.md) ·
   [phase 6](docs/plans/PLAN-create-phase-06-preallocation.md) ·
   [phase 7](docs/plans/PLAN-create-phase-07-baselines.md) ·
-  [phase 8](docs/plans/PLAN-create-phase-08-integration-tests.md))
+  [phase 8](docs/plans/PLAN-create-phase-08-integration-tests.md) ·
+  [phase 9](docs/plans/PLAN-create-phase-09-fuzz-coverage.md))
   Preallocation for vmdk / vpc / vhdx (each format needs its
   own BAT-population pattern plus a host post-pass — analogous
   to qcow2 metadata mode), multi-file VMDK subformats
@@ -110,6 +111,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and `scripts/detect-profiles.py` learn a new `create` command
   + `create-info-json` output type.
   ([phase 7](docs/plans/PLAN-create-phase-07-baselines.md))
+
+- **Coverage-guided fuzz target for `instar create` emitters**
+  (`src/fuzz/fuzz_targets/fuzz_create_emitters.rs`). Decodes
+  structured fuzz input into per-format option tuples and
+  dispatches to every public planner in `crates/create/`
+  (`plan_qcow2`, `plan_vmdk`, `plan_vhd`, `plan_vhdx`).
+  Asserts plan-level bookkeeping invariants (write totals
+  match, every write fits in `minimum_file_size`, no
+  arithmetic overflow, write count within bound) plus a
+  header re-parse round-trip via the matching parser crate
+  (`qcow2::QcowHeader`, `vmdk::Vmdk4Header`,
+  `vhd::VhdFooter`, `vhdx::VhdxHeader`). Picked up
+  automatically by the nightly coverage-fuzz workflow
+  (16 targets total now). Smoke run reaches ~700 coverage
+  edges in 60 seconds with no crashes.
+  ([phase 9](docs/plans/PLAN-create-phase-09-fuzz-coverage.md))
 
 - **Integration test matrix for `instar create`.** Three new
   test surfaces in `tests/test_create.py` (added on top of the
