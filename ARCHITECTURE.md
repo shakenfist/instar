@@ -329,7 +329,23 @@ provides a modular architecture with:
   coalesced sector-sized writes; tracked in PLAN-create.md's
   Future-work section. The binary builds at ~36 KiB / 384 KiB
   and is excluded from `cargo test --workspace` like the
-  other `no_main` operation binaries.
+  other `no_main` operation binaries. Integration tests in
+  `tests/test_create.py` cross-validate the create writer on
+  three surfaces: per-`(target, case)` comparison via
+  `qemu-img info` against phase 7's recorded baselines
+  (`instar-testdata/expected-outputs/create-info-json/<target>/`);
+  runtime cross-validation creating the same image twice
+  (instar + system qemu-img) and comparing via `instar info`;
+  and full-matrix `instar check` round-trip for writer/reader
+  self-consistency. The normalisation filter in
+  `tests/helpers/info_json.py` strips the divergence whitelist
+  (filename, actual-size, vmdk cid + parent-cid, vhdx log-size,
+  the wrapping-file physical size, cache hints) before
+  comparison; remaining writer divergences (qcow2
+  refcount_bits hardcode, qcow2 compat hardcode, zstd
+  accept-ignore, vhdx default block_size, vhd CHS-rounded
+  virtual_size) are documented as per-case skips rather than
+  whitelist extensions so each gap stays visible.
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation,

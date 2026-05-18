@@ -61,12 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   [phase 4](docs/plans/PLAN-create-phase-04-target-options.md) ·
   [phase 5](docs/plans/PLAN-create-phase-05-backing-file.md) ·
   [phase 6](docs/plans/PLAN-create-phase-06-preallocation.md) ·
-  [phase 7](docs/plans/PLAN-create-phase-07-baselines.md))
-
-  Deferred to later phases:
-  comprehensive integration matrix and cross-version
-  info-equivalence
-  ([phase 8](docs/plans/PLAN-create.md)).
+  [phase 7](docs/plans/PLAN-create-phase-07-baselines.md) ·
+  [phase 8](docs/plans/PLAN-create-phase-08-integration-tests.md))
   Preallocation for vmdk / vpc / vhdx (each format needs its
   own BAT-population pattern plus a host post-pass — analogous
   to qcow2 metadata mode), multi-file VMDK subformats
@@ -114,6 +110,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and `scripts/detect-profiles.py` learn a new `create` command
   + `create-info-json` output type.
   ([phase 7](docs/plans/PLAN-create-phase-07-baselines.md))
+
+- **Integration test matrix for `instar create`.** Three new
+  test surfaces in `tests/test_create.py` (added on top of the
+  pre-existing phase 3–6 smoke / `-o` / backing / preallocation
+  coverage): (1) `TestCreateBaselineMatrix` — per-`(target,
+  case)` baseline comparison against phase 7's recorded
+  `qemu-img info` JSON via `instar create` + system
+  `qemu-img info`, normalised by a divergence-whitelist filter
+  in `tests/helpers/info_json.py`; (2)
+  `TestCreateCrossValidation` — 12 curated cases that build the
+  same image twice (instar + system qemu-img) and compare both
+  via `instar info`; (3) `TestCreateRoundTripCheck` —
+  full-matrix `instar create` + `instar check` self-consistency
+  pass. Known instar/qemu writer divergences (qcow2
+  refcount_bits hardcode, qcow2 compat hardcode, zstd accept-
+  ignore, vhdx default block_size, vhd CHS-rounded virtual_size)
+  are documented in a `KNOWN_WRITER_DIVERGENCES` skip set with
+  per-entry rationale; a separate `KNOWN_CHECK_FAILURES` set
+  tracks writer/reader self-disagreements (currently only
+  qcow2 refcount_bits=64). Phase 8 also reads the per-target
+  raw baseline bucket directly rather than going through
+  `get_expected_output()`, sidestepping a latent
+  `detect-profiles.py` flat-copy collision bug in phase 7
+  whereby case names like `1M-default` clobber each other in
+  `profiles/profile-NN/` across the five target formats.
+  ([phase 8](docs/plans/PLAN-create-phase-08-integration-tests.md))
 
 - **Test and fuzz infrastructure.** Comprehensive integration
   tests for `instar measure` (`tests/test_measure.py`, 345 tests

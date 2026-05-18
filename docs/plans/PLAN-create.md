@@ -560,7 +560,7 @@ currently have any, so this set may stay empty.
 | 5. Backing-file support (`-b` / `-F` / `-u`) | [PLAN-create-phase-05-backing-file.md](PLAN-create-phase-05-backing-file.md) | Complete |
 | 6. Preallocation modes (`off`/`metadata`/`falloc`/`full`) | [PLAN-create-phase-06-preallocation.md](PLAN-create-phase-06-preallocation.md) | Complete |
 | 7. Cross-version baseline generation in `instar-testdata` | [PLAN-create-phase-07-baselines.md](PLAN-create-phase-07-baselines.md) | Complete |
-| 8. Integration tests (`tests/test_create.py`) | PLAN-create-phase-08-integration-tests.md (not yet written) | Not started |
+| 8. Integration tests (`tests/test_create.py`) | [PLAN-create-phase-08-integration-tests.md](PLAN-create-phase-08-integration-tests.md) | Complete |
 | 9. Coverage-guided fuzz harnesses for the emitters | PLAN-create-phase-09-fuzz-coverage.md (not yet written) | Not started |
 | 10. Differential fuzzing extension | PLAN-create-phase-10-fuzz-differential.md (not yet written) | Not started |
 | 11. Documentation, CHANGELOG, follow-ups | PLAN-create-phase-11-docs.md (not yet written) | Not started |
