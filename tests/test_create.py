@@ -1010,3 +1010,145 @@ for _target, _cases in CREATE_CASES.items():
             TestCreateBaselineMatrix, _name,
             _make_baseline_test(_target, _case),
         )
+
+
+# ----------------------------------------------------------------------
+# Phase 8c: instar-vs-qemu-img cross-validation via instar info
+# ----------------------------------------------------------------------
+#
+# Curated subset of CREATE_CASES chosen to avoid the known writer
+# divergences. Each test creates the same image twice — once with
+# `instar create`, once with the system `qemu-img create` — then runs
+# `instar info --output=json` on both and asserts the normalised dicts
+# match. Validates the master-plan contract that "instar create |
+# instar info ≡ qemu-img create | instar info" (modulo the divergence
+# whitelist) on the live system qemu-img rather than against frozen
+# baselines.
+CROSS_VALIDATION_CASES = [
+    ('qcow2', ('1M-default',          '1M', [])),
+    ('qcow2', ('1G-default',          '1G', [])),
+    ('qcow2', ('1G-cs-64k',           '1G', ['cluster_size=64k'])),
+    ('qcow2', ('1G-extended-l2',      '1G', ['extended_l2=on,cluster_size=64k'])),
+    ('qcow2', ('1G-lazy-refcounts',   '1G', ['lazy_refcounts=on'])),
+    ('vmdk',  ('1M-default',          '1M', [])),
+    ('vmdk',  ('1G-default',          '1G', [])),
+    ('vmdk',  ('1G-stream-optimized', '1G', ['subformat=streamOptimized'])),
+    ('vhdx',  ('1G-block-16M',        '1G', ['block_size=16M'])),
+    ('vhdx',  ('1G-block-32M',        '1G', ['block_size=32M'])),
+    ('raw',   ('1M-default',          '1M', [])),
+    ('raw',   ('1G-default',          '1G', [])),
+]
+
+
+class TestCreateCrossValidation(TestCreateSmoke):
+    """Runtime cross-validation against the system qemu-img.
+
+    Compares `instar create | instar info` to `qemu-img create | instar
+    info` on the live system qemu-img — no baseline lookup. Catches
+    writer divergences that surface against the *currently installed*
+    qemu-img version rather than the frozen phase-7 matrix. Independent
+    of the testdata repo.
+
+    The same KNOWN_WRITER_DIVERGENCES set applies: if instar's writer
+    deliberately picks a different layout from qemu's, this surface
+    will also fail. Skip via the dict; do not extend it to silence new
+    failures.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        try:
+            r = subprocess.run(['qemu-img', '--version'],
+                               capture_output=True, text=True)
+            cls._system_qemu_available = (r.returncode == 0)
+        except FileNotFoundError:
+            cls._system_qemu_available = False
+
+    def _run_qemu_create(self, target, size_str, options_list, out_path,
+                         timeout=60):
+        """Invoke the system qemu-img create. Returns (stdout, stderr, rc)."""
+        qemu_target = 'vpc' if target == 'vhd' else target
+        cmd = ['qemu-img', 'create', '-f', qemu_target]
+        for opt in options_list:
+            cmd.extend(['-o', opt])
+        cmd.extend([str(out_path), size_str])
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=timeout)
+            return r.stdout, r.stderr, r.returncode
+        except subprocess.TimeoutExpired:
+            return '', f'qemu-img create timeout after {timeout}s', -1
+
+
+def _make_xval_test(target, case):
+    case_name, size_str, options_list = case
+
+    def test(self):
+        if not getattr(type(self), '_system_qemu_available', False):
+            self.skipTest('system qemu-img not available')
+        known = KNOWN_WRITER_DIVERGENCES.get((target, case_name))
+        if known is not None:
+            self.skipTest(f'known writer divergence: {known}')
+
+        ext = {'qcow2': 'qcow2', 'vmdk': 'vmdk', 'vhd': 'vhd',
+               'vhdx': 'vhdx', 'raw': 'raw'}[target]
+        with tempfile.TemporaryDirectory() as td_a, \
+                tempfile.TemporaryDirectory() as td_b:
+            inst_path = Path(td_a) / f'instar.{ext}'
+            qemu_path = Path(td_b) / f'qemu.{ext}'
+
+            inst_args = ['-f', _instar_target_name(target)]
+            for opt in options_list:
+                inst_args.extend(['-o', opt])
+            inst_args.extend([str(inst_path), size_str])
+            _, stderr, rc = self.run_instar_create(*inst_args)
+            self.assertEqual(
+                rc, 0,
+                f'instar create failed for {target}/{case_name}: '
+                f'stderr={stderr}',
+            )
+
+            _, q_stderr, q_rc = self._run_qemu_create(
+                target, size_str, options_list, qemu_path)
+            if q_rc != 0:
+                self.skipTest(
+                    f'qemu-img rejected case (rc={q_rc}): '
+                    f'{q_stderr.strip()}'
+                )
+
+            inst_info, inst_err, inst_rc = self.run_instar_info(
+                inst_path, output='json')
+            self.assertEqual(
+                inst_rc, 0,
+                f'instar info on instar output failed: {inst_err}',
+            )
+            qemu_info, qemu_err, qemu_rc = self.run_instar_info(
+                qemu_path, output='json')
+            self.assertEqual(
+                qemu_rc, 0,
+                f'instar info on qemu output failed: {qemu_err}',
+            )
+
+            assert_info_equivalent(
+                self, inst_info, qemu_info, target,
+                tmp_path=str(inst_path),
+                expected_tmp_path=str(qemu_path),
+                msg=(f'cross-validation {target}/{case_name}: '
+                     f'instar={inst_path}, qemu={qemu_path}'),
+            )
+
+    test.__name__ = (
+        f'test_xval_{target}_{case_name.replace("-", "_")}'
+    )
+    test.__doc__ = (
+        f'instar create vs qemu-img create for -f {target} '
+        f'{" ".join(options_list)} {size_str} agree via instar info.'
+    )
+    return test
+
+
+for _target, _case in CROSS_VALIDATION_CASES:
+    _name = f'test_xval_{_target}_{_case[0].replace("-", "_")}'
+    setattr(TestCreateCrossValidation, _name,
+            _make_xval_test(_target, _case))

@@ -124,7 +124,8 @@ def normalise_info_json(obj, target, tmp_path=None):
 
 
 def assert_info_equivalent(test_case, actual_json_str, expected_json_str,
-                           target, tmp_path=None, msg=''):
+                           target, tmp_path=None, expected_tmp_path=None,
+                           msg=''):
     """assertEqual on the normalised forms of two qemu-img-info-shape
     JSON strings.
 
@@ -132,19 +133,25 @@ def assert_info_equivalent(test_case, actual_json_str, expected_json_str,
         test_case: the testtools/unittest TestCase instance (for
             assertEqual and the readable diff).
         actual_json_str: JSON output from the produced file.
-        expected_json_str: JSON output from the baseline (already
-            has `$FILENAME` in place of any path).
+        expected_json_str: JSON output from the baseline or a second
+            live invocation.
         target: target format ('qcow2' / 'vmdk' / 'vhd' / 'vpc' /
             'vhdx' / 'raw').
         tmp_path: absolute path to substitute in `actual_json_str`.
             Pass None if the actual side already has `$FILENAME`.
+        expected_tmp_path: absolute path to substitute in
+            `expected_json_str`. Pass None if the expected side
+            already has `$FILENAME` (the baseline-comparison case);
+            pass the qemu-img tmp file path when both sides are
+            live (cross-validation case).
         msg: extra context prepended to the diff on failure.
     """
     actual_obj = json.loads(actual_json_str)
     expected_obj = json.loads(expected_json_str)
 
     actual_norm = normalise_info_json(actual_obj, target, tmp_path=tmp_path)
-    expected_norm = normalise_info_json(expected_obj, target, tmp_path=None)
+    expected_norm = normalise_info_json(
+        expected_obj, target, tmp_path=expected_tmp_path)
 
     if actual_norm != expected_norm:
         diff_msg = (
