@@ -142,7 +142,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `vhd::VhdFooter`, `vhdx::VhdxHeader`). Picked up
   automatically by the nightly coverage-fuzz workflow
   (16 targets total now). Smoke run reaches ~700 coverage
-  edges in 60 seconds with no crashes.
+  edges in 60 seconds with no crashes. Adding the
+  dependency surfaced a latent gap in the fuzz crate's
+  mock CallTable: the `send_create_result` field that phase
+  2 of create added to `shared::CallTable` was missing
+  because no prior fuzz target had pulled in the create
+  crate transitively. Filled in alongside the new harness.
   ([phase 9](docs/plans/PLAN-create-phase-09-fuzz-coverage.md))
 
 - **Integration test matrix for `instar create`.** Three new

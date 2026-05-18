@@ -838,7 +838,8 @@ After a sub-agent completes, the management session verifies:
 
 ### Success criteria
 
-The plan is complete when:
+Status: **Complete** (all 11 phases shipped on the `create`
+branch). The plan was complete when:
 
 * All 11 phases complete and committed on the `create`
   branch.
@@ -915,10 +916,66 @@ The plan is complete when:
   writing to `FILENAME.tmp` and `rename()` on guest
   success. Match qemu-img (which does *not* do this) for
   v1, revisit if users complain.
+* **VHD CHS-geometry `virtual_size` round-trip.** qemu-img
+  rounds the user's requested virtual_size up to the next
+  CHS-aligned multiple; instar emits exact bytes. Closes
+  every `vhd` entry in
+  `tests/test_create.py::KNOWN_WRITER_DIVERGENCES`.
+* **qcow2 `refcount_bits` parameterisation.** The writer
+  hardcodes `refcount_order=4` (=> 16-bit refcount entries
+  on disk) regardless of `-o refcount_bits=...`. Driving
+  the L1/L2/refcount math off the user's choice closes
+  three `KNOWN_WRITER_DIVERGENCES` entries plus the
+  `1G-rb-64` `KNOWN_CHECK_FAILURES` entry.
+* **qcow2 `compat=0.10` honouring.** Writer hardcodes
+  `compat=1.1`. qemu-img emits both depending on the user's
+  option.
+* **zstd-aware qcow2 create.** Currently accept-ignored;
+  emit the zstd `incompatible_features` bit so subsequent
+  writes can land zstd-compressed clusters.
+* **vhdx default `block_size` matching qemu's 32 MiB** at
+  virtual sizes ≤ 1 GiB. Closes the three
+  `KNOWN_WRITER_DIVERGENCES` entries for vhdx defaults.
+* **`detect-profiles.py` collision fix in `instar-testdata`.**
+  Phase 7's flat-copy logic at
+  `copy_multi_bucket_version_to_profile()` assumes case
+  names encode the target, but for create-info-json
+  `1M-default`, `64M-default`, and `1G-default` collide
+  across qcow2 / vmdk / vhd / vhdx / raw. Phase 8 sidesteps
+  by reading the raw per-target bucket directly; the fix
+  (target-prefix the destination filename, or prefix case
+  names at generation time for symmetry with measure) is
+  queued for the next testdata regeneration in
+  `instar-testdata`.
 
 ### Bugs fixed during this work
 
-(To be filled in as work progresses.)
+* **Phase 6c — host-side `flags` assembly didn't set the
+  preallocation bits.** Phase 6b added the
+  `CreateConfig::preallocation()` decoder for the guest
+  side but the host's flag-pack code never set bits 4–5.
+  The validator gate prevented non-`Off` from reaching the
+  guest anyway, so the gap was latent until 6c lifted the
+  validator. Fixed as part of 6c.
+* **Phase 9a — fuzz crate's mock `CallTable` was missing
+  `send_create_result`.** Phase 2 of create added the
+  field to `shared::CallTable`, but no pre-9 fuzz target
+  pulled in the create crate transitively, so the gap was
+  latent. Surfaced when phase 9a introduced the new
+  dependency; added the field plus a no-op mock function
+  pointer.
+* **Phase 9b — re-parse round-trip assertion was too
+  strict.** The libFuzzer harness's strict
+  `parsed_virtual_size == requested_virtual_size`
+  assertion fired on the first non-grain-aligned input
+  (16 813 824 bytes for a vmdk with default 64 KiB grain),
+  which the planner correctly rounded up to the next grain
+  boundary (16 842 752). Documented behaviour, not a bug.
+  Relaxed the assertion to
+  `parsed >= requested && parsed - requested < 512 MiB`
+  in 9b. Loose enough to absorb any format's alignment
+  rounding, tight enough that endianness / offset bugs
+  still surface as orders-of-magnitude mismatches.
 
 ### Documentation index maintenance
 
