@@ -152,6 +152,16 @@ const CREATE_CONFIG_FLAG_LAZY_REFCOUNTS: u32 = 1 << 1;
 const CREATE_CONFIG_FLAG_COMPAT_V3: u32 = 1 << 2;
 #[allow(dead_code)]
 const CREATE_CONFIG_FLAG_BACKING_UNSAFE: u32 = 1 << 3;
+// Preallocation mode lives at bits 4-5 of CreateConfig.flags, mirroring
+// MeasureConfig. Decoded back into the Preallocation enum by the guest.
+#[allow(dead_code)]
+const CREATE_CONFIG_PREALLOC_OFF: u32 = 0 << 4;
+#[allow(dead_code)]
+const CREATE_CONFIG_PREALLOC_METADATA: u32 = 1 << 4;
+#[allow(dead_code)]
+const CREATE_CONFIG_PREALLOC_FALLOC: u32 = 2 << 4;
+#[allow(dead_code)]
+const CREATE_CONFIG_PREALLOC_FULL: u32 = 3 << 4;
 const CREATE_CONFIG_MAX_BACKING_FILE: usize = 1024;
 
 // CreateResult constants (must match shared crate)
@@ -6793,6 +6803,12 @@ fn run_create_nonraw(args: &CreateArgs, verbose: bool) -> Result<(), Box<dyn std
     if args.backing_unsafe {
         flags |= CREATE_CONFIG_FLAG_BACKING_UNSAFE;
     }
+    flags |= match args.preallocation.as_str() {
+        "metadata" => CREATE_CONFIG_PREALLOC_METADATA,
+        "falloc" => CREATE_CONFIG_PREALLOC_FALLOC,
+        "full" => CREATE_CONFIG_PREALLOC_FULL,
+        _ => CREATE_CONFIG_PREALLOC_OFF,
+    };
 
     let vmdk_subformat: u8 = match args.subformat.as_str() {
         "streamOptimized" => 1,
@@ -6967,6 +6983,47 @@ fn run_create_nonraw(args: &CreateArgs, verbose: bool) -> Result<(), Box<dyn std
                 )
                 .into());
             }
+
+            // For qcow2 + falloc/full, apply the host-side post-pass
+            // on the data region the guest just framed with metadata.
+            // The guest laid out the file as
+            //     header | L1 | refcount | L2 | data
+            // so the data region runs from
+            //     data_offset = file_size_after - data_len
+            // where data_len is the virtual size rounded up to the
+            // cluster boundary.
+            if args.target_format == "qcow2"
+                && matches!(args.preallocation.as_str(), "falloc" | "full")
+            {
+                let cluster = cluster_size.max(1) as u64;
+                let data_len = create_result
+                    .resolved_virtual_size
+                    .div_ceil(cluster)
+                    .saturating_mul(cluster);
+                let data_offset = create_result.file_size_after.saturating_sub(data_len);
+                if let Err(e) = (|| -> Result<(), Box<dyn std::error::Error>> {
+                    let postpass_file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(output_path)
+                        .map_err(|e| {
+                        format!("create: reopen for preallocation failed: {}", e)
+                    })?;
+                    apply_preallocation(
+                        &postpass_file,
+                        &args.preallocation,
+                        data_offset,
+                        data_len,
+                    )?;
+                    postpass_file
+                        .sync_all()
+                        .map_err(|e| format!("create: sync after preallocation failed: {}", e))?;
+                    Ok(())
+                })() {
+                    let _ = std::fs::remove_file(output_path);
+                    return Err(e);
+                }
+            }
+
             if !args.quiet {
                 render_create_success(
                     args,
@@ -7393,7 +7450,6 @@ fn run_create_raw(args: &CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let size_str = args.size.as_ref().ok_or("create: -f raw requires SIZE")?;
     let virtual_size = parse_memory_size(size_str)?;
-    let preallocate = args.preallocation == "falloc";
 
     let path = Path::new(&args.filename);
     let file = std::fs::OpenOptions::new()
@@ -7405,7 +7461,7 @@ fn run_create_raw(args: &CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
         .open(path)
         .map_err(|e| format!("create: open '{}' failed: {}", args.filename, e))?;
 
-    if let Err(e) = create_raw_finalize(&file, virtual_size, preallocate) {
+    if let Err(e) = create_raw_finalize(&file, virtual_size, &args.preallocation) {
         drop(file);
         let _ = std::fs::remove_file(path);
         return Err(e);
@@ -7418,34 +7474,149 @@ fn run_create_raw(args: &CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Apply ftruncate + (optional) posix_fallocate and fsync. Split
-/// out so `run_create_raw` can handle cleanup uniformly on any
-/// failure.
+/// Apply ftruncate + optional preallocation pass + fsync. Split out
+/// so `run_create_raw` can handle cleanup uniformly on any failure.
+///
+/// `preallocation` may be "off", "falloc", or "full". "metadata" is
+/// rejected for raw at the validator (raw has no metadata to
+/// preallocate); any other value is a no-op fallthrough handled the
+/// same as "off".
 fn create_raw_finalize(
     file: &std::fs::File,
     virtual_size: u64,
-    preallocate: bool,
+    preallocation: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::fd::AsRawFd;
+
     file.set_len(virtual_size)
         .map_err(|e| format!("create: ftruncate failed: {}", e))?;
 
-    if preallocate {
-        use std::os::fd::AsRawFd;
-        let fd = file.as_raw_fd();
-        // posix_fallocate returns 0 on success, errno on failure
-        // (does not set errno; the return value IS the errno).
-        let rc = unsafe { libc::posix_fallocate(fd, 0, virtual_size as libc::off_t) };
-        if rc != 0 {
-            return Err(format!(
-                "create: posix_fallocate failed: {}",
-                std::io::Error::from_raw_os_error(rc)
-            )
-            .into());
+    let fd = file.as_raw_fd();
+    match preallocation {
+        "falloc" => {
+            // posix_fallocate returns 0 on success, errno on failure
+            // (does not set errno; the return value IS the errno).
+            let rc = unsafe { libc::posix_fallocate(fd, 0, virtual_size as libc::off_t) };
+            if rc != 0 {
+                return Err(format!(
+                    "create: posix_fallocate failed: {}",
+                    std::io::Error::from_raw_os_error(rc)
+                )
+                .into());
+            }
         }
+        "full" => {
+            fill_zeros(fd, 0, virtual_size)
+                .map_err(|e| format!("create: zero-fill failed: {}", e))?;
+        }
+        _ => {}
     }
 
     file.sync_all()
         .map_err(|e| format!("create: sync failed: {}", e))?;
+    Ok(())
+}
+
+/// Zero a byte range in `fd` from `offset` for `length` bytes.
+///
+/// Tries `fallocate(FALLOC_FL_ZERO_RANGE)` first (fast on btrfs /
+/// ext4 / xfs — no actual writes). On `EOPNOTSUPP` (or kernels /
+/// filesystems that don't support it: tmpfs, NFS, some FUSE),
+/// falls back to a `pwrite` loop with a 64 KiB stack-allocated
+/// zero buffer.
+fn fill_zeros(fd: libc::c_int, offset: u64, length: u64) -> std::io::Result<()> {
+    if length == 0 {
+        return Ok(());
+    }
+
+    let rc = unsafe {
+        libc::fallocate(
+            fd,
+            libc::FALLOC_FL_ZERO_RANGE,
+            offset as libc::off_t,
+            length as libc::off_t,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) | Some(libc::EINVAL) => {
+            // FALLOC_FL_ZERO_RANGE may surface as EINVAL on some
+            // older kernels; fall through to the write loop.
+        }
+        _ => return Err(err),
+    }
+
+    let zeros = [0u8; 65536];
+    let mut written: u64 = 0;
+    while written < length {
+        let remaining = length - written;
+        let chunk = remaining.min(zeros.len() as u64) as usize;
+        let rc = unsafe {
+            libc::pwrite(
+                fd,
+                zeros.as_ptr() as *const libc::c_void,
+                chunk,
+                (offset + written) as libc::off_t,
+            )
+        };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if rc == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "pwrite returned 0 during zero-fill",
+            ));
+        }
+        written += rc as u64;
+    }
+    Ok(())
+}
+
+/// Apply the host-side portion of qcow2 preallocation, layered on
+/// top of the metadata the guest already emitted.
+///
+/// - `off` / `metadata`: no-op (guest did all the work).
+/// - `falloc`: `posix_fallocate` over the data region.
+/// - `full`: zero-fill (via `fallocate(FALLOC_FL_ZERO_RANGE)`,
+///   falling back to a `pwrite` loop).
+///
+/// Unknown modes are treated as no-ops; the validator rejects them
+/// before reaching this function.
+fn apply_preallocation(
+    file: &std::fs::File,
+    mode: &str,
+    data_offset: u64,
+    data_len: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::fd::AsRawFd;
+
+    if data_len == 0 {
+        return Ok(());
+    }
+    let fd = file.as_raw_fd();
+    match mode {
+        "falloc" => {
+            let rc = unsafe {
+                libc::posix_fallocate(fd, data_offset as libc::off_t, data_len as libc::off_t)
+            };
+            if rc != 0 {
+                return Err(format!(
+                    "create: posix_fallocate failed: {}",
+                    std::io::Error::from_raw_os_error(rc)
+                )
+                .into());
+            }
+        }
+        "full" => {
+            fill_zeros(fd, data_offset, data_len)
+                .map_err(|e| format!("create: zero-fill failed: {}", e))?;
+        }
+        _ => {}
+    }
     Ok(())
 }
 
