@@ -597,7 +597,7 @@ For each iteration it:
    cluster size, compression, and data patterns).
 2. Creates separate copies for instar and qemu-img.
 3. Runs a random chain of 2-4 operations (info, check, convert, compressed
-   convert, measure) against both tools.
+   convert, measure, create) against both tools.
 4. Compares outputs: exit codes, JSON info output (after normalisation to
    remove known-divergent fields like disk size), and converted file content
    (via SHA-256 of raw-flattened output).
@@ -616,6 +616,21 @@ the convert writer's per-block sector alignment slack
 Known quirks (see `docs/quirks.md`) are excluded from comparison: non-QCOW2
 formats for `check` (qemu-img only checks QCOW2), disk size fields, and
 format-specific metadata.
+
+The `create` operation has its own dual oracle: it creates the same
+image via `instar create` and the system `qemu-img create` into
+separate tmp paths, then reads both back via `qemu-img info
+--output=json` and compares the normalised JSON dicts (same
+divergence-whitelist filter the phase 8b integration tests use,
+inlined from `tests/helpers/info_json.py`). The random
+`(target, options, size)` picker biases away from phase 8b's
+documented writer-divergence list — vhd target excluded (CHS
+rounding), qcow2 refcount_bits pinned to 16, qcow2 compat pinned
+to 1.1, compression_type=zstd never set, vhdx block_size always
+explicit. Combinations the curated test matrix doesn't exercise
+(random cluster sizes, lazy_refcounts on/off, every preallocation
+mode, every vmdk subformat) get coverage here without spurious
+findings from the known gaps.
 
 ### libyal Cross-Validation
 

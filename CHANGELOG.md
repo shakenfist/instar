@@ -63,7 +63,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   [phase 6](docs/plans/PLAN-create-phase-06-preallocation.md) ·
   [phase 7](docs/plans/PLAN-create-phase-07-baselines.md) ·
   [phase 8](docs/plans/PLAN-create-phase-08-integration-tests.md) ·
-  [phase 9](docs/plans/PLAN-create-phase-09-fuzz-coverage.md))
+  [phase 9](docs/plans/PLAN-create-phase-09-fuzz-coverage.md) ·
+  [phase 10](docs/plans/PLAN-create-phase-10-fuzz-differential.md))
   Preallocation for vmdk / vpc / vhdx (each format needs its
   own BAT-population pattern plus a host post-pass — analogous
   to qcow2 metadata mode), multi-file VMDK subformats
@@ -111,6 +112,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and `scripts/detect-profiles.py` learn a new `create` command
   + `create-info-json` output type.
   ([phase 7](docs/plans/PLAN-create-phase-07-baselines.md))
+
+- **Differential fuzzer exercises `instar create`.**
+  `scripts/differential-fuzz.py` adds `'create'` to its
+  random operation list. Each picked iteration creates the
+  same image via `instar create` and the system
+  `qemu-img create` into separate tmp paths, reads both
+  back via `qemu-img info --output=json`, and asserts
+  normalised dict equality through the same divergence
+  whitelist phase 8b's integration tests use (inlined into
+  the fuzzer with a "keep in sync" comment). The random
+  `(target, options, size)` picker is biased away from
+  phase 8b's documented writer-divergence list so a finding
+  surfaced by this surface is a real bug rather than a
+  known limitation. Picked up by the existing
+  differential-fuzz workflow without configuration changes.
+  ([phase 10](docs/plans/PLAN-create-phase-10-fuzz-differential.md))
 
 - **Coverage-guided fuzz target for `instar create` emitters**
   (`src/fuzz/fuzz_targets/fuzz_create_emitters.rs`). Decodes
