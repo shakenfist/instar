@@ -27,7 +27,11 @@ Initial target formats:
 
 **Initial implementation** - The `info` prototype has been promoted to the main
 instar implementation in `src/`. Operations include `info`, `copy`, `check`,
-`compare`, `convert`, and `measure`. Prototypes remain available for reference.
+`compare`, `convert`, `measure`, and `create`. Prototypes remain available
+for reference.
+
+See [docs/measure.md](docs/measure.md) and [docs/create.md](docs/create.md)
+for the per-subcommand user guides.
 
 ## Installation
 

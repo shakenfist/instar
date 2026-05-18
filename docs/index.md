@@ -44,6 +44,7 @@ Features unique to instar that do not exist in qemu-img.
 | [Chain Discovery](chain-discovery.md) | `instar info --chain` - secure backing chain discovery |
 | [Chain Config Protocol](chain-config.md) | Chain config structure layout and VMM-to-guest data flow |
 | [Measure](measure.md) | `instar measure` - predict file size for a target format |
+| [Create](create.md) | `instar create` - create a new empty disk image |
 
 ## Compatibility
 
