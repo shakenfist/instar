@@ -558,7 +558,7 @@ currently have any, so this set may stay empty.
 | 3. Host VMM subcommand + clap surface | [PLAN-create-phase-03-host-cli.md](PLAN-create-phase-03-host-cli.md) | Complete |
 | 4. `-o` option parsing for create | [PLAN-create-phase-04-target-options.md](PLAN-create-phase-04-target-options.md) | Complete |
 | 5. Backing-file support (`-b` / `-F` / `-u`) | [PLAN-create-phase-05-backing-file.md](PLAN-create-phase-05-backing-file.md) | Complete |
-| 6. Preallocation modes (`off`/`metadata`/`falloc`/`full`) | [PLAN-create-phase-06-preallocation.md](PLAN-create-phase-06-preallocation.md) | Not started |
+| 6. Preallocation modes (`off`/`metadata`/`falloc`/`full`) | [PLAN-create-phase-06-preallocation.md](PLAN-create-phase-06-preallocation.md) | Complete |
 | 7. Cross-version baseline generation in `instar-testdata` | PLAN-create-phase-07-baselines.md (not yet written) | Not started |
 | 8. Integration tests (`tests/test_create.py`) | PLAN-create-phase-08-integration-tests.md (not yet written) | Not started |
 | 9. Coverage-guided fuzz harnesses for the emitters | PLAN-create-phase-09-fuzz-coverage.md (not yet written) | Not started |
@@ -894,8 +894,14 @@ The plan is complete when:
 * **vhdx fixed subformat.** qemu-img does not produce
   this; instar's vhdx writer in convert is dynamic-only.
   Add if a user requests it.
-* **`preallocation=metadata` for vhdx.** v1 implements
-  metadata-mode for qcow2 only.
+* **Preallocation for vmdk / vpc / vhdx.** Phase 6 implements
+  `metadata` / `falloc` / `full` for qcow2 (plus `falloc` /
+  `full` for raw); non-qcow2 sparse formats reject non-`off`
+  preallocation with a "future work" pointer. Each format
+  needs its own BAT-population pattern up front plus the same
+  host `apply_preallocation` post-pass that qcow2 already
+  uses. Analogous to the qcow2 metadata-mode work in
+  [PLAN-create-phase-06-preallocation.md](PLAN-create-phase-06-preallocation.md).
 * **`compression_type=zstd` aware create.** qcow2 zstd is
   supported by convert; create should default-decline
   zstd compression in metadata clusters if the runtime

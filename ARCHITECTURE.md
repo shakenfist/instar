@@ -299,7 +299,30 @@ provides a modular architecture with:
   size extraction not implemented) and
   `ERROR_BACKING_SIZE_TOO_LARGE` (pre-flight ceiling check
   surfaces a clearer "try a larger cluster size" hint instead
-  of plan_*'s generic `InvalidVirtualSize`). The host enforces
+  of plan_*'s generic `InvalidVirtualSize`). Phase 6 added
+  preallocation modes for raw and qcow2: for qcow2,
+  `Preallocation::{Metadata,Falloc,Full}` (any non-Off mode)
+  extends the `qcow2::create::Qcow2Layout` to cover L2 tables
+  and a data region, populates L1 entries with L2 offsets
+  (each with `OFLAG_COPIED`), and marks every used cluster
+  (header + L1 + reftable + refblocks + L2 + data) refcount=1.
+  The L2 tables are emitted by the guest *outside* the
+  `MetadataPlan` (via a reusable single-cluster scratch slot)
+  because they can total far more than
+  `GUEST_CREATE_SCRATCH_LIMIT` (128 MiB at 1 TiB virtual with
+  64 KiB clusters); the plan's `minimum_file_size` carries
+  the total file size so the guest also writes a final
+  trailing zero sector to extend the file. `Falloc` and
+  `Full` lay out the same metadata as `Metadata`; the host's
+  `apply_preallocation` helper (`src/vmm/src/main.rs`) layers
+  `posix_fallocate` or a `fill_zeros` pass (tries
+  `fallocate(FALLOC_FL_ZERO_RANGE)` first, falls back to a
+  `pwrite` loop with a 64 KiB zero buffer) over the data
+  region. Raw also gains the same `full` zero-fill path via
+  `fill_zeros(fd, 0, virtual_size)`. Non-qcow2 sparse formats
+  (vmdk / vpc / vhdx) reject non-`off` preallocation with a
+  "future work" pointer — each format would need its own
+  BAT-population pattern. The host enforces
   `--sector-size=512` because the `crates/create` MetadataPlan
   entries are 512-byte aligned but not always to larger sector
   sizes — relaxing this needs a planner-side change to emit

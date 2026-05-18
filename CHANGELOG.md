@@ -30,9 +30,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `compat`, `refcount_bits`, `extended_l2`, `lazy_refcounts`,
   `compression_type`, `subformat`, `grain_size`, and
   `block_size`. Unknown keys, encrypted-create (`encrypt.*`),
-  external data files (`data_file*`), and deferred
-  preallocation modes (`metadata` / `full`) return clear
-  "deferred" errors with phase pointers. Output rendering:
+  and external data files (`data_file*`) return clear "deferred"
+  errors with phase pointers. Preallocation modes supported
+  (phase 6): `off` (any format, default), `metadata` (qcow2
+  only — guest populates L1/L2/refcount for the full virtual
+  range and frames the data region), `falloc` (raw or qcow2 —
+  host applies `posix_fallocate` over the data region on top
+  of metadata mode), `full` (raw or qcow2 — host fills the
+  data region with zeros via `fallocate(FALLOC_FL_ZERO_RANGE)`
+  with a `pwrite` fallback). Non-qcow2 sparse formats
+  (vmdk / vpc / vhdx) reject non-`off` preallocation with a
+  "future work" pointer. Output rendering:
   human one-liner (default), `--output=json`, or `-q` quiet.
   Backing-file polish (phase 5): backing virtual_size is now
   recovered correctly for vhdx parents via
@@ -51,18 +59,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   [phase 2](docs/plans/PLAN-create-phase-02-guest-op.md) ·
   [phase 3](docs/plans/PLAN-create-phase-03-host-cli.md) ·
   [phase 4](docs/plans/PLAN-create-phase-04-target-options.md) ·
-  [phase 5](docs/plans/PLAN-create-phase-05-backing-file.md))
+  [phase 5](docs/plans/PLAN-create-phase-05-backing-file.md) ·
+  [phase 6](docs/plans/PLAN-create-phase-06-preallocation.md))
 
   Deferred to later phases:
-  preallocation modes beyond `off` and raw's `falloc`
-  ([phase 6](docs/plans/PLAN-create.md)),
   comprehensive integration matrix and cross-version
   info-equivalence
   ([phase 8](docs/plans/PLAN-create.md)).
-  Multi-file VMDK subformats (`monolithicFlat`,
-  `twoGbMaxExtent*`), differencing VHD / VHDX as the *output*
-  target, and `--sector-size > 512` remain deferred to future
-  work (see PLAN-create.md's Future-work section).
+  Preallocation for vmdk / vpc / vhdx (each format needs its
+  own BAT-population pattern plus a host post-pass — analogous
+  to qcow2 metadata mode), multi-file VMDK subformats
+  (`monolithicFlat`, `twoGbMaxExtent*`), differencing VHD /
+  VHDX as the *output* target, and `--sector-size > 512`
+  remain deferred to future work (see PLAN-create.md's
+  Future-work section).
 
 - **New `instar measure` subcommand.** Predicts the file size
   required to convert an image (or a hypothetical `--size N`

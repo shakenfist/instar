@@ -66,12 +66,15 @@ vhdx (VHDX), luks (info + convert with decryption)
 - `measure`: predict file size required to convert an image to a target
   format. See [docs/measure.md](docs/measure.md) for the full reference.
 - `create`: create a new empty disk image of a given format and size.
-  Raw output is host-only (open + ftruncate + optional falloc); every
-  other format runs `crates/create` in the KVM sandbox and writes the
-  metadata via virtio. Supports backing files (`-b BACKING [-F FMT]`)
-  and the full qemu-img-style `-o KEY=VAL,...` option matrix
-  (`-o` wins over individual flags on conflict). Full preallocation
-  modes (metadata, full) land in phase 6.
+  Raw output is host-only (open + ftruncate + optional falloc / full
+  zero-fill); every other format runs `crates/create` in the KVM
+  sandbox and writes the metadata via virtio. Supports backing files
+  (`-b BACKING [-F FMT]`) and the full qemu-img-style
+  `-o KEY=VAL,...` option matrix (`-o` wins over individual flags
+  on conflict). Preallocation modes: `off` (any format),
+  `metadata` / `falloc` / `full` (qcow2; raw also accepts
+  `falloc` / `full`). Non-qcow2 sparse formats (vmdk / vpc / vhdx)
+  reject non-`off` preallocation with a "future work" pointer.
 
 ## Working on This Project
 
