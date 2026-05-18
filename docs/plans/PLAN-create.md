@@ -563,7 +563,7 @@ currently have any, so this set may stay empty.
 | 8. Integration tests (`tests/test_create.py`) | [PLAN-create-phase-08-integration-tests.md](PLAN-create-phase-08-integration-tests.md) | Complete |
 | 9. Coverage-guided fuzz harnesses for the emitters | [PLAN-create-phase-09-fuzz-coverage.md](PLAN-create-phase-09-fuzz-coverage.md) | Complete |
 | 10. Differential fuzzing extension | [PLAN-create-phase-10-fuzz-differential.md](PLAN-create-phase-10-fuzz-differential.md) | Complete |
-| 11. Documentation, CHANGELOG, follow-ups | PLAN-create-phase-11-docs.md (not yet written) | Not started |
+| 11. Documentation, CHANGELOG, follow-ups | [PLAN-create-phase-11-docs.md](PLAN-create-phase-11-docs.md) | Complete |
 
 ### Phase notes (not yet detailed plans)
 

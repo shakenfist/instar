@@ -529,7 +529,7 @@ instar/
 │   │   ├── vhdx/   # VHDX headers, region table, metadata, BAT, CRC-32C
 │   │   ├── vmdk/   # VMDK4 header and descriptor parsing
 │   │   └── luks/   # LUKS header parsing, KDF, AFsplitter, decryption
-│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert)
+│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, measure, create)
 │   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates
 │   └── guest-protocol/ # Protocol Buffers messaging for guests
