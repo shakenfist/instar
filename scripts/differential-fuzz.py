@@ -950,12 +950,21 @@ def _create_option_picker(rng):
         options = []
         cs = rng.choice(QCOW2_CLUSTER_SIZES)
         options.append(f'cluster_size={cs}')
-        if rng.random() < 0.3 and cs >= 16384:
+        extended_l2 = rng.random() < 0.3 and cs >= 16384
+        if extended_l2:
             # extended_l2 requires cluster_size >= 16 KiB.
             options.append('extended_l2=on')
         if rng.random() < 0.3:
             options.append('lazy_refcounts=on')
-        prealloc = rng.choice([None, 'metadata', 'falloc', 'full'])
+        # qcow2 compute_layout in crates/qcow2::create rejects
+        # extended_l2 + non-Off preallocation with
+        # PreallocationUnsupported (deferred to a future phase). Mirror
+        # that constraint in the picker so the differential fuzzer
+        # doesn't flag a documented gap as a divergence.
+        if extended_l2:
+            prealloc = None
+        else:
+            prealloc = rng.choice([None, 'metadata', 'falloc', 'full'])
         if prealloc is not None:
             options.append(f'preallocation={prealloc}')
             if prealloc in ('falloc', 'full'):
