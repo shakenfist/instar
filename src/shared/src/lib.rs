@@ -2605,6 +2605,34 @@ mod tests {
     }
 
     #[test]
+    fn create_config_layout_matches_host_writes() {
+        // The host in src/vmm/src/main.rs::run_create_guest writes
+        // CreateConfig fields at hardcoded byte offsets via
+        // guest_mem.write_obj. The guest reads the struct via a
+        // typed reference cast over OPERATION_CONFIG_ADDR, which
+        // relies on the #[repr(C)] layout matching those offsets
+        // exactly. This test catches any silent padding shift from
+        // a future field reorder. PR #298 review item #7.
+        use core::mem::offset_of;
+        assert_eq!(offset_of!(CreateConfig, magic), 0);
+        assert_eq!(offset_of!(CreateConfig, target_format), 4);
+        assert_eq!(offset_of!(CreateConfig, flags), 8);
+        assert_eq!(offset_of!(CreateConfig, sector_size), 12);
+        assert_eq!(offset_of!(CreateConfig, virtual_size), 16);
+        assert_eq!(offset_of!(CreateConfig, qcow2_cluster_size), 24);
+        assert_eq!(offset_of!(CreateConfig, qcow2_refcount_bits), 28);
+        assert_eq!(offset_of!(CreateConfig, vmdk_subformat), 29);
+        assert_eq!(offset_of!(CreateConfig, vhd_subformat), 30);
+        assert_eq!(offset_of!(CreateConfig, _pad), 31);
+        assert_eq!(offset_of!(CreateConfig, vmdk_grain_size), 32);
+        assert_eq!(offset_of!(CreateConfig, block_size), 36);
+        assert_eq!(offset_of!(CreateConfig, backing_file_len), 40);
+        assert_eq!(offset_of!(CreateConfig, backing_file), 44);
+        assert_eq!(offset_of!(CreateConfig, backing_format), 1068);
+        assert_eq!(offset_of!(CreateConfig, _reserved), 1072);
+    }
+
+    #[test]
     fn create_result_magic_uniqueness() {
         assert_ne!(CreateResult::MAGIC, InfoResult::MAGIC);
         assert_ne!(CreateResult::MAGIC, CheckResult::MAGIC);

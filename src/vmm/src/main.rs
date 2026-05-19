@@ -6893,14 +6893,21 @@ fn run_create_nonraw(args: &CreateArgs, verbose: bool) -> Result<(), Box<dyn std
                 .join(typed_backing)
         };
 
+        // Single metadata() call serves both the is_file check (when
+        // -u is absent) and the backing-size capture. Previously two
+        // separate stats; deduped per PR #298 review item #4. Note
+        // that this still has a small TOCTOU window vs the subsequent
+        // BackingStore::open — eliminating that would require a
+        // BackingStore::is_regular_file() helper that fstats the
+        // opened fd. Tracked as a follow-up in PLAN-create.md.
+        let backing_md_opt = std::fs::metadata(&resolved).ok();
         if !args.backing_unsafe {
-            let md = std::fs::metadata(&resolved).map_err(|e| {
+            let md = backing_md_opt.as_ref().ok_or_else(|| {
                 format!(
-                    "create: backing file '{}' (resolved to '{}') not accessible: {} \
+                    "create: backing file '{}' (resolved to '{}') not accessible \
                      (pass -u to skip this check)",
                     typed_backing,
                     resolved.display(),
-                    e
                 )
             })?;
             if !md.is_file() {
@@ -6911,8 +6918,7 @@ fn run_create_nonraw(args: &CreateArgs, verbose: bool) -> Result<(), Box<dyn std
                 .into());
             }
         }
-
-        let backing_md_size = std::fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
+        let backing_md_size = backing_md_opt.as_ref().map(|m| m.len()).unwrap_or(0);
         let real_backing = BackingStore::open(&resolved, true, None, false).map_err(|e| {
             format!(
                 "create: open backing '{}' failed: {}",
@@ -7063,6 +7069,22 @@ fn run_create_nonraw(args: &CreateArgs, verbose: bool) -> Result<(), Box<dyn std
                             "create: preallocation range [{}, {}) exceeds \
                              observed file size {}; refusing",
                             data_offset, range_end, observed_file_size
+                        )
+                        .into());
+                    }
+                    // Defence-in-depth (PR #298 review item #11): a
+                    // qcow2 image always has at least one cluster of
+                    // metadata at offset 0 (the header). If the guest
+                    // emitted a short file the saturating_sub above
+                    // could land data_offset at 0, and the post-pass
+                    // would clobber the header. Require at least one
+                    // cluster of headroom before the data region.
+                    if data_offset < cluster {
+                        return Err(format!(
+                            "create: preallocation data_offset ({}) below \
+                             minimum metadata footprint ({}); the guest may have \
+                             emitted a short file. Refusing to preallocate.",
+                            data_offset, cluster
                         )
                         .into());
                     }

@@ -526,9 +526,14 @@ pub fn plan_vmdk<'a>(
     let capacity_bytes = opts.virtual_size.div_ceil(grain_size_bytes) * grain_size_bytes;
     let capacity_sectors = capacity_bytes / SECTOR;
 
-    // GD entries cover the full virtual size.
+    // GD entries cover the full virtual size. The GD is a flat u32 array
+    // in the on-disk header, so the entry count must fit in u32; reject
+    // pathological virtual_size values rather than silently truncating
+    // (which would produce a smaller GD than the address space requires
+    // and corrupt the emitted image).
     let sectors_per_gt = gtes_per_gt as u64 * grain_size_sectors;
-    let num_gd_entries: u32 = capacity_sectors.div_ceil(sectors_per_gt) as u32;
+    let num_gd_entries: u32 = u32::try_from(capacity_sectors.div_ceil(sectors_per_gt))
+        .map_err(|_| CreateError::Overflow)?;
     let gd_bytes: usize = num_gd_entries as usize * 4;
     let gd_sectors: u64 = (gd_bytes as u64).div_ceil(SECTOR);
 
@@ -754,7 +759,12 @@ pub fn plan_vhd<'a>(
                 return Err(CreateError::InvalidBlockSize);
             }
             let block_size = opts.block_size as u64;
-            let max_table_entries: u32 = opts.virtual_size.div_ceil(block_size) as u32;
+            // BAT entries are u32-indexed in the on-disk dynamic header; a
+            // u64 → u32 truncation here would emit a smaller BAT than the
+            // virtual address space requires. Reject overflow with a
+            // clear error rather than silently corrupting the image.
+            let max_table_entries: u32 = u32::try_from(opts.virtual_size.div_ceil(block_size))
+                .map_err(|_| CreateError::Overflow)?;
             let bat_bytes: u64 = max_table_entries as u64 * 4;
             let bat_padded: u64 = bat_bytes.div_ceil(SECTOR) * SECTOR;
 

@@ -339,12 +339,59 @@ fn target_can_address(target: ImageFormat, virtual_size: u64, config: &CreateCon
             // and the parser cap.
             l1_entries <= qcow2::QCOW2_MAX_L1_SIZE_ENTRIES as u64
         }
-        // VMDK / VHD / VHDX: per-format ceilings are far above any
-        // practical virtual_size (vmdk's grain count is the dominant
-        // cap and the supported grain sizes leave petabytes of
-        // headroom). Accept and let the planner catch any pathological
-        // case.
-        ImageFormat::Vmdk4 | ImageFormat::Vhd | ImageFormat::Vhdx => true,
+        // VMDK: GD entry count must fit in u32. Each entry covers
+        // (GTES_PER_GT * grain_size) bytes of address space, so the
+        // ceiling is u32::MAX * GTES_PER_GT * grain_size. With the
+        // default grain (64 KiB) the cap is 16 EiB; with the minimum
+        // (4 KiB) it's 1 EiB. Either way well above any practical
+        // virtual_size, but we check anyway so a malicious backing
+        // image can't drive plan_vmdk into the Overflow path and
+        // produce a generic "InvalidVirtualSize" surface — we want
+        // the friendlier "backing too large for target" hint.
+        ImageFormat::Vmdk4 => {
+            let grain_size: u64 = if config.vmdk_grain_size == 0 {
+                65536
+            } else {
+                config.vmdk_grain_size as u64
+            };
+            let gtes_per_gt: u64 = vmdk::DEFAULT_NUM_GTES_PER_GT as u64;
+            let bytes_per_gd_entry = match grain_size.checked_mul(gtes_per_gt) {
+                Some(v) if v > 0 => v,
+                _ => return false,
+            };
+            let max_virtual = (u32::MAX as u64).checked_mul(bytes_per_gd_entry);
+            match max_virtual {
+                Some(cap) => virtual_size <= cap,
+                None => true, // Cap exceeds u64::MAX; any virtual_size fits.
+            }
+        }
+        // VHD dynamic: BAT entry count (u32) = virtual_size / block_size.
+        // Cap = u32::MAX * block_size. With the min block_size (512 KiB)
+        // the cap is 2 PiB; with the default (2 MiB) it's 8 PiB.
+        ImageFormat::Vhd => {
+            let block_size: u64 = if config.block_size == 0 {
+                2 * 1024 * 1024
+            } else {
+                config.block_size as u64
+            };
+            let max_virtual = (u32::MAX as u64).checked_mul(block_size);
+            match max_virtual {
+                Some(cap) => virtual_size <= cap,
+                None => true,
+            }
+        }
+        // VHDX: defer to the parser crate's authoritative computation.
+        // calculate_bat_layout returns None when either total_blocks or
+        // chunk_ratio overflows u32, which is precisely the ceiling we
+        // need to enforce.
+        ImageFormat::Vhdx => {
+            let block_size: u32 = if config.block_size == 0 {
+                32 * 1024 * 1024
+            } else {
+                config.block_size
+            };
+            vhdx::calculate_bat_layout(virtual_size, block_size, 512).is_some()
+        }
         // Any other target was already rejected by validate_create_args
         // / parse_create_o_options; treat as not addressable so we
         // surface a clear "unsupported format" error rather than

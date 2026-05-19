@@ -984,6 +984,29 @@ branch). The plan was complete when:
   citing the VHD / VHDX specs. The offsets are
   spec-mandated, but a one-line comment per assertion would
   keep the tests grep-friendly for future spec readers.
+* **Backing-file TOCTOU between `is_file` check and
+  `BackingStore::open`.** PR #298 review item #3. The host
+  currently `std::fs::metadata`s the resolved backing path
+  before `BackingStore::open` reopens it; a symlink swap in
+  between would let an attacker substitute a different
+  file. Practical risk is low (instar runs as the invoking
+  user), but defence-in-depth says we should fstat the
+  opened fd instead. Cleanest fix: add
+  `BackingStore::is_regular_file()` that calls
+  `file.metadata()?.file_type().is_file()` on the inner
+  `File` and drop the path-side check. Phase 11's audit
+  follow-up deduped the redundant second metadata call;
+  closing the TOCTOU window is the next layer.
+* **Factor the divergence-whitelist normaliser out of
+  `scripts/differential-fuzz.py`.** PR #298 review item
+  #9. The fuzzer currently inlines a near-copy of
+  `tests/helpers/info_json.py` with a "keep in sync"
+  comment. Cheap follow-up: factor into a shared module
+  under `scripts/lib/` (or `tests/helpers/`) and have both
+  call sites import it. Alternative: add a cross-check
+  test that imports both copies and asserts the whitelist
+  constants match — surfaces drift instead of preventing
+  it.
 
 ### Bugs fixed during this work
 

@@ -144,9 +144,62 @@ fn sweep_qcow2() {
     assert_eq!(parsed.backing_file_size as usize, b"backing.qcow2".len());
     cases += 1;
 
-    // cases counts: matrix-success + 1 (the trailing backing-file case).
+    // Preallocation::Metadata case (PR #298 review item #5).
+    // The matrix above only exercises Preallocation::Off; Metadata /
+    // Falloc / Full share the same metadata layout but populate L1
+    // and refcount differently and reserve space for the L2 region
+    // emitted by the guest (outside the plan). The minimum_file_size
+    // override (layout.total_file_size, not max write end) is what
+    // makes the host extend the file to cover the data region, so
+    // assert_plan_invariants's strict minimum_file_size == max_end
+    // rule doesn't apply here — verify the relaxed invariants inline.
+    let opts = Qcow2CreateOpts {
+        virtual_size: 1 << 26, // 64 MiB
+        cluster_size: 65536,
+        refcount_bits: 16,
+        extended_l2: false,
+        lazy_refcounts: false,
+        compat_v3: true,
+        backing: None,
+        preallocation: qcow2::create::Preallocation::Metadata,
+    };
+    let mut scratch = vec![0u8; QCOW2_MAX_METADATA_SCRATCH];
+    let plan = plan_qcow2(&opts, &mut scratch).expect("plan for metadata mode");
+    let sum: u64 = plan.writes().iter().map(|w| w.bytes.len() as u64).sum();
+    assert_eq!(
+        plan.total_metadata_bytes, sum,
+        "Preallocation::Metadata total_metadata_bytes"
+    );
+    let max_end: u64 = plan
+        .writes()
+        .iter()
+        .map(|w| w.byte_offset + w.bytes.len() as u64)
+        .max()
+        .unwrap_or(0);
+    assert!(
+        plan.minimum_file_size >= max_end,
+        "Preallocation::Metadata minimum_file_size {} should cover the \
+         max write end {}",
+        plan.minimum_file_size,
+        max_end
+    );
+    assert!(
+        plan.minimum_file_size >= 1 << 26,
+        "Preallocation::Metadata minimum_file_size {} should cover the \
+         64 MiB data region",
+        plan.minimum_file_size
+    );
+    // Re-parse the header (sector 0) — the writes for the header /
+    // L1 / refcount cluster all live within plan.writes(), so the
+    // materialise sized at minimum_file_size still captures them.
+    let bytes = materialise(&plan);
+    let parsed = qcow2::QcowHeader::parse(&bytes).expect("metadata mode parse");
+    assert_eq!(parsed.virtual_size, 1 << 26);
+    cases += 1;
+
+    // cases counts: matrix-success + 2 (trailing backing-file + Metadata cases).
     // skipped counts: matrix-skip (combinations beyond format limits).
-    assert_eq!(cases + skipped, sizes.len() * cluster_sizes.len() * 2 + 1);
+    assert_eq!(cases + skipped, sizes.len() * cluster_sizes.len() * 2 + 2);
     // We should have covered at least the realistic combinations.
     assert!(cases > 30, "sweep covered only {} cases", cases);
 }
