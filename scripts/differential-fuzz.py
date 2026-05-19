@@ -967,8 +967,17 @@ def _create_option_picker(rng):
             prealloc = rng.choice([None, 'metadata', 'falloc', 'full'])
         if prealloc is not None:
             options.append(f'preallocation={prealloc}')
-            if prealloc in ('falloc', 'full'):
-                # Real-block allocation modes: cap size for fuzz speed.
+            if prealloc in ('metadata', 'falloc', 'full'):
+                # All non-Off preallocation modes scale runtime with
+                # virtual_size / cluster_size. falloc/full write real
+                # blocks; metadata writes L1/L2 entries proportional
+                # to the cluster count and is slow under qemu-img at
+                # the minimum cluster_size (=512) — a 64 MiB image
+                # populates ~1 MiB of L2 tables and qemu-img times
+                # out at the fuzzer's 30s budget. Cap virtual_size
+                # at 1 MiB so the worst-case combination
+                # (cluster_size=512 + 1 MiB) is at most ~16 KiB of
+                # L2, which fits comfortably in the budget.
                 return target, '1M', options
         size = rng.choice(['1M', '16M', '64M'])
         return target, size, options
