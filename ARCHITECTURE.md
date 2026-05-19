@@ -269,6 +269,83 @@ provides a modular architecture with:
   SEEK_HOLE detection, qcow2/vhdx/vmdk overcounts on some real-world
   images, VHD CHS rounding) are skipped with documented reasons
   pending follow-up work.
+- **operations/create/** - Empty-image creation operation. Reads a
+  `CreateConfig` (target format, virtual size, per-format options,
+  optional backing reference) from `OPERATION_CONFIG_ADDR`, optionally
+  recovers the virtual size from a backing image's header on input
+  device 0, calls the matching `crates/create::plan_*` to build a
+  `MetadataPlan`, and writes every entry to the output device via
+  `write_output_sector`. Backing-file lookup supports raw, qcow2,
+  vmdk, vhd, and vhdx source headers (phase 5 added the vhdx path
+  via `vhdx::VhdxState::init`'s metadata-region walk). When the
+  target and backing are both vmdk, the guest also reads the
+  parent's descriptor via `vmdk::read_and_parse_descriptor` and
+  plumbs the real `parentCID` into the new image's descriptor
+  (no longer the phase-1d deadbeef sentinel). The host CLI
+  (`run_create` in `src/vmm/src/main.rs`, wired in phase 3) handles
+  the raw target entirely host-side via open + ftruncate +
+  optional posix_fallocate; for every other format it opens the
+  output as a writable virtio device, optionally attaches the
+  backing file as input device 0, populates `CreateConfig`, and
+  launches `create.bin`. Result rendering supports human
+  ("Created: ..."), JSON (`--output=json`), and quiet (`-q`)
+  modes. Phase 4 wires the qemu-img-style
+  `-o KEY=VAL,...` parser (`parse_create_o_options` +
+  `apply_create_overrides` in `src/vmm/src/main.rs`) so the
+  full per-format option matrix is reachable via either
+  individual `--flag` forms or qemu-img-compatible `-o`
+  syntax; `-o` wins on conflict. Phase 5 added two error codes —
+  `ERROR_BACKING_FORMAT_UNSUPPORTED` (recognised format but
+  size extraction not implemented) and
+  `ERROR_BACKING_SIZE_TOO_LARGE` (pre-flight ceiling check
+  surfaces a clearer "try a larger cluster size" hint instead
+  of plan_*'s generic `InvalidVirtualSize`). Phase 6 added
+  preallocation modes for raw and qcow2: for qcow2,
+  `Preallocation::{Metadata,Falloc,Full}` (any non-Off mode)
+  extends the `qcow2::create::Qcow2Layout` to cover L2 tables
+  and a data region, populates L1 entries with L2 offsets
+  (each with `OFLAG_COPIED`), and marks every used cluster
+  (header + L1 + reftable + refblocks + L2 + data) refcount=1.
+  The L2 tables are emitted by the guest *outside* the
+  `MetadataPlan` (via a reusable single-cluster scratch slot)
+  because they can total far more than
+  `GUEST_CREATE_SCRATCH_LIMIT` (128 MiB at 1 TiB virtual with
+  64 KiB clusters); the plan's `minimum_file_size` carries
+  the total file size so the guest also writes a final
+  trailing zero sector to extend the file. `Falloc` and
+  `Full` lay out the same metadata as `Metadata`; the host's
+  `apply_preallocation` helper (`src/vmm/src/main.rs`) layers
+  `posix_fallocate` or a `fill_zeros` pass (tries
+  `fallocate(FALLOC_FL_ZERO_RANGE)` first, falls back to a
+  `pwrite` loop with a 64 KiB zero buffer) over the data
+  region. Raw also gains the same `full` zero-fill path via
+  `fill_zeros(fd, 0, virtual_size)`. Non-qcow2 sparse formats
+  (vmdk / vpc / vhdx) reject non-`off` preallocation with a
+  "future work" pointer — each format would need its own
+  BAT-population pattern. The host enforces
+  `--sector-size=512` because the `crates/create` MetadataPlan
+  entries are 512-byte aligned but not always to larger sector
+  sizes — relaxing this needs a planner-side change to emit
+  coalesced sector-sized writes; tracked in PLAN-create.md's
+  Future-work section. The binary builds at ~36 KiB / 384 KiB
+  and is excluded from `cargo test --workspace` like the
+  other `no_main` operation binaries. Integration tests in
+  `tests/test_create.py` cross-validate the create writer on
+  three surfaces: per-`(target, case)` comparison via
+  `qemu-img info` against phase 7's recorded baselines
+  (`instar-testdata/expected-outputs/create-info-json/<target>/`);
+  runtime cross-validation creating the same image twice
+  (instar + system qemu-img) and comparing via `instar info`;
+  and full-matrix `instar check` round-trip for writer/reader
+  self-consistency. The normalisation filter in
+  `tests/helpers/info_json.py` strips the divergence whitelist
+  (filename, actual-size, vmdk cid + parent-cid, vhdx log-size,
+  the wrapping-file physical size, cache hints) before
+  comparison; remaining writer divergences (qcow2
+  refcount_bits hardcode, qcow2 compat hardcode, zstd
+  accept-ignore, vhdx default block_size, vhd CHS-rounded
+  virtual_size) are documented as per-case skips rather than
+  whitelist extensions so each gap stays visible.
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation,
@@ -279,6 +356,10 @@ provides a modular architecture with:
   subcommand. `MeasureConfig` and `MeasureResult` structs carry
   options and results across OPERATION_CONFIG_ADDR and the
   `send_measure_result` CallTable callback (CallTable VERSION 14).
+  Phase 2 of `PLAN-create.md` adds `CreateConfig` / `CreateResult` /
+  `GUEST_CREATE_SCRATCH_LIMIT` here and a new `send_create_result`
+  CallTable function pointer (appended at the end of the struct so
+  existing operation binaries keep working unchanged).
 
 **Chain validation in check (`--chain`):**
 The check operation supports an optional `--chain` flag that uses the host-side
@@ -330,6 +411,18 @@ structure layout and VMM-to-guest data flow.
 **Measurable target formats**: raw, qcow2 (qemu-img-parity),
 vmdk, vpc (VHD), vhdx (instar-only — qemu-img does not
 implement `measure` for these targets).
+
+**Creatable target formats**: raw (host-only —
+`open + ftruncate + posix_fallocate`), qcow2 (qemu-img
+info-equivalent modulo `refcount_bits` / `compat` / `zstd`
+hardcodes), vmdk monolithicSparse + streamOptimized, vpc
+dynamic + fixed (modulo CHS `virtual_size` rounding), vhdx
+dynamic (modulo default `block_size` when unspecified).
+Backing-file references supported on qcow2, vmdk, vpc, vhdx
+(matches qemu-img's permission set). See
+[docs/create.md](docs/create.md) for the user reference and
+[docs/quirks.md](docs/quirks.md) for the documented writer
+divergences.
 
 ### qcow2
 
@@ -472,7 +565,9 @@ The test manifest (`tests/manifest.json`) references them with
 
 `instar-testdata` ships a per-qemu-version baseline matrix
 generated by `make baselines-info` / `make baselines-check` /
-`make baselines-measure` (and aggregated via `make baselines`).
+`make baselines-measure` (and aggregated via `make baselines`),
+plus a `create-info-json` matrix produced by
+`python scripts/generate-baselines.py --command create`.
 Each command writes recorded stdout / stderr / exit-code triples
 to `expected-outputs/<output-type>/[bucket/]<version>/<image-id>.{stdout,
 stderr,meta.json}`, then `make profiles` deduplicates them into
@@ -483,7 +578,16 @@ installed qemu-img version. Currently 80 versions are covered
 a `_size/` pseudo-bucket for `--size`-mode invocations that have
 no source image, and a `__<target>` suffix on source-image
 filenames to record both `-O raw` and `-O qcow2` measurements
-of the same image.
+of the same image. The create baselines bucket by target format
+(`create-info-json/<target>/<version>/<case-name>.{stdout,…}`)
+and run a two-step pipeline (`qemu-img create` then `qemu-img
+info --output=json`) — the recorded artefact is the info JSON
+on the produced fixture, not create's own log line. Per-
+invocation random fields (vmdk `cid` / `parent-cid`, vhdx
+header-id) prevent dedup from collapsing duplicate-output
+versions, so each version gets its own profile; phase 8's
+comparison logic excludes those random fields from the
+field-equivalence check.
 
 ## oslo.utils Cross-Validation
 
@@ -505,7 +609,7 @@ For each iteration it:
    cluster size, compression, and data patterns).
 2. Creates separate copies for instar and qemu-img.
 3. Runs a random chain of 2-4 operations (info, check, convert, compressed
-   convert, measure) against both tools.
+   convert, measure, create) against both tools.
 4. Compares outputs: exit codes, JSON info output (after normalisation to
    remove known-divergent fields like disk size), and converted file content
    (via SHA-256 of raw-flattened output).
@@ -524,6 +628,21 @@ the convert writer's per-block sector alignment slack
 Known quirks (see `docs/quirks.md`) are excluded from comparison: non-QCOW2
 formats for `check` (qemu-img only checks QCOW2), disk size fields, and
 format-specific metadata.
+
+The `create` operation has its own dual oracle: it creates the same
+image via `instar create` and the system `qemu-img create` into
+separate tmp paths, then reads both back via `qemu-img info
+--output=json` and compares the normalised JSON dicts (same
+divergence-whitelist filter the phase 8b integration tests use,
+inlined from `tests/helpers/info_json.py`). The random
+`(target, options, size)` picker biases away from phase 8b's
+documented writer-divergence list — vhd target excluded (CHS
+rounding), qcow2 refcount_bits pinned to 16, qcow2 compat pinned
+to 1.1, compression_type=zstd never set, vhdx block_size always
+explicit. Combinations the curated test matrix doesn't exercise
+(random cluster sizes, lazy_refcounts on/off, every preallocation
+mode, every vmdk subformat) get coverage here without spurious
+findings from the known gaps.
 
 ### libyal Cross-Validation
 
@@ -556,12 +675,16 @@ A mock `CallTable` (in `src/fuzz/src/lib.rs`) backed by thread-local
 fuzzer input provides sector-based I/O, allowing libFuzzer to explore
 deeply malformed inputs.
 
-15 fuzz targets cover all parser crates: format detection, header
+16 fuzz targets cover all parser crates: format detection, header
 parsing (QCOW2, VMDK, VHD, VHDX, RAW, LUKS), L1/L2 cluster lookup,
 refcount table traversal, zlib decompression, grain directory lookup,
-BAT traversal, VHDX metadata parsing, plus the measure subcommand's
+BAT traversal, VHDX metadata parsing, the measure subcommand's
 calculator math (`fuzz_measure_calc`) and the per-parser
-`scan_allocation` entry points (`fuzz_measure_scan`).
+`scan_allocation` entry points (`fuzz_measure_scan`), plus the create
+subcommand's emitters (`fuzz_create_emitters` — exercises
+`plan_qcow2`, `plan_vmdk`, `plan_vhd`, `plan_vhdx` with structured
+fuzz input, asserting plan-level bookkeeping invariants and a header
+re-parse round-trip via the matching parser crate).
 
 The seed corpus is extracted from `instar-testdata` by
 `scripts/extract-fuzz-corpus.py`, which filters images by format and

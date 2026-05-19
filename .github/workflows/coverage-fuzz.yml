@@ -145,11 +145,11 @@ jobs:
             DURATION=${INPUT_DURATION}
             TARGETS=${INPUT_TARGETS}
 
-            # Count targets (default 15 if all)
+            # Count targets (default 16 if all)
             if [ -n "$TARGETS" ]; then
               N_TARGETS=$(echo "$TARGETS" | tr ',' '\n' | wc -l)
             else
-              N_TARGETS=15
+              N_TARGETS=16
             fi
 
             # Cap duration so total fits in 450 min (30 min headroom)
@@ -170,7 +170,7 @@ jobs:
             echo "duration=15" >> $GITHUB_OUTPUT
             echo "targets=" >> $GITHUB_OUTPUT
           else
-            # schedule (nightly) — 1500s × 15 targets ≈ 375 min, fits 480 min timeout
+            # schedule (nightly) — 1500s × 16 targets = 400 min, fits 480 min timeout
             echo "duration=1500" >> $GITHUB_OUTPUT
             echo "targets=" >> $GITHUB_OUTPUT
           fi
@@ -224,6 +224,7 @@ jobs:
               fuzz_luks_header
               fuzz_measure_calc
               fuzz_measure_scan
+              fuzz_create_emitters
             )
           fi
 

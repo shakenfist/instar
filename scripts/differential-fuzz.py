@@ -45,7 +45,8 @@ QCOW2_CLUSTER_SIZES = [512, 4096, 65536, 262144, 2097152]
 DATA_PATTERNS = ['zeros', 'random', 'sparse', 'mbr']
 
 # Operations that the fuzzer can chain together
-OPERATIONS = ['info', 'check', 'convert', 'convert_compressed', 'measure']
+OPERATIONS = ['info', 'check', 'convert', 'convert_compressed', 'measure',
+              'create']
 
 # Known divergence categories to skip (unsafe quirks)
 # See docs/quirks.md for rationale
@@ -860,6 +861,234 @@ def op_measure(instar_bin, instar_copy, qemu_copy, fmt,
 
 
 # ---------------------------------------------------------------------------
+# op_create: instar create vs qemu-img create
+# ---------------------------------------------------------------------------
+#
+# Mirrors tests/helpers/info_json.py — keep in sync by hand. A divergence
+# whitelist change in either copy should also land in the other.
+_CREATE_UNIVERSAL_STRIP = {
+    'actual-size', 'dirty-flag',
+    'refcount-block-cache-size', 'l2-cache-size',
+    'l2-cache-entry-size', 'cache-clean-interval',
+}
+_CREATE_TARGET_STRIP = {
+    'qcow2': set(),
+    'vmdk': {'cid', 'parent-cid'},
+    'vhd': set(),
+    'vhdx': {'log-size'},
+    'raw': set(),
+}
+_CREATE_NESTED_INFO_STRIP = {'virtual-size'}
+
+
+def _create_strip_keys(obj, keys):
+    if isinstance(obj, dict):
+        for k in list(obj.keys()):
+            if k in keys:
+                del obj[k]
+            else:
+                _create_strip_keys(obj[k], keys)
+    elif isinstance(obj, list):
+        for item in obj:
+            _create_strip_keys(item, keys)
+
+
+def _create_substitute_filename(obj, tmp_path):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == 'filename' and isinstance(v, str) and v == tmp_path:
+                obj[k] = '$FILENAME'
+            else:
+                _create_substitute_filename(v, tmp_path)
+    elif isinstance(obj, list):
+        for item in obj:
+            _create_substitute_filename(item, tmp_path)
+
+
+def _normalise_create_info(obj, target, tmp_path):
+    """Strip divergence-whitelist fields and substitute $FILENAME.
+
+    Returns a normalised deep copy ready for dict-equality comparison
+    against another normalised side.
+    """
+    import copy as _copy
+    result = _copy.deepcopy(obj)
+    strip = set(_CREATE_UNIVERSAL_STRIP)
+    strip.update(_CREATE_TARGET_STRIP.get(target, set()))
+    _create_strip_keys(result, strip)
+    # Nested children[*].info: strip the wrapping-file physical size
+    # (writer-layout artefact; the top-level virtual-size is the
+    # contract field and stays).
+    if isinstance(result, dict):
+        children = result.get('children')
+        if isinstance(children, list):
+            for child in children:
+                if isinstance(child, dict):
+                    info = child.get('info')
+                    if isinstance(info, dict):
+                        for k in _CREATE_NESTED_INFO_STRIP:
+                            info.pop(k, None)
+    _create_substitute_filename(result, tmp_path)
+    return result
+
+
+def _create_option_picker(rng):
+    """Pick a (target, size_str, options_list) triple biased to avoid
+    instar/qemu writer divergences documented in phase 8b's
+    KNOWN_WRITER_DIVERGENCES.
+
+    Excludes:
+        vhd target entirely        (CHS-geometry rounding divergence)
+        qcow2 refcount_bits != 16  (instar hardcodes refcount_order=4)
+        qcow2 compat=0.10          (instar hardcodes compat=1.1)
+        compression_type=zstd      (instar accept-ignores; emits zlib)
+        vhdx default block_size    (instar 8 MiB vs qemu 32 MiB at <= 1 GiB)
+    """
+    target = rng.choice(['qcow2', 'vmdk', 'vhdx', 'raw'])
+
+    if target == 'qcow2':
+        options = []
+        cs = rng.choice(QCOW2_CLUSTER_SIZES)
+        options.append(f'cluster_size={cs}')
+        extended_l2 = rng.random() < 0.3 and cs >= 16384
+        if extended_l2:
+            # extended_l2 requires cluster_size >= 16 KiB.
+            options.append('extended_l2=on')
+        if rng.random() < 0.3:
+            options.append('lazy_refcounts=on')
+        # qcow2 compute_layout in crates/qcow2::create rejects
+        # extended_l2 + non-Off preallocation with
+        # PreallocationUnsupported (deferred to a future phase). Mirror
+        # that constraint in the picker so the differential fuzzer
+        # doesn't flag a documented gap as a divergence.
+        if extended_l2:
+            prealloc = None
+        else:
+            prealloc = rng.choice([None, 'metadata', 'falloc', 'full'])
+        if prealloc is not None:
+            options.append(f'preallocation={prealloc}')
+            if prealloc in ('metadata', 'falloc', 'full'):
+                # All non-Off preallocation modes scale runtime with
+                # virtual_size / cluster_size. falloc/full write real
+                # blocks; metadata writes L1/L2 entries proportional
+                # to the cluster count and is slow under qemu-img at
+                # the minimum cluster_size (=512) — a 64 MiB image
+                # populates ~1 MiB of L2 tables and qemu-img times
+                # out at the fuzzer's 30s budget. Cap virtual_size
+                # at 1 MiB so the worst-case combination
+                # (cluster_size=512 + 1 MiB) is at most ~16 KiB of
+                # L2, which fits comfortably in the budget.
+                return target, '1M', options
+        size = rng.choice(['1M', '16M', '64M'])
+        return target, size, options
+
+    if target == 'vmdk':
+        subformat = rng.choice(['monolithicSparse', 'streamOptimized'])
+        size = rng.choice(['1M', '16M', '64M', '256M'])
+        return target, size, [f'subformat={subformat}']
+
+    if target == 'vhdx':
+        # block_size always explicit — instar's default diverges from
+        # qemu's at virtual sizes <= 1 GiB.
+        bs = rng.choice(['16M', '32M'])
+        size = rng.choice(['64M', '256M', '1G'])
+        return target, size, [f'block_size={bs}']
+
+    # raw
+    size = rng.choice(['1M', '16M', '64M', '256M'])
+    return target, size, []
+
+
+def op_create(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
+    """Create the same image via instar create and the system qemu-img
+    create, compare via qemu-img info JSON.
+
+    instar_copy / qemu_copy / fmt are part of the standard op_* signature
+    but unused here — `create` produces new files from a synthetic
+    (target, options, size) triple rather than reading the iteration's
+    source image. The fuzz loop dispatches uniformly across ops, so the
+    signature must match.
+    """
+    target, size_str, options_list = _create_option_picker(rng)
+
+    iter_dir = instar_copy.parent
+    ext = {'qcow2': 'qcow2', 'vmdk': 'vmdk', 'vhdx': 'vhdx',
+           'raw': 'raw'}[target]
+    inst_path = iter_dir / f'create-instar.{ext}'
+    qemu_path = iter_dir / f'create-qemu.{ext}'
+
+    inst_args = ['-f', target]
+    qemu_args = ['-f', target]
+    for opt in options_list:
+        inst_args.extend(['-o', opt])
+        qemu_args.extend(['-o', opt])
+    inst_args.extend([str(inst_path), size_str])
+    qemu_args.extend([str(qemu_path), size_str])
+
+    i_out, i_err, i_rc = run_instar(
+        instar_bin, ['create'], inst_args, timeout=timeout)
+    q_out, q_err, q_rc = run_qemu_img(
+        ['create'], qemu_args, timeout=timeout)
+
+    div = compare_exit_codes(
+        i_rc, q_rc, 'create',
+        {'target_format': target,
+         'size': size_str,
+         'options': options_list,
+         'instar_stderr': i_err[:500],
+         'qemu_stderr': q_err[:500]},
+    )
+    if div:
+        return div
+    if i_rc != 0:
+        return None  # both failed, nothing to compare
+
+    inst_info_out, _, inst_info_rc = run_qemu_img(
+        ['info', '--output=json'], [str(inst_path)], timeout=timeout)
+    qemu_info_out, _, qemu_info_rc = run_qemu_img(
+        ['info', '--output=json'], [str(qemu_path)], timeout=timeout)
+    if inst_info_rc != 0 or qemu_info_rc != 0:
+        return {
+            'type': 'create_info_readback_failure',
+            'target_format': target,
+            'size': size_str,
+            'options': options_list,
+            'instar_info_rc': inst_info_rc,
+            'qemu_info_rc': qemu_info_rc,
+            'instar_info_stdout': inst_info_out[:500],
+            'qemu_info_stdout': qemu_info_out[:500],
+        }
+
+    try:
+        inst_json = json.loads(inst_info_out)
+        qemu_json = json.loads(qemu_info_out)
+    except json.JSONDecodeError as e:
+        return {
+            'type': 'create_info_json_parse_failure',
+            'target_format': target,
+            'size': size_str,
+            'options': options_list,
+            'error': str(e),
+            'instar_info_stdout': inst_info_out[:500],
+            'qemu_info_stdout': qemu_info_out[:500],
+        }
+
+    inst_norm = _normalise_create_info(inst_json, target, str(inst_path))
+    qemu_norm = _normalise_create_info(qemu_json, target, str(qemu_path))
+
+    if inst_norm != qemu_norm:
+        return {
+            'type': 'create_info_divergence',
+            'target_format': target,
+            'size': size_str,
+            'options': options_list,
+            'instar_normalised': inst_norm,
+            'qemu_normalised': qemu_norm,
+        }
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Single iteration
 # ---------------------------------------------------------------------------
 
@@ -910,6 +1139,11 @@ def run_iteration(instar_bin, workdir, rng, iteration, timeout,
                 )
             elif op == 'measure':
                 div = op_measure(
+                    instar_bin, instar_copy, qemu_copy, fmt,
+                    timeout, rng,
+                )
+            elif op == 'create':
+                div = op_create(
                     instar_bin, instar_copy, qemu_copy, fmt,
                     timeout, rng,
                 )

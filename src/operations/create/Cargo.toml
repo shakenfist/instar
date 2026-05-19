@@ -1,0 +1,25 @@
+[package]
+name = "create-op"
+version = "0.2.0"
+edition = "2021"
+description = "Create operation: emit empty image metadata for a target format"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "create"
+path = "src/main.rs"
+
+[dependencies]
+shared = { path = "../../shared" }
+create = { path = "../../crates/create" }
+qcow2 = { path = "../../crates/qcow2" }
+vmdk = { path = "../../crates/vmdk" }
+vhd = { path = "../../crates/vhd" }
+vhdx = { path = "../../crates/vhdx" }
+raw = { path = "../../crates/raw" }
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true

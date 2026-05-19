@@ -17,7 +17,7 @@ instar/
 │   ├── core/       # Core guest initialization
 │   ├── crates/     # Shared format crates (qcow2, raw, vmdk, vhd, vhdx, luks)
 │   ├── shared/     # Shared library code (byte-order helpers, configs)
-│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, measure)
+│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, measure, create)
 │   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates (guest-protocol)
 ├── prototypes/     # Experimental implementations (11 KVM prototypes)
@@ -65,6 +65,17 @@ vhdx (VHDX), luks (info + convert with decryption)
 - `convert`: convert a disk image from one format to another
 - `measure`: predict file size required to convert an image to a target
   format. See [docs/measure.md](docs/measure.md) for the full reference.
+- `create`: create a new empty disk image of a given format and size.
+  Raw output is host-only (open + ftruncate + optional falloc / full
+  zero-fill); every other format runs `crates/create` in the KVM
+  sandbox and writes the metadata via virtio. Supports backing files
+  (`-b BACKING [-F FMT]`) and the full qemu-img-style
+  `-o KEY=VAL,...` option matrix (`-o` wins over individual flags
+  on conflict). Preallocation modes: `off` (any format),
+  `metadata` / `falloc` / `full` (qcow2; raw also accepts
+  `falloc` / `full`). Non-qcow2 sparse formats (vmdk / vpc / vhdx)
+  reject non-`off` preallocation with a "future work" pointer.
+  See [docs/create.md](docs/create.md) for the full reference.
 
 ## Working on This Project
 

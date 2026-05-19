@@ -142,6 +142,43 @@ const MEASURE_RESULT_ERROR_INVALID_OPTION: u32 = 2;
 #[allow(dead_code)]
 const MEASURE_RESULT_ERROR_INVALID_SIZE: u32 = 3;
 
+// CreateConfig constants (must match shared crate)
+const CREATE_CONFIG_MAGIC: u32 = 0x43524541; // "CREA"
+#[allow(dead_code)]
+const CREATE_CONFIG_FLAG_EXTENDED_L2: u32 = 1 << 0;
+#[allow(dead_code)]
+const CREATE_CONFIG_FLAG_LAZY_REFCOUNTS: u32 = 1 << 1;
+#[allow(dead_code)]
+const CREATE_CONFIG_FLAG_COMPAT_V3: u32 = 1 << 2;
+#[allow(dead_code)]
+const CREATE_CONFIG_FLAG_BACKING_UNSAFE: u32 = 1 << 3;
+// Preallocation mode lives at bits 4-5 of CreateConfig.flags, mirroring
+// MeasureConfig. Decoded back into the Preallocation enum by the guest.
+#[allow(dead_code)]
+const CREATE_CONFIG_PREALLOC_OFF: u32 = 0 << 4;
+#[allow(dead_code)]
+const CREATE_CONFIG_PREALLOC_METADATA: u32 = 1 << 4;
+#[allow(dead_code)]
+const CREATE_CONFIG_PREALLOC_FALLOC: u32 = 2 << 4;
+#[allow(dead_code)]
+const CREATE_CONFIG_PREALLOC_FULL: u32 = 3 << 4;
+const CREATE_CONFIG_MAX_BACKING_FILE: usize = 1024;
+
+// CreateResult constants (must match shared crate)
+#[allow(dead_code)]
+const CREATE_RESULT_MAGIC: u32 = 0x43524553; // "CRES"
+const CREATE_RESULT_ERROR_OK: u32 = 0;
+const CREATE_RESULT_ERROR_INVALID_OPTION: u32 = 1;
+const CREATE_RESULT_ERROR_INVALID_SIZE: u32 = 2;
+const CREATE_RESULT_ERROR_SCRATCH_TOO_SMALL: u32 = 3;
+const CREATE_RESULT_ERROR_BACKING_READ_FAILED: u32 = 4;
+const CREATE_RESULT_ERROR_BACKING_PARSE_FAILED: u32 = 5;
+const CREATE_RESULT_ERROR_BACKING_TOO_LONG: u32 = 6;
+const CREATE_RESULT_ERROR_WRITE_FAILED: u32 = 7;
+const CREATE_RESULT_ERROR_UNSUPPORTED_FORMAT: u32 = 8;
+const CREATE_RESULT_ERROR_BACKING_FORMAT_UNSUPPORTED: u32 = 9;
+const CREATE_RESULT_ERROR_BACKING_SIZE_TOO_LARGE: u32 = 10;
+
 // CheckResult flag constants (must match shared crate)
 const CHECK_RESULT_FLAG_VALID: u32 = 1 << 0;
 #[allow(dead_code)]
@@ -703,6 +740,18 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
                 "measure_result target_format={} required={} fully_allocated={} \
                 resolved_unit_size={} error={}",
                 m.target_format, m.required, m.fully_allocated, m.resolved_unit_size, m.error
+            )
+        }
+        Some(guest_::GuestMessage_::Payload::CreateResult(c)) => {
+            format!(
+                "create_result target_format={} resolved_virtual_size={} \
+                metadata_bytes_written={} file_size_after={} resolved_unit_size={} error={}",
+                c.target_format,
+                c.resolved_virtual_size,
+                c.metadata_bytes_written,
+                c.file_size_after,
+                c.resolved_unit_size,
+                c.error
             )
         }
         None => "empty payload".to_string(),
@@ -2202,6 +2251,8 @@ enum Commands {
     Convert(ConvertArgs),
     /// Measure the size required to convert an image to a target format
     Measure(MeasureArgs),
+    /// Create a new empty disk image of the given format and size
+    Create(CreateArgs),
     /// Display or validate configuration
     Config(ConfigArgs),
 }
@@ -2583,6 +2634,109 @@ struct MeasureArgs {
 }
 
 #[derive(Args, Debug)]
+struct CreateArgs {
+    /// Path to the new image file to create. Overwrites if it
+    /// already exists (matches qemu-img).
+    filename: String,
+
+    /// Virtual disk size (e.g. "1G", "512M", "1T"). Required unless
+    /// -b BACKING is given, in which case it defaults to the backing
+    /// file's virtual size.
+    #[arg(value_name = "SIZE")]
+    size: Option<String>,
+
+    /// Target output format. Supported: raw, qcow2, vmdk, vpc (VHD), vhdx.
+    #[arg(short = 'f', long = "format", default_value = "raw",
+          value_parser = ["raw", "qcow2", "vmdk", "vpc", "vhdx"])]
+    target_format: String,
+
+    /// Backing file path. The path is embedded verbatim into the
+    /// resulting image (so the metadata is portable) and resolved
+    /// relative to the new image's directory for opening.
+    #[arg(short = 'b', long = "backing", value_name = "BACKING")]
+    backing: Option<String>,
+
+    /// Backing file format hint (qcow2 / raw / vmdk / ...).
+    #[arg(short = 'F', long = "backing-format", value_name = "FMT")]
+    backing_format: Option<String>,
+
+    /// Don't fail if the backing file isn't accessible / parseable.
+    #[arg(short = 'u', long = "backing-unsafe")]
+    backing_unsafe: bool,
+
+    /// Suppress the "Created: ..." line on success (matches qemu-img -q).
+    #[arg(short = 'q', long)]
+    quiet: bool,
+
+    /// Result rendering: human (default) or json.
+    #[arg(long, default_value = "human", value_parser = ["human", "json"])]
+    output: String,
+
+    /// Host I/O sector size. Phase 3 only supports 512 because the
+    /// metadata layouts in `crates/create` are 512-byte aligned but
+    /// not always aligned to larger sector sizes — multi-write
+    /// metadata would clobber itself in a single bigger sector.
+    /// Documented; phase 5 may relax this.
+    #[arg(long, default_value = "512")]
+    sector_size: u32,
+
+    /// qcow2 cluster size in bytes. Power of two in [512, 2 MiB].
+    /// Default (when -f qcow2): 65536.
+    #[arg(long, default_value = "0")]
+    cluster_size: u32,
+
+    /// qcow2 refcount entry width in bits. Must be in {1,2,4,8,16,32,64}.
+    /// Default (when -f qcow2): 16.
+    #[arg(long, default_value = "0")]
+    refcount_bits: u8,
+
+    /// qcow2: emit extended-L2 entries (16-byte with subcluster bitmaps).
+    #[arg(long)]
+    extended_l2: bool,
+
+    /// qcow2: enable the lazy-refcounts compat bit.
+    #[arg(long)]
+    lazy_refcounts: bool,
+
+    /// qcow2 compat level: "0.10" (v2) or "1.1" (v3, default).
+    #[arg(long, default_value = "1.1", value_parser = ["0.10", "1.1"])]
+    compat: String,
+
+    /// vmdk subformat (default: monolithicSparse). vhd subformat
+    /// (default: dynamic). Other subformats are accepted in this
+    /// argument name and validated against the chosen --format.
+    #[arg(long, default_value = "",
+          value_parser = ["", "monolithicSparse", "streamOptimized",
+                          "monolithicFlat", "dynamic", "fixed"])]
+    subformat: String,
+
+    /// vmdk grain size in bytes. Power of two in [4 KiB, 64 KiB].
+    /// Default (when -f vmdk): 65536.
+    #[arg(long, default_value = "0")]
+    grain_size: u32,
+
+    /// vhd / vhdx block size in bytes. Power of two.
+    /// vhd default: 2 MiB; vhdx default: 32 MiB.
+    #[arg(long, default_value = "0")]
+    block_size: u32,
+
+    /// Preallocation mode. Phase 3 accepts "off" (default) and
+    /// "falloc" (raw only); other modes return a clear "not yet
+    /// supported" error pointing at phase 6 of PLAN-create.md.
+    #[arg(long, default_value = "off",
+          value_parser = ["off", "metadata", "falloc", "full"])]
+    preallocation: String,
+
+    /// qemu-img-style options as comma-separated key=value pairs.
+    /// Phase 3 placeholder — the full parser ships in phase 4 of
+    /// PLAN-create.md. Passing any -o option returns an error
+    /// pointing users at the individual flags for now.
+    #[arg(short = 'o', long = "options", action = clap::ArgAction::Append,
+          value_name = "KEY=VALUE,...")]
+    option: Vec<String>,
+}
+
+#[derive(Args, Debug)]
 struct ConfigArgs {
     /// Show which file each config value came from
     #[arg(long)]
@@ -2613,6 +2767,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Compare(args) => run_compare(args, verbose),
         Commands::Convert(args) => run_convert(args, verbose),
         Commands::Measure(args) => run_measure(args, verbose),
+        Commands::Create(args) => run_create(args, verbose),
         Commands::Config(args) => run_config(args),
     }
 }
@@ -5632,6 +5787,333 @@ fn parse_o_options(
     Ok(out)
 }
 
+// ============================================================================
+// Create -o key=value parsing
+// ============================================================================
+
+/// Overrides parsed from `-o` for the create operation.
+///
+/// Mirrors `MeasureOptionOverrides` in shape: every field is
+/// `Option<T>` so "user didn't set this key" is distinguishable
+/// from "user set it to the default value". Overrides win over
+/// the matching individual flag (last-wins, matches measure and
+/// qemu-img).
+#[derive(Default, Debug)]
+struct CreateOptionOverrides {
+    cluster_size: Option<u32>,
+    refcount_bits: Option<u8>,
+    extended_l2: Option<bool>,
+    lazy_refcounts: Option<bool>,
+    compat_v3: Option<bool>,
+    vmdk_subformat: Option<u8>,
+    grain_size: Option<u32>,
+    vhd_subformat: Option<u8>,
+    block_size: Option<u32>,
+    preallocation: Option<&'static str>,
+
+    // Create-specific keys with no individual-flag analogue.
+    size: Option<u64>,
+    backing_file: Option<String>,
+    backing_fmt: Option<&'static str>,
+}
+
+/// Boolean parser for `-o key=value` (create variant of measure's helper).
+/// Accepts on/off/true/false/yes/no, case-insensitive.
+fn parse_create_o_bool(key: &str, value: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    match value.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" => Ok(true),
+        "off" | "false" | "no" => Ok(false),
+        _ => Err(format!(
+            "create: bad value '{}' for -o key '{}' (expected on/off)",
+            value, key
+        )
+        .into()),
+    }
+}
+
+/// Parse a size value (K/M/G/T) and bounds-check to u32. Used for
+/// cluster_size, grain_size, block_size, refcount-related fields.
+fn parse_create_o_size_u32(key: &str, value: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    let n = parse_memory_size(value)
+        .map_err(|e| format!("create: bad size '{}' for -o key '{}' ({})", value, key, e))?;
+    if n > u32::MAX as u64 {
+        return Err(format!("create: size {} for -o key '{}' exceeds u32::MAX", n, key).into());
+    }
+    Ok(n as u32)
+}
+
+/// Parse a size value (K/M/G/T) as a u64 — used for `-o size=N`
+/// where virtual disk sizes can comfortably exceed u32.
+fn parse_create_o_size_u64(key: &str, value: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    parse_memory_size(value)
+        .map_err(|e| format!("create: bad size '{}' for -o key '{}' ({})", value, key, e).into())
+}
+
+/// Parse a decimal u8 — used for refcount_bits.
+fn parse_create_o_u8(key: &str, value: &str) -> Result<u8, Box<dyn std::error::Error>> {
+    value
+        .parse::<u8>()
+        .map_err(|_| -> Box<dyn std::error::Error> {
+            format!("create: bad number '{}' for -o key '{}'", value, key).into()
+        })
+}
+
+/// Parse one or more qemu-img-style `-o KEY=VAL,KEY=VAL,...`
+/// strings into a [`CreateOptionOverrides`] for the given target
+/// format.
+///
+/// Returns an error on unknown keys, invalid values, or
+/// not-yet-supported features. Repeated keys across all `-o`
+/// invocations are last-wins.
+fn parse_create_o_options(
+    target: &str,
+    raw: &[String],
+) -> Result<CreateOptionOverrides, Box<dyn std::error::Error>> {
+    let mut out = CreateOptionOverrides::default();
+
+    for input in raw {
+        for piece in input.split(',') {
+            let piece = piece.trim();
+            if piece.is_empty() {
+                continue;
+            }
+            let (key, value) = match piece.split_once('=') {
+                Some((k, v)) => (k.trim(), v),
+                None => {
+                    return Err(format!(
+                        "create: -o option '{}' is missing a value (expected KEY=VALUE)",
+                        piece
+                    )
+                    .into())
+                }
+            };
+
+            match (target, key) {
+                // -------- common keys (every non-raw target) --------
+                (_, "size") => {
+                    out.size = Some(parse_create_o_size_u64(key, value)?);
+                }
+                ("qcow2" | "vmdk" | "vpc" | "vhdx", "backing_file") => {
+                    out.backing_file = Some(value.to_string());
+                }
+                ("qcow2" | "vmdk" | "vpc" | "vhdx", "backing_fmt") => {
+                    out.backing_fmt = Some(match value {
+                        "raw" => "raw",
+                        "qcow2" => "qcow2",
+                        "vmdk" => "vmdk",
+                        "vpc" | "vhd" => "vpc",
+                        "vhdx" => "vhdx",
+                        _ => {
+                            return Err(format!(
+                                "create: bad value '{}' for -o key 'backing_fmt' \
+                                 (expected raw, qcow2, vmdk, vpc, or vhdx)",
+                                value
+                            )
+                            .into())
+                        }
+                    });
+                }
+
+                // -------- raw --------
+                ("raw", "preallocation") => match value {
+                    "off" => out.preallocation = Some("off"),
+                    "falloc" => out.preallocation = Some("falloc"),
+                    "full" => out.preallocation = Some("full"),
+                    "metadata" => {
+                        return Err("create: -o preallocation=metadata is not valid for raw \
+                             (raw has no metadata to preallocate)"
+                            .into())
+                    }
+                    _ => {
+                        return Err(format!(
+                            "create: bad value '{}' for -o key 'preallocation' \
+                             (expected off, falloc, or full)",
+                            value
+                        )
+                        .into())
+                    }
+                },
+
+                // -------- qcow2 --------
+                ("qcow2", "cluster_size") => {
+                    out.cluster_size = Some(parse_create_o_size_u32(key, value)?);
+                }
+                ("qcow2", "compat") => match value {
+                    "0.10" => out.compat_v3 = Some(false),
+                    "1.1" => out.compat_v3 = Some(true),
+                    _ => {
+                        return Err(format!(
+                            "create: bad value '{}' for -o key 'compat' \
+                             (expected 0.10 or 1.1)",
+                            value
+                        )
+                        .into())
+                    }
+                },
+                ("qcow2", "refcount_bits") => {
+                    out.refcount_bits = Some(parse_create_o_u8(key, value)?);
+                }
+                ("qcow2", "extended_l2") => {
+                    out.extended_l2 = Some(parse_create_o_bool(key, value)?);
+                }
+                ("qcow2", "lazy_refcounts") => {
+                    out.lazy_refcounts = Some(parse_create_o_bool(key, value)?);
+                }
+                ("qcow2", "compression_type") => match value {
+                    // No CreateConfig flag bit yet — accept-ignore so qemu-img
+                    // command lines copy-paste. Phase 6 may wire this through
+                    // when preallocation lands.
+                    "zlib" | "zstd" => {}
+                    _ => {
+                        return Err(format!(
+                            "create: bad value '{}' for -o key 'compression_type' \
+                             (expected zlib or zstd)",
+                            value
+                        )
+                        .into())
+                    }
+                },
+                ("qcow2", "preallocation") => match value {
+                    "off" => out.preallocation = Some("off"),
+                    "metadata" => out.preallocation = Some("metadata"),
+                    "falloc" => out.preallocation = Some("falloc"),
+                    "full" => out.preallocation = Some("full"),
+                    _ => {
+                        return Err(format!(
+                            "create: bad value '{}' for -o key 'preallocation' \
+                             (expected off, metadata, falloc, or full)",
+                            value
+                        )
+                        .into())
+                    }
+                },
+
+                // qcow2 reject list (data files / encryption deferred).
+                ("qcow2", "data_file") | ("qcow2", "data_file_raw") => {
+                    return Err(format!(
+                        "create: -o key '{}' is not yet supported \
+                         (external data files are deferred — see \
+                         PLAN-convert-followups.md and PLAN-create.md future work)",
+                        key
+                    )
+                    .into());
+                }
+                ("qcow2", k) if k.starts_with("encrypt.") => {
+                    return Err(format!(
+                        "create: -o key '{}' is not yet supported \
+                         (encrypted create is deferred — see PLAN-create.md future work)",
+                        k
+                    )
+                    .into());
+                }
+
+                // -------- vmdk --------
+                ("vmdk", "subformat") => match value {
+                    "monolithicSparse" => out.vmdk_subformat = Some(0),
+                    "streamOptimized" => out.vmdk_subformat = Some(1),
+                    "monolithicFlat" => out.vmdk_subformat = Some(2),
+                    _ => {
+                        return Err(format!(
+                            "create: bad value '{}' for -o key 'subformat' \
+                             (expected monolithicSparse / streamOptimized / monolithicFlat)",
+                            value
+                        )
+                        .into())
+                    }
+                },
+                ("vmdk", "grain_size") => {
+                    out.grain_size = Some(parse_create_o_size_u32(key, value)?);
+                }
+                ("vmdk", "adapter_type")
+                | ("vmdk", "hwversion")
+                | ("vmdk", "toolsversion")
+                | ("vmdk", "zeroed_grain") => {
+                    // accept-ignore — no effect on the empty-image bytes
+                    // we emit
+                }
+
+                // -------- vpc (VHD) --------
+                ("vpc", "subformat") => match value {
+                    "dynamic" => out.vhd_subformat = Some(0),
+                    "fixed" => out.vhd_subformat = Some(1),
+                    _ => {
+                        return Err(format!(
+                            "create: bad value '{}' for -o key 'subformat' \
+                             (expected dynamic or fixed)",
+                            value
+                        )
+                        .into())
+                    }
+                },
+                ("vpc", "block_size") => {
+                    out.block_size = Some(parse_create_o_size_u32(key, value)?);
+                }
+                ("vpc", "force_size") | ("vpc", "force_size_calc") => {
+                    // accept-ignore
+                }
+
+                // -------- vhdx --------
+                ("vhdx", "subformat") => match value {
+                    "dynamic" => { /* default */ }
+                    "fixed" => {
+                        return Err("create: -O vhdx -o subformat=fixed is not yet supported \
+                                    (vhdx-fixed lands in phase 5 of PLAN-create.md)"
+                            .into())
+                    }
+                    _ => {
+                        return Err(format!(
+                            "create: bad value '{}' for -o key 'subformat' \
+                             (expected dynamic or fixed)",
+                            value
+                        )
+                        .into())
+                    }
+                },
+                ("vhdx", "block_size") => {
+                    out.block_size = Some(parse_create_o_size_u32(key, value)?);
+                }
+                ("vhdx", "log_size") | ("vhdx", "block_state_zero") => {
+                    // accept-ignore
+                }
+
+                // -------- non-qcow2 preallocation: deferred --------
+                ("vmdk" | "vpc" | "vhdx", "preallocation") => match value {
+                    "off" => out.preallocation = Some("off"),
+                    "metadata" | "falloc" | "full" => {
+                        return Err(format!(
+                            "create: -o preallocation={} is not yet supported for {} \
+                             (non-qcow2 preallocation is future work — see PLAN-create.md)",
+                            value, target
+                        )
+                        .into())
+                    }
+                    _ => {
+                        return Err(format!(
+                            "create: bad value '{}' for -o key 'preallocation' \
+                             (expected off, metadata, falloc, or full)",
+                            value
+                        )
+                        .into())
+                    }
+                },
+
+                // -------- catch-all --------
+                _ => {
+                    return Err(format!(
+                        "create: unrecognised -o key '{}' for target {} \
+                         (run with --help for the accepted flag set; \
+                         qemu-img -o keys map 1:1 to the --flag form)",
+                        key, target
+                    )
+                    .into())
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 /// Run the measure operation (predict output size for a target format).
 fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Touch the result magic constant so its presence is preserved for
@@ -6194,6 +6676,1309 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+/// Entry point for the `create` subcommand.
+///
+/// Phase 4 wires `-o KEY=VAL,...` parsing on top of the phase-3
+/// individual flags: parse `-o` first, then apply the overrides
+/// to a mutable copy of the args (last-wins, matches qemu-img
+/// and measure), then run the full validator. Raw output bypasses
+/// the guest entirely; everything else dispatches into
+/// `run_create_nonraw`.
+fn run_create(mut args: CreateArgs, _verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let overrides = parse_create_o_options(&args.target_format, &args.option)?;
+    apply_create_overrides(&mut args, overrides);
+    validate_create_args(&args)?;
+
+    // Raw output bypasses the guest entirely — there is no metadata
+    // to emit. Open + ftruncate (+ optional posix_fallocate for the
+    // falloc preallocation mode) is the whole job.
+    if args.target_format == "raw" {
+        return run_create_raw(&args);
+    }
+
+    run_create_nonraw(&args, _verbose)
+}
+
+/// Apply parsed `-o` overrides on top of the individual `--flag`
+/// values. Overrides always win (last-wins on the command line,
+/// matching qemu-img). Mutating `CreateArgs` in place keeps the
+/// rest of `run_create_raw` / `run_create_nonraw` unchanged —
+/// they read the same field set as before.
+fn apply_create_overrides(args: &mut CreateArgs, overrides: CreateOptionOverrides) {
+    if let Some(v) = overrides.cluster_size {
+        args.cluster_size = v;
+    }
+    if let Some(v) = overrides.refcount_bits {
+        args.refcount_bits = v;
+    }
+    if let Some(v) = overrides.extended_l2 {
+        args.extended_l2 = v;
+    }
+    if let Some(v) = overrides.lazy_refcounts {
+        args.lazy_refcounts = v;
+    }
+    if let Some(v) = overrides.compat_v3 {
+        args.compat = if v { "1.1" } else { "0.10" }.to_string();
+    }
+    if let Some(v) = overrides.vmdk_subformat {
+        args.subformat = match v {
+            0 => "monolithicSparse",
+            1 => "streamOptimized",
+            2 => "monolithicFlat",
+            _ => "monolithicSparse",
+        }
+        .to_string();
+    }
+    if let Some(v) = overrides.grain_size {
+        args.grain_size = v;
+    }
+    if let Some(v) = overrides.vhd_subformat {
+        args.subformat = match v {
+            0 => "dynamic",
+            1 => "fixed",
+            _ => "dynamic",
+        }
+        .to_string();
+    }
+    if let Some(v) = overrides.block_size {
+        args.block_size = v;
+    }
+    if let Some(v) = overrides.preallocation {
+        args.preallocation = v.to_string();
+    }
+    if let Some(v) = overrides.size {
+        // Encode the override as a decimal-bytes string so the
+        // existing parse_memory_size call site picks it up
+        // unchanged. -o size wins over the positional SIZE.
+        args.size = Some(v.to_string());
+    }
+    if let Some(v) = overrides.backing_file {
+        args.backing = Some(v);
+    }
+    if let Some(v) = overrides.backing_fmt {
+        args.backing_format = Some(v.to_string());
+    }
+}
+
+/// Map a backing-format string (the `-F` argument) to its numeric
+/// ImageFormat code. Returns 0 ("Unknown") for an empty hint so the
+/// guest sees "no format hint" rather than a bogus enum value.
+fn create_backing_format_code(s: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    Ok(match s {
+        "" => IMAGE_FORMAT_UNKNOWN,
+        "raw" => IMAGE_FORMAT_RAW,
+        "qcow2" => IMAGE_FORMAT_QCOW2,
+        "vmdk" => IMAGE_FORMAT_VMDK4,
+        "vpc" | "vhd" => IMAGE_FORMAT_VHD,
+        "vhdx" => IMAGE_FORMAT_VHDX,
+        other => {
+            return Err(format!(
+                "create: -F {} is not a recognised backing format \
+                 (expected raw, qcow2, vmdk, vpc, or vhdx)",
+                other
+            )
+            .into());
+        }
+    })
+}
+
+/// Non-raw create dispatch: open the output, attach as a virtio
+/// device, populate `CreateConfig`, launch the create guest binary,
+/// and wait for the result.
+///
+/// Phase 3c ships the no-backing path. Phase 3d adds the backing
+/// attach; phase 3e replaces the minimal error reporting here with
+/// the full human / json / quiet renderer.
+fn run_create_nonraw(args: &CreateArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // --- Resolve fields from args ---------------------------------------
+    let target_format = create_target_format(&args.target_format)?;
+    let virtual_size = args
+        .size
+        .as_ref()
+        .map(|s| parse_memory_size(s))
+        .transpose()?
+        .unwrap_or(0);
+
+    let mut flags: u32 = 0;
+    if args.extended_l2 {
+        flags |= CREATE_CONFIG_FLAG_EXTENDED_L2;
+    }
+    if args.lazy_refcounts {
+        flags |= CREATE_CONFIG_FLAG_LAZY_REFCOUNTS;
+    }
+    if args.compat == "1.1" {
+        flags |= CREATE_CONFIG_FLAG_COMPAT_V3;
+    }
+    if args.backing_unsafe {
+        flags |= CREATE_CONFIG_FLAG_BACKING_UNSAFE;
+    }
+    flags |= match args.preallocation.as_str() {
+        "metadata" => CREATE_CONFIG_PREALLOC_METADATA,
+        "falloc" => CREATE_CONFIG_PREALLOC_FALLOC,
+        "full" => CREATE_CONFIG_PREALLOC_FULL,
+        _ => CREATE_CONFIG_PREALLOC_OFF,
+    };
+
+    let vmdk_subformat: u8 = match args.subformat.as_str() {
+        "streamOptimized" => 1,
+        _ => 0, // monolithicSparse default
+    };
+    let vhd_subformat: u8 = match args.subformat.as_str() {
+        "fixed" => 1,
+        _ => 0, // dynamic default
+    };
+
+    let cluster_size = args.cluster_size;
+    let refcount_bits = args.refcount_bits;
+    let grain_size = args.grain_size;
+    let block_size = args.block_size;
+
+    // --- Load guest binaries --------------------------------------------
+    let core_path = get_binary_path("core.bin");
+    let operation_path = get_binary_path("create.bin");
+    let core_code = load_guest_binary(core_path.to_str().unwrap())?;
+    debug!(
+        "Loaded core binary: {} bytes from {}",
+        core_code.len(),
+        core_path.display()
+    );
+    let operation_code = load_guest_binary(operation_path.to_str().unwrap())?;
+    debug!(
+        "Loaded operation binary: {} bytes from {}",
+        operation_code.len(),
+        operation_path.display()
+    );
+
+    // --- Open and attach output device ----------------------------------
+    let output_path = Path::new(&args.filename);
+    // The output is sparse — the on-disk size is just the metadata
+    // footprint (kilobytes typically), but virtio needs a capacity to
+    // expose. Pass a generous upper bound (virtual_size + 64 MiB)
+    // and let the file stay sparse. For the inferred-from-backing
+    // path (virtual_size == 0; phase 3d) we fall back to 64 MiB —
+    // the BAT/L1/refcount metadata is far smaller than that.
+    let output_capacity_hint = virtual_size
+        .saturating_add(64 * 1024 * 1024)
+        .max(64 * 1024 * 1024);
+
+    let output_backing =
+        BackingStore::open(output_path, false, Some(output_capacity_hint), true)
+            .map_err(|e| format!("create: open '{}' for write failed: {}", args.filename, e))?;
+
+    // core unconditionally initialises input device 0 and places the
+    // output device at MMIO index = active_input_count. The input
+    // device 0 is either the real backing file (when -b is given) or
+    // a 1-sector tempfile stub the guest ignores.
+    struct CreateStubInput(std::path::PathBuf);
+    impl Drop for CreateStubInput {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let mut backing_file_bytes: Vec<u8> = Vec::new();
+    let mut backing_format_code: u32 = IMAGE_FORMAT_UNKNOWN;
+    let _stub_input: Option<CreateStubInput>;
+
+    let (input_backing, input_capacity) = if let Some(ref typed_backing) = args.backing {
+        // Resolve the backing path relative to the output's parent
+        // directory, matching qemu-img. The path the user typed is
+        // embedded verbatim into the new image's metadata so the
+        // backing reference stays portable across moves.
+        let resolved = if Path::new(typed_backing).is_absolute() {
+            Path::new(typed_backing).to_path_buf()
+        } else {
+            output_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(typed_backing)
+        };
+
+        // Single metadata() call serves both the is_file check (when
+        // -u is absent) and the backing-size capture. Previously two
+        // separate stats; deduped per PR #298 review item #4. Note
+        // that this still has a small TOCTOU window vs the subsequent
+        // BackingStore::open — eliminating that would require a
+        // BackingStore::is_regular_file() helper that fstats the
+        // opened fd. Tracked as a follow-up in PLAN-create.md.
+        let backing_md_opt = std::fs::metadata(&resolved).ok();
+        if !args.backing_unsafe {
+            let md = backing_md_opt.as_ref().ok_or_else(|| {
+                format!(
+                    "create: backing file '{}' (resolved to '{}') not accessible \
+                     (pass -u to skip this check)",
+                    typed_backing,
+                    resolved.display(),
+                )
+            })?;
+            if !md.is_file() {
+                return Err(format!(
+                    "create: backing path '{}' is not a regular file",
+                    resolved.display()
+                )
+                .into());
+            }
+        }
+        let backing_md_size = backing_md_opt.as_ref().map(|m| m.len()).unwrap_or(0);
+        let real_backing = BackingStore::open(&resolved, true, None, false).map_err(|e| {
+            format!(
+                "create: open backing '{}' failed: {}",
+                resolved.display(),
+                e
+            )
+        })?;
+
+        // Embed the user-typed bytes verbatim. The host-resolved
+        // path is *not* what ends up in the metadata.
+        let typed_bytes = typed_backing.as_bytes();
+        if typed_bytes.len() > CREATE_CONFIG_MAX_BACKING_FILE {
+            return Err(format!(
+                "create: backing path too long ({} bytes; max {})",
+                typed_bytes.len(),
+                CREATE_CONFIG_MAX_BACKING_FILE
+            )
+            .into());
+        }
+        backing_file_bytes = typed_bytes.to_vec();
+
+        if let Some(ref fmt) = args.backing_format {
+            backing_format_code = create_backing_format_code(fmt)?;
+        }
+        _stub_input = None;
+        (real_backing, backing_md_size)
+    } else {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let stub_path = std::env::temp_dir().join(format!("instar-create-stub-{}-{}", pid, nanos));
+        let stub_file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&stub_path)?;
+        stub_file.set_len(args.sector_size as u64)?;
+        drop(stub_file);
+        _stub_input = Some(CreateStubInput(stub_path.clone()));
+        let stub_backing = BackingStore::open(&stub_path, true, None, false)?;
+        (stub_backing, args.sector_size as u64)
+    };
+
+    // Build the device-attach + guest-launch closure so any failure
+    // along the way can hit the partial-output cleanup path.
+    let result = run_create_guest(
+        &core_code,
+        &operation_code,
+        args,
+        target_format,
+        flags,
+        virtual_size,
+        cluster_size,
+        refcount_bits,
+        vmdk_subformat,
+        vhd_subformat,
+        grain_size,
+        block_size,
+        input_backing,
+        input_capacity,
+        &backing_file_bytes,
+        backing_format_code,
+        output_backing,
+        output_capacity_hint,
+        verbose,
+    );
+
+    match result {
+        Ok(create_result) => {
+            if create_result.error != CREATE_RESULT_ERROR_OK {
+                let _ = std::fs::remove_file(output_path);
+                return Err(format!(
+                    "create failed: {}",
+                    create_error_detail(create_result.error)
+                )
+                .into());
+            }
+
+            // For qcow2 + falloc/full, apply the host-side post-pass
+            // on the data region the guest just framed with metadata.
+            // The guest laid out the file as
+            //     header | L1 | refcount | L2 | data
+            // so the data region runs from
+            //     data_offset = file_size_after - data_len
+            // where data_len is the virtual size rounded up to the
+            // cluster boundary.
+            //
+            // Defence-in-depth: the size inputs come from the guest
+            // (CreateResultMessage) and the host has its own
+            // authoritative knowledge of virtual_size (when set via
+            // --size) and the on-disk file length (via stat). We
+            // clamp `data_len` against the host-known virtual_size
+            // when available, fall back to the guest report bounded
+            // by a sanity ceiling otherwise, and refuse to apply
+            // preallocation past the observed end-of-file.
+            if args.target_format == "qcow2"
+                && matches!(args.preallocation.as_str(), "falloc" | "full")
+            {
+                // Use the host's own knowledge of virtual_size where
+                // we have it; for backing-defaulted sizes (host saw
+                // virtual_size=0 and the guest filled it in) fall
+                // back to the guest report bounded by a sanity
+                // ceiling (2^57 bytes = 128 PiB; comfortably above
+                // any plausible image but below i64::MAX).
+                const VIRTUAL_SIZE_SANITY_CEILING: u64 = 1u64 << 57;
+                let trusted_virtual_size = if virtual_size != 0 {
+                    virtual_size
+                } else {
+                    let reported = create_result.resolved_virtual_size;
+                    if reported > VIRTUAL_SIZE_SANITY_CEILING {
+                        return Err(format!(
+                            "create: guest reported resolved_virtual_size={} \
+                             exceeding the sanity ceiling ({} bytes); \
+                             refusing preallocation",
+                            reported, VIRTUAL_SIZE_SANITY_CEILING
+                        )
+                        .into());
+                    }
+                    reported
+                };
+                let cluster = cluster_size.max(1) as u64;
+                let data_len = trusted_virtual_size
+                    .div_ceil(cluster)
+                    .saturating_mul(cluster);
+                if let Err(e) = (|| -> Result<(), Box<dyn std::error::Error>> {
+                    let postpass_file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(output_path)
+                        .map_err(|e| {
+                        format!("create: reopen for preallocation failed: {}", e)
+                    })?;
+                    // Anchor the preallocation range to the file's
+                    // actual length on disk, not the guest's report.
+                    let observed_file_size = postpass_file
+                        .metadata()
+                        .map_err(|e| {
+                            format!("create: stat for preallocation bounds failed: {}", e)
+                        })?
+                        .len();
+                    let data_offset = observed_file_size.saturating_sub(data_len);
+                    let range_end = data_offset
+                        .checked_add(data_len)
+                        .ok_or("create: preallocation range overflows u64")?;
+                    if range_end > observed_file_size {
+                        return Err(format!(
+                            "create: preallocation range [{}, {}) exceeds \
+                             observed file size {}; refusing",
+                            data_offset, range_end, observed_file_size
+                        )
+                        .into());
+                    }
+                    // Defence-in-depth (PR #298 review item #11): a
+                    // qcow2 image always has at least one cluster of
+                    // metadata at offset 0 (the header). If the guest
+                    // emitted a short file the saturating_sub above
+                    // could land data_offset at 0, and the post-pass
+                    // would clobber the header. Require at least one
+                    // cluster of headroom before the data region.
+                    if data_offset < cluster {
+                        return Err(format!(
+                            "create: preallocation data_offset ({}) below \
+                             minimum metadata footprint ({}); the guest may have \
+                             emitted a short file. Refusing to preallocate.",
+                            data_offset, cluster
+                        )
+                        .into());
+                    }
+                    apply_preallocation(
+                        &postpass_file,
+                        &args.preallocation,
+                        data_offset,
+                        data_len,
+                    )?;
+                    postpass_file
+                        .sync_all()
+                        .map_err(|e| format!("create: sync after preallocation failed: {}", e))?;
+                    Ok(())
+                })() {
+                    let _ = std::fs::remove_file(output_path);
+                    return Err(e);
+                }
+            }
+
+            if !args.quiet {
+                render_create_success(
+                    args,
+                    create_result.resolved_virtual_size,
+                    create_result.metadata_bytes_written,
+                    create_result.file_size_after,
+                    create_result.resolved_unit_size,
+                );
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(output_path);
+            Err(e)
+        }
+    }
+}
+
+/// Decode a target-format string into its numeric `ImageFormat`.
+/// Errors on unsupported values; clap's value_parser already rules
+/// out completely unknown strings.
+fn create_target_format(s: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    match s {
+        "raw" => Ok(IMAGE_FORMAT_RAW),
+        "qcow2" => Ok(IMAGE_FORMAT_QCOW2),
+        "vmdk" => Ok(IMAGE_FORMAT_VMDK4),
+        "vpc" => Ok(IMAGE_FORMAT_VHD),
+        "vhdx" => Ok(IMAGE_FORMAT_VHDX),
+        other => Err(format!("create: unsupported target format '{}'", other).into()),
+    }
+}
+
+/// Numeric host-side mirror of `CreateResult` populated by the guest
+/// dispatch. We only need the fields the host renders.
+struct CreateRunResult {
+    resolved_virtual_size: u64,
+    metadata_bytes_written: u64,
+    file_size_after: u64,
+    resolved_unit_size: u32,
+    error: u32,
+}
+
+/// Build CreateConfig, set up KVM + virtio, launch the create guest
+/// binary, and harvest the resulting `CreateResultMessage`.
+///
+/// Pulled out of `run_create_nonraw` so the partial-output cleanup
+/// in the caller is a single match arm.
+#[allow(clippy::too_many_arguments)]
+fn run_create_guest(
+    core_code: &[u8],
+    operation_code: &[u8],
+    args: &CreateArgs,
+    target_format: u32,
+    flags: u32,
+    virtual_size: u64,
+    cluster_size: u32,
+    refcount_bits: u8,
+    vmdk_subformat: u8,
+    vhd_subformat: u8,
+    grain_size: u32,
+    block_size: u32,
+    input_backing: BackingStore,
+    input_capacity: u64,
+    backing_file_bytes: &[u8],
+    backing_format_code: u32,
+    output_backing: BackingStore,
+    output_capacity_hint: u64,
+    verbose: bool,
+) -> Result<CreateRunResult, Box<dyn std::error::Error>> {
+    // --- KVM / VM / guest memory setup ----------------------------------
+    let kvm = Kvm::new()?;
+    debug!("KVM API version: {}", kvm.get_api_version());
+
+    let kvm_stats_checker = kvm_stats::KvmStatsChecker::new(&kvm);
+    kvm_stats_checker.display_status();
+
+    let vm = kvm.create_vm()?;
+    debug!("Created VM");
+
+    let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
+    debug!("Allocated {GUEST_MEM_SIZE} bytes of guest memory");
+
+    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let host_addr = region.as_ptr() as u64;
+
+    let mem_region = kvm_userspace_memory_region {
+        slot: 0,
+        guest_phys_addr: 0,
+        memory_size: GUEST_MEM_SIZE,
+        userspace_addr: host_addr,
+        flags: 0,
+    };
+    // SAFETY: mem_region.userspace_addr points to a valid
+    // GuestMemoryMmap allocation that outlives the VM.
+    unsafe {
+        vm.set_user_memory_region(mem_region)?;
+    }
+    debug!("Configured memory region");
+
+    setup_gdt(&guest_mem)?;
+    setup_page_tables(&guest_mem, GUEST_MEM_SIZE)?;
+
+    guest_mem.write_slice(core_code, GuestAddress(GUEST_CODE_BASE))?;
+    guest_mem.write_slice(operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
+
+    // --- Write CreateConfig at OPERATION_CONFIG_ADDR --------------------
+    // Layout (must match shared::CreateConfig exactly):
+    //    0: magic                u32
+    //    4: target_format        u32
+    //    8: flags                u32
+    //   12: sector_size          u32
+    //   16: virtual_size         u64
+    //   24: qcow2_cluster_size   u32
+    //   28: qcow2_refcount_bits  u8
+    //   29: vmdk_subformat       u8
+    //   30: vhd_subformat        u8
+    //   31: _pad                 u8
+    //   32: vmdk_grain_size      u32
+    //   36: block_size           u32
+    //   40: backing_file_len     u32
+    //   44: backing_file         [u8; 1024]
+    // 1068: backing_format       u32
+    // 1072: _reserved            [u8; 64]
+    guest_mem.write_obj(CREATE_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
+    guest_mem.write_obj(target_format, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
+    guest_mem.write_obj(flags, GuestAddress(OPERATION_CONFIG_ADDR + 8))?;
+    guest_mem.write_obj(args.sector_size, GuestAddress(OPERATION_CONFIG_ADDR + 12))?;
+    guest_mem.write_obj(virtual_size, GuestAddress(OPERATION_CONFIG_ADDR + 16))?;
+    guest_mem.write_obj(cluster_size, GuestAddress(OPERATION_CONFIG_ADDR + 24))?;
+    guest_mem.write_obj(refcount_bits, GuestAddress(OPERATION_CONFIG_ADDR + 28))?;
+    guest_mem.write_obj(vmdk_subformat, GuestAddress(OPERATION_CONFIG_ADDR + 29))?;
+    guest_mem.write_obj(vhd_subformat, GuestAddress(OPERATION_CONFIG_ADDR + 30))?;
+    // _pad (offset 31) left zero from page-zeroed memory.
+    guest_mem.write_obj(grain_size, GuestAddress(OPERATION_CONFIG_ADDR + 32))?;
+    guest_mem.write_obj(block_size, GuestAddress(OPERATION_CONFIG_ADDR + 36))?;
+    // Backing-file fields. backing_file_bytes is empty when no -b
+    // was given (phase 3c's stub-input path); otherwise it holds the
+    // user-typed path bytes and the guest reads input device 0 to
+    // recover the backing's virtual size when CreateConfig.virtual_size
+    // is zero.
+    let backing_len = backing_file_bytes.len() as u32;
+    guest_mem.write_obj(backing_len, GuestAddress(OPERATION_CONFIG_ADDR + 40))?;
+    let mut backing_buf = [0u8; CREATE_CONFIG_MAX_BACKING_FILE];
+    backing_buf[..backing_file_bytes.len()].copy_from_slice(backing_file_bytes);
+    guest_mem.write_slice(&backing_buf, GuestAddress(OPERATION_CONFIG_ADDR + 44))?;
+    guest_mem.write_obj(
+        backing_format_code,
+        GuestAddress(OPERATION_CONFIG_ADDR + 1068),
+    )?;
+
+    debug!(
+        "Wrote create config at 0x{:x} (target={}, flags=0x{:x}, sector_size={}, \
+         virtual_size={}, cluster_size={}, refcount_bits={}, vmdk_subformat={}, \
+         vhd_subformat={}, grain_size={}, block_size={})",
+        OPERATION_CONFIG_ADDR,
+        target_format,
+        flags,
+        args.sector_size,
+        virtual_size,
+        cluster_size,
+        refcount_bits,
+        vmdk_subformat,
+        vhd_subformat,
+        grain_size,
+        block_size,
+    );
+
+    // --- Set up devices --------------------------------------------------
+    // core unconditionally initialises input device 0 (see core/src/
+    // main.rs::_start), so even though phase 3c has no real backing we
+    // attach a tiny stub at device index 0 and place the output at
+    // index 1. The guest never reads from the stub.
+    let mut device_set = DeviceSet::new();
+    let mut io_events: Vec<IoEvent> = Vec::new();
+
+    let input_mmio = device_mmio_base(0);
+    let input_vq = device_vq_base(0);
+    let input_device = VirtioBlockDevice::new(
+        input_backing,
+        input_capacity,
+        args.sector_size as u64,
+        true, // read-only
+        input_mmio,
+        input_vq,
+    );
+    let input_device = Arc::new(Mutex::new(input_device));
+    device_set.add_device(Arc::clone(&input_device), true);
+    io_events.push(IoEvent::new(input_mmio)?);
+
+    let output_mmio = device_mmio_base(1);
+    let output_vq = device_vq_base(1);
+    let output_device = VirtioBlockDevice::new(
+        output_backing,
+        output_capacity_hint,
+        args.sector_size as u64,
+        false, // writable
+        output_mmio,
+        output_vq,
+    );
+    debug!(
+        "Created output virtio-block device at MMIO 0x{output_mmio:x}, VQ 0x{output_vq:x} \
+         (capacity hint {output_capacity_hint} bytes)"
+    );
+    let output_device = Arc::new(Mutex::new(output_device));
+    device_set.add_device(Arc::clone(&output_device), false);
+    io_events.push(IoEvent::new(output_mmio)?);
+
+    let guest_mem = Arc::new(guest_mem);
+    let vmm_stats = Arc::new(Mutex::new(VmmStats::new()));
+
+    // Try to register ioeventfds; fall back to VM exits on failure.
+    let mut io_thread: Option<io_thread::IoThread> = None;
+    let mut registered_count = 0usize;
+    let mut registration_failed = false;
+    for evt in io_events.iter_mut() {
+        if let Err(e) = evt.register(&vm) {
+            debug!("ioeventfd: failed to register ({e:?}), falling back to VM exits");
+            registration_failed = true;
+            break;
+        }
+        registered_count += 1;
+    }
+    if registration_failed {
+        for evt in io_events.iter_mut().take(registered_count) {
+            let _ = evt.unregister(&vm);
+        }
+    }
+    let all_registered = !registration_failed;
+
+    if all_registered && !io_events.is_empty() {
+        debug!(
+            "ioeventfd: enabled for {} device(s) (with I/O thread)",
+            io_events.len()
+        );
+        let io_devices = device_set.create_io_devices(io_events);
+        io_thread = Some(io_thread::IoThread::new(
+            io_devices,
+            Arc::clone(&guest_mem),
+            Arc::clone(&vmm_stats),
+        ));
+    }
+
+    // --- vCPU setup ------------------------------------------------------
+    let mut vcpu = vm.create_vcpu(0)?;
+    let mut sregs = vcpu.get_sregs()?;
+    setup_sregs(&mut sregs);
+    vcpu.set_sregs(&sregs)?;
+    let mut regs = vcpu.get_regs()?;
+    setup_regs(&mut regs);
+    vcpu.set_regs(&regs)?;
+
+    // --- Serial decoders / transmitter / debug buffer -------------------
+    let mut serial_decoder = SerialDecoder::new();
+    let mut serial_transmitter = SerialTransmitter::new();
+    let mut debug_buffer = DebugBuffer::new();
+
+    // 1 stub input + 1 output, no progress events (the metadata write
+    // is tiny and instant). Phase 3d replaces the stub with the real
+    // backing image when -b is given.
+    let config = vmm_config(args.sector_size, args.sector_size, 100);
+    serial_transmitter.queue_config(&config);
+    debug!(
+        "Queued configuration message ({} bytes) for guest",
+        serial_transmitter.buffer.len()
+    );
+
+    // --- Run the vCPU loop ----------------------------------------------
+    let mut create_result_seen = false;
+    let mut harvested = CreateRunResult {
+        resolved_virtual_size: 0,
+        metadata_bytes_written: 0,
+        file_size_after: 0,
+        resolved_unit_size: 0,
+        error: CREATE_RESULT_ERROR_OK,
+    };
+    let mut vm_error: Option<String> = None;
+
+    debug!("Starting guest execution");
+
+    loop {
+        match vcpu.run()? {
+            VcpuExit::Hlt => {
+                vmm_stats.lock().unwrap().record_hlt();
+                debug!("Create operation completed (HLT)");
+                break;
+            }
+            VcpuExit::IoOut(port, data) => {
+                vmm_stats.lock().unwrap().record_io_out();
+                if port == SERIAL_PORT {
+                    for &byte in data {
+                        if let Some(msg) = serial_decoder.add_byte(byte) {
+                            if let Some(guest_::GuestMessage_::Payload::CreateResult(c)) =
+                                &msg.payload
+                            {
+                                harvested.resolved_virtual_size = c.resolved_virtual_size;
+                                harvested.metadata_bytes_written = c.metadata_bytes_written;
+                                harvested.file_size_after = c.file_size_after;
+                                harvested.resolved_unit_size = c.resolved_unit_size;
+                                harvested.error = c.error;
+                                create_result_seen = true;
+                            } else if verbose {
+                                debug!("{}", format_message(&msg));
+                            }
+                        }
+                    }
+                } else if port == DEBUG_PORT {
+                    for &byte in data {
+                        if let Some(line) = debug_buffer.add_byte(byte) {
+                            debug!("[GUEST] {line}");
+                        }
+                    }
+                } else {
+                    debug!("IO OUT: port=0x{port:x}, data={data:?}");
+                }
+            }
+            VcpuExit::IoIn(port, data) => {
+                vmm_stats.lock().unwrap().record_io_in();
+                if port == SERIAL_PORT {
+                    for byte in data.iter_mut() {
+                        *byte = serial_transmitter.next_byte().unwrap_or(0);
+                    }
+                } else if port == SERIAL_PORT + 5 {
+                    let mut lsr = 0x60u8;
+                    if serial_transmitter.has_data() {
+                        lsr |= 0x01;
+                    }
+                    data[0] = lsr;
+                } else {
+                    for byte in data {
+                        *byte = 0;
+                    }
+                }
+            }
+            VcpuExit::MmioRead(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_read();
+                let value = device_set.mmio_read(addr);
+                write_mmio_data(data, value);
+            }
+            VcpuExit::MmioWrite(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_write();
+                let value = read_mmio_data(data);
+                if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
+                    if io_thread.is_none() && should_process {
+                        device_set.process_queue_for_device(
+                            device_index,
+                            &guest_mem,
+                            &vmm_stats,
+                        )?;
+                    }
+                }
+            }
+            VcpuExit::Shutdown => {
+                vmm_stats.lock().unwrap().record_shutdown();
+                vm_error = Some("VM shutdown (triple fault)".to_string());
+                break;
+            }
+            VcpuExit::FailEntry(reason, cpu) => {
+                vmm_stats.lock().unwrap().record_fail_entry();
+                vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
+                break;
+            }
+            exit => {
+                vmm_stats.lock().unwrap().record_unknown();
+                vm_error = Some(format!("unexpected VM exit: {exit:?}"));
+                break;
+            }
+        }
+    }
+
+    if let Some(mut thread) = io_thread {
+        thread.stop();
+    }
+
+    if log::log_enabled!(log::Level::Debug) {
+        vmm_stats.lock().unwrap().display();
+    }
+
+    if let Some(error) = vm_error {
+        return Err(error.into());
+    }
+    if !create_result_seen {
+        return Err("create: guest did not return a result".into());
+    }
+
+    Ok(harvested)
+}
+
+/// User-facing message for each `CreateResult::ERROR_*` code.
+fn create_error_detail(code: u32) -> &'static str {
+    match code {
+        CREATE_RESULT_ERROR_INVALID_OPTION => "invalid option for target format",
+        CREATE_RESULT_ERROR_INVALID_SIZE => "virtual size out of range for format",
+        CREATE_RESULT_ERROR_SCRATCH_TOO_SMALL => {
+            "option combination exceeds guest scratch (try a larger cluster size)"
+        }
+        CREATE_RESULT_ERROR_BACKING_READ_FAILED => "failed to read backing file header",
+        CREATE_RESULT_ERROR_BACKING_PARSE_FAILED => {
+            "backing file header could not be parsed \
+             (file may be truncated, corrupted, or an unrecognised format)"
+        }
+        CREATE_RESULT_ERROR_BACKING_TOO_LONG => "backing file path too long (max 1024 bytes)",
+        CREATE_RESULT_ERROR_WRITE_FAILED => "write to output device failed",
+        CREATE_RESULT_ERROR_UNSUPPORTED_FORMAT => "target format not supported",
+        CREATE_RESULT_ERROR_BACKING_FORMAT_UNSUPPORTED => {
+            "backing file format is recognised but virtual_size \
+             extraction is not yet implemented for it"
+        }
+        CREATE_RESULT_ERROR_BACKING_SIZE_TOO_LARGE => {
+            "backing file is too large for the target format with the \
+             requested options (try a larger cluster size, switch to \
+             a target format with greater virtual-size headroom, or \
+             pass an explicit SIZE that fits)"
+        }
+        _ => "unknown error",
+    }
+}
+
+/// Host-side raw image creation: `open(O_CREAT|O_TRUNC|O_RDWR)` +
+/// `ftruncate(SIZE)`, plus `posix_fallocate` when the user asked
+/// for preallocation=falloc. On any failure the partial output
+/// file is removed before propagating the error.
+fn run_create_raw(args: &CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let size_str = args.size.as_ref().ok_or("create: -f raw requires SIZE")?;
+    let virtual_size = parse_memory_size(size_str)?;
+
+    let path = Path::new(&args.filename);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .read(true)
+        .mode(0o644)
+        .open(path)
+        .map_err(|e| format!("create: open '{}' failed: {}", args.filename, e))?;
+
+    if let Err(e) = create_raw_finalize(&file, virtual_size, &args.preallocation) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    drop(file);
+
+    if !args.quiet {
+        render_create_success(args, virtual_size, 0, virtual_size, 0);
+    }
+    Ok(())
+}
+
+/// Apply ftruncate + optional preallocation pass + fsync. Split out
+/// so `run_create_raw` can handle cleanup uniformly on any failure.
+///
+/// `preallocation` may be "off", "falloc", or "full". "metadata" is
+/// rejected for raw at the validator (raw has no metadata to
+/// preallocate); any other value is a no-op fallthrough handled the
+/// same as "off".
+fn create_raw_finalize(
+    file: &std::fs::File,
+    virtual_size: u64,
+    preallocation: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::fd::AsRawFd;
+
+    file.set_len(virtual_size)
+        .map_err(|e| format!("create: ftruncate failed: {}", e))?;
+
+    let fd = file.as_raw_fd();
+    match preallocation {
+        "falloc" => {
+            // posix_fallocate returns 0 on success, errno on failure
+            // (does not set errno; the return value IS the errno).
+            // SAFETY: fd is the raw fd of `file`, which the caller
+            // owns for the duration of this block. virtual_size has
+            // been bounded to <= i64::MAX by validate_create_args, so
+            // the cast to off_t (i64) is in-range.
+            let rc = unsafe { libc::posix_fallocate(fd, 0, virtual_size as libc::off_t) };
+            if rc != 0 {
+                return Err(format!(
+                    "create: posix_fallocate failed: {}",
+                    std::io::Error::from_raw_os_error(rc)
+                )
+                .into());
+            }
+        }
+        "full" => {
+            fill_zeros(fd, 0, virtual_size)
+                .map_err(|e| format!("create: zero-fill failed: {}", e))?;
+        }
+        _ => {}
+    }
+
+    file.sync_all()
+        .map_err(|e| format!("create: sync failed: {}", e))?;
+    Ok(())
+}
+
+/// Zero a byte range in `fd` from `offset` for `length` bytes.
+///
+/// Tries `fallocate(FALLOC_FL_ZERO_RANGE)` first (fast on btrfs /
+/// ext4 / xfs — no actual writes). On `EOPNOTSUPP` (or kernels /
+/// filesystems that don't support it: tmpfs, NFS, some FUSE),
+/// falls back to a `pwrite` loop with a 64 KiB stack-allocated
+/// zero buffer.
+fn fill_zeros(fd: libc::c_int, offset: u64, length: u64) -> std::io::Result<()> {
+    if length == 0 {
+        return Ok(());
+    }
+
+    // SAFETY: fd is a valid open file descriptor owned by the caller
+    // (passed in by every call site as `file.as_raw_fd()` on a still-
+    // live File). FALLOC_FL_ZERO_RANGE is a kernel constant. offset
+    // and length are non-negative u64 values cast to off_t; an
+    // out-of-range cast surfaces as EINVAL from the syscall rather
+    // than UB.
+    let rc = unsafe {
+        libc::fallocate(
+            fd,
+            libc::FALLOC_FL_ZERO_RANGE,
+            offset as libc::off_t,
+            length as libc::off_t,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) | Some(libc::EINVAL) => {
+            // FALLOC_FL_ZERO_RANGE may surface as EINVAL on some
+            // older kernels; fall through to the write loop.
+        }
+        _ => return Err(err),
+    }
+
+    let zeros = [0u8; 65536];
+    let mut written: u64 = 0;
+    while written < length {
+        let remaining = length - written;
+        let chunk = remaining.min(zeros.len() as u64) as usize;
+        // SAFETY: `zeros` is a stack-allocated [u8; 65536] live for
+        // the duration of this call. `chunk` is bounded by
+        // `zeros.len()` via the preceding .min(), so pwrite reads at
+        // most that many bytes from the buffer. fd is caller-owned.
+        let rc = unsafe {
+            libc::pwrite(
+                fd,
+                zeros.as_ptr() as *const libc::c_void,
+                chunk,
+                (offset + written) as libc::off_t,
+            )
+        };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if rc == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "pwrite returned 0 during zero-fill",
+            ));
+        }
+        written += rc as u64;
+    }
+    Ok(())
+}
+
+/// Apply the host-side portion of qcow2 preallocation, layered on
+/// top of the metadata the guest already emitted.
+///
+/// - `off` / `metadata`: no-op (guest did all the work).
+/// - `falloc`: `posix_fallocate` over the data region.
+/// - `full`: zero-fill (via `fallocate(FALLOC_FL_ZERO_RANGE)`,
+///   falling back to a `pwrite` loop).
+///
+/// Unknown modes are treated as no-ops; the validator rejects them
+/// before reaching this function.
+fn apply_preallocation(
+    file: &std::fs::File,
+    mode: &str,
+    data_offset: u64,
+    data_len: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::fd::AsRawFd;
+
+    if data_len == 0 {
+        return Ok(());
+    }
+    let fd = file.as_raw_fd();
+    match mode {
+        "falloc" => {
+            // SAFETY: fd is the raw fd of `file`, caller-owned for
+            // the duration of this call. data_offset and data_len
+            // are validated against the file's observed length by
+            // run_create's clamping step before this function is
+            // entered. Out-of-range casts surface as EINVAL from
+            // posix_fallocate rather than UB.
+            let rc = unsafe {
+                libc::posix_fallocate(fd, data_offset as libc::off_t, data_len as libc::off_t)
+            };
+            if rc != 0 {
+                return Err(format!(
+                    "create: posix_fallocate failed: {}",
+                    std::io::Error::from_raw_os_error(rc)
+                )
+                .into());
+            }
+        }
+        "full" => {
+            fill_zeros(fd, data_offset, data_len)
+                .map_err(|e| format!("create: zero-fill failed: {}", e))?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Render a successful create to stdout in the user's chosen
+/// format.
+///
+/// `human` (default) emits a qemu-img-style one-liner:
+///     Created: foo.qcow2 (format=qcow2, virtual_size=1073741824, cluster_size=65536)
+/// `json` emits a 4-space-indented object with a fixed key order.
+/// `-q` (args.quiet) suppresses the human line; JSON output is
+/// always emitted regardless of -q so scripts can rely on it.
+fn render_create_success(
+    args: &CreateArgs,
+    virtual_size: u64,
+    metadata_bytes_written: u64,
+    file_size_after: u64,
+    resolved_unit_size: u32,
+) {
+    if args.output == "json" {
+        render_create_success_json(
+            args,
+            virtual_size,
+            metadata_bytes_written,
+            file_size_after,
+            resolved_unit_size,
+        );
+        return;
+    }
+    if args.quiet {
+        return;
+    }
+    if resolved_unit_size == 0 {
+        println!(
+            "Created: {} (format={}, virtual_size={})",
+            args.filename, args.target_format, virtual_size
+        );
+    } else {
+        println!(
+            "Created: {} (format={}, virtual_size={}, unit_size={})",
+            args.filename, args.target_format, virtual_size, resolved_unit_size
+        );
+    }
+}
+
+/// JSON object companion to the human-readable success line.
+///
+/// 4-space indent, key order: filename, format, virtual_size,
+/// metadata_bytes_written, file_size_after, resolved_unit_size.
+/// The escape pass on `filename` matches measure's JSON output for
+/// strings containing backslashes or quotes.
+fn render_create_success_json(
+    args: &CreateArgs,
+    virtual_size: u64,
+    metadata_bytes_written: u64,
+    file_size_after: u64,
+    resolved_unit_size: u32,
+) {
+    let escaped = json_escape_string(&args.filename);
+    println!("{{");
+    println!("    \"filename\": \"{}\",", escaped);
+    println!("    \"format\": \"{}\",", args.target_format);
+    println!("    \"virtual_size\": {},", virtual_size);
+    println!(
+        "    \"metadata_bytes_written\": {},",
+        metadata_bytes_written
+    );
+    println!("    \"file_size_after\": {},", file_size_after);
+    println!("    \"resolved_unit_size\": {}", resolved_unit_size);
+    println!("}}");
+}
+
+/// Minimal JSON-string escaping for `"` and `\`. Filenames may
+/// contain either; the rest of the renderer assumes ASCII-safe
+/// values for the other fields (numeric or controlled strings).
+fn json_escape_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Host-side defensive validation of `CreateArgs`. The guest
+/// re-checks every critical field, but failing early at the host
+/// gives a clearer user-facing error before any I/O or KVM setup.
+fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Filename + (size or backing).
+    if args.filename.is_empty() {
+        return Err("create: FILENAME is required".into());
+    }
+    if args.size.is_none() && args.backing.is_none() {
+        return Err("create: either SIZE or -b BACKING must be provided".into());
+    }
+
+    // Sector size: phase 3 only supports 512. Larger sector sizes
+    // are valid per the call-table ABI but the create metadata
+    // layouts in `crates/create` were sized for 512-byte alignment
+    // (per-format header / descriptor / footer offsets), and the
+    // guest's sector-by-sector write loop would conflate multiple
+    // metadata regions into a single big sector if asked. Phase 5
+    // may relax this once the planner emits coalesced sector-sized
+    // writes.
+    if args.sector_size != 512 {
+        return Err(format!(
+            "create: --sector-size must be 512 in phase 3 \
+             (larger sector sizes are deferred — see PLAN-create.md \
+             phase 5; got {})",
+            args.sector_size
+        )
+        .into());
+    }
+
+    // Per-format option validation. Each ignores the default 0
+    // sentinel (filled in by the per-format handler later).
+    if args.cluster_size != 0
+        && (args.cluster_size < 512
+            || args.cluster_size > (2 << 20)
+            || !args.cluster_size.is_power_of_two())
+    {
+        return Err(format!(
+            "create: --cluster-size must be a power of 2 in 512..=2 MiB (got {})",
+            args.cluster_size
+        )
+        .into());
+    }
+    if args.refcount_bits != 0 && !matches!(args.refcount_bits, 1 | 2 | 4 | 8 | 16 | 32 | 64) {
+        return Err(format!(
+            "create: --refcount-bits must be one of 1,2,4,8,16,32,64 (got {})",
+            args.refcount_bits
+        )
+        .into());
+    }
+    if args.grain_size != 0
+        && (args.grain_size < 4096 || args.grain_size > 65536 || !args.grain_size.is_power_of_two())
+    {
+        return Err(format!(
+            "create: --grain-size must be a power of 2 in [4 KiB, 64 KiB] (got {})",
+            args.grain_size
+        )
+        .into());
+    }
+    if args.block_size != 0 && !args.block_size.is_power_of_two() {
+        return Err(format!(
+            "create: --block-size must be a power of 2 (got {})",
+            args.block_size
+        )
+        .into());
+    }
+
+    // Subformat must be valid for the chosen target.
+    match args.target_format.as_str() {
+        "vmdk" => {
+            if !matches!(
+                args.subformat.as_str(),
+                "" | "monolithicSparse" | "streamOptimized" | "monolithicFlat"
+            ) {
+                return Err(format!(
+                    "create: --subformat '{}' is not valid for vmdk \
+                     (expected monolithicSparse, streamOptimized, or monolithicFlat)",
+                    args.subformat
+                )
+                .into());
+            }
+            if args.subformat == "monolithicFlat" {
+                return Err("create: vmdk monolithicFlat is not yet supported \
+                            (multi-file subformats land in phase 5 of \
+                            PLAN-create.md; use instar convert -O vmdk for now)"
+                    .into());
+            }
+        }
+        "vpc" => {
+            if !matches!(args.subformat.as_str(), "" | "dynamic" | "fixed") {
+                return Err(format!(
+                    "create: --subformat '{}' is not valid for vpc (expected dynamic or fixed)",
+                    args.subformat
+                )
+                .into());
+            }
+        }
+        _ => {
+            if !args.subformat.is_empty() {
+                return Err(format!(
+                    "create: --subformat is only valid with -f vmdk or -f vpc (got -f {})",
+                    args.target_format
+                )
+                .into());
+            }
+        }
+    }
+
+    // Preallocation accept set (phase 6):
+    //   off       — any format (default)
+    //   metadata  — qcow2 only (raw has no metadata to preallocate;
+    //               vmdk/vpc/vhdx deferred)
+    //   falloc    — raw or qcow2
+    //   full      — raw or qcow2
+    // Non-qcow2 sparse formats (vmdk/vpc/vhdx) reject all non-`off`
+    // modes with a clear "future work" pointer.
+    match (args.target_format.as_str(), args.preallocation.as_str()) {
+        (_, "off") => {}
+        ("raw", "metadata") => {
+            return Err("create: --preallocation=metadata is not valid for raw \
+                 (raw has no metadata to preallocate)"
+                .into());
+        }
+        ("qcow2", "metadata") | ("raw" | "qcow2", "falloc") | ("raw" | "qcow2", "full") => {}
+        ("vmdk" | "vpc" | "vhdx", mode @ ("metadata" | "falloc" | "full")) => {
+            return Err(format!(
+                "create: --preallocation={} is not yet supported for {} \
+                 (non-qcow2 preallocation is future work — see PLAN-create.md)",
+                mode, args.target_format
+            )
+            .into());
+        }
+        (_, other) => {
+            return Err(format!("create: unknown --preallocation '{}'", other).into());
+        }
+    }
+
+    // Raw doesn't support backing. Reject explicitly.
+    if args.target_format == "raw" && args.backing.is_some() {
+        return Err("create: -f raw does not support -b BACKING (raw images \
+                    have no backing-file concept)"
+            .into());
+    }
+
+    // Backing without -F and without -u: match modern qemu-img and refuse.
+    if args.backing.is_some() && args.backing_format.is_none() && !args.backing_unsafe {
+        return Err("create: -b BACKING requires either -F BACKING_FORMAT or \
+                    -u (backing-unsafe). Refusing to guess the backing format \
+                    matches modern qemu-img."
+            .into());
+    }
+
+    // Size, when provided, must parse to a non-zero value and stay
+    // within the host's off_t range — the preallocation path casts
+    // virtual_size to libc::off_t (i64), and values above i64::MAX
+    // wrap to negative offsets, which would fail with EINVAL but
+    // shouldn't reach the syscall in the first place.
+    if let Some(ref s) = args.size {
+        let parsed = parse_memory_size(s)?;
+        if parsed == 0 {
+            return Err("create: SIZE must be greater than zero".into());
+        }
+        if parsed > i64::MAX as u64 {
+            return Err(format!(
+                "create: SIZE {parsed} exceeds the maximum representable \
+                 size ({})",
+                i64::MAX
+            )
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
 /// Print compare result in human-readable or JSON format.
 ///
 /// Human output matches qemu-img compare (all output to stdout):
@@ -6417,5 +8202,235 @@ fn write_mmio_data(data: &mut [u8], value: u32) {
             data[..8].copy_from_slice(&bytes);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod create_option_tests {
+    //! Unit tests for `parse_create_o_options` and its helpers.
+    //!
+    //! Tests live next to the parser rather than in tests/ so they
+    //! don't require the integration-test harness (no KVM, no
+    //! testdata). Integration coverage of the wired path lives in
+    //! tests/test_create.py.
+    use super::*;
+
+    fn s(v: &str) -> Vec<String> {
+        vec![v.to_string()]
+    }
+
+    #[test]
+    fn empty_overrides_parse_cleanly() {
+        let o = parse_create_o_options("qcow2", &[]).unwrap();
+        assert!(o.cluster_size.is_none());
+        assert!(o.size.is_none());
+        assert!(o.backing_file.is_none());
+    }
+
+    #[test]
+    fn qcow2_all_keys_parse() {
+        let o = parse_create_o_options(
+            "qcow2",
+            &s(
+                "cluster_size=4k,refcount_bits=8,extended_l2=on,lazy_refcounts=yes,\
+                compat=0.10,preallocation=off,size=64M,backing_file=p.qcow2,\
+                backing_fmt=qcow2,compression_type=zlib",
+            ),
+        )
+        .unwrap();
+        assert_eq!(o.cluster_size, Some(4096));
+        assert_eq!(o.refcount_bits, Some(8));
+        assert_eq!(o.extended_l2, Some(true));
+        assert_eq!(o.lazy_refcounts, Some(true));
+        assert_eq!(o.compat_v3, Some(false));
+        assert_eq!(o.preallocation, Some("off"));
+        assert_eq!(o.size, Some(64 * 1024 * 1024));
+        assert_eq!(o.backing_file.as_deref(), Some("p.qcow2"));
+        assert_eq!(o.backing_fmt, Some("qcow2"));
+    }
+
+    #[test]
+    fn vmdk_subformat_and_grain() {
+        let o =
+            parse_create_o_options("vmdk", &s("subformat=streamOptimized,grain_size=16k")).unwrap();
+        assert_eq!(o.vmdk_subformat, Some(1));
+        assert_eq!(o.grain_size, Some(16 * 1024));
+    }
+
+    #[test]
+    fn vmdk_monolithic_flat_parses_but_host_will_reject() {
+        // Phase 1's library and phase 3's host validator reject
+        // monolithicFlat; the parser is permissive so the user gets
+        // the more specific "deferred" error from the host pass.
+        let o = parse_create_o_options("vmdk", &s("subformat=monolithicFlat")).unwrap();
+        assert_eq!(o.vmdk_subformat, Some(2));
+    }
+
+    #[test]
+    fn vpc_subformat_fixed() {
+        let o = parse_create_o_options("vpc", &s("subformat=fixed")).unwrap();
+        assert_eq!(o.vhd_subformat, Some(1));
+    }
+
+    #[test]
+    fn vhdx_block_size() {
+        let o = parse_create_o_options("vhdx", &s("block_size=8M")).unwrap();
+        assert_eq!(o.block_size, Some(8 * 1024 * 1024));
+    }
+
+    #[test]
+    fn raw_size_and_preallocation() {
+        let o = parse_create_o_options("raw", &s("size=4M,preallocation=falloc")).unwrap();
+        assert_eq!(o.size, Some(4 * 1024 * 1024));
+        assert_eq!(o.preallocation, Some("falloc"));
+    }
+
+    #[test]
+    fn unknown_key_errors_with_target_name() {
+        let err = parse_create_o_options("qcow2", &s("nonsense=1"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nonsense"), "error did not mention key: {err}");
+        assert!(err.contains("qcow2"), "error did not mention target: {err}");
+    }
+
+    #[test]
+    fn bad_cluster_size_value_errors() {
+        let err = parse_create_o_options("qcow2", &s("cluster_size=zzz"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cluster_size"), "error mentions key: {err}");
+    }
+
+    #[test]
+    fn bad_compat_value_errors() {
+        let err = parse_create_o_options("qcow2", &s("compat=2.0"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("compat"));
+    }
+
+    #[test]
+    fn last_wins_across_multiple_o_invocations() {
+        let raw = vec![
+            "cluster_size=512".to_string(),
+            "cluster_size=4k".to_string(),
+        ];
+        let o = parse_create_o_options("qcow2", &raw).unwrap();
+        assert_eq!(o.cluster_size, Some(4096));
+    }
+
+    #[test]
+    fn last_wins_within_single_o_invocation() {
+        let o = parse_create_o_options("qcow2", &s("cluster_size=512,cluster_size=4k")).unwrap();
+        assert_eq!(o.cluster_size, Some(4096));
+    }
+
+    #[test]
+    fn encrypt_keys_return_deferred_error() {
+        let err = parse_create_o_options("qcow2", &s("encrypt.cipher=aes"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("encrypt"));
+        assert!(err.contains("deferred"));
+    }
+
+    #[test]
+    fn data_file_returns_deferred_error() {
+        let err = parse_create_o_options("qcow2", &s("data_file=ext.bin"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("data_file"));
+        assert!(err.contains("deferred"));
+    }
+
+    #[test]
+    fn qcow2_preallocation_metadata_accepted() {
+        let o = parse_create_o_options("qcow2", &s("preallocation=metadata")).unwrap();
+        assert_eq!(o.preallocation, Some("metadata"));
+    }
+
+    #[test]
+    fn qcow2_preallocation_falloc_accepted() {
+        let o = parse_create_o_options("qcow2", &s("preallocation=falloc")).unwrap();
+        assert_eq!(o.preallocation, Some("falloc"));
+    }
+
+    #[test]
+    fn qcow2_preallocation_full_accepted() {
+        let o = parse_create_o_options("qcow2", &s("preallocation=full")).unwrap();
+        assert_eq!(o.preallocation, Some("full"));
+    }
+
+    #[test]
+    fn raw_preallocation_metadata_rejected() {
+        let err = parse_create_o_options("raw", &s("preallocation=metadata"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("raw has no metadata"));
+    }
+
+    #[test]
+    fn raw_preallocation_full_accepted() {
+        let o = parse_create_o_options("raw", &s("preallocation=full")).unwrap();
+        assert_eq!(o.preallocation, Some("full"));
+    }
+
+    #[test]
+    fn vmdk_preallocation_metadata_deferred() {
+        let err = parse_create_o_options("vmdk", &s("preallocation=metadata"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-qcow2 preallocation is future work"));
+    }
+
+    #[test]
+    fn raw_rejects_qcow2_keys() {
+        let err = parse_create_o_options("raw", &s("cluster_size=4k"))
+            .unwrap_err()
+            .to_string();
+        // raw target doesn't accept cluster_size; the catch-all
+        // produces an "unrecognised -o key" error mentioning raw.
+        assert!(err.contains("cluster_size"));
+        assert!(err.contains("raw"));
+    }
+
+    #[test]
+    fn boolean_accepts_off_on_true_false_yes_no() {
+        for v in ["on", "ON", "True", "yes"] {
+            assert_eq!(parse_create_o_bool("k", v).unwrap(), true);
+        }
+        for v in ["off", "OFF", "False", "no"] {
+            assert_eq!(parse_create_o_bool("k", v).unwrap(), false);
+        }
+        assert!(parse_create_o_bool("k", "maybe").is_err());
+    }
+
+    #[test]
+    fn size_u64_accepts_t_suffix() {
+        assert_eq!(parse_create_o_size_u64("size", "1T").unwrap(), 1u64 << 40);
+    }
+
+    #[test]
+    fn missing_value_errors_with_helpful_message() {
+        let err = parse_create_o_options("qcow2", &s("cluster_size"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing a value"));
+    }
+
+    #[test]
+    fn empty_pieces_are_skipped() {
+        // Trailing or empty comma-separated pieces are ignored.
+        let o = parse_create_o_options("qcow2", &s(",cluster_size=4k,,")).unwrap();
+        assert_eq!(o.cluster_size, Some(4096));
+    }
+
+    #[test]
+    fn backing_fmt_accepts_vhd_alias() {
+        let o = parse_create_o_options("qcow2", &s("backing_fmt=vhd")).unwrap();
+        // qemu-img uses "vpc" canonically for VHD; we accept "vhd"
+        // as an alias and normalise to "vpc".
+        assert_eq!(o.backing_fmt, Some("vpc"));
     }
 }

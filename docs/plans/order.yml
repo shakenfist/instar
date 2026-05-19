@@ -14,3 +14,4 @@
 - PLAN-fuzz-autofix.md: Fuzz autofix workflow
 - PLAN-convert-followups.md: Convert follow-ups
 - PLAN-measure.md: instar measure subcommand
+- PLAN-create.md: instar create subcommand

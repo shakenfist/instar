@@ -90,7 +90,8 @@ jobs:
               --exclude check \
               --exclude compare \
               --exclude convert \
-              --exclude measure-op
+              --exclude measure-op \
+              --exclude create-op
 
       - name: Test config commands in container
         run: |

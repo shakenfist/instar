@@ -29,6 +29,7 @@ COMMAND_OUTPUT_DIRS = {
     'check': 'check',        # check-human, check-json
     'compare': 'compare',    # compare-human, compare-json
     'measure': 'measure',    # measure-human, measure-json
+    'create': 'create-info', # create-info-json (json-only, no human variant)
 }
 
 

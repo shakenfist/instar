@@ -1,0 +1,23 @@
+[package]
+name = "create"
+version = "0.2.0"
+edition = "2021"
+description = "Build empty disk image metadata layouts (no I/O)"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+shared = { path = "../../shared" }
+qcow2  = { path = "../qcow2", features = ["create"], default-features = false }
+vmdk   = { path = "../vmdk",  default-features = false }
+vhd    = { path = "../vhd",   default-features = false }
+vhdx   = { path = "../vhdx",  default-features = false }
+
+[dev-dependencies]
+# Integration tests in tests/ exercise the parser crates directly to
+# verify round-trip parsing.
+shared = { path = "../../shared" }
+qcow2  = { path = "../qcow2", features = ["create"], default-features = false }
+vmdk   = { path = "../vmdk",  default-features = false }
+vhd    = { path = "../vhd",   default-features = false }
+vhdx   = { path = "../vhdx",  default-features = false }

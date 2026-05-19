@@ -17,6 +17,7 @@ vhdx = { path = "../crates/vhdx" }
 raw = { path = "../crates/raw" }
 luks = { path = "../crates/luks" }
 measure = { path = "../crates/measure" }
+create = { path = "../crates/create" }
 
 [profile.release]
 debug = true
@@ -112,5 +113,11 @@ test = false
 [[bin]]
 name = "fuzz_measure_scan"
 path = "fuzz_targets/fuzz_measure_scan.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "fuzz_create_emitters"
+path = "fuzz_targets/fuzz_create_emitters.rs"
 doc = false
 test = false

@@ -9,6 +9,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **New `instar create` subcommand.** Creates a new empty disk
+  image of a given format and size:
+  `instar create [-f FMT] [OPTIONS] FILENAME [SIZE]`. Raw output
+  is host-only (open + ftruncate + optional `--preallocation
+  falloc`); qcow2 / vmdk / vpc (VHD) / vhdx run the new
+  `create.bin` guest in the KVM sandbox and write the metadata
+  via virtio. Supports backing files via
+  `-b BACKING [-F FMT] [-u]` — the user-typed backing path is
+  embedded verbatim into the new image so the reference stays
+  portable, and the host resolves the path relative to the new
+  image's directory when opening it. Per-format option flags
+  (`--cluster-size`, `--refcount-bits`, `--extended-l2`,
+  `--lazy-refcounts`, `--compat`, `--subformat`, `--grain-size`,
+  `--block-size`), plus qemu-img-style
+  `-o KEY=VAL,KEY=VAL,...` syntax that mirrors the same option
+  matrix (`-o` wins on conflict). Recognises every key
+  `qemu-img create -o` accepts for the supported formats —
+  `size`, `backing_file`, `backing_fmt`, `cluster_size`,
+  `compat`, `refcount_bits`, `extended_l2`, `lazy_refcounts`,
+  `compression_type`, `subformat`, `grain_size`, and
+  `block_size`. Unknown keys, encrypted-create (`encrypt.*`),
+  and external data files (`data_file*`) return clear "deferred"
+  errors with phase pointers. Preallocation modes supported
+  (phase 6): `off` (any format, default), `metadata` (qcow2
+  only — guest populates L1/L2/refcount for the full virtual
+  range and frames the data region), `falloc` (raw or qcow2 —
+  host applies `posix_fallocate` over the data region on top
+  of metadata mode), `full` (raw or qcow2 — host fills the
+  data region with zeros via `fallocate(FALLOC_FL_ZERO_RANGE)`
+  with a `pwrite` fallback). Non-qcow2 sparse formats
+  (vmdk / vpc / vhdx) reject non-`off` preallocation with a
+  "future work" pointer. Output rendering:
+  human one-liner (default), `--output=json`, or `-q` quiet.
+  Backing-file polish (phase 5): backing virtual_size is now
+  recovered correctly for vhdx parents via
+  `vhdx::VhdxState::init`'s metadata-region walk (previously
+  returned BACKING_PARSE_FAILED with a phase-5 pointer);
+  vmdk-from-vmdk chains now embed the real parent CID in the
+  child's descriptor `parentCID=` line (previously a fixed
+  `deadbeef` sentinel). Two new error codes —
+  `ERROR_BACKING_FORMAT_UNSUPPORTED` and
+  `ERROR_BACKING_SIZE_TOO_LARGE` — surface clearer messages
+  for the corner cases; the latter fires a pre-flight ceiling
+  check that suggests "try a larger cluster size" when a
+  backing-derived virtual_size exceeds the target's
+  addressable range.
+  ([phase 1](docs/plans/PLAN-create-phase-01-emitters.md) ·
+  [phase 2](docs/plans/PLAN-create-phase-02-guest-op.md) ·
+  [phase 3](docs/plans/PLAN-create-phase-03-host-cli.md) ·
+  [phase 4](docs/plans/PLAN-create-phase-04-target-options.md) ·
+  [phase 5](docs/plans/PLAN-create-phase-05-backing-file.md) ·
+  [phase 6](docs/plans/PLAN-create-phase-06-preallocation.md) ·
+  [phase 7](docs/plans/PLAN-create-phase-07-baselines.md) ·
+  [phase 8](docs/plans/PLAN-create-phase-08-integration-tests.md) ·
+  [phase 9](docs/plans/PLAN-create-phase-09-fuzz-coverage.md) ·
+  [phase 10](docs/plans/PLAN-create-phase-10-fuzz-differential.md))
+  Preallocation for vmdk / vpc / vhdx (each format needs its
+  own BAT-population pattern plus a host post-pass — analogous
+  to qcow2 metadata mode), multi-file VMDK subformats
+  (`monolithicFlat`, `twoGbMaxExtent*`), differencing VHD /
+  VHDX as the *output* target, and `--sector-size > 512`
+  remain deferred to future work (see PLAN-create.md's
+  Future-work section).
+
 - **New `instar measure` subcommand.** Predicts the file size
   required to convert an image (or a hypothetical `--size N`
   image) to a target format. Output matches `qemu-img measure`
@@ -33,6 +97,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   ([phase 1](docs/plans/PLAN-measure-phase-01-calculators.md) ·
   [phase 2](docs/plans/PLAN-measure-phase-02-allocation-scanners.md) ·
   [phase 3](docs/plans/PLAN-measure-phase-03-guest-op.md))
+
+- **Cross-version `qemu-img create` baselines** committed to
+  `instar-testdata/expected-outputs/create-info-json/` for 80
+  qemu-img versions (6.0.0 through 10.2.0). For each `(target,
+  options, size)` case in a 36-entry per-version matrix the
+  generator runs `qemu-img create` followed by `qemu-img info
+  --output=json` and records the info JSON as the comparable
+  artefact. Consumed by phase 8's integration tests, which
+  compare instar's info JSON output against the version-matched
+  qemu baseline modulo a documented divergence whitelist
+  (filename, actual-size, vmdk cid + parent-cid, vhdx
+  header-id). `instar-testdata`'s `scripts/generate-baselines.py`
+  and `scripts/detect-profiles.py` learn a new `create` command
+  + `create-info-json` output type.
+  ([phase 7](docs/plans/PLAN-create-phase-07-baselines.md))
+
+- **Differential fuzzer exercises `instar create`.**
+  `scripts/differential-fuzz.py` adds `'create'` to its
+  random operation list. Each picked iteration creates the
+  same image via `instar create` and the system
+  `qemu-img create` into separate tmp paths, reads both
+  back via `qemu-img info --output=json`, and asserts
+  normalised dict equality through the same divergence
+  whitelist phase 8b's integration tests use (inlined into
+  the fuzzer with a "keep in sync" comment). The random
+  `(target, options, size)` picker is biased away from
+  phase 8b's documented writer-divergence list so a finding
+  surfaced by this surface is a real bug rather than a
+  known limitation. Picked up by the existing
+  differential-fuzz workflow without configuration changes.
+  ([phase 10](docs/plans/PLAN-create-phase-10-fuzz-differential.md))
+
+- **Coverage-guided fuzz target for `instar create` emitters**
+  (`src/fuzz/fuzz_targets/fuzz_create_emitters.rs`). Decodes
+  structured fuzz input into per-format option tuples and
+  dispatches to every public planner in `crates/create/`
+  (`plan_qcow2`, `plan_vmdk`, `plan_vhd`, `plan_vhdx`).
+  Asserts plan-level bookkeeping invariants (write totals
+  match, every write fits in `minimum_file_size`, no
+  arithmetic overflow, write count within bound) plus a
+  header re-parse round-trip via the matching parser crate
+  (`qcow2::QcowHeader`, `vmdk::Vmdk4Header`,
+  `vhd::VhdFooter`, `vhdx::VhdxHeader`). Picked up
+  automatically by the nightly coverage-fuzz workflow
+  (16 targets total now). Smoke run reaches ~700 coverage
+  edges in 60 seconds with no crashes. Adding the
+  dependency surfaced a latent gap in the fuzz crate's
+  mock CallTable: the `send_create_result` field that phase
+  2 of create added to `shared::CallTable` was missing
+  because no prior fuzz target had pulled in the create
+  crate transitively. Filled in alongside the new harness.
+  ([phase 9](docs/plans/PLAN-create-phase-09-fuzz-coverage.md))
+
+- **Integration test matrix for `instar create`.** Three new
+  test surfaces in `tests/test_create.py` (added on top of the
+  pre-existing phase 3–6 smoke / `-o` / backing / preallocation
+  coverage): (1) `TestCreateBaselineMatrix` — per-`(target,
+  case)` baseline comparison against phase 7's recorded
+  `qemu-img info` JSON via `instar create` + system
+  `qemu-img info`, normalised by a divergence-whitelist filter
+  in `tests/helpers/info_json.py`; (2)
+  `TestCreateCrossValidation` — 12 curated cases that build the
+  same image twice (instar + system qemu-img) and compare both
+  via `instar info`; (3) `TestCreateRoundTripCheck` —
+  full-matrix `instar create` + `instar check` self-consistency
+  pass. Known instar/qemu writer divergences (qcow2
+  refcount_bits hardcode, qcow2 compat hardcode, zstd accept-
+  ignore, vhdx default block_size, vhd CHS-rounded virtual_size)
+  are documented in a `KNOWN_WRITER_DIVERGENCES` skip set with
+  per-entry rationale; a separate `KNOWN_CHECK_FAILURES` set
+  tracks writer/reader self-disagreements (currently only
+  qcow2 refcount_bits=64). Phase 8 also reads the per-target
+  raw baseline bucket directly rather than going through
+  `get_expected_output()`, sidestepping a latent
+  `detect-profiles.py` flat-copy collision bug in phase 7
+  whereby case names like `1M-default` clobber each other in
+  `profiles/profile-NN/` across the five target formats.
+  ([phase 8](docs/plans/PLAN-create-phase-08-integration-tests.md))
 
 - **Test and fuzz infrastructure.** Comprehensive integration
   tests for `instar measure` (`tests/test_measure.py`, 345 tests

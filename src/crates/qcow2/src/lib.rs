@@ -15,6 +15,9 @@
 #[cfg(feature = "decompress-zstd")]
 extern crate alloc;
 
+#[cfg(feature = "create")]
+pub mod create;
+
 #[cfg(any(
     feature = "decompress",
     feature = "decompress-zstd",
@@ -103,6 +106,12 @@ pub const SUPPORTED_INCOMPAT_FEATURES: u64 = INCOMPAT_DIRTY
 // L1/L2 entry masks and flags
 /// Bit 62 set indicates a compressed cluster in an L2 entry
 pub const OFLAG_COMPRESSED: u64 = 1 << 62;
+/// Bit 63 set indicates the cluster (L2 table for an L1 entry, or
+/// data cluster for an L2 entry) has refcount == 1, so writes can
+/// modify it in place rather than copy-on-write. Set by the
+/// preallocation modes (`metadata` / `falloc` / `full`) during
+/// create — every preallocated cluster starts with refcount=1.
+pub const OFLAG_COPIED: u64 = 1 << 63;
 /// Mask for extracting offset from L1/L2 entries (bits 9-55)
 pub const L1_OFFSET_MASK: u64 = 0x00fffffffffffe00;
 /// Mask for extracting offset from L2 entries (bits 9-55)

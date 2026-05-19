@@ -497,8 +497,11 @@ test-rust: instar-devcontainer
 			--exclude check \
 			--exclude compare \
 			--exclude convert \
-			--exclude measure-op && \
-		cargo test --release -p luks --features "decrypt,encrypt"'
+			--exclude measure-op \
+			--exclude create-op && \
+		cargo test --release -p luks --features "decrypt,encrypt" && \
+		cargo test --release -p qcow2 --features create && \
+		cargo test --release -p create'
 
 # Run Python integration tests only (on host)
 # Runs all test files except malicious image tests (explicit opt-in via test-malicious)
