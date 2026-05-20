@@ -2316,6 +2316,176 @@ impl CreateResult {
 }
 
 // ============================================================================
+// Resize operation
+// ============================================================================
+
+/// Configuration for the resize operation.
+///
+/// Written to `OPERATION_CONFIG_ADDR` by the VMM before launching
+/// the resize guest binary. The guest reads this directly via
+/// `&*(OPERATION_CONFIG_ADDR as *const ResizeConfig)`.
+///
+/// Mirrors [`CreateConfig`]'s shape (flags layout, preallocation
+/// bits at 4-5, sector_size, padding for forward compat) so the
+/// host CLI and the guest planner share idioms across operations.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ResizeConfig {
+    /// Magic (`0x52455349` = "RESI").
+    pub magic: u32,
+    /// Source/target format (`ImageFormat as u32`). Resize is an
+    /// in-place mutation: source and target format are identical.
+    pub target_format: u32,
+    /// Flags. See `FLAG_*` constants and `PREALLOC_*`.
+    pub flags: u32,
+    /// Sector size for I/O (matches host sector_size).
+    pub sector_size: u32,
+
+    /// Current virtual size in bytes. The host populates this
+    /// from the existing image's header before launching the
+    /// guest; the guest cross-checks against its own parse and
+    /// errors out with [`ResizeResult::ERROR_HEADER_MISMATCH`]
+    /// on mismatch.
+    pub current_virtual_size: u64,
+    /// Requested new virtual size in bytes. The host resolves
+    /// `[+-]SIZE` syntax to an absolute byte count before
+    /// populating this field.
+    pub new_virtual_size: u64,
+
+    /// qcow2 cluster size in bytes (from the existing header).
+    /// 0 if the image isn't qcow2.
+    pub qcow2_cluster_size: u32,
+    /// qcow2 refcount entry width in bits (from the existing
+    /// header). 0 if the image isn't qcow2.
+    pub qcow2_refcount_bits: u8,
+    /// vmdk subformat of the existing image: 0=MonolithicSparse,
+    /// 1=StreamOptimized, 2=MonolithicFlat,
+    /// 3=TwoGbMaxExtentSparse, 4=TwoGbMaxExtentFlat. 0 if not
+    /// vmdk.
+    pub vmdk_subformat: u8,
+    /// vhd subformat of the existing image: 0=Dynamic, 1=Fixed.
+    /// 0 if not vhd.
+    pub vhd_subformat: u8,
+    /// Reserved padding.
+    pub _pad: u8,
+    /// vmdk grain size in bytes (from the existing header). 0
+    /// if not vmdk.
+    pub vmdk_grain_size: u32,
+    /// vhd/vhdx block size in bytes (from the existing header).
+    /// 0 if not applicable.
+    pub block_size: u32,
+
+    /// Reserved padding for forward compatibility (zero-init).
+    pub _reserved: [u8; 64],
+}
+
+impl ResizeConfig {
+    /// Magic value for resize config.
+    pub const MAGIC: u32 = 0x52455349; // "RESI"
+
+    /// Flag: `--shrink` was passed by the user. Required for any
+    /// resize where `new_virtual_size < current_virtual_size`,
+    /// matching `qemu-img resize --shrink`.
+    pub const FLAG_SHRINK: u32 = 1 << 0;
+    /// Flag: the existing qcow2 image uses 16-byte extended L2
+    /// entries.
+    pub const FLAG_EXTENDED_L2: u32 = 1 << 1;
+    /// Flag: quiet mode. Host-side only; the guest ignores this
+    /// bit.
+    pub const FLAG_QUIET: u32 = 1 << 2;
+
+    /// Preallocation mode encoded in flags bits 4-5, exactly
+    /// mirroring [`CreateConfig`] and [`MeasureConfig`].
+    pub const PREALLOC_MASK: u32 = 0b11 << 4;
+    pub const PREALLOC_OFF: u32 = 0 << 4;
+    pub const PREALLOC_METADATA: u32 = 1 << 4;
+    pub const PREALLOC_FALLOC: u32 = 2 << 4;
+    pub const PREALLOC_FULL: u32 = 3 << 4;
+
+    /// True if magic matches.
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+
+    /// Extract the preallocation mode from `flags`.
+    pub fn preallocation(&self) -> u32 {
+        self.flags & Self::PREALLOC_MASK
+    }
+
+    /// True if the user passed `--shrink`.
+    pub fn allow_shrink(&self) -> bool {
+        self.flags & Self::FLAG_SHRINK != 0
+    }
+}
+
+/// Result structure for the resize operation.
+///
+/// Passed by the guest into `call_table.send_resize_result` (the
+/// call-table field is added in phase 7).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ResizeResult {
+    /// Magic value (`0x52524553` = "RRES").
+    pub magic: u32,
+    /// Target format echoed back so the host can render the
+    /// right output.
+    pub target_format: u32,
+    /// Resolved new virtual size in bytes (after the host
+    /// translated any `+/-` relative input into an absolute
+    /// value, and after the guest cross-checked).
+    pub resolved_new_virtual_size: u64,
+    /// File size before the host's post-pass `set_len` (the
+    /// pre-resize EOF).
+    pub file_size_before: u64,
+    /// File size after the guest's last patch (but before the
+    /// host post-pass).
+    pub file_size_after: u64,
+    /// Action taken. See `ACTION_*`.
+    pub action: u32,
+    /// Error code. See `ERROR_*`.
+    pub error: u32,
+}
+
+impl ResizeResult {
+    /// Magic value for resize result.
+    pub const MAGIC: u32 = 0x52524553; // "RRES"
+
+    /// Action: nothing changed (new == current).
+    pub const ACTION_NOOP: u32 = 0;
+    /// Action: file/virtual size grew.
+    pub const ACTION_GROW: u32 = 1;
+    /// Action: file/virtual size shrank.
+    pub const ACTION_SHRINK: u32 = 2;
+
+    // Error codes are stable: only appended, never reordered.
+    // Existing operation binaries depend on the numeric values
+    // matching what the host renders.
+    pub const ERROR_OK: u32 = 0;
+    pub const ERROR_INVALID_OPTION: u32 = 1;
+    pub const ERROR_INVALID_NEW_SIZE: u32 = 2;
+    pub const ERROR_SHRINK_WITHOUT_FLAG: u32 = 3;
+    pub const ERROR_SHRINK_BELOW_ALLOCATED: u32 = 4;
+    pub const ERROR_UNSUPPORTED_FORMAT: u32 = 5;
+    pub const ERROR_UNSUPPORTED_SUBFORMAT: u32 = 6;
+    pub const ERROR_UNSUPPORTED_SHRINK: u32 = 7;
+    pub const ERROR_PREALLOCATION_UNSUPPORTED: u32 = 8;
+    pub const ERROR_SCRATCH_TOO_SMALL: u32 = 9;
+    pub const ERROR_READ_FAILED: u32 = 10;
+    pub const ERROR_WRITE_FAILED: u32 = 11;
+    pub const ERROR_PARSE_FAILED: u32 = 12;
+    /// The host pre-populated `current_virtual_size` differs
+    /// from what the guest parsed out of the existing header.
+    /// Indicates either a race (the file changed between the
+    /// host's pre-probe and the guest's read) or a host bug.
+    pub const ERROR_HEADER_MISMATCH: u32 = 13;
+
+    /// True if magic matches.
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+}
+
+// ============================================================================
 // Chain configuration structures (for multi-device/backing chain operations)
 // ============================================================================
 
@@ -2721,6 +2891,74 @@ mod tests {
         assert!(r.is_valid());
         r.magic = 0;
         assert!(!r.is_valid());
+    }
+
+    #[test]
+    fn resize_config_magic() {
+        assert_eq!(ResizeConfig::MAGIC, 0x5245_5349); // "RESI" LE
+    }
+
+    #[test]
+    fn resize_result_magic() {
+        assert_eq!(ResizeResult::MAGIC, 0x5252_4553); // "RRES" LE
+    }
+
+    #[test]
+    fn resize_config_size_budget() {
+        // Forward-compat tripwire: if a future phase grows this
+        // past 256 bytes that's a deliberate ABI change and the
+        // assertion should fail on purpose so it's reviewed.
+        assert!(
+            core::mem::size_of::<ResizeConfig>() <= 256,
+            "ResizeConfig grew to {} bytes",
+            core::mem::size_of::<ResizeConfig>()
+        );
+    }
+
+    #[test]
+    fn resize_result_size_budget() {
+        assert!(
+            core::mem::size_of::<ResizeResult>() <= 64,
+            "ResizeResult grew to {} bytes",
+            core::mem::size_of::<ResizeResult>()
+        );
+    }
+
+    #[test]
+    fn resize_config_prealloc_layout_matches_create() {
+        // The encoding must match CreateConfig and MeasureConfig
+        // exactly so the host's preallocation translation can be
+        // a single function across all three operations.
+        assert_eq!(ResizeConfig::PREALLOC_MASK, CreateConfig::PREALLOC_MASK);
+        assert_eq!(ResizeConfig::PREALLOC_OFF, CreateConfig::PREALLOC_OFF);
+        assert_eq!(
+            ResizeConfig::PREALLOC_METADATA,
+            CreateConfig::PREALLOC_METADATA
+        );
+        assert_eq!(ResizeConfig::PREALLOC_FALLOC, CreateConfig::PREALLOC_FALLOC);
+        assert_eq!(ResizeConfig::PREALLOC_FULL, CreateConfig::PREALLOC_FULL);
+    }
+
+    #[test]
+    fn resize_config_shrink_flag() {
+        let cfg = ResizeConfig {
+            magic: ResizeConfig::MAGIC,
+            target_format: 0,
+            flags: ResizeConfig::FLAG_SHRINK,
+            sector_size: 0,
+            current_virtual_size: 0,
+            new_virtual_size: 0,
+            qcow2_cluster_size: 0,
+            qcow2_refcount_bits: 0,
+            vmdk_subformat: 0,
+            vhd_subformat: 0,
+            _pad: 0,
+            vmdk_grain_size: 0,
+            block_size: 0,
+            _reserved: [0; 64],
+        };
+        assert!(cfg.allow_shrink());
+        assert_eq!(cfg.preallocation(), ResizeConfig::PREALLOC_OFF);
     }
 
     #[test]
