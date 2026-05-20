@@ -1,0 +1,437 @@
+//! Plan in-place metadata mutations to resize disk images.
+//!
+//! Given the parsed header of an existing image and
+//! `(new_virtual_size, options, preallocation)`, the
+//! `plan_resize_*` functions in this crate return a [`ResizePlan`]
+//! — an ordered, bounded sequence of [`ResizePatch`] operations
+//! (in-place writes, file-extending appends, zero-fills) that
+//! together implement the resize.
+//!
+//! This crate is `no_std` and performs no I/O. Scratch buffers
+//! are caller-supplied; the returned [`ResizePlan`] borrows from
+//! the scratch buffer.
+//!
+//! This phase ships scaffolding only: the type surface and
+//! stubbed planners that return [`ResizeError::UnsupportedFormat`].
+//! Later phases (2 = qcow2 grow, 3 = qcow2 shrink, 4 = vhd, 5 =
+//! vhdx, 6 = vmdk) fill in the per-format implementations.
+
+#![no_std]
+
+/// Errors returned by the `plan_resize_*` family of functions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeError {
+    /// New virtual size is zero, misaligned, or exceeds the
+    /// format's maximum addressable range.
+    InvalidNewVirtualSize,
+    /// Caller asked to shrink but did not pass the equivalent of
+    /// `qemu-img resize --shrink`.
+    ShrinkWithoutFlag,
+    /// Caller asked to shrink past data that is still allocated
+    /// in the image (qcow2 shrink only; other formats reject
+    /// shrink unconditionally with `UnsupportedShrink`).
+    ShrinkBelowAllocated,
+    /// The source format is not supported by this version of
+    /// `instar resize` (QED, LUKS, encrypted qcow2, ...).
+    UnsupportedFormat,
+    /// The format is supported but the subformat isn't (multi-
+    /// file VMDK, fixed VHDX, ...).
+    UnsupportedSubformat,
+    /// The format is supported but shrinking it isn't (vmdk /
+    /// vhd / vhdx in v1). qemu-img-compatible: the corresponding
+    /// `qemu-img resize` invocations fail too.
+    UnsupportedShrink,
+    /// An internal size computation overflowed.
+    Overflow,
+    /// The caller-supplied scratch buffer is too small for the
+    /// requested layout.
+    ScratchTooSmall,
+    /// The requested preallocation mode isn't supported for the
+    /// target format/subformat (e.g. `metadata` on vmdk).
+    PreallocationUnsupported,
+}
+
+/// What the resize will do to the file. Carried in [`ResizePlan`]
+/// so the host can render the right success line and so the
+/// post-pass `set_len` knows whether to grow or shrink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeAction {
+    /// New virtual size > current virtual size.
+    Grow,
+    /// New virtual size < current virtual size.
+    Shrink,
+    /// New == current. The plan is empty; the host should print
+    /// "Image resized." and exit zero, matching qemu-img's
+    /// behaviour for a no-op resize.
+    NoOp,
+}
+
+/// A single byte-level operation against the file being resized.
+///
+/// Patches are emitted by a planner and applied **in order** by
+/// the guest. Ordering is load-bearing for crash safety on some
+/// formats (qcow2's refcount-then-data-then-header sequence;
+/// vhdx's two-header sequence-number dance). Planners must not
+/// reorder patches; the guest must not reorder patches.
+#[derive(Debug, Clone, Copy)]
+pub enum ResizePatch<'a> {
+    /// Overwrite an existing byte range. Used for header
+    /// rewrites, footer copy updates, in-place L1/BAT entry
+    /// updates, and refcount decrements.
+    Write {
+        /// Absolute byte offset within the file.
+        byte_offset: u64,
+        /// Bytes to write.
+        bytes: &'a [u8],
+    },
+    /// Extend the file by writing new bytes starting at
+    /// `byte_offset`. `byte_offset` must equal the file size at
+    /// the moment the patch is applied — the guest cannot skip
+    /// forward and leave a hole. Used for appending new L1
+    /// regions, refcount blocks, BAT extensions, and new
+    /// metadata regions.
+    Append {
+        /// Absolute byte offset within the file (== current EOF).
+        byte_offset: u64,
+        /// Bytes to write.
+        bytes: &'a [u8],
+    },
+    /// Zero `len` bytes at `byte_offset`. Equivalent to `Write`
+    /// with a zero buffer of size `len`, but lets the planner
+    /// declare large zero regions without paying for the staging
+    /// buffer. The guest implementation writes `ceil(len /
+    /// sector_size)` zero sectors via `write_output_sector`.
+    ZeroFill {
+        /// Absolute byte offset within the file.
+        byte_offset: u64,
+        /// Number of zero bytes to write.
+        len: u64,
+    },
+}
+
+/// Maximum number of patch entries a [`ResizePlan`] can hold.
+///
+/// QCOW2 grow at small cluster sizes with a refcount-table
+/// extension is the dominant case: a header rewrite plus an L1
+/// append plus ~32 refcount-block appends plus old-L1 refcount
+/// decrements plus new L1-table refcount increments. 128 is
+/// conservative; phase 2 either confirms this is sufficient or
+/// raises the bound.
+pub const MAX_RESIZE_PATCHES: usize = 128;
+
+/// A complete in-place mutation plan.
+///
+/// The plan stores its patches inline as a fixed-size array so
+/// the whole value is `Copy` and the guest does not need to pass
+/// a separate patches buffer alongside the byte scratch. Only
+/// the first [`ResizePlan::patches`]`().len()` entries are
+/// populated.
+#[derive(Debug, Clone, Copy)]
+pub struct ResizePlan<'a> {
+    /// File size the host should `ftruncate` to after applying
+    /// every patch. For `Shrink` this may be smaller than the
+    /// pre-resize file size; for `Grow` larger; for `NoOp`
+    /// unchanged from the pre-resize file size.
+    pub total_file_size: u64,
+    /// What this plan does at a high level.
+    pub action: ResizeAction,
+    /// Number of populated entries in `patches_storage`.
+    patch_count: u16,
+    /// Inline storage; only `..patch_count` is valid.
+    patches_storage: [ResizePatch<'a>; MAX_RESIZE_PATCHES],
+}
+
+impl<'a> ResizePlan<'a> {
+    /// Construct an empty plan for the given action and target
+    /// file size. Push patches into it with [`Self::push`].
+    pub const fn new(action: ResizeAction, total_file_size: u64) -> Self {
+        ResizePlan {
+            total_file_size,
+            action,
+            patch_count: 0,
+            patches_storage: [ResizePatch::EMPTY; MAX_RESIZE_PATCHES],
+        }
+    }
+
+    /// Ordered list of patches to apply.
+    pub fn patches(&self) -> &[ResizePatch<'a>] {
+        &self.patches_storage[..self.patch_count as usize]
+    }
+
+    /// Append a patch to the plan. Returns
+    /// [`ResizeError::ScratchTooSmall`] if the plan's storage is
+    /// full — this indicates either a planner bug or a format
+    /// pathologically large in the way that motivated the
+    /// [`MAX_RESIZE_PATCHES`] bound; if you hit it legitimately,
+    /// raise the constant.
+    pub fn push(&mut self, patch: ResizePatch<'a>) -> Result<(), ResizeError> {
+        let idx = self.patch_count as usize;
+        if idx >= MAX_RESIZE_PATCHES {
+            return Err(ResizeError::ScratchTooSmall);
+        }
+        self.patches_storage[idx] = patch;
+        self.patch_count += 1;
+        Ok(())
+    }
+}
+
+impl<'a> ResizePatch<'a> {
+    /// Empty placeholder used as the default array element when
+    /// building a [`ResizePlan`].
+    pub const EMPTY: ResizePatch<'static> = ResizePatch::Write {
+        byte_offset: 0,
+        bytes: &[],
+    };
+
+    /// Byte offset where this patch starts in the file.
+    pub fn byte_offset(&self) -> u64 {
+        match self {
+            ResizePatch::Write { byte_offset, .. }
+            | ResizePatch::Append { byte_offset, .. }
+            | ResizePatch::ZeroFill { byte_offset, .. } => *byte_offset,
+        }
+    }
+
+    /// Length of the range covered by this patch, in bytes.
+    pub fn len(&self) -> u64 {
+        match self {
+            ResizePatch::Write { bytes, .. } | ResizePatch::Append { bytes, .. } => {
+                bytes.len() as u64
+            }
+            ResizePatch::ZeroFill { len, .. } => *len,
+        }
+    }
+
+    /// True if this patch covers zero bytes. Trivial helper.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Preallocation mode for newly-added regions.
+///
+/// Layout numerically matches `shared::ResizeConfig::PREALLOC_*`
+/// (and, for consistency, `shared::CreateConfig::PREALLOC_*`).
+/// Forward-compat tripwire: phase 1d asserts the variant count
+/// is exactly four.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Preallocation {
+    /// Metadata only; the new region is sparse.
+    Off = 0,
+    /// Pre-populate format metadata (qcow2 L2 / vhdx BAT entries)
+    /// pointing at zero clusters in the new region; the host
+    /// does not extend the data region itself.
+    Metadata = 1,
+    /// Reserve disk blocks for the new region via
+    /// `posix_fallocate` without writing.
+    Falloc = 2,
+    /// Reserve disk blocks for the new region and zero them.
+    Full = 3,
+}
+
+/// VMDK subformat identifiers. Variants outside the v1 supported
+/// set still appear in the enum so the host CLI can map qemu-
+/// img's subformat string to a variant and emit
+/// [`ResizeError::UnsupportedSubformat`] rather than treating it
+/// as unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmdkSubformat {
+    MonolithicSparse,
+    StreamOptimized,
+    MonolithicFlat,
+    TwoGbMaxExtentSparse,
+    TwoGbMaxExtentFlat,
+}
+
+/// VHD subformat identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VhdSubformat {
+    Dynamic,
+    Fixed,
+}
+
+/// Options for [`plan_resize_raw`].
+///
+/// Raw has no metadata; the host's post-pass `set_len` does the
+/// work. The planner only classifies the action and reports the
+/// new file size.
+#[derive(Debug, Clone, Copy)]
+pub struct RawResizeOpts {
+    /// Current virtual size in bytes (== current file size for
+    /// raw).
+    pub current_virtual_size: u64,
+    /// Requested new virtual size in bytes.
+    pub new_virtual_size: u64,
+    /// Preallocation for the newly-added region (`Grow` only).
+    /// Phase 1's planner does not consume this; phase 9's host-
+    /// side preallocation pass reads it from the config.
+    pub preallocation: Preallocation,
+}
+
+/// Options for [`plan_resize_qcow2`].
+#[derive(Debug, Clone, Copy)]
+pub struct Qcow2ResizeOpts<'a> {
+    /// Current virtual size in bytes (from the existing header's
+    /// `size` field).
+    pub current_virtual_size: u64,
+    /// Requested new virtual size in bytes.
+    pub new_virtual_size: u64,
+    /// Cluster size in bytes (from the existing header; the
+    /// guest cross-checks against the parsed value).
+    pub cluster_size: u32,
+    /// Refcount entry width in bits (from the existing header).
+    pub refcount_bits: u8,
+    /// True if the existing image uses 16-byte extended L2
+    /// entries.
+    pub extended_l2: bool,
+    /// Preallocation mode for the new range.
+    pub preallocation: Preallocation,
+    /// True iff the host CLI passed `--shrink`.
+    pub allow_shrink: bool,
+    /// Read-only view of the existing image's L1 table. Phase 1
+    /// leaves this `&[]`; phase 2 (qcow2 grow) wires it in for
+    /// shrink validation and L1 extension. Carrying the lifetime
+    /// here keeps the API stable across phases.
+    pub existing_l1_bytes: &'a [u8],
+}
+
+/// Options for [`plan_resize_vmdk`].
+#[derive(Debug, Clone, Copy)]
+pub struct VmdkResizeOpts {
+    /// Current virtual size in bytes.
+    pub current_virtual_size: u64,
+    /// Requested new virtual size in bytes.
+    pub new_virtual_size: u64,
+    /// Grain size in bytes (from the existing header).
+    pub grain_size: u32,
+    /// Subformat of the existing image.
+    pub subformat: VmdkSubformat,
+    /// True iff the host CLI passed `--shrink`. v1 rejects vmdk
+    /// shrink unconditionally with [`ResizeError::UnsupportedShrink`].
+    pub allow_shrink: bool,
+    /// Preallocation mode for the new range.
+    pub preallocation: Preallocation,
+}
+
+/// Options for [`plan_resize_vhd`].
+#[derive(Debug, Clone, Copy)]
+pub struct VhdResizeOpts {
+    /// Current virtual size in bytes.
+    pub current_virtual_size: u64,
+    /// Requested new virtual size in bytes.
+    pub new_virtual_size: u64,
+    /// Block size in bytes (from the existing dynamic header;
+    /// unused for `Fixed`).
+    pub block_size: u32,
+    /// Subformat of the existing image.
+    pub subformat: VhdSubformat,
+    /// True iff the host CLI passed `--shrink`. v1 rejects vhd
+    /// shrink unconditionally with [`ResizeError::UnsupportedShrink`].
+    pub allow_shrink: bool,
+    /// Preallocation mode for the new range.
+    pub preallocation: Preallocation,
+}
+
+/// Options for [`plan_resize_vhdx`].
+#[derive(Debug, Clone, Copy)]
+pub struct VhdxResizeOpts {
+    /// Current virtual size in bytes (from the
+    /// `VirtualDiskSize` metadata entry).
+    pub current_virtual_size: u64,
+    /// Requested new virtual size in bytes.
+    pub new_virtual_size: u64,
+    /// Block size in bytes (from the `FileParameters` metadata
+    /// entry).
+    pub block_size: u32,
+    /// Preallocation mode for the new range.
+    pub preallocation: Preallocation,
+    // No `allow_shrink` field — vhdx shrink is rejected
+    // unconditionally because qemu-img has no upstream
+    // implementation to mirror.
+}
+
+// ============================================================================
+// Worst-case scratch buffer sizes
+// ============================================================================
+//
+// Each per-format planner takes a caller-supplied scratch buffer
+// large enough to stage its append/write payloads. These
+// constants give the guest binary (phase 7) a static upper bound
+// per format. They are conservative for phase 1 and will be
+// tightened as each format's planner lands.
+
+/// Worst-case scratch buffer size for [`plan_resize_qcow2`].
+// TODO(phase-2): tighten once the qcow2 grow planner lands.
+pub const QCOW2_MAX_RESIZE_SCRATCH: usize = 32 * 1024 * 1024;
+
+/// Worst-case scratch buffer size for [`plan_resize_vmdk`].
+// TODO(phase-6): tighten once the vmdk planner lands.
+pub const VMDK_MAX_RESIZE_SCRATCH: usize = 4 * 1024 * 1024;
+
+/// Worst-case scratch buffer size for [`plan_resize_vhd`].
+// TODO(phase-4): tighten once the vhd planner lands.
+pub const VHD_MAX_RESIZE_SCRATCH: usize = 4 * 1024 * 1024;
+
+/// Worst-case scratch buffer size for [`plan_resize_vhdx`].
+// TODO(phase-5): tighten once the vhdx planner lands.
+pub const VHDX_MAX_RESIZE_SCRATCH: usize = 8 * 1024 * 1024;
+
+// ============================================================================
+// Planner functions
+// ============================================================================
+//
+// Phase 1 stubs every planner to `UnsupportedFormat`. Phase 1c
+// upgrades `plan_resize_raw` to a real implementation. Phases
+// 2–6 fill in the per-format planners.
+
+/// Plan a resize of a raw image.
+///
+/// Raw resize is metadata-free: the host's post-pass `set_len`
+/// extends or truncates the file. The planner classifies the
+/// action and reports the target file size.
+pub fn plan_resize_raw(_opts: &RawResizeOpts) -> Result<ResizePlan<'static>, ResizeError> {
+    Err(ResizeError::UnsupportedFormat)
+}
+
+/// Plan a resize of a qcow2 image.
+///
+/// Phase 1 stub. Phase 2 lands the grow planner; phase 3 lands
+/// the shrink planner.
+pub fn plan_resize_qcow2<'a>(
+    _opts: &Qcow2ResizeOpts<'_>,
+    _scratch: &'a mut [u8],
+) -> Result<ResizePlan<'a>, ResizeError> {
+    Err(ResizeError::UnsupportedFormat)
+}
+
+/// Plan a resize of a vmdk image.
+///
+/// Phase 1 stub. Phase 6 lands monolithicSparse grow; other
+/// subformats remain unsupported.
+pub fn plan_resize_vmdk<'a>(
+    _opts: &VmdkResizeOpts,
+    _scratch: &'a mut [u8],
+) -> Result<ResizePlan<'a>, ResizeError> {
+    Err(ResizeError::UnsupportedFormat)
+}
+
+/// Plan a resize of a vhd image.
+///
+/// Phase 1 stub. Phase 4 lands dynamic and fixed grow planners.
+pub fn plan_resize_vhd<'a>(
+    _opts: &VhdResizeOpts,
+    _scratch: &'a mut [u8],
+) -> Result<ResizePlan<'a>, ResizeError> {
+    Err(ResizeError::UnsupportedFormat)
+}
+
+/// Plan a resize of a vhdx image.
+///
+/// Phase 1 stub. Phase 5 lands the dynamic grow planner.
+pub fn plan_resize_vhdx<'a>(
+    _opts: &VhdxResizeOpts,
+    _scratch: &'a mut [u8],
+) -> Result<ResizePlan<'a>, ResizeError> {
+    Err(ResizeError::UnsupportedFormat)
+}

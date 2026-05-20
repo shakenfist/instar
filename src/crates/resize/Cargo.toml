@@ -1,0 +1,10 @@
+[package]
+name = "resize"
+version = "0.2.0"
+edition = "2021"
+description = "Plan in-place metadata mutations to resize disk images (no I/O)"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+shared = { path = "../../shared" }
