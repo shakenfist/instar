@@ -389,9 +389,27 @@ pub const VHDX_MAX_RESIZE_SCRATCH: usize = 8 * 1024 * 1024;
 ///
 /// Raw resize is metadata-free: the host's post-pass `set_len`
 /// extends or truncates the file. The planner classifies the
-/// action and reports the target file size.
-pub fn plan_resize_raw(_opts: &RawResizeOpts) -> Result<ResizePlan<'static>, ResizeError> {
-    Err(ResizeError::UnsupportedFormat)
+/// action and reports the target file size; the patches list is
+/// always empty.
+///
+/// Raw resize does **not** require `--shrink`: `qemu-img resize
+/// -f raw IMAGE SMALLER` succeeds without `--shrink` because the
+/// host-side `ftruncate` is the user's deliberate choice and
+/// there is no metadata to consult. The planner therefore
+/// ignores any `allow_shrink` signal from the host CLI on the
+/// raw path.
+pub fn plan_resize_raw(opts: &RawResizeOpts) -> Result<ResizePlan<'static>, ResizeError> {
+    if opts.new_virtual_size == 0 {
+        return Err(ResizeError::InvalidNewVirtualSize);
+    }
+    let action = if opts.new_virtual_size == opts.current_virtual_size {
+        ResizeAction::NoOp
+    } else if opts.new_virtual_size > opts.current_virtual_size {
+        ResizeAction::Grow
+    } else {
+        ResizeAction::Shrink
+    };
+    Ok(ResizePlan::new(action, opts.new_virtual_size))
 }
 
 /// Plan a resize of a qcow2 image.
@@ -434,4 +452,175 @@ pub fn plan_resize_vhdx<'a>(
     _scratch: &'a mut [u8],
 ) -> Result<ResizePlan<'a>, ResizeError> {
     Err(ResizeError::UnsupportedFormat)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw_opts(current: u64, new: u64) -> RawResizeOpts {
+        RawResizeOpts {
+            current_virtual_size: current,
+            new_virtual_size: new,
+            preallocation: Preallocation::Off,
+        }
+    }
+
+    #[test]
+    fn raw_noop_when_sizes_equal() {
+        let plan = plan_resize_raw(&raw_opts(1 << 20, 1 << 20)).unwrap();
+        assert_eq!(plan.action, ResizeAction::NoOp);
+        assert_eq!(plan.total_file_size, 1 << 20);
+        assert_eq!(plan.patches().len(), 0);
+    }
+
+    #[test]
+    fn raw_grow_when_new_larger() {
+        let plan = plan_resize_raw(&raw_opts(1 << 20, 2 << 20)).unwrap();
+        assert_eq!(plan.action, ResizeAction::Grow);
+        assert_eq!(plan.total_file_size, 2 << 20);
+        assert_eq!(plan.patches().len(), 0);
+    }
+
+    #[test]
+    fn raw_shrink_when_new_smaller_no_flag_needed() {
+        // Raw resize matches qemu-img: --shrink is not required
+        // for raw because there is no metadata to consult.
+        let plan = plan_resize_raw(&raw_opts(2 << 20, 1 << 20)).unwrap();
+        assert_eq!(plan.action, ResizeAction::Shrink);
+        assert_eq!(plan.total_file_size, 1 << 20);
+        assert_eq!(plan.patches().len(), 0);
+    }
+
+    #[test]
+    fn raw_zero_size_rejected() {
+        let err = plan_resize_raw(&raw_opts(1 << 20, 0)).unwrap_err();
+        assert_eq!(err, ResizeError::InvalidNewVirtualSize);
+    }
+
+    #[test]
+    fn plan_push_increments_count_and_keeps_total_file_size() {
+        let mut plan = ResizePlan::new(ResizeAction::Grow, 2 << 20);
+        assert_eq!(plan.patches().len(), 0);
+        plan.push(ResizePatch::Write {
+            byte_offset: 0,
+            bytes: &[0xAB; 8],
+        })
+        .unwrap();
+        assert_eq!(plan.patches().len(), 1);
+        // total_file_size is set at construction and is not
+        // touched by push — it describes the post-resize EOF the
+        // host should set_len to, not the cumulative bytes
+        // written by the patches.
+        assert_eq!(plan.total_file_size, 2 << 20);
+    }
+
+    #[test]
+    fn plan_push_returns_scratch_too_small_when_full() {
+        let mut plan = ResizePlan::new(ResizeAction::Grow, 0);
+        for _ in 0..MAX_RESIZE_PATCHES {
+            plan.push(ResizePatch::Write {
+                byte_offset: 0,
+                bytes: &[],
+            })
+            .unwrap();
+        }
+        let err = plan
+            .push(ResizePatch::Write {
+                byte_offset: 0,
+                bytes: &[],
+            })
+            .unwrap_err();
+        assert_eq!(err, ResizeError::ScratchTooSmall);
+    }
+
+    #[test]
+    fn patch_byte_offset_and_len_per_variant() {
+        let w = ResizePatch::Write {
+            byte_offset: 100,
+            bytes: &[0; 16],
+        };
+        assert_eq!(w.byte_offset(), 100);
+        assert_eq!(w.len(), 16);
+
+        let a = ResizePatch::Append {
+            byte_offset: 200,
+            bytes: &[0; 4],
+        };
+        assert_eq!(a.byte_offset(), 200);
+        assert_eq!(a.len(), 4);
+
+        let z = ResizePatch::ZeroFill {
+            byte_offset: 300,
+            len: 4096,
+        };
+        assert_eq!(z.byte_offset(), 300);
+        assert_eq!(z.len(), 4096);
+    }
+
+    #[test]
+    fn patch_is_empty() {
+        assert!(ResizePatch::EMPTY.is_empty());
+        assert!(!ResizePatch::Write {
+            byte_offset: 0,
+            bytes: &[1],
+        }
+        .is_empty());
+    }
+
+    #[test]
+    fn non_raw_planners_stub_to_unsupported() {
+        let qcow2_opts = Qcow2ResizeOpts {
+            current_virtual_size: 1 << 20,
+            new_virtual_size: 2 << 20,
+            cluster_size: 65536,
+            refcount_bits: 16,
+            extended_l2: false,
+            preallocation: Preallocation::Off,
+            allow_shrink: false,
+            existing_l1_bytes: &[],
+        };
+        let mut scratch = [0u8; 64];
+        assert_eq!(
+            plan_resize_qcow2(&qcow2_opts, &mut scratch).unwrap_err(),
+            ResizeError::UnsupportedFormat
+        );
+
+        let vmdk_opts = VmdkResizeOpts {
+            current_virtual_size: 1 << 20,
+            new_virtual_size: 2 << 20,
+            grain_size: 65536,
+            subformat: VmdkSubformat::MonolithicSparse,
+            allow_shrink: false,
+            preallocation: Preallocation::Off,
+        };
+        assert_eq!(
+            plan_resize_vmdk(&vmdk_opts, &mut scratch).unwrap_err(),
+            ResizeError::UnsupportedFormat
+        );
+
+        let vhd_opts = VhdResizeOpts {
+            current_virtual_size: 1 << 20,
+            new_virtual_size: 2 << 20,
+            block_size: 2 * 1024 * 1024,
+            subformat: VhdSubformat::Dynamic,
+            allow_shrink: false,
+            preallocation: Preallocation::Off,
+        };
+        assert_eq!(
+            plan_resize_vhd(&vhd_opts, &mut scratch).unwrap_err(),
+            ResizeError::UnsupportedFormat
+        );
+
+        let vhdx_opts = VhdxResizeOpts {
+            current_virtual_size: 1 << 20,
+            new_virtual_size: 2 << 20,
+            block_size: 32 * 1024 * 1024,
+            preallocation: Preallocation::Off,
+        };
+        assert_eq!(
+            plan_resize_vhdx(&vhdx_opts, &mut scratch).unwrap_err(),
+            ResizeError::UnsupportedFormat
+        );
+    }
 }
