@@ -130,11 +130,7 @@ pub(crate) fn plan_grow<'a>(
         Qcow2GrowAction::HeaderOnly => plan_header_only(opts, scratch),
         Qcow2GrowAction::L1Grow => plan_l1_grow(opts, &target_layout, scratch),
         Qcow2GrowAction::L1AndRefcountGrow => {
-            // Phase 2c lands this. Surfacing ScratchTooSmall vs a
-            // dedicated "not-yet-implemented" error keeps the
-            // error enum minimal; the test matrix exercises both
-            // paths once 2c lifts the gate.
-            Err(ResizeError::ScratchTooSmall)
+            plan_l1_and_refcount_grow(opts, &target_layout, existing_block_count, scratch)
         }
     }
 }
@@ -578,6 +574,354 @@ fn allocate_staging(
     }
     *next_staging = end;
     Ok(off)
+}
+
+/// L1AndRefcountGrow path: the full algorithm. The L1 grows AND
+/// the refcount table needs more blocks (or possibly a larger
+/// table itself; we always relocate when it grows).
+///
+/// File layout after the resize (appended in this order):
+///   [current EOF .. ] new L1 region
+///   [..] new refcount-table region (only if the table grows)
+///   [..] new refcount blocks
+///
+/// Patch sequence (crash-safe ordering):
+///   Phase A (prepare):
+///     1. Append new L1 region
+///     2. Append new refcount-table region (if relocated)
+///     3. Append new refcount blocks (pre-populated with
+///        refcount=1 for every cluster in the post-resize image)
+///     4. Write existing refcount blocks that need entry-level
+///        patching (for the rare case where the new clusters
+///        overlap an existing block's coverage range)
+///   Phase B (commit):
+///     5. Write new header
+///   Phase C (cleanup):
+///     6. Write decrements for old L1 region's refcount entries
+///     7. Write decrements for old refcount-table's refcount
+///        entries (if relocated)
+///
+/// Preallocation::Metadata is rejected by the upstream gate in
+/// plan_grow; integrating it into this path is deferred.
+fn plan_l1_and_refcount_grow<'a>(
+    opts: &Qcow2ResizeOpts<'_>,
+    target_layout: &Qcow2Layout,
+    existing_block_count: u64,
+    scratch: &'a mut [u8],
+) -> Result<ResizePlan<'a>, ResizeError> {
+    let cluster_size = opts.cluster_size as u64;
+    let cluster_size_us = opts.cluster_size as usize;
+    let entries_per_refblock: u64 = (cluster_size * 8) / opts.refcount_bits as u64;
+
+    let new_l1_entries = target_layout.l1_entries;
+    let new_l1_clusters = ((new_l1_entries as u64) * 8).div_ceil(cluster_size).max(1);
+    let new_l1_size_bytes = new_l1_clusters * cluster_size;
+
+    let target_block_count = target_layout.refcount_block_count;
+    let new_block_count_delta = target_block_count.saturating_sub(existing_block_count);
+    let target_table_clusters = target_layout.refcount_table_clusters;
+    let table_grows = target_table_clusters > opts.current_refcount_table_clusters as u64;
+
+    // File layout post-resize.
+    let new_l1_offset = opts.current_file_size;
+    let new_refcount_table_offset = new_l1_offset + new_l1_size_bytes;
+    let new_refcount_table_size_bytes = if table_grows {
+        target_table_clusters * cluster_size
+    } else {
+        0
+    };
+    let new_refcount_blocks_offset = new_refcount_table_offset + new_refcount_table_size_bytes;
+    let new_refcount_blocks_size_bytes = new_block_count_delta * cluster_size;
+    let total_file_size = new_refcount_blocks_offset + new_refcount_blocks_size_bytes;
+    let new_total_clusters = total_file_size / cluster_size;
+
+    let effective_table_offset = if table_grows {
+        new_refcount_table_offset
+    } else {
+        opts.current_refcount_table_offset
+    };
+    let effective_table_clusters = if table_grows {
+        target_table_clusters
+    } else {
+        opts.current_refcount_table_clusters as u64
+    };
+
+    // Carve scratch: header (1 cluster) + new L1 + new RT + new
+    // RBs + per-existing-block staging slots.
+    let header_off = 0usize;
+    let header_end = cluster_size_us;
+    let l1_off = header_end;
+    let l1_end = l1_off + new_l1_size_bytes as usize;
+    let table_off = l1_end;
+    let table_end = table_off + new_refcount_table_size_bytes as usize;
+    let blocks_off = table_end;
+    let blocks_end = blocks_off + new_refcount_blocks_size_bytes as usize;
+    if blocks_end > scratch.len() {
+        return Err(ResizeError::ScratchTooSmall);
+    }
+
+    // Build new L1 region (existing entries + zero pad).
+    {
+        let l1_buf = &mut scratch[l1_off..l1_end];
+        l1_buf.fill(0);
+        let old_l1_size_bytes = (opts.current_l1_entries as u64) * 8;
+        let copy_len = opts.existing_l1_bytes.len().min(old_l1_size_bytes as usize);
+        l1_buf[..copy_len].copy_from_slice(&opts.existing_l1_bytes[..copy_len]);
+    }
+
+    // Build new refcount table region (if relocated). Old entries
+    // are copied from the existing table; new entries point at
+    // the appended block clusters.
+    if table_grows {
+        let table_buf = &mut scratch[table_off..table_end];
+        table_buf.fill(0);
+        let copy_len = opts
+            .existing_refcount_table_bytes
+            .len()
+            .min(table_buf.len());
+        table_buf[..copy_len].copy_from_slice(&opts.existing_refcount_table_bytes[..copy_len]);
+        for i in 0..new_block_count_delta {
+            let entry_idx = (existing_block_count + i) as usize;
+            let entry_off = entry_idx * 8;
+            if entry_off + 8 > table_buf.len() {
+                return Err(ResizeError::ScratchTooSmall);
+            }
+            let block_file_offset = new_refcount_blocks_offset + i * cluster_size;
+            write_be_u64(table_buf, entry_off, block_file_offset);
+        }
+    }
+
+    // Build new refcount blocks: refcount=1 for every cluster in
+    // [first_covered..new_total_clusters), 0 elsewhere. This
+    // covers the post-resize image's new region (clusters >=
+    // current_file_size / cluster_size).
+    {
+        let blocks_buf = &mut scratch[blocks_off..blocks_end];
+        blocks_buf.fill(0);
+        for i in 0..new_block_count_delta {
+            let block_idx_in_table = existing_block_count + i;
+            let block_buf = &mut blocks_buf
+                [(i as usize) * cluster_size_us..((i as usize) + 1) * cluster_size_us];
+            let first_cluster = block_idx_in_table * entries_per_refblock;
+            for j in 0..entries_per_refblock {
+                let cluster_idx = first_cluster + j;
+                if cluster_idx < new_total_clusters {
+                    set_refcount(block_buf, j, opts.refcount_bits, 1)?;
+                }
+            }
+        }
+    }
+
+    // Build the new header (last "prepare"-ordered patch).
+    let header_layout = Qcow2Layout {
+        cluster_bits: cluster_bits_from(opts.cluster_size).expect("validated upstream"),
+        cluster_size,
+        virtual_size: opts.new_virtual_size,
+        refcount_bits: opts.refcount_bits as u32,
+        extended_l2: opts.extended_l2,
+        preallocation: Qcow2CreatePreallocation::Off,
+        l1_entries: new_l1_entries,
+        l1_size_bytes: (new_l1_entries as u64) * 8,
+        l1_clusters: new_l1_clusters,
+        l1_offset: new_l1_offset,
+        refcount_table_offset: effective_table_offset,
+        refcount_table_clusters: effective_table_clusters,
+        refcount_block_count: 0,
+        refcount_blocks_base_offset: 0,
+        l2_clusters: 0,
+        l2_base_offset: 0,
+        data_clusters: 0,
+        data_base_offset: 0,
+        total_clusters: 0,
+        total_file_size: 0,
+    };
+    let header_bytes_len = {
+        let header_buf = &mut scratch[header_off..header_end];
+        build_header(
+            header_buf,
+            &BuildHeaderOptions {
+                layout: &header_layout,
+                backing_file: opts.backing_file,
+                backing_format: opts.backing_format,
+                lazy_refcounts: opts.lazy_refcounts,
+                luks_header: None,
+            },
+        )
+        .map_err(map_qcow2_create_err)?
+        .len()
+    };
+
+    // === Stage overlap and cleanup work BEFORE assembling
+    // patches (the assembly takes immutable borrows on scratch
+    // that would otherwise conflict). ===
+    const MAX_OVERLAP_BLOCKS: usize = 4;
+    let mut overlap_slots: [(u64, usize); MAX_OVERLAP_BLOCKS] = [(0, 0); MAX_OVERLAP_BLOCKS];
+    let mut overlap_count: usize = 0;
+    const MAX_CLEANUP_BLOCKS: usize = 8;
+    let mut cleanup_slots: [(u64, usize); MAX_CLEANUP_BLOCKS] = [(0, 0); MAX_CLEANUP_BLOCKS];
+    let mut cleanup_count: usize = 0;
+    let mut next_staging = blocks_end;
+
+    // Overlap: existing blocks that hold entries for newly-
+    // allocated clusters (the last existing block may not be
+    // full).
+    let pre_resize_cluster_count = opts.current_file_size / cluster_size;
+    let existing_block_coverage = existing_block_count * entries_per_refblock;
+    let overlap_first = pre_resize_cluster_count;
+    let overlap_last_excl = existing_block_coverage.min(new_total_clusters);
+
+    let mut c = overlap_first;
+    while c < overlap_last_excl {
+        let block_idx = c / entries_per_refblock;
+        let local_idx = c % entries_per_refblock;
+        let off = if let Some(pos) = overlap_slots
+            .iter()
+            .take(overlap_count)
+            .position(|(idx, _)| *idx == block_idx)
+        {
+            overlap_slots[pos].1
+        } else {
+            if overlap_count >= MAX_OVERLAP_BLOCKS {
+                return Err(ResizeError::ScratchTooSmall);
+            }
+            let new_off = allocate_staging(&mut next_staging, scratch.len(), cluster_size_us)?;
+            ensure_block_staged(opts, block_idx, scratch, new_off, cluster_size_us)?;
+            overlap_slots[overlap_count] = (block_idx, new_off);
+            overlap_count += 1;
+            new_off
+        };
+        set_refcount(
+            &mut scratch[off..off + cluster_size_us],
+            local_idx,
+            opts.refcount_bits,
+            1,
+        )?;
+        c += 1;
+    }
+
+    // Cleanup: old L1 region clusters, plus old refcount table
+    // clusters if the table relocated.
+    let old_l1_first = opts.current_l1_table_offset / cluster_size;
+    let old_l1_clusters = ((opts.current_l1_entries as u64) * 8)
+        .div_ceil(cluster_size)
+        .max(1);
+    let old_l1_last_excl = old_l1_first + old_l1_clusters;
+    for c in old_l1_first..old_l1_last_excl {
+        stage_cleanup_decrement(
+            opts,
+            scratch,
+            c,
+            entries_per_refblock,
+            &mut cleanup_slots,
+            &mut cleanup_count,
+            MAX_CLEANUP_BLOCKS,
+            &mut next_staging,
+            cluster_size_us,
+        )?;
+    }
+    if table_grows {
+        let old_rt_first = opts.current_refcount_table_offset / cluster_size;
+        let old_rt_last_excl = old_rt_first + opts.current_refcount_table_clusters as u64;
+        for c in old_rt_first..old_rt_last_excl {
+            stage_cleanup_decrement(
+                opts,
+                scratch,
+                c,
+                entries_per_refblock,
+                &mut cleanup_slots,
+                &mut cleanup_count,
+                MAX_CLEANUP_BLOCKS,
+                &mut next_staging,
+                cluster_size_us,
+            )?;
+        }
+    }
+
+    // === Assemble the plan in crash-safe order. ===
+    let mut plan = ResizePlan::new(ResizeAction::Grow, total_file_size);
+
+    // Phase A — prepare (1-3): appends.
+    plan.push(ResizePatch::Append {
+        byte_offset: new_l1_offset,
+        bytes: &scratch[l1_off..l1_end],
+    })?;
+    if table_grows {
+        plan.push(ResizePatch::Append {
+            byte_offset: new_refcount_table_offset,
+            bytes: &scratch[table_off..table_end],
+        })?;
+    }
+    if new_block_count_delta > 0 {
+        plan.push(ResizePatch::Append {
+            byte_offset: new_refcount_blocks_offset,
+            bytes: &scratch[blocks_off..blocks_end],
+        })?;
+    }
+
+    // Phase A (4): overlap patches.
+    for slot in overlap_slots.iter().take(overlap_count) {
+        let block_file_off = block_offset_in_file(opts.existing_refcount_table_bytes, slot.0)?;
+        plan.push(ResizePatch::Write {
+            byte_offset: block_file_off,
+            bytes: &scratch[slot.1..slot.1 + cluster_size_us],
+        })?;
+    }
+
+    // Phase B — header rewrite (atomic commit).
+    plan.push(ResizePatch::Write {
+        byte_offset: 0,
+        bytes: &scratch[header_off..header_off + header_bytes_len],
+    })?;
+
+    // Phase C — cleanup decrements.
+    for slot in cleanup_slots.iter().take(cleanup_count) {
+        let block_file_off = block_offset_in_file(opts.existing_refcount_table_bytes, slot.0)?;
+        plan.push(ResizePatch::Write {
+            byte_offset: block_file_off,
+            bytes: &scratch[slot.1..slot.1 + cluster_size_us],
+        })?;
+    }
+
+    Ok(plan)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_cleanup_decrement(
+    opts: &Qcow2ResizeOpts<'_>,
+    scratch: &mut [u8],
+    cluster_idx: u64,
+    entries_per_refblock: u64,
+    cleanup_slots: &mut [(u64, usize); 8],
+    cleanup_count: &mut usize,
+    max_blocks: usize,
+    next_staging: &mut usize,
+    cluster_size_us: usize,
+) -> Result<(), ResizeError> {
+    let block_idx = cluster_idx / entries_per_refblock;
+    let local_idx = cluster_idx % entries_per_refblock;
+    let off = if let Some(pos) = cleanup_slots
+        .iter()
+        .take(*cleanup_count)
+        .position(|(idx, _)| *idx == block_idx)
+    {
+        cleanup_slots[pos].1
+    } else {
+        if *cleanup_count >= max_blocks {
+            return Err(ResizeError::ScratchTooSmall);
+        }
+        let new_off = allocate_staging(next_staging, scratch.len(), cluster_size_us)?;
+        ensure_block_staged(opts, block_idx, scratch, new_off, cluster_size_us)?;
+        cleanup_slots[*cleanup_count] = (block_idx, new_off);
+        *cleanup_count += 1;
+        new_off
+    };
+    set_refcount(
+        &mut scratch[off..off + cluster_size_us],
+        local_idx,
+        opts.refcount_bits,
+        0,
+    )?;
+    Ok(())
 }
 
 // ============================================================================
