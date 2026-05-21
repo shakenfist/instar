@@ -763,7 +763,7 @@ versions; we can collapse those).
 | Phase | Plan | Status |
 |-------|------|--------|
 | 1. Resize planner crate skeleton (`crates/resize/`) + raw + shared types | [PLAN-resize-phase-01-skeleton.md](PLAN-resize-phase-01-skeleton.md) | Complete |
-| 2. QCOW2 grow planner (L1 + refcount-table extension) | [PLAN-resize-phase-02-qcow2-grow.md](PLAN-resize-phase-02-qcow2-grow.md) | Not started |
+| 2. QCOW2 grow planner (L1 + refcount-table extension) | [PLAN-resize-phase-02-qcow2-grow.md](PLAN-resize-phase-02-qcow2-grow.md) | Complete except `Preallocation::Metadata` (deferred — see Future work) |
 | 3. QCOW2 shrink planner (`--shrink` semantics, L2 walk, cluster discard) | PLAN-resize-phase-03-qcow2-shrink.md (not yet written) | Not started |
 | 4. VHD resize planner (dynamic grow, fixed grow; shrink deferred) | PLAN-resize-phase-04-vhd.md (not yet written) | Not started |
 | 5. VHDX resize planner (dynamic grow; shrink unsupported upstream) | PLAN-resize-phase-05-vhdx.md (not yet written) | Not started |
@@ -1081,6 +1081,18 @@ We will know this plan has been successfully implemented when:
 
 ### Future work
 
+* **QCOW2 grow with `Preallocation::Metadata`.** Phase 2c
+  deferred the metadata-mode population path; the planner
+  currently rejects `Preallocation::Metadata` with
+  `PreallocationUnsupported`. The work involves appending L2
+  tables for new L1 entries (zero-filled, since every L2 entry
+  is 0 for an empty range), populating new L1 entries with
+  L2-table offsets + `OFLAG_COPIED`, optionally appending zero
+  data clusters to match qemu's `disk size` reported value, and
+  extending the refcount entries to cover the new L2 (and
+  optionally data) clusters. Either land as a 2e sub-step under
+  the existing phase plan, or roll into phase 9's preallocation
+  work.
 * **QCOW2 internal snapshot virtual_size adjustment.** qemu-
   img resize leaves internal snapshots at their snapshot-
   time virtual_size; the top-level resize affects only the
