@@ -149,6 +149,8 @@ fn opts_from_image<'a>(
         backing_file: None,
         backing_format: None,
         lazy_refcounts: header.lazy_refcounts,
+        existing_l2_bytes: &[],
+        existing_l2_indices: &[],
     }
 }
 

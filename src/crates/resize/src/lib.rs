@@ -361,6 +361,20 @@ pub struct Qcow2ResizeOpts<'a> {
     /// Whether the existing header has the `lazy_refcounts`
     /// compatible feature bit set.
     pub lazy_refcounts: bool,
+    /// Read-only snapshots of L2 tables the shrink planner
+    /// needs to walk. The guest's pre-pass identifies which
+    /// L2 tables cover virtual addresses in
+    /// `[new_virtual_size, current_virtual_size)` and stages
+    /// them here as a flat concatenation of cluster-sized
+    /// blocks in `existing_l2_indices` order. If the planner
+    /// needs an L2 table not present here it returns
+    /// [`ResizeError::ScratchTooSmall`].
+    pub existing_l2_bytes: &'a [u8],
+    /// L1 indices of the L2 tables staged in
+    /// `existing_l2_bytes`, in the same order. Table `i` lives
+    /// in `&existing_l2_bytes[i * cluster_size..(i + 1) *
+    /// cluster_size]`.
+    pub existing_l2_indices: &'a [u32],
 }
 
 /// Options for [`plan_resize_vmdk`].
