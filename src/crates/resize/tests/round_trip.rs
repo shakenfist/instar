@@ -7,10 +7,9 @@
 //! cover end-to-end invariants and forward-compat tripwires.
 
 use resize::{
-    plan_resize_qcow2, plan_resize_raw, plan_resize_vhd, plan_resize_vhdx, plan_resize_vmdk,
-    Preallocation, Qcow2ResizeOpts, RawResizeOpts, ResizeAction, ResizeError, ResizePatch,
-    ResizePlan, VhdResizeOpts, VhdSubformat, VhdxResizeOpts, VmdkResizeOpts, VmdkSubformat,
-    MAX_RESIZE_PATCHES,
+    plan_resize_raw, plan_resize_vhd, plan_resize_vhdx, plan_resize_vmdk, Preallocation,
+    RawResizeOpts, ResizeAction, ResizeError, ResizePatch, ResizePlan, VhdResizeOpts, VhdSubformat,
+    VhdxResizeOpts, VmdkResizeOpts, VmdkSubformat, MAX_RESIZE_PATCHES,
 };
 
 #[test]
@@ -118,34 +117,10 @@ fn plan_resize_raw_classifies_action_for_three_size_pairs() {
 
 #[test]
 fn non_raw_planners_remain_stubbed() {
+    // qcow2 has its own integration suite (phase 2d's
+    // tests/qcow2_grow.rs); the three remaining non-raw
+    // planners are still phase-stubbed.
     let mut scratch = [0u8; 128];
-
-    let qcow2_opts = Qcow2ResizeOpts {
-        current_virtual_size: 1 << 20,
-        new_virtual_size: 2 << 20,
-        cluster_size: 65536,
-        refcount_bits: 16,
-        extended_l2: false,
-        preallocation: Preallocation::Off,
-        allow_shrink: false,
-        existing_l1_bytes: &[],
-        existing_refcount_table_bytes: &[],
-        existing_refcount_block_bytes: &[],
-        existing_refcount_block_indices: &[],
-        current_file_size: 0,
-        current_l1_entries: 0,
-        current_l1_table_offset: 0,
-        current_refcount_table_offset: 0,
-        current_refcount_table_clusters: 0,
-        current_incompatible_features: 0,
-        backing_file: None,
-        backing_format: None,
-        lazy_refcounts: false,
-    };
-    assert_eq!(
-        plan_resize_qcow2(&qcow2_opts, &mut scratch).unwrap_err(),
-        ResizeError::UnsupportedFormat
-    );
 
     let vmdk_opts = VmdkResizeOpts {
         current_virtual_size: 1 << 20,

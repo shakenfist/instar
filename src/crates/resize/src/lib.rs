@@ -56,6 +56,13 @@ pub enum ResizeError {
     /// to operate on it until the user runs `instar check` and
     /// resolves the inconsistency.
     RequiresCheckFirst,
+    /// The opts the planner received describe a geometry that
+    /// doesn't agree with what the host pre-populated in
+    /// `ResizeConfig.current_virtual_size`. Either the file
+    /// changed between the host's pre-probe and the guest's
+    /// read, or a host bug. The guest surfaces this so the host
+    /// can render a specific diagnostic.
+    HeaderMismatch,
 }
 
 /// What the resize will do to the file. Carried in [`ResizePlan`]
@@ -474,13 +481,15 @@ pub fn plan_resize_raw(opts: &RawResizeOpts) -> Result<ResizePlan<'static>, Resi
 
 /// Plan a resize of a qcow2 image.
 ///
-/// Phase 1 stub. Phase 2 lands the grow planner; phase 3 lands
-/// the shrink planner.
+/// Phase 2 implements the grow planner (HeaderOnly and L1Grow
+/// flavours; L1AndRefcountGrow lands in step 2c and
+/// `Preallocation::Metadata` likewise). Phase 3 will land the
+/// shrink planner.
 pub fn plan_resize_qcow2<'a>(
-    _opts: &Qcow2ResizeOpts<'_>,
-    _scratch: &'a mut [u8],
+    opts: &Qcow2ResizeOpts<'_>,
+    scratch: &'a mut [u8],
 ) -> Result<ResizePlan<'a>, ResizeError> {
-    Err(ResizeError::UnsupportedFormat)
+    qcow2::plan_grow(opts, scratch)
 }
 
 /// Plan a resize of a vmdk image.
@@ -630,33 +639,12 @@ mod tests {
 
     #[test]
     fn non_raw_planners_stub_to_unsupported() {
-        let qcow2_opts = Qcow2ResizeOpts {
-            current_virtual_size: 1 << 20,
-            new_virtual_size: 2 << 20,
-            cluster_size: 65536,
-            refcount_bits: 16,
-            extended_l2: false,
-            preallocation: Preallocation::Off,
-            allow_shrink: false,
-            existing_l1_bytes: &[],
-            existing_refcount_table_bytes: &[],
-            existing_refcount_block_bytes: &[],
-            existing_refcount_block_indices: &[],
-            current_file_size: 0,
-            current_l1_entries: 0,
-            current_l1_table_offset: 0,
-            current_refcount_table_offset: 0,
-            current_refcount_table_clusters: 0,
-            current_incompatible_features: 0,
-            backing_file: None,
-            backing_format: None,
-            lazy_refcounts: false,
-        };
+        // qcow2 is no longer stubbed (phase 2b lands the grow
+        // planner); see crates/resize/src/qcow2.rs tests and the
+        // tests/qcow2_grow.rs integration suite (phase 2d) for
+        // qcow2 coverage. The remaining three formats are still
+        // stubbed pending phases 4-6.
         let mut scratch = [0u8; 64];
-        assert_eq!(
-            plan_resize_qcow2(&qcow2_opts, &mut scratch).unwrap_err(),
-            ResizeError::UnsupportedFormat
-        );
 
         let vmdk_opts = VmdkResizeOpts {
             current_virtual_size: 1 << 20,
