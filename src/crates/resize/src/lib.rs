@@ -18,6 +18,8 @@
 
 #![no_std]
 
+mod qcow2;
+
 /// Errors returned by the `plan_resize_*` family of functions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResizeError {
@@ -49,6 +51,11 @@ pub enum ResizeError {
     /// The requested preallocation mode isn't supported for the
     /// target format/subformat (e.g. `metadata` on vmdk).
     PreallocationUnsupported,
+    /// The image is marked dirty or corrupt (qcow2's
+    /// `INCOMPAT_DIRTY` / `INCOMPAT_CORRUPT` bits). Resize refuses
+    /// to operate on it until the user runs `instar check` and
+    /// resolves the inconsistency.
+    RequiresCheckFirst,
 }
 
 /// What the resize will do to the file. Carried in [`ResizePlan`]
@@ -289,11 +296,64 @@ pub struct Qcow2ResizeOpts<'a> {
     pub preallocation: Preallocation,
     /// True iff the host CLI passed `--shrink`.
     pub allow_shrink: bool,
-    /// Read-only view of the existing image's L1 table. Phase 1
-    /// leaves this `&[]`; phase 2 (qcow2 grow) wires it in for
-    /// shrink validation and L1 extension. Carrying the lifetime
-    /// here keeps the API stable across phases.
+    /// Read-only view of the existing image's L1 table. The guest
+    /// reads `current_l1_entries * 8` bytes starting at
+    /// `current_l1_table_offset` into scratch before calling the
+    /// planner; the planner copies these bytes verbatim into the
+    /// new L1 region.
     pub existing_l1_bytes: &'a [u8],
+    /// Read-only view of the existing image's refcount table.
+    /// The guest reads `current_refcount_table_clusters *
+    /// cluster_size` bytes starting at
+    /// `current_refcount_table_offset` into scratch before calling
+    /// the planner; the planner walks it to find the offsets of
+    /// existing refcount blocks (so the new refcount table can
+    /// preserve pointers to unchanged blocks).
+    pub existing_refcount_table_bytes: &'a [u8],
+    /// Read-only snapshot of the *existing* refcount blocks that
+    /// the planner needs to patch (those that span the new L1
+    /// region's first cluster, new refcount-block clusters, etc).
+    /// The guest does a pre-pass to identify which blocks the
+    /// planner will modify and stages only those here; if the
+    /// planner needs a block that wasn't staged it returns
+    /// [`ResizeError::ScratchTooSmall`].
+    ///
+    /// Storage is a flat concatenation of cluster-sized blocks in
+    /// `existing_refcount_block_indices` order.
+    pub existing_refcount_block_bytes: &'a [u8],
+    /// The refcount-table indices of the blocks staged in
+    /// `existing_refcount_block_bytes`, in the same order.
+    /// `block i` lives in
+    /// `&existing_refcount_block_bytes[i * cluster_size..(i + 1) *
+    /// cluster_size]`.
+    pub existing_refcount_block_indices: &'a [u64],
+    /// Current file size in bytes (pre-resize EOF). The planner
+    /// places appended regions at this offset.
+    pub current_file_size: u64,
+    /// Current `header.l1_size` (entries, not bytes).
+    pub current_l1_entries: u32,
+    /// Current `header.l1_table_offset`.
+    pub current_l1_table_offset: u64,
+    /// Current `header.refcount_table_offset`.
+    pub current_refcount_table_offset: u64,
+    /// Current `header.refcount_table_clusters`.
+    pub current_refcount_table_clusters: u32,
+    /// Current `header.incompatible_features`. The planner rejects
+    /// `INCOMPAT_EXTERNAL_DATA` / `INCOMPAT_COMPRESSION` and any
+    /// unknown bits with [`ResizeError::UnsupportedFormat`]; it
+    /// rejects `INCOMPAT_DIRTY` / `INCOMPAT_CORRUPT` with
+    /// [`ResizeError::RequiresCheckFirst`].
+    pub current_incompatible_features: u64,
+    /// Optional backing-file path bytes (from the existing
+    /// header). Copied verbatim into the new header so the
+    /// backing-file reference survives the rewrite.
+    pub backing_file: Option<&'a [u8]>,
+    /// Optional backing-format hint (from the existing header's
+    /// EXT_BACKING_FORMAT extension).
+    pub backing_format: Option<&'a [u8]>,
+    /// Whether the existing header has the `lazy_refcounts`
+    /// compatible feature bit set.
+    pub lazy_refcounts: bool,
 }
 
 /// Options for [`plan_resize_vmdk`].
@@ -579,6 +639,18 @@ mod tests {
             preallocation: Preallocation::Off,
             allow_shrink: false,
             existing_l1_bytes: &[],
+            existing_refcount_table_bytes: &[],
+            existing_refcount_block_bytes: &[],
+            existing_refcount_block_indices: &[],
+            current_file_size: 0,
+            current_l1_entries: 0,
+            current_l1_table_offset: 0,
+            current_refcount_table_offset: 0,
+            current_refcount_table_clusters: 0,
+            current_incompatible_features: 0,
+            backing_file: None,
+            backing_format: None,
+            lazy_refcounts: false,
         };
         let mut scratch = [0u8; 64];
         assert_eq!(

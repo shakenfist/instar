@@ -129,6 +129,18 @@ fn non_raw_planners_remain_stubbed() {
         preallocation: Preallocation::Off,
         allow_shrink: false,
         existing_l1_bytes: &[],
+        existing_refcount_table_bytes: &[],
+        existing_refcount_block_bytes: &[],
+        existing_refcount_block_indices: &[],
+        current_file_size: 0,
+        current_l1_entries: 0,
+        current_l1_table_offset: 0,
+        current_refcount_table_offset: 0,
+        current_refcount_table_clusters: 0,
+        current_incompatible_features: 0,
+        backing_file: None,
+        backing_format: None,
+        lazy_refcounts: false,
     };
     assert_eq!(
         plan_resize_qcow2(&qcow2_opts, &mut scratch).unwrap_err(),
