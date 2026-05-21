@@ -763,7 +763,7 @@ versions; we can collapse those).
 | Phase | Plan | Status |
 |-------|------|--------|
 | 1. Resize planner crate skeleton (`crates/resize/`) + raw + shared types | [PLAN-resize-phase-01-skeleton.md](PLAN-resize-phase-01-skeleton.md) | Complete |
-| 2. QCOW2 grow planner (L1 + refcount-table extension) | PLAN-resize-phase-02-qcow2-grow.md (not yet written) | Not started |
+| 2. QCOW2 grow planner (L1 + refcount-table extension) | [PLAN-resize-phase-02-qcow2-grow.md](PLAN-resize-phase-02-qcow2-grow.md) | Not started |
 | 3. QCOW2 shrink planner (`--shrink` semantics, L2 walk, cluster discard) | PLAN-resize-phase-03-qcow2-shrink.md (not yet written) | Not started |
 | 4. VHD resize planner (dynamic grow, fixed grow; shrink deferred) | PLAN-resize-phase-04-vhd.md (not yet written) | Not started |
 | 5. VHDX resize planner (dynamic grow; shrink unsupported upstream) | PLAN-resize-phase-05-vhdx.md (not yet written) | Not started |
