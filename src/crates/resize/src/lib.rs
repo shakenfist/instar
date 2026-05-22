@@ -64,6 +64,11 @@ pub enum ResizeError {
     /// read, or a host bug. The guest surfaces this so the host
     /// can render a specific diagnostic.
     HeaderMismatch,
+    /// A format-specific parser (`vhd::VhdFooter::parse`,
+    /// `vhd::VhdDynamicHeader::parse`, etc.) failed to interpret
+    /// the existing metadata the host staged into the opts.
+    /// Indicates either a corrupted image or a host bug.
+    ParseFailed,
 }
 
 /// What the resize will do to the file. Carried in [`ResizePlan`]
