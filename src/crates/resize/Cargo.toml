@@ -10,9 +10,11 @@ publish = false
 shared = { path = "../../shared" }
 qcow2  = { path = "../qcow2", features = ["create"], default-features = false }
 vhd    = { path = "../vhd", default-features = false }
+vhdx   = { path = "../vhdx", default-features = false }
 
 [dev-dependencies]
 create = { path = "../create" }
 qcow2  = { path = "../qcow2", features = ["create"], default-features = false }
 shared = { path = "../../shared" }
 vhd    = { path = "../vhd", default-features = false }
+vhdx   = { path = "../vhdx", default-features = false }

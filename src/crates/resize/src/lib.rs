@@ -20,6 +20,7 @@
 
 mod qcow2;
 mod vhd;
+mod vhdx;
 
 /// Errors returned by the `plan_resize_*` family of functions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -448,7 +449,7 @@ pub struct VhdResizeOpts<'a> {
 
 /// Options for [`plan_resize_vhdx`].
 #[derive(Debug, Clone, Copy)]
-pub struct VhdxResizeOpts {
+pub struct VhdxResizeOpts<'a> {
     /// Current virtual size in bytes (from the
     /// `VirtualDiskSize` metadata entry).
     pub current_virtual_size: u64,
@@ -459,9 +460,54 @@ pub struct VhdxResizeOpts {
     pub block_size: u32,
     /// Preallocation mode for the new range.
     pub preallocation: Preallocation,
-    // No `allow_shrink` field — vhdx shrink is rejected
-    // unconditionally because qemu-img has no upstream
-    // implementation to mirror.
+    /// True iff the host CLI passed `--shrink`. VHDX shrink is
+    /// rejected unconditionally with
+    /// [`ResizeError::UnsupportedShrink`] (no qemu upstream
+    /// implementation to mirror) but the flag is carried for
+    /// host-side diagnostics.
+    pub allow_shrink: bool,
+    /// Existing bytes of the *active* header (4 KiB).  The
+    /// guest's pre-pass selects whichever header has the
+    /// higher `sequence_number` and stages it here.  Used to
+    /// read `sequence_number` and `log_guid`.
+    pub existing_active_header: &'a [u8],
+    /// File offset of the active header: either `0x10000` or
+    /// `0x20000`.  The planner writes the *other* header first
+    /// with `sequence_number + 1` so it becomes active.
+    pub current_active_header_offset: u64,
+    /// Current `sequence_number` of the active header.
+    pub current_sequence_number: u64,
+    /// Existing region table bytes (64 KiB).  Either copy is
+    /// fine — they're identical when consistent.
+    pub existing_region_table: &'a [u8],
+    /// Existing BAT bytes (`current_total_bat_entries * 8`).
+    /// The planner walks these to preserve allocated-block
+    /// references when relocating.
+    pub existing_bat: &'a [u8],
+    /// Current BAT region's file offset (from the region
+    /// table).
+    pub current_bat_offset: u64,
+    /// Current BAT region's length in bytes (from the region
+    /// table).
+    pub current_bat_length: u32,
+    /// Current `total_bat_entries` (computed by the parser at
+    /// init time via `calculate_bat_layout`).
+    pub current_total_bat_entries: u32,
+    /// Current metadata region's file offset.
+    pub current_metadata_offset: u64,
+    /// Current metadata region's length (typically 1 MiB).
+    pub current_metadata_length: u32,
+    /// `logical_sector_size` from the existing metadata.
+    pub logical_sector_size: u32,
+    /// `physical_sector_size` from the existing metadata.
+    pub physical_sector_size: u32,
+    /// Whether the existing image has a parent (differencing
+    /// disk).  Resize rejects differencing with
+    /// [`ResizeError::UnsupportedSubformat`].
+    pub has_parent: bool,
+    /// Current file size in bytes (pre-resize EOF).  The
+    /// relocate path appends a new BAT region here.
+    pub current_file_size: u64,
 }
 
 // ============================================================================
@@ -561,12 +607,13 @@ pub fn plan_resize_vhd<'a>(
 
 /// Plan a resize of a vhdx image.
 ///
-/// Phase 1 stub. Phase 5 lands the dynamic grow planner.
+/// Phase 5 lands the dynamic grow planner; shrink is not
+/// supported by qemu upstream and the planner rejects it.
 pub fn plan_resize_vhdx<'a>(
-    _opts: &VhdxResizeOpts,
-    _scratch: &'a mut [u8],
+    opts: &VhdxResizeOpts<'_>,
+    scratch: &'a mut [u8],
 ) -> Result<ResizePlan<'a>, ResizeError> {
-    Err(ResizeError::UnsupportedFormat)
+    vhdx::plan_grow(opts, scratch)
 }
 
 #[cfg(test)]
@@ -708,15 +755,7 @@ mod tests {
         // VHD is no longer a stub (phase 4 ships the grow
         // planner); coverage moves to tests/vhd_grow.rs.
 
-        let vhdx_opts = VhdxResizeOpts {
-            current_virtual_size: 1 << 20,
-            new_virtual_size: 2 << 20,
-            block_size: 32 * 1024 * 1024,
-            preallocation: Preallocation::Off,
-        };
-        assert_eq!(
-            plan_resize_vhdx(&vhdx_opts, &mut scratch).unwrap_err(),
-            ResizeError::UnsupportedFormat
-        );
+        // VHDX is no longer a stub (phase 5 ships the grow
+        // planner); coverage moves to tests/vhdx_grow.rs.
     }
 }
