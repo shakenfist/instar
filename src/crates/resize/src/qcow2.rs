@@ -70,17 +70,16 @@ pub(crate) fn plan_grow<'a>(
     if opts.new_virtual_size == 0 {
         return Err(ResizeError::InvalidNewVirtualSize);
     }
+    validate_incompat(opts.current_incompatible_features)?;
     if opts.new_virtual_size < opts.current_virtual_size {
         if !opts.allow_shrink {
             return Err(ResizeError::ShrinkWithoutFlag);
         }
-        // Phase 3 lands the shrink planner.
-        return Err(ResizeError::UnsupportedShrink);
+        return plan_shrink(opts, scratch);
     }
     if opts.new_virtual_size == opts.current_virtual_size {
         return Ok(ResizePlan::new(ResizeAction::NoOp, opts.current_file_size));
     }
-    validate_incompat(opts.current_incompatible_features)?;
     if opts.preallocation == Preallocation::Metadata {
         // 2c lifts this gate after the metadata layer lands.
         return Err(ResizeError::PreallocationUnsupported);
@@ -922,6 +921,383 @@ fn stage_cleanup_decrement(
         0,
     )?;
     Ok(())
+}
+
+/// Shrink planner: walk L1/L2 to identify clusters above
+/// `new_virtual_size`, zero their L2 entries and L1 entries
+/// (where the entire L2 coverage is above the boundary),
+/// decrement refcounts to 0, and rewrite the header. No file
+/// truncation; matches qemu's behaviour.
+///
+/// Patch sequence (crash-safe ordering — prepare → header,
+/// no cleanup phase because no metadata is relocated):
+///   1. Write: straddling L2 table (if any) with entries above
+///      the boundary zeroed
+///   2. Write: existing L1 region with discarded entries zeroed
+///   3. Write: each modified existing refcount block (entries
+///      decremented to 0 for discarded data clusters and the
+///      L2-table clusters they referenced)
+///   4. Write: new header (header.size = new_virtual_size)
+fn plan_shrink<'a>(
+    opts: &Qcow2ResizeOpts<'_>,
+    scratch: &'a mut [u8],
+) -> Result<ResizePlan<'a>, ResizeError> {
+    let cluster_size = opts.cluster_size as u64;
+    let cluster_size_us = opts.cluster_size as usize;
+    let cluster_bits = cluster_bits_from(opts.cluster_size)?;
+
+    // Round down to cluster boundary per the phase plan's
+    // open question 1.
+    let new_virtual_size = (opts.new_virtual_size / cluster_size) * cluster_size;
+    if new_virtual_size < cluster_size {
+        // Minimum one cluster of virtual size; smaller asks
+        // are rejected.
+        return Err(ResizeError::InvalidNewVirtualSize);
+    }
+
+    let l2_entry_size: u64 = if opts.extended_l2 { 16 } else { 8 };
+    let entries_per_l2: u64 = cluster_size / l2_entry_size;
+    let l2_coverage: u64 = cluster_size * entries_per_l2;
+    let entries_per_refblock: u64 = (cluster_size * 8) / opts.refcount_bits as u64;
+
+    // L1 entries fully above the new size.
+    let first_discarded_l1_idx = new_virtual_size.div_ceil(l2_coverage) as u32;
+    // The L1 entry whose coverage range straddles the boundary
+    // (if any). When new_virtual_size is an exact multiple of
+    // l2_coverage, no straddling case.
+    let straddle_l1_idx: Option<u32> = if new_virtual_size.is_multiple_of(l2_coverage) {
+        None
+    } else {
+        Some((new_virtual_size / l2_coverage) as u32)
+    };
+
+    // Carve scratch:
+    //   [0..cluster_size)                — new header
+    //   [cluster_size..+l1_region_bytes) — rewritten L1 region
+    //   [..+cluster_size)                — straddling L2 staging
+    //   [..]                             — refcount-block staging
+    let old_l1_size_bytes = (opts.current_l1_entries as u64) * 8;
+    let old_l1_clusters = old_l1_size_bytes.div_ceil(cluster_size).max(1);
+    let l1_region_bytes = old_l1_clusters * cluster_size;
+
+    let header_off = 0usize;
+    let header_end = cluster_size_us;
+    let l1_off = header_end;
+    let l1_end = l1_off + l1_region_bytes as usize;
+    let straddle_l2_off = l1_end;
+    let straddle_l2_end = straddle_l2_off + cluster_size_us;
+    if straddle_l2_end > scratch.len() {
+        return Err(ResizeError::ScratchTooSmall);
+    }
+    let mut next_staging = straddle_l2_end;
+
+    // Build the new L1 region: copy existing + zero discarded
+    // L1 entries (we mark them zero up-front; the walk loop
+    // below validates that the L2 walk doesn't reveal allocated
+    // data the user didn't authorise to drop).
+    {
+        let l1_buf = &mut scratch[l1_off..l1_end];
+        l1_buf.fill(0);
+        let copy_len = opts.existing_l1_bytes.len().min(old_l1_size_bytes as usize);
+        l1_buf[..copy_len].copy_from_slice(&opts.existing_l1_bytes[..copy_len]);
+    }
+
+    // Track existing refcount blocks we need to patch (decrement
+    // entries to 0 for each discarded data/L2 cluster). Up to
+    // MAX_DISCARD_REFBLOCKS distinct blocks; if exceeded return
+    // ScratchTooSmall.
+    const MAX_DISCARD_REFBLOCKS: usize = 64;
+    let mut refblock_slots: [(u64, usize); MAX_DISCARD_REFBLOCKS] = [(0, 0); MAX_DISCARD_REFBLOCKS];
+    let mut refblock_count: usize = 0;
+
+    let mut decrement_cluster = |scratch: &mut [u8],
+                                 next_staging: &mut usize,
+                                 refblock_slots: &mut [(u64, usize); MAX_DISCARD_REFBLOCKS],
+                                 refblock_count: &mut usize,
+                                 host_offset: u64|
+     -> Result<(), ResizeError> {
+        let cluster_idx = host_offset / cluster_size;
+        let block_idx = cluster_idx / entries_per_refblock;
+        let local_idx = cluster_idx % entries_per_refblock;
+        let off = if let Some(pos) = refblock_slots
+            .iter()
+            .take(*refblock_count)
+            .position(|(idx, _)| *idx == block_idx)
+        {
+            refblock_slots[pos].1
+        } else {
+            if *refblock_count >= MAX_DISCARD_REFBLOCKS {
+                return Err(ResizeError::ScratchTooSmall);
+            }
+            let new_off = allocate_staging(next_staging, scratch.len(), cluster_size_us)?;
+            ensure_block_staged(opts, block_idx, scratch, new_off, cluster_size_us)?;
+            refblock_slots[*refblock_count] = (block_idx, new_off);
+            *refblock_count += 1;
+            new_off
+        };
+        set_refcount(
+            &mut scratch[off..off + cluster_size_us],
+            local_idx,
+            opts.refcount_bits,
+            0,
+        )?;
+        Ok(())
+    };
+
+    // 1. Walk L1 entries fully above new_virtual_size.
+    for i in first_discarded_l1_idx..opts.current_l1_entries {
+        let l1_entry = be_u64(opts.existing_l1_bytes, (i as usize) * 8);
+        if l1_entry == 0 {
+            continue;
+        }
+        let l2_host = l1_entry & qcow2::L2_OFFSET_MASK;
+        // Walk the L2 table; for each non-zero data entry,
+        // decrement (or reject without --shrink).
+        let l2_bytes = lookup_l2(opts, i, cluster_size_us)?;
+        walk_l2_for_discard(
+            opts,
+            l2_bytes,
+            None, // discard all entries
+            scratch,
+            &mut next_staging,
+            &mut refblock_slots,
+            &mut refblock_count,
+            &mut decrement_cluster,
+            l2_entry_size,
+        )?;
+        // Decrement the L2 table cluster itself.
+        decrement_cluster(
+            scratch,
+            &mut next_staging,
+            &mut refblock_slots,
+            &mut refblock_count,
+            l2_host,
+        )?;
+        // Zero the L1 entry in the rewritten L1 region.
+        let l1_buf = &mut scratch[l1_off..l1_end];
+        let off = (i as usize) * 8;
+        write_be_u64(l1_buf, off, 0);
+    }
+
+    // 2. Handle the straddling L1 entry (if any).
+    let mut straddle_emit = false;
+    if let Some(i) = straddle_l1_idx {
+        let l1_entry = be_u64(opts.existing_l1_bytes, (i as usize) * 8);
+        if l1_entry != 0 {
+            let l2_bytes = lookup_l2(opts, i, cluster_size_us)?;
+            // Stage the L2 table; zero the entries whose guest
+            // offset is >= new_virtual_size, decrement the
+            // referenced data clusters.
+            let base_virtual = (i as u64) * l2_coverage;
+            // Copy l2_bytes into staging, then mutate.
+            scratch[straddle_l2_off..straddle_l2_end].copy_from_slice(l2_bytes);
+            let entries = entries_per_l2 as usize;
+            for j in 0..entries {
+                let entry_off = j * l2_entry_size as usize;
+                let l2e = be_u64(l2_bytes, entry_off);
+                let v_start = base_virtual + (j as u64) * cluster_size;
+                if v_start < new_virtual_size {
+                    continue;
+                }
+                if l2e == 0 {
+                    // Already unallocated; nothing to do beyond
+                    // ensuring the entry stays zero.
+                    if l2_entry_size == 16 {
+                        let staged = &mut scratch[straddle_l2_off..straddle_l2_end];
+                        write_be_u64(staged, entry_off, 0);
+                        write_be_u64(staged, entry_off + 8, 0);
+                    } else {
+                        let staged = &mut scratch[straddle_l2_off..straddle_l2_end];
+                        write_be_u64(staged, entry_off, 0);
+                    }
+                    straddle_emit = true;
+                    continue;
+                }
+                // Allocated cluster above the boundary — discard.
+                let data_host = l2e & qcow2::L2_OFFSET_MASK;
+                decrement_cluster(
+                    scratch,
+                    &mut next_staging,
+                    &mut refblock_slots,
+                    &mut refblock_count,
+                    data_host,
+                )?;
+                // Zero the L2 entry in staging.
+                let staged = &mut scratch[straddle_l2_off..straddle_l2_end];
+                write_be_u64(staged, entry_off, 0);
+                if l2_entry_size == 16 {
+                    write_be_u64(staged, entry_off + 8, 0);
+                }
+                straddle_emit = true;
+            }
+        }
+    }
+
+    // 3. Build the new header.
+    let header_layout = Qcow2Layout {
+        cluster_bits,
+        cluster_size,
+        virtual_size: new_virtual_size,
+        refcount_bits: opts.refcount_bits as u32,
+        extended_l2: opts.extended_l2,
+        preallocation: Qcow2CreatePreallocation::Off,
+        l1_entries: opts.current_l1_entries,
+        l1_size_bytes: old_l1_size_bytes,
+        l1_clusters: old_l1_clusters,
+        l1_offset: opts.current_l1_table_offset,
+        refcount_table_offset: opts.current_refcount_table_offset,
+        refcount_table_clusters: opts.current_refcount_table_clusters as u64,
+        refcount_block_count: 0,
+        refcount_blocks_base_offset: 0,
+        l2_clusters: 0,
+        l2_base_offset: 0,
+        data_clusters: 0,
+        data_base_offset: 0,
+        total_clusters: 0,
+        total_file_size: 0,
+    };
+    let header_bytes_len = {
+        let header_buf = &mut scratch[header_off..header_end];
+        build_header(
+            header_buf,
+            &BuildHeaderOptions {
+                layout: &header_layout,
+                backing_file: opts.backing_file,
+                backing_format: opts.backing_format,
+                lazy_refcounts: opts.lazy_refcounts,
+                luks_header: None,
+            },
+        )
+        .map_err(map_qcow2_create_err)?
+        .len()
+    };
+
+    // 4. Assemble the plan in crash-safe order.
+    let mut plan = ResizePlan::new(ResizeAction::Shrink, opts.current_file_size);
+
+    // Phase A — prepare:
+    if straddle_emit {
+        if let Some(i) = straddle_l1_idx {
+            let l1_entry = be_u64(opts.existing_l1_bytes, (i as usize) * 8);
+            let l2_host = l1_entry & qcow2::L2_OFFSET_MASK;
+            plan.push(ResizePatch::Write {
+                byte_offset: l2_host,
+                bytes: &scratch[straddle_l2_off..straddle_l2_end],
+            })?;
+        }
+    }
+    // L1 region rewrite (with discarded entries zeroed). Always
+    // emit even if no L1 entries were zeroed, to keep the patch
+    // sequence uniform — qemu's check tolerates a no-op rewrite.
+    // Actually skip it if nothing changed: the straddle-only
+    // case doesn't touch L1.
+    let l1_changed = first_discarded_l1_idx < opts.current_l1_entries
+        && (first_discarded_l1_idx..opts.current_l1_entries)
+            .any(|i| be_u64(opts.existing_l1_bytes, (i as usize) * 8) != 0);
+    if l1_changed {
+        plan.push(ResizePatch::Write {
+            byte_offset: opts.current_l1_table_offset,
+            bytes: &scratch[l1_off..l1_end],
+        })?;
+    }
+    // Refcount-block patches (each modified block, with all
+    // relevant entries decremented to 0).
+    for slot in refblock_slots.iter().take(refblock_count) {
+        let block_file_off = block_offset_in_file(opts.existing_refcount_table_bytes, slot.0)?;
+        plan.push(ResizePatch::Write {
+            byte_offset: block_file_off,
+            bytes: &scratch[slot.1..slot.1 + cluster_size_us],
+        })?;
+    }
+
+    // Phase B — header rewrite (atomic commit).
+    plan.push(ResizePatch::Write {
+        byte_offset: 0,
+        bytes: &scratch[header_off..header_off + header_bytes_len],
+    })?;
+
+    Ok(plan)
+}
+
+/// Walk an L2 table, decrementing refcounts for non-zero entries
+/// in the discard range. With `boundary == None` (fully-discarded
+/// L1 entry), every non-zero entry is decremented. With
+/// `boundary == Some((base_virtual, new_virtual_size))`
+/// (straddling case), only entries whose guest offset is
+/// `>= new_virtual_size` are decremented.
+///
+/// Returns `ShrinkBelowAllocated` if `!opts.allow_shrink` and any
+/// entry in the discard range is allocated. Otherwise updates
+/// refblock_slots in place via the `decrement` closure.
+#[allow(clippy::too_many_arguments)]
+fn walk_l2_for_discard(
+    opts: &Qcow2ResizeOpts<'_>,
+    l2_bytes: &[u8],
+    boundary: Option<(u64, u64)>, // (base_virtual, new_virtual_size)
+    scratch: &mut [u8],
+    next_staging: &mut usize,
+    refblock_slots: &mut [(u64, usize); 64],
+    refblock_count: &mut usize,
+    decrement: &mut impl FnMut(
+        &mut [u8],
+        &mut usize,
+        &mut [(u64, usize); 64],
+        &mut usize,
+        u64,
+    ) -> Result<(), ResizeError>,
+    l2_entry_size: u64,
+) -> Result<(), ResizeError> {
+    let cluster_size = opts.cluster_size as u64;
+    let entries = (opts.cluster_size as u64 / l2_entry_size) as usize;
+    for j in 0..entries {
+        let entry_off = j * l2_entry_size as usize;
+        if entry_off + 8 > l2_bytes.len() {
+            return Err(ResizeError::ScratchTooSmall);
+        }
+        let l2e = be_u64(l2_bytes, entry_off);
+        if l2e == 0 {
+            continue;
+        }
+        if let Some((base_virtual, new_virtual_size)) = boundary {
+            let v = base_virtual + (j as u64) * cluster_size;
+            if v < new_virtual_size {
+                continue;
+            }
+        }
+        if !opts.allow_shrink {
+            return Err(ResizeError::ShrinkBelowAllocated);
+        }
+        let data_host = l2e & qcow2::L2_OFFSET_MASK;
+        decrement(
+            scratch,
+            next_staging,
+            refblock_slots,
+            refblock_count,
+            data_host,
+        )?;
+    }
+    Ok(())
+}
+
+/// Look up an L2 table in the staged snapshot. Returns the
+/// `cluster_size` bytes for L2 index `l1_index`, or
+/// `ScratchTooSmall` if the guest did not stage it.
+fn lookup_l2<'a>(
+    opts: &'a Qcow2ResizeOpts<'_>,
+    l1_index: u32,
+    cluster_size: usize,
+) -> Result<&'a [u8], ResizeError> {
+    for (i, &idx) in opts.existing_l2_indices.iter().enumerate() {
+        if idx == l1_index {
+            let off = i * cluster_size;
+            let end = off + cluster_size;
+            if end > opts.existing_l2_bytes.len() {
+                return Err(ResizeError::ScratchTooSmall);
+            }
+            return Ok(&opts.existing_l2_bytes[off..end]);
+        }
+    }
+    Err(ResizeError::ScratchTooSmall)
 }
 
 // ============================================================================

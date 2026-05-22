@@ -279,20 +279,6 @@ fn rejects_shrink_without_flag() {
 }
 
 #[test]
-fn rejects_shrink_with_flag_pending_phase_3() {
-    let (bytes, header) = build_starting_image(1 << 30, 65536);
-    let opts = opts_from_image(&bytes, &header, 1 << 28, Preallocation::Off, true);
-    let mut scratch = vec![0u8; QCOW2_MAX_RESIZE_SCRATCH];
-    // Phase 3 lands the real shrink implementation; for now we
-    // return UnsupportedShrink so the host can render a
-    // "shrink not yet supported" message.
-    assert_eq!(
-        plan_resize_qcow2(&opts, &mut scratch).unwrap_err(),
-        ResizeError::UnsupportedShrink
-    );
-}
-
-#[test]
 fn rejects_zero_new_virtual_size() {
     let (bytes, header) = build_starting_image(1 << 20, 65536);
     let opts = opts_from_image(&bytes, &header, 0, Preallocation::Off, false);
