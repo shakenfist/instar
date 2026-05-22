@@ -19,6 +19,7 @@
 #![no_std]
 
 mod qcow2;
+mod vhd;
 
 /// Errors returned by the `plan_resize_*` family of functions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -397,7 +398,7 @@ pub struct VmdkResizeOpts {
 
 /// Options for [`plan_resize_vhd`].
 #[derive(Debug, Clone, Copy)]
-pub struct VhdResizeOpts {
+pub struct VhdResizeOpts<'a> {
     /// Current virtual size in bytes.
     pub current_virtual_size: u64,
     /// Requested new virtual size in bytes.
@@ -412,6 +413,32 @@ pub struct VhdResizeOpts {
     pub allow_shrink: bool,
     /// Preallocation mode for the new range.
     pub preallocation: Preallocation,
+    /// Existing footer bytes (512). For dynamic VHDs this is
+    /// the head footer at offset 0. The planner reads
+    /// `disk_type`, `current_size`, and `uuid` from here so the
+    /// rewritten footers preserve disk identity.
+    pub existing_footer: &'a [u8],
+    /// Existing dynamic header bytes (1024). Only meaningful
+    /// for dynamic; `&[]` for fixed.
+    pub existing_dynamic_header: &'a [u8],
+    /// Existing BAT bytes (only meaningful for dynamic). The
+    /// planner walks these to decide whether the new BAT fits
+    /// in place or must be relocated.
+    pub existing_bat: &'a [u8],
+    /// Current file size in bytes (pre-resize EOF). The
+    /// relocate path uses this to compute where the new BAT
+    /// region lands.
+    pub current_file_size: u64,
+    /// Disk type from the existing footer
+    /// (`DISK_TYPE_FIXED` / `DYNAMIC` / `DIFFERENCING`). The
+    /// planner rejects differencing with
+    /// [`ResizeError::UnsupportedSubformat`].
+    pub disk_type: u32,
+    /// Current dynamic header's `table_offset`. 0 for fixed.
+    pub current_table_offset: u64,
+    /// Current dynamic header's `max_table_entries`. 0 for
+    /// fixed.
+    pub current_max_table_entries: u32,
 }
 
 /// Options for [`plan_resize_vhdx`].
@@ -519,12 +546,12 @@ pub fn plan_resize_vmdk<'a>(
 
 /// Plan a resize of a vhd image.
 ///
-/// Phase 1 stub. Phase 4 lands dynamic and fixed grow planners.
+/// Phase 4 lands fixed and dynamic grow; shrink is deferred.
 pub fn plan_resize_vhd<'a>(
-    _opts: &VhdResizeOpts,
-    _scratch: &'a mut [u8],
+    opts: &VhdResizeOpts<'_>,
+    scratch: &'a mut [u8],
 ) -> Result<ResizePlan<'a>, ResizeError> {
-    Err(ResizeError::UnsupportedFormat)
+    vhd::plan_grow(opts, scratch)
 }
 
 /// Plan a resize of a vhdx image.
@@ -673,18 +700,8 @@ mod tests {
             ResizeError::UnsupportedFormat
         );
 
-        let vhd_opts = VhdResizeOpts {
-            current_virtual_size: 1 << 20,
-            new_virtual_size: 2 << 20,
-            block_size: 2 * 1024 * 1024,
-            subformat: VhdSubformat::Dynamic,
-            allow_shrink: false,
-            preallocation: Preallocation::Off,
-        };
-        assert_eq!(
-            plan_resize_vhd(&vhd_opts, &mut scratch).unwrap_err(),
-            ResizeError::UnsupportedFormat
-        );
+        // VHD is no longer a stub (phase 4 ships the grow
+        // planner); coverage moves to tests/vhd_grow.rs.
 
         let vhdx_opts = VhdxResizeOpts {
             current_virtual_size: 1 << 20,

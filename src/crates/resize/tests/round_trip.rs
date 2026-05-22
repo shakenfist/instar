@@ -7,9 +7,9 @@
 //! cover end-to-end invariants and forward-compat tripwires.
 
 use resize::{
-    plan_resize_raw, plan_resize_vhd, plan_resize_vhdx, plan_resize_vmdk, Preallocation,
-    RawResizeOpts, ResizeAction, ResizeError, ResizePatch, ResizePlan, VhdResizeOpts, VhdSubformat,
-    VhdxResizeOpts, VmdkResizeOpts, VmdkSubformat, MAX_RESIZE_PATCHES,
+    plan_resize_raw, plan_resize_vhdx, plan_resize_vmdk, Preallocation, RawResizeOpts,
+    ResizeAction, ResizeError, ResizePatch, ResizePlan, VhdxResizeOpts, VmdkResizeOpts,
+    VmdkSubformat, MAX_RESIZE_PATCHES,
 };
 
 #[test]
@@ -135,18 +135,8 @@ fn non_raw_planners_remain_stubbed() {
         ResizeError::UnsupportedFormat
     );
 
-    let vhd_opts = VhdResizeOpts {
-        current_virtual_size: 1 << 20,
-        new_virtual_size: 2 << 20,
-        block_size: 2 * 1024 * 1024,
-        subformat: VhdSubformat::Dynamic,
-        allow_shrink: false,
-        preallocation: Preallocation::Off,
-    };
-    assert_eq!(
-        plan_resize_vhd(&vhd_opts, &mut scratch).unwrap_err(),
-        ResizeError::UnsupportedFormat
-    );
+    // VHD is no longer a stub (phase 4 ships the grow planner);
+    // coverage moves to tests/vhd_grow.rs.
 
     let vhdx_opts = VhdxResizeOpts {
         current_virtual_size: 1 << 20,
