@@ -19,3 +19,4 @@
 # plans live in docs/plans/ (this rule is anchored to the repo
 # root so it does not catch docs/plans/PLAN-*.md).
 /PLAN-*.md
+__pycache__/
