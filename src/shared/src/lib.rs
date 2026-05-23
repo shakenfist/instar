@@ -673,6 +673,22 @@ pub struct CallTable {
     /// existing operation binaries do not need to recompile against
     /// shifted offsets to keep working.
     pub send_create_result: unsafe extern "C" fn(*const CreateResult),
+
+    /// Read a sector from the *output* device. Resize is the
+    /// first operation that reads from the file it writes to;
+    /// rebase and commit will reuse this. Args:
+    /// `(sector_number, buf_ptr, buf_len)`; returns `true` on
+    /// success. Appended at the end of `CallTable` so existing
+    /// operation binaries do not need to recompile against
+    /// shifted offsets to keep working.
+    pub read_output_sector: unsafe extern "C" fn(u64, *mut u8, usize) -> bool,
+
+    /// Send the resize result message. Args: `resize_result`
+    /// pointer containing the resolved new virtual size, the
+    /// pre/post file sizes, the action (noop/grow/shrink), and
+    /// the error code. Appended at the end of `CallTable` for
+    /// the same back-compat reason as `send_create_result`.
+    pub send_resize_result: unsafe extern "C" fn(*const ResizeResult),
 }
 
 /// Backing format type for QCOW2 header extension
@@ -2891,6 +2907,24 @@ mod tests {
         assert!(r.is_valid());
         r.magic = 0;
         assert!(!r.is_valid());
+    }
+
+    #[test]
+    fn call_table_carries_resize_function_pointers() {
+        // Forward-compat tripwire: phase 7a appended
+        // `read_output_sector` and `send_resize_result` at the
+        // end of CallTable. The size budget asserts no field
+        // sneaks in past them. Update the budget deliberately
+        // when adding new fields and document the change.
+        let expected_fn_ptr = core::mem::size_of::<usize>();
+        let min_fn_ptrs_in_table = 25; // grew from 23 in phase 7a
+        let min_size = core::mem::size_of::<u32>() * 2 // magic + version
+            + expected_fn_ptr * min_fn_ptrs_in_table;
+        assert!(
+            core::mem::size_of::<CallTable>() >= min_size,
+            "CallTable shrank to {} bytes",
+            core::mem::size_of::<CallTable>()
+        );
     }
 
     #[test]

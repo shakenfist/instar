@@ -270,6 +270,18 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
                 c.error
             )
         }
+        Some(guest_::GuestMessage_::Payload::ResizeResult(r)) => {
+            format!(
+                "resize_result target_format={} resolved_new_virtual_size={} \
+                file_size_before={} file_size_after={} action={} error={}",
+                r.target_format,
+                r.resolved_new_virtual_size,
+                r.file_size_before,
+                r.file_size_after,
+                r.action,
+                r.error
+            )
+        }
         None => "empty payload".to_string(),
     };
 

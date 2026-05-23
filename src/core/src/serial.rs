@@ -532,3 +532,27 @@ pub fn send_create_result(result: &shared::CreateResult) {
     );
     send_message(&msg);
 }
+
+/// Send a resize result message.
+///
+/// Mirrors [`send_create_result`].  The `action` u32 in
+/// `ResizeResult` (NoOp / Grow / Shrink) is mapped to the
+/// matching short string for the protobuf envelope so the host
+/// can render the success line directly.
+pub fn send_resize_result(result: &shared::ResizeResult) {
+    let target_name = shared::ImageFormat::from_u32(result.target_format).name();
+    let action = match result.action {
+        shared::ResizeResult::ACTION_GROW => "grow",
+        shared::ResizeResult::ACTION_SHRINK => "shrink",
+        _ => "noop",
+    };
+    let msg = guest_protocol::resize_result_message(
+        target_name,
+        result.resolved_new_virtual_size,
+        result.file_size_before,
+        result.file_size_after,
+        action,
+        result.error,
+    );
+    send_message(&msg);
+}

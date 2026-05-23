@@ -21,15 +21,16 @@ use core::ptr::write_volatile;
 
 use shared::{
     CallTable, ChainConfig, CheckResult, CompareResult, CreateResult, LuksInfo, MeasureResult,
-    Qcow2Info, VdiInfo, VmdkInfo, CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR, CHAIN_CONFIG_MAX_SIZE,
-    OPERATION_CONFIG_ADDR, OPERATION_CONFIG_MAX_SIZE, OPERATION_LOAD_ADDR, VMM_PARAMS_ADDR,
+    Qcow2Info, ResizeResult, VdiInfo, VmdkInfo, CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR,
+    CHAIN_CONFIG_MAX_SIZE, OPERATION_CONFIG_ADDR, OPERATION_CONFIG_MAX_SIZE, OPERATION_LOAD_ADDR,
+    VMM_PARAMS_ADDR,
 };
 
 use crate::serial::{
     debug_print, read_config, send_check_result, send_compare_result, send_complete,
     send_create_result, send_error, send_info_result, send_info_result_luks,
     send_info_result_qcow2, send_info_result_vdi, send_info_result_vmdk, send_init,
-    send_measure_result, send_progress, DeviceConfig,
+    send_measure_result, send_progress, send_resize_result, DeviceConfig,
 };
 use crate::virtio::VirtioBlock;
 
@@ -286,6 +287,8 @@ fn setup_call_table() {
         send_compare_result: ct_send_compare_result,
         send_measure_result: ct_send_measure_result,
         send_create_result: ct_send_create_result,
+        read_output_sector: ct_read_output_sector,
+        send_resize_result: ct_send_resize_result,
     };
 
     unsafe {
@@ -657,6 +660,24 @@ unsafe extern "C" fn ct_send_measure_result(result: *const MeasureResult) {
 unsafe extern "C" fn ct_send_create_result(result: *const CreateResult) {
     if !result.is_null() {
         send_create_result(&*result);
+    }
+}
+
+/// Read a sector from the output device. Resize is the first
+/// consumer; rebase / commit will reuse later.
+unsafe extern "C" fn ct_read_output_sector(sector: u64, buffer: *mut u8, len: usize) -> bool {
+    if let Some(ref mut dev) = *OUTPUT_DEVICE.get_mut() {
+        let slice = core::slice::from_raw_parts_mut(buffer, len);
+        dev.read_sector(sector, slice)
+    } else {
+        false
+    }
+}
+
+/// Send resize result message.
+unsafe extern "C" fn ct_send_resize_result(result: *const ResizeResult) {
+    if !result.is_null() {
+        send_resize_result(&*result);
     }
 }
 
