@@ -179,6 +179,40 @@ const CREATE_RESULT_ERROR_UNSUPPORTED_FORMAT: u32 = 8;
 const CREATE_RESULT_ERROR_BACKING_FORMAT_UNSUPPORTED: u32 = 9;
 const CREATE_RESULT_ERROR_BACKING_SIZE_TOO_LARGE: u32 = 10;
 
+// ResizeConfig constants (must match shared crate)
+const RESIZE_CONFIG_MAGIC: u32 = 0x52455349; // "RESI"
+const RESIZE_CONFIG_FLAG_SHRINK: u32 = 1 << 0;
+#[allow(dead_code)]
+const RESIZE_CONFIG_FLAG_EXTENDED_L2: u32 = 1 << 1;
+#[allow(dead_code)]
+const RESIZE_CONFIG_FLAG_QUIET: u32 = 1 << 2;
+#[allow(dead_code)]
+const RESIZE_CONFIG_PREALLOC_OFF: u32 = 0 << 4;
+const RESIZE_CONFIG_PREALLOC_METADATA: u32 = 1 << 4;
+const RESIZE_CONFIG_PREALLOC_FALLOC: u32 = 2 << 4;
+const RESIZE_CONFIG_PREALLOC_FULL: u32 = 3 << 4;
+
+// ResizeResult constants (must match shared crate)
+#[allow(dead_code)]
+const RESIZE_RESULT_MAGIC: u32 = 0x52524553; // "RRES"
+const RESIZE_RESULT_ACTION_NOOP: u32 = 0;
+const RESIZE_RESULT_ACTION_GROW: u32 = 1;
+const RESIZE_RESULT_ACTION_SHRINK: u32 = 2;
+const RESIZE_RESULT_ERROR_OK: u32 = 0;
+const RESIZE_RESULT_ERROR_INVALID_OPTION: u32 = 1;
+const RESIZE_RESULT_ERROR_INVALID_NEW_SIZE: u32 = 2;
+const RESIZE_RESULT_ERROR_SHRINK_WITHOUT_FLAG: u32 = 3;
+const RESIZE_RESULT_ERROR_SHRINK_BELOW_ALLOCATED: u32 = 4;
+const RESIZE_RESULT_ERROR_UNSUPPORTED_FORMAT: u32 = 5;
+const RESIZE_RESULT_ERROR_UNSUPPORTED_SUBFORMAT: u32 = 6;
+const RESIZE_RESULT_ERROR_UNSUPPORTED_SHRINK: u32 = 7;
+const RESIZE_RESULT_ERROR_PREALLOCATION_UNSUPPORTED: u32 = 8;
+const RESIZE_RESULT_ERROR_SCRATCH_TOO_SMALL: u32 = 9;
+const RESIZE_RESULT_ERROR_READ_FAILED: u32 = 10;
+const RESIZE_RESULT_ERROR_WRITE_FAILED: u32 = 11;
+const RESIZE_RESULT_ERROR_PARSE_FAILED: u32 = 12;
+const RESIZE_RESULT_ERROR_HEADER_MISMATCH: u32 = 13;
+
 // CheckResult flag constants (must match shared crate)
 const CHECK_RESULT_FLAG_VALID: u32 = 1 << 0;
 #[allow(dead_code)]
@@ -2883,9 +2917,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Run the resize operation.  Phase 8a ships a stub; 8b lands
-/// the real implementation.
-fn run_resize(args: ResizeArgs, _verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+/// Run the resize operation.
+fn run_resize(args: ResizeArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Reject the unsupported surface up-front before any I/O.
     if args.object.is_some() {
         return Err("--object is not yet supported by instar resize".into());
@@ -2893,9 +2926,650 @@ fn run_resize(args: ResizeArgs, _verbose: bool) -> Result<(), Box<dyn std::error
     if args.image_opts {
         return Err("--image-opts is not yet supported by instar resize".into());
     }
-    // 8b lands probe_current_size + run_resize_raw + run_resize_nonraw.
-    let _ = parse_resize_size(&args.size)?;
-    Err("instar resize: phase 8b lands the real implementation".into())
+
+    let parsed_size = parse_resize_size(&args.size)?;
+    let probed = probe_resize_target(Path::new(&args.filename), args.format.as_deref())?;
+    let new_virtual_size = match parsed_size {
+        ParsedResizeSize::Absolute(v) => v,
+        ParsedResizeSize::Add(d) => probed
+            .current_virtual_size
+            .checked_add(d)
+            .ok_or("resize: new virtual size overflows u64")?,
+        ParsedResizeSize::Subtract(d) => probed
+            .current_virtual_size
+            .checked_sub(d)
+            .ok_or("resize: new virtual size underflows below zero")?,
+    };
+
+    if probed.format == IMAGE_FORMAT_RAW {
+        run_resize_raw(&args, &probed, new_virtual_size)
+    } else {
+        run_resize_nonraw(&args, &probed, new_virtual_size, verbose)
+    }
+}
+
+/// Snapshot of what the host probed from the target file before
+/// launching the guest.
+struct ProbedResizeTarget {
+    /// Numeric `IMAGE_FORMAT_*` constant.
+    format: u32,
+    /// Virtual disk size in bytes (= file length for raw; from
+    /// the format header otherwise).
+    current_virtual_size: u64,
+    /// File size in bytes (pre-resize EOF).
+    current_file_size: u64,
+    /// QCOW2 only: extended_l2 bit from the header.  False for
+    /// other formats.
+    qcow2_extended_l2: bool,
+}
+
+/// Probe the resize target's format and current virtual size.
+/// Honours `-f FMT` if given; otherwise auto-detects via
+/// `shared::format_detection::detect_format_from_header`.
+fn probe_resize_target(
+    path: &Path,
+    forced_format: Option<&str>,
+) -> Result<ProbedResizeTarget, Box<dyn std::error::Error>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::OpenOptions::new().read(true).open(path)?;
+    let current_file_size = file.metadata()?.len();
+
+    // Read the first 4 KiB; covers every format's sector-0
+    // header.  VHDX uses a bigger first-region magic but the
+    // 8-byte file identifier still lives at offset 0.
+    let mut buf = vec![0u8; 4096];
+    let read = file.read(&mut buf)?;
+    buf.truncate(read);
+
+    let detected = match forced_format {
+        Some("raw") => shared::ImageFormat::Raw,
+        Some("qcow2") => shared::ImageFormat::Qcow2,
+        Some("vmdk") => shared::ImageFormat::Vmdk4,
+        Some("vpc") | Some("vhd") => shared::ImageFormat::Vhd,
+        Some("vhdx") => shared::ImageFormat::Vhdx,
+        Some(other) => return Err(format!("resize: unknown -f format '{other}'").into()),
+        None => shared::format_detection::detect_format_from_header(&buf, buf.len(), false),
+    };
+
+    let (format_code, current_virtual_size, qcow2_extended_l2) = match detected {
+        shared::ImageFormat::Raw => (IMAGE_FORMAT_RAW, current_file_size, false),
+        shared::ImageFormat::Qcow2 => {
+            let header = qcow2::QcowHeader::parse(&buf).ok_or("resize: invalid qcow2 header")?;
+            (IMAGE_FORMAT_QCOW2, header.virtual_size, header.extended_l2)
+        }
+        shared::ImageFormat::Vmdk4 | shared::ImageFormat::Vmdk3 => {
+            let header = vmdk::Vmdk4Header::parse(&buf).ok_or("resize: invalid vmdk header")?;
+            (IMAGE_FORMAT_VMDK4, header.virtual_size, false)
+        }
+        shared::ImageFormat::Vhd => {
+            // VHD footer lives at file end (last 512 bytes).
+            if current_file_size < 512 {
+                return Err("resize: file too small to contain a vhd footer".into());
+            }
+            file.seek(SeekFrom::Start(current_file_size - 512))?;
+            let mut footer = [0u8; 512];
+            file.read_exact(&mut footer)?;
+            let parsed = vhd::VhdFooter::parse(&footer).ok_or("resize: invalid vhd footer")?;
+            (IMAGE_FORMAT_VHD, parsed.current_size, false)
+        }
+        shared::ImageFormat::Vhdx => {
+            // VHDX VirtualDiskSize lives in the metadata region;
+            // walk header → region table → metadata to find it.
+            let vds = probe_vhdx_virtual_size(&mut file, current_file_size)?;
+            (IMAGE_FORMAT_VHDX, vds, false)
+        }
+        other => {
+            return Err(format!(
+                "resize: format {:?} is not supported for in-place resize",
+                other
+            )
+            .into())
+        }
+    };
+    Ok(ProbedResizeTarget {
+        format: format_code,
+        current_virtual_size,
+        current_file_size,
+        qcow2_extended_l2,
+    })
+}
+
+/// Read the VHDX `VirtualDiskSize` metadata field by walking
+/// the active header → region table → metadata layout.  This is
+/// the host-side mirror of what the guest does during the
+/// vhdx pre-pass — the host only needs the size, so we read
+/// the minimum necessary regions.
+fn probe_vhdx_virtual_size(
+    file: &mut std::fs::File,
+    current_file_size: u64,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    use std::io::{Read, Seek, SeekFrom};
+    if current_file_size < 0x40000 + 64 * 1024 {
+        return Err("resize: file too small for vhdx layout".into());
+    }
+    // Read both headers (4 KiB each), pick the higher-seq one.
+    let mut header1 = [0u8; 4096];
+    file.seek(SeekFrom::Start(0x10000))?;
+    file.read_exact(&mut header1)?;
+    let mut header2 = [0u8; 4096];
+    file.seek(SeekFrom::Start(0x20000))?;
+    file.read_exact(&mut header2)?;
+    let h1 = vhdx::VhdxHeader::parse(&header1);
+    let h2 = vhdx::VhdxHeader::parse(&header2);
+    let _active_seq = match (h1, h2) {
+        (Some(a), Some(b)) => a.sequence_number.max(b.sequence_number),
+        (Some(a), None) => a.sequence_number,
+        (None, Some(b)) => b.sequence_number,
+        (None, None) => return Err("resize: vhdx headers both invalid".into()),
+    };
+    // Read region table copy 1 (64 KiB at 0x30000).
+    let mut rt = vec![0u8; 64 * 1024];
+    file.seek(SeekFrom::Start(0x30000))?;
+    file.read_exact(&mut rt)?;
+    let (entries, _count) =
+        vhdx::parse_region_table(&rt).ok_or("resize: vhdx region table invalid")?;
+    // entries[1] is the metadata region per the create-crate
+    // layout convention.
+    let metadata = &entries[1];
+    let mut meta = vec![0u8; metadata.length as usize];
+    file.seek(SeekFrom::Start(metadata.file_offset))?;
+    file.read_exact(&mut meta)?;
+    // VirtualDiskSize lives at relative offset 0x10008 in the
+    // metadata region as a u64 LE.
+    if meta.len() < 0x10008 + 8 {
+        return Err("resize: vhdx metadata too short".into());
+    }
+    let vds = shared::le_u64(&meta, 0x10008);
+    Ok(vds)
+}
+
+/// Host-side raw resize: `set_len` to the new size and
+/// `sync_all`.  Preallocation `falloc`/`full` is deferred to
+/// phase 9.
+fn run_resize_raw(
+    args: &ResizeArgs,
+    probed: &ProbedResizeTarget,
+    new_virtual_size: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if matches!(args.preallocation.as_str(), "falloc" | "full" | "metadata") {
+        return Err(format!(
+            "resize: --preallocation={} for raw is deferred to phase 9",
+            args.preallocation
+        )
+        .into());
+    }
+    if new_virtual_size < probed.current_virtual_size && !args.shrink {
+        return Err(format!(
+            "resize: shrinking from {} to {} bytes requires --shrink",
+            probed.current_virtual_size, new_virtual_size
+        )
+        .into());
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&args.filename)?;
+    file.set_len(new_virtual_size)?;
+    file.sync_all()?;
+
+    let action = action_str(probed.current_virtual_size, new_virtual_size);
+    render_resize_success(
+        args,
+        probed.format,
+        probed.current_virtual_size,
+        new_virtual_size,
+        new_virtual_size,
+        action,
+    );
+    Ok(())
+}
+
+fn action_str(old: u64, new: u64) -> &'static str {
+    if new > old {
+        "grow"
+    } else if new < old {
+        "shrink"
+    } else {
+        "noop"
+    }
+}
+
+/// Render a success line.  Phase 8b emits a terse line matching
+/// qemu's `"Image resized."`; 8c upgrades the JSON form.
+fn render_resize_success(
+    args: &ResizeArgs,
+    _format: u32,
+    _old_size: u64,
+    _new_virtual_size: u64,
+    _new_file_size: u64,
+    _action: &'static str,
+) {
+    if args.quiet {
+        return;
+    }
+    // Phase 8c lands the structured JSON form.
+    println!("Image resized.");
+}
+
+/// Map a `ResizeResult::ERROR_*` code to a user-facing string.
+fn map_resize_error(code: u32) -> String {
+    match code {
+        RESIZE_RESULT_ERROR_OK => "ok".into(),
+        RESIZE_RESULT_ERROR_INVALID_OPTION => "invalid resize option".into(),
+        RESIZE_RESULT_ERROR_INVALID_NEW_SIZE => "invalid new size".into(),
+        RESIZE_RESULT_ERROR_SHRINK_WITHOUT_FLAG => {
+            "shrinking requires --shrink (would discard data above the new size)".into()
+        }
+        RESIZE_RESULT_ERROR_SHRINK_BELOW_ALLOCATED => {
+            "shrink rejected: allocated data lives above the new size".into()
+        }
+        RESIZE_RESULT_ERROR_UNSUPPORTED_FORMAT => "format does not support resize".into(),
+        RESIZE_RESULT_ERROR_UNSUPPORTED_SUBFORMAT => "subformat does not support resize".into(),
+        RESIZE_RESULT_ERROR_UNSUPPORTED_SHRINK => "shrink not yet supported for this format".into(),
+        RESIZE_RESULT_ERROR_PREALLOCATION_UNSUPPORTED => {
+            "preallocation mode not supported by this format".into()
+        }
+        RESIZE_RESULT_ERROR_SCRATCH_TOO_SMALL => {
+            "image too large for the resize scratch buffer".into()
+        }
+        RESIZE_RESULT_ERROR_READ_FAILED => "I/O error reading the image".into(),
+        RESIZE_RESULT_ERROR_WRITE_FAILED => "I/O error writing the image".into(),
+        RESIZE_RESULT_ERROR_PARSE_FAILED => "the image header could not be parsed".into(),
+        RESIZE_RESULT_ERROR_HEADER_MISMATCH => {
+            "the image's current virtual size changed between host and \
+             guest read; retry the operation"
+                .into()
+        }
+        _ => format!("unknown resize error code {code}"),
+    }
+}
+
+/// Host-side mirror of `ResizeResult` populated by the guest
+/// dispatch.
+struct ResizeRunResult {
+    resolved_new_virtual_size: u64,
+    file_size_before: u64,
+    file_size_after: u64,
+    action: u32,
+    error: u32,
+}
+
+/// Run the resize guest for any non-raw format.  Opens the
+/// output file `O_RDWR` (no truncate), launches the guest,
+/// receives the `ResizeResultMessage`, then post-passes
+/// `set_len(file_size_after)` to commit the planner's reported
+/// EOF.
+fn run_resize_nonraw(
+    args: &ResizeArgs,
+    probed: &ProbedResizeTarget,
+    new_virtual_size: u64,
+    verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if matches!(args.preallocation.as_str(), "falloc" | "full") {
+        return Err(format!(
+            "resize: --preallocation={} post-pass is deferred to phase 9",
+            args.preallocation
+        )
+        .into());
+    }
+    let core_path = get_binary_path("core.bin");
+    let core_code = load_guest_binary(
+        core_path
+            .to_str()
+            .ok_or("resize: core.bin path is not valid UTF-8")?,
+    )?;
+    let resize_path = get_binary_path("resize.bin");
+    let resize_code = load_guest_binary(
+        resize_path
+            .to_str()
+            .ok_or("resize: resize.bin path is not valid UTF-8")?,
+    )?;
+
+    // Expose a generous capacity hint to virtio so the guest
+    // can append BAT / L1 / refcount regions past the
+    // pre-resize EOF.  The planner upper-bound is governed by
+    // the worst-case extension; double the larger of the two
+    // sizes is comfortably above it.
+    let capacity_hint = probed
+        .current_file_size
+        .max(new_virtual_size)
+        .saturating_mul(2)
+        .max(1 << 30);
+    let output =
+        backing::BackingStore::open_rw_existing(Path::new(&args.filename), Some(capacity_hint))?;
+
+    let mut flags: u32 = 0;
+    if args.shrink {
+        flags |= RESIZE_CONFIG_FLAG_SHRINK;
+    }
+    if args.quiet {
+        flags |= RESIZE_CONFIG_FLAG_QUIET;
+    }
+    if probed.qcow2_extended_l2 {
+        flags |= RESIZE_CONFIG_FLAG_EXTENDED_L2;
+    }
+    flags |= match args.preallocation.as_str() {
+        "metadata" => RESIZE_CONFIG_PREALLOC_METADATA,
+        "falloc" => RESIZE_CONFIG_PREALLOC_FALLOC,
+        "full" => RESIZE_CONFIG_PREALLOC_FULL,
+        _ => 0, // PREALLOC_OFF
+    };
+
+    let result = run_resize_guest(
+        &core_code,
+        &resize_code,
+        probed.format,
+        flags,
+        probed.current_virtual_size,
+        new_virtual_size,
+        output,
+        capacity_hint,
+        verbose,
+    )?;
+    if result.error != RESIZE_RESULT_ERROR_OK {
+        return Err(format!(
+            "resize: guest reported error {}: {}",
+            result.error,
+            map_resize_error(result.error)
+        )
+        .into());
+    }
+
+    // Post-pass set_len: commit the planner's reported EOF.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&args.filename)?;
+    file.set_len(result.file_size_after)?;
+    file.sync_all()?;
+
+    let action_str = match result.action {
+        RESIZE_RESULT_ACTION_GROW => "grow",
+        RESIZE_RESULT_ACTION_SHRINK => "shrink",
+        _ => "noop",
+    };
+    render_resize_success(
+        args,
+        probed.format,
+        result.file_size_before,
+        result.resolved_new_virtual_size,
+        result.file_size_after,
+        action_str,
+    );
+    Ok(())
+}
+
+/// Launch the resize guest binary, wait for the
+/// `ResizeResultMessage`.  Modelled on `run_create_guest` but
+/// with one output device (no input device) and the resize
+/// payload variant.
+#[allow(clippy::too_many_arguments)]
+fn run_resize_guest(
+    core_code: &[u8],
+    operation_code: &[u8],
+    target_format: u32,
+    flags: u32,
+    current_virtual_size: u64,
+    new_virtual_size: u64,
+    output_backing: backing::BackingStore,
+    output_capacity_hint: u64,
+    verbose: bool,
+) -> Result<ResizeRunResult, Box<dyn std::error::Error>> {
+    // --- KVM / VM / guest memory setup ----------------------------------
+    let kvm = Kvm::new()?;
+    debug!("KVM API version: {}", kvm.get_api_version());
+
+    let kvm_stats_checker = kvm_stats::KvmStatsChecker::new(&kvm);
+    kvm_stats_checker.display_status();
+
+    let vm = kvm.create_vm()?;
+    let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
+
+    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let host_addr = region.as_ptr() as u64;
+    let mem_region = kvm_userspace_memory_region {
+        slot: 0,
+        guest_phys_addr: 0,
+        memory_size: GUEST_MEM_SIZE,
+        userspace_addr: host_addr,
+        flags: 0,
+    };
+    // SAFETY: mem_region.userspace_addr points to a valid
+    // GuestMemoryMmap allocation that outlives the VM.
+    unsafe {
+        vm.set_user_memory_region(mem_region)?;
+    }
+    setup_gdt(&guest_mem)?;
+    setup_page_tables(&guest_mem, GUEST_MEM_SIZE)?;
+    guest_mem.write_slice(core_code, GuestAddress(GUEST_CODE_BASE))?;
+    guest_mem.write_slice(operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
+
+    // --- Write ResizeConfig at OPERATION_CONFIG_ADDR --------------------
+    // Layout (must match shared::ResizeConfig exactly):
+    //    0: magic                u32  ("RESI")
+    //    4: target_format        u32
+    //    8: flags                u32
+    //   12: sector_size          u32
+    //   16: current_virtual_size u64
+    //   24: new_virtual_size     u64
+    //   32: qcow2_cluster_size   u32  (0 = let guest re-read header)
+    //   36: qcow2_refcount_bits  u8
+    //   37: vmdk_subformat       u8
+    //   38: vhd_subformat        u8
+    //   39: _pad                 u8
+    //   40: vmdk_grain_size      u32
+    //   44: block_size           u32
+    //   48: _reserved            [u8; 64]
+    let sector_size: u32 = 512;
+    guest_mem.write_obj(RESIZE_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
+    guest_mem.write_obj(target_format, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
+    guest_mem.write_obj(flags, GuestAddress(OPERATION_CONFIG_ADDR + 8))?;
+    guest_mem.write_obj(sector_size, GuestAddress(OPERATION_CONFIG_ADDR + 12))?;
+    guest_mem.write_obj(
+        current_virtual_size,
+        GuestAddress(OPERATION_CONFIG_ADDR + 16),
+    )?;
+    guest_mem.write_obj(new_virtual_size, GuestAddress(OPERATION_CONFIG_ADDR + 24))?;
+    // qcow2_cluster_size / refcount_bits / vmdk_subformat / vhd_subformat /
+    // _pad / vmdk_grain_size / block_size are left zero — the guest
+    // re-reads the canonical values from the existing image header.
+    // _reserved at offset 48 stays zero from the page-zeroed memory.
+
+    debug!(
+        "Wrote resize config at 0x{:x} (target={}, flags=0x{:x}, current_virtual_size={}, \
+         new_virtual_size={})",
+        OPERATION_CONFIG_ADDR, target_format, flags, current_virtual_size, new_virtual_size,
+    );
+
+    // --- Set up devices --------------------------------------------------
+    // Resize uses ONE device: the output (the file being
+    // resized).  The guest reads via read_output_sector and
+    // writes via write_output_sector.  No input device is
+    // attached.
+    let mut device_set = DeviceSet::new();
+    let mut io_events: Vec<IoEvent> = Vec::new();
+
+    let output_mmio = device_mmio_base(0);
+    let output_vq = device_vq_base(0);
+    let output_device = VirtioBlockDevice::new(
+        output_backing,
+        output_capacity_hint,
+        sector_size as u64,
+        false, // writable
+        output_mmio,
+        output_vq,
+    );
+    let output_device = Arc::new(Mutex::new(output_device));
+    device_set.add_device(Arc::clone(&output_device), false);
+    io_events.push(IoEvent::new(output_mmio)?);
+
+    let guest_mem = Arc::new(guest_mem);
+    let vmm_stats = Arc::new(Mutex::new(VmmStats::new()));
+
+    // Try to register ioeventfds; fall back to VM exits on failure.
+    let mut io_thread: Option<io_thread::IoThread> = None;
+    let mut registered_count = 0usize;
+    let mut registration_failed = false;
+    for evt in io_events.iter_mut() {
+        if let Err(e) = evt.register(&vm) {
+            debug!("ioeventfd: failed to register ({e:?}), falling back to VM exits");
+            registration_failed = true;
+            break;
+        }
+        registered_count += 1;
+    }
+    if registration_failed {
+        for evt in io_events.iter_mut().take(registered_count) {
+            let _ = evt.unregister(&vm);
+        }
+    }
+    let all_registered = !registration_failed;
+    if all_registered && !io_events.is_empty() {
+        let io_devices = device_set.create_io_devices(io_events);
+        io_thread = Some(io_thread::IoThread::new(
+            io_devices,
+            Arc::clone(&guest_mem),
+            Arc::clone(&vmm_stats),
+        ));
+    }
+
+    // --- vCPU setup ------------------------------------------------------
+    let mut vcpu = vm.create_vcpu(0)?;
+    let mut sregs = vcpu.get_sregs()?;
+    setup_sregs(&mut sregs);
+    vcpu.set_sregs(&sregs)?;
+    let mut regs = vcpu.get_regs()?;
+    setup_regs(&mut regs);
+    vcpu.set_regs(&regs)?;
+
+    // --- Serial decoders / transmitter / debug buffer -------------------
+    let mut serial_decoder = SerialDecoder::new();
+    let mut serial_transmitter = SerialTransmitter::new();
+    let mut debug_buffer = DebugBuffer::new();
+
+    // 0 inputs + 1 output; progress reporting suppressed (resize
+    // patches are few and complete near-instantly).
+    let config = vmm_config(sector_size, sector_size, 100);
+    serial_transmitter.queue_config(&config);
+
+    // --- Run the vCPU loop ----------------------------------------------
+    let mut result_seen = false;
+    let mut harvested = ResizeRunResult {
+        resolved_new_virtual_size: 0,
+        file_size_before: 0,
+        file_size_after: 0,
+        action: RESIZE_RESULT_ACTION_NOOP,
+        error: RESIZE_RESULT_ERROR_OK,
+    };
+    let mut vm_error: Option<String> = None;
+
+    loop {
+        match vcpu.run()? {
+            VcpuExit::Hlt => {
+                vmm_stats.lock().unwrap().record_hlt();
+                break;
+            }
+            VcpuExit::IoOut(port, data) => {
+                vmm_stats.lock().unwrap().record_io_out();
+                if port == SERIAL_PORT {
+                    for &byte in data {
+                        if let Some(msg) = serial_decoder.add_byte(byte) {
+                            if let Some(guest_::GuestMessage_::Payload::ResizeResult(r)) =
+                                &msg.payload
+                            {
+                                harvested.resolved_new_virtual_size = r.resolved_new_virtual_size;
+                                harvested.file_size_before = r.file_size_before;
+                                harvested.file_size_after = r.file_size_after;
+                                harvested.action = match r.action.as_str() {
+                                    "grow" => RESIZE_RESULT_ACTION_GROW,
+                                    "shrink" => RESIZE_RESULT_ACTION_SHRINK,
+                                    _ => RESIZE_RESULT_ACTION_NOOP,
+                                };
+                                harvested.error = r.error;
+                                result_seen = true;
+                            } else if verbose {
+                                debug!("{}", format_message(&msg));
+                            }
+                        }
+                    }
+                } else if port == DEBUG_PORT {
+                    for &byte in data {
+                        if let Some(line) = debug_buffer.add_byte(byte) {
+                            debug!("[GUEST] {line}");
+                        }
+                    }
+                } else {
+                    debug!("IO OUT: port=0x{port:x}, data={data:?}");
+                }
+            }
+            VcpuExit::IoIn(port, data) => {
+                vmm_stats.lock().unwrap().record_io_in();
+                if port == SERIAL_PORT {
+                    for byte in data.iter_mut() {
+                        *byte = serial_transmitter.next_byte().unwrap_or(0);
+                    }
+                } else if port == SERIAL_PORT + 5 {
+                    let mut lsr = 0x60u8;
+                    if serial_transmitter.has_data() {
+                        lsr |= 0x01;
+                    }
+                    data[0] = lsr;
+                } else {
+                    for byte in data {
+                        *byte = 0;
+                    }
+                }
+            }
+            VcpuExit::MmioRead(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_read();
+                let value = device_set.mmio_read(addr);
+                write_mmio_data(data, value);
+            }
+            VcpuExit::MmioWrite(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_write();
+                let value = read_mmio_data(data);
+                if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
+                    if io_thread.is_none() && should_process {
+                        device_set.process_queue_for_device(
+                            device_index,
+                            &guest_mem,
+                            &vmm_stats,
+                        )?;
+                    }
+                }
+            }
+            VcpuExit::Shutdown => {
+                vmm_stats.lock().unwrap().record_shutdown();
+                vm_error = Some("VM shutdown (triple fault)".to_string());
+                break;
+            }
+            VcpuExit::FailEntry(reason, cpu) => {
+                vmm_stats.lock().unwrap().record_fail_entry();
+                vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
+                break;
+            }
+            exit => {
+                vmm_stats.lock().unwrap().record_unknown();
+                vm_error = Some(format!("unexpected VM exit: {exit:?}"));
+                break;
+            }
+        }
+    }
+
+    if let Some(mut thread) = io_thread {
+        thread.stop();
+    }
+
+    if log::log_enabled!(log::Level::Debug) {
+        vmm_stats.lock().unwrap().display();
+    }
+
+    if let Some(error) = vm_error {
+        return Err(error.into());
+    }
+    if !result_seen {
+        return Err("resize: guest did not return a result".into());
+    }
+    Ok(harvested)
 }
 
 /// Run the config operation (display or validate configuration)

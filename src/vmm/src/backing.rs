@@ -73,6 +73,26 @@ impl BackingStore {
         })
     }
 
+    /// Open an existing file read-write *without* truncating
+    /// it.  Used by `instar resize`, which mutates the file in
+    /// place and must preserve every byte not explicitly
+    /// rewritten by the planner.
+    ///
+    /// The capacity exposed to virtio defaults to the file's
+    /// current size; pass `capacity` to expose a larger window
+    /// when the resize will append.
+    pub fn open_rw_existing(path: &Path, capacity: Option<u64>) -> io::Result<Self> {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let actual_size = file.metadata()?.len();
+        let exposed = capacity.unwrap_or(actual_size).max(actual_size);
+        Ok(Self {
+            file,
+            capacity: exposed,
+            current_size: actual_size,
+            sparse: true,
+        })
+    }
+
     /// Compute `offset + buf.len()` with overflow checking.
     fn checked_end(offset: u64, len: usize) -> io::Result<u64> {
         offset
