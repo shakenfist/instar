@@ -169,6 +169,25 @@ else
 fi
 
 echo ""
+echo "=== Building resize operation ==="
+cd operations/resize
+cargo +nightly build --release
+cd ../..
+
+# Convert resize ELF to flat binary
+echo "=== Converting resize ELF to flat binary ==="
+RESIZE_ELF="target/x86_64-unknown-none/release/resize"
+RESIZE_BIN="resize.bin"
+
+if [ -f "$RESIZE_ELF" ]; then
+    rust-objcopy -O binary "$RESIZE_ELF" "$RESIZE_BIN"
+    echo "Created $RESIZE_BIN ($(wc -c < "$RESIZE_BIN") bytes)"
+else
+    echo "Error: Resize ELF not found at $RESIZE_ELF"
+    exit 1
+fi
+
+echo ""
 echo "=== Building instar ==="
 cd vmm
 cargo build --release
@@ -185,7 +204,8 @@ cp "$COMPARE_BIN" target/release/
 cp "$CONVERT_BIN" target/release/
 cp "$MEASURE_BIN" target/release/
 cp "$CREATE_BIN" target/release/
-echo "Copied core.bin, info.bin, copy.bin, check.bin, compare.bin, convert.bin, measure.bin, and create.bin to target/release/"
+cp "$RESIZE_BIN" target/release/
+echo "Copied core.bin, info.bin, copy.bin, check.bin, compare.bin, convert.bin, measure.bin, create.bin, and resize.bin to target/release/"
 
 # Check binary sizes against memory layout limits
 # Memory layout (from shared/src/lib.rs):
@@ -224,6 +244,7 @@ check_size "compare.bin" "target/release/$COMPARE_BIN" "$OP_MAX" || FAILED=1
 check_size "convert.bin" "target/release/$CONVERT_BIN" "$OP_MAX" || FAILED=1
 check_size "measure.bin" "target/release/$MEASURE_BIN" "$OP_MAX" || FAILED=1
 check_size "create.bin" "target/release/$CREATE_BIN" "$OP_MAX" || FAILED=1
+check_size "resize.bin" "target/release/$RESIZE_BIN" "$OP_MAX" || FAILED=1
 
 if [ "$FAILED" -eq 1 ]; then
     echo ""
@@ -245,6 +266,7 @@ echo "  - compare.bin    Compare operation (image comparison) - loaded at 0x2000
 echo "  - convert.bin    Convert operation (image conversion) - loaded at 0x20000"
 echo "  - measure.bin    Measure operation (disk measurement) - loaded at 0x20000"
 echo "  - create.bin     Create operation (empty image creation) - loaded at 0x20000"
+echo "  - resize.bin     Resize operation (in-place image resize) - loaded at 0x20000"
 echo ""
 echo "To run:"
 echo "  sudo ./target/release/instar info image.qcow2"

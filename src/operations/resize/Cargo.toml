@@ -1,0 +1,25 @@
+[package]
+name = "resize-op"
+version = "0.2.0"
+edition = "2021"
+description = "Resize operation: in-place mutation of an existing disk image"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "resize"
+path = "src/main.rs"
+
+[dependencies]
+shared = { path = "../../shared" }
+resize = { path = "../../crates/resize" }
+qcow2 = { path = "../../crates/qcow2", features = ["create"] }
+vmdk = { path = "../../crates/vmdk" }
+vhd = { path = "../../crates/vhd" }
+vhdx = { path = "../../crates/vhdx" }
+raw = { path = "../../crates/raw" }
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true
