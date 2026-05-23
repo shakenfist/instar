@@ -360,6 +360,51 @@ fn parse_memory_size(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
         .ok_or_else(|| format!("memory size overflow: '{s}'").into())
 }
 
+/// Parse a qemu-img size string with the full suffix set:
+/// `b`=512, `k`/`K`=KiB, `M`/`m`=MiB, `G`/`g`=GiB, `T`/`t`=TiB,
+/// `P`/`p`=PiB, `E`/`e`=EiB.  Used by `instar resize` for the
+/// `[+-]SIZE` argument.  Strict superset of `parse_memory_size`
+/// — kept as a sibling rather than replacing it to avoid
+/// disturbing the create/measure call sites.
+fn parse_qemu_img_size(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty size string".into());
+    }
+    let (num_str, multiplier) = match s.as_bytes().last() {
+        Some(b'E' | b'e') => (&s[..s.len() - 1], 1u64 << 60),
+        Some(b'P' | b'p') => (&s[..s.len() - 1], 1u64 << 50),
+        Some(b'T' | b't') => (&s[..s.len() - 1], 1u64 << 40),
+        Some(b'G' | b'g') => (&s[..s.len() - 1], 1u64 << 30),
+        Some(b'M' | b'm') => (&s[..s.len() - 1], 1u64 << 20),
+        Some(b'K' | b'k') => (&s[..s.len() - 1], 1u64 << 10),
+        Some(b'b') => (&s[..s.len() - 1], 512u64),
+        _ => (s, 1u64),
+    };
+    let num: u64 = num_str
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid size: '{s}'"))?;
+    num.checked_mul(multiplier)
+        .ok_or_else(|| format!("size overflow: '{s}'").into())
+}
+
+/// Parse `[+-]SIZE[bkKMGTPE]`.  Returns the parsed `ParsedResizeSize`
+/// which the caller resolves against `current_virtual_size`.
+fn parse_resize_size(s: &str) -> Result<ParsedResizeSize, Box<dyn std::error::Error>> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty size string".into());
+    }
+    if let Some(rest) = s.strip_prefix('+') {
+        Ok(ParsedResizeSize::Add(parse_qemu_img_size(rest)?))
+    } else if let Some(rest) = s.strip_prefix('-') {
+        Ok(ParsedResizeSize::Subtract(parse_qemu_img_size(rest)?))
+    } else {
+        Ok(ParsedResizeSize::Absolute(parse_qemu_img_size(s)?))
+    }
+}
+
 // ============================================================================
 // Multi-device management (Phase 0c)
 //
@@ -2265,8 +2310,61 @@ enum Commands {
     Measure(MeasureArgs),
     /// Create a new empty disk image of the given format and size
     Create(CreateArgs),
+    /// Resize an existing disk image in place
+    Resize(ResizeArgs),
     /// Display or validate configuration
     Config(ConfigArgs),
+}
+
+/// Arguments for `instar resize`.  Mirrors qemu-img resize's
+/// surface (see PLAN-resize-phase-08-host-cli.md).
+#[derive(Args, Debug)]
+struct ResizeArgs {
+    /// Image file to resize.
+    filename: String,
+    /// `[+-]SIZE[bkKMGTPE]`. Absent prefix is absolute; `+`
+    /// adds to the current virtual size; `-` subtracts.
+    size: String,
+    /// Force the image format detection (raw / qcow2 / vmdk /
+    /// vpc / vhdx).
+    #[arg(short = 'f', long)]
+    format: Option<String>,
+    /// Allow shrink. Required when the new size is smaller
+    /// than the current size.
+    #[arg(long)]
+    shrink: bool,
+    /// Preallocation mode for newly-added regions.  Phase 8
+    /// routes the flag through to the guest; falloc/full
+    /// post-pass for raw lands in phase 9.
+    #[arg(long, default_value = "off", value_parser = ["off", "metadata", "falloc", "full"])]
+    preallocation: String,
+    /// QEMU user-creatable object (e.g. encryption key).  Not
+    /// yet supported; rejected at runtime.
+    #[arg(long)]
+    object: Option<String>,
+    /// Indicates FILENAME is a complete image specification.
+    /// Not yet supported; rejected at runtime.
+    #[arg(long)]
+    image_opts: bool,
+    /// Suppress the success line on stdout.  Errors still go
+    /// to stderr.
+    #[arg(short = 'q', long)]
+    quiet: bool,
+    /// Output format.
+    #[arg(long, default_value = "human", value_parser = ["human", "json"])]
+    output: String,
+}
+
+/// A parsed `[+-]SIZE` string, before resolution against the
+/// existing image's current virtual size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParsedResizeSize {
+    /// Absolute: `new_virtual_size = value`.
+    Absolute(u64),
+    /// Additive: `new_virtual_size = current + delta`.
+    Add(u64),
+    /// Subtractive: `new_virtual_size = current - delta`.
+    Subtract(u64),
 }
 
 #[derive(Args, Debug)]
@@ -2780,8 +2878,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Convert(args) => run_convert(args, verbose),
         Commands::Measure(args) => run_measure(args, verbose),
         Commands::Create(args) => run_create(args, verbose),
+        Commands::Resize(args) => run_resize(args, verbose),
         Commands::Config(args) => run_config(args),
     }
+}
+
+/// Run the resize operation.  Phase 8a ships a stub; 8b lands
+/// the real implementation.
+fn run_resize(args: ResizeArgs, _verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Reject the unsupported surface up-front before any I/O.
+    if args.object.is_some() {
+        return Err("--object is not yet supported by instar resize".into());
+    }
+    if args.image_opts {
+        return Err("--image-opts is not yet supported by instar resize".into());
+    }
+    // 8b lands probe_current_size + run_resize_raw + run_resize_nonraw.
+    let _ = parse_resize_size(&args.size)?;
+    Err("instar resize: phase 8b lands the real implementation".into())
 }
 
 /// Run the config operation (display or validate configuration)
@@ -8444,5 +8558,79 @@ mod create_option_tests {
         // qemu-img uses "vpc" canonically for VHD; we accept "vhd"
         // as an alias and normalise to "vpc".
         assert_eq!(o.backing_fmt, Some("vpc"));
+    }
+}
+
+#[cfg(test)]
+mod resize_size_parser_tests {
+    //! Unit tests for `parse_qemu_img_size` and `parse_resize_size`.
+    //! Integration coverage of the wired CLI path lives in
+    //! `tests/test_resize.py` once phase 11 lands.
+    use super::*;
+
+    #[test]
+    fn qemu_img_size_bare_number_is_bytes() {
+        assert_eq!(parse_qemu_img_size("1024").unwrap(), 1024);
+    }
+
+    #[test]
+    fn qemu_img_size_suffixes() {
+        assert_eq!(parse_qemu_img_size("1b").unwrap(), 512);
+        assert_eq!(parse_qemu_img_size("1k").unwrap(), 1024);
+        assert_eq!(parse_qemu_img_size("1K").unwrap(), 1024);
+        assert_eq!(parse_qemu_img_size("1M").unwrap(), 1 << 20);
+        assert_eq!(parse_qemu_img_size("1G").unwrap(), 1 << 30);
+        assert_eq!(parse_qemu_img_size("1T").unwrap(), 1u64 << 40);
+        assert_eq!(parse_qemu_img_size("1P").unwrap(), 1u64 << 50);
+        assert_eq!(parse_qemu_img_size("1E").unwrap(), 1u64 << 60);
+    }
+
+    #[test]
+    fn qemu_img_size_rejects_empty() {
+        assert!(parse_qemu_img_size("").is_err());
+        assert!(parse_qemu_img_size("   ").is_err());
+    }
+
+    #[test]
+    fn qemu_img_size_rejects_garbage() {
+        assert!(parse_qemu_img_size("abc").is_err());
+        assert!(parse_qemu_img_size("1xq").is_err());
+    }
+
+    #[test]
+    fn qemu_img_size_overflow() {
+        // 16 EiB * 2 overflows u64.
+        assert!(parse_qemu_img_size("32E").is_err());
+    }
+
+    #[test]
+    fn resize_size_absolute() {
+        match parse_resize_size("1G").unwrap() {
+            ParsedResizeSize::Absolute(v) => assert_eq!(v, 1 << 30),
+            other => panic!("expected Absolute, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resize_size_additive() {
+        match parse_resize_size("+512M").unwrap() {
+            ParsedResizeSize::Add(v) => assert_eq!(v, 512 << 20),
+            other => panic!("expected Add, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resize_size_subtractive() {
+        match parse_resize_size("-256k").unwrap() {
+            ParsedResizeSize::Subtract(v) => assert_eq!(v, 256 << 10),
+            other => panic!("expected Subtract, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resize_size_rejects_empty() {
+        assert!(parse_resize_size("").is_err());
+        assert!(parse_resize_size("+").is_err());
+        assert!(parse_resize_size("-").is_err());
     }
 }
