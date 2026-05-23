@@ -7918,6 +7918,7 @@ fn run_create_nonraw(args: &CreateArgs, verbose: bool) -> Result<(), Box<dyn std
                     }
                     apply_preallocation(
                         &postpass_file,
+                        "create",
                         &args.preallocation,
                         data_offset,
                         data_len,
@@ -8437,34 +8438,60 @@ fn create_raw_finalize(
 /// falls back to a `pwrite` loop with a 64 KiB stack-allocated
 /// zero buffer.
 fn fill_zeros(fd: libc::c_int, offset: u64, length: u64) -> std::io::Result<()> {
+    fill_zeros_inner(fd, offset, length, |fd, off, len| {
+        // SAFETY: fd is a valid open file descriptor owned by the
+        // caller (passed in as `file.as_raw_fd()` on a still-live
+        // File). FALLOC_FL_ZERO_RANGE is a kernel constant. offset
+        // and length are non-negative u64 values cast to off_t; an
+        // out-of-range cast surfaces as EINVAL from the syscall
+        // rather than UB.
+        let rc = unsafe {
+            libc::fallocate(
+                fd,
+                libc::FALLOC_FL_ZERO_RANGE,
+                off as libc::off_t,
+                len as libc::off_t,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    })
+}
+
+/// Inner implementation of [`fill_zeros`] with an injectable
+/// `fallocate_fn` so tests can drive the `EOPNOTSUPP` fallback
+/// path without depending on the host filesystem's
+/// `FALLOC_FL_ZERO_RANGE` support.
+///
+/// `fallocate_fn(fd, offset, length)` is the operation the
+/// production code maps to `libc::fallocate(FALLOC_FL_ZERO_RANGE)`.
+/// When it returns `Ok(())`, `fill_zeros_inner` returns
+/// immediately.  When it returns `EOPNOTSUPP` / `ENOSYS` /
+/// `EINVAL`, the function falls through to the `pwrite` zero
+/// loop.  Any other error propagates.
+fn fill_zeros_inner<F>(
+    fd: libc::c_int,
+    offset: u64,
+    length: u64,
+    fallocate_fn: F,
+) -> std::io::Result<()>
+where
+    F: FnOnce(libc::c_int, u64, u64) -> std::io::Result<()>,
+{
     if length == 0 {
         return Ok(());
     }
-
-    // SAFETY: fd is a valid open file descriptor owned by the caller
-    // (passed in by every call site as `file.as_raw_fd()` on a still-
-    // live File). FALLOC_FL_ZERO_RANGE is a kernel constant. offset
-    // and length are non-negative u64 values cast to off_t; an
-    // out-of-range cast surfaces as EINVAL from the syscall rather
-    // than UB.
-    let rc = unsafe {
-        libc::fallocate(
-            fd,
-            libc::FALLOC_FL_ZERO_RANGE,
-            offset as libc::off_t,
-            length as libc::off_t,
-        )
-    };
-    if rc == 0 {
-        return Ok(());
-    }
-    let err = std::io::Error::last_os_error();
-    match err.raw_os_error() {
-        Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) | Some(libc::EINVAL) => {
-            // FALLOC_FL_ZERO_RANGE may surface as EINVAL on some
-            // older kernels; fall through to the write loop.
-        }
-        _ => return Err(err),
+    match fallocate_fn(fd, offset, length) {
+        Ok(()) => return Ok(()),
+        Err(err) => match err.raw_os_error() {
+            Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) | Some(libc::EINVAL) => {
+                // Fall through to the write loop.
+            }
+            _ => return Err(err),
+        },
     }
 
     let zeros = [0u8; 65536];
@@ -8510,6 +8537,7 @@ fn fill_zeros(fd: libc::c_int, offset: u64, length: u64) -> std::io::Result<()> 
 /// before reaching this function.
 fn apply_preallocation(
     file: &std::fs::File,
+    op_name: &str,
     mode: &str,
     data_offset: u64,
     data_len: u64,
@@ -8525,7 +8553,7 @@ fn apply_preallocation(
             // SAFETY: fd is the raw fd of `file`, caller-owned for
             // the duration of this call. data_offset and data_len
             // are validated against the file's observed length by
-            // run_create's clamping step before this function is
+            // the caller's clamping step before this function is
             // entered. Out-of-range casts surface as EINVAL from
             // posix_fallocate rather than UB.
             let rc = unsafe {
@@ -8533,7 +8561,8 @@ fn apply_preallocation(
             };
             if rc != 0 {
                 return Err(format!(
-                    "create: posix_fallocate failed: {}",
+                    "{}: posix_fallocate failed: {}",
+                    op_name,
                     std::io::Error::from_raw_os_error(rc)
                 )
                 .into());
@@ -8541,7 +8570,7 @@ fn apply_preallocation(
         }
         "full" => {
             fill_zeros(fd, data_offset, data_len)
-                .map_err(|e| format!("create: zero-fill failed: {}", e))?;
+                .map_err(|e| format!("{}: zero-fill failed: {}", op_name, e))?;
         }
         _ => {}
     }
@@ -9397,5 +9426,92 @@ mod resize_size_parser_tests {
             }
             other => panic!("expected Resize, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod preallocation_tests {
+    //! Unit tests for `fill_zeros_inner`.
+    //!
+    //! The closure parameter lets us drive the EOPNOTSUPP fallback
+    //! path without depending on the host filesystem's
+    //! `FALLOC_FL_ZERO_RANGE` support, which is missing on tmpfs and
+    //! some FUSE / NFS mounts where these tests might run.
+    use super::*;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn fill_zeros_inner_fast_path() {
+        // Closure returns Ok(()): the fallocate path "succeeds" and
+        // we exit without falling through to the pwrite loop. The
+        // file is never touched.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let fd = tmp.as_file().as_raw_fd();
+        let called = std::cell::Cell::new(false);
+        let result = fill_zeros_inner(fd, 0, 4096, |_fd, off, len| {
+            called.set(true);
+            assert_eq!(off, 0);
+            assert_eq!(len, 4096);
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert!(called.get());
+        // File is still empty: the closure didn't actually zero, and
+        // the loop didn't fire.
+        assert_eq!(tmp.as_file().metadata().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn fill_zeros_inner_eopnotsupp_falls_back_to_pwrite() {
+        // Closure returns EOPNOTSUPP: we fall through to the pwrite
+        // loop and verify the bytes are actually zeroed.
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        // Pre-fill with non-zero bytes so we can confirm the
+        // fallback overwrites them with zeros.
+        tmp.write_all(&[0xAAu8; 8192]).unwrap();
+        tmp.flush().unwrap();
+        let fd = tmp.as_file().as_raw_fd();
+        let result = fill_zeros_inner(fd, 1024, 4096, |_fd, _off, _len| {
+            Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+        });
+        assert!(result.is_ok());
+        let mut buf = vec![0u8; 8192];
+        tmp.as_file().seek(SeekFrom::Start(0)).unwrap();
+        tmp.as_file().read_exact(&mut buf).unwrap();
+        // First 1024 bytes unchanged (0xAA).
+        assert!(buf[..1024].iter().all(|&b| b == 0xAA));
+        // Middle 4096 bytes zeroed.
+        assert!(buf[1024..5120].iter().all(|&b| b == 0));
+        // Trailing bytes unchanged (0xAA).
+        assert!(buf[5120..].iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn fill_zeros_inner_unrelated_error_propagates() {
+        // Closure returns EIO: not in the fallback whitelist, so the
+        // error bubbles up unmodified and the pwrite loop never runs.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let fd = tmp.as_file().as_raw_fd();
+        let result = fill_zeros_inner(fd, 0, 4096, |_fd, _off, _len| {
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        });
+        let err = result.expect_err("EIO should propagate");
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        // File untouched.
+        assert_eq!(tmp.as_file().metadata().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn fill_zeros_inner_zero_length_is_noop() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let fd = tmp.as_file().as_raw_fd();
+        let called = std::cell::Cell::new(false);
+        let result = fill_zeros_inner(fd, 0, 0, |_fd, _off, _len| {
+            called.set(true);
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert!(!called.get(), "zero-length call must short-circuit");
     }
 }
