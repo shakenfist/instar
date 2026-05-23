@@ -21,6 +21,7 @@
 mod qcow2;
 mod vhd;
 mod vhdx;
+mod vmdk;
 
 /// Errors returned by the `plan_resize_*` family of functions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -386,7 +387,7 @@ pub struct Qcow2ResizeOpts<'a> {
 
 /// Options for [`plan_resize_vmdk`].
 #[derive(Debug, Clone, Copy)]
-pub struct VmdkResizeOpts {
+pub struct VmdkResizeOpts<'a> {
     /// Current virtual size in bytes.
     pub current_virtual_size: u64,
     /// Requested new virtual size in bytes.
@@ -396,10 +397,38 @@ pub struct VmdkResizeOpts {
     /// Subformat of the existing image.
     pub subformat: VmdkSubformat,
     /// True iff the host CLI passed `--shrink`. v1 rejects vmdk
-    /// shrink unconditionally with [`ResizeError::UnsupportedShrink`].
+    /// shrink unconditionally with
+    /// [`ResizeError::UnsupportedShrink`].
     pub allow_shrink: bool,
     /// Preallocation mode for the new range.
     pub preallocation: Preallocation,
+    /// Existing 512-byte sparse extent header bytes
+    /// (sector 0). The planner reads `capacity_sectors`,
+    /// `grain_size_sectors`, `num_gtes_per_gt`,
+    /// `descriptor_offset_sectors`,
+    /// `descriptor_size_sectors`, `gd_offset_sectors`, and
+    /// `overhead_sectors` from here.
+    pub existing_header: &'a [u8],
+    /// Existing descriptor bytes (typically 10 KiB starting at
+    /// `descriptor_offset_sectors * 512`). The planner parses
+    /// CID, parentCID, createType, and the extent line's
+    /// filename / size_sectors from here.
+    pub existing_descriptor: &'a [u8],
+    /// Existing GD region bytes. Used by the relocate path to
+    /// preserve old entries; the metadata-only path doesn't
+    /// touch it. The slice's length must be at least
+    /// `current_num_gd_entries * 4`.
+    pub existing_gd: &'a [u8],
+    /// Current `num_gd_entries` decoded from the existing
+    /// header.
+    pub current_num_gd_entries: u32,
+    /// Current GD region size in sectors (the number of
+    /// sectors the GD region occupies in the file). Used for
+    /// the in-place-vs-relocate slack computation.
+    pub current_gd_sectors: u32,
+    /// Current file size in bytes (pre-resize EOF). The
+    /// relocate path appends a new GD region here.
+    pub current_file_size: u64,
 }
 
 /// Options for [`plan_resize_vhd`].
@@ -586,13 +615,13 @@ pub fn plan_resize_qcow2<'a>(
 
 /// Plan a resize of a vmdk image.
 ///
-/// Phase 1 stub. Phase 6 lands monolithicSparse grow; other
-/// subformats remain unsupported.
+/// Phase 6 lands monolithicSparse grow; other subformats
+/// remain unsupported.
 pub fn plan_resize_vmdk<'a>(
-    _opts: &VmdkResizeOpts,
-    _scratch: &'a mut [u8],
+    opts: &VmdkResizeOpts<'_>,
+    scratch: &'a mut [u8],
 ) -> Result<ResizePlan<'a>, ResizeError> {
-    Err(ResizeError::UnsupportedFormat)
+    vmdk::plan_grow(opts, scratch)
 }
 
 /// Plan a resize of a vhd image.
@@ -730,32 +759,9 @@ mod tests {
         .is_empty());
     }
 
-    #[test]
-    fn non_raw_planners_stub_to_unsupported() {
-        // qcow2 is no longer stubbed (phase 2b lands the grow
-        // planner); see crates/resize/src/qcow2.rs tests and the
-        // tests/qcow2_grow.rs integration suite (phase 2d) for
-        // qcow2 coverage. The remaining three formats are still
-        // stubbed pending phases 4-6.
-        let mut scratch = [0u8; 64];
-
-        let vmdk_opts = VmdkResizeOpts {
-            current_virtual_size: 1 << 20,
-            new_virtual_size: 2 << 20,
-            grain_size: 65536,
-            subformat: VmdkSubformat::MonolithicSparse,
-            allow_shrink: false,
-            preallocation: Preallocation::Off,
-        };
-        assert_eq!(
-            plan_resize_vmdk(&vmdk_opts, &mut scratch).unwrap_err(),
-            ResizeError::UnsupportedFormat
-        );
-
-        // VHD is no longer a stub (phase 4 ships the grow
-        // planner); coverage moves to tests/vhd_grow.rs.
-
-        // VHDX is no longer a stub (phase 5 ships the grow
-        // planner); coverage moves to tests/vhdx_grow.rs.
-    }
+    // Note: every non-raw planner has shipped as of phases 2-6;
+    // their dedicated integration suites
+    // (tests/qcow2_grow.rs, tests/qcow2_shrink.rs,
+    // tests/vhd_grow.rs, tests/vhdx_grow.rs, tests/vmdk_grow.rs)
+    // own that coverage now.
 }

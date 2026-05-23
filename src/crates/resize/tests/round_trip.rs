@@ -7,8 +7,8 @@
 //! cover end-to-end invariants and forward-compat tripwires.
 
 use resize::{
-    plan_resize_raw, plan_resize_vmdk, Preallocation, RawResizeOpts, ResizeAction, ResizeError,
-    ResizePatch, ResizePlan, VmdkResizeOpts, VmdkSubformat, MAX_RESIZE_PATCHES,
+    plan_resize_raw, Preallocation, RawResizeOpts, ResizeAction, ResizeError, ResizePatch,
+    ResizePlan, MAX_RESIZE_PATCHES,
 };
 
 #[test]
@@ -114,29 +114,7 @@ fn plan_resize_raw_classifies_action_for_three_size_pairs() {
     assert_eq!(noop.patches().len(), 0);
 }
 
-#[test]
-fn non_raw_planners_remain_stubbed() {
-    // qcow2 has its own integration suite (phase 2d's
-    // tests/qcow2_grow.rs); the three remaining non-raw
-    // planners are still phase-stubbed.
-    let mut scratch = [0u8; 128];
-
-    let vmdk_opts = VmdkResizeOpts {
-        current_virtual_size: 1 << 20,
-        new_virtual_size: 2 << 20,
-        grain_size: 65536,
-        subformat: VmdkSubformat::MonolithicSparse,
-        allow_shrink: false,
-        preallocation: Preallocation::Off,
-    };
-    assert_eq!(
-        plan_resize_vmdk(&vmdk_opts, &mut scratch).unwrap_err(),
-        ResizeError::UnsupportedFormat
-    );
-
-    // VHD is no longer a stub (phase 4 ships the grow planner);
-    // coverage moves to tests/vhd_grow.rs.
-    //
-    // VHDX is no longer a stub either (phase 5 ships the grow
-    // planner); coverage moves to tests/vhdx_grow.rs.
-}
+// Every non-raw planner has shipped as of phases 2-6; their
+// dedicated integration suites
+// (tests/qcow2_grow.rs, tests/qcow2_shrink.rs, tests/vhd_grow.rs,
+// tests/vhdx_grow.rs, tests/vmdk_grow.rs) own that coverage now.
