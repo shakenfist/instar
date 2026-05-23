@@ -770,7 +770,7 @@ versions; we can collapse those).
 | 6. VMDK resize planner (monolithicSparse grow; others rejected) | [PLAN-resize-phase-06-vmdk.md](PLAN-resize-phase-06-vmdk.md) | Complete |
 | 7. Guest `resize` operation + protobuf + `read_output_sector` | [PLAN-resize-phase-07-guest-op.md](PLAN-resize-phase-07-guest-op.md) | Complete |
 | 8. Host VMM subcommand + clap surface + `[+-]SIZE` parsing | [PLAN-resize-phase-08-host-cli.md](PLAN-resize-phase-08-host-cli.md) | Complete |
-| 9. Preallocation modes (`off`/`metadata`/`falloc`/`full`) | [PLAN-resize-phase-09-preallocation.md](PLAN-resize-phase-09-preallocation.md) | Not started |
+| 9. Preallocation modes (`off`/`metadata`/`falloc`/`full`) | [PLAN-resize-phase-09-preallocation.md](PLAN-resize-phase-09-preallocation.md) | Complete (sparse-format data-region preallocation deferred — see Future work) |
 | 10. Cross-version baselines in `instar-testdata` | PLAN-resize-phase-10-baselines.md (not yet written) | Not started |
 | 11. Integration tests (`tests/test_resize.py`) | PLAN-resize-phase-11-integration-tests.md (not yet written) | Not started |
 | 12. Coverage-guided + differential fuzz harnesses | PLAN-resize-phase-12-fuzz.md (not yet written) | Not started |

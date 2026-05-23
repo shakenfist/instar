@@ -3083,20 +3083,24 @@ fn probe_vhdx_virtual_size(
     Ok(vds)
 }
 
-/// Host-side raw resize: `set_len` to the new size and
-/// `sync_all`.  Preallocation `falloc`/`full` is deferred to
-/// phase 9.
+/// Host-side raw resize: `set_len` to the new size, optional
+/// `falloc`/`full` post-pass over the newly-added region, and
+/// `sync_all`.
+///
+/// `metadata` is rejected for raw — there is no metadata to
+/// preallocate.  `falloc`/`full` combined with shrink is rejected
+/// as nonsensical (you can't preallocate space you're discarding).
 fn run_resize_raw(
     args: &ResizeArgs,
     probed: &ProbedResizeTarget,
     new_virtual_size: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if matches!(args.preallocation.as_str(), "falloc" | "full" | "metadata") {
-        return Err(format!(
-            "resize: --preallocation={} for raw is deferred to phase 9",
-            args.preallocation
-        )
-        .into());
+    let mode = args.preallocation.as_str();
+    if mode == "metadata" {
+        return Err("resize: --preallocation=metadata is not supported for raw".into());
+    }
+    if matches!(mode, "falloc" | "full") && new_virtual_size < probed.current_virtual_size {
+        return Err(format!("resize: --preallocation={mode} is meaningless when shrinking").into());
     }
     if new_virtual_size < probed.current_virtual_size && !args.shrink {
         return Err(format!(
@@ -3110,6 +3114,10 @@ fn run_resize_raw(
         .write(true)
         .open(&args.filename)?;
     file.set_len(new_virtual_size)?;
+    if new_virtual_size > probed.current_virtual_size {
+        let added = new_virtual_size - probed.current_virtual_size;
+        apply_preallocation(&file, "resize", mode, probed.current_virtual_size, added)?;
+    }
     file.sync_all()?;
 
     let action = action_str(probed.current_virtual_size, new_virtual_size);
@@ -3233,12 +3241,9 @@ fn run_resize_nonraw(
     new_virtual_size: u64,
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if matches!(args.preallocation.as_str(), "falloc" | "full") {
-        return Err(format!(
-            "resize: --preallocation={} post-pass is deferred to phase 9",
-            args.preallocation
-        )
-        .into());
+    let mode = args.preallocation.as_str();
+    if matches!(mode, "falloc" | "full") && new_virtual_size < probed.current_virtual_size {
+        return Err(format!("resize: --preallocation={mode} is meaningless when shrinking").into());
     }
     let core_path = get_binary_path("core.bin");
     let core_code = load_guest_binary(
@@ -3276,7 +3281,7 @@ fn run_resize_nonraw(
     if probed.qcow2_extended_l2 {
         flags |= RESIZE_CONFIG_FLAG_EXTENDED_L2;
     }
-    flags |= match args.preallocation.as_str() {
+    flags |= match mode {
         "metadata" => RESIZE_CONFIG_PREALLOC_METADATA,
         "falloc" => RESIZE_CONFIG_PREALLOC_FALLOC,
         "full" => RESIZE_CONFIG_PREALLOC_FULL,
@@ -3304,9 +3309,24 @@ fn run_resize_nonraw(
     }
 
     // Post-pass set_len: commit the planner's reported EOF.
+    // Open read+write (not write-only) so apply_preallocation can
+    // call posix_fallocate / fallocate(FALLOC_FL_ZERO_RANGE) on
+    // the fd; those syscalls require the fd to be writable but
+    // some kernels are picky about O_WRONLY for fallocate.
     let file = std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .open(&args.filename)?;
+    // Phase 9: post-pass the newly-appended file region only.
+    // This is a deliberate divergence from qemu, which
+    // preallocates the entire data-region span for the new
+    // virtual size; see docs/quirks.md.  Bytes in
+    // [file_size_before, file_size_after) are the physical
+    // appended region the planner wrote past the pre-resize EOF.
+    if matches!(mode, "falloc" | "full") && result.file_size_after > result.file_size_before {
+        let added = result.file_size_after - result.file_size_before;
+        apply_preallocation(&file, "resize", mode, result.file_size_before, added)?;
+    }
     file.set_len(result.file_size_after)?;
     file.sync_all()?;
 
@@ -9425,6 +9445,33 @@ mod resize_size_parser_tests {
                 assert_eq!(args.size, "+1G");
             }
             other => panic!("expected Resize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resize_args_clap_accepts_every_preallocation_mode() {
+        // Phase 9 ships post-pass handling for every documented
+        // preallocation mode.  Verify clap accepts each one; the
+        // post-pass logic itself is exercised by integration tests
+        // in phase 11.
+        use clap::Parser;
+        for mode in ["off", "metadata", "falloc", "full"] {
+            let argv = vec![
+                "instar",
+                "resize",
+                "--preallocation",
+                mode,
+                "foo.qcow2",
+                "+1G",
+            ];
+            let cli = Cli::try_parse_from(&argv)
+                .unwrap_or_else(|e| panic!("clap rejected --preallocation={mode}: {e}"));
+            match cli.command {
+                Commands::Resize(args) => {
+                    assert_eq!(args.preallocation, mode);
+                }
+                other => panic!("expected Resize, got {other:?}"),
+            }
         }
     }
 }
