@@ -3134,21 +3134,49 @@ fn action_str(old: u64, new: u64) -> &'static str {
     }
 }
 
-/// Render a success line.  Phase 8b emits a terse line matching
-/// qemu's `"Image resized."`; 8c upgrades the JSON form.
+/// Map an `IMAGE_FORMAT_*` constant to its qemu-img-canonical
+/// name (the same names the create / measure subcommands accept
+/// on the CLI).
+fn image_format_name(code: u32) -> &'static str {
+    match code {
+        IMAGE_FORMAT_RAW => "raw",
+        IMAGE_FORMAT_QCOW2 => "qcow2",
+        IMAGE_FORMAT_VMDK4 | IMAGE_FORMAT_VMDK3 => "vmdk",
+        IMAGE_FORMAT_VHD => "vpc",
+        IMAGE_FORMAT_VHDX => "vhdx",
+        _ => "unknown",
+    }
+}
+
+/// Render a success line.  Human form matches qemu's
+/// `"Image resized."` byte-for-byte; JSON form emits a
+/// structured envelope.
 fn render_resize_success(
     args: &ResizeArgs,
-    _format: u32,
-    _old_size: u64,
-    _new_virtual_size: u64,
-    _new_file_size: u64,
-    _action: &'static str,
+    format: u32,
+    old_size: u64,
+    new_virtual_size: u64,
+    new_file_size: u64,
+    action: &'static str,
 ) {
     if args.quiet {
         return;
     }
-    // Phase 8c lands the structured JSON form.
-    println!("Image resized.");
+    if args.output == "json" {
+        println!(
+            "{{\n  \"filename\": \"{}\",\n  \"format\": \"{}\",\n  \
+             \"action\": \"{}\",\n  \"old_virtual_size\": {},\n  \
+             \"new_virtual_size\": {},\n  \"new_file_size\": {}\n}}",
+            json_escape_string(&args.filename),
+            image_format_name(format),
+            action,
+            old_size,
+            new_virtual_size,
+            new_file_size,
+        );
+    } else {
+        println!("Image resized.");
+    }
 }
 
 /// Map a `ResizeResult::ERROR_*` code to a user-facing string.
@@ -9306,5 +9334,68 @@ mod resize_size_parser_tests {
         assert!(parse_resize_size("").is_err());
         assert!(parse_resize_size("+").is_err());
         assert!(parse_resize_size("-").is_err());
+    }
+
+    #[test]
+    fn image_format_names_match_qemu() {
+        assert_eq!(image_format_name(IMAGE_FORMAT_RAW), "raw");
+        assert_eq!(image_format_name(IMAGE_FORMAT_QCOW2), "qcow2");
+        assert_eq!(image_format_name(IMAGE_FORMAT_VMDK4), "vmdk");
+        assert_eq!(image_format_name(IMAGE_FORMAT_VMDK3), "vmdk");
+        // qemu canonical name for VHD is "vpc" (Virtual PC).
+        assert_eq!(image_format_name(IMAGE_FORMAT_VHD), "vpc");
+        assert_eq!(image_format_name(IMAGE_FORMAT_VHDX), "vhdx");
+        assert_eq!(image_format_name(999), "unknown");
+    }
+
+    #[test]
+    fn resize_error_codes_have_messages() {
+        // Forward-compat tripwire: every numeric error code we
+        // ship has a non-empty human message.  If a future
+        // ResizeResult::ERROR_* lands without a matching arm in
+        // map_resize_error, the fallback returns "unknown
+        // resize error code N" — we want every known code to
+        // hit a specific message instead.
+        for code in 0..=RESIZE_RESULT_ERROR_HEADER_MISMATCH {
+            let msg = map_resize_error(code);
+            assert!(!msg.is_empty(), "code {code} has empty message");
+            assert!(
+                !msg.starts_with("unknown"),
+                "code {code} hit the unknown-fallback: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn resize_args_parse_via_clap() {
+        // Smoke test: clap parses the documented flag set
+        // without surprises.  Uses Cli::try_parse_from rather
+        // than running main so we don't actually launch
+        // anything.
+        use clap::Parser;
+        let argv = vec![
+            "instar",
+            "resize",
+            "--shrink",
+            "--preallocation",
+            "off",
+            "-q",
+            "--output",
+            "json",
+            "foo.qcow2",
+            "+1G",
+        ];
+        let cli = Cli::try_parse_from(argv).expect("clap parse");
+        match cli.command {
+            Commands::Resize(args) => {
+                assert!(args.shrink);
+                assert_eq!(args.preallocation, "off");
+                assert!(args.quiet);
+                assert_eq!(args.output, "json");
+                assert_eq!(args.filename, "foo.qcow2");
+                assert_eq!(args.size, "+1G");
+            }
+            other => panic!("expected Resize, got {other:?}"),
+        }
     }
 }
