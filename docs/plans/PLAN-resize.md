@@ -767,7 +767,7 @@ versions; we can collapse those).
 | 3. QCOW2 shrink planner (`--shrink` semantics, L2 walk, cluster discard) | [PLAN-resize-phase-03-qcow2-shrink.md](PLAN-resize-phase-03-qcow2-shrink.md) | Complete |
 | 4. VHD resize planner (dynamic grow, fixed grow; shrink deferred) | [PLAN-resize-phase-04-vhd.md](PLAN-resize-phase-04-vhd.md) | Complete |
 | 5. VHDX resize planner (dynamic grow; shrink unsupported upstream) | [PLAN-resize-phase-05-vhdx.md](PLAN-resize-phase-05-vhdx.md) | Complete |
-| 6. VMDK resize planner (monolithicSparse grow; others rejected) | [PLAN-resize-phase-06-vmdk.md](PLAN-resize-phase-06-vmdk.md) | Not started |
+| 6. VMDK resize planner (monolithicSparse grow; others rejected) | [PLAN-resize-phase-06-vmdk.md](PLAN-resize-phase-06-vmdk.md) | Complete |
 | 7. Guest `resize` operation + protobuf + `read_output_sector` | PLAN-resize-phase-07-guest-op.md (not yet written) | Not started |
 | 8. Host VMM subcommand + clap surface + `[+-]SIZE` parsing | PLAN-resize-phase-08-host-cli.md (not yet written) | Not started |
 | 9. Preallocation modes (`off`/`metadata`/`falloc`/`full`) | PLAN-resize-phase-09-preallocation.md (not yet written) | Not started |
