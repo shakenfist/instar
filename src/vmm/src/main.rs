@@ -2999,6 +2999,22 @@ fn probe_resize_target(
         shared::ImageFormat::Raw => (IMAGE_FORMAT_RAW, current_file_size, false),
         shared::ImageFormat::Qcow2 => {
             let header = qcow2::QcowHeader::parse(&buf).ok_or("resize: invalid qcow2 header")?;
+            // Defensive guard against silent backing-chain
+            // orphaning. The qcow2 grow / shrink planners do not
+            // thread the existing backing reference through to
+            // `build_header`, so a resize would rewrite the
+            // header with `backing_file_offset = 0` and the
+            // overlay would lose its parent. Reject up-front
+            // pending a follow-up phase that plumbs the backing
+            // bytes + format through `ResizeConfig`. Mirrors
+            // VHDX's `has_parent` rejection.
+            if header.backing_file_offset != 0 || header.backing_file_size != 0 {
+                return Err("resize: qcow2 images with a backing file are not yet \
+                     supported (resize would orphan the backing reference); \
+                     resize the base image directly or flatten via \
+                     `instar convert` first"
+                    .into());
+            }
             (IMAGE_FORMAT_QCOW2, header.virtual_size, header.extended_l2)
         }
         shared::ImageFormat::Vmdk4 | shared::ImageFormat::Vmdk3 => {
@@ -3309,6 +3325,22 @@ fn run_resize_nonraw(
             "resize: guest reported error {}: {}",
             result.error,
             map_resize_error(result.error)
+        )
+        .into());
+    }
+
+    // Defence in depth: clamp the guest-reported `file_size_after`
+    // against the capacity hint we exposed via virtio. The guest is
+    // on the user's side of the trust boundary, but a buggy planner
+    // (or a fuzzer reaching an Ok path with corrupt outputs) could
+    // return an out-of-range value; the SAFETY comment on
+    // `apply_preallocation` claims its `data_len` is caller-clamped,
+    // and that claim is enforced here.
+    if result.file_size_after > capacity_hint {
+        return Err(format!(
+            "resize: guest reported file_size_after {} exceeds capacity hint \
+             {} — refusing to truncate beyond the exposed device range",
+            result.file_size_after, capacity_hint,
         )
         .into());
     }
@@ -8625,10 +8657,13 @@ fn apply_preallocation(
         "falloc" => {
             // SAFETY: fd is the raw fd of `file`, caller-owned for
             // the duration of this call. data_offset and data_len
-            // are validated against the file's observed length by
-            // the caller's clamping step before this function is
-            // entered. Out-of-range casts surface as EINVAL from
-            // posix_fallocate rather than UB.
+            // are bounded by the caller: `run_create_nonraw`
+            // clamps against the planned file size; `run_resize_nonraw`
+            // rejects guest-reported file sizes above the virtio
+            // capacity hint before calling here, and the
+            // `data_offset` derives from `file_size_before` (read
+            // from `stat()`). Out-of-range casts surface as EINVAL
+            // from posix_fallocate rather than UB.
             let rc = unsafe {
                 libc::posix_fallocate(fd, data_offset as libc::off_t, data_len as libc::off_t)
             };

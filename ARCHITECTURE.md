@@ -211,8 +211,8 @@ provides a modular architecture with:
   sparse case). `AllocationSummary` has been moved to `crates/shared` so
   format crates can produce it without depending on `measure`; a
   back-compat re-export remains in this crate. Consumed by the
-  `measure` operation in `src/operations/measure/`; intended for
-  later reuse by `create` / `resize` once those subcommands ship.
+  `measure` operation in `src/operations/measure/` and by the
+  size-estimation helpers shared with `create` and `resize`.
 - **operations/info/** - Format detection operation
 - **operations/copy/** - File copy operation
 - **operations/check/** - Image integrity validation operation (with

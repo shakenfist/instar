@@ -490,6 +490,21 @@ make test-container-convert-vhd      # VHD/VHDX convert (slowest)
 make clean-tests
 ```
 
+**Fuzz Testing:**
+```bash
+# Build a single coverage-guided fuzz target (uses the devcontainer)
+make fuzz-build FUZZ_TARGET=fuzz_resize_planners
+
+# Build every coverage-guided fuzz target
+make fuzz-build
+
+# Run a single target for a bounded wall-clock budget (seconds; default 60)
+make fuzz-run FUZZ_TARGET=fuzz_resize_planners FUZZ_DURATION=300
+```
+
+See the "Coverage-Guided Fuzzing" section below for the target list and the
+nightly CI rotation.
+
 The integration tests compare `instar info` output against `qemu-img info` to
 verify drop-in replacement compatibility, validate `instar check` against
 deliberately corrupt test images, cross-validate `instar compare` output

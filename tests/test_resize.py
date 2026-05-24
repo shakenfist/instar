@@ -682,6 +682,36 @@ class TestResizeErrorPaths(TestResizeSmoke):
             self.assertNotEqual(rc, 0)
             self.assertIn('image-opts', stderr.lower())
 
+    def test_qcow2_with_backing_file_rejected(self):
+        """Resize must reject qcow2 overlays to prevent the planner
+        from silently dropping the backing reference.
+
+        The qcow2 grow / shrink planners do not currently thread the
+        existing backing bytes + format through `build_header`, so
+        without this guard the resize would rewrite the header with
+        `backing_file_offset = 0` and orphan the chain. Lifting the
+        rejection requires plumbing the backing reference through
+        `ResizeConfig` (queued under PLAN-resize.md Future work).
+        """
+        with tempfile.TemporaryDirectory() as td:
+            parent = Path(td) / 'parent.qcow2'
+            child = Path(td) / 'child.qcow2'
+            _, _, c_rc = self.run_instar_create(
+                '-f', 'qcow2', str(parent), '16M')
+            self.assertEqual(c_rc, 0)
+            _, _, c_rc = self.run_instar_create(
+                '-f', 'qcow2', '-b', 'parent.qcow2', '-F', 'qcow2',
+                str(child))
+            self.assertEqual(c_rc, 0)
+            _, stderr, rc = self.run_instar_resize(
+                '-f', 'qcow2', str(child), '64M')
+            self.assertNotEqual(
+                rc, 0,
+                'resize must reject qcow2 overlays to prevent '
+                'silent backing-chain orphaning'
+            )
+            self.assertIn('backing', stderr.lower())
+
 
 # ----------------------------------------------------------------------
 # Surface 3: live cross-validation against the system qemu-img.

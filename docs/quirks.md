@@ -1091,6 +1091,21 @@ to qemu-img's output. `-q` suppresses it. `--output=json`
 swaps in a structured envelope (filename, format, action,
 old/new virtual size, new file size) and ignores `-q`.
 
+### qcow2 overlays with a backing file are rejected up-front
+
+`instar resize` of a qcow2 image whose header carries a
+`backing_file_offset` / `backing_file_size` rejects with
+`resize: qcow2 images with a backing file are not yet
+supported (resize would orphan the backing reference);
+resize the base image directly or flatten via
+`instar convert` first`. The qcow2 resize planners do not
+yet thread the existing backing reference through the
+header-rewrite path, so without this guard the rewritten
+header would have `backing_file_offset = 0` and the overlay
+would lose its parent. The rejection mirrors VHDX's
+`has_parent` guard. Lifting it is queued under PLAN-resize.md
+Future work — see the "Planner gaps" section.
+
 ### Same file is exposed as input device 0 and output device 1
 
 The resize guest binary reads via `read_output_sector` (new

@@ -793,6 +793,19 @@ reviewers can find every queued item in one place. Mirrored in
 - **Differencing VHD / VHDX as the resize target** (phases
   4 + 5). Currently rejected; needs the parent-locator
   update path.
+- **qcow2 overlays with a backing file** (push-audit
+  finding; phase 13). The grow / shrink planners take a
+  `backing_file: Option<&[u8]>` and `backing_format:
+  Option<&[u8]>` in `Qcow2ResizeOpts`, but the guest's
+  pre-pass always passes `None` for both, so a resize
+  rewrites the header without preserving the existing
+  backing reference. Host-side `probe_resize_target`
+  rejects overlays up-front with a clear message pending
+  the proper fix — plumbing the existing backing bytes +
+  format through `ResizeConfig` so the planner can pass
+  them to `build_header`. Until lifted, users must
+  flatten via `instar convert` (or resize the base image)
+  before resizing the chain.
 
 ### Host CLI gaps
 
