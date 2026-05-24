@@ -24,6 +24,21 @@ from helpers.info_json import assert_info_equivalent
 from test_create import KNOWN_WRITER_DIVERGENCES  # noqa: F401  (reserved for future per-case create-side lookup)
 
 
+# Cases where `instar create` produces a file that `instar check`
+# already rejects (independent of resize). The resize round-trip
+# test inherits the failure, so it skips these. Re-stated here
+# because the resize case names differ from the create names.
+KNOWN_CREATE_CHECK_FAILURES = {
+    # instar emits refcount_bits=64 in the header but writes
+    # 16-bit refcount entries on disk; instar check spots the
+    # mismatch. Same root cause as ('qcow2', '1G-rb-64') in
+    # test_create.py:KNOWN_CHECK_FAILURES.
+    ('qcow2', '1M-to-64M-rb-64'):
+        'instar emits refcount_bits=64 header but 16-bit on-disk '
+        'entries — check rejects (independent of resize)',
+}
+
+
 # Cases where the post-resize info JSON diverges from qemu's
 # baseline for a documented reason. Three categories:
 #
@@ -666,3 +681,382 @@ class TestResizeErrorPaths(TestResizeSmoke):
                 '--image-opts', f'file.filename={path}', '8M')
             self.assertNotEqual(rc, 0)
             self.assertIn('image-opts', stderr.lower())
+
+
+# ----------------------------------------------------------------------
+# Surface 3: live cross-validation against the system qemu-img.
+# ----------------------------------------------------------------------
+#
+# Curated subset chosen to exercise the qcow2 + raw paths qemu
+# actually supports for resize. For each case, run the full
+# `create -> resize` pipeline once via instar and once via
+# qemu-img, then compare both outputs via `instar info` (not
+# qemu info — we're measuring writer agreement, not reader
+# agreement). Mirrors TestCreateCrossValidation in
+# tests/test_create.py.
+RESIZE_CROSS_VALIDATION_CASES = [
+    # qcow2 (qemu supports resize)
+    ('qcow2', ('1M-to-4M-default',     '1M',  '4M',   [],     None)),
+    ('qcow2', ('1M-to-64M-default',    '1M',  '64M',  [],     None)),
+    ('qcow2', ('1M-to-4M-prealloc-full','1M', '4M',   [],     'full')),
+    ('qcow2', ('64M-minus-32M-shrink', '64M', '-32M', [],     None)),
+    # raw paths
+    ('raw',   ('1M-to-64M-default',    '1M',  '64M',  [],     None)),
+    ('raw',   ('64M-to-1M-shrink',     '64M', '1M',   [],     None)),
+    ('raw',   ('1M-to-4M-prealloc-full','1M', '4M',   [],     'full')),
+]
+
+
+class TestResizeCrossValidation(TestResizeSmoke):
+    """Live cross-validation against the system qemu-img.
+
+    For each entry in RESIZE_CROSS_VALIDATION_CASES, runs the
+    full create -> resize pipeline twice (once via instar, once
+    via qemu-img), then `instar info` on both outputs and
+    asserts byte-equivalence of the normalised JSONs. Catches
+    writer divergences that surface against the *currently
+    installed* qemu-img version rather than the frozen phase-10
+    matrix.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        try:
+            r = subprocess.run(
+                ['qemu-img', '--version'],
+                capture_output=True, text=True,
+            )
+            cls._system_qemu_available = (r.returncode == 0)
+        except FileNotFoundError:
+            cls._system_qemu_available = False
+
+    def _run_qemu_create(self, target, size_str, options_list, out_path,
+                         timeout=60):
+        qemu_target = 'vpc' if target == 'vhd' else target
+        cmd = ['qemu-img', 'create', '-f', qemu_target]
+        for opt in options_list:
+            cmd.extend(['-o', opt])
+        cmd.extend([str(out_path), size_str])
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=timeout)
+            return r.stdout, r.stderr, r.returncode
+        except subprocess.TimeoutExpired:
+            return '', f'qemu-img create timeout after {timeout}s', -1
+
+    def _run_qemu_resize(self, target, end_spec, apply_shrink, prealloc,
+                         out_path, timeout=60):
+        qemu_target = 'vpc' if target == 'vhd' else target
+        cmd = ['qemu-img', 'resize', '-f', qemu_target]
+        if apply_shrink:
+            cmd.append('--shrink')
+        if prealloc is not None:
+            cmd.extend(['--preallocation', prealloc])
+        cmd.extend([str(out_path), end_spec])
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=timeout)
+            return r.stdout, r.stderr, r.returncode
+        except subprocess.TimeoutExpired:
+            return '', f'qemu-img resize timeout after {timeout}s', -1
+
+
+def _make_resize_xval_test(target, case):
+    case_name, start_size, end_spec, create_opts, prealloc = case
+
+    def test(self):
+        if not getattr(type(self), '_system_qemu_available', False):
+            self.skipTest('system qemu-img not available')
+        known = KNOWN_RESIZE_DIVERGENCES.get((target, case_name))
+        if known is not None:
+            self.skipTest(f'known resize divergence: {known}')
+
+        ext = _EXT_FOR_TARGET[target]
+        with tempfile.TemporaryDirectory() as td_a, \
+                tempfile.TemporaryDirectory() as td_b:
+            inst_path = Path(td_a) / f'instar.{ext}'
+            qemu_path = Path(td_b) / f'qemu.{ext}'
+
+            # instar pipeline
+            i_args = ['-f', _instar_target_name(target)]
+            for opt in create_opts:
+                i_args.extend(['-o', opt])
+            i_args.extend([str(inst_path), start_size])
+            _, c_stderr, c_rc = self.run_instar_create(*i_args)
+            self.assertEqual(
+                c_rc, 0,
+                f'instar create failed: {c_stderr}'
+            )
+            r_args, apply_shrink, _ = self._apply_resize_args_for_case(
+                target, case, inst_path)
+            _, r_stderr, r_rc = self.run_instar_resize(*r_args)
+            self.assertEqual(
+                r_rc, 0,
+                f'instar resize failed: {r_stderr}'
+            )
+
+            # qemu pipeline
+            _, qc_stderr, qc_rc = self._run_qemu_create(
+                target, start_size, create_opts, qemu_path)
+            if qc_rc != 0:
+                self.skipTest(
+                    f'qemu-img create rejected: {qc_stderr.strip()}'
+                )
+            _, qr_stderr, qr_rc = self._run_qemu_resize(
+                target, end_spec, apply_shrink, prealloc, qemu_path)
+            if qr_rc != 0:
+                self.skipTest(
+                    f'qemu-img resize rejected: {qr_stderr.strip()}'
+                )
+
+            # Compare via instar info on both outputs.
+            inst_info, inst_err, inst_rc = self.run_instar_info(
+                inst_path, output_format='json')
+            self.assertEqual(
+                inst_rc, 0, f'instar info on instar output failed: {inst_err}'
+            )
+            qemu_info, qemu_err, qemu_rc = self.run_instar_info(
+                qemu_path, output_format='json')
+            self.assertEqual(
+                qemu_rc, 0, f'instar info on qemu output failed: {qemu_err}'
+            )
+
+            assert_info_equivalent(
+                self, inst_info, qemu_info,
+                _instar_target_name(target),
+                tmp_path=str(inst_path),
+                expected_tmp_path=str(qemu_path),
+                msg=(f'cross-validation {target}/{case_name}: '
+                     f'instar={inst_path}, qemu={qemu_path}'),
+            )
+
+    test.__name__ = f'test_xval_{target}_{case_name.replace("-", "_")}'
+    test.__doc__ = (
+        f'instar create+resize vs qemu-img create+resize for '
+        f'-f {target} {start_size} -> {end_spec} '
+        f'(prealloc={prealloc}) agree via instar info.'
+    )
+    return test
+
+
+for _target, _case in RESIZE_CROSS_VALIDATION_CASES:
+    _name = f'test_xval_{_target}_{_case[0].replace("-", "_")}'
+    setattr(TestResizeCrossValidation, _name,
+            _make_resize_xval_test(_target, _case))
+
+
+# ----------------------------------------------------------------------
+# Surface 4: round-trip check across the full matrix.
+# ----------------------------------------------------------------------
+#
+# For every (target, case) in RESIZE_CASES, instar create -> resize
+# -> check, expect rc==0. Catches a resize emitter regression that
+# produces a file qemu-img info accepts but the instar reader flags.
+# Skips raw (instar check is a no-op for raw) and the -no-shrink
+# rejection cases.
+
+
+class TestResizeRoundTripCheck(TestResizeSmoke):
+    """`instar create -> resize -> check` for every meaningful case."""
+
+    pass
+
+
+def _make_resize_check_test(target, case):
+    case_name, start_size, end_spec, create_opts, prealloc = case
+
+    def test(self):
+        if target == 'raw':
+            self.skipTest('instar check does not apply to raw images')
+        if case_name.endswith('-no-shrink'):
+            self.skipTest(
+                'rejection case; resize would fail before check could run'
+            )
+        known = KNOWN_RESIZE_DIVERGENCES.get((target, case_name))
+        if known is not None and 'rejected' in known.lower() or \
+                known is not None and 'deferred' in known.lower():
+            self.skipTest(f'resize itself is rejected: {known}')
+        create_check_fail = KNOWN_CREATE_CHECK_FAILURES.get((target, case_name))
+        if create_check_fail is not None:
+            self.skipTest(create_check_fail)
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / f'image.{_EXT_FOR_TARGET[target]}'
+
+            c_args = ['-f', _instar_target_name(target)]
+            for opt in create_opts:
+                c_args.extend(['-o', opt])
+            c_args.extend([str(path), start_size])
+            _, c_stderr, c_rc = self.run_instar_create(*c_args)
+            if c_rc != 0:
+                self.skipTest(
+                    f'instar create rejected {target}/{case_name}: '
+                    f'{c_stderr.strip()}'
+                )
+
+            r_args, _, _ = self._apply_resize_args_for_case(target, case, path)
+            _, r_stderr, r_rc = self.run_instar_resize(*r_args)
+            self.assertEqual(
+                r_rc, 0,
+                f'instar resize failed for {target}/{case_name}: '
+                f'stderr={r_stderr}'
+            )
+
+            _, k_stderr, k_rc = self.run_instar_check(path)
+            self.assertEqual(
+                k_rc, 0,
+                f'instar check failed on freshly-resized '
+                f'{target}/{case_name}: stderr={k_stderr}'
+            )
+
+    test.__name__ = f'test_check_{target}_{case_name.replace("-", "_")}'
+    test.__doc__ = (
+        f'instar check passes on instar create+resize -f {target} '
+        f'{start_size} -> {end_spec} (prealloc={prealloc}).'
+    )
+    return test
+
+
+for _target, _cases in RESIZE_CASES.items():
+    for _case in _cases:
+        _name = (
+            f'test_check_{_target}_{_case[0].replace("-", "_")}'
+        )
+        setattr(TestResizeRoundTripCheck, _name,
+                _make_resize_check_test(_target, _case))
+
+
+# ----------------------------------------------------------------------
+# Surface 5: internal-consistency suite for vmdk / vhd / vhdx.
+# ----------------------------------------------------------------------
+#
+# qemu-img can't resize these formats, so the baseline matrix
+# (surface 2) skips them entirely. This suite is the substitute:
+# create -> resize -> info -> (check), all via instar, asserting
+# the post-resize virtual-size matches expected_final_size and
+# the file passes integrity checks.
+#
+# vhd's virtual-size diverges from expected_final_size for *create*
+# in some cases (qemu rounds to CHS-aligned multiples; instar uses
+# the exact byte count). The resize planner preserves whatever the
+# create writer chose, so we assert against the round-trip:
+# post-resize virtual-size should equal what instar would have
+# produced for a fresh create at the target size. Since we have no
+# fresh-create comparison here, we assert the looser invariant that
+# virtual-size is non-zero and the file is at least as big as the
+# requested final size (modulo format overhead).
+
+
+class TestResizeConsistency(TestResizeSmoke):
+    """Internal consistency for vmdk / vhd / vhdx (qemu rejects)."""
+
+    pass
+
+
+# Targets where qemu rejects resize; for these the consistency suite
+# is the only coverage surface for the cross-tool matrix.
+_CONSISTENCY_TARGETS = ('vmdk', 'vhd', 'vhdx')
+
+
+def _make_resize_consistency_test(target, case):
+    case_name, start_size, end_spec, create_opts, prealloc = case
+
+    def test(self):
+        # Sanity: only run when the matching baseline meta records
+        # a qemu rejection — otherwise the baseline matrix is the
+        # right place for this case.
+        meta = self._baseline_meta(target, case_name)
+        if meta is None:
+            self.skipTest(f'no baseline meta for {target}/{case_name}')
+        if meta.get('resize_return_code') == 0:
+            self.skipTest(
+                'qemu supports this resize; covered by baseline matrix'
+            )
+
+        end_bytes = resolve_resize_end_bytes(start_size, end_spec)
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / f'image.{_EXT_FOR_TARGET[target]}'
+
+            c_args = ['-f', _instar_target_name(target)]
+            for opt in create_opts:
+                c_args.extend(['-o', opt])
+            c_args.extend([str(path), start_size])
+            _, c_stderr, c_rc = self.run_instar_create(*c_args)
+            if c_rc != 0:
+                self.skipTest(
+                    f'instar create rejected {target}/{case_name}: '
+                    f'{c_stderr.strip()}'
+                )
+
+            r_args, _, _ = self._apply_resize_args_for_case(target, case, path)
+            _, r_stderr, r_rc = self.run_instar_resize(*r_args)
+            self.assertEqual(
+                r_rc, 0,
+                f'instar resize failed for {target}/{case_name}: '
+                f'stderr={r_stderr}'
+            )
+
+            info_stdout, info_err, info_rc = self.run_instar_info(
+                path, output_format='json')
+            self.assertEqual(
+                info_rc, 0,
+                f'instar info failed on post-resize {target}/{case_name}: '
+                f'{info_err}'
+            )
+            info = json.loads(info_stdout)
+
+            # vhd virtual-size may be rounded up to a CHS-aligned
+            # multiple by the writer (documented in
+            # KNOWN_WRITER_DIVERGENCES). For non-vhd targets, the
+            # post-resize virtual-size must equal the requested
+            # end_bytes exactly; for vhd, allow >= (the writer may
+            # have rounded up).
+            actual_vs = info.get('virtual-size')
+            self.assertIsNotNone(
+                actual_vs,
+                f'{target}/{case_name}: info JSON missing virtual-size'
+            )
+            if target == 'vhd':
+                self.assertGreaterEqual(
+                    actual_vs, end_bytes,
+                    f'{target}/{case_name}: virtual-size {actual_vs} '
+                    f'< expected_final_size {end_bytes} (CHS-rounded '
+                    f'value should be >=, never <)'
+                )
+            else:
+                self.assertEqual(
+                    actual_vs, end_bytes,
+                    f'{target}/{case_name}: virtual-size {actual_vs} '
+                    f'!= expected_final_size {end_bytes}'
+                )
+
+            # Check on vhd / vhdx (vmdk check is a no-op today, same
+            # policy as test_create's round-trip check).
+            if target in ('vhd', 'vhdx'):
+                _, k_stderr, k_rc = self.run_instar_check(path)
+                self.assertEqual(
+                    k_rc, 0,
+                    f'instar check failed on freshly-resized '
+                    f'{target}/{case_name}: stderr={k_stderr}'
+                )
+
+    test.__name__ = (
+        f'test_consistency_{target}_{case_name.replace("-", "_")}'
+    )
+    test.__doc__ = (
+        f'instar create+resize+info+check round-trip for -f {target} '
+        f'{start_size} -> {end_spec} (qemu rejects this; consistency '
+        f'check is the substitute for baseline diff).'
+    )
+    return test
+
+
+for _target in _CONSISTENCY_TARGETS:
+    for _case in RESIZE_CASES.get(_target, []):
+        _name = (
+            f'test_consistency_{_target}_{_case[0].replace("-", "_")}'
+        )
+        setattr(TestResizeConsistency, _name,
+                _make_resize_consistency_test(_target, _case))
