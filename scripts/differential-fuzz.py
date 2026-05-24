@@ -1174,8 +1174,9 @@ def _resize_option_picker(rng):
             end = rng.choice(['4M', '8M', '16M'])
             if _resize_parse_qemu_size(end) == _resize_parse_qemu_size(start):
                 end = '16M'
-            if prealloc is not None:
-                options_for_prealloc = []  # prealloc is a resize flag, not -o
+            # prealloc is a resize flag, not -o — no extra
+            # create-time options needed beyond what the qcow2
+            # branch already accumulated.
         else:
             start = rng.choice(['1M', '4M', '16M'])
             # Pick end form: absolute, additive, or subtractive.

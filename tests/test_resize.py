@@ -21,7 +21,6 @@ from pathlib import Path
 
 from base import InstarTestBase
 from helpers.info_json import assert_info_equivalent
-from test_create import KNOWN_WRITER_DIVERGENCES  # noqa: F401  (reserved for future per-case create-side lookup)
 
 
 # Cases where `instar create` produces a file that `instar check`
