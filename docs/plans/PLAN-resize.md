@@ -771,7 +771,7 @@ versions; we can collapse those).
 | 7. Guest `resize` operation + protobuf + `read_output_sector` | [PLAN-resize-phase-07-guest-op.md](PLAN-resize-phase-07-guest-op.md) | Complete |
 | 8. Host VMM subcommand + clap surface + `[+-]SIZE` parsing | [PLAN-resize-phase-08-host-cli.md](PLAN-resize-phase-08-host-cli.md) | Complete |
 | 9. Preallocation modes (`off`/`metadata`/`falloc`/`full`) | [PLAN-resize-phase-09-preallocation.md](PLAN-resize-phase-09-preallocation.md) | Complete (sparse-format data-region preallocation deferred — see Future work) |
-| 10. Cross-version baselines in `instar-testdata` | PLAN-resize-phase-10-baselines.md (not yet written) | Not started |
+| 10. Cross-version baselines in `instar-testdata` | [PLAN-resize-phase-10-baselines.md](PLAN-resize-phase-10-baselines.md) | Complete (3,280 baselines × 80 qemu-img versions; vmdk/vhd/vhdx record qemu's "format does not support resize" rejection — phase 11 falls back to internal consistency checks for those) |
 | 11. Integration tests (`tests/test_resize.py`) | PLAN-resize-phase-11-integration-tests.md (not yet written) | Not started |
 | 12. Coverage-guided + differential fuzz harnesses | PLAN-resize-phase-12-fuzz.md (not yet written) | Not started |
 | 13. Documentation, CHANGELOG, follow-ups | PLAN-resize-phase-13-docs.md (not yet written) | Not started |
