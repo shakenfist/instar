@@ -15,6 +15,7 @@
         instar instar-devcontainer clean-instar run-instar check-binary-sizes \
         metadata audit deb rpm package \
         test-venv test test-rust test-integration test-ci test-malicious test-report clean-tests \
+        fuzz-build fuzz-run \
         test-container test-container-core test-container-convert-qcow2 test-container-convert-vhd \
         clean-cargo-cache release check-version
 
@@ -503,6 +504,46 @@ test-rust: instar-devcontainer
 		cargo test --release -p luks --features "decrypt,encrypt" && \
 		cargo test --release -p qcow2 --features create && \
 		cargo test --release -p create'
+
+# Build all coverage-guided fuzz targets via cargo-fuzz inside the
+# devcontainer (matches the .github/workflows/coverage-fuzz.yml build
+# step). The container ships a pinned rust nightly + cargo-fuzz; the
+# host doesn't need either.
+#
+# Pass FUZZ_TARGET=name to build just one target; default builds all.
+FUZZ_TARGET ?=
+fuzz-build: instar-devcontainer
+	@echo "Building fuzz targets..."
+	docker run --rm \
+		-u "$(shell id -u):$(shell id -g)" \
+		-e HOME=/build \
+		-e CARGO_HOME=/build/.cargo \
+		-v "$(CURDIR):/workspace" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
+		-w "/workspace/src/fuzz" \
+		"$(INSTAR_IMAGE)" \
+		bash -c "cargo fuzz build $(FUZZ_TARGET)"
+
+# Run a single fuzz target for a bounded wall-clock budget (seconds).
+# Usage: make fuzz-run FUZZ_TARGET=fuzz_resize_planners FUZZ_DURATION=60
+FUZZ_DURATION ?= 60
+fuzz-run: instar-devcontainer
+	@if [ -z "$(FUZZ_TARGET)" ]; then \
+		echo "Error: FUZZ_TARGET=<name> is required"; \
+		exit 1; \
+	fi
+	@echo "Running $(FUZZ_TARGET) for $(FUZZ_DURATION)s..."
+	docker run --rm \
+		-u "$(shell id -u):$(shell id -g)" \
+		-e HOME=/build \
+		-e CARGO_HOME=/build/.cargo \
+		-v "$(CURDIR):/workspace" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
+		-w "/workspace/src/fuzz" \
+		"$(INSTAR_IMAGE)" \
+		bash -c "cargo fuzz run $(FUZZ_TARGET) -- -max_total_time=$(FUZZ_DURATION)"
 
 # Run Python integration tests only (on host)
 # Runs all test files except malicious image tests (explicit opt-in via test-malicious)
