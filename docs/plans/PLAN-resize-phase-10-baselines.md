@@ -93,6 +93,18 @@ regressed when a baseline changes.
   preallocation flag — older versions that reject a
   specific mode for a specific format just produce a non-zero
   exit, which the baseline records verbatim.
+- **qemu-img cannot resize vmdk, vpc (vhd), or vhdx** on
+  any version we ship. The driver responds `"Image format
+  driver does not support resize"`. instar **does** support
+  resize on all three. We still generate baselines for these
+  formats — they record the rejection verbatim, document the
+  capability gap, and act as a tripwire for the day qemu
+  adds support. Phase 11 must handle the cross-tool
+  asymmetry: for qcow2 + raw, diff instar's info JSON
+  against qemu's matching baseline; for vmdk / vhd / vhdx,
+  the baseline's `resize_return_code != 0` is the signal
+  to fall back to internal consistency checks (instar
+  resize → instar info → instar check) instead of a diff.
 - **`COMMANDS['create']['output_types']`** is
   `{'create-info-json': 'json'}`. Phase 10 mirrors with
   `{'resize-info-json': 'json'}` — info-JSON is the only
