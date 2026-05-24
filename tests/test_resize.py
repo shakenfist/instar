@@ -20,6 +20,44 @@ import tempfile
 from pathlib import Path
 
 from base import InstarTestBase
+from helpers.info_json import assert_info_equivalent
+from test_create import KNOWN_WRITER_DIVERGENCES  # noqa: F401  (reserved for future per-case create-side lookup)
+
+
+# Cases where the post-resize info JSON diverges from qemu's
+# baseline for a documented reason. Three categories:
+#
+# 1. **Create-time divergence carries forward.** instar's create
+#    writer hardcodes refcount_bits=16 and compat=1.1 (see
+#    KNOWN_WRITER_DIVERGENCES in test_create.py), so the post-
+#    resize info reports those values rather than what the
+#    -o flags requested. The resize case names differ from the
+#    create case names, so we re-list them here.
+# 2. **Resize-time planner gaps.** Documented Future-work items
+#    from the master plan; the resize op rejects rather than
+#    silently producing the wrong layout.
+#
+# A case NOT in this dict that fails the diff is a real
+# regression and must be investigated, not silenced.
+KNOWN_RESIZE_DIVERGENCES = {
+    # Create-time divergence carry-forward
+    # ----------------------------------------
+    # instar's qcow2 build_header hardcodes refcount_order=4
+    # (-> refcount_bits=16); -o refcount_bits=N is ignored.
+    ('qcow2', '1M-to-64M-rb-1'):  'instar hardcodes refcount_bits=16',
+    ('qcow2', '1M-to-64M-rb-64'): 'instar hardcodes refcount_bits=16',
+    # instar's qcow2 build_header hardcodes compat=1.1; the
+    # -o compat=0.10 flag is silently ignored.
+    ('qcow2', '1M-to-64M-compat-v2'): 'instar hardcodes compat=1.1',
+
+    # Resize-time planner gap (master-plan Future work)
+    # ----------------------------------------
+    # qcow2 + preallocation=metadata on resize is rejected by
+    # the planner (PreallocationUnsupported, deferred from
+    # phase 2c). qemu accepts it.
+    ('qcow2', '1M-to-4M-prealloc-metadata'):
+        'qcow2 metadata preallocation deferred (master-plan Future work)',
+}
 
 
 # ----------------------------------------------------------------------
@@ -301,15 +339,42 @@ class TestResizeSmoke(InstarTestBase):
 
 
 # ----------------------------------------------------------------------
-# Surface 1: schema-drift tripwire.
+# Surface 1 + 2: schema-drift tripwire + per-(target, case) baseline diff.
 # ----------------------------------------------------------------------
 
 class TestResizeBaselineMatrix(TestResizeSmoke):
     """Cross-version baseline comparison + schema-drift tripwire.
 
-    Step 11a ships only the tripwire; the per-(target, case)
-    factory lands in 11b.
+    For each entry in RESIZE_CASES, the per-case factory runs
+    `instar create` to produce the start image, then `instar
+    resize` with the recorded flag set, then system
+    `qemu-img info --output=json` on the post-resize file, and
+    asserts byte-equivalence against the version-matched baseline
+    (modulo the divergence whitelist already established by
+    phase 8's create matrix and reused here via
+    `KNOWN_WRITER_DIVERGENCES`).
+
+    Bypasses get_output_profiles() and reads the per-target
+    bucket directly, matching the create harness's approach in
+    tests/test_create.py:TestCreateBaselineMatrix.
     """
+
+    @staticmethod
+    def _run_qemu_img_info(path, timeout=30):
+        """Run system qemu-img info --output=json. No -f flag so
+        the auto-detect path matches what the baseline generator
+        recorded. Returns (stdout, stderr, rc).
+        """
+        try:
+            r = subprocess.run(
+                ['qemu-img', 'info', '--output=json', str(path)],
+                capture_output=True, text=True, timeout=timeout,
+            )
+            return r.stdout, r.stderr, r.returncode
+        except FileNotFoundError:
+            return '', 'qemu-img not installed', -1
+        except subprocess.TimeoutExpired:
+            return '', f'qemu-img info timeout after {timeout}s', -1
 
     def test_resize_cases_match_baselines(self):
         """Every baseline on disk must have a matching RESIZE_CASES entry.
@@ -341,6 +406,131 @@ class TestResizeBaselineMatrix(TestResizeSmoke):
                 f'{missing_from_disk}. Regenerate baselines via '
                 f'instar-testdata.'
             )
+
+
+def _make_resize_baseline_test(target, case):
+    """Factory: one test method per (target, case) tuple.
+
+    Skips the case when:
+    - The baseline isn't on disk (matrix not populated for this
+      installed qemu version).
+    - The baseline records a non-zero qemu-img create / resize /
+      info rc (qemu-img couldn't produce a comparable artefact —
+      vmdk / vhd / vhdx baselines all land here because qemu
+      doesn't support resize on those formats; covered by
+      TestResizeConsistency in 11c).
+    - The case is a `-no-shrink` rejection (covered by
+      TestResizeErrorPaths instead — a baseline-diff on an error
+      message is too brittle).
+    - The case hits a known instar-vs-qemu create-time writer
+      divergence (the divergence carries forward into the post-
+      resize info).
+    """
+    case_name, start_size, end_spec, create_opts, prealloc = case
+
+    def test(self):
+        meta = self._baseline_meta(target, case_name)
+        if meta is None:
+            self.skipTest(
+                f'no baseline meta for {target}/{case_name} '
+                f'(installed qemu version not in matrix?)'
+            )
+        if meta.get('create_return_code', 0) != 0:
+            self.skipTest(
+                f'baseline create_rc={meta["create_return_code"]} '
+                f'(qemu rejected create); no comparable artefact'
+            )
+        if meta.get('resize_return_code', 0) != 0:
+            self.skipTest(
+                f"qemu-img cannot resize {target} "
+                f"(meta resize_rc={meta['resize_return_code']}); "
+                f"covered by TestResizeConsistency"
+            )
+        if meta.get('info_return_code', 0) != 0:
+            self.skipTest(
+                f'baseline info_rc={meta["info_return_code"]} '
+                f'(no comparable JSON)'
+            )
+
+        if case_name.endswith('-no-shrink'):
+            self.skipTest(
+                'rejection case; covered by TestResizeErrorPaths'
+            )
+
+        known = KNOWN_RESIZE_DIVERGENCES.get((target, case_name))
+        if known is not None:
+            self.skipTest(f'known resize divergence: {known}')
+
+        baseline_path = self._baseline_stdout(target, case_name)
+        if baseline_path is None:
+            self.skipTest(f'no baseline stdout for {target}/{case_name}')
+
+        # Mirror-vs-meta sanity: catches drift between this in-test
+        # mirror and the testdata generator before more expensive
+        # invocations fire.
+        self._assert_case_matches_meta(target, case, meta)
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / f'image.{_EXT_FOR_TARGET[target]}'
+
+            # 1. Create the start image with instar.
+            c_args = ['-f', _instar_target_name(target)]
+            for opt in create_opts:
+                c_args.extend(['-o', opt])
+            c_args.extend([str(path), start_size])
+            _, c_stderr, c_rc = self.run_instar_create(*c_args)
+            self.assertEqual(
+                c_rc, 0,
+                f'instar create failed for {target}/{case_name}: '
+                f'stderr={c_stderr}'
+            )
+
+            # 2. Resize via instar.
+            r_args, _, _ = self._apply_resize_args_for_case(target, case, path)
+            _, r_stderr, r_rc = self.run_instar_resize(*r_args)
+            self.assertEqual(
+                r_rc, 0,
+                f'instar resize failed for {target}/{case_name}: '
+                f'stderr={r_stderr}'
+            )
+
+            # 3. Run system qemu-img info and diff against the baseline.
+            info_stdout, info_stderr, info_rc = self._run_qemu_img_info(path)
+            if info_rc == -1 and 'not installed' in info_stderr:
+                self.skipTest('system qemu-img not installed')
+            self.assertEqual(
+                info_rc, 0,
+                f'qemu-img info failed on instar output for '
+                f'{target}/{case_name}: stderr={info_stderr}'
+            )
+            expected = baseline_path.read_text()
+            assert_info_equivalent(
+                self, info_stdout, expected,
+                _instar_target_name(target),
+                tmp_path=str(path),
+                msg=f'{target}/{case_name}',
+            )
+
+    test.__name__ = (
+        f'test_baseline_{target}_{case_name.replace("-", "_")}'
+    )
+    test.__doc__ = (
+        f'instar create -f {target} {" ".join(create_opts)} {start_size} '
+        f'-> resize {end_spec} (prealloc={prealloc}) matches '
+        f'phase-10 baseline.'
+    )
+    return test
+
+
+for _target, _cases in RESIZE_CASES.items():
+    for _case in _cases:
+        _name = (
+            f'test_baseline_{_target}_{_case[0].replace("-", "_")}'
+        )
+        setattr(
+            TestResizeBaselineMatrix, _name,
+            _make_resize_baseline_test(_target, _case),
+        )
 
 
 # ----------------------------------------------------------------------
