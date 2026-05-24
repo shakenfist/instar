@@ -27,11 +27,11 @@ Initial target formats:
 
 **Initial implementation** - The `info` prototype has been promoted to the main
 instar implementation in `src/`. Operations include `info`, `copy`, `check`,
-`compare`, `convert`, `measure`, and `create`. Prototypes remain available
-for reference.
+`compare`, `convert`, `measure`, `create`, and `resize`. Prototypes remain
+available for reference.
 
-See [docs/measure.md](docs/measure.md) and [docs/create.md](docs/create.md)
-for the per-subcommand user guides.
+See [docs/measure.md](docs/measure.md), [docs/create.md](docs/create.md),
+and [docs/resize.md](docs/resize.md) for the per-subcommand user guides.
 
 ## Installation
 
@@ -529,7 +529,7 @@ instar/
 │   │   ├── vhdx/   # VHDX headers, region table, metadata, BAT, CRC-32C
 │   │   ├── vmdk/   # VMDK4 header and descriptor parsing
 │   │   └── luks/   # LUKS header parsing, KDF, AFsplitter, decryption
-│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, measure, create)
+│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, measure, create, resize)
 │   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates
 │   └── guest-protocol/ # Protocol Buffers messaging for guests

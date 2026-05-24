@@ -17,7 +17,7 @@ instar/
 │   ├── core/       # Core guest initialization
 │   ├── crates/     # Shared format crates (qcow2, raw, vmdk, vhd, vhdx, luks)
 │   ├── shared/     # Shared library code (byte-order helpers, configs)
-│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, measure, create)
+│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, measure, create, resize)
 │   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates (guest-protocol)
 ├── prototypes/     # Experimental implementations (11 KVM prototypes)
@@ -76,6 +76,23 @@ vhdx (VHDX), luks (info + convert with decryption)
   `falloc` / `full`). Non-qcow2 sparse formats (vmdk / vpc / vhdx)
   reject non-`off` preallocation with a "future work" pointer.
   See [docs/create.md](docs/create.md) for the full reference.
+- `resize`: change the virtual size of an existing disk image in
+  place. End-spec grammar matches qemu-img:
+  `FILENAME [+-]SIZE[bkKMGTPE]` accepts absolute (`64M`), additive
+  (`+1G`), and subtractive (`-512M`) forms. Raw resize is host-only
+  (`open(O_RDWR) + ftruncate` plus optional preallocation
+  post-pass); qcow2 / vmdk / vpc / vhdx run `crates/resize` in the
+  KVM sandbox, which reads the existing header, plans the metadata
+  mutation, and applies patches via virtio. qcow2 + raw support
+  grow and shrink (`--shrink` required for shrink); vmdk / vpc /
+  vhdx are grow-only. Preallocation `falloc` / `full` (raw + qcow2)
+  preallocates only the newly-appended file region — a deliberate
+  divergence from qemu's whole-data-region preallocation, queued
+  under Future work. `qemu-img resize` cannot resize vmdk / vpc /
+  vhdx on any shipped version (documented coverage gap; instar
+  resize works for all three with coverage via the internal
+  consistency suite). See [docs/resize.md](docs/resize.md) for the
+  full reference.
 
 ## Working on This Project
 
