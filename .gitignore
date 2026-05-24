@@ -20,3 +20,4 @@
 # root so it does not catch docs/plans/PLAN-*.md).
 /PLAN-*.md
 __pycache__/
+fuzz-logs/
