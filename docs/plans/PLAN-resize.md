@@ -758,6 +758,87 @@ versions; we can collapse those).
     }
     ```
 
+## Future work
+
+Consolidated inventory of resize-related work deferred during
+phases 1–12, with the originating phase pointer for each. Pulled
+from the inline "Future work" mentions across the phase plans so
+reviewers can find every queued item in one place. Mirrored in
+`docs/resize.md`'s Future-work section for user-facing visibility.
+
+### Planner gaps
+
+- **qcow2 `Preallocation::Metadata`** (phase 2c). The qcow2
+  grow planner returns `PreallocationUnsupported`; qemu
+  supports it. Closing the gap needs the same
+  `Qcow2Layout` extension that ships in create's metadata
+  mode, adapted for the grow path.
+- **vmdk shrink** (phase 6). monolithicSparse permits shrink
+  but the planner doesn't implement the GD walk + grain
+  deallocation. Rejected today with `UnsupportedShrink`.
+- **vhd shrink** (phase 4). Fixed + dynamic grow ship; shrink
+  is deferred. Same `UnsupportedShrink` rejection.
+- **vhdx shrink** (phase 5). qemu has no upstream
+  implementation to mirror, so neither do we. Same rejection.
+- **Sparse-format data-region preallocation** (phase 9). For
+  `falloc`/`full` on qcow2/vhdx/vmdk/vhd-dynamic, instar
+  preallocates only the appended file region;
+  qemu preallocates the entire data region. Closing the gap
+  needs a per-format walk-and-populate pass — comparable in
+  complexity to a half-create operation per format.
+- **vmdk multi-extent subformats** (phase 6). `twoGbMaxExtent*`
+  and `monolithicFlat` rejected with `UnsupportedSubformat`.
+  Multi-file resize needs the same multi-output-device call-
+  table extension create's roadmap already calls out.
+- **Differencing VHD / VHDX as the resize target** (phases
+  4 + 5). Currently rejected; needs the parent-locator
+  update path.
+
+### Host CLI gaps
+
+- **`--object OBJDEF`** (phase 8). Rejected with a "not yet
+  supported" message; lands alongside the matching convert-
+  side LUKS plumbing.
+- **`--image-opts`** (phase 8). Same — rejected with a clear
+  deferral message.
+
+### Robustness / hardening
+
+- **Tighten `QCOW2_MAX_RESIZE_SCRATCH` for non-default
+  cluster sizes** (phase 12 finding). The current 32 MiB
+  scratch is sized for default 64 KiB clusters; 2 MiB
+  clusters overflow it with even modest virtual sizes
+  (`image too large for the resize scratch buffer`). The
+  differential fuzz picker filters the combination today.
+- **Planner-side defensive checks for inconsistent host
+  inputs** (phase 12 finding). The VHDX planner can return
+  `Ok(plan { total_file_size: 0 })` when the host passes
+  impossibly small file sizes relative to the metadata
+  region's offset. Not reachable from real callers (the host
+  derives `current_file_size` from `stat()` on the actual
+  file) but worth hardening; the coverage-fuzz target's
+  input-clamp envelope avoids the path today.
+
+### Fuzz coverage
+
+- **Re-parse round-trip in `fuzz_resize_planners`** (phase 12
+  open question 1). Reconstruct a faithful starting image
+  from the fuzzer's synthetic existing-state bytes and
+  re-parse with the matching format crate; mirrors
+  `fuzz_create_emitters`'s contract.
+- **Curated seed corpus for `fuzz_resize_planners`** (phase
+  12 open question 8). `scripts/extract-fuzz-corpus.py` has
+  no resize codepath today — input shape is a packed
+  `(format_selector, opts, slices)` blob, not a raw image.
+- **Populated-image differential coverage** (phase 12 open
+  question 3). The differential harness creates empty start
+  images today; populated variants become meaningful once
+  data-region preallocation parity lands.
+- **libyal-based vmdk/vhd/vhdx differential coverage**
+  (phase 12 open question 5). If `vmdkinfo` / `vhdiinfo` ever
+  gain resize support we get a third axis for the formats
+  qemu can't compare against.
+
 ## Execution
 
 | Phase | Plan | Status |
@@ -774,7 +855,7 @@ versions; we can collapse those).
 | 10. Cross-version baselines in `instar-testdata` | [PLAN-resize-phase-10-baselines.md](PLAN-resize-phase-10-baselines.md) | Complete (3,280 baselines × 80 qemu-img versions; vmdk/vhd/vhdx record qemu's "format does not support resize" rejection — phase 11 falls back to internal consistency checks for those) |
 | 11. Integration tests (`tests/test_resize.py`) | [PLAN-resize-phase-11-integration-tests.md](PLAN-resize-phase-11-integration-tests.md) | Complete (114 tests: 83 pass + 31 documented skips; first run also surfaced two device-routing / CLI bugs fixed in b1d2dac) |
 | 12. Coverage-guided + differential fuzz harnesses | [PLAN-resize-phase-12-fuzz.md](PLAN-resize-phase-12-fuzz.md) | Complete (fuzz_resize_planners: 730k iter / 5 min clean, cov 469, ft 594; differential op_resize: 200 iter / seed 42 clean; CI wired into coverage-fuzz.yml at 17 targets) |
-| 13. Documentation, CHANGELOG, follow-ups | PLAN-resize-phase-13-docs.md (not yet written) | Not started |
+| 13. Documentation, CHANGELOG, follow-ups | [PLAN-resize-phase-13-docs.md](PLAN-resize-phase-13-docs.md) | Complete (new docs/resize.md; CHANGELOG `[Unreleased]` entry; AGENTS/ARCHITECTURE/README mentions; docs/quirks.md `## resize subcommand quirks`; docs/index.md TOC; docs/format-coverage.md per-format table; docs/testing.md test-file enumeration; `~~resize~~` struck from PLAN-convert-followups.md; consolidated Future-work section below) |
 
 ### Phase notes (not yet detailed plans)
 
