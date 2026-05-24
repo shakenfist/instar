@@ -726,9 +726,10 @@ cd src/fuzz
 cargo fuzz run fuzz_qcow2_header -- -max_total_time=60
 ```
 
-13 fuzz targets cover all parser crates (QCOW2, VMDK, VHD, VHDX, RAW,
+17 fuzz targets cover all parser crates (QCOW2, VMDK, VHD, VHDX, RAW,
 LUKS) including header parsing, L1/L2 lookup, refcount traversal, and
-decompression. Seed the corpus from `instar-testdata`:
+decompression, plus the create and resize planners. Seed the corpus
+from `instar-testdata`:
 
 ```bash
 python3 scripts/extract-fuzz-corpus.py --testdata /path/to/instar-testdata
