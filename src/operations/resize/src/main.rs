@@ -931,9 +931,11 @@ pub unsafe extern "C" fn _start() -> u64 {
     }
 
     let sector_size = (call_table.get_output_sector_size)();
-    let file_size_before = (call_table.get_output_capacity)()
-        .checked_mul(sector_size as u64)
-        .unwrap_or(0);
+    // current_file_size is the real on-disk file size, populated
+    // by the host from stat(). The virtio device capacity is the
+    // host's capacity *hint* (room for the planner to write past
+    // the pre-resize EOF) and is therefore not a valid stand-in.
+    let file_size_before = config.current_file_size;
 
     // Read sector 0 to detect the format.
     if !(call_table.read_output_sector)(0, HEADER_BUF as *mut u8, sector_size) {

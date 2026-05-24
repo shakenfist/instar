@@ -2358,6 +2358,10 @@ struct ResizeArgs {
     filename: String,
     /// `[+-]SIZE[bkKMGTPE]`. Absent prefix is absolute; `+`
     /// adds to the current virtual size; `-` subtracts.
+    ///
+    /// `allow_hyphen_values` lets `-32M` reach this positional
+    /// instead of being mis-parsed as a short flag by clap.
+    #[arg(allow_hyphen_values = true)]
     size: String,
     /// Force the image format detection (raw / qcow2 / vmdk /
     /// vpc / vhdx).
@@ -3295,6 +3299,7 @@ fn run_resize_nonraw(
         flags,
         probed.current_virtual_size,
         new_virtual_size,
+        probed.current_file_size,
         output,
         capacity_hint,
         verbose,
@@ -3358,6 +3363,7 @@ fn run_resize_guest(
     flags: u32,
     current_virtual_size: u64,
     new_virtual_size: u64,
+    current_file_size: u64,
     output_backing: backing::BackingStore,
     output_capacity_hint: u64,
     verbose: bool,
@@ -3406,7 +3412,8 @@ fn run_resize_guest(
     //   39: _pad                 u8
     //   40: vmdk_grain_size      u32
     //   44: block_size           u32
-    //   48: _reserved            [u8; 64]
+    //   48: current_file_size    u64
+    //   56: _reserved            [u8; 56]
     let sector_size: u32 = 512;
     guest_mem.write_obj(RESIZE_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
     guest_mem.write_obj(target_format, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
@@ -3420,24 +3427,70 @@ fn run_resize_guest(
     // qcow2_cluster_size / refcount_bits / vmdk_subformat / vhd_subformat /
     // _pad / vmdk_grain_size / block_size are left zero — the guest
     // re-reads the canonical values from the existing image header.
-    // _reserved at offset 48 stays zero from the page-zeroed memory.
+    guest_mem.write_obj(current_file_size, GuestAddress(OPERATION_CONFIG_ADDR + 48))?;
+    // _reserved at offset 56 stays zero from the page-zeroed memory.
 
     debug!(
         "Wrote resize config at 0x{:x} (target={}, flags=0x{:x}, current_virtual_size={}, \
-         new_virtual_size={})",
-        OPERATION_CONFIG_ADDR, target_format, flags, current_virtual_size, new_virtual_size,
+         new_virtual_size={}, current_file_size={})",
+        OPERATION_CONFIG_ADDR,
+        target_format,
+        flags,
+        current_virtual_size,
+        new_virtual_size,
+        current_file_size,
     );
 
     // --- Set up devices --------------------------------------------------
-    // Resize uses ONE device: the output (the file being
-    // resized).  The guest reads via read_output_sector and
-    // writes via write_output_sector.  No input device is
-    // attached.
+    // The guest core unconditionally probes input device 0
+    // (see core/src/main.rs::_start), so even though resize
+    // has no logical input we attach a 1-sector stub at slot 0
+    // and place the real (read-write) output at slot 1.  The
+    // resize guest reads via `read_output_sector` and writes
+    // via `write_output_sector`, both of which dispatch to
+    // slot 1.  The stub is never read.  Mirrors the pattern
+    // in `run_create_nonraw`.
+    struct ResizeStubInput(std::path::PathBuf);
+    impl Drop for ResizeStubInput {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let stub_path = std::env::temp_dir().join(format!("instar-resize-stub-{pid}-{nanos}"));
+    let stub_file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&stub_path)?;
+    stub_file.set_len(sector_size as u64)?;
+    drop(stub_file);
+    let _stub_input = ResizeStubInput(stub_path.clone());
+    let input_backing = backing::BackingStore::open(&stub_path, true, None, false)?;
+
     let mut device_set = DeviceSet::new();
     let mut io_events: Vec<IoEvent> = Vec::new();
 
-    let output_mmio = device_mmio_base(0);
-    let output_vq = device_vq_base(0);
+    let input_mmio = device_mmio_base(0);
+    let input_vq = device_vq_base(0);
+    let input_device = VirtioBlockDevice::new(
+        input_backing,
+        sector_size as u64,
+        sector_size as u64,
+        true, // read-only
+        input_mmio,
+        input_vq,
+    );
+    let input_device = Arc::new(Mutex::new(input_device));
+    device_set.add_device(Arc::clone(&input_device), true);
+    io_events.push(IoEvent::new(input_mmio)?);
+
+    let output_mmio = device_mmio_base(1);
+    let output_vq = device_vq_base(1);
     let output_device = VirtioBlockDevice::new(
         output_backing,
         output_capacity_hint,

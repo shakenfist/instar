@@ -2391,8 +2391,15 @@ pub struct ResizeConfig {
     /// 0 if not applicable.
     pub block_size: u32,
 
+    /// Actual on-disk file size in bytes before resize. The host
+    /// populates this from `stat()` after probing the target.
+    /// The guest uses it for planning instead of deriving from
+    /// the virtio device capacity (which is the host's capacity
+    /// *hint*, not the actual file size).
+    pub current_file_size: u64,
+
     /// Reserved padding for forward compatibility (zero-init).
-    pub _reserved: [u8; 64],
+    pub _reserved: [u8; 56],
 }
 
 impl ResizeConfig {
@@ -2989,7 +2996,8 @@ mod tests {
             _pad: 0,
             vmdk_grain_size: 0,
             block_size: 0,
-            _reserved: [0; 64],
+            current_file_size: 0,
+            _reserved: [0; 56],
         };
         assert!(cfg.allow_shrink());
         assert_eq!(cfg.preallocation(), ResizeConfig::PREALLOC_OFF);
