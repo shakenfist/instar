@@ -746,7 +746,8 @@ jobs:
               /build/test-venv/bin/pip install -q \
                 -r tests/requirements.txt &&
               /build/test-venv/bin/pip install -q \
-                git+https://github.com/openstack/oslo.utils.git &&
+                git+https://github.com/openstack/oslo.utils.git \
+                cryptography &&
               cd tests &&
               /build/test-venv/bin/stestr run test_oslo_crossval
             '
