@@ -645,6 +645,103 @@ pub fn plan_resize_vhdx<'a>(
     vhdx::plan_grow(opts, scratch)
 }
 
+// ============================================================================
+// Targeted qcow2 grow pre-pass query (followup-01)
+// ============================================================================
+
+/// Classification of a qcow2 grow request.
+///
+/// Returned by [`compute_qcow2_grow_query`] so the guest can stage
+/// exactly the refcount blocks each flavour will touch, lifting the
+/// "stage every block" image-size ceiling.  Mirrors the internal
+/// action enum used by [`plan_resize_qcow2`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Qcow2GrowAction {
+    /// No metadata mutation beyond the header rewrite.
+    HeaderOnly,
+    /// L1 table must be appended/relocated, refcount table still
+    /// addresses every newly-allocated cluster.
+    L1Grow,
+    /// L1 *and* refcount table grow — new refcount blocks need
+    /// allocating.
+    L1AndRefcountGrow,
+}
+
+/// Upper bound on the number of distinct refcount blocks any grow
+/// flavour will demand.  Worst case observed in
+/// [`plan_l1_and_refcount_grow`] is ~6 (overlap blocks for the
+/// new L1 / RT region plus cleanup blocks for the old L1 / RT
+/// region); 16 leaves comfortable headroom for non-default cluster
+/// sizes without bloating the result struct.
+pub const QCOW2_MAX_REQUIRED_BLOCKS: usize = 16;
+
+/// Scalar inputs to [`compute_qcow2_grow_query`].  Mirrors the
+/// subset of [`Qcow2ResizeOpts`] the query function actually
+/// reads — the slices and indices arrays that the full
+/// [`Qcow2ResizeOpts`] carries are not needed here because the
+/// query runs *before* the guest stages refcount-block contents.
+///
+/// The `existing_refcount_table_bytes` slice IS needed: counting
+/// non-zero entries in the table determines `existing_block_count`,
+/// which sets the upper bound of the "overlap" cluster range for
+/// the [`Qcow2GrowAction::L1AndRefcountGrow`] flavour.
+#[derive(Debug, Clone, Copy)]
+pub struct Qcow2ResizeGrowQuery<'a> {
+    pub cluster_size: u32,
+    pub refcount_bits: u8,
+    pub extended_l2: bool,
+    pub current_virtual_size: u64,
+    pub new_virtual_size: u64,
+    pub current_file_size: u64,
+    pub current_l1_entries: u32,
+    pub current_l1_table_offset: u64,
+    pub current_refcount_table_offset: u64,
+    pub current_refcount_table_clusters: u32,
+    pub current_incompatible_features: u64,
+    pub preallocation: Preallocation,
+    pub allow_shrink: bool,
+    pub existing_refcount_table_bytes: &'a [u8],
+}
+
+/// Result of [`compute_qcow2_grow_query`].  Carries the chosen
+/// action and the *distinct* refcount-block indices the planner
+/// will demand via `ensure_block_staged`.
+///
+/// `required_blocks_len` may be zero (HeaderOnly flavour and the
+/// no-op case both stage nothing).  Otherwise the first
+/// `required_blocks_len` entries are valid block indices into the
+/// existing refcount table; the rest of the array is undefined.
+#[derive(Debug, Clone, Copy)]
+pub struct Qcow2GrowQueryResult {
+    pub action: Qcow2GrowAction,
+    pub required_blocks: [u64; QCOW2_MAX_REQUIRED_BLOCKS],
+    pub required_blocks_len: usize,
+}
+
+/// Compute, *before* staging any refcount blocks, the grow flavour
+/// that [`plan_resize_qcow2`] would choose and the exact set of
+/// existing refcount-block indices it will demand via
+/// `ensure_block_staged`.
+///
+/// The guest's pre-pass calls this first, then stages only the
+/// returned blocks — replacing the older "stage every non-zero
+/// refcount block" pattern that imposed an image-size ceiling
+/// proportional to cluster size.
+///
+/// The function is pure: no I/O, no allocation, returns the same
+/// errors [`plan_resize_qcow2`]'s grow path does for the
+/// pre-classification stage (`InvalidNewVirtualSize`,
+/// `UnsupportedFormat`, `RequiresCheckFirst`, `ShrinkWithoutFlag`,
+/// `HeaderMismatch`, `PreallocationUnsupported`).  Shrink is not
+/// handled here — for `new_virtual_size < current_virtual_size`
+/// the function returns `UnsupportedShrink` (the caller should
+/// use a separate L2-staging pre-pass for shrink).
+pub fn compute_qcow2_grow_query(
+    q: &Qcow2ResizeGrowQuery<'_>,
+) -> Result<Qcow2GrowQueryResult, ResizeError> {
+    qcow2::compute_grow_query(q)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -19,24 +19,14 @@ use qcow2::create::{
 };
 use shared::{be_u64, write_be_u64};
 
-use crate::{Preallocation, Qcow2ResizeOpts, ResizeAction, ResizeError, ResizePatch, ResizePlan};
+use crate::{
+    Preallocation, Qcow2GrowAction, Qcow2GrowQueryResult, Qcow2ResizeGrowQuery, Qcow2ResizeOpts,
+    ResizeAction, ResizeError, ResizePatch, ResizePlan, QCOW2_MAX_REQUIRED_BLOCKS,
+};
 
-/// Classification of a qcow2 grow request, decided up-front from
-/// the existing and target layouts.
-///
-/// The three flavours have progressively more invasive patch
-/// lists. [`Qcow2GrowAction::HeaderOnly`] emits a single header
-/// rewrite; [`Qcow2GrowAction::L1Grow`] additionally appends a
-/// new L1 region and updates the refcount entries that cover it;
-/// [`Qcow2GrowAction::L1AndRefcountGrow`] runs the full algorithm
-/// including new refcount blocks and (optionally) a relocated
-/// refcount table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Qcow2GrowAction {
-    HeaderOnly,
-    L1Grow,
-    L1AndRefcountGrow,
-}
+// Qcow2GrowAction is now defined in lib.rs (public) so the guest
+// pre-pass can dispatch on the flavour returned by
+// `compute_qcow2_grow_query`.  See lib.rs for the variant docs.
 
 /// Decide which growth flavour applies, given the current and
 /// target geometry. Pure scalar function; no I/O.
@@ -56,6 +46,250 @@ pub(crate) fn decide_action(
         (true, false) => Qcow2GrowAction::L1Grow,
         (true, true) | (false, true) => Qcow2GrowAction::L1AndRefcountGrow,
     }
+}
+
+// ----------------------------------------------------------------
+// Targeted refcount-block pre-pass query (followup-01).
+// ----------------------------------------------------------------
+
+/// Implementation of [`crate::compute_qcow2_grow_query`].  Mirrors
+/// the input-validation gates of [`plan_grow`] and emits the
+/// pre-classification (action + required block indices) the guest
+/// needs to stage exactly the right slice of refcount-block bytes
+/// before invoking [`plan_resize_qcow2`].
+pub(crate) fn compute_grow_query(
+    q: &Qcow2ResizeGrowQuery<'_>,
+) -> Result<Qcow2GrowQueryResult, ResizeError> {
+    if q.new_virtual_size == 0 {
+        return Err(ResizeError::InvalidNewVirtualSize);
+    }
+    validate_incompat(q.current_incompatible_features)?;
+    if q.new_virtual_size < q.current_virtual_size {
+        if !q.allow_shrink {
+            return Err(ResizeError::ShrinkWithoutFlag);
+        }
+        // This helper is grow-only; shrink uses a different
+        // (L2-table) staging strategy.  Caller must dispatch.
+        return Err(ResizeError::UnsupportedShrink);
+    }
+    if q.preallocation == Preallocation::Metadata {
+        return Err(ResizeError::PreallocationUnsupported);
+    }
+    if q.extended_l2 && q.preallocation != Preallocation::Off {
+        return Err(ResizeError::PreallocationUnsupported);
+    }
+
+    let cluster_bits = cluster_bits_from(q.cluster_size)?;
+    let cluster_size = q.cluster_size as u64;
+    if !q.current_file_size.is_multiple_of(cluster_size) {
+        return Err(ResizeError::HeaderMismatch);
+    }
+
+    // No-change: empty plan, no blocks to stage.
+    if q.new_virtual_size == q.current_virtual_size {
+        return Ok(Qcow2GrowQueryResult {
+            action: Qcow2GrowAction::HeaderOnly,
+            required_blocks: [0; QCOW2_MAX_REQUIRED_BLOCKS],
+            required_blocks_len: 0,
+        });
+    }
+
+    // Run compute_layout for the *target* geometry so we can
+    // decide_action identically to plan_grow.
+    let target_layout = compute_layout(
+        q.new_virtual_size,
+        cluster_bits,
+        q.refcount_bits as u32,
+        q.extended_l2,
+        Qcow2CreatePreallocation::Off,
+    )
+    .map_err(map_qcow2_create_err)?;
+
+    let existing_block_count = count_existing_refcount_blocks(q.existing_refcount_table_bytes);
+    let action = decide_action(
+        q.current_l1_entries,
+        q.current_refcount_table_clusters,
+        existing_block_count,
+        target_layout.l1_entries,
+        target_layout.refcount_table_clusters,
+        target_layout.refcount_block_count,
+    );
+
+    // Enumerate cluster ranges per flavour and dedupe to distinct
+    // block indices.
+    let mut required = RequiredBlocks::new();
+    let entries_per_refblock: u64 = (cluster_size * 8) / q.refcount_bits as u64;
+    debug_assert!(entries_per_refblock > 0);
+
+    match action {
+        Qcow2GrowAction::HeaderOnly => {
+            // Nothing to stage.
+        }
+        Qcow2GrowAction::L1Grow => {
+            add_l1_growth_blocks(&mut required, q, &target_layout, entries_per_refblock)?;
+        }
+        Qcow2GrowAction::L1AndRefcountGrow => {
+            add_l1_and_refcount_growth_blocks(
+                &mut required,
+                q,
+                &target_layout,
+                existing_block_count,
+                entries_per_refblock,
+            )?;
+        }
+    }
+
+    Ok(Qcow2GrowQueryResult {
+        action,
+        required_blocks: required.storage,
+        required_blocks_len: required.len,
+    })
+}
+
+/// Small helper struct for de-duplicating block indices into a
+/// fixed-size array.
+struct RequiredBlocks {
+    storage: [u64; QCOW2_MAX_REQUIRED_BLOCKS],
+    len: usize,
+}
+
+impl RequiredBlocks {
+    fn new() -> Self {
+        Self {
+            storage: [0; QCOW2_MAX_REQUIRED_BLOCKS],
+            len: 0,
+        }
+    }
+
+    /// Add `block_idx` if it isn't already present.  Returns
+    /// `ScratchTooSmall` if the array is full — that's the
+    /// "planner needs more blocks than the helper budgeted for"
+    /// signal, and means [`QCOW2_MAX_REQUIRED_BLOCKS`] needs
+    /// raising rather than that the caller did anything wrong.
+    fn add(&mut self, block_idx: u64) -> Result<(), ResizeError> {
+        for i in 0..self.len {
+            if self.storage[i] == block_idx {
+                return Ok(());
+            }
+        }
+        if self.len >= QCOW2_MAX_REQUIRED_BLOCKS {
+            return Err(ResizeError::ScratchTooSmall);
+        }
+        self.storage[self.len] = block_idx;
+        self.len += 1;
+        Ok(())
+    }
+}
+
+/// Identify blocks the L1Grow flavour touches: new L1 region
+/// clusters (increment side) plus old L1 region clusters
+/// (decrement side).
+fn add_l1_growth_blocks(
+    required: &mut RequiredBlocks,
+    q: &Qcow2ResizeGrowQuery<'_>,
+    target_layout: &Qcow2Layout,
+    entries_per_refblock: u64,
+) -> Result<(), ResizeError> {
+    let cluster_size = q.cluster_size as u64;
+
+    let new_l1_size_bytes = (target_layout.l1_entries as u64) * 8;
+    let new_l1_clusters = new_l1_size_bytes.div_ceil(cluster_size).max(1);
+    let new_l1_first_cluster = q.current_file_size / cluster_size;
+    let new_l1_last_cluster = new_l1_first_cluster + new_l1_clusters - 1;
+
+    let old_l1_first_cluster = q.current_l1_table_offset / cluster_size;
+    let old_l1_size_bytes = (q.current_l1_entries as u64) * 8;
+    let old_l1_clusters = old_l1_size_bytes.div_ceil(cluster_size).max(1);
+    let old_l1_last_cluster = old_l1_first_cluster + old_l1_clusters - 1;
+
+    for c in new_l1_first_cluster..=new_l1_last_cluster {
+        required.add(c / entries_per_refblock)?;
+    }
+    for c in old_l1_first_cluster..=old_l1_last_cluster {
+        required.add(c / entries_per_refblock)?;
+    }
+    Ok(())
+}
+
+/// Identify blocks the L1AndRefcountGrow flavour touches.
+///
+/// The flavour appends a new L1 region, optionally a relocated
+/// refcount table, and one or more new refcount blocks (all at
+/// EOF).  Existing refcount blocks need staging only when:
+///
+/// - they contain the "overlap" clusters — the trailing slice
+///   of the new appended region that still falls within an
+///   already-existing refcount block (the last existing block
+///   may be partially populated), AND
+/// - they contain the "cleanup" clusters — the old L1 region
+///   and (if the table relocates) the old refcount table.
+///
+/// New refcount blocks beyond `existing_block_count` are
+/// constructed from scratch by the planner — no existing
+/// block-bytes to stage for those.
+fn add_l1_and_refcount_growth_blocks(
+    required: &mut RequiredBlocks,
+    q: &Qcow2ResizeGrowQuery<'_>,
+    target_layout: &Qcow2Layout,
+    existing_block_count: u64,
+    entries_per_refblock: u64,
+) -> Result<(), ResizeError> {
+    let cluster_size = q.cluster_size as u64;
+
+    let new_l1_size_bytes = (target_layout.l1_entries as u64) * 8;
+    let new_l1_clusters = new_l1_size_bytes.div_ceil(cluster_size).max(1);
+    let new_l1_offset = q.current_file_size;
+
+    let target_table_clusters = target_layout.refcount_table_clusters;
+    let table_grows = target_table_clusters > q.current_refcount_table_clusters as u64;
+
+    let new_refcount_table_offset = new_l1_offset + new_l1_clusters * cluster_size;
+    let new_refcount_table_size = if table_grows {
+        target_table_clusters * cluster_size
+    } else {
+        0
+    };
+    let new_refcount_blocks_offset = new_refcount_table_offset + new_refcount_table_size;
+    let target_block_count = target_layout.refcount_block_count;
+    let new_block_count_delta = target_block_count.saturating_sub(existing_block_count);
+    let new_refcount_blocks_size = new_block_count_delta * cluster_size;
+    let total_file_size = new_refcount_blocks_offset + new_refcount_blocks_size;
+    let new_total_clusters = total_file_size / cluster_size;
+
+    // Overlap range: clusters in [pre_resize_cluster_count,
+    // min(existing_block_coverage, new_total_clusters)) live in
+    // existing refcount blocks that need staging.  Beyond
+    // existing_block_coverage the planner writes brand-new
+    // refcount blocks, so no existing block to stage.
+    let pre_resize_cluster_count = q.current_file_size / cluster_size;
+    let existing_block_coverage = existing_block_count * entries_per_refblock;
+    let overlap_last_excl = existing_block_coverage.min(new_total_clusters);
+    let mut c = pre_resize_cluster_count;
+    while c < overlap_last_excl {
+        required.add(c / entries_per_refblock)?;
+        c += 1;
+    }
+
+    // Cleanup: old L1 region.
+    let old_l1_first = q.current_l1_table_offset / cluster_size;
+    let old_l1_clusters = ((q.current_l1_entries as u64) * 8)
+        .div_ceil(cluster_size)
+        .max(1);
+    let old_l1_last_excl = old_l1_first + old_l1_clusters;
+    for c in old_l1_first..old_l1_last_excl {
+        required.add(c / entries_per_refblock)?;
+    }
+
+    // Cleanup: old refcount table (only if relocated).
+    if table_grows {
+        let old_rt_first = q.current_refcount_table_offset / cluster_size;
+        let old_rt_last_excl = old_rt_first + q.current_refcount_table_clusters as u64;
+        for c in old_rt_first..old_rt_last_excl {
+            required.add(c / entries_per_refblock)?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Plan a qcow2 resize.
@@ -1671,5 +1905,192 @@ mod tests {
         // Decrement to 0.
         set_refcount(&mut block, 0, 16, 0).unwrap();
         assert_eq!(&block[0..2], &[0x00, 0x00]);
+    }
+
+    // ------------------------------------------------------------------
+    // compute_grow_query unit tests (followup-01).
+    // ------------------------------------------------------------------
+
+    /// Build a `Qcow2ResizeGrowQuery` for a small synthetic qcow2
+    /// at the given cluster size and current virtual size.  The
+    /// refcount-table bytes are sized to match what `compute_layout`
+    /// would produce for `current_virtual_size`, and densely-packed
+    /// (one entry per existing refcount block).
+    fn make_query<'a>(
+        rt_bytes_buf: &'a mut [u8],
+        cluster_size: u32,
+        current_virtual_size: u64,
+        new_virtual_size: u64,
+    ) -> Qcow2ResizeGrowQuery<'a> {
+        let cluster_bits = cluster_bits_from(cluster_size).unwrap();
+        let layout = compute_layout(
+            current_virtual_size,
+            cluster_bits,
+            16,
+            false,
+            Qcow2CreatePreallocation::Off,
+        )
+        .unwrap();
+
+        // Populate the refcount-table buffer densely up to
+        // `layout.refcount_block_count` entries.
+        let cs = cluster_size as u64;
+        let blocks_base = layout
+            .refcount_table_offset
+            .saturating_add(layout.refcount_table_clusters * cs);
+        for i in 0..layout.refcount_block_count {
+            let entry_off = (i as usize) * 8;
+            if entry_off + 8 > rt_bytes_buf.len() {
+                break;
+            }
+            write_be_u64(rt_bytes_buf, entry_off, blocks_base + i * cs);
+        }
+
+        let total_file_size = layout.total_file_size;
+        Qcow2ResizeGrowQuery {
+            cluster_size,
+            refcount_bits: 16,
+            extended_l2: false,
+            current_virtual_size,
+            new_virtual_size,
+            current_file_size: total_file_size,
+            current_l1_entries: layout.l1_entries,
+            current_l1_table_offset: layout.l1_offset,
+            current_refcount_table_offset: layout.refcount_table_offset,
+            current_refcount_table_clusters: layout.refcount_table_clusters as u32,
+            current_incompatible_features: 0,
+            preallocation: Preallocation::Off,
+            allow_shrink: false,
+            existing_refcount_table_bytes: rt_bytes_buf,
+        }
+    }
+
+    #[test]
+    fn compute_grow_query_header_only_at_default_cluster() {
+        // Tiny grow within the same L1 region — HeaderOnly path.
+        let mut rt = [0u8; 8192];
+        let q = make_query(&mut rt, 65536, 1 << 20, 4 << 20);
+        let r = compute_grow_query(&q).unwrap();
+        assert_eq!(r.action, Qcow2GrowAction::HeaderOnly);
+        assert_eq!(r.required_blocks_len, 0);
+    }
+
+    #[test]
+    fn compute_grow_query_l1_grow_at_default_cluster() {
+        // Grow from 1 MiB to 64 MiB at default 64K cluster.
+        // current L1: 1 entry (covers one L2 of 64K * 8K = 512 MiB).
+        // Actually with one L1 entry covering 512 MiB, 64 MiB stays
+        // HeaderOnly.  Force L1Grow by jumping into a regime where
+        // multiple L1 entries are needed.  At 4 KiB cluster, one L1
+        // entry covers cluster_size * cluster_size/8 = 2 MiB; so
+        // 1 MiB -> 64 MiB does grow the L1.
+        let mut rt = [0u8; 8192];
+        let q = make_query(&mut rt, 4096, 1 << 20, 64 << 20);
+        let r = compute_grow_query(&q).unwrap();
+        assert_eq!(r.action, Qcow2GrowAction::L1Grow);
+        // Must demand at least one block (the one covering the new
+        // L1 region, appended at EOF), plus the one covering the
+        // old L1 region.  Distinct count is typically 1-2.
+        assert!(
+            r.required_blocks_len >= 1 && r.required_blocks_len <= 4,
+            "L1Grow required_blocks_len out of bounds: {}",
+            r.required_blocks_len
+        );
+    }
+
+    #[test]
+    fn compute_grow_query_handles_large_virtual_size() {
+        // 500 GiB -> 1 TiB at default cluster.  Pre-followup this
+        // would blow EXISTING_STATE_LIMIT; the targeted helper must
+        // return a bounded block set regardless of image size.
+        let mut rt = [0u8; 8192];
+        let q = make_query(&mut rt, 65536, 500u64 << 30, 1024u64 << 30);
+        let r = compute_grow_query(&q).unwrap();
+        assert!(
+            r.required_blocks_len <= QCOW2_MAX_REQUIRED_BLOCKS,
+            "required_blocks_len ({}) exceeds MAX_REQUIRED_BLOCKS ({})",
+            r.required_blocks_len,
+            QCOW2_MAX_REQUIRED_BLOCKS,
+        );
+        // 1 TiB grow at 64K cluster needs L1+refcount table growth.
+        assert!(matches!(
+            r.action,
+            Qcow2GrowAction::L1Grow | Qcow2GrowAction::L1AndRefcountGrow
+        ));
+    }
+
+    #[test]
+    fn compute_grow_query_rejects_zero_size() {
+        let mut rt = [0u8; 8192];
+        let mut q = make_query(&mut rt, 65536, 1 << 20, 4 << 20);
+        q.new_virtual_size = 0;
+        assert_eq!(
+            compute_grow_query(&q).unwrap_err(),
+            ResizeError::InvalidNewVirtualSize
+        );
+    }
+
+    #[test]
+    fn compute_grow_query_rejects_shrink_without_flag() {
+        let mut rt = [0u8; 8192];
+        let mut q = make_query(&mut rt, 65536, 4 << 20, 1 << 20);
+        q.allow_shrink = false;
+        assert_eq!(
+            compute_grow_query(&q).unwrap_err(),
+            ResizeError::ShrinkWithoutFlag
+        );
+    }
+
+    #[test]
+    fn compute_grow_query_rejects_shrink_with_flag() {
+        // Helper is grow-only; shrink uses different staging.
+        let mut rt = [0u8; 8192];
+        let mut q = make_query(&mut rt, 65536, 4 << 20, 1 << 20);
+        q.allow_shrink = true;
+        assert_eq!(
+            compute_grow_query(&q).unwrap_err(),
+            ResizeError::UnsupportedShrink
+        );
+    }
+
+    #[test]
+    fn compute_grow_query_rejects_metadata_preallocation() {
+        let mut rt = [0u8; 8192];
+        let mut q = make_query(&mut rt, 65536, 1 << 20, 4 << 20);
+        q.preallocation = Preallocation::Metadata;
+        assert_eq!(
+            compute_grow_query(&q).unwrap_err(),
+            ResizeError::PreallocationUnsupported
+        );
+    }
+
+    #[test]
+    fn compute_grow_query_no_op_returns_empty_blocks() {
+        let mut rt = [0u8; 8192];
+        let q = make_query(&mut rt, 65536, 4 << 20, 4 << 20);
+        let r = compute_grow_query(&q).unwrap();
+        assert_eq!(r.action, Qcow2GrowAction::HeaderOnly);
+        assert_eq!(r.required_blocks_len, 0);
+    }
+
+    #[test]
+    fn required_blocks_dedupes() {
+        let mut r = RequiredBlocks::new();
+        r.add(7).unwrap();
+        r.add(3).unwrap();
+        r.add(7).unwrap();
+        r.add(3).unwrap();
+        r.add(11).unwrap();
+        assert_eq!(r.len, 3);
+        assert_eq!(&r.storage[..3], &[7, 3, 11]);
+    }
+
+    #[test]
+    fn required_blocks_overflow_returns_scratch_too_small() {
+        let mut r = RequiredBlocks::new();
+        for i in 0..QCOW2_MAX_REQUIRED_BLOCKS as u64 {
+            r.add(i).unwrap();
+        }
+        assert_eq!(r.add(99).unwrap_err(), ResizeError::ScratchTooSmall);
     }
 }
