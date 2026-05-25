@@ -1089,3 +1089,81 @@ for _target in _CONSISTENCY_TARGETS:
         )
         setattr(TestResizeConsistency, _name,
                 _make_resize_consistency_test(_target, _case))
+
+
+# ----------------------------------------------------------------------
+# Large-image grows (followup-01: targeted refcount-block pre-pass).
+# ----------------------------------------------------------------------
+#
+# Before the targeted pre-pass, the guest staged every non-zero
+# refcount block referenced by the refcount table, imposing an
+# image-size ceiling of ~128 GiB at the default 64 KiB cluster
+# (4 MiB EXISTING_STATE / 64 KiB block size = 64 blocks; 64
+# blocks * 2 GiB-per-block coverage = 128 GiB). The targeted
+# pre-pass stages only the specific blocks the planner will
+# touch — bounded by QCOW2_MAX_REQUIRED_BLOCKS = 16 regardless
+# of image size.
+#
+# These tests exercise grows well past the old ceiling. The files
+# are sparse on disk (Preallocation::Off) so they stay tiny — a
+# 1 TiB virtual qcow2 occupies a few hundred KiB of metadata
+# clusters.
+
+
+class TestResizeLargeImages(TestResizeSmoke):
+    """End-to-end resize of qcow2 images past the old ~128 GiB ceiling.
+
+    All four cases create a sparse qcow2, resize to the target
+    size, and read back via `instar info --output=json` to confirm
+    the new virtual-size matches. Disk usage stays well under
+    1 MiB per case because Preallocation::Off makes the file's
+    physical size proportional to the metadata only.
+    """
+
+    def _grow(self, start_size, end_size):
+        """Helper: create -> resize -> info; return parsed JSON."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'large.qcow2'
+            _, c_stderr, c_rc = self.run_instar_create(
+                '-f', 'qcow2', str(path), start_size)
+            self.assertEqual(
+                c_rc, 0,
+                f'create {start_size} failed: {c_stderr}'
+            )
+            _, r_stderr, r_rc = self.run_instar_resize(
+                '-f', 'qcow2', str(path), end_size)
+            self.assertEqual(
+                r_rc, 0,
+                f'resize {start_size} -> {end_size} failed: {r_stderr}'
+            )
+            info_stdout, info_err, info_rc = self.run_instar_info(
+                path, output_format='json')
+            self.assertEqual(info_rc, 0, f'info failed: {info_err}')
+            return json.loads(info_stdout)
+
+    def test_grow_past_old_ceiling_256_gib(self):
+        """200 GiB -> 256 GiB at default cluster.
+
+        Past the historic ~128 GiB stage-all ceiling. Pre-followup
+        this hit `resize: guest reported error 9: image too large
+        for the resize scratch buffer`.
+        """
+        info = self._grow('200G', '256G')
+        self.assertEqual(info['virtual-size'], 256 * 1024 ** 3)
+
+    def test_grow_to_500_gib(self):
+        """100 GiB -> 500 GiB. Spans the boundary cleanly."""
+        info = self._grow('100G', '500G')
+        self.assertEqual(info['virtual-size'], 500 * 1024 ** 3)
+
+    def test_grow_to_1_tib(self):
+        """200 GiB -> 1 TiB. An order of magnitude past the old
+        ceiling."""
+        info = self._grow('200G', '1T')
+        self.assertEqual(info['virtual-size'], 1024 ** 4)
+
+    def test_grow_1_tib_to_2_tib(self):
+        """1 TiB -> 2 TiB. The headline cloud-disk case the old
+        approach could not handle."""
+        info = self._grow('1T', '2T')
+        self.assertEqual(info['virtual-size'], 2 * 1024 ** 4)
