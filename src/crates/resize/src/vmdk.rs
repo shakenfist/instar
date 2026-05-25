@@ -74,7 +74,17 @@ pub(crate) fn plan_grow<'a>(
         return Err(ResizeError::ParseFailed);
     }
     let header_capacity_sectors = le_u64(opts.existing_header, CAPACITY_OFFSET);
-    if header_capacity_sectors * SECTOR != opts.current_virtual_size {
+    // checked_mul: a fuzzer-supplied header can carry a capacity
+    // sectors field near u64::MAX, where multiplying by SECTOR
+    // (512) overflows.  Surface as HeaderMismatch — the planner's
+    // contract is "scalar fields must reflect a real parsed
+    // header"; impossible values reach this check, never the
+    // planner proper.
+    let header_capacity_bytes = match header_capacity_sectors.checked_mul(SECTOR) {
+        Some(v) => v,
+        None => return Err(ResizeError::HeaderMismatch),
+    };
+    if header_capacity_bytes != opts.current_virtual_size {
         return Err(ResizeError::HeaderMismatch);
     }
 

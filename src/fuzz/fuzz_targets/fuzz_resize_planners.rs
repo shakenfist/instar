@@ -95,31 +95,41 @@ fuzz_target!(|data: &[u8]| {
     // The host VMM constructs these from `stat()` on a real file
     // (`current_file_size`) and from parsed header bytes
     // (`current_virtual_size` / `new_virtual_size`). Real images
-    // top out around 100 TiB for the largest deployments; clamping
-    // to 40 bits (= 1 TiB) keeps the fuzzer in that realistic range
-    // and avoids steering it into the "host lied about my inputs"
-    // branch where planner arithmetic overflows because the caller
-    // passed mutually inconsistent values (e.g. current_file_size
-    // = 0 with current_metadata_offset = 2 MiB).
+    // top out around 100 TiB for the largest deployments.
     //
-    // 40 bits of entropy is still plenty for coverage: it spans the
-    // 512-byte → 1 TiB range, exercising every relevant decision
-    // boundary (qcow2 L1/refcount-table growth, vhdx BAT relocate,
-    // vmdk grain-directory layout). Planner-side defensive checks
-    // for impossibly-inconsistent inputs are a separate hardening
-    // pass; see the master-plan Future-work entry.
-    const SIZE_MASK: u64 = (1 << 40) - 1;
+    // Per-format clamp because the planners have different
+    // robustness profiles:
+    //
+    // * **qcow2** is robust against large sizes after followup-01
+    //   (the targeted refcount-block pre-pass bounded the staging
+    //   regardless of image size).  Use 48 bits = 256 TiB to
+    //   exercise the new code path at cloud-disk scale.
+    // * **vmdk / vhd / vhdx** still have the phase-12 planner-
+    //   input-validation gap (returning Ok with corrupt
+    //   total_file_size when the host passes mutually
+    //   inconsistent values).  Keep the 40-bit / 1 TiB clamp
+    //   until those planners are hardened (master-plan Future
+    //   work).
+    //
+    // The qcow2 branch is selected by `format_sel == 1`.
+    const SIZE_MASK_TIGHT: u64 = (1 << 40) - 1;
+    const SIZE_MASK_QCOW2: u64 = (1 << 48) - 1;
+    let size_mask = if format_sel == 1 {
+        SIZE_MASK_QCOW2
+    } else {
+        SIZE_MASK_TIGHT
+    };
     let current_virtual_size =
-        u64::from_le_bytes(data[8..16].try_into().unwrap()) & SIZE_MASK;
+        u64::from_le_bytes(data[8..16].try_into().unwrap()) & size_mask;
     let new_virtual_size =
-        u64::from_le_bytes(data[16..24].try_into().unwrap()) & SIZE_MASK;
+        u64::from_le_bytes(data[16..24].try_into().unwrap()) & size_mask;
     // current_file_size floored at 8 MiB: the hardcoded VHDX
     // metadata/BAT offsets the harness passes (2 / 3 MiB) must
     // land within the file. The floor reflects what a real VHDX
     // actually looks like — even a 1 MiB image has its 1 MiB
     // metadata region past the headers + log.
     let current_file_size =
-        (u64::from_le_bytes(data[24..32].try_into().unwrap()) & SIZE_MASK)
+        (u64::from_le_bytes(data[24..32].try_into().unwrap()) & size_mask)
             .max(8 * 1024 * 1024);
 
     let preallocation = match prealloc_sel {

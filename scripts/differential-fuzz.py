@@ -1178,15 +1178,19 @@ def _resize_option_picker(rng):
             # create-time options needed beyond what the qcow2
             # branch already accumulated.
         else:
-            start = rng.choice(['1M', '4M', '16M'])
+            # qcow2 grow sizes include 256M / 1G after followup-01
+            # lifted the stage-all refcount-block ceiling; both
+            # tools handle these sparse-only-file sizes in well
+            # under the differential harness's 30s timeout.
+            start = rng.choice(['1M', '4M', '16M', '256M'])
             # Pick end form: absolute, additive, or subtractive.
             form = rng.choice(['abs', 'add', 'sub'])
             if form == 'abs':
-                end = rng.choice(['4M', '16M', '64M'])
+                end = rng.choice(['4M', '16M', '64M', '256M', '1G'])
                 if _resize_parse_qemu_size(end) == _resize_parse_qemu_size(start):
-                    end = '64M'
+                    end = '1G'
             elif form == 'add':
-                end = rng.choice(['+1M', '+15M', '+63M'])
+                end = rng.choice(['+1M', '+15M', '+63M', '+256M'])
             else:
                 start_b = _resize_parse_qemu_size(start)
                 # Pick a delta that keeps end > 0.
