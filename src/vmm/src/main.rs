@@ -3232,8 +3232,11 @@ fn map_resize_error(code: u32) -> String {
         RESIZE_RESULT_ERROR_WRITE_FAILED => "I/O error writing the image".into(),
         RESIZE_RESULT_ERROR_PARSE_FAILED => "the image header could not be parsed".into(),
         RESIZE_RESULT_ERROR_HEADER_MISMATCH => {
-            "the image's current virtual size changed between host and \
-             guest read; retry the operation"
+            "the image's metadata is internally inconsistent or \
+             changed between the host's pre-probe and the guest's \
+             read (concurrent modification, a pathological image, \
+             or a planner accounting bug); retry the operation, or \
+             run `instar check` if the image may be corrupt"
                 .into()
         }
         _ => format!("unknown resize error code {code}"),

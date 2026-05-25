@@ -59,12 +59,24 @@ pub enum ResizeError {
     /// to operate on it until the user runs `instar check` and
     /// resolves the inconsistency.
     RequiresCheckFirst,
-    /// The opts the planner received describe a geometry that
-    /// doesn't agree with what the host pre-populated in
-    /// `ResizeConfig.current_virtual_size`. Either the file
-    /// changed between the host's pre-probe and the guest's
-    /// read, or a host bug. The guest surfaces this so the host
-    /// can render a specific diagnostic.
+    /// The image's staged metadata is internally inconsistent or
+    /// disagrees with what the host pre-populated. Covers several
+    /// underlying conditions, all of which present as "we can't
+    /// safely plan from what we have":
+    ///
+    /// * `current_virtual_size` from the host disagrees with the
+    ///   guest's parse of the existing header (race between host
+    ///   pre-probe and guest read, or a host bug);
+    /// * a qcow2 file size that isn't a multiple of `cluster_size`
+    ///   (impossible for a sound image);
+    /// * a qcow2 refcount-table entry the planner needs to update
+    ///   is zero (a pre-pass / planner accounting bug, or a
+    ///   pathological image);
+    /// * vhd / vhdx / vmdk header or footer fields that disagree
+    ///   with what the host pre-probed.
+    ///
+    /// The host surfaces a single diagnostic for the whole class
+    /// rather than trying to distinguish them.
     HeaderMismatch,
     /// A format-specific parser (`vhd::VhdFooter::parse`,
     /// `vhd::VhdDynamicHeader::parse`, etc.) failed to interpret

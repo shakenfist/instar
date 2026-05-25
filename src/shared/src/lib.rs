@@ -2359,9 +2359,9 @@ pub struct ResizeConfig {
 
     /// Current virtual size in bytes. The host populates this
     /// from the existing image's header before launching the
-    /// guest; the guest cross-checks against its own parse and
-    /// errors out with [`ResizeResult::ERROR_HEADER_MISMATCH`]
-    /// on mismatch.
+    /// guest; if the guest's own parse disagrees, that mismatch
+    /// is one of the conditions surfaced via
+    /// [`ResizeResult::ERROR_HEADER_MISMATCH`].
     pub current_virtual_size: u64,
     /// Requested new virtual size in bytes. The host resolves
     /// `[+-]SIZE` syntax to an absolute byte count before
@@ -2496,10 +2496,15 @@ impl ResizeResult {
     pub const ERROR_READ_FAILED: u32 = 10;
     pub const ERROR_WRITE_FAILED: u32 = 11;
     pub const ERROR_PARSE_FAILED: u32 = 12;
-    /// The host pre-populated `current_virtual_size` differs
-    /// from what the guest parsed out of the existing header.
-    /// Indicates either a race (the file changed between the
-    /// host's pre-probe and the guest's read) or a host bug.
+    /// The image's staged metadata is internally inconsistent or
+    /// disagrees with the host's pre-probe. Returned for: a
+    /// host/guest `current_virtual_size` mismatch (race or host
+    /// bug); a qcow2 file size that isn't a multiple of
+    /// `cluster_size`; a qcow2 refcount-table entry the planner
+    /// needs to update being zero; or vhd / vhdx / vmdk header
+    /// fields that disagree with what the host pre-probed. See
+    /// the `HeaderMismatch` variant in `crates/resize` for the
+    /// authoritative breakdown.
     pub const ERROR_HEADER_MISMATCH: u32 = 13;
 
     /// True if magic matches.
