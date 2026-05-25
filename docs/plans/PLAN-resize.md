@@ -823,8 +823,18 @@ reviewers can find every queued item in one place. Mirrored in
   clusters overflow it with even modest virtual sizes
   (`image too large for the resize scratch buffer`). The
   differential fuzz picker filters the combination today.
+- **Targeted shrink-side pre-pass** (followup-01 set the
+  precedent for grow). Today the guest stages every non-zero
+  refcount block before the L2 walk for the shrink path,
+  retaining the per-cluster-size image-size ceiling
+  followup-01 lifted for grow (~128 GiB at default cluster).
+  Lifting it requires a two-phase shrink pre-pass: walk L2
+  tables first to identify which clusters will be discarded,
+  then stage only the refcount blocks containing those
+  clusters.  Comparable design effort to followup-01.
 - **Planner-side defensive checks for inconsistent host
-  inputs** (phase 12 finding). The VHDX planner can return
+  inputs** (phase 12 finding, partially addressed by
+  followup-01d's vmdk fix). The VHDX planner can return
   `Ok(plan { total_file_size: 0 })` when the host passes
   impossibly small file sizes relative to the metadata
   region's offset. Not reachable from real callers (the host

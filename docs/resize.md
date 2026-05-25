@@ -70,6 +70,18 @@ by `tests/test_resize.py:TestResizeBaselineMatrix`). For vmdk / vpc
 post-resize state is verified by `tests/test_resize.py:TestResize
 Consistency` (instar resize → instar info → instar check).
 
+**Image-size ceiling.** qcow2 grow is bounded only by what the
+filesystem can hold — followup-01's targeted refcount-block
+pre-pass keeps the guest's metadata staging budget O(1) blocks
+regardless of image size. Tested end-to-end through 1 TiB → 2 TiB
+in under 200 ms (`tests/test_resize.py:TestResizeLargeImages`).
+qcow2 shrink retains the older "stage every non-zero refcount
+block" pre-pass and so retains a per-cluster-size ceiling
+(~128 GiB at the default 64 KiB cluster); lifting it is the next
+follow-up in the Future-work section below. Raw / vmdk / vpc /
+vhdx have no analogous metadata-staging step and are bounded
+only by filesystem capacity.
+
 ## Output format
 
 Human (default):
@@ -195,12 +207,22 @@ The create-side carry-forwards are listed in
   cluster_size with even modest virtual sizes overflows the
   scratch buffer (`image too large for the resize scratch
   buffer`). The picker filters the combination today.
+- Targeted shrink-side refcount-block pre-pass. Followup-01
+  lifted the per-cluster-size image-size ceiling for qcow2
+  *grow* by staging only the refcount blocks the chosen flavour
+  will touch.  Shrink retains the old "stage every non-zero
+  block" pre-pass and so retains the ceiling (~128 GiB at the
+  default 64 KiB cluster).  Lifting it requires a two-phase
+  shrink pre-pass: walk L2 tables first to identify which
+  clusters will be discarded, then stage only the refcount
+  blocks containing those clusters.
 - Planner-side defensive checks for inconsistent host inputs
-  (phase 12 finding). The VHDX planner can return
+  (phase 12 finding; partially addressed by followup-01d's
+  vmdk `checked_mul`). The VHDX planner can return
   `Ok(plan { total_file_size: 0 })` when the host passes
   impossibly small file sizes — not reachable from real callers
   (the host derives `current_file_size` from `stat()`) but worth
-  hardening.
+  hardening; similar shapes elsewhere need a systematic sweep.
 - Re-parse round-trip in `fuzz_resize_planners`: reconstruct a
   faithful starting image from the fuzzer's synthetic
   existing-state bytes and re-parse with the matching format

@@ -1121,6 +1121,29 @@ revision attached the output at slot 0, which broke the
 guest's `init stage=probe device=output address=0x10001000`
 walk. Caught and fixed before phase 11 landed.
 
+### qcow2 grow has no image-size ceiling; qcow2 shrink does
+
+After followup-01, qcow2 *grow* is bounded only by what the
+filesystem can hold — the guest's targeted pre-pass stages a
+small bounded set of refcount blocks (≤ 16) regardless of
+image size. Tested end-to-end through 1 TiB → 2 TiB in 163 ms.
+
+qcow2 *shrink* still uses the older "stage every non-zero
+refcount block" pre-pass and so retains a per-cluster-size
+ceiling: 4 MiB of `EXISTING_STATE` divided by `cluster_size`
+gives the maximum number of refcount blocks stage-able, each
+covering `cluster_size² / 2` bytes of file. At the default
+64 KiB cluster the ceiling is ~128 GiB; at 4 KiB it's ~8 GiB;
+at 1 MiB it's ~512 TiB (no practical limit). Lifting it
+requires a two-phase shrink pre-pass that walks the L2 tables
+first to identify which clusters are discarded, then stages
+only the refcount blocks containing those clusters; queued
+under PLAN-resize.md Future-work as a separate followup.
+
+Raw / vmdk / vpc / vhdx grow and shrink have no analogous
+metadata-staging step and are bounded only by filesystem
+capacity.
+
 ## Future Additions
 
 Additional quirks will be documented here as they are discovered during

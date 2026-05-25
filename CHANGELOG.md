@@ -135,6 +135,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   invocations.
   ([phase 12](docs/plans/PLAN-resize-phase-12-fuzz.md))
 
+- **Lifted the qcow2 grow image-size ceiling.** The original
+  resize guest pre-pass staged every non-zero refcount block
+  referenced by the existing image's refcount table — bounded
+  by the 4 MiB EXISTING_STATE region, this imposed a
+  per-cluster-size image-size ceiling (~128 GiB at the default
+  64 KiB cluster). Followup-01 introduces a new public
+  `compute_qcow2_grow_query` planner helper that identifies the
+  *exact* refcount blocks each grow flavour (HeaderOnly /
+  L1Grow / L1AndRefcountGrow) will demand via
+  `ensure_block_staged`, bounded by `QCOW2_MAX_REQUIRED_BLOCKS
+  = 16` regardless of image size. The guest pre-pass calls it
+  before reading any refcount-block bytes and stages exactly
+  the returned set. The qcow2 grow ceiling is now bounded only
+  by what the filesystem can hold; tested through 1 TiB → 2 TiB
+  in 163 ms. Shrink retains the older stage-all pre-pass and
+  its per-cluster-size ceiling; lifting that is queued as a
+  separate follow-up. New `tests/test_resize.py:TestResizeLarge
+  Images` exercises 256 GiB / 500 GiB / 1 TiB / 2 TiB grows
+  end-to-end through the VMM; new `qcow2_grow_large.rs`
+  integration test exercises the planner directly with the
+  targeted stage list. Fuzz size clamp for qcow2 in
+  `fuzz_resize_planners` lifted from 40 to 48 bits (1 TiB to
+  256 TiB); differential picker adds 256M and 1G qcow2 sizes.
+  Drive-by fix: a vmdk planner-input overflow surfaced by the
+  larger coverage smoke
+  (`header_capacity_sectors * SECTOR` near u64::MAX) is now
+  guarded by `checked_mul`.
+  ([followup-01](docs/plans/PLAN-resize-followup-01-targeted-prepass.md))
+
 - **New `instar create` subcommand.** Creates a new empty disk
   image of a given format and size:
   `instar create [-f FMT] [OPTIONS] FILENAME [SIZE]`. Raw output
