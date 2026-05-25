@@ -22,9 +22,10 @@
 use core::panic::PanicInfo;
 
 use resize::{
-    plan_resize_qcow2, plan_resize_raw, plan_resize_vhd, plan_resize_vhdx, plan_resize_vmdk,
-    Preallocation, Qcow2ResizeOpts, RawResizeOpts, ResizeAction, ResizeError, ResizePatch,
-    ResizePlan, VhdResizeOpts, VhdSubformat, VhdxResizeOpts, VmdkResizeOpts, VmdkSubformat,
+    compute_qcow2_grow_query, plan_resize_qcow2, plan_resize_raw, plan_resize_vhd,
+    plan_resize_vhdx, plan_resize_vmdk, Preallocation, Qcow2ResizeGrowQuery, Qcow2ResizeOpts,
+    RawResizeOpts, ResizeAction, ResizeError, ResizePatch, ResizePlan, VhdResizeOpts, VhdSubformat,
+    VhdxResizeOpts, VmdkResizeOpts, VmdkSubformat, QCOW2_MAX_REQUIRED_BLOCKS,
 };
 use shared::{
     be_u64, format_detection::detect_format_from_header, le_u32, le_u64, validate_call_table,
@@ -379,26 +380,73 @@ unsafe fn run_qcow2(
         return err_result(config, ResizeResult::ERROR_READ_FAILED);
     }
 
-    // Determine which refcount blocks the planner needs.  Phase 7c
-    // stages every block referenced by the refcount table — covers
-    // every grow/shrink case at the cost of bandwidth.  Large
-    // images can blow EXISTING_STATE_LIMIT; we return
-    // ScratchTooSmall in that case.
+    // Identify which refcount blocks the planner needs.  Two
+    // paths:
+    //
+    // * Grow: call `compute_qcow2_grow_query` to get the *exact*
+    //   set of distinct block indices the chosen grow flavour
+    //   will demand via `ensure_block_staged`.  Bounded by
+    //   `QCOW2_MAX_REQUIRED_BLOCKS` (16) regardless of image
+    //   size — this is what lifts the historic ~128 GiB ceiling
+    //   at the default 64 KiB cluster size.
+    //
+    // * Shrink: keep the legacy stage-every-non-zero-block scan.
+    //   The targeted approach for shrink would need the L2 walk
+    //   to decide which clusters are discarded; doing that here
+    //   would duplicate planner logic.  Shrink retains the
+    //   per-cluster-size image-size ceiling pending a separate
+    //   follow-up (PLAN-resize.md Future work).
     let rt_slice = core::slice::from_raw_parts(state_base.add(rt_off), rt_bytes);
-    const MAX_RB_INDICES: usize = 1024;
-    let mut block_indices: [u64; MAX_RB_INDICES] = [0; MAX_RB_INDICES];
-    let mut block_count: usize = 0;
-    let mut i = 0;
-    while i + 8 <= rt_slice.len() {
-        let entry = be_u64(rt_slice, i);
-        if entry != 0 {
-            if block_count >= MAX_RB_INDICES {
-                return err_result(config, ResizeResult::ERROR_SCRATCH_TOO_SMALL);
+    let is_grow = config.new_virtual_size >= config.current_virtual_size;
+
+    // Storage for the block-index list (size depends on path).
+    let mut grow_blocks: [u64; QCOW2_MAX_REQUIRED_BLOCKS] = [0; QCOW2_MAX_REQUIRED_BLOCKS];
+    const MAX_SHRINK_RB_INDICES: usize = 1024;
+    let mut shrink_blocks: [u64; MAX_SHRINK_RB_INDICES] = [0; MAX_SHRINK_RB_INDICES];
+    let block_count: usize;
+    let block_indices: &[u64];
+
+    if is_grow {
+        let query = Qcow2ResizeGrowQuery {
+            cluster_size: parsed.cluster_size as u32,
+            refcount_bits: parsed.refcount_bits as u8,
+            extended_l2: parsed.extended_l2,
+            current_virtual_size: config.current_virtual_size,
+            new_virtual_size: config.new_virtual_size,
+            current_file_size: file_size_before,
+            current_l1_entries: parsed.l1_size,
+            current_l1_table_offset: parsed.l1_table_offset,
+            current_refcount_table_offset: parsed.refcount_table_offset,
+            current_refcount_table_clusters: parsed.refcount_table_clusters,
+            current_incompatible_features: parsed.incompatible_features,
+            preallocation: map_prealloc(config.flags),
+            allow_shrink: config.allow_shrink(),
+            existing_refcount_table_bytes: rt_slice,
+        };
+        let qres = match compute_qcow2_grow_query(&query) {
+            Ok(q) => q,
+            Err(e) => return err_result(config, map_error(e)),
+        };
+        grow_blocks = qres.required_blocks;
+        block_count = qres.required_blocks_len;
+        block_indices = &grow_blocks[..block_count];
+    } else {
+        // Legacy stage-all scan for shrink.
+        let mut count: usize = 0;
+        let mut i = 0;
+        while i + 8 <= rt_slice.len() {
+            let entry = be_u64(rt_slice, i);
+            if entry != 0 {
+                if count >= MAX_SHRINK_RB_INDICES {
+                    return err_result(config, ResizeResult::ERROR_SCRATCH_TOO_SMALL);
+                }
+                shrink_blocks[count] = (i / 8) as u64;
+                count += 1;
             }
-            block_indices[block_count] = (i / 8) as u64;
-            block_count += 1;
+            i += 8;
         }
-        i += 8;
+        block_count = count;
+        block_indices = &shrink_blocks[..block_count];
     }
 
     let blocks_off = rt_end;
@@ -406,7 +454,7 @@ unsafe fn run_qcow2(
     if blocks_off + blocks_total > EXISTING_STATE_LIMIT {
         return err_result(config, ResizeResult::ERROR_SCRATCH_TOO_SMALL);
     }
-    for (slot, &block_idx) in block_indices[..block_count].iter().enumerate() {
+    for (slot, &block_idx) in block_indices.iter().enumerate() {
         let block_file_off = be_u64(rt_slice, (block_idx as usize) * 8);
         if !read_byte_range(
             call_table,
