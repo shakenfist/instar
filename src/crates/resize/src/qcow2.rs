@@ -48,6 +48,66 @@ pub(crate) fn decide_action(
     }
 }
 
+/// Compute the actual refcount-block and refcount-table requirements
+/// for a resize-by-append (the strategy both L1Grow and
+/// L1AndRefcountGrow follow). Returns
+/// `(block_count, table_clusters, new_total_clusters)`.
+///
+/// `compute_layout` models a *compact fresh build* at the target
+/// virtual size, so it under-counts refcount requirements for the
+/// append strategy: a resize appends new L1 / RT / RB regions at
+/// the existing EOF and leaves the old L1 in place (decremented to
+/// refcount 0, but still occupying clusters). So the post-resize
+/// file is larger than a fresh image of the same virtual size and
+/// may need more RBs (and occasionally a bigger RT) to refcount
+/// itself.
+///
+/// Fixed-point iterates because each added RB / RT cluster grows
+/// the file, which in turn may require another RB. Bounded by the
+/// post-resize cluster count, so it terminates after a handful of
+/// iterations.
+pub(crate) fn compute_append_requirements(
+    current_file_size: u64,
+    cluster_size: u64,
+    refcount_bits: u8,
+    target_l1_clusters: u64,
+    current_refcount_table_clusters: u64,
+    existing_block_count: u64,
+) -> (u64, u64, u64) {
+    let entries_per_refblock: u64 = (cluster_size * 8) / refcount_bits as u64;
+    let new_l1_size_bytes = target_l1_clusters * cluster_size;
+    let current_rt_clusters = current_refcount_table_clusters.max(1);
+
+    let mut block_count = existing_block_count.max(1);
+    let mut table_clusters = current_rt_clusters;
+    loop {
+        let table_grows = table_clusters > current_rt_clusters;
+        let new_table_bytes = if table_grows {
+            table_clusters * cluster_size
+        } else {
+            0
+        };
+        let new_blocks_delta = block_count.saturating_sub(existing_block_count);
+        let new_blocks_bytes = new_blocks_delta * cluster_size;
+        let total_file_size =
+            current_file_size + new_l1_size_bytes + new_table_bytes + new_blocks_bytes;
+        let new_total_clusters = total_file_size / cluster_size;
+
+        let needed_block_count = new_total_clusters
+            .div_ceil(entries_per_refblock)
+            .max(existing_block_count.max(1));
+        let needed_table_clusters = (needed_block_count * 8)
+            .div_ceil(cluster_size)
+            .max(current_rt_clusters);
+
+        if needed_block_count == block_count && needed_table_clusters == table_clusters {
+            return (block_count, table_clusters, new_total_clusters);
+        }
+        block_count = needed_block_count;
+        table_clusters = needed_table_clusters;
+    }
+}
+
 // ----------------------------------------------------------------
 // Targeted refcount-block pre-pass query (followup-01).
 // ----------------------------------------------------------------
@@ -106,13 +166,39 @@ pub(crate) fn compute_grow_query(
     .map_err(map_qcow2_create_err)?;
 
     let existing_block_count = count_existing_refcount_blocks(q.existing_refcount_table_bytes);
+
+    // Use append-aware RB/RT counts (not target_layout's fresh-build
+    // counts) when L1 grows — the appended L1 region can spill into
+    // refcount-block territory that a compact fresh build would not
+    // have needed, forcing L1AndRefcountGrow.
+    let l1_grows = target_layout.l1_entries > q.current_l1_entries;
+    let (effective_block_count, effective_table_clusters) = if l1_grows {
+        let target_l1_clusters = ((target_layout.l1_entries as u64) * 8)
+            .div_ceil(cluster_size)
+            .max(1);
+        let (bc, tc, _) = compute_append_requirements(
+            q.current_file_size,
+            cluster_size,
+            q.refcount_bits,
+            target_l1_clusters,
+            q.current_refcount_table_clusters as u64,
+            existing_block_count,
+        );
+        (bc, tc)
+    } else {
+        (
+            target_layout.refcount_block_count,
+            target_layout.refcount_table_clusters,
+        )
+    };
+
     let action = decide_action(
         q.current_l1_entries,
         q.current_refcount_table_clusters,
         existing_block_count,
         target_layout.l1_entries,
-        target_layout.refcount_table_clusters,
-        target_layout.refcount_block_count,
+        effective_table_clusters,
+        effective_block_count,
     );
 
     // Enumerate cluster ranges per flavour and dedupe to distinct
@@ -240,18 +326,26 @@ fn add_l1_and_refcount_growth_blocks(
     let new_l1_clusters = new_l1_size_bytes.div_ceil(cluster_size).max(1);
     let new_l1_offset = q.current_file_size;
 
-    let target_table_clusters = target_layout.refcount_table_clusters;
-    let table_grows = target_table_clusters > q.current_refcount_table_clusters as u64;
+    // Mirror plan_l1_and_refcount_grow's append-aware sizing.
+    let current_rt_clusters = q.current_refcount_table_clusters as u64;
+    let (effective_block_count, effective_table_clusters, _) = compute_append_requirements(
+        q.current_file_size,
+        cluster_size,
+        q.refcount_bits,
+        new_l1_clusters,
+        current_rt_clusters,
+        existing_block_count,
+    );
+    let table_relocates = effective_table_clusters > current_rt_clusters;
 
     let new_refcount_table_offset = new_l1_offset + new_l1_clusters * cluster_size;
-    let new_refcount_table_size = if table_grows {
-        target_table_clusters * cluster_size
+    let new_refcount_table_size = if table_relocates {
+        effective_table_clusters * cluster_size
     } else {
         0
     };
     let new_refcount_blocks_offset = new_refcount_table_offset + new_refcount_table_size;
-    let target_block_count = target_layout.refcount_block_count;
-    let new_block_count_delta = target_block_count.saturating_sub(existing_block_count);
+    let new_block_count_delta = effective_block_count.saturating_sub(existing_block_count);
     let new_refcount_blocks_size = new_block_count_delta * cluster_size;
     let total_file_size = new_refcount_blocks_offset + new_refcount_blocks_size;
     let new_total_clusters = total_file_size / cluster_size;
@@ -281,7 +375,7 @@ fn add_l1_and_refcount_growth_blocks(
     }
 
     // Cleanup: old refcount table (only if relocated).
-    if table_grows {
+    if table_relocates {
         let old_rt_first = q.current_refcount_table_offset / cluster_size;
         let old_rt_last_excl = old_rt_first + q.current_refcount_table_clusters as u64;
         for c in old_rt_first..old_rt_last_excl {
@@ -350,13 +444,36 @@ pub(crate) fn plan_grow<'a>(
     // have? Count non-zero entries in the refcount table.
     let existing_block_count = count_existing_refcount_blocks(opts.existing_refcount_table_bytes);
 
+    // Use append-aware RB/RT counts (not target_layout's fresh-build
+    // counts) when L1 grows — see compute_append_requirements.
+    let l1_grows = target_layout.l1_entries > opts.current_l1_entries;
+    let (effective_block_count, effective_table_clusters) = if l1_grows {
+        let target_l1_clusters = ((target_layout.l1_entries as u64) * 8)
+            .div_ceil(opts.cluster_size as u64)
+            .max(1);
+        let (bc, tc, _) = compute_append_requirements(
+            opts.current_file_size,
+            opts.cluster_size as u64,
+            opts.refcount_bits,
+            target_l1_clusters,
+            opts.current_refcount_table_clusters as u64,
+            existing_block_count,
+        );
+        (bc, tc)
+    } else {
+        (
+            target_layout.refcount_block_count,
+            target_layout.refcount_table_clusters,
+        )
+    };
+
     let action = decide_action(
         opts.current_l1_entries,
         opts.current_refcount_table_clusters,
         existing_block_count,
         target_layout.l1_entries,
-        target_layout.refcount_table_clusters,
-        target_layout.refcount_block_count,
+        effective_table_clusters,
+        effective_block_count,
     );
 
     match action {
@@ -850,16 +967,32 @@ fn plan_l1_and_refcount_grow<'a>(
     let new_l1_clusters = ((new_l1_entries as u64) * 8).div_ceil(cluster_size).max(1);
     let new_l1_size_bytes = new_l1_clusters * cluster_size;
 
-    let target_block_count = target_layout.refcount_block_count;
-    let new_block_count_delta = target_block_count.saturating_sub(existing_block_count);
-    let target_table_clusters = target_layout.refcount_table_clusters;
-    let table_grows = target_table_clusters > opts.current_refcount_table_clusters as u64;
+    // Derive refcount-block/table requirements for the resize-by-
+    // append strategy. target_layout models a *fresh compact build*
+    // which under-counts the append strategy's needs (the old L1
+    // region stays in place, growing the post-resize file).
+    let current_rt_clusters = opts.current_refcount_table_clusters as u64;
+    let (effective_block_count, effective_table_clusters, _new_total_clusters_est) =
+        compute_append_requirements(
+            opts.current_file_size,
+            cluster_size,
+            opts.refcount_bits,
+            new_l1_clusters,
+            current_rt_clusters,
+            existing_block_count,
+        );
+    let new_block_count_delta = effective_block_count.saturating_sub(existing_block_count);
+    let table_relocates = effective_table_clusters > current_rt_clusters;
+    // The existing RT also needs a Write patch when it stays in
+    // place but new RBs are added — the new RT entries pointing at
+    // the new blocks must be persisted before the header commit.
+    let table_updates_in_place = !table_relocates && new_block_count_delta > 0;
 
     // File layout post-resize.
     let new_l1_offset = opts.current_file_size;
     let new_refcount_table_offset = new_l1_offset + new_l1_size_bytes;
-    let new_refcount_table_size_bytes = if table_grows {
-        target_table_clusters * cluster_size
+    let new_refcount_table_size_bytes = if table_relocates {
+        effective_table_clusters * cluster_size
     } else {
         0
     };
@@ -868,25 +1001,26 @@ fn plan_l1_and_refcount_grow<'a>(
     let total_file_size = new_refcount_blocks_offset + new_refcount_blocks_size_bytes;
     let new_total_clusters = total_file_size / cluster_size;
 
-    let effective_table_offset = if table_grows {
+    let effective_table_offset = if table_relocates {
         new_refcount_table_offset
     } else {
         opts.current_refcount_table_offset
     };
-    let effective_table_clusters = if table_grows {
-        target_table_clusters
-    } else {
-        opts.current_refcount_table_clusters as u64
-    };
 
-    // Carve scratch: header (1 cluster) + new L1 + new RT + new
-    // RBs + per-existing-block staging slots.
+    // Carve scratch: header (1 cluster) + new L1 + RT staging
+    // (sized to the effective table when there's any RT patch) +
+    // new RBs + per-existing-block staging slots.
+    let rt_staging_bytes = if table_relocates || table_updates_in_place {
+        effective_table_clusters * cluster_size
+    } else {
+        0
+    };
     let header_off = 0usize;
     let header_end = cluster_size_us;
     let l1_off = header_end;
     let l1_end = l1_off + new_l1_size_bytes as usize;
     let table_off = l1_end;
-    let table_end = table_off + new_refcount_table_size_bytes as usize;
+    let table_end = table_off + rt_staging_bytes as usize;
     let blocks_off = table_end;
     let blocks_end = blocks_off + new_refcount_blocks_size_bytes as usize;
     if blocks_end > scratch.len() {
@@ -902,10 +1036,11 @@ fn plan_l1_and_refcount_grow<'a>(
         l1_buf[..copy_len].copy_from_slice(&opts.existing_l1_bytes[..copy_len]);
     }
 
-    // Build new refcount table region (if relocated). Old entries
-    // are copied from the existing table; new entries point at
-    // the appended block clusters.
-    if table_grows {
+    // Build the RT region — used by either the relocated Append
+    // (table_relocates) or the in-place Write (table_updates_in_place).
+    // Both flavours need the existing entries plus the new ones
+    // pointing at the newly-appended refcount blocks.
+    if table_relocates || table_updates_in_place {
         let table_buf = &mut scratch[table_off..table_end];
         table_buf.fill(0);
         let copy_len = opts
@@ -1050,9 +1185,11 @@ fn plan_l1_and_refcount_grow<'a>(
             MAX_CLEANUP_BLOCKS,
             &mut next_staging,
             cluster_size_us,
+            &overlap_slots,
+            overlap_count,
         )?;
     }
-    if table_grows {
+    if table_relocates {
         let old_rt_first = opts.current_refcount_table_offset / cluster_size;
         let old_rt_last_excl = old_rt_first + opts.current_refcount_table_clusters as u64;
         for c in old_rt_first..old_rt_last_excl {
@@ -1066,6 +1203,8 @@ fn plan_l1_and_refcount_grow<'a>(
                 MAX_CLEANUP_BLOCKS,
                 &mut next_staging,
                 cluster_size_us,
+                &overlap_slots,
+                overlap_count,
             )?;
         }
     }
@@ -1078,7 +1217,7 @@ fn plan_l1_and_refcount_grow<'a>(
         byte_offset: new_l1_offset,
         bytes: &scratch[l1_off..l1_end],
     })?;
-    if table_grows {
+    if table_relocates {
         plan.push(ResizePatch::Append {
             byte_offset: new_refcount_table_offset,
             bytes: &scratch[table_off..table_end],
@@ -1088,6 +1227,17 @@ fn plan_l1_and_refcount_grow<'a>(
         plan.push(ResizePatch::Append {
             byte_offset: new_refcount_blocks_offset,
             bytes: &scratch[blocks_off..blocks_end],
+        })?;
+    }
+    // In-place RT update: when the table stays at its existing
+    // location but new RB entries were added, write the updated
+    // table back to its existing offset (before the header commit,
+    // so a crash mid-flight still leaves a consistent RT once the
+    // header is rewritten).
+    if table_updates_in_place {
+        plan.push(ResizePatch::Write {
+            byte_offset: opts.current_refcount_table_offset,
+            bytes: &scratch[table_off..table_end],
         })?;
     }
 
@@ -1129,6 +1279,8 @@ fn stage_cleanup_decrement(
     max_blocks: usize,
     next_staging: &mut usize,
     cluster_size_us: usize,
+    overlap_slots: &[(u64, usize)],
+    overlap_count: usize,
 ) -> Result<(), ResizeError> {
     let block_idx = cluster_idx / entries_per_refblock;
     let local_idx = cluster_idx % entries_per_refblock;
@@ -1143,7 +1295,21 @@ fn stage_cleanup_decrement(
             return Err(ResizeError::ScratchTooSmall);
         }
         let new_off = allocate_staging(next_staging, scratch.len(), cluster_size_us)?;
-        ensure_block_staged(opts, block_idx, scratch, new_off, cluster_size_us)?;
+        // Seed the cleanup slot from the overlap slot if it exists
+        // — the Phase C write is the FINAL state and must include
+        // any Phase A increments to the same block. Without this,
+        // the cleanup write overwrites the overlap write because
+        // they target the same file offset.
+        if let Some(pos) = overlap_slots
+            .iter()
+            .take(overlap_count)
+            .position(|(idx, _)| *idx == block_idx)
+        {
+            let src_off = overlap_slots[pos].1;
+            scratch.copy_within(src_off..src_off + cluster_size_us, new_off);
+        } else {
+            ensure_block_staged(opts, block_idx, scratch, new_off, cluster_size_us)?;
+        }
         cleanup_slots[*cleanup_count] = (block_idx, new_off);
         *cleanup_count += 1;
         new_off

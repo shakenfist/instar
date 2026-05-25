@@ -211,6 +211,122 @@ fn grow_l1_and_refcount_table_extension() {
 }
 
 #[test]
+fn grow_l1_spillover_into_new_refcount_block() {
+    // Regression: differential fuzz iter 66 (seed 4165940029).
+    //
+    // 256 MiB at cluster_size=512: the fresh-build refcount layout
+    // for the target (257 MiB) still only needs one refcount block,
+    // so the old `decide_action` chose L1Grow. But L1Grow appends a
+    // 129-cluster L1 region at EOF (cluster 131 onwards), which
+    // crosses the existing block's 256-cluster coverage and demands
+    // a second refcount block. The planner then asked for a refcount
+    // block whose RT entry was zero, surfacing as HeaderMismatch.
+    //
+    // After the append-aware action decision, this scenario must
+    // pick L1AndRefcountGrow and produce a valid resize plan.
+    let (parsed, action, _) = round_trip(256 << 20, (256 << 20) + (1 << 20), 512);
+    assert_eq!(action, ResizeAction::Grow);
+    assert_eq!(parsed.virtual_size, (256 << 20) + (1 << 20));
+}
+
+#[test]
+fn grow_l1_spillover_updates_existing_rt_in_place() {
+    // Same shape as the regression above. The refcount table only
+    // has 1 cluster (64 entries) which is plenty for the 2 RBs we
+    // now need — so the table does not relocate, but its new entry
+    // for the second RB must still be written. Verify by parsing
+    // the resulting image and confirming RT entry [1] points to a
+    // valid in-file refcount block.
+    let (parsed, _action, bytes) = round_trip(256 << 20, (256 << 20) + (1 << 20), 512);
+    assert_eq!(parsed.refcount_table_clusters, 1);
+    let rt_off = parsed.refcount_table_offset as usize;
+    let entry0 = be_u64(&bytes, rt_off);
+    let entry1 = be_u64(&bytes, rt_off + 8);
+    assert_ne!(entry0, 0, "RT entry 0 should still point at block 0");
+    assert_ne!(entry1, 0, "RT entry 1 must point at the new block");
+    assert!(
+        (entry1 as usize) < bytes.len(),
+        "RT entry 1 must point inside the file (off=0x{:x}, len={})",
+        entry1,
+        bytes.len()
+    );
+}
+
+#[test]
+fn grow_l1_spillover_refcounts_are_consistent() {
+    // Verify the post-resize image's refcount blocks correctly
+    // refcount every cluster the new L1 region occupies and clear
+    // the refcount on the old L1 region. Mirrors `qemu-img check`.
+    let (parsed, _action, bytes) = round_trip(256 << 20, (256 << 20) + (1 << 20), 512);
+    let cluster_size = parsed.cluster_size;
+    let rb_entries = cluster_size * 8 / parsed.refcount_bits as u64;
+    let rt_off = parsed.refcount_table_offset as usize;
+    let rt_bytes =
+        &bytes[rt_off..rt_off + parsed.refcount_table_clusters as usize * cluster_size as usize];
+
+    // Walk every cluster, look up its refcount, and check that
+    // metadata clusters (header / L1 / RT / RBs) and L2 entries
+    // referenced by L1 are all refcount>=1, while old-L1 clusters
+    // we deliberately dropped are 0.
+    let refcount_of = |cluster: u64| -> u64 {
+        let block_idx = cluster / rb_entries;
+        let local_idx = cluster % rb_entries;
+        let rb_off = be_u64(rt_bytes, (block_idx * 8) as usize);
+        if rb_off == 0 {
+            return 0;
+        }
+        let entry_off = rb_off as usize + (local_idx as usize) * 2;
+        u16::from_be_bytes([bytes[entry_off], bytes[entry_off + 1]]) as u64
+    };
+
+    let header_cluster = 0;
+    assert!(refcount_of(header_cluster) >= 1, "header cluster");
+
+    let new_l1_first = parsed.l1_table_offset / cluster_size;
+    let new_l1_size_bytes = (parsed.l1_size as u64) * 8;
+    let new_l1_clusters = new_l1_size_bytes.div_ceil(cluster_size);
+    for c in new_l1_first..new_l1_first + new_l1_clusters {
+        assert!(
+            refcount_of(c) >= 1,
+            "new L1 cluster {c} must be refcounted (got {})",
+            refcount_of(c)
+        );
+    }
+
+    let rt_cluster_first = parsed.refcount_table_offset / cluster_size;
+    for c in rt_cluster_first..rt_cluster_first + parsed.refcount_table_clusters as u64 {
+        assert!(refcount_of(c) >= 1, "RT cluster {c}");
+    }
+
+    // Old L1 region: clusters 1..=128 in this scenario. Iterate
+    // until we hit the new L1's first cluster.
+    for c in 1..new_l1_first {
+        // Skip any cluster that's actually a referenced RB.
+        let mut is_rb = false;
+        for i in 0..parsed.refcount_table_clusters as u64 * (cluster_size / 8) {
+            let rb_off = be_u64(rt_bytes, (i * 8) as usize);
+            if rb_off != 0 && rb_off / cluster_size == c {
+                is_rb = true;
+                break;
+            }
+        }
+        if is_rb {
+            continue;
+        }
+        // Skip RT clusters.
+        if c >= rt_cluster_first && c < rt_cluster_first + parsed.refcount_table_clusters as u64 {
+            continue;
+        }
+        assert_eq!(
+            refcount_of(c),
+            0,
+            "old-L1 cluster {c} must be decremented to 0 (got {})",
+            refcount_of(c)
+        );
+    }
+}
+
+#[test]
 fn noop_when_sizes_equal() {
     let (bytes, header) = build_starting_image(1 << 20, 65536);
     let opts = opts_from_image(&bytes, &header, 1 << 20, Preallocation::Off, false);
