@@ -27,11 +27,11 @@ Initial target formats:
 
 **Initial implementation** - The `info` prototype has been promoted to the main
 instar implementation in `src/`. Operations include `info`, `copy`, `check`,
-`compare`, `convert`, `measure`, and `create`. Prototypes remain available
-for reference.
+`compare`, `convert`, `measure`, `create`, and `resize`. Prototypes remain
+available for reference.
 
-See [docs/measure.md](docs/measure.md) and [docs/create.md](docs/create.md)
-for the per-subcommand user guides.
+See [docs/measure.md](docs/measure.md), [docs/create.md](docs/create.md),
+and [docs/resize.md](docs/resize.md) for the per-subcommand user guides.
 
 ## Installation
 
@@ -490,6 +490,21 @@ make test-container-convert-vhd      # VHD/VHDX convert (slowest)
 make clean-tests
 ```
 
+**Fuzz Testing:**
+```bash
+# Build a single coverage-guided fuzz target (uses the devcontainer)
+make fuzz-build FUZZ_TARGET=fuzz_resize_planners
+
+# Build every coverage-guided fuzz target
+make fuzz-build
+
+# Run a single target for a bounded wall-clock budget (seconds; default 60)
+make fuzz-run FUZZ_TARGET=fuzz_resize_planners FUZZ_DURATION=300
+```
+
+See the "Coverage-Guided Fuzzing" section below for the target list and the
+nightly CI rotation.
+
 The integration tests compare `instar info` output against `qemu-img info` to
 verify drop-in replacement compatibility, validate `instar check` against
 deliberately corrupt test images, cross-validate `instar compare` output
@@ -529,7 +544,7 @@ instar/
 │   │   ├── vhdx/   # VHDX headers, region table, metadata, BAT, CRC-32C
 │   │   ├── vmdk/   # VMDK4 header and descriptor parsing
 │   │   └── luks/   # LUKS header parsing, KDF, AFsplitter, decryption
-│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, measure, create)
+│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, measure, create, resize)
 │   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates
 │   └── guest-protocol/ # Protocol Buffers messaging for guests
@@ -726,9 +741,10 @@ cd src/fuzz
 cargo fuzz run fuzz_qcow2_header -- -max_total_time=60
 ```
 
-13 fuzz targets cover all parser crates (QCOW2, VMDK, VHD, VHDX, RAW,
+17 fuzz targets cover all parser crates (QCOW2, VMDK, VHD, VHDX, RAW,
 LUKS) including header parsing, L1/L2 lookup, refcount traversal, and
-decompression. Seed the corpus from `instar-testdata`:
+decompression, plus the create and resize planners. Seed the corpus
+from `instar-testdata`:
 
 ```bash
 python3 scripts/extract-fuzz-corpus.py --testdata /path/to/instar-testdata

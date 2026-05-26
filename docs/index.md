@@ -45,6 +45,7 @@ Features unique to instar that do not exist in qemu-img.
 | [Chain Config Protocol](chain-config.md) | Chain config structure layout and VMM-to-guest data flow |
 | [Measure](measure.md) | `instar measure` - predict file size for a target format |
 | [Create](create.md) | `instar create` - create a new empty disk image |
+| [Resize](resize.md) | `instar resize` - change a disk image's virtual size |
 
 ## Compatibility
 

@@ -9,6 +9,161 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **New `instar resize` subcommand.** Changes the virtual size of
+  an existing disk image in place:
+  `instar resize [-f FMT] [--shrink] [--preallocation MODE] [-q]
+  [--output FORMAT] FILENAME [+-]SIZE[bkKMGTPE]`. Raw resize is
+  host-only (open `O_RDWR` + ftruncate + optional preallocation
+  post-pass); qcow2 / vmdk / vpc (VHD) / vhdx run the new
+  `resize.bin` guest in the KVM sandbox, which reads the existing
+  header, plans the metadata mutation, and applies patches via
+  virtio-block. The `[+-]SIZE` end-spec grammar matches qemu-img
+  exactly: bare `64M` is absolute, `+1G` is additive,
+  `-512M` is subtractive (and requires `--shrink`).
+  Per-format support: qcow2 grow + shrink (`--shrink` required for
+  shrink), vmdk monolithicSparse grow only, vhd dynamic + fixed
+  grow only, vhdx dynamic grow only, raw grow + shrink. Format
+  auto-detection from the file's magic bytes when `-f` is omitted.
+  Preallocation modes for grow (`--preallocation` or
+  `-o preallocation=...`): `off` (any format, default),
+  `falloc` / `full` (raw + qcow2 — host applies `posix_fallocate`
+  or `fallocate(FALLOC_FL_ZERO_RANGE)` over the newly-added file
+  region, with a `pwrite` zero-fill fallback for filesystems that
+  reject `FALLOC_FL_ZERO_RANGE`). The host-side post-pass
+  deliberately preallocates only the appended file region rather
+  than the entire data region of the new virtual size; full
+  data-region parity with qemu is queued under Future work. Shrink
+  combined with `--preallocation=falloc|full` is rejected outright
+  with a clear message (qemu silently accepts and discards the
+  flag); `--preallocation=metadata` on raw is rejected (qemu
+  accepts-but-no-ops). For vmdk / vpc / vhdx — formats `qemu-img
+  resize` rejects with "Image format driver does not support
+  resize" on every shipped version — instar resize works
+  end-to-end, with coverage from the internal consistency suite
+  (`TestResizeConsistency`) rather than a cross-tool diff.
+  Output: `Image resized.` literal (matches qemu byte-for-byte)
+  or `--output=json` for a structured envelope (filename, format,
+  action ∈ {grow,shrink,noop}, old/new virtual size, new file
+  size). `-q` suppresses both on success.
+  See [docs/resize.md](docs/resize.md) for the full reference.
+  ([phase 1](docs/plans/PLAN-resize-phase-01-skeleton.md) ·
+  [phase 2](docs/plans/PLAN-resize-phase-02-qcow2-grow.md) ·
+  [phase 3](docs/plans/PLAN-resize-phase-03-qcow2-shrink.md) ·
+  [phase 4](docs/plans/PLAN-resize-phase-04-vhd.md) ·
+  [phase 5](docs/plans/PLAN-resize-phase-05-vhdx.md) ·
+  [phase 6](docs/plans/PLAN-resize-phase-06-vmdk.md) ·
+  [phase 7](docs/plans/PLAN-resize-phase-07-guest-op.md) ·
+  [phase 8](docs/plans/PLAN-resize-phase-08-host-cli.md) ·
+  [phase 9](docs/plans/PLAN-resize-phase-09-preallocation.md) ·
+  [phase 10](docs/plans/PLAN-resize-phase-10-baselines.md) ·
+  [phase 11](docs/plans/PLAN-resize-phase-11-integration-tests.md) ·
+  [phase 12](docs/plans/PLAN-resize-phase-12-fuzz.md) ·
+  [phase 13](docs/plans/PLAN-resize-phase-13-docs.md))
+
+- **Supporting library and crate-level pieces for resize.** New
+  `crates/resize/` (no_std, pure-function per-format planners:
+  `plan_resize_raw`, `plan_resize_qcow2`, `plan_resize_vmdk`,
+  `plan_resize_vhd`, `plan_resize_vhdx`) with a structured
+  `ResizePlan` carrying up to 128 `ResizePatch` entries
+  (`Write` / `Append` / `ZeroFill`). New `ResizeConfig` /
+  `ResizeResult` structs in `shared`, a new
+  `ResizeResultMessage` protobuf field, two new CallTable
+  function pointers (`read_output_sector` for in-place reads
+  from the output device — reusable by future operations like
+  rebase / commit; `send_resize_result` for the result envelope).
+  ([phase 1](docs/plans/PLAN-resize-phase-01-skeleton.md) ·
+  [phase 7](docs/plans/PLAN-resize-phase-07-guest-op.md))
+
+- **Cross-version `qemu-img resize` baselines** committed to
+  `instar-testdata/expected-outputs/resize-info-json/` for 80
+  qemu-img versions (6.0.0 through 10.2.0). 41 cases per
+  version (qcow2: 19, vmdk: 3, vhd: 6, vhdx: 5, raw: 8) capture
+  `qemu-img create` → `qemu-img resize` → `qemu-img info` as the
+  comparable artefact; the 16 vmdk/vhd/vhdx cases per version
+  record qemu's "Image format driver does not support resize"
+  rejection verbatim, documenting the cross-tool coverage gap
+  and acting as a tripwire if qemu ever lifts the restriction.
+  `instar-testdata`'s `scripts/generate-baselines.py` learns a
+  new `resize` command + `resize-info-json` output type plus an
+  on-demand `baselines-resize` Makefile target.
+  ([phase 10](docs/plans/PLAN-resize-phase-10-baselines.md))
+
+- **Integration test matrix for `instar resize`.** New
+  `tests/test_resize.py` (~900 lines, 114 tests) covering six
+  surfaces: (1) `TestResizeBaselineMatrix` — per-`(target, case)`
+  diff of `instar create` → `instar resize` → `qemu-img info`
+  against the phase-10 baseline (22 active for qcow2 + raw, 16
+  skipped where qemu rejects, with `KNOWN_RESIZE_DIVERGENCES`
+  documenting the rest); (2) schema-drift tripwire confirming
+  the in-test case mirror matches the testdata generator's
+  output; (3) `TestResizeCrossValidation` — 7 curated cases
+  comparing instar end-to-end against the live qemu-img via
+  `instar info` on both outputs; (4) `TestResizeRoundTripCheck`
+  — `instar create → resize → check` across the full matrix
+  catching reader/writer self-disagreement; (5)
+  `TestResizeConsistency` — the 14 vmdk/vhd/vhdx cases qemu
+  can't resize, verified via `instar info` virtual-size match
+  + `instar check`; (6) `TestResizeErrorPaths` — 9 fixed tests
+  pinning the host-CLI rejection contracts (shrink-without-flag,
+  invalid size strings, metadata-on-raw, falloc-with-shrink,
+  `--object` / `--image-opts`). The first matrix run surfaced
+  two latent regressions (non-raw resize device routing,
+  subtractive size CLI parsing) which were fixed in the same
+  branch — exactly what an integration suite exists to catch.
+  ([phase 11](docs/plans/PLAN-resize-phase-11-integration-tests.md))
+
+- **Fuzz coverage for `instar resize`.** New
+  `src/fuzz/fuzz_targets/fuzz_resize_planners.rs` coverage-guided
+  libFuzzer target that exercises every public planner in
+  `crates/resize/` with a structured 32-byte header decoded into
+  per-format opts plus synthetic existing-state byte slices.
+  Asserts plan-level invariants (patch count ≤ 128, no
+  `offset + len` overflow, every patch ends within
+  `total_file_size`, no overlapping Writes). Inputs are clamped
+  to a realistic 40-bit (1 TiB) envelope with an 8 MiB file-size
+  floor so the harness focuses on plausible host inputs rather
+  than wide-open u64 ranges. The differential harness adds an
+  `op_resize` operation that creates the same image twice
+  (instar + system qemu-img), runs the matching resize on each,
+  and compares via `qemu-img info` JSON. Picker restricted to
+  qcow2 + raw and biased away from documented planner gaps
+  (cluster_size=2 MiB scratch overflow, extended_l2 + non-Off
+  preallocation, qcow2 metadata preallocation). Both harnesses
+  picked up by the existing fuzz CI workflows; coverage-fuzz
+  bumped from 16 to 17 default targets. New `make fuzz-build`
+  / `fuzz-run` Makefile targets wrap the devcontainer
+  invocations.
+  ([phase 12](docs/plans/PLAN-resize-phase-12-fuzz.md))
+
+- **Lifted the qcow2 grow image-size ceiling.** The original
+  resize guest pre-pass staged every non-zero refcount block
+  referenced by the existing image's refcount table — bounded
+  by the 4 MiB EXISTING_STATE region, this imposed a
+  per-cluster-size image-size ceiling (~128 GiB at the default
+  64 KiB cluster). Followup-01 introduces a new public
+  `compute_qcow2_grow_query` planner helper that identifies the
+  *exact* refcount blocks each grow flavour (HeaderOnly /
+  L1Grow / L1AndRefcountGrow) will demand via
+  `ensure_block_staged`, bounded by `QCOW2_MAX_REQUIRED_BLOCKS
+  = 16` regardless of image size. The guest pre-pass calls it
+  before reading any refcount-block bytes and stages exactly
+  the returned set. The qcow2 grow ceiling is now bounded only
+  by what the filesystem can hold; tested through 1 TiB → 2 TiB
+  in 163 ms. Shrink retains the older stage-all pre-pass and
+  its per-cluster-size ceiling; lifting that is queued as a
+  separate follow-up. New `tests/test_resize.py:TestResizeLarge
+  Images` exercises 256 GiB / 500 GiB / 1 TiB / 2 TiB grows
+  end-to-end through the VMM; new `qcow2_grow_large.rs`
+  integration test exercises the planner directly with the
+  targeted stage list. Fuzz size clamp for qcow2 in
+  `fuzz_resize_planners` lifted from 40 to 48 bits (1 TiB to
+  256 TiB); differential picker adds 256M and 1G qcow2 sizes.
+  Drive-by fix: a vmdk planner-input overflow surfaced by the
+  larger coverage smoke
+  (`header_capacity_sectors * SECTOR` near u64::MAX) is now
+  guarded by `checked_mul`.
+  ([followup-01](docs/plans/PLAN-resize-followup-01-targeted-prepass.md))
+
 - **New `instar create` subcommand.** Creates a new empty disk
   image of a given format and size:
   `instar create [-f FMT] [OPTIONS] FILENAME [SIZE]`. Raw output

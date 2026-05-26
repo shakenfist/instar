@@ -18,6 +18,7 @@ raw = { path = "../crates/raw" }
 luks = { path = "../crates/luks" }
 measure = { path = "../crates/measure" }
 create = { path = "../crates/create" }
+resize = { path = "../crates/resize" }
 
 [profile.release]
 debug = true
@@ -119,5 +120,11 @@ test = false
 [[bin]]
 name = "fuzz_create_emitters"
 path = "fuzz_targets/fuzz_create_emitters.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "fuzz_resize_planners"
+path = "fuzz_targets/fuzz_resize_planners.rs"
 doc = false
 test = false

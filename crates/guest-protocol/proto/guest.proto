@@ -232,6 +232,27 @@ message CreateResultMessage {
   uint32 error = 6;
 }
 
+// Image resize result (from resize operation).
+message ResizeResultMessage {
+  // Target output format echoed back (e.g. "raw", "qcow2",
+  // "vmdk", "vhd", "vhdx").
+  string target_format = 1;
+  // Resolved new virtual disk size in bytes.
+  uint64 resolved_new_virtual_size = 2;
+  // File size before the host's post-pass `set_len` (the
+  // pre-resize EOF).
+  uint64 file_size_before = 3;
+  // File size after the guest's last patch (before the host
+  // post-pass).
+  uint64 file_size_after = 4;
+  // Action taken: "noop" | "grow" | "shrink". Matches
+  // ResizeResult::ACTION_* in src/shared/src/lib.rs.
+  string action = 5;
+  // Error code: 0 = ok, non-zero mirrors ResizeResult::ERROR_*
+  // in src/shared/src/lib.rs.
+  uint32 error = 6;
+}
+
 // Main message wrapper with level and payload
 message GuestMessage {
   Level level = 1;
@@ -246,5 +267,6 @@ message GuestMessage {
     CompareResultMessage compare_result = 9;
     MeasureResultMessage measure_result = 10;
     CreateResultMessage create_result = 11;
+    ResizeResultMessage resize_result = 12;
   }
 }

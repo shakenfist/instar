@@ -46,7 +46,7 @@ DATA_PATTERNS = ['zeros', 'random', 'sparse', 'mbr']
 
 # Operations that the fuzzer can chain together
 OPERATIONS = ['info', 'check', 'convert', 'convert_compressed', 'measure',
-              'create']
+              'create', 'resize']
 
 # Known divergence categories to skip (unsafe quirks)
 # See docs/quirks.md for rationale
@@ -1089,6 +1089,273 @@ def op_create(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
 
 
 # ---------------------------------------------------------------------------
+# Resize: shared helpers + picker + op
+# ---------------------------------------------------------------------------
+
+# qemu-img size-suffix grammar; ported from
+# instar-testdata/scripts/generate-baselines.py so the picker can
+# do byte-math for --shrink inference without parsing qemu's grammar.
+_RESIZE_SIZE_SUFFIX_MULTIPLIERS = {
+    'b': 512,
+    'k': 1024,
+    'K': 1024,
+    'M': 1024 ** 2,
+    'G': 1024 ** 3,
+}
+
+
+def _resize_parse_qemu_size(size_str):
+    """Parse a qemu-img SIZE string to bytes (M/G grammar subset)."""
+    s = size_str.strip()
+    if s[-1] in _RESIZE_SIZE_SUFFIX_MULTIPLIERS:
+        return int(s[:-1]) * _RESIZE_SIZE_SUFFIX_MULTIPLIERS[s[-1]]
+    return int(s)
+
+
+def _resize_resolve_end_bytes(start_size, end_spec):
+    """Resolve a resize end_spec ('64M' / '+63M' / '-32M') to bytes."""
+    start_bytes = _resize_parse_qemu_size(start_size)
+    s = end_spec.strip()
+    if s.startswith('+'):
+        return start_bytes + _resize_parse_qemu_size(s[1:])
+    if s.startswith('-'):
+        return start_bytes - _resize_parse_qemu_size(s[1:])
+    return _resize_parse_qemu_size(s)
+
+
+def _resize_option_picker(rng):
+    """Pick (target, start_size, end_spec, options_list, prealloc).
+
+    Constraints honour KNOWN_RESIZE_DIVERGENCES from
+    tests/test_resize.py and the resize planner's documented gaps:
+      * qcow2 + raw only — qemu-img can't resize vmdk/vhd/vhdx on
+        any shipped version; the differential surface has nothing
+        to compare against for those targets (see PLAN-resize
+        phase 10 and 11 for the asymmetry).
+      * No qcow2 refcount_bits != 16 (instar hardcodes
+        refcount_order=4).
+      * No qcow2 compat=0.10 (instar hardcodes compat=1.1).
+      * No qcow2 + preallocation=metadata (planner gap deferred
+        from phase 2c; master-plan Future work).
+      * No qcow2 cluster_size=2097152 — the qcow2 resize planner's
+        worst-case scratch buffer (QCOW2_MAX_RESIZE_SCRATCH = 32M)
+        is sized for default-cluster-size images; 2 MiB cluster
+        sizes blow it out for even modest virtual sizes
+        ("image too large for the resize scratch buffer").
+        Tightening the bound is a master-plan TODO.
+      * No qcow2 extended_l2 + non-Off preallocation — the
+        planner rejects with PreallocationUnsupported (same gap
+        the create picker excludes; see _create_option_picker).
+    """
+    target = rng.choice(['qcow2', 'raw'])
+
+    if target == 'qcow2':
+        options = []
+        # Drop 2 MiB clusters — see docstring.
+        cs = rng.choice([c for c in QCOW2_CLUSTER_SIZES if c != 2097152])
+        options.append(f'cluster_size={cs}')
+        extended_l2 = rng.random() < 0.3 and cs >= 16384
+        if extended_l2:
+            options.append('extended_l2=on')
+        if rng.random() < 0.3:
+            options.append('lazy_refcounts=on')
+
+        # Pick a start / end pair. Sizes capped at 64M for runtime;
+        # falloc/full prealloc additionally capped at 4M because
+        # they materialise real blocks.
+        # extended_l2 + non-Off preallocation is a planner-side
+        # rejection — match the create picker's constraint.
+        if extended_l2:
+            prealloc = rng.choice([None, 'off'])
+        else:
+            prealloc = rng.choice([None, 'off', 'falloc', 'full'])
+        if prealloc in ('falloc', 'full'):
+            start = rng.choice(['1M', '4M'])
+            end = rng.choice(['4M', '8M', '16M'])
+            if _resize_parse_qemu_size(end) == _resize_parse_qemu_size(start):
+                end = '16M'
+            # prealloc is a resize flag, not -o — no extra
+            # create-time options needed beyond what the qcow2
+            # branch already accumulated.
+        else:
+            # qcow2 grow sizes include 256M / 1G after followup-01
+            # lifted the stage-all refcount-block ceiling; both
+            # tools handle these sparse-only-file sizes in well
+            # under the differential harness's 30s timeout.
+            start = rng.choice(['1M', '4M', '16M', '256M'])
+            # Pick end form: absolute, additive, or subtractive.
+            form = rng.choice(['abs', 'add', 'sub'])
+            if form == 'abs':
+                end = rng.choice(['4M', '16M', '64M', '256M', '1G'])
+                if _resize_parse_qemu_size(end) == _resize_parse_qemu_size(start):
+                    end = '1G'
+            elif form == 'add':
+                end = rng.choice(['+1M', '+15M', '+63M', '+256M'])
+            else:
+                start_b = _resize_parse_qemu_size(start)
+                # Pick a delta that keeps end > 0.
+                if start_b > 1024 ** 2:
+                    end = rng.choice(['-512K', '-1M'])
+                else:
+                    end = '+63M'  # too small to shrink; fall back to grow
+
+        return target, start, end, options, prealloc
+
+    # raw
+    options = []
+    prealloc = rng.choice([None, 'off', 'falloc', 'full'])
+    if prealloc in ('falloc', 'full'):
+        start = rng.choice(['1M', '4M'])
+        end = rng.choice(['4M', '8M', '16M'])
+        if _resize_parse_qemu_size(end) == _resize_parse_qemu_size(start):
+            end = '16M'
+    else:
+        start = rng.choice(['1M', '4M', '16M', '64M'])
+        form = rng.choice(['abs', 'add', 'sub'])
+        if form == 'abs':
+            end = rng.choice(['4M', '16M', '64M', '256M'])
+            if _resize_parse_qemu_size(end) == _resize_parse_qemu_size(start):
+                end = '256M'
+        elif form == 'add':
+            end = rng.choice(['+1M', '+15M', '+63M'])
+        else:
+            start_b = _resize_parse_qemu_size(start)
+            if start_b > 1024 ** 2:
+                end = rng.choice(['-512K', '-1M'])
+            else:
+                end = '+63M'
+    return target, start, end, options, prealloc
+
+
+def op_resize(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
+    """Create the same image twice, resize each via its native tool,
+    compare via qemu-img info JSON.
+
+    instar_copy / qemu_copy / fmt are part of the standard op_*
+    signature but unused — `resize` builds its own
+    (target, start, end, opts, prealloc) tuple via the picker.
+    """
+    target, start_size, end_spec, options_list, prealloc = (
+        _resize_option_picker(rng))
+    end_bytes = _resize_resolve_end_bytes(start_size, end_spec)
+    start_bytes = _resize_parse_qemu_size(start_size)
+    apply_shrink = end_bytes < start_bytes
+
+    iter_dir = instar_copy.parent
+    ext = {'qcow2': 'qcow2', 'raw': 'raw'}[target]
+    inst_path = iter_dir / f'resize-instar.{ext}'
+    qemu_path = iter_dir / f'resize-qemu.{ext}'
+
+    # 1. Seed identical start images.
+    create_args_base = ['-f', target]
+    for opt in options_list:
+        create_args_base.extend(['-o', opt])
+
+    _, ic_stderr, ic_rc = run_instar(
+        instar_bin, ['create'],
+        create_args_base + [str(inst_path), start_size],
+        timeout=timeout)
+    _, qc_stderr, qc_rc = run_qemu_img(
+        ['create'],
+        create_args_base + [str(qemu_path), start_size],
+        timeout=timeout)
+    if ic_rc != 0 or qc_rc != 0:
+        # Divergent rejections at the create step show up as
+        # phase 8's create matrix issues, not resize issues.
+        if ic_rc != 0 and qc_rc != 0:
+            return None  # both rejected; not a resize-side divergence
+        return {
+            'type': 'resize_create_seed_divergence',
+            'target_format': target,
+            'start_size': start_size,
+            'options': options_list,
+            'instar_rc': ic_rc, 'qemu_rc': qc_rc,
+            'instar_stderr': ic_stderr[:500],
+            'qemu_stderr': qc_stderr[:500],
+        }
+
+    # 2. Resize each via its native tool.
+    resize_args_base = ['-f', target]
+    if apply_shrink:
+        resize_args_base.append('--shrink')
+    if prealloc is not None:
+        resize_args_base.extend(['--preallocation', prealloc])
+
+    _, ir_stderr, ir_rc = run_instar(
+        instar_bin, ['resize'],
+        resize_args_base + [str(inst_path), end_spec],
+        timeout=timeout)
+    _, qr_stderr, qr_rc = run_qemu_img(
+        ['resize'],
+        resize_args_base + [str(qemu_path), end_spec],
+        timeout=timeout)
+
+    div = compare_exit_codes(
+        ir_rc, qr_rc, 'resize',
+        {'target_format': target,
+         'start_size': start_size,
+         'end_spec': end_spec,
+         'options': options_list,
+         'preallocation': prealloc,
+         'apply_shrink': apply_shrink,
+         'instar_stderr': ir_stderr[:500],
+         'qemu_stderr': qr_stderr[:500]},
+    )
+    if div:
+        return div
+    if ir_rc != 0:
+        return None  # both rejected; nothing to compare
+
+    # 3. Compare via qemu-img info on both outputs.
+    inst_info_out, _, inst_info_rc = run_qemu_img(
+        ['info', '--output=json'], [str(inst_path)], timeout=timeout)
+    qemu_info_out, _, qemu_info_rc = run_qemu_img(
+        ['info', '--output=json'], [str(qemu_path)], timeout=timeout)
+    if inst_info_rc != 0 or qemu_info_rc != 0:
+        return {
+            'type': 'resize_info_readback_failure',
+            'target_format': target,
+            'start_size': start_size,
+            'end_spec': end_spec,
+            'options': options_list,
+            'preallocation': prealloc,
+            'instar_info_rc': inst_info_rc,
+            'qemu_info_rc': qemu_info_rc,
+            'instar_info_stdout': inst_info_out[:500],
+            'qemu_info_stdout': qemu_info_out[:500],
+        }
+
+    try:
+        inst_json = json.loads(inst_info_out)
+        qemu_json = json.loads(qemu_info_out)
+    except json.JSONDecodeError as e:
+        return {
+            'type': 'resize_info_json_parse_failure',
+            'target_format': target,
+            'error': str(e),
+            'instar_info_stdout': inst_info_out[:500],
+            'qemu_info_stdout': qemu_info_out[:500],
+        }
+
+    inst_norm = _normalise_create_info(inst_json, target, str(inst_path))
+    qemu_norm = _normalise_create_info(qemu_json, target, str(qemu_path))
+
+    if inst_norm != qemu_norm:
+        return {
+            'type': 'resize_info_divergence',
+            'target_format': target,
+            'start_size': start_size,
+            'end_spec': end_spec,
+            'options': options_list,
+            'preallocation': prealloc,
+            'apply_shrink': apply_shrink,
+            'instar_normalised': inst_norm,
+            'qemu_normalised': qemu_norm,
+        }
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Single iteration
 # ---------------------------------------------------------------------------
 
@@ -1144,6 +1411,11 @@ def run_iteration(instar_bin, workdir, rng, iteration, timeout,
                 )
             elif op == 'create':
                 div = op_create(
+                    instar_bin, instar_copy, qemu_copy, fmt,
+                    timeout, rng,
+                )
+            elif op == 'resize':
+                div = op_resize(
                     instar_bin, instar_copy, qemu_copy, fmt,
                     timeout, rng,
                 )

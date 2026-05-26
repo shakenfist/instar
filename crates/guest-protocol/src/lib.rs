@@ -624,6 +624,36 @@ pub fn create_result_message(
     msg
 }
 
+/// Build a `ResizeResultMessage` envelope from the resize
+/// operation's fields. Mirrors `create_result_message` — the
+/// host treats both the same way after framing.
+///
+/// `action` is one of `"noop"`, `"grow"`, `"shrink"`; the host
+/// uses it to render the success line and to drive the post-
+/// pass `set_len`.
+pub fn resize_result_message(
+    target_format: &str,
+    resolved_new_virtual_size: u64,
+    file_size_before: u64,
+    file_size_after: u64,
+    action: &str,
+    error: u32,
+) -> guest_::GuestMessage {
+    let mut msg = guest_::GuestMessage::default();
+    msg.level = guest_::Level::Info;
+
+    let mut result = guest_::ResizeResultMessage::default();
+    push_str(&mut result.target_format, target_format);
+    result.resolved_new_virtual_size = resolved_new_virtual_size;
+    result.file_size_before = file_size_before;
+    result.file_size_after = file_size_after;
+    push_str(&mut result.action, action);
+    result.error = error;
+
+    msg.payload = Some(guest_::GuestMessage_::Payload::ResizeResult(result));
+    msg
+}
+
 // =============================================================================
 // VMM -> Guest configuration message support
 // =============================================================================

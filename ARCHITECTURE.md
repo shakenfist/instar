@@ -211,8 +211,8 @@ provides a modular architecture with:
   sparse case). `AllocationSummary` has been moved to `crates/shared` so
   format crates can produce it without depending on `measure`; a
   back-compat re-export remains in this crate. Consumed by the
-  `measure` operation in `src/operations/measure/`; intended for
-  later reuse by `create` / `resize` once those subcommands ship.
+  `measure` operation in `src/operations/measure/` and by the
+  size-estimation helpers shared with `create` and `resize`.
 - **operations/info/** - Format detection operation
 - **operations/copy/** - File copy operation
 - **operations/check/** - Image integrity validation operation (with
@@ -346,6 +346,63 @@ provides a modular architecture with:
   accept-ignore, vhdx default block_size, vhd CHS-rounded
   virtual_size) are documented as per-case skips rather than
   whitelist extensions so each gap stays visible.
+- **operations/resize/** - In-place virtual-size mutation
+  operation. Reads a `ResizeConfig` (target format, current and
+  new virtual sizes, current file size, per-format hints from the
+  existing header, preallocation mode, `--shrink` flag) from
+  `OPERATION_CONFIG_ADDR`, reads sector 0 to confirm the format,
+  walks the existing header / L1 / refcount / BAT / descriptor
+  via the matching parser crate, calls the matching
+  `crates/resize::plan_resize_*` to build a `ResizePlan` of up
+  to 128 `ResizePatch` entries (`Write` / `Append` / `ZeroFill`),
+  then applies each patch via `write_output_sector` plus the
+  new phase-7 `read_output_sector` call-table primitive (the
+  resize op is the first reader of the output device — future
+  in-place operations like `rebase` / `commit` will reuse it).
+  Per-format support: raw is host-only (`open(O_RDWR) +
+  ftruncate` plus optional preallocation post-pass; no guest
+  launch); qcow2 grows and shrinks (L1 + refcount-table
+  extension via `qcow2::plan_grow`, L2 walk + cluster discard
+  via `qcow2::plan_shrink`); vmdk monolithicSparse grows
+  (sparse extent header rewrite + descriptor update + GD
+  relocate via `vmdk::plan_grow`); vhd dynamic + fixed grow
+  (BAT extension + footer + dynamic-header rewrite); vhdx
+  dynamic grow (two-header sequence-number protocol +
+  metadata `VirtualDiskSize` update + BAT extension). vmdk /
+  vhd / vhdx shrink is rejected (`UnsupportedShrink`). The
+  host CLI (`run_resize` / `run_resize_raw` / `run_resize_nonraw`
+  in `src/vmm/src/main.rs`, wired in phase 8) parses the
+  qemu-img-compatible `[+-]SIZE` end-spec grammar
+  (`parse_resize_size`), opens the output `O_RDWR` (the same
+  file is both input and output — the guest reads via
+  `read_output_sector` and writes via `write_output_sector` to
+  the device at slot 1; the stub-input-at-slot-0 pattern
+  satisfies core's unconditional input-device probe, mirroring
+  `run_create_nonraw`), launches `resize.bin`, and applies
+  the phase-9 preallocation post-pass via the shared op-agnostic
+  `apply_preallocation` helper (`falloc` ⇒ `posix_fallocate` on
+  the newly-appended file region; `full` ⇒ `fill_zeros`
+  on the same range). Deliberate divergence from qemu: instar
+  preallocates only the appended region, not the entire data
+  region of the new virtual size; full parity is queued under
+  Future work. `--preallocation=falloc|full` combined with
+  shrink is rejected for clarity; `--preallocation=metadata`
+  on raw is rejected (raw has no metadata to populate); qcow2
+  `metadata` preallocation is rejected by the planner
+  (`PreallocationUnsupported`, deferred from phase 2c). Output
+  rendering supports human (`Image resized.`, matches
+  qemu byte-for-byte), `--output=json` (filename / format /
+  action / old & new virtual sizes / new file size), and
+  `-q` quiet. Integration tests in `tests/test_resize.py`
+  cover six surfaces — schema-drift tripwire, cross-version
+  baseline matrix (qcow2 + raw), live cross-validation, full-
+  matrix round-trip check, internal consistency for
+  vmdk/vpc/vhdx (the formats qemu rejects), and targeted
+  error-path tests — totalling 114 tests (83 active +
+  31 documented skips). Coverage and differential fuzz live in
+  `src/fuzz/fuzz_targets/fuzz_resize_planners.rs` and
+  `scripts/differential-fuzz.py`'s `op_resize`. The binary
+  builds at ~73 KiB / 384 KiB.
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation,
@@ -359,7 +416,13 @@ provides a modular architecture with:
   Phase 2 of `PLAN-create.md` adds `CreateConfig` / `CreateResult` /
   `GUEST_CREATE_SCRATCH_LIMIT` here and a new `send_create_result`
   CallTable function pointer (appended at the end of the struct so
-  existing operation binaries keep working unchanged).
+  existing operation binaries keep working unchanged). Phase 7 of
+  `PLAN-resize.md` adds `ResizeConfig` / `ResizeResult` plus two
+  more CallTable function pointers: `read_output_sector` (lets a
+  guest read from the same device it writes to — the first
+  in-place-mutation primitive, reusable by `rebase` / `commit`
+  / snapshot-delete) and `send_resize_result`. Same
+  append-at-end discipline.
 
 **Chain validation in check (`--chain`):**
 The check operation supports an optional `--chain` flag that uses the host-side
@@ -675,7 +738,7 @@ A mock `CallTable` (in `src/fuzz/src/lib.rs`) backed by thread-local
 fuzzer input provides sector-based I/O, allowing libFuzzer to explore
 deeply malformed inputs.
 
-16 fuzz targets cover all parser crates: format detection, header
+17 fuzz targets cover all parser crates: format detection, header
 parsing (QCOW2, VMDK, VHD, VHDX, RAW, LUKS), L1/L2 cluster lookup,
 refcount table traversal, zlib decompression, grain directory lookup,
 BAT traversal, VHDX metadata parsing, the measure subcommand's
@@ -684,7 +747,12 @@ calculator math (`fuzz_measure_calc`) and the per-parser
 subcommand's emitters (`fuzz_create_emitters` — exercises
 `plan_qcow2`, `plan_vmdk`, `plan_vhd`, `plan_vhdx` with structured
 fuzz input, asserting plan-level bookkeeping invariants and a header
-re-parse round-trip via the matching parser crate).
+re-parse round-trip via the matching parser crate) and the resize
+subcommand's planners (`fuzz_resize_planners` — exercises
+`plan_resize_raw` / `_qcow2` / `_vmdk` / `_vhd` / `_vhdx`, asserting
+plan-level patch invariants: bounded patch count, no offset+len
+overflow, every patch ends within `total_file_size`, no overlapping
+Writes).
 
 The seed corpus is extracted from `instar-testdata` by
 `scripts/extract-fuzz-corpus.py`, which filters images by format and

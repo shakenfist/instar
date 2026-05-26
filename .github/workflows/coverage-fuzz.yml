@@ -145,11 +145,11 @@ jobs:
             DURATION=${INPUT_DURATION}
             TARGETS=${INPUT_TARGETS}
 
-            # Count targets (default 16 if all)
+            # Count targets (default 17 if all)
             if [ -n "$TARGETS" ]; then
               N_TARGETS=$(echo "$TARGETS" | tr ',' '\n' | wc -l)
             else
-              N_TARGETS=16
+              N_TARGETS=17
             fi
 
             # Cap duration so total fits in 450 min (30 min headroom)
@@ -225,6 +225,7 @@ jobs:
               fuzz_measure_calc
               fuzz_measure_scan
               fuzz_create_emitters
+              fuzz_resize_planners
             )
           fi
 
