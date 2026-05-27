@@ -1098,7 +1098,16 @@ impl VhdxState {
             sector += 1;
         }
 
-        let allocated_bytes = allocated_blocks.saturating_mul(self.block_size as u64);
+        // `block_size` (default 32 MiB) is often larger than
+        // `virtual_size` for small images, so the per-block count can
+        // overshoot. Clamp at `virtual_size` so callers see the
+        // invariant allocated_bytes <= virtual_size — `measure_<fmt>`
+        // would otherwise reject the summary as InvalidSize. Mirrors
+        // the qcow2 out-of-bounds skip established in
+        // PLAN-fuzzing-bugs phase 2.
+        let allocated_bytes = allocated_blocks
+            .saturating_mul(self.block_size as u64)
+            .min(virtual_size);
 
         Some(AllocationSummary {
             virtual_size,

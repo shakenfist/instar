@@ -909,7 +909,14 @@ impl VmdkState {
             }
         }
 
-        let allocated_bytes = allocated_grains.saturating_mul(self.grain_size_bytes);
+        // Clamp at `virtual_size` so the last grain (which may extend
+        // past the declared virtual size) does not push
+        // allocated_bytes above the invariant `measure_<fmt>` requires.
+        // Mirrors the qcow2 out-of-bounds skip established in
+        // PLAN-fuzzing-bugs phase 2.
+        let allocated_bytes = allocated_grains
+            .saturating_mul(self.grain_size_bytes)
+            .min(virtual_size);
         Some(AllocationSummary {
             virtual_size,
             allocated_bytes,

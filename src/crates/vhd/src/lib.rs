@@ -736,7 +736,17 @@ impl VhdState {
             sector += 1;
         }
 
-        let allocated_bytes = allocated_blocks.saturating_mul(self.block_size as u64);
+        // `block_size` (typically 2 MiB) frequently exceeds the
+        // virtual_size of small images, so a single allocated block can
+        // make `allocated_blocks * block_size` overshoot `current_size`.
+        // Clamp at `current_size` so callers see the invariant
+        // allocated_bytes <= virtual_size — `measure_<fmt>` rejects
+        // summaries that violate it, which would surface to the user as
+        // "source image is unsupported format". Mirrors the qcow2
+        // out-of-bounds skip established in PLAN-fuzzing-bugs phase 2.
+        let allocated_bytes = allocated_blocks
+            .saturating_mul(self.block_size as u64)
+            .min(self.current_size);
 
         Some(AllocationSummary {
             virtual_size: self.current_size,

@@ -7,7 +7,9 @@ cross-version test matrix lives in phase 7.
 """
 
 import json
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 from base import InstarTestBase
@@ -164,6 +166,58 @@ class TestMeasureSmoke(InstarTestBase):
         self.assertGreater(data['required'], 0)
         self.assertGreater(data['fully-allocated'], 0)
         self.assertLessEqual(data['required'], data['fully-allocated'])
+
+    def test_measure_small_vpc_with_allocated_block(self):
+        """Regression for B1 (PLAN-fuzzing-bugs phase 4).
+
+        A 1 MiB dynamic VPC with default 2 MiB block_size: a single
+        allocated block makes `allocated_blocks * block_size` overshoot
+        virtual_size. Before the phase-4 clamp the scanner reported
+        `allocated_bytes > virtual_size`, which `measure_qcow2`
+        rejected as InvalidSize and surfaced to the user as
+        'measure: source image is unsupported format'. After the clamp,
+        instar matches qemu-img byte-for-byte.
+
+        Closes #293, #306, #310, #311, #319, #323, #324, #325, #335.
+        """
+        if shutil.which('qemu-img') is None or shutil.which('qemu-io') is None:
+            self.skipTest('qemu-img / qemu-io not installed')
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'image.vpc'
+            r = subprocess.run(
+                ['qemu-img', 'create', '-f', 'vpc', str(path), '1M'],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(r.returncode, 0, f'create: {r.stderr}')
+
+            # Force a block allocation in the data region. The leading
+            # footer copy at sector 0 stays intact; the write triggers a
+            # new BAT entry whose block size (2 MiB) exceeds the 1 MiB
+            # virtual_size.
+            r = subprocess.run(
+                ['qemu-io', '-f', 'vpc', '-c', 'write -P 1 4096 4096', str(path)],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(r.returncode, 0, f'qemu-io: {r.stderr}')
+
+            i_stdout, i_stderr, i_rc = self.run_instar_measure(
+                str(path), '-O', 'qcow2', '--output', 'json',
+            )
+            self.assertEqual(i_rc, 0, f'instar measure: {i_stderr}')
+            i_json = json.loads(i_stdout)
+
+            q = subprocess.run(
+                ['qemu-img', 'measure', '-O', 'qcow2', '--output=json', str(path)],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(q.returncode, 0, f'qemu-img measure: {q.stderr}')
+            q_json = json.loads(q.stdout)
+
+            for key in ('required', 'fully-allocated'):
+                self.assertEqual(
+                    i_json.get(key), q_json.get(key),
+                    f'{key}: instar={i_json.get(key)} qemu={q_json.get(key)}',
+                )
 
     # --- Error paths ---
 
