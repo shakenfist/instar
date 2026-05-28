@@ -381,8 +381,30 @@ def check_libyal_parse_consistency(
     """Compare parse-success consistency between instar and a libyal tool.
 
     Returns a divergence dict if the tools disagree on whether
-    the image is valid, or None if they agree.
+    the image is valid, or None if they agree. External-tool
+    timeouts on either side are reclassified as inconclusive
+    rather than `libyal_check_divergence` — mirrors the
+    `compare_exit_codes` policy.
     """
+    libyal_timed_out = _is_external_timeout(libyal_rc, libyal_stderr)
+    instar_timed_out = _is_external_timeout(instar_rc, instar_stderr)
+    if libyal_timed_out or instar_timed_out:
+        return {
+            'type': 'inconclusive_external_timeout',
+            'operation': f'libyal:{tool_name}',
+            'tool': tool_name,
+            'format': fmt,
+            'instar_rc': instar_rc,
+            'libyal_rc': libyal_rc,
+            'timed_out': (
+                'libyal' if libyal_timed_out and not instar_timed_out
+                else 'instar' if instar_timed_out and not libyal_timed_out
+                else 'both'
+            ),
+            'instar_stderr': instar_stderr[:500],
+            'libyal_stderr': libyal_stderr[:500],
+        }
+
     instar_ok = (instar_rc == 0)
     libyal_ok = (libyal_rc == 0)
 

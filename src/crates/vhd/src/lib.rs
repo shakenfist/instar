@@ -667,13 +667,13 @@ impl VhdState {
     ) -> Option<AllocationSummary> {
         // Fixed VHDs: every byte is allocated — no BAT to walk.
         if self.disk_type == DISK_TYPE_FIXED {
-            return Some(AllocationSummary {
-                virtual_size: self.current_size,
-                allocated_bytes: self.current_size,
+            return Some(AllocationSummary::clamp(
+                self.current_size,
+                self.current_size,
                 // TODO(#286): populate from target_unit_size when this
                 // scanner is converted to target-aware accounting.
-                target_units_with_data: 0,
-            });
+                0,
+            ));
         }
 
         // Dynamic (and Differencing) VHDs: walk the BAT.
@@ -739,22 +739,20 @@ impl VhdState {
         // `block_size` (typically 2 MiB) frequently exceeds the
         // virtual_size of small images, so a single allocated block can
         // make `allocated_blocks * block_size` overshoot `current_size`.
-        // Clamp at `current_size` so callers see the invariant
-        // allocated_bytes <= virtual_size — `measure_<fmt>` rejects
-        // summaries that violate it, which would surface to the user as
-        // "source image is unsupported format". Mirrors the qcow2
+        // AllocationSummary::clamp enforces allocated_bytes <=
+        // virtual_size at construction; `measure_<fmt>` rejects
+        // summaries that violate it, which would surface to the user
+        // as "source image is unsupported format". Mirrors the qcow2
         // out-of-bounds skip established in PLAN-fuzzing-bugs phase 2.
-        let allocated_bytes = allocated_blocks
-            .saturating_mul(self.block_size as u64)
-            .min(self.current_size);
+        let allocated_bytes = allocated_blocks.saturating_mul(self.block_size as u64);
 
-        Some(AllocationSummary {
-            virtual_size: self.current_size,
+        Some(AllocationSummary::clamp(
+            self.current_size,
             allocated_bytes,
             // TODO(#286): populate from target_unit_size when this
             // scanner is converted to target-aware accounting.
-            target_units_with_data: 0,
-        })
+            0,
+        ))
     }
 }
 

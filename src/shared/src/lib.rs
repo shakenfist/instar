@@ -454,13 +454,33 @@ pub const COMPRESSED_BUF_SIZE: usize = MAX_CLUSTER_SIZE + MAX_SECTOR_SIZE;
 /// Phase 2 of `PLAN-measure.md` produces this from a parsed source
 /// image; the `measure` crate consumes it as input to the per-format
 /// size calculators.
+///
+/// # Invariants
+///
+/// * `allocated_bytes <= virtual_size`. Callers that compute
+///   `allocated_bytes` as `count * block_size` (or similar) must
+///   cap the product — otherwise the per-format calculators
+///   surface `MeasureError::InvalidSize` and the user sees
+///   "measure: source image is unsupported format". See
+///   `PLAN-fuzzing-bugs.md` phases 2 and 4.
+/// * `target_units_with_data <=
+///   virtual_size.div_ceil(target_unit_size)` when
+///   `target_unit_size != 0`. The scanner is responsible for
+///   honouring this bound; the struct does not know the target
+///   unit size at construction time.
+///
+/// Prefer [`AllocationSummary::clamp`] over the struct literal
+/// when computing from a count × size product; it enforces the
+/// first invariant for you.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AllocationSummary {
     /// Total addressable size of the source image in bytes.
     pub virtual_size: u64,
     /// Bytes that the source has marked as allocated (whether or not they
     /// contain non-zero data). For raw input this equals `virtual_size`.
-    /// For sparse inputs it may be less.
+    /// For sparse inputs it may be less. Must not exceed `virtual_size`
+    /// — use [`AllocationSummary::clamp`] when computing from a count ×
+    /// block-size product to enforce that invariant.
     pub allocated_bytes: u64,
     /// Count of target-aligned regions that contain at least one byte of
     /// allocated source data, computed against a `target_unit_size`
@@ -477,6 +497,31 @@ pub struct AllocationSummary {
     /// measure calculators fall back to `ceil(allocated_bytes /
     /// target_unit)`. New scanners should always populate it.
     pub target_units_with_data: u64,
+}
+
+impl AllocationSummary {
+    /// Build an `AllocationSummary` whose `allocated_bytes` is
+    /// clamped to `virtual_size`.
+    ///
+    /// Scanners that compute `allocated_bytes` as `count *
+    /// block_size` (or similar) routinely overshoot `virtual_size`
+    /// when the block/grain size exceeds the image's virtual size —
+    /// a single allocated 2 MiB VHD block in a 1 MiB image already
+    /// blows the invariant. Use this constructor at the scanner's
+    /// return site so the invariant is enforced once, rather than
+    /// relying on each call site to remember `.min(virtual_size)`.
+    ///
+    /// `target_units_with_data` is not clamped here: the struct
+    /// cannot know the relevant `target_unit_size`. Scanners that
+    /// populate it must respect the second invariant themselves
+    /// (see the struct-level docs).
+    pub fn clamp(virtual_size: u64, allocated_bytes: u64, target_units_with_data: u64) -> Self {
+        Self {
+            virtual_size,
+            allocated_bytes: allocated_bytes.min(virtual_size),
+            target_units_with_data,
+        }
+    }
 }
 
 /// Result from get_operation_config (FFI-safe alternative to tuple)

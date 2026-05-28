@@ -1818,11 +1818,15 @@ impl Qcow2State {
             }
         }
 
-        Some(AllocationSummary {
+        // walk_l2_standard / count_allocated_in_l2_extended already skip
+        // out-of-bounds L2 entries, so `allocated_bytes` is naturally
+        // bounded — `clamp` here is defensive and reasserts the
+        // AllocationSummary invariant at the scanner's return site.
+        Some(AllocationSummary::clamp(
             virtual_size,
             allocated_bytes,
-            target_units_with_data: tracker.target_units_with_data,
-        })
+            tracker.target_units_with_data,
+        ))
     }
 }
 
