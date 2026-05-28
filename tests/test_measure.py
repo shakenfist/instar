@@ -167,35 +167,35 @@ class TestMeasureSmoke(InstarTestBase):
         self.assertGreater(data['fully-allocated'], 0)
         self.assertLessEqual(data['required'], data['fully-allocated'])
 
-    def test_measure_small_vpc_with_allocated_block(self):
-        """Regression for B1 (PLAN-fuzzing-bugs phase 4).
+    def _assert_measure_clamp_matches_qemu(
+        self, fmt, ext, size, create_opts=None,
+    ):
+        """Helper for phase-4 B1 regression tests.
 
-        A 1 MiB dynamic VPC with default 2 MiB block_size: a single
-        allocated block makes `allocated_blocks * block_size` overshoot
-        virtual_size. Before the phase-4 clamp the scanner reported
-        `allocated_bytes > virtual_size`, which `measure_qcow2`
-        rejected as InvalidSize and surfaced to the user as
-        'measure: source image is unsupported format'. After the clamp,
-        instar matches qemu-img byte-for-byte.
-
-        Closes #293, #306, #310, #311, #319, #323, #324, #325, #335.
+        Creates a small image of `fmt`, forces a block / grain
+        allocation via qemu-io, and asserts `instar measure -O qcow2`
+        matches `qemu-img measure -O qcow2` byte-for-byte. Before the
+        phase-4 clamp the dynamic-block scanners reported
+        `allocated_bytes > virtual_size` for any format whose
+        block / grain size exceeds the virtual size, surfaced to the
+        user as 'measure: source image is unsupported format'.
         """
         if shutil.which('qemu-img') is None or shutil.which('qemu-io') is None:
             self.skipTest('qemu-img / qemu-io not installed')
         with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / 'image.vpc'
+            path = Path(td) / f'image.{ext}'
+            create_cmd = ['qemu-img', 'create', '-f', fmt]
+            for opt in (create_opts or []):
+                create_cmd.extend(['-o', opt])
+            create_cmd.extend([str(path), size])
             r = subprocess.run(
-                ['qemu-img', 'create', '-f', 'vpc', str(path), '1M'],
-                capture_output=True, text=True, timeout=30,
+                create_cmd, capture_output=True, text=True, timeout=30,
             )
             self.assertEqual(r.returncode, 0, f'create: {r.stderr}')
 
-            # Force a block allocation in the data region. The leading
-            # footer copy at sector 0 stays intact; the write triggers a
-            # new BAT entry whose block size (2 MiB) exceeds the 1 MiB
-            # virtual_size.
             r = subprocess.run(
-                ['qemu-io', '-f', 'vpc', '-c', 'write -P 1 4096 4096', str(path)],
+                ['qemu-io', '-f', fmt, '-c',
+                 'write -P 1 4096 4096', str(path)],
                 capture_output=True, text=True, timeout=30,
             )
             self.assertEqual(r.returncode, 0, f'qemu-io: {r.stderr}')
@@ -207,7 +207,8 @@ class TestMeasureSmoke(InstarTestBase):
             i_json = json.loads(i_stdout)
 
             q = subprocess.run(
-                ['qemu-img', 'measure', '-O', 'qcow2', '--output=json', str(path)],
+                ['qemu-img', 'measure', '-O', 'qcow2',
+                 '--output=json', str(path)],
                 capture_output=True, text=True, timeout=30,
             )
             self.assertEqual(q.returncode, 0, f'qemu-img measure: {q.stderr}')
@@ -218,6 +219,47 @@ class TestMeasureSmoke(InstarTestBase):
                     i_json.get(key), q_json.get(key),
                     f'{key}: instar={i_json.get(key)} qemu={q_json.get(key)}',
                 )
+
+    def test_measure_small_vpc_with_allocated_block(self):
+        """Regression for B1 (PLAN-fuzzing-bugs phase 4) — VPC.
+
+        1 MiB dynamic VPC with default 2 MiB block_size: a single
+        allocated block makes `allocated_blocks * block_size` overshoot
+        virtual_size. Tests the vhd::scan_allocation clamp.
+
+        Closes #293, #306, #310, #311, #319, #323, #324, #325, #335
+        (and, manually post-merge, #315).
+        """
+        self._assert_measure_clamp_matches_qemu(
+            fmt='vpc', ext='vpc', size='1M',
+        )
+
+    def test_measure_small_vhdx_with_allocated_block(self):
+        """Regression for B1 (PLAN-fuzzing-bugs phase 4) — VHDX.
+
+        1 MiB dynamic VHDX with the qemu-default 32 MiB block_size: a
+        single allocated block would overshoot virtual_size by 32x
+        without the phase-4 clamp. Tests the vhdx::scan_allocation
+        clamp on the same shape as the VPC case.
+        """
+        self._assert_measure_clamp_matches_qemu(
+            fmt='vhdx', ext='vhdx', size='1M',
+        )
+
+    def test_measure_small_vmdk_with_allocated_grain(self):
+        """Regression for B1 (PLAN-fuzzing-bugs phase 4) — VMDK.
+
+        Small monolithicSparse VMDK with a grain-sized write that lands
+        on the boundary of virtual_size. Tests the vmdk::scan_allocation
+        clamp parallel to the VPC and VHDX cases. VMDK uses smaller
+        grains (default 64 KiB) so the overshoot is less extreme than
+        VHD/VHDX but the clamp still applies for grain-sized writes
+        near the end of virtual_size.
+        """
+        self._assert_measure_clamp_matches_qemu(
+            fmt='vmdk', ext='vmdk', size='1M',
+            create_opts=['subformat=monolithicSparse'],
+        )
 
     # --- Error paths ---
 

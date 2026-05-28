@@ -136,11 +136,11 @@ on a per-issue basis.
 
 | Phase | Plan | Status |
 |-------|------|--------|
-| 1. Category A1: `plan_vmdk` capacity panic | [PLAN-fuzzing-bugs-phase-01-create-emitters.md](PLAN-fuzzing-bugs-phase-01-create-emitters.md) | Not started |
-| 2. Category A2: qcow2 `scan_allocation` invariant break | [PLAN-fuzzing-bugs-phase-02-measure-scan.md](PLAN-fuzzing-bugs-phase-02-measure-scan.md) | Not started |
-| 3. Category A3: measure calculator overflow | [PLAN-fuzzing-bugs-phase-03-measure-calc.md](PLAN-fuzzing-bugs-phase-03-measure-calc.md) | Not started |
-| 4. Category B1: measure fixed-VHD source detection | [PLAN-fuzzing-bugs-phase-04-measure-fixed-vhd.md](PLAN-fuzzing-bugs-phase-04-measure-fixed-vhd.md) | Not started |
-| 5. Category B2: differential-fuzz timeout classification | [PLAN-fuzzing-bugs-phase-05-diff-fuzz-timeouts.md](PLAN-fuzzing-bugs-phase-05-diff-fuzz-timeouts.md) | Not started |
+| 1. Category A1: `plan_vmdk` capacity panic | [PLAN-fuzzing-bugs-phase-01-create-emitters.md](PLAN-fuzzing-bugs-phase-01-create-emitters.md) | Complete (commit `0220ae9`) |
+| 2. Category A2: qcow2 `scan_allocation` invariant break | [PLAN-fuzzing-bugs-phase-02-measure-scan.md](PLAN-fuzzing-bugs-phase-02-measure-scan.md) | Complete (commit `6de9687`) |
+| 3. Category A3: measure calculator overflow | [PLAN-fuzzing-bugs-phase-03-measure-calc.md](PLAN-fuzzing-bugs-phase-03-measure-calc.md) | Complete (commit `b4e312d`) |
+| 4. Category B1: vhd/vhdx/vmdk `allocated_bytes` clamp | [PLAN-fuzzing-bugs-phase-04-measure-fixed-vhd.md](PLAN-fuzzing-bugs-phase-04-measure-fixed-vhd.md) | Complete (commit `bed14fc`); root cause turned out to be unclamped block-count overshoot in scan_allocation, not fixed-VHD detection — phase plan still names the original hypothesis |
+| 5. Category B2: differential-fuzz timeout classification | [PLAN-fuzzing-bugs-phase-05-diff-fuzz-timeouts.md](PLAN-fuzzing-bugs-phase-05-diff-fuzz-timeouts.md) | Complete (commit `71e3e33`) |
 
 Phases are independent and can land in any order. I suggest
 landing them in the listed order because phases 1-3 carry the
@@ -228,7 +228,26 @@ After each phase:
 
 ### Bugs fixed during this work
 
-To be filled in as the phases land.
+All 44 open `security-audit` GitHub issues at the start of this
+plan are closed by the five phase commits. Auto-close via the
+`Closes #N` keywords in each commit message; one issue (#315)
+was miscategorised in the initial triage and is fixed by phase 4
+but not referenced in `bed14fc` — it will be closed manually
+post-merge with a pointer to `bed14fc`.
+
+* **A1 — `fuzz_create_emitters` panic (7 issues, commit `0220ae9`):**
+  #309, #314, #318, #322, #328, #331, #339.
+* **A2 — `fuzz_measure_scan` invariant break (10 issues, commit `6de9687`):**
+  #292, #295, #297, #304, #308, #313, #317, #321, #330, #338.
+* **A3 — `fuzz_measure_calc` overflow (15 issues, commit `b4e312d`):**
+  #289, #290, #291, #294, #296, #303, #305, #307, #312, #316,
+  #320, #327, #329, #333, #337.
+* **B1 — vhd/vhdx/vmdk `allocated_bytes` overshoot
+  (9 issues commit `bed14fc` + 1 manual close):** #293, #306,
+  #310, #311, #319, #323, #324, #325, #335, plus #315
+  (miscategorised in original triage; same root cause).
+* **B2 — qemu-img timeout reclassification (2 issues, commit `71e3e33`):**
+  #334, #336.
 
 ### Documentation index maintenance
 

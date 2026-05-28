@@ -16,3 +16,4 @@
 - PLAN-measure.md: instar measure subcommand
 - PLAN-create.md: instar create subcommand
 - PLAN-resize.md: instar resize subcommand
+- PLAN-fuzzing-bugs.md: Fuzzing bug backlog
