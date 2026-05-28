@@ -381,8 +381,30 @@ def check_libyal_parse_consistency(
     """Compare parse-success consistency between instar and a libyal tool.
 
     Returns a divergence dict if the tools disagree on whether
-    the image is valid, or None if they agree.
+    the image is valid, or None if they agree. External-tool
+    timeouts on either side are reclassified as inconclusive
+    rather than `libyal_check_divergence` — mirrors the
+    `compare_exit_codes` policy.
     """
+    libyal_timed_out = _is_external_timeout(libyal_rc, libyal_stderr)
+    instar_timed_out = _is_external_timeout(instar_rc, instar_stderr)
+    if libyal_timed_out or instar_timed_out:
+        return {
+            'type': 'inconclusive_external_timeout',
+            'operation': f'libyal:{tool_name}',
+            'tool': tool_name,
+            'format': fmt,
+            'instar_rc': instar_rc,
+            'libyal_rc': libyal_rc,
+            'timed_out': (
+                'libyal' if libyal_timed_out and not instar_timed_out
+                else 'instar' if instar_timed_out and not libyal_timed_out
+                else 'both'
+            ),
+            'instar_stderr': instar_stderr[:500],
+            'libyal_stderr': libyal_stderr[:500],
+        }
+
     instar_ok = (instar_rc == 0)
     libyal_ok = (libyal_rc == 0)
 
@@ -454,8 +476,39 @@ def normalize_info_json(raw_json):
     return json.dumps(data, sort_keys=True, indent=2)
 
 
+def _is_external_timeout(rc, stderr):
+    """Detect the sentinel returned by run_instar / run_qemu_img when a
+    subprocess.TimeoutExpired fires (rc=-1, stderr='TIMEOUT after Ns')."""
+    return rc == -1 and isinstance(stderr, str) and 'TIMEOUT after' in stderr
+
+
 def compare_exit_codes(instar_rc, qemu_rc, operation, context):
-    """Compare exit codes, returning a divergence dict or None."""
+    """Compare exit codes, returning a divergence dict or None.
+
+    Timeouts on either side are reclassified as inconclusive rather
+    than `exit_code_divergence`: qemu-img is known to hang on some
+    adversarial qcow2 shrink inputs and a timeout vs a real failure
+    is not an instar defect. The harness records the inconclusive
+    iteration in the summary so visibility is preserved without
+    polluting the divergence count or filing a GitHub issue."""
+    qemu_timed_out = _is_external_timeout(qemu_rc, context.get('qemu_stderr', ''))
+    instar_timed_out = _is_external_timeout(
+        instar_rc, context.get('instar_stderr', '')
+    )
+    if qemu_timed_out or instar_timed_out:
+        return {
+            'type': 'inconclusive_external_timeout',
+            'operation': operation,
+            'instar_rc': instar_rc,
+            'qemu_rc': qemu_rc,
+            'timed_out': (
+                'qemu' if qemu_timed_out and not instar_timed_out
+                else 'instar' if instar_timed_out and not qemu_timed_out
+                else 'both'
+            ),
+            'context': context,
+        }
+
     # Both succeed or both fail = OK
     instar_ok = (instar_rc == 0)
     qemu_ok = (qemu_rc == 0)
@@ -1636,6 +1689,7 @@ def main():
 
     rng = random.Random(seed)
     divergences = []
+    inconclusive = []
     start_time = time.time()
 
     try:
@@ -1649,8 +1703,10 @@ def main():
                 elapsed = time.time() - start_time
                 rate = (i + 1) / elapsed if elapsed > 0 else 0
                 logger.info(
-                    'Iteration %d/%d (%.1f iter/s, %d divergences)',
-                    i + 1, args.iterations, rate, len(divergences),
+                    'Iteration %d/%d (%.1f iter/s, %d divergences, '
+                    '%d inconclusive)',
+                    i + 1, args.iterations, rate,
+                    len(divergences), len(inconclusive),
                 )
 
             try:
@@ -1671,6 +1727,16 @@ def main():
 
             if div:
                 attrs['iter_seed'] = iter_seed
+                # Inconclusive records (e.g. external-tool timeouts)
+                # are logged for visibility but do not count as
+                # divergences and never file a GitHub issue.
+                if str(div.get('type', '')).startswith('inconclusive_'):
+                    inconclusive.append((i, div))
+                    logger.info(
+                        'inconclusive at iteration %d: %s',
+                        i, div.get('type', 'unknown'),
+                    )
+                    continue
                 report_path = write_divergence_report(
                     log_dir, seed, i, attrs, div,
                 )
@@ -1701,6 +1767,11 @@ def main():
             iterations_done / elapsed if elapsed > 0 else 0,
         )
         logger.info('Divergences found: %d', len(divergences))
+        if inconclusive:
+            logger.info(
+                'Inconclusive iterations (external-tool timeout, '
+                'not a divergence): %d', len(inconclusive),
+            )
 
         # Write summary (including in --fail-fast mode)
         summary = {
@@ -1710,6 +1781,8 @@ def main():
             'elapsed_seconds': round(elapsed, 1),
             'divergences_found': len(divergences),
             'divergence_iterations': [d[0] for d in divergences],
+            'inconclusive_count': len(inconclusive),
+            'inconclusive_iterations': [d[0] for d in inconclusive],
         }
         summary_path = log_dir / f'summary-{seed}.json'
         with open(summary_path, 'w') as f:

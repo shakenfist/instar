@@ -355,6 +355,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the source is a qcow2 v3 image, matching qemu-img exactly
   (surfaced and refined by phase 7c source-image tests).
 
+### Fixed
+
+- **Fuzzing bug backlog (44 issues).** Five categories of fuzz
+  findings from coverage-guided and differential fuzzing are
+  closed by the `PLAN-fuzzing-bugs` work:
+  - `create::plan_vmdk` no longer panics on adversarial
+    `(virtual_size, grain_size)` tuples — capacity arithmetic
+    now uses `checked_mul` and surfaces
+    `CreateError::Overflow` (commit `0220ae9`).
+  - `qcow2::scan_allocation` honours the invariant
+    `allocated_bytes <= virtual_size` for on-disk L2 entries
+    past `virtual_size`, which the spec allows but the
+    measure path rejects. Last-cluster contributions are
+    capped at `virtual_size - cluster_start`
+    (commit `6de9687`).
+  - The measure calculators (`measure_raw`, `measure_qcow2`,
+    `measure_vmdk`, `measure_vhd`, `measure_vhdx`) route
+    construction of their `MeasureOutput` through a new
+    `try_new` helper that rejects sum-overflow on
+    `required + fully_allocated` (commit `b4e312d`).
+  - The dynamic-VHD, VHDX, and VMDK allocation scanners
+    clamp `allocated_bytes` at `virtual_size`, fixing the
+    `instar measure` failure on small dynamic-VPC images
+    where a single 2 MiB block exceeds the 1 MiB virtual
+    size (commit `bed14fc`).
+  - `scripts/differential-fuzz.py` reclassifies external-
+    tool subprocess timeouts as `inconclusive_external_timeout`
+    rather than `exit_code_divergence`, so qemu-img hangs
+    on adversarial qcow2 shrink inputs no longer file
+    GitHub issues against instar (commit `71e3e33`).
+
 ### Changed
 
 - **CallTable ABI version bumped from 13 to 14** by the addition

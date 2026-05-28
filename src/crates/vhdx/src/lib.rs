@@ -995,13 +995,13 @@ impl VhdxState {
         // Guard against degenerate input: zero virtual size or zero
         // BAT entries means nothing to scan.
         if virtual_size == 0 || self.total_bat_entries == 0 || self.chunk_ratio == 0 {
-            return Some(AllocationSummary {
+            return Some(AllocationSummary::clamp(
                 virtual_size,
-                allocated_bytes: 0,
+                0,
                 // TODO(#286): populate from target_unit_size when this
                 // scanner is converted to target-aware accounting.
-                target_units_with_data: 0,
-            });
+                0,
+            ));
         }
 
         let total_payload_blocks_u64 = virtual_size.div_ceil(self.block_size as u64);
@@ -1098,15 +1098,22 @@ impl VhdxState {
             sector += 1;
         }
 
+        // `block_size` (default 32 MiB) is often larger than
+        // `virtual_size` for small images, so the per-block count can
+        // overshoot. AllocationSummary::clamp enforces the invariant
+        // allocated_bytes <= virtual_size at construction;
+        // `measure_<fmt>` would otherwise reject the summary as
+        // InvalidSize. Mirrors the qcow2 out-of-bounds skip
+        // established in PLAN-fuzzing-bugs phase 2.
         let allocated_bytes = allocated_blocks.saturating_mul(self.block_size as u64);
 
-        Some(AllocationSummary {
+        Some(AllocationSummary::clamp(
             virtual_size,
             allocated_bytes,
             // TODO(#286): populate from target_unit_size when this
             // scanner is converted to target-aware accounting.
-            target_units_with_data: 0,
-        })
+            0,
+        ))
     }
 }
 

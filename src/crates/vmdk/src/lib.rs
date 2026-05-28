@@ -909,14 +909,18 @@ impl VmdkState {
             }
         }
 
+        // AllocationSummary::clamp keeps `allocated_bytes <=
+        // virtual_size` even when the last allocated grain extends
+        // past the declared virtual size. Mirrors the qcow2
+        // out-of-bounds skip established in PLAN-fuzzing-bugs phase 2.
         let allocated_bytes = allocated_grains.saturating_mul(self.grain_size_bytes);
-        Some(AllocationSummary {
+        Some(AllocationSummary::clamp(
             virtual_size,
             allocated_bytes,
             // TODO(#286): populate from target_unit_size when this
             // scanner is converted to target-aware accounting.
-            target_units_with_data: 0,
-        })
+            0,
+        ))
     }
 }
 

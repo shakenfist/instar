@@ -30,6 +30,24 @@ pub struct MeasureOutput {
     pub fully_allocated: u64,
 }
 
+impl MeasureOutput {
+    /// Construct a `MeasureOutput` after verifying its summability
+    /// invariant: `required + fully_allocated` must fit in `u64`.
+    /// Callers can otherwise produce values that individually fit but
+    /// overflow when summed (e.g. `measure_raw(u64::MAX)` would yield
+    /// `required = fully_allocated = u64::MAX`), which downstream
+    /// consumers and `fuzz_measure_calc` invariant 4 reject.
+    pub fn try_new(required: u64, fully_allocated: u64) -> MeasureResult {
+        required
+            .checked_add(fully_allocated)
+            .ok_or(MeasureError::Overflow)?;
+        Ok(MeasureOutput {
+            required,
+            fully_allocated,
+        })
+    }
+}
+
 /// Errors returned by the measure functions.
 ///
 /// - `Overflow`: an intermediate or final value exceeds `u64::MAX`.
@@ -103,10 +121,7 @@ pub enum VhdSubformat {
 /// For raw images `required` and `fully_allocated` are both equal to
 /// `virtual_size`; there is no format overhead.
 pub fn measure_raw(virtual_size: u64) -> MeasureResult {
-    Ok(MeasureOutput {
-        required: virtual_size,
-        fully_allocated: virtual_size,
-    })
+    MeasureOutput::try_new(virtual_size, virtual_size)
 }
 
 // ---------------------------------------------------------------------------
@@ -316,10 +331,7 @@ pub fn measure_qcow2(s: &AllocationSummary, opts: &Qcow2Opts) -> MeasureResult {
     // with qemu-img but do not affect the size bound.
     let _ = (opts.compress, opts.lazy_refcounts);
 
-    Ok(MeasureOutput {
-        required,
-        fully_allocated,
-    })
+    MeasureOutput::try_new(required, fully_allocated)
 }
 
 /// Ceiling division for `u64`. Caller guarantees `b > 0`.
@@ -613,10 +625,7 @@ fn measure_vmdk_monolithic_sparse(
         .ok_or(MeasureError::Overflow)?;
     let fully_allocated = checked_sum(&[grain_data_start, grains_bytes_full, all_gts, gd_padded])?;
 
-    Ok(MeasureOutput {
-        required,
-        fully_allocated,
-    })
+    MeasureOutput::try_new(required, fully_allocated)
 }
 
 /// StreamOptimized size calculation.
@@ -708,10 +717,7 @@ fn measure_vmdk_stream_optimized(
         max_sector_size,
     )?;
 
-    Ok(MeasureOutput {
-        required,
-        fully_allocated,
-    })
+    MeasureOutput::try_new(required, fully_allocated)
 }
 
 /// MonolithicFlat size calculation.
@@ -730,10 +736,7 @@ fn measure_vmdk_flat(s: &AllocationSummary) -> MeasureResult {
     let total = 512u64
         .checked_add(s.virtual_size)
         .ok_or(MeasureError::Overflow)?;
-    Ok(MeasureOutput {
-        required: total,
-        fully_allocated: total,
-    })
+    MeasureOutput::try_new(total, total)
 }
 
 /// Round `a` up to the nearest multiple of `b`. Caller guarantees `b > 0`.
@@ -852,10 +855,7 @@ fn measure_vhd_fixed(s: &AllocationSummary) -> MeasureResult {
     let total = data_size
         .checked_add(vhd::FOOTER_SIZE as u64)
         .ok_or(MeasureError::Overflow)?;
-    Ok(MeasureOutput {
-        required: total,
-        fully_allocated: total,
-    })
+    MeasureOutput::try_new(total, total)
 }
 
 /// Dynamic VHD size calculation.
@@ -928,10 +928,7 @@ fn measure_vhd_dynamic(s: &AllocationSummary, block_size: u64) -> MeasureResult 
         vhd::FOOTER_SIZE as u64, // trailing footer
     ])?;
 
-    Ok(MeasureOutput {
-        required,
-        fully_allocated,
-    })
+    MeasureOutput::try_new(required, fully_allocated)
 }
 
 // ---------------------------------------------------------------------------
@@ -1073,10 +1070,7 @@ pub fn measure_vhdx(s: &AllocationSummary, opts: &VhdxOpts) -> MeasureResult {
         .checked_add(payload_full)
         .ok_or(MeasureError::Overflow)?;
 
-    Ok(MeasureOutput {
-        required,
-        fully_allocated,
-    })
+    MeasureOutput::try_new(required, fully_allocated)
 }
 
 // ---------------------------------------------------------------------------
@@ -1146,15 +1140,106 @@ mod tests {
     #[test]
     fn raw_max_u64() {
         // u64::MAX as a virtual_size is hypothetical (qemu-img measure --size
-        // 18446744073709551615 -O raw errors at the CLI level), but raw output
-        // cannot overflow: both fields simply equal the input.
+        // 18446744073709551615 -O raw errors at the CLI level). Individually
+        // both fields equal the input, but their sum overflows u64; the
+        // calculator must surface that as `MeasureError::Overflow` to
+        // satisfy `MeasureOutput::try_new`'s summability invariant.
+        assert_eq!(measure_raw(u64::MAX), Err(MeasureError::Overflow));
+    }
+
+    // Regression tests for github.com/shakenfist/instar issues #289, #290,
+    // #291, #294, #296, #303, #305, #307, #312, #316, #320, #327, #329,
+    // #333, #337 — fuzz_measure_calc panicked at invariant 4
+    // (required + fully_allocated overflows u64) for adversarial inputs
+    // that drive each calculator to outputs whose sum exceeds u64::MAX.
+    // The calculators must surface MeasureError::Overflow, not panic.
+    #[test]
+    fn try_new_rejects_sum_overflow() {
         assert_eq!(
-            measure_raw(u64::MAX),
+            MeasureOutput::try_new(u64::MAX, 1),
+            Err(MeasureError::Overflow)
+        );
+        assert_eq!(
+            MeasureOutput::try_new(u64::MAX / 2 + 1, u64::MAX / 2 + 1),
+            Err(MeasureError::Overflow)
+        );
+        assert_eq!(
+            MeasureOutput::try_new(u64::MAX, 0),
             Ok(MeasureOutput {
                 required: u64::MAX,
-                fully_allocated: u64::MAX
-            }),
+                fully_allocated: 0,
+            })
         );
+    }
+
+    #[test]
+    fn measure_qcow2_huge_virtual_size_does_not_panic() {
+        let s = AllocationSummary {
+            virtual_size: u64::MAX,
+            allocated_bytes: 0,
+            target_units_with_data: 0,
+        };
+        let opts = Qcow2Opts {
+            cluster_size: 65536,
+            refcount_bits: 16,
+            extended_l2: false,
+            lazy_refcounts: false,
+            compat_v3: false,
+            compress: false,
+            preallocation: Preallocation::Off,
+            luks_header_overhead: None,
+        };
+        // Either an overflow on intermediates or InvalidSize is acceptable;
+        // the harness's only oracle is panic.
+        let r = measure_qcow2(&s, &opts);
+        assert!(r.is_err(), "expected Err, got {:?}", r);
+    }
+
+    #[test]
+    fn measure_vmdk_huge_virtual_size_does_not_panic() {
+        let s = AllocationSummary {
+            virtual_size: u64::MAX,
+            allocated_bytes: 0,
+            target_units_with_data: 0,
+        };
+        let opts = VmdkOpts {
+            subformat: VmdkSubformat::MonolithicSparse,
+            grain_size: 65536,
+        };
+        let r = measure_vmdk(&s, &opts);
+        assert!(r.is_err(), "expected Err, got {:?}", r);
+    }
+
+    #[test]
+    fn measure_vhd_fixed_huge_virtual_size_does_not_panic() {
+        // round_up_u64(virtual_size, 512) + 512 footer; both fields equal
+        // the total, so their sum trips the try_new guard whenever total
+        // exceeds u64::MAX / 2.
+        let s = AllocationSummary {
+            virtual_size: u64::MAX / 2 + 1,
+            allocated_bytes: 0,
+            target_units_with_data: 0,
+        };
+        let opts = VhdOpts {
+            subformat: VhdSubformat::Fixed,
+            block_size: 2 * 1024 * 1024,
+        };
+        let r = measure_vhd(&s, &opts);
+        assert!(r.is_err(), "expected Err, got {:?}", r);
+    }
+
+    #[test]
+    fn measure_vhdx_huge_virtual_size_does_not_panic() {
+        let s = AllocationSummary {
+            virtual_size: u64::MAX,
+            allocated_bytes: 0,
+            target_units_with_data: 0,
+        };
+        let opts = VhdxOpts {
+            block_size: 32 * 1024 * 1024,
+        };
+        let r = measure_vhdx(&s, &opts);
+        assert!(r.is_err(), "expected Err, got {:?}", r);
     }
 
     // -----------------------------------------------------------------------

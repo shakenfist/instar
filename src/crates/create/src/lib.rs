@@ -522,8 +522,15 @@ pub fn plan_vmdk<'a>(
     let gtes_per_gt: u32 = vmdk::DEFAULT_NUM_GTES_PER_GT;
 
     // Capacity (round up virtual_size to grain boundary, then to sector).
+    // `div_ceil(_, grain) * grain` can exceed u64::MAX when virtual_size is
+    // close to u64::MAX (e.g. fuzzer-generated inputs). Surface as Overflow
+    // rather than panicking under overflow-checks=on.
     let grain_size_bytes = opts.grain_size as u64;
-    let capacity_bytes = opts.virtual_size.div_ceil(grain_size_bytes) * grain_size_bytes;
+    let capacity_bytes = opts
+        .virtual_size
+        .div_ceil(grain_size_bytes)
+        .checked_mul(grain_size_bytes)
+        .ok_or(CreateError::Overflow)?;
     let capacity_sectors = capacity_bytes / SECTOR;
 
     // GD entries cover the full virtual size. The GD is a flat u32 array
@@ -1306,6 +1313,22 @@ mod vmdk_plan_tests {
         assert!(matches!(
             plan_vmdk(&opts, &mut scratch),
             Err(CreateError::InvalidGrainSize)
+        ));
+    }
+
+    #[test]
+    fn plan_vmdk_rejects_capacity_overflow() {
+        // virtual_size = u64::MAX with the largest valid grain rounds up
+        // past u64::MAX in the capacity computation. Must return Overflow,
+        // not panic. Regression test for coverage-fuzz panics at lib.rs:526
+        // (github.com/shakenfist/instar issues #309, #314, #318, #322,
+        // #328, #331, #339).
+        let mut opts = default_opts(u64::MAX);
+        opts.grain_size = 65536;
+        let mut scratch = vec![0u8; VMDK_MAX_METADATA_SCRATCH];
+        assert!(matches!(
+            plan_vmdk(&opts, &mut scratch),
+            Err(CreateError::Overflow)
         ));
     }
 
