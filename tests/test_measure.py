@@ -669,9 +669,12 @@ KNOWN_SOURCE_SCANNER_DIVERGENCES = {
     # qcow2 scanner counts allocated bytes slightly differently than qemu-img
     # for some real-world images — likely a compressed-cluster or
     # extended-L2 subcluster edge case worth its own investigation.
-    'debian-12-sfagent': ('qcow2', 'instar qcow2 scanner counts allocated bytes differently'),
+    #
+    # `debian-12-sfagent` and `sf-vda-backing` were here too until
+    # PLAN-fuzzing-bugs phase 2 (qcow2::scan_allocation OOB L2 skip) fixed
+    # them as an incidental consequence; the byte-equality test now passes
+    # for both. `sf-vda` still diverges and remains entered.
     'sf-vda':            ('qcow2', 'instar qcow2 scanner counts allocated bytes differently'),
-    'sf-vda-backing':    ('qcow2', 'instar qcow2 scanner does not consult backing chain'),
 
     # VHDX scanner treats every block as fully allocated; qemu-img returns
     # the actual block-state distribution.
