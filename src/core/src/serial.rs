@@ -556,3 +556,42 @@ pub fn send_resize_result(result: &shared::ResizeResult) {
     );
     send_message(&msg);
 }
+
+/// Send a rebase result message.
+///
+/// Mirrors [`send_resize_result`]. The `mode` u32 in
+/// `RebaseResult` (Unsafe / Safe) is mapped to the matching
+/// short string for the protobuf envelope so the host can render
+/// the success line directly.
+pub fn send_rebase_result(result: &shared::RebaseResult) {
+    let overlay_name = shared::ImageFormat::from_u32(result.overlay_format).name();
+    let mode = match result.mode {
+        shared::RebaseResult::MODE_UNSAFE => "unsafe",
+        _ => "safe",
+    };
+    let msg = guest_protocol::rebase_result_message(
+        overlay_name,
+        mode,
+        result.clusters_copied,
+        result.bytes_copied,
+        result.error,
+    );
+    send_message(&msg);
+}
+
+/// Send a commit result message.
+///
+/// Mirrors [`send_rebase_result`].
+pub fn send_commit_result(result: &shared::CommitResult) {
+    let overlay_name = shared::ImageFormat::from_u32(result.overlay_format).name();
+    let backing_name = shared::ImageFormat::from_u32(result.backing_format).name();
+    let msg = guest_protocol::commit_result_message(
+        overlay_name,
+        backing_name,
+        result.clusters_committed,
+        result.bytes_committed,
+        result.overlay_clusters_cleared,
+        result.error,
+    );
+    send_message(&msg);
+}

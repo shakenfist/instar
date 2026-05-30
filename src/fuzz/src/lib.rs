@@ -84,6 +84,9 @@ pub fn build_call_table() -> shared::CallTable {
         send_create_result: mock_send_create_result,
         read_output_sector: mock_read_output_sector,
         send_resize_result: mock_send_resize_result,
+        send_rebase_result: mock_send_rebase_result,
+        send_commit_result: mock_send_commit_result,
+        write_input_sector: mock_write_input_sector,
     }
 }
 
@@ -273,6 +276,19 @@ unsafe extern "C" fn mock_read_output_sector(
 }
 
 unsafe extern "C" fn mock_send_resize_result(_result: *const shared::ResizeResult) {}
+
+unsafe extern "C" fn mock_send_rebase_result(_result: *const shared::RebaseResult) {}
+
+unsafe extern "C" fn mock_send_commit_result(_result: *const shared::CommitResult) {}
+
+unsafe extern "C" fn mock_write_input_sector(
+    _device_idx: u32,
+    _sector: u64,
+    _buffer: *const u8,
+    _len: usize,
+) -> bool {
+    false
+}
 
 // ---------------------------------------------------------------------------
 // Unit tests

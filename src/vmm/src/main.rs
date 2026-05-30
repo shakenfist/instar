@@ -845,6 +845,26 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
                 r.error
             )
         }
+        Some(guest_::GuestMessage_::Payload::RebaseResult(r)) => {
+            format!(
+                "rebase_result overlay_format={} mode={} clusters_copied={} \
+                bytes_copied={} error={}",
+                r.overlay_format, r.mode, r.clusters_copied, r.bytes_copied, r.error
+            )
+        }
+        Some(guest_::GuestMessage_::Payload::CommitResult(c)) => {
+            format!(
+                "commit_result overlay_format={} backing_format={} \
+                clusters_committed={} bytes_committed={} \
+                overlay_clusters_cleared={} error={}",
+                c.overlay_format,
+                c.backing_format,
+                c.clusters_committed,
+                c.bytes_committed,
+                c.overlay_clusters_cleared,
+                c.error
+            )
+        }
         None => "empty payload".to_string(),
     };
 
@@ -2222,6 +2242,99 @@ fn open_chain_devices(
             device_set.add_device(Arc::clone(&device), true);
             io_events.push(IoEvent::new(mmio)?);
             idx += 1;
+        }
+    }
+
+    Ok(idx - start_idx)
+}
+
+/// Variant of [`open_chain_devices`] that opens specific slots
+/// with read-write access instead of read-only.
+///
+/// `rw_slots` lists the device-slot indices (relative to
+/// `start_idx`, i.e. 0 = first opened image, 1 = second, ...)
+/// that should be attached via [`BackingStore::open_rw_existing`].
+/// Every other slot is opened read-only just as
+/// [`open_chain_devices`] does. The virtio device is also
+/// constructed with `read_only=false` for RW slots so that the
+/// guest's `write_input_sector` reaches the file rather than
+/// being rejected by the device's read-only feature flag.
+///
+/// Designed for commit (phase 8 of PLAN-rebase-commit), where
+/// the overlay attached as input slot 0 needs RW so the
+/// overlay-clear pass can zero its L2 / refcount entries.
+/// Rebase (phase 4) does not use this variant — the overlay
+/// being rebased is the output device, not an input.
+///
+/// The `rw_slots` indices count chain images and external data
+/// files in the same order they would be attached by
+/// `open_chain_devices`, starting from `0`. Indices outside the
+/// number of devices actually opened are ignored, matching the
+/// "tolerate extra entries" convention used by the chain
+/// helpers elsewhere in this file.
+#[allow(dead_code)]
+fn open_chain_devices_rw(
+    chain: &BackingChain,
+    sector_size: u64,
+    device_set: &mut DeviceSet,
+    io_events: &mut Vec<IoEvent>,
+    start_idx: usize,
+    label: &str,
+    rw_slots: &[usize],
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut idx = start_idx;
+    let mut slot_in_chain: usize = 0;
+
+    for image in chain.images().iter() {
+        let is_rw = rw_slots.contains(&slot_in_chain);
+        let backing = if is_rw {
+            BackingStore::open_rw_existing(&image.path, None)?
+        } else {
+            BackingStore::open(&image.path, true, None, false)?
+        };
+        let file_size = std::fs::metadata(&image.path)?.len();
+        let mmio = device_mmio_base(idx);
+        let vq = device_vq_base(idx);
+        let device = VirtioBlockDevice::new(backing, file_size, sector_size, !is_rw, mmio, vq);
+        debug!(
+            "Created {} device [{}] at MMIO 0x{:x} ({}): {}",
+            label,
+            idx,
+            mmio,
+            if is_rw { "rw" } else { "ro" },
+            image.path.display()
+        );
+        let device = Arc::new(Mutex::new(device));
+        device_set.add_device(Arc::clone(&device), true);
+        io_events.push(IoEvent::new(mmio)?);
+        idx += 1;
+        slot_in_chain += 1;
+
+        for data_file in &image.external_data_files {
+            let is_rw = rw_slots.contains(&slot_in_chain);
+            let data_backing = if is_rw {
+                BackingStore::open_rw_existing(&data_file.path, None)?
+            } else {
+                BackingStore::open(&data_file.path, true, None, false)?
+            };
+            let data_size = std::fs::metadata(&data_file.path)?.len();
+            let mmio = device_mmio_base(idx);
+            let vq = device_vq_base(idx);
+            let device =
+                VirtioBlockDevice::new(data_backing, data_size, sector_size, !is_rw, mmio, vq);
+            debug!(
+                "Created {} data file device [{}] at MMIO 0x{:x} ({}): {}",
+                label,
+                idx,
+                mmio,
+                if is_rw { "rw" } else { "ro" },
+                data_file.path.display()
+            );
+            let device = Arc::new(Mutex::new(device));
+            device_set.add_device(Arc::clone(&device), true);
+            io_events.push(IoEvent::new(mmio)?);
+            idx += 1;
+            slot_in_chain += 1;
         }
     }
 

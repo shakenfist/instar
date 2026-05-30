@@ -294,6 +294,26 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
                 r.error
             )
         }
+        Some(guest_::GuestMessage_::Payload::RebaseResult(r)) => {
+            format!(
+                "rebase_result overlay_format={} mode={} clusters_copied={} \
+                bytes_copied={} error={}",
+                r.overlay_format, r.mode, r.clusters_copied, r.bytes_copied, r.error
+            )
+        }
+        Some(guest_::GuestMessage_::Payload::CommitResult(c)) => {
+            format!(
+                "commit_result overlay_format={} backing_format={} \
+                clusters_committed={} bytes_committed={} \
+                overlay_clusters_cleared={} error={}",
+                c.overlay_format,
+                c.backing_format,
+                c.clusters_committed,
+                c.bytes_committed,
+                c.overlay_clusters_cleared,
+                c.error
+            )
+        }
         None => "empty payload".to_string(),
     };
 

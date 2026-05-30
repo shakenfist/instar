@@ -420,7 +420,7 @@ For **commit**:
 | Device slot | Image | Mode | Purpose |
 |-------------|-------|------|---------|
 | Output | Backing (commit target) | `O_RDWR` | Receive committed cluster data; refcount updates. |
-| Input 0 | Overlay | `O_RDWR` | Read source data; clear allocation at the end (so also opened RW). |
+| Input 0 | Overlay | `O_RDWR` | Read source data; clear allocation at the end. Attached via `open_chain_devices_rw` with `rw_slots=&[0]`; the guest uses `write_input_sector(0, ...)` to zero the overlay's L2 / refcount entries. |
 | Input 1..N | Backing's own ancestors | `O_RDONLY` | Needed only if commit chooses to skip clusters whose overlay value equals what the backing chain already provides (open question — see below). |
 
 Open subquestion for the commit phase plan: should commit be
@@ -437,19 +437,44 @@ inputs) already exists for convert.
 
 ### Call-table extension
 
-**None required.** `read_output_sector`, `write_output_sector`,
-`read_input_sector`, `get_input_device_count`,
-`get_input_capacity`, and `get_input_sector_size` together
-cover everything both subcommands need. The
-`OPERATION_CONFIG_ADDR` and `CHAIN_CONFIG_ADDR` slots already
-exist; we just add `RebaseConfig` / `RebaseResult` and
-`CommitConfig` / `CommitResult` structs to `src/shared/src/lib.rs`
-plus their `send_*_result` function pointers in `CallTable`.
+Three new function pointers are appended at the end of
+`CallTable` in `src/shared/src/lib.rs`, with `VERSION` bumped
+from 14 to 15 (see [PLAN-rebase-commit phase 1](PLAN-rebase-commit-phase-01-abi.md)
+for the wire details):
 
-The lack of an ABI change is one of the reasons rebase/commit
-should ship together: the cost we paid in resize to add
-`read_output_sector` is now amortised over three operations
-instead of one.
+- `send_rebase_result: unsafe extern "C" fn(*const RebaseResult)`
+- `send_commit_result: unsafe extern "C" fn(*const CommitResult)`
+- `write_input_sector: unsafe extern "C" fn(u32, u64, *const u8, usize) -> bool`
+
+The two `send_*_result` pointers follow the exact pattern of
+`send_resize_result` (resize phase 7) and `send_create_result`
+(create). `write_input_sector` is the symmetric counterpart of
+`read_input_sector` and is required for commit's overlay-clear
+pass: commit attaches the overlay as an input device (input
+slot 0) because the backing it writes the merged cluster data
+into is the output, and the guest needs to clear the overlay's
+L2 / refcount tables once the merge is done. Phase 1 research
+surfaced this gap; the master plan originally claimed no ABI
+extension was needed, which was incorrect.
+
+For the existing I/O primitives, rebase and commit reuse
+`read_output_sector` (added in resize phase 7),
+`write_output_sector`, `read_input_sector`,
+`get_input_device_count`, `get_input_capacity`, and
+`get_input_sector_size`. The `OPERATION_CONFIG_ADDR` and
+`CHAIN_CONFIG_ADDR` slots already exist; phase 1 adds
+`RebaseConfig` / `RebaseResult` and `CommitConfig` /
+`CommitResult` structs to `src/shared/src/lib.rs` alongside
+the existing per-op config and result families.
+
+On the host side, phase 1 also adds an `open_chain_devices_rw`
+helper alongside the existing `open_chain_devices`. The new
+variant takes a `rw_slots: &[usize]` parameter naming which
+chain slots should be opened `O_RDWR` (and constructed with
+`read_only=false` on the virtio side). For commit, slot 0 (the
+overlay) is RW; every other slot stays RO. For rebase, the
+helper is not used — the overlay being rebased is the output
+device.
 
 ### Per-format plans
 
