@@ -72,7 +72,7 @@ effort:
 
 | Phase | Plan | Status |
 |-------|------|--------|
-| 1. `qemu-img` subcommand parity (~~create~~ / map / ~~measure~~ / ~~resize~~ / snapshot / rebase / commit) | PLAN-convert-followups-phase-01-subcommands.md (not yet written) | Not started (`measure` complete — see [PLAN-measure.md](PLAN-measure.md); `create` complete — see [PLAN-create.md](PLAN-create.md); `resize` complete — see [PLAN-resize.md](PLAN-resize.md)) |
+| 1. `qemu-img` subcommand parity (~~create~~ / map / ~~measure~~ / ~~resize~~ / snapshot / rebase / commit) | PLAN-convert-followups-phase-01-subcommands.md (not yet written) | Not started (`measure` complete — see [PLAN-measure.md](PLAN-measure.md); `create` complete — see [PLAN-create.md](PLAN-create.md); `resize` complete — see [PLAN-resize.md](PLAN-resize.md); `rebase` and `commit` scheduled — see [PLAN-rebase-commit.md](PLAN-rebase-commit.md)) |
 | 2. `check --repair` wiring | PLAN-convert-followups-phase-02-check-repair.md (not yet written) | Not started |
 
 Subcommands in phase 1 should be split into one phase plan each
@@ -93,9 +93,8 @@ For phase 1 detail planning, the original scope notes from
 - ~~**resize**~~ — Shipped. See [PLAN-resize.md](PLAN-resize.md).
 - **snapshot** — List, apply, create, delete internal QCOW2
   snapshots.
-- **rebase** — Change backing file references. Unsafe
-  metadata-only mode and safe data-aware mode.
-- **commit** — Commit overlay changes into backing file.
+- **rebase** — Scheduled. See [PLAN-rebase-commit.md](PLAN-rebase-commit.md).
+- **commit** — Scheduled. See [PLAN-rebase-commit.md](PLAN-rebase-commit.md).
 
 ## Agent guidance
 
