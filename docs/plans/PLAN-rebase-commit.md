@@ -539,7 +539,7 @@ called out below. Each phase produces at least one commit.
 
 | Phase | Plan | Status |
 |-------|------|--------|
-| 1. Shared ABI: `RebaseConfig`, `CommitConfig`, `*Result` structs, `send_*_result` call-table pointers, `GuestMessage` arms, host two-device chain plumbing | PLAN-rebase-commit-phase-01-abi.md (not yet written) | Not started |
+| 1. Shared ABI: `RebaseConfig`, `CommitConfig`, `*Result` structs, `send_*_result` + `write_input_sector` call-table pointers, `GuestMessage` arms, host two-device chain plumbing | [PLAN-rebase-commit-phase-01-abi.md](PLAN-rebase-commit-phase-01-abi.md) | Not started (plan written) |
 | 2. Rebase planners (qcow2 + vmdk, both `-u` and safe modes) | PLAN-rebase-commit-phase-02-rebase-planners.md (not yet written) | Not started |
 | 3. Rebase guest binary | PLAN-rebase-commit-phase-03-rebase-guest.md (not yet written) | Not started |
 | 4. Rebase host CLI (`run_rebase`, clap args, chain wiring) | PLAN-rebase-commit-phase-04-rebase-host.md (not yet written) | Not started |
