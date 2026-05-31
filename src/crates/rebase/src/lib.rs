@@ -79,28 +79,34 @@ pub enum RebaseError {
     /// `RebaseResult::ERROR_HEADER_MISMATCH`.
     HeaderMismatch,
     /// The supplied new-backing-path is longer than the format's
-    /// cap (1024 bytes for qcow2; matches `CreateConfig`).
+    /// cap (1024 bytes for qcow2; matches `CreateConfig`). Maps
+    /// to `RebaseResult::ERROR_BACKING_PATH_TOO_LONG`.
     BackingPathTooLong,
     /// The caller-supplied scratch buffer is too small for the
-    /// requested layout.
+    /// requested layout. Maps to
+    /// `RebaseResult::ERROR_SCRATCH_TOO_SMALL`.
     ScratchTooSmall,
     /// The overlay's metadata is internally inconsistent in a
     /// way the planner can detect without I/O (e.g. negative
-    /// cluster index after decoding a header field).
+    /// cluster index after decoding a header field). Maps to
+    /// `RebaseResult::ERROR_OVERLAY_CORRUPT`.
     OverlayCorrupt,
     /// Safe-mode allocator: every existing refcount block (qcow2)
     /// or grain table (vmdk) is full and v1 does not yet append
     /// new ones. The user can fall back to `-u` mode or run
-    /// `qemu-img rebase`.
+    /// `qemu-img rebase`. Maps to
+    /// `RebaseResult::ERROR_REFCOUNT_EXHAUSTED`.
     RefcountExhausted,
     /// The vmdk descriptor slot is too small to hold the
-    /// new-backing-reference text.
+    /// new-backing-reference text. Maps to
+    /// `RebaseResult::ERROR_DESCRIPTOR_TOO_LARGE`.
     DescriptorTooLarge,
-    /// An internal size or offset computation overflowed.
+    /// An internal size or offset computation overflowed. Maps
+    /// to `RebaseResult::ERROR_INTERNAL_OVERFLOW`.
     Overflow,
     /// A format-specific parser failed to interpret the staged
     /// header bytes. Indicates either a corrupted image or a
-    /// host bug.
+    /// host bug. Maps to `RebaseResult::ERROR_PARSE_FAILED`.
     ParseFailed,
 }
 

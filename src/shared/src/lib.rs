@@ -2737,6 +2737,34 @@ impl RebaseResult {
     /// Overlay's header changed during the operation (defensive
     /// read-back check).
     pub const ERROR_HEADER_MISMATCH: u32 = 6;
+    /// Overlay's metadata is internally inconsistent (e.g.
+    /// `INCOMPAT_DIRTY` or `INCOMPAT_CORRUPT` set; cluster size
+    /// of zero).
+    pub const ERROR_OVERLAY_CORRUPT: u32 = 7;
+    /// New backing path exceeds the format's cap (1024 bytes
+    /// for qcow2; matches `CreateConfig`).
+    pub const ERROR_BACKING_PATH_TOO_LONG: u32 = 8;
+    /// Guest scratch buffer was too small for the requested
+    /// layout. Indicates either an image larger than v1
+    /// supports or a planner-side accounting bug.
+    pub const ERROR_SCRATCH_TOO_SMALL: u32 = 9;
+    /// Safe-mode allocator exhausted every existing refcount
+    /// block (qcow2) or grain table (vmdk). v1 doesn't yet
+    /// append new ones; the user can fall back to `-u` mode
+    /// or `qemu-img rebase`.
+    pub const ERROR_REFCOUNT_EXHAUSTED: u32 = 10;
+    /// vmdk descriptor slot is too small to hold the rewrite.
+    pub const ERROR_DESCRIPTOR_TOO_LARGE: u32 = 11;
+    /// Format-specific parser (`QcowHeader::parse`,
+    /// `Vmdk4HeaderFull::parse`) failed to interpret the
+    /// staged header bytes.
+    pub const ERROR_PARSE_FAILED: u32 = 12;
+    /// Internal size or offset computation overflowed.
+    /// Surfaces planner-side `Overflow` and guest-side
+    /// arithmetic checks. Distinct from `ERROR_PARSE_FAILED`
+    /// because the cause is a host or guest bug, not a
+    /// malformed image.
+    pub const ERROR_INTERNAL_OVERFLOW: u32 = 13;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -3495,6 +3523,38 @@ mod tests {
         };
         assert!(cfg.is_unsafe());
         assert!(cfg.is_detach());
+    }
+
+    #[test]
+    fn rebase_result_error_codes_distinct() {
+        // Phase 3 added codes 7..=13. Confirm every code is
+        // distinct so the host's match arms don't accidentally
+        // alias.
+        let codes = [
+            RebaseResult::ERROR_OK,
+            RebaseResult::ERROR_UNSUPPORTED_FORMAT,
+            RebaseResult::ERROR_NEW_BACKING_INCOMPATIBLE,
+            RebaseResult::ERROR_EXTERNAL_DATA_FILE,
+            RebaseResult::ERROR_LUKS_UNSUPPORTED,
+            RebaseResult::ERROR_CHAIN_DEPTH,
+            RebaseResult::ERROR_HEADER_MISMATCH,
+            RebaseResult::ERROR_OVERLAY_CORRUPT,
+            RebaseResult::ERROR_BACKING_PATH_TOO_LONG,
+            RebaseResult::ERROR_SCRATCH_TOO_SMALL,
+            RebaseResult::ERROR_REFCOUNT_EXHAUSTED,
+            RebaseResult::ERROR_DESCRIPTOR_TOO_LARGE,
+            RebaseResult::ERROR_PARSE_FAILED,
+            RebaseResult::ERROR_INTERNAL_OVERFLOW,
+        ];
+        for i in 0..codes.len() {
+            for j in (i + 1)..codes.len() {
+                assert_ne!(codes[i], codes[j], "codes {i} and {j} alias");
+            }
+        }
+        // Confirm contiguous 0..=13 numbering.
+        for (i, c) in codes.iter().enumerate() {
+            assert_eq!(*c, i as u32);
+        }
     }
 
     #[test]
