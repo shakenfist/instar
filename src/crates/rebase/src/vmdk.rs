@@ -86,6 +86,18 @@ pub struct GrainAllocationState {
     pub allocated: u64,
 }
 
+/// Allocate a single fresh grain in the overlay.
+///
+/// Step 2e fills this in. Step 2d ships a stub that returns
+/// [`RebaseError::UnsupportedFormat`] so the re-export from
+/// the crate root compiles.
+pub fn allocate_overlay_grain_vmdk(
+    _context: &mut RebaseVmdkSafeContext<'_>,
+    _state: &mut GrainAllocationState,
+) -> Result<u64, RebaseError> {
+    Err(RebaseError::UnsupportedFormat)
+}
+
 /// Plan a vmdk monolithicSparse rebase.
 pub fn plan_rebase_vmdk<'a>(
     opts: &VmdkRebaseOpts<'_>,
@@ -200,12 +212,10 @@ fn rewrite_descriptor(
         // Insert missing parent lines right after the first
         // `CID=` line, matching the descriptor layout
         // create::build_vmdk_descriptor_with_backing emits.
-        if line.starts_with(b"CID=") {
-            if !saw_parent_cid {
-                pos = write_parent_cid_line(dest, pos, cid_value)?;
-                pos = put_byte(dest, pos, b'\n')?;
-                saw_parent_cid = true;
-            }
+        if line.starts_with(b"CID=") && !saw_parent_cid {
+            pos = write_parent_cid_line(dest, pos, cid_value)?;
+            pos = put_byte(dest, pos, b'\n')?;
+            saw_parent_cid = true;
         }
 
         line_start = line_end + 1;
@@ -332,7 +342,8 @@ mod tests {
     fn inserts_missing_lines_after_cid() {
         // Descriptor without parentCID or parentFileNameHint;
         // rewriter should insert them after CID=.
-        let src = b"# Disk DescriptorFile\nversion=1\nCID=fffffffe\ncreateType=\"monolithicSparse\"\n";
+        let src =
+            b"# Disk DescriptorFile\nversion=1\nCID=fffffffe\ncreateType=\"monolithicSparse\"\n";
         let mut dest = [0u8; 4096];
         let n = rewrite_descriptor(src, b"new.vmdk", 0xabcd_1234, false, &mut dest).unwrap();
         let out = core::str::from_utf8(&dest[..n]).unwrap();
@@ -344,13 +355,7 @@ mod tests {
     #[test]
     fn rejects_when_dest_too_small() {
         let mut tiny = [0u8; 32];
-        let r = rewrite_descriptor(
-            SAMPLE_DESCRIPTOR,
-            b"new.vmdk",
-            0,
-            false,
-            &mut tiny,
-        );
+        let r = rewrite_descriptor(SAMPLE_DESCRIPTOR, b"new.vmdk", 0, false, &mut tiny);
         assert_eq!(r.err(), Some(RebaseError::DescriptorTooLarge));
     }
 
