@@ -568,7 +568,7 @@ called out below. Each phase produces at least one commit.
 | 2. Rebase planners (qcow2 + vmdk, both `-u` and safe modes) | [PLAN-rebase-commit-phase-02-rebase-planners.md](PLAN-rebase-commit-phase-02-rebase-planners.md) | Partial: qcow2 unsafe + safe (6395d97, 0e4c4b9), vmdk unsafe (54caf37). Deferred: vmdk safe-mode + grain allocator (step 2e), cross-format integration tests using create (step 2f). |
 | 3. Rebase guest binary | [PLAN-rebase-commit-phase-03-rebase-guest.md](PLAN-rebase-commit-phase-03-rebase-guest.md) | Partial: error codes (f96833a), scaffold (9dd1fa3), qcow2 unsafe (fd3e338), vmdk unsafe (a47f48d). Deferred: qcow2 safe-mode runner (step 3e) and read_chain_cluster helper (step 3f). |
 | 4. Rebase host CLI (`run_rebase`, clap args, chain wiring) | [PLAN-rebase-commit-phase-04-rebase-host.md](PLAN-rebase-commit-phase-04-rebase-host.md) | Partial: clap args + dispatch (913ce15), render + error mapping (3a39c33), pre-checks + chain discovery (dc39783). Deferred: KVM lifecycle / vCPU loop (step 4d), smoke tests (step 4e). |
-| 5. Rebase integration tests + cross-version baselines | PLAN-rebase-commit-phase-05-rebase-tests.md (not yet written) | Not started |
+| 5. Rebase integration tests + cross-version baselines | [PLAN-rebase-commit-phase-05-rebase-tests.md](PLAN-rebase-commit-phase-05-rebase-tests.md) | Not started (plan written) |
 | 6. Commit planners (qcow2 + vmdk) | PLAN-rebase-commit-phase-06-commit-planners.md (not yet written) | Not started |
 | 7. Commit guest binary | PLAN-rebase-commit-phase-07-commit-guest.md (not yet written) | Not started |
 | 8. Commit host CLI (`run_commit`, clap args, overlay-RW wiring) | PLAN-rebase-commit-phase-08-commit-host.md (not yet written) | Not started |
