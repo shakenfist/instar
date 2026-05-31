@@ -3415,6 +3415,120 @@ fn map_resize_error(code: u32) -> String {
     }
 }
 
+/// Render a success line for `instar rebase`. Human form
+/// matches qemu's `"Image rebased."` byte-for-byte (or
+/// `"Image detached."` for a detach); JSON form emits a
+/// structured envelope.
+#[allow(dead_code)]
+fn render_rebase_success(
+    args: &RebaseArgs,
+    overlay_format: u32,
+    mode: u32,
+    clusters_copied: u64,
+    bytes_copied: u64,
+) {
+    if args.quiet {
+        return;
+    }
+    let mode_str = if mode == shared::RebaseResult::MODE_SAFE {
+        "safe"
+    } else {
+        "unsafe"
+    };
+    let is_detach = args.backing.is_empty();
+    if args.output == "json" {
+        if is_detach {
+            println!(
+                "{{\n  \"overlay\": \"{}\",\n  \"overlay_format\": \"{}\",\n  \
+                 \"mode\": \"{}\",\n  \"clusters_copied\": {},\n  \
+                 \"bytes_copied\": {},\n  \"detached\": true\n}}",
+                json_escape_string(&args.filename),
+                image_format_name(overlay_format),
+                mode_str,
+                clusters_copied,
+                bytes_copied,
+            );
+        } else {
+            println!(
+                "{{\n  \"overlay\": \"{}\",\n  \"overlay_format\": \"{}\",\n  \
+                 \"mode\": \"{}\",\n  \"clusters_copied\": {},\n  \
+                 \"bytes_copied\": {},\n  \"new_backing\": \"{}\"\n}}",
+                json_escape_string(&args.filename),
+                image_format_name(overlay_format),
+                mode_str,
+                clusters_copied,
+                bytes_copied,
+                json_escape_string(&args.backing),
+            );
+        }
+    } else if is_detach {
+        println!("Image detached.");
+    } else {
+        println!("Image rebased.");
+    }
+}
+
+/// Map a `RebaseResult::ERROR_*` code to a user-facing
+/// string. Exhaustive on the constants from
+/// `src/shared/src/lib.rs` (0..=13); the trailing catch-all
+/// covers future code additions only.
+#[allow(dead_code)]
+fn map_rebase_error(code: u32) -> String {
+    match code {
+        c if c == shared::RebaseResult::ERROR_OK => "ok".into(),
+        c if c == shared::RebaseResult::ERROR_UNSUPPORTED_FORMAT => {
+            "format does not support rebase in this mode (qcow2 and vmdk only; \
+             safe mode for qcow2 only; vmdk safe mode not yet supported -- try -u)"
+                .into()
+        }
+        c if c == shared::RebaseResult::ERROR_NEW_BACKING_INCOMPATIBLE => {
+            "new backing is incompatible with the overlay (virtual size too small \
+             or format unsupported)"
+                .into()
+        }
+        c if c == shared::RebaseResult::ERROR_EXTERNAL_DATA_FILE => {
+            "qcow2 overlays with the external-data-file feature cannot be rebased".into()
+        }
+        c if c == shared::RebaseResult::ERROR_LUKS_UNSUPPORTED => {
+            "LUKS-encrypted overlays and backings are not yet supported for rebase".into()
+        }
+        c if c == shared::RebaseResult::ERROR_CHAIN_DEPTH => {
+            "the combined old and new backing chains exceed the maximum depth".into()
+        }
+        c if c == shared::RebaseResult::ERROR_HEADER_MISMATCH => {
+            "the overlay's header changed during rebase, or a guest write failed; \
+             retry, or run `instar check` if the image may be corrupt"
+                .into()
+        }
+        c if c == shared::RebaseResult::ERROR_OVERLAY_CORRUPT => {
+            "the overlay is marked dirty or corrupt; run `instar check` first".into()
+        }
+        c if c == shared::RebaseResult::ERROR_BACKING_PATH_TOO_LONG => {
+            "the new backing path is longer than the overlay's existing slot, and \
+             long-path relocation is not yet supported in this release"
+                .into()
+        }
+        c if c == shared::RebaseResult::ERROR_SCRATCH_TOO_SMALL => {
+            "the overlay is too large for the rebase scratch buffer".into()
+        }
+        c if c == shared::RebaseResult::ERROR_REFCOUNT_EXHAUSTED => {
+            "the overlay's refcount blocks are full; v1 doesn't append new ones. \
+             Fall back to -u or use `qemu-img rebase`"
+                .into()
+        }
+        c if c == shared::RebaseResult::ERROR_DESCRIPTOR_TOO_LARGE => {
+            "the vmdk descriptor slot is too small for the new backing reference".into()
+        }
+        c if c == shared::RebaseResult::ERROR_PARSE_FAILED => {
+            "the overlay's header could not be parsed".into()
+        }
+        c if c == shared::RebaseResult::ERROR_INTERNAL_OVERFLOW => {
+            "internal size or offset computation overflowed (host or guest bug)".into()
+        }
+        _ => format!("unknown rebase error code {code}"),
+    }
+}
+
 /// Host-side mirror of `ResizeResult` populated by the guest
 /// dispatch.
 struct ResizeRunResult {
