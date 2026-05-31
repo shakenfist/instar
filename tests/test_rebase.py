@@ -8,21 +8,25 @@ Phase 5 of PLAN-rebase-commit.md. Structurally a sibling of
   child classes.
 - ``TestRebaseErrorPaths`` pins the host CLI rejection
   contracts established in phase 4 step 4c (pre-checks +
-  chain discovery). These tests run today.
+  chain discovery).
 - ``TestRebaseSuccessPaths`` enumerates the success-path
-  contracts. Each test currently calls ``self.skipTest`` with
-  a message naming the phase 4 step 4d dependency. When step
-  4d ships, the skips become asserts.
+  contracts. The qcow2 ``-u`` rebase and detach paths run
+  end-to-end now that step 4d (KVM guest lifecycle) ships.
+  The vmdk and round-trip cases still skip — they need test
+  scaffolding (vmdk creation with a backing reference,
+  qemu-img round-trip harness) that lives in phase 5 step 5f.
 
 Steps 5d (cross-version baselines in the instar-testdata
 repo) and 5e (`TestRebaseBaselineMatrix`) are deferred to a
 follow-up; the matrix factory pattern from
 `tests/test_resize.py:359` is the template when they land.
 
-Tests run on the host's installed `instar` binary; the
-host-side error-path tests don't require ``/dev/kvm`` access.
+Tests run on the host's installed `instar` binary. The
+success-path tests require ``/dev/kvm`` access; the error
+paths don't.
 """
 
+import json
 import subprocess
 import tempfile
 from pathlib import Path
@@ -156,42 +160,88 @@ class TestRebaseErrorPaths(TestRebaseSmoke):
 
 
 # ----------------------------------------------------------------------
-# Success-path tests — currently skipped because the rebase
-# guest lifecycle (phase 4 step 4d) is deferred. When 4d
-# ships, removing the `self.skipTest(...)` line should be the
-# only change required to ungate each test.
+# Success-path tests — end-to-end with the rebase guest
+# lifecycle from phase 4 step 4d. The qcow2 in-place cases
+# run today; vmdk and qemu-img round-trip are still skipped
+# pending the test scaffolding in phase 5 step 5f.
 # ----------------------------------------------------------------------
 
 
 class TestRebaseSuccessPaths(TestRebaseSmoke):
-    """End-to-end success-path tests (deferred — phase 4 step 4d)."""
-
-    DEFER_MSG = 'rebase guest lifecycle deferred (phase 4 step 4d)'
+    """End-to-end success-path tests."""
 
     def test_qcow2_unsafe_rebase_records_new_backing(self):
-        """qcow2 `-u` rebase rewrites the overlay's backing reference."""
-        self.skipTest(self.DEFER_MSG)
-        # When 4d ships, the assertion shape is:
-        #   1. instar create -f qcow2 -b old_parent_path overlay 1M
-        #   2. self.run_instar_rebase(overlay, '-u', '-b', new_parent_path)
-        #   3. self.run_instar_info(overlay, output='json')
-        #   4. Assert info['backing-filename'] == new_parent_path
+        """qcow2 `-u` rebase rewrites the overlay's backing reference.
+
+        Uses an equal-length new backing path so the new
+        reference fits into the overlay's existing
+        backing_file_size slot. Long-path relocation is a v2
+        item (`ERROR_BACKING_PATH_TOO_LONG` from the planner).
+        """
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            old_backing = td / 'base.qcow2'
+            new_backing = td / 'next.qcow2'  # same length as old
+            overlay = td / 'overlay.qcow2'
+
+            _, _, rc = self.run_instar_create(
+                '-f', 'qcow2', str(old_backing), '1M')
+            self.assertEqual(rc, 0)
+            _, _, rc = self.run_instar_create(
+                '-f', 'qcow2', str(new_backing), '1M')
+            self.assertEqual(rc, 0)
+            _, _, rc = self.run_instar_create(
+                '-f', 'qcow2', '-b', 'base.qcow2', '-F', 'qcow2',
+                str(overlay), '1M')
+            self.assertEqual(rc, 0)
+
+            _, stderr, rc = self.run_instar_rebase(
+                overlay, '-u', '-b', 'next.qcow2')
+            self.assertEqual(
+                rc, 0,
+                f'rebase failed: stderr={stderr!r}')
+
+            stdout, stderr, rc = self.run_instar_info(
+                overlay, output_format='json')
+            self.assertEqual(rc, 0, f'info failed: stderr={stderr!r}')
+            info = json.loads(stdout)
+            self.assertEqual(info.get('backing-filename'), 'next.qcow2')
 
     def test_qcow2_unsafe_detach(self):
         """qcow2 `-u -b ""` clears the overlay's backing reference."""
-        self.skipTest(self.DEFER_MSG)
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            backing = td / 'base.qcow2'
+            overlay = td / 'overlay.qcow2'
+
+            _, _, rc = self.run_instar_create(
+                '-f', 'qcow2', str(backing), '1M')
+            self.assertEqual(rc, 0)
+            _, _, rc = self.run_instar_create(
+                '-f', 'qcow2', '-b', 'base.qcow2', '-F', 'qcow2',
+                str(overlay), '1M')
+            self.assertEqual(rc, 0)
+
+            _, stderr, rc = self.run_instar_rebase(
+                overlay, '-u', '-b', '')
+            self.assertEqual(
+                rc, 0,
+                f'detach failed: stderr={stderr!r}')
+
+            stdout, stderr, rc = self.run_instar_info(
+                overlay, output_format='json')
+            self.assertEqual(rc, 0, f'info failed: stderr={stderr!r}')
+            info = json.loads(stdout)
+            self.assertNotIn('backing-filename', info)
+            self.assertNotIn('full-backing-filename', info)
 
     def test_vmdk_unsafe_rebase_records_new_backing(self):
         """vmdk monolithicSparse `-u` rebase rewrites parentFileNameHint."""
-        self.skipTest(self.DEFER_MSG)
+        self.skipTest(
+            'vmdk test scaffolding (overlay-with-backing creation) '
+            'lands in phase 5 step 5f')
 
     def test_qcow2_rebase_round_trip_matches_qemu(self):
         """Round-trip: instar's rebased overlay matches qemu-img's."""
-        self.skipTest(self.DEFER_MSG)
-        # When 4d ships, the assertion shape (per step 5f):
-        #   1. Build overlay + backing.
-        #   2. Make two copies of the overlay.
-        #   3. Run instar rebase on copy A; qemu-img rebase on copy B.
-        #   4. Run qemu-img info --output=json on each.
-        #   5. assert_info_equivalent(self, copyA_info, copyB_info, 'qcow2',
-        #                             tmp_path=str(copyA), expected_tmp_path=str(copyB))
+        self.skipTest(
+            'qemu-img round-trip harness lands in phase 5 step 5f')

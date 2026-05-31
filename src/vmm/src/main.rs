@@ -181,6 +181,11 @@ const CREATE_RESULT_ERROR_BACKING_SIZE_TOO_LARGE: u32 = 10;
 
 // ResizeConfig constants (must match shared crate)
 const RESIZE_CONFIG_MAGIC: u32 = 0x52455349; // "RESI"
+const REBASE_CONFIG_MAGIC: u32 = 0x52454241; // "REBA"
+const REBASE_CONFIG_FLAG_UNSAFE: u32 = 1 << 0;
+#[allow(dead_code)]
+const REBASE_CONFIG_FLAG_QUIET: u32 = 1 << 1;
+const REBASE_CONFIG_FLAG_DETACH: u32 = 1 << 2;
 const RESIZE_CONFIG_FLAG_SHRINK: u32 = 1 << 0;
 #[allow(dead_code)]
 const RESIZE_CONFIG_FLAG_EXTENDED_L2: u32 = 1 << 1;
@@ -2541,7 +2546,6 @@ struct RebaseArgs {
 
 /// Host-side holder for the harvested `RebaseResultMessage`.
 /// Mirrors `ResizeRunResult`.
-#[allow(dead_code)]
 struct RebaseRunResult {
     overlay_format: u32,
     mode: u32,
@@ -3246,29 +3250,110 @@ fn run_rebase(args: RebaseArgs, verbose: bool) -> Result<(), Box<dyn std::error:
         .into());
     }
 
-    // Pre-checks complete. The remaining work — opening the
-    // overlay as the output device, attaching the input
-    // chains via open_chain_devices, writing RebaseConfig to
-    // OPERATION_CONFIG_ADDR, launching the rebase guest
-    // binary, and harvesting RebaseResultMessage — is phase
-    // 4 step 4d. Until that ships, the runner errors out
-    // here with a pointer to the deferred work.
-    let _ = probed;
-    let _ = old_chain_full;
-    let _ = new_chain_full;
-    let _ = total_input_devices;
-    Err(format!(
-        "rebase: pre-checks passed (overlay format={}, virtual_size={}, \
-         old chain {} parents, new chain {} devices, mode={}); guest \
-         lifecycle not yet wired -- see PLAN-rebase-commit-phase-04-rebase-host.md \
-         step 4d",
-        image_format_name(probed.format),
+    // Build a parents-only sub-chain (strip the overlay itself
+    // from the front of the discovered chain). The guest's old
+    // chain is the parents only — the overlay is the output
+    // device, not an input.
+    let old_chain_parents = if old_chain_images.is_empty() {
+        BackingChain::new()
+    } else {
+        let mut parents = BackingChain::new();
+        for img in &old_chain_images[1..] {
+            parents.push(img.clone());
+        }
+        parents
+    };
+    let old_chain_input_devices = old_chain_parents.total_devices();
+    let new_chain_input_devices = new_chain_full
+        .as_ref()
+        .map(|c| c.total_devices())
+        .unwrap_or(0);
+    let total_input_devices_final = old_chain_input_devices + new_chain_input_devices;
+    debug_assert_eq!(total_input_devices_final, total_input_devices);
+
+    // Resolve the new-backing-format hint. None / "" → 0
+    // (auto-detect by the guest probe path). Honour `-F`.
+    let new_backing_format_code = match args.backing_format.as_deref() {
+        None => 0u32,
+        Some("qcow2") => IMAGE_FORMAT_QCOW2,
+        Some("vmdk") => IMAGE_FORMAT_VMDK4,
+        Some("raw") => IMAGE_FORMAT_RAW,
+        Some(other) => {
+            return Err(format!(
+                "rebase: backing format '{other}' is not supported (qcow2, vmdk, raw only)"
+            )
+            .into());
+        }
+    };
+
+    let mut flags: u32 = 0;
+    if args.unsafe_mode {
+        flags |= REBASE_CONFIG_FLAG_UNSAFE;
+    }
+    if args.quiet {
+        flags |= REBASE_CONFIG_FLAG_QUIET;
+    }
+    if is_detach {
+        flags |= REBASE_CONFIG_FLAG_DETACH;
+    }
+
+    // Load core + rebase guest binaries.
+    let core_path = get_binary_path("core.bin");
+    let core_code = load_guest_binary(
+        core_path
+            .to_str()
+            .ok_or("rebase: core.bin path is not valid UTF-8")?,
+    )?;
+    let rebase_path = get_binary_path("rebase.bin");
+    let rebase_code = load_guest_binary(
+        rebase_path
+            .to_str()
+            .ok_or("rebase: rebase.bin path is not valid UTF-8")?,
+    )?;
+
+    // Open the overlay as the output device, RW. Expose a
+    // generous capacity hint so safe mode can grow the file
+    // (allocate clusters past EOF) without being rejected at
+    // the virtio boundary. Unsafe mode never grows.
+    let capacity_hint = probed.current_file_size.saturating_mul(2).max(1 << 30);
+    let output_backing = BackingStore::open_rw_existing(overlay_path, Some(capacity_hint))?;
+
+    let result = run_rebase_guest(
+        &core_code,
+        &rebase_code,
+        probed.format,
+        new_backing_format_code,
+        flags,
+        sector_size,
+        probed.overlay_cluster_size,
         probed.current_virtual_size,
-        old_chain_parent_count,
-        new_chain_count,
-        if args.unsafe_mode { "unsafe" } else { "safe" },
-    )
-    .into())
+        args.backing.as_bytes(),
+        output_backing,
+        capacity_hint,
+        &old_chain_parents,
+        new_chain_full.as_ref(),
+        old_chain_input_devices,
+        new_chain_input_devices,
+        verbose,
+    )?;
+
+    if result.error != shared::RebaseResult::ERROR_OK {
+        return Err(format!(
+            "rebase: guest reported error {}: {}",
+            result.error,
+            map_rebase_error(result.error)
+        )
+        .into());
+    }
+
+    render_rebase_success(
+        &args,
+        result.overlay_format,
+        result.mode,
+        result.clusters_copied,
+        result.bytes_copied,
+    );
+    Ok(())
 }
 
 /// Run the resize operation.
@@ -3597,7 +3682,6 @@ fn map_resize_error(code: u32) -> String {
 /// matches qemu's `"Image rebased."` byte-for-byte (or
 /// `"Image detached."` for a detach); JSON form emits a
 /// structured envelope.
-#[allow(dead_code)]
 fn render_rebase_success(
     args: &RebaseArgs,
     overlay_format: u32,
@@ -3650,7 +3734,6 @@ fn render_rebase_success(
 /// string. Exhaustive on the constants from
 /// `src/shared/src/lib.rs` (0..=13); the trailing catch-all
 /// covers future code additions only.
-#[allow(dead_code)]
 fn map_rebase_error(code: u32) -> String {
     match code {
         c if c == shared::RebaseResult::ERROR_OK => "ok".into(),
@@ -4168,6 +4251,400 @@ fn run_resize_guest(
     }
     if !result_seen {
         return Err("resize: guest did not return a result".into());
+    }
+    Ok(harvested)
+}
+
+/// Launch the rebase guest binary, wait for the
+/// `RebaseResultMessage`. Modelled on `run_resize_guest` but
+/// with chain-of-inputs (old chain parents + new chain) + the
+/// overlay attached as the output device.
+#[allow(clippy::too_many_arguments)]
+fn run_rebase_guest(
+    core_code: &[u8],
+    operation_code: &[u8],
+    overlay_format: u32,
+    new_backing_format: u32,
+    flags: u32,
+    sector_size: u32,
+    overlay_cluster_size: u32,
+    overlay_virtual_size: u64,
+    new_backing_path: &[u8],
+    output_backing: BackingStore,
+    output_capacity_hint: u64,
+    old_chain_parents: &BackingChain,
+    new_chain: Option<&BackingChain>,
+    old_chain_input_devices: usize,
+    new_chain_input_devices: usize,
+    verbose: bool,
+) -> Result<RebaseRunResult, Box<dyn std::error::Error>> {
+    // --- KVM / VM / guest memory setup ----------------------------------
+    let kvm = Kvm::new()?;
+    debug!("KVM API version: {}", kvm.get_api_version());
+
+    let kvm_stats_checker = kvm_stats::KvmStatsChecker::new(&kvm);
+    kvm_stats_checker.display_status();
+
+    let vm = kvm.create_vm()?;
+    let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
+
+    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let host_addr = region.as_ptr() as u64;
+    let mem_region = kvm_userspace_memory_region {
+        slot: 0,
+        guest_phys_addr: 0,
+        memory_size: GUEST_MEM_SIZE,
+        userspace_addr: host_addr,
+        flags: 0,
+    };
+    // SAFETY: mem_region.userspace_addr points to a valid
+    // GuestMemoryMmap allocation that outlives the VM.
+    unsafe {
+        vm.set_user_memory_region(mem_region)?;
+    }
+    setup_gdt(&guest_mem)?;
+    setup_page_tables(&guest_mem, GUEST_MEM_SIZE)?;
+    guest_mem.write_slice(core_code, GuestAddress(GUEST_CODE_BASE))?;
+    guest_mem.write_slice(operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
+
+    // --- Write RebaseConfig at OPERATION_CONFIG_ADDR --------------------
+    // Layout (must match shared::RebaseConfig exactly):
+    //    0: magic                u32 ("REBA")
+    //    4: overlay_format       u32
+    //    8: new_backing_format   u32 (0 = guest auto-detect)
+    //   12: flags                u32
+    //   16: sector_size          u32
+    //   20: overlay_cluster_size u32
+    //   24: overlay_virtual_size u64
+    //   32: old_chain_first      u32
+    //   36: old_chain_count      u32
+    //   40: new_chain_first      u32
+    //   44: new_chain_count      u32
+    //   48: new_backing_path     [u8; 1024]
+    // 1072: new_backing_path_len u32
+    // 1076: _reserved            [u8; 60]
+    let old_chain_first = 0u32;
+    let old_chain_count = old_chain_input_devices as u32;
+    let new_chain_first = old_chain_count;
+    let new_chain_count = new_chain_input_devices as u32;
+    let path_len = new_backing_path.len();
+    if path_len > 1024 {
+        return Err(format!("rebase: backing path is {path_len} bytes; maximum is 1024").into());
+    }
+
+    guest_mem.write_obj(REBASE_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
+    guest_mem.write_obj(overlay_format, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
+    guest_mem.write_obj(new_backing_format, GuestAddress(OPERATION_CONFIG_ADDR + 8))?;
+    guest_mem.write_obj(flags, GuestAddress(OPERATION_CONFIG_ADDR + 12))?;
+    guest_mem.write_obj(sector_size, GuestAddress(OPERATION_CONFIG_ADDR + 16))?;
+    guest_mem.write_obj(
+        overlay_cluster_size,
+        GuestAddress(OPERATION_CONFIG_ADDR + 20),
+    )?;
+    guest_mem.write_obj(
+        overlay_virtual_size,
+        GuestAddress(OPERATION_CONFIG_ADDR + 24),
+    )?;
+    guest_mem.write_obj(old_chain_first, GuestAddress(OPERATION_CONFIG_ADDR + 32))?;
+    guest_mem.write_obj(old_chain_count, GuestAddress(OPERATION_CONFIG_ADDR + 36))?;
+    guest_mem.write_obj(new_chain_first, GuestAddress(OPERATION_CONFIG_ADDR + 40))?;
+    guest_mem.write_obj(new_chain_count, GuestAddress(OPERATION_CONFIG_ADDR + 44))?;
+    if path_len > 0 {
+        guest_mem.write_slice(new_backing_path, GuestAddress(OPERATION_CONFIG_ADDR + 48))?;
+    }
+    guest_mem.write_obj(
+        path_len as u32,
+        GuestAddress(OPERATION_CONFIG_ADDR + 48 + 1024),
+    )?;
+    // _reserved at offset 1076 stays zero from page-zeroed memory.
+
+    debug!(
+        "Wrote rebase config at 0x{:x} (overlay_format={}, flags=0x{:x}, \
+         old_chain=[{}..+{}), new_chain=[{}..+{}), path_len={})",
+        OPERATION_CONFIG_ADDR,
+        overlay_format,
+        flags,
+        old_chain_first,
+        old_chain_count,
+        new_chain_first,
+        new_chain_count,
+        path_len,
+    );
+
+    // --- Set up devices --------------------------------------------------
+    // Device layout (MMIO slot order):
+    //   [0..old_chain_input_devices): old chain parents
+    //   [old_chain_input_devices..total_inputs): new chain
+    //   [total_inputs]: overlay (output, RW)
+    //
+    // If there are no inputs (detach with no parents and no new
+    // chain) the core binary still unconditionally probes
+    // input device 0 — attach a 1-sector stub at slot 0 just
+    // like resize does, and place the output at slot 1.
+    let total_input_devices = old_chain_input_devices + new_chain_input_devices;
+
+    let mut device_set = DeviceSet::new();
+    let mut io_events: Vec<IoEvent> = Vec::new();
+
+    struct RebaseStubInput(std::path::PathBuf);
+    impl Drop for RebaseStubInput {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _stub_input: Option<RebaseStubInput> = if total_input_devices == 0 {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let stub_path = std::env::temp_dir().join(format!("instar-rebase-stub-{pid}-{nanos}"));
+        let stub_file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&stub_path)?;
+        stub_file.set_len(sector_size as u64)?;
+        drop(stub_file);
+        let stub = RebaseStubInput(stub_path.clone());
+        let input_backing = BackingStore::open(&stub_path, true, None, false)?;
+        let input_mmio = device_mmio_base(0);
+        let input_vq = device_vq_base(0);
+        let input_device = VirtioBlockDevice::new(
+            input_backing,
+            sector_size as u64,
+            sector_size as u64,
+            true,
+            input_mmio,
+            input_vq,
+        );
+        let input_device = Arc::new(Mutex::new(input_device));
+        device_set.add_device(Arc::clone(&input_device), true);
+        io_events.push(IoEvent::new(input_mmio)?);
+        Some(stub)
+    } else {
+        let opened = open_chain_devices(
+            old_chain_parents,
+            sector_size as u64,
+            &mut device_set,
+            &mut io_events,
+            0,
+            "rebase-old",
+        )?;
+        if let Some(chain) = new_chain {
+            open_chain_devices(
+                chain,
+                sector_size as u64,
+                &mut device_set,
+                &mut io_events,
+                opened,
+                "rebase-new",
+            )?;
+        }
+        None
+    };
+
+    // Output device — overlay, attached at the slot after all
+    // inputs. When `total_input_devices == 0` we have a 1-slot
+    // stub, so the overlay sits at slot 1; otherwise it sits at
+    // `total_input_devices`.
+    let output_slot = if total_input_devices == 0 {
+        1
+    } else {
+        total_input_devices
+    };
+    let output_mmio = device_mmio_base(output_slot);
+    let output_vq = device_vq_base(output_slot);
+    let output_device = VirtioBlockDevice::new(
+        output_backing,
+        output_capacity_hint,
+        sector_size as u64,
+        false,
+        output_mmio,
+        output_vq,
+    );
+    let output_device = Arc::new(Mutex::new(output_device));
+    device_set.add_device(Arc::clone(&output_device), false);
+    io_events.push(IoEvent::new(output_mmio)?);
+
+    let guest_mem = Arc::new(guest_mem);
+    let vmm_stats = Arc::new(Mutex::new(VmmStats::new()));
+
+    let mut io_thread: Option<io_thread::IoThread> = None;
+    let mut registered_count = 0usize;
+    let mut registration_failed = false;
+    for evt in io_events.iter_mut() {
+        if let Err(e) = evt.register(&vm) {
+            debug!("ioeventfd: failed to register ({e:?}), falling back to VM exits");
+            registration_failed = true;
+            break;
+        }
+        registered_count += 1;
+    }
+    if registration_failed {
+        for evt in io_events.iter_mut().take(registered_count) {
+            let _ = evt.unregister(&vm);
+        }
+    }
+    let all_registered = !registration_failed;
+    if all_registered && !io_events.is_empty() {
+        let io_devices = device_set.create_io_devices(io_events);
+        io_thread = Some(io_thread::IoThread::new(
+            io_devices,
+            Arc::clone(&guest_mem),
+            Arc::clone(&vmm_stats),
+        ));
+    }
+
+    // --- vCPU setup ------------------------------------------------------
+    let mut vcpu = vm.create_vcpu(0)?;
+    let mut sregs = vcpu.get_sregs()?;
+    setup_sregs(&mut sregs);
+    vcpu.set_sregs(&sregs)?;
+    let mut regs = vcpu.get_regs()?;
+    setup_regs(&mut regs);
+    vcpu.set_regs(&regs)?;
+
+    let mut serial_decoder = SerialDecoder::new();
+    let mut serial_transmitter = SerialTransmitter::new();
+    let mut debug_buffer = DebugBuffer::new();
+
+    // Inputs + output device config. If we used a stub, treat
+    // the stub as a single input so the guest's core init
+    // matches what's actually attached.
+    let input_device_count = if total_input_devices == 0 {
+        1
+    } else {
+        total_input_devices
+    };
+    let config = vmm_config_chain_with_output(sector_size, sector_size, input_device_count, 100);
+    serial_transmitter.queue_config(&config);
+
+    // --- Run the vCPU loop ----------------------------------------------
+    let mut result_seen = false;
+    let mut harvested = RebaseRunResult {
+        overlay_format,
+        mode: if flags & REBASE_CONFIG_FLAG_UNSAFE != 0 {
+            shared::RebaseResult::MODE_UNSAFE
+        } else {
+            shared::RebaseResult::MODE_SAFE
+        },
+        clusters_copied: 0,
+        bytes_copied: 0,
+        error: shared::RebaseResult::ERROR_OK,
+    };
+    let mut vm_error: Option<String> = None;
+
+    loop {
+        match vcpu.run()? {
+            VcpuExit::Hlt => {
+                vmm_stats.lock().unwrap().record_hlt();
+                break;
+            }
+            VcpuExit::IoOut(port, data) => {
+                vmm_stats.lock().unwrap().record_io_out();
+                if port == SERIAL_PORT {
+                    for &byte in data {
+                        if let Some(msg) = serial_decoder.add_byte(byte) {
+                            if let Some(guest_::GuestMessage_::Payload::RebaseResult(r)) =
+                                &msg.payload
+                            {
+                                harvested.overlay_format = match r.overlay_format.as_str() {
+                                    "qcow2" => IMAGE_FORMAT_QCOW2,
+                                    "vmdk" => IMAGE_FORMAT_VMDK4,
+                                    "raw" => IMAGE_FORMAT_RAW,
+                                    _ => overlay_format,
+                                };
+                                harvested.mode = match r.mode.as_str() {
+                                    "unsafe" => shared::RebaseResult::MODE_UNSAFE,
+                                    _ => shared::RebaseResult::MODE_SAFE,
+                                };
+                                harvested.clusters_copied = r.clusters_copied;
+                                harvested.bytes_copied = r.bytes_copied;
+                                harvested.error = r.error;
+                                result_seen = true;
+                            } else if verbose {
+                                debug!("{}", format_message(&msg));
+                            }
+                        }
+                    }
+                } else if port == DEBUG_PORT {
+                    for &byte in data {
+                        if let Some(line) = debug_buffer.add_byte(byte) {
+                            debug!("[GUEST] {line}");
+                        }
+                    }
+                } else {
+                    debug!("IO OUT: port=0x{port:x}, data={data:?}");
+                }
+            }
+            VcpuExit::IoIn(port, data) => {
+                vmm_stats.lock().unwrap().record_io_in();
+                if port == SERIAL_PORT {
+                    for byte in data.iter_mut() {
+                        *byte = serial_transmitter.next_byte().unwrap_or(0);
+                    }
+                } else if port == SERIAL_PORT + 5 {
+                    let mut lsr = 0x60u8;
+                    if serial_transmitter.has_data() {
+                        lsr |= 0x01;
+                    }
+                    data[0] = lsr;
+                } else {
+                    for byte in data {
+                        *byte = 0;
+                    }
+                }
+            }
+            VcpuExit::MmioRead(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_read();
+                let value = device_set.mmio_read(addr);
+                write_mmio_data(data, value);
+            }
+            VcpuExit::MmioWrite(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_write();
+                let value = read_mmio_data(data);
+                if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
+                    if io_thread.is_none() && should_process {
+                        device_set.process_queue_for_device(
+                            device_index,
+                            &guest_mem,
+                            &vmm_stats,
+                        )?;
+                    }
+                }
+            }
+            VcpuExit::Shutdown => {
+                vmm_stats.lock().unwrap().record_shutdown();
+                vm_error = Some("VM shutdown (triple fault)".to_string());
+                break;
+            }
+            VcpuExit::FailEntry(reason, cpu) => {
+                vmm_stats.lock().unwrap().record_fail_entry();
+                vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
+                break;
+            }
+            exit => {
+                vmm_stats.lock().unwrap().record_unknown();
+                vm_error = Some(format!("unexpected VM exit: {exit:?}"));
+                break;
+            }
+        }
+    }
+
+    if let Some(mut thread) = io_thread {
+        thread.stop();
+    }
+
+    if log::log_enabled!(log::Level::Debug) {
+        vmm_stats.lock().unwrap().display();
+    }
+
+    if let Some(error) = vm_error {
+        return Err(error.into());
+    }
+    if !result_seen {
+        return Err("rebase: guest did not return a result".into());
     }
     Ok(harvested)
 }
