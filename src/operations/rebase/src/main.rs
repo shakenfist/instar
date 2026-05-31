@@ -15,7 +15,10 @@
 
 use core::panic::PanicInfo;
 
-use rebase::RebaseError;
+use rebase::{
+    plan_rebase_qcow2, Qcow2RebaseOpts, Qcow2RebaseOutput, RebaseError, RebaseMode, RebasePatch,
+    RebasePlan,
+};
 use shared::{
     format_detection::detect_format_from_header, validate_call_table, CallTable, ImageFormat,
     RebaseConfig, RebaseResult, CALL_TABLE_ADDR, MAX_SECTOR_SIZE, OPERATION_CONFIG_ADDR,
@@ -210,21 +213,141 @@ unsafe fn write_byte_range(
     true
 }
 
+/// Apply a complete `RebasePlan` to the output device.
+/// Patches are applied in slice order; ordering is load-
+/// bearing for crash safety (path bytes before header field
+/// rewrite, refcount/L2 before path relocation Append).
+unsafe fn apply_rebase_plan(call_table: &CallTable, plan: &RebasePlan<'_>) -> bool {
+    let sector_size = (call_table.get_output_sector_size)();
+    for patch in plan.patches() {
+        let ok = match patch {
+            RebasePatch::Write { byte_offset, bytes }
+            | RebasePatch::Append { byte_offset, bytes } => {
+                write_byte_range(call_table, sector_size, *byte_offset, bytes)
+            }
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
 // ---------------------------------------------------------------------------
 // Per-format runners (stubs in step 3b)
 // ---------------------------------------------------------------------------
 
-/// qcow2 rebase runner. Filled in by steps 3c (unsafe) and 3e
-/// (safe).
-unsafe fn run_qcow2(_call_table: &CallTable, config: &RebaseConfig) -> RebaseResult {
-    let mode = if config.is_unsafe() {
-        RebaseResult::MODE_UNSAFE
+/// qcow2 rebase runner.
+///
+/// Dispatches on the `FLAG_UNSAFE` bit of [`RebaseConfig`] and
+/// delegates to [`run_qcow2_unsafe`] or [`run_qcow2_safe`].
+/// Safe mode is a stub in step 3c that returns
+/// `ERROR_UNSUPPORTED_FORMAT`; step 3e fills it in.
+unsafe fn run_qcow2(call_table: &CallTable, config: &RebaseConfig) -> RebaseResult {
+    if config.is_unsafe() {
+        run_qcow2_unsafe(call_table, config)
     } else {
-        RebaseResult::MODE_SAFE
+        run_qcow2_safe(call_table, config)
+    }
+}
+
+/// qcow2 unsafe-mode (`-u`) rebase: reads the overlay header,
+/// calls the planner with `RebaseMode::Unsafe`, and applies
+/// the resulting patches in order. No chain comparison, no
+/// data copy.
+unsafe fn run_qcow2_unsafe(call_table: &CallTable, config: &RebaseConfig) -> RebaseResult {
+    let sector_size = (call_table.get_output_sector_size)();
+    let header_bytes = core::slice::from_raw_parts(HEADER_BUF as *const u8, sector_size);
+
+    // The overlay's file size is the host's capacity hint (in
+    // sectors). Unsafe mode does not grow the file, so any
+    // value the planner can subsequently treat as "current EOF"
+    // is fine.
+    let capacity_sectors = (call_table.get_output_capacity)();
+    let overlay_file_size = capacity_sectors.saturating_mul(sector_size as u64);
+
+    // The new backing path slice; only the first
+    // new_backing_path_len bytes are valid input.
+    let path_len = config.new_backing_path_len as usize;
+    let new_backing_path = if path_len <= config.new_backing_path.len() {
+        &config.new_backing_path[..path_len]
+    } else {
+        // Defensive: a malformed host-side config that
+        // claims a longer length than the buffer holds is
+        // a parse failure.
+        return err_result(
+            config.overlay_format,
+            RebaseResult::MODE_UNSAFE,
+            RebaseResult::ERROR_PARSE_FAILED,
+        );
     };
+
+    let opts = Qcow2RebaseOpts {
+        mode: RebaseMode::Unsafe,
+        overlay_header: header_bytes,
+        overlay_file_size,
+        refcount_table: &[],
+        refblock_host_offsets: &[],
+        refcount_blocks: &[],
+        refblock_count: 0,
+        new_backing_virtual_size: config.overlay_virtual_size,
+        new_backing_path,
+        detach: config.is_detach(),
+    };
+
+    let scratch =
+        core::slice::from_raw_parts_mut(PLANNER_SCRATCH as *mut u8, PLANNER_SCRATCH_LIMIT);
+    let out = match plan_rebase_qcow2(&opts, scratch) {
+        Ok(o) => o,
+        Err(e) => {
+            return err_result(
+                config.overlay_format,
+                RebaseResult::MODE_UNSAFE,
+                map_rebase_error(e),
+            );
+        }
+    };
+
+    let plan = match out {
+        Qcow2RebaseOutput::Unsafe { plan } => plan,
+        Qcow2RebaseOutput::Safe { .. } => {
+            // Defensive: the planner shouldn't return Safe
+            // when we asked for Unsafe; if it does, treat it
+            // as an internal mismatch.
+            return err_result(
+                config.overlay_format,
+                RebaseResult::MODE_UNSAFE,
+                RebaseResult::ERROR_INTERNAL_OVERFLOW,
+            );
+        }
+    };
+
+    if !apply_rebase_plan(call_table, &plan) {
+        return err_result(
+            config.overlay_format,
+            RebaseResult::MODE_UNSAFE,
+            RebaseResult::ERROR_HEADER_MISMATCH,
+        );
+    }
+
+    RebaseResult {
+        magic: RebaseResult::MAGIC,
+        overlay_format: config.overlay_format,
+        mode: RebaseResult::MODE_UNSAFE,
+        error: RebaseResult::ERROR_OK,
+        clusters_copied: 0,
+        bytes_copied: 0,
+        _reserved: [0; 56],
+    }
+}
+
+/// qcow2 safe-mode rebase: drives the per-cluster comparison
+/// loop. Filled in by step 3e; currently returns
+/// `ERROR_UNSUPPORTED_FORMAT`.
+unsafe fn run_qcow2_safe(_call_table: &CallTable, config: &RebaseConfig) -> RebaseResult {
     err_result(
         config.overlay_format,
-        mode,
+        RebaseResult::MODE_SAFE,
         RebaseResult::ERROR_UNSUPPORTED_FORMAT,
     )
 }
