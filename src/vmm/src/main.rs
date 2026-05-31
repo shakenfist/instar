@@ -3079,18 +3079,196 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// Probed metadata for the overlay being rebased.
+#[allow(dead_code)]
+struct ProbedRebaseTarget {
+    format: u32,
+    current_virtual_size: u64,
+    current_file_size: u64,
+    overlay_cluster_size: u32,
+}
+
+/// Probe the overlay's format and key metadata. Reads the
+/// first 4 KiB sector-0 region via the host (the same
+/// pre-launch pattern resize uses).
+fn probe_rebase_target(
+    path: &Path,
+    forced_format: Option<&str>,
+) -> Result<ProbedRebaseTarget, Box<dyn std::error::Error>> {
+    use std::io::Read;
+    let mut file = std::fs::OpenOptions::new().read(true).open(path)?;
+    let current_file_size = file.metadata()?.len();
+
+    let mut buf = vec![0u8; 4096];
+    let read = file.read(&mut buf)?;
+    buf.truncate(read);
+
+    let detected = match forced_format {
+        Some("qcow2") => shared::ImageFormat::Qcow2,
+        Some("vmdk") => shared::ImageFormat::Vmdk4,
+        Some(other) => {
+            return Err(
+                format!("rebase: format '{other}' is not supported (qcow2 and vmdk only)").into(),
+            );
+        }
+        None => shared::format_detection::detect_format_from_header(&buf, buf.len(), false),
+    };
+
+    let (format_code, current_virtual_size, overlay_cluster_size) = match detected {
+        shared::ImageFormat::Qcow2 => {
+            let parsed = qcow2::QcowHeader::parse(&buf).ok_or_else(|| {
+                Box::<dyn std::error::Error>::from("rebase: failed to parse qcow2 header")
+            })?;
+            (
+                IMAGE_FORMAT_QCOW2,
+                parsed.virtual_size,
+                parsed.cluster_size as u32,
+            )
+        }
+        shared::ImageFormat::Vmdk4 => {
+            let parsed = vmdk::Vmdk4Header::parse(&buf).ok_or_else(|| {
+                Box::<dyn std::error::Error>::from("rebase: failed to parse vmdk header")
+            })?;
+            (IMAGE_FORMAT_VMDK4, parsed.virtual_size, 0u32)
+        }
+        other => {
+            return Err(format!(
+                "rebase: format '{:?}' does not support rebase (qcow2 and vmdk only)",
+                other
+            )
+            .into());
+        }
+    };
+
+    Ok(ProbedRebaseTarget {
+        format: format_code,
+        current_virtual_size,
+        current_file_size,
+        overlay_cluster_size,
+    })
+}
+
 /// Run the rebase operation.
 ///
-/// Steps 4c (`run_rebase` body) and 4d (`run_rebase_guest`)
-/// fill in the chain-discovery + KVM lifecycle. Step 4a
-/// ships only the dispatch stub so the clap surface compiles
-/// cleanly.
-#[allow(unused_variables)]
+/// Step 4c ships path resolution, format probing, chain
+/// discovery (old + new), and pre-checks. The actual KVM
+/// lifecycle that writes RebaseConfig, attaches the devices,
+/// and runs the guest is step 4d — currently deferred. The
+/// runner therefore errors out with a clear message at the
+/// guest-launch point.
 fn run_rebase(args: RebaseArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
-    Err(
-        "instar rebase is not yet implemented; see PLAN-rebase-commit-phase-04-rebase-host.md"
-            .into(),
+    let _ = verbose;
+    let overlay_path = Path::new(&args.filename);
+    if !overlay_path.exists() {
+        return Err(format!("rebase: overlay '{}' does not exist", args.filename).into());
+    }
+
+    let probed = probe_rebase_target(overlay_path, args.format.as_deref())?;
+
+    // Resolve the new backing path. Empty string = detach.
+    // Relative paths resolve against the overlay's parent
+    // directory to match qemu-img's semantics.
+    let is_detach = args.backing.is_empty();
+    let resolved_new_backing = if is_detach {
+        None
+    } else {
+        let p = Path::new(&args.backing);
+        let resolved = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            overlay_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(p)
+        };
+        if !args.unsafe_mode && !resolved.exists() {
+            return Err(format!(
+                "rebase: new backing file '{}' does not exist; pass -u to skip this check",
+                resolved.display()
+            )
+            .into());
+        }
+        Some(resolved)
+    };
+
+    // Validate the path length against the embedded buffer
+    // size in RebaseConfig.
+    if args.backing.len() > 1024 {
+        return Err(format!(
+            "rebase: backing path is {} bytes; maximum is 1024",
+            args.backing.len()
+        )
+        .into());
+    }
+
+    // Discover the old chain (the overlay's current parent +
+    // ancestors). discover_backing_chain returns a chain
+    // that starts with the top image (the overlay); strip
+    // that front entry so the chain is "parents only".
+    let security_config = config::SecurityConfig::default();
+    let sector_size = 512u32;
+
+    let old_chain_full = discover_backing_chain(overlay_path, sector_size, &security_config)
+        .map_err(|e| -> Box<dyn std::error::Error> { format!("rebase: {e}").into() })?;
+    let old_chain_images = old_chain_full.images();
+    let old_chain_parent_count = if old_chain_images.is_empty() {
+        0
+    } else {
+        old_chain_images.len() - 1
+    };
+
+    // Discover the new chain (only if not detaching).
+    let new_chain_full = if let Some(ref p) = resolved_new_backing {
+        Some(
+            discover_backing_chain(p, sector_size, &security_config)
+                .map_err(|e| -> Box<dyn std::error::Error> { format!("rebase: {e}").into() })?,
+        )
+    } else {
+        None
+    };
+    let new_chain_count = new_chain_full
+        .as_ref()
+        .map(|c| c.total_devices())
+        .unwrap_or(0);
+
+    // Combined device count check. MAX_CHAIN_DEVICES is the
+    // shared cap (16); the overlay itself uses the output
+    // slot, so the inputs are old_chain_parent_count +
+    // new_chain_count.
+    let total_input_devices = old_chain_parent_count + new_chain_count;
+    if total_input_devices > shared::MAX_CHAIN_DEVICES {
+        return Err(format!(
+            "rebase: combined chain length ({} parents + {} new chain) exceeds the {}-device limit",
+            old_chain_parent_count,
+            new_chain_count,
+            shared::MAX_CHAIN_DEVICES
+        )
+        .into());
+    }
+
+    // Pre-checks complete. The remaining work — opening the
+    // overlay as the output device, attaching the input
+    // chains via open_chain_devices, writing RebaseConfig to
+    // OPERATION_CONFIG_ADDR, launching the rebase guest
+    // binary, and harvesting RebaseResultMessage — is phase
+    // 4 step 4d. Until that ships, the runner errors out
+    // here with a pointer to the deferred work.
+    let _ = probed;
+    let _ = old_chain_full;
+    let _ = new_chain_full;
+    let _ = total_input_devices;
+    Err(format!(
+        "rebase: pre-checks passed (overlay format={}, virtual_size={}, \
+         old chain {} parents, new chain {} devices, mode={}); guest \
+         lifecycle not yet wired -- see PLAN-rebase-commit-phase-04-rebase-host.md \
+         step 4d",
+        image_format_name(probed.format),
+        probed.current_virtual_size,
+        old_chain_parent_count,
+        new_chain_count,
+        if args.unsafe_mode { "unsafe" } else { "safe" },
     )
+    .into())
 }
 
 /// Run the resize operation.
