@@ -568,7 +568,7 @@ called out below. Each phase produces at least one commit.
 | 2. Rebase planners (qcow2 + vmdk, both `-u` and safe modes) | [PLAN-rebase-commit-phase-02-rebase-planners.md](PLAN-rebase-commit-phase-02-rebase-planners.md) | Partial: qcow2 unsafe + safe (6395d97, 0e4c4b9), vmdk unsafe (54caf37). Deferred: vmdk safe-mode + grain allocator (step 2e), cross-format integration tests using create (step 2f). |
 | 3. Rebase guest binary | [PLAN-rebase-commit-phase-03-rebase-guest.md](PLAN-rebase-commit-phase-03-rebase-guest.md) | Partial: error codes (f96833a), scaffold (9dd1fa3), qcow2 unsafe (fd3e338), vmdk unsafe (a47f48d). Deferred: qcow2 safe-mode runner (step 3e) and read_chain_cluster helper (step 3f). |
 | 4. Rebase host CLI (`run_rebase`, clap args, chain wiring) | [PLAN-rebase-commit-phase-04-rebase-host.md](PLAN-rebase-commit-phase-04-rebase-host.md) | Partial: clap args + dispatch (913ce15), render + error mapping (3a39c33), pre-checks + chain discovery (dc39783). Deferred: KVM lifecycle / vCPU loop (step 4d), smoke tests (step 4e). |
-| 5. Rebase integration tests + cross-version baselines | [PLAN-rebase-commit-phase-05-rebase-tests.md](PLAN-rebase-commit-phase-05-rebase-tests.md) | Not started (plan written) |
+| 5. Rebase integration tests + cross-version baselines | [PLAN-rebase-commit-phase-05-rebase-tests.md](PLAN-rebase-commit-phase-05-rebase-tests.md) | Partial: base.py helpers (546d8fd), error + success-path scaffolding (837006a). Deferred: cross-version baselines in instar-testdata (5d), baseline matrix tests (5e), round-trip helper (5f). |
 | 6. Commit planners (qcow2 + vmdk) | PLAN-rebase-commit-phase-06-commit-planners.md (not yet written) | Not started |
 | 7. Commit guest binary | PLAN-rebase-commit-phase-07-commit-guest.md (not yet written) | Not started |
 | 8. Commit host CLI (`run_commit`, clap args, overlay-RW wiring) | PLAN-rebase-commit-phase-08-commit-host.md (not yet written) | Not started |
@@ -725,6 +725,25 @@ because the following statements will be true:
 
 Items beyond the twelve phases above:
 
+- **Phase 5 deferrals** (carried over from the partial
+  shipment of phase 5):
+  - Cross-version baselines (step 5d). Extend
+    `instar-testdata/scripts/generate-baselines.py` with
+    `REBASE_CASES` + `generate_rebase_baseline`, run the
+    generator across every installed qemu-img version,
+    commit `expected-outputs/rebase-info-json/` to the
+    `instar-testdata` repo.
+  - `TestRebaseBaselineMatrix` (step 5e). Mirror
+    `TestCreateBaselineMatrix` in `tests/test_create.py`
+    with factory-generated per-(target, case) tests
+    against the baselines from step 5d. The matrix
+    factory pattern from `tests/test_resize.py:359` is
+    the template.
+  - Round-trip helper test (step 5f). Implements the
+    canonical "instar matches qemu-img" assertion shape
+    using `assert_info_equivalent` from
+    `tests/helpers/info_json.py`. Depends on phase 4
+    step 4d so the rebase guest can actually succeed.
 - **Phase 4 deferrals** (carried over from the partial
   shipment of phase 4):
   - `run_rebase_guest` KVM lifecycle (step 4d). The host
