@@ -565,7 +565,7 @@ called out below. Each phase produces at least one commit.
 | Phase | Plan | Status |
 |-------|------|--------|
 | 1. Shared ABI: `RebaseConfig`, `CommitConfig`, `*Result` structs, `send_*_result` + `write_input_sector` call-table pointers, `GuestMessage` arms, host two-device chain plumbing | [PLAN-rebase-commit-phase-01-abi.md](PLAN-rebase-commit-phase-01-abi.md) | Complete (58f15a6) |
-| 2. Rebase planners (qcow2 + vmdk, both `-u` and safe modes) | [PLAN-rebase-commit-phase-02-rebase-planners.md](PLAN-rebase-commit-phase-02-rebase-planners.md) | Not started (plan written) |
+| 2. Rebase planners (qcow2 + vmdk, both `-u` and safe modes) | [PLAN-rebase-commit-phase-02-rebase-planners.md](PLAN-rebase-commit-phase-02-rebase-planners.md) | Partial: qcow2 unsafe + safe (6395d97, 0e4c4b9), vmdk unsafe (54caf37). Deferred: vmdk safe-mode + grain allocator (step 2e), cross-format integration tests using create (step 2f). |
 | 3. Rebase guest binary | PLAN-rebase-commit-phase-03-rebase-guest.md (not yet written) | Not started |
 | 4. Rebase host CLI (`run_rebase`, clap args, chain wiring) | PLAN-rebase-commit-phase-04-rebase-host.md (not yet written) | Not started |
 | 5. Rebase integration tests + cross-version baselines | PLAN-rebase-commit-phase-05-rebase-tests.md (not yet written) | Not started |
@@ -725,6 +725,27 @@ because the following statements will be true:
 
 Items beyond the twelve phases above:
 
+- **Phase 2 deferrals** (carried over from the partial
+  shipment of phase 2):
+  - vmdk safe-mode planner + grain allocator (step 2e). The
+    type surface is in place but `plan_rebase_vmdk` with
+    `RebaseMode::Safe` returns `UnsupportedFormat`.
+  - Cross-format integration tests under
+    `src/crates/rebase/tests/` (step 2f). The in-crate unit
+    tests cover validation and patch construction; end-to-
+    end tests with `create` are deferred to bundle with
+    phase 3 (the rebase guest binary).
+  - Long-path relocation in both qcow2 modes. When the new
+    backing path doesn't fit the existing slot, both modes
+    reject with `BackingPathTooLong`. Wiring the allocator
+    into the metadata-patch construction is mechanical but
+    bundled together with phase 3 review.
+  - qcow2 refcount widths other than 16 in the allocator.
+    1/2/4/8/32/64 bit are rare; the bit-packing reference
+    is `qcow2::lookup_refcount`.
+  - qcow2 backing-format header extension rewrite. When the
+    user passes `-F BACKING_FMT`, rebase should emit a
+    patch for the extension block.
 - VHD differencing and VHDX differencing backing-chain
   support. Requires parent-locator parsing in the respective
   format crates first. Track under PLAN-convert-followups
