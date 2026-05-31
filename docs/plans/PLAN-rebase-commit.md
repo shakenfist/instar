@@ -566,7 +566,7 @@ called out below. Each phase produces at least one commit.
 |-------|------|--------|
 | 1. Shared ABI: `RebaseConfig`, `CommitConfig`, `*Result` structs, `send_*_result` + `write_input_sector` call-table pointers, `GuestMessage` arms, host two-device chain plumbing | [PLAN-rebase-commit-phase-01-abi.md](PLAN-rebase-commit-phase-01-abi.md) | Complete (58f15a6) |
 | 2. Rebase planners (qcow2 + vmdk, both `-u` and safe modes) | [PLAN-rebase-commit-phase-02-rebase-planners.md](PLAN-rebase-commit-phase-02-rebase-planners.md) | Partial: qcow2 unsafe + safe (6395d97, 0e4c4b9), vmdk unsafe (54caf37). Deferred: vmdk safe-mode + grain allocator (step 2e), cross-format integration tests using create (step 2f). |
-| 3. Rebase guest binary | PLAN-rebase-commit-phase-03-rebase-guest.md (not yet written) | Not started |
+| 3. Rebase guest binary | [PLAN-rebase-commit-phase-03-rebase-guest.md](PLAN-rebase-commit-phase-03-rebase-guest.md) | Not started (plan written) |
 | 4. Rebase host CLI (`run_rebase`, clap args, chain wiring) | PLAN-rebase-commit-phase-04-rebase-host.md (not yet written) | Not started |
 | 5. Rebase integration tests + cross-version baselines | PLAN-rebase-commit-phase-05-rebase-tests.md (not yet written) | Not started |
 | 6. Commit planners (qcow2 + vmdk) | PLAN-rebase-commit-phase-06-commit-planners.md (not yet written) | Not started |
