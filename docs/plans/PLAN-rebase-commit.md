@@ -567,7 +567,7 @@ called out below. Each phase produces at least one commit.
 | 1. Shared ABI: `RebaseConfig`, `CommitConfig`, `*Result` structs, `send_*_result` + `write_input_sector` call-table pointers, `GuestMessage` arms, host two-device chain plumbing | [PLAN-rebase-commit-phase-01-abi.md](PLAN-rebase-commit-phase-01-abi.md) | Complete (58f15a6) |
 | 2. Rebase planners (qcow2 + vmdk, both `-u` and safe modes) | [PLAN-rebase-commit-phase-02-rebase-planners.md](PLAN-rebase-commit-phase-02-rebase-planners.md) | Partial: qcow2 unsafe + safe (6395d97, 0e4c4b9), vmdk unsafe (54caf37). Deferred: vmdk safe-mode + grain allocator (step 2e), cross-format integration tests using create (step 2f). |
 | 3. Rebase guest binary | [PLAN-rebase-commit-phase-03-rebase-guest.md](PLAN-rebase-commit-phase-03-rebase-guest.md) | Partial: error codes (f96833a), scaffold (9dd1fa3), qcow2 unsafe (fd3e338), vmdk unsafe (a47f48d). Deferred: qcow2 safe-mode runner (step 3e) and read_chain_cluster helper (step 3f). |
-| 4. Rebase host CLI (`run_rebase`, clap args, chain wiring) | [PLAN-rebase-commit-phase-04-rebase-host.md](PLAN-rebase-commit-phase-04-rebase-host.md) | Not started (plan written) |
+| 4. Rebase host CLI (`run_rebase`, clap args, chain wiring) | [PLAN-rebase-commit-phase-04-rebase-host.md](PLAN-rebase-commit-phase-04-rebase-host.md) | Partial: clap args + dispatch (913ce15), render + error mapping (3a39c33), pre-checks + chain discovery (dc39783). Deferred: KVM lifecycle / vCPU loop (step 4d), smoke tests (step 4e). |
 | 5. Rebase integration tests + cross-version baselines | PLAN-rebase-commit-phase-05-rebase-tests.md (not yet written) | Not started |
 | 6. Commit planners (qcow2 + vmdk) | PLAN-rebase-commit-phase-06-commit-planners.md (not yet written) | Not started |
 | 7. Commit guest binary | PLAN-rebase-commit-phase-07-commit-guest.md (not yet written) | Not started |
@@ -725,6 +725,23 @@ because the following statements will be true:
 
 Items beyond the twelve phases above:
 
+- **Phase 4 deferrals** (carried over from the partial
+  shipment of phase 4):
+  - `run_rebase_guest` KVM lifecycle (step 4d). The host
+    pre-checks pass and chain discovery succeeds; the
+    binary errors out at the guest-launch boundary with a
+    pointer to step 4d. Wiring: write `RebaseConfig` to
+    `OPERATION_CONFIG_ADDR`, open the overlay via
+    `BackingStore::open_rw_existing` and attach as device
+    slot 0 output, attach old chain via
+    `open_chain_devices` starting at slot 1, attach new
+    chain at slot 1 + old_chain_count, run the vCPU loop
+    matching on `Payload::RebaseResult` to populate
+    `RebaseRunResult`. Mirror `run_resize_guest` for KVM
+    setup. No post-pass needed.
+  - Smoke tests in `tests/test_rebase.py` (step 4e).
+    Wait until the guest launches successfully so the
+    tests can assert on actual rebase outcomes.
 - **Phase 3 deferrals** (carried over from the partial
   shipment of phase 3):
   - qcow2 safe-mode runner in the guest binary (step 3e).
