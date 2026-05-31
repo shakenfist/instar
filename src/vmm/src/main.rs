@@ -2459,6 +2459,8 @@ enum Commands {
     Create(CreateArgs),
     /// Resize an existing disk image in place
     Resize(ResizeArgs),
+    /// Change an overlay's backing-file reference
+    Rebase(RebaseArgs),
     /// Display or validate configuration
     Config(ConfigArgs),
 }
@@ -2504,6 +2506,48 @@ struct ResizeArgs {
     /// Output format.
     #[arg(long, default_value = "human", value_parser = ["human", "json"])]
     output: String,
+}
+
+/// Arguments for `instar rebase`. Mirrors `qemu-img rebase`'s
+/// surface (see PLAN-rebase-commit-phase-04-rebase-host.md).
+#[derive(Args, Debug)]
+struct RebaseArgs {
+    /// Overlay image file to rebase.
+    filename: String,
+    /// Force the overlay format detection (qcow2 / vmdk).
+    #[arg(short = 'f', long)]
+    format: Option<String>,
+    /// New backing file path. Empty string detaches the
+    /// overlay from its backing chain.
+    #[arg(short = 'b', long = "backing", value_name = "BACKING")]
+    backing: String,
+    /// New backing file format hint (qcow2 / vmdk / raw).
+    /// Optional; the guest probes either way.
+    #[arg(short = 'F', long = "backing-format", value_name = "FMT")]
+    backing_format: Option<String>,
+    /// Unsafe / metadata-only rebase. Trusts the user that
+    /// the new backing has the same content as the old; no
+    /// chain comparison, no data copy.
+    #[arg(short = 'u', long = "backing-unsafe")]
+    unsafe_mode: bool,
+    /// Suppress the success line on stdout. Errors still go
+    /// to stderr.
+    #[arg(short = 'q', long)]
+    quiet: bool,
+    /// Output format.
+    #[arg(long, default_value = "human", value_parser = ["human", "json"])]
+    output: String,
+}
+
+/// Host-side holder for the harvested `RebaseResultMessage`.
+/// Mirrors `ResizeRunResult`.
+#[allow(dead_code)]
+struct RebaseRunResult {
+    overlay_format: u32,
+    mode: u32,
+    clusters_copied: u64,
+    bytes_copied: u64,
+    error: u32,
 }
 
 /// A parsed `[+-]SIZE` string, before resolution against the
@@ -3030,8 +3074,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Measure(args) => run_measure(args, verbose),
         Commands::Create(args) => run_create(args, verbose),
         Commands::Resize(args) => run_resize(args, verbose),
+        Commands::Rebase(args) => run_rebase(args, verbose),
         Commands::Config(args) => run_config(args),
     }
+}
+
+/// Run the rebase operation.
+///
+/// Steps 4c (`run_rebase` body) and 4d (`run_rebase_guest`)
+/// fill in the chain-discovery + KVM lifecycle. Step 4a
+/// ships only the dispatch stub so the clap surface compiles
+/// cleanly.
+#[allow(unused_variables)]
+fn run_rebase(args: RebaseArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    Err(
+        "instar rebase is not yet implemented; see PLAN-rebase-commit-phase-04-rebase-host.md"
+            .into(),
+    )
 }
 
 /// Run the resize operation.
