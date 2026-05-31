@@ -16,8 +16,8 @@
 use core::panic::PanicInfo;
 
 use rebase::{
-    plan_rebase_qcow2, Qcow2RebaseOpts, Qcow2RebaseOutput, RebaseError, RebaseMode, RebasePatch,
-    RebasePlan,
+    plan_rebase_qcow2, plan_rebase_vmdk, Qcow2RebaseOpts, Qcow2RebaseOutput, RebaseError,
+    RebaseMode, RebasePatch, RebasePlan, VmdkRebaseOpts, VmdkRebaseOutput,
 };
 use shared::{
     format_detection::detect_format_from_header, validate_call_table, CallTable, ImageFormat,
@@ -352,19 +352,258 @@ unsafe fn run_qcow2_safe(_call_table: &CallTable, config: &RebaseConfig) -> Reba
     )
 }
 
-/// vmdk rebase runner. Filled in by step 3d (unsafe) and a
-/// follow-up that depends on phase 2 step 2e (safe).
-unsafe fn run_vmdk(_call_table: &CallTable, config: &RebaseConfig) -> RebaseResult {
-    let mode = if config.is_unsafe() {
-        RebaseResult::MODE_UNSAFE
+/// vmdk rebase runner.
+///
+/// v1 only supports unsafe mode. Safe mode is blocked on
+/// phase 2 step 2e (the grain allocator) and returns
+/// `ERROR_UNSUPPORTED_FORMAT` for now.
+unsafe fn run_vmdk(call_table: &CallTable, config: &RebaseConfig) -> RebaseResult {
+    if config.is_unsafe() {
+        run_vmdk_unsafe(call_table, config)
     } else {
-        RebaseResult::MODE_SAFE
+        err_result(
+            config.overlay_format,
+            RebaseResult::MODE_SAFE,
+            RebaseResult::ERROR_UNSUPPORTED_FORMAT,
+        )
+    }
+}
+
+/// vmdk monolithicSparse unsafe-mode rebase.
+unsafe fn run_vmdk_unsafe(call_table: &CallTable, config: &RebaseConfig) -> RebaseResult {
+    let sector_size = (call_table.get_output_sector_size)();
+    let header_bytes = core::slice::from_raw_parts(HEADER_BUF as *const u8, sector_size);
+
+    // Parse the overlay's binary header to get descriptor
+    // location and virtual size.
+    let parsed = match vmdk::Vmdk4Header::parse(header_bytes) {
+        Some(p) => p,
+        None => {
+            return err_result(
+                config.overlay_format,
+                RebaseResult::MODE_UNSAFE,
+                RebaseResult::ERROR_PARSE_FAILED,
+            );
+        }
     };
-    err_result(
-        config.overlay_format,
-        mode,
-        RebaseResult::ERROR_UNSUPPORTED_FORMAT,
-    )
+
+    let desc_byte_offset = match parsed.desc_offset_sectors.checked_mul(512) {
+        Some(v) => v,
+        None => {
+            return err_result(
+                config.overlay_format,
+                RebaseResult::MODE_UNSAFE,
+                RebaseResult::ERROR_INTERNAL_OVERFLOW,
+            );
+        }
+    };
+    let desc_byte_size = match parsed.desc_size_sectors.checked_mul(512) {
+        Some(v) => v,
+        None => {
+            return err_result(
+                config.overlay_format,
+                RebaseResult::MODE_UNSAFE,
+                RebaseResult::ERROR_INTERNAL_OVERFLOW,
+            );
+        }
+    };
+    let desc_byte_size_usize = desc_byte_size as usize;
+    if desc_byte_size_usize > EXISTING_STATE_LIMIT {
+        return err_result(
+            config.overlay_format,
+            RebaseResult::MODE_UNSAFE,
+            RebaseResult::ERROR_SCRATCH_TOO_SMALL,
+        );
+    }
+
+    // Read the descriptor region into EXISTING_STATE scratch.
+    let desc_ptr = EXISTING_STATE as *mut u8;
+    if !read_byte_range(
+        call_table,
+        sector_size,
+        desc_byte_offset,
+        desc_ptr,
+        desc_byte_size_usize,
+    ) {
+        return err_result(
+            config.overlay_format,
+            RebaseResult::MODE_UNSAFE,
+            RebaseResult::ERROR_PARSE_FAILED,
+        );
+    }
+    let descriptor_bytes = core::slice::from_raw_parts(desc_ptr, desc_byte_size_usize);
+
+    // Resolve the new parent CID by probing the first device
+    // of the new chain (if any). The descriptor rewriter
+    // falls back to the qemu-img sentinel 0xffffffff when
+    // we can't extract a real CID (non-vmdk backing, detach,
+    // or read failure).
+    let new_parent_cid = if config.is_detach() || config.new_chain_count == 0 {
+        0xffff_ffff_u32
+    } else {
+        extract_parent_cid_from_input(call_table, config.new_chain_first, sector_size)
+            .unwrap_or(0xffff_ffff)
+    };
+
+    let path_len = config.new_backing_path_len as usize;
+    let new_backing_path = if path_len <= config.new_backing_path.len() {
+        &config.new_backing_path[..path_len]
+    } else {
+        return err_result(
+            config.overlay_format,
+            RebaseResult::MODE_UNSAFE,
+            RebaseResult::ERROR_PARSE_FAILED,
+        );
+    };
+
+    let opts = VmdkRebaseOpts {
+        mode: RebaseMode::Unsafe,
+        overlay_virtual_size: parsed.virtual_size,
+        overlay_descriptor: descriptor_bytes,
+        overlay_descriptor_size: desc_byte_size as u32,
+        overlay_descriptor_offset: desc_byte_offset,
+        new_backing_virtual_size: parsed.virtual_size,
+        new_backing_path,
+        new_parent_cid,
+        detach: config.is_detach(),
+    };
+
+    let scratch =
+        core::slice::from_raw_parts_mut(PLANNER_SCRATCH as *mut u8, PLANNER_SCRATCH_LIMIT);
+    let out = match plan_rebase_vmdk(&opts, scratch) {
+        Ok(o) => o,
+        Err(e) => {
+            return err_result(
+                config.overlay_format,
+                RebaseResult::MODE_UNSAFE,
+                map_rebase_error(e),
+            );
+        }
+    };
+
+    let plan = match out {
+        VmdkRebaseOutput::Unsafe { plan } => plan,
+        VmdkRebaseOutput::Safe { .. } => {
+            return err_result(
+                config.overlay_format,
+                RebaseResult::MODE_UNSAFE,
+                RebaseResult::ERROR_INTERNAL_OVERFLOW,
+            );
+        }
+    };
+
+    if !apply_rebase_plan(call_table, &plan) {
+        return err_result(
+            config.overlay_format,
+            RebaseResult::MODE_UNSAFE,
+            RebaseResult::ERROR_HEADER_MISMATCH,
+        );
+    }
+
+    RebaseResult {
+        magic: RebaseResult::MAGIC,
+        overlay_format: config.overlay_format,
+        mode: RebaseResult::MODE_UNSAFE,
+        error: RebaseResult::ERROR_OK,
+        clusters_copied: 0,
+        bytes_copied: 0,
+        _reserved: [0; 56],
+    }
+}
+
+/// Probe an input device's sector 0 for a vmdk header and, if
+/// found, follow it to the descriptor and extract the
+/// `CID=` value. Returns `None` for non-vmdk or unparseable
+/// input. Uses the tail of EXISTING_STATE as a scratch
+/// region (the unsafe-mode runner has already moved on from
+/// it).
+unsafe fn extract_parent_cid_from_input(
+    call_table: &CallTable,
+    device_idx: u32,
+    sector_size: usize,
+) -> Option<u32> {
+    // Stage the new device's header in a scratch sector
+    // outside HEADER_BUF (which still holds the overlay's
+    // header).
+    let in_header_ptr = (EXISTING_STATE + EXISTING_STATE_LIMIT - MAX_SECTOR_SIZE) as *mut u8;
+    if !(call_table.read_input_sector)(device_idx, 0, in_header_ptr, sector_size) {
+        return None;
+    }
+    let in_header = core::slice::from_raw_parts(in_header_ptr, sector_size);
+
+    let parsed = vmdk::Vmdk4Header::parse(in_header)?;
+    let desc_byte_offset = parsed.desc_offset_sectors.checked_mul(512)?;
+    let desc_byte_size_usize = parsed.desc_size_sectors.checked_mul(512)? as usize;
+    if desc_byte_size_usize == 0 || desc_byte_size_usize > 64 * 1024 {
+        return None;
+    }
+
+    // Read the new backing's descriptor into the same tail
+    // scratch slot (overwriting the header we just read; we
+    // don't need it again).
+    let desc_ptr = in_header_ptr;
+    if !read_input_byte_range(
+        call_table,
+        device_idx,
+        sector_size,
+        desc_byte_offset,
+        desc_ptr,
+        desc_byte_size_usize,
+    ) {
+        return None;
+    }
+    let desc_bytes = core::slice::from_raw_parts(desc_ptr, desc_byte_size_usize);
+
+    let mut info = shared::VmdkInfo::default();
+    vmdk::parse_descriptor(desc_bytes, desc_bytes.len(), &mut info);
+    Some(info.cid)
+}
+
+/// Sector-aligned byte-range read against an *input* device.
+/// Modelled on read_byte_range but routes through
+/// read_input_sector instead of read_output_sector.
+unsafe fn read_input_byte_range(
+    call_table: &CallTable,
+    device_idx: u32,
+    sector_size: usize,
+    byte_offset: u64,
+    dst_ptr: *mut u8,
+    len: usize,
+) -> bool {
+    if len == 0 {
+        return true;
+    }
+    // Use a fresh bounce slot at the tail of EXISTING_STATE
+    // so we don't clobber the destination (which is also in
+    // EXISTING_STATE's tail). The bounce slot sits one
+    // sector before dst_ptr.
+    let bounce_ptr = dst_ptr.sub(MAX_SECTOR_SIZE);
+    let mut written: usize = 0;
+    let mut cur_offset = byte_offset;
+    while written < len {
+        let sector = cur_offset / sector_size as u64;
+        let in_sector_off = (cur_offset % sector_size as u64) as usize;
+        let take = (sector_size - in_sector_off).min(len - written);
+
+        if in_sector_off == 0 && take == sector_size {
+            let dst = dst_ptr.add(written);
+            if !(call_table.read_input_sector)(device_idx, sector, dst, sector_size) {
+                return false;
+            }
+        } else {
+            if !(call_table.read_input_sector)(device_idx, sector, bounce_ptr, sector_size) {
+                return false;
+            }
+            core::ptr::copy_nonoverlapping(
+                bounce_ptr.add(in_sector_off),
+                dst_ptr.add(written),
+                take,
+            );
+        }
+        written += take;
+        cur_offset += take as u64;
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------
