@@ -2895,6 +2895,33 @@ impl CommitResult {
     /// Overlay's or backing's header changed during the
     /// operation (defensive read-back check).
     pub const ERROR_HEADER_MISMATCH: u32 = 7;
+    /// Overlay's metadata is internally inconsistent (e.g.
+    /// `INCOMPAT_DIRTY` or `INCOMPAT_CORRUPT` set; cluster size
+    /// of zero). Distinct from [`Self::ERROR_HEADER_MISMATCH`]
+    /// because the host can render which file is at fault.
+    pub const ERROR_OVERLAY_CORRUPT: u32 = 8;
+    /// Backing's metadata is internally inconsistent.
+    pub const ERROR_BACKING_CORRUPT: u32 = 9;
+    /// Guest scratch buffer was too small for the requested
+    /// layout. Indicates either an image larger than v1
+    /// supports or a planner-side accounting bug.
+    pub const ERROR_SCRATCH_TOO_SMALL: u32 = 10;
+    /// Backing allocator exhausted every existing refcount
+    /// block (qcow2) or grain table (vmdk). v1 doesn't yet
+    /// append new ones; the user can fall back to
+    /// `qemu-img commit` or run `qemu-img check -r` on the
+    /// backing to reclaim leaked clusters.
+    pub const ERROR_REFCOUNT_EXHAUSTED: u32 = 11;
+    /// Format-specific parser (`QcowHeader::parse`,
+    /// `Vmdk4HeaderFull::parse`) failed to interpret the
+    /// staged header bytes.
+    pub const ERROR_PARSE_FAILED: u32 = 12;
+    /// Internal size or offset computation overflowed.
+    /// Surfaces planner-side `Overflow` and guest-side
+    /// arithmetic checks. Distinct from
+    /// [`Self::ERROR_PARSE_FAILED`] because the cause is a
+    /// host or guest bug, not a malformed image.
+    pub const ERROR_INTERNAL_OVERFLOW: u32 = 13;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -3593,6 +3620,38 @@ mod tests {
         assert!(cfg.is_valid());
         cfg.magic = 0;
         assert!(!cfg.is_valid());
+    }
+
+    #[test]
+    fn commit_result_error_codes_distinct() {
+        // Phase 7 step 7a added codes 8..=13. Confirm every
+        // code is distinct so the host's match arms don't
+        // accidentally alias.
+        let codes = [
+            CommitResult::ERROR_OK,
+            CommitResult::ERROR_UNSUPPORTED_FORMAT,
+            CommitResult::ERROR_NO_BACKING,
+            CommitResult::ERROR_EXTERNAL_DATA_FILE,
+            CommitResult::ERROR_LUKS_UNSUPPORTED,
+            CommitResult::ERROR_BACKING_TOO_SMALL,
+            CommitResult::ERROR_OVERLAY_LARGER_THAN_BACKING,
+            CommitResult::ERROR_HEADER_MISMATCH,
+            CommitResult::ERROR_OVERLAY_CORRUPT,
+            CommitResult::ERROR_BACKING_CORRUPT,
+            CommitResult::ERROR_SCRATCH_TOO_SMALL,
+            CommitResult::ERROR_REFCOUNT_EXHAUSTED,
+            CommitResult::ERROR_PARSE_FAILED,
+            CommitResult::ERROR_INTERNAL_OVERFLOW,
+        ];
+        for i in 0..codes.len() {
+            for j in (i + 1)..codes.len() {
+                assert_ne!(codes[i], codes[j], "codes {i} and {j} alias");
+            }
+        }
+        // Confirm contiguous 0..=13 numbering.
+        for (i, c) in codes.iter().enumerate() {
+            assert_eq!(*c, i as u32);
+        }
     }
 
     #[test]

@@ -44,51 +44,66 @@ mod vmdk;
 
 /// Errors returned by the `plan_commit_*` family of functions.
 ///
-/// Mirrors the [`shared::CommitResult::ERROR_*`] numeric codes
-/// where applicable; phase 7 (the commit guest binary) maps
-/// variants to those codes when reporting back to the host.
-/// Additional variants describe planner-internal conditions
-/// that don't have a corresponding wire-level error.
+/// Each variant maps to a distinct
+/// [`shared::CommitResult::ERROR_*`] wire code via the
+/// `map_commit_error` helper in `src/operations/commit/src/main.rs`
+/// (phase 7 step 7c). Wire codes 0..=13 are append-only and
+/// stable; phase 7 step 7a appended codes 8..=13 to cover the
+/// planner-internal variants below that didn't have a phase-1
+/// wire equivalent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitError {
     /// The overlay or backing is not a format this crate
-    /// supports (qcow2 v2/v3 or vmdk monolithicSparse).
+    /// supports (qcow2 v2/v3 or vmdk monolithicSparse). Maps to
+    /// `CommitResult::ERROR_UNSUPPORTED_FORMAT` (1).
     UnsupportedFormat,
     /// The format is supported but the subformat isn't (e.g.
-    /// vmdk twoGbMaxExtent overlay).
+    /// vmdk twoGbMaxExtent overlay). Maps to
+    /// `CommitResult::ERROR_UNSUPPORTED_FORMAT` (1) on the
+    /// wire — only the planner distinguishes.
     UnsupportedSubformat,
     /// The overlay is a qcow2 image with the external-data-file
-    /// incompatible feature set. Commit refuses to match
-    /// qemu-img.
+    /// incompatible feature set. Maps to
+    /// `CommitResult::ERROR_EXTERNAL_DATA_FILE` (3).
     ExternalDataFile,
-    /// The overlay or backing is LUKS-wrapped. v1 of commit
-    /// refuses; a future plan can lift this.
+    /// The overlay or backing is LUKS-wrapped. Maps to
+    /// `CommitResult::ERROR_LUKS_UNSUPPORTED` (4).
     LuksUnsupported,
     /// The backing's virtual size is smaller than the
-    /// overlay's. Commit refuses to truncate guest data.
+    /// overlay's. Maps to
+    /// `CommitResult::ERROR_OVERLAY_LARGER_THAN_BACKING` (6).
     OverlayLargerThanBacking,
     /// The backing's virtual size is smaller than the highest
-    /// cluster the overlay has allocated. Distinct from
-    /// [`Self::OverlayLargerThanBacking`] because some overlays
-    /// declare a larger virtual size than they have allocated.
+    /// cluster the overlay has allocated. Maps to
+    /// `CommitResult::ERROR_BACKING_TOO_SMALL` (5). Distinct
+    /// from [`Self::OverlayLargerThanBacking`] because some
+    /// overlays declare a larger virtual size than they have
+    /// allocated.
     BackingTooSmall,
     /// The overlay's or backing's header changed during
     /// planning, or one of its internal invariants is broken.
+    /// Maps to `CommitResult::ERROR_HEADER_MISMATCH` (7).
     HeaderMismatch,
-    /// The overlay's metadata is internally inconsistent.
+    /// The overlay's metadata is internally inconsistent. Maps
+    /// to `CommitResult::ERROR_OVERLAY_CORRUPT` (8).
     OverlayCorrupt,
-    /// The backing's metadata is internally inconsistent.
+    /// The backing's metadata is internally inconsistent. Maps
+    /// to `CommitResult::ERROR_BACKING_CORRUPT` (9).
     BackingCorrupt,
     /// The caller-supplied scratch buffer is too small for the
-    /// requested layout.
+    /// requested layout. Maps to
+    /// `CommitResult::ERROR_SCRATCH_TOO_SMALL` (10).
     ScratchTooSmall,
     /// Backing allocator: every existing refcount block is
-    /// full and v1 does not yet append new ones.
+    /// full and v1 does not yet append new ones. Maps to
+    /// `CommitResult::ERROR_REFCOUNT_EXHAUSTED` (11).
     RefcountExhausted,
     /// A format-specific parser failed to interpret the staged
-    /// header bytes.
+    /// header bytes. Maps to
+    /// `CommitResult::ERROR_PARSE_FAILED` (12).
     ParseFailed,
-    /// An internal size or offset computation overflowed.
+    /// An internal size or offset computation overflowed. Maps
+    /// to `CommitResult::ERROR_INTERNAL_OVERFLOW` (13).
     Overflow,
 }
 
