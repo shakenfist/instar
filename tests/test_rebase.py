@@ -10,16 +10,21 @@ Phase 5 of PLAN-rebase-commit.md. Structurally a sibling of
   contracts established in phase 4 step 4c (pre-checks +
   chain discovery).
 - ``TestRebaseSuccessPaths`` enumerates the success-path
-  contracts. The qcow2 ``-u`` rebase and detach paths run
-  end-to-end now that step 4d (KVM guest lifecycle) ships.
-  The vmdk and round-trip cases still skip — they need test
-  scaffolding (vmdk creation with a backing reference,
-  qemu-img round-trip harness) that lives in phase 5 step 5f.
-
-Steps 5d (cross-version baselines in the instar-testdata
-repo) and 5e (`TestRebaseBaselineMatrix`) are deferred to a
-follow-up; the matrix factory pattern from
-`tests/test_resize.py:359` is the template when they land.
+  contracts. The qcow2 in-place rewrite paths use ``instar
+  create`` to build the fixtures; the vmdk path uses
+  ``qemu-img create`` because instar's vmdk-with-backing
+  create doesn't yet emit matching CIDs (out-of-scope for the
+  rebase plan; tracked under PLAN-create's vmdk follow-ups).
+- ``TestRebaseRoundTrip`` (step 5f) runs ``instar rebase``
+  and ``qemu-img rebase`` against identically-seeded
+  fixtures and asserts the resulting ``qemu-img info
+  --output=json`` outputs are byte-equivalent after
+  whitelist normalisation.
+- ``TestRebaseBaselineMatrix`` (step 5e) consumes the
+  cross-version baselines step 5d generates in
+  ``instar-testdata`` and asserts ``instar rebase``'s output
+  matches the version-pinned ``qemu-img rebase`` baseline
+  for every ``(target, case)`` pair.
 
 Tests run on the host's installed `instar` binary. The
 success-path tests require ``/dev/kvm`` access; the error
@@ -27,11 +32,13 @@ paths don't.
 """
 
 import json
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
 from base import InstarTestBase
+from helpers.info_json import assert_info_equivalent
 
 
 # ----------------------------------------------------------------------
@@ -236,12 +243,219 @@ class TestRebaseSuccessPaths(TestRebaseSmoke):
             self.assertNotIn('full-backing-filename', info)
 
     def test_vmdk_unsafe_rebase_records_new_backing(self):
-        """vmdk monolithicSparse `-u` rebase rewrites parentFileNameHint."""
-        self.skipTest(
-            'vmdk test scaffolding (overlay-with-backing creation) '
-            'lands in phase 5 step 5f')
+        """vmdk monolithicSparse `-u` rebase rewrites parentFileNameHint.
 
-    def test_qcow2_rebase_round_trip_matches_qemu(self):
-        """Round-trip: instar's rebased overlay matches qemu-img's."""
+        The fixtures are built via ``qemu-img create`` rather than
+        ``instar create``. instar's vmdk-with-backing create does
+        not yet emit matching CIDs (the descriptor records
+        `parentCID=0xfffffffe`, the sentinel for "no parent"),
+        which makes the post-rebase ``backing-filename`` field
+        absent from ``qemu-img info``. Using ``qemu-img create``
+        for the fixture isolates this from the rebase test — the
+        instar vmdk-create gap is a separate item under PLAN-create's
+        vmdk follow-ups.
+        """
+        if shutil.which('qemu-img') is None:
+            self.skipTest('system qemu-img not installed')
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            old_backing = td / 'base.vmdk'
+            new_backing = td / 'next.vmdk'  # same length as 'base'
+            overlay = td / 'overlay.vmdk'
+
+            for name, fp in (('base', old_backing), ('next', new_backing)):
+                r = subprocess.run(
+                    ['qemu-img', 'create', '-f', 'vmdk', str(fp), '1M'],
+                    capture_output=True, text=True, timeout=30)
+                self.assertEqual(
+                    r.returncode, 0,
+                    f'qemu-img create {name} failed: {r.stderr!r}')
+
+            r = subprocess.run(
+                ['qemu-img', 'create', '-f', 'vmdk',
+                 '-o', f'backing_file=base.vmdk,backing_fmt=vmdk',
+                 str(overlay), '1M'],
+                capture_output=True, text=True, timeout=30,
+                cwd=str(td))
+            self.assertEqual(
+                r.returncode, 0,
+                f'qemu-img create overlay failed: {r.stderr!r}')
+
+            _, stderr, rc = self.run_instar_rebase(
+                overlay, '-u', '-b', 'next.vmdk', '-F', 'vmdk')
+            self.assertEqual(
+                rc, 0, f'rebase failed: stderr={stderr!r}')
+
+            r = subprocess.run(
+                ['qemu-img', 'info', '--output=json', str(overlay)],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 0,
+                             f'qemu-img info failed: {r.stderr!r}')
+            info = json.loads(r.stdout)
+            self.assertEqual(
+                info.get('backing-filename'), 'next.vmdk',
+                f'unexpected backing-filename in {info!r}')
+
+
+# ----------------------------------------------------------------------
+# Round-trip tests — for every supported (format, mode) pair, build
+# two byte-identical overlays, rebase one with `instar rebase` and
+# the other with `qemu-img rebase`, then assert `qemu-img info
+# --output=json` produces equivalent JSON after the whitelist
+# normalisation. This is the canonical "instar matches qemu-img"
+# assertion shape for the rebase planner.
+# ----------------------------------------------------------------------
+
+
+class TestRebaseRoundTrip(TestRebaseSmoke):
+    """instar rebase output matches qemu-img rebase output."""
+
+    def _assert_round_trip(self, target, overlay_factory,
+                           backing_pair, instar_flags, qemu_flags):
+        """Shared driver: build two copies of the overlay via
+        ``overlay_factory(td)``, run instar against the first and
+        qemu-img against the second with matching arguments, then
+        compare the resulting info JSONs.
+
+        ``overlay_factory`` is a callable taking a temp dir Path and
+        returning ``(overlay_path, base_backing_name)``; it is
+        expected to also create the old + new backing files in the
+        same directory at the same relative names so both invocations
+        can resolve them.
+
+        ``backing_pair`` is ``(new_backing_relative_name,
+        new_backing_format_hint_or_None)``; passed to both rebase
+        commands.
+        """
+        if shutil.which('qemu-img') is None:
+            self.skipTest('system qemu-img not installed')
+
+        new_backing_name, new_backing_format = backing_pair
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            overlay_a, _ = overlay_factory(td, 'overlay_a')
+            overlay_b, _ = overlay_factory(td, 'overlay_b')
+
+            i_args = ['-u', '-b', new_backing_name]
+            q_args = ['-u', '-b', new_backing_name]
+            if new_backing_format is not None:
+                i_args += ['-F', new_backing_format]
+                q_args += ['-F', new_backing_format]
+            i_args += instar_flags
+            q_args += qemu_flags
+
+            _, stderr, rc = self.run_instar_rebase(overlay_a, *i_args)
+            self.assertEqual(
+                rc, 0, f'instar rebase failed: stderr={stderr!r}')
+
+            r = subprocess.run(
+                ['qemu-img', 'rebase', *q_args, str(overlay_b)],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(
+                r.returncode, 0,
+                f'qemu-img rebase failed: stderr={r.stderr!r}')
+
+            actual = subprocess.run(
+                ['qemu-img', 'info', '--output=json', str(overlay_a)],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(actual.returncode, 0, actual.stderr)
+            expected = subprocess.run(
+                ['qemu-img', 'info', '--output=json', str(overlay_b)],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(expected.returncode, 0, expected.stderr)
+
+            assert_info_equivalent(
+                self, actual.stdout, expected.stdout, target,
+                tmp_path=str(overlay_a),
+                expected_tmp_path=str(overlay_b),
+                msg=f'rebase round-trip ({target}, {new_backing_name})')
+
+    def _qcow2_overlay(self, td, name):
+        """Create a qcow2 overlay backed by ``base.qcow2`` in ``td``.
+
+        Both backings are created with ``instar create`` so the test
+        is exercising end-to-end instar primitives. Returns
+        ``(overlay_path, 'base.qcow2')``.
+        """
+        base = td / 'base.qcow2'
+        new = td / 'next.qcow2'
+        if not base.exists():
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2', str(base), '1M')
+            self.assertEqual(rc, 0, stderr)
+        if not new.exists():
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2', str(new), '1M')
+            self.assertEqual(rc, 0, stderr)
+        overlay = td / f'{name}.qcow2'
+        _, stderr, rc = self.run_instar_create(
+            '-f', 'qcow2', '-b', 'base.qcow2', '-F', 'qcow2',
+            str(overlay), '1M')
+        self.assertEqual(rc, 0, stderr)
+        return overlay, 'base.qcow2'
+
+    def _vmdk_overlay(self, td, name):
+        """Create a vmdk overlay backed by ``base.vmdk`` via
+        ``qemu-img create`` (see notes on
+        ``test_vmdk_unsafe_rebase_records_new_backing`` for why
+        qemu-img owns the create step).
+        """
+        base = td / 'base.vmdk'
+        new = td / 'next.vmdk'
+        for fp in (base, new):
+            if fp.exists():
+                continue
+            r = subprocess.run(
+                ['qemu-img', 'create', '-f', 'vmdk', str(fp), '1M'],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(
+                r.returncode, 0,
+                f'qemu-img create {fp.name} failed: {r.stderr!r}')
+        overlay = td / f'{name}.vmdk'
+        r = subprocess.run(
+            ['qemu-img', 'create', '-f', 'vmdk',
+             '-o', 'backing_file=base.vmdk,backing_fmt=vmdk',
+             str(overlay), '1M'],
+            capture_output=True, text=True, timeout=30,
+            cwd=str(td))
+        self.assertEqual(
+            r.returncode, 0,
+            f'qemu-img create overlay failed: {r.stderr!r}')
+        return overlay, 'base.vmdk'
+
+    def test_qcow2_unsafe_round_trip_matches_qemu(self):
+        """qcow2 `-u` rebase output matches qemu-img's exactly."""
+        self._assert_round_trip(
+            target='qcow2',
+            overlay_factory=self._qcow2_overlay,
+            backing_pair=('next.qcow2', 'qcow2'),
+            instar_flags=[],
+            qemu_flags=[],
+        )
+
+    def test_qcow2_unsafe_detach_round_trip_matches_qemu(self):
+        """qcow2 `-u -b ""` detach output matches qemu-img's exactly."""
+        self._assert_round_trip(
+            target='qcow2',
+            overlay_factory=self._qcow2_overlay,
+            backing_pair=('', None),
+            instar_flags=[],
+            qemu_flags=[],
+        )
+
+    def test_vmdk_unsafe_round_trip_skips_no_qemu_support(self):
+        """vmdk rebase has no qemu-img counterpart to round-trip against.
+
+        ``qemu-img rebase`` on a vmdk overlay returns ``Operation
+        not supported`` on every shipped qemu version we test, so
+        there is no reference to compare instar against. This test
+        records that fact rather than silently disappearing; the
+        ``test_vmdk_unsafe_rebase_records_new_backing`` test in
+        ``TestRebaseSuccessPaths`` covers the instar-side
+        contract via ``qemu-img info`` instead.
+        """
         self.skipTest(
-            'qemu-img round-trip harness lands in phase 5 step 5f')
+            'qemu-img rebase does not support vmdk '
+            '(reports "Operation not supported"); vmdk rebase is '
+            'covered by test_vmdk_unsafe_rebase_records_new_backing')
+
