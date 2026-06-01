@@ -15,9 +15,11 @@
 
 use core::panic::PanicInfo;
 
+use qcow2::{QcowHeader, L1_OFFSET_MASK, L2_OFFSET_MASK, OFLAG_COPIED};
 use rebase::{
-    plan_rebase_qcow2, plan_rebase_vmdk, Qcow2RebaseOpts, Qcow2RebaseOutput, RebaseError,
-    RebaseMode, RebasePatch, RebasePlan, VmdkRebaseOpts, VmdkRebaseOutput,
+    allocate_overlay_cluster_qcow2, plan_rebase_qcow2, plan_rebase_vmdk, AllocationState,
+    Qcow2RebaseOpts, Qcow2RebaseOutput, RebaseError, RebaseMode, RebasePatch, RebasePlan,
+    VmdkRebaseOpts, VmdkRebaseOutput,
 };
 use shared::{
     format_detection::detect_format_from_header, validate_call_table, CallTable, ChainConfig,
@@ -54,8 +56,7 @@ use shared::{
 //                       (`old_buf` and `new_buf`) used by the
 //                       safe-mode comparison loop to read one
 //                       cluster from each chain before
-//                       comparing them. Reserved by step 3f;
-//                       consumed by step 3e.
+//                       comparing them.
 
 const HEADER_BUF: usize = SCRATCH_MEM_BASE;
 const EXISTING_STATE: usize = HEADER_BUF + MAX_SECTOR_SIZE;
@@ -155,7 +156,6 @@ fn map_rebase_error(e: RebaseError) -> u32 {
 /// Read `len` bytes starting at `byte_offset` into the buffer
 /// at `dst_ptr`. Handles non-sector-aligned starts/ends via a
 /// small bounce buffer at `HEADER_BUF`.
-#[allow(dead_code)]
 unsafe fn read_byte_range(
     call_table: &CallTable,
     sector_size: usize,
@@ -198,7 +198,6 @@ unsafe fn read_byte_range(
 /// Write `bytes` starting at `byte_offset`. Handles partial
 /// leading/trailing sectors via read-modify-write through the
 /// bounce buffer at `HEADER_BUF`.
-#[allow(dead_code)]
 unsafe fn write_byte_range(
     call_table: &CallTable,
     sector_size: usize,
@@ -368,15 +367,657 @@ unsafe fn run_qcow2_unsafe(call_table: &CallTable, config: &RebaseConfig) -> Reb
     }
 }
 
-/// qcow2 safe-mode rebase: drives the per-cluster comparison
-/// loop. Filled in by step 3e; currently returns
-/// `ERROR_UNSUPPORTED_FORMAT`.
-unsafe fn run_qcow2_safe(_call_table: &CallTable, config: &RebaseConfig) -> RebaseResult {
-    err_result(
-        config.overlay_format,
-        RebaseResult::MODE_SAFE,
-        RebaseResult::ERROR_UNSUPPORTED_FORMAT,
-    )
+/// Per-staged-L2 metadata: the index of the L1 entry that
+/// points at this L2 table, the L2's host byte offset, and
+/// whether the comparison loop has written to it.
+///
+/// The L1 entry's mask is recomputed from the staged L1 buffer
+/// on each flush so we don't have to keep two sources of truth
+/// in sync.
+#[derive(Clone, Copy)]
+struct StagedL2 {
+    l1_idx: u32,
+    host_offset: u64,
+    dirty: bool,
+}
+
+/// Upper bound on the number of staged L2 tables. 256 L2 tables
+/// covers an L1 of up to 256 entries, which is enough for a
+/// 128 GiB qcow2 with 64 KiB clusters
+/// (`128 GiB / (64 KiB * 8192 GTEs/L2) = 256`). Larger images
+/// require a follow-up.
+const MAX_STAGED_L2: usize = 256;
+
+/// Maximum refcount blocks the safe-mode runner is willing to
+/// stage. 2048 refblocks × 64 KiB = 128 MiB of refcount
+/// coverage, well past v1's 16 GiB sweet spot.
+const MAX_REFBLOCKS: usize = 2048;
+
+/// qcow2 safe-mode rebase. Stages overlay metadata into
+/// scratch, calls the planner with `RebaseMode::Safe`, walks
+/// every guest cluster, and for clusters whose old-chain
+/// content differs from the new-chain content writes a copy
+/// into the overlay (allocating refcount / L2 / L1 entries as
+/// needed) so the swap to the new backing preserves the
+/// overlay's observed semantics.
+unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> RebaseResult {
+    let sector_size = (call_table.get_output_sector_size)();
+    let header_bytes = core::slice::from_raw_parts(HEADER_BUF as *const u8, sector_size);
+
+    let parsed = match QcowHeader::parse(header_bytes) {
+        Some(p) => p,
+        None => {
+            return err_result(
+                config.overlay_format,
+                RebaseResult::MODE_SAFE,
+                RebaseResult::ERROR_PARSE_FAILED,
+            );
+        }
+    };
+
+    // v1 covers refcount_bits == 16 only; this matches the
+    // planner's safe-mode coverage (see qcow2.rs step 2c).
+    if parsed.refcount_bits != 16 {
+        return err_result(
+            config.overlay_format,
+            RebaseResult::MODE_SAFE,
+            RebaseResult::ERROR_UNSUPPORTED_FORMAT,
+        );
+    }
+
+    let cluster_size = parsed.cluster_size;
+    if cluster_size == 0 || cluster_size > COMPARE_BUF_SIZE as u64 {
+        return err_result(
+            config.overlay_format,
+            RebaseResult::MODE_SAFE,
+            RebaseResult::ERROR_SCRATCH_TOO_SMALL,
+        );
+    }
+    let cluster_size_usize = cluster_size as usize;
+
+    let path_len = config.new_backing_path_len as usize;
+    let new_backing_path = if path_len <= config.new_backing_path.len() {
+        &config.new_backing_path[..path_len]
+    } else {
+        return err_result(
+            config.overlay_format,
+            RebaseResult::MODE_SAFE,
+            RebaseResult::ERROR_PARSE_FAILED,
+        );
+    };
+
+    // ----- Stage overlay metadata into EXISTING_STATE -------
+    let mut cursor = EXISTING_STATE;
+    let existing_state_end = EXISTING_STATE + EXISTING_STATE_LIMIT - MAX_SECTOR_SIZE;
+
+    // L1 table
+    let l1_size_bytes = (parsed.l1_size as usize).saturating_mul(8);
+    if cursor + l1_size_bytes > existing_state_end {
+        return err_result(
+            config.overlay_format,
+            RebaseResult::MODE_SAFE,
+            RebaseResult::ERROR_SCRATCH_TOO_SMALL,
+        );
+    }
+    let l1_ptr = cursor as *mut u8;
+    if l1_size_bytes > 0
+        && !read_byte_range(
+            call_table,
+            sector_size,
+            parsed.l1_table_offset,
+            l1_ptr,
+            l1_size_bytes,
+        )
+    {
+        return err_result(
+            config.overlay_format,
+            RebaseResult::MODE_SAFE,
+            RebaseResult::ERROR_PARSE_FAILED,
+        );
+    }
+    cursor += l1_size_bytes;
+
+    // Staged L2 tables — walk L1, read each non-zero L2 into
+    // scratch, and remember the (l1_idx, host_offset) tuple.
+    let l2_staging_start = cursor;
+    let mut staged_l2 = [StagedL2 {
+        l1_idx: 0,
+        host_offset: 0,
+        dirty: false,
+    }; MAX_STAGED_L2];
+    let mut staged_l2_count: usize = 0;
+
+    let l1_buf = core::slice::from_raw_parts_mut(l1_ptr, l1_size_bytes);
+    for i in 0..parsed.l1_size as usize {
+        let entry = read_u64_be(l1_buf, i * 8);
+        let l2_host = entry & L1_OFFSET_MASK;
+        if l2_host == 0 {
+            continue;
+        }
+        if staged_l2_count >= MAX_STAGED_L2 {
+            return err_result(
+                config.overlay_format,
+                RebaseResult::MODE_SAFE,
+                RebaseResult::ERROR_SCRATCH_TOO_SMALL,
+            );
+        }
+        if cursor + cluster_size_usize > existing_state_end {
+            return err_result(
+                config.overlay_format,
+                RebaseResult::MODE_SAFE,
+                RebaseResult::ERROR_SCRATCH_TOO_SMALL,
+            );
+        }
+        if !read_byte_range(
+            call_table,
+            sector_size,
+            l2_host,
+            cursor as *mut u8,
+            cluster_size_usize,
+        ) {
+            return err_result(
+                config.overlay_format,
+                RebaseResult::MODE_SAFE,
+                RebaseResult::ERROR_PARSE_FAILED,
+            );
+        }
+        staged_l2[staged_l2_count] = StagedL2 {
+            l1_idx: i as u32,
+            host_offset: l2_host,
+            dirty: false,
+        };
+        staged_l2_count += 1;
+        cursor += cluster_size_usize;
+    }
+
+    // Refcount table
+    let rt_size_bytes =
+        (parsed.refcount_table_clusters as usize).saturating_mul(cluster_size_usize);
+    if cursor + rt_size_bytes > existing_state_end {
+        return err_result(
+            config.overlay_format,
+            RebaseResult::MODE_SAFE,
+            RebaseResult::ERROR_SCRATCH_TOO_SMALL,
+        );
+    }
+    let rt_ptr = cursor as *mut u8;
+    if rt_size_bytes > 0
+        && !read_byte_range(
+            call_table,
+            sector_size,
+            parsed.refcount_table_offset,
+            rt_ptr,
+            rt_size_bytes,
+        )
+    {
+        return err_result(
+            config.overlay_format,
+            RebaseResult::MODE_SAFE,
+            RebaseResult::ERROR_PARSE_FAILED,
+        );
+    }
+    let rt_slice = core::slice::from_raw_parts(rt_ptr, rt_size_bytes);
+    cursor += rt_size_bytes;
+
+    // Refcount block host offsets as a native-endian u64 array
+    // for the planner. Count non-zero refcount-table entries
+    // first to bound the buffer.
+    let mut refblock_count: usize = 0;
+    {
+        let mut i = 0;
+        while i + 8 <= rt_size_bytes {
+            if read_u64_be(rt_slice, i) != 0 {
+                refblock_count += 1;
+            }
+            i += 8;
+        }
+    }
+    if refblock_count > MAX_REFBLOCKS {
+        return err_result(
+            config.overlay_format,
+            RebaseResult::MODE_SAFE,
+            RebaseResult::ERROR_SCRATCH_TOO_SMALL,
+        );
+    }
+    let rb_offsets_bytes = refblock_count.saturating_mul(8);
+    if cursor + rb_offsets_bytes > existing_state_end {
+        return err_result(
+            config.overlay_format,
+            RebaseResult::MODE_SAFE,
+            RebaseResult::ERROR_SCRATCH_TOO_SMALL,
+        );
+    }
+    let rb_offsets_ptr = cursor as *mut u64;
+    let rb_offsets = core::slice::from_raw_parts_mut(rb_offsets_ptr, refblock_count);
+    {
+        let mut i = 0;
+        let mut out = 0;
+        while i + 8 <= rt_size_bytes {
+            let entry = read_u64_be(rt_slice, i);
+            if entry != 0 {
+                rb_offsets[out] = entry;
+                out += 1;
+            }
+            i += 8;
+        }
+    }
+    cursor += rb_offsets_bytes;
+
+    // Refcount blocks — concatenated in table order.
+    let rb_data_bytes = refblock_count.saturating_mul(cluster_size_usize);
+    if cursor + rb_data_bytes > existing_state_end {
+        return err_result(
+            config.overlay_format,
+            RebaseResult::MODE_SAFE,
+            RebaseResult::ERROR_SCRATCH_TOO_SMALL,
+        );
+    }
+    let rb_data_ptr = cursor as *mut u8;
+    for (i, host_off) in rb_offsets.iter().copied().enumerate() {
+        let dst = rb_data_ptr.add(i * cluster_size_usize);
+        if !read_byte_range(call_table, sector_size, host_off, dst, cluster_size_usize) {
+            return err_result(
+                config.overlay_format,
+                RebaseResult::MODE_SAFE,
+                RebaseResult::ERROR_PARSE_FAILED,
+            );
+        }
+    }
+    let rb_data_slice = core::slice::from_raw_parts(rb_data_ptr, rb_data_bytes);
+
+    // ----- Plan the rebase via the safe-mode planner -------
+    let capacity_sectors = (call_table.get_output_capacity)();
+    let overlay_file_size = capacity_sectors.saturating_mul(sector_size as u64);
+
+    let opts = Qcow2RebaseOpts {
+        mode: RebaseMode::Safe,
+        overlay_header: header_bytes,
+        overlay_file_size,
+        refcount_table: rt_slice,
+        refblock_host_offsets: rb_offsets,
+        refcount_blocks: rb_data_slice,
+        refblock_count: refblock_count as u32,
+        new_backing_virtual_size: config.overlay_virtual_size,
+        new_backing_path,
+        detach: config.is_detach(),
+    };
+
+    let planner_scratch =
+        core::slice::from_raw_parts_mut(PLANNER_SCRATCH as *mut u8, PLANNER_SCRATCH_LIMIT);
+    let out = match plan_rebase_qcow2(&opts, planner_scratch) {
+        Ok(o) => o,
+        Err(e) => {
+            return err_result(
+                config.overlay_format,
+                RebaseResult::MODE_SAFE,
+                map_rebase_error(e),
+            );
+        }
+    };
+
+    let (mut context, deferred_metadata) = match out {
+        Qcow2RebaseOutput::Safe {
+            context,
+            deferred_metadata,
+        } => (context, deferred_metadata),
+        Qcow2RebaseOutput::Unsafe { .. } => {
+            return err_result(
+                config.overlay_format,
+                RebaseResult::MODE_SAFE,
+                RebaseResult::ERROR_INTERNAL_OVERFLOW,
+            );
+        }
+    };
+
+    // ----- Initialise chain-reader state -------------------
+    let chain_config = &*(CHAIN_CONFIG_ADDR as *const ChainConfig);
+    if !chain_config.is_valid() {
+        return err_result(
+            config.overlay_format,
+            RebaseResult::MODE_SAFE,
+            RebaseResult::ERROR_PARSE_FAILED,
+        );
+    }
+
+    let device_count = {
+        let old_end = config
+            .old_chain_first
+            .saturating_add(config.old_chain_count);
+        let new_end = config
+            .new_chain_first
+            .saturating_add(config.new_chain_count);
+        old_end.max(new_end) as usize
+    };
+    if device_count > MAX_CHAIN_DEVICES {
+        return err_result(
+            config.overlay_format,
+            RebaseResult::MODE_SAFE,
+            RebaseResult::ERROR_CHAIN_DEPTH,
+        );
+    }
+
+    let mut chain_states = qcow2::ChainStates::default();
+    let mut bytes_read: u64 = 0;
+    if device_count > 0
+        && !qcow2::init_chain_states(
+            call_table,
+            chain_config,
+            &mut chain_states,
+            device_count,
+            sector_size,
+            CHAIN_CACHES,
+            &mut bytes_read,
+        )
+    {
+        return err_result(
+            config.overlay_format,
+            RebaseResult::MODE_SAFE,
+            RebaseResult::ERROR_PARSE_FAILED,
+        );
+    }
+
+    // ----- Per-cluster comparison loop ---------------------
+    let old_buf = COMPARE_BUFS as *mut u8;
+    let new_buf = old_buf.add(COMPARE_BUF_SIZE);
+    let entries_per_l2 = cluster_size / 8;
+    let mut state = AllocationState::default();
+    let mut l1_dirty = false;
+    let mut clusters_copied: u64 = 0;
+    let mut bytes_copied: u64 = 0;
+
+    // The L2 staging slice is a single contiguous region; each
+    // entry lives at `l2_staging_start + slot * cluster_size`.
+    let l2_staging_slice = core::slice::from_raw_parts_mut(
+        l2_staging_start as *mut u8,
+        // We currently use staged_l2_count slots; future
+        // allocations (when an L1 entry was zero) push past
+        // this. Reserve the rest of EXISTING_STATE up to
+        // cursor as the staging arena.
+        staged_l2_count * cluster_size_usize,
+    );
+    // Track how many L2 slots have been used so far (matches
+    // staged_l2_count but moves up as we allocate new tables).
+    let mut l2_slots_used = staged_l2_count;
+    let l2_slot_byte_capacity = existing_state_end.saturating_sub(l2_staging_start);
+
+    for cluster_idx in 0..context.overlay_cluster_count {
+        let guest_offset = cluster_idx.checked_mul(cluster_size).ok_or(()).unwrap_or(0);
+
+        let l1_idx = cluster_idx / entries_per_l2;
+        let l2_inner_idx = (cluster_idx % entries_per_l2) as usize;
+        if l1_idx >= parsed.l1_size as u64 {
+            // Guest offset is past the L1 table's coverage —
+            // nothing more to compare.
+            break;
+        }
+        let l1_idx_usize = l1_idx as usize;
+
+        // Look up the current overlay L2 entry (if any).
+        let l1_entry = read_u64_be(l1_buf, l1_idx_usize * 8);
+        let l2_host = l1_entry & L1_OFFSET_MASK;
+        let mut slot = None;
+        if l2_host != 0 {
+            slot = find_staged_l2(&staged_l2, staged_l2_count, l1_idx as u32);
+            if let Some(s) = slot {
+                let base = s * cluster_size_usize;
+                let entry = read_u64_be(l2_staging_slice, base + l2_inner_idx * 8);
+                if entry != 0 {
+                    // Overlay already owns the cluster; nothing
+                    // to copy.
+                    continue;
+                }
+            }
+        }
+
+        // Read the old and new chains at this guest offset.
+        if !read_chain_cluster(
+            call_table,
+            config.old_chain_first,
+            config.old_chain_count,
+            chain_config,
+            &mut chain_states,
+            guest_offset,
+            cluster_size,
+            old_buf,
+            sector_size,
+        ) {
+            return err_result(
+                config.overlay_format,
+                RebaseResult::MODE_SAFE,
+                RebaseResult::ERROR_PARSE_FAILED,
+            );
+        }
+        if !read_chain_cluster(
+            call_table,
+            config.new_chain_first,
+            config.new_chain_count,
+            chain_config,
+            &mut chain_states,
+            guest_offset,
+            cluster_size,
+            new_buf,
+            sector_size,
+        ) {
+            return err_result(
+                config.overlay_format,
+                RebaseResult::MODE_SAFE,
+                RebaseResult::ERROR_PARSE_FAILED,
+            );
+        }
+
+        if buffers_eq(old_buf, new_buf, cluster_size_usize) {
+            continue;
+        }
+
+        // Divergent. Allocate a data cluster, write old-chain
+        // content into it, and wire it into the overlay's L2.
+        // If the relevant L1 entry was zero, also allocate a
+        // fresh L2 table first.
+        let staged_slot = match slot {
+            Some(s) => s,
+            None => {
+                if staged_l2_count >= MAX_STAGED_L2 {
+                    return err_result(
+                        config.overlay_format,
+                        RebaseResult::MODE_SAFE,
+                        RebaseResult::ERROR_SCRATCH_TOO_SMALL,
+                    );
+                }
+                let needed = (l2_slots_used + 1) * cluster_size_usize;
+                if needed > l2_slot_byte_capacity {
+                    return err_result(
+                        config.overlay_format,
+                        RebaseResult::MODE_SAFE,
+                        RebaseResult::ERROR_SCRATCH_TOO_SMALL,
+                    );
+                }
+                let l2_host_new = match allocate_overlay_cluster_qcow2(&mut context, &mut state) {
+                    Ok(off) => off,
+                    Err(e) => {
+                        return err_result(
+                            config.overlay_format,
+                            RebaseResult::MODE_SAFE,
+                            map_rebase_error(e),
+                        );
+                    }
+                };
+                // Zero the fresh L2 table in scratch.
+                let new_slot_ptr = l2_staging_start + l2_slots_used * cluster_size_usize;
+                core::ptr::write_bytes(new_slot_ptr as *mut u8, 0, cluster_size_usize);
+                let new_slot = l2_slots_used;
+                l2_slots_used += 1;
+
+                staged_l2[staged_l2_count] = StagedL2 {
+                    l1_idx: l1_idx as u32,
+                    host_offset: l2_host_new,
+                    dirty: true,
+                };
+                staged_l2_count += 1;
+
+                // Update L1 entry to point at the new L2.
+                write_u64_be(l1_buf, l1_idx_usize * 8, l2_host_new | OFLAG_COPIED);
+                l1_dirty = true;
+                new_slot
+            }
+        };
+
+        let data_host = match allocate_overlay_cluster_qcow2(&mut context, &mut state) {
+            Ok(off) => off,
+            Err(e) => {
+                return err_result(
+                    config.overlay_format,
+                    RebaseResult::MODE_SAFE,
+                    map_rebase_error(e),
+                );
+            }
+        };
+
+        let old_slice = core::slice::from_raw_parts(old_buf, cluster_size_usize);
+        if !write_byte_range(call_table, sector_size, data_host, old_slice) {
+            return err_result(
+                config.overlay_format,
+                RebaseResult::MODE_SAFE,
+                RebaseResult::ERROR_HEADER_MISMATCH,
+            );
+        }
+
+        // Refresh the staging slice with the (potentially
+        // grown) capacity so we can write into newly-allocated
+        // slots too.
+        let staging_bytes_in_use = l2_slots_used * cluster_size_usize;
+        let l2_staging_slice_mut =
+            core::slice::from_raw_parts_mut(l2_staging_start as *mut u8, staging_bytes_in_use);
+        let base = staged_slot * cluster_size_usize;
+        write_u64_be(
+            l2_staging_slice_mut,
+            base + l2_inner_idx * 8,
+            data_host | OFLAG_COPIED,
+        );
+        staged_l2[find_staged_l2(&staged_l2, staged_l2_count, l1_idx as u32).unwrap()].dirty = true;
+
+        clusters_copied += 1;
+        bytes_copied = bytes_copied.saturating_add(cluster_size);
+    }
+
+    // ----- Flush dirty metadata back to the overlay --------
+    // Order: data clusters (already written above) → L2 → L1
+    // → refcount blocks → deferred metadata patches (path
+    // bytes + header field rewrite). Matches the resize
+    // pattern: every reachable cluster's content is durable
+    // before we update the pointers that make it reachable.
+    for i in 0..staged_l2_count {
+        if !staged_l2[i].dirty {
+            continue;
+        }
+        let base = i * cluster_size_usize;
+        let slice =
+            core::slice::from_raw_parts((l2_staging_start + base) as *const u8, cluster_size_usize);
+        if !write_byte_range(call_table, sector_size, staged_l2[i].host_offset, slice) {
+            return err_result(
+                config.overlay_format,
+                RebaseResult::MODE_SAFE,
+                RebaseResult::ERROR_HEADER_MISMATCH,
+            );
+        }
+    }
+
+    if l1_dirty && !write_byte_range(call_table, sector_size, parsed.l1_table_offset, l1_buf) {
+        return err_result(
+            config.overlay_format,
+            RebaseResult::MODE_SAFE,
+            RebaseResult::ERROR_HEADER_MISMATCH,
+        );
+    }
+
+    // Flush dirty refcount blocks. `context.dirty` is a
+    // refblock-indexed bitmap; the matching host offset lives
+    // in our local `rb_offsets` array.
+    for i in 0..refblock_count {
+        let byte = i / 8;
+        let bit = i % 8;
+        let is_dirty = context
+            .dirty
+            .get(byte)
+            .map(|b| (b & (1u8 << bit)) != 0)
+            .unwrap_or(false);
+        if !is_dirty {
+            continue;
+        }
+        let base = i * cluster_size_usize;
+        let slice = &context.refblocks[base..base + cluster_size_usize];
+        if !write_byte_range(call_table, sector_size, rb_offsets[i], slice) {
+            return err_result(
+                config.overlay_format,
+                RebaseResult::MODE_SAFE,
+                RebaseResult::ERROR_HEADER_MISMATCH,
+            );
+        }
+    }
+
+    if !apply_rebase_plan(call_table, &deferred_metadata) {
+        return err_result(
+            config.overlay_format,
+            RebaseResult::MODE_SAFE,
+            RebaseResult::ERROR_HEADER_MISMATCH,
+        );
+    }
+
+    // Silence dead-code on L2_OFFSET_MASK; reserved for the
+    // extended-L2 follow-up where the per-subcluster bitmap
+    // is decoded alongside the host offset.
+    let _ = L2_OFFSET_MASK;
+
+    RebaseResult {
+        magic: RebaseResult::MAGIC,
+        overlay_format: config.overlay_format,
+        mode: RebaseResult::MODE_SAFE,
+        error: RebaseResult::ERROR_OK,
+        clusters_copied,
+        bytes_copied,
+        _reserved: [0; 56],
+    }
+}
+
+fn read_u64_be(buf: &[u8], off: usize) -> u64 {
+    u64::from_be_bytes([
+        buf[off],
+        buf[off + 1],
+        buf[off + 2],
+        buf[off + 3],
+        buf[off + 4],
+        buf[off + 5],
+        buf[off + 6],
+        buf[off + 7],
+    ])
+}
+
+fn write_u64_be(buf: &mut [u8], off: usize, value: u64) {
+    buf[off..off + 8].copy_from_slice(&value.to_be_bytes());
+}
+
+fn find_staged_l2(staged: &[StagedL2; MAX_STAGED_L2], count: usize, l1_idx: u32) -> Option<usize> {
+    let mut i = 0;
+    while i < count {
+        if staged[i].l1_idx == l1_idx {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Byte-equality compare of two raw buffers. Reads in usize
+/// chunks where alignment allows; otherwise falls back to a
+/// byte loop. Both pointers must point to at least `len` bytes.
+unsafe fn buffers_eq(a: *const u8, b: *const u8, len: usize) -> bool {
+    let mut i = 0;
+    while i < len {
+        if *a.add(i) != *b.add(i) {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 /// vmdk rebase runner.
@@ -799,29 +1440,8 @@ pub unsafe extern "C" fn _start() -> u64 {
         ),
     };
 
-    // Silence dead-code on the scratch-layout constants until
-    // step 3e wires the safe-mode runner through them. Step 3f
-    // added `read_chain_cluster` and the `CHAIN_CACHES` /
-    // `COMPARE_BUFS` regions; only the helper and the chain
-    // cache region are exercised before step 3e ships.
-    let _ = PLANNER_SCRATCH;
-    let _ = PLANNER_SCRATCH_LIMIT;
-    let _ = EXISTING_STATE_LIMIT;
     let _ = CHAIN_CACHES_LIMIT;
-    let _ = COMPARE_BUFS;
     let _ = COMPARE_BUFS_LIMIT;
-    let _ = COMPARE_BUF_SIZE;
-    let _: unsafe fn(
-        &CallTable,
-        u32,
-        u32,
-        &ChainConfig,
-        &mut qcow2::ChainStates,
-        u64,
-        u64,
-        *mut u8,
-        usize,
-    ) -> bool = read_chain_cluster;
 
     let ok = result.error == RebaseResult::ERROR_OK;
     (call_table.send_rebase_result)(&result);
