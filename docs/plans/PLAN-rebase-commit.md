@@ -565,7 +565,7 @@ called out below. Each phase produces at least one commit.
 | Phase | Plan | Status |
 |-------|------|--------|
 | 1. Shared ABI: `RebaseConfig`, `CommitConfig`, `*Result` structs, `send_*_result` + `write_input_sector` call-table pointers, `GuestMessage` arms, host two-device chain plumbing | [PLAN-rebase-commit-phase-01-abi.md](PLAN-rebase-commit-phase-01-abi.md) | Complete (58f15a6) |
-| 2. Rebase planners (qcow2 + vmdk, both `-u` and safe modes) | [PLAN-rebase-commit-phase-02-rebase-planners.md](PLAN-rebase-commit-phase-02-rebase-planners.md) | Partial: qcow2 unsafe + safe (6395d97, 0e4c4b9), vmdk unsafe (54caf37). Deferred: vmdk safe-mode + grain allocator (step 2e), cross-format integration tests using create (step 2f). |
+| 2. Rebase planners (qcow2 + vmdk, both `-u` and safe modes) | [PLAN-rebase-commit-phase-02-rebase-planners.md](PLAN-rebase-commit-phase-02-rebase-planners.md) | Complete: qcow2 unsafe + safe (6395d97, 0e4c4b9), vmdk unsafe (54caf37), vmdk safe-mode + grain allocator (step 2e), cross-format integration tests (step 2f). |
 | 3. Rebase guest binary | [PLAN-rebase-commit-phase-03-rebase-guest.md](PLAN-rebase-commit-phase-03-rebase-guest.md) | Partial: error codes (f96833a), scaffold (9dd1fa3), qcow2 unsafe (fd3e338), vmdk unsafe (a47f48d). Deferred: qcow2 safe-mode runner (step 3e) and read_chain_cluster helper (step 3f). |
 | 4. Rebase host CLI (`run_rebase`, clap args, chain wiring) | [PLAN-rebase-commit-phase-04-rebase-host.md](PLAN-rebase-commit-phase-04-rebase-host.md) | Partial: clap args + dispatch (913ce15), render + error mapping (3a39c33), pre-checks + chain discovery (dc39783), KVM lifecycle / vCPU loop (4d) + smoke tests (4e) shipped together. |
 | 5. Rebase integration tests + cross-version baselines | [PLAN-rebase-commit-phase-05-rebase-tests.md](PLAN-rebase-commit-phase-05-rebase-tests.md) | Partial: base.py helpers (546d8fd), error + success-path scaffolding (837006a), qcow2 success paths run end-to-end. Deferred: cross-version baselines in instar-testdata (5d), baseline matrix tests (5e), round-trip helper + vmdk overlay-with-backing scaffold (5f). |
@@ -768,16 +768,9 @@ Items beyond the twelve phases above:
     chain provides at that address. Needed by step 3e
     and likely by commit (phase 7); track promotion to a
     shared crate at that point.
-- **Phase 2 deferrals** (carried over from the partial
-  shipment of phase 2):
-  - vmdk safe-mode planner + grain allocator (step 2e). The
-    type surface is in place but `plan_rebase_vmdk` with
-    `RebaseMode::Safe` returns `UnsupportedFormat`.
-  - Cross-format integration tests under
-    `src/crates/rebase/tests/` (step 2f). The in-crate unit
-    tests cover validation and patch construction; end-to-
-    end tests with `create` are deferred to bundle with
-    phase 3 (the rebase guest binary).
+- **Phase 2 deferrals** (steps 2e and 2f shipped together
+  alongside the rest of phase 2; the remaining items below
+  are scope reductions inside the shipped surface):
   - Long-path relocation in both qcow2 modes. When the new
     backing path doesn't fit the existing slot, both modes
     reject with `BackingPathTooLong`. Wiring the allocator
@@ -789,6 +782,12 @@ Items beyond the twelve phases above:
   - qcow2 backing-format header extension rewrite. When the
     user passes `-F BACKING_FMT`, rebase should emit a
     patch for the extension block.
+  - vmdk safe-mode GD extension. The step 2e allocator only
+    fills GTEs in GTs that already exist; allocating a new
+    GT (and bumping the GD entry) when the covering GDE is
+    zero is a follow-up. Until that lands, the safe-mode
+    guest must fall back to `-u` for overlays whose
+    pre-existing GD coverage is incomplete.
 - VHD differencing and VHDX differencing backing-chain
   support. Requires parent-locator parsing in the respective
   format crates first. Track under PLAN-convert-followups

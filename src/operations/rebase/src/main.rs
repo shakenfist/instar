@@ -456,17 +456,16 @@ unsafe fn run_vmdk_unsafe(call_table: &CallTable, config: &RebaseConfig) -> Reba
         );
     };
 
-    let opts = VmdkRebaseOpts {
-        mode: RebaseMode::Unsafe,
-        overlay_virtual_size: parsed.virtual_size,
-        overlay_descriptor: descriptor_bytes,
-        overlay_descriptor_size: desc_byte_size as u32,
-        overlay_descriptor_offset: desc_byte_offset,
-        new_backing_virtual_size: parsed.virtual_size,
+    let opts = VmdkRebaseOpts::unsafe_only(
+        parsed.virtual_size,
+        descriptor_bytes,
+        desc_byte_size as u32,
+        desc_byte_offset,
+        parsed.virtual_size,
         new_backing_path,
         new_parent_cid,
-        detach: config.is_detach(),
-    };
+        config.is_detach(),
+    );
 
     let scratch =
         core::slice::from_raw_parts_mut(PLANNER_SCRATCH as *mut u8, PLANNER_SCRATCH_LIMIT);
