@@ -207,6 +207,25 @@ else
 fi
 
 echo ""
+echo "=== Building commit operation ==="
+cd operations/commit
+cargo +nightly build --release
+cd ../..
+
+# Convert commit ELF to flat binary
+echo "=== Converting commit ELF to flat binary ==="
+COMMIT_ELF="target/x86_64-unknown-none/release/commit"
+COMMIT_BIN="commit.bin"
+
+if [ -f "$COMMIT_ELF" ]; then
+    rust-objcopy -O binary "$COMMIT_ELF" "$COMMIT_BIN"
+    echo "Created $COMMIT_BIN ($(wc -c < "$COMMIT_BIN") bytes)"
+else
+    echo "Error: Commit ELF not found at $COMMIT_ELF"
+    exit 1
+fi
+
+echo ""
 echo "=== Building instar ==="
 cd vmm
 cargo build --release
@@ -225,7 +244,8 @@ cp "$MEASURE_BIN" target/release/
 cp "$CREATE_BIN" target/release/
 cp "$RESIZE_BIN" target/release/
 cp "$REBASE_BIN" target/release/
-echo "Copied core.bin, info.bin, copy.bin, check.bin, compare.bin, convert.bin, measure.bin, create.bin, resize.bin, and rebase.bin to target/release/"
+cp "$COMMIT_BIN" target/release/
+echo "Copied core.bin, info.bin, copy.bin, check.bin, compare.bin, convert.bin, measure.bin, create.bin, resize.bin, rebase.bin, and commit.bin to target/release/"
 
 # Check binary sizes against memory layout limits
 # Memory layout (from shared/src/lib.rs):
@@ -266,6 +286,7 @@ check_size "measure.bin" "target/release/$MEASURE_BIN" "$OP_MAX" || FAILED=1
 check_size "create.bin" "target/release/$CREATE_BIN" "$OP_MAX" || FAILED=1
 check_size "resize.bin" "target/release/$RESIZE_BIN" "$OP_MAX" || FAILED=1
 check_size "rebase.bin" "target/release/$REBASE_BIN" "$OP_MAX" || FAILED=1
+check_size "commit.bin" "target/release/$COMMIT_BIN" "$OP_MAX" || FAILED=1
 
 if [ "$FAILED" -eq 1 ]; then
     echo ""
@@ -289,6 +310,7 @@ echo "  - measure.bin    Measure operation (disk measurement) - loaded at 0x2000
 echo "  - create.bin     Create operation (empty image creation) - loaded at 0x20000"
 echo "  - resize.bin     Resize operation (in-place image resize) - loaded at 0x20000"
 echo "  - rebase.bin     Rebase operation (change backing-file reference) - loaded at 0x20000"
+echo "  - commit.bin     Commit operation (merge overlay into backing) - loaded at 0x20000"
 echo ""
 echo "To run:"
 echo "  sudo ./target/release/instar info image.qcow2"
