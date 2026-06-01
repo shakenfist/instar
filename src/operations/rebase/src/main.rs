@@ -402,7 +402,16 @@ const MAX_REFBLOCKS: usize = 2048;
 /// overlay's observed semantics.
 unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> RebaseResult {
     let sector_size = (call_table.get_output_sector_size)();
-    let header_bytes = core::slice::from_raw_parts(HEADER_BUF as *const u8, sector_size);
+    // Copy the header out of HEADER_BUF before any other reads:
+    // `read_byte_range` uses HEADER_BUF as a sub-sector bounce
+    // buffer, so any partial-sector staging read (L1, refcount
+    // table, etc.) would clobber HEADER_BUF and break the
+    // planner's re-parse downstream. The stable copy lives at
+    // the tail of EXISTING_STATE so it isn't aliased by the
+    // metadata-staging cursor.
+    let stable_header_ptr = (EXISTING_STATE + EXISTING_STATE_LIMIT - MAX_SECTOR_SIZE) as *mut u8;
+    core::ptr::copy_nonoverlapping(HEADER_BUF as *const u8, stable_header_ptr, sector_size);
+    let header_bytes = core::slice::from_raw_parts(stable_header_ptr, sector_size);
 
     let parsed = match QcowHeader::parse(header_bytes) {
         Some(p) => p,

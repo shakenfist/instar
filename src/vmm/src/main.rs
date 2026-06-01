@@ -4467,6 +4467,24 @@ fn run_rebase_guest(
     device_set.add_device(Arc::clone(&output_device), false);
     io_events.push(IoEvent::new(output_mmio)?);
 
+    // --- Write the combined chain config at CHAIN_CONFIG_ADDR ----------
+    // The guest's safe-mode runner indexes `chain_config.devices[]`
+    // by input device slot; concatenate the old chain and the new
+    // chain in the same order they were attached so slot N in the
+    // guest matches `devices[N]`. Unsafe mode ignores chain config.
+    let mut combined_chain = BackingChain::new();
+    for img in old_chain_parents.images() {
+        combined_chain.push(img.clone());
+    }
+    if let Some(chain) = new_chain {
+        for img in chain.images() {
+            combined_chain.push(img.clone());
+        }
+    }
+    if combined_chain.total_devices() > 0 {
+        write_chain_config(&guest_mem, &combined_chain)?;
+    }
+
     let guest_mem = Arc::new(guest_mem);
     let vmm_stats = Arc::new(Mutex::new(VmmStats::new()));
 
