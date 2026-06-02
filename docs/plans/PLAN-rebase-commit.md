@@ -811,6 +811,49 @@ Items beyond the twelve phases above:
 - An aggregate `instar repack` operation that combines
   commit + rebase + sparsify into one pass over a chain.
   Out of scope but easy once the primitives exist.
+- **Commit scratch budget for large clusters.** The commit
+  guest binary's `OVERLAY_RT_LIMIT` and `BACKING_RT_LIMIT`
+  scratch regions are sized at `MAX_SECTOR_SIZE` (64 KiB),
+  so a single-cluster refcount table for any
+  `cluster_size > 64 KiB` overflows the budget and returns
+  `ERROR_SCRATCH_TOO_SMALL`. The differential fuzzer picker
+  caps `cluster_size` at 64 KiB to match. Lifting needs the
+  scratch carve to size against the largest supported
+  cluster (~2 MiB), matching what the rebase planner
+  already does.
+- **Vmdk implicit-`-b` for commit.** The host info
+  operation doesn't currently expose vmdk monolithicSparse's
+  `parentFileNameHint` via the `backing_file` field, so the
+  host-side `-b`-against-recorded-parent check refuses
+  every vmdk commit without an explicit `-b`. Phase 9's
+  matrix + round-trip vmdk cases all pass an explicit
+  `-b base.vmdk`; the implicit form will start working
+  unchanged once the info-side gap is closed. Tracked
+  separately under PLAN-info's vmdk follow-ups; mirrored
+  here so the rebase/commit Future-work surface is
+  complete.
+- **Cross-cluster-size rebase.** Safe-mode rebase
+  currently requires the old and new backing's qcow2
+  cluster sizes to match. If they differ the planner
+  refuses with `ERROR_NEW_BACKING_INCOMPATIBLE`. Lifting
+  needs cluster-size adapters in the safe-mode allocator
+  and the per-cluster comparison loop.
+- **Targeted seed corpora for `fuzz_rebase_planners` and
+  `fuzz_commit_planners`.** Both targets shipped without
+  seed corpora (matching the resize target's shipping
+  shape). The `scripts/generate-fuzz-seeds.py`
+  infrastructure can walk the existing testdata and emit
+  `(starting_header_bytes, backing_metadata, options)`
+  tuples for both planners; out of scope for v1, queued
+  alongside the resize-side equivalent.
+- **Widen fuzz harness clamps.** Both rebase and commit
+  planner fuzz targets currently mask `refblock_count`
+  and `allocated_gt_count` at 4 bits (cap 15), so the
+  `> MAX_REFBLOCKS` and `refblock_host_offsets.len() !=
+  refblock_count` mismatch shapes are never explored.
+  Widening the masks or adding a separate boundary-shape
+  arm would surface the same class of bug as the
+  `RebasePlan::new(0)` finding from phase 10.
 
 ### Bugs fixed during this work
 
