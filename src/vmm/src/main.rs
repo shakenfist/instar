@@ -2466,6 +2466,8 @@ enum Commands {
     Resize(ResizeArgs),
     /// Change an overlay's backing-file reference
     Rebase(RebaseArgs),
+    /// Commit an overlay's data down into its backing file
+    Commit(CommitArgs),
     /// Display or validate configuration
     Config(ConfigArgs),
 }
@@ -2551,6 +2553,42 @@ struct RebaseRunResult {
     mode: u32,
     clusters_copied: u64,
     bytes_copied: u64,
+    error: u32,
+}
+
+/// Arguments for `instar commit`. Mirrors `qemu-img commit`'s
+/// surface (see PLAN-rebase-commit-phase-08-commit-host.md).
+#[derive(Args, Debug)]
+struct CommitArgs {
+    /// Overlay image file to commit.
+    filename: String,
+    /// Force the overlay format detection (qcow2 / vmdk).
+    #[arg(short = 'f', long)]
+    format: Option<String>,
+    /// Backing file to commit into. Optional; when omitted the
+    /// host resolves the overlay's recorded immediate parent.
+    /// v1 only supports the overlay's immediate parent;
+    /// intermediate-image commits are deferred.
+    #[arg(short = 'b', long = "base", value_name = "BASE")]
+    base: Option<String>,
+    /// Suppress the success line on stdout. Errors still go
+    /// to stderr.
+    #[arg(short = 'q', long)]
+    quiet: bool,
+    /// Output format.
+    #[arg(long, default_value = "human", value_parser = ["human", "json"])]
+    output: String,
+}
+
+/// Host-side holder for the harvested `CommitResultMessage`.
+/// Mirrors `RebaseRunResult`.
+#[allow(dead_code)]
+struct CommitRunResult {
+    overlay_format: u32,
+    backing_format: u32,
+    clusters_committed: u64,
+    bytes_committed: u64,
+    overlay_clusters_cleared: u64,
     error: u32,
 }
 
@@ -3079,6 +3117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Create(args) => run_create(args, verbose),
         Commands::Resize(args) => run_resize(args, verbose),
         Commands::Rebase(args) => run_rebase(args, verbose),
+        Commands::Commit(args) => run_commit(args, verbose),
         Commands::Config(args) => run_config(args),
     }
 }
@@ -3354,6 +3393,18 @@ fn run_rebase(args: RebaseArgs, verbose: bool) -> Result<(), Box<dyn std::error:
         result.bytes_copied,
     );
     Ok(())
+}
+
+/// Run the commit operation.
+///
+/// Step 8a ships only the dispatch stub. Step 8c adds path
+/// resolution, format probing, chain discovery, and pre-checks;
+/// step 8d wires the KVM lifecycle and harvests the
+/// `CommitResultMessage`. Until 8c lands, the runner errors
+/// out with a clear message.
+fn run_commit(args: CommitArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = (args, verbose);
+    Err("phase 8 step 8c not yet wired".into())
 }
 
 /// Run the resize operation.
