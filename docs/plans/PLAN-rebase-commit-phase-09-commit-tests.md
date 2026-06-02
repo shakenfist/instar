@@ -340,7 +340,7 @@ two commits at the end is also fine.
 
 | Step | Effort | Model | Isolation | Brief for sub-agent |
 |------|--------|-------|-----------|---------------------|
-| 9a | high | opus | none | Extend `instar-testdata/scripts/generate-baselines.py` with `COMMIT_CASES`, `generate_commit_baseline`, the `'commit'` entry in `COMMANDS` (`output_types={'commit-overlay-info-json': 'json', 'commit-backing-info-json': 'json'}`, `targets=['qcow2', 'vmdk']`), and the `main` dispatch arm. Generate the full matrix (every shipped qemu-img version × qcow2/vmdk targets × COMMIT_CASES). Commit the script change + the generated baselines to `instar-testdata` as two commits (mirroring phase 5's `f24b1bc37` script + `ab587c0cd` baselines split). Update the testdata manifest. |
+| 9a | high | opus | none | Extend `instar-testdata/scripts/generate-baselines.py` with `COMMIT_CASES`, `generate_commit_baseline`, the `'commit'` entry in `COMMANDS` (`output_types={'commit-overlay-info-json': 'json', 'commit-backing-info-json': 'json'}`, `targets=['qcow2', 'vmdk']`), and the `main` dispatch arm. Generate the full matrix (every shipped qemu-img version × qcow2/vmdk targets × COMMIT_CASES). Commit the script change + the generated baselines to `instar-testdata` as two commits (mirroring phase 5's `c10c499d9` script + `3e9c11f3b` baselines split). Update the testdata manifest. |
 | 9b | high | opus | none | `TestCommitBaselineMatrix` in `tests/test_commit.py`: module-level `COMMIT_CASES` mirror, `_baseline_root` / `_baseline_version_dir` / `_baseline_overlay_stdout` / `_baseline_backing_stdout` / `_baseline_meta` helpers, `test_commit_cases_match_baselines` drift audit, `_make_commit_baseline_test` factory, and the module-bottom factory loop. Each generated test builds the same fixtures the generator built (via `qemu-img create` + optional `qemu-io` seed), runs `instar commit`, then asserts both the overlay and backing post-commit info JSONs match the version-pinned baselines. Mirrors `TestRebaseBaselineMatrix` shape line-for-line. |
 | 9c | medium | sonnet | none | `TestCommitRoundTrip` in `tests/test_commit.py`: `_assert_round_trip` driver that builds byte-identical overlay+backing pairs A and B, runs `instar commit` on A and `qemu-img commit` on B with matching flags, then compares both the overlay and backing info JSONs via `assert_info_equivalent`. Plus `_qcow2_overlay` and `_vmdk_overlay` fixture factories. Mirrors `TestRebaseRoundTrip` shape. |
 | 9d | low | sonnet | none | Pre-commit clean. Master plan updated to mark phase 9 complete with shipping commit hashes (instar-side + testdata-side). Document anything that surfaced during 9a–9c in this plan's "Future work created by this phase" / "Bugs fixed" sections. |
@@ -447,7 +447,7 @@ Anticipated; the implementation may surface more.
 
 - **Per-case subdirectory in the generator's fixture build**
   (`instar-testdata/scripts/generate-baselines.py`, shipped
-  in `efaebe99b`). qemu-img commit's `-b BASE` flag walks
+  in `1f2cc83b1`). qemu-img commit's `-b BASE` flag walks
   the chain and compares BASE against each entry's
   canonicalised path. With the rebase generator's case-
   name-in-filename convention (`{target}-{case_name}-base.qcow2`),
