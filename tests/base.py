@@ -462,6 +462,41 @@ class InstarTestBase(testtools.TestCase):
         except subprocess.TimeoutExpired:
             return '', 'Timeout after {}s'.format(timeout), -1
 
+    def run_instar_commit(
+        self,
+        overlay_path: Path,
+        *args: str,
+        timeout: int = 60,
+    ) -> tuple:
+        """
+        Run `instar commit` on an overlay image.
+
+        Mirrors `run_instar_rebase` shape. Extra clap arguments
+        (`-b BASE`, `-f FMT`, `-q`, `--output json`) are passed
+        through via *args.
+
+        Args:
+            overlay_path: Path to the overlay image (the file being
+                committed).
+            *args: Additional commit flags.
+            timeout: Timeout in seconds.
+
+        Returns:
+            tuple: (stdout, stderr, return_code).
+        """
+        instar = self.get_instar_binary()
+        cmd = [str(instar), 'commit', *[str(a) for a in args], str(overlay_path)]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            return result.stdout, result.stderr, result.returncode
+        except subprocess.TimeoutExpired:
+            return '', 'Timeout after {}s'.format(timeout), -1
+
     def run_qemu_img_rebase(
         self,
         overlay_path: Path,
