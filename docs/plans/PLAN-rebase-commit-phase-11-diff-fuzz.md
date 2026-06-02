@@ -420,7 +420,41 @@ Anticipated; the implementation may surface more.
 
 ### Bugs fixed during this work
 
-To be filled in as work progresses.
+No new planner bugs surfaced during 11a/11b — both new
+ops exercise the rebase/commit paths exhaustively tested
+by phases 2–9, and the picker constraints documented
+above keep the fuzzer inside the supported envelope.
+
+### Picker constraints discovered during bring-up
+
+The first 100-iteration run of 11b surfaced 22 divergences
+across two documented gap categories — neither a planner
+bug but both worth pinning in the picker:
+
+- **vmdk explicit `-b`** (16 of 22 divergences): instar
+  refused with "overlay has no recorded backing file" for
+  every vmdk case. Root cause is the
+  info-vmdk-backing-file follow-up (the host info operation
+  doesn't surface vmdk monolithicSparse's
+  `parentFileNameHint` via `backing_file`), already gated
+  with `skipTest` in the phase 8e smoke + phase 9b matrix
+  + phase 9c round-trip tests. Picker fix: drop `'vmdk'`
+  from the commit target choice entirely. Once the info
+  follow-up lands, add `'vmdk'` back.
+
+- **qcow2 commit scratch budget** (6 of 22 divergences):
+  instar's commit guest returned `ERROR_SCRATCH_TOO_SMALL`
+  for `cluster_size > 64 KiB`. The commit guest carves
+  `OVERLAY_RT_LIMIT = BACKING_RT_LIMIT = MAX_SECTOR_SIZE
+  (64 KiB)`; a single-cluster refcount table for any
+  `cluster_size > 64 KiB` blows that budget. Picker fix:
+  cap `cluster_size` at 65536. Lifting the bound is a
+  master-plan TODO — the resize phase's QCOW2_MAX_RESIZE_
+  SCRATCH carries the equivalent ceiling for the same
+  reason.
+
+After both picker fixes, two consecutive 100-iteration runs
+(seeds 42, 7777) report 0 divergences each.
 
 ### Documentation index maintenance
 

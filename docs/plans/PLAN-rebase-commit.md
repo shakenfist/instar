@@ -574,7 +574,7 @@ called out below. Each phase produces at least one commit.
 | 8. Commit host CLI (`run_commit`, clap args, overlay-RW wiring) | [PLAN-rebase-commit-phase-08-commit-host.md](PLAN-rebase-commit-phase-08-commit-host.md) | Complete: plan + master link (6af197d), clap args + dispatch stub (9a3561a), render + error mapping (c24c22f), pre-checks + chain discovery (9cbe75c), KVM lifecycle + vCPU loop (a72f351), test_commit.py smoke tests (e425618). Phase 7 commit-op output bounce fix landed alongside as b7dc9c7. |
 | 9. Commit integration tests + cross-version baselines | [PLAN-rebase-commit-phase-09-commit-tests.md](PLAN-rebase-commit-phase-09-commit-tests.md) | Complete: plan (9be9e66), instar-testdata generator extension (efaebe99b) + 640 cross-version baselines (8dcc3b907), TestCommitBaselineMatrix (8baa56d), TestCommitRoundTrip (ba16ca9). |
 | 10. Coverage-guided fuzzing (rebase + commit planners) | [PLAN-rebase-commit-phase-10-fuzz.md](PLAN-rebase-commit-phase-10-fuzz.md) | Complete: plan (af25ec6), rebase vmdk planner bug fix (1611841) + fuzz_rebase_planners (a2935bb), fuzz_commit_planners (95f632c), CI wiring + wrap-up (this step). |
-| 11. Differential fuzzing vs qemu-img | [PLAN-rebase-commit-phase-11-diff-fuzz.md](PLAN-rebase-commit-phase-11-diff-fuzz.md) | Not started |
+| 11. Differential fuzzing vs qemu-img | [PLAN-rebase-commit-phase-11-diff-fuzz.md](PLAN-rebase-commit-phase-11-diff-fuzz.md) | Complete: plan (1518b30), op_rebase (47db188), op_commit (0649c4c), wrap-up (this step). |
 | 12. Documentation, CHANGELOG, ARCHITECTURE updates | PLAN-rebase-commit-phase-12-docs.md (not yet written) | Not started |
 
 Recommended planning effort by phase:
