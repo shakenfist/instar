@@ -326,8 +326,16 @@ fn plan_vmdk_unsafe<'a>(
         *b = 0;
     }
 
+    // The descriptor rewrite mutates an existing region in
+    // place; the file size doesn't change. Match the qcow2
+    // unsafe planner (line 411) which initialises
+    // `RebasePlan::new(opts.overlay_file_size)`. Earlier this
+    // function used `RebasePlan::new(0)`, which left callers
+    // (and the phase-10 fuzz harness) with no way to bound
+    // the patch's range — the bug surfaced on the very first
+    // fuzz run.
     let patch_bytes: &'a [u8] = &scratch[..slot_size];
-    let mut plan = RebasePlan::new(0);
+    let mut plan = RebasePlan::new(opts.overlay_file_size);
     plan.push(RebasePatch::Write {
         byte_offset: opts.overlay_descriptor_offset,
         bytes: patch_bytes,
