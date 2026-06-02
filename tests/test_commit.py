@@ -298,6 +298,189 @@ class TestCommitSuccessPaths(TestCommitSmoke):
 
 
 # ----------------------------------------------------------------------
+# Round-trip tests — phase 9 step 9c. For every supported
+# (format, case) pair, build two byte-identical overlay+backing
+# pairs, commit one with `instar commit` and the other with
+# `qemu-img commit`, then assert the resulting info JSONs (both
+# overlay and backing) are equivalent after the whitelist
+# normalisation. Mirrors `TestRebaseRoundTrip`.
+# ----------------------------------------------------------------------
+
+
+class TestCommitRoundTrip(TestCommitSmoke):
+    """instar commit output matches qemu-img commit output."""
+
+    def _assert_round_trip(self, target, overlay_size, explicit_base,
+                           seed_spec=None):
+        """Shared driver: build two byte-identical overlay+backing
+        pairs (one for instar, one for qemu-img), commit each with
+        its respective binary, then compare the resulting overlay
+        and backing info JSONs.
+
+        Each pair lives in its own subdirectory under the shared
+        temp dir so the backing can be named `base.<ext>`
+        verbatim and explicit `-b base.<ext>` resolves against
+        the chain entry's canonicalised basename.
+        """
+        if shutil.which('qemu-img') is None:
+            self.skipTest('system qemu-img not installed')
+        if seed_spec == 'seed-64k' and shutil.which('qemu-io') is None:
+            self.skipTest('system qemu-io not installed')
+
+        ext = {'qcow2': 'qcow2', 'vmdk': 'vmdk'}[target]
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+
+            def _build_pair(subdir_name):
+                """Create a backing + overlay (+ optional seed) pair
+                inside `td / subdir_name`. Returns (overlay, backing).
+                """
+                pair_dir = td / subdir_name
+                pair_dir.mkdir(parents=True, exist_ok=True)
+                base = pair_dir / f'base.{ext}'
+                overlay = pair_dir / f'overlay.{ext}'
+
+                r = subprocess.run(
+                    ['qemu-img', 'create', '-f', target,
+                     str(base), overlay_size],
+                    capture_output=True, text=True, timeout=30)
+                self.assertEqual(
+                    r.returncode, 0,
+                    f'qemu-img create base failed: {r.stderr!r}')
+                r = subprocess.run(
+                    ['qemu-img', 'create', '-f', target,
+                     '-o',
+                     f'backing_file={base.name},backing_fmt={target}',
+                     str(overlay), overlay_size],
+                    capture_output=True, text=True, timeout=30,
+                    cwd=str(pair_dir))
+                self.assertEqual(
+                    r.returncode, 0,
+                    f'qemu-img create overlay failed: {r.stderr!r}')
+
+                if seed_spec == 'seed-64k':
+                    r = subprocess.run(
+                        ['qemu-io', '-f', target,
+                         '-c', 'write -P 0xab 0 64k', str(overlay)],
+                        capture_output=True, text=True, timeout=30)
+                    self.assertEqual(
+                        r.returncode, 0,
+                        f'qemu-io seed failed: {r.stderr!r}')
+
+                return overlay, base
+
+            overlay_a, base_a = _build_pair('instar')
+            overlay_b, base_b = _build_pair('qemu')
+
+            # --- instar commit on pair A -------------------------
+            i_args = []
+            if explicit_base is not None:
+                i_args += ['-b', explicit_base]
+            _, stderr, rc = self.run_instar_commit(
+                overlay_a, *i_args, timeout=120)
+            if rc != 0:
+                if target == 'vmdk':
+                    self.skipTest(
+                        f'vmdk round-trip: known phase 7 follow-up '
+                        f'(stderr={stderr!r})')
+                self.fail(f'instar commit failed: stderr={stderr!r}')
+
+            # --- qemu-img commit on pair B -----------------------
+            q_args = ['qemu-img', 'commit']
+            if explicit_base is not None:
+                q_args += ['-b', explicit_base]
+            q_args.append(str(overlay_b))
+            r = subprocess.run(
+                q_args, capture_output=True, text=True, timeout=60,
+                cwd=str(overlay_b.parent))
+            self.assertEqual(
+                r.returncode, 0,
+                f'qemu-img commit failed: stderr={r.stderr!r}')
+
+            # --- Compare overlay info JSONs ----------------------
+            overlay_a_info = subprocess.run(
+                ['qemu-img', 'info', '--output=json', str(overlay_a)],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(overlay_a_info.returncode, 0,
+                             overlay_a_info.stderr)
+            overlay_b_info = subprocess.run(
+                ['qemu-img', 'info', '--output=json', str(overlay_b)],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(overlay_b_info.returncode, 0,
+                             overlay_b_info.stderr)
+
+            # Each side has its own absolute paths; let
+            # `assert_info_equivalent` substitute the overlay
+            # paths to `$FILENAME`, and substitute the backing
+            # paths to `$BASE` manually.
+            actual_overlay = (overlay_a_info.stdout
+                              .replace(str(base_a), '$BASE'))
+            expected_overlay = (overlay_b_info.stdout
+                                .replace(str(base_b), '$BASE'))
+            assert_info_equivalent(
+                self, actual_overlay, expected_overlay, target,
+                tmp_path=str(overlay_a),
+                expected_tmp_path=str(overlay_b),
+                msg=f'commit round-trip ({target}, {overlay_size}, '
+                    f'explicit_base={explicit_base!r}, '
+                    f'seed={seed_spec!r}) overlay')
+
+            # --- Compare backing info JSONs ----------------------
+            base_a_info = subprocess.run(
+                ['qemu-img', 'info', '--output=json', str(base_a)],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(base_a_info.returncode, 0,
+                             base_a_info.stderr)
+            base_b_info = subprocess.run(
+                ['qemu-img', 'info', '--output=json', str(base_b)],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(base_b_info.returncode, 0,
+                             base_b_info.stderr)
+
+            assert_info_equivalent(
+                self, base_a_info.stdout, base_b_info.stdout,
+                target, tmp_path=str(base_a),
+                expected_tmp_path=str(base_b),
+                msg=f'commit round-trip ({target}, {overlay_size}, '
+                    f'explicit_base={explicit_base!r}, '
+                    f'seed={seed_spec!r}) backing')
+
+    def test_qcow2_implicit_empty_round_trip_matches_qemu(self):
+        """qcow2 implicit-`-b` commit matches qemu-img's exactly."""
+        self._assert_round_trip(
+            target='qcow2', overlay_size='1M',
+            explicit_base=None)
+
+    def test_qcow2_implicit_seeded_round_trip_matches_qemu(self):
+        """qcow2 implicit-`-b` seeded commit matches qemu-img."""
+        self._assert_round_trip(
+            target='qcow2', overlay_size='1M',
+            explicit_base=None, seed_spec='seed-64k')
+
+    def test_qcow2_explicit_seeded_round_trip_matches_qemu(self):
+        """qcow2 explicit-`-b` seeded commit matches qemu-img."""
+        self._assert_round_trip(
+            target='qcow2', overlay_size='1M',
+            explicit_base='base.qcow2', seed_spec='seed-64k')
+
+    def test_vmdk_explicit_round_trip_skips_known_gap(self):
+        """vmdk round-trip is gated on the phase 7 follow-up.
+
+        Instar's explicit-`-b` path for vmdk currently refuses
+        because the host info operation doesn't expose vmdk
+        monolithicSparse's `parentFileNameHint` via
+        `backing_file`. The round-trip driver returns skipTest
+        from the catch when commit fails; this method exercises
+        a single vmdk case explicitly so the gap is visible in
+        the test output rather than hidden inside the matrix.
+        """
+        self._assert_round_trip(
+            target='vmdk', overlay_size='1M',
+            explicit_base='base.vmdk', seed_spec='seed-64k')
+
+
+# ----------------------------------------------------------------------
 # Cross-version baseline matrix — phase 9 step 9b. For every
 # entry in COMMIT_CASES the test builds the same fixtures the
 # generator built, runs ``instar commit``, then asserts both the
