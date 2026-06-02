@@ -389,7 +389,19 @@ Anticipated; the implementation may surface more.
 
 ### Bugs fixed during this work
 
-To be filled in as work progresses.
+- **`plan_rebase_vmdk` unsafe-mode `RebasePlan::new(0)`**
+  (`src/crates/rebase/src/vmdk.rs`, fixed in `1611841`).
+  The vmdk unsafe-mode planner was constructing its
+  returned `RebasePlan` via `RebasePlan::new(0)`, leaving
+  `total_file_size` at zero regardless of the actual
+  overlay file size. The `qcow2` unsafe-mode planner
+  correctly uses `RebasePlan::new(opts.overlay_file_size)`;
+  this brought the vmdk planner in line. Surfaced by
+  `fuzz_rebase_planners` on its very first run with a
+  panic on the plan-level invariant `patch.end <=
+  total_file_size` against any real-image-sized descriptor
+  offset. The descriptor rewrite mutates an existing
+  region in place; the file size doesn't change.
 
 ### Documentation index maintenance
 
