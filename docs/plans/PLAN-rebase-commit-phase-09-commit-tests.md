@@ -445,7 +445,36 @@ Anticipated; the implementation may surface more.
 
 ### Bugs fixed during this work
 
-To be filled in as work progresses.
+- **Per-case subdirectory in the generator's fixture build**
+  (`instar-testdata/scripts/generate-baselines.py`, shipped
+  in `efaebe99b`). qemu-img commit's `-b BASE` flag walks
+  the chain and compares BASE against each entry's
+  canonicalised path. With the rebase generator's case-
+  name-in-filename convention (`{target}-{case_name}-base.qcow2`),
+  no `-b basename` value could ever match the chain entry's
+  canonicalised path because the chain entry stores the same
+  case-name-prefixed filename. The fix carves a per-case
+  subdirectory (`{target}-{case_name}/`) so the backing
+  can be named `base.<ext>` verbatim; `-b base.qcow2`
+  canonicalised against `cwd=case_dir` then matches the chain
+  entry canonicalised against the overlay's directory (both
+  resolve to the same absolute path). Per-case isolation also
+  prevents cross-case file collisions inside the shared
+  `tmp_dir`.
+
+### Vmdk matrix + round-trip tests gated as skipTest
+
+The vmdk matrix and round-trip tests skipTest when
+`instar commit` returns non-zero. Root cause is the same
+info-vmdk-backing-file gap the phase 8e smoke test gates on:
+instar's host pre-check refuses every explicit `-b` for
+vmdk because the host info operation doesn't expose vmdk
+monolithicSparse's `parentFileNameHint` via `backing_file`,
+and the resolved-`-b`-against-recorded-parent comparison in
+`run_commit` therefore concludes the user is naming a new
+(non-parent) backing. The vmdk baselines and round-trip
+fixtures are still recorded — they'll start passing
+unchanged once the info-vmdk follow-up lands.
 
 ### Documentation index maintenance
 
