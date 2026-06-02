@@ -27,11 +27,12 @@ Initial target formats:
 
 **Initial implementation** - The `info` prototype has been promoted to the main
 instar implementation in `src/`. Operations include `info`, `copy`, `check`,
-`compare`, `convert`, `measure`, `create`, and `resize`. Prototypes remain
-available for reference.
+`compare`, `convert`, `measure`, `create`, `resize`, `rebase`, and `commit`.
+Prototypes remain available for reference.
 
 See [docs/measure.md](docs/measure.md), [docs/create.md](docs/create.md),
-and [docs/resize.md](docs/resize.md) for the per-subcommand user guides.
+[docs/resize.md](docs/resize.md), [docs/rebase.md](docs/rebase.md), and
+[docs/commit.md](docs/commit.md) for the per-subcommand user guides.
 
 ## Installation
 
@@ -324,6 +325,44 @@ Supported output formats:
   default 2MB via `--block-size`)
 - **vhdx** - VHDX dynamic output, configurable block size (1MB-256MB,
   default 32MB via `--block-size`)
+
+### Image Rebase
+
+```bash
+# Unsafe (metadata-only) rebase to a new backing in the same dir
+instar rebase -u -b new-backing.qcow2 disk.qcow2
+
+# Safe rebase (walks chains, copies divergent clusters)
+instar rebase -b new-backing.qcow2 -F qcow2 disk.qcow2
+
+# Detach the overlay (zero its backing pointer)
+instar rebase -u -b "" disk.qcow2
+```
+
+Changes the backing-file reference recorded in a qcow2 or vmdk overlay.
+Unsafe mode (`-u`) rewrites only the header pointer; safe mode (default)
+also walks the old and new chains and copies any divergent clusters into
+the overlay so reads stay coherent. Detach is encoded as `-b ""`. See
+[docs/rebase.md](docs/rebase.md) for the full reference.
+
+### Image Commit
+
+```bash
+# Commit into the overlay's recorded parent (implicit -b)
+instar commit overlay.qcow2
+
+# Commit with an explicit base (must match the recorded parent)
+instar commit -b base.qcow2 overlay.qcow2
+
+# JSON output for scripting
+instar commit --output=json overlay.qcow2
+```
+
+Merges every allocated cluster from a qcow2 or vmdk overlay into its
+backing image, then zeroes the overlay's metadata so the overlay reads
+as empty against the (now-updated) backing. v1 supports only the
+overlay's immediate parent; intermediate-image commit is deferred. See
+[docs/commit.md](docs/commit.md) for the full reference.
 
 ### Version Compatibility
 

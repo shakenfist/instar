@@ -9,6 +9,162 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **New `instar rebase` subcommand.** Changes the backing-file
+  pointer recorded in a qcow2 or vmdk overlay and, in safe mode,
+  copies divergent clusters from the old backing chain into the
+  overlay so reads stay coherent:
+  `instar rebase [-f FMT] [-u] -b BACKING [-F FMT] [-q]
+  [--output FORMAT] FILENAME`. Both modes run the new
+  `rebase.bin` guest in the KVM sandbox; the host opens the
+  overlay as the output device (RW), the old backing chain as
+  input slots [0..N), and (in safe mode) the new backing chain
+  as input slots [N..M). Unsafe mode (`-u`) rewrites only the
+  header's backing-file pointer; safe mode (default) also walks
+  both chains and copies clusters whose content differs into the
+  overlay before rewriting the pointer. Detach is encoded as
+  `-b ""` (any mode). Per-format support: qcow2 v2/v3 with
+  refcount_bits=16 in both modes; vmdk monolithicSparse unsafe-
+  mode only (safe-mode vmdk is a planner gap). Format
+  auto-detection from the overlay's magic bytes when `-f` is
+  omitted. Output: `Image rebased.` / `Image detached.` literals
+  (matches qemu byte-for-byte) or `--output=json` for a
+  structured envelope (overlay, overlay_format, mode,
+  clusters_copied, bytes_copied, new_backing or detached). `-q`
+  suppresses both on success. Known divergences: long-path
+  relocation is refused (qemu silently relocates), vmdk rebase
+  is instar-only (qemu rejects all vmdk rebase), cross-cluster-
+  size rebase is refused, external-data-file qcow2 overlays
+  are refused. For qcow2, the post-rebase `qemu-img info
+  --output=json` matches qemu-img rebase byte-for-byte across
+  qemu-img 6.0.0 through 10.2.0 modulo the
+  `KNOWN_REBASE_DIVERGENCES` whitelist. See
+  [docs/rebase.md](docs/rebase.md) for the full reference.
+  ([phase 1](docs/plans/PLAN-rebase-commit-phase-01-abi.md) ·
+  [phase 2](docs/plans/PLAN-rebase-commit-phase-02-rebase-planners.md) ·
+  [phase 3](docs/plans/PLAN-rebase-commit-phase-03-rebase-guest.md) ·
+  [phase 4](docs/plans/PLAN-rebase-commit-phase-04-rebase-host.md) ·
+  [phase 5](docs/plans/PLAN-rebase-commit-phase-05-rebase-tests.md) ·
+  [phase 10](docs/plans/PLAN-rebase-commit-phase-10-fuzz.md) ·
+  [phase 11](docs/plans/PLAN-rebase-commit-phase-11-diff-fuzz.md) ·
+  [phase 12](docs/plans/PLAN-rebase-commit-phase-12-docs.md))
+
+- **New `instar commit` subcommand.** Merges every allocated
+  cluster from a qcow2 or vmdk overlay into its backing image,
+  then zeroes the overlay's metadata so the overlay reads as
+  empty against the (now-updated) backing:
+  `instar commit [-f FMT] [-b BASE] [-q] [--output FORMAT]
+  FILENAME`. Runs the new `commit.bin` guest in the KVM
+  sandbox. The host opens the backing as the output device (RW)
+  and the overlay as input slot 0 (RW, so the guest's
+  overlay-clear pass can write through the new
+  `write_input_sector(0, ...)` call-table primitive); the
+  backing's own ancestor chain occupies input slots [1..N)
+  read-only (v1 doesn't consult them but the slots are
+  populated for forward compatibility). `-b` is optional —
+  when omitted, the host resolves the overlay's recorded
+  immediate parent; when supplied, the host refuses any base
+  that doesn't match the recorded parent (intermediate-image
+  commit is deferred). Atomicity contract: cluster data into
+  the backing first, then backing metadata, then a batched
+  overlay-clear pass; a crash between any two stages leaves
+  both files internally consistent (the post-crash overlay +
+  backing pair reads as the post-commit state). Per-format
+  support: qcow2 v2/v3 with refcount_bits=16 in both implicit
+  and explicit `-b`; vmdk monolithicSparse with explicit `-b`
+  only (implicit `-b` is blocked by an info-side gap — see
+  Known Divergences). Output: `Image committed.` literal
+  (matches qemu byte-for-byte) or `--output=json` for a
+  structured envelope (overlay, overlay_format, backing,
+  backing_format, clusters_committed, bytes_committed,
+  overlay_clusters_cleared). `-q` suppresses both on success.
+  Known divergences: `-d` / `-p` / `-r` / `-t` are not
+  implemented; intermediate-image commit refused;
+  cluster-size mismatch between overlay and backing refused;
+  cross-format commit refused; `cluster_size > 64 KiB`
+  overflows the guest scratch budget and returns
+  `ERROR_SCRATCH_TOO_SMALL`; vmdk implicit `-b` blocked by an
+  info-side gap (the host info operation doesn't currently
+  expose vmdk monolithicSparse's `parentFileNameHint` via
+  `backing_file`, tracked separately under PLAN-info's vmdk
+  follow-ups). For qcow2, the post-commit `qemu-img info
+  --output=json` for both the overlay and the backing
+  matches qemu-img commit byte-for-byte across qemu-img
+  6.0.0 through 10.2.0 modulo the
+  `KNOWN_COMMIT_DIVERGENCES` whitelist. See
+  [docs/commit.md](docs/commit.md) for the full reference.
+  ([phase 1](docs/plans/PLAN-rebase-commit-phase-01-abi.md) ·
+  [phase 6](docs/plans/PLAN-rebase-commit-phase-06-commit-planners.md) ·
+  [phase 7](docs/plans/PLAN-rebase-commit-phase-07-commit-guest.md) ·
+  [phase 8](docs/plans/PLAN-rebase-commit-phase-08-commit-host.md) ·
+  [phase 9](docs/plans/PLAN-rebase-commit-phase-09-commit-tests.md) ·
+  [phase 10](docs/plans/PLAN-rebase-commit-phase-10-fuzz.md) ·
+  [phase 11](docs/plans/PLAN-rebase-commit-phase-11-diff-fuzz.md) ·
+  [phase 12](docs/plans/PLAN-rebase-commit-phase-12-docs.md))
+
+- **Cross-version `qemu-img rebase` baselines** committed to
+  `instar-testdata/expected-outputs/rebase-info-json/` for 80
+  qemu-img versions (6.0.0 through 10.2.0). qcow2 only (qemu-img
+  rebase rejects every other format on every shipped version);
+  six cases per version covering unsafe-to-default-parent,
+  unsafe-to-larger-parent, unsafe-detach, safe-to-default-parent,
+  and safe-detach across 1M and 64M overlay sizes. The matrix
+  is consumed by `tests/test_rebase.py:TestRebaseBaselineMatrix`
+  (one test method per `(target, case)` pair, drift audit) and
+  the corresponding round-trip class
+  `TestRebaseRoundTrip`.
+
+- **Cross-version `qemu-img commit` baselines** committed to
+  `instar-testdata/expected-outputs/commit-overlay-info-json/`
+  and `commit-backing-info-json/` for 80 qemu-img versions.
+  Both buckets are populated because a commit's observable
+  state lives on both sides — overlay's L2/refcount entries
+  zeroed, backing's allocated clusters grown. Six qcow2 cases
+  + two vmdk cases per version, with explicit `-b` for vmdk
+  (the implicit-`-b` info-side gap blocks the implicit form
+  for vmdk). Optional `qemu-io` seed at offset 0 exercises
+  real data merges in seeded cases. Consumed by
+  `tests/test_commit.py:TestCommitBaselineMatrix` and
+  `TestCommitRoundTrip`.
+
+- **Coverage-guided fuzzing for the rebase + commit planners.**
+  Two new `cargo fuzz` targets at
+  `src/fuzz/fuzz_targets/`:
+  `fuzz_rebase_planners` exercises `plan_rebase_qcow2` and
+  `plan_rebase_vmdk` across both `RebaseMode::Unsafe` and
+  `RebaseMode::Safe`, asserting plan-level invariants
+  (`patches.len() <= MAX_REBASE_PATCHES`, no integer overflow
+  in `byte_offset + len`, every Write/Append's range within
+  `total_file_size`, no overlapping `Write` patches) plus
+  safe-mode context invariants (dirty-bitmap length relation,
+  refblocks/grain-tables length relation,
+  entries_per_refblock arithmetic). `fuzz_commit_planners`
+  asserts the same shape for `plan_commit_qcow2` /
+  `plan_commit_vmdk` contexts. Both targets land in the
+  nightly + on-demand CI workflow via
+  `.github/workflows/coverage-fuzz.yml`'s `TARGETS` array.
+  Bringing up `fuzz_rebase_planners` surfaced one real
+  planner bug (`plan_vmdk_unsafe` was constructing
+  `RebasePlan::new(0)` instead of
+  `RebasePlan::new(opts.overlay_file_size)`); fix shipped as
+  the preceding commit before the harness landed.
+
+- **Differential fuzzing arms for rebase + commit.** Two new
+  operation hooks (`op_rebase`, `op_commit`) in
+  `scripts/differential-fuzz.py`. Both build byte-identical
+  fixtures via `qemu-img create`, run the respective
+  subcommand on each side, then compare the resulting
+  `qemu-img info --output=json` via the existing
+  `_normalise_create_info` helper. Commit additionally
+  compares the backing's info JSON (a commit's observable
+  state lives on both sides) and runs each side in a
+  per-pair subdirectory so explicit `-b base.<ext>`
+  resolves against the chain entry's canonicalised
+  basename. Picker constraints documented inline avoid
+  the documented gaps (vmdk explicit-`-b` info-side
+  blocker; qcow2 commit `cluster_size > 64 KiB` scratch
+  budget; rebase long-path relocation). 100-iteration
+  local runs with seeds 42 and 7777 report 0 divergences.
+
 - **New `instar resize` subcommand.** Changes the virtual size of
   an existing disk image in place:
   `instar resize [-f FMT] [--shrink] [--preallocation MODE] [-q]

@@ -74,6 +74,27 @@ checking on all image-derived offsets. Integer arithmetic on untrusted
 input uses Rust's checked arithmetic (`checked_mul`, `checked_add`). See
 [docs/security-audits.md](docs/security-audits.md) for full audit results.
 
+## Multi-Device Operations
+
+Some operations (rebase, commit) mutate one image while reading from
+others. The VMM exposes up to 16 virtio-block devices to the guest,
+each with its own MMIO base, sector size, and capacity. A `ChainConfig`
+structure at a fixed guest-physical address tells the guest which
+device index holds what — the overlay being modified, the old backing
+chain, the new backing chain, and so on. See
+[docs/chain-config.md](docs/chain-config.md) for the binary layout and
+[docs/chain-discovery.md](docs/chain-discovery.md) for how the VMM
+discovers backing chains in the first place.
+
+Commit is the only v1 operation that opens an **input** device RW: the
+overlay attaches at input slot 0 RW so the guest's overlay-clear pass
+can write through the call-table primitive `write_input_sector(0, ...)`.
+Every other operation opens input devices read-only, with the
+output-device pointer attached separately. The host's
+`open_chain_devices_rw(rw_slots: &[usize], ...)` helper takes an
+explicit list of slots to open RW; rebase passes the empty list,
+commit passes `&[0]`.
+
 ## Communication Protocol
 
 TBD - Options to explore:
