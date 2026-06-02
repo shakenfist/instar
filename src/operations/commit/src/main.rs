@@ -73,8 +73,17 @@ const PLANNER_SCRATCH_LIMIT: usize = 3 * 1024 * 1024;
 const DATA_BUF: usize = PLANNER_SCRATCH + PLANNER_SCRATCH_LIMIT;
 const DATA_BUF_LIMIT: usize = 1024 * 1024;
 
+/// Sector-sized bounce buffer used by `read_output_byte_range`
+/// and `write_output_byte_range` for sub-sector accesses on
+/// the output device. Located off `HEADER_BUF` /
+/// `BACKING_HEADER_BUF` so backing metadata reads don't
+/// clobber the stable overlay-header slice that
+/// `plan_commit_qcow2` re-parses.
+const OUTPUT_BOUNCE: usize = DATA_BUF + DATA_BUF_LIMIT;
+const OUTPUT_BOUNCE_LIMIT: usize = MAX_SECTOR_SIZE;
+
 const _: () = assert!(
-    DATA_BUF + DATA_BUF_LIMIT <= shared::ALLOC_HEAP_BASE,
+    OUTPUT_BOUNCE + OUTPUT_BOUNCE_LIMIT <= shared::ALLOC_HEAP_BASE,
     "commit scratch layout overlaps the allocator heap"
 );
 
@@ -161,7 +170,7 @@ fn map_commit_error(e: CommitError) -> u32 {
 // ---------------------------------------------------------------------------
 
 /// Read `len` bytes from the output device. Handles sub-sector
-/// reads via a single-sector bounce buffer at `HEADER_BUF`.
+/// reads via a single-sector bounce buffer at `OUTPUT_BOUNCE`.
 /// Used for staging the backing's metadata.
 unsafe fn read_output_byte_range(
     call_table: &CallTable,
@@ -173,7 +182,7 @@ unsafe fn read_output_byte_range(
     if len == 0 {
         return true;
     }
-    let bounce_ptr = HEADER_BUF as *mut u8;
+    let bounce_ptr = OUTPUT_BOUNCE as *mut u8;
     let mut written: usize = 0;
     let mut cur_offset = byte_offset;
     while written < len {
@@ -204,7 +213,7 @@ unsafe fn read_output_byte_range(
 
 /// Write `bytes` to the output device at `byte_offset`.
 /// Handles sub-sector writes via read-modify-write through the
-/// bounce buffer at `HEADER_BUF`. Used for the backing's
+/// bounce buffer at `OUTPUT_BOUNCE`. Used for the backing's
 /// cluster data and metadata writes.
 unsafe fn write_output_byte_range(
     call_table: &CallTable,
@@ -215,7 +224,7 @@ unsafe fn write_output_byte_range(
     if bytes.is_empty() {
         return true;
     }
-    let bounce_ptr = HEADER_BUF as *mut u8;
+    let bounce_ptr = OUTPUT_BOUNCE as *mut u8;
     let mut written: usize = 0;
     let mut cur_offset = byte_offset;
     while written < bytes.len() {
