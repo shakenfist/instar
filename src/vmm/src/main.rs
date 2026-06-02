@@ -186,6 +186,8 @@ const REBASE_CONFIG_FLAG_UNSAFE: u32 = 1 << 0;
 #[allow(dead_code)]
 const REBASE_CONFIG_FLAG_QUIET: u32 = 1 << 1;
 const REBASE_CONFIG_FLAG_DETACH: u32 = 1 << 2;
+const COMMIT_CONFIG_MAGIC: u32 = 0x434F4D4D; // "COMM"
+const COMMIT_CONFIG_FLAG_QUIET: u32 = 1 << 0;
 const RESIZE_CONFIG_FLAG_SHRINK: u32 = 1 << 0;
 #[allow(dead_code)]
 const RESIZE_CONFIG_FLAG_EXTENDED_L2: u32 = 1 << 1;
@@ -2582,7 +2584,6 @@ struct CommitArgs {
 
 /// Host-side holder for the harvested `CommitResultMessage`.
 /// Mirrors `RebaseRunResult`.
-#[allow(dead_code)]
 struct CommitRunResult {
     overlay_format: u32,
     backing_format: u32,
@@ -3637,10 +3638,82 @@ fn run_commit(args: CommitArgs, verbose: bool) -> Result<(), Box<dyn std::error:
         .into());
     }
 
-    // Step 8d wires the KVM lifecycle. Until then the runner
-    // exits cleanly at the guest-launch boundary.
-    let _ = (overlay_probe, backing_probe, backing_parents);
-    Err("phase 8 step 8d not yet wired".into())
+    // Load core + commit guest binaries.
+    let core_path = get_binary_path("core.bin");
+    let core_code = load_guest_binary(
+        core_path
+            .to_str()
+            .ok_or("commit: core.bin path is not valid UTF-8")?,
+    )?;
+    let commit_path = get_binary_path("commit.bin");
+    let commit_code = load_guest_binary(
+        commit_path
+            .to_str()
+            .ok_or("commit: commit.bin path is not valid UTF-8")?,
+    )?;
+
+    // Open the backing as the output device, RW. The commit
+    // grows the backing past its current file size when the
+    // overlay's allocator path appends new clusters (qcow2) or
+    // grains (vmdk) at EOF — expose a generous capacity hint
+    // so the virtio boundary doesn't reject those writes.
+    let backing_file_size = std::fs::metadata(&resolved_backing_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let output_capacity_hint = backing_file_size.saturating_mul(2).max(1 << 30);
+    let output_backing =
+        BackingStore::open_rw_existing(&resolved_backing_path, Some(output_capacity_hint))?;
+
+    let mut flags: u32 = 0;
+    if args.quiet {
+        flags |= COMMIT_CONFIG_FLAG_QUIET;
+    }
+
+    let backing_path_string = resolved_backing_path.to_string_lossy().into_owned();
+    let overlay_format = overlay_probe.format;
+    let backing_format = backing_probe.format;
+    let overlay_cluster_size = overlay_probe.cluster_size;
+    let backing_cluster_size = backing_probe.cluster_size;
+    let overlay_virtual_size = overlay_probe.virtual_size;
+    let backing_virtual_size = backing_probe.virtual_size;
+
+    let result = run_commit_guest(
+        &core_code,
+        &commit_code,
+        overlay_format,
+        backing_format,
+        flags,
+        sector_size,
+        overlay_cluster_size,
+        backing_cluster_size,
+        overlay_virtual_size,
+        backing_virtual_size,
+        overlay_path,
+        output_backing,
+        output_capacity_hint,
+        &backing_parents,
+        verbose,
+    )?;
+
+    if result.error != shared::CommitResult::ERROR_OK {
+        return Err(format!(
+            "commit: guest reported error {}: {}",
+            result.error,
+            map_commit_error(result.error)
+        )
+        .into());
+    }
+
+    render_commit_success(
+        &args,
+        &backing_path_string,
+        result.overlay_format,
+        result.backing_format,
+        result.clusters_committed,
+        result.bytes_committed,
+        result.overlay_clusters_cleared,
+    );
+    Ok(())
 }
 
 /// Run the resize operation.
@@ -4081,7 +4154,6 @@ fn map_rebase_error(code: u32) -> String {
 /// matches qemu's `"Image committed."` byte-for-byte; JSON
 /// form emits a structured envelope. `--quiet` suppresses
 /// the success line; errors still go to stderr.
-#[allow(dead_code)]
 fn render_commit_success(
     args: &CommitArgs,
     backing_path: &str,
@@ -4117,7 +4189,6 @@ fn render_commit_success(
 /// Exhaustive on the 14 constants from
 /// `src/shared/src/lib.rs` (0..=13); the trailing catch-all
 /// covers future code additions only.
-#[allow(dead_code)]
 fn map_commit_error(code: u32) -> String {
     match code {
         c if c == shared::CommitResult::ERROR_OK => "ok".into(),
@@ -5043,6 +5114,385 @@ fn run_rebase_guest(
     }
     if !result_seen {
         return Err("rebase: guest did not return a result".into());
+    }
+    Ok(harvested)
+}
+
+/// Map a u32 image-format code (as stored in CommitConfig and
+/// the per-format probe results) back to the chain crate's
+/// `ImageFormat` enum so the host can build `ChainImage`
+/// entries for `write_chain_config` and `open_chain_devices_rw`.
+fn image_format_from_u32(code: u32) -> ImageFormat {
+    match code {
+        IMAGE_FORMAT_QCOW2 => ImageFormat::Qcow2,
+        IMAGE_FORMAT_VMDK4 => ImageFormat::Vmdk4,
+        IMAGE_FORMAT_VMDK3 => ImageFormat::Vmdk3,
+        IMAGE_FORMAT_VHD => ImageFormat::Vhd,
+        IMAGE_FORMAT_VHDX => ImageFormat::Vhdx,
+        IMAGE_FORMAT_QCOW1 => ImageFormat::Qcow1,
+        IMAGE_FORMAT_LUKS => ImageFormat::Luks,
+        IMAGE_FORMAT_RAW => ImageFormat::Raw,
+        _ => ImageFormat::Unknown,
+    }
+}
+
+/// Launch the commit guest binary, wait for the
+/// `CommitResultMessage`. Modelled on `run_rebase_guest` with
+/// the device layout flipped: the overlay is input slot 0
+/// opened RW (the guest uses `write_input_sector(0, ...)` for
+/// the overlay-clear pass), the backing's own ancestor chain
+/// fills input slots 1..N opened RO (forward-compat — v1's
+/// guest ignores those slots), and the backing being committed
+/// into is the output device opened RW.
+#[allow(clippy::too_many_arguments)]
+fn run_commit_guest(
+    core_code: &[u8],
+    operation_code: &[u8],
+    overlay_format: u32,
+    backing_format: u32,
+    flags: u32,
+    sector_size: u32,
+    overlay_cluster_size: u32,
+    backing_cluster_size: u32,
+    overlay_virtual_size: u64,
+    backing_virtual_size: u64,
+    overlay_path: &Path,
+    output_backing: BackingStore,
+    output_capacity_hint: u64,
+    backing_parents: &BackingChain,
+    verbose: bool,
+) -> Result<CommitRunResult, Box<dyn std::error::Error>> {
+    // --- KVM / VM / guest memory setup ----------------------------------
+    let kvm = Kvm::new()?;
+    debug!("KVM API version: {}", kvm.get_api_version());
+
+    let kvm_stats_checker = kvm_stats::KvmStatsChecker::new(&kvm);
+    kvm_stats_checker.display_status();
+
+    let vm = kvm.create_vm()?;
+    let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
+
+    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let host_addr = region.as_ptr() as u64;
+    let mem_region = kvm_userspace_memory_region {
+        slot: 0,
+        guest_phys_addr: 0,
+        memory_size: GUEST_MEM_SIZE,
+        userspace_addr: host_addr,
+        flags: 0,
+    };
+    // SAFETY: mem_region.userspace_addr points to a valid
+    // GuestMemoryMmap allocation that outlives the VM.
+    unsafe {
+        vm.set_user_memory_region(mem_region)?;
+    }
+    setup_gdt(&guest_mem)?;
+    setup_page_tables(&guest_mem, GUEST_MEM_SIZE)?;
+    guest_mem.write_slice(core_code, GuestAddress(GUEST_CODE_BASE))?;
+    guest_mem.write_slice(operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
+
+    // --- Write CommitConfig at OPERATION_CONFIG_ADDR --------------------
+    // Layout (must match shared::CommitConfig exactly):
+    //    0: magic                  u32 ("COMM")
+    //    4: overlay_format         u32
+    //    8: backing_format         u32
+    //   12: flags                  u32
+    //   16: sector_size            u32
+    //   20: overlay_cluster_size   u32
+    //   24: backing_cluster_size   u32
+    //   28: _pad                   u32
+    //   32: overlay_virtual_size   u64
+    //   40: backing_virtual_size   u64
+    //   48: backing_chain_first    u32
+    //   52: backing_chain_count    u32
+    //   56: _reserved              [u8; 64]
+    let backing_chain_first = 1u32; // slot 0 is the overlay
+    let backing_chain_count = backing_parents.total_devices() as u32;
+
+    guest_mem.write_obj(COMMIT_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
+    guest_mem.write_obj(overlay_format, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
+    guest_mem.write_obj(backing_format, GuestAddress(OPERATION_CONFIG_ADDR + 8))?;
+    guest_mem.write_obj(flags, GuestAddress(OPERATION_CONFIG_ADDR + 12))?;
+    guest_mem.write_obj(sector_size, GuestAddress(OPERATION_CONFIG_ADDR + 16))?;
+    guest_mem.write_obj(
+        overlay_cluster_size,
+        GuestAddress(OPERATION_CONFIG_ADDR + 20),
+    )?;
+    guest_mem.write_obj(
+        backing_cluster_size,
+        GuestAddress(OPERATION_CONFIG_ADDR + 24),
+    )?;
+    // _pad at offset 28 stays zero from page-zeroed memory.
+    guest_mem.write_obj(
+        overlay_virtual_size,
+        GuestAddress(OPERATION_CONFIG_ADDR + 32),
+    )?;
+    guest_mem.write_obj(
+        backing_virtual_size,
+        GuestAddress(OPERATION_CONFIG_ADDR + 40),
+    )?;
+    guest_mem.write_obj(
+        backing_chain_first,
+        GuestAddress(OPERATION_CONFIG_ADDR + 48),
+    )?;
+    guest_mem.write_obj(
+        backing_chain_count,
+        GuestAddress(OPERATION_CONFIG_ADDR + 52),
+    )?;
+    // _reserved at offset 56 stays zero from page-zeroed memory.
+
+    debug!(
+        "Wrote commit config at 0x{:x} (overlay_format={}, backing_format={}, \
+         flags=0x{:x}, backing_chain=[{}..+{}))",
+        OPERATION_CONFIG_ADDR,
+        overlay_format,
+        backing_format,
+        flags,
+        backing_chain_first,
+        backing_chain_count,
+    );
+
+    // --- Set up devices --------------------------------------------------
+    // Device layout (MMIO slot order):
+    //   0:                       overlay (input, RW)
+    //   [1..1+backing_parents):  backing's parents (input, RO)
+    //   [1+backing_parents]:     backing (output, RW)
+    //
+    // The combined chain is what the guest's per-side decoder
+    // consumes via `write_chain_config`. open_chain_devices_rw
+    // takes `rw_slots = &[0]` so only the overlay is RW.
+    let mut device_set = DeviceSet::new();
+    let mut io_events: Vec<IoEvent> = Vec::new();
+
+    // Build the overlay's ChainImage from the probe results
+    // plus the file size from the filesystem. The guest's
+    // chain_config consumer reads back format / virtual_size /
+    // cluster_size / actual_size for each slot.
+    let overlay_actual_size = std::fs::metadata(overlay_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let overlay_image = ChainImage {
+        path: overlay_path.to_path_buf(),
+        format: image_format_from_u32(overlay_format),
+        virtual_size: overlay_virtual_size,
+        actual_size: overlay_actual_size,
+        cluster_size: overlay_cluster_size,
+        backing_file_raw: None,
+        flags: 0,
+        external_data_files: Vec::new(),
+    };
+
+    let mut combined_chain = BackingChain::new();
+    combined_chain.push(overlay_image);
+    for img in backing_parents.images() {
+        combined_chain.push(img.clone());
+    }
+
+    let total_input_devices = open_chain_devices_rw(
+        &combined_chain,
+        sector_size as u64,
+        &mut device_set,
+        &mut io_events,
+        0,
+        "commit",
+        &[0],
+    )?;
+
+    // Output device — backing, attached at the slot
+    // immediately after the combined input chain.
+    let output_slot = total_input_devices;
+    let output_mmio = device_mmio_base(output_slot);
+    let output_vq = device_vq_base(output_slot);
+    let output_device = VirtioBlockDevice::new(
+        output_backing,
+        output_capacity_hint,
+        sector_size as u64,
+        false,
+        output_mmio,
+        output_vq,
+    );
+    let output_device = Arc::new(Mutex::new(output_device));
+    device_set.add_device(Arc::clone(&output_device), false);
+    io_events.push(IoEvent::new(output_mmio)?);
+
+    // --- Write the combined chain config at CHAIN_CONFIG_ADDR ----------
+    // The guest's per-side decoder indexes
+    // `chain_config.devices[]` by input slot; the order is
+    // overlay (slot 0) + backing's ancestor chain (slots 1..N).
+    if combined_chain.total_devices() > 0 {
+        write_chain_config(&guest_mem, &combined_chain)?;
+    }
+
+    let guest_mem = Arc::new(guest_mem);
+    let vmm_stats = Arc::new(Mutex::new(VmmStats::new()));
+
+    let mut io_thread: Option<io_thread::IoThread> = None;
+    let mut registered_count = 0usize;
+    let mut registration_failed = false;
+    for evt in io_events.iter_mut() {
+        if let Err(e) = evt.register(&vm) {
+            debug!("ioeventfd: failed to register ({e:?}), falling back to VM exits");
+            registration_failed = true;
+            break;
+        }
+        registered_count += 1;
+    }
+    if registration_failed {
+        for evt in io_events.iter_mut().take(registered_count) {
+            let _ = evt.unregister(&vm);
+        }
+    }
+    let all_registered = !registration_failed;
+    if all_registered && !io_events.is_empty() {
+        let io_devices = device_set.create_io_devices(io_events);
+        io_thread = Some(io_thread::IoThread::new(
+            io_devices,
+            Arc::clone(&guest_mem),
+            Arc::clone(&vmm_stats),
+        ));
+    }
+
+    // --- vCPU setup ------------------------------------------------------
+    let mut vcpu = vm.create_vcpu(0)?;
+    let mut sregs = vcpu.get_sregs()?;
+    setup_sregs(&mut sregs);
+    vcpu.set_sregs(&sregs)?;
+    let mut regs = vcpu.get_regs()?;
+    setup_regs(&mut regs);
+    vcpu.set_regs(&regs)?;
+
+    let mut serial_decoder = SerialDecoder::new();
+    let mut serial_transmitter = SerialTransmitter::new();
+    let mut debug_buffer = DebugBuffer::new();
+
+    let config = vmm_config_chain_with_output(sector_size, sector_size, total_input_devices, 100);
+    serial_transmitter.queue_config(&config);
+
+    // --- Run the vCPU loop ----------------------------------------------
+    let mut result_seen = false;
+    let mut harvested = CommitRunResult {
+        overlay_format,
+        backing_format,
+        clusters_committed: 0,
+        bytes_committed: 0,
+        overlay_clusters_cleared: 0,
+        error: shared::CommitResult::ERROR_OK,
+    };
+    let mut vm_error: Option<String> = None;
+
+    loop {
+        match vcpu.run()? {
+            VcpuExit::Hlt => {
+                vmm_stats.lock().unwrap().record_hlt();
+                break;
+            }
+            VcpuExit::IoOut(port, data) => {
+                vmm_stats.lock().unwrap().record_io_out();
+                if port == SERIAL_PORT {
+                    for &byte in data {
+                        if let Some(msg) = serial_decoder.add_byte(byte) {
+                            if let Some(guest_::GuestMessage_::Payload::CommitResult(r)) =
+                                &msg.payload
+                            {
+                                harvested.overlay_format = match r.overlay_format.as_str() {
+                                    "qcow2" => IMAGE_FORMAT_QCOW2,
+                                    "vmdk" => IMAGE_FORMAT_VMDK4,
+                                    "raw" => IMAGE_FORMAT_RAW,
+                                    _ => overlay_format,
+                                };
+                                harvested.backing_format = match r.backing_format.as_str() {
+                                    "qcow2" => IMAGE_FORMAT_QCOW2,
+                                    "vmdk" => IMAGE_FORMAT_VMDK4,
+                                    "raw" => IMAGE_FORMAT_RAW,
+                                    _ => backing_format,
+                                };
+                                harvested.clusters_committed = r.clusters_committed;
+                                harvested.bytes_committed = r.bytes_committed;
+                                harvested.overlay_clusters_cleared = r.overlay_clusters_cleared;
+                                harvested.error = r.error;
+                                result_seen = true;
+                            } else if verbose {
+                                debug!("{}", format_message(&msg));
+                            }
+                        }
+                    }
+                } else if port == DEBUG_PORT {
+                    for &byte in data {
+                        if let Some(line) = debug_buffer.add_byte(byte) {
+                            debug!("[GUEST] {line}");
+                        }
+                    }
+                } else {
+                    debug!("IO OUT: port=0x{port:x}, data={data:?}");
+                }
+            }
+            VcpuExit::IoIn(port, data) => {
+                vmm_stats.lock().unwrap().record_io_in();
+                if port == SERIAL_PORT {
+                    for byte in data.iter_mut() {
+                        *byte = serial_transmitter.next_byte().unwrap_or(0);
+                    }
+                } else if port == SERIAL_PORT + 5 {
+                    let mut lsr = 0x60u8;
+                    if serial_transmitter.has_data() {
+                        lsr |= 0x01;
+                    }
+                    data[0] = lsr;
+                } else {
+                    for byte in data {
+                        *byte = 0;
+                    }
+                }
+            }
+            VcpuExit::MmioRead(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_read();
+                let value = device_set.mmio_read(addr);
+                write_mmio_data(data, value);
+            }
+            VcpuExit::MmioWrite(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_write();
+                let value = read_mmio_data(data);
+                if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
+                    if io_thread.is_none() && should_process {
+                        device_set.process_queue_for_device(
+                            device_index,
+                            &guest_mem,
+                            &vmm_stats,
+                        )?;
+                    }
+                }
+            }
+            VcpuExit::Shutdown => {
+                vmm_stats.lock().unwrap().record_shutdown();
+                vm_error = Some("VM shutdown (triple fault)".to_string());
+                break;
+            }
+            VcpuExit::FailEntry(reason, cpu) => {
+                vmm_stats.lock().unwrap().record_fail_entry();
+                vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
+                break;
+            }
+            exit => {
+                vmm_stats.lock().unwrap().record_unknown();
+                vm_error = Some(format!("unexpected VM exit: {exit:?}"));
+                break;
+            }
+        }
+    }
+
+    if let Some(mut thread) = io_thread {
+        thread.stop();
+    }
+
+    if log::log_enabled!(log::Level::Debug) {
+        vmm_stats.lock().unwrap().display();
+    }
+
+    if let Some(error) = vm_error {
+        return Err(error.into());
+    }
+    if !result_seen {
+        return Err("commit: guest did not return a result".into());
     }
     Ok(harvested)
 }
