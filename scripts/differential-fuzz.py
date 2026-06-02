@@ -46,7 +46,7 @@ DATA_PATTERNS = ['zeros', 'random', 'sparse', 'mbr']
 
 # Operations that the fuzzer can chain together
 OPERATIONS = ['info', 'check', 'convert', 'convert_compressed', 'measure',
-              'create', 'resize', 'rebase']
+              'create', 'resize', 'rebase', 'commit']
 
 # Known divergence categories to skip (unsafe quirks)
 # See docs/quirks.md for rationale
@@ -166,24 +166,26 @@ def _write_random_data(rng, image_path, fmt):
 # Tool runners
 # ---------------------------------------------------------------------------
 
-def run_instar(instar_bin, subcmd, args, timeout=30):
+def run_instar(instar_bin, subcmd, args, timeout=30, cwd=None):
     """Run an instar subcommand. Returns (stdout, stderr, rc)."""
     cmd = [str(instar_bin)] + subcmd + args
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout
+            cmd, capture_output=True, text=True,
+            timeout=timeout, cwd=cwd,
         )
         return result.stdout, result.stderr, result.returncode
     except subprocess.TimeoutExpired:
         return '', f'TIMEOUT after {timeout}s', -1
 
 
-def run_qemu_img(subcmd, args, timeout=30):
+def run_qemu_img(subcmd, args, timeout=30, cwd=None):
     """Run a qemu-img subcommand. Returns (stdout, stderr, rc)."""
     cmd = ['qemu-img'] + subcmd + args
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout
+            cmd, capture_output=True, text=True,
+            timeout=timeout, cwd=cwd,
         )
         return result.stdout, result.stderr, result.returncode
     except subprocess.TimeoutExpired:
@@ -1661,6 +1663,251 @@ def _rebase_replace_filename(obj, needle, replacement):
             _rebase_replace_filename(item, needle, replacement)
 
 
+def _commit_option_picker(rng):
+    """Pick (target, overlay_size, explicit_base, seed_spec,
+    extra_create_options).
+
+    Constraints honour the commit planner's documented gaps:
+      * qcow2 only — vmdk explicit `-b` is blocked by the
+        info-vmdk-backing-file follow-up (the host info
+        operation doesn't expose vmdk monolithicSparse's
+        `parentFileNameHint`, so the host-side pre-check
+        refuses every vmdk `-b` as "not the recorded
+        parent"). The vmdk smoke + matrix + round-trip
+        tests gate this with skipTest; the fuzzer matches
+        by excluding vmdk targets. Once the info follow-up
+        lands, add `'vmdk'` back to the target choice.
+      * No qcow2 refcount_bits != 16, no compat=0.10.
+      * Optional `qemu-io` seed at offset 0 so the commit
+        has real data to merge in some iterations.
+      * cluster_size capped at 64 KiB: the commit guest's
+        OVERLAY_RT_LIMIT / BACKING_RT_LIMIT are sized at
+        MAX_SECTOR_SIZE (64 KiB), so a single-cluster
+        refcount table for any cluster_size > 64 KiB blows
+        the budget (ERROR_SCRATCH_TOO_SMALL). Lifting the
+        bound is a master-plan TODO.
+    """
+    target = 'qcow2'
+    overlay_size = rng.choice(['1M', '4M', '64M'])
+    explicit_base = rng.choice([None, 'base.qcow2'])
+    seed_spec = rng.choice([None, 'seed-64k'])
+    create_options = []
+    cs = rng.choice([c for c in QCOW2_CLUSTER_SIZES if c <= 65536])
+    create_options.append(f'cluster_size={cs}')
+    if rng.random() < 0.3:
+        create_options.append('lazy_refcounts=on')
+    return target, overlay_size, explicit_base, seed_spec, \
+           create_options
+
+
+def op_commit(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
+    """Build identical overlay+backing pairs (each in its own
+    per-pair subdirectory so explicit `-b base.<ext>` matches
+    the chain entry's canonicalised basename), commit each via
+    its native tool, compare via `qemu-img info --output=json`
+    on both the resulting overlay AND the resulting backing.
+
+    A commit's observable state lives on both sides — the
+    overlay's L2/refcount entries get zeroed and the backing's
+    allocated clusters grow — so the comparison covers both.
+
+    `instar_copy / qemu_copy / fmt` are part of the standard
+    op_* signature but unused — `commit` builds its own
+    fixture pairs via the picker.
+    """
+    (target, overlay_size, explicit_base, seed_spec,
+     create_options) = _commit_option_picker(rng)
+
+    iter_dir = instar_copy.parent
+    ext = {'qcow2': 'qcow2', 'vmdk': 'vmdk'}[target]
+    inst_dir = iter_dir / 'commit-instar'
+    qemu_dir = iter_dir / 'commit-qemu'
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    qemu_dir.mkdir(parents=True, exist_ok=True)
+
+    inst_base = inst_dir / f'base.{ext}'
+    inst_overlay = inst_dir / f'overlay.{ext}'
+    qemu_base = qemu_dir / f'base.{ext}'
+    qemu_overlay = qemu_dir / f'overlay.{ext}'
+
+    create_args_base = ['-f', target]
+    for opt in create_options:
+        create_args_base.extend(['-o', opt])
+
+    # 1. Seed identical backings via qemu-img create.
+    for path in (inst_base, qemu_base):
+        _, st, rc = run_qemu_img(
+            ['create'],
+            create_args_base + [str(path), overlay_size],
+            timeout=timeout)
+        if rc != 0:
+            return {
+                'type': 'commit_fixture_create_failed',
+                'side': 'base',
+                'path': str(path),
+                'stderr': st[:500],
+            }
+
+    # 2. Build the overlays. `cwd=<side_dir>` so the recorded
+    # backing pointer is just `base.<ext>` (relative basename
+    # matching the chain canonicalisation that `-b base.<ext>`
+    # uses at commit time).
+    overlay_create_args = create_args_base + [
+        '-o', f'backing_file=base.{ext},backing_fmt={target}',
+    ]
+    for (side_dir, overlay_path) in (
+        (inst_dir, inst_overlay),
+        (qemu_dir, qemu_overlay),
+    ):
+        _, st, rc = run_qemu_img(
+            ['create'],
+            overlay_create_args + [str(overlay_path), overlay_size],
+            timeout=timeout, cwd=str(side_dir))
+        if rc != 0:
+            return {
+                'type': 'commit_fixture_create_failed',
+                'side': 'overlay',
+                'path': str(overlay_path),
+                'stderr': st[:500],
+            }
+
+    # 3. Optional seed step. qemu-io fixture-builder writes a
+    # known 64 KiB pattern at offset 0 so both binaries have
+    # the same real data to merge. The seed runs on both
+    # copies; skip cleanly when qemu-io is missing.
+    if seed_spec == 'seed-64k':
+        if shutil.which('qemu-io') is None:
+            # Treat as inconclusive — record nothing.
+            return None
+        for overlay_path in (inst_overlay, qemu_overlay):
+            _, st, rc = _run_qemu_io(
+                ['-f', target, '-c', 'write -P 0xab 0 64k',
+                 str(overlay_path)],
+                timeout=timeout)
+            if rc != 0:
+                return {
+                    'type': 'commit_seed_failed',
+                    'path': str(overlay_path),
+                    'stderr': st[:500],
+                }
+
+    # 4. Commit each via its native tool. Run with `cwd=<side>`
+    # so explicit `-b base.<ext>` resolves to the side's own
+    # backing file.
+    instar_commit_args = []
+    qemu_commit_args = []
+    if explicit_base is not None:
+        instar_commit_args += ['-b', explicit_base]
+        qemu_commit_args += ['-b', explicit_base]
+
+    _, ic_stderr, ic_rc = run_instar(
+        instar_bin, ['commit'],
+        instar_commit_args + [str(inst_overlay)],
+        timeout=timeout, cwd=str(inst_dir))
+    _, qc_stderr, qc_rc = run_qemu_img(
+        ['commit'],
+        qemu_commit_args + [str(qemu_overlay)],
+        timeout=timeout, cwd=str(qemu_dir))
+
+    div = compare_exit_codes(
+        ic_rc, qc_rc, 'commit',
+        {'target_format': target,
+         'overlay_size': overlay_size,
+         'explicit_base': explicit_base,
+         'seed_spec': seed_spec,
+         'create_options': create_options,
+         'instar_stderr': ic_stderr[:500],
+         'qemu_stderr': qc_stderr[:500]},
+    )
+    if div:
+        return div
+    if ic_rc != 0:
+        return None  # both rejected; nothing to compare
+
+    # 5. Compare via qemu-img info on BOTH the overlay and the
+    # backing. A commit's observable state lives on both
+    # sides.
+    for (label, inst_path, qemu_path) in (
+        ('overlay', inst_overlay, qemu_overlay),
+        ('backing', inst_base, qemu_base),
+    ):
+        inst_info_out, _, inst_info_rc = run_qemu_img(
+            ['info', '--output=json'], [str(inst_path)],
+            timeout=timeout)
+        qemu_info_out, _, qemu_info_rc = run_qemu_img(
+            ['info', '--output=json'], [str(qemu_path)],
+            timeout=timeout)
+        if inst_info_rc != 0 or qemu_info_rc != 0:
+            return {
+                'type': 'commit_info_readback_failure',
+                'side': label,
+                'target_format': target,
+                'overlay_size': overlay_size,
+                'explicit_base': explicit_base,
+                'seed_spec': seed_spec,
+                'instar_info_rc': inst_info_rc,
+                'qemu_info_rc': qemu_info_rc,
+                'instar_info_stdout': inst_info_out[:500],
+                'qemu_info_stdout': qemu_info_out[:500],
+            }
+        try:
+            inst_json = json.loads(inst_info_out)
+            qemu_json = json.loads(qemu_info_out)
+        except json.JSONDecodeError as e:
+            return {
+                'type': 'commit_info_json_parse_failure',
+                'side': label,
+                'target_format': target,
+                'error': str(e),
+                'instar_info_stdout': inst_info_out[:500],
+                'qemu_info_stdout': qemu_info_out[:500],
+            }
+
+        inst_norm = _normalise_create_info(
+            inst_json, target, str(inst_path))
+        qemu_norm = _normalise_create_info(
+            qemu_json, target, str(qemu_path))
+
+        # The overlay info JSON references the backing's
+        # absolute path via `full-backing-filename`; anonymise
+        # so the two sides' distinct paths don't trip the
+        # comparison.
+        if label == 'overlay':
+            _rebase_replace_filename(
+                inst_norm, str(inst_base), '$BASE')
+            _rebase_replace_filename(
+                qemu_norm, str(qemu_base), '$BASE')
+
+        if inst_norm != qemu_norm:
+            return {
+                'type': f'commit_{label}_info_divergence',
+                'target_format': target,
+                'overlay_size': overlay_size,
+                'explicit_base': explicit_base,
+                'seed_spec': seed_spec,
+                'create_options': create_options,
+                'instar_normalised': inst_norm,
+                'qemu_normalised': qemu_norm,
+            }
+
+    return None
+
+
+def _run_qemu_io(args, timeout=30):
+    """Run a qemu-io command. Returns (stdout, stderr, rc).
+    Mirrors `run_qemu_img`'s shape; used as a fixture-builder
+    in `op_commit`'s optional seed step.
+    """
+    cmd = ['qemu-io'] + args
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+        )
+        return result.stdout, result.stderr, result.returncode
+    except subprocess.TimeoutExpired:
+        return '', f'TIMEOUT after {timeout}s', -1
+
+
 # ---------------------------------------------------------------------------
 # Single iteration
 # ---------------------------------------------------------------------------
@@ -1727,6 +1974,11 @@ def run_iteration(instar_bin, workdir, rng, iteration, timeout,
                 )
             elif op == 'rebase':
                 div = op_rebase(
+                    instar_bin, instar_copy, qemu_copy, fmt,
+                    timeout, rng,
+                )
+            elif op == 'commit':
+                div = op_commit(
                     instar_bin, instar_copy, qemu_copy, fmt,
                     timeout, rng,
                 )
