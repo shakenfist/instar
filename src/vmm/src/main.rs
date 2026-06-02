@@ -3395,16 +3395,252 @@ fn run_rebase(args: RebaseArgs, verbose: bool) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+/// Probed metadata for an image involved in a commit (overlay
+/// or backing). Mirrors `ProbedRebaseTarget` but adds the
+/// recorded backing-file pointer so the host can resolve an
+/// implicit `-b`.
+#[allow(dead_code)]
+struct ProbedCommitTarget {
+    format: u32,
+    virtual_size: u64,
+    cluster_size: u32,
+    backing_file_raw: Option<String>,
+}
+
+/// Probe an image's format + key metadata + recorded backing-
+/// file pointer via the sandboxed info operation. Used for
+/// both the overlay and the backing during commit pre-checks.
+fn probe_commit_target(
+    path: &Path,
+    forced_format: Option<&str>,
+    label: &str,
+) -> Result<ProbedCommitTarget, Box<dyn std::error::Error>> {
+    let info = execute_info_operation(path, 65536, false)
+        .map_err(|e| -> Box<dyn std::error::Error> { format!("commit: {label}: {e}").into() })?;
+
+    // Honour an explicit format override. Refuse anything other
+    // than qcow2 / vmdk up-front so the user gets a clear error
+    // before the per-format checks below.
+    let detected = match forced_format {
+        Some("qcow2") => "qcow2",
+        Some("vmdk") => "vmdk",
+        Some(other) => {
+            return Err(format!(
+                "commit: {label}: format '{other}' is not supported (qcow2 and vmdk only)"
+            )
+            .into());
+        }
+        None => info.format.as_str(),
+    };
+
+    let format_code = match detected {
+        "qcow2" => IMAGE_FORMAT_QCOW2,
+        "vmdk" => IMAGE_FORMAT_VMDK4,
+        other => {
+            return Err(format!(
+                "commit: {label}: format '{other}' does not support commit \
+                 (qcow2 and vmdk only)"
+            )
+            .into());
+        }
+    };
+
+    Ok(ProbedCommitTarget {
+        format: format_code,
+        virtual_size: info.virtual_size,
+        cluster_size: info.cluster_size,
+        backing_file_raw: info.backing_file,
+    })
+}
+
 /// Run the commit operation.
 ///
-/// Step 8a ships only the dispatch stub. Step 8c adds path
-/// resolution, format probing, chain discovery, and pre-checks;
-/// step 8d wires the KVM lifecycle and harvests the
-/// `CommitResultMessage`. Until 8c lands, the runner errors
-/// out with a clear message.
+/// Step 8c ships path resolution, format probing, chain
+/// discovery (on the backing only), and the pre-checks listed
+/// in PLAN-rebase-commit-phase-08-commit-host.md. The actual
+/// KVM lifecycle that writes `CommitConfig`, attaches the
+/// devices, and runs the guest is step 8d — currently
+/// deferred. The runner therefore errors out with a clear
+/// message at the guest-launch point.
 fn run_commit(args: CommitArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let _ = (args, verbose);
-    Err("phase 8 step 8c not yet wired".into())
+    let _ = verbose;
+    let overlay_path = Path::new(&args.filename);
+    if !overlay_path.exists() {
+        return Err(format!("commit: overlay '{}' does not exist", args.filename).into());
+    }
+
+    let overlay_probe = probe_commit_target(overlay_path, args.format.as_deref(), "overlay")?;
+
+    // Resolve the backing path. -b BASE wins; otherwise fall
+    // back to the overlay's recorded backing-file pointer.
+    // Relative paths resolve against the overlay's parent
+    // directory to match qemu-img semantics.
+    let overlay_parent = overlay_path.parent().unwrap_or_else(|| Path::new("."));
+    let resolve_relative = |raw: &str| -> std::path::PathBuf {
+        let p = Path::new(raw);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            overlay_parent.join(p)
+        }
+    };
+
+    let (resolved_backing_path, base_was_explicit) = match &args.base {
+        Some(base) => (resolve_relative(base), true),
+        None => match overlay_probe.backing_file_raw.as_deref() {
+            Some(b) if !b.is_empty() => (resolve_relative(b), false),
+            _ => {
+                return Err("commit: overlay has no recorded backing file; \
+                            pass -b BASE to name one"
+                    .into());
+            }
+        },
+    };
+
+    if !resolved_backing_path.exists() {
+        return Err(format!(
+            "commit: backing file '{}' does not exist",
+            resolved_backing_path.display()
+        )
+        .into());
+    }
+
+    // Backing-writability pre-check. We need O_RDWR for the
+    // commit's data and metadata writes; surface a clearer
+    // message than KVM-side EACCES.
+    if std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&resolved_backing_path)
+        .is_err()
+    {
+        return Err(format!(
+            "commit: backing file '{}' is not writable",
+            resolved_backing_path.display()
+        )
+        .into());
+    }
+
+    let backing_probe = probe_commit_target(&resolved_backing_path, None, "backing")?;
+
+    // Cross-format refusal. v1 commits must be qcow2 → qcow2
+    // or vmdk → vmdk. Cross-format commits need planner
+    // extensions and are tracked as Future work.
+    if overlay_probe.format != backing_probe.format {
+        return Err(format!(
+            "commit: cross-format commit is not yet supported (overlay is {}, backing is {})",
+            image_format_name(overlay_probe.format),
+            image_format_name(backing_probe.format),
+        )
+        .into());
+    }
+
+    // Cluster-size mismatch refusal. Phase 7's guest also
+    // refuses with ERROR_UNSUPPORTED_FORMAT; the host catches
+    // it earlier with a clearer message and saves a guest
+    // launch.
+    if overlay_probe.cluster_size != 0
+        && backing_probe.cluster_size != 0
+        && overlay_probe.cluster_size != backing_probe.cluster_size
+    {
+        return Err(format!(
+            "commit: cluster-size mismatch is not yet supported (overlay {} B, backing {} B)",
+            overlay_probe.cluster_size, backing_probe.cluster_size,
+        )
+        .into());
+    }
+
+    // Backing must be at least as large as the overlay or the
+    // last cluster has nowhere to land.
+    if backing_probe.virtual_size < overlay_probe.virtual_size {
+        return Err(format!(
+            "commit: overlay virtual size ({} B) exceeds backing virtual size ({} B)",
+            overlay_probe.virtual_size, backing_probe.virtual_size,
+        )
+        .into());
+    }
+
+    // If -b was supplied, verify it names the overlay's
+    // immediate parent. Intermediate-image commits are
+    // deferred per the master plan; the comparison
+    // canonicalises both sides so symlinks / `..` don't
+    // produce false negatives.
+    if base_was_explicit {
+        let canonical_supplied = resolved_backing_path
+            .canonicalize()
+            .unwrap_or_else(|_| resolved_backing_path.clone());
+        let recorded_parent = overlay_probe
+            .backing_file_raw
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(resolve_relative);
+        match recorded_parent {
+            Some(recorded) => {
+                let canonical_recorded = recorded.canonicalize().unwrap_or(recorded);
+                if canonical_supplied != canonical_recorded {
+                    return Err(format!(
+                        "commit: commit through an intermediate layer is not yet \
+                         supported (the overlay's immediate parent is '{}')",
+                        canonical_recorded.display(),
+                    )
+                    .into());
+                }
+            }
+            None => {
+                // The overlay has no recorded parent, so any
+                // explicit -b is necessarily a non-parent.
+                return Err(format!(
+                    "commit: overlay has no recorded backing file; '-b {}' would be \
+                     a new backing reference, which commit does not support \
+                     (use `instar rebase` to set a backing)",
+                    resolved_backing_path.display(),
+                )
+                .into());
+            }
+        }
+    }
+
+    // Discover the backing's own ancestor chain. The backing
+    // itself is the output device, not part of the input
+    // chain — strip it from the front of the returned chain.
+    // The v1 guest ignores these slots; populating them gives
+    // the future "skip when chain already provides this data"
+    // mode something to consume.
+    let security_config = config::SecurityConfig::default();
+    let sector_size = 512u32;
+    let backing_chain_full =
+        discover_backing_chain(&resolved_backing_path, sector_size, &security_config)
+            .map_err(|e| -> Box<dyn std::error::Error> { format!("commit: {e}").into() })?;
+    let backing_chain_images = backing_chain_full.images();
+    let backing_parents = if backing_chain_images.is_empty() {
+        BackingChain::new()
+    } else {
+        let mut parents = BackingChain::new();
+        for img in &backing_chain_images[1..] {
+            parents.push(img.clone());
+        }
+        parents
+    };
+
+    // Combined device count check. The overlay occupies input
+    // slot 0; backing's parents fill input slots 1..N. The
+    // backing-as-output isn't counted in MAX_CHAIN_DEVICES
+    // (it's the output, not an input).
+    let total_input_devices = 1 + backing_parents.total_devices();
+    if total_input_devices > shared::MAX_CHAIN_DEVICES {
+        return Err(format!(
+            "commit: combined chain length (overlay + {} backing parents) exceeds the \
+             {}-device limit",
+            backing_parents.total_devices(),
+            shared::MAX_CHAIN_DEVICES,
+        )
+        .into());
+    }
+
+    // Step 8d wires the KVM lifecycle. Until then the runner
+    // exits cleanly at the guest-launch boundary.
+    let _ = (overlay_probe, backing_probe, backing_parents);
+    Err("phase 8 step 8d not yet wired".into())
 }
 
 /// Run the resize operation.
