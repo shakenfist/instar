@@ -23,8 +23,9 @@
 use core::panic::PanicInfo;
 
 use commit::{
-    allocate_backing_cluster_qcow2, plan_commit_qcow2, BackingAllocationState, CommitError,
-    Qcow2CommitOpts,
+    allocate_backing_cluster_qcow2, allocate_backing_grain_vmdk, plan_commit_qcow2,
+    plan_commit_vmdk, BackingAllocationState, BackingGrainAllocationState, CommitError,
+    Qcow2CommitOpts, VmdkCommitOpts,
 };
 use qcow2::{
     QcowHeader, INCOMPAT_CORRUPT, INCOMPAT_DIRTY, INCOMPAT_EXTENDED_L2, INCOMPAT_EXTERNAL_DATA,
@@ -35,6 +36,7 @@ use shared::{
     CommitResult, ImageFormat, CALL_TABLE_ADDR, MAX_SECTOR_SIZE, OPERATION_CONFIG_ADDR,
     SCRATCH_MEM_BASE,
 };
+use vmdk::{Vmdk4HeaderFull, FLAG_COMPRESSED};
 
 // ---------------------------------------------------------------------------
 // Scratch layout
@@ -921,13 +923,451 @@ fn err(config: &CommitConfig, error: u32) -> CommitResult {
     err_result(config.overlay_format, config.backing_format, error)
 }
 
-/// vmdk commit runner. Step 7d stub.
-unsafe fn run_vmdk(_call_table: &CallTable, config: &CommitConfig) -> CommitResult {
-    err_result(
-        config.overlay_format,
-        config.backing_format,
-        CommitResult::ERROR_UNSUPPORTED_FORMAT,
-    )
+// ---------------------------------------------------------------------------
+// vmdk commit runner (step 7d)
+// ---------------------------------------------------------------------------
+//
+// vmdk's per-side metadata is shallower than qcow2: a single
+// grain directory of u32 LE sector pointers, and one grain
+// table per allocated GD entry (also u32 LE sector pointers).
+// No refcount table. v1 reuses the qcow2 scratch regions:
+// `OVERLAY_L1_BUF` / `BACKING_L1_BUF` for the grain
+// directories, `OVERLAY_L2_STAGING` / `BACKING_L2_STAGING`
+// for the GTs, and `OVERLAY_RT_BUF` / `BACKING_RT_BUF` for
+// the descriptor bytes (only used for the defensive re-read
+// check).
+
+/// Reuse [`StagedL2`] for vmdk: `l1_idx` carries the GD entry
+/// index, `host_offset` carries the GT's host sector (not byte
+/// offset — vmdk pointers are sector-granularity), `dirty`
+/// flags GT bytes the allocator has mutated.
+type StagedGt = StagedL2;
+
+fn read_u32_le(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
+
+fn write_u32_le(buf: &mut [u8], off: usize, value: u32) {
+    buf[off..off + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+unsafe fn stage_vmdk_side(
+    sector_size: usize,
+    gd_offset_sectors: u64,
+    num_gd_entries: u32,
+    num_gtes_per_gt: u32,
+    gd_ptr: *mut u8,
+    gt_staging_base: usize,
+    gt_capacity_bytes: usize,
+    staged: &mut [StagedGt; MAX_STAGED_L2],
+    read_byte_range: impl Fn(u64, *mut u8, usize) -> bool,
+) -> Result<usize, CommitError> {
+    let gd_bytes = (num_gd_entries as usize)
+        .checked_mul(4)
+        .ok_or(CommitError::Overflow)?;
+    if gd_bytes > OVERLAY_L1_LIMIT {
+        return Err(CommitError::ScratchTooSmall);
+    }
+    if gd_bytes > 0 && !read_byte_range(gd_offset_sectors * 512, gd_ptr, gd_bytes) {
+        return Err(CommitError::ParseFailed);
+    }
+    let gd_buf = core::slice::from_raw_parts(gd_ptr, gd_bytes);
+    let gt_size_bytes = (num_gtes_per_gt as usize)
+        .checked_mul(4)
+        .ok_or(CommitError::Overflow)?;
+    let mut count = 0usize;
+    let mut cursor = gt_staging_base;
+    let cap_end = gt_staging_base + gt_capacity_bytes;
+    let _ = sector_size; // bounce buffer comes from helper's own region
+    for i in 0..num_gd_entries as usize {
+        let gd_entry = read_u32_le(gd_buf, i * 4);
+        if gd_entry == 0 {
+            continue;
+        }
+        let gt_host_byte = (gd_entry as u64) * 512;
+        if count >= MAX_STAGED_L2 || cursor + gt_size_bytes > cap_end {
+            return Err(CommitError::ScratchTooSmall);
+        }
+        if !read_byte_range(gt_host_byte, cursor as *mut u8, gt_size_bytes) {
+            return Err(CommitError::ParseFailed);
+        }
+        staged[count] = StagedGt {
+            l1_idx: i as u32,
+            host_offset: gd_entry as u64, // host sector, not bytes
+            dirty: false,
+        };
+        count += 1;
+        cursor += gt_size_bytes;
+    }
+    Ok(count)
+}
+
+unsafe fn run_vmdk(call_table: &CallTable, config: &CommitConfig) -> CommitResult {
+    let sector_size = (call_table.get_output_sector_size)();
+    let overlay_header = core::slice::from_raw_parts(HEADER_BUF as *const u8, sector_size);
+    let backing_header_slice =
+        core::slice::from_raw_parts(BACKING_HEADER_BUF as *const u8, sector_size);
+
+    let overlay = match Vmdk4HeaderFull::parse(overlay_header) {
+        Some(p) => p,
+        None => return err(config, CommitResult::ERROR_PARSE_FAILED),
+    };
+    let backing = match Vmdk4HeaderFull::parse(backing_header_slice) {
+        Some(p) => p,
+        None => return err(config, CommitResult::ERROR_PARSE_FAILED),
+    };
+
+    if (overlay.flags & FLAG_COMPRESSED) != 0 || (backing.flags & FLAG_COMPRESSED) != 0 {
+        return err(config, CommitResult::ERROR_UNSUPPORTED_FORMAT);
+    }
+    if overlay.grain_size_sectors != backing.grain_size_sectors
+        || overlay.num_gtes_per_gt != backing.num_gtes_per_gt
+    {
+        return err(config, CommitResult::ERROR_UNSUPPORTED_FORMAT);
+    }
+    if backing.virtual_size < overlay.virtual_size {
+        return err(config, CommitResult::ERROR_OVERLAY_LARGER_THAN_BACKING);
+    }
+    if overlay.grain_size_sectors == 0 || overlay.num_gtes_per_gt == 0 {
+        return err(config, CommitResult::ERROR_OVERLAY_CORRUPT);
+    }
+    if backing.grain_size_sectors == 0 || backing.num_gtes_per_gt == 0 {
+        return err(config, CommitResult::ERROR_BACKING_CORRUPT);
+    }
+
+    let overlay_num_gd = match overlay.num_gd_entries() {
+        Some(n) => n,
+        None => return err(config, CommitResult::ERROR_OVERLAY_CORRUPT),
+    };
+    let backing_num_gd = match backing.num_gd_entries() {
+        Some(n) => n,
+        None => return err(config, CommitResult::ERROR_BACKING_CORRUPT),
+    };
+
+    let grain_size_sectors = overlay.grain_size_sectors as u32;
+    let num_gtes_per_gt = overlay.num_gtes_per_gt;
+    let grain_size_bytes = overlay.grain_size_bytes;
+    let grain_size_bytes_usize = grain_size_bytes as usize;
+    if grain_size_bytes_usize > DATA_BUF_LIMIT {
+        return err(config, CommitResult::ERROR_SCRATCH_TOO_SMALL);
+    }
+
+    // ----- Stage overlay GD + GTs (input slot 0) -----------
+    let mut overlay_staged_gt = [StagedGt {
+        l1_idx: 0,
+        host_offset: 0,
+        dirty: false,
+    }; MAX_STAGED_L2];
+    let overlay_staged_count = match stage_vmdk_side(
+        sector_size,
+        overlay.gd_offset_sectors,
+        overlay_num_gd,
+        num_gtes_per_gt,
+        OVERLAY_L1_BUF as *mut u8,
+        OVERLAY_L2_STAGING,
+        OVERLAY_L2_LIMIT,
+        &mut overlay_staged_gt,
+        |off, dst, len| read_input_byte_range(call_table, 0, sector_size, off, dst, len),
+    ) {
+        Ok(n) => n,
+        Err(e) => return err(config, map_commit_error(e)),
+    };
+
+    // ----- Stage overlay descriptor (for length validation
+    //       and the planner opts) -----------------------------
+    let overlay_desc_size = (overlay.desc_size_sectors * 512) as usize;
+    if overlay_desc_size > OVERLAY_RT_LIMIT {
+        return err(config, CommitResult::ERROR_SCRATCH_TOO_SMALL);
+    }
+    if overlay_desc_size > 0
+        && !read_input_byte_range(
+            call_table,
+            0,
+            sector_size,
+            overlay.desc_offset_sectors * 512,
+            OVERLAY_RT_BUF as *mut u8,
+            overlay_desc_size,
+        )
+    {
+        return err(config, CommitResult::ERROR_PARSE_FAILED);
+    }
+
+    // ----- Stage backing GD + GTs (output device) ----------
+    let mut backing_staged_gt = [StagedGt {
+        l1_idx: 0,
+        host_offset: 0,
+        dirty: false,
+    }; MAX_STAGED_L2];
+    let backing_staged_count = match stage_vmdk_side(
+        sector_size,
+        backing.gd_offset_sectors,
+        backing_num_gd,
+        num_gtes_per_gt,
+        BACKING_L1_BUF as *mut u8,
+        BACKING_L2_STAGING,
+        BACKING_L2_LIMIT,
+        &mut backing_staged_gt,
+        |off, dst, len| read_output_byte_range(call_table, sector_size, off, dst, len),
+    ) {
+        Ok(n) => n,
+        Err(e) => return err(config, map_commit_error(e)),
+    };
+
+    let backing_desc_size = (backing.desc_size_sectors * 512) as usize;
+    if backing_desc_size > BACKING_RT_LIMIT {
+        return err(config, CommitResult::ERROR_SCRATCH_TOO_SMALL);
+    }
+    if backing_desc_size > 0
+        && !read_output_byte_range(
+            call_table,
+            sector_size,
+            backing.desc_offset_sectors * 512,
+            BACKING_RT_BUF as *mut u8,
+            backing_desc_size,
+        )
+    {
+        return err(config, CommitResult::ERROR_PARSE_FAILED);
+    }
+
+    // ----- Plan ---------------------------------------------
+    let gt_size_bytes = (num_gtes_per_gt as usize) * 4;
+    let overlay_gd_bytes = (overlay_num_gd as usize) * 4;
+    let backing_gd_bytes = (backing_num_gd as usize) * 4;
+    let overlay_gd_slice =
+        core::slice::from_raw_parts(OVERLAY_L1_BUF as *const u8, overlay_gd_bytes);
+    let overlay_gt_slice = core::slice::from_raw_parts(
+        OVERLAY_L2_STAGING as *const u8,
+        overlay_staged_count * gt_size_bytes,
+    );
+    let overlay_desc_slice =
+        core::slice::from_raw_parts(OVERLAY_RT_BUF as *const u8, overlay_desc_size);
+    let backing_gd_slice =
+        core::slice::from_raw_parts(BACKING_L1_BUF as *const u8, backing_gd_bytes);
+    let backing_gt_slice = core::slice::from_raw_parts(
+        BACKING_L2_STAGING as *const u8,
+        backing_staged_count * gt_size_bytes,
+    );
+    let backing_desc_slice =
+        core::slice::from_raw_parts(BACKING_RT_BUF as *const u8, backing_desc_size);
+
+    let overlay_gt_hosts_buf =
+        core::slice::from_raw_parts_mut(BACKING_RB_OFFSETS as *mut u64, overlay_staged_count);
+    for (i, gt) in overlay_staged_gt
+        .iter()
+        .take(overlay_staged_count)
+        .enumerate()
+    {
+        overlay_gt_hosts_buf[i] = gt.host_offset;
+    }
+    let backing_gt_hosts_buf = core::slice::from_raw_parts_mut(
+        (BACKING_RB_OFFSETS + overlay_staged_count * 8) as *mut u64,
+        backing_staged_count,
+    );
+    for (i, gt) in backing_staged_gt
+        .iter()
+        .take(backing_staged_count)
+        .enumerate()
+    {
+        backing_gt_hosts_buf[i] = gt.host_offset;
+    }
+
+    let capacity_sectors_backing = (call_table.get_output_capacity)();
+    let backing_file_size = capacity_sectors_backing.saturating_mul(sector_size as u64);
+    let overlay_file_size = (call_table.get_input_capacity)(0).saturating_mul(sector_size as u64);
+
+    let opts = VmdkCommitOpts {
+        overlay_header,
+        overlay_descriptor: overlay_desc_slice,
+        overlay_grain_size_sectors: grain_size_sectors,
+        overlay_num_gtes_per_gt: num_gtes_per_gt,
+        overlay_num_gd_entries: overlay_num_gd,
+        overlay_gd_offset_sectors: overlay.gd_offset_sectors,
+        overlay_grain_directory: overlay_gd_slice,
+        overlay_grain_tables: overlay_gt_slice,
+        overlay_allocated_gt_host_sectors: overlay_gt_hosts_buf,
+        overlay_allocated_gt_count: overlay_staged_count as u32,
+        overlay_virtual_size: overlay.virtual_size,
+        overlay_file_size,
+        backing_header: backing_header_slice,
+        backing_descriptor: backing_desc_slice,
+        backing_grain_size_sectors: grain_size_sectors,
+        backing_num_gtes_per_gt: num_gtes_per_gt,
+        backing_num_gd_entries: backing_num_gd,
+        backing_gd_offset_sectors: backing.gd_offset_sectors,
+        backing_grain_directory: backing_gd_slice,
+        backing_grain_tables: backing_gt_slice,
+        backing_allocated_gt_host_sectors: backing_gt_hosts_buf,
+        backing_allocated_gt_count: backing_staged_count as u32,
+        backing_virtual_size: backing.virtual_size,
+        backing_file_size,
+    };
+    let planner_scratch =
+        core::slice::from_raw_parts_mut(PLANNER_SCRATCH as *mut u8, PLANNER_SCRATCH_LIMIT);
+    let mut ctx = match plan_commit_vmdk(&opts, planner_scratch) {
+        Ok(c) => c,
+        Err(e) => return err(config, map_commit_error(e)),
+    };
+
+    // ----- Per-grain commit loop ----------------------------
+    let mut state = match BackingGrainAllocationState::at_eof(backing_file_size, grain_size_sectors)
+    {
+        Ok(s) => s,
+        Err(e) => return err(config, map_commit_error(e)),
+    };
+    let mut clusters_committed: u64 = 0;
+    let mut bytes_committed: u64 = 0;
+    let data_buf = DATA_BUF as *mut u8;
+
+    let backing_gt_buf_mut = core::slice::from_raw_parts_mut(
+        BACKING_L2_STAGING as *mut u8,
+        backing_staged_count * gt_size_bytes,
+    );
+
+    for grain_idx in 0..ctx.overlay_grain_count {
+        let gd_idx = grain_idx / (num_gtes_per_gt as u64);
+        let gte_inner = (grain_idx % (num_gtes_per_gt as u64)) as usize;
+        if gd_idx >= overlay_num_gd as u64 {
+            break;
+        }
+        let gd_idx_u32 = gd_idx as u32;
+
+        // Decode overlay GD/GT.
+        let overlay_slot =
+            match find_staged_l2(&overlay_staged_gt, overlay_staged_count, gd_idx_u32) {
+                Some(s) => s,
+                None => continue, // GD entry is zero — nothing allocated here.
+            };
+        let overlay_gt = core::slice::from_raw_parts(
+            (OVERLAY_L2_STAGING + overlay_slot * gt_size_bytes) as *const u8,
+            gt_size_bytes,
+        );
+        let gte = read_u32_le(overlay_gt, gte_inner * 4);
+        if gte == 0 {
+            continue;
+        }
+        let overlay_grain_host_byte = (gte as u64) * 512;
+
+        // Read the overlay grain's data.
+        if !read_input_byte_range(
+            call_table,
+            0,
+            sector_size,
+            overlay_grain_host_byte,
+            data_buf,
+            grain_size_bytes_usize,
+        ) {
+            return err(config, CommitResult::ERROR_PARSE_FAILED);
+        }
+
+        // Locate the matching backing GT. v1 skips grains
+        // whose covering backing GD entry is zero
+        // (GD-extension follow-up).
+        let backing_slot =
+            match find_staged_l2(&backing_staged_gt, backing_staged_count, gd_idx_u32) {
+                Some(s) => s,
+                None => continue,
+            };
+        let backing_gte_off = backing_slot * gt_size_bytes + gte_inner * 4;
+        let backing_gte = read_u32_le(backing_gt_buf_mut, backing_gte_off);
+        let backing_grain_host_byte = if backing_gte != 0 {
+            (backing_gte as u64) * 512
+        } else {
+            let off = match allocate_backing_grain_vmdk(&mut ctx, &mut state) {
+                Ok(off) => off,
+                Err(e) => return err(config, map_commit_error(e)),
+            };
+            let sector = (off / 512) as u32;
+            write_u32_le(backing_gt_buf_mut, backing_gte_off, sector);
+            backing_staged_gt[backing_slot].dirty = true;
+            off
+        };
+
+        let data_slice = core::slice::from_raw_parts(data_buf, grain_size_bytes_usize);
+        if !write_output_byte_range(call_table, sector_size, backing_grain_host_byte, data_slice) {
+            return err(config, CommitResult::ERROR_HEADER_MISMATCH);
+        }
+
+        clusters_committed += 1;
+        bytes_committed = bytes_committed.saturating_add(grain_size_bytes);
+    }
+
+    // ----- Flush dirty backing GTs --------------------------
+    for i in 0..backing_staged_count {
+        if !backing_staged_gt[i].dirty {
+            continue;
+        }
+        let slice = core::slice::from_raw_parts(
+            (BACKING_L2_STAGING + i * gt_size_bytes) as *const u8,
+            gt_size_bytes,
+        );
+        let host_byte = backing_staged_gt[i].host_offset * 512;
+        if !write_output_byte_range(call_table, sector_size, host_byte, slice) {
+            return err(config, CommitResult::ERROR_HEADER_MISMATCH);
+        }
+    }
+
+    // ----- Overlay-clear pass ------------------------------
+    let zeros_4 = [0u8; 4];
+    let mut overlay_clusters_cleared: u64 = 0;
+    for grain_idx in 0..ctx.overlay_grain_count {
+        let gd_idx = grain_idx / (num_gtes_per_gt as u64);
+        let gte_inner = (grain_idx % (num_gtes_per_gt as u64)) as usize;
+        if gd_idx >= overlay_num_gd as u64 {
+            break;
+        }
+        let slot = match find_staged_l2(&overlay_staged_gt, overlay_staged_count, gd_idx as u32) {
+            Some(s) => s,
+            None => continue,
+        };
+        let overlay_gt = core::slice::from_raw_parts(
+            (OVERLAY_L2_STAGING + slot * gt_size_bytes) as *const u8,
+            gt_size_bytes,
+        );
+        let gte = read_u32_le(overlay_gt, gte_inner * 4);
+        if gte == 0 {
+            continue;
+        }
+        // Was this grain committed? v1 commits every
+        // allocated overlay grain whose covering backing GD
+        // entry is non-zero; otherwise it was skipped. Mirror
+        // the data-loop's skip predicate.
+        if find_staged_l2(&backing_staged_gt, backing_staged_count, gd_idx as u32).is_none() {
+            continue;
+        }
+
+        let gte_byte_offset = overlay_staged_gt[slot].host_offset * 512 + (gte_inner as u64) * 4;
+        if !write_input_byte_range(call_table, 0, sector_size, gte_byte_offset, &zeros_4) {
+            return err(config, CommitResult::ERROR_HEADER_MISMATCH);
+        }
+        overlay_clusters_cleared += 1;
+    }
+
+    // ----- Defensive backing-header re-read -----------------
+    let mut redo = [0u8; MAX_SECTOR_SIZE];
+    if !(call_table.read_output_sector)(0, redo.as_mut_ptr(), sector_size) {
+        return err(config, CommitResult::ERROR_HEADER_MISMATCH);
+    }
+    let redo_parsed = match Vmdk4HeaderFull::parse(&redo[..sector_size]) {
+        Some(p) => p,
+        None => return err(config, CommitResult::ERROR_HEADER_MISMATCH),
+    };
+    if redo_parsed.virtual_size != backing.virtual_size
+        || redo_parsed.grain_size_sectors != backing.grain_size_sectors
+        || redo_parsed.gd_offset_sectors != backing.gd_offset_sectors
+    {
+        return err(config, CommitResult::ERROR_HEADER_MISMATCH);
+    }
+
+    CommitResult {
+        magic: CommitResult::MAGIC,
+        overlay_format: config.overlay_format,
+        backing_format: config.backing_format,
+        error: CommitResult::ERROR_OK,
+        clusters_committed,
+        bytes_committed,
+        overlay_clusters_cleared,
+        _reserved: [0; 56],
+    }
 }
 
 // ---------------------------------------------------------------------------
