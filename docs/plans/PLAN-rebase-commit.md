@@ -575,7 +575,7 @@ called out below. Each phase produces at least one commit.
 | 9. Commit integration tests + cross-version baselines | [PLAN-rebase-commit-phase-09-commit-tests.md](PLAN-rebase-commit-phase-09-commit-tests.md) | Complete: plan (9be9e66), instar-testdata generator extension (efaebe99b) + 640 cross-version baselines (8dcc3b907), TestCommitBaselineMatrix (8baa56d), TestCommitRoundTrip (ba16ca9). |
 | 10. Coverage-guided fuzzing (rebase + commit planners) | [PLAN-rebase-commit-phase-10-fuzz.md](PLAN-rebase-commit-phase-10-fuzz.md) | Complete: plan (af25ec6), rebase vmdk planner bug fix (1611841) + fuzz_rebase_planners (a2935bb), fuzz_commit_planners (95f632c), CI wiring + wrap-up (this step). |
 | 11. Differential fuzzing vs qemu-img | [PLAN-rebase-commit-phase-11-diff-fuzz.md](PLAN-rebase-commit-phase-11-diff-fuzz.md) | Complete: plan (1518b30), op_rebase (47db188), op_commit (0649c4c), wrap-up (this step). |
-| 12. Documentation, CHANGELOG, ARCHITECTURE updates | [PLAN-rebase-commit-phase-12-docs.md](PLAN-rebase-commit-phase-12-docs.md) | Not started |
+| 12. Documentation, CHANGELOG, ARCHITECTURE updates | [PLAN-rebase-commit-phase-12-docs.md](PLAN-rebase-commit-phase-12-docs.md) | Complete: plan (6fe5888), per-subcommand guides (944788f), cross-cutting updates (e29b3a5), wrap-up (this step). **All twelve phases of PLAN-rebase-commit are now complete.** |
 
 Recommended planning effort by phase:
 

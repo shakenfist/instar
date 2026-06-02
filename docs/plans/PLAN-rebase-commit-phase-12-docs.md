@@ -423,7 +423,9 @@ and `docs/commit.md` will cross-reference:
 
 ### Bugs fixed during this work
 
-To be filled in as work progresses.
+None — phase 12 was pure documentation work. No code paths
+were modified. The `pre-commit run --all-files` check ran
+clean after both 12a and 12b.
 
 ### Documentation index maintenance
 
