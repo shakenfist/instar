@@ -20,6 +20,7 @@ measure = { path = "../crates/measure" }
 create = { path = "../crates/create" }
 resize = { path = "../crates/resize" }
 rebase = { path = "../crates/rebase" }
+commit = { path = "../crates/commit" }
 
 [profile.release]
 debug = true
@@ -133,5 +134,11 @@ test = false
 [[bin]]
 name = "fuzz_rebase_planners"
 path = "fuzz_targets/fuzz_rebase_planners.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "fuzz_commit_planners"
+path = "fuzz_targets/fuzz_commit_planners.rs"
 doc = false
 test = false
