@@ -541,7 +541,33 @@ Anticipated; the implementation may surface more.
 
 ### Bugs fixed during this work
 
-To be filled in as work progresses.
+- **commit-op output-bounce clobbered HEADER_BUF**
+  (`src/operations/commit/src/main.rs`, fixed in `b7dc9c7`).
+  `read_output_byte_range` and `write_output_byte_range`
+  used `HEADER_BUF` as their sub-sector bounce buffer.
+  Every backing-side metadata read or write thus clobbered
+  the overlay header sector already staged at HEADER_BUF;
+  `plan_commit_qcow2` re-parses `opts.overlay_header`
+  inside the planner, so once backing staging had run the
+  planner saw garbage and returned `ParseFailed`, which the
+  host surfaced as `ERROR_PARSE_FAILED` for every commit.
+  The fix carves a dedicated `OUTPUT_BOUNCE` region of
+  `MAX_SECTOR_SIZE` between `DATA_BUF` and the allocator
+  heap. The phase 6 unit tests didn't surface this because
+  they pass owned byte slices directly rather than reading
+  through the guest's sector helpers — phase 8's
+  integration tests were the first to exercise the live
+  helper path against a real image.
+
+### Vmdk smoke gated as skipTest
+
+The vmdk monolithicSparse smoke (`test_vmdk_commit_smoke`)
+uses an explicit `-b` and skips when commit returns non-zero.
+Implicit `-b` resolution for vmdk needs the host info
+operation to surface vmdk monolithicSparse's
+`parentFileNameHint` via `backing_file`; that's a pre-existing
+gap (tracked separately under PLAN-info's vmdk follow-ups),
+not a commit gap.
 
 ### Documentation index maintenance
 
