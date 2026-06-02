@@ -3841,6 +3841,99 @@ fn map_rebase_error(code: u32) -> String {
     }
 }
 
+/// Render a success line for `instar commit`. Human form
+/// matches qemu's `"Image committed."` byte-for-byte; JSON
+/// form emits a structured envelope. `--quiet` suppresses
+/// the success line; errors still go to stderr.
+#[allow(dead_code)]
+fn render_commit_success(
+    args: &CommitArgs,
+    backing_path: &str,
+    overlay_format: u32,
+    backing_format: u32,
+    clusters_committed: u64,
+    bytes_committed: u64,
+    overlay_clusters_cleared: u64,
+) {
+    if args.quiet {
+        return;
+    }
+    if args.output == "json" {
+        println!(
+            "{{\n  \"overlay\": \"{}\",\n  \"overlay_format\": \"{}\",\n  \
+             \"backing\": \"{}\",\n  \"backing_format\": \"{}\",\n  \
+             \"clusters_committed\": {},\n  \"bytes_committed\": {},\n  \
+             \"overlay_clusters_cleared\": {}\n}}",
+            json_escape_string(&args.filename),
+            image_format_name(overlay_format),
+            json_escape_string(backing_path),
+            image_format_name(backing_format),
+            clusters_committed,
+            bytes_committed,
+            overlay_clusters_cleared,
+        );
+    } else {
+        println!("Image committed.");
+    }
+}
+
+/// Map a `CommitResult::ERROR_*` code to a user-facing string.
+/// Exhaustive on the 14 constants from
+/// `src/shared/src/lib.rs` (0..=13); the trailing catch-all
+/// covers future code additions only.
+#[allow(dead_code)]
+fn map_commit_error(code: u32) -> String {
+    match code {
+        c if c == shared::CommitResult::ERROR_OK => "ok".into(),
+        c if c == shared::CommitResult::ERROR_UNSUPPORTED_FORMAT => {
+            "format does not support commit (qcow2 and vmdk only; commit between \
+             mismatched formats or cluster sizes is not yet supported)"
+                .into()
+        }
+        c if c == shared::CommitResult::ERROR_NO_BACKING => {
+            "the overlay has no recorded backing file; pass -b to name one".into()
+        }
+        c if c == shared::CommitResult::ERROR_EXTERNAL_DATA_FILE => {
+            "qcow2 overlays with the external-data-file feature cannot be committed".into()
+        }
+        c if c == shared::CommitResult::ERROR_LUKS_UNSUPPORTED => {
+            "LUKS-encrypted overlays and backings are not yet supported for commit".into()
+        }
+        c if c == shared::CommitResult::ERROR_BACKING_TOO_SMALL => {
+            "the backing file is smaller than the overlay; cannot commit".into()
+        }
+        c if c == shared::CommitResult::ERROR_OVERLAY_LARGER_THAN_BACKING => {
+            "the overlay's virtual size exceeds the backing's virtual size".into()
+        }
+        c if c == shared::CommitResult::ERROR_HEADER_MISMATCH => {
+            "the overlay or backing header changed during commit, or a guest write \
+             failed; retry, or run `instar check` if the image may be corrupt"
+                .into()
+        }
+        c if c == shared::CommitResult::ERROR_OVERLAY_CORRUPT => {
+            "the overlay is marked dirty or corrupt; run `instar check` first".into()
+        }
+        c if c == shared::CommitResult::ERROR_BACKING_CORRUPT => {
+            "the backing is marked dirty or corrupt; run `instar check` first".into()
+        }
+        c if c == shared::CommitResult::ERROR_SCRATCH_TOO_SMALL => {
+            "the overlay or backing is too large for the commit scratch buffer".into()
+        }
+        c if c == shared::CommitResult::ERROR_REFCOUNT_EXHAUSTED => {
+            "the backing's refcount blocks are full; v1 doesn't append new ones. \
+             Fall back to `qemu-img commit`"
+                .into()
+        }
+        c if c == shared::CommitResult::ERROR_PARSE_FAILED => {
+            "the overlay or backing header could not be parsed".into()
+        }
+        c if c == shared::CommitResult::ERROR_INTERNAL_OVERFLOW => {
+            "internal size or offset computation overflowed (host or guest bug)".into()
+        }
+        _ => format!("unknown commit error code {code}"),
+    }
+}
+
 /// Host-side mirror of `ResizeResult` populated by the guest
 /// dispatch.
 struct ResizeRunResult {
