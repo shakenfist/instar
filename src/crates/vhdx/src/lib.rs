@@ -13,7 +13,7 @@
 
 use shared::{
     le_u16, le_u32, le_u64, write_le_u16, write_le_u32, write_le_u64, AllocationSummary, CallTable,
-    MAX_SECTOR_SIZE,
+    MapExtent, MapExtentCoalescer, MapExtentState, MAX_SECTOR_SIZE,
 };
 
 // ============================================================================
@@ -565,6 +565,51 @@ pub fn count_allocated_in_bat(
     count
 }
 
+/// Classify one VHDX payload BAT entry into a single `MapExtent`.
+///
+/// Mirrors `block_lookup`'s payload-state decision tree, augmented
+/// with `PAYLOAD_BLOCK_PARTIALLY_PRESENT` treated as `Data` for v1
+/// (matches `scan_allocation`'s allocated-overcount posture; the
+/// per-sector-bitmap walk that qemu-img map performs for this state
+/// is listed as future work in PLAN-map.md).
+///
+/// State decoding (low 3 bits of `entry`):
+/// - `NOT_PRESENT (0)`, `UNDEFINED (1)`, `UNMAPPED (3)`: `Hole`.
+/// - `ZERO (2)`: `ZeroAllocated`.
+/// - `FULLY_PRESENT (6)`: `Data { file_offset: entry &
+///   BAT_ENTRY_OFFSET_MASK }`.
+/// - `PARTIALLY_PRESENT (7)`: `Data { file_offset: entry &
+///   BAT_ENTRY_OFFSET_MASK }` (v1 simplification).
+/// - Anything else (reserved): `Hole` (defensive — only states
+///   0..=3, 6, 7 are spec-defined).
+///
+/// `block_size_bytes` is the extent's length; `virtual_offset` is
+/// the virtual address of the block's first byte. The caller is
+/// responsible for clamping `length` against virtual_size if the
+/// block straddles end-of-image.
+pub fn classify_vhdx_bat_entry(
+    entry: u64,
+    virtual_offset: u64,
+    block_size_bytes: u64,
+) -> MapExtent {
+    let state = entry & BAT_ENTRY_STATE_MASK;
+    let ext_state = match state {
+        PAYLOAD_BLOCK_NOT_PRESENT | PAYLOAD_BLOCK_UNDEFINED | PAYLOAD_BLOCK_UNMAPPED => {
+            MapExtentState::Hole
+        }
+        PAYLOAD_BLOCK_ZERO => MapExtentState::ZeroAllocated,
+        PAYLOAD_BLOCK_FULLY_PRESENT | PAYLOAD_BLOCK_PARTIALLY_PRESENT => MapExtentState::Data {
+            file_offset: entry & BAT_ENTRY_OFFSET_MASK,
+        },
+        _ => MapExtentState::Hole,
+    };
+    MapExtent {
+        start: virtual_offset,
+        length: block_size_bytes,
+        state: ext_state,
+    }
+}
+
 /// Incremental variant of `count_allocated_in_bat` for chunked BAT
 /// walks across multiple cached sector reads.
 ///
@@ -1114,6 +1159,148 @@ impl VhdxState {
             // scanner is converted to target-aware accounting.
             0,
         ))
+    }
+
+    /// Walk the VHDX BAT (skipping interleaved sector-bitmap
+    /// entries) and emit a coalesced `MapExtent` stream covering
+    /// `[0, virtual_disk_size)`.
+    ///
+    /// Mirrors `scan_allocation`'s sector-walking shell and
+    /// chunk_ratio-aware BAT-entry rotation, but classifies each
+    /// payload entry via [`classify_vhdx_bat_entry`] and pushes the
+    /// result through a `MapExtentCoalescer` that persists for the
+    /// whole walk. Sector-bitmap entries (every `chunk_ratio`
+    /// payload entries) are skipped, as are payload entries past
+    /// `total_payload_blocks` (BAT tail padding).
+    ///
+    /// A trailing `Hole` covers any virtual range past the last
+    /// walked block up to `virtual_disk_size` so emitted extents
+    /// partition `[0, virtual_disk_size)`.
+    ///
+    /// PAYLOAD_BLOCK_PARTIALLY_PRESENT is treated as Data (v1
+    /// simplification matching scan_allocation; the per-sector-bitmap
+    /// walk is future work).
+    ///
+    /// Returns `Some(())` on success (including early termination);
+    /// `None` on I/O failure.
+    ///
+    /// # Safety
+    ///
+    /// `call_table` must be valid. `bat_cache_buf` must still point
+    /// to at least `MAX_SECTOR_SIZE` writable bytes.
+    pub unsafe fn map_extents<F: FnMut(MapExtent) -> bool>(
+        &mut self,
+        call_table: &CallTable,
+        sector_size: usize,
+        input_capacity: u64,
+        bytes_read: &mut u64,
+        emit: &mut F,
+    ) -> Option<()> {
+        let virtual_size = self.virtual_disk_size;
+        if virtual_size == 0 || self.total_bat_entries == 0 || self.chunk_ratio == 0 {
+            return Some(());
+        }
+
+        let block_size = self.block_size as u64;
+        let total_payload_blocks_u64 = virtual_size.div_ceil(block_size);
+        let total_payload_blocks = u32::try_from(total_payload_blocks_u64).ok()?;
+
+        let total_bat_bytes = (self.total_bat_entries as u64).checked_mul(8)?;
+        let bat_start_sector = self.bat_offset / sector_size as u64;
+        let bat_end_byte = self.bat_offset.checked_add(total_bat_bytes)?;
+        let bat_end_sector = bat_end_byte.checked_add(sector_size as u64 - 1)? / sector_size as u64;
+
+        let mut coalescer = MapExtentCoalescer::new(emit);
+        let mut next_unwalked: u64 = 0;
+        let group = self.chunk_ratio as u64 + 1;
+        let mut entry_index: u64 = 0;
+        let mut payload_seen: u64 = 0;
+        let mut bat_bytes_consumed: u64 = 0;
+
+        let mut sector = bat_start_sector;
+        'walk: while sector < bat_end_sector {
+            if sector >= input_capacity {
+                return None;
+            }
+            if !(call_table.read_input_sector)(
+                self.device_idx,
+                sector,
+                self.bat_cache_buf,
+                sector_size,
+            ) {
+                return None;
+            }
+            self.bat_cached_sector = u64::MAX;
+            *bytes_read += sector_size as u64;
+
+            let sector_byte_start = sector * sector_size as u64;
+            let buf_start = if sector_byte_start < self.bat_offset {
+                (self.bat_offset - sector_byte_start) as usize
+            } else {
+                0
+            };
+            let buf_end =
+                sector_size.min((bat_end_byte.saturating_sub(sector_byte_start)) as usize);
+            if buf_end <= buf_start {
+                sector += 1;
+                continue;
+            }
+            let chunk =
+                core::slice::from_raw_parts(self.bat_cache_buf.add(buf_start), buf_end - buf_start);
+            let meaningful_len =
+                (total_bat_bytes - bat_bytes_consumed).min((buf_end - buf_start) as u64) as usize;
+            let meaningful = &chunk[..meaningful_len];
+            let aligned_len = meaningful_len - (meaningful_len % 8);
+            let aligned = &meaningful[..aligned_len];
+
+            for (offset, raw) in aligned.chunks_exact(8).enumerate() {
+                let i = entry_index + offset as u64;
+                let slot_in_group = i % group;
+                if slot_in_group >= self.chunk_ratio as u64 {
+                    // Sector-bitmap entry — skip.
+                    continue;
+                }
+                // Payload entry.
+                if payload_seen >= total_payload_blocks as u64 {
+                    // BAT tail past the last payload block; nothing
+                    // more to emit.
+                    break 'walk;
+                }
+                let block_virt = payload_seen.saturating_mul(block_size);
+                if block_virt >= virtual_size {
+                    break 'walk;
+                }
+                let block_visible = block_size.min(virtual_size - block_virt);
+                let entry = u64::from_le_bytes([
+                    raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+                ]);
+
+                let mut ext = classify_vhdx_bat_entry(entry, block_virt, block_size);
+                if ext.length > block_visible {
+                    ext.length = block_visible;
+                }
+                let cont = coalescer.push(ext);
+                next_unwalked = block_virt.saturating_add(block_visible);
+                payload_seen += 1;
+                if !cont {
+                    break 'walk;
+                }
+            }
+
+            entry_index += (aligned_len / 8) as u64;
+            bat_bytes_consumed += aligned_len as u64;
+            sector += 1;
+        }
+
+        if next_unwalked < virtual_size {
+            let _ = coalescer.push(MapExtent {
+                start: next_unwalked,
+                length: virtual_size - next_unwalked,
+                state: MapExtentState::Hole,
+            });
+        }
+        let _ = coalescer.finish();
+        Some(())
     }
 }
 
@@ -1791,5 +1978,88 @@ mod tests {
         // Check virtual disk size
         let vs = le_u64(&buf, 0x10000 + 8);
         assert_eq!(vs, 1024 * 1024 * 1024);
+    }
+
+    // ====================================================================
+    // classify_vhdx_bat_entry tests
+    // ====================================================================
+
+    fn make_bat_entry_u64(state: u64, file_offset_mb: u64) -> u64 {
+        ((file_offset_mb << 20) & BAT_ENTRY_OFFSET_MASK) | (state & BAT_ENTRY_STATE_MASK)
+    }
+
+    #[test]
+    fn classify_vhdx_not_present_is_hole() {
+        let e = classify_vhdx_bat_entry(
+            make_bat_entry_u64(PAYLOAD_BLOCK_NOT_PRESENT, 0),
+            0,
+            32 << 20,
+        );
+        assert_eq!(e.state, MapExtentState::Hole);
+        assert_eq!(e.length, 32 << 20);
+    }
+
+    #[test]
+    fn classify_vhdx_undefined_is_hole() {
+        let e =
+            classify_vhdx_bat_entry(make_bat_entry_u64(PAYLOAD_BLOCK_UNDEFINED, 10), 0, 32 << 20);
+        assert_eq!(e.state, MapExtentState::Hole);
+    }
+
+    #[test]
+    fn classify_vhdx_unmapped_is_hole() {
+        let e = classify_vhdx_bat_entry(make_bat_entry_u64(PAYLOAD_BLOCK_UNMAPPED, 0), 0, 32 << 20);
+        assert_eq!(e.state, MapExtentState::Hole);
+    }
+
+    #[test]
+    fn classify_vhdx_zero_is_zero_alloc() {
+        // PAYLOAD_BLOCK_ZERO (2) → ZeroAllocated regardless of any
+        // file_offset bits.
+        let e = classify_vhdx_bat_entry(make_bat_entry_u64(PAYLOAD_BLOCK_ZERO, 5), 0, 32 << 20);
+        assert_eq!(e.state, MapExtentState::ZeroAllocated);
+    }
+
+    #[test]
+    fn classify_vhdx_fully_present_is_data() {
+        // file_offset is stored as 1 MiB units in the high bits.
+        let e = classify_vhdx_bat_entry(
+            make_bat_entry_u64(PAYLOAD_BLOCK_FULLY_PRESENT, 5),
+            0,
+            32 << 20,
+        );
+        assert_eq!(
+            e.state,
+            MapExtentState::Data {
+                file_offset: 5 << 20
+            }
+        );
+    }
+
+    #[test]
+    fn classify_vhdx_partially_present_is_data_in_v1() {
+        // v1 simplification: treat PARTIALLY_PRESENT as Data with
+        // the recorded file_offset. Per-sector-bitmap walking is
+        // future work.
+        let e = classify_vhdx_bat_entry(
+            make_bat_entry_u64(PAYLOAD_BLOCK_PARTIALLY_PRESENT, 100),
+            0,
+            32 << 20,
+        );
+        assert_eq!(
+            e.state,
+            MapExtentState::Data {
+                file_offset: 100 << 20
+            }
+        );
+    }
+
+    #[test]
+    fn classify_vhdx_reserved_state_is_hole() {
+        // States 4 and 5 are reserved by the VHDX spec — emit
+        // defensively as Hole.
+        let entry = make_bat_entry_u64(4, 5);
+        let e = classify_vhdx_bat_entry(entry, 0, 32 << 20);
+        assert_eq!(e.state, MapExtentState::Hole);
     }
 }
