@@ -57,7 +57,9 @@ if [ -d "$PROJECT_ROOT/src" ]; then
             --exclude convert \
             --exclude measure-op \
             --exclude create-op \
+            --exclude rebase-op \
             --exclude resize-op \
+            --exclude commit-op \
             -- -D warnings || FAILED=1
     else
         run_in_docker "src" cargo clippy --workspace \
@@ -69,7 +71,9 @@ if [ -d "$PROJECT_ROOT/src" ]; then
             --exclude convert \
             --exclude measure-op \
             --exclude create-op \
+            --exclude rebase-op \
             --exclude resize-op \
+            --exclude commit-op \
             -- -D warnings || FAILED=1
     fi
 

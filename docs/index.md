@@ -46,6 +46,8 @@ Features unique to instar that do not exist in qemu-img.
 | [Measure](measure.md) | `instar measure` - predict file size for a target format |
 | [Create](create.md) | `instar create` - create a new empty disk image |
 | [Resize](resize.md) | `instar resize` - change a disk image's virtual size |
+| [Rebase](rebase.md) | `instar rebase` - change an overlay's backing-file reference |
+| [Commit](commit.md) | `instar commit` - merge an overlay's data into its backing |
 
 ## Compatibility
 

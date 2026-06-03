@@ -1,0 +1,22 @@
+[package]
+name = "rebase-op"
+version = "0.2.0"
+edition = "2021"
+description = "Rebase operation: change overlay's backing-file reference"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "rebase"
+path = "src/main.rs"
+
+[dependencies]
+shared = { path = "../../shared" }
+rebase = { path = "../../crates/rebase" }
+qcow2 = { path = "../../crates/qcow2", features = ["create"] }
+vmdk = { path = "../../crates/vmdk" }
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true

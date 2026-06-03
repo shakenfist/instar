@@ -253,6 +253,43 @@ message ResizeResultMessage {
   uint32 error = 6;
 }
 
+// Image rebase result (from rebase operation).
+message RebaseResultMessage {
+  // Overlay format echoed back (e.g. "qcow2", "vmdk").
+  string overlay_format = 1;
+  // Mode taken: "safe" | "unsafe". Matches RebaseResult::MODE_*
+  // in src/shared/src/lib.rs.
+  string mode = 2;
+  // Number of clusters copied from the old chain into the
+  // overlay (safe mode only; zero in unsafe mode).
+  uint64 clusters_copied = 3;
+  // Total bytes copied from the old chain into the overlay
+  // (safe mode only; zero in unsafe mode).
+  uint64 bytes_copied = 4;
+  // Error code: 0 = ok, non-zero mirrors RebaseResult::ERROR_*
+  // in src/shared/src/lib.rs.
+  uint32 error = 5;
+}
+
+// Image commit result (from commit operation).
+message CommitResultMessage {
+  // Overlay format echoed back (e.g. "qcow2", "vmdk").
+  string overlay_format = 1;
+  // Backing format echoed back (e.g. "qcow2", "vmdk").
+  string backing_format = 2;
+  // Number of overlay clusters whose data was written into the
+  // backing.
+  uint64 clusters_committed = 3;
+  // Total bytes written into the backing.
+  uint64 bytes_committed = 4;
+  // Number of overlay L2 entries cleared as part of the
+  // overlay-clear pass.
+  uint64 overlay_clusters_cleared = 5;
+  // Error code: 0 = ok, non-zero mirrors CommitResult::ERROR_*
+  // in src/shared/src/lib.rs.
+  uint32 error = 6;
+}
+
 // Main message wrapper with level and payload
 message GuestMessage {
   Level level = 1;
@@ -268,5 +305,7 @@ message GuestMessage {
     MeasureResultMessage measure_result = 10;
     CreateResultMessage create_result = 11;
     ResizeResultMessage resize_result = 12;
+    RebaseResultMessage rebase_result = 13;
+    CommitResultMessage commit_result = 14;
   }
 }

@@ -20,17 +20,17 @@ use core::panic::PanicInfo;
 use core::ptr::write_volatile;
 
 use shared::{
-    CallTable, ChainConfig, CheckResult, CompareResult, CreateResult, LuksInfo, MeasureResult,
-    Qcow2Info, ResizeResult, VdiInfo, VmdkInfo, CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR,
-    CHAIN_CONFIG_MAX_SIZE, OPERATION_CONFIG_ADDR, OPERATION_CONFIG_MAX_SIZE, OPERATION_LOAD_ADDR,
-    VMM_PARAMS_ADDR,
+    CallTable, ChainConfig, CheckResult, CommitResult, CompareResult, CreateResult, LuksInfo,
+    MeasureResult, Qcow2Info, RebaseResult, ResizeResult, VdiInfo, VmdkInfo, CALL_TABLE_ADDR,
+    CHAIN_CONFIG_ADDR, CHAIN_CONFIG_MAX_SIZE, OPERATION_CONFIG_ADDR, OPERATION_CONFIG_MAX_SIZE,
+    OPERATION_LOAD_ADDR, VMM_PARAMS_ADDR,
 };
 
 use crate::serial::{
-    debug_print, read_config, send_check_result, send_compare_result, send_complete,
-    send_create_result, send_error, send_info_result, send_info_result_luks,
+    debug_print, read_config, send_check_result, send_commit_result, send_compare_result,
+    send_complete, send_create_result, send_error, send_info_result, send_info_result_luks,
     send_info_result_qcow2, send_info_result_vdi, send_info_result_vmdk, send_init,
-    send_measure_result, send_progress, send_resize_result, DeviceConfig,
+    send_measure_result, send_progress, send_rebase_result, send_resize_result, DeviceConfig,
 };
 use crate::virtio::VirtioBlock;
 
@@ -289,6 +289,9 @@ fn setup_call_table() {
         send_create_result: ct_send_create_result,
         read_output_sector: ct_read_output_sector,
         send_resize_result: ct_send_resize_result,
+        send_rebase_result: ct_send_rebase_result,
+        send_commit_result: ct_send_commit_result,
+        write_input_sector: ct_write_input_sector,
     };
 
     unsafe {
@@ -679,6 +682,42 @@ unsafe extern "C" fn ct_send_resize_result(result: *const ResizeResult) {
     if !result.is_null() {
         send_resize_result(&*result);
     }
+}
+
+/// Send rebase result message.
+unsafe extern "C" fn ct_send_rebase_result(result: *const RebaseResult) {
+    if !result.is_null() {
+        send_rebase_result(&*result);
+    }
+}
+
+/// Send commit result message.
+unsafe extern "C" fn ct_send_commit_result(result: *const CommitResult) {
+    if !result.is_null() {
+        send_commit_result(&*result);
+    }
+}
+
+/// Write a sector to an input device. Commit uses this to clear
+/// the overlay's L2 / refcount tables after merging cluster data
+/// into the backing. The host-side virtio device for the slot
+/// must have been attached RW; otherwise the underlying
+/// virtio request fails and this returns `false`.
+unsafe extern "C" fn ct_write_input_sector(
+    device_index: u32,
+    sector: u64,
+    buffer: *const u8,
+    len: usize,
+) -> bool {
+    let index = device_index as usize;
+    let devices = INPUT_DEVICES.get_mut();
+    if index < *INPUT_DEVICE_COUNT.get() {
+        if let Some(ref mut dev) = devices[index] {
+            let slice = core::slice::from_raw_parts(buffer, len);
+            return dev.write_sector(sector, slice);
+        }
+    }
+    false
 }
 
 /// Convert null-terminated C string to &str.

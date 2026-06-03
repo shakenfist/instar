@@ -1,0 +1,22 @@
+[package]
+name = "commit-op"
+version = "0.2.0"
+edition = "2021"
+description = "Commit operation: merge overlay clusters into the backing image"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "commit"
+path = "src/main.rs"
+
+[dependencies]
+shared = { path = "../../shared" }
+commit = { path = "../../crates/commit" }
+qcow2 = { path = "../../crates/qcow2", features = ["create"] }
+vmdk = { path = "../../crates/vmdk" }
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true

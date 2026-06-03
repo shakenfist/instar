@@ -734,6 +734,34 @@ pub struct CallTable {
     /// the error code. Appended at the end of `CallTable` for
     /// the same back-compat reason as `send_create_result`.
     pub send_resize_result: unsafe extern "C" fn(*const ResizeResult),
+
+    /// Send the rebase result message. Args: `rebase_result`
+    /// pointer containing the mode (safe/unsafe), bytes/clusters
+    /// copied (safe mode only), and the error code. Appended at
+    /// the end of `CallTable` for the same back-compat reason as
+    /// `send_resize_result`.
+    pub send_rebase_result: unsafe extern "C" fn(*const RebaseResult),
+
+    /// Send the commit result message. Args: `commit_result`
+    /// pointer containing the clusters/bytes committed into the
+    /// backing, the number of overlay L2 entries cleared, and
+    /// the error code. Appended at the end of `CallTable` for
+    /// the same back-compat reason as `send_rebase_result`.
+    pub send_commit_result: unsafe extern "C" fn(*const CommitResult),
+
+    /// Write a sector to an *input* device. Commit is the first
+    /// operation to need writes against a device it also reads
+    /// as an input: the overlay being committed is attached as
+    /// input slot 0 (opened RW host-side) and the guest uses
+    /// this primitive to clear the overlay's L2 / refcount
+    /// tables after merging cluster data into the backing.
+    /// Args: `(device_index, sector_number, buf_ptr, buf_len)`;
+    /// returns `true` on success. The host-side stub returns
+    /// `false` if `device_index` was not opened RW (see
+    /// `open_chain_devices_rw` in the VMM). Appended at the end
+    /// of `CallTable` for the same back-compat reason as
+    /// `read_output_sector`.
+    pub write_input_sector: unsafe extern "C" fn(u32, u64, *const u8, usize) -> bool,
 }
 
 /// Backing format type for QCOW2 header extension
@@ -1053,8 +1081,10 @@ impl CallTable {
     /// Magic value indicating a valid call table
     pub const MAGIC: u32 = 0x494D4147; // "IMAG"
 
-    /// Current ABI version (bumped: added subcluster_errors to CheckResult)
-    pub const VERSION: u32 = 14;
+    /// Current ABI version (bumped: rebase-commit phase 1 appended
+    /// `send_rebase_result`, `send_commit_result`, and
+    /// `write_input_sector`).
+    pub const VERSION: u32 = 15;
 }
 
 // ============================================================================
@@ -2558,6 +2588,347 @@ impl ResizeResult {
     }
 }
 
+/// Configuration structure for the rebase operation.
+///
+/// Written by the host at [`OPERATION_CONFIG_ADDR`] before the
+/// guest is launched. The guest reads it via
+/// `call_table.get_operation_config`.
+///
+/// The host attaches the old backing chain and the new backing
+/// chain as input devices in a single contiguous range; the
+/// `old_chain_*` / `new_chain_*` fields delimit which slot range
+/// belongs to which chain. The overlay being rebased is the
+/// output device, opened RW. In `-u` (unsafe) mode the guest
+/// skips the chain comparison and only rewrites the overlay's
+/// backing-file pointer; safe mode reads from both chains and
+/// copies divergent clusters into the overlay before swapping
+/// the pointer.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RebaseConfig {
+    /// Magic (`0x52454241` = "REBA").
+    pub magic: u32,
+    /// Overlay format (`ImageFormat as u32`).
+    pub overlay_format: u32,
+    /// New backing format (`ImageFormat as u32`); `0` means
+    /// "auto-detect via the standard format-probe path".
+    pub new_backing_format: u32,
+    /// Flags. See `FLAG_*` constants.
+    pub flags: u32,
+
+    /// Sector size for I/O (matches host sector_size).
+    pub sector_size: u32,
+    /// qcow2 cluster size in bytes (from the overlay's existing
+    /// header). 0 if the overlay isn't qcow2.
+    pub overlay_cluster_size: u32,
+    /// Overlay virtual size in bytes (from the existing header).
+    pub overlay_virtual_size: u64,
+
+    /// First input device slot belonging to the old chain.
+    pub old_chain_first: u32,
+    /// Number of input devices in the old chain
+    /// (`old_chain_first .. old_chain_first + old_chain_count`).
+    pub old_chain_count: u32,
+    /// First input device slot belonging to the new chain.
+    pub new_chain_first: u32,
+    /// Number of input devices in the new chain
+    /// (`new_chain_first .. new_chain_first + new_chain_count`).
+    pub new_chain_count: u32,
+
+    /// New backing-file path string the guest writes into the
+    /// overlay's header. The first `new_backing_path_len` bytes
+    /// are the path; the rest are zero-padding. A length of zero
+    /// combined with [`FLAG_DETACH`] means the overlay becomes
+    /// standalone.
+    pub new_backing_path: [u8; 1024],
+    /// Number of valid bytes in `new_backing_path`.
+    pub new_backing_path_len: u32,
+
+    /// Reserved padding for forward compatibility (zero-init).
+    pub _reserved: [u8; 60],
+}
+
+impl RebaseConfig {
+    /// Magic value for rebase config.
+    pub const MAGIC: u32 = 0x52454241; // "REBA"
+
+    /// Flag: `-u` unsafe / metadata-only mode. Guest rewrites
+    /// only the backing-file pointer; no chain comparison or
+    /// data copy.
+    pub const FLAG_UNSAFE: u32 = 1 << 0;
+    /// Flag: quiet mode. Host-side only; the guest ignores this
+    /// bit.
+    pub const FLAG_QUIET: u32 = 1 << 1;
+    /// Flag: detach the overlay from its backing chain. Paired
+    /// with `new_backing_path_len == 0`.
+    pub const FLAG_DETACH: u32 = 1 << 2;
+
+    /// True if magic matches.
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+
+    /// True if the user passed `-u`.
+    pub fn is_unsafe(&self) -> bool {
+        self.flags & Self::FLAG_UNSAFE != 0
+    }
+
+    /// True if the rebase detaches the overlay.
+    pub fn is_detach(&self) -> bool {
+        self.flags & Self::FLAG_DETACH != 0
+    }
+}
+
+/// Result structure for the rebase operation.
+///
+/// Passed by the guest into `call_table.send_rebase_result`
+/// (added in phase 1 of `PLAN-rebase-commit`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RebaseResult {
+    /// Magic value (`0x52425253` = "RBRS").
+    pub magic: u32,
+    /// Overlay format echoed back so the host can render the
+    /// right output.
+    pub overlay_format: u32,
+    /// Mode taken. See `MODE_*`.
+    pub mode: u32,
+    /// Error code. See `ERROR_*`.
+    pub error: u32,
+
+    /// Number of clusters (overlay-cluster-size units) copied
+    /// from the old chain into the overlay. Always zero in
+    /// `-u` (unsafe) mode.
+    pub clusters_copied: u64,
+    /// Total bytes copied from the old chain into the overlay.
+    /// Always zero in `-u` mode.
+    pub bytes_copied: u64,
+
+    /// Reserved padding for forward compatibility (zero-init).
+    pub _reserved: [u8; 56],
+}
+
+impl RebaseResult {
+    /// Magic value for rebase result.
+    pub const MAGIC: u32 = 0x52425253; // "RBRS"
+
+    /// Mode: `-u` unsafe / metadata-only mode.
+    pub const MODE_UNSAFE: u32 = 0;
+    /// Mode: safe / data-aware mode (default).
+    pub const MODE_SAFE: u32 = 1;
+
+    // Error codes are stable: only appended, never reordered.
+    pub const ERROR_OK: u32 = 0;
+    /// Overlay or new backing is not a format we accept for
+    /// rebase (qcow2 v2/v3 and vmdk monolithicSparse only in
+    /// v1).
+    pub const ERROR_UNSUPPORTED_FORMAT: u32 = 1;
+    /// New backing's virtual size is smaller than the overlay's,
+    /// or its format is otherwise incompatible.
+    pub const ERROR_NEW_BACKING_INCOMPATIBLE: u32 = 2;
+    /// qcow2 with the external-data-file incompatible feature.
+    /// Refused to match qemu-img.
+    pub const ERROR_EXTERNAL_DATA_FILE: u32 = 3;
+    /// Overlay or new backing is LUKS-wrapped. v1 of rebase
+    /// refuses; a future plan can lift this.
+    pub const ERROR_LUKS_UNSUPPORTED: u32 = 4;
+    /// Old or new chain exceeds [`MAX_CHAIN_DEVICES`].
+    pub const ERROR_CHAIN_DEPTH: u32 = 5;
+    /// Overlay's header changed during the operation (defensive
+    /// read-back check).
+    pub const ERROR_HEADER_MISMATCH: u32 = 6;
+    /// Overlay's metadata is internally inconsistent (e.g.
+    /// `INCOMPAT_DIRTY` or `INCOMPAT_CORRUPT` set; cluster size
+    /// of zero).
+    pub const ERROR_OVERLAY_CORRUPT: u32 = 7;
+    /// New backing path exceeds the format's cap (1024 bytes
+    /// for qcow2; matches `CreateConfig`).
+    pub const ERROR_BACKING_PATH_TOO_LONG: u32 = 8;
+    /// Guest scratch buffer was too small for the requested
+    /// layout. Indicates either an image larger than v1
+    /// supports or a planner-side accounting bug.
+    pub const ERROR_SCRATCH_TOO_SMALL: u32 = 9;
+    /// Safe-mode allocator exhausted every existing refcount
+    /// block (qcow2) or grain table (vmdk). v1 doesn't yet
+    /// append new ones; the user can fall back to `-u` mode
+    /// or `qemu-img rebase`.
+    pub const ERROR_REFCOUNT_EXHAUSTED: u32 = 10;
+    /// vmdk descriptor slot is too small to hold the rewrite.
+    pub const ERROR_DESCRIPTOR_TOO_LARGE: u32 = 11;
+    /// Format-specific parser (`QcowHeader::parse`,
+    /// `Vmdk4HeaderFull::parse`) failed to interpret the
+    /// staged header bytes.
+    pub const ERROR_PARSE_FAILED: u32 = 12;
+    /// Internal size or offset computation overflowed.
+    /// Surfaces planner-side `Overflow` and guest-side
+    /// arithmetic checks. Distinct from `ERROR_PARSE_FAILED`
+    /// because the cause is a host or guest bug, not a
+    /// malformed image.
+    pub const ERROR_INTERNAL_OVERFLOW: u32 = 13;
+
+    /// True if magic matches.
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+}
+
+/// Configuration structure for the commit operation.
+///
+/// Written by the host at [`OPERATION_CONFIG_ADDR`] before the
+/// guest is launched. The guest reads it via
+/// `call_table.get_operation_config`.
+///
+/// The overlay is attached as input device slot 0, opened RW
+/// (the guest uses `write_input_sector(0, ...)` for the
+/// overlay-clear pass). The backing being committed into is the
+/// output device. Slots `backing_chain_first ..
+/// backing_chain_first + backing_chain_count` carry the
+/// backing's own ancestor chain, if any.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CommitConfig {
+    /// Magic (`0x434F4D4D` = "COMM").
+    pub magic: u32,
+    /// Overlay format (`ImageFormat as u32`).
+    pub overlay_format: u32,
+    /// Backing format (`ImageFormat as u32`).
+    pub backing_format: u32,
+    /// Flags. See `FLAG_*` constants.
+    pub flags: u32,
+
+    /// Sector size for I/O (matches host sector_size).
+    pub sector_size: u32,
+    /// qcow2 cluster size of the overlay (from its existing
+    /// header). 0 if the overlay isn't qcow2.
+    pub overlay_cluster_size: u32,
+    /// qcow2 cluster size of the backing (from its existing
+    /// header). 0 if the backing isn't qcow2.
+    pub backing_cluster_size: u32,
+    /// Reserved padding.
+    pub _pad: u32,
+
+    /// Overlay virtual size in bytes (from the existing header).
+    pub overlay_virtual_size: u64,
+    /// Backing virtual size in bytes (from the existing header).
+    pub backing_virtual_size: u64,
+
+    /// First input device slot belonging to the backing's own
+    /// ancestor chain (typically slot 1, immediately after the
+    /// overlay at slot 0).
+    pub backing_chain_first: u32,
+    /// Number of input devices in the backing's ancestor chain.
+    /// 0 if the backing has no parents of its own.
+    pub backing_chain_count: u32,
+
+    /// Reserved padding for forward compatibility (zero-init).
+    pub _reserved: [u8; 64],
+}
+
+impl CommitConfig {
+    /// Magic value for commit config.
+    pub const MAGIC: u32 = 0x434F4D4D; // "COMM"
+
+    /// Flag: quiet mode. Host-side only; the guest ignores this
+    /// bit.
+    pub const FLAG_QUIET: u32 = 1 << 0;
+
+    /// True if magic matches.
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+}
+
+/// Result structure for the commit operation.
+///
+/// Passed by the guest into `call_table.send_commit_result`
+/// (added in phase 1 of `PLAN-rebase-commit`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CommitResult {
+    /// Magic value (`0x434F5253` = "CORS").
+    pub magic: u32,
+    /// Overlay format echoed back so the host can render the
+    /// right output.
+    pub overlay_format: u32,
+    /// Backing format echoed back so the host can render the
+    /// right output.
+    pub backing_format: u32,
+    /// Error code. See `ERROR_*`.
+    pub error: u32,
+
+    /// Number of overlay clusters (overlay-cluster-size units)
+    /// whose data was written into the backing.
+    pub clusters_committed: u64,
+    /// Total bytes written into the backing.
+    pub bytes_committed: u64,
+    /// Number of overlay L2 entries cleared as part of the
+    /// overlay-clear pass.
+    pub overlay_clusters_cleared: u64,
+
+    /// Reserved padding for forward compatibility (zero-init).
+    pub _reserved: [u8; 56],
+}
+
+impl CommitResult {
+    /// Magic value for commit result.
+    pub const MAGIC: u32 = 0x434F5253; // "CORS"
+
+    // Error codes are stable: only appended, never reordered.
+    pub const ERROR_OK: u32 = 0;
+    /// Overlay or backing is not a format we accept for commit
+    /// (qcow2 v2/v3 and vmdk monolithicSparse only in v1).
+    pub const ERROR_UNSUPPORTED_FORMAT: u32 = 1;
+    /// Overlay has no backing reference.
+    pub const ERROR_NO_BACKING: u32 = 2;
+    /// qcow2 with the external-data-file incompatible feature.
+    /// Refused to match qemu-img.
+    pub const ERROR_EXTERNAL_DATA_FILE: u32 = 3;
+    /// Overlay or backing is LUKS-wrapped. v1 of commit
+    /// refuses; a future plan can lift this.
+    pub const ERROR_LUKS_UNSUPPORTED: u32 = 4;
+    /// Backing's virtual size is smaller than the highest
+    /// cluster the overlay has allocated.
+    pub const ERROR_BACKING_TOO_SMALL: u32 = 5;
+    /// Overlay's virtual size exceeds the backing's. Commit
+    /// refuses.
+    pub const ERROR_OVERLAY_LARGER_THAN_BACKING: u32 = 6;
+    /// Overlay's or backing's header changed during the
+    /// operation (defensive read-back check).
+    pub const ERROR_HEADER_MISMATCH: u32 = 7;
+    /// Overlay's metadata is internally inconsistent (e.g.
+    /// `INCOMPAT_DIRTY` or `INCOMPAT_CORRUPT` set; cluster size
+    /// of zero). Distinct from [`Self::ERROR_HEADER_MISMATCH`]
+    /// because the host can render which file is at fault.
+    pub const ERROR_OVERLAY_CORRUPT: u32 = 8;
+    /// Backing's metadata is internally inconsistent.
+    pub const ERROR_BACKING_CORRUPT: u32 = 9;
+    /// Guest scratch buffer was too small for the requested
+    /// layout. Indicates either an image larger than v1
+    /// supports or a planner-side accounting bug.
+    pub const ERROR_SCRATCH_TOO_SMALL: u32 = 10;
+    /// Backing allocator exhausted every existing refcount
+    /// block (qcow2) or grain table (vmdk). v1 doesn't yet
+    /// append new ones; the user can fall back to
+    /// `qemu-img commit` or run `qemu-img check -r` on the
+    /// backing to reclaim leaked clusters.
+    pub const ERROR_REFCOUNT_EXHAUSTED: u32 = 11;
+    /// Format-specific parser (`QcowHeader::parse`,
+    /// `Vmdk4HeaderFull::parse`) failed to interpret the
+    /// staged header bytes.
+    pub const ERROR_PARSE_FAILED: u32 = 12;
+    /// Internal size or offset computation overflowed.
+    /// Surfaces planner-side `Overflow` and guest-side
+    /// arithmetic checks. Distinct from
+    /// [`Self::ERROR_PARSE_FAILED`] because the cause is a
+    /// host or guest bug, not a malformed image.
+    pub const ERROR_INTERNAL_OVERFLOW: u32 = 13;
+
+    /// True if magic matches.
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+}
+
 // ============================================================================
 // Chain configuration structures (for multi-device/backing chain operations)
 // ============================================================================
@@ -3073,5 +3444,230 @@ mod tests {
             luks_header_overhead: 0,
         };
         assert_eq!(cfg.preallocation(), MeasureConfig::PREALLOC_FALLOC);
+    }
+
+    #[test]
+    fn rebase_config_magic() {
+        assert_eq!(RebaseConfig::MAGIC, 0x5245_4241); // "REBA" LE
+    }
+
+    #[test]
+    fn rebase_result_magic() {
+        assert_eq!(RebaseResult::MAGIC, 0x5242_5253); // "RBRS" LE
+    }
+
+    #[test]
+    fn commit_config_magic() {
+        assert_eq!(CommitConfig::MAGIC, 0x434F_4D4D); // "COMM" LE
+    }
+
+    #[test]
+    fn commit_result_magic() {
+        assert_eq!(CommitResult::MAGIC, 0x434F_5253); // "CORS" LE
+    }
+
+    #[test]
+    fn rebase_config_size_budget() {
+        // RebaseConfig embeds a 1024-byte backing path; the rest
+        // of the struct should stay under ~150 bytes so the total
+        // fits comfortably below 1.2 KiB. If a future phase grows
+        // it past 1200, that's a deliberate ABI change and the
+        // assertion should fail on purpose so it's reviewed.
+        assert!(
+            core::mem::size_of::<RebaseConfig>() <= 1200,
+            "RebaseConfig grew to {} bytes",
+            core::mem::size_of::<RebaseConfig>()
+        );
+    }
+
+    #[test]
+    fn rebase_result_size_budget() {
+        assert!(
+            core::mem::size_of::<RebaseResult>() <= 96,
+            "RebaseResult grew to {} bytes",
+            core::mem::size_of::<RebaseResult>()
+        );
+    }
+
+    #[test]
+    fn commit_config_size_budget() {
+        assert!(
+            core::mem::size_of::<CommitConfig>() <= 160,
+            "CommitConfig grew to {} bytes",
+            core::mem::size_of::<CommitConfig>()
+        );
+    }
+
+    #[test]
+    fn commit_result_size_budget() {
+        assert!(
+            core::mem::size_of::<CommitResult>() <= 96,
+            "CommitResult grew to {} bytes",
+            core::mem::size_of::<CommitResult>()
+        );
+    }
+
+    #[test]
+    fn rebase_config_is_valid_checks_magic() {
+        let mut cfg = RebaseConfig {
+            magic: RebaseConfig::MAGIC,
+            overlay_format: 0,
+            new_backing_format: 0,
+            flags: 0,
+            sector_size: 0,
+            overlay_cluster_size: 0,
+            overlay_virtual_size: 0,
+            old_chain_first: 0,
+            old_chain_count: 0,
+            new_chain_first: 0,
+            new_chain_count: 0,
+            new_backing_path: [0; 1024],
+            new_backing_path_len: 0,
+            _reserved: [0; 60],
+        };
+        assert!(cfg.is_valid());
+        cfg.magic = 0;
+        assert!(!cfg.is_valid());
+    }
+
+    #[test]
+    fn rebase_config_flags() {
+        let cfg = RebaseConfig {
+            magic: RebaseConfig::MAGIC,
+            overlay_format: 0,
+            new_backing_format: 0,
+            flags: RebaseConfig::FLAG_UNSAFE | RebaseConfig::FLAG_DETACH,
+            sector_size: 0,
+            overlay_cluster_size: 0,
+            overlay_virtual_size: 0,
+            old_chain_first: 0,
+            old_chain_count: 0,
+            new_chain_first: 0,
+            new_chain_count: 0,
+            new_backing_path: [0; 1024],
+            new_backing_path_len: 0,
+            _reserved: [0; 60],
+        };
+        assert!(cfg.is_unsafe());
+        assert!(cfg.is_detach());
+    }
+
+    #[test]
+    fn rebase_result_error_codes_distinct() {
+        // Phase 3 added codes 7..=13. Confirm every code is
+        // distinct so the host's match arms don't accidentally
+        // alias.
+        let codes = [
+            RebaseResult::ERROR_OK,
+            RebaseResult::ERROR_UNSUPPORTED_FORMAT,
+            RebaseResult::ERROR_NEW_BACKING_INCOMPATIBLE,
+            RebaseResult::ERROR_EXTERNAL_DATA_FILE,
+            RebaseResult::ERROR_LUKS_UNSUPPORTED,
+            RebaseResult::ERROR_CHAIN_DEPTH,
+            RebaseResult::ERROR_HEADER_MISMATCH,
+            RebaseResult::ERROR_OVERLAY_CORRUPT,
+            RebaseResult::ERROR_BACKING_PATH_TOO_LONG,
+            RebaseResult::ERROR_SCRATCH_TOO_SMALL,
+            RebaseResult::ERROR_REFCOUNT_EXHAUSTED,
+            RebaseResult::ERROR_DESCRIPTOR_TOO_LARGE,
+            RebaseResult::ERROR_PARSE_FAILED,
+            RebaseResult::ERROR_INTERNAL_OVERFLOW,
+        ];
+        for i in 0..codes.len() {
+            for j in (i + 1)..codes.len() {
+                assert_ne!(codes[i], codes[j], "codes {i} and {j} alias");
+            }
+        }
+        // Confirm contiguous 0..=13 numbering.
+        for (i, c) in codes.iter().enumerate() {
+            assert_eq!(*c, i as u32);
+        }
+    }
+
+    #[test]
+    fn rebase_result_is_valid_checks_magic() {
+        let mut r = RebaseResult {
+            magic: RebaseResult::MAGIC,
+            overlay_format: 0,
+            mode: RebaseResult::MODE_SAFE,
+            error: RebaseResult::ERROR_OK,
+            clusters_copied: 0,
+            bytes_copied: 0,
+            _reserved: [0; 56],
+        };
+        assert!(r.is_valid());
+        r.magic = 0;
+        assert!(!r.is_valid());
+    }
+
+    #[test]
+    fn commit_config_is_valid_checks_magic() {
+        let mut cfg = CommitConfig {
+            magic: CommitConfig::MAGIC,
+            overlay_format: 0,
+            backing_format: 0,
+            flags: 0,
+            sector_size: 0,
+            overlay_cluster_size: 0,
+            backing_cluster_size: 0,
+            _pad: 0,
+            overlay_virtual_size: 0,
+            backing_virtual_size: 0,
+            backing_chain_first: 0,
+            backing_chain_count: 0,
+            _reserved: [0; 64],
+        };
+        assert!(cfg.is_valid());
+        cfg.magic = 0;
+        assert!(!cfg.is_valid());
+    }
+
+    #[test]
+    fn commit_result_error_codes_distinct() {
+        // Phase 7 step 7a added codes 8..=13. Confirm every
+        // code is distinct so the host's match arms don't
+        // accidentally alias.
+        let codes = [
+            CommitResult::ERROR_OK,
+            CommitResult::ERROR_UNSUPPORTED_FORMAT,
+            CommitResult::ERROR_NO_BACKING,
+            CommitResult::ERROR_EXTERNAL_DATA_FILE,
+            CommitResult::ERROR_LUKS_UNSUPPORTED,
+            CommitResult::ERROR_BACKING_TOO_SMALL,
+            CommitResult::ERROR_OVERLAY_LARGER_THAN_BACKING,
+            CommitResult::ERROR_HEADER_MISMATCH,
+            CommitResult::ERROR_OVERLAY_CORRUPT,
+            CommitResult::ERROR_BACKING_CORRUPT,
+            CommitResult::ERROR_SCRATCH_TOO_SMALL,
+            CommitResult::ERROR_REFCOUNT_EXHAUSTED,
+            CommitResult::ERROR_PARSE_FAILED,
+            CommitResult::ERROR_INTERNAL_OVERFLOW,
+        ];
+        for i in 0..codes.len() {
+            for j in (i + 1)..codes.len() {
+                assert_ne!(codes[i], codes[j], "codes {i} and {j} alias");
+            }
+        }
+        // Confirm contiguous 0..=13 numbering.
+        for (i, c) in codes.iter().enumerate() {
+            assert_eq!(*c, i as u32);
+        }
+    }
+
+    #[test]
+    fn commit_result_is_valid_checks_magic() {
+        let mut r = CommitResult {
+            magic: CommitResult::MAGIC,
+            overlay_format: 0,
+            backing_format: 0,
+            error: CommitResult::ERROR_OK,
+            clusters_committed: 0,
+            bytes_committed: 0,
+            overlay_clusters_cleared: 0,
+            _reserved: [0; 56],
+        };
+        assert!(r.is_valid());
+        r.magic = 0;
+        assert!(!r.is_valid());
     }
 }

@@ -654,6 +654,60 @@ pub fn resize_result_message(
     msg
 }
 
+/// Build a `RebaseResultMessage` envelope from the rebase
+/// operation's fields. Mirrors `resize_result_message` — the
+/// host treats both the same way after framing.
+///
+/// `mode` is one of `"safe"`, `"unsafe"`. The host uses it to
+/// render the success line; `clusters_copied` and
+/// `bytes_copied` are always zero in unsafe mode.
+pub fn rebase_result_message(
+    overlay_format: &str,
+    mode: &str,
+    clusters_copied: u64,
+    bytes_copied: u64,
+    error: u32,
+) -> guest_::GuestMessage {
+    let mut msg = guest_::GuestMessage::default();
+    msg.level = guest_::Level::Info;
+
+    let mut result = guest_::RebaseResultMessage::default();
+    push_str(&mut result.overlay_format, overlay_format);
+    push_str(&mut result.mode, mode);
+    result.clusters_copied = clusters_copied;
+    result.bytes_copied = bytes_copied;
+    result.error = error;
+
+    msg.payload = Some(guest_::GuestMessage_::Payload::RebaseResult(result));
+    msg
+}
+
+/// Build a `CommitResultMessage` envelope from the commit
+/// operation's fields. Mirrors `rebase_result_message` — the
+/// host treats both the same way after framing.
+pub fn commit_result_message(
+    overlay_format: &str,
+    backing_format: &str,
+    clusters_committed: u64,
+    bytes_committed: u64,
+    overlay_clusters_cleared: u64,
+    error: u32,
+) -> guest_::GuestMessage {
+    let mut msg = guest_::GuestMessage::default();
+    msg.level = guest_::Level::Info;
+
+    let mut result = guest_::CommitResultMessage::default();
+    push_str(&mut result.overlay_format, overlay_format);
+    push_str(&mut result.backing_format, backing_format);
+    result.clusters_committed = clusters_committed;
+    result.bytes_committed = bytes_committed;
+    result.overlay_clusters_cleared = overlay_clusters_cleared;
+    result.error = error;
+
+    msg.payload = Some(guest_::GuestMessage_::Payload::CommitResult(result));
+    msg
+}
+
 // =============================================================================
 // VMM -> Guest configuration message support
 // =============================================================================

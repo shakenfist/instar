@@ -500,7 +500,9 @@ test-rust: instar-devcontainer
 			--exclude convert \
 			--exclude measure-op \
 			--exclude create-op \
-			--exclude resize-op && \
+			--exclude rebase-op \
+			--exclude resize-op \
+			--exclude commit-op && \
 		cargo test --release -p luks --features "decrypt,encrypt" && \
 		cargo test --release -p qcow2 --features create && \
 		cargo test --release -p create'
@@ -714,7 +716,9 @@ CARGO_TOML_FILES := \
 	src/crates/raw/Cargo.toml \
 	src/crates/measure/Cargo.toml \
 	src/crates/create/Cargo.toml \
+	src/crates/rebase/Cargo.toml \
 	src/crates/resize/Cargo.toml \
+	src/crates/commit/Cargo.toml \
 	src/operations/info/Cargo.toml \
 	src/operations/copy/Cargo.toml \
 	src/operations/check/Cargo.toml \
@@ -722,7 +726,9 @@ CARGO_TOML_FILES := \
 	src/operations/convert/Cargo.toml \
 	src/operations/measure/Cargo.toml \
 	src/operations/create/Cargo.toml \
+	src/operations/rebase/Cargo.toml \
 	src/operations/resize/Cargo.toml \
+	src/operations/commit/Cargo.toml \
 	crates/guest-protocol/Cargo.toml
 
 # Bump all Cargo.toml versions, commit, and create a signed tag.
