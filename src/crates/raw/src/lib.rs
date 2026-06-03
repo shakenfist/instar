@@ -55,6 +55,36 @@ pub fn scan_allocation(virtual_size: u64, target_unit_size: u64) -> shared::Allo
     }
 }
 
+/// Emit the extent map for a raw source image.
+///
+/// Raw images carry no allocation metadata: the entire virtual
+/// range is one Data extent at file offset 0. `virtual_size == 0`
+/// emits nothing.
+///
+/// The qemu-img map command probes `SEEK_HOLE` / `SEEK_DATA` on
+/// raw inputs to split sparse files into multiple extents; the
+/// no_std raw parser cannot do this from inside the guest. The
+/// host-side SEEK_HOLE prepass is tracked as future work in
+/// PLAN-map.md.
+///
+/// Returns `Some(())` on a successful walk (including early
+/// termination via `emit` returning `false`). Raw is infallible:
+/// there is no I/O.
+pub fn map_extents<F: FnMut(shared::MapExtent) -> bool>(
+    virtual_size: u64,
+    emit: &mut F,
+) -> Option<()> {
+    if virtual_size == 0 {
+        return Some(());
+    }
+    let _ = emit(shared::MapExtent {
+        start: 0,
+        length: virtual_size,
+        state: shared::MapExtentState::Data { file_offset: 0 },
+    });
+    Some(())
+}
+
 /// Detect partition table type from the first sector.
 ///
 /// Detection logic:
@@ -154,6 +184,81 @@ mod tests {
         let s = scan_allocation(u64::MAX, 0);
         assert_eq!(s.virtual_size, u64::MAX);
         assert_eq!(s.allocated_bytes, u64::MAX);
+    }
+
+    // ---- map_extents ----
+
+    fn collect_extents(virtual_size: u64) -> ([shared::MapExtent; 4], usize) {
+        let mut buf = [shared::MapExtent {
+            start: 0,
+            length: 0,
+            state: shared::MapExtentState::Hole,
+        }; 4];
+        let mut count = 0usize;
+        let mut emit = |e: shared::MapExtent| -> bool {
+            assert!(
+                count < buf.len(),
+                "raw map_extents emitted too many extents"
+            );
+            buf[count] = e;
+            count += 1;
+            true
+        };
+        let result = map_extents(virtual_size, &mut emit);
+        assert!(result.is_some());
+        (buf, count)
+    }
+
+    #[test]
+    fn raw_map_extents_zero_emits_nothing() {
+        let (_, count) = collect_extents(0);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn raw_map_extents_one_sector() {
+        let (buf, count) = collect_extents(512);
+        assert_eq!(count, 1);
+        assert_eq!(buf[0].start, 0);
+        assert_eq!(buf[0].length, 512);
+        assert_eq!(
+            buf[0].state,
+            shared::MapExtentState::Data { file_offset: 0 }
+        );
+    }
+
+    #[test]
+    fn raw_map_extents_one_gib() {
+        let (buf, count) = collect_extents(1 << 30);
+        assert_eq!(count, 1);
+        assert_eq!(buf[0].length, 1 << 30);
+    }
+
+    #[test]
+    fn raw_map_extents_emitter_abort_still_returns_some() {
+        // Emitter returning false on the first (only) call must
+        // still leave map_extents returning Some(()); raw has no
+        // further work to do.
+        let mut count = 0;
+        let mut emit = |_: shared::MapExtent| -> bool {
+            count += 1;
+            false
+        };
+        let result = map_extents(4096, &mut emit);
+        assert!(result.is_some());
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn raw_map_extents_emits_exact_fields() {
+        let (buf, count) = collect_extents(8192);
+        assert_eq!(count, 1);
+        let want = shared::MapExtent {
+            start: 0,
+            length: 8192,
+            state: shared::MapExtentState::Data { file_offset: 0 },
+        };
+        assert_eq!(buf[0], want);
     }
 
     // ---- Buffer too short ----
