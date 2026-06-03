@@ -448,15 +448,18 @@ provides a modular architecture with:
   `peek_is_vmdk_descriptor`, and `--start-offset >= file_size`
   on the host before launching the guest), writes `MapConfig`
   per-field at `OPERATION_CONFIG_ADDR`, attaches the source
-  read-only as input device 0, runs the vCPU loop accumulating
-  `MapExtentMessage` records into a `Vec` and capturing the
-  `MapResultMessage` terminator, and routes the result through
-  `print_map_result` -> `format_map_human` / `format_map_json`.
-  The phase 3 renderer produces *valid* output for both
-  `--output=human` and `--output=json` but does not chase
-  byte-for-byte qemu-img parity (column widths, exact JSON
-  whitespace, field ordering, streaming emission); phase 4 of
-  PLAN-map polishes against the cross-version baseline matrix.
+  read-only as input device 0, and runs the vCPU loop. Phase 4
+  of PLAN-map ships the streaming `MapRenderer<'a, W: Write>`
+  that writes each extent to stdout (via a `BufWriter` over
+  `stdout().lock()`) as the `MapExtentMessage` arrives in the
+  vCPU loop; host memory stays O(1) regardless of how
+  fragmented the source is. Human and JSON output match
+  `qemu-img map` byte-for-byte modulo the divergences
+  documented in `docs/quirks.md` (raw `SEEK_HOLE` not
+  implemented, qcow2 compressed clusters reported as
+  `compressed: false`, VHDX partially-present treated as data,
+  no backing-chain depth in v1). BrokenPipe on stdout (user
+  piped into `head`) short-circuits cleanly with exit 0.
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation,

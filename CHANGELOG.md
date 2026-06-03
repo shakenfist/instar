@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`instar map` output polish (PLAN-map phase 4).** Replaces
+  the phase 3 placeholder renderer with a streaming
+  `MapRenderer<'a, W: Write>` that emits each extent to
+  stdout as the guest sends it (via a `BufWriter` over
+  `stdout().lock()`), bringing host memory back to O(1) for
+  pathologically fragmented sources. Human and JSON output
+  now match `qemu-img map` byte-for-byte, modulo eight
+  documented divergences in `docs/quirks.md` (raw
+  `SEEK_HOLE` not implemented, qcow2 compressed clusters
+  emitted as `compressed: false`, VHDX partially-present
+  reported as fully data, depth always 0 in v1, etc.).
+  21 byte-exact unit tests pin the renderer against
+  expected output sequences captured from `qemu-img 10.0.8`
+  during plan research. BrokenPipe on stdout (user piped
+  into `head` / `less`) short-circuits cleanly with exit 0.
 - **`instar map` host CLI surface (PLAN-map phase 3).** The
   guest binary from phases 1-2 is now reachable end-to-end via
   `instar map [-f FMT] [--output={human,json}]
