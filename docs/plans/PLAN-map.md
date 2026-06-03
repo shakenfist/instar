@@ -466,7 +466,7 @@ of phase 1.
 
 | Phase | Plan | Status |
 |-------|------|--------|
-| 1. Per-format extent iterators on parser crates | PLAN-map-phase-01-extent-iterators.md (not yet written) | Not started |
+| 1. Per-format extent iterators on parser crates | [PLAN-map-phase-01-extent-iterators.md](PLAN-map-phase-01-extent-iterators.md) | Not started |
 | 2. Guest `map` operation + protobuf | PLAN-map-phase-02-guest-op.md (not yet written) | Not started |
 | 3. Host VMM subcommand + clap surface | PLAN-map-phase-03-host-cli.md (not yet written) | Not started |
 | 4. Output formatting (human / JSON) | PLAN-map-phase-04-output-formatting.md (not yet written) | Not started |
