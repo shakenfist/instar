@@ -26,7 +26,8 @@ pub mod create;
 use shared::COMPRESSED_BUF_SIZE;
 use shared::{
     be_u32, be_u64, l1_cache_addr, l2_cache_addr, AllocationSummary, BackingFormat, CallTable,
-    ChainConfig, ImageFormat, MAX_CHAIN_DEVICES, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE,
+    ChainConfig, ImageFormat, MapExtent, MapExtentCoalescer, MapExtentState, MAX_CHAIN_DEVICES,
+    MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE,
 };
 #[cfg(feature = "vhd-input")]
 use vhd::{BlockLookup, VhdState};
@@ -1242,6 +1243,179 @@ pub fn count_allocated_in_l2_extended(
     total
 }
 
+/// Classify one standard-L2 entry into a single `MapExtent`.
+///
+/// The classification mirrors `Qcow2State::cluster_lookup`'s
+/// standard-L2 decision tree exactly:
+///
+/// - `entry == 0` → `Hole`.
+/// - `entry & OFLAG_COMPRESSED != 0` → `Data { file_offset:
+///   entry & L2_OFFSET_MASK }`. For map's purposes the compressed
+///   cluster occupies one cluster's worth of virtual space at the
+///   masked file offset; the embedded length-in-sectors field is
+///   not extracted (map only reports file_offset, not file_length).
+/// - Otherwise, `host_offset = entry & L2_OFFSET_MASK`:
+///   - `host_offset == 0` → `Hole` (matches cluster_lookup's
+///     "host_offset == 0 && !extended_l2 → Unallocated" path).
+///   - `host_offset != 0` → `Data { file_offset: host_offset }`.
+///
+/// `cluster_size` is the extent's length. `virtual_offset` is the
+/// virtual address of the cluster's first byte; the caller is
+/// responsible for clamping `length` against virtual_size if the
+/// cluster straddles end-of-image.
+///
+/// instar's qcow2 parser does not implement the qcow2 v3
+/// `QCOW_OFLAG_ZERO` bit (bit 0) for standard L2 entries; the
+/// rest of the codebase (cluster_lookup, scan_allocation) treats
+/// any non-zero entry without `OFLAG_COMPRESSED` as `Standard`.
+/// map matches that behaviour for consistency. ZeroAllocated
+/// reporting is exclusively driven by the extended-L2 subcluster
+/// bitmap. Documented in `docs/quirks.md` (see PLAN-map-phase-09).
+pub fn classify_qcow2_l2_standard(entry: u64, virtual_offset: u64, cluster_size: u64) -> MapExtent {
+    if entry == 0 {
+        return MapExtent {
+            start: virtual_offset,
+            length: cluster_size,
+            state: MapExtentState::Hole,
+        };
+    }
+    if (entry & OFLAG_COMPRESSED) != 0 {
+        let file_offset = entry & L2_OFFSET_MASK;
+        return MapExtent {
+            start: virtual_offset,
+            length: cluster_size,
+            state: MapExtentState::Data { file_offset },
+        };
+    }
+    let host_offset = entry & L2_OFFSET_MASK;
+    if host_offset == 0 {
+        return MapExtent {
+            start: virtual_offset,
+            length: cluster_size,
+            state: MapExtentState::Hole,
+        };
+    }
+    MapExtent {
+        start: virtual_offset,
+        length: cluster_size,
+        state: MapExtentState::Data {
+            file_offset: host_offset,
+        },
+    }
+}
+
+/// Classify one extended-L2 entry by pushing 1-32 subcluster
+/// `MapExtent`s through the supplied coalescer.
+///
+/// Each cluster has 32 subclusters of size `cluster_size / 32`.
+/// The 64-bit `sc_bitmap` packs the per-subcluster state as two
+/// 32-bit words: `alloc_bits = sc_bitmap as u32` and
+/// `zero_bits = (sc_bitmap >> 32) as u32`. Per cluster_lookup
+/// extended-L2 decision tree:
+///
+/// - `l2_entry == 0`, `zero_bits == 0`: 32× `Hole`. Coalesces to
+///   one extent.
+/// - `l2_entry == 0`, `zero_bits != 0`: per-subcluster: if
+///   `zero_bits[i]` set → `ZeroAllocated`, else → `Hole`.
+/// - `l2_entry & OFLAG_COMPRESSED != 0`: 32× `Data { file_offset
+///   = (l2_entry & L2_OFFSET_MASK) + i * subcluster_size }`.
+///   (Compressed clusters do not technically have one host offset
+///   per subcluster, but emitting them as a Data sequence that
+///   coalesces into one cluster-wide extent matches the qemu-img
+///   map output.)
+/// - `l2_entry != 0`, `alloc_bits == 0xFFFF_FFFF`, `zero_bits ==
+///   0`: 32× `Data` with contiguous file offsets (collapses).
+/// - Otherwise: per-subcluster (alloc[i], zero[i]) →
+///   (0,0)=`Hole`, (0,1)=`ZeroAllocated`, (1,0)=`Data { offset
+///   = host_offset + i * subcluster_size }`, (1,1)=`ZeroAllocated`
+///   (zero wins; sc_bitmap_invalid rejects this combo, but treat
+///   defensively as zero for forward compatibility).
+///
+/// The caller is responsible for clamping `cluster_length` to
+/// virtual_size if the cluster straddles end-of-image. Returns
+/// `false` if the coalescer signalled abort.
+pub fn classify_qcow2_l2_extended<F: FnMut(MapExtent) -> bool>(
+    l2_entry: u64,
+    sc_bitmap: u64,
+    virtual_offset: u64,
+    cluster_size: u64,
+    cluster_length: u64,
+    sink: &mut MapExtentCoalescer<'_, F>,
+) -> bool {
+    if cluster_size == 0 || cluster_length == 0 {
+        return true;
+    }
+    let subcluster_size = cluster_size / 32;
+    if subcluster_size == 0 {
+        return true;
+    }
+    let alloc_bits = sc_bitmap as u32;
+    let zero_bits = (sc_bitmap >> 32) as u32;
+    let host_offset = l2_entry & L2_OFFSET_MASK;
+    let is_compressed = (l2_entry & OFLAG_COMPRESSED) != 0;
+
+    // Per-subcluster emission. The coalescer merges
+    // adjacent same-state subclusters back into one extent.
+    let mut sub_virt = virtual_offset;
+    let mut consumed: u64 = 0;
+    for i in 0..32u32 {
+        // Clamp the final subcluster against the cluster's
+        // remaining length so the emitted run never exceeds the
+        // cluster's effective span (caller-supplied
+        // `cluster_length` accounts for end-of-image clamping).
+        let remaining = cluster_length.saturating_sub(consumed);
+        if remaining == 0 {
+            break;
+        }
+        let sub_len = subcluster_size.min(remaining);
+
+        let state = if is_compressed {
+            // All 32 subclusters point into the same compressed
+            // payload; emit each at host_offset + i * subcluster_size
+            // so the coalescer collapses them into one cluster-wide
+            // Data extent.
+            MapExtentState::Data {
+                file_offset: host_offset.saturating_add((i as u64).saturating_mul(subcluster_size)),
+            }
+        } else if l2_entry == 0 {
+            if (zero_bits >> i) & 1 != 0 {
+                MapExtentState::ZeroAllocated
+            } else {
+                MapExtentState::Hole
+            }
+        } else {
+            let a = (alloc_bits >> i) & 1 != 0;
+            let z = (zero_bits >> i) & 1 != 0;
+            match (a, z) {
+                (false, false) => MapExtentState::Hole,
+                (_, true) => MapExtentState::ZeroAllocated,
+                (true, false) => {
+                    if host_offset == 0 {
+                        MapExtentState::Hole
+                    } else {
+                        MapExtentState::Data {
+                            file_offset: host_offset
+                                .saturating_add((i as u64).saturating_mul(subcluster_size)),
+                        }
+                    }
+                }
+            }
+        };
+
+        let cont = sink.push(MapExtent {
+            start: sub_virt,
+            length: sub_len,
+            state,
+        });
+        if !cont {
+            return false;
+        }
+        sub_virt = sub_virt.saturating_add(sub_len);
+        consumed = consumed.saturating_add(sub_len);
+    }
+    true
+}
+
 impl Qcow2State {
     /// Return the bitmask of incompatible features that are set but
     /// not in `supported_mask`. Returns 0 if all set features are
@@ -1827,6 +2001,248 @@ impl Qcow2State {
             allocated_bytes,
             tracker.target_units_with_data,
         ))
+    }
+
+    /// Walk the L1 / L2 tables and emit a coalesced `MapExtent`
+    /// stream covering `[0, virtual_size)`.
+    ///
+    /// Reports the active layer only; backing-chain composition is
+    /// the caller's responsibility (deferred — see PLAN-map.md).
+    ///
+    /// The walker mirrors `Qcow2State::scan_allocation` for sector
+    /// reading and L1/L2 traversal but classifies each L2 entry via
+    /// [`classify_qcow2_l2_standard`] or
+    /// [`classify_qcow2_l2_extended`] and pushes the result through a
+    /// `MapExtentCoalescer` wrapping the caller's `emit` callback.
+    /// The coalescer persists across L2-table boundaries so a Data
+    /// run spanning two L2 tables with contiguous file offsets
+    /// collapses into one extent.
+    ///
+    /// L1 entries that are zero or whose L2 table offset is zero
+    /// emit one `Hole` for the entire L2-coverage range (clamped
+    /// against virtual_size). A trailing `Hole` is pushed for any
+    /// virtual range past the last walked L1 entry up to
+    /// `virtual_size`, so the emitted extents partition
+    /// `[0, virtual_size)`.
+    ///
+    /// Returns `Some(())` on a successful walk (including early
+    /// termination via `emit` returning `false`). Returns `None` on
+    /// an I/O failure or adversarial L2 offset, matching
+    /// `scan_allocation`'s convention.
+    ///
+    /// # Safety
+    ///
+    /// `call_table` must be valid. `l1_cache_buf` and `l2_cache_buf`
+    /// must still point to at least `MAX_SECTOR_SIZE` writable bytes.
+    pub unsafe fn map_extents<F: FnMut(MapExtent) -> bool>(
+        &mut self,
+        call_table: &CallTable,
+        sector_size: usize,
+        input_capacity: u64,
+        virtual_size: u64,
+        bytes_read: &mut u64,
+        emit: &mut F,
+    ) -> Option<()> {
+        if virtual_size == 0 {
+            return Some(());
+        }
+
+        let cluster_size = self.cluster_size;
+        let extended_l2 = self.extended_l2;
+        let l1_size = self.l1_size as u64;
+        let l1_table_offset = self.l1_table_offset;
+
+        let entry_size_bytes: u64 = if extended_l2 { 16 } else { 8 };
+        let entries_per_l2: u64 = cluster_size / entry_size_bytes;
+        let l2_coverage = cluster_size.checked_mul(entries_per_l2)?;
+
+        let mut coalescer = MapExtentCoalescer::new(emit);
+        // Virtual offset of the next byte we still need to cover.
+        // Used to emit Hole records for unwalked L2 tables and to
+        // detect the trailing hole at end-of-image.
+        let mut next_unwalked: u64 = 0;
+
+        'l1_loop: for l1_index in 0..l1_size {
+            let l1_byte_offset = l1_table_offset.checked_add(l1_index.checked_mul(8)?)?;
+            let l1_entry = read_u64_be_cached(
+                call_table,
+                self.device_idx,
+                l1_byte_offset,
+                sector_size,
+                input_capacity,
+                &mut self.l1_cached_sector,
+                self.l1_cache_buf,
+                bytes_read,
+            )?;
+
+            let l1_virtual_start = (l1_index).saturating_mul(l2_coverage);
+            if l1_virtual_start >= virtual_size {
+                // L1 entries past virtual_size cover no
+                // guest-visible bytes; nothing to emit.
+                continue;
+            }
+            let l1_remaining = virtual_size - l1_virtual_start;
+            let l1_visible_span = l2_coverage.min(l1_remaining);
+
+            let l2_table_offset = l1_entry & L2_OFFSET_MASK;
+            if l2_table_offset == 0 {
+                // Entire L2 coverage range is unallocated. Push one
+                // Hole for the visible portion; the coalescer merges
+                // it with adjacent same-state extents.
+                let cont = coalescer.push(MapExtent {
+                    start: l1_virtual_start,
+                    length: l1_visible_span,
+                    state: MapExtentState::Hole,
+                });
+                next_unwalked = l1_virtual_start.saturating_add(l1_visible_span);
+                if !cont {
+                    break 'l1_loop;
+                }
+                continue;
+            }
+
+            // Invalidate L2 cache before each new L2 (matches the
+            // pattern in scan_allocation).
+            self.l2_cached_sector = u64::MAX;
+
+            // Reject obviously-invalid L2 offsets up front (mirrors
+            // scan_allocation's defence).
+            let device_byte_capacity = input_capacity.checked_mul(sector_size as u64)?;
+            if l2_table_offset >= device_byte_capacity {
+                return None;
+            }
+            let l2_end_byte = l2_table_offset.checked_add(cluster_size)?;
+            let l2_start_sector = l2_table_offset / sector_size as u64;
+            let l2_end_sector =
+                l2_end_byte.checked_add(sector_size as u64 - 1)? / sector_size as u64;
+
+            let mut l2_bytes_consumed: u64 = 0;
+
+            let mut sector = l2_start_sector;
+            while sector < l2_end_sector {
+                if sector >= input_capacity {
+                    return None;
+                }
+                if !(call_table.read_input_sector)(
+                    self.device_idx,
+                    sector,
+                    self.l2_cache_buf,
+                    sector_size,
+                ) {
+                    return None;
+                }
+                *bytes_read += sector_size as u64;
+                self.l2_cached_sector = sector;
+
+                let sector_byte_start = sector * sector_size as u64;
+                let buf_start = if sector_byte_start < l2_table_offset {
+                    (l2_table_offset - sector_byte_start) as usize
+                } else {
+                    0
+                };
+                let buf_end =
+                    sector_size.min((l2_end_byte.saturating_sub(sector_byte_start)) as usize);
+                if buf_end <= buf_start {
+                    sector += 1;
+                    continue;
+                }
+
+                let chunk = core::slice::from_raw_parts(
+                    self.l2_cache_buf.add(buf_start),
+                    buf_end - buf_start,
+                );
+
+                let meaningful_len =
+                    (cluster_size - l2_bytes_consumed).min((buf_end - buf_start) as u64) as usize;
+                let meaningful = &chunk[..meaningful_len];
+
+                // Walk the entries in this chunk in virtual-offset
+                // order. Each entry covers `cluster_size` of virtual
+                // space; for extended L2 it occupies 16 bytes of L2
+                // table, for standard L2 8 bytes.
+                let chunk_entry_count = (meaningful_len as u64) / entry_size_bytes;
+                let base_entry_index = l2_bytes_consumed / entry_size_bytes;
+
+                for k in 0..chunk_entry_count {
+                    let entry_byte_offset = (k as usize) * (entry_size_bytes as usize);
+                    let l2_entry = u64::from_be_bytes([
+                        meaningful[entry_byte_offset],
+                        meaningful[entry_byte_offset + 1],
+                        meaningful[entry_byte_offset + 2],
+                        meaningful[entry_byte_offset + 3],
+                        meaningful[entry_byte_offset + 4],
+                        meaningful[entry_byte_offset + 5],
+                        meaningful[entry_byte_offset + 6],
+                        meaningful[entry_byte_offset + 7],
+                    ]);
+                    let global_entry_idx = base_entry_index + k;
+                    let cluster_virt = l1_virtual_start
+                        .saturating_add(global_entry_idx.saturating_mul(cluster_size));
+                    if cluster_virt >= virtual_size {
+                        // OOB cluster: don't emit; subsequent
+                        // entries are also OOB so we can break.
+                        break;
+                    }
+                    let cluster_visible = cluster_size.min(virtual_size - cluster_virt);
+
+                    let cont = if extended_l2 {
+                        let sc_bitmap = u64::from_be_bytes([
+                            meaningful[entry_byte_offset + 8],
+                            meaningful[entry_byte_offset + 9],
+                            meaningful[entry_byte_offset + 10],
+                            meaningful[entry_byte_offset + 11],
+                            meaningful[entry_byte_offset + 12],
+                            meaningful[entry_byte_offset + 13],
+                            meaningful[entry_byte_offset + 14],
+                            meaningful[entry_byte_offset + 15],
+                        ]);
+                        classify_qcow2_l2_extended(
+                            l2_entry,
+                            sc_bitmap,
+                            cluster_virt,
+                            cluster_size,
+                            cluster_visible,
+                            &mut coalescer,
+                        )
+                    } else {
+                        let mut ext =
+                            classify_qcow2_l2_standard(l2_entry, cluster_virt, cluster_size);
+                        // Clamp to virtual_size for end-of-image
+                        // clusters.
+                        if ext.length > cluster_visible {
+                            ext.length = cluster_visible;
+                        }
+                        coalescer.push(ext)
+                    };
+
+                    next_unwalked = cluster_virt.saturating_add(cluster_visible);
+
+                    if !cont {
+                        // Abort the entire walk; the coalescer has
+                        // already noted the abort and any further
+                        // push/finish call will short-circuit.
+                        break 'l1_loop;
+                    }
+                }
+
+                l2_bytes_consumed += meaningful_len as u64;
+                sector += 1;
+            }
+        }
+
+        // Trailing hole: any virtual range past the last walked
+        // cluster up to virtual_size must be emitted so the output
+        // partitions [0, virtual_size).
+        if next_unwalked < virtual_size {
+            let _ = coalescer.push(MapExtent {
+                start: next_unwalked,
+                length: virtual_size - next_unwalked,
+                state: MapExtentState::Hole,
+            });
+        }
+
+        let _ = coalescer.finish();
+        Some(())
     }
 }
 
@@ -2961,6 +3377,247 @@ mod tests {
         let mut buf = [0u8; 16];
         put_ext_entry(&mut buf, 0, 0x10000, full);
         assert_eq!(count_allocated_in_l2_extended(&buf, 65536, 0, 30000), 30000,);
+    }
+
+    // ====================================================================
+    // classify_qcow2_l2_standard tests
+    // ====================================================================
+
+    #[test]
+    fn classify_standard_zero_is_hole() {
+        let e = classify_qcow2_l2_standard(0, 0, 65536);
+        assert_eq!(e.start, 0);
+        assert_eq!(e.length, 65536);
+        assert_eq!(e.state, MapExtentState::Hole);
+    }
+
+    #[test]
+    fn classify_standard_normal_is_data() {
+        // host_offset = 0x50000, no flag bits.
+        let e = classify_qcow2_l2_standard(0x0005_0000, 0, 65536);
+        assert_eq!(
+            e.state,
+            MapExtentState::Data {
+                file_offset: 0x0005_0000
+            }
+        );
+    }
+
+    #[test]
+    fn classify_standard_compressed_is_data() {
+        // OFLAG_COMPRESSED set; offset bits in L2_OFFSET_MASK range.
+        let entry = OFLAG_COMPRESSED | 0x0001_2000;
+        let e = classify_qcow2_l2_standard(entry, 65536, 65536);
+        assert_eq!(e.start, 65536);
+        assert_eq!(e.length, 65536);
+        // file_offset masked with L2_OFFSET_MASK.
+        let want_off = entry & L2_OFFSET_MASK;
+        assert_eq!(
+            e.state,
+            MapExtentState::Data {
+                file_offset: want_off
+            }
+        );
+    }
+
+    #[test]
+    fn classify_standard_oflag_copied_only_is_hole() {
+        // OFLAG_COPIED is bit 63; on its own with no offset the
+        // entry is non-zero but host_offset is 0 — treat as Hole
+        // to match cluster_lookup's "host_offset == 0 →
+        // Unallocated" path.
+        let e = classify_qcow2_l2_standard(OFLAG_COPIED, 0, 65536);
+        assert_eq!(e.state, MapExtentState::Hole);
+    }
+
+    #[test]
+    fn classify_standard_oflag_copied_with_offset_is_data() {
+        let entry = OFLAG_COPIED | 0x0001_0000;
+        let e = classify_qcow2_l2_standard(entry, 0, 65536);
+        assert_eq!(
+            e.state,
+            MapExtentState::Data {
+                file_offset: 0x0001_0000
+            }
+        );
+    }
+
+    // ====================================================================
+    // classify_qcow2_l2_extended tests
+    // ====================================================================
+
+    fn extract_extents(
+        l2_entry: u64,
+        sc_bitmap: u64,
+        virtual_offset: u64,
+        cluster_size: u64,
+        cluster_visible: u64,
+    ) -> ([MapExtent; 40], usize) {
+        let mut buf = [MapExtent {
+            start: 0,
+            length: 0,
+            state: MapExtentState::Hole,
+        }; 40];
+        let mut count = 0usize;
+        let mut emit = |e: MapExtent| -> bool {
+            assert!(count < buf.len(), "extract_extents overflowed buffer");
+            buf[count] = e;
+            count += 1;
+            true
+        };
+        {
+            let mut sink = MapExtentCoalescer::new(&mut emit);
+            assert!(classify_qcow2_l2_extended(
+                l2_entry,
+                sc_bitmap,
+                virtual_offset,
+                cluster_size,
+                cluster_visible,
+                &mut sink,
+            ));
+            assert!(sink.finish());
+        }
+        (buf, count)
+    }
+
+    #[test]
+    fn classify_extended_zero_entry_no_zero_bits_is_one_hole() {
+        // l2_entry == 0, zero_bits == 0 → 32 Hole subclusters
+        // that coalesce into one cluster-wide Hole.
+        let (buf, count) = extract_extents(0, 0, 0, 65536, 65536);
+        assert_eq!(count, 1);
+        assert_eq!(buf[0].state, MapExtentState::Hole);
+        assert_eq!(buf[0].length, 65536);
+    }
+
+    #[test]
+    fn classify_extended_zero_entry_all_zero_bits_is_one_zero_alloc() {
+        // l2_entry == 0, zero_bits == 0xFFFFFFFF → 32 ZeroAllocated
+        // subclusters that coalesce.
+        let bitmap: u64 = 0xFFFF_FFFFu64 << 32;
+        let (buf, count) = extract_extents(0, bitmap, 0, 65536, 65536);
+        assert_eq!(count, 1);
+        assert_eq!(buf[0].state, MapExtentState::ZeroAllocated);
+        assert_eq!(buf[0].length, 65536);
+    }
+
+    #[test]
+    fn classify_extended_full_alloc_is_one_data() {
+        // alloc_bits == 0xFFFFFFFF, zero_bits == 0, host_offset
+        // non-zero. Each subcluster gets file_offset host + i*sc;
+        // coalesces into one Data extent at host_offset.
+        let bitmap: u64 = 0xFFFF_FFFF;
+        let host_offset: u64 = 0x10_0000;
+        let (buf, count) = extract_extents(host_offset, bitmap, 0, 65536, 65536);
+        assert_eq!(count, 1);
+        assert_eq!(buf[0].length, 65536);
+        assert_eq!(
+            buf[0].state,
+            MapExtentState::Data {
+                file_offset: host_offset
+            }
+        );
+    }
+
+    #[test]
+    fn classify_extended_compressed_is_one_data() {
+        // OFLAG_COMPRESSED set: emit Data for every subcluster with
+        // file_offset = host + i*sc; coalesces to one extent at the
+        // host offset.
+        let host_offset: u64 = 0x4000;
+        let entry = OFLAG_COMPRESSED | host_offset;
+        let (buf, count) = extract_extents(entry, 0, 0, 65536, 65536);
+        assert_eq!(count, 1);
+        assert_eq!(buf[0].length, 65536);
+        assert_eq!(
+            buf[0].state,
+            MapExtentState::Data {
+                file_offset: host_offset
+            }
+        );
+    }
+
+    #[test]
+    fn classify_extended_checkerboard_alloc_keeps_split() {
+        // alloc_bits = 0xAAAAAAAA (every other subcluster
+        // allocated), zero_bits = 0. Result: 32 separate extents
+        // alternating Hole / Data. The coalescer cannot merge them
+        // because the states differ.
+        let alloc: u64 = 0xAAAA_AAAA;
+        let host_offset: u64 = 0x1_0000_0000;
+        let (buf, count) = extract_extents(host_offset, alloc, 0, 65536, 65536);
+        assert_eq!(count, 32);
+        // Even-index subclusters are Hole (low bits = 0).
+        assert_eq!(buf[0].state, MapExtentState::Hole);
+        // Odd-index are Data.
+        match buf[1].state {
+            MapExtentState::Data { file_offset } => {
+                assert_eq!(file_offset, host_offset + 2048);
+            }
+            other => panic!("expected Data, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn classify_extended_one_alloc_amid_holes() {
+        // alloc_bits = 1 (subcluster 0 only), zero_bits = 0.
+        // 1 Data extent then 1 Hole extent (31 subclusters worth
+        // of Hole, coalesced).
+        let alloc: u64 = 1;
+        let host_offset: u64 = 0x8000;
+        let (buf, count) = extract_extents(host_offset, alloc, 0, 65536, 65536);
+        assert_eq!(count, 2);
+        assert_eq!(
+            buf[0].state,
+            MapExtentState::Data {
+                file_offset: host_offset
+            }
+        );
+        assert_eq!(buf[0].length, 2048);
+        assert_eq!(buf[1].state, MapExtentState::Hole);
+        assert_eq!(buf[1].length, 2048 * 31);
+    }
+
+    #[test]
+    fn classify_extended_alloc_plus_zero_subcluster_is_zero_alloc() {
+        // Subcluster 0 has both alloc and zero set: zero wins
+        // (defensive against sc_bitmap validator I1).
+        let bitmap: u64 = (1u64 << 32) | 1;
+        let (buf, count) = extract_extents(0x1_0000, bitmap, 0, 65536, 65536);
+        // Subcluster 0: ZeroAllocated. Subclusters 1..32: Hole
+        // (l2_entry != 0 path: alloc=0, zero=0 → Hole).
+        assert_eq!(count, 2);
+        assert_eq!(buf[0].state, MapExtentState::ZeroAllocated);
+        assert_eq!(buf[0].length, 2048);
+        assert_eq!(buf[1].state, MapExtentState::Hole);
+    }
+
+    #[test]
+    fn classify_extended_clamps_to_cluster_visible() {
+        // Fully-allocated cluster but virtual_size cuts it at half
+        // the cluster size; emitted length must match
+        // cluster_visible, not cluster_size.
+        let bitmap: u64 = 0xFFFF_FFFF;
+        let (buf, count) = extract_extents(0x1_0000, bitmap, 0, 65536, 32768);
+        // We've asked for half the cluster.
+        let total_len: u64 = buf[..count].iter().map(|e| e.length).sum();
+        assert_eq!(total_len, 32768);
+    }
+
+    // ====================================================================
+    // Smoke-test that the new helpers are wired correctly via the
+    // module's public API. Full Qcow2State::map_extents end-to-end
+    // coverage lives in the phase 6 integration tests against real
+    // testdata.
+    // ====================================================================
+
+    #[test]
+    fn classify_standard_compressed_offset_masked() {
+        // Make sure high garbage bits don't leak into file_offset.
+        let entry = OFLAG_COMPRESSED | OFLAG_COPIED | 0x0007_0000;
+        let e = classify_qcow2_l2_standard(entry, 0, 65536);
+        let want = entry & L2_OFFSET_MASK;
+        assert_eq!(e.state, MapExtentState::Data { file_offset: want });
     }
 }
 
