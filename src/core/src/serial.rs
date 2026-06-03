@@ -595,3 +595,34 @@ pub fn send_commit_result(result: &shared::CommitResult) {
     );
     send_message(&msg);
 }
+
+/// Send a single map extent message.
+///
+/// Called once per coalesced extent during the map operation,
+/// before the terminating [`send_map_result`].
+pub fn send_map_extent(record: &shared::MapExtentRecord) {
+    let state = match record.state {
+        shared::MapExtentRecord::STATE_HOLE => "hole",
+        shared::MapExtentRecord::STATE_ZERO_ALLOCATED => "zero",
+        shared::MapExtentRecord::STATE_DATA => "data",
+        _ => "unknown",
+    };
+    let msg =
+        guest_protocol::map_extent_message(record.start, record.length, state, record.file_offset);
+    send_message(&msg);
+}
+
+/// Send the map operation's terminator summary.
+///
+/// Called once per invocation, after the last
+/// [`send_map_extent`].
+pub fn send_map_result(result: &shared::MapResult) {
+    let source = shared::ImageFormat::from_u32(result.source_format).name();
+    let msg = guest_protocol::map_result_message(
+        source,
+        result.extents_emitted,
+        result.virtual_size,
+        result.error,
+    );
+    send_message(&msg);
+}

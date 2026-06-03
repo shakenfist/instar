@@ -912,6 +912,23 @@ pub struct CallTable {
     /// of `CallTable` for the same back-compat reason as
     /// `read_output_sector`.
     pub write_input_sector: unsafe extern "C" fn(u32, u64, *const u8, usize) -> bool,
+
+    /// Send one coalesced map extent. Called once per extent
+    /// emitted by the guest's per-format `map_extents` walker
+    /// during the map operation. Args: `*const MapExtentRecord`
+    /// carrying the extent's virtual start, length, state code,
+    /// and (for `STATE_DATA` extents) the source file offset.
+    /// Appended at the end of `CallTable` for the same
+    /// back-compat reason as `write_input_sector`.
+    pub send_map_extent: unsafe extern "C" fn(*const MapExtentRecord),
+
+    /// Send the map operation's terminator summary. Called once
+    /// per invocation, after the last `send_map_extent`. Args:
+    /// `*const MapResult` carrying the extent count, virtual
+    /// size, source format echo, and error code. Appended at the
+    /// end of `CallTable` for the same back-compat reason as
+    /// `send_map_extent`.
+    pub send_map_result: unsafe extern "C" fn(*const MapResult),
 }
 
 /// Backing format type for QCOW2 header extension
@@ -1231,10 +1248,10 @@ impl CallTable {
     /// Magic value indicating a valid call table
     pub const MAGIC: u32 = 0x494D4147; // "IMAG"
 
-    /// Current ABI version (bumped: rebase-commit phase 1 appended
-    /// `send_rebase_result`, `send_commit_result`, and
-    /// `write_input_sector`).
-    pub const VERSION: u32 = 15;
+    /// Current ABI version (bumped: PLAN-map phase 2 appended
+    /// `send_map_extent` and `send_map_result` to support the
+    /// streaming-emit shape map needs).
+    pub const VERSION: u32 = 16;
 }
 
 // ============================================================================
