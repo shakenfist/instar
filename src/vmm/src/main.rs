@@ -142,6 +142,19 @@ const MEASURE_RESULT_ERROR_INVALID_OPTION: u32 = 2;
 #[allow(dead_code)]
 const MEASURE_RESULT_ERROR_INVALID_SIZE: u32 = 3;
 
+// MapConfig constants (must match shared::MapConfig)
+const MAP_CONFIG_MAGIC: u32 = 0x4D41505F; // "MAP_"
+#[allow(dead_code)]
+const MAP_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
+
+// MapResult constants (must match shared::MapResult)
+const MAP_RESULT_MAGIC: u32 = 0x4D505253; // "MPRS"
+const MAP_RESULT_ERROR_OK: u32 = 0;
+const MAP_RESULT_ERROR_INVALID_SOURCE: u32 = 1;
+const MAP_RESULT_ERROR_INVALID_OPTION: u32 = 2;
+const MAP_RESULT_ERROR_HAS_BACKING: u32 = 3;
+const MAP_RESULT_ERROR_IO: u32 = 4;
+
 // CreateConfig constants (must match shared crate)
 const CREATE_CONFIG_MAGIC: u32 = 0x43524541; // "CREA"
 #[allow(dead_code)]
@@ -2483,6 +2496,8 @@ enum Commands {
     Rebase(RebaseArgs),
     /// Commit an overlay's data down into its backing file
     Commit(CommitArgs),
+    /// Emit the allocation map of a disk image
+    Map(MapArgs),
     /// Display or validate configuration
     Config(ConfigArgs),
 }
@@ -2593,6 +2608,48 @@ struct CommitArgs {
     /// Output format.
     #[arg(long, default_value = "human", value_parser = ["human", "json"])]
     output: String,
+}
+
+/// Arguments for `instar map`. Mirrors `qemu-img map`'s
+/// surface (FILENAME, -f, --output, --start-offset,
+/// --max-length, --image-opts) plus an instar-specific
+/// `--sector-size`.
+#[derive(Args, Debug)]
+struct MapArgs {
+    /// Source image file. Required.
+    input: String,
+
+    /// Source format override (rare; usually auto-detected).
+    /// Accepted for parity with qemu-img -f.
+    #[arg(short = 'f', long = "format")]
+    source_format: Option<String>,
+
+    /// Output format: human (default) or json.
+    #[arg(long, default_value = "human", value_parser = ["human", "json"])]
+    output: String,
+
+    /// Start emission at this virtual byte offset. Accepts
+    /// K/M/G/T suffixes (parsed by parse_memory_size).
+    /// Default: 0 (start of image).
+    #[arg(long = "start-offset")]
+    start_offset: Option<String>,
+
+    /// Stop emission after this many virtual bytes from
+    /// --start-offset. Accepts K/M/G/T suffixes. Default:
+    /// emit to end of image.
+    #[arg(long = "max-length")]
+    max_length: Option<String>,
+
+    /// Sector size for source I/O. Default: 65536. Not part
+    /// of qemu-img's surface; instar-specific.
+    #[arg(long, default_value = "65536")]
+    sector_size: u32,
+
+    /// Refused for parity-rejection: qemu-img's
+    /// --image-opts descriptor-based source specification
+    /// is deferred. Documented in docs/quirks.md.
+    #[arg(long = "image-opts")]
+    image_opts: bool,
 }
 
 /// Host-side holder for the harvested `CommitResultMessage`.
@@ -3132,6 +3189,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Resize(args) => run_resize(args, verbose),
         Commands::Rebase(args) => run_rebase(args, verbose),
         Commands::Commit(args) => run_commit(args, verbose),
+        Commands::Map(args) => run_map(args, verbose),
         Commands::Config(args) => run_config(args),
     }
 }
@@ -9412,6 +9470,32 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     }
 
     Ok(())
+}
+
+/// Entry point for the `map` subcommand.
+///
+/// Streams the source image's allocation map by launching the
+/// `map.bin` guest binary with a populated `MapConfig` and
+/// consuming `MapExtentMessage` records followed by a
+/// terminating `MapResultMessage`. Phase 3 stub: the body
+/// lands in step 3b; the placeholder renderer lands in 3c.
+fn run_map(_args: MapArgs, _verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Touch the magic constants so the constant block stays
+    // referenced (and so `cargo clippy` doesn't warn dead-code
+    // ahead of step 3b wiring them up). Will be removed when
+    // step 3b adds the real body.
+    let _ = MAP_CONFIG_MAGIC;
+    let _ = MAP_RESULT_MAGIC;
+    let _ = MAP_RESULT_ERROR_OK;
+    let _ = MAP_RESULT_ERROR_INVALID_SOURCE;
+    let _ = MAP_RESULT_ERROR_INVALID_OPTION;
+    let _ = MAP_RESULT_ERROR_HAS_BACKING;
+    let _ = MAP_RESULT_ERROR_IO;
+    Err(
+        "map: not yet implemented (run_map stub from PLAN-map phase 3a; \
+         body lands in 3b)"
+            .into(),
+    )
 }
 
 /// Entry point for the `create` subcommand.
