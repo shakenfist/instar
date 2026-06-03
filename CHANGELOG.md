@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`instar map` host CLI surface (PLAN-map phase 3).** The
+  guest binary from phases 1-2 is now reachable end-to-end via
+  `instar map [-f FMT] [--output={human,json}]
+  [--start-offset=OFFSET] [--max-length=LEN] [--sector-size=N]
+  FILENAME`. `run_map` validates args (refusing `--image-opts`,
+  VMDK monolithicFlat sources, and `--start-offset >= file
+  size` on the host), populates `MapConfig`, attaches the
+  source read-only, runs the vCPU loop accumulating extent
+  records, and routes the result through a placeholder
+  human/JSON renderer (`format_map_human` / `format_map_json`)
+  that produces *valid* output for both formats. The renderer
+  is structural-only in phase 3; phase 4 of PLAN-map polishes
+  to byte-for-byte qemu-img parity against the cross-version
+  baseline matrix. 18 new unit tests pin the state-triple
+  table, JSON field ordering, and error-message table so the
+  phase 4 refactor preserves the contract.
 - **`instar map` subcommand foundation (PLAN-map phases 1-2).**
   Per-format extent walkers (`<Format>State::map_extents`) on
   every parser crate (`raw`, `qcow2`, `vmdk`, `vhd`, `vhdx`)

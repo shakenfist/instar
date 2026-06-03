@@ -440,8 +440,23 @@ provides a modular architecture with:
   window (with file-offset adjustment for front-trimmed Data
   extents) and signals walker abort once the window is
   exhausted. Single-image v1; chain composition is a follow-up.
-  Binary builds at ~28 KiB / 384 KiB (7%). Host CLI lands in
-  phase 3 of PLAN-map.
+  Binary builds at ~28 KiB / 384 KiB (7%). Host CLI (phase 3
+  of PLAN-map) wires `instar map [-f FMT] [--output={human,json}]
+  [--start-offset=OFFSET] [--max-length=LEN] [--sector-size=N]
+  FILENAME`: `run_map` in `src/vmm/src/main.rs` parses args
+  (refusing `--image-opts`, VMDK monolithicFlat sources via
+  `peek_is_vmdk_descriptor`, and `--start-offset >= file_size`
+  on the host before launching the guest), writes `MapConfig`
+  per-field at `OPERATION_CONFIG_ADDR`, attaches the source
+  read-only as input device 0, runs the vCPU loop accumulating
+  `MapExtentMessage` records into a `Vec` and capturing the
+  `MapResultMessage` terminator, and routes the result through
+  `print_map_result` -> `format_map_human` / `format_map_json`.
+  The phase 3 renderer produces *valid* output for both
+  `--output=human` and `--output=json` but does not chase
+  byte-for-byte qemu-img parity (column widths, exact JSON
+  whitespace, field ordering, streaming emission); phase 4 of
+  PLAN-map polishes against the cross-version baseline matrix.
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation,
