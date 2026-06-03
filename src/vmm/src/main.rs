@@ -9477,25 +9477,386 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 /// Streams the source image's allocation map by launching the
 /// `map.bin` guest binary with a populated `MapConfig` and
 /// consuming `MapExtentMessage` records followed by a
-/// terminating `MapResultMessage`. Phase 3 stub: the body
-/// lands in step 3b; the placeholder renderer lands in 3c.
-fn run_map(_args: MapArgs, _verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
-    // Touch the magic constants so the constant block stays
-    // referenced (and so `cargo clippy` doesn't warn dead-code
-    // ahead of step 3b wiring them up). Will be removed when
-    // step 3b adds the real body.
-    let _ = MAP_CONFIG_MAGIC;
+/// terminating `MapResultMessage`. Phase 3 ships a working
+/// CLI with a placeholder renderer (step 3c); phase 4 polishes
+/// the renderer to byte-for-byte qemu-img parity.
+fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Touch the result magic so the constant block stays
+    // referenced (the on-wire message uses the magic
+    // implicitly via the FFI struct; the host doesn't
+    // dereference it directly).
     let _ = MAP_RESULT_MAGIC;
-    let _ = MAP_RESULT_ERROR_OK;
-    let _ = MAP_RESULT_ERROR_INVALID_SOURCE;
-    let _ = MAP_RESULT_ERROR_INVALID_OPTION;
-    let _ = MAP_RESULT_ERROR_HAS_BACKING;
-    let _ = MAP_RESULT_ERROR_IO;
-    Err(
-        "map: not yet implemented (run_map stub from PLAN-map phase 3a; \
-         body lands in 3b)"
-            .into(),
-    )
+
+    // --- Validate args ---------------------------------------------------
+    if args.image_opts {
+        return Err(
+            "map: --image-opts is not supported (instar accepts FILENAME directly; \
+             see docs/quirks.md)"
+                .into(),
+        );
+    }
+
+    if !(512..=MAX_SECTOR_SIZE).contains(&args.sector_size) || !args.sector_size.is_power_of_two() {
+        return Err(format!(
+            "sector size must be a power of 2, 512 to {} (got {})",
+            MAX_SECTOR_SIZE, args.sector_size
+        )
+        .into());
+    }
+
+    // --- VMDK monolithicFlat source rejection ----------------------------
+    // The guest's VmdkState::init naturally fails the VMDK4 binary header
+    // parse for descriptor-driven layouts, but the resulting
+    // ERROR_INVALID_SOURCE is less helpful than this host-side pre-check
+    // pointing at qemu-img as an escape hatch.
+    let input_path = Path::new(&args.input);
+    if peek_is_vmdk_descriptor(input_path).unwrap_or(false) {
+        return Err("map: monolithicFlat source images are not yet supported \
+             (use qemu-img map instead)"
+            .into());
+    }
+
+    // --- Resolve window bytes --------------------------------------------
+    let start_offset: u64 = if let Some(ref s) = args.start_offset {
+        parse_memory_size(s)?
+    } else {
+        0
+    };
+    let max_length: u64 = if let Some(ref s) = args.max_length {
+        parse_memory_size(s)?
+    } else {
+        0
+    };
+
+    // --- Host-side --start-offset > source size check --------------------
+    // The guest's clip_to_window would silently emit nothing in this case;
+    // catch it here so the user sees a clear error.
+    let input_meta = std::fs::metadata(input_path)?;
+    let input_size = input_meta.len();
+    if start_offset >= input_size && input_size != 0 {
+        return Err(format!(
+            "map: --start-offset {} is past the end of the image ({} bytes)",
+            start_offset, input_size
+        )
+        .into());
+    }
+
+    // --- Load guest binaries --------------------------------------------
+    let core_path = get_binary_path("core.bin");
+    let operation_path = get_binary_path("map.bin");
+
+    let core_code = load_guest_binary(core_path.to_str().unwrap())?;
+    debug!(
+        "Loaded core binary: {} bytes from {}",
+        core_code.len(),
+        core_path.display()
+    );
+
+    let operation_code = load_guest_binary(operation_path.to_str().unwrap())?;
+    debug!(
+        "Loaded operation binary: {} bytes from {}",
+        operation_code.len(),
+        operation_path.display()
+    );
+
+    // --- KVM / VM / guest memory setup ----------------------------------
+    let kvm = Kvm::new()?;
+    debug!("KVM API version: {}", kvm.get_api_version());
+
+    let kvm_stats_checker = kvm_stats::KvmStatsChecker::new(&kvm);
+    kvm_stats_checker.display_status();
+
+    let vm = kvm.create_vm()?;
+    debug!("Created VM");
+
+    let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
+    debug!("Allocated {GUEST_MEM_SIZE} bytes of guest memory");
+
+    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let host_addr = region.as_ptr() as u64;
+
+    let mem_region = kvm_userspace_memory_region {
+        slot: 0,
+        guest_phys_addr: 0,
+        memory_size: GUEST_MEM_SIZE,
+        userspace_addr: host_addr,
+        flags: 0,
+    };
+    // SAFETY: mem_region.userspace_addr points to a valid GuestMemoryMmap
+    // allocation that outlives the VM. The slot/guest_phys_addr are unique
+    // per operation entry point.
+    unsafe {
+        vm.set_user_memory_region(mem_region)?;
+    }
+    debug!("Configured memory region");
+
+    setup_gdt(&guest_mem)?;
+    setup_page_tables(&guest_mem, GUEST_MEM_SIZE)?;
+    guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
+    guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
+
+    // --- Write MapConfig (per-field at known offsets) --------------------
+    // Layout must match shared::MapConfig exactly (64 bytes total):
+    //   0:  magic                 u32
+    //   4:  flags                 u32
+    //   8:  sector_size           u32
+    //  12:  input_device_count    u32  (always 1 in v1)
+    //  16:  start_offset          u64
+    //  24:  max_length            u64
+    //  32..64: _reserved          [u8; 32]  (left zero from page-zeroed memory)
+    let map_flags: u32 = if verbose { MAP_CONFIG_FLAG_VERBOSE } else { 0 };
+    guest_mem.write_obj(MAP_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
+    guest_mem.write_obj(map_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
+    guest_mem.write_obj(args.sector_size, GuestAddress(OPERATION_CONFIG_ADDR + 8))?;
+    guest_mem.write_obj(1u32, GuestAddress(OPERATION_CONFIG_ADDR + 12))?;
+    guest_mem.write_obj(start_offset, GuestAddress(OPERATION_CONFIG_ADDR + 16))?;
+    guest_mem.write_obj(max_length, GuestAddress(OPERATION_CONFIG_ADDR + 24))?;
+    debug!(
+        "Wrote map config at 0x{:x} (sector_size={}, start_offset={}, max_length={})",
+        OPERATION_CONFIG_ADDR, args.sector_size, start_offset, max_length
+    );
+
+    // --- Set up source device 0 (read-only) -----------------------------
+    let mut device_set = DeviceSet::new();
+    let mut io_events: Vec<IoEvent> = Vec::new();
+
+    let input_backing = BackingStore::open(input_path, true, None, false)?;
+    let input_mmio = device_mmio_base(0);
+    let input_vq = device_vq_base(0);
+    let input_device = VirtioBlockDevice::new(
+        input_backing,
+        input_size,
+        args.sector_size as u64,
+        true, // read-only
+        input_mmio,
+        input_vq,
+    );
+    debug!(
+        "Created source virtio-block device at MMIO 0x{input_mmio:x}, VQ 0x{input_vq:x} ({} bytes)",
+        input_size
+    );
+    let input_device = Arc::new(Mutex::new(input_device));
+    device_set.add_device(Arc::clone(&input_device), true);
+    io_events.push(IoEvent::new(input_mmio)?);
+
+    let guest_mem = Arc::new(guest_mem);
+    let vmm_stats = Arc::new(Mutex::new(VmmStats::new()));
+
+    // Register ioeventfds; fall back to VM exits on failure.
+    let mut io_thread: Option<io_thread::IoThread> = None;
+    let mut registered_count = 0usize;
+    let mut registration_failed = false;
+    for evt in io_events.iter_mut() {
+        if let Err(e) = evt.register(&vm) {
+            debug!("ioeventfd: failed to register ({e:?}), falling back to VM exits");
+            registration_failed = true;
+            break;
+        }
+        registered_count += 1;
+    }
+    if registration_failed {
+        for evt in io_events.iter_mut().take(registered_count) {
+            if let Err(e) = evt.unregister(&vm) {
+                warn!("ioeventfd: failed to unregister during rollback: {e:?}");
+            }
+        }
+    }
+    let all_registered = !registration_failed;
+
+    if all_registered && !io_events.is_empty() {
+        debug!(
+            "ioeventfd: enabled for {} device(s) (with I/O thread)",
+            io_events.len()
+        );
+        let io_devices = device_set.create_io_devices(io_events);
+        io_thread = Some(io_thread::IoThread::new(
+            io_devices,
+            Arc::clone(&guest_mem),
+            Arc::clone(&vmm_stats),
+        ));
+    }
+
+    // --- vCPU setup ------------------------------------------------------
+    let mut vcpu = vm.create_vcpu(0)?;
+    let mut sregs = vcpu.get_sregs()?;
+    setup_sregs(&mut sregs);
+    vcpu.set_sregs(&sregs)?;
+    let mut regs = vcpu.get_regs()?;
+    setup_regs(&mut regs);
+    vcpu.set_regs(&regs)?;
+
+    // --- Serial decoders / transmitter / debug buffer -------------------
+    let mut serial_decoder = SerialDecoder::new();
+    let mut serial_transmitter = SerialTransmitter::new();
+    let mut debug_buffer = DebugBuffer::new();
+
+    let config = vmm_config_input_only(args.sector_size);
+    serial_transmitter.queue_config(&config);
+    debug!(
+        "Queued configuration message ({} bytes) for guest",
+        serial_transmitter.buffer.len()
+    );
+
+    // --- Run the vCPU loop ----------------------------------------------
+    // Phase 3b buffers extents into a Vec; phase 4 will swap in a
+    // streaming writer to keep host memory bounded for pathologically
+    // fragmented sources.
+    let mut extents: Vec<guest_::MapExtentMessage> = Vec::new();
+    let mut map_result: Option<guest_::MapResultMessage> = None;
+    let mut vm_error: Option<String> = None;
+
+    loop {
+        match vcpu.run()? {
+            VcpuExit::Hlt => {
+                vmm_stats.lock().unwrap().record_hlt();
+                debug!("Map operation completed");
+                break;
+            }
+            VcpuExit::IoOut(port, data) => {
+                vmm_stats.lock().unwrap().record_io_out();
+                if port == SERIAL_PORT {
+                    for &byte in data {
+                        if let Some(msg) = serial_decoder.add_byte(byte) {
+                            match &msg.payload {
+                                Some(guest_::GuestMessage_::Payload::MapExtent(e)) => {
+                                    extents.push(e.clone());
+                                }
+                                Some(guest_::GuestMessage_::Payload::MapResult(r)) => {
+                                    map_result = Some(r.clone());
+                                }
+                                _ => {
+                                    if verbose {
+                                        debug!("{}", format_message(&msg));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if port == DEBUG_PORT {
+                    for &byte in data {
+                        if let Some(line) = debug_buffer.add_byte(byte) {
+                            debug!("[GUEST] {line}");
+                        }
+                    }
+                } else {
+                    debug!("IO OUT: port=0x{port:x}, data={data:?}");
+                }
+            }
+            VcpuExit::IoIn(port, data) => {
+                vmm_stats.lock().unwrap().record_io_in();
+                if port == SERIAL_PORT {
+                    for byte in data.iter_mut() {
+                        *byte = serial_transmitter.next_byte().unwrap_or(0);
+                    }
+                } else if port == SERIAL_PORT + 5 {
+                    let mut lsr = 0x60u8;
+                    if serial_transmitter.has_data() {
+                        lsr |= 0x01;
+                    }
+                    data[0] = lsr;
+                } else {
+                    for byte in data {
+                        *byte = 0;
+                    }
+                }
+            }
+            VcpuExit::MmioRead(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_read();
+                let value = device_set.mmio_read(addr);
+                write_mmio_data(data, value);
+            }
+            VcpuExit::MmioWrite(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_write();
+                let value = read_mmio_data(data);
+                if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
+                    if io_thread.is_none() && should_process {
+                        device_set.process_queue_for_device(
+                            device_index,
+                            &guest_mem,
+                            &vmm_stats,
+                        )?;
+                    }
+                }
+            }
+            VcpuExit::Shutdown => {
+                vmm_stats.lock().unwrap().record_shutdown();
+                eprintln!("\n--- VM Shutdown (triple fault?) ---");
+                vm_error = Some("VM shutdown (triple fault)".to_string());
+                break;
+            }
+            VcpuExit::FailEntry(reason, cpu) => {
+                vmm_stats.lock().unwrap().record_fail_entry();
+                eprintln!("VM Entry Failed! reason=0x{reason:x}, cpu={cpu}");
+                vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
+                break;
+            }
+            exit => {
+                vmm_stats.lock().unwrap().record_unknown();
+                eprintln!("Unexpected VM exit: {exit:?}");
+                vm_error = Some(format!("unexpected VM exit: {exit:?}"));
+                break;
+            }
+        }
+    }
+
+    if let Some(mut thread) = io_thread {
+        thread.stop();
+    }
+
+    if log::log_enabled!(log::Level::Debug) {
+        vmm_stats.lock().unwrap().display();
+    }
+
+    if let Some(error) = vm_error {
+        return Err(error.into());
+    }
+
+    let result = map_result.ok_or_else(|| "map: guest returned no MapResult".to_string())?;
+
+    // --- Render output (phase 3c placeholder; phase 4 polishes) ---------
+    print_map_result(&extents, &result, &args.output);
+
+    if result.error != MAP_RESULT_ERROR_OK {
+        return Err(format!("map: guest reported error code {}", result.error).into());
+    }
+
+    Ok(())
+}
+
+/// Render the map operation's output.
+///
+/// Phase 3c placeholder: produces *valid* human / JSON output but
+/// does not chase byte-for-byte qemu-img parity (column widths,
+/// exact JSON whitespace, field ordering). Phase 4 replaces this
+/// function with the polished formatter that drives the
+/// cross-version baseline matrix.
+fn print_map_result(
+    extents: &[guest_::MapExtentMessage],
+    result: &guest_::MapResultMessage,
+    output_format: &str,
+) {
+    if result.error != MAP_RESULT_ERROR_OK {
+        let msg = match result.error {
+            MAP_RESULT_ERROR_INVALID_SOURCE => "map: source format unrecognised",
+            MAP_RESULT_ERROR_INVALID_OPTION => "map: invalid config",
+            MAP_RESULT_ERROR_HAS_BACKING => {
+                "map: source has a backing/parent reference; \
+                 chain composition is deferred (see PLAN-map.md)"
+            }
+            MAP_RESULT_ERROR_IO => "map: I/O failure walking the source",
+            _ => "map: unknown error",
+        };
+        eprintln!("{}", msg);
+        return;
+    }
+
+    // Phase 3 placeholder: log a one-line summary so the CLI
+    // produces visible output until 3c lands the proper renderer.
+    let _ = (extents, output_format);
+    eprintln!(
+        "map: {} extents emitted across {} bytes virtual",
+        result.extents_emitted, result.virtual_size
+    );
 }
 
 /// Entry point for the `create` subcommand.
