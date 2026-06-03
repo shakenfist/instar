@@ -9698,12 +9698,23 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
     );
 
     // --- Run the vCPU loop ----------------------------------------------
-    // Phase 3b buffers extents into a Vec; phase 4 will swap in a
-    // streaming writer to keep host memory bounded for pathologically
-    // fragmented sources.
-    let mut extents: Vec<guest_::MapExtentMessage> = Vec::new();
+    // Phase 4 streams each extent to stdout via MapRenderer as the
+    // guest sends it; host memory stays O(1) regardless of how
+    // fragmented the source is. The renderer's `begin()` writes the
+    // header / opening "[" before the first extent arrives, so a
+    // partial table on guest failure is the trade-off for keeping
+    // the streaming path clean (documented in docs/quirks.md).
+    let stdout = std::io::stdout();
+    let mut writer = std::io::BufWriter::new(stdout.lock());
+    let mut renderer = MapRenderer::new(&mut writer, &args.output, args.input.clone());
+    renderer.begin()?;
+
     let mut map_result: Option<guest_::MapResultMessage> = None;
     let mut vm_error: Option<String> = None;
+    // Set to `true` once stdout has closed (e.g. user piped into
+    // `head`). Subsequent extent emits become no-ops so we exit
+    // cleanly without spamming BrokenPipe errors.
+    let mut broken_pipe = false;
 
     loop {
         match vcpu.run()? {
@@ -9719,7 +9730,20 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
                         if let Some(msg) = serial_decoder.add_byte(byte) {
                             match &msg.payload {
                                 Some(guest_::GuestMessage_::Payload::MapExtent(e)) => {
-                                    extents.push(e.clone());
+                                    if !broken_pipe {
+                                        match renderer.emit_extent(e) {
+                                            Ok(()) => {}
+                                            Err(err)
+                                                if err.kind() == std::io::ErrorKind::BrokenPipe =>
+                                            {
+                                                // Downstream consumer closed
+                                                // (head, less etc.). Stop
+                                                // emitting; exit cleanly.
+                                                broken_pipe = true;
+                                            }
+                                            Err(err) => return Err(err.into()),
+                                        }
+                                    }
                                 }
                                 Some(guest_::GuestMessage_::Payload::MapResult(r)) => {
                                     map_result = Some(r.clone());
@@ -9811,14 +9835,27 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
         return Err(error.into());
     }
 
+    // BrokenPipe short-circuit: the downstream consumer closed
+    // before the guest finished. Skip the renderer's finish() (the
+    // closing "]" would just fail again) and exit Ok so the
+    // process status mirrors coreutils' behaviour for piped output.
+    if broken_pipe {
+        return Ok(());
+    }
+
     let result = map_result.ok_or_else(|| "map: guest returned no MapResult".to_string())?;
 
-    // --- Render output (phase 3c placeholder; phase 4 polishes) ---------
-    print_map_result(&extents, &result, &args.output);
-
-    if result.error != MAP_RESULT_ERROR_OK {
+    // Render: success path closes the streaming output via
+    // renderer.finish(); error path writes a clear stderr message
+    // and leaves any partial output in place.
+    if let Some(msg) = map_error_message(result.error) {
+        eprintln!("{}", msg);
         return Err(format!("map: guest reported error code {}", result.error).into());
     }
+    renderer.finish()?;
+    // Drop the BufWriter so its destructor flushes to stdout.
+    drop(renderer);
+    drop(writer);
 
     Ok(())
 }
@@ -9842,60 +9879,6 @@ fn map_state_triple(state: &str) -> (bool, bool, bool, bool) {
     }
 }
 
-/// Format the human-readable map output as a single `String`.
-///
-/// Phase 3c placeholder: tab-separated columns with a header row;
-/// phase 4 replaces this with the qemu-img-compatible fixed-width
-/// column layout that the cross-version baselines pin.
-fn format_map_human(extents: &[guest_::MapExtentMessage]) -> String {
-    let mut out = String::new();
-    out.push_str("Offset\tLength\tMapped to\tFile\n");
-    for e in extents {
-        let (_present, _zero, data, _emit_offset) = map_state_triple(&e.state);
-        if data {
-            out.push_str(&format!(
-                "{:#x}\t{:#x}\t{:#x}\t\n",
-                e.start, e.length, e.file_offset
-            ));
-        } else {
-            out.push_str(&format!("{:#x}\t{:#x}\t\t\n", e.start, e.length));
-        }
-    }
-    out
-}
-
-/// Format the JSON map output as a single `String`.
-///
-/// Phase 3c placeholder: a JSON array with one object per extent.
-/// The object field order is `start, length, depth, present, zero,
-/// data, offset` to match qemu-img map. `offset` is omitted when
-/// the extent is unallocated (not "data" state). Phase 4 swaps in
-/// a streaming writer driven directly from the vCPU loop.
-fn format_map_json(extents: &[guest_::MapExtentMessage]) -> String {
-    let mut out = String::from("[");
-    for (i, e) in extents.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        let (present, zero, data, emit_offset) = map_state_triple(&e.state);
-        if emit_offset {
-            out.push_str(&format!(
-                "{{ \"start\": {}, \"length\": {}, \"depth\": 0, \
-                 \"present\": {}, \"zero\": {}, \"data\": {}, \"offset\": {} }}",
-                e.start, e.length, present, zero, data, e.file_offset
-            ));
-        } else {
-            out.push_str(&format!(
-                "{{ \"start\": {}, \"length\": {}, \"depth\": 0, \
-                 \"present\": {}, \"zero\": {}, \"data\": {} }}",
-                e.start, e.length, present, zero, data
-            ));
-        }
-    }
-    out.push(']');
-    out
-}
-
 /// Resolve a `MapResult::error` code to a stderr-friendly message.
 /// Returns `None` for `ERROR_OK` (the caller renders the success
 /// path instead).
@@ -9913,42 +9896,8 @@ fn map_error_message(error: u32) -> Option<&'static str> {
     }
 }
 
-/// Render the map operation's output.
-///
-/// Phase 3c placeholder: produces *valid* human / JSON output but
-/// does not chase byte-for-byte qemu-img parity (column widths,
-/// exact JSON whitespace, field ordering). Phase 4 replaces this
-/// function with the polished formatter that drives the
-/// cross-version baseline matrix.
-fn print_map_result(
-    extents: &[guest_::MapExtentMessage],
-    result: &guest_::MapResultMessage,
-    output_format: &str,
-) {
-    if let Some(msg) = map_error_message(result.error) {
-        eprintln!("{}", msg);
-        return;
-    }
-
-    if output_format == "json" {
-        // print! (no trailing newline) so the buffer matches the
-        // qemu-img-compatible shape that phase 4's streaming writer
-        // will produce; the JSON array is its own line-equivalent.
-        println!("{}", format_map_json(extents));
-    } else {
-        print!("{}", format_map_human(extents));
-    }
-}
-
 /// Output format selector for [`MapRenderer`].
-///
-/// The renderer is only invoked through `run_map`'s wiring (which
-/// lands in step 4b); until that step, the struct is exercised
-/// solely by `map_renderer_tests`. The `#[allow(dead_code)]`
-/// suppression on the enum + struct will be removed in 4b when
-/// `run_map` constructs a `MapRenderer` per invocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 enum MapOutputFormat {
     Human,
     Json,
@@ -9978,7 +9927,6 @@ enum MapOutputFormat {
 /// emitted (human mode skips holes / zero-allocated; the guest's
 /// `MapResultMessage::extents_emitted` is a different number used
 /// for the streaming-protocol audit).
-#[allow(dead_code)]
 struct MapRenderer<'a, W: std::io::Write> {
     writer: &'a mut W,
     output_format: MapOutputFormat,
@@ -9996,7 +9944,6 @@ struct MapRenderer<'a, W: std::io::Write> {
     extents_written: u64,
 }
 
-#[allow(dead_code)]
 impl<'a, W: std::io::Write> MapRenderer<'a, W> {
     fn new(writer: &'a mut W, output_format: &str, filename: String) -> Self {
         let fmt = match output_format {
@@ -10092,7 +10039,6 @@ impl<'a, W: std::io::Write> MapRenderer<'a, W> {
 /// human-mode column formatting: the first row of a freshly-
 /// allocated qcow2 emits `0` (not `0x0`) for the offset, and
 /// subsequent rows use `0x...`.
-#[allow(dead_code)]
 fn format_hex_or_zero(n: u64) -> String {
     if n == 0 {
         "0".to_string()
@@ -12189,106 +12135,9 @@ mod map_renderer_tests {
         assert_eq!(map_state_triple("future-state"), (true, false, true, true));
     }
 
-    // --- format_map_human -----------------------------------------------
-
-    #[test]
-    fn human_empty_extents_emits_header_only() {
-        let out = format_map_human(&[]);
-        assert_eq!(out, "Offset\tLength\tMapped to\tFile\n");
-    }
-
-    #[test]
-    fn human_single_data_extent_with_file_offset() {
-        let out = format_map_human(&[ext(0, 0x100000, "data", 0x50000)]);
-        let expected = "Offset\tLength\tMapped to\tFile\n0x0\t0x100000\t0x50000\t\n";
-        assert_eq!(out, expected);
-    }
-
-    #[test]
-    fn human_hole_omits_mapped_to_column() {
-        let out = format_map_human(&[ext(0x100000, 0x100000, "hole", 0)]);
-        let expected = "Offset\tLength\tMapped to\tFile\n0x100000\t0x100000\t\t\n";
-        assert_eq!(out, expected);
-    }
-
-    #[test]
-    fn human_mixed_extents() {
-        let out = format_map_human(&[
-            ext(0, 0x100000, "data", 0x50000),
-            ext(0x100000, 0x100000, "hole", 0),
-            ext(0x200000, 0x100000, "zero", 0),
-        ]);
-        let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 4); // header + 3 extents
-        assert_eq!(lines[0], "Offset\tLength\tMapped to\tFile");
-        assert_eq!(lines[1], "0x0\t0x100000\t0x50000\t");
-        assert_eq!(lines[2], "0x100000\t0x100000\t\t");
-        // zero state has no mapped-to: present=true, but data=false
-        // -> no offset emitted.
-        assert_eq!(lines[3], "0x200000\t0x100000\t\t");
-    }
-
-    // --- format_map_json ------------------------------------------------
-
-    #[test]
-    fn json_empty_extents_is_empty_array() {
-        assert_eq!(format_map_json(&[]), "[]");
-    }
-
-    #[test]
-    fn json_single_data_extent_includes_offset() {
-        let out = format_map_json(&[ext(0, 4096, "data", 65536)]);
-        assert_eq!(
-            out,
-            "[{ \"start\": 0, \"length\": 4096, \"depth\": 0, \
-             \"present\": true, \"zero\": false, \"data\": true, \"offset\": 65536 }]"
-        );
-    }
-
-    #[test]
-    fn json_hole_omits_offset_field() {
-        let out = format_map_json(&[ext(0, 4096, "hole", 999)]);
-        assert!(
-            !out.contains("\"offset\""),
-            "Hole extents must omit the offset field; got: {}",
-            out
-        );
-        assert!(out.contains("\"present\": false"));
-        assert!(out.contains("\"zero\": true"));
-        assert!(out.contains("\"data\": false"));
-    }
-
-    #[test]
-    fn json_zero_state_is_present_but_not_data_and_omits_offset() {
-        let out = format_map_json(&[ext(0, 4096, "zero", 999)]);
-        assert!(!out.contains("\"offset\""));
-        assert!(out.contains("\"present\": true"));
-        assert!(out.contains("\"zero\": true"));
-        assert!(out.contains("\"data\": false"));
-    }
-
-    #[test]
-    fn json_multiple_extents_comma_separated() {
-        let out = format_map_json(&[ext(0, 4096, "data", 0), ext(4096, 4096, "hole", 0)]);
-        // Two objects, comma-separated, wrapped in []. The
-        // structural shape matters here; phase 4 will pin the
-        // exact whitespace.
-        assert!(out.starts_with('['));
-        assert!(out.ends_with(']'));
-        let comma_count = out.matches('}').count();
-        assert_eq!(comma_count, 2, "two extents -> two closing braces");
-        // Internal comma between the two objects.
-        assert!(out.contains("},{"));
-    }
-
-    #[test]
-    fn json_large_file_offset_is_preserved() {
-        // u64 values near 1 TiB must round-trip cleanly through
-        // the {} formatter; no hex / scientific notation.
-        let big = 1u64 << 40; // 1 TiB
-        let out = format_map_json(&[ext(0, 4096, "data", big)]);
-        assert!(out.contains(&format!("\"offset\": {}", big)));
-    }
+    // The phase 3c format_map_human / format_map_json tests were
+    // removed in step 4b; their byte-exact replacements live in
+    // the "Phase 4: MapRenderer byte-exact tests" section below.
 
     // --- map_error_message ----------------------------------------------
 
