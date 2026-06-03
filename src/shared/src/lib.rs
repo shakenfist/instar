@@ -524,6 +524,156 @@ impl AllocationSummary {
     }
 }
 
+/// Allocation state of a virtual-address range in a source image,
+/// emitted by the per-format `map_extents` walkers.
+///
+/// Mirrors the qemu-img map output classification minus the
+/// backing-chain `depth` / `filename` fields, which the host
+/// emits and the parser does not know. Single-image v1 only;
+/// chain composition is deferred (see PLAN-map.md).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapExtentState {
+    /// Region holds data and is backed by the source file at
+    /// `file_offset`. Compressed qcow2 clusters count as Data;
+    /// `file_offset` is the start of the (possibly compressed)
+    /// on-disk bytes.
+    Data { file_offset: u64 },
+    /// Region reads as zero and is explicitly recorded as zero
+    /// in the metadata (qcow2 ZERO_PLAIN / ZERO_ALLOC, vmdk
+    /// grain marker `0xFFFFFFFE`, vhdx PAYLOAD_BLOCK_ZERO).
+    ZeroAllocated,
+    /// Region is unallocated — reads as zero but is not present
+    /// in the source file (the qemu-img `present=false` case).
+    Hole,
+}
+
+/// One contiguous extent of the source's virtual address space
+/// with a single allocation state.
+///
+/// `length` is never zero — zero-length extents are dropped at
+/// the coalescer. `start + length` must not overflow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapExtent {
+    /// Virtual offset of the extent's first byte, in bytes from
+    /// the start of the source image.
+    pub start: u64,
+    /// Extent length in bytes.
+    pub length: u64,
+    /// Allocation state.
+    pub state: MapExtentState,
+}
+
+/// Sink that swallows per-cluster `MapExtent`s and forwards
+/// coalesced runs to an underlying emitter.
+///
+/// Usage: parser builds one wrapping the user's
+/// `&mut FnMut(MapExtent) -> bool`, calls `push(extent)` for
+/// each cluster/grain/block, and calls `finish()` at the end
+/// to flush any trailing pending extent.
+///
+/// Both `push` and `finish` return `false` if the underlying
+/// emitter returned `false` — the caller must stop walking
+/// when it sees that.
+///
+/// Two adjacent extents merge when:
+/// - Their virtual ranges are contiguous (`a.start + a.length
+///   == b.start`).
+/// - Their states match. For `Data` that requires the file
+///   offsets to be contiguous too:
+///   `a.state.file_offset + a.length == b.state.file_offset`.
+///   For `ZeroAllocated` and `Hole`, state equality is enough.
+///
+/// Zero-length pushes are silently dropped (no merge, no
+/// emit). Pushes whose virtual range would overflow are
+/// silently dropped — the walker is responsible for clamping
+/// inputs to valid ranges.
+pub struct MapExtentCoalescer<'a, F: FnMut(MapExtent) -> bool> {
+    pending: Option<MapExtent>,
+    emit: &'a mut F,
+    aborted: bool,
+}
+
+impl<'a, F: FnMut(MapExtent) -> bool> MapExtentCoalescer<'a, F> {
+    pub fn new(emit: &'a mut F) -> Self {
+        Self {
+            pending: None,
+            emit,
+            aborted: false,
+        }
+    }
+
+    /// Push one extent. Returns `false` if the underlying
+    /// emitter has signalled abort (either on this push or any
+    /// previous push). The caller must stop walking.
+    pub fn push(&mut self, ext: MapExtent) -> bool {
+        if self.aborted {
+            return false;
+        }
+        if ext.length == 0 {
+            return true;
+        }
+        if ext.start.checked_add(ext.length).is_none() {
+            return true;
+        }
+
+        match self.pending {
+            None => {
+                self.pending = Some(ext);
+                true
+            }
+            Some(prev) => {
+                if extents_mergeable(&prev, &ext) {
+                    self.pending = Some(MapExtent {
+                        start: prev.start,
+                        length: prev.length + ext.length,
+                        state: prev.state,
+                    });
+                    true
+                } else {
+                    let cont = (self.emit)(prev);
+                    if !cont {
+                        self.aborted = true;
+                        self.pending = None;
+                        return false;
+                    }
+                    self.pending = Some(ext);
+                    true
+                }
+            }
+        }
+    }
+
+    /// Flush any pending extent. Returns `false` if the
+    /// emitter signalled abort during the flush (or earlier).
+    pub fn finish(self) -> bool {
+        if self.aborted {
+            return false;
+        }
+        if let Some(prev) = self.pending {
+            return (self.emit)(prev);
+        }
+        true
+    }
+}
+
+fn extents_mergeable(a: &MapExtent, b: &MapExtent) -> bool {
+    let Some(a_end) = a.start.checked_add(a.length) else {
+        return false;
+    };
+    if a_end != b.start {
+        return false;
+    }
+    match (a.state, b.state) {
+        (MapExtentState::Hole, MapExtentState::Hole) => true,
+        (MapExtentState::ZeroAllocated, MapExtentState::ZeroAllocated) => true,
+        (
+            MapExtentState::Data { file_offset: a_off },
+            MapExtentState::Data { file_offset: b_off },
+        ) => a_off.checked_add(a.length) == Some(b_off),
+        _ => false,
+    }
+}
+
 /// Result from get_operation_config (FFI-safe alternative to tuple)
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -3669,5 +3819,200 @@ mod tests {
         assert!(r.is_valid());
         r.magic = 0;
         assert!(!r.is_valid());
+    }
+
+    // ------------------------------------------------------------------
+    // MapExtentCoalescer tests
+    // ------------------------------------------------------------------
+
+    fn data(start: u64, length: u64, file_offset: u64) -> MapExtent {
+        MapExtent {
+            start,
+            length,
+            state: MapExtentState::Data { file_offset },
+        }
+    }
+
+    fn hole(start: u64, length: u64) -> MapExtent {
+        MapExtent {
+            start,
+            length,
+            state: MapExtentState::Hole,
+        }
+    }
+
+    fn zero_alloc(start: u64, length: u64) -> MapExtent {
+        MapExtent {
+            start,
+            length,
+            state: MapExtentState::ZeroAllocated,
+        }
+    }
+
+    /// Small fixed-size emitter that records each emitted extent
+    /// into a stack-allocated buffer. Avoids requiring `alloc`
+    /// in tests so the shared crate's no_std test build stays
+    /// dependency-free.
+    struct Recorder {
+        buf: [MapExtent; 8],
+        len: usize,
+    }
+
+    impl Recorder {
+        fn new() -> Self {
+            Self {
+                buf: [hole(0, 0); 8],
+                len: 0,
+            }
+        }
+
+        fn record(&mut self, e: MapExtent) {
+            assert!(self.len < self.buf.len(), "recorder overflow");
+            self.buf[self.len] = e;
+            self.len += 1;
+        }
+
+        fn slice(&self) -> &[MapExtent] {
+            &self.buf[..self.len]
+        }
+    }
+
+    /// Drive the coalescer with `pushes`, asserting no abort, and
+    /// return the recorder's contents.
+    fn collect(pushes: &[MapExtent]) -> Recorder {
+        let mut rec = Recorder::new();
+        let mut emit = |e: MapExtent| -> bool {
+            rec.record(e);
+            true
+        };
+        {
+            let mut c = MapExtentCoalescer::new(&mut emit);
+            for p in pushes {
+                let cont = c.push(*p);
+                assert!(cont, "coalescer aborted unexpectedly");
+            }
+            assert!(c.finish());
+        }
+        rec
+    }
+
+    #[test]
+    fn coalescer_empty_emits_nothing() {
+        let r = collect(&[]);
+        assert_eq!(r.slice(), &[] as &[MapExtent]);
+    }
+
+    #[test]
+    fn coalescer_single_data_passes_through() {
+        let r = collect(&[data(0, 4096, 0)]);
+        assert_eq!(r.slice(), &[data(0, 4096, 0)]);
+    }
+
+    #[test]
+    fn coalescer_two_contiguous_data_merge() {
+        let r = collect(&[data(0, 4096, 0), data(4096, 4096, 4096)]);
+        assert_eq!(r.slice(), &[data(0, 8192, 0)]);
+    }
+
+    #[test]
+    fn coalescer_two_data_with_noncontiguous_file_offset_split() {
+        // Same virtual contiguity, but file offsets jump — qemu-img
+        // splits these.
+        let r = collect(&[data(0, 4096, 0), data(4096, 4096, 8192)]);
+        assert_eq!(r.slice(), &[data(0, 4096, 0), data(4096, 4096, 8192)]);
+    }
+
+    #[test]
+    fn coalescer_two_holes_merge() {
+        let r = collect(&[hole(0, 4096), hole(4096, 4096)]);
+        assert_eq!(r.slice(), &[hole(0, 8192)]);
+    }
+
+    #[test]
+    fn coalescer_two_zero_alloc_merge() {
+        let r = collect(&[zero_alloc(0, 4096), zero_alloc(4096, 4096)]);
+        assert_eq!(r.slice(), &[zero_alloc(0, 8192)]);
+    }
+
+    #[test]
+    fn coalescer_hole_then_data_splits() {
+        let r = collect(&[hole(0, 4096), data(4096, 4096, 0)]);
+        assert_eq!(r.slice(), &[hole(0, 4096), data(4096, 4096, 0)]);
+    }
+
+    #[test]
+    fn coalescer_data_then_zero_alloc_splits() {
+        let r = collect(&[data(0, 4096, 0), zero_alloc(4096, 4096)]);
+        assert_eq!(r.slice(), &[data(0, 4096, 0), zero_alloc(4096, 4096)]);
+    }
+
+    #[test]
+    fn coalescer_virtual_gap_splits() {
+        // No virtual gap allowed even for matching state.
+        let r = collect(&[data(0, 4096, 0), data(8192, 4096, 8192)]);
+        assert_eq!(r.slice(), &[data(0, 4096, 0), data(8192, 4096, 8192)]);
+    }
+
+    #[test]
+    fn coalescer_zero_length_push_dropped() {
+        let r = collect(&[
+            data(0, 4096, 0),
+            data(4096, 0, 4096),
+            data(4096, 4096, 4096),
+        ]);
+        assert_eq!(r.slice(), &[data(0, 8192, 0)]);
+    }
+
+    #[test]
+    fn coalescer_abort_on_first_emit_stops_iteration() {
+        let mut rec = Recorder::new();
+        let mut emit = |e: MapExtent| -> bool {
+            rec.record(e);
+            false
+        };
+        {
+            let mut c = MapExtentCoalescer::new(&mut emit);
+            // First push fills pending — no emit yet.
+            assert!(c.push(data(0, 4096, 0)));
+            // Second push flushes pending; emitter returns false.
+            assert!(!c.push(hole(4096, 4096)));
+            // Subsequent pushes are dropped.
+            assert!(!c.push(data(8192, 4096, 0)));
+            assert!(!c.finish());
+        }
+        // Only the first (flushed) extent was emitted.
+        assert_eq!(rec.slice(), &[data(0, 4096, 0)]);
+    }
+
+    #[test]
+    fn coalescer_abort_on_finish_flush() {
+        let mut emit = |_: MapExtent| -> bool { false };
+        {
+            let mut c = MapExtentCoalescer::new(&mut emit);
+            assert!(c.push(data(0, 4096, 0)));
+            // finish() flushes pending; emitter returns false.
+            assert!(!c.finish());
+        }
+    }
+
+    #[test]
+    fn coalescer_overflow_push_dropped() {
+        // start + length overflows u64 — silently dropped.
+        let r = collect(&[
+            data(0, 4096, 0),
+            data(u64::MAX, 1, 0), // start + length overflows by 1
+        ]);
+        assert_eq!(r.slice(), &[data(0, 4096, 0)]);
+    }
+
+    #[test]
+    fn coalescer_data_file_offset_overflow_does_not_merge() {
+        // a_end virtual is fine, but a.file_offset + a.length overflows;
+        // mergeable returns false rather than panicking.
+        let r = collect(&[data(0, 4096, u64::MAX - 1000), data(4096, 4096, 0)]);
+        assert_eq!(
+            r.slice(),
+            &[data(0, 4096, u64::MAX - 1000), data(4096, 4096, 0)]
+        );
     }
 }
