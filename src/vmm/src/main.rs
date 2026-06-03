@@ -9823,6 +9823,96 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+/// Translate a guest-side state code (the string sent in
+/// `MapExtentMessage::state`) to the (present, zero, data,
+/// emit_offset) tuple used by qemu-img map's JSON output.
+///
+/// "hole" → unallocated, reads as zero, no backing data.
+/// "zero" → explicit zero record in metadata, no backing data.
+/// "data" → present, contains data, emit `offset` in JSON.
+fn map_state_triple(state: &str) -> (bool, bool, bool, bool) {
+    match state {
+        "hole" => (false, true, false, false),
+        "zero" => (true, true, false, false),
+        "data" => (true, false, true, true),
+        // Defensive fallback for an unknown state code (the guest
+        // emits only the three above). Treat as data so the offset
+        // is preserved for debugging.
+        _ => (true, false, true, true),
+    }
+}
+
+/// Format the human-readable map output as a single `String`.
+///
+/// Phase 3c placeholder: tab-separated columns with a header row;
+/// phase 4 replaces this with the qemu-img-compatible fixed-width
+/// column layout that the cross-version baselines pin.
+fn format_map_human(extents: &[guest_::MapExtentMessage]) -> String {
+    let mut out = String::new();
+    out.push_str("Offset\tLength\tMapped to\tFile\n");
+    for e in extents {
+        let (_present, _zero, data, _emit_offset) = map_state_triple(&e.state);
+        if data {
+            out.push_str(&format!(
+                "{:#x}\t{:#x}\t{:#x}\t\n",
+                e.start, e.length, e.file_offset
+            ));
+        } else {
+            out.push_str(&format!("{:#x}\t{:#x}\t\t\n", e.start, e.length));
+        }
+    }
+    out
+}
+
+/// Format the JSON map output as a single `String`.
+///
+/// Phase 3c placeholder: a JSON array with one object per extent.
+/// The object field order is `start, length, depth, present, zero,
+/// data, offset` to match qemu-img map. `offset` is omitted when
+/// the extent is unallocated (not "data" state). Phase 4 swaps in
+/// a streaming writer driven directly from the vCPU loop.
+fn format_map_json(extents: &[guest_::MapExtentMessage]) -> String {
+    let mut out = String::from("[");
+    for (i, e) in extents.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let (present, zero, data, emit_offset) = map_state_triple(&e.state);
+        if emit_offset {
+            out.push_str(&format!(
+                "{{ \"start\": {}, \"length\": {}, \"depth\": 0, \
+                 \"present\": {}, \"zero\": {}, \"data\": {}, \"offset\": {} }}",
+                e.start, e.length, present, zero, data, e.file_offset
+            ));
+        } else {
+            out.push_str(&format!(
+                "{{ \"start\": {}, \"length\": {}, \"depth\": 0, \
+                 \"present\": {}, \"zero\": {}, \"data\": {} }}",
+                e.start, e.length, present, zero, data
+            ));
+        }
+    }
+    out.push(']');
+    out
+}
+
+/// Resolve a `MapResult::error` code to a stderr-friendly message.
+/// Returns `None` for `ERROR_OK` (the caller renders the success
+/// path instead).
+fn map_error_message(error: u32) -> Option<&'static str> {
+    match error {
+        MAP_RESULT_ERROR_OK => None,
+        MAP_RESULT_ERROR_INVALID_SOURCE => Some("map: source format unrecognised"),
+        MAP_RESULT_ERROR_INVALID_OPTION => Some("map: invalid config"),
+        MAP_RESULT_ERROR_HAS_BACKING => Some(
+            "map: source has a backing/parent reference; \
+             chain composition is deferred (see PLAN-map.md)",
+        ),
+        MAP_RESULT_ERROR_IO => Some("map: I/O failure walking the source"),
+        _ => Some("map: unknown error"),
+    }
+}
+
 /// Render the map operation's output.
 ///
 /// Phase 3c placeholder: produces *valid* human / JSON output but
@@ -9835,28 +9925,19 @@ fn print_map_result(
     result: &guest_::MapResultMessage,
     output_format: &str,
 ) {
-    if result.error != MAP_RESULT_ERROR_OK {
-        let msg = match result.error {
-            MAP_RESULT_ERROR_INVALID_SOURCE => "map: source format unrecognised",
-            MAP_RESULT_ERROR_INVALID_OPTION => "map: invalid config",
-            MAP_RESULT_ERROR_HAS_BACKING => {
-                "map: source has a backing/parent reference; \
-                 chain composition is deferred (see PLAN-map.md)"
-            }
-            MAP_RESULT_ERROR_IO => "map: I/O failure walking the source",
-            _ => "map: unknown error",
-        };
+    if let Some(msg) = map_error_message(result.error) {
         eprintln!("{}", msg);
         return;
     }
 
-    // Phase 3 placeholder: log a one-line summary so the CLI
-    // produces visible output until 3c lands the proper renderer.
-    let _ = (extents, output_format);
-    eprintln!(
-        "map: {} extents emitted across {} bytes virtual",
-        result.extents_emitted, result.virtual_size
-    );
+    if output_format == "json" {
+        // print! (no trailing newline) so the buffer matches the
+        // qemu-img-compatible shape that phase 4's streaming writer
+        // will produce; the JSON array is its own line-equivalent.
+        println!("{}", format_map_json(extents));
+    } else {
+        print!("{}", format_map_human(extents));
+    }
 }
 
 /// Entry point for the `create` subcommand.
@@ -11898,5 +11979,203 @@ mod preallocation_tests {
         });
         assert!(result.is_ok());
         assert!(!called.get(), "zero-length call must short-circuit");
+    }
+}
+
+#[cfg(test)]
+mod map_renderer_tests {
+    //! Tests for the phase 3c placeholder map renderer
+    //! (format_map_human, format_map_json, map_state_triple,
+    //! map_error_message). Phase 4 will replace these with
+    //! byte-for-byte qemu-img-compatible formatters; until then,
+    //! these tests pin the placeholder's structural invariants
+    //! (state-triple table, JSON field ordering, error-message
+    //! table) so phase 4 can refactor with confidence.
+    use super::*;
+
+    /// Build a `MapExtentMessage` by routing through the
+    /// public guest-protocol builder so the private `push_str`
+    /// helper stays encapsulated.
+    fn ext(start: u64, length: u64, state: &str, file_offset: u64) -> guest_::MapExtentMessage {
+        let msg = guest_protocol::map_extent_message(start, length, state, file_offset);
+        match msg.payload {
+            Some(guest_::GuestMessage_::Payload::MapExtent(e)) => e,
+            _ => panic!("map_extent_message must wrap a MapExtent payload"),
+        }
+    }
+
+    // --- map_state_triple -----------------------------------------------
+
+    #[test]
+    fn state_triple_hole() {
+        assert_eq!(map_state_triple("hole"), (false, true, false, false));
+    }
+
+    #[test]
+    fn state_triple_zero() {
+        assert_eq!(map_state_triple("zero"), (true, true, false, false));
+    }
+
+    #[test]
+    fn state_triple_data() {
+        assert_eq!(map_state_triple("data"), (true, false, true, true));
+    }
+
+    #[test]
+    fn state_triple_unknown_falls_back_to_data() {
+        // Defensive: an unknown state preserves the offset for
+        // debugging rather than dropping it.
+        assert_eq!(map_state_triple("future-state"), (true, false, true, true));
+    }
+
+    // --- format_map_human -----------------------------------------------
+
+    #[test]
+    fn human_empty_extents_emits_header_only() {
+        let out = format_map_human(&[]);
+        assert_eq!(out, "Offset\tLength\tMapped to\tFile\n");
+    }
+
+    #[test]
+    fn human_single_data_extent_with_file_offset() {
+        let out = format_map_human(&[ext(0, 0x100000, "data", 0x50000)]);
+        let expected = "Offset\tLength\tMapped to\tFile\n0x0\t0x100000\t0x50000\t\n";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn human_hole_omits_mapped_to_column() {
+        let out = format_map_human(&[ext(0x100000, 0x100000, "hole", 0)]);
+        let expected = "Offset\tLength\tMapped to\tFile\n0x100000\t0x100000\t\t\n";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn human_mixed_extents() {
+        let out = format_map_human(&[
+            ext(0, 0x100000, "data", 0x50000),
+            ext(0x100000, 0x100000, "hole", 0),
+            ext(0x200000, 0x100000, "zero", 0),
+        ]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 4); // header + 3 extents
+        assert_eq!(lines[0], "Offset\tLength\tMapped to\tFile");
+        assert_eq!(lines[1], "0x0\t0x100000\t0x50000\t");
+        assert_eq!(lines[2], "0x100000\t0x100000\t\t");
+        // zero state has no mapped-to: present=true, but data=false
+        // -> no offset emitted.
+        assert_eq!(lines[3], "0x200000\t0x100000\t\t");
+    }
+
+    // --- format_map_json ------------------------------------------------
+
+    #[test]
+    fn json_empty_extents_is_empty_array() {
+        assert_eq!(format_map_json(&[]), "[]");
+    }
+
+    #[test]
+    fn json_single_data_extent_includes_offset() {
+        let out = format_map_json(&[ext(0, 4096, "data", 65536)]);
+        assert_eq!(
+            out,
+            "[{ \"start\": 0, \"length\": 4096, \"depth\": 0, \
+             \"present\": true, \"zero\": false, \"data\": true, \"offset\": 65536 }]"
+        );
+    }
+
+    #[test]
+    fn json_hole_omits_offset_field() {
+        let out = format_map_json(&[ext(0, 4096, "hole", 999)]);
+        assert!(
+            !out.contains("\"offset\""),
+            "Hole extents must omit the offset field; got: {}",
+            out
+        );
+        assert!(out.contains("\"present\": false"));
+        assert!(out.contains("\"zero\": true"));
+        assert!(out.contains("\"data\": false"));
+    }
+
+    #[test]
+    fn json_zero_state_is_present_but_not_data_and_omits_offset() {
+        let out = format_map_json(&[ext(0, 4096, "zero", 999)]);
+        assert!(!out.contains("\"offset\""));
+        assert!(out.contains("\"present\": true"));
+        assert!(out.contains("\"zero\": true"));
+        assert!(out.contains("\"data\": false"));
+    }
+
+    #[test]
+    fn json_multiple_extents_comma_separated() {
+        let out = format_map_json(&[ext(0, 4096, "data", 0), ext(4096, 4096, "hole", 0)]);
+        // Two objects, comma-separated, wrapped in []. The
+        // structural shape matters here; phase 4 will pin the
+        // exact whitespace.
+        assert!(out.starts_with('['));
+        assert!(out.ends_with(']'));
+        let comma_count = out.matches('}').count();
+        assert_eq!(comma_count, 2, "two extents -> two closing braces");
+        // Internal comma between the two objects.
+        assert!(out.contains("},{"));
+    }
+
+    #[test]
+    fn json_large_file_offset_is_preserved() {
+        // u64 values near 1 TiB must round-trip cleanly through
+        // the {} formatter; no hex / scientific notation.
+        let big = 1u64 << 40; // 1 TiB
+        let out = format_map_json(&[ext(0, 4096, "data", big)]);
+        assert!(out.contains(&format!("\"offset\": {}", big)));
+    }
+
+    // --- map_error_message ----------------------------------------------
+
+    #[test]
+    fn error_ok_returns_none() {
+        assert!(map_error_message(MAP_RESULT_ERROR_OK).is_none());
+    }
+
+    #[test]
+    fn error_codes_have_distinct_messages() {
+        let codes = [
+            MAP_RESULT_ERROR_INVALID_SOURCE,
+            MAP_RESULT_ERROR_INVALID_OPTION,
+            MAP_RESULT_ERROR_HAS_BACKING,
+            MAP_RESULT_ERROR_IO,
+        ];
+        let messages: Vec<&'static str> = codes
+            .iter()
+            .map(|c| map_error_message(*c).expect("known error must have message"))
+            .collect();
+        // Each message is non-empty and contains the "map: " prefix.
+        for m in &messages {
+            assert!(!m.is_empty());
+            assert!(m.starts_with("map: "), "missing prefix: {}", m);
+        }
+        // Messages must be mutually distinct so the user can tell
+        // which failure occurred.
+        for i in 0..messages.len() {
+            for j in (i + 1)..messages.len() {
+                assert_ne!(
+                    messages[i], messages[j],
+                    "error codes {} and {} share a message",
+                    codes[i], codes[j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn error_unknown_returns_generic_message() {
+        let msg = map_error_message(999).expect("unknown error returns Some");
+        assert!(msg.contains("unknown"));
+    }
+
+    #[test]
+    fn error_has_backing_mentions_chain_followup() {
+        let msg = map_error_message(MAP_RESULT_ERROR_HAS_BACKING)
+            .expect("has-backing error must have message");
+        assert!(msg.contains("chain") || msg.contains("PLAN-map"));
     }
 }
