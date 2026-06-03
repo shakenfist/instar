@@ -424,6 +424,24 @@ provides a modular architecture with:
   `src/fuzz/fuzz_targets/fuzz_resize_planners.rs` and
   `scripts/differential-fuzz.py`'s `op_resize`. The binary
   builds at ~73 KiB / 384 KiB.
+- **operations/map/** - Allocation-map operation. Reads a
+  `MapConfig` (sector_size, input_device_count, start_offset,
+  max_length window) from `OPERATION_CONFIG_ADDR`, detects the
+  source format on input device 0, refuses sources with chain
+  composition (qcow2 backing-file references, vhd differencing
+  disks; vhdx differencing is already rejected by
+  `VhdxState::init`; vmdk multi-extent layouts fail the
+  binary-header parse naturally), and dispatches to the matching
+  per-format `<Format>State::map_extents` walker from phase 1 of
+  PLAN-map. Streams one `MapExtentRecord` per coalesced extent
+  through the call table's `send_map_extent` function pointer,
+  followed by a `MapResult` summary through `send_map_result`.
+  The emit closure clips each extent against the configured
+  window (with file-offset adjustment for front-trimmed Data
+  extents) and signals walker abort once the window is
+  exhausted. Single-image v1; chain composition is a follow-up.
+  Binary builds at ~28 KiB / 384 KiB (7%). Host CLI lands in
+  phase 3 of PLAN-map.
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation,

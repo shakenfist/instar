@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`instar map` subcommand foundation (PLAN-map phases 1-2).**
+  Per-format extent walkers (`<Format>State::map_extents`) on
+  every parser crate (`raw`, `qcow2`, `vmdk`, `vhd`, `vhdx`)
+  emit coalesced `MapExtent` records via a callback / coalescer
+  pair in `shared`. The new `operations/map/map.bin` guest
+  binary reads a `MapConfig`, detects the source format,
+  refuses sources with chain composition (single-image v1),
+  dispatches to the matching walker, and streams one
+  `MapExtentRecord` per extent through the call table's new
+  `send_map_extent` function pointer, followed by a `MapResult`
+  summary through `send_map_result`. Window filtering
+  (`start_offset` / `max_length`) is applied in the emit
+  closure. Two new protobuf payloads (`MapExtentMessage` field
+  15, `MapResultMessage` field 16) land in the `GuestMessage`
+  oneof. The `CallTable::VERSION` bumps from 15 to 16 to add
+  the two new streaming function pointers (the streaming-emit
+  shape is new — every other operation sends exactly one
+  result message). Backing-chain composition, walker-side
+  window pruning, host CLI surface, output rendering,
+  cross-version baselines, integration tests, and fuzz are
+  follow-ups in PLAN-map phases 3-9. `map.bin` builds at
+  ~28 KiB / 384 KiB.
 - **New `instar rebase` subcommand.** Changes the backing-file
   pointer recorded in a qcow2 or vmdk overlay and, in safe mode,
   copies divergent clusters from the old backing chain into the
