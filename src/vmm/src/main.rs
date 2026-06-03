@@ -9940,6 +9940,167 @@ fn print_map_result(
     }
 }
 
+/// Output format selector for [`MapRenderer`].
+///
+/// The renderer is only invoked through `run_map`'s wiring (which
+/// lands in step 4b); until that step, the struct is exercised
+/// solely by `map_renderer_tests`. The `#[allow(dead_code)]`
+/// suppression on the enum + struct will be removed in 4b when
+/// `run_map` constructs a `MapRenderer` per invocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+enum MapOutputFormat {
+    Human,
+    Json,
+}
+
+/// Streaming renderer for `instar map` output.
+///
+/// Phase 4 replaces the phase 3c `Vec`-buffered renderer with a
+/// streaming writer that emits one extent at a time as the guest
+/// sends it. Host memory stays O(1) regardless of how fragmented
+/// the source is. Byte-for-byte output matches `qemu-img map`
+/// modulo the documented divergences (see `docs/quirks.md`).
+///
+/// Lifecycle:
+/// - [`MapRenderer::begin`] is called once before the first
+///   `emit_extent` to write the format-specific header / opening
+///   bracket.
+/// - [`MapRenderer::emit_extent`] is called once per
+///   `MapExtentMessage` arriving from the guest. Human mode emits
+///   a row only for `data: true` extents; JSON mode emits every
+///   extent.
+/// - [`MapRenderer::finish`] is called once after the guest's
+///   `MapResultMessage` arrives (and signals success) to write
+///   the closing bracket.
+///
+/// The renderer's `extents_written` counter tracks rows actually
+/// emitted (human mode skips holes / zero-allocated; the guest's
+/// `MapResultMessage::extents_emitted` is a different number used
+/// for the streaming-protocol audit).
+#[allow(dead_code)]
+struct MapRenderer<'a, W: std::io::Write> {
+    writer: &'a mut W,
+    output_format: MapOutputFormat,
+    /// The argv string the user passed for the source. Used
+    /// verbatim in the human-mode "File" column; qemu-img echoes
+    /// whatever was on the command line (relative paths stay
+    /// relative, etc.).
+    filename: String,
+    /// True until the first JSON object is emitted. Drives the
+    /// `,\n` inter-object separator.
+    first_extent_json: bool,
+    /// Count of rows / objects this renderer has actually written
+    /// (lower than the guest's `extents_emitted` in human mode
+    /// because holes are skipped).
+    extents_written: u64,
+}
+
+#[allow(dead_code)]
+impl<'a, W: std::io::Write> MapRenderer<'a, W> {
+    fn new(writer: &'a mut W, output_format: &str, filename: String) -> Self {
+        let fmt = match output_format {
+            "json" => MapOutputFormat::Json,
+            _ => MapOutputFormat::Human,
+        };
+        Self {
+            writer,
+            output_format: fmt,
+            filename,
+            first_extent_json: true,
+            extents_written: 0,
+        }
+    }
+
+    /// Write the format-specific header / opening bracket. Called
+    /// once before any `emit_extent`.
+    fn begin(&mut self) -> std::io::Result<()> {
+        match self.output_format {
+            MapOutputFormat::Human => writeln!(
+                self.writer,
+                "Offset          Length          Mapped to       File"
+            ),
+            MapOutputFormat::Json => write!(self.writer, "["),
+        }
+    }
+
+    /// Write one extent's representation. Human mode emits a row
+    /// only when `data: true`; JSON mode emits every extent with
+    /// the qemu-img-compatible field set.
+    fn emit_extent(&mut self, ext: &guest_::MapExtentMessage) -> std::io::Result<()> {
+        let (present, zero, data, has_offset) = map_state_triple(&ext.state);
+        match self.output_format {
+            MapOutputFormat::Human => {
+                if !data {
+                    // Holes and zero-allocated extents do not
+                    // produce visible rows (matches qemu-img).
+                    return Ok(());
+                }
+                let start_str = format_hex_or_zero(ext.start);
+                let length_str = format_hex_or_zero(ext.length);
+                let mapped_str = format_hex_or_zero(ext.file_offset);
+                writeln!(
+                    self.writer,
+                    "{:<16}{:<16}{:<16}{}",
+                    start_str, length_str, mapped_str, self.filename
+                )?;
+                self.extents_written += 1;
+                Ok(())
+            }
+            MapOutputFormat::Json => {
+                if !self.first_extent_json {
+                    writeln!(self.writer, ",")?;
+                }
+                self.first_extent_json = false;
+                if has_offset {
+                    write!(
+                        self.writer,
+                        "{{ \"start\": {}, \"length\": {}, \"depth\": 0, \
+                         \"present\": {}, \"zero\": {}, \"data\": {}, \
+                         \"compressed\": false, \"offset\": {}}}",
+                        ext.start, ext.length, present, zero, data, ext.file_offset
+                    )?;
+                } else {
+                    write!(
+                        self.writer,
+                        "{{ \"start\": {}, \"length\": {}, \"depth\": 0, \
+                         \"present\": {}, \"zero\": {}, \"data\": {}, \
+                         \"compressed\": false}}",
+                        ext.start, ext.length, present, zero, data
+                    )?;
+                }
+                self.extents_written += 1;
+                Ok(())
+            }
+        }
+    }
+
+    /// Write the format-specific closing bracket. Called once
+    /// after the last `emit_extent` and only on the success path
+    /// (on error, the caller writes a stderr message instead and
+    /// leaves the partial output in place).
+    fn finish(&mut self) -> std::io::Result<()> {
+        match self.output_format {
+            MapOutputFormat::Human => Ok(()),
+            MapOutputFormat::Json => write!(self.writer, "]"),
+        }
+    }
+}
+
+/// Format a `u64` as the literal string `"0"` for zero values,
+/// otherwise as lowercase `0x...` hex. Matches qemu-img map's
+/// human-mode column formatting: the first row of a freshly-
+/// allocated qcow2 emits `0` (not `0x0`) for the offset, and
+/// subsequent rows use `0x...`.
+#[allow(dead_code)]
+fn format_hex_or_zero(n: u64) -> String {
+    if n == 0 {
+        "0".to_string()
+    } else {
+        format!("{:#x}", n)
+    }
+}
+
 /// Entry point for the `create` subcommand.
 ///
 /// Phase 4 wires `-o KEY=VAL,...` parsing on top of the phase-3
@@ -12177,5 +12338,339 @@ mod map_renderer_tests {
         let msg = map_error_message(MAP_RESULT_ERROR_HAS_BACKING)
             .expect("has-backing error must have message");
         assert!(msg.contains("chain") || msg.contains("PLAN-map"));
+    }
+
+    // ================================================================
+    // Phase 4: MapRenderer byte-exact tests.
+    //
+    // Expected byte sequences were captured by running
+    // `qemu-img map --output={human,json}` against synthetic
+    // fixtures during phase 4a development. The renderer's job is
+    // to match qemu-img byte-for-byte (modulo the documented
+    // divergences in docs/quirks.md); these tests pin that
+    // contract.
+    // ================================================================
+
+    fn render_human(extents: &[guest_::MapExtentMessage], filename: &str) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut r = MapRenderer::new(&mut buf, "human", filename.to_string());
+            r.begin().unwrap();
+            for e in extents {
+                r.emit_extent(e).unwrap();
+            }
+            r.finish().unwrap();
+        }
+        buf
+    }
+
+    fn render_json(extents: &[guest_::MapExtentMessage]) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut r = MapRenderer::new(&mut buf, "json", "<unused>".to_string());
+            r.begin().unwrap();
+            for e in extents {
+                r.emit_extent(e).unwrap();
+            }
+            r.finish().unwrap();
+        }
+        buf
+    }
+
+    // --- format_hex_or_zero ---------------------------------------
+
+    #[test]
+    fn hex_or_zero_zero_is_literal_zero() {
+        assert_eq!(format_hex_or_zero(0), "0");
+    }
+
+    #[test]
+    fn hex_or_zero_nonzero_is_lowercase_hex() {
+        assert_eq!(format_hex_or_zero(0x10000), "0x10000");
+        assert_eq!(format_hex_or_zero(0x50000), "0x50000");
+        assert_eq!(format_hex_or_zero(u64::MAX), "0xffffffffffffffff");
+    }
+
+    // --- Human-mode tests -----------------------------------------
+
+    #[test]
+    fn renderer_human_empty_extents_emits_header_only() {
+        let out = render_human(&[], "any.qcow2");
+        // 53 bytes: 4 columns, last unpadded, plus '\n'.
+        assert_eq!(
+            out,
+            b"Offset          Length          Mapped to       File\n"
+        );
+    }
+
+    #[test]
+    fn human_single_data_extent_byte_exact() {
+        // Matches qemu-img map output for an image with one
+        // 64 KiB data extent at virtual offset 0 mapped to file
+        // offset 0x50000.
+        let out = render_human(&[ext(0, 0x10000, "data", 0x50000)], "m4.qcow2");
+        let expected = "\
+Offset          Length          Mapped to       File
+0               0x10000         0x50000         m4.qcow2
+";
+        assert_eq!(out, expected.as_bytes());
+    }
+
+    #[test]
+    fn human_zero_offset_renders_as_literal_zero() {
+        // The "0" rule applies to every column: start=0 → "0",
+        // length=0 still emits "0x..." because length is never
+        // zero for a real extent (the coalescer drops zero-length
+        // pushes), but file_offset=0 must render as "0" not "0x0".
+        let out = render_human(&[ext(0, 0x10000, "data", 0)], "raw5.img");
+        let expected = "\
+Offset          Length          Mapped to       File
+0               0x10000         0               raw5.img
+";
+        assert_eq!(out, expected.as_bytes());
+    }
+
+    #[test]
+    fn human_holes_are_elided() {
+        // qemu-img human output does not emit rows for holes or
+        // zero-allocated extents; only data: true extents produce
+        // visible rows.
+        let out = render_human(
+            &[
+                ext(0, 0x10000, "hole", 0),
+                ext(0x10000, 0x10000, "zero", 0),
+                ext(0x20000, 0x10000, "data", 0x50000),
+            ],
+            "mix.qcow2",
+        );
+        let expected = "\
+Offset          Length          Mapped to       File
+0x20000         0x10000         0x50000         mix.qcow2
+";
+        assert_eq!(out, expected.as_bytes());
+    }
+
+    #[test]
+    fn human_multiple_data_extents_preserve_order() {
+        let out = render_human(
+            &[
+                ext(0, 0x10000, "data", 0x50000),
+                ext(0x80000, 0x10000, "data", 0x60000),
+            ],
+            "m3.qcow2",
+        );
+        let expected = "\
+Offset          Length          Mapped to       File
+0               0x10000         0x50000         m3.qcow2
+0x80000         0x10000         0x60000         m3.qcow2
+";
+        assert_eq!(out, expected.as_bytes());
+    }
+
+    #[test]
+    fn human_filename_preserved_verbatim() {
+        // qemu-img echoes the argv string in the File column —
+        // relative paths stay relative, embedded chars survive.
+        let out = render_human(&[ext(0, 0x10000, "data", 0)], "/tmp/has spaces/img.qcow2");
+        let expected = "\
+Offset          Length          Mapped to       File
+0               0x10000         0               /tmp/has spaces/img.qcow2
+";
+        assert_eq!(out, expected.as_bytes());
+    }
+
+    #[test]
+    fn human_large_offset_overflows_column_gracefully() {
+        // 0xffffffffffffffff is 18 chars (with 0x prefix) which
+        // overflows the 16-char column. {:<16} leaves the value
+        // intact and the next column starts immediately after —
+        // matches qemu-img's behaviour (no truncation, no panic).
+        let out = render_human(&[ext(u64::MAX - 0xffff, 0x10000, "data", 0)], "big.img");
+        let lines: Vec<&[u8]> = out.split(|&b| b == b'\n').collect();
+        assert_eq!(
+            lines[0],
+            b"Offset          Length          Mapped to       File"
+        );
+        // Data row starts with the hex value; we just check
+        // the value appears and the filename arrives at the end.
+        assert!(lines[1].starts_with(b"0xffffffffffff"));
+        assert!(lines[1].ends_with(b"big.img"));
+    }
+
+    // --- JSON-mode tests ------------------------------------------
+
+    #[test]
+    fn renderer_json_empty_extents_is_empty_array() {
+        let out = render_json(&[]);
+        assert_eq!(out, b"[]");
+    }
+
+    #[test]
+    fn json_single_data_extent_byte_exact() {
+        let out = render_json(&[ext(0, 0x10000, "data", 0x50000)]);
+        // Field order: start, length, depth, present, zero, data,
+        // compressed, offset. Single space after { and , — no
+        // space before }.
+        let expected = b"[{ \"start\": 0, \"length\": 65536, \"depth\": 0, \
+                          \"present\": true, \"zero\": false, \"data\": true, \
+                          \"compressed\": false, \"offset\": 327680}]";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn json_hole_omits_offset_but_includes_compressed_false() {
+        let out = render_json(&[ext(0, 0x100000, "hole", 0)]);
+        // Hole: present=false, zero=true, data=false. No offset.
+        // compressed: false always emitted.
+        let expected = b"[{ \"start\": 0, \"length\": 1048576, \"depth\": 0, \
+                          \"present\": false, \"zero\": true, \"data\": false, \
+                          \"compressed\": false}]";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn json_zero_state_is_present_no_offset() {
+        // zero-allocated: present=true, zero=true, data=false.
+        // No offset (data is false). compressed: false present.
+        let out = render_json(&[ext(0, 0x10000, "zero", 0)]);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.contains("\"present\": true"));
+        assert!(s.contains("\"zero\": true"));
+        assert!(s.contains("\"data\": false"));
+        assert!(!s.contains("\"offset\""));
+        assert!(s.contains("\"compressed\": false"));
+    }
+
+    #[test]
+    fn json_inter_object_separator_is_comma_newline() {
+        let out = render_json(&[
+            ext(0, 0x10000, "data", 0x50000),
+            ext(0x10000, 0x10000, "hole", 0),
+        ]);
+        let s = std::str::from_utf8(&out).unwrap();
+        // The two objects are joined by },\n{
+        assert!(s.contains("},\n{"));
+        // No `},{` (without newline) — that would be wrong format.
+        assert!(!s.contains("},{"));
+    }
+
+    #[test]
+    fn json_multiple_extents_byte_exact() {
+        // Matches qemu-img map output for the 3-extent qcow2
+        // fixture (data + hole + data, 1 MiB total).
+        let out = render_json(&[
+            ext(0, 0x10000, "data", 0x50000),
+            ext(0x10000, 0x10000, "hole", 0),
+            ext(0x20000, 0x10000, "data", 0x70000),
+        ]);
+        let expected = b"[{ \"start\": 0, \"length\": 65536, \"depth\": 0, \
+                          \"present\": true, \"zero\": false, \"data\": true, \
+                          \"compressed\": false, \"offset\": 327680},\n\
+                          { \"start\": 65536, \"length\": 65536, \"depth\": 0, \
+                          \"present\": false, \"zero\": true, \"data\": false, \
+                          \"compressed\": false},\n\
+                          { \"start\": 131072, \"length\": 65536, \"depth\": 0, \
+                          \"present\": true, \"zero\": false, \"data\": true, \
+                          \"compressed\": false, \"offset\": 458752}]";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn json_no_trailing_newline_after_closing_bracket() {
+        let out = render_json(&[ext(0, 0x10000, "data", 0)]);
+        assert!(
+            !out.ends_with(b"\n"),
+            "JSON output must not have a trailing newline"
+        );
+        assert!(out.ends_with(b"]"));
+    }
+
+    #[test]
+    fn json_compressed_false_emitted_for_every_state() {
+        for state in ["hole", "zero", "data"] {
+            let out = render_json(&[ext(0, 0x10000, state, 0)]);
+            let s = std::str::from_utf8(&out).unwrap();
+            assert!(
+                s.contains("\"compressed\": false"),
+                "state {} must emit compressed: false; got: {}",
+                state,
+                s,
+            );
+        }
+    }
+
+    #[test]
+    fn json_field_order_is_canonical() {
+        // Required field order: start, length, depth, present,
+        // zero, data, compressed, offset. Subsequent phases (e.g.
+        // when compressed becomes a real value) must not reorder.
+        let out = render_json(&[ext(0, 4096, "data", 65536)]);
+        let s = std::str::from_utf8(&out).unwrap();
+        let order = [
+            "\"start\":",
+            "\"length\":",
+            "\"depth\":",
+            "\"present\":",
+            "\"zero\":",
+            "\"data\":",
+            "\"compressed\":",
+            "\"offset\":",
+        ];
+        let mut last_pos = 0usize;
+        for field in order {
+            let pos = s
+                .find(field)
+                .unwrap_or_else(|| panic!("missing field {} in JSON: {}", field, s));
+            assert!(
+                pos >= last_pos,
+                "field {} appears out of order at byte {}: {}",
+                field,
+                pos,
+                s
+            );
+            last_pos = pos;
+        }
+    }
+
+    #[test]
+    fn json_large_u64_offset_is_decimal() {
+        // u64 values near 1 TiB must serialise as decimal, not
+        // hex or scientific notation.
+        let big = 1u64 << 40; // 1 TiB
+        let out = render_json(&[ext(0, 4096, "data", big)]);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.contains(&format!("\"offset\": {}", big)));
+        // No accidental hex / 0x prefix.
+        assert!(!s.contains("0x"));
+    }
+
+    // --- Lifecycle / counter tests --------------------------------
+
+    #[test]
+    fn renderer_extents_written_counts_data_only_in_human() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut r = MapRenderer::new(&mut buf, "human", "img".to_string());
+        r.begin().unwrap();
+        r.emit_extent(&ext(0, 0x10000, "hole", 0)).unwrap();
+        r.emit_extent(&ext(0x10000, 0x10000, "data", 0x50000))
+            .unwrap();
+        r.emit_extent(&ext(0x20000, 0x10000, "zero", 0)).unwrap();
+        r.finish().unwrap();
+        // Only the data extent counted.
+        assert_eq!(r.extents_written, 1);
+    }
+
+    #[test]
+    fn renderer_extents_written_counts_all_in_json() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut r = MapRenderer::new(&mut buf, "json", "img".to_string());
+        r.begin().unwrap();
+        r.emit_extent(&ext(0, 0x10000, "hole", 0)).unwrap();
+        r.emit_extent(&ext(0x10000, 0x10000, "data", 0x50000))
+            .unwrap();
+        r.emit_extent(&ext(0x20000, 0x10000, "zero", 0)).unwrap();
+        r.finish().unwrap();
+        // JSON mode counts every extent.
+        assert_eq!(r.extents_written, 3);
     }
 }
