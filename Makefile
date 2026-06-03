@@ -502,7 +502,8 @@ test-rust: instar-devcontainer
 			--exclude create-op \
 			--exclude rebase-op \
 			--exclude resize-op \
-			--exclude commit-op && \
+			--exclude commit-op \
+			--exclude map-op && \
 		cargo test --release -p luks --features "decrypt,encrypt" && \
 		cargo test --release -p qcow2 --features create && \
 		cargo test --release -p create'
