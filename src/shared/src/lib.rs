@@ -2389,6 +2389,153 @@ impl MeasureResult {
 }
 
 // ============================================================================
+// Map configuration and result structures
+// ============================================================================
+
+/// Configuration for the map operation.
+///
+/// Written to `OPERATION_CONFIG_ADDR` by the VMM before launching
+/// the map guest binary. The guest reads this directly via
+/// `&*(OPERATION_CONFIG_ADDR as *const MapConfig)`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MapConfig {
+    /// Magic (`0x4D41505F` = "MAP_").
+    pub magic: u32,
+    /// Configuration flags. Bit 31 is FLAG_VERBOSE; all other
+    /// bits are reserved for future use (chain mode, SEEK_HOLE
+    /// host pre-pass, etc.).
+    pub flags: u32,
+    /// Sector size for input I/O (typically 65536).
+    pub sector_size: u32,
+    /// Number of input devices in the backing chain. Reserved
+    /// for the chain follow-up; phase 2 enforces
+    /// `input_device_count == 1`.
+    pub input_device_count: u32,
+    /// Start the emission window at this virtual byte offset.
+    /// Zero means "start at the beginning of the image".
+    pub start_offset: u64,
+    /// Stop the emission window after this many virtual bytes
+    /// from `start_offset`. Zero means "emit to virtual_size".
+    /// A non-zero value smaller than one source cluster /
+    /// grain / block still emits the extent that overlaps the
+    /// window; trimming happens at extent boundaries, matching
+    /// qemu-img map.
+    pub max_length: u64,
+    /// Reserved padding for forward compat. Future fields:
+    /// snapshot ID length + bytes, image-opts descriptor.
+    pub _reserved: [u8; 32],
+}
+
+impl MapConfig {
+    /// Magic value for map config.
+    pub const MAGIC: u32 = 0x4D41505F; // "MAP_"
+
+    /// Flag: verbose guest logging.
+    pub const FLAG_VERBOSE: u32 = 1 << 31;
+
+    /// True if magic matches.
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+}
+
+/// One coalesced map extent in the on-wire FFI representation.
+///
+/// The parser-facing [`MapExtent`] type (Rust enum) is converted
+/// at the guest's emit boundary into this `#[repr(C)]` form so
+/// the call-table function pointer can take a plain pointer.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MapExtentRecord {
+    /// Magic (`0x4D584554` = "MXET").
+    pub magic: u32,
+    /// State code: 0 = Hole, 1 = ZeroAllocated, 2 = Data.
+    pub state: u32,
+    /// Virtual offset of the extent's first byte.
+    pub start: u64,
+    /// Extent length in bytes. Never zero.
+    pub length: u64,
+    /// Source file offset for `state == STATE_DATA`; zero
+    /// otherwise. (Host renderer omits the JSON field when
+    /// `state != STATE_DATA`.)
+    pub file_offset: u64,
+    /// Reserved padding for forward compat (compressed length,
+    /// subcluster flags, chain depth).
+    pub _reserved: [u8; 16],
+}
+
+impl MapExtentRecord {
+    /// Magic value for map extent record.
+    pub const MAGIC: u32 = 0x4D584554; // "MXET"
+
+    /// Extent state: unallocated, reads as zero, not present in
+    /// the source file.
+    pub const STATE_HOLE: u32 = 0;
+    /// Extent state: explicitly recorded as zero in the metadata
+    /// (qcow2 ZERO_PLAIN / ZERO_ALLOC, vmdk grain marker, vhdx
+    /// PAYLOAD_BLOCK_ZERO).
+    pub const STATE_ZERO_ALLOCATED: u32 = 1;
+    /// Extent state: contains data backed by the source file at
+    /// `file_offset`.
+    pub const STATE_DATA: u32 = 2;
+
+    /// True if magic matches.
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+}
+
+/// Result structure for the map operation.
+///
+/// One per invocation, sent via the `send_map_result` call-table
+/// function after every `send_map_extent`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MapResult {
+    /// Magic (`0x4D505253` = "MPRS").
+    pub magic: u32,
+    /// Source format echoed back. ImageFormat-as-u32; the host
+    /// translates to a name for the protobuf envelope.
+    pub source_format: u32,
+    /// Number of `send_map_extent` calls the guest made during
+    /// this invocation. The host can sanity-check that it
+    /// received exactly that many extent messages before the
+    /// result.
+    pub extents_emitted: u64,
+    /// Virtual size of the source image, in bytes. The host uses
+    /// this to verify the partition invariant (sum of received
+    /// extent lengths == virtual_size minus any window trim).
+    pub virtual_size: u64,
+    /// Error code: 0 = ok, non-zero mirrors `MapResult::ERROR_*`.
+    pub error: u32,
+    /// Reserved padding for forward compat.
+    pub _reserved: u32,
+}
+
+impl MapResult {
+    /// Magic value for map result.
+    pub const MAGIC: u32 = 0x4D505253; // "MPRS"
+
+    pub const ERROR_OK: u32 = 0;
+    /// Source format unrecognised or scan rejected the image.
+    pub const ERROR_INVALID_SOURCE: u32 = 1;
+    /// Invalid config (missing magic, bad sector_size,
+    /// input_device_count != 1, oversized start_offset).
+    pub const ERROR_INVALID_OPTION: u32 = 2;
+    /// Source has a backing file / parent / multi-extent
+    /// descriptor and chain composition is deferred.
+    pub const ERROR_HAS_BACKING: u32 = 3;
+    /// I/O failure during walk.
+    pub const ERROR_IO: u32 = 4;
+
+    /// True if magic matches.
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+}
+
+// ============================================================================
 // Create configuration and result structures
 // ============================================================================
 
@@ -4014,5 +4161,127 @@ mod tests {
             r.slice(),
             &[data(0, 4096, u64::MAX - 1000), data(4096, 4096, 0)]
         );
+    }
+
+    // ------------------------------------------------------------------
+    // MapConfig / MapExtentRecord / MapResult tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn map_magic_values_are_unique_among_existing_magics() {
+        // Cross-check the three new magic values against the
+        // existing 21 in the crate. If a future config struct
+        // accidentally picks the same magic, the static asserts
+        // here will surface the collision.
+        let map_magics = [MapConfig::MAGIC, MapExtentRecord::MAGIC, MapResult::MAGIC];
+        let existing = [
+            CallTable::MAGIC,
+            CopyConfig::MAGIC,
+            InfoConfig::MAGIC,
+            InfoResult::MAGIC,
+            CheckConfig::MAGIC,
+            CheckResult::MAGIC,
+            CompareConfig::MAGIC,
+            CompareResult::MAGIC,
+            ConvertConfig::MAGIC,
+            MeasureConfig::MAGIC,
+            MeasureResult::MAGIC,
+            CreateConfig::MAGIC,
+            CreateResult::MAGIC,
+            ResizeConfig::MAGIC,
+            ResizeResult::MAGIC,
+            RebaseConfig::MAGIC,
+            RebaseResult::MAGIC,
+            CommitConfig::MAGIC,
+            CommitResult::MAGIC,
+            ChainConfig::MAGIC,
+        ];
+        // No new magic equals any existing magic.
+        for m in &map_magics {
+            for e in &existing {
+                assert_ne!(*m, *e, "map magic 0x{:08x} collides with existing", m);
+            }
+        }
+        // The three new magics are also mutually distinct.
+        assert_ne!(MapConfig::MAGIC, MapExtentRecord::MAGIC);
+        assert_ne!(MapConfig::MAGIC, MapResult::MAGIC);
+        assert_ne!(MapExtentRecord::MAGIC, MapResult::MAGIC);
+    }
+
+    #[test]
+    fn map_config_is_valid_accepts_magic_rejects_zero() {
+        let mut c = MapConfig {
+            magic: MapConfig::MAGIC,
+            flags: 0,
+            sector_size: 65536,
+            input_device_count: 1,
+            start_offset: 0,
+            max_length: 0,
+            _reserved: [0; 32],
+        };
+        assert!(c.is_valid());
+        c.magic = 0;
+        assert!(!c.is_valid());
+        c.magic = 0xDEAD_BEEF;
+        assert!(!c.is_valid());
+    }
+
+    #[test]
+    fn map_extent_record_is_valid_accepts_magic_rejects_zero() {
+        let mut r = MapExtentRecord {
+            magic: MapExtentRecord::MAGIC,
+            state: MapExtentRecord::STATE_DATA,
+            start: 0,
+            length: 4096,
+            file_offset: 0,
+            _reserved: [0; 16],
+        };
+        assert!(r.is_valid());
+        r.magic = 0;
+        assert!(!r.is_valid());
+    }
+
+    #[test]
+    fn map_result_is_valid_accepts_magic_rejects_zero() {
+        let mut r = MapResult {
+            magic: MapResult::MAGIC,
+            source_format: 0,
+            extents_emitted: 0,
+            virtual_size: 0,
+            error: MapResult::ERROR_OK,
+            _reserved: 0,
+        };
+        assert!(r.is_valid());
+        r.magic = 0;
+        assert!(!r.is_valid());
+    }
+
+    #[test]
+    fn map_extent_record_state_codes_are_contiguous_from_zero() {
+        // The host renderer maps state codes by table lookup; the
+        // codes must stay contiguous from 0 and mutually disjoint.
+        assert_eq!(MapExtentRecord::STATE_HOLE, 0);
+        assert_eq!(MapExtentRecord::STATE_ZERO_ALLOCATED, 1);
+        assert_eq!(MapExtentRecord::STATE_DATA, 2);
+    }
+
+    #[test]
+    fn map_result_error_codes_have_expected_values() {
+        // Pinned to keep the wire format stable across versions —
+        // protobuf transports these directly.
+        assert_eq!(MapResult::ERROR_OK, 0);
+        assert_eq!(MapResult::ERROR_INVALID_SOURCE, 1);
+        assert_eq!(MapResult::ERROR_INVALID_OPTION, 2);
+        assert_eq!(MapResult::ERROR_HAS_BACKING, 3);
+        assert_eq!(MapResult::ERROR_IO, 4);
+    }
+
+    #[test]
+    fn map_config_flag_verbose_is_top_bit() {
+        // The convention in this crate (cross-checked against
+        // ConvertConfig::FLAG_VERBOSE) is that bit 31 carries
+        // verbosity so subsequent flags can extend from bit 0
+        // upwards without colliding.
+        assert_eq!(MapConfig::FLAG_VERBOSE, 1 << 31);
     }
 }
