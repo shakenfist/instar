@@ -708,6 +708,67 @@ pub fn commit_result_message(
     msg
 }
 
+/// Build a `MapExtentMessage` envelope for one coalesced map
+/// extent. Streamed one-per-extent during the map operation;
+/// the host accumulates them into the rendered output.
+///
+/// # Arguments
+/// * `start` - Virtual offset of the extent's first byte
+/// * `length` - Extent length in bytes (never zero)
+/// * `state` - One of `"hole"`, `"zero"`, or `"data"`. Maps to
+///   `MapExtentRecord::STATE_*` in shared.
+/// * `file_offset` - Source file offset; only meaningful when
+///   `state == "data"`.
+pub fn map_extent_message(
+    start: u64,
+    length: u64,
+    state: &str,
+    file_offset: u64,
+) -> guest_::GuestMessage {
+    let mut msg = guest_::GuestMessage::default();
+    msg.level = guest_::Level::Info;
+
+    let mut ext = guest_::MapExtentMessage::default();
+    ext.start = start;
+    ext.length = length;
+    push_str(&mut ext.state, state);
+    ext.file_offset = file_offset;
+
+    msg.payload = Some(guest_::GuestMessage_::Payload::MapExtent(ext));
+    msg
+}
+
+/// Build a `MapResultMessage` envelope for the map operation's
+/// terminator summary. Sent once at end-of-walk after every
+/// `map_extent_message`.
+///
+/// # Arguments
+/// * `source_format` - Source format echoed back (e.g. `"qcow2"`,
+///   `"vmdk"`)
+/// * `extents_emitted` - Count of `MapExtentMessage` records the
+///   guest sent this invocation
+/// * `virtual_size` - Source virtual size in bytes
+/// * `error` - 0 = ok, non-zero mirrors `MapResult::ERROR_*` in
+///   shared
+pub fn map_result_message(
+    source_format: &str,
+    extents_emitted: u64,
+    virtual_size: u64,
+    error: u32,
+) -> guest_::GuestMessage {
+    let mut msg = guest_::GuestMessage::default();
+    msg.level = guest_::Level::Info;
+
+    let mut result = guest_::MapResultMessage::default();
+    push_str(&mut result.source_format, source_format);
+    result.extents_emitted = extents_emitted;
+    result.virtual_size = virtual_size;
+    result.error = error;
+
+    msg.payload = Some(guest_::GuestMessage_::Payload::MapResult(result));
+    msg
+}
+
 // =============================================================================
 // VMM -> Guest configuration message support
 // =============================================================================

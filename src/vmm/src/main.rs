@@ -872,6 +872,19 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
                 c.error
             )
         }
+        Some(guest_::GuestMessage_::Payload::MapExtent(e)) => {
+            format!(
+                "map_extent start={} length={} state={} file_offset={}",
+                e.start, e.length, e.state, e.file_offset
+            )
+        }
+        Some(guest_::GuestMessage_::Payload::MapResult(r)) => {
+            format!(
+                "map_result source_format={} extents_emitted={} \
+                virtual_size={} error={}",
+                r.source_format, r.extents_emitted, r.virtual_size, r.error
+            )
+        }
         None => "empty payload".to_string(),
     };
 
