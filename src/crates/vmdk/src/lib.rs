@@ -11,7 +11,7 @@
 
 use shared::{
     le_u16, le_u32, le_u64, write_le_u16, write_le_u32, write_le_u64, AllocationSummary, CallTable,
-    VmdkInfo, MAX_SECTOR_SIZE,
+    MapExtent, MapExtentCoalescer, MapExtentState, VmdkInfo, MAX_SECTOR_SIZE,
 };
 
 // ============================================================================
@@ -517,6 +517,52 @@ pub fn count_allocated_in_gt(gt_bytes: &[u8]) -> u64 {
         .count() as u64
 }
 
+/// Classify one VMDK grain-table entry into a single `MapExtent`.
+///
+/// Mirrors `VmdkState::grain_lookup`'s decision tree, augmented with
+/// the explicit `ZERO_GRAIN_MARKER` (0xFFFF_FFFE) sentinel that
+/// `count_allocated_in_gt` already treats as unallocated-but-zero
+/// (used by qemu-img for monolithicSparse output to mark
+/// explicit-zero grains).
+///
+/// - `entry == 0` (`GTE_UNALLOCATED`): `Hole`.
+/// - `entry == GTE_ZEROED` (`1`), when `has_zero_grain` is set:
+///   `ZeroAllocated`. (FLAG_ZERO_GRAIN is on header; without it the
+///   `1` is technically a malformed grain pointer — fall through to
+///   the Data path. Mirrors `grain_lookup`'s feature gate.)
+/// - `entry == ZERO_GRAIN_MARKER` (`0xFFFF_FFFE`): `ZeroAllocated`.
+/// - Otherwise: `Data { file_offset: (entry as u64) * 512 }`. For
+///   compressed (streamOptimized) VMDKs this is the marker offset
+///   (12-byte grain header + compressed payload), matching
+///   `grain_lookup`'s compressed-path semantics. For standard VMDKs
+///   it is the grain data offset.
+///
+/// `grain_size_bytes` is the extent's length; `virtual_offset` is
+/// the virtual address of the grain's first byte. The caller is
+/// responsible for clamping `length` against virtual_size if the
+/// grain straddles end-of-image.
+pub fn classify_vmdk_gt_entry(
+    entry: u32,
+    virtual_offset: u64,
+    grain_size_bytes: u64,
+    has_zero_grain: bool,
+) -> MapExtent {
+    let state = if entry == GTE_UNALLOCATED {
+        MapExtentState::Hole
+    } else if (has_zero_grain && entry == GTE_ZEROED) || entry == ZERO_GRAIN_MARKER {
+        MapExtentState::ZeroAllocated
+    } else {
+        MapExtentState::Data {
+            file_offset: (entry as u64).saturating_mul(512),
+        }
+    };
+    MapExtent {
+        start: virtual_offset,
+        length: grain_size_bytes,
+        state,
+    }
+}
+
 // ============================================================================
 // VMDK state for grain table I/O
 // ============================================================================
@@ -921,6 +967,183 @@ impl VmdkState {
             // scanner is converted to target-aware accounting.
             0,
         ))
+    }
+
+    /// Walk the grain directory and per-GD-entry grain tables, and
+    /// emit a coalesced `MapExtent` stream covering
+    /// `[0, virtual_size)`.
+    ///
+    /// Single-extent monolithicSparse / monolithicFlat /
+    /// streamOptimized only — multi-extent descriptor-driven layouts
+    /// are not propagated here (the parser returns the top extent
+    /// only, matching `scan_allocation`'s posture). The map host CLI
+    /// in phase 3 will refuse multi-extent sources with a clear
+    /// error.
+    ///
+    /// The walker mirrors `scan_allocation` for sector reading and
+    /// GD/GT traversal but classifies each GT entry via
+    /// [`classify_vmdk_gt_entry`] and pushes the result through a
+    /// `MapExtentCoalescer`. The coalescer persists across GT
+    /// boundaries so adjacent Data grains with contiguous file
+    /// offsets collapse into one extent.
+    ///
+    /// GD entries that are zero emit one `Hole` per GT-coverage
+    /// range. A trailing `Hole` covers any virtual range past the
+    /// last walked grain up to `virtual_size`.
+    ///
+    /// Returns `Some(())` on success (including early termination);
+    /// `None` on I/O failure.
+    ///
+    /// # Safety
+    ///
+    /// `call_table` must be valid. `gd_cache_buf` and `gt_cache_buf`
+    /// must still each point to at least `MAX_SECTOR_SIZE` writable
+    /// bytes.
+    pub unsafe fn map_extents<F: FnMut(MapExtent) -> bool>(
+        &mut self,
+        call_table: &CallTable,
+        sector_size: usize,
+        input_capacity: u64,
+        bytes_read: &mut u64,
+        emit: &mut F,
+    ) -> Option<()> {
+        let virtual_size = self.capacity_sectors.checked_mul(512)?;
+        if virtual_size == 0 {
+            return Some(());
+        }
+
+        let grain_size_bytes = self.grain_size_bytes;
+        let has_zero_grain = self.has_zero_grain;
+        let gt_size_bytes = (self.num_gtes_per_gt as u64).checked_mul(4)?;
+        let gt_coverage = (self.num_gtes_per_gt as u64).checked_mul(grain_size_bytes)?;
+
+        let mut coalescer = MapExtentCoalescer::new(emit);
+        let mut next_unwalked: u64 = 0;
+
+        'gd_loop: for gd_index in 0..self.num_gd_entries as u64 {
+            let gd_byte_offset = self
+                .gd_offset_sectors
+                .checked_mul(512)?
+                .checked_add(gd_index.checked_mul(4)?)?;
+            let gd_entry = read_u32_le_cached(
+                call_table,
+                self.device_idx,
+                gd_byte_offset,
+                sector_size,
+                input_capacity,
+                &mut self.gd_cached_sector,
+                self.gd_cache_buf,
+                bytes_read,
+            )?;
+
+            let gd_virtual_start = gd_index.saturating_mul(gt_coverage);
+            if gd_virtual_start >= virtual_size {
+                continue;
+            }
+            let gd_remaining = virtual_size - gd_virtual_start;
+            let gd_visible_span = gt_coverage.min(gd_remaining);
+
+            if gd_entry == 0 {
+                let cont = coalescer.push(MapExtent {
+                    start: gd_virtual_start,
+                    length: gd_visible_span,
+                    state: MapExtentState::Hole,
+                });
+                next_unwalked = gd_virtual_start.saturating_add(gd_visible_span);
+                if !cont {
+                    break 'gd_loop;
+                }
+                continue;
+            }
+
+            let gt_start_byte = (gd_entry as u64).checked_mul(512)?;
+            let gt_end_byte = gt_start_byte.checked_add(gt_size_bytes)?;
+            let gt_start_sector = gt_start_byte / sector_size as u64;
+            let gt_end_sector =
+                gt_end_byte.checked_add(sector_size as u64 - 1)? / sector_size as u64;
+
+            let mut gt_bytes_consumed: u64 = 0;
+            let mut sector = gt_start_sector;
+            while sector < gt_end_sector {
+                if sector >= input_capacity {
+                    return None;
+                }
+                if !(call_table.read_input_sector)(
+                    self.device_idx,
+                    sector,
+                    self.gt_cache_buf,
+                    sector_size,
+                ) {
+                    return None;
+                }
+                *bytes_read += sector_size as u64;
+                self.gt_cached_sector = sector;
+
+                let sector_byte_start = sector * sector_size as u64;
+                let buf_start = if sector_byte_start < gt_start_byte {
+                    (gt_start_byte - sector_byte_start) as usize
+                } else {
+                    0
+                };
+                let buf_end =
+                    sector_size.min((gt_end_byte.saturating_sub(sector_byte_start)) as usize);
+                if buf_end <= buf_start {
+                    sector += 1;
+                    continue;
+                }
+                let chunk = core::slice::from_raw_parts(
+                    self.gt_cache_buf.add(buf_start),
+                    buf_end - buf_start,
+                );
+                let meaningful_len =
+                    (gt_size_bytes - gt_bytes_consumed).min((buf_end - buf_start) as u64) as usize;
+                let meaningful = &chunk[..meaningful_len];
+
+                let chunk_entry_count = (meaningful_len as u64) / 4;
+                let base_entry_index = gt_bytes_consumed / 4;
+
+                for k in 0..chunk_entry_count {
+                    let off = (k as usize) * 4;
+                    let entry = u32::from_le_bytes([
+                        meaningful[off],
+                        meaningful[off + 1],
+                        meaningful[off + 2],
+                        meaningful[off + 3],
+                    ]);
+                    let global_idx = base_entry_index + k;
+                    let grain_virt = gd_virtual_start
+                        .saturating_add(global_idx.saturating_mul(grain_size_bytes));
+                    if grain_virt >= virtual_size {
+                        break;
+                    }
+                    let grain_visible = grain_size_bytes.min(virtual_size - grain_virt);
+
+                    let mut ext =
+                        classify_vmdk_gt_entry(entry, grain_virt, grain_size_bytes, has_zero_grain);
+                    if ext.length > grain_visible {
+                        ext.length = grain_visible;
+                    }
+                    let cont = coalescer.push(ext);
+                    next_unwalked = grain_virt.saturating_add(grain_visible);
+                    if !cont {
+                        break 'gd_loop;
+                    }
+                }
+
+                gt_bytes_consumed += meaningful_len as u64;
+                sector += 1;
+            }
+        }
+
+        if next_unwalked < virtual_size {
+            let _ = coalescer.push(MapExtent {
+                start: next_unwalked,
+                length: virtual_size - next_unwalked,
+                state: MapExtentState::Hole,
+            });
+        }
+        let _ = coalescer.finish();
+        Some(())
     }
 }
 
@@ -2078,6 +2301,86 @@ RW 2097152 FLAT \"disk-f003.vmdk\" 0
             }
         }
         assert_eq!(count_allocated_in_gt(&buf), expected);
+    }
+
+    // ====================================================================
+    // classify_vmdk_gt_entry tests
+    // ====================================================================
+
+    #[test]
+    fn classify_vmdk_unallocated_is_hole() {
+        let e = classify_vmdk_gt_entry(GTE_UNALLOCATED, 0, 65536, true);
+        assert_eq!(e.state, MapExtentState::Hole);
+        assert_eq!(e.length, 65536);
+    }
+
+    #[test]
+    fn classify_vmdk_zeroed_with_flag_is_zero_alloc() {
+        let e = classify_vmdk_gt_entry(GTE_ZEROED, 0, 65536, true);
+        assert_eq!(e.state, MapExtentState::ZeroAllocated);
+    }
+
+    #[test]
+    fn classify_vmdk_zeroed_without_flag_is_data() {
+        // Without has_zero_grain set, GTE value 1 is just a (very
+        // low) sector pointer — emit as Data.
+        let e = classify_vmdk_gt_entry(GTE_ZEROED, 0, 65536, false);
+        assert_eq!(e.state, MapExtentState::Data { file_offset: 512 });
+    }
+
+    #[test]
+    fn classify_vmdk_zero_grain_marker_is_zero_alloc() {
+        let e = classify_vmdk_gt_entry(ZERO_GRAIN_MARKER, 0, 65536, false);
+        assert_eq!(e.state, MapExtentState::ZeroAllocated);
+    }
+
+    #[test]
+    fn classify_vmdk_normal_is_data() {
+        // entry = 0x100 sectors → file_offset = 0x100 * 512.
+        let e = classify_vmdk_gt_entry(0x100, 65536, 65536, false);
+        assert_eq!(e.start, 65536);
+        assert_eq!(
+            e.state,
+            MapExtentState::Data {
+                file_offset: 0x100 * 512,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_vmdk_large_sector_offset() {
+        // Ensure (entry as u64) * 512 doesn't lose precision for
+        // max-u32 entries.
+        let e = classify_vmdk_gt_entry(0x7FFF_FFFF, 0, 65536, false);
+        assert_eq!(
+            e.state,
+            MapExtentState::Data {
+                file_offset: 0x7FFF_FFFFu64 * 512
+            }
+        );
+    }
+
+    #[test]
+    fn classify_vmdk_grain_size_512() {
+        // Smallest sensible grain size (1 sector).
+        let e = classify_vmdk_gt_entry(0x10, 0, 512, false);
+        assert_eq!(e.length, 512);
+        assert_eq!(
+            e.state,
+            MapExtentState::Data {
+                file_offset: 0x10 * 512
+            }
+        );
+    }
+
+    #[test]
+    fn classify_vmdk_zero_grain_marker_overrides_has_zero_grain() {
+        // ZERO_GRAIN_MARKER must produce ZeroAllocated regardless
+        // of whether has_zero_grain is set.
+        let with_flag = classify_vmdk_gt_entry(ZERO_GRAIN_MARKER, 0, 65536, true);
+        let without_flag = classify_vmdk_gt_entry(ZERO_GRAIN_MARKER, 0, 65536, false);
+        assert_eq!(with_flag.state, MapExtentState::ZeroAllocated);
+        assert_eq!(without_flag.state, MapExtentState::ZeroAllocated);
     }
 }
 
