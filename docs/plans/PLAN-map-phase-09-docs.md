@@ -3,7 +3,21 @@
 Master plan: [PLAN-map.md](PLAN-map.md) ·
 Previous phase: [PLAN-map-phase-08-fuzz-differential.md](PLAN-map-phase-08-fuzz-differential.md)
 
-## Status: Not started
+## Status: Complete
+
+Both steps committed. `docs/map.md` shipped at ~252 lines
+with real captured human + JSON output from a fresh
+fragmented qcow2. Cross-document touch-ups: `docs/index.md`
+gains a Map row; `README.md` gains an Allocation Map
+section between Commit and Version Compatibility;
+`AGENTS.md` gains a `map` operations bullet; the
+`PLAN-convert-followups.md` deferred list now reads
+`(~~create~~ / ~~map~~ / ~~measure~~ / ~~resize~~ /
+snapshot / ~~rebase~~ / ~~commit~~)` — only `snapshot`
+remains; `docs/plans/index.md` shows PLAN-map as Complete
+(phases 1-9); the master plan's Execution table marks
+every phase 1-9 Complete. `ARCHITECTURE.md` already
+mentioned phases 7 and 8 from the per-phase docs steps.
 
 ## Mission
 

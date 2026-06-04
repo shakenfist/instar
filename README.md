@@ -364,6 +364,23 @@ as empty against the (now-updated) backing. v1 supports only the
 overlay's immediate parent; intermediate-image commit is deferred. See
 [docs/commit.md](docs/commit.md) for the full reference.
 
+### Allocation Map
+
+```bash
+# Human-readable allocation table
+instar map disk.qcow2
+
+# JSON for scripting
+instar map --output=json disk.qcow2
+```
+
+Emits the allocation map of a disk image as a stream of contiguous
+extents covering `[0, virtual_size)`, mirroring `qemu-img map`. Each
+extent is classified as data, zero-allocated, or hole. Window flags
+`--start-offset` / `--max-length` clip the emission range. Single-
+image v1; backing-chain `depth` composition is deferred. See
+[docs/map.md](docs/map.md) for the full reference.
+
 ### Version Compatibility
 
 Different qemu-img versions produce slightly different output formats:
