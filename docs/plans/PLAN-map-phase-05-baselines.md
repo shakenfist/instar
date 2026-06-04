@@ -3,7 +3,17 @@
 Master plan: [PLAN-map.md](PLAN-map.md) ·
 Previous phase: [PLAN-map-phase-04-output-formatting.md](PLAN-map-phase-04-output-formatting.md)
 
-## Status: Not started
+## Status: Complete
+
+`instar-testdata` commits `4e56008d8` (generator extension),
+`8e0498ca3` + `315859c3d` (profile dedup), and `0f972d5b1`
+(raw baselines) produced `map-human` + `map-json` baselines
+for all 80 qemu-img versions (6.0.0–10.2.x) across every
+safe-tier source image — ~6,240 baseline cells total.
+`detect-profiles.py` deduplicates into 1 `map-human` profile
+(stable across the full range) and 3 `map-json` profiles
+(transitions at 6.0.x→6.1.x — likely `compressed` field
+addition — and 8.1.x→8.2.x).
 
 ## Mission
 

@@ -3,7 +3,16 @@
 Master plan: [PLAN-map.md](PLAN-map.md) ·
 Previous phase: [PLAN-map-phase-01-extent-iterators.md](PLAN-map-phase-01-extent-iterators.md)
 
-## Status: Not started
+## Status: Complete
+
+New `src/operations/map/` guest binary builds at ~28 KiB / 384 KiB
+(7%). `MapConfig` ("MAP_" magic) / `MapResult` ("MPRS" magic) /
+`MapExtentRecord` ("MXET" magic) added to `src/shared/src/lib.rs`
+alongside the matching `MapExtentMessage` / `MapResultMessage`
+protobufs in `crates/guest-protocol/proto/guest.proto`. CallTable
+ABI gained `send_map_extent` and `send_map_result` function
+pointers and the VERSION bumped 15 → 16. Single-image v1 refuses
+chain sources with `MAP_RESULT_ERROR_HAS_BACKING`.
 
 ## Mission
 

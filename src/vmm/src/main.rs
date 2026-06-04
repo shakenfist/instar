@@ -144,7 +144,6 @@ const MEASURE_RESULT_ERROR_INVALID_SIZE: u32 = 3;
 
 // MapConfig constants (must match shared::MapConfig)
 const MAP_CONFIG_MAGIC: u32 = 0x4D41505F; // "MAP_"
-#[allow(dead_code)]
 const MAP_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
 
 // MapResult constants (must match shared::MapResult)

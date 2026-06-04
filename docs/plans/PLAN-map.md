@@ -466,10 +466,10 @@ of phase 1.
 
 | Phase | Plan | Status |
 |-------|------|--------|
-| 1. Per-format extent iterators on parser crates | [PLAN-map-phase-01-extent-iterators.md](PLAN-map-phase-01-extent-iterators.md) | Not started |
-| 2. Guest `map` operation + protobuf | [PLAN-map-phase-02-guest-op.md](PLAN-map-phase-02-guest-op.md) | Not started |
-| 3. Host VMM subcommand + clap surface | [PLAN-map-phase-03-host-cli.md](PLAN-map-phase-03-host-cli.md) | Not started |
-| 4. Output formatting (human / JSON) | [PLAN-map-phase-04-output-formatting.md](PLAN-map-phase-04-output-formatting.md) | Not started |
+| 1. Per-format extent iterators on parser crates | [PLAN-map-phase-01-extent-iterators.md](PLAN-map-phase-01-extent-iterators.md) | Complete (MapExtent / MapExtentState / MapExtentCoalescer in shared; map_extents walker on each of raw / qcow2 / vmdk / vhd / vhdx) |
+| 2. Guest `map` operation + protobuf | [PLAN-map-phase-02-guest-op.md](PLAN-map-phase-02-guest-op.md) | Complete (operations/map guest binary at ~28 KiB / 384 KiB; MapExtentMessage + MapResultMessage protobufs; CallTable send_map_extent + send_map_result; VERSION 15→16) |
+| 3. Host VMM subcommand + clap surface | [PLAN-map-phase-03-host-cli.md](PLAN-map-phase-03-host-cli.md) | Complete (MapArgs + Commands::Map; run_map dispatches into the guest; --image-opts / VMDK descriptor / invalid sector-size rejected host-side) |
+| 4. Output formatting (human / JSON) | [PLAN-map-phase-04-output-formatting.md](PLAN-map-phase-04-output-formatting.md) | Complete (streaming MapRenderer<'a, W: Write>; human + JSON match qemu-img byte-for-byte modulo documented quirks; 21 byte-exact unit tests) |
 | 5. Cross-version baseline generation in `instar-testdata` | [PLAN-map-phase-05-baselines.md](PLAN-map-phase-05-baselines.md) | Complete (instar-testdata commits `4e56008d8`, `8e0498ca3`, `315859c3d`, `0f972d5b1`; 80 versions; 1 map-human profile + 3 map-json profiles) |
 | 6. Integration tests (`tests/test_map.py`) | [PLAN-map-phase-06-integration-tests.md](PLAN-map-phase-06-integration-tests.md) | Complete (95 active tests + 91 documented skips; two real bugs fixed mid-phase — JSON trailing newline, host-side start-offset check vs file-size) |
 | 7. Coverage-guided fuzz harnesses | [PLAN-map-phase-07-fuzz-coverage.md](PLAN-map-phase-07-fuzz-coverage.md) | Complete (fuzz_map_iter target landed; 60s smoke ~4M runs, 0 crashes, ongoing coverage growth) |

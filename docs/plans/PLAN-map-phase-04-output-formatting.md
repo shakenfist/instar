@@ -3,7 +3,17 @@
 Master plan: [PLAN-map.md](PLAN-map.md) ·
 Previous phase: [PLAN-map-phase-03-host-cli.md](PLAN-map-phase-03-host-cli.md)
 
-## Status: Not started
+## Status: Complete
+
+Streaming `MapRenderer<'a, W: Write>` in `src/vmm/src/main.rs`
+writes each extent to stdout (via a `BufWriter` over
+`stdout().lock()`) as the `MapExtentMessage` arrives in the
+vCPU loop; host memory stays O(1) regardless of how fragmented
+the source is. Human and JSON output match `qemu-img map`
+byte-for-byte modulo the eight quirks now documented in
+`docs/quirks.md`. 21 byte-exact unit tests pin the renderer
+against expected output sequences. BrokenPipe on stdout
+short-circuits cleanly with exit 0.
 
 ## Mission
 

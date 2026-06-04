@@ -3,7 +3,17 @@
 Master plan: [PLAN-map.md](PLAN-map.md) ·
 Previous phase: [PLAN-map-phase-02-guest-op.md](PLAN-map-phase-02-guest-op.md)
 
-## Status: Not started
+## Status: Complete
+
+`MapArgs` clap struct and `Commands::Map(MapArgs)` arm
+shipped in `src/vmm/src/main.rs`; `run_map` writes
+`MapConfig` per-field at `OPERATION_CONFIG_ADDR`, attaches
+the source read-only as input device 0, runs the vCPU loop,
+and decodes streamed `MapExtentMessage` records into a
+placeholder renderer (replaced in phase 4). Host-side guards
+reject `--image-opts`, VMDK monolithicFlat descriptors via
+`peek_is_vmdk_descriptor`, and invalid sector sizes
+(non-power-of-2 or outside `[512, MAX_SECTOR_SIZE]`).
 
 ## Mission
 

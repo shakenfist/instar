@@ -2,7 +2,16 @@
 
 Master plan: [PLAN-map.md](PLAN-map.md)
 
-## Status: Not started
+## Status: Complete
+
+`MapExtent`, `MapExtentState`, and `MapExtentCoalescer` shipped
+in `src/shared/src/lib.rs` (with full coalescer unit-test
+coverage). Each parser crate (`raw`, `qcow2`, `vmdk`, `vhd`,
+`vhdx`) gained a `map_extents` walker mirroring the existing
+`scan_allocation` shell, plus pure classification helpers
+(`classify_qcow2_l2_*`, `classify_vmdk_grain_entry`,
+`classify_vhd_bat_entry`, `classify_vhdx_bat_entry`) under
+unit test. Workspace `make lint` + `make test-rust` clean.
 
 ## Mission
 

@@ -3,7 +3,22 @@
 Master plan: [PLAN-map.md](PLAN-map.md) ·
 Previous phase: [PLAN-map-phase-05-baselines.md](PLAN-map-phase-05-baselines.md)
 
-## Status: Not started
+## Status: Complete
+
+`tests/test_map.py` shipped with five test classes
+(TestMapSmoke / TestMapBaselineSource / TestMapWindowFilter /
+TestMapErrorPaths / TestMapDivergenceRegression). Final
+count: 95 active tests + 91 documented skips, 0 failures.
+`tests/base.py` gained `'map'` in `COMMAND_OUTPUT_DIRS` and
+the `get_profile_for_installed_qemu` helper for the 3
+map-json profiles. The full sweep surfaced and fixed two
+real bugs mid-phase: (1) JSON output was missing a trailing
+newline (renderer fixed; the phase 4 "no trailing newline"
+doc note was a `cat -A` misread, corrected in
+`docs/quirks.md`); (2) host-side `--start-offset > file_size`
+check compared against the on-disk file size rather than the
+virtual size, causing spurious rejections for sparse
+qcow2 sources (check removed).
 
 ## Mission
 
