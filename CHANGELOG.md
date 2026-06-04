@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`instar map` coverage-guided fuzz harness (PLAN-map phase 7).**
+  Adds `src/fuzz/fuzz_targets/fuzz_map_iter.rs`: a libFuzzer
+  target that dispatches on a format prefix byte
+  (qcow2/vmdk/vhd/vhdx) and drives each parser's `map_extents`
+  walker through the existing `instar_fuzz` mock CallTable.
+  Records emitted extents into a 1 M-cap Vec and asserts the
+  partition invariant — every byte of `[0, virtual_size)` must
+  be covered by exactly one extent, with no overlaps, no gaps,
+  no zero-length records, and no `start+length` overflow. That
+  stricter assertion catches off-by-one cluster-boundary bugs
+  that `fuzz_measure_scan`'s summary check (`allocated_bytes
+  <= virtual_size`) cannot see. raw is omitted (pure of
+  virtual_size, no on-disk input surface). 60-second smoke run
+  reaches ~4M iterations with libFuzzer reporting ongoing
+  coverage growth and zero crashes. CI integration via
+  `.github/workflows/coverage-fuzz.yml`'s auto-discovery — no
+  workflow edit required.
 - **`instar map` integration tests (PLAN-map phase 6).**
   Adds `tests/test_map.py` with five test classes:
   `TestMapSmoke` (wiring), `TestMapBaselineSource`

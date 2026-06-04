@@ -3,7 +3,15 @@
 Master plan: [PLAN-map.md](PLAN-map.md) ·
 Previous phase: [PLAN-map-phase-06-integration-tests.md](PLAN-map-phase-06-integration-tests.md)
 
-## Status: Not started
+## Status: Complete
+
+Both steps committed. `fuzz_map_iter` builds clean under
+`make fuzz-build FUZZ_TARGET=fuzz_map_iter`. 60-second smoke
+run (`make fuzz-run FUZZ_TARGET=fuzz_map_iter
+FUZZ_DURATION=60`) reaches ~4M iterations with libFuzzer
+reporting ongoing `NEW` coverage growth and zero crashes.
+Auto-discovery in `.github/workflows/coverage-fuzz.yml`
+picks up the new `[[bin]]` entry without a workflow edit.
 
 ## Mission
 
