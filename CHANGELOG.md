@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`instar map` cross-version baselines (PLAN-map phase 5).**
+  Generates `map-human` and `map-json` baselines for all 80
+  qemu-img versions (6.0.0 through 10.2.x) across every
+  safe-tier source image in the `instar-testdata` repo
+  (~6,240 baseline cells total). detect-profiles.py
+  deduplicates into 1 `map-human` profile (output stable
+  across the full range) and 3 `map-json` profiles (two
+  transitions at 6.0.x→6.1.x — likely the `compressed`
+  field addition — and 8.1.x→8.2.x). Phase 6's integration
+  tests will diff `instar map`'s output against the
+  version-keyed profile for whichever qemu-img is installed.
+  See `instar-testdata` commits `4e56008d8` (generator
+  extension), `8e0498ca3` + `315859c3d` (profile dedup),
+  and `0f972d5b1` (raw baselines).
 - **`instar map` output polish (PLAN-map phase 4).** Replaces
   the phase 3 placeholder renderer with a streaming
   `MapRenderer<'a, W: Write>` that emits each extent to
