@@ -191,8 +191,11 @@ KNOWN_MAP_DIVERGENCES = {
     # are wrong on top of the compressed: false divergence.
     # See docs/quirks.md "map subcommand quirks" + PLAN-map.md
     # future work.
-    'qcow2-zstd':
-        ('json', 'compressed-cluster reporting deferred'),
+    # Note: qcow2-zstd was a candidate divergence (compressed-
+    # cluster reporting deferred), but the actual fixture happens
+    # to be 1 MiB of zeros with no compressed clusters actually
+    # exercised — instar matches qemu-img byte-for-byte. Removed
+    # by the TestMapDivergenceRegression assertion during 6d.
     'cirros-qcow2':
         ('json', 'compressed-cluster reporting deferred; '
                  'cirros-0.6.3 uses compressed-cluster L2 entries'),
@@ -241,9 +244,10 @@ KNOWN_MAP_DIVERGENCES = {
     'vhdx-disk2vhd':
         ('json', 'instar vhdx walker emits BAT-level detail; '
                  'qemu-img emits one whole-image extent'),
-    'vhd-d2v-zerofilled':
-        ('json', 'instar vhd walker reports present=false for '
-                 'unallocated VHD; qemu-img reports present=true'),
+    # Note: vhd-d2v-zerofilled was a candidate divergence (VHD
+    # present:false vs true) but the actual fixture has allocated
+    # data and instar matches byte-for-byte. Removed by the
+    # TestMapDivergenceRegression assertion during 6d.
 
     # ---------- VHDX divergences ----------
     # instar's vhdx walker exposes the BAT entries individually
@@ -564,4 +568,176 @@ class TestMapWindowFilter(TestMapSmoke):
         self.assertTrue(
             stdout.endswith(']\n'),
             f'expected JSON output to end with ]\\n; got: {stdout[-20:]!r}'
+        )
+
+
+class TestMapErrorPaths(TestMapSmoke):
+    """Host-side guards from phase 3b: --image-opts refusal,
+    missing source, invalid sector size, chain image refusal.
+    """
+
+    def test_image_opts_rejected(self):
+        """--image-opts is rejected with a clear stderr message
+        pointing at docs/quirks.md."""
+        # Pass any file as the positional; --image-opts is
+        # refused before any file access happens.
+        stdout, stderr, rc = self.run_instar_map(
+            '--image-opts', '/dev/null',
+        )
+        self.assertNotEqual(rc, 0)
+        self.assertIn('--image-opts', stderr)
+
+    def test_missing_source_file_errors(self):
+        """Non-existent FILENAME returns non-zero."""
+        stdout, stderr, rc = self.run_instar_map(
+            '/tmp/this-file-definitely-does-not-exist-12345.qcow2',
+        )
+        self.assertNotEqual(rc, 0)
+
+    def test_invalid_sector_size_errors(self):
+        """Non-power-of-2 --sector-size is rejected."""
+        # Pick any image just to have a positional; sector_size
+        # is validated before any file access.
+        image = self.get_image('qcow2-min-cluster')
+        if not image.path.exists():
+            self.skipTest(f'fixture not available: {image.path}')
+        stdout, stderr, rc = self.run_instar_map(
+            str(image.path), '--sector-size', '1000',
+        )
+        self.assertNotEqual(rc, 0)
+        # Either the sector-size message or the clap-level
+        # error — both are acceptable failure modes.
+
+    def test_chain_qcow2_rejected_with_has_backing(self):
+        """A qcow2 source with a backing-file pointer is refused
+        by the guest with ERROR_HAS_BACKING; the host renders a
+        clear stderr message and returns non-zero."""
+        image = self.get_image('qcow2-overlay-chain')
+        if not image.path.exists():
+            self.skipTest(f'fixture not available: {image.path}')
+        stdout, stderr, rc = self.run_instar_map(str(image.path))
+        self.assertNotEqual(
+            rc, 0,
+            f'expected non-zero exit for chain source; '
+            f'stdout: {stdout[:200]!r}'
+        )
+        # The stderr message should mention backing/chain so the
+        # user knows why the operation was rejected.
+        combined = (stdout + stderr).lower()
+        self.assertTrue(
+            'backing' in combined or 'chain' in combined,
+            f'expected backing/chain mention in output; '
+            f'stderr: {stderr!r}'
+        )
+
+
+class TestMapDivergenceRegression(TestMapSmoke):
+    """Assert each KNOWN_MAP_DIVERGENCES entry still diverges.
+
+    If a future change accidentally lifts a documented
+    divergence (e.g. raw SEEK_HOLE gets implemented, the
+    compressed bit gets carried through the FFI, vhd `present`
+    semantics get fixed, etc.), the corresponding entry's
+    divergence-regression test will FAIL — surfacing the fix
+    as a prompt to clean up KNOWN_MAP_DIVERGENCES rather than
+    silently leaving the entry stale.
+
+    Per entry: run instar map against the image. If instar
+    refused (rc != 0), the divergence is still present (instar
+    can't handle the source). If instar succeeded, compare its
+    output to the baseline — assertNotEqual catches a silent
+    fix.
+    """
+
+
+def _make_divergence_regression_test(image_id, output_type, reason):
+    """Factory: return a test method that asserts the divergence
+    is still observable for one (image_id, output_type)."""
+
+    def test(self):
+        # Look the image up; skip if not on disk.
+        if image_id not in self._images_by_id:
+            self.skipTest(f'image id {image_id} not in manifest')
+        image_dict = next(
+            i for i in _safe_tier_images() if i['id'] == image_id
+        )
+        image_path = self._testdata_root / image_dict['path']
+        if not image_path.exists():
+            self.skipTest(f'image not found: {image_path}')
+
+        # Locate the baseline meta. If the baseline has rc != 0,
+        # there's nothing meaningful to compare against — the
+        # divergence is "qemu-img couldn't even run", which
+        # isn't a divergence we can regress *from*.
+        profiles = self.get_output_profiles(
+            output_type=output_type, command='map'
+        )
+        any_version = next(iter(profiles['version_to_profile']))
+        src_format = image_dict.get('format', 'unknown')
+        meta_path = (
+            self._testdata_root / 'expected-outputs' /
+            f'map-{output_type}' / src_format / any_version /
+            f'{image_id}.meta.json'
+        )
+        if not meta_path.exists():
+            self.skipTest(f'no baseline meta: {meta_path}')
+        with meta_path.open() as f:
+            meta = json.load(f)
+        if meta.get('return_code', 0) != 0:
+            self.skipTest(
+                f'baseline has non-zero exit; nothing to regress from'
+            )
+
+        stdout, _stderr, rc = self.run_instar_map(
+            str(image_path), '--output', output_type
+        )
+        if rc != 0:
+            # instar refused — divergence is "instar can't handle
+            # this source". Still divergent; test passes.
+            return
+
+        profile_name = self.get_profile_for_installed_qemu(
+            output_type=output_type, command='map'
+        )
+        try:
+            expected = self.get_expected_output(
+                image_id, profile_name,
+                output_type=output_type, command='map'
+            )
+        except FileNotFoundError:
+            self.skipTest(f'no baseline file for {image_id}')
+
+        # The whole point of this class: assert the divergence
+        # has NOT been silently fixed.
+        self.assertNotEqual(
+            stdout, expected,
+            f'KNOWN_MAP_DIVERGENCES entry for {image_id} '
+            f'({output_type}) appears to be fixed — '
+            f'instar now matches qemu-img. Reason was: {reason!r}. '
+            f'Remove this entry from KNOWN_MAP_DIVERGENCES so the '
+            f'TestMapBaselineSource factory exercises it.'
+        )
+
+    test.__name__ = (
+        f'test_divergence_{image_id.replace("-", "_")}_{output_type}'
+    )
+    test.__doc__ = (
+        f'Asserts {image_id} ({output_type}) still diverges from '
+        f'qemu-img. Reason: {reason}'
+    )
+    return test
+
+
+for _img_id, (_pattern, _reason) in KNOWN_MAP_DIVERGENCES.items():
+    _output_types = (
+        ('human', 'json') if _pattern == '*' else (_pattern,)
+    )
+    for _ot in _output_types:
+        _name = (
+            f'test_divergence_{_img_id.replace("-", "_")}_{_ot}'
+        )
+        setattr(
+            TestMapDivergenceRegression,
+            _name,
+            _make_divergence_regression_test(_img_id, _ot, _reason),
         )
