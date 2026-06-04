@@ -906,6 +906,22 @@ true` extent covering the whole virtual size. A host-side
 `SEEK_HOLE` pre-pass that feeds an extent list through
 `MapConfig` is tracked as future work.
 
+### VHD unallocated blocks are reported as `present: false`
+
+`qemu-img map` reports a dynamic VHD's unallocated BAT entries
+(`0xFFFFFFFF`) as `present: true, zero: true, data: false` —
+the same `ZeroAllocated` convention it applies to raw sparse
+runs. instar's vhd walker reports them as `present: false,
+zero: true, data: false` (`Hole`), faithful to the on-disk
+BAT marker. Functionally equivalent for downstream consumers
+that care only about which bytes contain data; visually
+different in the `present` field. Phase 6's
+`KNOWN_MAP_DIVERGENCES` (`hyperv-dynamic-vhd`,
+`virtualpc-vhd`) and phase 8's differential fuzzer
+(`MAP_FIELD_SKIPS` in `scripts/differential-fuzz.py`)
+both skip the `present` field on vpc sources for this
+reason.
+
 ### VHDX `PAYLOAD_BLOCK_PARTIALLY_PRESENT` is reported as `data: true`
 
 `qemu-img map` walks the per-sector bitmap for partially-
