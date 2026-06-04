@@ -474,7 +474,7 @@ of phase 1.
 | 6. Integration tests (`tests/test_map.py`) | [PLAN-map-phase-06-integration-tests.md](PLAN-map-phase-06-integration-tests.md) | Complete (95 active tests + 91 documented skips; two real bugs fixed mid-phase — JSON trailing newline, host-side start-offset check vs file-size) |
 | 7. Coverage-guided fuzz harnesses | [PLAN-map-phase-07-fuzz-coverage.md](PLAN-map-phase-07-fuzz-coverage.md) | Complete (fuzz_map_iter target landed; 60s smoke ~4M runs, 0 crashes, ongoing coverage growth) |
 | 8. Differential fuzzing extension | [PLAN-map-phase-08-fuzz-differential.md](PLAN-map-phase-08-fuzz-differential.md) | Complete (op_map landed; 200-iter smoke clean after a per-format `present`-field skip for vpc tracking the documented VHD-unallocated-block convention divergence) |
-| 9. Documentation, CHANGELOG, follow-ups | PLAN-map-phase-09-docs.md (not yet written) | Not started |
+| 9. Documentation, CHANGELOG, follow-ups | [PLAN-map-phase-09-docs.md](PLAN-map-phase-09-docs.md) | Not started |
 
 ### Phase notes (not yet detailed plans)
 
