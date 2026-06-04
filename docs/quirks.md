@@ -939,13 +939,18 @@ tracked as future work; once landed, the differential
 fuzzer will catch any remaining divergence on
 compressed-cluster sources.
 
-### No trailing newline after JSON `]`
+### Trailing newline after JSON `]`
 
-`qemu-img map --output=json` emits no trailing newline
-after the closing `]`. instar matches this byte-for-byte.
-Some JSON pretty-printers (e.g. `jq`) inject a trailing
-newline when reading; the difference shows up only when
-diffing the raw stdout against `qemu-img`.
+`qemu-img map --output=json` emits a single trailing
+newline after the closing `]`. instar matches this
+byte-for-byte. (An earlier draft of this document
+incorrectly stated "no trailing newline" based on a
+misread of `cat -A` output — `cat -A` places the `$`
+end-of-line marker *before* each newline, including the
+trailing one, which made the trailing newline easy to
+miss in spot-check verification. Phase 6's full baseline
+sweep surfaced the discrepancy and corrected the
+renderer.)
 
 ### Partial output on guest failure
 

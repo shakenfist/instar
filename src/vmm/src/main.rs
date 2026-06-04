@@ -10026,10 +10026,15 @@ impl<'a, W: std::io::Write> MapRenderer<'a, W> {
     /// after the last `emit_extent` and only on the success path
     /// (on error, the caller writes a stderr message instead and
     /// leaves the partial output in place).
+    ///
+    /// JSON mode emits `]\n` (closing bracket followed by a
+    /// trailing newline) to match qemu-img map exactly. Human mode
+    /// is a no-op — the last data row's `writeln!` already
+    /// produced its own trailing newline.
     fn finish(&mut self) -> std::io::Result<()> {
         match self.output_format {
             MapOutputFormat::Human => Ok(()),
-            MapOutputFormat::Json => write!(self.writer, "]"),
+            MapOutputFormat::Json => writeln!(self.writer, "]"),
         }
     }
 }
@@ -12351,7 +12356,7 @@ Offset          Length          Mapped to       File
     #[test]
     fn renderer_json_empty_extents_is_empty_array() {
         let out = render_json(&[]);
-        assert_eq!(out, b"[]");
+        assert_eq!(out, b"[]\n");
     }
 
     #[test]
@@ -12359,10 +12364,11 @@ Offset          Length          Mapped to       File
         let out = render_json(&[ext(0, 0x10000, "data", 0x50000)]);
         // Field order: start, length, depth, present, zero, data,
         // compressed, offset. Single space after { and , — no
-        // space before }.
+        // space before }. Trailing newline after `]` matches
+        // qemu-img exactly.
         let expected = b"[{ \"start\": 0, \"length\": 65536, \"depth\": 0, \
                           \"present\": true, \"zero\": false, \"data\": true, \
-                          \"compressed\": false, \"offset\": 327680}]";
+                          \"compressed\": false, \"offset\": 327680}]\n";
         assert_eq!(out, expected);
     }
 
@@ -12373,7 +12379,7 @@ Offset          Length          Mapped to       File
         // compressed: false always emitted.
         let expected = b"[{ \"start\": 0, \"length\": 1048576, \"depth\": 0, \
                           \"present\": false, \"zero\": true, \"data\": false, \
-                          \"compressed\": false}]";
+                          \"compressed\": false}]\n";
         assert_eq!(out, expected);
     }
 
@@ -12420,18 +12426,23 @@ Offset          Length          Mapped to       File
                           \"compressed\": false},\n\
                           { \"start\": 131072, \"length\": 65536, \"depth\": 0, \
                           \"present\": true, \"zero\": false, \"data\": true, \
-                          \"compressed\": false, \"offset\": 458752}]";
+                          \"compressed\": false, \"offset\": 458752}]\n";
         assert_eq!(out, expected);
     }
 
     #[test]
-    fn json_no_trailing_newline_after_closing_bracket() {
+    fn json_trailing_newline_after_closing_bracket() {
+        // qemu-img map --output=json emits a trailing newline
+        // after the closing `]`; the phase 5 baselines confirm
+        // this. Earlier plan-doc and quirks notes mistakenly said
+        // "no trailing newline" — that was based on misreading
+        // cat -A output (the $ marker appears before each
+        // newline, not after). Updated 6b.
         let out = render_json(&[ext(0, 0x10000, "data", 0)]);
         assert!(
-            !out.ends_with(b"\n"),
-            "JSON output must not have a trailing newline"
+            out.ends_with(b"]\n"),
+            "JSON output must end with `]\\n` to match qemu-img"
         );
-        assert!(out.ends_with(b"]"));
     }
 
     #[test]
