@@ -9528,18 +9528,17 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
         0
     };
 
-    // --- Host-side --start-offset > source size check --------------------
-    // The guest's clip_to_window would silently emit nothing in this case;
-    // catch it here so the user sees a clear error.
+    // Read the source file metadata to size the virtio device,
+    // but do NOT pre-check start_offset against the file size:
+    // for sparse qcow2 the on-disk file size is smaller than the
+    // virtual size that start_offset is measured against. The
+    // guest's clip_to_window silently emits nothing if
+    // start_offset >= virtual_size, matching qemu-img map's
+    // behaviour (verified against qemu-img 10.0.8: past-EOF
+    // start-offset returns rc=0 with just the header / empty
+    // JSON array).
     let input_meta = std::fs::metadata(input_path)?;
     let input_size = input_meta.len();
-    if start_offset >= input_size && input_size != 0 {
-        return Err(format!(
-            "map: --start-offset {} is past the end of the image ({} bytes)",
-            start_offset, input_size
-        )
-        .into());
-    }
 
     // --- Load guest binaries --------------------------------------------
     let core_path = get_binary_path("core.bin");

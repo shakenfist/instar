@@ -21,7 +21,10 @@ from `TestMapSmoke`:
 """
 
 import json
+import os
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 from base import InstarTestBase
@@ -380,4 +383,185 @@ for _img in _safe_tier_images():
             TestMapBaselineSource,
             _name,
             _make_map_source_test(_img, _ot),
+        )
+
+
+class TestMapWindowFilter(TestMapSmoke):
+    """`--start-offset` / `--max-length` window filter behaviour.
+
+    These tests construct a small fragmented qcow2 fixture in a
+    `tempfile.mkdtemp()` directory (cleaned up in `setUp`/
+    `addCleanup`) via the recipe from phase 4a: `truncate` a
+    1 MiB raw image, write 64 KiB of data at offset 0 and at
+    offset 0x80000, then `qemu-img convert -f raw -O qcow2` to
+    produce a qcow2 with two allocated extents separated by a
+    hole.
+
+    Tests assert *structural* properties (extent count, byte
+    ranges, presence/absence of specific offsets) rather than
+    byte-equality against qemu-img — the phase 4a `MapRenderer`
+    unit tests already pin the byte-level shape, and adding
+    qemu-img comparison here would duplicate that coverage.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # Skip the whole class if qemu-img isn't available — the
+        # fixture construction depends on it.
+        if shutil.which('qemu-img') is None:
+            cls._fixture_path = None
+            return
+        cls._fixture_dir = tempfile.mkdtemp(prefix='instar-map-window-')
+        raw_path = os.path.join(cls._fixture_dir, 'fixture.raw')
+        qcow_path = os.path.join(cls._fixture_dir, 'fixture.qcow2')
+        subprocess.run(['truncate', '-s', '1M', raw_path], check=True)
+        # Two 64 KiB data runs at offsets 0 and 0x80000 (512 KiB).
+        with open(raw_path, 'r+b') as f:
+            f.seek(0)
+            f.write(b'\xab' * 0x10000)
+            f.seek(0x80000)
+            f.write(b'\xcd' * 0x10000)
+        subprocess.run(
+            ['qemu-img', 'convert', '-f', 'raw', '-O', 'qcow2',
+             raw_path, qcow_path],
+            check=True,
+        )
+        cls._fixture_path = qcow_path
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            fixture_dir = getattr(cls, '_fixture_dir', None)
+            if fixture_dir:
+                shutil.rmtree(fixture_dir, ignore_errors=True)
+        finally:
+            super().tearDownClass()
+
+    def _require_fixture(self):
+        if not getattr(self, '_fixture_path', None):
+            self.skipTest('qemu-img not available; cannot build fixture')
+
+    def test_default_window_emits_all_extents(self):
+        """No window flags: emit both allocated extents plus the
+        intermediate hole."""
+        self._require_fixture()
+        stdout, stderr, rc = self.run_instar_map(
+            self._fixture_path, '--output', 'json'
+        )
+        self.assertEqual(rc, 0, f'stderr: {stderr}')
+        # The fragmented fixture has at least two data extents
+        # (one at offset 0, one at 0x80000). Older qcow2 layouts
+        # may coalesce neighbouring zero ranges, so accept >=2
+        # rather than pinning an exact count.
+        data_count = stdout.count('"data": true')
+        self.assertGreaterEqual(
+            data_count, 2,
+            f'expected >=2 data extents; got {data_count}\n'
+            f'stdout: {stdout[:400]!r}',
+        )
+
+    def test_start_offset_clips_leading_extents(self):
+        """--start-offset=0x80000: only the second data extent
+        appears."""
+        self._require_fixture()
+        stdout, stderr, rc = self.run_instar_map(
+            self._fixture_path, '--start-offset', '512K',
+            '--output', 'json',
+        )
+        self.assertEqual(rc, 0, f'stderr: {stderr}')
+        # No extent should start before the window.
+        # Every "start": value must be >= 0x80000 (524288).
+        # Pull out the "start": N values and check the min.
+        starts = []
+        for line in stdout.splitlines():
+            # Each extent object is one line; find "start": N
+            idx = line.find('"start": ')
+            if idx >= 0:
+                rest = line[idx + len('"start": '):]
+                num = ''
+                for ch in rest:
+                    if ch.isdigit():
+                        num += ch
+                    else:
+                        break
+                if num:
+                    starts.append(int(num))
+        self.assertTrue(starts, 'expected at least one extent')
+        self.assertGreaterEqual(
+            min(starts), 0x80000,
+            f'extent starts {starts!r} must all be >= 0x80000'
+        )
+
+    def test_max_length_clips_trailing_extents(self):
+        """--max-length=0x10000: only the first data extent fits."""
+        self._require_fixture()
+        stdout, stderr, rc = self.run_instar_map(
+            self._fixture_path, '--max-length', '64K',
+            '--output', 'json',
+        )
+        self.assertEqual(rc, 0, f'stderr: {stderr}')
+        # The second data extent (at 0x80000) must not appear
+        # in the output.
+        self.assertNotIn(
+            '"start": 524288', stdout,
+            'extent at 0x80000 should be clipped by --max-length'
+        )
+
+    def test_start_offset_plus_max_length_window(self):
+        """Combined window: --start-offset=0x80000 --max-length=0x10000
+        — emit only the second data extent."""
+        self._require_fixture()
+        stdout, stderr, rc = self.run_instar_map(
+            self._fixture_path,
+            '--start-offset', '512K',
+            '--max-length', '64K',
+            '--output', 'json',
+        )
+        self.assertEqual(rc, 0, f'stderr: {stderr}')
+        # Exactly one Data extent should be emitted (the one at
+        # 0x80000); coalescing with adjacent holes in the
+        # 64 KiB window keeps the JSON object count tight.
+        data_count = stdout.count('"data": true')
+        self.assertEqual(
+            data_count, 1,
+            f'expected exactly 1 data extent in window; '
+            f'got {data_count}: {stdout!r}'
+        )
+
+    def test_start_offset_past_eof_emits_empty(self):
+        """--start-offset >= virtual_size silently emits empty
+        output and exits 0, matching qemu-img map's behaviour.
+
+        Verified against qemu-img 10.0.8: `qemu-img map
+        --start-offset=10G <tiny.qcow2>` returns rc=0 with just
+        the human header row (or `[]\\n` for JSON).
+        """
+        self._require_fixture()
+        # Use a huge offset that clearly exceeds the 1 MiB virtual
+        # size.
+        stdout, stderr, rc = self.run_instar_map(
+            self._fixture_path, '--start-offset', '1T',
+            '--output', 'json',
+        )
+        self.assertEqual(rc, 0, f'stderr: {stderr}')
+        # Empty extent list (qemu-img matches this).
+        self.assertEqual(
+            stdout, '[]\n',
+            f'expected empty JSON array; got: {stdout!r}'
+        )
+
+    def test_max_length_past_eof_clips_silently(self):
+        """--max-length larger than virtual_size silently clips at
+        the image end (no error)."""
+        self._require_fixture()
+        stdout, stderr, rc = self.run_instar_map(
+            self._fixture_path, '--max-length', '1T',
+            '--output', 'json',
+        )
+        self.assertEqual(rc, 0, f'stderr: {stderr}')
+        # Should produce valid JSON output ending with `]\n`.
+        self.assertTrue(
+            stdout.endswith(']\n'),
+            f'expected JSON output to end with ]\\n; got: {stdout[-20:]!r}'
         )
