@@ -471,7 +471,7 @@ of phase 1.
 | 3. Host VMM subcommand + clap surface | [PLAN-map-phase-03-host-cli.md](PLAN-map-phase-03-host-cli.md) | Not started |
 | 4. Output formatting (human / JSON) | [PLAN-map-phase-04-output-formatting.md](PLAN-map-phase-04-output-formatting.md) | Not started |
 | 5. Cross-version baseline generation in `instar-testdata` | [PLAN-map-phase-05-baselines.md](PLAN-map-phase-05-baselines.md) | Complete (instar-testdata commits `4e56008d8`, `8e0498ca3`, `315859c3d`, `0f972d5b1`; 80 versions; 1 map-human profile + 3 map-json profiles) |
-| 6. Integration tests (`tests/test_map.py`) | PLAN-map-phase-06-integration-tests.md (not yet written) | Not started |
+| 6. Integration tests (`tests/test_map.py`) | [PLAN-map-phase-06-integration-tests.md](PLAN-map-phase-06-integration-tests.md) | Not started |
 | 7. Coverage-guided fuzz harnesses | PLAN-map-phase-07-fuzz-coverage.md (not yet written) | Not started |
 | 8. Differential fuzzing extension | PLAN-map-phase-08-fuzz-differential.md (not yet written) | Not started |
 | 9. Documentation, CHANGELOG, follow-ups | PLAN-map-phase-09-docs.md (not yet written) | Not started |
