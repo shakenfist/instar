@@ -460,6 +460,15 @@ provides a modular architecture with:
   `compressed: false`, VHDX partially-present treated as data,
   no backing-chain depth in v1). BrokenPipe on stdout (user
   piped into `head`) short-circuits cleanly with exit 0.
+  Integration tests in `tests/test_map.py` cross-validate
+  `instar map` against the `qemu-img map` baselines in
+  `instar-testdata/expected-outputs/map-*` for every safe-tier
+  image, plus in-test fixtures for window-filter behaviour,
+  host-side error paths (`--image-opts` refusal, chain image
+  refusal, invalid sector size), and a divergence-regression
+  suite that catches accidental fixes to known instar-vs-
+  qemu-img gaps so `KNOWN_MAP_DIVERGENCES` doesn't go stale.
+  Phase 6 baseline: 95 active tests + 91 documented skips.
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation,

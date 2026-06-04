@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`instar map` integration tests (PLAN-map phase 6).**
+  Adds `tests/test_map.py` with five test classes:
+  `TestMapSmoke` (wiring), `TestMapBaselineSource`
+  (per-image factory cross-validating against the phase 5
+  baselines), `TestMapWindowFilter` (in-test fixtures
+  exercising `--start-offset` / `--max-length`),
+  `TestMapErrorPaths` (host-side guards), and
+  `TestMapDivergenceRegression` (assertNotEqual against
+  baselines for entries in `KNOWN_MAP_DIVERGENCES` so a
+  silent fix surfaces loudly). 95 active tests + 91
+  documented skips; the skips track real divergences
+  documented in `docs/quirks.md`. Surfaced two bugs during
+  development: (1) JSON output was missing a trailing
+  newline (renderer fixed; phase 4's "no trailing newline"
+  doc note corrected — it was a `cat -A` misread); (2)
+  host-side `--start-offset > file_size` check compared
+  against the on-disk file size rather than the virtual
+  size, causing spurious rejections for sparse qcow2
+  sources (check removed; qemu-img's silent past-EOF
+  behaviour preserved).
 - **`instar map` cross-version baselines (PLAN-map phase 5).**
   Generates `map-human` and `map-json` baselines for all 80
   qemu-img versions (6.0.0 through 10.2.x) across every
