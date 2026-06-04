@@ -120,6 +120,12 @@ doc = false
 test = false
 
 [[bin]]
+name = "fuzz_map_iter"
+path = "fuzz_targets/fuzz_map_iter.rs"
+doc = false
+test = false
+
+[[bin]]
 name = "fuzz_create_emitters"
 path = "fuzz_targets/fuzz_create_emitters.rs"
 doc = false
