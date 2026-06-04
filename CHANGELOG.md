@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`instar map` differential fuzzer extension (PLAN-map phase 8).**
+  Adds `op_map` to `scripts/differential-fuzz.py`'s random
+  operation chain. For each randomly-generated image (raw
+  gated out), runs `instar map --output=json` and
+  `qemu-img map --output=json` against independent copies
+  and compares the resulting JSON arrays extent-by-extent on
+  `{start, length, present, zero, data}`. Window-arg coverage
+  (`--start-offset` / `--max-length`, 25%/25% probabilities,
+  64-KiB-aligned) diversifies the filter path. A per-format
+  `MAP_FIELD_SKIPS` catalogue handles documented divergences
+  — `vpc` skips the `present` field (instar reports VHD
+  unallocated BAT entries as `present=false` faithful to
+  `0xFFFFFFFF`; qemu-img reports them as `present=true,
+  zero=true` matching the ZeroAllocated convention also used
+  for raw sparse runs). 200-iteration local smoke (seed=1):
+  zero divergences after the field skip; pre-fix run surfaced
+  14 of the same vpc-present divergence, confirming `op_map`
+  is exercised. CI auto-discovery via the existing
+  `differential-fuzz.yml` workflow — no workflow edit.
+  Documented the VHD-unallocated-block convention in
+  `docs/quirks.md` alongside the analogous raw-sparseness and
+  vhdx-partial-present entries.
 - **`instar map` coverage-guided fuzz harness (PLAN-map phase 7).**
   Adds `src/fuzz/fuzz_targets/fuzz_map_iter.rs`: a libFuzzer
   target that dispatches on a format prefix byte

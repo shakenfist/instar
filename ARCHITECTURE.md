@@ -738,7 +738,7 @@ For each iteration it:
    cluster size, compression, and data patterns).
 2. Creates separate copies for instar and qemu-img.
 3. Runs a random chain of 2-4 operations (info, check, convert, compressed
-   convert, measure, create) against both tools.
+   convert, measure, create, resize, rebase, commit, map) against both tools.
 4. Compares outputs: exit codes, JSON info output (after normalisation to
    remove known-divergent fields like disk size), and converted file content
    (via SHA-256 of raw-flattened output).
@@ -757,6 +757,19 @@ the convert writer's per-block sector alignment slack
 Known quirks (see `docs/quirks.md`) are excluded from comparison: non-QCOW2
 formats for `check` (qemu-img only checks QCOW2), disk size fields, and
 format-specific metadata.
+
+The `map` operation runs `instar map --output=json` and
+`qemu-img map --output=json` against independent copies and
+compares the resulting JSON arrays extent-by-extent on
+`{start, length, present, zero, data}`. `{depth, compressed,
+offset, filename}` are skipped (always 0 / always false /
+compressed-cluster reporting drift / different paths). `raw` is
+gated out entirely (SEEK_HOLE divergence). A per-format
+`MAP_FIELD_SKIPS` catalogue skips the `present` field on `vpc`
+sources, matching the documented VHD-unallocated-block
+convention difference (`docs/quirks.md`). With ~25%/25%
+probabilities, window args (`--start-offset` / `--max-length`)
+are picked 64-KiB-aligned and passed to both binaries.
 
 The `create` operation has its own dual oracle: it creates the same
 image via `instar create` and the system `qemu-img create` into

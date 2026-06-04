@@ -3,7 +3,22 @@
 Master plan: [PLAN-map.md](PLAN-map.md) ·
 Previous phase: [PLAN-map-phase-07-fuzz-coverage.md](PLAN-map-phase-07-fuzz-coverage.md)
 
-## Status: Not started
+## Status: Complete
+
+Both steps committed. `op_map` is wired into the random
+operation chain in `scripts/differential-fuzz.py`. The 200-
+iteration local smoke (seed=1) initially surfaced 14
+divergences all of one shape — vpc unallocated BAT blocks
+report `present=false` from instar (true to `0xFFFFFFFF`)
+vs `present=true, zero=true` from qemu-img (the
+ZeroAllocated convention also used for raw sparse runs).
+This matches phase 6's `KNOWN_MAP_DIVERGENCES` entries for
+`hyperv-dynamic-vhd` and `virtualpc-vhd`. Added a per-format
+`MAP_FIELD_SKIPS` catalogue that skips the `present` field
+on `vpc` while keeping `{start, length, zero, data}` active
+— catches BAT-walking boundary bugs without flooding on the
+documented semantic difference. Documented in
+`docs/quirks.md`. Re-run: 200 iterations, 0 divergences.
 
 ## Mission
 
