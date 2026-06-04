@@ -30,6 +30,7 @@ COMMAND_OUTPUT_DIRS = {
     'compare': 'compare',    # compare-human, compare-json
     'measure': 'measure',    # measure-human, measure-json
     'create': 'create-info', # create-info-json (json-only, no human variant)
+    'map': 'map',            # map-human, map-json (PLAN-map phase 6)
 }
 
 
@@ -186,6 +187,58 @@ class InstarTestBase(testtools.TestCase):
         if len(parts) >= 2:
             return f'{parts[0]}.{parts[1]}'
         return parts[0]
+
+    def get_profile_for_installed_qemu(
+        self,
+        output_type: str,
+        command: str,
+    ) -> str:
+        """
+        Resolve the profile name matching the host's qemu-img version.
+
+        Phase 5's map-json baselines produced 3 profiles (with two
+        format transitions across the 6.0-10.2 range), so the
+        existing `next(iter(profiles['profiles']))` pattern is no
+        longer safe for any command that has multiple profiles for
+        a given output_type. This helper looks up the host's
+        qemu-img version in `version_to_profile` via major-minor
+        prefix matching.
+
+        Args:
+            output_type: 'human' or 'json'
+            command: 'info', 'check', 'measure', 'map', etc.
+
+        Returns:
+            Profile name (e.g. 'profile-10-0-0'). Falls back to
+            the first profile in the version map when the host's
+            qemu-img version isn't in the matrix (e.g. a newer
+            qemu-img than the baselines cover); byte-equality
+            assertions will then surface real format drift.
+        """
+        profiles = self.get_output_profiles(output_type, command)
+        v2p = profiles.get('version_to_profile', {})
+        if not v2p:
+            return next(iter(profiles['profiles']))
+
+        if self._qemu_version is None:
+            return next(iter(v2p.values()))
+
+        major, minor = self._qemu_version
+        prefix = f'{major}.{minor}.'
+        for key, profile in v2p.items():
+            if key.startswith(prefix):
+                return profile
+        # Major-version fallback: pick the closest version with a
+        # matching major, irrespective of minor. Useful when the
+        # host runs qemu-img 10.99 and the baselines stop at 10.2.
+        major_prefix = f'{major}.'
+        for key, profile in v2p.items():
+            if key.startswith(major_prefix):
+                return profile
+        # Last resort: first entry in the map. Real format drift
+        # will fail the byte-equality assertion with a clear
+        # message.
+        return next(iter(v2p.values()))
 
     def get_image(self, image_id: str) -> TestImage:
         """Get a test image by its ID."""
