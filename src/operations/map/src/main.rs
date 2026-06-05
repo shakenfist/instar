@@ -30,8 +30,8 @@ use core::panic::PanicInfo;
 
 use shared::{
     format_detection::detect_format_from_header, validate_call_table, CallTable, ImageFormat,
-    MapConfig, MapExtent, MapExtentCoalescer, MapExtentRecord, MapExtentState, MapResult,
-    CALL_TABLE_ADDR, MAX_SECTOR_SIZE, OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE,
+    MapConfig, MapExtent, MapExtentRecord, MapExtentState, MapResult, CALL_TABLE_ADDR,
+    MAX_SECTOR_SIZE, OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE,
 };
 
 /// Scratch memory layout for map: one header buffer plus two
@@ -285,6 +285,15 @@ pub unsafe extern "C" fn _start() -> u64 {
     // Dispatch on format. For raw we skip init entirely (the
     // raw walker is pure). For the others, we init state and
     // then map_extents through the closure.
+    //
+    // Window-abort invariant: each emit closure returns false
+    // once `e.start + e.length >= win_end` to stop the walker
+    // early. This relies on every per-format walker emitting
+    // contiguous extents in virtual-offset order — a chain-aware
+    // shadowing walker (future work) that skips already-covered
+    // ranges would need a different abort condition, since an
+    // extent past the window does not imply no further in-window
+    // extents.
     let walk_err: u32 = match format {
         ImageFormat::Raw => {
             let (win_start, win_end) = resolve_window(virtual_size);
@@ -552,11 +561,3 @@ pub unsafe extern "C" fn _start() -> u64 {
         bytes_read,
     )
 }
-
-// Suppress dead-code warnings: MapExtentCoalescer is currently
-// unused at this layer (the per-format walkers wrap their own
-// coalescer internally). Kept as a transitive import to ensure
-// the type stays compiled into the shared crate's surface that
-// future versions of the walkers may consume directly.
-#[allow(dead_code)]
-type _UnusedCoalescer<'a, F> = MapExtentCoalescer<'a, F>;

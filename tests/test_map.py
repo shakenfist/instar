@@ -152,10 +152,14 @@ def _safe_tier_images():
 #     qemu-img walks the chain.
 #   * Compressed-cluster reporting: instar emits compressed: false
 #     unconditionally; qemu-img emits compressed: true for
-#     compressed cluster extents. cirros-qcow2 and qcow2-zstd have
-#     compressed clusters; cirros has return_code=1 in baseline so
-#     it's caught by the non-zero-baseline skip path, but qcow2-zstd
-#     is included for the json output type.
+#     compressed cluster extents. cirros-qcow2 has compressed
+#     clusters and return_code=1 in its baseline, so it's caught
+#     by the non-zero-baseline skip path. qcow2-zstd was a
+#     candidate divergence (compressed-cluster reporting) but the
+#     fixture happens not to exercise compressed clusters in
+#     practice — TestMapDivergenceRegression's assertNotEqual
+#     surfaced this during 6d and the entry was removed (see the
+#     comment on the removed entry below).
 #   * Raw sparseness: instar emits one fully-allocated Data extent;
 #     qemu-img walks SEEK_HOLE.
 #   * Image-specific divergences surfaced empirically: this list

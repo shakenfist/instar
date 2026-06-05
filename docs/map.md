@@ -25,7 +25,7 @@ Common options:
       --output <FORMAT>           human (default) | json
       --start-offset <OFFSET>     Emit extents starting at OFFSET bytes
       --max-length <LEN>          Stop emission at OFFSET + LEN bytes
-      --sector-size <N>           Source sector size (default: 512)
+      --sector-size <N>           Source sector size (default: 65536)
 ```
 
 `--image-opts` is explicitly rejected; the positional `<INPUT>`
@@ -100,8 +100,12 @@ implementation lives in `<format>::map_extents` in
 L1 table → L2 tables walk. Per L2 entry:
 
 - Zero/unallocated entry (`0`): `Hole`.
-- `QCOW2_CLUSTER_ZERO_PLAIN` / `QCOW2_CLUSTER_ZERO_ALLOC`:
-  `ZeroAllocated`.
+- `QCOW2_CLUSTER_ZERO_PLAIN` / `QCOW2_CLUSTER_ZERO_ALLOC`
+  (extended-L2 subcluster bitmap only): `ZeroAllocated`. On
+  *standard* L2 tables instar does not honour the qcow2 v3
+  `QCOW_OFLAG_ZERO` bit and reports such clusters as `Data`
+  (or `Hole` when `host_offset == 0`). See the "Known
+  divergences" section below.
 - Allocated cluster: `Data` with the L2 host-cluster offset as the
   `file_offset`.
 - Compressed cluster: `Data` with the compressed-payload file
@@ -172,6 +176,13 @@ rationale and the future-work pointer.
   (monolithicFlat, 2GbMaxExtent…) sources fail host-side via
   `peek_is_vmdk_descriptor`. Use `qemu-img map` as the workaround.
   See [docs/quirks.md § VMDK multi-extent sources are refused](quirks.md#vmdk-multi-extent-sources-are-refused).
+- **qcow2 v3 standard-L2 `QCOW_OFLAG_ZERO` not honoured** — for
+  qcow2 v3 (compat=1.1) images that use standard 8-byte L2
+  entries, instar reports `QCOW2_CLUSTER_ZERO_PLAIN` /
+  `_ZERO_ALLOC` clusters as `Data` (or `Hole` when
+  `host_offset == 0`) rather than `ZeroAllocated`. Extended-L2
+  subcluster bitmaps are unaffected. See
+  [docs/quirks.md § qcow2 v3 standard-L2 `QCOW_OFLAG_ZERO` not honoured](quirks.md#qcow2-v3-standard-l2-qcow_oflag_zero-not-honoured).
 - **qcow2 compressed clusters report `compressed: false`** —
   instar's renderer always emits `false`; qemu-img emits `true`
   for compressed-cluster extents. The `file_offset` field for
@@ -214,6 +225,10 @@ sources for the same VHD-unallocated reason.
   compressed bit through the FFI and renderer; strip the
   `nb_sectors-1` bits from the file offset to match qemu-img's
   high-bit-set marker convention.
+- **qcow2 v3 standard-L2 `QCOW_OFLAG_ZERO` honouring** — branch
+  on the bit in `classify_qcow2_l2_standard` and emit
+  `ZeroAllocated`. A matching `cluster_lookup` change is the
+  prerequisite so the parser stays consistent across operations.
 - **`-l SNAPSHOT` snapshot-targeted mapping** — reuses convert's
   snapshot machinery.
 - **`--image-opts` parsing** — deferred until a real user requests

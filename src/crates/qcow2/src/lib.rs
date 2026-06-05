@@ -1270,7 +1270,8 @@ pub fn count_allocated_in_l2_extended(
 /// any non-zero entry without `OFLAG_COMPRESSED` as `Standard`.
 /// map matches that behaviour for consistency. ZeroAllocated
 /// reporting is exclusively driven by the extended-L2 subcluster
-/// bitmap. Documented in `docs/quirks.md` (see PLAN-map-phase-09).
+/// bitmap. Documented in `docs/quirks.md § qcow2 v3 standard-L2
+/// `QCOW_OFLAG_ZERO` not honoured`.
 pub fn classify_qcow2_l2_standard(entry: u64, virtual_offset: u64, cluster_size: u64) -> MapExtent {
     if entry == 0 {
         return MapExtent {

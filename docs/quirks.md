@@ -941,6 +941,25 @@ host CLI also refuses them via `peek_is_vmdk_descriptor`
 before launching the guest, pointing the user at `qemu-img
 map` as the workaround.
 
+### qcow2 v3 standard-L2 `QCOW_OFLAG_ZERO` not honoured
+
+In qcow2 v3 (compat=1.1) images that use *standard* L2 tables
+(8-byte entries, not extended L2), the `QCOW_OFLAG_ZERO` bit
+(bit 0) on an L2 entry signals `QCOW2_CLUSTER_ZERO_PLAIN`
+(when `host_offset == 0`) or `QCOW2_CLUSTER_ZERO_ALLOC` (when
+`host_offset != 0`) — both of which qemu-img reports as
+`present: true, zero: true, data: false` (`ZeroAllocated`).
+instar's `classify_qcow2_l2_standard` ignores the bit and
+treats any non-zero L2 entry without `OFLAG_COMPRESSED` as
+`Data`; if `host_offset == 0` it reports `Hole`. This is a
+pre-existing gap in the qcow2 parser (`cluster_lookup` has no
+`OFLAG_ZERO` branch either) inherited by map for consistency.
+Reporting the bit correctly is a single-edit change in
+`classify_qcow2_l2_standard` once we want to land it; tracked
+as future work in PLAN-map.md. Extended-L2 subcluster-bitmap
+`ZeroAllocated` reporting is unaffected — instar walks the
+bitmap and classifies subclusters correctly.
+
 ### qcow2 compressed clusters report `compressed: false`
 
 `qemu-img map` emits `compressed: true` for extents that

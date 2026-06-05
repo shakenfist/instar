@@ -147,6 +147,12 @@ const MAP_CONFIG_MAGIC: u32 = 0x4D41505F; // "MAP_"
 const MAP_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
 
 // MapResult constants (must match shared::MapResult)
+// Kept for symmetry with the other operations' magic constants
+// and for future host-side use (e.g. directly inspecting a
+// MapResult FFI struct in shared memory). The current host path
+// consumes MapResultMessage from the serial channel, which
+// doesn't carry the FFI magic.
+#[allow(dead_code)]
 const MAP_RESULT_MAGIC: u32 = 0x4D505253; // "MPRS"
 const MAP_RESULT_ERROR_OK: u32 = 0;
 const MAP_RESULT_ERROR_INVALID_SOURCE: u32 = 1;
@@ -9480,12 +9486,6 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 /// CLI with a placeholder renderer (step 3c); phase 4 polishes
 /// the renderer to byte-for-byte qemu-img parity.
 fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
-    // Touch the result magic so the constant block stays
-    // referenced (the on-wire message uses the magic
-    // implicitly via the FFI struct; the host doesn't
-    // dereference it directly).
-    let _ = MAP_RESULT_MAGIC;
-
     // --- Validate args ---------------------------------------------------
     if args.image_opts {
         return Err(
