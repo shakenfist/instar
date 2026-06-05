@@ -290,6 +290,39 @@ message CommitResultMessage {
   uint32 error = 6;
 }
 
+// Single coalesced map extent (from map operation). Sent once
+// per emitted extent; followed by a MapResultMessage terminator
+// after the last extent. The host accumulates these into the
+// rendered human / JSON output in phase 4.
+message MapExtentMessage {
+  // Virtual offset of the extent's first byte.
+  uint64 start = 1;
+  // Extent length in bytes. Never zero.
+  uint64 length = 2;
+  // State: "hole" | "zero" | "data". Mirrors
+  // MapExtentRecord::STATE_* in src/shared/src/lib.rs.
+  string state = 3;
+  // Source file offset; only meaningful when state == "data".
+  // Host renderer omits the JSON field when state != "data".
+  uint64 file_offset = 4;
+}
+
+// Map operation summary (sent after the last MapExtentMessage).
+message MapResultMessage {
+  // Source format echoed back (e.g. "raw", "qcow2", "vmdk",
+  // "vhd", "vhdx").
+  string source_format = 1;
+  // Number of MapExtentMessage records sent during this
+  // invocation. The host can sanity-check the receive count.
+  uint64 extents_emitted = 2;
+  // Virtual size of the source image, in bytes.
+  uint64 virtual_size = 3;
+  // Error code: 0 = ok, non-zero mirrors MapResult::ERROR_*
+  // in src/shared/src/lib.rs (1=invalid_source, 2=invalid_option,
+  // 3=has_backing, 4=io).
+  uint32 error = 4;
+}
+
 // Main message wrapper with level and payload
 message GuestMessage {
   Level level = 1;
@@ -307,5 +340,7 @@ message GuestMessage {
     ResizeResultMessage resize_result = 12;
     RebaseResultMessage rebase_result = 13;
     CommitResultMessage commit_result = 14;
+    MapExtentMessage map_extent = 15;
+    MapResultMessage map_result = 16;
   }
 }

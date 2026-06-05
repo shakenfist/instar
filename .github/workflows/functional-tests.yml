@@ -94,7 +94,8 @@ jobs:
               --exclude create-op \
               --exclude resize-op \
               --exclude rebase-op \
-              --exclude commit-op
+              --exclude commit-op \
+              --exclude map-op
 
       - name: Test config commands in container
         run: |

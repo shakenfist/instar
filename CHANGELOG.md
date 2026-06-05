@@ -9,6 +9,132 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`instar map` differential fuzzer extension (PLAN-map phase 8).**
+  Adds `op_map` to `scripts/differential-fuzz.py`'s random
+  operation chain. For each randomly-generated image (raw
+  gated out), runs `instar map --output=json` and
+  `qemu-img map --output=json` against independent copies
+  and compares the resulting JSON arrays extent-by-extent on
+  `{start, length, present, zero, data}`. Window-arg coverage
+  (`--start-offset` / `--max-length`, 25%/25% probabilities,
+  64-KiB-aligned) diversifies the filter path. A per-format
+  `MAP_FIELD_SKIPS` catalogue handles documented divergences
+  — `vpc` skips the `present` field (instar reports VHD
+  unallocated BAT entries as `present=false` faithful to
+  `0xFFFFFFFF`; qemu-img reports them as `present=true,
+  zero=true` matching the ZeroAllocated convention also used
+  for raw sparse runs). 200-iteration local smoke (seed=1):
+  zero divergences after the field skip; pre-fix run surfaced
+  14 of the same vpc-present divergence, confirming `op_map`
+  is exercised. CI auto-discovery via the existing
+  `differential-fuzz.yml` workflow — no workflow edit.
+  Documented the VHD-unallocated-block convention in
+  `docs/quirks.md` alongside the analogous raw-sparseness and
+  vhdx-partial-present entries.
+- **`instar map` coverage-guided fuzz harness (PLAN-map phase 7).**
+  Adds `src/fuzz/fuzz_targets/fuzz_map_iter.rs`: a libFuzzer
+  target that dispatches on a format prefix byte
+  (qcow2/vmdk/vhd/vhdx) and drives each parser's `map_extents`
+  walker through the existing `instar_fuzz` mock CallTable.
+  Records emitted extents into a 1 M-cap Vec and asserts the
+  partition invariant — every byte of `[0, virtual_size)` must
+  be covered by exactly one extent, with no overlaps, no gaps,
+  no zero-length records, and no `start+length` overflow. That
+  stricter assertion catches off-by-one cluster-boundary bugs
+  that `fuzz_measure_scan`'s summary check (`allocated_bytes
+  <= virtual_size`) cannot see. raw is omitted (pure of
+  virtual_size, no on-disk input surface). 60-second smoke run
+  reaches ~4M iterations with libFuzzer reporting ongoing
+  coverage growth and zero crashes. CI integration via
+  `.github/workflows/coverage-fuzz.yml`'s auto-discovery — no
+  workflow edit required.
+- **`instar map` integration tests (PLAN-map phase 6).**
+  Adds `tests/test_map.py` with five test classes:
+  `TestMapSmoke` (wiring), `TestMapBaselineSource`
+  (per-image factory cross-validating against the phase 5
+  baselines), `TestMapWindowFilter` (in-test fixtures
+  exercising `--start-offset` / `--max-length`),
+  `TestMapErrorPaths` (host-side guards), and
+  `TestMapDivergenceRegression` (assertNotEqual against
+  baselines for entries in `KNOWN_MAP_DIVERGENCES` so a
+  silent fix surfaces loudly). 95 active tests + 91
+  documented skips; the skips track real divergences
+  documented in `docs/quirks.md`. Surfaced two bugs during
+  development: (1) JSON output was missing a trailing
+  newline (renderer fixed; phase 4's "no trailing newline"
+  doc note corrected — it was a `cat -A` misread); (2)
+  host-side `--start-offset > file_size` check compared
+  against the on-disk file size rather than the virtual
+  size, causing spurious rejections for sparse qcow2
+  sources (check removed; qemu-img's silent past-EOF
+  behaviour preserved).
+- **`instar map` cross-version baselines (PLAN-map phase 5).**
+  Generates `map-human` and `map-json` baselines for all 80
+  qemu-img versions (6.0.0 through 10.2.x) across every
+  safe-tier source image in the `instar-testdata` repo
+  (~6,240 baseline cells total). detect-profiles.py
+  deduplicates into 1 `map-human` profile (output stable
+  across the full range) and 3 `map-json` profiles (two
+  transitions at 6.0.x→6.1.x — likely the `compressed`
+  field addition — and 8.1.x→8.2.x). Phase 6's integration
+  tests will diff `instar map`'s output against the
+  version-keyed profile for whichever qemu-img is installed.
+  See `instar-testdata` commits `4e56008d8` (generator
+  extension), `8e0498ca3` + `315859c3d` (profile dedup),
+  and `0f972d5b1` (raw baselines).
+- **`instar map` output polish (PLAN-map phase 4).** Replaces
+  the phase 3 placeholder renderer with a streaming
+  `MapRenderer<'a, W: Write>` that emits each extent to
+  stdout as the guest sends it (via a `BufWriter` over
+  `stdout().lock()`), bringing host memory back to O(1) for
+  pathologically fragmented sources. Human and JSON output
+  now match `qemu-img map` byte-for-byte, modulo eight
+  documented divergences in `docs/quirks.md` (raw
+  `SEEK_HOLE` not implemented, qcow2 compressed clusters
+  emitted as `compressed: false`, VHDX partially-present
+  reported as fully data, depth always 0 in v1, etc.).
+  21 byte-exact unit tests pin the renderer against
+  expected output sequences captured from `qemu-img 10.0.8`
+  during plan research. BrokenPipe on stdout (user piped
+  into `head` / `less`) short-circuits cleanly with exit 0.
+- **`instar map` host CLI surface (PLAN-map phase 3).** The
+  guest binary from phases 1-2 is now reachable end-to-end via
+  `instar map [-f FMT] [--output={human,json}]
+  [--start-offset=OFFSET] [--max-length=LEN] [--sector-size=N]
+  FILENAME`. `run_map` validates args (refusing `--image-opts`,
+  VMDK monolithicFlat sources, and `--start-offset >= file
+  size` on the host), populates `MapConfig`, attaches the
+  source read-only, runs the vCPU loop accumulating extent
+  records, and routes the result through a placeholder
+  human/JSON renderer (`format_map_human` / `format_map_json`)
+  that produces *valid* output for both formats. The renderer
+  is structural-only in phase 3; phase 4 of PLAN-map polishes
+  to byte-for-byte qemu-img parity against the cross-version
+  baseline matrix. 18 new unit tests pin the state-triple
+  table, JSON field ordering, and error-message table so the
+  phase 4 refactor preserves the contract.
+- **`instar map` subcommand foundation (PLAN-map phases 1-2).**
+  Per-format extent walkers (`<Format>State::map_extents`) on
+  every parser crate (`raw`, `qcow2`, `vmdk`, `vhd`, `vhdx`)
+  emit coalesced `MapExtent` records via a callback / coalescer
+  pair in `shared`. The new `operations/map/map.bin` guest
+  binary reads a `MapConfig`, detects the source format,
+  refuses sources with chain composition (single-image v1),
+  dispatches to the matching walker, and streams one
+  `MapExtentRecord` per extent through the call table's new
+  `send_map_extent` function pointer, followed by a `MapResult`
+  summary through `send_map_result`. Window filtering
+  (`start_offset` / `max_length`) is applied in the emit
+  closure. Two new protobuf payloads (`MapExtentMessage` field
+  15, `MapResultMessage` field 16) land in the `GuestMessage`
+  oneof. The `CallTable::VERSION` bumps from 15 to 16 to add
+  the two new streaming function pointers (the streaming-emit
+  shape is new — every other operation sends exactly one
+  result message). Backing-chain composition, walker-side
+  window pruning, host CLI surface, output rendering,
+  cross-version baselines, integration tests, and fuzz are
+  follow-ups in PLAN-map phases 3-9. `map.bin` builds at
+  ~28 KiB / 384 KiB.
 - **New `instar rebase` subcommand.** Changes the backing-file
   pointer recorded in a qcow2 or vmdk overlay and, in safe mode,
   copies divergent clusters from the old backing chain into the

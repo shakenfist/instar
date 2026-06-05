@@ -424,6 +424,51 @@ provides a modular architecture with:
   `src/fuzz/fuzz_targets/fuzz_resize_planners.rs` and
   `scripts/differential-fuzz.py`'s `op_resize`. The binary
   builds at ~73 KiB / 384 KiB.
+- **operations/map/** - Allocation-map operation. Reads a
+  `MapConfig` (sector_size, input_device_count, start_offset,
+  max_length window) from `OPERATION_CONFIG_ADDR`, detects the
+  source format on input device 0, refuses sources with chain
+  composition (qcow2 backing-file references, vhd differencing
+  disks; vhdx differencing is already rejected by
+  `VhdxState::init`; vmdk multi-extent layouts fail the
+  binary-header parse naturally), and dispatches to the matching
+  per-format `<Format>State::map_extents` walker from phase 1 of
+  PLAN-map. Streams one `MapExtentRecord` per coalesced extent
+  through the call table's `send_map_extent` function pointer,
+  followed by a `MapResult` summary through `send_map_result`.
+  The emit closure clips each extent against the configured
+  window (with file-offset adjustment for front-trimmed Data
+  extents) and signals walker abort once the window is
+  exhausted. Single-image v1; chain composition is a follow-up.
+  Binary builds at ~28 KiB / 384 KiB (7%). Host CLI (phase 3
+  of PLAN-map) wires `instar map [-f FMT] [--output={human,json}]
+  [--start-offset=OFFSET] [--max-length=LEN] [--sector-size=N]
+  FILENAME`: `run_map` in `src/vmm/src/main.rs` parses args
+  (refusing `--image-opts`, VMDK monolithicFlat sources via
+  `peek_is_vmdk_descriptor`, and `--start-offset >= file_size`
+  on the host before launching the guest), writes `MapConfig`
+  per-field at `OPERATION_CONFIG_ADDR`, attaches the source
+  read-only as input device 0, and runs the vCPU loop. Phase 4
+  of PLAN-map ships the streaming `MapRenderer<'a, W: Write>`
+  that writes each extent to stdout (via a `BufWriter` over
+  `stdout().lock()`) as the `MapExtentMessage` arrives in the
+  vCPU loop; host memory stays O(1) regardless of how
+  fragmented the source is. Human and JSON output match
+  `qemu-img map` byte-for-byte modulo the divergences
+  documented in `docs/quirks.md` (raw `SEEK_HOLE` not
+  implemented, qcow2 compressed clusters reported as
+  `compressed: false`, VHDX partially-present treated as data,
+  no backing-chain depth in v1). BrokenPipe on stdout (user
+  piped into `head`) short-circuits cleanly with exit 0.
+  Integration tests in `tests/test_map.py` cross-validate
+  `instar map` against the `qemu-img map` baselines in
+  `instar-testdata/expected-outputs/map-*` for every safe-tier
+  image, plus in-test fixtures for window-filter behaviour,
+  host-side error paths (`--image-opts` refusal, chain image
+  refusal, invalid sector size), and a divergence-regression
+  suite that catches accidental fixes to known instar-vs-
+  qemu-img gaps so `KNOWN_MAP_DIVERGENCES` doesn't go stale.
+  Phase 6 baseline: 95 active tests + 91 documented skips.
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation,
@@ -693,7 +738,7 @@ For each iteration it:
    cluster size, compression, and data patterns).
 2. Creates separate copies for instar and qemu-img.
 3. Runs a random chain of 2-4 operations (info, check, convert, compressed
-   convert, measure, create) against both tools.
+   convert, measure, create, resize, rebase, commit, map) against both tools.
 4. Compares outputs: exit codes, JSON info output (after normalisation to
    remove known-divergent fields like disk size), and converted file content
    (via SHA-256 of raw-flattened output).
@@ -712,6 +757,19 @@ the convert writer's per-block sector alignment slack
 Known quirks (see `docs/quirks.md`) are excluded from comparison: non-QCOW2
 formats for `check` (qemu-img only checks QCOW2), disk size fields, and
 format-specific metadata.
+
+The `map` operation runs `instar map --output=json` and
+`qemu-img map --output=json` against independent copies and
+compares the resulting JSON arrays extent-by-extent on
+`{start, length, present, zero, data}`. `{depth, compressed,
+offset, filename}` are skipped (always 0 / always false /
+compressed-cluster reporting drift / different paths). `raw` is
+gated out entirely (SEEK_HOLE divergence). A per-format
+`MAP_FIELD_SKIPS` catalogue skips the `present` field on `vpc`
+sources, matching the documented VHD-unallocated-block
+convention difference (`docs/quirks.md`). With ~25%/25%
+probabilities, window args (`--start-offset` / `--max-length`)
+are picked 64-KiB-aligned and passed to both binaries.
 
 The `create` operation has its own dual oracle: it creates the same
 image via `instar create` and the system `qemu-img create` into
@@ -759,21 +817,27 @@ A mock `CallTable` (in `src/fuzz/src/lib.rs`) backed by thread-local
 fuzzer input provides sector-based I/O, allowing libFuzzer to explore
 deeply malformed inputs.
 
-17 fuzz targets cover all parser crates: format detection, header
+18 fuzz targets cover all parser crates: format detection, header
 parsing (QCOW2, VMDK, VHD, VHDX, RAW, LUKS), L1/L2 cluster lookup,
 refcount table traversal, zlib decompression, grain directory lookup,
 BAT traversal, VHDX metadata parsing, the measure subcommand's
 calculator math (`fuzz_measure_calc`) and the per-parser
-`scan_allocation` entry points (`fuzz_measure_scan`), plus the create
-subcommand's emitters (`fuzz_create_emitters` — exercises
-`plan_qcow2`, `plan_vmdk`, `plan_vhd`, `plan_vhdx` with structured
-fuzz input, asserting plan-level bookkeeping invariants and a header
-re-parse round-trip via the matching parser crate) and the resize
-subcommand's planners (`fuzz_resize_planners` — exercises
-`plan_resize_raw` / `_qcow2` / `_vmdk` / `_vhd` / `_vhdx`, asserting
-plan-level patch invariants: bounded patch count, no offset+len
-overflow, every patch ends within `total_file_size`, no overlapping
-Writes).
+`scan_allocation` entry points (`fuzz_measure_scan`), the map
+subcommand's per-parser `map_extents` entry points (`fuzz_map_iter`
+— exercises `qcow2::Qcow2State::map_extents` and the vmdk / vhd /
+vhdx equivalents with a recording closure, asserting the partition
+invariant: emitted extents must cover `[0, virtual_size)` exactly
+once with no gaps, overlaps, zero-length records, or `start+length`
+overflow; this is the stricter assertion that scan-summary
+invariants cannot see), plus the create subcommand's emitters
+(`fuzz_create_emitters` — exercises `plan_qcow2`, `plan_vmdk`,
+`plan_vhd`, `plan_vhdx` with structured fuzz input, asserting
+plan-level bookkeeping invariants and a header re-parse round-trip
+via the matching parser crate) and the resize subcommand's planners
+(`fuzz_resize_planners` — exercises `plan_resize_raw` / `_qcow2` /
+`_vmdk` / `_vhd` / `_vhdx`, asserting plan-level patch invariants:
+bounded patch count, no offset+len overflow, every patch ends
+within `total_file_size`, no overlapping Writes).
 
 The seed corpus is extracted from `instar-testdata` by
 `scripts/extract-fuzz-corpus.py`, which filters images by format and

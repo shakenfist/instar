@@ -142,6 +142,24 @@ const MEASURE_RESULT_ERROR_INVALID_OPTION: u32 = 2;
 #[allow(dead_code)]
 const MEASURE_RESULT_ERROR_INVALID_SIZE: u32 = 3;
 
+// MapConfig constants (must match shared::MapConfig)
+const MAP_CONFIG_MAGIC: u32 = 0x4D41505F; // "MAP_"
+const MAP_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
+
+// MapResult constants (must match shared::MapResult)
+// Kept for symmetry with the other operations' magic constants
+// and for future host-side use (e.g. directly inspecting a
+// MapResult FFI struct in shared memory). The current host path
+// consumes MapResultMessage from the serial channel, which
+// doesn't carry the FFI magic.
+#[allow(dead_code)]
+const MAP_RESULT_MAGIC: u32 = 0x4D505253; // "MPRS"
+const MAP_RESULT_ERROR_OK: u32 = 0;
+const MAP_RESULT_ERROR_INVALID_SOURCE: u32 = 1;
+const MAP_RESULT_ERROR_INVALID_OPTION: u32 = 2;
+const MAP_RESULT_ERROR_HAS_BACKING: u32 = 3;
+const MAP_RESULT_ERROR_IO: u32 = 4;
+
 // CreateConfig constants (must match shared crate)
 const CREATE_CONFIG_MAGIC: u32 = 0x43524541; // "CREA"
 #[allow(dead_code)]
@@ -870,6 +888,19 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
                 c.bytes_committed,
                 c.overlay_clusters_cleared,
                 c.error
+            )
+        }
+        Some(guest_::GuestMessage_::Payload::MapExtent(e)) => {
+            format!(
+                "map_extent start={} length={} state={} file_offset={}",
+                e.start, e.length, e.state, e.file_offset
+            )
+        }
+        Some(guest_::GuestMessage_::Payload::MapResult(r)) => {
+            format!(
+                "map_result source_format={} extents_emitted={} \
+                virtual_size={} error={}",
+                r.source_format, r.extents_emitted, r.virtual_size, r.error
             )
         }
         None => "empty payload".to_string(),
@@ -2470,6 +2501,8 @@ enum Commands {
     Rebase(RebaseArgs),
     /// Commit an overlay's data down into its backing file
     Commit(CommitArgs),
+    /// Emit the allocation map of a disk image
+    Map(MapArgs),
     /// Display or validate configuration
     Config(ConfigArgs),
 }
@@ -2580,6 +2613,48 @@ struct CommitArgs {
     /// Output format.
     #[arg(long, default_value = "human", value_parser = ["human", "json"])]
     output: String,
+}
+
+/// Arguments for `instar map`. Mirrors `qemu-img map`'s
+/// surface (FILENAME, -f, --output, --start-offset,
+/// --max-length, --image-opts) plus an instar-specific
+/// `--sector-size`.
+#[derive(Args, Debug)]
+struct MapArgs {
+    /// Source image file. Required.
+    input: String,
+
+    /// Source format override (rare; usually auto-detected).
+    /// Accepted for parity with qemu-img -f.
+    #[arg(short = 'f', long = "format")]
+    source_format: Option<String>,
+
+    /// Output format: human (default) or json.
+    #[arg(long, default_value = "human", value_parser = ["human", "json"])]
+    output: String,
+
+    /// Start emission at this virtual byte offset. Accepts
+    /// K/M/G/T suffixes (parsed by parse_memory_size).
+    /// Default: 0 (start of image).
+    #[arg(long = "start-offset")]
+    start_offset: Option<String>,
+
+    /// Stop emission after this many virtual bytes from
+    /// --start-offset. Accepts K/M/G/T suffixes. Default:
+    /// emit to end of image.
+    #[arg(long = "max-length")]
+    max_length: Option<String>,
+
+    /// Sector size for source I/O. Default: 65536. Not part
+    /// of qemu-img's surface; instar-specific.
+    #[arg(long, default_value = "65536")]
+    sector_size: u32,
+
+    /// Refused for parity-rejection: qemu-img's
+    /// --image-opts descriptor-based source specification
+    /// is deferred. Documented in docs/quirks.md.
+    #[arg(long = "image-opts")]
+    image_opts: bool,
 }
 
 /// Host-side holder for the harvested `CommitResultMessage`.
@@ -3119,6 +3194,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Resize(args) => run_resize(args, verbose),
         Commands::Rebase(args) => run_rebase(args, verbose),
         Commands::Commit(args) => run_commit(args, verbose),
+        Commands::Map(args) => run_map(args, verbose),
         Commands::Config(args) => run_config(args),
     }
 }
@@ -9401,6 +9477,579 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+/// Entry point for the `map` subcommand.
+///
+/// Streams the source image's allocation map by launching the
+/// `map.bin` guest binary with a populated `MapConfig` and
+/// consuming `MapExtentMessage` records followed by a
+/// terminating `MapResultMessage`. Phase 3 ships a working
+/// CLI with a placeholder renderer (step 3c); phase 4 polishes
+/// the renderer to byte-for-byte qemu-img parity.
+fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // --- Validate args ---------------------------------------------------
+    if args.image_opts {
+        return Err(
+            "map: --image-opts is not supported (instar accepts FILENAME directly; \
+             see docs/quirks.md)"
+                .into(),
+        );
+    }
+
+    if !(512..=MAX_SECTOR_SIZE).contains(&args.sector_size) || !args.sector_size.is_power_of_two() {
+        return Err(format!(
+            "sector size must be a power of 2, 512 to {} (got {})",
+            MAX_SECTOR_SIZE, args.sector_size
+        )
+        .into());
+    }
+
+    // --- VMDK monolithicFlat source rejection ----------------------------
+    // The guest's VmdkState::init naturally fails the VMDK4 binary header
+    // parse for descriptor-driven layouts, but the resulting
+    // ERROR_INVALID_SOURCE is less helpful than this host-side pre-check
+    // pointing at qemu-img as an escape hatch.
+    let input_path = Path::new(&args.input);
+    if peek_is_vmdk_descriptor(input_path).unwrap_or(false) {
+        return Err("map: monolithicFlat source images are not yet supported \
+             (use qemu-img map instead)"
+            .into());
+    }
+
+    // --- Resolve window bytes --------------------------------------------
+    let start_offset: u64 = if let Some(ref s) = args.start_offset {
+        parse_memory_size(s)?
+    } else {
+        0
+    };
+    let max_length: u64 = if let Some(ref s) = args.max_length {
+        parse_memory_size(s)?
+    } else {
+        0
+    };
+
+    // Read the source file metadata to size the virtio device,
+    // but do NOT pre-check start_offset against the file size:
+    // for sparse qcow2 the on-disk file size is smaller than the
+    // virtual size that start_offset is measured against. The
+    // guest's clip_to_window silently emits nothing if
+    // start_offset >= virtual_size, matching qemu-img map's
+    // behaviour (verified against qemu-img 10.0.8: past-EOF
+    // start-offset returns rc=0 with just the header / empty
+    // JSON array).
+    let input_meta = std::fs::metadata(input_path)?;
+    let input_size = input_meta.len();
+
+    // --- Load guest binaries --------------------------------------------
+    let core_path = get_binary_path("core.bin");
+    let operation_path = get_binary_path("map.bin");
+
+    let core_code = load_guest_binary(core_path.to_str().unwrap())?;
+    debug!(
+        "Loaded core binary: {} bytes from {}",
+        core_code.len(),
+        core_path.display()
+    );
+
+    let operation_code = load_guest_binary(operation_path.to_str().unwrap())?;
+    debug!(
+        "Loaded operation binary: {} bytes from {}",
+        operation_code.len(),
+        operation_path.display()
+    );
+
+    // --- KVM / VM / guest memory setup ----------------------------------
+    let kvm = Kvm::new()?;
+    debug!("KVM API version: {}", kvm.get_api_version());
+
+    let kvm_stats_checker = kvm_stats::KvmStatsChecker::new(&kvm);
+    kvm_stats_checker.display_status();
+
+    let vm = kvm.create_vm()?;
+    debug!("Created VM");
+
+    let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
+    debug!("Allocated {GUEST_MEM_SIZE} bytes of guest memory");
+
+    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let host_addr = region.as_ptr() as u64;
+
+    let mem_region = kvm_userspace_memory_region {
+        slot: 0,
+        guest_phys_addr: 0,
+        memory_size: GUEST_MEM_SIZE,
+        userspace_addr: host_addr,
+        flags: 0,
+    };
+    // SAFETY: mem_region.userspace_addr points to a valid GuestMemoryMmap
+    // allocation that outlives the VM. The slot/guest_phys_addr are unique
+    // per operation entry point.
+    unsafe {
+        vm.set_user_memory_region(mem_region)?;
+    }
+    debug!("Configured memory region");
+
+    setup_gdt(&guest_mem)?;
+    setup_page_tables(&guest_mem, GUEST_MEM_SIZE)?;
+    guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
+    guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
+
+    // --- Write MapConfig (per-field at known offsets) --------------------
+    // Layout must match shared::MapConfig exactly (64 bytes total):
+    //   0:  magic                 u32
+    //   4:  flags                 u32
+    //   8:  sector_size           u32
+    //  12:  input_device_count    u32  (always 1 in v1)
+    //  16:  start_offset          u64
+    //  24:  max_length            u64
+    //  32..64: _reserved          [u8; 32]  (left zero from page-zeroed memory)
+    let map_flags: u32 = if verbose { MAP_CONFIG_FLAG_VERBOSE } else { 0 };
+    guest_mem.write_obj(MAP_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
+    guest_mem.write_obj(map_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
+    guest_mem.write_obj(args.sector_size, GuestAddress(OPERATION_CONFIG_ADDR + 8))?;
+    guest_mem.write_obj(1u32, GuestAddress(OPERATION_CONFIG_ADDR + 12))?;
+    guest_mem.write_obj(start_offset, GuestAddress(OPERATION_CONFIG_ADDR + 16))?;
+    guest_mem.write_obj(max_length, GuestAddress(OPERATION_CONFIG_ADDR + 24))?;
+    debug!(
+        "Wrote map config at 0x{:x} (sector_size={}, start_offset={}, max_length={})",
+        OPERATION_CONFIG_ADDR, args.sector_size, start_offset, max_length
+    );
+
+    // --- Set up source device 0 (read-only) -----------------------------
+    let mut device_set = DeviceSet::new();
+    let mut io_events: Vec<IoEvent> = Vec::new();
+
+    let input_backing = BackingStore::open(input_path, true, None, false)?;
+    let input_mmio = device_mmio_base(0);
+    let input_vq = device_vq_base(0);
+    let input_device = VirtioBlockDevice::new(
+        input_backing,
+        input_size,
+        args.sector_size as u64,
+        true, // read-only
+        input_mmio,
+        input_vq,
+    );
+    debug!(
+        "Created source virtio-block device at MMIO 0x{input_mmio:x}, VQ 0x{input_vq:x} ({} bytes)",
+        input_size
+    );
+    let input_device = Arc::new(Mutex::new(input_device));
+    device_set.add_device(Arc::clone(&input_device), true);
+    io_events.push(IoEvent::new(input_mmio)?);
+
+    let guest_mem = Arc::new(guest_mem);
+    let vmm_stats = Arc::new(Mutex::new(VmmStats::new()));
+
+    // Register ioeventfds; fall back to VM exits on failure.
+    let mut io_thread: Option<io_thread::IoThread> = None;
+    let mut registered_count = 0usize;
+    let mut registration_failed = false;
+    for evt in io_events.iter_mut() {
+        if let Err(e) = evt.register(&vm) {
+            debug!("ioeventfd: failed to register ({e:?}), falling back to VM exits");
+            registration_failed = true;
+            break;
+        }
+        registered_count += 1;
+    }
+    if registration_failed {
+        for evt in io_events.iter_mut().take(registered_count) {
+            if let Err(e) = evt.unregister(&vm) {
+                warn!("ioeventfd: failed to unregister during rollback: {e:?}");
+            }
+        }
+    }
+    let all_registered = !registration_failed;
+
+    if all_registered && !io_events.is_empty() {
+        debug!(
+            "ioeventfd: enabled for {} device(s) (with I/O thread)",
+            io_events.len()
+        );
+        let io_devices = device_set.create_io_devices(io_events);
+        io_thread = Some(io_thread::IoThread::new(
+            io_devices,
+            Arc::clone(&guest_mem),
+            Arc::clone(&vmm_stats),
+        ));
+    }
+
+    // --- vCPU setup ------------------------------------------------------
+    let mut vcpu = vm.create_vcpu(0)?;
+    let mut sregs = vcpu.get_sregs()?;
+    setup_sregs(&mut sregs);
+    vcpu.set_sregs(&sregs)?;
+    let mut regs = vcpu.get_regs()?;
+    setup_regs(&mut regs);
+    vcpu.set_regs(&regs)?;
+
+    // --- Serial decoders / transmitter / debug buffer -------------------
+    let mut serial_decoder = SerialDecoder::new();
+    let mut serial_transmitter = SerialTransmitter::new();
+    let mut debug_buffer = DebugBuffer::new();
+
+    let config = vmm_config_input_only(args.sector_size);
+    serial_transmitter.queue_config(&config);
+    debug!(
+        "Queued configuration message ({} bytes) for guest",
+        serial_transmitter.buffer.len()
+    );
+
+    // --- Run the vCPU loop ----------------------------------------------
+    // Phase 4 streams each extent to stdout via MapRenderer as the
+    // guest sends it; host memory stays O(1) regardless of how
+    // fragmented the source is. The renderer's `begin()` writes the
+    // header / opening "[" before the first extent arrives, so a
+    // partial table on guest failure is the trade-off for keeping
+    // the streaming path clean (documented in docs/quirks.md).
+    let stdout = std::io::stdout();
+    let mut writer = std::io::BufWriter::new(stdout.lock());
+    let mut renderer = MapRenderer::new(&mut writer, &args.output, args.input.clone());
+    renderer.begin()?;
+
+    let mut map_result: Option<guest_::MapResultMessage> = None;
+    let mut vm_error: Option<String> = None;
+    // Set to `true` once stdout has closed (e.g. user piped into
+    // `head`). Subsequent extent emits become no-ops so we exit
+    // cleanly without spamming BrokenPipe errors.
+    let mut broken_pipe = false;
+
+    loop {
+        match vcpu.run()? {
+            VcpuExit::Hlt => {
+                vmm_stats.lock().unwrap().record_hlt();
+                debug!("Map operation completed");
+                break;
+            }
+            VcpuExit::IoOut(port, data) => {
+                vmm_stats.lock().unwrap().record_io_out();
+                if port == SERIAL_PORT {
+                    for &byte in data {
+                        if let Some(msg) = serial_decoder.add_byte(byte) {
+                            match &msg.payload {
+                                Some(guest_::GuestMessage_::Payload::MapExtent(e)) => {
+                                    if !broken_pipe {
+                                        match renderer.emit_extent(e) {
+                                            Ok(()) => {}
+                                            Err(err)
+                                                if err.kind() == std::io::ErrorKind::BrokenPipe =>
+                                            {
+                                                // Downstream consumer closed
+                                                // (head, less etc.). Stop
+                                                // emitting; exit cleanly.
+                                                broken_pipe = true;
+                                            }
+                                            Err(err) => return Err(err.into()),
+                                        }
+                                    }
+                                }
+                                Some(guest_::GuestMessage_::Payload::MapResult(r)) => {
+                                    map_result = Some(r.clone());
+                                }
+                                _ => {
+                                    if verbose {
+                                        debug!("{}", format_message(&msg));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if port == DEBUG_PORT {
+                    for &byte in data {
+                        if let Some(line) = debug_buffer.add_byte(byte) {
+                            debug!("[GUEST] {line}");
+                        }
+                    }
+                } else {
+                    debug!("IO OUT: port=0x{port:x}, data={data:?}");
+                }
+            }
+            VcpuExit::IoIn(port, data) => {
+                vmm_stats.lock().unwrap().record_io_in();
+                if port == SERIAL_PORT {
+                    for byte in data.iter_mut() {
+                        *byte = serial_transmitter.next_byte().unwrap_or(0);
+                    }
+                } else if port == SERIAL_PORT + 5 {
+                    let mut lsr = 0x60u8;
+                    if serial_transmitter.has_data() {
+                        lsr |= 0x01;
+                    }
+                    data[0] = lsr;
+                } else {
+                    for byte in data {
+                        *byte = 0;
+                    }
+                }
+            }
+            VcpuExit::MmioRead(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_read();
+                let value = device_set.mmio_read(addr);
+                write_mmio_data(data, value);
+            }
+            VcpuExit::MmioWrite(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_write();
+                let value = read_mmio_data(data);
+                if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
+                    if io_thread.is_none() && should_process {
+                        device_set.process_queue_for_device(
+                            device_index,
+                            &guest_mem,
+                            &vmm_stats,
+                        )?;
+                    }
+                }
+            }
+            VcpuExit::Shutdown => {
+                vmm_stats.lock().unwrap().record_shutdown();
+                eprintln!("\n--- VM Shutdown (triple fault?) ---");
+                vm_error = Some("VM shutdown (triple fault)".to_string());
+                break;
+            }
+            VcpuExit::FailEntry(reason, cpu) => {
+                vmm_stats.lock().unwrap().record_fail_entry();
+                eprintln!("VM Entry Failed! reason=0x{reason:x}, cpu={cpu}");
+                vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
+                break;
+            }
+            exit => {
+                vmm_stats.lock().unwrap().record_unknown();
+                eprintln!("Unexpected VM exit: {exit:?}");
+                vm_error = Some(format!("unexpected VM exit: {exit:?}"));
+                break;
+            }
+        }
+    }
+
+    if let Some(mut thread) = io_thread {
+        thread.stop();
+    }
+
+    if log::log_enabled!(log::Level::Debug) {
+        vmm_stats.lock().unwrap().display();
+    }
+
+    if let Some(error) = vm_error {
+        return Err(error.into());
+    }
+
+    // BrokenPipe short-circuit: the downstream consumer closed
+    // before the guest finished. Skip the renderer's finish() (the
+    // closing "]" would just fail again) and exit Ok so the
+    // process status mirrors coreutils' behaviour for piped output.
+    if broken_pipe {
+        return Ok(());
+    }
+
+    let result = map_result.ok_or_else(|| "map: guest returned no MapResult".to_string())?;
+
+    // Render: success path closes the streaming output via
+    // renderer.finish(); error path writes a clear stderr message
+    // and leaves any partial output in place.
+    if let Some(msg) = map_error_message(result.error) {
+        eprintln!("{}", msg);
+        return Err(format!("map: guest reported error code {}", result.error).into());
+    }
+    renderer.finish()?;
+    // Drop the BufWriter so its destructor flushes to stdout.
+    drop(renderer);
+    drop(writer);
+
+    Ok(())
+}
+
+/// Translate a guest-side state code (the string sent in
+/// `MapExtentMessage::state`) to the (present, zero, data,
+/// emit_offset) tuple used by qemu-img map's JSON output.
+///
+/// "hole" → unallocated, reads as zero, no backing data.
+/// "zero" → explicit zero record in metadata, no backing data.
+/// "data" → present, contains data, emit `offset` in JSON.
+fn map_state_triple(state: &str) -> (bool, bool, bool, bool) {
+    match state {
+        "hole" => (false, true, false, false),
+        "zero" => (true, true, false, false),
+        "data" => (true, false, true, true),
+        // Defensive fallback for an unknown state code (the guest
+        // emits only the three above). Treat as data so the offset
+        // is preserved for debugging.
+        _ => (true, false, true, true),
+    }
+}
+
+/// Resolve a `MapResult::error` code to a stderr-friendly message.
+/// Returns `None` for `ERROR_OK` (the caller renders the success
+/// path instead).
+fn map_error_message(error: u32) -> Option<&'static str> {
+    match error {
+        MAP_RESULT_ERROR_OK => None,
+        MAP_RESULT_ERROR_INVALID_SOURCE => Some("map: source format unrecognised"),
+        MAP_RESULT_ERROR_INVALID_OPTION => Some("map: invalid config"),
+        MAP_RESULT_ERROR_HAS_BACKING => Some(
+            "map: source has a backing/parent reference; \
+             chain composition is deferred (see PLAN-map.md)",
+        ),
+        MAP_RESULT_ERROR_IO => Some("map: I/O failure walking the source"),
+        _ => Some("map: unknown error"),
+    }
+}
+
+/// Output format selector for [`MapRenderer`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MapOutputFormat {
+    Human,
+    Json,
+}
+
+/// Streaming renderer for `instar map` output.
+///
+/// Phase 4 replaces the phase 3c `Vec`-buffered renderer with a
+/// streaming writer that emits one extent at a time as the guest
+/// sends it. Host memory stays O(1) regardless of how fragmented
+/// the source is. Byte-for-byte output matches `qemu-img map`
+/// modulo the documented divergences (see `docs/quirks.md`).
+///
+/// Lifecycle:
+/// - [`MapRenderer::begin`] is called once before the first
+///   `emit_extent` to write the format-specific header / opening
+///   bracket.
+/// - [`MapRenderer::emit_extent`] is called once per
+///   `MapExtentMessage` arriving from the guest. Human mode emits
+///   a row only for `data: true` extents; JSON mode emits every
+///   extent.
+/// - [`MapRenderer::finish`] is called once after the guest's
+///   `MapResultMessage` arrives (and signals success) to write
+///   the closing bracket.
+///
+/// The renderer's `extents_written` counter tracks rows actually
+/// emitted (human mode skips holes / zero-allocated; the guest's
+/// `MapResultMessage::extents_emitted` is a different number used
+/// for the streaming-protocol audit).
+struct MapRenderer<'a, W: std::io::Write> {
+    writer: &'a mut W,
+    output_format: MapOutputFormat,
+    /// The argv string the user passed for the source. Used
+    /// verbatim in the human-mode "File" column; qemu-img echoes
+    /// whatever was on the command line (relative paths stay
+    /// relative, etc.).
+    filename: String,
+    /// True until the first JSON object is emitted. Drives the
+    /// `,\n` inter-object separator.
+    first_extent_json: bool,
+    /// Count of rows / objects this renderer has actually written
+    /// (lower than the guest's `extents_emitted` in human mode
+    /// because holes are skipped).
+    extents_written: u64,
+}
+
+impl<'a, W: std::io::Write> MapRenderer<'a, W> {
+    fn new(writer: &'a mut W, output_format: &str, filename: String) -> Self {
+        let fmt = match output_format {
+            "json" => MapOutputFormat::Json,
+            _ => MapOutputFormat::Human,
+        };
+        Self {
+            writer,
+            output_format: fmt,
+            filename,
+            first_extent_json: true,
+            extents_written: 0,
+        }
+    }
+
+    /// Write the format-specific header / opening bracket. Called
+    /// once before any `emit_extent`.
+    fn begin(&mut self) -> std::io::Result<()> {
+        match self.output_format {
+            MapOutputFormat::Human => writeln!(
+                self.writer,
+                "Offset          Length          Mapped to       File"
+            ),
+            MapOutputFormat::Json => write!(self.writer, "["),
+        }
+    }
+
+    /// Write one extent's representation. Human mode emits a row
+    /// only when `data: true`; JSON mode emits every extent with
+    /// the qemu-img-compatible field set.
+    fn emit_extent(&mut self, ext: &guest_::MapExtentMessage) -> std::io::Result<()> {
+        let (present, zero, data, has_offset) = map_state_triple(&ext.state);
+        match self.output_format {
+            MapOutputFormat::Human => {
+                if !data {
+                    // Holes and zero-allocated extents do not
+                    // produce visible rows (matches qemu-img).
+                    return Ok(());
+                }
+                let start_str = format_hex_or_zero(ext.start);
+                let length_str = format_hex_or_zero(ext.length);
+                let mapped_str = format_hex_or_zero(ext.file_offset);
+                writeln!(
+                    self.writer,
+                    "{:<16}{:<16}{:<16}{}",
+                    start_str, length_str, mapped_str, self.filename
+                )?;
+                self.extents_written += 1;
+                Ok(())
+            }
+            MapOutputFormat::Json => {
+                if !self.first_extent_json {
+                    writeln!(self.writer, ",")?;
+                }
+                self.first_extent_json = false;
+                if has_offset {
+                    write!(
+                        self.writer,
+                        "{{ \"start\": {}, \"length\": {}, \"depth\": 0, \
+                         \"present\": {}, \"zero\": {}, \"data\": {}, \
+                         \"compressed\": false, \"offset\": {}}}",
+                        ext.start, ext.length, present, zero, data, ext.file_offset
+                    )?;
+                } else {
+                    write!(
+                        self.writer,
+                        "{{ \"start\": {}, \"length\": {}, \"depth\": 0, \
+                         \"present\": {}, \"zero\": {}, \"data\": {}, \
+                         \"compressed\": false}}",
+                        ext.start, ext.length, present, zero, data
+                    )?;
+                }
+                self.extents_written += 1;
+                Ok(())
+            }
+        }
+    }
+
+    /// Write the format-specific closing bracket. Called once
+    /// after the last `emit_extent` and only on the success path
+    /// (on error, the caller writes a stderr message instead and
+    /// leaves the partial output in place).
+    ///
+    /// JSON mode emits `]\n` (closing bracket followed by a
+    /// trailing newline) to match qemu-img map exactly. Human mode
+    /// is a no-op — the last data row's `writeln!` already
+    /// produced its own trailing newline.
+    fn finish(&mut self) -> std::io::Result<()> {
+        match self.output_format {
+            MapOutputFormat::Human => Ok(()),
+            MapOutputFormat::Json => writeln!(self.writer, "]"),
+        }
+    }
+}
+
+/// Format a `u64` as the literal string `"0"` for zero values,
+/// otherwise as lowercase `0x...` hex. Matches qemu-img map's
+/// human-mode column formatting: the first row of a freshly-
+/// allocated qcow2 emits `0` (not `0x0`) for the offset, and
+/// subsequent rows use `0x...`.
+fn format_hex_or_zero(n: u64) -> String {
+    if n == 0 {
+        "0".to_string()
+    } else {
+        format!("{:#x}", n)
+    }
+}
+
 /// Entry point for the `create` subcommand.
 ///
 /// Phase 4 wires `-o KEY=VAL,...` parsing on top of the phase-3
@@ -11440,5 +12089,446 @@ mod preallocation_tests {
         });
         assert!(result.is_ok());
         assert!(!called.get(), "zero-length call must short-circuit");
+    }
+}
+
+#[cfg(test)]
+mod map_renderer_tests {
+    //! Tests for the phase 3c placeholder map renderer
+    //! (format_map_human, format_map_json, map_state_triple,
+    //! map_error_message). Phase 4 will replace these with
+    //! byte-for-byte qemu-img-compatible formatters; until then,
+    //! these tests pin the placeholder's structural invariants
+    //! (state-triple table, JSON field ordering, error-message
+    //! table) so phase 4 can refactor with confidence.
+    use super::*;
+
+    /// Build a `MapExtentMessage` by routing through the
+    /// public guest-protocol builder so the private `push_str`
+    /// helper stays encapsulated.
+    fn ext(start: u64, length: u64, state: &str, file_offset: u64) -> guest_::MapExtentMessage {
+        let msg = guest_protocol::map_extent_message(start, length, state, file_offset);
+        match msg.payload {
+            Some(guest_::GuestMessage_::Payload::MapExtent(e)) => e,
+            _ => panic!("map_extent_message must wrap a MapExtent payload"),
+        }
+    }
+
+    // --- map_state_triple -----------------------------------------------
+
+    #[test]
+    fn state_triple_hole() {
+        assert_eq!(map_state_triple("hole"), (false, true, false, false));
+    }
+
+    #[test]
+    fn state_triple_zero() {
+        assert_eq!(map_state_triple("zero"), (true, true, false, false));
+    }
+
+    #[test]
+    fn state_triple_data() {
+        assert_eq!(map_state_triple("data"), (true, false, true, true));
+    }
+
+    #[test]
+    fn state_triple_unknown_falls_back_to_data() {
+        // Defensive: an unknown state preserves the offset for
+        // debugging rather than dropping it.
+        assert_eq!(map_state_triple("future-state"), (true, false, true, true));
+    }
+
+    // The phase 3c format_map_human / format_map_json tests were
+    // removed in step 4b; their byte-exact replacements live in
+    // the "Phase 4: MapRenderer byte-exact tests" section below.
+
+    // --- map_error_message ----------------------------------------------
+
+    #[test]
+    fn error_ok_returns_none() {
+        assert!(map_error_message(MAP_RESULT_ERROR_OK).is_none());
+    }
+
+    #[test]
+    fn error_codes_have_distinct_messages() {
+        let codes = [
+            MAP_RESULT_ERROR_INVALID_SOURCE,
+            MAP_RESULT_ERROR_INVALID_OPTION,
+            MAP_RESULT_ERROR_HAS_BACKING,
+            MAP_RESULT_ERROR_IO,
+        ];
+        let messages: Vec<&'static str> = codes
+            .iter()
+            .map(|c| map_error_message(*c).expect("known error must have message"))
+            .collect();
+        // Each message is non-empty and contains the "map: " prefix.
+        for m in &messages {
+            assert!(!m.is_empty());
+            assert!(m.starts_with("map: "), "missing prefix: {}", m);
+        }
+        // Messages must be mutually distinct so the user can tell
+        // which failure occurred.
+        for i in 0..messages.len() {
+            for j in (i + 1)..messages.len() {
+                assert_ne!(
+                    messages[i], messages[j],
+                    "error codes {} and {} share a message",
+                    codes[i], codes[j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn error_unknown_returns_generic_message() {
+        let msg = map_error_message(999).expect("unknown error returns Some");
+        assert!(msg.contains("unknown"));
+    }
+
+    #[test]
+    fn error_has_backing_mentions_chain_followup() {
+        let msg = map_error_message(MAP_RESULT_ERROR_HAS_BACKING)
+            .expect("has-backing error must have message");
+        assert!(msg.contains("chain") || msg.contains("PLAN-map"));
+    }
+
+    // ================================================================
+    // Phase 4: MapRenderer byte-exact tests.
+    //
+    // Expected byte sequences were captured by running
+    // `qemu-img map --output={human,json}` against synthetic
+    // fixtures during phase 4a development. The renderer's job is
+    // to match qemu-img byte-for-byte (modulo the documented
+    // divergences in docs/quirks.md); these tests pin that
+    // contract.
+    // ================================================================
+
+    fn render_human(extents: &[guest_::MapExtentMessage], filename: &str) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut r = MapRenderer::new(&mut buf, "human", filename.to_string());
+            r.begin().unwrap();
+            for e in extents {
+                r.emit_extent(e).unwrap();
+            }
+            r.finish().unwrap();
+        }
+        buf
+    }
+
+    fn render_json(extents: &[guest_::MapExtentMessage]) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut r = MapRenderer::new(&mut buf, "json", "<unused>".to_string());
+            r.begin().unwrap();
+            for e in extents {
+                r.emit_extent(e).unwrap();
+            }
+            r.finish().unwrap();
+        }
+        buf
+    }
+
+    // --- format_hex_or_zero ---------------------------------------
+
+    #[test]
+    fn hex_or_zero_zero_is_literal_zero() {
+        assert_eq!(format_hex_or_zero(0), "0");
+    }
+
+    #[test]
+    fn hex_or_zero_nonzero_is_lowercase_hex() {
+        assert_eq!(format_hex_or_zero(0x10000), "0x10000");
+        assert_eq!(format_hex_or_zero(0x50000), "0x50000");
+        assert_eq!(format_hex_or_zero(u64::MAX), "0xffffffffffffffff");
+    }
+
+    // --- Human-mode tests -----------------------------------------
+
+    #[test]
+    fn renderer_human_empty_extents_emits_header_only() {
+        let out = render_human(&[], "any.qcow2");
+        // 53 bytes: 4 columns, last unpadded, plus '\n'.
+        assert_eq!(
+            out,
+            b"Offset          Length          Mapped to       File\n"
+        );
+    }
+
+    #[test]
+    fn human_single_data_extent_byte_exact() {
+        // Matches qemu-img map output for an image with one
+        // 64 KiB data extent at virtual offset 0 mapped to file
+        // offset 0x50000.
+        let out = render_human(&[ext(0, 0x10000, "data", 0x50000)], "m4.qcow2");
+        let expected = "\
+Offset          Length          Mapped to       File
+0               0x10000         0x50000         m4.qcow2
+";
+        assert_eq!(out, expected.as_bytes());
+    }
+
+    #[test]
+    fn human_zero_offset_renders_as_literal_zero() {
+        // The "0" rule applies to every column: start=0 → "0",
+        // length=0 still emits "0x..." because length is never
+        // zero for a real extent (the coalescer drops zero-length
+        // pushes), but file_offset=0 must render as "0" not "0x0".
+        let out = render_human(&[ext(0, 0x10000, "data", 0)], "raw5.img");
+        let expected = "\
+Offset          Length          Mapped to       File
+0               0x10000         0               raw5.img
+";
+        assert_eq!(out, expected.as_bytes());
+    }
+
+    #[test]
+    fn human_holes_are_elided() {
+        // qemu-img human output does not emit rows for holes or
+        // zero-allocated extents; only data: true extents produce
+        // visible rows.
+        let out = render_human(
+            &[
+                ext(0, 0x10000, "hole", 0),
+                ext(0x10000, 0x10000, "zero", 0),
+                ext(0x20000, 0x10000, "data", 0x50000),
+            ],
+            "mix.qcow2",
+        );
+        let expected = "\
+Offset          Length          Mapped to       File
+0x20000         0x10000         0x50000         mix.qcow2
+";
+        assert_eq!(out, expected.as_bytes());
+    }
+
+    #[test]
+    fn human_multiple_data_extents_preserve_order() {
+        let out = render_human(
+            &[
+                ext(0, 0x10000, "data", 0x50000),
+                ext(0x80000, 0x10000, "data", 0x60000),
+            ],
+            "m3.qcow2",
+        );
+        let expected = "\
+Offset          Length          Mapped to       File
+0               0x10000         0x50000         m3.qcow2
+0x80000         0x10000         0x60000         m3.qcow2
+";
+        assert_eq!(out, expected.as_bytes());
+    }
+
+    #[test]
+    fn human_filename_preserved_verbatim() {
+        // qemu-img echoes the argv string in the File column —
+        // relative paths stay relative, embedded chars survive.
+        let out = render_human(&[ext(0, 0x10000, "data", 0)], "/tmp/has spaces/img.qcow2");
+        let expected = "\
+Offset          Length          Mapped to       File
+0               0x10000         0               /tmp/has spaces/img.qcow2
+";
+        assert_eq!(out, expected.as_bytes());
+    }
+
+    #[test]
+    fn human_large_offset_overflows_column_gracefully() {
+        // 0xffffffffffffffff is 18 chars (with 0x prefix) which
+        // overflows the 16-char column. {:<16} leaves the value
+        // intact and the next column starts immediately after —
+        // matches qemu-img's behaviour (no truncation, no panic).
+        let out = render_human(&[ext(u64::MAX - 0xffff, 0x10000, "data", 0)], "big.img");
+        let lines: Vec<&[u8]> = out.split(|&b| b == b'\n').collect();
+        assert_eq!(
+            lines[0],
+            b"Offset          Length          Mapped to       File"
+        );
+        // Data row starts with the hex value; we just check
+        // the value appears and the filename arrives at the end.
+        assert!(lines[1].starts_with(b"0xffffffffffff"));
+        assert!(lines[1].ends_with(b"big.img"));
+    }
+
+    // --- JSON-mode tests ------------------------------------------
+
+    #[test]
+    fn renderer_json_empty_extents_is_empty_array() {
+        let out = render_json(&[]);
+        assert_eq!(out, b"[]\n");
+    }
+
+    #[test]
+    fn json_single_data_extent_byte_exact() {
+        let out = render_json(&[ext(0, 0x10000, "data", 0x50000)]);
+        // Field order: start, length, depth, present, zero, data,
+        // compressed, offset. Single space after { and , — no
+        // space before }. Trailing newline after `]` matches
+        // qemu-img exactly.
+        let expected = b"[{ \"start\": 0, \"length\": 65536, \"depth\": 0, \
+                          \"present\": true, \"zero\": false, \"data\": true, \
+                          \"compressed\": false, \"offset\": 327680}]\n";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn json_hole_omits_offset_but_includes_compressed_false() {
+        let out = render_json(&[ext(0, 0x100000, "hole", 0)]);
+        // Hole: present=false, zero=true, data=false. No offset.
+        // compressed: false always emitted.
+        let expected = b"[{ \"start\": 0, \"length\": 1048576, \"depth\": 0, \
+                          \"present\": false, \"zero\": true, \"data\": false, \
+                          \"compressed\": false}]\n";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn json_zero_state_is_present_no_offset() {
+        // zero-allocated: present=true, zero=true, data=false.
+        // No offset (data is false). compressed: false present.
+        let out = render_json(&[ext(0, 0x10000, "zero", 0)]);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.contains("\"present\": true"));
+        assert!(s.contains("\"zero\": true"));
+        assert!(s.contains("\"data\": false"));
+        assert!(!s.contains("\"offset\""));
+        assert!(s.contains("\"compressed\": false"));
+    }
+
+    #[test]
+    fn json_inter_object_separator_is_comma_newline() {
+        let out = render_json(&[
+            ext(0, 0x10000, "data", 0x50000),
+            ext(0x10000, 0x10000, "hole", 0),
+        ]);
+        let s = std::str::from_utf8(&out).unwrap();
+        // The two objects are joined by },\n{
+        assert!(s.contains("},\n{"));
+        // No `},{` (without newline) — that would be wrong format.
+        assert!(!s.contains("},{"));
+    }
+
+    #[test]
+    fn json_multiple_extents_byte_exact() {
+        // Matches qemu-img map output for the 3-extent qcow2
+        // fixture (data + hole + data, 1 MiB total).
+        let out = render_json(&[
+            ext(0, 0x10000, "data", 0x50000),
+            ext(0x10000, 0x10000, "hole", 0),
+            ext(0x20000, 0x10000, "data", 0x70000),
+        ]);
+        let expected = b"[{ \"start\": 0, \"length\": 65536, \"depth\": 0, \
+                          \"present\": true, \"zero\": false, \"data\": true, \
+                          \"compressed\": false, \"offset\": 327680},\n\
+                          { \"start\": 65536, \"length\": 65536, \"depth\": 0, \
+                          \"present\": false, \"zero\": true, \"data\": false, \
+                          \"compressed\": false},\n\
+                          { \"start\": 131072, \"length\": 65536, \"depth\": 0, \
+                          \"present\": true, \"zero\": false, \"data\": true, \
+                          \"compressed\": false, \"offset\": 458752}]\n";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn json_trailing_newline_after_closing_bracket() {
+        // qemu-img map --output=json emits a trailing newline
+        // after the closing `]`; the phase 5 baselines confirm
+        // this. Earlier plan-doc and quirks notes mistakenly said
+        // "no trailing newline" — that was based on misreading
+        // cat -A output (the $ marker appears before each
+        // newline, not after). Updated 6b.
+        let out = render_json(&[ext(0, 0x10000, "data", 0)]);
+        assert!(
+            out.ends_with(b"]\n"),
+            "JSON output must end with `]\\n` to match qemu-img"
+        );
+    }
+
+    #[test]
+    fn json_compressed_false_emitted_for_every_state() {
+        for state in ["hole", "zero", "data"] {
+            let out = render_json(&[ext(0, 0x10000, state, 0)]);
+            let s = std::str::from_utf8(&out).unwrap();
+            assert!(
+                s.contains("\"compressed\": false"),
+                "state {} must emit compressed: false; got: {}",
+                state,
+                s,
+            );
+        }
+    }
+
+    #[test]
+    fn json_field_order_is_canonical() {
+        // Required field order: start, length, depth, present,
+        // zero, data, compressed, offset. Subsequent phases (e.g.
+        // when compressed becomes a real value) must not reorder.
+        let out = render_json(&[ext(0, 4096, "data", 65536)]);
+        let s = std::str::from_utf8(&out).unwrap();
+        let order = [
+            "\"start\":",
+            "\"length\":",
+            "\"depth\":",
+            "\"present\":",
+            "\"zero\":",
+            "\"data\":",
+            "\"compressed\":",
+            "\"offset\":",
+        ];
+        let mut last_pos = 0usize;
+        for field in order {
+            let pos = s
+                .find(field)
+                .unwrap_or_else(|| panic!("missing field {} in JSON: {}", field, s));
+            assert!(
+                pos >= last_pos,
+                "field {} appears out of order at byte {}: {}",
+                field,
+                pos,
+                s
+            );
+            last_pos = pos;
+        }
+    }
+
+    #[test]
+    fn json_large_u64_offset_is_decimal() {
+        // u64 values near 1 TiB must serialise as decimal, not
+        // hex or scientific notation.
+        let big = 1u64 << 40; // 1 TiB
+        let out = render_json(&[ext(0, 4096, "data", big)]);
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.contains(&format!("\"offset\": {}", big)));
+        // No accidental hex / 0x prefix.
+        assert!(!s.contains("0x"));
+    }
+
+    // --- Lifecycle / counter tests --------------------------------
+
+    #[test]
+    fn renderer_extents_written_counts_data_only_in_human() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut r = MapRenderer::new(&mut buf, "human", "img".to_string());
+        r.begin().unwrap();
+        r.emit_extent(&ext(0, 0x10000, "hole", 0)).unwrap();
+        r.emit_extent(&ext(0x10000, 0x10000, "data", 0x50000))
+            .unwrap();
+        r.emit_extent(&ext(0x20000, 0x10000, "zero", 0)).unwrap();
+        r.finish().unwrap();
+        // Only the data extent counted.
+        assert_eq!(r.extents_written, 1);
+    }
+
+    #[test]
+    fn renderer_extents_written_counts_all_in_json() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut r = MapRenderer::new(&mut buf, "json", "img".to_string());
+        r.begin().unwrap();
+        r.emit_extent(&ext(0, 0x10000, "hole", 0)).unwrap();
+        r.emit_extent(&ext(0x10000, 0x10000, "data", 0x50000))
+            .unwrap();
+        r.emit_extent(&ext(0x20000, 0x10000, "zero", 0)).unwrap();
+        r.finish().unwrap();
+        // JSON mode counts every extent.
+        assert_eq!(r.extents_written, 3);
     }
 }

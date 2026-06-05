@@ -292,6 +292,7 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
                 c.error
             )
         }
+        Some(_) => "(unhandled payload variant)".to_string(),
         None => "empty payload".to_string(),
     };
 

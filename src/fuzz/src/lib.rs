@@ -87,6 +87,8 @@ pub fn build_call_table() -> shared::CallTable {
         send_rebase_result: mock_send_rebase_result,
         send_commit_result: mock_send_commit_result,
         write_input_sector: mock_write_input_sector,
+        send_map_extent: mock_send_map_extent,
+        send_map_result: mock_send_map_result,
     }
 }
 
@@ -289,6 +291,10 @@ unsafe extern "C" fn mock_write_input_sector(
 ) -> bool {
     false
 }
+
+unsafe extern "C" fn mock_send_map_extent(_record: *const shared::MapExtentRecord) {}
+
+unsafe extern "C" fn mock_send_map_result(_result: *const shared::MapResult) {}
 
 // ---------------------------------------------------------------------------
 // Unit tests

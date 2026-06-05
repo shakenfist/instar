@@ -93,6 +93,20 @@ vhdx (VHDX), luks (info + convert with decryption)
   resize works for all three with coverage via the internal
   consistency suite). See [docs/resize.md](docs/resize.md) for the
   full reference.
+- `map`: emit the allocation map of a disk image as a stream of
+  contiguous extents covering `[0, virtual_size)`, mirroring
+  `qemu-img map`. The guest binary walks the source's
+  on-disk allocation metadata and streams one extent per coalesced
+  run over the serial channel; the host renderer writes each extent
+  to stdout as it arrives, so host memory stays O(1) regardless of
+  fragmentation. Human and JSON output match `qemu-img map` byte-
+  for-byte modulo a small list of documented divergences (raw
+  sparseness not detected, VHD unallocated blocks reported as
+  `present: false`, VHDX partial-present treated as data, qcow2
+  compressed clusters reported as `compressed: false`, backing-
+  chain `depth` always 0, `--image-opts` rejected). Window flags
+  `--start-offset` / `--max-length` clip the emission range. See
+  [docs/map.md](docs/map.md) for the full reference.
 
 ## Working on This Project
 

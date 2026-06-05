@@ -21,16 +21,17 @@ use core::ptr::write_volatile;
 
 use shared::{
     CallTable, ChainConfig, CheckResult, CommitResult, CompareResult, CreateResult, LuksInfo,
-    MeasureResult, Qcow2Info, RebaseResult, ResizeResult, VdiInfo, VmdkInfo, CALL_TABLE_ADDR,
-    CHAIN_CONFIG_ADDR, CHAIN_CONFIG_MAX_SIZE, OPERATION_CONFIG_ADDR, OPERATION_CONFIG_MAX_SIZE,
-    OPERATION_LOAD_ADDR, VMM_PARAMS_ADDR,
+    MapExtentRecord, MapResult, MeasureResult, Qcow2Info, RebaseResult, ResizeResult, VdiInfo,
+    VmdkInfo, CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR, CHAIN_CONFIG_MAX_SIZE, OPERATION_CONFIG_ADDR,
+    OPERATION_CONFIG_MAX_SIZE, OPERATION_LOAD_ADDR, VMM_PARAMS_ADDR,
 };
 
 use crate::serial::{
     debug_print, read_config, send_check_result, send_commit_result, send_compare_result,
     send_complete, send_create_result, send_error, send_info_result, send_info_result_luks,
     send_info_result_qcow2, send_info_result_vdi, send_info_result_vmdk, send_init,
-    send_measure_result, send_progress, send_rebase_result, send_resize_result, DeviceConfig,
+    send_map_extent, send_map_result, send_measure_result, send_progress, send_rebase_result,
+    send_resize_result, DeviceConfig,
 };
 use crate::virtio::VirtioBlock;
 
@@ -292,6 +293,8 @@ fn setup_call_table() {
         send_rebase_result: ct_send_rebase_result,
         send_commit_result: ct_send_commit_result,
         write_input_sector: ct_write_input_sector,
+        send_map_extent: ct_send_map_extent,
+        send_map_result: ct_send_map_result,
     };
 
     unsafe {
@@ -718,6 +721,22 @@ unsafe extern "C" fn ct_write_input_sector(
         }
     }
     false
+}
+
+/// Send one coalesced map extent. Called once per emit from the
+/// guest's `map_extents` walker during the map operation.
+unsafe extern "C" fn ct_send_map_extent(record: *const MapExtentRecord) {
+    if !record.is_null() {
+        send_map_extent(&*record);
+    }
+}
+
+/// Send the map operation's terminator summary. Called once
+/// after the last `ct_send_map_extent`.
+unsafe extern "C" fn ct_send_map_result(result: *const MapResult) {
+    if !result.is_null() {
+        send_map_result(&*result);
+    }
 }
 
 /// Convert null-terminated C string to &str.

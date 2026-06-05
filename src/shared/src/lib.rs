@@ -524,6 +524,156 @@ impl AllocationSummary {
     }
 }
 
+/// Allocation state of a virtual-address range in a source image,
+/// emitted by the per-format `map_extents` walkers.
+///
+/// Mirrors the qemu-img map output classification minus the
+/// backing-chain `depth` / `filename` fields, which the host
+/// emits and the parser does not know. Single-image v1 only;
+/// chain composition is deferred (see PLAN-map.md).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapExtentState {
+    /// Region holds data and is backed by the source file at
+    /// `file_offset`. Compressed qcow2 clusters count as Data;
+    /// `file_offset` is the start of the (possibly compressed)
+    /// on-disk bytes.
+    Data { file_offset: u64 },
+    /// Region reads as zero and is explicitly recorded as zero
+    /// in the metadata (qcow2 ZERO_PLAIN / ZERO_ALLOC, vmdk
+    /// grain marker `0xFFFFFFFE`, vhdx PAYLOAD_BLOCK_ZERO).
+    ZeroAllocated,
+    /// Region is unallocated — reads as zero but is not present
+    /// in the source file (the qemu-img `present=false` case).
+    Hole,
+}
+
+/// One contiguous extent of the source's virtual address space
+/// with a single allocation state.
+///
+/// `length` is never zero — zero-length extents are dropped at
+/// the coalescer. `start + length` must not overflow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapExtent {
+    /// Virtual offset of the extent's first byte, in bytes from
+    /// the start of the source image.
+    pub start: u64,
+    /// Extent length in bytes.
+    pub length: u64,
+    /// Allocation state.
+    pub state: MapExtentState,
+}
+
+/// Sink that swallows per-cluster `MapExtent`s and forwards
+/// coalesced runs to an underlying emitter.
+///
+/// Usage: parser builds one wrapping the user's
+/// `&mut FnMut(MapExtent) -> bool`, calls `push(extent)` for
+/// each cluster/grain/block, and calls `finish()` at the end
+/// to flush any trailing pending extent.
+///
+/// Both `push` and `finish` return `false` if the underlying
+/// emitter returned `false` — the caller must stop walking
+/// when it sees that.
+///
+/// Two adjacent extents merge when:
+/// - Their virtual ranges are contiguous (`a.start + a.length
+///   == b.start`).
+/// - Their states match. For `Data` that requires the file
+///   offsets to be contiguous too:
+///   `a.state.file_offset + a.length == b.state.file_offset`.
+///   For `ZeroAllocated` and `Hole`, state equality is enough.
+///
+/// Zero-length pushes are silently dropped (no merge, no
+/// emit). Pushes whose virtual range would overflow are
+/// silently dropped — the walker is responsible for clamping
+/// inputs to valid ranges.
+pub struct MapExtentCoalescer<'a, F: FnMut(MapExtent) -> bool> {
+    pending: Option<MapExtent>,
+    emit: &'a mut F,
+    aborted: bool,
+}
+
+impl<'a, F: FnMut(MapExtent) -> bool> MapExtentCoalescer<'a, F> {
+    pub fn new(emit: &'a mut F) -> Self {
+        Self {
+            pending: None,
+            emit,
+            aborted: false,
+        }
+    }
+
+    /// Push one extent. Returns `false` if the underlying
+    /// emitter has signalled abort (either on this push or any
+    /// previous push). The caller must stop walking.
+    pub fn push(&mut self, ext: MapExtent) -> bool {
+        if self.aborted {
+            return false;
+        }
+        if ext.length == 0 {
+            return true;
+        }
+        if ext.start.checked_add(ext.length).is_none() {
+            return true;
+        }
+
+        match self.pending {
+            None => {
+                self.pending = Some(ext);
+                true
+            }
+            Some(prev) => {
+                if extents_mergeable(&prev, &ext) {
+                    self.pending = Some(MapExtent {
+                        start: prev.start,
+                        length: prev.length + ext.length,
+                        state: prev.state,
+                    });
+                    true
+                } else {
+                    let cont = (self.emit)(prev);
+                    if !cont {
+                        self.aborted = true;
+                        self.pending = None;
+                        return false;
+                    }
+                    self.pending = Some(ext);
+                    true
+                }
+            }
+        }
+    }
+
+    /// Flush any pending extent. Returns `false` if the
+    /// emitter signalled abort during the flush (or earlier).
+    pub fn finish(self) -> bool {
+        if self.aborted {
+            return false;
+        }
+        if let Some(prev) = self.pending {
+            return (self.emit)(prev);
+        }
+        true
+    }
+}
+
+fn extents_mergeable(a: &MapExtent, b: &MapExtent) -> bool {
+    let Some(a_end) = a.start.checked_add(a.length) else {
+        return false;
+    };
+    if a_end != b.start {
+        return false;
+    }
+    match (a.state, b.state) {
+        (MapExtentState::Hole, MapExtentState::Hole) => true,
+        (MapExtentState::ZeroAllocated, MapExtentState::ZeroAllocated) => true,
+        (
+            MapExtentState::Data { file_offset: a_off },
+            MapExtentState::Data { file_offset: b_off },
+        ) => a_off.checked_add(a.length) == Some(b_off),
+        _ => false,
+    }
+}
+
 /// Result from get_operation_config (FFI-safe alternative to tuple)
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -762,6 +912,23 @@ pub struct CallTable {
     /// of `CallTable` for the same back-compat reason as
     /// `read_output_sector`.
     pub write_input_sector: unsafe extern "C" fn(u32, u64, *const u8, usize) -> bool,
+
+    /// Send one coalesced map extent. Called once per extent
+    /// emitted by the guest's per-format `map_extents` walker
+    /// during the map operation. Args: `*const MapExtentRecord`
+    /// carrying the extent's virtual start, length, state code,
+    /// and (for `STATE_DATA` extents) the source file offset.
+    /// Appended at the end of `CallTable` for the same
+    /// back-compat reason as `write_input_sector`.
+    pub send_map_extent: unsafe extern "C" fn(*const MapExtentRecord),
+
+    /// Send the map operation's terminator summary. Called once
+    /// per invocation, after the last `send_map_extent`. Args:
+    /// `*const MapResult` carrying the extent count, virtual
+    /// size, source format echo, and error code. Appended at the
+    /// end of `CallTable` for the same back-compat reason as
+    /// `send_map_extent`.
+    pub send_map_result: unsafe extern "C" fn(*const MapResult),
 }
 
 /// Backing format type for QCOW2 header extension
@@ -1081,10 +1248,10 @@ impl CallTable {
     /// Magic value indicating a valid call table
     pub const MAGIC: u32 = 0x494D4147; // "IMAG"
 
-    /// Current ABI version (bumped: rebase-commit phase 1 appended
-    /// `send_rebase_result`, `send_commit_result`, and
-    /// `write_input_sector`).
-    pub const VERSION: u32 = 15;
+    /// Current ABI version (bumped: PLAN-map phase 2 appended
+    /// `send_map_extent` and `send_map_result` to support the
+    /// streaming-emit shape map needs).
+    pub const VERSION: u32 = 16;
 }
 
 // ============================================================================
@@ -2231,6 +2398,153 @@ impl MeasureResult {
     pub const ERROR_OVERFLOW: u32 = 1;
     pub const ERROR_INVALID_OPTION: u32 = 2;
     pub const ERROR_INVALID_SIZE: u32 = 3;
+
+    /// True if magic matches.
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+}
+
+// ============================================================================
+// Map configuration and result structures
+// ============================================================================
+
+/// Configuration for the map operation.
+///
+/// Written to `OPERATION_CONFIG_ADDR` by the VMM before launching
+/// the map guest binary. The guest reads this directly via
+/// `&*(OPERATION_CONFIG_ADDR as *const MapConfig)`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MapConfig {
+    /// Magic (`0x4D41505F` = "MAP_").
+    pub magic: u32,
+    /// Configuration flags. Bit 31 is FLAG_VERBOSE; all other
+    /// bits are reserved for future use (chain mode, SEEK_HOLE
+    /// host pre-pass, etc.).
+    pub flags: u32,
+    /// Sector size for input I/O (typically 65536).
+    pub sector_size: u32,
+    /// Number of input devices in the backing chain. Reserved
+    /// for the chain follow-up; phase 2 enforces
+    /// `input_device_count == 1`.
+    pub input_device_count: u32,
+    /// Start the emission window at this virtual byte offset.
+    /// Zero means "start at the beginning of the image".
+    pub start_offset: u64,
+    /// Stop the emission window after this many virtual bytes
+    /// from `start_offset`. Zero means "emit to virtual_size".
+    /// A non-zero value smaller than one source cluster /
+    /// grain / block still emits the extent that overlaps the
+    /// window; trimming happens at extent boundaries, matching
+    /// qemu-img map.
+    pub max_length: u64,
+    /// Reserved padding for forward compat. Future fields:
+    /// snapshot ID length + bytes, image-opts descriptor.
+    pub _reserved: [u8; 32],
+}
+
+impl MapConfig {
+    /// Magic value for map config.
+    pub const MAGIC: u32 = 0x4D41505F; // "MAP_"
+
+    /// Flag: verbose guest logging.
+    pub const FLAG_VERBOSE: u32 = 1 << 31;
+
+    /// True if magic matches.
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+}
+
+/// One coalesced map extent in the on-wire FFI representation.
+///
+/// The parser-facing [`MapExtent`] type (Rust enum) is converted
+/// at the guest's emit boundary into this `#[repr(C)]` form so
+/// the call-table function pointer can take a plain pointer.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MapExtentRecord {
+    /// Magic (`0x4D584554` = "MXET").
+    pub magic: u32,
+    /// State code: 0 = Hole, 1 = ZeroAllocated, 2 = Data.
+    pub state: u32,
+    /// Virtual offset of the extent's first byte.
+    pub start: u64,
+    /// Extent length in bytes. Never zero.
+    pub length: u64,
+    /// Source file offset for `state == STATE_DATA`; zero
+    /// otherwise. (Host renderer omits the JSON field when
+    /// `state != STATE_DATA`.)
+    pub file_offset: u64,
+    /// Reserved padding for forward compat (compressed length,
+    /// subcluster flags, chain depth).
+    pub _reserved: [u8; 16],
+}
+
+impl MapExtentRecord {
+    /// Magic value for map extent record.
+    pub const MAGIC: u32 = 0x4D584554; // "MXET"
+
+    /// Extent state: unallocated, reads as zero, not present in
+    /// the source file.
+    pub const STATE_HOLE: u32 = 0;
+    /// Extent state: explicitly recorded as zero in the metadata
+    /// (qcow2 ZERO_PLAIN / ZERO_ALLOC, vmdk grain marker, vhdx
+    /// PAYLOAD_BLOCK_ZERO).
+    pub const STATE_ZERO_ALLOCATED: u32 = 1;
+    /// Extent state: contains data backed by the source file at
+    /// `file_offset`.
+    pub const STATE_DATA: u32 = 2;
+
+    /// True if magic matches.
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+}
+
+/// Result structure for the map operation.
+///
+/// One per invocation, sent via the `send_map_result` call-table
+/// function after every `send_map_extent`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MapResult {
+    /// Magic (`0x4D505253` = "MPRS").
+    pub magic: u32,
+    /// Source format echoed back. ImageFormat-as-u32; the host
+    /// translates to a name for the protobuf envelope.
+    pub source_format: u32,
+    /// Number of `send_map_extent` calls the guest made during
+    /// this invocation. The host can sanity-check that it
+    /// received exactly that many extent messages before the
+    /// result.
+    pub extents_emitted: u64,
+    /// Virtual size of the source image, in bytes. The host uses
+    /// this to verify the partition invariant (sum of received
+    /// extent lengths == virtual_size minus any window trim).
+    pub virtual_size: u64,
+    /// Error code: 0 = ok, non-zero mirrors `MapResult::ERROR_*`.
+    pub error: u32,
+    /// Reserved padding for forward compat.
+    pub _reserved: u32,
+}
+
+impl MapResult {
+    /// Magic value for map result.
+    pub const MAGIC: u32 = 0x4D505253; // "MPRS"
+
+    pub const ERROR_OK: u32 = 0;
+    /// Source format unrecognised or scan rejected the image.
+    pub const ERROR_INVALID_SOURCE: u32 = 1;
+    /// Invalid config (missing magic, bad sector_size,
+    /// input_device_count != 1, oversized start_offset).
+    pub const ERROR_INVALID_OPTION: u32 = 2;
+    /// Source has a backing file / parent / multi-extent
+    /// descriptor and chain composition is deferred.
+    pub const ERROR_HAS_BACKING: u32 = 3;
+    /// I/O failure during walk.
+    pub const ERROR_IO: u32 = 4;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -3669,5 +3983,322 @@ mod tests {
         assert!(r.is_valid());
         r.magic = 0;
         assert!(!r.is_valid());
+    }
+
+    // ------------------------------------------------------------------
+    // MapExtentCoalescer tests
+    // ------------------------------------------------------------------
+
+    fn data(start: u64, length: u64, file_offset: u64) -> MapExtent {
+        MapExtent {
+            start,
+            length,
+            state: MapExtentState::Data { file_offset },
+        }
+    }
+
+    fn hole(start: u64, length: u64) -> MapExtent {
+        MapExtent {
+            start,
+            length,
+            state: MapExtentState::Hole,
+        }
+    }
+
+    fn zero_alloc(start: u64, length: u64) -> MapExtent {
+        MapExtent {
+            start,
+            length,
+            state: MapExtentState::ZeroAllocated,
+        }
+    }
+
+    /// Small fixed-size emitter that records each emitted extent
+    /// into a stack-allocated buffer. Avoids requiring `alloc`
+    /// in tests so the shared crate's no_std test build stays
+    /// dependency-free.
+    struct Recorder {
+        buf: [MapExtent; 8],
+        len: usize,
+    }
+
+    impl Recorder {
+        fn new() -> Self {
+            Self {
+                buf: [hole(0, 0); 8],
+                len: 0,
+            }
+        }
+
+        fn record(&mut self, e: MapExtent) {
+            assert!(self.len < self.buf.len(), "recorder overflow");
+            self.buf[self.len] = e;
+            self.len += 1;
+        }
+
+        fn slice(&self) -> &[MapExtent] {
+            &self.buf[..self.len]
+        }
+    }
+
+    /// Drive the coalescer with `pushes`, asserting no abort, and
+    /// return the recorder's contents.
+    fn collect(pushes: &[MapExtent]) -> Recorder {
+        let mut rec = Recorder::new();
+        let mut emit = |e: MapExtent| -> bool {
+            rec.record(e);
+            true
+        };
+        {
+            let mut c = MapExtentCoalescer::new(&mut emit);
+            for p in pushes {
+                let cont = c.push(*p);
+                assert!(cont, "coalescer aborted unexpectedly");
+            }
+            assert!(c.finish());
+        }
+        rec
+    }
+
+    #[test]
+    fn coalescer_empty_emits_nothing() {
+        let r = collect(&[]);
+        assert_eq!(r.slice(), &[] as &[MapExtent]);
+    }
+
+    #[test]
+    fn coalescer_single_data_passes_through() {
+        let r = collect(&[data(0, 4096, 0)]);
+        assert_eq!(r.slice(), &[data(0, 4096, 0)]);
+    }
+
+    #[test]
+    fn coalescer_two_contiguous_data_merge() {
+        let r = collect(&[data(0, 4096, 0), data(4096, 4096, 4096)]);
+        assert_eq!(r.slice(), &[data(0, 8192, 0)]);
+    }
+
+    #[test]
+    fn coalescer_two_data_with_noncontiguous_file_offset_split() {
+        // Same virtual contiguity, but file offsets jump — qemu-img
+        // splits these.
+        let r = collect(&[data(0, 4096, 0), data(4096, 4096, 8192)]);
+        assert_eq!(r.slice(), &[data(0, 4096, 0), data(4096, 4096, 8192)]);
+    }
+
+    #[test]
+    fn coalescer_two_holes_merge() {
+        let r = collect(&[hole(0, 4096), hole(4096, 4096)]);
+        assert_eq!(r.slice(), &[hole(0, 8192)]);
+    }
+
+    #[test]
+    fn coalescer_two_zero_alloc_merge() {
+        let r = collect(&[zero_alloc(0, 4096), zero_alloc(4096, 4096)]);
+        assert_eq!(r.slice(), &[zero_alloc(0, 8192)]);
+    }
+
+    #[test]
+    fn coalescer_hole_then_data_splits() {
+        let r = collect(&[hole(0, 4096), data(4096, 4096, 0)]);
+        assert_eq!(r.slice(), &[hole(0, 4096), data(4096, 4096, 0)]);
+    }
+
+    #[test]
+    fn coalescer_data_then_zero_alloc_splits() {
+        let r = collect(&[data(0, 4096, 0), zero_alloc(4096, 4096)]);
+        assert_eq!(r.slice(), &[data(0, 4096, 0), zero_alloc(4096, 4096)]);
+    }
+
+    #[test]
+    fn coalescer_virtual_gap_splits() {
+        // No virtual gap allowed even for matching state.
+        let r = collect(&[data(0, 4096, 0), data(8192, 4096, 8192)]);
+        assert_eq!(r.slice(), &[data(0, 4096, 0), data(8192, 4096, 8192)]);
+    }
+
+    #[test]
+    fn coalescer_zero_length_push_dropped() {
+        let r = collect(&[
+            data(0, 4096, 0),
+            data(4096, 0, 4096),
+            data(4096, 4096, 4096),
+        ]);
+        assert_eq!(r.slice(), &[data(0, 8192, 0)]);
+    }
+
+    #[test]
+    fn coalescer_abort_on_first_emit_stops_iteration() {
+        let mut rec = Recorder::new();
+        let mut emit = |e: MapExtent| -> bool {
+            rec.record(e);
+            false
+        };
+        {
+            let mut c = MapExtentCoalescer::new(&mut emit);
+            // First push fills pending — no emit yet.
+            assert!(c.push(data(0, 4096, 0)));
+            // Second push flushes pending; emitter returns false.
+            assert!(!c.push(hole(4096, 4096)));
+            // Subsequent pushes are dropped.
+            assert!(!c.push(data(8192, 4096, 0)));
+            assert!(!c.finish());
+        }
+        // Only the first (flushed) extent was emitted.
+        assert_eq!(rec.slice(), &[data(0, 4096, 0)]);
+    }
+
+    #[test]
+    fn coalescer_abort_on_finish_flush() {
+        let mut emit = |_: MapExtent| -> bool { false };
+        {
+            let mut c = MapExtentCoalescer::new(&mut emit);
+            assert!(c.push(data(0, 4096, 0)));
+            // finish() flushes pending; emitter returns false.
+            assert!(!c.finish());
+        }
+    }
+
+    #[test]
+    fn coalescer_overflow_push_dropped() {
+        // start + length overflows u64 — silently dropped.
+        let r = collect(&[
+            data(0, 4096, 0),
+            data(u64::MAX, 1, 0), // start + length overflows by 1
+        ]);
+        assert_eq!(r.slice(), &[data(0, 4096, 0)]);
+    }
+
+    #[test]
+    fn coalescer_data_file_offset_overflow_does_not_merge() {
+        // a_end virtual is fine, but a.file_offset + a.length overflows;
+        // mergeable returns false rather than panicking.
+        let r = collect(&[data(0, 4096, u64::MAX - 1000), data(4096, 4096, 0)]);
+        assert_eq!(
+            r.slice(),
+            &[data(0, 4096, u64::MAX - 1000), data(4096, 4096, 0)]
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // MapConfig / MapExtentRecord / MapResult tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn map_magic_values_are_unique_among_existing_magics() {
+        // Cross-check the three new magic values against the
+        // existing 21 in the crate. If a future config struct
+        // accidentally picks the same magic, the static asserts
+        // here will surface the collision.
+        let map_magics = [MapConfig::MAGIC, MapExtentRecord::MAGIC, MapResult::MAGIC];
+        let existing = [
+            CallTable::MAGIC,
+            CopyConfig::MAGIC,
+            InfoConfig::MAGIC,
+            InfoResult::MAGIC,
+            CheckConfig::MAGIC,
+            CheckResult::MAGIC,
+            CompareConfig::MAGIC,
+            CompareResult::MAGIC,
+            ConvertConfig::MAGIC,
+            MeasureConfig::MAGIC,
+            MeasureResult::MAGIC,
+            CreateConfig::MAGIC,
+            CreateResult::MAGIC,
+            ResizeConfig::MAGIC,
+            ResizeResult::MAGIC,
+            RebaseConfig::MAGIC,
+            RebaseResult::MAGIC,
+            CommitConfig::MAGIC,
+            CommitResult::MAGIC,
+            ChainConfig::MAGIC,
+        ];
+        // No new magic equals any existing magic.
+        for m in &map_magics {
+            for e in &existing {
+                assert_ne!(*m, *e, "map magic 0x{:08x} collides with existing", m);
+            }
+        }
+        // The three new magics are also mutually distinct.
+        assert_ne!(MapConfig::MAGIC, MapExtentRecord::MAGIC);
+        assert_ne!(MapConfig::MAGIC, MapResult::MAGIC);
+        assert_ne!(MapExtentRecord::MAGIC, MapResult::MAGIC);
+    }
+
+    #[test]
+    fn map_config_is_valid_accepts_magic_rejects_zero() {
+        let mut c = MapConfig {
+            magic: MapConfig::MAGIC,
+            flags: 0,
+            sector_size: 65536,
+            input_device_count: 1,
+            start_offset: 0,
+            max_length: 0,
+            _reserved: [0; 32],
+        };
+        assert!(c.is_valid());
+        c.magic = 0;
+        assert!(!c.is_valid());
+        c.magic = 0xDEAD_BEEF;
+        assert!(!c.is_valid());
+    }
+
+    #[test]
+    fn map_extent_record_is_valid_accepts_magic_rejects_zero() {
+        let mut r = MapExtentRecord {
+            magic: MapExtentRecord::MAGIC,
+            state: MapExtentRecord::STATE_DATA,
+            start: 0,
+            length: 4096,
+            file_offset: 0,
+            _reserved: [0; 16],
+        };
+        assert!(r.is_valid());
+        r.magic = 0;
+        assert!(!r.is_valid());
+    }
+
+    #[test]
+    fn map_result_is_valid_accepts_magic_rejects_zero() {
+        let mut r = MapResult {
+            magic: MapResult::MAGIC,
+            source_format: 0,
+            extents_emitted: 0,
+            virtual_size: 0,
+            error: MapResult::ERROR_OK,
+            _reserved: 0,
+        };
+        assert!(r.is_valid());
+        r.magic = 0;
+        assert!(!r.is_valid());
+    }
+
+    #[test]
+    fn map_extent_record_state_codes_are_contiguous_from_zero() {
+        // The host renderer maps state codes by table lookup; the
+        // codes must stay contiguous from 0 and mutually disjoint.
+        assert_eq!(MapExtentRecord::STATE_HOLE, 0);
+        assert_eq!(MapExtentRecord::STATE_ZERO_ALLOCATED, 1);
+        assert_eq!(MapExtentRecord::STATE_DATA, 2);
+    }
+
+    #[test]
+    fn map_result_error_codes_have_expected_values() {
+        // Pinned to keep the wire format stable across versions —
+        // protobuf transports these directly.
+        assert_eq!(MapResult::ERROR_OK, 0);
+        assert_eq!(MapResult::ERROR_INVALID_SOURCE, 1);
+        assert_eq!(MapResult::ERROR_INVALID_OPTION, 2);
+        assert_eq!(MapResult::ERROR_HAS_BACKING, 3);
+        assert_eq!(MapResult::ERROR_IO, 4);
+    }
+
+    #[test]
+    fn map_config_flag_verbose_is_top_bit() {
+        // The convention in this crate (cross-checked against
+        // ConvertConfig::FLAG_VERBOSE) is that bit 31 carries
+        // verbosity so subsequent flags can extend from bit 0
+        // upwards without colliding.
+        assert_eq!(MapConfig::FLAG_VERBOSE, 1 << 31);
     }
 }

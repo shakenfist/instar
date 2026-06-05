@@ -46,7 +46,7 @@ DATA_PATTERNS = ['zeros', 'random', 'sparse', 'mbr']
 
 # Operations that the fuzzer can chain together
 OPERATIONS = ['info', 'check', 'convert', 'convert_compressed', 'measure',
-              'create', 'resize', 'rebase', 'commit']
+              'create', 'resize', 'rebase', 'commit', 'map']
 
 # Known divergence categories to skip (unsafe quirks)
 # See docs/quirks.md for rationale
@@ -1893,6 +1893,172 @@ def op_commit(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
     return None
 
 
+# ---------------------------------------------------------------------------
+# op_map: instar map vs qemu-img map (PLAN-map phase 8)
+# ---------------------------------------------------------------------------
+
+# Per-extent fields compared between instar and qemu-img. The skipped
+# fields are documented in docs/plans/PLAN-map-phase-08-fuzz-
+# differential.md (depth: always 0 in v1; compressed: instar emits
+# false always; offset: compressed-cluster reporting drift across
+# binaries; filename: paths differ between the two copies).
+MAP_COMPARE_FIELDS = ('start', 'length', 'present', 'zero', 'data')
+
+# Per-format field skips for documented divergences that would
+# otherwise flood the differential signal. The phase 8 smoke
+# discovered each entry empirically.
+MAP_FIELD_SKIPS = {
+    # VHD unallocated blocks: instar reports present=false (true
+    # to the on-disk BAT 0xFFFFFFFF marker); qemu-img reports
+    # present=true with zero=true (the "ZeroAllocated"
+    # convention, same as it uses for raw sparse runs). Phase 6's
+    # KNOWN_MAP_DIVERGENCES in tests/test_map.py marks
+    # hyperv-dynamic-vhd and virtualpc-vhd with the same rationale.
+    # Keeping {start, length, zero, data} comparison active for
+    # vpc still catches BAT-walking boundary bugs and any genuine
+    # data/zero mislabelling.
+    'vpc': ('present',),
+}
+
+
+def _map_probe_virtual_size(qemu_copy, timeout):
+    """Return the virtual size of an image in bytes via qemu-img info,
+    or None on probe failure (in which case the caller should skip
+    window-arg selection)."""
+    out, _err, rc = run_qemu_img(
+        ['info'], ['--output=json', str(qemu_copy)],
+        timeout=timeout,
+    )
+    if rc != 0:
+        return None
+    try:
+        info = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    value = info.get('virtual-size')
+    if not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _map_window_args(rng, virtual_size_bytes):
+    """Pick optional --start-offset / --max-length window arguments.
+
+    25% chance each of being set, 64 KiB cluster-aligned to dodge the
+    documented "instar clips bytes, qemu-img clips clusters" quirk
+    in docs/quirks.md.
+    """
+    args = []
+    align = 64 * 1024
+    if virtual_size_bytes < align * 2:
+        # Image too small for meaningful windowing; skip.
+        return args
+    if rng.random() < 0.25:
+        half = virtual_size_bytes // 2
+        start = (rng.randint(0, half) // align) * align
+        args += ['--start-offset', str(start)]
+    if rng.random() < 0.25:
+        max_len = (rng.randint(align, virtual_size_bytes) // align) * align
+        max_len = min(max_len, virtual_size_bytes)
+        args += ['--max-length', str(max_len)]
+    return args
+
+
+def op_map(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
+    """Run instar map and qemu-img map, comparing JSON output extent-by-
+    extent.
+
+    Raw is gated out: instar emits one fully-allocated extent while
+    qemu-img walks SEEK_HOLE — a documented divergence (see
+    docs/quirks.md) that would noise-flood the fuzzer. The same
+    posture as `op_info`'s raw skip.
+
+    Other format-level divergences (chain qcow2 refused, vmdk
+    multi-extent refused, vhdx partial-present) don't fire here
+    because generate_image() never produces those shapes.
+    """
+    if fmt == 'raw':
+        return None
+
+    virtual_size = _map_probe_virtual_size(qemu_copy, timeout)
+    window_args = (
+        _map_window_args(rng, virtual_size) if virtual_size else []
+    )
+
+    instar_args = window_args + ['--output', 'json', str(instar_copy)]
+    qemu_args = window_args + ['--output=json', str(qemu_copy)]
+
+    i_out, i_err, i_rc = run_instar(
+        instar_bin, ['map'], instar_args, timeout=timeout,
+    )
+    q_out, q_err, q_rc = run_qemu_img(
+        ['map'], qemu_args, timeout=timeout,
+    )
+
+    div = compare_exit_codes(i_rc, q_rc, 'map', {
+        'window_args': window_args,
+        'instar_stderr': i_err[:500],
+        'qemu_stderr': q_err[:500],
+    })
+    if div:
+        return div
+
+    if i_rc != 0:
+        # Both failed identically — nothing to compare.
+        return None
+
+    try:
+        i_arr = json.loads(i_out)
+        q_arr = json.loads(q_out)
+    except json.JSONDecodeError as exc:
+        return {
+            'type': 'map_json_parse_failure',
+            'window_args': window_args,
+            'error': str(exc),
+            'instar_stdout': i_out[:500],
+            'qemu_stdout': q_out[:500],
+        }
+
+    if not isinstance(i_arr, list) or not isinstance(q_arr, list):
+        return {
+            'type': 'map_json_shape_divergence',
+            'window_args': window_args,
+            'instar_stdout': i_out[:500],
+            'qemu_stdout': q_out[:500],
+        }
+
+    if len(i_arr) != len(q_arr):
+        return {
+            'type': 'map_extent_count_divergence',
+            'window_args': window_args,
+            'instar_count': len(i_arr),
+            'qemu_count': len(q_arr),
+            'instar_stdout': i_out[:1000],
+            'qemu_stdout': q_out[:1000],
+        }
+
+    skip_fields = MAP_FIELD_SKIPS.get(fmt, ())
+    for idx, (i_ext, q_ext) in enumerate(zip(i_arr, q_arr)):
+        for field in MAP_COMPARE_FIELDS:
+            if field in skip_fields:
+                continue
+            if i_ext.get(field) != q_ext.get(field):
+                return {
+                    'type': 'map_field_divergence',
+                    'window_args': window_args,
+                    'extent_index': idx,
+                    'field': field,
+                    'instar_value': i_ext.get(field),
+                    'qemu_value': q_ext.get(field),
+                    'instar_extent': i_ext,
+                    'qemu_extent': q_ext,
+                    'instar_stdout': i_out[:1000],
+                    'qemu_stdout': q_out[:1000],
+                }
+
+    return None
+
+
 def _run_qemu_io(args, timeout=30):
     """Run a qemu-io command. Returns (stdout, stderr, rc).
     Mirrors `run_qemu_img`'s shape; used as a fixture-builder
@@ -1979,6 +2145,11 @@ def run_iteration(instar_bin, workdir, rng, iteration, timeout,
                 )
             elif op == 'commit':
                 div = op_commit(
+                    instar_bin, instar_copy, qemu_copy, fmt,
+                    timeout, rng,
+                )
+            elif op == 'map':
+                div = op_map(
                     instar_bin, instar_copy, qemu_copy, fmt,
                     timeout, rng,
                 )

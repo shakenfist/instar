@@ -1,0 +1,24 @@
+[package]
+name = "map-op"
+version = "0.2.0"
+edition = "2021"
+description = "Map operation: stream per-extent allocation map for a source image"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "map"
+path = "src/main.rs"
+
+[dependencies]
+shared = { path = "../../shared" }
+qcow2 = { path = "../../crates/qcow2" }
+raw = { path = "../../crates/raw" }
+vmdk = { path = "../../crates/vmdk" }
+vhd = { path = "../../crates/vhd" }
+vhdx = { path = "../../crates/vhdx" }
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true

@@ -9,7 +9,7 @@
 
 use shared::{
     be_u16, be_u32, be_u64, write_be_u16, write_be_u32, write_be_u64, AllocationSummary, CallTable,
-    MAX_SECTOR_SIZE,
+    MapExtent, MapExtentCoalescer, MapExtentState, MAX_SECTOR_SIZE,
 };
 
 // ============================================================================
@@ -316,6 +316,41 @@ pub fn count_allocated_in_bat(bat_bytes: &[u8]) -> u64 {
         .chunks_exact(4)
         .filter(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]) != BAT_UNALLOCATED)
         .count() as u64
+}
+
+/// Classify one dynamic-VHD BAT entry into a single `MapExtent`.
+///
+/// Mirrors `VhdState::block_lookup`'s dynamic-VHD decision tree:
+///
+/// - `entry == BAT_UNALLOCATED` (0xFFFF_FFFF): `Hole`.
+/// - Otherwise: `Data { file_offset = entry * 512 +
+///   block_data_offset }`. The BAT entry is the absolute sector
+///   number of the block's sector-bitmap; the payload starts
+///   `block_data_offset` bytes later.
+///
+/// `block_size_bytes` is the extent's length. `virtual_offset` is
+/// the virtual address of the block's first byte; the caller is
+/// responsible for clamping `length` against virtual_size if the
+/// block straddles end-of-image.
+pub fn classify_vhd_bat_entry(
+    entry: u32,
+    virtual_offset: u64,
+    block_size_bytes: u64,
+    block_data_offset: u64,
+) -> MapExtent {
+    let state = if entry == BAT_UNALLOCATED {
+        MapExtentState::Hole
+    } else {
+        let block_host_offset = (entry as u64).saturating_mul(512);
+        MapExtentState::Data {
+            file_offset: block_host_offset.saturating_add(block_data_offset),
+        }
+    };
+    MapExtent {
+        start: virtual_offset,
+        length: block_size_bytes,
+        state,
+    }
 }
 
 // ============================================================================
@@ -754,6 +789,141 @@ impl VhdState {
             0,
         ))
     }
+
+    /// Walk the dynamic-VHD BAT (or short-circuit for fixed VHDs)
+    /// and emit a coalesced `MapExtent` stream covering
+    /// `[0, current_size)`.
+    ///
+    /// For fixed VHDs: a single Data extent at file_offset 0
+    /// covering the whole virtual size. No BAT walk.
+    ///
+    /// For dynamic / differencing VHDs: walks the BAT exactly like
+    /// `scan_allocation`'s sector-walking shell, classifies each
+    /// entry via [`classify_vhd_bat_entry`], and pushes the result
+    /// through a `MapExtentCoalescer` that persists for the whole
+    /// walk so consecutive Data blocks with contiguous payload
+    /// offsets coalesce into one extent.
+    ///
+    /// A trailing `Hole` covers any virtual range past the last
+    /// walked block up to `current_size` so emitted extents
+    /// partition `[0, current_size)`.
+    ///
+    /// Returns `Some(())` on success (including early termination);
+    /// `None` on I/O failure.
+    ///
+    /// # Safety
+    ///
+    /// `call_table` must be valid. `bat_cache_buf` must still point
+    /// to at least `MAX_SECTOR_SIZE` writable bytes.
+    pub unsafe fn map_extents<F: FnMut(MapExtent) -> bool>(
+        &mut self,
+        call_table: &CallTable,
+        sector_size: usize,
+        input_capacity: u64,
+        bytes_read: &mut u64,
+        emit: &mut F,
+    ) -> Option<()> {
+        if self.current_size == 0 {
+            return Some(());
+        }
+
+        if self.disk_type == DISK_TYPE_FIXED {
+            let _ = emit(MapExtent {
+                start: 0,
+                length: self.current_size,
+                state: MapExtentState::Data { file_offset: 0 },
+            });
+            return Some(());
+        }
+
+        let block_size = self.block_size as u64;
+        let block_data_offset = self.block_data_offset as u64;
+        let total_bat_bytes = (self.max_table_entries as u64).checked_mul(4)?;
+        let bat_start_sector = self.table_offset / sector_size as u64;
+        let bat_end_byte = self.table_offset.checked_add(total_bat_bytes)?;
+        let bat_end_sector = bat_end_byte.checked_add(sector_size as u64 - 1)? / sector_size as u64;
+
+        let mut coalescer = MapExtentCoalescer::new(emit);
+        let mut next_unwalked: u64 = 0;
+        let mut bat_bytes_consumed: u64 = 0;
+
+        let mut sector = bat_start_sector;
+        'walk: while sector < bat_end_sector {
+            if sector >= input_capacity {
+                return None;
+            }
+            if !(call_table.read_input_sector)(
+                self.device_idx,
+                sector,
+                self.bat_cache_buf,
+                sector_size,
+            ) {
+                return None;
+            }
+            *bytes_read += sector_size as u64;
+
+            let sector_byte_start = sector * sector_size as u64;
+            let buf_start = if sector_byte_start < self.table_offset {
+                (self.table_offset - sector_byte_start) as usize
+            } else {
+                0
+            };
+            let buf_end =
+                sector_size.min((bat_end_byte.saturating_sub(sector_byte_start)) as usize);
+            if buf_end <= buf_start {
+                sector += 1;
+                continue;
+            }
+            let chunk =
+                core::slice::from_raw_parts(self.bat_cache_buf.add(buf_start), buf_end - buf_start);
+            let meaningful_len =
+                (total_bat_bytes - bat_bytes_consumed).min((buf_end - buf_start) as u64) as usize;
+            let meaningful = &chunk[..meaningful_len];
+
+            let chunk_entry_count = (meaningful_len as u64) / 4;
+            let base_entry_index = bat_bytes_consumed / 4;
+
+            for k in 0..chunk_entry_count {
+                let off = (k as usize) * 4;
+                let entry = u32::from_be_bytes([
+                    meaningful[off],
+                    meaningful[off + 1],
+                    meaningful[off + 2],
+                    meaningful[off + 3],
+                ]);
+                let global_idx = base_entry_index + k;
+                let block_virt = global_idx.saturating_mul(block_size);
+                if block_virt >= self.current_size {
+                    break 'walk;
+                }
+                let block_visible = block_size.min(self.current_size - block_virt);
+
+                let mut ext =
+                    classify_vhd_bat_entry(entry, block_virt, block_size, block_data_offset);
+                if ext.length > block_visible {
+                    ext.length = block_visible;
+                }
+                let cont = coalescer.push(ext);
+                next_unwalked = block_virt.saturating_add(block_visible);
+                if !cont {
+                    break 'walk;
+                }
+            }
+
+            bat_bytes_consumed += meaningful_len as u64;
+            sector += 1;
+        }
+
+        if next_unwalked < self.current_size {
+            let _ = coalescer.push(MapExtent {
+                start: next_unwalked,
+                length: self.current_size - next_unwalked,
+                state: MapExtentState::Hole,
+            });
+        }
+        let _ = coalescer.finish();
+        Some(())
+    }
 }
 
 // ============================================================================
@@ -1147,5 +1317,71 @@ mod tests {
         // Only 0xFFFFFFFF is the unallocated sentinel.
         let buf = be32(0x0000_0000);
         assert_eq!(count_allocated_in_bat(&buf), 1);
+    }
+
+    // ====================================================================
+    // classify_vhd_bat_entry tests
+    // ====================================================================
+
+    #[test]
+    fn classify_vhd_unallocated_is_hole() {
+        let e = classify_vhd_bat_entry(BAT_UNALLOCATED, 0, 2 * 1024 * 1024, 512);
+        assert_eq!(e.state, MapExtentState::Hole);
+        assert_eq!(e.length, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn classify_vhd_allocated_is_data_with_bitmap_offset() {
+        // Block starts at sector 10, bitmap is 512 bytes (1 sector),
+        // so payload starts at byte 10*512 + 512 = 5632.
+        let e = classify_vhd_bat_entry(10, 0, 2 * 1024 * 1024, 512);
+        assert_eq!(e.state, MapExtentState::Data { file_offset: 5632 });
+    }
+
+    #[test]
+    fn classify_vhd_allocated_zero_sector() {
+        // BAT entry of 0 is a valid sector pointer (sector 0); payload
+        // starts at block_data_offset bytes.
+        let e = classify_vhd_bat_entry(0, 0, 2 * 1024 * 1024, 512);
+        assert_eq!(e.state, MapExtentState::Data { file_offset: 512 });
+    }
+
+    #[test]
+    fn classify_vhd_large_block_index() {
+        // 2 MiB block at sector 1000.
+        let e = classify_vhd_bat_entry(1000, 4 * 1024 * 1024, 2 * 1024 * 1024, 1024);
+        assert_eq!(e.start, 4 * 1024 * 1024);
+        assert_eq!(e.length, 2 * 1024 * 1024);
+        assert_eq!(
+            e.state,
+            MapExtentState::Data {
+                file_offset: 1000 * 512 + 1024
+            }
+        );
+    }
+
+    #[test]
+    fn classify_vhd_max_sector_pointer_minus_one() {
+        // 0xFFFFFFFE is allocated (only 0xFFFFFFFF is unallocated).
+        let e = classify_vhd_bat_entry(0xFFFF_FFFE, 0, 2 * 1024 * 1024, 512);
+        assert_eq!(
+            e.state,
+            MapExtentState::Data {
+                file_offset: 0xFFFF_FFFEu64 * 512 + 512
+            }
+        );
+    }
+
+    #[test]
+    fn classify_vhd_block_data_offset_zero() {
+        // A theoretical zero-bitmap layout: payload starts exactly at
+        // sector boundary.
+        let e = classify_vhd_bat_entry(100, 0, 4096, 0);
+        assert_eq!(
+            e.state,
+            MapExtentState::Data {
+                file_offset: 100 * 512
+            }
+        );
     }
 }
