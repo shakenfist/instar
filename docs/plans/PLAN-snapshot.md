@@ -1,0 +1,1103 @@
+# `instar snapshot` subcommand
+
+## Prompt
+
+Before responding to questions or discussion points in this
+document, explore the instar codebase thoroughly. Read relevant
+source files, understand existing patterns (VMM structure, guest
+operation layout, shared crate conventions, call table ABI,
+format parsing, test infrastructure), and ground your answers in
+what the code actually does today. Do not speculate about the
+codebase when you could read it instead. Where a question touches
+on external concepts (QCOW2 snapshot table layout, refcount table
+semantics, L1/L2 COPIED-flag invariants, `qemu-img snapshot`
+behaviour, KVM / virtio), research as needed to give a confident
+answer. Flag any uncertainty explicitly rather than guessing.
+
+All planning documents go in `docs/plans/`. Phase plans for this
+master plan are named `PLAN-snapshot-phase-NN-<descriptive>.md`
+alongside this file and linked from the Execution table below.
+They are *not* added to `docs/plans/order.yml` — only the master
+plan is.
+
+I prefer one commit per logical change, and at minimum one commit
+per phase. Each commit should be self-contained: it should build,
+pass tests, and have a clear commit message explaining what
+changed and why.
+
+## Situation
+
+`PLAN-convert-followups.md` enumerates seven `qemu-img` subcommands
+deferred from the original convert effort. `create`, `measure`,
+`resize`, `rebase`, `commit`, and `map` have all shipped (see
+their respective master plans). **`snapshot` is the sole remaining
+item.**
+
+`snapshot` is scheduled last because:
+
+- It is the only deferred subcommand that is **format-restricted to
+  qcow2**. `qemu-img snapshot` refuses every other format
+  ("Format driver 'vmdk' does not support image snapshots"). Our
+  test matrix collapses from "five formats × matrix" to "qcow2 ×
+  matrix", but the qcow2 implementation has to be deeper than any
+  prior plan because every mutating mode (`-a`/`-c`/`-d`) touches
+  refcounts and the COPIED-flag invariant — the single most
+  delicate piece of qcow2 metadata.
+- Modern KVM/virtualisation workflows have largely moved away from
+  internal qcow2 snapshots in favour of external overlay chains
+  (which `rebase` and `commit` already cover). The day-to-day
+  demand is correspondingly lower; this is the right item to land
+  last rather than first.
+- It nevertheless completes the convert-follow-ups roster and
+  closes out `qemu-img` parity for the operations instar will
+  ever care about. Downstream consumers — oVirt's `ovirt-imageio`
+  upload sizing, Proxmox's PVE-backed disk migration scripts —
+  exercise `qemu-img snapshot -l` for inventory and occasionally
+  `-d` to clean up old snapshots before transfer. Listing is the
+  high-value mode; mutation is the long-tail.
+- It builds on existing infrastructure rather than introducing
+  any new call-table primitives. Both `read_output_sector`
+  (resize phase 7, `src/shared/src/lib.rs:879`) and
+  `write_input_sector` (rebase/commit phase 1,
+  `src/shared/src/lib.rs:914`) are already in the ABI; the
+  snapshot image is opened RW as input device 0 and uses
+  `write_input_sector` for all mutations, exactly like commit's
+  overlay-RW path.
+- The qcow2 snapshot table parser is *already in tree*
+  (`src/crates/qcow2/src/lib.rs:684` `parse_snapshot_table`,
+  with `SnapshotEntry` and `SnapshotTable` types and a
+  16-snapshot in-memory cap). It is currently used only by
+  `info` to set `FLAG_HAS_SNAPSHOTS`. Phase 1 of this plan
+  extends it from "is there *any* snapshot?" to "emit one
+  message per snapshot with full metadata".
+
+The relevant existing infrastructure this plan builds on:
+
+- **Snapshot table parser**:
+  `parse_snapshot_table()` and `SnapshotEntry` / `SnapshotTable`
+  in `src/crates/qcow2/src/lib.rs:599-869` plus
+  `find_snapshot()` at `:874`. Already reads `l1_table_offset`,
+  `l1_size`, id/name, `date_sec`, and the legacy 32-bit
+  `vm_state_size`. The 64-bit `vm_state_size_large`, `disk_size`,
+  and `icount` (extra-data section, qcow2 v3) are *not* yet
+  surfaced — phase 1 extends the parser.
+- **Refcount table walk infrastructure**: `scan_allocation()`
+  already reads refcount blocks (phase 2 of PLAN-measure) and
+  the `qcow2::lookup_cluster` / `qcow2::write_l2_entry`
+  pattern in resize phases 2–3 handles L1/L2 mutation. We do
+  not need a new walk; we need a *mutator* on top of the
+  existing reader.
+- **VMM subcommand scaffolding** in `src/vmm/src/main.rs`
+  (clap `Commands` enum at lines 2482–2508, per-op `*Args`,
+  `run_*`), call-table boundary in `src/shared/src/lib.rs`
+  (`OPERATION_CONFIG_ADDR`, per-op `*Config` and `*Result`
+  structs), protobuf wrapper in
+  `crates/guest-protocol/proto/guest.proto` (`GuestMessage`
+  oneof, next free tag is 17 after `map_extent`=15 /
+  `map_result`=16).
+- **Two-device-RW open path**: `open_chain_devices_rw` from
+  PLAN-rebase-commit phase 1, which opens the input device RW
+  so the guest can use `write_input_sector(0, …)`. Snapshot
+  uses the single-device variant (no chain): one image opened
+  RW on input slot 0, no output device.
+- **Streaming guest-message channel** used by `info`, `check`,
+  `convert`, `commit`, and `map` for unbounded record streams.
+  Snapshot list mode reuses this for emitting one
+  `SnapshotEntryMessage` per snapshot (bounded by qcow2's own
+  cap of 65536 snapshots, in practice well under that).
+- **Cross-version baseline generator**
+  (`instar-testdata/scripts/generate-baselines.py`) and its
+  `expected-outputs/{info,check,compare,measure,map}-{human,json}/`
+  layout, which we extend with a `snapshot-list-{human,json}`
+  profile pair. Mutating modes (`-a`/`-c`/`-d`) are validated
+  by *post-operation* image equivalence (instar vs qemu-img
+  ran on the same input), not by stdout baselines, because
+  successful mutation produces no stdout.
+- **Coverage-guided fuzz harnesses** in `src/fuzz/` and the
+  **differential fuzzer** (`scripts/differential-fuzz.py`).
+  Both extend naturally: the fuzz target drains
+  `parse_snapshot_table` against random qcow2 fragments; the
+  differential fuzzer applies a random sequence of
+  `instar snapshot -c/-d/-a` and compares image bytes against
+  the same sequence under qemu-img.
+
+## Mission and problem statement
+
+Implement `instar snapshot` such that:
+
+1. It accepts the same surface area as `qemu-img snapshot`:
+   - A required `FILENAME` (qcow2 only).
+   - **Mutually exclusive mode flags**:
+     - `-l` — list snapshots (read-only).
+     - `-a SNAPSHOT` — apply ("goto") snapshot by ID or name.
+     - `-c NAME` — create snapshot with the given name; qemu
+       assigns the next available numeric ID.
+     - `-d SNAPSHOT` — delete snapshot by ID or name.
+   - `-f FMT` — format hint (qemu accepts; we accept and
+     enforce qcow2-only).
+   - `-q` — suppress success line on stdout.
+   - `-U` / `--force-share` — skip image-lock check. instar
+     does not implement qemu's file-lock protocol, so this
+     flag is a host-side no-op accepted for CLI compatibility.
+   - `--output={human,json}` — instar extension; `qemu-img
+     snapshot -l` is human-only. JSON is opt-in.
+   - `--image-opts` — explicitly rejected with a clear error
+     (consistent with `measure`, `map`, etc.).
+2. The qcow2 parsing **and** mutation work runs entirely inside
+   the KVM guest. Untrusted input metadata never touches the
+   host. The host opens the image RW and dispatches; the guest
+   does every read, every refcount mutation, every header
+   rewrite.
+3. **Format restriction**: qemu-img refuses non-qcow2 with
+   `Format driver '<fmt>' does not support image snapshots`.
+   instar matches this error verbatim modulo the leading
+   binary name; document divergence in `docs/quirks.md` if
+   any qemu-img version in the matrix differs in wording.
+4. **List mode** matches `qemu-img snapshot -l` byte-for-byte
+   across the matrix in
+   `instar-testdata/qemu-img-binaries/x86_64/`, including the
+   column layout (`ID`, `TAG`, `VM_SIZE`, `DATE`, `VM_CLOCK`,
+   `ICOUNT` (v3 only)), the date formatting (`%Y-%m-%d
+   %H:%M:%S`), and the VM-clock format (`HH:MM:SS.NNN`).
+5. **Mutating modes** produce a qcow2 file byte-equivalent (or
+   refcount-equivalent — see open question 7) to the result of
+   running the same `qemu-img snapshot` command. Validated by:
+   - Post-op `qemu-img check` clean.
+   - Post-op `qemu-img info` snapshot count, name, ID match.
+   - Post-op `instar info` matches qemu-img info on the same
+     image.
+   - Post-op `qemu-img compare` against a snapshot-applied
+     reference image returns "Images are identical".
+6. **Backing chain**: Internal snapshots and backing chains
+   compose at the qcow2 spec level (the snapshot's L1 refers
+   to the same data clusters; clusters not present in the
+   overlay still resolve through the backing). v1 supports
+   snapshots in images *with* a backing file but does not
+   need to walk the backing chain for any operation —
+   refcount manipulation only touches *this* image's clusters.
+   The active L1 already refers to the overlay's clusters
+   (not the backing's); the snapshot's L1 is a snapshot of the
+   active L1; both refer only to overlay clusters.
+7. Coverage-guided fuzzing exercises `parse_snapshot_table`
+   and the refcount mutators (`update_snapshot_refcount`,
+   `alloc_cluster`, `free_cluster`, COPIED-flag rewrite) on
+   adversarial qcow2 fragments. The differential fuzzer runs
+   `instar snapshot -c/-d/-a` sequences against `qemu-img
+   snapshot` and compares post-op `qemu-img check` plus
+   stripped-metadata image bytes.
+
+## Design overview
+
+### Architectural shape
+
+The work decomposes along the same three-layer pattern as
+prior plans (parser primitives → guest binary → host glue),
+but the parser layer here is **mutating** for three of the
+four modes, which materially changes the testing posture.
+
+1. **Mutator primitives in `src/crates/qcow2/`** (and a new
+   `src/crates/snapshot/` if the surface grows enough to
+   warrant its own crate — see open question 3). Specifically:
+   - `parse_snapshot_table_extended()` — extends the existing
+     parser to surface `vm_state_size_large` (extra-data offset
+     0), `disk_size` (offset 8), `icount` (offset 16).
+   - `update_snapshot_refcount(addend, l1_table_offset,
+     l1_size, …)` — walks the snapshot's L1 → L2 chain and
+     increments / decrements refcounts for every referenced
+     data cluster *and* every referenced L2 table cluster.
+     For compressed clusters, updates the refcount for the
+     entire compressed extent (which may span more than one
+     cluster).
+   - `alloc_cluster(…) -> Option<u64>` — finds a free cluster
+     by scanning refcount blocks (reuses the resize-grow
+     allocator pattern), sets refcount=1, returns host offset.
+     Handles refcount-table growth when the existing refcount
+     table is full.
+   - `free_cluster(host_offset, …)` — decrements refcount.
+     Does *not* coalesce/release space at the file level
+     (qcow2 doesn't either; freed clusters stay in the file
+     until reused).
+   - `write_snapshot_table_entry()` — serialises one
+     `QCowSnapshotHeader` + extra-data + id/name strings into
+     the snapshot-table area at a given offset; handles the
+     8-byte alignment padding.
+   - `rebuild_snapshot_table()` — for delete and create-when-
+     full: allocates new cluster(s), rewrites the snapshot
+     table, updates header's `snapshots_offset` /
+     `nb_snapshots`, frees the old table clusters. The qcow2
+     spec mandates an atomic header rewrite as the
+     commit point.
+   - `update_copied_flags_for_l1()` — after a refcount
+     change crosses the 1-boundary, walks the *active* L1 → L2
+     and rewrites the COPIED bit on each entry whose refcount
+     state changed. (qemu does this incrementally inside
+     `qcow2_update_snapshot_refcount`; we can do it as a
+     separate pass to keep the planner readable.)
+   The mutators take `(call_table, device_idx)` and use
+   `write_input_sector(0, …)` for every write. They run
+   inside the guest.
+
+2. **Guest binary** `src/operations/snapshot/`. Reads
+   `SnapshotConfig` (mode discriminator + arg strings) from
+   `OPERATION_CONFIG_ADDR`, opens device 0, dispatches on
+   mode:
+   - `MODE_LIST`: calls `parse_snapshot_table_extended()`,
+     emits one `SnapshotEntryMessage` per snapshot followed
+     by a `SnapshotResult` terminator. Refuses non-qcow2 with
+     `ERROR_UNSUPPORTED_FORMAT`.
+   - `MODE_APPLY`: finds snapshot by ID/name, validates
+     `l1_size <= active_l1_size_max`, performs refcount
+     adjustments (inc snapshot's L1 chain, dec active L1's
+     chain), copies snapshot's L1 contents into the active
+     L1 area, updates COPIED flags, sends `SnapshotResult`.
+   - `MODE_CREATE`: copies active L1 to a freshly allocated
+     L1-table cluster, increments refcounts on all clusters
+     reachable from active L1 (now reachable from two L1s →
+     refcount goes from 1 to 2), clears COPIED flags on the
+     active L1's entries that just crossed 1→2, appends new
+     snapshot table entry (growing table if needed), updates
+     header (`nb_snapshots`, possibly `snapshots_offset`),
+     sends `SnapshotResult` with the auto-assigned ID.
+   - `MODE_DELETE`: finds snapshot, decrements refcounts on
+     its L1 chain (data clusters first, then L2 tables, then
+     the L1 cluster itself), removes the entry from the
+     snapshot table, rewrites the snapshot table (compacting
+     to remove the gap), updates header, sets COPIED flags
+     on active L1/L2 entries that just crossed 2→1, sends
+     `SnapshotResult`.
+
+3. **Host glue**: `run_snapshot()` in `src/vmm/src/main.rs`
+   that wires up clap args, opens the image RW (single-device
+   variant of `open_chain_devices_rw`), builds `SnapshotConfig`,
+   launches the guest, consumes streamed messages, renders
+   list output for `-l`, or the quiet/success line for the
+   mutating modes.
+
+Splitting mutator primitives into qcow2-crate functions keeps
+them `cargo test`-able with synthetic images. The fuzz harness
+for the refcount mutators is then trivial (no KVM, no serial
+channel).
+
+### Why qcow2-only
+
+`qemu-img snapshot -l` on raw / vmdk / vhd / vhdx prints
+nothing (or errors); `qemu-img snapshot -c`/`-d`/`-a` on
+non-qcow2 errors with `Format driver '<fmt>' does not support
+image snapshots`. The qcow2 format is the only one in our
+parser set with an internal snapshot table.
+
+- raw: no metadata at all.
+- vmdk: descriptor mentions snapshots only in the
+  `parentCID` / overlay sense (external snapshots, which are
+  qemu-img *external* snapshots = `qemu-img create -b base`,
+  not internal snapshots). `qemu-img snapshot` on vmdk errors.
+- vhd: differencing VHD is conceptually similar to an
+  external snapshot chain; no internal snapshot table.
+- vhdx: VHDX has a log/journal but not user-facing
+  snapshots; `qemu-img snapshot` errors.
+
+This plan does not extend snapshot support to other formats.
+The host-side dispatcher rejects non-qcow2 sources at
+`run_snapshot` with the qemu-compatible error.
+
+### Streaming vs. buffering
+
+Only `-l` (list) produces variable-length output, and qcow2
+caps `nb_snapshots` at 65536. In practice (oVirt, Proxmox,
+typical libvirt workflows) the count is single digits.
+Reusing the streaming `*Message`-per-entry pattern from `map`
+costs nothing and keeps the guest's stack flat. Each
+`SnapshotEntryMessage` carries id, name, l1_table_offset,
+l1_size, date_sec, date_nsec, vm_clock_nsec,
+vm_state_size_large, disk_size, icount, and extra_data_size
+(for forward compat with future qemu extensions).
+
+Mutating modes emit only a single `SnapshotResult` summary
+at end-of-stream.
+
+### Call-table and protobuf changes
+
+- New `SnapshotConfig` in `src/shared/src/lib.rs` next to
+  `MapConfig`, with magic `SNAP`:
+  ```rust
+  #[repr(C)]
+  pub struct SnapshotConfig {
+      pub magic: [u8; 4],          // *b"SNAP"
+      pub version: u32,
+      pub mode: u32,               // MODE_LIST | _APPLY | _CREATE | _DELETE
+      pub arg_len: u32,            // bytes used in `arg`
+      pub arg: [u8; 256],          // snapshot ID / name (UTF-8, no nul)
+      pub flags: u32,              // FLAG_QUIET | FLAG_FORCE_SHARE
+      pub reserved: [u8; 240],     // future
+  }
+  ```
+- New `SnapshotEntryMessage` in `guest.proto`:
+  ```
+  message SnapshotEntryMessage {
+    string id = 1;                 // snapshot ID (qemu's "0", "1", ...)
+    string name = 2;               // snapshot tag/name
+    uint64 l1_table_offset = 3;
+    uint32 l1_size = 4;
+    uint32 date_sec = 5;
+    uint32 date_nsec = 6;
+    uint64 vm_clock_nsec = 7;
+    uint64 vm_state_size = 8;      // 64-bit large value
+    uint64 disk_size = 9;          // virtual disk size at snapshot
+    uint64 icount = 10;            // record/replay; -1 if absent
+    uint32 extra_data_size = 11;   // for forward compat
+  }
+  ```
+- New `SnapshotResult` in `src/shared/src/lib.rs`:
+  ```rust
+  #[repr(C)]
+  pub struct SnapshotResult {
+      pub mode: u32,
+      pub error: u32,
+      pub snapshots_emitted: u32,  // populated for MODE_LIST
+      pub assigned_id_len: u32,    // populated for MODE_CREATE
+      pub assigned_id: [u8; 64],   // populated for MODE_CREATE
+      pub reserved: [u8; 64],
+  }
+  ```
+  with `ERROR_*` codes for: success, not-qcow2, snapshot-not-
+  found, duplicate-name, refcount-overflow, allocation-failed
+  (refcount table full and cannot grow), snapshot-table-full
+  (would exceed `QCOW_MAX_SNAPSHOTS`), io-error, l1-size-
+  mismatch (apply: snapshot's L1 doesn't fit in active L1 area
+  and growing would exceed `QCOW_MAX_L1_SIZE`), invalid-utf8
+  in name.
+- New `SnapshotResultMessage` in `guest.proto`:
+  ```
+  message SnapshotResultMessage {
+    uint32 mode = 1;
+    uint32 error = 2;
+    uint32 snapshots_emitted = 3;
+    string assigned_id = 4;
+  }
+  ```
+- `GuestMessage` oneof additions: `SnapshotEntryMessage` as
+  field 17, `SnapshotResultMessage` as field 18.
+- Two new `CallTable` function pointers (appended at the end,
+  per the back-compat convention):
+  - `send_snapshot_entry: unsafe extern "C" fn(*const
+    SnapshotEntryRecord)` — host-side stub serialises the
+    record into the protobuf message. The intermediate
+    `SnapshotEntryRecord` is a plain struct in `shared`
+    (parallel to `MapExtentRecord`) so the guest doesn't
+    depend on protobuf.
+  - `send_snapshot_result: unsafe extern "C" fn(*const
+    SnapshotResult)` — same pattern as `send_resize_result`,
+    `send_rebase_result`, `send_commit_result`,
+    `send_map_result`.
+
+### Refcount management — the hard part
+
+Every mutating mode boils down to walking an L1 table and
+adjusting refcounts. The skeleton:
+
+```rust
+// pseudocode
+fn update_snapshot_refcount(
+    call_table, dev, l1_table_offset, l1_size, addend) -> Result {
+    for l1_idx in 0..l1_size {
+        let l1_entry = read_l1_entry(l1_table_offset, l1_idx);
+        if l1_entry == 0 { continue; }   // unallocated subtree
+        let l2_host_offset = l1_entry & L1E_OFFSET_MASK;
+
+        // Per-L2 walk
+        for l2_idx in 0..l2_entries_per_cluster {
+            let l2_entry = read_l2_entry(l2_host_offset, l2_idx);
+            match classify_l2(l2_entry) {
+                Unallocated => continue,
+                Standard(host_off) => {
+                    update_refcount(host_off, addend)?;
+                }
+                Compressed { offset, sectors } => {
+                    // Compressed extent may span >1 cluster.
+                    update_compressed_refcount(offset, sectors, addend)?;
+                }
+                Zero => continue,  // pure zero clusters have no host alloc
+            }
+        }
+
+        // The L2 table cluster itself
+        update_refcount(l2_host_offset, addend)?;
+    }
+    // The L1 table cluster(s) themselves
+    for cluster in l1_cluster_range(l1_table_offset, l1_size) {
+        update_refcount(cluster, addend)?;
+    }
+    Ok(())
+}
+```
+
+Three invariants must hold across the operation:
+
+- **Refcount ≤ `1 << refcount_bits`**. qcow2 v3 default is
+  16 bits → 65535. Overflow returns `ERROR_REFCOUNT_OVERFLOW`
+  and the operation aborts before mutating anything (dry-run
+  pass first, then apply pass — see open question 8).
+- **COPIED bit on L1/L2 entries is correct**. Bit
+  `QCOW_OFLAG_COPIED` (high bit of an L1 or L2 entry) is set
+  iff the referenced cluster has refcount=1. After any
+  refcount mutation that crosses 1, the corresponding L1/L2
+  entry must be rewritten with the bit flipped. This is the
+  invariant that makes COW correct; getting it wrong is what
+  causes "qcow2 corruption" reports.
+- **Atomicity of the snapshot-table swap**. New table at new
+  location; new entries written; header pointer (`snapshots_
+  offset` + `nb_snapshots`) updated in one 8-byte-aligned
+  write *after* the table is durable; old table clusters
+  freed last. Any crash before the header update leaves the
+  old table intact; any crash after leaves the new table
+  intact.
+
+We adopt qemu's ordering verbatim; the planner expresses it
+as an explicit step list and the guest just executes it.
+
+### Host CLI dispatch
+
+`qemu-img snapshot`'s clap surface is small. The mode flags
+are mutually exclusive; clap's `ArgGroup` with `multiple=false`
+and `required=true` enforces this at parse time.
+
+```rust
+#[derive(Args, Debug)]
+struct SnapshotArgs {
+    /// Image file to operate on (qcow2 only).
+    filename: String,
+    /// List snapshots.
+    #[arg(short = 'l', long, group = "mode")]
+    list: bool,
+    /// Apply / "goto" the named snapshot.
+    #[arg(short = 'a', long, group = "mode", value_name = "SNAPSHOT")]
+    apply: Option<String>,
+    /// Create a snapshot with the given name.
+    #[arg(short = 'c', long, group = "mode", value_name = "NAME")]
+    create: Option<String>,
+    /// Delete the named snapshot (by ID or name).
+    #[arg(short = 'd', long, group = "mode", value_name = "SNAPSHOT")]
+    delete: Option<String>,
+    /// Force the image format detection (must be qcow2 if set).
+    #[arg(short = 'f', long)]
+    format: Option<String>,
+    /// Suppress success line on stdout.
+    #[arg(short = 'q', long)]
+    quiet: bool,
+    /// Skip image-lock check (accepted for qemu-img compat; no-op).
+    #[arg(short = 'U', long = "force-share")]
+    force_share: bool,
+    /// Reject `--image-opts` with a clear error.
+    #[arg(long)]
+    image_opts: bool,
+    /// Output format (instar extension; qemu-img -l is human only).
+    #[arg(long, default_value = "human", value_parser = ["human", "json"])]
+    output: String,
+}
+```
+
+clap's `ArgGroup` requires `clap >= 4.5`, which is already in
+the dependency tree (used by resize / rebase / commit).
+
+### qemu-img snapshot -l output format
+
+`qemu-img snapshot -l image.qcow2` produces (for a v3 qcow2
+with two snapshots):
+
+```
+Snapshot list:
+ID        TAG               VM_SIZE                DATE     VM_CLOCK     ICOUNT
+1         snap1                  0 B 2026-06-05 12:34:56  00:00:00.000          0
+2         snap2                  0 B 2026-06-05 12:35:00  00:00:00.000          0
+```
+
+Important format details (verified against qemu source
+`block/qcow2-snapshot.c::dump_one_snapshot` and
+`qemu-img.c::collect_snapshots`):
+
+- The header row is fixed text; the data rows are
+  `printf("%-10s%-18s%7s%20s%13s%11s\n", ...)`.
+- `ID` is left-aligned, width 10.
+- `TAG` is left-aligned, width 18 (longer names are not
+  truncated; column shifts).
+- `VM_SIZE` is right-aligned, width 7, formatted via qemu's
+  `size_to_str` (e.g. `0 B`, `4.0 KiB`, `1.0 MiB`).
+- `DATE` is right-aligned, width 20, formatted as
+  `%Y-%m-%d %H:%M:%S` in **local time** (this is a known
+  gotcha for cross-version baselines — the qemu-img matrix
+  runs under known TZ; we pin `TZ=UTC` in baseline gen and
+  in tests, as the existing baseline harness already does for
+  `qemu-img info`'s "date created" field for vhd).
+- `VM_CLOCK` is right-aligned, width 13, formatted as
+  `HH:MM:SS.NNN` (vm_clock_nsec divided into hours, minutes,
+  seconds, ms).
+- `ICOUNT` is right-aligned, width 11, only emitted for v3
+  images that have icount in extra-data (and only emitted if
+  *any* snapshot in the list has an icount; otherwise the
+  column is omitted entirely from the header and rows).
+- The leading `Snapshot list:` is printed *only* if there is
+  at least one snapshot. Empty snapshot table: no output,
+  exit 0.
+
+Human output formatting lives in `src/vmm/src/main.rs` or
+a new `src/vmm/src/snapshot_output.rs` (the latter is
+cleaner if the column-width logic gets long).
+
+JSON output (instar extension) is a flat array of objects:
+
+```json
+[
+  { "id": "1", "name": "snap1", "vm-state-size": 0,
+    "date": { "seconds": 1717589696, "nanoseconds": 0 },
+    "vm-clock": { "seconds": 0, "nanoseconds": 0 },
+    "icount": 0 }
+]
+```
+
+The JSON key names mirror qemu's QMP `SnapshotInfo` struct
+(`block/qapi.c::qmp_query_named_block_nodes`) so consumers
+that already parse QMP snapshot listings can reuse their
+parsers.
+
+### Versioning and baseline strategy
+
+We extend `instar-testdata/scripts/generate-baselines.py`
+with a `snapshot-list` command entry. For each qemu-img
+version and each qcow2 baseline image that has at least one
+snapshot, capture `qemu-img snapshot -l --image-opts=...` or
+the equivalent flag set into
+`expected-outputs/snapshot-list-{human,json}/qcow2/<version>/<image-id>.{stdout,stderr,meta.json}`.
+
+Mutating modes do not have a stdout baseline; their
+behaviour is validated by `qemu-img check` + `qemu-img info`
++ `qemu-img compare` post-op assertions in
+`tests/test_snapshot.py`. We also produce a small set of
+"qemu-img snapshot -c then -l" baseline pairs — run a known
+mutation under each qemu-img version and capture the listing
+output — to catch versions where qemu changed an output
+column.
+
+Baseline matrix size estimate:
+- ~80 qemu-img versions
+- 2 output types (human, json)
+- ~6-10 snapshot-bearing qcow2 fixtures (no snapshots,
+  one snapshot, many snapshots, snapshot with vm_state,
+  snapshot with icount, snapshot with v2 image, snapshot
+  with extended L2, etc.)
+
+That's well under 2k files — far smaller than the map
+baseline tree.
+
+### Test fixtures
+
+We need a small set of qcow2 fixtures *with snapshots* in
+`instar-testdata`. These do not exist today: the existing
+qcow2 fixtures are snapshot-free. The fixture generator
+(`generate-baselines.py`) runs `qemu-img create` then
+`qemu-img snapshot -c` to produce each fixture. The fixtures
+go into a new manifest tier (`snapshot-bearing-qcow2`)
+because they're tied to the qcow2 driver's ID-assignment
+behaviour, which has changed (very slightly) across qemu
+versions and which our cross-version harness needs to handle.
+
+### Per-mode plans
+
+#### `-l` list mode
+
+The simplest mode. v1 path:
+
+1. Read header, refuse non-qcow2 with
+   `ERROR_UNSUPPORTED_FORMAT`.
+2. `parse_snapshot_table_extended()` walking up to
+   `MAX_SNAPSHOTS` entries (16; see open question 6 on
+   raising this).
+3. For each entry, build a `SnapshotEntryRecord` and call
+   `send_snapshot_entry`.
+4. Send `SnapshotResult { mode: MODE_LIST, error: OK,
+   snapshots_emitted: n }`.
+
+Host renders the column-aligned table or the JSON array.
+
+#### `-c` create mode
+
+Reuses existing readers + new mutators. Plan:
+
+1. Read header, refuse non-qcow2.
+2. Parse snapshot table; refuse on duplicate name (qemu
+   returns `Could not create snapshot 'name': already exists`).
+3. Assign next ID: max(existing IDs) + 1, formatted as
+   decimal string (qemu uses `bdrv_snapshot_find_by_id_and_name`
+   to ensure uniqueness; we replicate).
+4. Allocate cluster(s) for the snapshot's L1 table copy.
+   L1 size matches active L1 size.
+5. Copy active L1 contents to the new L1 location.
+6. Walk active L1 chain: increment refcount on every
+   reachable data cluster, every L2 table cluster (these
+   now have two L1s pointing at them).
+7. Walk active L1 *again*, this time clearing
+   `QCOW_OFLAG_COPIED` on every entry whose refcount is now
+   > 1 (which is all of them, by definition of the create).
+8. Append snapshot table entry. If existing snapshot table
+   has room, write in place; otherwise allocate new
+   cluster(s), rewrite the whole table, update
+   `snapshots_offset`.
+9. Update header `nb_snapshots`.
+10. Send `SnapshotResult` with `assigned_id`.
+
+The order matters: steps 5–7 must complete before step 8,
+because step 8 commits the new snapshot's existence and a
+crash between 5 and 8 leaves orphaned clusters but no
+dangling references.
+
+#### `-d` delete mode
+
+The opposite of create:
+
+1. Read header, refuse non-qcow2.
+2. Parse snapshot table; find target by id or name.
+3. Walk target's L1 chain, decrement refcount on every
+   reachable data cluster, L2 table cluster, L1 table
+   cluster.
+4. Walk active L1, set `QCOW_OFLAG_COPIED` on entries whose
+   refcount now equals 1 (i.e. clusters that were shared
+   with the deleted snapshot and are now sole-owned by
+   active).
+5. Remove the entry from the snapshot table by compacting.
+   If the entry was last in the table, just decrement
+   `nb_snapshots`. If interior, shift later entries back
+   and rewrite.
+6. Update header `nb_snapshots`.
+
+#### `-a` apply / goto mode
+
+The trickiest because the L1 table is *overwritten*:
+
+1. Read header, refuse non-qcow2.
+2. Parse snapshot table; find target by id or name.
+3. Validate `target.l1_size` against active L1 capacity.
+   If target's L1 is larger than active L1's cluster
+   allocation, grow active L1 (allocate new clusters,
+   rewrite `l1_size` and `l1_table_offset` in header).
+4. Walk target's L1 chain (in the snapshot's L1 cluster),
+   increment refcount on everything.
+5. Walk active L1 chain (in the active L1 cluster),
+   decrement refcount on everything.
+6. Copy target's L1 entries into the active L1 cluster
+   (overwriting what was there). The active L1
+   *cluster offset itself* does not change.
+7. Walk the now-current active L1 (= snapshot's L1
+   contents), refresh `QCOW_OFLAG_COPIED` on entries
+   whose refcount is now 1 (just-decremented from 2,
+   because step 5 dropped the old active references and
+   step 4 raised the target's references).
+
+Apply is the only mode where order matters in a way that
+risks a "dangling reference" intermediate state. We
+explicitly *do not* attempt to be crash-consistent during
+apply (qemu isn't either; `qcow2_snapshot_goto`'s
+implementation is similarly best-effort). Document in
+`docs/quirks.md`.
+
+### Source format scope
+
+v1 supports:
+- qcow2 v2 and v3.
+- qcow2 with/without backing file.
+- qcow2 with extended L2 (subcluster bitmaps): refcount
+  semantics are identical to standard L2 — the bitmap is
+  internal to the L2 entry; the cluster is allocated or not
+  at L2-entry granularity. Mutating snapshots on extended-L2
+  images works without special handling.
+- qcow2 with up to `MAX_SNAPSHOTS = 16` snapshots
+  (matching the existing parser cap). The qcow2 spec
+  allows 65536; raising the cap is open question 6.
+
+v1 does not support (rejected with clear error):
+- Compressed clusters (`QCOW2_INCOMPAT_COMPRESSION` flag) —
+  refcount adjustment for compressed extents requires
+  walking sub-cluster ranges; out of scope. v1 errors with
+  `ERROR_UNSUPPORTED_FEATURE` on `-c`/`-d`/`-a` for any
+  image whose active L1 chain contains a compressed entry.
+  `-l` works regardless.
+- Encrypted images (`QCOW2_INCOMPAT_ENCRYPTION`) — instar
+  has no LUKS write path yet; refuse.
+- External data file (`QCOW2_INCOMPAT_EXTERNAL_DATA`) —
+  refcount semantics differ; refuse.
+- Bitmaps extension (qcow2 v3 dirty bitmaps) — bitmaps
+  reference clusters too, and a snapshot operation must
+  also dec/inc the bitmap's clusters. Refuse with
+  `ERROR_UNSUPPORTED_FEATURE`; future work.
+
+These restrictions are checked host-side after `info` and
+again guest-side as a defence-in-depth.
+
+### Test matrix
+
+| Mode | Compare against |
+|------|-----------------|
+| `-l` human  | qemu-img stdout per version |
+| `-l` json   | qemu-img stdout (instar extension; instar self-baseline) |
+| `-c` then `-l`  | qemu-img stdout per version |
+| `-c` then qemu-img check | clean |
+| `-c` then qemu-img info | matches qemu-img-applied reference |
+| `-d` then qemu-img check | clean |
+| `-d` then qemu-img info | matches |
+| `-a` then qemu-img check | clean |
+| `-a` then `instar info` vs `qemu-img info` | identical |
+| `-a` then qemu-img compare against pre-`-c` image | identical |
+
+The differential fuzzer extends with a random
+create/delete/apply chain on a randomly generated qcow2
+image, post-op-comparing against the same chain applied by
+qemu-img.
+
+## Open questions
+
+1. **Should this be one master plan or split (`PLAN-snapshot-list`
+   + `PLAN-snapshot-mutate`)?** Recommendation: **one plan,
+   phased so list-mode lands first**. List mode is shippable
+   on its own (~2 phases of work), but the planning and ABI
+   work is shared with mutating modes. Splitting would
+   duplicate the prompt/situation/design-overview sections
+   and risks the mutating modes never landing. The phase
+   table below front-loads list mode so it is mergeable
+   independently after phase 4.
+
+2. **`--image-opts`**: Same posture as `measure`, `map`,
+   etc. — reject explicitly with a clear error; document in
+   `docs/quirks.md`. Resolved.
+
+3. **New `src/crates/snapshot/` crate, or extend
+   `src/crates/qcow2/`?** Recommendation: **extend
+   `src/crates/qcow2/`**. The mutators are intimately tied
+   to qcow2 metadata layout; carving out a separate crate
+   would require either re-exposing qcow2 internals or
+   duplicating type definitions. Compare with `create` which
+   has its own crate (because it's format-agnostic and
+   serves five formats) vs. `qcow2-create` would have been
+   wrong; the mirror reasoning applies here in reverse:
+   `qcow2` is the natural home. Confirm during phase 1
+   review.
+
+4. **`SnapshotResult` struct vs protobuf-only?** Every
+   other mutating operation has a `*Result` struct in
+   `src/shared/src/lib.rs` for the guest to populate. Mirror
+   that pattern; the protobuf message is a serialised view.
+   Resolved.
+
+5. **VM state on `-c`**: `qemu-img snapshot -c` always
+   creates a snapshot with `vm_state_size = 0` (the running
+   VM state is the QEMU monitor's `savevm` command, not
+   `qemu-img`'s). v1 mirrors this: `-c` always writes 0 for
+   vm_state. Resolved.
+
+6. **`MAX_SNAPSHOTS = 16` cap**: The existing parser caps
+   at 16 in-memory entries (`src/crates/qcow2/src/lib.rs:603`).
+   qcow2 allows 65536. We don't need 65536-entry capacity
+   in the guest because (a) we only iterate, and the guest
+   can emit entries one-at-a-time without holding them all
+   in memory; (b) for `-c`/`-d`/`-a` we operate on one
+   entry at a time. Recommendation: **bump to 256 for list
+   mode** (which is more than any real-world workflow), but
+   stream-emit so the guest's working set stays small.
+   Confirm in phase 2.
+
+7. **Bit-exact image comparison post-op vs structural
+   comparison**: `qemu-img snapshot -c` writes a
+   `date_sec`/`date_nsec` that captures *wall-clock time at
+   the moment of the call*. instar and qemu-img will
+   produce different `date_sec` values. For diff-testing,
+   we either (a) inject a fixed timestamp via env var
+   (`SOURCE_DATE_EPOCH`-style) into both — qemu has
+   `qemu-img --time-now=N` no, that doesn't exist —
+   (b) strip the timestamp before comparing image bytes,
+   or (c) compare structurally via `qemu-img info`. Approach
+   (c) is simplest and matches what users care about; we
+   adopt it. The fuzz harness then asserts:
+   "post-instar `qemu-img info` ≡ post-qemu-img `qemu-img info`
+   modulo the date fields."
+
+8. **Dry-run pass before mutation**: refcount overflow can
+   happen on `-c` if any cluster's existing refcount is
+   already at the max (extremely rare but possible in
+   contrived images and definitely possible in fuzz inputs).
+   Aborting halfway leaves the image inconsistent.
+   Recommendation: **two-pass for `-c` and `-a` — walk first,
+   check all refcounts will be ≤ max; then walk again and
+   apply.** `-d` cannot overflow (decrement only). Phase
+   plans capture this.
+
+9. **`-a` after a chain of `-c`s that referenced
+   different cluster sets**: instar's refcount management
+   is per-cluster, so this Just Works — refcount goes from
+   2 (active + snapshot) back to 1 (active only) on dec,
+   and the COPIED-flag rewrite sees the transition. No
+   special handling needed beyond the per-mode plans above.
+   Verify by integration test.
+
+10. **Atomicity of snapshot-table rewrite**: qemu's
+    `qcow2_write_snapshots` allocates new cluster(s), writes
+    the table, fdatasyncs, updates header, fdatasyncs, frees
+    old. The guest doesn't have `fdatasync` — every
+    `write_input_sector` call goes through `pwrite()` on the
+    host, which is durable on `fsync` of the host FD. We
+    rely on the host VMM doing `fsync` before exiting the
+    guest. Confirm host-side: `flush_input_sector` doesn't
+    exist; we need to add an `fsync_input` call-table
+    primitive, or rely on the host's process-exit fsync.
+    Recommendation: **add `fsync_input(device_idx)` in
+    phase 1** as a call-table extension. Snapshot, commit,
+    and future writers benefit. (commit currently relies on
+    process-exit fsync; this is technically a latent
+    durability bug we'd fix here.)
+
+11. **Cluster-allocation strategy**: When allocating a new
+    cluster for the snapshot's L1 or for a new snapshot
+    table cluster, we scan refcount blocks for a 0 refcount.
+    The resize-grow allocator does the same thing
+    (`allocate_data_cluster` in
+    `src/crates/qcow2/src/lib.rs`). Reuse it. Open question:
+    does the existing allocator handle the case where the
+    refcount table itself needs to grow? Resize phase 2
+    answered "yes" for grow; we inherit that work.
+
+## Execution
+
+| Phase | Plan | Status |
+|-------|------|--------|
+| 1. Shared ABI: `SnapshotConfig`, `SnapshotResult`, `SnapshotEntryRecord`, error codes, `send_snapshot_entry`/`send_snapshot_result` call-table pointers, `fsync_input` call-table primitive, `GuestMessage` arms | PLAN-snapshot-phase-01-abi.md | Not started |
+| 2. Snapshot-table parser extension and list-mode planner: `parse_snapshot_table_extended` (vm_state_size_large, disk_size, icount); raise list cap to 256; unit tests against the new snapshot-bearing fixtures | PLAN-snapshot-phase-02-list-planner.md | Not started |
+| 3. Guest binary scaffolding + list mode (`src/operations/snapshot/`): config read, format check, dispatch, MODE_LIST emit loop | PLAN-snapshot-phase-03-list-guest.md | Not started |
+| 4. Host CLI for list mode (`run_snapshot`, clap surface, human + JSON renderer, `qemu-img snapshot -l` byte-exact output) | PLAN-snapshot-phase-04-list-host.md | Not started |
+| 5. Refcount mutators (planner crate): `update_snapshot_refcount`, `alloc_cluster_for_snapshot`, `free_cluster`, `update_copied_flags_for_l1`, two-pass overflow check. Pure planner; unit tests with synthetic images | PLAN-snapshot-phase-05-refcount-planners.md | Not started |
+| 6. Snapshot create planner + guest binary (MODE_CREATE) | PLAN-snapshot-phase-06-create.md | Not started |
+| 7. Snapshot delete planner + guest binary (MODE_DELETE) | PLAN-snapshot-phase-07-delete.md | Not started |
+| 8. Snapshot apply planner + guest binary (MODE_APPLY) | PLAN-snapshot-phase-08-apply.md | Not started |
+| 9. Host CLI for mutating modes (`-c`/`-d`/`-a` dispatch, single-device RW open, success-line rendering) | PLAN-snapshot-phase-09-mutate-host.md | Not started |
+| 10. Cross-version baselines: snapshot-bearing qcow2 fixtures, `snapshot-list-{human,json}` profiles in `generate-baselines.py`, baseline generation pass | PLAN-snapshot-phase-10-baselines.md | Not started |
+| 11. Integration tests (`tests/test_snapshot.py`): list matrix, create/delete/apply round-trips, error paths, qcow2-only enforcement, post-op `qemu-img check` clean | PLAN-snapshot-phase-11-integration-tests.md | Not started |
+| 12. Coverage-guided fuzz harnesses: `fuzz_snapshot_parse`, `fuzz_snapshot_refcount` | PLAN-snapshot-phase-12-fuzz-coverage.md | Not started |
+| 13. Differential fuzzing extension: random `-c/-d/-a` chain vs qemu-img, structural `qemu-img info` comparison | PLAN-snapshot-phase-13-fuzz-differential.md | Not started |
+| 14. Documentation, CHANGELOG, follow-ups (`docs/snapshot.md`, quirks, usage, ARCHITECTURE, README, AGENTS, `PLAN-convert-followups.md` final strike-through) | PLAN-snapshot-phase-14-docs.md | Not started |
+
+### Phase notes (effort and model)
+
+Each phase plan is written one at a time, immediately before
+the phase is executed. Recommended planning effort and
+recommended sub-agent model per phase:
+
+- **Phase 1 (ABI)**: medium effort, sonnet. The pattern is
+  identical to `CreateConfig` / `ResizeConfig` /
+  `RebaseConfig` / `MapConfig`. The `fsync_input` extension
+  is novel but mechanical. Worktree isolation recommended
+  for the `version` bump.
+- **Phase 2 (list planner)**: medium effort, opus.
+  Extra-data parsing has alignment/endianness traps; opus
+  for the qcow2-spec cross-reference.
+- **Phase 3 (list guest)**: medium effort, sonnet. Mostly
+  scaffolding mirroring `src/operations/map/`.
+- **Phase 4 (list host)**: medium effort, sonnet. Column
+  formatting against `block/qcow2-snapshot.c::dump_one_snapshot`
+  is fiddly but well-specified.
+- **Phase 5 (refcount mutators)**: **high effort, opus.**
+  This is the riskiest phase in the plan. Refcount + COPIED-
+  flag invariants are the single biggest source of qcow2
+  corruption bugs; the mutators must be written carefully
+  and unit-tested exhaustively. Worktree isolation
+  mandatory.
+- **Phase 6 (create)**: high effort, opus. Reuses phase 5
+  mutators but coordinates the multi-step rewrite ordering.
+  Worktree isolation.
+- **Phase 7 (delete)**: high effort, opus. Snapshot-table
+  compaction is the new work here. Worktree.
+- **Phase 8 (apply)**: high effort, opus. L1-overwrite
+  ordering is delicate; the dec-then-inc-then-overwrite
+  sequence has correctness subtleties. Worktree.
+- **Phase 9 (mutate host)**: medium effort, sonnet.
+  Dispatch over phases 6/7/8.
+- **Phase 10 (baselines)**: low effort, sonnet. New fixture
+  generation + script extension; long-running but
+  mechanical.
+- **Phase 11 (integration tests)**: medium effort, sonnet.
+- **Phase 12 (coverage fuzz)**: medium effort, opus for
+  harness invariants (the "no corruption regardless of
+  input" assertion needs care), sonnet for the boilerplate.
+- **Phase 13 (differential fuzz)**: high effort, opus.
+  Designing the structural-comparison assertion to be
+  strict enough to catch bugs but lenient enough to allow
+  legitimate ID-format differences across qemu-img versions
+  is the hard part.
+- **Phase 14 (docs)**: low effort, haiku or sonnet.
+
+When in doubt, skew to the more capable model. Phases 5–8
+are the riskiest; the management session should review
+sub-agent output against the qcow2 spec, not just against
+the test suite (a failing test is a known unknown; a
+quietly-broken refcount is an unknown unknown).
+
+## Agent guidance
+
+### Execution model
+
+All implementation work is done by sub-agents, never in the
+management session. The management session is reserved for
+planning, review, and decision-making.
+
+The workflow per step:
+
+1. **Plan** at high effort in the management session.
+2. **Spawn a sub-agent** for each implementation step with
+   the brief from the phase plan.
+3. **Review** the sub-agent's output in the management
+   session. Read the actual files; don't trust the summary.
+   For phases 5–8 this includes manually walking through a
+   small example: pick a 2-cluster qcow2 with one snapshot,
+   trace what the mutator should do, and diff against what
+   it did.
+4. **Fix or retry** if the output is wrong.
+5. **Commit** once the management session is satisfied.
+
+Use `isolation: "worktree"` for any phase that mutates
+refcounts (phases 5, 6, 7, 8). Use it also for phase 1
+(ABI bump) and phase 10 (baseline generation, which writes
+many fixture files into instar-testdata). Phases 2, 3, 4,
+9, 11–14 can run in the main tree.
+
+### Planning effort
+
+The master plan itself is high effort. See the per-phase
+notes above for phase-by-phase effort recommendations.
+
+### Step-level guidance
+
+Each phase plan should fill in the table:
+
+```
+| Step | Effort | Model | Isolation | Brief for sub-agent |
+|------|--------|-------|-----------|---------------------|
+```
+
+following `PLAN-TEMPLATE.md` conventions.
+
+For this plan in particular, model choice should default
+to **opus** for any step in phases 5–8 (refcount mutators,
+create, delete, apply). Sonnet is fine for clap parsing,
+output rendering, and integration test boilerplate.
+
+### Management session review checklist
+
+After a sub-agent completes, the management session
+verifies:
+
+- [ ] The files that were supposed to change actually
+      changed (read them).
+- [ ] No unrelated files were modified.
+- [ ] `make instar` builds and `make lint` is clean.
+- [ ] Guest binaries pass `make check-binary-sizes`
+      (384 KB limit per operation).
+- [ ] `make test-rust` and the relevant
+      `make test-integration` targets pass.
+- [ ] `pre-commit run --all-files` passes.
+- [ ] The changes match the intent of the brief —
+      semantically right, not just syntactically.
+- [ ] For phases 5–8: `qemu-img check` on a post-op
+      image is clean; `qemu-img info` reports the
+      expected snapshot state.
+- [ ] Commit message follows project conventions
+      (Co-Authored-By with model + context window +
+      effort, Signed-off-by, Prompt paragraph).
+
+## Administration and logistics
+
+### Success criteria
+
+The plan is complete when:
+
+* All 14 phases complete and committed on the `snapshot`
+  branch.
+* `make instar` builds with `snapshot.bin` within the
+  384 KiB operation-binary cap.
+* `make lint` clean across the workspace.
+* `make test-rust` passes; new tests in `qcow2` /
+  `snapshot` raise totals as documented in each phase
+  plan.
+* `make test-integration` includes `tests/test_snapshot.py`;
+  test count and pass/skip breakdown documented in each
+  phase plan.
+* `make check-binary-sizes` includes `snapshot.bin`.
+* `pre-commit run --all-files` clean throughout.
+* For qcow2 sources: `instar snapshot -l` matches
+  `qemu-img snapshot -l` byte-for-byte (both human and
+  json, with the documented `--output=json` extension)
+  across every qemu-img version in
+  `instar-testdata/qemu-img-binaries/x86_64/`, modulo
+  documented quirks.
+* For qcow2 sources: post-`instar snapshot -c/-d/-a`
+  images satisfy `qemu-img check` clean and produce
+  `qemu-img info` output identical to the same operation
+  run under qemu-img (modulo `date_sec`/`date_nsec`).
+* Coverage-guided fuzz targets `fuzz_snapshot_parse` and
+  `fuzz_snapshot_refcount` registered in nightly CI.
+* Differential fuzzer's random operation chain includes
+  `snapshot -c/-d/-a`.
+* `docs/snapshot.md`, `docs/quirks.md`, `docs/usage.md`,
+  `README.md`, `AGENTS.md`, `ARCHITECTURE.md`, and
+  `CHANGELOG.md` all updated.
+* `PLAN-convert-followups.md` strikes `snapshot` from the
+  deferred-subcommand list (it then has zero deferred
+  subcommands left; phase 1 of that plan is complete
+  pending only the `check --repair` phase 2 work).
+
+### Future work
+
+* **Compressed-cluster support.** v1 errors on `-c`/`-d`/
+  `-a` for images with compressed clusters. The refcount
+  update for compressed extents must walk sub-cluster
+  byte ranges (an extent may span a partial cluster at
+  both ends). qemu's `qcow2_update_refcount_for_compressed`
+  is the reference. Probably a single follow-up phase.
+* **Bitmaps extension.** qcow2 v3 dirty bitmaps reference
+  clusters; snapshots must update bitmap refcounts too.
+  Defer until any user asks.
+* **External data file.** Snapshot semantics with an
+  external data file are subtle (the L2 entries point at
+  raw offsets in the external file, not at the qcow2
+  file); needs dedicated thought.
+* **Encrypted images.** Requires LUKS write path, which
+  is not yet in instar. Tracked separately.
+* **Snapshot table > 256 entries.** v1 caps in-memory
+  list at 256. Streaming the parser would let us go to
+  the qcow2 max of 65536 without holding all entries
+  resident; the cap is a simple constant change but the
+  test matrix needs an extreme-count fixture. Defer.
+* **`-l` with `--all-data-images`-style chain walk.**
+  qemu-img doesn't have this; not a follow-up.
+* **VM state on `-c`** (i.e. snapshot a running VM via
+  instar). Not applicable — instar operates on stopped
+  images only. Documented; not a follow-up.
+* **`fsync_input` rollout to other writers.** Phase 1
+  adds the call-table primitive for snapshot. commit
+  currently relies on process-exit fsync — switching it
+  to use `fsync_input` at the appropriate checkpoint
+  would be a small follow-up.
+
+### Bugs fixed during this work
+
+This section will list any bugs encountered during
+development that we fix in passing.
+
+### Documentation index maintenance
+
+This plan should be registered in `docs/plans/index.md`
+and `docs/plans/order.yml` when it is created. Phase files
+are linked from the Execution table above and are *not*
+added to `order.yml`.
+
+When all phases are complete, update the row in
+`index.md` to *Complete*.
+
+### Back brief
+
+Before executing any step of this plan, please back brief
+the operator as to your understanding of the plan and how
+the work you intend to do aligns with that plan.
