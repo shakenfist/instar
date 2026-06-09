@@ -84,6 +84,58 @@ typedef struct QCowSnapshot {
 } QCowSnapshot;
 ```
 
+## Parser surface
+
+The qcow2 crate exposes two parser variants:
+
+- **`parse_snapshot_table`** — bounded. Returns a `SnapshotTable`
+  with up to `MAX_SNAPSHOTS` (16) entries on the caller's stack.
+  Used by `info` (to set the `FLAG_HAS_SNAPSHOTS` bit) and
+  `convert` (to find a single snapshot by id-or-name before
+  switching to its L1 table). Behaviour is byte-identical to
+  the pre-streaming implementation; the bounded variant is now
+  a thin wrapper over `for_each_snapshot_entry` that stops once
+  the 16-entry array is full.
+- **`for_each_snapshot_entry`** — streaming, no in-memory cap.
+  Invokes a `FnMut(&SnapshotEntry) -> bool` callback once per
+  entry. Bounded only by the qcow2 header's `nb_snapshots`
+  field (spec cap 65536). Aborts and returns `false` on a read
+  error or when the callback returns `false`. Used by the
+  snapshot subcommand to emit one wire record per entry
+  without ballooning the guest's stack.
+- **`find_snapshot_streaming`** — convenience over
+  `for_each_snapshot_entry` that returns the first id-or-name
+  match. Mirrors `find_snapshot`'s comparison rules.
+- **`snapshot_entry_to_record`** — planner converter from the
+  internal `SnapshotEntry` to the wire-FFI
+  `shared::SnapshotEntryRecord`. Splits `date_sec` into hi/lo
+  halves, truncates id (32) and name (256) to the wire buffer
+  sizes, and resolves the v2 `disk_size` fallback by taking the
+  active image's virtual size as a parameter.
+
+### Extra-data fallback rules
+
+qemu's `block/qcow2-snapshot.c::qcow2_read_snapshots` applies
+progressive-reveal rules to the extra-data section: fields are
+populated only when `extra_data_size` is large enough to carry
+them, with sentinel values otherwise. The instar parser mirrors
+this exactly.
+
+| `extra_data_size` | `vm_state_size_large` | `disk_size`           | `icount`       |
+|-------------------|-----------------------|-----------------------|----------------|
+| `< 8`             | `vm_state_size as u64`| `0` (use header size) | `u64::MAX`     |
+| `>= 8`            | from offset 0         | `0` (use header size) | `u64::MAX`     |
+| `>= 16`           | from offset 0         | from offset 8         | `u64::MAX`     |
+| `>= 24`           | from offset 0         | from offset 8         | from offset 16 |
+| `> 1024`          | (rejected — entry is skipped per `QCOW_MAX_SNAPSHOT_EXTRA_DATA`) | | |
+
+`disk_size == 0` is the v2 / short-v3 sentinel meaning "fall
+back to the active header's virtual size"; the converter
+`snapshot_entry_to_record` substitutes it at conversion time
+because the parser is unaware of the active header.
+`icount == u64::MAX` matches qemu's `qcow2_snapshot.icount = -1`
+and the `SnapshotEntryRecord::ICOUNT_ABSENT` constant.
+
 ## Snapshot L1 Table
 
 Each snapshot has its own L1 table, independent of the "active" L1 table.

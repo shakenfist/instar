@@ -198,9 +198,13 @@ four modes, which materially changes the testing posture.
 1. **Mutator primitives in `src/crates/qcow2/`** (and a new
    `src/crates/snapshot/` if the surface grows enough to
    warrant its own crate — see open question 3). Specifically:
-   - `parse_snapshot_table_extended()` — extends the existing
-     parser to surface `vm_state_size_large` (extra-data offset
-     0), `disk_size` (offset 8), `icount` (offset 16).
+   - `for_each_snapshot_entry()` — streaming variant; emits one
+     `SnapshotEntry` at a time via a `FnMut` callback, surfacing
+     `vm_state_size_large` (extra-data offset 0), `disk_size`
+     (offset 8), and `icount` (offset 16). The bounded
+     `parse_snapshot_table` remains for `info` / `convert`
+     callers and is now a thin wrapper over the streaming
+     primitive.
    - `update_snapshot_refcount(addend, l1_table_offset,
      l1_size, …)` — walks the snapshot's L1 → L2 chain and
      increments / decrements refcounts for every referenced
@@ -810,6 +814,16 @@ qemu-img.
    stream-emit so the guest's working set stays small.
    Confirm in phase 2.
 
+   **Resolved in phase 2**: streaming used; no in-memory
+   cap raise needed. `parse_snapshot_table` stays at 16
+   entries (the bounded API used by `info` and `convert`);
+   the new `for_each_snapshot_entry` streaming primitive
+   handles arbitrary counts up to the qcow2 spec cap of
+   65536. The snapshot subcommand's list / find paths use
+   the streaming primitive so the guest's working set is
+   one `SnapshotEntry` at a time regardless of
+   `nb_snapshots`.
+
 7. **Bit-exact image comparison post-op vs structural
    comparison**: `qemu-img snapshot -c` writes a
    `date_sec`/`date_nsec` that captures *wall-clock time at
@@ -872,7 +886,7 @@ qemu-img.
 | Phase | Plan | Status |
 |-------|------|--------|
 | 1. Shared ABI: `SnapshotConfig`, `SnapshotResult`, `SnapshotEntryRecord`, error codes, `send_snapshot_entry`/`send_snapshot_result` call-table pointers, `fsync_input` call-table primitive, `GuestMessage` arms | PLAN-snapshot-phase-01-abi.md | Not started |
-| 2. Snapshot-table parser extension and list-mode planner: `parse_snapshot_table_extended` (vm_state_size_large, disk_size, icount); raise list cap to 256; unit tests against the new snapshot-bearing fixtures | PLAN-snapshot-phase-02-list-planner.md | Not started |
+| 2. Snapshot-table parser extension and list-mode planner: `for_each_snapshot_entry` streaming primitive + extra-data fallback + planner converter (`snapshot_entry_to_record`); `find_snapshot_streaming`; extended `SnapshotEntry` with v3 fields; ~14 new qcow2 unit tests | PLAN-snapshot-phase-02-list-planner.md | Landed |
 | 3. Guest binary scaffolding + list mode (`src/operations/snapshot/`): config read, format check, dispatch, MODE_LIST emit loop | PLAN-snapshot-phase-03-list-guest.md | Not started |
 | 4. Host CLI for list mode (`run_snapshot`, clap surface, human + JSON renderer, `qemu-img snapshot -l` byte-exact output) | PLAN-snapshot-phase-04-list-host.md | Not started |
 | 5. Refcount mutators (planner crate): `update_snapshot_refcount`, `alloc_cluster_for_snapshot`, `free_cluster`, `update_copied_flags_for_l1`, two-pass overflow check. Pure planner; unit tests with synthetic images | PLAN-snapshot-phase-05-refcount-planners.md | Not started |

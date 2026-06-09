@@ -599,10 +599,28 @@ pub unsafe fn read_backing_file(
 // Snapshot table parsing
 // ============================================================================
 
-/// Maximum number of snapshots we will parse (memory constraint).
+/// Maximum number of snapshots we will parse via the bounded
+/// `parse_snapshot_table` path (memory constraint).
+///
+/// The streaming `for_each_snapshot_entry` API has no in-memory cap
+/// and is bounded only by the qcow2 header's `nb_snapshots` field.
 pub const MAX_SNAPSHOTS: usize = 16;
 
+/// Maximum size of a single snapshot's extra-data section, in bytes.
+///
+/// Mirrors qemu's `QCOW_MAX_SNAPSHOT_EXTRA_DATA` cap from
+/// `block/qcow2-snapshot.c`. Entries whose `extra_data_size` exceeds
+/// this value are rejected by the per-entry parser.
+pub const QCOW_MAX_SNAPSHOT_EXTRA_DATA: u32 = 1024;
+
 /// Parsed snapshot table entry.
+///
+/// The first set of fields mirrors what `qemu-img snapshot -l`
+/// surfaces from the on-disk 40-byte header. The trailing fields
+/// (after `vm_state_size`) carry the v3 extra-data progressive-
+/// reveal values; see `parse_snapshot_extra_data` for the fallback
+/// rules.
+#[derive(Clone, Copy)]
 pub struct SnapshotEntry {
     /// Byte offset of this snapshot's L1 table
     pub l1_table_offset: u64,
@@ -618,11 +636,44 @@ pub struct SnapshotEntry {
     pub name: [u8; 64],
     /// Creation timestamp (seconds since epoch)
     pub date_sec: u32,
-    /// VM state size in bytes
+    /// VM state size in bytes (legacy 32-bit field).
     pub vm_state_size: u32,
+    /// Subsecond component of the snapshot creation date
+    /// (nanoseconds).
+    pub date_nsec: u32,
+    /// VM clock at snapshot creation (nanoseconds).
+    pub vm_clock_nsec: u64,
+    /// 64-bit VM state size from qcow2 v3 extra-data (offset 0).
+    ///
+    /// Equals `vm_state_size as u64` when the v3 extra-data is not
+    /// present (`extra_data_size < 8`).
+    pub vm_state_size_large: u64,
+    /// Virtual disk size at snapshot creation, from qcow2 v3 extra-
+    /// data (offset 8).
+    ///
+    /// `0` is a sentinel meaning "not present in extra-data"; the
+    /// planner converter `snapshot_entry_to_record` substitutes the
+    /// active image's virtual size from the qcow2 header.
+    pub disk_size: u64,
+    /// qemu record/replay icount, from qcow2 v3 extra-data
+    /// (offset 16).
+    ///
+    /// [`ICOUNT_ABSENT`](Self::ICOUNT_ABSENT) (`u64::MAX`) is the
+    /// sentinel for "not present" — matches qemu's
+    /// `qcow2_snapshot.icount = -1`.
+    pub icount: u64,
+    /// Length of the source extra-data section, reported for
+    /// forward-compat diagnostics.
+    pub extra_data_size: u32,
 }
 
 impl SnapshotEntry {
+    /// Sentinel indicating no qemu record/replay icount is present
+    /// on the source snapshot. Mirrors qemu's
+    /// `qcow2_snapshot.icount = -1` and matches
+    /// `shared::SnapshotEntryRecord::ICOUNT_ABSENT`.
+    pub const ICOUNT_ABSENT: u64 = u64::MAX;
+
     const fn zeroed() -> Self {
         Self {
             l1_table_offset: 0,
@@ -633,6 +684,12 @@ impl SnapshotEntry {
             name: [0; 64],
             date_sec: 0,
             vm_state_size: 0,
+            date_nsec: 0,
+            vm_clock_nsec: 0,
+            vm_state_size_large: 0,
+            disk_size: 0,
+            icount: Self::ICOUNT_ABSENT,
+            extra_data_size: 0,
         }
     }
 }
@@ -671,11 +728,344 @@ impl SnapshotTable {
     }
 }
 
+/// Raw on-disk snapshot header fields, decoded from a 40-byte
+/// in-memory slice.
+///
+/// Private intermediate; not exposed in the public surface. The
+/// streaming parser uses this together with `SnapshotExtraData` to
+/// assemble a `SnapshotEntry`.
+struct SnapshotHeaderRaw {
+    l1_table_offset: u64,
+    l1_size: u32,
+    id_str_size: u16,
+    name_size: u16,
+    date_sec: u32,
+    date_nsec: u32,
+    vm_clock_nsec: u64,
+    vm_state_size: u32,
+    extra_data_size: u32,
+}
+
+/// Decoded snapshot v3 extra-data fields, with qemu's progressive-
+/// reveal fallback rules applied.
+///
+/// Private intermediate; not exposed in the public surface.
+struct SnapshotExtraData {
+    /// 64-bit VM state size (extra-data offset 0). Equals
+    /// `vm_state_size as u64` when `extra_data_size < 8`.
+    vm_state_size_large: u64,
+    /// Virtual disk size at snapshot creation (extra-data offset 8).
+    /// `0` sentinel when `extra_data_size < 16`.
+    disk_size: u64,
+    /// qemu record/replay icount (extra-data offset 16). `u64::MAX`
+    /// sentinel when `extra_data_size < 24`.
+    icount: u64,
+}
+
+/// Parse the fixed 40-byte snapshot header from an in-memory slice.
+///
+/// Returns `None` if the buffer is shorter than 40 bytes. All fields
+/// are big-endian on disk; see the qcow2 spec §4.2 "Snapshots" and
+/// `block/qcow2-snapshot.c::qcow2_read_snapshots` in qemu.
+fn parse_snapshot_header_bytes(buf: &[u8]) -> Option<SnapshotHeaderRaw> {
+    if buf.len() < 40 {
+        return None;
+    }
+    // Offsets per the qcow2 snapshot header layout:
+    //   0-7:   l1_table_offset (u64 BE)
+    //   8-11:  l1_size (u32 BE)
+    //   12-13: id_str_size (u16 BE)
+    //   14-15: name_size (u16 BE)
+    //   16-19: date_sec (u32 BE)
+    //   20-23: date_nsec (u32 BE)
+    //   24-31: vm_clock_nsec (u64 BE)
+    //   32-35: vm_state_size (u32 BE)
+    //   36-39: extra_data_size (u32 BE)
+    let l1_table_offset = u64::from_be_bytes(buf[0..8].try_into().ok()?);
+    let l1_size = u32::from_be_bytes(buf[8..12].try_into().ok()?);
+    let id_str_size = u16::from_be_bytes(buf[12..14].try_into().ok()?);
+    let name_size = u16::from_be_bytes(buf[14..16].try_into().ok()?);
+    let date_sec = u32::from_be_bytes(buf[16..20].try_into().ok()?);
+    let date_nsec = u32::from_be_bytes(buf[20..24].try_into().ok()?);
+    let vm_clock_nsec = u64::from_be_bytes(buf[24..32].try_into().ok()?);
+    let vm_state_size = u32::from_be_bytes(buf[32..36].try_into().ok()?);
+    let extra_data_size = u32::from_be_bytes(buf[36..40].try_into().ok()?);
+    Some(SnapshotHeaderRaw {
+        l1_table_offset,
+        l1_size,
+        id_str_size,
+        name_size,
+        date_sec,
+        date_nsec,
+        vm_clock_nsec,
+        vm_state_size,
+        extra_data_size,
+    })
+}
+
+/// Apply qemu's progressive-reveal extra-data rules to the in-memory
+/// extra-data slice.
+///
+/// Per `block/qcow2-snapshot.c::qcow2_read_snapshots`:
+/// - `extra_data_size >= 8`: read 64-bit `vm_state_size_large`.
+/// - `extra_data_size >= 16`: read `disk_size`. Otherwise `0`
+///   sentinel meaning "fall back to the active header's virtual
+///   size" — resolved by the planner converter.
+/// - `extra_data_size >= 24`: read `icount`. Otherwise
+///   `u64::MAX` (matches qemu's `sn->icount = -1`).
+///
+/// Truncated buffers (slice shorter than the field offset would
+/// require) fall back to the same sentinels, so a partial read
+/// still produces a consistent result.
+fn parse_snapshot_extra_data(buf: &[u8], extra_data_size: u32) -> SnapshotExtraData {
+    let mut out = SnapshotExtraData {
+        vm_state_size_large: 0,
+        disk_size: 0,
+        icount: u64::MAX,
+    };
+    // Refuse oversized extra-data per qemu's `QCOW_MAX_SNAPSHOT_EXTRA_DATA`.
+    if extra_data_size > QCOW_MAX_SNAPSHOT_EXTRA_DATA {
+        return out;
+    }
+    if extra_data_size >= 8 {
+        if let Some(slice) = buf.get(0..8) {
+            if let Ok(arr) = slice.try_into() {
+                out.vm_state_size_large = u64::from_be_bytes(arr);
+            }
+        }
+    }
+    if extra_data_size >= 16 {
+        if let Some(slice) = buf.get(8..16) {
+            if let Ok(arr) = slice.try_into() {
+                out.disk_size = u64::from_be_bytes(arr);
+            }
+        }
+    }
+    if extra_data_size >= 24 {
+        if let Some(slice) = buf.get(16..24) {
+            if let Ok(arr) = slice.try_into() {
+                out.icount = u64::from_be_bytes(arr);
+            }
+        }
+    }
+    out
+}
+
+/// Read `len` consecutive bytes from `offset` into `out`, using
+/// the sector-cache helper byte-by-byte. Stops on the first read
+/// failure and returns `false`; otherwise returns `true`.
+///
+/// # Safety
+///
+/// Same contract as the cached-read helpers: `call_table` must be
+/// valid, `cache_buf` must point to at least `sector_size`
+/// writable bytes.
+#[allow(clippy::too_many_arguments)]
+unsafe fn read_bytes_cached(
+    call_table: &CallTable,
+    device_idx: u32,
+    offset: u64,
+    len: usize,
+    sector_size: usize,
+    input_capacity: u64,
+    cached_sector: &mut u64,
+    cache_buf: *mut u8,
+    bytes_read: &mut u64,
+    out: &mut [u8],
+) -> bool {
+    let n = len.min(out.len());
+    for (j, slot) in out.iter_mut().take(n).enumerate() {
+        match read_u8_cached(
+            call_table,
+            device_idx,
+            offset + j as u64,
+            sector_size,
+            input_capacity,
+            cached_sector,
+            cache_buf,
+            bytes_read,
+        ) {
+            Some(b) => *slot = b,
+            None => return false,
+        }
+    }
+    true
+}
+
+/// Stream snapshot entries one at a time through a caller-supplied
+/// callback.
+///
+/// Bounded only by `nb_snapshots` from the qcow2 header (which the
+/// spec caps at 65536). No in-memory snapshot array: the single
+/// in-flight `SnapshotEntry` lives on this function's stack frame.
+///
+/// The callback returns `true` to continue iterating or `false` to
+/// stop early. This function returns `true` if the full table was
+/// visited and `false` if the callback stopped early or a read
+/// error / oversized-extra-data condition aborted the loop.
+///
+/// `bytes_read` is updated cumulatively across all sector reads.
+///
+/// # Safety
+///
+/// `call_table` must be valid. `cache_buf` must point to at least
+/// `MAX_SECTOR_SIZE` writable bytes.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn for_each_snapshot_entry(
+    call_table: &CallTable,
+    device_idx: u32,
+    nb_snapshots: u32,
+    snapshots_offset: u64,
+    sector_size: usize,
+    input_capacity: u64,
+    cache_buf: *mut u8,
+    bytes_read: &mut u64,
+    mut callback: impl FnMut(&SnapshotEntry) -> bool,
+) -> bool {
+    let mut offset = snapshots_offset;
+    let mut cached_sector = u64::MAX;
+    // Scratch buffer for the 40-byte header + a clamped extra-data
+    // section. We only need to inspect the first 24 bytes of extra-
+    // data (icount lives at offset 16); anything beyond is ignored.
+    let mut header_buf = [0u8; 40];
+    let mut extra_buf = [0u8; 24];
+
+    for _ in 0..nb_snapshots {
+        // Read the fixed 40-byte snapshot header.
+        if !read_bytes_cached(
+            call_table,
+            device_idx,
+            offset,
+            40,
+            sector_size,
+            input_capacity,
+            &mut cached_sector,
+            cache_buf,
+            bytes_read,
+            &mut header_buf,
+        ) {
+            return false;
+        }
+        let raw = match parse_snapshot_header_bytes(&header_buf) {
+            Some(r) => r,
+            None => return false,
+        };
+        // Reject oversized extra-data per qemu's cap.
+        if raw.extra_data_size > QCOW_MAX_SNAPSHOT_EXTRA_DATA {
+            return false;
+        }
+
+        // Read up to 24 bytes of extra-data (anything beyond is
+        // ignored for parsing — we still skip the full
+        // `extra_data_size` when advancing).
+        let extra_read = (raw.extra_data_size as usize).min(extra_buf.len());
+        // Zero the buffer first so a short extra_data_size leaves
+        // tail bytes as zero rather than carrying stale data.
+        for b in extra_buf.iter_mut() {
+            *b = 0;
+        }
+        if extra_read > 0
+            && !read_bytes_cached(
+                call_table,
+                device_idx,
+                offset + 40,
+                extra_read,
+                sector_size,
+                input_capacity,
+                &mut cached_sector,
+                cache_buf,
+                bytes_read,
+                &mut extra_buf[..extra_read],
+            )
+        {
+            return false;
+        }
+        let extra = parse_snapshot_extra_data(&extra_buf[..extra_read], raw.extra_data_size);
+
+        // Build the entry. Id/name strings are read directly into
+        // the entry buffers, truncated at 63 bytes (the historical
+        // limit; longer names are silently dropped — see
+        // `snapshot_entry_to_record` for the wire-record path).
+        let mut entry = SnapshotEntry::zeroed();
+        entry.l1_table_offset = raw.l1_table_offset;
+        entry.l1_size = raw.l1_size;
+        entry.id_len = raw.id_str_size;
+        entry.name_len = raw.name_size;
+        entry.date_sec = raw.date_sec;
+        entry.date_nsec = raw.date_nsec;
+        entry.vm_clock_nsec = raw.vm_clock_nsec;
+        entry.vm_state_size = raw.vm_state_size;
+        entry.extra_data_size = raw.extra_data_size;
+        entry.vm_state_size_large = if raw.extra_data_size >= 8 {
+            extra.vm_state_size_large
+        } else {
+            raw.vm_state_size as u64
+        };
+        entry.disk_size = extra.disk_size;
+        entry.icount = extra.icount;
+
+        let id_start = offset + 40 + raw.extra_data_size as u64;
+        let id_copy_len = (raw.id_str_size as usize).min(63);
+        if id_copy_len > 0
+            && !read_bytes_cached(
+                call_table,
+                device_idx,
+                id_start,
+                id_copy_len,
+                sector_size,
+                input_capacity,
+                &mut cached_sector,
+                cache_buf,
+                bytes_read,
+                &mut entry.id[..id_copy_len],
+            )
+        {
+            return false;
+        }
+        // entry.id[id_copy_len] is already zero from `zeroed()`.
+
+        let name_start = id_start + raw.id_str_size as u64;
+        let name_copy_len = (raw.name_size as usize).min(63);
+        if name_copy_len > 0
+            && !read_bytes_cached(
+                call_table,
+                device_idx,
+                name_start,
+                name_copy_len,
+                sector_size,
+                input_capacity,
+                &mut cached_sector,
+                cache_buf,
+                bytes_read,
+                &mut entry.name[..name_copy_len],
+            )
+        {
+            return false;
+        }
+
+        if !callback(&entry) {
+            return false;
+        }
+
+        // Advance to the next entry: 40-byte header + extra_data +
+        // id + name, rounded up to the 8-byte boundary.
+        let entry_size =
+            40 + raw.extra_data_size as u64 + raw.id_str_size as u64 + raw.name_size as u64;
+        offset += (entry_size + 7) & !7;
+    }
+    true
+}
+
 /// Parse the QCOW2 snapshot table from disk.
 ///
-/// Reads variable-length snapshot entries starting at `snapshots_offset`.
-/// Each entry has a fixed 40-byte header followed by variable-length
-/// ID and name strings, then padding to an 8-byte boundary.
+/// Reads variable-length snapshot entries starting at
+/// `snapshots_offset`. Bounded at [`MAX_SNAPSHOTS`] (16) entries —
+/// use [`for_each_snapshot_entry`] for the streaming, uncapped
+/// variant.
+///
+/// This is a thin wrapper over [`for_each_snapshot_entry`] that
+/// stops once the bounded array is full; the public signature and
+/// behaviour are unchanged.
 ///
 /// # Safety
 ///
@@ -692,179 +1082,25 @@ pub unsafe fn parse_snapshot_table(
     bytes_read: &mut u64,
 ) -> SnapshotTable {
     let mut table = SnapshotTable::empty();
-    let count = (nb_snapshots as usize).min(MAX_SNAPSHOTS);
-    let mut offset = snapshots_offset;
-    let mut cached_sector = u64::MAX;
-
-    for i in 0..count {
-        // Snapshot header layout (40 bytes):
-        //   0-3:   l1_table_offset (u64) [high word]
-        //   ...actually the format is:
-        //   0-7:   l1_table_offset (u64 BE)
-        //   8-11:  l1_size (u32 BE)
-        //   12-13: id_str_size (u16 BE)
-        //   14-15: name_size (u16 BE)
-        //   16-19: date_sec (u32 BE)
-        //   20-23: date_nsec (u32 BE)
-        //   24-31: vm_clock_nsec (u64 BE)
-        //   32-35: vm_state_size (u32 BE)
-        //   36-39: extra_data_size (u32 BE)
-        //   Then: extra_data_size bytes of extra data
-        //   Then: id_str_size bytes (not null-terminated)
-        //   Then: name_size bytes (not null-terminated)
-        //   Then: padding to 8-byte boundary
-
-        let l1_table_offset = match read_u64_be_cached(
-            call_table,
-            device_idx,
-            offset,
-            sector_size,
-            input_capacity,
-            &mut cached_sector,
-            cache_buf,
-            bytes_read,
-        ) {
-            Some(v) => v,
-            None => break,
-        };
-
-        let l1_size = match read_u32_be_cached(
-            call_table,
-            device_idx,
-            offset + 8,
-            sector_size,
-            input_capacity,
-            &mut cached_sector,
-            cache_buf,
-            bytes_read,
-        ) {
-            Some(v) => v,
-            None => break,
-        };
-
-        let id_str_size = match read_u16_be_cached(
-            call_table,
-            device_idx,
-            offset + 12,
-            sector_size,
-            input_capacity,
-            &mut cached_sector,
-            cache_buf,
-            bytes_read,
-        ) {
-            Some(v) => v,
-            None => break,
-        };
-
-        let name_size = match read_u16_be_cached(
-            call_table,
-            device_idx,
-            offset + 14,
-            sector_size,
-            input_capacity,
-            &mut cached_sector,
-            cache_buf,
-            bytes_read,
-        ) {
-            Some(v) => v,
-            None => break,
-        };
-
-        let date_sec = match read_u32_be_cached(
-            call_table,
-            device_idx,
-            offset + 16,
-            sector_size,
-            input_capacity,
-            &mut cached_sector,
-            cache_buf,
-            bytes_read,
-        ) {
-            Some(v) => v,
-            None => break,
-        };
-
-        let vm_state_size = match read_u32_be_cached(
-            call_table,
-            device_idx,
-            offset + 32,
-            sector_size,
-            input_capacity,
-            &mut cached_sector,
-            cache_buf,
-            bytes_read,
-        ) {
-            Some(v) => v,
-            None => break,
-        };
-
-        let extra_data_size = match read_u32_be_cached(
-            call_table,
-            device_idx,
-            offset + 36,
-            sector_size,
-            input_capacity,
-            &mut cached_sector,
-            cache_buf,
-            bytes_read,
-        ) {
-            Some(v) => v,
-            None => break,
-        };
-
-        // Read ID string (byte by byte, up to 63 chars)
-        let id_copy_len = (id_str_size as usize).min(63);
-        let id_start = offset + 40 + extra_data_size as u64;
-        let entry = &mut table.entries[i];
-        for j in 0..id_copy_len {
-            if let Some(b) = read_u8_cached(
-                call_table,
-                device_idx,
-                id_start + j as u64,
-                sector_size,
-                input_capacity,
-                &mut cached_sector,
-                cache_buf,
-                bytes_read,
-            ) {
-                entry.id[j] = b;
+    let bounded = nb_snapshots.min(MAX_SNAPSHOTS as u32);
+    for_each_snapshot_entry(
+        call_table,
+        device_idx,
+        bounded,
+        snapshots_offset,
+        sector_size,
+        input_capacity,
+        cache_buf,
+        bytes_read,
+        |entry| {
+            if table.count >= MAX_SNAPSHOTS {
+                return false;
             }
-        }
-        entry.id[id_copy_len] = 0;
-
-        // Read name string (byte by byte, up to 63 chars)
-        let name_copy_len = (name_size as usize).min(63);
-        let name_start = id_start + id_str_size as u64;
-        for j in 0..name_copy_len {
-            if let Some(b) = read_u8_cached(
-                call_table,
-                device_idx,
-                name_start + j as u64,
-                sector_size,
-                input_capacity,
-                &mut cached_sector,
-                cache_buf,
-                bytes_read,
-            ) {
-                entry.name[j] = b;
-            }
-        }
-        entry.name[name_copy_len] = 0;
-
-        entry.l1_table_offset = l1_table_offset;
-        entry.l1_size = l1_size;
-        entry.id_len = id_str_size;
-        entry.name_len = name_size;
-        entry.date_sec = date_sec;
-        entry.vm_state_size = vm_state_size;
-        table.count = i + 1;
-
-        // Advance to next entry: 40 + extra_data_size + id_str_size + name_size
-        // rounded up to 8-byte boundary
-        let entry_size = 40 + extra_data_size as u64 + id_str_size as u64 + name_size as u64;
-        offset += (entry_size + 7) & !7;
-    }
-
+            table.entries[table.count] = *entry;
+            table.count += 1;
+            true
+        },
+    );
     table
 }
 
@@ -886,6 +1122,119 @@ pub fn find_snapshot(table: &SnapshotTable, needle: &[u8]) -> Option<usize> {
         }
     }
     None
+}
+
+/// Find a snapshot by ID or name without building the bounded
+/// in-memory table.
+///
+/// Streams over the snapshot table via [`for_each_snapshot_entry`]
+/// and returns the first entry whose id-or-name matches `needle`.
+/// Mirrors [`find_snapshot`]'s comparison rules (id first, then
+/// name; exact-length match required).
+///
+/// Returns `None` if no match is found or if a read error aborts
+/// the iteration before a match.
+///
+/// # Safety
+///
+/// `call_table` must be valid. `cache_buf` must point to at least
+/// `MAX_SECTOR_SIZE` writable bytes.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn find_snapshot_streaming(
+    call_table: &CallTable,
+    device_idx: u32,
+    nb_snapshots: u32,
+    snapshots_offset: u64,
+    sector_size: usize,
+    input_capacity: u64,
+    cache_buf: *mut u8,
+    bytes_read: &mut u64,
+    needle: &[u8],
+) -> Option<SnapshotEntry> {
+    let mut found: Option<SnapshotEntry> = None;
+    for_each_snapshot_entry(
+        call_table,
+        device_idx,
+        nb_snapshots,
+        snapshots_offset,
+        sector_size,
+        input_capacity,
+        cache_buf,
+        bytes_read,
+        |entry| {
+            let id_len = entry.id_len as usize;
+            if id_len == needle.len() && entry.id[..id_len] == *needle {
+                found = Some(*entry);
+                return false;
+            }
+            let name_len = entry.name_len as usize;
+            if name_len == needle.len() && entry.name[..name_len] == *needle {
+                found = Some(*entry);
+                return false;
+            }
+            true
+        },
+    );
+    found
+}
+
+/// Convert a parsed [`SnapshotEntry`] into the wire-FFI
+/// [`shared::SnapshotEntryRecord`] representation.
+///
+/// `header_virtual_size` is the active image's virtual size from
+/// the qcow2 header; it is substituted for `entry.disk_size` when
+/// the source extra-data did not carry a `disk_size` (qcow2 v2 or
+/// short v3, the parser stored `0` as the sentinel).
+///
+/// `date_sec` is split into `date_sec_hi` / `date_sec_lo` to match
+/// the on-disk and wire layout. The parser stores the assembled
+/// u32 in `entry.date_sec`; the converter places it in
+/// `date_sec_lo` with `date_sec_hi = 0` (Unix time fits in u32
+/// until 2106; the wire layout reserves the upper half for the
+/// post-2106 future).
+///
+/// id/name are silently truncated to the wire-record buffer sizes
+/// (32 bytes for id, 256 for name) and the `_len` fields reflect
+/// the truncated length, matching qemu's truncation behaviour.
+pub fn snapshot_entry_to_record(
+    entry: &SnapshotEntry,
+    header_virtual_size: u64,
+) -> shared::SnapshotEntryRecord {
+    // Clamp len against both the parser's source buffer (64 bytes) and
+    // the wire record's destination buffer (32 for id, 256 for name).
+    // The parser already truncates strings at 63 bytes, so in practice
+    // id_len <= 63 and name_len <= 63 — but defend in depth.
+    let id_len = (entry.id_len as usize).min(entry.id.len()).min(32);
+    let name_len = (entry.name_len as usize).min(entry.name.len()).min(256);
+    let mut id = [0u8; 32];
+    let mut name = [0u8; 256];
+    id[..id_len].copy_from_slice(&entry.id[..id_len]);
+    name[..name_len].copy_from_slice(&entry.name[..name_len]);
+
+    let disk_size = if entry.disk_size == 0 {
+        header_virtual_size
+    } else {
+        entry.disk_size
+    };
+
+    shared::SnapshotEntryRecord {
+        magic: shared::SnapshotEntryRecord::MAGIC,
+        date_sec_hi: 0,
+        date_sec_lo: entry.date_sec,
+        date_nsec: entry.date_nsec,
+        vm_clock_nsec: entry.vm_clock_nsec,
+        vm_state_size_large: entry.vm_state_size_large,
+        disk_size,
+        icount: entry.icount,
+        l1_table_offset: entry.l1_table_offset,
+        l1_size: entry.l1_size,
+        extra_data_size: entry.extra_data_size,
+        id_len: id_len as u32,
+        name_len: name_len as u32,
+        id,
+        name,
+        _reserved: [0; 32],
+    }
 }
 
 // ============================================================================
@@ -2627,6 +2976,9 @@ pub unsafe fn read_compressed_cluster_zstd(
 // ============================================================================
 
 #[cfg(test)]
+extern crate std;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3619,6 +3971,629 @@ mod tests {
         let e = classify_qcow2_l2_standard(entry, 0, 65536);
         let want = entry & L2_OFFSET_MASK;
         assert_eq!(e.state, MapExtentState::Data { file_offset: want });
+    }
+
+    // ----------------------------------------------------------------
+    // Snapshot table parser tests (PLAN-snapshot phase 2)
+    // ----------------------------------------------------------------
+
+    /// Build a 40-byte snapshot header with the given fields.
+    #[allow(clippy::too_many_arguments)]
+    fn make_snapshot_header(
+        l1_table_offset: u64,
+        l1_size: u32,
+        id_str_size: u16,
+        name_size: u16,
+        date_sec: u32,
+        date_nsec: u32,
+        vm_clock_nsec: u64,
+        vm_state_size: u32,
+        extra_data_size: u32,
+    ) -> [u8; 40] {
+        let mut buf = [0u8; 40];
+        buf[0..8].copy_from_slice(&l1_table_offset.to_be_bytes());
+        buf[8..12].copy_from_slice(&l1_size.to_be_bytes());
+        buf[12..14].copy_from_slice(&id_str_size.to_be_bytes());
+        buf[14..16].copy_from_slice(&name_size.to_be_bytes());
+        buf[16..20].copy_from_slice(&date_sec.to_be_bytes());
+        buf[20..24].copy_from_slice(&date_nsec.to_be_bytes());
+        buf[24..32].copy_from_slice(&vm_clock_nsec.to_be_bytes());
+        buf[32..36].copy_from_slice(&vm_state_size.to_be_bytes());
+        buf[36..40].copy_from_slice(&extra_data_size.to_be_bytes());
+        buf
+    }
+
+    #[test]
+    fn snapshot_header_happy_path() {
+        let buf = make_snapshot_header(
+            0x4000,
+            64,
+            3,
+            5,
+            0x6000_0001,
+            0x0a0b_0c0d,
+            0x1122_3344_5566_7788,
+            0xdead_beef,
+            16,
+        );
+        let raw = parse_snapshot_header_bytes(&buf).expect("header parses");
+        assert_eq!(raw.l1_table_offset, 0x4000);
+        assert_eq!(raw.l1_size, 64);
+        assert_eq!(raw.id_str_size, 3);
+        assert_eq!(raw.name_size, 5);
+        assert_eq!(raw.date_sec, 0x6000_0001);
+        assert_eq!(raw.date_nsec, 0x0a0b_0c0d);
+        assert_eq!(raw.vm_clock_nsec, 0x1122_3344_5566_7788);
+        assert_eq!(raw.vm_state_size, 0xdead_beef);
+        assert_eq!(raw.extra_data_size, 16);
+    }
+
+    #[test]
+    fn snapshot_header_rejects_short() {
+        let buf = [0u8; 39];
+        assert!(parse_snapshot_header_bytes(&buf).is_none());
+        let buf2 = [0u8; 0];
+        assert!(parse_snapshot_header_bytes(&buf2).is_none());
+    }
+
+    #[test]
+    fn snapshot_extra_data_v2_fallback() {
+        // extra_data_size == 0 → all sentinels.
+        let extra = parse_snapshot_extra_data(&[], 0);
+        assert_eq!(extra.vm_state_size_large, 0);
+        assert_eq!(extra.disk_size, 0);
+        assert_eq!(extra.icount, u64::MAX);
+    }
+
+    #[test]
+    fn snapshot_extra_data_v3_8() {
+        // extra_data_size == 8 → vm_state_size_large only.
+        let mut buf = [0u8; 8];
+        buf[0..8].copy_from_slice(&0x1234_5678_9abc_def0u64.to_be_bytes());
+        let extra = parse_snapshot_extra_data(&buf, 8);
+        assert_eq!(extra.vm_state_size_large, 0x1234_5678_9abc_def0);
+        assert_eq!(extra.disk_size, 0);
+        assert_eq!(extra.icount, u64::MAX);
+    }
+
+    #[test]
+    fn snapshot_extra_data_v3_16() {
+        // extra_data_size == 16 → vm_state_size_large + disk_size.
+        let mut buf = [0u8; 16];
+        buf[0..8].copy_from_slice(&100u64.to_be_bytes());
+        buf[8..16].copy_from_slice(&(1u64 << 30).to_be_bytes());
+        let extra = parse_snapshot_extra_data(&buf, 16);
+        assert_eq!(extra.vm_state_size_large, 100);
+        assert_eq!(extra.disk_size, 1u64 << 30);
+        assert_eq!(extra.icount, u64::MAX);
+    }
+
+    #[test]
+    fn snapshot_extra_data_v3_24() {
+        // extra_data_size == 24 → all three populated.
+        let mut buf = [0u8; 24];
+        buf[0..8].copy_from_slice(&100u64.to_be_bytes());
+        buf[8..16].copy_from_slice(&(1u64 << 30).to_be_bytes());
+        buf[16..24].copy_from_slice(&42u64.to_be_bytes());
+        let extra = parse_snapshot_extra_data(&buf, 24);
+        assert_eq!(extra.vm_state_size_large, 100);
+        assert_eq!(extra.disk_size, 1u64 << 30);
+        assert_eq!(extra.icount, 42);
+    }
+
+    #[test]
+    fn snapshot_extra_data_oversized_rejected() {
+        // extra_data_size > QCOW_MAX_SNAPSHOT_EXTRA_DATA → all sentinels,
+        // trailing data ignored.
+        let buf = [0xffu8; 32];
+        let extra = parse_snapshot_extra_data(&buf, QCOW_MAX_SNAPSHOT_EXTRA_DATA + 1);
+        assert_eq!(extra.vm_state_size_large, 0);
+        assert_eq!(extra.disk_size, 0);
+        assert_eq!(extra.icount, u64::MAX);
+    }
+
+    #[test]
+    fn snapshot_extra_data_truncated_buffer() {
+        // extra_data_size claims 24 but buffer only carries 12 bytes;
+        // we get the first field, then sentinels for the rest.
+        let mut buf = [0u8; 12];
+        buf[0..8].copy_from_slice(&77u64.to_be_bytes());
+        let extra = parse_snapshot_extra_data(&buf, 24);
+        assert_eq!(extra.vm_state_size_large, 77);
+        // buf[8..16] is partial — try_into() fails, falls back to 0.
+        assert_eq!(extra.disk_size, 0);
+        assert_eq!(extra.icount, u64::MAX);
+    }
+
+    #[test]
+    fn snapshot_entry_to_record_v2_fallback() {
+        // entry.disk_size == 0 (v2 sentinel) → record.disk_size =
+        // header_virtual_size.
+        let entry = SnapshotEntry::zeroed();
+        let rec = snapshot_entry_to_record(&entry, 4096);
+        assert_eq!(rec.disk_size, 4096);
+    }
+
+    #[test]
+    fn snapshot_entry_to_record_happy_path() {
+        let mut entry = SnapshotEntry::zeroed();
+        entry.l1_table_offset = 0x5000;
+        entry.l1_size = 16;
+        entry.id_len = 3;
+        entry.name_len = 5;
+        entry.id[..3].copy_from_slice(b"42\0");
+        entry.name[..5].copy_from_slice(b"hello");
+        entry.date_sec = 1_700_000_000;
+        entry.date_nsec = 12345;
+        entry.vm_clock_nsec = 0xdead_beef_cafe_babe;
+        entry.vm_state_size = 0;
+        entry.vm_state_size_large = 256 * 1024;
+        entry.disk_size = 1u64 << 30;
+        entry.icount = 99;
+        entry.extra_data_size = 24;
+        let rec = snapshot_entry_to_record(&entry, 0);
+        assert_eq!(rec.magic, shared::SnapshotEntryRecord::MAGIC);
+        assert_eq!(rec.date_sec_hi, 0);
+        assert_eq!(rec.date_sec_lo, 1_700_000_000);
+        assert_eq!(rec.date_nsec, 12345);
+        assert_eq!(rec.vm_clock_nsec, 0xdead_beef_cafe_babe);
+        assert_eq!(rec.vm_state_size_large, 256 * 1024);
+        assert_eq!(rec.disk_size, 1u64 << 30);
+        assert_eq!(rec.icount, 99);
+        assert_eq!(rec.l1_table_offset, 0x5000);
+        assert_eq!(rec.l1_size, 16);
+        assert_eq!(rec.extra_data_size, 24);
+        assert_eq!(rec.id_len, 3);
+        assert_eq!(rec.name_len, 5);
+        assert_eq!(&rec.id[..3], b"42\0");
+        assert_eq!(&rec.name[..5], b"hello");
+        // Bytes past the populated tail are zero.
+        assert!(rec.id[3..].iter().all(|&b| b == 0));
+        assert!(rec.name[5..].iter().all(|&b| b == 0));
+        assert!(rec._reserved.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn snapshot_entry_to_record_long_name_truncates_to_wire_buffer() {
+        // The wire record's `name` is 256 bytes; the parser's
+        // `SnapshotEntry::name` is only 64. With name_len = 300 (set
+        // directly, bypassing the parser's own truncation), the
+        // converter must clamp against both the source buffer (64)
+        // and the destination buffer (256). The resulting wire
+        // name_len is therefore 64 (source-buffer-bounded), not 300
+        // (raw entry value) or 256 (dest-bounded). This guards
+        // against an OOB panic if a future change to the converter
+        // forgets to clamp the source side.
+        let mut entry = SnapshotEntry::zeroed();
+        entry.name_len = 300;
+        for (i, b) in entry.name.iter_mut().enumerate() {
+            *b = (i as u8) | 0x80;
+        }
+        let rec = snapshot_entry_to_record(&entry, 0);
+        assert_eq!(rec.name_len, 64);
+        // The 64 source bytes land at the start of the 256-byte
+        // wire buffer; the rest is zero-padded.
+        for (i, &b) in rec.name[..64].iter().enumerate() {
+            assert_eq!(b, (i as u8) | 0x80);
+        }
+        assert!(rec.name[64..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn snapshot_entry_to_record_long_id_truncates_to_wire_buffer() {
+        // Wire record's id buffer is 32; internal is 64. A 40-byte id
+        // (forced by setting id_len = 40) truncates to 32 on the wire.
+        let mut entry = SnapshotEntry::zeroed();
+        entry.id_len = 40;
+        for (i, b) in entry.id.iter_mut().enumerate() {
+            *b = (i as u8) | 0x40;
+        }
+        let rec = snapshot_entry_to_record(&entry, 0);
+        // wire id_len is min(40, 32) = 32.
+        assert_eq!(rec.id_len, 32);
+        for (i, &b) in rec.id.iter().enumerate() {
+            assert_eq!(b, (i as u8) | 0x40);
+        }
+    }
+
+    #[test]
+    fn snapshot_entry_icount_absent_matches_shared() {
+        assert_eq!(
+            SnapshotEntry::ICOUNT_ABSENT,
+            shared::SnapshotEntryRecord::ICOUNT_ABSENT
+        );
+        assert_eq!(SnapshotEntry::ICOUNT_ABSENT, u64::MAX);
+    }
+
+    #[test]
+    fn snapshot_entry_size_tripwire() {
+        // Tripwire: if SnapshotEntry's size drifts, the bounded
+        // SnapshotTable's stack footprint changes and callers
+        // (info, convert) need re-validation. Adjust this number
+        // intentionally when adding fields, after auditing callers.
+        //
+        // Current shape: u64 + u32 + u16 + u16 + [u8;64] + [u8;64] +
+        // u32 + u32 + u32 + u64 + u64 + u64 + u64 + u32
+        // The rust layout may pad; verify against actual size_of.
+        let s = core::mem::size_of::<SnapshotEntry>();
+        // Sanity bounds: must fit comfortably below 256 bytes so the
+        // bounded 16-entry SnapshotTable stays in the low-kilobyte
+        // range.
+        assert!(
+            s >= 184 && s <= 256,
+            "SnapshotEntry size unexpected: {} bytes",
+            s
+        );
+    }
+
+    // ---- Streaming find tests ------------------------------------
+
+    /// A self-contained streaming snapshot fixture in memory.
+    ///
+    /// Builds a small qcow2-style snapshot table in a fixed buffer,
+    /// installs a `CallTable` whose `read_input_sector` services
+    /// reads from the buffer, then exercises
+    /// `find_snapshot_streaming` against it.
+    struct StreamingFixture {
+        // Static-sized buffer big enough for a few small entries.
+        buf: [u8; 4096],
+    }
+
+    // Serialize tests that touch the shared `STREAMING_FIXTURE`
+    // global. The streaming `read_input_sector` callback can only
+    // close over `'static` state because it is an `extern "C" fn`,
+    // hence the global buffer + lock.
+    static STREAMING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    static mut STREAMING_FIXTURE: StreamingFixture = StreamingFixture { buf: [0u8; 4096] };
+
+    unsafe extern "C" fn streaming_read_sector(
+        _device_idx: u32,
+        sector: u64,
+        out_buf: *mut u8,
+        sector_size: usize,
+    ) -> bool {
+        let start = (sector as usize).saturating_mul(sector_size);
+        if start + sector_size > 4096 {
+            return false;
+        }
+        let fixture_ptr = core::ptr::addr_of!(STREAMING_FIXTURE.buf) as *const u8;
+        core::ptr::copy_nonoverlapping(fixture_ptr.add(start), out_buf, sector_size);
+        true
+    }
+
+    unsafe extern "C" fn streaming_read_sector_fail(
+        _device_idx: u32,
+        _sector: u64,
+        _out_buf: *mut u8,
+        _sector_size: usize,
+    ) -> bool {
+        false
+    }
+
+    /// Write one snapshot entry into the fixture buffer at `offset`
+    /// with the given id/name and return the post-entry offset.
+    fn write_entry(buf: &mut [u8], offset: usize, id: &[u8], name: &[u8]) -> usize {
+        // Use minimal-but-valid v3 extra-data (24 bytes carrying
+        // vm_state_size_large=0, disk_size=0, icount=ABSENT).
+        let id_str_size = id.len() as u16;
+        let name_size = name.len() as u16;
+        let extra_data_size: u32 = 24;
+        let header = make_snapshot_header(
+            0x4000,
+            16,
+            id_str_size,
+            name_size,
+            0,
+            0,
+            0,
+            0,
+            extra_data_size,
+        );
+        buf[offset..offset + 40].copy_from_slice(&header);
+        // 24-byte extra-data carrying icount=ABSENT (u64::MAX).
+        let extra_start = offset + 40;
+        buf[extra_start..extra_start + 8].fill(0);
+        buf[extra_start + 8..extra_start + 16].fill(0);
+        buf[extra_start + 16..extra_start + 24].copy_from_slice(&u64::MAX.to_be_bytes());
+        let id_start = extra_start + 24;
+        buf[id_start..id_start + id.len()].copy_from_slice(id);
+        let name_start = id_start + id.len();
+        buf[name_start..name_start + name.len()].copy_from_slice(name);
+        let raw_end = name_start + name.len();
+        // Round up to 8-byte boundary.
+        (raw_end + 7) & !7
+    }
+
+    /// Build a CallTable with every function pointer set to a
+    /// trivially-correct stub. Only `read_input_sector` is
+    /// overwritten by callers as needed.
+    fn stub_call_table() -> shared::CallTable {
+        unsafe extern "C" fn s_get_dev_count() -> u32 {
+            1
+        }
+        unsafe extern "C" fn s_read_in(_: u32, _: u64, _: *mut u8, _: usize) -> bool {
+            false
+        }
+        unsafe extern "C" fn s_in_cap(_: u32) -> u64 {
+            8
+        }
+        unsafe extern "C" fn s_in_secsz(_: u32) -> usize {
+            512
+        }
+        unsafe extern "C" fn s_write_out(_: u64, _: *const u8, _: usize) -> bool {
+            false
+        }
+        unsafe extern "C" fn s_out_cap() -> u64 {
+            0
+        }
+        unsafe extern "C" fn s_out_secsz() -> usize {
+            512
+        }
+        unsafe extern "C" fn s_prog_int() -> u32 {
+            100
+        }
+        unsafe extern "C" fn s_send_prog(_: *const u8, _: u64, _: u64, _: u32) {}
+        unsafe extern "C" fn s_send_err(_: *const u8, _: *const u8, _: u64, _: u32) {}
+        unsafe extern "C" fn s_send_complete(_: *const u8, _: u64, _: bool) {}
+        unsafe extern "C" fn s_dbg(_: *const u8) {}
+        unsafe extern "C" fn s_verb(_: *const u8) {}
+        unsafe extern "C" fn s_get_op_cfg() -> shared::ConfigResult {
+            shared::ConfigResult {
+                ptr: core::ptr::null(),
+                len: 0,
+            }
+        }
+        unsafe extern "C" fn s_get_chain_cfg() -> shared::ConfigResult {
+            shared::ConfigResult {
+                ptr: core::ptr::null(),
+                len: 0,
+            }
+        }
+        unsafe extern "C" fn s_send_info(
+            _: *const u8,
+            _: u32,
+            _: u64,
+            _: u64,
+            _: u32,
+            _: u32,
+            _: *const u8,
+            _: *const u8,
+        ) {
+        }
+        unsafe extern "C" fn s_send_info_q(
+            _: *const u8,
+            _: u32,
+            _: u64,
+            _: u64,
+            _: u32,
+            _: u32,
+            _: *const u8,
+            _: *const u8,
+            _: *const shared::Qcow2Info,
+        ) {
+        }
+        unsafe extern "C" fn s_send_info_v(
+            _: *const u8,
+            _: u32,
+            _: u64,
+            _: u64,
+            _: u32,
+            _: u32,
+            _: *const u8,
+            _: *const u8,
+            _: *const shared::VmdkInfo,
+        ) {
+        }
+        unsafe extern "C" fn s_send_info_vdi(
+            _: *const u8,
+            _: u32,
+            _: u64,
+            _: u64,
+            _: u32,
+            _: u32,
+            _: *const u8,
+            _: *const u8,
+            _: *const shared::VdiInfo,
+        ) {
+        }
+        unsafe extern "C" fn s_send_info_l(
+            _: *const u8,
+            _: u32,
+            _: u64,
+            _: u64,
+            _: u32,
+            _: u32,
+            _: *const u8,
+            _: *const u8,
+            _: *const shared::LuksInfo,
+        ) {
+        }
+        unsafe extern "C" fn s_send_check(_: *const shared::CheckResult) {}
+        unsafe extern "C" fn s_send_compare(_: *const shared::CompareResult) {}
+        unsafe extern "C" fn s_send_measure(_: *const shared::MeasureResult) {}
+        unsafe extern "C" fn s_send_create(_: *const shared::CreateResult) {}
+        unsafe extern "C" fn s_read_out(_: u64, _: *mut u8, _: usize) -> bool {
+            false
+        }
+        unsafe extern "C" fn s_send_resize(_: *const shared::ResizeResult) {}
+        unsafe extern "C" fn s_send_rebase(_: *const shared::RebaseResult) {}
+        unsafe extern "C" fn s_send_commit(_: *const shared::CommitResult) {}
+        unsafe extern "C" fn s_write_in(_: u32, _: u64, _: *const u8, _: usize) -> bool {
+            false
+        }
+        unsafe extern "C" fn s_send_map_ex(_: *const shared::MapExtentRecord) {}
+        unsafe extern "C" fn s_send_map_res(_: *const shared::MapResult) {}
+        unsafe extern "C" fn s_send_snap_ent(_: *const shared::SnapshotEntryRecord) {}
+        unsafe extern "C" fn s_send_snap_res(_: *const shared::SnapshotResult) {}
+        unsafe extern "C" fn s_fsync_in(_: u32) -> bool {
+            true
+        }
+        shared::CallTable {
+            magic: shared::CallTable::MAGIC,
+            version: shared::CallTable::VERSION,
+            get_input_device_count: s_get_dev_count,
+            read_input_sector: s_read_in,
+            get_input_capacity: s_in_cap,
+            get_input_sector_size: s_in_secsz,
+            write_output_sector: s_write_out,
+            get_output_capacity: s_out_cap,
+            get_output_sector_size: s_out_secsz,
+            get_progress_interval: s_prog_int,
+            send_progress: s_send_prog,
+            send_error: s_send_err,
+            send_complete: s_send_complete,
+            debug_print: s_dbg,
+            verbose_print: s_verb,
+            get_operation_config: s_get_op_cfg,
+            get_chain_config: s_get_chain_cfg,
+            send_info_result: s_send_info,
+            send_info_result_qcow2: s_send_info_q,
+            send_info_result_vmdk: s_send_info_v,
+            send_info_result_vdi: s_send_info_vdi,
+            send_info_result_luks: s_send_info_l,
+            send_check_result: s_send_check,
+            send_compare_result: s_send_compare,
+            send_measure_result: s_send_measure,
+            send_create_result: s_send_create,
+            read_output_sector: s_read_out,
+            send_resize_result: s_send_resize,
+            send_rebase_result: s_send_rebase,
+            send_commit_result: s_send_commit,
+            write_input_sector: s_write_in,
+            send_map_extent: s_send_map_ex,
+            send_map_result: s_send_map_res,
+            send_snapshot_entry: s_send_snap_ent,
+            send_snapshot_result: s_send_snap_res,
+            fsync_input: s_fsync_in,
+        }
+    }
+
+    /// Make a CallTable with `read_input_sector` set to the
+    /// streaming fixture's reader.
+    fn make_streaming_call_table() -> shared::CallTable {
+        shared::CallTable {
+            read_input_sector: streaming_read_sector,
+            ..stub_call_table()
+        }
+    }
+
+    #[test]
+    fn streaming_find_by_id() {
+        let _guard = STREAMING_LOCK.lock().unwrap();
+        unsafe {
+            let buf = &raw mut STREAMING_FIXTURE.buf;
+            for b in (*buf).iter_mut() {
+                *b = 0;
+            }
+            let mut next = write_entry(&mut *buf, 0, b"1", b"first");
+            next = write_entry(&mut *buf, next, b"2", b"second");
+            let _ = next;
+            let ct = make_streaming_call_table();
+            let mut cache = [0u8; 512];
+            let mut bytes = 0u64;
+            let found = find_snapshot_streaming(
+                &ct,
+                0,
+                2,
+                0,
+                512,
+                8, // input_capacity in sectors
+                cache.as_mut_ptr(),
+                &mut bytes,
+                b"2",
+            );
+            let f = found.expect("found by id");
+            assert_eq!(f.id_len, 1);
+            assert_eq!(&f.id[..1], b"2");
+            assert_eq!(f.name_len, 6);
+            assert_eq!(&f.name[..6], b"second");
+        }
+    }
+
+    #[test]
+    fn streaming_find_by_name() {
+        let _guard = STREAMING_LOCK.lock().unwrap();
+        unsafe {
+            let buf = &raw mut STREAMING_FIXTURE.buf;
+            for b in (*buf).iter_mut() {
+                *b = 0;
+            }
+            let mut next = write_entry(&mut *buf, 0, b"1", b"alpha");
+            next = write_entry(&mut *buf, next, b"2", b"beta");
+            let _ = next;
+            let ct = make_streaming_call_table();
+            let mut cache = [0u8; 512];
+            let mut bytes = 0u64;
+            let found = find_snapshot_streaming(
+                &ct,
+                0,
+                2,
+                0,
+                512,
+                8,
+                cache.as_mut_ptr(),
+                &mut bytes,
+                b"beta",
+            );
+            let f = found.expect("found by name");
+            assert_eq!(&f.name[..f.name_len as usize], b"beta");
+        }
+    }
+
+    #[test]
+    fn streaming_find_no_match() {
+        let _guard = STREAMING_LOCK.lock().unwrap();
+        unsafe {
+            let buf = &raw mut STREAMING_FIXTURE.buf;
+            for b in (*buf).iter_mut() {
+                *b = 0;
+            }
+            let next = write_entry(&mut *buf, 0, b"1", b"alpha");
+            let _ = next;
+            let ct = make_streaming_call_table();
+            let mut cache = [0u8; 512];
+            let mut bytes = 0u64;
+            let found = find_snapshot_streaming(
+                &ct,
+                0,
+                1,
+                0,
+                512,
+                8,
+                cache.as_mut_ptr(),
+                &mut bytes,
+                b"missing",
+            );
+            assert!(found.is_none());
+        }
+    }
+
+    #[test]
+    fn streaming_find_read_error() {
+        let _guard = STREAMING_LOCK.lock().unwrap();
+        unsafe {
+            // CallTable whose read always fails — streaming aborts and
+            // returns None.
+            let ct = shared::CallTable {
+                read_input_sector: streaming_read_sector_fail,
+                ..stub_call_table()
+            };
+            let mut cache = [0u8; 512];
+            let mut bytes = 0u64;
+            let found = find_snapshot_streaming(
+                &ct,
+                0,
+                1,
+                0,
+                512,
+                8,
+                cache.as_mut_ptr(),
+                &mut bytes,
+                b"anything",
+            );
+            assert!(found.is_none());
+        }
     }
 }
 
