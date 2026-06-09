@@ -323,6 +323,59 @@ message MapResultMessage {
   uint32 error = 4;
 }
 
+// Single snapshot record (from the snapshot list mode). Sent
+// once per snapshot, followed by a SnapshotResultMessage
+// terminator after the last entry. The host renders these into
+// the qemu-img-compatible column-aligned table or the
+// instar-extension JSON array in PLAN-snapshot phase 4.
+message SnapshotEntryMessage {
+  // Snapshot ID (qemu's decimal string: "0", "1", ...).
+  string id = 1;
+  // Snapshot tag/name (UTF-8).
+  string name = 2;
+  // Location of the snapshot's L1 table on disk.
+  uint64 l1_table_offset = 3;
+  // Snapshot L1 size in entries.
+  uint32 l1_size = 4;
+  // Creation date split as qcow2 stores it on disk (two
+  // big-endian u32s in the snapshot header).
+  uint32 date_sec_hi = 5;
+  uint32 date_sec_lo = 6;
+  uint32 date_nsec = 7;
+  // VM clock at snapshot creation (nanoseconds).
+  uint64 vm_clock_nsec = 8;
+  // 64-bit VM state size (qcow2 v3 extra-data offset 0).
+  uint64 vm_state_size = 9;
+  // Virtual disk size at snapshot creation (qcow2 v3 extra-data
+  // offset 8).
+  uint64 disk_size = 10;
+  // qemu record/replay icount; u64::MAX means absent (matches
+  // SnapshotEntryRecord::ICOUNT_ABSENT in src/shared/src/lib.rs).
+  uint64 icount = 11;
+  // Length of the source extra-data section; reported for
+  // forward-compat diagnostics.
+  uint32 extra_data_size = 12;
+}
+
+// Snapshot operation summary (sent after the last
+// SnapshotEntryMessage, or as the only message for the mutating
+// modes).
+message SnapshotResultMessage {
+  // Echo of the requested mode (0=list, 1=apply, 2=create,
+  // 3=delete). Mirrors SnapshotConfig::MODE_* in
+  // src/shared/src/lib.rs.
+  uint32 mode = 1;
+  // Error code: 0 = ok, non-zero mirrors
+  // SnapshotResult::ERROR_* in src/shared/src/lib.rs.
+  uint32 error = 2;
+  // Number of SnapshotEntryMessage records emitted (list
+  // mode only; 0 otherwise).
+  uint32 snapshots_emitted = 3;
+  // Auto-assigned snapshot ID returned by MODE_CREATE; empty
+  // string for the other modes.
+  string assigned_id = 4;
+}
+
 // Main message wrapper with level and payload
 message GuestMessage {
   Level level = 1;
@@ -342,5 +395,7 @@ message GuestMessage {
     CommitResultMessage commit_result = 14;
     MapExtentMessage map_extent = 15;
     MapResultMessage map_result = 16;
+    SnapshotEntryMessage snapshot_entry = 17;
+    SnapshotResultMessage snapshot_result = 18;
   }
 }

@@ -769,6 +769,115 @@ pub fn map_result_message(
     msg
 }
 
+/// Helper to push a string into a 64-char heapless String (used
+/// for the snapshot result's `assigned_id` field).
+fn push_str_64(dest: &mut heapless::String<64>, src: &str) {
+    dest.clear();
+    for c in src.chars() {
+        if dest.push(c).is_err() {
+            break;
+        }
+    }
+}
+
+/// Helper to push a string into a 256-char heapless String (used
+/// for the snapshot entry's `name` field; matches
+/// `QCOW_MAX_SNAPSHOT_NAME`).
+fn push_str_256(dest: &mut heapless::String<256>, src: &str) {
+    dest.clear();
+    for c in src.chars() {
+        if dest.push(c).is_err() {
+            break;
+        }
+    }
+}
+
+/// Build a `SnapshotEntryMessage` envelope for one snapshot
+/// emitted during `MODE_LIST`. Sent once per snapshot, before the
+/// terminating [`snapshot_result_message`].
+///
+/// # Arguments
+/// * `id` - Snapshot ID (qemu uses small decimal strings)
+/// * `name` - Snapshot tag/name (UTF-8)
+/// * `l1_table_offset` - Host offset of the snapshot's L1 table
+/// * `l1_size` - Snapshot L1 size, in entries
+/// * `date_sec_hi` / `date_sec_lo` - High and low 32 bits of the
+///   snapshot's `date_sec` (matches the qcow2 on-disk split)
+/// * `date_nsec` - Subsecond component of the snapshot date
+/// * `vm_clock_nsec` - VM clock at snapshot creation
+/// * `vm_state_size` - 64-bit VM state size
+/// * `disk_size` - Virtual disk size at snapshot creation
+/// * `icount` - qemu record/replay icount; `u64::MAX` means absent
+/// * `extra_data_size` - Length of the source extra-data section
+#[allow(clippy::too_many_arguments)]
+pub fn snapshot_entry_message(
+    id: &str,
+    name: &str,
+    l1_table_offset: u64,
+    l1_size: u32,
+    date_sec_hi: u32,
+    date_sec_lo: u32,
+    date_nsec: u32,
+    vm_clock_nsec: u64,
+    vm_state_size: u64,
+    disk_size: u64,
+    icount: u64,
+    extra_data_size: u32,
+) -> guest_::GuestMessage {
+    let mut msg = guest_::GuestMessage::default();
+    msg.level = guest_::Level::Info;
+
+    let mut entry = guest_::SnapshotEntryMessage::default();
+    push_str(&mut entry.id, id);
+    push_str_256(&mut entry.name, name);
+    entry.l1_table_offset = l1_table_offset;
+    entry.l1_size = l1_size;
+    entry.date_sec_hi = date_sec_hi;
+    entry.date_sec_lo = date_sec_lo;
+    entry.date_nsec = date_nsec;
+    entry.vm_clock_nsec = vm_clock_nsec;
+    entry.vm_state_size = vm_state_size;
+    entry.disk_size = disk_size;
+    entry.icount = icount;
+    entry.extra_data_size = extra_data_size;
+
+    msg.payload = Some(guest_::GuestMessage_::Payload::SnapshotEntry(entry));
+    msg
+}
+
+/// Build a `SnapshotResultMessage` envelope for the snapshot
+/// operation's terminator summary. Sent once per invocation,
+/// after the last [`snapshot_entry_message`] (or as the only
+/// message for the mutating modes).
+///
+/// # Arguments
+/// * `mode` - Echo of the requested mode (0=list, 1=apply,
+///   2=create, 3=delete); mirrors `SnapshotConfig::MODE_*`
+/// * `error` - 0 = ok, non-zero mirrors `SnapshotResult::ERROR_*`
+/// * `snapshots_emitted` - Count of `SnapshotEntryMessage`
+///   records sent during this invocation (list mode only;
+///   0 otherwise)
+/// * `assigned_id` - Auto-assigned snapshot ID returned by
+///   `MODE_CREATE`; empty for the other modes
+pub fn snapshot_result_message(
+    mode: u32,
+    error: u32,
+    snapshots_emitted: u32,
+    assigned_id: &str,
+) -> guest_::GuestMessage {
+    let mut msg = guest_::GuestMessage::default();
+    msg.level = guest_::Level::Info;
+
+    let mut result = guest_::SnapshotResultMessage::default();
+    result.mode = mode;
+    result.error = error;
+    result.snapshots_emitted = snapshots_emitted;
+    push_str_64(&mut result.assigned_id, assigned_id);
+
+    msg.payload = Some(guest_::GuestMessage_::Payload::SnapshotResult(result));
+    msg
+}
+
 // =============================================================================
 // VMM -> Guest configuration message support
 // =============================================================================

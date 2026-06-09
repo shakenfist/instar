@@ -903,6 +903,33 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
                 r.source_format, r.extents_emitted, r.virtual_size, r.error
             )
         }
+        Some(guest_::GuestMessage_::Payload::SnapshotEntry(e)) => {
+            format!(
+                "snapshot_entry id={} name={} l1_table_offset={} \
+                l1_size={} date_sec_hi={} date_sec_lo={} date_nsec={} \
+                vm_clock_nsec={} vm_state_size={} disk_size={} \
+                icount={} extra_data_size={}",
+                e.id,
+                e.name,
+                e.l1_table_offset,
+                e.l1_size,
+                e.date_sec_hi,
+                e.date_sec_lo,
+                e.date_nsec,
+                e.vm_clock_nsec,
+                e.vm_state_size,
+                e.disk_size,
+                e.icount,
+                e.extra_data_size
+            )
+        }
+        Some(guest_::GuestMessage_::Payload::SnapshotResult(r)) => {
+            format!(
+                "snapshot_result mode={} error={} snapshots_emitted={} \
+                assigned_id={}",
+                r.mode, r.error, r.snapshots_emitted, r.assigned_id
+            )
+        }
         None => "empty payload".to_string(),
     };
 

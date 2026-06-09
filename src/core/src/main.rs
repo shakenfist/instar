@@ -21,9 +21,10 @@ use core::ptr::write_volatile;
 
 use shared::{
     CallTable, ChainConfig, CheckResult, CommitResult, CompareResult, CreateResult, LuksInfo,
-    MapExtentRecord, MapResult, MeasureResult, Qcow2Info, RebaseResult, ResizeResult, VdiInfo,
-    VmdkInfo, CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR, CHAIN_CONFIG_MAX_SIZE, OPERATION_CONFIG_ADDR,
-    OPERATION_CONFIG_MAX_SIZE, OPERATION_LOAD_ADDR, VMM_PARAMS_ADDR,
+    MapExtentRecord, MapResult, MeasureResult, Qcow2Info, RebaseResult, ResizeResult,
+    SnapshotEntryRecord, SnapshotResult, VdiInfo, VmdkInfo, CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR,
+    CHAIN_CONFIG_MAX_SIZE, OPERATION_CONFIG_ADDR, OPERATION_CONFIG_MAX_SIZE, OPERATION_LOAD_ADDR,
+    VMM_PARAMS_ADDR,
 };
 
 use crate::serial::{
@@ -31,7 +32,7 @@ use crate::serial::{
     send_complete, send_create_result, send_error, send_info_result, send_info_result_luks,
     send_info_result_qcow2, send_info_result_vdi, send_info_result_vmdk, send_init,
     send_map_extent, send_map_result, send_measure_result, send_progress, send_rebase_result,
-    send_resize_result, DeviceConfig,
+    send_resize_result, send_snapshot_entry, send_snapshot_result, DeviceConfig,
 };
 use crate::virtio::VirtioBlock;
 
@@ -295,6 +296,9 @@ fn setup_call_table() {
         write_input_sector: ct_write_input_sector,
         send_map_extent: ct_send_map_extent,
         send_map_result: ct_send_map_result,
+        send_snapshot_entry: ct_send_snapshot_entry,
+        send_snapshot_result: ct_send_snapshot_result,
+        fsync_input: ct_fsync_input,
     };
 
     unsafe {
@@ -737,6 +741,41 @@ unsafe extern "C" fn ct_send_map_result(result: *const MapResult) {
     if !result.is_null() {
         send_map_result(&*result);
     }
+}
+
+/// Send one snapshot record. Called once per snapshot during the
+/// snapshot list mode, before the terminating
+/// `ct_send_snapshot_result`.
+unsafe extern "C" fn ct_send_snapshot_entry(record: *const SnapshotEntryRecord) {
+    if !record.is_null() {
+        send_snapshot_entry(&*record);
+    }
+}
+
+/// Send the snapshot operation's terminator summary. Called once
+/// per invocation, after the last `ct_send_snapshot_entry` (or
+/// as the only call for the mutating modes).
+unsafe extern "C" fn ct_send_snapshot_result(result: *const SnapshotResult) {
+    if !result.is_null() {
+        send_snapshot_result(&*result);
+    }
+}
+
+/// Request that the host fdatasync the named input device's
+/// backing file. The host-side stub returns `false` for slots
+/// that were not opened RW or for invalid slot indices; the
+/// guest treats `false` the same way it treats `false` from
+/// `ct_write_input_sector` (i.e. aborts the operation with an
+/// I/O error).
+unsafe extern "C" fn ct_fsync_input(device_index: u32) -> bool {
+    let index = device_index as usize;
+    let devices = INPUT_DEVICES.get_mut();
+    if index < *INPUT_DEVICE_COUNT.get() {
+        if let Some(ref mut dev) = devices[index] {
+            return dev.flush();
+        }
+    }
+    false
 }
 
 /// Convert null-terminated C string to &str.

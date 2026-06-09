@@ -89,6 +89,9 @@ pub fn build_call_table() -> shared::CallTable {
         write_input_sector: mock_write_input_sector,
         send_map_extent: mock_send_map_extent,
         send_map_result: mock_send_map_result,
+        send_snapshot_entry: mock_send_snapshot_entry,
+        send_snapshot_result: mock_send_snapshot_result,
+        fsync_input: mock_fsync_input,
     }
 }
 
@@ -295,6 +298,14 @@ unsafe extern "C" fn mock_write_input_sector(
 unsafe extern "C" fn mock_send_map_extent(_record: *const shared::MapExtentRecord) {}
 
 unsafe extern "C" fn mock_send_map_result(_result: *const shared::MapResult) {}
+
+unsafe extern "C" fn mock_send_snapshot_entry(_record: *const shared::SnapshotEntryRecord) {}
+
+unsafe extern "C" fn mock_send_snapshot_result(_result: *const shared::SnapshotResult) {}
+
+unsafe extern "C" fn mock_fsync_input(_device_idx: u32) -> bool {
+    true
+}
 
 // ---------------------------------------------------------------------------
 // Unit tests

@@ -929,6 +929,38 @@ pub struct CallTable {
     /// end of `CallTable` for the same back-compat reason as
     /// `send_map_extent`.
     pub send_map_result: unsafe extern "C" fn(*const MapResult),
+
+    /// Send one snapshot record during `MODE_LIST`. Called once
+    /// per snapshot, before the terminating
+    /// `send_snapshot_result`. Args: `*const SnapshotEntryRecord`
+    /// carrying the full v3 snapshot metadata (id, name,
+    /// vm_state_size_large, disk_size, icount, date, vm_clock,
+    /// l1 location). Appended at the end of `CallTable` for the
+    /// same back-compat reason as `send_map_result`.
+    pub send_snapshot_entry: unsafe extern "C" fn(*const SnapshotEntryRecord),
+
+    /// Send the snapshot operation's terminator summary. Called
+    /// once per invocation, after the last `send_snapshot_entry`
+    /// (or as the only call for `MODE_APPLY` / `_CREATE` /
+    /// `_DELETE`). Args: `*const SnapshotResult` carrying the
+    /// mode echo, error code, emitted count (for list), and
+    /// assigned id (for create). Appended at the end of
+    /// `CallTable` for the same back-compat reason as
+    /// `send_snapshot_entry`.
+    pub send_snapshot_result: unsafe extern "C" fn(*const SnapshotResult),
+
+    /// Request that the host fdatasync the named input device's
+    /// backing file. Args: `device_index` (must refer to a slot
+    /// opened RW via `open_chain_devices_rw`; the host stub
+    /// returns `false` for read-only or invalid slots). Returns
+    /// `true` on success.
+    ///
+    /// Mutating snapshot modes use this between the data-write
+    /// pass and the header-pointer flip to enforce qemu's
+    /// "old table still valid until header updated" durability
+    /// contract. Appended at the end of `CallTable` for the
+    /// same back-compat reason as `send_snapshot_result`.
+    pub fsync_input: unsafe extern "C" fn(u32) -> bool,
 }
 
 /// Backing format type for QCOW2 header extension
@@ -1250,8 +1282,11 @@ impl CallTable {
 
     /// Current ABI version (bumped: PLAN-map phase 2 appended
     /// `send_map_extent` and `send_map_result` to support the
-    /// streaming-emit shape map needs).
-    pub const VERSION: u32 = 16;
+    /// streaming-emit shape map needs; PLAN-snapshot phase 1
+    /// appended `send_snapshot_entry`, `send_snapshot_result`,
+    /// and `fsync_input` for the snapshot subcommand and its
+    /// durability checkpoints).
+    pub const VERSION: u32 = 17;
 }
 
 // ============================================================================
@@ -2545,6 +2580,229 @@ impl MapResult {
     pub const ERROR_HAS_BACKING: u32 = 3;
     /// I/O failure during walk.
     pub const ERROR_IO: u32 = 4;
+
+    /// True if magic matches.
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+}
+
+// ============================================================================
+// Snapshot configuration and result structures
+// ============================================================================
+
+/// Configuration for the snapshot operation.
+///
+/// Written to `OPERATION_CONFIG_ADDR` by the VMM before launching
+/// the snapshot guest binary. The guest reads this directly via
+/// `&*(OPERATION_CONFIG_ADDR as *const SnapshotConfig)`.
+///
+/// `mode` is the discriminator between list / apply / create /
+/// delete. `arg` carries the snapshot ID or name as UTF-8 bytes
+/// (no nul terminator); `arg_len` is the byte count actually used.
+/// For `MODE_LIST` the argument is unused and `arg_len` should be 0.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SnapshotConfig {
+    /// Magic (`0x534E4150` = "SNAP").
+    pub magic: u32,
+    /// Mode discriminator: one of `MODE_LIST`, `MODE_APPLY`,
+    /// `MODE_CREATE`, `MODE_DELETE`.
+    pub mode: u32,
+    /// Configuration flags: `FLAG_QUIET`, `FLAG_FORCE_SHARE`,
+    /// or `FLAG_VERBOSE` (bit 31). Other bits are reserved.
+    pub flags: u32,
+    /// Sector size for input I/O (typically 512 or 65536).
+    pub sector_size: u32,
+
+    /// Bytes used in `arg` (0..=255). `MODE_LIST` accepts 0.
+    pub arg_len: u32,
+    /// Padding so `arg` is 8-byte aligned within the struct.
+    pub _pad: u32,
+
+    /// Snapshot ID or name (UTF-8, no nul). For `-a` / `-d` this
+    /// is the ID or name to match. For `-c` this is the requested
+    /// snapshot name.
+    pub arg: [u8; 256],
+
+    /// Reserved padding for forward compat (image-opts descriptor,
+    /// chain-depth tag, etc.).
+    pub _reserved: [u8; 32],
+}
+
+impl SnapshotConfig {
+    /// Magic value for snapshot config.
+    pub const MAGIC: u32 = 0x534E4150; // "SNAP"
+
+    /// Mode: list snapshots (read-only).
+    pub const MODE_LIST: u32 = 0;
+    /// Mode: apply / "goto" the named snapshot.
+    pub const MODE_APPLY: u32 = 1;
+    /// Mode: create a snapshot with the given name.
+    pub const MODE_CREATE: u32 = 2;
+    /// Mode: delete the named snapshot.
+    pub const MODE_DELETE: u32 = 3;
+
+    /// Flag: suppress the success line on stdout (host-side `-q`).
+    pub const FLAG_QUIET: u32 = 1 << 0;
+    /// Flag: skip image-lock check (host-side `-U`; the guest
+    /// ignores this).
+    pub const FLAG_FORCE_SHARE: u32 = 1 << 1;
+    /// Flag: verbose guest logging. Matches the bit-31 convention
+    /// used by `MapConfig::FLAG_VERBOSE` and friends.
+    pub const FLAG_VERBOSE: u32 = 1 << 31;
+
+    /// True if magic matches.
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+}
+
+/// One snapshot record in the on-wire FFI representation.
+///
+/// Emitted once per snapshot during `MODE_LIST` via the
+/// `send_snapshot_entry` call-table function pointer, before the
+/// terminating `send_snapshot_result`. The host serialises the
+/// record into a protobuf `SnapshotEntryMessage` so the guest does
+/// not need to depend on the protobuf encoder.
+///
+/// `date_sec` is split into `date_sec_hi` and `date_sec_lo` to
+/// match the on-disk qcow2 snapshot-header layout (two big-endian
+/// u32s) and to avoid requiring a 64-bit aligned write on the FFI
+/// boundary.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SnapshotEntryRecord {
+    /// Magic (`0x534E4552` = "SNER").
+    pub magic: u32,
+    /// High 32 bits of the snapshot's `date_sec` (matches the
+    /// qcow2 on-disk split).
+    pub date_sec_hi: u32,
+    /// Low 32 bits of the snapshot's `date_sec`.
+    pub date_sec_lo: u32,
+    /// Subsecond component of the snapshot date (nanoseconds).
+    pub date_nsec: u32,
+
+    /// VM clock at snapshot creation (nanoseconds).
+    pub vm_clock_nsec: u64,
+    /// 64-bit VM state size (qcow2 v3 extra-data offset 0).
+    pub vm_state_size_large: u64,
+    /// Virtual disk size at snapshot creation (qcow2 v3
+    /// extra-data offset 8).
+    pub disk_size: u64,
+    /// qemu record/replay icount (qcow2 v3 extra-data offset 16).
+    /// `u64::MAX` sentinel for "absent" (matches qemu's
+    /// `qcow2_snapshot.icount = -1`).
+    pub icount: u64,
+
+    /// Host offset of the snapshot's L1 table.
+    pub l1_table_offset: u64,
+    /// Snapshot L1 size, in entries.
+    pub l1_size: u32,
+    /// Length of the source extra-data section, reported for
+    /// forward-compat diagnostics.
+    pub extra_data_size: u32,
+
+    /// Bytes used in `id`.
+    pub id_len: u32,
+    /// Bytes used in `name`.
+    pub name_len: u32,
+
+    /// Snapshot ID (qemu uses small decimal strings; 32 is
+    /// generous).
+    pub id: [u8; 32],
+    /// Snapshot tag/name (UTF-8, no nul).
+    pub name: [u8; 256],
+
+    /// Reserved padding for forward compat.
+    pub _reserved: [u8; 32],
+}
+
+impl SnapshotEntryRecord {
+    /// Magic value for snapshot entry record.
+    pub const MAGIC: u32 = 0x534E4552; // "SNER"
+
+    /// Sentinel indicating no icount is present on the source
+    /// snapshot (matches qemu's `qcow2_snapshot.icount = -1`).
+    pub const ICOUNT_ABSENT: u64 = u64::MAX;
+
+    /// True if magic matches.
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+}
+
+/// Result structure for the snapshot operation.
+///
+/// One per invocation, sent via the `send_snapshot_result` call-
+/// table function after every `send_snapshot_entry` (or as the
+/// only call for `MODE_APPLY` / `_CREATE` / `_DELETE`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SnapshotResult {
+    /// Magic (`0x534E5253` = "SNRS").
+    pub magic: u32,
+    /// Echo of the requested `SnapshotConfig.mode`.
+    pub mode: u32,
+    /// Error code: 0 = ok, non-zero mirrors `SnapshotResult::ERROR_*`.
+    pub error: u32,
+    /// Padding so `snapshots_emitted` lands at a 4-byte boundary
+    /// inside the struct.
+    pub _pad: u32,
+
+    /// Number of `send_snapshot_entry` calls the guest made
+    /// during this invocation (populated for `MODE_LIST`; zero
+    /// otherwise).
+    pub snapshots_emitted: u32,
+    /// Bytes used in `assigned_id` (populated for `MODE_CREATE`).
+    pub assigned_id_len: u32,
+    /// Auto-assigned snapshot ID returned by `MODE_CREATE`
+    /// (qemu uses decimal strings: "0", "1", ...). Empty
+    /// (`assigned_id_len == 0`) for the other modes.
+    pub assigned_id: [u8; 64],
+
+    /// Reserved padding for forward compat.
+    pub _reserved: [u8; 96],
+}
+
+impl SnapshotResult {
+    /// Magic value for snapshot result.
+    pub const MAGIC: u32 = 0x534E5253; // "SNRS"
+
+    /// Success.
+    pub const ERROR_OK: u32 = 0;
+    /// Source is not qcow2; `qemu-img snapshot` refuses all
+    /// non-qcow2 formats.
+    pub const ERROR_UNSUPPORTED_FORMAT: u32 = 1;
+    /// qcow2 image has compressed clusters, encryption, an
+    /// external data file, or bitmaps. Only the mutating modes
+    /// refuse; `MODE_LIST` still works.
+    pub const ERROR_UNSUPPORTED_FEATURE: u32 = 2;
+    /// `-a` or `-d` argument matches neither an ID nor a name.
+    pub const ERROR_NOT_FOUND: u32 = 3;
+    /// `-c` with a name that already exists in the snapshot
+    /// table.
+    pub const ERROR_DUPLICATE_NAME: u32 = 4;
+    /// A cluster's refcount would exceed `1 << refcount_bits`.
+    /// Caught by the phase 5 dry-run pass.
+    pub const ERROR_REFCOUNT_OVERFLOW: u32 = 5;
+    /// Refcount table is full and cannot grow within v1's
+    /// bounds.
+    pub const ERROR_ALLOCATION_FAILED: u32 = 6;
+    /// Would exceed the in-memory snapshot-table cap (phase 2
+    /// picks the value; qcow2 spec allows up to 65536).
+    pub const ERROR_SNAPSHOT_TABLE_FULL: u32 = 7;
+    /// Sector read or write failed at the call-table boundary.
+    pub const ERROR_IO: u32 = 8;
+    /// `-a` target's L1 is larger than the active L1 allocation
+    /// and growing would exceed the qcow2 spec cap.
+    pub const ERROR_L1_SIZE_MISMATCH: u32 = 9;
+    /// Name field in `SnapshotConfig.arg` is not valid UTF-8.
+    pub const ERROR_INVALID_UTF8: u32 = 10;
+    /// Magic / version mismatch in `SnapshotConfig`.
+    pub const ERROR_INVALID_CONFIG: u32 = 11;
+    /// qcow2 header / snapshot-table byte-level parse failed.
+    pub const ERROR_PARSE_FAILED: u32 = 12;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -4300,5 +4558,213 @@ mod tests {
         // verbosity so subsequent flags can extend from bit 0
         // upwards without colliding.
         assert_eq!(MapConfig::FLAG_VERBOSE, 1 << 31);
+    }
+
+    // ------------------------------------------------------------------
+    // SnapshotConfig / SnapshotEntryRecord / SnapshotResult tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn snapshot_magic_values_are_unique_among_existing_magics() {
+        // Cross-check the three new magic values against the
+        // existing set in the crate. If a future config struct
+        // accidentally picks the same magic, this assertion will
+        // surface the collision.
+        let snapshot_magics = [
+            SnapshotConfig::MAGIC,
+            SnapshotEntryRecord::MAGIC,
+            SnapshotResult::MAGIC,
+        ];
+        let existing = [
+            CallTable::MAGIC,
+            CopyConfig::MAGIC,
+            InfoConfig::MAGIC,
+            InfoResult::MAGIC,
+            CheckConfig::MAGIC,
+            CheckResult::MAGIC,
+            CompareConfig::MAGIC,
+            CompareResult::MAGIC,
+            ConvertConfig::MAGIC,
+            MeasureConfig::MAGIC,
+            MeasureResult::MAGIC,
+            CreateConfig::MAGIC,
+            CreateResult::MAGIC,
+            ResizeConfig::MAGIC,
+            ResizeResult::MAGIC,
+            RebaseConfig::MAGIC,
+            RebaseResult::MAGIC,
+            CommitConfig::MAGIC,
+            CommitResult::MAGIC,
+            ChainConfig::MAGIC,
+            MapConfig::MAGIC,
+            MapExtentRecord::MAGIC,
+            MapResult::MAGIC,
+        ];
+        // No new magic equals any existing magic.
+        for m in &snapshot_magics {
+            for e in &existing {
+                assert_ne!(*m, *e, "snapshot magic 0x{:08x} collides with existing", m);
+            }
+        }
+        // The three new magics are also mutually distinct.
+        assert_ne!(SnapshotConfig::MAGIC, SnapshotEntryRecord::MAGIC);
+        assert_ne!(SnapshotConfig::MAGIC, SnapshotResult::MAGIC);
+        assert_ne!(SnapshotEntryRecord::MAGIC, SnapshotResult::MAGIC);
+    }
+
+    #[test]
+    fn snapshot_magic_values_match_ascii() {
+        // The magics are intentionally readable as 4-byte ASCII
+        // for ease of debugging hex dumps. Pin the bytes.
+        assert_eq!(SnapshotConfig::MAGIC, 0x534E4150); // "SNAP"
+        assert_eq!(SnapshotEntryRecord::MAGIC, 0x534E4552); // "SNER"
+        assert_eq!(SnapshotResult::MAGIC, 0x534E5253); // "SNRS"
+    }
+
+    #[test]
+    fn snapshot_config_is_valid_accepts_magic_rejects_zero() {
+        let mut c = SnapshotConfig {
+            magic: SnapshotConfig::MAGIC,
+            mode: SnapshotConfig::MODE_LIST,
+            flags: 0,
+            sector_size: 65536,
+            arg_len: 0,
+            _pad: 0,
+            arg: [0; 256],
+            _reserved: [0; 32],
+        };
+        assert!(c.is_valid());
+        c.magic = 0;
+        assert!(!c.is_valid());
+        c.magic = 0xDEAD_BEEF;
+        assert!(!c.is_valid());
+    }
+
+    #[test]
+    fn snapshot_entry_record_is_valid_accepts_magic_rejects_zero() {
+        let mut r = SnapshotEntryRecord {
+            magic: SnapshotEntryRecord::MAGIC,
+            date_sec_hi: 0,
+            date_sec_lo: 0,
+            date_nsec: 0,
+            vm_clock_nsec: 0,
+            vm_state_size_large: 0,
+            disk_size: 0,
+            icount: SnapshotEntryRecord::ICOUNT_ABSENT,
+            l1_table_offset: 0,
+            l1_size: 0,
+            extra_data_size: 0,
+            id_len: 0,
+            name_len: 0,
+            id: [0; 32],
+            name: [0; 256],
+            _reserved: [0; 32],
+        };
+        assert!(r.is_valid());
+        r.magic = 0;
+        assert!(!r.is_valid());
+    }
+
+    #[test]
+    fn snapshot_result_is_valid_accepts_magic_rejects_zero() {
+        let mut r = SnapshotResult {
+            magic: SnapshotResult::MAGIC,
+            mode: SnapshotConfig::MODE_LIST,
+            error: SnapshotResult::ERROR_OK,
+            _pad: 0,
+            snapshots_emitted: 0,
+            assigned_id_len: 0,
+            assigned_id: [0; 64],
+            _reserved: [0; 96],
+        };
+        assert!(r.is_valid());
+        r.magic = 0;
+        assert!(!r.is_valid());
+    }
+
+    #[test]
+    fn snapshot_config_mode_codes_are_contiguous_from_zero() {
+        // The host renderer and the guest dispatcher both rely
+        // on mode codes being contiguous from 0 and mutually
+        // disjoint.
+        assert_eq!(SnapshotConfig::MODE_LIST, 0);
+        assert_eq!(SnapshotConfig::MODE_APPLY, 1);
+        assert_eq!(SnapshotConfig::MODE_CREATE, 2);
+        assert_eq!(SnapshotConfig::MODE_DELETE, 3);
+    }
+
+    #[test]
+    fn snapshot_config_flags_do_not_collide() {
+        // Bit 31 is reserved for FLAG_VERBOSE across configs.
+        assert_eq!(SnapshotConfig::FLAG_QUIET, 1 << 0);
+        assert_eq!(SnapshotConfig::FLAG_FORCE_SHARE, 1 << 1);
+        assert_eq!(SnapshotConfig::FLAG_VERBOSE, 1 << 31);
+        assert_ne!(SnapshotConfig::FLAG_QUIET, SnapshotConfig::FLAG_FORCE_SHARE);
+        assert_ne!(SnapshotConfig::FLAG_QUIET, SnapshotConfig::FLAG_VERBOSE);
+        assert_ne!(
+            SnapshotConfig::FLAG_FORCE_SHARE,
+            SnapshotConfig::FLAG_VERBOSE
+        );
+    }
+
+    #[test]
+    fn snapshot_result_error_codes_have_expected_values() {
+        // Pinned to keep the wire format stable across versions —
+        // protobuf transports these directly.
+        assert_eq!(SnapshotResult::ERROR_OK, 0);
+        assert_eq!(SnapshotResult::ERROR_UNSUPPORTED_FORMAT, 1);
+        assert_eq!(SnapshotResult::ERROR_UNSUPPORTED_FEATURE, 2);
+        assert_eq!(SnapshotResult::ERROR_NOT_FOUND, 3);
+        assert_eq!(SnapshotResult::ERROR_DUPLICATE_NAME, 4);
+        assert_eq!(SnapshotResult::ERROR_REFCOUNT_OVERFLOW, 5);
+        assert_eq!(SnapshotResult::ERROR_ALLOCATION_FAILED, 6);
+        assert_eq!(SnapshotResult::ERROR_SNAPSHOT_TABLE_FULL, 7);
+        assert_eq!(SnapshotResult::ERROR_IO, 8);
+        assert_eq!(SnapshotResult::ERROR_L1_SIZE_MISMATCH, 9);
+        assert_eq!(SnapshotResult::ERROR_INVALID_UTF8, 10);
+        assert_eq!(SnapshotResult::ERROR_INVALID_CONFIG, 11);
+        assert_eq!(SnapshotResult::ERROR_PARSE_FAILED, 12);
+    }
+
+    #[test]
+    fn snapshot_result_error_codes_are_mutually_distinct() {
+        let codes = [
+            SnapshotResult::ERROR_OK,
+            SnapshotResult::ERROR_UNSUPPORTED_FORMAT,
+            SnapshotResult::ERROR_UNSUPPORTED_FEATURE,
+            SnapshotResult::ERROR_NOT_FOUND,
+            SnapshotResult::ERROR_DUPLICATE_NAME,
+            SnapshotResult::ERROR_REFCOUNT_OVERFLOW,
+            SnapshotResult::ERROR_ALLOCATION_FAILED,
+            SnapshotResult::ERROR_SNAPSHOT_TABLE_FULL,
+            SnapshotResult::ERROR_IO,
+            SnapshotResult::ERROR_L1_SIZE_MISMATCH,
+            SnapshotResult::ERROR_INVALID_UTF8,
+            SnapshotResult::ERROR_INVALID_CONFIG,
+            SnapshotResult::ERROR_PARSE_FAILED,
+        ];
+        for (i, a) in codes.iter().enumerate() {
+            for (j, b) in codes.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "error codes at {} and {} collide", i, j);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_entry_record_icount_absent_sentinel() {
+        // The wire format reserves u64::MAX to mean "no icount
+        // was present in the source"; pin the value because the
+        // host-side renderer special-cases it.
+        assert_eq!(SnapshotEntryRecord::ICOUNT_ABSENT, u64::MAX);
+    }
+
+    #[test]
+    fn call_table_version_is_seventeen() {
+        // PLAN-snapshot phase 1 bumps the call-table ABI from
+        // 16 to 17 by appending `send_snapshot_entry`,
+        // `send_snapshot_result`, and `fsync_input`.
+        assert_eq!(CallTable::VERSION, 17);
     }
 }

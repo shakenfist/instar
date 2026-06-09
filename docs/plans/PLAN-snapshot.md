@@ -317,6 +317,11 @@ at end-of-stream.
 
 ### Call-table and protobuf changes
 
+Phase 1 landed the structs with magics `0x534E4150` ("SNAP"),
+`0x534E4552` ("SNER"), and `0x534E5253` ("SNRS"); the
+`CallTable::VERSION` bumped from 16 to 17 to cover the three
+new function pointers appended at the end.
+
 - New `SnapshotConfig` in `src/shared/src/lib.rs` next to
   `MapConfig`, with magic `SNAP`:
   ```rust
@@ -377,7 +382,7 @@ at end-of-stream.
   ```
 - `GuestMessage` oneof additions: `SnapshotEntryMessage` as
   field 17, `SnapshotResultMessage` as field 18.
-- Two new `CallTable` function pointers (appended at the end,
+- Three new `CallTable` function pointers (appended at the end,
   per the back-compat convention):
   - `send_snapshot_entry: unsafe extern "C" fn(*const
     SnapshotEntryRecord)` — host-side stub serialises the
@@ -389,6 +394,9 @@ at end-of-stream.
     SnapshotResult)` — same pattern as `send_resize_result`,
     `send_rebase_result`, `send_commit_result`,
     `send_map_result`.
+  - `fsync_input: unsafe extern "C" fn(u32) -> bool` — see
+    open question 10 below; phase 1 added the guest virtio
+    flush path.
 
 ### Refcount management — the hard part
 
@@ -838,18 +846,16 @@ qemu-img.
 10. **Atomicity of snapshot-table rewrite**: qemu's
     `qcow2_write_snapshots` allocates new cluster(s), writes
     the table, fdatasyncs, updates header, fdatasyncs, frees
-    old. The guest doesn't have `fdatasync` — every
-    `write_input_sector` call goes through `pwrite()` on the
-    host, which is durable on `fsync` of the host FD. We
-    rely on the host VMM doing `fsync` before exiting the
-    guest. Confirm host-side: `flush_input_sector` doesn't
-    exist; we need to add an `fsync_input` call-table
-    primitive, or rely on the host's process-exit fsync.
-    Recommendation: **add `fsync_input(device_idx)` in
-    phase 1** as a call-table extension. Snapshot, commit,
-    and future writers benefit. (commit currently relies on
-    process-exit fsync; this is technically a latent
-    durability bug we'd fix here.)
+    old. **Resolved in phase 1**: step 1f added the guest-side
+    virtio `flush()` path that issues `VIRTIO_BLK_T_FLUSH`,
+    exposed through the new `fsync_input(u32) -> bool` call-
+    table pointer. The host-side FLUSH handler already existed
+    in `src/vmm/src/virtio/block.rs:428`, which calls
+    `self.backing.sync()` (`File::sync_all()` on the host FD).
+    Snapshot, commit, and future writers benefit. (commit
+    currently relies on process-exit fsync; switching it to
+    use `fsync_input` at the appropriate checkpoint is the
+    deferred follow-up tracked in "Future work".)
 
 11. **Cluster-allocation strategy**: When allocating a new
     cluster for the snapshot's L1 or for a new snapshot
