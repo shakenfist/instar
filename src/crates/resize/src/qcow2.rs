@@ -1892,59 +1892,29 @@ fn block_offset_in_file(refcount_table_bytes: &[u8], idx: u64) -> Result<u64, Re
     Ok(entry)
 }
 
-/// Set the entry at index `local_idx` within a refcount block to
-/// `value` (currently only 0 or 1 are used). Handles every
+/// Set the entry at index `local_idx` within a refcount block
+/// to `value` (currently only 0 or 1 are used). Handles every
 /// permitted refcount width.
+///
+/// **Phase 5 of PLAN-snapshot lifted the bit-level body** into
+/// the new `snapshot` crate as `set_refcount_in_block`. This
+/// thin wrapper keeps the resize-side signature
+/// (`refcount_bits: u8`, [`ResizeError`] return type) so the
+/// 14 existing call sites compile unchanged. The new home is
+/// authoritative; do not edit the bit-level logic here.
 fn set_refcount(
     block: &mut [u8],
     local_idx: u64,
     refcount_bits: u8,
     value: u64,
 ) -> Result<(), ResizeError> {
-    match refcount_bits {
-        1 => {
-            let byte = (local_idx / 8) as usize;
-            let bit = 7 - (local_idx % 8) as u32;
-            if value == 0 {
-                block[byte] &= !(1 << bit);
-            } else {
-                block[byte] |= 1 << bit;
-            }
-        }
-        2 => {
-            let byte = (local_idx / 4) as usize;
-            let shift = 6 - 2 * (local_idx % 4) as u32;
-            let mask = 0b11u8 << shift;
-            block[byte] = (block[byte] & !mask) | (((value as u8) & 0b11) << shift);
-        }
-        4 => {
-            let byte = (local_idx / 2) as usize;
-            let shift = if local_idx.is_multiple_of(2) { 4 } else { 0 };
-            let mask = 0b1111u8 << shift;
-            block[byte] = (block[byte] & !mask) | (((value as u8) & 0b1111) << shift);
-        }
-        8 => {
-            let byte = local_idx as usize;
-            block[byte] = value as u8;
-        }
-        16 => {
-            let off = (local_idx as usize) * 2;
-            block[off] = (value >> 8) as u8;
-            block[off + 1] = value as u8;
-        }
-        32 => {
-            let off = (local_idx as usize) * 4;
-            for i in 0..4 {
-                block[off + i] = (value >> ((3 - i) * 8)) as u8;
-            }
-        }
-        64 => {
-            let off = (local_idx as usize) * 8;
-            write_be_u64(block, off, value);
-        }
-        _ => return Err(ResizeError::InvalidNewVirtualSize),
-    }
-    Ok(())
+    // The new home returns a richer `SnapshotError`; resize
+    // pre-lift returned `InvalidNewVirtualSize` for any failure
+    // mode (only unsupported widths could fail in practice).
+    // Collapse all snapshot errors to that same code so the 14
+    // call sites observe identical behaviour.
+    snapshot::qcow2::set_refcount_in_block(block, local_idx, refcount_bits as u32, value)
+        .map_err(|_| ResizeError::InvalidNewVirtualSize)
 }
 
 #[cfg(test)]

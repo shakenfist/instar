@@ -136,6 +136,52 @@ because the parser is unaware of the active header.
 `icount == u64::MAX` matches qemu's `qcow2_snapshot.icount = -1`
 and the `SnapshotEntryRecord::ICOUNT_ABSENT` constant.
 
+## Mutator surface
+
+The mutating snapshot operations (`-c` / `-d` / `-a`) compose
+their per-mode patch lists from pure mutator primitives in the
+`src/crates/snapshot/` crate (parallel to `commit` and `rebase`;
+landed in PLAN-snapshot phase 5). The crate is `no_std`, depends
+only on `qcow2` for type / constant access, and operates on
+caller-staged byte slices without any I/O.
+
+- **`read_refcount_in_block`** / **`set_refcount_in_block`** —
+  scalar accessors for every spec-permitted refcount width
+  (1, 2, 4, 8, 16, 32, 64). The setter was lifted from
+  `resize::qcow2::set_refcount`; resize calls it through a
+  thin wrapper.
+- **`check_refcount_after_addend`** — overflow-safe arithmetic
+  used by the two-pass refcount mutator's dry-run pass.
+- **`alloc_cluster_in_refblocks`** — cursor-driven linear scan
+  over staged refcount blocks. Claims the first zero entry and
+  returns its host byte offset. v1 supports 16-bit refcounts
+  only.
+- **`rewrite_l1_entry_copied_flag`** / **`rewrite_l2_entry_copied_flag`** —
+  set or clear `OFLAG_COPIED` on one L1 / L2 entry. The L2
+  helper handles both standard (8-byte stride) and extended-L2
+  (16-byte stride; subcluster bitmap untouched) layouts.
+- **`for_each_cluster_in_l1`** — visitor that walks the
+  L1 -> L2 chain and yields one `L1ClusterRef` per allocated
+  cluster (Standard or Compressed); unallocated L1 and L2
+  entries are skipped.
+- **`update_snapshot_refcount`** — two-pass composed mutator.
+  Pass 1 walks the relevant L1(s) and runs
+  `check_refcount_after_addend` for every cluster; on the first
+  overflow it returns `RefcountOverflow { at_host_offset }`
+  *before* mutating any refblock. Pass 2 walks again and applies
+  the new refcounts via `set_refcount_in_block`. Handles
+  `IncrementForCreate`, `DecrementForDelete`, and
+  `SwapForApply { from_l1, to_l1 }`.
+- **`update_copied_flags_for_l1`** — walks the L1, rewriting the
+  `OFLAG_COPIED` flag on each L1 and L2 entry based on the
+  cluster's current refcount (set when refcount==1, clear
+  otherwise). Returns the number of entries rewritten.
+
+The crate does not emit `SnapshotPatch` entries itself: phases
+6-8 (create / delete / apply planners) translate the mutated
+slice state into patches via the `SnapshotPatch` / `SnapshotPlan`
+types declared in the crate root.
+
 ## Snapshot L1 Table
 
 Each snapshot has its own L1 table, independent of the "active" L1 table.

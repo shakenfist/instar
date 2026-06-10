@@ -780,16 +780,18 @@ qemu-img.
    `docs/quirks.md`. Resolved.
 
 3. **New `src/crates/snapshot/` crate, or extend
-   `src/crates/qcow2/`?** Recommendation: **extend
-   `src/crates/qcow2/`**. The mutators are intimately tied
-   to qcow2 metadata layout; carving out a separate crate
-   would require either re-exposing qcow2 internals or
-   duplicating type definitions. Compare with `create` which
-   has its own crate (because it's format-agnostic and
-   serves five formats) vs. `qcow2-create` would have been
-   wrong; the mirror reasoning applies here in reverse:
-   `qcow2` is the natural home. Confirm during phase 1
-   review.
+   `src/crates/qcow2/`?** **Resolved in phase 5**: new
+   `src/crates/snapshot/` crate, parallel to `commit` and
+   `rebase`. The original recommendation to extend `qcow2`
+   was overturned because the project's actual convention
+   (commit / rebase / resize / measure / create) is one
+   crate per mutating operation; the qcow2 crate stays
+   read-mostly. The phase also lifts `set_refcount` from
+   `resize::qcow2` into the new crate as
+   `snapshot::qcow2::set_refcount_in_block`; resize keeps
+   its 14 existing call sites working through a thin
+   wrapper. See PLAN-snapshot-phase-05-refcount-planners.md
+   for the full rationale.
 
 4. **`SnapshotResult` struct vs protobuf-only?** Every
    other mutating operation has a `*Result` struct in
@@ -844,10 +846,16 @@ qemu-img.
    already at the max (extremely rare but possible in
    contrived images and definitely possible in fuzz inputs).
    Aborting halfway leaves the image inconsistent.
-   Recommendation: **two-pass for `-c` and `-a` — walk first,
-   check all refcounts will be ≤ max; then walk again and
-   apply.** `-d` cannot overflow (decrement only). Phase
-   plans capture this.
+   **Resolved in phase 5**:
+   `snapshot::qcow2::update_snapshot_refcount` implements a
+   two-pass mutator. Pass 1 walks the relevant L1(s) using
+   `read_refcount_in_block` and `check_refcount_after_addend`,
+   returning `RefcountOverflow { at_host_offset }` on the
+   first overflow *without* touching the refblocks buffer.
+   Pass 2 walks again and applies via `set_refcount_in_block`.
+   `-d` paths still go through the dry-run (with addend `-1`)
+   for symmetry — the underflow check catches caller
+   bookkeeping bugs early.
 
 9. **`-a` after a chain of `-c`s that referenced
    different cluster sets**: instar's refcount management
@@ -889,7 +897,7 @@ qemu-img.
 | 2. Snapshot-table parser extension and list-mode planner: `for_each_snapshot_entry` streaming primitive + extra-data fallback + planner converter (`snapshot_entry_to_record`); `find_snapshot_streaming`; extended `SnapshotEntry` with v3 fields; ~14 new qcow2 unit tests | PLAN-snapshot-phase-02-list-planner.md | Landed |
 | 3. Guest binary scaffolding + list mode (`src/operations/snapshot/`): config read, format check, dispatch, MODE_LIST emit loop | PLAN-snapshot-phase-03-list-guest.md | Not started |
 | 4. Host CLI for list mode (`run_snapshot`, clap surface, human + JSON renderer, `qemu-img snapshot -l` byte-exact output) | PLAN-snapshot-phase-04-list-host.md | Not started |
-| 5. Refcount mutators (planner crate): `update_snapshot_refcount`, `alloc_cluster_for_snapshot`, `free_cluster`, `update_copied_flags_for_l1`, two-pass overflow check. Pure planner; unit tests with synthetic images | PLAN-snapshot-phase-05-refcount-planners.md | Not started |
+| 5. Refcount mutators (planner crate): `update_snapshot_refcount`, `alloc_cluster_in_refblocks`, `set_refcount_in_block` (lifted from resize), `update_copied_flags_for_l1`, two-pass overflow check. New `src/crates/snapshot/` crate parallel to commit/rebase; ~60 unit tests | PLAN-snapshot-phase-05-refcount-planners.md | Landed |
 | 6. Snapshot create planner + guest binary (MODE_CREATE) | PLAN-snapshot-phase-06-create.md | Not started |
 | 7. Snapshot delete planner + guest binary (MODE_DELETE) | PLAN-snapshot-phase-07-delete.md | Not started |
 | 8. Snapshot apply planner + guest binary (MODE_APPLY) | PLAN-snapshot-phase-08-apply.md | Not started |
