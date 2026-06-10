@@ -258,6 +258,21 @@ After phase 4 lands:
      `,\n` separator (parallel to `MapRenderer`).
 
 5. `qemu-img snapshot -l` byte-exact human format:
+   - **Correction (phase 4 implementation):** the format below
+     describes the qemu v3–v5 layout (`VM SIZE` / `VM CLOCK` with
+     spaces; widths 7/16/7/20/13/15; conditional `sn->date_sec ?
+     " " : ""` separator; 2-digit hours in the clock). The
+     installed qemu-img is **10.0.8**, whose
+     `dump_one_snapshot` emits `VM_SIZE` / `VM_CLOCK` (underscores)
+     with widths 7/16/**8**/**19**/15/**10**, a uniform single-
+     space separator (no `sn->date_sec` quirk), 4-digit hours in
+     the clock (`0000:00:00.000`), and `"--"` for absent
+     `icount`. The phase 4 implementation matches v10. The text
+     below is left as the historical record of the wrong-and-
+     corrected exchange. The matching `_reserved` width in
+     `SnapshotConfig` is also corrected from `[u8; 40]` (320
+     bytes total) to `[u8; 32]` (312 bytes total), per
+     `src/shared/src/lib.rs`.
    - Header: `qemu_printf("%-7s %-16s %7s %20s %13s %15s",
      "ID", "TAG", "VM SIZE", "DATE", "VM CLOCK", "ICOUNT")`
      plus `\n`. Note column titles are `VM SIZE`, `VM CLOCK`

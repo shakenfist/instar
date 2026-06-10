@@ -1433,6 +1433,36 @@ provides this data" mode (see
 plans/PLAN-rebase-commit-phase-08-commit-host.md)) can
 plug in without an ABI change.
 
+## snapshot subcommand quirks
+
+### `DATE` column is rendered in local time
+
+`instar snapshot -l` formats the `DATE` column using the host's
+local timezone, matching `qemu-img snapshot -l`'s behaviour
+(both use `strftime("%Y-%m-%d %H:%M:%S", localtime(&date_sec))`).
+For deterministic output (CI runs, cross-version baselines, byte-
+exact diff harnesses), set `TZ=UTC` in the environment before
+invoking either tool. Without `TZ=UTC` the rendered date depends
+on the operator's locale and the two tools' output will only
+match when they're invoked under the same TZ.
+
+The `--output=json` form is an instar extension; its `date`
+object reports the raw `seconds` since the Unix epoch alongside
+the `nanoseconds` subsecond component, so JSON consumers do not
+need to round-trip the human-readable column to recover the
+underlying timestamp.
+
+### `vm_state_size == 0` renders as `0 B`
+
+qemu's `qemu-img snapshot -l` uses `size_to_str()` for the
+`VM_SIZE` column, which emits the literal string `"0 B"` for a
+zero `vm_state_size`. The shared `format_size_human(_, qemu_compat
+= true)` helper used elsewhere in instar (e.g. `instar info`)
+returns the bare string `"0"` for zero bytes, matching qemu-img's
+**info** output. The snapshot renderer therefore wraps the helper
+with a `0`-byte short-circuit so the `VM_SIZE` column matches the
+qemu-img snapshot dump rather than the qemu-img info dump.
+
 ## Future Additions
 
 Additional quirks will be documented here as they are discovered during
