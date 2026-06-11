@@ -2625,9 +2625,24 @@ pub struct SnapshotConfig {
     /// snapshot name.
     pub arg: [u8; 256],
 
+    /// Host wall-clock seconds since the UNIX epoch at the moment
+    /// of invocation. Written by the host for `MODE_CREATE`; stored
+    /// verbatim in the new snapshot's on-disk `date_sec` field. Zero
+    /// for every other mode (the guest has no clock). Truncated to a
+    /// `u32` to match the qcow2 on-disk field width (qemu wraps in
+    /// 2106 too).
+    pub date_sec: u32,
+    /// Host wall-clock sub-second component (nanoseconds) at the
+    /// moment of invocation. Stored verbatim in the new snapshot's
+    /// on-disk `date_nsec` field for `MODE_CREATE`; zero otherwise.
+    /// The host truncates this to microsecond precision
+    /// (`usec * 1000`) so it matches `qemu-img`'s
+    /// `tv_usec * 1000` byte-for-byte.
+    pub date_nsec: u32,
+
     /// Reserved padding for forward compat (image-opts descriptor,
     /// chain-depth tag, etc.).
-    pub _reserved: [u8; 32],
+    pub _reserved: [u8; 24],
 }
 
 impl SnapshotConfig {
@@ -4622,6 +4637,33 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_config_layout_is_pinned() {
+        // The host writes this struct field-by-field at fixed
+        // offsets in the VMM (`run_snapshot_create` /
+        // `run_snapshot_list`), so every offset and the total size
+        // is load-bearing. PLAN-snapshot phase 6a carved
+        // `date_sec` / `date_nsec` from the front of the old
+        // `_reserved: [u8; 32]` without moving any pre-existing
+        // field: total size, `arg` offset, and all earlier offsets
+        // are unchanged.
+        use core::mem::offset_of;
+        assert_eq!(core::mem::size_of::<SnapshotConfig>(), 312);
+        assert_eq!(offset_of!(SnapshotConfig, magic), 0);
+        assert_eq!(offset_of!(SnapshotConfig, mode), 4);
+        assert_eq!(offset_of!(SnapshotConfig, flags), 8);
+        assert_eq!(offset_of!(SnapshotConfig, sector_size), 12);
+        assert_eq!(offset_of!(SnapshotConfig, arg_len), 16);
+        assert_eq!(offset_of!(SnapshotConfig, _pad), 20);
+        assert_eq!(offset_of!(SnapshotConfig, arg), 24);
+        // New date fields land in the space the old 32-byte
+        // `_reserved` used to occupy; the residual reserve shrinks
+        // to 24 bytes so the total size is unchanged.
+        assert_eq!(offset_of!(SnapshotConfig, date_sec), 280);
+        assert_eq!(offset_of!(SnapshotConfig, date_nsec), 284);
+        assert_eq!(offset_of!(SnapshotConfig, _reserved), 288);
+    }
+
+    #[test]
     fn snapshot_config_is_valid_accepts_magic_rejects_zero() {
         let mut c = SnapshotConfig {
             magic: SnapshotConfig::MAGIC,
@@ -4631,7 +4673,9 @@ mod tests {
             arg_len: 0,
             _pad: 0,
             arg: [0; 256],
-            _reserved: [0; 32],
+            date_sec: 0,
+            date_nsec: 0,
+            _reserved: [0; 24],
         };
         assert!(c.is_valid());
         c.magic = 0;

@@ -276,22 +276,9 @@ pub struct AllocCursor {
 /// Allocate a single fresh cluster from the staged refcount
 /// blocks.
 ///
-/// Pure function: scans the concatenated `blocks` byte buffer
-/// starting from `cursor.next_refblock` /
-/// `cursor.next_entry_in_refblock`, finds the next entry whose
-/// refcount is zero, bumps it to one, advances the cursor, and
-/// returns the cluster's host byte offset
-/// (`host_refblocks_start` is added so callers can describe a
-/// virtual offset basis independent of where the refblocks
-/// physically live).
-///
-/// v1 supports `refcount_bits == 16` only (matches the sister
-/// `commit` crate's allocator scope). Other widths return
-/// [`SnapshotError::Unsupported`].
-///
-/// Returns [`SnapshotError::RefcountExhausted`] if every
-/// existing entry is non-zero. Refcount-table growth is a
-/// separate concern (see open question 7 in the phase plan).
+/// Thin wrapper over [`alloc_contiguous_clusters_in_refblocks`]
+/// with `count == 1`. See that function for the scan / cursor
+/// semantics and the `refcount_bits == 16` v1 restriction.
 pub fn alloc_cluster_in_refblocks(
     blocks: &mut [u8],
     cluster_size: u64,
@@ -300,18 +287,77 @@ pub fn alloc_cluster_in_refblocks(
     host_refblocks_start: u64,
     cursor: &mut AllocCursor,
 ) -> Result<u64, SnapshotError> {
+    alloc_contiguous_clusters_in_refblocks(
+        blocks,
+        cluster_size,
+        refcount_bits,
+        refblock_count,
+        host_refblocks_start,
+        1,
+        cursor,
+    )
+}
+
+/// Allocate `count` *consecutive* fresh clusters from the staged
+/// refcount blocks (first-fit) and return the host byte offset of
+/// the first.
+///
+/// Pure function: scans the concatenated `blocks` byte buffer
+/// starting from `cursor.next_refblock` /
+/// `cursor.next_entry_in_refblock` for the first run of `count`
+/// consecutive cluster indices whose refcounts are all zero. The
+/// run is allowed to span refblock boundaries (refblock coverage
+/// is contiguous over consecutive cluster indices). Every claimed
+/// entry is set to 1; the cursor is advanced past the run.
+/// `host_refblocks_start` is added to the first cluster's index ×
+/// `cluster_size` so callers can describe a virtual offset basis
+/// independent of where the refblocks physically live.
+///
+/// `count == 0` is rejected as [`SnapshotError::InvalidConfig`]
+/// (a zero-cluster allocation has no host offset to return; the
+/// MODE_CREATE caller handles the `l1_size == 0` case separately).
+///
+/// v1 supports `refcount_bits == 16` only (matches the sister
+/// `commit` crate's allocator scope). Other widths return
+/// [`SnapshotError::Unsupported`].
+///
+/// Returns [`SnapshotError::RefcountExhausted`] if no run of
+/// `count` consecutive free clusters exists. Refcount-table growth
+/// is a separate concern (see open question 7 in the phase plan).
+pub fn alloc_contiguous_clusters_in_refblocks(
+    blocks: &mut [u8],
+    cluster_size: u64,
+    refcount_bits: u32,
+    refblock_count: u64,
+    host_refblocks_start: u64,
+    count: u64,
+    cursor: &mut AllocCursor,
+) -> Result<u64, SnapshotError> {
     if refcount_bits != 16 {
         return Err(SnapshotError::Unsupported);
     }
     if cluster_size == 0 {
         return Err(SnapshotError::InvalidConfig);
     }
+    if count == 0 {
+        return Err(SnapshotError::InvalidConfig);
+    }
     let entries_per_refblock = (cluster_size * 8) / refcount_bits as u64;
+    if entries_per_refblock == 0 {
+        return Err(SnapshotError::InvalidConfig);
+    }
     let bytes_per_refblock = cluster_size as usize;
+    let total_entries = refblock_count
+        .checked_mul(entries_per_refblock)
+        .ok_or(SnapshotError::ParseFailed)?;
 
-    while cursor.next_refblock < refblock_count {
-        let refblock_idx = cursor.next_refblock as usize;
-        let refblock_byte_off = refblock_idx
+    // Linear index over the flattened cluster space, resuming from
+    // the cursor. `read_entry` maps a flat cluster index to its
+    // refcount within `blocks` (bounds-checked).
+    let read_entry = |blocks: &[u8], cluster_index: u64| -> Result<u64, SnapshotError> {
+        let refblock_idx = cluster_index / entries_per_refblock;
+        let entry_idx = cluster_index % entries_per_refblock;
+        let refblock_byte_off = (refblock_idx as usize)
             .checked_mul(bytes_per_refblock)
             .ok_or(SnapshotError::ParseFailed)?;
         let refblock_end = refblock_byte_off
@@ -320,33 +366,52 @@ pub fn alloc_cluster_in_refblocks(
         if refblock_end > blocks.len() {
             return Err(SnapshotError::MisalignedAccess);
         }
-        let refblock = &mut blocks[refblock_byte_off..refblock_end];
+        read_refcount_in_block(
+            &blocks[refblock_byte_off..refblock_end],
+            entry_idx,
+            refcount_bits,
+        )
+    };
 
-        while cursor.next_entry_in_refblock < entries_per_refblock {
-            let entry_idx = cursor.next_entry_in_refblock;
-            let raw = read_refcount_in_block(refblock, entry_idx, refcount_bits)?;
-            if raw == 0 {
-                set_refcount_in_block(refblock, entry_idx, refcount_bits, 1)?;
+    let mut start = cursor
+        .next_refblock
+        .checked_mul(entries_per_refblock)
+        .and_then(|v| v.checked_add(cursor.next_entry_in_refblock))
+        .ok_or(SnapshotError::ParseFailed)?;
 
-                let cluster_index = cursor
-                    .next_refblock
-                    .checked_mul(entries_per_refblock)
-                    .and_then(|v| v.checked_add(entry_idx))
-                    .ok_or(SnapshotError::ParseFailed)?;
-                let host_offset = cluster_index
-                    .checked_mul(cluster_size)
-                    .and_then(|v| v.checked_add(host_refblocks_start))
-                    .ok_or(SnapshotError::ParseFailed)?;
-
-                cursor.next_entry_in_refblock = entry_idx + 1;
-                cursor.allocated += 1;
-                return Ok(host_offset);
+    while start + count <= total_entries {
+        // Scan `count` consecutive entries from `start`.
+        let mut all_free = true;
+        let mut probe = start;
+        while probe < start + count {
+            if read_entry(blocks, probe)? != 0 {
+                all_free = false;
+                break;
             }
-            cursor.next_entry_in_refblock += 1;
+            probe += 1;
         }
-
-        cursor.next_refblock += 1;
-        cursor.next_entry_in_refblock = 0;
+        if all_free {
+            // Claim every entry in the run.
+            for cluster_index in start..start + count {
+                let refblock_idx = cluster_index / entries_per_refblock;
+                let entry_idx = cluster_index % entries_per_refblock;
+                let refblock_byte_off = (refblock_idx as usize) * bytes_per_refblock;
+                let refblock =
+                    &mut blocks[refblock_byte_off..refblock_byte_off + bytes_per_refblock];
+                set_refcount_in_block(refblock, entry_idx, refcount_bits, 1)?;
+            }
+            let next = start + count;
+            cursor.next_refblock = next / entries_per_refblock;
+            cursor.next_entry_in_refblock = next % entries_per_refblock;
+            cursor.allocated += count;
+            let host_offset = start
+                .checked_mul(cluster_size)
+                .and_then(|v| v.checked_add(host_refblocks_start))
+                .ok_or(SnapshotError::ParseFailed)?;
+            return Ok(host_offset);
+        }
+        // Resume scanning just past the occupied entry at `probe`.
+        start = probe + 1;
     }
 
     Err(SnapshotError::RefcountExhausted)
@@ -648,10 +713,30 @@ pub enum SnapshotRefcountOp<'a> {
 /// **Pass 2 (apply)** walks the same L1(s) again and applies
 /// each new value via [`set_refcount_in_block`].
 ///
+/// **L2-table coverage.** Both passes adjust the refcount of
+/// every reachable *data* cluster **and** of each **L2 table
+/// cluster** — once per non-zero L1 entry, after that entry's L2
+/// data clusters, exactly as qemu's
+/// `qcow2_update_snapshot_refcount` in `block/qcow2-refcount.c`
+/// does (qemu calls `qcow2_update_cluster_refcount(l2_offset >>
+/// cluster_bits, ...)` once per L1 entry). The L2-table bump is
+/// mandatory for create: after a create the active L1 and the
+/// snapshot's L1 copy share the same physical L2 tables, so the
+/// L2 cluster's refcount must reach 2 for a later guest write to
+/// trigger the L2 COW instead of silently mutating the
+/// snapshot's L2 in place.
+///
+/// **L1-cluster exclusion.** Neither pass touches the L1 table's
+/// own clusters — qemu's function doesn't either; the *caller*
+/// owns L1-cluster refcounts (create allocates the snapshot's L1
+/// copy at refcount 1; delete frees the snapshot's L1
+/// explicitly).
+///
 /// `l2_for_index` returns the staged L2 bytes for a given L1
 /// index; `refblock_byte_offset_for_cluster` maps a cluster's
 /// host offset to `(refblock_byte_offset_within_blocks,
-/// entry_local_idx)`.
+/// entry_local_idx)` — it is called for L2-table clusters with
+/// the same mapping as for data clusters.
 pub fn update_snapshot_refcount<'l2, L2F, RBF>(
     op: SnapshotRefcountOp<'_>,
     refblocks: &mut [u8],
@@ -864,6 +949,36 @@ where
                 Err(e) => return Err(e),
             }
         }
+
+        // The L2 table cluster itself. qemu's
+        // `qcow2_update_snapshot_refcount` adjusts the L2 table
+        // cluster's refcount once per non-zero L1 entry (it calls
+        // `qcow2_update_cluster_refcount(l2_offset >> cluster_bits,
+        // ...)` after the per-entry loop). Check it for overflow
+        // here so the dry-run aborts before any mutation if the L2
+        // table cluster is already at the refcount cap.
+        let l2_table_offset = raw & L1_OFFSET_MASK;
+        let (rb_off, local_idx) = match refblock_byte_offset_for_cluster(l2_table_offset) {
+            Some(t) => t,
+            None => return Err(SnapshotError::MisalignedAccess),
+        };
+        let end = rb_off
+            .checked_add(bytes_per_refblock)
+            .ok_or(SnapshotError::MisalignedAccess)?;
+        if end > refblocks.len() {
+            return Err(SnapshotError::MisalignedAccess);
+        }
+        let refblock = &refblocks[rb_off..end];
+        let current = read_refcount_in_block(refblock, local_idx, refcount_bits)?;
+        match check_refcount_after_addend(current, addend, refcount_bits) {
+            Ok(_) => {}
+            Err(SnapshotError::RefcountOverflow { .. }) => {
+                return Err(SnapshotError::RefcountOverflow {
+                    at_host_offset: l2_table_offset,
+                });
+            }
+            Err(e) => return Err(e),
+        }
     }
     Ok(())
 }
@@ -957,6 +1072,26 @@ where
             let new_val = check_refcount_after_addend(current, addend, refcount_bits)?;
             set_refcount_in_block(refblock, local_idx, refcount_bits, new_val)?;
         }
+
+        // The L2 table cluster itself — bumped once per non-zero
+        // L1 entry, matching qemu's `qcow2_update_snapshot_refcount`
+        // (see the dry-run pass for the qemu cross-reference). The
+        // dry-run already validated this cluster's overflow.
+        let l2_table_offset = raw & L1_OFFSET_MASK;
+        let (rb_off, local_idx) = match refblock_byte_offset_for_cluster(l2_table_offset) {
+            Some(t) => t,
+            None => return Err(SnapshotError::MisalignedAccess),
+        };
+        let end = rb_off
+            .checked_add(bytes_per_refblock)
+            .ok_or(SnapshotError::MisalignedAccess)?;
+        if end > refblocks.len() {
+            return Err(SnapshotError::MisalignedAccess);
+        }
+        let refblock = &mut refblocks[rb_off..end];
+        let current = read_refcount_in_block(refblock, local_idx, refcount_bits)?;
+        let new_val = check_refcount_after_addend(current, addend, refcount_bits)?;
+        set_refcount_in_block(refblock, local_idx, refcount_bits, new_val)?;
     }
     Ok(())
 }
@@ -1439,6 +1574,141 @@ mod tests {
         );
     }
 
+    // ---------------- alloc_contiguous_clusters_in_refblocks ----------------
+
+    #[test]
+    fn alloc_contiguous_happy_path() {
+        // One refblock, all free; ask for 3 consecutive clusters.
+        let mut blocks = [0u8; 512];
+        let mut cursor = AllocCursor::default();
+        let off =
+            alloc_contiguous_clusters_in_refblocks(&mut blocks, 512, 16, 1, 0, 3, &mut cursor)
+                .unwrap();
+        assert_eq!(off, 0);
+        // Entries 0, 1, 2 all set to 1.
+        assert_eq!(read_refcount_in_block(&blocks, 0, 16).unwrap(), 1);
+        assert_eq!(read_refcount_in_block(&blocks, 1, 16).unwrap(), 1);
+        assert_eq!(read_refcount_in_block(&blocks, 2, 16).unwrap(), 1);
+        // Entry 3 still free.
+        assert_eq!(read_refcount_in_block(&blocks, 3, 16).unwrap(), 0);
+        assert_eq!(cursor.allocated, 3);
+        assert_eq!(cursor.next_entry_in_refblock, 3);
+    }
+
+    #[test]
+    fn alloc_contiguous_spans_refblock_boundary() {
+        // Two 512-byte refblocks. entries_per_refblock = 256.
+        // Occupy the last entry of refblock 0 (entry 255) so a
+        // 3-cluster run can't fit ending in block 0; the run lands
+        // at the start of block 1.
+        let mut blocks = [0u8; 1024];
+        // Fill block 0 entirely so first-fit must move to block 1.
+        for b in blocks.iter_mut().take(512) {
+            *b = 0xff;
+        }
+        let mut cursor = AllocCursor::default();
+        let off =
+            alloc_contiguous_clusters_in_refblocks(&mut blocks, 512, 16, 2, 0, 3, &mut cursor)
+                .unwrap();
+        // First free run starts at cluster index 256 (block 1).
+        assert_eq!(off, 256 * 512);
+        assert_eq!(read_refcount_in_block(&blocks[512..], 0, 16).unwrap(), 1);
+        assert_eq!(read_refcount_in_block(&blocks[512..], 1, 16).unwrap(), 1);
+        assert_eq!(read_refcount_in_block(&blocks[512..], 2, 16).unwrap(), 1);
+    }
+
+    #[test]
+    fn alloc_contiguous_run_crosses_boundary_between_blocks() {
+        // entries_per_refblock = 256. Occupy entries 0..254 of
+        // block 0 (leaving entry 255 free) so a 3-run must span the
+        // block 0 / block 1 boundary: clusters 255, 256, 257.
+        let mut blocks = [0u8; 1024];
+        for i in 0..255u64 {
+            set_refcount_in_block(&mut blocks[..512], i, 16, 1).unwrap();
+        }
+        let mut cursor = AllocCursor::default();
+        let off =
+            alloc_contiguous_clusters_in_refblocks(&mut blocks, 512, 16, 2, 0, 3, &mut cursor)
+                .unwrap();
+        assert_eq!(off, 255 * 512);
+        // Cluster 255 (block 0, entry 255) and 256/257 (block 1).
+        assert_eq!(read_refcount_in_block(&blocks[..512], 255, 16).unwrap(), 1);
+        assert_eq!(read_refcount_in_block(&blocks[512..], 0, 16).unwrap(), 1);
+        assert_eq!(read_refcount_in_block(&blocks[512..], 1, 16).unwrap(), 1);
+    }
+
+    #[test]
+    fn alloc_contiguous_skips_hole_smaller_than_count() {
+        // Free run of 2 at entries 0..2, then entry 2 occupied,
+        // then a run of >=3 from entry 3. Asking for 3 must skip
+        // the 2-cluster hole and land at entry 3.
+        let mut blocks = [0u8; 512];
+        set_refcount_in_block(&mut blocks, 2, 16, 1).unwrap();
+        let mut cursor = AllocCursor::default();
+        let off =
+            alloc_contiguous_clusters_in_refblocks(&mut blocks, 512, 16, 1, 0, 3, &mut cursor)
+                .unwrap();
+        assert_eq!(off, 3 * 512);
+        assert_eq!(read_refcount_in_block(&blocks, 3, 16).unwrap(), 1);
+        assert_eq!(read_refcount_in_block(&blocks, 4, 16).unwrap(), 1);
+        assert_eq!(read_refcount_in_block(&blocks, 5, 16).unwrap(), 1);
+        // Entry 0/1 (the too-small hole) left untouched.
+        assert_eq!(read_refcount_in_block(&blocks, 0, 16).unwrap(), 0);
+        assert_eq!(read_refcount_in_block(&blocks, 1, 16).unwrap(), 0);
+    }
+
+    #[test]
+    fn alloc_contiguous_exhausted() {
+        // Only 2 free entries at the end; asking for 3 fails.
+        let mut blocks = [0u8; 512]; // 256 entries
+        for i in 0..254u64 {
+            set_refcount_in_block(&mut blocks, i, 16, 1).unwrap();
+        }
+        let mut cursor = AllocCursor::default();
+        assert_eq!(
+            alloc_contiguous_clusters_in_refblocks(&mut blocks, 512, 16, 1, 0, 3, &mut cursor),
+            Err(SnapshotError::RefcountExhausted)
+        );
+    }
+
+    #[test]
+    fn alloc_contiguous_cursor_reuse_across_calls() {
+        let mut blocks = [0u8; 512];
+        let mut cursor = AllocCursor::default();
+        let o0 = alloc_contiguous_clusters_in_refblocks(&mut blocks, 512, 16, 1, 0, 2, &mut cursor)
+            .unwrap();
+        let o1 = alloc_contiguous_clusters_in_refblocks(&mut blocks, 512, 16, 1, 0, 2, &mut cursor)
+            .unwrap();
+        assert_eq!(o0, 0);
+        assert_eq!(o1, 2 * 512);
+        assert_eq!(cursor.allocated, 4);
+        assert_eq!(cursor.next_entry_in_refblock, 4);
+    }
+
+    #[test]
+    fn alloc_contiguous_count_zero_rejected() {
+        let mut blocks = [0u8; 512];
+        let mut cursor = AllocCursor::default();
+        assert_eq!(
+            alloc_contiguous_clusters_in_refblocks(&mut blocks, 512, 16, 1, 0, 0, &mut cursor),
+            Err(SnapshotError::InvalidConfig)
+        );
+    }
+
+    #[test]
+    fn alloc_single_wrapper_matches_contiguous_count_one() {
+        // The thin wrapper must behave exactly like count == 1.
+        let mut a = [0u8; 512];
+        let mut b = [0u8; 512];
+        let mut ca = AllocCursor::default();
+        let mut cb = AllocCursor::default();
+        let oa = alloc_cluster_in_refblocks(&mut a, 512, 16, 1, 0, &mut ca).unwrap();
+        let ob = alloc_contiguous_clusters_in_refblocks(&mut b, 512, 16, 1, 0, 1, &mut cb).unwrap();
+        assert_eq!(oa, ob);
+        assert_eq!(a, b);
+        assert_eq!(ca, cb);
+    }
+
     // -------------------- rewrite_l1_entry_copied_flag --------------------
 
     fn make_l1_entry(offset: u64, copied: bool) -> [u8; 8] {
@@ -1852,6 +2122,10 @@ mod tests {
         set_refcount_in_block(&mut refblocks, 0x101, 16, 1).unwrap();
         set_refcount_in_block(&mut refblocks, 0x102, 16, 2).unwrap();
         set_refcount_in_block(&mut refblocks, 0x103, 16, 1).unwrap();
+        // The L2 table cluster lives at host offset 0x4000 (entry
+        // idx 0x4 under refblock_lookup); seed it at 1 so the
+        // create bump takes it to 2.
+        set_refcount_in_block(&mut refblocks, 0x4, 16, 1).unwrap();
 
         let l1 = refc_l1();
         update_snapshot_refcount(
@@ -1869,6 +2143,11 @@ mod tests {
         assert_eq!(read_refcount_in_block(&refblocks, 0x101, 16).unwrap(), 2);
         assert_eq!(read_refcount_in_block(&refblocks, 0x102, 16).unwrap(), 3);
         assert_eq!(read_refcount_in_block(&refblocks, 0x103, 16).unwrap(), 2);
+        // The L2 table cluster is now counted by the create: its
+        // refcount went 1 -> 2 (active L1 + snapshot L1 copy share
+        // this physical L2 table). qemu's
+        // qcow2_update_snapshot_refcount bumps it once per L1 entry.
+        assert_eq!(read_refcount_in_block(&refblocks, 0x4, 16).unwrap(), 2);
     }
 
     #[test]
@@ -1879,6 +2158,10 @@ mod tests {
         set_refcount_in_block(&mut refblocks, 0x101, 16, 2).unwrap();
         set_refcount_in_block(&mut refblocks, 0x102, 16, 3).unwrap();
         set_refcount_in_block(&mut refblocks, 0x103, 16, 2).unwrap();
+        // The L2 table cluster (host 0x4000 -> entry idx 0x4) is
+        // shared by two L1s before the delete; seed it at 2 so the
+        // decrement takes it to 1.
+        set_refcount_in_block(&mut refblocks, 0x4, 16, 2).unwrap();
 
         let l1 = refc_l1();
         update_snapshot_refcount(
@@ -1896,6 +2179,10 @@ mod tests {
         assert_eq!(read_refcount_in_block(&refblocks, 0x101, 16).unwrap(), 1);
         assert_eq!(read_refcount_in_block(&refblocks, 0x102, 16).unwrap(), 2);
         assert_eq!(read_refcount_in_block(&refblocks, 0x103, 16).unwrap(), 1);
+        // The L2 table cluster is now counted by the delete: its
+        // refcount went 2 -> 1 (only the active L1 still references
+        // it once the snapshot is gone).
+        assert_eq!(read_refcount_in_block(&refblocks, 0x4, 16).unwrap(), 1);
     }
 
     #[test]
@@ -1939,6 +2226,12 @@ mod tests {
         set_refcount_in_block(&mut refblocks, 0x101, 16, 2).unwrap();
         set_refcount_in_block(&mut refblocks, 0x102, 16, 1).unwrap();
         set_refcount_in_block(&mut refblocks, 0x103, 16, 1).unwrap();
+        // The two sides reach distinct L2 table clusters: from_l1's
+        // L2 at host 0x4000 (entry 0x4), to_l1's at 0x5000 (entry
+        // 0x5). The apply decrements from's L2 table and increments
+        // to's, exactly as it does for the data clusters.
+        set_refcount_in_block(&mut refblocks, 0x4, 16, 2).unwrap();
+        set_refcount_in_block(&mut refblocks, 0x5, 16, 1).unwrap();
 
         static FROM_L2: [u8; 16] = {
             let mut b = [0u8; 16];
@@ -2003,6 +2296,11 @@ mod tests {
         assert_eq!(read_refcount_in_block(&refblocks, 0x101, 16).unwrap(), 1);
         assert_eq!(read_refcount_in_block(&refblocks, 0x102, 16).unwrap(), 2);
         assert_eq!(read_refcount_in_block(&refblocks, 0x103, 16).unwrap(), 2);
+        // The per-side L2 table clusters move with their side: from's
+        // L2 table (0x4) decremented 2 -> 1, to's L2 table (0x5)
+        // incremented 1 -> 2.
+        assert_eq!(read_refcount_in_block(&refblocks, 0x4, 16).unwrap(), 1);
+        assert_eq!(read_refcount_in_block(&refblocks, 0x5, 16).unwrap(), 2);
     }
 
     #[test]
@@ -2029,6 +2327,183 @@ mod tests {
         assert_eq!(err, Err(SnapshotError::ParseFailed));
         // Byte-identity.
         assert_eq!(refblocks, snapshot);
+    }
+
+    // ---- L2-table refcount coverage (phase 6b, open question 2) ----
+    //
+    // These tests pin the phase-6 extension: update_snapshot_refcount
+    // must adjust each L2 table cluster's refcount once per non-zero
+    // L1 entry, mirroring qemu's qcow2_update_snapshot_refcount.
+
+    /// An L2 table with a single allocated data cluster at
+    /// host 0x10_0000 (entry idx 0x100 under refblock_lookup).
+    static L2_ONE_DATA: [u8; 32] = {
+        let mut b = [0u8; 32];
+        let e = 0x10_0000u64.to_be_bytes();
+        let mut j = 0;
+        while j < 8 {
+            b[j] = e[j];
+            j += 1;
+        }
+        b
+    };
+
+    /// An empty L2 table (no allocated data clusters). Used to prove
+    /// the L2-table cluster itself is still counted even when it has
+    /// no data entries.
+    static L2_EMPTY: [u8; 32] = [0u8; 32];
+
+    #[test]
+    fn l2_table_increment_bumps_only_l2_cluster_when_data_empty() {
+        // L1 has one entry pointing at an L2 table at host 0x4000
+        // (entry idx 0x4). The L2 table is empty, so the only
+        // refcount that should change is the L2 table cluster's.
+        let mut refblocks = [0u8; 4096];
+        set_refcount_in_block(&mut refblocks, 0x4, 16, 1).unwrap();
+        let l1 = l1_pointing_to(0x4000, true);
+        update_snapshot_refcount(
+            SnapshotRefcountOp::IncrementForCreate { snapshot_l1: &l1 },
+            &mut refblocks,
+            12,
+            16,
+            false,
+            |_idx| Some(&L2_EMPTY[..]),
+            refblock_lookup,
+        )
+        .unwrap();
+        // L2 table cluster bumped exactly once: 1 -> 2.
+        assert_eq!(read_refcount_in_block(&refblocks, 0x4, 16).unwrap(), 2);
+    }
+
+    #[test]
+    fn l2_table_two_l1_entries_bump_both_l2_clusters() {
+        // Two L1 entries pointing at two distinct L2 tables at host
+        // 0x4000 (idx 0x4) and 0x6000 (idx 0x6). Each L2 table
+        // cluster must be bumped exactly once.
+        let mut l1 = [0u8; 16];
+        l1[0..8].copy_from_slice(&l1_pointing_to(0x4000, true));
+        l1[8..16].copy_from_slice(&l1_pointing_to(0x6000, true));
+        let mut refblocks = [0u8; 4096];
+        set_refcount_in_block(&mut refblocks, 0x4, 16, 1).unwrap();
+        set_refcount_in_block(&mut refblocks, 0x6, 16, 1).unwrap();
+        set_refcount_in_block(&mut refblocks, 0x100, 16, 1).unwrap();
+        update_snapshot_refcount(
+            SnapshotRefcountOp::IncrementForCreate { snapshot_l1: &l1 },
+            &mut refblocks,
+            12,
+            16,
+            false,
+            // Both L1 entries hand back the same one-data-cluster L2
+            // fixture; the data cluster (0x100) is therefore bumped
+            // twice, while each L2 table cluster is bumped once.
+            |_idx| Some(&L2_ONE_DATA[..]),
+            refblock_lookup,
+        )
+        .unwrap();
+        assert_eq!(read_refcount_in_block(&refblocks, 0x4, 16).unwrap(), 2);
+        assert_eq!(read_refcount_in_block(&refblocks, 0x6, 16).unwrap(), 2);
+        // Shared data cluster reached from both L2s: bumped twice.
+        assert_eq!(read_refcount_in_block(&refblocks, 0x100, 16).unwrap(), 3);
+    }
+
+    #[test]
+    fn l2_table_unallocated_l1_entry_contributes_no_bump() {
+        // L1 entry 0 is unallocated (zero); entry 1 points at an L2
+        // table at host 0x4000 (idx 0x4). Only one L2-table bump.
+        let mut l1 = [0u8; 16];
+        // entry 0 left zero
+        l1[8..16].copy_from_slice(&l1_pointing_to(0x4000, true));
+        let mut refblocks = [0u8; 4096];
+        set_refcount_in_block(&mut refblocks, 0x4, 16, 1).unwrap();
+        let mut l2_calls = 0u32;
+        update_snapshot_refcount(
+            SnapshotRefcountOp::IncrementForCreate { snapshot_l1: &l1 },
+            &mut refblocks,
+            12,
+            16,
+            false,
+            |idx| {
+                // The closure must only be asked for the allocated
+                // entry (index 1), never index 0.
+                assert_eq!(idx, 1, "unallocated L1 entry 0 must be skipped");
+                l2_calls += 1;
+                Some(&L2_EMPTY[..])
+            },
+            refblock_lookup,
+        )
+        .unwrap();
+        assert_eq!(read_refcount_in_block(&refblocks, 0x4, 16).unwrap(), 2);
+        // l2_for_index called once per pass (dry-run + apply) for
+        // the single allocated entry.
+        assert_eq!(l2_calls, 2);
+    }
+
+    #[test]
+    fn l2_table_dry_run_overflow_on_l2_cluster_leaves_refblocks_untouched() {
+        // The L2 table cluster (host 0x4000 -> entry 0x4) is already
+        // at the 16-bit max; the create's L2-table bump would
+        // overflow. The data clusters are fine, so the overflow is
+        // detected on the L2 table cluster specifically. Byte-
+        // identity must hold (the dry-run mutates nothing).
+        let mut refblocks = [0u8; 4096];
+        set_refcount_in_block(&mut refblocks, 0x100, 16, 1).unwrap();
+        set_refcount_in_block(&mut refblocks, 0x101, 16, 1).unwrap();
+        set_refcount_in_block(&mut refblocks, 0x102, 16, 1).unwrap();
+        set_refcount_in_block(&mut refblocks, 0x103, 16, 1).unwrap();
+        set_refcount_in_block(&mut refblocks, 0x4, 16, 0xffff).unwrap();
+
+        let snapshot = refblocks; // byte-identity reference
+        let l1 = refc_l1();
+        let err = update_snapshot_refcount(
+            SnapshotRefcountOp::IncrementForCreate { snapshot_l1: &l1 },
+            &mut refblocks,
+            12,
+            16,
+            false,
+            |_idx| Some(&REFC_L2[..]),
+            refblock_lookup,
+        );
+        match err {
+            Err(SnapshotError::RefcountOverflow { at_host_offset }) => {
+                // The overflow is reported against the L2 table
+                // cluster's host offset, not a data cluster.
+                assert_eq!(at_host_offset, 0x4000);
+            }
+            other => panic!("expected RefcountOverflow on the L2 cluster, got {other:?}"),
+        }
+        assert_eq!(refblocks, snapshot);
+    }
+
+    #[test]
+    fn l2_table_swap_with_shared_l2_nets_to_zero() {
+        // Degenerate apply where from_l1 and to_l1 reach the *same*
+        // L2 table cluster (host 0x4000 -> entry 0x4). The
+        // decrement on the from side and the increment on the to
+        // side must net to zero for that shared L2 table cluster.
+        let mut refblocks = [0u8; 4096];
+        // Shared L2 table cluster starts at 2.
+        set_refcount_in_block(&mut refblocks, 0x4, 16, 2).unwrap();
+        // Shared single data cluster 0x100 starts at 2 too.
+        set_refcount_in_block(&mut refblocks, 0x100, 16, 2).unwrap();
+
+        let from_l1 = l1_pointing_to(0x4000, true);
+        let to_l1 = l1_pointing_to(0x4000, true);
+        update_snapshot_refcount(
+            SnapshotRefcountOp::SwapForApply {
+                from_l1: &from_l1,
+                to_l1: &to_l1,
+            },
+            &mut refblocks,
+            12,
+            16,
+            false,
+            |_idx| Some(&L2_ONE_DATA[..]),
+            refblock_lookup,
+        )
+        .unwrap();
+        // dec then inc on the same clusters: net zero.
+        assert_eq!(read_refcount_in_block(&refblocks, 0x4, 16).unwrap(), 2);
+        assert_eq!(read_refcount_in_block(&refblocks, 0x100, 16).unwrap(), 2);
     }
 
     // -------------------- update_copied_flags_for_l1 --------------------

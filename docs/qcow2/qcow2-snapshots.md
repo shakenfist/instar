@@ -171,16 +171,94 @@ caller-staged byte slices without any I/O.
   *before* mutating any refblock. Pass 2 walks again and applies
   the new refcounts via `set_refcount_in_block`. Handles
   `IncrementForCreate`, `DecrementForDelete`, and
-  `SwapForApply { from_l1, to_l1 }`.
+  `SwapForApply { from_l1, to_l1 }`. Both passes adjust every
+  reachable **data** cluster **and** each **L2 table cluster** —
+  once per non-zero L1 entry, after that entry's data clusters —
+  mirroring qemu's `qcow2_update_snapshot_refcount`
+  (`block/qcow2-refcount.c`). The L2-table bump is mandatory for
+  create: after a create the active L1 and the snapshot's L1 copy
+  share the same physical L2 tables, so each L2 cluster's refcount
+  must reach 2 for a later guest write to trigger the L2
+  copy-on-write instead of silently overwriting the snapshot's L2
+  in place. The function never touches the L1 table's own
+  clusters — the caller owns those (create allocates the snapshot
+  L1 copy at refcount 1; delete frees the snapshot L1 explicitly).
+  *(The L2-table coverage was added in PLAN-snapshot phase 6,
+  closing a phase 5 correctness gap.)*
 - **`update_copied_flags_for_l1`** — walks the L1, rewriting the
   `OFLAG_COPIED` flag on each L1 and L2 entry based on the
   cluster's current refcount (set when refcount==1, clear
   otherwise). Returns the number of entries rewritten.
 
-The crate does not emit `SnapshotPatch` entries itself: phases
-6-8 (create / delete / apply planners) translate the mutated
-slice state into patches via the `SnapshotPatch` / `SnapshotPlan`
-types declared in the crate root.
+The phase 6 create planner adds these table-serialisation
+helpers (`src/crates/snapshot/src/table.rs`):
+
+- **`alloc_contiguous_clusters_in_refblocks`** — first-fit scan
+  for `count` *consecutive* zero-refcount clusters (allowed to
+  span refblock boundaries), claiming each. The single-cluster
+  `alloc_cluster_in_refblocks` is now a `count = 1` wrapper.
+- **`NewSnapshotEntry`** + **`serialize_snapshot_entry`** — emit
+  one new on-disk entry: 40-byte big-endian header,
+  `extra_data_size = 24`, the 24-byte extra data
+  (`vm_state_size_large` / `disk_size` / `icount`), then the id
+  and name strings, with no trailing pad. Matches `qemu-img`
+  10.0.x byte-for-byte (`icount` written as `0`, not the
+  `u64::MAX` "absent" sentinel the read side uses).
+- **`snapshot_table_byte_len`** — walk the raw old table for
+  `nb_snapshots` entries (8-aligned starts) and return its exact
+  unpadded byte length, so the guest can stage / copy / free it.
+- **`build_snapshot_table`** — copy the old entries verbatim
+  (preserving any unknown trailing extra data), zero-pad to the
+  next 8-byte boundary, and append the serialised new entry.
+- **`parse_decimal_id`** / **`format_decimal_u64`** — strtoul- /
+  `%lu`-style ID arithmetic for the `max(existing IDs) + 1`
+  assignment qemu's `find_new_snapshot_id` performs.
+
+The crate does not emit `SnapshotPatch` entries itself: the
+create guest binary writes each staged region directly
+(commit-binary style), because the create writeback needs
+`fsync` barriers *between* write groups, which a flat patch list
+cannot express. The `SnapshotPatch` / `SnapshotPlan` types remain
+declared in the crate root for a possible future planner.
+
+### Create write ordering (crash safety)
+
+`instar snapshot -c` writes back in four `fsync`-separated groups,
+mirroring qemu's `qcow2_snapshot_create` + `qcow2_write_snapshots`:
+
+```
+A: L1 copy (verbatim pre-flag-rewrite bytes), dirty L2 tables,
+   the rewritten active L1, and the dirty refcount blocks
+   (covering the data / L2 increments and the new allocations)
+   -> fsync
+B: the new snapshot table (at a freshly allocated, contiguous
+   region)
+   -> fsync
+C: the 12-byte header write at offset 60 — nb_snapshots (u32 BE)
+   followed by snapshots_offset (u64 BE). THIS IS THE COMMIT
+   POINT.
+   -> fsync
+D: free the old snapshot table's clusters (decrement their
+   refcounts to 0 and write those refblocks back). Skipped when
+   there was no old table (nb_snapshots was 0).
+   -> fsync
+```
+
+The barrier ordering gives the same crash-safety contract as
+qemu: a crash *before* group C leaves the old table authoritative
+(the new clusters are orphaned garbage — `qemu-img check` reports
+leaks, not corruption); a crash *after* group C leaves the new
+table authoritative (the old table's clusters leak until group D
+runs). Leaks are repairable with `qemu-img check -r`; dangling
+references are not, and this ordering never produces them.
+
+The snapshot's L1 copy is serialised from the active L1's bytes
+captured **before** the COPIED-flag rewrite, so — exactly like
+qemu — the stored copy keeps its (now stale) `OFLAG_COPIED` bits
+even though the shared clusters are at refcount 2. `qemu-img
+check` validates only the *active* L1/L2 flags, so this is
+correct; the apply path refreshes the flags if the snapshot is
+ever restored.
 
 ## Snapshot L1 Table
 

@@ -635,26 +635,47 @@ Host renders the column-aligned table or the JSON array.
 Reuses existing readers + new mutators. Plan:
 
 1. Read header, refuse non-qcow2.
-2. Parse snapshot table; refuse on duplicate name (qemu
-   returns `Could not create snapshot 'name': already exists`).
-3. Assign next ID: max(existing IDs) + 1, formatted as
-   decimal string (qemu uses `bdrv_snapshot_find_by_id_and_name`
-   to ensure uniqueness; we replicate).
-4. Allocate cluster(s) for the snapshot's L1 table copy.
-   L1 size matches active L1 size.
-5. Copy active L1 contents to the new L1 location.
-6. Walk active L1 chain: increment refcount on every
-   reachable data cluster, every L2 table cluster (these
-   now have two L1s pointing at them).
+2. Parse snapshot table for the max existing ID. **Duplicate
+   names are allowed** — this was empirically corrected in
+   phase 6: `qemu-img snapshot -c` accepts a duplicate name and
+   creates a second entry (the "already exists" error belongs to
+   HMP `savevm`, not `qemu-img`). The earlier "refuse on
+   duplicate name" claim here was wrong; see
+   PLAN-snapshot-phase-06-create.md fact 2.
+3. Assign next ID: max(existing IDs) + 1, formatted as a decimal
+   string. qemu's `find_new_snapshot_id` takes `max` over
+   `strtoul(id_str)` and renders `id_max + 1` with `%lu`; we
+   replicate (`parse_decimal_id` / `format_decimal_u64`).
+4. Allocate contiguous cluster(s) for the snapshot's L1 table
+   copy. L1 size matches active L1 size. (A 0-byte virtual disk
+   has `l1_size == 0`: no allocation; the snapshot's stored
+   `l1_table_offset` mirrors the active L1's offset, matching
+   qemu.)
+5. Copy active L1 contents to the new L1 location, captured
+   **before** the COPIED-flag rewrite (so the copy keeps stale
+   COPIED bits, exactly like qemu).
+6. Walk active L1 chain: increment refcount on every reachable
+   data cluster *and* every L2 table cluster (these now have two
+   L1s pointing at them).
 7. Walk active L1 *again*, this time clearing
    `QCOW_OFLAG_COPIED` on every entry whose refcount is now
    > 1 (which is all of them, by definition of the create).
-8. Append snapshot table entry. If existing snapshot table
-   has room, write in place; otherwise allocate new
-   cluster(s), rewrite the whole table, update
-   `snapshots_offset`.
-9. Update header `nb_snapshots`.
+8. **Always reallocate the snapshot table.** qemu's
+   `qcow2_write_snapshots` always writes a fresh, contiguous
+   table and frees the old one — there is no "append in place"
+   path (phase 6 fact 6 corrects the earlier claim here). The
+   old table stays intact until the header pointer flips, which
+   is the better crash-safety story.
+9. Update header `nb_snapshots` + `snapshots_offset` as a single
+   12-byte write at offset 60 (the commit point), then free the
+   old table.
 10. Send `SnapshotResult` with `assigned_id`.
+
+(`vm_state_size`, `vm_clock_nsec`, and `vm_state_size_large` are
+always 0 for `qemu-img`-style creates, and `icount` is written as
+`0` — not the `u64::MAX` "absent" sentinel — confirmed
+empirically in phase 6; see open question 5 and fact 4 of the
+phase-6 plan.)
 
 The order matters: steps 5–7 must complete before step 8,
 because step 8 commits the new snapshot's existence and a
@@ -895,13 +916,13 @@ qemu-img.
 |-------|------|--------|
 | 1. Shared ABI: `SnapshotConfig`, `SnapshotResult`, `SnapshotEntryRecord`, error codes, `send_snapshot_entry`/`send_snapshot_result` call-table pointers, `fsync_input` call-table primitive, `GuestMessage` arms | PLAN-snapshot-phase-01-abi.md | Not started |
 | 2. Snapshot-table parser extension and list-mode planner: `for_each_snapshot_entry` streaming primitive + extra-data fallback + planner converter (`snapshot_entry_to_record`); `find_snapshot_streaming`; extended `SnapshotEntry` with v3 fields; ~14 new qcow2 unit tests | PLAN-snapshot-phase-02-list-planner.md | Landed |
-| 3. Guest binary scaffolding + list mode (`src/operations/snapshot/`): config read, format check, dispatch, MODE_LIST emit loop | PLAN-snapshot-phase-03-list-guest.md | Not started |
-| 4. Host CLI for list mode (`run_snapshot`, clap surface, human + JSON renderer, `qemu-img snapshot -l` byte-exact output) | PLAN-snapshot-phase-04-list-host.md | Not started |
+| 3. Guest binary scaffolding + list mode (`src/operations/snapshot/`): config read, format check, dispatch, MODE_LIST emit loop | PLAN-snapshot-phase-03-list-guest.md | Landed |
+| 4. Host CLI for list mode (`run_snapshot`, clap surface, human + JSON renderer, `qemu-img snapshot -l` byte-exact output) | PLAN-snapshot-phase-04-list-host.md | Landed |
 | 5. Refcount mutators (planner crate): `update_snapshot_refcount`, `alloc_cluster_in_refblocks`, `set_refcount_in_block` (lifted from resize), `update_copied_flags_for_l1`, two-pass overflow check. New `src/crates/snapshot/` crate parallel to commit/rebase; ~60 unit tests | PLAN-snapshot-phase-05-refcount-planners.md | Landed |
-| 6. Snapshot create planner + guest binary (MODE_CREATE) | PLAN-snapshot-phase-06-create.md | Not started |
+| 6. Snapshot create planner + guest binary (MODE_CREATE), plus the minimal `-c` host dispatch pulled forward from phase 9 (see open question 1 in that plan) | PLAN-snapshot-phase-06-create.md | Landed |
 | 7. Snapshot delete planner + guest binary (MODE_DELETE) | PLAN-snapshot-phase-07-delete.md | Not started |
 | 8. Snapshot apply planner + guest binary (MODE_APPLY) | PLAN-snapshot-phase-08-apply.md | Not started |
-| 9. Host CLI for mutating modes (`-c`/`-d`/`-a` dispatch, single-device RW open, success-line rendering) | PLAN-snapshot-phase-09-mutate-host.md | Not started |
+| 9. Host CLI for mutating modes. **The `-c` (create) dispatch landed early in phase 6** (see open question 1 in PLAN-snapshot-phase-06-create.md); the `-d` / `-a` dispatch follow in phases 7 / 8, and phase 9 shrinks to consolidation (shared RW-open helper, quiet-success review, error-message polish, master-plan state). | PLAN-snapshot-phase-09-mutate-host.md | Not started |
 | 10. Cross-version baselines: snapshot-bearing qcow2 fixtures, `snapshot-list-{human,json}` profiles in `generate-baselines.py`, baseline generation pass | PLAN-snapshot-phase-10-baselines.md | Not started |
 | 11. Integration tests (`tests/test_snapshot.py`): list matrix, create/delete/apply round-trips, error paths, qcow2-only enforcement, post-op `qemu-img check` clean | PLAN-snapshot-phase-11-integration-tests.md | Not started |
 | 12. Coverage-guided fuzz harnesses: `fuzz_snapshot_parse`, `fuzz_snapshot_refcount` | PLAN-snapshot-phase-12-fuzz-coverage.md | Not started |

@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 shared = { path = "../../shared" }
 qcow2 = { path = "../../crates/qcow2" }
+snapshot = { path = "../../crates/snapshot", default-features = false }
 
 [profile.release]
 panic = "abort"

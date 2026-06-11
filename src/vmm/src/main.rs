@@ -165,7 +165,6 @@ const SNAPSHOT_CONFIG_MAGIC: u32 = 0x534E4150; // "SNAP"
 const SNAPSHOT_CONFIG_MODE_LIST: u32 = 0;
 #[allow(dead_code)]
 const SNAPSHOT_CONFIG_MODE_APPLY: u32 = 1;
-#[allow(dead_code)]
 const SNAPSHOT_CONFIG_MODE_CREATE: u32 = 2;
 #[allow(dead_code)]
 const SNAPSHOT_CONFIG_MODE_DELETE: u32 = 3;
@@ -10225,10 +10224,11 @@ fn run_snapshot(args: SnapshotArgs, verbose: bool) -> Result<(), Box<dyn std::er
     if args.list {
         return run_snapshot_list(&args, verbose);
     }
+    if let Some(name) = args.create.clone() {
+        return run_snapshot_create(&args, &name, verbose);
+    }
     let (short, long) = if args.apply.is_some() {
         ('a', "apply")
-    } else if args.create.is_some() {
-        ('c', "create")
     } else if args.delete.is_some() {
         ('d', "delete")
     } else {
@@ -10236,7 +10236,8 @@ fn run_snapshot(args: SnapshotArgs, verbose: bool) -> Result<(), Box<dyn std::er
     };
     Err(format!(
         "snapshot: -{} ({}) is not yet implemented in v1; \
-         arrives in PLAN-snapshot phase 9 (see docs/plans/PLAN-snapshot.md)",
+         delete / apply arrive in PLAN-snapshot phases 7-9 \
+         (see docs/plans/PLAN-snapshot.md)",
         short, long
     )
     .into())
@@ -10313,9 +10314,12 @@ fn run_snapshot_list(args: &SnapshotArgs, verbose: bool) -> Result<(), Box<dyn s
     //   12:  sector_size  u32
     //   16:  arg_len      u32
     //   20:  _pad         u32
-    //   24..280: arg      [u8; 256]
-    //   280..312: _reserved [u8; 32]
-    // For MODE_LIST, arg_len = 0 and arg is left page-zeroed.
+    //   24..280:  arg       [u8; 256]
+    //   280: date_sec     u32   (MODE_CREATE only; zero for list)
+    //   284: date_nsec    u32   (MODE_CREATE only; zero for list)
+    //   288..312: _reserved [u8; 24]
+    // For MODE_LIST, arg_len = 0 and arg / date_* are left
+    // page-zeroed (guest memory is zero-initialised).
     let mut snapshot_flags: u32 = 0;
     if verbose {
         snapshot_flags |= SNAPSHOT_CONFIG_FLAG_VERBOSE;
@@ -10570,6 +10574,314 @@ fn run_snapshot_list(args: &SnapshotArgs, verbose: bool) -> Result<(), Box<dyn s
     Ok(())
 }
 
+/// Drive `MODE_CREATE` end-to-end: open the image RW with a
+/// capacity hint (so the guest can allocate clusters past EOF and
+/// grow the file), write a `SnapshotConfig` with `mode =
+/// MODE_CREATE`, the snapshot name in `arg`, and the host's
+/// wall-clock in `date_sec` / `date_nsec`, launch the guest, and
+/// capture the terminating `SnapshotResultMessage`.
+///
+/// Success is silent (matching `qemu-img snapshot -c`), so `-q`
+/// has no visible effect. Modelled on `run_snapshot_list` with the
+/// RW-open / config / quiet-success deltas; phase 9 consolidates
+/// the shared VM-setup boilerplate.
+fn run_snapshot_create(
+    args: &SnapshotArgs,
+    name: &str,
+    verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // --- Validate the snapshot name (open question 9) -------------------
+    // qemu-img silently truncates names to 255 bytes; instar refuses
+    // loudly instead (divergence noted in docs/quirks.md). An empty
+    // name is also refused (the plan requires a non-empty name even
+    // though qemu-img accepts it — documented divergence).
+    let name_bytes = name.as_bytes();
+    if name_bytes.is_empty() {
+        return Err("snapshot: -c requires a non-empty snapshot name".into());
+    }
+    if name_bytes.len() > 255 {
+        return Err(format!(
+            "snapshot: snapshot name is {} bytes; the qcow2 on-disk limit is 255 \
+             (qemu-img truncates silently; instar refuses; see docs/quirks.md)",
+            name_bytes.len()
+        )
+        .into());
+    }
+
+    let input_path = Path::new(&args.filename);
+    let input_meta = std::fs::metadata(input_path)?;
+    let input_size = input_meta.len();
+
+    // --- Host wall-clock for the snapshot's date fields -----------------
+    // Truncate nanoseconds to microsecond precision (usec * 1000) to
+    // match qemu-img's `tv_usec * 1000` byte-for-byte.
+    let (date_sec, date_nsec) =
+        match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(dur) => {
+                let secs = dur.as_secs() as u32;
+                let usec = dur.subsec_micros();
+                (secs, usec.saturating_mul(1000))
+            }
+            Err(_) => (0u32, 0u32),
+        };
+
+    // --- Load guest binaries --------------------------------------------
+    let core_path = get_binary_path("core.bin");
+    let operation_path = get_binary_path("snapshot.bin");
+    let core_code = load_guest_binary(core_path.to_str().unwrap())?;
+    let operation_code = load_guest_binary(operation_path.to_str().unwrap())?;
+
+    // --- KVM / VM / guest memory setup ----------------------------------
+    let kvm = Kvm::new()?;
+    let vm = kvm.create_vm()?;
+    let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
+    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let host_addr = region.as_ptr() as u64;
+    let mem_region = kvm_userspace_memory_region {
+        slot: 0,
+        guest_phys_addr: 0,
+        memory_size: GUEST_MEM_SIZE,
+        userspace_addr: host_addr,
+        flags: 0,
+    };
+    // SAFETY: mem_region.userspace_addr points to a valid
+    // GuestMemoryMmap allocation that outlives the VM.
+    unsafe {
+        vm.set_user_memory_region(mem_region)?;
+    }
+    setup_gdt(&guest_mem)?;
+    setup_page_tables(&guest_mem, GUEST_MEM_SIZE)?;
+    guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
+    guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
+
+    // --- Write SnapshotConfig (per-field at known offsets) --------------
+    // Layout matches shared::SnapshotConfig (312 bytes; see the list
+    // path for the full offset map). MODE_CREATE populates arg_len /
+    // arg and date_sec (offset 280) / date_nsec (offset 284).
+    let mut snapshot_flags: u32 = 0;
+    if verbose {
+        snapshot_flags |= SNAPSHOT_CONFIG_FLAG_VERBOSE;
+    }
+    if args.quiet {
+        snapshot_flags |= SNAPSHOT_CONFIG_FLAG_QUIET;
+    }
+    if args.force_share {
+        snapshot_flags |= SNAPSHOT_CONFIG_FLAG_FORCE_SHARE;
+    }
+    guest_mem.write_obj(SNAPSHOT_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
+    guest_mem.write_obj(
+        SNAPSHOT_CONFIG_MODE_CREATE,
+        GuestAddress(OPERATION_CONFIG_ADDR + 4),
+    )?;
+    guest_mem.write_obj(snapshot_flags, GuestAddress(OPERATION_CONFIG_ADDR + 8))?;
+    guest_mem.write_obj(args.sector_size, GuestAddress(OPERATION_CONFIG_ADDR + 12))?;
+    guest_mem.write_obj(
+        name_bytes.len() as u32,
+        GuestAddress(OPERATION_CONFIG_ADDR + 16),
+    )?;
+    guest_mem.write_obj(0u32, GuestAddress(OPERATION_CONFIG_ADDR + 20))?;
+    // arg bytes at offset 24.
+    guest_mem.write_slice(name_bytes, GuestAddress(OPERATION_CONFIG_ADDR + 24))?;
+    // date_sec at 280, date_nsec at 284.
+    guest_mem.write_obj(date_sec, GuestAddress(OPERATION_CONFIG_ADDR + 280))?;
+    guest_mem.write_obj(date_nsec, GuestAddress(OPERATION_CONFIG_ADDR + 284))?;
+    debug!(
+        "Wrote snapshot config at 0x{:x} (mode=CREATE, name_len={}, sector_size={}, \
+         date_sec={}, date_nsec={})",
+        OPERATION_CONFIG_ADDR,
+        name_bytes.len(),
+        args.sector_size,
+        date_sec,
+        date_nsec
+    );
+
+    // --- Set up source device 0 (read-write, growable) ------------------
+    // Generous capacity hint (file_size * 2, min 1 GiB) so the guest
+    // can write past EOF to grow the file — same pattern as rebase /
+    // commit (see src/vmm/src/main.rs rebase open path).
+    let capacity_hint = input_size.saturating_mul(2).max(1 << 30);
+    let mut device_set = DeviceSet::new();
+    let mut io_events: Vec<IoEvent> = Vec::new();
+
+    let input_backing = BackingStore::open_rw_existing(input_path, Some(capacity_hint))?;
+    let input_mmio = device_mmio_base(0);
+    let input_vq = device_vq_base(0);
+    // Expose the capacity hint (not the current file size) as the
+    // device capacity so the guest can write past EOF to grow the
+    // file, exactly as the rebase / commit output device does.
+    let input_device = VirtioBlockDevice::new(
+        input_backing,
+        capacity_hint,
+        args.sector_size as u64,
+        false, // read-write
+        input_mmio,
+        input_vq,
+    );
+    let input_device = Arc::new(Mutex::new(input_device));
+    device_set.add_device(Arc::clone(&input_device), true);
+    io_events.push(IoEvent::new(input_mmio)?);
+
+    let guest_mem = Arc::new(guest_mem);
+    let vmm_stats = Arc::new(Mutex::new(VmmStats::new()));
+
+    let mut io_thread: Option<io_thread::IoThread> = None;
+    let mut registered_count = 0usize;
+    let mut registration_failed = false;
+    for evt in io_events.iter_mut() {
+        if let Err(e) = evt.register(&vm) {
+            debug!("ioeventfd: failed to register ({e:?}), falling back to VM exits");
+            registration_failed = true;
+            break;
+        }
+        registered_count += 1;
+    }
+    if registration_failed {
+        for evt in io_events.iter_mut().take(registered_count) {
+            if let Err(e) = evt.unregister(&vm) {
+                warn!("ioeventfd: failed to unregister during rollback: {e:?}");
+            }
+        }
+    }
+    let all_registered = !registration_failed;
+    if all_registered && !io_events.is_empty() {
+        let io_devices = device_set.create_io_devices(io_events);
+        io_thread = Some(io_thread::IoThread::new(
+            io_devices,
+            Arc::clone(&guest_mem),
+            Arc::clone(&vmm_stats),
+        ));
+    }
+
+    // --- vCPU setup ------------------------------------------------------
+    let mut vcpu = vm.create_vcpu(0)?;
+    let mut sregs = vcpu.get_sregs()?;
+    setup_sregs(&mut sregs);
+    vcpu.set_sregs(&sregs)?;
+    let mut regs = vcpu.get_regs()?;
+    setup_regs(&mut regs);
+    vcpu.set_regs(&regs)?;
+
+    // --- Serial decoders / transmitter / debug buffer -------------------
+    let mut serial_decoder = SerialDecoder::new();
+    let mut serial_transmitter = SerialTransmitter::new();
+    let mut debug_buffer = DebugBuffer::new();
+    let config = vmm_config_input_only(args.sector_size);
+    serial_transmitter.queue_config(&config);
+
+    let mut snapshot_result: Option<guest_::SnapshotResultMessage> = None;
+    let mut vm_error: Option<String> = None;
+
+    loop {
+        match vcpu.run()? {
+            VcpuExit::Hlt => {
+                vmm_stats.lock().unwrap().record_hlt();
+                break;
+            }
+            VcpuExit::IoOut(port, data) => {
+                vmm_stats.lock().unwrap().record_io_out();
+                if port == SERIAL_PORT {
+                    for &byte in data {
+                        if let Some(msg) = serial_decoder.add_byte(byte) {
+                            match &msg.payload {
+                                Some(guest_::GuestMessage_::Payload::SnapshotResult(r)) => {
+                                    snapshot_result = Some(r.clone());
+                                }
+                                _ => {
+                                    if verbose {
+                                        debug!("{}", format_message(&msg));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if port == DEBUG_PORT {
+                    for &byte in data {
+                        if let Some(line) = debug_buffer.add_byte(byte) {
+                            debug!("[GUEST] {line}");
+                        }
+                    }
+                } else {
+                    debug!("IO OUT: port=0x{port:x}, data={data:?}");
+                }
+            }
+            VcpuExit::IoIn(port, data) => {
+                vmm_stats.lock().unwrap().record_io_in();
+                if port == SERIAL_PORT {
+                    for byte in data.iter_mut() {
+                        *byte = serial_transmitter.next_byte().unwrap_or(0);
+                    }
+                } else if port == SERIAL_PORT + 5 {
+                    let mut lsr = 0x60u8;
+                    if serial_transmitter.has_data() {
+                        lsr |= 0x01;
+                    }
+                    data[0] = lsr;
+                } else {
+                    for byte in data {
+                        *byte = 0;
+                    }
+                }
+            }
+            VcpuExit::MmioRead(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_read();
+                let value = device_set.mmio_read(addr);
+                write_mmio_data(data, value);
+            }
+            VcpuExit::MmioWrite(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_write();
+                let value = read_mmio_data(data);
+                if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
+                    if io_thread.is_none() && should_process {
+                        device_set.process_queue_for_device(
+                            device_index,
+                            &guest_mem,
+                            &vmm_stats,
+                        )?;
+                    }
+                }
+            }
+            VcpuExit::Shutdown => {
+                vmm_stats.lock().unwrap().record_shutdown();
+                vm_error = Some("VM shutdown (triple fault)".to_string());
+                break;
+            }
+            VcpuExit::FailEntry(reason, cpu) => {
+                vmm_stats.lock().unwrap().record_fail_entry();
+                vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
+                break;
+            }
+            exit => {
+                vmm_stats.lock().unwrap().record_unknown();
+                vm_error = Some(format!("unexpected VM exit: {exit:?}"));
+                break;
+            }
+        }
+    }
+
+    if let Some(mut thread) = io_thread {
+        thread.stop();
+    }
+    if log::log_enabled!(log::Level::Debug) {
+        vmm_stats.lock().unwrap().display();
+    }
+    if let Some(error) = vm_error {
+        return Err(error.into());
+    }
+
+    let result =
+        snapshot_result.ok_or_else(|| "snapshot: guest returned no SnapshotResult".to_string())?;
+    if let Some(msg) = snapshot_error_message(result.error) {
+        eprintln!("{}", msg);
+        return Err(format!("snapshot: guest reported error code {}", result.error).into());
+    }
+
+    // Success is silent, matching `qemu-img snapshot -c` (so `-q`
+    // has no visible effect). The assigned ID is available in
+    // `result.assigned_id` for callers that want it; we do not print
+    // it (qemu-img prints nothing).
+    Ok(())
+}
+
 /// Resolve a `SnapshotResult::error` code to a stderr-friendly
 /// message. Returns `None` for `ERROR_OK` (success path closes
 /// the renderer instead).
@@ -10580,9 +10892,11 @@ fn snapshot_error_message(error: u32) -> Option<&'static str> {
             Some("snapshot: source is not qcow2 (qemu-img refuses non-qcow2 sources too)")
         }
         SNAPSHOT_RESULT_ERROR_UNSUPPORTED_FEATURE => Some(
-            "snapshot: qcow2 image has an incompatible feature \
-             (compression / encryption / external data file / bitmaps); \
-             list mode should not return this, please report",
+            "snapshot: this qcow2 image uses a feature instar cannot snapshot \
+             (compressed clusters, encryption, an external data file, dirty \
+             bitmaps, a dirty/corrupt header, or a refcount width other than \
+             16 bits). List mode works regardless; the mutating modes refuse. \
+             See docs/quirks.md.",
         ),
         SNAPSHOT_RESULT_ERROR_NOT_FOUND => {
             Some("snapshot: argument matches neither a snapshot ID nor a name")
@@ -10590,13 +10904,18 @@ fn snapshot_error_message(error: u32) -> Option<&'static str> {
         SNAPSHOT_RESULT_ERROR_DUPLICATE_NAME => {
             Some("snapshot: a snapshot with that name already exists")
         }
-        SNAPSHOT_RESULT_ERROR_REFCOUNT_OVERFLOW => {
-            Some("snapshot: a cluster's refcount would exceed the refcount-bits cap")
-        }
-        SNAPSHOT_RESULT_ERROR_ALLOCATION_FAILED => {
-            Some("snapshot: refcount table is full and cannot grow")
-        }
-        SNAPSHOT_RESULT_ERROR_SNAPSHOT_TABLE_FULL => Some("snapshot: snapshot table is full"),
+        SNAPSHOT_RESULT_ERROR_REFCOUNT_OVERFLOW => Some(
+            "snapshot: a cluster's refcount would exceed the 16-bit refcount cap \
+             (65535); the image is too heavily shared to snapshot",
+        ),
+        SNAPSHOT_RESULT_ERROR_ALLOCATION_FAILED => Some(
+            "snapshot: no free clusters available — the refcount table is full and \
+             instar v1 does not grow it",
+        ),
+        SNAPSHOT_RESULT_ERROR_SNAPSHOT_TABLE_FULL => Some(
+            "snapshot: the image already has 16 snapshots, the instar v1 cap \
+             (qemu allows up to 65536); delete one first. See docs/quirks.md.",
+        ),
         SNAPSHOT_RESULT_ERROR_IO => Some("snapshot: I/O failure reading the source"),
         SNAPSHOT_RESULT_ERROR_L1_SIZE_MISMATCH => {
             Some("snapshot: target L1 size exceeds the active L1 allocation cap")

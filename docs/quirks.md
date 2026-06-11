@@ -1463,6 +1463,75 @@ returns the bare string `"0"` for zero bytes, matching qemu-img's
 with a `0`-byte short-circuit so the `VM_SIZE` column matches the
 qemu-img snapshot dump rather than the qemu-img info dump.
 
+### `snapshot -c` (create) quirks
+
+The following apply to `instar snapshot -c NAME` (create mode,
+landed in PLAN-snapshot phase 6).
+
+- **Duplicate names are allowed.** Creating two snapshots with the
+  same `NAME` succeeds and yields two distinct entries (IDs `1`
+  and `2`, both tagged `NAME`), matching `qemu-img snapshot -c`
+  exactly. There is *no* "already exists" error — that message
+  belongs to QEMU's HMP `savevm`, not to `qemu-img snapshot -c`.
+  (`ERROR_DUPLICATE_NAME` remains reserved in the ABI for a future
+  savevm-style mode.)
+
+- **16-snapshot cap.** instar v1 refuses to create the 17th
+  snapshot (`ERROR_SNAPSHOT_TABLE_FULL`). The qcow2 spec allows up
+  to 65536; raising the cap is future work. Delete a snapshot
+  first, or use `qemu-img` for images that need more than 16.
+
+- **`refcount_bits != 16` refused for mutating modes.** The v1
+  cluster allocator is 16-bit-refcount only (the `qemu-img`
+  default since qcow2 v3, and the only width v2 uses). Images with
+  a different `refcount_order` are refused by `-c`
+  (`ERROR_UNSUPPORTED_FEATURE`); list mode still works on them.
+
+- **Dirty / corrupt images refused.** `qemu-img` auto-repairs a
+  dirty lazy-refcount image when it opens it read-write; instar v1
+  refuses instead (`ERROR_UNSUPPORTED_FEATURE`). Refcounts in a
+  dirty image are not trustworthy, and instar will not mutate on
+  top of them. Run `qemu-img check -r all` first to clear the
+  dirty bit, then retry.
+
+- **Compressed clusters refused.** Images with zstd compression
+  (header bit) or any zlib-compressed cluster (detected during the
+  L2 walk) are refused by the mutating modes
+  (`ERROR_UNSUPPORTED_FEATURE`). Refcounting a compressed extent
+  needs a multi-cluster walk deferred to future work. List mode
+  works regardless.
+
+- **External data file / encryption / dirty bitmaps refused.**
+  Same `ERROR_UNSUPPORTED_FEATURE` posture as the other mutating
+  modes — these features change the refcount semantics or require
+  a write path instar does not yet have.
+
+- **`-q` has no visible effect on create.** `qemu-img snapshot -c`
+  prints nothing on success and exits 0; instar matches that, so
+  `-q` (suppress the success line) changes nothing visible for
+  `-c`. The flag is still plumbed through for the other modes and
+  for CLI parity.
+
+- **Names longer than 255 bytes are refused (not truncated).**
+  The qcow2 on-disk `name` field tops out at 255 usable bytes.
+  `qemu-img snapshot -c` *silently truncates* a longer name to 255
+  bytes and exits 0; instar refuses loudly with a clear host-side
+  error instead, on the principle that silently dropping bytes the
+  user typed is surprising. An **empty** name is likewise refused
+  (qemu-img accepts an empty name); supply a non-empty `NAME`.
+
+- **The created file may be physically larger than `qemu-img`'s.**
+  instar writes through 64 KiB virtio sectors, so the final
+  snapshot-table write rounds the file up to the next sector
+  boundary; `qemu-img` writes at byte granularity and leaves the
+  trailing cluster sparse. The result is a benign difference in
+  `qemu-img info`'s `disk size` / `file length` — the trailing
+  bytes are zero, `qemu-img check` is clean with no leaks, and the
+  qcow2 structure (snapshot table, L1 copy, refcounts, COPIED
+  flags) is byte-for-byte identical to `qemu-img`'s. This is an
+  instar-wide property of its sector-granular I/O, not specific to
+  snapshots.
+
 ## Future Additions
 
 Additional quirks will be documented here as they are discovered during

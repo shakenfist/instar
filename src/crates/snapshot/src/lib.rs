@@ -34,6 +34,7 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod qcow2;
+pub mod table;
 
 use shared::SnapshotResult;
 
