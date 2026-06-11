@@ -10227,20 +10227,16 @@ fn run_snapshot(args: SnapshotArgs, verbose: bool) -> Result<(), Box<dyn std::er
     if let Some(name) = args.create.clone() {
         return run_snapshot_create(&args, &name, verbose);
     }
-    let (short, long) = if args.apply.is_some() {
-        ('a', "apply")
-    } else if args.delete.is_some() {
-        ('d', "delete")
-    } else {
-        unreachable!("clap ArgGroup guarantees one mode flag is set");
-    };
-    Err(format!(
-        "snapshot: -{} ({}) is not yet implemented in v1; \
-         delete / apply arrive in PLAN-snapshot phases 7-9 \
-         (see docs/plans/PLAN-snapshot.md)",
-        short, long
-    )
-    .into())
+    if let Some(needle) = args.delete.clone() {
+        return run_snapshot_delete(&args, &needle, verbose);
+    }
+    if args.apply.is_some() {
+        return Err("snapshot: -a (apply) is not yet implemented in v1; \
+             apply arrives in PLAN-snapshot phase 8 \
+             (see docs/plans/PLAN-snapshot.md)"
+            .into());
+    }
+    unreachable!("clap ArgGroup guarantees one mode flag is set");
 }
 
 /// Drive `MODE_LIST` end-to-end: launch the guest, consume
@@ -10574,17 +10570,12 @@ fn run_snapshot_list(args: &SnapshotArgs, verbose: bool) -> Result<(), Box<dyn s
     Ok(())
 }
 
-/// Drive `MODE_CREATE` end-to-end: open the image RW with a
-/// capacity hint (so the guest can allocate clusters past EOF and
-/// grow the file), write a `SnapshotConfig` with `mode =
-/// MODE_CREATE`, the snapshot name in `arg`, and the host's
-/// wall-clock in `date_sec` / `date_nsec`, launch the guest, and
-/// capture the terminating `SnapshotResultMessage`.
+/// Drive `MODE_CREATE` end-to-end: validate the snapshot name,
+/// compute the host wall-clock date fields, and delegate the
+/// guest launch to [`run_snapshot_mutating_guest`].
 ///
 /// Success is silent (matching `qemu-img snapshot -c`), so `-q`
-/// has no visible effect. Modelled on `run_snapshot_list` with the
-/// RW-open / config / quiet-success deltas; phase 9 consolidates
-/// the shared VM-setup boilerplate.
+/// has no visible effect.
 fn run_snapshot_create(
     args: &SnapshotArgs,
     name: &str,
@@ -10608,10 +10599,6 @@ fn run_snapshot_create(
         .into());
     }
 
-    let input_path = Path::new(&args.filename);
-    let input_meta = std::fs::metadata(input_path)?;
-    let input_size = input_meta.len();
-
     // --- Host wall-clock for the snapshot's date fields -----------------
     // Truncate nanoseconds to microsecond precision (usec * 1000) to
     // match qemu-img's `tv_usec * 1000` byte-for-byte.
@@ -10624,6 +10611,83 @@ fn run_snapshot_create(
             }
             Err(_) => (0u32, 0u32),
         };
+
+    run_snapshot_mutating_guest(
+        args,
+        SNAPSHOT_CONFIG_MODE_CREATE,
+        name_bytes,
+        date_sec,
+        date_nsec,
+        verbose,
+    )
+}
+
+/// Drive `MODE_DELETE` end-to-end via
+/// [`run_snapshot_mutating_guest`].
+///
+/// The argument is passed through verbatim — no emptiness or
+/// length validation. qemu 10's delete matches snapshots by NAME
+/// only (first match in table order; `bdrv_snapshot_find` has no
+/// ID path), and qemu happily matches an empty name if a
+/// qemu-created image carries one, so instar must too (instar
+/// refuses *creating* empty names but still deletes them — see
+/// docs/quirks.md). The date fields are zero: delete writes no
+/// timestamps, which is what makes post-delete images
+/// byte-comparable against qemu's. An argument longer than the
+/// 256-byte wire buffer cannot name any matchable snapshot
+/// (qemu-img truncates names to 255 bytes at creation), so it is
+/// resolved as not-found without launching the guest.
+fn run_snapshot_delete(
+    args: &SnapshotArgs,
+    needle: &str,
+    verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let needle_bytes = needle.as_bytes();
+    if needle_bytes.len() > 256 {
+        // Matches the guest's ERROR_NOT_FOUND surface (message +
+        // non-zero exit), with the image untouched.
+        if let Some(msg) = snapshot_error_message(SNAPSHOT_RESULT_ERROR_NOT_FOUND) {
+            eprintln!("{}", msg);
+        }
+        return Err(format!(
+            "snapshot: guest reported error code {}",
+            SNAPSHOT_RESULT_ERROR_NOT_FOUND
+        )
+        .into());
+    }
+    run_snapshot_mutating_guest(
+        args,
+        SNAPSHOT_CONFIG_MODE_DELETE,
+        needle_bytes,
+        0,
+        0,
+        verbose,
+    )
+}
+
+/// The shared mutating-mode guest launch: open the image RW with a
+/// capacity hint (so the guest can allocate clusters past EOF and
+/// grow the file), write a `SnapshotConfig` with the given mode /
+/// argument bytes / date fields, launch the guest, and capture the
+/// terminating `SnapshotResultMessage`. Success is silent for
+/// every mutating mode (matching qemu-img).
+///
+/// Factored out of phase 6's `run_snapshot_create` so `-d`
+/// (phase 7) and `-a` (phase 8) don't copy the launch body;
+/// modelled on `run_snapshot_list` with the RW-open / config /
+/// quiet-success deltas. Phase 9 consolidates the remaining
+/// VM-setup boilerplate.
+fn run_snapshot_mutating_guest(
+    args: &SnapshotArgs,
+    mode: u32,
+    arg_bytes: &[u8],
+    date_sec: u32,
+    date_nsec: u32,
+    verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let input_path = Path::new(&args.filename);
+    let input_meta = std::fs::metadata(input_path)?;
+    let input_size = input_meta.len();
 
     // --- Load guest binaries --------------------------------------------
     let core_path = get_binary_path("core.bin");
@@ -10656,8 +10720,10 @@ fn run_snapshot_create(
 
     // --- Write SnapshotConfig (per-field at known offsets) --------------
     // Layout matches shared::SnapshotConfig (312 bytes; see the list
-    // path for the full offset map). MODE_CREATE populates arg_len /
-    // arg and date_sec (offset 280) / date_nsec (offset 284).
+    // path for the full offset map). Mutating modes populate
+    // arg_len / arg; create also populates date_sec (offset 280) /
+    // date_nsec (offset 284) — delete passes them as zero (it
+    // writes no timestamps).
     let mut snapshot_flags: u32 = 0;
     if verbose {
         snapshot_flags |= SNAPSHOT_CONFIG_FLAG_VERBOSE;
@@ -10669,27 +10735,25 @@ fn run_snapshot_create(
         snapshot_flags |= SNAPSHOT_CONFIG_FLAG_FORCE_SHARE;
     }
     guest_mem.write_obj(SNAPSHOT_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
-    guest_mem.write_obj(
-        SNAPSHOT_CONFIG_MODE_CREATE,
-        GuestAddress(OPERATION_CONFIG_ADDR + 4),
-    )?;
+    guest_mem.write_obj(mode, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
     guest_mem.write_obj(snapshot_flags, GuestAddress(OPERATION_CONFIG_ADDR + 8))?;
     guest_mem.write_obj(args.sector_size, GuestAddress(OPERATION_CONFIG_ADDR + 12))?;
     guest_mem.write_obj(
-        name_bytes.len() as u32,
+        arg_bytes.len() as u32,
         GuestAddress(OPERATION_CONFIG_ADDR + 16),
     )?;
     guest_mem.write_obj(0u32, GuestAddress(OPERATION_CONFIG_ADDR + 20))?;
     // arg bytes at offset 24.
-    guest_mem.write_slice(name_bytes, GuestAddress(OPERATION_CONFIG_ADDR + 24))?;
+    guest_mem.write_slice(arg_bytes, GuestAddress(OPERATION_CONFIG_ADDR + 24))?;
     // date_sec at 280, date_nsec at 284.
     guest_mem.write_obj(date_sec, GuestAddress(OPERATION_CONFIG_ADDR + 280))?;
     guest_mem.write_obj(date_nsec, GuestAddress(OPERATION_CONFIG_ADDR + 284))?;
     debug!(
-        "Wrote snapshot config at 0x{:x} (mode=CREATE, name_len={}, sector_size={}, \
+        "Wrote snapshot config at 0x{:x} (mode={}, arg_len={}, sector_size={}, \
          date_sec={}, date_nsec={})",
         OPERATION_CONFIG_ADDR,
-        name_bytes.len(),
+        mode,
+        arg_bytes.len(),
         args.sector_size,
         date_sec,
         date_nsec
@@ -10875,10 +10939,10 @@ fn run_snapshot_create(
         return Err(format!("snapshot: guest reported error code {}", result.error).into());
     }
 
-    // Success is silent, matching `qemu-img snapshot -c` (so `-q`
-    // has no visible effect). The assigned ID is available in
-    // `result.assigned_id` for callers that want it; we do not print
-    // it (qemu-img prints nothing).
+    // Success is silent for every mutating mode, matching qemu-img
+    // (so `-q` has no visible effect). For create, the assigned ID
+    // is available in `result.assigned_id` for callers that want
+    // it; we do not print it (qemu-img prints nothing).
     Ok(())
 }
 
@@ -10898,9 +10962,10 @@ fn snapshot_error_message(error: u32) -> Option<&'static str> {
              16 bits). List mode works regardless; the mutating modes refuse. \
              See docs/quirks.md.",
         ),
-        SNAPSHOT_RESULT_ERROR_NOT_FOUND => {
-            Some("snapshot: argument matches neither a snapshot ID nor a name")
-        }
+        SNAPSHOT_RESULT_ERROR_NOT_FOUND => Some(
+            "snapshot: no snapshot with that name (qemu-img 10 matches -d \
+             arguments by name only, not ID; see docs/quirks.md)",
+        ),
         SNAPSHOT_RESULT_ERROR_DUPLICATE_NAME => {
             Some("snapshot: a snapshot with that name already exists")
         }
@@ -13932,6 +13997,17 @@ Offset          Length          Mapped to       File
     fn snapshot_error_unknown_returns_generic_message() {
         let msg = snapshot_error_message(999).expect("unknown error returns Some");
         assert!(msg.contains("unknown"));
+    }
+
+    #[test]
+    fn snapshot_not_found_message_is_name_only() {
+        // Phase 7 (fact 2): qemu 10's delete matches by name only —
+        // the old "matches neither a snapshot ID nor a name" wording
+        // was wrong and must not come back.
+        let msg = snapshot_error_message(SNAPSHOT_RESULT_ERROR_NOT_FOUND)
+            .expect("not-found has a message");
+        assert!(msg.contains("name only"), "msg: {}", msg);
+        assert!(!msg.contains("neither"), "msg: {}", msg);
     }
 
     // --- json_escape ----------------------------------------------

@@ -214,6 +214,25 @@ helpers (`src/crates/snapshot/src/table.rs`):
   `%lu`-style ID arithmetic for the `max(existing IDs) + 1`
   assignment qemu's `find_new_snapshot_id` performs.
 
+The phase 7 delete planner adds:
+
+- **`snapshot_table_entry_bounds`** — the (start offset, unpadded
+  length) of one raw table entry, walking entries exactly like
+  `snapshot_table_byte_len`. Delete's find-by-name walk uses it
+  to compare the full on-disk name (independent of the bounded
+  parser's 63-byte truncation) and to locate the removed entry.
+- **`build_snapshot_table_without`** — the table compaction:
+  every entry except the removed one copied verbatim to the next
+  8-aligned output offset (gaps zeroed, unpadded tail). Removing
+  the sole remaining entry yields length 0; the caller then
+  writes header `nb_snapshots = 0, snapshots_offset = 0` and
+  allocates no table, matching qemu.
+- **`precheck_snapshot_refcount`** (in `qcow2.rs`) — a public
+  read-only wrapper over `update_snapshot_refcount`'s dry-run
+  pass (pass 1), so delete can validate the decrement against the
+  staged refblocks *before any disk write* while deferring the
+  paired apply until after the commit-point header write.
+
 The crate does not emit `SnapshotPatch` entries itself: the
 create guest binary writes each staged region directly
 (commit-binary style), because the create writeback needs
@@ -259,6 +278,54 @@ even though the shared clusters are at refcount 2. `qemu-img
 check` validates only the *active* L1/L2 flags, so this is
 correct; the apply path refreshes the flags if the snapshot is
 ever restored.
+
+### Delete write ordering (crash safety)
+
+`instar snapshot -d` finds the target by **name only, first
+match in table order** (qemu 10's `bdrv_snapshot_find` — see
+docs/quirks.md), stages BOTH chains (the deleted snapshot's
+L1 + L2 set for the decrement walk; the active L1 + L2 set for
+the COPIED refresh), then writes back in three `fsync`-separated
+groups, mirroring `qcow2_snapshot_delete`:
+
+```
+precheck: precheck_snapshot_refcount(DecrementForDelete) over the
+   snapshot's chain, plus refcount >= 1 checks on the snapshot's
+   L1 clusters and the old table's clusters. Read-only, BEFORE
+   any disk write: a corrupt image fails here with the file
+   untouched. (qemu has no such check; its equivalent failure
+   would surface after the commit point.)
+A: the compacted snapshot table (built by
+   build_snapshot_table_without at a freshly allocated,
+   contiguous region) + all staged refblocks, which at this
+   moment carry ONLY the table-allocation bumps. Skipped
+   entirely when the remaining snapshot count is 0.
+   -> fsync
+B: the 12-byte header write at offset 60 — nb_snapshots - 1
+   (u32 BE) followed by the new table offset, or 0 / 0 when the
+   table is now empty. THIS IS THE COMMIT POINT.
+   -> fsync
+   (in-memory, qemu's "we won't recover but just leak clusters"
+    zone: update_snapshot_refcount(DecrementForDelete) over the
+    snapshot's chain, then decrement the snapshot's L1 clusters,
+    then the old table's clusters — decrements, never set-to-0,
+    so an underflow surfaces a double-free bug. Then the COPIED
+    refresh over the ACTIVE chain against the post-decrement
+    refcounts: shared data clusters that dropped 2 -> 1 get
+    COPIED SET, the reverse direction from create.)
+C: all staged refblocks (now carrying the decrements) + the
+   active L1 + the active L2 set.
+   -> fsync
+```
+
+A crash before group B leaves the old table authoritative and at
+worst an orphaned compacted table (a leak); a crash after group B
+but before group C completes leaves the snapshot gone with
+refcounts too *high* and/or stale COPIED flags — leaks and
+repairable flag warnings, never a dangling reference. Because
+delete writes no timestamps, the post-delete image is
+byte-identical to qemu's given byte-identical inputs (modulo
+freed-cluster contents and the file tail — docs/quirks.md).
 
 ## Snapshot L1 Table
 

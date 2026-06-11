@@ -1532,6 +1532,57 @@ landed in PLAN-snapshot phase 6).
   instar-wide property of its sector-granular I/O, not specific to
   snapshots.
 
+### `snapshot -d` (delete) quirks
+
+The following apply to `instar snapshot -d SNAPSHOT` (delete
+mode, landed in PLAN-snapshot phase 7). The feature gates
+(`refcount_bits != 16`, compressed clusters, encryption, external
+data file, bitmaps, dirty/corrupt) are the same uniform set as
+`-c` above.
+
+- **`-d` matches by NAME only, first match in table order.** The
+  modern `qemu-img` this tracks (10.x) resolves the `-d` argument
+  via `bdrv_snapshot_find`, which is a plain name comparison —
+  **there is no ID matching on the delete path**. On an image
+  whose snapshots are `alpha` (id 1) and `gamma` (id 3),
+  `qemu-img snapshot -d 3` fails with "snapshot not found", and
+  instar matches that exactly. With duplicate names, the first
+  entry in table order is deleted; with a snapshot *named* "2"
+  and another with *ID* 2, `-d 2` deletes the one named "2".
+  *Cross-version note:* older `qemu-img` releases resolved IDs
+  first (the since-removed `bdrv_snapshot_delete_by_id_or_name`);
+  instar follows 10.x, and the cross-version baseline phases must
+  pin delete baselines accordingly.
+
+- **Deleting never truncates the file.** Freed clusters (the
+  snapshot's L1, the old snapshot table, and any data / L2
+  cluster whose refcount reaches 0) remain in the file until
+  reused, matching qemu.
+
+- **Freed-cluster bytes may differ from `qemu-img`'s.** By
+  default qemu-img passes a *discard* down to the file for the
+  clusters a delete frees (`QCOW2_DISCARD_SNAPSHOT` /
+  `QCOW2_DISCARD_ALWAYS` default on), punching holes so those
+  regions read back as zeros; qemu's `-1` refcount walk also
+  rewrites COPIED flags inside the about-to-be-freed L1/L2
+  clusters. instar never writes to freed clusters at all — their
+  stale bytes remain. All *live* metadata is byte-for-byte
+  identical: running the qemu side with
+  `--image-opts driver=qcow2,file.filename=…,file.discard=ignore`
+  (which disables only the protocol-level hole punching) yields
+  post-delete images that are **bit-for-bit identical** to
+  instar's, modulo the sector-granular file-tail quirk above.
+  `qemu-img check` is clean either way.
+
+- **An empty `-d` argument is passed through.** `qemu-img
+  snapshot -c ''` happily creates an empty-named snapshot, and
+  `-d ''` deletes it; instar refuses *creating* empty names (see
+  the `-c` quirks) but still deletes them for parity. There is no
+  host-side validation of the delete argument; an argument longer
+  than the 256-byte wire buffer cannot name any matchable
+  snapshot (qemu-img truncates names to 255 bytes at creation)
+  and resolves to the same not-found error.
+
 ## Future Additions
 
 Additional quirks will be documented here as they are discovered during

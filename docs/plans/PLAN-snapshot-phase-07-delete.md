@@ -444,6 +444,22 @@ The master plan's `-d` description carried two stale claims
 by step 7f. Any further gaps surfaced by the byte-identity
 matrix are fixed in the same commit and listed here.
 
+**Gap surfaced during execution: qemu discards freed clusters.**
+Fact 5's plain-`cmp` byte-identity failed on first contact
+because `qemu-img` passes a protocol-level *discard* down to the
+file for every cluster a delete frees
+(`QCOW2_DISCARD_SNAPSHOT` / `QCOW2_DISCARD_ALWAYS` default on in
+`qcow2.c`), punching holes so freed clusters read back as zeros —
+a second freed-cluster divergence this plan's "flag-rewrite into
+freed clusters" note did not anticipate. instar's design is
+unchanged (it never writes to freed clusters, exactly as
+specified); the matrix runs the qemu side with `--image-opts
+driver=qcow2,file.filename=…,file.discard=ignore`, which disables
+only the hole punching, and the byte-identity assertion then
+holds bit-for-bit across every fixture. Documented in
+docs/quirks.md and flagged for phase 13's comparison design
+alongside the existing freed-cluster note.
+
 ### Documentation index maintenance
 
 This is a phase plan, not a master plan: **not** added to

@@ -684,22 +684,30 @@ dangling references.
 
 #### `-d` delete mode
 
-The opposite of create:
+The opposite of create. **Two earlier claims here were corrected
+empirically in phase 7** (see
+PLAN-snapshot-phase-07-delete.md, facts 2/3/6): the argument
+matches by **name only, first occurrence in table order**
+(`bdrv_snapshot_find` has no ID path in qemu 10 — "by id or
+name" was wrong for delete), and qemu always **rewrites the
+whole table at a new allocation** via `qcow2_write_snapshots`
+(there is no in-place shift-and-rewrite path).
 
 1. Read header, refuse non-qcow2.
-2. Parse snapshot table; find target by id or name.
-3. Walk target's L1 chain, decrement refcount on every
+2. Parse snapshot table; find the first entry whose **name**
+   equals the argument. Not-found exits 1 before any write.
+3. Build the compacted table (every entry except the removed
+   one, verbatim) at a fresh allocation; write it, then the
+   header's `nb_snapshots - 1` + new `snapshots_offset` as the
+   commit point (or `0 / 0` when the table empties — no
+   allocation at all in that case).
+4. Walk target's L1 chain, decrement refcount on every
    reachable data cluster, L2 table cluster, L1 table
-   cluster.
-4. Walk active L1, set `QCOW_OFLAG_COPIED` on entries whose
+   cluster; free the old table's clusters.
+5. Walk active L1, set `QCOW_OFLAG_COPIED` on entries whose
    refcount now equals 1 (i.e. clusters that were shared
    with the deleted snapshot and are now sole-owned by
    active).
-5. Remove the entry from the snapshot table by compacting.
-   If the entry was last in the table, just decrement
-   `nb_snapshots`. If interior, shift later entries back
-   and rewrite.
-6. Update header `nb_snapshots`.
 
 #### `-a` apply / goto mode
 
@@ -920,9 +928,9 @@ qemu-img.
 | 4. Host CLI for list mode (`run_snapshot`, clap surface, human + JSON renderer, `qemu-img snapshot -l` byte-exact output) | PLAN-snapshot-phase-04-list-host.md | Landed |
 | 5. Refcount mutators (planner crate): `update_snapshot_refcount`, `alloc_cluster_in_refblocks`, `set_refcount_in_block` (lifted from resize), `update_copied_flags_for_l1`, two-pass overflow check. New `src/crates/snapshot/` crate parallel to commit/rebase; ~60 unit tests | PLAN-snapshot-phase-05-refcount-planners.md | Landed |
 | 6. Snapshot create planner + guest binary (MODE_CREATE), plus the minimal `-c` host dispatch pulled forward from phase 9 (see open question 1 in that plan) | PLAN-snapshot-phase-06-create.md | Landed |
-| 7. Snapshot delete planner + guest binary (MODE_DELETE) | PLAN-snapshot-phase-07-delete.md | Not started |
+| 7. Snapshot delete planner + guest binary (MODE_DELETE), plus the `-d` host dispatch (pulled forward like `-c` was) and the shared `run_snapshot_mutating_guest` launch helper | PLAN-snapshot-phase-07-delete.md | Landed |
 | 8. Snapshot apply planner + guest binary (MODE_APPLY) | PLAN-snapshot-phase-08-apply.md | Not started |
-| 9. Host CLI for mutating modes. **The `-c` (create) dispatch landed early in phase 6** (see open question 1 in PLAN-snapshot-phase-06-create.md); the `-d` / `-a` dispatch follow in phases 7 / 8, and phase 9 shrinks to consolidation (shared RW-open helper, quiet-success review, error-message polish, master-plan state). | PLAN-snapshot-phase-09-mutate-host.md | Not started |
+| 9. Host CLI for mutating modes. **The `-c` (create) dispatch landed early in phase 6** (see open question 1 in PLAN-snapshot-phase-06-create.md) **and the `-d` (delete) dispatch landed in phase 7**, which also factored the shared `run_snapshot_mutating_guest(mode, arg, dates)` launch helper that `-a` should reuse; phase 9 shrinks to consolidation (shared VM-setup boilerplate with the list path, quiet-success review, error-message polish, master-plan state). | PLAN-snapshot-phase-09-mutate-host.md | Not started |
 | 10. Cross-version baselines: snapshot-bearing qcow2 fixtures, `snapshot-list-{human,json}` profiles in `generate-baselines.py`, baseline generation pass | PLAN-snapshot-phase-10-baselines.md | Not started |
 | 11. Integration tests (`tests/test_snapshot.py`): list matrix, create/delete/apply round-trips, error paths, qcow2-only enforcement, post-op `qemu-img check` clean | PLAN-snapshot-phase-11-integration-tests.md | Not started |
 | 12. Coverage-guided fuzz harnesses: `fuzz_snapshot_parse`, `fuzz_snapshot_refcount` | PLAN-snapshot-phase-12-fuzz-coverage.md | Not started |

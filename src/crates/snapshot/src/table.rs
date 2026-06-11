@@ -10,8 +10,15 @@
 //!   `block/qcow2-snapshot.c` from qemu 10.0.x.
 //! - [`snapshot_table_byte_len`] walks the raw old table to find
 //!   its exact byte length so the guest can stage / copy / free it.
+//! - [`snapshot_table_entry_bounds`] returns one raw entry's
+//!   (start offset, unpadded length) for MODE_DELETE's
+//!   find-by-name walk and compaction maths (phase 7).
 //! - [`build_snapshot_table`] copies the old entries verbatim and
 //!   8-aligns the new entry after them.
+//! - [`build_snapshot_table_without`] copies every entry except
+//!   one verbatim, re-aligning survivors — MODE_DELETE's table
+//!   compaction (phase 7), matching `qcow2_write_snapshots`'
+//!   full-table rewrite after the in-memory `memmove`.
 //! - [`parse_decimal_id`] / [`format_decimal_u64`] implement
 //!   qemu's `find_new_snapshot_id` ID arithmetic (strtoul-style
 //!   parse, `%lu`-style render).
@@ -135,6 +142,47 @@ pub fn serialize_snapshot_entry(
     Ok(total)
 }
 
+/// Compute the bounds of the raw entry starting at (or after, once
+/// 8-aligned) `offset` within `table`. Returns the entry's
+/// `(aligned_start, unpadded_len)`.
+///
+/// Shared walk core for [`snapshot_table_byte_len`] and
+/// [`snapshot_table_entry_bounds`]: 8-align the start, read the
+/// 40-byte header's `extra_data_size` / `id_str_size` /
+/// `name_size`, and advance by `40 + extra + id + name`. Returns
+/// [`SnapshotError::ParseFailed`] if the entry would escape
+/// `table`.
+fn entry_bounds_at(table: &[u8], offset: usize) -> Result<(usize, usize), SnapshotError> {
+    // 8-align the entry start.
+    let start = round_up_8(offset).ok_or(SnapshotError::ParseFailed)?;
+    let header_end = start
+        .checked_add(SNAPSHOT_HEADER_SIZE)
+        .ok_or(SnapshotError::ParseFailed)?;
+    if header_end > table.len() {
+        return Err(SnapshotError::ParseFailed);
+    }
+    let extra_data_size = u32::from_be_bytes([
+        table[start + 36],
+        table[start + 37],
+        table[start + 38],
+        table[start + 39],
+    ]) as usize;
+    let id_str_size = u16::from_be_bytes([table[start + 12], table[start + 13]]) as usize;
+    let name_size = u16::from_be_bytes([table[start + 14], table[start + 15]]) as usize;
+    let entry_len = SNAPSHOT_HEADER_SIZE
+        .checked_add(extra_data_size)
+        .and_then(|v| v.checked_add(id_str_size))
+        .and_then(|v| v.checked_add(name_size))
+        .ok_or(SnapshotError::ParseFailed)?;
+    let entry_end = start
+        .checked_add(entry_len)
+        .ok_or(SnapshotError::ParseFailed)?;
+    if entry_end > table.len() {
+        return Err(SnapshotError::ParseFailed);
+    }
+    Ok((start, entry_len))
+}
+
 /// Walk the raw on-disk snapshot table `table` for `nb_snapshots`
 /// entries and return the total byte length up to the unpadded end
 /// of the last entry.
@@ -152,36 +200,42 @@ pub fn serialize_snapshot_entry(
 pub fn snapshot_table_byte_len(table: &[u8], nb_snapshots: u32) -> Result<usize, SnapshotError> {
     let mut offset: usize = 0;
     for _ in 0..nb_snapshots {
-        // 8-align the entry start.
-        offset = round_up_8(offset).ok_or(SnapshotError::ParseFailed)?;
-        let header_end = offset
-            .checked_add(SNAPSHOT_HEADER_SIZE)
-            .ok_or(SnapshotError::ParseFailed)?;
-        if header_end > table.len() {
-            return Err(SnapshotError::ParseFailed);
-        }
-        let extra_data_size = u32::from_be_bytes([
-            table[offset + 36],
-            table[offset + 37],
-            table[offset + 38],
-            table[offset + 39],
-        ]) as usize;
-        let id_str_size = u16::from_be_bytes([table[offset + 12], table[offset + 13]]) as usize;
-        let name_size = u16::from_be_bytes([table[offset + 14], table[offset + 15]]) as usize;
-        let entry_len = SNAPSHOT_HEADER_SIZE
-            .checked_add(extra_data_size)
-            .and_then(|v| v.checked_add(id_str_size))
-            .and_then(|v| v.checked_add(name_size))
-            .ok_or(SnapshotError::ParseFailed)?;
-        let entry_end = offset
-            .checked_add(entry_len)
-            .ok_or(SnapshotError::ParseFailed)?;
-        if entry_end > table.len() {
-            return Err(SnapshotError::ParseFailed);
-        }
-        offset = entry_end;
+        let (start, len) = entry_bounds_at(table, offset)?;
+        offset = start + len;
     }
     Ok(offset)
+}
+
+/// Return the `(start_offset, unpadded_length)` of raw entry
+/// `index` within `table`, walking entries exactly like
+/// [`snapshot_table_byte_len`].
+///
+/// MODE_DELETE (phase 7) uses this to find the matched entry's raw
+/// bytes (the find-by-name walk compares the full on-disk name,
+/// independent of the bounded parser's 63-char truncation) and to
+/// compute the compaction copy ranges.
+///
+/// Returns [`SnapshotError::InvalidConfig`] if
+/// `index >= nb_snapshots`, or [`SnapshotError::ParseFailed`] if
+/// the walk would escape `table`.
+pub fn snapshot_table_entry_bounds(
+    table: &[u8],
+    nb_snapshots: u32,
+    index: u32,
+) -> Result<(usize, usize), SnapshotError> {
+    if index >= nb_snapshots {
+        return Err(SnapshotError::InvalidConfig);
+    }
+    let mut offset: usize = 0;
+    for i in 0..=index {
+        let (start, len) = entry_bounds_at(table, offset)?;
+        if i == index {
+            return Ok((start, len));
+        }
+        offset = start + len;
+    }
+    // Unreachable: the loop returns at i == index.
+    Err(SnapshotError::ParseFailed)
 }
 
 /// Build the new snapshot table into `out`: the old entries copied
@@ -222,6 +276,65 @@ pub fn build_snapshot_table(
     // Append the new entry.
     out[aligned..total].copy_from_slice(new_entry);
     Ok(total)
+}
+
+/// Build the compacted snapshot table into `out`: every entry of
+/// the old table except `remove_index` copied verbatim, each
+/// surviving entry starting at the next 8-aligned output offset
+/// with the alignment gaps zeroed. Returns the total byte length
+/// (unpadded after the last surviving entry, matching qemu).
+///
+/// This is MODE_DELETE's table compaction (phase 7, open
+/// question 5): a verbatim per-entry copy preserves unknown
+/// trailing extra data byte-for-byte, exactly what the
+/// byte-identity matrix against `qemu-img snapshot -d` requires.
+/// Removing the sole remaining entry yields length 0 (the caller
+/// then writes header `nb_snapshots = 0, snapshots_offset = 0`
+/// and allocates no table — phase plan fact 3).
+///
+/// `old_len` is the exact byte length of the old table (from
+/// [`snapshot_table_byte_len`]); only `old_table[..old_len]` is
+/// walked. Returns [`SnapshotError::InvalidConfig`] if
+/// `remove_index >= nb_snapshots`,
+/// [`SnapshotError::MisalignedAccess`] if `old_len` exceeds
+/// `old_table` or `out` is too small, and
+/// [`SnapshotError::ParseFailed`] if the walk escapes the table.
+pub fn build_snapshot_table_without(
+    old_table: &[u8],
+    old_len: usize,
+    nb_snapshots: u32,
+    remove_index: u32,
+    out: &mut [u8],
+) -> Result<usize, SnapshotError> {
+    if remove_index >= nb_snapshots {
+        return Err(SnapshotError::InvalidConfig);
+    }
+    if old_len > old_table.len() {
+        return Err(SnapshotError::MisalignedAccess);
+    }
+    let table = &old_table[..old_len];
+    let mut in_offset: usize = 0;
+    let mut out_offset: usize = 0;
+    for i in 0..nb_snapshots {
+        let (start, len) = entry_bounds_at(table, in_offset)?;
+        in_offset = start + len;
+        if i == remove_index {
+            continue;
+        }
+        // 8-align the surviving entry's output start, zeroing the
+        // alignment gap.
+        let aligned = round_up_8(out_offset).ok_or(SnapshotError::ParseFailed)?;
+        let end = aligned.checked_add(len).ok_or(SnapshotError::ParseFailed)?;
+        if end > out.len() {
+            return Err(SnapshotError::MisalignedAccess);
+        }
+        for b in out.iter_mut().take(aligned).skip(out_offset) {
+            *b = 0;
+        }
+        out[aligned..end].copy_from_slice(&table[start..start + len]);
+        out_offset = end;
+    }
+    Ok(out_offset)
 }
 
 /// Parse the leading decimal digits of `id`, strtoul-style.
@@ -591,6 +704,214 @@ mod tests {
     fn format_decimal_u64_too_small_returns_zero() {
         let mut out = [0u8; 2];
         assert_eq!(format_decimal_u64(123, &mut out), 0);
+    }
+
+    // -------------------- snapshot_table_entry_bounds --------------------
+
+    /// The 3-entry mixed-length table used by the bounds / build
+    /// tests: id/name lengths chosen so entry lengths are NOT
+    /// multiples of 8 (the alignment maths must be exercised) and
+    /// the middle entry carries unknown trailing extra data.
+    fn mixed_table(buf: &mut [u8]) -> usize {
+        build_raw_table(
+            buf,
+            &[
+                (b"1", b"alpha", 24),   // 40+24+1+5 = 70
+                (b"22", b"beta", 40),   // 40+40+2+4 = 86 (unknown extra)
+                (b"3", b"gamma-x", 24), // 40+24+1+7 = 72
+            ],
+        )
+    }
+
+    #[test]
+    fn entry_bounds_first_middle_last() {
+        let mut raw = [0u8; 512];
+        let total = mixed_table(&mut raw);
+        let t = &raw[..total];
+        // Entry 0 at 0, len 70. Entry 1 at 72 (70 aligned), len 86.
+        // Entry 2 at 160 (158 aligned), len 72.
+        assert_eq!(snapshot_table_entry_bounds(t, 3, 0).unwrap(), (0, 70));
+        assert_eq!(snapshot_table_entry_bounds(t, 3, 1).unwrap(), (72, 86));
+        assert_eq!(snapshot_table_entry_bounds(t, 3, 2).unwrap(), (160, 72));
+        // Cross-check against the total walk.
+        assert_eq!(snapshot_table_byte_len(t, 3).unwrap(), 160 + 72);
+        assert_eq!(total, 232);
+    }
+
+    #[test]
+    fn entry_bounds_recovers_name_bytes() {
+        // The bounds plus the in-entry header offsets recover the
+        // exact name bytes — the delete find-by-name path.
+        let mut raw = [0u8; 512];
+        let total = mixed_table(&mut raw);
+        let t = &raw[..total];
+        let (start, _len) = snapshot_table_entry_bounds(t, 3, 1).unwrap();
+        let extra = u32::from_be_bytes(t[start + 36..start + 40].try_into().unwrap()) as usize;
+        let id_size = u16::from_be_bytes(t[start + 12..start + 14].try_into().unwrap()) as usize;
+        let name_size = u16::from_be_bytes(t[start + 14..start + 16].try_into().unwrap()) as usize;
+        let name_start = start + 40 + extra + id_size;
+        assert_eq!(&t[name_start..name_start + name_size], b"beta");
+    }
+
+    #[test]
+    fn entry_bounds_index_out_of_range() {
+        let mut raw = [0u8; 512];
+        let total = mixed_table(&mut raw);
+        assert_eq!(
+            snapshot_table_entry_bounds(&raw[..total], 3, 3),
+            Err(SnapshotError::InvalidConfig)
+        );
+        assert_eq!(
+            snapshot_table_entry_bounds(&[], 0, 0),
+            Err(SnapshotError::InvalidConfig)
+        );
+    }
+
+    #[test]
+    fn entry_bounds_escape_errors() {
+        // Entry 1's header lies past the truncated buffer.
+        let mut raw = [0u8; 512];
+        let _ = mixed_table(&mut raw);
+        assert_eq!(
+            snapshot_table_entry_bounds(&raw[..80], 3, 1),
+            Err(SnapshotError::ParseFailed)
+        );
+        // A header claiming a huge name escapes for index 0.
+        let mut bad = [0u8; 40];
+        bad[14..16].copy_from_slice(&0xFFFFu16.to_be_bytes());
+        assert_eq!(
+            snapshot_table_entry_bounds(&bad, 1, 0),
+            Err(SnapshotError::ParseFailed)
+        );
+    }
+
+    // -------------------- build_snapshot_table_without --------------------
+
+    /// Helper: bounds of each entry of `table` as (start, len).
+    fn all_bounds(table: &[u8], nb: u32) -> [(usize, usize); 3] {
+        let mut out = [(0usize, 0usize); 3];
+        for (i, slot) in out.iter_mut().enumerate().take(nb as usize) {
+            *slot = snapshot_table_entry_bounds(table, nb, i as u32).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn build_without_first_preserves_survivors() {
+        let mut raw = [0u8; 512];
+        let total = mixed_table(&mut raw);
+        let t = &raw[..total];
+        let b = all_bounds(t, 3);
+        let mut out = [0xEEu8; 512];
+        let new_len = build_snapshot_table_without(t, total, 3, 0, &mut out).unwrap();
+        // Survivors: entry 1 (len 86) at 0, entry 2 (len 72) at 88.
+        assert_eq!(new_len, 88 + 72);
+        assert_eq!(&out[..86], &t[b[1].0..b[1].0 + b[1].1]);
+        // Alignment gap zeroed.
+        assert_eq!(&out[86..88], &[0, 0]);
+        assert_eq!(&out[88..88 + 72], &t[b[2].0..b[2].0 + b[2].1]);
+        // The new table re-walks cleanly as a 2-entry table.
+        assert_eq!(
+            snapshot_table_byte_len(&out[..new_len], 2).unwrap(),
+            new_len
+        );
+    }
+
+    #[test]
+    fn build_without_middle_preserves_survivors() {
+        // Removing the middle (unknown-extra) entry: survivors 0
+        // and 2 are copied verbatim. (The unknown-extra entry's own
+        // verbatim preservation as a survivor is pinned by
+        // build_without_first_preserves_survivors above.)
+        let mut raw = [0u8; 512];
+        let total = mixed_table(&mut raw);
+        let t = &raw[..total];
+        let b = all_bounds(t, 3);
+        let mut out = [0xEEu8; 512];
+        let new_len = build_snapshot_table_without(t, total, 3, 1, &mut out).unwrap();
+        // Survivors: entry 0 (len 70) at 0, entry 2 (len 72) at 72.
+        assert_eq!(new_len, 72 + 72);
+        assert_eq!(&out[..70], &t[b[0].0..b[0].0 + b[0].1]);
+        assert_eq!(&out[70..72], &[0, 0]);
+        assert_eq!(&out[72..72 + 72], &t[b[2].0..b[2].0 + b[2].1]);
+    }
+
+    #[test]
+    fn build_without_last_is_prefix() {
+        // Removing the last entry leaves the old table's prefix
+        // byte-for-byte (no re-alignment changes for survivors).
+        let mut raw = [0u8; 512];
+        let total = mixed_table(&mut raw);
+        let t = &raw[..total];
+        let b = all_bounds(t, 3);
+        let mut out = [0xEEu8; 512];
+        let new_len = build_snapshot_table_without(t, total, 3, 2, &mut out).unwrap();
+        // Survivors end at entry 1's unpadded end: 72 + 86 = 158.
+        assert_eq!(new_len, b[1].0 + b[1].1);
+        assert_eq!(&out[..new_len], &t[..new_len]);
+    }
+
+    #[test]
+    fn build_without_realigns_after_odd_length_removal() {
+        // Entry 0's length (70) is not a multiple of 8; removing it
+        // shifts entry 1 from input offset 72 to output offset 0,
+        // and entry 2 from 160 to 88 — both 8-aligned.
+        let mut raw = [0u8; 512];
+        let total = mixed_table(&mut raw);
+        let t = &raw[..total];
+        let mut out = [0u8; 512];
+        let new_len = build_snapshot_table_without(t, total, 3, 0, &mut out).unwrap();
+        let (s1, _) = snapshot_table_entry_bounds(&out[..new_len], 2, 0).unwrap();
+        let (s2, _) = snapshot_table_entry_bounds(&out[..new_len], 2, 1).unwrap();
+        assert_eq!(s1 % 8, 0);
+        assert_eq!(s2 % 8, 0);
+    }
+
+    #[test]
+    fn build_without_sole_entry_yields_zero() {
+        let mut raw = [0u8; 128];
+        let total = build_raw_table(&mut raw, &[(b"1", b"only", 24)]);
+        let mut out = [0xEEu8; 64];
+        assert_eq!(
+            build_snapshot_table_without(&raw[..total], total, 1, 0, &mut out).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn build_without_rejects_bad_args() {
+        let mut raw = [0u8; 512];
+        let total = mixed_table(&mut raw);
+        let mut out = [0u8; 512];
+        // remove_index out of range.
+        assert_eq!(
+            build_snapshot_table_without(&raw[..total], total, 3, 3, &mut out),
+            Err(SnapshotError::InvalidConfig)
+        );
+        // old_len beyond the slice.
+        assert_eq!(
+            build_snapshot_table_without(&raw[..100], 200, 3, 0, &mut out),
+            Err(SnapshotError::MisalignedAccess)
+        );
+        // out too small for the survivors.
+        let mut tiny = [0u8; 16];
+        assert_eq!(
+            build_snapshot_table_without(&raw[..total], total, 3, 0, &mut tiny),
+            Err(SnapshotError::MisalignedAccess)
+        );
+    }
+
+    #[test]
+    fn build_without_malformed_table_errors() {
+        // A truncated table (entry 1 escapes) fails ParseFailed even
+        // when removing entry 0.
+        let mut raw = [0u8; 512];
+        let _ = mixed_table(&mut raw);
+        let mut out = [0u8; 512];
+        assert_eq!(
+            build_snapshot_table_without(&raw[..80], 80, 3, 0, &mut out),
+            Err(SnapshotError::ParseFailed)
+        );
     }
 
     // Keep the OFLAG_COPIED import meaningful: a serialized entry's

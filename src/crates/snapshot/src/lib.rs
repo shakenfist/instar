@@ -22,6 +22,9 @@
 //!   L1 -> L2 chain, classifying each allocated cluster.
 //! - [`qcow2::update_snapshot_refcount`] — two-pass refcount
 //!   mutator (dry-run reads only, apply pass mutates).
+//! - [`qcow2::precheck_snapshot_refcount`] — the dry-run pass
+//!   alone, read-only, for callers that must validate before any
+//!   disk write but apply after a commit point (delete, phase 7).
 //! - [`qcow2::update_copied_flags_for_l1`] — rewrites COPIED
 //!   flags on L1 and L2 entries based on current refcount.
 //!

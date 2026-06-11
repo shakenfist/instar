@@ -713,6 +713,13 @@ pub enum SnapshotRefcountOp<'a> {
 /// **Pass 2 (apply)** walks the same L1(s) again and applies
 /// each new value via [`set_refcount_in_block`].
 ///
+/// Callers that need the validation *without* the paired apply
+/// (e.g. MODE_DELETE's pre-write validation, which must run
+/// before any disk write while the apply must run after the
+/// commit-point header write) use the standalone
+/// [`precheck_snapshot_refcount`], which runs exactly this
+/// function's pass 1 against an immutable `refblocks`.
+///
 /// **L2-table coverage.** Both passes adjust the refcount of
 /// every reachable *data* cluster **and** of each **L2 table
 /// cluster** — once per non-zero L1 entry, after that entry's L2
@@ -838,6 +845,91 @@ where
                 &mut refblock_byte_offset_for_cluster,
             )?;
             apply_refcount_pass(
+                to_l1,
+                1,
+                refblocks,
+                cluster_bits,
+                refcount_bits,
+                extended_l2,
+                &mut l2_for_index,
+                &mut refblock_byte_offset_for_cluster,
+            )
+        }
+    }
+}
+
+/// Read-only refcount pre-validation: run
+/// [`update_snapshot_refcount`]'s dry-run pass (pass 1) for `op`
+/// without the paired apply pass.
+///
+/// Walks the relevant L1(s) and, for every reachable data cluster
+/// **and** every L2 table cluster (the same coverage as
+/// [`update_snapshot_refcount`]), reads the current refcount from
+/// `refblocks` and runs [`check_refcount_after_addend`] with the
+/// op's addend(s). `refblocks` is immutable — the borrow makes the
+/// no-mutation guarantee structural.
+///
+/// MODE_DELETE (phase 7) calls this *before any disk write* so a
+/// corrupt image (a chain cluster whose decrement would
+/// underflow) fails with the file untouched; the later full
+/// [`update_snapshot_refcount`] call's internal dry-run is then a
+/// redundant-but-free second check. [`SnapshotRefcountOp::
+/// SwapForApply`] prechecks both sides (decrement on `from_l1`,
+/// increment on `to_l1`), each against the *current* refcounts —
+/// the same independent-side semantics as the paired mutator's
+/// pass 1.
+///
+/// Errors are those of the dry-run pass:
+/// [`SnapshotError::RefcountOverflow`] (with the offending
+/// cluster's host offset), [`SnapshotError::ParseFailed`] for a
+/// decrement underflow, and [`SnapshotError::MisalignedAccess`]
+/// for staging gaps.
+pub fn precheck_snapshot_refcount<'l2, L2F, RBF>(
+    op: SnapshotRefcountOp<'_>,
+    refblocks: &[u8],
+    cluster_bits: u32,
+    refcount_bits: u32,
+    extended_l2: bool,
+    mut l2_for_index: L2F,
+    mut refblock_byte_offset_for_cluster: RBF,
+) -> Result<(), SnapshotError>
+where
+    L2F: FnMut(u32) -> Option<&'l2 [u8]>,
+    RBF: FnMut(u64) -> Option<(usize, u64)>,
+{
+    match op {
+        SnapshotRefcountOp::IncrementForCreate { snapshot_l1 } => dry_run_refcount_pass(
+            snapshot_l1,
+            1,
+            refblocks,
+            cluster_bits,
+            refcount_bits,
+            extended_l2,
+            &mut l2_for_index,
+            &mut refblock_byte_offset_for_cluster,
+        ),
+        SnapshotRefcountOp::DecrementForDelete { snapshot_l1 } => dry_run_refcount_pass(
+            snapshot_l1,
+            -1,
+            refblocks,
+            cluster_bits,
+            refcount_bits,
+            extended_l2,
+            &mut l2_for_index,
+            &mut refblock_byte_offset_for_cluster,
+        ),
+        SnapshotRefcountOp::SwapForApply { from_l1, to_l1 } => {
+            dry_run_refcount_pass(
+                from_l1,
+                -1,
+                refblocks,
+                cluster_bits,
+                refcount_bits,
+                extended_l2,
+                &mut l2_for_index,
+                &mut refblock_byte_offset_for_cluster,
+            )?;
+            dry_run_refcount_pass(
                 to_l1,
                 1,
                 refblocks,
@@ -2504,6 +2596,216 @@ mod tests {
         // dec then inc on the same clusters: net zero.
         assert_eq!(read_refcount_in_block(&refblocks, 0x4, 16).unwrap(), 2);
         assert_eq!(read_refcount_in_block(&refblocks, 0x100, 16).unwrap(), 2);
+    }
+
+    // -------------------- precheck_snapshot_refcount --------------------
+
+    #[test]
+    fn precheck_healthy_decrement_passes_and_mutates_nothing() {
+        let mut refblocks = [0u8; 4096];
+        for idx in [0x100u64, 0x101, 0x102, 0x103] {
+            set_refcount_in_block(&mut refblocks, idx, 16, 2).unwrap();
+        }
+        set_refcount_in_block(&mut refblocks, 0x4, 16, 2).unwrap();
+        let snapshot = refblocks; // byte-identity reference
+        let l1 = refc_l1();
+        precheck_snapshot_refcount(
+            SnapshotRefcountOp::DecrementForDelete { snapshot_l1: &l1 },
+            &refblocks,
+            12,
+            16,
+            false,
+            |_idx| Some(&REFC_L2[..]),
+            refblock_lookup,
+        )
+        .unwrap();
+        // Provably untouched on success too.
+        assert_eq!(refblocks, snapshot);
+    }
+
+    #[test]
+    fn precheck_detects_data_cluster_underflow() {
+        let mut refblocks = [0u8; 4096];
+        // Data cluster 0x10_1000 (entry 0x101) has refcount 0; the
+        // decrement underflows -> ParseFailed.
+        set_refcount_in_block(&mut refblocks, 0x100, 16, 1).unwrap();
+        set_refcount_in_block(&mut refblocks, 0x102, 16, 1).unwrap();
+        set_refcount_in_block(&mut refblocks, 0x103, 16, 1).unwrap();
+        set_refcount_in_block(&mut refblocks, 0x4, 16, 1).unwrap();
+        let snapshot = refblocks;
+        let l1 = refc_l1();
+        let err = precheck_snapshot_refcount(
+            SnapshotRefcountOp::DecrementForDelete { snapshot_l1: &l1 },
+            &refblocks,
+            12,
+            16,
+            false,
+            |_idx| Some(&REFC_L2[..]),
+            refblock_lookup,
+        );
+        assert_eq!(err, Err(SnapshotError::ParseFailed));
+        assert_eq!(refblocks, snapshot);
+    }
+
+    #[test]
+    fn precheck_detects_l2_table_cluster_underflow() {
+        let mut refblocks = [0u8; 4096];
+        // All data clusters healthy; the L2 table cluster itself
+        // (host 0x4000 -> entry 0x4) is 0, so the L2-table-cluster
+        // coverage must catch the underflow.
+        for idx in [0x100u64, 0x101, 0x102, 0x103] {
+            set_refcount_in_block(&mut refblocks, idx, 16, 1).unwrap();
+        }
+        let snapshot = refblocks;
+        let l1 = refc_l1();
+        let err = precheck_snapshot_refcount(
+            SnapshotRefcountOp::DecrementForDelete { snapshot_l1: &l1 },
+            &refblocks,
+            12,
+            16,
+            false,
+            |_idx| Some(&REFC_L2[..]),
+            refblock_lookup,
+        );
+        assert_eq!(err, Err(SnapshotError::ParseFailed));
+        assert_eq!(refblocks, snapshot);
+    }
+
+    #[test]
+    fn precheck_detects_increment_overflow_with_offset() {
+        let mut refblocks = [0u8; 4096];
+        set_refcount_in_block(&mut refblocks, 0x100, 16, 1).unwrap();
+        set_refcount_in_block(&mut refblocks, 0x101, 16, 0xffff).unwrap();
+        set_refcount_in_block(&mut refblocks, 0x102, 16, 1).unwrap();
+        set_refcount_in_block(&mut refblocks, 0x103, 16, 1).unwrap();
+        set_refcount_in_block(&mut refblocks, 0x4, 16, 1).unwrap();
+        let l1 = refc_l1();
+        let err = precheck_snapshot_refcount(
+            SnapshotRefcountOp::IncrementForCreate { snapshot_l1: &l1 },
+            &refblocks,
+            12,
+            16,
+            false,
+            |_idx| Some(&REFC_L2[..]),
+            refblock_lookup,
+        );
+        match err {
+            Err(SnapshotError::RefcountOverflow { at_host_offset }) => {
+                assert_eq!(at_host_offset, 0x10_1000);
+            }
+            other => panic!("expected RefcountOverflow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn precheck_swap_checks_decrement_side() {
+        let mut refblocks = [0u8; 4096];
+        // from_l1's data cluster 0x10_0000 has refcount 0 ->
+        // underflow on the decrement side.
+        set_refcount_in_block(&mut refblocks, 0x4, 16, 1).unwrap();
+        let from_l1 = l1_pointing_to(0x4000, true);
+        let to_l1 = [0u8; 8]; // empty
+        let err = precheck_snapshot_refcount(
+            SnapshotRefcountOp::SwapForApply {
+                from_l1: &from_l1,
+                to_l1: &to_l1,
+            },
+            &refblocks,
+            12,
+            16,
+            false,
+            |_idx| Some(&L2_ONE_DATA[..]),
+            refblock_lookup,
+        );
+        assert_eq!(err, Err(SnapshotError::ParseFailed));
+    }
+
+    #[test]
+    fn precheck_swap_checks_increment_side() {
+        let mut refblocks = [0u8; 4096];
+        // to_l1's data cluster 0x10_0000 is at the 16-bit max ->
+        // overflow on the increment side.
+        set_refcount_in_block(&mut refblocks, 0x100, 16, 0xffff).unwrap();
+        set_refcount_in_block(&mut refblocks, 0x4, 16, 1).unwrap();
+        let from_l1 = [0u8; 8]; // empty
+        let to_l1 = l1_pointing_to(0x4000, true);
+        let err = precheck_snapshot_refcount(
+            SnapshotRefcountOp::SwapForApply {
+                from_l1: &from_l1,
+                to_l1: &to_l1,
+            },
+            &refblocks,
+            12,
+            16,
+            false,
+            |_idx| Some(&L2_ONE_DATA[..]),
+            refblock_lookup,
+        );
+        match err {
+            Err(SnapshotError::RefcountOverflow { at_host_offset }) => {
+                assert_eq!(at_host_offset, 0x10_0000);
+            }
+            other => panic!("expected RefcountOverflow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn precheck_swap_healthy_both_sides_passes() {
+        let mut refblocks = [0u8; 4096];
+        set_refcount_in_block(&mut refblocks, 0x100, 16, 2).unwrap();
+        set_refcount_in_block(&mut refblocks, 0x4, 16, 2).unwrap();
+        let snapshot = refblocks;
+        let from_l1 = l1_pointing_to(0x4000, true);
+        let to_l1 = l1_pointing_to(0x4000, true);
+        precheck_snapshot_refcount(
+            SnapshotRefcountOp::SwapForApply {
+                from_l1: &from_l1,
+                to_l1: &to_l1,
+            },
+            &refblocks,
+            12,
+            16,
+            false,
+            |_idx| Some(&L2_ONE_DATA[..]),
+            refblock_lookup,
+        )
+        .unwrap();
+        assert_eq!(refblocks, snapshot);
+    }
+
+    #[test]
+    fn precheck_matches_paired_mutator_dry_run() {
+        // The precheck must agree with update_snapshot_refcount's
+        // built-in pass 1: where the precheck passes, the paired
+        // mutator applies cleanly.
+        let mut refblocks = [0u8; 4096];
+        for idx in [0x100u64, 0x101, 0x102, 0x103] {
+            set_refcount_in_block(&mut refblocks, idx, 16, 2).unwrap();
+        }
+        set_refcount_in_block(&mut refblocks, 0x4, 16, 2).unwrap();
+        let l1 = refc_l1();
+        precheck_snapshot_refcount(
+            SnapshotRefcountOp::DecrementForDelete { snapshot_l1: &l1 },
+            &refblocks,
+            12,
+            16,
+            false,
+            |_idx| Some(&REFC_L2[..]),
+            refblock_lookup,
+        )
+        .unwrap();
+        update_snapshot_refcount(
+            SnapshotRefcountOp::DecrementForDelete { snapshot_l1: &l1 },
+            &mut refblocks,
+            12,
+            16,
+            false,
+            |_idx| Some(&REFC_L2[..]),
+            refblock_lookup,
+        )
+        .unwrap();
+        assert_eq!(read_refcount_in_block(&refblocks, 0x100, 16).unwrap(), 1);
+        assert_eq!(read_refcount_in_block(&refblocks, 0x4, 16).unwrap(), 1);
     }
 
     // -------------------- update_copied_flags_for_l1 --------------------
