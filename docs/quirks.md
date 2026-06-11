@@ -1558,31 +1558,21 @@ captured baselines. The raw per-version baselines for all 80
 matrix versions live in
 `instar-testdata/expected-outputs/snapshot-list-human/`.
 
-### Snapshot names longer than 63 bytes are truncated in list output
+### Snapshot names up to 255 bytes are listed in full
 
-instar's list path reads each snapshot entry through a streaming
-parser (`for_each_snapshot_entry` in `src/crates/qcow2/src/lib.rs`)
-that copies at most 63 bytes of the snapshot name into the
-`SnapshotEntry::name: [u8; 64]` intermediate buffer
-(`.min(63)` cap; the 64th byte is reserved for the null sentinel).
-The converter (`snapshot_entry_to_record`) then propagates
-`min(name_len, 64)` bytes to the wire record.
+`SnapshotEntry::name` was widened from `[u8; 64]` to `[u8; 256]`
+and the parser's copy cap raised from `.min(63)` to `.min(255)`.
+The wire record's `name` field is 256 bytes, so no truncation
+occurs for any name qemu-img can produce (qemu caps creation at
+255 bytes). Fixture `snap-qcow2-longname` (200-byte name) in the
+phase 10 baseline matrix produces byte-identical output to
+`qemu-img snapshot -l`.
 
-The result: any snapshot whose on-disk name exceeds 63 bytes is
-rendered truncated in the `TAG` column. qemu-img renders the full
-name. For example, a 200-byte name appears as 63 characters in
-`instar snapshot -l` output but all 200 in `qemu-img snapshot -l`
-output. Fixture `snap-qcow2-longname` in the phase 10 baseline
-matrix exercises this case and its expected output reflects the
-truncated form.
-
-This is a v1 limitation: the 63-byte cap was chosen to match the
-historical qemu-img `--snapshot` argument maximum, but
-`qemu-img snapshot -c` itself silently accepts names up to 255
-bytes (instar's create path enforces 255 bytes and refuses
-256+). Raising the intermediate buffer to 256 bytes and removing
-the `.min(63)` cap would fix the list-mode truncation; tracked as
-a v1+ follow-up.
+**Residual note**: names longer than the 256-byte wire buffer
+(i.e. longer than 255 usable bytes) would still be silently
+truncated at the converter. This is unreachable via `qemu-img
+snapshot -c`, which caps creation at 255 bytes; instar's own
+create path refuses 256+ byte names with an error.
 
 ### `snapshot -c` (create) quirks
 

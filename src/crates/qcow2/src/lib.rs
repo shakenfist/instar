@@ -632,8 +632,13 @@ pub struct SnapshotEntry {
     pub name_len: u16,
     /// Snapshot ID (null-terminated, max 63 chars)
     pub id: [u8; 64],
-    /// Snapshot name (null-terminated, max 63 chars)
-    pub name: [u8; 64],
+    /// Snapshot name (null-terminated, max 255 chars).
+    ///
+    /// Widened from 64 to 256 bytes so the parser can hold any name
+    /// that qemu-img can create (qemu caps creation at 255 bytes).
+    /// The wire record's `name` field is also 256 bytes, so no
+    /// truncation occurs on the list path for any qemu-reachable name.
+    pub name: [u8; 256],
     /// Creation timestamp (seconds since epoch)
     pub date_sec: u32,
     /// VM state size in bytes (legacy 32-bit field).
@@ -681,7 +686,7 @@ impl SnapshotEntry {
             id_len: 0,
             name_len: 0,
             id: [0; 64],
-            name: [0; 64],
+            name: [0; 256],
             date_sec: 0,
             vm_state_size: 0,
             date_nsec: 0,
@@ -1025,7 +1030,11 @@ pub unsafe fn for_each_snapshot_entry(
         // entry.id[id_copy_len] is already zero from `zeroed()`.
 
         let name_start = id_start + raw.id_str_size as u64;
-        let name_copy_len = (raw.name_size as usize).min(63);
+        // Cap at 255: the name buffer is [u8; 256] with the last byte
+        // reserved as null sentinel, matching the wire record's 256-byte
+        // name field.  qemu-img caps creation at 255 bytes, so this is
+        // lossless for every name qemu-img can produce.
+        let name_copy_len = (raw.name_size as usize).min(255);
         if name_copy_len > 0
             && !read_bytes_cached(
                 call_table,
@@ -1194,16 +1203,21 @@ pub unsafe fn find_snapshot_streaming(
 /// post-2106 future).
 ///
 /// id/name are silently truncated to the wire-record buffer sizes
-/// (32 bytes for id, 256 for name) and the `_len` fields reflect
-/// the truncated length, matching qemu's truncation behaviour.
+/// (32 bytes for id, 256 for name) and the `_len` fields reflect the
+/// truncated length. In practice `SnapshotEntry::name` is 256 bytes
+/// (parser cap 255), so no truncation occurs for any name qemu-img
+/// can produce (qemu caps creation at 255 bytes). The clamp is
+/// retained as a depth-defence against pathological callers.
 pub fn snapshot_entry_to_record(
     entry: &SnapshotEntry,
     header_virtual_size: u64,
 ) -> shared::SnapshotEntryRecord {
-    // Clamp len against both the parser's source buffer (64 bytes) and
-    // the wire record's destination buffer (32 for id, 256 for name).
-    // The parser already truncates strings at 63 bytes, so in practice
-    // id_len <= 63 and name_len <= 63 — but defend in depth.
+    // Clamp len against both the parser's source buffer and the wire
+    // record's destination buffer (32 bytes for id, 256 for name).
+    // The parser caps id at 63 bytes ([u8;64]) and name at 255 bytes
+    // ([u8;256]), so in practice id_len <= 63 and name_len <= 255 —
+    // but defend in depth against any future caller that bypasses the
+    // parser.
     let id_len = (entry.id_len as usize).min(entry.id.len()).min(32);
     let name_len = (entry.name_len as usize).min(entry.name.len()).min(256);
     let mut id = [0u8; 32];
@@ -4155,28 +4169,27 @@ mod tests {
 
     #[test]
     fn snapshot_entry_to_record_long_name_truncates_to_wire_buffer() {
-        // The wire record's `name` is 256 bytes; the parser's
-        // `SnapshotEntry::name` is only 64. With name_len = 300 (set
-        // directly, bypassing the parser's own truncation), the
-        // converter must clamp against both the source buffer (64)
-        // and the destination buffer (256). The resulting wire
-        // name_len is therefore 64 (source-buffer-bounded), not 300
-        // (raw entry value) or 256 (dest-bounded). This guards
-        // against an OOB panic if a future change to the converter
-        // forgets to clamp the source side.
+        // `SnapshotEntry::name` is now [u8; 256] (parser cap 255), matching
+        // the wire record's destination buffer exactly.  With name_len = 300
+        // (set directly, bypassing the parser's own truncation), the
+        // converter must clamp against both the source buffer (256) and the
+        // destination buffer (256).  The resulting wire name_len is therefore
+        // 256 (source-buffer-bounded), not 300 (raw entry value).
+        // Previously the source buffer was [u8; 64] and the expected result
+        // was 64 — that cap was the bug fixed here; this test is deliberately
+        // updated to reflect the widened buffer, not blind re-snapshotted.
         let mut entry = SnapshotEntry::zeroed();
         entry.name_len = 300;
         for (i, b) in entry.name.iter_mut().enumerate() {
             *b = (i as u8) | 0x80;
         }
         let rec = snapshot_entry_to_record(&entry, 0);
-        assert_eq!(rec.name_len, 64);
-        // The 64 source bytes land at the start of the 256-byte
-        // wire buffer; the rest is zero-padded.
-        for (i, &b) in rec.name[..64].iter().enumerate() {
+        // Source buffer is 256 bytes; dest buffer is also 256 bytes.
+        assert_eq!(rec.name_len, 256);
+        // All 256 source bytes land verbatim in the wire buffer.
+        for (i, &b) in rec.name.iter().enumerate() {
             assert_eq!(b, (i as u8) | 0x80);
         }
-        assert!(rec.name[64..].iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -4196,6 +4209,128 @@ mod tests {
         }
     }
 
+    // ---- 200-byte name round-trip tests (longname fix) -----------
+
+    /// Build a 200-byte cyclic (a-z) name pattern into `out`.
+    fn make_200_byte_name(out: &mut [u8; 200]) {
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = b'a' + (i as u8 % 26);
+        }
+    }
+
+    /// Build the bytes for a single snapshot entry with a 200-byte name.
+    /// Returns the raw bytes to place in the fixture buffer and the
+    /// expected post-padding byte length.
+    fn longname_200_entry_bytes() -> ([u8; 512], usize) {
+        let mut name = [0u8; 200];
+        make_200_byte_name(&mut name);
+        let id = b"1";
+        let mut buf = [0u8; 512];
+        let end = write_entry(&mut buf, 0, id, &name);
+        (buf, end)
+    }
+
+    #[test]
+    fn for_each_snapshot_entry_200_byte_name_round_trip() {
+        // A 200-byte snapshot name must survive the streaming parser
+        // with all 200 bytes intact and name_len == 200.
+        let _guard = STREAMING_LOCK.lock().unwrap();
+        unsafe {
+            let (entry_bytes, _end) = longname_200_entry_bytes();
+            let buf = &raw mut STREAMING_FIXTURE.buf;
+            for b in (*buf).iter_mut() {
+                *b = 0;
+            }
+            (&mut (*buf))[..entry_bytes.len()].copy_from_slice(&entry_bytes);
+            let ct = make_streaming_call_table();
+            let mut cache = [0u8; 512];
+            let mut bytes = 0u64;
+            let mut captured: Option<SnapshotEntry> = None;
+            let done = for_each_snapshot_entry(
+                &ct,
+                0,
+                1,
+                0,
+                512,
+                8,
+                cache.as_mut_ptr(),
+                &mut bytes,
+                |e| {
+                    captured = Some(*e);
+                    true
+                },
+            );
+            assert!(done, "for_each_snapshot_entry should complete");
+            let e = captured.expect("callback must have fired");
+            assert_eq!(e.name_len, 200, "name_len must be 200");
+            // Check all 200 bytes are the correct cyclic pattern.
+            let mut expected = [0u8; 200];
+            make_200_byte_name(&mut expected);
+            assert_eq!(&e.name[..200], &expected[..]);
+            // Bytes past name_len must be zero (zeroed() guarantee).
+            assert!(
+                e.name[200..].iter().all(|&b| b == 0),
+                "bytes past name_len must be zero"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_entry_to_record_200_byte_name_round_trip() {
+        // A 200-byte name that came through the parser must arrive on
+        // the wire with all 200 bytes intact.
+        let mut entry = SnapshotEntry::zeroed();
+        entry.name_len = 200;
+        let mut expected = [0u8; 200];
+        make_200_byte_name(&mut expected);
+        entry.name[..200].copy_from_slice(&expected);
+        let rec = snapshot_entry_to_record(&entry, 4096);
+        assert_eq!(rec.name_len, 200);
+        assert_eq!(&rec.name[..200], &expected[..]);
+        assert!(rec.name[200..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn snapshot_entry_to_record_255_byte_name_boundary() {
+        // 255 bytes is the maximum qemu-img can create.  All 255 bytes
+        // must pass through the converter without truncation.
+        let mut entry = SnapshotEntry::zeroed();
+        entry.name_len = 255;
+        // Fill with a recognisable pattern.
+        let mut expected = [0u8; 255];
+        for (i, b) in expected.iter_mut().enumerate() {
+            *b = (i as u8) | 0xA0;
+        }
+        entry.name[..255].copy_from_slice(&expected);
+        let rec = snapshot_entry_to_record(&entry, 0);
+        assert_eq!(rec.name_len, 255);
+        assert_eq!(&rec.name[..255], &expected[..]);
+        assert_eq!(rec.name[255], 0);
+    }
+
+    #[test]
+    fn snapshot_entry_to_record_256_byte_name_over_limit_truncation_pin() {
+        // name_len = 256 is unreachable via qemu-img (which caps
+        // creation at 255), but if a caller forces it the converter
+        // must clamp to the source buffer size (256) AND the
+        // destination buffer size (256).  Both are 256, so the wire
+        // name_len must be 256 — all 256 bytes land intact.
+        // (A name_len > 256 would be clamped to 256 by entry.name.len().)
+        let mut entry = SnapshotEntry::zeroed();
+        entry.name_len = 257; // beyond any on-disk possibility
+        for (i, b) in entry.name.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_add(0x20);
+        }
+        let rec = snapshot_entry_to_record(&entry, 0);
+        // min(257, 256 [src], 256 [dst]) = 256
+        assert_eq!(rec.name_len, 256);
+        for (i, &b) in rec.name.iter().enumerate() {
+            assert_eq!(b, (i as u8).wrapping_add(0x20));
+        }
+    }
+
+    // ---- end 200-byte name round-trip tests ----------------------
+
     #[test]
     fn snapshot_entry_icount_absent_matches_shared() {
         assert_eq!(
@@ -4209,18 +4344,26 @@ mod tests {
     fn snapshot_entry_size_tripwire() {
         // Tripwire: if SnapshotEntry's size drifts, the bounded
         // SnapshotTable's stack footprint changes and callers
-        // (info, convert) need re-validation. Adjust this number
-        // intentionally when adding fields, after auditing callers.
+        // (convert) need re-validation.  Adjust this number
+        // intentionally when adding/resizing fields, after auditing
+        // callers.
         //
-        // Current shape: u64 + u32 + u16 + u16 + [u8;64] + [u8;64] +
+        // Current shape: u64 + u32 + u16 + u16 + [u8;64] + [u8;256] +
         // u32 + u32 + u32 + u64 + u64 + u64 + u64 + u32
-        // The rust layout may pad; verify against actual size_of.
+        // = 8 + 4 + 2 + 2 + 64 + 256 + 4 + 4 + 4 + 8 + 8 + 8 + 8 + 4
+        // = 384 bytes (plus any Rust padding).
+        //
+        // `name` was widened from [u8;64] to [u8;256] when fixing the
+        // list-mode 63-byte truncation bug.  The 16-entry SnapshotTable
+        // grows by 16×192 = 3072 bytes (from ~3 KiB to ~6 KiB), well
+        // within the 4 MiB guest stack budget.  The convert caller
+        // (src/operations/convert/src/main.rs:413) allocates this as a
+        // local variable; stack headroom remains ample (>2×).
         let s = core::mem::size_of::<SnapshotEntry>();
-        // Sanity bounds: must fit comfortably below 256 bytes so the
-        // bounded 16-entry SnapshotTable stays in the low-kilobyte
-        // range.
+        // Sanity bounds: must fit below 512 bytes so the bounded
+        // 16-entry SnapshotTable stays in the low-kilobyte range.
         assert!(
-            s >= 184 && s <= 256,
+            s >= 376 && s <= 512,
             "SnapshotEntry size unexpected: {} bytes",
             s
         );

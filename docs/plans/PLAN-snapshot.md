@@ -980,7 +980,7 @@ qemu-img.
 | 7. Snapshot delete planner + guest binary (MODE_DELETE), plus the `-d` host dispatch (pulled forward like `-c` was) and the shared `run_snapshot_mutating_guest` launch helper | PLAN-snapshot-phase-07-delete.md | Landed |
 | 8. Snapshot apply planner + guest binary (MODE_APPLY), plus the `-a` host dispatch (pulled forward like `-c` / `-d`), the shared raw-table finder (`find_snapshot_in_table`, ID-then-name for apply / name-only for delete), and the walker stale-flag scrub | PLAN-snapshot-phase-08-apply.md | Landed |
 | 9. Host CLI consolidation and parity: D1 fix (`-U` with mutating modes refused before file access), D2 fix (bare `snapshot FILE` defaults to list), D3 documented (mixed-mode exit-code delta kept as-is), launch consolidation declined (renderer borrow fights the helper boundary), `tools/snapshot-cli-parity.sh` (30 assertions, all passing), quirks docs updated. | PLAN-snapshot-phase-09-mutate-host.md | Landed |
-| 10. Cross-version baselines: snapshot-bearing qcow2 fixtures, `snapshot-list-human` profiles in `generate-baselines.py` (JSON deferred to phase 11 — no qemu source of truth; mutation baselines dropped — column drift already captured by listing frozen fixtures), baseline generation pass for 80 versions. FINDING: snapshot names >63 bytes are truncated by the list parser (documented in quirks.md; `snap-qcow2-longname` profile reflects truncated form). | PLAN-snapshot-phase-10-baselines.md | Landed |
+| 10. Cross-version baselines: snapshot-bearing qcow2 fixtures, `snapshot-list-human` profiles in `generate-baselines.py` (JSON deferred to phase 11 — no qemu source of truth; mutation baselines dropped — column drift already captured by listing frozen fixtures), baseline generation pass for 80 versions. FINDING: snapshot names >63 bytes are truncated by the list parser (bug fixed post-landing: `SnapshotEntry::name` widened to `[u8;256]`, cap raised to `.min(255)`; `snap-qcow2-longname` profile updated to full 200-byte baseline; see "Bugs fixed during this work"). | PLAN-snapshot-phase-10-baselines.md | Landed |
 | 11. Integration tests (`tests/test_snapshot.py`): list matrix, create/delete/apply round-trips, error paths, qcow2-only enforcement, post-op `qemu-img check` clean. **Fixtures, profiles, and manifest tag `snapshots` are ready from phase 10.** JSON golden files for `--output=json` belong here (instar-side self-baseline; no qemu source of truth). | PLAN-snapshot-phase-11-integration-tests.md | Not started |
 | 12. Coverage-guided fuzz harnesses: `fuzz_snapshot_parse`, `fuzz_snapshot_refcount` | PLAN-snapshot-phase-12-fuzz-coverage.md | Not started |
 | 13. Differential fuzzing extension: random `-c/-d/-a` chain vs qemu-img, structural `qemu-img info` comparison | PLAN-snapshot-phase-13-fuzz-differential.md | Not started |
@@ -1232,6 +1232,19 @@ development that we fix in passing.
   because qemu-maintained images never carry such stale
   bits — the scrub only improves fidelity on
   contrived-but-valid images.
+
+* **Phase 10 finding / post-landing fix**: list-mode name
+  truncation. The streaming parser's `SnapshotEntry::name`
+  field was `[u8; 64]` with a `.min(63)` copy cap, so
+  snapshot names longer than 63 bytes were silently
+  truncated in `instar snapshot -l` output. Surfaced by
+  the `snap-qcow2-longname` fixture (200-byte name) in the
+  phase 10 cross-version baseline matrix. Fixed by widening
+  `SnapshotEntry::name` to `[u8; 256]` and raising the cap
+  to `.min(255)`, matching the wire record's 256-byte name
+  field. All names qemu-img can create (≤255 bytes) now
+  list byte-identically. See `docs/quirks.md` (snapshot
+  subcommand section) for the residual note.
 
 ### Documentation index maintenance
 
