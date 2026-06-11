@@ -2721,11 +2721,14 @@ struct MapArgs {
 /// Arguments for `instar snapshot`. Mirrors `qemu-img snapshot`'s
 /// surface (FILENAME, -l/-a/-c/-d mode flags, -f, -q, -U,
 /// --image-opts) plus instar-specific `--output` and
-/// `--sector-size`. Exactly one of `-l`, `-a`, `-c`, `-d` is
-/// required (enforced by the clap ArgGroup with
-/// `required = true, multiple = false`).
+/// `--sector-size`.
+///
+/// The mode flags are mutually exclusive (clap ArgGroup,
+/// `required = false`). When no mode flag is supplied, `run_snapshot`
+/// defaults to list mode — matching `qemu-img snapshot`'s behaviour
+/// (its `-l` is "the default"; see D2 in PLAN-snapshot-phase-09).
 #[derive(Args, Debug)]
-#[command(group(clap::ArgGroup::new("mode").required(true).multiple(false)))]
+#[command(group(clap::ArgGroup::new("mode").required(false).multiple(false)))]
 struct SnapshotArgs {
     /// Source image file. Required.
     filename: String,
@@ -10180,11 +10183,10 @@ fn format_hex_or_zero(n: u64) -> String {
 // ================================================================
 // Snapshot subcommand (PLAN-snapshot phase 4).
 //
-// Phase 4 ships list mode (`instar snapshot -l`) end-to-end with
-// the full `qemu-img snapshot` clap surface. The mutating modes
-// (-a/-c/-d) are clap-recognised but rejected with a friendly
-// "arrives in PLAN-snapshot phase 9" message at the host CLI
-// level — no guest boot, no partial mutation.
+// Phase 4 ships list mode (`instar snapshot -l`). Phases 6–8
+// landed the mutating modes (-c/-d/-a). Phase 9 adds:
+//   D1: `-U` with mutating modes refused before any file access.
+//   D2: bare `instar snapshot FILE` defaults to list.
 // ================================================================
 
 /// Entry point for the `snapshot` subcommand.
@@ -10218,12 +10220,28 @@ fn run_snapshot(args: SnapshotArgs, verbose: bool) -> Result<(), Box<dyn std::er
         }
     }
 
-    // Mode selection. The clap ArgGroup guarantees exactly one of
-    // list/apply/create/delete is set, so the `else` branch is
-    // unreachable in practice.
-    if args.list {
-        return run_snapshot_list(&args, verbose);
+    // D1 (PLAN-snapshot-phase-09): `-U` (--force-share) is only safe
+    // with read-only operations. qemu refuses `-U` combined with any
+    // mutating mode with exit 1 ("force-share=on can only be used with
+    // read-only images"); instar matches that substance here, before
+    // any file access, image untouched. `-U -l` (and the bare-filename
+    // default, which resolves to list) is accepted — instar takes no
+    // image locks, so the flag is a no-op for the read path.
+    if args.force_share && (args.create.is_some() || args.delete.is_some() || args.apply.is_some())
+    {
+        return Err(
+            "snapshot: --force-share (-U) can only be used with read-only \
+             operations; -l is the only sharing-safe mode"
+                .into(),
+        );
     }
+
+    // Mode selection. D2 (PLAN-snapshot-phase-09): bare `instar
+    // snapshot FILE` (no mode flag) defaults to list, matching
+    // `qemu-img snapshot` which documents `-l` as "the default".
+    // The clap ArgGroup is `required = false` so this path is
+    // reachable; an absent mode resolves to list here, dispatching
+    // to the real list path (not a reimplementation).
     if let Some(name) = args.create.clone() {
         return run_snapshot_create(&args, &name, verbose);
     }
@@ -10233,7 +10251,8 @@ fn run_snapshot(args: SnapshotArgs, verbose: bool) -> Result<(), Box<dyn std::er
     if let Some(needle) = args.apply.clone() {
         return run_snapshot_apply(&args, &needle, verbose);
     }
-    unreachable!("clap ArgGroup guarantees one mode flag is set");
+    // Explicit `-l` or bare filename (no mode flag): both resolve to list.
+    run_snapshot_list(&args, verbose)
 }
 
 /// Drive `MODE_LIST` end-to-end: launch the guest, consume
@@ -14117,6 +14136,111 @@ Offset          Length          Mapped to       File
         )
         .expect("delete mismatch has a message");
         assert_ne!(apply, delete);
+    }
+
+    // --- D1: force-share refusal for mutating modes ---------------
+
+    /// Helper: build a minimal SnapshotArgs for refusal tests.
+    /// The filename is intentionally bogus — the D1 check must fire
+    /// before any file access.
+    fn snapshot_args_for_d1(
+        force_share: bool,
+        create: Option<&str>,
+        delete: Option<&str>,
+        apply: Option<&str>,
+        list: bool,
+    ) -> SnapshotArgs {
+        SnapshotArgs {
+            filename: "/dev/null/no_such_image".to_string(),
+            list,
+            apply: apply.map(str::to_string),
+            create: create.map(str::to_string),
+            delete: delete.map(str::to_string),
+            format: None,
+            quiet: false,
+            force_share,
+            image_opts: false,
+            output: "human".to_string(),
+            sector_size: 65536,
+        }
+    }
+
+    #[test]
+    fn snapshot_force_share_with_create_is_refused_before_file() {
+        // D1: -U -c must be rejected before any file access.
+        let args = snapshot_args_for_d1(true, Some("snap1"), None, None, false);
+        let err = run_snapshot(args, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("force-share") || msg.contains("-U"),
+            "expected force-share refusal, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn snapshot_force_share_with_delete_is_refused_before_file() {
+        // D1: -U -d must be rejected before any file access.
+        let args = snapshot_args_for_d1(true, None, Some("snap1"), None, false);
+        let err = run_snapshot(args, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("force-share") || msg.contains("-U"),
+            "expected force-share refusal, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn snapshot_force_share_with_apply_is_refused_before_file() {
+        // D1: -U -a must be rejected before any file access.
+        let args = snapshot_args_for_d1(true, None, None, Some("snap1"), false);
+        let err = run_snapshot(args, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("force-share") || msg.contains("-U"),
+            "expected force-share refusal, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn snapshot_force_share_with_list_proceeds_past_d1_check() {
+        // D1: -U -l must NOT be refused at the force-share gate;
+        // the error that follows is file-not-found (or similar),
+        // NOT a force-share message.
+        let args = snapshot_args_for_d1(true, None, None, None, true);
+        let err = run_snapshot(args, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("force-share") && !msg.contains("sharing-safe"),
+            "D1 gate must not fire for -U -l; got: {}",
+            msg
+        );
+    }
+
+    // --- D2: bare filename (no mode flag) defaults to list --------
+
+    #[test]
+    fn snapshot_bare_filename_dispatches_to_list() {
+        // D2: no mode flag → list path. The list path fails because
+        // the file doesn't exist, but the error must not be a
+        // force-share or "required mode" clap error.
+        let args = snapshot_args_for_d1(false, None, None, None, false);
+        let err = run_snapshot(args, false).unwrap_err();
+        let msg = err.to_string();
+        // Must NOT be a mode-required clap error:
+        assert!(
+            !msg.contains("required") && !msg.contains("force-share"),
+            "bare filename must reach list path, not mode-required gate; got: {}",
+            msg
+        );
+        // Must be a file-access-level error (the I/O path fires):
+        assert!(
+            msg.contains("No such file") || msg.contains("not found") || msg.contains("os error"),
+            "expected file-not-found after D2 dispatch, got: {}",
+            msg
+        );
     }
 
     // --- json_escape ----------------------------------------------

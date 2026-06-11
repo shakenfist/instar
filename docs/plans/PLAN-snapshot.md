@@ -135,10 +135,16 @@ Implement `instar snapshot` such that:
      - `-d SNAPSHOT` — delete snapshot by ID or name.
    - `-f FMT` — format hint (qemu accepts; we accept and
      enforce qcow2-only).
-   - `-q` — suppress success line on stdout.
-   - `-U` / `--force-share` — skip image-lock check. instar
-     does not implement qemu's file-lock protocol, so this
-     flag is a host-side no-op accepted for CLI compatibility.
+   - `-q` — accepted for CLI compatibility; no visible effect
+     for any snapshot mode under either tool (success is always
+     silent; errors are always printed regardless of `-q`). See
+     `docs/quirks.md` for the generalised no-op note (phase 9).
+   - `-U` / `--force-share` — list-only no-op. instar takes no
+     image locks, so `-U -l` is a no-op accepted for parity.
+     `-U` combined with any mutating mode (`-c`/`-d`/`-a`) is
+     refused host-side before any file access, matching qemu's
+     substance (though not its exact stderr text). See
+     `docs/quirks.md` for the D1 entry (phase 9).
    - `--output={human,json}` — instar extension; `qemu-img
      snapshot -l` is human-only. JSON is opt-in.
    - `--image-opts` — explicitly rejected with a clear error
@@ -963,7 +969,7 @@ qemu-img.
 | 6. Snapshot create planner + guest binary (MODE_CREATE), plus the minimal `-c` host dispatch pulled forward from phase 9 (see open question 1 in that plan) | PLAN-snapshot-phase-06-create.md | Landed |
 | 7. Snapshot delete planner + guest binary (MODE_DELETE), plus the `-d` host dispatch (pulled forward like `-c` was) and the shared `run_snapshot_mutating_guest` launch helper | PLAN-snapshot-phase-07-delete.md | Landed |
 | 8. Snapshot apply planner + guest binary (MODE_APPLY), plus the `-a` host dispatch (pulled forward like `-c` / `-d`), the shared raw-table finder (`find_snapshot_in_table`, ID-then-name for apply / name-only for delete), and the walker stale-flag scrub | PLAN-snapshot-phase-08-apply.md | Landed |
-| 9. Host CLI for mutating modes. **All three mutating dispatches landed early**: `-c` in phase 6 (see open question 1 in PLAN-snapshot-phase-06-create.md), `-d` in phase 7 (which also factored the shared `run_snapshot_mutating_guest(mode, arg, dates)` launch helper), and `-a` in phase 8 (which also made the not-found / geometry error messages mode-aware). Phase 9 is consolidation only: shared VM-setup boilerplate with the list path, `-q`/`-U` semantics review, error-message polish, master-plan state. | PLAN-snapshot-phase-09-mutate-host.md | Not started |
+| 9. Host CLI consolidation and parity: D1 fix (`-U` with mutating modes refused before file access), D2 fix (bare `snapshot FILE` defaults to list), D3 documented (mixed-mode exit-code delta kept as-is), launch consolidation declined (renderer borrow fights the helper boundary), `tools/snapshot-cli-parity.sh` (30 assertions, all passing), quirks docs updated. | PLAN-snapshot-phase-09-mutate-host.md | Landed |
 | 10. Cross-version baselines: snapshot-bearing qcow2 fixtures, `snapshot-list-{human,json}` profiles in `generate-baselines.py`, baseline generation pass | PLAN-snapshot-phase-10-baselines.md | Not started |
 | 11. Integration tests (`tests/test_snapshot.py`): list matrix, create/delete/apply round-trips, error paths, qcow2-only enforcement, post-op `qemu-img check` clean | PLAN-snapshot-phase-11-integration-tests.md | Not started |
 | 12. Coverage-guided fuzz harnesses: `fuzz_snapshot_parse`, `fuzz_snapshot_refcount` | PLAN-snapshot-phase-12-fuzz-coverage.md | Not started |

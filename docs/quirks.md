@@ -1435,6 +1435,81 @@ plug in without an ABI change.
 
 ## snapshot subcommand quirks
 
+### Bare `snapshot FILE` defaults to list mode (D2)
+
+`qemu-img snapshot` documents `-l` as "the default" — running
+`qemu-img snapshot image.qcow2` without a mode flag lists the
+snapshot table and exits 0. Before phase 9, instar's clap ArgGroup
+had `required = true`, so the bare form produced a clap usage error
+(exit 2). Phase 9 fixes this: the ArgGroup is now `required = false`,
+and `run_snapshot` routes an absent mode flag to the real list path
+(`run_snapshot_list`), producing byte-identical output to the
+explicit `-l` form.
+
+### `--force-share` (`-U`) is list-only (D1)
+
+`qemu-img` refuses `-U` combined with any mutating mode (`-c`, `-d`,
+`-a`) with exit 1 and the message:
+
+```
+qemu-img: Could not open 'IMAGE': force-share=on can only be used with read-only images
+```
+
+Before phase 9, instar accepted `-U` with mutating modes and
+performed the mutation (the flag was plumbed to the guest but
+unenforced at the host). Phase 9 adds a host-side gate in
+`run_snapshot` that fires before any file access: `-U` combined with
+`-c`, `-d`, or `-a` exits 1 with:
+
+```
+snapshot: --force-share (-U) can only be used with read-only operations; -l is the only sharing-safe mode
+```
+
+The message wording differs from qemu's (which mentions
+`force-share=on` and "read-only images" — artefacts of qemu's
+open-flags machinery). The substance is the same: refusal, exit 1,
+image untouched.
+
+`-U -l` is accepted by both tools. instar takes no image locks, so
+the flag is a no-op for the read-only path; the bit is still
+forwarded to the guest via `FLAG_FORCE_SHARE` but the guest likewise
+ignores it.
+
+### `-q` is a no-op for all snapshot modes
+
+`-q` (quiet) has no visible effect on any snapshot mode under either
+tool:
+
+- `-c` (create): success is always silent (no stdout line exists to
+  suppress). `-q` changes nothing.
+- `-d` (delete): success is always silent. Error messages (e.g.
+  "snapshot not found") are printed to stderr and are **not**
+  suppressed by `-q` under either tool; both exit 1.
+- `-a` (apply): success is always silent. Error messages not
+  suppressed.
+- `-l` (list): the snapshot table goes to stdout regardless of `-q`.
+
+The flag is accepted for CLI compatibility and forwarded to the guest
+via `FLAG_QUIET`, but the guest likewise ignores it for all modes
+implemented so far. The phase 6 note ("`-q` has no visible effect on
+create") generalises to all four modes.
+
+### Mixed mode flags: clap exits 2, qemu exits 1 (D3)
+
+Supplying two or more mode flags (`-c snap -d snap`, `-l -c snap`,
+etc.) is a mutually-exclusive-argument violation under both tools,
+but the exit codes and messages differ:
+
+- `qemu-img`: prints `Cannot mix '-l', '-a', '-c', '-d'`, exits 1.
+- `instar`: clap detects the conflict at parse time, prints its own
+  usage-error message, exits 2.
+
+The behaviours agree in substance (refusal, non-zero exit, no image
+access); the exit code and message differ cosmetically. Fighting clap
+for a one-digit exit-code delta buys nothing — instar's other
+subcommands already expose clap usage-error semantics — so this
+divergence is documented rather than fixed.
+
 ### `DATE` column is rendered in local time
 
 `instar snapshot -l` formats the `DATE` column using the host's
@@ -1508,9 +1583,8 @@ landed in PLAN-snapshot phase 6).
 
 - **`-q` has no visible effect on create.** `qemu-img snapshot -c`
   prints nothing on success and exits 0; instar matches that, so
-  `-q` (suppress the success line) changes nothing visible for
-  `-c`. The flag is still plumbed through for the other modes and
-  for CLI parity.
+  `-q` changes nothing visible for `-c`. See the general `-q`
+  no-op note above for all four modes.
 
 - **Names longer than 255 bytes are refused (not truncated).**
   The qcow2 on-disk `name` field tops out at 255 usable bytes.
