@@ -957,8 +957,9 @@ recommended sub-agent model per phase:
 - **Phase 6 (create)**: high effort, opus. Reuses phase 5
   mutators but coordinates the multi-step rewrite ordering.
   Worktree isolation.
-- **Phase 7 (delete)**: high effort, opus. Snapshot-table
-  compaction is the new work here. Worktree.
+- **Phase 7 (delete)**: high effort, **fable**. Snapshot-table
+  compaction is the new work here. Worktree. (Originally
+  "opus"; see the model-tier update below.)
 - **Phase 8 (apply)**: high effort, opus. L1-overwrite
   ordering is delicate; the dec-then-inc-then-overwrite
   sequence has correctness subtleties. Worktree.
@@ -983,6 +984,17 @@ are the riskiest; the management session should review
 sub-agent output against the qcow2 spec, not just against
 the test suite (a failing test is a known unknown; a
 quietly-broken refcount is an unknown unknown).
+
+**Model-tier update (post phase 6):** Fable became available
+as a sub-agent tier above opus after phase 6 landed. From
+phase 7 onward, steps the notes above mark "opus" for risk
+reasons should be considered for **fable** instead —
+"skew to the more capable model" now points at fable.
+Phase 7 runs as a single fable agent as a deliberate
+experiment, chosen because its shape (crate helpers + guest
+mode + host dispatch + verification matrix) is directly
+comparable to the opus-run phase 6; evaluate the result
+before updating `PLAN-TEMPLATE.md`.
 
 ## Agent guidance
 
