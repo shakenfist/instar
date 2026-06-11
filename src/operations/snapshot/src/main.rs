@@ -1,10 +1,10 @@
 //! Snapshot operation: list / apply / create / delete qcow2 internal snapshots.
 //!
-//! Phase 7 of `PLAN-snapshot.md` lands `MODE_DELETE` end-to-end;
-//! `MODE_LIST` (phase 3) and `MODE_CREATE` (phase 6) are
-//! unchanged in behaviour (create's staging stages are factored
-//! into helpers both mutating modes share). `MODE_APPLY` remains
-//! a stub (phase 8).
+//! Phase 8 of `PLAN-snapshot.md` lands `MODE_APPLY`, the last
+//! mutating mode; `MODE_LIST` (phase 3), `MODE_CREATE` (phase 6)
+//! and `MODE_DELETE` (phase 7) are unchanged in behaviour
+//! (delete's find now goes through the shared raw-table finder
+//! in name-only mode).
 //!
 //! Flow:
 //! 1. Read [`SnapshotConfig`] at [`OPERATION_CONFIG_ADDR`] and
@@ -24,12 +24,14 @@
 //!      (`run_create`).
 //!    - `MODE_DELETE` (3): the qemu-faithful delete
 //!      (`run_delete`).
-//!    - `MODE_APPLY` (1): stub returns `ERROR_INVALID_CONFIG`.
+//!    - `MODE_APPLY` (1): the qemu-faithful apply / "goto"
+//!      (`run_apply`).
 //!    - Otherwise: `ERROR_INVALID_CONFIG` for the unknown mode.
 //! 6. Build a [`SnapshotResult`] and emit it via
 //!    `send_snapshot_result`, then signal `send_complete`.
 //!
-//! `MODE_CREATE` / `MODE_DELETE` are the mutating paths. The input
+//! `MODE_CREATE` / `MODE_DELETE` / `MODE_APPLY` are the mutating
+//! paths. The input
 //! image is opened RW on slot 0 (the host uses
 //! `BackingStore::open_rw_existing` with a generous capacity hint so
 //! the guest can write past EOF to grow the file on demand). All
@@ -72,6 +74,15 @@
 //!   C: refblocks (now carrying the decrements) + active L1 +
 //!      active L2 set
 //!   fsync
+//!
+//! The apply writeback ordering mirrors qemu's
+//! `qcow2_snapshot_goto` (find -> validate geometry -> +1 walk
+//! over the snapshot's chain -> pwrite_sync of the snapshot's L1
+//! over the active L1 -> -1 walk over the old active chain ->
+//! addend-0 COPIED refresh), adapted to the staged model — see
+//! `run_apply`'s doc comment for the group A / B / C breakdown
+//! (B, the active-L1 overwrite, is the commit point; apply never
+//! touches the snapshot table or the header).
 
 #![no_std]
 #![no_main]
@@ -94,9 +105,8 @@ use snapshot::qcow2::{
     update_copied_flags_for_l1, update_snapshot_refcount, AllocCursor, SnapshotRefcountOp,
 };
 use snapshot::table::{
-    build_snapshot_table, build_snapshot_table_without, format_decimal_u64,
-    serialize_snapshot_entry, snapshot_table_byte_len, snapshot_table_entry_bounds,
-    NewSnapshotEntry,
+    build_snapshot_table, build_snapshot_table_without, find_snapshot_in_table, format_decimal_u64,
+    serialize_snapshot_entry, snapshot_table_byte_len, MatchMode, NewSnapshotEntry,
 };
 use snapshot::SnapshotError;
 
@@ -112,7 +122,11 @@ use snapshot::SnapshotError;
 // buffer. Delete mode (phase 7) appends a second L1 + L2 staging
 // set for the deleted snapshot's chain (regions whose lifetimes
 // don't overlap — L1_COPY_BUF — are create-only and left unused by
-// delete).
+// delete). Apply mode (phase 8) stages both chains exactly like
+// delete (the target snapshot's chain in the SNAP_* regions, the
+// old active chain in the create-mode regions) and repurposes
+// NEW_TABLE_BUF — apply allocates no snapshot table — for the
+// zero-padded new-L1 working copy.
 
 const HEADER_BUF: usize = SCRATCH_MEM_BASE;
 const CACHE_BUF_A: usize = HEADER_BUF + MAX_SECTOR_SIZE;
@@ -790,14 +804,7 @@ pub unsafe extern "C" fn _start() -> u64 {
             run_create(call_table, config, &hdr, header, sector_size, bytes_read)
         }
         SnapshotConfig::MODE_APPLY => {
-            (call_table.verbose_print)(b"snapshot: mode 1 not implemented in v1\n\0".as_ptr());
-            finish(
-                call_table,
-                SnapshotConfig::MODE_APPLY,
-                SnapshotResult::ERROR_INVALID_CONFIG,
-                0,
-                bytes_read,
-            )
+            run_apply(call_table, config, &hdr, header, sector_size, bytes_read)
         }
         SnapshotConfig::MODE_DELETE => {
             run_delete(call_table, config, &hdr, header, sector_size, bytes_read)
@@ -1294,46 +1301,34 @@ unsafe fn run_delete(
     // arg_len beyond the wire buffer cannot be compared and so
     // matches nothing (parity: qemu-img-created names are at most
     // 255 bytes, and qemu's own matcher would find nothing either).
+    // The find walks the RAW staged table via the shared finder
+    // (phase 8a refactor) in NameOnly mode — behaviourally
+    // identical to phase 7's inline walk.
     let arg_len = config.arg_len as usize;
-    let mut remove_idx: u32 = u32::MAX;
-    let mut snap_l1_offset: u64 = 0;
-    let mut snap_l1_size: u32 = 0;
+    let mut found = None;
     if arg_len <= config.arg.len() {
         let needle = &config.arg[..arg_len];
-        for i in 0..hdr.nb_snapshots {
-            let (start, _len) = match snapshot_table_entry_bounds(old_table, hdr.nb_snapshots, i) {
-                Ok(b) => b,
-                Err(e) => fail!(map_snapshot_error(e)),
-            };
-            let extra = u32::from_be_bytes([
-                old_table[start + 36],
-                old_table[start + 37],
-                old_table[start + 38],
-                old_table[start + 39],
-            ]) as usize;
-            let id_size =
-                u16::from_be_bytes([old_table[start + 12], old_table[start + 13]]) as usize;
-            let name_size =
-                u16::from_be_bytes([old_table[start + 14], old_table[start + 15]]) as usize;
-            let name_start = start + 40 + extra + id_size;
-            if name_size == needle.len() && &old_table[name_start..name_start + name_size] == needle
-            {
-                remove_idx = i;
-                snap_l1_offset = read_u64_be(old_table, start);
-                snap_l1_size = u32::from_be_bytes([
-                    old_table[start + 8],
-                    old_table[start + 9],
-                    old_table[start + 10],
-                    old_table[start + 11],
-                ]);
-                break;
-            }
+        found = match find_snapshot_in_table(
+            old_table,
+            old_table_len,
+            hdr.nb_snapshots,
+            needle,
+            MatchMode::NameOnly,
+        ) {
+            Ok(f) => f,
+            Err(e) => fail!(map_snapshot_error(e)),
+        };
+    }
+    let found = match found {
+        Some(f) => f,
+        None => {
+            (call_table.verbose_print)(b"snapshot: no snapshot with that name\n\0".as_ptr());
+            fail!(SnapshotResult::ERROR_NOT_FOUND);
         }
-    }
-    if remove_idx == u32::MAX {
-        (call_table.verbose_print)(b"snapshot: no snapshot with that name\n\0".as_ptr());
-        fail!(SnapshotResult::ERROR_NOT_FOUND);
-    }
+    };
+    let remove_idx = found.index;
+    let snap_l1_offset = found.l1_table_offset;
+    let snap_l1_size = found.l1_size;
 
     // ----- Step 3: stage BOTH chains --------------------------------------
     // The snapshot's L1 + L2 set feed the decrement walk (read-only
@@ -1630,6 +1625,508 @@ unsafe fn run_delete(
             active_set.entries[k].host_offset,
             l2,
         ) {
+            fail!(SnapshotResult::ERROR_IO);
+        }
+    }
+    if !(call_table.fsync_input)(0) {
+        fail!(SnapshotResult::ERROR_IO);
+    }
+
+    finish(call_table, mode, SnapshotResult::ERROR_OK, 0, bytes_read)
+}
+
+/// Number of L1 entries whose masked L2 offset is non-zero —
+/// exactly the entries for which the refcount walks invoke their
+/// `l2_for_index` closure, in walk order. MODE_APPLY's precheck
+/// uses this to split one `SwapForApply` closure across the two
+/// staged chains (the dry-run walks `from_l1` fully, then
+/// `to_l1`).
+fn count_allocated_l1_entries(l1_bytes: &[u8]) -> usize {
+    let mut n = 0usize;
+    let entries = l1_bytes.len() / 8;
+    for i in 0..entries {
+        if (read_u64_be(l1_bytes, i * 8) & L1_OFFSET_MASK) != 0 {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// MODE_APPLY: the qemu-faithful apply / "goto" (phase 8).
+///
+/// Mirrors `qcow2_snapshot_goto` from qemu 10.0.x, adapted to the
+/// staged model. Matching is **ID first, then name** — two FULL
+/// passes over the raw table (`find_snapshot_by_id_or_name`: a
+/// later entry matching by ID beats an earlier entry matching by
+/// name; phase plan fact 2 — the opposite asymmetry from
+/// delete's name-only matcher). Apply rewrites the **active L1
+/// in place**; it never touches the snapshot table or the
+/// header. Write-group ordering (phase plan, Situation):
+///
+///   precheck: SwapForApply, read-only, both directions, before
+///     ANY write
+///   (in-memory: +1 walk over the snapshot's chain)
+///   A: all staged refblocks (increments only)
+///   fsync
+///   B: the snapshot's RAW L1 content, zero-padded to
+///      hdr.l1_size * 8, at hdr.l1_table_offset — stale flags
+///      intact (the commit point; mirrors qemu's pwrite_sync)
+///   fsync
+///   (in-memory: -1 walk over the staged OLD active chain, then
+///    the final-state COPIED refresh over the padded new-L1 copy
+///    + the snapshot's L2 set, and over the staged old active
+///    chain — qemu's -1 walk also refreshes the old chain's L2
+///    entries and flushes the survivors)
+///   C: all staged refblocks (now carrying the decrements) + the
+///      refreshed L1 to BOTH locations — hdr.l1_table_offset at
+///      the padded length and sn.l1_table_offset at
+///      sn.l1_size * 8 (replicating the snapshot-stored-L1 flag
+///      write qemu's +1 walk performs, fact 6) — + the dirty
+///      snapshot-set L2s + the SURVIVING old-active L2s (final
+///      refcount > 0; e.g. shared with another snapshot). Freed
+///      old-active L2s are NEVER written.
+///   fsync
+///
+/// One final-state flag pass suffices because after an apply
+/// every cluster reachable from the new active chain has
+/// refcount >= 2 (the snapshot still references everything the
+/// new active L1 does), so every COPIED flag ends clear in both
+/// qemu's mid-state write and the final state — identical bytes
+/// (phase plan, "The key flag invariant").
+///
+/// Geometry refusals (`ERROR_L1_SIZE_MISMATCH`): a stored
+/// `disk_size` differing from the current virtual size (qemu
+/// TRUNCATES the image here — fact 3; instar refuses, open
+/// question 1; an absent disk_size — the finder's 0 sentinel —
+/// matches, mirroring `qcow2_read_snapshots`' default of the
+/// current virtual size), and `sn.l1_size > hdr.l1_size` (qemu
+/// grows the active L1; instar refuses, fact 4). A smaller
+/// snapshot L1 takes the zero-pad path, like qemu.
+///
+/// # Safety
+///
+/// `call_table` is the validated table; `header` is the staged
+/// sector-0 slice at `HEADER_BUF`; `hdr` is its parse.
+unsafe fn run_apply(
+    call_table: &CallTable,
+    config: &SnapshotConfig,
+    hdr: &QcowHeader,
+    header: &[u8],
+    sector_size: usize,
+    bytes_read: u64,
+) -> u64 {
+    let mode = SnapshotConfig::MODE_APPLY;
+
+    macro_rules! fail {
+        ($err:expr) => {
+            return finish(call_table, mode, $err, 0, bytes_read)
+        };
+    }
+
+    // ----- Step 1: feature gates (identical set to create/delete) --------
+    if let Some(code) = mutating_feature_gates(call_table, hdr, header) {
+        fail!(code);
+    }
+
+    let cluster_size = hdr.cluster_size;
+    let cluster_size_usize = cluster_size as usize;
+    let cluster_bits = hdr.cluster_bits;
+    let extended_l2 = (hdr.incompatible_features & INCOMPAT_EXTENDED_L2) != 0 || hdr.extended_l2;
+    let active_l1_bytes = (hdr.l1_size as usize).saturating_mul(8);
+    if active_l1_bytes > ACTIVE_L1_LIMIT || active_l1_bytes > NEW_TABLE_LIMIT {
+        fail!(SnapshotResult::ERROR_UNSUPPORTED_FEATURE);
+    }
+
+    // ----- Step 2: find the target, ID then name (two full passes) -------
+    // Not-found must be decided before any write; an image with no
+    // snapshots can't match anything.
+    if hdr.nb_snapshots == 0 {
+        (call_table.verbose_print)(b"snapshot: apply on 0-snapshot image\n\0".as_ptr());
+        fail!(SnapshotResult::ERROR_NOT_FOUND);
+    }
+    let input_capacity = (call_table.get_input_capacity)(0);
+    let old_table_len = match stage_old_table(
+        call_table,
+        sector_size,
+        input_capacity,
+        hdr.snapshots_offset,
+        hdr.nb_snapshots,
+    ) {
+        Ok(n) => n,
+        Err(code) => fail!(code),
+    };
+    let old_table = core::slice::from_raw_parts(OLD_TABLE_BUF as *const u8, old_table_len);
+
+    // The argument is passed through verbatim by the host; an
+    // arg_len beyond the wire buffer can match nothing.
+    let arg_len = config.arg_len as usize;
+    let mut found = None;
+    if arg_len <= config.arg.len() {
+        let needle = &config.arg[..arg_len];
+        found = match find_snapshot_in_table(
+            old_table,
+            old_table_len,
+            hdr.nb_snapshots,
+            needle,
+            MatchMode::IdThenName,
+        ) {
+            Ok(f) => f,
+            Err(e) => fail!(map_snapshot_error(e)),
+        };
+    }
+    let found = match found {
+        Some(f) => f,
+        None => {
+            (call_table.verbose_print)(b"snapshot: no snapshot with that ID or name\n\0".as_ptr());
+            fail!(SnapshotResult::ERROR_NOT_FOUND);
+        }
+    };
+
+    // ----- Step 3: geometry checks ----------------------------------------
+    // disk_size: 0 is the finder's "absent extra data" sentinel —
+    // qemu's reader defaults an absent disk_size to the CURRENT
+    // virtual size, so the check passes (open question 5); a
+    // genuinely-zero disk_size on a 0-byte image also matches.
+    if found.disk_size_or_zero != 0 && found.disk_size_or_zero != hdr.virtual_size {
+        (call_table.verbose_print)(b"snapshot: disk_size mismatch refused\n\0".as_ptr());
+        fail!(SnapshotResult::ERROR_L1_SIZE_MISMATCH);
+    }
+    // l1_size: larger-than-active needs qemu's L1 grow — refused in
+    // v1 (only reachable on hand-crafted images given the disk_size
+    // refusal above). Smaller takes the zero-pad path below.
+    if found.l1_size > hdr.l1_size {
+        (call_table.verbose_print)(
+            b"snapshot: snapshot L1 larger than active refused\n\0".as_ptr(),
+        );
+        fail!(SnapshotResult::ERROR_L1_SIZE_MISMATCH);
+    }
+
+    // ----- Step 4: stage BOTH chains + the refblocks ----------------------
+    // The snapshot's chain feeds the increment walk and the flag
+    // refresh; the active chain feeds the decrement walk. Shared
+    // L2 clusters appear in both staged sets (no dedup, same
+    // posture as delete).
+    let snap_l1_bytes = (found.l1_size as usize).saturating_mul(8);
+    if snap_l1_bytes > SNAP_L1_LIMIT {
+        fail!(SnapshotResult::ERROR_UNSUPPORTED_FEATURE);
+    }
+    let snap_l1_ptr = SNAP_L1_BUF as *mut u8;
+    if snap_l1_bytes > 0
+        && !read_input_byte_range(
+            call_table,
+            0,
+            sector_size,
+            found.l1_table_offset,
+            snap_l1_ptr,
+            snap_l1_bytes,
+        )
+    {
+        fail!(SnapshotResult::ERROR_PARSE_FAILED);
+    }
+    let snap_set = match stage_l2_set(
+        call_table,
+        sector_size,
+        snap_l1_ptr,
+        snap_l1_bytes,
+        cluster_size_usize,
+        extended_l2,
+        SNAP_L2_STAGING,
+        SNAP_L2_STAGING_LIMIT,
+    ) {
+        Ok(s) => s,
+        Err(code) => fail!(code),
+    };
+
+    let active_l1_ptr = ACTIVE_L1_BUF as *mut u8;
+    if active_l1_bytes > 0
+        && !read_input_byte_range(
+            call_table,
+            0,
+            sector_size,
+            hdr.l1_table_offset,
+            active_l1_ptr,
+            active_l1_bytes,
+        )
+    {
+        fail!(SnapshotResult::ERROR_PARSE_FAILED);
+    }
+    let active_set = match stage_l2_set(
+        call_table,
+        sector_size,
+        active_l1_ptr,
+        active_l1_bytes,
+        cluster_size_usize,
+        extended_l2,
+        L2_STAGING,
+        L2_STAGING_LIMIT,
+    ) {
+        Ok(s) => s,
+        Err(code) => fail!(code),
+    };
+
+    let refblock_count = match stage_refblocks(call_table, hdr, sector_size) {
+        Ok(n) => n,
+        Err(code) => fail!(code),
+    };
+    let rb_offsets = core::slice::from_raw_parts(RB_OFFSETS as *const u64, refblock_count);
+    let rb_total = refblock_count.saturating_mul(cluster_size_usize);
+    let refblocks = core::slice::from_raw_parts_mut(REFBLOCKS_BUF as *mut u8, rb_total);
+    let entries_per_refblock = (cluster_size * 8) / 16;
+    let refblock_byte_offset_for_cluster = rb_lookup(
+        cluster_size,
+        entries_per_refblock,
+        refblock_count,
+        cluster_size_usize,
+    );
+
+    // The padded new-L1 working copy: the snapshot's RAW L1 bytes
+    // zero-padded to the active L1's byte size. Apply allocates no
+    // snapshot table, so the (otherwise unused) NEW_TABLE_BUF
+    // region hosts it — its 66 KiB limit covers the 64 KiB
+    // ACTIVE_L1_LIMIT (checked above).
+    let padded_l1_ptr = NEW_TABLE_BUF as *mut u8;
+    if snap_l1_bytes > 0 {
+        core::ptr::copy_nonoverlapping(snap_l1_ptr as *const u8, padded_l1_ptr, snap_l1_bytes);
+    }
+    if active_l1_bytes > snap_l1_bytes {
+        core::ptr::write_bytes(
+            padded_l1_ptr.add(snap_l1_bytes),
+            0,
+            active_l1_bytes - snap_l1_bytes,
+        );
+    }
+
+    // ----- Step 5: precheck (SwapForApply), BEFORE any write --------------
+    // Validates the decrement side (old active chain) for
+    // underflow and the increment side (snapshot chain) for
+    // overflow against the staged refblocks. The dry-run walks
+    // from_l1 fully, then to_l1; one closure serves both staged
+    // sets by counting calls against the from-chain's allocated
+    // L1 entry count (the same pattern the phase 5 SwapForApply
+    // unit test models).
+    {
+        let active_l1 = core::slice::from_raw_parts(active_l1_ptr as *const u8, active_l1_bytes);
+        let snap_l1 = core::slice::from_raw_parts(snap_l1_ptr as *const u8, snap_l1_bytes);
+        let from_allocated = count_allocated_l1_entries(active_l1);
+        let mut calls = 0usize;
+        match precheck_snapshot_refcount(
+            SnapshotRefcountOp::SwapForApply {
+                from_l1: active_l1,
+                to_l1: snap_l1,
+            },
+            refblocks,
+            cluster_bits,
+            16,
+            extended_l2,
+            |i| {
+                calls += 1;
+                if calls <= from_allocated {
+                    active_set.l2_for_index(i)
+                } else {
+                    snap_set.l2_for_index(i)
+                }
+            },
+            refblock_byte_offset_for_cluster,
+        ) {
+            Ok(()) => {}
+            Err(SnapshotError::RefcountOverflow { .. }) => {
+                fail!(SnapshotResult::ERROR_REFCOUNT_OVERFLOW)
+            }
+            Err(e) => fail!(map_snapshot_error(e)),
+        }
+    }
+
+    // ----- Step 6: in-memory +1 walk over the snapshot's chain ------------
+    // (IncrementForCreate is the inc walk; the create-flavoured
+    // name is cosmetic — open question 3.)
+    {
+        let snap_l1 = core::slice::from_raw_parts(snap_l1_ptr as *const u8, snap_l1_bytes);
+        match update_snapshot_refcount(
+            SnapshotRefcountOp::IncrementForCreate {
+                snapshot_l1: snap_l1,
+            },
+            refblocks,
+            cluster_bits,
+            16,
+            extended_l2,
+            |i| snap_set.l2_for_index(i),
+            refblock_byte_offset_for_cluster,
+        ) {
+            Ok(()) => {}
+            Err(SnapshotError::RefcountOverflow { .. }) => {
+                fail!(SnapshotResult::ERROR_REFCOUNT_OVERFLOW)
+            }
+            Err(e) => fail!(map_snapshot_error(e)),
+        }
+    }
+
+    // ----- Step 7: write group A (refblocks, increments only) -------------
+    // A crash after this leaves over-referenced refcounts: leaks,
+    // repairable by qemu-img check -r leaks; never a dangling
+    // reference.
+    for (k, host_off) in rb_offsets.iter().copied().enumerate() {
+        let block = &refblocks[k * cluster_size_usize..(k + 1) * cluster_size_usize];
+        if !write_input_byte_range(call_table, 0, sector_size, host_off, block) {
+            fail!(SnapshotResult::ERROR_IO);
+        }
+    }
+    if !(call_table.fsync_input)(0) {
+        fail!(SnapshotResult::ERROR_IO);
+    }
+
+    // ----- Step 8: write group B (the commit point) ------------------------
+    // The padded RAW snapshot-L1 content — stale flags intact —
+    // over the active L1 offset, mirroring qemu's bdrv_pwrite_sync
+    // (the refreshed bytes land in group C, exactly as qemu's
+    // addend-0 walk overwrites its own raw copy later).
+    if active_l1_bytes > 0 {
+        let padded = core::slice::from_raw_parts(padded_l1_ptr as *const u8, active_l1_bytes);
+        if !write_input_byte_range(call_table, 0, sector_size, hdr.l1_table_offset, padded) {
+            fail!(SnapshotResult::ERROR_IO);
+        }
+    }
+    if !(call_table.fsync_input)(0) {
+        fail!(SnapshotResult::ERROR_IO);
+    }
+
+    // ----- Step 9: in-memory -1 walk over the staged OLD active chain -----
+    // qemu's "decrease refcount of clusters of current L1 table"
+    // — done from the in-memory (staged) old L1, which is why the
+    // just-committed on-disk L1 is irrelevant here. Failures past
+    // the commit point leave a consistent image with leaks /
+    // stale flags, qemu's own best-effort posture.
+    {
+        let active_l1 = core::slice::from_raw_parts(active_l1_ptr as *const u8, active_l1_bytes);
+        match update_snapshot_refcount(
+            SnapshotRefcountOp::DecrementForDelete {
+                snapshot_l1: active_l1,
+            },
+            refblocks,
+            cluster_bits,
+            16,
+            extended_l2,
+            |i| active_set.l2_for_index(i),
+            refblock_byte_offset_for_cluster,
+        ) {
+            Ok(()) => {}
+            Err(e) => fail!(map_snapshot_error(e)),
+        }
+    }
+
+    // ----- Step 10: final-state COPIED refresh over the NEW chain ---------
+    // One pass at final-state refcounts over the padded new-L1
+    // copy + the snapshot's staged L2 set (see the flag-invariant
+    // note in the function docs). The pad entries are zero and
+    // are skipped by the walker.
+    let refcount_for_cluster = |host_offset: u64| -> Option<u64> {
+        let (base, entry_local) = refblock_byte_offset_for_cluster(host_offset)?;
+        let block = &refblocks[base..base + cluster_size_usize];
+        read_refcount_in_block(block, entry_local, 16).ok()
+    };
+    {
+        let padded_l1_mut = core::slice::from_raw_parts_mut(padded_l1_ptr, active_l1_bytes);
+        if let Err(e) = update_copied_flags_for_l1(
+            padded_l1_mut,
+            cluster_bits,
+            |i| snap_set.l2_for_index_mut(i),
+            refcount_for_cluster,
+            extended_l2,
+        ) {
+            fail!(map_snapshot_error(e));
+        }
+    }
+
+    // ----- Step 10b: COPIED refresh over the SURVIVING old chain ----------
+    // qemu's -1 walk also recomputes COPIED on the OLD active
+    // chain's L2 entries (post-decrement == final refcounts) and
+    // flushes the dirty L2s whose clusters were NOT freed —
+    // e.g. an old-active L2 shared with a *different* snapshot
+    // survives at refcount >= 1 and lands on disk with refreshed
+    // flags (verified empirically: s1, write, s2, apply s1 -> the
+    // s2-shared L2's data entry gains COPIED under qemu). Only
+    // the walked L1 is exempt from writeback ("Update L1 only if
+    // addend >= 0"). Refresh the staged old chain here; group C
+    // writes back the surviving (refcount > 0) active-set L2s.
+    // The old L1 buffer is mutated in place but never written.
+    {
+        let active_l1_mut = core::slice::from_raw_parts_mut(active_l1_ptr, active_l1_bytes);
+        if let Err(e) = update_copied_flags_for_l1(
+            active_l1_mut,
+            cluster_bits,
+            |i| active_set.l2_for_index_mut(i),
+            refcount_for_cluster,
+            extended_l2,
+        ) {
+            fail!(map_snapshot_error(e));
+        }
+    }
+
+    // ----- Step 11: write group C ------------------------------------------
+    // All staged refblocks (now carrying the decrements), the
+    // refreshed L1 to BOTH locations at their two lengths, the
+    // dirty snapshot-set L2s, and the surviving old-active L2s
+    // (refreshed in step 10b; a physical L2 shared by both sets
+    // is written twice with identical bytes). The freed
+    // old-active-only L2s are never written (qemu's
+    // cache_discards drops them).
+    for (k, host_off) in rb_offsets.iter().copied().enumerate() {
+        let block = &refblocks[k * cluster_size_usize..(k + 1) * cluster_size_usize];
+        if !write_input_byte_range(call_table, 0, sector_size, host_off, block) {
+            fail!(SnapshotResult::ERROR_IO);
+        }
+    }
+    if active_l1_bytes > 0 {
+        let padded = core::slice::from_raw_parts(padded_l1_ptr as *const u8, active_l1_bytes);
+        // The active L1 offset: the full padded length.
+        if !write_input_byte_range(call_table, 0, sector_size, hdr.l1_table_offset, padded) {
+            fail!(SnapshotResult::ERROR_IO);
+        }
+        // The snapshot's stored L1: its own sn.l1_size * 8 length
+        // (the write that replicates qemu's +1-walk flag scrub of
+        // the stored L1 — fact 6).
+        if snap_l1_bytes > 0
+            && !write_input_byte_range(
+                call_table,
+                0,
+                sector_size,
+                found.l1_table_offset,
+                &padded[..snap_l1_bytes],
+            )
+        {
+            fail!(SnapshotResult::ERROR_IO);
+        }
+    }
+    for k in 0..snap_set.count {
+        let l2 = core::slice::from_raw_parts(
+            (SNAP_L2_STAGING + k * cluster_size_usize) as *const u8,
+            cluster_size_usize,
+        );
+        if !write_input_byte_range(
+            call_table,
+            0,
+            sector_size,
+            snap_set.entries[k].host_offset,
+            l2,
+        ) {
+            fail!(SnapshotResult::ERROR_IO);
+        }
+    }
+    // Surviving old-active L2s (step 10b): write back the staged
+    // active-set L2s whose own cluster's final refcount is still
+    // non-zero. Freed L2s (refcount 0) are skipped — never
+    // written, matching qemu's cache discard.
+    for k in 0..active_set.count {
+        let host_off = active_set.entries[k].host_offset;
+        match refcount_for_cluster(host_off) {
+            Some(0) => continue, // freed: never written
+            Some(_) => {}
+            None => fail!(SnapshotResult::ERROR_IO),
+        }
+        let l2 = core::slice::from_raw_parts(
+            (L2_STAGING + k * cluster_size_usize) as *const u8,
+            cluster_size_usize,
+        );
+        if !write_input_byte_range(call_table, 0, sector_size, host_off, l2) {
             fail!(SnapshotResult::ERROR_IO);
         }
     }

@@ -711,33 +711,55 @@ whole table at a new allocation** via `qcow2_write_snapshots`
 
 #### `-a` apply / goto mode
 
-The trickiest because the L1 table is *overwritten*:
+The trickiest because the L1 table is *overwritten*.
+*(Corrected by phase 8 against `qcow2_snapshot_goto` /
+`qcow2_update_snapshot_refcount` in qemu 10.0.x and the
+installed qemu-img 10.0.8 — the original sketch assumed L1
+growth support and did not know about qemu's disk-size
+truncate or the snapshot-stored-L1 flag write. See
+PLAN-snapshot-phase-08-apply.md for the landed design.)*
 
-1. Read header, refuse non-qcow2.
-2. Parse snapshot table; find target by id or name.
-3. Validate `target.l1_size` against active L1 capacity.
-   If target's L1 is larger than active L1's cluster
-   allocation, grow active L1 (allocate new clusters,
-   rewrite `l1_size` and `l1_table_offset` in header).
-4. Walk target's L1 chain (in the snapshot's L1 cluster),
-   increment refcount on everything.
-5. Walk active L1 chain (in the active L1 cluster),
-   decrement refcount on everything.
-6. Copy target's L1 entries into the active L1 cluster
-   (overwriting what was there). The active L1
-   *cluster offset itself* does not change.
-7. Walk the now-current active L1 (= snapshot's L1
-   contents), refresh `QCOW_OFLAG_COPIED` on entries
-   whose refcount is now 1 (just-decremented from 2,
-   because step 5 dropped the old active references and
-   step 4 raised the target's references).
+1. Read header, refuse non-qcow2; the uniform mutating-mode
+   feature gates.
+2. Find the target by **ID first, then name — two FULL
+   passes** over the raw table (qemu's
+   `find_snapshot_by_id_or_name`: a later entry matching by
+   ID beats an earlier entry matching by name). This is the
+   opposite asymmetry from delete's name-only matcher.
+3. Geometry checks. A stored `disk_size` differing from the
+   current virtual size means the image was resized after
+   the snapshot was taken — qemu **truncates the image**
+   here (`blk_truncate` inside `qcow2_snapshot_goto`);
+   instar v1 **refuses** (`ERROR_L1_SIZE_MISMATCH`, with a
+   resize-back workaround message). A snapshot L1 *larger*
+   than the active L1 would need qemu's L1 grow — refused in
+   v1 (only reachable on hand-crafted images given the
+   disk-size refusal). A *smaller* snapshot L1 is supported:
+   the copy is zero-padded to the active L1's size, like
+   qemu.
+4. Precheck both directions read-only (SwapForApply) before
+   any write, then the in-memory +1 walk over the target's
+   chain; write the refblocks (increments only); fsync.
+5. Write the target's RAW L1 content (stale flags intact),
+   zero-padded, over the active L1 offset — the commit
+   point; fsync. The active L1 *cluster offset itself* does
+   not change.
+6. In-memory -1 walk over the staged OLD active chain, then
+   one final-state COPIED refresh over the new chain and
+   the surviving old chain.
+7. Write the refblocks (now with decrements), the refreshed
+   L1 to BOTH offsets — the active location at the padded
+   length and the snapshot's stored L1 at its own length
+   (qemu's +1 walk rewrites the stored L1's flags; instar
+   replicates the same final bytes) — the dirty
+   snapshot-set L2s, and the surviving old-active L2s
+   (never the freed ones); fsync.
 
-Apply is the only mode where order matters in a way that
-risks a "dangling reference" intermediate state. We
-explicitly *do not* attempt to be crash-consistent during
-apply (qemu isn't either; `qcow2_snapshot_goto`'s
-implementation is similarly best-effort). Document in
-`docs/quirks.md`.
+Apply's crash consistency is best-effort, like qemu's: a
+crash before the commit point leaves only repairable leaks;
+between the commit point and the final group, leaks plus
+stale COPIED flags — never a dangling reference. Documented
+in `docs/quirks.md`.
 
 ### Source format scope
 
@@ -892,7 +914,18 @@ qemu-img.
    2 (active + snapshot) back to 1 (active only) on dec,
    and the COPIED-flag rewrite sees the transition. No
    special handling needed beyond the per-mode plans above.
-   Verify by integration test.
+   **Resolved in phase 8** by the apply matrix's round-trip
+   and cross-mode scenarios
+   (`tools/snapshot-apply-matrix.sh`): snap → write → apply
+   → write → apply again, and apply-middle-of-three →
+   delete → apply, all byte-identical to qemu with
+   `qemu-img check` clean and content restored
+   (`qemu-img compare` against a snapshot-time reference).
+   One subtlety surfaced: when the old active chain shares
+   L2 tables with a *different* snapshot, those L2s survive
+   the apply and qemu flushes them with refreshed COPIED
+   flags — instar writes the surviving (refcount > 0)
+   old-active L2s back in its final group to match.
 
 10. **Atomicity of snapshot-table rewrite**: qemu's
     `qcow2_write_snapshots` allocates new cluster(s), writes
@@ -929,8 +962,8 @@ qemu-img.
 | 5. Refcount mutators (planner crate): `update_snapshot_refcount`, `alloc_cluster_in_refblocks`, `set_refcount_in_block` (lifted from resize), `update_copied_flags_for_l1`, two-pass overflow check. New `src/crates/snapshot/` crate parallel to commit/rebase; ~60 unit tests | PLAN-snapshot-phase-05-refcount-planners.md | Landed |
 | 6. Snapshot create planner + guest binary (MODE_CREATE), plus the minimal `-c` host dispatch pulled forward from phase 9 (see open question 1 in that plan) | PLAN-snapshot-phase-06-create.md | Landed |
 | 7. Snapshot delete planner + guest binary (MODE_DELETE), plus the `-d` host dispatch (pulled forward like `-c` was) and the shared `run_snapshot_mutating_guest` launch helper | PLAN-snapshot-phase-07-delete.md | Landed |
-| 8. Snapshot apply planner + guest binary (MODE_APPLY) | PLAN-snapshot-phase-08-apply.md | Not started |
-| 9. Host CLI for mutating modes. **The `-c` (create) dispatch landed early in phase 6** (see open question 1 in PLAN-snapshot-phase-06-create.md) **and the `-d` (delete) dispatch landed in phase 7**, which also factored the shared `run_snapshot_mutating_guest(mode, arg, dates)` launch helper that `-a` should reuse; phase 9 shrinks to consolidation (shared VM-setup boilerplate with the list path, quiet-success review, error-message polish, master-plan state). | PLAN-snapshot-phase-09-mutate-host.md | Not started |
+| 8. Snapshot apply planner + guest binary (MODE_APPLY), plus the `-a` host dispatch (pulled forward like `-c` / `-d`), the shared raw-table finder (`find_snapshot_in_table`, ID-then-name for apply / name-only for delete), and the walker stale-flag scrub | PLAN-snapshot-phase-08-apply.md | Landed |
+| 9. Host CLI for mutating modes. **All three mutating dispatches landed early**: `-c` in phase 6 (see open question 1 in PLAN-snapshot-phase-06-create.md), `-d` in phase 7 (which also factored the shared `run_snapshot_mutating_guest(mode, arg, dates)` launch helper), and `-a` in phase 8 (which also made the not-found / geometry error messages mode-aware). Phase 9 is consolidation only: shared VM-setup boilerplate with the list path, `-q`/`-U` semantics review, error-message polish, master-plan state. | PLAN-snapshot-phase-09-mutate-host.md | Not started |
 | 10. Cross-version baselines: snapshot-bearing qcow2 fixtures, `snapshot-list-{human,json}` profiles in `generate-baselines.py`, baseline generation pass | PLAN-snapshot-phase-10-baselines.md | Not started |
 | 11. Integration tests (`tests/test_snapshot.py`): list matrix, create/delete/apply round-trips, error paths, qcow2-only enforcement, post-op `qemu-img check` clean | PLAN-snapshot-phase-11-integration-tests.md | Not started |
 | 12. Coverage-guided fuzz harnesses: `fuzz_snapshot_parse`, `fuzz_snapshot_refcount` | PLAN-snapshot-phase-12-fuzz-coverage.md | Not started |
@@ -1149,11 +1182,40 @@ The plan is complete when:
   currently relies on process-exit fsync — switching it
   to use `fsync_input` at the appropriate checkpoint
   would be a small follow-up.
+* **disk_size-mismatch apply** (phase 8). qemu truncates
+  the image to the snapshot's `disk_size` inside
+  `qcow2_snapshot_goto`; instar v1 refuses with a
+  resize-back workaround message. A follow-up could
+  compose the resize planner with apply; only worth it if
+  a user actually hits the refusal.
+* **`qcow2::find_snapshot` disposition** (phase 8). The
+  phase 2 per-entry id-or-name helper is confirmed wrong
+  for *both* mutating modes' semantics (delete is
+  name-only; apply is two-full-pass ID-then-name) and is
+  unused — phase 14 removes or re-documents it.
+* **`instar resize` on snapshot-bearing qcow2 images**
+  (observed in passing during phase 8, *not* snapshot
+  scope): fails with a confusing internal-inconsistency
+  error (error 13) where qemu-img resizes successfully.
+  Worth an eventual fix in the resize plan family — and it
+  is the tooling path that creates the disk_size-mismatch
+  fixtures above.
 
 ### Bugs fixed during this work
 
 This section will list any bugs encountered during
 development that we fix in passing.
+
+* **Phase 8**: the flags walker
+  (`update_copied_flags_for_l1`, phases 5–7) skipped
+  UNALLOCATED / ZERO_PLAIN L2 entries entirely, where
+  qemu's `qcow2_update_snapshot_refcount` assigns them
+  `refcount = 0` and so actively scrubs a stale COPIED
+  bit on every walk. Fixed (with unit tests); the
+  create/delete byte-identity matrices are unaffected
+  because qemu-maintained images never carry such stale
+  bits — the scrub only improves fidelity on
+  contrived-but-valid images.
 
 ### Documentation index maintenance
 

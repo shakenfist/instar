@@ -13,6 +13,11 @@
 //! - [`snapshot_table_entry_bounds`] returns one raw entry's
 //!   (start offset, unpadded length) for MODE_DELETE's
 //!   find-by-name walk and compaction maths (phase 7).
+//! - [`find_snapshot_in_table`] resolves a snapshot argument
+//!   against the raw table with per-mode matching semantics
+//!   ([`MatchMode`]): `-d` is name-only, `-a` is ID-then-name
+//!   (two full passes, qemu's `find_snapshot_by_id_or_name`
+//!   shape) — phase 8.
 //! - [`build_snapshot_table`] copies the old entries verbatim and
 //!   8-aligns the new entry after them.
 //! - [`build_snapshot_table_without`] copies every entry except
@@ -335,6 +340,167 @@ pub fn build_snapshot_table_without(
         out_offset = end;
     }
     Ok(out_offset)
+}
+
+/// Matching semantics for [`find_snapshot_in_table`].
+///
+/// qemu's mutating modes resolve their snapshot argument with
+/// *different* matchers (phase 8 fact 2):
+///
+/// - `qemu-img snapshot -a` goes through
+///   `qcow2_snapshot_goto` -> `find_snapshot_by_id_or_name`:
+///   one **full pass comparing IDs**, then — only if no ID
+///   matched — a second **full pass comparing names**. A later
+///   entry matching by ID beats an earlier entry matching by
+///   name.
+/// - `qemu-img snapshot -d` (qemu 10) goes through
+///   `bdrv_snapshot_find`'s name-only `strcmp` scan; ID
+///   matching does not exist on that path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchMode {
+    /// `-a` semantics: a full ID pass, then a full name pass.
+    IdThenName,
+    /// `-d` semantics: a single name pass, first match wins.
+    NameOnly,
+}
+
+/// A snapshot located by [`find_snapshot_in_table`]: the fields
+/// of the raw on-disk entry that the mutating modes need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoundSnapshot {
+    /// Table index of the matched entry (0-based walk order).
+    pub index: u32,
+    /// The snapshot's stored L1 table host byte offset.
+    pub l1_table_offset: u64,
+    /// The snapshot's stored L1 entry count.
+    pub l1_size: u32,
+    /// The snapshot's `disk_size` (extra-data offset 8) when the
+    /// entry carries one (`extra_data_size >= 16`), else 0. The 0
+    /// sentinel means "absent": qemu's reader
+    /// (`qcow2_read_snapshots`) defaults an absent `disk_size` to
+    /// the image's *current* virtual size, so the goto geometry
+    /// check passes — callers must treat 0 as matching.
+    pub disk_size_or_zero: u64,
+}
+
+/// Build a [`FoundSnapshot`] from the raw entry at `start`.
+/// The caller guarantees (via [`entry_bounds_at`]) that the
+/// header and extra data are in bounds.
+fn found_snapshot_at(table: &[u8], index: u32, start: usize, extra: usize) -> FoundSnapshot {
+    let l1_table_offset = u64::from_be_bytes([
+        table[start],
+        table[start + 1],
+        table[start + 2],
+        table[start + 3],
+        table[start + 4],
+        table[start + 5],
+        table[start + 6],
+        table[start + 7],
+    ]);
+    let l1_size = u32::from_be_bytes([
+        table[start + 8],
+        table[start + 9],
+        table[start + 10],
+        table[start + 11],
+    ]);
+    let disk_size_or_zero = if extra >= 16 {
+        let off = start + SNAPSHOT_HEADER_SIZE + 8;
+        u64::from_be_bytes([
+            table[off],
+            table[off + 1],
+            table[off + 2],
+            table[off + 3],
+            table[off + 4],
+            table[off + 5],
+            table[off + 6],
+            table[off + 7],
+        ])
+    } else {
+        0
+    };
+    FoundSnapshot {
+        index,
+        l1_table_offset,
+        l1_size,
+        disk_size_or_zero,
+    }
+}
+
+/// One full matching pass over the raw table: compare `needle`
+/// against each entry's id (`by_id`) or name field, returning
+/// the first match in table order.
+fn find_pass(
+    table: &[u8],
+    nb_snapshots: u32,
+    needle: &[u8],
+    by_id: bool,
+) -> Result<Option<FoundSnapshot>, SnapshotError> {
+    let mut offset: usize = 0;
+    for i in 0..nb_snapshots {
+        let (start, len) = entry_bounds_at(table, offset)?;
+        offset = start + len;
+        let extra = u32::from_be_bytes([
+            table[start + 36],
+            table[start + 37],
+            table[start + 38],
+            table[start + 39],
+        ]) as usize;
+        let id_size = u16::from_be_bytes([table[start + 12], table[start + 13]]) as usize;
+        let name_size = u16::from_be_bytes([table[start + 14], table[start + 15]]) as usize;
+        let id_start = start + SNAPSHOT_HEADER_SIZE + extra;
+        let (field_start, field_len) = if by_id {
+            (id_start, id_size)
+        } else {
+            (id_start + id_size, name_size)
+        };
+        if field_len == needle.len() && &table[field_start..field_start + field_len] == needle {
+            return Ok(Some(found_snapshot_at(table, i, start, extra)));
+        }
+    }
+    Ok(None)
+}
+
+/// Find a snapshot in the raw on-disk table by `needle` with the
+/// given [`MatchMode`], comparing the **full on-disk strings**
+/// (exact byte compare, independent of the bounded parser's
+/// 63-byte id/name truncation). An empty needle is allowed and
+/// matches an empty-id / empty-named snapshot.
+///
+/// `table[..table_len]` is walked for `nb_snapshots` entries
+/// (`table_len` from [`snapshot_table_byte_len`]).
+///
+/// [`MatchMode::IdThenName`] runs one full pass comparing the id
+/// bytes; only if **no** entry's id matched does a second full
+/// pass compare the name bytes — so a later entry matching by ID
+/// beats an earlier entry matching by name, exactly qemu's
+/// `find_snapshot_by_id_or_name` (the `-a` resolver).
+/// [`MatchMode::NameOnly`] runs the single name pass (`-d`).
+/// Within each pass the first match in table order wins.
+///
+/// Returns `Ok(None)` when nothing matches,
+/// [`SnapshotError::MisalignedAccess`] if `table_len` exceeds
+/// `table`, and [`SnapshotError::ParseFailed`] if the entry walk
+/// escapes the table.
+pub fn find_snapshot_in_table(
+    table: &[u8],
+    table_len: usize,
+    nb_snapshots: u32,
+    needle: &[u8],
+    mode: MatchMode,
+) -> Result<Option<FoundSnapshot>, SnapshotError> {
+    if table_len > table.len() {
+        return Err(SnapshotError::MisalignedAccess);
+    }
+    let table = &table[..table_len];
+    match mode {
+        MatchMode::IdThenName => {
+            if let Some(found) = find_pass(table, nb_snapshots, needle, true)? {
+                return Ok(Some(found));
+            }
+            find_pass(table, nb_snapshots, needle, false)
+        }
+        MatchMode::NameOnly => find_pass(table, nb_snapshots, needle, false),
+    }
 }
 
 /// Parse the leading decimal digits of `id`, strtoul-style.
@@ -911,6 +1077,193 @@ mod tests {
         assert_eq!(
             build_snapshot_table_without(&raw[..80], 80, 3, 0, &mut out),
             Err(SnapshotError::ParseFailed)
+        );
+    }
+
+    // -------------------- find_snapshot_in_table --------------------
+
+    /// Build a findable raw table whose entries carry distinct
+    /// l1_table_offset / l1_size / disk_size values derived from
+    /// their position, so a match can be verified by payload.
+    /// `entries` is (id, name, extra_data_size).
+    fn build_find_table(buf: &mut [u8], entries: &[(&[u8], &[u8], usize)]) -> usize {
+        let total = build_raw_table(buf, entries);
+        // Walk again and stamp per-entry payloads.
+        for (i, _) in entries.iter().enumerate() {
+            let (start, _len) =
+                snapshot_table_entry_bounds(&buf[..total], entries.len() as u32, i as u32).unwrap();
+            let l1_off = 0x1_0000u64 * (i as u64 + 1);
+            let l1_size = 10u32 + i as u32;
+            buf[start..start + 8].copy_from_slice(&l1_off.to_be_bytes());
+            buf[start + 8..start + 12].copy_from_slice(&l1_size.to_be_bytes());
+            let extra =
+                u32::from_be_bytes(buf[start + 36..start + 40].try_into().unwrap()) as usize;
+            if extra >= 16 {
+                let disk = 0x40_0000u64 + i as u64;
+                buf[start + 48..start + 56].copy_from_slice(&disk.to_be_bytes());
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn find_id_pass_beats_earlier_name_match() {
+        // The phase 8 precedence fixture: id=1 name="2", id=2
+        // name="x". Needle "2" must resolve to the SECOND entry
+        // (ID match) under IdThenName even though the first
+        // entry's NAME matches — a later ID match beats an
+        // earlier name match (two full passes).
+        let mut raw = [0u8; 512];
+        let total = build_find_table(&mut raw, &[(b"1", b"2", 24), (b"2", b"x", 24)]);
+        let f = find_snapshot_in_table(&raw, total, 2, b"2", MatchMode::IdThenName)
+            .unwrap()
+            .unwrap();
+        assert_eq!(f.index, 1);
+        assert_eq!(f.l1_table_offset, 0x2_0000);
+        assert_eq!(f.l1_size, 11);
+    }
+
+    #[test]
+    fn find_name_fallback_when_no_id_matches() {
+        let mut raw = [0u8; 512];
+        let total = build_find_table(&mut raw, &[(b"1", b"alpha", 24), (b"2", b"beta", 24)]);
+        let f = find_snapshot_in_table(&raw, total, 2, b"beta", MatchMode::IdThenName)
+            .unwrap()
+            .unwrap();
+        assert_eq!(f.index, 1);
+        assert_eq!(
+            find_snapshot_in_table(&raw, total, 2, b"nosuch", MatchMode::IdThenName).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn find_name_only_ignores_ids() {
+        // NameOnly must NOT match entry ids — the delete
+        // semantics. Needle "2" only matches the entry NAMED "2"
+        // (the first), never the entry with ID 2.
+        let mut raw = [0u8; 512];
+        let total = build_find_table(&mut raw, &[(b"1", b"2", 24), (b"2", b"x", 24)]);
+        let f = find_snapshot_in_table(&raw, total, 2, b"2", MatchMode::NameOnly)
+            .unwrap()
+            .unwrap();
+        assert_eq!(f.index, 0);
+        // A pure-ID needle finds nothing in NameOnly mode.
+        assert_eq!(
+            find_snapshot_in_table(&raw, total, 2, b"1", MatchMode::NameOnly).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn find_first_match_within_each_pass_for_duplicates() {
+        // Duplicate names: the FIRST name match in table order
+        // wins, in both modes (no id matches "dup").
+        let mut raw = [0u8; 512];
+        let total = build_find_table(&mut raw, &[(b"1", b"dup", 24), (b"2", b"dup", 24)]);
+        for mode in [MatchMode::IdThenName, MatchMode::NameOnly] {
+            let f = find_snapshot_in_table(&raw, total, 2, b"dup", mode)
+                .unwrap()
+                .unwrap();
+            assert_eq!(f.index, 0, "mode {:?}", mode);
+        }
+        // Duplicate ids: first ID match wins under IdThenName.
+        let mut raw2 = [0u8; 512];
+        let total2 = build_find_table(&mut raw2, &[(b"7", b"a", 24), (b"7", b"b", 24)]);
+        let f = find_snapshot_in_table(&raw2, total2, 2, b"7", MatchMode::IdThenName)
+            .unwrap()
+            .unwrap();
+        assert_eq!(f.index, 0);
+    }
+
+    #[test]
+    fn find_empty_needle_matches_empty_fields() {
+        // An empty needle matches an empty-named snapshot
+        // (qemu-created images can carry one).
+        let mut raw = [0u8; 512];
+        let total = build_find_table(&mut raw, &[(b"1", b"x", 24), (b"2", b"", 24)]);
+        let f = find_snapshot_in_table(&raw, total, 2, b"", MatchMode::NameOnly)
+            .unwrap()
+            .unwrap();
+        assert_eq!(f.index, 1);
+        let f = find_snapshot_in_table(&raw, total, 2, b"", MatchMode::IdThenName)
+            .unwrap()
+            .unwrap();
+        assert_eq!(f.index, 1, "no empty id exists; the name pass matches");
+    }
+
+    #[test]
+    fn find_matches_full_long_names_beyond_parser_truncation() {
+        // A 70-byte name (beyond the bounded parser's 63-byte
+        // truncation) must compare in full: the exact name
+        // matches, a 63-byte prefix does not.
+        let long = [b'n'; 70];
+        let mut raw = [0u8; 512];
+        let total = build_find_table(&mut raw, &[(b"1", &long, 24)]);
+        let f = find_snapshot_in_table(&raw, total, 1, &long, MatchMode::NameOnly)
+            .unwrap()
+            .unwrap();
+        assert_eq!(f.index, 0);
+        assert_eq!(
+            find_snapshot_in_table(&raw, total, 1, &long[..63], MatchMode::NameOnly).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn find_reports_disk_size_from_extra_data() {
+        let mut raw = [0u8; 512];
+        let total = build_find_table(&mut raw, &[(b"1", b"a", 24), (b"2", b"b", 40)]);
+        let f = find_snapshot_in_table(&raw, total, 2, b"a", MatchMode::NameOnly)
+            .unwrap()
+            .unwrap();
+        assert_eq!(f.disk_size_or_zero, 0x40_0000);
+        // Oversized extra data still reads disk_size at offset 8.
+        let f = find_snapshot_in_table(&raw, total, 2, b"b", MatchMode::NameOnly)
+            .unwrap()
+            .unwrap();
+        assert_eq!(f.disk_size_or_zero, 0x40_0001);
+    }
+
+    #[test]
+    fn find_absent_extra_data_reports_zero_disk_size() {
+        // extra_data_size = 8 (< 16): disk_size is absent; the
+        // finder reports the 0 sentinel (open question 5 — the
+        // caller treats it as matching, mirroring
+        // qcow2_read_snapshots' current-virtual-size default).
+        let mut raw = [0u8; 512];
+        let total = build_find_table(&mut raw, &[(b"1", b"a", 8)]);
+        let f = find_snapshot_in_table(&raw, total, 1, b"a", MatchMode::NameOnly)
+            .unwrap()
+            .unwrap();
+        assert_eq!(f.disk_size_or_zero, 0);
+    }
+
+    #[test]
+    fn find_malformed_table_errors() {
+        // Truncated walk escapes the table.
+        let mut raw = [0u8; 512];
+        let _ = mixed_table(&mut raw);
+        assert_eq!(
+            find_snapshot_in_table(&raw[..80], 80, 3, b"gamma-x", MatchMode::NameOnly),
+            Err(SnapshotError::ParseFailed)
+        );
+        // table_len beyond the slice.
+        assert_eq!(
+            find_snapshot_in_table(&raw[..100], 200, 3, b"x", MatchMode::NameOnly),
+            Err(SnapshotError::MisalignedAccess)
+        );
+    }
+
+    #[test]
+    fn find_zero_snapshots_is_none() {
+        assert_eq!(
+            find_snapshot_in_table(&[], 0, 0, b"x", MatchMode::IdThenName).unwrap(),
+            None
+        );
+        assert_eq!(
+            find_snapshot_in_table(&[], 0, 0, b"", MatchMode::NameOnly).unwrap(),
+            None
         );
     }
 

@@ -188,7 +188,15 @@ caller-staged byte slices without any I/O.
 - **`update_copied_flags_for_l1`** — walks the L1, rewriting the
   `OFLAG_COPIED` flag on each L1 and L2 entry based on the
   cluster's current refcount (set when refcount==1, clear
-  otherwise). Returns the number of entries rewritten.
+  otherwise). Returns the number of entries rewritten. L2 entries
+  that reference no cluster (UNALLOCATED, or ZERO_PLAIN on
+  standard L2) are **scrubbed**, not skipped: qemu's
+  `qcow2_update_snapshot_refcount` strips `OFLAG_COPIED` before
+  classifying and assigns `refcount = 0` to those entry types, so
+  a stale COPIED bit is actively cleared on every walk — the
+  walker mirrors that (added in PLAN-snapshot phase 8, closing a
+  phase 5–7 fidelity gap; the extended-L2 subcluster bitmap is
+  untouched).
 
 The phase 6 create planner adds these table-serialisation
 helpers (`src/crates/snapshot/src/table.rs`):
@@ -232,6 +240,23 @@ The phase 7 delete planner adds:
   pass (pass 1), so delete can validate the decrement against the
   staged refblocks *before any disk write* while deferring the
   paired apply until after the commit-point header write.
+
+The phase 8 apply planner adds:
+
+- **`MatchMode`** / **`FoundSnapshot`** /
+  **`find_snapshot_in_table`** — the raw-table snapshot finder
+  with per-mode matching semantics. `NameOnly` is delete's single
+  name pass (the phase 7 inline find was refactored onto it);
+  `IdThenName` is apply's two-full-pass resolver (qemu's
+  `find_snapshot_by_id_or_name`: a complete ID pass, then — only
+  if no ID matched — a complete name pass, so a later ID match
+  beats an earlier name match). Comparisons cover the full
+  on-disk strings, independent of the bounded parser's 63-byte
+  truncation. `FoundSnapshot` carries the entry's index, L1
+  geometry, and `disk_size_or_zero` (extra-data offset 8 when
+  `extra_data_size >= 16`, else a 0 "absent" sentinel that the
+  caller treats as matching — mirroring `qcow2_read_snapshots`'
+  default of the current virtual size).
 
 The crate does not emit `SnapshotPatch` entries itself: the
 create guest binary writes each staged region directly
@@ -326,6 +351,73 @@ repairable flag warnings, never a dangling reference. Because
 delete writes no timestamps, the post-delete image is
 byte-identical to qemu's given byte-identical inputs (modulo
 freed-cluster contents and the file tail — docs/quirks.md).
+
+### Apply write ordering (crash safety)
+
+`instar snapshot -a` finds the target by **ID first, then name —
+two full passes** (qemu's `find_snapshot_by_id_or_name`; see
+docs/quirks.md for the `-d` / `-a` asymmetry), refuses geometry
+mismatches (a stored `disk_size` differing from the current
+virtual size, or a snapshot L1 larger than the active L1 — qemu
+truncates / grows respectively; docs/quirks.md), stages BOTH
+chains (the target snapshot's L1 + L2 set; the old active L1 +
+L2 set), then writes back in three `fsync`-separated groups,
+mirroring `qcow2_snapshot_goto`. Apply rewrites the **active L1
+in place** and never touches the snapshot table or the header:
+
+```
+precheck: precheck_snapshot_refcount(SwapForApply { from: active
+   L1, to: snapshot L1 }) — both directions (decrement underflow
+   on the outgoing chain, increment overflow on the incoming
+   one) validated read-only, BEFORE any disk write.
+   (in-memory: update_snapshot_refcount increment walk over the
+    snapshot's chain — qemu's +1 walk)
+A: all staged refblocks, carrying the increments only.
+   -> fsync
+B: the snapshot's RAW L1 content, zero-padded to the active L1's
+   byte size (hdr.l1_size * 8), written at hdr.l1_table_offset —
+   stale COPIED flags intact, mirroring qemu's bdrv_pwrite_sync.
+   THIS IS THE COMMIT POINT: the active view is now the snapshot.
+   -> fsync
+   (in-memory: the -1 walk over the staged OLD active chain, then
+    ONE final-state COPIED refresh over the padded new-L1 copy +
+    the snapshot's L2 set, and over the staged old active chain —
+    qemu's -1 walk also refreshes the old chain's surviving L2s)
+C: all staged refblocks (now carrying the decrements) + the
+   refreshed L1 written to BOTH locations — hdr.l1_table_offset
+   at the padded length AND sn.l1_table_offset at sn.l1_size * 8
+   (replicating the snapshot-stored-L1 flag write qemu's +1 walk
+   performs) — + the dirty snapshot-set L2s + the surviving
+   old-active L2s (final refcount > 0, e.g. shared with another
+   snapshot). Freed old-active L2s are NEVER written (qemu runs
+   the walks with cache_discards = true, so dirty cache entries
+   for freed clusters are dropped, not flushed).
+   -> fsync
+```
+
+**Why one flag pass suffices** (qemu performs three flag-bearing
+writes: the snapshot's stored L1 mid-state during the +1 walk,
+the raw padded copy, then the active L1 at final state in the
+addend-0 walk): after an apply, every cluster reachable from the
+new active chain has refcount >= 2 — the active L1 is a copy of
+the snapshot's L1, so everything the active view references is
+also referenced by the still-present snapshot. Every COPIED flag
+on the new chain therefore ends *clear*, and the flags qemu
+computes mid-state equal the flags at final state. instar
+computes flags once, at final state, and writes the same bytes.
+
+A crash before group B leaves the image unchanged except
+over-referenced refcounts (repairable leaks); a crash between B
+and C leaves the active view switched with leaks and stale
+COPIED flags — repairable, never a dangling reference. One
+window differs cosmetically from qemu (qemu scrubs the
+snapshot's stored L1 *before* its active overwrite, instar
+after); both orders leave only repairable states and the final
+bytes are identical. Because apply writes no timestamps, no
+snapshot-table bytes and no header bytes, post-apply images are
+byte-identical to qemu's given byte-identical inputs across
+every scenario, including diverged applies (modulo freed-cluster
+contents and the file tail — docs/quirks.md).
 
 ## Snapshot L1 Table
 

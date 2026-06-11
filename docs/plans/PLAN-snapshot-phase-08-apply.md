@@ -211,6 +211,30 @@ are the empirical check on this argument.
     snapshot-set L2s. Freed old-active-only L2s are **not**
     written (fact 6, third bullet). `fsync_input(0)`.
 
+**Gap surfaced during execution: surviving old-active L2s are
+written by qemu.** The algorithm above enumerated group C as
+refblocks + both L1 writes + dirty snapshot-set L2s, with freed
+old-active L2s never written (fact 6, third bullet). That
+enumeration missed a case: when the old active chain shares an
+L2 table with a *different* snapshot than the one being applied
+(e.g. `s1`, write, `s2`, apply `s1` — the old active L2 is
+shared with `s2`), that L2 survives the apply at refcount ≥ 1,
+and qemu's −1 walk recomputes its entries' COPIED flags at
+post-decrement (= final) refcounts, marks it dirty, and flushes
+it (`cache_discards` only drops entries for *freed* clusters;
+the trailing `bdrv_flush` writes the rest). Verified
+empirically: the s2-shared L2's data entry gains COPIED under
+qemu (refcount 2 → 1). This scenario is reachable by the
+matrix's own cross-mode row, so byte-identity required closing
+it: step 10 gains a second final-state flag refresh over the
+staged old active chain, and group C additionally writes back
+the surviving (final refcount > 0) active-set L2s — freed ones
+are still never written. A physical L2 staged in both sets is
+written twice with identical bytes (both refreshes are the same
+pure function of entry content and final refcounts). Facts 6
+and 7 are unchanged; this is a completion of the group C
+enumeration, not a design change.
+
 Crash-safety contract: before group B the image is unchanged
 except over-referenced refcounts (leaks). After B the active
 view is the snapshot; until C completes, refcounts are

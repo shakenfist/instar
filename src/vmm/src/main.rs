@@ -10230,11 +10230,8 @@ fn run_snapshot(args: SnapshotArgs, verbose: bool) -> Result<(), Box<dyn std::er
     if let Some(needle) = args.delete.clone() {
         return run_snapshot_delete(&args, &needle, verbose);
     }
-    if args.apply.is_some() {
-        return Err("snapshot: -a (apply) is not yet implemented in v1; \
-             apply arrives in PLAN-snapshot phase 8 \
-             (see docs/plans/PLAN-snapshot.md)"
-            .into());
+    if let Some(needle) = args.apply.clone() {
+        return run_snapshot_apply(&args, &needle, verbose);
     }
     unreachable!("clap ArgGroup guarantees one mode flag is set");
 }
@@ -10556,7 +10553,7 @@ fn run_snapshot_list(args: &SnapshotArgs, verbose: bool) -> Result<(), Box<dyn s
     let result =
         snapshot_result.ok_or_else(|| "snapshot: guest returned no SnapshotResult".to_string())?;
 
-    if let Some(msg) = snapshot_error_message(result.error) {
+    if let Some(msg) = snapshot_error_message(SNAPSHOT_CONFIG_MODE_LIST, result.error) {
         eprintln!("{}", msg);
         return Err(format!("snapshot: guest reported error code {}", result.error).into());
     }
@@ -10646,7 +10643,9 @@ fn run_snapshot_delete(
     if needle_bytes.len() > 256 {
         // Matches the guest's ERROR_NOT_FOUND surface (message +
         // non-zero exit), with the image untouched.
-        if let Some(msg) = snapshot_error_message(SNAPSHOT_RESULT_ERROR_NOT_FOUND) {
+        if let Some(msg) =
+            snapshot_error_message(SNAPSHOT_CONFIG_MODE_DELETE, SNAPSHOT_RESULT_ERROR_NOT_FOUND)
+        {
             eprintln!("{}", msg);
         }
         return Err(format!(
@@ -10658,6 +10657,48 @@ fn run_snapshot_delete(
     run_snapshot_mutating_guest(
         args,
         SNAPSHOT_CONFIG_MODE_DELETE,
+        needle_bytes,
+        0,
+        0,
+        verbose,
+    )
+}
+
+/// Drive `MODE_APPLY` end-to-end via
+/// [`run_snapshot_mutating_guest`].
+///
+/// The argument is passed through verbatim. qemu's apply resolves
+/// it via `find_snapshot_by_id_or_name`: a full pass comparing
+/// IDs, then — only if no ID matched — a full pass comparing
+/// names (the opposite asymmetry from delete's name-only matcher;
+/// see docs/quirks.md). The date fields are zero: apply writes no
+/// timestamps, no snapshot-table bytes, and no header bytes,
+/// which is what makes post-apply images byte-comparable against
+/// qemu's. An argument longer than the 256-byte wire buffer
+/// cannot name any matchable snapshot, so it is resolved as
+/// not-found without launching the guest. Success is silent
+/// (matching `qemu-img snapshot -a`).
+fn run_snapshot_apply(
+    args: &SnapshotArgs,
+    needle: &str,
+    verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let needle_bytes = needle.as_bytes();
+    if needle_bytes.len() > 256 {
+        if let Some(msg) =
+            snapshot_error_message(SNAPSHOT_CONFIG_MODE_APPLY, SNAPSHOT_RESULT_ERROR_NOT_FOUND)
+        {
+            eprintln!("{}", msg);
+        }
+        return Err(format!(
+            "snapshot: guest reported error code {}",
+            SNAPSHOT_RESULT_ERROR_NOT_FOUND
+        )
+        .into());
+    }
+    run_snapshot_mutating_guest(
+        args,
+        SNAPSHOT_CONFIG_MODE_APPLY,
         needle_bytes,
         0,
         0,
@@ -10934,7 +10975,7 @@ fn run_snapshot_mutating_guest(
 
     let result =
         snapshot_result.ok_or_else(|| "snapshot: guest returned no SnapshotResult".to_string())?;
-    if let Some(msg) = snapshot_error_message(result.error) {
+    if let Some(msg) = snapshot_error_message(mode, result.error) {
         eprintln!("{}", msg);
         return Err(format!("snapshot: guest reported error code {}", result.error).into());
     }
@@ -10949,7 +10990,13 @@ fn run_snapshot_mutating_guest(
 /// Resolve a `SnapshotResult::error` code to a stderr-friendly
 /// message. Returns `None` for `ERROR_OK` (success path closes
 /// the renderer instead).
-fn snapshot_error_message(error: u32) -> Option<&'static str> {
+///
+/// `mode` (a `SNAPSHOT_CONFIG_MODE_*` value) selects per-mode
+/// wording where the modes genuinely differ (phase 8):
+/// `ERROR_NOT_FOUND` — delete matches by name only, apply by ID
+/// then name — and `ERROR_L1_SIZE_MISMATCH` — apply's
+/// disk-size / L1-geometry refusal where qemu-img would truncate.
+fn snapshot_error_message(mode: u32, error: u32) -> Option<&'static str> {
     match error {
         SNAPSHOT_RESULT_ERROR_OK => None,
         SNAPSHOT_RESULT_ERROR_UNSUPPORTED_FORMAT => {
@@ -10962,10 +11009,20 @@ fn snapshot_error_message(error: u32) -> Option<&'static str> {
              16 bits). List mode works regardless; the mutating modes refuse. \
              See docs/quirks.md.",
         ),
-        SNAPSHOT_RESULT_ERROR_NOT_FOUND => Some(
-            "snapshot: no snapshot with that name (qemu-img 10 matches -d \
-             arguments by name only, not ID; see docs/quirks.md)",
-        ),
+        SNAPSHOT_RESULT_ERROR_NOT_FOUND => {
+            if mode == SNAPSHOT_CONFIG_MODE_APPLY {
+                Some(
+                    "snapshot: no snapshot with that ID or name (qemu-img 10 \
+                     matches -a arguments by ID first, then by name; see \
+                     docs/quirks.md)",
+                )
+            } else {
+                Some(
+                    "snapshot: no snapshot with that name (qemu-img 10 matches -d \
+                     arguments by name only, not ID; see docs/quirks.md)",
+                )
+            }
+        }
         SNAPSHOT_RESULT_ERROR_DUPLICATE_NAME => {
             Some("snapshot: a snapshot with that name already exists")
         }
@@ -10983,7 +11040,17 @@ fn snapshot_error_message(error: u32) -> Option<&'static str> {
         ),
         SNAPSHOT_RESULT_ERROR_IO => Some("snapshot: I/O failure reading the source"),
         SNAPSHOT_RESULT_ERROR_L1_SIZE_MISMATCH => {
-            Some("snapshot: target L1 size exceeds the active L1 allocation cap")
+            if mode == SNAPSHOT_CONFIG_MODE_APPLY {
+                Some(
+                    "snapshot: the snapshot's disk size or L1 geometry differs \
+                     from the image's current state — the image was resized \
+                     after the snapshot was taken. qemu-img truncates the image \
+                     on apply; instar refuses. Resize the image back to the \
+                     snapshot's size first. See docs/quirks.md.",
+                )
+            } else {
+                Some("snapshot: target L1 size exceeds the active L1 allocation cap")
+            }
         }
         SNAPSHOT_RESULT_ERROR_INVALID_UTF8 => Some("snapshot: argument is not valid UTF-8"),
         SNAPSHOT_RESULT_ERROR_INVALID_CONFIG => {
@@ -13955,7 +14022,14 @@ Offset          Length          Mapped to       File
 
     #[test]
     fn snapshot_error_ok_returns_none() {
-        assert!(snapshot_error_message(SNAPSHOT_RESULT_ERROR_OK).is_none());
+        for mode in [
+            SNAPSHOT_CONFIG_MODE_LIST,
+            SNAPSHOT_CONFIG_MODE_APPLY,
+            SNAPSHOT_CONFIG_MODE_CREATE,
+            SNAPSHOT_CONFIG_MODE_DELETE,
+        ] {
+            assert!(snapshot_error_message(mode, SNAPSHOT_RESULT_ERROR_OK).is_none());
+        }
     }
 
     #[test]
@@ -13974,40 +14048,75 @@ Offset          Length          Mapped to       File
             SNAPSHOT_RESULT_ERROR_INVALID_CONFIG,
             SNAPSHOT_RESULT_ERROR_PARSE_FAILED,
         ];
-        let messages: Vec<&'static str> = codes
-            .iter()
-            .map(|c| snapshot_error_message(*c).expect("known error must have message"))
-            .collect();
-        for m in &messages {
-            assert!(!m.is_empty());
-            assert!(m.starts_with("snapshot: "), "missing prefix: {}", m);
-        }
-        for i in 0..messages.len() {
-            for j in (i + 1)..messages.len() {
-                assert_ne!(
-                    messages[i], messages[j],
-                    "error codes {} and {} share a message",
-                    codes[i], codes[j]
-                );
+        for mode in [SNAPSHOT_CONFIG_MODE_APPLY, SNAPSHOT_CONFIG_MODE_DELETE] {
+            let messages: Vec<&'static str> = codes
+                .iter()
+                .map(|c| snapshot_error_message(mode, *c).expect("known error must have message"))
+                .collect();
+            for m in &messages {
+                assert!(!m.is_empty());
+                assert!(m.starts_with("snapshot: "), "missing prefix: {}", m);
+            }
+            for i in 0..messages.len() {
+                for j in (i + 1)..messages.len() {
+                    assert_ne!(
+                        messages[i], messages[j],
+                        "mode {}: error codes {} and {} share a message",
+                        mode, codes[i], codes[j]
+                    );
+                }
             }
         }
     }
 
     #[test]
     fn snapshot_error_unknown_returns_generic_message() {
-        let msg = snapshot_error_message(999).expect("unknown error returns Some");
+        let msg = snapshot_error_message(SNAPSHOT_CONFIG_MODE_LIST, 999)
+            .expect("unknown error returns Some");
         assert!(msg.contains("unknown"));
     }
 
     #[test]
-    fn snapshot_not_found_message_is_name_only() {
+    fn snapshot_not_found_message_is_name_only_for_delete() {
         // Phase 7 (fact 2): qemu 10's delete matches by name only —
         // the old "matches neither a snapshot ID nor a name" wording
         // was wrong and must not come back.
-        let msg = snapshot_error_message(SNAPSHOT_RESULT_ERROR_NOT_FOUND)
-            .expect("not-found has a message");
+        let msg =
+            snapshot_error_message(SNAPSHOT_CONFIG_MODE_DELETE, SNAPSHOT_RESULT_ERROR_NOT_FOUND)
+                .expect("not-found has a message");
         assert!(msg.contains("name only"), "msg: {}", msg);
         assert!(!msg.contains("neither"), "msg: {}", msg);
+    }
+
+    #[test]
+    fn snapshot_not_found_message_is_id_then_name_for_apply() {
+        // Phase 8 (fact 2): qemu's apply resolves via
+        // find_snapshot_by_id_or_name — ID first, then name.
+        let msg =
+            snapshot_error_message(SNAPSHOT_CONFIG_MODE_APPLY, SNAPSHOT_RESULT_ERROR_NOT_FOUND)
+                .expect("not-found has a message");
+        assert!(msg.contains("ID first, then by name"), "msg: {}", msg);
+        assert!(!msg.contains("name only"), "msg: {}", msg);
+    }
+
+    #[test]
+    fn snapshot_l1_mismatch_message_is_mode_aware() {
+        // Apply's geometry refusal explains the qemu-truncates /
+        // instar-refuses divergence and the resize-back workaround.
+        let apply = snapshot_error_message(
+            SNAPSHOT_CONFIG_MODE_APPLY,
+            SNAPSHOT_RESULT_ERROR_L1_SIZE_MISMATCH,
+        )
+        .expect("apply mismatch has a message");
+        assert!(apply.contains("resized"), "msg: {}", apply);
+        assert!(apply.contains("truncates"), "msg: {}", apply);
+        assert!(apply.contains("quirks"), "msg: {}", apply);
+        let delete = snapshot_error_message(
+            SNAPSHOT_CONFIG_MODE_DELETE,
+            SNAPSHOT_RESULT_ERROR_L1_SIZE_MISMATCH,
+        )
+        .expect("delete mismatch has a message");
+        assert_ne!(apply, delete);
     }
 
     // --- json_escape ----------------------------------------------

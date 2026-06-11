@@ -1198,6 +1198,19 @@ where
 /// (via `l2_for_index`) are then walked and each L2 entry's
 /// COPIED flag rewritten similarly.
 ///
+/// Entries that reference no cluster are **scrubbed**, not
+/// skipped (phase 8b): qemu's `qcow2_update_snapshot_refcount`
+/// strips `QCOW_OFLAG_COPIED` before classifying and assigns
+/// `refcount = 0` to `QCOW2_CLUSTER_ZERO_PLAIN` (standard L2
+/// only: zero bit set, offset 0 — with subclusters the zero
+/// status lives in the bitmap and `qcow2_get_cluster_type`
+/// skips the zero branch) and `QCOW2_CLUSTER_UNALLOCATED`
+/// (offset 0), so a stale COPIED bit on such an entry is
+/// actively cleared. Both classifications reduce to "offset
+/// masks to 0 and not compressed", and both get the same
+/// treatment: clear a set COPIED bit and count the rewrite.
+/// The extended-L2 subcluster bitmap is untouched.
+///
 /// Returns the count of entries (L1 + L2 combined) actually
 /// rewritten.
 pub fn update_copied_flags_for_l1<'l2, L2MF, RCF>(
@@ -1271,10 +1284,6 @@ where
                 l2_bytes[eoff + 6],
                 l2_bytes[eoff + 7],
             ]);
-            let masked = l2_entry & !OFLAG_COPIED;
-            if masked == 0 {
-                continue;
-            }
             let host_offset = if (l2_entry & OFLAG_COMPRESSED) != 0 {
                 let raw_off = l2_entry & !(OFLAG_COMPRESSED | OFLAG_COPIED);
                 let cluster_mask = !((1u64 << cluster_bits) - 1);
@@ -1282,6 +1291,14 @@ where
             } else {
                 let v = l2_entry & L2_OFFSET_MASK;
                 if v == 0 {
+                    // UNALLOCATED or ZERO_PLAIN: qemu treats the
+                    // refcount as 0, so COPIED can never be
+                    // legitimately set — scrub a stale bit
+                    // (phase 8b; see the doc comment).
+                    if (l2_entry & OFLAG_COPIED) != 0 {
+                        rewrite_l2_entry_copied_flag(l2_bytes, l2_idx as u32, false, extended_l2)?;
+                        rewrites = rewrites.saturating_add(1);
+                    }
                     continue;
                 }
                 v
@@ -3014,5 +3031,190 @@ mod tests {
             false,
         );
         assert_eq!(r, Err(SnapshotError::InvalidConfig));
+    }
+
+    // ---------------- phase 8b: stale-COPIED scrub ----------------
+    //
+    // qemu's qcow2_update_snapshot_refcount strips COPIED before
+    // classifying; ZERO_PLAIN / UNALLOCATED entries get
+    // refcount = 0, so a stale COPIED bit is cleared on every
+    // walk. These tests pin the mirrored behaviour. Real mutable
+    // L2 buffers are threaded through the 'l2 lifetime with a raw
+    // pointer reborrow, the same pattern the guest binary uses.
+
+    /// Run the walker over one L1 entry (-> L2 at 0x4000, rc 1,
+    /// COPIED already set so the L1 contributes no rewrite) and
+    /// the given L2 buffer. Returns the rewrite count.
+    fn run_flags_over_l2(l2: &mut [u8], extended_l2: bool, rc_data: u64) -> u32 {
+        let mut l1 = [0u8; 8];
+        let l1_entry = (0x4000u64 & L1_OFFSET_MASK) | OFLAG_COPIED;
+        l1.copy_from_slice(&l1_entry.to_be_bytes());
+        let rc = move |off: u64| -> Option<u64> {
+            Some(match off {
+                0x4000 => 1,
+                _ => rc_data,
+            })
+        };
+        let ptr = l2.as_mut_ptr();
+        let len = l2.len();
+        update_copied_flags_for_l1(
+            &mut l1,
+            12,
+            // SAFETY: the walker visits each L1 index once, so a
+            // single live reborrow of the buffer exists at a time.
+            |_idx| Some(unsafe { core::slice::from_raw_parts_mut(ptr, len) }),
+            rc,
+            extended_l2,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn scrub_clears_stale_copied_on_zero_plain_standard() {
+        // ZERO_PLAIN: zero bit (bit 0) set, offset 0, stale
+        // COPIED. The scrub clears COPIED, preserves the zero
+        // bit, and counts one rewrite.
+        let mut l2 = [0u8; 16];
+        l2[0..8].copy_from_slice(&(OFLAG_COPIED | 1u64).to_be_bytes());
+        l2[8..16].copy_from_slice(&1u64.to_be_bytes()); // clean zero-plain
+        let rewrites = run_flags_over_l2(&mut l2, false, 0);
+        assert_eq!(rewrites, 1);
+        assert_eq!(u64::from_be_bytes(l2[0..8].try_into().unwrap()), 1);
+        assert_eq!(u64::from_be_bytes(l2[8..16].try_into().unwrap()), 1);
+    }
+
+    #[test]
+    fn scrub_clears_stale_copied_on_unallocated_standard() {
+        // UNALLOCATED with only COPIED set: scrubbed to all-zero.
+        let mut l2 = [0u8; 16];
+        l2[0..8].copy_from_slice(&OFLAG_COPIED.to_be_bytes());
+        // Entry 1 fully zero: untouched, no rewrite counted.
+        let rewrites = run_flags_over_l2(&mut l2, false, 0);
+        assert_eq!(rewrites, 1);
+        assert_eq!(u64::from_be_bytes(l2[0..8].try_into().unwrap()), 0);
+        assert_eq!(u64::from_be_bytes(l2[8..16].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn scrub_clean_unallocated_entries_untouched() {
+        // No stale flags anywhere: zero rewrites, bytes identical.
+        let mut l2 = [0u8; 24];
+        l2[0..8].copy_from_slice(&0u64.to_be_bytes());
+        l2[8..16].copy_from_slice(&1u64.to_be_bytes()); // zero-plain, clean
+        l2[16..24].copy_from_slice(&0u64.to_be_bytes());
+        let before = l2;
+        let rewrites = run_flags_over_l2(&mut l2, false, 0);
+        assert_eq!(rewrites, 0);
+        assert_eq!(l2, before);
+    }
+
+    #[test]
+    fn scrub_clears_stale_copied_on_extended_l2_offset_zero() {
+        // Extended L2: 16-byte entries. An offset-0 entry with a
+        // stale COPIED (with subclusters this is UNALLOCATED —
+        // qcow2_get_cluster_type skips the zero branch — but the
+        // scrub result is the same). The subcluster bitmap must
+        // be untouched.
+        let mut l2 = [0u8; 32];
+        l2[0..8].copy_from_slice(&OFLAG_COPIED.to_be_bytes());
+        l2[8..16].copy_from_slice(&0xDEAD_BEEF_CAFE_F00Du64.to_be_bytes());
+        // Entry 1: bit 0 set + COPIED, offset 0 (UNALLOCATED under
+        // extended L2): scrubbed too, bitmap untouched.
+        l2[16..24].copy_from_slice(&(OFLAG_COPIED | 1u64).to_be_bytes());
+        l2[24..32].copy_from_slice(&0x0123_4567_89AB_CDEFu64.to_be_bytes());
+        let rewrites = run_flags_over_l2(&mut l2, true, 0);
+        assert_eq!(rewrites, 2);
+        assert_eq!(u64::from_be_bytes(l2[0..8].try_into().unwrap()), 0);
+        assert_eq!(
+            u64::from_be_bytes(l2[8..16].try_into().unwrap()),
+            0xDEAD_BEEF_CAFE_F00D
+        );
+        assert_eq!(u64::from_be_bytes(l2[16..24].try_into().unwrap()), 1);
+        assert_eq!(
+            u64::from_be_bytes(l2[24..32].try_into().unwrap()),
+            0x0123_4567_89AB_CDEF
+        );
+    }
+
+    #[test]
+    fn scrub_does_not_consult_refcounts_for_scrubbed_entries() {
+        // qemu assigns refcount = 0 without a refcount lookup for
+        // ZERO_PLAIN / UNALLOCATED; the walker must not call
+        // refcount_for_cluster for them (only for the L1's own
+        // L2 cluster here).
+        let mut l1 = [0u8; 8];
+        let l1_entry = (0x4000u64 & L1_OFFSET_MASK) | OFLAG_COPIED;
+        l1.copy_from_slice(&l1_entry.to_be_bytes());
+        let mut l2 = [0u8; 16];
+        l2[0..8].copy_from_slice(&(OFLAG_COPIED | 1u64).to_be_bytes());
+        l2[8..16].copy_from_slice(&OFLAG_COPIED.to_be_bytes());
+        let rc = |off: u64| -> Option<u64> {
+            assert_eq!(off, 0x4000, "data refcount consulted for an empty entry");
+            Some(1)
+        };
+        let ptr = l2.as_mut_ptr();
+        let len = l2.len();
+        let rewrites = update_copied_flags_for_l1(
+            &mut l1,
+            12,
+            // SAFETY: single L1 index, single live reborrow.
+            |_idx| Some(unsafe { core::slice::from_raw_parts_mut(ptr, len) }),
+            rc,
+            false,
+        )
+        .unwrap();
+        assert_eq!(rewrites, 2);
+    }
+
+    #[test]
+    fn scrub_mixed_with_allocated_entries() {
+        // Allocated entries keep the refcount-driven behaviour
+        // (rc 2 -> COPIED cleared; rc 1 via a second run -> set),
+        // while the stale zero-plain neighbour is scrubbed in the
+        // same pass.
+        let mut l2 = [0u8; 24];
+        l2[0..8].copy_from_slice(&(0x10_0000u64 | OFLAG_COPIED).to_be_bytes());
+        l2[8..16].copy_from_slice(&(OFLAG_COPIED | 1u64).to_be_bytes());
+        l2[16..24].copy_from_slice(&0x10_1000u64.to_be_bytes());
+        let rewrites = run_flags_over_l2(&mut l2, false, 2);
+        // Entry 0: rc 2, COPIED cleared (1 rewrite). Entry 1:
+        // scrubbed (1 rewrite). Entry 2: rc 2, COPIED already
+        // clear (no rewrite).
+        assert_eq!(rewrites, 2);
+        assert_eq!(u64::from_be_bytes(l2[0..8].try_into().unwrap()), 0x10_0000);
+        assert_eq!(u64::from_be_bytes(l2[8..16].try_into().unwrap()), 1);
+        assert_eq!(
+            u64::from_be_bytes(l2[16..24].try_into().unwrap()),
+            0x10_1000
+        );
+    }
+
+    #[test]
+    fn scrub_allocated_refcount_one_still_sets_copied() {
+        // Regression guard for the allocated path: rc 1 sets
+        // COPIED exactly as before the scrub change.
+        let mut l2 = [0u8; 16];
+        l2[0..8].copy_from_slice(&0x10_0000u64.to_be_bytes());
+        l2[8..16].copy_from_slice(&(OFLAG_COPIED | 1u64).to_be_bytes());
+        let rewrites = run_flags_over_l2(&mut l2, false, 1);
+        assert_eq!(rewrites, 2);
+        assert_eq!(
+            u64::from_be_bytes(l2[0..8].try_into().unwrap()),
+            0x10_0000 | OFLAG_COPIED
+        );
+        assert_eq!(u64::from_be_bytes(l2[8..16].try_into().unwrap()), 1);
+    }
+
+    #[test]
+    fn scrub_is_idempotent() {
+        let mut l2 = [0u8; 16];
+        l2[0..8].copy_from_slice(&(OFLAG_COPIED | 1u64).to_be_bytes());
+        l2[8..16].copy_from_slice(&OFLAG_COPIED.to_be_bytes());
+        let first = run_flags_over_l2(&mut l2, false, 0);
+        assert_eq!(first, 2);
+        let after_first = l2;
+        let second = run_flags_over_l2(&mut l2, false, 0);
+        assert_eq!(second, 0);
+        assert_eq!(l2, after_first);
     }
 }

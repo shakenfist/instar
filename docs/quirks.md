@@ -1583,6 +1583,72 @@ data file, bitmaps, dirty/corrupt) are the same uniform set as
   snapshot (qemu-img truncates names to 255 bytes at creation)
   and resolves to the same not-found error.
 
+### `snapshot -a` (apply) quirks
+
+The following apply to `instar snapshot -a SNAPSHOT` (apply /
+"goto" mode, landed in PLAN-snapshot phase 8). The feature gates
+are the same uniform set as `-c` / `-d` above.
+
+- **Snapshot argument matching is asymmetric between `-d` and
+  `-a`.** qemu 10.x resolves the two modes' arguments through
+  *different* matchers, and instar matches each exactly:
+
+  | Mode | Matcher | Semantics |
+  |------|---------|-----------|
+  | `-d` | `bdrv_snapshot_find` | name only, first match |
+  | `-a` | `find_snapshot_by_id_or_name` | one full pass over the table comparing **IDs**, then — only if no ID matched — a second full pass comparing **names** |
+
+  The two-full-pass structure means a *later* entry matching by
+  ID beats an *earlier* entry matching by name. Example: on an
+  image with `id=1 name="2"` and `id=2 name="x"`, `-a 2` applies
+  the snapshot with **ID 2** (the one named "x"), while `-d 2`
+  deletes the one **named** "2". A pure-ID argument (`-a 1`)
+  works for apply but is not-found for delete.
+  *Cross-version note:* as with delete (above), older `qemu-img`
+  releases resolved delete arguments differently; instar follows
+  10.x and the cross-version baseline phases must pin per-version
+  behaviour.
+
+- **Applying a snapshot to a since-resized image is refused.**
+  Modern `qemu-img` allows `resize` on images with internal
+  snapshots, and a later `qemu-img snapshot -a` **truncates the
+  image** back to the snapshot's stored `disk_size`
+  (`blk_truncate` inside `qcow2_snapshot_goto`). instar refuses
+  instead (`ERROR_L1_SIZE_MISMATCH`) and leaves the image
+  untouched — a full virtual-size truncate embedded in apply is
+  out of scope for v1. Workaround: `qemu-img resize` the image
+  back to the snapshot's size, then apply. (A snapshot entry
+  with *absent* extra data carries no `disk_size`; qemu defaults
+  it to the current virtual size, so such entries always pass
+  the check — instar mirrors that.) For the same reason a
+  hand-crafted snapshot whose L1 is *larger* than the active L1
+  is refused (qemu would grow the active L1); a *smaller*
+  snapshot L1 is supported via zero-padding, like qemu.
+
+- **Apply is best-effort crash-consistent, like qemu.** Apply
+  rewrites the active L1 in place; it writes no timestamps, no
+  snapshot-table bytes and no header bytes. instar's write order
+  is: refblock increments (group A), fsync; the snapshot's raw
+  L1 over the active L1 — the commit point (group B), fsync;
+  refblock decrements + refreshed COPIED flags (group C), fsync.
+  A crash before B leaves the image unchanged except
+  over-referenced refcounts (repairable leaks); a crash between
+  B and C leaves the active view switched with leaks and stale
+  COPIED flags — `qemu-img check` reports repairable issues,
+  never a dangling reference. qemu's goto has the same
+  best-effort character; one window differs cosmetically (qemu
+  scrubs the snapshot's stored L1 before its active-L1
+  overwrite, instar after), but both orders leave only
+  repairable states and the final bytes are identical.
+
+- **Freed-cluster bytes may differ from `qemu-img`'s.** Same as
+  delete: qemu punches holes over the clusters the apply frees
+  (the old active chain's exclusive L2/data clusters) unless run
+  with `file.discard=ignore`, while instar never writes freed
+  clusters. With the protocol-level discard disabled, post-apply
+  images are **bit-for-bit identical** to instar's across every
+  verified scenario, including diverged applies.
+
 ## Future Additions
 
 Additional quirks will be documented here as they are discovered during
