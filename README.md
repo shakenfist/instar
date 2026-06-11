@@ -574,8 +574,14 @@ oversized virtual sizes, VMDK grain sizes, VHDX dual headers, BAT beyond EOF),
 and format confusion attacks (polyglot files, truncated headers, VMDK
 descriptor attacks). CVE reproduction tests verify that 6 known qemu-img CVEs
 (CVE-2024-32498, CVE-2015-5163, CVE-2022-47951, CVE-2015-5162, CVE-2014-0223,
-CVE-2024-4467) are fully mitigated by instar's architecture. Test images are in
-the sibling `instar-testdata/` repository.
+CVE-2024-4467) are fully mitigated by instar's architecture.
+`tests/test_snapshot.py` (phase 11) adds 94 snapshot-subcommand tests: the
+12-image list matrix against cross-version baselines, 12 JSON golden
+comparisons with a structural cross-check, mutation round-trips
+(create/delete/apply) with `qemu-img check` post-op assertions, error paths
+and qcow2-only enforcement, and empty-table behaviour. JSON goldens live in
+`tests/golden/snapshot-list/`. Test images are in the sibling
+`instar-testdata/` repository.
 
 **Running:**
 ```bash

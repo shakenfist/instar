@@ -25,12 +25,13 @@ from helpers.types import TestImage
 # Mapping from command names to output type directory prefixes
 # 'info' uses legacy names for backwards compatibility
 COMMAND_OUTPUT_DIRS = {
-    'info': 'qemu-img',      # qemu-img-human, qemu-img-json
-    'check': 'check',        # check-human, check-json
-    'compare': 'compare',    # compare-human, compare-json
-    'measure': 'measure',    # measure-human, measure-json
-    'create': 'create-info', # create-info-json (json-only, no human variant)
-    'map': 'map',            # map-human, map-json (PLAN-map phase 6)
+    'info': 'qemu-img',            # qemu-img-human, qemu-img-json
+    'check': 'check',              # check-human, check-json
+    'compare': 'compare',          # compare-human, compare-json
+    'measure': 'measure',          # measure-human, measure-json
+    'create': 'create-info',       # create-info-json (json-only, no human variant)
+    'map': 'map',                  # map-human, map-json (PLAN-map phase 6)
+    'snapshot-list': 'snapshot-list',  # snapshot-list-human (PLAN-snapshot phase 11)
 }
 
 
@@ -673,6 +674,46 @@ class InstarTestBase(testtools.TestCase):
             return result.stdout, result.stderr, result.returncode
         except subprocess.TimeoutExpired:
             return '', 'Timeout after {}s'.format(timeout), -1
+
+    def run_instar_snapshot(
+        self,
+        *args,
+        timeout: int = 60,
+        env_overrides: Optional[dict] = None,
+    ) -> tuple:
+        """Run `instar snapshot` with the given args.
+
+        Accepts an ``env_overrides`` dict so callers can pin
+        ``TZ=UTC`` explicitly — the snapshot-list baseline files
+        were generated under UTC, so every list invocation that
+        compares against a baseline must set TZ=UTC.
+
+        Args:
+            *args: Additional snapshot flags and the image path.
+            timeout: Timeout in seconds.
+            env_overrides: Optional dict of environment variables to
+                add/override in the subprocess environment.
+
+        Returns:
+            tuple: (stdout, stderr, return_code).
+        """
+        import os as _os
+        instar = self.get_instar_binary()
+        cmd = [str(instar), 'snapshot', *[str(a) for a in args]]
+        env = dict(_os.environ)
+        if env_overrides:
+            env.update(env_overrides)
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+            )
+            return result.stdout, result.stderr, result.returncode
+        except subprocess.TimeoutExpired:
+            return '', f'Timeout after {timeout}s', -1
 
     def run_instar_convert(
         self,

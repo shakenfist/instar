@@ -469,6 +469,13 @@ provides a modular architecture with:
   suite that catches accidental fixes to known instar-vs-
   qemu-img gaps so `KNOWN_MAP_DIVERGENCES` doesn't go stale.
   Phase 6 baseline: 95 active tests + 91 documented skips.
+  `tests/test_snapshot.py` (phase 11 of PLAN-snapshot) adds
+  94 tests covering the five snapshot families: list-matrix
+  (12 images, TZ=UTC, profile-resolved), JSON goldens with
+  structural cross-check and QMP-key schema pin, mutation
+  round-trips (create/delete/apply with post-op qemu-img check),
+  error paths and qcow2-only enforcement, and empty-table
+  behaviour. JSON goldens live in `tests/golden/snapshot-list/`.
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation,

@@ -293,6 +293,12 @@ make clean-tests
 - `tests/test_oslo_crossval.py` - Cross-validation against oslo.utils
   format_inspector (format detection, safety checks, virtual size).
   Skips if oslo.utils is not installed.
+- `tests/test_snapshot.py` - Integration tests for the `instar snapshot`
+  subcommand (phase 11): 12-image list matrix vs cross-version baselines,
+  12 JSON golden comparisons with structural cross-check, mutation
+  round-trips (create/delete/apply) with `qemu-img check` post-op
+  assertions, error paths and qcow2-only enforcement, empty-table
+  behaviour. JSON goldens in `tests/golden/snapshot-list/`.
 - `tests/expected_outputs/` - Expected output files for malicious images
 
 **Adding new test images:**

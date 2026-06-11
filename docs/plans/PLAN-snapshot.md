@@ -812,18 +812,18 @@ again guest-side as a defence-in-depth.
 
 ### Test matrix
 
-| Mode | Compare against |
-|------|-----------------|
-| `-l` human  | qemu-img stdout per version |
-| `-l` json   | qemu-img stdout (instar extension; instar self-baseline) |
-| `-c` then `-l`  | qemu-img stdout per version |
-| `-c` then qemu-img check | clean |
-| `-c` then qemu-img info | matches qemu-img-applied reference |
-| `-d` then qemu-img check | clean |
-| `-d` then qemu-img info | matches |
-| `-a` then qemu-img check | clean |
-| `-a` then `instar info` vs `qemu-img info` | identical |
-| `-a` then qemu-img compare against pre-`-c` image | identical |
+| Mode | Compare against | Phase-11 test |
+|------|-----------------|---------------|
+| `-l` human  | qemu-img stdout per version | `TestSnapshotListHuman` (factory, 12 images) |
+| `-l` json   | qemu-img stdout (instar extension; instar self-baseline) | `TestSnapshotListGoldens` (factory, 12 images) |
+| `-c` then `-l`  | qemu-img stdout per version | `TestSnapshotCreate.test_create_list_agreement` |
+| `-c` then qemu-img check | clean | `TestSnapshotCreate.test_create_check_clean` |
+| `-c` then qemu-img info | matches qemu-img-applied reference | `TestSnapshotCreate.test_create_second_assigns_id_2_duplicate_name_accepted` |
+| `-d` then qemu-img check | clean | `TestSnapshotDelete.test_delete_{first,last,sole}_check_clean` |
+| `-d` then qemu-img info | matches | `TestSnapshotDelete.test_delete_name_only_matching_on_namecollision` |
+| `-a` then qemu-img check | clean | `TestSnapshotApply.test_apply_check_clean` |
+| `-a` then `instar info` vs `qemu-img info` | identical | `TestSnapshotApply.test_apply_by_id_on_namecollision` |
+| `-a` then qemu-img compare against pre-`-c` image | identical | `TestSnapshotApply.test_apply_restores_content` |
 
 The differential fuzzer extends with a random
 create/delete/apply chain on a randomly generated qcow2
@@ -981,7 +981,7 @@ qemu-img.
 | 8. Snapshot apply planner + guest binary (MODE_APPLY), plus the `-a` host dispatch (pulled forward like `-c` / `-d`), the shared raw-table finder (`find_snapshot_in_table`, ID-then-name for apply / name-only for delete), and the walker stale-flag scrub | PLAN-snapshot-phase-08-apply.md | Landed |
 | 9. Host CLI consolidation and parity: D1 fix (`-U` with mutating modes refused before file access), D2 fix (bare `snapshot FILE` defaults to list), D3 documented (mixed-mode exit-code delta kept as-is), launch consolidation declined (renderer borrow fights the helper boundary), `tools/snapshot-cli-parity.sh` (30 assertions, all passing), quirks docs updated. | PLAN-snapshot-phase-09-mutate-host.md | Landed |
 | 10. Cross-version baselines: snapshot-bearing qcow2 fixtures, `snapshot-list-human` profiles in `generate-baselines.py` (JSON deferred to phase 11 — no qemu source of truth; mutation baselines dropped — column drift already captured by listing frozen fixtures), baseline generation pass for 80 versions. FINDING: snapshot names >63 bytes are truncated by the list parser (bug fixed post-landing: `SnapshotEntry::name` widened to `[u8;256]`, cap raised to `.min(255)`; `snap-qcow2-longname` profile updated to full 200-byte baseline; see "Bugs fixed during this work"). | PLAN-snapshot-phase-10-baselines.md | Landed |
-| 11. Integration tests (`tests/test_snapshot.py`): list matrix, create/delete/apply round-trips, error paths, qcow2-only enforcement, post-op `qemu-img check` clean. **Fixtures, profiles, and manifest tag `snapshots` are ready from phase 10.** JSON golden files for `--output=json` belong here (instar-side self-baseline; no qemu source of truth). | PLAN-snapshot-phase-11-integration-tests.md | Not started |
+| 11. Integration tests (`tests/test_snapshot.py`): list matrix, create/delete/apply round-trips, error paths, qcow2-only enforcement, post-op `qemu-img check` clean. **Fixtures, profiles, and manifest tag `snapshots` are ready from phase 10.** JSON golden files for `--output=json` belong here (instar-side self-baseline; no qemu source of truth). 94 tests: 92 pass, 2 skip (qcow2-snapshots: no phase-10 baseline), 0 fail; suite wall time ~1s; JSON goldens in `tests/golden/snapshot-list/`. Test families: (a) list-matrix (b) JSON-goldens + vmstate structural + QMP-key schema (c) mutation round-trips (d) error paths + qcow2-only enforcement (e) empty-table. | PLAN-snapshot-phase-11-integration-tests.md | Landed |
 | 12. Coverage-guided fuzz harnesses: `fuzz_snapshot_parse`, `fuzz_snapshot_refcount` | PLAN-snapshot-phase-12-fuzz-coverage.md | Not started |
 | 13. Differential fuzzing extension: random `-c/-d/-a` chain vs qemu-img, structural `qemu-img info` comparison | PLAN-snapshot-phase-13-fuzz-differential.md | Not started |
 | 14. Documentation, CHANGELOG, follow-ups (`docs/snapshot.md`, quirks, usage, ARCHITECTURE, README, AGENTS, `PLAN-convert-followups.md` final strike-through) | PLAN-snapshot-phase-14-docs.md | Not started |

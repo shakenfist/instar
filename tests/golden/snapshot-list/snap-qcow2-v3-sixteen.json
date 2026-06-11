@@ -1,0 +1,18 @@
+[
+{ "id": "1", "name": "snap01", "vm-state-size": 0, "date": { "seconds": 1767225600, "nanoseconds": 0 }, "vm-clock": { "seconds": 0, "nanoseconds": 0 }, "icount": 0 },
+{ "id": "2", "name": "snap02", "vm-state-size": 0, "date": { "seconds": 1767225600, "nanoseconds": 0 }, "vm-clock": { "seconds": 0, "nanoseconds": 0 }, "icount": 0 },
+{ "id": "3", "name": "snap03", "vm-state-size": 0, "date": { "seconds": 1767225600, "nanoseconds": 0 }, "vm-clock": { "seconds": 0, "nanoseconds": 0 }, "icount": 0 },
+{ "id": "4", "name": "snap04", "vm-state-size": 0, "date": { "seconds": 1767225600, "nanoseconds": 0 }, "vm-clock": { "seconds": 0, "nanoseconds": 0 }, "icount": 0 },
+{ "id": "5", "name": "snap05", "vm-state-size": 0, "date": { "seconds": 1767225600, "nanoseconds": 0 }, "vm-clock": { "seconds": 0, "nanoseconds": 0 }, "icount": 0 },
+{ "id": "6", "name": "snap06", "vm-state-size": 0, "date": { "seconds": 1767225600, "nanoseconds": 0 }, "vm-clock": { "seconds": 0, "nanoseconds": 0 }, "icount": 0 },
+{ "id": "7", "name": "snap07", "vm-state-size": 0, "date": { "seconds": 1767225600, "nanoseconds": 0 }, "vm-clock": { "seconds": 0, "nanoseconds": 0 }, "icount": 0 },
+{ "id": "8", "name": "snap08", "vm-state-size": 0, "date": { "seconds": 1767225600, "nanoseconds": 0 }, "vm-clock": { "seconds": 0, "nanoseconds": 0 }, "icount": 0 },
+{ "id": "9", "name": "snap09", "vm-state-size": 0, "date": { "seconds": 1767225600, "nanoseconds": 0 }, "vm-clock": { "seconds": 0, "nanoseconds": 0 }, "icount": 0 },
+{ "id": "10", "name": "snap10", "vm-state-size": 0, "date": { "seconds": 1767225600, "nanoseconds": 0 }, "vm-clock": { "seconds": 0, "nanoseconds": 0 }, "icount": 0 },
+{ "id": "11", "name": "snap11", "vm-state-size": 0, "date": { "seconds": 1767225600, "nanoseconds": 0 }, "vm-clock": { "seconds": 0, "nanoseconds": 0 }, "icount": 0 },
+{ "id": "12", "name": "snap12", "vm-state-size": 0, "date": { "seconds": 1767225600, "nanoseconds": 0 }, "vm-clock": { "seconds": 0, "nanoseconds": 0 }, "icount": 0 },
+{ "id": "13", "name": "snap13", "vm-state-size": 0, "date": { "seconds": 1767225600, "nanoseconds": 0 }, "vm-clock": { "seconds": 0, "nanoseconds": 0 }, "icount": 0 },
+{ "id": "14", "name": "snap14", "vm-state-size": 0, "date": { "seconds": 1767225600, "nanoseconds": 0 }, "vm-clock": { "seconds": 0, "nanoseconds": 0 }, "icount": 0 },
+{ "id": "15", "name": "snap15", "vm-state-size": 0, "date": { "seconds": 1767225600, "nanoseconds": 0 }, "vm-clock": { "seconds": 0, "nanoseconds": 0 }, "icount": 0 },
+{ "id": "16", "name": "snap16", "vm-state-size": 0, "date": { "seconds": 1767225600, "nanoseconds": 0 }, "vm-clock": { "seconds": 0, "nanoseconds": 0 }, "icount": 0 }
+]
