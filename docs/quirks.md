@@ -1538,6 +1538,52 @@ returns the bare string `"0"` for zero bytes, matching qemu-img's
 with a `0`-byte short-circuit so the `VM_SIZE` column matches the
 qemu-img snapshot dump rather than the qemu-img info dump.
 
+### Cross-version listing format: instar tracks the modern layout
+
+`qemu-img snapshot -l` output changed format between qemu 8.x and
+9.0. The cross-version baseline matrix (phase 10) captures exactly
+two profile families:
+
+- **Old format** (qemu 6.0.0 through 8.2.x): column headers `VM
+  SIZE` and `VM CLOCK` (space-separated), clock rendered with
+  2-digit hours (`00:00:00.000`).
+- **New format** (qemu 9.0.0 onward): column headers `VM_SIZE` and
+  `VM_CLOCK` (underscore-separated), clock rendered with 4-digit
+  hours (`0000:00:00.000`), matching instar's renderer from phase 4.
+
+instar implements the new (≥9.0) format. Phase 11 integration tests
+compare `instar snapshot -l` output against the newest-format
+profile and use the old-format profiles only to validate the
+captured baselines. The raw per-version baselines for all 80
+matrix versions live in
+`instar-testdata/expected-outputs/snapshot-list-human/`.
+
+### Snapshot names longer than 63 bytes are truncated in list output
+
+instar's list path reads each snapshot entry through a streaming
+parser (`for_each_snapshot_entry` in `src/crates/qcow2/src/lib.rs`)
+that copies at most 63 bytes of the snapshot name into the
+`SnapshotEntry::name: [u8; 64]` intermediate buffer
+(`.min(63)` cap; the 64th byte is reserved for the null sentinel).
+The converter (`snapshot_entry_to_record`) then propagates
+`min(name_len, 64)` bytes to the wire record.
+
+The result: any snapshot whose on-disk name exceeds 63 bytes is
+rendered truncated in the `TAG` column. qemu-img renders the full
+name. For example, a 200-byte name appears as 63 characters in
+`instar snapshot -l` output but all 200 in `qemu-img snapshot -l`
+output. Fixture `snap-qcow2-longname` in the phase 10 baseline
+matrix exercises this case and its expected output reflects the
+truncated form.
+
+This is a v1 limitation: the 63-byte cap was chosen to match the
+historical qemu-img `--snapshot` argument maximum, but
+`qemu-img snapshot -c` itself silently accepts names up to 255
+bytes (instar's create path enforces 255 bytes and refuses
+256+). Raising the intermediate buffer to 256 bytes and removing
+the `.min(63)` cap would fix the list-mode truncation; tracked as
+a v1+ follow-up.
+
 ### `snapshot -c` (create) quirks
 
 The following apply to `instar snapshot -c NAME` (create mode,

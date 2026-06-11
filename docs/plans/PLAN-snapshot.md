@@ -582,29 +582,39 @@ parsers.
 We extend `instar-testdata/scripts/generate-baselines.py`
 with a `snapshot-list` command entry. For each qemu-img
 version and each qcow2 baseline image that has at least one
-snapshot, capture `qemu-img snapshot -l --image-opts=...` or
-the equivalent flag set into
-`expected-outputs/snapshot-list-{human,json}/qcow2/<version>/<image-id>.{stdout,stderr,meta.json}`.
+snapshot, capture `qemu-img snapshot -l` into
+`expected-outputs/snapshot-list-human/qcow2/<version>/<image-id>.{stdout,stderr,meta.json}`.
 
-Mutating modes do not have a stdout baseline; their
-behaviour is validated by `qemu-img check` + `qemu-img info`
-+ `qemu-img compare` post-op assertions in
-`tests/test_snapshot.py`. We also produce a small set of
-"qemu-img snapshot -c then -l" baseline pairs — run a known
-mutation under each qemu-img version and capture the listing
-output — to catch versions where qemu changed an output
-column.
+**Phase 10 resolution of open question 1 (JSON baselines)**:
+`qemu-img snapshot -l` has no `--output=json` equivalent, so
+there is no qemu source of truth for a JSON baseline. JSON
+golden files (`--output=json`) are deferred to phase 11 as
+instar-side self-baselines in `tests/` — a self-baseline
+catches schema regressions, which is all a self-baseline can
+do. The testdata generation flow must not depend on instar
+build artefacts.
 
-Baseline matrix size estimate:
-- ~80 qemu-img versions
-- 2 output types (human, json)
-- ~6-10 snapshot-bearing qcow2 fixtures (no snapshots,
-  one snapshot, many snapshots, snapshot with vm_state,
-  snapshot with icount, snapshot with v2 image, snapshot
-  with extended L2, etc.)
+**Phase 10 resolution of open question 2 (mutation baselines)**:
+The "`-c` then `-l`" per-version baseline pairs are dropped.
+Mutating modes print nothing (no stdout to baseline); column
+drift is already captured by listing frozen fixtures under every
+version; ID assignment is probe-confirmed stable across the
+whole 6.0.0–10.2.0 matrix; and post-op image equivalence is
+validated live by the phase 6–8 harnesses and phase 11/13
+going forward. A generation-time mutation would also embed
+wall-clock timestamps, breaking determinism.
 
-That's well under 2k files — far smaller than the map
-baseline tree.
+Mutating modes continue to be validated by `qemu-img check` +
+`qemu-img info` + `qemu-img compare` post-op assertions in
+`tests/test_snapshot.py`.
+
+Baseline matrix (phase 10 actuals):
+- 80 qemu-img versions (6.0.0 through 10.2.0)
+- 1 output type (snapshot-list-human)
+- 12 images: 11 snapshot-bearing fixtures + 1 empty-case
+- Total: 2880 files
+
+Far smaller than the map baseline tree, as estimated.
 
 ### Test fixtures
 
@@ -970,8 +980,8 @@ qemu-img.
 | 7. Snapshot delete planner + guest binary (MODE_DELETE), plus the `-d` host dispatch (pulled forward like `-c` was) and the shared `run_snapshot_mutating_guest` launch helper | PLAN-snapshot-phase-07-delete.md | Landed |
 | 8. Snapshot apply planner + guest binary (MODE_APPLY), plus the `-a` host dispatch (pulled forward like `-c` / `-d`), the shared raw-table finder (`find_snapshot_in_table`, ID-then-name for apply / name-only for delete), and the walker stale-flag scrub | PLAN-snapshot-phase-08-apply.md | Landed |
 | 9. Host CLI consolidation and parity: D1 fix (`-U` with mutating modes refused before file access), D2 fix (bare `snapshot FILE` defaults to list), D3 documented (mixed-mode exit-code delta kept as-is), launch consolidation declined (renderer borrow fights the helper boundary), `tools/snapshot-cli-parity.sh` (30 assertions, all passing), quirks docs updated. | PLAN-snapshot-phase-09-mutate-host.md | Landed |
-| 10. Cross-version baselines: snapshot-bearing qcow2 fixtures, `snapshot-list-{human,json}` profiles in `generate-baselines.py`, baseline generation pass | PLAN-snapshot-phase-10-baselines.md | Not started |
-| 11. Integration tests (`tests/test_snapshot.py`): list matrix, create/delete/apply round-trips, error paths, qcow2-only enforcement, post-op `qemu-img check` clean | PLAN-snapshot-phase-11-integration-tests.md | Not started |
+| 10. Cross-version baselines: snapshot-bearing qcow2 fixtures, `snapshot-list-human` profiles in `generate-baselines.py` (JSON deferred to phase 11 — no qemu source of truth; mutation baselines dropped — column drift already captured by listing frozen fixtures), baseline generation pass for 80 versions. FINDING: snapshot names >63 bytes are truncated by the list parser (documented in quirks.md; `snap-qcow2-longname` profile reflects truncated form). | PLAN-snapshot-phase-10-baselines.md | Landed |
+| 11. Integration tests (`tests/test_snapshot.py`): list matrix, create/delete/apply round-trips, error paths, qcow2-only enforcement, post-op `qemu-img check` clean. **Fixtures, profiles, and manifest tag `snapshots` are ready from phase 10.** JSON golden files for `--output=json` belong here (instar-side self-baseline; no qemu source of truth). | PLAN-snapshot-phase-11-integration-tests.md | Not started |
 | 12. Coverage-guided fuzz harnesses: `fuzz_snapshot_parse`, `fuzz_snapshot_refcount` | PLAN-snapshot-phase-12-fuzz-coverage.md | Not started |
 | 13. Differential fuzzing extension: random `-c/-d/-a` chain vs qemu-img, structural `qemu-img info` comparison | PLAN-snapshot-phase-13-fuzz-differential.md | Not started |
 | 14. Documentation, CHANGELOG, follow-ups (`docs/snapshot.md`, quirks, usage, ARCHITECTURE, README, AGENTS, `PLAN-convert-followups.md` final strike-through) | PLAN-snapshot-phase-14-docs.md | Not started |
