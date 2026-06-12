@@ -11164,10 +11164,23 @@ impl<'a, W: std::io::Write> SnapshotRenderer<'a, W> {
                     entry.icount.to_string()
                 };
 
+                // ID and TAG are left-justified to a minimum field
+                // width measured in BYTES, matching qemu's C
+                // printf("%-7s"/"%-16s"). Rust's `{:<7}` counts
+                // chars, which diverges for multibyte UTF-8 names.
+                // The right-aligned columns carry ASCII-only
+                // generated strings, so `{:>N}` is safe there.
                 writeln!(
                     self.writer,
-                    "{:<7} {:<16} {:>8} {:>19} {:>15} {:>10}",
-                    entry.id, entry.name, vm_size_str, date_str, clock_str, icount_str
+                    "{}{} {}{} {:>8} {:>19} {:>15} {:>10}",
+                    entry.id,
+                    " ".repeat(7usize.saturating_sub(entry.id.len())),
+                    entry.name,
+                    " ".repeat(16usize.saturating_sub(entry.name.len())),
+                    vm_size_str,
+                    date_str,
+                    clock_str,
+                    icount_str
                 )
             }
             SnapshotOutputFormat::Json => {
@@ -14009,6 +14022,29 @@ Offset          Length          Mapped to       File
         // The ID is longer than 7, so the row is longer than 80.
         assert!(row.len() > 80, "row should expand: len={}", row.len());
         assert!(row.starts_with("very-long-id "), "id at head: {:?}", row);
+    }
+
+    #[test]
+    fn snapshot_human_multibyte_name_pads_by_bytes() {
+        // qemu's C printf("%-16s") pads the TAG column to a minimum
+        // field width measured in BYTES; Rust's `{:<16}` counts
+        // chars, which over-pads multibyte UTF-8 names (7 chars vs
+        // 12 bytes here). Found by the phase 13 differential
+        // fuzzer's first smoke run: `snäp-名前` drew 9 pad spaces
+        // from instar but 4 from qemu-img.
+        let e = snap("1", "snäp-名前", 0, 0, 0, 0, 0, 0);
+        let out = render_snapshot_human(&[e]);
+        let text = String::from_utf8(out).unwrap();
+        let row = text.lines().nth(2).expect("expected data row");
+        // 1-byte ID + 6 pad + separator; 12-byte name + 4 pad +
+        // separator; "0 B" right-aligned in 8.
+        let expected_prefix =
+            format!("1{}snäp-名前{}0 B", " ".repeat(7), " ".repeat(10));
+        assert!(
+            row.starts_with(&expected_prefix),
+            "byte-padded row: {:?}",
+            row
+        );
     }
 
     #[test]
