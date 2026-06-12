@@ -54,12 +54,21 @@ pub fn read_refcount_in_block(
     refcount_bits: u32,
 ) -> Result<u64, SnapshotError> {
     match refcount_bits {
+        // Sub-byte widths are LSB-first within each byte: entry 0
+        // occupies the LOWEST bits of byte 0, matching qemu's
+        // get_refcount_ro0/ro1/ro2 in block/qcow2-refcount.c
+        // (`>> (index % 8)`, `>> (2 * (index % 4))`,
+        // `>> (4 * (index % 2))`). These paths were MSB-first
+        // until the PLAN-snapshot pre-push audit caught the
+        // divergence from qemu and from qcow2::lookup_refcount;
+        // the MSB-first order corrupted refcount_bits 1/2/4
+        // images in `resize --shrink`, which delegates here.
         1 => {
             let byte = (local_idx / 8) as usize;
             if byte >= block.len() {
                 return Err(SnapshotError::MisalignedAccess);
             }
-            let bit = 7 - (local_idx % 8) as u32;
+            let bit = (local_idx % 8) as u32;
             Ok(((block[byte] >> bit) & 0b1) as u64)
         }
         2 => {
@@ -67,7 +76,7 @@ pub fn read_refcount_in_block(
             if byte >= block.len() {
                 return Err(SnapshotError::MisalignedAccess);
             }
-            let shift = 6 - 2 * (local_idx % 4) as u32;
+            let shift = 2 * (local_idx % 4) as u32;
             Ok(((block[byte] >> shift) & 0b11) as u64)
         }
         4 => {
@@ -75,7 +84,7 @@ pub fn read_refcount_in_block(
             if byte >= block.len() {
                 return Err(SnapshotError::MisalignedAccess);
             }
-            let shift = if local_idx.is_multiple_of(2) { 4 } else { 0 };
+            let shift = if local_idx.is_multiple_of(2) { 0 } else { 4 };
             Ok(((block[byte] >> shift) & 0b1111) as u64)
         }
         8 => {
@@ -125,12 +134,17 @@ pub fn read_refcount_in_block(
 /// Set the refcount entry at index `local_idx` within a
 /// refcount block to `value`.
 ///
-/// Lifted from `resize::qcow2::set_refcount`; the bit-level
-/// logic is preserved byte-for-byte so the resize crate's 14
-/// existing call sites stay byte-compatible. The signature
-/// widens `refcount_bits` from `u8` to `u32` to match the rest
-/// of the snapshot crate's API; resize bridges the type
-/// difference via a thin wrapper.
+/// Lifted from `resize::qcow2::set_refcount` (the resize crate
+/// now delegates here via a thin wrapper). The byte-and-wider
+/// widths are preserved byte-for-byte from the original; the
+/// sub-byte widths (1/2/4) were corrected to qemu's LSB-first
+/// packing during the PLAN-snapshot pre-push audit — the
+/// original MSB-first order corrupted sub-byte-width images in
+/// `resize --shrink` (see the ordering note on
+/// [`read_refcount_in_block`]). The signature widens
+/// `refcount_bits` from `u8` to `u32` to match the rest of the
+/// snapshot crate's API; resize bridges the type difference via
+/// a thin wrapper.
 ///
 /// Returns [`SnapshotError::MisalignedAccess`] if the entry
 /// extends past the end of `block` or
@@ -142,12 +156,15 @@ pub fn set_refcount_in_block(
     value: u64,
 ) -> Result<(), SnapshotError> {
     match refcount_bits {
+        // Sub-byte widths are LSB-first within each byte, matching
+        // qemu's set_refcount_ro0/ro1/ro2 — see the ordering note
+        // on read_refcount_in_block above.
         1 => {
             let byte = (local_idx / 8) as usize;
             if byte >= block.len() {
                 return Err(SnapshotError::MisalignedAccess);
             }
-            let bit = 7 - (local_idx % 8) as u32;
+            let bit = (local_idx % 8) as u32;
             if value == 0 {
                 block[byte] &= !(1 << bit);
             } else {
@@ -159,7 +176,7 @@ pub fn set_refcount_in_block(
             if byte >= block.len() {
                 return Err(SnapshotError::MisalignedAccess);
             }
-            let shift = 6 - 2 * (local_idx % 4) as u32;
+            let shift = 2 * (local_idx % 4) as u32;
             let mask = 0b11u8 << shift;
             block[byte] = (block[byte] & !mask) | (((value as u8) & 0b11) << shift);
         }
@@ -168,7 +185,7 @@ pub fn set_refcount_in_block(
             if byte >= block.len() {
                 return Err(SnapshotError::MisalignedAccess);
             }
-            let shift = if local_idx.is_multiple_of(2) { 4 } else { 0 };
+            let shift = if local_idx.is_multiple_of(2) { 0 } else { 4 };
             let mask = 0b1111u8 << shift;
             block[byte] = (block[byte] & !mask) | (((value as u8) & 0b1111) << shift);
         }
@@ -1460,6 +1477,47 @@ mod tests {
                 (i & 0b1111) as u64
             );
         }
+    }
+
+    #[test]
+    fn sub_byte_widths_are_lsb_first_like_qemu() {
+        // Round-trip tests pass under EITHER bit order (set and
+        // read mirror each other), which is how an MSB-first bug
+        // survived until the PLAN-snapshot pre-push audit. This
+        // test pins the on-disk layout byte-exactly against
+        // qemu's get/set_refcount_ro0/ro1/ro2
+        // (block/qcow2-refcount.c): entry 0 occupies the LOWEST
+        // bits of byte 0.
+        //
+        // Width 1: qemu reads `(byte >> (index % 8)) & 1`.
+        let block = [0b0000_0010u8];
+        assert_eq!(read_refcount_in_block(&block, 0, 1).unwrap(), 0);
+        assert_eq!(read_refcount_in_block(&block, 1, 1).unwrap(), 1);
+        assert_eq!(read_refcount_in_block(&block, 7, 1).unwrap(), 0);
+
+        // Width 2: qemu reads `(byte >> (2 * (index % 4))) & 3`.
+        // 0x39 = 0b00_11_10_01 -> indices 0..3 read 1, 2, 3, 0.
+        let block = [0x39u8];
+        for (idx, want) in [(0u64, 1u64), (1, 2), (2, 3), (3, 0)] {
+            assert_eq!(read_refcount_in_block(&block, idx, 2).unwrap(), want);
+        }
+
+        // Width 4: qemu reads `(byte >> (4 * (index % 2))) & 0xf`.
+        // 0x21 -> index 0 (low nibble) reads 1, index 1 reads 2.
+        let block = [0x21u8];
+        assert_eq!(read_refcount_in_block(&block, 0, 4).unwrap(), 1);
+        assert_eq!(read_refcount_in_block(&block, 1, 4).unwrap(), 2);
+
+        // Set side: writing entry 0 must land in the LOW bits.
+        let mut block = [0u8];
+        set_refcount_in_block(&mut block, 0, 4, 0xf).unwrap();
+        assert_eq!(block[0], 0x0f);
+        let mut block = [0u8];
+        set_refcount_in_block(&mut block, 0, 2, 0b11).unwrap();
+        assert_eq!(block[0], 0b0000_0011);
+        let mut block = [0u8];
+        set_refcount_in_block(&mut block, 0, 1, 1).unwrap();
+        assert_eq!(block[0], 0b0000_0001);
     }
 
     #[test]

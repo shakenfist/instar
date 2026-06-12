@@ -687,6 +687,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Sub-byte refcount accessors used the wrong bit order.** The
+  `snapshot` crate's `read_refcount_in_block` /
+  `set_refcount_in_block` (lifted from `resize::qcow2`, which now
+  delegates to them) packed 1/2/4-bit refcount entries MSB-first
+  within each byte; qemu's `get/set_refcount_ro0/ro1/ro2` are
+  LSB-first. Round-trip tests pass under either order, which is
+  how the divergence survived — found by the pre-push audit's
+  cross-check against `qcow2::lookup_refcount` and pinned
+  byte-exactly against the qemu source. Production impact was
+  limited: the snapshot mutating modes refuse `refcount_bits !=
+  16`. Known issue: `instar resize --shrink` still corrupts
+  sub-byte-refcount images through a separate width assumption
+  in its shrink path (exit 0, `qemu-img check` errors); that
+  pre-existing bug is tracked separately and is unaffected by
+  the snapshot work.
+
 - **Snapshot list rows over-padded multibyte UTF-8 names.**
   qemu's `qemu-img snapshot -l` pads the ID and TAG columns with
   C `printf` minimum field widths, which count **bytes**; the
