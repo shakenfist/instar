@@ -29,9 +29,10 @@
 //!   flags on L1 and L2 entries based on current refcount.
 //!
 //! The crate is `no_std` and performs no I/O. Mutators operate
-//! on slices in place; [`SnapshotPatch`] / [`SnapshotPlan`] exist
-//! so phases 6-8 can emit patches from real planners without an
-//! ABI break.
+//! on slices in place. (A speculative `SnapshotPatch` /
+//! `SnapshotPlan` patch-list API existed through phase 13 but
+//! was never adopted — the guest binaries went with direct
+//! write-groups in phase 6 — and was removed in phase 14.)
 
 #![no_std]
 #![allow(clippy::too_many_arguments)]
@@ -136,151 +137,9 @@ impl From<SnapshotError> for u32 {
     }
 }
 
-/// A single byte-level operation against the qcow2 file.
-///
-/// Snapshot v1 only emits [`SnapshotPatch::Write`]; an `Append`
-/// variant is intentionally absent because the bounded
-/// `MAX_SNAPSHOTS = 16` cap from phase 2 prevents the snapshot
-/// table from spilling beyond its initial cluster.
-#[derive(Debug, Clone, Copy)]
-pub enum SnapshotPatch<'a> {
-    /// Overwrite an existing byte range. The patch carries no
-    /// indication of which file it targets; the guest knows
-    /// based on which slot it pulls the patch from.
-    Write {
-        /// Absolute byte offset within the target file.
-        byte_offset: u64,
-        /// Bytes to write.
-        bytes: &'a [u8],
-    },
-}
-
-impl<'a> SnapshotPatch<'a> {
-    /// Empty placeholder used as the default array element when
-    /// building a [`SnapshotPlan`].
-    pub const EMPTY: SnapshotPatch<'static> = SnapshotPatch::Write {
-        byte_offset: 0,
-        bytes: &[],
-    };
-
-    /// Byte offset where this patch starts in its target file.
-    pub fn byte_offset(&self) -> u64 {
-        match self {
-            SnapshotPatch::Write { byte_offset, .. } => *byte_offset,
-        }
-    }
-
-    /// Number of bytes this patch touches.
-    pub fn len(&self) -> usize {
-        match self {
-            SnapshotPatch::Write { bytes, .. } => bytes.len(),
-        }
-    }
-
-    /// True if the patch is a no-op (zero-length write).
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-/// Maximum number of patch entries a [`SnapshotPlan`] can hold.
-///
-/// 64 is conservative headroom for phases 6-8. A snapshot
-/// create / delete / apply realistically tops out at ~30
-/// patches: header rewrite, snapshot-table entry rewrite,
-/// per-modified-refblock writeback, per-modified-L2 writeback,
-/// new-L1 cluster allocation. The constant lives here so the
-/// type surface is stable for phases 6-8.
-pub const MAX_SNAPSHOT_PATCHES: usize = 64;
-
-/// A bounded collection of [`SnapshotPatch`] entries.
-///
-/// Mirrors `CommitPlan` / `RebasePlan` in shape; phase 5 does
-/// not emit patches (mutators operate in place) but the type
-/// exists so the phases 6-8 planners can populate it without
-/// an ABI break.
-#[derive(Debug, Clone, Copy)]
-pub struct SnapshotPlan<'a> {
-    /// File size the qcow2 image should end up at after applying
-    /// every patch. Equals the pre-snapshot file size for v1 (no
-    /// growth — open question 3 in phase plan).
-    pub total_file_size: u64,
-    /// Number of populated entries in `patches_storage`.
-    patch_count: u16,
-    /// Inline storage; only `..patch_count` is valid.
-    patches_storage: [SnapshotPatch<'a>; MAX_SNAPSHOT_PATCHES],
-}
-
-impl<'a> SnapshotPlan<'a> {
-    /// Construct an empty plan for the given target file size.
-    pub const fn new(total_file_size: u64) -> Self {
-        SnapshotPlan {
-            total_file_size,
-            patch_count: 0,
-            patches_storage: [SnapshotPatch::EMPTY; MAX_SNAPSHOT_PATCHES],
-        }
-    }
-
-    /// Ordered list of patches to apply.
-    pub fn patches(&self) -> &[SnapshotPatch<'a>] {
-        &self.patches_storage[..self.patch_count as usize]
-    }
-
-    /// Append a patch to the plan. Returns
-    /// [`SnapshotError::SnapshotTableFull`] if the plan's
-    /// storage is full.
-    pub fn push(&mut self, patch: SnapshotPatch<'a>) -> Result<(), SnapshotError> {
-        let idx = self.patch_count as usize;
-        if idx >= MAX_SNAPSHOT_PATCHES {
-            return Err(SnapshotError::SnapshotTableFull);
-        }
-        self.patches_storage[idx] = patch;
-        self.patch_count += 1;
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn patch_methods_match_variant() {
-        let p = SnapshotPatch::Write {
-            byte_offset: 0x2000,
-            bytes: &[7, 8, 9],
-        };
-        assert_eq!(p.byte_offset(), 0x2000);
-        assert_eq!(p.len(), 3);
-        assert!(!p.is_empty());
-
-        let empty = SnapshotPatch::EMPTY;
-        assert!(empty.is_empty());
-        assert_eq!(empty.byte_offset(), 0);
-        assert_eq!(empty.len(), 0);
-    }
-
-    #[test]
-    fn plan_push_respects_bound() {
-        let mut plan = SnapshotPlan::new(4096);
-        for i in 0..MAX_SNAPSHOT_PATCHES {
-            let r = plan.push(SnapshotPatch::Write {
-                byte_offset: i as u64,
-                bytes: &[],
-            });
-            assert!(r.is_ok(), "push at i={i} must succeed within bound");
-        }
-        let overflow = plan.push(SnapshotPatch::EMPTY);
-        assert_eq!(overflow, Err(SnapshotError::SnapshotTableFull));
-        assert_eq!(plan.patches().len(), MAX_SNAPSHOT_PATCHES);
-    }
-
-    #[test]
-    fn plan_new_starts_empty() {
-        let plan = SnapshotPlan::new(8192);
-        assert_eq!(plan.total_file_size, 8192);
-        assert_eq!(plan.patches().len(), 0);
-    }
 
     #[test]
     fn error_to_wire_code_mapping() {

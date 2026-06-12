@@ -12,7 +12,7 @@
 //! Header layout (LE):
 //!
 //! ```text
-//!   0:      op selector (% 8)
+//!   0:      op selector (% 7)
 //!   1:      flags: bit0 extended_l2, bit1 set/clear for the
 //!           flag helpers
 //!   2:      refcount_bits selector (% 7 -> 1/2/4/8/16/32/64)
@@ -132,10 +132,10 @@
 //!    table whose surviving entries are byte-identical (via
 //!    bounds extraction) and whose byte_len re-parses at one
 //!    fewer entry.
-//! 8. **`SnapshotPlan::push`** accepts exactly
-//!    `MAX_SNAPSHOT_PATCHES` entries then errors
-//!    `SnapshotTableFull` (direct from the bounded-storage
-//!    implementation).
+//!
+//! (A phase 12 invariant 8 covered `SnapshotPlan::push`'s bound;
+//! the never-adopted `SnapshotPlan` API and its op 7 were removed
+//! in PLAN-snapshot phase 14.)
 
 #![no_main]
 use libfuzzer_sys::fuzz_target;
@@ -152,7 +152,7 @@ use snapshot::table::{
     build_snapshot_table, build_snapshot_table_without, serialize_snapshot_entry,
     snapshot_table_byte_len, snapshot_table_entry_bounds, NewSnapshotEntry,
 };
-use snapshot::{SnapshotError, SnapshotPatch, SnapshotPlan, MAX_SNAPSHOT_PATCHES};
+use snapshot::SnapshotError;
 
 const HEADER_BYTES: usize = 32;
 
@@ -277,7 +277,7 @@ fuzz_target!(|data: &[u8]| {
     // ------------------------------------------------------------------
     // Decode the structured header.
     // ------------------------------------------------------------------
-    let op = data[0] % 8;
+    let op = data[0] % 7;
     let refcount_bits = match data[2] % 7 {
         0 => 1u32,
         1 => 2,
@@ -345,7 +345,7 @@ fuzz_target!(|data: &[u8]| {
                 cursor_entry_seed,
             ),
             5 => run_flag_helpers(&cfg, s, l1_len, l2_len, helper_idx),
-            6 => run_table_round_trip(
+            _ => run_table_round_trip(
                 &cfg,
                 s,
                 &old_table,
@@ -354,7 +354,6 @@ fuzz_target!(|data: &[u8]| {
                 &name_buf[..name_len],
                 data,
             ),
-            _ => run_plan_push(&cfg, &id_buf[..id_len]),
         }
     });
 });
@@ -969,28 +968,4 @@ fn run_table_round_trip(
         );
         j += 1;
     }
-}
-
-// ---------------------------------------------------------------------------
-// Op 7: SnapshotPlan::push bound (invariant 8).
-// ---------------------------------------------------------------------------
-
-fn run_plan_push(cfg: &Cfg, payload: &[u8]) {
-    let mut plan = SnapshotPlan::new(cfg.host_start);
-    for i in 0..MAX_SNAPSHOT_PATCHES {
-        let r = plan.push(SnapshotPatch::Write {
-            byte_offset: i as u64,
-            bytes: payload,
-        });
-        assert!(
-            r.is_ok(),
-            "snapshot plan: push {i} failed within MAX_SNAPSHOT_PATCHES",
-        );
-    }
-    assert_eq!(plan.patches().len(), MAX_SNAPSHOT_PATCHES);
-    assert_eq!(
-        plan.push(SnapshotPatch::EMPTY),
-        Err(SnapshotError::SnapshotTableFull),
-        "snapshot plan: push past the bound must error SnapshotTableFull",
-    );
 }

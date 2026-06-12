@@ -256,9 +256,11 @@ def create_minimal_seeds(corpus_base):
 
     # fuzz_snapshot_refcount: one structured-header seed per op
     # selector (the target is synthetic; no natural seeds exist).
+    # Ops 0..=6; op 7 (SnapshotPlan::push) was removed with the
+    # never-adopted SnapshotPlan API in PLAN-snapshot phase 14.
     dest = os.path.join(corpus_base, 'fuzz_snapshot_refcount')
     os.makedirs(dest, exist_ok=True)
-    for op in range(8):
+    for op in range(7):
         with open(os.path.join(dest, f'minimal_op{op}'), 'wb') as f:
             f.write(build_snapshot_refcount_seed(op))
 
