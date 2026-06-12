@@ -185,7 +185,7 @@ a per-issue basis.
 
 | Phase | Plan | Status |
 |-------|------|--------|
-| 1. Category A: Fixed-VHD `virtual_size` overflow guard | [PLAN-bug-fixes-phase-01-fixed-vhd-overflow.md](PLAN-bug-fixes-phase-01-fixed-vhd-overflow.md) | Not started |
+| 1. Category A: Fixed-VHD `virtual_size` overflow guard | [PLAN-bug-fixes-phase-01-fixed-vhd-overflow.md](PLAN-bug-fixes-phase-01-fixed-vhd-overflow.md) | Complete (commit `bbfdfc9`) |
 | 2. Category B: VHDX resize sequence-number overflow | [PLAN-bug-fixes-phase-02-vhdx-resize-seqnum.md](PLAN-bug-fixes-phase-02-vhdx-resize-seqnum.md) | Not started |
 | 3. Category C: qcow2 shrink sub-byte refcount corruption | [PLAN-bug-fixes-phase-03-qcow2-shrink-subbyte-refcount.md](PLAN-bug-fixes-phase-03-qcow2-shrink-subbyte-refcount.md) | Not started |
 
