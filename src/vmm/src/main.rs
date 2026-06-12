@@ -13975,6 +13975,10 @@ Offset          Length          Mapped to       File
             fn tzset();
         }
         std::env::set_var("TZ", "UTC");
+        // SAFETY: tzset() takes no arguments, touches only libc's
+        // process-global timezone state, and is called here after
+        // TZ is pinned so the subsequent localtime_r reads the
+        // test's timezone rather than the host's.
         unsafe { tzset() };
         let e = snap("1", "x", 0, 0, 0, 0, 0, 0);
         let out = render_snapshot_human(&[e]);
@@ -14246,6 +14250,57 @@ Offset          Length          Mapped to       File
             "expected force-share refusal, got: {}",
             msg
         );
+    }
+
+    // --- Host-side name/needle validation (phase 6/7 quirks) ------
+    // These fire before any file access, so the bogus D1 filename
+    // proves the validation path (not file-not-found) produced the
+    // error. Pre-push audit 2b: these previously had only harness
+    // coverage (tools/snapshot-create-refusals.sh), which a silent
+    // regression of the host-side check would not necessarily fail
+    // deterministically in CI's unit lane.
+
+    #[test]
+    fn snapshot_create_empty_name_refused_host_side() {
+        let args = snapshot_args_for_d1(false, Some(""), None, None, false);
+        let err = run_snapshot(args, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("non-empty"),
+            "expected empty-name refusal, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn snapshot_create_over_255_byte_name_refused_host_side() {
+        let long = "n".repeat(256);
+        let args = snapshot_args_for_d1(false, Some(&long), None, None, false);
+        let err = run_snapshot(args, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("255"),
+            "expected over-length refusal, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn snapshot_delete_apply_oversized_needle_not_found_host_side() {
+        // A needle longer than the 256-byte wire buffer cannot name
+        // any matchable snapshot; both modes resolve to the guest's
+        // not-found surface without touching the file.
+        let long = "n".repeat(257);
+        for (delete, apply) in [(Some(long.as_str()), None), (None, Some(long.as_str()))] {
+            let args = snapshot_args_for_d1(false, None, delete, apply, false);
+            let err = run_snapshot(args, false).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("error code {}", SNAPSHOT_RESULT_ERROR_NOT_FOUND)),
+                "expected not-found surface, got: {}",
+                msg
+            );
+        }
     }
 
     #[test]

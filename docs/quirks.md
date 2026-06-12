@@ -1580,6 +1580,22 @@ the phase 13 differential fuzzer, whose comparator zeroes the
 live table's pad bytes on both sides per step, alongside its
 date normalization.
 
+### Snapshot names are rendered raw, like qemu-img
+
+`instar snapshot -l` writes snapshot IDs and names to stdout
+byte-for-byte as stored in the image, exactly as `qemu-img
+snapshot -l` does (qemu `printf`s them raw). A hostile image can
+therefore embed terminal control characters (ANSI escapes,
+carriage returns, newlines) in a snapshot name and have them
+reach the operator's terminal — a cosmetic output-spoofing
+vector, noted by the PLAN-snapshot pre-push security review and
+**accepted deliberately as qemu-img parity**: sanitizing would
+break the byte-identical `-l` contract the cross-version
+baselines and harnesses pin. The JSON output path escapes per
+the JSON spec (`"`, `\`, and C0 controls) and is the right
+choice for untrusted automation. Pipe human output through
+`less` or similar when listing images you do not trust.
+
 ### Zero `date_sec` renders the epoch (fixed in phase 14)
 
 For a snapshot-table entry whose `date_sec` is 0, `instar

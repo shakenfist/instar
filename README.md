@@ -634,7 +634,9 @@ instar/
 │   │   ├── vhd/    # VHD footer, dynamic header, BAT parsing
 │   │   ├── vhdx/   # VHDX headers, region table, metadata, BAT, CRC-32C
 │   │   ├── vmdk/   # VMDK4 header and descriptor parsing
-│   │   └── luks/   # LUKS header parsing, KDF, AFsplitter, decryption
+│   │   ├── luks/   # LUKS header parsing, KDF, AFsplitter, decryption
+│   │   └── ...     # Per-operation planner crates (measure, create,
+│   │               # resize, rebase, commit, snapshot)
 │   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, measure, create, resize, rebase, commit, map, snapshot)
 │   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates

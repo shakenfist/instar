@@ -531,6 +531,15 @@ provides a modular architecture with:
   guest read from the same device it writes to — the first
   in-place-mutation primitive, reusable by `rebase` / `commit`
   / snapshot-delete) and `send_resize_result`. Same
+  append-at-end discipline. Phase 1 of `PLAN-snapshot.md` adds
+  `SnapshotConfig` (magic `b"SNAP"`, carrying the mode, the
+  snapshot name/needle argument, and the create-mode
+  `date_sec`/`date_nsec` wall-clock fields) / `SnapshotResult` /
+  the `SnapshotEntryRecord` wire record, and three more CallTable
+  entries — `send_snapshot_entry` (streams one listed snapshot
+  per call), `send_snapshot_result`, and `fsync_input` (the
+  guest-visible write barrier the mutating modes use between
+  write groups) — bumping CallTable VERSION from 16 to 17, same
   append-at-end discipline.
 
 **Chain validation in check (`--chain`):**
@@ -860,7 +869,7 @@ A mock `CallTable` (in `src/fuzz/src/lib.rs`) backed by thread-local
 fuzzer input provides sector-based I/O, allowing libFuzzer to explore
 deeply malformed inputs.
 
-18 fuzz targets cover all parser crates: format detection, header
+22 fuzz targets cover all parser crates: format detection, header
 parsing (QCOW2, VMDK, VHD, VHDX, RAW, LUKS), L1/L2 cluster lookup,
 refcount table traversal, zlib decompression, grain directory lookup,
 BAT traversal, VHDX metadata parsing, the measure subcommand's
@@ -880,7 +889,13 @@ via the matching parser crate) and the resize subcommand's planners
 (`fuzz_resize_planners` — exercises `plan_resize_raw` / `_qcow2` /
 `_vmdk` / `_vhd` / `_vhdx`, asserting plan-level patch invariants:
 bounded patch count, no offset+len overflow, every patch ends
-within `total_file_size`, no overlapping Writes).
+within `total_file_size`, no overlapping Writes). The rebase and
+commit planners have equivalent targets (`fuzz_rebase_planners`,
+`fuzz_commit_planners`), and the snapshot subcommand adds
+`fuzz_snapshot_parse` (the streaming snapshot-table parser plus
+the pure table readers) and `fuzz_snapshot_refcount` (the
+refcount mutators, COPIED-flag walker, allocator, and table
+round-trip under semantic invariants).
 
 The seed corpus is extracted from `instar-testdata` by
 `scripts/extract-fuzz-corpus.py`, which filters images by format and
