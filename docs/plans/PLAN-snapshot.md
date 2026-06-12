@@ -983,7 +983,7 @@ qemu-img.
 | 10. Cross-version baselines: snapshot-bearing qcow2 fixtures, `snapshot-list-human` profiles in `generate-baselines.py` (JSON deferred to phase 11 — no qemu source of truth; mutation baselines dropped — column drift already captured by listing frozen fixtures), baseline generation pass for 80 versions. FINDING: snapshot names >63 bytes are truncated by the list parser (bug fixed post-landing: `SnapshotEntry::name` widened to `[u8;256]`, cap raised to `.min(255)`; `snap-qcow2-longname` profile updated to full 200-byte baseline; see "Bugs fixed during this work"). | PLAN-snapshot-phase-10-baselines.md | Landed |
 | 11. Integration tests (`tests/test_snapshot.py`): list matrix, create/delete/apply round-trips, error paths, qcow2-only enforcement, post-op `qemu-img check` clean. **Fixtures, profiles, and manifest tag `snapshots` are ready from phase 10.** JSON golden files for `--output=json` belong here (instar-side self-baseline; no qemu source of truth). 94 tests: 92 pass, 2 skip (qcow2-snapshots: no phase-10 baseline), 0 fail; suite wall time ~1s; JSON goldens in `tests/golden/snapshot-list/`. Test families: (a) list-matrix (b) JSON-goldens + vmstate structural + QMP-key schema (c) mutation round-trips (d) error paths + qcow2-only enforcement (e) empty-table. | PLAN-snapshot-phase-11-integration-tests.md | Landed |
 | 12. Coverage-guided fuzz harnesses: `fuzz_snapshot_parse`, `fuzz_snapshot_refcount` | PLAN-snapshot-phase-12-fuzz-coverage.md | Landed |
-| 13. Differential fuzzing extension: random `-c/-d/-a` chain vs qemu-img, structural `qemu-img info` comparison | PLAN-snapshot-phase-13-fuzz-differential.md | Not started |
+| 13. Differential fuzzing extension: random `-c/-d/-a` chain vs qemu-img, structural `qemu-img info` comparison | PLAN-snapshot-phase-13-fuzz-differential.md | Landed |
 | 14. Documentation, CHANGELOG, follow-ups (`docs/snapshot.md`, quirks, usage, ARCHITECTURE, README, AGENTS, `PLAN-convert-followups.md` final strike-through) | PLAN-snapshot-phase-14-docs.md | Not started |
 
 ### Phase notes (effort and model)
@@ -1038,6 +1038,12 @@ recommended sub-agent model per phase:
   strict enough to catch bugs but lenient enough to allow
   legitimate ID-format differences across qemu-img versions
   is the hard part.
+  (As executed: single fable agent for implementation, with
+  verification completed in the management session past the
+  sub-agent permission boundary. The strict byte-identity
+  comparator earned its keep immediately — a real renderer
+  bug and two dead-byte normalization rules on the first
+  runs.)
 - **Phase 14 (docs)**: low effort, haiku or sonnet.
 
 When in doubt, skew to the more capable model. Phases 5–8
@@ -1164,7 +1170,11 @@ The plan is complete when:
   nightly list and the corpus seeder; the next nightly run
   picks them up.)
 * Differential fuzzer's random operation chain includes
-  `snapshot -c/-d/-a`.
+  `snapshot -c/-d/-a`. (Phase 13: `op_snapshot` chains
+  create/delete/apply/write with byte-identity after every
+  element; its first runs found and led to fixing a real
+  multibyte list-padding bug and surfaced two dead-byte
+  normalization rules, both documented in docs/quirks.md.)
 * `docs/snapshot.md`, `docs/quirks.md`, `docs/usage.md`,
   `README.md`, `AGENTS.md`, `ARCHITECTURE.md`, and
   `CHANGELOG.md` all updated.

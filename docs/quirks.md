@@ -1527,6 +1527,53 @@ the `nanoseconds` subsecond component, so JSON consumers do not
 need to round-trip the human-readable column to recover the
 underlying timestamp.
 
+### TAG / ID columns pad to a byte-measured minimum width
+
+qemu's `qemu-img snapshot -l` renders rows with C
+`printf("%-7s %-16s …")`, whose minimum field widths count
+**bytes**. Rust's `{:<7}` / `{:<16}` count chars, which over-pads
+multibyte UTF-8 names (`snäp-名前` is 7 chars but 12 bytes).
+instar's renderer pads the ID and TAG columns by byte length so
+the row layout is byte-identical to qemu's for any name. Found
+by PLAN-snapshot phase 13's differential fuzzer on its first
+smoke run — the phase 10/11 fixture names were all ASCII, where
+the two semantics agree.
+
+### Inter-entry snapshot-table padding bytes may differ
+
+Snapshot-table entries start 8-aligned, leaving up to 7 padding
+bytes between an entry's unaligned end and the next entry's
+start. instar serializes the whole table with zeroed gaps;
+qemu's `qcow2_write_snapshots` writes each entry field-by-field
+and never touches the pad bytes. On a table allocated into a
+**reused** (previously freed, dirty) cluster — e.g. a create or
+delete following an apply that freed data clusters — qemu's
+padding therefore retains stale bytes while instar's reads zero.
+Both images are valid: the padding is dead bytes no parser
+reads. Unreachable in the phase 6–8 byte-identity matrices
+(their tables always landed in fresh zero clusters); found by
+the phase 13 differential fuzzer, whose comparator zeroes the
+live table's pad bytes on both sides per step, alongside its
+date normalization.
+
+### Zero `date_sec` renders a blank DATE column
+
+For a snapshot-table entry whose `date_sec` is 0, `instar
+snapshot -l` prints a blank `DATE` column while `qemu-img
+snapshot -l` renders the Unix epoch in local time
+(`1970-01-01 …`). This is a degenerate-input renderer
+divergence: it is unreachable via qemu-created images — both
+`qemu-img snapshot -c` and `instar snapshot -c` always stamp the
+wall-clock creation time, so a zero `date_sec` requires a
+hand-crafted table. Found by PLAN-snapshot phase 13's
+date-normalization probes, which is why the differential
+fuzzer's comparator normalizes `date_sec`/`date_nsec` to a fixed
+**nonzero** sentinel (`0x60000000`/`0`) rather than zero: with
+the nonzero value both tools render the identical timestamp and
+`-l` output is byte-identical. Phase 14 owns the fix decision —
+render the epoch like qemu (parity) or keep the blank column
+(arguably clearer for a value that means "never stamped").
+
 ### `vm_state_size == 0` renders as `0 B`
 
 qemu's `qemu-img snapshot -l` uses `size_to_str()` for the
@@ -1597,6 +1644,23 @@ landed in PLAN-snapshot phase 6).
   default since qcow2 v3, and the only width v2 uses). Images with
   a different `refcount_order` are refused by `-c`
   (`ERROR_UNSUPPORTED_FEATURE`); list mode still works on them.
+
+- **Create may exhaust the image's existing refblocks.** instar
+  v1 allocates new clusters (the snapshot's L1 copy, the
+  reallocated snapshot table) only from the refblocks already
+  present in the image's refcount table — it never allocates a
+  new refblock and never grows the refcount table. When no free
+  run remains in the present refblocks, `-c` fails with
+  `ERROR_ALLOCATION_FAILED` ("no free clusters available") and
+  the image is untouched; `qemu-img snapshot -c` grows the
+  refcount structures and succeeds. In practice this bites at
+  small cluster sizes, where per-create allocations are many
+  clusters (at `cluster_size=512` a 64M image's L1 copy alone is
+  32 clusters) and each refblock covers little file range. Found
+  by the phase 13 differential fuzzer; its chain generator pairs
+  512-byte clusters only with 4M images (the phase 6–8 matrix
+  pairing). Refcount-structure growth is future work (phase 6
+  open question 7).
 
 - **Dirty / corrupt images refused.** `qemu-img` auto-repairs a
   dirty lazy-refcount image when it opens it read-write; instar v1

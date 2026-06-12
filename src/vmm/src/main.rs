@@ -14038,8 +14038,7 @@ Offset          Length          Mapped to       File
         let row = text.lines().nth(2).expect("expected data row");
         // 1-byte ID + 6 pad + separator; 12-byte name + 4 pad +
         // separator; "0 B" right-aligned in 8.
-        let expected_prefix =
-            format!("1{}snäp-名前{}0 B", " ".repeat(7), " ".repeat(10));
+        let expected_prefix = format!("1{}snäp-名前{}0 B", " ".repeat(7), " ".repeat(10));
         assert!(
             row.starts_with(&expected_prefix),
             "byte-padded row: {:?}",
