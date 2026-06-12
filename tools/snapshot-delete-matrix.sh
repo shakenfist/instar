@@ -362,5 +362,53 @@ PY
     fi
 fi
 
+# --- Shared-L2 surviving-snapshot COPIED refresh ---------------------------
+# Regression for the phase 13 differential-fuzzer finding (soak2
+# iteration 209). Two snapshots share an L2; guest writes then COW
+# the ACTIVE chain onto fresh L2s, so the shared L2 belongs only to
+# the two snapshots. Deleting one drops the shared data clusters
+# 2 -> 1, and qemu's -1 walk writes the SURVIVING snapshot's L2
+# back with COPIED set on those entries — instar must match
+# byte-for-byte (delete_and_compare) AND the surviving snapshot's
+# L2 must actually carry COPIED bits (so the scenario keeps
+# covering the mechanism if cluster layouts drift).
+printf '\n=== Shared-L2 delete: surviving snapshot L2 gains COPIED ===\n'
+rm -f "$WORK"/base.qcow2
+qemu-img create -f qcow2 -o cluster_size=4096 "$WORK/base.qcow2" 4M >/dev/null 2>&1
+qemu-io -c "write -P 0x93 2608k 128k" "$WORK/base.qcow2" >/dev/null 2>&1
+qemu-img snapshot -c alpha  "$WORK/base.qcow2" >/dev/null 2>&1
+qemu-img snapshot -c keeper "$WORK/base.qcow2" >/dev/null 2>&1
+qemu-io -c "write -P 0x58 752k 4k" -c "write -P 0xFE 2700k 64k" "$WORK/base.qcow2" >/dev/null 2>&1
+delete_and_compare "shared-l2" "delete-alpha" alpha
+if python3 - "$WORK/A.qcow2" <<'PY'
+import struct, sys
+d = open(sys.argv[1], 'rb').read()
+MASK = 0x00fffffffffffe00
+COPIED = 1 << 63
+nb, snap_off = struct.unpack_from('>IQ', d, 60)
+pos = snap_off
+copied_entries = 0
+for _ in range(nb):
+    pos = (pos + 7) & ~7
+    l1_off, l1_size = struct.unpack_from('>QI', d, pos)
+    il, nl = struct.unpack_from('>HH', d, pos + 12)
+    ex = struct.unpack_from('>I', d, pos + 36)[0]
+    for i in range(l1_size):
+        l2 = struct.unpack_from('>Q', d, l1_off + 8 * i)[0] & MASK
+        if not l2:
+            continue
+        for j in range(4096 // 8):
+            e = struct.unpack_from('>Q', d, l2 + 8 * j)[0]
+            if e & COPIED and e & MASK:
+                copied_entries += 1
+    pos += 40 + ex + il + nl
+sys.exit(0 if copied_entries > 0 else 1)
+PY
+then
+    ok "shared-l2: surviving snapshot's L2 carries COPIED entries (mechanism exercised)"
+else
+    bad "shared-l2: surviving snapshot's L2 has no COPIED entries — scenario no longer covers the refresh"
+fi
+
 printf '\n=== Delete matrix result: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

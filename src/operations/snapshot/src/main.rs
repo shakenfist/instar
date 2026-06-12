@@ -70,9 +70,14 @@
 //!   (in-memory: chain decrements via update_snapshot_refcount,
 //!    snapshot-L1 free, old-table free — qemu's "we won't recover
 //!    but just leak clusters" zone — then the COPIED refresh over
-//!    the ACTIVE chain)
+//!    the ACTIVE chain and over the DELETED chain's staged L2s,
+//!    both at post-decrement refcounts)
 //!   C: refblocks (now carrying the decrements) + active L1 +
-//!      active L2 set
+//!      active L2 set + the deleted chain's SURVIVING L2s
+//!      (refcount >= 1 — shared with another snapshot or the
+//!      active chain — with refreshed COPIED flags, matching
+//!      qemu's -1-walk flush; freed L2s are never written, the
+//!      cache-discard exemption)
 //!   fsync
 //!
 //! The apply writeback ordering mirrors qemu's
@@ -1598,9 +1603,37 @@ unsafe fn run_delete(
         }
     }
 
+    // ----- COPIED refresh over the DELETED chain's staged L2s -------------
+    // qemu's -1 walk over the deleted snapshot's L1 also recomputes
+    // COPIED on the visited L2 entries (post-decrement refcounts)
+    // and flushes the dirty L2s whose clusters were NOT freed — an
+    // L2 shared with a *different* snapshot survives at refcount
+    // >= 1 and lands on disk with refreshed flags (e.g. a shared
+    // data cluster that dropped 2 -> 1 gains COPIED inside the
+    // surviving snapshot's L2). Only the walked L1 is exempt from
+    // writeback ("Update L1 only if addend >= 0"); it is also
+    // being freed. Refresh the staged deleted chain here; group C
+    // writes back the surviving (refcount > 0) snap-set L2s. The
+    // snap L1 buffer is mutated in place but never written. Found
+    // by the phase 13 differential fuzzer (soak2 iteration 209);
+    // same mechanism as MODE_APPLY's step 10b.
+    {
+        let snap_l1_mut = core::slice::from_raw_parts_mut(snap_l1_ptr, snap_l1_bytes);
+        if let Err(e) = update_copied_flags_for_l1(
+            snap_l1_mut,
+            cluster_bits,
+            |i| snap_set.l2_for_index_mut(i),
+            refcount_for_cluster,
+            extended_l2,
+        ) {
+            fail!(map_snapshot_error(e));
+        }
+    }
+
     // ----- Step 10: write group C -----------------------------------------
     // All staged refblocks (now carrying the decrements), the
-    // active L1, and the active L2 set.
+    // active L1, the active L2 set, and the deleted chain's
+    // surviving L2s.
     for (k, host_off) in rb_offsets.iter().copied().enumerate() {
         let block = &refblocks[k * cluster_size_usize..(k + 1) * cluster_size_usize];
         if !write_input_byte_range(call_table, 0, sector_size, host_off, block) {
@@ -1625,6 +1658,27 @@ unsafe fn run_delete(
             active_set.entries[k].host_offset,
             l2,
         ) {
+            fail!(SnapshotResult::ERROR_IO);
+        }
+    }
+    // Surviving deleted-chain L2s: write back the staged snap-set
+    // L2s whose own cluster's post-decrement refcount is still
+    // non-zero (shared with another snapshot or the active chain;
+    // a physical L2 in both staged sets is written twice with
+    // identical bytes). Freed L2s (refcount 0) are skipped — never
+    // written, matching qemu's cache discard.
+    for k in 0..snap_set.count {
+        let host_off = snap_set.entries[k].host_offset;
+        match refcount_for_cluster(host_off) {
+            Some(0) => continue, // freed: never written
+            Some(_) => {}
+            None => fail!(SnapshotResult::ERROR_IO),
+        }
+        let l2 = core::slice::from_raw_parts(
+            (SNAP_L2_STAGING + k * cluster_size_usize) as *const u8,
+            cluster_size_usize,
+        );
+        if !write_input_byte_range(call_table, 0, sector_size, host_off, l2) {
             fail!(SnapshotResult::ERROR_IO);
         }
     }
