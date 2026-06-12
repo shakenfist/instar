@@ -2109,8 +2109,17 @@ SNAPSHOT_NAME_POOL = [
 # CI container, whose Debian-stable qemu-utils tracks the 10.0.x
 # series the phase 6-8 harnesses pinned).
 _QEMU_IMG_VERSION = None
-_SNAPSHOT_VERSION_SKIP_LOGGED = False
-_SNAPSHOT_LIST_SKIP_LOGGED = False
+
+# Keys for one-shot log messages (version-gate skips), so they print
+# once per run instead of once per fuzz iteration.
+_LOGGED_ONCE = set()
+
+
+def _log_once(key, msg, *args):
+    """Emit `logger.info(msg, *args)` the first time `key` is seen."""
+    if key not in _LOGGED_ONCE:
+        _LOGGED_ONCE.add(key)
+        logger.info(msg, *args)
 
 
 def qemu_img_version():
@@ -2417,8 +2426,6 @@ def op_snapshot(instar_bin, instar_copy, qemu_copy, fmt, timeout,
     signature but unused — snapshot builds its own image pair via
     `_snapshot_chain_picker`, per the resize/commit precedent.
     """
-    global _SNAPSHOT_VERSION_SKIP_LOGGED
-
     # Version gate (a): the whole op requires qemu >= 4.0. instar
     # implements modern name-only delete semantics
     # (bdrv_snapshot_find); older qemu-img resolved delete arguments
@@ -2427,11 +2434,10 @@ def op_snapshot(instar_bin, instar_copy, qemu_copy, fmt, timeout,
     # matches by NAME only" cross-version note).
     version = qemu_img_version()
     if version < (4, 0):
-        if not _SNAPSHOT_VERSION_SKIP_LOGGED:
-            logger.info(
-                'op_snapshot: qemu-img %d.%d < 4.0, skipping '
-                'snapshot chains', version[0], version[1])
-            _SNAPSHOT_VERSION_SKIP_LOGGED = True
+        _log_once(
+            'snapshot-version-skip',
+            'op_snapshot: qemu-img %d.%d < 4.0, skipping '
+            'snapshot chains', version[0], version[1])
         return None
 
     base_opts, chain = _snapshot_chain_picker(rng)
@@ -2595,15 +2601,13 @@ def _snapshot_compare_list_output(instar_bin, inst_path, timeout,
     9.0 the check silently skips (logged once); byte identity still
     carries the oracle.
     """
-    global _SNAPSHOT_LIST_SKIP_LOGGED
     version = qemu_img_version()
     if version < (9, 0):
-        if not _SNAPSHOT_LIST_SKIP_LOGGED:
-            logger.info(
-                'op_snapshot: qemu-img %d.%d < 9.0, skipping -l '
-                'stdout comparison (byte identity still applies)',
-                version[0], version[1])
-            _SNAPSHOT_LIST_SKIP_LOGGED = True
+        _log_once(
+            'snapshot-list-skip',
+            'op_snapshot: qemu-img %d.%d < 9.0, skipping -l '
+            'stdout comparison (byte identity still applies)',
+            version[0], version[1])
         return None
 
     il_out, il_err, il_rc = run_instar(
