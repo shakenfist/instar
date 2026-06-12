@@ -11273,13 +11273,12 @@ fn format_qemu_snapshot_clock(vm_clock_nsec: u64) -> String {
 /// `YYYY-MM-DD HH:MM:SS` in local time, matching qemu-img's
 /// `strftime("%Y-%m-%d %H:%M:%S", localtime(&date_sec))`.
 ///
-/// Returns an empty string if `date_sec` is 0 (the pathological
-/// hand-crafted case). This is documented in docs/quirks.md;
-/// real qcow2 snapshots always carry a nonzero creation date.
+/// A zero `date_sec` is fed through `localtime_r` like any other
+/// value and renders the Unix epoch in local time, exactly as
+/// qemu does. (An earlier early-return rendered a blank DATE
+/// column for this hand-crafted-only input; PLAN-snapshot phase
+/// 14 removed it for byte-parity — see docs/quirks.md.)
 fn format_qemu_snapshot_date_local(date_sec: u64) -> String {
-    if date_sec == 0 {
-        return String::new();
-    }
     // SAFETY: `localtime_r` writes a fully-initialised `tm` into
     // the stack-allocated buffer when given a valid time_t; we
     // pass a stack reference and the kernel-provided tzdata is
@@ -13903,10 +13902,12 @@ Offset          Length          Mapped to       File
         // space separators, VM_SIZE/VM_CLOCK underscores, 4-digit
         // hours, `--` for absent icount.
         //
-        // We use TZ-independent fixtures by going through
-        // date_sec=0 (omitted-date path) for a deterministic check
-        // on the rest of the row shape. A separate dated test
-        // pins the column positions.
+        // date_sec=0 renders the epoch in local time (19 bytes
+        // under any TZ), so the row shape is deterministic even
+        // though the DATE text is TZ-dependent; this test asserts
+        // only the TZ-independent parts of the row. The
+        // date_sec_zero test below pins the DATE column itself
+        // under TZ=UTC.
         let e = snap("1", "snap1", 0, 0, 0, 0, 0, 0);
         let out = render_snapshot_human(&[e]);
         let text = String::from_utf8(out).unwrap();
@@ -13962,11 +13963,19 @@ Offset          Length          Mapped to       File
 
     #[test]
     fn snapshot_human_date_sec_zero_renders_epoch() {
-        // PLAN-snapshot phase 4 implementation: with the v10
-        // format there is no `sn->date_sec ? " " : ""` quirk —
-        // the separator is uniform. The date-sec-zero case
-        // renders an empty DATE column, but the row shape is
-        // unchanged.
+        // PLAN-snapshot phase 14 decision (open question 2):
+        // qemu feeds a zero `date_sec` through `localtime` and
+        // renders the Unix epoch in local time; instar matches.
+        // Pin TZ=UTC (the integration tests' convention for the
+        // local-time DATE column) so the rendered string is
+        // deterministic, and call tzset() so libc re-reads the
+        // variable. (The libc crate does not expose tzset on
+        // unix targets, so declare it directly.)
+        extern "C" {
+            fn tzset();
+        }
+        std::env::set_var("TZ", "UTC");
+        unsafe { tzset() };
         let e = snap("1", "x", 0, 0, 0, 0, 0, 0);
         let out = render_snapshot_human(&[e]);
         let text = String::from_utf8(out).unwrap();
@@ -13974,11 +13983,11 @@ Offset          Length          Mapped to       File
         let row = text.lines().nth(2).expect("expected data row");
         assert_eq!(row.len(), 80, "row width: {:?}", row);
         // Check DATE column slot (cols 35..54, 1-indexed -> bytes
-        // 34..53). Should be 19 spaces in the date-sec-zero case.
+        // 34..53): the epoch, rendered like any other timestamp.
         let date_slot = &row[34..53];
-        assert!(
-            date_slot.trim().is_empty(),
-            "date column should be blank when date_sec is zero: {:?}",
+        assert_eq!(
+            date_slot, "1970-01-01 00:00:00",
+            "date_sec == 0 must render the epoch like qemu: {:?}",
             date_slot
         );
     }

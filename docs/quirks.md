@@ -1580,23 +1580,29 @@ the phase 13 differential fuzzer, whose comparator zeroes the
 live table's pad bytes on both sides per step, alongside its
 date normalization.
 
-### Zero `date_sec` renders a blank DATE column
+### Zero `date_sec` renders the epoch (fixed in phase 14)
 
 For a snapshot-table entry whose `date_sec` is 0, `instar
-snapshot -l` prints a blank `DATE` column while `qemu-img
 snapshot -l` renders the Unix epoch in local time
-(`1970-01-01 …`). This is a degenerate-input renderer
-divergence: it is unreachable via qemu-created images — both
-`qemu-img snapshot -c` and `instar snapshot -c` always stamp the
-wall-clock creation time, so a zero `date_sec` requires a
-hand-crafted table. Found by PLAN-snapshot phase 13's
-date-normalization probes, which is why the differential
-fuzzer's comparator normalizes `date_sec`/`date_nsec` to a fixed
-**nonzero** sentinel (`0x60000000`/`0`) rather than zero: with
-the nonzero value both tools render the identical timestamp and
-`-l` output is byte-identical. Phase 14 owns the fix decision —
-render the epoch like qemu (parity) or keep the blank column
-(arguably clearer for a value that means "never stamped").
+(`1970-01-01 00:00:00` under `TZ=UTC`), byte-identical to
+`qemu-img snapshot -l`, which feeds 0 through `localtime` like
+any other value. instar originally early-returned a blank
+`DATE` column here; PLAN-snapshot phase 14 resolved the
+divergence in favour of parity (the project's standing
+principle) and removed the early return — the `localtime_r`
+path handles 0 fine, and the JSON output path carries raw
+numeric date fields either way.
+
+The input is degenerate: it is unreachable via qemu-created
+images — both `qemu-img snapshot -c` and `instar snapshot -c`
+always stamp the wall-clock creation time, so a zero `date_sec`
+requires a hand-crafted table. The original divergence was
+found by PLAN-snapshot phase 13's date-normalization probes,
+which is why the differential fuzzer's comparator normalizes
+`date_sec`/`date_nsec` to a fixed **nonzero** sentinel
+(`0x60000000`/`0`): with the nonzero value both tools rendered
+identically even before the fix, and nothing depends on the
+zero case, so the sentinel stays as-is.
 
 ### `vm_state_size == 0` renders as `0 B`
 
