@@ -95,7 +95,8 @@ jobs:
               --exclude resize-op \
               --exclude rebase-op \
               --exclude commit-op \
-              --exclude map-op
+              --exclude map-op \
+              --exclude snapshot-op
 
       - name: Test config commands in container
         run: |
@@ -659,6 +660,59 @@ jobs:
             ${{ github.workspace }}/test-output.txt
           retention-days: 7
 
+  # Snapshot shell harnesses: live byte-parity verification of
+  # `instar snapshot` against qemu-img (241 assertions across the
+  # seven tools/snapshot-*.sh scripts). A separate job rather
+  # than a step in an integration job: the harnesses are
+  # self-fixturing (qemu-img create + qemu-io inside the
+  # devcontainer), so they need no testdata clone and can run in
+  # parallel with the testdata-bound jobs. `make
+  # snapshot-harnesses` runs the scripts inside the devcontainer
+  # with /dev/kvm passed through, the same execution model as
+  # the differential-fuzz workflow.
+  snapshot-harnesses:
+    needs: build-and-test
+    runs-on: [self-hosted, debian-12, xl]
+    timeout-minutes: 30
+
+    env:
+      DOCKER_BUILDKIT: 1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Docker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y docker.io
+          sudo systemctl start docker
+          sudo chmod 666 /var/run/docker.sock
+
+      - name: Remove previous devcontainers, if any
+        run: |
+          docker image rm -f instar-build 2>/dev/null || true
+
+      - name: Build instar
+        run: |
+          make instar
+
+      - name: Run snapshot harnesses
+        run: |
+          set +e
+          make snapshot-harnesses 2>&1 | tee harness-output.txt
+          harness_exit_code=${PIPESTATUS[0]}
+          set -e
+          exit ${harness_exit_code}
+
+      - name: Upload harness output
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: snapshot-harness-logs
+          path: harness-output.txt
+          retention-days: 7
+
   # Cross-validate instar against oslo.utils git master.
   # This catches drift from oslo.utils development before
   # it reaches PyPI. Allowed to fail (informational).
@@ -758,7 +812,7 @@ jobs:
   automated_reviewer:
     name: "Automated reviewer"
     runs-on: [self-hosted, claude-code]
-    needs: [check-bot-commit, build-and-test, integration-core, integration-convert-qcow2, integration-convert-vhd]
+    needs: [check-bot-commit, build-and-test, integration-core, integration-convert-qcow2, integration-convert-vhd, snapshot-harnesses]
     if: >-
       ${{ github.event_name == 'pull_request' &&
           needs.check-bot-commit.outputs.is_bot != 'true' }}

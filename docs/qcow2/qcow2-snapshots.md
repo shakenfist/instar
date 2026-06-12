@@ -91,8 +91,11 @@ The qcow2 crate exposes two parser variants:
 - **`parse_snapshot_table`** — bounded. Returns a `SnapshotTable`
   with up to `MAX_SNAPSHOTS` (16) entries on the caller's stack.
   Used by `info` (to set the `FLAG_HAS_SNAPSHOTS` bit) and
-  `convert` (to find a single snapshot by id-or-name before
-  switching to its L1 table). Behaviour is byte-identical to
+  `convert` (whose `--snapshot` resolver, `find_snapshot`, runs
+  qemu's two-full-pass ID-then-name match over the parsed table
+  before switching to the found snapshot's L1 — see
+  docs/quirks.md's convert section, including the bounded
+  16-entry lookup residual). Behaviour is byte-identical to
   the pre-streaming implementation; the bounded variant is now
   a thin wrapper over `for_each_snapshot_entry` that stops once
   the 16-entry array is full.
@@ -102,10 +105,10 @@ The qcow2 crate exposes two parser variants:
   field (spec cap 65536). Aborts and returns `false` on a read
   error or when the callback returns `false`. Used by the
   snapshot subcommand to emit one wire record per entry
-  without ballooning the guest's stack.
-- **`find_snapshot_streaming`** — convenience over
-  `for_each_snapshot_entry` that returns the first id-or-name
-  match. Mirrors `find_snapshot`'s comparison rules.
+  without ballooning the guest's stack. (An unused
+  `find_snapshot_streaming` convenience wrapper with the old
+  per-entry id-or-name semantics was removed in PLAN-snapshot
+  phase 14.)
 - **`snapshot_entry_to_record`** — planner converter from the
   internal `SnapshotEntry` to the wire-FFI
   `shared::SnapshotEntryRecord`. Splits `date_sec` into hi/lo
@@ -258,12 +261,12 @@ The phase 8 apply planner adds:
   caller treats as matching — mirroring `qcow2_read_snapshots`'
   default of the current virtual size).
 
-The crate does not emit `SnapshotPatch` entries itself: the
-create guest binary writes each staged region directly
-(commit-binary style), because the create writeback needs
-`fsync` barriers *between* write groups, which a flat patch list
-cannot express. The `SnapshotPatch` / `SnapshotPlan` types remain
-declared in the crate root for a possible future planner.
+The crate emits no patch lists: the guest binaries write each
+staged region directly (commit-binary style), because the
+writeback needs `fsync` barriers *between* write groups, which a
+flat patch list cannot express. (A speculative `SnapshotPatch` /
+`SnapshotPlan` patch-list API sat unused in the crate root
+through phase 13 and was removed in PLAN-snapshot phase 14.)
 
 ### Create write ordering (crash safety)
 
@@ -336,10 +339,19 @@ B: the 12-byte header write at offset 60 — nb_snapshots - 1
     then the old table's clusters — decrements, never set-to-0,
     so an underflow surfaces a double-free bug. Then the COPIED
     refresh over the ACTIVE chain against the post-decrement
-    refcounts: shared data clusters that dropped 2 -> 1 get
-    COPIED SET, the reverse direction from create.)
+    refcounts — shared data clusters that dropped 2 -> 1 get
+    COPIED SET, the reverse direction from create — AND over the
+    deleted chain's staged L2 set, mirroring qemu's -1 walk,
+    which recomputes flags on every L2 entry it visits. The
+    deleted snapshot's L1 buffer is mutated in place but never
+    written — qemu's "update L1 only if addend >= 0" exemption,
+    and it is being freed anyway.)
 C: all staged refblocks (now carrying the decrements) + the
-   active L1 + the active L2 set.
+   active L1 + the active L2 set + the SURVIVING snap-set L2s
+   (those whose own cluster's post-decrement refcount is
+   non-zero, e.g. L2 tables shared with another snapshot, which
+   land on disk with refreshed COPIED flags). Freed L2s are
+   never written, matching qemu's cache discard.
    -> fsync
 ```
 
@@ -350,7 +362,11 @@ refcounts too *high* and/or stale COPIED flags — leaks and
 repairable flag warnings, never a dangling reference. Because
 delete writes no timestamps, the post-delete image is
 byte-identical to qemu's given byte-identical inputs (modulo
-freed-cluster contents and the file tail — docs/quirks.md).
+freed-cluster contents and the file tail — docs/quirks.md). The
+surviving-L2 write-back was added post-phase-13: the
+differential fuzzer caught a deleted-snapshot L2 shared with a
+surviving snapshot landing with stale COPIED-clear entries
+(safe — a spurious COW at worst — but not byte-identical).
 
 ### Apply write ordering (crash safety)
 

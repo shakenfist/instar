@@ -971,7 +971,7 @@ qemu-img.
 
 | Phase | Plan | Status |
 |-------|------|--------|
-| 1. Shared ABI: `SnapshotConfig`, `SnapshotResult`, `SnapshotEntryRecord`, error codes, `send_snapshot_entry`/`send_snapshot_result` call-table pointers, `fsync_input` call-table primitive, `GuestMessage` arms | PLAN-snapshot-phase-01-abi.md | Not started |
+| 1. Shared ABI: `SnapshotConfig`, `SnapshotResult`, `SnapshotEntryRecord`, error codes, `send_snapshot_entry`/`send_snapshot_result` call-table pointers, `fsync_input` call-table primitive, `GuestMessage` arms | PLAN-snapshot-phase-01-abi.md | Landed |
 | 2. Snapshot-table parser extension and list-mode planner: `for_each_snapshot_entry` streaming primitive + extra-data fallback + planner converter (`snapshot_entry_to_record`); `find_snapshot_streaming`; extended `SnapshotEntry` with v3 fields; ~14 new qcow2 unit tests | PLAN-snapshot-phase-02-list-planner.md | Landed |
 | 3. Guest binary scaffolding + list mode (`src/operations/snapshot/`): config read, format check, dispatch, MODE_LIST emit loop | PLAN-snapshot-phase-03-list-guest.md | Landed |
 | 4. Host CLI for list mode (`run_snapshot`, clap surface, human + JSON renderer, `qemu-img snapshot -l` byte-exact output) | PLAN-snapshot-phase-04-list-host.md | Landed |
@@ -984,7 +984,7 @@ qemu-img.
 | 11. Integration tests (`tests/test_snapshot.py`): list matrix, create/delete/apply round-trips, error paths, qcow2-only enforcement, post-op `qemu-img check` clean. **Fixtures, profiles, and manifest tag `snapshots` are ready from phase 10.** JSON golden files for `--output=json` belong here (instar-side self-baseline; no qemu source of truth). 94 tests: 92 pass, 2 skip (qcow2-snapshots: no phase-10 baseline), 0 fail; suite wall time ~1s; JSON goldens in `tests/golden/snapshot-list/`. Test families: (a) list-matrix (b) JSON-goldens + vmstate structural + QMP-key schema (c) mutation round-trips (d) error paths + qcow2-only enforcement (e) empty-table. | PLAN-snapshot-phase-11-integration-tests.md | Landed |
 | 12. Coverage-guided fuzz harnesses: `fuzz_snapshot_parse`, `fuzz_snapshot_refcount` | PLAN-snapshot-phase-12-fuzz-coverage.md | Landed |
 | 13. Differential fuzzing extension: random `-c/-d/-a` chain vs qemu-img, structural `qemu-img info` comparison | PLAN-snapshot-phase-13-fuzz-differential.md | Landed |
-| 14. Documentation, CHANGELOG, follow-ups (`docs/snapshot.md`, quirks, usage, ARCHITECTURE, README, AGENTS, `PLAN-convert-followups.md` final strike-through) | PLAN-snapshot-phase-14-docs.md | Not started |
+| 14. Documentation, CHANGELOG, follow-ups (`docs/snapshot.md`, quirks, usage, ARCHITECTURE, README, AGENTS, `PLAN-convert-followups.md` final strike-through) plus the four deferred dispositions, three of which were code: `find_snapshot` reworked to qemu's two-full-pass ID-then-name matcher (fixing a real `convert --snapshot` collision bug; dead `find_snapshot_streaming` removed), zero-`date_sec` now renders the epoch like qemu, dead `SnapshotPlan`/`SnapshotPatch` API removed (with the fuzz-target op-7 and corpus-seeder ripple), and the seven shell harnesses wired into CI via `make snapshot-harnesses` + a functional-tests job | PLAN-snapshot-phase-14-docs.md | Landed |
 
 ### Phase notes (effort and model)
 
@@ -1139,49 +1139,76 @@ verifies:
 
 ### Success criteria
 
-The plan is complete when:
+The plan is complete when (final sweep annotations from the
+phase 14 close-out in brackets):
 
 * All 14 phases complete and committed on the `snapshot`
-  branch.
+  branch. [Met — see the Execution table; every row Landed.]
 * `make instar` builds with `snapshot.bin` within the
-  384 KiB operation-binary cap.
-* `make lint` clean across the workspace.
+  384 KiB operation-binary cap. [Met — 55 KiB / 384 KiB
+  (14%) at close-out.]
+* `make lint` clean across the workspace. [Met.]
 * `make test-rust` passes; new tests in `qcow2` /
   `snapshot` raise totals as documented in each phase
-  plan.
+  plan. [Met — at close-out the qcow2 crate runs 122 tests
+  and the snapshot crate 127, including phase 14's
+  collision-matcher and epoch-rendering pins.]
 * `make test-integration` includes `tests/test_snapshot.py`;
   test count and pass/skip breakdown documented in each
-  phase plan.
-* `make check-binary-sizes` includes `snapshot.bin`.
-* `pre-commit run --all-files` clean throughout.
+  phase plan. [Met — 94 tests: 92 pass, 2 skip (phase 11),
+  plus the phase 14 `convert --snapshot` collision
+  regression test in `tests/test_convert.py`.]
+* `make check-binary-sizes` includes `snapshot.bin`. [Met.]
+* `pre-commit run --all-files` clean throughout. [Met.]
 * For qcow2 sources: `instar snapshot -l` matches
   `qemu-img snapshot -l` byte-for-byte (both human and
   json, with the documented `--output=json` extension)
   across every qemu-img version in
   `instar-testdata/qemu-img-binaries/x86_64/`, modulo
-  documented quirks.
+  documented quirks. [Met — phase 10's 80-version baseline
+  matrix + phase 11's list matrix; instar tracks the modern
+  ≥9.0 layout, with the old-format profiles captured and the
+  divergence documented in docs/quirks.md. The phase 14
+  zero-`date_sec` fix removed the last known list-mode
+  divergence.]
 * For qcow2 sources: post-`instar snapshot -c/-d/-a`
   images satisfy `qemu-img check` clean and produce
   `qemu-img info` output identical to the same operation
   run under qemu-img (modulo `date_sec`/`date_nsec`).
+  [Exceeded — phases 6-8 and 13 established full
+  byte-identity of the post-op images under
+  `file.discard=ignore`, not just info-equivalence; 241
+  harness assertions + `op_snapshot` byte-identity after
+  every chain element.]
 * Coverage-guided fuzz targets `fuzz_snapshot_parse` and
   `fuzz_snapshot_refcount` registered in nightly CI.
   (Phase 12: both targets registered in the workflow's
   nightly list and the corpus seeder; the next nightly run
-  picks them up.)
+  picks them up.) [Met; phase 14 removed the
+  never-adopted op 7 / invariant 8 with the SnapshotPlan
+  API.]
 * Differential fuzzer's random operation chain includes
   `snapshot -c/-d/-a`. (Phase 13: `op_snapshot` chains
   create/delete/apply/write with byte-identity after every
   element; its first runs found and led to fixing a real
   multibyte list-padding bug and surfaced two dead-byte
   normalization rules, both documented in docs/quirks.md.)
+  [Met.]
 * `docs/snapshot.md`, `docs/quirks.md`, `docs/usage.md`,
   `README.md`, `AGENTS.md`, `ARCHITECTURE.md`, and
-  `CHANGELOG.md` all updated.
+  `CHANGELOG.md` all updated. [Met — phase 14; also
+  `docs/index.md`, `docs/testing.md`, and
+  `docs/qcow2/qcow2-snapshots.md`.]
 * `PLAN-convert-followups.md` strikes `snapshot` from the
   deferred-subcommand list (it then has zero deferred
   subcommands left; phase 1 of that plan is complete
-  pending only the `check --repair` phase 2 work).
+  pending only the `check --repair` phase 2 work). [Met —
+  phase 14.]
+
+Operational note: the instar-testdata `snapshot-baselines`
+branch (phases 10-13 baselines) awaits operator review and
+push; nothing in-tree depends on it, but the plan is not
+operationally complete until it lands on testdata main.
 
 ### Future work
 
@@ -1200,11 +1227,23 @@ The plan is complete when:
   file); needs dedicated thought.
 * **Encrypted images.** Requires LUKS write path, which
   is not yet in instar. Tracked separately.
-* **Snapshot table > 256 entries.** v1 caps in-memory
-  list at 256. Streaming the parser would let us go to
-  the qcow2 max of 65536 without holding all entries
-  resident; the cap is a simple constant change but the
-  test matrix needs an extreme-count fixture. Defer.
+* **Snapshot counts beyond the 16-entry caps.** List mode
+  already streams (one entry resident at a time, up to the
+  qcow2 spec max of 65536 — the phase 2 resolution; an
+  earlier version of this entry claiming a 256-entry list
+  cap was stale). What remains capped at 16
+  (`MAX_SNAPSHOTS`) is the mutating side — `-c` refuses to
+  create a 17th snapshot — and the bounded
+  `parse_snapshot_table` consumers (see the convert lookup
+  entry below). Raising these needs an extreme-count
+  fixture in the test matrix. Defer.
+* **Convert's 16-entry snapshot lookup cap** (phase 14).
+  `convert --snapshot` resolves its argument over the
+  bounded 16-entry `parse_snapshot_table`, so a snapshot
+  stored beyond the first 16 table entries is not-found
+  under instar where `qemu-img convert -l` finds it. Same
+  cap family as the create cap above; documented in
+  docs/quirks.md (convert section). Defer.
 * **`-l` with `--all-data-images`-style chain walk.**
   qemu-img doesn't have this; not a follow-up.
 * **VM state on `-c`** (i.e. snapshot a running VM via
@@ -1221,11 +1260,17 @@ The plan is complete when:
   resize-back workaround message. A follow-up could
   compose the resize planner with apply; only worth it if
   a user actually hits the refusal.
-* **`qcow2::find_snapshot` disposition** (phase 8). The
-  phase 2 per-entry id-or-name helper is confirmed wrong
-  for *both* mutating modes' semantics (delete is
-  name-only; apply is two-full-pass ID-then-name) and is
-  unused — phase 14 removes or re-documents it.
+* ~~**`qcow2::find_snapshot` disposition** (phase 8).~~
+  **Resolved in phase 14.** The "unused" claim was stale:
+  `convert --snapshot` called it, and its per-entry
+  id-or-name walk picked the wrong snapshot on
+  ID/name-collision images (probe 1 of the phase 14 plan).
+  Fixed by reworking it to qemu's two-full-pass
+  ID-then-name shape (`find_snapshot_by_id_or_name`, the
+  same semantics `-a` implements); the genuinely unused
+  `find_snapshot_streaming` companion was deleted. The
+  bounded-lookup residual is the convert 16-entry cap
+  entry above.
 * **`instar resize` on snapshot-bearing qcow2 images**
   (observed in passing during phase 8, *not* snapshot
   scope): fails with a confusing internal-inconsistency
@@ -1262,6 +1307,33 @@ development that we fix in passing.
   field. All names qemu-img can create (≤255 bytes) now
   list byte-identically. See `docs/quirks.md` (snapshot
   subcommand section) for the residual note.
+
+* **Phase 13**: multibyte list-column padding. The list
+  renderer padded ID/TAG with Rust's char-counting `{:<7}`
+  / `{:<16}` where qemu's C `printf` counts bytes,
+  over-padding multibyte UTF-8 names. Fixed to byte-measured
+  padding (commit `5f6a1b9`); found by the differential
+  fuzzer's first smoke run.
+
+* **Phase 13 (soak)**: delete left stale COPIED flags in
+  L2 tables shared between the deleted and a surviving
+  snapshot — safe (spurious COW at worst, check clean) but
+  not byte-identical. Delete now refreshes the deleted
+  chain's staged L2 set and writes back the surviving
+  snap-set L2s, matching qemu's `-1` walk (commit
+  `a5d0767`).
+
+* **Phase 14**: `convert --snapshot` collision bug — the
+  per-entry id-or-name `find_snapshot` returned the first
+  hit of either kind, extracting the wrong snapshot when a
+  name collides with a later ID. Fixed to qemu's two-pass
+  shape (probe 1; collision unit tests + a convert
+  integration regression test added).
+
+* **Phase 14**: zero-`date_sec` snapshot entries rendered a
+  blank DATE column where qemu renders the epoch. Early
+  return removed (probe 2); unreachable via either tool's
+  create, hand-crafted images only.
 
 ### Documentation index maintenance
 

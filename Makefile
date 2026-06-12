@@ -15,7 +15,7 @@
         instar instar-devcontainer clean-instar run-instar check-binary-sizes \
         metadata audit deb rpm package \
         test-venv test test-rust test-integration test-ci test-malicious test-report clean-tests \
-        fuzz-build fuzz-run \
+        fuzz-build fuzz-run snapshot-harnesses \
         test-container test-container-core test-container-convert-qcow2 test-container-convert-vhd \
         clean-cargo-cache release check-version
 
@@ -78,6 +78,7 @@ help:
 	@echo "  test-container-convert-vhd    Run VHD/VHDX convert tests inside container"
 	@echo "  test-ci              Run CI-suitable tests (safe + caution)"
 	@echo "  test-malicious       Run all tests including malicious images"
+	@echo "  snapshot-harnesses   Run the seven snapshot shell harnesses (needs /dev/kvm)"
 	@echo "  test-report          Show test differences without failing"
 	@echo "  clean-tests          Clean test artifacts"
 	@echo ""
@@ -548,6 +549,32 @@ fuzz-run: instar-devcontainer
 		-w "/workspace/src/fuzz" \
 		"$(INSTAR_IMAGE)" \
 		bash -c "cargo fuzz run $(FUZZ_TARGET) -- -max_total_time=$(FUZZ_DURATION)"
+
+# Run the seven snapshot shell harnesses (tools/snapshot-*.sh):
+# live byte-parity verification of `instar snapshot` against
+# qemu-img — 241 assertions across the create/delete/apply
+# matrices, the refusal batteries, and the CLI-parity checks.
+# Runs inside the devcontainer (which ships the qemu-utils the
+# harnesses compare against and matches the glibc the instar
+# binary was built with), with /dev/kvm passed through. The
+# scripts resolve $INSTAR relative to the repo root, so the
+# container's /workspace mount finds the built binary. set -e
+# stops at the first failing harness.
+snapshot-harnesses: instar-devcontainer
+	@if [ ! -f "$(SRC_DIR)/target/release/instar" ]; then \
+		echo "Error: instar not built. Run 'make instar' first."; \
+		exit 1; \
+	fi
+	docker run --rm \
+		--device=/dev/kvm \
+		-u "$(shell id -u):$(shell id -g)" \
+		--group-add "$$(stat -c '%g' /dev/kvm)" \
+		-e HOME=/build \
+		-v "$(CURDIR):/workspace" \
+		-w "/workspace" \
+		"$(INSTAR_IMAGE)" \
+		bash -c 'set -e; for h in tools/snapshot-*.sh; do \
+			echo ""; echo "=== $$h ==="; bash "$$h"; done'
 
 # Run Python integration tests only (on host)
 # Runs all test files except malicious image tests (explicit opt-in via test-malicious)

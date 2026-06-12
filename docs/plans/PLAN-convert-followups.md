@@ -72,7 +72,7 @@ effort:
 
 | Phase | Plan | Status |
 |-------|------|--------|
-| 1. `qemu-img` subcommand parity (~~create~~ / ~~map~~ / ~~measure~~ / ~~resize~~ / snapshot / ~~rebase~~ / ~~commit~~) | PLAN-convert-followups-phase-01-subcommands.md (not yet written) | Not started (`measure` complete — see [PLAN-measure.md](PLAN-measure.md); `create` complete — see [PLAN-create.md](PLAN-create.md); `resize` complete — see [PLAN-resize.md](PLAN-resize.md); `rebase` and `commit` complete — see [PLAN-rebase-commit.md](PLAN-rebase-commit.md); `map` complete — see [PLAN-map.md](PLAN-map.md); `snapshot` remains.) |
+| 1. `qemu-img` subcommand parity (~~create~~ / ~~map~~ / ~~measure~~ / ~~resize~~ / ~~snapshot~~ / ~~rebase~~ / ~~commit~~) | PLAN-convert-followups-phase-01-subcommands.md (never needed — each subcommand got its own master plan) | Complete (`measure` — see [PLAN-measure.md](PLAN-measure.md); `create` — see [PLAN-create.md](PLAN-create.md); `resize` — see [PLAN-resize.md](PLAN-resize.md); `rebase` and `commit` — see [PLAN-rebase-commit.md](PLAN-rebase-commit.md); `map` — see [PLAN-map.md](PLAN-map.md); `snapshot` — see [PLAN-snapshot.md](PLAN-snapshot.md). The roster is complete; this plan now needs only the phase 2 `check --repair` work.) |
 | 2. `check --repair` wiring | PLAN-convert-followups-phase-02-check-repair.md (not yet written) | Not started |
 
 Subcommands in phase 1 should be split into one phase plan each
@@ -89,8 +89,7 @@ For phase 1 detail planning, the original scope notes from
 - ~~**map**~~ — Shipped. See [PLAN-map.md](PLAN-map.md).
 - ~~**measure**~~ — Shipped. See [PLAN-measure.md](PLAN-measure.md).
 - ~~**resize**~~ — Shipped. See [PLAN-resize.md](PLAN-resize.md).
-- **snapshot** — List, apply, create, delete internal QCOW2
-  snapshots.
+- ~~**snapshot**~~ — Shipped. See [PLAN-snapshot.md](PLAN-snapshot.md).
 - ~~**rebase**~~ — Shipped. See [PLAN-rebase-commit.md](PLAN-rebase-commit.md).
 - ~~**commit**~~ — Shipped. See [PLAN-rebase-commit.md](PLAN-rebase-commit.md).
 

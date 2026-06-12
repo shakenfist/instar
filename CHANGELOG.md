@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **New `instar snapshot` subcommand (PLAN-snapshot phases 1-14).**
+  Manages the internal snapshots of a qcow2 image, mirroring
+  `qemu-img snapshot`'s four modes:
+  `instar snapshot [-l | -c NAME | -a SNAPSHOT | -d SNAPSHOT]
+  [-f FMT] [-q] [-U] [--output={human,json}] FILENAME` (a bare
+  `snapshot FILE` defaults to list, like qemu-img). qcow2-only,
+  matching qemu's format restriction. List mode streams one
+  entry record per snapshot from the guest (no in-memory cap;
+  names up to the 255-byte on-disk maximum list in full — the
+  phase 10 cross-version baselines caught and fixed a
+  pre-release 63-byte parser truncation, commit `c2e1cc6`) and
+  renders byte-identically to `qemu-img snapshot -l`'s modern
+  (≥9.0) layout — local-time DATE column, 4-digit-hour
+  VM_CLOCK, `--` for absent icount — or as a QMP-keyed JSON
+  array (instar extension). The mutating modes run entirely in
+  the KVM sandbox via `write_input_sector` with `fsync_input`
+  barriers between write groups and a single commit point each:
+  create copies the active L1, increments refcounts, clears
+  COPIED flags, and reallocates the snapshot table; delete
+  matches by name only (qemu 10.x's `bdrv_snapshot_find`),
+  compacts the table, decrements, and refreshes COPIED flags;
+  apply matches ID-then-name in two full passes
+  (`find_snapshot_by_id_or_name`) and rewrites the active L1
+  in place. Post-op images are bit-for-bit identical to
+  qemu-img's given identical inputs under `file.discard=ignore`
+  (instar never writes freed clusters). v1 gates: 16-snapshot
+  cap, `refcount_bits=16` only, no refcount-structure growth,
+  compressed / encrypted / external-data / bitmap / dirty
+  images refused for mutation, apply-after-resize refused with
+  a workaround message; names >255 bytes refused loudly where
+  qemu silently truncates. Verified by seven shell harnesses
+  (241 assertions, `make snapshot-harnesses`, wired into the
+  functional-tests workflow), 94 integration tests in
+  `tests/test_snapshot.py` with JSON goldens, cross-version
+  `snapshot-list-human` baselines for 80 qemu-img versions
+  (6.0.0-10.2.0), two coverage-guided fuzz targets
+  (`fuzz_snapshot_parse`, `fuzz_snapshot_refcount`) in the
+  nightly rotation, and the differential fuzzer's `op_snapshot`
+  chain (byte-identity after every chain element). The
+  `CallTable::VERSION` bumped from 16 to 17 for
+  `send_snapshot_entry` / `send_snapshot_result` /
+  `fsync_input`; the new `src/crates/snapshot/` planner crate
+  carries the two-pass refcount mutators, COPIED-flag walker,
+  allocator, and table serialisation helpers. Closes the
+  convert-followups subcommand roster. See
+  [docs/snapshot.md](docs/snapshot.md) for the full reference
+  and `docs/quirks.md` for the documented divergences.
+
 - **`instar map` differential fuzzer extension (PLAN-map phase 8).**
   Adds `op_map` to `scripts/differential-fuzz.py`'s random
   operation chain. For each randomly-generated image (raw
@@ -638,6 +686,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (surfaced and refined by phase 7c source-image tests).
 
 ### Fixed
+
+- **Snapshot list rows over-padded multibyte UTF-8 names.**
+  qemu's `qemu-img snapshot -l` pads the ID and TAG columns with
+  C `printf` minimum field widths, which count **bytes**; the
+  renderer used Rust's `{:<7}` / `{:<16}`, which count chars and
+  over-pad multibyte names (`snäp-名前` drew 9 pad spaces from
+  instar, 4 from qemu). The columns now pad by byte length, so
+  `-l` output is byte-identical for any name qemu can create.
+  Found by PLAN-snapshot phase 13's differential fuzzer on its
+  first smoke run — the phase 10/11 fixture names were all
+  ASCII, where the two semantics agree (commit `5f6a1b9`).
+
+- **Snapshot delete left stale COPIED flags in surviving L2s.**
+  qemu's delete decrement walk also recomputes `OFLAG_COPIED` on
+  every L2 entry it visits and flushes dirty L2s whose clusters
+  were not freed, so an L2 shared between the deleted snapshot
+  and a surviving one lands on disk with refreshed flags.
+  instar's delete refreshed only the active chain, leaving
+  stale COPIED-clear entries in the surviving snapshot's L2 —
+  safe (a spurious COW after a later apply at worst; `qemu-img
+  check` clean) but not byte-identical. Delete now refreshes
+  the deleted chain's staged L2 set and writes back the
+  surviving (refcount > 0) snap-set L2s in its final write
+  group, matching qemu's cache-discard behaviour for freed L2s.
+  Found by the phase 13 differential fuzzer's soak (commit
+  `a5d0767`); a shared-L2 regression scenario joined
+  `tools/snapshot-delete-matrix.sh`.
+
+- **`convert --snapshot` picked the wrong snapshot on
+  ID/name-collision images.** `qcow2::find_snapshot` matched
+  id-or-name per entry and returned the first hit, where
+  qemu's `find_snapshot_by_id_or_name` (the resolver behind
+  `qemu-img convert -l` and `snapshot -a`) makes one full ID
+  pass and only then a name pass. On an image with `id=1
+  name="2"` and `id=2 name="x"`, `instar convert --snapshot 2`
+  extracted the snapshot *named* "2" while qemu extracts ID 2.
+  The matcher is now two full passes; the dead
+  `find_snapshot_streaming` variant was removed. A collision
+  regression test joins the convert suite; the bounded
+  16-entry lookup residual is documented in `docs/quirks.md`
+  (PLAN-snapshot phase 14, probe 1).
+
+- **Zero `date_sec` rendered a blank snapshot DATE column.**
+  qemu feeds a zero `date_sec` through `localtime` and renders
+  the Unix epoch; instar early-returned an empty string,
+  diverging on hand-crafted images (the value is unreachable
+  via either tool's create). The early return is removed and
+  the epoch renders like any other timestamp (PLAN-snapshot
+  phase 14, probe 2; found by phase 13's date-normalization
+  probes).
 
 - **Fuzzing bug backlog (44 issues).** Five categories of fuzz
   findings from coverage-guided and differential fuzzing are
