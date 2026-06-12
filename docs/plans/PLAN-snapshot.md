@@ -982,7 +982,7 @@ qemu-img.
 | 9. Host CLI consolidation and parity: D1 fix (`-U` with mutating modes refused before file access), D2 fix (bare `snapshot FILE` defaults to list), D3 documented (mixed-mode exit-code delta kept as-is), launch consolidation declined (renderer borrow fights the helper boundary), `tools/snapshot-cli-parity.sh` (30 assertions, all passing), quirks docs updated. | PLAN-snapshot-phase-09-mutate-host.md | Landed |
 | 10. Cross-version baselines: snapshot-bearing qcow2 fixtures, `snapshot-list-human` profiles in `generate-baselines.py` (JSON deferred to phase 11 — no qemu source of truth; mutation baselines dropped — column drift already captured by listing frozen fixtures), baseline generation pass for 80 versions. FINDING: snapshot names >63 bytes are truncated by the list parser (bug fixed post-landing: `SnapshotEntry::name` widened to `[u8;256]`, cap raised to `.min(255)`; `snap-qcow2-longname` profile updated to full 200-byte baseline; see "Bugs fixed during this work"). | PLAN-snapshot-phase-10-baselines.md | Landed |
 | 11. Integration tests (`tests/test_snapshot.py`): list matrix, create/delete/apply round-trips, error paths, qcow2-only enforcement, post-op `qemu-img check` clean. **Fixtures, profiles, and manifest tag `snapshots` are ready from phase 10.** JSON golden files for `--output=json` belong here (instar-side self-baseline; no qemu source of truth). 94 tests: 92 pass, 2 skip (qcow2-snapshots: no phase-10 baseline), 0 fail; suite wall time ~1s; JSON goldens in `tests/golden/snapshot-list/`. Test families: (a) list-matrix (b) JSON-goldens + vmstate structural + QMP-key schema (c) mutation round-trips (d) error paths + qcow2-only enforcement (e) empty-table. | PLAN-snapshot-phase-11-integration-tests.md | Landed |
-| 12. Coverage-guided fuzz harnesses: `fuzz_snapshot_parse`, `fuzz_snapshot_refcount` | PLAN-snapshot-phase-12-fuzz-coverage.md | Not started |
+| 12. Coverage-guided fuzz harnesses: `fuzz_snapshot_parse`, `fuzz_snapshot_refcount` | PLAN-snapshot-phase-12-fuzz-coverage.md | Landed |
 | 13. Differential fuzzing extension: random `-c/-d/-a` chain vs qemu-img, structural `qemu-img info` comparison | PLAN-snapshot-phase-13-fuzz-differential.md | Not started |
 | 14. Documentation, CHANGELOG, follow-ups (`docs/snapshot.md`, quirks, usage, ARCHITECTURE, README, AGENTS, `PLAN-convert-followups.md` final strike-through) | PLAN-snapshot-phase-14-docs.md | Not started |
 
@@ -1029,6 +1029,10 @@ recommended sub-agent model per phase:
 - **Phase 12 (coverage fuzz)**: medium effort, opus for
   harness invariants (the "no corruption regardless of
   input" assertion needs care), sonnet for the boilerplate.
+  (As executed: a single fable agent did both — the
+  invariant judgement was the phase's bulk, and two of the
+  plan's pinned invariants needed source-grounded
+  refinement before they were safe to assert.)
 - **Phase 13 (differential fuzz)**: high effort, opus.
   Designing the structural-comparison assertion to be
   strict enough to catch bugs but lenient enough to allow
@@ -1156,6 +1160,9 @@ The plan is complete when:
   run under qemu-img (modulo `date_sec`/`date_nsec`).
 * Coverage-guided fuzz targets `fuzz_snapshot_parse` and
   `fuzz_snapshot_refcount` registered in nightly CI.
+  (Phase 12: both targets registered in the workflow's
+  nightly list and the corpus seeder; the next nightly run
+  picks them up.)
 * Differential fuzzer's random operation chain includes
   `snapshot -c/-d/-a`.
 * `docs/snapshot.md`, `docs/quirks.md`, `docs/usage.md`,

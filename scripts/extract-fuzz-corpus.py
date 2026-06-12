@@ -25,6 +25,7 @@ FORMAT_TO_TARGETS = {
         'fuzz_qcow2_l1l2',
         'fuzz_qcow2_refcount',
         'fuzz_qcow2_decompress',
+        'fuzz_snapshot_parse',
     ],
     'vmdk': ['fuzz_vmdk_header', 'fuzz_vmdk_grain'],
     'vpc': ['fuzz_vhd_footer', 'fuzz_vhd_bat'],
@@ -79,8 +80,187 @@ def copy_seed(src_path, dest_dir, truncate_bytes=None):
     return True
 
 
+def walk_qcow2_snapshot_table(blob, nb_snapshots, max_entries=4096):
+    """Walk a raw qcow2 snapshot table and return its byte length.
+
+    Mirrors the entry walk in the snapshot crate's
+    snapshot_table_byte_len: entries start 8-aligned; each is
+    40 bytes of header + extra_data_size + id_str_size + name_size.
+    Returns None if the walk escapes the blob.
+    """
+    pos = 0
+    for _ in range(min(nb_snapshots, max_entries)):
+        pos = (pos + 7) & ~7
+        if pos + 40 > len(blob):
+            return None
+        extra = int.from_bytes(blob[pos + 36:pos + 40], 'big')
+        id_len = int.from_bytes(blob[pos + 12:pos + 14], 'big')
+        name_len = int.from_bytes(blob[pos + 14:pos + 16], 'big')
+        end = pos + 40 + extra + id_len + name_len
+        if end > len(blob):
+            return None
+        pos = end
+    return pos
+
+
+def build_snapshot_parse_seed(header_sector, nb_snapshots, table):
+    """Build a fuzz_snapshot_parse seed from a header + snapshot table.
+
+    The target's input layout is: device sector 0 (qcow2 header),
+    a control block at 512..544, and the rest of the input is the
+    mock device. The seed relocates the snapshot table to byte
+    1024 and patches the header (nb_snapshots at offset 60,
+    snapshots_offset at 64, both big-endian) so the header-led
+    parse, the header-independent parse (control bytes 512..524)
+    and the pure-table-reader window (control bytes 524..530) all
+    land on the table.
+    """
+    seed = bytearray(1024 + len(table))
+    seed[0:512] = header_sector[:512]
+    seed[60:64] = nb_snapshots.to_bytes(4, 'big')
+    seed[64:72] = (1024).to_bytes(8, 'big')
+    # Control block (little-endian, per the target's doc comment).
+    seed[512:520] = (1024).to_bytes(8, 'little')   # variant-2 snapshots_offset
+    seed[520:524] = nb_snapshots.to_bytes(4, 'little')  # variant-2 nb
+    seed[524:528] = (1024).to_bytes(4, 'little')   # pure-reader window start
+    seed[528:530] = min(nb_snapshots, 0xffff).to_bytes(2, 'little')  # pure nb
+    seed[530] = 0                                   # early stop: never
+    # Needle: point at the first entry's id bytes if decodable.
+    if len(table) >= 40:
+        id_len = int.from_bytes(table[12:14], 'big')
+        extra = int.from_bytes(table[36:40], 'big')
+        seed[531] = min(id_len, 64)
+        seed[532:540] = (1024 + 40 + extra).to_bytes(8, 'little')
+    seed[1024:1024 + len(table)] = table
+    return bytes(seed)
+
+
+def extract_snapshot_parse_seed(src_path, dest_dir):
+    """Snapshot-aware seed extraction for fuzz_snapshot_parse.
+
+    Header-only truncation would chop the snapshot table (it
+    usually lives megabytes into the image), and whole-image
+    copies are skipped above MAX_SEED_SIZE, so snapshot-bearing
+    fixtures get a compact relocated seed: header sector +
+    control block + the snapshot table itself.
+    """
+    try:
+        with open(src_path, 'rb') as f:
+            header = f.read(512)
+            if len(header) < 512:
+                return False
+            nb_snapshots = int.from_bytes(header[60:64], 'big')
+            snapshots_offset = int.from_bytes(header[64:72], 'big')
+            if nb_snapshots == 0 or snapshots_offset == 0:
+                return False
+            if snapshots_offset > os.path.getsize(src_path):
+                return False
+            f.seek(snapshots_offset)
+            blob = f.read(1024 * 1024)
+    except (OSError, IOError):
+        return False
+
+    table_len = walk_qcow2_snapshot_table(blob, nb_snapshots)
+    if table_len is None or table_len == 0:
+        return False
+
+    seed = build_snapshot_parse_seed(header, nb_snapshots, blob[:table_len])
+    os.makedirs(dest_dir, exist_ok=True)
+    name = 'snaptable_' + sha256_hex(seed)
+    dest_path = os.path.join(dest_dir, name)
+    if not os.path.exists(dest_path):
+        with open(dest_path, 'wb') as f:
+            f.write(seed)
+    return True
+
+
+def build_snapshot_refcount_seed(op):
+    """Build one fuzz_snapshot_refcount seed for the given op selector.
+
+    Mirrors the target's 32-byte structured header and sequential
+    pool layout (refblocks, L1-A, L1-B, L2 pool, id, name,
+    old-table window). The staged state is a small consistent
+    image fragment: cluster_bits 9 (512-byte clusters), one
+    refblock, one L1 entry -> L2 table at host 0x800 (flat index
+    4, refcount 1) with one data cluster at host 0x1000 (flat
+    index 8, refcount 1), so the refcount ops, the flag walker
+    and the allocator all take their success paths.
+    """
+    header = bytearray(32)
+    header[0] = op
+    header[1] = 0          # standard L2, helper clears
+    header[2] = 4          # refcount_bits = 16
+    header[3] = 0          # cluster_bits = 9
+    header[4] = 0          # refblock_count = 1
+    header[5] = 1          # one L1 entry
+    header[6] = 1          # L2 slot = 16 bytes (two entries)
+    header[7] = 1          # id_len = 1
+    header[8] = 4          # name_len = 4
+    header[9] = 2          # allocator count = 2
+    header[10:12] = (0).to_bytes(2, 'little')   # helper entry index
+    header[12:20] = (0xffffffffffffffff).to_bytes(8, 'little')  # presence
+    header[20:28] = (0).to_bytes(8, 'little')   # host_refblocks_start
+    header[28] = 1         # old table has one entry
+    header[29] = 0         # cursor refblock seed
+    header[30:32] = (0).to_bytes(2, 'little')   # cursor entry seed
+
+    refblocks = bytearray(512)
+    refblocks[8:10] = (1).to_bytes(2, 'big')    # flat 4 (L2 table) rc = 1
+    refblocks[16:18] = (1).to_bytes(2, 'big')   # flat 8 (data) rc = 1
+    l1a = (0x800).to_bytes(8, 'big')
+    l1b = (0x800).to_bytes(8, 'big')
+    l2 = (0x1000).to_bytes(8, 'big') + (0).to_bytes(8, 'big')
+    id_bytes = b'1'
+    name_bytes = b'snap'
+    old_table = bytearray(1024)
+    old_table[0:8] = (0x800).to_bytes(8, 'big')      # l1_table_offset
+    old_table[8:12] = (1).to_bytes(4, 'big')         # l1_size
+    old_table[12:14] = (1).to_bytes(2, 'big')        # id_str_size
+    old_table[14:16] = (4).to_bytes(2, 'big')        # name_size
+    old_table[36:40] = (24).to_bytes(4, 'big')       # extra_data_size
+    old_table[64:65] = b'9'                          # id
+    old_table[65:69] = b'old '                       # name
+
+    return bytes(header) + bytes(refblocks) + l1a + l1b + l2 + \
+        id_bytes + name_bytes + bytes(old_table)
+
+
 def create_minimal_seeds(corpus_base):
     """Create hand-crafted minimal seed inputs for each target."""
+
+    # fuzz_snapshot_parse: a synthetic snapshot-bearing qcow2
+    # (v3 header + two-entry table), independent of testdata.
+    sp_header = bytearray(512)
+    sp_header[0:4] = b'\x51\x46\x49\xfb'              # magic
+    sp_header[4:8] = (3).to_bytes(4, 'big')           # version 3
+    sp_header[20:24] = (16).to_bytes(4, 'big')        # cluster_bits
+    sp_header[24:32] = (1 << 30).to_bytes(8, 'big')   # virtual_size
+    sp_header[96:100] = (4).to_bytes(4, 'big')        # refcount_order
+    sp_header[100:104] = (112).to_bytes(4, 'big')     # header_length
+    sp_table = bytearray()
+    for i, (sid, sname) in enumerate([(b'1', b'snap1'), (b'2', b'snap2')]):
+        if len(sp_table) % 8 != 0:
+            sp_table += bytes(8 - len(sp_table) % 8)
+        entry = bytearray(40)
+        entry[0:8] = (0x10000 * (i + 1)).to_bytes(8, 'big')  # l1_table_offset
+        entry[8:12] = (1).to_bytes(4, 'big')                 # l1_size
+        entry[12:14] = len(sid).to_bytes(2, 'big')
+        entry[14:16] = len(sname).to_bytes(2, 'big')
+        entry[36:40] = (24).to_bytes(4, 'big')               # extra_data_size
+        sp_table += bytes(entry) + bytes(24) + sid + sname
+    sp_seed = build_snapshot_parse_seed(bytes(sp_header), 2, bytes(sp_table))
+    dest = os.path.join(corpus_base, 'fuzz_snapshot_parse')
+    os.makedirs(dest, exist_ok=True)
+    with open(os.path.join(dest, 'minimal_snapshot_table'), 'wb') as f:
+        f.write(sp_seed)
+
+    # fuzz_snapshot_refcount: one structured-header seed per op
+    # selector (the target is synthetic; no natural seeds exist).
+    dest = os.path.join(corpus_base, 'fuzz_snapshot_refcount')
+    os.makedirs(dest, exist_ok=True)
+    for op in range(8):
+        with open(os.path.join(dest, f'minimal_op{op}'), 'wb') as f:
+            f.write(build_snapshot_refcount_seed(op))
 
     # QCOW2 minimal v2 header (105 bytes minimum)
     qcow2_header = bytearray(512)
@@ -236,6 +416,15 @@ def main():
             if copy_seed(src_path, dest, truncate):
                 copied += 1
 
+        # Snapshot-bearing qcow2 fixtures additionally get a
+        # compact relocated header+table seed (whole-image copies
+        # are skipped above MAX_SEED_SIZE and would bury the
+        # table megabytes into the input).
+        if fmt == 'qcow2':
+            dest = os.path.join(corpus_base, 'fuzz_snapshot_parse')
+            if extract_snapshot_parse_seed(src_path, dest):
+                copied += 1
+
     # Also scan for images not in the manifest (custom/audit/ etc.)
     for root, dirs, files in os.walk(args.testdata):
         for name in files:
@@ -262,6 +451,11 @@ def main():
                 truncate = HEADER_ONLY_TARGETS.get(target)
                 dest = os.path.join(corpus_base, target)
                 if copy_seed(src_path, dest, truncate):
+                    copied += 1
+
+            if fmt == 'qcow2':
+                dest = os.path.join(corpus_base, 'fuzz_snapshot_parse')
+                if extract_snapshot_parse_seed(src_path, dest):
                     copied += 1
 
     # Create minimal hand-crafted seeds
