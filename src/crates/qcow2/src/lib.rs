@@ -1115,76 +1115,38 @@ pub unsafe fn parse_snapshot_table(
 
 /// Find a snapshot by ID or name string.
 ///
+/// Two full passes over the table, matching qemu's
+/// `find_snapshot_by_id_or_name` (the resolver behind both
+/// `qemu-img snapshot -a` and `qemu-img convert -l`): the first
+/// pass compares every entry's **ID**; only if no ID matched does
+/// the second pass compare every entry's **name**. A *later*
+/// entry matching by ID therefore beats an *earlier* entry
+/// matching by name — on a table with `id=1 name="2"` and
+/// `id=2 name="x"`, the needle `2` resolves to ID 2, not to the
+/// snapshot named "2". (The earlier per-entry id-or-name walk
+/// returned the first hit of either kind, which diverged from
+/// qemu on exactly such collision tables; fixed in PLAN-snapshot
+/// phase 14, probe 1.)
+///
 /// Returns the index into `SnapshotTable::entries` if found.
 pub fn find_snapshot(table: &SnapshotTable, needle: &[u8]) -> Option<usize> {
+    // Pass 1: IDs only, over the whole table.
     for i in 0..table.count {
         let entry = &table.entries[i];
-        // Compare against ID
         let id_len = entry.id_len as usize;
         if id_len == needle.len() && entry.id[..id_len] == *needle {
             return Some(i);
         }
-        // Compare against name
+    }
+    // Pass 2: names only, over the whole table.
+    for i in 0..table.count {
+        let entry = &table.entries[i];
         let name_len = entry.name_len as usize;
         if name_len == needle.len() && entry.name[..name_len] == *needle {
             return Some(i);
         }
     }
     None
-}
-
-/// Find a snapshot by ID or name without building the bounded
-/// in-memory table.
-///
-/// Streams over the snapshot table via [`for_each_snapshot_entry`]
-/// and returns the first entry whose id-or-name matches `needle`.
-/// Mirrors [`find_snapshot`]'s comparison rules (id first, then
-/// name; exact-length match required).
-///
-/// Returns `None` if no match is found or if a read error aborts
-/// the iteration before a match.
-///
-/// # Safety
-///
-/// `call_table` must be valid. `cache_buf` must point to at least
-/// `MAX_SECTOR_SIZE` writable bytes.
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn find_snapshot_streaming(
-    call_table: &CallTable,
-    device_idx: u32,
-    nb_snapshots: u32,
-    snapshots_offset: u64,
-    sector_size: usize,
-    input_capacity: u64,
-    cache_buf: *mut u8,
-    bytes_read: &mut u64,
-    needle: &[u8],
-) -> Option<SnapshotEntry> {
-    let mut found: Option<SnapshotEntry> = None;
-    for_each_snapshot_entry(
-        call_table,
-        device_idx,
-        nb_snapshots,
-        snapshots_offset,
-        sector_size,
-        input_capacity,
-        cache_buf,
-        bytes_read,
-        |entry| {
-            let id_len = entry.id_len as usize;
-            if id_len == needle.len() && entry.id[..id_len] == *needle {
-                found = Some(*entry);
-                return false;
-            }
-            let name_len = entry.name_len as usize;
-            if name_len == needle.len() && entry.name[..name_len] == *needle {
-                found = Some(*entry);
-                return false;
-            }
-            true
-        },
-    );
-    found
 }
 
 /// Convert a parsed [`SnapshotEntry`] into the wire-FFI
@@ -4369,14 +4331,15 @@ mod tests {
         );
     }
 
-    // ---- Streaming find tests ------------------------------------
+    // ---- Streaming parser fixture ---------------------------------
 
     /// A self-contained streaming snapshot fixture in memory.
     ///
-    /// Builds a small qcow2-style snapshot table in a fixed buffer,
-    /// installs a `CallTable` whose `read_input_sector` services
-    /// reads from the buffer, then exercises
-    /// `find_snapshot_streaming` against it.
+    /// Builds a small qcow2-style snapshot table in a fixed buffer
+    /// and installs a `CallTable` whose `read_input_sector` services
+    /// reads from the buffer, so streaming-parser tests (e.g. the
+    /// 200-byte-name round trip above) can exercise
+    /// `for_each_snapshot_entry` without a real device.
     struct StreamingFixture {
         // Static-sized buffer big enough for a few small entries.
         buf: [u8; 4096],
@@ -4403,15 +4366,6 @@ mod tests {
         let fixture_ptr = core::ptr::addr_of!(STREAMING_FIXTURE.buf) as *const u8;
         core::ptr::copy_nonoverlapping(fixture_ptr.add(start), out_buf, sector_size);
         true
-    }
-
-    unsafe extern "C" fn streaming_read_sector_fail(
-        _device_idx: u32,
-        _sector: u64,
-        _out_buf: *mut u8,
-        _sector_size: usize,
-    ) -> bool {
-        false
     }
 
     /// Write one snapshot entry into the fixture buffer at `offset`
@@ -4621,122 +4575,58 @@ mod tests {
         }
     }
 
-    #[test]
-    fn streaming_find_by_id() {
-        let _guard = STREAMING_LOCK.lock().unwrap();
-        unsafe {
-            let buf = &raw mut STREAMING_FIXTURE.buf;
-            for b in (*buf).iter_mut() {
-                *b = 0;
-            }
-            let mut next = write_entry(&mut *buf, 0, b"1", b"first");
-            next = write_entry(&mut *buf, next, b"2", b"second");
-            let _ = next;
-            let ct = make_streaming_call_table();
-            let mut cache = [0u8; 512];
-            let mut bytes = 0u64;
-            let found = find_snapshot_streaming(
-                &ct,
-                0,
-                2,
-                0,
-                512,
-                8, // input_capacity in sectors
-                cache.as_mut_ptr(),
-                &mut bytes,
-                b"2",
-            );
-            let f = found.expect("found by id");
-            assert_eq!(f.id_len, 1);
-            assert_eq!(&f.id[..1], b"2");
-            assert_eq!(f.name_len, 6);
-            assert_eq!(&f.name[..6], b"second");
+    // ---- find_snapshot (two-pass ID-then-name) tests ---------------
+
+    /// Build an in-memory `SnapshotTable` from (id, name) pairs.
+    fn table_with(entries: &[(&[u8], &[u8])]) -> SnapshotTable {
+        let mut table = SnapshotTable::empty();
+        for (id, name) in entries {
+            let mut e = SnapshotEntry::zeroed();
+            e.id_len = id.len() as u16;
+            e.id[..id.len()].copy_from_slice(id);
+            e.name_len = name.len() as u16;
+            e.name[..name.len()].copy_from_slice(name);
+            table.entries[table.count] = e;
+            table.count += 1;
         }
+        table
     }
 
     #[test]
-    fn streaming_find_by_name() {
-        let _guard = STREAMING_LOCK.lock().unwrap();
-        unsafe {
-            let buf = &raw mut STREAMING_FIXTURE.buf;
-            for b in (*buf).iter_mut() {
-                *b = 0;
-            }
-            let mut next = write_entry(&mut *buf, 0, b"1", b"alpha");
-            next = write_entry(&mut *buf, next, b"2", b"beta");
-            let _ = next;
-            let ct = make_streaming_call_table();
-            let mut cache = [0u8; 512];
-            let mut bytes = 0u64;
-            let found = find_snapshot_streaming(
-                &ct,
-                0,
-                2,
-                0,
-                512,
-                8,
-                cache.as_mut_ptr(),
-                &mut bytes,
-                b"beta",
-            );
-            let f = found.expect("found by name");
-            assert_eq!(&f.name[..f.name_len as usize], b"beta");
-        }
+    fn find_snapshot_later_id_beats_earlier_name() {
+        // The probe-1 collision shape: `id=1 name="2"` then
+        // `id=2 name="x"`. qemu's two-full-pass matcher resolves
+        // the needle "2" to ID 2 (index 1), not to the earlier
+        // entry *named* "2" (index 0). The pre-fix per-entry walk
+        // returned index 0 here.
+        let table = table_with(&[(b"1", b"2"), (b"2", b"x")]);
+        assert_eq!(find_snapshot(&table, b"2"), Some(1));
+        // The mirrored collision: a later entry's NAME does not
+        // outrank an earlier entry's ID either — "1" is an ID hit
+        // on the first pass.
+        let table = table_with(&[(b"1", b"x"), (b"2", b"1")]);
+        assert_eq!(find_snapshot(&table, b"1"), Some(0));
     }
 
     #[test]
-    fn streaming_find_no_match() {
-        let _guard = STREAMING_LOCK.lock().unwrap();
-        unsafe {
-            let buf = &raw mut STREAMING_FIXTURE.buf;
-            for b in (*buf).iter_mut() {
-                *b = 0;
-            }
-            let next = write_entry(&mut *buf, 0, b"1", b"alpha");
-            let _ = next;
-            let ct = make_streaming_call_table();
-            let mut cache = [0u8; 512];
-            let mut bytes = 0u64;
-            let found = find_snapshot_streaming(
-                &ct,
-                0,
-                1,
-                0,
-                512,
-                8,
-                cache.as_mut_ptr(),
-                &mut bytes,
-                b"missing",
-            );
-            assert!(found.is_none());
-        }
+    fn find_snapshot_name_only_fallback() {
+        // No ID matches the needle, so the second (name) pass
+        // resolves it — including a needle that looks numeric.
+        let table = table_with(&[(b"1", b"alpha"), (b"2", b"beta")]);
+        assert_eq!(find_snapshot(&table, b"beta"), Some(1));
+        let table = table_with(&[(b"1", b"7"), (b"2", b"x")]);
+        assert_eq!(find_snapshot(&table, b"7"), Some(0));
     }
 
     #[test]
-    fn streaming_find_read_error() {
-        let _guard = STREAMING_LOCK.lock().unwrap();
-        unsafe {
-            // CallTable whose read always fails — streaming aborts and
-            // returns None.
-            let ct = shared::CallTable {
-                read_input_sector: streaming_read_sector_fail,
-                ..stub_call_table()
-            };
-            let mut cache = [0u8; 512];
-            let mut bytes = 0u64;
-            let found = find_snapshot_streaming(
-                &ct,
-                0,
-                1,
-                0,
-                512,
-                8,
-                cache.as_mut_ptr(),
-                &mut bytes,
-                b"anything",
-            );
-            assert!(found.is_none());
-        }
+    fn find_snapshot_not_found() {
+        let table = table_with(&[(b"1", b"alpha")]);
+        assert_eq!(find_snapshot(&table, b"missing"), None);
+        // Prefix of a name is not an exact-length match.
+        assert_eq!(find_snapshot(&table, b"alph"), None);
+        // Empty table.
+        let table = table_with(&[]);
+        assert_eq!(find_snapshot(&table, b"1"), None);
     }
 }
 

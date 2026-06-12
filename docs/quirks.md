@@ -1433,6 +1433,30 @@ provides this data" mode (see
 plans/PLAN-rebase-commit-phase-08-commit-host.md)) can
 plug in without an ABI change.
 
+## convert subcommand quirks
+
+### `--snapshot` resolves ID-then-name over a bounded 16-entry table
+
+`instar convert --snapshot ARG` resolves `ARG` with the same
+two-full-pass matcher as `qemu-img convert -l` (qemu's
+`find_snapshot_by_id_or_name`, shared with `snapshot -a`): one
+full pass over the snapshot table comparing **IDs**, then — only
+if no ID matched — a second full pass comparing **names**. A
+later entry matching by ID beats an earlier entry matching by
+name; see the `snapshot -a` matcher-asymmetry table below for
+the collision example. (Before PLAN-snapshot phase 14, instar
+returned the first per-entry id-or-name hit, which picked the
+wrong snapshot on ID/name-collision images.)
+
+**Residual divergence**: the lookup walks the bounded in-memory
+table from `parse_snapshot_table`, which caps at 16 entries
+(`MAX_SNAPSHOTS`). A snapshot stored beyond the first 16 table
+entries is reported not-found by `instar convert --snapshot`
+where `qemu-img convert -l` finds it. This is the same v1
+16-snapshot cap family as the snapshot subcommand's create cap
+(see "16-snapshot cap" under the `snapshot -c` quirks); raising
+it is future work.
+
 ## snapshot subcommand quirks
 
 ### Bare `snapshot FILE` defaults to list mode (D2)
