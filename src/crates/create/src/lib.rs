@@ -742,7 +742,18 @@ pub fn plan_vhd<'a>(
     opts: &VhdCreateOpts<'_>,
     scratch: &'a mut [u8],
 ) -> Result<MetadataPlan<'a>, CreateError> {
-    if opts.virtual_size == 0 {
+    // The largest virtual size VHD can represent, matching qemu's
+    // `block/vpc.c` `VHD_MAX_SECTORS` (0xFF000000 sectors = 2040 GiB):
+    // `qemu-img create -f vpc` accepts exactly this size and rejects one
+    // sector more. The check sits before the subformat split so it covers
+    // both Fixed and Dynamic. Without it the Fixed branch places the footer
+    // at byte_offset == virtual_size, so a virtual_size near u64::MAX makes
+    // `total_metadata_bytes + minimum_file_size` overflow u64 (the Dynamic
+    // branch was already protected, incidentally, by its u32 BAT-entry count
+    // overflowing first).
+    const VHD_MAX_VIRTUAL_SIZE: u64 = 0xFF00_0000 * 512;
+
+    if opts.virtual_size == 0 || opts.virtual_size > VHD_MAX_VIRTUAL_SIZE {
         return Err(CreateError::InvalidVirtualSize);
     }
     if opts.backing.is_some() {
@@ -1467,6 +1478,52 @@ mod vhd_plan_tests {
             plan_vhd(&opts, &mut scratch),
             Err(CreateError::InvalidBlockSize)
         ));
+    }
+
+    #[test]
+    fn plan_vhd_rejects_oversize_virtual_size() {
+        // VHD tops out at 0xFF000000 sectors (2040 GiB): `qemu-img create
+        // -f vpc` accepts exactly this and rejects one sector more. Without
+        // the cap, a Fixed VHD places its footer at byte_offset ==
+        // virtual_size, so a virtual_size near u64::MAX makes
+        // total_metadata_bytes + minimum_file_size overflow u64 — the
+        // fuzz_create_emitters invariant-3 panic (instar #353 #355 #357 #361
+        // #362 #363 #367). The cap sits before the subformat split, so it
+        // rejects oversize inputs for both Fixed and Dynamic before any
+        // subformat-specific work runs.
+        const VHD_MAX: u64 = 0xFF00_0000 * 512;
+        let mut scratch = vec![0u8; VHD_MAX_METADATA_SCRATCH];
+
+        // The boundary value is accepted for Fixed (it needs only a footer's
+        // worth of scratch, so no materialisation is required to confirm).
+        let plan = plan_vhd(&default_fixed(VHD_MAX), &mut scratch).expect("max is accepted");
+        assert!(plan
+            .total_metadata_bytes
+            .checked_add(plan.minimum_file_size)
+            .is_some());
+
+        // One sector past the cap is rejected for both subformats.
+        for opts in [default_fixed(VHD_MAX + 512), default_dynamic(VHD_MAX + 512)] {
+            assert!(matches!(
+                plan_vhd(&opts, &mut scratch),
+                Err(CreateError::InvalidVirtualSize)
+            ));
+        }
+
+        // The exact fuzz reproducer virtual_sizes are all rejected rather
+        // than producing a plan that trips invariant 3.
+        for vsize in [
+            0xffff_ffff_ffff_fd80u64, // #367
+            0xffff_ffff_ffff_fd00,    // #363 / #362
+            0xffff_ffff_ffff_fdff,    // #361 / #357
+            0xffff_ffff_ffff_fdc1,    // #355
+            0xffff_ffff_ffff_fc02,    // #353
+        ] {
+            assert!(matches!(
+                plan_vhd(&default_fixed(vsize), &mut scratch),
+                Err(CreateError::InvalidVirtualSize)
+            ));
+        }
     }
 
     #[test]
