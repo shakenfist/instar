@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -4002,6 +4003,103 @@ class TestConvertSnapshot(InstarTestBase):
                 cmp_rc, 0,
                 f'Snapshot ID 1 differs from snap1: '
                 f'{cmp_out}'
+            )
+
+    def test_convert_snapshot_id_name_collision(self):
+        """``--snapshot 2`` resolves ID 2 on a collision image.
+
+        qemu's convert ``-l`` resolver
+        (``find_snapshot_by_id_or_name``) makes one full pass over
+        the table comparing IDs, then a second pass comparing
+        names: a later entry matching by ID beats an earlier entry
+        matching by name. Build an image with id=1 name="2"
+        (content 0xAA) and id=2 name="x" (content 0xBB);
+        extracting snapshot "2" must yield ID 2's 0xBB content,
+        matching ``qemu-img convert -l 2``. Regression test for
+        the PLAN-snapshot phase 14 two-pass ``find_snapshot``
+        fix (probe 1).
+        """
+        if shutil.which('qemu-io') is None:
+            self.skipTest('qemu-io not available')
+
+        with tempfile.TemporaryDirectory() as td:
+            image = Path(td) / 'collision.qcow2'
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 str(image), '1M'],
+                capture_output=True, text=True,
+                timeout=30, check=True
+            )
+            # Content 0xAA, then a snapshot named "2"
+            # (auto-assigned ID 1).
+            subprocess.run(
+                ['qemu-io', '-c', 'write -P 0xaa 0 64k',
+                 str(image)],
+                capture_output=True, text=True,
+                timeout=30, check=True
+            )
+            subprocess.run(
+                ['qemu-img', 'snapshot', '-c', '2',
+                 str(image)],
+                capture_output=True, text=True,
+                timeout=30, check=True
+            )
+            # Content 0xBB, then a snapshot named "x"
+            # (auto-assigned ID 2).
+            subprocess.run(
+                ['qemu-io', '-c', 'write -P 0xbb 0 64k',
+                 str(image)],
+                capture_output=True, text=True,
+                timeout=30, check=True
+            )
+            subprocess.run(
+                ['qemu-img', 'snapshot', '-c', 'x',
+                 str(image)],
+                capture_output=True, text=True,
+                timeout=30, check=True
+            )
+
+            raw_out = Path(td) / 'instar.raw'
+            qemu_raw = Path(td) / 'qemu.raw'
+
+            stdout, stderr, rc = self.run_instar_convert(
+                image, raw_out, snapshot='2'
+            )
+            self.assertEqual(
+                rc, 0,
+                f'Collision convert failed: {stderr}'
+            )
+
+            subprocess.run(
+                [
+                    'qemu-img', 'convert',
+                    '-l', '2',
+                    '-f', 'qcow2', '-O', 'raw',
+                    str(image), str(qemu_raw),
+                ],
+                capture_output=True, text=True,
+                timeout=30, check=True
+            )
+
+            # Byte-compare against qemu-img's extraction.
+            cmp_out, _, cmp_rc = self.run_instar_compare(
+                raw_out, qemu_raw
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Collision snapshot differs from qemu-img: '
+                f'{cmp_out}'
+            )
+
+            # Direction-explicit: the extracted bytes are the
+            # 0xBB pattern captured by ID 2, not the 0xAA
+            # pattern of the snapshot *named* "2".
+            with open(raw_out, 'rb') as f:
+                first = f.read(1)
+            self.assertEqual(
+                first, b'\xbb',
+                'Expected ID-2 content (0xBB); the ID pass '
+                'must beat the earlier name match'
             )
 
     def test_convert_nonexistent_snapshot(self):

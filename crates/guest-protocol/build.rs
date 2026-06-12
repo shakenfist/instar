@@ -49,6 +49,19 @@ fn main() {
         micropb_gen::Config::new().max_bytes(48),
     );
 
+    // Snapshot names match qemu-img's QCOW_MAX_SNAPSHOT_NAME (256
+    // bytes including the nul; instar carries them without the
+    // nul so 256 is the cap). Snapshot IDs are decimal strings;
+    // 32 is generous.
+    generator.configure(
+        ".guest.SnapshotEntryMessage.name",
+        micropb_gen::Config::new().max_bytes(256),
+    );
+    generator.configure(
+        ".guest.SnapshotResultMessage.assigned_id",
+        micropb_gen::Config::new().max_bytes(64),
+    );
+
     // Generate the Rust module
     generator
         .compile_protos(&[proto_file], out_dir.join("guest.rs"))

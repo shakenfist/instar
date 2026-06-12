@@ -62,7 +62,7 @@ if ! check_size "$RELEASE_DIR/core.bin" "$CORE_MAX_SIZE" "core.bin (0x10000-0x20
 fi
 
 # Check operation binaries
-for op in info copy check compare convert measure create rebase resize commit; do
+for op in info copy check compare convert measure create rebase resize commit snapshot; do
     if ! check_size "$RELEASE_DIR/${op}.bin" "$OPERATION_MAX_SIZE" "${op}.bin (0x20000-0x80000)"; then
         failed=1
     fi

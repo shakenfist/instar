@@ -1315,6 +1315,139 @@
             "tags": ["raw", "security", "cve", "json", "format-confusion"],
             "cve_references": ["CVE-2024-4467"],
             "generated_by": "instar-testdata/scripts/create-cve-reproducer-testdata.py"
+        },
+
+        {
+            "id": "snap-qcow2-v3-one",
+            "path": "custom/snapshots/snap-qcow2-v3-one.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "qcow2 v3 with 64 KiB clusters and one snapshot (PLAN-snapshot phase 10)",
+            "tags": ["qcow2", "snapshots", "v3"],
+            "sha256": "f5301993d6d070696481020cd0010541b3f6902fdc9689006128ee1c88a92cae",
+            "generated_by": "instar-testdata/scripts/create-snapshot-testdata.py"
+        },
+        {
+            "id": "snap-qcow2-v3-two",
+            "path": "custom/snapshots/snap-qcow2-v3-two.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "qcow2 v3 with two snapshots and divergent writes between them (PLAN-snapshot phase 10)",
+            "tags": ["qcow2", "snapshots", "v3", "multi-snapshot"],
+            "sha256": "e51cb8af2ce3e6800cef96db48921d15cc118373895c2e54c13743bdb16f8d94",
+            "generated_by": "instar-testdata/scripts/create-snapshot-testdata.py"
+        },
+        {
+            "id": "snap-qcow2-v3-sixteen",
+            "path": "custom/snapshots/snap-qcow2-v3-sixteen.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "qcow2 v3 with sixteen snapshots (instar v1 cap boundary; PLAN-snapshot phase 10)",
+            "tags": ["qcow2", "snapshots", "v3", "multi-snapshot", "cap-boundary"],
+            "sha256": "67a3fab7e7179b5ea2d4a04b9e09bece549b85350b8d1b8c8764bf0cb3f30e04",
+            "generated_by": "instar-testdata/scripts/create-snapshot-testdata.py"
+        },
+        {
+            "id": "snap-qcow2-v2",
+            "path": "custom/snapshots/snap-qcow2-v2.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "qcow2 v2 (compat=0.10) with one snapshot (PLAN-snapshot phase 10)",
+            "tags": ["qcow2", "snapshots", "version-2"],
+            "sha256": "17e9c1ee970a0f649d12b3b0befbf24b762666ba407ef9f7d72a540632716d6c",
+            "generated_by": "instar-testdata/scripts/create-snapshot-testdata.py"
+        },
+        {
+            "id": "snap-qcow2-extl2",
+            "path": "custom/snapshots/snap-qcow2-extl2.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "qcow2 with extended-L2 enabled and one snapshot (PLAN-snapshot phase 10)",
+            "tags": ["qcow2", "snapshots", "extended-l2"],
+            "sha256": "edf8665da414a7c13744d867f52036574ddb98c3fe97c0593ad35dae9bd28345",
+            "generated_by": "instar-testdata/scripts/create-snapshot-testdata.py"
+        },
+        {
+            "id": "snap-qcow2-512",
+            "path": "custom/snapshots/snap-qcow2-512.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "qcow2 with 512-byte clusters and two snapshots (PLAN-snapshot phase 10)",
+            "tags": ["qcow2", "snapshots", "small-clusters"],
+            "sha256": "2ff1a4901d70d9840f237b6a912173ac3e18eee3477daf29caa38a56ec8302a7",
+            "generated_by": "instar-testdata/scripts/create-snapshot-testdata.py"
+        },
+        {
+            "id": "snap-qcow2-backing-base",
+            "path": "custom/snapshots/snap-qcow2-backing-base.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "Backing base image for snap-qcow2-backing; also serves as the snapshot-list empty-case (no snapshots, exit 0) for PLAN-snapshot phase 10",
+            "tags": ["qcow2", "snapshots", "backing-file", "base", "empty-case"],
+            "sha256": "514f90c36f83a80e6717cf7d9e21ca51dac4201c43567068e73090e339cb0abf",
+            "generated_by": "instar-testdata/scripts/create-snapshot-testdata.py"
+        },
+        {
+            "id": "snap-qcow2-backing",
+            "path": "custom/snapshots/snap-qcow2-backing.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "qcow2 overlay with relative backing file and one snapshot (PLAN-snapshot phase 10)",
+            "tags": ["qcow2", "snapshots", "backing-file", "overlay"],
+            "sha256": "62d61891a5fcbd60f0b43689e467e3aebd88f88a016e9470892070844f856fda",
+            "generated_by": "instar-testdata/scripts/create-snapshot-testdata.py"
+        },
+        {
+            "id": "snap-qcow2-dupname",
+            "path": "custom/snapshots/snap-qcow2-dupname.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "qcow2 with two snapshots sharing the same name (IDs 1 and 2; PLAN-snapshot phase 10)",
+            "tags": ["qcow2", "snapshots", "duplicate-name"],
+            "sha256": "c4e3a7786d6cb57ea81fb377ded01378f768c9e20829ae3de47791ca3e8665fe",
+            "generated_by": "instar-testdata/scripts/create-snapshot-testdata.py"
+        },
+        {
+            "id": "snap-qcow2-namecollision",
+            "path": "custom/snapshots/snap-qcow2-namecollision.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "qcow2 with id=1,name=2 and id=2,name=x — matching-asymmetry fixture for phase 11 (PLAN-snapshot phase 10)",
+            "tags": ["qcow2", "snapshots", "name-collision"],
+            "sha256": "13a9a26006911c0dd3a1131ff4c0730c4f37c4476ef6751ee392aed417b790c1",
+            "generated_by": "instar-testdata/scripts/create-snapshot-testdata.py"
+        },
+        {
+            "id": "snap-qcow2-longname",
+            "path": "custom/snapshots/snap-qcow2-longname.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "qcow2 with a 200-byte snapshot name and an ID patched to 9999 (column-overflow test; PLAN-snapshot phase 10)",
+            "tags": ["qcow2", "snapshots", "long-name"],
+            "sha256": "8fc145e2cd574f074b6a55d70ffb5969c1d93d193dac7dc395a512ee5a0249e9",
+            "generated_by": "instar-testdata/scripts/create-snapshot-testdata.py"
+        },
+        {
+            "id": "snap-qcow2-vmstate",
+            "path": "custom/snapshots/snap-qcow2-vmstate.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "qcow2 with hand-patched metadata: vm_state_size=1MiB, vm_clock_nsec=3661500000000 (01:01:01.500), icount=12345 (PLAN-snapshot phase 10)",
+            "tags": ["qcow2", "snapshots", "vm-state", "vm-clock", "icount"],
+            "sha256": "1608dd5d333b7e7a68caa08c9c5aaac34157b5942b8e3e3c83e4ecde05be3b66",
+            "generated_by": "instar-testdata/scripts/create-snapshot-testdata.py"
         }
     ]
 }

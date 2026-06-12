@@ -626,3 +626,46 @@ pub fn send_map_result(result: &shared::MapResult) {
     );
     send_message(&msg);
 }
+
+/// Send a single snapshot entry message.
+///
+/// Called once per snapshot during the snapshot operation's
+/// list mode, before the terminating [`send_snapshot_result`].
+pub fn send_snapshot_entry(record: &shared::SnapshotEntryRecord) {
+    let id_end = (record.id_len as usize).min(record.id.len());
+    let name_end = (record.name_len as usize).min(record.name.len());
+    let id = core::str::from_utf8(&record.id[..id_end]).unwrap_or("");
+    let name = core::str::from_utf8(&record.name[..name_end]).unwrap_or("");
+    let msg = guest_protocol::snapshot_entry_message(
+        id,
+        name,
+        record.l1_table_offset,
+        record.l1_size,
+        record.date_sec_hi,
+        record.date_sec_lo,
+        record.date_nsec,
+        record.vm_clock_nsec,
+        record.vm_state_size_large,
+        record.disk_size,
+        record.icount,
+        record.extra_data_size,
+    );
+    send_message(&msg);
+}
+
+/// Send the snapshot operation's terminator summary.
+///
+/// Called once per invocation, after the last
+/// [`send_snapshot_entry`] (or as the only call for the mutating
+/// modes).
+pub fn send_snapshot_result(result: &shared::SnapshotResult) {
+    let id_end = (result.assigned_id_len as usize).min(result.assigned_id.len());
+    let assigned_id = core::str::from_utf8(&result.assigned_id[..id_end]).unwrap_or("");
+    let msg = guest_protocol::snapshot_result_message(
+        result.mode,
+        result.error,
+        result.snapshots_emitted,
+        assigned_id,
+    );
+    send_message(&msg);
+}

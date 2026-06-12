@@ -54,7 +54,9 @@ mod status {
 // Use shared constants directly where types match
 use shared_virtio::desc_flags::{NEXT as VIRTQ_DESC_F_NEXT, WRITE as VIRTQ_DESC_F_WRITE};
 use shared_virtio::request_status::OK as VIRTIO_BLK_S_OK;
-use shared_virtio::request_type::{IN as VIRTIO_BLK_T_IN, OUT as VIRTIO_BLK_T_OUT};
+use shared_virtio::request_type::{
+    FLUSH as VIRTIO_BLK_T_FLUSH, IN as VIRTIO_BLK_T_IN, OUT as VIRTIO_BLK_T_OUT,
+};
 use shared_virtio::QUEUE_SIZE_MAX;
 
 // Use shared queue size
@@ -220,6 +222,23 @@ impl VirtioBlock {
         let mut buf = [0u8; MAX_SECTOR_SIZE];
         buf[..self.sector_size].copy_from_slice(&buffer[..self.sector_size]);
         self.do_request(VIRTIO_BLK_T_OUT, sector, &mut buf[..self.sector_size])
+    }
+
+    /// Request a host-side `fdatasync` of the backing file.
+    ///
+    /// Used by mutating snapshot modes (and, eventually, commit)
+    /// between the data-write pass and the header-pointer flip
+    /// to enforce qemu's "old table still valid until header
+    /// updated" durability contract.
+    ///
+    /// Issues a `VIRTIO_BLK_T_FLUSH` request on the same
+    /// 3-descriptor chain `do_request` uses; the host VMM block
+    /// emulator (`src/vmm/src/virtio/block.rs`) reads the data
+    /// descriptor for layout reasons but ignores its contents
+    /// for FLUSH and calls `File::sync_all()` on the backing.
+    pub fn flush(&mut self) -> bool {
+        let mut buf = [0u8; MAX_SECTOR_SIZE];
+        self.do_request(VIRTIO_BLK_T_FLUSH, 0, &mut buf[..self.sector_size])
     }
 
     fn do_request(&mut self, req_type: u32, sector: u64, buffer: &mut [u8]) -> bool {

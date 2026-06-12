@@ -27,12 +27,13 @@ Initial target formats:
 
 **Initial implementation** - The `info` prototype has been promoted to the main
 instar implementation in `src/`. Operations include `info`, `copy`, `check`,
-`compare`, `convert`, `measure`, `create`, `resize`, `rebase`, and `commit`.
-Prototypes remain available for reference.
+`compare`, `convert`, `measure`, `create`, `resize`, `rebase`, `commit`,
+`map`, and `snapshot`. Prototypes remain available for reference.
 
 See [docs/measure.md](docs/measure.md), [docs/create.md](docs/create.md),
-[docs/resize.md](docs/resize.md), [docs/rebase.md](docs/rebase.md), and
-[docs/commit.md](docs/commit.md) for the per-subcommand user guides.
+[docs/resize.md](docs/resize.md), [docs/rebase.md](docs/rebase.md),
+[docs/commit.md](docs/commit.md), [docs/map.md](docs/map.md), and
+[docs/snapshot.md](docs/snapshot.md) for the per-subcommand user guides.
 
 ## Installation
 
@@ -381,6 +382,30 @@ extent is classified as data, zero-allocated, or hole. Window flags
 image v1; backing-chain `depth` composition is deferred. See
 [docs/map.md](docs/map.md) for the full reference.
 
+### Internal Snapshots
+
+```bash
+# List snapshots (byte-identical to qemu-img snapshot -l)
+instar snapshot -l disk.qcow2
+
+# Create / apply / delete a snapshot
+instar snapshot -c before-upgrade disk.qcow2
+instar snapshot -a before-upgrade disk.qcow2
+instar snapshot -d before-upgrade disk.qcow2
+
+# JSON listing (instar extension; QMP SnapshotInfo key names)
+instar snapshot -l --output=json disk.qcow2
+```
+
+Manages the internal snapshot table of a qcow2 image (qcow2 only,
+like qemu-img). All parsing and every mutation — refcounts, L1
+copies, COPIED flags, header writes — runs inside the KVM guest.
+Mutating modes produce images bit-for-bit identical to `qemu-img
+snapshot` given identical inputs (modulo documented freed-cluster
+and file-tail notes). See [docs/snapshot.md](docs/snapshot.md)
+for the full reference, including the `-d` (name-only) vs `-a`
+(ID-then-name) matcher asymmetry and the v1 limits.
+
 ### Version Compatibility
 
 Different qemu-img versions produce slightly different output formats:
@@ -556,6 +581,10 @@ make fuzz-build
 
 # Run a single target for a bounded wall-clock budget (seconds; default 60)
 make fuzz-run FUZZ_TARGET=fuzz_resize_planners FUZZ_DURATION=300
+
+# Run the seven snapshot shell harnesses (live differential
+# verification against qemu-img; needs a built instar + /dev/kvm)
+make snapshot-harnesses
 ```
 
 See the "Coverage-Guided Fuzzing" section below for the target list and the
@@ -574,8 +603,14 @@ oversized virtual sizes, VMDK grain sizes, VHDX dual headers, BAT beyond EOF),
 and format confusion attacks (polyglot files, truncated headers, VMDK
 descriptor attacks). CVE reproduction tests verify that 6 known qemu-img CVEs
 (CVE-2024-32498, CVE-2015-5163, CVE-2022-47951, CVE-2015-5162, CVE-2014-0223,
-CVE-2024-4467) are fully mitigated by instar's architecture. Test images are in
-the sibling `instar-testdata/` repository.
+CVE-2024-4467) are fully mitigated by instar's architecture.
+`tests/test_snapshot.py` (phase 11) adds 94 snapshot-subcommand tests: the
+12-image list matrix against cross-version baselines, 12 JSON golden
+comparisons with a structural cross-check, mutation round-trips
+(create/delete/apply) with `qemu-img check` post-op assertions, error paths
+and qcow2-only enforcement, and empty-table behaviour. JSON goldens live in
+`tests/golden/snapshot-list/`. Test images are in the sibling
+`instar-testdata/` repository.
 
 **Running:**
 ```bash
@@ -599,8 +634,10 @@ instar/
 │   │   ├── vhd/    # VHD footer, dynamic header, BAT parsing
 │   │   ├── vhdx/   # VHDX headers, region table, metadata, BAT, CRC-32C
 │   │   ├── vmdk/   # VMDK4 header and descriptor parsing
-│   │   └── luks/   # LUKS header parsing, KDF, AFsplitter, decryption
-│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, measure, create, resize)
+│   │   ├── luks/   # LUKS header parsing, KDF, AFsplitter, decryption
+│   │   └── ...     # Per-operation planner crates (measure, create,
+│   │               # resize, rebase, commit, snapshot)
+│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, measure, create, resize, rebase, commit, map, snapshot)
 │   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates
 │   └── guest-protocol/ # Protocol Buffers messaging for guests
@@ -797,10 +834,12 @@ cd src/fuzz
 cargo fuzz run fuzz_qcow2_header -- -max_total_time=60
 ```
 
-17 fuzz targets cover all parser crates (QCOW2, VMDK, VHD, VHDX, RAW,
+22 fuzz targets cover all parser crates (QCOW2, VMDK, VHD, VHDX, RAW,
 LUKS) including header parsing, L1/L2 lookup, refcount traversal, and
-decompression, plus the create and resize planners. Seed the corpus
-from `instar-testdata`:
+decompression, plus the create / resize / rebase / commit planners,
+the map extent walkers, the snapshot table parser
+(`fuzz_snapshot_parse`), and the snapshot refcount mutators
+(`fuzz_snapshot_refcount`). Seed the corpus from `instar-testdata`:
 
 ```bash
 python3 scripts/extract-fuzz-corpus.py --testdata /path/to/instar-testdata

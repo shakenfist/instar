@@ -17,7 +17,8 @@ Usage:
         [--seed 42] \
         [--workdir /tmp/fuzz] \
         [--timeout 30] \
-        [--log-dir ./fuzz-logs]
+        [--log-dir ./fuzz-logs] \
+        [--ops snapshot,resize]
 """
 
 import argparse
@@ -25,6 +26,7 @@ import hashlib
 import json
 import logging
 import random
+import re
 import shutil
 import struct
 import subprocess
@@ -46,7 +48,7 @@ DATA_PATTERNS = ['zeros', 'random', 'sparse', 'mbr']
 
 # Operations that the fuzzer can chain together
 OPERATIONS = ['info', 'check', 'convert', 'convert_compressed', 'measure',
-              'create', 'resize', 'rebase', 'commit', 'map']
+              'create', 'resize', 'rebase', 'commit', 'map', 'snapshot']
 
 # Known divergence categories to skip (unsafe quirks)
 # See docs/quirks.md for rationale
@@ -2075,13 +2077,565 @@ def _run_qemu_io(args, timeout=30):
 
 
 # ---------------------------------------------------------------------------
+# op_snapshot: instar snapshot -c/-d/-a chains vs qemu-img
+# (PLAN-snapshot phase 13)
+# ---------------------------------------------------------------------------
+
+# Fixed NONZERO date written into every live snapshot-table entry's
+# date_sec / date_nsec after each successful create, on BOTH sides
+# (phase 13 probe 3). Nonzero matters: with date_sec == 0,
+# `instar snapshot -l` prints a blank DATE column while
+# `qemu-img snapshot -l` renders the epoch in local time (degenerate
+# input; see docs/quirks.md). With 0x60000000 both tools print
+# '2021-01-14 19:25:36' (host-local) and -l output is byte-identical.
+SNAPSHOT_NORM_DATE_SEC = 0x60000000
+SNAPSHOT_NORM_DATE_NSEC = 0
+
+# Name pool for `-c` chain elements: a 255-byte name (qemu's creation
+# cap; never over), names with spaces, UTF-8 multibyte names, and an
+# ID-like name ('2' — the -d-name-only vs -a-ID-first asymmetry is
+# prime differential territory). Duplicate names arise naturally from
+# repeated picks (first-match delete semantics). Never empty.
+SNAPSHOT_NAME_POOL = [
+    'alpha', 'beta', 'gamma',
+    '2',
+    'snap with spaces',
+    'snäp-名前',
+    'L' * 255,
+]
+
+# Module-level qemu-img version cache (startup probe, not a
+# build-time constant — contributors may run older distros than the
+# CI container, whose Debian-stable qemu-utils tracks the 10.0.x
+# series the phase 6-8 harnesses pinned).
+_QEMU_IMG_VERSION = None
+
+# Keys for one-shot log messages (version-gate skips), so they print
+# once per run instead of once per fuzz iteration.
+_LOGGED_ONCE = set()
+
+
+def _log_once(key, msg, *args):
+    """Emit `logger.info(msg, *args)` the first time `key` is seen."""
+    if key not in _LOGGED_ONCE:
+        _LOGGED_ONCE.add(key)
+        logger.info(msg, *args)
+
+
+def qemu_img_version():
+    """Parse and cache `qemu-img --version` as a (major, minor) tuple.
+
+    Returns (0, 0) when the version cannot be determined, which fails
+    both of op_snapshot's version gates closed (the op skips).
+    """
+    global _QEMU_IMG_VERSION
+    if _QEMU_IMG_VERSION is None:
+        out, _err, rc = run_qemu_img(['--version'], [], timeout=10)
+        match = re.search(r'version\s+(\d+)\.(\d+)', out)
+        if rc == 0 and match:
+            _QEMU_IMG_VERSION = (int(match.group(1)),
+                                 int(match.group(2)))
+        else:
+            _QEMU_IMG_VERSION = (0, 0)
+    return _QEMU_IMG_VERSION
+
+
+def _snapshot_next_id(live):
+    """Mirror qemu's find_new_snapshot_id: max numeric ID + 1."""
+    max_id = 0
+    for sid, _name in live:
+        if sid.isdigit():
+            max_id = max(max_id, int(sid))
+    return str(max_id + 1)
+
+
+def _snapshot_pick_arg(rng, live):
+    """Pick a -d / -a argument biased toward existing snapshots.
+
+    Existing names (3x weight) exercise the happy paths; existing IDs
+    (2x) are valid for -a but not-found for -d under qemu >= 4.0
+    name-only delete semantics; bogus names and random numeric IDs
+    keep failure-op parity (probe 4) in the mix.
+    """
+    choices = ['no-such-snapshot', str(rng.randint(1, 20))]
+    if live:
+        entry = rng.choice(live)
+        choices = [entry[1]] * 3 + [entry[0]] * 2 + choices
+    return rng.choice(choices)
+
+
+# Divergence-avoidance table. Each documented instar<->qemu snapshot
+# divergence (docs/quirks.md, snapshot sections) is avoided by
+# generation, never absorbed by weakening the comparator:
+#
+# | Avoided input | Behaviour difference | docs/quirks.md entry |
+# |---|---|---|
+# | `-c ''` (empty name) | qemu accepts; instar refuses | "snapshot
+# |   -c (create) quirks" — names >255 bytes refused, empty name
+# |   likewise refused. Pool has no empty names. |
+# | `-c` name > 255 bytes | qemu silently truncates; instar refuses
+# |   | same entry. Pool tops out at exactly 255 bytes. |
+# | 17th live snapshot | qemu allows; instar
+# |   ERROR_SNAPSHOT_TABLE_FULL | "snapshot -c quirks" —
+# |   16-snapshot cap. Picker simulates the live table and only
+# |   offers 'create' while count < 16. |
+# | resize within a chain | qemu's later -a truncates; instar
+# |   refuses (ERROR_L1_SIZE_MISMATCH); instar resize on
+# |   snapshot-bearing images is open future work | "snapshot -a
+# |   quirks" — apply to a since-resized image refused. No resize
+# |   chain element exists. |
+# | dirty / compressed / encrypted / external-data / bitmap images
+# |   | instar mutating modes refuse (ERROR_UNSUPPORTED_FEATURE)
+# |   | "snapshot -c quirks" — dirty/compressed/external-data/
+# |   encryption/bitmaps refused. Avoidance is structural: plain
+# |   `qemu-img create` bases never produce these. |
+# | refcount_bits != 16 | instar mutating modes refuse | "snapshot
+# |   -c quirks" — refcount_bits != 16 refused. The qemu-img
+# |   default is 16; the picker never overrides refcount_order. |
+# | 512-byte clusters above 4M | chains exhaust the image's
+# |   present refblocks; instar v1 never allocates new refblocks
+# |   or grows the refcount table (qemu grows both and succeeds)
+# |   | "snapshot -c quirks" — create may exhaust the image's
+# |   existing refblocks. 512-byte clusters pair only with 4M
+# |   images, the phase 6-8 matrix pairing. |
+#
+# Divergences HANDLED by the comparator (not avoided): freed-cluster
+# discard (qemu side runs file.discard=ignore), date stamps
+# (per-step normalization, probes 2/3), the sector-granular file
+# tail (zero-tail tolerance), stderr wording (exit codes only,
+# probe 4).
+def _snapshot_chain_picker(rng):
+    """Pick (base_opts, chain) for one snapshot-chain iteration.
+
+    base_opts mirrors the phase 6-8 matrix dimensions
+    (tools/snapshot-*-matrix.sh): cluster_size in {512, 4096, 65536};
+    compat in {1.1, 0.10}; extended_l2 only with 64k clusters and
+    compat 1.1; size in {4M, 16M, 64M} (4M only for 512-byte
+    clusters — avoidance row 7 below); an optional backing file;
+    plus 0-2 seed writes so creates capture real data.
+
+    chain is 1-8 elements: ['create', NAME], ['delete', ARG],
+    ['apply', ARG], ['write', OFFSET, LENGTH, PATTERN]. The picker
+    simulates the live snapshot table (create appends with qemu's
+    max-numeric-ID+1 assignment; delete removes the first name
+    match, mirroring bdrv_snapshot_find's name-only semantics) so
+    the create guard can hold the live count under instar's
+    16-snapshot v1 cap (avoidance table above).
+    """
+    cluster_size = rng.choice([512, 4096, 65536])
+    compat = rng.choice(['1.1', '0.10'])
+    extended_l2 = (cluster_size == 65536 and compat == '1.1'
+                   and rng.random() < 0.3)
+    # Avoidance row 7: 512-byte clusters only pair with 4M images
+    # (exactly the phase 6-8 matrix pairing). instar v1 never
+    # allocates new refblocks or grows the refcount table
+    # (docs/quirks.md, "Create may exhaust the image's existing
+    # refblocks"), so at 512-byte clusters a larger image's
+    # per-create L1 copy (32 clusters at 64M) exhausts the base
+    # image's present refblocks within a few creates while qemu
+    # grows the refcount structures and succeeds. Found by the
+    # first 500-iteration soak: every divergence was a create on a
+    # cluster_size=512 / 64M image failing ERROR_ALLOCATION_FAILED
+    # under instar with qemu rc 0.
+    size = rng.choice(['4M']) if cluster_size == 512 else (
+        rng.choice(['4M', '16M', '64M']))
+    backing = rng.random() < 0.25
+    size_bytes = _resize_parse_qemu_size(size)
+
+    def pick_write():
+        length = rng.choice([4096, 65536, 131072])
+        offset = (rng.randint(0, size_bytes - length) // 4096) * 4096
+        return ['write', offset, length, rng.randint(1, 255)]
+
+    base_opts = {
+        'cluster_size': cluster_size,
+        'compat': compat,
+        'extended_l2': extended_l2,
+        'size': size,
+        'backing': backing,
+        'seed_writes': [pick_write()
+                        for _ in range(rng.randint(0, 2))],
+    }
+
+    live = []  # simulated table: list of (id, name)
+    chain = []
+    for _ in range(rng.randint(1, 8)):
+        kinds = ['delete', 'apply', 'write']
+        if len(live) < 16:
+            kinds += ['create', 'create', 'create']
+        kind = rng.choice(kinds)
+        if kind == 'create':
+            name = rng.choice(SNAPSHOT_NAME_POOL)
+            live.append((_snapshot_next_id(live), name))
+            chain.append(['create', name])
+        elif kind == 'delete':
+            arg = _snapshot_pick_arg(rng, live)
+            for idx, (_sid, name) in enumerate(live):
+                if name == arg:
+                    del live[idx]
+                    break
+            chain.append(['delete', arg])
+        elif kind == 'apply':
+            chain.append(['apply', _snapshot_pick_arg(rng, live)])
+        else:
+            chain.append(pick_write())
+    return base_opts, chain
+
+
+def _snapshot_normalize_table(path):
+    """Normalize the live snapshot table's tool-divergent dead bytes:
+    dates and inter-entry alignment padding.
+
+    Dates: patch every entry's date_sec / date_nsec to the fixed
+    nonzero sentinel (probe 3 — each tool stamps its own wall
+    clock; zero would expose the zero-date `-l` renderer quirk).
+
+    Padding: zero the up-to-7 alignment bytes between an entry's
+    end and the next entry's 8-aligned start. instar serializes the
+    whole table with zeroed gaps (`build_snapshot_table`); qemu's
+    `qcow2_write_snapshots` writes each entry field-by-field and
+    never touches the pad bytes, so a table reallocated into a
+    reused (freed, dirty) cluster keeps stale bytes there under
+    qemu. Found by the first phase 13 soak: a create-after-apply
+    chain reallocated the table into a freed data cluster and
+    diverged by exactly the 2 pad bytes after a 70-byte entry.
+    Both images are valid — the padding is dead bytes — so this is
+    comparator-handled like the freed-cluster discard rule, not an
+    instar bug (see docs/quirks.md).
+
+    Called immediately after every successful create AND delete
+    (both rewrite the table), on BOTH images. Per-step, NOT
+    end-of-chain: when a later operation reallocates the snapshot
+    table, both tools leave the old table's bytes — embedding each
+    tool's own timestamps and padding — in the freed cluster, so
+    normalizing only at chain end leaves divergent residue
+    (probe 2). Normalizing the live table per step means all later
+    residue inherits the normalized bytes.
+
+    The entry walk mirrors walk_qcow2_snapshot_table in
+    scripts/extract-fuzz-corpus.py. Returns True on success, False
+    if the header or table walk escapes (a structural anomaly the
+    caller reports as a divergence).
+    """
+    with open(path, 'r+b') as f:
+        header = f.read(72)
+        if len(header) < 72 or header[0:4] != b'QFI\xfb':
+            return False
+        nb_snapshots = int.from_bytes(header[60:64], 'big')
+        snapshots_offset = int.from_bytes(header[64:72], 'big')
+        if nb_snapshots == 0:
+            return True
+        if snapshots_offset == 0:
+            return False
+        f.seek(snapshots_offset)
+        blob = f.read(1024 * 1024)
+        pos = 0
+        patch_offsets = []
+        pad_ranges = []
+        for _ in range(nb_snapshots):
+            aligned = (pos + 7) & ~7
+            if aligned > pos:
+                pad_ranges.append((snapshots_offset + pos,
+                                   aligned - pos))
+            pos = aligned
+            if pos + 40 > len(blob):
+                return False
+            patch_offsets.append(snapshots_offset + pos + 16)
+            extra = int.from_bytes(blob[pos + 36:pos + 40], 'big')
+            id_len = int.from_bytes(blob[pos + 12:pos + 14], 'big')
+            name_len = int.from_bytes(blob[pos + 14:pos + 16], 'big')
+            pos = pos + 40 + extra + id_len + name_len
+            if pos > len(blob):
+                return False
+        stamp = struct.pack('>II', SNAPSHOT_NORM_DATE_SEC,
+                            SNAPSHOT_NORM_DATE_NSEC)
+        for off in patch_offsets:
+            f.seek(off)
+            f.write(stamp)
+        for off, length in pad_ranges:
+            f.seek(off)
+            f.write(bytes(length))
+    return True
+
+
+def _snapshot_compare_bytes(inst_path, qemu_path):
+    """Byte-identity check ported from the phase 6-8 harnesses'
+    assert_byte_identical (tools/snapshot-*-matrix.sh): the files
+    must agree over their common prefix, and the longer file's tail
+    must be all zero (the sector-granular file-tail quirk —
+    docs/quirks.md, "The created file may be physically larger than
+    qemu-img's"). Returns None on identity or a detail dict.
+    """
+    inst_len = inst_path.stat().st_size
+    qemu_len = qemu_path.stat().st_size
+    common = min(inst_len, qemu_len)
+    with open(inst_path, 'rb') as fa, open(qemu_path, 'rb') as fb:
+        offset = 0
+        while offset < common:
+            n = min(1 << 20, common - offset)
+            a = fa.read(n)
+            b = fb.read(n)
+            if a != b:
+                first = next(i for i in range(len(a))
+                             if a[i] != b[i])
+                return {
+                    'kind': 'prefix_mismatch',
+                    'offset': offset + first,
+                    'instar_byte': a[first],
+                    'qemu_byte': b[first],
+                    'instar_len': inst_len,
+                    'qemu_len': qemu_len,
+                }
+            offset += n
+        longer, longer_side = ((fa, 'instar') if inst_len > qemu_len
+                               else (fb, 'qemu'))
+        longer.seek(common)
+        while True:
+            chunk = longer.read(1 << 20)
+            if not chunk:
+                break
+            if chunk.count(0) != len(chunk):
+                return {
+                    'kind': 'nonzero_tail',
+                    'side': longer_side,
+                    'instar_len': inst_len,
+                    'qemu_len': qemu_len,
+                }
+    return None
+
+
+def _snapshot_qemu_image_opts(path):
+    """qemu-img side image spec: protocol-level discard disabled so
+    qemu leaves stale bytes in freed clusters exactly like instar
+    does (docs/quirks.md, "Freed-cluster bytes may differ from
+    qemu-img's", under both -d and -a). With discard suppressed the
+    post-op images are bit-for-bit identical (phase 6-8 harnesses;
+    probes 1-2).
+    """
+    return f'driver=qcow2,file.filename={path},file.discard=ignore'
+
+
+def op_snapshot(instar_bin, instar_copy, qemu_copy, fmt, timeout,
+                rng):
+    """Apply a random create/delete/apply/write chain to identical
+    qcow2 images via instar and qemu-img; demand byte-identical
+    results after every element (the phase 6-8 matrix methodology
+    ported from tools/snapshot-*-matrix.sh).
+
+    instar_copy / qemu_copy / fmt are part of the standard op_*
+    signature but unused — snapshot builds its own image pair via
+    `_snapshot_chain_picker`, per the resize/commit precedent.
+    """
+    # Version gate (a): the whole op requires qemu >= 4.0. instar
+    # implements modern name-only delete semantics
+    # (bdrv_snapshot_find); older qemu-img resolved delete arguments
+    # ID-first via the since-removed
+    # bdrv_snapshot_delete_by_id_or_name (docs/quirks.md, "-d
+    # matches by NAME only" cross-version note).
+    version = qemu_img_version()
+    if version < (4, 0):
+        _log_once(
+            'snapshot-version-skip',
+            'op_snapshot: qemu-img %d.%d < 4.0, skipping '
+            'snapshot chains', version[0], version[1])
+        return None
+
+    base_opts, chain = _snapshot_chain_picker(rng)
+
+    has_writes = base_opts['seed_writes'] or any(
+        el[0] == 'write' for el in chain)
+    if has_writes and shutil.which('qemu-io') is None:
+        return None  # same posture as op_commit's seed step
+
+    iter_dir = instar_copy.parent
+    base_path = iter_dir / 'snap-base.qcow2'
+    inst_path = iter_dir / 'snap-instar.qcow2'
+    qemu_path = iter_dir / 'snap-qemu.qcow2'
+
+    def context(idx=None):
+        ctx = {'base_options': base_opts, 'chain': chain}
+        if idx is not None:
+            ctx['element_index'] = idx
+            ctx['element'] = chain[idx]
+        return ctx
+
+    def write_both(off, length, pattern, paths):
+        for path in paths:
+            _, st, rc = _run_qemu_io(
+                ['-f', 'qcow2', '-c',
+                 f'write -P {pattern} {off} {length}', str(path)],
+                timeout=timeout)
+            if rc != 0:
+                return {'path': str(path), 'write_rc': rc,
+                        'stderr': st[:500]}
+        return None
+
+    # 1. Build the base (and optional backing) ONCE via qemu-img so
+    # both sides start from identical bytes; copy to the two sides.
+    create_args = ['-f', 'qcow2',
+                   '-o', f'cluster_size={base_opts["cluster_size"]}',
+                   '-o', f'compat={base_opts["compat"]}']
+    if base_opts['extended_l2']:
+        create_args += ['-o', 'extended_l2=on']
+    if base_opts['backing']:
+        backing_path = iter_dir / 'snap-backing.qcow2'
+        _, st, rc = run_qemu_img(
+            ['create'],
+            ['-f', 'qcow2', str(backing_path), base_opts['size']],
+            timeout=timeout)
+        if rc != 0:
+            return dict(context(),
+                        type='snapshot_fixture_create_failed',
+                        side='backing', stderr=st[:500])
+        # Both copies reference the SAME backing path (master plan
+        # point 6: internal snapshots compose with backing files
+        # without walking the chain).
+        create_args += ['-b', str(backing_path), '-F', 'qcow2']
+    _, st, rc = run_qemu_img(
+        ['create'], create_args + [str(base_path), base_opts['size']],
+        timeout=timeout)
+    if rc != 0:
+        return dict(context(), type='snapshot_fixture_create_failed',
+                    side='base', stderr=st[:500])
+
+    for wr in base_opts['seed_writes']:
+        err = write_both(wr[1], wr[2], wr[3], [base_path])
+        if err:
+            return dict(context(),
+                        type='snapshot_fixture_create_failed',
+                        side='seed_write', **err)
+
+    shutil.copy2(base_path, inst_path)
+    shutil.copy2(base_path, qemu_path)
+
+    # 2. Run the chain element by element.
+    for idx, element in enumerate(chain):
+        kind = element[0]
+        if kind == 'write':
+            _kind, off, length, pattern = element
+            err = write_both(off, length, pattern,
+                             [inst_path, qemu_path])
+            if err:
+                return dict(context(idx),
+                            type='snapshot_write_failed', **err)
+        else:
+            flag = {'create': '-c', 'delete': '-d',
+                    'apply': '-a'}[kind]
+            arg = element[1]
+            _i_out, i_err, i_rc = run_instar(
+                instar_bin, ['snapshot'],
+                [flag, arg, str(inst_path)], timeout=timeout)
+            _q_out, q_err, q_rc = run_qemu_img(
+                ['snapshot'],
+                [flag, arg, '--image-opts',
+                 _snapshot_qemu_image_opts(qemu_path)],
+                timeout=timeout)
+            # Failure ops (e.g. not-found delete/apply) compare exit
+            # codes ONLY — stderr wording differs by design (probe
+            # 4: instar explains the matcher semantics, qemu says
+            # "snapshot not found") and is never compared.
+            div = compare_exit_codes(
+                i_rc, q_rc, 'snapshot',
+                dict(context(idx),
+                     instar_stderr=i_err[:500],
+                     qemu_stderr=q_err[:500]))
+            if div:
+                return div
+            if kind in ('create', 'delete') and i_rc == 0:
+                # Per-step table normalization (probes 2 and 3,
+                # plus the inter-entry padding finding — see
+                # _snapshot_normalize_table): patch the LIVE tables
+                # on both sides now, so any residue a later table
+                # reallocation leaves behind already carries
+                # normalized bytes. End-of-chain normalization is
+                # NOT sufficient (probe 2: freed-table residue
+                # embeds each tool's own timestamps). Create and
+                # delete both rewrite the table; apply does not.
+                for path in (inst_path, qemu_path):
+                    if not _snapshot_normalize_table(path):
+                        return dict(
+                            context(idx),
+                            type='snapshot_normalize_failed',
+                            path=str(path))
+        # Byte-compare after EVERY element so the earliest diverging
+        # element is the one reported.
+        mismatch = _snapshot_compare_bytes(inst_path, qemu_path)
+        if mismatch:
+            return dict(context(idx),
+                        type='snapshot_byte_divergence', **mismatch)
+
+    # 3. Chain-end secondary net: check / compare / -l. Byte
+    # identity above is the primary oracle; these mostly diagnose
+    # what a byte divergence would mean.
+    for side, path in (('instar', inst_path), ('qemu', qemu_path)):
+        c_out, c_err, c_rc = run_qemu_img(
+            ['check'], [str(path)], timeout=timeout)
+        if c_rc != 0:
+            return dict(context(), type='snapshot_check_divergence',
+                        side=side, check_rc=c_rc,
+                        check_stdout=c_out[:500],
+                        check_stderr=c_err[:500])
+
+    cmp_out, cmp_err, cmp_rc = run_qemu_img(
+        ['compare'], [str(inst_path), str(qemu_path)],
+        timeout=timeout)
+    if cmp_rc != 0:
+        return dict(context(), type='snapshot_compare_divergence',
+                    compare_rc=cmp_rc,
+                    compare_stdout=cmp_out[:500],
+                    compare_stderr=cmp_err[:500])
+
+    return _snapshot_compare_list_output(
+        instar_bin, inst_path, timeout, context)
+
+
+def _snapshot_compare_list_output(instar_bin, inst_path, timeout,
+                                  context):
+    """Version-gated -l stdout equality: `instar snapshot -l` vs
+    `qemu-img snapshot -l` on the SAME (instar) image, isolating
+    renderer parity from image bytes.
+
+    Version gate (b): requires qemu >= 9.0 — qemu 8.x prints
+    `VM SIZE` / 2-digit clock hours while instar implements the 9.0
+    layout (docs/quirks.md, "Cross-version listing format"). Below
+    9.0 the check silently skips (logged once); byte identity still
+    carries the oracle.
+    """
+    version = qemu_img_version()
+    if version < (9, 0):
+        _log_once(
+            'snapshot-list-skip',
+            'op_snapshot: qemu-img %d.%d < 9.0, skipping -l '
+            'stdout comparison (byte identity still applies)',
+            version[0], version[1])
+        return None
+
+    il_out, il_err, il_rc = run_instar(
+        instar_bin, ['snapshot'], ['-l', str(inst_path)],
+        timeout=timeout)
+    ql_out, ql_err, ql_rc = run_qemu_img(
+        ['snapshot'], ['-l', str(inst_path)], timeout=timeout)
+    if il_rc != 0 or ql_rc != 0 or il_out != ql_out:
+        return dict(context(), type='snapshot_list_divergence',
+                    instar_rc=il_rc, qemu_rc=ql_rc,
+                    instar_stdout=il_out[:1000],
+                    qemu_stdout=ql_out[:1000],
+                    instar_stderr=il_err[:500],
+                    qemu_stderr=ql_err[:500])
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Single iteration
 # ---------------------------------------------------------------------------
 
 def run_iteration(instar_bin, workdir, rng, iteration, timeout,
-                   libyal_tools=None):
+                   libyal_tools=None, operations=None):
     """Run one fuzzing iteration. Returns (divergence_dict, attrs) or
     (None, attrs) on success.
+
+    `operations` restricts the op pool for this run (the --ops CLI
+    filter); None means all of OPERATIONS.
     """
     iter_dir = workdir / f'iter-{iteration:06d}'
     iter_dir.mkdir(parents=True, exist_ok=True)
@@ -2098,8 +2652,9 @@ def run_iteration(instar_bin, workdir, rng, iteration, timeout,
 
         # Pick a random set of 2-4 operations to run independently
         # on the same input image
+        op_pool = operations if operations else OPERATIONS
         num_ops = rng.randint(2, 4)
-        ops = [rng.choice(OPERATIONS) for _ in range(num_ops)]
+        ops = [rng.choice(op_pool) for _ in range(num_ops)]
         attrs['operations'] = ops
 
         for op in ops:
@@ -2150,6 +2705,11 @@ def run_iteration(instar_bin, workdir, rng, iteration, timeout,
                 )
             elif op == 'map':
                 div = op_map(
+                    instar_bin, instar_copy, qemu_copy, fmt,
+                    timeout, rng,
+                )
+            elif op == 'snapshot':
+                div = op_snapshot(
                     instar_bin, instar_copy, qemu_copy, fmt,
                     timeout, rng,
                 )
@@ -2317,6 +2877,11 @@ def main():
         help='Exit on first divergence (default: continue and report)',
     )
     parser.add_argument(
+        '--ops', type=str, default=None,
+        help='Comma-separated subset of operations to run '
+             f'(default: all). Valid: {", ".join(OPERATIONS)}',
+    )
+    parser.add_argument(
         '--create-issues', action='store_true',
         help='File GitHub issues immediately as divergences are found '
              '(requires gh CLI and GH_TOKEN)',
@@ -2336,6 +2901,20 @@ def main():
     log_dir = Path(args.log_dir).resolve()
     seed = args.seed if args.seed is not None else random.randint(0, 2**32 - 1)
 
+    # Validate the --ops filter against OPERATIONS at startup.
+    operations = None
+    if args.ops is not None:
+        operations = [o.strip() for o in args.ops.split(',')
+                      if o.strip()]
+        invalid = sorted(set(operations) - set(OPERATIONS))
+        if invalid or not operations:
+            print(
+                f'Error: invalid --ops value {args.ops!r}; valid '
+                f'operations: {", ".join(OPERATIONS)}',
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
     # Verify qemu-img is available
     try:
         subprocess.run(
@@ -2353,6 +2932,8 @@ def main():
     logger.info('  instar:      %s', instar_bin)
     logger.info('  timeout:    %ds', args.timeout)
     logger.info('  log file:   %s', log_file)
+    logger.info('  ops:        %s',
+                ','.join(operations) if operations else 'all')
 
     # Detect libyal tools (optional — graceful degradation)
     libyal_tools = detect_libyal_tools()
@@ -2393,7 +2974,7 @@ def main():
             try:
                 div, attrs = run_iteration(
                     instar_bin, workdir, iter_rng, i, args.timeout,
-                    libyal_tools=libyal_tools,
+                    libyal_tools=libyal_tools, operations=operations,
                 )
             except Exception as exc:
                 logger.warning(

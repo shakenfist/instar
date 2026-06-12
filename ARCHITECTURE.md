@@ -469,6 +469,49 @@ provides a modular architecture with:
   suite that catches accidental fixes to known instar-vs-
   qemu-img gaps so `KNOWN_MAP_DIVERGENCES` doesn't go stale.
   Phase 6 baseline: 95 active tests + 91 documented skips.
+- **operations/snapshot/** - Internal-snapshot operation
+  (PLAN-snapshot, qcow2-only like `qemu-img snapshot`). Reads a
+  `SnapshotConfig` (mode discriminator, argument bytes, flags,
+  and for create the host-stamped `date_sec`/`date_nsec`) from
+  `OPERATION_CONFIG_ADDR`, opens the image RW as input device 0,
+  and dispatches on mode. MODE_LIST streams one
+  `SnapshotEntryRecord` per table entry via the qcow2 crate's
+  `for_each_snapshot_entry` (no in-memory cap; one entry
+  resident at a time) followed by a `SnapshotResult` terminator;
+  the host renderer produces byte-identical
+  `qemu-img snapshot -l` output (modern ≥9.0 layout, local-time
+  DATE column, byte-measured ID/TAG padding) or the
+  `--output=json` QMP-keyed extension. The mutating modes
+  (MODE_CREATE / MODE_DELETE / MODE_APPLY) compose the
+  `src/crates/snapshot/` planner primitives — two-pass
+  dry-run-then-apply refcount mutators, the COPIED-flag walker,
+  the contiguous-cluster allocator, and the table
+  serialisation/compaction helpers — into per-mode
+  `fsync_input`-separated write groups with a single commit
+  point each (create/delete: the 12-byte header write at offset
+  60; apply: the raw L1 overwrite). Delete matches by name only;
+  apply and `convert --snapshot` match ID-then-name in two full
+  passes (qemu's asymmetry — docs/quirks.md). Uniform feature
+  gates refuse `refcount_bits != 16`, compressed clusters,
+  encryption, external data files, bitmaps, and dirty images;
+  v1 caps the table at 16 snapshots and never grows the
+  refcount structures. Post-op images are bit-for-bit identical
+  to qemu-img's under `file.discard=ignore` (see
+  docs/qcow2/qcow2-snapshots.md for the write orderings and
+  docs/snapshot.md for the user reference). Binary builds at
+  ~55 KiB / 384 KiB. Verification: seven shell harnesses
+  (`tools/snapshot-*.sh`, 241 assertions, `make
+  snapshot-harnesses`, run in CI by functional-tests);
+  `tests/test_snapshot.py` (phase 11) adds 94 tests covering
+  the five snapshot families: list-matrix (12 images, TZ=UTC,
+  profile-resolved), JSON goldens with structural cross-check
+  and QMP-key schema pin, mutation round-trips
+  (create/delete/apply with post-op qemu-img check), error
+  paths and qcow2-only enforcement, and empty-table behaviour
+  (JSON goldens live in `tests/golden/snapshot-list/`); two
+  coverage-guided fuzz targets (`fuzz_snapshot_parse`,
+  `fuzz_snapshot_refcount`); and the differential fuzzer's
+  `op_snapshot` chain (byte-identity after every element).
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation,
@@ -488,6 +531,15 @@ provides a modular architecture with:
   guest read from the same device it writes to — the first
   in-place-mutation primitive, reusable by `rebase` / `commit`
   / snapshot-delete) and `send_resize_result`. Same
+  append-at-end discipline. Phase 1 of `PLAN-snapshot.md` adds
+  `SnapshotConfig` (magic `b"SNAP"`, carrying the mode, the
+  snapshot name/needle argument, and the create-mode
+  `date_sec`/`date_nsec` wall-clock fields) / `SnapshotResult` /
+  the `SnapshotEntryRecord` wire record, and three more CallTable
+  entries — `send_snapshot_entry` (streams one listed snapshot
+  per call), `send_snapshot_result`, and `fsync_input` (the
+  guest-visible write barrier the mutating modes use between
+  write groups) — bumping CallTable VERSION from 16 to 17, same
   append-at-end discipline.
 
 **Chain validation in check (`--chain`):**
@@ -817,7 +869,7 @@ A mock `CallTable` (in `src/fuzz/src/lib.rs`) backed by thread-local
 fuzzer input provides sector-based I/O, allowing libFuzzer to explore
 deeply malformed inputs.
 
-18 fuzz targets cover all parser crates: format detection, header
+22 fuzz targets cover all parser crates: format detection, header
 parsing (QCOW2, VMDK, VHD, VHDX, RAW, LUKS), L1/L2 cluster lookup,
 refcount table traversal, zlib decompression, grain directory lookup,
 BAT traversal, VHDX metadata parsing, the measure subcommand's
@@ -837,7 +889,13 @@ via the matching parser crate) and the resize subcommand's planners
 (`fuzz_resize_planners` — exercises `plan_resize_raw` / `_qcow2` /
 `_vmdk` / `_vhd` / `_vhdx`, asserting plan-level patch invariants:
 bounded patch count, no offset+len overflow, every patch ends
-within `total_file_size`, no overlapping Writes).
+within `total_file_size`, no overlapping Writes). The rebase and
+commit planners have equivalent targets (`fuzz_rebase_planners`,
+`fuzz_commit_planners`), and the snapshot subcommand adds
+`fuzz_snapshot_parse` (the streaming snapshot-table parser plus
+the pure table readers) and `fuzz_snapshot_refcount` (the
+refcount mutators, COPIED-flag walker, allocator, and table
+round-trip under semantic invariants).
 
 The seed corpus is extracted from `instar-testdata` by
 `scripts/extract-fuzz-corpus.py`, which filters images by format and

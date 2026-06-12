@@ -17,7 +17,7 @@ instar/
 │   ├── core/       # Core guest initialization
 │   ├── crates/     # Shared format crates (qcow2, raw, vmdk, vhd, vhdx, luks)
 │   ├── shared/     # Shared library code (byte-order helpers, configs)
-│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, measure, create, resize)
+│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, measure, create, resize, rebase, commit, map, snapshot)
 │   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates (guest-protocol)
 ├── prototypes/     # Experimental implementations (11 KVM prototypes)
@@ -107,6 +107,26 @@ vhdx (VHDX), luks (info + convert with decryption)
   chain `depth` always 0, `--image-opts` rejected). Window flags
   `--start-offset` / `--max-length` clip the emission range. See
   [docs/map.md](docs/map.md) for the full reference.
+- `snapshot`: manage the internal snapshots of a qcow2 image
+  (qcow2-only, like `qemu-img snapshot`). `-l` lists
+  (byte-identical to qemu-img's modern layout; `--output=json`
+  is an instar extension with QMP `SnapshotInfo` key names);
+  `-c` / `-d` / `-a` create, delete, and apply snapshots
+  entirely inside the KVM guest — refcount mutations, L1
+  copies, COPIED-flag rewrites, and the header commit point are
+  all guest-side writes with `fsync` barriers between groups.
+  Delete matches by name only; apply matches ID-then-name in
+  two full passes (qemu's matcher asymmetry). Mutating modes
+  refuse `refcount_bits != 16`, compressed clusters,
+  encryption, external data files, bitmaps, and dirty images;
+  v1 caps the table at 16 snapshots. Post-op images are
+  bit-for-bit identical to qemu-img's given identical inputs
+  (modulo documented freed-cluster / file-tail notes —
+  docs/quirks.md). Verified by seven shell harnesses
+  (`make snapshot-harnesses`, 241 assertions, also run in CI),
+  `tests/test_snapshot.py`, two coverage-guided fuzz targets,
+  and the differential fuzzer's `op_snapshot` chain. See
+  [docs/snapshot.md](docs/snapshot.md) for the full reference.
 
 ## Working on This Project
 
@@ -293,6 +313,12 @@ make clean-tests
 - `tests/test_oslo_crossval.py` - Cross-validation against oslo.utils
   format_inspector (format detection, safety checks, virtual size).
   Skips if oslo.utils is not installed.
+- `tests/test_snapshot.py` - Integration tests for the `instar snapshot`
+  subcommand (phase 11): 12-image list matrix vs cross-version baselines,
+  12 JSON golden comparisons with structural cross-check, mutation
+  round-trips (create/delete/apply) with `qemu-img check` post-op
+  assertions, error paths and qcow2-only enforcement, empty-table
+  behaviour. JSON goldens in `tests/golden/snapshot-list/`.
 - `tests/expected_outputs/` - Expected output files for malicious images
 
 **Adding new test images:**

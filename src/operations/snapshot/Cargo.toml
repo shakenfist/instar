@@ -1,0 +1,21 @@
+[package]
+name = "snapshot-op"
+version = "0.2.0"
+edition = "2021"
+description = "Snapshot operation: list / apply / create / delete qcow2 internal snapshots"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "snapshot"
+path = "src/main.rs"
+
+[dependencies]
+shared = { path = "../../shared" }
+qcow2 = { path = "../../crates/qcow2" }
+snapshot = { path = "../../crates/snapshot", default-features = false }
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true

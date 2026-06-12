@@ -12,6 +12,7 @@
 #   - measure.bin at 0x20000 (disk measurement operation, same address as info)
 #   - create.bin at 0x20000 (image creation operation, same address as info)
 #   - map.bin at 0x20000 (allocation map operation, same address as info)
+#   - snapshot.bin at 0x20000 (snapshot operation, same address as info)
 
 set -e
 
@@ -246,6 +247,25 @@ else
 fi
 
 echo ""
+echo "=== Building snapshot operation ==="
+cd operations/snapshot
+cargo +nightly build --release
+cd ../..
+
+# Convert snapshot ELF to flat binary
+echo "=== Converting snapshot ELF to flat binary ==="
+SNAPSHOT_ELF="target/x86_64-unknown-none/release/snapshot"
+SNAPSHOT_BIN="snapshot.bin"
+
+if [ -f "$SNAPSHOT_ELF" ]; then
+    rust-objcopy -O binary "$SNAPSHOT_ELF" "$SNAPSHOT_BIN"
+    echo "Created $SNAPSHOT_BIN ($(wc -c < "$SNAPSHOT_BIN") bytes)"
+else
+    echo "Error: Snapshot ELF not found at $SNAPSHOT_ELF"
+    exit 1
+fi
+
+echo ""
 echo "=== Building instar ==="
 cd vmm
 cargo build --release
@@ -266,7 +286,8 @@ cp "$RESIZE_BIN" target/release/
 cp "$REBASE_BIN" target/release/
 cp "$COMMIT_BIN" target/release/
 cp "$MAP_BIN" target/release/
-echo "Copied core.bin, info.bin, copy.bin, check.bin, compare.bin, convert.bin, measure.bin, create.bin, resize.bin, rebase.bin, commit.bin, and map.bin to target/release/"
+cp "$SNAPSHOT_BIN" target/release/
+echo "Copied core.bin, info.bin, copy.bin, check.bin, compare.bin, convert.bin, measure.bin, create.bin, resize.bin, rebase.bin, commit.bin, map.bin, and snapshot.bin to target/release/"
 
 # Check binary sizes against memory layout limits
 # Memory layout (from shared/src/lib.rs):
@@ -309,6 +330,7 @@ check_size "resize.bin" "target/release/$RESIZE_BIN" "$OP_MAX" || FAILED=1
 check_size "rebase.bin" "target/release/$REBASE_BIN" "$OP_MAX" || FAILED=1
 check_size "commit.bin" "target/release/$COMMIT_BIN" "$OP_MAX" || FAILED=1
 check_size "map.bin" "target/release/$MAP_BIN" "$OP_MAX" || FAILED=1
+check_size "snapshot.bin" "target/release/$SNAPSHOT_BIN" "$OP_MAX" || FAILED=1
 
 if [ "$FAILED" -eq 1 ]; then
     echo ""
@@ -334,6 +356,7 @@ echo "  - resize.bin     Resize operation (in-place image resize) - loaded at 0x
 echo "  - rebase.bin     Rebase operation (change backing-file reference) - loaded at 0x20000"
 echo "  - commit.bin     Commit operation (merge overlay into backing) - loaded at 0x20000"
 echo "  - map.bin        Map operation (stream allocation map) - loaded at 0x20000"
+echo "  - snapshot.bin   Snapshot operation (list/apply/create/delete) - loaded at 0x20000"
 echo ""
 echo "To run:"
 echo "  sudo ./target/release/instar info image.qcow2"
