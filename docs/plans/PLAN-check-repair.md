@@ -193,7 +193,9 @@ backup for valuable images — the same posture as `qemu-img`.
 
 This is the property that actually protects the user, and the one
 a backup cannot provide. If the guest dies mid-repair the image
-must not be left *worse*. We follow qemu's discipline:
+must not be left *worse*. The discipline applies to the **lossy
+`all` tier** (phase 5), whose structural rewrites can leave
+mid-flight inconsistency:
 
 - Set the header `corrupt` bit (incompatible feature bit 1)
   **before** the first structural write, so an interrupted
@@ -205,6 +207,17 @@ must not be left *worse*. We follow qemu's discipline:
   table — repair reuses it).
 - Clear the `corrupt` bit **last**, only after a final in-guest
   re-validation pass reports zero corruptions/refcount errors.
+
+The safe **`leaks` tier** (phase 4) deliberately does **not**
+touch the `corrupt` bit. Leak reclamation only lowers the
+refcounts of clusters the completed whole-image walk proved
+unreferenced — monotonic frees that are individually crash-safe,
+so a partially-applied leaks repair leaves a consistent (if
+still-leaky) image. Setting the `corrupt` bit there would also
+*regress* an image that has unrelated, unfixed corruptions:
+re-validation would not come back clean, so the bit would be left
+set on an image that was openable before. `fsync` ordering still
+applies for durability; the `corrupt`-bit guard does not.
 
 ### 5. Refuse rather than guess
 
@@ -302,8 +315,9 @@ Working answer: **match `qemu-img check -r`**. After a
 successful repair, qemu re-checks and returns 0 if clean, 3 if
 only leaks remain, 2 if corruptions remain. instar's VMM already
 maps `CheckResult` counters to exit codes for the report path;
-repair extends that mapping to "counters *after* repair". Phase 5
-(host CLI) owns this.
+repair extends that mapping to "counters *after* repair". Phase 6
+(host CLI polish) owns the full 0/2/3 mapping; phase 4's minimal
+host enablement keeps the existing pass/fail exit behaviour.
 
 ## Execution
 
@@ -312,20 +326,25 @@ repair extends that mapping to "counters *after* repair". Phase 5
 | 1. ABI + crate scaffolding: add `FLAG_REPAIR_ALL` to `CheckConfig`, repair-result counters (`repaired_leaks`/`refcounts`/`corruptions`) + `FLAG_REPAIR_INCOMPLETE` to `CheckResult`, create the `src/crates/check/` planner crate (deps `shared`+`qcow2`+`snapshot`; `RepairTier`/`RepairError`/`RepairCounters` surface), and rename the op package `check` → `check-op` (binary stays `check.bin`) to free the crate name. Writable-input-device open deferred to phase 4/5 (open question 3) | PLAN-check-repair-phase-01-abi.md | **Landed** |
 | 2. Leak-reclamation planner (safe tier): `reclaim_leaks_in_refblock` — pure per-refblock driver that zeroes the refcount of `rc > 0 && !is_referenced` entries (the guest supplies the per-block referenced predicate), reusing `set_refcount_in_block`; never lowers a live cluster (that is phase 3's over-count case, since the detector's bitmap is boolean); unit tests over synthetic refblocks incl. sub-byte neighbour preservation | PLAN-check-repair-phase-02-leak-planner.md | **Landed** |
 | 3. Refcount-rebuild + COPIED reconciliation planner (lossy tier): `account_reference_in_map` (count references into a staged computed-refcount map, overflow→`AmbiguousCorruption`), `correct_refcounts_in_refblock` (both-directions correction to the computed value — raise too-low, lower too-high, free zero-count — generalising phase 2), and `reconcile_copied_flags_for_l1` (wrapper over `snapshot::update_copied_flags_for_l1`). Recounts because the detector's bitmap is boolean; refuses on overflow / over-capacity (refcount-structure growth deferred, OQ7). Pure; unwired | PLAN-check-repair-phase-03-refcount-planner.md | **Landed** |
-| 4. Guest binary wiring: dispatch `FLAG_REPAIR`/`FLAG_REPAIR_ALL` in `src/operations/check/`, the crash-safe write-ordering sequence (set `corrupt` bit → write → fsync → re-validate → clear `corrupt` bit), emit repair-result counters | PLAN-check-repair-phase-04-guest.md | Not started |
-| 5. Host CLI: `--repair[=leaks\|all]` clap surface, `--help` warning on `all`, `CheckConfig` flag plumbing, post-repair exit-code mapping matching `qemu-img check -r` (open question 6) | PLAN-check-repair-phase-05-host.md | Not started |
-| 6. Cross-version baselines: corrupt qcow2 fixtures (leaked cluster, refcount mismatch, stale COPIED, set `corrupt` bit) and their post-`qemu-img -r` clean references across the version matrix | PLAN-check-repair-phase-06-baselines.md | Not started |
-| 7. Integration tests (`tests/test_check_repair.py`): corrupt-fixture → `instar check --repair` → post-op `qemu-img check`/`info`/`compare` clean; leaks-vs-all tiering; refuse-don't-guess paths exit non-zero without writing; qcow2-only enforcement | PLAN-check-repair-phase-07-integration.md | Not started |
-| 8. Coverage-guided fuzzing of the repair planners (`fuzz_check_repair`): corrupt refblock/L1/L2 buffers in, assert no panic and no out-of-bounds write | PLAN-check-repair-phase-08-fuzz-coverage.md | Not started |
-| 9. Differential fuzzing: random corruptions injected into a valid image, repaired by both instar and qemu-img, results compared for `qemu-img check` cleanliness and guest-data equivalence | PLAN-check-repair-phase-09-fuzz-differential.md | Not started |
-| 10. Docs, CHANGELOG, follow-ups: `docs/qcow2/qcow2-refcount.md` repair section, `docs/usage.md` + `--help`, `ARCHITECTURE.md`/`README.md`/`AGENTS.md`, strike through convert-followups phase 2 | PLAN-check-repair-phase-10-docs.md | Not started |
+| 4. Guest wiring — **safe `leaks` tier, end-to-end**: `check-op` depends on the `check` crate; after the detection walk (which builds the reference bitmap), a `repair_leaks_qcow2` pass stages each refblock and calls `reclaim_leaks_in_refblock`, writes back via `write_input_sector`/`fsync_input`, updates the post-repair `CheckResult` (`repaired_leaks`, recomputed `leaks`). Plus the **minimal host enablement** pulled forward: a `--repair` flag on `CheckArgs`, conditional read-write device open in `run_check`, `FLAG_REPAIR` plumbed. No `corrupt`-bit dance — leak reclamation is crash-safe (monotonic frees of unreferenced clusters). Memory-light (one refblock at a time) | PLAN-check-repair-phase-04-guest-leaks.md | **Planned, not started** |
+| 5. Guest wiring — **lossy `all` tier**: the whole-metadata counting walk (active L1→L2s, snapshot L1s→L2s, refcount structures, snapshot table, header self-refs) building a staged computed-refcount map via `account_reference_in_map`; the correction pass via `correct_refcounts_in_refblock`; COPIED reconciliation across all L1s via `reconcile_copied_flags_for_l1`; the **crash-safe `corrupt`-bit ordering** (set bit → write → fsync → re-validate → clear) that this tier needs because structural rewrites can leave mid-flight inconsistency; over-capacity/overflow → `FLAG_REPAIR_INCOMPLETE`. `FLAG_REPAIR_ALL` plumbed | PLAN-check-repair-phase-05-guest-all.md | Not started |
+| 6. Host CLI polish: `--repair[=leaks\|all]` clap surface (replacing the phase-4 minimal flag), `--help` warning on `all`, post-repair exit-code mapping matching `qemu-img check -r` (0 clean / 2 errors / 3 leaks; open question 6) | PLAN-check-repair-phase-06-host.md | Not started |
+| 7. Cross-version baselines: corrupt qcow2 fixtures (leaked cluster, refcount mismatch, stale COPIED, set `corrupt` bit) and their post-`qemu-img -r` clean references across the version matrix | PLAN-check-repair-phase-07-baselines.md | Not started |
+| 8. Integration tests (`tests/test_check_repair.py`): corrupt-fixture → `instar check --repair` → post-op `qemu-img check`/`info`/`compare` clean; leaks-vs-all tiering; refuse-don't-guess paths exit non-zero without writing; qcow2-only enforcement | PLAN-check-repair-phase-08-integration.md | Not started |
+| 9. Coverage-guided fuzzing of the repair planners (`fuzz_check_repair`): corrupt refblock/L1/L2 buffers in, assert no panic and no out-of-bounds write | PLAN-check-repair-phase-09-fuzz-coverage.md | Not started |
+| 10. Differential fuzzing: random corruptions injected into a valid image, repaired by both instar and qemu-img, results compared for `qemu-img check` cleanliness and guest-data equivalence | PLAN-check-repair-phase-10-fuzz-differential.md | Not started |
+| 11. Docs, CHANGELOG, follow-ups: `docs/qcow2/qcow2-refcount.md` repair section, `docs/usage.md` + `--help`, `ARCHITECTURE.md`/`README.md`/`AGENTS.md`, strike through convert-followups phase 2 | PLAN-check-repair-phase-11-docs.md | Not started |
 
 Phase plans are written one at a time, at the effort level the
 phase warrants, as each is scheduled — matching how the snapshot
-family was rolled out. Phases 1, 3, and 4 are high-effort opus
-(ABI/safety-ordering judgment, lossy-repair correctness); phases
-2, 5, 8 are medium; phases 6, 7, 9, 10 follow established
-fixture/test/doc patterns.
+family was rolled out. Phases 1, 3, 4, and 5 are high-effort opus
+(ABI/safety-ordering judgment, repair correctness — phase 5 is
+the riskiest guest phase); phases 2, 6, 9 are medium; phases 7,
+8, 10, 11 follow established fixture/test/doc patterns. Phase 4
+was split from the original single "guest wiring" phase: the
+safe `leaks` tier (here) is end-to-end testable on its own, and
+the lossy `all` tier counting-walk (phase 5) is a phase-3-sized
+chunk that earns standalone focus.
 
 ## Agent guidance
 
