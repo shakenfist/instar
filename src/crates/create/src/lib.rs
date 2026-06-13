@@ -1094,13 +1094,13 @@ mod qcow2_plan_tests {
         let mut opts = default_opts(1 << 30);
         opts.refcount_bits = 1;
         let bytes = run_round_trip(&opts);
-        // refcount_order=4 is hardcoded in build_header (matching
-        // convert) regardless of the layout's refcount_bits, so the
-        // parsed header still reports 16. The round-trip property
-        // we assert is that the file at least parses and has the
-        // right virtual size.
+        // build_header now derives refcount_order from refcount_bits, so the
+        // header's declared width matches the 1-bit-packed refcount blocks
+        // (previously it hardcoded refcount_order=4 and corrupted sub-byte
+        // images — instar #365).
         let parsed = qcow2::QcowHeader::parse(&bytes).expect("parse header");
         assert_eq!(parsed.virtual_size, 1 << 30);
+        assert_eq!(parsed.refcount_bits, 1);
     }
 
     #[test]

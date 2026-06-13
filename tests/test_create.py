@@ -361,10 +361,9 @@ class TestCreateOOptions(InstarTestBase):
         """Comma-separated values parse multiple keys in one -o.
 
         Uses cluster_size + extended_l2 because both round-trip
-        through `instar info`. Note: refcount_bits != 16 currently
-        does *not* round-trip — qcow2::create::build_header
-        hardcodes refcount_order=4 to match convert's behaviour.
-        Phase-1's unit tests document this limitation.
+        through `instar info`. (refcount_bits != 16 also round-trips
+        now that build_header derives refcount_order from
+        refcount_bits — instar #365.)
         """
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / 'foo.qcow2'
@@ -786,12 +785,11 @@ def _instar_target_name(target):
 # regression (a new divergence between instar and qemu-img) and must
 # be investigated rather than added to the dict to make CI green.
 KNOWN_WRITER_DIVERGENCES = {
-    # qcow2: build_header hardcodes refcount_order=4 (=> refcount_bits=16),
-    # ignoring -o refcount_bits. Documented in test_create.py:351 and
-    # in PLAN-create-phase-01-emitters.md.
-    ('qcow2', '1G-rb-1'):  'instar hardcodes refcount_bits=16',
-    ('qcow2', '1G-rb-8'):  'instar hardcodes refcount_bits=16',
-    ('qcow2', '1G-rb-64'): 'instar hardcodes refcount_bits=16',
+    # NOTE: the qcow2 refcount_bits cases ('1G-rb-1', '1G-rb-8',
+    # '1G-rb-64') were removed once build_header began deriving
+    # refcount_order from refcount_bits (and set_refcount_to_one was
+    # corrected to LSB-first) — instar now emits the requested width and
+    # matches qemu (instar #365).
     # qcow2: build_header hardcodes compat=1.1; -o compat=0.10 is ignored.
     ('qcow2', '1G-compat-v2'): 'instar hardcodes compat=1.1',
     # qcow2: compression_type=zstd is accept-ignored, header records zlib.
@@ -1174,12 +1172,10 @@ for _target, _case in CROSS_VALIDATION_CASES:
 # instar reader itself rejects. Each entry should have a tracking
 # issue or a planned fix; the skip is documented in line.
 KNOWN_CHECK_FAILURES = {
-    # instar emits refcount_bits=64 in the header but uses 16-bit
-    # refcount entries on disk (the writer hardcodes refcount_order=4).
-    # instar check spots the mismatch and reports "errors detected".
-    # rb=1 and rb=8 happen to fit in the smaller encoding and pass.
-    ('qcow2', '1G-rb-64'): 'instar emits refcount_bits=64 header but '
-                           '16-bit on-disk entries — check rejects',
+    # (Previously held ('qcow2', '1G-rb-64'): instar emitted a
+    # refcount_order=4 header over differently-packed on-disk entries and
+    # instar check rejected it. Fixed by deriving refcount_order from
+    # refcount_bits and packing sub-byte widths LSB-first — instar #365.)
 }
 
 

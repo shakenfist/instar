@@ -994,9 +994,12 @@ def _create_option_picker(rng):
     instar/qemu writer divergences documented in phase 8b's
     KNOWN_WRITER_DIVERGENCES.
 
+    All qcow2 refcount_bits widths are now exercised — build_header
+    derives refcount_order from refcount_bits and packs sub-byte widths
+    LSB-first (instar #365).
+
     Excludes:
         vhd target entirely        (CHS-geometry rounding divergence)
-        qcow2 refcount_bits != 16  (instar hardcodes refcount_order=4)
         qcow2 compat=0.10          (instar hardcodes compat=1.1)
         compression_type=zstd      (instar accept-ignores; emits zlib)
         vhdx default block_size    (instar 8 MiB vs qemu 32 MiB at <= 1 GiB)
@@ -1013,6 +1016,13 @@ def _create_option_picker(rng):
             options.append('extended_l2=on')
         if rng.random() < 0.3:
             options.append('lazy_refcounts=on')
+        # refcount_bits dimension (instar #365): build_header now derives
+        # refcount_order from refcount_bits and packs sub-byte widths
+        # LSB-first, so every width qemu accepts round-trips and is
+        # differential-comparable.
+        if rng.random() < 0.4:
+            options.append(
+                f'refcount_bits={rng.choice([1, 2, 4, 8, 16, 32, 64])}')
         # qcow2 compute_layout in crates/qcow2::create rejects
         # extended_l2 + non-Off preallocation with
         # PreallocationUnsupported (deferred to a future phase). Mirror
@@ -1189,8 +1199,10 @@ def _resize_option_picker(rng):
         any shipped version; the differential surface has nothing
         to compare against for those targets (see PLAN-resize
         phase 10 and 11 for the asymmetry).
-      * No qcow2 refcount_bits != 16 (instar hardcodes
-        refcount_order=4).
+      * qcow2 refcount_bits is now exercised across all widths —
+        build_header derives refcount_order from refcount_bits and
+        sub-byte widths are packed LSB-first (instar #365), so the
+        widths qemu accepts are differential-comparable.
       * No qcow2 compat=0.10 (instar hardcodes compat=1.1).
       * No qcow2 + preallocation=metadata (planner gap deferred
         from phase 2c; master-plan Future work).
@@ -1216,6 +1228,11 @@ def _resize_option_picker(rng):
             options.append('extended_l2=on')
         if rng.random() < 0.3:
             options.append('lazy_refcounts=on')
+        # refcount_bits dimension (instar #365): exercise sub-byte and
+        # wide refcounts, not just the qemu default of 16.
+        if rng.random() < 0.4:
+            options.append(
+                f'refcount_bits={rng.choice([1, 2, 4, 8, 16, 32, 64])}')
 
         # Pick a start / end pair. Sizes capped at 64M for runtime;
         # falloc/full prealloc additionally capped at 4M because

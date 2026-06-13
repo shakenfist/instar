@@ -22,8 +22,8 @@ extern crate std;
 use shared::{write_be_u32, write_be_u64};
 
 use crate::{
-    EXT_BACKING_FORMAT, EXT_END, INCOMPAT_EXTENDED_L2, OFLAG_COPIED, QCOW2_DEFAULT_REFCOUNT_ORDER,
-    QCOW2_HEADER_LENGTH_V3, QCOW2_MAGIC, QCOW2_VERSION_3,
+    EXT_BACKING_FORMAT, EXT_END, INCOMPAT_EXTENDED_L2, OFLAG_COPIED, QCOW2_HEADER_LENGTH_V3,
+    QCOW2_MAGIC, QCOW2_VERSION_3,
 };
 
 /// Preallocation mode for a qcow2 image being emitted.
@@ -364,7 +364,15 @@ pub fn build_header<'a>(
     };
     write_be_u64(hdr, 80, compat);
     // autoclear_features (88) = 0
-    write_be_u32(hdr, 96, QCOW2_DEFAULT_REFCOUNT_ORDER);
+    // refcount_order: log2(refcount_bits). refcount_bits is a validated
+    // power of two in {1,2,4,8,16,32,64} (compute_layout for create; 1 <<
+    // refcount_order from the parsed source header for resize/snapshot
+    // rebuilds), so trailing_zeros() yields the order directly. Deriving it
+    // here — rather than hardcoding the 16-bit default — keeps the header's
+    // declared width consistent with how the refcount blocks are actually
+    // packed; a mismatch made qemu read sub-byte refcounts as 16-bit and
+    // corrupted 1/2/4-bit images (instar #365).
+    write_be_u32(hdr, 96, opts.layout.refcount_bits.trailing_zeros());
     write_be_u32(hdr, 100, QCOW2_HEADER_LENGTH_V3);
 
     // Lay out header extensions starting at offset 104.
@@ -570,22 +578,24 @@ pub fn build_refcount_block<'a>(
 fn set_refcount_to_one(block: &mut [u8], idx: u64, refcount_bits: u32) {
     match refcount_bits {
         1 => {
-            // 8 entries per byte; MSB-first packing within byte.
+            // 8 entries per byte; LSB-first packing within byte (entry 0 in
+            // the lowest bit), matching qemu's set_refcount_ro0 and the
+            // shared snapshot::qcow2 accessors. See instar #365.
             let byte = (idx / 8) as usize;
-            let bit = 7 - (idx % 8) as u32;
+            let bit = (idx % 8) as u32;
             block[byte] |= 1 << bit;
         }
         2 => {
-            // 4 entries per byte; MSB-first 2-bit slots.
+            // 4 entries per byte; LSB-first 2-bit slots.
             let byte = (idx / 4) as usize;
-            let slot = idx % 4; // 0..=3
-            let shift = (3 - slot) * 2;
+            let shift = 2 * (idx % 4) as u32;
             block[byte] |= 0b01 << shift;
         }
         4 => {
-            // 2 entries per byte; MSB-first nibbles.
+            // 2 entries per byte; LSB-first nibbles (entry 0 in the low
+            // nibble).
             let byte = (idx / 2) as usize;
-            let shift = if idx.is_multiple_of(2) { 4 } else { 0 };
+            let shift = if idx.is_multiple_of(2) { 0 } else { 4 };
             block[byte] |= 0b0001 << shift;
         }
         8 => {
@@ -750,6 +760,43 @@ mod tests {
     }
 
     #[test]
+    fn header_refcount_order_tracks_refcount_bits() {
+        // build_header must write refcount_order = log2(refcount_bits) for
+        // every valid width, not a hardcoded 16-bit default — otherwise the
+        // declared width disagrees with the packed refcount blocks and qemu
+        // misreads sub-byte images (instar #365).
+        for (bits, order) in [
+            (1u32, 0u32),
+            (2, 1),
+            (4, 2),
+            (8, 3),
+            (16, 4),
+            (32, 5),
+            (64, 6),
+        ] {
+            let layout = compute_layout(1 << 30, 16, bits, false, Preallocation::Off).unwrap();
+            let cs = layout.cluster_size as usize;
+            let mut buf = vec![0u8; cs];
+            let opts = BuildHeaderOptions {
+                layout: &layout,
+                backing_file: None,
+                backing_format: None,
+                lazy_refcounts: false,
+                luks_header: None,
+            };
+            let hdr = build_header(&mut buf, &opts).unwrap();
+            // refcount_order is the big-endian u32 at offset 96.
+            let written = u32::from_be_bytes([hdr[96], hdr[97], hdr[98], hdr[99]]);
+            assert_eq!(written, order, "refcount_bits {bits} -> order {order}");
+            assert_eq!(
+                crate::QcowHeader::parse(hdr).unwrap().refcount_bits,
+                bits,
+                "parsed refcount_bits for width {bits}",
+            );
+        }
+    }
+
+    #[test]
     fn header_round_trips_through_parser() {
         let layout = compute_layout(1 << 30, 16, 16, false, Preallocation::Off).unwrap();
         let cluster_size = layout.cluster_size as usize;
@@ -899,14 +946,51 @@ mod tests {
 
     #[test]
     fn refcount_block_marks_all_used_clusters_1bit() {
+        // Sub-byte refcounts are LSB-first within each byte (entry 0 in the
+        // lowest bit), matching qemu's set_refcount_ro0. A byte-exact check
+        // pins the ordering so it can't silently flip back to the MSB-first
+        // packing that corrupted sub-byte images (instar #365).
         let layout = compute_layout(1 << 20, 16, 1, false, Preallocation::Off).unwrap();
         let cs = layout.cluster_size as usize;
         let mut buf = vec![0u8; cs];
         let rb = build_refcount_block(&mut buf, &layout, 0).unwrap();
         for i in 0..layout.total_clusters as usize {
             let byte = i / 8;
-            let bit = 7 - (i % 8);
-            assert!(rb[byte] & (1u8 << bit) != 0, "cluster {} bit unset", i,);
+            let bit = i % 8; // LSB-first
+            assert!(rb[byte] & (1u8 << bit) != 0, "cluster {} bit unset", i);
+        }
+        // The N used clusters occupy the N lowest bits of the block: full
+        // 0xFF bytes followed by a partial low-bit-filled byte.
+        let used = layout.total_clusters as usize;
+        for (b, byte) in rb.iter().enumerate() {
+            let expected: u8 = if (b + 1) * 8 <= used {
+                0xFF
+            } else if b * 8 >= used {
+                0x00
+            } else {
+                (1u8 << (used - b * 8)) - 1
+            };
+            assert_eq!(*byte, expected, "refblock byte {b} mismatch");
+        }
+    }
+
+    #[test]
+    fn refcount_block_sub_byte_widths_are_lsb_first() {
+        // 2- and 4-bit widths pack entry 0 in the lowest bits too. Every
+        // used cluster has refcount 1, so the low slots read back as 1.
+        for &bits in &[2u32, 4u32] {
+            let layout = compute_layout(1 << 20, 16, bits, false, Preallocation::Off).unwrap();
+            let cs = layout.cluster_size as usize;
+            let mut buf = vec![0u8; cs];
+            let rb = build_refcount_block(&mut buf, &layout, 0).unwrap();
+            let entries_per_byte = (8 / bits) as u64;
+            let mask = (1u8 << bits) - 1;
+            for i in 0..layout.total_clusters {
+                let byte = (i / entries_per_byte) as usize;
+                let shift = (bits as u64 * (i % entries_per_byte)) as u32;
+                let val = (rb[byte] >> shift) & mask;
+                assert_eq!(val, 1, "width {bits}: cluster {i} refcount {val} != 1");
+            }
         }
     }
 
