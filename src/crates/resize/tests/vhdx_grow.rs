@@ -348,6 +348,33 @@ fn rejects_dirty_log_guid() {
 }
 
 #[test]
+fn rejects_sequence_number_near_u64_max() {
+    // The two grow flavours write header copies at
+    // current_sequence_number + 1 and + 2. A sequence number within 2 of
+    // u64::MAX overflows those increments — the fuzz_resize_planners panic at
+    // vhdx.rs:248 (instar #354, #360). The planner must reject it rather than
+    // overflow. u64::MAX - 2 is the largest value that stays in range.
+    let bytes = build_starting_vhdx(1u64 << 30, 32 * 1024 * 1024);
+    let mut scratch = vec![0u8; VHDX_SCRATCH];
+
+    for seq in [u64::MAX, u64::MAX - 1] {
+        let mut opts = opts_from_image(&bytes, 2u64 << 30, false);
+        opts.current_sequence_number = seq;
+        assert_eq!(
+            plan_resize_vhdx(&opts, &mut scratch).unwrap_err(),
+            ResizeError::Overflow,
+            "sequence number {seq} must be rejected",
+        );
+    }
+
+    // The largest in-range value (its + 2 increment is exactly u64::MAX) is
+    // still accepted — the guard is not over-broad.
+    let mut opts = opts_from_image(&bytes, 2u64 << 30, false);
+    opts.current_sequence_number = u64::MAX - 2;
+    assert!(plan_resize_vhdx(&opts, &mut scratch).is_ok());
+}
+
+#[test]
 fn rejects_invalid_active_header_offset() {
     let bytes = build_starting_vhdx(1u64 << 30, 32 * 1024 * 1024);
     let mut opts = opts_from_image(&bytes, 2u64 << 30, false);

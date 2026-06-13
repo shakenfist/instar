@@ -362,11 +362,10 @@ provides a modular architecture with:
   `tests/helpers/info_json.py` strips the divergence whitelist
   (filename, actual-size, vmdk cid + parent-cid, vhdx log-size,
   the wrapping-file physical size, cache hints) before
-  comparison; remaining writer divergences (qcow2
-  refcount_bits hardcode, qcow2 compat hardcode, zstd
-  accept-ignore, vhdx default block_size, vhd CHS-rounded
-  virtual_size) are documented as per-case skips rather than
-  whitelist extensions so each gap stays visible.
+  comparison; remaining writer divergences (qcow2 compat
+  hardcode, zstd accept-ignore, vhdx default block_size, vhd
+  CHS-rounded virtual_size) are documented as per-case skips
+  rather than whitelist extensions so each gap stays visible.
 - **operations/resize/** - In-place virtual-size mutation
   operation. Reads a `ResizeConfig` (target format, current and
   new virtual sizes, current file size, per-format hints from the
@@ -831,11 +830,12 @@ divergence-whitelist filter the phase 8b integration tests use,
 inlined from `tests/helpers/info_json.py`). The random
 `(target, options, size)` picker biases away from phase 8b's
 documented writer-divergence list — vhd target excluded (CHS
-rounding), qcow2 refcount_bits pinned to 16, qcow2 compat pinned
-to 1.1, compression_type=zstd never set, vhdx block_size always
-explicit. Combinations the curated test matrix doesn't exercise
-(random cluster sizes, lazy_refcounts on/off, every preallocation
-mode, every vmdk subformat) get coverage here without spurious
+rounding), qcow2 compat pinned to 1.1, compression_type=zstd
+never set, vhdx block_size always explicit. Combinations the
+curated test matrix doesn't exercise (random cluster sizes,
+every qcow2 refcount_bits width, lazy_refcounts on/off, every
+preallocation mode, every vmdk subformat) get coverage here
+without spurious
 findings from the known gaps.
 
 ### libyal Cross-Validation

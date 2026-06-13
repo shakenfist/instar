@@ -28,13 +28,10 @@ from helpers.info_json import assert_info_equivalent
 # test inherits the failure, so it skips these. Re-stated here
 # because the resize case names differ from the create names.
 KNOWN_CREATE_CHECK_FAILURES = {
-    # instar emits refcount_bits=64 in the header but writes
-    # 16-bit refcount entries on disk; instar check spots the
-    # mismatch. Same root cause as ('qcow2', '1G-rb-64') in
-    # test_create.py:KNOWN_CHECK_FAILURES.
-    ('qcow2', '1M-to-64M-rb-64'):
-        'instar emits refcount_bits=64 header but 16-bit on-disk '
-        'entries — check rejects (independent of resize)',
+    # (Previously held ('qcow2', '1M-to-64M-rb-64'), the resize mirror of
+    # test_create.py's rb-64 check failure. Fixed by deriving
+    # refcount_order from refcount_bits and packing sub-byte widths
+    # LSB-first — instar #365.)
 }
 
 
@@ -42,11 +39,10 @@ KNOWN_CREATE_CHECK_FAILURES = {
 # baseline for a documented reason. Three categories:
 #
 # 1. **Create-time divergence carries forward.** instar's create
-#    writer hardcodes refcount_bits=16 and compat=1.1 (see
-#    KNOWN_WRITER_DIVERGENCES in test_create.py), so the post-
-#    resize info reports those values rather than what the
-#    -o flags requested. The resize case names differ from the
-#    create case names, so we re-list them here.
+#    writer hardcodes compat=1.1 (see KNOWN_WRITER_DIVERGENCES in
+#    test_create.py), so the post-resize info reports that value
+#    rather than what the -o flag requested. The resize case names
+#    differ from the create case names, so we re-list them here.
 # 2. **Resize-time planner gaps.** Documented Future-work items
 #    from the master plan; the resize op rejects rather than
 #    silently producing the wrong layout.
@@ -56,10 +52,10 @@ KNOWN_CREATE_CHECK_FAILURES = {
 KNOWN_RESIZE_DIVERGENCES = {
     # Create-time divergence carry-forward
     # ----------------------------------------
-    # instar's qcow2 build_header hardcodes refcount_order=4
-    # (-> refcount_bits=16); -o refcount_bits=N is ignored.
-    ('qcow2', '1M-to-64M-rb-1'):  'instar hardcodes refcount_bits=16',
-    ('qcow2', '1M-to-64M-rb-64'): 'instar hardcodes refcount_bits=16',
+    # (Previously held the qcow2 '1M-to-64M-rb-1' / '-rb-64' carry-
+    # forwards: instar's build_header hardcoded refcount_order=4 so the
+    # post-resize info reported refcount_bits=16. Fixed — build_header now
+    # derives the order and sub-byte packing is LSB-first — instar #365.)
     # instar's qcow2 build_header hardcodes compat=1.1; the
     # -o compat=0.10 flag is silently ignored.
     ('qcow2', '1M-to-64M-compat-v2'): 'instar hardcodes compat=1.1',
