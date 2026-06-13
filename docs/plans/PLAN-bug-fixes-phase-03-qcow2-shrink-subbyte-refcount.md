@@ -111,17 +111,17 @@ succeeds) rather than filing it.
 
 ## Verification
 
-- [ ] The #365 shell reproduction: `rb=16` clean exit 0; `rb=1/2/4`
-      either `qemu-img check`-clean or non-zero exit with a clear
-      message — never exit 0 over a corrupt image.
-- [ ] `make instar` builds, `make lint` clean.
-- [ ] `make check-binary-sizes` passes (guest shrink op may change).
-- [ ] `make test-rust` and the relevant `make test-integration`
-      (resize) targets pass.
-- [ ] Differential resize fuzzer with the new `refcount_bits`
-      dimension runs without filing the (now fixed or known-gated)
-      divergence.
-- [ ] `pre-commit run --all-files` passes.
+- [x] The #365 shell reproduction: `create` and `resize --shrink`
+      across `refcount_bits` 1/2/4/16 are all `qemu-img check`-clean
+      (the root-cause fix resolved sub-byte create as well).
+- [x] `make instar` builds, `make lint` clean.
+- [x] `make check-binary-sizes` passes.
+- [x] `make test-rust` and the full `make test-integration` suite pass
+      (the previously-skipped rb-1/rb-8/rb-64 create+resize cases now
+      run live against qemu).
+- [x] Differential fuzzer with the new `refcount_bits` dimension ran
+      250 iterations with 0 divergences.
+- [x] `pre-commit run --all-files` passes.
 
 ## Commit
 

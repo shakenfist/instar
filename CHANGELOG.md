@@ -687,6 +687,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`instar create` could emit an unrepresentable Fixed VHD plan for
+  enormous virtual sizes (#353, #355, #357, #361, #362, #363, #367).**
+  `plan_vhd` placed the footer at `byte_offset == virtual_size` with
+  no upper bound, so a `virtual_size` near `u64::MAX` overflowed the
+  file-size bookkeeping (the `fuzz_create_emitters` invariant panic).
+  `plan_vhd` now rejects `virtual_size` above VHD's maximum
+  (`0xFF000000` sectors = 2040 GiB, matching qemu `vpc.c`) before the
+  subformat split.
+
+- **`instar resize` panicked on a VHDX header with a near-maximum
+  sequence number (#354, #360).** The grow planner incremented the
+  parsed (attacker-controllable) `sequence_number` by 1 and 2 for the
+  two header copies without bounds; a value within 2 of `u64::MAX`
+  overflowed (the `fuzz_resize_planners` panic). The planner now
+  rejects such a header up front with `Overflow`.
+
 - **qcow2 sub-byte refcounts corrupted on `create` and `resize
   --shrink` (#365).** `crates/qcow2::create::build_header` hardcoded
   the header's `refcount_order` field to the 16-bit default instead
@@ -715,7 +731,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   limited: the snapshot mutating modes refuse `refcount_bits !=
   16`. (The separate `instar resize --shrink` / `create`
   sub-byte corruption noted here originally is now also fixed —
-  see the entry below.)
+  see the entry above.)
 
 - **Snapshot list rows over-padded multibyte UTF-8 names.**
   qemu's `qemu-img snapshot -l` pads the ID and TAG columns with

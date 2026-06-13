@@ -247,6 +247,47 @@ fn shrink_within_single_l2_entry() {
 }
 
 #[test]
+fn shrink_preserves_sub_byte_refcount_width() {
+    // Regression for instar #365: the shrink path rebuilds the qcow2
+    // header via crates/qcow2::build_header. That writer used to hardcode
+    // refcount_order=4, so shrinking a refcount_bits=1/2/4 image produced a
+    // header that claimed 16-bit refcounts over sub-byte-packed blocks
+    // (qemu-img check ERRORs, exit 0). The rebuilt header must declare the
+    // source image's actual refcount width.
+    for rb in [1u8, 2, 4] {
+        let opts = Qcow2CreateOpts {
+            virtual_size: 64 << 20,
+            cluster_size: 65536,
+            refcount_bits: rb,
+            extended_l2: false,
+            lazy_refcounts: false,
+            compat_v3: true,
+            backing: None,
+            preallocation: qcow2::create::Preallocation::Off,
+        };
+        let mut cscratch = vec![0u8; create::QCOW2_MAX_METADATA_SCRATCH];
+        let bytes = materialise_create(&plan_qcow2(&opts, &mut cscratch).expect("create plan"));
+        let header = QcowHeader::parse(&bytes).expect("parse starting");
+        assert_eq!(header.refcount_bits, rb as u32, "starting image width");
+
+        let ropts = opts_from_image(&bytes, &header, 32 << 20, true, &[]);
+        let mut scratch = vec![0u8; QCOW2_MAX_RESIZE_SCRATCH];
+        let plan = plan_resize_qcow2(&ropts, &mut scratch).expect("shrink plan");
+        assert_eq!(plan.action, ResizeAction::Shrink);
+
+        let mut file = bytes.clone();
+        apply_resize(&mut file, &plan);
+        let parsed = QcowHeader::parse(&file).expect("re-parse");
+        assert_eq!(parsed.virtual_size, 32 << 20);
+        // The rebuilt header must keep the sub-byte width, not revert to 16.
+        assert_eq!(
+            parsed.refcount_bits, rb as u32,
+            "shrunk image refcount width"
+        );
+    }
+}
+
+#[test]
 fn shrink_drops_multiple_l1_entries() {
     // 4 GiB → 1 GiB at default cluster: L1 entries 2..=7 are
     // fully above the boundary, L1[1] straddles. Fresh image

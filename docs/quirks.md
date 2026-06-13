@@ -1072,18 +1072,6 @@ are valid VHDs — the difference surfaces only in the
 `tests/test_create.py::KNOWN_WRITER_DIVERGENCES` skips every
 affected case; closing this gap is documented future work.
 
-### qcow2 `refcount_bits` is hardcoded to 16
-
-`crates/qcow2::create::build_header` emits `refcount_order = 4`
-(=> 16-bit refcount entries on disk) regardless of the user's
-`-o refcount_bits=...` value. Honoured values that don't cause
-visible divergence: `1` and `8` (smaller widths still fit the
-16-bit encoding and produce valid files). `refcount_bits=64`
-produces a header `instar check` rejects on round-trip — the
-only entry in `tests/test_create.py::KNOWN_CHECK_FAILURES`.
-Closing the gap requires parameterising the L1/L2/refcount math
-over the user's choice. Future work.
-
 ### qcow2 `compat=0.10` is silently upgraded to `1.1`
 
 The writer hardcodes `compat=1.1` in the header. qemu-img
@@ -1122,16 +1110,6 @@ pass `-f vpc` explicitly to surface the vhd format. This is
 qemu's native behaviour and not a bug in either tool. Phase 7's
 baselines were recorded without `-f`, so phase 8's matrix
 comparison naturally agrees on both sides.
-
-### Known check failure: qcow2 `refcount_bits=64`
-
-`instar create -f qcow2 -o refcount_bits=64 ...` produces a
-file whose internal validator rejects on `instar check`
-("image check failed: errors detected"). The header claims
-64-bit refcounts but the on-disk entries are 16-bit
-(refcount_bits hardcode, above). This is the only entry in
-`tests/test_create.py::KNOWN_CHECK_FAILURES`; `refcount_bits=1`
-and `=8` fit the encoding and pass.
 
 ## resize subcommand quirks
 
