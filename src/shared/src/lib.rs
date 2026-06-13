@@ -1739,6 +1739,27 @@ impl CheckConfig {
     /// Flag: Validate backing chain (chain mode)
     pub const FLAG_CHAIN: u32 = 1 << 3;
 
+    /// Flag: Select the lossy `all` repair tier.
+    ///
+    /// Repair intent is encoded by two bits, mirroring
+    /// `qemu-img check -r leaks|all`:
+    /// - [`FLAG_REPAIR`] alone selects the **leaks** tier — the
+    ///   safe, lossless reclamation of allocated-but-unreferenced
+    ///   clusters.
+    /// - [`FLAG_REPAIR`] together with [`FLAG_REPAIR_ALL`] selects
+    ///   the **all** tier — the leaks tier plus the lossy
+    ///   refcount-structure rebuild and `corrupt`-bit clearing.
+    /// - [`FLAG_REPAIR_ALL`] set *without* [`FLAG_REPAIR`] is
+    ///   meaningless and is treated as **no repair**: the tier bit
+    ///   only escalates an already-requested repair, it never
+    ///   requests one on its own. [`should_repair_all`] enforces
+    ///   this by requiring both bits.
+    ///
+    /// Bit 4 is free: bits 0-3 are
+    /// REPAIR/QUIET/UNSAFE_QUIRKS/CHAIN here, and the VMM-side
+    /// mirror's only other flag is VERBOSE at `1 << 31`.
+    pub const FLAG_REPAIR_ALL: u32 = 1 << 4;
+
     /// Create a default config
     pub const fn default_config() -> Self {
         Self {
@@ -1755,6 +1776,17 @@ impl CheckConfig {
     /// Check if repair flag is set
     pub fn should_repair(&self) -> bool {
         (self.flags & Self::FLAG_REPAIR) != 0
+    }
+
+    /// Check if the lossy `all` repair tier is requested.
+    ///
+    /// Returns true only when *both* [`FLAG_REPAIR`] and
+    /// [`FLAG_REPAIR_ALL`] are set. [`FLAG_REPAIR_ALL`] on its own
+    /// is meaningless (see its doc comment) and yields false here,
+    /// so callers can branch on `should_repair()` for "any repair"
+    /// and `should_repair_all()` for "escalate to the lossy tier".
+    pub fn should_repair_all(&self) -> bool {
+        (self.flags & Self::FLAG_REPAIR_ALL) != 0 && self.should_repair()
     }
 
     /// Check if quiet flag is set
@@ -1817,6 +1849,19 @@ pub struct CheckResult {
 
     /// Status flags
     pub flags: u32,
+
+    /// Number of leaked clusters reclaimed during repair (0 when
+    /// no repair ran). Folded in by the guest from the leak
+    /// planner's [`RepairCounters`](../check/struct.RepairCounters.html).
+    pub repaired_leaks: u32,
+
+    /// Number of refcount inconsistencies corrected during repair
+    /// (0 when no repair ran).
+    pub repaired_refcounts: u32,
+
+    /// Number of corruptions resolved during repair (0 when no
+    /// repair ran).
+    pub repaired_corruptions: u32,
 }
 
 impl Default for CheckResult {
@@ -1853,6 +1898,16 @@ impl CheckResult {
     /// Flag: Chain validation errors found
     pub const FLAG_CHAIN_ERRORS: u32 = 1 << 7;
 
+    /// Flag: Repair ran but could not fully clean the image.
+    ///
+    /// Set when a `--repair` pass made progress but left findings
+    /// behind — either a refuse-don't-guess boundary was hit, or
+    /// the snapshot allocator returned `RefcountExhausted`. Bit 8
+    /// is the first free bit: bits 0-7 are
+    /// VALID/HAS_LEAKS/HAS_CORRUPTIONS/DIRTY/CORRUPT_BIT/INCOMPLETE/
+    /// NOT_SUPPORTED/CHAIN_ERRORS.
+    pub const FLAG_REPAIR_INCOMPLETE: u32 = 1 << 8;
+
     /// Create a new empty result
     pub const fn new() -> Self {
         Self {
@@ -1869,12 +1924,21 @@ impl CheckResult {
             clusters_allocated: 0,
             fragmentation: 0,
             flags: 0,
+            repaired_leaks: 0,
+            repaired_refcounts: 0,
+            repaired_corruptions: 0,
         }
     }
 
     /// Check if result is valid
     pub fn is_valid(&self) -> bool {
         self.magic == Self::MAGIC
+    }
+
+    /// Check if a repair pass ran but could not fully clean the
+    /// image (see [`FLAG_REPAIR_INCOMPLETE`]).
+    pub fn repair_incomplete(&self) -> bool {
+        (self.flags & Self::FLAG_REPAIR_INCOMPLETE) != 0
     }
 
     /// Get the detected format
@@ -4810,5 +4874,78 @@ mod tests {
         // 16 to 17 by appending `send_snapshot_entry`,
         // `send_snapshot_result`, and `fsync_input`.
         assert_eq!(CallTable::VERSION, 17);
+    }
+
+    #[test]
+    fn check_config_flag_repair_all_bit_value() {
+        // Bit 4: must not collide with the existing bits 0-3
+        // (REPAIR/QUIET/UNSAFE_QUIRKS/CHAIN).
+        assert_eq!(CheckConfig::FLAG_REPAIR_ALL, 1 << 4);
+        assert_ne!(CheckConfig::FLAG_REPAIR_ALL, CheckConfig::FLAG_REPAIR);
+        assert_ne!(CheckConfig::FLAG_REPAIR_ALL, CheckConfig::FLAG_QUIET);
+        assert_ne!(
+            CheckConfig::FLAG_REPAIR_ALL,
+            CheckConfig::FLAG_UNSAFE_QUIRKS
+        );
+        assert_ne!(CheckConfig::FLAG_REPAIR_ALL, CheckConfig::FLAG_CHAIN);
+    }
+
+    #[test]
+    fn check_config_should_repair_all_requires_both_bits() {
+        let cfg = CheckConfig {
+            magic: CheckConfig::MAGIC,
+            flags: CheckConfig::FLAG_REPAIR | CheckConfig::FLAG_REPAIR_ALL,
+        };
+        assert!(cfg.should_repair());
+        assert!(cfg.should_repair_all());
+    }
+
+    #[test]
+    fn check_config_should_repair_all_false_when_only_all_set() {
+        // FLAG_REPAIR_ALL without FLAG_REPAIR is meaningless and
+        // must be treated as no repair at all.
+        let cfg = CheckConfig {
+            magic: CheckConfig::MAGIC,
+            flags: CheckConfig::FLAG_REPAIR_ALL,
+        };
+        assert!(!cfg.should_repair());
+        assert!(!cfg.should_repair_all());
+
+        // FLAG_REPAIR alone is the leaks tier: repair yes, all no.
+        let leaks = CheckConfig {
+            magic: CheckConfig::MAGIC,
+            flags: CheckConfig::FLAG_REPAIR,
+        };
+        assert!(leaks.should_repair());
+        assert!(!leaks.should_repair_all());
+    }
+
+    #[test]
+    fn check_result_repair_incomplete_accessor() {
+        assert_eq!(CheckResult::FLAG_REPAIR_INCOMPLETE, 1 << 8);
+        let mut result = CheckResult::new();
+        assert!(!result.repair_incomplete());
+        result.flags |= CheckResult::FLAG_REPAIR_INCOMPLETE;
+        assert!(result.repair_incomplete());
+    }
+
+    #[test]
+    fn check_result_new_zeroes_repair_counters() {
+        let result = CheckResult::new();
+        assert_eq!(result.repaired_leaks, 0);
+        assert_eq!(result.repaired_refcounts, 0);
+        assert_eq!(result.repaired_corruptions, 0);
+    }
+
+    #[test]
+    fn check_result_repair_counters_round_trip_through_copy() {
+        let mut result = CheckResult::new();
+        result.repaired_leaks = 7;
+        result.repaired_refcounts = 11;
+        result.repaired_corruptions = 13;
+        let copy = result;
+        assert_eq!(copy.repaired_leaks, 7);
+        assert_eq!(copy.repaired_refcounts, 11);
+        assert_eq!(copy.repaired_corruptions, 13);
     }
 }

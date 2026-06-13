@@ -52,7 +52,7 @@ if [ -d "$PROJECT_ROOT/src" ]; then
             --exclude core \
             --exclude info \
             --exclude copy \
-            --exclude check \
+            --exclude check-op \
             --exclude compare \
             --exclude convert \
             --exclude measure-op \
@@ -68,7 +68,7 @@ if [ -d "$PROJECT_ROOT/src" ]; then
             --exclude core \
             --exclude info \
             --exclude copy \
-            --exclude check \
+            --exclude check-op \
             --exclude compare \
             --exclude convert \
             --exclude measure-op \

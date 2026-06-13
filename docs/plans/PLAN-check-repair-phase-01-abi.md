@@ -95,6 +95,13 @@ The rename's blast radius was mapped and is contained:
   new `check` *crate* is a host-testable `no_std` lib like
   `snapshot` and is intentionally **not** excluded, so its unit
   tests run under `--workspace`.
+- `scripts/check-rust.sh` `--exclude check` (TWO sites: the
+  clippy `--fix` invocation ~line 55 and the clippy check
+  invocation ~line 71) — **must become** `--exclude check-op`.
+  *(Found during execution, not in the original blast-radius
+  sweep — see "Bugs fixed during this work". Without it, clippy
+  tries to build the `no_std`/`panic=abort` operation binary and
+  fails with "unwinding panics are not supported without std".)*
 - `src/Cargo.toml` `members` references operations by path
   (`operations/check`), not package name — **unaffected** by the
   rename; this phase only *adds* `crates/check` to it.
@@ -301,9 +308,20 @@ Phase 1 is complete when:
 
 ### Bugs fixed during this work
 
-To be filled in if the ABI/rename work surfaces anything (e.g.
-a stale `check` package reference not found in the blast-radius
-sweep).
+- **`scripts/check-rust.sh` clippy exclude lists.** The original
+  blast-radius sweep found only the `Makefile` `cargo test`
+  exclude, but `check-rust.sh` carries the operation-binary
+  exclude list in two more places (the clippy `--fix` and clippy
+  check invocations). Leaving them as `--exclude check` made
+  clippy attempt to build the renamed `check-op` `no_std` /
+  `panic = "abort"` binary in the dev profile (where the
+  per-package `panic = "abort"` is ignored — "profiles for the
+  non root package will be ignored"), failing with "unwinding
+  panics are not supported without std". Caught by
+  `pre-commit run --all-files`; fixed by renaming both to
+  `--exclude check-op`. Lesson for future renames: grep the
+  whole repo for the package name in *every* exclude list, not
+  just the Makefile.
 
 ### Documentation index maintenance
 

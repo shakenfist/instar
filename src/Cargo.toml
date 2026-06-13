@@ -1,4 +1,4 @@
 [workspace]
 resolver = "2"
-members = ["vmm", "shared", "core", "crates/qcow2", "crates/raw", "crates/vmdk", "crates/vhd", "crates/vhdx", "crates/create", "crates/luks", "crates/measure", "crates/rebase", "crates/resize", "crates/commit", "crates/snapshot", "operations/info", "operations/copy", "operations/check", "operations/compare", "operations/convert", "operations/create", "operations/measure", "operations/rebase", "operations/resize", "operations/commit", "operations/map", "operations/snapshot"]
+members = ["vmm", "shared", "core", "crates/qcow2", "crates/raw", "crates/vmdk", "crates/vhd", "crates/vhdx", "crates/create", "crates/luks", "crates/measure", "crates/rebase", "crates/resize", "crates/commit", "crates/snapshot", "crates/check", "operations/info", "operations/copy", "operations/check", "operations/compare", "operations/convert", "operations/create", "operations/measure", "operations/rebase", "operations/resize", "operations/commit", "operations/map", "operations/snapshot"]
 exclude = ["fuzz"]

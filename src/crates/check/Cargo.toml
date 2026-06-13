@@ -1,0 +1,17 @@
+[package]
+name = "check"
+version = "0.1.0"
+edition = "2021"
+description = "Pure planner crate for qcow2 check --repair (leak reclamation + refcount/COPIED rebuild, no I/O)"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+shared   = { path = "../../shared" }
+qcow2    = { path = "../qcow2", default-features = false }
+snapshot = { path = "../snapshot", default-features = false }
+
+[dev-dependencies]
+shared   = { path = "../../shared" }
+qcow2    = { path = "../qcow2", default-features = false }
+snapshot = { path = "../snapshot", default-features = false }
