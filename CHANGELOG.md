@@ -687,6 +687,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **qcow2 sub-byte refcounts corrupted on `create` and `resize
+  --shrink` (#365).** `crates/qcow2::create::build_header` hardcoded
+  the header's `refcount_order` field to the 16-bit default instead
+  of deriving it from `refcount_bits`, and `set_refcount_to_one`
+  packed sub-byte (1/2/4-bit) refcount entries MSB-first while qemu
+  (and instar's own `lookup_refcount`) are LSB-first. Both writers
+  are shared by `create` and by the `resize --shrink` header rebuild,
+  so `instar create -o refcount_bits=1` and `instar resize --shrink`
+  on a `refcount_bits` 1/2/4 image produced files that exited 0 but
+  failed `qemu-img check` (referenced clusters left at refcount 0).
+  `build_header` now derives `refcount_order = log2(refcount_bits)`
+  and sub-byte widths pack LSB-first; `create` and `resize --shrink`
+  across `refcount_bits` 1/2/4/16 are `qemu-img check`-clean. The
+  differential fuzzer's create and resize pickers gained a
+  `refcount_bits` dimension to guard the path.
+
 - **Sub-byte refcount accessors used the wrong bit order.** The
   `snapshot` crate's `read_refcount_in_block` /
   `set_refcount_in_block` (lifted from `resize::qcow2`, which now
@@ -697,11 +713,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   cross-check against `qcow2::lookup_refcount` and pinned
   byte-exactly against the qemu source. Production impact was
   limited: the snapshot mutating modes refuse `refcount_bits !=
-  16`. Known issue: `instar resize --shrink` still corrupts
-  sub-byte-refcount images through a separate width assumption
-  in its shrink path (exit 0, `qemu-img check` errors); that
-  pre-existing bug is tracked separately and is unaffected by
-  the snapshot work.
+  16`. (The separate `instar resize --shrink` / `create`
+  sub-byte corruption noted here originally is now also fixed —
+  see the entry below.)
 
 - **Snapshot list rows over-padded multibyte UTF-8 names.**
   qemu's `qemu-img snapshot -l` pads the ID and TAG columns with

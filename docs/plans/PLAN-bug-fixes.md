@@ -187,7 +187,7 @@ a per-issue basis.
 |-------|------|--------|
 | 1. Category A: Fixed-VHD `virtual_size` overflow guard | [PLAN-bug-fixes-phase-01-fixed-vhd-overflow.md](PLAN-bug-fixes-phase-01-fixed-vhd-overflow.md) | Complete (commit `bbfdfc9`) |
 | 2. Category B: VHDX resize sequence-number overflow | [PLAN-bug-fixes-phase-02-vhdx-resize-seqnum.md](PLAN-bug-fixes-phase-02-vhdx-resize-seqnum.md) | Complete (commit `514c52a`) |
-| 3. Category C: qcow2 shrink sub-byte refcount corruption | [PLAN-bug-fixes-phase-03-qcow2-shrink-subbyte-refcount.md](PLAN-bug-fixes-phase-03-qcow2-shrink-subbyte-refcount.md) | Not started |
+| 3. Category C: qcow2 shrink sub-byte refcount corruption | [PLAN-bug-fixes-phase-03-qcow2-shrink-subbyte-refcount.md](PLAN-bug-fixes-phase-03-qcow2-shrink-subbyte-refcount.md) | Complete (commit `a54cef8`) |
 
 Phases are independent and can land in any order. The
 recommended order is by ascending risk and difficulty: Phase 1
@@ -287,8 +287,18 @@ the phases land.
   #353, #355, #357, #361, #362, #363, #367.
 * **Category B — VHDX resize sequence-number overflow (2 issues):**
   #354, #360.
-* **Category C — qcow2 shrink sub-byte refcount corruption (1 issue):**
-  #365.
+* **Category C — qcow2 shrink sub-byte refcount corruption (1 issue,
+  commit `a54cef8`):** #365. The root cause turned out to be broader
+  than the resize shrink path: two shared write-side width assumptions
+  in `crates/qcow2::create` (`build_header` hardcoded `refcount_order`
+  to the 16-bit default; `set_refcount_to_one` packed sub-byte widths
+  MSB-first instead of qemu's LSB-first). Both are reached by the shrink
+  header rebuild *and* by plain `create`, so the same fix also resolved
+  a latent **`instar create -o refcount_bits=N` corruption** for
+  `refcount_bits != 16`. The integration suites' known-divergence skips
+  for the qcow2 rb-1/rb-8/rb-64 create and resize cases were removed
+  (they now run live and match qemu), and the differential fuzzer's
+  create and resize pickers gained a `refcount_bits` dimension.
 
 ### Documentation index maintenance
 
