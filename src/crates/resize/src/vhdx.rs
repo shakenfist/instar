@@ -72,6 +72,16 @@ pub(crate) fn plan_grow<'a>(
         return Ok(ResizePlan::new(ResizeAction::NoOp, opts.current_file_size));
     }
 
+    // Both grow flavours below write the two header copies at
+    // `current_sequence_number + 1` and `+ 2`. The sequence number comes
+    // straight from the parsed (attacker-controllable) header, so guard the
+    // increment here rather than at each call site: a value within 2 of
+    // u64::MAX would overflow. A real VHDX never reaches that sequence number
+    // — a header claiming it is corrupt — so reject it loudly.
+    if opts.current_sequence_number > u64::MAX - 2 {
+        return Err(ResizeError::Overflow);
+    }
+
     let (target_total_bat_entries, _chunk_ratio, _payload_blocks) = calculate_bat_layout(
         opts.new_virtual_size,
         opts.block_size,
