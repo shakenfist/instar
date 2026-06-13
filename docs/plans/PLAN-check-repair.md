@@ -1,0 +1,413 @@
+# `instar check --repair` for QCOW2
+
+## Prompt
+
+Before responding to questions or discussion points in this
+document, explore the instar codebase thoroughly. Read relevant
+source files, understand existing patterns (VMM structure, guest
+operation layout, shared crate conventions, call table ABI,
+format parsing, test infrastructure), and ground your answers in
+what the code actually does today. Do not speculate about the
+codebase when you could read it instead. Where a question touches
+on external concepts (the QCOW2 refcount / L1 / L2 / snapshot
+metadata model, `qemu-img check -r` semantics, the `corrupt`
+header bit, KVM/virtio), research as needed to give a confident
+answer. Flag any uncertainty explicitly rather than guessing.
+
+The authoritative external references for repair semantics are
+the qemu sources — `block/qcow2-refcount.c`
+(`qcow2_check_refcounts`, `check_refcounts_l1`,
+`check_refcounts_l2`, `rebuild_refcount_structure`,
+`qcow2_check_fix_snapshots`) and `block/qcow2.c`
+(`qcow2_co_check_locked`, the `BdrvCheckResult` /
+`BdrvCheckMode` model) — plus the on-disk layout in
+`docs/qcow2/qcow2-refcount.md`, `docs/qcow2/qcow2-l1l2-tables.md`,
+and `docs/qcow2/qcow2-format.md`.
+
+All planning documents go into `docs/plans/`. Consult
+`ARCHITECTURE.md` for the host VMM / KVM guest / call-table
+structure, `AGENTS.md` for build commands and conventions, and
+`docs/commentary/` for design rationale.
+
+When we get to detailed planning, each phase gets its own plan
+file named `PLAN-check-repair-phase-NN-descriptive.md` in this
+directory, tracked via the Execution table below.
+
+I prefer one commit per logical change, and at minimum one
+commit per phase. Each commit should be self-contained: it
+should build, pass tests, and have a clear commit message
+explaining what changed and why.
+
+## Situation
+
+`instar check` is feature-complete as a *reporting* tool. The
+guest binary (`src/operations/check/src/main.rs`) does a full
+QCOW2 walk — header validation, L1/L2 traversal, overlap
+detection, refcount validation at all widths (1–64 bit), leak
+detection, dirty/corrupt flag handling, extended-L2 subclusters,
+and external data files — and reports the findings back through
+the `CheckResult` wire struct. That struct already classifies
+findings into the granular buckets repair will need
+(`src/shared/src/lib.rs`, the "Check operation configuration and
+results" block):
+
+- `corruptions` — data-integrity issues (out-of-bounds offsets,
+  overlapping metadata).
+- `leaks` — allocated-but-unreferenced clusters. The check op
+  deliberately treats these as non-fatal: leaks do **not** clear
+  `FLAG_VALID`, because the data is intact and the space is
+  simply wasted (`check/src/main.rs:262-272`). This already
+  mirrors qemu's distinction between "leaks" (exit 3) and
+  "errors" (exit 2).
+- `refcount_errors` — refcount table/block inconsistencies.
+- `chain_errors` — backing-chain validation problems.
+- `subcluster_errors` — extended-L2 subcluster bitmap problems.
+
+What is **missing** is any code that *acts* on those findings.
+The repair capability is a reserved-but-dead ABI placeholder:
+
+- `CheckConfig::FLAG_REPAIR = 1 << 0` exists with the comment
+  "Attempt to repair errors (future feature)", and
+  `should_repair()` reads it — but nothing consumes the result.
+- `src/vmm/src/main.rs:86` defines `CHECK_CONFIG_FLAG_REPAIR`
+  and **never references it again** — there is no `--repair`
+  flag on the host `check` CLI surface, so the bit can never
+  even be set today.
+- There is no repair logic anywhere in `src/operations/` or
+  `src/crates/`.
+
+Meanwhile, phases 5–8 of `PLAN-snapshot.md` landed a complete,
+well-tested set of pure QCOW2 refcount/L1/L2 mutator primitives
+in `src/crates/snapshot/` (`set_refcount_in_block`,
+`read_refcount_in_block`, `check_refcount_after_addend`,
+`alloc_cluster_in_refblocks`, `for_each_cluster_in_l1`,
+`update_snapshot_refcount`, `update_copied_flags_for_l1`, plus
+the COPIED-flag rewriters). These are exactly the operations a
+refcount repair needs. The mutators are pure functions over
+staged byte slices with no I/O, 128 unit tests, and fuzz
+coverage — so repair can build on a hardened foundation rather
+than re-deriving refcount-width arithmetic.
+
+This plan was promoted from phase 2 of
+[PLAN-convert-followups.md](PLAN-convert-followups.md). That
+umbrella plan tracked two deferred items: the seven `qemu-img`
+subcommands (all now shipped, each as its own master plan) and
+`check --repair`. Following the precedent that each subcommand
+became its own master plan rather than a convert-followups phase,
+`check --repair` gets the same treatment here. convert-followups'
+phase-2 row is repointed at this plan.
+
+### Scope
+
+**In scope (v1):** QCOW2 only. QCOW2 has by far the richest
+metadata to repair and is the only format whose corruption is
+both common and mechanically repairable. The repair tiers mirror
+`qemu-img check -r`:
+
+- `--repair=leaks` — the **safe tier**. Reclaim
+  allocated-but-unreferenced clusters by decrementing their
+  refcounts to zero. This is purely additive to free space and
+  cannot lose guest-visible data.
+- `--repair=all` — the safe tier **plus** the lossy tier:
+  rebuild/correct refcount structures, reconcile the
+  refcount↔COPIED invariant, and clear the header `corrupt`
+  bit once the image validates clean.
+
+**Out of scope (deferred, see Future work):** repair for VMDK /
+VHD / VHDX; `qemu-img amend`; snapshot-table repair beyond what
+`qcow2_check_fix_snapshots` does for refcounts; refcount-table
+*growth* during repair (the snapshot allocator returns
+`RefcountExhausted` rather than growing — repair inherits that
+limit and reports it rather than guessing).
+
+## Mission and problem statement
+
+After this plan lands:
+
+1. `instar check --repair=leaks <image.qcow2>` reclaims leaked
+   clusters in place and reports the count reclaimed, matching
+   `qemu-img check -r leaks` exit codes and post-repair state.
+2. `instar check --repair=all <image.qcow2>` additionally
+   rebuilds inconsistent refcounts, restores the
+   refcount↔COPIED invariant, and clears the `corrupt` header
+   bit when the result validates clean, matching
+   `qemu-img check -r all`.
+3. Repair runs **inside the KVM guest**, consistent with every
+   other mutating operation (resize / commit / snapshot all
+   mutate the live image via the `write_*_sector` call-table
+   primitives). No new trust boundary is introduced.
+4. A corrupt fixture that `qemu-img check -r` can repair is
+   repaired byte-equivalently (or at minimum to a state
+   `qemu-img check` declares clean) by instar, verified in
+   integration tests and differential fuzzing.
+5. The repair mutators reuse `src/crates/snapshot/`'s primitives
+   wherever possible; any genuinely new pure logic lands in a
+   `repair` module (a `src/crates/check/` planner crate, or a
+   `repair` submodule of an existing crate — open question 1).
+6. No regression to the existing reporting path: `instar check`
+   with no `--repair` flag is byte-identical in output and exit
+   code.
+
+## Design overview: the repair safety model
+
+The single most important design decision in this plan is the
+safety model, because a buggy repair does not fail loudly — it
+silently corrupts an image the user explicitly asked us to fix.
+"Force the user to take a backup first" is the blunt framing and
+we **reject it**, for three reasons: `qemu-img check -r` does not
+do it (parity is instar's whole purpose); mandating a full copy
+of a potentially terabyte-scale image to reclaim a few leaked
+clusters is absurd UX; and in-place mutation is the established
+house style for every instar mutating op. Instead, safety comes
+from five concrete properties:
+
+### 1. Tiering: safe vs lossy, mirroring qemu
+
+| Tier | Flag | Operations | Reversibility |
+|------|------|------------|---------------|
+| Safe | `leaks` | Decrement refcount of allocated-but-unreferenced clusters to 0 | **Lossless** — only frees space provably referenced by nothing |
+| Lossy | `all` | Rebuild refcount structures, reconcile COPIED flags, clear `corrupt` bit | **Potentially lossy** — resolves ambiguity; a wrong guess discards a reference |
+
+`leaks` is the only tier we can promise is non-destructive. It is
+the conservative default the documentation steers users toward.
+`all` is opt-in and carries an explicit warning in `--help` and
+docs.
+
+### 2. Dry-run is already the default — and it is free
+
+Plain `instar check` (no `--repair`) is the dry run: it walks the
+image and reports every finding without writing a byte. Users
+preview exactly what repair would target before opting in. We do
+**not** need a separate `--dry-run` flag; the absence of
+`--repair` *is* the dry run, matching qemu.
+
+### 3. In-place mutation, no mandatory backup
+
+Repair patches the live file through `write_input_sector` /
+`write_output_sector`, exactly as resize/commit/snapshot do. We
+do not copy, stage-to-temp-then-rename, or force a `.bak`. The
+docs note that `all` is destructive and recommend (not require) a
+backup for valuable images — the same posture as `qemu-img`.
+
+### 4. Crash-safe write ordering, guarded by the `corrupt` bit
+
+This is the property that actually protects the user, and the one
+a backup cannot provide. If the guest dies mid-repair the image
+must not be left *worse*. We follow qemu's discipline:
+
+- Set the header `corrupt` bit (incompatible feature bit 1)
+  **before** the first structural write, so an interrupted
+  repair leaves an image that refuses to open read-write until
+  re-repaired, rather than one that silently mis-reads.
+- Write new/rebuilt refcount blocks **before** repointing the
+  refcount table at them; `fsync` between ordering-critical
+  phases (the snapshot work added `fsync_input` to the call
+  table — repair reuses it).
+- Clear the `corrupt` bit **last**, only after a final in-guest
+  re-validation pass reports zero corruptions/refcount errors.
+
+### 5. Refuse rather than guess
+
+Where a corruption is ambiguous and qemu itself would bail (e.g.
+a refcount-table entry pointing outside the file, an L1 entry
+whose L2 cluster overlaps the refcount structures), repair
+reports the condition and exits non-zero **without writing**,
+rather than fabricating a plausible-but-wrong fix. Repair only
+acts where the correct outcome is mechanically determined by the
+rest of the metadata. The snapshot allocator's `RefcountExhausted`
+path (no refcount-table growth) is one such refuse-don't-guess
+boundary inherited directly.
+
+## Open questions
+
+### 1. Where do the repair mutators live?
+
+Working answer: a **new `src/crates/check/` planner crate**,
+parallel to `snapshot` / `commit` / `rebase`, depending on
+`shared` + `qcow2` + `snapshot` (to reuse the refcount/L1/L2
+primitives). Rationale mirrors snapshot phase 5's: the `qcow2`
+crate is read-mostly and should not gain mutation surface; the
+existing `check` *operation* binary is not a library; one crate
+per mutating operation is the convention. The reporting-side
+walk logic currently in `src/operations/check/src/main.rs` may
+be partially lifted into this crate so repair and report share a
+single traversal — phase 1 decides how much to lift vs leave.
+
+*Alternative considered:* a `repair` submodule inside
+`src/crates/snapshot/`. Rejected — repair is not a snapshot
+operation and would muddy that crate's purpose, though it is the
+heaviest consumer of snapshot's primitives.
+
+### 2. `--repair` flag surface: `leaks`/`all` enum or bare bool?
+
+Working answer: **`--repair[=leaks|all]`** with `leaks` as the
+value when bare, matching `qemu-img check -r` (which takes
+`leaks`/`all`). This needs a second ABI flag bit
+(`FLAG_REPAIR_ALL`) alongside the existing `FLAG_REPAIR`, since
+the wire `CheckConfig` only has one repair bit today. Phase 1
+adds it.
+
+### 3. Does repair need a new call-table primitive?
+
+Working answer: **no**. Repair writes via the existing
+`write_input_sector` (the input image is the repair target) and
+orders via `fsync_input` — both already in the call table from
+prior work. This mirrors snapshot's mutating modes, which added
+no primitive in phase 5+. Confirm during phase 1 that
+`write_input_sector` + `fsync_input` cover every repair write;
+if a read-modify-write at sub-sector granularity needs a bounce
+buffer, reuse the resize/snapshot bounce pattern rather than a
+new primitive.
+
+### 4. Refcount repair: in-place correction or full rebuild?
+
+Working answer: **both, tiered**. For `leaks` and isolated
+single-cluster refcount mismatches, correct in place (the
+snapshot `set_refcount_in_block` primitive). For an image whose
+refcount structure is broadly inconsistent, qemu's
+`rebuild_refcount_structure` recomputes the entire refcount table
+from the L1/L2 walk and writes a fresh structure. v1 working
+answer: implement in-place correction for `leaks` and bounded
+mismatches; implement full rebuild for `all` only if the
+in-place path cannot converge. Phase 3 (the lossy tier) settles
+how far to go; a reasonable v1 floor is "match qemu on the
+adversarial fixtures we test."
+
+### 5. How is success measured against qemu-img?
+
+Working answer: **post-repair `qemu-img check` cleanliness**,
+not byte-identity of the repaired image. qemu's repair makes
+allocation choices (which cluster to claim) that instar need not
+reproduce bit-for-bit. The integration and differential tests
+assert that after `instar check --repair`, `qemu-img check`
+reports the image clean and `qemu-img info` / `qemu-img compare`
+agree on guest-visible data. Byte-identity is a non-goal.
+
+### 6. Exit-code semantics
+
+Working answer: **match `qemu-img check -r`**. After a
+successful repair, qemu re-checks and returns 0 if clean, 3 if
+only leaks remain, 2 if corruptions remain. instar's VMM already
+maps `CheckResult` counters to exit codes for the report path;
+repair extends that mapping to "counters *after* repair". Phase 5
+(host CLI) owns this.
+
+## Execution
+
+| Phase | Plan | Status |
+|-------|------|--------|
+| 1. ABI + crate scaffolding: add `FLAG_REPAIR_ALL` to `CheckConfig`, repair-result counters (`leaks_fixed`, `refcounts_fixed`, `corruptions_fixed`) to `CheckResult`, create `src/crates/check/` planner crate depending on `shared`+`qcow2`+`snapshot`, confirm `write_input_sector`/`fsync_input` suffice (open questions 1–3) | PLAN-check-repair-phase-01-abi.md | Not started |
+| 2. Leak-reclamation planner (safe tier): pure logic over staged refblocks that, given the report walk's leak set, decrements the offending refcounts to zero; reuses `set_refcount_in_block`; unit tests over synthetic refblock buffers | PLAN-check-repair-phase-02-leak-planner.md | Not started |
+| 3. Refcount-rebuild + COPIED reconciliation planner (lossy tier): in-place correction and, where needed, full refcount-structure rebuild from the L1/L2 walk; restores the refcount↔COPIED invariant via `update_copied_flags_for_l1`; refuse-don't-guess boundaries (open questions 4–5) | PLAN-check-repair-phase-03-refcount-planner.md | Not started |
+| 4. Guest binary wiring: dispatch `FLAG_REPAIR`/`FLAG_REPAIR_ALL` in `src/operations/check/`, the crash-safe write-ordering sequence (set `corrupt` bit → write → fsync → re-validate → clear `corrupt` bit), emit repair-result counters | PLAN-check-repair-phase-04-guest.md | Not started |
+| 5. Host CLI: `--repair[=leaks\|all]` clap surface, `--help` warning on `all`, `CheckConfig` flag plumbing, post-repair exit-code mapping matching `qemu-img check -r` (open question 6) | PLAN-check-repair-phase-05-host.md | Not started |
+| 6. Cross-version baselines: corrupt qcow2 fixtures (leaked cluster, refcount mismatch, stale COPIED, set `corrupt` bit) and their post-`qemu-img -r` clean references across the version matrix | PLAN-check-repair-phase-06-baselines.md | Not started |
+| 7. Integration tests (`tests/test_check_repair.py`): corrupt-fixture → `instar check --repair` → post-op `qemu-img check`/`info`/`compare` clean; leaks-vs-all tiering; refuse-don't-guess paths exit non-zero without writing; qcow2-only enforcement | PLAN-check-repair-phase-07-integration.md | Not started |
+| 8. Coverage-guided fuzzing of the repair planners (`fuzz_check_repair`): corrupt refblock/L1/L2 buffers in, assert no panic and no out-of-bounds write | PLAN-check-repair-phase-08-fuzz-coverage.md | Not started |
+| 9. Differential fuzzing: random corruptions injected into a valid image, repaired by both instar and qemu-img, results compared for `qemu-img check` cleanliness and guest-data equivalence | PLAN-check-repair-phase-09-fuzz-differential.md | Not started |
+| 10. Docs, CHANGELOG, follow-ups: `docs/qcow2/qcow2-refcount.md` repair section, `docs/usage.md` + `--help`, `ARCHITECTURE.md`/`README.md`/`AGENTS.md`, strike through convert-followups phase 2 | PLAN-check-repair-phase-10-docs.md | Not started |
+
+Phase plans are written one at a time, at the effort level the
+phase warrants, as each is scheduled — matching how the snapshot
+family was rolled out. Phases 1, 3, and 4 are high-effort opus
+(ABI/safety-ordering judgment, lossy-repair correctness); phases
+2, 5, 8 are medium; phases 6, 7, 9, 10 follow established
+fixture/test/doc patterns.
+
+## Agent guidance
+
+### Execution model
+
+All implementation work is done by sub-agents, never in the
+management session. The management session is reserved for
+planning, review, and decision-making. The workflow per step:
+plan at high effort → spawn a sub-agent with the brief →
+review the actual changed files (not the summary) → fix/retry or
+commit. Use `isolation: "worktree"` for the structural-repair
+phases (3, 4) where a wrong write is costly; safer phases can
+work in the main tree.
+
+### Planning effort
+
+This master plan is high-effort. Per-phase effort is noted in the
+Execution table. The refcount-rebuild phase (3), the crash-safe
+write-ordering guest phase (4), and the ABI phase (1) are the
+high-stakes ones — refcount/metadata repair is subtle and easy to
+corrupt further, which is precisely the failure mode the safety
+model exists to prevent.
+
+### Management session review checklist
+
+After each step:
+
+- [ ] The intended files changed; no unrelated files touched.
+- [ ] `make instar` builds, `make lint` clean.
+- [ ] Guest binaries pass `make check-binary-sizes` (384KB cap;
+      the check binary grows — watch its budget).
+- [ ] `make test-rust` and the relevant `make test-integration`
+      pass.
+- [ ] `pre-commit run --all-files` passes.
+- [ ] **Safety-model invariants hold:** the dry-run pass never
+      writes; `leaks` tier never touches a referenced cluster;
+      the `corrupt` bit is set before the first structural write
+      and cleared only after a clean re-validation; refuse-
+      don't-guess paths exit non-zero without writing.
+- [ ] Repair planners reuse `src/crates/snapshot/` primitives
+      rather than re-deriving refcount-width arithmetic.
+- [ ] No `unsafe` beyond what the existing crates require; the
+      planner crate is safe Rust top-to-bottom.
+
+## Administration and logistics
+
+### Success criteria
+
+* `make instar` builds and `make lint` is clean.
+* Guest binaries pass `make check-binary-sizes` (384KB limit).
+* All Rust unit tests pass (`make test-rust`).
+* All Python integration tests pass (`make test-integration`),
+  including the new `tests/test_check_repair.py`.
+* `pre-commit run --all-files` passes.
+* Repair logic lives in a `no_std`-compatible shared crate under
+  `src/crates/`, reusing `src/crates/snapshot/` primitives.
+* `instar check --repair=leaks` and `=all` produce images that
+  `qemu-img check` declares clean across the corrupt-fixture
+  matrix; differential fuzzing finds no divergence in
+  cleanliness or guest-visible data.
+* The reporting-only `instar check` path is byte-identical.
+* Docs (`docs/qcow2/qcow2-refcount.md`, `docs/usage.md`),
+  `--help`, `ARCHITECTURE.md`, `README.md`, `AGENTS.md`, and
+  `CHANGELOG.md` are updated; convert-followups phase 2 is
+  struck through.
+
+### Future work
+
+* **Repair for VMDK / VHD / VHDX.** QCOW2 first because its
+  metadata is the richest and most mechanically repairable.
+* **Refcount-table growth during repair.** Inherited limit from
+  the snapshot allocator's `RefcountExhausted` boundary; repair
+  reports rather than grows. Lift resize's growth helper if a
+  real workflow demands it.
+* **`qemu-img amend`** as a sibling capability (changing image
+  options post-creation).
+* **Snapshot-table structural repair** beyond refcount fixes.
+
+### Bugs fixed during this work
+
+To be filled in as development surfaces bugs (e.g. if the repair
+walk reveals a gap in the existing `check` reporting walk, fixing
+it is in scope and recorded here).
+
+### Documentation index maintenance
+
+* `index.md` — add a *Master plans* row (date 2026-06-13, link,
+  intent, status "Drafted, not started", phase links as written).
+* `order.yml` — add `PLAN-check-repair.md` after
+  `PLAN-snapshot.md`. Phase files are not added to `order.yml`.
+* `PLAN-convert-followups.md` — repoint the phase-2 row at this
+  master plan.
+
+### Back brief
+
+Before executing any step of this plan, please back brief the
+operator as to your understanding of the plan and how the work
+you intend to do aligns with that plan.

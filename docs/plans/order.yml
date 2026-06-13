@@ -19,5 +19,6 @@
 - PLAN-rebase-commit.md: instar rebase and commit subcommands
 - PLAN-map.md: instar map subcommand
 - PLAN-snapshot.md: instar snapshot subcommand
+- PLAN-check-repair.md: instar check --repair for QCOW2
 - PLAN-fuzzing-bugs.md: Fuzzing bug backlog
 - PLAN-bug-fixes.md: June 2026 fuzzer bug backlog
