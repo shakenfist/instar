@@ -294,9 +294,21 @@ commit (the phase).
 
 ### Bugs fixed during this work
 
-To be filled in if wiring surfaces anything (e.g. a detector
-`cidx`-math edge case exposed when the repair pass reuses it, or
-a sector/cluster boundary bug in the write-back).
+- **Snapshot-blind-spot corruption guard (follow-up commit).**
+  Found while planning phase 5: `check_qcow2` does not walk
+  snapshot L1/L2 tables (it only reports `nb_snapshots`), so the
+  detection `bmp` omits clusters referenced only by an internal
+  snapshot. On a diverged-snapshot image those clusters have
+  `refcount > 0` but test `!bmp`, so the leaks-tier reclamation
+  would free them and corrupt the snapshot. (Read-only `check`
+  already over-reports them as leaks — a pre-existing detection
+  false-positive; repair weaponised it.) Fix: the guest refuses
+  leak repair when `hdr.nb_snapshots > 0` (reclaim nothing, set
+  `FLAG_REPAIR_INCOMPLETE`). Verified on a diverged-snapshot
+  fixture (instar reports 67 false leaks; `--repair` leaves the
+  image byte-identical and `qemu-img check` clean with the
+  snapshot intact). Snapshot-aware recount is future work (it
+  needs the snapshot-table walk phase 5 also defers).
 
 ### Documentation index maintenance
 

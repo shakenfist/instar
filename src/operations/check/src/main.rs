@@ -2962,7 +2962,20 @@ unsafe fn check_qcow2(
             // unreferenced — crash-safe, no corrupt-bit action. The
             // post-repair result reflects the reclaimed leaks (matching
             // qemu's re-check-after-repair), without a second full walk.
-            if repair {
+            if repair && hdr.nb_snapshots > 0 {
+                // SAFETY: the detection walk does not traverse snapshot L1/L2
+                // tables, so the reference bitmap `bmp` omits clusters
+                // referenced only by an internal snapshot (e.g. clusters the
+                // active image has since diverged from via copy-on-write).
+                // Such a cluster has refcount > 0 but tests `!bmp`, so leak
+                // reclamation would free it and corrupt the snapshot. Refuse
+                // repair on snapshotted images and report it incomplete; the
+                // snapshot-aware recount is future work (see phase 5 scope).
+                (call_table.debug_print)(
+                    b"check: refusing leak repair on snapshotted image\n\0".as_ptr(),
+                );
+                result.flags |= CheckResult::FLAG_REPAIR_INCOMPLETE;
+            } else if repair {
                 (call_table.verbose_print)(b"check: reclaiming leaked clusters\n\0".as_ptr());
                 let reclaimed = repair_leaks_qcow2(
                     call_table,
