@@ -40,6 +40,52 @@ use shared::{
     CALL_TABLE_ADDR, MAX_SECTOR_SIZE,
 };
 
+// ---------------------------------------------------------------------------
+// Repair scratch layout (qcow2 --repair leaks tier)
+// ---------------------------------------------------------------------------
+//
+// The leaks-tier repair pass (repair_leaks_qcow2) stages one whole
+// refcount block (refblock) cluster at a time and writes it back via a
+// sector read-modify-write bounce. These two buffers live at the TOP of
+// the scratch region (just below the bump-allocator heap), because the
+// overlap-detection bitmap (BitmapContext::init_in_scratch) grows
+// FORWARD from SCRATCH_MEM_BASE and must stay live throughout repair
+// (the is_referenced predicate tests it). Anchoring the repair buffers
+// at the top keeps them clear of the bitmap; repair_leaks_qcow2 still
+// runtime-guards that the bitmap does not extend up into them before
+// touching the image (see the bmp.size check there).
+//
+// Sized to the maximum qcow2 cluster (2 MiB): one refblock is exactly
+// one cluster, so the buffer must hold a full cluster's worth of
+// refcount entries. The RMW bounce is one sector for partial-sector
+// write-back.
+
+/// Maximum qcow2 cluster size (cluster_bits maxes at 21 -> 2 MiB).
+/// A refblock is one cluster, so this bounds the staging buffer.
+const REPAIR_REFBLOCK_LIMIT: usize = 2 * 1024 * 1024;
+
+/// Sector-sized read-modify-write bounce for partial-sector write-back.
+const REPAIR_RMW_BOUNCE_LIMIT: usize = MAX_SECTOR_SIZE;
+
+/// RMW bounce buffer base — placed flush against the allocator heap.
+const REPAIR_RMW_BOUNCE: usize = shared::ALLOC_HEAP_BASE - REPAIR_RMW_BOUNCE_LIMIT;
+
+/// Refblock staging buffer base — sits below the RMW bounce.
+const REPAIR_REFBLOCK_BUF: usize = REPAIR_RMW_BOUNCE - REPAIR_REFBLOCK_LIMIT;
+
+// Compile-time guard: the repair staging region must fit between
+// SCRATCH_MEM_BASE and the allocator heap (no overlap with the heap,
+// and not below the scratch base). The bitmap's dynamic extent is
+// checked at runtime in repair_leaks_qcow2.
+const _: () = assert!(
+    REPAIR_REFBLOCK_BUF >= shared::SCRATCH_MEM_BASE,
+    "repair refblock buffer is below SCRATCH_MEM_BASE"
+);
+const _: () = assert!(
+    REPAIR_RMW_BOUNCE + REPAIR_RMW_BOUNCE_LIMIT <= shared::ALLOC_HEAP_BASE,
+    "repair scratch layout overlaps the allocator heap"
+);
+
 /// Entry point called by core after devices are initialized.
 ///
 /// Returns the number of bytes read/checked.
@@ -58,6 +104,19 @@ pub unsafe extern "C" fn _start() -> u64 {
     // the guest operation only needs the unsafe_quirks flag.
     let unsafe_quirks = if config.is_valid() {
         config.unsafe_quirks_enabled()
+    } else {
+        false
+    };
+    // Repair tier selection (qcow2 only; honoured inside check_qcow2).
+    // should_repair() => the safe leaks tier; should_repair_all() => the
+    // lossy all tier (deferred to a later phase, flagged INCOMPLETE).
+    let repair = if config.is_valid() {
+        config.should_repair()
+    } else {
+        false
+    };
+    let repair_all = if config.is_valid() {
+        config.should_repair_all()
     } else {
         false
     };
@@ -158,6 +217,8 @@ pub unsafe extern "C" fn _start() -> u64 {
                 input_sector_size,
                 actual_size,
                 data_file_size,
+                repair,
+                repair_all,
             );
         }
         ImageFormat::Vmdk4 => {
@@ -2102,6 +2163,7 @@ unsafe fn check_vhd(
 /// - Refcount validation (referenced clusters have refcount > 0)
 /// - Leak detection (refcount > 0 but no reference)
 /// - Dirty/corrupt incompatible feature flags (v3 only)
+#[allow(clippy::too_many_arguments)]
 unsafe fn check_qcow2(
     header: &[u8],
     result: &mut CheckResult,
@@ -2109,6 +2171,8 @@ unsafe fn check_qcow2(
     sector_size: usize,
     actual_size: u64,
     data_file_size: u64,
+    repair: bool,
+    repair_all: bool,
 ) -> u64 {
     let mut bytes_read: u64 = 0;
 
@@ -2887,6 +2951,57 @@ unsafe fn check_qcow2(
             }
 
             (call_table.verbose_print)(b"check: leak scan complete\n\0".as_ptr());
+
+            // ---- Leak reclamation (repair, safe leaks tier) ----
+            //
+            // A SEPARATE pass, after the complete reference bitmap is
+            // built and the read-only detection sweep above has run
+            // byte-identically. Guarded by `repair`; qcow2-only (we are
+            // inside check_qcow2). It re-iterates the refcount table and
+            // frees only clusters the whole-image walk proved
+            // unreferenced — crash-safe, no corrupt-bit action. The
+            // post-repair result reflects the reclaimed leaks (matching
+            // qemu's re-check-after-repair), without a second full walk.
+            if repair {
+                (call_table.verbose_print)(b"check: reclaiming leaked clusters\n\0".as_ptr());
+                let reclaimed = repair_leaks_qcow2(
+                    call_table,
+                    sector_size,
+                    &bmp,
+                    refcount_table_offset,
+                    refcount_table_clusters,
+                    cluster_size,
+                    refcount_bits,
+                    entries_per_block,
+                    input_capacity,
+                    actual_size,
+                );
+                // Reclaimed count is bounded by the detected leak count
+                // (the leaks tier only frees proven-unreferenced
+                // clusters), so it fits the u32 result fields.
+                let reclaimed_u32 = reclaimed as u32;
+                result.repaired_leaks = reclaimed_u32;
+                result.leaks = result.leaks.saturating_sub(reclaimed_u32);
+                result.total_errors = result.total_errors.saturating_sub(reclaimed_u32);
+                if result.leaks == 0 {
+                    result.flags &= !CheckResult::FLAG_HAS_LEAKS;
+                } else {
+                    // Some detected leaks could not be reclaimed: the repair
+                    // pass aborted on a capacity boundary (cluster larger
+                    // than the staging buffer, refcount-map bitmap overlap,
+                    // or an oversized refcount table) or a mid-pass I/O
+                    // error. Report the repair as incomplete rather than
+                    // silently leaving leaks behind.
+                    result.flags |= CheckResult::FLAG_REPAIR_INCOMPLETE;
+                }
+                // The lossy `all` tier (recount/COPIED/corrupt-bit) is
+                // deferred. If it was requested, do the safe leaks work
+                // above and mark the repair incomplete.
+                if repair_all {
+                    result.flags |= CheckResult::FLAG_REPAIR_INCOMPLETE;
+                }
+                (call_table.verbose_print)(b"check: leak reclamation complete\n\0".as_ptr());
+            }
         } // end else (reftable_entries within bounds)
     }
 
@@ -3080,6 +3195,291 @@ unsafe fn validate_chain_qcow2_header(
     }
 
     0
+}
+
+/// Read `len` bytes from input device `dev` at `byte_offset` into the
+/// buffer at `dst_ptr`. Sub-sector or unaligned reads go through the
+/// RMW bounce buffer. Mirrors snapshot's `read_input_byte_range`.
+///
+/// # Safety
+///
+/// `call_table` must be the validated CallTable; `dst_ptr` must be
+/// valid for `len` writable bytes; the repair scratch RMW bounce must
+/// be free for the duration of the call.
+unsafe fn read_input_byte_range(
+    call_table: &CallTable,
+    dev: u32,
+    sector_size: usize,
+    byte_offset: u64,
+    dst_ptr: *mut u8,
+    len: usize,
+) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let bounce_ptr = REPAIR_RMW_BOUNCE as *mut u8;
+    let mut done: usize = 0;
+    let mut cur = byte_offset;
+    while done < len {
+        let sector = cur / sector_size as u64;
+        let in_off = (cur % sector_size as u64) as usize;
+        let take = (sector_size - in_off).min(len - done);
+        if in_off == 0 && take == sector_size {
+            if !(call_table.read_input_sector)(dev, sector, dst_ptr.add(done), sector_size) {
+                return false;
+            }
+        } else {
+            if !(call_table.read_input_sector)(dev, sector, bounce_ptr, sector_size) {
+                return false;
+            }
+            core::ptr::copy_nonoverlapping(bounce_ptr.add(in_off), dst_ptr.add(done), take);
+        }
+        done += take;
+        cur += take as u64;
+    }
+    true
+}
+
+/// Write `bytes` to input device `dev` at `byte_offset`. Sub-sector or
+/// unaligned writes go through read-modify-write via the RMW bounce
+/// buffer. Mirrors snapshot's `write_input_byte_range`.
+///
+/// # Safety
+///
+/// `call_table` must be the validated CallTable; the input device must
+/// be open read-write; the repair scratch RMW bounce must be free for
+/// the duration of the call.
+unsafe fn write_input_byte_range(
+    call_table: &CallTable,
+    dev: u32,
+    sector_size: usize,
+    byte_offset: u64,
+    bytes: &[u8],
+) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+    let bounce_ptr = REPAIR_RMW_BOUNCE as *mut u8;
+    let mut done: usize = 0;
+    let mut cur = byte_offset;
+    while done < bytes.len() {
+        let sector = cur / sector_size as u64;
+        let in_off = (cur % sector_size as u64) as usize;
+        let take = (sector_size - in_off).min(bytes.len() - done);
+        if in_off == 0 && take == sector_size {
+            if !(call_table.write_input_sector)(dev, sector, bytes.as_ptr().add(done), sector_size)
+            {
+                return false;
+            }
+        } else {
+            if !(call_table.read_input_sector)(dev, sector, bounce_ptr, sector_size) {
+                return false;
+            }
+            core::ptr::copy_nonoverlapping(bytes.as_ptr().add(done), bounce_ptr.add(in_off), take);
+            if !(call_table.write_input_sector)(dev, sector, bounce_ptr, sector_size) {
+                return false;
+            }
+        }
+        done += take;
+        cur += take as u64;
+    }
+    true
+}
+
+/// Reclaim leaked clusters in a qcow2 image (the safe "leaks" tier).
+///
+/// Runs as a SEPARATE pass AFTER the detection leak sweep has built the
+/// complete reference bitmap `bmp`, so detection stays byte-identical.
+/// Iterates the refcount table exactly as the detector's leak sweep
+/// does (reading each refblock offset from the table), stages each
+/// non-zero refblock cluster into the scratch buffer, and drives the
+/// pure phase-2 planner `check::qcow2::reclaim_leaks_in_refblock`, which
+/// zeroes every entry with `rc > 0` that the `is_referenced` predicate
+/// reports unreferenced. If any entry in a refblock was reclaimed, the
+/// staged cluster is written back at `refblock_off` (length
+/// `cluster_size`). A single `fsync_input(0)` durability barrier runs
+/// after the loop iff anything was written (every reclaimed entry is an
+/// independent safe free, so there is no inter-block ordering
+/// constraint).
+///
+/// The `is_referenced` predicate maps a refblock-local entry index to a
+/// global cluster index `cidx = rt_idx * entries_per_block + local_idx`
+/// and tests `bmp`. This matches the detector's `cidx` math exactly:
+/// the detector computes `cidx = rt_idx * entries_per_block +
+/// global_entry`, where `global_entry` is the entry's 0-based position
+/// within the whole refblock — which, when the planner iterates a
+/// whole staged refblock from `local_idx = 0`, equals `local_idx`.
+/// Refblock clusters were self-marked referenced in `bmp` during the
+/// detector's first pass, so they are never freed.
+///
+/// On any `RepairError` (or a failed read/write, or a bitmap that
+/// extends into the repair scratch), the repair ABORTS: it returns the
+/// count reclaimed so far and leaves the rest of the image untouched.
+/// It never panics. Because each write-back is an independent safe free,
+/// an early abort still leaves a consistent (if still-leaky) image.
+///
+/// Returns the number of leaked clusters reclaimed.
+///
+/// # Safety
+///
+/// `call_table` must be the validated CallTable; the input device must
+/// be open read-write; `bmp` must be the live, completed reference
+/// bitmap from the detection walk; the repair scratch region must be
+/// free.
+#[allow(clippy::too_many_arguments)]
+unsafe fn repair_leaks_qcow2(
+    call_table: &CallTable,
+    sector_size: usize,
+    bmp: &BitmapContext,
+    refcount_table_offset: u64,
+    refcount_table_clusters: u32,
+    cluster_size: u64,
+    refcount_bits: u32,
+    entries_per_block: u64,
+    input_capacity: u64,
+    actual_size: u64,
+) -> u64 {
+    // The staged refblock must fit the buffer (one cluster <= 2 MiB).
+    if cluster_size as usize > REPAIR_REFBLOCK_LIMIT {
+        (call_table.debug_print)(
+            b"check: repair cluster_size exceeds staging buffer; aborting repair\n\0".as_ptr(),
+        );
+        return 0;
+    }
+
+    // The reference bitmap grows forward from SCRATCH_MEM_BASE and must
+    // stay clear of the repair staging region at the top of scratch.
+    // If a large image pushed the bitmap up into the staging buffers,
+    // staging would corrupt the bitmap we test — refuse to repair.
+    if shared::SCRATCH_MEM_BASE + bmp.size > REPAIR_REFBLOCK_BUF {
+        (call_table.debug_print)(
+            b"check: repair bitmap overlaps staging buffer; aborting repair\n\0".as_ptr(),
+        );
+        return 0;
+    }
+
+    // Mirror the detector's refblock-count derivation (lines computing
+    // reftable_entries in the leak sweep) so we iterate identically.
+    const MAX_REFTABLE_ENTRIES: u64 = 16 * 1024 * 1024;
+    let reftable_entries = {
+        let raw = (refcount_table_clusters as u64).saturating_mul(cluster_size / 8);
+        let max_entries = actual_size / 8;
+        core::cmp::min(raw, max_entries)
+    };
+    if reftable_entries > MAX_REFTABLE_ENTRIES {
+        (call_table.debug_print)(
+            b"check: repair reftable_entries exceeds bounds; aborting repair\n\0".as_ptr(),
+        );
+        return 0;
+    }
+
+    let refblock_ptr = REPAIR_REFBLOCK_BUF as *mut u8;
+    let cluster_usize = cluster_size as usize;
+
+    // Cached read of refcount-table entries (one u64 BE per entry),
+    // mirroring the detector's read_u64_be_cached over the table.
+    let mut reftable_cached_sector: u64 = u64::MAX;
+    let mut reftable_cached_buffer = [0u8; MAX_SECTOR_SIZE];
+    let mut scratch_bytes: u64 = 0;
+
+    let mut reclaimed_total: u64 = 0;
+    let mut wrote_anything = false;
+
+    for rt_idx in 0..reftable_entries {
+        let rt_byte_off = match rt_idx
+            .checked_mul(8)
+            .and_then(|v| refcount_table_offset.checked_add(v))
+        {
+            Some(off) => off,
+            None => break,
+        };
+        if rt_byte_off + 8 > actual_size {
+            break;
+        }
+        let refblock_off = match qcow2::read_u64_be_cached(
+            call_table,
+            0,
+            rt_byte_off,
+            sector_size,
+            input_capacity,
+            &mut reftable_cached_sector,
+            reftable_cached_buffer.as_mut_ptr(),
+            &mut scratch_bytes,
+        ) {
+            Some(v) => v,
+            None => break,
+        };
+
+        if refblock_off == 0 {
+            continue;
+        }
+
+        // Stage the whole refblock cluster into the scratch buffer.
+        if !read_input_byte_range(
+            call_table,
+            0,
+            sector_size,
+            refblock_off,
+            refblock_ptr,
+            cluster_usize,
+        ) {
+            (call_table.debug_print)(
+                b"check: repair refblock read failed; aborting repair\n\0".as_ptr(),
+            );
+            break;
+        }
+
+        let refblock = core::slice::from_raw_parts_mut(refblock_ptr, cluster_usize);
+
+        // Drive the pure planner. is_referenced maps the refblock-local
+        // entry index to the global cluster index using the EXACT same
+        // arithmetic the detector used: cidx = rt_idx * entries_per_block
+        // + local_idx (the detector's global_entry == local_idx when the
+        // whole block is iterated from 0). Refblock clusters are
+        // self-marked in bmp, so they test referenced and are not freed.
+        let reclaimed = match check::qcow2::reclaim_leaks_in_refblock(
+            refblock,
+            entries_per_block,
+            refcount_bits,
+            |local_idx| match rt_idx
+                .checked_mul(entries_per_block)
+                .and_then(|v| v.checked_add(local_idx))
+            {
+                Some(cidx) => bmp.test(cidx),
+                // An out-of-range cidx cannot be proven unreferenced;
+                // treat it as referenced so the entry is never freed.
+                None => true,
+            },
+        ) {
+            Ok(n) => n,
+            Err(_) => {
+                (call_table.debug_print)(
+                    b"check: repair planner error; aborting repair\n\0".as_ptr(),
+                );
+                break;
+            }
+        };
+
+        if reclaimed > 0 {
+            // Write the modified refblock cluster back in place.
+            if !write_input_byte_range(call_table, 0, sector_size, refblock_off, refblock) {
+                (call_table.debug_print)(
+                    b"check: repair refblock write failed; aborting repair\n\0".as_ptr(),
+                );
+                break;
+            }
+            wrote_anything = true;
+            reclaimed_total += reclaimed as u64;
+        }
+    }
+
+    // One durability barrier after all write-backs (no inter-block
+    // ordering constraint: each free is independent and crash-safe).
+    if wrote_anything {
+        let _ = (call_table.fsync_input)(0);
+    }
+
+    reclaimed_total
 }
 
 /// Read a refcount entry from a sector buffer at a given byte

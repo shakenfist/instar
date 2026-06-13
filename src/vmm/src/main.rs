@@ -2938,6 +2938,17 @@ struct CheckArgs {
     /// Validate the complete backing file chain
     #[arg(long)]
     chain: bool,
+
+    /// Reclaim leaked clusters in the image (qcow2 only).
+    ///
+    /// Opens the image read-write and frees clusters the integrity
+    /// walk proved unreferenced (the safe "leaks" tier), mirroring
+    /// `qemu-img check -r leaks`. Leak reclamation is crash-safe: a
+    /// partially-applied repair leaves a consistent (if still-leaky)
+    /// image. The full `--repair[=leaks|all]` surface (the lossy
+    /// recount tier) lands in a later phase.
+    #[arg(long)]
+    repair: bool,
 }
 
 #[derive(Args, Debug)]
@@ -6730,6 +6741,12 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     if args.chain {
         check_flags |= CHECK_CONFIG_FLAG_CHAIN;
     }
+    if args.repair {
+        // Safe leaks tier only; FLAG_REPAIR_ALL (the lossy recount
+        // tier) is deliberately not set here — that lands in a later
+        // phase along with the --repair[=leaks|all] CLI surface.
+        check_flags |= CHECK_CONFIG_FLAG_REPAIR;
+    }
     guest_mem.write_obj(CHECK_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
     guest_mem.write_obj(check_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
     debug!("Wrote check config at 0x{OPERATION_CONFIG_ADDR:x} (flags=0x{check_flags:x})");
@@ -6759,6 +6776,35 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
 
         // Write chain config to guest memory
         write_chain_config(&guest_mem, chain)?;
+    } else if args.repair {
+        // Single-device repair mode: open the input read-write so the
+        // guest can reclaim leaked clusters in place. Mirrors
+        // run_snapshot_mutating_guest's read-write open
+        // (BackingStore::open_rw_existing + VirtioBlockDevice::new(..,
+        // false)). Leak reclamation only zeroes refcount entries in
+        // place and never grows the file, so the capacity hint is the
+        // current file size (the same value the read-only path passes
+        // as the device capacity).
+        let capacity_hint = input_size;
+        let input_backing =
+            BackingStore::open_rw_existing(Path::new(&args.input), Some(capacity_hint))?;
+        let input_mmio = device_mmio_base(0);
+        let input_vq = device_vq_base(0);
+        let input_device = VirtioBlockDevice::new(
+            input_backing,
+            capacity_hint,
+            args.sector_size as u64,
+            false, // read-write (repair)
+            input_mmio,
+            input_vq,
+        );
+        debug!(
+            "Created read-write virtio-block device at MMIO 0x{input_mmio:x}, VQ 0x{input_vq:x}"
+        );
+        debug!("  Sector size: {} bytes", input_device.sector_size());
+        let input_device = Arc::new(Mutex::new(input_device));
+        device_set.add_device(Arc::clone(&input_device), true);
+        io_events.push(IoEvent::new(input_mmio)?);
     } else {
         // Single-device mode (original behavior)
         let input_backing = BackingStore::open(Path::new(&args.input), true, None, false)?;
