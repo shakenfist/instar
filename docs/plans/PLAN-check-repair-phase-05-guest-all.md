@@ -311,9 +311,23 @@ and 5b (check op) touch disjoint files; they land as one commit.
 
 ### Bugs fixed during this work
 
-To be filled in if wiring surfaces anything (e.g. a header
-incompat-field read/write edge case, or an L2-staging bound that
-needs adjusting against the snapshot binary's value).
+- **Compression gate missed zlib (caught by the phase-5 smoke).**
+  The first cut gated compression on the `INCOMPAT_COMPRESSION`
+  header bit, but that bit only flags **zstd** — standard **zlib**
+  compression sets no incompatible-feature bit (compression is
+  per-L2-entry via `OFLAG_COMPRESSED`). So a zlib-compressed image
+  passed the gate, the all tier ran, and it corrupted the metadata
+  (`qemu-img check`: "copied flag must never be set for compressed
+  clusters"; and shared compressed host clusters would be wrongly
+  lowered to refcount 1). Fix: the detection L2 walk sets a
+  `uses_compression` flag on any `OFLAG_COMPRESSED` entry, and the
+  `all_supported` gate refuses when it is set (the leaks tier
+  stays safe on compressed images — it only frees `bmp`-false
+  clusters, which the walk marks correctly). Verified: a fresh
+  zlib-compressed image under `--repair=all` is now refused
+  (byte-identical, `qemu-img check` clean, data intact). The
+  smoke test that caught this ran *before* the phase-5 commit, so
+  no corrupting build was committed.
 
 ### Documentation index maintenance
 

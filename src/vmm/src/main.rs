@@ -34,7 +34,7 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use guest_protocol::{
     decode_framed, encode_vmm_config_framed, guest_, vmm_config, vmm_config_chain,
     vmm_config_chain_with_output, vmm_config_input_only, FRAME_HEADER_SIZE,
@@ -84,6 +84,12 @@ const INFO_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
 const CHECK_CONFIG_MAGIC: u32 = 0x43484543; // "CHEC"
 #[allow(dead_code)]
 const CHECK_CONFIG_FLAG_REPAIR: u32 = 1 << 0;
+// Mirrors shared::CheckConfig::FLAG_REPAIR_ALL (1 << 4): selects the
+// lossy `all` tier (refcount recount + COPIED reconciliation). Only
+// meaningful in addition to CHECK_CONFIG_FLAG_REPAIR; set when the
+// CLI receives `--repair=all`.
+#[allow(dead_code)]
+const CHECK_CONFIG_FLAG_REPAIR_ALL: u32 = 1 << 4;
 #[allow(dead_code)]
 const CHECK_CONFIG_FLAG_QUIET: u32 = 1 << 1;
 #[allow(dead_code)]
@@ -2911,6 +2917,22 @@ struct CopyArgs {
     sector_count: u64,
 }
 
+/// Repair tier selected by `--repair[=MODE]`.
+///
+/// `leaks` (the bare `--repair` default) frees only clusters the
+/// integrity walk proved unreferenced — crash-safe, lossless.
+/// `all` additionally corrects wrong refcounts (both directions)
+/// and reconciles the refcount↔COPIED invariant under the crash-safe
+/// `corrupt`-bit ordering; it is destructive (the `--help` warning
+/// text and 0/2/3 exit-code mapping land in a later phase).
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum RepairMode {
+    /// Safe leak-reclamation tier (qemu-img check -r leaks).
+    Leaks,
+    /// Lossy refcount + COPIED correction tier (qemu-img check -r all).
+    All,
+}
+
 #[derive(Args, Debug)]
 struct CheckArgs {
     /// Input image file
@@ -2939,16 +2961,18 @@ struct CheckArgs {
     #[arg(long)]
     chain: bool,
 
-    /// Reclaim leaked clusters in the image (qcow2 only).
+    /// Repair the image in place (qcow2 only): `--repair[=leaks|all]`.
     ///
-    /// Opens the image read-write and frees clusters the integrity
-    /// walk proved unreferenced (the safe "leaks" tier), mirroring
-    /// `qemu-img check -r leaks`. Leak reclamation is crash-safe: a
-    /// partially-applied repair leaves a consistent (if still-leaky)
-    /// image. The full `--repair[=leaks|all]` surface (the lossy
-    /// recount tier) lands in a later phase.
-    #[arg(long)]
-    repair: bool,
+    /// Bare `--repair` (or `--repair=leaks`) opens the image read-write
+    /// and frees clusters the integrity walk proved unreferenced (the
+    /// safe "leaks" tier), mirroring `qemu-img check -r leaks`; this is
+    /// crash-safe. `--repair=all` additionally corrects wrong refcounts
+    /// (both directions) and reconciles the refcount↔COPIED invariant
+    /// under the crash-safe `corrupt`-bit ordering — the lossy tier,
+    /// mirroring `qemu-img check -r all`. (The `--help` destructive
+    /// warning and the 0/2/3 exit-code mapping land in a later phase.)
+    #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "leaks")]
+    repair: Option<RepairMode>,
 }
 
 #[derive(Args, Debug)]
@@ -6741,11 +6765,16 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     if args.chain {
         check_flags |= CHECK_CONFIG_FLAG_CHAIN;
     }
-    if args.repair {
-        // Safe leaks tier only; FLAG_REPAIR_ALL (the lossy recount
-        // tier) is deliberately not set here — that lands in a later
-        // phase along with the --repair[=leaks|all] CLI surface.
+    if args.repair.is_some() {
+        // Any --repair[=MODE] selects the base repair flag (read-write
+        // open + leaks tier). --repair=all additionally sets
+        // FLAG_REPAIR_ALL to request the lossy recount + COPIED tier;
+        // the guest still falls back to the leaks tier when the all
+        // tier is unsupported for the image.
         check_flags |= CHECK_CONFIG_FLAG_REPAIR;
+        if matches!(args.repair, Some(RepairMode::All)) {
+            check_flags |= CHECK_CONFIG_FLAG_REPAIR_ALL;
+        }
     }
     guest_mem.write_obj(CHECK_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
     guest_mem.write_obj(check_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
@@ -6776,7 +6805,7 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
 
         // Write chain config to guest memory
         write_chain_config(&guest_mem, chain)?;
-    } else if args.repair {
+    } else if args.repair.is_some() {
         // Single-device repair mode: open the input read-write so the
         // guest can reclaim leaked clusters in place. Mirrors
         // run_snapshot_mutating_guest's read-write open
