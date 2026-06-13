@@ -220,18 +220,31 @@ boundary inherited directly.
 
 ## Open questions
 
-### 1. Where do the repair mutators live?
+### 1. Where do the repair mutators live? — RESOLVED (phase 1)
 
-Working answer: a **new `src/crates/check/` planner crate**,
-parallel to `snapshot` / `commit` / `rebase`, depending on
-`shared` + `qcow2` + `snapshot` (to reuse the refcount/L1/L2
-primitives). Rationale mirrors snapshot phase 5's: the `qcow2`
-crate is read-mostly and should not gain mutation surface; the
-existing `check` *operation* binary is not a library; one crate
-per mutating operation is the convention. The reporting-side
-walk logic currently in `src/operations/check/src/main.rs` may
-be partially lifted into this crate so repair and report share a
-single traversal — phase 1 decides how much to lift vs leave.
+**Resolved: a new `src/crates/check/` planner crate**, parallel
+to `snapshot` / `commit` / `rebase`, depending on `shared` +
+`qcow2` + `snapshot` (to reuse the refcount/L1/L2 primitives).
+Rationale mirrors snapshot phase 5's: the `qcow2` crate is
+read-mostly and should not gain mutation surface; the existing
+`check` *operation* binary is not a library; one crate per
+mutating operation is the convention.
+
+The crate name `check` collides with the existing `check`
+*operation* package (the lone operation without the `-op`
+suffix). **Operator decision this session: adopt the
+convention** — rename the operation package `check` → `check-op`
+with a `[[bin]] name = "check"` stanza (so the produced binary
+stays `check.bin`, exactly like `snapshot-op` → `snapshot.bin`),
+freeing the clean `check` name for the planner crate. The
+rename's blast radius is contained (only `Makefile`'s
+`--exclude check` → `--exclude check-op`); see
+[PLAN-check-repair-phase-01-abi.md](PLAN-check-repair-phase-01-abi.md).
+
+The reporting-side walk currently in
+`src/operations/check/src/main.rs` may later be partially lifted
+into this crate so repair and report share one traversal; v1
+leaves it in the op and only adds repair planners (phases 2–3).
 
 *Alternative considered:* a `repair` submodule inside
 `src/crates/snapshot/`. Rejected — repair is not a snapshot
@@ -296,7 +309,7 @@ repair extends that mapping to "counters *after* repair". Phase 5
 
 | Phase | Plan | Status |
 |-------|------|--------|
-| 1. ABI + crate scaffolding: add `FLAG_REPAIR_ALL` to `CheckConfig`, repair-result counters (`leaks_fixed`, `refcounts_fixed`, `corruptions_fixed`) to `CheckResult`, create `src/crates/check/` planner crate depending on `shared`+`qcow2`+`snapshot`, confirm `write_input_sector`/`fsync_input` suffice (open questions 1–3) | PLAN-check-repair-phase-01-abi.md | Not started |
+| 1. ABI + crate scaffolding: add `FLAG_REPAIR_ALL` to `CheckConfig`, repair-result counters (`repaired_leaks`/`refcounts`/`corruptions`) + `FLAG_REPAIR_INCOMPLETE` to `CheckResult`, create the `src/crates/check/` planner crate (deps `shared`+`qcow2`+`snapshot`; `RepairTier`/`RepairError`/`RepairCounters` surface), and rename the op package `check` → `check-op` (binary stays `check.bin`) to free the crate name. Writable-input-device open deferred to phase 4/5 (open question 3) | PLAN-check-repair-phase-01-abi.md | **Planned, not started** |
 | 2. Leak-reclamation planner (safe tier): pure logic over staged refblocks that, given the report walk's leak set, decrements the offending refcounts to zero; reuses `set_refcount_in_block`; unit tests over synthetic refblock buffers | PLAN-check-repair-phase-02-leak-planner.md | Not started |
 | 3. Refcount-rebuild + COPIED reconciliation planner (lossy tier): in-place correction and, where needed, full refcount-structure rebuild from the L1/L2 walk; restores the refcount↔COPIED invariant via `update_copied_flags_for_l1`; refuse-don't-guess boundaries (open questions 4–5) | PLAN-check-repair-phase-03-refcount-planner.md | Not started |
 | 4. Guest binary wiring: dispatch `FLAG_REPAIR`/`FLAG_REPAIR_ALL` in `src/operations/check/`, the crash-safe write-ordering sequence (set `corrupt` bit → write → fsync → re-validate → clear `corrupt` bit), emit repair-result counters | PLAN-check-repair-phase-04-guest.md | Not started |
