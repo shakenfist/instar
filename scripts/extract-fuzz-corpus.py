@@ -225,6 +225,67 @@ def build_snapshot_refcount_seed(op):
         id_bytes + name_bytes + bytes(old_table)
 
 
+def build_check_repair_seed(op):
+    """Build one fuzz_check_repair seed for the given op selector.
+
+    Mirrors the target's 32-byte structured header
+    (fuzz_check_repair.rs) and per-op pool layout. Each seed stages
+    a small consistent fragment that reaches the op's success path:
+
+    * op 0 reclaim   — an 8-byte (4-entry, 16-bit) refcount block
+      [1, 2, 1, 0] with entries 0 and 2 referenced, so entry 1
+      (rc 2, unreferenced) is reclaimed.
+    * op 1 account   — the same block shape; an in-range target.
+    * op 2 correct   — the same block shape; all entries covered.
+    * op 3 reconcile — cluster_bits 9, one refblock, one L1 entry ->
+      an L2 table at host 0x200 with one data cluster at 0x400, all
+      L2 slots present, so the COPIED walker runs without erroring.
+
+    16-bit refcounts are big-endian (entry i at bytes [2i, 2i+1]);
+    L1/L2 entries are big-endian u64. Keep this in sync with the
+    header/pool layout in fuzz_check_repair.rs.
+    """
+    header = bytearray(32)
+    header[0] = op
+    header[2] = 4          # refcount_bits selector -> 16-bit
+
+    if op in (0, 1, 2):
+        header[4] = 7      # block byte length = 1 + 7 = 8 (4 entries)
+        header[5] = 4      # entries_in_block = 4
+        if op == 0:
+            header[8] = 0b0101  # ref_mask: entries 0 and 2 referenced
+        if op == 1:
+            # driver low byte = target seed; target = driver % (cap+4),
+            # cap = 8*8/16 = 4, so target = 1 (in range).
+            header[16] = 1
+        # op 2: driver/none_mask left 0 -> all entries covered.
+        block = bytearray(8)
+        if op == 0:
+            for i, rc in enumerate((1, 2, 1, 0)):
+                block[2 * i:2 * i + 2] = rc.to_bytes(2, 'big')
+        elif op == 1:
+            block[2:4] = (3).to_bytes(2, 'big')   # entry 1 = 3 (non-saturated)
+        else:
+            for i, rc in enumerate((0, 1, 2, 1)):
+                block[2 * i:2 * i + 2] = rc.to_bytes(2, 'big')
+        return bytes(header) + bytes(block)
+
+    # op 3 reconcile: structured image fragment.
+    header[1] = 0          # standard L2
+    header[3] = 0          # cluster_bits = 9 (512-byte clusters)
+    header[4] = 0          # refblock_count = 1
+    header[6] = 1          # one L1 entry
+    header[7] = 1          # L2 slot length = 16 bytes (two entries)
+    header[8:16] = (0xffffffffffffffff).to_bytes(8, 'little')  # presence
+
+    refblocks = bytearray(512)
+    refblocks[2:4] = (1).to_bytes(2, 'big')   # flat 1 (L2 table @ 0x200) rc=1
+    refblocks[4:6] = (1).to_bytes(2, 'big')   # flat 2 (data @ 0x400) rc=1
+    l1 = (0x200).to_bytes(8, 'big')
+    l2 = (0x400).to_bytes(8, 'big') + (0).to_bytes(8, 'big')
+    return bytes(header) + bytes(refblocks) + l1 + l2
+
+
 def create_minimal_seeds(corpus_base):
     """Create hand-crafted minimal seed inputs for each target."""
 
@@ -263,6 +324,15 @@ def create_minimal_seeds(corpus_base):
     for op in range(7):
         with open(os.path.join(dest, f'minimal_op{op}'), 'wb') as f:
             f.write(build_snapshot_refcount_seed(op))
+
+    # fuzz_check_repair: one structured-header seed per op selector
+    # (the target is synthetic; no natural seeds exist). Ops 0..=3:
+    # reclaim, account, correct, reconcile.
+    dest = os.path.join(corpus_base, 'fuzz_check_repair')
+    os.makedirs(dest, exist_ok=True)
+    for op in range(4):
+        with open(os.path.join(dest, f'minimal_op{op}'), 'wb') as f:
+            f.write(build_check_repair_seed(op))
 
     # QCOW2 minimal v2 header (105 bytes minimum)
     qcow2_header = bytearray(512)

@@ -22,6 +22,7 @@ resize = { path = "../crates/resize" }
 rebase = { path = "../crates/rebase" }
 commit = { path = "../crates/commit" }
 snapshot = { path = "../crates/snapshot" }
+check = { path = "../crates/check" }
 
 [profile.release]
 debug = true
@@ -159,5 +160,11 @@ test = false
 [[bin]]
 name = "fuzz_snapshot_refcount"
 path = "fuzz_targets/fuzz_snapshot_refcount.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "fuzz_check_repair"
+path = "fuzz_targets/fuzz_check_repair.rs"
 doc = false
 test = false
