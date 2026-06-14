@@ -518,6 +518,9 @@ pub fn check_result_message(
     flags: u32,
     chain_errors: u32,
     subcluster_errors: u32,
+    repaired_leaks: u32,
+    repaired_refcounts: u32,
+    repaired_corruptions: u32,
 ) -> guest_::GuestMessage {
     let mut msg = guest_::GuestMessage::default();
     msg.level = guest_::Level::Info;
@@ -535,6 +538,9 @@ pub fn check_result_message(
     result.flags = flags;
     result.chain_errors = chain_errors;
     result.subcluster_errors = subcluster_errors;
+    result.repaired_leaks = repaired_leaks;
+    result.repaired_refcounts = repaired_refcounts;
+    result.repaired_corruptions = repaired_corruptions;
 
     msg.payload = Some(guest_::GuestMessage_::Payload::CheckResult(result));
     msg

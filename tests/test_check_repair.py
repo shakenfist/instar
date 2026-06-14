@@ -387,3 +387,56 @@ class TestRepairCli(_RepairTestBase):
             'repairing an already-clean image must not change it'
         )
         self._assert_qemu_clean(copy)
+
+
+class TestRepairCounters(_RepairTestBase):
+    """The per-class repaired-* counters reach the host (guest+proto wire).
+
+    These counters are guest-side state surfaced over the
+    CheckResultMessage protobuf; they are emitted only when a repair
+    actually fixed something, so a read-only check keeps its existing
+    schema.
+    """
+
+    def test_leaks_counter_in_json(self):
+        """leaked + leaks → JSON reports `repaired-leaks` for the reclaim."""
+        _copy, stdout, _stderr, _rc, _sb, _sa = self._repair_copy(
+            'check-qcow2-leaked', repair='leaks'
+        )
+        data = json.loads(stdout)
+        self.assertEqual(
+            data.get('repaired-leaks'), 1,
+            f'expected one reclaimed leak in the JSON, got: {stdout}'
+        )
+        self.assertNotIn('repaired-refcounts', data)
+
+    def test_refcount_counter_in_json(self):
+        """refcount-too-high + all → JSON reports `repaired-refcounts`."""
+        _copy, stdout, _stderr, _rc, _sb, _sa = self._repair_copy(
+            'check-qcow2-refcount-too-high', repair='all'
+        )
+        data = json.loads(stdout)
+        self.assertGreaterEqual(
+            data.get('repaired-refcounts', 0), 1,
+            f'expected a refcount correction in the JSON, got: {stdout}'
+        )
+
+    def test_plain_check_omits_repaired_keys(self):
+        """A read-only check emits no `repaired-*` keys (schema preserved)."""
+        copy = self._make_copy('check-qcow2-leaked')
+        stdout, _stderr, _rc = self.run_instar_check(
+            copy, output_format='json', repair=None
+        )
+        data = json.loads(stdout)
+        for key in ('repaired-leaks', 'repaired-refcounts',
+                    'repaired-corruptions'):
+            self.assertNotIn(key, data)
+
+    def test_human_output_reports_repaired(self):
+        """Human output prints a `Repaired ...` summary line after a repair."""
+        copy = self._make_copy('check-qcow2-leaked')
+        stdout, _stderr, _rc = self.run_instar_check(
+            copy, output_format=None, repair='leaks'
+        )
+        self.assertIn('Repaired', stdout)
+        self.assertIn('1 leaked cluster', stdout)

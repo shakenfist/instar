@@ -29,8 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   image untouched and reporting `repair-incomplete` — on
   snapshotted, compressed, external-data, or already-`corrupt`
   images, and on refcount-table exhaustion, rather than guessing;
-  structural overlaps get a safe partial repair. `--repair` cannot
-  be combined with `--chain`. Covered by `tests/test_check_repair.py`,
+  structural overlaps get a safe partial repair. A repair run
+  reports the per-class counts of what it fixed (`repaired-leaks` /
+  `repaired-refcounts` / `repaired-corruptions`, carried from the
+  guest over the `CheckResultMessage` protobuf) in both the human
+  and JSON output; a read-only `check` omits them, so its schema is
+  unchanged. `--repair` cannot be combined with `--chain`. Covered
+  by `tests/test_check_repair.py`,
   the `fuzz_check_repair` coverage fuzzer, and the differential
   fuzzer's `op_repair` arm (instar vs `qemu-img check -r`). The safe
   tier is intentionally narrower than `qemu-img -r leaks` (it never

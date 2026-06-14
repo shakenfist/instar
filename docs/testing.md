@@ -69,12 +69,18 @@ copy, never the committed fixture):
   appear, and instar exits 2 with `repair-incomplete`.
 - **CLI**: `--repair`+`--chain` rejection, clean-image no-op,
   qcow2-only not-supported on a raw image, and idempotence.
+- **Repaired counters** (`TestRepairCounters`): the per-class
+  `repaired-leaks` / `repaired-refcounts` / `repaired-corruptions`
+  counts reach the host over the `CheckResultMessage` protobuf and
+  render in both the JSON and human `--repair` output, and are
+  *omitted* on a read-only check so its schema is unchanged.
 
-Tests assert post-repair *state* (`qemu-img check`-clean, data
-reads, byte-identity), not instar's exit code or repaired-counter
-output, since the exit code still reflects the detected corruption
-after a clean repair and the per-counter fields are not yet on the
-guest→host wire.
+The structural tests assert post-repair *state* (`qemu-img
+check`-clean, data reads, byte-identity) rather than instar's exit
+code, since the exit code still reflects the detected corruption
+after a clean repair; the repaired-counter output is asserted
+separately by `TestRepairCounters` now that those counts travel on
+the guest→host wire.
 
 ### Compare Tests (`test_compare.py`)
 

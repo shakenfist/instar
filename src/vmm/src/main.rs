@@ -291,9 +291,9 @@ const CHECK_RESULT_FLAG_INCOMPLETE: u32 = 1 << 5;
 const CHECK_RESULT_FLAG_NOT_SUPPORTED: u32 = 1 << 6;
 // Set when an in-place --repair could not fully reconcile the image and
 // some issues remain. Mirrors shared::CheckResult::FLAG_REPAIR_INCOMPLETE
-// (1 << 8). This bit travels to the host inside CheckResult.flags (the
-// only repair signal on the wire — the repaired_* counters are guest-only
-// and are not part of the CheckResultMessage protobuf).
+// (1 << 8). This bit travels to the host inside CheckResult.flags,
+// alongside the per-class repaired_leaks / repaired_refcounts /
+// repaired_corruptions counters carried by the CheckResultMessage protobuf.
 const CHECK_RESULT_FLAG_REPAIR_INCOMPLETE: u32 = 1 << 8;
 
 // ChainConfig constants (must match shared crate)
@@ -7232,15 +7232,23 @@ fn print_check_result(
             );
         }
 
-        // Repair section. The per-class repaired_* counters
-        // (repaired_leaks / repaired_refcounts) are guest-only state and
-        // are not carried by the CheckResultMessage protobuf, so they
-        // cannot be rendered host-side without a guest/wire change. Only
-        // FLAG_REPAIR_INCOMPLETE travels to the host (inside
-        // result.flags), so that is all we can report here; the
-        // post-repair leaks/errors counts above already reflect what was
-        // fixed (reclaimed clusters are subtracted before the result is
-        // sent).
+        // Repair section. The per-class repaired_* counters travel on the
+        // CheckResultMessage protobuf, so a repair run reports what it
+        // fixed; the post-repair leaks/errors counts above already reflect
+        // those fixes (reclaimed clusters are subtracted before the result
+        // is sent). The summary line is printed only when a repair
+        // actually changed something, so a read-only check is unaffected.
+        let repaired_total = result
+            .repaired_leaks
+            .saturating_add(result.repaired_refcounts)
+            .saturating_add(result.repaired_corruptions);
+        if repaired_total > 0 {
+            println!(
+                "Repaired {} leaked cluster(s), {} refcount correction(s), \
+                 {} corruption(s).",
+                result.repaired_leaks, result.repaired_refcounts, result.repaired_corruptions
+            );
+        }
         if (result.flags & CHECK_RESULT_FLAG_REPAIR_INCOMPLETE) != 0 {
             println!("Repair did not complete; some issues remain (re-run or use qemu-img).");
         }
@@ -7307,11 +7315,25 @@ fn print_check_result_json(
     println!("    \"corrupt\": {is_corrupt},");
     println!("    \"chain-errors\": {},", result.chain_errors);
     println!("    \"subcluster-errors\": {},", result.subcluster_errors);
-    // Repair signal. Only the incomplete flag is carried on the wire (the
-    // repaired_* counters are guest-only and not part of the
-    // CheckResultMessage protobuf), so we emit just this boolean. Appended
-    // after the existing keys so the schema the parity tests parse is
-    // unchanged.
+    // Per-class repair counters, carried on the CheckResultMessage
+    // protobuf. Emitted only when a repair actually fixed something, so a
+    // read-only check keeps its existing key set (the qemu-img parity
+    // schema and the check-json baselines are unaffected).
+    if result.repaired_leaks > 0 {
+        println!("    \"repaired-leaks\": {},", result.repaired_leaks);
+    }
+    if result.repaired_refcounts > 0 {
+        println!("    \"repaired-refcounts\": {},", result.repaired_refcounts);
+    }
+    if result.repaired_corruptions > 0 {
+        println!(
+            "    \"repaired-corruptions\": {},",
+            result.repaired_corruptions
+        );
+    }
+    // Repair signal. The incomplete flag is carried inside result.flags;
+    // appended last (no trailing comma) after the existing keys so the
+    // schema the parity tests parse is unchanged.
     let repair_incomplete = (result.flags & CHECK_RESULT_FLAG_REPAIR_INCOMPLETE) != 0;
     println!("    \"repair-incomplete\": {repair_incomplete}");
     println!("}}");

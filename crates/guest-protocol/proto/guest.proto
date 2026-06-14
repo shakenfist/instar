@@ -175,6 +175,13 @@ message CheckResultMessage {
   uint32 chain_errors = 11;
   // Number of subcluster bitmap validation errors (extended L2)
   uint32 subcluster_errors = 12;
+  // Repair counters (from `check --repair`): leaked clusters reclaimed,
+  // refcount inconsistencies corrected, and corruptions resolved. Zero on
+  // a read-only check. proto3 omits zero-value scalars, so a plain check
+  // carries none of these on the wire.
+  uint32 repaired_leaks = 13;
+  uint32 repaired_refcounts = 14;
+  uint32 repaired_corruptions = 15;
 }
 
 // Image comparison result (from compare operation)
