@@ -211,11 +211,47 @@ testdata repo is a normal clone (not a worktree) on `main`.
 - **Lifting the corrupt-bit-set refusal** so instar can clear a
   structurally-sound corrupt flag like qemu-img -r.
 
-### Bugs fixed during this work
+### Findings during this work
 
-To be filled in if building fixtures surfaces an instar detection
-gap (e.g. a corruption qemu flags that instar's `check` misses —
-which would be an instar `check` bug, in scope to note here).
+- **End-to-end repair validated (first real proof).** Phases 4–5
+  were only smoke-tested on healthy/refuse cases; here all four
+  repairable fixtures were repaired by `instar check --repair` and
+  then declared **clean by `qemu-img check`**: `leaked-cluster`
+  (leaks tier), `refcount-zero` (all, raise 0→1),
+  `refcount-too-high` (all, lower 2→1), `stale-copied` (all,
+  refcount+COPIED). The refuse fixtures (`corrupt-bit-set`,
+  `snapshot-leak`, `compressed-leak`) were left byte-identical.
+- **`overlapping` is a *partial* repair, not byte-identical.** The
+  fixture has an overlap (structural) *and* a leak. `--repair=all`
+  refuses the all tier (`corruptions > 0`) but the leaks tier
+  safely reclaims the genuine leak, leaving the overlap untouched;
+  `qemu-img check` afterward shows the overlap remains and the
+  leak is gone (not made worse), and instar reports "Repair did
+  not complete" + exit 2. The phase table's "image byte-identical"
+  for this row was corrected to "partial repair".
+- **`corrupt-bit-set`: plain `qemu-img check` is silent (qemu
+  10.0.8).** It does not re-flag `INCOMPAT_CORRUPT` on a read-only
+  check; `qemu-img info` shows `corrupt: true` and write-open is
+  refused. instar reads the bit directly and refuses, so the
+  fixture still tests the intended refuse path; the manifest
+  description notes the qemu quirk.
+- **Manifest convention: no `sha256`.** The existing
+  script-generated `check-validation` qcow2 entries carry
+  `skip_qemu_img: true` and **no** hash (regeneration across qemu
+  versions is not byte-identical), so the new entries follow that
+  pattern rather than the plan's assumed sha256-pinning.
+
+### Deferred in this phase
+
+- **The 80-version `qemu-img check` baseline capture (step 7b) was
+  not run.** Per the plan's own scoping note, corruption detection
+  is stable across the matrix (a leak is a leak), the capture is
+  ~1-profile and low-value, and phase 8's real oracle is the live
+  system `qemu-img`. The fixtures + the `qemu-img check -r`-clean
+  verification (done directly against qemu 10.0.8) are the
+  load-bearing deliverables. Running the full matrix capture
+  remains an optional follow-up if cross-version detection drift
+  is ever suspected.
 
 ### Documentation index maintenance
 
