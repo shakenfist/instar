@@ -25,11 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   fsync-separated; an interrupted run leaves the bit set so the
   image refuses read-write open until re-repaired). Repair runs in
   the KVM guest, reusing the new `crates/check` planner crate and
-  `crates/snapshot`'s refcount mutators. It refuses — leaving the
-  image untouched and reporting `repair-incomplete` — on
-  snapshotted, compressed, external-data, or already-`corrupt`
-  images, and on refcount-table exhaustion, rather than guessing;
-  structural overlaps get a safe partial repair. A repair run
+  `crates/snapshot`'s refcount mutators. It refuses rather than
+  guessing: snapshotted images are repaired by neither tier (left
+  untouched), and the lossy `all` tier declines its rebuild —
+  reporting `repair-incomplete` — on compressed, external-data, or
+  already-`corrupt` images and on refcount-table exhaustion, while
+  the safe leak reclamation still runs; structural overlaps get a
+  safe partial repair. A repair run
   reports the per-class counts of what it fixed (`repaired-leaks` /
   `repaired-refcounts` / `repaired-corruptions`, carried from the
   guest over the `CheckResultMessage` protobuf) in both the human

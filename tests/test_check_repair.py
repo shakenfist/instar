@@ -312,6 +312,59 @@ class TestRepairRefuse(_RepairTestBase):
             f'repair must not introduce check-errors: {after}'
         )
 
+    def test_all_tier_oversized_l2_set_aborts_cleanly(self):
+        """Regression: more active L2 tables than the staging arena holds
+        must abort cleanly, never overflow it.
+
+        The all-tier L2 staging arena is 2 MiB. With 2 MiB clusters it
+        holds exactly one L2 table, and each such L2 covers 512 GiB of
+        virtual space, so writing at offset 0 and past 512 GiB allocates
+        two L2 tables in an otherwise-sparse 1 TiB image — one more than
+        the arena holds. Before the byte-extent guard was restored (it had
+        been dropped from snapshot's `stage_l2_set` reference) this
+        overran the arena into adjacent guest scratch. The repair must now
+        abort (report incomplete) without crashing or corrupting data.
+        """
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        img = Path(td.name) / 'bigclusters.qcow2'
+        subprocess.run(
+            ['qemu-img', 'create', '-f', 'qcow2',
+             '-o', 'cluster_size=2097152', str(img), '1T'],
+            capture_output=True, timeout=30, check=True,
+        )
+        for off in ('0', '600G'):
+            subprocess.run(
+                ['qemu-io', '-f', 'qcow2', '-c',
+                 f'write -P 0xAB {off} 4k', str(img)],
+                capture_output=True, timeout=30, check=True,
+            )
+
+        stdout, stderr, rc = self.run_instar_check(
+            img, output_format='json', repair='all', timeout=120
+        )
+        # No crash / hang (run_instar_check returns -1 on timeout; a
+        # signal death would be negative too).
+        self.assertGreaterEqual(rc, 0, f'instar must not crash/hang: {stderr}')
+        self.assertTrue(
+            self._repair_incomplete(stdout),
+            f'over-capacity all-tier repair must report incomplete: {stdout}'
+        )
+        # Data survives — an arena overflow would clobber the staged
+        # buffers (and the written-back metadata). The abort leaves the
+        # corrupt bit set, so read with a read-only open.
+        for off in ('0', '600G'):
+            result = subprocess.run(
+                ['qemu-io', '-r', '-f', 'qcow2', '-c',
+                 f'read -P 0xAB {off} 4k', str(img)],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'data at {off} must survive the aborted repair:\n'
+                f'{result.stdout}\n{result.stderr}'
+            )
+
 
 class TestRepairCli(_RepairTestBase):
     """CLI guards, no-op repair, raw handling, idempotence."""

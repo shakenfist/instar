@@ -268,14 +268,17 @@ unreferenced cluster is a single monotonic refcount write.
 
 ### Refuse rather than guess
 
-`--repair` declines — leaving the image byte-identical and reporting the
-result incomplete — when the correct fix is not mechanically determined by the
-rest of the metadata:
+The lossy `all` tier declines its rebuild — reporting the result incomplete —
+when the correct fix is not mechanically determined by the rest of the
+metadata. The safe `leaks` reclamation is lossless, so it still runs in these
+cases (the image is only guaranteed byte-identical for snapshotted images,
+where both tiers refuse):
 
 - **Snapshotted images** (`nb_snapshots > 0`) — the detection walk does not
   traverse snapshot L1/L2 tables, so a cluster referenced only by an internal
   snapshot looks unreferenced; freeing it would corrupt the snapshot. This
-  guard takes precedence over the `all` tier.
+  guard refuses **both** tiers (it takes precedence over the `all` tier), so a
+  snapshotted image is left byte-identical.
 - **Compressed and external-data images** (zstd `INCOMPAT_COMPRESSION`,
   `INCOMPAT_EXTERNAL_DATA`, or any `OFLAG_COMPRESSED` cluster) — shared
   compressed host clusters and the COPIED-on-compressed rule fall outside the

@@ -193,9 +193,11 @@ For QCOW2 images, `instar check --repair[=leaks|all]` additionally repairs the
 image in place: the safe `leaks` tier reclaims unreferenced clusters
 (crash-safe, lossless), and the lossy `all` tier rebuilds refcounts and
 reconciles COPIED flags under a crash-safe `corrupt`-bit write ordering —
-mirroring `qemu-img check -r leaks`/`-r all`. It refuses (leaving the image
-untouched) on snapshotted, compressed, external-data, or already-corrupt
-images rather than guessing. See
+mirroring `qemu-img check -r leaks`/`-r all`. It refuses rather than guessing:
+snapshotted images are repaired by neither tier, and the lossy `all` tier
+declines its rebuild on compressed, external-data, or already-corrupt images
+(the safe leak reclamation still runs, and the result is reported incomplete).
+See
 [docs/qcow2/qcow2-refcount.md](docs/qcow2/qcow2-refcount.md#repairing-refcount-inconsistencies).
 
 For VMDK images (monolithicSparse, streamOptimized, and

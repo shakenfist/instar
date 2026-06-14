@@ -3602,6 +3602,11 @@ unsafe fn repair_leaks_qcow2(
             break;
         }
 
+        // SAFETY: per this function's `# Safety` doc — `refblock_ptr` is the
+        // base-anchored `REPAIR_REFBLOCK_BUF` scratch (>= `cluster_usize`
+        // bytes; `cluster_size <= REPAIR_REFBLOCK_LIMIT` is pre-checked and the
+        // bmp-extent guard keeps it clear of the bitmap), just filled by the
+        // read above, with no other live view of the region.
         let refblock = core::slice::from_raw_parts_mut(refblock_ptr, cluster_usize);
 
         // Drive the pure planner. is_referenced maps the refblock-local
@@ -3889,6 +3894,10 @@ unsafe fn repair_all_qcow2(
             tally.aborted = true;
             return tally;
         }
+        // SAFETY: per this function's `# Safety` doc — `refblock_ptr` is the
+        // base-anchored `REPAIR_REFBLOCK_BUF` scratch (>= `cluster_usize`
+        // bytes, guarded clear of the bmp), just filled by the read above,
+        // with no other live view of the region.
         let refblock = core::slice::from_raw_parts_mut(refblock_ptr, cluster_usize);
 
         // Correct against the bmp-derived ground truth: every correct
@@ -3999,16 +4008,26 @@ unsafe fn repair_all_qcow2(
                 continue;
             }
             // Over-capacity: more active L2 tables than the bounded
-            // staging arena holds. Refuse (corrupt bit left set).
-            if staged_count >= REPAIR_ALL_MAX_STAGED_L2 {
+            // staging arena holds — by entry count OR by byte extent (a
+            // large cluster fills the 2 MiB arena in fewer than
+            // MAX_STAGED_L2 entries, and a single cluster larger than the
+            // arena overflows on the first stage). Refuse (corrupt bit
+            // left set). Mirrors snapshot's `stage_l2_set` guard, whose
+            // byte-extent half (`cursor + cluster_size > cap_end`) this
+            // port had dropped — without it an image with cluster_bits
+            // >= 14 and enough active L2 tables would write past the arena
+            // into the adjacent staging buffers.
+            let stage_addr = REPAIR_ALL_L2_STAGING + staged_count * cluster_usize;
+            if staged_count >= REPAIR_ALL_MAX_STAGED_L2
+                || stage_addr + cluster_usize > REPAIR_ALL_L2_STAGING + REPAIR_ALL_L2_STAGING_LIMIT
+            {
                 (call_table.debug_print)(
-                    b"check: all-tier L2 count exceeds staging bound; aborting (corrupt bit set)\n\0"
+                    b"check: all-tier L2 staging exceeds bound; aborting (corrupt bit set)\n\0"
                         .as_ptr(),
                 );
                 tally.aborted = true;
                 return tally;
             }
-            let stage_addr = REPAIR_ALL_L2_STAGING + staged_count * cluster_usize;
             if !read_input_byte_range(
                 call_table,
                 0,
@@ -4038,6 +4057,9 @@ unsafe fn repair_all_qcow2(
     // refcount_for_cluster maps a HOST BYTE OFFSET to the bmp-derived
     // refcount via cidx = host_off / cluster_size (the detector's math).
     {
+        // SAFETY: `l1_ptr` is the base-anchored `REPAIR_ALL_L1_BUF` scratch
+        // (>= `l1_size_bytes`, pre-checked against its limit), just staged,
+        // with no other live view.
         let l1_mut = core::slice::from_raw_parts_mut(l1_ptr, l1_size_bytes);
         let staged_ref = &staged;
         match check::qcow2::reconcile_copied_flags_for_l1(
@@ -4048,6 +4070,11 @@ unsafe fn repair_all_qcow2(
                 while k < staged_count {
                     if staged_ref[k].l1_idx == l1_idx {
                         let ptr = (REPAIR_ALL_L2_STAGING + k * cluster_usize) as *mut u8;
+                        // SAFETY: staged slot k spans [REPAIR_ALL_L2_STAGING +
+                        // k*cluster_usize, + cluster_usize), which the staging
+                        // guard proved stays within the arena; the walk visits
+                        // each L1 index once, so this reborrow is the only live
+                        // view of slot k.
                         return Some(core::slice::from_raw_parts_mut(ptr, cluster_usize));
                     }
                     k += 1;

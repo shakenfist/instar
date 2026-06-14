@@ -571,7 +571,7 @@ fuzzing (Phase 3) cannot reach.
 
 ### Fuzz targets
 
-22 targets across the parser and planner crates, organized in
+23 targets across the parser and planner crates, organized in
 `src/fuzz/`:
 
 | Target | Crate | Type |

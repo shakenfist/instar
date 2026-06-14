@@ -102,10 +102,11 @@ qemu-img check --output json -f FORMAT <image>
   `--repair=all` tier additionally corrects wrong refcounts in both
   directions and reconciles the refcount↔COPIED invariant under a crash-safe
   `corrupt`-bit write ordering, mirroring `qemu-img check -r all`; back up
-  valuable images first. instar refuses (leaving the image untouched and
-  reporting the result incomplete) on snapshotted, compressed, external-data,
-  or already-`corrupt`-flagged images rather than guessing. `--repair` cannot
-  be combined with `--chain`. See
+  valuable images first. instar refuses rather than guessing: snapshotted
+  images are repaired by neither tier, and the lossy `all` tier declines its
+  rebuild on compressed, external-data, or already-`corrupt`-flagged images
+  (the safe leak reclamation still runs, and the result is reported
+  incomplete). `--repair` cannot be combined with `--chain`. See
   [docs/qcow2/qcow2-refcount.md](qcow2/qcow2-refcount.md#repairing-refcount-inconsistencies)
 
 #### measure

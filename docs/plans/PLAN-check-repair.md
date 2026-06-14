@@ -430,12 +430,43 @@ After each step:
 * **`qemu-img amend`** as a sibling capability (changing image
   options post-creation).
 * **Snapshot-table structural repair** beyond refcount fixes.
+* **Snapshot- and compression-aware recount** (the lossy `all`
+  tier's deferred extension). v1 refuses snapshotted, compressed,
+  and external-data images because the `bmp`-as-count identity
+  (every correct refcount is 0 or 1) only holds for the
+  snapshot-free, uncompressed, single-file scope; a true recount
+  via `account_reference_in_map` over the snapshot L1/L2s and the
+  compressed cluster host ranges would lift those refusals.
+  (Deferred from phase 5/7; `account_reference_in_map` is shipped
+  but unused in v1.)
+* **80-version `check` detection baseline capture for the repair
+  fixtures.** Phase 7 registered the fixtures and verified
+  detection on the host qemu-img but did not run the full
+  80-qemu-version baseline sweep (detection output is stable, so
+  low value); capture it if a regression ever suggests
+  version-dependent detection drift on these images.
 
 ### Bugs fixed during this work
 
-To be filled in as development surfaces bugs (e.g. if the repair
-walk reveals a gap in the existing `check` reporting walk, fixing
-it is in scope and recorded here).
+* **All-tier L2 staging over-capacity guard (pre-push audit).**
+  `repair_all_qcow2`'s L2 staging loop guarded only on the entry
+  count (`staged_count >= REPAIR_ALL_MAX_STAGED_L2`), dropping the
+  byte-extent half of snapshot's `stage_l2_set` guard (`cursor +
+  cluster_size > cap_end`). An image with `cluster_bits >= 14` and
+  more active L2 tables than fit in the 2 MiB staging arena would
+  write past the arena into the adjacent guest scratch buffers
+  (sandbox-contained — the VMM still clamps every write-back to the
+  device capacity — but a real guest-side OOB write that could also
+  produce wrong on-disk metadata). Fixed by restoring the
+  byte-extent bound; the fuzz target's `cluster_bits <= 14` cap is
+  why it was not caught earlier.
+* **CI excluded the wrong `check` crate (pre-push audit).**
+  `.github/workflows/functional-tests.yml`'s `cargo test
+  --workspace` excluded `check` (the planner crate, whose unit
+  tests are this work's primary Rust test surface) instead of
+  `check-op` (the no_main guest binary), after the phase-1 package
+  rename. The Makefile was updated but the workflow was not. Fixed
+  to `--exclude check-op`.
 
 ### Documentation index maintenance
 
