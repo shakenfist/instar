@@ -333,7 +333,7 @@ host enablement keeps the existing pass/fail exit behaviour.
 | 8. Integration tests (`tests/test_check_repair.py`): codify the phase-7-verified behaviour — leaks/all tiers repair the fixtures to `qemu-img check`-clean with guest data preserved (`qemu-io read -P`); refuse paths (corrupt-bit / snapshot / compression) stay byte-identical; overlapping is a safe partial repair (leak reclaimed, overlap remains, not worse, exit 2); plus CLI (`--repair`+`--chain` reject, qcow2-only, idempotence). Adds an additive `repair=` param to `run_instar_check`; host-test-only (`check.bin` unchanged) | PLAN-check-repair-phase-08-integration.md | **Landed** |
 | 9. Coverage-guided fuzzing of the repair planners (`fuzz_check_repair`): corrupt refblock/L1/L2 buffers in, assert no panic and no out-of-bounds write | PLAN-check-repair-phase-09-fuzz-coverage.md | **Landed** |
 | 10. Differential fuzzing: random corruptions injected into a valid image, repaired by both instar and qemu-img, results compared for `qemu-img check` cleanliness and guest-data equivalence | PLAN-check-repair-phase-10-fuzz-differential.md | **Landed** |
-| 11. Docs, CHANGELOG, follow-ups: `docs/qcow2/qcow2-refcount.md` repair section, `docs/usage.md` + `--help`, `ARCHITECTURE.md`/`README.md`/`AGENTS.md`, strike through convert-followups phase 2 | PLAN-check-repair-phase-11-docs.md | Not started |
+| 11. Docs, CHANGELOG, follow-ups: `docs/qcow2/qcow2-refcount.md` repair section, `docs/usage.md` + `--help`, `ARCHITECTURE.md`/`README.md`/`AGENTS.md`, strike through convert-followups phase 2 | PLAN-check-repair-phase-11-docs.md | **Planned, not started** |
 
 Phase plans are written one at a time, at the effort level the
 phase warrants, as each is scheduled — matching how the snapshot
