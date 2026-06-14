@@ -73,7 +73,7 @@ effort:
 | Phase | Plan | Status |
 |-------|------|--------|
 | 1. `qemu-img` subcommand parity (~~create~~ / ~~map~~ / ~~measure~~ / ~~resize~~ / ~~snapshot~~ / ~~rebase~~ / ~~commit~~) | PLAN-convert-followups-phase-01-subcommands.md (never needed — each subcommand got its own master plan) | Complete (`measure` — see [PLAN-measure.md](PLAN-measure.md); `create` — see [PLAN-create.md](PLAN-create.md); `resize` — see [PLAN-resize.md](PLAN-resize.md); `rebase` and `commit` — see [PLAN-rebase-commit.md](PLAN-rebase-commit.md); `map` — see [PLAN-map.md](PLAN-map.md); `snapshot` — see [PLAN-snapshot.md](PLAN-snapshot.md). The roster is complete; this plan now needs only the phase 2 `check --repair` work.) |
-| 2. `check --repair` wiring | Promoted to its own master plan: [PLAN-check-repair.md](PLAN-check-repair.md) (following the phase-1 precedent that each substantial work item gets its own master plan rather than a convert-followups phase) | Drafted, not started |
+| 2. ~~`check --repair` wiring~~ | Promoted to its own master plan: [PLAN-check-repair.md](PLAN-check-repair.md) (following the phase-1 precedent that each substantial work item gets its own master plan rather than a convert-followups phase) | **Complete** — all 11 phases of PLAN-check-repair landed (`check --repair[=leaks\|all]` for QCOW2) |
 
 Subcommands in phase 1 should be split into one phase plan each
 once any one of them is scheduled — they share no implementation

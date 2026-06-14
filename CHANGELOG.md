@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`instar check --repair` for QCOW2 (PLAN-check-repair phases
+  1-11).** Wires the long-reserved `CheckConfig::FLAG_REPAIR` ABI
+  bit to real in-place qcow2 repair, mirroring `qemu-img check -r
+  leaks`/`-r all`: `instar check --repair[=leaks|all] FILENAME`
+  (qcow2 only; the read-only `instar check` is unchanged and
+  byte-identical). The safe `leaks` tier (bare `--repair` or
+  `--repair=leaks`) frees clusters the integrity walk proved
+  unreferenced — a single monotonic refcount write, crash-safe and
+  lossless. The lossy `--repair=all` tier rebuilds refcounts in
+  both directions (raise under-counts, lower over-counts, free
+  zero-counts) and reconciles the refcount↔COPIED invariant under a
+  crash-safe `corrupt`-bit write ordering (set `INCOMPAT_CORRUPT` →
+  correct refcounts → reconcile COPIED → clear bit, each
+  fsync-separated; an interrupted run leaves the bit set so the
+  image refuses read-write open until re-repaired). Repair runs in
+  the KVM guest, reusing the new `crates/check` planner crate and
+  `crates/snapshot`'s refcount mutators. It refuses — leaving the
+  image untouched and reporting `repair-incomplete` — on
+  snapshotted, compressed, external-data, or already-`corrupt`
+  images, and on refcount-table exhaustion, rather than guessing;
+  structural overlaps get a safe partial repair. `--repair` cannot
+  be combined with `--chain`. Covered by `tests/test_check_repair.py`,
+  the `fuzz_check_repair` coverage fuzzer, and the differential
+  fuzzer's `op_repair` arm (instar vs `qemu-img check -r`). The safe
+  tier is intentionally narrower than `qemu-img -r leaks` (it never
+  lowers a referenced cluster's refcount; use `--repair=all` to
+  match) — see `docs/quirks.md`. Promoted from convert-followups
+  phase 2.
 - **New `instar snapshot` subcommand (PLAN-snapshot phases 1-14).**
   Manages the internal snapshots of a qcow2 image, mirroring
   `qemu-img snapshot`'s four modes:

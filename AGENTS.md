@@ -60,7 +60,8 @@ vhdx (VHDX), luks (info + convert with decryption)
 
 - `info`: report format, virtual size, and metadata for a disk image
 - `copy`: raw byte-for-byte copy of a disk image
-- `check`: validate image structure and integrity
+- `check`: validate image structure and integrity, and optionally repair
+  qcow2 refcount/COPIED inconsistencies in place (`--repair[=leaks|all]`)
 - `compare`: byte-identical virtual-content comparison between two images
 - `convert`: convert a disk image from one format to another
 - `measure`: predict file size required to convert an image to a target
@@ -282,6 +283,13 @@ make clean-tests
   QCOW2 snapshot detection, TestExtendedL2Subclusters for
   partial subcluster allocation with Normal/Zero/Unallocated
   states)
+- `tests/test_check_repair.py` - Tests for `check --repair`
+  (leaks/all tiers repair the corrupt-fixture matrix to
+  `qemu-img check`-clean with guest data preserved; the
+  snapshot/compression/corrupt-bit refuse paths stay
+  byte-identical; the overlapping case is a safe partial repair;
+  plus `--repair`+`--chain` rejection, clean-image no-op,
+  qcow2-only handling, and idempotence)
 - `tests/test_compare.py` - Tests for compare operation
   (raw-vs-raw, QCOW2-vs-raw, QCOW2-vs-QCOW2, compressed
   QCOW2, backing chains, LUKS-in-QCOW2 decryption)
