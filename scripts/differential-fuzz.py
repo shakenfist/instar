@@ -48,7 +48,8 @@ DATA_PATTERNS = ['zeros', 'random', 'sparse', 'mbr']
 
 # Operations that the fuzzer can chain together
 OPERATIONS = ['info', 'check', 'convert', 'convert_compressed', 'measure',
-              'create', 'resize', 'rebase', 'commit', 'map', 'snapshot']
+              'create', 'resize', 'rebase', 'commit', 'map', 'snapshot',
+              'repair']
 
 # Known divergence categories to skip (unsafe quirks)
 # See docs/quirks.md for rationale
@@ -2643,6 +2644,328 @@ def _snapshot_compare_list_output(instar_bin, inst_path, timeout,
 
 
 # ---------------------------------------------------------------------------
+# check --repair: qcow2 corruptor + differential oracle
+# ---------------------------------------------------------------------------
+#
+# The on-disk arithmetic below mirrors
+# instar-testdata/custom/check-validation/create-corrupt-images.py
+# (the fixture generator). Generated images use qemu-img's default
+# qcow2 v3 layout with refcount_order=4, i.e. 16-bit big-endian
+# refcounts (entry i at byte 2*i of its refcount block); L1/L2
+# entries are big-endian u64 with the offset in bits 9..55.
+
+_Q_MAGIC = 0x514649FB
+_Q_OFFSET_MASK = 0x00FFFFFFFFFFFE00
+_Q_OFLAG_COPIED = 1 << 63
+# qcow2 corruption classes the corruptor can inject, and the repair
+# tier(s) that can mechanically resolve each (for reference; the
+# oracle does not hard-code these — it reads instar's own
+# repair-incomplete signal).
+REPAIR_CORRUPTIONS = [
+    'refcount_zero',       # referenced cluster, refcount 0  (all)
+    'refcount_too_high',   # referenced cluster, refcount 2  (all)
+    'leaked_cluster',      # orphaned cluster, refcount kept (leaks/all)
+    'stale_copied',        # OFLAG_COPIED + refcount 2       (all)
+    'overlapping',         # two L2 entries -> one cluster   (partial)
+]
+
+
+def _q_read_header(path):
+    """Parse the qcow2 header fields the corruptor needs, or None."""
+    with open(path, 'rb') as f:
+        hdr = f.read(104)
+    if len(hdr) < 104 or struct.unpack('>I', hdr[0:4])[0] != _Q_MAGIC:
+        return None
+    cluster_bits = struct.unpack('>I', hdr[20:24])[0]
+    return {
+        'cluster_bits': cluster_bits,
+        'cluster_size': 1 << cluster_bits,
+        'l1_size': struct.unpack('>I', hdr[36:40])[0],
+        'l1_offset': struct.unpack('>Q', hdr[40:48])[0],
+        'reftable_offset': struct.unpack('>Q', hdr[48:56])[0],
+    }
+
+
+def _q_read64(path, offset):
+    """Read a big-endian u64 at a file offset."""
+    with open(path, 'rb') as f:
+        f.seek(offset)
+        return struct.unpack('>Q', f.read(8))[0]
+
+
+def _q_write64(path, offset, value):
+    """Write a big-endian u64 at a file offset."""
+    with open(path, 'r+b') as f:
+        f.seek(offset)
+        f.write(struct.pack('>Q', value))
+
+
+def _q_set_refcount(path, hdr, data_offset, value):
+    """Set the 16-bit refcount for the cluster at data_offset.
+
+    Returns False when the cluster's refcount block is not allocated.
+    """
+    cs = hdr['cluster_size']
+    cluster_index = data_offset // cs
+    entries_per_block = cs // 2
+    refblock_index = cluster_index // entries_per_block
+    entry_in_block = cluster_index % entries_per_block
+    refblock_offset = _q_read64(
+        path, hdr['reftable_offset'] + refblock_index * 8
+    )
+    if refblock_offset == 0:
+        return False
+    with open(path, 'r+b') as f:
+        f.seek(refblock_offset + entry_in_block * 2)
+        f.write(struct.pack('>H', value))
+    return True
+
+
+def _q_l2_entry(path, hdr, l2_index):
+    """Resolve L1[0] -> L2[l2_index]; return (l2_off, entry, data_off)
+    or None when the slot is unallocated."""
+    l1_entry = _q_read64(path, hdr['l1_offset'])
+    l2_off = l1_entry & _Q_OFFSET_MASK
+    if l2_off == 0:
+        return None
+    entry = _q_read64(path, l2_off + l2_index * 8)
+    data_off = entry & _Q_OFFSET_MASK
+    if data_off == 0:
+        return None
+    return l2_off, entry, data_off
+
+
+def corrupt_qcow2(rng, path):
+    """Inject one random metadata corruption into a valid qcow2.
+
+    Returns ``{'class': ..., 'data_offset': ...}`` or ``None`` when the
+    image has no allocated cluster to corrupt (a skip, not a finding).
+    """
+    hdr = _q_read_header(path)
+    if hdr is None or hdr['l1_size'] == 0:
+        return None
+    first = _q_l2_entry(path, hdr, 0)
+    if first is None:
+        return None
+    l2_off, l2_entry, data_off = first
+    cls = rng.choice(REPAIR_CORRUPTIONS)
+
+    if cls == 'refcount_zero':
+        if not _q_set_refcount(path, hdr, data_off, 0):
+            return None
+    elif cls == 'refcount_too_high':
+        # Clear OFLAG_COPIED so qemu sees a pure leak, then inflate.
+        _q_write64(path, l2_off, l2_entry & ~_Q_OFLAG_COPIED)
+        if not _q_set_refcount(path, hdr, data_off, 2):
+            return None
+    elif cls == 'leaked_cluster':
+        # Zero the L2 entry, orphaning its data cluster (refcount kept).
+        _q_write64(path, l2_off, 0)
+    elif cls == 'stale_copied':
+        # Prefer L2[1] so this is not a near-duplicate of the others;
+        # set OFLAG_COPIED and inflate the refcount to 2.
+        second = _q_l2_entry(path, hdr, 1)
+        l2o, entry, do = second if second is not None else first
+        idx = 1 if second is not None else 0
+        _q_write64(path, l2o + idx * 8, entry | _Q_OFLAG_COPIED)
+        if not _q_set_refcount(path, hdr, do, 2):
+            return None
+    elif cls == 'overlapping':
+        # Duplicate L2[0] into L2[1]: two virtual clusters -> one host
+        # cluster (a structural overlap).
+        _q_write64(path, l2_off + 1 * 8, l2_entry)
+
+    return {'class': cls, 'data_offset': data_off}
+
+
+def _qemu_check_metrics(path, timeout):
+    """Read-only ``qemu-img check --output=json`` -> a metrics dict
+    ``{'corruptions','leaks','check-errors'}`` (null -> 0), or None when
+    qemu-img cannot produce parseable JSON for the image."""
+    try:
+        result = subprocess.run(
+            ['qemu-img', 'check', '--output=json', str(path)],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except (ValueError, json.JSONDecodeError):
+        return None
+    return {
+        'corruptions': data.get('corruptions') or 0,
+        'leaks': data.get('leaks') or 0,
+        'check-errors': data.get('check-errors') or 0,
+    }
+
+
+def _instar_repair_incomplete(stdout):
+    """Parse instar's ``repair-incomplete`` JSON key; None if unparseable."""
+    try:
+        return bool(json.loads(stdout).get('repair-incomplete'))
+    except (ValueError, json.JSONDecodeError):
+        return None
+
+
+def _is_clean(metrics):
+    """True when a qemu-img check metrics dict reports no problems."""
+    return (
+        metrics is not None
+        and metrics['corruptions'] == 0
+        and metrics['leaks'] == 0
+        and metrics['check-errors'] == 0
+    )
+
+
+def op_repair(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
+    """Differential test of ``check --repair`` (qcow2 repair).
+
+    Self-contained, like ``op_create``: ignores the passed copies,
+    builds its own clean qcow2 with known data, corrupts it once, forks
+    the corrupt file to two byte-identical copies, repairs one with
+    ``instar check --repair`` and the other with ``qemu-img check -r``,
+    and applies a three-tier oracle:
+
+    1. Safety (unconditional): instar must never produce check-errors
+       and never raise the corruption/leak count above the original —
+       it must not make the image worse, even when it refuses.
+    2. Convergence (only when instar claims a complete ``all``-tier
+       repair via ``repair-incomplete == false``): the image must be
+       qemu-clean, the way ``qemu-img check -r all`` reaches.
+    3. Data equivalence (only when both reach clean): the raw-flattened
+       guest data must match.
+
+    instar's deliberate refuse/partial behaviour is recorded as
+    ``inconclusive_repair_conservative`` (visibility, not a divergence).
+    Returns a divergence dict, an inconclusive record, or None.
+    """
+    iter_dir = instar_copy.parent
+    base = iter_dir / 'repair-base.qcow2'
+    cluster_size = rng.choice([512, 4096, 65536])
+
+    # 1. Build a clean qcow2 with known data patterns.
+    try:
+        created = subprocess.run(
+            ['qemu-img', 'create', '-f', 'qcow2',
+             '-o', f'cluster_size={cluster_size}', str(base), '1M'],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if created.returncode != 0:
+            return None
+        for pattern, off, length in (
+            ('0xAA', '0', '64k'), ('0xBB', '64k', '64k'),
+            ('0xCC', '128k', '64k'), ('0xDD', '192k', '64k'),
+        ):
+            written = subprocess.run(
+                ['qemu-io', '-f', 'qcow2', '-c',
+                 f'write -P {pattern} {off} {length}', str(base)],
+                capture_output=True, text=True, timeout=timeout,
+            )
+            if written.returncode != 0:
+                return None
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+    # 2. Corrupt it once (skip if nothing is allocated to corrupt).
+    corruption = corrupt_qcow2(rng, base)
+    if corruption is None:
+        return None
+
+    # 3. Establish the baseline on the corrupt original.
+    orig = _qemu_check_metrics(base, timeout)
+    if orig is None:
+        return {
+            'type': 'inconclusive_repair_no_baseline',
+            'corruption': corruption['class'],
+        }
+
+    # 4. Fork byte-identical copies and repair each at a random tier.
+    inst = iter_dir / 'repair-instar.qcow2'
+    qemu = iter_dir / 'repair-qemu.qcow2'
+    shutil.copy2(base, inst)
+    shutil.copy2(base, qemu)
+    tier = rng.choice(['leaks', 'all'])
+
+    i_out, i_err, i_rc = run_instar(
+        instar_bin, ['check'],
+        [f'--repair={tier}', '--output', 'json', str(inst)],
+        timeout=timeout,
+    )
+    if _is_external_timeout(i_rc, i_err):
+        return {'type': 'inconclusive_external_timeout', 'operation': 'repair',
+                'instar_rc': i_rc, 'qemu_rc': 0, 'timed_out': 'instar',
+                'context': {'corruption': corruption['class'], 'tier': tier}}
+    run_qemu_img(['check'], ['-r', tier, str(qemu)], timeout=timeout)
+
+    # 5. Oracle.
+    inst_m = _qemu_check_metrics(inst, timeout)
+    qemu_m = _qemu_check_metrics(qemu, timeout)
+    ctx = {'corruption': corruption['class'], 'tier': tier,
+           'cluster_size': cluster_size, 'orig': orig}
+
+    # 5a. Safety (unconditional). A repaired image qemu can no longer
+    # parse, or with more corruptions/leaks than the original, means
+    # instar made it worse.
+    if inst_m is None:
+        return {'type': 'repair_safety_divergence',
+                'note': 'qemu-img check could not parse instar-repaired image',
+                'instar_stderr': i_err[:500], **ctx}
+    if (inst_m['check-errors'] > 0
+            or inst_m['corruptions'] > orig['corruptions']
+            or inst_m['leaks'] > orig['leaks']):
+        return {'type': 'repair_safety_divergence',
+                'instar': inst_m, 'instar_stderr': i_err[:500], **ctx}
+
+    incomplete = _instar_repair_incomplete(i_out)
+
+    # 5b. Convergence — only for the `all` tier, where instar and
+    # qemu-img have matching scope (full refcount rebuild + leak
+    # reclamation + COPIED reconciliation). When instar claims a
+    # complete all-tier repair (repair-incomplete == false), the image
+    # must be qemu-clean, the way `qemu-img check -r all` reaches.
+    #
+    # The leaks tier is deliberately NOT checked for convergence: it
+    # is narrower than qemu-img's `-r leaks`. instar's safe tier only
+    # frees unreferenced clusters and never lowers a *referenced*
+    # cluster's refcount (over-count correction is the all tier's
+    # lossy concern — see reclaim_leaks_in_refblock's doc), whereas
+    # qemu-img's `-r leaks` also trims over-counts. So a refcount-too-
+    # high / stale-copied cluster stays flagged after instar
+    # `--repair=leaks` but is cleaned by `qemu-img -r leaks`: a known,
+    # intentional scope difference, not a repair failure. Data
+    # equivalence (5c) still covers the leaks-tier cases instar does
+    # fully repair (genuine leaked clusters).
+    if tier == 'all' and incomplete is False and not _is_clean(inst_m):
+        return {'type': 'repair_completeness_divergence',
+                'instar': inst_m, 'qemu': qemu_m,
+                'instar_stdout': i_out[:500], **ctx}
+
+    # 5c. Data equivalence (only when both reach clean).
+    if _is_clean(inst_m) and _is_clean(qemu_m):
+        inst_raw = iter_dir / 'repair-instar.raw'
+        qemu_raw = iter_dir / 'repair-qemu.raw'
+        subprocess.run(['qemu-img', 'convert', '-O', 'raw',
+                        str(inst), str(inst_raw)],
+                       capture_output=True, timeout=timeout)
+        subprocess.run(['qemu-img', 'convert', '-O', 'raw',
+                        str(qemu), str(qemu_raw)],
+                       capture_output=True, timeout=timeout)
+        if (inst_raw.exists() and qemu_raw.exists()
+                and not files_match(inst_raw, qemu_raw)):
+            return {'type': 'repair_data_divergence',
+                    'instar_sha256': _file_sha256(inst_raw),
+                    'qemu_sha256': _file_sha256(qemu_raw), **ctx}
+
+    # 5d. Conservatism — instar deliberately did less. Recorded for
+    # visibility, never a divergence or a GitHub issue.
+    if incomplete:
+        return {'type': 'inconclusive_repair_conservative', **ctx}
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Single iteration
 # ---------------------------------------------------------------------------
 
@@ -2727,6 +3050,11 @@ def run_iteration(instar_bin, workdir, rng, iteration, timeout,
                 )
             elif op == 'snapshot':
                 div = op_snapshot(
+                    instar_bin, instar_copy, qemu_copy, fmt,
+                    timeout, rng,
+                )
+            elif op == 'repair':
+                div = op_repair(
                     instar_bin, instar_copy, qemu_copy, fmt,
                     timeout, rng,
                 )
