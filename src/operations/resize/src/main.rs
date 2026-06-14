@@ -28,9 +28,10 @@ use resize::{
     VhdxResizeOpts, VmdkResizeOpts, VmdkSubformat, QCOW2_MAX_REQUIRED_BLOCKS,
 };
 use shared::{
-    be_u64, format_detection::detect_format_from_header, le_u32, le_u64, validate_call_table,
-    CallTable, ImageFormat, ResizeConfig, ResizeResult, CALL_TABLE_ADDR, MAX_SECTOR_SIZE,
-    OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE,
+    be_u64,
+    format_detection::{detect_format_from_header, detect_vhd_footer},
+    le_u32, le_u64, validate_call_table, CallTable, ImageFormat, ResizeConfig, ResizeResult,
+    CALL_TABLE_ADDR, MAX_SECTOR_SIZE, OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE,
 };
 
 // ---------------------------------------------------------------------------
@@ -1000,7 +1001,22 @@ pub unsafe extern "C" fn _start() -> u64 {
         return 0;
     }
     let header = core::slice::from_raw_parts(HEADER_BUF as *const u8, sector_size);
-    let format = detect_format_from_header(header, sector_size, false);
+    let mut format = detect_format_from_header(header, sector_size, false);
+
+    // A fixed VHD has raw data at the head and its footer only at the
+    // tail (the last sector), so header detection returns Raw. Probe the
+    // tail for a VHD footer before dispatching — otherwise a fixed VHD
+    // resizes through the raw path and loses its footer. Mirrors the info
+    // op's tail detection. Reusing HEADER_BUF is safe: the header
+    // detection above is complete, run_vhd re-reads the footer into its
+    // own EXISTING_STATE buffer, and run_raw does not parse headers.
+    if format == ImageFormat::Raw && file_size_before >= sector_size as u64 {
+        let last_sector = file_size_before / sector_size as u64 - 1;
+        if (call_table.read_output_sector)(last_sector, HEADER_BUF as *mut u8, sector_size) {
+            let tail = core::slice::from_raw_parts(HEADER_BUF as *const u8, sector_size);
+            format = detect_vhd_footer(tail);
+        }
+    }
 
     let result = match format {
         ImageFormat::Raw => run_raw(config),

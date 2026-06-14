@@ -34,7 +34,7 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use guest_protocol::{
     decode_framed, encode_vmm_config_framed, guest_, vmm_config, vmm_config_chain,
     vmm_config_chain_with_output, vmm_config_input_only, FRAME_HEADER_SIZE,
@@ -84,6 +84,12 @@ const INFO_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
 const CHECK_CONFIG_MAGIC: u32 = 0x43484543; // "CHEC"
 #[allow(dead_code)]
 const CHECK_CONFIG_FLAG_REPAIR: u32 = 1 << 0;
+// Mirrors shared::CheckConfig::FLAG_REPAIR_ALL (1 << 4): selects the
+// lossy `all` tier (refcount recount + COPIED reconciliation). Only
+// meaningful in addition to CHECK_CONFIG_FLAG_REPAIR; set when the
+// CLI receives `--repair=all`.
+#[allow(dead_code)]
+const CHECK_CONFIG_FLAG_REPAIR_ALL: u32 = 1 << 4;
 #[allow(dead_code)]
 const CHECK_CONFIG_FLAG_QUIET: u32 = 1 << 1;
 #[allow(dead_code)]
@@ -283,6 +289,12 @@ const CHECK_RESULT_FLAG_CORRUPT_BIT: u32 = 1 << 4;
 #[allow(dead_code)]
 const CHECK_RESULT_FLAG_INCOMPLETE: u32 = 1 << 5;
 const CHECK_RESULT_FLAG_NOT_SUPPORTED: u32 = 1 << 6;
+// Set when an in-place --repair could not fully reconcile the image and
+// some issues remain. Mirrors shared::CheckResult::FLAG_REPAIR_INCOMPLETE
+// (1 << 8). This bit travels to the host inside CheckResult.flags,
+// alongside the per-class repaired_leaks / repaired_refcounts /
+// repaired_corruptions counters carried by the CheckResultMessage protobuf.
+const CHECK_RESULT_FLAG_REPAIR_INCOMPLETE: u32 = 1 << 8;
 
 // ChainConfig constants (must match shared crate)
 // These are used by write_chain_config() which is infrastructure for Phase 1+
@@ -2911,6 +2923,22 @@ struct CopyArgs {
     sector_count: u64,
 }
 
+/// Repair tier selected by `--repair[=MODE]`.
+///
+/// `leaks` (the bare `--repair` default) frees only clusters the
+/// integrity walk proved unreferenced — crash-safe, lossless.
+/// `all` additionally corrects wrong refcounts (both directions)
+/// and reconciles the refcount↔COPIED invariant under the crash-safe
+/// `corrupt`-bit ordering; it is destructive (it rewrites image
+/// metadata in place — back up valuable images first).
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum RepairMode {
+    /// Safe leak-reclamation tier (qemu-img check -r leaks).
+    Leaks,
+    /// Lossy refcount + COPIED correction tier (qemu-img check -r all).
+    All,
+}
+
 #[derive(Args, Debug)]
 struct CheckArgs {
     /// Input image file
@@ -2938,6 +2966,21 @@ struct CheckArgs {
     /// Validate the complete backing file chain
     #[arg(long)]
     chain: bool,
+
+    /// Repair the image in place (qcow2 only): `--repair[=leaks|all]`.
+    ///
+    /// Bare `--repair` (or `--repair=leaks`) opens the image read-write
+    /// and frees clusters the integrity walk proved unreferenced (the
+    /// safe "leaks" tier), mirroring `qemu-img check -r leaks`; this is
+    /// crash-safe and lossless.
+    ///
+    /// `--repair=all` is LOSSY: it rewrites image metadata in place,
+    /// correcting wrong refcounts (both directions) and reconciling the
+    /// refcount<->COPIED invariant under the crash-safe `corrupt`-bit
+    /// ordering, mirroring `qemu-img check -r all`. Back up valuable
+    /// images before using it.
+    #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "leaks")]
+    repair: Option<RepairMode>,
 }
 
 #[derive(Args, Debug)]
@@ -3993,7 +4036,30 @@ fn probe_resize_target(
         Some("vpc") | Some("vhd") => shared::ImageFormat::Vhd,
         Some("vhdx") => shared::ImageFormat::Vhdx,
         Some(other) => return Err(format!("resize: unknown -f format '{other}'").into()),
-        None => shared::format_detection::detect_format_from_header(&buf, buf.len(), false),
+        None => {
+            let by_header =
+                shared::format_detection::detect_format_from_header(&buf, buf.len(), false);
+            // A fixed VHD has raw data at the head and its footer only at
+            // the tail (last 512 bytes), so header detection returns Raw.
+            // Probe the tail for a VHD footer before falling through to
+            // raw, matching info/check and the resize guest — otherwise a
+            // fixed VHD is routed to the raw resize path and loses its
+            // footer.
+            if by_header == shared::ImageFormat::Raw && current_file_size >= 512 {
+                let mut tail = [0u8; 512];
+                if file.seek(SeekFrom::Start(current_file_size - 512)).is_ok()
+                    && file.read_exact(&mut tail).is_ok()
+                    && shared::format_detection::detect_vhd_footer(&tail)
+                        == shared::ImageFormat::Vhd
+                {
+                    shared::ImageFormat::Vhd
+                } else {
+                    by_header
+                }
+            } else {
+                by_header
+            }
+        }
     };
 
     let (format_code, current_virtual_size, qcow2_extended_l2) = match detected {
@@ -6593,6 +6659,21 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+/// Post-repair check counts captured from the guest's `CheckResult`,
+/// used to map the operation to a qemu-img-parity process exit code.
+///
+/// These are the *post-repair* values: when `--repair` reclaims leaked
+/// clusters the guest decrements `leaks`/`total_errors` before sending
+/// the result, so a fully-repaired image reports zero here and exits 0,
+/// matching `qemu-img check -r`'s re-check semantics.
+struct CheckExit {
+    corruptions: u32,
+    refcount_errors: u32,
+    chain_errors: u32,
+    leaks: u32,
+    not_supported: bool,
+}
+
 /// Run the check operation (image integrity validation)
 fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Validate sector size (must be power of 2, 512 to 64KB)
@@ -6602,6 +6683,28 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
             MAX_SECTOR_SIZE, args.sector_size
         )
         .into());
+    }
+
+    // --repair and --chain are mutually exclusive: repair opens the
+    // single input read-write to reclaim clusters in place, whereas the
+    // chain path opens every chain image read-only. Combining them would
+    // silently set the repair flag against a read-only device (repair
+    // would fail-safe to INCOMPLETE), so reject the combination up front
+    // with a clear message before any device is opened.
+    if args.repair.is_some() && args.chain {
+        return Err(
+            "check: --repair cannot be combined with --chain (repair operates on a single image)"
+                .into(),
+        );
+    }
+
+    // --repair=all is the lossy tier: it rewrites image metadata in
+    // place. Print a one-line stderr nudge before launching the guest so
+    // the in-the-moment risk is visible (qemu-img does not prompt either).
+    if matches!(args.repair, Some(RepairMode::All)) {
+        eprintln!(
+            "warning: --repair=all rewrites image metadata in place; back up valuable images first"
+        );
     }
 
     // Auto-discover binaries in same directory as executable
@@ -6730,6 +6833,17 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     if args.chain {
         check_flags |= CHECK_CONFIG_FLAG_CHAIN;
     }
+    if args.repair.is_some() {
+        // Any --repair[=MODE] selects the base repair flag (read-write
+        // open + leaks tier). --repair=all additionally sets
+        // FLAG_REPAIR_ALL to request the lossy recount + COPIED tier;
+        // the guest still falls back to the leaks tier when the all
+        // tier is unsupported for the image.
+        check_flags |= CHECK_CONFIG_FLAG_REPAIR;
+        if matches!(args.repair, Some(RepairMode::All)) {
+            check_flags |= CHECK_CONFIG_FLAG_REPAIR_ALL;
+        }
+    }
     guest_mem.write_obj(CHECK_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
     guest_mem.write_obj(check_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
     debug!("Wrote check config at 0x{OPERATION_CONFIG_ADDR:x} (flags=0x{check_flags:x})");
@@ -6759,6 +6873,35 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
 
         // Write chain config to guest memory
         write_chain_config(&guest_mem, chain)?;
+    } else if args.repair.is_some() {
+        // Single-device repair mode: open the input read-write so the
+        // guest can reclaim leaked clusters in place. Mirrors
+        // run_snapshot_mutating_guest's read-write open
+        // (BackingStore::open_rw_existing + VirtioBlockDevice::new(..,
+        // false)). Leak reclamation only zeroes refcount entries in
+        // place and never grows the file, so the capacity hint is the
+        // current file size (the same value the read-only path passes
+        // as the device capacity).
+        let capacity_hint = input_size;
+        let input_backing =
+            BackingStore::open_rw_existing(Path::new(&args.input), Some(capacity_hint))?;
+        let input_mmio = device_mmio_base(0);
+        let input_vq = device_vq_base(0);
+        let input_device = VirtioBlockDevice::new(
+            input_backing,
+            capacity_hint,
+            args.sector_size as u64,
+            false, // read-write (repair)
+            input_mmio,
+            input_vq,
+        );
+        debug!(
+            "Created read-write virtio-block device at MMIO 0x{input_mmio:x}, VQ 0x{input_vq:x}"
+        );
+        debug!("  Sector size: {} bytes", input_device.sector_size());
+        let input_device = Arc::new(Mutex::new(input_device));
+        device_set.add_device(Arc::clone(&input_device), true);
+        io_events.push(IoEvent::new(input_mmio)?);
     } else {
         // Single-device mode (original behavior)
         let input_backing = BackingStore::open(Path::new(&args.input), true, None, false)?;
@@ -6873,6 +7016,11 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     // Track check result for exit code (default to false - require explicit pass)
     let mut check_passed = false;
 
+    // Capture the post-repair result counts for qemu-img-parity exit-code
+    // mapping in the tail. None until a CheckResult arrives; a missing
+    // result is treated as a failure (Err) below.
+    let mut check_exit: Option<CheckExit> = None;
+
     // Track VM errors - if set, we return an error instead of Ok(())
     let mut vm_error: Option<String> = None;
 
@@ -6905,6 +7053,21 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
                                     check_passed = (result.flags & CHECK_RESULT_FLAG_VALID) != 0
                                         && result.total_errors == 0
                                         && result.chain_errors == 0;
+
+                                    // Capture the post-repair counts for the
+                                    // exit-code mapping in the tail. These are
+                                    // already post-repair: the guest decrements
+                                    // leaks/total_errors for clusters it
+                                    // reclaimed before sending the result.
+                                    check_exit = Some(CheckExit {
+                                        corruptions: result.corruptions,
+                                        refcount_errors: result.refcount_errors,
+                                        chain_errors: result.chain_errors,
+                                        leaks: result.leaks,
+                                        not_supported: (result.flags
+                                            & CHECK_RESULT_FLAG_NOT_SUPPORTED)
+                                            != 0,
+                                    });
                                 }
                                 if !args.quiet || !check_passed {
                                     print_check_result(
@@ -6994,17 +7157,47 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
         vmm_stats.lock().unwrap().display();
     }
 
-    // Return error if VM crashed or failed
+    // Return error if VM crashed or failed (genuine VM/I-O failures keep
+    // returning Err, i.e. exit 1, regardless of any check counts).
     if let Some(error) = vm_error {
         return Err(error.into());
     }
 
-    // Return error if check failed (image has errors or is invalid)
-    if !check_passed {
-        return Err("image check failed: errors detected".into());
-    }
+    // Map the post-repair CheckResult to a qemu-img-parity process exit
+    // code. All cleanup above (I/O thread stop, stats display) has already
+    // run and there is no critical work left after this point — the
+    // function would otherwise just return — so std::process::exit here is
+    // safe (this mirrors run_compare, which exits the same way). Returning
+    // Err always maps to exit 1, so the 0/2/3 cases must use exit/Ok
+    // directly rather than Err.
+    //
+    // qemu-img check exit codes: 0 = clean, 2 = corruptions/errors,
+    // 3 = leaks only. We compute these from the post-repair counts.
+    match check_exit {
+        // No result was received from the guest: treat as a failure.
+        None => Err("image check failed: no result received".into()),
+        Some(exit) => {
+            // Unsupported format: mirror `qemu-img check`, which exits 63
+            // (EXIT_NOT_SUPPORTED) with a "does not support checks"
+            // message. The not-supported message is already rendered above.
+            if exit.not_supported {
+                std::process::exit(63);
+            }
 
-    Ok(())
+            let errors = exit.corruptions > 0 || exit.refcount_errors > 0 || exit.chain_errors > 0;
+            if errors {
+                // Corruptions / refcount / chain errors => exit 2.
+                std::process::exit(2);
+            }
+            if exit.leaks > 0 {
+                // Leaks only (no other error class) => exit 3.
+                std::process::exit(3);
+            }
+
+            // Clean image => exit 0.
+            Ok(())
+        }
+    }
 }
 
 /// Print check result in human-readable or JSON format
@@ -7060,6 +7253,27 @@ fn print_check_result(
                 "{} subcluster bitmap error(s) were found.",
                 result.subcluster_errors
             );
+        }
+
+        // Repair section. The per-class repaired_* counters travel on the
+        // CheckResultMessage protobuf, so a repair run reports what it
+        // fixed; the post-repair leaks/errors counts above already reflect
+        // those fixes (reclaimed clusters are subtracted before the result
+        // is sent). The summary line is printed only when a repair
+        // actually changed something, so a read-only check is unaffected.
+        let repaired_total = result
+            .repaired_leaks
+            .saturating_add(result.repaired_refcounts)
+            .saturating_add(result.repaired_corruptions);
+        if repaired_total > 0 {
+            println!(
+                "Repaired {} leaked cluster(s), {} refcount correction(s), \
+                 {} corruption(s).",
+                result.repaired_leaks, result.repaired_refcounts, result.repaired_corruptions
+            );
+        }
+        if (result.flags & CHECK_RESULT_FLAG_REPAIR_INCOMPLETE) != 0 {
+            println!("Repair did not complete; some issues remain (re-run or use qemu-img).");
         }
 
         // Show statistics
@@ -7123,7 +7337,28 @@ fn print_check_result_json(
     println!("    \"dirty\": {is_dirty},");
     println!("    \"corrupt\": {is_corrupt},");
     println!("    \"chain-errors\": {},", result.chain_errors);
-    println!("    \"subcluster-errors\": {}", result.subcluster_errors);
+    println!("    \"subcluster-errors\": {},", result.subcluster_errors);
+    // Per-class repair counters, carried on the CheckResultMessage
+    // protobuf. Emitted only when a repair actually fixed something, so a
+    // read-only check keeps its existing key set (the qemu-img parity
+    // schema and the check-json baselines are unaffected).
+    if result.repaired_leaks > 0 {
+        println!("    \"repaired-leaks\": {},", result.repaired_leaks);
+    }
+    if result.repaired_refcounts > 0 {
+        println!("    \"repaired-refcounts\": {},", result.repaired_refcounts);
+    }
+    if result.repaired_corruptions > 0 {
+        println!(
+            "    \"repaired-corruptions\": {},",
+            result.repaired_corruptions
+        );
+    }
+    // Repair signal. The incomplete flag is carried inside result.flags;
+    // appended last (no trailing comma) after the existing keys so the
+    // schema the parity tests parse is unchanged.
+    let repair_incomplete = (result.flags & CHECK_RESULT_FLAG_REPAIR_INCOMPLETE) != 0;
+    println!("    \"repair-incomplete\": {repair_incomplete}");
     println!("}}");
 }
 

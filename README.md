@@ -168,6 +168,12 @@ instar check --output json image.qcow2
 
 # Validate the entire backing chain
 instar check --chain image.qcow2
+
+# Repair a qcow2 image in place: safe leak reclamation (the default tier)
+instar check --repair image.qcow2
+
+# Lossy repair: also rebuild refcounts and reconcile COPIED flags
+instar check --repair=all image.qcow2
 ```
 
 For QCOW2 images, check validates:
@@ -182,6 +188,17 @@ For QCOW2 images, check validates:
   including correct handling of compressed cluster host ranges
 - Cluster sizes from 512B to 2MB (cluster_bits 9-21)
 - Dirty/corrupt incompatible feature flags
+
+For QCOW2 images, `instar check --repair[=leaks|all]` additionally repairs the
+image in place: the safe `leaks` tier reclaims unreferenced clusters
+(crash-safe, lossless), and the lossy `all` tier rebuilds refcounts and
+reconciles COPIED flags under a crash-safe `corrupt`-bit write ordering —
+mirroring `qemu-img check -r leaks`/`-r all`. It refuses rather than guessing:
+snapshotted images are repaired by neither tier, and the lossy `all` tier
+declines its rebuild on compressed, external-data, or already-corrupt images
+(the safe leak reclamation still runs, and the result is reported incomplete).
+See
+[docs/qcow2/qcow2-refcount.md](docs/qcow2/qcow2-refcount.md#repairing-refcount-inconsistencies).
 
 For VMDK images (monolithicSparse, streamOptimized, and
 monolithicFlat — including multi-extent twoGbMaxExtentFlat
@@ -834,12 +851,13 @@ cd src/fuzz
 cargo fuzz run fuzz_qcow2_header -- -max_total_time=60
 ```
 
-22 fuzz targets cover all parser crates (QCOW2, VMDK, VHD, VHDX, RAW,
+23 fuzz targets cover all parser crates (QCOW2, VMDK, VHD, VHDX, RAW,
 LUKS) including header parsing, L1/L2 lookup, refcount traversal, and
 decompression, plus the create / resize / rebase / commit planners,
-the map extent walkers, the snapshot table parser
-(`fuzz_snapshot_parse`), and the snapshot refcount mutators
-(`fuzz_snapshot_refcount`). Seed the corpus from `instar-testdata`:
+the qcow2 check-repair planners (`fuzz_check_repair`), the map extent
+walkers, the snapshot table parser (`fuzz_snapshot_parse`), and the
+snapshot refcount mutators (`fuzz_snapshot_refcount`). Seed the corpus
+from `instar-testdata`:
 
 ```bash
 python3 scripts/extract-fuzz-corpus.py --testdata /path/to/instar-testdata

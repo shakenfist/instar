@@ -87,7 +87,7 @@ jobs:
               --exclude core \
               --exclude info \
               --exclude copy \
-              --exclude check \
+              --exclude check-op \
               --exclude compare \
               --exclude convert \
               --exclude measure-op \

@@ -848,6 +848,56 @@
             "tags": ["qcow2", "check-validation", "leak"]
         },
         {
+            "id": "check-qcow2-refcount-too-high",
+            "path": "custom/check-validation/qcow2-refcount-too-high.qcow2",
+            "format": "qcow2",
+            "safety": "malformed",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "QCOW2 with a once-referenced data cluster whose refcount is inflated to 2 (over-count); check --repair=all lowers it to 1",
+            "tags": ["qcow2", "check-validation", "refcount", "corruption", "repair-all"]
+        },
+        {
+            "id": "check-qcow2-stale-copied",
+            "path": "custom/check-validation/qcow2-stale-copied.qcow2",
+            "format": "qcow2",
+            "safety": "malformed",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "QCOW2 with OFLAG_COPIED set on a cluster whose refcount is 2 (copied-on-shared); check --repair=all reconciles refcount+COPIED",
+            "tags": ["qcow2", "check-validation", "copied", "corruption", "repair-all"]
+        },
+        {
+            "id": "check-qcow2-corrupt-bit-set",
+            "path": "custom/check-validation/qcow2-corrupt-bit-set.qcow2",
+            "format": "qcow2",
+            "safety": "malformed",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "QCOW2 with INCOMPAT_CORRUPT (header offset 72, bit 1) set but otherwise sound; check --repair refuses (FLAG_REPAIR_INCOMPLETE). NOTE: plain qemu-img check is silent on the bit; qemu-img info shows corrupt=true",
+            "tags": ["qcow2", "check-validation", "corrupt-bit", "repair-refuse"]
+        },
+        {
+            "id": "check-qcow2-snapshot-leak",
+            "path": "custom/check-validation/qcow2-snapshot-leak.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "Valid QCOW2 with an internal snapshot plus post-snapshot COW divergence; qemu-img check is clean but instar's check false-reports leaks, so check --repair refuses (snapshot guard)",
+            "tags": ["qcow2", "check-validation", "snapshot", "repair-refuse"]
+        },
+        {
+            "id": "check-qcow2-compressed-leak",
+            "path": "custom/check-validation/qcow2-compressed-leak.qcow2",
+            "format": "qcow2",
+            "safety": "safe",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "Valid zlib-compressed QCOW2; check --repair=all refuses the lossy tier (compressed clusters may share host clusters), leaks tier is a safe no-op",
+            "tags": ["qcow2", "check-validation", "compressed", "repair-refuse"]
+        },
+        {
             "id": "qcow2-snapshots",
             "path": "custom/format-coverage/qcow2-snapshots.qcow2",
             "format": "qcow2",

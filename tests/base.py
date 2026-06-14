@@ -409,6 +409,7 @@ class InstarTestBase(testtools.TestCase):
         output_format: Optional[str] = None,
         unsafe_quirks: bool = False,
         chain: bool = False,
+        repair: Optional[str] = None,
     ) -> tuple:
         """
         Run instar check on an image.
@@ -420,6 +421,9 @@ class InstarTestBase(testtools.TestCase):
             output_format: Optional output format ('human' or 'json')
             unsafe_quirks: Enable unsafe qemu-img compatible mode.
             chain: Enable backing chain validation (--chain)
+            repair: Optional repair tier. When set, appends
+                `--repair={repair}` (e.g. 'leaks' or 'all'). Default
+                None appends nothing, leaving existing callers unchanged.
 
         Returns:
             tuple: (stdout, stderr, return_code)
@@ -435,6 +439,8 @@ class InstarTestBase(testtools.TestCase):
             cmd.append('--unsafe-quirks')
         if chain:
             cmd.append('--chain')
+        if repair is not None:
+            cmd.append(f'--repair={repair}')
         cmd.append(str(image_path))
 
         try:

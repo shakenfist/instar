@@ -496,7 +496,7 @@ test-rust: instar-devcontainer
 			--exclude core \
 			--exclude info \
 			--exclude copy \
-			--exclude check \
+			--exclude check-op \
 			--exclude compare \
 			--exclude convert \
 			--exclude measure-op \

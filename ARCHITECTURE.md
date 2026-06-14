@@ -237,7 +237,14 @@ provides a modular architecture with:
 - **operations/info/** - Format detection operation
 - **operations/copy/** - File copy operation
 - **operations/check/** - Image integrity validation operation (with
-  optional `--chain` backing chain validation)
+  optional `--chain` backing chain validation, and optional in-place
+  qcow2 repair via `--repair[=leaks|all]`: the safe `leaks` tier
+  reclaims unreferenced clusters, the lossy `all` tier rebuilds
+  refcounts and reconciles COPIED flags under a crash-safe
+  `corrupt`-bit write ordering — set bit → correct refcounts →
+  reconcile COPIED → clear bit, each fsync-separated — reusing the
+  `crates/check` planner crate and `crates/snapshot`'s refcount
+  mutators; refuses on snapshotted/compressed/corrupt images)
 - **operations/compare/** - Image comparison operation (format-aware virtual
   content comparison between two images, supporting raw, QCOW2, VMDK,
   VHD, and VHDX inputs including compressed clusters, backing chain
@@ -869,7 +876,7 @@ A mock `CallTable` (in `src/fuzz/src/lib.rs`) backed by thread-local
 fuzzer input provides sector-based I/O, allowing libFuzzer to explore
 deeply malformed inputs.
 
-22 fuzz targets cover all parser crates: format detection, header
+23 fuzz targets cover all parser crates: format detection, header
 parsing (QCOW2, VMDK, VHD, VHDX, RAW, LUKS), L1/L2 cluster lookup,
 refcount table traversal, zlib decompression, grain directory lookup,
 BAT traversal, VHDX metadata parsing, the measure subcommand's
@@ -891,11 +898,15 @@ via the matching parser crate) and the resize subcommand's planners
 bounded patch count, no offset+len overflow, every patch ends
 within `total_file_size`, no overlapping Writes). The rebase and
 commit planners have equivalent targets (`fuzz_rebase_planners`,
-`fuzz_commit_planners`), and the snapshot subcommand adds
+`fuzz_commit_planners`), the snapshot subcommand adds
 `fuzz_snapshot_parse` (the streaming snapshot-table parser plus
 the pure table readers) and `fuzz_snapshot_refcount` (the
 refcount mutators, COPIED-flag walker, allocator, and table
-round-trip under semantic invariants).
+round-trip under semantic invariants), and the check-repair
+planners get `fuzz_check_repair` (the qcow2 leak-reclamation,
+refcount-correction, count-accumulation, and COPIED-reconciliation
+planners, asserting sub-byte-masked containment, tally correctness,
+the overflow/bounds error classifications, and idempotence).
 
 The seed corpus is extracted from `instar-testdata` by
 `scripts/extract-fuzz-corpus.py`, which filters images by format and
