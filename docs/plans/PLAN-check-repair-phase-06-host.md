@@ -194,14 +194,48 @@ sub-agents may work directly in the tree (no per-step worktree).
 
 ### Future work created by this phase
 
+- **Wire the repair counters to the host** so the renderer can
+  print "Repaired N leaked clusters" / "Corrected N refcounts"
+  like qemu-img. Needs three small changes (a guest+proto change,
+  so a separate commit/phase — not host-only): add the three
+  `repaired_*` fields to the proto `CheckResultMessage`, copy them
+  in `src/core/src/serial.rs`'s `send_check_result` conversion,
+  and render them in `print_check_result[_json]`. Until then a
+  successful repair prints only the post-repair clean state with
+  no "what was fixed" line. Tracked here; a good candidate to fold
+  into phase 8 (integration) or its own short follow-up.
 - A `--repair`-specific JSON schema aligned with `qemu-img check
   --output=json`'s repair fields, if a consumer needs exact
-  parity (phase 8 may surface the need).
+  parity.
 
 ### Bugs fixed during this work
 
-To be filled in if the exit-code change surfaces an existing
-test that depended on the old `1`-for-everything behaviour.
+- **Repair counters are not on the wire (scope correction).**
+  Phase 1 added `repaired_leaks` / `repaired_refcounts` /
+  `repaired_corruptions` to the `#[repr(C)] shared::CheckResult`,
+  but the guest→host **protobuf** `CheckResultMessage`
+  (`crates/guest-protocol/proto/guest.proto`, the serial
+  conversion in `src/core/src/serial.rs`, and the host parser)
+  carries only the older 12 fields — *not* the repair counters.
+  Only `flags` (hence `FLAG_REPAIR_INCOMPLETE`) reaches the host.
+  So the `"Repaired N leaked clusters."` / `"Corrected N
+  refcount(s)."` human lines and the `repaired-leaks` /
+  `repaired-refcounts` JSON keys are **impossible host-only** —
+  rendering them needs a guest+proto change, which this phase
+  forbids (`check.bin` must stay byte-identical). Implemented the
+  achievable subset: the `FLAG_REPAIR_INCOMPLETE` message + a
+  `repair-incomplete` JSON key. The **exit codes are unaffected**
+  — `leaks`/`corruptions`/`refcount_errors`/`chain_errors` *are*
+  on the wire and the guest decrements them post-repair, so 0/2/3
+  reflect the post-repair state correctly. See Future work.
+- **`not_supported` exit code matches qemu at 63, not 0.** The
+  plan guessed "likely 0"; empirically `qemu-img check` on a raw
+  file prints "does not support checks" and exits **63**
+  (`EXIT_NOT_SUPPORTED`). instar previously exited 0 for such
+  images; this phase mirrors qemu's 63. Verified safe: the check
+  integration suite (`test_check_formats.py`, `test_check_chain.py`)
+  passed 76/2-skipped, and the raw/`--unsafe-quirks` tests assert
+  on JSON content, not the exit code.
 
 ### Documentation index maintenance
 
