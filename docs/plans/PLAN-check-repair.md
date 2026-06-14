@@ -467,6 +467,21 @@ After each step:
   `check-op` (the no_main guest binary), after the phase-1 package
   rename. The Makefile was updated but the workflow was not. Fixed
   to `--exclude check-op`.
+* **Fixed-VHD resize dropped the footer (surfaced by CI).** A fixed
+  VHD has raw data at the head and its footer only in the last 512
+  bytes, so `resize`'s header-only format detection (both the host
+  `probe_resize_target` and the guest's `detect_format_from_header`)
+  misdetected it as raw and routed it through the raw resize path,
+  which `set_len`s to the new size and drops the footer — leaving a
+  footerless raw file. Pre-existing on develop, but masked there
+  because plain `check` returned 0 for the degraded format; this
+  work's phase-6 `not_supported`→63 exit-code parity (which matches
+  `qemu-img check`, verified) made `check` return 63 on the footerless
+  result, failing `test_resize`'s `vhd_1M_to_4M_fixed` cases. Fixed by
+  probing the tail for a VHD footer in both detection sites when the
+  header detection returns raw (mirroring the `info` op's
+  `detect_vhd_footer` tail check), so a fixed VHD resizes as a VHD and
+  keeps its footer.
 
 ### Documentation index maintenance
 

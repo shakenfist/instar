@@ -4036,7 +4036,30 @@ fn probe_resize_target(
         Some("vpc") | Some("vhd") => shared::ImageFormat::Vhd,
         Some("vhdx") => shared::ImageFormat::Vhdx,
         Some(other) => return Err(format!("resize: unknown -f format '{other}'").into()),
-        None => shared::format_detection::detect_format_from_header(&buf, buf.len(), false),
+        None => {
+            let by_header =
+                shared::format_detection::detect_format_from_header(&buf, buf.len(), false);
+            // A fixed VHD has raw data at the head and its footer only at
+            // the tail (last 512 bytes), so header detection returns Raw.
+            // Probe the tail for a VHD footer before falling through to
+            // raw, matching info/check and the resize guest — otherwise a
+            // fixed VHD is routed to the raw resize path and loses its
+            // footer.
+            if by_header == shared::ImageFormat::Raw && current_file_size >= 512 {
+                let mut tail = [0u8; 512];
+                if file.seek(SeekFrom::Start(current_file_size - 512)).is_ok()
+                    && file.read_exact(&mut tail).is_ok()
+                    && shared::format_detection::detect_vhd_footer(&tail)
+                        == shared::ImageFormat::Vhd
+                {
+                    shared::ImageFormat::Vhd
+                } else {
+                    by_header
+                }
+            } else {
+                by_header
+            }
+        }
     };
 
     let (format_code, current_virtual_size, qcow2_extended_l2) = match detected {
