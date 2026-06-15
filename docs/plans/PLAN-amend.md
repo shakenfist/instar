@@ -295,6 +295,38 @@ real fork in the design, grounded in what the code does today.
    otherwise clearing the compatible bit is safe. Confirm against
    the qcow2 spec and qemu source.
 
+   **Resolved in phase 2** (`PLAN-amend-phase-02-qcow2-planner.md`,
+   `src/crates/amend/`):
+   - **OQ1 / OQ2 (downgrade writer + relocation):** option (A) — a
+     dedicated copy-and-adjust serializer in the amend crate (not
+     `build_header`, which only emits v3 and cannot preserve
+     existing extensions). A version change rebuilds the whole
+     header cluster, relocating the extension area + backing-file
+     string to the new fixed-header boundary (72↔104) and bumping
+     `backing_file_offset` by the shift; `ExtensionRelocationUnsupported`
+     only when the shift would overflow the cluster. Fixture work
+     confirmed real qemu layouts (v2 exts at 72; v3 `header_length`
+     = 112 with a feature-name-table ext; backing-file always
+     preceded by the backing-format ext). Upgrade writes the
+     minimal `header_length = 104` and omits the feature-name-table
+     ext (info-equivalent; any residual divergence is recorded in
+     phase 6).
+   - **OQ3 (refcount width):** downgrade refuses `refcount_bits != 16`
+     with `DowngradeRefcountWidth`.
+   - **OQ4 (no-op):** target == current for both version and lazy
+     ⇒ `AmendAction::NoOp`, zero patches (idempotent; the file is
+     not touched). Whether qemu rewrites anyway on a no-op is
+     reconciled in phase 6.
+   - **OQ5 (lazy clear safety):** any `DIRTY`/`CORRUPT` image is
+     refused (`Dirty`), so a non-dirty lazy clear is safe with no
+     refcount flush. A v3→v2 downgrade silently clears inherited
+     lazy; only an *explicit* `lazy_refcounts=on` against a v2
+     target is refused (`LazyRequiresV3`). (A review caught and
+     fixed a first-cut bug that rejected the silent-clear case.)
+   - **OQ6 (crash-safety) remains for phase 3** — the planner emits
+     only the final target bytes; write ordering / corrupt-bit
+     guarding is a guest concern.
+
 6. **Crash-safety / write ordering.** Header rewrites must be
    crash-safe. `check --repair` established the pattern of
    guarding risky in-place mutation with the `corrupt`
@@ -348,7 +380,7 @@ because the mutation is header-only.
 | Phase | Plan | Status |
 |-------|------|--------|
 | 1. ABI: `AmendConfig`/`AmendResult`, call-table `send_amend_result`, `AmendResultMessage` proto, magic/flag/error constants | PLAN-amend-phase-01-abi.md | Complete |
-| 2. qcow2 amend planner crate (`src/crates/amend/`): header patch computation for compat up/down + lazy toggle, all validation (downgrade blockers, refcount-width, extension relocation), inline unit tests | PLAN-amend-phase-02-qcow2-planner.md | Not started |
+| 2. qcow2 amend planner crate (`src/crates/amend/`): header patch computation for compat up/down + lazy toggle, all validation (downgrade blockers, refcount-width, extension relocation), inline unit tests | PLAN-amend-phase-02-qcow2-planner.md | Complete |
 | 3. Guest op (`src/operations/amend/`): read config, read full header cluster, dispatch qcow2, apply patches, send result; binary-size check | PLAN-amend-phase-03-guest.md | Not started |
 | 4. Host VMM subcommand: `AmendArgs` clap surface, `-o` option parsing + validation, host-side format probe, `run_amend`/`run_amend_guest`, human/json rendering | PLAN-amend-phase-04-host-cli.md | Not started |
 | 5. Rust round-trip tests (`src/crates/amend/tests/`): amend → re-parse, assert header invariants for each transition | PLAN-amend-phase-05-rust-tests.md | Not started |

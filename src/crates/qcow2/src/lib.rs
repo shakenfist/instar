@@ -520,6 +520,45 @@ pub fn parse_header_extensions(header: &[u8], parsed: &QcowHeader) -> HeaderExte
     result
 }
 
+/// Walk the header-extension chain and return the offset just past
+/// the terminating `EXT_END` record.
+///
+/// Unlike [`parse_header_extensions`], this is **version-agnostic**:
+/// it walks `(type:u32 BE, len:u32 BE)` records from `start`,
+/// advancing by `8 + align8(len)` per record, and stops *after* the
+/// `EXT_END` (type == 0) record, returning the offset just past its
+/// 8-byte header. The amend planner uses this to size the
+/// "meaningful tail" (extension chain + backing string) that a
+/// version change must relocate, for either a v2 source (extensions
+/// at offset 72) or a v3 source (extensions at `header_length`).
+///
+/// Returns `None` if any record header or body would read out of
+/// bounds, or if no `EXT_END` is found within the cluster.
+pub fn header_extension_area_end(cluster: &[u8], start: usize) -> Option<usize> {
+    let mut off = start;
+    loop {
+        // Need the 8-byte (type, len) record header.
+        if off.checked_add(8)? > cluster.len() {
+            return None;
+        }
+        let ext_type = be_u32(cluster, off);
+        let ext_len = be_u32(cluster, off + 4) as usize;
+
+        if ext_type == EXT_END {
+            // Stop after the EXT_END record (its body is ignored).
+            return Some(off + 8);
+        }
+
+        // Validate the (padded) body stays in bounds before advancing.
+        let padded_len = (ext_len + 7) & !7;
+        let next = off.checked_add(8)?.checked_add(padded_len)?;
+        if next > cluster.len() {
+            return None;
+        }
+        off = next;
+    }
+}
+
 /// Read the backing file path from a QCOW2 image.
 ///
 /// Uses the `backing_file_offset` and `backing_file_size` from the
@@ -2957,6 +2996,43 @@ extern crate std;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ext_area_end_empty_region() {
+        // EXT_END immediately at `start`: a zeroed cluster reads
+        // (type=0, len=0) and stops right after the 8-byte header.
+        let cluster = [0u8; 256];
+        assert_eq!(header_extension_area_end(&cluster, 72), Some(80));
+    }
+
+    #[test]
+    fn ext_area_end_one_backing_format_ext() {
+        // One backing-format extension (type 0xE2792ACA, len 5 =
+        // "qcow2"), then EXT_END.
+        let mut cluster = [0u8; 256];
+        let start = 72usize;
+        // ext header: type + len
+        cluster[start..start + 4].copy_from_slice(&EXT_BACKING_FORMAT.to_be_bytes());
+        cluster[start + 4..start + 8].copy_from_slice(&5u32.to_be_bytes());
+        cluster[start + 8..start + 13].copy_from_slice(b"qcow2");
+        // padded body len = 8, so EXT_END at start + 8 + 8 = 88.
+        // EXT_END is already zeros; its header is at 88, end = 96.
+        assert_eq!(
+            header_extension_area_end(&cluster, start),
+            Some(start + 16 + 8)
+        );
+    }
+
+    #[test]
+    fn ext_area_end_truncated_chain_is_none() {
+        // A non-EXT_END record whose body runs past the buffer end,
+        // and no EXT_END terminator -> None.
+        let mut cluster = [0u8; 24];
+        cluster[0..4].copy_from_slice(&EXT_BACKING_FORMAT.to_be_bytes());
+        // len = 100 (way past the 24-byte buffer).
+        cluster[4..8].copy_from_slice(&100u32.to_be_bytes());
+        assert_eq!(header_extension_area_end(&cluster, 0), None);
+    }
 
     /// Build a minimal QCOW2 header buffer (≥105 bytes).
     /// Fields default to valid v3, cluster_bits=16, virtual_size=1GiB.

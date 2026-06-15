@@ -331,6 +331,56 @@ relocation as a follow-up — but default to (A).
 and the plan switches to (B). Absent that, the steps below assume
 (A).)
 
+**Fixture findings (verified 2026-06-15 against qemu-img 10.0.8).**
+Real qemu layouts the implementer must handle:
+
+- **v2 plain** (`compat=0.10`, no backing): version=2,
+  `backing_file_offset=0`, bytes 72..cluster-end all zero. Upgrade
+  writes the v3 fixed fields into 72..104; nothing to relocate.
+- **v2 + backing** (`compat=0.10,backing_file=…,backing_fmt=…`):
+  extension chain starts at **offset 72** — a backing-format ext
+  (`0xE2792ACA`, len 5 = "qcow2"), then `EXT_END` at 0x58, then the
+  backing string at offset 96 (`backing_file_offset=0x60`,
+  size 10). On upgrade this whole region (72..106) collides with
+  the v3 fixed header and **must relocate to 104** (+32), with
+  `backing_file_offset` bumped 96→128. This is the case option (B)
+  would refuse — confirming (A).
+- **v3 plain** (`compat=1.1`): **`header_length` = 112, not 104**
+  (`refcount_order=4` at 96, header_length `0x70` at 100), and a
+  **feature-name-table extension `0x6803F857`** (len 384, the
+  "dirty bit"/"corrupt bit"/… strings) sits at offset 112. So
+  v3 sources have `src_ext_start = header_length = 112` (read the
+  field — do NOT hardcode 104) and carry an extension `build_header`
+  cannot emit, reconfirming amend must relocate extensions
+  verbatim.
+- **v3 + backing**: ext chain at 112 = backing-format ext, then
+  feature-name-table ext, with the backing string far out at
+  `backing_file_offset=0x210` (528). Downgrade relocates the whole
+  112..538 region down to 72 (−40) and bumps `backing_file_offset`
+  528→488.
+- **Backing file without `backing_fmt`**: qemu **refuses to create
+  it** ("Backing file specified without backing format"), so the
+  "bare backing string at offset 72 with no extension chain" case
+  does not arise from qemu — every backing file is preceded by the
+  backing-format extension. The planner should still bound-check
+  defensively, but need not special-case it.
+
+Design consequences folded into step 2c:
+- **Read the source `header_length` field for v3** (`src_ext_start`);
+  it is 112 in modern qemu, sometimes 104 elsewhere.
+- **On upgrade, write `header_length = 104`** (the minimum valid v3
+  header: no `compression_type` field, extensions immediately
+  after) and **do not synthesize a feature-name-table extension**.
+  The relocated v2 extensions (if any) are placed at 104. This is
+  byte-different from qemu's upgrade (112 + feature-name-table +
+  `compression_type=0`) but `qemu-img info`/`check`/`compare` do
+  not observe `header_length` or the feature-name-table, so it
+  should stay info-equivalent — phase 6 records any residual
+  divergence in `KNOWN_AMEND_DIVERGENCES`.
+- **On downgrade, relocate the feature-name-table extension
+  verbatim** to offset 72 (v2 readers ignore unknown extensions;
+  harmless). Do not attempt to strip it.
+
 ### 3. Version-agnostic extension-area length helper
 
 The rebuild (and the overflow check) needs the length of the
