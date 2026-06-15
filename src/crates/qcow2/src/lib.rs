@@ -4526,6 +4526,7 @@ mod tests {
         unsafe extern "C" fn s_fsync_in(_: u32) -> bool {
             true
         }
+        unsafe extern "C" fn s_send_amend(_: *const shared::AmendResult) {}
         shared::CallTable {
             magic: shared::CallTable::MAGIC,
             version: shared::CallTable::VERSION,
@@ -4563,6 +4564,7 @@ mod tests {
             send_snapshot_entry: s_send_snap_ent,
             send_snapshot_result: s_send_snap_res,
             fsync_input: s_fsync_in,
+            send_amend_result: s_send_amend,
         }
     }
 

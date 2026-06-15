@@ -321,6 +321,22 @@ real fork in the design, grounded in what the code does today.
    host probes + passes a cross-check, guest re-parses and
    validates against it.
 
+   **Resolved in phase 1.** The ABI froze on the resize model:
+   `AmendConfig` (128 B) carries `target_format`, `flags`
+   (present-bit + value-bit pairs: `FLAG_SET_COMPAT`/
+   `FLAG_COMPAT_V3`, `FLAG_SET_LAZY`/`FLAG_LAZY_ON`, `FLAG_QUIET`),
+   and the host-probed cross-check (`current_version`,
+   `current_refcount_bits`, both feature words, `cluster_size`,
+   `virtual_size`); `AmendResult` (64 B) returns `action`
+   (noop/amended), `resulting_version`, `resulting_lazy_refcounts`,
+   and `error`. Only one call-table pointer was added
+   (`send_amend_result`), bumping `CallTable::VERSION` 17 → 18; no
+   new device-I/O primitive was needed (resolves Open question 6/7's
+   ABI half — amend reuses resize's `read_output_sector` /
+   `write_output_sector`). Header-length is *not* carried in the
+   config: `cluster_size` bounds the header-cluster read and the
+   guest derives the rest from its own re-parse.
+
 ## Execution
 
 Phase plans are written one at a time, at the recommended effort,
@@ -331,7 +347,7 @@ because the mutation is header-only.
 
 | Phase | Plan | Status |
 |-------|------|--------|
-| 1. ABI: `AmendConfig`/`AmendResult`, call-table `send_amend_result`, `AmendResultMessage` proto, magic/flag/error constants | PLAN-amend-phase-01-abi.md | Not started |
+| 1. ABI: `AmendConfig`/`AmendResult`, call-table `send_amend_result`, `AmendResultMessage` proto, magic/flag/error constants | PLAN-amend-phase-01-abi.md | Complete |
 | 2. qcow2 amend planner crate (`src/crates/amend/`): header patch computation for compat up/down + lazy toggle, all validation (downgrade blockers, refcount-width, extension relocation), inline unit tests | PLAN-amend-phase-02-qcow2-planner.md | Not started |
 | 3. Guest op (`src/operations/amend/`): read config, read full header cluster, dispatch qcow2, apply patches, send result; binary-size check | PLAN-amend-phase-03-guest.md | Not started |
 | 4. Host VMM subcommand: `AmendArgs` clap surface, `-o` option parsing + validation, host-side format probe, `run_amend`/`run_amend_guest`, human/json rendering | PLAN-amend-phase-04-host-cli.md | Not started |
@@ -463,6 +479,17 @@ the following statements will be true:
 
 Obvious extensions deferred from v1:
 
+* **`core.bin` is at its 64 KiB budget ceiling (surfaced in phase
+  1).** Wiring amend's result sender into `core` took it from
+  63 680 B (97 %) to 65 304 B (99 %) — and only after moving the
+  result strings off the wire to keep it under the 65 536 B cap
+  (see phase-1 plan Open question 5). ~232 B of headroom remain.
+  The next subcommand/phase that adds anything to `core` will
+  overflow it; at that point we must either keep trimming
+  per-feature or lift the core memory budget (move the operations
+  load address in `src/shared/src/lib.rs`'s memory map — a
+  loader/layout change affecting every guest binary). An operator
+  decision, not resolved here.
 * **`refcount_bits` amend.** Changing the refcount width requires
   rewriting the entire refcount tree (and possibly growing/
   shrinking refcount blocks). Substantial; reuse the

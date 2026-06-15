@@ -921,6 +921,13 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
                 r.overlay_format, r.mode, r.clusters_copied, r.bytes_copied, r.error
             )
         }
+        Some(guest_::GuestMessage_::Payload::AmendResult(a)) => {
+            format!(
+                "amend_result target_format={} action={} resulting_version={} \
+                lazy_refcounts={} error={}",
+                a.target_format, a.action, a.resulting_version, a.lazy_refcounts, a.error
+            )
+        }
         Some(guest_::GuestMessage_::Payload::CommitResult(c)) => {
             format!(
                 "commit_result overlay_format={} backing_format={} \
@@ -2661,6 +2668,20 @@ struct RebaseRunResult {
     mode: u32,
     clusters_copied: u64,
     bytes_copied: u64,
+    error: u32,
+}
+
+/// Host-side holder for the harvested `AmendResultMessage`.
+/// Mirrors `RebaseRunResult`. Not yet constructed by any
+/// subcommand (the `amend` CLI entry point lands in phase 4);
+/// the ABI and decode path are wired here so phases 2–4 build
+/// against a frozen surface.
+#[allow(dead_code)]
+struct AmendRunResult {
+    target_format: u32,
+    action: u32,
+    resulting_version: u32,
+    resulting_lazy_refcounts: u32,
     error: u32,
 }
 

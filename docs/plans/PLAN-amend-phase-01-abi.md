@@ -291,22 +291,54 @@ size yields 64 bytes total.
 
 ### 5. Proto `AmendResultMessage` shape
 
-Working draft (mirrors `RebaseResultMessage`):
+**Resolved as IMPLEMENTED (diverged from the string-based draft —
+forced by the core binary size cap).** The string draft below
+mirrored `RebaseResultMessage`:
 
 ```protobuf
+// REJECTED draft:
 message AmendResultMessage {
-  string target_format = 1;   // "qcow2"
+  string target_format = 1;
   string action = 2;          // "noop" | "amended"
-  string compat = 3;          // resulting "0.10" | "1.1"
-  bool lazy_refcounts = 4;    // resulting state
-  uint32 error = 5;           // mirrors AmendResult::ERROR_*
+  string compat = 3;          // "0.10" | "1.1"
+  bool lazy_refcounts = 4;
+  uint32 error = 5;
 }
 ```
 
-`serial::send_amend_result` maps `AmendResult.action` → the action
-string, `resulting_version` → `compat` ("0.10"/"1.1" via the same
-mapping `QcowHeader::compat_str` uses), and `resulting_lazy_refcounts`
-→ the bool. Oneof arm: `AmendResultMessage amend_result = 19;`.
+This was rejected during implementation: `core.bin` was already at
+**63 680 B / 65 536 B (97 %)** on `develop`, and wiring the
+string-mapping sender (`"noop"/"amended"`, `"0.10"/"1.1"`) into
+`core` pushed it to **65 600 B — 64 B over the hard 64 KiB cap**
+(`make instar` / `check-binary-sizes` FAIL). The fix moves the
+presentation strings to the host (which has no size budget) and
+keeps `action` / `resulting_version` numeric on the wire. The
+**shipped** message:
+
+```protobuf
+message AmendResultMessage {
+  string target_format = 1;     // "qcow2" (reuses ImageFormat::name())
+  uint32 action = 2;            // AmendResult::ACTION_* (0=noop,1=amended)
+  uint32 resulting_version = 3; // qcow2 version 2 or 3; host -> "0.10"/"1.1"
+  bool lazy_refcounts = 4;      // resulting state
+  uint32 error = 5;             // mirrors AmendResult::ERROR_*
+}
+```
+
+`serial::send_amend_result` now passes `action` and
+`resulting_version` through numerically (only `target_format`
+keeps the shared `ImageFormat::name()` mapping every sender
+already links); the host renders `"noop"/"amended"` and
+`"0.10"/"1.1"` in phase 4. This brought `core.bin` to **65 304 B
+(99 %)** — it fits, but with only ~232 B of headroom.
+
+**Finding for the operator (raised separately): `core.bin` is
+effectively at its 64 KiB ceiling.** Every future result-sender
+addition will overflow it. The next subcommand/phase that touches
+`core` will force a decision: keep squeezing per-feature, or lift
+the core memory budget (move the operations load address in
+`src/shared/src/lib.rs`'s memory map — a loader/layout change). Not
+resolved here. Oneof arm: `AmendResultMessage amend_result = 19;`.
 
 ### 6. Does amend need any new device-I/O primitive?
 
