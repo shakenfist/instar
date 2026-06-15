@@ -18,11 +18,45 @@ fi
 
 MODE="${1:-check}"  # "check" or "fix"
 
+# Run the lint container as the host user so build artifacts (target/,
+# Cargo.lock, the cargo cache) are written owned by us rather than root.
+# The Makefile's build/test targets already run as -u $(id -u):$(id -g);
+# matching that here keeps a `pre-commit` lint run from leaving root-owned
+# files that later break `make instar` / `make test-rust` with "Permission
+# denied" and that cannot be removed (e.g. worktree cleanup) without sudo.
+UID_VAL="$(id -u)"
+GID_VAL="$(id -g)"
+
+# Docker creates missing bind-mount dirs as root, and any earlier root-owned
+# lint run can leave the cargo cache, target/, or Cargo.lock owned by root --
+# either blocks a later run as the host user. Create the cache dirs up front,
+# then fix ownership of anything already root-owned using a throwaway
+# container (no sudo required). Globs that match nothing are skipped.
+mkdir -p "$PROJECT_ROOT/.cargo-cache/registry" "$PROJECT_ROOT/.cargo-cache/git"
+fix_ownership() {
+    local path
+    for path in "$@"; do
+        if [ -e "$path" ] && [ ! -w "$path" ]; then
+            echo "Fixing ownership of $path ..."
+            docker run --rm -v "$path:/fixme" alpine \
+                chown -R "$UID_VAL:$GID_VAL" /fixme
+        fi
+    done
+}
+fix_ownership "$PROJECT_ROOT/.cargo-cache/registry" "$PROJECT_ROOT/.cargo-cache/git" \
+    "$PROJECT_ROOT/src/Cargo.lock" "$PROJECT_ROOT/src/target" \
+    "$PROJECT_ROOT"/prototypes/*/Cargo.lock "$PROJECT_ROOT"/prototypes/*/target
+
 run_in_docker() {
     local dir="$1"
     shift
     docker run --rm \
+        -u "$UID_VAL:$GID_VAL" \
+        -e HOME=/build \
+        -e CARGO_HOME=/build/.cargo \
         -v "$PROJECT_ROOT:/workspace" \
+        -v "$PROJECT_ROOT/.cargo-cache/registry:/build/.cargo/registry" \
+        -v "$PROJECT_ROOT/.cargo-cache/git:/build/.cargo/git" \
         -w "/workspace/$dir" \
         "$IMAGE" \
         "$@"
