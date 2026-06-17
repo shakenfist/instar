@@ -335,12 +335,33 @@ real fork in the design, grounded in what the code does today.
    rewrite need that machinery, or is a single sector/cluster
    write atomic enough at our guarantees? Decide and document.
 
+   **Resolved in phase 3** (`PLAN-amend-phase-03-guest.md`,
+   `src/operations/amend/`): **a direct header write, no corrupt-bit
+   guard**, matching `resize`/`rebase` (and qemu's own
+   `qcow2_update_header`, which rewrites the header cluster without
+   the guard). The load-bearing fixed-header fields live in the
+   first sector (atomic flip), and the host fsyncs the output file
+   after the guest halts (`vmm/src/main.rs` `file.sync_all()`); the
+   corrupt-bit dance is reserved for `check --repair`'s
+   multi-cluster, multi-phase mutation. Residual: a 512-byte-sector
+   image whose relocated extensions span multiple sectors has a
+   torn-header window on crash — the same window qemu has — accepted
+   for v1, with a corrupt-bit guard noted as possible future
+   hardening.
+
 7. **Does amend need to read more than sector 0?** resize/rebase
    read sector 0 to detect format, then read more as needed. amend
    needs the full header cluster (up to `cluster_size`, ≥ 512 B)
    to see header extensions and compute relocation. Confirm the
    guest reads the whole first cluster, not just sector 0, before
    planning.
+
+   **Resolved in phase 3:** yes — the guest reads the whole first
+   cluster (`read_byte_range(.., 0, .., cluster_size)`) into a
+   dedicated buffer before planning, after a `cluster_size <=`
+   scratch-limit bounds check. A defensive layout guard also
+   refuses images whose refcount-table or L1 offset falls inside
+   cluster 0 (which the whole-cluster rewrite would clobber).
 
 8. **ABI footprint.** `AmendConfig`/`AmendResult` shapes: how much
    do we pass? Likely `target_format`, `flags` (a bitfield:
@@ -381,7 +402,7 @@ because the mutation is header-only.
 |-------|------|--------|
 | 1. ABI: `AmendConfig`/`AmendResult`, call-table `send_amend_result`, `AmendResultMessage` proto, magic/flag/error constants | PLAN-amend-phase-01-abi.md | Complete |
 | 2. qcow2 amend planner crate (`src/crates/amend/`): header patch computation for compat up/down + lazy toggle, all validation (downgrade blockers, refcount-width, extension relocation), inline unit tests | PLAN-amend-phase-02-qcow2-planner.md | Complete |
-| 3. Guest op (`src/operations/amend/`): read config, read full header cluster, dispatch qcow2, apply patches, send result; binary-size check | PLAN-amend-phase-03-guest.md | Not started |
+| 3. Guest op (`src/operations/amend/`): read config, read full header cluster, dispatch qcow2, apply patches, send result; binary-size check | PLAN-amend-phase-03-guest.md | Complete |
 | 4. Host VMM subcommand: `AmendArgs` clap surface, `-o` option parsing + validation, host-side format probe, `run_amend`/`run_amend_guest`, human/json rendering | PLAN-amend-phase-04-host-cli.md | Not started |
 | 5. Rust round-trip tests (`src/crates/amend/tests/`): amend → re-parse, assert header invariants for each transition | PLAN-amend-phase-05-rust-tests.md | Not started |
 | 6. Python integration tests (`tests/test_amend.py`): cross-check vs `qemu-img amend` with post-op `info`/`check`/`compare`, known-divergence registry | PLAN-amend-phase-06-integration.md | Not started |

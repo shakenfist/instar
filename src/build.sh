@@ -266,6 +266,25 @@ else
 fi
 
 echo ""
+echo "=== Building amend operation ==="
+cd operations/amend
+cargo +nightly build --release
+cd ../..
+
+# Convert amend ELF to flat binary
+echo "=== Converting amend ELF to flat binary ==="
+AMEND_ELF="target/x86_64-unknown-none/release/amend"
+AMEND_BIN="amend.bin"
+
+if [ -f "$AMEND_ELF" ]; then
+    rust-objcopy -O binary "$AMEND_ELF" "$AMEND_BIN"
+    echo "Created $AMEND_BIN ($(wc -c < "$AMEND_BIN") bytes)"
+else
+    echo "Error: Amend ELF not found at $AMEND_ELF"
+    exit 1
+fi
+
+echo ""
 echo "=== Building instar ==="
 cd vmm
 cargo build --release
@@ -287,7 +306,8 @@ cp "$REBASE_BIN" target/release/
 cp "$COMMIT_BIN" target/release/
 cp "$MAP_BIN" target/release/
 cp "$SNAPSHOT_BIN" target/release/
-echo "Copied core.bin, info.bin, copy.bin, check.bin, compare.bin, convert.bin, measure.bin, create.bin, resize.bin, rebase.bin, commit.bin, map.bin, and snapshot.bin to target/release/"
+cp "$AMEND_BIN" target/release/
+echo "Copied core.bin, info.bin, copy.bin, check.bin, compare.bin, convert.bin, measure.bin, create.bin, resize.bin, rebase.bin, commit.bin, map.bin, snapshot.bin, and amend.bin to target/release/"
 
 # Check binary sizes against memory layout limits
 # Memory layout (from shared/src/lib.rs):
@@ -331,6 +351,7 @@ check_size "rebase.bin" "target/release/$REBASE_BIN" "$OP_MAX" || FAILED=1
 check_size "commit.bin" "target/release/$COMMIT_BIN" "$OP_MAX" || FAILED=1
 check_size "map.bin" "target/release/$MAP_BIN" "$OP_MAX" || FAILED=1
 check_size "snapshot.bin" "target/release/$SNAPSHOT_BIN" "$OP_MAX" || FAILED=1
+check_size "amend.bin" "target/release/$AMEND_BIN" "$OP_MAX" || FAILED=1
 
 if [ "$FAILED" -eq 1 ]; then
     echo ""
@@ -357,6 +378,7 @@ echo "  - rebase.bin     Rebase operation (change backing-file reference) - load
 echo "  - commit.bin     Commit operation (merge overlay into backing) - loaded at 0x20000"
 echo "  - map.bin        Map operation (stream allocation map) - loaded at 0x20000"
 echo "  - snapshot.bin   Snapshot operation (list/apply/create/delete) - loaded at 0x20000"
+echo "  - amend.bin      Amend operation (change qcow2 compat / lazy refcounts) - loaded at 0x20000"
 echo ""
 echo "To run:"
 echo "  sudo ./target/release/instar info image.qcow2"
