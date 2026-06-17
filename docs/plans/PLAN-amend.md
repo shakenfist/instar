@@ -403,7 +403,7 @@ because the mutation is header-only.
 | 1. ABI: `AmendConfig`/`AmendResult`, call-table `send_amend_result`, `AmendResultMessage` proto, magic/flag/error constants | PLAN-amend-phase-01-abi.md | Complete |
 | 2. qcow2 amend planner crate (`src/crates/amend/`): header patch computation for compat up/down + lazy toggle, all validation (downgrade blockers, refcount-width, extension relocation), inline unit tests | PLAN-amend-phase-02-qcow2-planner.md | Complete |
 | 3. Guest op (`src/operations/amend/`): read config, read full header cluster, dispatch qcow2, apply patches, send result; binary-size check | PLAN-amend-phase-03-guest.md | Complete |
-| 4. Host VMM subcommand: `AmendArgs` clap surface, `-o` option parsing + validation, host-side format probe, `run_amend`/`run_amend_guest`, human/json rendering | PLAN-amend-phase-04-host-cli.md | Not started |
+| 4. Host VMM subcommand: `AmendArgs` clap surface, `-o` option parsing + validation, host-side format probe, `run_amend`/`run_amend_guest`, human/json rendering | PLAN-amend-phase-04-host-cli.md | Complete |
 | 5. Rust round-trip tests (`src/crates/amend/tests/`): amend → re-parse, assert header invariants for each transition | PLAN-amend-phase-05-rust-tests.md | Not started |
 | 6. Python integration tests (`tests/test_amend.py`): cross-check vs `qemu-img amend` with post-op `info`/`check`/`compare`, known-divergence registry | PLAN-amend-phase-06-integration.md | Not started |
 | 7. Cross-version baselines: `AMEND_CASES` in `generate-baselines.py`, `expected-outputs/amend-info-json/`, testdata push | PLAN-amend-phase-07-baselines.md | Not started |

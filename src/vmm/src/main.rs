@@ -2579,6 +2579,8 @@ enum Commands {
     Rebase(RebaseArgs),
     /// Commit an overlay's data down into its backing file
     Commit(CommitArgs),
+    /// Amend an existing qcow2 image's compat version / lazy refcounts
+    Amend(AmendArgs),
     /// Emit the allocation map of a disk image
     Map(MapArgs),
     /// List, apply, create, or delete qcow2 internal snapshots
@@ -2676,13 +2678,116 @@ struct RebaseRunResult {
 /// subcommand (the `amend` CLI entry point lands in phase 4);
 /// the ABI and decode path are wired here so phases 2–4 build
 /// against a frozen surface.
-#[allow(dead_code)]
 struct AmendRunResult {
     target_format: u32,
     action: u32,
     resulting_version: u32,
     resulting_lazy_refcounts: u32,
     error: u32,
+}
+
+/// Arguments for `instar amend`. Mirrors `qemu-img amend`'s
+/// surface for the v1 supported keys (compat / lazy_refcounts);
+/// see PLAN-amend-phase-04-host-cli.md.
+#[derive(Args, Debug)]
+struct AmendArgs {
+    /// Image file to amend (qcow2 only).
+    filename: String,
+    /// Force the image format detection (qcow2 only).
+    #[arg(short = 'f', long)]
+    format: Option<String>,
+    /// Suppress the success line on stdout. Errors still go to stderr.
+    #[arg(short = 'q', long)]
+    quiet: bool,
+    /// Output format.
+    #[arg(long, default_value = "human", value_parser = ["human", "json"])]
+    output: String,
+    /// qemu-img-style options, comma-separated key=value
+    /// (e.g. -o compat=1.1,lazy_refcounts=on). Only compat and
+    /// lazy_refcounts are supported.
+    #[arg(short = 'o', long = "options", action = clap::ArgAction::Append,
+          value_name = "KEY=VALUE,...")]
+    option: Vec<String>,
+}
+
+/// Parsed, validated `-o` options for `instar amend`. Each
+/// field is `None` when the corresponding key was not given,
+/// leaving that aspect of the header unchanged.
+#[derive(Debug)]
+struct AmendOOptions {
+    /// `Some(true)` for `compat=1.1`, `Some(false)` for
+    /// `compat=0.10`, `None` if `compat=` was not given.
+    compat_v3: Option<bool>,
+    /// `Some(true)` for `lazy_refcounts=on`, `Some(false)` for
+    /// off, `None` if `lazy_refcounts=` was not given.
+    lazy_on: Option<bool>,
+}
+
+/// Parse the `-o key=value,...` strings for `instar amend`.
+///
+/// Only the qcow2 keys `compat` (`0.10`→v2 / `1.1`→v3) and
+/// `lazy_refcounts` (on/off) are accepted; every other key is
+/// rejected with a clear CLI error before any VM launch. At least
+/// one supported option must be given.
+fn parse_amend_o_options(raw: &[String]) -> Result<AmendOOptions, Box<dyn std::error::Error>> {
+    let mut compat_v3: Option<bool> = None;
+    let mut lazy_on: Option<bool> = None;
+
+    for input in raw {
+        for piece in input.split(',') {
+            let piece = piece.trim();
+            if piece.is_empty() {
+                continue;
+            }
+            let (key, value) = match piece.split_once('=') {
+                Some((k, v)) => (k.trim(), v.trim()),
+                None => {
+                    return Err(format!(
+                        "amend: -o option '{piece}' is missing a value (expected KEY=VALUE)"
+                    )
+                    .into())
+                }
+            };
+            match key {
+                "compat" => match value {
+                    "0.10" => compat_v3 = Some(false),
+                    "1.1" => compat_v3 = Some(true),
+                    _ => {
+                        return Err(format!(
+                            "amend: bad value '{value}' for -o key 'compat' \
+                             (expected 0.10 or 1.1)"
+                        )
+                        .into())
+                    }
+                },
+                "lazy_refcounts" => match value.to_ascii_lowercase().as_str() {
+                    "on" | "true" | "yes" => lazy_on = Some(true),
+                    "off" | "false" | "no" => lazy_on = Some(false),
+                    _ => {
+                        return Err(format!(
+                            "amend: bad value '{value}' for -o key 'lazy_refcounts' \
+                             (expected on/off)"
+                        )
+                        .into())
+                    }
+                },
+                other => {
+                    return Err(format!(
+                        "amend: -o key '{other}' is not supported (amend changes \
+                         compat and lazy_refcounts only)"
+                    )
+                    .into())
+                }
+            }
+        }
+    }
+
+    if compat_v3.is_none() && lazy_on.is_none() {
+        return Err("amend: no supported -o options given \
+                    (expected compat= and/or lazy_refcounts=)"
+            .into());
+    }
+    Ok(AmendOOptions { compat_v3, lazy_on })
 }
 
 /// Arguments for `instar commit`. Mirrors `qemu-img commit`'s
@@ -3387,6 +3492,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Resize(args) => run_resize(args, verbose),
         Commands::Rebase(args) => run_rebase(args, verbose),
         Commands::Commit(args) => run_commit(args, verbose),
+        Commands::Amend(args) => run_amend(args, verbose),
         Commands::Map(args) => run_map(args, verbose),
         Commands::Snapshot(args) => run_snapshot(args, verbose),
         Commands::Config(args) => run_config(args),
@@ -4995,6 +5101,597 @@ fn run_resize_guest(
     }
     if !result_seen {
         return Err("resize: guest did not return a result".into());
+    }
+    Ok(harvested)
+}
+
+/// Snapshot of what the host probed from the qcow2 target file
+/// before launching the amend guest. Mirrors
+/// `ProbedResizeTarget`; the fields populate `AmendConfig`'s
+/// cross-check summary so the guest can re-validate its own
+/// re-read of the header.
+struct ProbedAmendTarget {
+    /// qcow2 cluster size in bytes (header-cluster span).
+    cluster_size: u32,
+    /// Current qcow2 version (2 or 3).
+    current_version: u32,
+    /// Current refcount width in bits.
+    current_refcount_bits: u32,
+    /// Current incompatible feature word.
+    current_incompatible_features: u64,
+    /// Current compatible feature word.
+    current_compatible_features: u64,
+    /// Virtual disk size in bytes.
+    virtual_size: u64,
+}
+
+/// Probe the amend target's format and header summary. Honours
+/// `-f qcow2` if given; otherwise auto-detects via
+/// `detect_format_from_header`. Amend is qcow2-only: any other
+/// forced or detected format is rejected here, before a VM
+/// launch. Mirrors `probe_resize_target`.
+fn probe_amend_target(
+    path: &Path,
+    forced_format: Option<&str>,
+) -> Result<ProbedAmendTarget, Box<dyn std::error::Error>> {
+    use std::io::Read;
+    let mut file = std::fs::OpenOptions::new().read(true).open(path)?;
+
+    // Read the first 4 KiB; covers the qcow2 sector-0 header.
+    let mut buf = vec![0u8; 4096];
+    let read = file.read(&mut buf)?;
+    buf.truncate(read);
+
+    let detected = match forced_format {
+        Some("qcow2") => shared::ImageFormat::Qcow2,
+        Some(_) => return Err("amend: only qcow2 images can be amended".into()),
+        None => shared::format_detection::detect_format_from_header(&buf, buf.len(), false),
+    };
+    if detected != shared::ImageFormat::Qcow2 {
+        return Err("amend: only qcow2 images can be amended".into());
+    }
+
+    let header = qcow2::QcowHeader::parse(&buf).ok_or("amend: invalid qcow2 header")?;
+    Ok(ProbedAmendTarget {
+        cluster_size: header.cluster_size as u32,
+        current_version: header.version,
+        current_refcount_bits: header.refcount_bits,
+        current_incompatible_features: header.incompatible_features,
+        current_compatible_features: header.compatible_features,
+        virtual_size: header.virtual_size,
+    })
+}
+
+/// Handler for `instar amend`. The host is thin: it parses `-o`,
+/// probes the qcow2 header for the cross-check summary, builds
+/// the flag set, launches the guest (which owns all the refusal /
+/// downgrade / no-op logic), maps any guest error to a message,
+/// fsyncs on a successful rewrite, and renders. Mirrors
+/// `run_resize` / `run_resize_nonraw`.
+fn run_amend(args: AmendArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let opts = parse_amend_o_options(&args.option)?;
+    let probed = probe_amend_target(Path::new(&args.filename), args.format.as_deref())?;
+
+    // Build the flag set from the parsed options + -q.
+    let mut flags: u32 = 0;
+    if let Some(v3) = opts.compat_v3 {
+        flags |= shared::AmendConfig::FLAG_SET_COMPAT;
+        if v3 {
+            flags |= shared::AmendConfig::FLAG_COMPAT_V3;
+        }
+    }
+    if let Some(on) = opts.lazy_on {
+        flags |= shared::AmendConfig::FLAG_SET_LAZY;
+        if on {
+            flags |= shared::AmendConfig::FLAG_LAZY_ON;
+        }
+    }
+    if args.quiet {
+        flags |= shared::AmendConfig::FLAG_QUIET;
+    }
+
+    // Load the core + amend guest binaries.
+    let core_path = get_binary_path("core.bin");
+    let core_code = load_guest_binary(
+        core_path
+            .to_str()
+            .ok_or("amend: core.bin path is not valid UTF-8")?,
+    )?;
+    let amend_path = get_binary_path("amend.bin");
+    let amend_code = load_guest_binary(
+        amend_path
+            .to_str()
+            .ok_or("amend: amend.bin path is not valid UTF-8")?,
+    )?;
+
+    // Open the target file O_RDWR as the output device. Amend
+    // only rewrites the header cluster, so the existing file
+    // size is the device capacity (no append past EOF). The virtio
+    // capacity hint is expressed in BYTES (the device divides by
+    // its sector size to advertise a sector count), matching the
+    // resize/rebase convention.
+    let current_file_size = std::fs::metadata(&args.filename)?.len();
+    let output_capacity_hint = current_file_size;
+    let output = backing::BackingStore::open_rw_existing(
+        Path::new(&args.filename),
+        Some(output_capacity_hint),
+    )?;
+
+    let result = run_amend_guest(
+        &core_code,
+        &amend_code,
+        IMAGE_FORMAT_QCOW2,
+        flags,
+        probed.cluster_size,
+        probed.current_version,
+        probed.current_refcount_bits,
+        probed.current_incompatible_features,
+        probed.current_compatible_features,
+        probed.virtual_size,
+        output,
+        output_capacity_hint,
+        verbose,
+    )?;
+
+    if result.error != shared::AmendResult::ERROR_OK {
+        return Err(format!("amend: {}", map_amend_error(result.error)).into());
+    }
+
+    // Durability fsync: a successful rewrite touched the header
+    // cluster. Re-open read+write and `sync_all()` (resize's
+    // pattern) so the change is on stable storage before we
+    // report success. A NoOp wrote nothing, so no fsync.
+    if result.action == shared::AmendResult::ACTION_AMENDED {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&args.filename)?;
+        file.sync_all()?;
+    }
+
+    render_amend_success(
+        &args,
+        result.target_format,
+        result.action,
+        result.resulting_version,
+        result.resulting_lazy_refcounts,
+    );
+    Ok(())
+}
+
+/// Map an `AmendResult::ERROR_*` code to a user-facing string.
+/// Exhaustive on the constants from `src/shared/src/lib.rs`
+/// (0..=12); the trailing catch-all covers future additions only.
+fn map_amend_error(code: u32) -> &'static str {
+    match code {
+        c if c == shared::AmendResult::ERROR_OK => "ok",
+        c if c == shared::AmendResult::ERROR_UNSUPPORTED_FORMAT => {
+            "only qcow2 images can be amended"
+        }
+        c if c == shared::AmendResult::ERROR_INVALID_OPTION => {
+            "an unsupported -o option reached the guest (amend changes \
+             compat and lazy_refcounts only)"
+        }
+        c if c == shared::AmendResult::ERROR_DOWNGRADE_BLOCKED_FEATURE => {
+            "cannot downgrade to compat=0.10: image uses a v3-only \
+             incompatible feature (compression, extended L2, external \
+             data, or is dirty/corrupt)"
+        }
+        c if c == shared::AmendResult::ERROR_DOWNGRADE_REFCOUNT_WIDTH => {
+            "cannot downgrade to compat=0.10: image uses refcount_bits != 16 \
+             (v2 supports 16-bit refcounts only; rewriting the refcount tree \
+             is out of scope)"
+        }
+        c if c == shared::AmendResult::ERROR_LAZY_REQUIRES_V3 => {
+            "lazy_refcounts=on requires compat=1.1 (lazy refcounts are a \
+             v3-only feature); upgrade with -o compat=1.1 first or in the \
+             same invocation"
+        }
+        c if c == shared::AmendResult::ERROR_HEADER_MISMATCH => {
+            "the image's header changed between the host's pre-probe and the \
+             guest's read, or a guest write failed; retry, or run \
+             `instar check` if the image may be corrupt"
+        }
+        c if c == shared::AmendResult::ERROR_PARSE_FAILED => "the image header could not be parsed",
+        c if c == shared::AmendResult::ERROR_DIRTY => {
+            "the image is marked dirty (another writer may hold it open); \
+             run `instar check` first"
+        }
+        c if c == shared::AmendResult::ERROR_EXTENSION_RELOCATION_UNSUPPORTED => {
+            "this compat change would have to relocate a header extension, \
+             which is not yet supported; use `qemu-img amend`"
+        }
+        c if c == shared::AmendResult::ERROR_SCRATCH_TOO_SMALL => {
+            "the image is too large for the amend scratch buffer"
+        }
+        c if c == shared::AmendResult::ERROR_WRITE_FAILED => "I/O error writing the image header",
+        c if c == shared::AmendResult::ERROR_INTERNAL_OVERFLOW => {
+            "internal size or offset computation overflowed (host or guest bug)"
+        }
+        _ => "unknown amend error code",
+    }
+}
+
+/// Render a success line for `instar amend`. Human form prints
+/// `"Image amended."` (or `"No change."` for a no-op); JSON
+/// form emits a structured envelope. `--quiet` suppresses the
+/// success line; errors still go to stderr. Mirrors
+/// `render_resize_success`.
+fn render_amend_success(
+    args: &AmendArgs,
+    target_format: u32,
+    action: u32,
+    resulting_version: u32,
+    resulting_lazy_refcounts: u32,
+) {
+    if args.quiet {
+        return;
+    }
+    let action_str = if action == shared::AmendResult::ACTION_AMENDED {
+        "amended"
+    } else {
+        "noop"
+    };
+    let compat_str = if resulting_version == 3 {
+        "1.1"
+    } else {
+        "0.10"
+    };
+    let lazy_str = if resulting_lazy_refcounts != 0 {
+        "on"
+    } else {
+        "off"
+    };
+    if args.output == "json" {
+        println!(
+            "{{\n  \"filename\": \"{}\",\n  \"format\": \"{}\",\n  \
+             \"action\": \"{}\",\n  \"compat\": \"{}\",\n  \
+             \"lazy_refcounts\": \"{}\"\n}}",
+            json_escape_string(&args.filename),
+            image_format_name(target_format),
+            action_str,
+            compat_str,
+            lazy_str,
+        );
+    } else if action == shared::AmendResult::ACTION_AMENDED {
+        println!("Image amended.");
+    } else {
+        println!("No change.");
+    }
+}
+
+/// Launch the amend guest binary, wait for the
+/// `AmendResultMessage`. Modelled on `run_resize_guest`: one
+/// 1-sector stub input at slot 0 (the core unconditionally
+/// probes input device 0) and the target file (opened O_RDWR)
+/// as the output at slot 1. The amend guest reads via
+/// `read_output_sector` and writes via `write_output_sector`,
+/// both dispatching to slot 1.
+#[allow(clippy::too_many_arguments)]
+fn run_amend_guest(
+    core_code: &[u8],
+    operation_code: &[u8],
+    target_format: u32,
+    flags: u32,
+    cluster_size: u32,
+    current_version: u32,
+    current_refcount_bits: u32,
+    current_incompatible_features: u64,
+    current_compatible_features: u64,
+    virtual_size: u64,
+    output_backing: backing::BackingStore,
+    output_capacity_hint: u64,
+    verbose: bool,
+) -> Result<AmendRunResult, Box<dyn std::error::Error>> {
+    // --- KVM / VM / guest memory setup ----------------------------------
+    let kvm = Kvm::new()?;
+    debug!("KVM API version: {}", kvm.get_api_version());
+
+    let kvm_stats_checker = kvm_stats::KvmStatsChecker::new(&kvm);
+    kvm_stats_checker.display_status();
+
+    let vm = kvm.create_vm()?;
+    let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
+
+    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let host_addr = region.as_ptr() as u64;
+    let mem_region = kvm_userspace_memory_region {
+        slot: 0,
+        guest_phys_addr: 0,
+        memory_size: GUEST_MEM_SIZE,
+        userspace_addr: host_addr,
+        flags: 0,
+    };
+    // SAFETY: mem_region.userspace_addr points to a valid
+    // GuestMemoryMmap allocation that outlives the VM.
+    unsafe {
+        vm.set_user_memory_region(mem_region)?;
+    }
+    setup_gdt(&guest_mem)?;
+    setup_page_tables(&guest_mem, GUEST_MEM_SIZE)?;
+    guest_mem.write_slice(core_code, GuestAddress(GUEST_CODE_BASE))?;
+    guest_mem.write_slice(operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
+
+    // --- Write AmendConfig at OPERATION_CONFIG_ADDR ---------------------
+    // Layout (must match shared::AmendConfig exactly):
+    //    0: magic                         u32  ("AMND")
+    //    4: target_format                 u32
+    //    8: flags                         u32
+    //   12: sector_size                   u32
+    //   16: cluster_size                  u32
+    //   20: current_version               u32
+    //   24: current_refcount_bits         u32
+    //   28: _pad                          u32
+    //   32: current_incompatible_features u64
+    //   40: current_compatible_features   u64
+    //   48: virtual_size                  u64
+    //   56: _reserved                     [u8; 72]
+    let sector_size: u32 = 512;
+    guest_mem.write_obj(
+        shared::AmendConfig::MAGIC,
+        GuestAddress(OPERATION_CONFIG_ADDR),
+    )?;
+    guest_mem.write_obj(target_format, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
+    guest_mem.write_obj(flags, GuestAddress(OPERATION_CONFIG_ADDR + 8))?;
+    guest_mem.write_obj(sector_size, GuestAddress(OPERATION_CONFIG_ADDR + 12))?;
+    guest_mem.write_obj(cluster_size, GuestAddress(OPERATION_CONFIG_ADDR + 16))?;
+    guest_mem.write_obj(current_version, GuestAddress(OPERATION_CONFIG_ADDR + 20))?;
+    guest_mem.write_obj(
+        current_refcount_bits,
+        GuestAddress(OPERATION_CONFIG_ADDR + 24),
+    )?;
+    // _pad at offset 28 stays zero from the page-zeroed memory.
+    guest_mem.write_obj(
+        current_incompatible_features,
+        GuestAddress(OPERATION_CONFIG_ADDR + 32),
+    )?;
+    guest_mem.write_obj(
+        current_compatible_features,
+        GuestAddress(OPERATION_CONFIG_ADDR + 40),
+    )?;
+    guest_mem.write_obj(virtual_size, GuestAddress(OPERATION_CONFIG_ADDR + 48))?;
+    // _reserved at offset 56 stays zero from the page-zeroed memory.
+
+    debug!(
+        "Wrote amend config at 0x{:x} (target={}, flags=0x{:x}, cluster_size={}, \
+         current_version={}, current_refcount_bits={}, incompat=0x{:x}, compat=0x{:x}, \
+         virtual_size={})",
+        OPERATION_CONFIG_ADDR,
+        target_format,
+        flags,
+        cluster_size,
+        current_version,
+        current_refcount_bits,
+        current_incompatible_features,
+        current_compatible_features,
+        virtual_size,
+    );
+
+    // --- Set up devices --------------------------------------------------
+    // The guest core unconditionally probes input device 0
+    // (see core/src/main.rs::_start), so even though amend has
+    // no logical input we attach a 1-sector stub at slot 0 and
+    // place the real (read-write) output at slot 1. The stub is
+    // never read. Mirrors `run_resize_guest`.
+    struct AmendStubInput(std::path::PathBuf);
+    impl Drop for AmendStubInput {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let stub_path = std::env::temp_dir().join(format!("instar-amend-stub-{pid}-{nanos}"));
+    let stub_file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&stub_path)?;
+    stub_file.set_len(sector_size as u64)?;
+    drop(stub_file);
+    let _stub_input = AmendStubInput(stub_path.clone());
+    let input_backing = backing::BackingStore::open(&stub_path, true, None, false)?;
+
+    let mut device_set = DeviceSet::new();
+    let mut io_events: Vec<IoEvent> = Vec::new();
+
+    let input_mmio = device_mmio_base(0);
+    let input_vq = device_vq_base(0);
+    let input_device = VirtioBlockDevice::new(
+        input_backing,
+        sector_size as u64,
+        sector_size as u64,
+        true, // read-only
+        input_mmio,
+        input_vq,
+    );
+    let input_device = Arc::new(Mutex::new(input_device));
+    device_set.add_device(Arc::clone(&input_device), true);
+    io_events.push(IoEvent::new(input_mmio)?);
+
+    let output_mmio = device_mmio_base(1);
+    let output_vq = device_vq_base(1);
+    let output_device = VirtioBlockDevice::new(
+        output_backing,
+        output_capacity_hint,
+        sector_size as u64,
+        false, // writable
+        output_mmio,
+        output_vq,
+    );
+    let output_device = Arc::new(Mutex::new(output_device));
+    device_set.add_device(Arc::clone(&output_device), false);
+    io_events.push(IoEvent::new(output_mmio)?);
+
+    let guest_mem = Arc::new(guest_mem);
+    let vmm_stats = Arc::new(Mutex::new(VmmStats::new()));
+
+    // Try to register ioeventfds; fall back to VM exits on failure.
+    let mut io_thread: Option<io_thread::IoThread> = None;
+    let mut registered_count = 0usize;
+    let mut registration_failed = false;
+    for evt in io_events.iter_mut() {
+        if let Err(e) = evt.register(&vm) {
+            debug!("ioeventfd: failed to register ({e:?}), falling back to VM exits");
+            registration_failed = true;
+            break;
+        }
+        registered_count += 1;
+    }
+    if registration_failed {
+        for evt in io_events.iter_mut().take(registered_count) {
+            let _ = evt.unregister(&vm);
+        }
+    }
+    let all_registered = !registration_failed;
+    if all_registered && !io_events.is_empty() {
+        let io_devices = device_set.create_io_devices(io_events);
+        io_thread = Some(io_thread::IoThread::new(
+            io_devices,
+            Arc::clone(&guest_mem),
+            Arc::clone(&vmm_stats),
+        ));
+    }
+
+    // --- vCPU setup ------------------------------------------------------
+    let mut vcpu = vm.create_vcpu(0)?;
+    let mut sregs = vcpu.get_sregs()?;
+    setup_sregs(&mut sregs);
+    vcpu.set_sregs(&sregs)?;
+    let mut regs = vcpu.get_regs()?;
+    setup_regs(&mut regs);
+    vcpu.set_regs(&regs)?;
+
+    // --- Serial decoders / transmitter / debug buffer -------------------
+    let mut serial_decoder = SerialDecoder::new();
+    let mut serial_transmitter = SerialTransmitter::new();
+    let mut debug_buffer = DebugBuffer::new();
+
+    // 0 inputs + 1 output; progress reporting suppressed (amend
+    // rewrites a single header cluster and completes instantly).
+    let config = vmm_config(sector_size, sector_size, 100);
+    serial_transmitter.queue_config(&config);
+
+    // --- Run the vCPU loop ----------------------------------------------
+    let mut result_seen = false;
+    let mut harvested = AmendRunResult {
+        target_format,
+        action: shared::AmendResult::ACTION_NOOP,
+        resulting_version: 0,
+        resulting_lazy_refcounts: 0,
+        error: shared::AmendResult::ERROR_OK,
+    };
+    let mut vm_error: Option<String> = None;
+
+    loop {
+        match vcpu.run()? {
+            VcpuExit::Hlt => {
+                vmm_stats.lock().unwrap().record_hlt();
+                break;
+            }
+            VcpuExit::IoOut(port, data) => {
+                vmm_stats.lock().unwrap().record_io_out();
+                if port == SERIAL_PORT {
+                    for &byte in data {
+                        if let Some(msg) = serial_decoder.add_byte(byte) {
+                            if let Some(guest_::GuestMessage_::Payload::AmendResult(a)) =
+                                &msg.payload
+                            {
+                                // Harvest the numeric fields; the
+                                // host already knows the format code
+                                // it probed, so we keep `target_format`
+                                // from the arg rather than parsing the
+                                // echoed string.
+                                harvested.action = a.action;
+                                harvested.resulting_version = a.resulting_version;
+                                harvested.resulting_lazy_refcounts = a.lazy_refcounts as u32;
+                                harvested.error = a.error;
+                                result_seen = true;
+                            } else if verbose {
+                                debug!("{}", format_message(&msg));
+                            }
+                        }
+                    }
+                } else if port == DEBUG_PORT {
+                    for &byte in data {
+                        if let Some(line) = debug_buffer.add_byte(byte) {
+                            debug!("[GUEST] {line}");
+                        }
+                    }
+                } else {
+                    debug!("IO OUT: port=0x{port:x}, data={data:?}");
+                }
+            }
+            VcpuExit::IoIn(port, data) => {
+                vmm_stats.lock().unwrap().record_io_in();
+                if port == SERIAL_PORT {
+                    for byte in data.iter_mut() {
+                        *byte = serial_transmitter.next_byte().unwrap_or(0);
+                    }
+                } else if port == SERIAL_PORT + 5 {
+                    let mut lsr = 0x60u8;
+                    if serial_transmitter.has_data() {
+                        lsr |= 0x01;
+                    }
+                    data[0] = lsr;
+                } else {
+                    for byte in data {
+                        *byte = 0;
+                    }
+                }
+            }
+            VcpuExit::MmioRead(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_read();
+                let value = device_set.mmio_read(addr);
+                write_mmio_data(data, value);
+            }
+            VcpuExit::MmioWrite(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_write();
+                let value = read_mmio_data(data);
+                if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
+                    if io_thread.is_none() && should_process {
+                        device_set.process_queue_for_device(
+                            device_index,
+                            &guest_mem,
+                            &vmm_stats,
+                        )?;
+                    }
+                }
+            }
+            VcpuExit::Shutdown => {
+                vmm_stats.lock().unwrap().record_shutdown();
+                vm_error = Some("VM shutdown (triple fault)".to_string());
+                break;
+            }
+            VcpuExit::FailEntry(reason, cpu) => {
+                vmm_stats.lock().unwrap().record_fail_entry();
+                vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
+                break;
+            }
+            exit => {
+                vmm_stats.lock().unwrap().record_unknown();
+                vm_error = Some(format!("unexpected VM exit: {exit:?}"));
+                break;
+            }
+        }
+    }
+
+    if let Some(mut thread) = io_thread {
+        thread.stop();
+    }
+
+    if log::log_enabled!(log::Level::Debug) {
+        vmm_stats.lock().unwrap().display();
+    }
+
+    if let Some(error) = vm_error {
+        return Err(error.into());
+    }
+    if !result_seen {
+        return Err("amend: guest did not return a result".into());
     }
     Ok(harvested)
 }
@@ -13538,6 +14235,110 @@ mod resize_size_parser_tests {
                 other => panic!("expected Resize, got {other:?}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod amend_o_option_parser_tests {
+    //! Unit tests for `parse_amend_o_options`. Integration
+    //! coverage of the wired CLI path lives in
+    //! `tests/test_amend.py` once phase 6 lands.
+    use super::*;
+
+    fn opts(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn compat_v2() {
+        let parsed = parse_amend_o_options(&opts(&["compat=0.10"])).unwrap();
+        assert_eq!(parsed.compat_v3, Some(false));
+        assert_eq!(parsed.lazy_on, None);
+    }
+
+    #[test]
+    fn compat_v3() {
+        let parsed = parse_amend_o_options(&opts(&["compat=1.1"])).unwrap();
+        assert_eq!(parsed.compat_v3, Some(true));
+        assert_eq!(parsed.lazy_on, None);
+    }
+
+    #[test]
+    fn lazy_on() {
+        let parsed = parse_amend_o_options(&opts(&["lazy_refcounts=on"])).unwrap();
+        assert_eq!(parsed.compat_v3, None);
+        assert_eq!(parsed.lazy_on, Some(true));
+    }
+
+    #[test]
+    fn lazy_off() {
+        let parsed = parse_amend_o_options(&opts(&["lazy_refcounts=off"])).unwrap();
+        assert_eq!(parsed.compat_v3, None);
+        assert_eq!(parsed.lazy_on, Some(false));
+    }
+
+    #[test]
+    fn both_in_one_o() {
+        let parsed = parse_amend_o_options(&opts(&["compat=1.1,lazy_refcounts=on"])).unwrap();
+        assert_eq!(parsed.compat_v3, Some(true));
+        assert_eq!(parsed.lazy_on, Some(true));
+    }
+
+    #[test]
+    fn multiple_o_entries() {
+        let parsed = parse_amend_o_options(&opts(&["compat=0.10", "lazy_refcounts=off"])).unwrap();
+        assert_eq!(parsed.compat_v3, Some(false));
+        assert_eq!(parsed.lazy_on, Some(false));
+    }
+
+    #[test]
+    fn bad_compat_value() {
+        let err = parse_amend_o_options(&opts(&["compat=2.0"])).unwrap_err();
+        assert!(err.to_string().contains("expected 0.10 or 1.1"), "{err}");
+    }
+
+    #[test]
+    fn bad_lazy_value() {
+        let err = parse_amend_o_options(&opts(&["lazy_refcounts=maybe"])).unwrap_err();
+        assert!(err.to_string().contains("expected on/off"), "{err}");
+    }
+
+    #[test]
+    fn unsupported_key_cluster_size() {
+        let err = parse_amend_o_options(&opts(&["cluster_size=64k"])).unwrap_err();
+        assert!(err.to_string().contains("is not supported"), "{err}");
+    }
+
+    #[test]
+    fn unsupported_key_refcount_bits() {
+        let err = parse_amend_o_options(&opts(&["refcount_bits=8"])).unwrap_err();
+        assert!(err.to_string().contains("is not supported"), "{err}");
+    }
+
+    #[test]
+    fn empty_input_is_error() {
+        let err = parse_amend_o_options(&[]).unwrap_err();
+        assert!(
+            err.to_string().contains("no supported -o options given"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn only_blank_pieces_is_error() {
+        // Empty/blank comma pieces are skipped, leaving no
+        // supported option set.
+        let err = parse_amend_o_options(&opts(&[" , "])).unwrap_err();
+        assert!(
+            err.to_string().contains("no supported -o options given"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn missing_value_is_error() {
+        let err = parse_amend_o_options(&opts(&["compat"])).unwrap_err();
+        assert!(err.to_string().contains("missing a value"), "{err}");
     }
 }
 

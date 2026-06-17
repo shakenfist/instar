@@ -200,6 +200,19 @@ unsafe fn write_byte_range(
 
 /// Read the header cluster, cross-check against the host-probed
 /// summary, run the planner, and apply its patches.
+///
+/// `#[inline(never)]` is load-bearing. Built for `x86_64-unknown-none`
+/// with `opt-level = "z"` + `lto = true`, inlining this body into the
+/// `extern "C"` `_start` (which already carries the call-table
+/// validation, config read, and result/send plumbing) produced a
+/// miscompiled `_start`: at runtime the guest jumped into the middle of
+/// the post-`QcowHeader::parse` cross-check, hit an invalid opcode
+/// (#UD), and — with no IDT — triple-faulted before any patch was
+/// written. Keeping `run_qcow2` out of line makes both functions small
+/// enough to codegen correctly and is the same shape the working
+/// resize/rebase ops already have. Do not remove without re-verifying
+/// `instar amend` end-to-end on a real v2 image.
+#[inline(never)]
 unsafe fn run_qcow2(
     call_table: &CallTable,
     config: &AmendConfig,
