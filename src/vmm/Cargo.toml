@@ -16,7 +16,7 @@ name = "instar"
 path = "src/main.rs"
 
 [dependencies]
-kvm-ioctls = "0.24"
+kvm-ioctls = "0.25"
 kvm-bindings = "0.14"
 vm-memory = { version = "0.18", features = ["backend-mmap"] }
 virtio-queue = "0.17"
