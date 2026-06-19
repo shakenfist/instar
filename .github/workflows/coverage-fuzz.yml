@@ -230,6 +230,7 @@ jobs:
               fuzz_resize_planners
               fuzz_rebase_planners
               fuzz_commit_planners
+              fuzz_amend_planners
               fuzz_snapshot_parse
               fuzz_snapshot_refcount
               fuzz_check_repair

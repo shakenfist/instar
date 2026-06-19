@@ -407,7 +407,7 @@ because the mutation is header-only.
 | 5. Rust round-trip tests (`src/crates/amend/tests/`): amend → re-parse, assert header invariants for each transition | PLAN-amend-phase-05-rust-tests.md | Complete |
 | 6. Python integration tests (`tests/test_amend.py`): cross-check vs `qemu-img amend` with post-op `info`/`check`/`compare`, known-divergence registry | PLAN-amend-phase-06-integration.md | Complete |
 | 7. Cross-version baselines: `AMEND_CASES` in `generate-baselines.py`, `expected-outputs/amend-info-json/`, testdata push | PLAN-amend-phase-07-baselines.md | Complete (testdata push operator-gated) |
-| 8. Coverage fuzz (`fuzz_amend_planners.rs`) + differential fuzz (`op_amend` in `differential-fuzz.py`) | PLAN-amend-phase-08-fuzz.md | Not started |
+| 8. Coverage fuzz (`fuzz_amend_planners.rs`) + differential fuzz (`op_amend` in `differential-fuzz.py`) | PLAN-amend-phase-08-fuzz.md | Harnesses complete; found an open cluster-size defect (see Open defects) — root-cause fix pending |
 | 9. Docs: `docs/amend.md`, `docs/usage.md`, `CHANGELOG.md`, `ARCHITECTURE.md`/`README.md`/`AGENTS.md`, `index.md`/`order.yml` | PLAN-amend-phase-09-docs.md | Not started |
 
 ## Agent guidance
@@ -577,6 +577,31 @@ List any bugs encountered and fixed during development here. At the
 start of phase 1, scan the `security-audit` GitHub issue tracker
 for any open qcow2-header / feature-bit / version-detection issues
 that this work should resolve or be aware of.
+
+### Open defects found during this work
+
+- **Cluster-size `ERROR_HEADER_MISMATCH` (OPEN, found by phase-8
+  differential fuzzer).** `instar amend` spuriously fails with
+  `ERROR_HEADER_MISMATCH` for certain qcow2 cluster sizes (512, 2048,
+  16384, 32768, 262144 …) while `qemu-img amend` accepts the same
+  operation; the default 64 KiB cluster and many other sizes succeed,
+  which is why the by-example tests (phases 5–7, all built at the
+  default cluster) never caught it. Reproducer:
+  `qemu-img create -f qcow2 -o cluster_size=512 -o compat=1.1 t.qcow2 1M`
+  then `instar amend -f qcow2 -o lazy_refcounts=on t.qcow2` → rc=1.
+  Investigation ruled out the planner, the documented divergences, the
+  on-disk header (6 cross-checked fields are byte-identical across
+  failing/passing images), the guest build profile (`lto=false` and
+  `opt-level=2` both leave the failing set identical), the cross-check
+  codegen (disassembled — correct), and the host probe / `BackingStore`
+  read path (serves correct sector-0 bytes). Every input the guest
+  cross-check uses is correct yet it returns the mismatch error,
+  deterministically by cluster size and independent of optimization.
+  The guest op is extremely perturbation-sensitive (any added
+  instrumentation shifts the failing set or triple-faults), so the
+  remaining root-cause work needs live KVM/gdb single-step debugging.
+  This is a real bug to FIX, **not** a `KNOWN_AMEND_DIVERGENCES` entry;
+  the differential fuzzer (`op_amend`) intentionally keeps flagging it.
 
 ### Documentation index maintenance
 
