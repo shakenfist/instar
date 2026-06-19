@@ -406,7 +406,7 @@ because the mutation is header-only.
 | 4. Host VMM subcommand: `AmendArgs` clap surface, `-o` option parsing + validation, host-side format probe, `run_amend`/`run_amend_guest`, human/json rendering | PLAN-amend-phase-04-host-cli.md | Complete |
 | 5. Rust round-trip tests (`src/crates/amend/tests/`): amend → re-parse, assert header invariants for each transition | PLAN-amend-phase-05-rust-tests.md | Complete |
 | 6. Python integration tests (`tests/test_amend.py`): cross-check vs `qemu-img amend` with post-op `info`/`check`/`compare`, known-divergence registry | PLAN-amend-phase-06-integration.md | Complete |
-| 7. Cross-version baselines: `AMEND_CASES` in `generate-baselines.py`, `expected-outputs/amend-info-json/`, testdata push | PLAN-amend-phase-07-baselines.md | Not started |
+| 7. Cross-version baselines: `AMEND_CASES` in `generate-baselines.py`, `expected-outputs/amend-info-json/`, testdata push | PLAN-amend-phase-07-baselines.md | Complete (testdata push operator-gated) |
 | 8. Coverage fuzz (`fuzz_amend_planners.rs`) + differential fuzz (`op_amend` in `differential-fuzz.py`) | PLAN-amend-phase-08-fuzz.md | Not started |
 | 9. Docs: `docs/amend.md`, `docs/usage.md`, `CHANGELOG.md`, `ARCHITECTURE.md`/`README.md`/`AGENTS.md`, `index.md`/`order.yml` | PLAN-amend-phase-09-docs.md | Not started |
 

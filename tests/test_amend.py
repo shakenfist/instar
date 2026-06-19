@@ -70,6 +70,14 @@ KNOWN_AMEND_DIVERGENCES = {}
 # backing reference threaded into the start-image create.
 _BACKING_CASES = {'upgrade-with-backing', 'downgrade-with-backing'}
 
+# Baseline cases: the qcow2 matrix minus the backing cases.
+# Backing cases are excluded because recording a baseline would embed
+# a tmp-dir path into the backing-file field, making the baseline
+# non-portable. They are covered by cross-validation instead.
+_BASELINE_CASES = [
+    c for c in AMEND_CASES['qcow2'] if c[0] not in _BACKING_CASES
+]
+
 
 class TestAmendSmoke(InstarTestBase):
     """Parent class for the amend test families.
@@ -104,6 +112,60 @@ class TestAmendSmoke(InstarTestBase):
         """
         if not os.access('/dev/kvm', os.R_OK | os.W_OK):
             self.skipTest('/dev/kvm not readable+writable')
+
+    # ------------------------------------------------------------------
+    # Baseline helpers (amend is qcow2-only, so no `target` parameter).
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _baseline_root(cls):
+        """Root of the amend info-JSON baseline tree."""
+        return (cls._testdata_root / 'expected-outputs' /
+                'amend-info-json' / 'qcow2')
+
+    def _baseline_version_dir(self):
+        """Pick the version dir matching the installed qemu-img.
+
+        Lists version dirs under _baseline_root(), sorts them
+        numerically, prefers the one whose name starts with
+        f'{major}.{minor}.' from self._qemu_version, and falls back
+        to the most-recent recorded version. Returns None when the
+        root is missing or empty. Mirrors
+        TestResizeSmoke._baseline_version_dir.
+        """
+        root = self._baseline_root()
+        if not root.exists():
+            return None
+        names = [p.name for p in root.iterdir() if p.is_dir()]
+        if not names:
+            return None
+        names.sort(key=lambda v: tuple(int(p) for p in v.split('.')))
+        if self._qemu_version is not None:
+            major, minor = self._qemu_version
+            prefix = f'{major}.{minor}.'
+            matches = [n for n in names if n.startswith(prefix)]
+            if matches:
+                return root / matches[0]
+        return root / names[-1]
+
+    def _baseline_stdout(self, case_name):
+        """Return the Path to <version>/<case>.stdout.txt, or None."""
+        v_dir = self._baseline_version_dir()
+        if v_dir is None:
+            return None
+        p = v_dir / f'{case_name}.stdout.txt'
+        return p if p.exists() else None
+
+    def _baseline_meta(self, case_name):
+        """Return parsed JSON of <version>/<case>.meta.json, or None."""
+        v_dir = self._baseline_version_dir()
+        if v_dir is None:
+            return None
+        p = v_dir / f'{case_name}.meta.json'
+        if not p.exists():
+            return None
+        with open(p) as f:
+            return json.load(f)
 
     def _qemu_create(self, path, compat, extra_opts=(), backing=None):
         """Create a qcow2 fixture with `qemu-img create`.
@@ -573,3 +635,196 @@ class TestAmendRefusals(TestAmendSmoke):
             self.assertEqual(info.get('backing-filename'), 'base.qcow2')
             self.assertEqual(
                 info['format-specific']['data']['compat'], '0.10')
+
+
+# ----------------------------------------------------------------------
+# Cross-version baseline comparison matrix.
+# ----------------------------------------------------------------------
+
+
+class TestAmendBaselineMatrix(TestAmendSmoke):
+    """Cross-version baseline comparison for `instar amend`.
+
+    For each entry in _BASELINE_CASES, the per-case factory:
+    - Builds the start image with system `qemu-img create` (NOT
+      `instar create` — upgrade cases need a v2 start image, which
+      `instar create` cannot emit).
+    - Runs `instar amend` on the result.
+    - Runs system `qemu-img info --output=json` on the amended image.
+    - Asserts byte-equivalence against the version-matched baseline
+      recorded in the sibling `instar-testdata` repo under
+      expected-outputs/amend-info-json/qcow2/<version>/<case>.stdout.txt.
+
+    Backing cases (`*-with-backing`) are deliberately absent from the
+    baseline matrix: recording a backing-file path would embed a
+    tmp-dir filename, making baselines non-portable. Those cases are
+    covered by `TestAmendCrossValidation` and
+    `TestAmendRefusals.test_*_with_backing_*`.
+    """
+
+    @staticmethod
+    def _run_qemu_img_info(path, timeout=30):
+        """Run system `qemu-img info --output=json`.
+
+        No -f flag so auto-detect matches what the baseline generator
+        recorded. Returns (stdout, stderr, rc). Returns
+        ('', 'qemu-img info ... not installed', -1) on FileNotFoundError.
+        """
+        try:
+            r = subprocess.run(
+                ['qemu-img', 'info', '--output=json', str(path)],
+                capture_output=True, text=True, timeout=timeout,
+            )
+            return r.stdout, r.stderr, r.returncode
+        except FileNotFoundError:
+            return '', 'qemu-img info: command not installed', -1
+        except subprocess.TimeoutExpired:
+            return '', f'qemu-img info timeout after {timeout}s', -1
+
+    def test_amend_cases_match_baselines(self):
+        """Schema-drift tripwire: on-disk baseline stems must equal
+        _BASELINE_CASES names.
+
+        Walks <testdata>/expected-outputs/amend-info-json/qcow2/<version>/
+        and asserts the *.stdout.txt stems match
+        {c[0] for c in _BASELINE_CASES}. Catches drift between this
+        mirror and the testdata baseline generator in either direction.
+        """
+        v_dir = self._baseline_version_dir()
+        if v_dir is None:
+            self.skipTest('no amend baseline dir found in testdata')
+        on_disk = {
+            p.stem.rsplit('.stdout', 1)[0]
+            for p in v_dir.glob('*.stdout.txt')
+        }
+        in_mirror = {c[0] for c in _BASELINE_CASES}
+        missing_from_mirror = on_disk - in_mirror
+        missing_from_disk = in_mirror - on_disk
+        self.assertEqual(
+            missing_from_mirror, set(),
+            f'Baselines on disk not in _BASELINE_CASES: '
+            f'{missing_from_mirror}',
+        )
+        self.assertEqual(
+            missing_from_disk, set(),
+            f'_BASELINE_CASES entries with no on-disk baseline: '
+            f'{missing_from_disk}. Regenerate baselines via '
+            f'instar-testdata (amend-baselines branch).',
+        )
+
+
+def _make_amend_baseline_test(case):
+    """Factory: one baseline test method per _BASELINE_CASES entry.
+
+    The returned test:
+    - Requires /dev/kvm (amend launches a guest VMM).
+    - Skips when no version-matched baseline is on disk.
+    - Skips when the baseline recorded a non-zero create/amend/info rc
+      (qemu couldn't produce a comparable artefact for that version).
+    - Skips when the case is in KNOWN_AMEND_DIVERGENCES.
+    - Builds the start image with system qemu-img create (one -o per
+      opt, matching the generator exactly).
+    - Runs instar amend, then system qemu-img info --output=json.
+    - Asserts byte-equivalence via assert_info_equivalent.
+    """
+    case_name, create_opts, amend_opts = case
+
+    def test(self):
+        self._require_kvm()
+
+        meta = self._baseline_meta(case_name)
+        if meta is None:
+            self.skipTest(
+                f'no baseline meta for qcow2/{case_name} '
+                f'(installed qemu version not in matrix?)'
+            )
+        if meta.get('create_return_code', 0) != 0:
+            self.skipTest(
+                f'baseline create_rc={meta["create_return_code"]} '
+                f'(qemu rejected create); no comparable artefact'
+            )
+        if meta.get('amend_return_code', 0) != 0:
+            self.skipTest(
+                f'baseline amend_rc={meta["amend_return_code"]} '
+                f'(qemu rejected amend); no comparable artefact'
+            )
+        if meta.get('info_return_code', 0) != 0:
+            self.skipTest(
+                f'baseline info_rc={meta["info_return_code"]} '
+                f'(no comparable JSON)'
+            )
+
+        known = KNOWN_AMEND_DIVERGENCES.get(('qcow2', case_name))
+        if known is not None:
+            self.skipTest(f'known amend divergence: {known}')
+
+        baseline_path = self._baseline_stdout(case_name)
+        if baseline_path is None:
+            self.skipTest(
+                f'no baseline stdout for qcow2/{case_name}'
+            )
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'image.qcow2'
+
+            # Build the start image with system qemu-img create,
+            # passing each create_opt as its own -o to match the
+            # generator exactly (it uses one -o per opt too).
+            cmd = ['qemu-img', 'create', '-f', 'qcow2']
+            for o in create_opts:
+                cmd += ['-o', o]
+            cmd += [str(path), '1M']
+            try:
+                r = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=30)
+            except FileNotFoundError:
+                self.skipTest('system qemu-img not installed')
+            self.assertEqual(
+                r.returncode, 0,
+                f'qemu-img create failed for qcow2/{case_name}: '
+                f'{r.stderr!r}'
+            )
+
+            # Run instar amend: one -o per amend_opt.
+            i_args = ['-f', 'qcow2']
+            for o in amend_opts:
+                i_args += ['-o', o]
+            i_args.append(str(path))
+            _, i_stderr, i_rc = self.run_instar_amend(*i_args)
+            self.assertEqual(
+                i_rc, 0,
+                f'instar amend failed for qcow2/{case_name}: '
+                f'stderr={i_stderr!r}'
+            )
+
+            # Run system qemu-img info --output=json.
+            info_stdout, info_stderr, info_rc = (
+                self._run_qemu_img_info(path)
+            )
+            if info_rc == -1 and 'not installed' in info_stderr:
+                self.skipTest('system qemu-img not installed')
+            self.assertEqual(
+                info_rc, 0,
+                f'qemu-img info failed for qcow2/{case_name}: '
+                f'{info_stderr!r}'
+            )
+
+            expected = baseline_path.read_text()
+            assert_info_equivalent(
+                self, info_stdout, expected, 'qcow2',
+                tmp_path=str(path),
+                msg=f'qcow2/{case_name}',
+            )
+
+    test.__name__ = f'test_baseline_{case_name.replace("-", "_")}'
+    test.__doc__ = (
+        f'instar amend qcow2/{case_name}: '
+        f'create {create_opts} -> amend {amend_opts} '
+        f'matches recorded baseline.'
+    )
+    return test
+
+
+for _case in _BASELINE_CASES:
+    _name = f'test_baseline_{_case[0].replace("-", "_")}'
+    setattr(TestAmendBaselineMatrix, _name, _make_amend_baseline_test(_case))
