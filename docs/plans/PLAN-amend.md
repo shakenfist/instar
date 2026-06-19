@@ -405,7 +405,7 @@ because the mutation is header-only.
 | 3. Guest op (`src/operations/amend/`): read config, read full header cluster, dispatch qcow2, apply patches, send result; binary-size check | PLAN-amend-phase-03-guest.md | Complete |
 | 4. Host VMM subcommand: `AmendArgs` clap surface, `-o` option parsing + validation, host-side format probe, `run_amend`/`run_amend_guest`, human/json rendering | PLAN-amend-phase-04-host-cli.md | Complete |
 | 5. Rust round-trip tests (`src/crates/amend/tests/`): amend → re-parse, assert header invariants for each transition | PLAN-amend-phase-05-rust-tests.md | Complete |
-| 6. Python integration tests (`tests/test_amend.py`): cross-check vs `qemu-img amend` with post-op `info`/`check`/`compare`, known-divergence registry | PLAN-amend-phase-06-integration.md | Not started |
+| 6. Python integration tests (`tests/test_amend.py`): cross-check vs `qemu-img amend` with post-op `info`/`check`/`compare`, known-divergence registry | PLAN-amend-phase-06-integration.md | Complete |
 | 7. Cross-version baselines: `AMEND_CASES` in `generate-baselines.py`, `expected-outputs/amend-info-json/`, testdata push | PLAN-amend-phase-07-baselines.md | Not started |
 | 8. Coverage fuzz (`fuzz_amend_planners.rs`) + differential fuzz (`op_amend` in `differential-fuzz.py`) | PLAN-amend-phase-08-fuzz.md | Not started |
 | 9. Docs: `docs/amend.md`, `docs/usage.md`, `CHANGELOG.md`, `ARCHITECTURE.md`/`README.md`/`AGENTS.md`, `index.md`/`order.yml` | PLAN-amend-phase-09-docs.md | Not started |
@@ -560,6 +560,16 @@ Obvious extensions deferred from v1:
 * **Header-extension relocation hardening.** If v1 punts on images
   carrying v2 header extensions (refusing rather than relocating),
   lift that restriction here.
+* **Compressed-image downgrade (documented divergence, phase 6).**
+  `instar amend -o compat=0.10` refuses a v3 image with the
+  compression (zstd) incompatible feature
+  (`ERROR_DOWNGRADE_BLOCKED_FEATURE`), because v2 cannot represent
+  `compression_type` and instar's v1 does not recompress cluster
+  data — the "refuse rather than guess" posture. qemu-img 10.0.8
+  *accepts* the same downgrade (rewriting the compression type).
+  `tests/test_amend.py` asserts instar's refusal and records the
+  divergence without failing. Lifting this would mean recompressing
+  zstd→zlib (out of v1 scope).
 
 ### Bugs fixed during this work
 
