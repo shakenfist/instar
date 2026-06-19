@@ -407,7 +407,7 @@ because the mutation is header-only.
 | 5. Rust round-trip tests (`src/crates/amend/tests/`): amend → re-parse, assert header invariants for each transition | PLAN-amend-phase-05-rust-tests.md | Complete |
 | 6. Python integration tests (`tests/test_amend.py`): cross-check vs `qemu-img amend` with post-op `info`/`check`/`compare`, known-divergence registry | PLAN-amend-phase-06-integration.md | Complete |
 | 7. Cross-version baselines: `AMEND_CASES` in `generate-baselines.py`, `expected-outputs/amend-info-json/`, testdata push | PLAN-amend-phase-07-baselines.md | Complete (testdata push operator-gated) |
-| 8. Coverage fuzz (`fuzz_amend_planners.rs`) + differential fuzz (`op_amend` in `differential-fuzz.py`) | PLAN-amend-phase-08-fuzz.md | Harnesses complete; found an open cluster-size defect (see Open defects) — root-cause fix pending |
+| 8. Coverage fuzz (`fuzz_amend_planners.rs`) + differential fuzz (`op_amend` in `differential-fuzz.py`) | PLAN-amend-phase-08-fuzz.md | Complete — harnesses landed; the cluster-size defect they found (core `.bss` overflow into the op region) is root-caused and fixed (see Defects) |
 | 9. Docs: `docs/amend.md`, `docs/usage.md`, `CHANGELOG.md`, `ARCHITECTURE.md`/`README.md`/`AGENTS.md`, `index.md`/`order.yml` | PLAN-amend-phase-09-docs.md | Not started |
 
 ## Agent guidance
@@ -578,30 +578,51 @@ start of phase 1, scan the `security-audit` GitHub issue tracker
 for any open qcow2-header / feature-bit / version-detection issues
 that this work should resolve or be aware of.
 
-### Open defects found during this work
+### Defects found during this work
 
-- **Cluster-size `ERROR_HEADER_MISMATCH` (OPEN, found by phase-8
-  differential fuzzer).** `instar amend` spuriously fails with
-  `ERROR_HEADER_MISMATCH` for certain qcow2 cluster sizes (512, 2048,
-  16384, 32768, 262144 …) while `qemu-img amend` accepts the same
-  operation; the default 64 KiB cluster and many other sizes succeed,
-  which is why the by-example tests (phases 5–7, all built at the
-  default cluster) never caught it. Reproducer:
-  `qemu-img create -f qcow2 -o cluster_size=512 -o compat=1.1 t.qcow2 1M`
-  then `instar amend -f qcow2 -o lazy_refcounts=on t.qcow2` → rc=1.
-  Investigation ruled out the planner, the documented divergences, the
-  on-disk header (6 cross-checked fields are byte-identical across
-  failing/passing images), the guest build profile (`lto=false` and
-  `opt-level=2` both leave the failing set identical), the cross-check
-  codegen (disassembled — correct), and the host probe / `BackingStore`
-  read path (serves correct sector-0 bytes). Every input the guest
-  cross-check uses is correct yet it returns the mismatch error,
-  deterministically by cluster size and independent of optimization.
-  The guest op is extremely perturbation-sensitive (any added
-  instrumentation shifts the failing set or triple-faults), so the
-  remaining root-cause work needs live KVM/gdb single-step debugging.
-  This is a real bug to FIX, **not** a `KNOWN_AMEND_DIVERGENCES` entry;
-  the differential fuzzer (`op_amend`) intentionally keeps flagging it.
+- **Cluster-size `ERROR_HEADER_MISMATCH` (FIXED).** `instar amend`
+  spuriously failed with `ERROR_HEADER_MISMATCH` for certain qcow2
+  cluster sizes (512, 2048, 16384, 32768, 262144 …) while `qemu-img
+  amend` accepted the same operation; the default 64 KiB cluster and
+  many other sizes succeeded, which is why the by-example tests (phases
+  5–7, all built at the default cluster) never caught it. Found by the
+  phase-8 differential fuzzer (`op_amend`).
+
+  **Root cause:** core.bin's `.bss` overflowed its 64 KiB budget
+  (`0x10000`–`0x20000`) into the operation region at `0x20000`. The
+  static `OUTPUT_DEVICE: Option<VirtioBlock>` was linked at `0x20380`,
+  and when core initialised the output block device it wrote the
+  `VirtioBlock` struct there — clobbering ~72 bytes of the loaded op's
+  code at `0x20380`–`0x203c7`. For amend that region held the header
+  cross-check, whose corrupted bytes then branched data-dependently on
+  the cluster-size values (error for some sizes, accidental success for
+  others). Every op's bytes there were corrupted, but only amend had
+  critical branch logic at that offset. The flat-binary size lint missed
+  it because the `.bin` excludes `.bss` (the file was under budget while
+  the runtime extent reached `0x203d0`).
+
+  Root-caused with host-only KVM debugging (a hardware data-write
+  watchpoint on `0x20380` trapped the writing instruction in core.bin) —
+  the guest op is too codegen-fragile for source instrumentation.
+
+  **Fix:** `OPERATION_LOAD_ADDR` raised `0x20000` → `0x22000` (giving
+  core a 72 KiB region so its `.bss` no longer overlaps the op);
+  `src/operations/*/linker.ld` `OPERATION_BASE` updated to match; and
+  `scripts/check-binary-sizes.sh` rewritten to validate the
+  `.bss`-inclusive ELF memory extent (not just the flat `.bin` size), so
+  this class of overflow is caught in future. Verified: amend passes all
+  13 cluster sizes (512 … 2 MiB), the differential fuzzer reports 0
+  divergences over 60 iterations, and the resize/create/check/snapshot/
+  map suites are unregressed.
+
+- **resize grow on a 64 KiB-cluster qcow2 (PRE-EXISTING, separate, out
+  of scope).** `instar resize <img> 8M` on a `qemu-img create -f qcow2
+  -o cluster_size=65536 <img> 4M` image fails with resize error 13
+  (header mismatch). It reproduces identically on the clean branch
+  before this fix (so it is **not** caused by the `OPERATION_LOAD_ADDR`
+  move) and is not in the resize test suite (which passes). Flagged for
+  a separate investigation; likely a distinct resize-planner accounting
+  issue, unrelated to the amend `.bss` corruption above.
 
 ### Documentation index maintenance
 

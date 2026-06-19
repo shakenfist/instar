@@ -359,8 +359,20 @@ pub const CHAIN_CONFIG_MAX_SIZE: usize = 1024;
 /// If mmio_base is 0, the guest uses the default (0x10000000).
 pub const VMM_PARAMS_ADDR: usize = 0x00083000;
 
-/// Address where operation binaries are loaded
-pub const OPERATION_LOAD_ADDR: usize = 0x00020000;
+/// Address where operation binaries are loaded.
+///
+/// This sits above core's region [GUEST_CODE_BASE, OPERATION_LOAD_ADDR).
+/// It was raised from 0x20000 to 0x22000 because core's runtime memory
+/// footprint (notably its `.bss`, which holds the `INPUT_DEVICES` /
+/// `OUTPUT_DEVICE` virtio statics) overflowed the old 64 KiB core budget:
+/// `OUTPUT_DEVICE` landed at 0x20380 and core's device init wrote the
+/// VirtioBlock struct there, clobbering the loaded op's code at
+/// 0x20380-0x203c7. The flat-binary size check missed it because the
+/// flat image excludes `.bss`. Giving core 72 KiB keeps its `.bss` clear
+/// of the op region; `scripts/check-binary-sizes.sh` now also validates
+/// the `.bss`-inclusive ELF extent. Keep this in sync with the
+/// per-op `src/operations/*/linker.ld` `OPERATION_BASE`.
+pub const OPERATION_LOAD_ADDR: usize = 0x00022000;
 
 /// DMA pool base address (must match core/virtio.rs and vmm/main.rs).
 /// Used for virtio request headers, data buffers, and status bytes.
