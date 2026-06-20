@@ -93,8 +93,14 @@ pub fn plan_amend_qcow2<'a>(
     // Downgrade gate: v3 source -> v2 target.
     if header.version == 3 && target_version == 2 {
         if header.incompatible_features != 0 {
-            // Any incompatible bit (dirty/corrupt/external_data/
-            // compression/extended_l2) blocks the downgrade.
+            // The `!= 0` is deliberately broad: v2 has no
+            // incompatible-features word, so no v3 incompatible
+            // feature can survive a downgrade. This intentionally
+            // blocks any incompatible bit, present or future (today:
+            // dirty/corrupt/external_data/compression/extended_l2) —
+            // do not narrow it to a per-bit allowlist. The enumerated
+            // list in the user-facing message (`map_amend_error`) is
+            // illustrative, not exhaustive.
             return Err(AmendError::DowngradeBlockedFeature);
         }
         if header.refcount_bits != 16 {

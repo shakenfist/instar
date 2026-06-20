@@ -309,14 +309,22 @@ cp "$SNAPSHOT_BIN" target/release/
 cp "$AMEND_BIN" target/release/
 echo "Copied core.bin, info.bin, copy.bin, check.bin, compare.bin, convert.bin, measure.bin, create.bin, resize.bin, rebase.bin, commit.bin, map.bin, snapshot.bin, and amend.bin to target/release/"
 
-# Check binary sizes against memory layout limits
-# Memory layout (from shared/src/lib.rs):
-#   - Core loads at 0x10000, must fit before operations at 0x22000 (max 64KB)
-#   - Operations load at 0x22000, must fit before configs at 0x80000 (max 384KB)
+# Check binary sizes against memory layout limits.
+#
+# Memory layout (from shared/src/lib.rs): core loads at 0x10000 and must
+# fit before operations at 0x22000 (72KB); operations load at 0x22000 and
+# must fit before the call table at 0x80000 (376KB).
+#
+# This is a coarse build-time guard on the flat .bin file size, which does
+# NOT include .bss. The AUTHORITATIVE check is scripts/check-binary-sizes.sh
+# (run by `make check-binary-sizes`, the pre-commit hook, and CI), which
+# measures the .bss-inclusive ELF memory extent — keep the limits here in
+# sync with it. (We don't delegate to that script here because this runs in
+# the rust-objcopy/LLVM build container, which lacks GNU readelf.)
 echo ""
 echo "=== Checking binary sizes against memory layout ==="
-CORE_MAX=$((0x10000))      # 64KB
-OP_MAX=$((0x60000))        # 384KB
+CORE_MAX=$((0x22000 - 0x10000))   # 72KB: 0x10000..0x22000
+OP_MAX=$((0x80000 - 0x22000))     # 376KB: 0x22000..0x80000
 FAILED=0
 
 check_size() {

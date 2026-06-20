@@ -828,3 +828,84 @@ def _make_amend_baseline_test(case):
 for _case in _BASELINE_CASES:
     _name = f'test_baseline_{_case[0].replace("-", "_")}'
     setattr(TestAmendBaselineMatrix, _name, _make_amend_baseline_test(_case))
+
+
+# ----------------------------------------------------------------------
+# Cluster-size regression guard.
+# ----------------------------------------------------------------------
+
+
+class TestAmendClusterSizes(TestAmendSmoke):
+    """Regression guard for the cluster-size-dependent corruption class.
+
+    The core `.bss` overflow (fixed by raising `OPERATION_LOAD_ADDR`
+    0x20000 -> 0x22000) corrupted the loaded op's code at 0x20380 and
+    surfaced only for certain qcow2 cluster sizes (512, 2048, 16384,
+    ...). It slipped through phases 5-7 because every by-example fixture
+    used the default 64 KiB cluster; only the phase-8 differential
+    fuzzer exercised non-default sizes. These cases amend images across
+    a spread of cluster sizes -- including ones that previously failed
+    -- so a regression of that class is caught by the routine
+    integration suite, not only by opportunistic fuzzing.
+    """
+
+    # A spread over the previously-failing set (512, 2048, 16384) and the
+    # passing set (4096, 65536 default).
+    CLUSTER_SIZES = [512, 2048, 4096, 16384, 65536]
+
+
+def _make_amend_cluster_size_test(cluster_size):
+    """Factory: amend (enable lazy refcounts) on a v3 image built at
+    `cluster_size`, then assert the image is intact and the flag took.
+    """
+
+    def test(self):
+        self._require_kvm()
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'image.qcow2'
+            # v3 image at the target cluster size.
+            create = subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2', '-o',
+                 f'cluster_size={cluster_size},compat=1.1', str(path), '1M'],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(
+                create.returncode, 0,
+                f'qemu-img create cs={cluster_size} failed: {create.stderr!r}')
+
+            # Enable lazy refcounts -- the transition that exposed the
+            # corruption -- which must succeed at every cluster size.
+            _, stderr, rc = self.run_instar_amend(
+                '-f', 'qcow2', '-o', 'lazy_refcounts=on', str(path))
+            self.assertEqual(
+                rc, 0,
+                f'instar amend (lazy on) failed at cluster_size='
+                f'{cluster_size}: {stderr!r}')
+
+            # The image must still pass qemu-img check and report the
+            # flag set.
+            chk = subprocess.run(
+                ['qemu-img', 'check', str(path)],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(
+                chk.returncode, 0,
+                f'qemu-img check failed after amend at cs={cluster_size}: '
+                f'{chk.stdout!r} {chk.stderr!r}')
+            info = subprocess.run(
+                ['qemu-img', 'info', '--output=json', str(path)],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(info.returncode, 0, f'qemu-img info failed: {info.stderr!r}')
+            fmt_data = json.loads(info.stdout).get('format-specific', {}).get('data', {})
+            self.assertTrue(
+                fmt_data.get('lazy-refcounts'),
+                f'lazy-refcounts not set after amend at cluster_size={cluster_size}')
+
+    test.__name__ = f'test_amend_cluster_size_{cluster_size}'
+    test.__doc__ = (
+        f'amend -o lazy_refcounts=on on a cluster_size={cluster_size} '
+        f'qcow2 v3 image succeeds and the image stays valid.')
+    return test
+
+
+for _cs in TestAmendClusterSizes.CLUSTER_SIZES:
+    setattr(TestAmendClusterSizes, f'test_amend_cluster_size_{_cs}',
+            _make_amend_cluster_size_test(_cs))
