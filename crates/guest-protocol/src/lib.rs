@@ -714,6 +714,34 @@ pub fn commit_result_message(
     msg
 }
 
+/// Build an `AmendResultMessage` envelope from the amend
+/// operation's fields. Mirrors `commit_result_message` — the host
+/// treats both the same way after framing.
+///
+/// `action` is one of `"noop"`, `"amended"`. `compat` is the
+/// resulting `"0.10"` or `"1.1"`; `lazy_refcounts` is the
+/// resulting state.
+pub fn amend_result_message(
+    target_format: &str,
+    action: u32,
+    resulting_version: u32,
+    lazy_refcounts: bool,
+    error: u32,
+) -> guest_::GuestMessage {
+    let mut msg = guest_::GuestMessage::default();
+    msg.level = guest_::Level::Info;
+
+    let mut result = guest_::AmendResultMessage::default();
+    push_str(&mut result.target_format, target_format);
+    result.action = action;
+    result.resulting_version = resulting_version;
+    result.lazy_refcounts = lazy_refcounts;
+    result.error = error;
+
+    msg.payload = Some(guest_::GuestMessage_::Payload::AmendResult(result));
+    msg
+}
+
 /// Build a `MapExtentMessage` envelope for one coalesced map
 /// extent. Streamed one-per-extent during the map operation;
 /// the host accumulates them into the rendered output.

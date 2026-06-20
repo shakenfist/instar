@@ -1,0 +1,16 @@
+[package]
+name = "amend"
+version = "0.2.0"
+edition = "2021"
+description = "Plan in-place qcow2 amend (compat/lazy) header mutations (no I/O)"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+shared = { path = "../../shared" }
+qcow2  = { path = "../qcow2", features = ["create"], default-features = false }
+
+[dev-dependencies]
+create = { path = "../create" }
+qcow2  = { path = "../qcow2", features = ["create"], default-features = false }
+shared = { path = "../../shared" }

@@ -2,8 +2,8 @@
 
 ENTRY(_start)
 
-/* Operations are loaded at 0x20000 by the VMM */
-OPERATION_BASE = 0x20000;
+/* Operations are loaded at 0x22000 by the VMM (raised from 0x20000; see shared OPERATION_LOAD_ADDR) */
+OPERATION_BASE = 0x22000;
 
 SECTIONS
 {

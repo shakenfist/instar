@@ -1,0 +1,21 @@
+[package]
+name = "amend-op"
+version = "0.2.0"
+edition = "2021"
+description = "Amend operation: change a qcow2 image's compat version / lazy refcounts"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "amend"
+path = "src/main.rs"
+
+[dependencies]
+shared = { path = "../../shared" }
+amend = { path = "../../crates/amend" }
+qcow2 = { path = "../../crates/qcow2", features = ["create"] }
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true

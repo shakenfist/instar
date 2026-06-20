@@ -599,6 +599,27 @@ pub fn send_commit_result(result: &shared::CommitResult) {
     send_message(&msg);
 }
 
+/// Send an amend result message.
+///
+/// Mirrors [`send_rebase_result`], but passes the `action` and
+/// `resulting_version` codes through numerically rather than
+/// mapping them to strings here: the core binary is near its 72 KiB
+/// budget ceiling, so the "noop"/"amended" and "0.10"/"1.1"
+/// rendering is done host-side from these codes (the host has no
+/// size budget). Only `target_format` keeps the shared
+/// `ImageFormat::name()` mapping every sender already links.
+pub fn send_amend_result(result: &shared::AmendResult) {
+    let target_name = shared::ImageFormat::from_u32(result.target_format).name();
+    let msg = guest_protocol::amend_result_message(
+        target_name,
+        result.action,
+        result.resulting_version,
+        result.resulting_lazy_refcounts != 0,
+        result.error,
+    );
+    send_message(&msg);
+}
+
 /// Send a single map extent message.
 ///
 /// Called once per coalesced extent during the map operation,

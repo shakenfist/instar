@@ -92,6 +92,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   [docs/snapshot.md](docs/snapshot.md) for the full reference
   and `docs/quirks.md` for the documented divergences.
 
+- **New `instar amend` subcommand (PLAN-amend phases 1-9).** Changes a
+  qcow2 image's compatibility version (`compat=0.10`/`1.1`, i.e. qcow2
+  v2⇔v3) and/or the `lazy_refcounts` flag in place by rewriting only the
+  header cluster — the sandboxed equivalent of `qemu-img amend`.
+  qcow2-only. v1 refuses a v3→v2 downgrade when the image carries a
+  v3-only incompatible feature (compression type, extended L2, external
+  data, dirty, corrupt) or uses `refcount_bits != 16`, and refuses
+  `lazy_refcounts=on` against a v2 image. Covered by Rust round-trip unit
+  tests, Python integration tests with post-op `info`/`check`/`compare`
+  cross-validation against `qemu-img amend`, cross-version `qemu-img info`
+  baselines (6.0.0–10.2.0), and coverage + differential fuzzing. See
+  [docs/amend.md](docs/amend.md).
+
 - **`instar map` differential fuzzer extension (PLAN-map phase 8).**
   Adds `op_map` to `scripts/differential-fuzz.py`'s random
   operation chain. For each randomly-generated image (raw
@@ -721,6 +734,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (surfaced and refined by phase 7c source-image tests).
 
 ### Fixed
+
+- **Guest core `.bss` overflow corrupting operation code.** `core.bin`'s
+  `.bss` (the `INPUT_DEVICES`/`OUTPUT_DEVICE` virtio statics) overflowed
+  its 64 KiB budget into the operation region at `0x20000`; core's
+  device init wrote a `VirtioBlock` struct to `0x20380`, clobbering ~72
+  bytes of the loaded operation's code. Only `amend` had critical branch
+  logic at that offset, so it surfaced as spurious `ERROR_HEADER_MISMATCH`
+  for some qcow2 cluster sizes. Fixed by raising `OPERATION_LOAD_ADDR`
+  `0x20000` → `0x22000` (giving core a 72 KiB region) and updating every
+  `src/operations/*/linker.ld`; `scripts/check-binary-sizes.sh` now
+  validates the `.bss`-inclusive ELF memory extent (not just the flat
+  `.bin` file size, which excluded `.bss`) and warns as a binary nears
+  its limit. Found by the phase-8 differential fuzzer.
 
 - **`instar create` could emit an unrepresentable Fixed VHD plan for
   enormous virtual sizes (#353, #355, #357, #361, #362, #363, #367).**

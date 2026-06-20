@@ -297,6 +297,26 @@ message CommitResultMessage {
   uint32 error = 6;
 }
 
+// Image amend result (from amend operation).
+message AmendResultMessage {
+  // Target format echoed back (e.g. "qcow2").
+  string target_format = 1;
+  // Action taken, numeric: mirrors AmendResult::ACTION_* in
+  // src/shared/src/lib.rs (0 = noop, 1 = amended). Kept numeric
+  // (not a string) so the size-constrained core binary does not
+  // carry the action/version string tables; the host renders
+  // "noop"/"amended" and "0.10"/"1.1" from these codes.
+  uint32 action = 2;
+  // Resulting qcow2 version (2 or 3); the host maps it to the
+  // "0.10" / "1.1" compat string.
+  uint32 resulting_version = 3;
+  // Resulting lazy-refcounts state.
+  bool lazy_refcounts = 4;
+  // Error code: 0 = ok, non-zero mirrors AmendResult::ERROR_*
+  // in src/shared/src/lib.rs.
+  uint32 error = 5;
+}
+
 // Single coalesced map extent (from map operation). Sent once
 // per emitted extent; followed by a MapResultMessage terminator
 // after the last extent. The host accumulates these into the
@@ -404,5 +424,6 @@ message GuestMessage {
     MapResultMessage map_result = 16;
     SnapshotEntryMessage snapshot_entry = 17;
     SnapshotResultMessage snapshot_result = 18;
+    AmendResultMessage amend_result = 19;
   }
 }

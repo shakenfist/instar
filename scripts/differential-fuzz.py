@@ -48,8 +48,8 @@ DATA_PATTERNS = ['zeros', 'random', 'sparse', 'mbr']
 
 # Operations that the fuzzer can chain together
 OPERATIONS = ['info', 'check', 'convert', 'convert_compressed', 'measure',
-              'create', 'resize', 'rebase', 'commit', 'map', 'snapshot',
-              'repair']
+              'create', 'resize', 'amend', 'rebase', 'commit', 'map',
+              'snapshot', 'repair']
 
 # Known divergence categories to skip (unsafe quirks)
 # See docs/quirks.md for rationale
@@ -1426,6 +1426,210 @@ def op_resize(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
             'apply_shrink': apply_shrink,
             'instar_normalised': inst_norm,
             'qemu_normalised': qemu_norm,
+        }
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Amend: picker + op
+# ---------------------------------------------------------------------------
+
+def _amend_option_picker(rng):
+    """Pick (create_opts, amend_opts) for a qcow2 amend transition.
+
+    Both are lists of `key=value` strings passed to
+    `qemu-img create -o` / `instar|qemu-img amend -o`. Mirrors the
+    transition space of tests/test_amend.py's AMEND_CASES:
+      * upgrade   — create compat=0.10, amend compat=1.1
+                    (optionally + lazy_refcounts=on).
+      * downgrade — create compat=1.1, amend compat=0.10.
+      * lazy-on   — create compat=1.1, amend lazy_refcounts=on.
+      * lazy-off  — create compat=1.1,lazy_refcounts=on,
+                    amend lazy_refcounts=off.
+      * noop      — create compat=1.1, amend compat=1.1.
+
+    Divergence avoidance (a mis-steered picker floods false
+    divergences — see PLAN-amend phase 8b Situation):
+      * Never emits `compression_type=zstd` (or any
+        `compression_type`): instar refuses a compat=0.10 downgrade
+        of a zstd-compression image while qemu-img accepts it
+        (rewriting compression_type) — the one documented phase-6
+        divergence.
+      * Keeps `refcount_bits=16` (the qcow2 default) on every
+        downgrade case: instar refuses a compat=0.10 downgrade of an
+        image whose refcount width is not 16. refcount_bits is only
+        randomised for cases that do NOT downgrade.
+    """
+    case = rng.choice(
+        ['upgrade', 'downgrade', 'lazy-on', 'lazy-off', 'noop'])
+
+    create_opts = []
+    cs = rng.choice([512, 4096, 65536])
+    create_opts.append(f'cluster_size={cs}')
+
+    downgrade = (case == 'downgrade')
+
+    # refcount_bits is only safe to randomise when the amend does NOT
+    # downgrade to compat=0.10 (instar refuses a non-16 downgrade).
+    if not downgrade and rng.random() < 0.4:
+        create_opts.append(
+            f'refcount_bits={rng.choice([1, 2, 4, 8, 16, 32, 64])}')
+
+    if case == 'upgrade':
+        create_opts.append('compat=0.10')
+        if rng.random() < 0.5:
+            amend_opts = ['compat=1.1', 'lazy_refcounts=on']
+        else:
+            amend_opts = ['compat=1.1']
+    elif case == 'downgrade':
+        create_opts.append('compat=1.1')
+        amend_opts = ['compat=0.10']
+    elif case == 'lazy-on':
+        create_opts.append('compat=1.1')
+        amend_opts = ['lazy_refcounts=on']
+    elif case == 'lazy-off':
+        create_opts.append('compat=1.1')
+        create_opts.append('lazy_refcounts=on')
+        amend_opts = ['lazy_refcounts=off']
+    else:  # noop
+        create_opts.append('compat=1.1')
+        amend_opts = ['compat=1.1']
+
+    return create_opts, amend_opts
+
+
+def op_amend(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
+    """Build the same qcow2 twice, amend each via its native tool,
+    compare via qemu-img info JSON + a structural qemu-img check.
+
+    instar_copy / qemu_copy / fmt are part of the standard op_*
+    signature but unused — `amend` builds its own
+    (create_opts, amend_opts) pair via the picker. amend is
+    qcow2-only and launches a guest VMM needing /dev/kvm (the
+    workflow passes --device /dev/kvm; op_rebase/op_commit/op_repair
+    already assume this — no special kvm guard).
+    """
+    create_opts, amend_opts = _amend_option_picker(rng)
+
+    iter_dir = instar_copy.parent
+    inst_path = iter_dir / 'amend-instar.qcow2'
+    qemu_path = iter_dir / 'amend-qemu.qcow2'
+
+    # 1. Seed identical start images with qemu-img create (NOT instar
+    # create — it is v3-only and cannot make the v2 upgrade inputs).
+    create_args_base = ['-f', 'qcow2']
+    for opt in create_opts:
+        create_args_base.extend(['-o', opt])
+
+    _, ic_stderr, ic_rc = run_qemu_img(
+        ['create'], create_args_base + [str(inst_path), '1M'],
+        timeout=timeout)
+    _, qc_stderr, qc_rc = run_qemu_img(
+        ['create'], create_args_base + [str(qemu_path), '1M'],
+        timeout=timeout)
+    if ic_rc != 0 or qc_rc != 0:
+        # qemu-img create builds both sides; a failure here is not an
+        # amend divergence. If both fail, skip; if only one fails it
+        # is an unexpected qemu-img inconsistency, surface it.
+        if ic_rc != 0 and qc_rc != 0:
+            return None
+        return {
+            'type': 'amend_create_seed_divergence',
+            'create_opts': create_opts,
+            'amend_opts': amend_opts,
+            'instar_path_rc': ic_rc, 'qemu_path_rc': qc_rc,
+            'instar_path_stderr': ic_stderr[:500],
+            'qemu_path_stderr': qc_stderr[:500],
+        }
+
+    # 2. Amend each via its native tool.
+    amend_args_base = ['-f', 'qcow2']
+    for opt in amend_opts:
+        amend_args_base.extend(['-o', opt])
+
+    _, ia_stderr, ia_rc = run_instar(
+        instar_bin, ['amend'],
+        amend_args_base + [str(inst_path)],
+        timeout=timeout)
+    _, qa_stderr, qa_rc = run_qemu_img(
+        ['amend'],
+        amend_args_base + [str(qemu_path)],
+        timeout=timeout)
+
+    div = compare_exit_codes(
+        ia_rc, qa_rc, 'amend',
+        {'create_opts': create_opts,
+         'amend_opts': amend_opts,
+         'instar_stderr': ia_stderr[:500],
+         'qemu_stderr': qa_stderr[:500]},
+    )
+    if div:
+        return div
+    if ia_rc != 0:
+        return None  # both rejected; nothing to compare
+
+    # 3. Compare via qemu-img info on both outputs.
+    inst_info_out, _, inst_info_rc = run_qemu_img(
+        ['info', '--output=json'], [str(inst_path)], timeout=timeout)
+    qemu_info_out, _, qemu_info_rc = run_qemu_img(
+        ['info', '--output=json'], [str(qemu_path)], timeout=timeout)
+    if inst_info_rc != 0 or qemu_info_rc != 0:
+        return {
+            'type': 'amend_info_readback_failure',
+            'create_opts': create_opts,
+            'amend_opts': amend_opts,
+            'instar_info_rc': inst_info_rc,
+            'qemu_info_rc': qemu_info_rc,
+            'instar_info_stdout': inst_info_out[:500],
+            'qemu_info_stdout': qemu_info_out[:500],
+        }
+
+    try:
+        inst_json = json.loads(inst_info_out)
+        qemu_json = json.loads(qemu_info_out)
+    except json.JSONDecodeError as e:
+        return {
+            'type': 'amend_info_json_parse_failure',
+            'create_opts': create_opts,
+            'amend_opts': amend_opts,
+            'error': str(e),
+            'instar_info_stdout': inst_info_out[:500],
+            'qemu_info_stdout': qemu_info_out[:500],
+        }
+
+    inst_norm = _normalise_create_info(inst_json, 'qcow2', str(inst_path))
+    qemu_norm = _normalise_create_info(qemu_json, 'qcow2', str(qemu_path))
+
+    if inst_norm != qemu_norm:
+        return {
+            'type': 'amend_info_divergence',
+            'create_opts': create_opts,
+            'amend_opts': amend_opts,
+            'instar_normalised': inst_norm,
+            'qemu_normalised': qemu_norm,
+        }
+
+    # 4. Structural check on the instar output. amend rewrites only
+    # header metadata; a corruption qemu-img info doesn't surface
+    # (e.g. a damaged refcount/L1 table) shows up here. qemu-img
+    # check exits non-zero when it finds corruptions/leaks/errors;
+    # parse via metrics so a clean image with a benign non-zero rc
+    # is not misread.
+    inst_metrics = _qemu_check_metrics(inst_path, timeout)
+    if inst_metrics is None:
+        return {
+            'type': 'amend_check_unparseable',
+            'note': 'qemu-img check could not parse instar-amended image',
+            'create_opts': create_opts,
+            'amend_opts': amend_opts,
+            'instar_stderr': ia_stderr[:500],
+        }
+    if not _is_clean(inst_metrics):
+        return {
+            'type': 'amend_check_divergence',
+            'create_opts': create_opts,
+            'amend_opts': amend_opts,
+            'instar_metrics': inst_metrics,
         }
     return None
 
@@ -3030,6 +3234,11 @@ def run_iteration(instar_bin, workdir, rng, iteration, timeout,
                 )
             elif op == 'resize':
                 div = op_resize(
+                    instar_bin, instar_copy, qemu_copy, fmt,
+                    timeout, rng,
+                )
+            elif op == 'amend':
+                div = op_amend(
                     instar_bin, instar_copy, qemu_copy, fmt,
                     timeout, rng,
                 )

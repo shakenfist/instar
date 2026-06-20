@@ -323,8 +323,8 @@ macro_rules! cached_read {
 
 /// Address where the call table is located (set by core)
 /// Located at 512KB to avoid overlap with core binary (which can grow past 32KB).
-/// The core binary is loaded at 0x10000 and may extend to 0x20000 (64KB max).
-/// The operation binary is loaded at 0x20000, so we place data structures at 0x80000.
+/// The core binary is loaded at 0x10000 and may extend to 0x22000 (72KB max).
+/// The operation binary is loaded at 0x22000, so we place data structures at 0x80000.
 pub const CALL_TABLE_ADDR: usize = 0x00080000;
 
 /// Address where operation config is stored (set by VMM/core)
@@ -359,8 +359,20 @@ pub const CHAIN_CONFIG_MAX_SIZE: usize = 1024;
 /// If mmio_base is 0, the guest uses the default (0x10000000).
 pub const VMM_PARAMS_ADDR: usize = 0x00083000;
 
-/// Address where operation binaries are loaded
-pub const OPERATION_LOAD_ADDR: usize = 0x00020000;
+/// Address where operation binaries are loaded.
+///
+/// This sits above core's region [GUEST_CODE_BASE, OPERATION_LOAD_ADDR).
+/// It was raised from 0x20000 to 0x22000 because core's runtime memory
+/// footprint (notably its `.bss`, which holds the `INPUT_DEVICES` /
+/// `OUTPUT_DEVICE` virtio statics) overflowed the old 64 KiB core budget:
+/// `OUTPUT_DEVICE` landed at 0x20380 and core's device init wrote the
+/// VirtioBlock struct there, clobbering the loaded op's code at
+/// 0x20380-0x203c7. The flat-binary size check missed it because the
+/// flat image excludes `.bss`. Giving core 72 KiB keeps its `.bss` clear
+/// of the op region; `scripts/check-binary-sizes.sh` now also validates
+/// the `.bss`-inclusive ELF extent. Keep this in sync with the
+/// per-op `src/operations/*/linker.ld` `OPERATION_BASE`.
+pub const OPERATION_LOAD_ADDR: usize = 0x00022000;
 
 /// DMA pool base address (must match core/virtio.rs and vmm/main.rs).
 /// Used for virtio request headers, data buffers, and status bytes.
@@ -961,6 +973,13 @@ pub struct CallTable {
     /// contract. Appended at the end of `CallTable` for the
     /// same back-compat reason as `send_snapshot_result`.
     pub fsync_input: unsafe extern "C" fn(u32) -> bool,
+
+    /// Send the amend result message. Args: `amend_result`
+    /// pointer carrying the action (noop/amended), the resulting
+    /// qcow2 version and lazy-refcounts state, and the error
+    /// code. Appended at the end of `CallTable` for the same
+    /// back-compat reason as `send_rebase_result`.
+    pub send_amend_result: unsafe extern "C" fn(*const AmendResult),
 }
 
 /// Backing format type for QCOW2 header extension
@@ -1285,8 +1304,9 @@ impl CallTable {
     /// streaming-emit shape map needs; PLAN-snapshot phase 1
     /// appended `send_snapshot_entry`, `send_snapshot_result`,
     /// and `fsync_input` for the snapshot subcommand and its
-    /// durability checkpoints).
-    pub const VERSION: u32 = 17;
+    /// durability checkpoints; PLAN-amend phase 1 appended
+    /// `send_amend_result` for the amend subcommand).
+    pub const VERSION: u32 = 18;
 }
 
 // ============================================================================
@@ -3423,6 +3443,164 @@ impl RebaseResult {
     }
 }
 
+/// Configuration structure for the amend operation.
+///
+/// Written by the host at [`OPERATION_CONFIG_ADDR`] before the
+/// guest is launched (the same slot every other per-op config
+/// uses); the guest reads it via `call_table.get_operation_config`.
+/// amend reuses the existing `read_output_sector` /
+/// `write_output_sector` primitives for its single-cluster header
+/// rewrite, so no new address constant or device-I/O pointer is
+/// introduced.
+///
+/// The host pre-probes the image's current header and passes a
+/// summary (`current_version`, `current_refcount_bits`, the two
+/// feature words, `virtual_size`) as a cross-check; the guest
+/// re-parses the header and validates against these fields,
+/// exactly as resize passes `current_virtual_size`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct AmendConfig {
+    /// Magic (`0x414D4E44` = "AMND").
+    pub magic: u32,
+    /// Target format (`ImageFormat as u32`); `Qcow2` in v1.
+    pub target_format: u32,
+    /// Flags. See `FLAG_*` constants.
+    pub flags: u32,
+    /// Sector size for I/O (matches host sector_size).
+    pub sector_size: u32,
+
+    /// qcow2 cluster size in bytes (the header-cluster span).
+    pub cluster_size: u32,
+    /// Current qcow2 version (2 or 3); host-probed cross-check.
+    pub current_version: u32,
+    /// Current refcount width in bits; host-probed cross-check.
+    pub current_refcount_bits: u32,
+    /// Padding to align the following `u64` fields.
+    pub _pad: u32,
+
+    /// Current incompatible feature word; host-probed cross-check.
+    pub current_incompatible_features: u64,
+    /// Current compatible feature word; host-probed cross-check.
+    pub current_compatible_features: u64,
+    /// Virtual size in bytes; host-probed cross-check.
+    pub virtual_size: u64,
+
+    /// Reserved padding for forward compatibility (zero-init).
+    pub _reserved: [u8; 72],
+}
+
+impl AmendConfig {
+    /// Magic value for amend config.
+    pub const MAGIC: u32 = 0x414D4E44; // "AMND"
+
+    /// Flag: quiet mode. Host-side only; the guest ignores this
+    /// bit.
+    pub const FLAG_QUIET: u32 = 1 << 0;
+    /// Flag: the `compat=` option was given. When clear, the
+    /// target version is left unchanged.
+    pub const FLAG_SET_COMPAT: u32 = 1 << 1;
+    /// Flag: target version is v3 (`1.1`) when set, v2 (`0.10`)
+    /// when clear. Only meaningful when [`FLAG_SET_COMPAT`] is
+    /// set.
+    pub const FLAG_COMPAT_V3: u32 = 1 << 2;
+    /// Flag: the `lazy_refcounts=` option was given. When clear,
+    /// the lazy-refcounts state is left unchanged.
+    pub const FLAG_SET_LAZY: u32 = 1 << 3;
+    /// Flag: target lazy-refcounts state is on when set, off when
+    /// clear. Only meaningful when [`FLAG_SET_LAZY`] is set.
+    pub const FLAG_LAZY_ON: u32 = 1 << 4;
+
+    /// True if magic matches.
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+}
+
+/// Result structure for the amend operation.
+///
+/// Passed by the guest into `call_table.send_amend_result`
+/// (added in phase 1 of `PLAN-amend`). Carries the action taken,
+/// the resulting version / lazy-refcounts state (so the host can
+/// render the success line and phase-7 baselines can assert the
+/// post-amend state without a second probe), and the error code.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct AmendResult {
+    /// Magic value (`0x414D5253` = "AMRS").
+    pub magic: u32,
+    /// Target format echoed back so the host can render the right
+    /// output.
+    pub target_format: u32,
+    /// Action taken. See `ACTION_*`.
+    pub action: u32,
+    /// Error code. See `ERROR_*`.
+    pub error: u32,
+
+    /// qcow2 version (2 or 3) after the amend completes.
+    pub resulting_version: u32,
+    /// Lazy-refcounts state (0 / 1) after the amend completes.
+    pub resulting_lazy_refcounts: u32,
+
+    /// Reserved padding for forward compatibility (zero-init).
+    pub _reserved: [u8; 40],
+}
+
+impl AmendResult {
+    /// Magic value for amend result.
+    pub const MAGIC: u32 = 0x414D5253; // "AMRS"
+
+    /// Action: requested options already matched the header;
+    /// nothing was rewritten.
+    pub const ACTION_NOOP: u32 = 0;
+    /// Action: the header was rewritten.
+    pub const ACTION_AMENDED: u32 = 1;
+
+    // Error codes are stable: only appended, never reordered.
+    pub const ERROR_OK: u32 = 0;
+    /// Input is not qcow2 (v1 is qcow2-only).
+    pub const ERROR_UNSUPPORTED_FORMAT: u32 = 1;
+    /// An unrecognised / unsupported `-o` key reached the guest
+    /// (defence in depth; mostly rejected host-side in phase 4).
+    pub const ERROR_INVALID_OPTION: u32 = 2;
+    /// `compat=0.10` refused because a v3 incompatible feature is
+    /// set (`DIRTY`, `CORRUPT`, `EXTERNAL_DATA`, `COMPRESSION`,
+    /// `EXTENDED_L2`).
+    pub const ERROR_DOWNGRADE_BLOCKED_FEATURE: u32 = 3;
+    /// `compat=0.10` refused because `refcount_bits != 16` (v2
+    /// supports 16-bit only; rewriting the refcount tree is out of
+    /// v1 scope).
+    pub const ERROR_DOWNGRADE_REFCOUNT_WIDTH: u32 = 4;
+    /// `lazy_refcounts=on` requested against a v2 image, or while
+    /// simultaneously downgrading to v2.
+    pub const ERROR_LAZY_REQUIRES_V3: u32 = 5;
+    /// The host-probed cross-check (version / features /
+    /// refcount_bits / cluster_size) disagreed with the guest's
+    /// re-read of the header (defensive, mirrors rebase).
+    pub const ERROR_HEADER_MISMATCH: u32 = 6;
+    /// `QcowHeader::parse` failed on the staged header.
+    pub const ERROR_PARSE_FAILED: u32 = 7;
+    /// `INCOMPAT_DIRTY` is set; refuse to amend an image another
+    /// writer may hold open.
+    pub const ERROR_DIRTY: u32 = 8;
+    /// The image carries header extension(s) that a v2⇔v3
+    /// transition would have to relocate, and v1 punts. Reserved
+    /// in case phase 2 decides not to implement relocation.
+    pub const ERROR_EXTENSION_RELOCATION_UNSUPPORTED: u32 = 9;
+    /// A device write back to the header cluster failed.
+    pub const ERROR_WRITE_FAILED: u32 = 10;
+    /// Guest scratch buffer was too small for the requested
+    /// layout.
+    pub const ERROR_SCRATCH_TOO_SMALL: u32 = 11;
+    /// Internal size or offset computation overflowed.
+    pub const ERROR_INTERNAL_OVERFLOW: u32 = 12;
+
+    /// True if magic matches.
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+}
+
 /// Configuration structure for the commit operation.
 ///
 /// Written by the host at [`OPERATION_CONFIG_ADDR`] before the
@@ -4322,6 +4500,124 @@ mod tests {
         assert!(!r.is_valid());
     }
 
+    #[test]
+    fn amend_config_magic() {
+        assert_eq!(AmendConfig::MAGIC, 0x414D_4E44); // "AMND" LE
+    }
+
+    #[test]
+    fn amend_result_magic() {
+        assert_eq!(AmendResult::MAGIC, 0x414D_5253); // "AMRS" LE
+    }
+
+    #[test]
+    fn amend_config_size_and_align() {
+        // Source of truth: AmendConfig must be exactly 128 bytes
+        // and 8-byte aligned (it carries u64 cross-check fields).
+        assert_eq!(
+            core::mem::size_of::<AmendConfig>(),
+            128,
+            "AmendConfig is {} bytes",
+            core::mem::size_of::<AmendConfig>()
+        );
+        assert_eq!(core::mem::align_of::<AmendConfig>(), 8);
+    }
+
+    #[test]
+    fn amend_result_size_and_align() {
+        // Source of truth: AmendResult must be exactly 64 bytes
+        // and 4-byte aligned (all u32 fields).
+        assert_eq!(
+            core::mem::size_of::<AmendResult>(),
+            64,
+            "AmendResult is {} bytes",
+            core::mem::size_of::<AmendResult>()
+        );
+        assert_eq!(core::mem::align_of::<AmendResult>(), 4);
+    }
+
+    #[test]
+    fn amend_config_is_valid_checks_magic() {
+        let mut cfg = AmendConfig {
+            magic: AmendConfig::MAGIC,
+            target_format: 0,
+            flags: 0,
+            sector_size: 0,
+            cluster_size: 0,
+            current_version: 0,
+            current_refcount_bits: 0,
+            _pad: 0,
+            current_incompatible_features: 0,
+            current_compatible_features: 0,
+            virtual_size: 0,
+            _reserved: [0; 72],
+        };
+        assert!(cfg.is_valid());
+        cfg.magic = 0;
+        assert!(!cfg.is_valid());
+    }
+
+    #[test]
+    fn amend_config_flags_distinct() {
+        let flags = [
+            AmendConfig::FLAG_QUIET,
+            AmendConfig::FLAG_SET_COMPAT,
+            AmendConfig::FLAG_COMPAT_V3,
+            AmendConfig::FLAG_SET_LAZY,
+            AmendConfig::FLAG_LAZY_ON,
+        ];
+        for i in 0..flags.len() {
+            for j in (i + 1)..flags.len() {
+                assert_ne!(flags[i], flags[j], "flags {i} and {j} alias");
+            }
+        }
+    }
+
+    #[test]
+    fn amend_result_error_codes_distinct() {
+        // Phase 1 defines codes 0..=12. Confirm every code is
+        // distinct and contiguously numbered.
+        let codes = [
+            AmendResult::ERROR_OK,
+            AmendResult::ERROR_UNSUPPORTED_FORMAT,
+            AmendResult::ERROR_INVALID_OPTION,
+            AmendResult::ERROR_DOWNGRADE_BLOCKED_FEATURE,
+            AmendResult::ERROR_DOWNGRADE_REFCOUNT_WIDTH,
+            AmendResult::ERROR_LAZY_REQUIRES_V3,
+            AmendResult::ERROR_HEADER_MISMATCH,
+            AmendResult::ERROR_PARSE_FAILED,
+            AmendResult::ERROR_DIRTY,
+            AmendResult::ERROR_EXTENSION_RELOCATION_UNSUPPORTED,
+            AmendResult::ERROR_WRITE_FAILED,
+            AmendResult::ERROR_SCRATCH_TOO_SMALL,
+            AmendResult::ERROR_INTERNAL_OVERFLOW,
+        ];
+        for i in 0..codes.len() {
+            for j in (i + 1)..codes.len() {
+                assert_ne!(codes[i], codes[j], "codes {i} and {j} alias");
+            }
+        }
+        for (i, c) in codes.iter().enumerate() {
+            assert_eq!(*c, i as u32);
+        }
+    }
+
+    #[test]
+    fn amend_result_is_valid_checks_magic() {
+        let mut r = AmendResult {
+            magic: AmendResult::MAGIC,
+            target_format: 0,
+            action: AmendResult::ACTION_NOOP,
+            error: AmendResult::ERROR_OK,
+            resulting_version: 0,
+            resulting_lazy_refcounts: 0,
+            _reserved: [0; 40],
+        };
+        assert!(r.is_valid());
+        r.magic = 0;
+        assert!(!r.is_valid());
+    }
+
     // ------------------------------------------------------------------
     // MapExtentCoalescer tests
     // ------------------------------------------------------------------
@@ -4869,11 +5165,13 @@ mod tests {
     }
 
     #[test]
-    fn call_table_version_is_seventeen() {
-        // PLAN-snapshot phase 1 bumps the call-table ABI from
+    fn call_table_version_is_eighteen() {
+        // PLAN-snapshot phase 1 bumped the call-table ABI from
         // 16 to 17 by appending `send_snapshot_entry`,
         // `send_snapshot_result`, and `fsync_input`.
-        assert_eq!(CallTable::VERSION, 17);
+        // PLAN-amend phase 1 bumps 17 to 18 by appending
+        // `send_amend_result`.
+        assert_eq!(CallTable::VERSION, 18);
     }
 
     #[test]

@@ -128,6 +128,21 @@ vhdx (VHDX), luks (info + convert with decryption)
   `tests/test_snapshot.py`, two coverage-guided fuzz targets,
   and the differential fuzzer's `op_snapshot` chain. See
   [docs/snapshot.md](docs/snapshot.md) for the full reference.
+- `amend`: change a qcow2 image's compat version
+  (`-o compat=0.10|1.1`, v2⇔v3) and/or the `lazy_refcounts`
+  flag (`-o lazy_refcounts=on|off`) in place, rewriting only
+  the header cluster — like `qemu-img amend`. qcow2-only;
+  needs `/dev/kvm` (guest VMM). v1 gates: v3→v2 downgrade
+  refused if a v3-only incompatible feature is set (compression
+  type, extended L2, external data, dirty, corrupt) or
+  `refcount_bits != 16`; `lazy_refcounts=on` requires v3;
+  header-extension relocation across the version change is
+  unsupported. Covered by Rust round-trip unit tests, Python
+  integration tests with post-op `info`/`check`/`compare`
+  cross-validation against `qemu-img amend`, cross-version
+  `qemu-img info` baselines (6.0.0–10.2.0), and coverage +
+  differential fuzzing. See [docs/amend.md](docs/amend.md)
+  for the full reference.
 
 ## Working on This Project
 
