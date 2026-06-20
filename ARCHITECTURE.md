@@ -518,6 +518,21 @@ provides a modular architecture with:
   coverage-guided fuzz targets (`fuzz_snapshot_parse`,
   `fuzz_snapshot_refcount`); and the differential fuzzer's
   `op_snapshot` chain (byte-identity after every element).
+- **operations/amend/** - In-place qcow2 header amendment operation
+  (PLAN-amend, qcow2-only). Reads an `AmendConfig` (target compat
+  version and/or lazy_refcounts flag) from `OPERATION_CONFIG_ADDR`,
+  opens the image RW as the output device, reads the existing header
+  to determine the current version and feature state, runs the
+  `crates/amend` planner to derive a `AmendPlan` (a handful of
+  byte-range patches to the header cluster), and applies them via
+  `write_output_sector` — only the header cluster is rewritten; no
+  cluster or refcount data is touched. v1 gates: v3→v2 downgrade
+  refused if the image carries a v3-only incompatible feature
+  (dirty, corrupt, external data, compression type, extended L2) or
+  uses `refcount_bits != 16`; `lazy_refcounts=on` requires v3;
+  header-extension relocation across the version change is
+  unsupported. Needs `/dev/kvm` (launches a guest VMM). See
+  [docs/amend.md](docs/amend.md) for the full user reference.
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation,

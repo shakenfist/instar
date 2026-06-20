@@ -32,8 +32,9 @@ instar implementation in `src/`. Operations include `info`, `copy`, `check`,
 
 See [docs/measure.md](docs/measure.md), [docs/create.md](docs/create.md),
 [docs/resize.md](docs/resize.md), [docs/rebase.md](docs/rebase.md),
-[docs/commit.md](docs/commit.md), [docs/map.md](docs/map.md), and
-[docs/snapshot.md](docs/snapshot.md) for the per-subcommand user guides.
+[docs/commit.md](docs/commit.md), [docs/map.md](docs/map.md),
+[docs/snapshot.md](docs/snapshot.md), and
+[docs/amend.md](docs/amend.md) for the per-subcommand user guides.
 
 ## Installation
 
@@ -422,6 +423,24 @@ snapshot` given identical inputs (modulo documented freed-cluster
 and file-tail notes). See [docs/snapshot.md](docs/snapshot.md)
 for the full reference, including the `-d` (name-only) vs `-a`
 (ID-then-name) matcher asymmetry and the v1 limits.
+
+### QCOW2 Header Amendment
+
+```bash
+# Upgrade a v2 image to qcow2 v3 (compat=1.1)
+instar amend -o compat=1.1 disk.qcow2
+
+# Downgrade a v3 image to v2 (refused if v3-only features are present)
+instar amend -o compat=0.10 disk.qcow2
+
+# Toggle lazy refcounts (v3 only)
+instar amend -o lazy_refcounts=on disk.qcow2
+```
+
+Changes a qcow2 image's compatibility version (`compat=0.10`/`1.1`) and/or
+the `lazy_refcounts` flag in place, rewriting only the header cluster — the
+sandboxed equivalent of `qemu-img amend`. qcow2-only. See
+[docs/amend.md](docs/amend.md) for the full reference.
 
 ### Version Compatibility
 

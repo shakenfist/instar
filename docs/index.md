@@ -50,6 +50,7 @@ Features unique to instar that do not exist in qemu-img.
 | [Commit](commit.md) | `instar commit` - merge an overlay's data into its backing |
 | [Map](map.md) | `instar map` - emit the allocation map of a disk image |
 | [Snapshot](snapshot.md) | `instar snapshot` - manage internal qcow2 snapshots |
+| [Amend](amend.md) | `instar amend` - change qcow2 image options (compat version, lazy_refcounts) |
 
 ## Compatibility
 

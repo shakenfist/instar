@@ -408,7 +408,7 @@ because the mutation is header-only.
 | 6. Python integration tests (`tests/test_amend.py`): cross-check vs `qemu-img amend` with post-op `info`/`check`/`compare`, known-divergence registry | PLAN-amend-phase-06-integration.md | Complete |
 | 7. Cross-version baselines: `AMEND_CASES` in `generate-baselines.py`, `expected-outputs/amend-info-json/`, testdata push | PLAN-amend-phase-07-baselines.md | Complete (testdata push operator-gated) |
 | 8. Coverage fuzz (`fuzz_amend_planners.rs`) + differential fuzz (`op_amend` in `differential-fuzz.py`) | PLAN-amend-phase-08-fuzz.md | Complete — harnesses landed; the cluster-size defect they found (core `.bss` overflow into the op region) is root-caused and fixed (see Defects) |
-| 9. Docs: `docs/amend.md`, `docs/usage.md`, `CHANGELOG.md`, `ARCHITECTURE.md`/`README.md`/`AGENTS.md`, `index.md`/`order.yml` | PLAN-amend-phase-09-docs.md | Not started |
+| 9. Docs: `docs/amend.md`, `docs/usage.md`, `CHANGELOG.md`, `ARCHITECTURE.md`/`README.md`/`AGENTS.md`, `index.md`/`order.yml` | PLAN-amend-phase-09-docs.md | Complete |
 
 ## Agent guidance
 
@@ -629,12 +629,12 @@ that this work should resolve or be aware of.
 This master plan has been added to:
 
 * **`docs/plans/index.md`** — a row in the *Master plans* table
-  (dated 2026-06-15, status *Drafted, not started*, phases listed).
+  (dated 2026-06-15, status *Complete (phases 1-9)*, phases listed).
 * **`docs/plans/order.yml`** — an entry so it appears in the docs
   navigation. Phase files are *not* added to `order.yml`.
 
-When all phases are complete, update the status column in
-`index.md` to *Complete*.
+All phases are complete; the `index.md` status column has been
+updated to *Complete*.
 
 ### Back brief
 
