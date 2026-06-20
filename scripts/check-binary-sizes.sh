@@ -30,6 +30,13 @@ CALL_TABLE_ADDR=$((0x80000))
 CORE_MAX_SIZE=$((OPERATION_BASE - CORE_BASE))           # 72KB: 0x10000..0x22000
 OPERATION_MAX_SIZE=$((CALL_TABLE_ADDR - OPERATION_BASE)) # 376KB: 0x22000..0x80000
 
+# Early-warning threshold: a binary at or above this percent of its
+# region is flagged (without failing) so the layout gets attention
+# before it overflows. The .bss overflow this check now guards against
+# was preceded by core sitting at ~99% of its old budget; a warning here
+# gives runway to act. Override with WARN_PCT=NN to tune.
+WARN_PCT=${WARN_PCT:-85}
+
 # Binary locations. The flat .bin is what the VMM loads; the ELF (no
 # extension, under the target triple dir) carries the section/segment
 # info we need for the .bss-inclusive memory extent.
@@ -87,6 +94,11 @@ check_size() {
         echo "      .bin file size is ${bin_size}B; the overflow is in .bss."
         echo "      This will cause memory overlap and VM crashes!"
         return 1
+    elif [[ "$percent" -ge "$WARN_PCT" ]]; then
+        echo "WARN: $description - ${size_kb}KB / ${max_kb}KB (${percent}%, .bin=${bin_size}B)"
+        echo "      at/over ${WARN_PCT}% of its region; shrink it or raise the"
+        echo "      memory layout in shared/src/lib.rs before it overflows."
+        return 0
     else
         echo "OK:   $description - ${size_kb}KB / ${max_kb}KB (${percent}%, .bin=${bin_size}B)"
         return 0
