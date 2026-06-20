@@ -27,7 +27,7 @@ jobs:
       is_bot: ${{ steps.check.outputs.is_bot }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
 
@@ -54,7 +54,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install Docker
         run: |
@@ -253,7 +253,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install Docker and qemu-utils
         run: |
@@ -289,7 +289,7 @@ jobs:
 
     steps:
       - name: Checkout instar
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: instar
           fetch-depth: 0
@@ -484,7 +484,7 @@ jobs:
 
     steps:
       - name: Checkout instar
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: instar
           fetch-depth: 0
@@ -578,7 +578,7 @@ jobs:
 
     steps:
       - name: Checkout instar
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: instar
           fetch-depth: 0
@@ -681,7 +681,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install Docker
         run: |
@@ -728,7 +728,7 @@ jobs:
 
     steps:
       - name: Checkout instar
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: instar
           fetch-depth: 0
@@ -823,7 +823,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
