@@ -603,7 +603,7 @@ pub fn send_commit_result(result: &shared::CommitResult) {
 ///
 /// Mirrors [`send_rebase_result`], but passes the `action` and
 /// `resulting_version` codes through numerically rather than
-/// mapping them to strings here: the core binary is at its 64 KiB
+/// mapping them to strings here: the core binary is near its 72 KiB
 /// budget ceiling, so the "noop"/"amended" and "0.10"/"1.1"
 /// rendering is done host-side from these codes (the host has no
 /// size budget). Only `target_format` keeps the shared

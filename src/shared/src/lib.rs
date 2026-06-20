@@ -323,8 +323,8 @@ macro_rules! cached_read {
 
 /// Address where the call table is located (set by core)
 /// Located at 512KB to avoid overlap with core binary (which can grow past 32KB).
-/// The core binary is loaded at 0x10000 and may extend to 0x20000 (64KB max).
-/// The operation binary is loaded at 0x20000, so we place data structures at 0x80000.
+/// The core binary is loaded at 0x10000 and may extend to 0x22000 (72KB max).
+/// The operation binary is loaded at 0x22000, so we place data structures at 0x80000.
 pub const CALL_TABLE_ADDR: usize = 0x00080000;
 
 /// Address where operation config is stored (set by VMM/core)

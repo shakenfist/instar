@@ -63,6 +63,13 @@ const HEADER_CLUSTER_LIMIT: usize = MAX_CLUSTER;
 const PLANNER_SCRATCH: usize = HEADER_CLUSTER + HEADER_CLUSTER_LIMIT;
 const PLANNER_SCRATCH_LIMIT: usize = MAX_CLUSTER;
 
+// The three scratch regions must stay inside the scratch window, below
+// the allocator heap (mirrors the rebase op's compile-time guard).
+const _: () = assert!(
+    PLANNER_SCRATCH + PLANNER_SCRATCH_LIMIT <= shared::ALLOC_HEAP_BASE,
+    "amend scratch regions overflow the scratch window / heap base"
+);
+
 fn get_call_table() -> &'static CallTable {
     unsafe { &*(CALL_TABLE_ADDR as *const CallTable) }
 }
