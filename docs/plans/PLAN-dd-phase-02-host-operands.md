@@ -3,7 +3,7 @@
 Master plan: [PLAN-dd.md](PLAN-dd.md)
 Previous phase: [PLAN-dd-phase-01-abi.md](PLAN-dd-phase-01-abi.md)
 
-## Status: Not started
+## Status: Complete (8909837 refactor, 8b55c6c host impl, 1a2cb91 tests)
 
 ## Prompt
 
