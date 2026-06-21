@@ -134,6 +134,16 @@ Future work:
 These need an operator decision before detailed phase planning.
 Each has a recommended default.
 
+**Resolved (2026-06-21):** OQ1 → **(a) reuse/extend `convert.bin`**
+(no new guest binary or config magic; `dd` builds an extended
+`ConvertConfig` with an input byte-window + dense output). OQ2 →
+**full convert format set** (raw + qcow2 + vmdk + vhd + vhdx),
+phased raw-first (ph3) then the rest (ph4). OQ3 → **instar-native
+error text, matching exit codes**. OQ4 → **defer**
+`--image-opts`/`--object`/`-U` to Future work. OQ5 → **replicate**
+the count-shrinks-only and skip-past-EOF quirks. The original
+option text is retained below for the rationale.
+
 1. **Guest-binary strategy (the load-bearing decision).** dd
    needs `convert`'s format writers (`convert_to_qcow2`,
    `convert_to_vmdk`, `convert_to_vhd`, `convert_to_vhdx`,
@@ -262,7 +272,7 @@ strategy.
 
 | Phase | Plan | Status |
 |-------|------|--------|
-| 1. Shared ABI: `DdConfig` struct (magic, flags, `bs`, `count`, `skip`, `output_format`, `output_cluster_bits`, precomputed `copy_len`/`out_vsize`), `DD_CONFIG_MAGIC` + flag constants in `src/shared/src/lib.rs`, host two-file (`if`/`of`) device plumbing, and the guest-binary strategy from Open question 1 | PLAN-dd-phase-01-abi.md | Not started |
+| 1. Shared ABI: extend `ConvertConfig` with the input byte-window (`window_start`/`window_end`) + `FLAG_DD_WINDOW` (in `src/shared/src/lib.rs`, mirrored in `src/vmm/src/main.rs`); register the `Dd` subcommand variant + `run_dd` stub. Reuses `convert.bin` per Open question 1 — no new guest binary or config magic | [PLAN-dd-phase-01-abi.md](PLAN-dd-phase-01-abi.md) | Not started (planned) |
 | 2. Host operand parser: `name=value` operands (`bs`/`count`/`skip`/`if`/`of`) + dash-opts (`-f`/`-O`), `qemu_strtosz`-equivalent size suffixes, range/validation rules and exact exit-code semantics, mapping to `DdConfig`; `Dd` variant in `Commands` + `run_dd` | PLAN-dd-phase-02-host-operands.md | Not started |
 | 3. Guest op — raw output: windowed dense byte copy to raw (generalise `copy`'s loop), `copy_len`/`out_vsize` math, short final block, skip-past-EOF empty output | PLAN-dd-phase-03-guest-raw.md | Not started |
 | 4. Guest op — format output: wire the windowed dense stream into convert's qcow2/vmdk/vhd/vhdx writers per the Open-question-1 strategy; default-options-only creation | PLAN-dd-phase-04-guest-formats.md | Not started |
