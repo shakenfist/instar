@@ -10175,9 +10175,211 @@ fn parse_create_o_options(
     Ok(out)
 }
 
-/// Run the dd operation (stub — operand parsing is implemented in phase 2).
-fn run_dd(_args: DdArgs, _verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
-    Err("dd: not yet implemented".into())
+/// Parsed and validated `dd` operands (upstream qemu-img dd parity).
+#[derive(Debug)]
+struct DdParsed {
+    /// `if=` input image path (mandatory).
+    input: String,
+    /// `of=` output image path (mandatory).
+    output: String,
+    /// `bs=` block size in bytes. Range 1..=INT_MAX; default 512.
+    bs: u64,
+    /// `count=` number of blocks to copy. `None` ⇒ whole image.
+    count: Option<u64>,
+    /// `skip=` number of blocks to skip on input. Default 0.
+    skip: u64,
+    /// Input format override from `-f` (auto-detection is still
+    /// authoritative; see `run_dd`).
+    input_format: Option<String>,
+    /// Output format override from `-O`. `None` ⇒ default raw.
+    output_format: Option<String>,
+}
+
+/// Parse `dd` `name=value` operands into a validated `DdParsed`.
+///
+/// Rules (upstream qemu-img dd parity):
+/// - Each operand is split on the FIRST `=`. A token without `=`, or with
+///   a key not in {if,of,bs,count,skip}, is an error. Last value wins on a
+///   repeated key.
+/// - `bs`/`count`/`skip` parse via `parse_qemu_img_size` (1024-based
+///   suffixes). `count`/`skip` are block counts; `bs` is bytes.
+/// - `bs` range 1..=2147483647 (INT_MAX); `bs=0` is an error; absent ⇒ 512.
+/// - `skip` absent ⇒ 0; `count` absent ⇒ None.
+/// - `if=` and `of=` are both mandatory.
+fn parse_dd_operands(
+    operands: &[String],
+    input_format: Option<String>,
+    output_format: Option<String>,
+) -> Result<DdParsed, String> {
+    let mut input: Option<String> = None;
+    let mut output: Option<String> = None;
+    let mut bs: Option<u64> = None;
+    let mut count: Option<u64> = None;
+    let mut skip: Option<u64> = None;
+
+    for tok in operands {
+        let (key, value) = match tok.split_once('=') {
+            Some(kv) => kv,
+            None => return Err(format!("dd: unrecognized operand '{tok}'")),
+        };
+        match key {
+            "if" => input = Some(value.to_string()),
+            "of" => output = Some(value.to_string()),
+            "bs" => {
+                bs = Some(parse_qemu_img_size(value).map_err(|e| format!("dd: invalid bs: {e}"))?);
+            }
+            "count" => {
+                count = Some(
+                    parse_qemu_img_size(value).map_err(|e| format!("dd: invalid count: {e}"))?,
+                );
+            }
+            "skip" => {
+                skip =
+                    Some(parse_qemu_img_size(value).map_err(|e| format!("dd: invalid skip: {e}"))?);
+            }
+            _ => return Err(format!("dd: unrecognized operand '{tok}'")),
+        }
+    }
+
+    // bs range 1..=INT_MAX; bs=0 is an error; absent ⇒ 512.
+    let bs = match bs {
+        Some(v) => {
+            if !(1..=2147483647).contains(&v) {
+                return Err(format!("dd: invalid bs: {v} (must be 1..=2147483647)"));
+            }
+            v
+        }
+        None => 512,
+    };
+
+    let input = input.ok_or_else(|| "dd: 'if=' is required".to_string())?;
+    let output = output.ok_or_else(|| "dd: 'of=' is required".to_string())?;
+
+    Ok(DdParsed {
+        input,
+        output,
+        bs,
+        count,
+        skip: skip.unwrap_or(0),
+        input_format,
+        output_format,
+    })
+}
+
+/// The input byte-window and output virtual size derived from the `dd`
+/// operands and the input's virtual size.
+struct DdWindow {
+    /// Absolute window start byte offset (`window_start`).
+    start: u64,
+    /// Absolute window end byte offset (`window_end`).
+    end: u64,
+    /// Output virtual size (`out_vsize`), `end - start` saturating.
+    out_vsize: u64,
+}
+
+/// Compute the `dd` input window and output size.
+///
+/// Exact upstream semantics — there is NO bounds rejection: out-of-range
+/// windows yield empty output, never an error.
+///
+/// - `copy_len = count.map(|c| c*bs).min(virtual_size)` (count clamps DOWN
+///   only; overflow saturates then clamps); `None` ⇒ virtual_size.
+/// - `start = skip*bs` (saturating).
+/// - `end = copy_len`; `out_vsize = end - start` (saturating).
+///
+/// So skip past EOF ⇒ start>=end ⇒ out_vsize 0; count=0 ⇒ out_vsize 0.
+fn compute_dd_window(virtual_size: u64, bs: u64, count: Option<u64>, skip: u64) -> DdWindow {
+    let copy_len = match count {
+        Some(c) => c.saturating_mul(bs).min(virtual_size),
+        None => virtual_size,
+    };
+    let start = skip.saturating_mul(bs);
+    let end = copy_len;
+    let out_vsize = end.saturating_sub(start);
+    DdWindow {
+        start,
+        end,
+        out_vsize,
+    }
+}
+
+/// Run the `dd` operation: parse operands, compute the input window from
+/// the input's virtual size, size the output accordingly, and launch the
+/// convert guest via `execute_convert` with the window set.
+///
+/// INTERMEDIATE STATE (phase 2): the window is computed host-side here but
+/// is only HONOURED by the guest as of phase 3. Until then the guest copies
+/// the whole image and the (smaller) host-sized output is truncated, so
+/// non-trivial `skip`/`count` cases are NOT yet correct end-to-end. The
+/// whole-image raw case (`start=0`, `end=virtual_size`) IS correct.
+fn run_dd(args: DdArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let parsed = parse_dd_operands(&args.operands, args.input_format, args.output_format)?;
+
+    // dd mirrors convert's I/O defaults: 64KB sector size, 10% progress.
+    let sector_size: u32 = 65536;
+    let progress_percent: u32 = 10;
+
+    // Discover the input backing chain and read its virtual size.
+    //
+    // `-f` (parsed.input_format) is accepted and validated by clap but its
+    // forcing is DEFERRED: `discover_backing_chain` auto-detects the input
+    // format and exposes no format-hint parameter, so auto-detection remains
+    // authoritative here. Forcing the input format is a small follow-up.
+    let _ = &parsed.input_format;
+    let security_config = config::load_config().config.security;
+    let chain = discover_backing_chain(Path::new(&parsed.input), sector_size, &security_config)
+        .map_err(|e| {
+            format!(
+                "error discovering backing chain for {}: {}",
+                parsed.input, e
+            )
+        })?;
+    let virtual_size = chain.images()[0].virtual_size;
+
+    let win = compute_dd_window(virtual_size, parsed.bs, parsed.count, parsed.skip);
+
+    // Output format: dd defaults to raw (1) when `-O` is absent — NOT the
+    // input format.
+    let target_format = match parsed.output_format {
+        Some(ref s) => parse_output_format(s)?,
+        None => 1u32,
+    };
+    let is_qcow2_output = target_format == 2;
+
+    // dd is DENSE: no SKIP_ZEROS, no compress, no encrypt, no extended-l2.
+    // execute_convert ORs in DD_WINDOW (and VERBOSE) itself; we pass none.
+    let flags: u32 = 0;
+
+    // Per-format defaults mirror convert's clap defaults: 64KB qcow2 cluster
+    // (cluster_bits 16), 64KB VMDK grain, VHD/VHDX block_size 0 (format
+    // default chosen downstream).
+    let output_cluster_bits: u32 = if is_qcow2_output {
+        65536u32.trailing_zeros()
+    } else {
+        0
+    };
+
+    let exec = ConvertExecution {
+        input: parsed.input,
+        output: parsed.output,
+        target_format,
+        flags,
+        output_cluster_bits,
+        output_grain_size: 65536,
+        output_block_size: 0,
+        sector_size,
+        progress_percent,
+        is_vmdk_flat_output: false,
+        no_create: false,
+        decrypt_passphrase: None,
+        luks_encrypt: None,
+        snapshot: None,
+        max_guest_memory: None,
+        window: Some((win.start, win.end)),
+        output_vsize_override: Some(win.out_vsize),
+    };
+
+    execute_convert(exec, verbose)
 }
 
 /// Run the measure operation (predict output size for a target format).
@@ -15590,5 +15792,182 @@ Offset          Length          Mapped to       File
         assert_eq!(json_escape("a\\b"), "a\\\\b");
         assert_eq!(json_escape("a\nb"), "a\\nb");
         assert_eq!(json_escape("\x07"), "\\u0007");
+    }
+}
+
+#[cfg(test)]
+mod dd_operand_tests {
+    //! Unit tests for `parse_dd_operands` and `compute_dd_window`.
+    //!
+    //! Tests live next to the parser (host-only, pure functions) rather
+    //! than in tests/ so they don't require KVM or testdata. The
+    //! whole-image end-to-end smoke test lives in tests/test_dd.py.
+    use super::*;
+
+    fn ops(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    // --- parse_dd_operands ------------------------------------------------
+
+    #[test]
+    fn if_and_of_parse() {
+        let p = parse_dd_operands(&ops(&["if=in.qcow2", "of=out.raw"]), None, None).unwrap();
+        assert_eq!(p.input, "in.qcow2");
+        assert_eq!(p.output, "out.raw");
+        assert_eq!(p.bs, 512);
+        assert_eq!(p.count, None);
+        assert_eq!(p.skip, 0);
+    }
+
+    #[test]
+    fn missing_if_is_error() {
+        let e = parse_dd_operands(&ops(&["of=out.raw"]), None, None).unwrap_err();
+        assert!(e.contains("'if='"), "unexpected error: {e}");
+    }
+
+    #[test]
+    fn missing_of_is_error() {
+        let e = parse_dd_operands(&ops(&["if=in.qcow2"]), None, None).unwrap_err();
+        assert!(e.contains("'of='"), "unexpected error: {e}");
+    }
+
+    #[test]
+    fn unknown_operand_is_error() {
+        let e = parse_dd_operands(&ops(&["if=a", "of=b", "foo=1"]), None, None).unwrap_err();
+        assert_eq!(e, "dd: unrecognized operand 'foo=1'");
+    }
+
+    #[test]
+    fn token_without_equals_is_error() {
+        let e = parse_dd_operands(&ops(&["if=a", "of=b", "bar"]), None, None).unwrap_err();
+        assert_eq!(e, "dd: unrecognized operand 'bar'");
+    }
+
+    #[test]
+    fn bs_zero_is_error() {
+        let e = parse_dd_operands(&ops(&["if=a", "of=b", "bs=0"]), None, None).unwrap_err();
+        assert!(e.contains("invalid bs"), "unexpected error: {e}");
+    }
+
+    #[test]
+    fn bs_defaults_to_512() {
+        let p = parse_dd_operands(&ops(&["if=a", "of=b"]), None, None).unwrap();
+        assert_eq!(p.bs, 512);
+    }
+
+    #[test]
+    fn bs_suffix_1m() {
+        let p = parse_dd_operands(&ops(&["if=a", "of=b", "bs=1M"]), None, None).unwrap();
+        assert_eq!(p.bs, 1048576);
+    }
+
+    #[test]
+    fn count_parsed() {
+        let p = parse_dd_operands(&ops(&["if=a", "of=b", "count=4"]), None, None).unwrap();
+        assert_eq!(p.count, Some(4));
+    }
+
+    #[test]
+    fn skip_parsed() {
+        let p = parse_dd_operands(&ops(&["if=a", "of=b", "skip=2"]), None, None).unwrap();
+        assert_eq!(p.skip, 2);
+    }
+
+    #[test]
+    fn last_value_wins_on_repeat() {
+        let p = parse_dd_operands(&ops(&["if=a", "if=c", "of=b"]), None, None).unwrap();
+        assert_eq!(p.input, "c");
+    }
+
+    #[test]
+    fn input_format_too_large_for_bs() {
+        // bs above INT_MAX is rejected.
+        let e =
+            parse_dd_operands(&ops(&["if=a", "of=b", "bs=2147483648"]), None, None).unwrap_err();
+        assert!(e.contains("invalid bs"), "unexpected error: {e}");
+    }
+
+    #[test]
+    fn formats_stored() {
+        let p = parse_dd_operands(
+            &ops(&["if=a", "of=b"]),
+            Some("qcow2".to_string()),
+            Some("raw".to_string()),
+        )
+        .unwrap();
+        assert_eq!(p.input_format.as_deref(), Some("qcow2"));
+        assert_eq!(p.output_format.as_deref(), Some("raw"));
+    }
+
+    // --- compute_dd_window ------------------------------------------------
+
+    #[test]
+    fn whole_image_window() {
+        let w = compute_dd_window(4 * 1024 * 1024, 512, None, 0);
+        assert_eq!(w.start, 0);
+        assert_eq!(w.end, 4 * 1024 * 1024);
+        assert_eq!(w.out_vsize, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn count_clamps_down_to_virtual_size() {
+        // count * bs > virtual_size ⇒ end = virtual_size.
+        let vsize = 4 * 1024 * 1024;
+        let w = compute_dd_window(vsize, 1024 * 1024, Some(100), 0);
+        assert_eq!(w.end, vsize);
+        assert_eq!(w.out_vsize, vsize);
+    }
+
+    #[test]
+    fn count_smaller_than_image() {
+        // count * bs < virtual_size ⇒ end = count * bs.
+        let vsize = 4 * 1024 * 1024;
+        let w = compute_dd_window(vsize, 1024 * 1024, Some(2), 0);
+        assert_eq!(w.start, 0);
+        assert_eq!(w.end, 2 * 1024 * 1024);
+        assert_eq!(w.out_vsize, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn count_zero_yields_empty() {
+        let w = compute_dd_window(4 * 1024 * 1024, 512, Some(0), 0);
+        assert_eq!(w.end, 0);
+        assert_eq!(w.out_vsize, 0);
+    }
+
+    #[test]
+    fn skip_within_image() {
+        let vsize = 4 * 1024 * 1024;
+        let w = compute_dd_window(vsize, 1024 * 1024, None, 1);
+        assert_eq!(w.start, 1024 * 1024);
+        assert_eq!(w.end, vsize);
+        assert_eq!(w.out_vsize, vsize - 1024 * 1024);
+    }
+
+    #[test]
+    fn skip_past_eof_yields_empty() {
+        let vsize = 4 * 1024 * 1024;
+        // skip beyond the image ⇒ start >= end ⇒ out_vsize 0 (no error).
+        let w = compute_dd_window(vsize, 1024 * 1024, None, 100);
+        assert!(w.start >= w.end);
+        assert_eq!(w.out_vsize, 0);
+    }
+
+    #[test]
+    fn count_overflow_saturates() {
+        // Huge count * bs must saturate, then clamp to virtual_size.
+        let vsize = 1024;
+        let w = compute_dd_window(vsize, u64::MAX, Some(u64::MAX), 0);
+        assert_eq!(w.end, vsize);
+        assert_eq!(w.out_vsize, vsize);
+    }
+
+    #[test]
+    fn skip_overflow_saturates() {
+        // Huge skip * bs must saturate without panicking; out_vsize 0.
+        let w = compute_dd_window(1024, u64::MAX, None, u64::MAX);
+        assert_eq!(w.start, u64::MAX);
+        assert_eq!(w.out_vsize, 0);
     }
 }
