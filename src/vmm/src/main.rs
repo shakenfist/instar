@@ -116,6 +116,9 @@ const CONVERT_CONFIG_FLAG_COMPRESS: u32 = 1 << 1;
 const CONVERT_CONFIG_FLAG_DECRYPT_AES: u32 = 1 << 2;
 const CONVERT_CONFIG_FLAG_EXTENDED_L2: u32 = 1 << 3;
 const CONVERT_CONFIG_FLAG_ENCRYPT_LUKS: u32 = 1 << 4;
+// Mirrors ConvertConfig::FLAG_DD_WINDOW in the shared crate.
+#[allow(dead_code)]
+const CONVERT_CONFIG_FLAG_DD_WINDOW: u32 = 1 << 5;
 #[allow(dead_code)]
 const CONVERT_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
 
@@ -2569,6 +2572,8 @@ enum Commands {
     Compare(CompareArgs),
     /// Convert a disk image to a different format (qcow2 -> raw)
     Convert(ConvertArgs),
+    /// dd-style block copy (qemu-img dd compatible)
+    Dd(DdArgs),
     /// Measure the size required to convert an image to a target format
     Measure(MeasureArgs),
     /// Create a new empty disk image of the given format and size
@@ -3265,6 +3270,23 @@ struct ConvertArgs {
 }
 
 #[derive(Args, Debug)]
+struct DdArgs {
+    /// Raw dd operands: if=<input>, of=<output>, bs=<blocksize>,
+    /// count=<n>, skip=<n>. Captured verbatim for the phase-2 parser.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    operands: Vec<String>,
+
+    /// Input format override (e.g. "raw", "qcow2")
+    #[arg(short = 'f', long = "input-format")]
+    input_format: Option<String>,
+
+    /// Output format override (e.g. "raw", "qcow2").
+    /// When absent, the phase-2 parser defaults to "raw".
+    #[arg(short = 'O', long = "output-format")]
+    output_format: Option<String>,
+}
+
+#[derive(Args, Debug)]
 struct MeasureArgs {
     /// Source image file. Mutually exclusive with --size.
     #[arg(conflicts_with = "size")]
@@ -3487,6 +3509,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Check(args) => run_check(args, verbose),
         Commands::Compare(args) => run_compare(args, verbose),
         Commands::Convert(args) => run_convert(args, verbose),
+        Commands::Dd(args) => run_dd(args, verbose),
         Commands::Measure(args) => run_measure(args, verbose),
         Commands::Create(args) => run_create(args, verbose),
         Commands::Resize(args) => run_resize(args, verbose),
@@ -9996,6 +10019,11 @@ fn parse_create_o_options(
     }
 
     Ok(out)
+}
+
+/// Run the dd operation (stub — operand parsing is implemented in phase 2).
+fn run_dd(_args: DdArgs, _verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    Err("dd: not yet implemented".into())
 }
 
 /// Run the measure operation (predict output size for a target format).
