@@ -934,6 +934,84 @@ class InstarTestBase(testtools.TestCase):
                 f'block_size={block_size}'
             )
 
+    def run_instar_dd(
+        self,
+        operands: list,
+        input_format: Optional[str] = None,
+        output_format: Optional[str] = None,
+        timeout: int = 60,
+    ) -> tuple:
+        """
+        Run instar dd with the given operands.
+
+        Args:
+            operands: List of dd-style operands, e.g. ['if=/path/in',
+                'of=/path/out'].
+            input_format: Optional input format override (-f flag).
+            output_format: Optional output format override (-O flag).
+            timeout: Timeout in seconds.
+
+        Returns:
+            tuple: (stdout, stderr, return_code)
+        """
+        instar = self.get_instar_binary()
+
+        cmd = [str(instar), 'dd']
+        if input_format:
+            cmd.extend(['-f', input_format])
+        if output_format:
+            cmd.extend(['-O', output_format])
+        cmd.extend(operands)
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            return result.stdout, result.stderr, result.returncode
+        except subprocess.TimeoutExpired:
+            return '', 'Timeout after {}s'.format(timeout), -1
+
+    def run_qemu_img_dd(
+        self,
+        operands: list,
+        timeout: int = 60,
+    ) -> tuple:
+        """
+        Run qemu-img dd with the given operands.
+
+        Inserts a default bs=512 operand when the caller does not
+        supply one, to match instar dd's default block size and
+        ensure byte-identical output for whole-image copies.
+
+        Args:
+            operands: List of dd-style operands, e.g. ['if=/path/in',
+                'of=/path/out'].
+            timeout: Timeout in seconds.
+
+        Returns:
+            tuple: (stdout, stderr, return_code)
+        """
+        # Ensure a bs= is present so qemu-img dd uses the same
+        # default as instar dd (512 bytes).
+        if not any(op.startswith('bs=') for op in operands):
+            operands = list(operands) + ['bs=512']
+
+        cmd = ['qemu-img', 'dd'] + operands
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            return result.stdout, result.stderr, result.returncode
+        except subprocess.TimeoutExpired:
+            return '', 'Timeout after {}s'.format(timeout), -1
+
     def run_qemu_img_convert(
         self,
         input_path: Path,
