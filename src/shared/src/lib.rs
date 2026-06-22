@@ -2331,6 +2331,11 @@ impl ConvertConfig {
         (self.flags & Self::FLAG_SKIP_ZEROS) != 0
     }
 
+    /// Check if a `dd` input window (`window_start`/`window_end`) is active.
+    pub fn has_dd_window(&self) -> bool {
+        (self.flags & Self::FLAG_DD_WINDOW) != 0
+    }
+
     /// Check if compression is enabled
     pub fn should_compress(&self) -> bool {
         (self.flags & Self::FLAG_COMPRESS) != 0

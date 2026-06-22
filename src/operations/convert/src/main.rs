@@ -452,6 +452,17 @@ pub unsafe extern "C" fn _start() -> u64 {
         None
     };
 
+    // The input window to copy. For a `dd` windowed copy this is
+    // [window_start, window_end); for normal whole-image convert it is
+    // [0, virtual_size). As of phase 3 only convert_to_raw honours this
+    // window — the structured writers (qcow2/vmdk/vhd/vhdx) still copy the
+    // whole image and ignore it (phase 4).
+    let (read_start, read_end) = if config.has_dd_window() {
+        (config.window_start, config.window_end)
+    } else {
+        (0, virtual_size)
+    };
+
     // Dispatch based on target format
     let target = config.target_format();
     match target {
@@ -567,6 +578,8 @@ pub unsafe extern "C" fn _start() -> u64 {
             aes_key.as_ref(),
             luks_key,
             luks_sector_size,
+            read_start,
+            read_end,
             &mut bytes_read,
             &layout,
         ),
@@ -1082,6 +1095,11 @@ unsafe fn convert_luks_wrapped_qcow2(
             None,
             None,
             512,
+            // dd never uses the LUKS-wrapped path, so always copy the whole
+            // inner image here (the window is honoured only on the main
+            // dispatch path for `-O raw`).
+            0,
+            inner_virtual_size,
             bytes_read,
             layout,
         ),
@@ -1467,12 +1485,18 @@ unsafe fn convert_to_raw(
     chain_config: &ChainConfig,
     chain_states: &mut qcow2::ChainStates,
     input_device_count: usize,
-    virtual_size: u64,
+    _virtual_size: u64,
     sector_size: usize,
     skip_zeros: bool,
     aes_key: Option<&[u8; 16]>,
     luks_key: Option<&[u8]>,
     luks_sector_size: u64,
+    // [read_start, read_end) is the input window to copy to output offset 0.
+    // For normal (whole-image) convert this is (0, virtual_size); for a `dd`
+    // windowed copy it is (window_start, window_end). Output sectors are
+    // addressed relative to read_start so output offset 0 maps to read_start.
+    read_start: u64,
+    read_end: u64,
     bytes_read: &mut u64,
     layout: &ScratchLayout,
 ) -> u64 {
@@ -1514,29 +1538,85 @@ unsafe fn convert_to_raw(
     let mut staging_cluster_offset: u64 = u64::MAX;
 
     let buf = layout.buf_data as *mut u8;
-    let mut virtual_offset: u64 = 0;
+    let mut virtual_offset: u64 = read_start;
     let mut last_percent: u32 = 0;
     let mut chunks_done: u64 = 0;
-    let total_chunks = (virtual_size + chunk_size - 1) / chunk_size;
+    // Span of the input window. An empty window (read_end <= read_start, e.g.
+    // count=0 or skip past EOF) skips the loop entirely and writes nothing;
+    // total_chunks is guarded to 1 so the progress division never divides by
+    // zero (the loop body never executes for an empty window).
+    let span = read_end.saturating_sub(read_start);
+    let total_chunks = if span == 0 {
+        1
+    } else {
+        (span + chunk_size - 1) / chunk_size
+    };
 
-    // When cluster_size < output_sector_size we accumulate
-    // multiple clusters into the buffer before writing.  Track
-    // how many bytes we have buffered and the virtual offset
-    // where the current accumulation started.
+    // When cluster_size < output_sector_size we accumulate multiple clusters
+    // into the buffer before writing. `accum_bytes` counts buffered bytes not
+    // yet written to output. `accum_start` is the input virtual offset that
+    // currently maps to the start of the buffer; output sectors are addressed
+    // as `(accum_start - read_start) / output_sector_size`.
+    //
+    // On a flush we write only the whole sectors that have accumulated and
+    // carry the sub-sector remainder forward (advancing `accum_start` by the
+    // bytes written). This keeps `accum_start - read_start` a whole multiple
+    // of the output sector size at every flush, so the output stays densely
+    // packed from sector 0 even when a `dd` window starts partway into a
+    // cluster (which makes the first read short). For whole-image convert the
+    // remainder is always zero, so the carry is a no-op and the output is
+    // byte-identical to before.
     let mut accum_bytes: u64 = 0;
-    let mut accum_start: u64 = 0;
+    let mut accum_start: u64 = read_start;
 
-    while virtual_offset < virtual_size {
-        let remaining = virtual_size - virtual_offset;
-        let this_chunk = if remaining < chunk_size {
+    while virtual_offset < read_end {
+        let remaining = read_end - virtual_offset;
+        let mut this_chunk = if remaining < chunk_size {
             remaining
         } else {
             chunk_size
         };
 
+        // Clamp the read so it never crosses a cluster boundary. The chain
+        // reader's Standard-cluster path reads `read_size` bytes from
+        // `host_offset + (virtual_offset % cluster_size)`; a single cluster is
+        // contiguous on the host, but adjacent virtual clusters are not, so a
+        // read that began partway into a cluster (a `dd` window whose start is
+        // not cluster-aligned) and ran past the cluster boundary would pull in
+        // the wrong host bytes. Capping the chunk to the bytes left in the
+        // current cluster keeps every read within one cluster: the first
+        // (unaligned) read is short and all subsequent reads are
+        // cluster-aligned. For whole-image convert `virtual_offset` is always
+        // cluster-aligned, so this is a no-op.
+        let intra_cluster = virtual_offset % cluster_size;
+        if intra_cluster != 0 {
+            let to_cluster_end = cluster_size - intra_cluster;
+            if to_cluster_end < this_chunk {
+                this_chunk = to_cluster_end;
+            }
+        }
+
+        // Never read more than fits in the buffer past the bytes already
+        // accumulated. A carried sub-sector remainder (from an unaligned `dd`
+        // window) sits at the front of the buffer, so a full chunk_size read
+        // appended after it could otherwise exceed buf_size; the surplus is
+        // simply read on the next iteration. For whole-image convert
+        // accum_bytes is always zero here, so this is a no-op.
+        let buf_room = layout.buf_size as u64 - accum_bytes;
+        if buf_room < this_chunk {
+            this_chunk = buf_room;
+        }
+
         // Reset bump allocator before ZSTD decompression
         HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 
+        // The chain readers are byte-accurate: they fill exactly `this_chunk`
+        // bytes starting at the (possibly sub-sector) `virtual_offset`. No
+        // round-up or floor-alignment is needed, so a `dd` window that starts
+        // or ends partway through a device sector reads the exact bytes
+        // qemu-img dd would. For whole-image convert `virtual_offset` and
+        // `this_chunk` are sector-aligned and the readers take their original
+        // fast paths, so convert output is unchanged.
         if !qcow2::read_chain_virtual_cluster(
             call_table,
             0,
@@ -1565,17 +1645,13 @@ unsafe fn convert_to_raw(
             return *bytes_read;
         }
 
-        if accum_bytes == 0 {
-            accum_start = virtual_offset;
-        }
         accum_bytes += this_chunk;
         virtual_offset += this_chunk;
         chunks_done += 1;
 
         // Flush when we've accumulated enough for an output
         // sector, or when we've reached the end of the image.
-        let should_flush =
-            accum_bytes >= output_sector_size as u64 || virtual_offset >= virtual_size;
+        let should_flush = accum_bytes >= output_sector_size as u64 || virtual_offset >= read_end;
 
         if !should_flush {
             // Report progress even when not flushing
@@ -1592,8 +1668,14 @@ unsafe fn convert_to_raw(
             continue;
         }
 
-        // Check if the entire accumulated buffer is zeros
+        // Check if the entire accumulated buffer is zeros (skip-zeros / sparse
+        // output only, which is convert, never dd). Discard the buffered bytes
+        // without writing them, advancing `accum_start` past them so following
+        // data still lands at its correct absolute output sector. For convert
+        // `accum_bytes` is exactly one output sector here, so this matches the
+        // previous behaviour.
         if skip_zeros && is_all_zeros_ptr(buf, accum_bytes as usize) {
+            accum_start += accum_bytes;
             accum_bytes = 0;
             let percent = (chunks_done * 100 / total_chunks) as u32;
             if should_report_progress(progress_interval, percent, last_percent, chunks_done) {
@@ -1608,21 +1690,34 @@ unsafe fn convert_to_raw(
             continue;
         }
 
-        // Pad any partial final sector with zeros
-        let write_size = if accum_bytes < output_sector_size as u64 {
-            let pad_start = accum_bytes as usize;
-            let pad_end = output_sector_size;
-            for i in pad_start..pad_end {
+        // Whether this is the final flush (we have reached the end of the
+        // window). Only the final flush may emit a partial (zero-padded) output
+        // sector; intermediate flushes write whole sectors and carry any
+        // sub-sector remainder forward.
+        let at_end = virtual_offset >= read_end;
+
+        let (write_size, sectors_to_write) = if at_end {
+            // Pad the final partial sector with zeros so the written sector is
+            // zero-padded past the true window end, matching qemu-img dd (the
+            // host then truncates the file to the rounded out_vsize). For
+            // whole-image convert `accum_bytes` is already a sector multiple,
+            // so the padding loop is a no-op.
+            let ws = accum_bytes.div_ceil(output_sector_size as u64) * output_sector_size as u64;
+            for i in accum_bytes as usize..ws as usize {
                 *buf.add(i) = 0;
             }
-            output_sector_size as u64
+            (ws, ws / output_sector_size as u64)
         } else {
-            accum_bytes
+            // Write only the whole sectors accumulated so far; the sub-sector
+            // remainder is carried to the next accumulation below.
+            let full = accum_bytes / output_sector_size as u64;
+            (full * output_sector_size as u64, full)
         };
 
-        let output_first_sector = accum_start / output_sector_size as u64;
-        let sectors_to_write =
-            (write_size + output_sector_size as u64 - 1) / output_sector_size as u64;
+        // Address output sectors relative to read_start. `accum_start` is the
+        // virtual offset mapped to buf[0]; it advances by whole sectors per
+        // flush, so this division is always exact.
+        let output_first_sector = (accum_start - read_start) / output_sector_size as u64;
 
         for i in 0..sectors_to_write {
             let output_sector = output_first_sector + i;
@@ -1643,7 +1738,17 @@ unsafe fn convert_to_raw(
             }
         }
 
-        accum_bytes = 0;
+        // Carry the sub-sector remainder (bytes not yet written) to the front
+        // of the buffer so it joins the next accumulation, and advance
+        // `accum_start` by the bytes flushed. On the final flush `write_size`
+        // covers everything, so the remainder is empty.
+        let written = write_size;
+        let remainder = accum_bytes.saturating_sub(written);
+        if remainder > 0 {
+            core::ptr::copy(buf.add(written as usize), buf, remainder as usize);
+        }
+        accum_start += written;
+        accum_bytes = remainder;
 
         let percent = (chunks_done * 100 / total_chunks) as u32;
         if should_report_progress(progress_interval, percent, last_percent, chunks_done) {

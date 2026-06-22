@@ -9078,10 +9078,20 @@ fn execute_convert(
             true, // always sparse for structured formats
         )?
     } else {
+        // Raw output. The guest addresses the output in whole sectors and
+        // writes a full (zero-padded) final sector when out_vsize is not a
+        // multiple of the output sector size — as happens for a windowed dd
+        // copy. The virtio device advertises capacity rounded up to a whole
+        // sector (div_ceil), so the backing store must accept that final
+        // padded sector too; otherwise the guest's last write is rejected
+        // (write beyond capacity) and the conversion stalls. Round the
+        // backing capacity up to the output sector size; the file is
+        // truncated back to out_vsize after the guest finishes.
+        let raw_capacity = out_vsize.div_ceil(exec.sector_size as u64) * exec.sector_size as u64;
         BackingStore::open(
             &output_file_path,
             false,
-            Some(out_vsize),
+            Some(raw_capacity),
             // sparse when skipping zeros (default: true)
             skip_zeros,
         )?
@@ -9593,12 +9603,28 @@ fn execute_convert(
         );
     }
 
-    // For sparse raw output, truncate to the output virtual size so the
-    // apparent file size matches the image's virtual size (same as
-    // qemu-img convert behavior). For convert out_vsize == virtual_size.
-    if skip_zeros && !is_structured_output && flat_extent_path.is_none() {
-        let f = std::fs::OpenOptions::new().write(true).open(&exec.output)?;
-        f.set_len(out_vsize)?;
+    // Truncate raw output to its final size.
+    //
+    // For sparse convert output, that is the output virtual size, so the
+    // apparent file size matches the image's virtual size (same as qemu-img
+    // convert). For convert out_vsize == virtual_size.
+    //
+    // For a windowed dd copy the contract differs: qemu-img dd rounds the
+    // output file size UP to a 512-byte (sector) boundary and zero-pads the
+    // final partial block, so a 1000-byte window yields a 1024-byte file. The
+    // guest already writes that padded final sector; the device capacity was
+    // rounded up so the write was accepted. Truncate to the rounded size
+    // (not the exact out_vsize) so the result is byte- and size-identical to
+    // qemu-img dd. An empty window (out_vsize == 0) rounds to 0 -> 0-byte file.
+    if !is_structured_output && flat_extent_path.is_none() {
+        if exec.window.is_some() {
+            let rounded = out_vsize.div_ceil(exec.sector_size as u64) * exec.sector_size as u64;
+            let f = std::fs::OpenOptions::new().write(true).open(&exec.output)?;
+            f.set_len(rounded)?;
+        } else if skip_zeros {
+            let f = std::fs::OpenOptions::new().write(true).open(&exec.output)?;
+            f.set_len(out_vsize)?;
+        }
     }
 
     // For monolithicFlat output, truncate the flat extent file to
@@ -10307,16 +10333,22 @@ fn compute_dd_window(virtual_size: u64, bs: u64, count: Option<u64>, skip: u64) 
 /// the input's virtual size, size the output accordingly, and launch the
 /// convert guest via `execute_convert` with the window set.
 ///
-/// INTERMEDIATE STATE (phase 2): the window is computed host-side here but
-/// is only HONOURED by the guest as of phase 3. Until then the guest copies
-/// the whole image and the (smaller) host-sized output is truncated, so
-/// non-trivial `skip`/`count` cases are NOT yet correct end-to-end. The
-/// whole-image raw case (`start=0`, `end=virtual_size`) IS correct.
+/// As of phase 3 the guest honours the window for raw output: windowed
+/// `skip`/`count`/`bs` copies are byte- and size-identical to `qemu-img dd`,
+/// including sub-sector-aligned windows and short final blocks. Windowed dd to
+/// a non-raw output format still copies the whole image (phase 4).
 fn run_dd(args: DdArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     let parsed = parse_dd_operands(&args.operands, args.input_format, args.output_format)?;
 
-    // dd mirrors convert's I/O defaults: 64KB sector size, 10% progress.
-    let sector_size: u32 = 65536;
+    // dd uses a 512-byte device sector size, which is also the output sector
+    // size for raw output. qemu-img dd rounds its output file size up to a
+    // 512-byte boundary (zero-padding the final block), so the guest must
+    // address output in 512-byte sectors for the file size to match; a larger
+    // sector size would over-round the output (e.g. a 1000-byte window would
+    // become a 64 KiB file instead of 1024 bytes). The chain readers are
+    // byte-accurate regardless of sector size, so an unaligned sub-512
+    // window_start is still read at the exact byte.
+    let sector_size: u32 = 512;
     let progress_percent: u32 = 10;
 
     // Discover the input backing chain and read its virtual size.

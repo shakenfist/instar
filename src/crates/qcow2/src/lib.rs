@@ -2615,7 +2615,18 @@ impl Qcow2State {
 // Cluster data reading
 // ============================================================================
 
-/// Read a standard (uncompressed) cluster's data sector by sector.
+/// Read `cluster_size` bytes starting at the byte offset `host_offset`,
+/// byte-accurately.
+///
+/// Neither `host_offset` nor `cluster_size` need be a multiple of
+/// `sector_size`: the covering boundary sectors are read through a stack
+/// scratch and only the requested byte run is copied into `buf`, while full
+/// interior sectors are read straight in. This lets callers request an
+/// arbitrary sub-sector window (as a non-cluster-aligned `dd` window does).
+///
+/// When `host_offset` is sector-aligned and `cluster_size` is a multiple of
+/// `sector_size`, the original whole-sector-into-`buf` fast path runs and is
+/// byte-identical to before, so whole-image convert is unaffected.
 ///
 /// # Safety
 ///
@@ -2630,39 +2641,14 @@ pub unsafe fn read_cluster_sectors(
     sector_size: usize,
     bytes_read: &mut u64,
 ) -> bool {
-    let first_sector = host_offset / sector_size as u64;
-    let offset_in_sector = (host_offset % sector_size as u64) as usize;
+    let ssz = sector_size as u64;
+    let first_sector = host_offset / ssz;
+    let offset_in_sector = (host_offset % ssz) as usize;
 
-    if cluster_size < sector_size as u64 {
-        // The cluster fits inside a single sector.  Read the
-        // sector, then copy only the cluster's bytes to the
-        // caller's buffer so that buf[0] contains the first
-        // byte of the cluster, not the first byte of the
-        // sector.
-        //
-        // We use a stack buffer for the sector read.  The
-        // caller's buffer is at least MAX_SECTOR_SIZE, but we
-        // must not clobber bytes beyond cluster_size because
-        // the caller may be accumulating multiple clusters
-        // into the same buffer.
-        let mut sector_buf = [0u8; MAX_SECTOR_SIZE];
-        if !(call_table.read_input_sector)(
-            device_idx,
-            first_sector,
-            sector_buf.as_mut_ptr(),
-            sector_size,
-        ) {
-            return false;
-        }
-        *bytes_read += sector_size as u64;
-        core::ptr::copy_nonoverlapping(
-            sector_buf.as_ptr().add(offset_in_sector),
-            buf,
-            cluster_size as usize,
-        );
-    } else {
-        // Cluster spans one or more full sectors.
-        let sectors_per_cluster = cluster_size / sector_size as u64;
+    // Fast path: sector-aligned start and a whole number of sectors. This is
+    // the whole-image convert path and must stay byte-identical.
+    if offset_in_sector == 0 && cluster_size >= ssz && cluster_size.is_multiple_of(ssz) {
+        let sectors_per_cluster = cluster_size / ssz;
         for i in 0..sectors_per_cluster {
             let sector = first_sector + i;
             let buf_offset = (i as usize) * sector_size;
@@ -2670,8 +2656,52 @@ pub unsafe fn read_cluster_sectors(
             {
                 return false;
             }
-            *bytes_read += sector_size as u64;
+            *bytes_read += ssz;
         }
+        return true;
+    }
+
+    // Byte-accurate path. Walk the covering sectors, reading boundary
+    // (partial) sectors through a scratch and copying only the requested
+    // bytes; full interior sectors read straight into `buf`.
+    let mut sector = first_sector;
+    let mut produced: u64 = 0;
+    let mut sector_off = offset_in_sector as u64;
+    let mut scratch = [0u8; MAX_SECTOR_SIZE];
+
+    while produced < cluster_size {
+        let avail = ssz - sector_off;
+        let want = core::cmp::min(avail, cluster_size - produced);
+
+        if sector_off == 0 && want == ssz {
+            if !(call_table.read_input_sector)(
+                device_idx,
+                sector,
+                buf.add(produced as usize),
+                sector_size,
+            ) {
+                return false;
+            }
+        } else {
+            if !(call_table.read_input_sector)(
+                device_idx,
+                sector,
+                scratch.as_mut_ptr(),
+                sector_size,
+            ) {
+                return false;
+            }
+            core::ptr::copy_nonoverlapping(
+                scratch.as_ptr().add(sector_off as usize),
+                buf.add(produced as usize),
+                want as usize,
+            );
+        }
+
+        *bytes_read += ssz;
+        produced += want;
+        sector += 1;
+        sector_off = 0;
     }
     true
 }
@@ -4855,15 +4885,24 @@ pub unsafe fn lookup_refcount(
 // Chain-walking cluster reading
 // ============================================================================
 
-/// Read raw sectors from a device for a given virtual offset range.
+/// Read exactly `[virtual_offset, virtual_offset + chunk_size)` bytes from a
+/// device into `buf`, byte-accurately.
 ///
-/// Reads `chunk_size / sector_size` consecutive sectors starting at
-/// `virtual_offset`. If the device is smaller than the requested range,
-/// the remainder is zero-filled.
+/// `virtual_offset` and `chunk_size` need not be multiples of `sector_size`.
+/// The device is read in whole `sector_size` units (the only granularity the
+/// call table exposes); when the requested range starts partway into a sector
+/// or ends partway into one, the covering boundary sectors are read into a
+/// stack scratch and only the requested bytes are copied out, so callers may
+/// pass an arbitrary sub-sector window (as `dd skip=`/`count=` does). Any part
+/// of the range at or beyond the device capacity is zero-filled.
+///
+/// Aligned reads (sector-aligned `virtual_offset`, `chunk_size` a multiple of
+/// `sector_size`) take the original whole-sector-into-`buf` fast path and are
+/// byte-identical to before, so whole-image convert is unaffected.
 ///
 /// # Safety
 ///
-/// `buf` must point to at least `chunk_size` writable bytes.
+/// `buf` must point to at least `max(chunk_size, sector_size)` writable bytes.
 /// `call_table` must be valid.
 pub unsafe fn read_raw_sectors(
     call_table: &CallTable,
@@ -4875,30 +4914,92 @@ pub unsafe fn read_raw_sectors(
     input_capacity: u64,
     bytes_read: &mut u64,
 ) -> bool {
-    let first_sector = virtual_offset / sector_size as u64;
-    // Ensure at least one sector is read when chunk_size < sector_size.
-    // The caller's buffer is always >= MAX_SECTOR_SIZE.
-    let read_size = if chunk_size < sector_size as u64 {
-        sector_size as u64
-    } else {
-        chunk_size
-    };
-    let sectors_per_chunk = read_size / sector_size as u64;
+    let ssz = sector_size as u64;
+    let offset_in_sector = (virtual_offset % ssz) as usize;
 
-    for i in 0..sectors_per_chunk {
-        let sector = first_sector + i;
+    // Fast path: the requested range is sector-aligned at both ends, so every
+    // sector can be read straight into `buf`. This is the whole-image convert
+    // path and must stay byte-identical to the original implementation.
+    if offset_in_sector == 0 && chunk_size.is_multiple_of(ssz) {
+        let first_sector = virtual_offset / ssz;
+        // Ensure at least one sector is read when chunk_size < sector_size.
+        // The caller's buffer is always >= MAX_SECTOR_SIZE.
+        let read_size = if chunk_size < ssz { ssz } else { chunk_size };
+        let sectors_per_chunk = read_size / ssz;
+
+        for i in 0..sectors_per_chunk {
+            let sector = first_sector + i;
+            if sector >= input_capacity {
+                // Beyond file: fill remainder with zeros
+                let remaining = ((sectors_per_chunk - i) as usize) * sector_size;
+                let dest = buf.add((i as usize) * sector_size);
+                core::ptr::write_bytes(dest, 0, remaining);
+                break;
+            }
+            let buf_offset = (i as usize) * sector_size;
+            if !(call_table.read_input_sector)(device_idx, sector, buf.add(buf_offset), sector_size)
+            {
+                return false;
+            }
+            *bytes_read += ssz;
+        }
+        return true;
+    }
+
+    // Byte-accurate path for a sub-sector window. Walk the covering sectors,
+    // reading boundary (partial) sectors through a scratch and copying only
+    // the requested bytes, and full interior sectors straight into `buf`.
+    let mut sector = virtual_offset / ssz;
+    let mut produced: u64 = 0; // bytes written into buf so far
+    let mut sector_off = offset_in_sector as u64; // offset into the current sector
+    let mut scratch = [0u8; MAX_SECTOR_SIZE];
+
+    while produced < chunk_size {
+        // Number of bytes this sector contributes to the output range.
+        let avail = ssz - sector_off;
+        let want = core::cmp::min(avail, chunk_size - produced);
+
         if sector >= input_capacity {
-            // Beyond file: fill remainder with zeros
-            let remaining = ((sectors_per_chunk - i) as usize) * sector_size;
-            let dest = buf.add((i as usize) * sector_size);
-            core::ptr::write_bytes(dest, 0, remaining);
+            // Past the end of the device: zero-fill the rest of the range.
+            core::ptr::write_bytes(
+                buf.add(produced as usize),
+                0,
+                (chunk_size - produced) as usize,
+            );
             break;
         }
-        let buf_offset = (i as usize) * sector_size;
-        if !(call_table.read_input_sector)(device_idx, sector, buf.add(buf_offset), sector_size) {
-            return false;
+
+        if sector_off == 0 && want == ssz {
+            // Whole sector lands entirely in the output; read straight in.
+            if !(call_table.read_input_sector)(
+                device_idx,
+                sector,
+                buf.add(produced as usize),
+                sector_size,
+            ) {
+                return false;
+            }
+        } else {
+            // Partial sector: read into scratch, copy the wanted byte run.
+            if !(call_table.read_input_sector)(
+                device_idx,
+                sector,
+                scratch.as_mut_ptr(),
+                sector_size,
+            ) {
+                return false;
+            }
+            core::ptr::copy_nonoverlapping(
+                scratch.as_ptr().add(sector_off as usize),
+                buf.add(produced as usize),
+                want as usize,
+            );
         }
-        *bytes_read += sector_size as u64;
+
+        *bytes_read += ssz;
+        produced += want;
+        sector += 1;
+        sector_off = 0;
     }
     true
 }
