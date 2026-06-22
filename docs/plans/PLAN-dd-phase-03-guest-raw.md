@@ -3,7 +3,27 @@
 Master plan: [PLAN-dd.md](PLAN-dd.md)
 Previous phase: [PLAN-dd-phase-02-host-operands.md](PLAN-dd-phase-02-host-operands.md)
 
-## Status: Not started
+## Status: Complete (4375324 impl, 814197e tests)
+
+> **Implementation note (correcting the Design below).** The Design
+> section assumed `read_chain_virtual_cluster` reads arbitrary
+> unaligned offsets. That was **wrong**: `read_raw_sectors` (and the
+> multi-sector branch of `read_cluster_sectors`) floored the start to
+> a 512-byte sector and dropped sub-sector tails, so a window whose
+> start/end was not 512-aligned (only possible when `bs` is not a
+> multiple of 512) read the wrong bytes. Per the operator's choice of
+> full arbitrary-`bs` parity, this was fixed at the **root cause**:
+> both primitives now read an arbitrary sub-sector byte range
+> (covering boundary sectors via a scratch, exact-byte copy), with the
+> sector-aligned fast path byte-identical so other readers are
+> unaffected. `convert_to_raw` uses a carry scheme (write whole output
+> sectors per flush, carry the sub-sector remainder) and the host sizes
+> dd raw output to `round_up(out_vsize, 512)` (qemu-img dd's rule,
+> verified empirically). Result: windowed `dd -O raw` is byte- AND
+> size-identical to `qemu-img dd` for any `bs`. **For phase 4:** the
+> read primitives are already byte-accurate, so the structured writers
+> only need the read-loop windowing + output-metadata/size handling,
+> not another reader fix.
 
 ## Prompt
 
