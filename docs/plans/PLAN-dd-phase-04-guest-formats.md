@@ -3,7 +3,23 @@
 Master plan: [PLAN-dd.md](PLAN-dd.md)
 Previous phase: [PLAN-dd-phase-03-guest-raw.md](PLAN-dd-phase-03-guest-raw.md)
 
-## Status: Not started
+## Status: Complete (d10e5b1 impl, c3cd396 tests)
+
+> **Outcome.** All six structured writers honour the window;
+> `instar dd -O qcow2|vmdk|vpc|vhdx` matches `qemu-img dd` on data
+> and declared virtual size (round-trip-to-raw verified for aligned,
+> non-512-end, and sub-sector windows on raw + qcow2 inputs).
+> Per-format declared sizes: qcow2/vmdk/vhdx `round_up(out_vsize,
+> 512)`; VHD CHS-rounded via the new `vhd::chs_rounded_size` (the
+> Design's assumption that instar's existing geometry helper matched
+> qemu was **wrong** — it floors; fixed at root). dd uses a 64 KB
+> device sector size for structured output (the VHD/VHDX block path
+> assumes `oss == MAX_SECTOR_SIZE`) and 512 for raw.
+> **Known limitation:** `count=0 -O vhdx` (empty window) produces a
+> VHDX that `qemu-img info` rejects (no data, exits 0); qemu's empty
+> VHDX is readable. The empty vmdk case matches qemu (qemu's own
+> `count=0 -O vmdk` exits 1). Tracked in the master plan's Future
+> work and for phase-9 differential fuzzing.
 
 ## Prompt
 
