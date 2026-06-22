@@ -10340,15 +10340,37 @@ fn compute_dd_window(virtual_size: u64, bs: u64, count: Option<u64>, skip: u64) 
 fn run_dd(args: DdArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     let parsed = parse_dd_operands(&args.operands, args.input_format, args.output_format)?;
 
-    // dd uses a 512-byte device sector size, which is also the output sector
-    // size for raw output. qemu-img dd rounds its output file size up to a
-    // 512-byte boundary (zero-padding the final block), so the guest must
-    // address output in 512-byte sectors for the file size to match; a larger
-    // sector size would over-round the output (e.g. a 1000-byte window would
-    // become a 64 KiB file instead of 1024 bytes). The chain readers are
-    // byte-accurate regardless of sector size, so an unaligned sub-512
-    // window_start is still read at the exact byte.
-    let sector_size: u32 = 512;
+    // Output format: dd defaults to raw (1) when `-O` is absent — NOT the
+    // input format.
+    let target_format = match parsed.output_format {
+        Some(ref s) => parse_output_format(s)?,
+        None => 1u32,
+    };
+    let is_qcow2_output = target_format == 2;
+    let is_structured_output = matches!(target_format, 2 | 3 | 5 | 6);
+
+    // Device sector size for the conversion.
+    //
+    // RAW output uses a 512-byte device sector size, which is also the output
+    // sector size. qemu-img dd rounds its raw output file size up to a 512-byte
+    // boundary (zero-padding the final block), so the guest must address output
+    // in 512-byte sectors for the file size to match; a larger sector size
+    // would over-round the output (e.g. a 1000-byte window would become a
+    // 64 KiB file instead of 1024 bytes).
+    //
+    // STRUCTURED output (qcow2/vmdk/vpc/vhdx) uses the same 64KB sector size as
+    // `convert`: the structured writers assemble whole MAX_SECTOR_SIZE output
+    // sectors (the VHD/VHDX block path in particular assumes oss ==
+    // MAX_SECTOR_SIZE), and the declared virtual size / data is sized from the
+    // byte-granular window, not the device sector size, so the windowing is
+    // unaffected. The chain readers are byte-accurate regardless of sector
+    // size, so an unaligned sub-sector window_start is still read at the exact
+    // byte.
+    let sector_size: u32 = if is_structured_output {
+        MAX_SECTOR_SIZE
+    } else {
+        512
+    };
     let progress_percent: u32 = 10;
 
     // Discover the input backing chain and read its virtual size.
@@ -10369,14 +10391,6 @@ fn run_dd(args: DdArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>>
     let virtual_size = chain.images()[0].virtual_size;
 
     let win = compute_dd_window(virtual_size, parsed.bs, parsed.count, parsed.skip);
-
-    // Output format: dd defaults to raw (1) when `-O` is absent — NOT the
-    // input format.
-    let target_format = match parsed.output_format {
-        Some(ref s) => parse_output_format(s)?,
-        None => 1u32,
-    };
-    let is_qcow2_output = target_format == 2;
 
     // dd is DENSE: no SKIP_ZEROS, no compress, no encrypt, no extended-l2.
     // execute_convert ORs in DD_WINDOW (and VERBOSE) itself; we pass none.

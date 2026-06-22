@@ -297,6 +297,62 @@ pub fn compute_vhd_geometry(size: u64) -> (u16, u8, u8) {
     (cylinders as u16, heads as u8, sectors_per_track as u8)
 }
 
+/// Compute the CHS-rounded virtual size that `qemu-img dd -O vpc`
+/// declares for an arbitrary output size.
+///
+/// `qemu-img dd`/`qemu-img create` round the requested size up to the
+/// next whole CHS geometry (cylinders × heads × sectors_per_track ×
+/// 512) and store that rounded value as the footer's current_size,
+/// which is what `qemu-img info` reports as the virtual size.
+///
+/// This differs from [`compute_vhd_geometry`], which floors and is
+/// only correct when called on an already CHS-aligned size. This
+/// function uses qemu's round-up (ceil) divisions and a one-cylinder
+/// minimum so that, for example, `3000 -> 34816` (= 1×4×17×512),
+/// matching `qemu-img dd 10.0.8`.
+///
+/// Feeding the result back through [`compute_vhd_geometry`] reproduces
+/// the same size exactly (the rounded size is CHS-aligned, so floor ==
+/// ceil), so the footer geometry fields stay consistent.
+pub fn chs_rounded_size(size: u64) -> u64 {
+    // An empty window (size 0) has no CHS geometry; qemu-img dd produces a
+    // 0-virtual-size VHD for count=0, so return 0 rather than the
+    // one-cylinder minimum.
+    if size == 0 {
+        return 0;
+    }
+    // Round bytes up to whole sectors, as qemu does.
+    let mut total_sectors = size.div_ceil(512);
+
+    let max_sectors: u64 = 65535 * 16 * 255;
+    if total_sectors > max_sectors {
+        total_sectors = max_sectors;
+    }
+    if total_sectors >= 65535 * 16 * 63 {
+        return 65535u64 * 16 * 255 * 512;
+    }
+
+    let mut sectors_per_track: u64 = 17;
+    let mut cyl_times_heads = total_sectors.div_ceil(sectors_per_track);
+    let mut heads = cyl_times_heads.div_ceil(1024);
+    if heads < 4 {
+        heads = 4;
+    }
+    if cyl_times_heads >= heads * 1024 || heads > 16 {
+        sectors_per_track = 31;
+        heads = 16;
+        cyl_times_heads = total_sectors.div_ceil(sectors_per_track);
+    }
+    if cyl_times_heads >= heads * 1024 {
+        sectors_per_track = 63;
+        heads = 16;
+        cyl_times_heads = total_sectors.div_ceil(sectors_per_track);
+    }
+
+    let cylinders = cyl_times_heads.div_ceil(heads).max(1);
+    cylinders * heads * sectors_per_track * 512
+}
+
 // ============================================================================
 // Allocation scanning — pure helper
 // ============================================================================
