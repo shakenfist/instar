@@ -977,6 +977,7 @@ class InstarTestBase(testtools.TestCase):
     def run_qemu_img_dd(
         self,
         operands: list,
+        output_format: Optional[str] = None,
         timeout: int = 60,
     ) -> tuple:
         """
@@ -989,6 +990,7 @@ class InstarTestBase(testtools.TestCase):
         Args:
             operands: List of dd-style operands, e.g. ['if=/path/in',
                 'of=/path/out'].
+            output_format: Optional output format override (-O flag).
             timeout: Timeout in seconds.
 
         Returns:
@@ -999,7 +1001,10 @@ class InstarTestBase(testtools.TestCase):
         if not any(op.startswith('bs=') for op in operands):
             operands = list(operands) + ['bs=512']
 
-        cmd = ['qemu-img', 'dd'] + operands
+        cmd = ['qemu-img', 'dd']
+        if output_format:
+            cmd.extend(['-O', output_format])
+        cmd.extend(operands)
 
         try:
             result = subprocess.run(
