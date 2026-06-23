@@ -3,7 +3,21 @@
 Master plan: [PLAN-dd.md](PLAN-dd.md)
 Previous phase: [PLAN-dd-phase-07-baselines.md](PLAN-dd-phase-07-baselines.md)
 
-## Status: Not started
+## Status: Complete (8a 1ddb0c5, 8b 46f8a71)
+
+> **Outcome.** 8a: extracted `compute_dd_window` + `DdWindow` into a
+> new `no_std` `crates/dd` library crate (8 tests moved, run_dd
+> rewired). 8b: added `fuzz_dd_window`, `fuzz_chs_rounded_size`,
+> `fuzz_dd_read` (read primitives via mock CallTable); registered in
+> `src/fuzz/Cargo.toml` + the `coverage-fuzz.yml` target list (count
+> reconciled to the real 26 targets). `make fuzz-build` compiles
+> all; each smoke-ran 30s with no crash (~40M runs for the math
+> targets). The fuzz oracle is live — three over-strong first-draft
+> invariants crashed and were corrected (CHS 127.5 GiB ceiling cap;
+> `compute_vhd_geometry` floors so exact round-trip isn't universal;
+> zero-length reads out of domain) — all inherent behaviour, no code
+> bugs. `fuzz_dd_operands` intentionally omitted (CLI parsing isn't
+> fuzzed for any command).
 
 ## Prompt
 
