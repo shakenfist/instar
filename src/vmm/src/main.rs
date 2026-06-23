@@ -35,6 +35,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use dd::compute_dd_window;
 use guest_protocol::{
     decode_framed, encode_vmm_config_framed, guest_, vmm_config, vmm_config_chain,
     vmm_config_chain_with_output, vmm_config_input_only, FRAME_HEADER_SIZE,
@@ -10292,43 +10293,6 @@ fn parse_dd_operands(
     })
 }
 
-/// The input byte-window and output virtual size derived from the `dd`
-/// operands and the input's virtual size.
-struct DdWindow {
-    /// Absolute window start byte offset (`window_start`).
-    start: u64,
-    /// Absolute window end byte offset (`window_end`).
-    end: u64,
-    /// Output virtual size (`out_vsize`), `end - start` saturating.
-    out_vsize: u64,
-}
-
-/// Compute the `dd` input window and output size.
-///
-/// Exact upstream semantics — there is NO bounds rejection: out-of-range
-/// windows yield empty output, never an error.
-///
-/// - `copy_len = count.map(|c| c*bs).min(virtual_size)` (count clamps DOWN
-///   only; overflow saturates then clamps); `None` ⇒ virtual_size.
-/// - `start = skip*bs` (saturating).
-/// - `end = copy_len`; `out_vsize = end - start` (saturating).
-///
-/// So skip past EOF ⇒ start>=end ⇒ out_vsize 0; count=0 ⇒ out_vsize 0.
-fn compute_dd_window(virtual_size: u64, bs: u64, count: Option<u64>, skip: u64) -> DdWindow {
-    let copy_len = match count {
-        Some(c) => c.saturating_mul(bs).min(virtual_size),
-        None => virtual_size,
-    };
-    let start = skip.saturating_mul(bs);
-    let end = copy_len;
-    let out_vsize = end.saturating_sub(start);
-    DdWindow {
-        start,
-        end,
-        out_vsize,
-    }
-}
-
 /// Run the `dd` operation: parse operands, compute the input window from
 /// the input's virtual size, size the output accordingly, and launch the
 /// convert guest via `execute_convert` with the window set.
@@ -15964,11 +15928,12 @@ mod dd_format_tests {
 
 #[cfg(test)]
 mod dd_operand_tests {
-    //! Unit tests for `parse_dd_operands` and `compute_dd_window`.
+    //! Unit tests for `parse_dd_operands`.
     //!
     //! Tests live next to the parser (host-only, pure functions) rather
     //! than in tests/ so they don't require KVM or testdata. The
     //! whole-image end-to-end smoke test lives in tests/test_dd.py.
+    //! (The `compute_dd_window` window-math tests live in the `dd` crate.)
     use super::*;
 
     fn ops(v: &[&str]) -> Vec<String> {
@@ -16065,76 +16030,5 @@ mod dd_operand_tests {
         .unwrap();
         assert_eq!(p.input_format.as_deref(), Some("qcow2"));
         assert_eq!(p.output_format.as_deref(), Some("raw"));
-    }
-
-    // --- compute_dd_window ------------------------------------------------
-
-    #[test]
-    fn whole_image_window() {
-        let w = compute_dd_window(4 * 1024 * 1024, 512, None, 0);
-        assert_eq!(w.start, 0);
-        assert_eq!(w.end, 4 * 1024 * 1024);
-        assert_eq!(w.out_vsize, 4 * 1024 * 1024);
-    }
-
-    #[test]
-    fn count_clamps_down_to_virtual_size() {
-        // count * bs > virtual_size ⇒ end = virtual_size.
-        let vsize = 4 * 1024 * 1024;
-        let w = compute_dd_window(vsize, 1024 * 1024, Some(100), 0);
-        assert_eq!(w.end, vsize);
-        assert_eq!(w.out_vsize, vsize);
-    }
-
-    #[test]
-    fn count_smaller_than_image() {
-        // count * bs < virtual_size ⇒ end = count * bs.
-        let vsize = 4 * 1024 * 1024;
-        let w = compute_dd_window(vsize, 1024 * 1024, Some(2), 0);
-        assert_eq!(w.start, 0);
-        assert_eq!(w.end, 2 * 1024 * 1024);
-        assert_eq!(w.out_vsize, 2 * 1024 * 1024);
-    }
-
-    #[test]
-    fn count_zero_yields_empty() {
-        let w = compute_dd_window(4 * 1024 * 1024, 512, Some(0), 0);
-        assert_eq!(w.end, 0);
-        assert_eq!(w.out_vsize, 0);
-    }
-
-    #[test]
-    fn skip_within_image() {
-        let vsize = 4 * 1024 * 1024;
-        let w = compute_dd_window(vsize, 1024 * 1024, None, 1);
-        assert_eq!(w.start, 1024 * 1024);
-        assert_eq!(w.end, vsize);
-        assert_eq!(w.out_vsize, vsize - 1024 * 1024);
-    }
-
-    #[test]
-    fn skip_past_eof_yields_empty() {
-        let vsize = 4 * 1024 * 1024;
-        // skip beyond the image ⇒ start >= end ⇒ out_vsize 0 (no error).
-        let w = compute_dd_window(vsize, 1024 * 1024, None, 100);
-        assert!(w.start >= w.end);
-        assert_eq!(w.out_vsize, 0);
-    }
-
-    #[test]
-    fn count_overflow_saturates() {
-        // Huge count * bs must saturate, then clamp to virtual_size.
-        let vsize = 1024;
-        let w = compute_dd_window(vsize, u64::MAX, Some(u64::MAX), 0);
-        assert_eq!(w.end, vsize);
-        assert_eq!(w.out_vsize, vsize);
-    }
-
-    #[test]
-    fn skip_overflow_saturates() {
-        // Huge skip * bs must saturate without panicking; out_vsize 0.
-        let w = compute_dd_window(1024, u64::MAX, None, u64::MAX);
-        assert_eq!(w.start, u64::MAX);
-        assert_eq!(w.out_vsize, 0);
     }
 }
