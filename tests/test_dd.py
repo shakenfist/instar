@@ -742,3 +742,524 @@ class TestDdStructuredWindow(InstarTestBase):
             ['bs=65536', 'count=0'],
             label='count_zero',
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase-6a: CLI rejection matrix
+# ---------------------------------------------------------------------------
+
+class TestDdErrors(InstarTestBase):
+    """Phase-6a: CLI rejection parity matrix for ``instar dd``.
+
+    Each test case verifies that ``instar dd`` exits non-zero for an
+    invalid invocation.  For cases where ``qemu-img dd`` is given the
+    same (well-formed except for the one bad field) arguments, the test
+    also asserts that qemu-img dd exits non-zero (rejection parity).
+    The error *text* may differ between the two tools.
+
+    A single 1 MiB raw image and 1 MiB qcow2 image are created in
+    setUp() for cases that require valid if=/of= paths.
+    """
+
+    def setUp(self):
+        """Create small valid input images for rejection tests."""
+        super().setUp()
+        self._raw_tmp = tempfile.NamedTemporaryFile(suffix='.raw')
+        self._qcow2_tmp = tempfile.NamedTemporaryFile(suffix='.qcow2')
+        subprocess.run(
+            ['qemu-img', 'create', '-f', 'raw', self._raw_tmp.name, '1M'],
+            capture_output=True, check=True,
+        )
+        subprocess.run(
+            ['qemu-img', 'create', '-f', 'qcow2', self._qcow2_tmp.name, '1M'],
+            capture_output=True, check=True,
+        )
+
+    def tearDown(self):
+        """Clean up input images."""
+        self._raw_tmp.close()
+        self._qcow2_tmp.close()
+        super().tearDown()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _assert_both_reject(self, operands, label, output_format=None):
+        """Assert that instar dd and qemu-img dd both exit non-zero.
+
+        *operands* must contain all of if=, of=, and the bad field.
+        The output path must be a real temporary file so neither tool
+        trips over a missing destination.
+        """
+        with tempfile.NamedTemporaryFile(suffix='.out') as out:
+            instar_ops = [
+                op.replace('of=__OUT__', f'of={out.name}')
+                for op in operands
+            ]
+            qemu_ops = [
+                op.replace('of=__OUT__', f'of={out.name}')
+                for op in operands
+            ]
+
+            _, stderr, rc = self.run_instar_dd(
+                instar_ops, output_format=output_format,
+            )
+            self.assertNotEqual(
+                rc, 0,
+                f'[{label}] instar dd should have rejected; '
+                f'stderr={stderr!r}',
+            )
+
+            _, q_stderr, q_rc = self.run_qemu_img_dd(
+                qemu_ops, output_format=output_format,
+            )
+            self.assertNotEqual(
+                q_rc, 0,
+                f'[{label}] qemu-img dd should have rejected '
+                f'(rejection parity); stderr={q_stderr!r}',
+            )
+
+    # ------------------------------------------------------------------
+    # Test cases
+    # ------------------------------------------------------------------
+
+    def test_reject_bs_zero(self):
+        """bs=0 is rejected by both instar and qemu-img dd.
+
+        The helper injects bs=512 only when no bs= operand is present.
+        Because we explicitly pass bs=0 here, no injection occurs.
+        """
+        raw = self._raw_tmp.name
+        self._assert_both_reject(
+            [f'if={raw}', 'of=__OUT__', 'bs=0'],
+            label='bs=0',
+        )
+
+    def test_reject_bs_over_int_max(self):
+        """bs=2147483648 (> INT_MAX) is rejected by both instar and qemu-img dd."""
+        raw = self._raw_tmp.name
+        self._assert_both_reject(
+            [f'if={raw}', 'of=__OUT__', 'bs=2147483648'],
+            label='bs=2147483648',
+        )
+
+    def test_reject_unknown_operand(self):
+        """An unknown key=value operand (foo=1) is rejected by both tools."""
+        raw = self._raw_tmp.name
+        self._assert_both_reject(
+            [f'if={raw}', 'of=__OUT__', 'bs=512', 'foo=1'],
+            label='unknown_operand',
+        )
+
+    def test_reject_no_equals_token(self):
+        """A bare token with no '=' (bar) is rejected by both tools.
+
+        Empirically verified: qemu-img dd also treats a token without
+        '=' as an unrecognised operand and exits non-zero.
+        """
+        raw = self._raw_tmp.name
+        self._assert_both_reject(
+            [f'if={raw}', 'of=__OUT__', 'bs=512', 'bar'],
+            label='no_equals_token',
+        )
+
+    def test_reject_missing_if(self):
+        """Missing if= (only of= given) is rejected by both tools."""
+        with tempfile.NamedTemporaryFile(suffix='.out') as out:
+            _, stderr, rc = self.run_instar_dd(
+                [f'of={out.name}', 'bs=512'],
+            )
+            self.assertNotEqual(
+                rc, 0,
+                f'instar dd should have rejected missing if=; '
+                f'stderr={stderr!r}',
+            )
+
+            _, q_stderr, q_rc = self.run_qemu_img_dd(
+                [f'of={out.name}', 'bs=512'],
+            )
+            self.assertNotEqual(
+                q_rc, 0,
+                f'qemu-img dd should have rejected missing if= '
+                f'(rejection parity); stderr={q_stderr!r}',
+            )
+
+    def test_reject_missing_of(self):
+        """Missing of= (only if= given) is rejected by both tools."""
+        raw = self._raw_tmp.name
+        _, stderr, rc = self.run_instar_dd(
+            [f'if={raw}', 'bs=512'],
+        )
+        self.assertNotEqual(
+            rc, 0,
+            f'instar dd should have rejected missing of=; '
+            f'stderr={stderr!r}',
+        )
+
+        _, q_stderr, q_rc = self.run_qemu_img_dd(
+            [f'if={raw}', 'bs=512'],
+        )
+        self.assertNotEqual(
+            q_rc, 0,
+            f'qemu-img dd should have rejected missing of= '
+            f'(rejection parity); stderr={q_stderr!r}',
+        )
+
+    def test_reject_unknown_output_format(self):
+        """An unknown -O format (bogus) is rejected by both tools."""
+        raw = self._raw_tmp.name
+        self._assert_both_reject(
+            [f'if={raw}', 'of=__OUT__', 'bs=512'],
+            label='unknown_output_format',
+            output_format='bogus',
+        )
+
+
+# ---------------------------------------------------------------------------
+# Phase-6b: -O default is raw (not the input format)
+# ---------------------------------------------------------------------------
+
+class TestDdOutputDefault(InstarTestBase):
+    """Phase-6b: omitting -O produces raw output even from a qcow2 input.
+
+    qemu-img dd (and instar dd, by parity) always defaults the output
+    format to raw regardless of the input format.  This test makes that
+    invariant explicit:
+
+      - Run ``instar dd if=<qcow2> of=<out>`` with no -O flag.
+      - Assert ``qemu-img info --output=json <out>`` reports
+        ``format == "raw"`` (not ``"qcow2"``).
+      - Assert the bytes equal the output of ``qemu-img dd`` run with
+        the same omission (also raw by default).
+    """
+
+    def test_output_default_is_raw(self):
+        """Omitting -O on a qcow2 input produces a raw (not qcow2) output."""
+        with (
+            tempfile.NamedTemporaryFile(suffix='.qcow2') as qcow2,
+            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
+            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+        ):
+            # Create a patterned qcow2 input so the output is not all-zeros.
+            _make_patterned_image(qcow2.name, 'qcow2')
+
+            # Run instar dd with NO -O flag.
+            stdout, stderr, rc = self.run_instar_dd(
+                [f'if={qcow2.name}', f'of={instar_out.name}', 'bs=512'],
+            )
+            self.assertEqual(
+                rc, 0,
+                f'instar dd (no -O) failed: stderr={stderr!r}',
+            )
+
+            # Assert the output format is raw (not qcow2).
+            info_result = subprocess.run(
+                ['qemu-img', 'info', '--output=json', instar_out.name],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(
+                info_result.returncode, 0,
+                f'qemu-img info failed: {info_result.stderr}',
+            )
+            info = json.loads(info_result.stdout)
+            self.assertEqual(
+                info.get('format'), 'raw',
+                f'Expected format=raw but got format={info.get("format")!r}; '
+                f'instar dd must default to raw output even from a qcow2 input.',
+            )
+
+            # Run qemu-img dd with the same omission for cross-validation.
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_dd(
+                [f'if={qcow2.name}', f'of={qemu_out.name}', 'bs=512'],
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img dd (no -O) failed: stderr={q_stderr!r}',
+            )
+
+            # Both outputs must be byte-identical.
+            instar_bytes = _bytes_of(instar_out.name)
+            qemu_bytes = _bytes_of(qemu_out.name)
+            self.assertEqual(
+                instar_bytes,
+                qemu_bytes,
+                f'instar dd (no -O) output differs from qemu-img dd '
+                f'(instar={len(instar_bytes)} B, qemu={len(qemu_bytes)} B)',
+            )
+
+
+# ---------------------------------------------------------------------------
+# Phase-6b: input-format coverage
+# ---------------------------------------------------------------------------
+
+def _make_patterned_raw(path: str) -> None:
+    """Create a 1 MiB patterned raw image (reuses _make_patterned_image layout).
+
+    Identical layout to _make_patterned_image for 'raw', extracted here so
+    TestDdInputFormats can convert it to other formats.
+    """
+    _make_patterned_image(path, 'raw')
+
+
+class TestDdInputFormats(InstarTestBase):
+    """Phase-6b: input-format coverage for ``instar dd``.
+
+    dd inherits convert's input read path (auto-detection + backing-chain
+    composition).  Every existing dd test feeds a raw or qcow2 input.
+    This class confirms that dd also reads vmdk, vhd (vpc), vhdx, and
+    a backing-chain qcow2 correctly, producing byte-identical output to
+    ``qemu-img dd`` with the same window.
+
+    One window (bs=65536 skip=2 count=4) is used per input format --
+    windowing logic is format-independent on the read side; this validates
+    auto-detection + read for each format.
+
+    Input images are built fresh for each test method.
+    """
+
+    # Shared window: 4 blocks of 64 KiB starting at block 2 (byte offset 128 KiB).
+    # This window crosses both patterned regions in a 1 MiB image:
+    #   0xAA at offset 0 (block 0),  0x55 at offset 256 KiB (block 4).
+    # skip=2 start lands at 128 KiB (zeros), count=4 ends at 384 KiB (into 0x55).
+    _WINDOW = ['bs=65536', 'skip=2', 'count=4']
+
+    # ------------------------------------------------------------------
+    # Internal helper
+    # ------------------------------------------------------------------
+
+    def _assert_input_fmt_parity(
+        self, src_path: str, fmt: str, label: str,
+    ) -> None:
+        """Assert byte-identical output between instar dd and qemu-img dd.
+
+        Both tools auto-detect the input format; -O raw is passed
+        explicitly so the output is always raw (comparable byte-for-byte).
+        """
+        with (
+            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
+            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+        ):
+            stdout, stderr, rc = self.run_instar_dd(
+                [f'if={src_path}', f'of={instar_out.name}'] + self._WINDOW,
+                output_format='raw',
+            )
+            self.assertEqual(
+                rc, 0,
+                f'[{label}] instar dd -O raw failed: stderr={stderr!r}',
+            )
+
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_dd(
+                [f'if={src_path}', f'of={qemu_out.name}'] + self._WINDOW,
+                output_format='raw',
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'[{label}] qemu-img dd -O raw failed: stderr={q_stderr!r}',
+            )
+
+            instar_bytes = _bytes_of(instar_out.name)
+            qemu_bytes = _bytes_of(qemu_out.name)
+            self.assertEqual(
+                instar_bytes,
+                qemu_bytes,
+                f'[{label}] instar dd output differs from qemu-img dd '
+                f'(instar={len(instar_bytes)} B, qemu={len(qemu_bytes)} B)',
+            )
+
+    # ------------------------------------------------------------------
+    # Test cases
+    # ------------------------------------------------------------------
+
+    def test_input_vmdk(self):
+        """dd reads a vmdk input and produces byte-identical output to qemu-img dd."""
+        with (
+            tempfile.NamedTemporaryFile(suffix='.raw') as raw,
+            tempfile.NamedTemporaryFile(suffix='.vmdk') as vmdk,
+        ):
+            _make_patterned_raw(raw.name)
+            result = subprocess.run(
+                ['qemu-img', 'convert', '-O', 'vmdk', raw.name, vmdk.name],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img convert to vmdk failed: {result.stderr}',
+            )
+            self._assert_input_fmt_parity(vmdk.name, 'vmdk', label='vmdk')
+
+    def test_input_vpc(self):
+        """dd reads a vhd (vpc) input and produces byte-identical output to qemu-img dd."""
+        with (
+            tempfile.NamedTemporaryFile(suffix='.raw') as raw,
+            tempfile.NamedTemporaryFile(suffix='.vpc') as vpc,
+        ):
+            _make_patterned_raw(raw.name)
+            result = subprocess.run(
+                ['qemu-img', 'convert', '-O', 'vpc', raw.name, vpc.name],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img convert to vpc failed: {result.stderr}',
+            )
+            self._assert_input_fmt_parity(vpc.name, 'vpc', label='vpc')
+
+    def test_input_vhdx(self):
+        """dd reads a vhdx input and produces byte-identical output to qemu-img dd."""
+        with (
+            tempfile.NamedTemporaryFile(suffix='.raw') as raw,
+            tempfile.NamedTemporaryFile(suffix='.vhdx') as vhdx,
+        ):
+            _make_patterned_raw(raw.name)
+            result = subprocess.run(
+                ['qemu-img', 'convert', '-O', 'vhdx', raw.name, vhdx.name],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img convert to vhdx failed: {result.stderr}',
+            )
+            self._assert_input_fmt_parity(vhdx.name, 'vhdx', label='vhdx')
+
+    def test_input_backing_chain_qcow2(self):
+        """dd composes a qcow2 backing chain and matches qemu-img dd byte-for-byte.
+
+        Layout:
+          base.qcow2   -- 4 MiB; 0xAA written at offset 0 (first 64 KiB).
+          overlay.qcow2 -- 4 MiB backed by base; 0xBB written at offset
+                           262144 (256 KiB, second 64 KiB block).
+
+        The composed view (overlay resolved against base) has 0xAA at 0
+        and 0xBB at 256 KiB.  The window (bs=65536 skip=0 count=5) reads
+        the first 320 KiB, capturing both layers so neither 0xAA nor 0xBB
+        are zero-masked by the other.
+
+        This confirms that dd composes the chain via discover_backing_chain
+        the same way as convert, exactly matching qemu-img dd's output.
+        """
+        import os
+        import shutil
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            base_path = os.path.join(tmpdir, 'base.qcow2')
+            overlay_path = os.path.join(tmpdir, 'overlay.qcow2')
+
+            # Build base: 0xAA at offset 0.
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2', base_path, '4M'],
+                capture_output=True, check=True,
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'qcow2', '-c', 'write -P 0xAA 0 65536',
+                 base_path],
+                capture_output=True, check=True,
+            )
+
+            # Build overlay over base: 0xBB at offset 256 KiB (distinct
+            # from 0xAA in base so composed view differs from either layer).
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-b', base_path, '-F', 'qcow2', overlay_path, '4M'],
+                capture_output=True, check=True,
+            )
+            subprocess.run(
+                ['qemu-io', '-f', 'qcow2', '-c',
+                 'write -P 0xBB 262144 65536', overlay_path],
+                capture_output=True, check=True,
+            )
+
+            # Window covers first 320 KiB: sees 0xAA (base) and 0xBB (overlay).
+            window = ['bs=65536', 'skip=0', 'count=5']
+
+            with (
+                tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
+                tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+            ):
+                stdout, stderr, rc = self.run_instar_dd(
+                    [f'if={overlay_path}', f'of={instar_out.name}'] + window,
+                    output_format='raw',
+                )
+                self.assertEqual(
+                    rc, 0,
+                    f'[backing-chain] instar dd -O raw failed: stderr={stderr!r}',
+                )
+
+                q_stdout, q_stderr, q_rc = self.run_qemu_img_dd(
+                    [f'if={overlay_path}', f'of={qemu_out.name}'] + window,
+                    output_format='raw',
+                )
+                self.assertEqual(
+                    q_rc, 0,
+                    f'[backing-chain] qemu-img dd -O raw failed: '
+                    f'stderr={q_stderr!r}',
+                )
+
+                instar_bytes = _bytes_of(instar_out.name)
+                qemu_bytes = _bytes_of(qemu_out.name)
+
+                # Verify both layers are visible in the composed output.
+                self.assertEqual(
+                    instar_bytes[0:4], b'\xaa\xaa\xaa\xaa',
+                    '[backing-chain] 0xAA base pattern not visible at offset 0',
+                )
+                self.assertEqual(
+                    instar_bytes[262144:262148], b'\xbb\xbb\xbb\xbb',
+                    '[backing-chain] 0xBB overlay pattern not visible at '
+                    'offset 262144',
+                )
+
+                # Byte-identical to qemu-img dd.
+                self.assertEqual(
+                    instar_bytes,
+                    qemu_bytes,
+                    f'[backing-chain] instar dd output differs from qemu-img dd '
+                    f'(instar={len(instar_bytes)} B, qemu={len(qemu_bytes)} B)',
+                )
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_input_format_flag_accepted(self):
+        """``-f raw`` is accepted on a raw input and output matches qemu-img dd.
+
+        This documents that -f (input format hint) is accepted by instar dd.
+        We do not assert forcing semantics (auto-detection is authoritative);
+        we only confirm that passing -f does not cause an error and that the
+        output matches qemu-img dd (which uses auto-detection).
+        """
+        with (
+            tempfile.NamedTemporaryFile(suffix='.raw') as raw,
+            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
+            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+        ):
+            _make_patterned_raw(raw.name)
+            window = ['bs=65536', 'skip=0', 'count=2']
+
+            stdout, stderr, rc = self.run_instar_dd(
+                [f'if={raw.name}', f'of={instar_out.name}'] + window,
+                input_format='raw',
+                output_format='raw',
+            )
+            self.assertEqual(
+                rc, 0,
+                f'instar dd -f raw -O raw failed: stderr={stderr!r}',
+            )
+
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_dd(
+                [f'if={raw.name}', f'of={qemu_out.name}'] + window,
+                output_format='raw',
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img dd -O raw failed: stderr={q_stderr!r}',
+            )
+
+            instar_bytes = _bytes_of(instar_out.name)
+            qemu_bytes = _bytes_of(qemu_out.name)
+            self.assertEqual(
+                instar_bytes,
+                qemu_bytes,
+                f'instar dd -f raw output differs from qemu-img dd '
+                f'(instar={len(instar_bytes)} B, qemu={len(qemu_bytes)} B)',
+            )
