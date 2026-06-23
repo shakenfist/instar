@@ -3,7 +3,26 @@
 Master plan: [PLAN-dd.md](PLAN-dd.md)
 Previous phase: [PLAN-dd-phase-06-integration.md](PLAN-dd-phase-06-integration.md)
 
-## Status: Not started
+## Status: Complete (test 6ebe645; testdata baselines pending operator push)
+
+> **Outcome.** 7a: added `dd` to the testdata `generate-baselines.py`
+> (`DD_CASES`, `generate_dd_baseline` mirroring resize) + a
+> `baselines-dd` Makefile target, and registered `dd-info-json` in
+> `detect-profiles.py` (the assumption it handled arbitrary types was
+> wrong — `MULTI_BUCKET_TYPES` needed the entry). 7b: generated 1440
+> baselines across 80 qemu versions → 80 profiles (one per version,
+> like `create` — qemu's info-JSON format drifts per version) +
+> `version-map.json`. 7c (`6ebe645`): `tests/test_dd_baselines.py`
+> compares instar dd's result info to the qemu baseline for the
+> host's profile — 16 cases compared, 3 skipped (count=0 vmdk: qemu
+> exits 1; two vhdx: pre-existing 32-vs-8 MiB block-size writer
+> divergence, not a dd bug). 7d docs folded into phase 10 (holistic
+> dd docs).
+>
+> **Operator step:** the testdata repo changes (generator +
+> `detect-profiles.py` + the generated `expected-outputs/dd-info-json/`
+> tree) are committed on a branch there and need review + push to the
+> protected `main` ([[testdata-push-token]]).
 
 ## Prompt
 
