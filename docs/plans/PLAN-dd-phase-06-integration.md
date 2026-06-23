@@ -3,7 +3,14 @@
 Master plan: [PLAN-dd.md](PLAN-dd.md)
 Previous phase: [PLAN-dd-phase-05-rust-tests.md](PLAN-dd-phase-05-rust-tests.md)
 
-## Status: Not started
+## Status: Complete (b6cffd2)
+
+> **Outcome.** 13 tests added (TestDdErrors 7, TestDdOutputDefault
+> 1, TestDdInputFormats 5); 30 dd tests total, all pass; convert
+> 201/0. Parity finding: all seven rejection cases exit non-zero in
+> **both** instar and qemu-img dd (no accept/reject divergence),
+> including the bare `=`-less token. dd correctly reads vmdk/vhd/
+> vhdx and backing-chain qcow2 inputs.
 
 ## Prompt
 
