@@ -145,11 +145,11 @@ jobs:
             DURATION=${INPUT_DURATION}
             TARGETS=${INPUT_TARGETS}
 
-            # Count targets (default 22 if all)
+            # Count targets (default 26 if all)
             if [ -n "$TARGETS" ]; then
               N_TARGETS=$(echo "$TARGETS" | tr ',' '\n' | wc -l)
             else
-              N_TARGETS=22
+              N_TARGETS=26
             fi
 
             # Cap duration so total fits in 450 min (30 min headroom)
@@ -170,10 +170,12 @@ jobs:
             echo "duration=15" >> $GITHUB_OUTPUT
             echo "targets=" >> $GITHUB_OUTPUT
           else
-            # schedule (nightly) — 1200s × 22 targets = 440 min,
-            # fits the 480 min timeout with setup headroom (1500s
-            # stopped fitting once the target list passed 18)
-            echo "duration=1200" >> $GITHUB_OUTPUT
+            # schedule (nightly) — 1080s × 26 targets = 468 min, fits
+            # the 480 min timeout with setup headroom. (This branch does
+            # not apply the workflow_dispatch MAX_DURATION cap, so the
+            # per-target duration is sized by hand against N_TARGETS;
+            # bump it down whenever the target list grows.)
+            echo "duration=1080" >> $GITHUB_OUTPUT
             echo "targets=" >> $GITHUB_OUTPUT
           fi
 
@@ -234,6 +236,9 @@ jobs:
               fuzz_snapshot_parse
               fuzz_snapshot_refcount
               fuzz_check_repair
+              fuzz_dd_window
+              fuzz_chs_rounded_size
+              fuzz_dd_read
             )
           fi
 
