@@ -32,6 +32,7 @@ COMMAND_OUTPUT_DIRS = {
     'create': 'create-info',       # create-info-json (json-only, no human variant)
     'map': 'map',                  # map-human, map-json (PLAN-map phase 6)
     'snapshot-list': 'snapshot-list',  # snapshot-list-human (PLAN-snapshot phase 11)
+    'dd': 'dd-info',               # dd-info-json (PLAN-dd phase 7)
 }
 
 
