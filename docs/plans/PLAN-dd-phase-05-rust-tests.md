@@ -3,7 +3,16 @@
 Master plan: [PLAN-dd.md](PLAN-dd.md)
 Previous phase: [PLAN-dd-phase-04-guest-formats.md](PLAN-dd-phase-04-guest-formats.md)
 
-## Status: Not started
+## Status: Complete (44faa76)
+
+> **Outcome.** 26 hermetic unit tests added (vhd 3, qcow2 9, vmm
+> 14); `make test-rust` 0-fail. The qcow2 read-primitive tests were
+> confirmed non-tautological (mutating the copy flips five to
+> FAILED). One nuance: the `chs_rounded_size` CHS self-consistency
+> property holds for all but the very large sizes (≳ the spt=255
+> CHS region), where CHS cannot represent the size exactly — the
+> qemu-match table still covers those, matching qemu's own
+> behaviour.
 
 ## Prompt
 
