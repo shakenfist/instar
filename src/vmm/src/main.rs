@@ -15842,6 +15842,127 @@ Offset          Length          Mapped to       File
 }
 
 #[cfg(test)]
+mod dd_format_tests {
+    //! Unit tests for `parse_output_format` and `compute_output_capacity`.
+    //!
+    //! Pure-function tests; no KVM or testdata required.
+    use super::*;
+
+    // --- parse_output_format -------------------------------------------------
+
+    #[test]
+    fn parse_output_format_raw() {
+        assert_eq!(parse_output_format("raw").unwrap(), 1u32);
+    }
+
+    #[test]
+    fn parse_output_format_qcow2() {
+        assert_eq!(parse_output_format("qcow2").unwrap(), 2u32);
+    }
+
+    #[test]
+    fn parse_output_format_vmdk() {
+        assert_eq!(parse_output_format("vmdk").unwrap(), 3u32);
+    }
+
+    #[test]
+    fn parse_output_format_vpc() {
+        assert_eq!(parse_output_format("vpc").unwrap(), 5u32);
+    }
+
+    #[test]
+    fn parse_output_format_vhdx() {
+        assert_eq!(parse_output_format("vhdx").unwrap(), 6u32);
+    }
+
+    #[test]
+    fn parse_output_format_unknown_is_error() {
+        assert!(parse_output_format("bogus").is_err());
+        assert!(parse_output_format("").is_err());
+        assert!(parse_output_format("RAW").is_err()); // case-sensitive
+    }
+
+    // --- compute_output_capacity ---------------------------------------------
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn capacity_raw_is_vsize_unchanged() {
+        // Raw format: no headroom, capacity == vsize.
+        assert_eq!(compute_output_capacity(1, 0), 0);
+        assert_eq!(compute_output_capacity(1, MIB), MIB);
+        assert_eq!(compute_output_capacity(1, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn capacity_qcow2_exceeds_vsize() {
+        // QCOW2 (format 2) adds vsize/100 + 10 MiB headroom.
+        let vsize = MIB;
+        let expected = vsize + vsize / 100 + 10 * MIB;
+        assert_eq!(compute_output_capacity(2, vsize), expected);
+        // Must be strictly greater than vsize for non-zero input.
+        assert!(compute_output_capacity(2, vsize) > vsize);
+    }
+
+    #[test]
+    fn capacity_qcow2_zero_vsize() {
+        // With vsize=0, headroom is still 10 MiB (only the +1% term is 0).
+        assert_eq!(compute_output_capacity(2, 0), 10 * MIB);
+    }
+
+    #[test]
+    fn capacity_vmdk_exceeds_vsize() {
+        // VMDK (format 3) uses the same formula as QCOW2.
+        let vsize = MIB;
+        let expected = vsize + vsize / 100 + 10 * MIB;
+        assert_eq!(compute_output_capacity(3, vsize), expected);
+        assert!(compute_output_capacity(3, vsize) > vsize);
+    }
+
+    #[test]
+    fn capacity_vhd_exceeds_vsize() {
+        // VHD/VPC (format 5) uses the same formula as QCOW2.
+        let vsize = MIB;
+        let expected = vsize + vsize / 100 + 10 * MIB;
+        assert_eq!(compute_output_capacity(5, vsize), expected);
+        assert!(compute_output_capacity(5, vsize) > vsize);
+    }
+
+    #[test]
+    fn capacity_vhdx_rounds_to_32mib_blocks() {
+        // VHDX (format 6): round vsize up to 32 MiB boundary, add 10 MiB.
+        let block: u64 = 32 * MIB;
+
+        // 1 MiB input → ceil to 1 block (32 MiB) + 10 MiB = 42 MiB.
+        assert_eq!(compute_output_capacity(6, MIB), block + 10 * MIB);
+
+        // Exactly one block stays at one block.
+        assert_eq!(compute_output_capacity(6, block), block + 10 * MIB);
+
+        // One byte over a block → two blocks + 10 MiB.
+        assert_eq!(compute_output_capacity(6, block + 1), 2 * block + 10 * MIB);
+    }
+
+    #[test]
+    fn capacity_vhdx_zero_vsize() {
+        // vsize=0 → 0 blocks rounded up = 0, plus 10 MiB overhead.
+        assert_eq!(compute_output_capacity(6, 0), 10 * MIB);
+    }
+
+    #[test]
+    fn capacity_structured_formats_all_exceed_vsize_for_nonzero_input() {
+        // All structured formats must produce capacity > vsize when vsize > 0.
+        for fmt in [2u32, 3, 5, 6] {
+            let cap = compute_output_capacity(fmt, MIB);
+            assert!(
+                cap > MIB,
+                "format {fmt}: capacity {cap} should exceed vsize {MIB}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod dd_operand_tests {
     //! Unit tests for `parse_dd_operands` and `compute_dd_window`.
     //!

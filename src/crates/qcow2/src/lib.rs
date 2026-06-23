@@ -4736,6 +4736,257 @@ mod tests {
         let table = table_with(&[]);
         assert_eq!(find_snapshot(&table, b"1"), None);
     }
+
+    // ---- Byte-accurate read primitives (read_raw_sectors /
+    //      read_cluster_sectors) -------------------------------------
+    //
+    // Phase 3 rewrote these two shared read primitives to serve
+    // arbitrary sub-sector byte ranges, keeping a sector-aligned fast
+    // path byte-identical and adding a byte-accurate scratch-and-copy
+    // path for unaligned / partial windows. These tests pin both paths
+    // to a deterministic, position-dependent device pattern so any
+    // regression (e.g. dropping a partial tail, or mis-offsetting into
+    // a multi-sector cluster) fails fast without KVM or testdata.
+
+    /// Sector size used by the read-primitive tests. Small so cases are
+    /// easy to reason about by hand.
+    const READ_TEST_SSZ: usize = 512;
+
+    /// Deterministic, position-dependent device byte at absolute offset
+    /// `o`. 251 is prime and < 256, so the pattern has period 251 (not a
+    /// multiple of the 512-byte sector size); a sector- or
+    /// cluster-misaligned copy therefore cannot accidentally match.
+    fn read_test_pattern_byte(o: u64) -> u8 {
+        (o % 251) as u8
+    }
+
+    /// Device capacity, in `READ_TEST_SSZ` sectors, that the read-test
+    /// `read_input_sector` mock serves. Set per-test under the lock.
+    static mut READ_TEST_CAPACITY_SECTORS: u64 = 0;
+
+    /// Serialize tests that touch the `READ_TEST_CAPACITY_SECTORS`
+    /// global. The mock callback is an `extern "C" fn` and can only
+    /// close over `'static` state, hence the global + lock (mirrors the
+    /// `STREAMING_FIXTURE` / `STREAMING_LOCK` pattern above).
+    static READ_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Mock `read_input_sector`: fills `out_buf` with the device pattern
+    /// for `[sector*sector_size, (sector+1)*sector_size)`. Returns false
+    /// for any sector at/beyond the configured capacity, so a caller
+    /// reading past the end (which it must avoid by zero-filling itself)
+    /// would surface as a failure rather than fabricated bytes.
+    unsafe extern "C" fn read_test_sector(
+        _device_idx: u32,
+        sector: u64,
+        out_buf: *mut u8,
+        sector_size: usize,
+    ) -> bool {
+        if sector >= READ_TEST_CAPACITY_SECTORS {
+            return false;
+        }
+        let base = sector * sector_size as u64;
+        for i in 0..sector_size {
+            *out_buf.add(i) = read_test_pattern_byte(base + i as u64);
+        }
+        true
+    }
+
+    fn read_test_call_table() -> shared::CallTable {
+        shared::CallTable {
+            read_input_sector: read_test_sector,
+            ..stub_call_table()
+        }
+    }
+
+    /// The reference bytes a correct read of `[offset, offset+len)`
+    /// must produce: the device pattern where the range lies within
+    /// `capacity_sectors * READ_TEST_SSZ`, and zero past the device end.
+    fn read_test_expected(offset: u64, len: usize, capacity_sectors: u64) -> std::vec::Vec<u8> {
+        let capacity = capacity_sectors * READ_TEST_SSZ as u64;
+        let mut out = std::vec::Vec::with_capacity(len);
+        for i in 0..len as u64 {
+            let abs = offset + i;
+            if abs < capacity {
+                out.push(read_test_pattern_byte(abs));
+            } else {
+                out.push(0);
+            }
+        }
+        out
+    }
+
+    /// Drive `read_raw_sectors` for `[virtual_offset, virtual_offset +
+    /// chunk_size)` against a device of `capacity_sectors` and assert
+    /// every returned byte equals the reference pattern (zero past end).
+    /// Also asserts `bytes_read` advanced by a whole number of sectors.
+    fn check_read_raw(virtual_offset: u64, chunk_size: u64, capacity_sectors: u64) {
+        let _guard = READ_TEST_LOCK.lock().unwrap();
+        unsafe {
+            READ_TEST_CAPACITY_SECTORS = capacity_sectors;
+        }
+        let call_table = read_test_call_table();
+
+        // Buffer must hold at least max(chunk_size, sector_size) bytes
+        // per the safety contract; pad generously and sentinel it.
+        let buf_len = core::cmp::max(chunk_size as usize, READ_TEST_SSZ) + 64;
+        let mut buf = std::vec![0xAAu8; buf_len];
+        let mut bytes_read: u64 = 0;
+
+        let ok = unsafe {
+            read_raw_sectors(
+                &call_table,
+                0,
+                virtual_offset,
+                buf.as_mut_ptr(),
+                chunk_size,
+                READ_TEST_SSZ,
+                capacity_sectors,
+                &mut bytes_read,
+            )
+        };
+        assert!(ok, "read_raw_sectors returned false");
+
+        let expected = read_test_expected(virtual_offset, chunk_size as usize, capacity_sectors);
+        assert_eq!(
+            &buf[..chunk_size as usize],
+            &expected[..],
+            "read_raw_sectors bytes mismatch at offset={virtual_offset} len={chunk_size}"
+        );
+        // Device I/O happens in whole sectors only.
+        assert!(
+            bytes_read.is_multiple_of(READ_TEST_SSZ as u64),
+            "bytes_read {bytes_read} not a sector multiple"
+        );
+        // Bytes past the requested range must be untouched.
+        assert!(
+            buf[chunk_size as usize..].iter().all(|&b| b == 0xAA),
+            "read_raw_sectors wrote past the requested range"
+        );
+    }
+
+    /// Drive `read_cluster_sectors` for `[host_offset, host_offset +
+    /// cluster_size)` and assert every returned byte equals the
+    /// reference pattern. `read_cluster_sectors` has no past-capacity
+    /// handling of its own (callers only pass in-range host offsets),
+    /// so the device is sized to cover the whole range here.
+    fn check_read_cluster(host_offset: u64, cluster_size: u64, capacity_sectors: u64) {
+        let _guard = READ_TEST_LOCK.lock().unwrap();
+        unsafe {
+            READ_TEST_CAPACITY_SECTORS = capacity_sectors;
+        }
+        let call_table = read_test_call_table();
+
+        let buf_len = core::cmp::max(cluster_size as usize, READ_TEST_SSZ) + 64;
+        let mut buf = std::vec![0xAAu8; buf_len];
+        let mut bytes_read: u64 = 0;
+
+        let ok = unsafe {
+            read_cluster_sectors(
+                &call_table,
+                0,
+                host_offset,
+                buf.as_mut_ptr(),
+                cluster_size,
+                READ_TEST_SSZ,
+                &mut bytes_read,
+            )
+        };
+        assert!(ok, "read_cluster_sectors returned false");
+
+        let expected = read_test_expected(host_offset, cluster_size as usize, capacity_sectors);
+        assert_eq!(
+            &buf[..cluster_size as usize],
+            &expected[..],
+            "read_cluster_sectors bytes mismatch at host_offset={host_offset} len={cluster_size}"
+        );
+        assert!(
+            bytes_read.is_multiple_of(READ_TEST_SSZ as u64),
+            "bytes_read {bytes_read} not a sector multiple"
+        );
+        assert!(
+            buf[cluster_size as usize..].iter().all(|&b| b == 0xAA),
+            "read_cluster_sectors wrote past the requested range"
+        );
+    }
+
+    // -- read_raw_sectors --------------------------------------------
+
+    #[test]
+    fn read_raw_aligned_fast_path() {
+        // Offset and length both sector multiples: the fast path reads
+        // whole sectors straight into buf. Multi-sector read starting
+        // mid-device.
+        check_read_raw(2 * 512, 4 * 512, 32);
+    }
+
+    #[test]
+    fn read_raw_sub_sector_start() {
+        // Offset 600 = sector 1 + 88 bytes in. Exercises the partial
+        // head-sector scratch-and-copy.
+        check_read_raw(600, 512, 32);
+    }
+
+    #[test]
+    fn read_raw_sub_sector_length_tail() {
+        // Sector-aligned start, length not a sector multiple. Dropping
+        // the partial tail was the phase-3 bug; len=300 and len=1000
+        // both leave a non-zero tail that must be copied.
+        check_read_raw(0, 300, 32);
+        check_read_raw(512, 1000, 32);
+    }
+
+    #[test]
+    fn read_raw_full_span() {
+        // [600, 2100): partial head sector (600..1024), full interior
+        // sector (1024..1536, 1536..2048), partial tail sector
+        // (2048..2100) — all in one read.
+        check_read_raw(600, 1500, 32);
+    }
+
+    #[test]
+    fn read_raw_past_capacity_fast_path() {
+        // Aligned read whose range runs off the end of an 8-sector
+        // (4096-byte) device: sectors 6,7 are real, 8,9 are past end
+        // and must zero-fill. Hits the fast path's `sector >= capacity`
+        // branch.
+        check_read_raw(6 * 512, 4 * 512, 8);
+    }
+
+    #[test]
+    fn read_raw_past_capacity_byte_accurate() {
+        // Unaligned read straddling the device end (8 sectors = 4096
+        // bytes): starts at 3800 (in sector 7), runs to 4400 — past the
+        // 4096-byte capacity. In-range bytes match the pattern; the
+        // remainder zero-fills via the byte-accurate path.
+        check_read_raw(3800, 600, 8);
+    }
+
+    // -- read_cluster_sectors ----------------------------------------
+
+    #[test]
+    fn read_cluster_aligned_fast_path() {
+        // Sector-aligned host_offset, cluster_size a sector multiple:
+        // the fast path reads whole sectors straight into buf.
+        check_read_cluster(3 * 512, 4 * 512, 32);
+    }
+
+    #[test]
+    fn read_cluster_sub_sector_size() {
+        // cluster_size < sector_size: a single partial-sector read
+        // copying just the cluster's bytes from the right offset.
+        check_read_cluster(0, 200, 32);
+        // ...and a sub-sector cluster that also starts partway in.
+        check_read_cluster(700, 200, 32);
+    }
+
+    #[test]
+    fn read_cluster_unaligned_host_offset_multi_sector() {
+        // Non-sector-aligned host_offset into a multi-sector cluster —
+        // the latent bug phase 3 fixed. host_offset 600 (sector 1 + 88)
+        // with a 1536-byte (3-sector) cluster spans a partial head, a
+        // full interior sector, and a partial tail. Assert exact bytes.
+        check_read_cluster(600, 1536, 32);
+    }
 }
 
 /// Look up the refcount for a host cluster via two-level table indirection.
