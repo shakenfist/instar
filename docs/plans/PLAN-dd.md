@@ -281,7 +281,7 @@ strategy.
 | 7. Cross-version baselines: add `dd` to the testdata `generate-baselines.py` + `baselines-dd` Makefile target exactly like `resize`/`amend` (create fixture → `qemu-img dd` → `qemu-img info`), curated `DD_CASES` targeting the output virtual-size rounding (512 / CHS) + empty windows; consuming test compares instar dd's result info to the qemu baseline per profile | [PLAN-dd-phase-07-baselines.md](PLAN-dd-phase-07-baselines.md) | Complete (6ebe645; testdata push pending) |
 | 8. Coverage-guided fuzzing: extract `compute_dd_window` into a new `crates/dd` library crate (so it's fuzzable like sibling planners), then add `fuzz_dd_window`, `fuzz_chs_rounded_size`, and `fuzz_dd_read` (read primitives via mock CallTable) to `src/fuzz` + the `coverage-fuzz.yml` target list. `fuzz_dd_operands` intentionally omitted (CLI parsing isn't fuzzed for any command; covered by phase-5 unit tests) | [PLAN-dd-phase-08-fuzz.md](PLAN-dd-phase-08-fuzz.md) | Complete (1ddb0c5, 46f8a71) |
 | 9. Differential fuzzing: add `op_dd` to `scripts/differential-fuzz.py` (modeled on `op_convert`) — random `bs`/`count`/`skip`/`-O` vs `qemu-img dd`, content-compared by flattening both outputs to raw. Resolves the `count=0 -O vmdk`/`-O vhdx` empty-window cases as documented known divergences; run a ≥2000-iteration campaign clean | [PLAN-dd-phase-09-diff-fuzz.md](PLAN-dd-phase-09-diff-fuzz.md) | Complete (f62d7d9; fixes 779e7a7, b80c5d7) |
-| 10. Documentation: new `docs/dd.md` (mirroring `docs/amend.md`: synopsis, window semantics, per-format size rounding incl. VHD CHS, the known divergences, examples) + `docs/index.md` link; add `dd` to the operations enumerations in `README.md`/`ARCHITECTURE.md`/`AGENTS.md` + a README usage section; `CHANGELOG.md` (dd Added + the two phase-9 Fixed entries); `ARCHITECTURE.md` `dd-info-json` baselines note; flip `index.md`/master plan to Complete | [PLAN-dd-phase-10-docs.md](PLAN-dd-phase-10-docs.md) | Not started |
+| 10. Documentation: new `docs/dd.md` (mirroring `docs/amend.md`: synopsis, window semantics, per-format size rounding incl. VHD CHS, the known divergences, examples) + `docs/index.md` link; add `dd` to the operations enumerations in `README.md`/`ARCHITECTURE.md`/`AGENTS.md` + a README usage section; `CHANGELOG.md` (dd Added + the two phase-9 Fixed entries); `ARCHITECTURE.md` `dd-info-json` baselines note; flip `index.md`/master plan to Complete | [PLAN-dd-phase-10-docs.md](PLAN-dd-phase-10-docs.md) | Complete |
 
 ### Recommended planning effort per phase
 
@@ -357,13 +357,25 @@ We will know this plan is successfully implemented when:
 - The sibling in-scope subcommands `bench` and `bitmap` (separate
   master plans; `bench` pending a design spike on whether
   sandboxed benchmarking is meaningful).
+- **`-f` input-format forcing** — `-f` is accepted but
+  auto-detection is authoritative; threading a forced format
+  through `discover_backing_chain` is deferred (OQ4-adjacent).
+- **`fuzz_dd_operands`** — `parse_dd_operands` is unit-tested but
+  not coverage-fuzzed (phase 8 omitted it: CLI parsing isn't fuzzed
+  for any command, and it would require relocating
+  `parse_qemu_img_size` to a lib crate). Add if that calculus
+  changes.
 - **`count=0 -O vhdx` (empty-window VHDX)** — instar produces a
   0-virtual-size VHDX that `qemu-img info` rejects (no data, exits
-  0); qemu's empty VHDX is readable. A degenerate no-data case
-  deferred from phase 4; the difference appears to be the empty BAT
-  region layout. Phase-9 differential fuzzing should special-case
-  or fix it. (The empty-window vmdk case already matches qemu —
-  qemu's own `count=0 -O vmdk` exits 1.)
+  0); qemu's empty VHDX is readable. Phase 9 whitelisted it as a
+  known divergence so the differential campaign runs clean; making
+  instar's empty VHDX qemu-readable (the difference appears to be
+  the empty BAT region layout) remains open. (The empty-window vmdk
+  case matches qemu — qemu's own `count=0 -O vmdk` exits 1.)
+- **Cherry-pick the convert sub-cluster data-loss fix (`779e7a7`)
+  to `develop`** — it fixes shipped `instar convert -O
+  vmdk|vpc|vhdx` for qcow2 inputs with sub-grain cluster sizes, not
+  just dd. (See Bugs fixed.)
 
 ### Bugs fixed during this work
 
