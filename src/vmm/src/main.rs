@@ -8709,9 +8709,29 @@ fn compute_output_capacity(target_format: u32, vsize: u64) -> u64 {
             .div_ceil(vhdx_block)
             .saturating_mul(vhdx_block)
             .saturating_add(10 * 1024 * 1024)
+    } else if is_vhd_output {
+        // Dynamic VHD writes a per-block sector bitmap immediately before
+        // each block's payload, and the (bitmap + block) region is padded
+        // up to the output sector size (64KB). A *dense* output (dd, which
+        // never skips zero blocks; or a fully-allocated convert) therefore
+        // costs the full virtual size PLUS one output-sector of bitmap/
+        // alignment overhead per block. With the default 2MB block size
+        // that is up to 64KB per 2MB — ~32MB on a 1GB image — far more
+        // than the flat `vsize/100 + 10MB` headroom the other structured
+        // formats use, so size it explicitly. (Sparse convert allocates
+        // fewer blocks and stays well under this bound.)
+        let vhd_block: u64 = 2 * 1024 * 1024;
+        let oss: u64 = MAX_SECTOR_SIZE as u64;
+        let n_blocks = vsize.div_ceil(vhd_block);
+        // Per-block overhead: the bitmap pushes each block's region over a
+        // sector boundary, so it rounds up by at most one output sector.
+        let per_block_overhead = n_blocks.saturating_mul(oss);
+        vsize
+            .saturating_add(per_block_overhead)
+            .saturating_add(10 * 1024 * 1024)
     } else if is_structured_output {
-        // QCOW2, VMDK, and VHD need headroom for metadata (tables,
-        // headers, descriptor, BAT, alignment padding).
+        // QCOW2 and VMDK need headroom for metadata (tables,
+        // headers, descriptor, alignment padding).
         vsize
             .saturating_add(vsize / 100)
             .saturating_add(10 * 1024 * 1024)
@@ -9058,9 +9078,24 @@ fn execute_convert(
     let is_structured_output =
         (is_qcow2_output || is_vmdk_output || is_vhd_output || is_vhdx_output)
             && !is_vmdk_flat_output;
+    // The guest VHD writer declares a CHS-rounded virtual size for a
+    // windowed dd copy (it stamps `chs_rounded_size(out_vsize)`, matching
+    // qemu-img dd; see convert/main.rs ImageFormat::Vhd). That rounding can
+    // bump the size over a block boundary, adding an extra BAT entry whose
+    // payload block + trailing footer land beyond `out_vsize`. The output
+    // device capacity must cover the declared size, not the unrounded
+    // window, or the guest's final write runs past the virtio device's
+    // capacity and the I/O times out. Whole-image convert keeps the
+    // verbatim size (already CHS-aligned for normal images), so only the
+    // dd-window path (`exec.window.is_some()`) needs the round-up.
+    let capacity_vsize = if is_vhd_output && exec.window.is_some() {
+        vhd::chs_rounded_size(out_vsize)
+    } else {
+        out_vsize
+    };
     // Use the effective format so monolithicFlat (effective Raw) sizes
     // as a raw extent, matching the original inline capacity logic.
-    let output_capacity = compute_output_capacity(effective_target_format, out_vsize);
+    let output_capacity = compute_output_capacity(effective_target_format, capacity_vsize);
 
     // For monolithicFlat, the output device is the flat extent file.
     let output_file_path = if let Some((ref flat_path, _)) = flat_extent_path {
@@ -15884,12 +15919,30 @@ mod dd_format_tests {
     }
 
     #[test]
-    fn capacity_vhd_exceeds_vsize() {
-        // VHD/VPC (format 5) uses the same formula as QCOW2.
+    fn capacity_vhd_includes_per_block_bitmap_overhead() {
+        // VHD/VPC (format 5) sizes for a *dense* dynamic output: each 2MB
+        // block's sector bitmap rounds the (bitmap + block) region up by
+        // one 64KB output sector, so capacity is vsize + n_blocks*64KB +
+        // 10 MiB — enough for dd's never-skip-zeros output.
+        let vhd_block: u64 = 2 * MIB;
+        let oss: u64 = MAX_SECTOR_SIZE as u64;
+
+        // 1 MiB input → 1 block of overhead.
         let vsize = MIB;
-        let expected = vsize + vsize / 100 + 10 * MIB;
+        let expected = vsize + oss + 10 * MIB;
         assert_eq!(compute_output_capacity(5, vsize), expected);
         assert!(compute_output_capacity(5, vsize) > vsize);
+
+        // 1 GiB input → 512 blocks of bitmap/alignment overhead.
+        let vsize = 1024 * MIB;
+        let n_blocks = vsize.div_ceil(vhd_block);
+        let expected = vsize + n_blocks * oss + 10 * MIB;
+        assert_eq!(compute_output_capacity(5, vsize), expected);
+
+        // One byte over a block boundary still rounds the block count up.
+        let vsize = vhd_block + 1;
+        let expected = vsize + 2 * oss + 10 * MIB;
+        assert_eq!(compute_output_capacity(5, vsize), expected);
     }
 
     #[test]
