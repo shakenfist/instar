@@ -49,7 +49,7 @@ DATA_PATTERNS = ['zeros', 'random', 'sparse', 'mbr']
 # Operations that the fuzzer can chain together
 OPERATIONS = ['info', 'check', 'convert', 'convert_compressed', 'measure',
               'create', 'resize', 'amend', 'rebase', 'commit', 'map',
-              'snapshot', 'repair']
+              'snapshot', 'repair', 'dd']
 
 # Known divergence categories to skip (unsafe quirks)
 # See docs/quirks.md for rationale
@@ -752,6 +752,221 @@ def op_convert(instar_bin, instar_copy, qemu_copy, fmt,
                     'type': 'convert_content_divergence',
                     'target_format': target_fmt,
                     'compress': compress,
+                    'note': 'raw-flattened content differs',
+                    'instar_sha256': _file_sha256(instar_raw),
+                    'qemu_sha256': _file_sha256(qemu_raw),
+                }
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# dd: random bs/count/skip/-O parity vs qemu-img dd
+# ---------------------------------------------------------------------------
+#
+# This is the broadest parity guard for `dd`: it explores the operand
+# space the fixed integration matrix (phases 3/4/6) cannot, especially
+# non-512 `bs`, unaligned windows, and skip/count interactions. instar
+# matches qemu for all of these (verified phases 3/4); the fuzzer's job
+# is to keep that true. Any REAL divergence is a bug to fix, NOT to
+# whitelist.
+
+# bs values: a deliberate mix of 512-multiples (exercise the fast
+# sector-aligned path), non-512 values (exercise 512-rounding + CHS +
+# sub-sector read paths), the boundaries (1 byte), and one large value.
+# bs and bs*count are bounded by op_dd so outputs stay small.
+_DD_BS_ALIGNED = [512, 4096, 65536, 1048576]
+_DD_BS_UNALIGNED = [1, 777, 999, 1000, 4095, 65537, 1048577]
+# A large/near-INT_MAX bs is occasionally drawn to exercise the
+# big-buffer path. INT_MAX = 2147483647; clamp the actual copied bytes
+# via count so the output never balloons (see _dd_pick_window).
+_DD_BS_LARGE = 2147483647
+
+
+def _dd_pick_window(rng, virtual_size):
+    """Pick (bs, count, skip) for a dd invocation, bounding the total
+    output well under a few hundred MiB.
+
+    virtual_size is the input image's virtual size in bytes (from
+    qemu-img info). Returns a tuple suitable for building identical
+    operands for both tools, plus the computed `out_vsize` (the number
+    of bytes the copy will actually produce) so the caller can detect
+    the empty-window degenerate cases.
+    """
+    # Cap on the bytes any single dd may produce. The input images are
+    # small (<= 1 GiB virtual, sparse), so this keeps outputs modest
+    # even when count reaches past EOF.
+    max_out_bytes = 64 * 1024 * 1024  # 64 MiB
+
+    # bs selection: mostly a realistic mix; a 512-multiple ~45% of the
+    # time, a non-512 value ~45%, and the near-INT_MAX boundary ~10%.
+    roll = rng.random()
+    if roll < 0.45:
+        bs = rng.choice(_DD_BS_ALIGNED)
+    elif roll < 0.90:
+        bs = rng.choice(_DD_BS_UNALIGNED)
+    else:
+        bs = _DD_BS_LARGE
+
+    # The image's block count at this bs (ceil division — qemu/instar
+    # both read a final short block).
+    img_blocks = (virtual_size + bs - 1) // bs if bs > 0 else 0
+    # Upper bound on count so bs*count stays under max_out_bytes.
+    max_blocks = max(1, max_out_bytes // bs)
+
+    # skip: 0 .. ~2x the image's block count, so skip-past-EOF (which
+    # yields an empty copy) is reachable. Also bound skip by max_blocks
+    # so a tiny bs can't make skip absurdly large.
+    skip_hi = min(max(img_blocks * 2, 1), max_blocks * 2)
+    skip = rng.randint(0, skip_hi)
+
+    # count: None (whole image) most of the time, else a random block
+    # count (sometimes beyond the image's block count; occasionally 0).
+    count_roll = rng.random()
+    if count_roll < 0.55:
+        count = None
+    elif count_roll < 0.62:
+        count = 0  # degenerate empty window (see known-divergence note)
+    else:
+        # Up to ~1.5x the image block count, clamped to max_blocks.
+        hi = min(max(int(img_blocks * 1.5), 1), max_blocks)
+        count = rng.randint(1, hi)
+
+    # Compute out_vsize, mirroring dd::compute_dd_window EXACTLY (the
+    # instar host computes the same way, and qemu-img dd agrees):
+    #
+    #   copy_len = min(count * bs, virtual_size)  if count given
+    #            = virtual_size                   otherwise
+    #   start    = skip * bs
+    #   out_vsize = max(0, copy_len - start)
+    #
+    # Crucially `copy_len` is the ABSOLUTE end offset (from byte 0), NOT
+    # skip + count: `count` caps how many blocks are read counting from
+    # the start of the input, and `skip` advances the read pointer
+    # within that, so skip >= copy_len yields an empty window. Getting
+    # this wrong mis-detects empty-window vmdk/vhdx cases (see
+    # src/crates/dd/src/lib.rs::compute_dd_window).
+    copy_len = virtual_size if count is None else min(count * bs, virtual_size)
+    start = skip * bs
+    out_vsize = max(0, copy_len - start)
+
+    return bs, count, skip, out_vsize
+
+
+def op_dd(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
+    """Cross-check a random `instar dd` invocation against `qemu-img dd`.
+
+    Picks a random target format and random `bs`/`count`/`skip` window
+    operands, runs both tools with identical operands, compares exit
+    codes, and — on dual success — flattens BOTH outputs to raw via
+    `qemu-img convert -O raw` (neutral ground) and SHA-compares them.
+    Raw targets are compared directly. Mirrors `op_convert`.
+
+    Known degenerate cases (empty window, out_vsize == 0) are skipped
+    for vmdk/vhdx targets only — see the inline note below.
+    """
+    target_fmt = rng.choice(['raw', 'qcow2', 'vmdk', 'vpc', 'vhdx'])
+
+    # Need the input's virtual size to bound the window and detect the
+    # empty-window degenerate case. Probe via qemu-img info (neutral).
+    virtual_size = _map_probe_virtual_size(qemu_copy, timeout)
+    if virtual_size is None:
+        # Couldn't determine the input size; skip rather than guess.
+        return None
+
+    bs, count, skip, out_vsize = _dd_pick_window(rng, virtual_size)
+
+    # Known-divergence handling — NARROW: only empty-window vmdk/vhdx.
+    # When the chosen window is empty (out_vsize == 0, i.e. count==0 or
+    # skip past the count-clamped end):
+    #   * -O vmdk: qemu-img dd itself exits 1 (monolithicSparse cannot
+    #     represent a 0-capacity disk) while instar exits 0 with an
+    #     empty vmdk — an exit-code divergence on a degenerate input.
+    #   * -O vhdx: instar's 0-virtual-size vhdx is rejected by
+    #     qemu-img info/convert (the documented phase-4 limitation), so
+    #     flattening instar's output to raw fails while qemu's empty
+    #     vhdx is readable.
+    # Skip these (return None) — do NOT whitelist anything else; every
+    # non-512 bs, unaligned window, and skip/count combo MUST show
+    # parity.
+    if out_vsize == 0 and target_fmt in ('vmdk', 'vhdx'):
+        return None
+
+    instar_out = instar_copy.parent / f'{instar_copy.stem}-dd.{target_fmt}'
+    qemu_out = qemu_copy.parent / f'{qemu_copy.stem}-dd.{target_fmt}'
+
+    def build_operands(copy, out):
+        operands = ['-O', target_fmt, f'if={copy}', f'of={out}', f'bs={bs}']
+        if count is not None:
+            operands.append(f'count={count}')
+        if skip:
+            operands.append(f'skip={skip}')
+        return operands
+
+    i_out, i_err, i_rc = run_instar(
+        instar_bin, ['dd'], build_operands(instar_copy, instar_out),
+        timeout=timeout,
+    )
+    q_out, q_err, q_rc = run_qemu_img(
+        ['dd'], build_operands(qemu_copy, qemu_out), timeout=timeout,
+    )
+
+    context = {
+        'target_format': target_fmt,
+        'bs': bs,
+        'count': count,
+        'skip': skip,
+        'out_vsize': out_vsize,
+        'instar_stderr': i_err[:500],
+        'qemu_stderr': q_err[:500],
+    }
+
+    div = compare_exit_codes(i_rc, q_rc, 'dd', context)
+    if div:
+        return div
+
+    if i_rc != 0:
+        # Both failed identically — nothing further to compare.
+        return None
+
+    # Compare content. Raw targets compare directly; structured targets
+    # are flattened to raw (neutral ground) first — mirror op_convert.
+    if target_fmt == 'raw':
+        if not files_match(instar_out, qemu_out):
+            return {
+                'type': 'dd_content_divergence',
+                'target_format': target_fmt,
+                'bs': bs,
+                'count': count,
+                'skip': skip,
+                'out_vsize': out_vsize,
+                'instar_sha256': _file_sha256(instar_out),
+                'qemu_sha256': _file_sha256(qemu_out),
+            }
+    else:
+        instar_raw = instar_copy.parent / f'{instar_copy.stem}-dd-verify.raw'
+        qemu_raw = qemu_copy.parent / f'{qemu_copy.stem}-dd-verify.raw'
+
+        subprocess.run(
+            ['qemu-img', 'convert', '-O', 'raw',
+             str(instar_out), str(instar_raw)],
+            capture_output=True, timeout=timeout,
+        )
+        subprocess.run(
+            ['qemu-img', 'convert', '-O', 'raw',
+             str(qemu_out), str(qemu_raw)],
+            capture_output=True, timeout=timeout,
+        )
+
+        if instar_raw.exists() and qemu_raw.exists():
+            if not files_match(instar_raw, qemu_raw):
+                return {
+                    'type': 'dd_content_divergence',
+                    'target_format': target_fmt,
+                    'bs': bs,
+                    'count': count,
+                    'skip': skip,
+                    'out_vsize': out_vsize,
                     'note': 'raw-flattened content differs',
                     'instar_sha256': _file_sha256(instar_raw),
                     'qemu_sha256': _file_sha256(qemu_raw),
@@ -3264,6 +3479,11 @@ def run_iteration(instar_bin, workdir, rng, iteration, timeout,
                 )
             elif op == 'repair':
                 div = op_repair(
+                    instar_bin, instar_copy, qemu_copy, fmt,
+                    timeout, rng,
+                )
+            elif op == 'dd':
+                div = op_dd(
                     instar_bin, instar_copy, qemu_copy, fmt,
                     timeout, rng,
                 )
