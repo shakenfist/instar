@@ -27,7 +27,7 @@ Initial target formats:
 
 **Initial implementation** - The `info` prototype has been promoted to the main
 instar implementation in `src/`. Operations include `info`, `copy`, `check`,
-`compare`, `convert`, `measure`, `create`, `resize`, `rebase`, `commit`,
+`compare`, `convert`, `dd`, `measure`, `create`, `resize`, `rebase`, `commit`,
 `map`, and `snapshot`. Prototypes remain available for reference.
 
 See [docs/measure.md](docs/measure.md), [docs/create.md](docs/create.md),
@@ -344,6 +344,28 @@ Supported output formats:
   default 2MB via `--block-size`)
 - **vhdx** - VHDX dynamic output, configurable block size (1MB-256MB,
   default 32MB via `--block-size`)
+
+### Block Copy (dd)
+
+```bash
+# Copy a whole image to raw output (-O defaults to raw, not the input format)
+instar dd if=input.qcow2 of=output.raw
+
+# Copy to QCOW2 output
+instar dd -O qcow2 if=input.raw of=output.qcow2
+
+# Windowed copy: skip the first 2 blocks, copy the next 4 blocks of 65536 bytes
+instar dd bs=65536 skip=2 count=4 if=in.raw of=out.raw
+```
+
+Both `if=` (input) and `of=` (output) operands are mandatory; all other
+operands (`bs`, `count`, `skip`) are optional. `bs` defaults to 512; `count`
+clamps the copy down (the output is at most `count*bs` bytes); `skip` removes
+`skip*bs` bytes from the front of the input window. `-O` sets the output
+format and defaults to **raw** (not the input format). Supported output
+formats: raw, qcow2, vmdk, vpc (VHD), vhdx. Output is byte- and size-identical
+to `qemu-img dd` for all five formats. See [docs/dd.md](docs/dd.md) for the
+full reference.
 
 ### Image Rebase
 
