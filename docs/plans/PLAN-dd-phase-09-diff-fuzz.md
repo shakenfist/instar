@@ -3,7 +3,24 @@
 Master plan: [PLAN-dd.md](PLAN-dd.md)
 Previous phase: [PLAN-dd-phase-08-fuzz.md](PLAN-dd-phase-08-fuzz.md)
 
-## Status: Not started
+## Status: Complete (op_dd f62d7d9; fixes 779e7a7, b80c5d7)
+
+> **Outcome.** `op_dd` added to `differential-fuzz.py`; a
+> 500-iteration `--ops dd` campaign (seed 20260624) ran clean after
+> the campaign surfaced **two real bugs**, both fixed:
+> 1. **Pre-existing convert data loss** (`779e7a7`): the
+>    vmdk/vhd/vhdx writers passed a full grain/block to
+>    `read_chain_virtual_cluster` (which fills only one input
+>    cluster), so qcow2 inputs with sub-grain cluster sizes were
+>    truncated. Fixed with `read_chain_virtual_range`. This also
+>    fixes `instar convert` on develop — worth a separate
+>    cherry-pick.
+> 2. **Dense-VHD output-capacity under-estimate** (`b80c5d7`): a
+>    dense VHD's per-block bitmap/alignment overhead exceeded the
+>    generic headroom, stalling the final write; sized explicitly.
+> Empty-window `-O vmdk`/`-O vhdx` are the only whitelisted known
+> divergences. The convert integration suite stays 201/0; dd tests
+> and `make test-rust` green.
 
 ## Prompt
 

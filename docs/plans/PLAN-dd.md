@@ -280,7 +280,7 @@ strategy.
 | 6. Integration consolidation: fill the non-windowing matrix rows the per-phase tests skipped (windowing already covered by `TestDdRawWindow`/`TestDdStructuredWindow`) — CLI rejection parity (`bs=0`, bad operand, missing `if`/`of`, unknown `-O`; both tools exit non-zero), the `-O`-defaults-to-raw quirk (assert output format is raw, not the input's), and input-format coverage (vmdk/vhd/vhdx + backing-chain inputs vs `qemu-img dd`) | [PLAN-dd-phase-06-integration.md](PLAN-dd-phase-06-integration.md) | Complete (b6cffd2) |
 | 7. Cross-version baselines: add `dd` to the testdata `generate-baselines.py` + `baselines-dd` Makefile target exactly like `resize`/`amend` (create fixture → `qemu-img dd` → `qemu-img info`), curated `DD_CASES` targeting the output virtual-size rounding (512 / CHS) + empty windows; consuming test compares instar dd's result info to the qemu baseline per profile | [PLAN-dd-phase-07-baselines.md](PLAN-dd-phase-07-baselines.md) | Complete (6ebe645; testdata push pending) |
 | 8. Coverage-guided fuzzing: extract `compute_dd_window` into a new `crates/dd` library crate (so it's fuzzable like sibling planners), then add `fuzz_dd_window`, `fuzz_chs_rounded_size`, and `fuzz_dd_read` (read primitives via mock CallTable) to `src/fuzz` + the `coverage-fuzz.yml` target list. `fuzz_dd_operands` intentionally omitted (CLI parsing isn't fuzzed for any command; covered by phase-5 unit tests) | [PLAN-dd-phase-08-fuzz.md](PLAN-dd-phase-08-fuzz.md) | Complete (1ddb0c5, 46f8a71) |
-| 9. Differential fuzzing: add `op_dd` to `scripts/differential-fuzz.py` (modeled on `op_convert`) — random `bs`/`count`/`skip`/`-O` vs `qemu-img dd`, content-compared by flattening both outputs to raw. Resolves the `count=0 -O vmdk`/`-O vhdx` empty-window cases as documented known divergences; run a ≥2000-iteration campaign clean | [PLAN-dd-phase-09-diff-fuzz.md](PLAN-dd-phase-09-diff-fuzz.md) | Not started |
+| 9. Differential fuzzing: add `op_dd` to `scripts/differential-fuzz.py` (modeled on `op_convert`) — random `bs`/`count`/`skip`/`-O` vs `qemu-img dd`, content-compared by flattening both outputs to raw. Resolves the `count=0 -O vmdk`/`-O vhdx` empty-window cases as documented known divergences; run a ≥2000-iteration campaign clean | [PLAN-dd-phase-09-diff-fuzz.md](PLAN-dd-phase-09-diff-fuzz.md) | Complete (f62d7d9; fixes 779e7a7, b80c5d7) |
 | 10. Documentation: `docs/dd.md`, `README.md`, `ARCHITECTURE.md`, `AGENTS.md`, `CHANGELOG.md`, `docs/usage.md`, and the `index.md` status flip | PLAN-dd-phase-10-docs.md | Not started |
 
 ### Recommended planning effort per phase
@@ -367,10 +367,23 @@ We will know this plan is successfully implemented when:
 
 ### Bugs fixed during this work
 
-(To be filled in as development proceeds. Scan the
-`shakenfist/instar` GitHub issue tracker for any open `dd`-,
-`convert`-, or windowing-related issues that should be resolved or
-noted here when phase 1 is planned.)
+- **convert sub-cluster data loss (`779e7a7`, phase 9).** The
+  vmdk/vhd/vhdx output writers passed a full grain/block to
+  `read_chain_virtual_cluster`, which fills at most one input
+  cluster, so qcow2 inputs whose cluster size is smaller than the
+  output grain/block were silently truncated. **Pre-existing on
+  develop** (not dd-specific) — `instar convert -O vmdk|vpc|vhdx`
+  of a sub-64 KiB-cluster qcow2 dropped data. Surfaced by dd
+  differential fuzzing (`op_dd` targets the structured formats;
+  `op_convert` only did raw/qcow2). Fixed with
+  `qcow2::read_chain_virtual_range`. **Worth cherry-picking to
+  develop independently of the dd branch.**
+- **Dense-VHD output-capacity under-estimate (`b80c5d7`, phase
+  9).** A dense (dd) dynamic-VHD output's per-block sector-bitmap +
+  64 KiB alignment overhead exceeded the generic structured
+  headroom, so the guest's final write ran past device capacity and
+  stalled. `compute_output_capacity` now sizes the VHD case
+  explicitly.
 
 ### Documentation index maintenance
 
