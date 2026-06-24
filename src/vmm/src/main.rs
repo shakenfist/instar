@@ -118,7 +118,6 @@ const CONVERT_CONFIG_FLAG_DECRYPT_AES: u32 = 1 << 2;
 const CONVERT_CONFIG_FLAG_EXTENDED_L2: u32 = 1 << 3;
 const CONVERT_CONFIG_FLAG_ENCRYPT_LUKS: u32 = 1 << 4;
 // Mirrors ConvertConfig::FLAG_DD_WINDOW in the shared crate.
-#[allow(dead_code)]
 const CONVERT_CONFIG_FLAG_DD_WINDOW: u32 = 1 << 5;
 #[allow(dead_code)]
 const CONVERT_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;

@@ -105,7 +105,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   baselines (6.0.0–10.2.0), and coverage + differential fuzzing. See
   [docs/amend.md](docs/amend.md).
 
-- **New `instar dd` subcommand (PLAN-dd phases 1-9).** Windowed block
+- **New `instar dd` subcommand (PLAN-dd phases 1-10).** Windowed block
   copy compatible with `qemu-img dd`:
   `instar dd [-f FMT] [-O OUTPUT_FMT] if=INPUT of=OUTPUT [bs=N]
   [count=N] [skip=N]`. Both `if=`/`of=` mandatory; all other
