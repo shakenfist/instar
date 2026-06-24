@@ -6085,6 +6085,92 @@ pub unsafe fn read_chain_virtual_cluster(
     true
 }
 
+/// Read an arbitrary virtual byte range, filling the FULL `len` bytes.
+///
+/// [`read_chain_virtual_cluster`] only fills up to one input cluster per
+/// call (its `chunk_size` is clamped to the qcow2 cluster size for qcow2
+/// inputs), so a caller that hands it a span larger than the input
+/// cluster — e.g. a VMDK 64 KiB grain or a VHD/VHDX block read from a
+/// qcow2 with 512-byte clusters — would otherwise get only the first
+/// cluster filled and stale/zero bytes after it. The qcow2 output path
+/// loops in `min(input_cluster, output_cluster)` steps to avoid this;
+/// this wrapper centralises that loop so the VMDK/VHD/VHDX writers can
+/// request a whole grain/block and get every byte.
+///
+/// # Safety
+///
+/// `len` may be any size; it is filled exactly. `buf` must point to at
+/// least `len` writable bytes. All other arguments match
+/// [`read_chain_virtual_cluster`]; see its `# Safety` notes for the
+/// `compressed_buf`/`staging_buf` sizing and `call_table` validity
+/// requirements.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn read_chain_virtual_range(
+    call_table: &CallTable,
+    chain_start: usize,
+    chain_len: usize,
+    virtual_offset: u64,
+    buf: *mut u8,
+    len: u64,
+    sector_size: usize,
+    chain_config: &ChainConfig,
+    chain_states: &mut ChainStates,
+    compressed_buf: *mut u8,
+    staging_buf: *mut u8,
+    staging_cluster_offset: &mut u64,
+    aes_key: Option<&[u8; 16]>,
+    luks_key: Option<&[u8]>,
+    luks_sector_size: u64,
+    bytes_read: &mut u64,
+) -> bool {
+    // Per-call read granularity: the top device's cluster size bounds how
+    // much read_chain_virtual_cluster fills in one call. Raw inputs report
+    // cluster_size 0 and read the full span in one go, so fall back to
+    // `len` in that case (a single iteration).
+    let input_cluster_size = {
+        let top = &chain_config.devices[chain_start];
+        if top.cluster_size > 0 {
+            top.cluster_size as u64
+        } else {
+            len
+        }
+    };
+    let step = core::cmp::min(input_cluster_size, len).max(1);
+
+    let mut filled: u64 = 0;
+    while filled < len {
+        // read_chain_virtual_cluster reads from `intra = vo % cluster` up to
+        // `min(piece, cluster)` bytes, so a piece must never straddle a
+        // cluster boundary or the tail of the cluster would be skipped. Cap
+        // each piece at the remainder of the current input cluster.
+        let abs = virtual_offset + filled;
+        let to_cluster_end = input_cluster_size - (abs % input_cluster_size);
+        let piece = core::cmp::min(core::cmp::min(step, len - filled), to_cluster_end);
+        if !read_chain_virtual_cluster(
+            call_table,
+            chain_start,
+            chain_len,
+            virtual_offset + filled,
+            buf.add(filled as usize),
+            piece,
+            sector_size,
+            chain_config,
+            chain_states,
+            compressed_buf,
+            staging_buf,
+            staging_cluster_offset,
+            aes_key,
+            luks_key,
+            luks_sector_size,
+            bytes_read,
+        ) {
+            return false;
+        }
+        filled += piece;
+    }
+    true
+}
+
 /// Initialize QCOW2 state for each QCOW2 device in a chain.
 ///
 /// Iterates over `device_count` devices, initializing a `Qcow2State` for

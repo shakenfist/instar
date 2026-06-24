@@ -3225,9 +3225,12 @@ unsafe fn convert_to_vmdk(
             HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 
             // Read input data (skip the read entirely for a grain wholly
-            // past the window end — it is all zero-pad).
+            // past the window end — it is all zero-pad). Use the range
+            // reader so a 64 KiB grain is filled in full even when the input
+            // qcow2 has clusters smaller than the grain (sub-grain clusters
+            // would otherwise leave the grain tail stale/zero).
             if this_chunk > 0
-                && !qcow2::read_chain_virtual_cluster(
+                && !qcow2::read_chain_virtual_range(
                     call_table,
                     0,
                     input_device_count,
@@ -3527,8 +3530,10 @@ unsafe fn convert_to_vmdk_compressed(
             HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 
             // Read input data (skip for a grain wholly past the window end).
+            // Range reader fills the whole grain even for sub-grain input
+            // clusters (see the monolithicSparse grain loop above).
             if this_chunk > 0
-                && !qcow2::read_chain_virtual_cluster(
+                && !qcow2::read_chain_virtual_range(
                     call_table,
                     0,
                     input_device_count,
@@ -4034,7 +4039,7 @@ unsafe fn convert_to_vhd(
 
             HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 
-            if !qcow2::read_chain_virtual_cluster(
+            if !qcow2::read_chain_virtual_range(
                 call_table,
                 0,
                 input_device_count,
@@ -4149,7 +4154,7 @@ unsafe fn convert_to_vhd(
 
                 HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 
-                if !qcow2::read_chain_virtual_cluster(
+                if !qcow2::read_chain_virtual_range(
                     call_table,
                     0,
                     input_device_count,
@@ -4605,7 +4610,7 @@ unsafe fn convert_to_vhdx(
 
             HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 
-            if !qcow2::read_chain_virtual_cluster(
+            if !qcow2::read_chain_virtual_range(
                 call_table,
                 0,
                 input_device_count,
@@ -4674,7 +4679,7 @@ unsafe fn convert_to_vhdx(
 
             HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 
-            if !qcow2::read_chain_virtual_cluster(
+            if !qcow2::read_chain_virtual_range(
                 call_table,
                 0,
                 input_device_count,
