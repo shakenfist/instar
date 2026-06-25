@@ -47,7 +47,6 @@ stay in sync. Drift is surfaced by ``test_dd_cases_match_baselines``.
 import json
 import subprocess
 import tempfile
-from pathlib import Path
 
 from base import InstarTestBase
 from helpers.info_json import assert_info_equivalent
