@@ -43,6 +43,32 @@ jobs:
             echo "is_bot=false" >> $GITHUB_OUTPUT
           fi
 
+  # Assert every Python integration test is claimed by at least one of
+  # the integration jobs below. Cheap (pure Python + stestr discovery,
+  # no /dev/kvm, no testdata, no build), so it runs on a small runner
+  # and gives fast feedback. Guards against a test module silently
+  # dropping out of CI -- e.g. if integration-core's exclude-list were
+  # ever refactored into an include-list. See
+  # tools/ci/check-test-partition.py.
+  test-partition:
+    name: "Test partition guard"
+    if: github.event_name == 'pull_request'
+    runs-on: [self-hosted, debian-12, s]
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Ensure Python venv support
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-venv python3-pip
+
+      - name: Check CI test partition
+        run: tools/ci/check-test-partition.sh
+
   build-and-test:
     runs-on: [self-hosted, debian-12, s]
     timeout-minutes: 30
@@ -813,7 +839,7 @@ jobs:
   automated_reviewer:
     name: "Automated reviewer"
     runs-on: [self-hosted, claude-code]
-    needs: [check-bot-commit, build-and-test, integration-core, integration-convert-qcow2, integration-convert-vhd, snapshot-harnesses]
+    needs: [check-bot-commit, test-partition, build-and-test, integration-core, integration-convert-qcow2, integration-convert-vhd, snapshot-harnesses]
     if: >-
       ${{ github.event_name == 'pull_request' &&
           needs.check-bot-commit.outputs.is_bot != 'true' }}
