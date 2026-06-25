@@ -199,6 +199,18 @@ pre-commit run --all-files
 The hooks use a dedicated Docker container (`.devcontainer/rust-lint/`) with
 stable Rust to ensure consistent results across all development environments.
 
+### CI test partition
+
+Integration tests are split across several CI jobs by stestr regex
+selectors (the `test-container-*` Makefile targets). The
+`test-partition` CI job (`tools/ci/check-test-partition.sh`) fails if
+any `test_*.py` test is run by **no** pull-request job. When you add a
+new integration test module or a new integration job, the guard
+validates that the new partition still covers everything; an orphan is
+a hard CI failure. Deliberate exclusions live in an allowlist in
+`tools/ci/check-test-partition.py` (currently just the malicious
+suite). See [docs/testing.md](docs/testing.md).
+
 ### Using the Makefile
 
 The project includes a Makefile for common development tasks:

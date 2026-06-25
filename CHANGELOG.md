@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **CI test-partition guard.** A new lightweight `test-partition`
+  job (and `tools/ci/check-test-partition.{sh,py}`) asserts that
+  every Python integration test is claimed by at least one
+  pull-request job. It enumerates the suite with `stestr list` and
+  reads the real job selectors from the Makefile and workflow (no
+  duplicated copy), failing if any test would run in zero jobs —
+  guarding against a module silently dropping out of CI if the
+  exclude-based `integration-core` job were ever refactored, or a
+  `test_convert` class falling through the qcow2/vhd split. The
+  guard's own logic is unit-tested with stdlib `unittest`. See
+  [docs/testing.md](docs/testing.md).
+
 - **`instar check --repair` for QCOW2 (PLAN-check-repair phases
   1-11).** Wires the long-reserved `CheckConfig::FLAG_REPAIR` ABI
   bit to real in-place qcow2 repair, mirroring `qemu-img check -r
