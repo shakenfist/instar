@@ -24,6 +24,7 @@ commit = { path = "../crates/commit" }
 snapshot = { path = "../crates/snapshot" }
 check = { path = "../crates/check" }
 amend = { path = "../crates/amend" }
+dd = { path = "../crates/dd" }
 
 [profile.release]
 debug = true
@@ -173,5 +174,25 @@ test = false
 [[bin]]
 name = "fuzz_check_repair"
 path = "fuzz_targets/fuzz_check_repair.rs"
+doc = false
+test = false
+
+# dd targets
+
+[[bin]]
+name = "fuzz_dd_window"
+path = "fuzz_targets/fuzz_dd_window.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "fuzz_chs_rounded_size"
+path = "fuzz_targets/fuzz_chs_rounded_size.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "fuzz_dd_read"
+path = "fuzz_targets/fuzz_dd_read.rs"
 doc = false
 test = false

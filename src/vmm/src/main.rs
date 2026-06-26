@@ -35,6 +35,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use dd::compute_dd_window;
 use guest_protocol::{
     decode_framed, encode_vmm_config_framed, guest_, vmm_config, vmm_config_chain,
     vmm_config_chain_with_output, vmm_config_input_only, FRAME_HEADER_SIZE,
@@ -116,6 +117,8 @@ const CONVERT_CONFIG_FLAG_COMPRESS: u32 = 1 << 1;
 const CONVERT_CONFIG_FLAG_DECRYPT_AES: u32 = 1 << 2;
 const CONVERT_CONFIG_FLAG_EXTENDED_L2: u32 = 1 << 3;
 const CONVERT_CONFIG_FLAG_ENCRYPT_LUKS: u32 = 1 << 4;
+// Mirrors ConvertConfig::FLAG_DD_WINDOW in the shared crate.
+const CONVERT_CONFIG_FLAG_DD_WINDOW: u32 = 1 << 5;
 #[allow(dead_code)]
 const CONVERT_CONFIG_FLAG_VERBOSE: u32 = 1 << 31;
 
@@ -2569,6 +2572,8 @@ enum Commands {
     Compare(CompareArgs),
     /// Convert a disk image to a different format (qcow2 -> raw)
     Convert(ConvertArgs),
+    /// dd-style block copy (qemu-img dd compatible)
+    Dd(DdArgs),
     /// Measure the size required to convert an image to a target format
     Measure(MeasureArgs),
     /// Create a new empty disk image of the given format and size
@@ -3265,6 +3270,23 @@ struct ConvertArgs {
 }
 
 #[derive(Args, Debug)]
+struct DdArgs {
+    /// Raw dd operands: if=<input>, of=<output>, bs=<blocksize>,
+    /// count=<n>, skip=<n>. Captured verbatim for the phase-2 parser.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    operands: Vec<String>,
+
+    /// Input format override (e.g. "raw", "qcow2")
+    #[arg(short = 'f', long = "input-format")]
+    input_format: Option<String>,
+
+    /// Output format override (e.g. "raw", "qcow2").
+    /// When absent, the phase-2 parser defaults to "raw".
+    #[arg(short = 'O', long = "output-format")]
+    output_format: Option<String>,
+}
+
+#[derive(Args, Debug)]
 struct MeasureArgs {
     /// Source image file. Mutually exclusive with --size.
     #[arg(conflicts_with = "size")]
@@ -3487,6 +3509,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Check(args) => run_check(args, verbose),
         Commands::Compare(args) => run_compare(args, verbose),
         Commands::Convert(args) => run_convert(args, verbose),
+        Commands::Dd(args) => run_dd(args, verbose),
         Commands::Measure(args) => run_measure(args, verbose),
         Commands::Create(args) => run_create(args, verbose),
         Commands::Resize(args) => run_resize(args, verbose),
@@ -8595,22 +8618,130 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+/// Parameters for LUKS-encrypted output (`--luks-encrypt-passphrase`).
+/// Only populated when the convert/dd output is to be LUKS-encrypted.
+struct LuksEncryptParams {
+    passphrase: String,
+    iterations: u32,
+}
+
+/// Everything `execute_convert` needs to reproduce the convert
+/// guest-launch + vCPU-loop machinery. `run_convert` builds this from
+/// validated `ConvertArgs`; a future `run_dd` builds it from parsed
+/// operands. Every field mirrors a value `run_convert` previously
+/// threaded inline, so convert behaviour is preserved bit-for-bit.
+struct ConvertExecution {
+    /// Input image path (top of the discovered backing chain).
+    input: String,
+    /// Output image path (or VMDK descriptor path for monolithicFlat).
+    output: String,
+    /// Output `ImageFormat` value (1=raw, 2=qcow2, 3=vmdk, 5=vpc, 6=vhdx).
+    target_format: u32,
+    /// ConvertConfig flag bits, already assembled: SKIP_ZEROS, COMPRESS,
+    /// EXTENDED_L2, ENCRYPT_LUKS. VERBOSE is added from the `verbose`
+    /// parameter and DD_WINDOW is added when `window` is `Some`.
+    flags: u32,
+    /// QCOW2 output cluster size as bit shift (0 for non-qcow2 output).
+    output_cluster_bits: u32,
+    /// VMDK output grain size in bytes (config offset 392).
+    output_grain_size: u32,
+    /// VHD/VHDX output block size in bytes (config offset 396).
+    output_block_size: u32,
+    /// I/O sector size for the chain + output devices.
+    sector_size: u32,
+    /// Progress update interval, in percent.
+    progress_percent: u32,
+    /// True for VMDK monolithicFlat output (descriptor + flat extent),
+    /// which cannot be derived from `target_format` alone.
+    is_vmdk_flat_output: bool,
+    /// Don't create the output file (`-n`); it must already exist.
+    no_create: bool,
+    /// Resolved input decrypt passphrase (QCOW2 AES or LUKS). Mutually
+    /// exclusive with `luks_encrypt` (clap enforces this).
+    decrypt_passphrase: Option<String>,
+    /// LUKS output-encryption parameters, when encrypting the output.
+    luks_encrypt: Option<LuksEncryptParams>,
+    /// Snapshot ID/name to extract instead of the active image.
+    snapshot: Option<String>,
+    /// `--max-guest-memory` string for LUKS v2 Argon2id, if provided.
+    max_guest_memory: Option<String>,
+    /// dd window `(window_start, window_end)`; `None` for convert. When
+    /// `Some`, the bounds are written to config offsets 400/408 and
+    /// `FLAG_DD_WINDOW` is set; when `None`, zeros are written and the
+    /// flag is clear (the guest ignores the window without the flag).
+    window: Option<(u64, u64)>,
+    /// Output virtual size override (dd's `out_vsize`). `None` ⇒ use the
+    /// input chain's virtual size, reproducing convert behaviour.
+    output_vsize_override: Option<u64>,
+}
+
+/// Parse a convert/dd output format string into its `ImageFormat` value.
+fn parse_output_format(s: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    match s {
+        "raw" => Ok(1u32),   // ImageFormat::Raw
+        "qcow2" => Ok(2u32), // ImageFormat::Qcow2
+        "vmdk" => Ok(3u32),  // ImageFormat::Vmdk4
+        "vpc" => Ok(5u32),   // ImageFormat::Vhd
+        "vhdx" => Ok(6u32),  // ImageFormat::Vhdx
+        other => Err(format!(
+            "unsupported output format '{other}' \
+             (supported: 'raw', 'qcow2', 'vmdk', 'vpc', 'vhdx')"
+        )
+        .into()),
+    }
+}
+
+/// Compute the output file capacity (with format-specific metadata
+/// headroom) for a given target format and output virtual size.
+fn compute_output_capacity(target_format: u32, vsize: u64) -> u64 {
+    let is_qcow2_output = target_format == 2;
+    let is_vmdk_output = target_format == 3;
+    let is_vhd_output = target_format == 5;
+    let is_vhdx_output = target_format == 6;
+    let is_structured_output = is_qcow2_output || is_vmdk_output || is_vhd_output || is_vhdx_output;
+    if is_vhdx_output {
+        // VHDX uses 32MB blocks — data is rounded up to block_size
+        // boundaries, plus ~4MB metadata overhead (file identifier,
+        // headers, region tables, log, BAT, metadata region).
+        let vhdx_block: u64 = 32 * 1024 * 1024;
+        vsize
+            .div_ceil(vhdx_block)
+            .saturating_mul(vhdx_block)
+            .saturating_add(10 * 1024 * 1024)
+    } else if is_vhd_output {
+        // Dynamic VHD writes a per-block sector bitmap immediately before
+        // each block's payload, and the (bitmap + block) region is padded
+        // up to the output sector size (64KB). A *dense* output (dd, which
+        // never skips zero blocks; or a fully-allocated convert) therefore
+        // costs the full virtual size PLUS one output-sector of bitmap/
+        // alignment overhead per block. With the default 2MB block size
+        // that is up to 64KB per 2MB — ~32MB on a 1GB image — far more
+        // than the flat `vsize/100 + 10MB` headroom the other structured
+        // formats use, so size it explicitly. (Sparse convert allocates
+        // fewer blocks and stays well under this bound.)
+        let vhd_block: u64 = 2 * 1024 * 1024;
+        let oss: u64 = MAX_SECTOR_SIZE as u64;
+        let n_blocks = vsize.div_ceil(vhd_block);
+        // Per-block overhead: the bitmap pushes each block's region over a
+        // sector boundary, so it rounds up by at most one output sector.
+        let per_block_overhead = n_blocks.saturating_mul(oss);
+        vsize
+            .saturating_add(per_block_overhead)
+            .saturating_add(10 * 1024 * 1024)
+    } else if is_structured_output {
+        // QCOW2 and VMDK need headroom for metadata (tables,
+        // headers, descriptor, alignment padding).
+        vsize
+            .saturating_add(vsize / 100)
+            .saturating_add(10 * 1024 * 1024)
+    } else {
+        vsize
+    }
+}
+
 fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Parse and validate output format
-    let target_format = match args.output_format.as_str() {
-        "raw" => 1u32,   // ImageFormat::Raw
-        "qcow2" => 2u32, // ImageFormat::Qcow2
-        "vmdk" => 3u32,  // ImageFormat::Vmdk4
-        "vpc" => 5u32,   // ImageFormat::Vhd
-        "vhdx" => 6u32,  // ImageFormat::Vhdx
-        other => {
-            return Err(format!(
-                "unsupported output format '{other}' \
-                 (supported: 'raw', 'qcow2', 'vmdk', 'vpc', 'vhdx')"
-            )
-            .into());
-        }
-    };
+    let target_format = parse_output_format(&args.output_format)?;
     let is_qcow2_output = target_format == 2;
     let is_vmdk_output = target_format == 3;
     let is_vhd_output = target_format == 5;
@@ -8748,6 +8879,110 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         return Err("--luks-encrypt-passphrase cannot be combined with -c (compression)".into());
     }
 
+    // Resolve QCOW2 AES passphrase (--qcow2-password or --qcow2-password-file)
+    let qcow2_passphrase = if let Some(ref pass) = args.qcow2_password {
+        Some(pass.clone())
+    } else if let Some(ref path) = args.qcow2_password_file {
+        let mut data = std::fs::read_to_string(path)?;
+        if data.ends_with('\n') {
+            data.pop();
+        }
+        Some(data)
+    } else {
+        None
+    };
+
+    // Resolve LUKS passphrase (--luks-passphrase or --luks-passphrase-file)
+    let luks_passphrase = if let Some(ref pp) = args.luks_passphrase {
+        Some(pp.clone())
+    } else if let Some(ref path) = args.luks_passphrase_file {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read LUKS passphrase file '{path}': {e}"))?;
+        Some(content.trim_end_matches('\n').to_string())
+    } else {
+        None
+    };
+    // Same config field is used for both crypt_method=1 and =2 decrypt.
+    let decrypt_passphrase = qcow2_passphrase.or(luks_passphrase);
+
+    // Resolve skip_zeros for the convert flags:
+    //   CLI --no-skip-zeros > CLI --skip-zeros/-S > config convert.sparse > default(true)
+    let skip_zeros = if args.no_skip_zeros {
+        false
+    } else if args.skip_zeros {
+        true
+    } else {
+        config::load_config().config.convert.sparse.unwrap_or(true)
+    };
+
+    // QCOW2 output cluster size as a bit shift (0 for non-qcow2 output).
+    let output_cluster_bits: u32 = if is_qcow2_output {
+        args.cluster_size.trailing_zeros()
+    } else {
+        0
+    };
+
+    // Assemble the ConvertConfig flag bits. VERBOSE is added by
+    // execute_convert from its `verbose` parameter; DD_WINDOW is added
+    // there when a window is present (never for convert).
+    let mut flags: u32 = 0;
+    if skip_zeros {
+        flags |= CONVERT_CONFIG_FLAG_SKIP_ZEROS;
+    }
+    if args.compress {
+        flags |= CONVERT_CONFIG_FLAG_COMPRESS;
+    }
+    if args.extended_l2 {
+        flags |= CONVERT_CONFIG_FLAG_EXTENDED_L2;
+    }
+    if luks_encrypt_passphrase.is_some() {
+        flags |= CONVERT_CONFIG_FLAG_ENCRYPT_LUKS;
+    }
+
+    let luks_encrypt = luks_encrypt_passphrase.map(|passphrase| LuksEncryptParams {
+        passphrase,
+        iterations: args.luks_encrypt_iterations,
+    });
+
+    let exec = ConvertExecution {
+        input: args.input,
+        output: args.output,
+        target_format,
+        flags,
+        output_cluster_bits,
+        output_grain_size: args.grain_size,
+        output_block_size: args.block_size,
+        sector_size: args.sector_size,
+        progress_percent: args.progress_percent,
+        is_vmdk_flat_output,
+        no_create: args.no_create,
+        decrypt_passphrase,
+        luks_encrypt,
+        snapshot: args.snapshot,
+        max_guest_memory: args.max_guest_memory,
+        window: None,
+        output_vsize_override: None,
+    };
+
+    execute_convert(exec, verbose)
+}
+
+/// Launch the convert guest, run the vCPU loop, and finalise the output.
+/// Shared by `run_convert` (window `None`) and `run_dd` (window `Some`).
+/// Behaviour for convert is identical to the previous inline body.
+fn execute_convert(
+    exec: ConvertExecution,
+    verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let target_format = exec.target_format;
+    let is_qcow2_output = target_format == 2;
+    let is_vmdk_output = target_format == 3;
+    let is_vhd_output = target_format == 5;
+    let is_vhdx_output = target_format == 6;
+    let is_vmdk_flat_output = exec.is_vmdk_flat_output;
+    // skip_zeros drives sparse output sizing + the raw truncate below.
+    let skip_zeros = exec.flags & CONVERT_CONFIG_FLAG_SKIP_ZEROS != 0;
+
     // Auto-discover binaries
     let core_path = get_binary_path("core.bin");
     let operation_path = get_binary_path("convert.bin");
@@ -8766,22 +9001,10 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         operation_path.display()
     );
 
-    // Load configuration and resolve skip_zeros:
-    //   CLI --no-skip-zeros > CLI --skip-zeros/-S > config convert.sparse > default(true)
-    let tracked_config = config::load_config();
-    let skip_zeros = if args.no_skip_zeros {
-        false
-    } else if args.skip_zeros {
-        true
-    } else {
-        tracked_config.config.convert.sparse.unwrap_or(true)
-    };
-    debug!("skip_zeros = {skip_zeros}");
-
     // Discover input backing chain
-    let security_config = tracked_config.config.security;
-    let chain = discover_backing_chain(Path::new(&args.input), args.sector_size, &security_config)
-        .map_err(|e| format!("error discovering backing chain for {}: {}", args.input, e))?;
+    let security_config = config::load_config().config.security;
+    let chain = discover_backing_chain(Path::new(&exec.input), exec.sector_size, &security_config)
+        .map_err(|e| format!("error discovering backing chain for {}: {}", exec.input, e))?;
 
     if verbose {
         debug!("Input chain ({} image(s)):", chain.len());
@@ -8819,11 +9042,16 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         }
     }
 
-    // Get virtual size from top of chain for output capacity
+    // Get virtual size from top of chain. Convert sizes the output to
+    // the input's virtual size; dd overrides it with its windowed
+    // out_vsize (output_vsize_override). The input virtual size is still
+    // needed for chain semantics, so keep both.
     let virtual_size = chain.images()[0].virtual_size;
     if virtual_size == 0 {
         return Err("input image has zero virtual size".into());
     }
+    // Output virtual size: input's for convert, dd's out_vsize otherwise.
+    let out_vsize = exec.output_vsize_override.unwrap_or(virtual_size);
 
     // Open output file.
     // For QCOW2 output the file is always sparse (the guest
@@ -8834,7 +9062,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // format to Raw and derive the flat extent filename.
     let (effective_target_format, flat_extent_path) = if is_vmdk_flat_output {
         // Derive flat extent filename: "foo.vmdk" -> "foo-flat.vmdk"
-        let out_path = Path::new(&args.output);
+        let out_path = Path::new(&exec.output);
         let stem = out_path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -8849,33 +9077,33 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     let is_structured_output =
         (is_qcow2_output || is_vmdk_output || is_vhd_output || is_vhdx_output)
             && !is_vmdk_flat_output;
-    let output_capacity = if is_vhdx_output {
-        // VHDX uses 32MB blocks — data is rounded up to block_size
-        // boundaries, plus ~4MB metadata overhead (file identifier,
-        // headers, region tables, log, BAT, metadata region).
-        let vhdx_block: u64 = 32 * 1024 * 1024;
-        virtual_size
-            .div_ceil(vhdx_block)
-            .saturating_mul(vhdx_block)
-            .saturating_add(10 * 1024 * 1024)
-    } else if is_structured_output {
-        // QCOW2, VMDK, and VHD need headroom for metadata (tables,
-        // headers, descriptor, BAT, alignment padding).
-        virtual_size
-            .saturating_add(virtual_size / 100)
-            .saturating_add(10 * 1024 * 1024)
+    // The guest VHD writer declares a CHS-rounded virtual size for a
+    // windowed dd copy (it stamps `chs_rounded_size(out_vsize)`, matching
+    // qemu-img dd; see convert/main.rs ImageFormat::Vhd). That rounding can
+    // bump the size over a block boundary, adding an extra BAT entry whose
+    // payload block + trailing footer land beyond `out_vsize`. The output
+    // device capacity must cover the declared size, not the unrounded
+    // window, or the guest's final write runs past the virtio device's
+    // capacity and the I/O times out. Whole-image convert keeps the
+    // verbatim size (already CHS-aligned for normal images), so only the
+    // dd-window path (`exec.window.is_some()`) needs the round-up.
+    let capacity_vsize = if is_vhd_output && exec.window.is_some() {
+        vhd::chs_rounded_size(out_vsize)
     } else {
-        virtual_size
+        out_vsize
     };
+    // Use the effective format so monolithicFlat (effective Raw) sizes
+    // as a raw extent, matching the original inline capacity logic.
+    let output_capacity = compute_output_capacity(effective_target_format, capacity_vsize);
 
     // For monolithicFlat, the output device is the flat extent file.
     let output_file_path = if let Some((ref flat_path, _)) = flat_extent_path {
         flat_path.clone()
     } else {
-        Path::new(&args.output).to_path_buf()
+        Path::new(&exec.output).to_path_buf()
     };
 
-    let output_backing = if args.no_create {
+    let output_backing = if exec.no_create {
         BackingStore::open(&output_file_path, false, None, false)?
     } else if is_structured_output {
         BackingStore::open(
@@ -8885,10 +9113,20 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
             true, // always sparse for structured formats
         )?
     } else {
+        // Raw output. The guest addresses the output in whole sectors and
+        // writes a full (zero-padded) final sector when out_vsize is not a
+        // multiple of the output sector size — as happens for a windowed dd
+        // copy. The virtio device advertises capacity rounded up to a whole
+        // sector (div_ceil), so the backing store must accept that final
+        // padded sector too; otherwise the guest's last write is rejected
+        // (write beyond capacity) and the conversion stalls. Round the
+        // backing capacity up to the output sector size; the file is
+        // truncated back to out_vsize after the guest finishes.
+        let raw_capacity = out_vsize.div_ceil(exec.sector_size as u64) * exec.sector_size as u64;
         BackingStore::open(
             &output_file_path,
             false,
-            Some(virtual_size),
+            Some(raw_capacity),
             // sparse when skipping zeros (default: true)
             skip_zeros,
         )?
@@ -8901,7 +9139,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     );
 
     // Parse --max-guest-memory for LUKS v2 Argon2id support
-    let guest_mem_size: u64 = if let Some(ref mem_str) = args.max_guest_memory {
+    let guest_mem_size: u64 = if let Some(ref mem_str) = exec.max_guest_memory {
         let requested = parse_memory_size(mem_str)?;
         if requested < GUEST_MEM_SIZE {
             return Err(format!(
@@ -8961,28 +9199,17 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
     debug!("Loaded operation binary at 0x{OPERATION_LOAD_ADDR:x}");
 
-    // Write ConvertConfig at OPERATION_CONFIG_ADDR
-    let mut convert_flags: u32 = 0;
-    if skip_zeros {
-        convert_flags |= CONVERT_CONFIG_FLAG_SKIP_ZEROS;
-    }
-    if args.compress {
-        convert_flags |= CONVERT_CONFIG_FLAG_COMPRESS;
-    }
+    // Write ConvertConfig at OPERATION_CONFIG_ADDR. The caller assembled
+    // SKIP_ZEROS/COMPRESS/EXTENDED_L2/ENCRYPT_LUKS in exec.flags; add
+    // VERBOSE here, and DD_WINDOW when a window is present.
+    let mut convert_flags: u32 = exec.flags;
     if verbose {
         convert_flags |= CONVERT_CONFIG_FLAG_VERBOSE;
     }
-    if args.extended_l2 {
-        convert_flags |= CONVERT_CONFIG_FLAG_EXTENDED_L2;
+    if exec.window.is_some() {
+        convert_flags |= CONVERT_CONFIG_FLAG_DD_WINDOW;
     }
-    if luks_encrypt_passphrase.is_some() {
-        convert_flags |= CONVERT_CONFIG_FLAG_ENCRYPT_LUKS;
-    }
-    let output_cluster_bits: u32 = if is_qcow2_output {
-        args.cluster_size.trailing_zeros()
-    } else {
-        0
-    };
+    let output_cluster_bits = exec.output_cluster_bits;
 
     guest_mem.write_obj(CONVERT_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
     guest_mem.write_obj(convert_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
@@ -8999,32 +9226,8 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         GuestAddress(OPERATION_CONFIG_ADDR + 16),
     )?;
 
-    // Resolve QCOW2 AES passphrase (--qcow2-password or --qcow2-password-file)
-    let qcow2_passphrase = if let Some(ref pass) = args.qcow2_password {
-        Some(pass.clone())
-    } else if let Some(ref path) = args.qcow2_password_file {
-        let mut data = std::fs::read_to_string(path)?;
-        if data.ends_with('\n') {
-            data.pop();
-        }
-        Some(data)
-    } else {
-        None
-    };
-
-    // Resolve LUKS passphrase (--luks-passphrase or --luks-passphrase-file)
-    let luks_passphrase = if let Some(ref pp) = args.luks_passphrase {
-        Some(pp.clone())
-    } else if let Some(ref path) = args.luks_passphrase_file {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("failed to read LUKS passphrase file '{path}': {e}"))?;
-        Some(content.trim_end_matches('\n').to_string())
-    } else {
-        None
-    };
-
     // Write passphrase to ConvertConfig (same field for both crypt_method=1 and =2)
-    let effective_passphrase = qcow2_passphrase.or(luks_passphrase);
+    let effective_passphrase = exec.decrypt_passphrase.clone();
     if let Some(ref passphrase) = effective_passphrase {
         let pass_bytes = passphrase.as_bytes();
         if pass_bytes.len() > 256 {
@@ -9043,7 +9246,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     }
 
     // Write snapshot ID if specified
-    if let Some(ref snapshot_id) = args.snapshot {
+    if let Some(ref snapshot_id) = exec.snapshot {
         let snap_bytes = snapshot_id.as_bytes();
         if snap_bytes.len() > 64 {
             return Err("Snapshot ID too long (max 64 bytes)".into());
@@ -9068,7 +9271,8 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     guest_mem.write_obj(argon2_mem_size, GuestAddress(OPERATION_CONFIG_ADDR + 360))?;
 
     // Write LUKS encrypt config fields (offsets 368-391)
-    if let Some(ref encrypt_pp) = luks_encrypt_passphrase {
+    if let Some(ref luks_encrypt) = exec.luks_encrypt {
+        let encrypt_pp = &luks_encrypt.passphrase;
         use rand::RngExt;
         let mut rng = rand::rng();
 
@@ -9121,7 +9325,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 
         // Write LUKS encrypt config fields
         guest_mem.write_obj(
-            args.luks_encrypt_iterations,
+            luks_encrypt.iterations,
             GuestAddress(OPERATION_CONFIG_ADDR + 368),
         )?;
         guest_mem.write_obj(key_bytes as u32, GuestAddress(OPERATION_CONFIG_ADDR + 372))?;
@@ -9137,13 +9341,27 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 
         debug!(
             "LUKS encrypt: key_bytes={}, iterations={}, random_data={}B at 0x{:x}",
-            key_bytes, args.luks_encrypt_iterations, total_random, luks_data_addr
+            key_bytes, luks_encrypt.iterations, total_random, luks_data_addr
         );
     }
 
     // Write grain size and block size at offsets 392 and 396
-    guest_mem.write_obj(args.grain_size, GuestAddress(OPERATION_CONFIG_ADDR + 392))?;
-    guest_mem.write_obj(args.block_size, GuestAddress(OPERATION_CONFIG_ADDR + 396))?;
+    guest_mem.write_obj(
+        exec.output_grain_size,
+        GuestAddress(OPERATION_CONFIG_ADDR + 392),
+    )?;
+    guest_mem.write_obj(
+        exec.output_block_size,
+        GuestAddress(OPERATION_CONFIG_ADDR + 396),
+    )?;
+
+    // Write the dd window at offsets 400/408. For convert (window None)
+    // these are zeros and FLAG_DD_WINDOW is clear, so the guest ignores
+    // them — byte-identical to the pre-refactor config. The guest honours
+    // the window as of phase 3.
+    let (window_start, window_end) = exec.window.unwrap_or((0, 0));
+    guest_mem.write_obj(window_start, GuestAddress(OPERATION_CONFIG_ADDR + 400))?;
+    guest_mem.write_obj(window_end, GuestAddress(OPERATION_CONFIG_ADDR + 408))?;
 
     debug!(
         "Wrote convert config at 0x{:x} \
@@ -9154,8 +9372,8 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         input_device_count,
         target_format,
         output_cluster_bits,
-        args.grain_size,
-        args.block_size,
+        exec.output_grain_size,
+        exec.output_block_size,
         argon2_mem_size,
     );
 
@@ -9169,7 +9387,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // Set up input chain devices (read-only), including data file if present
     open_chain_devices(
         &chain,
-        args.sector_size as u64,
+        exec.sector_size as u64,
         &mut device_set,
         &mut io_events,
         0,
@@ -9183,12 +9401,15 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // so that cluster writes align to whole sectors.
     // For uncompressed VMDK and raw, use sector_size (VMDK GTEs
     // always reference 512-byte sectors internally).
-    let output_sector_size = if (is_qcow2_output || is_vmdk_output) && args.compress {
+    let compress = exec.flags & CONVERT_CONFIG_FLAG_COMPRESS != 0;
+    // For qcow2, recover the cluster size from its bit shift.
+    let output_cluster_size: u32 = 1u32 << output_cluster_bits;
+    let output_sector_size = if (is_qcow2_output || is_vmdk_output) && compress {
         512
     } else if is_qcow2_output {
-        core::cmp::min(args.sector_size, args.cluster_size)
+        core::cmp::min(exec.sector_size, output_cluster_size)
     } else {
-        args.sector_size
+        exec.sector_size
     };
     let output_idx = input_device_count;
     let output_mmio = device_mmio_base(output_idx);
@@ -9203,7 +9424,7 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     );
     debug!(
         "Created output device [{}] at MMIO 0x{:x}: {}",
-        output_idx, output_mmio, args.output
+        output_idx, output_mmio, exec.output
     );
     let output_device = Arc::new(Mutex::new(output_device));
     device_set.add_device(Arc::clone(&output_device), false);
@@ -9274,10 +9495,10 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 
     // Queue config with input chain devices + output device
     let config = vmm_config_chain_with_output(
-        args.sector_size,
+        exec.sector_size,
         output_sector_size,
         input_device_count,
-        args.progress_percent,
+        exec.progress_percent,
     );
     serial_transmitter.queue_config(&config);
     debug!(
@@ -9405,30 +9626,47 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // file; now we create the small text descriptor that points at
     // the flat file.
     if let Some((ref _flat_path, ref flat_name)) = flat_extent_path {
-        let capacity_sectors = virtual_size / 512;
+        // monolithicFlat is convert-only, so out_vsize == virtual_size.
+        let capacity_sectors = out_vsize / 512;
         let mut desc_buf = [0u8; 1024];
         let n =
             vmdk::build_flat_descriptor(&mut desc_buf, 0, capacity_sectors, flat_name.as_bytes());
-        std::fs::write(&args.output, &desc_buf[..n])?;
+        std::fs::write(&exec.output, &desc_buf[..n])?;
         debug!(
             "Wrote monolithicFlat descriptor: {} ({} bytes)",
-            args.output, n
+            exec.output, n
         );
     }
 
-    // For sparse raw output, truncate to virtual size so the
-    // apparent file size matches the image's virtual size (same
-    // as qemu-img convert behavior).
-    if skip_zeros && !is_structured_output && flat_extent_path.is_none() {
-        let f = std::fs::OpenOptions::new().write(true).open(&args.output)?;
-        f.set_len(virtual_size)?;
+    // Truncate raw output to its final size.
+    //
+    // For sparse convert output, that is the output virtual size, so the
+    // apparent file size matches the image's virtual size (same as qemu-img
+    // convert). For convert out_vsize == virtual_size.
+    //
+    // For a windowed dd copy the contract differs: qemu-img dd rounds the
+    // output file size UP to a 512-byte (sector) boundary and zero-pads the
+    // final partial block, so a 1000-byte window yields a 1024-byte file. The
+    // guest already writes that padded final sector; the device capacity was
+    // rounded up so the write was accepted. Truncate to the rounded size
+    // (not the exact out_vsize) so the result is byte- and size-identical to
+    // qemu-img dd. An empty window (out_vsize == 0) rounds to 0 -> 0-byte file.
+    if !is_structured_output && flat_extent_path.is_none() {
+        if exec.window.is_some() {
+            let rounded = out_vsize.div_ceil(exec.sector_size as u64) * exec.sector_size as u64;
+            let f = std::fs::OpenOptions::new().write(true).open(&exec.output)?;
+            f.set_len(rounded)?;
+        } else if skip_zeros {
+            let f = std::fs::OpenOptions::new().write(true).open(&exec.output)?;
+            f.set_len(out_vsize)?;
+        }
     }
 
     // For monolithicFlat output, truncate the flat extent file to
     // the virtual size (matching qemu-img behavior).
     if let Some((ref flat_path, _)) = flat_extent_path {
         let f = std::fs::OpenOptions::new().write(true).open(flat_path)?;
-        f.set_len(virtual_size)?;
+        f.set_len(out_vsize)?;
     }
 
     Ok(())
@@ -9996,6 +10234,205 @@ fn parse_create_o_options(
     }
 
     Ok(out)
+}
+
+/// Parsed and validated `dd` operands (upstream qemu-img dd parity).
+#[derive(Debug)]
+struct DdParsed {
+    /// `if=` input image path (mandatory).
+    input: String,
+    /// `of=` output image path (mandatory).
+    output: String,
+    /// `bs=` block size in bytes. Range 1..=INT_MAX; default 512.
+    bs: u64,
+    /// `count=` number of blocks to copy. `None` ⇒ whole image.
+    count: Option<u64>,
+    /// `skip=` number of blocks to skip on input. Default 0.
+    skip: u64,
+    /// Input format override from `-f` (auto-detection is still
+    /// authoritative; see `run_dd`).
+    input_format: Option<String>,
+    /// Output format override from `-O`. `None` ⇒ default raw.
+    output_format: Option<String>,
+}
+
+/// Parse `dd` `name=value` operands into a validated `DdParsed`.
+///
+/// Rules (upstream qemu-img dd parity):
+/// - Each operand is split on the FIRST `=`. A token without `=`, or with
+///   a key not in {if,of,bs,count,skip}, is an error. Last value wins on a
+///   repeated key.
+/// - `bs`/`count`/`skip` parse via `parse_qemu_img_size` (1024-based
+///   suffixes). `count`/`skip` are block counts; `bs` is bytes.
+/// - `bs` range 1..=2147483647 (INT_MAX); `bs=0` is an error; absent ⇒ 512.
+/// - `skip` absent ⇒ 0; `count` absent ⇒ None.
+/// - `if=` and `of=` are both mandatory.
+fn parse_dd_operands(
+    operands: &[String],
+    input_format: Option<String>,
+    output_format: Option<String>,
+) -> Result<DdParsed, String> {
+    let mut input: Option<String> = None;
+    let mut output: Option<String> = None;
+    let mut bs: Option<u64> = None;
+    let mut count: Option<u64> = None;
+    let mut skip: Option<u64> = None;
+
+    for tok in operands {
+        let (key, value) = match tok.split_once('=') {
+            Some(kv) => kv,
+            None => return Err(format!("dd: unrecognized operand '{tok}'")),
+        };
+        match key {
+            "if" => input = Some(value.to_string()),
+            "of" => output = Some(value.to_string()),
+            "bs" => {
+                bs = Some(parse_qemu_img_size(value).map_err(|e| format!("dd: invalid bs: {e}"))?);
+            }
+            "count" => {
+                count = Some(
+                    parse_qemu_img_size(value).map_err(|e| format!("dd: invalid count: {e}"))?,
+                );
+            }
+            "skip" => {
+                skip =
+                    Some(parse_qemu_img_size(value).map_err(|e| format!("dd: invalid skip: {e}"))?);
+            }
+            _ => return Err(format!("dd: unrecognized operand '{tok}'")),
+        }
+    }
+
+    // bs range 1..=INT_MAX; bs=0 is an error; absent ⇒ 512.
+    let bs = match bs {
+        Some(v) => {
+            if !(1..=2147483647).contains(&v) {
+                return Err(format!("dd: invalid bs: {v} (must be 1..=2147483647)"));
+            }
+            v
+        }
+        None => 512,
+    };
+
+    let input = input.ok_or_else(|| "dd: 'if=' is required".to_string())?;
+    let output = output.ok_or_else(|| "dd: 'of=' is required".to_string())?;
+
+    Ok(DdParsed {
+        input,
+        output,
+        bs,
+        count,
+        skip: skip.unwrap_or(0),
+        input_format,
+        output_format,
+    })
+}
+
+/// Run the `dd` operation: parse operands, compute the input window from
+/// the input's virtual size, size the output accordingly, and launch the
+/// convert guest via `execute_convert` with the window set.
+///
+/// As of phase 3 the guest honours the window for raw output: windowed
+/// `skip`/`count`/`bs` copies are byte- and size-identical to `qemu-img dd`,
+/// including sub-sector-aligned windows and short final blocks. Windowed dd to
+/// a non-raw output format still copies the whole image (phase 4).
+fn run_dd(args: DdArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let parsed = parse_dd_operands(&args.operands, args.input_format, args.output_format)?;
+
+    // Output format: dd defaults to raw (1) when `-O` is absent — NOT the
+    // input format.
+    let target_format = match parsed.output_format {
+        Some(ref s) => parse_output_format(s)?,
+        None => 1u32,
+    };
+    let is_qcow2_output = target_format == 2;
+    let is_structured_output = matches!(target_format, 2 | 3 | 5 | 6);
+
+    // Device sector size for the conversion.
+    //
+    // RAW output uses a 512-byte device sector size, which is also the output
+    // sector size. qemu-img dd rounds its raw output file size up to a 512-byte
+    // boundary (zero-padding the final block), so the guest must address output
+    // in 512-byte sectors for the file size to match; a larger sector size
+    // would over-round the output (e.g. a 1000-byte window would become a
+    // 64 KiB file instead of 1024 bytes).
+    //
+    // STRUCTURED output (qcow2/vmdk/vpc/vhdx) uses the same 64KB sector size as
+    // `convert`: the structured writers assemble whole MAX_SECTOR_SIZE output
+    // sectors (the VHD/VHDX block path in particular assumes oss ==
+    // MAX_SECTOR_SIZE), and the declared virtual size / data is sized from the
+    // byte-granular window, not the device sector size, so the windowing is
+    // unaffected. The chain readers are byte-accurate regardless of sector
+    // size, so an unaligned sub-sector window_start is still read at the exact
+    // byte.
+    let sector_size: u32 = if is_structured_output {
+        MAX_SECTOR_SIZE
+    } else {
+        512
+    };
+    let progress_percent: u32 = 10;
+
+    // Discover the input backing chain and read its virtual size.
+    //
+    // `-f` (parsed.input_format) is accepted and validated by clap but its
+    // forcing is DEFERRED: `discover_backing_chain` auto-detects the input
+    // format and exposes no format-hint parameter, so auto-detection remains
+    // authoritative here. Forcing the input format is a small follow-up.
+    // Warn when a hint is supplied so the deferral is visible at runtime
+    // rather than only in the docs (a deliberate `-f qcow2` is a silent
+    // no-op otherwise).
+    if let Some(fmt) = &parsed.input_format {
+        eprintln!(
+            "dd: -f {} is accepted but ignored; the input format is \
+             auto-detected",
+            fmt
+        );
+    }
+    let security_config = config::load_config().config.security;
+    let chain = discover_backing_chain(Path::new(&parsed.input), sector_size, &security_config)
+        .map_err(|e| {
+            format!(
+                "error discovering backing chain for {}: {}",
+                parsed.input, e
+            )
+        })?;
+    let virtual_size = chain.images()[0].virtual_size;
+
+    let win = compute_dd_window(virtual_size, parsed.bs, parsed.count, parsed.skip);
+
+    // dd is DENSE: no SKIP_ZEROS, no compress, no encrypt, no extended-l2.
+    // execute_convert ORs in DD_WINDOW (and VERBOSE) itself; we pass none.
+    let flags: u32 = 0;
+
+    // Per-format defaults mirror convert's clap defaults: 64KB qcow2 cluster
+    // (cluster_bits 16), 64KB VMDK grain, VHD/VHDX block_size 0 (format
+    // default chosen downstream).
+    let output_cluster_bits: u32 = if is_qcow2_output {
+        65536u32.trailing_zeros()
+    } else {
+        0
+    };
+
+    let exec = ConvertExecution {
+        input: parsed.input,
+        output: parsed.output,
+        target_format,
+        flags,
+        output_cluster_bits,
+        output_grain_size: 65536,
+        output_block_size: 0,
+        sector_size,
+        progress_percent,
+        is_vmdk_flat_output: false,
+        no_create: false,
+        decrypt_passphrase: None,
+        luks_encrypt: None,
+        snapshot: None,
+        max_guest_memory: None,
+        window: Some((win.start, win.end)),
+        output_vsize_override: Some(win.out_vsize),
+    };
+
+    execute_convert(exec, verbose)
 }
 
 /// Run the measure operation (predict output size for a target format).
@@ -15408,5 +15845,251 @@ Offset          Length          Mapped to       File
         assert_eq!(json_escape("a\\b"), "a\\\\b");
         assert_eq!(json_escape("a\nb"), "a\\nb");
         assert_eq!(json_escape("\x07"), "\\u0007");
+    }
+}
+
+#[cfg(test)]
+mod dd_format_tests {
+    //! Unit tests for `parse_output_format` and `compute_output_capacity`.
+    //!
+    //! Pure-function tests; no KVM or testdata required.
+    use super::*;
+
+    // --- parse_output_format -------------------------------------------------
+
+    #[test]
+    fn parse_output_format_raw() {
+        assert_eq!(parse_output_format("raw").unwrap(), 1u32);
+    }
+
+    #[test]
+    fn parse_output_format_qcow2() {
+        assert_eq!(parse_output_format("qcow2").unwrap(), 2u32);
+    }
+
+    #[test]
+    fn parse_output_format_vmdk() {
+        assert_eq!(parse_output_format("vmdk").unwrap(), 3u32);
+    }
+
+    #[test]
+    fn parse_output_format_vpc() {
+        assert_eq!(parse_output_format("vpc").unwrap(), 5u32);
+    }
+
+    #[test]
+    fn parse_output_format_vhdx() {
+        assert_eq!(parse_output_format("vhdx").unwrap(), 6u32);
+    }
+
+    #[test]
+    fn parse_output_format_unknown_is_error() {
+        assert!(parse_output_format("bogus").is_err());
+        assert!(parse_output_format("").is_err());
+        assert!(parse_output_format("RAW").is_err()); // case-sensitive
+    }
+
+    // --- compute_output_capacity ---------------------------------------------
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn capacity_raw_is_vsize_unchanged() {
+        // Raw format: no headroom, capacity == vsize.
+        assert_eq!(compute_output_capacity(1, 0), 0);
+        assert_eq!(compute_output_capacity(1, MIB), MIB);
+        assert_eq!(compute_output_capacity(1, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn capacity_qcow2_exceeds_vsize() {
+        // QCOW2 (format 2) adds vsize/100 + 10 MiB headroom.
+        let vsize = MIB;
+        let expected = vsize + vsize / 100 + 10 * MIB;
+        assert_eq!(compute_output_capacity(2, vsize), expected);
+        // Must be strictly greater than vsize for non-zero input.
+        assert!(compute_output_capacity(2, vsize) > vsize);
+    }
+
+    #[test]
+    fn capacity_qcow2_zero_vsize() {
+        // With vsize=0, headroom is still 10 MiB (only the +1% term is 0).
+        assert_eq!(compute_output_capacity(2, 0), 10 * MIB);
+    }
+
+    #[test]
+    fn capacity_vmdk_exceeds_vsize() {
+        // VMDK (format 3) uses the same formula as QCOW2.
+        let vsize = MIB;
+        let expected = vsize + vsize / 100 + 10 * MIB;
+        assert_eq!(compute_output_capacity(3, vsize), expected);
+        assert!(compute_output_capacity(3, vsize) > vsize);
+    }
+
+    #[test]
+    fn capacity_vhd_includes_per_block_bitmap_overhead() {
+        // VHD/VPC (format 5) sizes for a *dense* dynamic output: each 2MB
+        // block's sector bitmap rounds the (bitmap + block) region up by
+        // one 64KB output sector, so capacity is vsize + n_blocks*64KB +
+        // 10 MiB — enough for dd's never-skip-zeros output.
+        let vhd_block: u64 = 2 * MIB;
+        let oss: u64 = MAX_SECTOR_SIZE as u64;
+
+        // 1 MiB input → 1 block of overhead.
+        let vsize = MIB;
+        let expected = vsize + oss + 10 * MIB;
+        assert_eq!(compute_output_capacity(5, vsize), expected);
+        assert!(compute_output_capacity(5, vsize) > vsize);
+
+        // 1 GiB input → 512 blocks of bitmap/alignment overhead.
+        let vsize = 1024 * MIB;
+        let n_blocks = vsize.div_ceil(vhd_block);
+        let expected = vsize + n_blocks * oss + 10 * MIB;
+        assert_eq!(compute_output_capacity(5, vsize), expected);
+
+        // One byte over a block boundary still rounds the block count up.
+        let vsize = vhd_block + 1;
+        let expected = vsize + 2 * oss + 10 * MIB;
+        assert_eq!(compute_output_capacity(5, vsize), expected);
+    }
+
+    #[test]
+    fn capacity_vhdx_rounds_to_32mib_blocks() {
+        // VHDX (format 6): round vsize up to 32 MiB boundary, add 10 MiB.
+        let block: u64 = 32 * MIB;
+
+        // 1 MiB input → ceil to 1 block (32 MiB) + 10 MiB = 42 MiB.
+        assert_eq!(compute_output_capacity(6, MIB), block + 10 * MIB);
+
+        // Exactly one block stays at one block.
+        assert_eq!(compute_output_capacity(6, block), block + 10 * MIB);
+
+        // One byte over a block → two blocks + 10 MiB.
+        assert_eq!(compute_output_capacity(6, block + 1), 2 * block + 10 * MIB);
+    }
+
+    #[test]
+    fn capacity_vhdx_zero_vsize() {
+        // vsize=0 → 0 blocks rounded up = 0, plus 10 MiB overhead.
+        assert_eq!(compute_output_capacity(6, 0), 10 * MIB);
+    }
+
+    #[test]
+    fn capacity_structured_formats_all_exceed_vsize_for_nonzero_input() {
+        // All structured formats must produce capacity > vsize when vsize > 0.
+        for fmt in [2u32, 3, 5, 6] {
+            let cap = compute_output_capacity(fmt, MIB);
+            assert!(
+                cap > MIB,
+                "format {fmt}: capacity {cap} should exceed vsize {MIB}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod dd_operand_tests {
+    //! Unit tests for `parse_dd_operands`.
+    //!
+    //! Tests live next to the parser (host-only, pure functions) rather
+    //! than in tests/ so they don't require KVM or testdata. The
+    //! whole-image end-to-end smoke test lives in tests/test_dd.py.
+    //! (The `compute_dd_window` window-math tests live in the `dd` crate.)
+    use super::*;
+
+    fn ops(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    // --- parse_dd_operands ------------------------------------------------
+
+    #[test]
+    fn if_and_of_parse() {
+        let p = parse_dd_operands(&ops(&["if=in.qcow2", "of=out.raw"]), None, None).unwrap();
+        assert_eq!(p.input, "in.qcow2");
+        assert_eq!(p.output, "out.raw");
+        assert_eq!(p.bs, 512);
+        assert_eq!(p.count, None);
+        assert_eq!(p.skip, 0);
+    }
+
+    #[test]
+    fn missing_if_is_error() {
+        let e = parse_dd_operands(&ops(&["of=out.raw"]), None, None).unwrap_err();
+        assert!(e.contains("'if='"), "unexpected error: {e}");
+    }
+
+    #[test]
+    fn missing_of_is_error() {
+        let e = parse_dd_operands(&ops(&["if=in.qcow2"]), None, None).unwrap_err();
+        assert!(e.contains("'of='"), "unexpected error: {e}");
+    }
+
+    #[test]
+    fn unknown_operand_is_error() {
+        let e = parse_dd_operands(&ops(&["if=a", "of=b", "foo=1"]), None, None).unwrap_err();
+        assert_eq!(e, "dd: unrecognized operand 'foo=1'");
+    }
+
+    #[test]
+    fn token_without_equals_is_error() {
+        let e = parse_dd_operands(&ops(&["if=a", "of=b", "bar"]), None, None).unwrap_err();
+        assert_eq!(e, "dd: unrecognized operand 'bar'");
+    }
+
+    #[test]
+    fn bs_zero_is_error() {
+        let e = parse_dd_operands(&ops(&["if=a", "of=b", "bs=0"]), None, None).unwrap_err();
+        assert!(e.contains("invalid bs"), "unexpected error: {e}");
+    }
+
+    #[test]
+    fn bs_defaults_to_512() {
+        let p = parse_dd_operands(&ops(&["if=a", "of=b"]), None, None).unwrap();
+        assert_eq!(p.bs, 512);
+    }
+
+    #[test]
+    fn bs_suffix_1m() {
+        let p = parse_dd_operands(&ops(&["if=a", "of=b", "bs=1M"]), None, None).unwrap();
+        assert_eq!(p.bs, 1048576);
+    }
+
+    #[test]
+    fn count_parsed() {
+        let p = parse_dd_operands(&ops(&["if=a", "of=b", "count=4"]), None, None).unwrap();
+        assert_eq!(p.count, Some(4));
+    }
+
+    #[test]
+    fn skip_parsed() {
+        let p = parse_dd_operands(&ops(&["if=a", "of=b", "skip=2"]), None, None).unwrap();
+        assert_eq!(p.skip, 2);
+    }
+
+    #[test]
+    fn last_value_wins_on_repeat() {
+        let p = parse_dd_operands(&ops(&["if=a", "if=c", "of=b"]), None, None).unwrap();
+        assert_eq!(p.input, "c");
+    }
+
+    #[test]
+    fn input_format_too_large_for_bs() {
+        // bs above INT_MAX is rejected.
+        let e =
+            parse_dd_operands(&ops(&["if=a", "of=b", "bs=2147483648"]), None, None).unwrap_err();
+        assert!(e.contains("invalid bs"), "unexpected error: {e}");
+    }
+
+    #[test]
+    fn formats_stored() {
+        let p = parse_dd_operands(
+            &ops(&["if=a", "of=b"]),
+            Some("qcow2".to_string()),
+            Some("raw".to_string()),
+        )
+        .unwrap();
+        assert_eq!(p.input_format.as_deref(), Some("qcow2"));
+        assert_eq!(p.output_format.as_deref(), Some("raw"));
     }
 }

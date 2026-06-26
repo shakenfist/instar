@@ -2253,6 +2253,18 @@ pub struct ConvertConfig {
     /// VHD: 512KB..=256MB. VHDX: 1MB..=256MB.
     /// Offset: 396
     pub output_block_size: u32,
+
+    /// Inclusive VIRTUAL byte offset where the guest begins reading the input
+    /// for a `dd` windowed copy. `0` when `FLAG_DD_WINDOW` is clear; only
+    /// meaningful with that flag set.
+    /// Offset: 400
+    pub window_start: u64,
+
+    /// Exclusive VIRTUAL byte offset where the guest stops reading. `0` when
+    /// `FLAG_DD_WINDOW` is clear; with the flag set, `window_end == 0` means
+    /// copy nothing (empty output).
+    /// Offset: 408
+    pub window_end: u64,
 }
 
 impl ConvertConfig {
@@ -2273,6 +2285,11 @@ impl ConvertConfig {
 
     /// Flag: Write LUKS-encrypted QCOW2 output (crypt_method=2)
     pub const FLAG_ENCRYPT_LUKS: u32 = 1 << 4;
+
+    /// Flag: Gates `window_start`/`window_end`; set only by the `dd` subcommand
+    /// to mark a windowed (and dense) convert. When clear, the guest ignores the
+    /// window fields and behaves identically to a plain `convert`.
+    pub const FLAG_DD_WINDOW: u32 = 1 << 5;
 
     /// Flag: Verbose logging
     pub const FLAG_VERBOSE: u32 = 1 << 31;
@@ -2299,6 +2316,8 @@ impl ConvertConfig {
             luks_random_data_size: 0,
             output_grain_size: 0,
             output_block_size: 0,
+            window_start: 0,
+            window_end: 0,
         }
     }
 
@@ -2310,6 +2329,11 @@ impl ConvertConfig {
     /// Check if skip-zeros is enabled
     pub fn should_skip_zeros(&self) -> bool {
         (self.flags & Self::FLAG_SKIP_ZEROS) != 0
+    }
+
+    /// Check if a `dd` input window (`window_start`/`window_end`) is active.
+    pub fn has_dd_window(&self) -> bool {
+        (self.flags & Self::FLAG_DD_WINDOW) != 0
     }
 
     /// Check if compression is enabled

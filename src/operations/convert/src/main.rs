@@ -452,6 +452,30 @@ pub unsafe extern "C" fn _start() -> u64 {
         None
     };
 
+    // The input window to copy. For a `dd` windowed copy this is
+    // [window_start, window_end); for normal whole-image convert it is
+    // [0, virtual_size). Phase 3 made convert_to_raw honour this window;
+    // phase 4 extends it to the structured writers (qcow2/vmdk/vhd/vhdx).
+    let (read_start, read_end) = if config.has_dd_window() {
+        (config.window_start, config.window_end)
+    } else {
+        (0, virtual_size)
+    };
+
+    // Output virtual size: the span of input copied to output offset 0.
+    // For whole-image convert this is `virtual_size`; for a windowed `dd`
+    // copy it is `read_end - read_start` (0 for an empty window).
+    let out_vsize = read_end.saturating_sub(read_start);
+
+    // Declared virtual size — the size each writer stamps into its
+    // header/metadata, which `qemu-img info` reports. qemu-img dd rounds
+    // `out_vsize` up per format: qcow2/vmdk/vhdx round to the next 512-byte
+    // sector, vpc (VHD) rounds up to whole CHS geometry. For whole-image
+    // convert `out_vsize` is already 512-aligned, so the 512 round-up is a
+    // no-op and convert output is unchanged. (VHD convert keeps writing the
+    // verbatim `virtual_size`, matching prior behaviour — see below.)
+    let declared_512 = out_vsize.div_ceil(512) * 512;
+
     // Dispatch based on target format
     let target = config.target_format();
     match target {
@@ -463,7 +487,9 @@ pub unsafe extern "C" fn _start() -> u64 {
                     chain_config,
                     &mut chain_states,
                     input_device_count,
-                    virtual_size,
+                    read_start,
+                    out_vsize,
+                    declared_512,
                     sector_size,
                     skip_zeros,
                     aes_key.as_ref(),
@@ -479,7 +505,9 @@ pub unsafe extern "C" fn _start() -> u64 {
                     chain_config,
                     &mut chain_states,
                     input_device_count,
-                    virtual_size,
+                    read_start,
+                    out_vsize,
+                    declared_512,
                     sector_size,
                     skip_zeros,
                     aes_key.as_ref(),
@@ -498,7 +526,9 @@ pub unsafe extern "C" fn _start() -> u64 {
                     chain_config,
                     &mut chain_states,
                     input_device_count,
-                    virtual_size,
+                    read_start,
+                    out_vsize,
+                    declared_512,
                     sector_size,
                     skip_zeros,
                     aes_key.as_ref(),
@@ -514,7 +544,9 @@ pub unsafe extern "C" fn _start() -> u64 {
                     chain_config,
                     &mut chain_states,
                     input_device_count,
-                    virtual_size,
+                    read_start,
+                    out_vsize,
+                    declared_512,
                     sector_size,
                     skip_zeros,
                     aes_key.as_ref(),
@@ -526,27 +558,45 @@ pub unsafe extern "C" fn _start() -> u64 {
                 )
             }
         }
-        ImageFormat::Vhd => convert_to_vhd(
-            call_table,
-            chain_config,
-            &mut chain_states,
-            input_device_count,
-            virtual_size,
-            sector_size,
-            skip_zeros,
-            aes_key.as_ref(),
-            luks_key,
-            luks_sector_size,
-            config.output_block_size_vhd(),
-            &mut bytes_read,
-            &layout,
-        ),
+        ImageFormat::Vhd => {
+            // VHD declared size: for a windowed dd copy, qemu rounds
+            // `out_vsize` up to whole CHS geometry (e.g. 3000 -> 34816).
+            // For whole-image convert keep stamping the verbatim
+            // `virtual_size` so the convert round-trip stays byte- and
+            // size-identical to prior behaviour (the convert suite reads
+            // the declared size back, and qemu's convert baseline is the
+            // unrounded input size).
+            let vhd_declared = if config.has_dd_window() {
+                vhd::chs_rounded_size(out_vsize)
+            } else {
+                out_vsize
+            };
+            convert_to_vhd(
+                call_table,
+                chain_config,
+                &mut chain_states,
+                input_device_count,
+                read_start,
+                out_vsize,
+                vhd_declared,
+                sector_size,
+                skip_zeros,
+                aes_key.as_ref(),
+                luks_key,
+                luks_sector_size,
+                config.output_block_size_vhd(),
+                &mut bytes_read,
+                &layout,
+            )
+        }
         ImageFormat::Vhdx => convert_to_vhdx(
             call_table,
             chain_config,
             &mut chain_states,
             input_device_count,
-            virtual_size,
+            read_start,
+            out_vsize,
+            declared_512,
             sector_size,
             skip_zeros,
             aes_key.as_ref(),
@@ -567,6 +617,8 @@ pub unsafe extern "C" fn _start() -> u64 {
             aes_key.as_ref(),
             luks_key,
             luks_sector_size,
+            read_start,
+            read_end,
             &mut bytes_read,
             &layout,
         ),
@@ -978,6 +1030,10 @@ unsafe fn convert_luks_wrapped_qcow2(
                     chain_config_mut,
                     &mut chain_states,
                     1,
+                    // LUKS-wrapped convert is whole-image: read_start 0,
+                    // out_vsize and declared_size both = inner_virtual_size.
+                    0,
+                    inner_virtual_size,
                     inner_virtual_size,
                     sector_size,
                     skip_zeros,
@@ -994,6 +1050,8 @@ unsafe fn convert_luks_wrapped_qcow2(
                     chain_config_mut,
                     &mut chain_states,
                     1,
+                    0,
+                    inner_virtual_size,
                     inner_virtual_size,
                     sector_size,
                     skip_zeros,
@@ -1013,6 +1071,8 @@ unsafe fn convert_luks_wrapped_qcow2(
                     chain_config_mut,
                     &mut chain_states,
                     1,
+                    0,
+                    inner_virtual_size,
                     inner_virtual_size,
                     sector_size,
                     skip_zeros,
@@ -1029,6 +1089,8 @@ unsafe fn convert_luks_wrapped_qcow2(
                     chain_config_mut,
                     &mut chain_states,
                     1,
+                    0,
+                    inner_virtual_size,
                     inner_virtual_size,
                     sector_size,
                     skip_zeros,
@@ -1046,6 +1108,10 @@ unsafe fn convert_luks_wrapped_qcow2(
             chain_config_mut,
             &mut chain_states,
             1,
+            // LUKS-wrapped convert is whole-image, so declared_size is the
+            // verbatim inner_virtual_size (matching prior VHD convert output).
+            0,
+            inner_virtual_size,
             inner_virtual_size,
             sector_size,
             skip_zeros,
@@ -1061,6 +1127,8 @@ unsafe fn convert_luks_wrapped_qcow2(
             chain_config_mut,
             &mut chain_states,
             1,
+            0,
+            inner_virtual_size,
             inner_virtual_size,
             sector_size,
             skip_zeros,
@@ -1082,6 +1150,11 @@ unsafe fn convert_luks_wrapped_qcow2(
             None,
             None,
             512,
+            // dd never uses the LUKS-wrapped path, so always copy the whole
+            // inner image here (the window is honoured only on the main
+            // dispatch path for `-O raw`).
+            0,
+            inner_virtual_size,
             bytes_read,
             layout,
         ),
@@ -1467,12 +1540,18 @@ unsafe fn convert_to_raw(
     chain_config: &ChainConfig,
     chain_states: &mut qcow2::ChainStates,
     input_device_count: usize,
-    virtual_size: u64,
+    _virtual_size: u64,
     sector_size: usize,
     skip_zeros: bool,
     aes_key: Option<&[u8; 16]>,
     luks_key: Option<&[u8]>,
     luks_sector_size: u64,
+    // [read_start, read_end) is the input window to copy to output offset 0.
+    // For normal (whole-image) convert this is (0, virtual_size); for a `dd`
+    // windowed copy it is (window_start, window_end). Output sectors are
+    // addressed relative to read_start so output offset 0 maps to read_start.
+    read_start: u64,
+    read_end: u64,
     bytes_read: &mut u64,
     layout: &ScratchLayout,
 ) -> u64 {
@@ -1514,29 +1593,85 @@ unsafe fn convert_to_raw(
     let mut staging_cluster_offset: u64 = u64::MAX;
 
     let buf = layout.buf_data as *mut u8;
-    let mut virtual_offset: u64 = 0;
+    let mut virtual_offset: u64 = read_start;
     let mut last_percent: u32 = 0;
     let mut chunks_done: u64 = 0;
-    let total_chunks = (virtual_size + chunk_size - 1) / chunk_size;
+    // Span of the input window. An empty window (read_end <= read_start, e.g.
+    // count=0 or skip past EOF) skips the loop entirely and writes nothing;
+    // total_chunks is guarded to 1 so the progress division never divides by
+    // zero (the loop body never executes for an empty window).
+    let span = read_end.saturating_sub(read_start);
+    let total_chunks = if span == 0 {
+        1
+    } else {
+        (span + chunk_size - 1) / chunk_size
+    };
 
-    // When cluster_size < output_sector_size we accumulate
-    // multiple clusters into the buffer before writing.  Track
-    // how many bytes we have buffered and the virtual offset
-    // where the current accumulation started.
+    // When cluster_size < output_sector_size we accumulate multiple clusters
+    // into the buffer before writing. `accum_bytes` counts buffered bytes not
+    // yet written to output. `accum_start` is the input virtual offset that
+    // currently maps to the start of the buffer; output sectors are addressed
+    // as `(accum_start - read_start) / output_sector_size`.
+    //
+    // On a flush we write only the whole sectors that have accumulated and
+    // carry the sub-sector remainder forward (advancing `accum_start` by the
+    // bytes written). This keeps `accum_start - read_start` a whole multiple
+    // of the output sector size at every flush, so the output stays densely
+    // packed from sector 0 even when a `dd` window starts partway into a
+    // cluster (which makes the first read short). For whole-image convert the
+    // remainder is always zero, so the carry is a no-op and the output is
+    // byte-identical to before.
     let mut accum_bytes: u64 = 0;
-    let mut accum_start: u64 = 0;
+    let mut accum_start: u64 = read_start;
 
-    while virtual_offset < virtual_size {
-        let remaining = virtual_size - virtual_offset;
-        let this_chunk = if remaining < chunk_size {
+    while virtual_offset < read_end {
+        let remaining = read_end - virtual_offset;
+        let mut this_chunk = if remaining < chunk_size {
             remaining
         } else {
             chunk_size
         };
 
+        // Clamp the read so it never crosses a cluster boundary. The chain
+        // reader's Standard-cluster path reads `read_size` bytes from
+        // `host_offset + (virtual_offset % cluster_size)`; a single cluster is
+        // contiguous on the host, but adjacent virtual clusters are not, so a
+        // read that began partway into a cluster (a `dd` window whose start is
+        // not cluster-aligned) and ran past the cluster boundary would pull in
+        // the wrong host bytes. Capping the chunk to the bytes left in the
+        // current cluster keeps every read within one cluster: the first
+        // (unaligned) read is short and all subsequent reads are
+        // cluster-aligned. For whole-image convert `virtual_offset` is always
+        // cluster-aligned, so this is a no-op.
+        let intra_cluster = virtual_offset % cluster_size;
+        if intra_cluster != 0 {
+            let to_cluster_end = cluster_size - intra_cluster;
+            if to_cluster_end < this_chunk {
+                this_chunk = to_cluster_end;
+            }
+        }
+
+        // Never read more than fits in the buffer past the bytes already
+        // accumulated. A carried sub-sector remainder (from an unaligned `dd`
+        // window) sits at the front of the buffer, so a full chunk_size read
+        // appended after it could otherwise exceed buf_size; the surplus is
+        // simply read on the next iteration. For whole-image convert
+        // accum_bytes is always zero here, so this is a no-op.
+        let buf_room = layout.buf_size as u64 - accum_bytes;
+        if buf_room < this_chunk {
+            this_chunk = buf_room;
+        }
+
         // Reset bump allocator before ZSTD decompression
         HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 
+        // The chain readers are byte-accurate: they fill exactly `this_chunk`
+        // bytes starting at the (possibly sub-sector) `virtual_offset`. No
+        // round-up or floor-alignment is needed, so a `dd` window that starts
+        // or ends partway through a device sector reads the exact bytes
+        // qemu-img dd would. For whole-image convert `virtual_offset` and
+        // `this_chunk` are sector-aligned and the readers take their original
+        // fast paths, so convert output is unchanged.
         if !qcow2::read_chain_virtual_cluster(
             call_table,
             0,
@@ -1565,17 +1700,13 @@ unsafe fn convert_to_raw(
             return *bytes_read;
         }
 
-        if accum_bytes == 0 {
-            accum_start = virtual_offset;
-        }
         accum_bytes += this_chunk;
         virtual_offset += this_chunk;
         chunks_done += 1;
 
         // Flush when we've accumulated enough for an output
         // sector, or when we've reached the end of the image.
-        let should_flush =
-            accum_bytes >= output_sector_size as u64 || virtual_offset >= virtual_size;
+        let should_flush = accum_bytes >= output_sector_size as u64 || virtual_offset >= read_end;
 
         if !should_flush {
             // Report progress even when not flushing
@@ -1592,8 +1723,14 @@ unsafe fn convert_to_raw(
             continue;
         }
 
-        // Check if the entire accumulated buffer is zeros
+        // Check if the entire accumulated buffer is zeros (skip-zeros / sparse
+        // output only, which is convert, never dd). Discard the buffered bytes
+        // without writing them, advancing `accum_start` past them so following
+        // data still lands at its correct absolute output sector. For convert
+        // `accum_bytes` is exactly one output sector here, so this matches the
+        // previous behaviour.
         if skip_zeros && is_all_zeros_ptr(buf, accum_bytes as usize) {
+            accum_start += accum_bytes;
             accum_bytes = 0;
             let percent = (chunks_done * 100 / total_chunks) as u32;
             if should_report_progress(progress_interval, percent, last_percent, chunks_done) {
@@ -1608,21 +1745,34 @@ unsafe fn convert_to_raw(
             continue;
         }
 
-        // Pad any partial final sector with zeros
-        let write_size = if accum_bytes < output_sector_size as u64 {
-            let pad_start = accum_bytes as usize;
-            let pad_end = output_sector_size;
-            for i in pad_start..pad_end {
+        // Whether this is the final flush (we have reached the end of the
+        // window). Only the final flush may emit a partial (zero-padded) output
+        // sector; intermediate flushes write whole sectors and carry any
+        // sub-sector remainder forward.
+        let at_end = virtual_offset >= read_end;
+
+        let (write_size, sectors_to_write) = if at_end {
+            // Pad the final partial sector with zeros so the written sector is
+            // zero-padded past the true window end, matching qemu-img dd (the
+            // host then truncates the file to the rounded out_vsize). For
+            // whole-image convert `accum_bytes` is already a sector multiple,
+            // so the padding loop is a no-op.
+            let ws = accum_bytes.div_ceil(output_sector_size as u64) * output_sector_size as u64;
+            for i in accum_bytes as usize..ws as usize {
                 *buf.add(i) = 0;
             }
-            output_sector_size as u64
+            (ws, ws / output_sector_size as u64)
         } else {
-            accum_bytes
+            // Write only the whole sectors accumulated so far; the sub-sector
+            // remainder is carried to the next accumulation below.
+            let full = accum_bytes / output_sector_size as u64;
+            (full * output_sector_size as u64, full)
         };
 
-        let output_first_sector = accum_start / output_sector_size as u64;
-        let sectors_to_write =
-            (write_size + output_sector_size as u64 - 1) / output_sector_size as u64;
+        // Address output sectors relative to read_start. `accum_start` is the
+        // virtual offset mapped to buf[0]; it advances by whole sectors per
+        // flush, so this division is always exact.
+        let output_first_sector = (accum_start - read_start) / output_sector_size as u64;
 
         for i in 0..sectors_to_write {
             let output_sector = output_first_sector + i;
@@ -1643,7 +1793,17 @@ unsafe fn convert_to_raw(
             }
         }
 
-        accum_bytes = 0;
+        // Carry the sub-sector remainder (bytes not yet written) to the front
+        // of the buffer so it joins the next accumulation, and advance
+        // `accum_start` by the bytes flushed. On the final flush `write_size`
+        // covers everything, so the remainder is empty.
+        let written = write_size;
+        let remainder = accum_bytes.saturating_sub(written);
+        if remainder > 0 {
+            core::ptr::copy(buf.add(written as usize), buf, remainder as usize);
+        }
+        accum_start += written;
+        accum_bytes = remainder;
 
         let percent = (chunks_done * 100 / total_chunks) as u32;
         if should_report_progress(progress_interval, percent, last_percent, chunks_done) {
@@ -2076,7 +2236,14 @@ unsafe fn convert_to_qcow2(
     chain_config: &ChainConfig,
     chain_states: &mut qcow2::ChainStates,
     input_device_count: usize,
-    virtual_size: u64,
+    // [read_start, read_start + out_vsize) is the input window copied to
+    // output offset 0 (whole-image convert: read_start = 0, out_vsize =
+    // virtual_size). `declared_size` is the virtual size stamped into the
+    // QCOW2 header — round_up(out_vsize, 512), so it may exceed out_vsize;
+    // bytes in [out_vsize, declared_size) read back as zero.
+    read_start: u64,
+    out_vsize: u64,
+    declared_size: u64,
     sector_size: usize,
     skip_zeros: bool,
     aes_key: Option<&[u8; 16]>,
@@ -2089,7 +2256,7 @@ unsafe fn convert_to_qcow2(
         call_table,
         config,
         input_device_count,
-        virtual_size,
+        declared_size,
         bytes_read,
         scratch_layout,
     ) {
@@ -2251,9 +2418,12 @@ unsafe fn convert_to_qcow2(
         );
 
         for vc in first_vc..last_vc {
+            // `virtual_offset` is the OUTPUT virtual offset of this cluster.
+            // Input is read at `read_start + virtual_offset`; only the bytes
+            // inside the window [0, out_vsize) carry data, the rest is zero.
             let virtual_offset = vc * layout.cluster_size;
-            let remaining = virtual_size - virtual_offset;
-            let this_chunk = core::cmp::min(remaining, layout.cluster_size);
+            let data_remaining = out_vsize.saturating_sub(virtual_offset);
+            let this_chunk = core::cmp::min(data_remaining, layout.cluster_size);
 
             // Read input data, one input cluster at a time
             let mut buf_filled_q: u64 = 0;
@@ -2266,7 +2436,7 @@ unsafe fn convert_to_qcow2(
                     call_table,
                     0,
                     input_device_count,
-                    virtual_offset + buf_filled_q,
+                    read_start + virtual_offset + buf_filled_q,
                     buf_data.add(buf_filled_q as usize),
                     piece,
                     sector_size,
@@ -2283,7 +2453,7 @@ unsafe fn convert_to_qcow2(
                     (call_table.send_error)(
                         b"convert\0".as_ptr(),
                         b"input\0".as_ptr(),
-                        (virtual_offset + buf_filled_q) / sector_size as u64,
+                        (read_start + virtual_offset + buf_filled_q) / sector_size as u64,
                         1,
                     );
                     (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
@@ -2437,7 +2607,7 @@ unsafe fn convert_to_qcow2(
     if !write_qcow2_metadata(
         call_table,
         &layout,
-        virtual_size,
+        declared_size,
         data_end_offset,
         None,
         luks_hdr_opt,
@@ -2523,7 +2693,10 @@ unsafe fn convert_to_qcow2_compressed(
     chain_config: &ChainConfig,
     chain_states: &mut qcow2::ChainStates,
     input_device_count: usize,
-    virtual_size: u64,
+    // See convert_to_qcow2 for the window/declared-size contract.
+    read_start: u64,
+    out_vsize: u64,
+    declared_size: u64,
     sector_size: usize,
     skip_zeros: bool,
     aes_key: Option<&[u8; 16]>,
@@ -2536,7 +2709,7 @@ unsafe fn convert_to_qcow2_compressed(
         call_table,
         config,
         input_device_count,
-        virtual_size,
+        declared_size,
         bytes_read,
         scratch_layout,
     ) {
@@ -2612,9 +2785,12 @@ unsafe fn convert_to_qcow2_compressed(
         );
 
         for vc in first_vc..last_vc {
+            // `virtual_offset` is the OUTPUT virtual offset of this cluster;
+            // input is read at `read_start + virtual_offset`, only within the
+            // [0, out_vsize) window. Bytes past out_vsize are zero-padded.
             let virtual_offset = vc * layout.cluster_size;
-            let remaining = virtual_size - virtual_offset;
-            let this_chunk = core::cmp::min(remaining, layout.cluster_size);
+            let data_remaining = out_vsize.saturating_sub(virtual_offset);
+            let this_chunk = core::cmp::min(data_remaining, layout.cluster_size);
 
             // Read input data, one input cluster at a time
             // when input clusters are smaller than output.
@@ -2629,7 +2805,7 @@ unsafe fn convert_to_qcow2_compressed(
                     call_table,
                     0,
                     input_device_count,
-                    virtual_offset + buf_filled,
+                    read_start + virtual_offset + buf_filled,
                     buf_data.add(buf_filled as usize),
                     piece,
                     sector_size,
@@ -2646,7 +2822,7 @@ unsafe fn convert_to_qcow2_compressed(
                     (call_table.send_error)(
                         b"convert\0".as_ptr(),
                         b"input\0".as_ptr(),
-                        (virtual_offset + buf_filled) / sector_size as u64,
+                        (read_start + virtual_offset + buf_filled) / sector_size as u64,
                         1,
                     );
                     (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
@@ -2850,7 +3026,7 @@ unsafe fn convert_to_qcow2_compressed(
     if !write_qcow2_metadata(
         call_table,
         &layout,
-        virtual_size,
+        declared_size,
         write_pos,
         Some((refcount_array, max_refcount_entries)),
         None, // LUKS encrypt + compress is not supported
@@ -2969,7 +3145,13 @@ unsafe fn convert_to_vmdk(
     chain_config: &ChainConfig,
     chain_states: &mut qcow2::ChainStates,
     input_device_count: usize,
-    virtual_size: u64,
+    // [read_start, read_start + out_vsize) is the input window copied to
+    // output offset 0 (whole-image convert: read_start = 0, out_vsize =
+    // virtual_size). `declared_size` (= round_up(out_vsize, 512)) sizes the
+    // VMDK capacity/geometry; bytes in [out_vsize, declared_size) are zero.
+    read_start: u64,
+    out_vsize: u64,
+    declared_size: u64,
     sector_size: usize,
     skip_zeros: bool,
     aes_key: Option<&[u8; 16]>,
@@ -2982,7 +3164,7 @@ unsafe fn convert_to_vmdk(
     let layout = match init_vmdk_output_layout(
         call_table,
         input_device_count,
-        virtual_size,
+        declared_size,
         grain_size_bytes,
         bytes_read,
         scratch_layout,
@@ -3027,10 +3209,14 @@ unsafe fn convert_to_vmdk(
             core::cmp::min(first_grain + layout.gtes_per_gt as u64, layout.total_grains);
 
         for grain in first_grain..last_grain {
+            // `virtual_offset` is the OUTPUT virtual offset of this grain;
+            // input is read at `read_start + virtual_offset`, within the
+            // [0, out_vsize) window. Bytes past out_vsize are zero-padded.
             let virtual_offset = grain * layout.grain_size_bytes;
-            let remaining = virtual_size - virtual_offset;
-            let this_chunk = if remaining < layout.grain_size_bytes {
-                remaining
+            let input_offset = read_start + virtual_offset;
+            let data_remaining = out_vsize.saturating_sub(virtual_offset);
+            let this_chunk = if data_remaining < layout.grain_size_bytes {
+                data_remaining
             } else {
                 layout.grain_size_bytes
             };
@@ -3038,50 +3224,44 @@ unsafe fn convert_to_vmdk(
             // Reset bump allocator before ZSTD decompression
             HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 
-            // Read input data
-            if !qcow2::read_chain_virtual_cluster(
-                call_table,
-                0,
-                input_device_count,
-                virtual_offset,
-                buf_data,
-                this_chunk,
-                sector_size,
-                chain_config,
-                chain_states,
-                scratch_layout.buf_compressed as *mut u8,
-                staging_buf,
-                &mut staging_cluster_offset,
-                aes_key,
-                luks_key,
-                luks_sector_size,
-                bytes_read,
-            ) {
+            // Read input data (skip the read entirely for a grain wholly
+            // past the window end — it is all zero-pad). Use the range
+            // reader so a 64 KiB grain is filled in full even when the input
+            // qcow2 has clusters smaller than the grain (sub-grain clusters
+            // would otherwise leave the grain tail stale/zero).
+            if this_chunk > 0
+                && !qcow2::read_chain_virtual_range(
+                    call_table,
+                    0,
+                    input_device_count,
+                    input_offset,
+                    buf_data,
+                    this_chunk,
+                    sector_size,
+                    chain_config,
+                    chain_states,
+                    scratch_layout.buf_compressed as *mut u8,
+                    staging_buf,
+                    &mut staging_cluster_offset,
+                    aes_key,
+                    luks_key,
+                    luks_sector_size,
+                    bytes_read,
+                )
+            {
                 (call_table.send_error)(
                     b"convert\0".as_ptr(),
                     b"input\0".as_ptr(),
-                    virtual_offset / sector_size as u64,
+                    input_offset / sector_size as u64,
                     1,
                 );
                 (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                 return *bytes_read;
             }
 
-            // When grain_size < input sector_size, read_raw_sectors
-            // reads one full input sector into buf_data. Shift the
-            // sub-grain portion at intra_sector to the buffer start.
-            // Both grain_size and sector_size are powers of two, so
-            // the grain never straddles a sector boundary and
-            // intra_sector + this_chunk <= sector_size <= buf capacity.
-            let intra_sector = (virtual_offset % sector_size as u64) as usize;
-            if intra_sector > 0 {
-                debug_assert!(
-                    intra_sector + this_chunk as usize <= scratch_layout.buf_size,
-                    "sub-grain copy would read past buffer: intra_sector={}, this_chunk={}, buf_size={}",
-                    intra_sector, this_chunk, scratch_layout.buf_size,
-                );
-                core::ptr::copy(buf_data.add(intra_sector), buf_data, this_chunk as usize);
-            }
+            // The chain reader is byte-accurate: it fills exactly
+            // `this_chunk` bytes at buf_data[0] starting from `input_offset`
+            // (even for a sub-sector start), so no post-read shift is needed.
 
             // Skip zero grains when configured
             if skip_zeros && is_all_zeros_ptr(buf_data, this_chunk as usize) {
@@ -3260,7 +3440,10 @@ unsafe fn convert_to_vmdk_compressed(
     chain_config: &ChainConfig,
     chain_states: &mut qcow2::ChainStates,
     input_device_count: usize,
-    virtual_size: u64,
+    // See convert_to_vmdk for the window/declared-size contract.
+    read_start: u64,
+    out_vsize: u64,
+    declared_size: u64,
     sector_size: usize,
     skip_zeros: bool,
     aes_key: Option<&[u8; 16]>,
@@ -3273,7 +3456,7 @@ unsafe fn convert_to_vmdk_compressed(
     let layout = match init_vmdk_output_layout(
         call_table,
         input_device_count,
-        virtual_size,
+        declared_size,
         grain_size_bytes,
         bytes_read,
         scratch_layout,
@@ -3331,10 +3514,14 @@ unsafe fn convert_to_vmdk_compressed(
             core::cmp::min(first_grain + layout.gtes_per_gt as u64, layout.total_grains);
 
         for grain in first_grain..last_grain {
+            // `virtual_offset` is the OUTPUT virtual offset of this grain;
+            // input is read at `read_start + virtual_offset`, within the
+            // [0, out_vsize) window. Bytes past out_vsize are zero-padded.
             let virtual_offset = grain * layout.grain_size_bytes;
-            let remaining = virtual_size - virtual_offset;
-            let this_chunk = if remaining < layout.grain_size_bytes {
-                remaining
+            let input_offset = read_start + virtual_offset;
+            let data_remaining = out_vsize.saturating_sub(virtual_offset);
+            let this_chunk = if data_remaining < layout.grain_size_bytes {
+                data_remaining
             } else {
                 layout.grain_size_bytes
             };
@@ -3342,50 +3529,41 @@ unsafe fn convert_to_vmdk_compressed(
             // Reset bump allocator before ZSTD decompression
             HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 
-            // Read input data
-            if !qcow2::read_chain_virtual_cluster(
-                call_table,
-                0,
-                input_device_count,
-                virtual_offset,
-                buf_data,
-                this_chunk,
-                sector_size,
-                chain_config,
-                chain_states,
-                scratch_layout.buf_compressed as *mut u8,
-                staging_buf,
-                &mut staging_cluster_offset,
-                aes_key,
-                luks_key,
-                luks_sector_size,
-                bytes_read,
-            ) {
+            // Read input data (skip for a grain wholly past the window end).
+            // Range reader fills the whole grain even for sub-grain input
+            // clusters (see the monolithicSparse grain loop above).
+            if this_chunk > 0
+                && !qcow2::read_chain_virtual_range(
+                    call_table,
+                    0,
+                    input_device_count,
+                    input_offset,
+                    buf_data,
+                    this_chunk,
+                    sector_size,
+                    chain_config,
+                    chain_states,
+                    scratch_layout.buf_compressed as *mut u8,
+                    staging_buf,
+                    &mut staging_cluster_offset,
+                    aes_key,
+                    luks_key,
+                    luks_sector_size,
+                    bytes_read,
+                )
+            {
                 (call_table.send_error)(
                     b"convert\0".as_ptr(),
                     b"input\0".as_ptr(),
-                    virtual_offset / sector_size as u64,
+                    input_offset / sector_size as u64,
                     1,
                 );
                 (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                 return *bytes_read;
             }
 
-            // When grain_size < input sector_size, read_raw_sectors
-            // reads one full input sector into buf_data. Shift the
-            // sub-grain portion at intra_sector to the buffer start.
-            // Both grain_size and sector_size are powers of two, so
-            // the grain never straddles a sector boundary and
-            // intra_sector + this_chunk <= sector_size <= buf capacity.
-            let intra_sector = (virtual_offset % sector_size as u64) as usize;
-            if intra_sector > 0 {
-                debug_assert!(
-                    intra_sector + this_chunk as usize <= scratch_layout.buf_size,
-                    "sub-grain copy would read past buffer: intra_sector={}, this_chunk={}, buf_size={}",
-                    intra_sector, this_chunk, scratch_layout.buf_size,
-                );
-                core::ptr::copy(buf_data.add(intra_sector), buf_data, this_chunk as usize);
-            }
+            // The chain reader is byte-accurate (exact `this_chunk` bytes at
+            // buf_data[0] from `input_offset`), so no post-read shift is needed.
 
             // Skip zero grains
             if skip_zeros && is_all_zeros_ptr(buf_data, this_chunk as usize) {
@@ -3679,7 +3857,16 @@ unsafe fn convert_to_vhd(
     chain_config: &ChainConfig,
     chain_states: &mut qcow2::ChainStates,
     input_device_count: usize,
-    virtual_size: u64,
+    // [read_start, read_start + out_vsize) is the input window copied to
+    // output offset 0 (whole-image convert: read_start = 0, out_vsize =
+    // virtual_size). `declared_size` is the size stamped into the VHD footer
+    // and used to size the BAT/geometry: for a windowed dd copy this is the
+    // CHS-rounded size qemu-img dd uses (e.g. 3000 -> 34816); for convert it
+    // is the verbatim virtual_size (unchanged). Bytes in
+    // [out_vsize, declared_size) read back as zero.
+    read_start: u64,
+    out_vsize: u64,
+    declared_size: u64,
     sector_size: usize,
     skip_zeros: bool,
     aes_key: Option<&[u8; 16]>,
@@ -3692,7 +3879,7 @@ unsafe fn convert_to_vhd(
     let oss = (call_table.get_output_sector_size)();
     let oc = (call_table.get_output_capacity)();
     let progress_interval = (call_table.get_progress_interval)();
-    let max_table_entries = ((virtual_size + block_size - 1) / block_size) as u32;
+    let max_table_entries = ((declared_size + block_size - 1) / block_size) as u32;
 
     // Sector bitmap: ceil(block_size / 512 / 8) rounded up to 512
     let sectors_per_block = block_size / 512;
@@ -3727,9 +3914,9 @@ unsafe fn convert_to_vhd(
 
     (call_table.verbose_print)(b"convert: starting VHD conversion\n\0".as_ptr());
 
-    // Generate a deterministic UUID from virtual_size
+    // Generate a deterministic UUID from the declared size
     let mut uuid = [0u8; 16];
-    let size_bytes = virtual_size.to_le_bytes();
+    let size_bytes = declared_size.to_le_bytes();
     uuid[0..8].copy_from_slice(&size_bytes);
     // Mark as UUID version 4, variant 1 for basic conformance
     uuid[6] = (uuid[6] & 0x0F) | 0x40; // version 4
@@ -3742,7 +3929,7 @@ unsafe fn convert_to_vhd(
     let footer_slice = core::slice::from_raw_parts_mut(buf_hdr, vhd::FOOTER_SIZE);
     vhd::build_footer(
         footer_slice,
-        virtual_size,
+        declared_size,
         vhd::DISK_TYPE_DYNAMIC,
         dyn_header_offset,
         &uuid,
@@ -3820,10 +4007,14 @@ unsafe fn convert_to_vhd(
         // (which aliases bitmap_buf via buf_multipurpose) is used
         // for input reads that overwrite the bitmap data.
         core::ptr::write_bytes(bitmap_buf, 0xFF, bitmap_bytes as usize);
+        // `virtual_offset` is the OUTPUT virtual offset of this block; input
+        // is read at `read_start + virtual_offset`, within the [0, out_vsize)
+        // window. `this_block` is the windowed data length — the remainder of
+        // the block (up to block_size) is zero-padded, matching qemu.
         let virtual_offset = block_idx as u64 * block_size;
-        let remaining = virtual_size - virtual_offset;
-        let this_block = if remaining < block_size {
-            remaining
+        let data_remaining = out_vsize.saturating_sub(virtual_offset);
+        let this_block = if data_remaining < block_size {
+            data_remaining
         } else {
             block_size
         };
@@ -3837,7 +4028,7 @@ unsafe fn convert_to_vhd(
         let chunk_size = MAX_SECTOR_SIZE as u64;
         let mut intra_offset: u64 = 0;
 
-        // First pass: check if entire block is zeros
+        // First pass: check if entire windowed block is zeros
         while intra_offset < this_block {
             let chunk_remaining = this_block - intra_offset;
             let this_chunk = if chunk_remaining < chunk_size {
@@ -3848,11 +4039,11 @@ unsafe fn convert_to_vhd(
 
             HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 
-            if !qcow2::read_chain_virtual_cluster(
+            if !qcow2::read_chain_virtual_range(
                 call_table,
                 0,
                 input_device_count,
-                virtual_offset + intra_offset,
+                read_start + virtual_offset + intra_offset,
                 buf_data,
                 this_chunk,
                 sector_size,
@@ -3869,7 +4060,7 @@ unsafe fn convert_to_vhd(
                 (call_table.send_error)(
                     b"convert\0".as_ptr(),
                     b"input\0".as_ptr(),
-                    (virtual_offset + intra_offset) / sector_size as u64,
+                    (read_start + virtual_offset + intra_offset) / sector_size as u64,
                     1,
                 );
                 (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
@@ -3963,11 +4154,11 @@ unsafe fn convert_to_vhd(
 
                 HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 
-                if !qcow2::read_chain_virtual_cluster(
+                if !qcow2::read_chain_virtual_range(
                     call_table,
                     0,
                     input_device_count,
-                    virtual_offset + vdata_read,
+                    read_start + virtual_offset + vdata_read,
                     read_buf,
                     to_read,
                     sector_size,
@@ -3984,7 +4175,7 @@ unsafe fn convert_to_vhd(
                     (call_table.send_error)(
                         b"convert\0".as_ptr(),
                         b"input\0".as_ptr(),
-                        (virtual_offset + vdata_read) / sector_size as u64,
+                        (read_start + virtual_offset + vdata_read) / sector_size as u64,
                         1,
                     );
                     (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
@@ -4063,7 +4254,7 @@ unsafe fn convert_to_vhd(
     let footer_slice = core::slice::from_raw_parts_mut(buf_hdr, vhd::FOOTER_SIZE);
     vhd::build_footer(
         footer_slice,
-        virtual_size,
+        declared_size,
         vhd::DISK_TYPE_DYNAMIC,
         dyn_header_offset,
         &uuid,
@@ -4107,7 +4298,13 @@ unsafe fn convert_to_vhdx(
     chain_config: &ChainConfig,
     chain_states: &mut qcow2::ChainStates,
     input_device_count: usize,
-    virtual_size: u64,
+    // [read_start, read_start + out_vsize) is the input window copied to
+    // output offset 0 (whole-image convert: read_start = 0, out_vsize =
+    // virtual_size). `declared_size` (= round_up(out_vsize, 512)) sizes the
+    // BAT/metadata; bytes in [out_vsize, declared_size) are zero.
+    read_start: u64,
+    out_vsize: u64,
+    declared_size: u64,
     sector_size: usize,
     skip_zeros: bool,
     aes_key: Option<&[u8; 16]>,
@@ -4124,7 +4321,7 @@ unsafe fn convert_to_vhdx(
     let physical_sector_size: u32 = 4096;
 
     let (total_bat_entries, chunk_ratio, total_payload_blocks) =
-        match vhdx::calculate_bat_layout(virtual_size, block_size as u32, logical_sector_size) {
+        match vhdx::calculate_bat_layout(declared_size, block_size as u32, logical_sector_size) {
             Some(v) => v,
             None => {
                 (call_table.send_error)(
@@ -4146,7 +4343,12 @@ unsafe fn convert_to_vhdx(
     let log_offset: u64 = 0x10_0000; // 1MB
     let bat_offset: u64 = 0x20_0000; // 2MB
     let bat_size_bytes = total_bat_entries as u64 * 8;
-    let bat_region_size = align_up(bat_size_bytes, vhdx::MB_ALIGN as usize);
+    // The BAT region must be a whole number of 1MB regions, and at least one
+    // (an empty window, declared_size == 0, yields zero BAT entries; a
+    // zero-length BAT region is invalid and makes qemu reject the file, so
+    // floor it to a single 1MB region — qemu's own count=0 VHDX is likewise a
+    // valid header-only image).
+    let bat_region_size = align_up(bat_size_bytes, vhdx::MB_ALIGN as usize).max(vhdx::MB_ALIGN);
     let metadata_offset = bat_offset + bat_region_size;
     let metadata_region_size = vhdx::MB_ALIGN; // 1MB
     let payload_start = metadata_offset + metadata_region_size;
@@ -4312,7 +4514,7 @@ unsafe fn convert_to_vhdx(
     vhdx::build_metadata(
         md_slice,
         block_size as u32,
-        virtual_size,
+        declared_size,
         logical_sector_size,
         physical_sector_size,
         false, // no parent
@@ -4345,13 +4547,13 @@ unsafe fn convert_to_vhdx(
     shared::write_le_u32(item_slice, 0, block_size as u32);
     shared::write_le_u32(item_slice, 4, 0); // flags: no parent
                                             // Virtual Disk Size (u64) at offset 8
-    shared::write_le_u64(item_slice, 8, virtual_size);
+    shared::write_le_u64(item_slice, 8, declared_size);
     // Logical Sector Size (u32) at offset 16
     shared::write_le_u32(item_slice, 16, logical_sector_size);
     // Physical Sector Size (u32) at offset 20
     shared::write_le_u32(item_slice, 20, physical_sector_size);
     // Virtual Disk ID (16 bytes) at offset 24
-    let size_bytes = virtual_size.to_le_bytes();
+    let size_bytes = declared_size.to_le_bytes();
     item_slice[24..32].copy_from_slice(&size_bytes);
     let bs_bytes = (block_size as u32).to_le_bytes();
     item_slice[32..36].copy_from_slice(&bs_bytes);
@@ -4380,10 +4582,14 @@ unsafe fn convert_to_vhdx(
     let chunk_size = MAX_SECTOR_SIZE as u64;
 
     for block_idx in 0..total_payload_blocks {
+        // `virtual_offset` is the OUTPUT virtual offset of this block; input
+        // is read at `read_start + virtual_offset`, within the [0, out_vsize)
+        // window. `this_block` is the windowed data length; the block tail up
+        // to block_size is zero-padded (matching qemu).
         let virtual_offset = block_idx as u64 * block_size;
-        let remaining = virtual_size - virtual_offset;
-        let this_block = if remaining < block_size {
-            remaining
+        let data_remaining = out_vsize.saturating_sub(virtual_offset);
+        let this_block = if data_remaining < block_size {
+            data_remaining
         } else {
             block_size
         };
@@ -4404,11 +4610,11 @@ unsafe fn convert_to_vhdx(
 
             HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 
-            if !qcow2::read_chain_virtual_cluster(
+            if !qcow2::read_chain_virtual_range(
                 call_table,
                 0,
                 input_device_count,
-                virtual_offset + intra_offset,
+                read_start + virtual_offset + intra_offset,
                 buf_data,
                 this_chunk,
                 sector_size,
@@ -4425,7 +4631,7 @@ unsafe fn convert_to_vhdx(
                 (call_table.send_error)(
                     b"convert\0".as_ptr(),
                     b"input\0".as_ptr(),
-                    (virtual_offset + intra_offset) / sector_size as u64,
+                    (read_start + virtual_offset + intra_offset) / sector_size as u64,
                     1,
                 );
                 (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
@@ -4473,11 +4679,11 @@ unsafe fn convert_to_vhdx(
 
             HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 
-            if !qcow2::read_chain_virtual_cluster(
+            if !qcow2::read_chain_virtual_range(
                 call_table,
                 0,
                 input_device_count,
-                virtual_offset + intra_offset,
+                read_start + virtual_offset + intra_offset,
                 buf_data,
                 this_chunk,
                 sector_size,
@@ -4494,7 +4700,7 @@ unsafe fn convert_to_vhdx(
                 (call_table.send_error)(
                     b"convert\0".as_ptr(),
                     b"input\0".as_ptr(),
-                    (virtual_offset + intra_offset) / sector_size as u64,
+                    (read_start + virtual_offset + intra_offset) / sector_size as u64,
                     1,
                 );
                 (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
@@ -4531,10 +4737,21 @@ unsafe fn convert_to_vhdx(
             intra_offset += this_chunk;
         }
 
-        // Zero-pad remaining block data if this_block < block_size
-        if this_block < block_size {
-            let pad_start = block_file_offset + this_block;
-            let pad_len = block_size - this_block;
+        // Zero-pad remaining block data if this_block < block_size.
+        //
+        // Start the pad at the next output-sector boundary after the data:
+        // the final data-chunk write above already wrote a full (zero-padded)
+        // output sector, so the bytes between `block_file_offset + this_block`
+        // and `pad_start` are already zero on disk. Starting the pad here (not
+        // at the unaligned `block_file_offset + this_block`) is essential —
+        // write_bytes_to_output floors its offset to the output sector, so an
+        // unaligned pad start would re-zero the sector that holds the windowed
+        // data and clobber it. For whole-image convert `this_block` is always
+        // output-sector-aligned, so this is a no-op and the output is
+        // unchanged.
+        let pad_start = align_up(block_file_offset + this_block, oss);
+        if pad_start < block_file_offset + block_size {
+            let pad_len = (block_file_offset + block_size) - pad_start;
             let mut pad_written: u64 = 0;
             core::ptr::write_bytes(buf_data, 0, chunk_size as usize);
             while pad_written < pad_len {
@@ -4563,6 +4780,25 @@ unsafe fn convert_to_vhdx(
         if should_report_progress(progress_interval, pct, last_percent, blocks_done) {
             (call_table.send_progress)(b"convert\0".as_ptr(), blocks_done, total_blocks, pct);
             last_percent = pct;
+        }
+    }
+
+    // Ensure the file extends to the end of the metadata region. When no
+    // payload blocks are written (an empty window, declared_size == 0, has
+    // zero payload blocks), the last write would otherwise be inside the
+    // metadata region, leaving the file shorter than the region table
+    // declares; qemu then rejects the truncated metadata region with "Invalid
+    // argument". Writing a zero sector at the end of the metadata region pads
+    // the (sparse) file out to cover every declared region. For any non-empty
+    // conversion the payload blocks already extend past this point, so the
+    // write is a redundant no-op overwrite of an already-zero sector.
+    let file_min_end = metadata_offset + metadata_region_size;
+    if blocks_done == 0 {
+        let tail_sector = file_min_end - oss as u64;
+        core::ptr::write_bytes(buf_hdr, 0, oss);
+        if !write_bytes_to_output(call_table, buf_hdr, tail_sector, oss as u64, oss, oc) {
+            (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+            return *bytes_read;
         }
     }
 

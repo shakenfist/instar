@@ -1,0 +1,9 @@
+[package]
+name = "dd"
+version = "0.2.0"
+edition = "2021"
+description = "Compute the dd input byte-window and output virtual size (no I/O)"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]

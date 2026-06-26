@@ -17,7 +17,7 @@ instar/
 │   ├── core/       # Core guest initialization
 │   ├── crates/     # Shared format crates (qcow2, raw, vmdk, vhd, vhdx, luks)
 │   ├── shared/     # Shared library code (byte-order helpers, configs)
-│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, measure, create, resize, rebase, commit, map, snapshot)
+│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, dd, measure, create, resize, rebase, commit, map, snapshot)
 │   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates (guest-protocol)
 ├── prototypes/     # Experimental implementations (11 KVM prototypes)
@@ -143,6 +143,10 @@ vhdx (VHDX), luks (info + convert with decryption)
   `qemu-img info` baselines (6.0.0–10.2.0), and coverage +
   differential fuzzing. See [docs/amend.md](docs/amend.md)
   for the full reference.
+- `dd`: windowed block copy — `instar dd [-f FMT] [-O OUTPUT_FMT]
+  if=INPUT of=OUTPUT [bs=N] [count=N] [skip=N]` — qemu-img dd
+  compatible (name=value operands, -O defaults to raw); reuses
+  `convert.bin` via a windowed `ConvertConfig` with dense output.
 
 ## Working on This Project
 

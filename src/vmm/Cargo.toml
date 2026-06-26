@@ -30,6 +30,7 @@ guest-protocol = { path = "../../crates/guest-protocol", features = ["std"] }
 shared = { path = "../shared" }
 vmdk = { path = "../crates/vmdk" }
 qcow2 = { path = "../crates/qcow2" }
+dd = { path = "../crates/dd" }
 vhd = { path = "../crates/vhd" }
 vhdx = { path = "../crates/vhdx" }
 toml = "1.0"

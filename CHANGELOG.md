@@ -117,6 +117,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   baselines (6.0.0–10.2.0), and coverage + differential fuzzing. See
   [docs/amend.md](docs/amend.md).
 
+- **New `instar dd` subcommand (PLAN-dd phases 1-10).** Windowed block
+  copy compatible with `qemu-img dd`:
+  `instar dd [-f FMT] [-O OUTPUT_FMT] if=INPUT of=OUTPUT [bs=N]
+  [count=N] [skip=N]`. Both `if=`/`of=` mandatory; all other
+  arguments are `name=value` operands matching qemu-img's interface.
+  `-O` defaults to **raw** (not the input format). Window semantics:
+  `bs` defaults to 512, accepts 1024-based suffixes, range
+  `1..=INT_MAX` (`bs=0` rejected); `count` clamps the copy down
+  only (`min(virtual_size, count*bs)`) — `count=0` produces an
+  empty output; `skip` subtracts `skip*bs` bytes from the front of
+  the input, skip-past-EOF ⇒ empty output with exit 0. Output is
+  always dense (no zero-skipping, unlike convert). The `-f`
+  input-format hint is accepted for qemu-img compatibility but
+  ignored — the input format is always auto-detected, and a one-line
+  stderr warning is emitted when `-f` is supplied. All five output
+  formats are supported (raw, qcow2, vmdk, vpc/VHD, vhdx) and are
+  byte- and size-identical to `qemu-img dd` across qemu-img
+  6.0.0–10.2.0 (baselines in
+  `instar-testdata/expected-outputs/dd-info-json/`). Known
+  divergences: vhdx default block size (instar emits 32 MiB, qemu
+  8 MiB for small images — data and virtual size still match);
+  `count=0 -O vmdk` (qemu-img itself exits 1; instar exits 0 with
+  an unreadable vmdk); `count=0 -O vhdx` (instar's empty vhdx is
+  rejected by `qemu-img info`). Implemented host-side in `run_dd`
+  reusing `convert.bin` via a windowed `ConvertConfig`; the new
+  `crates/dd` crate provides the pure window-math helper. Covered
+  by integration tests (`tests/test_dd.py`), cross-version baselines
+  (`tests/test_dd_baselines.py`), coverage fuzzing, and differential
+  fuzzing against `qemu-img dd`. See [docs/dd.md](docs/dd.md).
+
 - **`instar map` differential fuzzer extension (PLAN-map phase 8).**
   Adds `op_map` to `scripts/differential-fuzz.py`'s random
   operation chain. For each randomly-generated image (raw
@@ -746,6 +776,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (surfaced and refined by phase 7c source-image tests).
 
 ### Fixed
+
+- **`instar convert -O vmdk|vpc|vhdx` silently truncated data when
+  the input qcow2 had clusters smaller than the output grain/block
+  size (commit `779e7a7`).** The structured writers (vmdk, vhd,
+  vhdx) filled only one input cluster per output grain/block,
+  leaving the remainder of each grain zero-filled when the qcow2
+  cluster size was smaller than the output grain or block size. The
+  correct fix is `qcow2::read_chain_virtual_range`, which fills the
+  full output grain by chaining as many input-cluster reads as
+  needed. This is a pre-existing bug in the shipped `instar convert`
+  command, found and fixed during `dd` implementation (phase 9).
+
+- **Dense VHD output capacity under-estimate could stall the final
+  write (commit `b80c5d7`).** The VHD writer computed output
+  capacity from the pre-window virtual size rather than the
+  post-window byte count when producing dense (dd-style) output,
+  causing the capacity hint passed to the guest to be too small for
+  the actual number of blocks written; the final write to the last
+  block stalled waiting for capacity that was never signalled. Fixed
+  by deriving the dense-output capacity from the actual window size.
 
 - **Guest core `.bss` overflow corrupting operation code.** `core.bin`'s
   `.bss` (the `INPUT_DEVICES`/`OUTPUT_DEVICE` virtio statics) overflowed
