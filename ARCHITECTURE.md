@@ -915,7 +915,7 @@ A mock `CallTable` (in `src/fuzz/src/lib.rs`) backed by thread-local
 fuzzer input provides sector-based I/O, allowing libFuzzer to explore
 deeply malformed inputs.
 
-23 fuzz targets cover all parser crates: format detection, header
+27 fuzz targets cover all parser crates: format detection, header
 parsing (QCOW2, VMDK, VHD, VHDX, RAW, LUKS), L1/L2 cluster lookup,
 refcount table traversal, zlib decompression, grain directory lookup,
 BAT traversal, VHDX metadata parsing, the measure subcommand's
@@ -946,6 +946,11 @@ planners get `fuzz_check_repair` (the qcow2 leak-reclamation,
 refcount-correction, count-accumulation, and COPIED-reconciliation
 planners, asserting sub-byte-masked containment, tally correctness,
 the overflow/bounds error classifications, and idempotence).
+Finally, the dd subcommand adds `fuzz_dd_window` (the pure
+input-window math — count-clamp / skip-subtract / empty-on-overrun
+with saturating arithmetic), `fuzz_chs_rounded_size` (VHD/VHDX CHS
+geometry rounding) and `fuzz_dd_read` (the byte-accurate windowed
+qcow2 read primitives).
 
 The seed corpus is extracted from `instar-testdata` by
 `scripts/extract-fuzz-corpus.py`, which filters images by format and

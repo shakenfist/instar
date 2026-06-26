@@ -777,10 +777,17 @@ def op_convert(instar_bin, instar_copy, qemu_copy, fmt,
 # bs and bs*count are bounded by op_dd so outputs stay small.
 _DD_BS_ALIGNED = [512, 4096, 65536, 1048576]
 _DD_BS_UNALIGNED = [1, 777, 999, 1000, 4095, 65537, 1048577]
-# A large/near-INT_MAX bs is occasionally drawn to exercise the
-# big-buffer path. INT_MAX = 2147483647; clamp the actual copied bytes
-# via count so the output never balloons (see _dd_pick_window).
-_DD_BS_LARGE = 2147483647
+# A "large" bs is occasionally drawn to exercise the big-buffer path.
+# It is deliberately capped at a few MiB rather than near INT_MAX:
+# qemu-img dd sizes its I/O buffer by bs (independent of count), so a
+# ~2 GiB bs makes the reference tool allocate ~2 GiB every iteration,
+# causing spurious slowness / OOM / timeout failures unrelated to any
+# real divergence. instar only uses bs for window math, and the
+# near-INT_MAX overflow boundary is already covered by the dd-window
+# unit and fuzz tests (src/crates/dd), so the differential harness does
+# not need to drive it. count still clamps the copied bytes so the
+# output never balloons (see _dd_pick_window).
+_DD_BS_LARGE = 8 * 1024 * 1024  # 8 MiB
 
 
 def _dd_pick_window(rng, virtual_size):
@@ -799,7 +806,7 @@ def _dd_pick_window(rng, virtual_size):
     max_out_bytes = 64 * 1024 * 1024  # 64 MiB
 
     # bs selection: mostly a realistic mix; a 512-multiple ~45% of the
-    # time, a non-512 value ~45%, and the near-INT_MAX boundary ~10%.
+    # time, a non-512 value ~45%, and the large (multi-MiB) bs ~10%.
     roll = rng.random()
     if roll < 0.45:
         bs = rng.choice(_DD_BS_ALIGNED)

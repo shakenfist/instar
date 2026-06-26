@@ -116,7 +116,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   only (`min(virtual_size, count*bs)`) — `count=0` produces an
   empty output; `skip` subtracts `skip*bs` bytes from the front of
   the input, skip-past-EOF ⇒ empty output with exit 0. Output is
-  always dense (no zero-skipping, unlike convert). All five output
+  always dense (no zero-skipping, unlike convert). The `-f`
+  input-format hint is accepted for qemu-img compatibility but
+  ignored — the input format is always auto-detected, and a one-line
+  stderr warning is emitted when `-f` is supplied. All five output
   formats are supported (raw, qcow2, vmdk, vpc/VHD, vhdx) and are
   byte- and size-identical to `qemu-img dd` across qemu-img
   6.0.0–10.2.0 (baselines in

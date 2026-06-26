@@ -10377,7 +10377,16 @@ fn run_dd(args: DdArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>>
     // forcing is DEFERRED: `discover_backing_chain` auto-detects the input
     // format and exposes no format-hint parameter, so auto-detection remains
     // authoritative here. Forcing the input format is a small follow-up.
-    let _ = &parsed.input_format;
+    // Warn when a hint is supplied so the deferral is visible at runtime
+    // rather than only in the docs (a deliberate `-f qcow2` is a silent
+    // no-op otherwise).
+    if let Some(fmt) = &parsed.input_format {
+        eprintln!(
+            "dd: -f {} is accepted but ignored; the input format is \
+             auto-detected",
+            fmt
+        );
+    }
     let security_config = config::load_config().config.security;
     let chain = discover_backing_chain(Path::new(&parsed.input), sector_size, &security_config)
         .map_err(|e| {
