@@ -5,6 +5,11 @@ Copies test images from the instar-testdata repository into per-target
 corpus directories under src/fuzz/corpus/. Images are filtered by
 format and optionally truncated for header-only targets.
 
+It also restores the per-target corpus accumulated by prior nightly
+runs (pushed to instar-testdata/custom/fuzz-corpus/<target>/), keyed by
+target name, so coverage compounds across runs — see
+restore_pushed_corpus().
+
 Usage:
     python3 scripts/extract-fuzz-corpus.py --testdata /path/to/instar-testdata
 
@@ -78,6 +83,47 @@ def copy_seed(src_path, dest_dir, truncate_bytes=None):
         with open(dest_path, 'wb') as f:
             f.write(data)
     return True
+
+
+def restore_pushed_corpus(testdata, corpus_base):
+    """Restore the per-target corpus accumulated by prior nightly runs.
+
+    Nightly runs push coverage-increasing inputs to
+    ``custom/fuzz-corpus/<target>/`` in instar-testdata. Restore each
+    target's entries straight back into ``corpus/<target>/`` by target
+    name, so that targets whose inputs are not recognizable image
+    formats (the window-math, geometry and planner fuzzers) accumulate
+    coverage across runs instead of re-seeding cold every night. Image-
+    format targets also benefit: their entries land in the exact target
+    that produced them rather than being re-routed by format detection.
+
+    Entries are content-addressed (same scheme as ``copy_seed``) so a
+    restore is idempotent and never duplicates an input already present.
+    Returns the number of files restored.
+    """
+    pushed_root = os.path.join(testdata, 'custom', 'fuzz-corpus')
+    if not os.path.isdir(pushed_root):
+        return 0
+
+    restored = 0
+    for target in sorted(os.listdir(pushed_root)):
+        target_dir = os.path.join(pushed_root, target)
+        if not os.path.isdir(target_dir):
+            continue
+        dest_dir = os.path.join(corpus_base, target)
+        for name in sorted(os.listdir(target_dir)):
+            src_path = os.path.join(target_dir, name)
+            if not os.path.isfile(src_path) or os.path.getsize(src_path) == 0:
+                continue
+            with open(src_path, 'rb') as f:
+                data = f.read()
+            os.makedirs(dest_dir, exist_ok=True)
+            dest_path = os.path.join(dest_dir, sha256_hex(data))
+            if not os.path.exists(dest_path):
+                with open(dest_path, 'wb') as f:
+                    f.write(data)
+            restored += 1
+    return restored
 
 
 def walk_qcow2_snapshot_table(blob, nb_snapshots, max_entries=4096):
@@ -499,6 +545,12 @@ def main():
 
     # Also scan for images not in the manifest (custom/audit/ etc.)
     for root, dirs, files in os.walk(args.testdata):
+        # The per-target corpus pushed by prior nightly runs is restored
+        # faithfully below by restore_pushed_corpus(); skip it here so its
+        # entries are not lossily re-routed by format detection (most are
+        # not recognizable image formats and would be dropped).
+        if os.path.basename(root) == 'custom' and 'fuzz-corpus' in dirs:
+            dirs.remove('fuzz-corpus')
         for name in files:
             src_path = os.path.join(root, name)
             if os.path.getsize(src_path) == 0:
@@ -530,10 +582,16 @@ def main():
                 if extract_snapshot_parse_seed(src_path, dest):
                     copied += 1
 
+    # Restore the per-target corpus accumulated by prior nightly runs so
+    # coverage compounds across runs (especially for the non-image-format
+    # targets, which would otherwise start cold every night).
+    restored = restore_pushed_corpus(args.testdata, corpus_base)
+
     # Create minimal hand-crafted seeds
     create_minimal_seeds(corpus_base)
 
-    print(f'Corpus seeding complete: {copied} files copied, {skipped} skipped')
+    print(f'Corpus seeding complete: {copied} files copied, {skipped} skipped, '
+          f'{restored} restored from accumulated corpus')
     print(f'Corpus directory: {corpus_base}')
 
     # Print per-target counts
