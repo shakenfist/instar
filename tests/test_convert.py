@@ -458,16 +458,19 @@ class TestConvertManifestImages(InstarTestBase):
                 f'{image_id}: {q_stderr}'
             )
 
-            # Compare outputs
-            cmp_out, _, cmp_rc = self.run_instar_compare(
+            # Compare outputs. The compare reads both raw outputs, so it
+            # performs roughly twice the sequential I/O of a single convert;
+            # under parallel-worker disk contention the per-convert budget is
+            # too tight for the largest images. Give it double the headroom.
+            cmp_out, cmp_err, cmp_rc = self.run_instar_compare(
                 Path(instar_raw.name),
                 Path(qemu_raw.name),
-                timeout=timeout
+                timeout=timeout * 2
             )
             self.assertEqual(
                 cmp_rc, 0,
                 f'Convert output for {image_id} differs '
-                f'from qemu-img: {cmp_out}'
+                f'from qemu-img (rc={cmp_rc}): {cmp_out or cmp_err}'
             )
 
     def test_convert_cirros_qcow2(self):
@@ -2157,16 +2160,19 @@ class TestConvertVmdkToRaw(InstarTestBase):
                 f'{image_id}: {q_stderr}'
             )
 
-            # Compare outputs
-            cmp_out, _, cmp_rc = self.run_instar_compare(
+            # Compare outputs. The compare reads both raw outputs, so it
+            # performs roughly twice the sequential I/O of a single convert;
+            # under parallel-worker disk contention the per-convert budget is
+            # too tight for the largest images. Give it double the headroom.
+            cmp_out, cmp_err, cmp_rc = self.run_instar_compare(
                 Path(instar_raw.name),
                 Path(qemu_raw.name),
-                timeout=timeout
+                timeout=timeout * 2
             )
             self.assertEqual(
                 cmp_rc, 0,
                 f'Convert output for {image_id} differs '
-                f'from qemu-img: {cmp_out}'
+                f'from qemu-img (rc={cmp_rc}): {cmp_out or cmp_err}'
             )
 
     def test_convert_plaso_vmdk(self):
@@ -2607,16 +2613,19 @@ class TestConvertVmdkStreamOptimized(InstarTestBase):
                 f'{image_id}: {q_stderr}'
             )
 
-            # Compare outputs
-            cmp_out, _, cmp_rc = self.run_instar_compare(
+            # Compare outputs. The compare reads both raw outputs, so it
+            # performs roughly twice the sequential I/O of a single convert;
+            # under parallel-worker disk contention the per-convert budget is
+            # too tight for the largest images. Give it double the headroom.
+            cmp_out, cmp_err, cmp_rc = self.run_instar_compare(
                 Path(instar_raw.name),
                 Path(qemu_raw.name),
-                timeout=timeout
+                timeout=timeout * 2
             )
             self.assertEqual(
                 cmp_rc, 0,
                 f'Convert output for {image_id} differs '
-                f'from qemu-img: {cmp_out}'
+                f'from qemu-img (rc={cmp_rc}): {cmp_out or cmp_err}'
             )
 
     def test_convert_vmdk_streamoptimized(self):
@@ -3122,16 +3131,19 @@ class TestConvertVhdxToRaw(InstarTestBase):
                 f'{image_id}: {q_stderr}'
             )
 
-            # Compare outputs
-            cmp_out, _, cmp_rc = self.run_instar_compare(
+            # Compare outputs. The compare reads both raw outputs, so it
+            # performs roughly twice the sequential I/O of a single convert;
+            # under parallel-worker disk contention the per-convert budget is
+            # too tight for the largest images. Give it double the headroom.
+            cmp_out, cmp_err, cmp_rc = self.run_instar_compare(
                 Path(instar_raw.name),
                 Path(qemu_raw.name),
-                timeout=timeout
+                timeout=timeout * 2
             )
             self.assertEqual(
                 cmp_rc, 0,
                 f'Convert output for {image_id} differs '
-                f'from qemu-img: {cmp_out}'
+                f'from qemu-img (rc={cmp_rc}): {cmp_out or cmp_err}'
             )
 
     def test_convert_qemu_vhdx(self):
