@@ -555,3 +555,5 @@ This allows reviewers to cherry-pick or drop individual fixes as needed.
 - `tools/render-review.py` - Renders review JSON to markdown (includes issue links)
 - `tools/review-schema.json` - JSON schema for review output validation
 - `scripts/differential-fuzz.py` - Differential fuzzing script (instar vs qemu-img + libyal)
+- `scripts/extract-fuzz-corpus.py` - Seeds + restores the coverage-fuzz corpus from instar-testdata
+- `tools/ci/fuzz-tier.sh` - Computes tiered nightly per-target fuzz durations

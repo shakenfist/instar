@@ -1,8 +1,9 @@
 name: Coverage-Guided Fuzzing
 
 on:
-  # Nightly: 1000s (~16.7 min) per target, all targets (see the
-  # schedule branch below; sized by hand against the target count)
+  # Nightly: all targets, per-target durations tiered against a 450-min
+  # budget (deep parser targets get the larger share; see the schedule
+  # branch below and tools/ci/fuzz-tier.sh)
   schedule:
     - cron: '0 4 * * *'
 
@@ -14,6 +15,7 @@ on:
       - 'src/shared/**'
       - '.github/workflows/coverage-fuzz.yml'
       - 'scripts/extract-fuzz-corpus.py'
+      - 'tools/ci/fuzz-tier.sh'
 
   # Post-merge smoke test: 15s per target
   push:
@@ -22,6 +24,7 @@ on:
       - 'src/**'
       - 'scripts/extract-fuzz-corpus.py'
       - '.github/workflows/coverage-fuzz.yml'
+      - 'tools/ci/fuzz-tier.sh'
 
   # Manual: configurable duration and target selection
   workflow_dispatch:
@@ -171,11 +174,12 @@ jobs:
             echo "duration=15" >> $GITHUB_OUTPUT
             echo "targets=" >> $GITHUB_OUTPUT
           else
-            # schedule (nightly) — 1000s × 27 targets = 450 min, fits
-            # the 480 min timeout with setup headroom. (This branch does
-            # not apply the workflow_dispatch MAX_DURATION cap, so the
-            # per-target duration is sized by hand against N_TARGETS;
-            # bump it down whenever the target list grows.)
+            # schedule (nightly) — per-target durations are tiered in the
+            # run step via tools/ci/fuzz-tier.sh against NIGHTLY_BUDGET_SECONDS
+            # (450 min), so this uniform `duration` is unused for nightly and
+            # is emitted only as a defensive fallback. When the deep-tier
+            # share drops near the fast-tier floor, shard across jobs rather
+            # than cut further (see docs/testing.md, "CI integration").
             echo "duration=1000" >> $GITHUB_OUTPUT
             echo "targets=" >> $GITHUB_OUTPUT
           fi
@@ -189,6 +193,13 @@ jobs:
         env:
           FUZZ_DURATION: ${{ steps.params.outputs.duration }}
           FUZZ_TARGETS: ${{ steps.params.outputs.targets }}
+          EVENT_NAME: ${{ github.event_name }}
+          # Nightly per-target durations are tiered (see tools/ci/fuzz-tier.sh):
+          # the deep parser targets split this wall-clock budget while the
+          # fast-saturating targets take a short fixed slice. 27000s = 450 min
+          # leaves ~30 min of the 480 min job timeout for build/seed/push.
+          NIGHTLY_BUDGET_SECONDS: '27000'
+          FAST_TIER_SECONDS: '300'
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -244,10 +255,24 @@ jobs:
             )
           fi
 
+          # Build the per-target run plan as "<target> <duration>" lines.
+          # The nightly schedule tiers durations via tools/ci/fuzz-tier.sh
+          # so the deep parser targets get most of the budget; every other
+          # event type runs each target for the uniform params duration.
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            PLAN=$(tools/ci/fuzz-tier.sh plan \
+              "$NIGHTLY_BUDGET_SECONDS" "$FAST_TIER_SECONDS" "${TARGETS[@]}")
+          else
+            PLAN=$(for T in "${TARGETS[@]}"; do echo "$T $FUZZ_DURATION"; done)
+          fi
+          echo "Run plan (target duration):"
+          echo "$PLAN"
+
           CRASHES_FOUND=0
 
-          for TARGET in "${TARGETS[@]}"; do
-            echo "=== Fuzzing $TARGET for ${FUZZ_DURATION}s ==="
+          while read -r TARGET DURATION; do
+            [ -z "$TARGET" ] && continue
+            echo "=== Fuzzing $TARGET for ${DURATION}s ==="
 
             # Run fuzzer inside container
             EXIT_CODE=0
@@ -263,7 +288,7 @@ jobs:
               bash -c "
                 set -o pipefail
                 cargo fuzz run $TARGET \
-                  -- -max_total_time=$FUZZ_DURATION \
+                  -- -max_total_time=$DURATION \
                      -max_len=4194304 \
                      -rss_limit_mb=4096 \
                   2>&1 | tee /workspace/coverage-fuzz-logs/${TARGET}.log
@@ -327,7 +352,7 @@ jobs:
             fi
 
             echo "=== Completed $TARGET ==="
-          done
+          done <<< "$PLAN"
 
           echo "Total crashes found: $CRASHES_FOUND"
           echo "crashes_found=$CRASHES_FOUND" >> $GITHUB_ENV

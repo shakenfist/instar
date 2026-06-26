@@ -953,11 +953,14 @@ geometry rounding) and `fuzz_dd_read` (the byte-accurate windowed
 qcow2 read primitives).
 
 The seed corpus is extracted from `instar-testdata` by
-`scripts/extract-fuzz-corpus.py`, which filters images by format and
-generates hand-crafted minimal valid inputs. The CI workflow
-(`.github/workflows/coverage-fuzz.yml`) runs nightly at 04:00 UTC
-(1 hour per target), with PR smoke tests and manual dispatch. Crashes
-are minimized and filed as GitHub Issues immediately.
+`scripts/extract-fuzz-corpus.py`, which filters images by format,
+generates hand-crafted minimal valid inputs, and restores the corpus
+accumulated by prior nightly runs (keyed by target name) so coverage
+compounds. The CI workflow (`.github/workflows/coverage-fuzz.yml`) runs
+nightly at 04:00 UTC with per-target durations tiered against a 450-min
+budget (`tools/ci/fuzz-tier.sh` — deep parser targets get the larger
+share), plus PR smoke tests and manual dispatch. Crashes are minimized
+and filed as GitHub Issues immediately.
 
 ## Open Questions
 
