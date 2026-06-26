@@ -658,6 +658,17 @@ This copies test images into per-target corpus directories under
 truncated copies. Hand-crafted minimal valid inputs are also generated
 for each format.
 
+It additionally **restores the accumulated corpus** pushed by prior
+nightly runs. Each nightly run pushes coverage-increasing inputs to
+`instar-testdata/custom/fuzz-corpus/<target>/`; on the next run those
+entries are copied straight back into `corpus/<target>/` *by target
+name* (`restore_pushed_corpus()`), so coverage compounds across runs.
+This matters most for the targets whose inputs are not recognizable
+image formats — the window-math, CHS-geometry and planner fuzzers —
+which would otherwise re-seed cold every night because format-based
+routing cannot place their entries. Entries are content-addressed, so
+restoration is idempotent.
+
 ### CI integration
 
 The CI workflow (`.github/workflows/coverage-fuzz.yml`) runs:
