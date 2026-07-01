@@ -495,6 +495,195 @@ pub fn bitmap_table_size_entries(serialized_bytes: u64, cluster_size: u64) -> u6
 }
 
 // ============================================================================
+// Streaming directory enumerator
+// ============================================================================
+
+/// Maximum on-disk size of a single bitmap directory entry, in bytes.
+///
+/// `entry_size = round_up(24 + extra_data_size + name_size, 8)`; for a valid
+/// entry `extra_data_size == 0` and `name_size <= BME_MAX_NAME_SIZE` (1023), so
+/// the largest possible entry is `round_up(24 + 1023, 8) = round_up(1047, 8) =
+/// 1048` bytes. This is the bound for the stack scratch buffer; any entry whose
+/// computed `entry_size` exceeds it is rejected as malformed.
+const BITMAP_DIR_ENTRY_MAX_SIZE: usize = 1048;
+
+/// Stream bitmap directory entries one at a time through a caller-supplied
+/// callback, reading from a caller-supplied byte source.
+///
+/// This is the pure, no-heap core of [`for_each_bitmap_entry`]; the public
+/// `unsafe` wrapper adapts the cached sector reader into the `read` closure.
+/// Tests drive this directly with an in-memory buffer.
+///
+/// `read(offset, out)` must fill `out` completely with the bytes at file
+/// `offset`, returning `true` on success or `false` on any read error. A single
+/// in-flight [`BitmapDirEntry`] (with its inline name buffer) lives on this
+/// function's stack; there is no heap allocation and no per-entry array.
+///
+/// The directory is bounded both by `nb_bitmaps` (the entry count from the
+/// header extension) and by `bitmap_directory_size` (the byte budget). Each
+/// entry's fixed 24-byte head is read first, then the remaining
+/// `entry_size - 24` bytes, into a single bounded stack scratch buffer; the
+/// assembled bytes are decoded with [`parse_bitmap_dir_entry`] (the field
+/// decoding is not re-implemented here).
+///
+/// The callback returns `true` to continue iterating or `false` to stop early.
+/// This function returns `true` only if all `nb_bitmaps` entries were visited
+/// cleanly, and `false` if the callback stopped early or a read error /
+/// malformed entry / oversized entry / directory-budget overrun aborted the
+/// loop. This matches [`for_each_snapshot_entry`](crate::for_each_snapshot_entry)'s
+/// convention exactly (early callback-stop ⇒ `false`).
+fn for_each_bitmap_entry_with(
+    mut read: impl FnMut(u64, &mut [u8]) -> bool,
+    bitmap_directory_offset: u64,
+    bitmap_directory_size: u64,
+    nb_bitmaps: u32,
+    mut callback: impl FnMut(&BitmapDirEntry) -> bool,
+) -> bool {
+    let mut offset = bitmap_directory_offset;
+    // Remaining byte budget within the directory.
+    let mut remaining = bitmap_directory_size;
+    // One bounded scratch buffer holds the whole entry (head + name + pad).
+    let mut scratch = [0u8; BITMAP_DIR_ENTRY_MAX_SIZE];
+
+    for _ in 0..nb_bitmaps {
+        // The fixed 24-byte head must fit within the remaining budget.
+        if remaining < 24 {
+            return false;
+        }
+
+        // Read the 24-byte fixed head.
+        if !read(offset, &mut scratch[..24]) {
+            return false;
+        }
+
+        // Decode just enough of the head to compute the full entry size.
+        // name_size @18 (u16 BE), extra_data_size @20 (u32 BE).
+        let name_size = match be_u16_at(&scratch, 18) {
+            Some(v) => v as u64,
+            None => return false,
+        };
+        let extra_data_size = match be_u32_at(&scratch, 20) {
+            Some(v) => v as u64,
+            None => return false,
+        };
+
+        // entry_size = round_up(24 + extra_data_size + name_size, 8), checked.
+        let raw_size = match 24u64
+            .checked_add(extra_data_size)
+            .and_then(|v| v.checked_add(name_size))
+        {
+            Some(v) => v,
+            None => return false,
+        };
+        let entry_size = match round_up_8(raw_size) {
+            Some(v) => v,
+            None => return false,
+        };
+        let entry_size_usize: usize = match entry_size.try_into() {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+
+        // Must fit the bounded scratch and the remaining directory budget.
+        if entry_size_usize > BITMAP_DIR_ENTRY_MAX_SIZE {
+            return false;
+        }
+        if entry_size > remaining {
+            return false;
+        }
+
+        // Read the remainder of the entry (name + any padding) right after
+        // the head, assembling a contiguous entry image in `scratch`.
+        if entry_size_usize > 24 {
+            let tail_offset = match offset.checked_add(24) {
+                Some(v) => v,
+                None => return false,
+            };
+            if !read(tail_offset, &mut scratch[24..entry_size_usize]) {
+                return false;
+            }
+        }
+
+        // Decode the assembled entry. `parse_bitmap_dir_entry` re-validates the
+        // head (flags / type / extra_data / name_size) and the entry_size.
+        let entry = match parse_bitmap_dir_entry(&scratch[..entry_size_usize]) {
+            Some((entry, parsed_size)) if parsed_size == entry_size_usize => entry,
+            _ => return false,
+        };
+
+        if !callback(&entry) {
+            return false;
+        }
+
+        // Advance past this entry and shrink the budget.
+        offset = match offset.checked_add(entry_size) {
+            Some(v) => v,
+            None => return false,
+        };
+        remaining -= entry_size;
+    }
+
+    true
+}
+
+/// Stream bitmap directory entries one at a time through a caller-supplied
+/// callback, reading directly from a qcow2 input device via the cached sector
+/// reader.
+///
+/// This mirrors [`for_each_snapshot_entry`](crate::for_each_snapshot_entry)
+/// exactly: same cached-reader I/O parameters (so the guest op invokes it the
+/// same way), same fixed stack scratch + inline-name approach, and the same
+/// `FnMut(&BitmapDirEntry) -> bool` callback (return `false` to stop early).
+/// No heap is used: the single in-flight entry lives on the stack.
+///
+/// Returns `true` only if all `nb_bitmaps` entries were visited cleanly;
+/// returns `false` if the callback stopped early, or on any read error,
+/// malformed/oversized entry, or overrun of `bitmap_directory_size`.
+///
+/// `bytes_read` is updated cumulatively across all sector reads.
+///
+/// # Safety
+///
+/// `call_table` must be valid. `cache_buf` must point to at least
+/// `MAX_SECTOR_SIZE` writable bytes.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn for_each_bitmap_entry(
+    call_table: &shared::CallTable,
+    device_idx: u32,
+    nb_bitmaps: u32,
+    bitmap_directory_offset: u64,
+    bitmap_directory_size: u64,
+    sector_size: usize,
+    input_capacity: u64,
+    cache_buf: *mut u8,
+    bytes_read: &mut u64,
+    callback: impl FnMut(&BitmapDirEntry) -> bool,
+) -> bool {
+    let mut cached_sector = u64::MAX;
+    let read = |offset: u64, out: &mut [u8]| -> bool {
+        crate::read_bytes_cached(
+            call_table,
+            device_idx,
+            offset,
+            out.len(),
+            sector_size,
+            input_capacity,
+            &mut cached_sector,
+            cache_buf,
+            bytes_read,
+            out,
+        )
+    };
+    for_each_bitmap_entry_with(
+        read,
+        bitmap_directory_offset,
+        bitmap_directory_size,
+        nb_bitmaps,
+        callback,
+    )
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -838,5 +1027,238 @@ mod tests {
         assert_eq!(bitmap_table_size_entries(65536, 65536), 1);
         assert_eq!(bitmap_table_size_entries(65537, 65536), 2);
         assert_eq!(bitmap_table_size_entries(100, 0), 0); // guard
+    }
+
+    // ------------------------------------------------------------------------
+    // Streaming directory enumerator
+    // ------------------------------------------------------------------------
+
+    /// Build a `BitmapDirEntry` for fixture use.
+    fn dir_entry(name: &[u8], flags: u32, granularity_bits: u8) -> BitmapDirEntry {
+        let mut entry = BitmapDirEntry::zeroed();
+        entry.bitmap_table_offset = 0x10000;
+        entry.bitmap_table_size = 1;
+        entry.flags = flags;
+        entry.bitmap_type = BT_DIRTY_TRACKING_BITMAP;
+        entry.granularity_bits = granularity_bits;
+        entry.name_size = name.len() as u16;
+        entry.extra_data_size = 0;
+        entry.name[..name.len()].copy_from_slice(name);
+        entry
+    }
+
+    /// Serialize a slice of entries into a contiguous in-memory directory
+    /// buffer at the given base offset (offset 0 in the returned Vec maps to
+    /// `base`). Returns the buffer and the total directory byte length.
+    fn build_directory(entries: &[BitmapDirEntry]) -> std::vec::Vec<u8> {
+        let mut dir = std::vec::Vec::new();
+        let mut scratch = [0u8; BITMAP_DIR_ENTRY_MAX_SIZE];
+        for entry in entries {
+            let n = serialize_bitmap_dir_entry(entry, &mut scratch).expect("serialize");
+            dir.extend_from_slice(&scratch[..n]);
+        }
+        dir
+    }
+
+    /// A reader closure over an in-memory directory buffer that starts at file
+    /// offset `base`. Returns `false` (read error) for any access outside the
+    /// buffer, mimicking a short backing device.
+    fn reader<'a>(buf: &'a [u8], base: u64) -> impl FnMut(u64, &mut [u8]) -> bool + 'a {
+        move |offset: u64, out: &mut [u8]| {
+            let start = match offset.checked_sub(base) {
+                Some(s) => s as usize,
+                None => return false,
+            };
+            let end = match start.checked_add(out.len()) {
+                Some(e) => e,
+                None => return false,
+            };
+            if end > buf.len() {
+                return false;
+            }
+            out.copy_from_slice(&buf[start..end]);
+            true
+        }
+    }
+
+    #[test]
+    fn enumerate_zero_entries() {
+        let base = 0x40000u64;
+        let mut count = 0;
+        let ok = for_each_bitmap_entry_with(reader(&[], base), base, 0, 0, |_| {
+            count += 1;
+            true
+        });
+        assert!(ok, "zero entries must complete cleanly");
+        assert_eq!(count, 0, "callback must never fire");
+    }
+
+    #[test]
+    fn enumerate_single_entry() {
+        let base = 0x40000u64;
+        let dir = build_directory(&[dir_entry(b"bitmap0", BME_FLAG_AUTO, 16)]);
+        let mut seen: std::vec::Vec<(std::vec::Vec<u8>, bool, u64)> = std::vec::Vec::new();
+        let ok = for_each_bitmap_entry_with(reader(&dir, base), base, dir.len() as u64, 1, |e| {
+            seen.push((e.name_bytes().to_vec(), e.is_enabled(), e.granularity()));
+            true
+        });
+        assert!(ok);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, b"bitmap0");
+        assert!(seen[0].1, "auto flag => enabled");
+        assert_eq!(seen[0].2, 1 << 16);
+    }
+
+    #[test]
+    fn enumerate_several_entries_in_order() {
+        let base = 0x80000u64;
+        let entries = [
+            dir_entry(b"a", BME_FLAG_AUTO, 16),   // enabled, short name
+            dir_entry(b"disabled-bitmap", 0, 12), // disabled
+            dir_entry(b"enabled-with-a-much-longer-name", BME_FLAG_AUTO, 9),
+            dir_entry(b"inuse", BME_FLAG_IN_USE, 31), // in-use, not enabled
+        ];
+        let dir = build_directory(&entries);
+        let mut seen: std::vec::Vec<(std::vec::Vec<u8>, bool, bool, u64)> = std::vec::Vec::new();
+        let ok = for_each_bitmap_entry_with(
+            reader(&dir, base),
+            base,
+            dir.len() as u64,
+            entries.len() as u32,
+            |e| {
+                seen.push((
+                    e.name_bytes().to_vec(),
+                    e.is_enabled(),
+                    e.is_in_use(),
+                    e.granularity(),
+                ));
+                true
+            },
+        );
+        assert!(ok);
+        assert_eq!(seen.len(), 4);
+        assert_eq!(seen[0], (b"a".to_vec(), true, false, 1 << 16));
+        assert_eq!(
+            seen[1],
+            (b"disabled-bitmap".to_vec(), false, false, 1 << 12)
+        );
+        assert_eq!(
+            seen[2],
+            (
+                b"enabled-with-a-much-longer-name".to_vec(),
+                true,
+                false,
+                1 << 9
+            )
+        );
+        assert_eq!(seen[3], (b"inuse".to_vec(), false, true, 1u64 << 31));
+    }
+
+    #[test]
+    fn enumerate_early_stop() {
+        let base = 0x40000u64;
+        let entries = [
+            dir_entry(b"first", BME_FLAG_AUTO, 16),
+            dir_entry(b"second", BME_FLAG_AUTO, 16),
+            dir_entry(b"third", BME_FLAG_AUTO, 16),
+        ];
+        let dir = build_directory(&entries);
+        let mut count = 0;
+        // Stop after the first entry (callback returns false). The function
+        // returns false on early stop, mirroring for_each_snapshot_entry.
+        let ok = for_each_bitmap_entry_with(
+            reader(&dir, base),
+            base,
+            dir.len() as u64,
+            entries.len() as u32,
+            |_| {
+                count += 1;
+                false
+            },
+        );
+        assert!(!ok, "early callback-stop must return false");
+        assert_eq!(count, 1, "only the first entry should be visited");
+    }
+
+    #[test]
+    fn enumerate_truncated_directory_budget() {
+        // bitmap_directory_size too small to hold the entry => clean false.
+        let base = 0x40000u64;
+        let dir = build_directory(&[dir_entry(b"bitmap0", BME_FLAG_AUTO, 16)]);
+        let mut count = 0;
+        let ok = for_each_bitmap_entry_with(
+            reader(&dir, base),
+            base,
+            (dir.len() - 1) as u64, // one byte short of the entry
+            1,
+            |_| {
+                count += 1;
+                true
+            },
+        );
+        assert!(!ok, "budget too small => false");
+        assert_eq!(count, 0, "no entry should be visited");
+    }
+
+    #[test]
+    fn enumerate_truncated_backing_buffer() {
+        // Backing buffer shorter than the directory claims => read error.
+        let base = 0x40000u64;
+        let dir = build_directory(&[dir_entry(b"bitmap0", BME_FLAG_AUTO, 16)]);
+        let short = &dir[..dir.len() - 4]; // truncate the name tail
+        let mut count = 0;
+        let ok = for_each_bitmap_entry_with(
+            reader(short, base),
+            base,
+            dir.len() as u64, // budget says the full entry is present
+            1,
+            |_| {
+                count += 1;
+                true
+            },
+        );
+        assert!(!ok, "short backing buffer => read failure => false");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn enumerate_nb_bitmaps_exceeds_available() {
+        // Two entries present, but nb_bitmaps claims three. The third read runs
+        // past the budget/buffer and must fail cleanly after visiting two.
+        let base = 0x40000u64;
+        let entries = [
+            dir_entry(b"one", BME_FLAG_AUTO, 16),
+            dir_entry(b"two", 0, 16),
+        ];
+        let dir = build_directory(&entries);
+        let mut count = 0;
+        let ok = for_each_bitmap_entry_with(
+            reader(&dir, base),
+            base,
+            dir.len() as u64, // budget covers only the two real entries
+            3,                // but claim three
+            |_| {
+                count += 1;
+                true
+            },
+        );
+        assert!(!ok, "nb_bitmaps over the available entries => false");
+        assert_eq!(count, 2, "the two real entries are visited before failure");
+    }
+
+    #[test]
+    fn enumerate_rejects_malformed_entry() {
+        // A directory whose single entry has a bad bitmap_type must fail.
+        let base = 0x40000u64;
+        let mut bad = dir_entry(b"bad", BME_FLAG_AUTO, 16);
+        bad.bitmap_type = 2; // invalid
+        let dir = build_directory(&[bad]);
+        let mut count = 0;
+        let ok = for_each_bitmap_entry_with(reader(&dir, base), base, dir.len() as u64, 1, |_| {
+            count += 1;
+            true
+        });
+        assert!(!ok, "malformed entry => false");
+        assert_eq!(count, 0);
     }
 }

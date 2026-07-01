@@ -958,7 +958,7 @@ fn parse_snapshot_extra_data(buf: &[u8], extra_data_size: u32) -> SnapshotExtraD
 /// valid, `cache_buf` must point to at least `sector_size`
 /// writable bytes.
 #[allow(clippy::too_many_arguments)]
-unsafe fn read_bytes_cached(
+pub(crate) unsafe fn read_bytes_cached(
     call_table: &CallTable,
     device_idx: u32,
     offset: u64,
