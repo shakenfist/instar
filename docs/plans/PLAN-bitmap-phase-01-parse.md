@@ -285,16 +285,21 @@ forward an unknown `0x23852875` extension**.
 | **rebase** | **Safe** | Writes only backing-path bytes + a 12-byte field at offset 8 (`src/crates/rebase/src/qcow2.rs:300-323`); never touches extensions/autoclear. |
 | **commit** | **Safe** | Only `Write` patches to backing-image refcount/L1/L2; no `build_header`, no header-extension rewrite (`src/crates/commit/src/qcow2.rs`, `lib.rs:119-149`). (Like qemu, commit does not migrate bitmaps — acceptable.) |
 | **check --repair** | **Safe** | RMW of the 8-byte `incompatible_features` word only, to set/clear `INCOMPAT_CORRUPT` (`src/operations/check/src/main.rs:3800-3826`, `:4132-4165`); no extension/autoclear touch. |
-| **snapshot** | **UNVERIFIED** | Must update `nb_snapshots`/`snapshots_offset` (offsets 60/64); planning did not confirm whether `src/crates/snapshot/src/qcow2.rs` uses selective field writes or a header rebuild. **Step 1d resolves this.** |
+| **snapshot** | **SAFE (and gated)** — *resolved in step 1d* | Never calls `build_header` (grep-confirmed). All header mutation is a targeted 12-byte RMW of `nb_snapshots`/`snapshots_offset` at offset 60 (`src/operations/snapshot/src/main.rs:1168-1171` create, `:1527-1530` delete; apply writes no header bytes), preserving offset-88 autoclear and any offset-≥104 extension. Belt-and-suspenders: all three modes call `mutating_feature_gates` (`main.rs:454-460`), which *refuses* any image with the autoclear bitmaps bit set (`ERROR_UNSUPPORTED_FEATURE`). |
 
-**Conclusion:** there is a real, pre-existing **bitmap-data-loss
-bug in `resize`** (and a latent autoclear-zeroing in cross-version
-`amend`), independent of this feature. Recommendation: record it
-in the master plan's "Bugs fixed during this work" section, file a
-tracker issue, and address it as a **dedicated follow-up** (teach
-`build_header` / the resize planner to preserve unknown extensions
-and the autoclear bit) rather than expanding this parsing phase.
-Operator decides whether that follow-up is in this plan's scope.
+**Conclusion (step 1d resolved):** there is a real, pre-existing
+**bitmap-data-loss bug in `resize`** (full header rebuild via
+`build_header` drops the bitmaps extension and clears autoclear on
+every path) and a latent autoclear-zeroing in cross-version
+`amend`; `rebase`/`commit`/`check --repair` are safe, and
+`snapshot` is safe *and* explicitly gates bitmap images out.
+`snapshot`'s autoclear-bit gate is the model for the recommended
+`resize` fix. This is recorded in the master plan's "Defects found
+during this work" section and deferred to a **dedicated follow-up**
+(teach the resize planner to either preserve unknown extensions +
+autoclear, or — matching snapshot — refuse bitmap-bearing images)
+rather than expanding this parsing phase. Operator decides whether
+that follow-up lands in this plan's scope.
 
 ## Step-level guidance
 

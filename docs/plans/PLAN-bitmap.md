@@ -402,7 +402,7 @@ bitmap directory/table/data structures are net-new to instar
 
 | Phase | Plan | Status |
 |-------|------|--------|
-| 1. qcow2 bitmap-structure parsing (`src/crates/qcow2/`): `EXT_BITMAPS` constant, bitmaps header-extension parse, directory-entry + table-entry + flags parse/serialize, granularity/geometry helpers, inline unit tests with fixtures; investigate bitmap preservation by other ops (OQ4); optionally surface bitmaps in `info` (OQ3) | PLAN-bitmap-phase-01-parse.md | Not started |
+| 1. qcow2 bitmap-structure parsing (`src/crates/qcow2/`): `EXT_BITMAPS` constant, bitmaps header-extension parse, directory-entry + table-entry + flags parse/serialize, granularity/geometry helpers, inline unit tests with fixtures; investigate bitmap preservation by other ops (OQ4); optionally surface bitmaps in `info` (OQ3) | PLAN-bitmap-phase-01-parse.md | Complete (steps 1a-1d; 1e info-listing deferred) |
 | 2. ABI: `BitmapConfig` (ordered action list, name, granularity, merge source, host cross-check) / `BitmapResult`, call-table `send_bitmap_result` (VERSION 18→19), proto result message, magic/action-opcode/flag/error constants; re-measure `core.bin` budget (OQ1, OQ9, OQ12) | PLAN-bitmap-phase-02-abi.md | Not started |
 | 3. bitmap planner crate (`src/crates/bitmap/`): per-action patch computation (add/remove/clear/enable/disable/merge), cluster allocate/free + refcount updates (reusing `snapshot`/`check` mutators), directory + table + extension serialization, autoclear-bit ordering, all validation (v2 refuse, name exists/too-long, granularity range, in_use rules), inline unit tests (OQ5, OQ6, OQ7, OQ8, OQ10) | PLAN-bitmap-phase-03-planner.md | Not started |
 | 4. Guest op (`src/operations/bitmap/`): read config, read header cluster + directory + refcount structures, loop the ordered actions through the planner, apply patches, send result; binary-size check | PLAN-bitmap-phase-04-guest.md | Not started |
@@ -557,11 +557,18 @@ Obvious extensions deferred from v1:
   image through a guest input device, OR-ing into the target.
 * **`instar info` bitmap reporting** (if not done in Phase 1):
   full qemu-img-info-equivalent bitmap listing and formatting.
-* **Bitmap preservation hardening in other ops** (Open question 4):
-  if `resize`/`amend`/`commit`/`rebase`/`check --repair` drop
-  bitmaps when rewriting metadata, make them preserve the bitmaps
-  extension or at least follow the autoclear-bit invalidation
-  contract deliberately.
+* **`resize` bitmap-preservation fix** (Open question 4, *resolved
+  in Phase 1 step 1d* — see Defects below). The Phase 1
+  investigation confirmed `resize` is the one op that silently
+  drops persistent dirty bitmaps (`rebase`/`commit`/`check --repair`
+  are safe; `snapshot` is safe *and* gates bitmap images out;
+  cross-version `amend` has only a latent, in-practice-harmless
+  autoclear-zeroing). The recommended follow-up: teach the resize
+  planner to either preserve unknown header extensions + the
+  autoclear bit across its `build_header` rebuild, or — matching
+  `snapshot`'s `mutating_feature_gates` — refuse bitmap-bearing
+  images. Deliberately scoped *out* of this plan's parsing phase;
+  operator decides whether it lands here or as its own plan.
 * **`--object`/`--image-opts`** real handling (beyond rejection),
   if a workflow needs it.
 * **`core.bin` budget.** Watch the 72 KiB core ceiling; the next
@@ -577,6 +584,32 @@ qcow2-bitmap / refcount / header-extension issues this work should
 resolve or be aware of, and resolve Open question 4 (whether other
 ops silently drop bitmaps) — if they do, that is a candidate bug to
 fix or document here.
+
+### Defects found during this work
+
+- **`resize` silently drops persistent dirty bitmaps
+  (PRE-EXISTING, deferred).** Found while resolving Open question 4
+  in Phase 1 (step 1d). `resize` rebuilds the whole qcow2 header
+  cluster via `qcow2::build_header` (`src/crates/qcow2/src/create.rs:329-410`)
+  on every path (header-only grow, grow-with-L1, table-relocate,
+  shrink). `build_header` writes a fresh v3 header that omits any
+  unknown header extension — including the bitmaps extension
+  (`0x23852875`) — and zeroes `autoclear_features` (offset 88).
+  Resizing an image carrying persistent dirty bitmaps therefore
+  discards the bitmaps directory extension and clears the autoclear
+  bit, orphaning/leaking the on-disk bitmap clusters. Every other
+  in-place mutation op was audited and is safe: `rebase`/`commit`/
+  `check --repair` do selective field writes; `snapshot` does
+  targeted 12-byte RMW at offset 60 **and** refuses images with the
+  autoclear bitmaps bit set (`mutating_feature_gates`,
+  `src/operations/snapshot/src/main.rs:454-460`). Cross-version
+  `amend` relocates unknown extensions verbatim but zeroes
+  autoclear on a v2→v3 upgrade — harmless in practice since bitmaps
+  require v3 (a v2 source has none). This defect is **independent of
+  the bitmap feature** and is scoped as a dedicated follow-up (see
+  Future work), not fixed in this parsing phase. No tracker issue
+  filed yet — recommend filing one; a draft description was produced
+  in step 1d.
 
 ### Documentation index maintenance
 
