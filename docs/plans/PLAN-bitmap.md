@@ -557,18 +557,13 @@ Obvious extensions deferred from v1:
   image through a guest input device, OR-ing into the target.
 * **`instar info` bitmap reporting** (if not done in Phase 1):
   full qemu-img-info-equivalent bitmap listing and formatting.
-* **`resize` bitmap-preservation fix** (Open question 4, *resolved
-  in Phase 1 step 1d* — see Defects below). The Phase 1
-  investigation confirmed `resize` is the one op that silently
-  drops persistent dirty bitmaps (`rebase`/`commit`/`check --repair`
-  are safe; `snapshot` is safe *and* gates bitmap images out;
-  cross-version `amend` has only a latent, in-practice-harmless
-  autoclear-zeroing). The recommended follow-up: teach the resize
-  planner to either preserve unknown header extensions + the
-  autoclear bit across its `build_header` rebuild, or — matching
-  `snapshot`'s `mutating_feature_gates` — refuse bitmap-bearing
-  images. Deliberately scoped *out* of this plan's parsing phase;
-  operator decides whether it lands here or as its own plan.
+* **`resize` bitmap-preservation** (Open question 4) — **FIXED on
+  this branch**, see Defects below. `resize` now refuses images
+  with the qcow2 bitmaps autoclear bit set (matching `snapshot`),
+  rather than silently dropping them. A future enhancement could
+  add true bitmap-aware resizing (preserve + adjust bitmap geometry
+  across the size change) instead of refusing, but that is a
+  feature well beyond the data-loss fix.
 * **`--object`/`--image-opts`** real handling (beyond rejection),
   if a workflow needs it.
 * **`core.bin` budget.** Watch the 72 KiB core ceiling; the next
@@ -588,8 +583,9 @@ fix or document here.
 ### Defects found during this work
 
 - **`resize` silently drops persistent dirty bitmaps
-  (PRE-EXISTING, deferred).** Found while resolving Open question 4
-  in Phase 1 (step 1d). `resize` rebuilds the whole qcow2 header
+  (PRE-EXISTING) — FIXED on this branch (commit `5892e1c`).** Found
+  while resolving Open question 4 in Phase 1 (step 1d). `resize`
+  rebuilds the whole qcow2 header
   cluster via `qcow2::build_header` (`src/crates/qcow2/src/create.rs:329-410`)
   on every path (header-only grow, grow-with-L1, table-relocate,
   shrink). `build_header` writes a fresh v3 header that omits any
@@ -605,11 +601,23 @@ fix or document here.
   `src/operations/snapshot/src/main.rs:454-460`). Cross-version
   `amend` relocates unknown extensions verbatim but zeroes
   autoclear on a v2→v3 upgrade — harmless in practice since bitmaps
-  require v3 (a v2 source has none). This defect is **independent of
-  the bitmap feature** and is scoped as a dedicated follow-up (see
-  Future work), not fixed in this parsing phase. No tracker issue
-  filed yet — recommend filing one; a draft description was produced
-  in step 1d.
+  require v3 (a v2 source has none).
+
+  **Fix (commit `5892e1c`):** `resize` now refuses images with the
+  bitmaps autoclear bit set, matching `snapshot`. The gate lives in
+  the resize planner (`validate_no_bitmaps`, called from
+  `compute_grow_query` and `plan_grow`); the guest op threads the
+  raw autoclear word into the planner via a new
+  `current_autoclear_features` opts/query field, captured *before*
+  any device I/O (`HEADER_BUF` is reused as a bounce buffer, so a
+  later re-read returns clobbered bytes — a bug the integration test
+  caught). New append-only ABI error code
+  `ResizeResult::ERROR_BITMAPS_UNSUPPORTED = 14` with a clear host
+  message. Covered by resize-crate unit/planner tests, a
+  ResizeResult ABI-stability test, and a `test_resize.py`
+  integration test that adds a bitmap with `qemu-img`, asserts
+  instar refuses, and asserts the bitmap survives with
+  `qemu-img check` clean.
 
 ### Documentation index maintenance
 

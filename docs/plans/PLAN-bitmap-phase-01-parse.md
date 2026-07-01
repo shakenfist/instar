@@ -293,13 +293,11 @@ forward an unknown `0x23852875` extension**.
 every path) and a latent autoclear-zeroing in cross-version
 `amend`; `rebase`/`commit`/`check --repair` are safe, and
 `snapshot` is safe *and* explicitly gates bitmap images out.
-`snapshot`'s autoclear-bit gate is the model for the recommended
-`resize` fix. This is recorded in the master plan's "Defects found
-during this work" section and deferred to a **dedicated follow-up**
-(teach the resize planner to either preserve unknown extensions +
-autoclear, or — matching snapshot — refuse bitmap-bearing images)
-rather than expanding this parsing phase. Operator decides whether
-that follow-up lands in this plan's scope.
+`snapshot`'s autoclear-bit gate is the model for the `resize` fix.
+The `resize` defect was **fixed on this branch** (commit `5892e1c`):
+the resize planner now refuses images with the bitmaps autoclear
+bit set, matching `snapshot`. See the master plan's "Defects found
+during this work" section for details.
 
 ## Step-level guidance
 
