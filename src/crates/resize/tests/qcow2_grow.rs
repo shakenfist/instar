@@ -146,6 +146,7 @@ fn opts_from_image<'a>(
         current_refcount_table_offset: header.refcount_table_offset,
         current_refcount_table_clusters: header.refcount_table_clusters,
         current_incompatible_features: header.incompatible_features,
+        current_autoclear_features: 0,
         backing_file: None,
         backing_format: None,
         lazy_refcounts: header.lazy_refcounts,
@@ -437,5 +438,20 @@ fn rejects_dirty_image() {
     assert_eq!(
         plan_resize_qcow2(&opts, &mut scratch).unwrap_err(),
         ResizeError::RequiresCheckFirst
+    );
+}
+
+#[test]
+fn rejects_image_with_persistent_bitmaps() {
+    // An otherwise-plannable grow, but the qcow2 bitmaps autoclear
+    // bit is set. resize rebuilds the header cluster and would drop
+    // the bitmaps extension, so plan_grow must refuse instead.
+    let (bytes, header) = build_starting_image(1 << 20, 65536);
+    let mut opts = opts_from_image(&bytes, &header, 2 << 20, Preallocation::Off, false);
+    opts.current_autoclear_features = qcow2::bitmap::AUTOCLEAR_BITMAPS_BIT;
+    let mut scratch = vec![0u8; QCOW2_MAX_RESIZE_SCRATCH];
+    assert_eq!(
+        plan_resize_qcow2(&opts, &mut scratch).unwrap_err(),
+        ResizeError::BitmapsPresent
     );
 }

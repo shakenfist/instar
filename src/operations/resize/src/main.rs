@@ -113,6 +113,7 @@ fn map_error(e: ResizeError) -> u32 {
         ResizeError::RequiresCheckFirst => ResizeResult::ERROR_PARSE_FAILED,
         ResizeError::HeaderMismatch => ResizeResult::ERROR_HEADER_MISMATCH,
         ResizeError::ParseFailed => ResizeResult::ERROR_PARSE_FAILED,
+        ResizeError::BitmapsPresent => ResizeResult::ERROR_BITMAPS_UNSUPPORTED,
     }
 }
 
@@ -344,6 +345,19 @@ unsafe fn run_qcow2(
         None => return err_result(config, ResizeResult::ERROR_PARSE_FAILED),
     };
 
+    // Capture the raw autoclear_features word (header offset 88) NOW,
+    // while `header` still holds the real first sector. `HEADER_BUF`
+    // is reused as a bounce buffer by `read_byte_range` /
+    // `write_byte_range` below, so re-reading `header` after any I/O
+    // would return clobbered bytes. QcowHeader::parse does not expose
+    // this field, so we read it directly here. Used to refuse images
+    // carrying persistent dirty bitmaps.
+    let current_autoclear_features = if header.len() >= qcow2::AUTOCLEAR_FEATURES_OFFSET + 8 {
+        be_u64(header, qcow2::AUTOCLEAR_FEATURES_OFFSET)
+    } else {
+        0
+    };
+
     let cluster_size = parsed.cluster_size as usize;
     if cluster_size == 0 || cluster_size > 2 * 1024 * 1024 {
         return err_result(config, ResizeResult::ERROR_PARSE_FAILED);
@@ -420,6 +434,7 @@ unsafe fn run_qcow2(
             current_refcount_table_offset: parsed.refcount_table_offset,
             current_refcount_table_clusters: parsed.refcount_table_clusters,
             current_incompatible_features: parsed.incompatible_features,
+            current_autoclear_features,
             preallocation: map_prealloc(config.flags),
             allow_shrink: config.allow_shrink(),
             existing_refcount_table_bytes: rt_slice,
@@ -546,6 +561,7 @@ unsafe fn run_qcow2(
         current_refcount_table_offset: parsed.refcount_table_offset,
         current_refcount_table_clusters: parsed.refcount_table_clusters,
         current_incompatible_features: parsed.incompatible_features,
+        current_autoclear_features,
         backing_file: None,
         backing_format: None,
         lazy_refcounts: parsed.lazy_refcounts,

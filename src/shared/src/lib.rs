@@ -3276,6 +3276,10 @@ impl ResizeResult {
     /// the `HeaderMismatch` variant in `crates/resize` for the
     /// authoritative breakdown.
     pub const ERROR_HEADER_MISMATCH: u32 = 13;
+    /// The image carries persistent dirty bitmaps (qcow2 bitmaps
+    /// autoclear bit set). resize refuses rather than silently
+    /// discarding them (build_header would drop the extension).
+    pub const ERROR_BITMAPS_UNSUPPORTED: u32 = 14;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -4216,6 +4220,15 @@ mod tests {
     #[test]
     fn resize_result_magic() {
         assert_eq!(ResizeResult::MAGIC, 0x5252_4553); // "RRES" LE
+    }
+
+    #[test]
+    fn resize_result_error_codes_are_stable() {
+        // These are ABI: append-only, never renumber.
+        assert_eq!(ResizeResult::ERROR_OK, 0);
+        assert_eq!(ResizeResult::ERROR_PARSE_FAILED, 12);
+        assert_eq!(ResizeResult::ERROR_HEADER_MISMATCH, 13);
+        assert_eq!(ResizeResult::ERROR_BITMAPS_UNSUPPORTED, 14);
     }
 
     #[test]

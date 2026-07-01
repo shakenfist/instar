@@ -278,6 +278,7 @@ const RESIZE_RESULT_ERROR_READ_FAILED: u32 = 10;
 const RESIZE_RESULT_ERROR_WRITE_FAILED: u32 = 11;
 const RESIZE_RESULT_ERROR_PARSE_FAILED: u32 = 12;
 const RESIZE_RESULT_ERROR_HEADER_MISMATCH: u32 = 13;
+const RESIZE_RESULT_ERROR_BITMAPS_UNSUPPORTED: u32 = 14;
 
 // CheckResult flag constants (must match shared crate)
 const CHECK_RESULT_FLAG_VALID: u32 = 1 << 0;
@@ -4454,6 +4455,12 @@ fn map_resize_error(code: u32) -> String {
              read (concurrent modification, a pathological image, \
              or a planner accounting bug); retry the operation, or \
              run `instar check` if the image may be corrupt"
+                .into()
+        }
+        RESIZE_RESULT_ERROR_BITMAPS_UNSUPPORTED => {
+            "refusing to resize an image with persistent dirty \
+             bitmaps (would discard them); remove the bitmaps first \
+             with `instar bitmap --remove` or qemu-img"
                 .into()
         }
         _ => format!("unknown resize error code {code}"),
@@ -14604,7 +14611,7 @@ mod resize_size_parser_tests {
         // map_resize_error, the fallback returns "unknown
         // resize error code N" — we want every known code to
         // hit a specific message instead.
-        for code in 0..=RESIZE_RESULT_ERROR_HEADER_MISMATCH {
+        for code in 0..=RESIZE_RESULT_ERROR_BITMAPS_UNSUPPORTED {
             let msg = map_resize_error(code);
             assert!(!msg.is_empty(), "code {code} has empty message");
             assert!(

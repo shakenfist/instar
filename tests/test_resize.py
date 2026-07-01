@@ -653,6 +653,74 @@ class TestResizeErrorPaths(TestResizeSmoke):
             self.assertNotEqual(rc, 0)
             self.assertIn('meaningless when shrinking', stderr)
 
+    # ----------- Persistent dirty bitmaps rejection (data-loss guard) -----------
+
+    def test_resize_refuses_image_with_persistent_bitmaps(self):
+        """resize must refuse a qcow2 carrying persistent dirty bitmaps.
+
+        `instar resize` rebuilds the whole qcow2 header cluster via
+        build_header, which drops unknown header extensions (including
+        the 0x23852875 bitmaps extension) and zeroes autoclear_features.
+        Rather than silently orphan the on-disk bitmap clusters, resize
+        refuses. This test proves the refusal *and* that the image and
+        its bitmap survive untouched.
+        """
+        def _qemu_img(*cmd):
+            try:
+                return subprocess.run(
+                    ['qemu-img', *cmd],
+                    capture_output=True, text=True, timeout=60)
+            except FileNotFoundError:
+                self.skipTest('system qemu-img not installed')
+
+        def _bitmap_names(path):
+            r = _qemu_img('info', '--output=json', str(path))
+            self.assertEqual(r.returncode, 0,
+                             f'qemu-img info failed: {r.stderr}')
+            data = json.loads(r.stdout)
+            return {
+                b.get('name')
+                for b in (data.get('format-specific', {})
+                          .get('data', {})
+                          .get('bitmaps', []) or [])
+            }
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'bm.qcow2'
+
+            # Build the image and add a persistent bitmap with system
+            # qemu-img (instar create doesn't add bitmaps).
+            r = _qemu_img('create', '-f', 'qcow2', str(path), '4M')
+            self.assertEqual(r.returncode, 0,
+                             f'qemu-img create failed: {r.stderr}')
+            r = _qemu_img('bitmap', '--add', str(path), 'testbm')
+            self.assertEqual(r.returncode, 0,
+                             f'qemu-img bitmap --add failed: {r.stderr}')
+
+            # Confirm the bitmap is present before we attempt the resize.
+            self.assertIn('testbm', _bitmap_names(path),
+                          'setup failed: bitmap not present before resize')
+
+            # The actual assertion: resize refuses.
+            _, stderr, rc = self.run_instar_resize(
+                '-f', 'qcow2', str(path), '8M')
+            self.assertNotEqual(
+                rc, 0,
+                f'expected resize to refuse a bitmapped image; stderr={stderr}')
+            self.assertIn('bitmap', stderr.lower(),
+                          f'expected a bitmaps-related message; stderr={stderr}')
+
+            # The image must be UNCHANGED: the bitmap survives...
+            self.assertIn('testbm', _bitmap_names(path),
+                          'bitmap was lost even though resize claimed to refuse')
+
+            # ...and the image still checks clean.
+            r = _qemu_img('check', str(path))
+            self.assertEqual(
+                r.returncode, 0,
+                f'qemu-img check failed after refused resize: '
+                f'{r.stdout}{r.stderr}')
+
     # ----------- --object / --image-opts deferral (phase 8) -----------
 
     def test_object_flag_rejected(self):
