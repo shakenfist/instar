@@ -420,6 +420,88 @@ I/O it already owns. This is a deviation from Mission §3's wording
 no-I/O constraint; the net freeing is identical, just split across the
 crate/guest boundary.
 
+#### 3d design decisions (merge — the crate/guest split)
+
+**Merge landed here, as pure pieces only (not deferred).** `merge`
+inherently reads on-disk bitmap **data** clusters (source and dest) and
+writes dest data clusters — I/O this pure `no_std` crate cannot do. So,
+exactly like the 3c remove/clear split, the crate owns the pure,
+testable logic and the Phase-4 guest owns the I/O orchestration. The
+crate side is *not* empty (validation + `or_bitmap_data` +
+`merge_cluster_action` are clean pure logic), so merge was **not
+deferred**; the ABI still reserves `ACTION_MERGE` and
+`ERROR_UNSUPPORTED_ACTION` for the cross-file `-b` case, which remains
+deferred (no source-file field in the ABI).
+
+**Module choice.** The merge pieces live in a new
+`src/crates/bitmap/src/merge.rs` (`pub mod merge;` in `lib.rs`), not in
+`action.rs`. Merge introduces its own vocabulary (`MergeSpec`,
+`MergeClusterAction`, `or_bitmap_data`) and, unlike the other five
+actions, does not follow the `action_*(…, out_dir) -> ActionOutcome`
+shape (it reads/writes bitmap *data*, not the directory), so a separate
+module reads more cleanly. It reuses `action::BitmapGeometry` and
+`directory::{find_bitmap, FoundBitmap}`.
+
+**New ABI error.** `ERROR_INCOMPATIBLE_MERGE = 19` was appended to
+`BitmapResult` (append-only, ABI-safe; `bitmap_result_error_codes_
+distinct` updated to cover 19), with `BitmapError::IncompatibleMerge`
+and its `From` mapping. Returned when the two bitmaps' `granularity_
+bits` differ (hence unequal bit-count / `bitmap_table_size`).
+
+**Crate/guest contract for merge.**
+
+- `merge_validate(dir, nb_bitmaps, dest_name, source_name, geom) ->
+  MergeSpec` — pure, no I/O, no mutation. Validates: dest exists
+  (`BitmapNotFound`); source exists (`MergeSourceNotFound`); neither is
+  `in_use` (`BitmapInUse`, dest checked first); equal `granularity_bits`
+  and equal `bitmap_table_size` (`IncompatibleMerge`). **Self-merge**
+  (`source_name == dest_name`) is a legal no-op (matches qemu): it
+  passes validation and returns `MergeSpec { self_merge: true, … }` so
+  the guest can skip the table walk. `MergeSpec` hands the guest both
+  bitmaps' on-disk table offsets/sizes (via `FoundBitmap`) plus the
+  equal `table_size` and `granularity_bits`.
+- `merge_cluster_action(source_entry: u64, dest_entry: u64) ->
+  MergeClusterAction` — decode both raw table words (Phase-1
+  `decode_bitmap_table_entry`; a bad word ⇒ `ParseFailed`) and tell the
+  guest what to do for that table index.
+- `or_bitmap_data(dst: &mut [u8], src: &[u8])` — byte-wise `dst[i] |=
+  src[i]`; requires **equal length** (a whole data cluster), else
+  `InternalOverflow` (no partial OR). The guest calls this per
+  `OrIntoExisting`/`AllocDestFromSource` cluster after staging both
+  clusters into scratch.
+
+**`MergeClusterAction` truth table (source × dest table entry).**
+
+| source \ dest | AllZeroes           | AllOnes | Allocated       |
+|---------------|---------------------|---------|-----------------|
+| **AllZeroes** | Skip                | Skip    | Skip            |
+| **AllOnes**   | CopyAllOnes         | Skip    | CopyAllOnes     |
+| **Allocated** | AllocDestFromSource | Skip    | OrIntoExisting  |
+
+- **Skip** — nothing to write: source contributes no set bits
+  (AllZeroes), or dest is already AllOnes (cannot gain bits).
+- **CopyAllOnes** — dest becomes AllOnes: the guest sets the dest table
+  entry's all-ones flag and, if the dest previously had an `Allocated`
+  data cluster, **frees** that cluster. (This folds the flagged "source
+  all-ones + dest allocated ⇒ dest all-ones, free its data cluster"
+  case — recorded in the variant's doc; the crate reports the action,
+  the guest performs the free since only it can read the dest table.)
+- **OrIntoExisting** — both allocated: guest reads both clusters, calls
+  `or_bitmap_data`, writes the result to the dest's existing data
+  cluster; dest table entry unchanged.
+- **AllocDestFromSource** — source allocated, dest AllZeroes: guest
+  allocates a fresh dest data cluster, copies the source bits in, writes
+  it, and points the dest table entry at the new cluster.
+
+**What the guest (Phase 4) owns for merge (NOT in this crate):** walking
+the two on-disk bitmap tables and pairing entry `i`; reading/writing
+data clusters; allocating dest data clusters (`snapshot::qcow2::alloc_*`)
+and freeing dest clusters that `CopyAllOnes` obsoletes; rewriting the
+dest bitmap table entries + refcounts; and re-serializing the directory
+(the dest directory entry is unchanged unless a full-rewrite path is
+chosen). The bounded staging of source+dest data clusters (one cluster
+of each at a time) is guest-side scratch management.
+
 **`read_cluster_refcount` is `#[cfg(test)]`.** The actions only need
 the refcount *write* path (freeing table clusters via
 `set_cluster_refcount`). The read companion is exercised by tests and

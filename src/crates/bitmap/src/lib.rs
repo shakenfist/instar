@@ -18,6 +18,9 @@
 //! - [`directory`] — directory-level byte helpers (find, build,
 //!   replace, extension-body serialization).
 //! - [`action`] — per-action validate-then-mutate functions.
+//! - [`merge`] — the pure crate-side pieces of same-image `merge`
+//!   (validation, per-cluster OR, per-table-entry disposition); the
+//!   Phase-4 guest owns the table walk and cluster I/O.
 //!
 //! The crate is `no_std` and panic-free.
 
@@ -28,6 +31,7 @@ extern crate std;
 
 pub mod action;
 pub mod directory;
+pub mod merge;
 
 use shared::BitmapResult;
 
@@ -103,6 +107,10 @@ pub enum BitmapError {
     /// allocator and refuses other widths. Maps to
     /// [`BitmapResult::ERROR_UNSUPPORTED_REFCOUNT_WIDTH`] (18).
     UnsupportedRefcountWidth,
+    /// A `--merge` named two bitmaps of incompatible geometry
+    /// (unequal granularity / bitmap-table size). Maps to
+    /// [`BitmapResult::ERROR_INCOMPATIBLE_MERGE`] (19).
+    IncompatibleMerge,
 }
 
 impl From<BitmapError> for u32 {
@@ -126,6 +134,7 @@ impl From<BitmapError> for u32 {
             BitmapError::MergeSourceNotFound => BitmapResult::ERROR_MERGE_SOURCE_NOT_FOUND,
             BitmapError::UnsupportedAction => BitmapResult::ERROR_UNSUPPORTED_ACTION,
             BitmapError::UnsupportedRefcountWidth => BitmapResult::ERROR_UNSUPPORTED_REFCOUNT_WIDTH,
+            BitmapError::IncompatibleMerge => BitmapResult::ERROR_INCOMPATIBLE_MERGE,
         }
     }
 }
@@ -209,6 +218,10 @@ mod tests {
             u32::from(BitmapError::UnsupportedRefcountWidth),
             BitmapResult::ERROR_UNSUPPORTED_REFCOUNT_WIDTH
         );
+        assert_eq!(
+            u32::from(BitmapError::IncompatibleMerge),
+            BitmapResult::ERROR_INCOMPATIBLE_MERGE
+        );
     }
 
     #[test]
@@ -233,6 +246,7 @@ mod tests {
             u32::from(BitmapError::MergeSourceNotFound),
             u32::from(BitmapError::UnsupportedAction),
             u32::from(BitmapError::UnsupportedRefcountWidth),
+            u32::from(BitmapError::IncompatibleMerge),
         ];
         for i in 0..codes.len() {
             for j in (i + 1)..codes.len() {

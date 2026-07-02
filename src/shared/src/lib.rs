@@ -3856,6 +3856,11 @@ impl BitmapResult {
     /// qcow2 refcount width != 16; v1 reuses the 16-bit-only
     /// allocator and refuses other widths.
     pub const ERROR_UNSUPPORTED_REFCOUNT_WIDTH: u32 = 18;
+    /// A `--merge` was requested between two bitmaps whose geometry
+    /// is incompatible (unequal granularity, hence unequal bit-count
+    /// / bitmap-table size). qemu requires equal granularity to
+    /// merge; v1 refuses rather than resampling.
+    pub const ERROR_INCOMPATIBLE_MERGE: u32 = 19;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -4994,8 +4999,8 @@ mod tests {
 
     #[test]
     fn bitmap_result_error_codes_distinct() {
-        // Phase 2 defines codes 0..=17; phase 3 appends 18. Confirm
-        // every code is distinct and contiguously numbered
+        // Phase 2 defines codes 0..=17; phase 3 appends 18 and 19.
+        // Confirm every code is distinct and contiguously numbered
         // (append-only).
         let codes = [
             BitmapResult::ERROR_OK,
@@ -5017,6 +5022,7 @@ mod tests {
             BitmapResult::ERROR_MERGE_SOURCE_NOT_FOUND,
             BitmapResult::ERROR_UNSUPPORTED_ACTION,
             BitmapResult::ERROR_UNSUPPORTED_REFCOUNT_WIDTH,
+            BitmapResult::ERROR_INCOMPATIBLE_MERGE,
         ];
         for i in 0..codes.len() {
             for j in (i + 1)..codes.len() {
