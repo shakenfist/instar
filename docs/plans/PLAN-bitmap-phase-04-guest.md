@@ -256,6 +256,62 @@ attempting it as step 4d; if it balloons the binary past the
 returns `ERROR_UNSUPPORTED_ACTION` for `ACTION_MERGE` and the other
 five actions ship. Decide at 4d review.
 
+**Resolution (4d — IMPLEMENTED, not deferred).** Merge landed. The
+binary grew only marginally (`bitmap.bin` is **36 KiB / 376 KiB, 9 %**
+— the crate logic was already linked for the `ERROR_UNSUPPORTED_ACTION`
+stub, so the incremental cost was the orchestration alone), and the
+flow reviewed cleanly. Design decisions:
+
+- **Dedicated flow, not the 4c write-back.** Merge does **not** touch
+  the directory (the dest's directory entry — its table offset/size —
+  is unchanged); it mutates only the dest bitmap's **table entries**
+  and **data clusters** plus the refcounts of freshly-allocated /
+  freed data clusters. So it runs `run_merge` / `write_back_merge` /
+  `merge_one_source` rather than 4c's directory-centric `write_back`.
+  The autoclear dance is the same shape (clear @88 + fsync → mutate →
+  write refblocks + fsync → set @88 + fsync); merge never removes the
+  last bitmap, so autoclear is always re-set.
+- **Incremental per-table-entry, no whole-table staging.** Source and
+  dest tables have equal granularity + equal `table_size`
+  (`merge_validate` enforces), and may be multi-cluster, so the flow
+  iterates index `i` in `0..table_size`, reads the two 8-byte table
+  words directly from disk (into 8-byte stack buffers), applies
+  `merge_cluster_action`, and for data-cluster cases reads/OR-s/writes
+  through the `DATA_A` (source) / `DATA_B` (dest) cluster scratch. Dest
+  table-entry rewrites (`CopyAllOnes` → all-ones sentinel;
+  `AllocDestFromSource` → new `Allocated` offset) are 8-byte writes to
+  `dest_table_offset + i*8`; `CopyAllOnes` also frees any obsolete dest
+  data cluster in the staged refblocks. Refblocks are flushed once,
+  after the loop, under the guard (a crash leaves autoclear clear ⇒
+  partial merge is safe).
+- **Mixing decision (v1 restriction).** An invocation is **either**
+  all-metadata-actions (the 4c path) **or** a single `ACTION_MERGE`
+  (the 4d path). `run_qcow2` detects any `ACTION_MERGE` in the action
+  list; if present it must be the *sole* action (`num_actions == 1` and
+  it is a merge), otherwise the op refuses with
+  `ERROR_UNSUPPORTED_ACTION`. qemu allows mixing merge with other
+  actions in one invocation, but v1 keeps them separate (the Phase-5
+  host / Phase-6-7 tests drive them separately). This can be relaxed
+  later without an ABI change.
+- **Multi-source decision (loop, single-`--merge`-source is the common
+  case).** `run_merge` loops over `config.num_merge_sources`, extracting
+  each source name from the concatenated `merge_source_pool` via the
+  `merge_source_lens[k]` prefix sums; a merge with N sources is applied
+  as N sequential single-source merges into the dest (they share one
+  `AllocCursor` + refblocks buffer, so allocations don't collide, and
+  the refblocks + autoclear are flushed once at the end). All N sources
+  are `merge_validate`-d up front (before any write) so a validation
+  refusal leaves the image byte-identical even for a multi-source
+  request. A self-merge source (`source_name == dest_name`) is skipped
+  (OR-ing a bitmap into itself is a no-op); if every source is a
+  self-merge the whole invocation is a no-op success.
+- **Error mapping.** Allocator `RefcountExhausted` ⇒ `ERROR_NO_SPACE`;
+  `Unsupported` (width ≠ 16) ⇒ `ERROR_UNSUPPORTED_REFCOUNT_WIDTH`; a
+  malformed source-name length or missing source ⇒
+  `ERROR_MERGE_SOURCE_NOT_FOUND`; crate `BitmapError`s map through the
+  existing `u32::from` (`IncompatibleMerge` / `BitmapInUse` /
+  `BitmapNotFound` / `ParseFailed`).
+
 ### 3. Binary size (376 KiB `.bss`-inclusive cap)
 
 The op links `qcow2` (with `create`?), `snapshot`, and `bitmap`,

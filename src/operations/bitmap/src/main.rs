@@ -9,20 +9,32 @@
 //! data-cluster work the crate cannot, writes everything back under
 //! a crash-safe autoclear dance, and returns a [`BitmapResult`].
 //!
-//! **This is step 4c: the metadata-action loop + write-back +
-//! autoclear dance** for the five metadata actions (add / remove /
-//! clear / enable / disable). On top of 4b's header read + gates +
-//! host cross-check + staging, `run_qcow2` now applies the ordered
-//! action list in memory (double-buffering the directory, threading
-//! one [`AllocCursor`] and the staged refblocks), performs the
-//! on-disk data-cluster work the Phase-3 crate cannot (walking a
-//! freed/cleared bitmap's on-disk table to free its data clusters),
-//! and writes everything back under the crash-safe autoclear dance
-//! (clear autoclear → write clusters/directory/refblocks → rewrite
-//! the bitmaps extension → set autoclear, leaving it clear when the
-//! last bitmap was removed). `ACTION_MERGE` still returns
-//! `ERROR_UNSUPPORTED_ACTION` (step 4d). Non-qcow2 targets are
-//! refused with `ERROR_UNSUPPORTED_FORMAT` (v1 is qcow2-only).
+//! **This is step 4d: merge on-disk orchestration, on top of 4c's
+//! metadata-action loop + write-back + autoclear dance** for the five
+//! metadata actions (add / remove / clear / enable / disable). On top
+//! of 4b's header read + gates + host cross-check + staging,
+//! `run_qcow2` applies the ordered action list in memory
+//! (double-buffering the directory, threading one [`AllocCursor`] and
+//! the staged refblocks), performs the on-disk data-cluster work the
+//! Phase-3 crate cannot (walking a freed/cleared bitmap's on-disk
+//! table to free its data clusters), and writes everything back under
+//! the crash-safe autoclear dance (clear autoclear → write
+//! clusters/directory/refblocks → rewrite the bitmaps extension → set
+//! autoclear, leaving it clear when the last bitmap was removed).
+//!
+//! **Merge (`ACTION_MERGE`)** is handled by a dedicated flow
+//! ([`run_merge`]) since it mutates only the destination bitmap's
+//! *table entries* and *data clusters* (never the directory), so it
+//! does not fit 4c's directory-centric write-back. An invocation is
+//! **either** all-metadata-actions (the 4c path) **or** a single
+//! merge action (the 4d path); an invocation that mixes merge with
+//! other actions is refused with `ERROR_UNSUPPORTED_ACTION` (v1
+//! restriction — the host/tests drive them separately). v1 merge
+//! supports a **single** `--merge` source (the first entry of the
+//! merge-source pool); a multi-source request is applied as N
+//! sequential single-source merges into the destination. Non-qcow2
+//! targets are refused with `ERROR_UNSUPPORTED_FORMAT` (v1 is
+//! qcow2-only).
 //!
 //! **First-add / no-extension case:** when the image has no bitmaps
 //! extension yet, the first `--add` creates a new `EXT_BITMAPS`
@@ -46,9 +58,10 @@ use bitmap::action::{
     BitmapGeometry, MAX_TABLE_CLUSTERS,
 };
 use bitmap::directory::serialize_bitmaps_extension;
+use bitmap::merge::{merge_cluster_action, merge_validate, or_bitmap_data, MergeClusterAction};
 use qcow2::bitmap::{
-    decode_bitmap_table_entry, default_granularity, granularity_bits_valid, BitmapTableEntry,
-    AUTOCLEAR_BITMAPS_BIT,
+    decode_bitmap_table_entry, default_granularity, encode_bitmap_table_entry,
+    granularity_bits_valid, BitmapTableEntry, AUTOCLEAR_BITMAPS_BIT,
 };
 use qcow2::{
     header_extension_area_end, parse_header_extensions, QcowHeader, AUTOCLEAR_FEATURES_OFFSET,
@@ -60,6 +73,7 @@ use shared::{
     OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE,
 };
 use snapshot::qcow2::{alloc_contiguous_clusters_in_refblocks, set_refcount_in_block, AllocCursor};
+use snapshot::SnapshotError;
 
 fn get_call_table() -> &'static CallTable {
     unsafe { &*(CALL_TABLE_ADDR as *const CallTable) }
@@ -610,6 +624,39 @@ unsafe fn run_qcow2(call_table: &CallTable, config: &BitmapConfig) -> BitmapResu
     if num_actions == 0 || num_actions > MAX_BITMAP_ACTIONS {
         (call_table.verbose_print)(b"bitmap: num_actions out of range\n\0".as_ptr());
         return make_result(config, 0, BitmapResult::ERROR_UNSUPPORTED_ACTION);
+    }
+
+    // --- Merge vs metadata dispatch (v1: never mixed) --------------------
+    //
+    // Merge mutates only the destination bitmap's *table entries* and
+    // *data clusters* (not the directory), so it uses a dedicated flow
+    // rather than 4c's directory-centric write-back. v1 restricts an
+    // invocation to EITHER all-metadata-actions OR a single merge
+    // action: a mix is refused with ERROR_UNSUPPORTED_ACTION (the
+    // host/tests drive them separately; documented in the module doc
+    // and the phase-4 plan).
+    let actions = &config.actions[..num_actions];
+    let any_merge = actions.iter().any(|&a| a == BitmapConfig::ACTION_MERGE);
+    if any_merge {
+        let all_merge = actions.iter().all(|&a| a == BitmapConfig::ACTION_MERGE);
+        if !all_merge || num_actions != 1 {
+            // Merge mixed with other actions (or repeated) — refuse.
+            (call_table.verbose_print)(b"bitmap: merge must be the sole action (v1)\n\0".as_ptr());
+            return make_result(
+                config,
+                BitmapConfig::ACTION_MERGE as u32,
+                BitmapResult::ERROR_UNSUPPORTED_ACTION,
+            );
+        }
+        return run_merge(
+            call_table,
+            config,
+            sector_size,
+            &hdr,
+            dir_len,
+            guest_nb_bitmaps,
+            staged,
+        );
     }
 
     // --- Locate the bitmaps extension body offset in HEADER_BUF ----------
@@ -1404,6 +1451,460 @@ unsafe fn write_bitmaps_extension(
         return Err(BitmapResult::ERROR_WRITE_FAILED);
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Merge on-disk orchestration (step 4d)
+// ---------------------------------------------------------------------------
+
+/// Resolve merge source `k`'s name slice within `config.merge_source_pool`,
+/// summing the preceding `merge_source_lens`. Returns `None` if the
+/// declared lengths run past the pool (a malformed config).
+fn merge_source_name(config: &BitmapConfig, k: usize) -> Option<&[u8]> {
+    let mut start: usize = 0;
+    for i in 0..k {
+        start = start.checked_add(config.merge_source_lens[i] as usize)?;
+    }
+    let len = config.merge_source_lens[k] as usize;
+    let end = start.checked_add(len)?;
+    config.merge_source_pool.get(start..end)
+}
+
+/// Map a `snapshot::qcow2` allocator error onto the bitmap ABI:
+/// exhaustion ⇒ `ERROR_NO_SPACE`, unsupported width ⇒
+/// `ERROR_UNSUPPORTED_REFCOUNT_WIDTH`, anything else ⇒
+/// `ERROR_INTERNAL_OVERFLOW`.
+fn alloc_err_to_code(e: SnapshotError) -> u32 {
+    match e {
+        SnapshotError::RefcountExhausted => BitmapResult::ERROR_NO_SPACE,
+        SnapshotError::Unsupported => BitmapResult::ERROR_UNSUPPORTED_REFCOUNT_WIDTH,
+        _ => BitmapResult::ERROR_INTERNAL_OVERFLOW,
+    }
+}
+
+/// Merge orchestration + crash-safe autoclear dance for
+/// `ACTION_MERGE`.
+///
+/// Merge OR-s each source bitmap's set bits into the destination
+/// bitmap. Unlike the metadata actions it does **not** change the
+/// directory (the destination's directory entry — its table
+/// offset/size — is unchanged); it mutates only the destination's
+/// bitmap **table entries** and its **data clusters**, plus the
+/// refcounts of freshly-allocated / freed data clusters. It therefore
+/// runs its own write-back rather than 4c's directory-centric one.
+///
+/// The full pre-flight (`merge_validate` for every source) runs
+/// *before* any write, so a validation refusal leaves the image
+/// byte-identical. Once validated, the flow is:
+///   1. self-merge only ⇒ no-op success (OR-ing a bitmap into itself
+///      changes nothing).
+///   2. CLEAR the autoclear bitmaps bit, fsync — a crash from here
+///      leaves the bitmaps ignorable.
+///   3. For each source, walk `table_size` table indices, applying the
+///      per-index [`MergeClusterAction`] (Skip / CopyAllOnes /
+///      OrIntoExisting / AllocDestFromSource): read/OR/write data
+///      clusters, allocate/free dest clusters, and rewrite dest table
+///      entries in place. fsync once after the loop.
+///   4. Write the mutated refblocks back, fsync.
+///   5. SET the autoclear bit back, fsync (merge never removes the
+///      last bitmap, so autoclear is always restored).
+///
+/// `#[inline(never)]` for the same codegen-miscompile reason as
+/// `run_qcow2` / `run_actions`.
+///
+/// # Safety
+///
+/// `call_table` must be the validated CallTable; the image is attached
+/// input-RW at slot 0. `dir_len` bytes of the staged directory are in
+/// DIR_A; `staged` describes REFBLOCKS_BUF / RB_OFFSETS.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn run_merge(
+    call_table: &CallTable,
+    config: &BitmapConfig,
+    sector_size: usize,
+    hdr: &QcowHeader,
+    dir_len: usize,
+    nb_bitmaps: u32,
+    staged: StagedRefblocks,
+) -> BitmapResult {
+    let merge_action = BitmapConfig::ACTION_MERGE as u32;
+    let cluster_size = hdr.cluster_size;
+
+    // Dest name (shared target). Guard the length as run_actions does.
+    let name_len = config.name_len as usize;
+    if name_len == 0 || name_len > config.name.len() {
+        return make_result(config, merge_action, BitmapResult::ERROR_NAME_TOO_LONG);
+    }
+    let dest_name = &config.name[..name_len];
+
+    // At least one source is required for a merge.
+    let num_sources = config.num_merge_sources as usize;
+    if num_sources == 0 || num_sources > shared::MAX_MERGE_SOURCES {
+        (call_table.verbose_print)(b"bitmap: merge requires 1..=8 sources\n\0".as_ptr());
+        return make_result(config, merge_action, BitmapResult::ERROR_UNSUPPORTED_ACTION);
+    }
+
+    let geom = BitmapGeometry {
+        cluster_size,
+        cluster_bits: hdr.cluster_bits,
+        refcount_bits: 16,
+        virtual_size: hdr.virtual_size,
+        refblock_count: staged.refblock_count as u64,
+        host_refblocks_start: staged.host_refblocks_start,
+    };
+
+    // The staged directory lives in DIR_A (dir_len bytes). merge_validate
+    // reads it read-only; the directory is never rewritten for merge.
+    let dir = core::slice::from_raw_parts(DIR_A as *const u8, dir_len);
+
+    // --- Pre-flight: validate every source (no write) --------------------
+    //
+    // Validating all sources up front keeps a refusal image-byte-identical
+    // even for a multi-source request. `all_self` tracks whether every
+    // source is a self-merge (⇒ whole invocation is a no-op).
+    let mut all_self = true;
+    for k in 0..num_sources {
+        let src_name = match merge_source_name(config, k) {
+            Some(s) if !s.is_empty() => s,
+            _ => {
+                (call_table.verbose_print)(b"bitmap: bad merge source name\n\0".as_ptr());
+                return make_result(
+                    config,
+                    merge_action,
+                    BitmapResult::ERROR_MERGE_SOURCE_NOT_FOUND,
+                );
+            }
+        };
+        match merge_validate(dir, nb_bitmaps, dest_name, src_name, &geom) {
+            Ok(spec) => {
+                if !spec.self_merge {
+                    all_self = false;
+                }
+            }
+            Err(e) => return make_result(config, merge_action, u32::from(e)),
+        }
+    }
+
+    // Every source is a self-merge (or the sole source is) ⇒ no-op success.
+    if all_self {
+        let mut result = make_result(config, merge_action, BitmapResult::ERROR_OK);
+        result.actions_applied = 1;
+        result.resulting_nb_bitmaps = nb_bitmaps;
+        return result;
+    }
+
+    // --- Autoclear dance around the data mutation ------------------------
+    match write_back_merge(
+        call_table,
+        config,
+        sector_size,
+        hdr,
+        &staged,
+        dir,
+        nb_bitmaps,
+        dest_name,
+        num_sources,
+        &geom,
+    ) {
+        Ok(()) => {}
+        Err(e) => return make_result(config, merge_action, e),
+    }
+
+    let mut result = make_result(config, merge_action, BitmapResult::ERROR_OK);
+    result.actions_applied = 1;
+    result.resulting_nb_bitmaps = nb_bitmaps;
+    result
+}
+
+/// The crash-safe merge write-back: clear the autoclear bitmaps bit,
+/// apply every source merge (per-index table walk + data I/O + dest
+/// table-entry rewrites), write the mutated refblocks, then set the
+/// autoclear bit back. fsync barriers mirror `check --repair`.
+///
+/// # Safety
+///
+/// `call_table` must be the validated CallTable; the image is attached
+/// input-RW at slot 0. `dir` names the staged directory; REFBLOCKS_BUF
+/// / RB_OFFSETS are described by `staged`.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn write_back_merge(
+    call_table: &CallTable,
+    config: &BitmapConfig,
+    sector_size: usize,
+    hdr: &QcowHeader,
+    staged: &StagedRefblocks,
+    dir: &[u8],
+    nb_bitmaps: u32,
+    dest_name: &[u8],
+    num_sources: usize,
+    geom: &BitmapGeometry,
+) -> Result<(), u32> {
+    let cluster_size = hdr.cluster_size;
+    let cluster_size_usize = cluster_size as usize;
+    let refblock_count = staged.refblock_count;
+
+    // Clamp the cluster size to the DATA_A / DATA_B scratch regions
+    // before any per-cluster data I/O (bounds the reads/writes below).
+    if cluster_size_usize > DATA_A_LIMIT || cluster_size_usize > DATA_B_LIMIT {
+        return Err(BitmapResult::ERROR_SCRATCH_TOO_SMALL);
+    }
+
+    // One shared AllocCursor + refblocks buffer across every source, so
+    // sequential merges into the same dest allocate without collision.
+    let mut cursor = AllocCursor::default();
+
+    // ---- CLEAR the autoclear bitmaps bit, fsync -------------------------
+    // From here a crash leaves the bitmaps ignorable (autoclear clear).
+    rmw_feature_word(
+        call_table,
+        sector_size,
+        AUTOCLEAR_FEATURES_OFFSET as u64,
+        |w| w & !AUTOCLEAR_BITMAPS_BIT,
+    )?;
+    let _ = (call_table.fsync_input)(0);
+
+    // ---- Apply each source merge (data I/O + dest table rewrites) -------
+    for k in 0..num_sources {
+        let src_name = match merge_source_name(config, k) {
+            Some(s) if !s.is_empty() => s,
+            _ => return Err(BitmapResult::ERROR_MERGE_SOURCE_NOT_FOUND),
+        };
+        // Re-validate against the (unchanged) directory to recover the
+        // fresh source/dest table offsets for this source.
+        let spec = merge_validate(dir, nb_bitmaps, dest_name, src_name, geom).map_err(u32::from)?;
+        if spec.self_merge {
+            continue; // OR-ing a bitmap into itself changes nothing.
+        }
+        merge_one_source(
+            call_table,
+            sector_size,
+            cluster_size,
+            refblock_count,
+            staged.host_refblocks_start,
+            spec.source.entry.bitmap_table_offset,
+            spec.dest.entry.bitmap_table_offset,
+            spec.table_size,
+            &mut cursor,
+        )?;
+    }
+    let _ = (call_table.fsync_input)(0);
+
+    // ---- Write the mutated refblocks back, fsync ------------------------
+    let rb_offsets = core::slice::from_raw_parts(RB_OFFSETS as *const u64, refblock_count);
+    for (k, &host_off) in rb_offsets.iter().enumerate() {
+        let src = (REFBLOCKS_BUF + k * cluster_size_usize) as *const u8;
+        let block = core::slice::from_raw_parts(src, cluster_size_usize);
+        if !write_input_byte_range(call_table, 0, sector_size, host_off, block) {
+            return Err(BitmapResult::ERROR_WRITE_FAILED);
+        }
+    }
+    let _ = (call_table.fsync_input)(0);
+
+    // ---- SET the autoclear bit back, fsync ------------------------------
+    // Merge never removes the last bitmap, so autoclear is always restored.
+    rmw_feature_word(
+        call_table,
+        sector_size,
+        AUTOCLEAR_FEATURES_OFFSET as u64,
+        |w| w | AUTOCLEAR_BITMAPS_BIT,
+    )?;
+    let _ = (call_table.fsync_input)(0);
+
+    Ok(())
+}
+
+/// Merge a single source bitmap into the destination, incrementally,
+/// one bitmap-table entry at a time.
+///
+/// Source and dest tables have equal `granularity` and equal
+/// `table_size` (`merge_validate` enforces), so index `i` of the
+/// source pairs with index `i` of the dest. For each `i` the 8-byte
+/// table words are read directly from disk (no whole-table staging —
+/// the tables may be multi-cluster) and the [`MergeClusterAction`]
+/// applied:
+/// - `Skip`: nothing.
+/// - `CopyAllOnes`: free any allocated dest data cluster, set the dest
+///   table entry to the all-ones sentinel.
+/// - `OrIntoExisting`: read source (DATA_A) + dest (DATA_B) data
+///   clusters, OR source into dest, write dest back.
+/// - `AllocDestFromSource`: allocate a fresh dest data cluster, copy
+///   the source data cluster (source bits == the new dest bits since
+///   dest was all-zeroes) into it, point the dest table entry at it.
+///
+/// Dest table-entry rewrites and data writes happen here under the
+/// autoclear guard; the refblocks are flushed once by the caller.
+///
+/// # Safety
+///
+/// `call_table` must be the validated CallTable; the image is attached
+/// input-RW at slot 0. REFBLOCKS_BUF holds `refblock_count` staged
+/// blocks; DATA_A / DATA_B are cluster-sized scratch.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn merge_one_source(
+    call_table: &CallTable,
+    sector_size: usize,
+    cluster_size: u64,
+    refblock_count: usize,
+    host_refblocks_start: u64,
+    source_table_offset: u64,
+    dest_table_offset: u64,
+    table_size: u32,
+    cursor: &mut AllocCursor,
+) -> Result<(), u32> {
+    let cluster_size_usize = cluster_size as usize;
+    let epr = entries_per_refblock(cluster_size);
+    let lookup = rb_lookup(cluster_size, epr, refblock_count, cluster_size_usize);
+    let refblocks = core::slice::from_raw_parts_mut(
+        REFBLOCKS_BUF as *mut u8,
+        refblock_count * cluster_size_usize,
+    );
+
+    for i in 0..table_size as u64 {
+        let byte_i = i
+            .checked_mul(8)
+            .ok_or(BitmapResult::ERROR_INTERNAL_OVERFLOW)?;
+        let src_word_off = source_table_offset
+            .checked_add(byte_i)
+            .ok_or(BitmapResult::ERROR_INTERNAL_OVERFLOW)?;
+        let dst_word_off = dest_table_offset
+            .checked_add(byte_i)
+            .ok_or(BitmapResult::ERROR_INTERNAL_OVERFLOW)?;
+
+        // Read the two 8-byte table words directly from disk.
+        let mut src_buf = [0u8; 8];
+        let mut dst_buf = [0u8; 8];
+        if !read_input_byte_range(
+            call_table,
+            0,
+            sector_size,
+            src_word_off,
+            src_buf.as_mut_ptr(),
+            8,
+        ) {
+            return Err(BitmapResult::ERROR_READ_FAILED);
+        }
+        if !read_input_byte_range(
+            call_table,
+            0,
+            sector_size,
+            dst_word_off,
+            dst_buf.as_mut_ptr(),
+            8,
+        ) {
+            return Err(BitmapResult::ERROR_READ_FAILED);
+        }
+        let src_raw = u64::from_be_bytes(src_buf);
+        let dst_raw = u64::from_be_bytes(dst_buf);
+
+        let action = merge_cluster_action(src_raw, dst_raw).map_err(u32::from)?;
+        match action {
+            MergeClusterAction::Skip => {}
+            MergeClusterAction::CopyAllOnes => {
+                // Free any allocated dest data cluster, then set the
+                // dest table entry to the all-ones sentinel.
+                if let Some(BitmapTableEntry::Allocated(off)) = decode_bitmap_table_entry(dst_raw) {
+                    let (rb_start, entry_local) =
+                        lookup(off).ok_or(BitmapResult::ERROR_INTERNAL_OVERFLOW)?;
+                    let block = refblocks
+                        .get_mut(rb_start..rb_start + cluster_size_usize)
+                        .ok_or(BitmapResult::ERROR_INTERNAL_OVERFLOW)?;
+                    if set_refcount_in_block(block, entry_local, 16, 0).is_err() {
+                        return Err(BitmapResult::ERROR_INTERNAL_OVERFLOW);
+                    }
+                }
+                let new_entry = encode_bitmap_table_entry(&BitmapTableEntry::AllOnes);
+                let bytes = new_entry.to_be_bytes();
+                if !write_input_byte_range(call_table, 0, sector_size, dst_word_off, &bytes) {
+                    return Err(BitmapResult::ERROR_WRITE_FAILED);
+                }
+            }
+            MergeClusterAction::OrIntoExisting => {
+                // Both allocated: read source (DATA_A) + dest (DATA_B),
+                // OR source into dest, write dest back. Decode both
+                // offsets (validated Allocated by merge_cluster_action).
+                let src_off = alloc_offset(src_raw)?;
+                let dst_off = alloc_offset(dst_raw)?;
+                if !read_input_byte_range(
+                    call_table,
+                    0,
+                    sector_size,
+                    src_off,
+                    DATA_A as *mut u8,
+                    cluster_size_usize,
+                ) {
+                    return Err(BitmapResult::ERROR_READ_FAILED);
+                }
+                if !read_input_byte_range(
+                    call_table,
+                    0,
+                    sector_size,
+                    dst_off,
+                    DATA_B as *mut u8,
+                    cluster_size_usize,
+                ) {
+                    return Err(BitmapResult::ERROR_READ_FAILED);
+                }
+                let src_data = core::slice::from_raw_parts(DATA_A as *const u8, cluster_size_usize);
+                let dst_data =
+                    core::slice::from_raw_parts_mut(DATA_B as *mut u8, cluster_size_usize);
+                or_bitmap_data(dst_data, src_data).map_err(u32::from)?;
+                if !write_input_byte_range(call_table, 0, sector_size, dst_off, dst_data) {
+                    return Err(BitmapResult::ERROR_WRITE_FAILED);
+                }
+            }
+            MergeClusterAction::AllocDestFromSource => {
+                // Source allocated, dest all-zeroes: allocate a fresh
+                // dest data cluster, copy source bits in (they ARE the
+                // new dest bits, since dest was zero), point the dest
+                // table entry at it.
+                let src_off = alloc_offset(src_raw)?;
+                let new_off = alloc_contiguous_clusters_in_refblocks(
+                    refblocks,
+                    cluster_size,
+                    16,
+                    refblock_count as u64,
+                    host_refblocks_start,
+                    1,
+                    cursor,
+                )
+                .map_err(alloc_err_to_code)?;
+                if !read_input_byte_range(
+                    call_table,
+                    0,
+                    sector_size,
+                    src_off,
+                    DATA_A as *mut u8,
+                    cluster_size_usize,
+                ) {
+                    return Err(BitmapResult::ERROR_READ_FAILED);
+                }
+                let src_data = core::slice::from_raw_parts(DATA_A as *const u8, cluster_size_usize);
+                if !write_input_byte_range(call_table, 0, sector_size, new_off, src_data) {
+                    return Err(BitmapResult::ERROR_WRITE_FAILED);
+                }
+                let new_entry = encode_bitmap_table_entry(&BitmapTableEntry::Allocated(new_off));
+                let bytes = new_entry.to_be_bytes();
+                if !write_input_byte_range(call_table, 0, sector_size, dst_word_off, &bytes) {
+                    return Err(BitmapResult::ERROR_WRITE_FAILED);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Decode a raw table word expected to be `Allocated` and return its
+/// host offset. A non-`Allocated` word here is an internal
+/// inconsistency (the [`MergeClusterAction`] guaranteed `Allocated`),
+/// mapped to `ERROR_INTERNAL_OVERFLOW`.
+fn alloc_offset(raw: u64) -> Result<u64, u32> {
+    match decode_bitmap_table_entry(raw) {
+        Some(BitmapTableEntry::Allocated(off)) => Ok(off),
+        _ => Err(BitmapResult::ERROR_INTERNAL_OVERFLOW),
+    }
 }
 
 // ---------------------------------------------------------------------------
