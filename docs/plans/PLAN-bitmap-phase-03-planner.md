@@ -355,6 +355,78 @@ rebuild wrong corrupts images. Skew to opus.
   lint`, `make instar`, `make check-binary-sizes`, and
   `pre-commit run --all-files` are all green.
 
+### Execution notes
+
+#### 3c design decisions
+
+**Double-buffered directory (OQ2, confirmed).** Each action reads
+`old_dir` and writes a fresh `out_dir`. The Phase-4 guest keeps two
+directory scratch buffers of the worst-case directory size and swaps
+them so a just-written `out_dir` becomes the next action's `old_dir`.
+The refcount blocks (`refblocks: &mut [u8]`) and the `AllocCursor` are
+threaded across all actions and mutated in place. This keeps every
+action a pure verbatim-copy + edit (mirroring
+`snapshot::table::build_*`).
+
+**`ActionOutcome` final shape.** Small, `Copy`, `no_std`:
+`new_dir_len: usize`, `new_nb_bitmaps: u32`,
+`extension_now_present: bool` (false only when the last bitmap was
+removed), `table_clusters_to_zero: [u64; MAX_TABLE_CLUSTERS]` +
+`num_table_clusters_to_zero: usize` (host offsets of newly-allocated
+`add` table clusters the guest must zero-fill), and — the
+data-cluster-freeing split below — `freed_table_offset: u64`,
+`freed_table_size: u32`, `zero_freed_table: bool`. `MAX_TABLE_CLUSTERS`
+is 8; a realistic bitmap table is one cluster and `add` refuses a
+table needing more than 8 (`NoSpace`).
+
+**Validation ordering for `add`.** `refcount_bits == 16`, then name
+length (`1..=1023`, `NameTooLong` covers *both* empty and over-long —
+documented on the fn), then `granularity_bits_valid`, then the count
+guard (`nb_bitmaps < 65535`, `TooManyBitmaps`) **before** `find_bitmap`
+(so an image already at the max is refused cheaply and without walking
+the directory), then `BitmapExists`. All validation precedes the
+single allocation, so a refused `add` leaves `refblocks` + `cursor`
+byte-identical (asserted in tests).
+
+**remove/clear data-cluster freeing — the crate/guest split (OQ5
+adjacent).** The crate performs **no I/O**, so it cannot read a
+bitmap's on-disk **bitmap table** and therefore cannot know which
+**data clusters** the bitmap owns. The split is:
+
+- The crate frees what it can compute directly from the directory
+  entry: the **table clusters** (host offset = `bitmap_table_offset`,
+  count = `ceil(bitmap_table_size * 8 / cluster_size)`), by setting
+  their refcounts to 0 in the staged `refblocks`. It validates every
+  table-cluster offset maps into the staged refblocks *before* writing
+  any refcount, preserving validate-before-mutate.
+- It returns the table's on-disk location
+  (`freed_table_offset` / `freed_table_size`) so the **Phase-4 guest**
+  walks the on-disk table (Phase-1 `decode_bitmap_table_entry`) and
+  frees the data clusters the crate cannot see.
+
+`remove` frees the table clusters (the whole bitmap is going away) and
+sets `zero_freed_table = false`. `clear` keeps the directory entry and
+the table clusters *allocated* (an empty bitmap keeps its all-zero
+table), so it changes **no** refcounts — it only validates, copies the
+directory through verbatim, and sets `zero_freed_table = true` to tell
+the guest to (a) walk the table and free the data clusters, then
+(b) zero the table cluster(s) back to an all-zero empty table.
+
+No `table: &[u8]` staging parameter was added: passing the table into
+the crate would still leave the *write-back* (freeing + zeroing on
+disk) to the guest, so the walk is cleaner kept guest-side next to the
+I/O it already owns. This is a deviation from Mission §3's wording
+("free … any allocated data clusters" inside the action) driven by the
+no-I/O constraint; the net freeing is identical, just split across the
+crate/guest boundary.
+
+**`read_cluster_refcount` is `#[cfg(test)]`.** The actions only need
+the refcount *write* path (freeing table clusters via
+`set_cluster_refcount`). The read companion is exercised by tests and
+gated `#[cfg(test)]` so clippy (`-D warnings`, no `--all-targets`) does
+not flag it as dead code; the Phase-4 guest can promote it when it
+needs to inspect refcounts.
+
 ## Back brief
 
 Before executing any step, the executing agent should back brief
