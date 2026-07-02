@@ -3853,6 +3853,9 @@ impl BitmapResult {
     /// `--merge -b`, or an action the planner does not yet
     /// implement). Kept reserved even if unused at freeze time.
     pub const ERROR_UNSUPPORTED_ACTION: u32 = 17;
+    /// qcow2 refcount width != 16; v1 reuses the 16-bit-only
+    /// allocator and refuses other widths.
+    pub const ERROR_UNSUPPORTED_REFCOUNT_WIDTH: u32 = 18;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -4991,8 +4994,9 @@ mod tests {
 
     #[test]
     fn bitmap_result_error_codes_distinct() {
-        // Phase 2 defines codes 0..=17. Confirm every code is
-        // distinct and contiguously numbered (append-only).
+        // Phase 2 defines codes 0..=17; phase 3 appends 18. Confirm
+        // every code is distinct and contiguously numbered
+        // (append-only).
         let codes = [
             BitmapResult::ERROR_OK,
             BitmapResult::ERROR_UNSUPPORTED_FORMAT,
@@ -5012,6 +5016,7 @@ mod tests {
             BitmapResult::ERROR_INTERNAL_OVERFLOW,
             BitmapResult::ERROR_MERGE_SOURCE_NOT_FOUND,
             BitmapResult::ERROR_UNSUPPORTED_ACTION,
+            BitmapResult::ERROR_UNSUPPORTED_REFCOUNT_WIDTH,
         ];
         for i in 0..codes.len() {
             for j in (i + 1)..codes.len() {
