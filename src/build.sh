@@ -285,6 +285,25 @@ else
 fi
 
 echo ""
+echo "=== Building bitmap operation ==="
+cd operations/bitmap
+cargo +nightly build --release
+cd ../..
+
+# Convert bitmap ELF to flat binary
+echo "=== Converting bitmap ELF to flat binary ==="
+BITMAP_ELF="target/x86_64-unknown-none/release/bitmap"
+BITMAP_BIN="bitmap.bin"
+
+if [ -f "$BITMAP_ELF" ]; then
+    rust-objcopy -O binary "$BITMAP_ELF" "$BITMAP_BIN"
+    echo "Created $BITMAP_BIN ($(wc -c < "$BITMAP_BIN") bytes)"
+else
+    echo "Error: Bitmap ELF not found at $BITMAP_ELF"
+    exit 1
+fi
+
+echo ""
 echo "=== Building instar ==="
 cd vmm
 cargo build --release
@@ -307,7 +326,8 @@ cp "$COMMIT_BIN" target/release/
 cp "$MAP_BIN" target/release/
 cp "$SNAPSHOT_BIN" target/release/
 cp "$AMEND_BIN" target/release/
-echo "Copied core.bin, info.bin, copy.bin, check.bin, compare.bin, convert.bin, measure.bin, create.bin, resize.bin, rebase.bin, commit.bin, map.bin, snapshot.bin, and amend.bin to target/release/"
+cp "$BITMAP_BIN" target/release/
+echo "Copied core.bin, info.bin, copy.bin, check.bin, compare.bin, convert.bin, measure.bin, create.bin, resize.bin, rebase.bin, commit.bin, map.bin, snapshot.bin, amend.bin, and bitmap.bin to target/release/"
 
 # Check binary sizes against memory layout limits.
 #
@@ -360,6 +380,7 @@ check_size "commit.bin" "target/release/$COMMIT_BIN" "$OP_MAX" || FAILED=1
 check_size "map.bin" "target/release/$MAP_BIN" "$OP_MAX" || FAILED=1
 check_size "snapshot.bin" "target/release/$SNAPSHOT_BIN" "$OP_MAX" || FAILED=1
 check_size "amend.bin" "target/release/$AMEND_BIN" "$OP_MAX" || FAILED=1
+check_size "bitmap.bin" "target/release/$BITMAP_BIN" "$OP_MAX" || FAILED=1
 
 if [ "$FAILED" -eq 1 ]; then
     echo ""
@@ -387,6 +408,7 @@ echo "  - commit.bin     Commit operation (merge overlay into backing) - loaded 
 echo "  - map.bin        Map operation (stream allocation map) - loaded at 0x22000"
 echo "  - snapshot.bin   Snapshot operation (list/apply/create/delete) - loaded at 0x22000"
 echo "  - amend.bin      Amend operation (change qcow2 compat / lazy refcounts) - loaded at 0x22000"
+echo "  - bitmap.bin     Bitmap operation (mutate qcow2 persistent dirty bitmaps) - loaded at 0x22000"
 echo ""
 echo "To run:"
 echo "  sudo ./target/release/instar info image.qcow2"

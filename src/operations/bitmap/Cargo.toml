@@ -1,0 +1,22 @@
+[package]
+name = "bitmap-op"
+version = "0.2.0"
+edition = "2021"
+description = "Bitmap operation: mutate a qcow2 image's persistent dirty bitmaps"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "bitmap"
+path = "src/main.rs"
+
+[dependencies]
+shared = { path = "../../shared" }
+bitmap = { path = "../../crates/bitmap" }
+qcow2 = { path = "../../crates/qcow2" }
+snapshot = { path = "../../crates/snapshot" }
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true
