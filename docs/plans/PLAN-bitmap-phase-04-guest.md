@@ -222,6 +222,25 @@ span sectors — accept the same torn-window qemu accepts, guarded by
 the autoclear bit. This is the highest-risk area; Phase 7's
 post-op `qemu-img check` is the ultimate validator.
 
+### 1b. First-add / no-extension case (resolved in 4c)
+
+The first `--add` on an image with **no** bitmaps extension requires
+inserting a new `EXT_BITMAPS` header-extension record. **4c
+implemented option (a): create the extension in place.** The guest
+locates the terminating `EXT_END` record (via
+`qcow2::header_extension_area_end`), overwrites it with a new
+`[EXT_BITMAPS][len=24][24-byte body]` record, and writes a fresh
+`EXT_END` immediately after — all within the staged header cluster in
+`HEADER_BUF`, then persists just the affected byte range. It is
+guarded by a header-cluster room check (`8 + 24 + 8` bytes from the
+old `EXT_END` offset must stay within the cluster); if there is no
+room it returns `ERROR_SCRATCH_TOO_SMALL`. In practice a v3 header
+(header_length 104/112) has the whole rest of the first cluster free
+for extensions, so this always succeeds for realistic images. The
+in-place rewrite path (extension already exists) overwrites the
+24-byte body directly. `qemu-img bitmap --add` on a fresh image — the
+primary use case — is therefore supported.
+
 ### 2. Merge in Phase 4, or defer? (master OQ2)
 
 The Phase-3 crate merge logic (validate + `or_bitmap_data` +

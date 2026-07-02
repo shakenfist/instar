@@ -9,17 +9,27 @@
 //! data-cluster work the crate cannot, writes everything back under
 //! a crash-safe autoclear dance, and returns a [`BitmapResult`].
 //!
-//! **This is step 4b: header read + gates + host cross-check +
-//! staging.** `run_qcow2` now reads the full header cluster, parses
-//! the header and the bitmaps extension, runs the refuse-before-any-
-//! write gate battery (Mission §2), cross-checks the host-probed
-//! [`BitmapConfig`] fields against the guest's own re-parse, and
-//! stages the bitmaps directory + refcount table + refblocks into
-//! scratch. It STILL returns a placeholder result
-//! (`ERROR_UNSUPPORTED_ACTION`, no actions applied) — the action
-//! loop (4c) and the merge orchestration (4d) fill in the mutation.
-//! Non-qcow2 targets are refused with `ERROR_UNSUPPORTED_FORMAT`
-//! (v1 is qcow2-only).
+//! **This is step 4c: the metadata-action loop + write-back +
+//! autoclear dance** for the five metadata actions (add / remove /
+//! clear / enable / disable). On top of 4b's header read + gates +
+//! host cross-check + staging, `run_qcow2` now applies the ordered
+//! action list in memory (double-buffering the directory, threading
+//! one [`AllocCursor`] and the staged refblocks), performs the
+//! on-disk data-cluster work the Phase-3 crate cannot (walking a
+//! freed/cleared bitmap's on-disk table to free its data clusters),
+//! and writes everything back under the crash-safe autoclear dance
+//! (clear autoclear → write clusters/directory/refblocks → rewrite
+//! the bitmaps extension → set autoclear, leaving it clear when the
+//! last bitmap was removed). `ACTION_MERGE` still returns
+//! `ERROR_UNSUPPORTED_ACTION` (step 4d). Non-qcow2 targets are
+//! refused with `ERROR_UNSUPPORTED_FORMAT` (v1 is qcow2-only).
+//!
+//! **First-add / no-extension case:** when the image has no bitmaps
+//! extension yet, the first `--add` creates a new `EXT_BITMAPS`
+//! header-extension record in place (overwriting the terminating
+//! `EXT_END`, appending a fresh one), guarded by a header-cluster
+//! room check; if there is no room it returns
+//! `ERROR_SCRATCH_TOO_SMALL`.
 //!
 //! Device idiom (Phase 5 host, mirrored here): the image is attached
 //! **input read-write** at slot 0, so the runner reads/writes via
@@ -31,14 +41,25 @@
 
 use core::panic::PanicInfo;
 
+use bitmap::action::{
+    action_add, action_clear, action_disable, action_enable, action_remove, ActionOutcome,
+    BitmapGeometry, MAX_TABLE_CLUSTERS,
+};
+use bitmap::directory::serialize_bitmaps_extension;
+use qcow2::bitmap::{
+    decode_bitmap_table_entry, default_granularity, granularity_bits_valid, BitmapTableEntry,
+    AUTOCLEAR_BITMAPS_BIT,
+};
 use qcow2::{
-    parse_header_extensions, QcowHeader, AUTOCLEAR_FEATURES_OFFSET, INCOMPAT_CORRUPT,
-    INCOMPAT_DIRTY, L1_OFFSET_MASK,
+    header_extension_area_end, parse_header_extensions, QcowHeader, AUTOCLEAR_FEATURES_OFFSET,
+    EXT_BITMAPS, EXT_END, HEADER_LENGTH_OFFSET, INCOMPAT_CORRUPT, INCOMPAT_DIRTY, L1_OFFSET_MASK,
 };
 use shared::{
-    validate_call_table, BitmapConfig, BitmapResult, CallTable, ImageFormat, ALLOC_HEAP_BASE,
-    CALL_TABLE_ADDR, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE, OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE,
+    validate_call_table, write_be_u32, BitmapConfig, BitmapResult, CallTable, ImageFormat,
+    ALLOC_HEAP_BASE, CALL_TABLE_ADDR, MAX_BITMAP_ACTIONS, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE,
+    OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE,
 };
+use snapshot::qcow2::{alloc_contiguous_clusters_in_refblocks, set_refcount_in_block, AllocCursor};
 
 fn get_call_table() -> &'static CallTable {
     unsafe { &*(CALL_TABLE_ADDR as *const CallTable) }
@@ -190,15 +211,9 @@ unsafe fn read_input_byte_range(
 /// writes go through read-modify-write via the bounce buffer at
 /// `RMW_BOUNCE`. Copied from snapshot's `write_input_byte_range`.
 ///
-/// Retained for 4c/4d (the write-back + autoclear dance); unused in
-/// 4b, which never writes. Marked `#[allow(dead_code)]` so the 4b
-/// build stays warning-clean without deleting the helper the later
-/// steps depend on.
-///
 /// # Safety
 ///
 /// `call_table` must be the validated CallTable.
-#[allow(dead_code)]
 unsafe fn write_input_byte_range(
     call_table: &CallTable,
     dev: u32,
@@ -365,10 +380,6 @@ unsafe fn stage_refblocks(
 /// Refblocks are contiguous from RT index 0, so refblock slot ==
 /// cluster_index / entries_per_refblock. Copied from snapshot's
 /// `rb_lookup`.
-///
-/// Retained for 4c/4d; unused in 4b. `#[allow(dead_code)]` keeps the
-/// 4b build warning-clean.
-#[allow(dead_code)]
 fn rb_lookup(
     cluster_size: u64,
     entries_per_refblock: u64,
@@ -392,14 +403,14 @@ fn rb_lookup(
 
 /// Drive the bitmap mutation over a qcow2 image.
 ///
-/// **Step 4b.** Reads the full header cluster, parses the header and
-/// bitmaps extension, runs the gate battery (Mission §2) — refusing
-/// *before any write* so a refusal leaves the image byte-identical —
+/// Reads the full header cluster, parses the header and bitmaps
+/// extension, runs the gate battery (Mission §2) — refusing *before
+/// any write* so a refusal leaves the image byte-identical —
 /// cross-checks the host-probed [`BitmapConfig`] fields against the
-/// guest's own re-parse, and stages the bitmaps directory + refcount
-/// table + refblocks into scratch. It then returns a placeholder
-/// `ERROR_UNSUPPORTED_ACTION` result: the action loop (4c) and the
-/// merge orchestration (4d) replace that with real mutation.
+/// guest's own re-parse, stages the bitmaps directory + refcount
+/// table + refblocks into scratch, then hands off to [`run_actions`]
+/// which applies the ordered action list (4c) and writes back under
+/// the autoclear dance. `ACTION_MERGE` is deferred to 4d.
 ///
 /// `#[inline(never)]` is load-bearing. Built for `x86_64-unknown-none`
 /// with `opt-level = "z"` + `lto = true`, inlining a large runner body
@@ -593,15 +604,806 @@ unsafe fn run_qcow2(call_table: &CallTable, config: &BitmapConfig) -> BitmapResu
     // `staged.refblock_count` refblocks are now in REFBLOCKS_BUF, their
     // host offsets in RB_OFFSETS, and `staged.host_refblocks_start`
     // (== 0) is the byte offset staged-refblock 0 maps to.
-    let _ = staged;
 
-    // --- Placeholder result (4c/4d replace this) -------------------------
+    // --- num_actions guard (do not slice out of bounds) ------------------
+    let num_actions = config.num_actions as usize;
+    if num_actions == 0 || num_actions > MAX_BITMAP_ACTIONS {
+        (call_table.verbose_print)(b"bitmap: num_actions out of range\n\0".as_ptr());
+        return make_result(config, 0, BitmapResult::ERROR_UNSUPPORTED_ACTION);
+    }
+
+    // --- Locate the bitmaps extension body offset in HEADER_BUF ----------
     //
-    // 4c: run the action loop here using the staged DIR_A + REFBLOCKS_BUF
-    // (double-buffering DIR_A<->DIR_B, threading one AllocCursor), then
-    // the write-back + autoclear dance. Until then, staging is exercised
-    // structurally but no action is applied and the image is untouched.
-    make_result(config, 0, BitmapResult::ERROR_UNSUPPORTED_ACTION)
+    // parse_header_extensions did not hand us the byte offset of the
+    // EXT_BITMAPS record body, so re-walk the chain to find it (for the
+    // in-place rewrite path) or the EXT_END position (for the first-add
+    // create-extension path). Both are guest-side of the write-back.
+    let ext_body_offset = find_bitmaps_ext_body_offset(header, &hdr);
+
+    // --- Run the ordered action loop + write-back + autoclear dance ------
+    run_actions(
+        call_table,
+        config,
+        sector_size,
+        &hdr,
+        dir_len,
+        guest_nb_bitmaps,
+        ext_body_offset,
+        staged,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Header-extension helpers
+// ---------------------------------------------------------------------------
+
+/// Walk the header-extension chain in `header` and return the byte
+/// offset of the EXT_BITMAPS record's 24-byte body (the offset just
+/// past its 8-byte type/len record header), or `None` if there is no
+/// EXT_BITMAPS record.
+///
+/// Mirrors [`parse_header_extensions`]'s walk exactly (same bounds
+/// checks) but reports position rather than parsed fields.
+#[inline(never)]
+fn find_bitmaps_ext_body_offset(header: &[u8], hdr: &QcowHeader) -> Option<usize> {
+    if hdr.version < 3 || header.len() < HEADER_LENGTH_OFFSET + 4 {
+        return None;
+    }
+    let header_length = read_u32_be(header, HEADER_LENGTH_OFFSET) as usize;
+    let mut ext_offset = header_length;
+    while ext_offset + 8 <= header.len() {
+        let ext_type = read_u32_be(header, ext_offset);
+        let ext_len = read_u32_be(header, ext_offset + 4) as usize;
+        if ext_type == EXT_END {
+            break;
+        }
+        if ext_offset + 8 + ext_len > header.len() {
+            break;
+        }
+        if ext_type == EXT_BITMAPS {
+            return Some(ext_offset + 8);
+        }
+        let padded_len = (ext_len + 7) & !7;
+        ext_offset += 8 + padded_len;
+    }
+    None
+}
+
+/// Read a big-endian u32 from `buf` at `off`; returns 0 if the read
+/// would run out of bounds (callers pre-bound their offsets, this is
+/// a panic-free fallback).
+fn read_u32_be(buf: &[u8], off: usize) -> u32 {
+    match buf.get(off..off + 4) {
+        Some(b) => u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+        None => 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Action loop + write-back + autoclear dance (step 4c)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of table clusters the guest may accumulate to
+/// zero-fill in a single invocation. Each `add` contributes up to
+/// [`MAX_TABLE_CLUSTERS`] and each `clear` its table clusters; with
+/// [`MAX_BITMAP_ACTIONS`] actions this bounds the accumulation list.
+const MAX_ZERO_CLUSTERS: usize = MAX_BITMAP_ACTIONS * MAX_TABLE_CLUSTERS;
+
+/// A fixed-capacity list of host cluster offsets to zero-fill on
+/// write-back (an `add`'s newly-allocated table clusters, a `clear`'s
+/// table clusters after their data is freed).
+struct ZeroList {
+    offsets: [u64; MAX_ZERO_CLUSTERS],
+    len: usize,
+}
+
+impl ZeroList {
+    fn new() -> Self {
+        Self {
+            offsets: [0; MAX_ZERO_CLUSTERS],
+            len: 0,
+        }
+    }
+
+    /// Push one cluster offset; returns false if the list is full.
+    fn push(&mut self, off: u64) -> bool {
+        if self.len >= MAX_ZERO_CLUSTERS {
+            return false;
+        }
+        self.offsets[self.len] = off;
+        self.len += 1;
+        true
+    }
+}
+
+/// Number of refcount entries per staged refcount block
+/// (`cluster_size * 8 / refcount_bits`). Refcount width is gated to
+/// 16 upstream, so this is well-defined.
+fn entries_per_refblock(cluster_size: u64) -> u64 {
+    (cluster_size * 8) / 16
+}
+
+/// Free the **data** clusters of a bitmap whose on-disk table lives at
+/// `table_offset` (`table_size` entries), by walking the table in
+/// `TABLE_BUF` and setting each `Allocated` cluster's refcount to 0 in
+/// the staged `REFBLOCKS_BUF`.
+///
+/// The Phase-3 crate already freed the *table* clusters (for `remove`)
+/// or left them allocated (for `clear`); this frees only the data
+/// clusters the crate could not see, exactly as the 3c design split
+/// prescribes. Read-only device I/O (staging the table); the frees are
+/// in-memory refblock mutations.
+///
+/// # Safety
+///
+/// `call_table` must be the validated CallTable.
+#[inline(never)]
+unsafe fn free_bitmap_data_clusters(
+    call_table: &CallTable,
+    sector_size: usize,
+    cluster_size: u64,
+    refblock_count: usize,
+    table_offset: u64,
+    table_size: u32,
+) -> Result<(), u32> {
+    if table_size == 0 || table_offset == 0 {
+        return Ok(());
+    }
+    let cluster_size_usize = cluster_size as usize;
+    let epr = entries_per_refblock(cluster_size);
+    let lookup = rb_lookup(cluster_size, epr, refblock_count, cluster_size_usize);
+    let refblocks = core::slice::from_raw_parts_mut(
+        REFBLOCKS_BUF as *mut u8,
+        refblock_count * cluster_size_usize,
+    );
+
+    // The bitmap table is `table_size` u64 words. Walk it one cluster
+    // of entries at a time through TABLE_BUF so an arbitrarily large
+    // table never needs more than one cluster of scratch.
+    let entries_per_cluster = cluster_size / 8;
+    if entries_per_cluster == 0 {
+        return Err(BitmapResult::ERROR_INTERNAL_OVERFLOW);
+    }
+    let mut remaining = table_size as u64;
+    let mut entry_index: u64 = 0;
+    while remaining > 0 {
+        let take = remaining.min(entries_per_cluster);
+        let bytes = (take as usize) * 8;
+        let cluster_ord = entry_index / entries_per_cluster;
+        let table_chunk_off = table_offset
+            .checked_add(
+                cluster_ord
+                    .checked_mul(cluster_size)
+                    .ok_or(BitmapResult::ERROR_INTERNAL_OVERFLOW)?,
+            )
+            .ok_or(BitmapResult::ERROR_INTERNAL_OVERFLOW)?;
+        if !read_input_byte_range(
+            call_table,
+            0,
+            sector_size,
+            table_chunk_off,
+            TABLE_BUF as *mut u8,
+            bytes,
+        ) {
+            return Err(BitmapResult::ERROR_READ_FAILED);
+        }
+        let table = core::slice::from_raw_parts(TABLE_BUF as *const u8, bytes);
+        let mut i = 0usize;
+        while i + 8 <= bytes {
+            let raw = read_u64_be(table, i);
+            match decode_bitmap_table_entry(raw) {
+                Some(BitmapTableEntry::Allocated(off)) => {
+                    // Free this data cluster: refcount -> 0.
+                    let (rb_start, entry_local) =
+                        lookup(off).ok_or(BitmapResult::ERROR_INTERNAL_OVERFLOW)?;
+                    let block = refblocks
+                        .get_mut(rb_start..rb_start + cluster_size_usize)
+                        .ok_or(BitmapResult::ERROR_INTERNAL_OVERFLOW)?;
+                    if set_refcount_in_block(block, entry_local, 16, 0).is_err() {
+                        return Err(BitmapResult::ERROR_INTERNAL_OVERFLOW);
+                    }
+                }
+                // AllZeroes / AllOnes own no data cluster; nothing to free.
+                Some(_) => {}
+                // A bad table word ⇒ refuse rather than corrupt refcounts.
+                None => return Err(BitmapResult::ERROR_PARSE_FAILED),
+            }
+            i += 8;
+        }
+        entry_index += take;
+        remaining -= take;
+    }
+    Ok(())
+}
+
+/// The ordered action loop, the write-back, and the crash-safe
+/// autoclear dance (Open question 1). Only reached after every gate
+/// passed and staging succeeded.
+///
+/// The loop mutates only scratch (the DIR_A/DIR_B double-buffer and
+/// REFBLOCKS_BUF in memory) plus read-only table-walk reads, so any
+/// action error returns immediately with the image byte-identical.
+/// Only after all actions succeed does the write-back touch the disk,
+/// guarded by clearing the autoclear bitmaps bit first and restoring
+/// it last.
+///
+/// `#[inline(never)]` for the same codegen-miscompile reason as
+/// `run_qcow2` (a large body inlined into `_start` triple-faults).
+///
+/// # Safety
+///
+/// `call_table` must be the validated CallTable; the image is attached
+/// input-RW at slot 0. `dir_len` bytes of the staged directory are in
+/// DIR_A; `staged` describes REFBLOCKS_BUF / RB_OFFSETS.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn run_actions(
+    call_table: &CallTable,
+    config: &BitmapConfig,
+    sector_size: usize,
+    hdr: &QcowHeader,
+    dir_len: usize,
+    initial_nb_bitmaps: u32,
+    ext_body_offset: Option<usize>,
+    staged: StagedRefblocks,
+) -> BitmapResult {
+    let cluster_size = hdr.cluster_size;
+    let cluster_size_usize = cluster_size as usize;
+    let refblock_count = staged.refblock_count;
+
+    // Resolve the shared target name and its (add-only) granularity.
+    let name_len = config.name_len as usize;
+    if name_len == 0 || name_len > config.name.len() {
+        return make_result(config, 0, BitmapResult::ERROR_NAME_TOO_LONG);
+    }
+    let name = &config.name[..name_len];
+
+    // Convert the requested granularity (bytes; 0 => default) to bits
+    // and validate the range once (add is the only consumer).
+    let granularity_bytes = if config.granularity == 0 {
+        default_granularity(cluster_size)
+    } else {
+        config.granularity
+    };
+    let granularity_bits = match bytes_to_bits(granularity_bytes) {
+        Some(b) if granularity_bits_valid(b) => b,
+        _ => return make_result(config, 0, BitmapResult::ERROR_GRANULARITY_RANGE),
+    };
+
+    let geom = BitmapGeometry {
+        cluster_size,
+        cluster_bits: hdr.cluster_bits,
+        refcount_bits: 16,
+        virtual_size: hdr.virtual_size,
+        refblock_count: refblock_count as u64,
+        host_refblocks_start: staged.host_refblocks_start,
+    };
+
+    let refblocks = core::slice::from_raw_parts_mut(
+        REFBLOCKS_BUF as *mut u8,
+        refblock_count * cluster_size_usize,
+    );
+
+    let mut cursor = AllocCursor::default();
+    let mut zeros = ZeroList::new();
+
+    // Directory double-buffer: `cur_in` names which scratch buffer
+    // holds the current directory; the action writes the other one.
+    let mut cur_in_a = true;
+    let mut cur_len = dir_len;
+    let mut cur_nb = initial_nb_bitmaps;
+    let mut last_action: u32 = 0;
+    let mut extension_present = initial_nb_bitmaps > 0;
+
+    for &opcode in &config.actions[..config.num_actions as usize] {
+        last_action = opcode as u32;
+        let (in_ptr, out_ptr, in_limit, out_limit) = if cur_in_a {
+            (DIR_A, DIR_B, DIR_A_LIMIT, DIR_B_LIMIT)
+        } else {
+            (DIR_B, DIR_A, DIR_B_LIMIT, DIR_A_LIMIT)
+        };
+        let old_dir = core::slice::from_raw_parts(in_ptr as *const u8, in_limit);
+        let out_dir = core::slice::from_raw_parts_mut(out_ptr as *mut u8, out_limit);
+
+        let outcome: ActionOutcome = match opcode {
+            BitmapConfig::ACTION_ADD => match action_add(
+                old_dir,
+                cur_len,
+                cur_nb,
+                name,
+                granularity_bits,
+                refblocks,
+                &mut cursor,
+                &geom,
+                out_dir,
+            ) {
+                Ok(o) => o,
+                Err(e) => return make_result(config, last_action, u32::from(e)),
+            },
+            BitmapConfig::ACTION_REMOVE => {
+                let o = match action_remove(
+                    old_dir, cur_len, cur_nb, name, refblocks, &geom, out_dir,
+                ) {
+                    Ok(o) => o,
+                    Err(e) => return make_result(config, last_action, u32::from(e)),
+                };
+                // Free the removed bitmap's data clusters (crate freed
+                // the table clusters; guest frees the data clusters).
+                if let Err(e) = free_bitmap_data_clusters(
+                    call_table,
+                    sector_size,
+                    cluster_size,
+                    refblock_count,
+                    o.freed_table_offset,
+                    o.freed_table_size,
+                ) {
+                    return make_result(config, last_action, e);
+                }
+                o
+            }
+            BitmapConfig::ACTION_CLEAR => {
+                let o =
+                    match action_clear(old_dir, cur_len, cur_nb, name, refblocks, &geom, out_dir) {
+                        Ok(o) => o,
+                        Err(e) => return make_result(config, last_action, u32::from(e)),
+                    };
+                // Free the data clusters, then remember to zero the
+                // (still-allocated) table clusters on write-back.
+                if let Err(e) = free_bitmap_data_clusters(
+                    call_table,
+                    sector_size,
+                    cluster_size,
+                    refblock_count,
+                    o.freed_table_offset,
+                    o.freed_table_size,
+                ) {
+                    return make_result(config, last_action, e);
+                }
+                if o.zero_freed_table {
+                    let table_clusters = table_cluster_count(o.freed_table_size, cluster_size);
+                    for k in 0..table_clusters {
+                        let off = match o
+                            .freed_table_offset
+                            .checked_add(k.wrapping_mul(cluster_size))
+                        {
+                            Some(v) => v,
+                            None => {
+                                return make_result(
+                                    config,
+                                    last_action,
+                                    BitmapResult::ERROR_INTERNAL_OVERFLOW,
+                                )
+                            }
+                        };
+                        if !zeros.push(off) {
+                            return make_result(
+                                config,
+                                last_action,
+                                BitmapResult::ERROR_SCRATCH_TOO_SMALL,
+                            );
+                        }
+                    }
+                }
+                o
+            }
+            BitmapConfig::ACTION_ENABLE => {
+                match action_enable(old_dir, cur_len, cur_nb, name, out_dir) {
+                    Ok(o) => o,
+                    Err(e) => return make_result(config, last_action, u32::from(e)),
+                }
+            }
+            BitmapConfig::ACTION_DISABLE => {
+                match action_disable(old_dir, cur_len, cur_nb, name, out_dir) {
+                    Ok(o) => o,
+                    Err(e) => return make_result(config, last_action, u32::from(e)),
+                }
+            }
+            BitmapConfig::ACTION_MERGE => {
+                // Merge is 4d; refuse for now (image untouched — the
+                // loop has only mutated scratch up to this point).
+                return make_result(config, last_action, BitmapResult::ERROR_UNSUPPORTED_ACTION);
+            }
+            _ => return make_result(config, last_action, BitmapResult::ERROR_UNSUPPORTED_ACTION),
+        };
+
+        // Record add's newly-allocated table clusters to zero-fill.
+        for k in 0..outcome.num_table_clusters_to_zero {
+            if !zeros.push(outcome.table_clusters_to_zero[k]) {
+                return make_result(config, last_action, BitmapResult::ERROR_SCRATCH_TOO_SMALL);
+            }
+        }
+
+        cur_len = outcome.new_dir_len;
+        cur_nb = outcome.new_nb_bitmaps;
+        extension_present = outcome.extension_now_present;
+        cur_in_a = !cur_in_a; // ping-pong: out becomes next in.
+    }
+
+    // The final directory is in whichever buffer `cur_in_a` now names.
+    let final_dir_ptr = if cur_in_a { DIR_A } else { DIR_B };
+    let final_len = cur_len;
+    let final_nb = cur_nb;
+
+    // --- Write-back + autoclear dance ------------------------------------
+    match write_back(
+        call_table,
+        config,
+        sector_size,
+        hdr,
+        &staged,
+        ext_body_offset,
+        final_dir_ptr,
+        final_len,
+        final_nb,
+        extension_present,
+        &zeros,
+    ) {
+        Ok(()) => {}
+        Err(e) => return make_result(config, last_action, e),
+    }
+
+    let mut result = make_result(config, last_action, BitmapResult::ERROR_OK);
+    result.actions_applied = config.num_actions;
+    result.resulting_nb_bitmaps = final_nb;
+    result
+}
+
+/// Number of clusters a bitmap table of `table_size` entries occupies:
+/// `ceil(table_size * 8 / cluster_size)`. Panic-free.
+fn table_cluster_count(table_size: u32, cluster_size: u64) -> u64 {
+    if cluster_size == 0 {
+        return 0;
+    }
+    ((table_size as u64).saturating_mul(8)).div_ceil(cluster_size)
+}
+
+/// Convert a power-of-two granularity in **bytes** to `granularity_bits`
+/// (`log2`). Returns `None` if `bytes` is 0 or not a power of two.
+fn bytes_to_bits(bytes: u64) -> Option<u8> {
+    if bytes == 0 || !bytes.is_power_of_two() {
+        return None;
+    }
+    Some(bytes.trailing_zeros() as u8)
+}
+
+/// The crash-safe write-back: clear the autoclear bitmaps bit, write
+/// the new/zeroed clusters + directory + refblocks, rewrite (or drop /
+/// create) the bitmaps extension, then set the autoclear bit back
+/// (unless the last bitmap was removed). fsync barriers model
+/// `check --repair`'s `repair_all_qcow2`.
+///
+/// # Safety
+///
+/// `call_table` must be the validated CallTable; the image is attached
+/// input-RW at slot 0. `final_dir_ptr`/`final_len` name the final
+/// directory in scratch; the header cluster is in HEADER_BUF.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn write_back(
+    call_table: &CallTable,
+    config: &BitmapConfig,
+    sector_size: usize,
+    hdr: &QcowHeader,
+    staged: &StagedRefblocks,
+    ext_body_offset: Option<usize>,
+    final_dir_ptr: usize,
+    final_len: usize,
+    final_nb: u32,
+    extension_present: bool,
+    zeros: &ZeroList,
+) -> Result<(), u32> {
+    let cluster_size = hdr.cluster_size;
+    let cluster_size_usize = cluster_size as usize;
+    let refblock_count = staged.refblock_count;
+
+    // The old directory occupies this many clusters at the old offset.
+    let old_dir_offset = config.bitmap_directory_offset;
+    let old_dir_clusters = if old_dir_offset != 0 {
+        div_ceil_u64(config.bitmap_directory_size, cluster_size)
+    } else {
+        0
+    };
+    let new_dir_clusters = if final_nb > 0 {
+        div_ceil_u64(final_len as u64, cluster_size).max(1)
+    } else {
+        0
+    };
+
+    let refblocks = core::slice::from_raw_parts_mut(
+        REFBLOCKS_BUF as *mut u8,
+        refblock_count * cluster_size_usize,
+    );
+    let epr = entries_per_refblock(cluster_size);
+    let lookup = rb_lookup(cluster_size, epr, refblock_count, cluster_size_usize);
+
+    // ---- Decide directory placement (in refblocks; no disk write yet) ---
+    let mut dir_offset = old_dir_offset;
+    let mut cursor = AllocCursor::default();
+    if final_nb == 0 {
+        // Last bitmap removed: no directory. Free the old dir clusters.
+        free_cluster_run(
+            refblocks,
+            &lookup,
+            cluster_size,
+            old_dir_offset,
+            old_dir_clusters,
+        )?;
+        dir_offset = 0;
+    } else if old_dir_offset != 0 && new_dir_clusters <= old_dir_clusters {
+        // Fits in place: keep dir_offset. Free the now-unused tail
+        // clusters for refcount cleanliness.
+        if new_dir_clusters < old_dir_clusters {
+            let tail_start = old_dir_offset
+                .checked_add(new_dir_clusters.wrapping_mul(cluster_size))
+                .ok_or(BitmapResult::ERROR_INTERNAL_OVERFLOW)?;
+            free_cluster_run(
+                refblocks,
+                &lookup,
+                cluster_size,
+                tail_start,
+                old_dir_clusters - new_dir_clusters,
+            )?;
+        }
+    } else {
+        // Grew, or there was no directory before (first add): allocate
+        // fresh contiguous clusters and free the old ones (if any).
+        let new_off = alloc_contiguous_clusters_in_refblocks(
+            refblocks,
+            cluster_size,
+            16,
+            refblock_count as u64,
+            staged.host_refblocks_start,
+            new_dir_clusters,
+            &mut cursor,
+        )
+        .map_err(|_| BitmapResult::ERROR_NO_SPACE)?;
+        if old_dir_offset != 0 {
+            free_cluster_run(
+                refblocks,
+                &lookup,
+                cluster_size,
+                old_dir_offset,
+                old_dir_clusters,
+            )?;
+        }
+        dir_offset = new_off;
+    }
+
+    // ---- Step 2: CLEAR the autoclear bitmaps bit, fsync -----------------
+    // From here a crash leaves the bitmaps ignorable (autoclear clear).
+    rmw_feature_word(
+        call_table,
+        sector_size,
+        AUTOCLEAR_FEATURES_OFFSET as u64,
+        |w| w & !AUTOCLEAR_BITMAPS_BIT,
+    )?;
+    let _ = (call_table.fsync_input)(0);
+
+    // ---- Step 4: write zeroed/table clusters, directory, refblocks ------
+    // Ensure ZERO_BUF holds a full cluster of zeros (fresh scratch).
+    core::ptr::write_bytes(ZERO_BUF as *mut u8, 0, cluster_size_usize);
+    let zero_slice = core::slice::from_raw_parts(ZERO_BUF as *const u8, cluster_size_usize);
+    for k in 0..zeros.len {
+        if !write_input_byte_range(call_table, 0, sector_size, zeros.offsets[k], zero_slice) {
+            return Err(BitmapResult::ERROR_WRITE_FAILED);
+        }
+    }
+
+    // Write the final directory bytes (in place or relocated).
+    if final_nb > 0 && dir_offset != 0 && final_len > 0 {
+        let dir_slice = core::slice::from_raw_parts(final_dir_ptr as *const u8, final_len);
+        if !write_input_byte_range(call_table, 0, sector_size, dir_offset, dir_slice) {
+            return Err(BitmapResult::ERROR_WRITE_FAILED);
+        }
+    }
+
+    // Write the mutated refblocks back to their on-disk locations
+    // (captured in RB_OFFSETS during staging). Written AFTER the
+    // clusters they account for so a crash cannot leave a
+    // refcounted-but-unwritten cluster claimed.
+    let rb_offsets = core::slice::from_raw_parts(RB_OFFSETS as *const u64, refblock_count);
+    for (k, &host_off) in rb_offsets.iter().enumerate() {
+        let src = (REFBLOCKS_BUF + k * cluster_size_usize) as *const u8;
+        let block = core::slice::from_raw_parts(src, cluster_size_usize);
+        if !write_input_byte_range(call_table, 0, sector_size, host_off, block) {
+            return Err(BitmapResult::ERROR_WRITE_FAILED);
+        }
+    }
+    let _ = (call_table.fsync_input)(0);
+
+    // ---- Step 5: write the bitmaps extension in the header --------------
+    write_bitmaps_extension(
+        call_table,
+        sector_size,
+        hdr,
+        ext_body_offset,
+        final_nb,
+        final_len as u64,
+        dir_offset,
+    )?;
+    let _ = (call_table.fsync_input)(0);
+
+    // ---- Step 6: SET the autoclear bit back (unless last removed) -------
+    if extension_present && final_nb > 0 {
+        rmw_feature_word(
+            call_table,
+            sector_size,
+            AUTOCLEAR_FEATURES_OFFSET as u64,
+            |w| w | AUTOCLEAR_BITMAPS_BIT,
+        )?;
+        let _ = (call_table.fsync_input)(0);
+    }
+
+    Ok(())
+}
+
+/// `ceil(a / b)`, panic-free (returns 0 if `b == 0`).
+fn div_ceil_u64(a: u64, b: u64) -> u64 {
+    if b == 0 {
+        0
+    } else {
+        a.div_ceil(b)
+    }
+}
+
+/// Free `count` consecutive clusters starting at `start` by setting
+/// each refcount to 0 in the staged refblocks.
+fn free_cluster_run<F>(
+    refblocks: &mut [u8],
+    lookup: &F,
+    cluster_size: u64,
+    start: u64,
+    count: u64,
+) -> Result<(), u32>
+where
+    F: Fn(u64) -> Option<(usize, u64)>,
+{
+    let cluster_size_usize = cluster_size as usize;
+    for k in 0..count {
+        let off = start
+            .checked_add(
+                k.checked_mul(cluster_size)
+                    .ok_or(BitmapResult::ERROR_INTERNAL_OVERFLOW)?,
+            )
+            .ok_or(BitmapResult::ERROR_INTERNAL_OVERFLOW)?;
+        let (rb_start, entry_local) = lookup(off).ok_or(BitmapResult::ERROR_INTERNAL_OVERFLOW)?;
+        let block = refblocks
+            .get_mut(rb_start..rb_start + cluster_size_usize)
+            .ok_or(BitmapResult::ERROR_INTERNAL_OVERFLOW)?;
+        if set_refcount_in_block(block, entry_local, 16, 0).is_err() {
+            return Err(BitmapResult::ERROR_INTERNAL_OVERFLOW);
+        }
+    }
+    Ok(())
+}
+
+/// Read-modify-write the 8-byte feature word at `offset`: read it,
+/// apply `f`, write it back. Used to clear/set the autoclear bitmaps
+/// bit. Models `check --repair`'s corrupt-bit RMW.
+///
+/// # Safety
+///
+/// `call_table` must be the validated CallTable.
+unsafe fn rmw_feature_word<F>(
+    call_table: &CallTable,
+    sector_size: usize,
+    offset: u64,
+    f: F,
+) -> Result<(), u32>
+where
+    F: FnOnce(u64) -> u64,
+{
+    let mut buf = [0u8; 8];
+    if !read_input_byte_range(call_table, 0, sector_size, offset, buf.as_mut_ptr(), 8) {
+        return Err(BitmapResult::ERROR_READ_FAILED);
+    }
+    let word = u64::from_be_bytes(buf);
+    let new = f(word).to_be_bytes();
+    if !write_input_byte_range(call_table, 0, sector_size, offset, &new) {
+        return Err(BitmapResult::ERROR_WRITE_FAILED);
+    }
+    Ok(())
+}
+
+/// Write the bitmaps extension body in the header on disk.
+///
+/// Three cases:
+/// - `final_nb == 0`: write a benign empty body (nb=0, size=0,
+///   offset=0) into the existing extension record if there is one; no
+///   record to create.
+/// - `ext_body_offset` present (an EXT_BITMAPS record already exists):
+///   overwrite its 24-byte body in place.
+/// - No record yet and `final_nb > 0` (first add on an image with no
+///   bitmaps extension): CREATE a new EXT_BITMAPS record by
+///   overwriting the terminating EXT_END with the new record and
+///   writing a fresh EXT_END after it, all within the header cluster.
+///
+/// # Safety
+///
+/// `call_table` must be the validated CallTable; HEADER_BUF holds the
+/// staged header cluster.
+#[inline(never)]
+unsafe fn write_bitmaps_extension(
+    call_table: &CallTable,
+    sector_size: usize,
+    hdr: &QcowHeader,
+    ext_body_offset: Option<usize>,
+    final_nb: u32,
+    dir_size: u64,
+    dir_offset: u64,
+) -> Result<(), u32> {
+    let mut body = [0u8; 24];
+    let (nb, size, off) = if final_nb == 0 {
+        (0u32, 0u64, 0u64)
+    } else {
+        (final_nb, dir_size, dir_offset)
+    };
+    serialize_bitmaps_extension(nb, size, off, &mut body)
+        .map_err(|_| BitmapResult::ERROR_INTERNAL_OVERFLOW)?;
+
+    if let Some(body_off) = ext_body_offset {
+        // In-place body rewrite of the existing EXT_BITMAPS record.
+        if !write_input_byte_range(call_table, 0, sector_size, body_off as u64, &body) {
+            return Err(BitmapResult::ERROR_WRITE_FAILED);
+        }
+        return Ok(());
+    }
+
+    // No existing extension. If the last bitmap was removed there is
+    // nothing to create (there was no extension to begin with in this
+    // branch); return cleanly.
+    if final_nb == 0 {
+        return Ok(());
+    }
+
+    // First add on an image with no bitmaps extension: create a new
+    // EXT_BITMAPS record before the terminating EXT_END, all within
+    // the staged header cluster in HEADER_BUF.
+    let cluster_size_usize = hdr.cluster_size as usize;
+    let header = core::slice::from_raw_parts_mut(HEADER_BUF as *mut u8, cluster_size_usize);
+    let header_ro = core::slice::from_raw_parts(HEADER_BUF as *const u8, cluster_size_usize);
+    let header_length = read_u32_be(header_ro, HEADER_LENGTH_OFFSET) as usize;
+
+    // Find where EXT_END currently sits (its record header offset).
+    let ext_end_after = match header_extension_area_end(header_ro, header_length) {
+        Some(v) => v, // offset just past the 8-byte EXT_END header.
+        None => return Err(BitmapResult::ERROR_PARSE_FAILED),
+    };
+    let ext_end_off = ext_end_after
+        .checked_sub(8)
+        .ok_or(BitmapResult::ERROR_INTERNAL_OVERFLOW)?;
+
+    // The new record is [type:u32][len=24:u32][24-byte body], then a
+    // fresh 8-byte EXT_END after it. It replaces the old EXT_END at
+    // `ext_end_off` and needs 8 + 24 + 8 = 40 bytes from there.
+    let need_end = ext_end_off
+        .checked_add(8 + 24 + 8)
+        .ok_or(BitmapResult::ERROR_INTERNAL_OVERFLOW)?;
+    if need_end > cluster_size_usize {
+        // No room in the header cluster for a new extension record.
+        (call_table.verbose_print)(
+            b"bitmap: no header room to create bitmaps extension\n\0".as_ptr(),
+        );
+        return Err(BitmapResult::ERROR_SCRATCH_TOO_SMALL);
+    }
+
+    // Write the record header + body + new EXT_END into HEADER_BUF.
+    write_be_u32(header, ext_end_off, EXT_BITMAPS);
+    write_be_u32(header, ext_end_off + 4, 24);
+    header[ext_end_off + 8..ext_end_off + 8 + 24].copy_from_slice(&body);
+    // New EXT_END record (type 0, len 0).
+    write_be_u32(header, ext_end_off + 32, EXT_END);
+    write_be_u32(header, ext_end_off + 36, 0);
+
+    // Persist just the affected header byte range [ext_end_off, need_end).
+    let patch = core::slice::from_raw_parts(
+        (HEADER_BUF + ext_end_off) as *const u8,
+        need_end - ext_end_off,
+    );
+    if !write_input_byte_range(call_table, 0, sector_size, ext_end_off as u64, patch) {
+        return Err(BitmapResult::ERROR_WRITE_FAILED);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
