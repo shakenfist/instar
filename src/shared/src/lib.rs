@@ -980,6 +980,13 @@ pub struct CallTable {
     /// code. Appended at the end of `CallTable` for the same
     /// back-compat reason as `send_rebase_result`.
     pub send_amend_result: unsafe extern "C" fn(*const AmendResult),
+
+    /// Send the bitmap result message. Args: `bitmap_result`
+    /// pointer carrying the last applied action opcode, the number
+    /// of actions applied, the resulting bitmap count, and the
+    /// error code. Appended at the end of `CallTable` for the same
+    /// back-compat reason as `send_amend_result`.
+    pub send_bitmap_result: unsafe extern "C" fn(*const BitmapResult),
 }
 
 /// Backing format type for QCOW2 header extension
@@ -1305,8 +1312,10 @@ impl CallTable {
     /// appended `send_snapshot_entry`, `send_snapshot_result`,
     /// and `fsync_input` for the snapshot subcommand and its
     /// durability checkpoints; PLAN-amend phase 1 appended
-    /// `send_amend_result` for the amend subcommand).
-    pub const VERSION: u32 = 18;
+    /// `send_amend_result` for the amend subcommand;
+    /// PLAN-bitmap phase 2 appended `send_bitmap_result` for the
+    /// bitmap subcommand).
+    pub const VERSION: u32 = 19;
 }
 
 // ============================================================================
@@ -5577,13 +5586,15 @@ mod tests {
     }
 
     #[test]
-    fn call_table_version_is_eighteen() {
+    fn call_table_version_is_nineteen() {
         // PLAN-snapshot phase 1 bumped the call-table ABI from
         // 16 to 17 by appending `send_snapshot_entry`,
         // `send_snapshot_result`, and `fsync_input`.
         // PLAN-amend phase 1 bumps 17 to 18 by appending
         // `send_amend_result`.
-        assert_eq!(CallTable::VERSION, 18);
+        // PLAN-bitmap phase 2 bumps 18 to 19 by appending
+        // `send_bitmap_result`.
+        assert_eq!(CallTable::VERSION, 19);
     }
 
     #[test]

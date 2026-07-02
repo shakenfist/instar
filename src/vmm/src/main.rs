@@ -932,6 +932,13 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
                 a.target_format, a.action, a.resulting_version, a.lazy_refcounts, a.error
             )
         }
+        Some(guest_::GuestMessage_::Payload::BitmapResult(b)) => {
+            format!(
+                "bitmap_result target_format={} error={} action={} \
+                actions_applied={} resulting_nb_bitmaps={}",
+                b.target_format, b.error, b.action, b.actions_applied, b.resulting_nb_bitmaps
+            )
+        }
         Some(guest_::GuestMessage_::Payload::CommitResult(c)) => {
             format!(
                 "commit_result overlay_format={} backing_format={} \
@@ -2690,6 +2697,21 @@ struct AmendRunResult {
     resulting_version: u32,
     resulting_lazy_refcounts: u32,
     error: u32,
+}
+
+/// Host-side holder for the harvested `BitmapResultMessage`.
+/// Mirrors `AmendRunResult`. Not yet constructed by any subcommand
+/// (the `bitmap` CLI entry point lands in phase 5); the ABI and
+/// decode path are wired here so phases build against a frozen
+/// surface. `#[allow(dead_code)]` until the phase-5 harvester
+/// consumes it.
+#[allow(dead_code)]
+struct BitmapRunResult {
+    target_format: u32,
+    error: u32,
+    action: u32,
+    actions_applied: u32,
+    resulting_nb_bitmaps: u32,
 }
 
 /// Arguments for `instar amend`. Mirrors `qemu-img amend`'s

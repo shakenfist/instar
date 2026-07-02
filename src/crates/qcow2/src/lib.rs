@@ -4762,6 +4762,7 @@ mod tests {
             true
         }
         unsafe extern "C" fn s_send_amend(_: *const shared::AmendResult) {}
+        unsafe extern "C" fn s_send_bitmap(_: *const shared::BitmapResult) {}
         shared::CallTable {
             magic: shared::CallTable::MAGIC,
             version: shared::CallTable::VERSION,
@@ -4800,6 +4801,7 @@ mod tests {
             send_snapshot_result: s_send_snap_res,
             fsync_input: s_fsync_in,
             send_amend_result: s_send_amend,
+            send_bitmap_result: s_send_bitmap,
         }
     }
 

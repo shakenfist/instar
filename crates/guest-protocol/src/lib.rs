@@ -742,6 +742,32 @@ pub fn amend_result_message(
     msg
 }
 
+/// Build a `BitmapResultMessage` envelope from the bitmap
+/// operation's fields. Mirrors `amend_result_message` — the fields
+/// are numeric-passthrough (the host renders any human-readable
+/// summary), with `target_format` the only string, carried the same
+/// way every other sender carries it via `ImageFormat::name()`.
+pub fn bitmap_result_message(
+    target_format: &str,
+    error: u32,
+    action: u32,
+    actions_applied: u32,
+    resulting_nb_bitmaps: u32,
+) -> guest_::GuestMessage {
+    let mut msg = guest_::GuestMessage::default();
+    msg.level = guest_::Level::Info;
+
+    let mut result = guest_::BitmapResultMessage::default();
+    push_str(&mut result.target_format, target_format);
+    result.error = error;
+    result.action = action;
+    result.actions_applied = actions_applied;
+    result.resulting_nb_bitmaps = resulting_nb_bitmaps;
+
+    msg.payload = Some(guest_::GuestMessage_::Payload::BitmapResult(result));
+    msg
+}
+
 /// Build a `MapExtentMessage` envelope for one coalesced map
 /// extent. Streamed one-per-extent during the map operation;
 /// the host accumulates them into the rendered output.

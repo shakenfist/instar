@@ -317,6 +317,26 @@ message AmendResultMessage {
   uint32 error = 5;
 }
 
+// Image bitmap result (from bitmap operation). qemu-img bitmap is
+// silent on success and produces no list output, so this is the
+// single terminal message for the op (no per-entry streaming).
+message BitmapResultMessage {
+  // Target format echoed back (e.g. "qcow2").
+  string target_format = 1;
+  // Error code: 0 = ok, non-zero mirrors BitmapResult::ERROR_*
+  // in src/shared/src/lib.rs. Kept numeric (not a string) so the
+  // size-constrained core binary does not carry the error string
+  // tables; the host renders the message from these codes.
+  uint32 error = 2;
+  // Last applied action opcode; mirrors BitmapConfig::ACTION_*
+  // in src/shared/src/lib.rs (0 = none applied).
+  uint32 action = 3;
+  // How many actions succeeded before the error/end.
+  uint32 actions_applied = 4;
+  // Bitmap count after the op (host render / baseline).
+  uint32 resulting_nb_bitmaps = 5;
+}
+
 // Single coalesced map extent (from map operation). Sent once
 // per emitted extent; followed by a MapResultMessage terminator
 // after the last extent. The host accumulates these into the
@@ -425,5 +445,6 @@ message GuestMessage {
     SnapshotEntryMessage snapshot_entry = 17;
     SnapshotResultMessage snapshot_result = 18;
     AmendResultMessage amend_result = 19;
+    BitmapResultMessage bitmap_result = 20;
   }
 }
