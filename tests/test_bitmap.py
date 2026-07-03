@@ -40,12 +40,30 @@ from base import InstarTestBase
 
 # ----------------------------------------------------------------------
 # KNOWN_BITMAP_DIVERGENCES -- registry of intentional instar-vs-qemu
-# differences (populated in step 7c's refusal suite). Mirrors
-# `KNOWN_AMEND_DIVERGENCES`. Keyed by a descriptive string -> reason.
-# A cross-validation case that fails while NOT registered here is a
-# real regression to investigate, not to silence.
+# differences. Mirrors `KNOWN_AMEND_DIVERGENCES`. Keyed by a descriptive
+# string -> reason. A cross-validation case that fails while NOT
+# registered here is a real regression to investigate, not to silence.
+#
+# In every case instar is deliberately MORE CONSERVATIVE than qemu-img:
+# it refuses an operation qemu accepts. `TestBitmapRefusals` asserts the
+# instar refusal AND (where a live scenario is cheap to build) that qemu
+# accepts the same input, documenting -- not failing on -- the gap.
+# Entries without a live test still document the intentional divergence.
 # ----------------------------------------------------------------------
-KNOWN_BITMAP_DIVERGENCES = {}
+KNOWN_BITMAP_DIVERGENCES = {
+    'merge_mixed':
+        'qemu applies --merge and metadata actions in CLI order in one '
+        'invocation; instar v1 requires a merge to be the sole action',
+    'cross_file_merge':
+        'qemu supports --merge -b SOURCE_FILE; instar v1 same-file merge '
+        'only',
+    'refcount_bits':
+        'instar refuses refcount_bits != 16 '
+        '(ERROR_UNSUPPORTED_REFCOUNT_WIDTH); qemu supports other widths',
+    'refcount_exhausted':
+        'instar refuses when existing refblocks are full (ERROR_NO_SPACE) '
+        'rather than growing the refcount table',
+}
 
 
 class TestBitmapSmoke(InstarTestBase):
@@ -635,3 +653,271 @@ def _install_merge_bits_tests():
 
 
 _install_merge_bits_tests()
+
+
+# ----------------------------------------------------------------------
+# TestBitmapRefusals -- the error-path contracts (step 7c, Mission §4).
+#
+# Every case asserts `rc != 0` and `assertIn(substr, stderr)` against the
+# EXACT Phase-5 host messages (`src/vmm/src/main.rs` `run_bitmap` +
+# `map_bitmap_error`). Cases split into two kinds:
+#
+#   * HOST-SIDE (argument validation + the non-qcow2 probe): these fail
+#     in `run_bitmap` / `probe_bitmap_target` BEFORE any guest launch, so
+#     they DO NOT call `_require_kvm()` -- they run (fast) even without
+#     /dev/kvm.
+#   * GUEST-SIDE (mapped from `map_bitmap_error`): these launch the guest
+#     VMM, so they call `_require_kvm()` first and self-skip without kvm.
+#
+# Where qemu-img is MORE permissive than instar (mixed --merge, cross-
+# file -b), the test also runs the qemu equivalent, asserts qemu accepts
+# it, and records the difference against KNOWN_BITMAP_DIVERGENCES rather
+# than failing -- exactly `test_amend.py`'s divergence-record pattern.
+# ----------------------------------------------------------------------
+class TestBitmapRefusals(TestBitmapSmoke):
+    """Refusal contracts for `instar bitmap`, matched to the Phase-5
+    host messages, plus the intentional instar-over-refuses divergences.
+    """
+
+    # ---- Host-side argument-validation refusals (no guest, no kvm) ----
+
+    def test_object_refused(self):
+        """`--object` is an unsupported surface, refused host-side."""
+        with tempfile.TemporaryDirectory() as td:
+            img = Path(td) / 'img.qcow2'
+            self._qemu_create(img)
+            _, stderr, rc = self.run_instar_bitmap(
+                '--add', '--object', 'foo', str(img), 'b0')
+            self.assertNotEqual(
+                rc, 0, f'instar should refuse --object; stderr={stderr!r}')
+            self.assertIn('--object is not yet supported', stderr,
+                          f'unexpected stderr: {stderr!r}')
+
+    def test_image_opts_refused(self):
+        """`--image-opts` is an unsupported surface, refused host-side."""
+        with tempfile.TemporaryDirectory() as td:
+            img = Path(td) / 'img.qcow2'
+            self._qemu_create(img)
+            _, stderr, rc = self.run_instar_bitmap(
+                '--add', '--image-opts', str(img), 'b0')
+            self.assertNotEqual(
+                rc, 0,
+                f'instar should refuse --image-opts; stderr={stderr!r}')
+            self.assertIn('--image-opts', stderr,
+                          f'unexpected stderr: {stderr!r}')
+
+    def test_cross_file_merge_refused(self):
+        """Cross-file `--merge -b SOURCE_FILE` is refused host-side.
+
+        DIVERGENCE (KNOWN_BITMAP_DIVERGENCES['cross_file_merge']): qemu
+        supports cross-file merge; instar v1 is same-file only. We assert
+        instar refuses AND that qemu accepts the same operation, recording
+        (not failing on) the gap.
+        """
+        self.assertIn('cross_file_merge', KNOWN_BITMAP_DIVERGENCES)
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            img = td / 'img.qcow2'
+            other = td / 'other.qcow2'
+            self._qemu_create(img)
+            self._qemu_create(other)
+            # Source bitmap 'src' lives in `other`; destination 'dst' in
+            # `img` (qemu needs both to actually perform the merge).
+            self.assertEqual(
+                self._qemu_bitmap('--add', str(other), 'src')[2], 0)
+            self.assertEqual(
+                self._qemu_bitmap('--add', str(img), 'dst')[2], 0)
+
+            _, stderr, rc = self.run_instar_bitmap(
+                '--merge', 'src', '-b', str(other), str(img), 'dst')
+            self.assertNotEqual(
+                rc, 0,
+                f'instar should refuse cross-file merge; stderr={stderr!r}')
+            self.assertIn('cross-file merge', stderr,
+                          f'unexpected stderr: {stderr!r}')
+
+            # qemu accepts the same cross-file merge -> record divergence.
+            qimg = td / 'qemu.qcow2'
+            shutil.copy2(img, qimg)
+            _, q_err, q_rc = self._qemu_bitmap(
+                '--merge', 'src', '-b', str(other), str(qimg), 'dst')
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu unexpectedly refused cross-file merge (the '
+                f'divergence premise no longer holds): stderr={q_err!r}')
+
+    def test_no_actions_refused(self):
+        """No action flags at all is refused host-side."""
+        with tempfile.TemporaryDirectory() as td:
+            img = Path(td) / 'img.qcow2'
+            self._qemu_create(img)
+            _, stderr, rc = self.run_instar_bitmap(str(img), 'b0')
+            self.assertNotEqual(
+                rc, 0,
+                f'instar should refuse no-action invocation; '
+                f'stderr={stderr!r}')
+            self.assertIn('Need at least one of --add', stderr,
+                          f'unexpected stderr: {stderr!r}')
+
+    def test_granularity_without_add_refused(self):
+        """`-g` without `--add` is refused host-side."""
+        with tempfile.TemporaryDirectory() as td:
+            img = Path(td) / 'img.qcow2'
+            self._qemu_create(img)
+            _, stderr, rc = self.run_instar_bitmap(
+                '--disable', '-g', '64k', str(img), 'b0')
+            self.assertNotEqual(
+                rc, 0,
+                f'instar should refuse -g without --add; stderr={stderr!r}')
+            self.assertIn('granularity only supported with --add', stderr,
+                          f'unexpected stderr: {stderr!r}')
+
+    def test_merge_mixed_refused(self):
+        """`--merge` mixed with metadata actions is refused host-side.
+
+        DIVERGENCE (KNOWN_BITMAP_DIVERGENCES['merge_mixed']): qemu applies
+        --merge and metadata actions in CLI order in one invocation;
+        instar v1 requires a merge to be the sole action. We assert instar
+        refuses AND that qemu accepts the mixed invocation, recording the
+        gap.
+        """
+        self.assertIn('merge_mixed', KNOWN_BITMAP_DIVERGENCES)
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            img = td / 'img.qcow2'
+            self._qemu_create(img)
+            # 'src' must exist for qemu's merge half to succeed.
+            self.assertEqual(self._qemu_bitmap('--add', str(img), 'src')[2], 0)
+
+            _, stderr, rc = self.run_instar_bitmap(
+                '--merge', 'src', '--add', str(img), 'dst')
+            self.assertNotEqual(
+                rc, 0,
+                f'instar should refuse mixed --merge + --add; '
+                f'stderr={stderr!r}')
+            self.assertIn('mixing --merge with other actions', stderr,
+                          f'unexpected stderr: {stderr!r}')
+
+            # qemu accepts `--add --merge src img dst` (adds dst, merges
+            # src into it, in CLI order) -> record divergence.
+            qimg = td / 'qemu.qcow2'
+            shutil.copy2(img, qimg)
+            _, q_err, q_rc = self._qemu_bitmap(
+                '--add', '--merge', 'src', str(qimg), 'dst')
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu unexpectedly refused mixed --add/--merge (the '
+                f'divergence premise no longer holds): stderr={q_err!r}')
+
+    def test_bad_granularity_refused(self):
+        """A non-power-of-two granularity is refused host-side."""
+        with tempfile.TemporaryDirectory() as td:
+            img = Path(td) / 'img.qcow2'
+            self._qemu_create(img)
+            _, stderr, rc = self.run_instar_bitmap(
+                '--add', '-g', '100000', str(img), 'b0')
+            self.assertNotEqual(
+                rc, 0,
+                f'instar should refuse a non-power-of-two granularity; '
+                f'stderr={stderr!r}')
+            self.assertIn('granularity must be a power of two', stderr,
+                          f'unexpected stderr: {stderr!r}')
+
+    def test_not_qcow2_refused(self):
+        """A non-qcow2 image is refused host-side by `probe_bitmap_target`.
+
+        The probe runs before any guest launch, so this needs no kvm.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            raw = Path(td) / 'raw.img'
+            # A plain zero-filled file: not a qcow2 magic header.
+            with open(raw, 'wb') as f:
+                f.truncate(4 * 1024 * 1024)
+            _, stderr, rc = self.run_instar_bitmap('--add', str(raw), 'b0')
+            self.assertNotEqual(
+                rc, 0,
+                f'instar should refuse a non-qcow2 image; stderr={stderr!r}')
+            self.assertIn('not a qcow2 image', stderr,
+                          f'unexpected stderr: {stderr!r}')
+
+    # ---- Guest-side refusals (mapped from map_bitmap_error; need kvm) --
+
+    def test_v2_image_refused(self):
+        """A qcow2 v2 image cannot store dirty bitmaps (guest-side)."""
+        self._require_kvm()
+        with tempfile.TemporaryDirectory() as td:
+            img = Path(td) / 'v2.qcow2'
+            self._qemu_create(img, compat='0.10')
+            _, stderr, rc = self.run_instar_bitmap('--add', str(img), 'b0')
+            self.assertNotEqual(
+                rc, 0,
+                f'instar should refuse a qcow2 v2 image; stderr={stderr!r}')
+            self.assertIn(
+                'cannot store dirty bitmaps in a qcow2 v2 image', stderr,
+                f'unexpected stderr: {stderr!r}')
+
+    def test_duplicate_add_refused(self):
+        """Adding a bitmap that already exists is refused (guest-side)."""
+        self._require_kvm()
+        with tempfile.TemporaryDirectory() as td:
+            img = Path(td) / 'img.qcow2'
+            self._qemu_create(img)
+            self.assertEqual(self._qemu_bitmap('--add', str(img), 'b0')[2], 0)
+            _, stderr, rc = self.run_instar_bitmap('--add', str(img), 'b0')
+            self.assertNotEqual(
+                rc, 0,
+                f'instar should refuse a duplicate --add; stderr={stderr!r}')
+            self.assertIn('bitmap already exists', stderr,
+                          f'unexpected stderr: {stderr!r}')
+
+    def test_remove_missing_refused(self):
+        """Removing a non-existent bitmap is refused (guest-side)."""
+        self._require_kvm()
+        with tempfile.TemporaryDirectory() as td:
+            img = Path(td) / 'img.qcow2'
+            self._qemu_create(img)
+            _, stderr, rc = self.run_instar_bitmap(
+                '--remove', str(img), 'nope')
+            self.assertNotEqual(
+                rc, 0,
+                f'instar should refuse removing a missing bitmap; '
+                f'stderr={stderr!r}')
+            self.assertIn('bitmap not found', stderr,
+                          f'unexpected stderr: {stderr!r}')
+
+    def test_enable_missing_refused(self):
+        """Enabling a non-existent bitmap is refused (guest-side)."""
+        self._require_kvm()
+        with tempfile.TemporaryDirectory() as td:
+            img = Path(td) / 'img.qcow2'
+            self._qemu_create(img)
+            _, stderr, rc = self.run_instar_bitmap(
+                '--enable', str(img), 'nope')
+            self.assertNotEqual(
+                rc, 0,
+                f'instar should refuse enabling a missing bitmap; '
+                f'stderr={stderr!r}')
+            self.assertIn('bitmap not found', stderr,
+                          f'unexpected stderr: {stderr!r}')
+
+    def test_merge_source_missing_refused(self):
+        """Merging from a non-existent source is refused (guest-side).
+
+        The destination bitmap exists; only the merge SOURCE is missing,
+        so the guest returns ERROR_MERGE_SOURCE_NOT_FOUND
+        ("merge source bitmap not found").
+        """
+        self._require_kvm()
+        with tempfile.TemporaryDirectory() as td:
+            img = Path(td) / 'img.qcow2'
+            self._qemu_create(img)
+            self.assertEqual(
+                self._qemu_bitmap('--add', str(img), 'dst')[2], 0)
+            _, stderr, rc = self.run_instar_bitmap(
+                '--merge', 'nosrc', str(img), 'dst')
+            self.assertNotEqual(
+                rc, 0,
+                f'instar should refuse a missing merge source; '
+                f'stderr={stderr!r}')
+            self.assertIn('merge source', stderr,
+                          f'unexpected stderr: {stderr!r}')
