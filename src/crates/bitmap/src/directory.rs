@@ -346,9 +346,7 @@ pub fn serialize_bitmaps_extension(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qcow2::bitmap::{
-        parse_bitmaps_extension, BME_FLAG_AUTO, BME_FLAG_IN_USE, BT_DIRTY_TRACKING_BITMAP,
-    };
+    use qcow2::bitmap::{parse_bitmaps_extension, BME_FLAG_AUTO, BT_DIRTY_TRACKING_BITMAP};
     use std::vec::Vec;
 
     /// Build a `BitmapDirEntry` fixture with the given fields.
