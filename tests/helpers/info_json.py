@@ -117,6 +117,25 @@ def normalise_info_json(obj, target, tmp_path=None):
                         for k in NESTED_INFO_DIVERGENCE:
                             info.pop(k, None)
 
+    # Sort the qcow2 bitmaps array by name (and each entry's flags) so
+    # the comparison is order-insensitive: instar and qemu-img write the
+    # on-disk bitmap directory in whatever order the op sequence created
+    # the bitmaps, which need not match. Guarded for absent keys — a
+    # missing bitmaps array (e.g. the remove-last case) is a no-op.
+    if isinstance(result, dict):
+        data = result.get('format-specific')
+        if isinstance(data, dict):
+            data = data.get('data')
+            if isinstance(data, dict):
+                bitmaps = data.get('bitmaps')
+                if isinstance(bitmaps, list):
+                    for b in bitmaps:
+                        if isinstance(b, dict) and isinstance(
+                                b.get('flags'), list):
+                            b['flags'] = sorted(b['flags'])
+                    bitmaps.sort(key=lambda b: b.get('name', '')
+                                 if isinstance(b, dict) else '')
+
     if tmp_path is not None:
         _substitute_path(result, tmp_path)
 

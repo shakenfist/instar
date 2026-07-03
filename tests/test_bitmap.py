@@ -36,6 +36,7 @@ import time
 from pathlib import Path
 
 from base import InstarTestBase
+from helpers.info_json import assert_info_equivalent
 
 
 # ----------------------------------------------------------------------
@@ -100,6 +101,60 @@ class TestBitmapSmoke(InstarTestBase):
         """
         if not os.access('/dev/kvm', os.R_OK | os.W_OK):
             self.skipTest('/dev/kvm not readable+writable')
+
+    # ------------------------------------------------------------------
+    # Baseline helpers (bitmap is qcow2-only, so no `target` parameter).
+    # Mirror TestAmendSmoke._baseline_* with the bitmap-info-json tree.
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _baseline_root(cls):
+        """Root of the bitmap info-JSON baseline tree."""
+        return (cls._testdata_root / 'expected-outputs' /
+                'bitmap-info-json' / 'qcow2')
+
+    def _baseline_version_dir(self):
+        """Pick the version dir matching the installed qemu-img.
+
+        Lists version dirs under _baseline_root(), sorts them
+        numerically, prefers the one whose name starts with
+        f'{major}.{minor}.' from self._qemu_version, and falls back to
+        the most-recent recorded version. Returns None when the root is
+        missing or empty. Mirrors TestAmendSmoke._baseline_version_dir.
+        """
+        root = self._baseline_root()
+        if not root.exists():
+            return None
+        names = [p.name for p in root.iterdir() if p.is_dir()]
+        if not names:
+            return None
+        names.sort(key=lambda v: tuple(int(p) for p in v.split('.')))
+        if self._qemu_version is not None:
+            major, minor = self._qemu_version
+            prefix = f'{major}.{minor}.'
+            matches = [n for n in names if n.startswith(prefix)]
+            if matches:
+                return root / matches[0]
+        return root / names[-1]
+
+    def _baseline_stdout(self, case_name):
+        """Return the Path to <version>/<case>.stdout.txt, or None."""
+        v_dir = self._baseline_version_dir()
+        if v_dir is None:
+            return None
+        p = v_dir / f'{case_name}.stdout.txt'
+        return p if p.exists() else None
+
+    def _baseline_meta(self, case_name):
+        """Return parsed JSON of <version>/<case>.meta.json, or None."""
+        v_dir = self._baseline_version_dir()
+        if v_dir is None:
+            return None
+        p = v_dir / f'{case_name}.meta.json'
+        if not p.exists():
+            return None
+        with open(p) as f:
+            return json.load(f)
 
     def _qemu_create(self, path, cluster_size=65536, compat='1.1',
                      size='64M'):
@@ -921,3 +976,218 @@ class TestBitmapRefusals(TestBitmapSmoke):
                 f'stderr={stderr!r}')
             self.assertIn('merge source', stderr,
                           f'unexpected stderr: {stderr!r}')
+
+
+# ----------------------------------------------------------------------
+# Cross-version baseline comparison matrix (Phase 8).
+#
+# BITMAP_BASELINE_CASES is the instar-side replica of the generator's
+# BITMAP_CASES (../instar-testdata/scripts/generate-baselines.py). Each
+# entry maps a case name to the LIST of bitmap ops applied in order.
+# Each op is a full `qemu-img bitmap` arg list whose trailing token is
+# the bitmap name and whose leading tokens are the flags -- exactly the
+# generator shape, so instar replays what qemu-img recorded. All cases
+# create with `qemu-img create -f qcow2 -o compat=1.1 <tmp> 1M`.
+#
+# Unlike the live differential (BITMAP_CASES above), this compares
+# qemu-img info of INSTAR's output against a stored pure-qemu baseline;
+# instar's own `info` emitting no bitmaps is irrelevant here.
+# ----------------------------------------------------------------------
+BITMAP_BASELINE_CASES = {
+    'add-default':     [['--add', 'b0']],
+    'add-granularity': [['--add', '-g', '131072', 'b0']],
+    'add-disabled':    [['--add', '--disable', 'b0']],
+    'disable':         [['--add', 'b0'], ['--disable', 'b0']],
+    'enable':          [['--add', 'b0'], ['--disable', 'b0'],
+                        ['--enable', 'b0']],
+    'clear':           [['--add', 'b0'], ['--clear', 'b0']],
+    'two-bitmaps':     [['--add', 'b0'], ['--add', '-g', '131072', 'b1']],
+    'remove-last':     [['--add', 'b0'], ['--remove', 'b0']],
+}
+
+# Registry of intentional instar-vs-qemu baseline divergences (cases to
+# skip). Empty: the metadata surface is expected to match exactly.
+KNOWN_BITMAP_BASELINE_DIVERGENCES = {}
+
+
+class TestBitmapBaselineMatrix(TestBitmapSmoke):
+    """Cross-version baseline comparison for `instar bitmap`.
+
+    For each entry in BITMAP_BASELINE_CASES, the per-case factory:
+    - Builds the start image with system `qemu-img create -f qcow2 -o
+      compat=1.1 <tmp> 1M` (matching the generator exactly).
+    - Replays the case's op sequence with `instar bitmap`.
+    - Runs system `qemu-img info --output=json` on the result.
+    - Asserts equivalence (via the bitmaps-array-sorting normaliser)
+      against the version-matched baseline recorded in the sibling
+      `instar-testdata` repo under expected-outputs/bitmap-info-json/
+      qcow2/<version>/<case>.stdout.txt.
+
+    The whole matrix skips when the baseline tree is absent (not yet
+    generated for the host qemu version).
+    """
+
+    @staticmethod
+    def _run_qemu_img_info(path, timeout=30):
+        """Run system `qemu-img info --output=json`.
+
+        No -f flag so auto-detect matches what the baseline generator
+        recorded. Returns (stdout, stderr, rc). Returns
+        ('', 'qemu-img info ... not installed', -1) on FileNotFoundError.
+        """
+        try:
+            r = subprocess.run(
+                ['qemu-img', 'info', '--output=json', str(path)],
+                capture_output=True, text=True, timeout=timeout,
+            )
+            return r.stdout, r.stderr, r.returncode
+        except FileNotFoundError:
+            return '', 'qemu-img info: command not installed', -1
+        except subprocess.TimeoutExpired:
+            return '', f'qemu-img info timeout after {timeout}s', -1
+
+    def test_bitmap_cases_match_baselines(self):
+        """Schema-drift tripwire: on-disk baseline stems must equal
+        BITMAP_BASELINE_CASES names.
+
+        Walks <testdata>/expected-outputs/bitmap-info-json/qcow2/
+        <version>/ and asserts the *.stdout.txt stems match the mirror.
+        Catches drift between this mirror and the testdata baseline
+        generator in either direction.
+        """
+        v_dir = self._baseline_version_dir()
+        if v_dir is None:
+            self.skipTest('no bitmap baseline dir found in testdata')
+        on_disk = {
+            p.stem.rsplit('.stdout', 1)[0]
+            for p in v_dir.glob('*.stdout.txt')
+        }
+        in_mirror = set(BITMAP_BASELINE_CASES)
+        missing_from_mirror = on_disk - in_mirror
+        missing_from_disk = in_mirror - on_disk
+        self.assertEqual(
+            missing_from_mirror, set(),
+            f'Baselines on disk not in BITMAP_BASELINE_CASES: '
+            f'{missing_from_mirror}',
+        )
+        self.assertEqual(
+            missing_from_disk, set(),
+            f'BITMAP_BASELINE_CASES entries with no on-disk baseline: '
+            f'{missing_from_disk}. Regenerate baselines via '
+            f'instar-testdata (bitmap-baselines branch).',
+        )
+
+
+def _make_bitmap_baseline_test(case_name):
+    """Factory: one baseline test method per BITMAP_BASELINE_CASES entry.
+
+    The returned test:
+    - Skips when no version-matched baseline is on disk.
+    - Skips when the baseline recorded a non-zero create/op/info rc
+      (qemu couldn't produce a comparable artefact for that version),
+      or when the case is in KNOWN_BITMAP_BASELINE_DIVERGENCES.
+    - Requires /dev/kvm (bitmap launches a guest VMM).
+    - Builds the start image with system qemu-img create -o compat=1.1
+      <tmp> 1M (matching the generator exactly).
+    - Replays the op sequence with instar bitmap (each op rc must be 0 --
+      an instar failure where qemu succeeded is a real bug).
+    - Runs system qemu-img info --output=json.
+    - Asserts equivalence via assert_info_equivalent (the normaliser
+      sorts the bitmaps array).
+    """
+    ops = BITMAP_BASELINE_CASES[case_name]
+
+    def test(self):
+        meta = self._baseline_meta(case_name)
+        if meta is None:
+            self.skipTest(
+                f'no baseline meta for qcow2/{case_name} '
+                f'(installed qemu version not in matrix?)'
+            )
+        if meta.get('create_return_code', 0) != 0:
+            self.skipTest(
+                f'baseline create_rc={meta["create_return_code"]} '
+                f'(qemu rejected create); no comparable artefact'
+            )
+        if any(rc != 0 for rc in meta.get('op_return_codes', [])):
+            self.skipTest(
+                f'baseline op_return_codes={meta["op_return_codes"]} '
+                f'(qemu rejected an op); no comparable artefact'
+            )
+        if meta.get('info_return_code', 0) != 0:
+            self.skipTest(
+                f'baseline info_rc={meta["info_return_code"]} '
+                f'(no comparable JSON)'
+            )
+        if case_name in KNOWN_BITMAP_BASELINE_DIVERGENCES:
+            self.skipTest(
+                f'known bitmap divergence: '
+                f'{KNOWN_BITMAP_BASELINE_DIVERGENCES[case_name]}'
+            )
+
+        baseline_path = self._baseline_stdout(case_name)
+        if baseline_path is None:
+            self.skipTest(f'no baseline stdout for qcow2/{case_name}')
+
+        self._require_kvm()
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'image.qcow2'
+
+            # Build the start image with system qemu-img create, matching
+            # the generator: `qemu-img create -f qcow2 -o compat=1.1 1M`.
+            cmd = ['qemu-img', 'create', '-f', 'qcow2',
+                   '-o', 'compat=1.1', str(path), '1M']
+            try:
+                r = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=30)
+            except FileNotFoundError:
+                self.skipTest('system qemu-img not installed')
+            self.assertEqual(
+                r.returncode, 0,
+                f'qemu-img create failed for qcow2/{case_name}: '
+                f'{r.stderr!r}'
+            )
+
+            # Replay the op sequence with instar bitmap. op[-1] is the
+            # bitmap name; op[:-1] are the flag tokens.
+            for op in ops:
+                flags = list(op[:-1])
+                name = op[-1]
+                _, i_stderr, i_rc = self.run_instar_bitmap(
+                    *flags, str(path), name)
+                self.assertEqual(
+                    i_rc, 0,
+                    f'instar bitmap {op} failed for qcow2/{case_name}: '
+                    f'stderr={i_stderr!r}'
+                )
+
+            # Run system qemu-img info --output=json.
+            info_stdout, info_stderr, info_rc = self._run_qemu_img_info(path)
+            if info_rc == -1 and 'not installed' in info_stderr:
+                self.skipTest('system qemu-img not installed')
+            self.assertEqual(
+                info_rc, 0,
+                f'qemu-img info failed for qcow2/{case_name}: '
+                f'{info_stderr!r}'
+            )
+
+            expected = baseline_path.read_text()
+            assert_info_equivalent(
+                self, info_stdout, expected, 'qcow2',
+                tmp_path=str(path),
+                msg=f'qcow2/{case_name}',
+            )
+
+    test.__name__ = f'test_baseline_{case_name.replace("-", "_")}'
+    test.__doc__ = (
+        f'instar bitmap qcow2/{case_name}: create compat=1.1 -> apply '
+        f'{ops} matches recorded baseline.'
+    )
+    return test
+
+
+for _bcase in BITMAP_BASELINE_CASES:
+    _bname = f'test_baseline_{_bcase.replace("-", "_")}'
+    setattr(TestBitmapBaselineMatrix, _bname,
+            _make_bitmap_baseline_test(_bcase))
