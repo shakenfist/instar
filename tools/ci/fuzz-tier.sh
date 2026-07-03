@@ -42,6 +42,8 @@ FAST_TIER=(
   fuzz_amend_planners
   fuzz_snapshot_refcount
   fuzz_check_repair
+  fuzz_bitmap_parse
+  fuzz_bitmap_planners
 )
 
 is_fast() {
