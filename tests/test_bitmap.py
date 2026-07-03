@@ -29,8 +29,10 @@ import copy  # noqa: F401  (registry-style symmetry with test_amend.py)
 import json  # noqa: F401  (used by helpers/future steps)
 import os
 import shutil
+import socket
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 from base import InstarTestBase
@@ -165,6 +167,194 @@ class TestBitmapSmoke(InstarTestBase):
             f'--- qemu B bitmaps ---\n'
             f'{json.dumps(bb, indent=2, sort_keys=True)}')
 
+    # ------------------------------------------------------------------
+    # Bits-set seeding + read-back oracle (step 7b, Open question 2).
+    #
+    # `_seed_bitmap` uses qemu-img/qemu-io to write KNOWN dirty extents
+    # into a bitmap (never instar), and `_bitmap_dirty_extents` reads
+    # them back neutrally via a qemu-storage-daemon NBD export. The
+    # `x-dirty-bitmap` DIRTY == `"data": false` polarity lives in ONE
+    # place (`_bitmap_dirty_extents`) so no other test reasons about it.
+    # Neither helper needs /dev/kvm -- only the `instar bitmap` call
+    # under test does.
+    # ------------------------------------------------------------------
+
+    def _qemu_io(self, img, cmd, timeout=30):
+        """Run a single `qemu-io -c CMD IMG` command; assert rc 0."""
+        r = subprocess.run(
+            ['qemu-io', '-c', cmd, str(img)],
+            capture_output=True, text=True, timeout=timeout)
+        self.assertEqual(
+            r.returncode, 0,
+            f'qemu-io -c {cmd!r} failed for {img}: {r.stderr!r}')
+        return r
+
+    def _seed_bitmap(self, img, name, writes, granularity=None):
+        """Seed a bitmap with KNOWN dirty extents, then disable it.
+
+        `qemu-img bitmap --add [-g granularity] IMG name` creates an
+        enabled/auto bitmap; each `(offset, length)` in `writes` is
+        dirtied into it with `qemu-io -c "write OFF LEN"`; then
+        `qemu-img bitmap --disable IMG name` stops recording (required
+        before a read-only NBD export).
+
+        Seed (and DISABLE) the source bitmap BEFORE adding an empty
+        destination, so a later `qemu-io` write cannot also dirty the
+        destination's auto bitmap.
+        """
+        add_args = ['--add']
+        if granularity is not None:
+            add_args += ['-g', str(granularity)]
+        add_args += [str(img), name]
+        _, err, rc = self._qemu_bitmap(*add_args)
+        self.assertEqual(
+            rc, 0, f'qemu-img bitmap --add {name} failed: {err!r}')
+        for off, length in writes:
+            self._qemu_io(img, f'write {off} {length}')
+        _, err, rc = self._qemu_bitmap('--disable', str(img), name)
+        self.assertEqual(
+            rc, 0, f'qemu-img bitmap --disable {name} failed: {err!r}')
+
+    def _qmp_exchange(self, sock, command):
+        """Send one QMP command and return its `return`/`error` reply.
+
+        Handles the JSON-line protocol: asynchronous events (which lack
+        both `return` and `error`) are skipped until the reply to this
+        command arrives.
+        """
+        sock.sendall((json.dumps(command) + '\r\n').encode())
+        buf = b''
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise RuntimeError(
+                    f'QMP socket closed awaiting reply to {command!r}')
+            buf += chunk
+            while b'\n' in buf:
+                line, buf = buf.split(b'\n', 1)
+                line = line.strip()
+                if not line:
+                    continue
+                msg = json.loads(line)
+                if 'return' in msg or 'error' in msg:
+                    return msg
+
+    def _bitmap_dirty_extents(self, img, name, timeout=30):
+        """Read a bitmap's dirty extents back neutrally (the oracle).
+
+        Launches `qemu-storage-daemon` exposing `img` (read-only) over a
+        unix NBD socket with the named bitmap attached, driven via QMP
+        `block-export-add`, then runs `qemu-img map --output=json` over
+        the NBD export with `x-dirty-bitmap=qemu:dirty-bitmap:NAME`.
+
+        The `x-dirty-bitmap` convention inverts `data`: a DIRTY cluster
+        reports `"data": false` and a clean cluster `"data": true`. This
+        polarity is centralised HERE (Open question 2).
+
+        Returns a SORTED, COALESCED list of `(offset, length)` dirty
+        ranges. The bitmap MUST be disabled (see `_seed_bitmap`) for the
+        read-only export. Needs no /dev/kvm. The daemon is always torn
+        down and the sockets removed in a `finally`.
+        """
+        tmpd = tempfile.mkdtemp(prefix='bitmap-oracle.')
+        nbd_sock = os.path.join(tmpd, 'nbd.sock')
+        qmp_sock = os.path.join(tmpd, 'qmp.sock')
+        daemon = None
+        sock = None
+        try:
+            daemon = subprocess.Popen(
+                ['qemu-storage-daemon',
+                 '--blockdev',
+                 f'node-name=n0,driver=qcow2,file.filename={img},'
+                 f'file.driver=file,read-only=on',
+                 '--nbd-server', f'addr.type=unix,addr.path={nbd_sock}',
+                 '--chardev',
+                 f'socket,id=qmp,path={qmp_sock},server=on,wait=off',
+                 '--monitor', 'chardev=qmp'],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            # Wait for the QMP socket to appear (or the daemon to die).
+            deadline = time.time() + timeout
+            while not os.path.exists(qmp_sock):
+                if daemon.poll() is not None:
+                    _, err = daemon.communicate()
+                    raise RuntimeError(
+                        f'qemu-storage-daemon exited early: '
+                        f'{err.decode(errors="replace")}')
+                if time.time() > deadline:
+                    raise RuntimeError('QMP socket did not appear in time')
+                time.sleep(0.02)
+
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect(qmp_sock)
+            sock.recv(65536)  # QMP greeting.
+
+            reply = self._qmp_exchange(sock, {'execute': 'qmp_capabilities'})
+            self.assertIn(
+                'return', reply, f'qmp_capabilities failed: {reply!r}')
+            reply = self._qmp_exchange(sock, {
+                'execute': 'block-export-add',
+                'arguments': {
+                    'type': 'nbd', 'id': 'exp', 'node-name': 'n0',
+                    'name': 'exp', 'writable': False, 'bitmaps': [name]}})
+            self.assertIn(
+                'return', reply, f'block-export-add failed: {reply!r}')
+
+            deadline = time.time() + timeout
+            while not os.path.exists(nbd_sock):
+                if time.time() > deadline:
+                    raise RuntimeError('NBD socket did not appear in time')
+                time.sleep(0.02)
+
+            image_opts = (
+                f'driver=nbd,server.type=unix,server.path={nbd_sock},'
+                f'export=exp,x-dirty-bitmap=qemu:dirty-bitmap:{name}')
+            mp = subprocess.run(
+                ['qemu-img', 'map', '--output=json', '--image-opts',
+                 image_opts],
+                capture_output=True, text=True, timeout=timeout)
+            self.assertEqual(
+                mp.returncode, 0,
+                f'qemu-img map failed for bitmap {name}: {mp.stderr!r}')
+
+            # DIRTY == "data": false (the x-dirty-bitmap convention).
+            extents = [
+                (int(e['start']), int(e['length']))
+                for e in json.loads(mp.stdout)
+                if e.get('data') is False]
+            extents.sort()
+            coalesced = []
+            for start, length in extents:
+                if coalesced and start == coalesced[-1][0] + coalesced[-1][1]:
+                    coalesced[-1] = (coalesced[-1][0],
+                                     coalesced[-1][1] + length)
+                else:
+                    coalesced.append((start, length))
+
+            try:
+                self._qmp_exchange(sock, {'execute': 'quit'})
+            except Exception:
+                pass
+            return coalesced
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            if daemon is not None:
+                try:
+                    daemon.terminate()
+                    daemon.wait(timeout=5)
+                except Exception:
+                    daemon.kill()
+                    try:
+                        daemon.wait(timeout=5)
+                    except Exception:
+                        pass
+            shutil.rmtree(tmpd, ignore_errors=True)
+
 
 # ----------------------------------------------------------------------
 # BITMAP_CASES -- the differential matrix.
@@ -297,3 +487,151 @@ def _install_bitmap_diff_tests():
 
 
 _install_bitmap_diff_tests()
+
+
+# ----------------------------------------------------------------------
+# MERGE_BITS_VARIANTS -- the bits-set same-file merge matrix (step 7b).
+#
+# Each variant seeds a SOURCE bitmap 'src' with known dirty writes and a
+# DEST bitmap 'dst' (possibly pre-seeded with its own writes), then merges
+# 'src' into 'dst' and asserts the resulting dst dirty extents match qemu
+# bit-for-bit. Writes are `(offset, length)` byte ranges; the expected
+# result is the coalesced union of the src and dst writes. All images are
+# v3 (compat=1.1) with a 64 KiB cluster and 64 KiB bitmap granularity so
+# a write maps to exactly one bitmap cluster.
+#
+# name -> (src_writes, dst_writes, expected_dst_extents)
+# ----------------------------------------------------------------------
+_G = 65536  # bitmap granularity (bytes); also the cluster size.
+
+MERGE_BITS_VARIANTS = {
+    # disjoint: src {0..128k}, dst empty -> dst gets {0..128k}.
+    'disjoint': (
+        [(0, 128 * 1024)],
+        [],
+        [(0, 128 * 1024)],
+    ),
+    # overlapping: src {0..128k}, dst pre-seeded {64k..192k} ->
+    # dst becomes the union {0..192k}.
+    'overlapping': (
+        [(0, 128 * 1024)],
+        [(64 * 1024, 128 * 1024)],
+        [(0, 192 * 1024)],
+    ),
+    # into_nonempty_disjoint: src {0..64k}, dst pre-seeded {1M..1M+64k}
+    # -> union of both (two disjoint ranges).
+    'into_nonempty_disjoint': (
+        [(0, 64 * 1024)],
+        [(1024 * 1024, 64 * 1024)],
+        [(0, 64 * 1024), (1024 * 1024, 64 * 1024)],
+    ),
+}
+
+
+class TestBitmapMergeBits(TestBitmapSmoke):
+    """Bits-set same-file `--merge`, cross-validated against qemu.
+
+    The first real exercise of the Phase-4 guest merge orchestration:
+    seed known dirty bits into 'src' (and optionally 'dst'), copy the
+    image to A (instar) and B (qemu), run `bitmap --merge src <img> dst`
+    on each, then assert (a) `qemu-img check(A)` clean, (b) the bitmaps
+    metadata (name/granularity/flags) equivalent, and (c) the actual
+    merged dst dirty extents identical -- the merged BITS match qemu.
+
+    `test_oracle_roundtrip` proves the read-back oracle in isolation
+    (no instar, no merge) before the merge matrix is built on it.
+    """
+
+    def test_oracle_roundtrip(self):
+        """The read-back oracle returns exactly the seeded extents.
+
+        Proves `_seed_bitmap` + `_bitmap_dirty_extents` before the merge
+        matrix relies on them. Needs no /dev/kvm.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            img = Path(td) / 'oracle.qcow2'
+            self._qemu_create(img, cluster_size=_G, size='4M')
+            writes = [(0, 128 * 1024), (1024 * 1024, 64 * 1024)]
+            self._seed_bitmap(img, 'b0', writes, granularity=_G)
+            self.assertEqual(
+                self._bitmap_dirty_extents(img, 'b0'),
+                [(0, 128 * 1024), (1024 * 1024, 64 * 1024)],
+                'oracle read-back did not match the seeded writes')
+
+
+def _make_merge_bits_test(name, spec):
+    """Factory: one bits-set merge differential test per variant."""
+    src_writes, dst_writes, expected = spec
+
+    def test(self):
+        self._require_kvm()
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            start = td / 'start.qcow2'
+            self._qemu_create(start, cluster_size=_G, size='4M')
+
+            # Seed 'src' (add + writes + DISABLE) BEFORE adding 'dst',
+            # so the dst writes below cannot dirty src's auto bitmap.
+            self._seed_bitmap(start, 'src', src_writes, granularity=_G)
+            # 'dst': add + optional pre-seed writes + DISABLE. An empty
+            # `dst_writes` yields an empty, disabled destination bitmap.
+            self._seed_bitmap(start, 'dst', dst_writes, granularity=_G)
+
+            path_a = td / 'a.qcow2'  # instar
+            path_b = td / 'b.qcow2'  # qemu
+            shutil.copy2(start, path_a)
+            shutil.copy2(start, path_b)
+
+            _, i_err, i_rc = self.run_instar_bitmap(
+                '--merge', 'src', str(path_a), 'dst')
+            self.assertEqual(
+                i_rc, 0,
+                f'instar bitmap --merge failed for {name}: {i_err!r}')
+            _, q_err, q_rc = self._qemu_bitmap(
+                '--merge', 'src', str(path_b), 'dst')
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img bitmap --merge failed for {name}: {q_err!r}')
+
+            # instar output must pass qemu-img check.
+            _, chk_err, chk_rc = self.run_qemu_img_check(path_a)
+            self.assertEqual(
+                chk_rc, 0,
+                f'qemu-img check failed on instar output for {name}: '
+                f'{chk_err}')
+
+            # Bitmaps metadata equivalence (qemu-vs-qemu, sorted).
+            self.assert_bitmaps_equivalent(
+                path_a, path_b,
+                msg=f'bits-set merge metadata {name}')
+
+            # THE actual merged bits: dst extents must match qemu AND the
+            # independently-computed expected union.
+            ext_a = self._bitmap_dirty_extents(path_a, 'dst')
+            ext_b = self._bitmap_dirty_extents(path_b, 'dst')
+            self.assertEqual(
+                ext_a, ext_b,
+                f'merged dst extents diverge from qemu for {name}:\n'
+                f'  instar A: {ext_a}\n  qemu   B: {ext_b}')
+            self.assertEqual(
+                ext_a, expected,
+                f'merged dst extents wrong for {name}:\n'
+                f'  got:      {ext_a}\n  expected: {expected}')
+
+    test.__name__ = f'test_merge_bits_{name}'
+    test.__doc__ = (
+        f'bits-set same-file merge ({name}): merge src {src_writes} into '
+        f'dst {dst_writes}; assert check + metadata + merged extents '
+        f'{expected} match qemu.')
+    return test
+
+
+def _install_merge_bits_tests():
+    """Install the bits-set merge differential matrix."""
+    for name, spec in MERGE_BITS_VARIANTS.items():
+        t = _make_merge_bits_test(name, spec)
+        setattr(TestBitmapMergeBits, t.__name__, t)
+
+
+_install_merge_bits_tests()
