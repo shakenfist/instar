@@ -2702,9 +2702,11 @@ struct AmendRunResult {
 }
 
 /// Host-side holder for the harvested `BitmapResultMessage`.
-/// Mirrors `AmendRunResult`. Constructed by `run_bitmap_guest`; the
-/// non-error fields are consumed by 5c's rendering (`target_format`
-/// / `action` / `actions_applied` / `resulting_nb_bitmaps`).
+/// Mirrors `AmendRunResult`. Constructed by `run_bitmap_guest`;
+/// `error`, `actions_applied` and `resulting_nb_bitmaps` drive the
+/// error mapping / json envelope. `target_format` and `action` are
+/// harvested for completeness (and the debug `format_message` arm)
+/// but not read on the success path, hence the `dead_code` allow.
 #[allow(dead_code)]
 struct BitmapRunResult {
     target_format: u32,
@@ -5259,11 +5261,12 @@ struct BitmapAction {
 
 /// Run the `instar bitmap` operation.
 ///
-/// Phase 5a: parse and validate the qemu-parity CLI surface, refuse
-/// the unsupported flags, and reconstruct the ordered action list
-/// (via `ArgMatches::indices_of`, since clap derive loses cross-flag
-/// order). After validation this returns a clear "not yet wired"
-/// error; 5b wires the probe + guest launch and 5c the rendering.
+/// Parses and validates the qemu-parity CLI surface, refuses the
+/// unsupported flags, and reconstructs the ordered action list (via
+/// `ArgMatches::indices_of`, since clap derive loses cross-flag
+/// order). Probes the qcow2 header, launches the bitmap guest over an
+/// input-RW attach, maps any structured guest error to a message,
+/// fsyncs on success, and renders (silent by default, json opt-in).
 fn run_bitmap(
     args: &BitmapArgs,
     matches: Option<&clap::ArgMatches>,
@@ -5416,12 +5419,91 @@ fn run_bitmap(
         verbose,
     )?;
 
-    // 5b: surface the raw guest result. 5c replaces this with
-    // map_bitmap_error + render_bitmap_success + host sync_all.
+    // On a non-OK guest error, map the structured code to a
+    // user-facing message and fail (non-zero exit). The message
+    // goes to stderr via the caller's error rendering.
     if result.error != shared::BitmapResult::ERROR_OK {
-        return Err(format!("bitmap: guest error code {}", result.error).into());
+        return Err(format!("bitmap: {}", map_bitmap_error(result.error)).into());
     }
+
+    // Durability fsync: a successful action rewrote qcow2 metadata
+    // (bitmap directory, table clusters, header autoclear word). The
+    // guest fsyncs during its dance; this host-side belt-and-suspenders
+    // re-opens read+write and `sync_all()`s (amend's pattern) so the
+    // mutation is on stable storage before we report success.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&args.filename)?;
+    file.sync_all()?;
+
+    render_bitmap_success(args, &result);
     Ok(())
+}
+
+/// Map a `BitmapResult::ERROR_*` code to a user-facing string.
+/// Exhaustive on the constants from `src/shared/src/lib.rs`
+/// (0..=19); the trailing catch-all covers future additions only.
+/// Messages are qemu-flavoured where a direct analogue exists.
+fn map_bitmap_error(code: u32) -> &'static str {
+    match code {
+        c if c == shared::BitmapResult::ERROR_OK => "ok",
+        c if c == shared::BitmapResult::ERROR_UNSUPPORTED_FORMAT => "not a qcow2 image",
+        c if c == shared::BitmapResult::ERROR_UNSUPPORTED_VERSION => {
+            "cannot store dirty bitmaps in a qcow2 v2 image"
+        }
+        c if c == shared::BitmapResult::ERROR_PARSE_FAILED => {
+            "the image header could not be parsed"
+        }
+        c if c == shared::BitmapResult::ERROR_HEADER_MISMATCH => {
+            "the image's header changed between the host's pre-probe and the \
+             guest's read, or a guest write failed; retry, or run \
+             `instar check` if the image may be corrupt"
+        }
+        c if c == shared::BitmapResult::ERROR_BITMAP_NOT_FOUND => "bitmap not found",
+        c if c == shared::BitmapResult::ERROR_BITMAP_EXISTS => "bitmap already exists",
+        c if c == shared::BitmapResult::ERROR_BITMAP_IN_USE => {
+            "bitmap is in use / inconsistent (only --remove is allowed)"
+        }
+        c if c == shared::BitmapResult::ERROR_NAME_TOO_LONG => "bitmap name is too long",
+        c if c == shared::BitmapResult::ERROR_GRANULARITY_RANGE => {
+            "granularity is out of range (must be a power of two between 512 and 2G)"
+        }
+        c if c == shared::BitmapResult::ERROR_TOO_MANY_BITMAPS => "too many bitmaps in the image",
+        c if c == shared::BitmapResult::ERROR_NO_SPACE => "no free clusters to allocate the bitmap",
+        c if c == shared::BitmapResult::ERROR_WRITE_FAILED => "I/O error writing the image",
+        c if c == shared::BitmapResult::ERROR_READ_FAILED => "I/O error reading the image",
+        c if c == shared::BitmapResult::ERROR_SCRATCH_TOO_SMALL => {
+            "the image is too large for the bitmap scratch buffer"
+        }
+        c if c == shared::BitmapResult::ERROR_INTERNAL_OVERFLOW => {
+            "internal size or offset computation overflowed (host or guest bug)"
+        }
+        c if c == shared::BitmapResult::ERROR_MERGE_SOURCE_NOT_FOUND => {
+            "merge source bitmap not found"
+        }
+        c if c == shared::BitmapResult::ERROR_UNSUPPORTED_ACTION => "unsupported bitmap action",
+        c if c == shared::BitmapResult::ERROR_UNSUPPORTED_REFCOUNT_WIDTH => {
+            "unsupported refcount width (only 16-bit refcounts are supported)"
+        }
+        c if c == shared::BitmapResult::ERROR_INCOMPATIBLE_MERGE => {
+            "bitmaps have incompatible granularity for merge"
+        }
+        _ => "unknown bitmap error",
+    }
+}
+
+/// Render success for `instar bitmap`. qemu-img bitmap prints
+/// nothing on success, so the human path is silent; only
+/// `--output json` emits a small numeric envelope. Errors always
+/// go to stderr regardless (handled by the caller).
+fn render_bitmap_success(args: &BitmapArgs, result: &BitmapRunResult) {
+    if args.output == "json" {
+        println!(
+            "{{\n  \"actions-applied\": {},\n  \"resulting-bitmaps\": {}\n}}",
+            result.actions_applied, result.resulting_nb_bitmaps,
+        );
+    }
 }
 
 /// Probe the amend target's format and header summary. Honours
