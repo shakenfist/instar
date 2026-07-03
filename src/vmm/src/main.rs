@@ -2702,11 +2702,9 @@ struct AmendRunResult {
 }
 
 /// Host-side holder for the harvested `BitmapResultMessage`.
-/// Mirrors `AmendRunResult`. Not yet constructed by any subcommand
-/// (the `bitmap` CLI entry point lands in phase 5); the ABI and
-/// decode path are wired here so phases build against a frozen
-/// surface. `#[allow(dead_code)]` until the phase-5 harvester
-/// consumes it.
+/// Mirrors `AmendRunResult`. Constructed by `run_bitmap_guest`; the
+/// non-error fields are consumed by 5c's rendering (`target_format`
+/// / `action` / `actions_applied` / `resulting_nb_bitmaps`).
 #[allow(dead_code)]
 struct BitmapRunResult {
     target_format: u32,
@@ -5269,7 +5267,7 @@ struct BitmapAction {
 fn run_bitmap(
     args: &BitmapArgs,
     matches: Option<&clap::ArgMatches>,
-    _verbose: bool,
+    verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // a. Reject the unsupported surface up-front (resize-style).
     if args.object.is_some() {
@@ -5402,15 +5400,28 @@ fn run_bitmap(
         return Err("bitmap: merge source names exceed the pool budget".into());
     }
 
-    // g. 5a stops here. The validated inputs below are what 5b/5c
-    // consume:
-    //   * `actions`            -- ordered (opcode, merge source?) list
-    //   * `granularity_bytes`  -- 0 when absent (format default)
-    //   * `args.bitmap`        -- target name (validated length)
-    // 5b: probe the qcow2 header + run_bitmap_guest (input-RW attach).
-    // 5c: render (silent human / json envelope) + host sync_all.
-    let _ = (&actions, granularity_bytes, &args.filename);
-    Err("bitmap: guest execution not yet wired (phase 5b/5c)".into())
+    // g. Probe the qcow2 header + bitmaps extension for the guest's
+    // cross-check, then launch the bitmap guest over an input-RW
+    // attach. bitmap uses a 512-byte sector size (open question 5:
+    // metadata writes are sub-cluster; there is no --sector-size flag).
+    let probed = probe_bitmap_target(&args.filename)?;
+    let sector_size: u32 = 512;
+    let result = run_bitmap_guest(
+        &args.filename,
+        &probed,
+        &actions,
+        granularity_bytes,
+        &args.bitmap,
+        sector_size,
+        verbose,
+    )?;
+
+    // 5b: surface the raw guest result. 5c replaces this with
+    // map_bitmap_error + render_bitmap_success + host sync_all.
+    if result.error != shared::BitmapResult::ERROR_OK {
+        return Err(format!("bitmap: guest error code {}", result.error).into());
+    }
+    Ok(())
 }
 
 /// Probe the amend target's format and header summary. Honours
@@ -5447,6 +5458,109 @@ fn probe_amend_target(
         current_incompatible_features: header.incompatible_features,
         current_compatible_features: header.compatible_features,
         virtual_size: header.virtual_size,
+    })
+}
+
+/// Snapshot of what the host probed from the qcow2 target file
+/// before launching the bitmap guest. Mirrors `ProbedAmendTarget`,
+/// but the bitmap cross-check additionally needs the autoclear
+/// feature word (read from offset 88) and the bitmaps-extension
+/// summary (`nb_bitmaps` + the bitmap directory location/size),
+/// which `QcowHeader` does not expose — those come from
+/// `qcow2::parse_header_extensions`. The guest re-derives every one
+/// of these itself and returns `ERROR_HEADER_MISMATCH` on any
+/// disagreement, so they must be derived exactly as the guest does.
+struct ProbedBitmapTarget {
+    /// qcow2 cluster size in bytes (header-cluster span).
+    cluster_size: u32,
+    /// Current qcow2 version (2 or 3).
+    current_version: u32,
+    /// Current refcount width in bits.
+    current_refcount_bits: u32,
+    /// Virtual disk size in bytes.
+    virtual_size: u64,
+    /// Autoclear feature word (raw word at offset 88; 0 for v2).
+    current_autoclear_features: u64,
+    /// Current incompatible feature word.
+    current_incompatible_features: u64,
+    /// Existing bitmap count (0 if no usable extension).
+    nb_bitmaps: u32,
+    /// Byte offset of the bitmap directory (0 if absent).
+    bitmap_directory_offset: u64,
+    /// Byte size of the bitmap directory (0 if absent).
+    bitmap_directory_size: u64,
+}
+
+/// Probe the bitmap target's header + bitmaps extension. Modelled on
+/// `probe_amend_target`, but reads the **full first cluster** (not
+/// just 4 KiB) so the header-extension chain is visible, calls
+/// `qcow2::parse_header_extensions`, and reads the autoclear word at
+/// offset 88. Refuses non-qcow2 host-side (the guest also refuses).
+///
+/// The `nb_bitmaps` / `bitmap_directory_offset` / `bitmap_directory_
+/// size` fields are taken verbatim from `parse_header_extensions`
+/// (which yields 0 when there is no bitmaps extension and the raw
+/// body values when one is present or inconsistent). This mirrors
+/// the guest's derivation (`ext_has_body ? body : 0`) exactly, since
+/// the crate already zeroes those fields when the extension is
+/// absent — keeping the host/guest cross-check in agreement.
+fn probe_bitmap_target(path: &str) -> Result<ProbedBitmapTarget, Box<dyn std::error::Error>> {
+    use std::io::Read;
+    let mut file = std::fs::OpenOptions::new().read(true).open(path)?;
+
+    // First read enough for the sector-0 header so we can learn the
+    // cluster size, then read the full first cluster so the header
+    // extension chain (which lives after the fixed header) is visible.
+    let mut head = vec![0u8; 4096];
+    let read = file.read(&mut head)?;
+    head.truncate(read);
+
+    if shared::format_detection::detect_format_from_header(&head, head.len(), false)
+        != shared::ImageFormat::Qcow2
+    {
+        return Err("bitmap: not a qcow2 image".into());
+    }
+    let header = qcow2::QcowHeader::parse(&head).ok_or("bitmap: invalid qcow2 header")?;
+
+    // Read the full first cluster (bounded to a sane 2 MiB max in
+    // case of a pathological cluster_size), re-seeking to the start.
+    let cluster_size = header.cluster_size as usize;
+    let full_len = cluster_size.clamp(4096, 2 * 1024 * 1024);
+    let mut full = vec![0u8; full_len];
+    use std::io::Seek;
+    file.seek(std::io::SeekFrom::Start(0))?;
+    let full_read = file.read(&mut full)?;
+    full.truncate(full_read);
+
+    // Re-parse from the full-cluster buffer (identical header, but keep
+    // it consistent with the buffer we hand to parse_header_extensions).
+    let header = qcow2::QcowHeader::parse(&full).ok_or("bitmap: invalid qcow2 header")?;
+    let ext = qcow2::parse_header_extensions(&full, &header);
+
+    // Autoclear word @88 (v2 images have no autoclear word; read 0).
+    let current_autoclear_features = if full.len() >= qcow2::AUTOCLEAR_FEATURES_OFFSET + 8 {
+        u64::from_be_bytes(
+            full[qcow2::AUTOCLEAR_FEATURES_OFFSET..qcow2::AUTOCLEAR_FEATURES_OFFSET + 8]
+                .try_into()
+                .unwrap(),
+        )
+    } else {
+        0
+    };
+
+    Ok(ProbedBitmapTarget {
+        cluster_size: header.cluster_size as u32,
+        current_version: header.version,
+        current_refcount_bits: header.refcount_bits,
+        virtual_size: header.virtual_size,
+        current_autoclear_features,
+        current_incompatible_features: header.incompatible_features,
+        // parse_header_extensions leaves these 0 when there is no
+        // extension body and fills them from the body otherwise —
+        // matching the guest's `ext_has_body ? body : 0` derivation.
+        nb_bitmaps: ext.bitmap_nb_bitmaps,
+        bitmap_directory_offset: ext.bitmap_directory_offset,
+        bitmap_directory_size: ext.bitmap_directory_size,
     })
 }
 
@@ -5980,6 +6094,416 @@ fn run_amend_guest(
     }
     if !result_seen {
         return Err("amend: guest did not return a result".into());
+    }
+    Ok(harvested)
+}
+
+/// Launch the bitmap guest binary, wait for the
+/// `BitmapResultMessage`. Modelled on `run_amend_guest` for the
+/// KVM / memory / vCPU-loop boilerplate, but attaches the target
+/// **input read-write at slot 0** (snapshot's idiom) with a
+/// growth-capable capacity hint, since bitmap allocates clusters
+/// (add tables, merge data, directory relocation). The
+/// `BitmapConfig` scalars are written field-by-field at
+/// `OPERATION_CONFIG_ADDR`; the `actions` / `name` /
+/// `merge_source_lens` / `merge_source_pool` byte arrays are written
+/// into the same region at their computed offsets. The result is
+/// harvested via a new `Payload::BitmapResult` decode arm.
+#[allow(clippy::too_many_arguments)]
+fn run_bitmap_guest(
+    filename: &str,
+    probed: &ProbedBitmapTarget,
+    actions: &[BitmapAction],
+    granularity_bytes: u64,
+    target_name: &str,
+    sector_size: u32,
+    verbose: bool,
+) -> Result<BitmapRunResult, Box<dyn std::error::Error>> {
+    // --- Load guest binaries --------------------------------------------
+    let core_path = get_binary_path("core.bin");
+    let core_code = load_guest_binary(
+        core_path
+            .to_str()
+            .ok_or("bitmap: core.bin path is not valid UTF-8")?,
+    )?;
+    let bitmap_path = get_binary_path("bitmap.bin");
+    let bitmap_code = load_guest_binary(
+        bitmap_path
+            .to_str()
+            .ok_or("bitmap: bitmap.bin path is not valid UTF-8")?,
+    )?;
+
+    // --- KVM / VM / guest memory setup ----------------------------------
+    let kvm = Kvm::new()?;
+    debug!("KVM API version: {}", kvm.get_api_version());
+
+    let kvm_stats_checker = kvm_stats::KvmStatsChecker::new(&kvm);
+    kvm_stats_checker.display_status();
+
+    let vm = kvm.create_vm()?;
+    let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
+
+    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let host_addr = region.as_ptr() as u64;
+    let mem_region = kvm_userspace_memory_region {
+        slot: 0,
+        guest_phys_addr: 0,
+        memory_size: GUEST_MEM_SIZE,
+        userspace_addr: host_addr,
+        flags: 0,
+    };
+    // SAFETY: mem_region.userspace_addr points to a valid
+    // GuestMemoryMmap allocation that outlives the VM.
+    unsafe {
+        vm.set_user_memory_region(mem_region)?;
+    }
+    setup_gdt(&guest_mem)?;
+    setup_page_tables(&guest_mem, GUEST_MEM_SIZE)?;
+    guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
+    guest_mem.write_slice(&bitmap_code, GuestAddress(OPERATION_LOAD_ADDR))?;
+
+    // --- Write BitmapConfig at OPERATION_CONFIG_ADDR --------------------
+    // Layout (must match shared::BitmapConfig exactly; repr(C), 3584 B):
+    //      0: magic                          u32  ("BMPC")
+    //      4: target_format                  u32
+    //      8: flags                          u32
+    //     12: sector_size                    u32
+    //     16: num_actions                    u32
+    //     20: name_len                       u32
+    //     24: num_merge_sources              u32
+    //     28: _pad0                          u32
+    //     32: granularity                    u64
+    //     40: current_autoclear_features     u64
+    //     48: current_incompatible_features  u64
+    //     56: virtual_size                   u64
+    //     64: bitmap_directory_offset        u64
+    //     72: bitmap_directory_size          u64
+    //     80: current_version                u32
+    //     84: current_refcount_bits          u32
+    //     88: cluster_size                   u32
+    //     92: nb_bitmaps                     u32
+    //     96: actions                        [u8; 8]
+    //    104: _pad1                          [u8; 8]
+    //    112: name                           [u8; 1024]
+    //   1136: merge_source_lens              [u16; 8]
+    //   1152: merge_source_pool              [u8; 2048]
+    //   3200: _reserved                      [u8; 384]
+    let num_actions = actions.len() as u32;
+    let num_merge_sources = actions
+        .iter()
+        .filter(|a| a.opcode == shared::BitmapConfig::ACTION_MERGE)
+        .count() as u32;
+    let name_bytes = target_name.as_bytes();
+    let name_len = name_bytes.len();
+    // These bounds were already enforced by run_bitmap's validation;
+    // assert here so a future refactor cannot silently overflow the
+    // fixed guest buffers.
+    assert!(actions.len() <= shared::MAX_BITMAP_ACTIONS);
+    assert!(name_len <= shared::BITMAP_NAME_BUF);
+    assert!((num_merge_sources as usize) <= shared::MAX_MERGE_SOURCES);
+
+    let mut flags: u32 = 0;
+    if verbose {
+        flags |= shared::BitmapConfig::FLAG_VERBOSE;
+    }
+
+    guest_mem.write_obj(
+        shared::BitmapConfig::MAGIC,
+        GuestAddress(OPERATION_CONFIG_ADDR),
+    )?;
+    guest_mem.write_obj(IMAGE_FORMAT_QCOW2, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
+    guest_mem.write_obj(flags, GuestAddress(OPERATION_CONFIG_ADDR + 8))?;
+    guest_mem.write_obj(sector_size, GuestAddress(OPERATION_CONFIG_ADDR + 12))?;
+    guest_mem.write_obj(num_actions, GuestAddress(OPERATION_CONFIG_ADDR + 16))?;
+    guest_mem.write_obj(name_len as u32, GuestAddress(OPERATION_CONFIG_ADDR + 20))?;
+    guest_mem.write_obj(num_merge_sources, GuestAddress(OPERATION_CONFIG_ADDR + 24))?;
+    // _pad0 at 28 stays zero from the page-zeroed memory.
+    guest_mem.write_obj(granularity_bytes, GuestAddress(OPERATION_CONFIG_ADDR + 32))?;
+    guest_mem.write_obj(
+        probed.current_autoclear_features,
+        GuestAddress(OPERATION_CONFIG_ADDR + 40),
+    )?;
+    guest_mem.write_obj(
+        probed.current_incompatible_features,
+        GuestAddress(OPERATION_CONFIG_ADDR + 48),
+    )?;
+    guest_mem.write_obj(
+        probed.virtual_size,
+        GuestAddress(OPERATION_CONFIG_ADDR + 56),
+    )?;
+    guest_mem.write_obj(
+        probed.bitmap_directory_offset,
+        GuestAddress(OPERATION_CONFIG_ADDR + 64),
+    )?;
+    guest_mem.write_obj(
+        probed.bitmap_directory_size,
+        GuestAddress(OPERATION_CONFIG_ADDR + 72),
+    )?;
+    guest_mem.write_obj(
+        probed.current_version,
+        GuestAddress(OPERATION_CONFIG_ADDR + 80),
+    )?;
+    guest_mem.write_obj(
+        probed.current_refcount_bits,
+        GuestAddress(OPERATION_CONFIG_ADDR + 84),
+    )?;
+    guest_mem.write_obj(
+        probed.cluster_size,
+        GuestAddress(OPERATION_CONFIG_ADDR + 88),
+    )?;
+    guest_mem.write_obj(probed.nb_bitmaps, GuestAddress(OPERATION_CONFIG_ADDR + 92))?;
+
+    // actions[8] @96: one opcode byte per action, in CLI order. The
+    // rest of the array stays zero (page-zeroed memory).
+    for (i, action) in actions.iter().enumerate() {
+        guest_mem.write_obj(
+            action.opcode,
+            GuestAddress(OPERATION_CONFIG_ADDR + 96 + i as u64),
+        )?;
+    }
+    // _pad1 @104 stays zero.
+
+    // name[1024] @112: the target name bytes (no NUL terminator; the
+    // guest uses name_len).
+    guest_mem.write_slice(name_bytes, GuestAddress(OPERATION_CONFIG_ADDR + 112))?;
+
+    // merge_source_lens[8] @1136 (u16 each) + merge_source_pool[2048]
+    // @1152: for each merge action in order, append its source bytes
+    // to the pool and record its length in the parallel lens array.
+    let mut pool_off = 0usize;
+    let mut merge_idx = 0usize;
+    for action in actions {
+        if action.opcode != shared::BitmapConfig::ACTION_MERGE {
+            continue;
+        }
+        let src = action
+            .source
+            .as_deref()
+            .ok_or("bitmap: internal error: merge action without source")?;
+        let src_bytes = src.as_bytes();
+        assert!(pool_off + src_bytes.len() <= shared::MERGE_SOURCE_POOL);
+        guest_mem.write_obj(
+            src_bytes.len() as u16,
+            GuestAddress(OPERATION_CONFIG_ADDR + 1136 + (merge_idx * 2) as u64),
+        )?;
+        guest_mem.write_slice(
+            src_bytes,
+            GuestAddress(OPERATION_CONFIG_ADDR + 1152 + pool_off as u64),
+        )?;
+        pool_off += src_bytes.len();
+        merge_idx += 1;
+    }
+
+    debug!(
+        "Wrote bitmap config at 0x{:x} (num_actions={}, name_len={}, num_merge_sources={}, \
+         granularity={}, cluster_size={}, version={}, refcount_bits={}, virtual_size={}, \
+         autoclear=0x{:x}, incompat=0x{:x}, nb_bitmaps={}, dir_offset={}, dir_size={})",
+        OPERATION_CONFIG_ADDR,
+        num_actions,
+        name_len,
+        num_merge_sources,
+        granularity_bytes,
+        probed.cluster_size,
+        probed.current_version,
+        probed.current_refcount_bits,
+        probed.virtual_size,
+        probed.current_autoclear_features,
+        probed.current_incompatible_features,
+        probed.nb_bitmaps,
+        probed.bitmap_directory_offset,
+        probed.bitmap_directory_size,
+    );
+
+    // --- Set up the target as input-RW device at slot 0 -----------------
+    // Bitmap grows the file (add allocates table clusters, merge
+    // allocates data clusters, directory relocation allocates), so use
+    // snapshot's generous capacity hint and expose it (not the current
+    // file size) as the device capacity so the guest can write past
+    // EOF. The core unconditionally probes input device 0, which is the
+    // real (read-write) target here — no stub is needed.
+    let input_size = std::fs::metadata(filename)?.len();
+    let capacity_hint = input_size.saturating_mul(2).max(1 << 30);
+
+    let mut device_set = DeviceSet::new();
+    let mut io_events: Vec<IoEvent> = Vec::new();
+
+    let input_backing =
+        backing::BackingStore::open_rw_existing(Path::new(filename), Some(capacity_hint))?;
+    let input_mmio = device_mmio_base(0);
+    let input_vq = device_vq_base(0);
+    let input_device = VirtioBlockDevice::new(
+        input_backing,
+        capacity_hint,
+        sector_size as u64,
+        false, // read-write
+        input_mmio,
+        input_vq,
+    );
+    let input_device = Arc::new(Mutex::new(input_device));
+    device_set.add_device(Arc::clone(&input_device), true);
+    io_events.push(IoEvent::new(input_mmio)?);
+
+    let guest_mem = Arc::new(guest_mem);
+    let vmm_stats = Arc::new(Mutex::new(VmmStats::new()));
+
+    // Try to register ioeventfds; fall back to VM exits on failure.
+    let mut io_thread: Option<io_thread::IoThread> = None;
+    let mut registered_count = 0usize;
+    let mut registration_failed = false;
+    for evt in io_events.iter_mut() {
+        if let Err(e) = evt.register(&vm) {
+            debug!("ioeventfd: failed to register ({e:?}), falling back to VM exits");
+            registration_failed = true;
+            break;
+        }
+        registered_count += 1;
+    }
+    if registration_failed {
+        for evt in io_events.iter_mut().take(registered_count) {
+            let _ = evt.unregister(&vm);
+        }
+    }
+    let all_registered = !registration_failed;
+    if all_registered && !io_events.is_empty() {
+        let io_devices = device_set.create_io_devices(io_events);
+        io_thread = Some(io_thread::IoThread::new(
+            io_devices,
+            Arc::clone(&guest_mem),
+            Arc::clone(&vmm_stats),
+        ));
+    }
+
+    // --- vCPU setup ------------------------------------------------------
+    let mut vcpu = vm.create_vcpu(0)?;
+    let mut sregs = vcpu.get_sregs()?;
+    setup_sregs(&mut sregs);
+    vcpu.set_sregs(&sregs)?;
+    let mut regs = vcpu.get_regs()?;
+    setup_regs(&mut regs);
+    vcpu.set_regs(&regs)?;
+
+    // --- Serial decoders / transmitter / debug buffer -------------------
+    let mut serial_decoder = SerialDecoder::new();
+    let mut serial_transmitter = SerialTransmitter::new();
+    let mut debug_buffer = DebugBuffer::new();
+
+    // One input device; progress reporting suppressed (bitmap metadata
+    // work completes instantly).
+    let config = vmm_config_input_only(sector_size);
+    serial_transmitter.queue_config(&config);
+
+    // --- Run the vCPU loop ----------------------------------------------
+    let mut result_seen = false;
+    let mut harvested = BitmapRunResult {
+        target_format: IMAGE_FORMAT_QCOW2,
+        error: shared::BitmapResult::ERROR_OK,
+        action: 0,
+        actions_applied: 0,
+        resulting_nb_bitmaps: 0,
+    };
+    let mut vm_error: Option<String> = None;
+
+    loop {
+        match vcpu.run()? {
+            VcpuExit::Hlt => {
+                vmm_stats.lock().unwrap().record_hlt();
+                break;
+            }
+            VcpuExit::IoOut(port, data) => {
+                vmm_stats.lock().unwrap().record_io_out();
+                if port == SERIAL_PORT {
+                    for &byte in data {
+                        if let Some(msg) = serial_decoder.add_byte(byte) {
+                            if let Some(guest_::GuestMessage_::Payload::BitmapResult(b)) =
+                                &msg.payload
+                            {
+                                harvested.action = b.action;
+                                harvested.actions_applied = b.actions_applied;
+                                harvested.resulting_nb_bitmaps = b.resulting_nb_bitmaps;
+                                harvested.error = b.error;
+                                result_seen = true;
+                            } else if verbose {
+                                debug!("{}", format_message(&msg));
+                            }
+                        }
+                    }
+                } else if port == DEBUG_PORT {
+                    for &byte in data {
+                        if let Some(line) = debug_buffer.add_byte(byte) {
+                            debug!("[GUEST] {line}");
+                        }
+                    }
+                } else {
+                    debug!("IO OUT: port=0x{port:x}, data={data:?}");
+                }
+            }
+            VcpuExit::IoIn(port, data) => {
+                vmm_stats.lock().unwrap().record_io_in();
+                if port == SERIAL_PORT {
+                    for byte in data.iter_mut() {
+                        *byte = serial_transmitter.next_byte().unwrap_or(0);
+                    }
+                } else if port == SERIAL_PORT + 5 {
+                    let mut lsr = 0x60u8;
+                    if serial_transmitter.has_data() {
+                        lsr |= 0x01;
+                    }
+                    data[0] = lsr;
+                } else {
+                    for byte in data {
+                        *byte = 0;
+                    }
+                }
+            }
+            VcpuExit::MmioRead(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_read();
+                let value = device_set.mmio_read(addr);
+                write_mmio_data(data, value);
+            }
+            VcpuExit::MmioWrite(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_write();
+                let value = read_mmio_data(data);
+                if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
+                    if io_thread.is_none() && should_process {
+                        device_set.process_queue_for_device(
+                            device_index,
+                            &guest_mem,
+                            &vmm_stats,
+                        )?;
+                    }
+                }
+            }
+            VcpuExit::Shutdown => {
+                vmm_stats.lock().unwrap().record_shutdown();
+                vm_error = Some("VM shutdown (triple fault)".to_string());
+                break;
+            }
+            VcpuExit::FailEntry(reason, cpu) => {
+                vmm_stats.lock().unwrap().record_fail_entry();
+                vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
+                break;
+            }
+            exit => {
+                vmm_stats.lock().unwrap().record_unknown();
+                vm_error = Some(format!("unexpected VM exit: {exit:?}"));
+                break;
+            }
+        }
+    }
+
+    if let Some(mut thread) = io_thread {
+        thread.stop();
+    }
+
+    if log::log_enabled!(log::Level::Debug) {
+        vmm_stats.lock().unwrap().display();
+    }
+
+    if let Some(error) = vm_error {
+        return Err(error.into());
+    }
+    if !result_seen {
+        return Err("bitmap: guest did not return a result".into());
     }
     Ok(harvested)
 }
