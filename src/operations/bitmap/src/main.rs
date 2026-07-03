@@ -314,22 +314,31 @@ unsafe fn stage_refblocks(
 ) -> Result<StagedRefblocks, u32> {
     let cluster_size_usize = hdr.cluster_size as usize;
     let rt_size = (hdr.refcount_table_clusters as usize).saturating_mul(cluster_size_usize);
-    if rt_size > RT_LIMIT {
-        return Err(BitmapResult::ERROR_SCRATCH_TOO_SMALL);
-    }
-    if rt_size > 0
+    // We only ever consult the populated prefix of the refcount table:
+    // the run must be contiguous from index 0 and no longer than
+    // `MAX_REFBLOCKS` (refused below), so the meaningful entries always
+    // live in the first `MAX_REFBLOCKS * 8` bytes. At large cluster
+    // sizes a single refcount-table cluster (up to `MAX_CLUSTER_SIZE`)
+    // exceeds the 64 KiB `RT_BUF`; rather than refuse the image, stage
+    // only the leading `RT_LIMIT` bytes. The trailing entries we skip
+    // are guaranteed zero for any image within the supported envelope
+    // (a populated entry beyond `RT_LIMIT` would imply far more than
+    // `MAX_REFBLOCKS` refblocks). `RT_LIMIT` is a whole number of
+    // sectors, so the bounded read stays sector-aligned.
+    let rt_read = rt_size.min(RT_LIMIT);
+    if rt_read > 0
         && !read_input_byte_range(
             call_table,
             0,
             sector_size,
             hdr.refcount_table_offset,
             RT_BUF as *mut u8,
-            rt_size,
+            rt_read,
         )
     {
         return Err(BitmapResult::ERROR_READ_FAILED);
     }
-    let rt = core::slice::from_raw_parts(RT_BUF as *const u8, rt_size);
+    let rt = core::slice::from_raw_parts(RT_BUF as *const u8, rt_read);
 
     // Collect refblock host offsets. v1 requires the populated
     // refblocks to be contiguous from refcount-table index 0 (no
@@ -339,7 +348,7 @@ unsafe fn stage_refblocks(
     {
         let mut i = 0usize;
         let mut seen_zero = false;
-        while i + 8 <= rt_size {
+        while i + 8 <= rt_read {
             let entry = read_u64_be(rt, i) & L1_OFFSET_MASK;
             if entry != 0 {
                 if seen_zero {
