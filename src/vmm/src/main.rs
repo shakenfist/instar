@@ -2594,6 +2594,8 @@ enum Commands {
     Commit(CommitArgs),
     /// Amend an existing qcow2 image's compat version / lazy refcounts
     Amend(AmendArgs),
+    /// Manage qcow2 persistent dirty bitmaps
+    Bitmap(BitmapArgs),
     /// Emit the allocation map of a disk image
     Map(MapArgs),
     /// List, apply, create, or delete qcow2 internal snapshots
@@ -2736,6 +2738,69 @@ struct AmendArgs {
     #[arg(short = 'o', long = "options", action = clap::ArgAction::Append,
           value_name = "KEY=VALUE,...")]
     option: Vec<String>,
+}
+
+/// Arguments for `instar bitmap`. Mirrors `qemu-img bitmap`'s
+/// surface: repeatable action flags applied in CLI order, an
+/// optional `-g/--granularity` (only valid with `--add`), the
+/// target FILENAME + BITMAP positionals, and format/output
+/// selectors. See PLAN-bitmap-phase-05-host-cli.md.
+///
+/// The action flags use `ArgAction::Count` (bare toggles) and
+/// `ArgAction::Append` (`--merge`) so that `ArgMatches::indices_of`
+/// can reconstruct the exact command-line order (Open question 1);
+/// the typed fields here exist only so clap validates the surface
+/// and `--help` reads correctly.
+#[derive(Args, Debug)]
+struct BitmapArgs {
+    /// Image file.
+    filename: String,
+    /// Bitmap name.
+    bitmap: String,
+
+    /// Create a new bitmap. Repeatable; applied in CLI order.
+    #[arg(long, action = clap::ArgAction::Count)]
+    add: u8,
+    /// Delete a bitmap. Repeatable; applied in CLI order.
+    #[arg(long, action = clap::ArgAction::Count)]
+    remove: u8,
+    /// Clear a bitmap's contents. Repeatable; applied in CLI order.
+    #[arg(long, action = clap::ArgAction::Count)]
+    clear: u8,
+    /// Enable recording into a bitmap. Repeatable; applied in CLI order.
+    #[arg(long, action = clap::ArgAction::Count)]
+    enable: u8,
+    /// Disable recording into a bitmap. Repeatable; applied in CLI order.
+    #[arg(long, action = clap::ArgAction::Count)]
+    disable: u8,
+    /// Merge a source bitmap into the target. Repeatable; applied
+    /// in CLI order.
+    #[arg(long, action = clap::ArgAction::Append, value_name = "SOURCE")]
+    merge: Vec<String>,
+
+    /// Granularity in bytes for `--add` (accepts suffixes, e.g.
+    /// 64k). Only valid together with `--add`.
+    #[arg(short = 'g', long = "granularity", value_name = "BYTES")]
+    granularity: Option<String>,
+    /// Force the image format detection (qcow2 only).
+    #[arg(short = 'f', long)]
+    format: Option<String>,
+    /// Output format: human (silent on success) or json.
+    #[arg(long, default_value = "human", value_parser = ["human", "json"])]
+    output: String,
+
+    /// Not yet supported; rejected at runtime.
+    #[arg(long)]
+    object: Option<String>,
+    /// Not yet supported; rejected at runtime.
+    #[arg(long = "image-opts")]
+    image_opts: bool,
+    /// Not yet supported; rejected at runtime.
+    #[arg(short = 'b', long = "source-file", value_name = "FILE")]
+    source_file: Option<String>,
+    /// Not yet supported; rejected at runtime.
+    #[arg(short = 'F', long = "source-format", value_name = "FMT")]
+    source_format: Option<String>,
 }
 
 /// Parsed, validated `-o` options for `instar amend`. Each
@@ -3514,7 +3579,13 @@ struct ConfigArgs {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+    // This is exactly what `Cli::parse()` does internally, but keeping
+    // the `ArgMatches` around lets `run_bitmap` recover the CLI order of
+    // the repeatable `bitmap` action flags via `indices_of`. Every other
+    // subcommand is unaffected.
+    use clap::{CommandFactory, FromArgMatches};
+    let matches = <Cli as CommandFactory>::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     let verbose = cli.verbose;
 
     // Initialize logger based on --verbose flag
@@ -3539,6 +3610,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Rebase(args) => run_rebase(args, verbose),
         Commands::Commit(args) => run_commit(args, verbose),
         Commands::Amend(args) => run_amend(args, verbose),
+        Commands::Bitmap(args) => run_bitmap(&args, matches.subcommand_matches("bitmap"), verbose),
         Commands::Map(args) => run_map(args, verbose),
         Commands::Snapshot(args) => run_snapshot(args, verbose),
         Commands::Config(args) => run_config(args),
@@ -5175,6 +5247,170 @@ struct ProbedAmendTarget {
     current_compatible_features: u64,
     /// Virtual disk size in bytes.
     virtual_size: u64,
+}
+
+/// A single bitmap action recovered in command-line order.
+/// `index` is the clap `ArgMatches` position used only for sorting;
+/// `opcode` is a `BitmapConfig::ACTION_*` value; `source` is the
+/// merge source name for `ACTION_MERGE`, `None` otherwise.
+struct BitmapAction {
+    index: usize,
+    opcode: u8,
+    source: Option<String>,
+}
+
+/// Run the `instar bitmap` operation.
+///
+/// Phase 5a: parse and validate the qemu-parity CLI surface, refuse
+/// the unsupported flags, and reconstruct the ordered action list
+/// (via `ArgMatches::indices_of`, since clap derive loses cross-flag
+/// order). After validation this returns a clear "not yet wired"
+/// error; 5b wires the probe + guest launch and 5c the rendering.
+fn run_bitmap(
+    args: &BitmapArgs,
+    matches: Option<&clap::ArgMatches>,
+    _verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // a. Reject the unsupported surface up-front (resize-style).
+    if args.object.is_some() {
+        return Err("bitmap: --object is not yet supported".into());
+    }
+    if args.image_opts {
+        return Err("bitmap: --image-opts is not yet supported".into());
+    }
+    if args.source_file.is_some() || args.source_format.is_some() {
+        return Err("bitmap: cross-file merge (-b/-F) is not yet supported".into());
+    }
+
+    // b. Reconstruct the ordered action list from `indices_of`. clap
+    // derive collapses each flag into a scalar/vec and loses the
+    // interleaved command-line order, so we go back to the raw
+    // `ArgMatches` and sort every occurrence by its CLI position.
+    let m = matches.ok_or("bitmap: internal error: missing arg matches")?;
+    let mut actions: Vec<BitmapAction> = Vec::new();
+    for (name, opcode) in [
+        ("add", shared::BitmapConfig::ACTION_ADD),
+        ("remove", shared::BitmapConfig::ACTION_REMOVE),
+        ("clear", shared::BitmapConfig::ACTION_CLEAR),
+        ("enable", shared::BitmapConfig::ACTION_ENABLE),
+        ("disable", shared::BitmapConfig::ACTION_DISABLE),
+    ] {
+        // A `Count` arg is always present in `ArgMatches` (default 0),
+        // so `indices_of` yields a phantom index even when the flag was
+        // never given. Gate on the real occurrence count.
+        let count = m.get_count(name);
+        if count == 0 {
+            continue;
+        }
+        // `Count` collapses repeats: `indices_of` returns a single index
+        // for the whole group regardless of how many times the flag was
+        // passed. Anchor every occurrence at that index (repeats of the
+        // same flag carry the same opcode, so their internal order is
+        // irrelevant; the index still orders this flag relative to the
+        // other, differently-spelled action flags — which is the order
+        // qemu cares about).
+        let anchor = m.index_of(name).unwrap_or(0);
+        for _ in 0..count {
+            actions.push(BitmapAction {
+                index: anchor,
+                opcode,
+                source: None,
+            });
+        }
+    }
+    if let (Some(indices), Some(values)) = (m.indices_of("merge"), m.get_many::<String>("merge")) {
+        for (idx, src) in indices.zip(values) {
+            actions.push(BitmapAction {
+                index: idx,
+                opcode: shared::BitmapConfig::ACTION_MERGE,
+                source: Some(src.clone()),
+            });
+        }
+    }
+    actions.sort_by_key(|a| a.index);
+
+    // c. qemu-parity validation, before any work.
+    if actions.is_empty() {
+        return Err("bitmap: Need at least one of --add, --remove, --clear, \
+                    --enable, --disable, or --merge"
+            .into());
+    }
+    let has_add = actions
+        .iter()
+        .any(|a| a.opcode == shared::BitmapConfig::ACTION_ADD);
+    if args.granularity.is_some() && !has_add {
+        return Err("bitmap: granularity only supported with --add".into());
+    }
+    if actions.len() > shared::MAX_BITMAP_ACTIONS {
+        return Err("bitmap: too many actions (max 8)".into());
+    }
+    let has_merge = actions
+        .iter()
+        .any(|a| a.opcode == shared::BitmapConfig::ACTION_MERGE);
+    let has_non_merge = actions
+        .iter()
+        .any(|a| a.opcode != shared::BitmapConfig::ACTION_MERGE);
+    if has_merge && has_non_merge {
+        return Err("bitmap: mixing --merge with other actions in one \
+                    invocation is not supported"
+            .into());
+    }
+    let merge_count = actions
+        .iter()
+        .filter(|a| a.opcode == shared::BitmapConfig::ACTION_MERGE)
+        .count();
+    if merge_count > shared::MAX_MERGE_SOURCES {
+        return Err("bitmap: too many --merge sources (max 8)".into());
+    }
+
+    // d. Parse the granularity (reusing resize/create's qemu size
+    // parser) and require a power of two in [512, 2G] (log2 in [9,31]).
+    let granularity_bytes: u64 = match args.granularity.as_deref() {
+        Some(g) => {
+            let bytes = parse_qemu_img_size(g)?;
+            if bytes == 0
+                || !bytes.is_power_of_two()
+                || bytes.trailing_zeros() < 9
+                || bytes.trailing_zeros() > 31
+            {
+                return Err("bitmap: granularity must be a power of two between 512 and 2G".into());
+            }
+            bytes
+        }
+        None => 0,
+    };
+
+    // e. Validate the target bitmap name length (qcow2 names are
+    // <= 1023 bytes; BME_MAX_NAME_SIZE).
+    let name_len = args.bitmap.len();
+    if name_len == 0 || name_len > 1023 {
+        return Err("bitmap: invalid bitmap name length".into());
+    }
+
+    // f. Validate each merge source name and the total pool budget.
+    let mut merge_pool_bytes = 0usize;
+    for action in &actions {
+        if let Some(src) = &action.source {
+            let len = src.len();
+            if len == 0 || len > 1023 {
+                return Err("bitmap: invalid merge source name length".into());
+            }
+            merge_pool_bytes += len;
+        }
+    }
+    if merge_pool_bytes > shared::MERGE_SOURCE_POOL {
+        return Err("bitmap: merge source names exceed the pool budget".into());
+    }
+
+    // g. 5a stops here. The validated inputs below are what 5b/5c
+    // consume:
+    //   * `actions`            -- ordered (opcode, merge source?) list
+    //   * `granularity_bytes`  -- 0 when absent (format default)
+    //   * `args.bitmap`        -- target name (validated length)
+    // 5b: probe the qcow2 header + run_bitmap_guest (input-RW attach).
+    // 5c: render (silent human / json envelope) + host sync_all.
+    let _ = (&actions, granularity_bytes, &args.filename);
+    Err("bitmap: guest execution not yet wired (phase 5b/5c)".into())
 }
 
 /// Probe the amend target's format and header summary. Honours
