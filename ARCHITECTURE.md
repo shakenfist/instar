@@ -567,9 +567,12 @@ provides a modular architecture with:
   `bitmaps` autoclear bit while the extension is inconsistent and
   restoring it once the write settles) so a crash mid-update leaves
   the image safe rather than corrupt. Needs `/dev/kvm` (launches a
-  guest VMM). Coverage: `tests/test_bitmap.py` integration parity
-  against `qemu-img bitmap`, cross-version baselines, and fuzzing.
-  See [docs/bitmap.md](docs/bitmap.md).
+  guest VMM). The ABI appends one call-table callback
+  (`send_bitmap_result`), bumping `CallTable::VERSION` from 18 to 19
+  (same append-at-end discipline as amend's 17→18). Coverage:
+  `tests/test_bitmap.py` integration parity against `qemu-img
+  bitmap`, cross-version baselines, and fuzzing. See
+  [docs/bitmap.md](docs/bitmap.md).
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation,
@@ -932,7 +935,7 @@ A mock `CallTable` (in `src/fuzz/src/lib.rs`) backed by thread-local
 fuzzer input provides sector-based I/O, allowing libFuzzer to explore
 deeply malformed inputs.
 
-27 fuzz targets cover all parser crates: format detection, header
+29 fuzz targets cover all parser crates: format detection, header
 parsing (QCOW2, VMDK, VHD, VHDX, RAW, LUKS), L1/L2 cluster lookup,
 refcount table traversal, zlib decompression, grain directory lookup,
 BAT traversal, VHDX metadata parsing, the measure subcommand's
@@ -967,7 +970,12 @@ Finally, the dd subcommand adds `fuzz_dd_window` (the pure
 input-window math — count-clamp / skip-subtract / empty-on-overrun
 with saturating arithmetic), `fuzz_chs_rounded_size` (VHD/VHDX CHS
 geometry rounding) and `fuzz_dd_read` (the byte-accurate windowed
-qcow2 read primitives).
+qcow2 read primitives). The amend subcommand adds
+`fuzz_amend_planners`, and the bitmap subcommand adds
+`fuzz_bitmap_parse` (the qcow2 bitmap directory/table/extension
+parsers) plus `fuzz_bitmap_planners` (the bitmap crate's
+directory/action/merge functions over synthesised
+directory+refblocks).
 
 The seed corpus is extracted from `instar-testdata` by
 `scripts/extract-fuzz-corpus.py`, which filters images by format,

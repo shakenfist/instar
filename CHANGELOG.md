@@ -156,9 +156,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   applied in command-line order and the tool is silent on success.
   qcow2 v3-only. Validated against `qemu-img bitmap` by integration
   tests (`tests/test_bitmap.py`), cross-version baselines, and
-  coverage + differential fuzzing. Note that `instar resize` now
-  refuses images that carry persistent dirty bitmaps (see
-  *Changed*). See [docs/bitmap.md](docs/bitmap.md).
+  coverage + differential fuzzing. The `CallTable::VERSION` bumps
+  from 18 to 19 for the appended `send_bitmap_result` callback (same
+  append-at-end discipline as prior subcommands). Note that `instar
+  resize` now refuses images that carry persistent dirty bitmaps
+  (see *Changed*). See [docs/bitmap.md](docs/bitmap.md).
 
 - **`instar map` differential fuzzer extension (PLAN-map phase 8).**
   Adds `op_map` to `scripts/differential-fuzz.py`'s random

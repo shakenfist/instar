@@ -718,7 +718,7 @@ instar/
 │   │   ├── luks/   # LUKS header parsing, KDF, AFsplitter, decryption
 │   │   └── ...     # Per-operation planner crates (measure, create,
 │   │               # resize, rebase, commit, snapshot)
-│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, measure, create, resize, rebase, commit, map, snapshot)
+│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, measure, create, resize, rebase, commit, map, snapshot, amend, dd, bitmap)
 │   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates
 │   └── guest-protocol/ # Protocol Buffers messaging for guests

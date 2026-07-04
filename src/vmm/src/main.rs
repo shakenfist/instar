@@ -5621,6 +5621,7 @@ fn probe_bitmap_target(path: &str) -> Result<ProbedBitmapTarget, Box<dyn std::er
 
     // Autoclear word @88 (v2 images have no autoclear word; read 0).
     let current_autoclear_features = if full.len() >= qcow2::AUTOCLEAR_FEATURES_OFFSET + 8 {
+        // Infallible: the guard above proves the slice is exactly 8 bytes.
         u64::from_be_bytes(
             full[qcow2::AUTOCLEAR_FEATURES_OFFSET..qcow2::AUTOCLEAR_FEATURES_OFFSET + 8]
                 .try_into()
