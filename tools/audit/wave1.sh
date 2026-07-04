@@ -64,6 +64,21 @@ fi
 green "PASS: make test-rust"
 echo
 
+# make fuzz-build compiles every libFuzzer target (cargo fuzz build
+# --bins). The fuzz crate (src/fuzz) is OUTSIDE the main cargo
+# workspace, so `make instar` / `make test-rust` / check-rust.sh do
+# NOT build it -- a fuzz target can silently drift out of sync with a
+# workspace struct change (e.g. a new *Opts/*Config field) and only
+# fail in the coverage-fuzz CI job. Building all targets here catches
+# that class of drift before push.
+bold "=== wave 1a: make fuzz-build (all libFuzzer targets) ==="
+if ! make fuzz-build; then
+    red "FAIL: make fuzz-build (fuzz crate drifted from a workspace change?)"
+    exit 7
+fi
+green "PASS: make fuzz-build"
+echo
+
 bold "=== wave 1b: mechanical style checks ==="
 
 # 1. Long-line check: warn on Rust source lines over 120 chars in
