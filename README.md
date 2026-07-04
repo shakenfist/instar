@@ -28,13 +28,15 @@ Initial target formats:
 **Initial implementation** - The `info` prototype has been promoted to the main
 instar implementation in `src/`. Operations include `info`, `copy`, `check`,
 `compare`, `convert`, `dd`, `measure`, `create`, `resize`, `rebase`, `commit`,
-`map`, and `snapshot`. Prototypes remain available for reference.
+`map`, `snapshot`, `amend`, and `bitmap`. Prototypes remain available for
+reference.
 
 See [docs/measure.md](docs/measure.md), [docs/create.md](docs/create.md),
 [docs/resize.md](docs/resize.md), [docs/rebase.md](docs/rebase.md),
 [docs/commit.md](docs/commit.md), [docs/map.md](docs/map.md),
-[docs/snapshot.md](docs/snapshot.md), and
-[docs/amend.md](docs/amend.md) for the per-subcommand user guides.
+[docs/snapshot.md](docs/snapshot.md),
+[docs/amend.md](docs/amend.md), and
+[docs/bitmap.md](docs/bitmap.md) for the per-subcommand user guides.
 
 ## Installation
 
@@ -463,6 +465,27 @@ Changes a qcow2 image's compatibility version (`compat=0.10`/`1.1`) and/or
 the `lazy_refcounts` flag in place, rewriting only the header cluster — the
 sandboxed equivalent of `qemu-img amend`. qcow2-only. See
 [docs/amend.md](docs/amend.md) for the full reference.
+
+### QCOW2 Dirty Bitmaps
+
+```bash
+# Add an enabled, empty bitmap with the default granularity
+instar bitmap --add disk.qcow2 backup0
+
+# Add a bitmap with an explicit 64 KiB granularity
+instar bitmap --add -g 64k disk.qcow2 backup0
+
+# Remove a bitmap (and free its clusters)
+instar bitmap --remove disk.qcow2 backup0
+
+# Merge one bitmap into another within the same image
+instar bitmap --merge incremental0 disk.qcow2 full0
+```
+
+Creates, deletes, clears, enables, disables, and merges qcow2 **persistent
+dirty bitmaps** in place — the sandboxed equivalent of `qemu-img bitmap`.
+Actions are applied in command-line order and the tool is silent on success.
+qcow2 v3-only. See [docs/bitmap.md](docs/bitmap.md) for the full reference.
 
 ### Version Compatibility
 

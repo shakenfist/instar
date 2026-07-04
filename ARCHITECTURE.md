@@ -553,6 +553,23 @@ provides a modular architecture with:
   Known divergences: vhdx default block size (32 MiB vs qemu's 8
   MiB for small images), count=0 vmdk/vhdx edge cases. See
   [docs/dd.md](docs/dd.md) for the full user reference.
+- **operations/bitmap/** - qcow2 persistent-dirty-bitmap management
+  operation (PLAN-bitmap, qcow2 v3-only). The host side (`run_bitmap`
+  in `src/vmm/src/main.rs`) validates the CLI surface (the repeatable
+  CLI-order actions `--add`/`--remove`/`--clear`/`--enable`/
+  `--disable`/`--merge`, the `-g` granularity, rejected qemu-only
+  flags), pre-probes the image, and hands a `BitmapConfig` to the
+  guest op, which mutates the image in place. The pure `no_std`
+  `crates/bitmap` planner provides the bitmap directory/table/action/
+  merge logic, reusing the snapshot refcount mutators to allocate and
+  free bitmap-table clusters. The guest applies each action under the
+  crash-safe **autoclear** dance (clearing the header's
+  `bitmaps` autoclear bit while the extension is inconsistent and
+  restoring it once the write settles) so a crash mid-update leaves
+  the image safe rather than corrupt. Needs `/dev/kvm` (launches a
+  guest VMM). Coverage: `tests/test_bitmap.py` integration parity
+  against `qemu-img bitmap`, cross-version baselines, and fuzzing.
+  See [docs/bitmap.md](docs/bitmap.md).
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation,
