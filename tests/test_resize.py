@@ -672,6 +672,7 @@ class TestResizeErrorPaths(TestResizeSmoke):
                     capture_output=True, text=True, timeout=60)
             except FileNotFoundError:
                 self.skipTest('system qemu-img not installed')
+                raise AssertionError('unreachable: skipTest always raises')
 
         def _bitmap_names(path):
             r = _qemu_img('info', '--output=json', str(path))

@@ -25,7 +25,6 @@ matrix across a cluster-size spread. The bits-set merge oracle
 (7b) and the refusal suite (7c) are added in later steps.
 """
 
-import copy  # noqa: F401  (registry-style symmetry with test_amend.py)
 import json  # noqa: F401  (used by helpers/future steps)
 import os
 import shutil
@@ -408,6 +407,9 @@ class TestBitmapSmoke(InstarTestBase):
             try:
                 self._qmp_exchange(sock, {'execute': 'quit'})
             except Exception:
+                # Best-effort QMP quit; the finally block below forcibly
+                # tears the daemon and sockets down, so a failure here is
+                # intentionally ignored.
                 pass
             return coalesced
         finally:
@@ -415,6 +417,7 @@ class TestBitmapSmoke(InstarTestBase):
                 try:
                     sock.close()
                 except Exception:
+                    # Best-effort socket close during teardown; ignored.
                     pass
             if daemon is not None:
                 try:
@@ -425,6 +428,7 @@ class TestBitmapSmoke(InstarTestBase):
                     try:
                         daemon.wait(timeout=5)
                     except Exception:
+                        # Best-effort final reap after kill; ignored.
                         pass
             shutil.rmtree(tmpd, ignore_errors=True)
 
