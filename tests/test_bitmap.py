@@ -635,6 +635,81 @@ class TestBitmapMergeBits(TestBitmapSmoke):
                 [(0, 128 * 1024), (1024 * 1024, 64 * 1024)],
                 'oracle read-back did not match the seeded writes')
 
+    def test_merge_multi_source_union(self):
+        """Multi-source `--merge srcA --merge srcB` in ONE invocation.
+
+        Regression for the host merge-collapse bug (PR #386 finding #1):
+        the host used to emit one action per `--merge`, making
+        `num_actions == N`, which the guest refuses (it requires
+        `num_actions == 1` and loops over `num_merge_sources`). A single
+        invocation with two sources must now succeed and produce the
+        UNION of both sources' bits in the destination.
+
+        Seed two source bitmaps with DISJOINT dirty ranges at the same
+        granularity, add an empty dest, then run the two-source merge on
+        an instar copy (A) and a qemu copy (B); assert instar exit 0
+        (NOT the old refusal), qemu-img check clean, bitmaps metadata
+        equivalent, and dst extents(A) == extents(B) == the union.
+        """
+        self._require_kvm()
+
+        src_a_writes = [(0, 64 * 1024)]
+        src_b_writes = [(1024 * 1024, 64 * 1024)]
+        expected_union = [(0, 64 * 1024), (1024 * 1024, 64 * 1024)]
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            start = td / 'start.qcow2'
+            self._qemu_create(start, cluster_size=_G, size='4M')
+
+            # Seed each source (add + writes + DISABLE) BEFORE adding the
+            # empty dst, so no seed write can dirty another bitmap's auto
+            # recording. Disjoint ranges + same granularity.
+            self._seed_bitmap(start, 'srcA', src_a_writes, granularity=_G)
+            self._seed_bitmap(start, 'srcB', src_b_writes, granularity=_G)
+            self._seed_bitmap(start, 'dst', [], granularity=_G)
+
+            path_a = td / 'a.qcow2'  # instar
+            path_b = td / 'b.qcow2'  # qemu
+            shutil.copy2(start, path_a)
+            shutil.copy2(start, path_b)
+
+            _, i_err, i_rc = self.run_instar_bitmap(
+                '--merge', 'srcA', '--merge', 'srcB', str(path_a), 'dst')
+            self.assertEqual(
+                i_rc, 0,
+                f'instar multi-source --merge should succeed (not the old '
+                f'refusal); stderr={i_err!r}')
+
+            _, q_err, q_rc = self._qemu_bitmap(
+                '--merge', 'srcA', '--merge', 'srcB', str(path_b), 'dst')
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img multi-source --merge failed: {q_err!r}')
+
+            # instar output must pass qemu-img check.
+            _, chk_err, chk_rc = self.run_qemu_img_check(path_a)
+            self.assertEqual(
+                chk_rc, 0,
+                f'qemu-img check failed on instar output: {chk_err}')
+
+            # Bitmaps metadata equivalence (qemu-vs-qemu, sorted).
+            self.assert_bitmaps_equivalent(
+                path_a, path_b, msg='multi-source merge metadata')
+
+            # THE actual merged bits: dst extents must match qemu AND the
+            # independently-computed expected union of both sources.
+            ext_a = self._bitmap_dirty_extents(path_a, 'dst')
+            ext_b = self._bitmap_dirty_extents(path_b, 'dst')
+            self.assertEqual(
+                ext_a, ext_b,
+                f'multi-source merged dst extents diverge from qemu:\n'
+                f'  instar A: {ext_a}\n  qemu   B: {ext_b}')
+            self.assertEqual(
+                ext_a, expected_union,
+                f'multi-source merged dst extents wrong:\n'
+                f'  got:      {ext_a}\n  expected: {expected_union}')
+
 
 def _make_merge_bits_test(name, spec):
     """Factory: one bits-set merge differential test per variant."""
@@ -816,6 +891,30 @@ class TestBitmapRefusals(TestBitmapSmoke):
                 f'instar should refuse no-action invocation; '
                 f'stderr={stderr!r}')
             self.assertIn('Need at least one of --add', stderr,
+                          f'unexpected stderr: {stderr!r}')
+
+    def test_too_many_merge_sources_refused(self):
+        """More than 8 `--merge` sources is refused host-side.
+
+        Regression for PR #386 finding #2: before the merge-collapse fix
+        each `--merge` was a separate action, so the generic `too many
+        actions (max 8)` guard fired first and the per-source
+        `MAX_MERGE_SOURCES` limit was unreachable. Now a merge is ONE
+        action carrying N sources, so 9 sources must hit the dedicated
+        `too many --merge sources` message. Host-side; needs no /dev/kvm.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            img = Path(td) / 'img.qcow2'
+            self._qemu_create(img)
+            merge_flags = []
+            for i in range(9):
+                merge_flags += ['--merge', f'src{i}']
+            _, stderr, rc = self.run_instar_bitmap(
+                *merge_flags, str(img), 'dst')
+            self.assertNotEqual(
+                rc, 0,
+                f'instar should refuse 9 --merge sources; stderr={stderr!r}')
+            self.assertIn('too many --merge sources', stderr,
                           f'unexpected stderr: {stderr!r}')
 
     def test_granularity_without_add_refused(self):

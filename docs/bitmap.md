@@ -192,6 +192,21 @@ allowlist `KNOWN_BITMAP_DIFFERENTIAL_DIVERGENCES` in
   implemented: `instar info` reports no bitmaps array. To inspect an
   image's bitmaps, use `qemu-img info --output=json` and read
   `format-specific.data.bitmaps`.
+- **Interleaved repeats of the *same* action flag may not preserve CLI
+  order.** The metadata action flags (`--add`, `--remove`, `--clear`,
+  `--enable`, `--disable`) use clap's `ArgAction::Count`, which collapses
+  all repeats of a given flag to a single command-line position.
+  Consequently a sequence that interleaves repeats of one flag around a
+  differently-spelled flag — e.g. `--add --remove --add` — is
+  reconstructed by relative flag position rather than exact
+  per-occurrence order (it becomes `add, add, remove`). Because every
+  action in an invocation targets the **same** bitmap name, such
+  interleaving is degenerate and rarely meaningful; non-interleaved
+  orderings (each flag appearing once, or repeats kept contiguous) are
+  preserved and match `qemu-img`. This is a reconstruction limitation,
+  not a refusal, so it is not in the refusal registry. Empirically
+  verified against clap 4.6.1 (see the `clap_count_indices_tests`
+  behaviour-pinning unit tests in `src/vmm/src/main.rs`).
 
 ## Interaction with other subcommands
 

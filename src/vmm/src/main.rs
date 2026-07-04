@@ -5251,22 +5251,31 @@ struct ProbedAmendTarget {
 
 /// A single bitmap action recovered in command-line order.
 /// `index` is the clap `ArgMatches` position used only for sorting;
-/// `opcode` is a `BitmapConfig::ACTION_*` value; `source` is the
-/// merge source name for `ACTION_MERGE`, `None` otherwise.
+/// `opcode` is a `BitmapConfig::ACTION_*` value.
+///
+/// Note on `--merge`: all `--merge` occurrences in one invocation
+/// collapse into exactly ONE `ACTION_MERGE` entry (anchored at the
+/// first `--merge`'s CLI index). The ordered list of source names is
+/// carried separately (see `merge_sources` in `run_bitmap`) and fed to
+/// the guest via `num_merge_sources` + the merge-source pool. The guest
+/// treats a multi-source merge as a single logical action that applies
+/// each source sequentially, so `num_actions` for a merge invocation is
+/// always 1.
 struct BitmapAction {
     index: usize,
     opcode: u8,
-    source: Option<String>,
 }
 
 /// Run the `instar bitmap` operation.
 ///
 /// Parses and validates the qemu-parity CLI surface, refuses the
 /// unsupported flags, and reconstructs the ordered action list (via
-/// `ArgMatches::indices_of`, since clap derive loses cross-flag
-/// order). Probes the qcow2 header, launches the bitmap guest over an
-/// input-RW attach, maps any structured guest error to a message,
-/// fsyncs on success, and renders (silent by default, json opt-in).
+/// `ArgMatches` positions, since clap derive loses cross-flag order).
+/// All `--merge` occurrences collapse into ONE `ACTION_MERGE` action
+/// with the source names carried out-of-band (see `merge_sources`).
+/// Probes the qcow2 header, launches the bitmap guest over an input-RW
+/// attach, maps any structured guest error to a message, fsyncs on
+/// success, and renders (silent by default, json opt-in).
 fn run_bitmap(
     args: &BitmapArgs,
     matches: Option<&clap::ArgMatches>,
@@ -5303,30 +5312,51 @@ fn run_bitmap(
         if count == 0 {
             continue;
         }
-        // `Count` collapses repeats: `indices_of` returns a single index
-        // for the whole group regardless of how many times the flag was
-        // passed. Anchor every occurrence at that index (repeats of the
-        // same flag carry the same opcode, so their internal order is
-        // irrelevant; the index still orders this flag relative to the
-        // other, differently-spelled action flags — which is the order
-        // qemu cares about).
+        // Known divergence (BUG #3, documented in docs/bitmap.md):
+        // `ArgAction::Count` collapses repeats — `indices_of` returns a
+        // single index for the whole group regardless of how many times
+        // the flag was passed (empirically verified against clap 4.6.1;
+        // see the `clap_count_indices_probe` test). So we anchor every
+        // occurrence at that one index. Repeats of the SAME flag carry
+        // the same opcode, so their internal order is irrelevant; the
+        // index still orders this flag relative to the other,
+        // differently-spelled action flags. The one case this cannot
+        // reconstruct is an *interleaved repeat* of one flag around a
+        // different flag (e.g. `--add --remove --add`), which would
+        // misorder. Since every action targets the SAME bitmap name,
+        // such interleaving is degenerate; qemu-img parity for the
+        // common (non-interleaved) orderings is preserved.
         let anchor = m.index_of(name).unwrap_or(0);
         for _ in 0..count {
             actions.push(BitmapAction {
                 index: anchor,
                 opcode,
-                source: None,
             });
         }
     }
+    // Collect ALL `--merge` sources in CLI order into a separate list.
+    // A multi-source merge is ONE logical action for the guest (it
+    // applies each source sequentially into the dest via
+    // num_merge_sources), so we emit exactly ONE `ACTION_MERGE` entry
+    // anchored at the FIRST `--merge`'s CLI index and carry the source
+    // names out-of-band. Emitting one action per `--merge` (the prior
+    // bug) made `num_actions == N`, which the guest refuses (it requires
+    // `num_actions == 1` for any merge).
+    let mut merge_sources: Vec<String> = Vec::new();
+    let mut first_merge_index: Option<usize> = None;
     if let (Some(indices), Some(values)) = (m.indices_of("merge"), m.get_many::<String>("merge")) {
         for (idx, src) in indices.zip(values) {
-            actions.push(BitmapAction {
-                index: idx,
-                opcode: shared::BitmapConfig::ACTION_MERGE,
-                source: Some(src.clone()),
-            });
+            if first_merge_index.is_none() {
+                first_merge_index = Some(idx);
+            }
+            merge_sources.push(src.clone());
         }
+    }
+    if let Some(idx) = first_merge_index {
+        actions.push(BitmapAction {
+            index: idx,
+            opcode: shared::BitmapConfig::ACTION_MERGE,
+        });
     }
     actions.sort_by_key(|a| a.index);
 
@@ -5356,11 +5386,10 @@ fn run_bitmap(
                     invocation is not supported"
             .into());
     }
-    let merge_count = actions
-        .iter()
-        .filter(|a| a.opcode == shared::BitmapConfig::ACTION_MERGE)
-        .count();
-    if merge_count > shared::MAX_MERGE_SOURCES {
+    // A merge invocation is now a single `ACTION_MERGE` action carrying
+    // `merge_sources.len()` sources, so the generic MAX_BITMAP_ACTIONS
+    // guard above no longer masks this per-source limit.
+    if merge_sources.len() > shared::MAX_MERGE_SOURCES {
         return Err("bitmap: too many --merge sources (max 8)".into());
     }
 
@@ -5390,14 +5419,12 @@ fn run_bitmap(
 
     // f. Validate each merge source name and the total pool budget.
     let mut merge_pool_bytes = 0usize;
-    for action in &actions {
-        if let Some(src) = &action.source {
-            let len = src.len();
-            if len == 0 || len > 1023 {
-                return Err("bitmap: invalid merge source name length".into());
-            }
-            merge_pool_bytes += len;
+    for src in &merge_sources {
+        let len = src.len();
+        if len == 0 || len > 1023 {
+            return Err("bitmap: invalid merge source name length".into());
         }
+        merge_pool_bytes += len;
     }
     if merge_pool_bytes > shared::MERGE_SOURCE_POOL {
         return Err("bitmap: merge source names exceed the pool budget".into());
@@ -5413,6 +5440,7 @@ fn run_bitmap(
         &args.filename,
         &probed,
         &actions,
+        &merge_sources,
         granularity_bytes,
         &args.bitmap,
         sector_size,
@@ -6197,6 +6225,7 @@ fn run_bitmap_guest(
     filename: &str,
     probed: &ProbedBitmapTarget,
     actions: &[BitmapAction],
+    merge_sources: &[String],
     granularity_bytes: u64,
     target_name: &str,
     sector_size: u32,
@@ -6272,10 +6301,10 @@ fn run_bitmap_guest(
     //   1152: merge_source_pool              [u8; 2048]
     //   3200: _reserved                      [u8; 384]
     let num_actions = actions.len() as u32;
-    let num_merge_sources = actions
-        .iter()
-        .filter(|a| a.opcode == shared::BitmapConfig::ACTION_MERGE)
-        .count() as u32;
+    // A merge invocation collapses to ONE `ACTION_MERGE` action carrying
+    // `merge_sources.len()` sources; `merge_sources` is empty for a
+    // metadata-only invocation.
+    let num_merge_sources = merge_sources.len() as u32;
     let name_bytes = target_name.as_bytes();
     let name_len = name_bytes.len();
     // These bounds were already enforced by run_bitmap's validation;
@@ -6351,18 +6380,12 @@ fn run_bitmap_guest(
     guest_mem.write_slice(name_bytes, GuestAddress(OPERATION_CONFIG_ADDR + 112))?;
 
     // merge_source_lens[8] @1136 (u16 each) + merge_source_pool[2048]
-    // @1152: for each merge action in order, append its source bytes
-    // to the pool and record its length in the parallel lens array.
+    // @1152: append each merge source's bytes to the pool in CLI order
+    // and record its length in the parallel lens array. The guest reads
+    // `num_merge_sources` entries and applies each source sequentially
+    // into the dest bitmap as one logical merge.
     let mut pool_off = 0usize;
-    let mut merge_idx = 0usize;
-    for action in actions {
-        if action.opcode != shared::BitmapConfig::ACTION_MERGE {
-            continue;
-        }
-        let src = action
-            .source
-            .as_deref()
-            .ok_or("bitmap: internal error: merge action without source")?;
+    for (merge_idx, src) in merge_sources.iter().enumerate() {
         let src_bytes = src.as_bytes();
         assert!(pool_off + src_bytes.len() <= shared::MERGE_SOURCE_POOL);
         guest_mem.write_obj(
@@ -6374,7 +6397,6 @@ fn run_bitmap_guest(
             GuestAddress(OPERATION_CONFIG_ADDR + 1152 + pool_off as u64),
         )?;
         pool_off += src_bytes.len();
-        merge_idx += 1;
     }
 
     debug!(
@@ -16963,5 +16985,66 @@ mod dd_operand_tests {
         .unwrap();
         assert_eq!(p.input_format.as_deref(), Some("qcow2"));
         assert_eq!(p.output_format.as_deref(), Some("raw"));
+    }
+}
+
+#[cfg(test)]
+mod clap_count_indices_tests {
+    //! Behaviour-pinning tests for `ArgMatches::indices_of` on
+    //! `ArgAction::Count` flags. These document WHY BUG #3 (interleaved
+    //! repeated action flags, e.g. `--add --remove --add`) cannot be
+    //! reconstructed via `indices_of` and is instead documented as a
+    //! known divergence (see docs/bitmap.md "Known divergences").
+    //!
+    //! Empirically verified against clap 4.6.1:
+    //!   * A `Count` flag passed N times yields a SINGLE collapsed index
+    //!     from `indices_of` (not one per occurrence), so per-occurrence
+    //!     CLI order relative to other flags is unrecoverable.
+    //!   * An ABSENT `Count` flag still yields a phantom index from
+    //!     `indices_of` (Some, not None), so `get_count() > 0` gating is
+    //!     required.
+    //!
+    //! If a future clap version changes either behaviour these tests
+    //! fail, prompting a revisit of the BUG #3 workaround.
+    use super::*;
+    use clap::CommandFactory;
+
+    fn bitmap_matches(argv: &[&str]) -> clap::ArgMatches {
+        let m = <Cli as CommandFactory>::command().get_matches_from(argv);
+        m.subcommand_matches("bitmap").unwrap().clone()
+    }
+
+    #[test]
+    fn count_flag_repeats_collapse_to_single_index() {
+        // `--add` twice, interleaved around `--remove`.
+        let m = bitmap_matches(&[
+            "instar",
+            "bitmap",
+            "img.qcow2",
+            "bm",
+            "--add",
+            "--remove",
+            "--add",
+        ]);
+        assert_eq!(m.get_count("add"), 2, "two --add occurrences counted");
+        let add_indices: Vec<usize> = m.indices_of("add").into_iter().flatten().collect();
+        // The two occurrences collapse to ONE index -> cannot reconstruct
+        // interleaved order. This is the root cause of BUG #3.
+        assert_eq!(
+            add_indices.len(),
+            1,
+            "Count collapses repeats to a single index; got {add_indices:?}"
+        );
+    }
+
+    #[test]
+    fn absent_count_flag_yields_phantom_index() {
+        let m = bitmap_matches(&["instar", "bitmap", "img.qcow2", "bm", "--add"]);
+        assert_eq!(m.get_count("clear"), 0, "--clear absent");
+        // Phantom: indices_of is Some even though the flag was never given.
+        assert!(
+            m.indices_of("clear").is_some(),
+            "absent Count flag still yields a phantom index; gate on get_count() > 0"
+        );
     }
 }

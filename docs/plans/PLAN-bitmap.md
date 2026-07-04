@@ -578,6 +578,16 @@ Obvious extensions deferred from v1:
   subcommand after bitmap that adds a call-table sender may force
   another memory-map budget lift (move `OPERATION_LOAD_ADDR`), a
   loader/layout change affecting every guest binary.
+* **Batch merge per-entry I/O (scalability).** PR #386 review finding
+  #4 (CONSIDER, non-blocking): the guest merge path (`run_merge` /
+  `write_back_merge` in `src/operations/bitmap/src/main.rs`) processes
+  bitmap table entries one at a time, issuing a read/modify/write per
+  entry. This is correct and fine for typical bitmap tables, but scales
+  poorly for very large or externally-created bitmap tables with many
+  entries. A v2 could batch contiguous entry I/O (coalesce adjacent
+  cluster reads/writes) to reduce the number of guest<->host round
+  trips. Correctness-neutral; purely a throughput improvement for the
+  large-table case.
 
 ### Bugs fixed during this work
 
