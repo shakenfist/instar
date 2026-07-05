@@ -25,3 +25,4 @@
 - PLAN-amend.md: instar amend subcommand
 - PLAN-dd.md: instar dd subcommand
 - PLAN-bitmap.md: instar bitmap subcommand
+- PLAN-bench.md: instar bench subcommand
