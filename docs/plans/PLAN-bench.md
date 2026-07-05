@@ -335,10 +335,10 @@ qemu 10.0.8/master behaviour.
    refcount increment, file growth) against an *existing* image —
    machinery that exists today only inside the commit op's
    overlay-into-backing path and the bitmap/snapshot metadata
-   allocators. **Phase 1 must assess how much of the commit path
-   (or `crates/snapshot`'s allocator + `crates/bitmap`'s patterns)
-   is reusable as a "write virtual range with allocation"
-   primitive.** If cheap: v1 ships `-w` for raw + qcow2 (the two
+   allocators. **Assessed in step 1d — see 'Findings:
+   allocating-write reuse' under Administration and logistics.**
+   Decision at master-plan review before Phase 5 is planned. If
+   cheap: v1 ships `-w` for raw + qcow2 (the two
    formats real bench invocations use — the Ceph example is
    `-w` on qcow2). If not: v1 ships `-w` raw-only, qcow2 write
    becomes its own follow-up, and the plan's phase table is
@@ -645,6 +645,149 @@ Obvious extensions deferred from v1:
 * **A host-path measurement mode** (explicit instar-only flag), if
   a concrete need to separate sandbox overhead from file-I/O cost
   appears (Open question 9 decided v1 is guest-only).
+
+### Findings: allocating-write reuse for `-w` on qcow2 (OQ4, step 1d)
+
+Investigation-only reading of the commit op end-to-end
+(`src/operations/commit/src/main.rs`, `src/crates/commit/`), the
+snapshot allocator/refcount machinery (`src/crates/snapshot/`),
+the bitmap guest op's staged-write pattern
+(`src/operations/bitmap/src/main.rs`), and convert's fresh-image
+writer for contrast. **Verdict: reuse is real and cheap.** There
+is no single callable "write N bytes at virtual offset X with
+allocation" function today, but every constituent primitive
+already exists as pure `no_std` code and is already reused across
+commit / snapshot / bitmap / check. The commit guest op at
+`src/operations/commit/src/main.rs:665-785` is a working,
+tested, end-to-end inlined composition of exactly the
+allocate-on-write sequence `-w` needs (allocate + zero an L2
+table if the L1 slot is empty, allocate a data cluster if the L2
+slot is empty, write the data, set both `OFLAG_COPIED` flags,
+then flush metadata in dependency order). It differs from bench
+only in that it *copies overlay cluster data* rather than filling
+a pattern buffer, and targets a *separate backing device* rather
+than the image under test. Lifting that sequence into the bench
+write loop is medium effort with **zero new I/O ABI**.
+
+| Machinery | Reusable for bench `-w`? | Evidence (file:line) | Notes |
+|-----------|--------------------------|----------------------|-------|
+| **commit planner path** | **Yes** — as the working template plus its pure allocator + offset helpers | pure allocator `allocate_backing_cluster_qcow2` `src/crates/commit/src/qcow2.rs:219-280`; L2 disk-offset math `overlay_l2_byte_offset_qcow2` `:296-298`; refcount disk-offset math `overlay_refcount_byte_offset_qcow2` `:313-321`; the inlined allocate-on-write loop (L2-table alloc, data-cluster alloc, data write, COPIED flags) `src/operations/commit/src/main.rs:711-785`; metadata flush ordering `:787-834` | Allocator claims free entries only inside *existing* refcount blocks — `RefcountExhausted` when full (`qcow2.rs:279`); never grows the refcount table. File growth is implicit (a `write_output_sector` past EOF extends the file). The allocator is welded into `Qcow2CommitOpts`/`Qcow2CommitContext`, which require *both* overlay and backing headers — the guest-op composition, not the crate API, is what bench copies. |
+| **snapshot allocator / refcount mutators** | **Yes** — best-factored, already a shared pure API | first-fit allocator with contiguous-run + `AllocCursor` + `host_refblocks_start` basis `src/crates/snapshot/src/qcow2.rs:344-435`; `alloc_cluster_in_refblocks` wrapper `:299-316`; refcount accessors `read_refcount_in_block` `:51` / `set_refcount_in_block` `:152` / overflow check `check_refcount_after_addend` `:239`; COPIED-flag rewriters `rewrite_l1_entry_copied_flag` `:450-483` / `rewrite_l2_entry_copied_flag` (handles extended-L2 16-byte stride) `:495-532`; two-pass dry-run-then-apply `update_snapshot_refcount` `:764-876`, `dry_run_refcount_pass` `:968-1093`, `apply_refcount_pass` `:1098-1206` | `refcount_bits == 16` only (`:353-355`); "Refcount-table growth is a separate concern" (`:341-343`, `RefcountExhausted` `:434`). Every current consumer allocates only *metadata* clusters pointed at by a header/table field — **never a data cluster wired into an active L2 entry**. That wiring is the one genuinely net-new piece. |
+| **bitmap staging pattern** | **Yes** — the closest precedent for bench's RW-attach + flush model (OQ5) | reuses snapshot's allocator verbatim: imports `alloc_contiguous_clusters_in_refblocks, set_refcount_in_block, AllocCursor` `src/operations/bitmap/src/main.rs:75`; RW-input attach + `read_input_sector`/`write_input_sector`/`fsync_input` `:48-49,:249,:258`; `fsync_input(0)` as the write barrier between metadata groups `:1272,:1304,:1316,:1326`; shared `AllocCursor`/refblocks buffer + double-buffered directory `:17,:951,:1213,:1715-1717`; refuses `refcount_bits != 16` `:521-523`; crate-side allocation `src/crates/bitmap/src/action.rs:346-353` | Confirms the RW-input-slot-0 + `fsync_input` idiom that OQ5 leans toward works with zero new I/O ABI. Like snapshot it only allocates table (metadata) clusters. |
+| **convert writer** | **No** — fresh-image only | linear bump allocator `let mut next_free` "Linear cluster allocator. Cluster 0 is the header." `src/operations/convert/src/main.rs:2369-2371`, bumped per L2/data cluster `:2487-2495` | Writes a *brand-new* qcow2 in one linear pass: no free-cluster search, no read-modify-write of an existing L2/refcount, never touches a pre-existing allocation. Structurally inapplicable to in-place writes into an existing image. |
+
+**(a) Callable primitive today?** No. Only per-op inlined
+compositions. The full allocate-on-write sequence is assembled in
+exactly one place — the commit guest op
+(`src/operations/commit/src/main.rs:711-785`) — and it is bound
+to commit's overlay→backing copy (its `Qcow2CommitOpts` demand
+both headers). `crates/snapshot` exposes the cleanest *pure*
+pieces (allocator, refcount two-pass, COPIED rewriters) but only
+ever assembles them for metadata allocation.
+
+**(b) Directly reusable vs net-new.** Directly reusable: the
+free-cluster allocator (prefer snapshot's
+`alloc_contiguous_clusters_in_refblocks` — it already supports
+contiguous runs for a bufsize>cluster split and carries an
+`AllocCursor`); the refcount-block RMW accessors + overflow
+check; the L1/L2 disk-offset math
+(`overlay_l2_byte_offset_qcow2`,
+`overlay_refcount_byte_offset_qcow2`); the COPIED-flag rewriters;
+and the call-table I/O primitives — `read_output_sector` /
+`write_output_sector` (commit's backing model) **and**
+`read_input_sector` / `write_input_sector` / `fsync_input`
+(bitmap's RW-input model) all already exist, so either attach
+posture works with **no new ABI**. Net-new: (1) the small driver
+that, per virtual offset, reads the active L1, allocates+zeros an
+L2 table when the L1 slot is empty, allocates a data cluster when
+the L2 slot is empty, writes the pattern, and sets both COPIED
+flags — i.e. commit's loop specialized to one target image
+writing a pattern; (2) the overwrite-in-place fast path
+(allocated + COPIED ⇒ write data only, no metadata touch) —
+trivial but not pre-written, because commit always allocates; (3)
+staging the *target's own* refcount table/blocks into guest
+scratch (commit stages the backing's — the host pre-read plumbing
+is directly analogous); (4) **sub-cluster RMW inside a
+freshly-allocated cluster** — commit always writes a whole
+`cluster_size` slice, but bench's default bufsize is 4096 bytes
+(smaller than a 64 KiB cluster), so a bench write that allocates
+a new cluster must zero-fill it and write the pattern at the
+correct in-cluster offset (`write_output_byte_range` already does
+sub-*sector* RMW; the cluster-level zero-then-patch is the new
+bit); (5) **copy-on-write / `OFLAG_COPIED` handling** — commit
+blind-overwrites an existing backing cluster without checking
+COPIED (`src/operations/commit/src/main.rs:761-762`) because it
+assumes unique ownership; a general write into an image with
+internal snapshots (refcount > 1, not COPIED) would corrupt the
+snapshot, so bench must either COW or (v1, simpler) gate such
+images out.
+
+**(c) Inherited limitations, and the bench v1 gates.** Yes — reuse
+inherits the sister mutators' exact envelope: `refcount_bits ==
+16` only (commit `src/crates/commit/src/qcow2.rs:137-139,223-225`;
+snapshot `src/crates/snapshot/src/qcow2.rs:353-355`; bitmap
+`src/operations/bitmap/src/main.rs:521-523`); **no refcount-table
+growth and no new refcount-block append** — allocation only
+claims free entries inside the already-existing refcount blocks
+and returns `RefcountExhausted` when they are full (commit
+`qcow2.rs:279`; snapshot `qcow2.rs:341-343,434`). This is
+acceptable for bench v1. `bench -w` would adopt the **union of the
+commit/snapshot gates**: refuse external-data-file, LUKS /
+encryption, compression, dirty/corrupt, extended-L2 (commit
+`src/operations/commit/src/main.rs:489-492`), and `refcount_bits
+!= 16`; **plus one gate the sister ops do not carry — refuse
+images with internal snapshots (`nb_snapshots > 0`)**, because
+bench overwrites in place and commit's blind-overwrite
+(`main.rs:761-762`, no COPIED check) would corrupt clusters
+shared with a snapshot. Surface `RefcountExhausted` as a clean
+"image too large for in-place bench write" refusal. Practical bound: one
+16-bit refcount block on a 64 KiB-cluster image covers 32768
+clusters = 2 GiB of address space, so the no-table-growth limit
+only bites when the write set exceeds the image's existing
+refcount coverage — a documented caveat, not a common failure.
+Refusing the same images the other mutators refuse is the right
+posture (master plan leaned yes; confirmed).
+
+**(d) Phase-5 shape.** Option **(i) reuse-and-compose inside the
+bench guest op — medium effort.** The mechanism already exists as
+a working, tested composition (commit `main.rs:711-785`); Phase 5
+lifts that sequence into the bench write loop, retargets it from
+backing→single image, swaps "read overlay cluster" for "fill the
+pattern buffer", adds the trivial overwrite-in-place branch, and
+reuses snapshot's allocator / refcount / COPIED primitives
+verbatim. A new `crates/bench-write` mini-planner (option ii,
+high effort) is **not warranted** — the pure math already lives in
+`crates/snapshot` and `crates/commit`; bench needs a guest-op
+composition, not another pure crate. Deferring qcow2 `-w` (option
+iii) is unnecessary. Main risk: metadata-write **atomicity
+ordering** — the data cluster must be durable (`fsync_input`)
+before the L2/L1 pointer that makes it reachable, with refcount
+blocks flushed last — must mirror commit's proven order
+(`main.rs:787-834`) or a crash mid-bench could corrupt the image;
+since `-w` is explicitly destructive and copies commit's ordering
+this is a code-review concern, not a design risk. Secondary risk:
+staging the target's own refcount table into the guest scratch
+budget for large images, bounded exactly as snapshot/bitmap bound
+theirs (`MAX_REFBLOCKS` / `REFBLOCKS_LIMIT`).
+
+**Recommendation for Phase 5: ship qcow2 `-w` in v1 via option
+(i) — reuse-and-compose the commit guest op's allocate-on-write
+sequence in the bench write loop, backed by `crates/snapshot`'s
+allocator + refcount + COPIED-flag primitives, gated to the same
+images the sister mutators refuse (`refcount_bits == 16`, no
+compression / extended-L2 / external-data / LUKS / dirty-corrupt)
+with `RefcountExhausted` surfaced as a clean refusal. Medium
+effort, no new ABI, no new crate; keep Phase 5 at high effort only
+for the crash-atomicity ordering review.**
+
+vmdk / vhd / vhdx (falls out for free, future work either way):
+commit already carries a vmdk in-place grain allocator analogue
+(`allocate_backing_grain_vmdk`, `VmdkCommitContext` in
+`src/crates/commit/src/vmdk.rs`), so an allocating write into an
+existing vmdk monolithicSparse image is demonstrably feasible;
+vhd/vhdx have no in-place allocating-write machinery anywhere in
+the tree. All three stay out of scope for bench `-w` v1 per the
+master plan.
 
 ### Bugs fixed during this work
 
