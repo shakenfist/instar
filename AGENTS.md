@@ -17,7 +17,7 @@ instar/
 │   ├── core/       # Core guest initialization
 │   ├── crates/     # Shared format crates (qcow2, raw, vmdk, vhd, vhdx, luks)
 │   ├── shared/     # Shared library code (byte-order helpers, configs)
-│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, dd, measure, create, resize, rebase, commit, map, snapshot)
+│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, dd, measure, create, resize, rebase, commit, map, snapshot, amend, bitmap)
 │   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates (guest-protocol)
 ├── prototypes/     # Experimental implementations (11 KVM prototypes)
@@ -147,6 +147,17 @@ vhdx (VHDX), luks (info + convert with decryption)
   if=INPUT of=OUTPUT [bs=N] [count=N] [skip=N]` — qemu-img dd
   compatible (name=value operands, -O defaults to raw); reuses
   `convert.bin` via a windowed `ConvertConfig` with dense output.
+- `bitmap`: manage a qcow2 image's persistent dirty bitmaps —
+  `--add`/`--remove`/`--clear`/`--enable`/`--disable`/`--merge
+  SOURCE` (repeatable, applied in command-line order), plus `-g`
+  granularity and `--output {human,json}` — the sandboxed
+  equivalent of `qemu-img bitmap`. qcow2 v3-only; runs in the KVM
+  guest (needs `/dev/kvm`). The pure `no_std` planner lives in
+  `src/crates/bitmap` (directory/table/action/merge logic, reusing
+  the snapshot refcount mutators). Covered by `tests/test_bitmap.py`
+  integration parity against `qemu-img bitmap`, cross-version
+  baselines, and coverage + differential fuzzing. See
+  [docs/bitmap.md](docs/bitmap.md).
 
 ## Working on This Project
 

@@ -40,6 +40,10 @@ It performs (and exits non-zero on any failure):
 - `make check-binary-sizes` (384KB-per-operation cap)
 - `make test-rust` (workspace unit tests, excluding the
   no_main guest binaries)
+- `make fuzz-build` (compiles every libFuzzer target; the
+  `src/fuzz` crate is outside the main workspace, so this
+  catches a fuzz target drifting out of sync with a
+  workspace struct change before it fails in coverage-fuzz CI)
 - mechanical style checks: lines wrapped at 120
   characters in changed Rust files, no large inline
   scripts in CI workflow steps (advisory), single
@@ -55,6 +59,7 @@ Exit codes:
 | 3    | `make instar` failed             |
 | 4    | binary size cap exceeded         |
 | 5    | `make test-rust` failed          |
+| 7    | `make fuzz-build` failed          |
 
 If wave 1 fails, fix the cause and re-run before
 spending on wave 2.

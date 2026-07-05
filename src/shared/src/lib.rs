@@ -980,6 +980,13 @@ pub struct CallTable {
     /// code. Appended at the end of `CallTable` for the same
     /// back-compat reason as `send_rebase_result`.
     pub send_amend_result: unsafe extern "C" fn(*const AmendResult),
+
+    /// Send the bitmap result message. Args: `bitmap_result`
+    /// pointer carrying the last applied action opcode, the number
+    /// of actions applied, the resulting bitmap count, and the
+    /// error code. Appended at the end of `CallTable` for the same
+    /// back-compat reason as `send_amend_result`.
+    pub send_bitmap_result: unsafe extern "C" fn(*const BitmapResult),
 }
 
 /// Backing format type for QCOW2 header extension
@@ -1305,8 +1312,10 @@ impl CallTable {
     /// appended `send_snapshot_entry`, `send_snapshot_result`,
     /// and `fsync_input` for the snapshot subcommand and its
     /// durability checkpoints; PLAN-amend phase 1 appended
-    /// `send_amend_result` for the amend subcommand).
-    pub const VERSION: u32 = 18;
+    /// `send_amend_result` for the amend subcommand;
+    /// PLAN-bitmap phase 2 appended `send_bitmap_result` for the
+    /// bitmap subcommand).
+    pub const VERSION: u32 = 19;
 }
 
 // ============================================================================
@@ -3276,6 +3285,10 @@ impl ResizeResult {
     /// the `HeaderMismatch` variant in `crates/resize` for the
     /// authoritative breakdown.
     pub const ERROR_HEADER_MISMATCH: u32 = 13;
+    /// The image carries persistent dirty bitmaps (qcow2 bitmaps
+    /// autoclear bit set). resize refuses rather than silently
+    /// discarding them (build_header would drop the extension).
+    pub const ERROR_BITMAPS_UNSUPPORTED: u32 = 14;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -3618,6 +3631,236 @@ impl AmendResult {
     pub const ERROR_SCRATCH_TOO_SMALL: u32 = 11;
     /// Internal size or offset computation overflowed.
     pub const ERROR_INTERNAL_OVERFLOW: u32 = 12;
+
+    /// True if magic matches.
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+}
+
+/// Maximum number of ordered actions carried in a single
+/// `BitmapConfig` (e.g. `--add --disable`). Generous; real
+/// `qemu-img bitmap` invocations use 1–3 actions. The host rejects
+/// requests with more than this.
+pub const MAX_BITMAP_ACTIONS: usize = 8;
+/// Size of the target bitmap-name buffer. Holds a name of up to
+/// 1023 bytes (the qemu limit); no trailing NUL is required
+/// (`name_len` delimits the used prefix).
+pub const BITMAP_NAME_BUF: usize = 1024;
+/// Maximum number of `--merge` source bitmaps in a single
+/// invocation. Real incremental-backup merges use 1–2 sources.
+pub const MAX_MERGE_SOURCES: usize = 8;
+/// Size of the concatenated merge-source name pool. Holds e.g. 8
+/// short names or ~2 max-length names; the host rejects a total
+/// source-name byte-count over this bound.
+pub const MERGE_SOURCE_POOL: usize = 2048;
+
+/// Configuration structure for the bitmap operation.
+///
+/// Written by the host at [`OPERATION_CONFIG_ADDR`] before the
+/// guest is launched. The guest reads it via
+/// `call_table.get_operation_config`.
+///
+/// Unlike single-mode operations, `qemu-img bitmap` applies an
+/// **ordered, repeatable list of actions** in one invocation (e.g.
+/// `--add --disable`), so the config carries an action *list*
+/// (`num_actions` + [`actions`](BitmapConfig::actions)) rather than
+/// a single mode. There is one positional target **name** (shared
+/// by every action); each `ACTION_MERGE` consumes the next entry,
+/// in order, from a length-delimited **merge-source pool**.
+///
+/// The host pre-probes the image header and bitmaps extension and
+/// passes a cross-check (the feature words, `virtual_size`,
+/// version / refcount width, cluster size, the bitmap-directory
+/// location and count); the guest re-parses these itself and
+/// validates against them, exactly as resize/amend do, emitting
+/// [`ERROR_HEADER_MISMATCH`](BitmapResult::ERROR_HEADER_MISMATCH)
+/// on disagreement. `bitmap` reuses the existing
+/// `read_output_sector` / `write_output_sector` primitives, so no
+/// new address constant or device-I/O pointer is introduced.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BitmapConfig {
+    /// Magic (`0x424D5043` = "BMPC").
+    pub magic: u32,
+    /// Target format (`ImageFormat as u32`); `Qcow2` in v1.
+    pub target_format: u32,
+    /// Flags. See `FLAG_*` constants.
+    pub flags: u32,
+    /// Sector size for I/O (matches host sector_size).
+    pub sector_size: u32,
+
+    /// Number of populated entries in `actions` (1..=MAX_BITMAP_ACTIONS).
+    pub num_actions: u32,
+    /// Target bitmap name length in bytes (1..=1023).
+    pub name_len: u32,
+    /// Number of populated merge sources (0..=MAX_MERGE_SOURCES).
+    pub num_merge_sources: u32,
+    /// Padding to align the following `u64` fields.
+    pub _pad0: u32,
+
+    /// `--add` granularity in bytes; `0` = format default.
+    pub granularity: u64,
+    /// Current autoclear feature word; host-probed cross-check.
+    pub current_autoclear_features: u64,
+    /// Current incompatible feature word; host-probed cross-check.
+    pub current_incompatible_features: u64,
+    /// Virtual size in bytes; host-probed cross-check.
+    pub virtual_size: u64,
+    /// Byte offset of the bitmap directory; `0` if there is no
+    /// bitmaps extension yet. Host-probed cross-check.
+    pub bitmap_directory_offset: u64,
+    /// Byte size of the bitmap directory. Host-probed cross-check.
+    pub bitmap_directory_size: u64,
+
+    /// Current qcow2 version (2 or 3); host-probed cross-check.
+    pub current_version: u32,
+    /// Current refcount width in bits; host-probed cross-check.
+    pub current_refcount_bits: u32,
+    /// qcow2 cluster size in bytes; host-probed cross-check.
+    pub cluster_size: u32,
+    /// Existing bitmap count (`0` if none); host-probed cross-check.
+    pub nb_bitmaps: u32,
+
+    /// Action opcodes, in CLI order. See `ACTION_*`. Entries at and
+    /// beyond `num_actions` are `0`.
+    pub actions: [u8; MAX_BITMAP_ACTIONS],
+    /// Padding to align the name / pool region.
+    pub _pad1: [u8; 8],
+
+    /// Target bitmap name (UTF-8, no NUL); `name_len` bytes used.
+    pub name: [u8; BITMAP_NAME_BUF],
+    /// Byte lengths of each merge source, in order.
+    pub merge_source_lens: [u16; MAX_MERGE_SOURCES],
+    /// Concatenated merge-source names, delimited by
+    /// `merge_source_lens`.
+    pub merge_source_pool: [u8; MERGE_SOURCE_POOL],
+
+    /// Reserved padding for forward compatibility (zero-init);
+    /// pads the total to a round 3584 bytes.
+    pub _reserved: [u8; 384],
+}
+
+impl BitmapConfig {
+    /// Magic value for bitmap config.
+    pub const MAGIC: u32 = 0x424D_5043; // "BMPC"
+
+    /// Action: create a new bitmap (`--add`).
+    pub const ACTION_ADD: u8 = 1;
+    /// Action: delete a bitmap (`--remove`).
+    pub const ACTION_REMOVE: u8 = 2;
+    /// Action: clear a bitmap's contents (`--clear`).
+    pub const ACTION_CLEAR: u8 = 3;
+    /// Action: enable recording into a bitmap (`--enable`).
+    pub const ACTION_ENABLE: u8 = 4;
+    /// Action: disable recording into a bitmap (`--disable`).
+    pub const ACTION_DISABLE: u8 = 5;
+    /// Action: merge source bitmap(s) into the target (`--merge`).
+    pub const ACTION_MERGE: u8 = 6;
+
+    /// Flag: quiet mode. Host-side only; the guest ignores this bit
+    /// (success is silent regardless, matching qemu).
+    pub const FLAG_QUIET: u32 = 1 << 0;
+    /// Flag: verbose mode. Mirrors the other configs' verbose bit.
+    pub const FLAG_VERBOSE: u32 = 1 << 31;
+
+    /// True if magic matches.
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+}
+
+/// Compile-time guard: `BitmapConfig` must fit the operation-config
+/// region (see [`OPERATION_CONFIG_MAX_SIZE`]).
+const _: () = assert!(core::mem::size_of::<BitmapConfig>() <= OPERATION_CONFIG_MAX_SIZE);
+
+/// Result structure for the bitmap operation.
+///
+/// Passed by the guest into `call_table.send_bitmap_result`. Carries
+/// the last applied opcode, how many actions succeeded, and the
+/// resulting bitmap count (so the host can render a summary and
+/// baselines can assert post-op state without a second probe), plus
+/// the error code. `qemu-img bitmap` produces no list output and is
+/// silent on success, so there is no per-entry streaming message.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BitmapResult {
+    /// Magic value (`0x424D5253` = "BMRS").
+    pub magic: u32,
+    /// Target format echoed back so the host can render the right
+    /// output.
+    pub target_format: u32,
+    /// Error code. See `ERROR_*`.
+    pub error: u32,
+    /// Last applied action opcode (`0` if none). See
+    /// [`BitmapConfig`]'s `ACTION_*`.
+    pub action: u32,
+
+    /// How many actions succeeded before an error or the end.
+    pub actions_applied: u32,
+    /// Bitmap count after the operation completed.
+    pub resulting_nb_bitmaps: u32,
+
+    /// Reserved padding for forward compatibility (zero-init);
+    /// pads the total to 64 bytes.
+    pub _reserved: [u8; 40],
+}
+
+impl BitmapResult {
+    /// Magic value for bitmap result.
+    pub const MAGIC: u32 = 0x424D_5253; // "BMRS"
+
+    // Error codes are stable: only appended, never reordered.
+    /// Success.
+    pub const ERROR_OK: u32 = 0;
+    /// Input is not qcow2 (v1 is qcow2-only).
+    pub const ERROR_UNSUPPORTED_FORMAT: u32 = 1;
+    /// qcow2 v2 cannot store dirty bitmaps.
+    pub const ERROR_UNSUPPORTED_VERSION: u32 = 2;
+    /// `QcowHeader::parse` failed.
+    pub const ERROR_PARSE_FAILED: u32 = 3;
+    /// The host-probed cross-check disagreed with the guest's
+    /// re-read of the header (defensive, mirrors rebase/amend).
+    pub const ERROR_HEADER_MISMATCH: u32 = 4;
+    /// A remove/clear/enable/disable/merge named a bitmap that does
+    /// not exist.
+    pub const ERROR_BITMAP_NOT_FOUND: u32 = 5;
+    /// `--add` with an already-existing name.
+    pub const ERROR_BITMAP_EXISTS: u32 = 6;
+    /// An `in_use`/inconsistent bitmap was targeted by an action
+    /// other than `--remove` (only remove is allowed; no `--force`).
+    pub const ERROR_BITMAP_IN_USE: u32 = 7;
+    /// Name longer than 1023 bytes.
+    pub const ERROR_NAME_TOO_LONG: u32 = 8;
+    /// Granularity bits outside `9..=31`.
+    pub const ERROR_GRANULARITY_RANGE: u32 = 9;
+    /// Would exceed 65535 bitmaps.
+    pub const ERROR_TOO_MANY_BITMAPS: u32 = 10;
+    /// Cluster allocation failed / bitmap too large for the
+    /// granularity.
+    pub const ERROR_NO_SPACE: u32 = 11;
+    /// A device write back to the image failed.
+    pub const ERROR_WRITE_FAILED: u32 = 12;
+    /// A device read from the image failed.
+    pub const ERROR_READ_FAILED: u32 = 13;
+    /// Guest scratch buffer was too small for the requested layout.
+    pub const ERROR_SCRATCH_TOO_SMALL: u32 = 14;
+    /// Internal size or offset computation overflowed.
+    pub const ERROR_INTERNAL_OVERFLOW: u32 = 15;
+    /// A `--merge` source bitmap does not exist.
+    pub const ERROR_MERGE_SOURCE_NOT_FOUND: u32 = 16;
+    /// Reserved for a deferred action path (e.g. cross-file
+    /// `--merge -b`, or an action the planner does not yet
+    /// implement). Kept reserved even if unused at freeze time.
+    pub const ERROR_UNSUPPORTED_ACTION: u32 = 17;
+    /// qcow2 refcount width != 16; v1 reuses the 16-bit-only
+    /// allocator and refuses other widths.
+    pub const ERROR_UNSUPPORTED_REFCOUNT_WIDTH: u32 = 18;
+    /// A `--merge` was requested between two bitmaps whose geometry
+    /// is incompatible (unequal granularity, hence unequal bit-count
+    /// / bitmap-table size). qemu requires equal granularity to
+    /// merge; v1 refuses rather than resampling.
+    pub const ERROR_INCOMPATIBLE_MERGE: u32 = 19;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -4219,6 +4462,15 @@ mod tests {
     }
 
     #[test]
+    fn resize_result_error_codes_are_stable() {
+        // These are ABI: append-only, never renumber.
+        assert_eq!(ResizeResult::ERROR_OK, 0);
+        assert_eq!(ResizeResult::ERROR_PARSE_FAILED, 12);
+        assert_eq!(ResizeResult::ERROR_HEADER_MISMATCH, 13);
+        assert_eq!(ResizeResult::ERROR_BITMAPS_UNSUPPORTED, 14);
+    }
+
+    #[test]
     fn resize_config_size_budget() {
         // Forward-compat tripwire: if a future phase grows this
         // past 256 bytes that's a deliberate ABI change and the
@@ -4635,6 +4887,162 @@ mod tests {
             error: AmendResult::ERROR_OK,
             resulting_version: 0,
             resulting_lazy_refcounts: 0,
+            _reserved: [0; 40],
+        };
+        assert!(r.is_valid());
+        r.magic = 0;
+        assert!(!r.is_valid());
+    }
+
+    #[test]
+    fn bitmap_config_magic() {
+        assert_eq!(BitmapConfig::MAGIC, 0x424D_5043); // "BMPC"
+        assert_eq!(BitmapConfig::MAGIC.to_be_bytes(), *b"BMPC");
+    }
+
+    #[test]
+    fn bitmap_result_magic() {
+        assert_eq!(BitmapResult::MAGIC, 0x424D_5253); // "BMRS"
+        assert_eq!(BitmapResult::MAGIC.to_be_bytes(), *b"BMRS");
+    }
+
+    #[test]
+    fn bitmap_config_size_and_align() {
+        // Source of truth: BitmapConfig must be exactly 3584 bytes,
+        // 8-byte aligned (it carries u64 cross-check fields), and
+        // fit the operation-config region.
+        assert_eq!(
+            core::mem::size_of::<BitmapConfig>(),
+            3584,
+            "BitmapConfig is {} bytes",
+            core::mem::size_of::<BitmapConfig>()
+        );
+        assert_eq!(core::mem::align_of::<BitmapConfig>(), 8);
+        assert!(core::mem::size_of::<BitmapConfig>() <= OPERATION_CONFIG_MAX_SIZE);
+    }
+
+    #[test]
+    fn bitmap_result_size_and_align() {
+        // Source of truth: BitmapResult must be exactly 64 bytes.
+        assert_eq!(
+            core::mem::size_of::<BitmapResult>(),
+            64,
+            "BitmapResult is {} bytes",
+            core::mem::size_of::<BitmapResult>()
+        );
+        assert_eq!(core::mem::align_of::<BitmapResult>(), 4);
+    }
+
+    #[test]
+    fn bitmap_config_is_valid_checks_magic() {
+        let mut cfg = BitmapConfig {
+            magic: BitmapConfig::MAGIC,
+            target_format: 0,
+            flags: 0,
+            sector_size: 0,
+            num_actions: 0,
+            name_len: 0,
+            num_merge_sources: 0,
+            _pad0: 0,
+            granularity: 0,
+            current_autoclear_features: 0,
+            current_incompatible_features: 0,
+            virtual_size: 0,
+            bitmap_directory_offset: 0,
+            bitmap_directory_size: 0,
+            current_version: 0,
+            current_refcount_bits: 0,
+            cluster_size: 0,
+            nb_bitmaps: 0,
+            actions: [0; MAX_BITMAP_ACTIONS],
+            _pad1: [0; 8],
+            name: [0; BITMAP_NAME_BUF],
+            merge_source_lens: [0; MAX_MERGE_SOURCES],
+            merge_source_pool: [0; MERGE_SOURCE_POOL],
+            _reserved: [0; 384],
+        };
+        assert!(cfg.is_valid());
+        cfg.magic = 0;
+        assert!(!cfg.is_valid());
+    }
+
+    #[test]
+    fn bitmap_config_flags_distinct() {
+        let flags = [BitmapConfig::FLAG_QUIET, BitmapConfig::FLAG_VERBOSE];
+        for i in 0..flags.len() {
+            for j in (i + 1)..flags.len() {
+                assert_ne!(flags[i], flags[j], "flags {i} and {j} alias");
+            }
+        }
+    }
+
+    #[test]
+    fn bitmap_config_action_opcodes() {
+        // Opcodes are 1..=6, distinct, and stably numbered.
+        let actions = [
+            BitmapConfig::ACTION_ADD,
+            BitmapConfig::ACTION_REMOVE,
+            BitmapConfig::ACTION_CLEAR,
+            BitmapConfig::ACTION_ENABLE,
+            BitmapConfig::ACTION_DISABLE,
+            BitmapConfig::ACTION_MERGE,
+        ];
+        for i in 0..actions.len() {
+            for j in (i + 1)..actions.len() {
+                assert_ne!(actions[i], actions[j], "actions {i} and {j} alias");
+            }
+        }
+        for (i, a) in actions.iter().enumerate() {
+            assert_eq!(*a, (i + 1) as u8);
+        }
+    }
+
+    #[test]
+    fn bitmap_result_error_codes_distinct() {
+        // Phase 2 defines codes 0..=17; phase 3 appends 18 and 19.
+        // Confirm every code is distinct and contiguously numbered
+        // (append-only).
+        let codes = [
+            BitmapResult::ERROR_OK,
+            BitmapResult::ERROR_UNSUPPORTED_FORMAT,
+            BitmapResult::ERROR_UNSUPPORTED_VERSION,
+            BitmapResult::ERROR_PARSE_FAILED,
+            BitmapResult::ERROR_HEADER_MISMATCH,
+            BitmapResult::ERROR_BITMAP_NOT_FOUND,
+            BitmapResult::ERROR_BITMAP_EXISTS,
+            BitmapResult::ERROR_BITMAP_IN_USE,
+            BitmapResult::ERROR_NAME_TOO_LONG,
+            BitmapResult::ERROR_GRANULARITY_RANGE,
+            BitmapResult::ERROR_TOO_MANY_BITMAPS,
+            BitmapResult::ERROR_NO_SPACE,
+            BitmapResult::ERROR_WRITE_FAILED,
+            BitmapResult::ERROR_READ_FAILED,
+            BitmapResult::ERROR_SCRATCH_TOO_SMALL,
+            BitmapResult::ERROR_INTERNAL_OVERFLOW,
+            BitmapResult::ERROR_MERGE_SOURCE_NOT_FOUND,
+            BitmapResult::ERROR_UNSUPPORTED_ACTION,
+            BitmapResult::ERROR_UNSUPPORTED_REFCOUNT_WIDTH,
+            BitmapResult::ERROR_INCOMPATIBLE_MERGE,
+        ];
+        for i in 0..codes.len() {
+            for j in (i + 1)..codes.len() {
+                assert_ne!(codes[i], codes[j], "codes {i} and {j} alias");
+            }
+        }
+        for (i, c) in codes.iter().enumerate() {
+            assert_eq!(*c, i as u32);
+        }
+    }
+
+    #[test]
+    fn bitmap_result_is_valid_checks_magic() {
+        let mut r = BitmapResult {
+            magic: BitmapResult::MAGIC,
+            target_format: 0,
+            error: BitmapResult::ERROR_OK,
+            action: 0,
+            actions_applied: 0,
+            resulting_nb_bitmaps: 0,
             _reserved: [0; 40],
         };
         assert!(r.is_valid());
@@ -5189,13 +5597,15 @@ mod tests {
     }
 
     #[test]
-    fn call_table_version_is_eighteen() {
+    fn call_table_version_is_nineteen() {
         // PLAN-snapshot phase 1 bumped the call-table ABI from
         // 16 to 17 by appending `send_snapshot_entry`,
         // `send_snapshot_result`, and `fsync_input`.
         // PLAN-amend phase 1 bumps 17 to 18 by appending
         // `send_amend_result`.
-        assert_eq!(CallTable::VERSION, 18);
+        // PLAN-bitmap phase 2 bumps 18 to 19 by appending
+        // `send_bitmap_result`.
+        assert_eq!(CallTable::VERSION, 19);
     }
 
     #[test]

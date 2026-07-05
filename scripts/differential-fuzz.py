@@ -49,7 +49,7 @@ DATA_PATTERNS = ['zeros', 'random', 'sparse', 'mbr']
 # Operations that the fuzzer can chain together
 OPERATIONS = ['info', 'check', 'convert', 'convert_compressed', 'measure',
               'create', 'resize', 'amend', 'rebase', 'commit', 'map',
-              'snapshot', 'repair', 'dd']
+              'snapshot', 'repair', 'dd', 'bitmap']
 
 # Known divergence categories to skip (unsafe quirks)
 # See docs/quirks.md for rationale
@@ -1856,6 +1856,339 @@ def op_amend(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Differential bitmap op (phase-9 step 9b)
+# ---------------------------------------------------------------------------
+
+# KNOWN_BITMAP_DIFFERENTIAL_DIVERGENCES -- intentional instar-vs-qemu
+# differences the picker deliberately never generates, so a real
+# divergence is never masked. Mirrors tests/test_bitmap.py's
+# KNOWN_BITMAP_DIVERGENCES and _amend_option_picker's divergence
+# avoidance. In every case instar is deliberately MORE conservative
+# than qemu-img (it refuses an input qemu accepts):
+#
+#   * cross_file_merge   -- instar v1 is same-file merge only; it
+#                           refuses `-b SRC_FILE` / `-F SRC_FMT`. The
+#                           picker never emits `-b`/`-F`.
+#   * merge_mixed        -- instar requires a `--merge` to be the sole
+#                           action in an invocation; qemu applies merge
+#                           and metadata actions in CLI order. The
+#                           picker emits each `--merge` as its own
+#                           single-action invocation.
+#   * refcount_bits      -- instar refuses refcount_bits != 16. The
+#                           picker hardcodes refcount_bits=16 (never
+#                           randomises it, unlike _create_option_picker).
+#   * compat_v2          -- bitmaps require qcow2 v3; the picker always
+#                           creates compat=1.1.
+#   * merge_granularity  -- qemu-img 10.0.8 rescales when merging bitmaps
+#                           of DIFFERING granularity; instar v1's merge
+#                           planner refuses ("bitmaps have incompatible
+#                           granularity for merge", crates/bitmap
+#                           merge.rs -- equal granularity_bits required,
+#                           a documented v1 limitation exercised as a
+#                           refusal by Phase 6). The picker only merges a
+#                           source into a destination of EQUAL effective
+#                           granularity (tracking each bitmap's resolved
+#                           granularity, including the cluster-size-
+#                           derived default).
+#
+# The generated operation space (add [+granularity], add+disable,
+# remove, clear, enable, disable, single-source same-file equal-
+# granularity merge with an existing enabled destination) is exactly the
+# space Phase 7's fixed BITMAP_CASES matrix proved parity-equivalent
+# against qemu-img 10.0.8, so any divergence op_bitmap surfaces is a real
+# bug, not a steer-around.
+KNOWN_BITMAP_DIFFERENTIAL_DIVERGENCES = {
+    'cross_file_merge', 'merge_mixed', 'refcount_bits', 'compat_v2',
+    'merge_granularity',
+}
+
+# Valid bitmap granularities: powers of two in [512, 2G] (bytes).
+# instar validates log2(granularity) in [9, 31]; the picker stays well
+# inside that window (<= 2 MiB) so every value round-trips on both
+# tools. Passed as a bare byte count (qemu accepts SIZE[KMGTPE]; a
+# plain integer is unambiguous to both).
+_BITMAP_GRANULARITIES = [512, 4096, 65536, 131072, 262144, 1048576, 2097152]
+
+
+def _bitmap_option_picker(rng):
+    """Pick a valid, parity-respecting bitmap plan.
+
+    Returns a dict ``{create_opts, vsize, invocations}`` where:
+      * ``create_opts`` -- ``-o`` create options for BOTH start images
+        (they must be identical): always ``compat=1.1`` (bitmaps need
+        qcow2 v3), a random ``cluster_size`` from ``QCOW2_CLUSTER_SIZES``,
+        and ``refcount_bits=16`` (never randomised -- instar refuses
+        other widths; see KNOWN_BITMAP_DIFFERENTIAL_DIVERGENCES).
+      * ``vsize`` -- a small random virtual size.
+      * ``invocations`` -- an ordered list of ``instar bitmap`` /
+        ``qemu-img bitmap`` arg-lists, each ending in the target bitmap
+        name (op_bitmap splits the trailing token off as the name). Each
+        invocation carries exactly ONE logical action.
+
+    Parity constraints (so instar and qemu AGREE -- Open question 3):
+      * Never emits ``-b``/``-F`` (instar is same-file merge only).
+      * Never mixes ``--merge`` with another action in one invocation
+        (instar requires merge to be the sole action).
+      * ``refcount_bits`` is always 16; ``compat`` is always 1.1.
+      * Granularities are valid powers of two in [512, 2 MiB].
+      * Bitmap names are short (``b0``..``bN``, well under the 1023-byte
+        limit) and unique per add.
+      * The picker tracks which names exist, their enabled state, and
+        their effective granularity, and only emits remove/clear/enable/
+        disable/merge against names that exist -- enable only on a
+        disabled bitmap, disable only on an enabled one, merge only into
+        an existing *enabled* destination from a distinct existing source
+        of EQUAL granularity (see merge_granularity above). Keeps <= 6
+        live bitmaps (well under instar's 8-action / 8-merge-source
+        ceilings).
+      * Sequence length is 2..6 invocations.
+
+    This is exactly the operation space Phase 7's BITMAP_CASES matrix
+    proved parity-equivalent, so any op_bitmap divergence is a real bug.
+    """
+    cluster_size = rng.choice(QCOW2_CLUSTER_SIZES)
+    create_opts = [
+        'compat=1.1',                                    # bitmaps need v3
+        f'cluster_size={cluster_size}',
+        'refcount_bits=16',                              # instar hardcodes
+    ]
+    vsize = rng.choice(['1M', '4M', '16M', '64M'])
+
+    # A bitmap added without -g takes qcow2's default granularity,
+    # which crates/qcow2 derives as cluster_size.clamp(4096, 65536).
+    default_gran = min(max(cluster_size, 4096), 65536)
+
+    existing = {}          # name -> {'enabled': bool, 'gran': int}
+    counter = 0
+    invocations = []
+    num = rng.randint(2, 6)
+
+    for _ in range(num):
+        names = list(existing.keys())
+        enabled_names = [n for n, m in existing.items() if m['enabled']]
+        disabled_names = [n for n, m in existing.items() if not m['enabled']]
+
+        # merge candidates: an enabled dest with a distinct existing
+        # source of EQUAL granularity (instar refuses cross-granularity).
+        merge_pairs = [
+            (src, dst)
+            for dst in enabled_names
+            for src in names
+            if src != dst and existing[src]['gran'] == existing[dst]['gran']
+        ]
+
+        choices = []
+        if len(existing) < 6:
+            choices += ['add', 'add-disabled']
+        if names:
+            choices += ['remove', 'clear']
+        if disabled_names:
+            choices.append('enable')
+        if enabled_names:
+            choices.append('disable')
+        if merge_pairs:
+            choices.append('merge')
+        if not choices:
+            choices = ['add']
+
+        action = rng.choice(choices)
+
+        if action == 'add':
+            name = f'b{counter}'
+            counter += 1
+            inv = ['--add']
+            if rng.random() < 0.5:
+                gran = rng.choice(_BITMAP_GRANULARITIES)
+                inv += ['-g', str(gran)]
+            else:
+                gran = default_gran
+            inv.append(name)
+            existing[name] = {'enabled': True, 'gran': gran}
+        elif action == 'add-disabled':
+            name = f'b{counter}'
+            counter += 1
+            inv = ['--add', '--disable', name]
+            existing[name] = {'enabled': False, 'gran': default_gran}
+        elif action == 'remove':
+            name = rng.choice(names)
+            inv = ['--remove', name]
+            del existing[name]
+        elif action == 'clear':
+            name = rng.choice(names)
+            inv = ['--clear', name]
+        elif action == 'enable':
+            name = rng.choice(disabled_names)
+            inv = ['--enable', name]
+            existing[name]['enabled'] = True
+        elif action == 'disable':
+            name = rng.choice(enabled_names)
+            inv = ['--disable', name]
+            existing[name]['enabled'] = False
+        else:  # merge -- sole action, equal-granularity src/dst
+            src, dest = rng.choice(merge_pairs)
+            inv = ['--merge', src, dest]
+
+        invocations.append(inv)
+
+    return {
+        'create_opts': create_opts,
+        'vsize': vsize,
+        'invocations': invocations,
+    }
+
+
+def _normalise_bitmaps_info(info_json_obj):
+    """Extract the parity surface from a ``qemu-img info --output=json``
+    dict: the ``format-specific.data.bitmaps`` array, each entry reduced
+    to ``{name, granularity, flags}`` with ``flags`` sorted, and the
+    whole list sorted by name.
+
+    The two images are produced independently, so on-disk directory
+    order (and unrelated allocation/actual-size) may differ; only the
+    bitmaps metadata is the contract. Mirrors test_bitmap.py's
+    ``_bitmaps_of`` / ``assert_bitmaps_equivalent``.
+    """
+    data = (info_json_obj.get('format-specific', {}) or {}).get('data', {}) or {}
+    bitmaps = data.get('bitmaps', []) or []
+    normalised = []
+    for b in bitmaps:
+        normalised.append({
+            'name': b.get('name'),
+            'granularity': b.get('granularity'),
+            'flags': sorted(b.get('flags', []) or []),
+        })
+    normalised.sort(key=lambda e: (e['name'] is None, e['name']))
+    return normalised
+
+
+def op_bitmap(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
+    """Build the same v3 qcow2 twice, apply an identical random bitmap
+    op sequence via each native tool, and compare after every
+    invocation.
+
+    Models op_amend: instar_copy / qemu_copy / fmt are part of the
+    standard op_* signature but unused -- bitmap builds its own start
+    images via the picker. bitmap is qcow2-only and launches a guest VMM
+    needing /dev/kvm (the workflow passes --device /dev/kvm, like
+    op_amend/op_rebase/op_commit).
+
+    Per invocation the oracle is: (1) exit-code agreement, (2) the
+    ``qemu-img info`` bitmaps array (name/granularity/flags), (3) a
+    structural ``qemu-img check`` on the instar image. The bit-content
+    merge oracle lives in Phase 7 (too heavy per iteration -- Open
+    question 4). Returns a typed divergence dict or None.
+    """
+    plan = _bitmap_option_picker(rng)
+    create_opts = plan['create_opts']
+    vsize = plan['vsize']
+    invocations = plan['invocations']
+
+    iter_dir = instar_copy.parent
+    inst_path = iter_dir / 'bitmap_instar.qcow2'
+    qemu_path = iter_dir / 'bitmap_qemu.qcow2'
+
+    # 1. Seed two byte-identical v3 start images with the SAME
+    # qemu-img create. A create failure is a seed problem (both sides
+    # use qemu-img identically), not a bitmap divergence -- skip.
+    create_o = ','.join(create_opts)
+    for path in (inst_path, qemu_path):
+        _, _, c_rc = run_qemu_img(
+            ['create'],
+            ['-f', 'qcow2', '-o', create_o, str(path), vsize],
+            timeout=timeout)
+        if c_rc != 0:
+            return None
+
+    # 2. Apply the op sequence to each image, comparing after each step.
+    for inv in invocations:
+        flags = list(inv[:-1])
+        name = inv[-1]
+
+        _, i_stderr, i_rc = run_instar(
+            instar_bin, ['bitmap'], flags + [str(inst_path), name],
+            timeout=timeout)
+        _, q_stderr, q_rc = run_qemu_img(
+            ['bitmap'], flags + [str(qemu_path), name],
+            timeout=timeout)
+
+        div = compare_exit_codes(
+            i_rc, q_rc, 'bitmap',
+            {'create_opts': create_opts, 'vsize': vsize,
+             'invocation': inv,
+             'instar_stderr': i_stderr[:500],
+             'qemu_stderr': q_stderr[:500]},
+        )
+        if div:
+            return div
+        if i_rc != 0:
+            # Both rejected this invocation: neither image changed, so
+            # they remain identical -- carry on with the next step.
+            continue
+
+        # Shared success: compare the bitmaps metadata arrays.
+        i_out, _, i_info_rc = run_qemu_img(
+            ['info', '--output=json'], [str(inst_path)], timeout=timeout)
+        q_out, _, q_info_rc = run_qemu_img(
+            ['info', '--output=json'], [str(qemu_path)], timeout=timeout)
+        if i_info_rc != 0 or q_info_rc != 0:
+            return {
+                'type': 'bitmap_info_readback_failure',
+                'operation': 'bitmap',
+                'create_opts': create_opts, 'vsize': vsize,
+                'invocation': inv,
+                'instar_info_rc': i_info_rc, 'qemu_info_rc': q_info_rc,
+                'instar_info_stdout': i_out[:500],
+                'qemu_info_stdout': q_out[:500],
+            }
+        try:
+            i_json = json.loads(i_out)
+            q_json = json.loads(q_out)
+        except json.JSONDecodeError as e:
+            return {
+                'type': 'bitmap_info_json_parse_failure',
+                'operation': 'bitmap',
+                'create_opts': create_opts, 'vsize': vsize,
+                'invocation': inv, 'error': str(e),
+                'instar_info_stdout': i_out[:500],
+                'qemu_info_stdout': q_out[:500],
+            }
+
+        i_bitmaps = _normalise_bitmaps_info(i_json)
+        q_bitmaps = _normalise_bitmaps_info(q_json)
+        if i_bitmaps != q_bitmaps:
+            return {
+                'type': 'bitmap_info_divergence',
+                'operation': 'bitmap',
+                'create_opts': create_opts, 'vsize': vsize,
+                'invocation': inv,
+                'instar_bitmaps': i_bitmaps,
+                'qemu_bitmaps': q_bitmaps,
+            }
+
+        # Structural: instar claimed success, so its image must be
+        # clean (no leaks / corruption qemu-img info doesn't surface).
+        inst_metrics = _qemu_check_metrics(inst_path, timeout)
+        if inst_metrics is None:
+            return {
+                'type': 'bitmap_check_unparseable',
+                'operation': 'bitmap',
+                'create_opts': create_opts, 'vsize': vsize,
+                'invocation': inv,
+                'instar_stderr': i_stderr[:500],
+            }
+        if not _is_clean(inst_metrics):
+            return {
+                'type': 'bitmap_check_divergence',
+                'operation': 'bitmap',
+                'create_opts': create_opts, 'vsize': vsize,
+                'invocation': inv,
+                'instar_metrics': inst_metrics,
+            }
+
+    return None
+
+
 def _rebase_option_picker(rng):
     """Pick (overlay_size, new_backing_name, new_backing_size,
     rebase_flags, extra_create_options).
@@ -3491,6 +3824,11 @@ def run_iteration(instar_bin, workdir, rng, iteration, timeout,
                 )
             elif op == 'dd':
                 div = op_dd(
+                    instar_bin, instar_copy, qemu_copy, fmt,
+                    timeout, rng,
+                )
+            elif op == 'bitmap':
+                div = op_bitmap(
                     instar_bin, instar_copy, qemu_copy, fmt,
                     timeout, rng,
                 )

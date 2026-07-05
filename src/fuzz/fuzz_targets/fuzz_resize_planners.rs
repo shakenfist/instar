@@ -222,6 +222,10 @@ fuzz_target!(|data: &[u8]| {
                     current_incompatible_features: u64::from_le_bytes(
                         data[16..24].try_into().unwrap(),
                     ),
+                    // Drive the qcow2 bitmaps autoclear bit (bit 0) from a
+                    // free flag bit so the fuzzer exercises resize's
+                    // refuse-bitmap-bearing-images gate.
+                    current_autoclear_features: ((flags >> 6) & 1) as u64,
                     backing_file,
                     backing_format: None,
                     lazy_refcounts,

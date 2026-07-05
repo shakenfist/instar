@@ -123,7 +123,8 @@ jobs:
               --exclude commit-op \
               --exclude map-op \
               --exclude snapshot-op \
-              --exclude amend-op
+              --exclude amend-op \
+              --exclude bitmap-op
 
       - name: Test config commands in container
         run: |

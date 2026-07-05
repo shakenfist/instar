@@ -217,6 +217,7 @@ fn opts_from_image<'a>(
         current_refcount_table_offset: header.refcount_table_offset,
         current_refcount_table_clusters: header.refcount_table_clusters,
         current_incompatible_features: header.incompatible_features,
+        current_autoclear_features: 0,
         backing_file: None,
         backing_format: None,
         lazy_refcounts: header.lazy_refcounts,

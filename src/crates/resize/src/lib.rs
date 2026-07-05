@@ -83,6 +83,14 @@ pub enum ResizeError {
     /// the existing metadata the host staged into the opts.
     /// Indicates either a corrupted image or a host bug.
     ParseFailed,
+    /// The image carries persistent dirty bitmaps (the qcow2
+    /// bitmaps autoclear bit is set). resize rebuilds the whole
+    /// header cluster via `build_header`, which drops unknown
+    /// header extensions (including the `0x23852875` bitmaps
+    /// extension) and zeroes `autoclear_features`, orphaning the
+    /// on-disk bitmap clusters. Rather than silently destroy the
+    /// bitmaps, resize refuses — matching `snapshot`'s posture.
+    BitmapsPresent,
 }
 
 /// What the resize will do to the file. Carried in [`ResizePlan`]
@@ -371,6 +379,9 @@ pub struct Qcow2ResizeOpts<'a> {
     /// rejects `INCOMPAT_DIRTY` / `INCOMPAT_CORRUPT` with
     /// [`ResizeError::RequiresCheckFirst`].
     pub current_incompatible_features: u64,
+    /// Raw `autoclear_features` word (header offset 88); used to
+    /// refuse images carrying persistent dirty bitmaps.
+    pub current_autoclear_features: u64,
     /// Optional backing-file path bytes (from the existing
     /// header). Copied verbatim into the new header so the
     /// backing-file reference survives the rewrite.
@@ -710,6 +721,9 @@ pub struct Qcow2ResizeGrowQuery<'a> {
     pub current_refcount_table_offset: u64,
     pub current_refcount_table_clusters: u32,
     pub current_incompatible_features: u64,
+    /// Raw `autoclear_features` word (header offset 88); used to
+    /// refuse images carrying persistent dirty bitmaps.
+    pub current_autoclear_features: u64,
     pub preallocation: Preallocation,
     pub allow_shrink: bool,
     pub existing_refcount_table_bytes: &'a [u8],

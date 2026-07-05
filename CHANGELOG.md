@@ -147,6 +147,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`tests/test_dd_baselines.py`), coverage fuzzing, and differential
   fuzzing against `qemu-img dd`. See [docs/dd.md](docs/dd.md).
 
+- **New `instar bitmap` subcommand (PLAN-bitmap phases 1-10).**
+  Creates, deletes, clears, enables, disables, and merges a qcow2
+  image's **persistent dirty bitmaps** in place — the sandboxed
+  equivalent of `qemu-img bitmap`. The six repeatable actions
+  (`--add`/`--remove`/`--clear`/`--enable`/`--disable`/`--merge
+  SOURCE`, plus `-g` granularity and `--output {human,json}`) are
+  applied in command-line order and the tool is silent on success.
+  qcow2 v3-only. Validated against `qemu-img bitmap` by integration
+  tests (`tests/test_bitmap.py`), cross-version baselines, and
+  coverage + differential fuzzing. The `CallTable::VERSION` bumps
+  from 18 to 19 for the appended `send_bitmap_result` callback (same
+  append-at-end discipline as prior subcommands). Note that `instar
+  resize` now refuses images that carry persistent dirty bitmaps
+  (see *Changed*). See [docs/bitmap.md](docs/bitmap.md).
+
 - **`instar map` differential fuzzer extension (PLAN-map phase 8).**
   Adds `op_map` to `scripts/differential-fuzz.py`'s random
   operation chain. For each randomly-generated image (raw
@@ -936,6 +951,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     GitHub issues against instar (commit `71e3e33`).
 
 ### Changed
+
+- **`instar resize` now refuses qcow2 images carrying persistent
+  dirty bitmaps** rather than silently discarding them. Resizing
+  rebuilds the header cluster, which would drop the qcow2 bitmaps
+  extension and its bitmaps; instead the operation fails with:
+
+  ```
+  refusing to resize an image with persistent dirty bitmaps (would
+  discard them); remove the bitmaps first with `instar bitmap
+  --remove` or qemu-img
+  ```
+
+  preventing silent bitmap-data loss. Remove the bitmaps first (see
+  the new `instar bitmap` subcommand under *Added*, or
+  [docs/bitmap.md](docs/bitmap.md)).
 
 - **CallTable ABI version bumped from 13 to 14** by the addition
   of `send_measure_result`. Stale operation binaries built against

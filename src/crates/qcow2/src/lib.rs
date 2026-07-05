@@ -15,6 +15,8 @@
 #[cfg(feature = "decompress-zstd")]
 extern crate alloc;
 
+pub mod bitmap;
+
 #[cfg(feature = "create")]
 pub mod create;
 
@@ -61,6 +63,9 @@ pub const COMPRESSION_TYPE_OFFSET: usize = 104;
 pub const EXT_BACKING_FORMAT: u32 = 0xE2792ACA;
 pub const EXT_EXTERNAL_DATA_FILE: u32 = 0x44415441; // "DATA"
 pub const EXT_ENCRYPT_HEADER: u32 = 0x0537BE77; // Full disk encryption header pointer (crypt_method=2)
+/// Persistent dirty bitmaps header extension (24-byte body).
+/// Parsed by [`bitmap::parse_bitmaps_extension`].
+pub const EXT_BITMAPS: u32 = 0x23852875;
 pub const EXT_END: u32 = 0x00000000;
 /// Start of header extensions in v2 (fixed 72-byte header)
 pub const V2_HEADER_EXTENSION_OFFSET: usize = 72;
@@ -458,6 +463,21 @@ pub struct HeaderExtensionResults {
     pub luks_header_offset: u64,
     /// Length of the LUKS header data in bytes (0 if absent).
     pub luks_header_len: u64,
+    /// True when a usable persistent-dirty-bitmaps extension is present:
+    /// the `EXT_BITMAPS` (`0x23852875`) extension parsed successfully AND
+    /// the header's autoclear bitmaps bit (bit 0) is set.
+    pub bitmaps_present: bool,
+    /// True when the bitmaps extension parsed but the header's autoclear
+    /// bitmaps bit is clear — the header advertises bitmaps that the
+    /// autoclear bit marks as stale/inconsistent. Callers must treat such
+    /// bitmaps as absent (only `--remove` is permitted by qemu).
+    pub bitmaps_inconsistent: bool,
+    /// `nb_bitmaps` from the bitmaps extension (0 if absent/unparsed).
+    pub bitmap_nb_bitmaps: u32,
+    /// `bitmap_directory_size` from the bitmaps extension (0 if absent).
+    pub bitmap_directory_size: u64,
+    /// `bitmap_directory_offset` from the bitmaps extension (0 if absent).
+    pub bitmap_directory_offset: u64,
 }
 
 /// Parse QCOW2 header extensions from a header buffer.
@@ -475,6 +495,11 @@ pub fn parse_header_extensions(header: &[u8], parsed: &QcowHeader) -> HeaderExte
         data_file_name_len: 0,
         luks_header_offset: 0,
         luks_header_len: 0,
+        bitmaps_present: false,
+        bitmaps_inconsistent: false,
+        bitmap_nb_bitmaps: 0,
+        bitmap_directory_size: 0,
+        bitmap_directory_offset: 0,
     };
 
     if parsed.version < 3 {
@@ -510,6 +535,34 @@ pub fn parse_header_extensions(header: &[u8], parsed: &QcowHeader) -> HeaderExte
             let data_start = ext_offset + 8;
             result.luks_header_offset = be_u64(header, data_start);
             result.luks_header_len = be_u64(header, data_start + 8);
+        } else if ext_type == EXT_BITMAPS {
+            // Parse the 24-byte bitmaps extension body. The loop has already
+            // bounds-checked `ext_offset + 8 + ext_len <= header.len()`.
+            let body = &header[ext_offset + 8..ext_offset + 8 + ext_len];
+            if let Some(ext) = bitmap::parse_bitmaps_extension(body) {
+                result.bitmap_nb_bitmaps = ext.nb_bitmaps;
+                result.bitmap_directory_size = ext.bitmap_directory_size;
+                result.bitmap_directory_offset = ext.bitmap_directory_offset;
+                // The bitmaps extension is consistency-guarded by autoclear
+                // bit 0: it is usable only if that bit is set. Length-guard
+                // before reading the autoclear word.
+                let bit_set = if header.len() >= AUTOCLEAR_FEATURES_OFFSET + 8 {
+                    be_u64(header, AUTOCLEAR_FEATURES_OFFSET) & bitmap::AUTOCLEAR_BITMAPS_BIT != 0
+                } else {
+                    false
+                };
+                if bit_set {
+                    result.bitmaps_present = true;
+                    result.bitmaps_inconsistent = false;
+                } else {
+                    // Header advertises bitmaps but the autoclear bit is
+                    // clear: treat as inconsistent/absent.
+                    result.bitmaps_present = false;
+                    result.bitmaps_inconsistent = true;
+                }
+            }
+            // parse_bitmaps_extension returning None ⇒ leave defaults
+            // (no usable bitmaps).
         }
 
         // Move to next extension (data padded to 8-byte boundary)
@@ -905,7 +958,7 @@ fn parse_snapshot_extra_data(buf: &[u8], extra_data_size: u32) -> SnapshotExtraD
 /// valid, `cache_buf` must point to at least `sector_size`
 /// writable bytes.
 #[allow(clippy::too_many_arguments)]
-unsafe fn read_bytes_cached(
+pub(crate) unsafe fn read_bytes_cached(
     call_table: &CallTable,
     device_idx: u32,
     offset: u64,
@@ -3301,6 +3354,82 @@ mod tests {
         );
     }
 
+    // ---- parse_header_extensions: bitmaps ----
+
+    /// Write a 24-byte EXT_BITMAPS body at `off` and an EXT_END terminator
+    /// after its (already-8-byte-aligned) padding. Returns nothing; mutates
+    /// `buf` in place.
+    fn poke_bitmaps_extension(
+        buf: &mut [u8; 512],
+        off: usize,
+        nb_bitmaps: u32,
+        dir_size: u64,
+        dir_offset: u64,
+    ) {
+        buf[off..off + 4].copy_from_slice(&EXT_BITMAPS.to_be_bytes());
+        buf[off + 4..off + 8].copy_from_slice(&24u32.to_be_bytes());
+        let body = off + 8;
+        buf[body..body + 4].copy_from_slice(&nb_bitmaps.to_be_bytes());
+        // reserved @body+4 left zero
+        buf[body + 8..body + 16].copy_from_slice(&dir_size.to_be_bytes());
+        buf[body + 16..body + 24].copy_from_slice(&dir_offset.to_be_bytes());
+        // 24 is already a multiple of 8: EXT_END follows immediately.
+        let next = body + 24;
+        buf[next..next + 4].copy_from_slice(&EXT_END.to_be_bytes());
+    }
+
+    #[test]
+    fn header_extensions_bitmaps_present_when_autoclear_set() {
+        let mut buf = make_qcow2_header();
+        // Autoclear bit 0 set ⇒ bitmaps are consistent/usable.
+        buf[AUTOCLEAR_FEATURES_OFFSET..AUTOCLEAR_FEATURES_OFFSET + 8]
+            .copy_from_slice(&1u64.to_be_bytes());
+        // header_length=112, so extensions start at offset 112.
+        poke_bitmaps_extension(&mut buf, 112, 3, 2048, 0x50000);
+
+        let hdr = QcowHeader::parse(&buf).unwrap();
+        let result = parse_header_extensions(&buf, &hdr);
+        assert!(result.bitmaps_present);
+        assert!(!result.bitmaps_inconsistent);
+        assert_eq!(result.bitmap_nb_bitmaps, 3);
+        assert_eq!(result.bitmap_directory_size, 2048);
+        assert_eq!(result.bitmap_directory_offset, 0x50000);
+    }
+
+    #[test]
+    fn header_extensions_bitmaps_inconsistent_when_autoclear_clear() {
+        let mut buf = make_qcow2_header();
+        // Autoclear bit 0 left clear ⇒ extension present but stale.
+        poke_bitmaps_extension(&mut buf, 112, 3, 2048, 0x50000);
+
+        let hdr = QcowHeader::parse(&buf).unwrap();
+        let result = parse_header_extensions(&buf, &hdr);
+        assert!(!result.bitmaps_present);
+        assert!(result.bitmaps_inconsistent);
+        // The parsed offsets are still recorded for diagnostics.
+        assert_eq!(result.bitmap_nb_bitmaps, 3);
+        assert_eq!(result.bitmap_directory_size, 2048);
+        assert_eq!(result.bitmap_directory_offset, 0x50000);
+    }
+
+    #[test]
+    fn header_extensions_no_bitmaps_extension() {
+        let mut buf = make_qcow2_header();
+        // Set the autoclear bit, but provide no bitmaps extension.
+        buf[AUTOCLEAR_FEATURES_OFFSET..AUTOCLEAR_FEATURES_OFFSET + 8]
+            .copy_from_slice(&1u64.to_be_bytes());
+        let ext_off = 112;
+        buf[ext_off..ext_off + 4].copy_from_slice(&EXT_END.to_be_bytes());
+
+        let hdr = QcowHeader::parse(&buf).unwrap();
+        let result = parse_header_extensions(&buf, &hdr);
+        assert!(!result.bitmaps_present);
+        assert!(!result.bitmaps_inconsistent);
+        assert_eq!(result.bitmap_nb_bitmaps, 0);
+        assert_eq!(result.bitmap_directory_size, 0);
+        assert_eq!(result.bitmap_directory_offset, 0);
+    }
+
     // ---- validate_subcluster_bitmap ----
 
     #[test]
@@ -4633,6 +4762,7 @@ mod tests {
             true
         }
         unsafe extern "C" fn s_send_amend(_: *const shared::AmendResult) {}
+        unsafe extern "C" fn s_send_bitmap(_: *const shared::BitmapResult) {}
         shared::CallTable {
             magic: shared::CallTable::MAGIC,
             version: shared::CallTable::VERSION,
@@ -4671,6 +4801,7 @@ mod tests {
             send_snapshot_result: s_send_snap_res,
             fsync_input: s_fsync_in,
             send_amend_result: s_send_amend,
+            send_bitmap_result: s_send_bitmap,
         }
     }
 

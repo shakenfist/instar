@@ -620,6 +620,25 @@ pub fn send_amend_result(result: &shared::AmendResult) {
     send_message(&msg);
 }
 
+/// Send a bitmap result message.
+///
+/// Mirrors [`send_amend_result`]: numeric-passthrough (the `action`,
+/// `actions_applied` and `resulting_nb_bitmaps` codes are rendered
+/// host-side), with only `target_format` mapped via the shared
+/// `ImageFormat::name()` every sender already links. The core binary
+/// is near its 72 KiB ceiling, so no string/lookup tables live here.
+pub fn send_bitmap_result(result: &shared::BitmapResult) {
+    let target_name = shared::ImageFormat::from_u32(result.target_format).name();
+    let msg = guest_protocol::bitmap_result_message(
+        target_name,
+        result.error,
+        result.action,
+        result.actions_applied,
+        result.resulting_nb_bitmaps,
+    );
+    send_message(&msg);
+}
+
 /// Send a single map extent message.
 ///
 /// Called once per coalesced extent during the map operation,

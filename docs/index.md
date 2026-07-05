@@ -52,6 +52,7 @@ Features unique to instar that do not exist in qemu-img.
 | [Snapshot](snapshot.md) | `instar snapshot` - manage internal qcow2 snapshots |
 | [Amend](amend.md) | `instar amend` - change qcow2 image options (compat version, lazy_refcounts) |
 | [Dd](dd.md) | `instar dd` — windowed block copy (qemu-img dd compatible) |
+| [Bitmap](bitmap.md) | `instar bitmap` - manage qcow2 persistent dirty bitmaps |
 
 ## Compatibility
 

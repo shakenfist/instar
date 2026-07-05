@@ -553,6 +553,26 @@ provides a modular architecture with:
   Known divergences: vhdx default block size (32 MiB vs qemu's 8
   MiB for small images), count=0 vmdk/vhdx edge cases. See
   [docs/dd.md](docs/dd.md) for the full user reference.
+- **operations/bitmap/** - qcow2 persistent-dirty-bitmap management
+  operation (PLAN-bitmap, qcow2 v3-only). The host side (`run_bitmap`
+  in `src/vmm/src/main.rs`) validates the CLI surface (the repeatable
+  CLI-order actions `--add`/`--remove`/`--clear`/`--enable`/
+  `--disable`/`--merge`, the `-g` granularity, rejected qemu-only
+  flags), pre-probes the image, and hands a `BitmapConfig` to the
+  guest op, which mutates the image in place. The pure `no_std`
+  `crates/bitmap` planner provides the bitmap directory/table/action/
+  merge logic, reusing the snapshot refcount mutators to allocate and
+  free bitmap-table clusters. The guest applies each action under the
+  crash-safe **autoclear** dance (clearing the header's
+  `bitmaps` autoclear bit while the extension is inconsistent and
+  restoring it once the write settles) so a crash mid-update leaves
+  the image safe rather than corrupt. Needs `/dev/kvm` (launches a
+  guest VMM). The ABI appends one call-table callback
+  (`send_bitmap_result`), bumping `CallTable::VERSION` from 18 to 19
+  (same append-at-end discipline as amend's 17→18). Coverage:
+  `tests/test_bitmap.py` integration parity against `qemu-img
+  bitmap`, cross-version baselines, and fuzzing. See
+  [docs/bitmap.md](docs/bitmap.md).
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation,
@@ -915,7 +935,7 @@ A mock `CallTable` (in `src/fuzz/src/lib.rs`) backed by thread-local
 fuzzer input provides sector-based I/O, allowing libFuzzer to explore
 deeply malformed inputs.
 
-27 fuzz targets cover all parser crates: format detection, header
+29 fuzz targets cover all parser crates: format detection, header
 parsing (QCOW2, VMDK, VHD, VHDX, RAW, LUKS), L1/L2 cluster lookup,
 refcount table traversal, zlib decompression, grain directory lookup,
 BAT traversal, VHDX metadata parsing, the measure subcommand's
@@ -950,7 +970,12 @@ Finally, the dd subcommand adds `fuzz_dd_window` (the pure
 input-window math — count-clamp / skip-subtract / empty-on-overrun
 with saturating arithmetic), `fuzz_chs_rounded_size` (VHD/VHDX CHS
 geometry rounding) and `fuzz_dd_read` (the byte-accurate windowed
-qcow2 read primitives).
+qcow2 read primitives). The amend subcommand adds
+`fuzz_amend_planners`, and the bitmap subcommand adds
+`fuzz_bitmap_parse` (the qcow2 bitmap directory/table/extension
+parsers) plus `fuzz_bitmap_planners` (the bitmap crate's
+directory/action/merge functions over synthesised
+directory+refblocks).
 
 The seed corpus is extracted from `instar-testdata` by
 `scripts/extract-fuzz-corpus.py`, which filters images by format,

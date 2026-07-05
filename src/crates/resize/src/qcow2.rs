@@ -124,6 +124,7 @@ pub(crate) fn compute_grow_query(
         return Err(ResizeError::InvalidNewVirtualSize);
     }
     validate_incompat(q.current_incompatible_features)?;
+    validate_no_bitmaps(q.current_autoclear_features)?;
     if q.new_virtual_size < q.current_virtual_size {
         if !q.allow_shrink {
             return Err(ResizeError::ShrinkWithoutFlag);
@@ -399,6 +400,7 @@ pub(crate) fn plan_grow<'a>(
         return Err(ResizeError::InvalidNewVirtualSize);
     }
     validate_incompat(opts.current_incompatible_features)?;
+    validate_no_bitmaps(opts.current_autoclear_features)?;
     if opts.new_virtual_size < opts.current_virtual_size {
         if !opts.allow_shrink {
             return Err(ResizeError::ShrinkWithoutFlag);
@@ -1728,6 +1730,17 @@ fn validate_incompat(features: u64) -> Result<(), ResizeError> {
     Ok(())
 }
 
+/// Reject images carrying persistent dirty bitmaps. resize would
+/// discard them (build_header drops unknown extensions + zeroes
+/// autoclear), so refuse rather than silently lose data — matching
+/// snapshot's posture.
+fn validate_no_bitmaps(autoclear_features: u64) -> Result<(), ResizeError> {
+    if autoclear_features & qcow2::bitmap::AUTOCLEAR_BITMAPS_BIT != 0 {
+        return Err(ResizeError::BitmapsPresent);
+    }
+    Ok(())
+}
+
 /// Compute `cluster_bits` from `cluster_size`, validating that
 /// cluster_size is a power of two in the qcow2-permitted range.
 fn cluster_bits_from(cluster_size: u32) -> Result<u32, ResizeError> {
@@ -2095,6 +2108,7 @@ mod tests {
             current_refcount_table_offset: layout.refcount_table_offset,
             current_refcount_table_clusters: layout.refcount_table_clusters as u32,
             current_incompatible_features: 0,
+            current_autoclear_features: 0,
             preallocation: Preallocation::Off,
             allow_shrink: false,
             existing_refcount_table_bytes: rt_bytes_buf,
@@ -2109,6 +2123,41 @@ mod tests {
         let r = compute_grow_query(&q).unwrap();
         assert_eq!(r.action, Qcow2GrowAction::HeaderOnly);
         assert_eq!(r.required_blocks_len, 0);
+    }
+
+    #[test]
+    fn validate_no_bitmaps_accepts_clear() {
+        assert_eq!(validate_no_bitmaps(0), Ok(()));
+        // Other autoclear bits (unknown to us) do not trip the gate;
+        // only the bitmaps bit does.
+        assert_eq!(validate_no_bitmaps(1 << 3), Ok(()));
+    }
+
+    #[test]
+    fn validate_no_bitmaps_rejects_bitmaps_bit() {
+        assert_eq!(
+            validate_no_bitmaps(qcow2::bitmap::AUTOCLEAR_BITMAPS_BIT),
+            Err(ResizeError::BitmapsPresent)
+        );
+        // Set alongside other bits, still rejected.
+        assert_eq!(
+            validate_no_bitmaps(qcow2::bitmap::AUTOCLEAR_BITMAPS_BIT | (1 << 5)),
+            Err(ResizeError::BitmapsPresent)
+        );
+    }
+
+    #[test]
+    fn compute_grow_query_refuses_bitmaps() {
+        // A grow that would otherwise be a plain HeaderOnly path, but
+        // the autoclear bitmaps bit is set — must refuse rather than
+        // silently drop the on-disk bitmaps.
+        let mut rt = [0u8; 8192];
+        let mut q = make_query(&mut rt, 65536, 1 << 20, 4 << 20);
+        q.current_autoclear_features = qcow2::bitmap::AUTOCLEAR_BITMAPS_BIT;
+        assert_eq!(
+            compute_grow_query(&q).unwrap_err(),
+            ResizeError::BitmapsPresent
+        );
     }
 
     #[test]
