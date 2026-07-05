@@ -313,6 +313,16 @@ instar bitmap: mixing --merge with other actions in one invocation is not suppor
 - **Cross-granularity merge.** Rescale a source bitmap to the target's
   granularity during a merge, as qemu does, instead of refusing
   `bitmaps have incompatible granularity for merge`.
+- **Prune the empty EXT_BITMAPS record on last removal.** When the
+  final bitmap is removed, the guest overwrites the bitmaps extension
+  body in place to `(nb=0, size=0, offset=0)` rather than deleting the
+  32-byte record and restoring `EXT_END`. This is inert — `write_back`
+  leaves the autoclear bitmaps bit clear on last removal, so qemu
+  treats the present-but-autoclear-clear extension as absent per the
+  qcow2 spec, and the body is rewritten in place so nothing accumulates
+  across add/remove cycles. Deleting the record cleanly would require
+  relocating any following header-extension records, unlike the
+  append-only create path, so it is left as accepted behaviour.
 - **`instar info` bitmap listing.** Report the image's persistent
   bitmaps (name, granularity, flags, count) in `instar info` output so
   `qemu-img info` is no longer required to inspect them.

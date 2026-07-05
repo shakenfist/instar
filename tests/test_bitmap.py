@@ -789,6 +789,237 @@ def _install_merge_bits_tests():
 _install_merge_bits_tests()
 
 
+class TestBitmapSameInvocationAddThenFree(TestBitmapSmoke):
+    """Add-then-free the SAME bitmap in ONE `instar bitmap` invocation.
+
+    Regression for the stale-table-read corruption (PR #386 finding #1).
+    `action_add` allocates a table cluster but DEFERS zero-filling it to
+    write_back's end-of-loop ZeroList flush (nothing is written to disk
+    during the action loop, for crash safety). If a `--remove`/`--clear`
+    of that SAME freshly-added bitmap runs later in the SAME invocation,
+    the guest used to call `free_bitmap_data_clusters` on the just-added
+    table offset -- which READS the table cluster from disk. That cluster
+    was never written, so the read returned STALE bytes from whatever
+    previously occupied the reused cluster; decoded as bitmap-table
+    entries, any that looked `Allocated(offset)` had their refcount
+    zeroed -- silent corruption of live image structures (or a clean
+    ERROR_PARSE_FAILED, depending on the stale bytes).
+
+    The fix skips the on-disk table walk when the target table offset is
+    still pending in the ZeroList (i.e. freshly added this invocation,
+    never written, provably zero data clusters). These tests prove the
+    result passes `qemu-img check` and -- the strongest assertion -- that
+    an UNRELATED pre-seeded bitmap's live dirty extents are untouched.
+    """
+
+    def _diff_add_then_free(self, free_flag, cluster_size=DEFAULT_CLUSTER_SIZE):
+        """add + free the same bitmap 'foo' in one invocation; A vs B.
+
+        Runs `bitmap --add foo <free_flag> foo <IMG> foo` on an instar
+        copy (A) and a qemu copy (B). Asserts both exit 0, qemu-img
+        check(A) CLEAN (pre-fix A could be corrupt), and the bitmaps
+        arrays equivalent (neither should have 'foo').
+        """
+        self._require_kvm()
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            start = td / 'start.qcow2'
+            self._qemu_create(start, cluster_size=cluster_size)
+
+            path_a = td / 'a.qcow2'  # instar
+            path_b = td / 'b.qcow2'  # qemu
+            shutil.copy2(start, path_a)
+            shutil.copy2(start, path_b)
+
+            _, i_err, i_rc = self.run_instar_bitmap(
+                '--add', free_flag, str(path_a), 'foo')
+            self.assertEqual(
+                i_rc, 0,
+                f'instar bitmap --add {free_flag} foo (one invocation) '
+                f'failed (cluster_size={cluster_size}): stderr={i_err!r}')
+            _, q_err, q_rc = self._qemu_bitmap(
+                '--add', free_flag, str(path_b), 'foo')
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img bitmap --add {free_flag} foo (one invocation) '
+                f'failed (cluster_size={cluster_size}): stderr={q_err!r}')
+
+            # THE key assertion: pre-fix the stale table read could zero a
+            # live refcount and leave A corrupt.
+            _, chk_err, chk_rc = self.run_qemu_img_check(path_a)
+            self.assertEqual(
+                chk_rc, 0,
+                f'qemu-img check failed on instar output for '
+                f'--add {free_flag} foo (cluster_size={cluster_size}): '
+                f'{chk_err}')
+
+            # Both images should now have no 'foo' bitmap.
+            self.assert_bitmaps_equivalent(
+                path_a, path_b,
+                msg=f'same-invocation add+{free_flag} foo '
+                    f'(cluster_size={cluster_size})')
+
+    def test_add_then_remove_same_name(self):
+        """`--add foo --remove foo` in one invocation stays CLEAN."""
+        self._diff_add_then_free('--remove')
+
+    def test_add_then_clear_same_name(self):
+        """`--add foo --clear foo` in one invocation stays CLEAN.
+
+        `--clear` frees the data clusters then defers zeroing the table;
+        the stale-read walk lived on this path too, so it exercises a
+        distinct free_bitmap_data_clusters call site.
+        """
+        self._diff_add_then_free('--clear')
+
+    def _keep_bitmap_untouched(self, free_flag):
+        """Strongest corruption regression: a live bitmap survives intact.
+
+        Seed an UNRELATED bitmap 'keep' with SET bits (real data + table
+        clusters), copy to A (instar), then run `--add foo <free_flag>
+        foo` on A in ONE invocation. Pre-fix the guest walked foo's
+        never-written table, decoded stale bytes, and could zero the
+        refcount of one of keep's live clusters. Assert qemu-img check(A)
+        CLEAN and keep's dirty extents are IDENTICAL before and after.
+        """
+        self._require_kvm()
+
+        keep_writes = [(0, 128 * 1024), (1024 * 1024, 64 * 1024)]
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            start = td / 'start.qcow2'
+            self._qemu_create(start, cluster_size=_G, size='4M')
+
+            # Seed 'keep' with known dirty bits (add + writes + DISABLE) so
+            # it owns live data/table clusters a stale decode could clobber.
+            self._seed_bitmap(start, 'keep', keep_writes, granularity=_G)
+
+            path_a = td / 'a.qcow2'  # instar
+            shutil.copy2(start, path_a)
+
+            # Baseline keep extents BEFORE the add+free invocation.
+            keep_before = self._bitmap_dirty_extents(path_a, 'keep')
+            self.assertEqual(
+                keep_before, keep_writes,
+                f'seed sanity: keep extents {keep_before} != seeded '
+                f'{keep_writes}')
+
+            _, i_err, i_rc = self.run_instar_bitmap(
+                '--add', free_flag, str(path_a), 'foo')
+            self.assertEqual(
+                i_rc, 0,
+                f'instar bitmap --add {free_flag} foo (with live keep) '
+                f'failed: stderr={i_err!r}')
+
+            # Image must be structurally clean...
+            _, chk_err, chk_rc = self.run_qemu_img_check(path_a)
+            self.assertEqual(
+                chk_rc, 0,
+                f'qemu-img check failed after --add {free_flag} foo with '
+                f'live keep bitmap: {chk_err}')
+
+            # ...and keep's live dirty extents must be UNCHANGED -- proof
+            # the stale table read did not zero a live cluster's refcount.
+            keep_after = self._bitmap_dirty_extents(path_a, 'keep')
+            self.assertEqual(
+                keep_after, keep_before,
+                f'live keep bitmap corrupted by same-invocation '
+                f'--add {free_flag} foo:\n'
+                f'  before: {keep_before}\n  after:  {keep_after}')
+
+    def test_add_then_remove_keeps_live_bitmap(self):
+        """`--add foo --remove foo` leaves an unrelated 'keep' intact."""
+        self._keep_bitmap_untouched('--remove')
+
+    def test_add_then_clear_keeps_live_bitmap(self):
+        """`--add foo --clear foo` leaves an unrelated 'keep' intact."""
+        self._keep_bitmap_untouched('--clear')
+
+    def _reuse_stale_table_corruption(self, free_flag):
+        """Deterministic stale-table-reuse corruption reproduction.
+
+        Force the freshly-added bitmap's DEFERRED (never-written) table
+        cluster to REUSE a freed cluster that still holds a stale
+        `Allocated(offset)` bitmap-table entry pointing at a NOW-LIVE
+        cluster, then free that bitmap in the SAME invocation. Pre-fix,
+        `free_bitmap_data_clusters` read the never-written table cluster,
+        decoded the stale entry, and zeroed a LIVE cluster's refcount --
+        qemu-img check reports `refcount=0 reference=1`. Post-fix the
+        walk is skipped for a freshly-added table, so the image is CLEAN.
+
+        Recipe (verified to corrupt pre-fix on qemu-img 10.0.8):
+          1. Add a bitmap 'victim' with SET bits: qemu allocates a data
+             cluster D and a table cluster T whose entry is
+             `Allocated(D)`.
+          2. Remove 'victim': qemu ZEROES D but leaves T's stale
+             `Allocated(D)` bytes on disk, both now freed (refcount 0).
+          3. Reallocate the low freed clusters (INCLUDING D) with fresh
+             guest-data writes, so D becomes LIVE again while the stale
+             table cluster T remains the lowest free cluster.
+          4. `--add foo <free_flag> foo` in ONE invocation: foo's add
+             reuses T (deferred, unwritten); the same-invocation free
+             walked T pre-fix and zeroed D's (now live) refcount.
+
+        Which cluster the linear-scan allocator lands on is qcow2-layout
+        dependent, so a few guest-write counts are swept. The fix makes
+        EVERY one CLEAN regardless of the cluster reused (the invariant
+        under test); at least one count reproduced the corruption pre-fix
+        (n_writes=1 -> `cluster 4 refcount=0`, n_writes=3 ->
+        `cluster 9 refcount=0`).
+        """
+        self._require_kvm()
+
+        for n_writes in (1, 2, 3, 4):
+            with tempfile.TemporaryDirectory() as td:
+                td = Path(td)
+                img = td / 'img.qcow2'
+                self._qemu_create(img, cluster_size=_G, size='4M')
+
+                # victim: a table cluster holding Allocated(data-cluster).
+                _, err, rc = self._qemu_bitmap(
+                    '--add', '-g', str(_G), str(img), 'victim')
+                self.assertEqual(rc, 0, f'add victim failed: {err!r}')
+                self._qemu_io(img, 'write 0 128k')
+                _, err, rc = self._qemu_bitmap('--remove', str(img), 'victim')
+                self.assertEqual(rc, 0, f'remove victim failed: {err!r}')
+
+                # Reallocate the low freed clusters (incl. victim's old
+                # data cluster) so the stale entry's target is LIVE.
+                off = 1024 * 1024
+                for _ in range(n_writes):
+                    self._qemu_io(img, f'write {off} 64k')
+                    off += 128 * 1024
+
+                path_a = td / 'a.qcow2'
+                shutil.copy2(img, path_a)
+
+                _, i_err, i_rc = self.run_instar_bitmap(
+                    '--add', free_flag, str(path_a), 'foo')
+                self.assertEqual(
+                    i_rc, 0,
+                    f'instar --add {free_flag} foo (n_writes={n_writes}) '
+                    f'failed: stderr={i_err!r}')
+
+                # THE regression assertion: the stale-table walk must not
+                # have zeroed a live cluster's refcount.
+                _, chk_err, chk_rc = self.run_qemu_img_check(path_a)
+                self.assertEqual(
+                    chk_rc, 0,
+                    f'stale-table reuse corrupted the image for '
+                    f'--add {free_flag} foo (n_writes={n_writes}): '
+                    f'qemu-img check: {chk_err}')
+
+    def test_stale_table_reuse_remove_stays_clean(self):
+        """add + `--remove` reusing a stale table cluster stays CLEAN."""
+        self._reuse_stale_table_corruption('--remove')
+
+    def test_stale_table_reuse_clear_stays_clean(self):
+        """add + `--clear` reusing a stale table cluster stays CLEAN."""
+        self._reuse_stale_table_corruption('--clear')
+
+
 # ----------------------------------------------------------------------
 # TestBitmapRefusals -- the error-path contracts (step 7c, Mission §4).
 #

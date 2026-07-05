@@ -770,6 +770,14 @@ impl ZeroList {
         self.len += 1;
         true
     }
+
+    /// Whether `off` is a pending-zero (not-yet-written) table cluster
+    /// offset. Used to detect a table that was freshly added earlier in
+    /// this same invocation and therefore has no on-disk contents to
+    /// walk (see [`run_actions`]).
+    fn contains(&self, off: u64) -> bool {
+        self.offsets[..self.len].iter().any(|&o| o == off)
+    }
 }
 
 /// Number of refcount entries per staged refcount block
@@ -985,15 +993,33 @@ unsafe fn run_actions(
                 };
                 // Free the removed bitmap's data clusters (crate freed
                 // the table clusters; guest frees the data clusters).
-                if let Err(e) = free_bitmap_data_clusters(
-                    call_table,
-                    sector_size,
-                    cluster_size,
-                    refblock_count,
-                    o.freed_table_offset,
-                    o.freed_table_size,
-                ) {
-                    return make_result(config, last_action, e);
+                //
+                // Skip the on-disk table walk if this table was freshly
+                // added earlier in THIS invocation: its clusters are in
+                // `zeros` (pending write-back), never written to disk, so
+                // a walk would read stale bytes from the reused cluster
+                // and mis-decode them as bitmap-table entries — zeroing
+                // the refcount of whatever those stale offsets point at
+                // (silent corruption). A freshly-added bitmap provably
+                // has zero data clusters (add allocates only an all-zero
+                // table), so there is nothing to free. Testing just the
+                // first table cluster (`freed_table_offset`) suffices:
+                // add pushes ALL of a table's clusters to `zeros`, they
+                // are contiguous from the entry's `bitmap_table_offset`,
+                // and remove reports that same offset as
+                // `freed_table_offset` — so membership of the first
+                // cluster implies the whole table is freshly added.
+                if !zeros.contains(o.freed_table_offset) {
+                    if let Err(e) = free_bitmap_data_clusters(
+                        call_table,
+                        sector_size,
+                        cluster_size,
+                        refblock_count,
+                        o.freed_table_offset,
+                        o.freed_table_size,
+                    ) {
+                        return make_result(config, last_action, e);
+                    }
                 }
                 o
             }
@@ -1005,15 +1031,25 @@ unsafe fn run_actions(
                     };
                 // Free the data clusters, then remember to zero the
                 // (still-allocated) table clusters on write-back.
-                if let Err(e) = free_bitmap_data_clusters(
-                    call_table,
-                    sector_size,
-                    cluster_size,
-                    refblock_count,
-                    o.freed_table_offset,
-                    o.freed_table_size,
-                ) {
-                    return make_result(config, last_action, e);
+                //
+                // Skip the on-disk table walk if this table was freshly
+                // added earlier in THIS invocation (same reasoning as the
+                // ACTION_REMOVE branch above): its clusters are pending in
+                // `zeros`, never written to disk, so a walk would decode
+                // stale bytes as bitmap-table entries and corrupt live
+                // refcounts. A freshly-added table is all-zero with no
+                // data clusters, so there is nothing to free.
+                if !zeros.contains(o.freed_table_offset) {
+                    if let Err(e) = free_bitmap_data_clusters(
+                        call_table,
+                        sector_size,
+                        cluster_size,
+                        refblock_count,
+                        o.freed_table_offset,
+                        o.freed_table_size,
+                    ) {
+                        return make_result(config, last_action, e);
+                    }
                 }
                 if o.zero_freed_table {
                     let table_clusters = table_cluster_count(o.freed_table_size, cluster_size);
@@ -1373,6 +1409,22 @@ where
 ///   bitmaps extension): CREATE a new EXT_BITMAPS record by
 ///   overwriting the terminating EXT_END with the new record and
 ///   writing a fresh EXT_END after it, all within the header cluster.
+///
+/// Removing the LAST bitmap intentionally leaves the (now empty)
+/// EXT_BITMAPS record in place — overwritten to (nb=0, size=0,
+/// offset=0) — rather than deleting the 32-byte record and restoring
+/// EXT_END. This is NOT a clean mirror of the create-insert branch: the
+/// create path only ever *appends* (it overwrites the terminating
+/// EXT_END at the end of the extension area), whereas EXT_BITMAPS may
+/// sit before other header-extension records, so deleting it would
+/// require relocating every subsequent record down by 32 bytes and
+/// rewriting a larger header span — meaningfully more complex and
+/// riskier than the append-only create path. The empty record is inert:
+/// `write_back` leaves the autoclear bitmaps bit CLEAR on last removal,
+/// so per the qcow2 spec qemu treats the present-but-autoclear-clear
+/// extension as inconsistent/absent. The body is overwritten in place,
+/// so there is no byte accumulation across repeated add/remove cycles.
+/// Documented as accepted behaviour (see docs/bitmap.md "Future work").
 ///
 /// # Safety
 ///
