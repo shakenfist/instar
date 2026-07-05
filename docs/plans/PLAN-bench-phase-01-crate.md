@@ -788,3 +788,51 @@ way to qemu's own rendered output.
   phase 4/6 don't pin the format explicitly in their own
   invocations; noting it here so later phases don't mistake it
   for part of the bench contract.
+
+## Captured flush-count verification (step 1c)
+
+Method: `strace -f -e trace=fdatasync,fsync` differencing against a
+scratch 10 MiB raw image (`qemu-img create -f raw b.raw 10M`), running a
+baseline `qemu-img bench -f raw -w -d 1 -c C -s 4096 -t writeback b.raw`
+(no `--flush-interval`) and a flush run of the same command plus
+`--flush-interval I`, counting `fdatasync`/`fsync` syscall lines in each.
+All counts were stable across repeated runs.
+
+| (count, interval) | baseline syscalls | flush-run syscalls | difference | `total_flushes()` | match? |
+|---|---|---|---|---|---|
+| (100, 50)  | 1 | 2 | 1 | 2 | yes (flush-run total) |
+| (101, 50)  | 1 | 3 | 2 | 3 | yes (flush-run total) |
+| (100, 100) | 1 | 1 | 0 | 1 | yes (flush-run total) |
+| (75, 25)   | 1 | 3 | 2 | 3 | yes (flush-run total) |
+| (1, 1)     | 1 | 1 | 0 | 1 | yes (flush-run total) |
+
+Measurement-method note (formula NOT adjusted): the naive
+`flush-run − baseline` difference lands one short of `total_flushes()`
+in every vector, because the assumption behind differencing — that the
+image-close flush fires unconditionally in both runs — is false. qemu's
+close-path flush is dirty-conditional: a **read** test issues 0 flushes
+total (nothing dirty at close), a **write** test with no
+`--flush-interval` issues exactly 1 (the image is dirty, so close flushes
+once — this is the baseline's single syscall), and a write **flush** run
+always ends with the trailing bench flush at `k == count`
+(`remaining == 0`, `0 % interval == 0`), which leaves the image clean and
+therefore **suppresses** the close-path flush. So the correct comparison
+is the flush-run *total* against `total_flushes()`, not the difference —
+and the flush-run total matches exactly for all five vectors (2, 3, 1, 3,
+1). The one-flush baseline is the close flush that the flush run no longer
+needs. The formula is confirmed against the live qemu-img 10.0.8 binary;
+the derivation from `bench_cb` stands, and only the differencing method
+(which double-assumes an unconditional close flush) was corrected.
+
+One epistemic footnote (management review): the flush-run totals alone
+cannot distinguish "`total_flushes()` bench flushes with the close
+flush suppressed" from "`total_flushes() − 1` bench flushes plus a
+dirty-close flush" — both hypotheses predict identical syscall totals
+on every vector above. The distinction is settled by the source, not
+the strace: `bench_cb` unambiguously issues the trailing flush at
+`remaining == 0` (`0 % x == 0` is true and `in_flight == 0` on the
+serial path), and the trailing flush's placement *inside the timed
+window* likewise comes from the source (the main loop only exits once
+the flush completion has re-entered `bench_cb`). The empirical table
+confirms the per-run flush *total*, which is the contract instar must
+reproduce; the position claims rest on the quoted C.

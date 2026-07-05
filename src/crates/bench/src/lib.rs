@@ -365,6 +365,73 @@ impl Iterator for TransferSplit {
     }
 }
 
+/// Whether a flush is issued *after* the `completed`-th request finishes.
+///
+/// Derived directly from qemu's `bench_cb` completion path (qemu-img.c,
+/// v10.0.8 lines 4439–4505):
+///
+/// ```c
+/// } else if (b->in_flight > 0) {
+///     int remaining = b->n - b->in_flight;
+///     b->n--;
+///     b->in_flight--;
+///     /* Time for flush? Drain queue if requested, then flush */
+///     if (b->flush_interval && remaining % b->flush_interval == 0) {
+///         if (!b->in_flight || !b->drain_on_flush) {
+///             ... blk_aio_flush(b->blk, cb, b); ...
+///         }
+///         if (b->drain_on_flush) { return; }
+///     }
+/// }
+/// ```
+///
+/// `remaining = b->n - b->in_flight` is computed *before* decrementing
+/// both. `b->n` counts still-uncompleted requests (starts at `count`,
+/// decremented at each completion). Under instar's serial execution
+/// `in_flight == 1` at every completion, so when the `k`-th request of
+/// `count` completes, `n = count - k + 1` and therefore
+/// `remaining = n - 1 = count - k`. A flush fires iff
+/// `flush_interval != 0 && (count - k) % flush_interval == 0`, for
+/// `k ∈ 1..=count`. This includes a **trailing flush at `k == count`**
+/// (`remaining == 0`, and `0 % x == 0`), which happens inside the timed
+/// window.
+///
+/// Depth independence: at depth > 1 the flush *positions* shift to drain
+/// boundaries, but the flush *count* is identical, because qemu enforces
+/// `flush_interval >= depth` (a validated invariant), which makes
+/// `remaining` land on each multiple of `flush_interval` exactly once. So
+/// this serial formula is the correct v1 semantics for any accepted depth.
+///
+/// Panic-free: no division unless `flush_interval != 0`, and `completed`
+/// is range-guarded (`1..=count`) so `count - completed` never underflows.
+pub fn flush_after_completion(count: u32, completed: u32, flush_interval: u32) -> bool {
+    flush_interval != 0
+        && completed >= 1
+        && completed <= count
+        && (count - completed).is_multiple_of(flush_interval)
+}
+
+/// The total number of flushes a whole bench run issues.
+///
+/// Equal to the number of `k ∈ 1..=count` for which
+/// [`flush_after_completion`] is true. Since a flush fires exactly when
+/// `(count - k) % flush_interval == 0`, and `count - k` ranges over
+/// `0..count` as `k` runs over `1..=count`, the count of multiples of
+/// `flush_interval` in `[0, count)` is `(count - 1) / flush_interval + 1`
+/// (integer division).
+///
+/// Panic-free: `flush_interval == 0` short-circuits to `0` (never divides
+/// by zero), and `count == 0` short-circuits to `0` so the `count - 1`
+/// never underflows. Validated params never pass `count == 0`, but the
+/// function is sensible and total on all inputs.
+pub fn total_flushes(count: u32, flush_interval: u32) -> u32 {
+    if flush_interval == 0 || count == 0 {
+        0
+    } else {
+        (count - 1) / flush_interval + 1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Unit tests for `BenchParams::validate` and `effective_step`.
@@ -794,5 +861,142 @@ mod tests {
         // A range near the top of the address space: offset saturates,
         // the iterator still terminates.
         assert_split_invariants(u64::MAX - 100000, 100000, 65536);
+    }
+
+    // ---- flush_after_completion / total_flushes ----
+
+    /// Collect the completion indices `k ∈ 1..=count` at which a flush
+    /// fires, for a given `(count, interval)`.
+    fn flush_positions(count: u32, interval: u32) -> [u32; 8] {
+        // Small fixed buffer is enough for the verification vectors.
+        let mut out = [0u32; 8];
+        let mut n = 0usize;
+        for k in 1..=count {
+            if flush_after_completion(count, k, interval) {
+                out[n] = k;
+                n += 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn vector_100_50() {
+        // Flushes after k = 50, 100; total 2.
+        assert!(flush_after_completion(100, 50, 50));
+        assert!(flush_after_completion(100, 100, 50));
+        assert_eq!(&flush_positions(100, 50)[..2], &[50, 100]);
+        assert_eq!(
+            (1..=100)
+                .filter(|&k| flush_after_completion(100, k, 50))
+                .count(),
+            2
+        );
+        assert_eq!(total_flushes(100, 50), 2);
+    }
+
+    #[test]
+    fn vector_101_50() {
+        // Flushes after k = 1, 51, 101; total 3 — note the immediate flush
+        // after the FIRST completion (remaining = 101 - 1 = 100, 100 % 50).
+        assert!(flush_after_completion(101, 1, 50));
+        assert!(flush_after_completion(101, 51, 50));
+        assert!(flush_after_completion(101, 101, 50));
+        assert_eq!(&flush_positions(101, 50)[..3], &[1, 51, 101]);
+        assert_eq!(total_flushes(101, 50), 3);
+    }
+
+    #[test]
+    fn vector_100_100() {
+        // Single flush at k = 100; total 1.
+        assert!(flush_after_completion(100, 100, 100));
+        assert_eq!(&flush_positions(100, 100)[..1], &[100]);
+        assert_eq!(total_flushes(100, 100), 1);
+    }
+
+    #[test]
+    fn vector_75_25() {
+        // Flushes after k = 25, 50, 75; total 3.
+        assert_eq!(&flush_positions(75, 25)[..3], &[25, 50, 75]);
+        assert_eq!(total_flushes(75, 25), 3);
+    }
+
+    #[test]
+    fn vector_1_1() {
+        // Single completion, single flush at k = 1; total 1.
+        assert!(flush_after_completion(1, 1, 1));
+        assert_eq!(&flush_positions(1, 1)[..1], &[1]);
+        assert_eq!(total_flushes(1, 1), 1);
+    }
+
+    #[test]
+    fn interval_zero_never_flushes() {
+        for k in 1..=10 {
+            assert!(!flush_after_completion(10, k, 0));
+        }
+        assert_eq!(total_flushes(10, 0), 0);
+        assert_eq!(total_flushes(75000, 0), 0);
+    }
+
+    #[test]
+    fn completed_zero_is_false() {
+        assert!(!flush_after_completion(100, 0, 50));
+    }
+
+    #[test]
+    fn completed_above_count_is_false() {
+        assert!(!flush_after_completion(100, 101, 50));
+        assert!(!flush_after_completion(100, 200, 1));
+    }
+
+    #[test]
+    fn count_equal_interval_single_flush_at_count() {
+        // count == interval: only k == count satisfies (count - k) % i == 0
+        // within 1..=count (k < count gives remaining in 1..count, none a
+        // multiple of interval == count).
+        assert!(flush_after_completion(50, 50, 50));
+        for k in 1..50 {
+            assert!(!flush_after_completion(50, k, 50));
+        }
+        assert_eq!(total_flushes(50, 50), 1);
+    }
+
+    #[test]
+    fn interval_greater_than_count_single_final_flush() {
+        // interval > count: only k == count fires ((count - count) % i == 0);
+        // total_flushes = (count - 1) / i + 1 == 1 since count - 1 < i.
+        assert!(flush_after_completion(10, 10, 25));
+        for k in 1..10 {
+            assert!(!flush_after_completion(10, k, 25));
+        }
+        assert_eq!(total_flushes(10, 25), 1);
+    }
+
+    #[test]
+    fn count_zero_no_panic() {
+        assert_eq!(total_flushes(0, 50), 0);
+        assert_eq!(total_flushes(0, 0), 0);
+        assert!(!flush_after_completion(0, 0, 50));
+        assert!(!flush_after_completion(0, 1, 50));
+    }
+
+    #[test]
+    fn total_flushes_matches_per_completion_count() {
+        // Property: total_flushes equals the number of completions at which
+        // a flush fires, across a grid of small counts and intervals.
+        for count in 1..=40u32 {
+            for interval in 0..=45u32 {
+                let by_loop = (1..=count)
+                    .filter(|&k| flush_after_completion(count, k, interval))
+                    .count() as u32;
+                assert_eq!(
+                    total_flushes(count, interval),
+                    by_loop,
+                    "mismatch at count={} interval={}",
+                    count,
+                    interval
+                );
+            }
+        }
     }
 }
