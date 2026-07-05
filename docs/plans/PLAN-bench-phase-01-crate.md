@@ -358,3 +358,433 @@ instar-convenient approximations; steps 1d and 1e are
 investigation/capture deliverables that append to plan documents
 rather than changing product code; and a flush-formula mismatch
 in 1c is escalated, never absorbed.
+
+## Captured qemu-img 10.0.8 message contract (step 1e)
+
+Empirical capture only — no source changes. Ran the local
+`qemu-img bench` binary against a scratch 10 MiB raw image
+(`probe.raw`, created with `qemu-img create -f raw probe.raw
+10M`) and a zero-byte file (`empty.raw`, `truncate -s 0`), both
+in a session scratchpad directory, then discarded.
+
+```
+$ qemu-img --version
+qemu-img version 10.0.8 (Debian 1:10.0.8+ds-0+deb13u1+b2)
+Copyright (c) 2003-2025 Fabrice Bellard and the QEMU Project developers
+```
+
+### `BenchParamError` → captured qemu message
+
+| `BenchParamError` variant | Captured qemu-img 10.0.8 message | Invocation |
+|---|---|---|
+| `CountOutOfRange` | `Invalid request count specified. Must be between 1 and 2147483647.` | 1, 2 |
+| `DepthOutOfRange` | `Invalid queue depth specified. Must be between 1 and 2147483647.` | 3 |
+| `BufsizeOutOfRange` | `Invalid buffer size specified. Must be between 1 and 2147483647.` | 4, 5 |
+| `StepOutOfRange` | `Invalid step size specified. Must be between 0 and 2147483647.` | 22, 23 (supplement) |
+| `FlushRequiresWrite` | `--flush-interval is only available in write tests` | 8 |
+| `FlushIntervalSmallerThanDepth` | `Flush interval can't be smaller than depth` | 9 |
+| `BufsizeAboveInstarCap` | instar-only — no qemu analog. qemu's own range check runs first, so an absurd `-s 3G` never reaches instar's 2 MiB cap; it surfaces qemu's `BufsizeOutOfRange` text (see invocation 5). Phase 4 must order its checks the same way (qemu bound first) so this variant only ever fires for `bufsize` values *inside* qemu's [1, 2147483647] range but above `BENCH_MAX_BUFSIZE`. | n/a |
+
+Pattern out-of-range (invocations 6, 7) is **not** a
+`BenchParamError` variant per Mission §2 — `pattern: u8` makes
+values above 255 unrepresentable in `BenchParams`, so that
+refusal belongs to the phase-4 host parser, not this crate. Its
+captured text (`Invalid pattern byte specified. Must be between
+0 and 255.`) still feeds phase 4's message table, just outside
+the `BenchParamError` enum.
+
+Two more captured messages have no `BenchParamError` mapping at
+all but are needed by phase 4/6 regardless: the cache-mode
+refusal (`-t bogus`, invocation 11) and the aio-backend refusal
+(`-i bogus`, invocation 12) — both are qemu option-parsing errors
+that instar's CLI will need its own text for, since `-t`/`-i`
+aren't part of `BenchParams`.
+
+### Per-invocation captures
+
+#### 1. `qemu-img bench -c 0 probe.raw`
+
+```
+$ qemu-img bench -c 0 probe.raw
+exit: 1
+stdout:
+stderr:
+qemu-img: Invalid request count specified. Must be between 1 and 2147483647.
+```
+
+#### 2. `qemu-img bench -c -1 probe.raw`
+
+```
+$ qemu-img bench -c -1 probe.raw
+exit: 1
+stdout:
+stderr:
+qemu-img: Invalid request count specified. Must be between 1 and 2147483647.
+```
+
+Identical message to `-c 0`: qemu does not distinguish "zero" from
+"negative" in the count parser — both collapse to the same
+range-check text. `BenchParamError::CountOutOfRange` should do
+the same (one variant, one message, regardless of which side of
+the range was violated — `count` is `u32` in `BenchParams` so a
+literal negative can't reach the type anyway; the phase-4 parser
+owns rejecting `-1` before it becomes a `u32`).
+
+#### 3. `qemu-img bench -d 0 probe.raw`
+
+```
+$ qemu-img bench -d 0 probe.raw
+exit: 1
+stdout:
+stderr:
+qemu-img: Invalid queue depth specified. Must be between 1 and 2147483647.
+```
+
+#### 4. `qemu-img bench -s 0 probe.raw`
+
+```
+$ qemu-img bench -s 0 probe.raw
+exit: 1
+stdout:
+stderr:
+qemu-img: Invalid buffer size specified. Must be between 1 and 2147483647.
+```
+
+#### 5. `qemu-img bench -s 3G probe.raw`
+
+```
+$ qemu-img bench -s 3G probe.raw
+exit: 1
+stdout:
+stderr:
+qemu-img: Invalid buffer size specified. Must be between 1 and 2147483647.
+```
+
+3 GiB (`3221225472`) exceeds `QEMU_BENCH_ARG_MAX`
+(`2147483647`), so this is rejected by qemu's own range check —
+it never reaches instar's `BENCH_MAX_BUFSIZE` (2 MiB) cap. This
+confirms the Mission's stated precedence (qemu-range check
+first, then instar cap) is also what qemu itself does: there is
+only one bound at this size, and it is qemu's. Phase 4 must not
+short-circuit on the instar cap before the qemu bound, or a `-s
+3G` request would get the wrong (instar-worded) message.
+
+#### 6. `qemu-img bench --pattern 256 -w -c 10 probe.raw`
+
+```
+$ qemu-img bench --pattern 256 -w -c 10 probe.raw
+exit: 1
+stdout:
+stderr:
+qemu-img: Invalid pattern byte specified. Must be between 0 and 255.
+```
+
+#### 7. `qemu-img bench --pattern -1 -w -c 10 probe.raw`
+
+```
+$ qemu-img bench --pattern -1 -w -c 10 probe.raw
+exit: 1
+stdout:
+stderr:
+qemu-img: Invalid pattern byte specified. Must be between 0 and 255.
+```
+
+Same message for both the above-range and negative case, same
+pattern as `-c`/`-c -1` above.
+
+#### 8. `qemu-img bench --flush-interval 50 -c 100 probe.raw`
+
+```
+$ qemu-img bench --flush-interval 50 -c 100 probe.raw
+exit: 1
+stdout:
+stderr:
+qemu-img: --flush-interval is only available in write tests
+```
+
+#### 9. `qemu-img bench -w -d 64 --flush-interval 32 -c 100 probe.raw`
+
+```
+$ qemu-img bench -w -d 64 --flush-interval 32 -c 100 probe.raw
+exit: 1
+stdout:
+stderr:
+qemu-img: Flush interval can't be smaller than depth
+```
+
+#### 10. `qemu-img bench --pattern 65 -c 100 probe.raw`
+
+```
+$ qemu-img bench --pattern 65 -c 100 probe.raw
+exit: 0
+stdout:
+Sending 100 read requests, 4096 bytes each, 64 in parallel (starting at offset 0, step size 4096)
+Run completed in 0.001 seconds.
+stderr:
+```
+
+Confirms the Mission's documented non-check: `--pattern` without
+`-w` is silently accepted (exit 0), not an error. The pattern
+value has no visible effect on a read test's output — as
+expected, since qemu only uses `pattern` to fill write buffers.
+
+#### 11. `qemu-img bench -t bogus -c 100 probe.raw`
+
+```
+$ qemu-img bench -t bogus -c 100 probe.raw
+exit: 1
+stdout:
+stderr:
+qemu-img: Invalid cache mode
+```
+
+Terser than the numeric-range messages — no "must be one of"
+list of valid cache-mode names is included.
+
+#### 12. `qemu-img bench -i bogus -c 100 probe.raw`
+
+```
+$ qemu-img bench -i bogus -c 100 probe.raw
+exit: 1
+stdout:
+stderr:
+qemu-img: Invalid aio option: bogus
+```
+
+Unlike `-t`, this message echoes the offending value back
+(`bogus`) rather than being generic.
+
+#### 13. `qemu-img bench -t none -c 100 probe.raw`
+
+```
+$ qemu-img bench -t none -c 100 probe.raw
+exit: 0
+stdout:
+Sending 100 read requests, 4096 bytes each, 64 in parallel (starting at offset 0, step size 4096)
+Run completed in 0.001 seconds.
+stderr:
+```
+
+Divergence-registry material: qemu accepts `-t none` (no host
+page cache, direct I/O) and runs the benchmark normally; instar
+v1 will refuse this cache mode outright. This is qemu's captured
+*success* behaviour for the case instar diverges on.
+
+#### 14. `qemu-img bench --image-opts -f raw -c 100 probe.raw`
+
+```
+$ qemu-img bench --image-opts -f raw -c 100 probe.raw
+exit: 1
+stdout:
+stderr:
+qemu-img: --image-opts and --format are mutually exclusive
+```
+
+#### 15. `qemu-img bench`
+
+```
+$ qemu-img bench
+exit: 1
+stdout:
+stderr:
+qemu-img: Expecting one image file name
+Try 'qemu-img bench --help' for more info
+```
+
+Two stderr lines: the error itself, plus a "Try --help" hint
+line. Both are needed if instar's message table reproduces this
+text verbatim.
+
+#### 16. `qemu-img bench -c 100 probe.raw probe.raw`
+
+```
+$ qemu-img bench -c 100 probe.raw probe.raw
+exit: 1
+stdout:
+stderr:
+qemu-img: Expecting one image file name
+Try 'qemu-img bench --help' for more info
+```
+
+Identical text to the no-filename case (15) — qemu does not
+distinguish "zero filenames" from "too many filenames" in its
+message.
+
+#### 17. `qemu-img bench -o -1 -c 100 probe.raw`
+
+```
+$ qemu-img bench -o -1 -c 100 probe.raw
+exit: 1
+stdout:
+stderr:
+qemu-img: Invalid offset specified. Must be between 0 and 9223372036854775807.
+```
+
+Upper bound is `i64::MAX` (`9223372036854775807`), matching the
+Mission's stated offset bound of `[0, i64::MAX]` — distinct from
+the `u32`-ish `2147483647` bound used for count/depth/bufsize/step.
+
+#### 18. `qemu-img bench -o 1k -c 100 probe.raw`
+
+```
+$ qemu-img bench -o 1k -c 100 probe.raw
+exit: 0
+stdout:
+Sending 100 read requests, 4096 bytes each, 64 in parallel (starting at offset 1024, step size 4096)
+Run completed in 0.001 seconds.
+stderr:
+```
+
+Confirms `qemu_strtosz`-style suffixes are accepted for `-o`
+(`1k` → 1024) and the parsed value is echoed in decimal bytes in
+the "starting at offset" header — this is a *host* (phase 4)
+parsing concern per the Mission's "Out of scope" list, captured
+here only to pin the header's rendering of the parsed value.
+
+#### 19. `qemu-img bench -c 100 empty.raw`
+
+```
+$ qemu-img bench -c 100 empty.raw
+exit: 1
+stdout:
+Sending 100 read requests, 4096 bytes each, 64 in parallel (starting at offset 0, step size 4096)
+stderr:
+qemu-img: Failed request: Input/output error
+```
+
+No up-front size check against the (zero-byte) image, confirming
+the Mission's "no offset/count/step bounds check against image
+size" note — the header line is printed unconditionally, and the
+image-size violation only surfaces once the first request is
+issued, as an I/O failure rather than a validation error. No
+"Run completed" line is printed on this path.
+
+#### 20. `qemu-img bench -c 100 -s 4096 probe.raw`
+
+```
+$ qemu-img bench -c 100 -s 4096 probe.raw
+exit: 0
+stdout:
+Sending 100 read requests, 4096 bytes each, 64 in parallel (starting at offset 0, step size 4096)
+Run completed in 0.001 seconds.
+stderr:
+```
+
+Plain successful read test: exactly two stdout lines (no flush
+line, since `--flush-interval` was not given). Timing precision
+is exactly 3 decimal places (`0.001 seconds.`), matching qemu's
+`%0.3f` format.
+
+#### 21. `qemu-img bench -w --flush-interval 50 -c 100 -d 1 probe.raw`
+
+```
+$ qemu-img bench -w --flush-interval 50 -c 100 -d 1 probe.raw
+exit: 0
+stdout:
+Sending 100 write requests, 4096 bytes each, 1 in parallel (starting at offset 0, step size 4096)
+Sending flush every 50 requests
+Run completed in 0.004 seconds.
+stderr:
+WARNING: Image format was not specified for 'probe.raw' and probing guessed raw.
+         Automatically detecting the format is dangerous for raw images, write operations on block 0 will be restricted.
+         Specify the 'raw' format explicitly to remove the restrictions.
+```
+
+Three stdout lines when a write test has a nonzero
+`--flush-interval`: the "Sending N write requests..." header,
+then a distinct "Sending flush every N requests" line, then "Run
+completed". This third-line case is what the task brief calls
+"all three stdout lines" — plain reads (20) only ever show two.
+Note also the unrelated stderr WARNING: because no `-f raw` was
+given on a *write* test against a raw image, qemu's raw-format
+auto-detection warning appears on stderr. This is not part of the
+bench message contract itself but phase 4's CLI should pass an
+explicit format to keep this noise out of `-w` runs.
+
+### Supplement: `StepOutOfRange` (not in the original matrix)
+
+The assigned invocation matrix did not include a `-S`/`--step-size`
+out-of-range case, but `BenchParamError::StepOutOfRange` needs a
+captured message like every other variant. Three extra probes
+were run to fill this gap:
+
+#### 22. `qemu-img bench -S -1 -c 100 probe.raw`
+
+```
+$ qemu-img bench -S -1 -c 100 probe.raw
+exit: 1
+stdout:
+stderr:
+qemu-img: Invalid step size specified. Must be between 0 and 2147483647.
+```
+
+#### 23. `qemu-img bench -S 2147483648 -c 100 probe.raw`
+
+```
+$ qemu-img bench -S 2147483648 -c 100 probe.raw
+exit: 1
+stdout:
+stderr:
+qemu-img: Invalid step size specified. Must be between 0 and 2147483647.
+```
+
+One past `QEMU_BENCH_ARG_MAX` (`2147483648`) triggers the same
+text as a negative step — same zero/negative-collapse pattern
+seen in `-c`/`--pattern` above. Note the lower bound in the
+message is `0`, not `1` — step is the only one of the four
+integer options where 0 is a valid, meaningful value ("= bufsize"),
+consistent with `StepOutOfRange` only firing above the bound.
+
+#### 24. `qemu-img bench -S 0 -c 100 probe.raw`
+
+```
+$ qemu-img bench -S 0 -c 100 probe.raw
+exit: 0
+stdout:
+Sending 100 read requests, 4096 bytes each, 64 in parallel (starting at offset 0, step size 4096)
+Run completed in 0.001 seconds.
+stderr:
+```
+
+Confirms step 0 is valid and displays as the *effective* step
+(`4096`, equal to bufsize) in the "step size" header field, not
+as a literal `0` — direct empirical confirmation of
+`effective_step()`'s "0 means bufsize" semantics reaching all the
+way to qemu's own rendered output.
+
+### Observed divergences from the master plan's expectations
+
+- `-s 3G` is rejected by qemu's own `[1, 2147483647]` bufsize
+  range check (invocation 5), not accepted and then separately
+  capped — there is no scenario where qemu accepts a `-s` value
+  instar's `BENCH_MAX_BUFSIZE` would reject, since qemu's own
+  bound is already stricter for absurd sizes. This matches the
+  Mission's stated precedence exactly; no divergence here, but it
+  is worth confirming empirically rather than assuming.
+- The timing line's precision is exactly 3 decimal digits
+  (`%0.3f`-shaped: `0.001 seconds.`, `0.004 seconds.`) in every
+  successful run observed — no divergence from the master plan's
+  assumption.
+- `-c 0` and `-c -1` (and likewise `--pattern 256`/`--pattern -1`,
+  and the new `-S -1`/`-S 2147483648` supplement) produce
+  byte-identical messages for the "too low" and "too high" sides
+  of each range — qemu does not have distinct over/under messages
+  per option. `BenchParamError`'s one-variant-one-message design
+  already matches this.
+- The "no filename" and "two filenames" cases (15, 16) are also
+  byte-identical to each other, both routed through qemu's
+  generic "Expecting one image file name" arg-count check.
+- The zero-byte-image case (19) confirms there is genuinely no
+  up-front size validation: the request header prints
+  unconditionally before the first (failing) I/O is attempted,
+  and the failure surfaces as `Failed request: Input/output
+  error` with no "Run completed" line — exactly as the Mission's
+  "no up-front bounds check... fails at request time" note
+  predicts.
+- Unplanned but relevant: a `-w` run against a raw image without
+  an explicit `-f raw` prints an unrelated stderr WARNING about
+  format auto-detection (invocation 21). This is real qemu-img
+  output that would pollute a captured-message comparison if
+  phase 4/6 don't pin the format explicitly in their own
+  invocations; noting it here so later phases don't mistake it
+  for part of the bench contract.
