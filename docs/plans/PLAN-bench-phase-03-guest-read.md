@@ -256,3 +256,34 @@ no instar-only per-request messages (Mission §3).
 Functional verification is deliberately deferred to phase 4's
 first end-to-end smoke test — there is no way to launch this op
 until `run_bench` exists.
+
+## Captured measurements (step 3c)
+
+`scripts/check-binary-sizes.sh` on the tree at the end of step 3b
+(`aeffeb9`), with `make instar` confirmed a no-op beforehand:
+
+```
+OK:   bench (0x30000-0xF0000) - 144KB / 768KB (18%, .bin=148352B)
+```
+
+and the script's final verdict, `All binaries fit within their
+memory regions.`
+
+This is the read-only op with convert's full qcow2 feature set
+linked in (decompress + zstd, plus vmdk/vhd/vhdx input support) —
+the same format coverage Mission §5's estimate was measured
+against. The comparison anchor from that estimate: convert (all
+formats *and* the write machinery bench does not need) is 299 KiB
+of the same 768 KiB budget. bench lands at under half of convert's
+footprint while covering every read-side format, which is the
+expected shape for a read-only op sharing convert's parsing and
+decompression code but carrying none of its allocating-write path.
+
+Scratch footprint as built matches Mission §4's layout: `BUF_DEST`
+(2 MiB) + `BUF_COMPRESSED` + `BUF_STAGING` (one `MAX_CLUSTER_SIZE`
+each) + `DYNAMIC_START`'s per-device L1/L2 caches (2 ×
+`MAX_SECTOR_SIZE` × `MAX_CHAIN_DEVICES`) come to a ~8.2 MiB
+high-water mark below `ALLOC_HEAP_BASE`, exactly as sized in the
+Mission §4 estimate, and the compile-time `assert!` at the bottom
+of that layout enforces the bound at build time rather than
+leaving it as a runtime hope.
