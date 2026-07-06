@@ -17,7 +17,7 @@ pub mod virtio;
 ///
 /// The heap lives at a fixed address in scratch memory (not a static
 /// array) to avoid .bss bloat that can overlap with the config area
-/// at 0x80000. Guest memory is zeroed on creation, so no explicit
+/// at 0xF0000. Guest memory is zeroed on creation, so no explicit
 /// initialization is needed.
 ///
 /// The allocator never frees; callers must reset `HEAP_POS` to 0
@@ -322,20 +322,25 @@ macro_rules! cached_read {
 }
 
 /// Address where the call table is located (set by core)
-/// Located at 512KB to avoid overlap with core binary (which can grow past 32KB).
-/// The core binary is loaded at 0x10000 and may extend to 0x22000 (72KB max).
-/// The operation binary is loaded at 0x22000, so we place data structures at 0x80000.
-pub const CALL_TABLE_ADDR: usize = 0x00080000;
+/// Placed just below the virtqueue region (VQ_BASE_START = 0x100000) so the
+/// guest data pages sit above the operation region without touching it.
+/// The core binary is loaded at 0x10000 and may extend to OPERATION_LOAD_ADDR
+/// (0x30000, 128 KiB max). The operation binary is loaded at 0x30000 and may
+/// extend to 0xF0000 (768 KiB max), so we place the data pages at 0xF0000:
+/// call table (0xF0000), operation config (0xF1000), chain config (0xF2000),
+/// VMM params (0xF3000). [0xF4000, 0x100000) is a 48 KiB guard gap below the
+/// virtqueue region.
+pub const CALL_TABLE_ADDR: usize = 0x000F0000;
 
 /// Address where operation config is stored (set by VMM/core)
-pub const OPERATION_CONFIG_ADDR: usize = 0x00081000;
+pub const OPERATION_CONFIG_ADDR: usize = 0x000F1000;
 
 /// Maximum size of operation config in bytes
 pub const OPERATION_CONFIG_MAX_SIZE: usize = 4096;
 
 /// Address where chain config is stored (set by VMM)
 /// This contains metadata about the backing chain for operations that need it.
-pub const CHAIN_CONFIG_ADDR: usize = 0x00082000;
+pub const CHAIN_CONFIG_ADDR: usize = 0x000F2000;
 
 /// Address where LUKS encrypt random data is stored (set by VMM).
 /// Layout: master_key (64B) + mk_digest_salt (32B) + slot_salt (32B)
@@ -357,7 +362,7 @@ pub const CHAIN_CONFIG_MAX_SIZE: usize = 1024;
 /// Address where VMM parameters are stored (set by VMM before guest starts).
 /// Layout: mmio_base (u64 at offset 0).
 /// If mmio_base is 0, the guest uses the default (0x10000000).
-pub const VMM_PARAMS_ADDR: usize = 0x00083000;
+pub const VMM_PARAMS_ADDR: usize = 0x000F3000;
 
 /// Address where operation binaries are loaded.
 ///
@@ -370,13 +375,50 @@ pub const VMM_PARAMS_ADDR: usize = 0x00083000;
 /// 0x20380-0x203c7. The flat-binary size check missed it because the
 /// flat image excludes `.bss`. Giving core 72 KiB keeps its `.bss` clear
 /// of the op region; `scripts/check-binary-sizes.sh` now also validates
-/// the `.bss`-inclusive ELF extent. Keep this in sync with the
-/// per-op `src/operations/*/linker.ld` `OPERATION_BASE`.
-pub const OPERATION_LOAD_ADDR: usize = 0x00022000;
+/// the `.bss`-inclusive ELF extent.
+///
+/// It was raised again from 0x22000 to 0x30000 (core budget 72 -> 128 KiB)
+/// on 2026-07-06: after the bench ABI change core sat at 94% of its 72 KiB
+/// budget, uncomfortably close to the op region. Rather than wait for the
+/// next overflow, the core budget was lifted pre-emptively together with the
+/// op region (CALL_TABLE_ADDR 0x80000 -> 0xF0000, op budget 376 -> 768 KiB).
+/// Keep this in sync with the per-op `src/operations/*/linker.ld`
+/// `OPERATION_BASE`.
+pub const OPERATION_LOAD_ADDR: usize = 0x00030000;
+
+/// Base address of the virtqueue memory region (consumed by vmm/main.rs and
+/// core/main.rs, which previously duplicated this constant). Virtqueue memory
+/// for up to 16 devices x 64 KiB occupies [VQ_BASE_START, DMA_POOL_BASE).
+pub const VQ_BASE_START: usize = 0x00100000;
 
 /// DMA pool base address (must match core/virtio.rs and vmm/main.rs).
 /// Used for virtio request headers, data buffers, and status bytes.
 pub const DMA_POOL_BASE: usize = 0x00200000;
+
+// Compile-time check: operation load address must sit above core's load base.
+const _: () = assert!(
+    OPERATION_LOAD_ADDR > 0x10000,
+    "OPERATION_LOAD_ADDR must be above the core load base (0x10000)"
+);
+
+// Compile-time check: the data pages must sit above the operation region.
+const _: () = assert!(
+    CALL_TABLE_ADDR > OPERATION_LOAD_ADDR,
+    "CALL_TABLE_ADDR must be above OPERATION_LOAD_ADDR"
+);
+
+// Compile-time check: the data pages must end below the virtqueue region.
+const _: () = assert!(
+    VMM_PARAMS_ADDR + 0x1000 <= VQ_BASE_START,
+    "guest data pages overlap the virtqueue region (VQ_BASE_START)"
+);
+
+// Compile-time check: virtqueue memory (16 devices x 64 KiB) must fit below
+// the DMA pool.
+const _: () = assert!(
+    VQ_BASE_START + 16 * 0x10000 <= DMA_POOL_BASE,
+    "virtqueue region overlaps the DMA pool"
+);
 
 /// DMA pool upper bound: header (16) + max sector (65536) + status (1), rounded up to 64KB.
 pub const DMA_POOL_END: usize = DMA_POOL_BASE + 0x10000;

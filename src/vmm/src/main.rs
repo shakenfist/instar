@@ -2,11 +2,11 @@
 //!
 //! This VMM loads two separate binaries:
 //! - Core binary (0x10000): Device initialization, call table setup
-//! - Operation binary (0x22000): Specific operation (copy, info, etc.)
+//! - Operation binary (0x30000): Specific operation (copy, info, etc.)
 //!
 //! The core initializes virtio-block devices and sets up a call table at
-//! 0x18000 with function pointers for I/O operations. The operation binary
-//! reads this call table to perform its work.
+//! CALL_TABLE_ADDR (0xF0000) with function pointers for I/O operations.
+//! The operation binary reads this call table to perform its work.
 //!
 //! This architecture reduces attack surface by only loading the operation
 //! needed for the current task.
@@ -369,7 +369,7 @@ const MMIO_SIZE: u64 = 0x1000; // 4KB per device
 
 // Virtqueue memory regions (inside guest memory)
 // Each device gets 64KB for virtqueue structures
-const VQ_BASE_START: u64 = 0x100000; // 1MB
+const VQ_BASE_START: u64 = shared::VQ_BASE_START as u64; // 1MB
 const VQ_SIZE_PER_DEVICE: u64 = 0x10000; // 64KB per device
 
 // Maximum number of devices in a backing chain (matches config default)
@@ -1881,7 +1881,7 @@ fn execute_info_operation(
     // Load core binary at GUEST_CODE_BASE (0x10000)
     guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
 
-    // Load operation binary at OPERATION_LOAD_ADDR (0x22000)
+    // Load operation binary at OPERATION_LOAD_ADDR (0x30000)
     guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
 
     // Write InfoConfig at OPERATION_CONFIG_ADDR (0x19000)
@@ -7631,7 +7631,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
     debug!("Loaded core binary at 0x{GUEST_CODE_BASE:x}");
 
-    // Load operation binary at OPERATION_LOAD_ADDR (0x22000)
+    // Load operation binary at OPERATION_LOAD_ADDR (0x30000)
     guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
     debug!("Loaded operation binary at 0x{OPERATION_LOAD_ADDR:x}");
 
@@ -8459,7 +8459,7 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
     debug!("Loaded core binary at 0x{GUEST_CODE_BASE:x}");
 
-    // Load operation binary at OPERATION_LOAD_ADDR (0x22000)
+    // Load operation binary at OPERATION_LOAD_ADDR (0x30000)
     guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
     debug!("Loaded operation binary at 0x{OPERATION_LOAD_ADDR:x}");
 
@@ -9181,7 +9181,7 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
     debug!("Loaded core binary at 0x{GUEST_CODE_BASE:x}");
 
-    // Load operation binary at OPERATION_LOAD_ADDR (0x22000)
+    // Load operation binary at OPERATION_LOAD_ADDR (0x30000)
     guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
     debug!("Loaded operation binary at 0x{OPERATION_LOAD_ADDR:x}");
 

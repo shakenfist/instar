@@ -145,7 +145,9 @@ implementation must honour:
 - **Subcommand anatomy is well-trodden.** `enum Commands` +
   `BenchArgs` + `run_bench` in `src/vmm/src/main.rs`, a new
   `src/operations/bench/` no_std guest op loaded at
-  `OPERATION_LOAD_ADDR` (0x22000, 376 KiB budget), config in via
+  `OPERATION_LOAD_ADDR` (0x30000, 768 KiB budget since the
+  2026-07-06 memory-map lift; 0x22000/376 KiB at survey time),
+  config in via
   `OPERATION_CONFIG_ADDR` (4 KiB max), results back via a typed
   protobuf message over the serial channel. Touch list: op crate +
   linker.ld, `src/Cargo.toml` workspace members, `src/build.sh`
@@ -189,6 +191,10 @@ implementation must honour:
   and bumps 19→20. `core.bin` sits at 66.7 KiB of its 72 KiB
   budget (~5.3 KiB headroom) — one more sender shim should fit but
   must be re-measured (the bitmap plan flagged this exact risk).
+  *(Superseded after phase 2: the shims fit at 94% of 72 KiB, and
+  the whole memory map was then lifted on 2026-07-06 — core budget
+  now 128 KiB at 53%, op region 768 KiB, data pages at 0xF0000;
+  see the OPERATION_LOAD_ADDR history in `src/shared/src/lib.rs`.)*
 - **CLI posture precedents:** `--image-opts` rejected everywhere;
   `-U` accepted as a documented no-op (no locking exists); dd's
   `-f` warn-then-ignore is the "accepted but deferred" pattern;
@@ -533,7 +539,7 @@ lighter model.
 **Brief for sub-agent** — write it as if briefing a colleague who
 has never seen the codebase: what to change, which files to touch,
 what patterns to follow, and the non-obvious constraints (the
-376 KiB guest binary cap and 72 KiB core budget, the `no_std`
+768 KiB guest binary cap and 128 KiB core budget, the `no_std`
 requirement of `crates/bench`, the call-table append-only
 discipline, the 64 KiB `MAX_SECTOR_SIZE` transfer cap, the
 single-DMA-buffer synchronous driver, byte-for-byte output parity
@@ -552,9 +558,9 @@ After a sub-agent completes, verify:
       (read them, don't trust the summary).
 - [ ] No unrelated files were modified.
 - [ ] `make instar` builds and `make lint` is clean.
-- [ ] Guest binaries pass `make check-binary-sizes` (376 KiB op
+- [ ] Guest binaries pass `make check-binary-sizes` (768 KiB op
       budget; `bench.bin` registered in the script's op list), and
-      `core.bin` still fits its 72 KiB `.bss`-inclusive budget
+      `core.bin` still fits its 128 KiB `.bss`-inclusive budget
       after the call-table addition.
 - [ ] `make test-rust` (including the new `bench` crate) passes.
 - [ ] Relevant `make test-integration` targets pass.
@@ -599,7 +605,7 @@ the following statements will be true:
 * `make instar` builds and `make lint` is clean.
 * Guest binaries pass `make check-binary-sizes`; `bench.bin` is
   registered in `scripts/check-binary-sizes.sh`; `core.bin` fits
-  its 72 KiB budget after the VERSION 19→20 call-table append.
+  its 128 KiB budget after the VERSION 19→20 call-table append.
 * All Rust unit tests pass (`make test-rust`), including
   `crates/bench`.
 * All Python integration tests pass (`make test-integration`),

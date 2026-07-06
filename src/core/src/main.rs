@@ -41,7 +41,7 @@ use crate::virtio::VirtioBlock;
 // Default MMIO base; overridden by VMM via VMM_PARAMS_ADDR when guest memory > 256MB.
 const DEFAULT_MMIO_BASE: usize = 0x10000000;
 const MMIO_SIZE: usize = 0x1000; // 4KB per device
-const VQ_BASE_START: usize = 0x100000; // 1MB
+const VQ_BASE_START: usize = shared::VQ_BASE_START; // 1MB
 const VQ_SIZE_PER_DEVICE: usize = 0x10000; // 64KB per device
 
 // Maximum number of input devices (backing chain depth)

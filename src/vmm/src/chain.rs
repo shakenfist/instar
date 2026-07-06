@@ -1080,7 +1080,7 @@ mod tests {
         use shared::{
             ChainConfig, ChainDeviceInfo, ImageFormat as SharedImageFormat, InfoResult,
             CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR, MAX_CHAIN_DEVICES, OPERATION_CONFIG_ADDR,
-            OPERATION_LOAD_ADDR,
+            OPERATION_LOAD_ADDR, VMM_PARAMS_ADDR, VQ_BASE_START,
         };
 
         #[test]
@@ -1221,11 +1221,13 @@ mod tests {
         fn test_chain_config_memory_address() {
             // Verify the memory addresses don't overlap
             // Memory layout:
-            //   0x010000: core.bin (up to 72KB)
-            //   0x022000 (OPERATION_LOAD_ADDR): operation binary (up to 376KB)
-            //   0x080000 (CALL_TABLE_ADDR): call table
-            //   0x081000 (OPERATION_CONFIG_ADDR): operation config (4KB)
-            //   0x082000 (CHAIN_CONFIG_ADDR): chain config (1KB)
+            //   0x010000: core.bin (up to 128KB)
+            //   0x030000 (OPERATION_LOAD_ADDR): operation binary (up to 768KB)
+            //   0x0F0000 (CALL_TABLE_ADDR): call table
+            //   0x0F1000 (OPERATION_CONFIG_ADDR): operation config (4KB)
+            //   0x0F2000 (CHAIN_CONFIG_ADDR): chain config (1KB)
+            //   0x0F3000 (VMM_PARAMS_ADDR): VMM params (4KB)
+            //   [0x0F4000, 0x100000): 48KB guard gap below the virtqueue region
             //   0x100000 (VQ_BASE_START): virtqueue memory (16 devices * 64KB = 1MB)
             //   0x200000 (DMA_POOL_BASE): DMA pool (64KB)
             //   0x300000 (SCRATCH_MEM_BASE): scratch memory (~12.9MB)
@@ -1233,7 +1235,7 @@ mod tests {
             //  0x1000000 (STACK_BASE): stack (4MB)
             //  0x2000000: end of guest memory (GUEST_MEM_SIZE)
             //
-            // The operation binary area (0x22000-0x80000 = 376KB) must be large
+            // The operation binary area (0x30000-0xF0000 = 768KB) must be large
             // enough for all operations (info.bin, copy.bin, check.bin). Binary
             // sizes are validated at build time in the Makefile.
 
@@ -1241,8 +1243,10 @@ mod tests {
             assert!(CHAIN_CONFIG_ADDR > OPERATION_CONFIG_ADDR);
             // Operation config is after call table
             assert!(OPERATION_CONFIG_ADDR > CALL_TABLE_ADDR);
-            // Call table is above operation binary area (0x80000 > 0x22000)
+            // Call table is above operation binary area (0xF0000 > 0x30000)
             assert!(CALL_TABLE_ADDR > OPERATION_LOAD_ADDR);
+            // The data pages sit below the virtqueue region with headroom.
+            assert!(VMM_PARAMS_ADDR + 0x1000 <= VQ_BASE_START);
         }
     }
 }
