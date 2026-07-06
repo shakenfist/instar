@@ -34,6 +34,7 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use bench::{BenchParamError, BenchParams};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use dd::compute_dd_window;
 use guest_protocol::{
@@ -467,16 +468,27 @@ fn parse_memory_size(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
         .ok_or_else(|| format!("memory size overflow: '{s}'").into())
 }
 
-/// Parse a qemu-img size string with the full suffix set:
-/// `b`=512, `k`/`K`=KiB, `M`/`m`=MiB, `G`/`g`=GiB, `T`/`t`=TiB,
-/// `P`/`p`=PiB, `E`/`e`=EiB.  Used by `instar resize` for the
-/// `[+-]SIZE` argument.  Strict superset of `parse_memory_size`
-/// — kept as a sibling rather than replacing it to avoid
-/// disturbing the create/measure call sites.
-fn parse_qemu_img_size(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
+/// Why a qemu-img size string failed to parse. `bench`'s message
+/// contract needs the distinction: a syntax error (`Invalid`) gets
+/// qemu's value-echoing `Invalid <name> specified: '<v>'.` form,
+/// while a multiply-overflow (`Overflow`) is a *number* out of
+/// range and gets the `Must be between` form — matching qemu's
+/// cvtnum, whose EINVAL and ERANGE outcomes produce those two
+/// different messages (1e capture Supplement 2).
+enum QemuImgSizeError {
+    /// The value is not a number (empty, non-numeric, bad suffix).
+    Invalid,
+    /// The numeric part parsed but the suffix multiply overflowed
+    /// `u64` — a number, just unrepresentably large.
+    Overflow,
+}
+
+/// Core of [`parse_qemu_img_size`], returning the structured
+/// failure reason instead of a display string.
+fn parse_qemu_img_size_classified(s: &str) -> Result<u64, QemuImgSizeError> {
     let s = s.trim();
     if s.is_empty() {
-        return Err("empty size string".into());
+        return Err(QemuImgSizeError::Invalid);
     }
     let (num_str, multiplier) = match s.as_bytes().last() {
         Some(b'E' | b'e') => (&s[..s.len() - 1], 1u64 << 60),
@@ -491,9 +503,26 @@ fn parse_qemu_img_size(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
     let num: u64 = num_str
         .trim()
         .parse()
-        .map_err(|_| format!("invalid size: '{s}'"))?;
+        .map_err(|_| QemuImgSizeError::Invalid)?;
     num.checked_mul(multiplier)
-        .ok_or_else(|| format!("size overflow: '{s}'").into())
+        .ok_or(QemuImgSizeError::Overflow)
+}
+
+/// Parse a qemu-img size string with the full suffix set:
+/// `b`=512, `k`/`K`=KiB, `M`/`m`=MiB, `G`/`g`=GiB, `T`/`t`=TiB,
+/// `P`/`p`=PiB, `E`/`e`=EiB.  Used by `instar resize` for the
+/// `[+-]SIZE` argument.  Strict superset of `parse_memory_size`
+/// — kept as a sibling rather than replacing it to avoid
+/// disturbing the create/measure call sites.
+fn parse_qemu_img_size(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err("empty size string".into());
+    }
+    parse_qemu_img_size_classified(trimmed).map_err(|e| match e {
+        QemuImgSizeError::Invalid => format!("invalid size: '{trimmed}'").into(),
+        QemuImgSizeError::Overflow => format!("size overflow: '{trimmed}'").into(),
+    })
 }
 
 /// Parse `[+-]SIZE[bkKMGTPE]`.  Returns the parsed `ParsedResizeSize`
@@ -3432,6 +3461,1424 @@ struct DdArgs {
     /// When absent, the phase-2 parser defaults to "raw".
     #[arg(short = 'O', long = "output-format")]
     output_format: Option<String>,
+}
+
+/// Arguments for `instar bench`. Mirrors `qemu-img bench`'s surface
+/// (see PLAN-bench-phase-04-host-cli.md, Mission section 1).
+///
+/// The numeric options (`-c`/`-d`/`-s`/`-S`/`-o`/`--pattern`/
+/// `--flush-interval`) are `Option<String>` rather than typed
+/// numeric fields: qemu's out-of-range message must be produced by
+/// `validate_bench_args`, not by clap's own parser, and a negative
+/// value must reach that check so it collapses into the same
+/// message qemu itself produces (see the phase-1 1e capture).
+/// `FILENAME` is a trailing `Vec<String>` positional so the CLI
+/// owns the "wrong number of filenames" check instead of clap's own
+/// arity error (qemu collapses "zero" and "too many" into one
+/// message; clap would report them differently).
+///
+/// Not yet wired into `Commands`/dispatch — that is step 4b.
+#[derive(Args, Debug)]
+#[allow(dead_code)] // wired in 4b
+struct BenchArgs {
+    /// Image file to benchmark. Exactly one is required; zero or
+    /// more than one is a validation error handled by
+    /// `validate_bench_args`, not clap's own arity check (qemu
+    /// parity — 1e capture invocations 15, 16).
+    #[arg(num_args = 0.., value_name = "FILENAME")]
+    filename: Vec<String>,
+
+    /// Number of requests to issue. Default 75000 (qemu's default).
+    /// Range `[1, 2147483647]`; parsed and range-checked by
+    /// `validate_bench_args`.
+    #[arg(short = 'c', value_name = "COUNT")]
+    count: Option<String>,
+
+    /// Queue depth. Default 64. Range `[1, 2147483647]`.
+    #[arg(short = 'd', value_name = "DEPTH")]
+    depth: Option<String>,
+
+    /// Issue a flush every N completed requests. Default 0
+    /// (never). Range `[0, 2147483647]`. A NONZERO value requires
+    /// `-w` (an explicit 0 without `-w` is silently accepted, like
+    /// qemu); phase 4 refuses `-w` outright, so today a nonzero
+    /// value is reachable only through the qemu cross-option error
+    /// text.
+    #[arg(long = "flush-interval", value_name = "FLUSH_INTERVAL")]
+    flush_interval: Option<String>,
+
+    /// Byte pattern used to fill write buffers. Default 0. Range
+    /// `[0, 255]`; silently ignored (not an error) on read tests.
+    #[arg(long, value_name = "PATTERN")]
+    pattern: Option<String>,
+
+    /// Bytes per request. Accepts qemu size suffixes
+    /// (b/k/K/m/M/g/G/t/T/p/P/e/E). Default 4096. Range
+    /// `[1, 2147483647]` (qemu's own bound), further capped at
+    /// 2 MiB by instar in phase 4.
+    #[arg(short = 's', value_name = "BUFFER_SIZE")]
+    buffer_size: Option<String>,
+
+    /// Byte offset advance per request (same suffixes as `-s`).
+    /// Default 0, meaning "use the buffer size" (see
+    /// `BenchParams::effective_step`). Range `[0, 2147483647]`.
+    #[arg(short = 'S', value_name = "STEP_SIZE")]
+    step_size: Option<String>,
+
+    /// The first request's byte offset (same suffixes as `-s`).
+    /// Default 0. Range `[0, 9223372036854775807]` (`i64::MAX`) --
+    /// wider than the other four numeric options.
+    #[arg(short = 'o', value_name = "OFFSET")]
+    offset: Option<String>,
+
+    /// Run a write test instead of a read test. Accepted by the
+    /// parser so `--help` documents the full surface, but refused
+    /// at runtime in phase 4 with `bench: write tests (-w) are not
+    /// yet supported`.
+    #[arg(short = 'w')]
+    write: bool,
+
+    /// Suppress qemu-img's progress indicator. instar has no
+    /// progress output for bench; accepted as a no-op.
+    #[arg(short = 'q')]
+    quiet: bool,
+
+    /// Force sharing (skip exclusive locking). instar performs no
+    /// image locking; accepted as a no-op.
+    #[arg(short = 'U', long = "force-share")]
+    force_share: bool,
+
+    /// Use native AIO. Refused at runtime: `bench: native AIO (-n)
+    /// is not yet supported`.
+    #[arg(short = 'n')]
+    native_aio: bool,
+
+    /// Skip draining in-flight requests before a scheduled flush.
+    /// Valid (and irrelevant) even when `--flush-interval` is 0.
+    #[arg(long = "no-drain")]
+    no_drain: bool,
+
+    /// Indicates FILENAME is a complete image specification.
+    /// Refused at runtime: qemu's own mutual-exclusion message when
+    /// combined with `-f`/`--format` (1e capture invocation 14), or
+    /// `bench: --image-opts is not yet supported` alone.
+    #[arg(long = "image-opts")]
+    image_opts: bool,
+
+    /// AIO backend selector. Refused at runtime for every value:
+    /// `bench: aio backend '<value>' is not yet supported`.
+    #[arg(short = 'i', value_name = "AIO")]
+    aio: Option<String>,
+
+    /// Cache mode selector. `writeback` (qemu's default) is
+    /// accepted silently; other valid qemu cache modes are refused
+    /// with an instar "not yet supported" message; anything else
+    /// gets qemu's own terse `Invalid cache mode` text (1e capture
+    /// invocation 11).
+    #[arg(short = 't', value_name = "CACHE")]
+    cache: Option<String>,
+
+    /// Force the image format detection. Accepted as a hint for the
+    /// (4b) discovery step; dd's warn-then-ignore posture applies
+    /// when it disagrees with the auto-detected format.
+    #[arg(short = 'f', long)]
+    format: Option<String>,
+
+    /// Output format.
+    #[arg(long, default_value = "human", value_parser = ["human", "json"])]
+    output: String,
+}
+
+/// The validated result of parsing `BenchArgs`, ready for
+/// `run_bench` (wired in 4b) to open the image and launch the
+/// guest. Bundles the bench crate's pure, qemu-parity
+/// `bench::BenchParams` with the host-only pieces that crate has no
+/// business knowing about: the filename, the `-f` format hint
+/// (validated against the auto-detected format only once discovery
+/// exists, in 4b), and the `--output` selector.
+#[allow(dead_code)] // wired in 4b
+#[derive(Debug, Clone, PartialEq)]
+struct BenchInvocation {
+    /// The validated, qemu-parity request parameters.
+    params: BenchParams,
+    /// The single positional filename (count already checked == 1).
+    filename: String,
+    /// `-f`/`--format`'s value, if given. Not validated here --
+    /// `run_bench` (4b) compares it against the auto-detected
+    /// format and applies dd's warn-then-ignore posture when they
+    /// disagree.
+    format_hint: Option<String>,
+    /// `--output`: "human" or "json" (clap's `value_parser` already
+    /// restricts it to these two).
+    output: String,
+    /// `-q`: accepted no-op, carried through for completeness.
+    quiet: bool,
+    /// `-U`/`--force-share`: accepted no-op, carried through for
+    /// completeness.
+    force_share: bool,
+}
+
+/// The three-way outcome of parsing one bench numeric option.
+/// qemu distinguishes an unparseable value (echoed back:
+/// `Invalid <name> specified: '<v>'.`) from an out-of-range
+/// *number* (`Invalid <name> specified. Must be between ...`) --
+/// Supplement 2 of the 1e capture (PLAN-bench-phase-01-crate.md).
+enum BenchNumParse {
+    /// A parseable number; the caller applies the option's own
+    /// range check.
+    Num(i64),
+    /// A plain integer too large (or too negative) for `i64` -- a
+    /// *number*, just outside any option's range, so it takes the
+    /// "Must be between" form, never the value-echoing form.
+    OutOfRange,
+    /// Not a number at all: the value-echoing form.
+    Unparseable,
+}
+
+/// Classify a plain (non-suffixed) integer option value
+/// (`-c`/`-d`/`--pattern`/`--flush-interval`). A leading `-` is a
+/// number (qemu range-rejects negatives, it does not echo them --
+/// 1e capture invocations 2, 7); an optionally-signed all-digit
+/// string that overflows `i64` is likewise a number out of range.
+fn parse_bench_plain_int(s: &str) -> BenchNumParse {
+    let t = s.trim();
+    if let Ok(v) = t.parse::<i64>() {
+        return BenchNumParse::Num(v);
+    }
+    let digits = t.strip_prefix('-').unwrap_or(t);
+    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        BenchNumParse::OutOfRange
+    } else {
+        BenchNumParse::Unparseable
+    }
+}
+
+/// The three-way outcome of parsing a suffixed size option
+/// (`-s`/`-S`/`-o`).
+enum BenchSizeParse {
+    /// A parsed byte value; the caller applies the option's own
+    /// range check.
+    Value(u64),
+    /// A number outside any representable/valid size -- takes the
+    /// "Must be between" form.
+    OutOfRange,
+    /// Not a number at all: the value-echoing form.
+    Unparseable,
+}
+
+/// Classify a size option value. A value `parse_qemu_img_size`
+/// accepts (including suffixed forms like `1k`) is a number; a
+/// suffix multiply that overflows `u64` (e.g. `200000000000000G`)
+/// is a *number* out of range (qemu's cvtnum returns ERANGE and
+/// prints the range form -- verified live, Supplement 2); a plain
+/// optionally-negative integer (e.g. `-1`) is likewise a number
+/// out of range (`-S -1` gets the range form -- 1e capture
+/// invocation 22); everything else (e.g. `abc`, `-1k`) is
+/// unparseable and gets the value-echoing form.
+fn parse_bench_size(s: &str) -> BenchSizeParse {
+    match parse_qemu_img_size_classified(s) {
+        Ok(v) => BenchSizeParse::Value(v),
+        Err(QemuImgSizeError::Overflow) => BenchSizeParse::OutOfRange,
+        Err(QemuImgSizeError::Invalid) => match parse_bench_plain_int(s) {
+            BenchNumParse::Num(_) | BenchNumParse::OutOfRange => BenchSizeParse::OutOfRange,
+            BenchNumParse::Unparseable => BenchSizeParse::Unparseable,
+        },
+    }
+}
+
+/// Validate `BenchArgs` against the qemu-img 10.0.8 message
+/// contract captured in PLAN-bench-phase-01-crate.md (step 1e) and
+/// tabulated in PLAN-bench-phase-04-host-cli.md Mission section 2.
+/// Pure and unit-tested: every message string below is pinned
+/// byte-for-byte in the `bench_validate_tests` module below.
+///
+/// Check order (Mission section 2): the seven numeric options in
+/// the table's order (`-c`, `-d`, `-s` qemu-bound then instar-cap,
+/// `-S`, `-o`, `--pattern`, `--flush-interval`), then the two
+/// `BenchParams::validate` cross-option rules (flush-requires-
+/// write, flush-smaller-than-depth), then the (phase-4-only) `-w`
+/// refusal, then the `-t`/`-i`/`-n`/`--image-opts` postures, and
+/// finally the filename-count check. Each numeric option has TWO
+/// failure forms (Supplement 2 of the 1e capture): an unparseable
+/// value gets the value-echoing `Invalid <name> specified:
+/// '<v>'.`, an out-of-range *number* gets the `Must be between`
+/// form. The order is deliberate: a nonzero `--flush-interval`
+/// without `-w` must surface the qemu cross-option text (1e
+/// capture invocation 8), not the `-w` refusal; and `-w
+/// --flush-interval 32 -d 64` must surface `Flush interval can't be
+/// smaller than depth` (invocation 9) before the phase-4 `-w`
+/// refusal ever fires. Both are exercised directly by
+/// `invocation_8_*`/`invocation_9_*` below.
+#[allow(dead_code)] // wired in 4b
+fn validate_bench_args(args: &BenchArgs) -> Result<BenchInvocation, String> {
+    // -c: request count.
+    let count: u32 = match &args.count {
+        None => bench::DEFAULT_COUNT,
+        Some(s) => match parse_bench_plain_int(s) {
+            BenchNumParse::Num(v) if (1..=bench::QEMU_BENCH_ARG_MAX as i64).contains(&v) => {
+                v as u32
+            }
+            BenchNumParse::Num(_) | BenchNumParse::OutOfRange => {
+                return Err(
+                    "Invalid request count specified. Must be between 1 and 2147483647."
+                        .to_string(),
+                )
+            }
+            BenchNumParse::Unparseable => {
+                return Err(format!("Invalid request count specified: '{}'.", s))
+            }
+        },
+    };
+
+    // -d: queue depth.
+    let depth: u32 = match &args.depth {
+        None => bench::DEFAULT_DEPTH,
+        Some(s) => match parse_bench_plain_int(s) {
+            BenchNumParse::Num(v) if (1..=bench::QEMU_BENCH_ARG_MAX as i64).contains(&v) => {
+                v as u32
+            }
+            BenchNumParse::Num(_) | BenchNumParse::OutOfRange => {
+                return Err(
+                    "Invalid queue depth specified. Must be between 1 and 2147483647.".to_string(),
+                )
+            }
+            BenchNumParse::Unparseable => {
+                return Err(format!("Invalid queue depth specified: '{}'.", s))
+            }
+        },
+    };
+
+    // -s: buffer size. qemu's [1, 2147483647] bound is checked
+    // FIRST, then the instar-only 2 MiB cap -- precedence pinned by
+    // the 1e capture's invocation 5 (`-s 3G` gets qemu's text,
+    // never instar's cap text, because 3 GiB is already outside
+    // qemu's own bound).
+    let bufsize: u64 = match &args.buffer_size {
+        None => bench::DEFAULT_BUFSIZE,
+        Some(s) => match parse_bench_size(s) {
+            BenchSizeParse::Value(v) if (1..=bench::QEMU_BENCH_ARG_MAX).contains(&v) => {
+                if v > bench::BENCH_MAX_BUFSIZE {
+                    return Err("bench: buffer sizes above 2 MiB are not yet supported".to_string());
+                }
+                v
+            }
+            BenchSizeParse::Value(_) | BenchSizeParse::OutOfRange => {
+                return Err(
+                    "Invalid buffer size specified. Must be between 1 and 2147483647.".to_string(),
+                )
+            }
+            BenchSizeParse::Unparseable => {
+                return Err(format!("Invalid buffer size specified: '{}'.", s))
+            }
+        },
+    };
+
+    // -S: step size. 0 is valid ("use bufsize" --
+    // BenchParams::effective_step).
+    let step: u64 = match &args.step_size {
+        None => 0,
+        Some(s) => match parse_bench_size(s) {
+            BenchSizeParse::Value(v) if v <= bench::QEMU_BENCH_ARG_MAX => v,
+            BenchSizeParse::Value(_) | BenchSizeParse::OutOfRange => {
+                return Err(
+                    "Invalid step size specified. Must be between 0 and 2147483647.".to_string(),
+                )
+            }
+            BenchSizeParse::Unparseable => {
+                return Err(format!("Invalid step size specified: '{}'.", s))
+            }
+        },
+    };
+
+    // -o: the first request's byte offset. Wider bound than the
+    // other four options -- i64::MAX, not QEMU_BENCH_ARG_MAX (1e
+    // capture invocation 17).
+    let offset: u64 = match &args.offset {
+        None => 0,
+        Some(s) => match parse_bench_size(s) {
+            BenchSizeParse::Value(v) if v <= i64::MAX as u64 => v,
+            BenchSizeParse::Value(_) | BenchSizeParse::OutOfRange => {
+                return Err(format!(
+                    "Invalid offset specified. Must be between 0 and {}.",
+                    i64::MAX
+                ))
+            }
+            BenchSizeParse::Unparseable => {
+                return Err(format!("Invalid offset specified: '{}'.", s))
+            }
+        },
+    };
+
+    // --pattern: byte fill value for write tests. `u8` makes values
+    // above 255 unrepresentable in BenchParams, so this range check
+    // lives here rather than in BenchParamError (phase-1 crate
+    // note).
+    let pattern: u8 = match &args.pattern {
+        None => 0,
+        Some(s) => match parse_bench_plain_int(s) {
+            BenchNumParse::Num(v) if (0..=255).contains(&v) => v as u8,
+            BenchNumParse::Num(_) | BenchNumParse::OutOfRange => {
+                return Err("Invalid pattern byte specified. Must be between 0 and 255.".to_string())
+            }
+            BenchNumParse::Unparseable => {
+                return Err(format!("Invalid pattern byte specified: '{}'.", s))
+            }
+        },
+    };
+
+    // --flush-interval: has its own [0, 2147483647] range check
+    // (Supplement 2 of the 1e capture), fired here in table order,
+    // BEFORE the two cross-option rules below. 0 is valid ("never
+    // flush") and -- verified live -- `--flush-interval 0` without
+    // `-w` is silently accepted: the cross-option check gates on
+    // the value, not on flag presence.
+    let flush_interval: u32 = match &args.flush_interval {
+        None => 0,
+        Some(s) => match parse_bench_plain_int(s) {
+            BenchNumParse::Num(v) if (0..=bench::QEMU_BENCH_ARG_MAX as i64).contains(&v) => {
+                v as u32
+            }
+            BenchNumParse::Num(_) | BenchNumParse::OutOfRange => {
+                return Err(
+                    "Invalid flush interval specified. Must be between 0 and 2147483647."
+                        .to_string(),
+                )
+            }
+            BenchNumParse::Unparseable => {
+                return Err(format!("Invalid flush interval specified: '{}'.", s))
+            }
+        },
+    };
+
+    // Cross-option rules owned by the bench crate: flush-requires-
+    // write and flush-smaller-than-depth. Built with the REAL `-w`/
+    // `--no-drain` values (not the phase-4 refusal below) so
+    // invocations 8 and 9 route through these qemu-worded messages
+    // before the phase-4 `-w` refusal ever has a chance to fire.
+    let candidate = BenchParams {
+        count,
+        depth,
+        bufsize,
+        step,
+        offset,
+        is_write: args.write,
+        pattern,
+        flush_interval,
+        no_drain: args.no_drain,
+    };
+    if let Err(e) = candidate.validate() {
+        let msg = match e {
+            // Unreachable in practice: the six numeric ranges above
+            // already enforce these bounds before `candidate` is
+            // built. Mapped anyway rather than panicking, since we
+            // don't fully control how `BenchParamError` might grow.
+            BenchParamError::CountOutOfRange => {
+                "Invalid request count specified. Must be between 1 and 2147483647.".to_string()
+            }
+            BenchParamError::DepthOutOfRange => {
+                "Invalid queue depth specified. Must be between 1 and 2147483647.".to_string()
+            }
+            BenchParamError::BufsizeOutOfRange => {
+                "Invalid buffer size specified. Must be between 1 and 2147483647.".to_string()
+            }
+            BenchParamError::StepOutOfRange => {
+                "Invalid step size specified. Must be between 0 and 2147483647.".to_string()
+            }
+            BenchParamError::BufsizeAboveInstarCap => {
+                "bench: buffer sizes above 2 MiB are not yet supported".to_string()
+            }
+            // Reachable: 1e capture invocations 8 and 9.
+            BenchParamError::FlushRequiresWrite => {
+                "--flush-interval is only available in write tests".to_string()
+            }
+            BenchParamError::FlushIntervalSmallerThanDepth => {
+                "Flush interval can't be smaller than depth".to_string()
+            }
+        };
+        return Err(msg);
+    }
+
+    // -w: accepted by the parser (so --help documents the full
+    // surface and the phase-5 diff is additive) but refused at
+    // runtime until phase 5 lands the write path.
+    if args.write {
+        // removed in phase 5
+        return Err("bench: write tests (-w) are not yet supported".to_string());
+    }
+
+    // -t: cache mode. qemu's own default (writeback) is silently
+    // accepted; other valid-but-unsupported qemu modes get an
+    // instar-worded refusal; anything else gets qemu's own terse
+    // "Invalid cache mode" text (1e capture invocation 11).
+    if let Some(cache) = &args.cache {
+        match cache.as_str() {
+            "writeback" => {}
+            "none" | "writethrough" | "directsync" | "unsafe" => {
+                return Err(format!(
+                    "bench: cache mode '{}' is not yet supported",
+                    cache
+                ))
+            }
+            _ => return Err("Invalid cache mode".to_string()),
+        }
+    }
+
+    // -i: aio backend. Every value is refused (no aio backend
+    // selection is implemented yet).
+    if let Some(aio) = &args.aio {
+        return Err(format!("bench: aio backend '{}' is not yet supported", aio));
+    }
+
+    // -n: native AIO.
+    if args.native_aio {
+        return Err("bench: native AIO (-n) is not yet supported".to_string());
+    }
+
+    // --image-opts: qemu-parity mutual exclusion with -f/--format
+    // first (1e capture invocation 14), then the house "not yet
+    // supported" refusal.
+    if args.image_opts && args.format.is_some() {
+        return Err("--image-opts and --format are mutually exclusive".to_string());
+    }
+    if args.image_opts {
+        return Err("bench: --image-opts is not yet supported".to_string());
+    }
+
+    // -q / -U (--force-share): accepted no-ops; nothing to check.
+
+    // Filename count: qemu collapses "zero" and "too many" into the
+    // identical two-line message (1e capture invocations 15, 16).
+    if args.filename.len() != 1 {
+        return Err(
+            "Expecting one image file name\nTry 'instar bench --help' for more info".to_string(),
+        );
+    }
+
+    Ok(BenchInvocation {
+        params: candidate,
+        filename: args.filename[0].clone(),
+        format_hint: args.format.clone(),
+        output: args.output.clone(),
+        quiet: args.quiet,
+        force_share: args.force_share,
+    })
+}
+
+/// Render the qemu-parity header line, printed once discovery and
+/// validation succeed and before the guest launches (Mission
+/// section 3). Byte-identical to qemu-img for equal arguments:
+/// offset is the parsed decimal byte value, step is the
+/// *effective* step (`-S 0` renders as `bufsize`, 1e capture
+/// invocation 24), and the read/write word comes from `is_write`.
+#[allow(dead_code)] // wired in 4b
+fn render_bench_header(params: &BenchParams) -> String {
+    format!(
+        "Sending {} {} requests, {} bytes each, {} in parallel (starting at offset {}, step size {})",
+        params.count,
+        if params.is_write { "write" } else { "read" },
+        params.bufsize,
+        params.depth,
+        params.offset,
+        params.effective_step(),
+    )
+}
+
+/// Render the "Sending flush every N requests" line (write tests
+/// only; unreachable in phase 4 since `-w` is refused, but the
+/// renderer exists now so phase 5 only needs to stop refusing
+/// `-w`).
+#[allow(dead_code)] // wired in 4b
+fn render_bench_flush_line(interval: u32) -> String {
+    format!("Sending flush every {} requests", interval)
+}
+
+/// Render the completion line. qemu's timing precision is exactly 3
+/// decimal digits (`%0.3f`-shaped; 1e capture invocations 20/21).
+#[allow(dead_code)] // wired in 4b
+fn render_bench_completion(secs: f64) -> String {
+    format!("Run completed in {:.3} seconds.", secs)
+}
+
+/// Render the `--output json` object for a completed bench run, per
+/// Mission section 3's schema (hyphenated keys, hand-built JSON --
+/// no serde, matching the house idiom in `print_measure_result_json`).
+/// `effective-depth` is a fixed `1`: v1 executes serially regardless
+/// of `-d` (master plan OQ1). Rates divide by `elapsed_seconds`; a
+/// `0.0` elapsed value (an extremely fast, tiny run) produces a
+/// non-finite rate exactly like a bare floating point division
+/// would -- no special-casing, since the captured contract has no
+/// zero-elapsed json example to pin.
+#[allow(dead_code)] // wired in 4b
+fn render_bench_json(
+    params: &BenchParams,
+    filename: &str,
+    format: &str,
+    flushes_issued: u32,
+    elapsed_seconds: f64,
+) -> String {
+    use std::fmt::Write as _;
+
+    let requests_per_second = params.count as f64 / elapsed_seconds;
+    let bytes_per_second = (params.count as u64 * params.bufsize) as f64 / elapsed_seconds;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "{{");
+    let _ = writeln!(
+        out,
+        "    \"filename\": \"{}\",",
+        escape_json_string(filename)
+    );
+    let _ = writeln!(out, "    \"format\": \"{}\",", escape_json_string(format));
+    let _ = writeln!(out, "    \"count\": {},", params.count);
+    let _ = writeln!(out, "    \"depth\": {},", params.depth);
+    let _ = writeln!(out, "    \"effective-depth\": 1,");
+    let _ = writeln!(out, "    \"buffer-size\": {},", params.bufsize);
+    let _ = writeln!(out, "    \"step-size\": {},", params.effective_step());
+    let _ = writeln!(out, "    \"offset\": {},", params.offset);
+    let _ = writeln!(out, "    \"write\": {},", params.is_write);
+    let _ = writeln!(out, "    \"pattern\": {},", params.pattern);
+    let _ = writeln!(out, "    \"flush-interval\": {},", params.flush_interval);
+    let _ = writeln!(out, "    \"no-drain\": {},", params.no_drain);
+    let _ = writeln!(out, "    \"flushes-issued\": {},", flushes_issued);
+    let _ = writeln!(out, "    \"elapsed-seconds\": {:.6},", elapsed_seconds);
+    let _ = writeln!(
+        out,
+        "    \"requests-per-second\": {:.2},",
+        requests_per_second
+    );
+    let _ = writeln!(out, "    \"bytes-per-second\": {:.2}", bytes_per_second);
+    let _ = write!(out, "}}");
+    out
+}
+
+#[cfg(test)]
+mod bench_validate_tests {
+    //! Byte-for-byte pins of `validate_bench_args`'s message table
+    //! (Mission section 2 of PLAN-bench-phase-04-host-cli.md)
+    //! against the 1e capture and its Supplement 2
+    //! (PLAN-bench-phase-01-crate.md). Every message string here is
+    //! copied verbatim from one of those two documents: each
+    //! numeric option pins BOTH failure forms -- the value-echoing
+    //! `Invalid <name> specified: '<v>'.` for unparseable input and
+    //! the `Must be between` form for out-of-range numbers.
+    use super::*;
+
+    /// A `BenchArgs` with every field at its clap default plus a
+    /// single, valid filename -- callers override only the fields
+    /// under test via struct-update syntax.
+    fn default_bench_args() -> BenchArgs {
+        BenchArgs {
+            filename: vec!["probe.raw".to_string()],
+            count: None,
+            depth: None,
+            flush_interval: None,
+            pattern: None,
+            buffer_size: None,
+            step_size: None,
+            offset: None,
+            write: false,
+            quiet: false,
+            force_share: false,
+            native_aio: false,
+            no_drain: false,
+            image_opts: false,
+            aio: None,
+            cache: None,
+            format: None,
+            output: "human".to_string(),
+        }
+    }
+
+    // --- defaults ---------------------------------------------------
+
+    #[test]
+    fn defaults_match_qemu_and_bench_crate() {
+        let args = default_bench_args();
+        let inv = validate_bench_args(&args).expect("defaults must validate");
+        assert_eq!(inv.params, BenchParams::default());
+        assert_eq!(inv.filename, "probe.raw");
+        assert_eq!(inv.output, "human");
+        assert!(!inv.quiet);
+        assert!(!inv.force_share);
+        assert_eq!(inv.format_hint, None);
+    }
+
+    // --- -c: request count (invocations 1, 2) ------------------------
+
+    #[test]
+    fn invocation_1_count_zero() {
+        let args = BenchArgs {
+            count: Some("0".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid request count specified. Must be between 1 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn invocation_2_count_negative_same_message_as_zero() {
+        let args = BenchArgs {
+            count: Some("-1".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid request count specified. Must be between 1 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn count_above_max_rejected() {
+        let args = BenchArgs {
+            count: Some("2147483648".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid request count specified. Must be between 1 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn count_unparseable_gets_value_echoing_message() {
+        // Supplement 2: unparseable input takes the value-echoing
+        // form, with the exact `: 'abc'.` punctuation.
+        let args = BenchArgs {
+            count: Some("abc".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid request count specified: 'abc'."
+        );
+    }
+
+    // --- -d: queue depth (invocation 3) ------------------------------
+
+    #[test]
+    fn invocation_3_depth_zero() {
+        let args = BenchArgs {
+            depth: Some("0".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid queue depth specified. Must be between 1 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn depth_negative_same_message() {
+        let args = BenchArgs {
+            depth: Some("-1".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid queue depth specified. Must be between 1 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn depth_unparseable_gets_value_echoing_message() {
+        let args = BenchArgs {
+            depth: Some("abc".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid queue depth specified: 'abc'."
+        );
+    }
+
+    // --- -s: buffer size (invocations 4, 5) + instar cap -------------
+
+    #[test]
+    fn invocation_4_bufsize_zero() {
+        let args = BenchArgs {
+            buffer_size: Some("0".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid buffer size specified. Must be between 1 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn invocation_5_bufsize_3g_gives_qemu_range_message_not_instar_cap() {
+        // Precedence: 3 GiB is past qemu's own [1, 2147483647]
+        // bound, so it never reaches instar's 2 MiB cap check.
+        let args = BenchArgs {
+            buffer_size: Some("3G".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid buffer size specified. Must be between 1 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn bufsize_3m_is_inside_qemu_range_but_above_instar_cap() {
+        // Precedence complement to invocation 5: 3 MiB is
+        // comfortably inside qemu's range, so it reaches instar's
+        // 2 MiB cap check instead.
+        let args = BenchArgs {
+            buffer_size: Some("3M".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "bench: buffer sizes above 2 MiB are not yet supported"
+        );
+    }
+
+    #[test]
+    fn bufsize_at_instar_cap_is_accepted() {
+        let args = BenchArgs {
+            buffer_size: Some("2M".to_string()),
+            ..default_bench_args()
+        };
+        let inv = validate_bench_args(&args).expect("2 MiB must be accepted");
+        assert_eq!(inv.params.bufsize, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn bufsize_unparseable_gets_value_echoing_message() {
+        let args = BenchArgs {
+            buffer_size: Some("abc".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid buffer size specified: 'abc'."
+        );
+    }
+
+    #[test]
+    fn bufsize_negative_with_suffix_is_unparseable_not_a_number() {
+        // Verified live: `-s -1` is a NUMBER (range form), but
+        // `-s -1k` is unparseable (echo form) -- the negative sign
+        // is only tolerated on plain integers.
+        let args = BenchArgs {
+            buffer_size: Some("-1k".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid buffer size specified: '-1k'."
+        );
+    }
+
+    #[test]
+    fn bufsize_plain_negative_is_a_number_and_gets_range_form() {
+        let args = BenchArgs {
+            buffer_size: Some("-1".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid buffer size specified. Must be between 1 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn bufsize_suffix_overflow_gets_range_form() {
+        // Verified live (Supplement 2): a suffix multiply that
+        // overflows u64 is a NUMBER out of range (qemu's cvtnum
+        // ERANGE), not an unparseable value -- range form, no echo.
+        let args = BenchArgs {
+            buffer_size: Some("200000000000000G".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid buffer size specified. Must be between 1 and 2147483647."
+        );
+    }
+
+    // --- -S: step size (invocations 22, 23, 24) ----------------------
+
+    #[test]
+    fn invocation_22_step_negative() {
+        let args = BenchArgs {
+            step_size: Some("-1".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid step size specified. Must be between 0 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn invocation_23_step_above_max() {
+        let args = BenchArgs {
+            step_size: Some("2147483648".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid step size specified. Must be between 0 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn step_unparseable_gets_value_echoing_message() {
+        let args = BenchArgs {
+            step_size: Some("abc".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid step size specified: 'abc'."
+        );
+    }
+
+    #[test]
+    fn step_suffix_overflow_gets_range_form() {
+        // Verified live (Supplement 2): suffix-multiply overflow is
+        // a number out of range, not an unparseable value.
+        let args = BenchArgs {
+            step_size: Some("200000000000000G".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid step size specified. Must be between 0 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn invocation_24_step_zero_is_valid_and_effective_step_is_bufsize() {
+        let args = BenchArgs {
+            step_size: Some("0".to_string()),
+            ..default_bench_args()
+        };
+        let inv = validate_bench_args(&args).expect("step 0 must be valid");
+        assert_eq!(inv.params.step, 0);
+        assert_eq!(inv.params.effective_step(), inv.params.bufsize);
+    }
+
+    // --- -o: offset (invocations 17, 18) ------------------------------
+
+    #[test]
+    fn invocation_17_offset_negative() {
+        let args = BenchArgs {
+            offset: Some("-1".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid offset specified. Must be between 0 and 9223372036854775807."
+        );
+    }
+
+    #[test]
+    fn offset_above_i64_max_is_rejected() {
+        let args = BenchArgs {
+            offset: Some("9223372036854775808".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid offset specified. Must be between 0 and 9223372036854775807."
+        );
+    }
+
+    #[test]
+    fn offset_unparseable_gets_value_echoing_message() {
+        let args = BenchArgs {
+            offset: Some("abc".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid offset specified: 'abc'."
+        );
+    }
+
+    #[test]
+    fn offset_suffix_overflow_gets_range_form() {
+        // Verified live (Supplement 2): `-o 200000000000000G`
+        // (2e14 * 2^30, overflows u64) gets the range form.
+        let args = BenchArgs {
+            offset: Some("200000000000000G".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid offset specified. Must be between 0 and 9223372036854775807."
+        );
+    }
+
+    #[test]
+    fn invocation_18_offset_suffix_renders_as_decimal() {
+        let args = BenchArgs {
+            offset: Some("1k".to_string()),
+            ..default_bench_args()
+        };
+        let inv = validate_bench_args(&args).expect("1k offset must parse");
+        assert_eq!(inv.params.offset, 1024);
+    }
+
+    // --- --pattern (invocations 6, 7, 10) -----------------------------
+
+    #[test]
+    fn invocation_6_pattern_256_out_of_range() {
+        // The -w flag is present (matching the exact invocation) but
+        // must not matter: the pattern range check runs before the
+        // -w refusal in check order.
+        let args = BenchArgs {
+            pattern: Some("256".to_string()),
+            write: true,
+            count: Some("10".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid pattern byte specified. Must be between 0 and 255."
+        );
+    }
+
+    #[test]
+    fn invocation_7_pattern_negative_same_message() {
+        let args = BenchArgs {
+            pattern: Some("-1".to_string()),
+            write: true,
+            count: Some("10".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid pattern byte specified. Must be between 0 and 255."
+        );
+    }
+
+    #[test]
+    fn invocation_10_pattern_without_write_is_not_an_error() {
+        let args = BenchArgs {
+            pattern: Some("65".to_string()),
+            count: Some("100".to_string()),
+            ..default_bench_args()
+        };
+        let inv = validate_bench_args(&args).expect("pattern without -w must not error");
+        assert_eq!(inv.params.pattern, 65);
+        assert!(!inv.params.is_write);
+    }
+
+    #[test]
+    fn pattern_unparseable_gets_value_echoing_message() {
+        let args = BenchArgs {
+            pattern: Some("abc".to_string()),
+            write: true,
+            count: Some("10".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid pattern byte specified: 'abc'."
+        );
+    }
+
+    // --- --flush-interval range check (Supplement 2) -------------------
+
+    #[test]
+    fn flush_interval_unparseable_gets_value_echoing_message() {
+        let args = BenchArgs {
+            flush_interval: Some("abc".to_string()),
+            write: true,
+            depth: Some("1".to_string()),
+            count: Some("10".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid flush interval specified: 'abc'."
+        );
+    }
+
+    #[test]
+    fn flush_interval_negative_gets_range_form() {
+        let args = BenchArgs {
+            flush_interval: Some("-1".to_string()),
+            write: true,
+            depth: Some("1".to_string()),
+            count: Some("10".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid flush interval specified. Must be between 0 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn flush_interval_above_max_gets_range_form() {
+        let args = BenchArgs {
+            flush_interval: Some("2147483648".to_string()),
+            write: true,
+            depth: Some("1".to_string()),
+            count: Some("10".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid flush interval specified. Must be between 0 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn flush_interval_range_check_fires_before_cross_option_rules() {
+        // An out-of-range interval WITHOUT -w must produce the
+        // range message, not "--flush-interval is only available in
+        // write tests" -- the range check runs first (verified
+        // live; Supplement 2).
+        let args = BenchArgs {
+            flush_interval: Some("-1".to_string()),
+            count: Some("10".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid flush interval specified. Must be between 0 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn flush_interval_zero_without_write_is_silently_accepted() {
+        // Verified live: the cross-option check gates on the VALUE,
+        // not on flag presence -- an explicit 0 without -w runs.
+        let args = BenchArgs {
+            flush_interval: Some("0".to_string()),
+            count: Some("10".to_string()),
+            ..default_bench_args()
+        };
+        let inv = validate_bench_args(&args).expect("--flush-interval 0 without -w must validate");
+        assert_eq!(inv.params.flush_interval, 0);
+        assert!(!inv.params.is_write);
+    }
+
+    // --- --flush-interval cross-option rules (invocations 8, 9) ------
+
+    #[test]
+    fn invocation_8_flush_without_write_gives_qemu_cross_option_message() {
+        let args = BenchArgs {
+            flush_interval: Some("50".to_string()),
+            count: Some("100".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "--flush-interval is only available in write tests"
+        );
+    }
+
+    #[test]
+    fn invocation_9_flush_smaller_than_depth_gives_qemu_cross_option_message() {
+        // -w is present (and the -w refusal check runs LATER in our
+        // order), so this must surface the cross-option message, not
+        // the phase-4 -w refusal -- pinning the ordering note in
+        // validate_bench_args's doc comment.
+        let args = BenchArgs {
+            write: true,
+            depth: Some("64".to_string()),
+            flush_interval: Some("32".to_string()),
+            count: Some("100".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Flush interval can't be smaller than depth"
+        );
+    }
+
+    // --- -w refusal (phase 4 only) ------------------------------------
+
+    #[test]
+    fn write_flag_alone_is_refused_in_phase_4() {
+        let args = BenchArgs {
+            write: true,
+            count: Some("100".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "bench: write tests (-w) are not yet supported"
+        );
+    }
+
+    // --- -t / -i / -n / --image-opts postures -------------------------
+
+    #[test]
+    fn cache_writeback_is_silently_accepted() {
+        let args = BenchArgs {
+            cache: Some("writeback".to_string()),
+            ..default_bench_args()
+        };
+        assert!(validate_bench_args(&args).is_ok());
+    }
+
+    #[test]
+    fn invocation_11_cache_mode_bogus_is_qemu_terse_text() {
+        let args = BenchArgs {
+            cache: Some("bogus".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid cache mode"
+        );
+    }
+
+    #[test]
+    fn invocation_13_cache_none_is_refused_diverging_from_qemu() {
+        // Divergence-registry material: real qemu-img 10.0.8 accepts
+        // `-t none` and runs the benchmark (1e capture invocation
+        // 13); instar v1 refuses it outright.
+        let args = BenchArgs {
+            cache: Some("none".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "bench: cache mode 'none' is not yet supported"
+        );
+    }
+
+    #[test]
+    fn invocation_12_aio_bogus_gets_instar_worded_refusal() {
+        // Diverges from qemu's own "Invalid aio option: bogus" (1e
+        // capture invocation 12) by design (OQ6): every -i value is
+        // refused since no aio backend selection exists yet.
+        let args = BenchArgs {
+            aio: Some("bogus".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "bench: aio backend 'bogus' is not yet supported"
+        );
+    }
+
+    #[test]
+    fn native_aio_flag_is_refused() {
+        let args = BenchArgs {
+            native_aio: true,
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "bench: native AIO (-n) is not yet supported"
+        );
+    }
+
+    #[test]
+    fn invocation_14_image_opts_with_format_is_mutually_exclusive() {
+        let args = BenchArgs {
+            image_opts: true,
+            format: Some("raw".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "--image-opts and --format are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn image_opts_alone_is_refused() {
+        let args = BenchArgs {
+            image_opts: true,
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "bench: --image-opts is not yet supported"
+        );
+    }
+
+    #[test]
+    fn quiet_and_force_share_are_accepted_noops() {
+        let args = BenchArgs {
+            quiet: true,
+            force_share: true,
+            ..default_bench_args()
+        };
+        let inv = validate_bench_args(&args).expect("no-ops must not error");
+        assert!(inv.quiet);
+        assert!(inv.force_share);
+    }
+
+    // --- filename count (invocations 15, 16) ---------------------------
+
+    #[test]
+    fn invocation_15_zero_filenames() {
+        let args = BenchArgs {
+            filename: vec![],
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Expecting one image file name\nTry 'instar bench --help' for more info"
+        );
+    }
+
+    #[test]
+    fn invocation_16_two_filenames_same_message_as_zero() {
+        let args = BenchArgs {
+            filename: vec!["a.raw".to_string(), "b.raw".to_string()],
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Expecting one image file name\nTry 'instar bench --help' for more info"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bench_render_tests {
+    //! Byte-for-byte pins of the Mission-section-3 renderers
+    //! (`render_bench_header`, `render_bench_flush_line`,
+    //! `render_bench_completion`, `render_bench_json`) against the
+    //! 1e capture and the phase-04 plan's JSON schema.
+    use super::*;
+
+    fn params(
+        count: u32,
+        depth: u32,
+        bufsize: u64,
+        step: u64,
+        offset: u64,
+        is_write: bool,
+    ) -> BenchParams {
+        BenchParams {
+            count,
+            depth,
+            bufsize,
+            step,
+            offset,
+            is_write,
+            pattern: 0,
+            flush_interval: 0,
+            no_drain: false,
+        }
+    }
+
+    #[test]
+    fn header_matches_invocation_20_defaults_style() {
+        let p = params(100, 64, 4096, 0, 0, false);
+        assert_eq!(
+            render_bench_header(&p),
+            "Sending 100 read requests, 4096 bytes each, 64 in parallel \
+             (starting at offset 0, step size 4096)"
+        );
+    }
+
+    #[test]
+    fn header_step_zero_renders_as_effective_bufsize_invocation_24() {
+        let p = params(100, 64, 4096, 0, 0, false);
+        assert_eq!(
+            render_bench_header(&p),
+            "Sending 100 read requests, 4096 bytes each, 64 in parallel \
+             (starting at offset 0, step size 4096)"
+        );
+    }
+
+    #[test]
+    fn header_offset_decimal_invocation_18() {
+        let p = params(100, 64, 4096, 0, 1024, false);
+        assert_eq!(
+            render_bench_header(&p),
+            "Sending 100 read requests, 4096 bytes each, 64 in parallel \
+             (starting at offset 1024, step size 4096)"
+        );
+    }
+
+    #[test]
+    fn header_write_word_invocation_21() {
+        // -w's CLI path refuses the flag in phase 4, so this
+        // constructs BenchParams directly to pin the renderer's
+        // read/write word independent of that refusal.
+        let p = params(100, 1, 4096, 0, 0, true);
+        assert_eq!(
+            render_bench_header(&p),
+            "Sending 100 write requests, 4096 bytes each, 1 in parallel \
+             (starting at offset 0, step size 4096)"
+        );
+    }
+
+    #[test]
+    fn header_bufsize_65537_is_echoed_verbatim() {
+        let p = params(100, 64, 65537, 0, 0, false);
+        assert_eq!(
+            render_bench_header(&p),
+            "Sending 100 read requests, 65537 bytes each, 64 in parallel \
+             (starting at offset 0, step size 65537)"
+        );
+    }
+
+    #[test]
+    fn flush_line_renders_interval() {
+        assert_eq!(
+            render_bench_flush_line(50),
+            "Sending flush every 50 requests"
+        );
+    }
+
+    #[test]
+    fn completion_line_matches_invocation_20_precision() {
+        assert_eq!(
+            render_bench_completion(0.001),
+            "Run completed in 0.001 seconds."
+        );
+    }
+
+    #[test]
+    fn completion_line_rounds_to_three_decimals() {
+        assert_eq!(
+            render_bench_completion(12.3456),
+            "Run completed in 12.346 seconds."
+        );
+    }
+
+    #[test]
+    fn json_full_object_escapes_filename_and_orders_keys() {
+        let p = params(100, 1, 4096, 0, 0, false);
+        let filename = "weird\"name.raw";
+        let elapsed = 0.004321;
+        let out = render_bench_json(&p, filename, "raw", 3, elapsed);
+        let expected_rps = 100.0_f64 / elapsed;
+        let expected_bps = (100u64 * 4096) as f64 / elapsed;
+        let expected = format!(
+            "{{\n\
+             \x20   \"filename\": \"{}\",\n\
+             \x20   \"format\": \"raw\",\n\
+             \x20   \"count\": 100,\n\
+             \x20   \"depth\": 1,\n\
+             \x20   \"effective-depth\": 1,\n\
+             \x20   \"buffer-size\": 4096,\n\
+             \x20   \"step-size\": 4096,\n\
+             \x20   \"offset\": 0,\n\
+             \x20   \"write\": false,\n\
+             \x20   \"pattern\": 0,\n\
+             \x20   \"flush-interval\": 0,\n\
+             \x20   \"no-drain\": false,\n\
+             \x20   \"flushes-issued\": 3,\n\
+             \x20   \"elapsed-seconds\": 0.004321,\n\
+             \x20   \"requests-per-second\": {:.2},\n\
+             \x20   \"bytes-per-second\": {:.2}\n\
+             }}",
+            escape_json_string(filename),
+            expected_rps,
+            expected_bps,
+        );
+        assert_eq!(out, expected);
+    }
 }
 
 #[derive(Args, Debug)]

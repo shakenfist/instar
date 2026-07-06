@@ -789,6 +789,59 @@ way to qemu's own rendered output.
   invocations; noting it here so later phases don't mistake it
   for part of the bench contract.
 
+### Supplement 2 (phase 4a): unparseable values and the flush-interval range
+
+Discovered during step 4a implementation (the original matrix
+only probed out-of-range *numbers*, never non-numeric input, and
+never probed `--flush-interval`'s own range). Re-verified against
+the same local 10.0.8 binary, all exit 1:
+
+- **Unparseable values do NOT collapse into the range message.**
+  A genuinely non-numeric value produces a distinct, value-echoing
+  form, uniformly across all seven numeric options:
+
+  ```
+  $ qemu-img bench -c abc probe.raw
+  qemu-img: Invalid request count specified: 'abc'.
+  ```
+
+  and likewise `Invalid queue depth specified: 'abc'.`,
+  `Invalid buffer size specified: 'abc'.`, `Invalid step size
+  specified: 'abc'.`, `Invalid offset specified: 'abc'.`,
+  `Invalid pattern byte specified: 'abc'.`, `Invalid flush
+  interval specified: 'abc'.` — the option's display name, a
+  colon, the offending value in single quotes, trailing period.
+  The phase-4 plan's original "parse failures collapse into the
+  range message" assumption was **wrong** and its §2 table has
+  been corrected.
+
+- **`--flush-interval` has its own range message**, absent from
+  the original matrix:
+
+  ```
+  $ qemu-img bench --flush-interval -1 -w -c 10 -d 1 probe.raw
+  qemu-img: Invalid flush interval specified. Must be between 0 and 2147483647.
+  ```
+
+  Bounds are `[0, 2147483647]` (0 = never flush, and
+  `--flush-interval 0 -w` runs successfully). This range check
+  fires before the cross-option rules.
+
+- **Suffix-multiply overflow takes the range form, not the echo
+  form** (qemu's cvtnum returns ERANGE for it, same as an
+  out-of-range number):
+
+  ```
+  $ qemu-img bench -o 200000000000000G probe.raw
+  qemu-img: Invalid offset specified. Must be between 0 and 9223372036854775807.
+  $ qemu-img bench -s 200000000000000G probe.raw
+  qemu-img: Invalid buffer size specified. Must be between 1 and 2147483647.
+  ```
+
+  instar's classifier maps `parse_qemu_img_size`'s overflow
+  outcome to the range form accordingly; only genuinely
+  non-numeric input gets the `: '<v>'.` echo form.
+
 ## Captured flush-count verification (step 1c)
 
 Method: `strace -f -e trace=fdatasync,fsync` differencing against a

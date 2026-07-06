@@ -129,23 +129,33 @@ come from the 1e capture **byte-for-byte** (bare qemu text, no
 instar-only refusals below DO carry the `bench:` prefix to mark
 them as instar postures):
 
+Each numeric option has TWO failure forms (Supplement 2 of the
+1e capture — the original "parse failures collapse into the range
+message" assumption was disproven during 4a and is corrected
+here): an **unparseable** value produces the value-echoing form
+`Invalid <name> specified: '<value>'.`, an out-of-range *number*
+produces the `Must be between` form. Display names: `request
+count`, `queue depth`, `buffer size`, `step size`, `offset`,
+`pattern byte`, `flush interval`.
+
 | Check (in order) | Message |
 |---|---|
-| `-c` not parseable / < 1 / > 2147483647 | `Invalid request count specified. Must be between 1 and 2147483647.` |
-| `-d` ditto | `Invalid queue depth specified. Must be between 1 and 2147483647.` |
-| `-s` not parseable / < 1 / > 2147483647 (qemu bound FIRST) | `Invalid buffer size specified. Must be between 1 and 2147483647.` |
+| `-c` unparseable | `Invalid request count specified: '<v>'.` |
+| `-c` < 1 / > 2147483647 | `Invalid request count specified. Must be between 1 and 2147483647.` |
+| `-d` unparseable / out of range | `Invalid queue depth specified: '<v>'.` / `Invalid queue depth specified. Must be between 1 and 2147483647.` |
+| `-s` unparseable | `Invalid buffer size specified: '<v>'.` |
+| `-s` < 1 / > 2147483647 (qemu bound FIRST) | `Invalid buffer size specified. Must be between 1 and 2147483647.` |
 | `-s` in qemu range but > `BENCH_MAX_BUFSIZE` (2 MiB) | `bench: buffer sizes above 2 MiB are not yet supported` |
-| `-S` not parseable / > 2147483647 (0 is valid) | `Invalid step size specified. Must be between 0 and 2147483647.` |
-| `-o` not parseable / negative / > i64::MAX | `Invalid offset specified. Must be between 0 and 9223372036854775807.` |
-| `--pattern` not parseable / outside [0, 255] | `Invalid pattern byte specified. Must be between 0 and 255.` |
-| `--flush-interval` without `-w` | `--flush-interval is only available in write tests` |
+| `-S` unparseable / > 2147483647 (0 is valid) | `Invalid step size specified: '<v>'.` / `Invalid step size specified. Must be between 0 and 2147483647.` |
+| `-o` unparseable / negative / > i64::MAX | `Invalid offset specified: '<v>'.` / `Invalid offset specified. Must be between 0 and 9223372036854775807.` |
+| `--pattern` unparseable / outside [0, 255] | `Invalid pattern byte specified: '<v>'.` / `Invalid pattern byte specified. Must be between 0 and 255.` |
+| `--flush-interval` unparseable / outside [0, 2147483647] | `Invalid flush interval specified: '<v>'.` / `Invalid flush interval specified. Must be between 0 and 2147483647.` |
+| **nonzero** flush interval without `-w` (`--flush-interval 0` without `-w` is silently fine — verified live; the check gates on the value, matching the crate's `FlushRequiresWrite`) | `--flush-interval is only available in write tests` |
 | nonzero flush interval < depth | `Flush interval can't be smaller than depth` |
 | filename count ≠ 1 | `Expecting one image file name` + second line `Try 'instar bench --help' for more info` (hint line names instar, not qemu-img — divergence-registry entry) |
 
-Parse failures (e.g. `-c abc`) collapse into the same range
-message as out-of-range values — matching qemu's
-cvtnum-then-range-check collapse observed for `-c -1` etc.; step
-4c verifies this assumption against the live binary. Where
+The flush-interval range check fires before the cross-option
+rules (verified live). Where
 `BenchParams::validate` covers a rule (count/depth/bufsize/step
 ranges, the two cross-option rules, the cap ordering), call it
 and map `BenchParamError` → the table; host-only rules (pattern
