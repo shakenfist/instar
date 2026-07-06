@@ -214,3 +214,175 @@ against qemu rather than against ourselves.
 | 5a | high | opus | none | Raw write path end-to-end: guest `write_input_byte_range` (sub-sector RMW on RW input slot 0, mirroring commit's output-side helper), the FLAG_WRITE branch for raw (per-offset pattern writes + `flush_after_completion` cadence + `fsync_input(0)` + `flushes_issued`), host `-w` enablement (drop the 4a refusal, RW-top attach, FLAG_WRITE + pattern into BenchConfig, vmdk/vhd/vhdx refusal message), flush-line rendering now reachable. Smoke: `-w --pattern 65 -c 100` on a raw image — pattern verifiable via cmp/xxd, `--flush-interval` count matches `total_flushes`, fsyncs actually reach the file (strace or /proc counters), byte-compare against a qemu `-w` run with identical args. Commit 1. |
 | 5b | high | opus | worktree | qcow2 allocating writes per Mission §1-§3: the per-cluster driver (overwrite fast path; allocating path with chain-read COW fill), write-through L2/L1 ordering, staged refblocks + flush-point/end write-back, the full gate set + the two new error codes + host rendering. MUST diff the resulting write-back order against commit's `:787-834` and state the comparison explicitly in the report; MUST verify the COW fill against a qemu `-w` run on an overlay — the oracle is the **virtual view** (`qemu-img compare` full-image equality) plus `qemu-img check` clean on ours; physical byte-identity of the two overlays is NOT required (allocator placement may legitimately differ) but record whether it holds anyway. Worktree isolation: this is in-place-mutation code on the most corruption-prone path. Gates: build/size/lint/test-rust plus its own smoke (fresh qcow2 grows, check clean, pattern lands, overlay COW correct). Commit 2. |
 | 5c | medium | sonnet | none | The recorded verification sweep + bookkeeping: matrix over {raw, fresh qcow2, populated qcow2, overlay} × {-w defaults, --pattern 65, --flush-interval 50 -d 1, --no-drain} — for each: instar vs qemu image byte-compare (or qemu-img compare where physical layouts legitimately differ — record which), `qemu-img check` clean, disk-size growth on fresh qcow2, flushes-issued == total_flushes, gate refusals (snapshot-bearing image, refcount_bits=1, compressed image, vmdk/vhd/vhdx), `--output json` fields. Append `## Captured write verification (step 5c)` to this plan; master plan row → Complete; index update; pre-commit. Stop-and-report on any content mismatch. Commit 3. |
+
+## Captured write verification (step 5c)
+
+Verified against local `qemu-img 10.0.8` (Debian 1:10.0.8+ds-0+deb13u1+b2)
+on `instar` built from `2a3d3af` (`make instar`, binary at
+`src/target/release/instar`). All work done in a scratch directory outside
+the repo; every run used a fresh pristine copy of the relevant base image
+(one copy for instar, one for qemu-img, never shared). No stop-and-report
+events fired: zero content mismatches, zero `check` errors/leaks, zero
+refusals that touched an image, zero stdout parity breaks.
+
+### Base images
+
+- **raw**: 10 MiB flat file, zeroed except an MBR `55 AA` signature at
+  bytes 510-511.
+- **fresh qcow2**: `qemu-img create -f qcow2 fresh.qcow2 64M` (no data
+  written).
+- **populated qcow2**: same 64 MiB qcow2, then
+  `qemu-io -c "write -P 0xbb 0 8M"` (first 8 MiB written).
+- **overlay**: a `backing.qcow2` identical to the populated image (64 MiB,
+  first 8 MiB filled with `0xbb`), with a qcow2 overlay pointed at it via
+  `-b`/`-F qcow2` (absolute backing path so a copy in any directory still
+  resolves — instar's default `SecurityConfig` restricts backing references
+  to the top image's own directory, so the shared backing file was copied
+  into the working directory used for the sweep).
+
+### Argument sets
+
+- (a) `-w -c 100 --pattern 65 -f <fmt>` (pattern `0x41`, no flush, `-d`
+  defaulted to 64)
+- (b) `-w -c 100 --pattern 65 --flush-interval 50 -d 1 -f <fmt>`
+- (c) `-w -c 100 --pattern 65 --no-drain --flush-interval 50 -d 1 -f <fmt>`
+- (d) `-w -c 200 -s 131072 -o 32768 --pattern 66 -f <fmt>` (pattern `0x42`,
+  128 KiB buffer over a 64 KiB cluster — every request straddles two
+  clusters; offset 32768 is mid-cluster, so the first touched cluster's
+  low half is outside the patch window)
+
+### Matrix verdicts (16 runs)
+
+All exit codes 0 except the one documented divergence below (raw × (d),
+qemu-img side). Stdout header lines byte-identical between instar and
+qemu-img on every run that completed; the "Sending flush every 50 requests"
+line is present on both sides for (b) and (c) and absent from both for (a)
+and (d).
+
+| Image | Argset | Exit (instar/qemu) | Content oracle | `check` | Disk-size growth (instar → qemu) |
+|-------|--------|---------------------|-----------------|---------|-----------------------------------|
+| raw | a | 0 / 0 | `cmp` byte-identical | n/a (raw) | fixed size, no growth (10485760 → 10485760 both sides) |
+| raw | b | 0 / 0 | `cmp` byte-identical | n/a | no growth |
+| raw | c | 0 / 0 | `cmp` byte-identical | n/a | no growth |
+| raw | d | 0 / **1** | not comparable — see divergence note below | n/a | no growth (file stays 10485760; instar wrote the full wrapped schedule in place) |
+| fresh qcow2 | a | 0 / 0 | `qemu-img compare`: identical | clean, no leaks | grows: 200704 → 786432 (instar) / 200704 → 729088 (qemu) |
+| fresh qcow2 | b | 0 / 0 | `qemu-img compare`: identical | clean | grows: 200704 → 786432 / 729088 |
+| fresh qcow2 | c | 0 / 0 | `qemu-img compare`: identical | clean | grows: 200704 → 786432 / 729088 |
+| fresh qcow2 | d | 0 / 0 | `qemu-img compare`: identical | clean | grows: 200704 → 26607616 / 26550272 |
+| populated qcow2 | a | 0 / 0 | `qemu-img compare`: identical (physical bytes also identical — fast overwrite path) | clean | no growth: 8716288 → 8716288 both sides |
+| populated qcow2 | b | 0 / 0 | identical, physical bytes identical | clean | no growth |
+| populated qcow2 | c | 0 / 0 | identical, physical bytes identical | clean | no growth |
+| populated qcow2 | d | 0 / 0 | `qemu-img compare`: identical (physical bytes differ — (d)'s range runs past the pre-populated 8 MiB, so it takes the allocating path there) | clean | grows: 8716288 → 26607616 / 26611712 (expected — (d) writes well past the 8 MiB pre-populated region) |
+| overlay | a | 0 / 0 | `qemu-img compare`: identical | clean | grows: 200704 → 786432 / 724992 |
+| overlay | b | 0 / 0 | identical | clean | grows: 200704 → 786432 / 724992 |
+| overlay | c | 0 / 0 | identical | clean | grows: 200704 → 786432 / 724992 |
+| overlay | d | 0 / 0 | identical | clean | grows: 200704 → 26607616 / 26550272 |
+
+Physical-byte match (informative, not required): identical on `raw` (all
+formats there are physically byte-comparable by construction) and on
+`populated` for (a)/(b)/(c) (both instar and qemu take the fast
+overwrite-in-place path over already-allocated clusters, so allocator
+placement doesn't enter it). Physical bytes differ on every `fresh`,
+`overlay`, and `populated`-(d) row — expected, since instar's and qemu's
+cluster allocators legitimately place new clusters differently; the virtual
+view (`qemu-img compare`) is the required oracle there and matched on every
+row.
+
+**raw × (d) divergence (not a stop-and-report event):** `qemu-img bench`
+10.0.8 fails partway through this row with `Failed request: Input/output
+error` (byte-count analysis: it completes ~19 of 200 requests, writing
+2,543,616 bytes of pattern `0x42`, before hitting its own EOF-overrun bug).
+This is the pre-existing qemu 10.0.8 wrap-rule bug that `crates/bench`
+already documents and deliberately does not reproduce (master plan OQ7,
+`src/crates/bench/src/lib.rs` wrap-rule doc comment): a 10 MiB raw image
+with a 128 KiB buffer stepping from offset 32768 for 200 requests overruns
+EOF under the naive "advance and let it fail" rule 10.0.8 still ships, and
+qemu-img bails with an I/O error instead of wrapping. instar adopts the
+fixed **master** wrap rule and completes all 200 requests, wrapping every
+overrunning offset back into `[0, image_size)`: the resulting file is
+10,354,688 bytes of pattern `0x42` out of 10,485,760 total (the remainder
+untouched — the wrap modulus leaves a small unwritten remainder, plus the
+2-byte MBR signature which a wrapped write happened not to cover), file
+size unchanged at 10,485,760 throughout. Because the two tools genuinely
+diverge in behaviour here (one succeeds, one errors), a `cmp` between the
+two output files is not a meaningful oracle for this row; instar's own
+output was independently verified (pattern-byte census, no unexpected
+values, file size unchanged) and is correct per its documented wrap
+contract. This is the write-path analogue of the read-path OQ7 finding
+recorded in phase 1 — worth folding into `KNOWN_BENCH_DIVERGENCES` in
+phase 6/8.
+
+### `--output json` flush-count verification
+
+Ran `--output json` on every image with two argument sets: one with no
+flush interval (expect `flushes-issued` 0) and one with
+`--flush-interval 50` at `-c 100` (expect `flushes-issued` 2, matching
+`crates/bench::total_flushes(100, 50) == 2`). All eight runs matched
+exactly:
+
+| Image | flush-interval 0 | flush-interval 50, count 100 |
+|-------|-------------------|-------------------------------|
+| raw | `flushes-issued: 0` | `flushes-issued: 2` |
+| fresh qcow2 | `flushes-issued: 0` | `flushes-issued: 2` |
+| populated qcow2 | `flushes-issued: 0` | `flushes-issued: 2` |
+| overlay | `flushes-issued: 0` | `flushes-issued: 2` |
+
+### Refusal rows (instar only; image untouched, confirmed by sha256)
+
+| Case | Refused with | sha256 unchanged |
+|------|---------------|-------------------|
+| qcow2 with internal snapshot (`qemu-img snapshot -c snap1`) | `bench: write tests are not supported for this image (internal snapshots)` | yes |
+| `refcount_bits=1` qcow2 | `bench: write tests are not supported for this image (refcount_bits != 16)` | yes |
+| Compressed qcow2 (verified via `qemu-img check`: 100% compressed clusters after `qemu-img convert -c` of compressible data) | `bench: write tests are not supported for this image (compression)` | yes |
+| vmdk (`qemu-img convert -O vmdk`) | `bench: write tests are not yet supported for vmdk` | yes |
+| vhdx (`qemu-img convert -O vhdx`) | `bench: write tests are not yet supported for vhdx` | yes |
+| vhd (`qemu-img convert -O vpc -o subformat=dynamic`; instar's discovered format name is `vpc`) | `bench: write tests are not yet supported for vpc` | yes |
+| LUKS-encrypted qcow2 (`-o encrypt.format=luks,encrypt.key-secret=...`) — not skipped, quick to build | `bench: write tests are not supported for this image (encryption)` | yes |
+
+Regression guard: `--flush-interval 50` without `-w` on a plain raw image
+still produces the qemu cross-option message verbatim —
+`--flush-interval is only available in write tests` — byte-identical to
+`qemu-img bench --flush-interval 50 -f raw` on the same image, exit 1,
+image untouched (sha256 unchanged).
+
+### Overlay COW spot-proof
+
+Repeated on the pristine matrix overlay (not a throwaway copy) after run
+(d): request 0 of (d) writes bytes `[32768, 163840)`, which starts
+mid-way through cluster 0 (`[0, 65536)`, cluster size 65536). Byte 20000 —
+inside the touched cluster, outside the patched window — reads `0xbb`
+(matching the backing file's content at the same offset) via
+`qemu-io -c "read -v 20000 16" overlay.qcow2`; byte 32768 (start of the
+patch window) reads `0x42` (pattern 66). This confirms the allocating
+path's chain-read COW fill preserved the rest of the newly-allocated
+cluster's virtual content exactly, patching only the intended window.
+
+### Measurement observations (informative only, no assertions)
+
+Elapsed times (host `Instant` bracket) were consistently higher for
+instar than for qemu-img across every row, most pronounced on the
+allocating/(d) rows:
+
+| Image | Argset | instar elapsed | qemu elapsed |
+|-------|--------|-----------------|---------------|
+| raw | a | 0.007s | 0.001s |
+| raw | b/c | 0.019s | 0.010-0.011s |
+| raw | d | 0.037s | n/a (errored) |
+| fresh qcow2 | a | 0.017s | 0.012s |
+| fresh qcow2 | b/c | 0.024s | 0.019-0.020s |
+| fresh qcow2 | d | 0.137s | 0.024s |
+| populated qcow2 | a | 0.017s | 0.001s |
+| populated qcow2 | b/c | 0.029s | 0.012s |
+| populated qcow2 | d | 0.116s | 0.012s |
+| overlay | a | 0.015s | 0.012s |
+| overlay | b/c | 0.025s | 0.017-0.018s |
+| overlay | d | 0.145s | 0.022s |
+
+The gap widens most on (d) (cluster-straddling, allocating writes), which
+is consistent with Mission §2's documented measurement caveat: instar
+concentrates staged-refblock write-back at flush points and at run end,
+inside the measured bracket, whereas qemu amortises metadata writes
+through its page cache during the run. No assertion is made about
+acceptable overhead magnitude — this is the sandbox-overhead data point
+the master plan's announcement-email motivation calls for, left for
+phase 6/8 to interpret.
