@@ -4075,6 +4075,18 @@ impl BenchResult {
     pub const ERROR_IO_WRITE: u32 = 5;
     /// A flush (`fsync_input`) of the image failed.
     pub const ERROR_IO_FLUSH: u32 = 6;
+    /// A write test was requested against an image the guest cannot
+    /// write. `error_detail` carries a small gate-id enum: `0` means
+    /// "the format itself has no write support yet" (phase 5a: qcow2
+    /// writes land in 5b, so a qcow2 image reaches the guest and is
+    /// refused with detail `0`). Later gate ids (compression, LUKS,
+    /// extended-L2, snapshot-bearing, …) are assigned as 5b adds them.
+    pub const ERROR_WRITE_UNSUPPORTED: u32 = 7;
+    /// A qcow2 allocating write could not obtain a free cluster because
+    /// the refcount table is full and v1 never grows it (the host
+    /// renders "image too large for in-place bench write"). Unused until
+    /// the 5b allocating-write path exists.
+    pub const ERROR_ALLOC_EXHAUSTED: u32 = 8;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -5195,8 +5207,8 @@ mod tests {
 
     #[test]
     fn bench_result_error_codes_distinct() {
-        // Phase 2 defines codes 0..=6. Confirm every code is
-        // distinct and contiguously numbered.
+        // Phase 2 defines codes 0..=6; phase 5 appends 7..=8. Confirm
+        // every code is distinct and contiguously numbered.
         let codes = [
             BenchResult::ERROR_OK,
             BenchResult::ERROR_BAD_CONFIG,
@@ -5205,6 +5217,8 @@ mod tests {
             BenchResult::ERROR_IO_READ,
             BenchResult::ERROR_IO_WRITE,
             BenchResult::ERROR_IO_FLUSH,
+            BenchResult::ERROR_WRITE_UNSUPPORTED,
+            BenchResult::ERROR_ALLOC_EXHAUSTED,
         ];
         for (i, c) in codes.iter().enumerate() {
             assert_eq!(*c, i as u32);

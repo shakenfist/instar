@@ -2481,7 +2481,8 @@ fn open_chain_devices(
 /// the overlay attached as input slot 0 needs RW so the
 /// overlay-clear pass can zero its L2 / refcount entries.
 /// Rebase (phase 4) does not use this variant — the overlay
-/// being rebased is the output device, not an input.
+/// being rebased is the output device, not an input. Bench (phase 5)
+/// also uses it for `-w`, attaching the top image RW at slot 0.
 ///
 /// The `rw_slots` indices count chain images and external data
 /// files in the same order they would be attached by
@@ -2489,7 +2490,6 @@ fn open_chain_devices(
 /// number of devices actually opened are ignored, matching the
 /// "tolerate extra entries" convention used by the chain
 /// helpers elsewhere in this file.
-#[allow(dead_code)]
 fn open_chain_devices_rw(
     chain: &BackingChain,
     sector_size: u64,
@@ -3905,13 +3905,12 @@ fn validate_bench_args(args: &BenchArgs) -> Result<BenchInvocation, String> {
         return Err(msg);
     }
 
-    // -w: accepted by the parser (so --help documents the full
-    // surface and the phase-5 diff is additive) but refused at
-    // runtime until phase 5 lands the write path.
-    if args.write {
-        // removed in phase 5
-        return Err("bench: write tests (-w) are not yet supported".to_string());
-    }
+    // -w: accepted and validated. The phase-4 blanket refusal is
+    // gone (phase 5 lands the write path); the format-specific refusal
+    // for -w on vmdk/vhd/vhdx lives in `run_bench`, after discovery
+    // knows the top-of-chain format. The cross-option rules above
+    // (flush-requires-write, interval >= depth) are now reachable
+    // end-to-end.
 
     // -t: cache mode. qemu's own default (writeback) is silently
     // accepted; other valid-but-unsupported qemu modes get an
@@ -4074,9 +4073,9 @@ struct BenchRunResult {
 /// Input/output error` (1e capture invocation 19): by the time it
 /// fires the header has already printed on stdout, so this reproduces
 /// qemu's exact zero-byte-image transcript. Every other code carries
-/// instar's `bench:` prefix. `ERROR_IO_WRITE` / `ERROR_IO_FLUSH` are
-/// unreachable until phase 5 lands the write path but are mapped now
-/// so the fork is exhaustive.
+/// instar's `bench:` prefix. `ERROR_IO_WRITE` / `ERROR_IO_FLUSH` /
+/// `ERROR_WRITE_UNSUPPORTED` / `ERROR_ALLOC_EXHAUSTED` are reachable
+/// from phase 5's write path.
 fn map_bench_error(code: u32) -> String {
     match code {
         c if c == shared::BenchResult::ERROR_IO_READ => {
@@ -4096,6 +4095,17 @@ fn map_bench_error(code: u32) -> String {
         }
         c if c == shared::BenchResult::ERROR_IO_FLUSH => {
             "bench: flushing the image failed".to_string()
+        }
+        c if c == shared::BenchResult::ERROR_WRITE_UNSUPPORTED => {
+            // Phase 5a: the host already lets qcow2 through to the guest
+            // (raw and qcow2 both pass the run_bench format gate), and
+            // the guest refuses qcow2 writes with this code until 5b
+            // lands the allocating path. Rendered generically so the
+            // same message serves any format the guest cannot yet write.
+            "bench: write tests are not yet supported for this image".to_string()
+        }
+        c if c == shared::BenchResult::ERROR_ALLOC_EXHAUSTED => {
+            "bench: image too large for in-place bench write".to_string()
         }
         other => format!("bench: guest returned an unknown error code ({other})"),
     }
@@ -4150,6 +4160,20 @@ fn run_bench(args: &BenchArgs, verbose: bool) -> Result<(), Box<dyn std::error::
         }
     }
 
+    // -w host-side format gate: write tests are supported only for raw
+    // and qcow2. Every other discovered top format is refused here,
+    // before the header prints or the guest launches (Mission §3
+    // divergence registry). raw and qcow2 both pass; qcow2 then reaches
+    // the guest, which refuses it with ERROR_WRITE_UNSUPPORTED until 5b
+    // lands the allocating write path.
+    if invocation.params.is_write && !matches!(top_format, ImageFormat::Raw | ImageFormat::Qcow2) {
+        return Err(format!(
+            "bench: write tests are not yet supported for {}",
+            top_format_name
+        )
+        .into());
+    }
+
     // Human mode prints the header (and, once phase 5 allows a nonzero
     // flush interval, the flush line) to stdout BEFORE the guest
     // launches — mirroring qemu, which prints them before submitting
@@ -4159,8 +4183,8 @@ fn run_bench(args: &BenchArgs, verbose: bool) -> Result<(), Box<dyn std::error::
     if human {
         println!("{}", render_bench_header(&invocation.params));
         if invocation.params.flush_interval != 0 {
-            // Unreachable in phase 4 (a nonzero flush interval requires
-            // -w, which run_bench refuses), but wired for phase 5.
+            // Reachable in phase 5: a nonzero flush interval requires
+            // -w, and -w now runs. Prints for real write runs.
             println!(
                 "{}",
                 render_bench_flush_line(invocation.params.flush_interval)
@@ -4291,8 +4315,14 @@ fn run_bench_guest(
     if verbose {
         flags |= shared::BenchConfig::FLAG_VERBOSE;
     }
-    // FLAG_WRITE is never set in phase 4: run_bench refuses -w before
-    // reaching here, and bench.bin is a read-only build.
+    // FLAG_WRITE drives the guest's write-mode fork (phase 5). The
+    // pattern byte is already carried in the config below; the guest
+    // fills its write buffer with it. run_bench has already refused any
+    // top format outside {raw, qcow2}, so a write run reaching here is
+    // raw (written in place) or qcow2 (refused guest-side until 5b).
+    if params.is_write {
+        flags |= shared::BenchConfig::FLAG_WRITE;
+    }
 
     guest_mem.write_obj(
         shared::BenchConfig::MAGIC,
@@ -4337,20 +4367,36 @@ fn run_bench_guest(
         sector_size,
     );
 
-    // --- Attach the input backing chain read-only (no output device) ----
-    // The whole discovered chain is opened read-only as input devices
-    // (convert's read-only attach). Bench never writes, so there is no
-    // output device.
+    // --- Attach the input backing chain (no output device) --------------
+    // Read tests open the whole discovered chain read-only (convert's
+    // read-only attach). Write tests (-w) need the TOP image writable so
+    // the guest's `write_input_sector(0, ..)` / `fsync_input(0)` reach
+    // the file; every parent stays read-only (writes through a backing
+    // chain never touch parents — for raw this is just the single RW
+    // device). This mirrors commit's mixed attach via
+    // `open_chain_devices_rw` with the top slot RW.
     let mut device_set = DeviceSet::new();
     let mut io_events: Vec<IoEvent> = Vec::new();
-    open_chain_devices(
-        chain,
-        sector_size as u64,
-        &mut device_set,
-        &mut io_events,
-        0,
-        "chain",
-    )?;
+    if params.is_write {
+        open_chain_devices_rw(
+            chain,
+            sector_size as u64,
+            &mut device_set,
+            &mut io_events,
+            0,
+            "chain",
+            &[0], // top image (input slot 0) read-write; parents read-only
+        )?;
+    } else {
+        open_chain_devices(
+            chain,
+            sector_size as u64,
+            &mut device_set,
+            &mut io_events,
+            0,
+            "chain",
+        )?;
+    }
     write_chain_config(&guest_mem, chain)?;
 
     let guest_mem = Arc::new(guest_mem);
@@ -5083,19 +5129,23 @@ mod bench_validate_tests {
         );
     }
 
-    // --- -w refusal (phase 4 only) ------------------------------------
+    // --- -w now validates (phase 5) -----------------------------------
 
     #[test]
-    fn write_flag_alone_is_refused_in_phase_4() {
+    fn write_flag_alone_now_validates() {
+        // Phase 4 refused `-w` outright in validate_bench_args; phase 5
+        // removed that blanket refusal (the write path exists, and the
+        // format-specific refusal for vmdk/vhd/vhdx moved to run_bench,
+        // after discovery). So a bare `-w` now passes validation with
+        // is_write set.
         let args = BenchArgs {
             write: true,
             count: Some("100".to_string()),
             ..default_bench_args()
         };
-        assert_eq!(
-            validate_bench_args(&args).unwrap_err(),
-            "bench: write tests (-w) are not yet supported"
-        );
+        let inv = validate_bench_args(&args).expect("-w must now validate");
+        assert!(inv.params.is_write);
+        assert_eq!(inv.params.count, 100);
     }
 
     // --- -t / -i / -n / --image-opts postures -------------------------

@@ -144,6 +144,66 @@ unsafe fn fail(
     bytes_read
 }
 
+/// Write `len` bytes from `src_ptr` into read-write input device 0 at
+/// an arbitrary `byte_offset`. A sector-aligned window (offset and
+/// length both on a sector boundary) writes straight through; any
+/// sub-sector window is a read-modify-write — read the covering sector
+/// into `bounce_ptr`, patch the byte window, write it back.
+///
+/// This is the input-device analog of commit's
+/// `write_output_byte_range`, and shares its structure exactly (only
+/// the call-table slot differs: `write_input_sector(0, ..)` /
+/// `read_input_sector(0, ..)` instead of the output-device pair). It
+/// is the raw write primitive: a raw image is a flat file, so a bench
+/// write just patches `[offset, offset + bufsize)` in place.
+///
+/// # Safety
+///
+/// `call_table` must be the validated `CallTable`; input slot 0 must
+/// be attached read-write. `src_ptr` must point at `len` readable
+/// bytes and `bounce_ptr` at `sector_size` writable bytes;
+/// `sector_size` must be nonzero (guaranteed by `verify_sector_sizes`).
+unsafe fn write_input_byte_range(
+    call_table: &CallTable,
+    sector_size: usize,
+    byte_offset: u64,
+    src_ptr: *const u8,
+    len: usize,
+    bounce_ptr: *mut u8,
+) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let mut written: usize = 0;
+    let mut cur_offset = byte_offset;
+    while written < len {
+        let sector = cur_offset / sector_size as u64;
+        let in_sector_off = (cur_offset % sector_size as u64) as usize;
+        let take = (sector_size - in_sector_off).min(len - written);
+
+        if in_sector_off == 0 && take == sector_size {
+            if !(call_table.write_input_sector)(0, sector, src_ptr.add(written), sector_size) {
+                return false;
+            }
+        } else {
+            if !(call_table.read_input_sector)(0, sector, bounce_ptr, sector_size) {
+                return false;
+            }
+            core::ptr::copy_nonoverlapping(
+                src_ptr.add(written),
+                bounce_ptr.add(in_sector_off),
+                take,
+            );
+            if !(call_table.write_input_sector)(0, sector, bounce_ptr, sector_size) {
+                return false;
+            }
+        }
+        written += take;
+        cur_offset += take as u64;
+    }
+    true
+}
+
 /// Entry point.
 ///
 /// # Safety
@@ -171,13 +231,11 @@ pub unsafe extern "C" fn _start() -> u64 {
     if !config.is_valid() {
         return fail(call_table, BenchResult::ERROR_BAD_CONFIG, 0, 0, bytes_read);
     }
-    // Phase-5 placeholder: the write path will replace this branch. The
-    // phase-4 host never sets FLAG_WRITE until phase 5 exists, so any
-    // write request reaching this read-only build is out of contract
-    // and refused as a bad config.
-    if config.flags & BenchConfig::FLAG_WRITE != 0 {
-        return fail(call_table, BenchResult::ERROR_BAD_CONFIG, 0, 0, bytes_read);
-    }
+    // Write vs read mode (phase 5). FLAG_WRITE selects the write-mode
+    // fork below; the raw-only gate (phase 5a) is applied after the
+    // format probe, pre-bracket. FLAG_NO_DRAIN is read (and documented)
+    // but is a no-op under serial execution.
+    let is_write = config.flags & BenchConfig::FLAG_WRITE != 0;
     // Guard only what would break the guest: the qemu numeric bounds
     // (count/depth/step ranges) are the host's job in phase 4. A zero
     // or over-cap bufsize would overrun BUF_DEST.
@@ -243,21 +301,45 @@ pub unsafe extern "C" fn _start() -> u64 {
         );
     }
 
+    // ---- Write-mode format gate (phase 5a, pre-bracket) ----
+    // Write mode supports RAW ONLY in phase 5a. A qcow2 (or any other
+    // family-checked) format reaching here under FLAG_WRITE is refused
+    // with ERROR_WRITE_UNSUPPORTED and gate id 0 ("format has no write
+    // support yet"); the host renders it as "write tests are not yet
+    // supported for this image". qcow2 write support is 5b — the match
+    // is the extension point (5b adds an `ImageFormat::Qcow2 => {}`
+    // arm). `cfg` is the host's format claim, already cross-checked
+    // against dev0 and the guest's own sector-0 probe at the gate above.
+    if is_write {
+        match cfg {
+            ImageFormat::Raw => {}
+            _ => {
+                return fail(
+                    call_table,
+                    BenchResult::ERROR_WRITE_UNSUPPORTED,
+                    0,
+                    0, // gate id 0: format has no write support yet
+                    bytes_read,
+                );
+            }
+        }
+    }
+
     // Virtual size is convert's source of truth: the top-of-chain
     // device's declared virtual size.
     let image_size = chain_config.devices[0].virtual_size;
 
     // ---- Bench parameters ----
     // Raw values straight from the config; the crate's effective_step()
-    // / OffsetSchedule own the wrap resolution. FLAG_WRITE was already
-    // rejected, so this is always a read test.
+    // / OffsetSchedule own the wrap resolution. `is_write` selects the
+    // write-mode loop below (raw-gated above).
     let params = bench::BenchParams {
         count: config.count,
         depth: config.depth,
         bufsize,
         step: config.step,
         offset: config.offset,
-        is_write: false,
+        is_write,
         pattern: config.pattern as u8,
         flush_interval: config.flush_interval,
         no_drain: config.flags & BenchConfig::FLAG_NO_DRAIN != 0,
@@ -291,7 +373,100 @@ pub unsafe extern "C" fn _start() -> u64 {
     // doc contract in `shared`).
     (call_table.send_bench_start)();
 
-    // ---- Request loop: one read_chain_virtual_range per offset ----
+    // ---- Write path (phase 5a: raw, in place) ----
+    // The raw-only gate above guarantees a write run reaching here is a
+    // flat raw file; each request patches `[offset, offset + bufsize)`
+    // with the pattern byte through RW input slot 0.
+    if params.is_write {
+        // Fill the pattern source once. Every request writes `bufsize`
+        // bytes of the pattern's low byte — qemu fills its write buffer
+        // with the pattern byte identically, so after equal-arg runs the
+        // two images are byte-comparable. BUF_DEST is the pattern
+        // source; BUF_COMPRESSED (unused on the write path — nothing
+        // decompresses) doubles as the sub-sector RMW bounce.
+        core::ptr::write_bytes(BUF_DEST as *mut u8, params.pattern, bufsize as usize);
+        let src_ptr = BUF_DEST as *const u8;
+        let bounce_ptr = BUF_COMPRESSED as *mut u8;
+
+        let mut completed: u64 = 0;
+        let mut flushes_issued: u64 = 0;
+        for offset in schedule {
+            // EOF pre-check: a write whose window overruns image_size is
+            // refused, reproducing qemu's "Failed request" EIO on raw
+            // (mapped to ERROR_IO_WRITE). The wrap rule keeps every
+            // offset after the first inside [0, image_size - bufsize], so
+            // only the raw first `-o` (or a degenerate image) reaches here.
+            let overruns = match offset.checked_add(bufsize) {
+                Some(end) => end > image_size,
+                None => true,
+            };
+            let ok = !overruns
+                && write_input_byte_range(
+                    call_table,
+                    sector_size,
+                    offset,
+                    src_ptr,
+                    bufsize as usize,
+                    bounce_ptr,
+                );
+            if !ok {
+                (call_table.send_error)(
+                    b"bench\0".as_ptr(),
+                    b"write\0".as_ptr(),
+                    offset / sector_size as u64,
+                    1,
+                );
+                return fail(
+                    call_table,
+                    BenchResult::ERROR_IO_WRITE,
+                    completed,
+                    offset,
+                    bytes_read,
+                );
+            }
+            completed += 1;
+            bytes_read += bufsize;
+
+            // Flush cadence owned by crates/bench: flush after completion
+            // k exactly when the schedule says so (this includes the
+            // trailing flush at k == count, inside the timed window).
+            // FLAG_NO_DRAIN is a no-op under serial execution — the queue
+            // is always drained — but the flush still fires. A flush
+            // failure is ERROR_IO_FLUSH with error_detail = k.
+            if bench::flush_after_completion(params.count, completed as u32, params.flush_interval)
+            {
+                if !(call_table.fsync_input)(0) {
+                    return fail(
+                        call_table,
+                        BenchResult::ERROR_IO_FLUSH,
+                        completed,
+                        completed,
+                        bytes_read,
+                    );
+                }
+                flushes_issued += 1;
+            }
+        }
+
+        // ---- Success: close the bracket ----
+        // `flushes_issued` was counted request-by-request; by
+        // construction it equals bench::total_flushes(count, interval)
+        // (the cadence unit-tested in crates/bench). Send the counted
+        // value.
+        let result = BenchResult {
+            magic: BenchResult::MAGIC,
+            error: BenchResult::ERROR_OK,
+            requests_completed: params.count as u64,
+            flushes_issued,
+            error_detail: 0,
+            _reserved: [0; 32],
+        };
+        (call_table.send_bench_result)(&result);
+        (call_table.send_complete)(b"bench\0".as_ptr(), bytes_read, true);
+        return bytes_read;
+    }
+
+    // ---- Read path: one read_chain_virtual_range per offset ----
     // No progress messages inside the timed window (Mission §3).
     let dest = BUF_DEST as *mut u8;
     let mut staging_cluster_offset: u64 = u64::MAX;
