@@ -33,6 +33,7 @@ mod virtio;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use bench::{BenchParamError, BenchParams};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -2685,6 +2686,8 @@ enum Commands {
     Amend(AmendArgs),
     /// Manage qcow2 persistent dirty bitmaps
     Bitmap(BitmapArgs),
+    /// Benchmark image I/O (qemu-img bench compatible, read path)
+    Bench(BenchArgs),
     /// Emit the allocation map of a disk image
     Map(MapArgs),
     /// List, apply, create, or delete qcow2 internal snapshots
@@ -3479,7 +3482,6 @@ struct DdArgs {
 ///
 /// Not yet wired into `Commands`/dispatch — that is step 4b.
 #[derive(Args, Debug)]
-#[allow(dead_code)] // wired in 4b
 struct BenchArgs {
     /// Image file to benchmark. Exactly one is required; zero or
     /// more than one is a validation error handled by
@@ -3596,7 +3598,6 @@ struct BenchArgs {
 /// business knowing about: the filename, the `-f` format hint
 /// (validated against the auto-detected format only once discovery
 /// exists, in 4b), and the `--output` selector.
-#[allow(dead_code)] // wired in 4b
 #[derive(Debug, Clone, PartialEq)]
 struct BenchInvocation {
     /// The validated, qemu-parity request parameters.
@@ -3709,7 +3710,6 @@ fn parse_bench_size(s: &str) -> BenchSizeParse {
 /// smaller than depth` (invocation 9) before the phase-4 `-w`
 /// refusal ever fires. Both are exercised directly by
 /// `invocation_8_*`/`invocation_9_*` below.
-#[allow(dead_code)] // wired in 4b
 fn validate_bench_args(args: &BenchArgs) -> Result<BenchInvocation, String> {
     // -c: request count.
     let count: u32 = match &args.count {
@@ -3970,7 +3970,6 @@ fn validate_bench_args(args: &BenchArgs) -> Result<BenchInvocation, String> {
 /// offset is the parsed decimal byte value, step is the
 /// *effective* step (`-S 0` renders as `bufsize`, 1e capture
 /// invocation 24), and the read/write word comes from `is_write`.
-#[allow(dead_code)] // wired in 4b
 fn render_bench_header(params: &BenchParams) -> String {
     format!(
         "Sending {} {} requests, {} bytes each, {} in parallel (starting at offset {}, step size {})",
@@ -3987,14 +3986,12 @@ fn render_bench_header(params: &BenchParams) -> String {
 /// only; unreachable in phase 4 since `-w` is refused, but the
 /// renderer exists now so phase 5 only needs to stop refusing
 /// `-w`).
-#[allow(dead_code)] // wired in 4b
 fn render_bench_flush_line(interval: u32) -> String {
     format!("Sending flush every {} requests", interval)
 }
 
 /// Render the completion line. qemu's timing precision is exactly 3
 /// decimal digits (`%0.3f`-shaped; 1e capture invocations 20/21).
-#[allow(dead_code)] // wired in 4b
 fn render_bench_completion(secs: f64) -> String {
     format!("Run completed in {:.3} seconds.", secs)
 }
@@ -4008,7 +4005,6 @@ fn render_bench_completion(secs: f64) -> String {
 /// non-finite rate exactly like a bare floating point division
 /// would -- no special-casing, since the captured contract has no
 /// zero-elapsed json example to pin.
-#[allow(dead_code)] // wired in 4b
 fn render_bench_json(
     params: &BenchParams,
     filename: &str,
@@ -4049,6 +4045,490 @@ fn render_bench_json(
     let _ = writeln!(out, "    \"bytes-per-second\": {:.2}", bytes_per_second);
     let _ = write!(out, "}}");
     out
+}
+
+/// Host-side holder for the harvested `BenchResultMessage`. Mirrors
+/// `BitmapRunResult`: `error` and `flushes_issued` drive the error
+/// mapping / json envelope; `requests_completed` and `error_detail`
+/// are harvested for completeness (and the debug `format_message`
+/// arm) but not read on the success path, hence the `dead_code`
+/// allow.
+#[allow(dead_code)]
+struct BenchRunResult {
+    error: u32,
+    requests_completed: u64,
+    flushes_issued: u64,
+    error_detail: u64,
+}
+
+/// Map a `BenchResult::ERROR_*` code to a user-facing message.
+///
+/// `ERROR_IO_READ` renders as the **bare** qemu text `Failed request:
+/// Input/output error` (1e capture invocation 19): by the time it
+/// fires the header has already printed on stdout, so this reproduces
+/// qemu's exact zero-byte-image transcript. Every other code carries
+/// instar's `bench:` prefix. `ERROR_IO_WRITE` / `ERROR_IO_FLUSH` are
+/// unreachable until phase 5 lands the write path but are mapped now
+/// so the fork is exhaustive.
+fn map_bench_error(code: u32) -> String {
+    match code {
+        c if c == shared::BenchResult::ERROR_IO_READ => {
+            "Failed request: Input/output error".to_string()
+        }
+        c if c == shared::BenchResult::ERROR_BAD_CONFIG => {
+            "bench: guest rejected the configuration".to_string()
+        }
+        c if c == shared::BenchResult::ERROR_UNSUPPORTED_FORMAT => {
+            "bench: unsupported input format".to_string()
+        }
+        c if c == shared::BenchResult::ERROR_PARSE_FAILED => {
+            "bench: failed to parse the image".to_string()
+        }
+        c if c == shared::BenchResult::ERROR_IO_WRITE => {
+            "bench: writing back to the image failed".to_string()
+        }
+        c if c == shared::BenchResult::ERROR_IO_FLUSH => {
+            "bench: flushing the image failed".to_string()
+        }
+        other => format!("bench: guest returned an unknown error code ({other})"),
+    }
+}
+
+/// Run `instar bench`: validate the qemu-parity argument surface,
+/// discover the input's backing chain, print the header, launch the
+/// read-only bench guest, and render the completion line (or the
+/// `--output json` object). See PLAN-bench-phase-04-host-cli.md §4.
+fn run_bench(args: &BenchArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate the CLI surface (qemu-parity messages, §2). Err strings
+    // propagate as-is; `main` renders them as `Error: <msg>` and exits 1.
+    let invocation = validate_bench_args(args)?;
+
+    // Bench uses convert's input-path sector size (the ConvertArgs
+    // `--sector-size` default): the virtio-block transport I/O
+    // granularity, not a format-level property. Recorded here because it
+    // is part of the measurement's definition (see the 4c measurements).
+    let sector_size = MAX_SECTOR_SIZE; // 65536
+
+    // Discover the input backing chain (convert's idiom, incl. the
+    // security config). Bench takes no format hint: discovery walks
+    // backing files by running the sandboxed info op per image and
+    // auto-detects each format. An open/discovery failure propagates.
+    let security_config = config::load_config().config.security;
+    let chain = discover_backing_chain(
+        Path::new(&invocation.filename),
+        sector_size,
+        &security_config,
+    )
+    .map_err(|e| {
+        format!(
+            "error discovering backing chain for {}: {}",
+            invocation.filename, e
+        )
+    })?;
+
+    // The discovered top-of-chain format is authoritative (§2).
+    let top_format = chain.images()[0].format;
+    let top_format_name = top_format.to_string();
+
+    // `-f` posture: dd's warn-then-ignore, but only when the hint
+    // disagrees with the auto-detected format (case-insensitive on the
+    // format name). A matching or absent hint stays silent so the common
+    // `-f raw` / `-f qcow2` invocations produce no noise.
+    if let Some(hint) = &invocation.format_hint {
+        if !hint.eq_ignore_ascii_case(&top_format_name) {
+            eprintln!(
+                "bench: -f {} is accepted but ignored; the input format is auto-detected",
+                hint
+            );
+        }
+    }
+
+    // Human mode prints the header (and, once phase 5 allows a nonzero
+    // flush interval, the flush line) to stdout BEFORE the guest
+    // launches — mirroring qemu, which prints them before submitting
+    // requests (unconditionally, even when the first request will fail).
+    // JSON mode prints nothing until the run completes.
+    let human = invocation.output != "json";
+    if human {
+        println!("{}", render_bench_header(&invocation.params));
+        if invocation.params.flush_interval != 0 {
+            // Unreachable in phase 4 (a nonzero flush interval requires
+            // -w, which run_bench refuses), but wired for phase 5.
+            println!(
+                "{}",
+                render_bench_flush_line(invocation.params.flush_interval)
+            );
+        }
+    }
+
+    // Launch the read-only bench guest and harvest the result plus the
+    // host half of the timing bracket.
+    let (result, elapsed) = run_bench_guest(
+        &chain,
+        &invocation.params,
+        top_format.to_shared_format_u32(),
+        sector_size,
+        verbose,
+    )?;
+
+    // A non-OK guest error fails the run (exit 1). ERROR_IO_READ renders
+    // as the bare qemu "Failed request" text; the others carry instar's
+    // `bench:` prefix. The header is already on stdout by now.
+    if result.error != shared::BenchResult::ERROR_OK {
+        return Err(map_bench_error(result.error).into());
+    }
+
+    // ERROR_OK without a timing bracket is a guest contract violation (a
+    // result must be preceded by a BenchStart) — an error, not a
+    // zero-timing success.
+    let elapsed = elapsed.ok_or("bench: guest sent a result without a start marker")?;
+    let elapsed_secs = elapsed.as_secs_f64();
+
+    if human {
+        println!("{}", render_bench_completion(elapsed_secs));
+    } else {
+        println!(
+            "{}",
+            render_bench_json(
+                &invocation.params,
+                &invocation.filename,
+                &top_format_name,
+                result.flushes_issued as u32,
+                elapsed_secs,
+            )
+        );
+    }
+
+    Ok(())
+}
+
+/// Launch the read-only bench guest (core.bin + bench.bin) over the
+/// discovered input backing chain and harvest its `BenchResult`.
+///
+/// Cloned from `run_bitmap_guest`'s single-result launch/harvest
+/// template, with convert's read-only chain attach (input devices
+/// only, no output device) grafted in place of bitmap's input-RW
+/// single-device attach. The host half of the phase-2 timing bracket
+/// is captured **inside** the vcpu loop: `bench_start` on `BenchStart`
+/// arrival, `bench_elapsed` on `BenchResult` arrival — never after
+/// HLT, so post-result teardown vmexits stay outside the measured
+/// window.
+fn run_bench_guest(
+    chain: &BackingChain,
+    params: &BenchParams,
+    target_format: u32,
+    sector_size: u32,
+    verbose: bool,
+) -> Result<(BenchRunResult, Option<Duration>), Box<dyn std::error::Error>> {
+    // --- Load guest binaries --------------------------------------------
+    let core_path = get_binary_path("core.bin");
+    let core_code = load_guest_binary(
+        core_path
+            .to_str()
+            .ok_or("bench: core.bin path is not valid UTF-8")?,
+    )?;
+    let bench_path = get_binary_path("bench.bin");
+    let bench_code = load_guest_binary(
+        bench_path
+            .to_str()
+            .ok_or("bench: bench.bin path is not valid UTF-8")?,
+    )?;
+
+    // --- KVM / VM / guest memory setup ----------------------------------
+    let kvm = Kvm::new()?;
+    debug!("KVM API version: {}", kvm.get_api_version());
+
+    let kvm_stats_checker = kvm_stats::KvmStatsChecker::new(&kvm);
+    kvm_stats_checker.display_status();
+
+    let vm = kvm.create_vm()?;
+    let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
+
+    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let host_addr = region.as_ptr() as u64;
+    let mem_region = kvm_userspace_memory_region {
+        slot: 0,
+        guest_phys_addr: 0,
+        memory_size: GUEST_MEM_SIZE,
+        userspace_addr: host_addr,
+        flags: 0,
+    };
+    // SAFETY: mem_region.userspace_addr points to a valid
+    // GuestMemoryMmap allocation that outlives the VM.
+    unsafe {
+        vm.set_user_memory_region(mem_region)?;
+    }
+    setup_gdt(&guest_mem)?;
+    setup_page_tables(&guest_mem, GUEST_MEM_SIZE)?;
+    guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
+    guest_mem.write_slice(&bench_code, GuestAddress(OPERATION_LOAD_ADDR))?;
+
+    // --- Write BenchConfig at OPERATION_CONFIG_ADDR ---------------------
+    // Layout (must match shared::BenchConfig exactly; repr(C), 128 B):
+    //      0: magic           u32  ("BNCH")
+    //      4: flags           u32
+    //      8: count           u32
+    //     12: depth           u32
+    //     16: bufsize         u64
+    //     24: step            u64  (raw; 0 = "use bufsize")
+    //     32: offset          u64
+    //     40: flush_interval  u32
+    //     44: pattern         u32  (byte in the low 8 bits)
+    //     48: target_format   u32  (discovered top format as u32)
+    //     52: sector_size     u32
+    //     56: _reserved       [u8; 72]
+    let mut flags: u32 = 0;
+    if params.no_drain {
+        flags |= shared::BenchConfig::FLAG_NO_DRAIN;
+    }
+    if verbose {
+        flags |= shared::BenchConfig::FLAG_VERBOSE;
+    }
+    // FLAG_WRITE is never set in phase 4: run_bench refuses -w before
+    // reaching here, and bench.bin is a read-only build.
+
+    guest_mem.write_obj(
+        shared::BenchConfig::MAGIC,
+        GuestAddress(OPERATION_CONFIG_ADDR),
+    )?;
+    guest_mem.write_obj(flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
+    guest_mem.write_obj(params.count, GuestAddress(OPERATION_CONFIG_ADDR + 8))?;
+    guest_mem.write_obj(params.depth, GuestAddress(OPERATION_CONFIG_ADDR + 12))?;
+    guest_mem.write_obj(params.bufsize, GuestAddress(OPERATION_CONFIG_ADDR + 16))?;
+    // step written raw (0 preserved); the guest's effective_step()
+    // resolves 0 to bufsize, keeping the wrap arithmetic in one place.
+    guest_mem.write_obj(params.step, GuestAddress(OPERATION_CONFIG_ADDR + 24))?;
+    guest_mem.write_obj(params.offset, GuestAddress(OPERATION_CONFIG_ADDR + 32))?;
+    guest_mem.write_obj(
+        params.flush_interval,
+        GuestAddress(OPERATION_CONFIG_ADDR + 40),
+    )?;
+    guest_mem.write_obj(
+        params.pattern as u32,
+        GuestAddress(OPERATION_CONFIG_ADDR + 44),
+    )?;
+    guest_mem.write_obj(target_format, GuestAddress(OPERATION_CONFIG_ADDR + 48))?;
+    guest_mem.write_obj(sector_size, GuestAddress(OPERATION_CONFIG_ADDR + 52))?;
+    // Zero _reserved [u8; 72] @56 explicitly. Guest memory is already
+    // page-zeroed, but be defensive so a future in-place reuse cannot
+    // leak stale bytes into the reserved tail.
+    guest_mem.write_slice(&[0u8; 72], GuestAddress(OPERATION_CONFIG_ADDR + 56))?;
+
+    debug!(
+        "Wrote bench config at 0x{:x} (flags=0x{:x}, count={}, depth={}, bufsize={}, \
+         step={}, offset={}, flush_interval={}, pattern={}, target_format={}, sector_size={})",
+        OPERATION_CONFIG_ADDR,
+        flags,
+        params.count,
+        params.depth,
+        params.bufsize,
+        params.step,
+        params.offset,
+        params.flush_interval,
+        params.pattern,
+        target_format,
+        sector_size,
+    );
+
+    // --- Attach the input backing chain read-only (no output device) ----
+    // The whole discovered chain is opened read-only as input devices
+    // (convert's read-only attach). Bench never writes, so there is no
+    // output device.
+    let mut device_set = DeviceSet::new();
+    let mut io_events: Vec<IoEvent> = Vec::new();
+    open_chain_devices(
+        chain,
+        sector_size as u64,
+        &mut device_set,
+        &mut io_events,
+        0,
+        "chain",
+    )?;
+    write_chain_config(&guest_mem, chain)?;
+
+    let guest_mem = Arc::new(guest_mem);
+    let vmm_stats = Arc::new(Mutex::new(VmmStats::new()));
+
+    // Try to register ioeventfds; fall back to VM exits on failure.
+    let mut io_thread: Option<io_thread::IoThread> = None;
+    let mut registered_count = 0usize;
+    let mut registration_failed = false;
+    for evt in io_events.iter_mut() {
+        if let Err(e) = evt.register(&vm) {
+            debug!("ioeventfd: failed to register ({e:?}), falling back to VM exits");
+            registration_failed = true;
+            break;
+        }
+        registered_count += 1;
+    }
+    if registration_failed {
+        for evt in io_events.iter_mut().take(registered_count) {
+            let _ = evt.unregister(&vm);
+        }
+    }
+    let all_registered = !registration_failed;
+    if all_registered && !io_events.is_empty() {
+        let io_devices = device_set.create_io_devices(io_events);
+        io_thread = Some(io_thread::IoThread::new(
+            io_devices,
+            Arc::clone(&guest_mem),
+            Arc::clone(&vmm_stats),
+        ));
+    }
+
+    // --- vCPU setup ------------------------------------------------------
+    let mut vcpu = vm.create_vcpu(0)?;
+    let mut sregs = vcpu.get_sregs()?;
+    setup_sregs(&mut sregs);
+    vcpu.set_sregs(&sregs)?;
+    let mut regs = vcpu.get_regs()?;
+    setup_regs(&mut regs);
+    vcpu.set_regs(&regs)?;
+
+    // --- Serial decoders / transmitter / debug buffer -------------------
+    let mut serial_decoder = SerialDecoder::new();
+    let mut serial_transmitter = SerialTransmitter::new();
+    let mut debug_buffer = DebugBuffer::new();
+
+    // Input-only config. A standalone image is one device
+    // (vmm_config_input_only); a qcow2 with a backing chain needs every
+    // chain device described so the core initialises them all and the
+    // guest's sector-size cross-check + chain reader see the full set
+    // (mirrors check's read-only chain attach). No output device either
+    // way.
+    let config = if chain.total_devices() > 1 {
+        vmm_config_chain(sector_size, chain.total_devices())
+    } else {
+        vmm_config_input_only(sector_size)
+    };
+    serial_transmitter.queue_config(&config);
+
+    // --- Run the vCPU loop ----------------------------------------------
+    let mut result_seen = false;
+    let mut harvested = BenchRunResult {
+        error: shared::BenchResult::ERROR_OK,
+        requests_completed: 0,
+        flushes_issued: 0,
+        error_detail: 0,
+    };
+    // Host half of the timing bracket: start on BenchStart arrival,
+    // elapsed on BenchResult arrival — both inside the loop, never after
+    // HLT.
+    let mut bench_start: Option<Instant> = None;
+    let mut bench_elapsed: Option<Duration> = None;
+    let mut vm_error: Option<String> = None;
+
+    loop {
+        match vcpu.run()? {
+            VcpuExit::Hlt => {
+                vmm_stats.lock().unwrap().record_hlt();
+                break;
+            }
+            VcpuExit::IoOut(port, data) => {
+                vmm_stats.lock().unwrap().record_io_out();
+                if port == SERIAL_PORT {
+                    for &byte in data {
+                        if let Some(msg) = serial_decoder.add_byte(byte) {
+                            match &msg.payload {
+                                Some(guest_::GuestMessage_::Payload::BenchStart(_)) => {
+                                    bench_start = Some(Instant::now());
+                                }
+                                Some(guest_::GuestMessage_::Payload::BenchResult(r)) => {
+                                    // Elapsed captured AT ARRIVAL, before HLT.
+                                    bench_elapsed = bench_start.map(|s| s.elapsed());
+                                    harvested.error = r.error;
+                                    harvested.requests_completed = r.requests_completed;
+                                    harvested.flushes_issued = r.flushes_issued;
+                                    harvested.error_detail = r.error_detail;
+                                    result_seen = true;
+                                }
+                                _ => {
+                                    if verbose {
+                                        debug!("{}", format_message(&msg));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if port == DEBUG_PORT {
+                    for &byte in data {
+                        if let Some(line) = debug_buffer.add_byte(byte) {
+                            debug!("[GUEST] {line}");
+                        }
+                    }
+                } else {
+                    debug!("IO OUT: port=0x{port:x}, data={data:?}");
+                }
+            }
+            VcpuExit::IoIn(port, data) => {
+                vmm_stats.lock().unwrap().record_io_in();
+                if port == SERIAL_PORT {
+                    for byte in data.iter_mut() {
+                        *byte = serial_transmitter.next_byte().unwrap_or(0);
+                    }
+                } else if port == SERIAL_PORT + 5 {
+                    let mut lsr = 0x60u8;
+                    if serial_transmitter.has_data() {
+                        lsr |= 0x01;
+                    }
+                    data[0] = lsr;
+                } else {
+                    for byte in data {
+                        *byte = 0;
+                    }
+                }
+            }
+            VcpuExit::MmioRead(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_read();
+                let value = device_set.mmio_read(addr);
+                write_mmio_data(data, value);
+            }
+            VcpuExit::MmioWrite(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_write();
+                let value = read_mmio_data(data);
+                if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
+                    if io_thread.is_none() && should_process {
+                        device_set.process_queue_for_device(
+                            device_index,
+                            &guest_mem,
+                            &vmm_stats,
+                        )?;
+                    }
+                }
+            }
+            VcpuExit::Shutdown => {
+                vmm_stats.lock().unwrap().record_shutdown();
+                vm_error = Some("VM shutdown (triple fault)".to_string());
+                break;
+            }
+            VcpuExit::FailEntry(reason, cpu) => {
+                vmm_stats.lock().unwrap().record_fail_entry();
+                vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
+                break;
+            }
+            exit => {
+                vmm_stats.lock().unwrap().record_unknown();
+                vm_error = Some(format!("unexpected VM exit: {exit:?}"));
+                break;
+            }
+        }
+    }
+
+    if let Some(mut thread) = io_thread {
+        thread.stop();
+    }
+
+    if log::log_enabled!(log::Level::Debug) {
+        vmm_stats.lock().unwrap().display();
+    }
+
+    if let Some(error) = vm_error {
+        return Err(error.into());
+    }
+    if !result_seen {
+        return Err("bench: guest did not return a result".into());
+    }
+    Ok((harvested, bench_elapsed))
 }
 
 #[cfg(test)]
@@ -5118,6 +5598,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Commit(args) => run_commit(args, verbose),
         Commands::Amend(args) => run_amend(args, verbose),
         Commands::Bitmap(args) => run_bitmap(&args, matches.subcommand_matches("bitmap"), verbose),
+        Commands::Bench(args) => run_bench(&args, verbose),
         Commands::Map(args) => run_map(args, verbose),
         Commands::Snapshot(args) => run_snapshot(args, verbose),
         Commands::Config(args) => run_config(args),
