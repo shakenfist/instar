@@ -939,6 +939,16 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
                 b.target_format, b.error, b.action, b.actions_applied, b.resulting_nb_bitmaps
             )
         }
+        Some(guest_::GuestMessage_::Payload::BenchStart(_)) => {
+            "bench_start (timing bracket opens)".to_string()
+        }
+        Some(guest_::GuestMessage_::Payload::BenchResult(r)) => {
+            format!(
+                "bench_result error={} requests_completed={} \
+                flushes_issued={} error_detail={}",
+                r.error, r.requests_completed, r.flushes_issued, r.error_detail
+            )
+        }
         Some(guest_::GuestMessage_::Payload::CommitResult(c)) => {
             format!(
                 "commit_result overlay_format={} backing_format={} \

@@ -337,6 +337,19 @@ message BitmapResultMessage {
   uint32 resulting_nb_bitmaps = 5;
 }
 
+// Bench timing-bracket start marker. Deliberately empty: the
+// host timestamps its arrival; there is no payload.
+message BenchStartMessage {
+}
+
+message BenchResultMessage {
+  // Error code: 0 = ok, non-zero mirrors BenchResult::ERROR_*
+  uint32 error = 1;
+  uint64 requests_completed = 2;
+  uint64 flushes_issued = 3;
+  uint64 error_detail = 4;
+}
+
 // Single coalesced map extent (from map operation). Sent once
 // per emitted extent; followed by a MapResultMessage terminator
 // after the last extent. The host accumulates these into the
@@ -446,5 +459,7 @@ message GuestMessage {
     SnapshotResultMessage snapshot_result = 18;
     AmendResultMessage amend_result = 19;
     BitmapResultMessage bitmap_result = 20;
+    BenchStartMessage bench_start = 21;
+    BenchResultMessage bench_result = 22;
   }
 }

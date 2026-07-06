@@ -343,7 +343,10 @@ and update the pin test at line 5608.
   `Payload::BenchResult` (error, requests_completed,
   flushes_issued, error_detail), matching the surrounding style
   near line 935. **No** `BenchArgs`, no `run_bench`, no harvest
-  loop — that is phase 4.
+  loop — that is phase 4. *Scope correction found during 2a:
+  these arms belong to step 2a's commit, not 2b's — the proto
+  oneof addition alone makes the exhaustive match non-exhaustive,
+  so the workspace does not build without them.*
 
 ### 7. Re-measure core.bin (Open question 10)
 
@@ -362,8 +365,8 @@ phase changes no behaviour).
 
 | Step | Effort | Model | Isolation | Brief for sub-agent |
 |------|--------|-------|-----------|---------------------|
-| 2a | medium | sonnet | none | Append `BenchStartMessage` (empty) and `BenchResultMessage` to `crates/guest-protocol/proto/guest.proto` with oneof tags 21/22, plus `bench_start_message()` / `bench_result_message()` builders in `crates/guest-protocol/src/lib.rs`, mirroring the bitmap pair (proto line 323/448, builder line 750) including message-level choices copied from `progress_message` / the `*_result` builders. Standalone-compilable; no other crates touched. Commit 1. |
-| 2b | high | opus | none | The lockstep compile unit, following commit `547104b`'s recipe with the exact layouts and doc-comment contracts in Mission §3-§6: `BenchConfig`/`BenchResult` + constants + asserts in `src/shared/src/lib.rs`; call-table append + VERSION 19→20 + history doc + pin-test update; `send_bench_start`/`send_bench_result` in `src/core/src/serial.rs`; thunks + literal registration in `src/core/src/main.rs`; mock stubs + version assert in `src/fuzz/src/lib.rs`; test-mock stubs in `src/crates/qcow2/src/lib.rs`; `format_message` arms in `src/vmm/src/main.rs`. High effort because the `send_bench_start` doc comment carries the timing contract, the struct layouts are pinned to the byte, and a missed mock literal or version assert breaks the workspace build in non-obvious places. `make instar` + `make lint` + `make test-rust` green. Commit 2. |
+| 2a | medium | sonnet | none | Append `BenchStartMessage` (empty) and `BenchResultMessage` to `crates/guest-protocol/proto/guest.proto` with oneof tags 21/22, plus `bench_start_message()` / `bench_result_message()` builders in `crates/guest-protocol/src/lib.rs`, mirroring the bitmap pair (proto line 323/448, builder line 750) including message-level choices copied from `progress_message` / the `*_result` builders. Also the two `format_message` render arms in `src/vmm/src/main.rs` (~line 935) — compile-forced by the oneof addition, so they cannot wait for 2b. Commit 1. |
+| 2b | high | opus | none | The lockstep compile unit, following commit `547104b`'s recipe with the exact layouts and doc-comment contracts in Mission §3-§6: `BenchConfig`/`BenchResult` + constants + asserts in `src/shared/src/lib.rs`; call-table append + VERSION 19→20 + history doc + pin-test update; `send_bench_start`/`send_bench_result` in `src/core/src/serial.rs`; thunks + literal registration in `src/core/src/main.rs`; mock stubs + version assert in `src/fuzz/src/lib.rs`; test-mock stubs in `src/crates/qcow2/src/lib.rs` (the `format_message` arms already landed with 2a). High effort because the `send_bench_start` doc comment carries the timing contract, the struct layouts are pinned to the byte, and a missed mock literal or version assert breaks the workspace build in non-obvious places. `make instar` + `make lint` + `make test-rust` green. Commit 2. |
 | 2c | low | sonnet | none | Build, run `scripts/check-binary-sizes.sh`, append a "Captured measurements" section to this plan (core.bin `.bss`-inclusive footprint before/after, headroom vs the 72 KiB gate, whether the 85% warning fired), update the master-plan execution row and `docs/plans/index.md` phase link/status. If the hard gate failed, stop and report — the §1 fallback is a management-session decision, not a mechanical fix. Commit 3. |
 
 ## Resolved open questions
