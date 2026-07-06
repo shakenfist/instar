@@ -2,8 +2,8 @@
 target = "x86_64-unknown-none"
 
 [target.x86_64-unknown-none]
-rustflags = ["-C", "link-arg=-Toperations/bench/linker.ld", "-C", "relocation-model=static"]
+rustflags = ["-C", "link-arg=-Toperations/bench/linker.ld", "-C", "relocation-model=static", "--cfg", 'aes_backend="soft"']
 
 [unstable]
-build-std = ["core"]
+build-std = ["core", "alloc"]
 build-std-features = ["compiler-builtins-mem"]
