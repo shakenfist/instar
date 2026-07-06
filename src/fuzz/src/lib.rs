@@ -94,6 +94,8 @@ pub fn build_call_table() -> shared::CallTable {
         fsync_input: mock_fsync_input,
         send_amend_result: mock_send_amend_result,
         send_bitmap_result: mock_send_bitmap_result,
+        send_bench_start: mock_send_bench_start,
+        send_bench_result: mock_send_bench_result,
     }
 }
 
@@ -312,6 +314,10 @@ unsafe extern "C" fn mock_fsync_input(_device_idx: u32) -> bool {
 unsafe extern "C" fn mock_send_amend_result(_result: *const shared::AmendResult) {}
 
 unsafe extern "C" fn mock_send_bitmap_result(_result: *const shared::BitmapResult) {}
+
+unsafe extern "C" fn mock_send_bench_start() {}
+
+unsafe extern "C" fn mock_send_bench_result(_result: *const shared::BenchResult) {}
 
 // ---------------------------------------------------------------------------
 // Unit tests

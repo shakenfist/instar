@@ -987,6 +987,48 @@ pub struct CallTable {
     /// error code. Appended at the end of `CallTable` for the same
     /// back-compat reason as `send_amend_result`.
     pub send_bitmap_result: unsafe extern "C" fn(*const BitmapResult),
+
+    /// Send the bench timing-bracket start marker. No arguments —
+    /// the marker's *arrival time* is its entire payload. Appended
+    /// at the end of `CallTable` for the same back-compat reason as
+    /// `send_bitmap_result`.
+    ///
+    /// # Timing contract (the ABI-level meaning of this message)
+    ///
+    /// The guest emits this exactly once, after config validation,
+    /// the format probe/open, cached-state setup, and buffer /
+    /// transfer-plan setup — **immediately before submitting the
+    /// first request**, mirroring qemu's `gettimeofday` bracket
+    /// placement. Everything set up before the marker (parsing,
+    /// allocation) is deliberately outside the measured window.
+    ///
+    /// The host records `Instant::now()` on receipt of this marker;
+    /// elapsed is measured from here to receipt of the terminal
+    /// [`send_bench_result`](Self::send_bench_result). The trailing
+    /// flush (when `flush_interval` divides such that the final
+    /// completion flushes) is **inside** the bracket, per phase 1's
+    /// verified cadence.
+    ///
+    /// [`BenchResult`] **may arrive without a preceding
+    /// `BenchStart`**: a validation/probe/parse failure before the
+    /// timed loop emits only the result. The host must render that
+    /// error without a timing line and must never assume the bracket
+    /// opened.
+    ///
+    /// The marker's own cost (a few serial-port `IoOut` vmexits,
+    /// ~µs) is noise at bench's ms-to-s scale — recorded here so
+    /// nobody "optimizes" it away.
+    pub send_bench_start: unsafe extern "C" fn(),
+
+    /// Send the bench result message. Args: `bench_result` pointer
+    /// carrying the number of requests completed, the number of
+    /// flushes issued, an error-detail offset, and the error code.
+    /// The terminal message of the bench operation; closes the
+    /// timing bracket opened by
+    /// [`send_bench_start`](Self::send_bench_start). Appended at the
+    /// end of `CallTable` for the same back-compat reason as
+    /// `send_bench_start`.
+    pub send_bench_result: unsafe extern "C" fn(*const BenchResult),
 }
 
 /// Backing format type for QCOW2 header extension
@@ -1314,8 +1356,10 @@ impl CallTable {
     /// durability checkpoints; PLAN-amend phase 1 appended
     /// `send_amend_result` for the amend subcommand;
     /// PLAN-bitmap phase 2 appended `send_bitmap_result` for the
-    /// bitmap subcommand).
-    pub const VERSION: u32 = 19;
+    /// bitmap subcommand; PLAN-bench phase 2 appended
+    /// `send_bench_start` and `send_bench_result` for the bench
+    /// subcommand's timing bracket).
+    pub const VERSION: u32 = 20;
 }
 
 // ============================================================================
@@ -3868,6 +3912,134 @@ impl BitmapResult {
     }
 }
 
+/// Configuration structure for the bench operation.
+///
+/// Passed by the host into the guest's operation-config region and
+/// cast by the bench guest op (phase 3). Unlike [`BitmapConfig`],
+/// bench carries **pure CLI parameters — deliberately no host-probed
+/// image cross-checks**: bench runs on all five input formats and the
+/// guest derives `image_size` from its own format parse, so there is
+/// nothing the host can probe without host-side parsing that the
+/// security model exists to avoid.
+///
+/// Field additions discovered in later phases must go into
+/// `_reserved`, never reorder existing fields (the host writes the
+/// struct field-by-field at explicit byte offsets in phase 4).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BenchConfig {
+    /// Magic (`0x424E4348` = "BNCH").
+    pub magic: u32,
+    /// Flags. See `FLAG_*`.
+    pub flags: u32,
+    /// Number of requests (1..=0x7fffffff, validated host-side).
+    pub count: u32,
+    /// Requested queue depth. Echoed in the header line and JSON
+    /// only; the guest ignores it — v1 execution is serial
+    /// (master plan Open question 1).
+    pub depth: u32,
+
+    /// Bytes per request (1..=BENCH_MAX_BUFSIZE).
+    pub bufsize: u64,
+    /// Raw step; `0` means "= bufsize" (`crates/bench`
+    /// `effective_step()` — the guest resolves it, keeping the
+    /// wrap arithmetic in one place).
+    pub step: u64,
+    /// Initial offset, raw and unwrapped (first request uses it
+    /// as-is, matching qemu).
+    pub offset: u64,
+
+    /// Flush every N completions; `0` = never. Nonzero only with
+    /// FLAG_WRITE (validated host-side).
+    pub flush_interval: u32,
+    /// Write-pattern byte in the low 8 bits.
+    pub pattern: u32,
+    /// Input format hint (`ImageFormat as u32`); the guest
+    /// verifies against its own parse.
+    pub target_format: u32,
+    /// Sector size for I/O (matches host sector_size).
+    pub sector_size: u32,
+
+    /// Reserved padding for forward compatibility (zero-init);
+    /// pads the total to a round 128 bytes.
+    pub _reserved: [u8; 72],
+}
+
+impl BenchConfig {
+    /// Magic value for bench config.
+    pub const MAGIC: u32 = 0x424E_4348; // "BNCH"
+
+    /// Flag: write test (`-w`). When clear, bench reads.
+    pub const FLAG_WRITE: u32 = 1 << 0;
+    /// Flag: skip the terminal drain/flush (`--no-drain`).
+    pub const FLAG_NO_DRAIN: u32 = 1 << 1;
+    /// Flag: verbose mode. Mirrors the other configs' verbose bit.
+    pub const FLAG_VERBOSE: u32 = 1 << 31;
+
+    /// True if magic matches.
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+}
+
+/// Compile-time guard: `BenchConfig` must fit the operation-config
+/// region (see [`OPERATION_CONFIG_MAX_SIZE`]).
+const _: () = assert!(core::mem::size_of::<BenchConfig>() <= OPERATION_CONFIG_MAX_SIZE);
+
+/// Result structure for the bench operation.
+///
+/// Passed by the guest into `call_table.send_bench_result`. Mirrors
+/// [`BitmapResult`]: numeric-only, the host renders any human-readable
+/// summary from these codes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BenchResult {
+    /// Magic (`0x424E5253` = "BNRS").
+    pub magic: u32,
+    /// Error code. See `ERROR_*`.
+    pub error: u32,
+
+    /// Requests fully completed (== count on success; the count
+    /// reached when a mid-run request failed otherwise).
+    pub requests_completed: u64,
+    /// Flushes issued (`crates/bench` `total_flushes()` on
+    /// success).
+    pub flushes_issued: u64,
+    /// Error detail: the byte offset of the failing request for
+    /// the I/O errors, else 0.
+    pub error_detail: u64,
+
+    /// Reserved padding for forward compatibility (zero-init);
+    /// pads the total to 64 bytes.
+    pub _reserved: [u8; 32],
+}
+
+impl BenchResult {
+    /// Magic value for bench result.
+    pub const MAGIC: u32 = 0x424E_5253; // "BNRS"
+
+    // Error codes are stable: only appended, never reordered.
+    /// Success.
+    pub const ERROR_OK: u32 = 0;
+    /// Magic/flag validation failed in the guest.
+    pub const ERROR_BAD_CONFIG: u32 = 1;
+    /// Input format is not supported by bench.
+    pub const ERROR_UNSUPPORTED_FORMAT: u32 = 2;
+    /// The guest's format parse failed.
+    pub const ERROR_PARSE_FAILED: u32 = 3;
+    /// A device read from the image failed.
+    pub const ERROR_IO_READ: u32 = 4;
+    /// A device write back to the image failed.
+    pub const ERROR_IO_WRITE: u32 = 5;
+    /// A flush (`fsync_input`) of the image failed.
+    pub const ERROR_IO_FLUSH: u32 = 6;
+
+    /// True if magic matches.
+    pub fn is_valid(&self) -> bool {
+        self.magic == Self::MAGIC
+    }
+}
+
 /// Configuration structure for the commit operation.
 ///
 /// Written by the host at [`OPERATION_CONFIG_ADDR`] before the
@@ -4934,6 +5106,70 @@ mod tests {
     }
 
     #[test]
+    fn bench_config_magic() {
+        assert_eq!(BenchConfig::MAGIC, 0x424E_4348); // "BNCH"
+        assert_eq!(BenchConfig::MAGIC.to_be_bytes(), *b"BNCH");
+    }
+
+    #[test]
+    fn bench_result_magic() {
+        assert_eq!(BenchResult::MAGIC, 0x424E_5253); // "BNRS"
+        assert_eq!(BenchResult::MAGIC.to_be_bytes(), *b"BNRS");
+    }
+
+    #[test]
+    fn bench_config_size_and_align() {
+        // Source of truth: BenchConfig must be exactly 128 bytes,
+        // 8-byte aligned (it carries u64 fields), and fit the
+        // operation-config region.
+        assert_eq!(
+            core::mem::size_of::<BenchConfig>(),
+            128,
+            "BenchConfig is {} bytes",
+            core::mem::size_of::<BenchConfig>()
+        );
+        assert_eq!(core::mem::align_of::<BenchConfig>(), 8);
+        assert!(core::mem::size_of::<BenchConfig>() <= OPERATION_CONFIG_MAX_SIZE);
+    }
+
+    #[test]
+    fn bench_result_size_and_align() {
+        // Source of truth: BenchResult must be exactly 64 bytes.
+        assert_eq!(
+            core::mem::size_of::<BenchResult>(),
+            64,
+            "BenchResult is {} bytes",
+            core::mem::size_of::<BenchResult>()
+        );
+        assert_eq!(core::mem::align_of::<BenchResult>(), 8);
+    }
+
+    #[test]
+    fn bench_config_flags_distinct() {
+        assert_eq!(BenchConfig::FLAG_WRITE, 1 << 0);
+        assert_eq!(BenchConfig::FLAG_NO_DRAIN, 1 << 1);
+        assert_eq!(BenchConfig::FLAG_VERBOSE, 1 << 31);
+    }
+
+    #[test]
+    fn bench_result_error_codes_distinct() {
+        // Phase 2 defines codes 0..=6. Confirm every code is
+        // distinct and contiguously numbered.
+        let codes = [
+            BenchResult::ERROR_OK,
+            BenchResult::ERROR_BAD_CONFIG,
+            BenchResult::ERROR_UNSUPPORTED_FORMAT,
+            BenchResult::ERROR_PARSE_FAILED,
+            BenchResult::ERROR_IO_READ,
+            BenchResult::ERROR_IO_WRITE,
+            BenchResult::ERROR_IO_FLUSH,
+        ];
+        for (i, c) in codes.iter().enumerate() {
+            assert_eq!(*c, i as u32);
+        }
+    }
+
+    #[test]
     fn bitmap_config_is_valid_checks_magic() {
         let mut cfg = BitmapConfig {
             magic: BitmapConfig::MAGIC,
@@ -5597,7 +5833,7 @@ mod tests {
     }
 
     #[test]
-    fn call_table_version_is_nineteen() {
+    fn call_table_version_is_twenty() {
         // PLAN-snapshot phase 1 bumped the call-table ABI from
         // 16 to 17 by appending `send_snapshot_entry`,
         // `send_snapshot_result`, and `fsync_input`.
@@ -5605,7 +5841,9 @@ mod tests {
         // `send_amend_result`.
         // PLAN-bitmap phase 2 bumps 18 to 19 by appending
         // `send_bitmap_result`.
-        assert_eq!(CallTable::VERSION, 19);
+        // PLAN-bench phase 2 bumps 19 to 20 by appending
+        // `send_bench_start` and `send_bench_result`.
+        assert_eq!(CallTable::VERSION, 20);
     }
 
     #[test]

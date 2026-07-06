@@ -20,20 +20,20 @@ use core::panic::PanicInfo;
 use core::ptr::write_volatile;
 
 use shared::{
-    AmendResult, BitmapResult, CallTable, ChainConfig, CheckResult, CommitResult, CompareResult,
-    CreateResult, LuksInfo, MapExtentRecord, MapResult, MeasureResult, Qcow2Info, RebaseResult,
-    ResizeResult, SnapshotEntryRecord, SnapshotResult, VdiInfo, VmdkInfo, CALL_TABLE_ADDR,
-    CHAIN_CONFIG_ADDR, CHAIN_CONFIG_MAX_SIZE, OPERATION_CONFIG_ADDR, OPERATION_CONFIG_MAX_SIZE,
-    OPERATION_LOAD_ADDR, VMM_PARAMS_ADDR,
+    AmendResult, BenchResult, BitmapResult, CallTable, ChainConfig, CheckResult, CommitResult,
+    CompareResult, CreateResult, LuksInfo, MapExtentRecord, MapResult, MeasureResult, Qcow2Info,
+    RebaseResult, ResizeResult, SnapshotEntryRecord, SnapshotResult, VdiInfo, VmdkInfo,
+    CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR, CHAIN_CONFIG_MAX_SIZE, OPERATION_CONFIG_ADDR,
+    OPERATION_CONFIG_MAX_SIZE, OPERATION_LOAD_ADDR, VMM_PARAMS_ADDR,
 };
 
 use crate::serial::{
-    debug_print, read_config, send_amend_result, send_bitmap_result, send_check_result,
-    send_commit_result, send_compare_result, send_complete, send_create_result, send_error,
-    send_info_result, send_info_result_luks, send_info_result_qcow2, send_info_result_vdi,
-    send_info_result_vmdk, send_init, send_map_extent, send_map_result, send_measure_result,
-    send_progress, send_rebase_result, send_resize_result, send_snapshot_entry,
-    send_snapshot_result, DeviceConfig,
+    debug_print, read_config, send_amend_result, send_bench_result, send_bench_start,
+    send_bitmap_result, send_check_result, send_commit_result, send_compare_result, send_complete,
+    send_create_result, send_error, send_info_result, send_info_result_luks,
+    send_info_result_qcow2, send_info_result_vdi, send_info_result_vmdk, send_init,
+    send_map_extent, send_map_result, send_measure_result, send_progress, send_rebase_result,
+    send_resize_result, send_snapshot_entry, send_snapshot_result, DeviceConfig,
 };
 use crate::virtio::VirtioBlock;
 
@@ -302,6 +302,8 @@ fn setup_call_table() {
         fsync_input: ct_fsync_input,
         send_amend_result: ct_send_amend_result,
         send_bitmap_result: ct_send_bitmap_result,
+        send_bench_start: ct_send_bench_start,
+        send_bench_result: ct_send_bench_result,
     };
 
     unsafe {
@@ -719,6 +721,19 @@ unsafe extern "C" fn ct_send_amend_result(result: *const AmendResult) {
 unsafe extern "C" fn ct_send_bitmap_result(result: *const BitmapResult) {
     if !result.is_null() {
         send_bitmap_result(&*result);
+    }
+}
+
+/// Send bench timing-bracket start marker. No arguments — the
+/// message is empty and the host timestamps its arrival.
+unsafe extern "C" fn ct_send_bench_start() {
+    send_bench_start();
+}
+
+/// Send bench result message.
+unsafe extern "C" fn ct_send_bench_result(result: *const BenchResult) {
+    if !result.is_null() {
+        send_bench_result(&*result);
     }
 }
 
