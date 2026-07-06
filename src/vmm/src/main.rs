@@ -3492,12 +3492,15 @@ struct BenchArgs {
 
     /// Number of requests to issue. Default 75000 (qemu's default).
     /// Range `[1, 2147483647]`; parsed and range-checked by
-    /// `validate_bench_args`.
-    #[arg(short = 'c', value_name = "COUNT")]
+    /// `validate_bench_args`. `allow_hyphen_values` lets a negative
+    /// value (`-c -1`) reach that check so it collapses into qemu's
+    /// range message instead of clap's "unexpected argument" error
+    /// (same idiom as ResizeArgs/DdArgs).
+    #[arg(short = 'c', value_name = "COUNT", allow_hyphen_values = true)]
     count: Option<String>,
 
     /// Queue depth. Default 64. Range `[1, 2147483647]`.
-    #[arg(short = 'd', value_name = "DEPTH")]
+    #[arg(short = 'd', value_name = "DEPTH", allow_hyphen_values = true)]
     depth: Option<String>,
 
     /// Issue a flush every N completed requests. Default 0
@@ -3506,31 +3509,35 @@ struct BenchArgs {
     /// qemu); phase 4 refuses `-w` outright, so today a nonzero
     /// value is reachable only through the qemu cross-option error
     /// text.
-    #[arg(long = "flush-interval", value_name = "FLUSH_INTERVAL")]
+    #[arg(
+        long = "flush-interval",
+        value_name = "FLUSH_INTERVAL",
+        allow_hyphen_values = true
+    )]
     flush_interval: Option<String>,
 
     /// Byte pattern used to fill write buffers. Default 0. Range
     /// `[0, 255]`; silently ignored (not an error) on read tests.
-    #[arg(long, value_name = "PATTERN")]
+    #[arg(long, value_name = "PATTERN", allow_hyphen_values = true)]
     pattern: Option<String>,
 
     /// Bytes per request. Accepts qemu size suffixes
     /// (b/k/K/m/M/g/G/t/T/p/P/e/E). Default 4096. Range
     /// `[1, 2147483647]` (qemu's own bound), further capped at
     /// 2 MiB by instar in phase 4.
-    #[arg(short = 's', value_name = "BUFFER_SIZE")]
+    #[arg(short = 's', value_name = "BUFFER_SIZE", allow_hyphen_values = true)]
     buffer_size: Option<String>,
 
     /// Byte offset advance per request (same suffixes as `-s`).
     /// Default 0, meaning "use the buffer size" (see
     /// `BenchParams::effective_step`). Range `[0, 2147483647]`.
-    #[arg(short = 'S', value_name = "STEP_SIZE")]
+    #[arg(short = 'S', value_name = "STEP_SIZE", allow_hyphen_values = true)]
     step_size: Option<String>,
 
     /// The first request's byte offset (same suffixes as `-s`).
     /// Default 0. Range `[0, 9223372036854775807]` (`i64::MAX`) --
     /// wider than the other four numeric options.
-    #[arg(short = 'o', value_name = "OFFSET")]
+    #[arg(short = 'o', value_name = "OFFSET", allow_hyphen_values = true)]
     offset: Option<String>,
 
     /// Run a write test instead of a read test. Accepted by the
@@ -5217,6 +5224,143 @@ mod bench_validate_tests {
             validate_bench_args(&args).unwrap_err(),
             "Expecting one image file name\nTry 'instar bench --help' for more info"
         );
+    }
+}
+
+#[cfg(test)]
+mod bench_clap_hyphen_tests {
+    //! Clap-LEVEL pins for negative numeric values. The
+    //! `bench_validate_tests` module constructs `BenchArgs` directly
+    //! and never exercises clap's own tokenizer -- which is exactly
+    //! the gap that let the 4c smoke run find `-c -1` dying inside
+    //! clap ("unexpected argument '-1' found", exit 2) instead of
+    //! reaching `validate_bench_args` and producing qemu's range
+    //! message (exit 1). These tests parse full argv vectors through
+    //! `Cli::try_parse_from` (the resize idiom) and assert both
+    //! halves of the contract: clap ACCEPTS the hyphen value thanks
+    //! to `allow_hyphen_values = true`, and `validate_bench_args`
+    //! then produces the exact 1e-capture message.
+    use super::*;
+    use clap::Parser;
+
+    /// Parse a full bench argv through clap and hand the resulting
+    /// `BenchArgs` to `validate_bench_args`, returning its Err
+    /// string. Panics if clap itself rejects the argv -- that is
+    /// the regression this module exists to catch.
+    fn clap_then_validate_err(argv: &[&str]) -> String {
+        let cli = Cli::try_parse_from(argv)
+            .unwrap_or_else(|e| panic!("clap rejected {argv:?} before validation: {e}"));
+        match cli.command {
+            Commands::Bench(args) => validate_bench_args(&args)
+                .expect_err("negative value must fail validation, not succeed"),
+            other => panic!("expected Bench, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn count_negative_reaches_validation() {
+        assert_eq!(
+            clap_then_validate_err(&["instar", "bench", "-c", "-1", "probe.raw"]),
+            "Invalid request count specified. Must be between 1 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn depth_negative_reaches_validation() {
+        assert_eq!(
+            clap_then_validate_err(&["instar", "bench", "-d", "-1", "probe.raw"]),
+            "Invalid queue depth specified. Must be between 1 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn buffer_size_negative_reaches_validation() {
+        assert_eq!(
+            clap_then_validate_err(&["instar", "bench", "-s", "-1", "probe.raw"]),
+            "Invalid buffer size specified. Must be between 1 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn step_size_negative_reaches_validation() {
+        assert_eq!(
+            clap_then_validate_err(&["instar", "bench", "-S", "-1", "probe.raw"]),
+            "Invalid step size specified. Must be between 0 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn offset_negative_reaches_validation() {
+        assert_eq!(
+            clap_then_validate_err(&["instar", "bench", "-o", "-1", "probe.raw"]),
+            "Invalid offset specified. Must be between 0 and 9223372036854775807."
+        );
+    }
+
+    #[test]
+    fn pattern_negative_reaches_validation() {
+        assert_eq!(
+            clap_then_validate_err(&["instar", "bench", "--pattern", "-1", "probe.raw"]),
+            "Invalid pattern byte specified. Must be between 0 and 255."
+        );
+    }
+
+    #[test]
+    fn flush_interval_negative_reaches_validation() {
+        // -w -d 1 so the flush-interval RANGE check is what fires
+        // (matching the qemu transcript in Supplement 2), not the
+        // "-flush-interval is only available in write tests" rule;
+        // the range check precedes the -w refusal (verified live
+        // in the 4c smoke run).
+        assert_eq!(
+            clap_then_validate_err(&[
+                "instar",
+                "bench",
+                "--flush-interval",
+                "-1",
+                "-w",
+                "-c",
+                "10",
+                "-d",
+                "1",
+                "probe.raw"
+            ]),
+            "Invalid flush interval specified. Must be between 0 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn positive_values_still_parse_normally() {
+        // allow_hyphen_values must not disturb the ordinary path:
+        // a fully-populated positive argv still parses and
+        // validates cleanly.
+        let cli = Cli::try_parse_from([
+            "instar",
+            "bench",
+            "-c",
+            "100",
+            "-d",
+            "2",
+            "-s",
+            "8192",
+            "-S",
+            "0",
+            "-o",
+            "1k",
+            "probe.raw",
+        ])
+        .expect("clap parse");
+        match cli.command {
+            Commands::Bench(args) => {
+                let inv = validate_bench_args(&args).expect("must validate");
+                assert_eq!(inv.params.count, 100);
+                assert_eq!(inv.params.depth, 2);
+                assert_eq!(inv.params.bufsize, 8192);
+                assert_eq!(inv.params.step, 0);
+                assert_eq!(inv.params.offset, 1024);
+            }
+            other => panic!("expected Bench, got {other:?}"),
+        }
     }
 }
 
