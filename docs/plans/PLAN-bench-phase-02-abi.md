@@ -380,3 +380,43 @@ phase changes no behaviour).
   (well under the 4 KiB config page), `BenchResult` at 64 bytes,
   two appended slots, VERSION 19→20; core.bin re-measured by
   step 2c with the fallback path predefined (Mission §7).
+
+## Captured measurements (step 2c)
+
+- **core.bin before this phase** (bitmap's addition, commit
+  `547104b`): ~66.7 KiB .bss-inclusive extent, ~5.3 KiB headroom
+  against the 72 KiB core region (Situation, "core.bin budget").
+- **core.bin after this phase:** `make instar` followed by
+  `scripts/check-binary-sizes.sh` on the tree with steps 2a and 2b
+  landed produces:
+
+  ```
+  WARN: core (0x10000-0x22000) - 68KB / 72KB (94%, .bin=68416B)
+  ```
+
+  i.e. a 68416-byte flat `.bin`, 94% of the 72 KiB region, ~4.4 KiB
+  headroom remaining. The growth versus the pre-phase measurement
+  is attributable to the two senders landed in steps 2a/2b: the
+  `ct_send_bench_start` / `ct_send_bench_result` thunks
+  (`src/core/src/main.rs`), the two new `serial.rs` builders
+  (`send_bench_start`, `send_bench_result`), and the two new proto
+  message types (`BenchStartMessage`, `BenchResultMessage`)
+  compiled into core's protobuf encoding path.
+- The script's 85% early-warning fires — as it already was firing
+  before this phase, per the bitmap-era ~5.3 KiB-headroom
+  measurement above — and the 72 KiB hard gate passes:
+  `scripts/check-binary-sizes.sh`'s final line reads "All binaries
+  fit within their memory regions."
+- **Consequence for Mission §1 (OQ3):** the hard gate held, so the
+  dedicated `send_bench_start` call-table slot stands as landed;
+  the sentinel-`send_progress` fallback described there was **not**
+  taken.
+- **Note for phase 3:** ~4.4 KiB of core headroom remains. The
+  bench guest op itself adds nothing further to core — the two
+  thunks above are the full cost already counted here — so the
+  next pressure on this budget is whichever future plan appends
+  the next call-table sender. Check the actual field count in
+  `CallTable` (`src/shared/src/lib.rs`) before citing a slot
+  number in a future plan rather than trusting this document's
+  count to still be current; simplest is to just say "the next
+  call-table append".
