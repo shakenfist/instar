@@ -1283,20 +1283,40 @@ fn print_info_result(
             println!("    parent cid: {}", info.vmdk_info.parent_cid);
             println!("    create type: {}", info.vmdk_info.create_type.as_str());
 
-            // Extents section - for monolithicSparse there's one extent
-            // The extent info includes virtual size (in bytes), filename, cluster size, and format
+            // Extents section.
+            //
+            // monolithicFlat / twoGbMaxExtentFlat images have one entry
+            // per resolved flat extent, rendered as "format: FLAT" with
+            // the resolved extent filename and no cluster-size line —
+            // exactly like the JSON extents rendering and qemu-img's
+            // human output. All other create types (monolithicSparse,
+            // streamOptimized, …) have a single self-referential extent
+            // described by the descriptor's own virtual size and cluster
+            // size, with an empty format.
             println!("    extents:");
-            println!("        [0]:");
-            // Output compressed: true if the extent is compressed (e.g., streamOptimized)
-            if info.flags & INFO_RESULT_FLAG_COMPRESSED != 0 {
-                println!("            compressed: true");
+            if let Some(resolved) = vmdk_flat {
+                for (idx, extent) in resolved.flat_extents.iter().enumerate() {
+                    println!("        [{idx}]:");
+                    println!("            virtual size: {}", extent.extent_size);
+                    println!(
+                        "            filename: {}",
+                        extent.flat_path.to_string_lossy()
+                    );
+                    println!("            format: FLAT");
+                }
+            } else {
+                println!("        [0]:");
+                // Output compressed: true if the extent is compressed (e.g., streamOptimized)
+                if info.flags & INFO_RESULT_FLAG_COMPRESSED != 0 {
+                    println!("            compressed: true");
+                }
+                println!("            virtual size: {}", info.virtual_size);
+                println!("            filename: {abs_path}");
+                println!("            cluster size: {}", info.cluster_size);
+                // qemu-img outputs "format: " with trailing space for empty format
+                print!("            format: ");
+                println!();
             }
-            println!("            virtual size: {}", info.virtual_size);
-            println!("            filename: {abs_path}");
-            println!("            cluster size: {}", info.cluster_size);
-            // qemu-img outputs "format: " with trailing space for empty format
-            print!("            format: ");
-            println!();
         }
 
         // Format specific information (VDI)
@@ -1318,9 +1338,35 @@ fn print_info_result(
             }
         }
 
-        // Child node '/file' section (qemu-img 8.0+)
-        // This section exposes information about the underlying protocol layer.
+        // Child node sections (qemu-img 8.0+)
+        // These sections expose information about the underlying protocol layer.
         if profile.include_child_node {
+            // VMDK monolithicFlat / twoGbMaxExtentFlat images expose one
+            // '/extents.N' protocol child per resolved flat extent,
+            // ahead of the descriptor's own '/file' child. This mirrors
+            // the JSON children rendering. The extent's "file length" is
+            // its declared virtual size (matching qemu-img, which opens
+            // the flat file as a raw protocol node); the "disk size"
+            // line is substituted from the filesystem at test time, so
+            // we report the descriptor's disk size like every other
+            // disk-size line here.
+            if let Some(resolved) = vmdk_flat {
+                for (i, extent) in resolved.flat_extents.iter().enumerate() {
+                    println!("Child node '/extents.{i}':");
+                    println!("    filename: {}", extent.flat_path.to_string_lossy());
+                    println!("    protocol type: file");
+                    println!(
+                        "    file length: {} ({} bytes)",
+                        format_size_human(extent.extent_size, qemu_compat),
+                        extent.extent_size
+                    );
+                    println!(
+                        "    disk size: {}",
+                        format_size_human(disk_size, qemu_compat)
+                    );
+                }
+            }
+
             // For file length, qemu-img reports the larger of:
             // 1. The actual filesystem size
             // 2. The calculated size based on internal metadata (e.g., L1 table for QCOW2)
@@ -1332,8 +1378,12 @@ fn print_info_result(
             } else {
                 std::cmp::max(file_size, info.actual_size)
             };
-            // For raw format, round up to 512-byte sector boundary
-            let effective_child_file_length = if info.format == "raw" {
+            // For raw format, round up to 512-byte sector boundary. VMDK
+            // flat descriptors are likewise treated as unstructured files
+            // by qemu-img, so their protocol-node length is rounded up to
+            // a sector — the same computation the JSON path applies to
+            // descriptor_vsize.
+            let effective_child_file_length = if info.format == "raw" || vmdk_flat.is_some() {
                 child_file_length.div_ceil(512) * 512
             } else {
                 child_file_length

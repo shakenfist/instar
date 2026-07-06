@@ -797,6 +797,24 @@ master plan.
 
 ### Bugs fixed during this work
 
+* **`info` human output wrong for VMDK monolithicFlat images**
+  (found 2026-07-06 by the memory-map lift's full integration run,
+  which surfaced never-committed human goldens in instar-testdata
+  encoding the correct qemu output). The human formatter's extents
+  section (`src/vmm/src/main.rs`) hardcoded a single `[0]` block
+  built from the descriptor (its own path, empty format, spurious
+  `cluster size: 0`), omitted the `Child node '/extents.N'`
+  blocks, and reported the raw descriptor byte size where qemu
+  reports the sector-rounded protocol-node length. The JSON path
+  was already correct via `ResolvedVmdkDescriptor.flat_extents`;
+  the human path now mirrors it (per-extent resolved filename +
+  `format: FLAT`, version-gated `/extents.N` children, 512-byte
+  rounding reusing the raw-format idiom). The five-profile human
+  goldens for `vmdk-flat-{1m,10m}` are now committed in
+  instar-testdata (the JSON half landed in `91c8d457c`; the human
+  half had been left uncommitted because instar could not match
+  it). `test_info_safe` went 526/536 → 536/536.
+
 List any bugs encountered and fixed during development here. At
 the start of Phase 1, scan the GitHub issue tracker for any open
 performance/virtio/io_thread issues this work should resolve or be
