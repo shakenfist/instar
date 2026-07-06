@@ -117,7 +117,7 @@ if ! check_size "core" "$CORE_BASE" "$CORE_MAX_SIZE" "core (0x10000-0x30000)"; t
 fi
 
 # Check operation binaries
-for op in info copy check compare convert measure create rebase resize commit snapshot amend bitmap; do
+for op in info copy check compare convert measure create rebase resize commit snapshot amend bitmap bench; do
     if ! check_size "$op" "$OPERATION_BASE" "$OPERATION_MAX_SIZE" "${op} (0x30000-0xF0000)"; then
         failed=1
     fi

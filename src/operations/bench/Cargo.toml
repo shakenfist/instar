@@ -1,0 +1,20 @@
+[package]
+name = "bench-op"
+version = "0.2.0"
+edition = "2021"
+description = "Bench operation: measure guest-side read/write throughput"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+[dependencies]
+shared = { path = "../../shared" }
+bench = { path = "../../crates/bench" }
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true
