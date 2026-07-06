@@ -2490,6 +2490,7 @@ fn open_chain_devices(
 /// number of devices actually opened are ignored, matching the
 /// "tolerate extra entries" convention used by the chain
 /// helpers elsewhere in this file.
+#[allow(clippy::too_many_arguments)]
 fn open_chain_devices_rw(
     chain: &BackingChain,
     sector_size: u64,
@@ -2498,18 +2499,33 @@ fn open_chain_devices_rw(
     start_idx: usize,
     label: &str,
     rw_slots: &[usize],
+    rw_capacity_hint: Option<u64>,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let mut idx = start_idx;
     let mut slot_in_chain: usize = 0;
 
     for image in chain.images().iter() {
         let is_rw = rw_slots.contains(&slot_in_chain);
+        // An RW slot may need to grow past its current EOF (bench's
+        // qcow2 `-w` appends fresh data / L2 / refcount clusters). When
+        // a capacity hint is supplied, expose it to BOTH the backing
+        // store (so `write_at` accepts the appended offsets) and the
+        // virtio device capacity (so `get_input_capacity` — which the
+        // guest's `cluster_lookup` bounds-checks against — covers them).
+        // The file still grows sparsely on demand; the hint is only an
+        // upper bound. RO slots and hint-less RW slots keep the file's
+        // current size as the capacity.
         let backing = if is_rw {
-            BackingStore::open_rw_existing(&image.path, None)?
+            BackingStore::open_rw_existing(&image.path, rw_capacity_hint)?
         } else {
             BackingStore::open(&image.path, true, None, false)?
         };
-        let file_size = std::fs::metadata(&image.path)?.len();
+        let on_disk_size = std::fs::metadata(&image.path)?.len();
+        let file_size = if is_rw {
+            rw_capacity_hint.unwrap_or(on_disk_size).max(on_disk_size)
+        } else {
+            on_disk_size
+        };
         let mmio = device_mmio_base(idx);
         let vq = device_vq_base(idx);
         let device = VirtioBlockDevice::new(backing, file_size, sector_size, !is_rw, mmio, vq);
@@ -4076,7 +4092,25 @@ struct BenchRunResult {
 /// instar's `bench:` prefix. `ERROR_IO_WRITE` / `ERROR_IO_FLUSH` /
 /// `ERROR_WRITE_UNSUPPORTED` / `ERROR_ALLOC_EXHAUSTED` are reachable
 /// from phase 5's write path.
-fn map_bench_error(code: u32) -> String {
+/// Render a short reason for the qcow2 write envelope gate id carried
+/// in `BenchResult::error_detail` alongside `ERROR_WRITE_UNSUPPORTED`.
+/// The ids are documented on `shared::BenchResult::ERROR_WRITE_UNSUPPORTED`
+/// and mirrored in the bench guest op's `wgate` const block.
+fn bench_write_gate_reason(detail: u64) -> &'static str {
+    match detail {
+        0 => "format not supported",
+        1 => "refcount_bits != 16",
+        2 => "compression",
+        3 => "extended L2",
+        4 => "external data file",
+        5 => "encryption",
+        6 => "dirty or corrupt",
+        7 => "internal snapshots",
+        _ => "unsupported feature",
+    }
+}
+
+fn map_bench_error(code: u32, error_detail: u64) -> String {
     match code {
         c if c == shared::BenchResult::ERROR_IO_READ => {
             "Failed request: Input/output error".to_string()
@@ -4097,12 +4131,13 @@ fn map_bench_error(code: u32) -> String {
             "bench: flushing the image failed".to_string()
         }
         c if c == shared::BenchResult::ERROR_WRITE_UNSUPPORTED => {
-            // Phase 5a: the host already lets qcow2 through to the guest
-            // (raw and qcow2 both pass the run_bench format gate), and
-            // the guest refuses qcow2 writes with this code until 5b
-            // lands the allocating path. Rendered generically so the
-            // same message serves any format the guest cannot yet write.
-            "bench: write tests are not yet supported for this image".to_string()
+            // The guest refuses a write test the image's envelope does
+            // not permit. `error_detail` is a gate id naming the reason
+            // (raw always passes; qcow2 carries the envelope checks).
+            format!(
+                "bench: write tests are not supported for this image ({})",
+                bench_write_gate_reason(error_detail)
+            )
         }
         c if c == shared::BenchResult::ERROR_ALLOC_EXHAUSTED => {
             "bench: image too large for in-place bench write".to_string()
@@ -4206,7 +4241,7 @@ fn run_bench(args: &BenchArgs, verbose: bool) -> Result<(), Box<dyn std::error::
     // as the bare qemu "Failed request" text; the others carry instar's
     // `bench:` prefix. The header is already on stdout by now.
     if result.error != shared::BenchResult::ERROR_OK {
-        return Err(map_bench_error(result.error).into());
+        return Err(map_bench_error(result.error, result.error_detail).into());
     }
 
     // ERROR_OK without a timing bracket is a guest contract violation (a
@@ -4378,6 +4413,20 @@ fn run_bench_guest(
     let mut device_set = DeviceSet::new();
     let mut io_events: Vec<IoEvent> = Vec::new();
     if params.is_write {
+        // qcow2 `-w` allocates fresh data / L2 / refcount clusters past
+        // the current EOF, so the RW top slot needs a capacity window
+        // above the file's current size. Mirror resize's generous hint
+        // (2× the larger of the file/virtual size, floored at 1 GiB);
+        // the refcount-table-growth gate bounds real growth well below
+        // it, and the file still grows sparsely on demand. raw writes
+        // stay in place, so raw gets no hint (identical to phase 5a).
+        let top = &chain.images()[0];
+        let rw_capacity_hint = if matches!(top.format, ImageFormat::Qcow2) {
+            let on_disk = std::fs::metadata(&top.path).map(|m| m.len()).unwrap_or(0);
+            Some(on_disk.max(top.virtual_size).saturating_mul(2).max(1 << 30))
+        } else {
+            None
+        };
         open_chain_devices_rw(
             chain,
             sector_size as u64,
@@ -4386,6 +4435,7 @@ fn run_bench_guest(
             0,
             "chain",
             &[0], // top image (input slot 0) read-write; parents read-only
+            rw_capacity_hint,
         )?;
     } else {
         open_chain_devices(
@@ -9385,6 +9435,9 @@ fn run_commit_guest(
         0,
         "commit",
         &[0],
+        // Commit's overlay-clear only zeroes existing L2 / refcount
+        // entries in place; the RW overlay never grows, so no hint.
+        None,
     )?;
 
     // Output device — backing, attached at the slot

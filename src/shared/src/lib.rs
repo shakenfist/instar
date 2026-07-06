@@ -4076,11 +4076,27 @@ impl BenchResult {
     /// A flush (`fsync_input`) of the image failed.
     pub const ERROR_IO_FLUSH: u32 = 6;
     /// A write test was requested against an image the guest cannot
-    /// write. `error_detail` carries a small gate-id enum: `0` means
-    /// "the format itself has no write support yet" (phase 5a: qcow2
-    /// writes land in 5b, so a qcow2 image reaches the guest and is
-    /// refused with detail `0`). Later gate ids (compression, LUKS,
-    /// extended-L2, snapshot-bearing, …) are assigned as 5b adds them.
+    /// write. `error_detail` carries a small, stable gate-id enum
+    /// identifying which envelope check refused the image. The host
+    /// (`map_bench_error`) renders each id as a short reason:
+    ///
+    /// - `0` — the format itself has no write support yet (phase 5a:
+    ///   a non-{raw,qcow2} family reaching the guest under `-w`).
+    /// - `1` — qcow2 `refcount_bits != 16` (only 16-bit is supported).
+    /// - `2` — qcow2 compression feature set, or an unknown
+    ///   incompatible-features bit beyond the ones bench recognises
+    ///   (also raised mid-run if a compressed L2 entry is hit).
+    /// - `3` — qcow2 extended-L2 (subcluster) feature.
+    /// - `4` — qcow2 external data file.
+    /// - `5` — qcow2 LUKS / encryption.
+    /// - `6` — qcow2 dirty / corrupt incompatible bits.
+    /// - `7` — qcow2 has internal snapshots (`nb_snapshots > 0`);
+    ///   bench overwrites in place and must not corrupt shared
+    ///   clusters. Also used mid-run if an allocated cluster is found
+    ///   without `OFLAG_COPIED` (a snapshot-shared cluster).
+    ///
+    /// The bench guest op mirrors these ids in its `wgate` const block;
+    /// the two lists must stay in sync.
     pub const ERROR_WRITE_UNSUPPORTED: u32 = 7;
     /// A qcow2 allocating write could not obtain a free cluster because
     /// the refcount table is full and v1 never grows it (the host
