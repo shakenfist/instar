@@ -53,6 +53,7 @@ Features unique to instar that do not exist in qemu-img.
 | [Amend](amend.md) | `instar amend` - change qcow2 image options (compat version, lazy_refcounts) |
 | [Dd](dd.md) | `instar dd` — windowed block copy (qemu-img dd compatible) |
 | [Bitmap](bitmap.md) | `instar bitmap` - manage qcow2 persistent dirty bitmaps |
+| [Bench](bench.md) | `instar bench` - benchmark the sandboxed I/O path |
 
 ## Compatibility
 
