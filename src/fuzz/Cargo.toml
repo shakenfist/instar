@@ -26,6 +26,7 @@ check = { path = "../crates/check" }
 amend = { path = "../crates/amend" }
 bitmap = { path = "../crates/bitmap" }
 dd = { path = "../crates/dd" }
+bench = { path = "../crates/bench" }
 
 [profile.release]
 debug = true
@@ -209,5 +210,13 @@ test = false
 [[bin]]
 name = "fuzz_dd_read"
 path = "fuzz_targets/fuzz_dd_read.rs"
+doc = false
+test = false
+
+# bench targets
+
+[[bin]]
+name = "fuzz_bench_schedule"
+path = "fuzz_targets/fuzz_bench_schedule.rs"
 doc = false
 test = false
