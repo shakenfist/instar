@@ -203,3 +203,29 @@ without retuning).
 | 7a | medium | sonnet | none | `fuzz_bench_schedule` per Mission §1 + the three registration spots per §2 (Cargo.toml [[bin]] + dep, workflow TARGETS array + N_TARGETS=30 + comment, FAST_TIER). Local smoke: fuzz-build + fuzz-run 120 s, zero crashes (crash = stop-and-report). actionlint via pre-commit covers the workflow edit. Commit 1. |
 | 7b | high | opus | none | `op_bench` + `_bench_option_picker` per Mission §3, cloned from op_bitmap's shape (typed dicts, steer-around picker, existing compare helpers). Local verification: run `scripts/differential-fuzz.py --instar src/target/release/instar --iterations 100 --timeout 30 --log-dir <scratchpad>` (NO --create-issues) on this KVM host; confirm bench invocations occurred (grep the log/summary), ZERO bench divergences reported, and no inconclusive storm (a few external timeouts are tolerable). Any real divergence: stop-and-report with the reproduction seed. Commit 2. |
 | 7c | low | sonnet | none | Bookkeeping: append `## Captured fuzz results (step 7c)` here (smoke-run stats, differential-run stats incl. how many iterations exercised bench), master plan row → Complete, index update, pre-commit. Commit 3. |
+
+## Captured fuzz results (step 7c)
+
+**7a smoke.** `fuzz_bench_schedule` was registered as the 30th
+coverage-fuzz target (`FAST_TIER`, pure math's fixed 300 s
+nightly slice). The local smoke: 1,306,856 runs in 121 s
+(~10,800 exec/s), zero crashes, coverage saturating early (cov
+49 / ft 71) — expected for a small pure-arithmetic input space
+with no format parsing behind it.
+
+**7b local differential run.** `op_bench` (seed 20260708, 100
+iterations, 233.8 s): zero bench divergences. 22 iterations
+invoked bench across 25 op-slots — close to the ~19 expected
+from a 3-ops-per-iteration draw over 16 registered operations —
+and the two inconclusives that surfaced belonged to other ops,
+not bench. The picker's schedule-linear wrap steer-around
+(`offset + (count-1)*eff_step + bufsize < image_size`, keeping
+the whole schedule inside the region where neither qemu
+10.0.8's wrap rule nor instar's ever fires) was verified over
+30,000 generated plans with zero wrap leaks.
+
+Nightly exercise of both surfaces begins with the next
+scheduled coverage-fuzz and differential-fuzz runs; any corpus
+entries or divergence issues they surface flow through the
+existing machinery (instar-testdata corpus commits, security-
+audit issue filing) — no phase-7-specific follow-up is needed.
