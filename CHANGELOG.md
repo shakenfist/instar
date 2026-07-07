@@ -162,6 +162,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   resize` now refuses images that carry persistent dirty bitmaps
   (see *Changed*). See [docs/bitmap.md](docs/bitmap.md).
 
+- **New `instar bench` subcommand (PLAN-bench phases 1-8).** Issues a
+  scripted sequence of read or write requests against a disk image and
+  reports how long they took — the sandboxed equivalent of `qemu-img
+  bench`, except it measures instar's own end-to-end sandboxed I/O path
+  (guest format layer → virtio-block → host I/O thread) rather than
+  qemu's block layer over the page cache, so the two numbers are
+  comparable to each other on an identical invocation but never in
+  isolation (see [docs/bench.md](docs/bench.md) for the full reframing
+  and caveats). Reads all five formats (raw, qcow2, vmdk, vpc, vhdx);
+  write tests (`-w`) are supported on raw and qcow2 only, including
+  qcow2 overlays with a backing chain, via a write-through-metadata
+  design (data and L2/L1 first, refcounts staged and written back last)
+  that leaves at worst a repairable leak on a mid-run crash. `--output
+  json` emits a stable schema with precomputed rates for downstream
+  perf-regression tracking; the human-readable path is byte-parity with
+  `qemu-img bench`, with 11 documented divergences tracked in
+  `KNOWN_BENCH_DIVERGENCES`. `CallTable::VERSION` bumps from 19 to 20
+  for the appended `send_bench_start`/`send_bench_result` callbacks
+  (same append-at-end discipline as bitmap's 18→19). Covered by
+  `tests/test_bench.py` (62 tests), the `fuzz_bench_schedule` coverage
+  fuzzer, and the differential fuzzer's `op_bench` arm. See
+  [docs/bench.md](docs/bench.md).
+
 - **`instar map` differential fuzzer extension (PLAN-map phase 8).**
   Adds `op_map` to `scripts/differential-fuzz.py`'s random
   operation chain. For each randomly-generated image (raw
@@ -792,6 +815,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`instar info`'s human output for flat VMDK extents diverged from
+  `qemu-img` (commit `dad884e`).** For monolithicFlat /
+  twoGbMaxExtentFlat images, the human formatter emitted a single
+  hardcoded placeholder extent block (descriptor path, empty format,
+  a spurious "cluster size: 0"), omitted the `Child node
+  '/extents.N'` blocks entirely, and reported `/file`'s length as the
+  raw descriptor byte size instead of the protocol-node length
+  rounded up to a 512-byte sector. The JSON path was already correct
+  via `ResolvedVmdkDescriptor.flat_extents`; the human path now
+  mirrors it (one entry per resolved flat extent, gated `/extents.N`
+  child blocks, the same `div_ceil(512)` rounding the raw format
+  already used). Found by the memory-map lift's full integration run
+  (`test_info_safe` 526/536 → 536/536); non-flat vmdk output is
+  unchanged.
+
 - **`instar convert -O vmdk|vpc|vhdx` silently truncated data when
   the input qcow2 had clusters smaller than the output grain/block
   size (commit `779e7a7`).** The structured writers (vmdk, vhd,
@@ -951,6 +989,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     GitHub issues against instar (commit `71e3e33`).
 
 ### Changed
+
+- **Guest core and operation memory budgets doubled (2026-07-06,
+  commit `3a5e1e2`).** Pre-emptive lift ahead of the bench work,
+  prompted by `core.bin` reaching 94% of its 72 KiB budget: core's
+  region grows from `[0x10000, 0x22000)` (72 KiB) to `[0x10000,
+  0x30000)` (128 KiB), and the operation region from `[0x22000,
+  0x80000)` (376 KiB) to `[0x30000, 0xF0000)` (768 KiB). The call
+  table / operation config / chain config data pages move from
+  `0x80000`-`0x84000` to `0xF0000`-`0xF4000`, gaining a new VMM-params
+  page, followed by a new 48 KiB guard gap below the (unchanged)
+  virtqueue region at `VQ_BASE_START` (`0x100000`). Nothing at or
+  above `0x100000` moves. `VQ_BASE_START` also moved into `shared` as
+  the single source of truth (previously duplicated in `vmm/main.rs`
+  and `core/main.rs`), and four compile-time asserts now make the
+  layout self-checking. See `src/shared/src/lib.rs`.
 
 - **`instar resize` now refuses qcow2 images carrying persistent
   dirty bitmaps** rather than silently discarding them. Resizing
