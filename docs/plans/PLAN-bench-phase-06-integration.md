@@ -208,3 +208,53 @@ traffic to the testdata repo for bench). No fuzz targets
 |------|--------|-------|-----------|---------------------|
 | 6a | high | sonnet | none | Write `tests/test_bench.py` in full per Mission §1-§3: module docstring with the OQ13 contract, `KNOWN_BENCH_DIVERGENCES` with the 11 entries, `BenchTestBase` helpers (incl. the in-file 55AA raw builder — two qemu-io writes at 510/511), and the seven test classes. Every pinned literal comes from the capture sections of the phase-01/04/05 plans — copy, don't paraphrase. Iterate with file-scoped stestr (`cd tests && ../.venv/bin/stestr run test_bench`) until 100% pass on this host; report the pass count and wall-clock. High effort for volume and for the discipline of matching capture text exactly; the design is fully specified. Commit 1. |
 | 6b | medium | sonnet | none | Full-suite integration: `make test-integration` end-to-end (the whole suite, 16-way — proves bench tests are order-free and add no cross-test interference); the suite is zero-fail on healthy testdata, so ANY failure anywhere is investigated, not waved off. Record the bench-file test count, suite totals, and wall-clock delta in a `## Captured suite results (step 6b)` section here; master plan row → Complete; index update; pre-commit. Commit 2. |
+
+## Captured suite results (step 6b)
+
+Run on 2026-07-07 on the 16-core reference host (healthy
+`../instar-testdata` at `a34ca1bf2`, git-lfs content present),
+via `make test-integration` from the repo root (stestr, 16-way,
+`--exclude-regex test_info_malicious`).
+
+### Bench file (from step 6a, for reference)
+
+- `tests/test_bench.py`: **62 tests in seven classes**
+  (`TestBenchHeaderParity`, `TestBenchValidation`,
+  `TestBenchReadBehaviour`, `TestBenchWrite`,
+  `TestBenchWriteRefusals`, `TestBenchJson`,
+  `TestBenchDivergenceRegression`), plus
+  `KNOWN_BENCH_DIVERGENCES` with 11 entries.
+- File-scoped run (`cd tests && ../.venv/bin/stestr run
+  test_bench`): 62/62 pass in ~2.4 s wall-clock.
+
+### Full-suite totals
+
+| Metric | Value |
+|--------|-------|
+| Ran | **2476** tests (was ~2414 pre-bench; +62 = exactly the bench file) |
+| Passed | **1919** |
+| Failed | **0** (also 0 expected-fail, 0 unexpected-success) |
+| Skipped | 557 |
+| Wall-clock | **13m 0s** (`time make test-integration`, includes the instar build check) |
+| stestr-reported | 775.5 s; sum of per-test execute time 7319.7 s across 16 workers |
+
+### Order-freedom and interference
+
+All 62 bench tests passed inside the full parallel run, scheduled
+across **10 different workers** ({6}-{15}) rather than a single
+partition — the file is order-free and introduced no cross-test
+interference. No bench test behaved differently under full-suite
+parallelism than it did file-scoped in 6a.
+
+### Incidents
+
+**None.** Zero failures anywhere in the suite. The known trap on
+this host — convert-compressed timeouts under external parallel
+load — did not occur (all `test_convert` compressed rows passed,
+worst single test ~3.5 s). The 557 skips were audited and are all
+pre-existing families unrelated to bench, none originating in
+`tests/test_bench.py`: 201 × `oslo.utils not installed` (optional
+dependency), the `KNOWN_MAP_DIVERGENCES` / scanner / writer
+divergence registries, baseline rows whose oracle exits non-zero,
+measure's documented monolithicFlat-source refusal, and
+qemu-side resize-unsupported-format rows.
