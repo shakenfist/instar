@@ -835,6 +835,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   reconstruction and idempotence instead of the old one-cylinder
   tolerance that had been documenting the bug.
 
+- **Differential fuzzer: snapshot byte compare now ignores
+  dead-cluster residue (issue #381).** Byte differences confined to
+  clusters whose refcount is 0 in *both* images are residue, not
+  divergence: under metadata-cache pressure (512-byte clusters) qemu
+  flushes a half-refreshed freed L2 mid-walk even with
+  `file.discard=ignore` — the eviction writes partially-updated
+  COPIED flags to disk, then the remaining dirty flags are discarded
+  with the cache entry when the L2 is freed — while instar never
+  writes freed clusters at all. Both images are `check`-clean and
+  `compare`-identical; only the dead bytes differ. See the updated
+  "Freed-cluster bytes" quirk in docs/quirks.md.
+
 - **`instar info`'s human output for flat VMDK extents diverged from
   `qemu-img` (commit `dad884e`).** For monolithicFlat /
   twoGbMaxExtentFlat images, the human formatter emitted a single

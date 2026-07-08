@@ -3490,6 +3490,74 @@ def _snapshot_normalize_table(path):
     return True
 
 
+def _qcow2_free_clusters(path):
+    """Parse a qcow2's refcount structures and return
+    ``(cluster_size, frozenset of host cluster indices with refcount
+    0)``, or None if the file is not a qcow2 this walk can handle
+    (bad magic, non-16-bit refcounts, out-of-range geometry). Only
+    clusters within the physical file length are considered.
+    """
+    try:
+        size = path.stat().st_size
+        with open(path, 'rb') as f:
+            header = f.read(104)
+            if len(header) < 72 or header[0:4] != b'QFI\xfb':
+                return None
+            version = int.from_bytes(header[4:8], 'big')
+            cluster_bits = int.from_bytes(header[20:24], 'big')
+            if not 9 <= cluster_bits <= 21:
+                return None
+            if version >= 3:
+                if len(header) < 100:
+                    return None
+                refcount_order = int.from_bytes(header[96:100], 'big')
+                if refcount_order != 4:  # only 16-bit refcounts
+                    return None
+            cs = 1 << cluster_bits
+            rt_off = int.from_bytes(header[48:56], 'big')
+            rt_clusters = int.from_bytes(header[56:60], 'big')
+            if rt_off == 0 or rt_off + rt_clusters * cs > size:
+                return None
+            total_clusters = (size + cs - 1) // cs
+            entries_per_rb = cs * 8 // 16
+            f.seek(rt_off)
+            rt = f.read(rt_clusters * cs)
+            free = set()
+            for slot in range(len(rt) // 8):
+                base = slot * entries_per_rb
+                if base >= total_clusters:
+                    break
+                covered = min(entries_per_rb, total_clusters - base)
+                rb_off = (int.from_bytes(rt[slot * 8:slot * 8 + 8],
+                                         'big') & 0x00fffffffffffe00)
+                if rb_off == 0:
+                    # Unallocated refblock: every covered cluster free.
+                    free.update(range(base, base + covered))
+                    continue
+                if rb_off + cs > size:
+                    return None
+                f.seek(rb_off)
+                rb = f.read(cs)
+                for k in range(covered):
+                    if rb[k * 2] == 0 and rb[k * 2 + 1] == 0:
+                        free.add(base + k)
+            return cs, frozenset(free)
+    except OSError:
+        return None
+
+
+def _snapshot_dead_clusters(inst_path, qemu_path):
+    """Clusters whose bytes are dead on BOTH sides: refcount 0 in both
+    images (with matching cluster size). Returns ``(cluster_size,
+    frozenset)`` or None when the rule cannot be applied (either side
+    unparseable or cluster sizes differ)."""
+    inst = _qcow2_free_clusters(inst_path)
+    qemu = _qcow2_free_clusters(qemu_path)
+    if inst is None or qemu is None or inst[0] != qemu[0]:
+        return None
+    return inst[0], inst[1] & qemu[1]
+
+
 def _snapshot_compare_bytes(inst_path, qemu_path):
     """Byte-identity check ported from the phase 6-8 harnesses'
     assert_byte_identical (tools/snapshot-*-matrix.sh): the files
@@ -3497,10 +3565,23 @@ def _snapshot_compare_bytes(inst_path, qemu_path):
     must be all zero (the sector-granular file-tail quirk —
     docs/quirks.md, "The created file may be physically larger than
     qemu-img's"). Returns None on identity or a detail dict.
+
+    Dead-cluster rule: differing bytes confined to clusters whose
+    refcount is 0 in BOTH images are residue, not divergence — like
+    the snapshot-table padding and timestamps the per-step
+    normalization handles. Even with `file.discard=ignore`, qemu can
+    write half-refreshed COPIED flags into an about-to-be-freed L2
+    when metadata-cache pressure (512-byte clusters) forces an
+    eviction flush mid-walk, while instar never writes freed
+    clusters at all (docs/quirks.md, "Freed-cluster bytes may differ
+    from qemu-img's"; issue #381). Both sides' refcount structures
+    are live clusters, so a disagreement about what IS free still
+    surfaces as a normal prefix mismatch.
     """
     inst_len = inst_path.stat().st_size
     qemu_len = qemu_path.stat().st_size
     common = min(inst_len, qemu_len)
+    dead = ()  # lazily computed on first mismatch: (cs, frozenset)
     with open(inst_path, 'rb') as fa, open(qemu_path, 'rb') as fb:
         offset = 0
         while offset < common:
@@ -3508,16 +3589,30 @@ def _snapshot_compare_bytes(inst_path, qemu_path):
             a = fa.read(n)
             b = fb.read(n)
             if a != b:
-                first = next(i for i in range(len(a))
-                             if a[i] != b[i])
-                return {
-                    'kind': 'prefix_mismatch',
-                    'offset': offset + first,
-                    'instar_byte': a[first],
-                    'qemu_byte': b[first],
-                    'instar_len': inst_len,
-                    'qemu_len': qemu_len,
-                }
+                if dead == ():
+                    dead = _snapshot_dead_clusters(inst_path, qemu_path)
+                # Walk the chunk cluster by cluster (the 1 MiB chunks
+                # are cluster-aligned for every qcow2 cluster size), so
+                # dead-cluster diffs can be skipped individually.
+                cs = dead[0] if dead else (1 << 20)
+                for coff in range(0, n, cs):
+                    sa = a[coff:coff + cs]
+                    if sa == b[coff:coff + cs]:
+                        continue
+                    cluster = (offset + coff) // cs
+                    if dead and cluster in dead[1]:
+                        continue
+                    sb = b[coff:coff + cs]
+                    first = next(i for i in range(len(sa))
+                                 if sa[i] != sb[i])
+                    return {
+                        'kind': 'prefix_mismatch',
+                        'offset': offset + coff + first,
+                        'instar_byte': sa[first],
+                        'qemu_byte': sb[first],
+                        'instar_len': inst_len,
+                        'qemu_len': qemu_len,
+                    }
             offset += n
         longer, longer_side = ((fa, 'instar') if inst_len > qemu_len
                                else (fb, 'qemu'))
