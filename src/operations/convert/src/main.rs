@@ -2428,7 +2428,27 @@ unsafe fn convert_to_qcow2(
             // Read input data, one input cluster at a time
             let mut buf_filled_q: u64 = 0;
             while buf_filled_q < this_chunk {
-                let piece = core::cmp::min(read_chunk_q, this_chunk - buf_filled_q);
+                let mut piece = core::cmp::min(read_chunk_q, this_chunk - buf_filled_q);
+
+                // Clamp the read so it never crosses an input-cluster
+                // boundary (mirrors convert_to_raw). The chain reader's
+                // Standard-cluster path reads `piece` bytes from
+                // `host_offset + (offset % cluster_size)`; a single
+                // cluster is contiguous on the host, but adjacent virtual
+                // clusters are not, so a read that begins partway into a
+                // cluster (a `dd` window whose start is not
+                // cluster-aligned) and runs past the cluster boundary
+                // would pull in the wrong host bytes — or run past EOF.
+                // For whole-image convert the offset is always
+                // cluster-aligned, so this is a no-op.
+                let read_off = read_start + virtual_offset + buf_filled_q;
+                let intra_cluster = read_off % input_cluster_size_q;
+                if intra_cluster != 0 {
+                    let to_cluster_end = input_cluster_size_q - intra_cluster;
+                    if to_cluster_end < piece {
+                        piece = to_cluster_end;
+                    }
+                }
 
                 HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);
 
@@ -2796,7 +2816,21 @@ unsafe fn convert_to_qcow2_compressed(
             // when input clusters are smaller than output.
             let mut buf_filled: u64 = 0;
             while buf_filled < this_chunk {
-                let piece = core::cmp::min(read_chunk, this_chunk - buf_filled);
+                let mut piece = core::cmp::min(read_chunk, this_chunk - buf_filled);
+
+                // Clamp the read so it never crosses an input-cluster
+                // boundary (mirrors convert_to_raw; see convert_to_qcow2).
+                // Unreachable for dd today (dd never compresses), but the
+                // clamp is a no-op for cluster-aligned offsets and keeps
+                // the three read_chain_virtual_cluster callers uniform.
+                let read_off = read_start + virtual_offset + buf_filled;
+                let intra_cluster = read_off % input_cluster_size;
+                if intra_cluster != 0 {
+                    let to_cluster_end = input_cluster_size - intra_cluster;
+                    if to_cluster_end < piece {
+                        piece = to_cluster_end;
+                    }
+                }
 
                 // Reset bump allocator before ZSTD decompression
                 HEAP_POS.store(0, core::sync::atomic::Ordering::Relaxed);

@@ -839,6 +839,29 @@ master plan.
   half had been left uncommitted because instar could not match
   it). `test_info_safe` went 526/536 → 536/536.
 
+* **`dd` unaligned windows corrupted or failed structured output**
+  (found 2026-07-08 by PR #394's differential-fuzz CI run — issue
+  #396, `exit_code_divergence`, seed 2630842467 iteration 96; a
+  pre-existing develop bug, confirmed by reproducing against a
+  develop-built binary — the bench branch only exposed it by
+  changing the fuzzer's random draw sequence). A dd window whose
+  start is not a multiple of the input cluster size shifts every
+  guest read off cluster alignment, so each chunk straddles an
+  input-cluster boundary; `convert_to_qcow2` /
+  `convert_to_qcow2_compressed` fed such chunks to
+  `read_chain_virtual_cluster`, whose single-cluster contract then
+  (a) zero-filled a whole chunk when only its first byte fell in a
+  hole, (b) read a cluster's tail from the physically-adjacent
+  file cluster — silent wrong data whenever physical order differs
+  from virtual order, and (c) ran past EOF when the allocated
+  cluster was physically last (the CI failure). Fixed by clamping
+  each read at input-cluster boundaries in both loops — the exact
+  clamp `convert_to_raw` already carried. Regression tests:
+  `tests/test_dd.py::TestDdUnalignedClusterCrossing` (hole-first
+  and out-of-order-cluster inputs, `bs=1000 skip=1`, full parity
+  across all four structured formats); the seeded fuzz run now
+  passes 97/97.
+
 List any bugs encountered and fixed during development here. At
 the start of Phase 1, scan the GitHub issue tracker for any open
 performance/virtio/io_thread issues this work should resolve or be

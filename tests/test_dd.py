@@ -745,6 +745,119 @@ class TestDdStructuredWindow(InstarTestBase):
 
 
 # ---------------------------------------------------------------------------
+# Regression: unaligned windows crossing input-cluster boundaries (issue #396)
+# ---------------------------------------------------------------------------
+
+def _make_hole_then_data_qcow2(path: str) -> None:
+    """Create a 4 MiB qcow2 whose FIRST cluster is a hole.
+
+    Layout (64 KiB clusters):
+      vc0             hole (unallocated)
+      vc1  [64K,128K) bytes 0xCD (the only allocated cluster)
+      vc2+            holes
+    """
+    subprocess.run(
+        ['qemu-img', 'create', '-f', 'qcow2', path, '4M'],
+        capture_output=True,
+        check=True,
+    )
+    subprocess.run(
+        ['qemu-io', '-f', 'qcow2', '-c', 'write -P 0xCD 65536 65536', path],
+        capture_output=True,
+        check=True,
+    )
+
+
+def _make_out_of_order_qcow2(path: str) -> None:
+    """Create a 4 MiB qcow2 whose physical cluster order differs from
+    the virtual order.
+
+    Clusters are written vc1, vc0, vc63 -- so in the file, vc1's data
+    cluster physically precedes vc0's, and vc0's is physically followed
+    by vc63's. Any reader that fetches a virtual cluster's tail from the
+    physically-adjacent file bytes returns the wrong data here.
+    """
+    subprocess.run(
+        ['qemu-img', 'create', '-f', 'qcow2', path, '4M'],
+        capture_output=True,
+        check=True,
+    )
+    subprocess.run(
+        ['qemu-io', '-f', 'qcow2',
+         '-c', 'write -P 0x22 65536 65536',
+         '-c', 'write -P 0x11 0 65536',
+         '-c', 'write -P 0xFF 4128768 65536',
+         path],
+        capture_output=True,
+        check=True,
+    )
+
+
+class TestDdUnalignedClusterCrossing(InstarTestBase):
+    """Regression tests for issue #396 (differential-fuzz divergence).
+
+    A dd window whose start is not a multiple of the input cluster size
+    shifts every guest read off cluster alignment, so each read chunk
+    straddles an input-cluster boundary. The structured-output read loops
+    (convert_to_qcow2 / convert_to_qcow2_compressed) fed such straddling
+    chunks to read_chain_virtual_cluster, whose single-cluster contract
+    made it (a) zero-fill an entire chunk when only the chunk's FIRST
+    byte fell in a hole, (b) read a cluster's tail bytes from the
+    physically-adjacent file cluster (wrong data unless physical order
+    matches virtual order), and (c) run past EOF when the allocated
+    cluster was physically last (the fuzzer's exit-code divergence).
+    The fix clamps each read at input-cluster boundaries, mirroring the
+    clamp convert_to_raw already had.
+
+    Both tests use bs=1000 skip=1 (window start 1000, well off any
+    cluster or sector boundary) and assert full live parity -- exit
+    codes, virtual size, and byte-identical round-trip-to-raw -- against
+    qemu-img dd for every structured output format.
+    """
+
+    _FORMATS = {
+        'qcow2': '.qcow2',
+        'vmdk':  '.vmdk',
+        'vpc':   '.vpc',
+        'vhdx':  '.vhdx',
+    }
+
+    def _run_all_formats(self, src_path: str, label: str) -> None:
+        for fmt, suffix in self._FORMATS.items():
+            _assert_structured_dd_parity(
+                self,
+                src_path=src_path,
+                window_ops=['bs=1000', 'skip=1'],
+                out_fmt=fmt,
+                out_suffix=suffix,
+                label=f'{label} fmt={fmt}',
+            )
+
+    def test_unaligned_skip_hole_then_data(self):
+        """Hole-first input: chunks straddle hole->data boundaries and the
+        allocated cluster is physically last in the file (EOF case).
+
+        Before the fix: instar exited 1 ("convert operation failed") for
+        -O qcow2 while qemu-img dd exited 0 -- the fuzzer's
+        exit_code_divergence (seed 2630842467, iteration 96).
+        """
+        with tempfile.NamedTemporaryFile(suffix='.qcow2') as src:
+            _make_hole_then_data_qcow2(src.name)
+            self._run_all_formats(src.name, 'hole_then_data')
+
+    def test_unaligned_skip_out_of_order_clusters(self):
+        """Out-of-order input: physical cluster order != virtual order.
+
+        Before the fix: instar exited 0 for -O qcow2 but the output's
+        content silently differed from qemu's (cluster tails read from
+        the physically-adjacent file cluster).
+        """
+        with tempfile.NamedTemporaryFile(suffix='.qcow2') as src:
+            _make_out_of_order_qcow2(src.name)
+            self._run_all_formats(src.name, 'out_of_order')
+
+
+# ---------------------------------------------------------------------------
 # Phase-6a: CLI rejection matrix
 # ---------------------------------------------------------------------------
 
