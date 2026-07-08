@@ -1081,8 +1081,7 @@ class TestBenchWriteRefusals(BenchTestBase):
             r = subprocess.run(
                 ['qemu-img', 'create', '-f', 'qcow2',
                  '--object', 'secret,id=sec0,data=test-passphrase',
-                 '-o', 'encrypt.format=luks,encrypt.key-secret=sec0,'
-                       'encrypt.iter-time=10',
+                 '-o', 'encrypt.format=luks,encrypt.key-secret=sec0,encrypt.iter-time=10',
                  str(img), '16M'],
                 capture_output=True, text=True, timeout=30)
             self.assertEqual(r.returncode, 0, f'create luks failed: {r.stderr}')
