@@ -124,7 +124,8 @@ jobs:
               --exclude map-op \
               --exclude snapshot-op \
               --exclude amend-op \
-              --exclude bitmap-op
+              --exclude bitmap-op \
+              --exclude bench-op
 
       - name: Test config commands in container
         run: |
