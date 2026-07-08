@@ -815,6 +815,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`instar dd`/`convert -O vpc` declared a different virtual size
+  than `qemu-img` for windowed copies (issue #382).** The VHD size
+  rounding (`vhd::chs_rounded_size`) approximated qemu's CHS rounding
+  with one pass of ceiling divisions; qemu (`vpc.c
+  calculate_rounded_image_size`) instead searches upward from the
+  requested sector count for the first candidate whose floor-geometry
+  product covers the request. For a 69632-sector dd window qemu
+  declares 69700 sectors (CHS 820/5/17) while instar declared 69936 —
+  with a footer CHS (822/5/17) that could not even address its own
+  current_size. `compute_vhd_geometry` also carried a non-qemu
+  "medium-large" 255-sectors-per-track branch at `65535*3*17` sectors
+  (qemu switches at `65535*16*63`), diverging on every vpc output of
+  roughly 1.6 GiB and larger. Both are now exact mirrors of qemu
+  vpc.c, validated against `qemu-img` 10.0.8 across the branch
+  boundaries and swept for the fixed-point property that lets
+  `build_footer` recompute the identical CHS from current_size. The
+  `fuzz_chs_rounded_size` target now asserts exact geometry
+  reconstruction and idempotence instead of the old one-cylinder
+  tolerance that had been documenting the bug.
+
 - **`instar info`'s human output for flat VMDK extents diverged from
   `qemu-img` (commit `dad884e`).** For monolithicFlat /
   twoGbMaxExtentFlat images, the human formatter emitted a single

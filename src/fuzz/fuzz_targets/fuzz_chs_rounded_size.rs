@@ -2,8 +2,11 @@
 //! CHS round-up arithmetic `qemu-img dd -O vpc` uses to declare a
 //! VHD's virtual size. The highest-value new dd fuzz target.
 //!
-//! Decodes a single `u64` size and calls `chs_rounded_size`.
-//! Invariants asserted (libFuzzer's oracle is panic):
+//! Decodes a single `u64` size and calls `chs_rounded_size`, which
+//! mirrors qemu vpc.c's `calculate_rounded_image_size` (the upward
+//! search over floor `calculate_geometry` candidates — see the
+//! function's doc comment). Invariants asserted (libFuzzer's oracle is
+//! panic):
 //!
 //!   1. No panic / overflow (the function caps `total_sectors`, so
 //!      `cylinders * heads * spt * 512` cannot overflow).
@@ -11,43 +14,29 @@
 //!   3. `size > 0 ⇒ result >= size` (rounds UP to a CHS boundary)
 //!      EXCEPT above the CHS ceiling. VHD CHS geometry uses 16-bit
 //!      cylinders, so it caps at `65535 * 16 * 255` sectors =
-//!      `CHS_MAX_BYTES` (~127.5 GiB); both `chs_rounded_size` and
-//!      qemu's VPC backend clamp any larger request to that ceiling,
-//!      so for `size > CHS_MAX_BYTES` the result is `CHS_MAX_BYTES`
-//!      and is (correctly) SMALLER than the input. In that saturated
-//!      region we assert `result == CHS_MAX_BYTES` instead of
-//!      `result >= size`. (The phase-5 `chs_rounded_size_rounds_up`
-//!      unit test never reached this region — its largest input is
-//!      10 GiB — so this fuzz target is what surfaces the ceiling.)
+//!      `CHS_MAX_BYTES` (~127.5 GiB); qemu refuses larger requests,
+//!      instar clamps them to the ceiling, so for
+//!      `size > CHS_MAX_BYTES` the result is `CHS_MAX_BYTES` and is
+//!      (correctly) SMALLER than the input. In that saturated region
+//!      we assert `result == CHS_MAX_BYTES` instead of
+//!      `result >= size`.
 //!   4. `result` is a whole number of sectors (`result % 512 == 0`).
-//!   5. CHS self-consistency (floor form). Feeding `result` back
-//!      through `compute_vhd_geometry` yields a geometry whose product
-//!      `c * h * spt * 512` is `<= result` and within ONE cylinder
-//!      (`h * spt * 512`) of it. i.e. `result` is the geometry rounded
-//!      UP to a whole cylinder, and the two functions agree to within
-//!      one cylinder.
-//!
-//!      NOTE on why this is NOT the stricter exact-equality the
-//!      phase-5 `chs_rounded_size_is_chs_consistent` test asserts:
-//!      that unit test feeds a hand-picked allowlist of CHS-ALIGNED
-//!      inputs. The exact round-trip `c*h*spt*512 == result` is NOT a
-//!      universal property of `chs_rounded_size` — this fuzz target
-//!      surfaced two counter-examples that prove it:
-//!        * `size = 35_643_423` → `result = 35_807_232`, but
-//!          `compute_vhd_geometry` floors `cyl_times_heads / heads`
-//!          (4113 / 5 = 822, dropping a remainder of 3) giving
-//!          `822*5*17*512 = 35_773_440 != result` — in the spt=17
-//!          branch, not the spt=255 region.
-//!        * near the `65535*16*63`-sector boundary,
-//!          `compute_vhd_geometry` takes its max-geometry early return
-//!          `(65535,16,255)` whose product (the full ceiling) EXCEEDS
-//!          a `result` that `chs_rounded_size` produced in the spt=63
-//!          branch.
-//!      So exact equality would be a false positive; the floor +
-//!      one-cylinder bound is the faithful invariant. The
-//!      max-geometry early-return region (geom returns a fixed
-//!      `(65535,16,255)` independent of `result`) is excluded — there
-//!      `result` is not derived from that geometry.
+//!   5. CHS self-consistency. Below the max-geometry window the result
+//!      is a `calculate_geometry` fixed point, so feeding it back
+//!      through `compute_vhd_geometry` reconstructs it EXACTLY:
+//!      `c * h * spt * 512 == result`. (The old one-pass ceil
+//!      implementation violated exactness — e.g. `35_643_423` produced
+//!      a size its own recomputed footer CHS could not address, the
+//!      qemu divergence behind issue #382 — so this target's old form
+//!      asserted only a one-cylinder bound. The qemu-mirror rewrite
+//!      restores exactness.) Inside the max-geometry window — sector
+//!      counts above the largest sub-ceiling product `65534*16*255`,
+//!      where qemu keeps the exact sector-rounded request — we instead
+//!      assert the result is exactly the sector-rounded (and ceiling-
+//!      clamped) request.
+//!   6. Idempotence: `chs_rounded_size(result) == result` everywhere
+//!      (an already-rounded size never re-rounds), which is what lets
+//!      `build_footer` recompute the footer CHS from current_size.
 
 #![no_main]
 use libfuzzer_sys::fuzz_target;
@@ -61,6 +50,9 @@ fuzz_target!(|data: &[u8]| {
     // The CHS ceiling: 16-bit cylinders × 16 heads × 255 spt × 512.
     // chs_rounded_size clamps any larger request to this value.
     const CHS_MAX_BYTES: u64 = 65535 * 16 * 255 * 512;
+    // The largest geometry product below the ceiling; sector counts
+    // above it fall into the max-geometry window.
+    const WINDOW_START_SECTORS: u64 = 65534 * 16 * 255;
 
     let result = vhd::chs_rounded_size(size);
 
@@ -92,27 +84,30 @@ fuzz_target!(|data: &[u8]| {
         "chs_rounded_size({size}) = {result} is not a sector multiple"
     );
 
-    // Invariant 5: floor-form CHS self-consistency. Excludes the
-    // max-geometry early-return region of compute_vhd_geometry
-    // (total_sectors >= 65535*16*63), where it returns a fixed
-    // (65535,16,255) independent of `result` and so cannot be expected
-    // to reconstruct it.
-    const GEOM_MAX_EARLY_SECTORS: u64 = 65535 * 16 * 63;
-    if result / 512 < GEOM_MAX_EARLY_SECTORS {
+    // Invariant 5: exact CHS reconstruction below the max-geometry
+    // window; the exact sector-rounded request inside it.
+    if result / 512 > WINDOW_START_SECTORS {
+        let expected = size.div_ceil(512).min(65535 * 16 * 255) * 512;
+        assert_eq!(
+            result, expected,
+            "max-geometry window must keep the sector-rounded request: \
+             input={size}, result={result}, expected={expected}"
+        );
+    } else {
         let (c, h, spt) = vhd::compute_vhd_geometry(result);
         let reconstructed = c as u64 * h as u64 * spt as u64 * 512;
-        let cylinder = h as u64 * spt as u64 * 512;
-        assert!(
-            reconstructed <= result,
-            "geometry over-reconstructs input={size}: \
+        assert_eq!(
+            reconstructed, result,
+            "geometry round-trip failed for input={size}: \
              chs_rounded_size={result}, c={c} h={h} spt={spt}, \
-             c*h*spt*512={reconstructed} > {result}"
-        );
-        assert!(
-            result - reconstructed < cylinder,
-            "geometry round-trip off by >=1 cylinder for input={size}: \
-             chs_rounded_size={result}, c={c} h={h} spt={spt}, \
-             c*h*spt*512={reconstructed}, cylinder={cylinder}"
+             c*h*spt*512={reconstructed}"
         );
     }
+
+    // Invariant 6: idempotence.
+    assert_eq!(
+        vhd::chs_rounded_size(result),
+        result,
+        "chs_rounded_size must be idempotent on its own output ({size} -> {result})"
+    );
 });
