@@ -847,6 +847,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `compare`-identical; only the dead bytes differ. See the updated
   "Freed-cluster bytes" quirk in docs/quirks.md.
 
+- **Differential fuzzer: bench `-w` recipes steered away from small
+  qcow2 clusters (issues #397–#401).** bench's v1 write path
+  allocates only from the refblocks populated at startup — never
+  allocating new refblocks or growing the refcount table — and one
+  16-bit refblock covers just `cluster_size²/2` bytes of host file:
+  128 KiB at 512-byte clusters, outrun by almost any allocating
+  schedule. The picker's new `qcow2-write-refblock-coverage`
+  steer-around pins `-w` qcow2 recipes to cluster sizes of at least
+  64 KiB (one refblock then covers 2 GiB+); the limitation is now a
+  registered `KNOWN_BENCH_DIVERGENCES` entry with a live regression
+  test and a docs/bench.md known-divergence bullet.
+
 - **`instar info`'s human output for flat VMDK extents diverged from
   `qemu-img` (commit `dad884e`).** For monolithicFlat /
   twoGbMaxExtentFlat images, the human formatter emitted a single

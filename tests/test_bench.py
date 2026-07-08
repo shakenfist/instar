@@ -64,7 +64,7 @@ COMPLETION_RE = re.compile(r'^Run completed in \d+\.\d{3} seconds\.$')
 # (test_map.py:168): `dict[key, (scope, reason)]`. A cross-validation
 # failure NOT registered here is a real regression to investigate, not
 # to silence; `TestBenchDivergenceRegression` asserts each testable
-# entry (2-7, 9-11) still diverges, so an accidental fix surfaces as a
+# entry (2-7, 9-12) still diverges, so an accidental fix surfaces as a
 # registry-cleanup prompt instead of a silent pass.
 #
 # `scope` is a short tag for where the divergence is observable:
@@ -154,6 +154,23 @@ KNOWN_BENCH_DIVERGENCES = {
         'as raw; qemu-img benches it happily. This is why every raw '
         'fixture in this suite carries the 55AA MBR signature '
         '(`make_raw_mbr`).'
+    ),
+    'qcow2-write-refblock-coverage': (
+        'write',
+        "qcow2 -w allocating writes claim clusters only from the "
+        "image's already-populated refblocks; bench never allocates "
+        'new refblocks or grows the refcount table (the same v1 '
+        'posture as snapshot create -- docs/quirks.md, "Create may '
+        'exhaust the image\'s existing refblocks"). A schedule whose '
+        'allocations outrun the staged coverage is refused (`bench: '
+        'image too large for in-place bench write`) while qemu-img '
+        'grows the refcount structures and succeeds. Routine at '
+        'small cluster sizes, where one 16-bit refblock covers only '
+        'cluster_size^2/2 bytes of host file (128 KiB at 512-byte '
+        'clusters, 8 MiB at 4 KiB) -- differential-fuzz issues '
+        "#397-#401. The fuzzer's picker steers -w qcow2 recipes to "
+        'cluster sizes of at least 64 KiB (one refblock then covers '
+        '2 GiB+, unreachable on its <= 64 MiB images).'
     ),
 }
 
@@ -1255,8 +1272,8 @@ class TestBenchJson(BenchTestBase):
 
 class TestBenchDivergenceRegression(BenchTestBase):
     """Assert each testable `KNOWN_BENCH_DIVERGENCES` entry still
-    diverges (entries 2-7, 9-11 per Mission §2; 1 and 8 have no live
-    regression test -- see their registry entries).
+    diverges (entries 2-7, 9-12; 1 and 8 have no live regression
+    test -- see their registry entries).
 
     Every test opens with `self.assertIn(key, KNOWN_BENCH_DIVERGENCES)`
     (the bitmap/map idiom) so the registry and the tests stay linked:
@@ -1454,3 +1471,34 @@ class TestBenchDivergenceRegression(BenchTestBase):
                 f'qemu-img unexpectedly refused the headerless raw file '
                 f'(the divergence premise no longer holds): '
                 f'stderr={q_err!r}')
+
+    def test_qcow2_write_refblock_coverage_still_diverges(self):
+        """Issue #397's vector: a 4M / 512-byte-cluster qcow2 whose
+        front 2 MiB is prepopulated, with a -w schedule that allocates
+        past the populated refblocks' coverage. instar refuses; qemu-img
+        grows the refcount structures and succeeds.
+        """
+        self.assertIn('qcow2-write-refblock-coverage',
+                      KNOWN_BENCH_DIVERGENCES)
+        self._require_kvm()
+        argv = ['-c', '21', '-d', '58', '-s', '65536', '-S', '0',
+                '--pattern', '197', '-o', '1269120', '-w',
+                '--flush-interval', '64', '-f', 'qcow2']
+        with tempfile.TemporaryDirectory() as td:
+            img = Path(td) / 'small-clusters.qcow2'
+            self.make_qcow2(img, size='4M', cluster_size=512)
+            self._qemu_io(img, 'write -P 0xcc 0 2M')
+
+            i_out, i_err, i_rc = self.run_instar_bench(*argv, str(img))
+            self.assertEqual(i_rc, 1, f'stdout={i_out!r} stderr={i_err!r}')
+            self.assertIn('image too large for in-place bench write',
+                          i_err)
+
+            self.make_qcow2(img, size='4M', cluster_size=512)
+            self._qemu_io(img, 'write -P 0xcc 0 2M')
+            q_out, q_err, q_rc = self.run_qemu_bench(*argv, str(img))
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img unexpectedly refused the allocating small-'
+                f'cluster write schedule (the divergence premise no '
+                f'longer holds): stderr={q_err!r}')

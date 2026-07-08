@@ -392,6 +392,18 @@ registered there is treated as a real regression.
   other recognisable signature) is refused as an unsupported format
   — instar's security posture requires a recognisable signature
   before a file is treated as raw; `qemu-img` benches it happily.
+- **`qcow2-write-refblock-coverage`.** A `-w` schedule whose
+  allocations outrun the image's already-populated refblocks is
+  refused (`bench: image too large for in-place bench write`);
+  `qemu-img` allocates new refblocks / grows the refcount table and
+  succeeds. bench's v1 allocator claims clusters only from the
+  refblocks staged at startup (see "Write tests" above), which is
+  routine to outrun at small cluster sizes — one 16-bit refblock
+  covers cluster_size²/2 bytes of host file, only 128 KiB at
+  512-byte clusters. Surfaced as differential-fuzz issues
+  #397-#401; the fuzzer's picker steers `-w` qcow2 recipes to
+  cluster sizes of at least 64 KiB (one refblock then covers
+  2 GiB+, unreachable on its ≤ 64 MiB images).
 
 ## Examples
 
