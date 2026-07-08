@@ -49,7 +49,7 @@ DATA_PATTERNS = ['zeros', 'random', 'sparse', 'mbr']
 # Operations that the fuzzer can chain together
 OPERATIONS = ['info', 'check', 'convert', 'convert_compressed', 'measure',
               'create', 'resize', 'amend', 'rebase', 'commit', 'map',
-              'snapshot', 'repair', 'dd', 'bitmap']
+              'snapshot', 'repair', 'dd', 'bitmap', 'bench']
 
 # Known divergence categories to skip (unsafe quirks)
 # See docs/quirks.md for rationale
@@ -2189,6 +2189,361 @@ def op_bitmap(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
     return None
 
 
+# ---------------------------------------------------------------------------
+# bench (differential over the deterministic CLI surface — PLAN-bench phase 7)
+# ---------------------------------------------------------------------------
+
+# Small image sizes (bytes) — bench launches a guest VMM per invocation, so
+# keep the schedules cheap. All <= 64 MiB per the phase-4 validated envelope.
+_BENCH_IMAGE_SIZES = [1 << 20, 4 << 20, 16 << 20, 64 << 20]
+
+# BENCH_MAX_BUFSIZE is 2 MiB; exactly 2 MiB is still accepted (the cap is
+# "*above* 2 MiB"), so 2097152 is the largest legal buffer size.
+_BENCH_MAX_BUFSIZE = 2 << 20
+
+
+def _bench_pick_bufsize(rng, image_size):
+    """Pick a -s buffer size biased to <= 64 KiB, with occasional
+    cluster-straddlers and rare large buffers, always leaving room in the
+    image (bufsize <= image_size // 4) so a valid non-wrapping schedule
+    exists."""
+    cap = image_size // 4
+    smalls = [b for b in (512, 1024, 4096, 8192, 16384, 65536) if b <= cap]
+    # Straddlers: non-power-of-two / off-by-one values that cross cluster
+    # boundaries so a request is split into multiple transfers.
+    strad = [b for b in (4095, 4097, 12288, 65535, 65537, 131072)
+             if b <= cap]
+    larges = [b for b in (262144, 524288, 1048576, _BENCH_MAX_BUFSIZE)
+              if b <= cap]
+    smalls = smalls or [512]
+    r = rng.random()
+    if r < 0.70 or (not strad and not larges):
+        pool = smalls
+    elif r < 0.88 and strad:
+        pool = strad
+    elif larges:
+        pool = larges
+    else:
+        pool = smalls
+    return rng.choice(pool)
+
+
+def _bench_pick_step(rng, bufsize):
+    """Pick a -S step size: 0 (means "use bufsize"), a power-of-two near
+    bufsize, or an unaligned odd value. Returned raw (0 preserved)."""
+    r = rng.random()
+    if r < 0.35:
+        return 0
+    if r < 0.68:
+        return bufsize
+    if r < 0.84:
+        return rng.choice([512, 4096, 65536, 131072, 262144])
+    return rng.choice([513, 777, 1000, 4097, 65537])
+
+
+def _bench_invocation_args(fmt, count, depth, bufsize, step, pattern,
+                           offset, write, flush_interval, no_drain):
+    """Assemble a full bench arg vector (WITHOUT the filename). -f is always
+    passed explicitly (suppresses qemu's raw-write auto-detect warning). All
+    numeric knobs are pinned so the run is fully deterministic on both
+    tools."""
+    args = [
+        '-f', fmt,
+        '-c', str(count),
+        '-d', str(depth),
+        '-s', str(bufsize),
+        '-S', str(step),
+        '--pattern', str(pattern),
+        '-o', str(offset),
+    ]
+    if write:
+        args.append('-w')
+        if flush_interval is not None:
+            args += ['--flush-interval', str(flush_interval)]
+            if no_drain and flush_interval != 0:
+                args.append('--no-drain')
+    return args
+
+
+def _bench_option_picker(rng):
+    """Pick a parity-respecting bench plan: an image recipe plus one or more
+    bench invocations, all inside the phase-4 validated envelope and steered
+    clear of every KNOWN_BENCH_DIVERGENCES trigger so any surfaced
+    divergence is real.
+
+    Returns ``{recipe, invocations}`` where:
+      * ``recipe`` — ``{fmt, size, cluster_size, prepopulate}``. ``fmt`` is
+        weighted toward qcow2/raw (they exercise -w). qcow2 is created with
+        ``compat=1.1,refcount_bits=16`` and a random ``cluster_size`` (no
+        snapshots/compression); raw is built WITH the 55AA MBR signature
+        (``secure-raw-detection`` steer-around); vmdk/vpc are plain.
+        ``prepopulate`` (qcow2 only) pre-fills the front of the image so -w
+        exercises both overwrite-in-place and allocating clusters.
+      * ``invocations`` — a list of arg vectors (no filename); op_bench
+        rebuilds a fresh byte-identical image pair for each.
+
+    Steer-arounds (each maps to a KNOWN_BENCH_DIVERGENCES entry):
+      * ``wrap-rule-10-0-8``: the whole schedule is kept linear and in
+        range — ``offset + (count-1)*eff_step + bufsize < image_size`` — so
+        NEITHER qemu 10.0.8's ``% image_size`` rule nor instar's
+        ``% (image_size - bufsize)`` rule ever wraps; both tools submit the
+        identical offset sequence and no request overruns EOF.
+      * ``secure-raw-detection``: raw fixtures carry the MBR signature.
+      * ``write-formats-limited``: -w only for qcow2/raw.
+      * ``bufsize-cap-2mib``: -s never exceeds 2 MiB.
+      * ``cache-modes-refused`` / ``aio-refused`` / ``native-aio-refused`` /
+        ``image-opts-refused``: never emits -t/-i/-n/--image-opts (nor
+        -U/-q).
+      * ``help-hint-names-instar`` / ``zero-byte-early-failure``: exactly one
+        (non-empty) filename per invocation.
+    """
+    fmt = rng.choices(
+        ['qcow2', 'raw', 'vmdk', 'vpc'], weights=[4, 4, 1, 1], k=1)[0]
+    image_size = rng.choice(_BENCH_IMAGE_SIZES)
+
+    recipe = {
+        'fmt': fmt,
+        'size': image_size,
+        'cluster_size': (rng.choice(QCOW2_CLUSTER_SIZES)
+                         if fmt == 'qcow2' else None),
+        'prepopulate': (fmt == 'qcow2' and rng.random() < 0.5),
+    }
+
+    invocations = []
+    for _ in range(rng.randint(1, 3)):
+        bufsize = _bench_pick_bufsize(rng, image_size)
+        step = _bench_pick_step(rng, bufsize)
+        eff_step = step if step != 0 else bufsize
+        depth = rng.randint(1, 64)
+        pattern = rng.randint(0, 255)
+
+        # Largest legal starting offset for the FINAL request so its buffer
+        # ends strictly before EOF: keeps the whole schedule linear (see the
+        # wrap-rule steer-around above). eff_step >= 1 always.
+        max_last_offset = image_size - bufsize - 1
+        max_increments = max_last_offset // eff_step
+        count = min(rng.randint(1, 256), max_increments + 1)
+        count = max(1, count)
+
+        offset_budget = max_last_offset - (count - 1) * eff_step
+        if offset_budget <= 0 or rng.random() < 0.5:
+            offset = 0
+        else:
+            offset = rng.randint(0, offset_budget)
+
+        write = fmt in ('qcow2', 'raw') and rng.random() < 0.5
+        flush_interval = None
+        no_drain = False
+        if write:
+            fc = rng.random()
+            if fc < 0.40:
+                flush_interval = None
+            elif fc < 0.60:
+                flush_interval = 0
+            else:
+                flush_interval = rng.randint(depth, max(depth, 4 * count))
+            if flush_interval:
+                no_drain = rng.random() < 0.5
+
+        invocations.append(_bench_invocation_args(
+            fmt, count, depth, bufsize, step, pattern, offset,
+            write, flush_interval, no_drain))
+
+    return {'recipe': recipe, 'invocations': invocations}
+
+
+def _bench_core_message(text, tool):
+    """Reduce a tool's stderr to its comparable core message: the first
+    non-empty line, with instar's ``Error: "..."`` wrapper or qemu's
+    ``qemu-img: `` prefix stripped."""
+    line = ''
+    for candidate in (text or '').splitlines():
+        if candidate.strip():
+            line = candidate.strip()
+            break
+    if tool == 'instar':
+        if line.startswith('Error: "') and line.endswith('"'):
+            line = line[len('Error: "'):-1]
+        elif line.startswith('Error: '):
+            line = line[len('Error: '):]
+    else:  # qemu
+        if line.startswith('qemu-img: '):
+            line = line[len('qemu-img: '):]
+    return line
+
+
+def _build_bench_image(path, recipe, timeout):
+    """Build one bench fixture per the recipe. Returns True on success,
+    False on any qemu-img/qemu-io failure (a seed problem — both tools use
+    the same fixture, so it is never a divergence)."""
+    fmt = recipe['fmt']
+    size = str(recipe['size'])
+    if fmt == 'qcow2':
+        opts = (f"cluster_size={recipe['cluster_size']}"
+                ',compat=1.1,refcount_bits=16')
+        _, _, rc = run_qemu_img(
+            ['create'], ['-f', 'qcow2', '-o', opts, str(path), size],
+            timeout=timeout)
+        if rc != 0:
+            return False
+        if recipe['prepopulate']:
+            fill = min(recipe['size'] // 2, 2 << 20)
+            try:
+                r = subprocess.run(
+                    ['qemu-io', '-f', 'qcow2',
+                     '-c', f'write -P 0xcc 0 {fill}', str(path)],
+                    capture_output=True, text=True, timeout=timeout)
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                return False
+            if r.returncode != 0:
+                return False
+        return True
+    if fmt == 'raw':
+        _, _, rc = run_qemu_img(
+            ['create'], ['-f', 'raw', str(path), size], timeout=timeout)
+        if rc != 0:
+            return False
+        # instar's secure format detection refuses headerless raw files, so
+        # every benched raw fixture carries the 55AA MBR signature (mirrors
+        # tests/test_bench.py's make_raw_mbr — secure-raw-detection).
+        try:
+            r = subprocess.run(
+                ['qemu-io', '-f', 'raw',
+                 '-c', 'write -P 0x55 510 1',
+                 '-c', 'write -P 0xaa 511 1', str(path)],
+                capture_output=True, text=True, timeout=timeout)
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return False
+        return r.returncode == 0
+    if fmt == 'vmdk':
+        _, _, rc = run_qemu_img(
+            ['create'], ['-f', 'vmdk', '-o', 'subformat=monolithicSparse',
+                         str(path), size], timeout=timeout)
+        return rc == 0
+    # vpc
+    _, _, rc = run_qemu_img(
+        ['create'], ['-f', 'vpc', str(path), size], timeout=timeout)
+    return rc == 0
+
+
+def op_bench(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
+    """Differential ``bench`` over the deterministic CLI surface (never
+    durations — PLAN-bench OQ13).
+
+    Self-built images like op_bitmap: instar_copy / qemu_copy / fmt are part
+    of the standard op_* signature but unused. bench launches a guest VMM
+    needing /dev/kvm (the workflow passes --device /dev/kvm, as for
+    op_bitmap). Per invocation: build the recipe image, fork two
+    byte-identical copies, run ``instar bench`` and ``qemu-img bench`` with
+    identical argv, then apply the oracle layers:
+
+      a. exit-code agreement (compare_exit_codes; either-side timeout ->
+         inconclusive).
+      b. both 0 -> first stdout line (the header) byte-equal; both nonzero
+         -> core stderr messages contain each other.
+      c. -w on shared success: raw -> sha256 equality; qcow2 -> qemu-img
+         compare (identical virtual content) + qemu-img check structural
+         cleanliness on the instar copy.
+
+    Returns a typed divergence dict or None.
+    """
+    plan = _bench_option_picker(rng)
+    recipe = plan['recipe']
+    invocations = plan['invocations']
+
+    iter_dir = instar_copy.parent
+    ext = recipe['fmt']
+    base = iter_dir / f'bench_base.{ext}'
+    inst_path = iter_dir / f'bench_instar.{ext}'
+    qemu_path = iter_dir / f'bench_qemu.{ext}'
+
+    for inv in invocations:
+        # Fresh byte-identical pair per invocation (writes mutate the image).
+        if not _build_bench_image(base, recipe, timeout):
+            return None
+        shutil.copy2(base, inst_path)
+        shutil.copy2(base, qemu_path)
+
+        i_out, i_err, i_rc = run_instar(
+            instar_bin, ['bench'], inv + [str(inst_path)], timeout=timeout)
+        q_out, q_err, q_rc = run_qemu_img(
+            ['bench'], inv + [str(qemu_path)], timeout=timeout)
+
+        context = {
+            'recipe': recipe,
+            'argv': inv,
+            'instar_rc': i_rc, 'qemu_rc': q_rc,
+            'instar_stdout': i_out[:500], 'qemu_stdout': q_out[:500],
+            'instar_stderr': i_err[:500], 'qemu_stderr': q_err[:500],
+        }
+
+        # (a) exit-code agreement (also reclassifies either-side timeout).
+        div = compare_exit_codes(i_rc, q_rc, 'bench', context)
+        if div:
+            return div
+
+        if i_rc == 0:
+            # (b) both succeeded: the header line must be byte-identical.
+            i_header = i_out.split('\n', 1)[0] if i_out else ''
+            q_header = q_out.split('\n', 1)[0] if q_out else ''
+            if i_header != q_header:
+                return {
+                    'type': 'bench_header_divergence',
+                    'operation': 'bench',
+                    'recipe': recipe, 'argv': inv,
+                    'instar_header': i_header, 'qemu_header': q_header,
+                    'instar_stdout': i_out[:500], 'qemu_stdout': q_out[:500],
+                }
+
+            # (c) write oracle on shared success.
+            if '-w' in inv:
+                if recipe['fmt'] == 'raw':
+                    if not files_match(inst_path, qemu_path):
+                        return {
+                            'type': 'bench_write_divergence',
+                            'operation': 'bench',
+                            'recipe': recipe, 'argv': inv,
+                            'reason': 'raw images differ byte-for-byte '
+                                      'after identical write bench',
+                        }
+                elif recipe['fmt'] == 'qcow2':
+                    _, cmp_err, cmp_rc = run_qemu_img(
+                        ['compare'], [str(inst_path), str(qemu_path)],
+                        timeout=timeout)
+                    if cmp_rc != 0:
+                        return {
+                            'type': 'bench_write_divergence',
+                            'operation': 'bench',
+                            'recipe': recipe, 'argv': inv,
+                            'compare_rc': cmp_rc,
+                            'compare_stderr': cmp_err[:500],
+                        }
+                    metrics = _qemu_check_metrics(inst_path, timeout)
+                    if not _is_clean(metrics):
+                        return {
+                            'type': 'bench_check_divergence',
+                            'operation': 'bench',
+                            'recipe': recipe, 'argv': inv,
+                            'instar_metrics': metrics,
+                        }
+        else:
+            # (b) both failed: the core validation messages must agree
+            # (containment either direction absorbs the instar/qemu
+            # prefix-wording differences).
+            i_msg = _bench_core_message(i_err, 'instar')
+            q_msg = _bench_core_message(q_err, 'qemu')
+            if not (i_msg and q_msg and (i_msg in q_msg or q_msg in i_msg)):
+                return {
+                    'type': 'bench_validation_divergence',
+                    'operation': 'bench',
+                    'recipe': recipe, 'argv': inv,
+                    'instar_message': i_msg, 'qemu_message': q_msg,
+                    'instar_stderr': i_err[:500], 'qemu_stderr': q_err[:500],
+                }
+
+    return None
+
+
 def _rebase_option_picker(rng):
     """Pick (overlay_size, new_backing_name, new_backing_size,
     rebase_flags, extra_create_options).
@@ -3829,6 +4184,11 @@ def run_iteration(instar_bin, workdir, rng, iteration, timeout,
                 )
             elif op == 'bitmap':
                 div = op_bitmap(
+                    instar_bin, instar_copy, qemu_copy, fmt,
+                    timeout, rng,
+                )
+            elif op == 'bench':
+                div = op_bench(
                     instar_bin, instar_copy, qemu_copy, fmt,
                     timeout, rng,
                 )

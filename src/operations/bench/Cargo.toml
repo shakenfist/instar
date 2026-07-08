@@ -1,0 +1,34 @@
+[package]
+name = "bench-op"
+version = "0.2.0"
+edition = "2021"
+description = "Bench operation: measure guest-side read/write throughput"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+[dependencies]
+shared = { path = "../../shared" }
+bench = { path = "../../crates/bench" }
+# Mirror convert's qcow2 feature list: the chain reader shared by both
+# ops (`read_chain_virtual_range` / `read_chain_virtual_cluster`)
+# dispatches on the device format and needs the decompression /
+# vmdk / vhd / vhdx arms compiled in. The vmdk/vhd/vhdx *crates* are
+# pulled in transitively by these qcow2 features (vmdk-decompress =>
+# vmdk-input => vmdk, etc.), so bench does not depend on them directly.
+qcow2 = { path = "../../crates/qcow2", features = [
+    "decompress", "decompress-zstd", "compress", "aes-decrypt",
+    "luks-decrypt", "vmdk-decompress", "vhd-input", "vhdx-input",
+] }
+# The qcow2 allocating-write path (phase 5b) reuses snapshot's pure
+# refblock allocator + refcount accessors verbatim (the same primitives
+# bitmap/commit compose), so no new allocation math lives in bench.
+snapshot = { path = "../../crates/snapshot" }
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true

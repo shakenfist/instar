@@ -639,6 +639,33 @@ pub fn send_bitmap_result(result: &shared::BitmapResult) {
     send_message(&msg);
 }
 
+/// Send the bench timing-bracket start marker.
+///
+/// No arguments — the message is deliberately empty; the host
+/// timestamps its arrival to open the timing bracket. Emitted once,
+/// immediately before the first request (see
+/// [`shared::CallTable::send_bench_start`] for the timing contract).
+pub fn send_bench_start() {
+    let msg = guest_protocol::bench_start_message();
+    send_message(&msg);
+}
+
+/// Send a bench result message.
+///
+/// Mirrors [`send_bitmap_result`]: numeric-passthrough (the host
+/// renders any human-readable summary from these codes). The core
+/// binary is near its 72 KiB ceiling, so no string/lookup tables
+/// live here.
+pub fn send_bench_result(result: &shared::BenchResult) {
+    let msg = guest_protocol::bench_result_message(
+        result.error,
+        result.requests_completed,
+        result.flushes_issued,
+        result.error_detail,
+    );
+    send_message(&msg);
+}
+
 /// Send a single map extent message.
 ///
 /// Called once per coalesced extent during the map operation,

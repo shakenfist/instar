@@ -98,6 +98,7 @@ if [ -d "$PROJECT_ROOT/src" ]; then
             --exclude snapshot-op \
             --exclude amend-op \
             --exclude bitmap-op \
+            --exclude bench-op \
             -- -D warnings || FAILED=1
     else
         run_in_docker "src" cargo clippy --workspace \
@@ -116,6 +117,7 @@ if [ -d "$PROJECT_ROOT/src" ]; then
             --exclude snapshot-op \
             --exclude amend-op \
             --exclude bitmap-op \
+            --exclude bench-op \
             -- -D warnings || FAILED=1
     fi
 

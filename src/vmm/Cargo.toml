@@ -31,6 +31,7 @@ shared = { path = "../shared" }
 vmdk = { path = "../crates/vmdk" }
 qcow2 = { path = "../crates/qcow2" }
 dd = { path = "../crates/dd" }
+bench = { path = "../crates/bench" }
 vhd = { path = "../crates/vhd" }
 vhdx = { path = "../crates/vhdx" }
 toml = "1.0"

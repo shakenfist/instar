@@ -28,15 +28,15 @@ Initial target formats:
 **Initial implementation** - The `info` prototype has been promoted to the main
 instar implementation in `src/`. Operations include `info`, `copy`, `check`,
 `compare`, `convert`, `dd`, `measure`, `create`, `resize`, `rebase`, `commit`,
-`map`, `snapshot`, `amend`, and `bitmap`. Prototypes remain available for
-reference.
+`map`, `snapshot`, `amend`, `bitmap`, and `bench`. Prototypes remain available
+for reference.
 
 See [docs/measure.md](docs/measure.md), [docs/create.md](docs/create.md),
 [docs/resize.md](docs/resize.md), [docs/rebase.md](docs/rebase.md),
 [docs/commit.md](docs/commit.md), [docs/map.md](docs/map.md),
-[docs/snapshot.md](docs/snapshot.md),
-[docs/amend.md](docs/amend.md), and
-[docs/bitmap.md](docs/bitmap.md) for the per-subcommand user guides.
+[docs/snapshot.md](docs/snapshot.md), [docs/amend.md](docs/amend.md),
+[docs/bitmap.md](docs/bitmap.md), and
+[docs/bench.md](docs/bench.md) for the per-subcommand user guides.
 
 ## Installation
 
@@ -487,6 +487,23 @@ dirty bitmaps** in place — the sandboxed equivalent of `qemu-img bitmap`.
 Actions are applied in command-line order and the tool is silent on success.
 qcow2 v3-only. See [docs/bitmap.md](docs/bitmap.md) for the full reference.
 
+### I/O Benchmarking (bench)
+
+```bash
+# Default read benchmark: 75000 requests, 4 KiB each, against a qcow2 image
+instar bench -f qcow2 disk.qcow2
+
+# A write benchmark modelled on Ceph's cli_migration.sh invocation
+instar bench -w -c 65536 -d 16 --pattern 65 -s 4096 -f qcow2 disk.qcow2
+```
+
+Issues a scripted sequence of read or write requests against a disk image
+and reports how long they took — the sandboxed equivalent of `qemu-img
+bench`. **Read [docs/bench.md](docs/bench.md) before trusting a number**:
+`instar bench` times its own end-to-end sandboxed I/O path, not qemu's
+block layer over the page cache, so the two tools' absolute numbers are
+not directly comparable to each other.
+
 ### Version Compatibility
 
 Different qemu-img versions produce slightly different output formats:
@@ -718,7 +735,7 @@ instar/
 │   │   ├── luks/   # LUKS header parsing, KDF, AFsplitter, decryption
 │   │   └── ...     # Per-operation planner crates (measure, create,
 │   │               # resize, rebase, commit, snapshot)
-│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, measure, create, resize, rebase, commit, map, snapshot, amend, dd, bitmap)
+│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, measure, create, resize, rebase, commit, map, snapshot, amend, dd, bitmap, bench)
 │   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates
 │   └── guest-protocol/ # Protocol Buffers messaging for guests
@@ -915,7 +932,7 @@ cd src/fuzz
 cargo fuzz run fuzz_qcow2_header -- -max_total_time=60
 ```
 
-27 fuzz targets cover all parser crates (QCOW2, VMDK, VHD, VHDX, RAW,
+30 fuzz targets cover all parser crates (QCOW2, VMDK, VHD, VHDX, RAW,
 LUKS) including header parsing, L1/L2 lookup, refcount traversal, and
 decompression, plus the create / resize / rebase / commit planners,
 the qcow2 check-repair planners (`fuzz_check_repair`), the map extent

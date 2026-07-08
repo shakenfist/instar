@@ -2,11 +2,11 @@
 //!
 //! This VMM loads two separate binaries:
 //! - Core binary (0x10000): Device initialization, call table setup
-//! - Operation binary (0x22000): Specific operation (copy, info, etc.)
+//! - Operation binary (0x30000): Specific operation (copy, info, etc.)
 //!
 //! The core initializes virtio-block devices and sets up a call table at
-//! 0x18000 with function pointers for I/O operations. The operation binary
-//! reads this call table to perform its work.
+//! CALL_TABLE_ADDR (0xF0000) with function pointers for I/O operations.
+//! The operation binary reads this call table to perform its work.
 //!
 //! This architecture reduces attack surface by only loading the operation
 //! needed for the current task.
@@ -33,7 +33,9 @@ mod virtio;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use bench::{BenchParamError, BenchParams};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use dd::compute_dd_window;
 use guest_protocol::{
@@ -369,7 +371,7 @@ const MMIO_SIZE: u64 = 0x1000; // 4KB per device
 
 // Virtqueue memory regions (inside guest memory)
 // Each device gets 64KB for virtqueue structures
-const VQ_BASE_START: u64 = 0x100000; // 1MB
+const VQ_BASE_START: u64 = shared::VQ_BASE_START as u64; // 1MB
 const VQ_SIZE_PER_DEVICE: u64 = 0x10000; // 64KB per device
 
 // Maximum number of devices in a backing chain (matches config default)
@@ -467,16 +469,27 @@ fn parse_memory_size(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
         .ok_or_else(|| format!("memory size overflow: '{s}'").into())
 }
 
-/// Parse a qemu-img size string with the full suffix set:
-/// `b`=512, `k`/`K`=KiB, `M`/`m`=MiB, `G`/`g`=GiB, `T`/`t`=TiB,
-/// `P`/`p`=PiB, `E`/`e`=EiB.  Used by `instar resize` for the
-/// `[+-]SIZE` argument.  Strict superset of `parse_memory_size`
-/// — kept as a sibling rather than replacing it to avoid
-/// disturbing the create/measure call sites.
-fn parse_qemu_img_size(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
+/// Why a qemu-img size string failed to parse. `bench`'s message
+/// contract needs the distinction: a syntax error (`Invalid`) gets
+/// qemu's value-echoing `Invalid <name> specified: '<v>'.` form,
+/// while a multiply-overflow (`Overflow`) is a *number* out of
+/// range and gets the `Must be between` form — matching qemu's
+/// cvtnum, whose EINVAL and ERANGE outcomes produce those two
+/// different messages (1e capture Supplement 2).
+enum QemuImgSizeError {
+    /// The value is not a number (empty, non-numeric, bad suffix).
+    Invalid,
+    /// The numeric part parsed but the suffix multiply overflowed
+    /// `u64` — a number, just unrepresentably large.
+    Overflow,
+}
+
+/// Core of [`parse_qemu_img_size`], returning the structured
+/// failure reason instead of a display string.
+fn parse_qemu_img_size_classified(s: &str) -> Result<u64, QemuImgSizeError> {
     let s = s.trim();
     if s.is_empty() {
-        return Err("empty size string".into());
+        return Err(QemuImgSizeError::Invalid);
     }
     let (num_str, multiplier) = match s.as_bytes().last() {
         Some(b'E' | b'e') => (&s[..s.len() - 1], 1u64 << 60),
@@ -491,9 +504,26 @@ fn parse_qemu_img_size(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
     let num: u64 = num_str
         .trim()
         .parse()
-        .map_err(|_| format!("invalid size: '{s}'"))?;
+        .map_err(|_| QemuImgSizeError::Invalid)?;
     num.checked_mul(multiplier)
-        .ok_or_else(|| format!("size overflow: '{s}'").into())
+        .ok_or(QemuImgSizeError::Overflow)
+}
+
+/// Parse a qemu-img size string with the full suffix set:
+/// `b`=512, `k`/`K`=KiB, `M`/`m`=MiB, `G`/`g`=GiB, `T`/`t`=TiB,
+/// `P`/`p`=PiB, `E`/`e`=EiB.  Used by `instar resize` for the
+/// `[+-]SIZE` argument.  Strict superset of `parse_memory_size`
+/// — kept as a sibling rather than replacing it to avoid
+/// disturbing the create/measure call sites.
+fn parse_qemu_img_size(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err("empty size string".into());
+    }
+    parse_qemu_img_size_classified(trimmed).map_err(|e| match e {
+        QemuImgSizeError::Invalid => format!("invalid size: '{trimmed}'").into(),
+        QemuImgSizeError::Overflow => format!("size overflow: '{trimmed}'").into(),
+    })
 }
 
 /// Parse `[+-]SIZE[bkKMGTPE]`.  Returns the parsed `ParsedResizeSize`
@@ -939,6 +969,16 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
                 b.target_format, b.error, b.action, b.actions_applied, b.resulting_nb_bitmaps
             )
         }
+        Some(guest_::GuestMessage_::Payload::BenchStart(_)) => {
+            "bench_start (timing bracket opens)".to_string()
+        }
+        Some(guest_::GuestMessage_::Payload::BenchResult(r)) => {
+            format!(
+                "bench_result error={} requests_completed={} \
+                flushes_issued={} error_detail={}",
+                r.error, r.requests_completed, r.flushes_issued, r.error_detail
+            )
+        }
         Some(guest_::GuestMessage_::Payload::CommitResult(c)) => {
             format!(
                 "commit_result overlay_format={} backing_format={} \
@@ -1273,20 +1313,40 @@ fn print_info_result(
             println!("    parent cid: {}", info.vmdk_info.parent_cid);
             println!("    create type: {}", info.vmdk_info.create_type.as_str());
 
-            // Extents section - for monolithicSparse there's one extent
-            // The extent info includes virtual size (in bytes), filename, cluster size, and format
+            // Extents section.
+            //
+            // monolithicFlat / twoGbMaxExtentFlat images have one entry
+            // per resolved flat extent, rendered as "format: FLAT" with
+            // the resolved extent filename and no cluster-size line —
+            // exactly like the JSON extents rendering and qemu-img's
+            // human output. All other create types (monolithicSparse,
+            // streamOptimized, …) have a single self-referential extent
+            // described by the descriptor's own virtual size and cluster
+            // size, with an empty format.
             println!("    extents:");
-            println!("        [0]:");
-            // Output compressed: true if the extent is compressed (e.g., streamOptimized)
-            if info.flags & INFO_RESULT_FLAG_COMPRESSED != 0 {
-                println!("            compressed: true");
+            if let Some(resolved) = vmdk_flat {
+                for (idx, extent) in resolved.flat_extents.iter().enumerate() {
+                    println!("        [{idx}]:");
+                    println!("            virtual size: {}", extent.extent_size);
+                    println!(
+                        "            filename: {}",
+                        extent.flat_path.to_string_lossy()
+                    );
+                    println!("            format: FLAT");
+                }
+            } else {
+                println!("        [0]:");
+                // Output compressed: true if the extent is compressed (e.g., streamOptimized)
+                if info.flags & INFO_RESULT_FLAG_COMPRESSED != 0 {
+                    println!("            compressed: true");
+                }
+                println!("            virtual size: {}", info.virtual_size);
+                println!("            filename: {abs_path}");
+                println!("            cluster size: {}", info.cluster_size);
+                // qemu-img outputs "format: " with trailing space for empty format
+                print!("            format: ");
+                println!();
             }
-            println!("            virtual size: {}", info.virtual_size);
-            println!("            filename: {abs_path}");
-            println!("            cluster size: {}", info.cluster_size);
-            // qemu-img outputs "format: " with trailing space for empty format
-            print!("            format: ");
-            println!();
         }
 
         // Format specific information (VDI)
@@ -1308,9 +1368,35 @@ fn print_info_result(
             }
         }
 
-        // Child node '/file' section (qemu-img 8.0+)
-        // This section exposes information about the underlying protocol layer.
+        // Child node sections (qemu-img 8.0+)
+        // These sections expose information about the underlying protocol layer.
         if profile.include_child_node {
+            // VMDK monolithicFlat / twoGbMaxExtentFlat images expose one
+            // '/extents.N' protocol child per resolved flat extent,
+            // ahead of the descriptor's own '/file' child. This mirrors
+            // the JSON children rendering. The extent's "file length" is
+            // its declared virtual size (matching qemu-img, which opens
+            // the flat file as a raw protocol node); the "disk size"
+            // line is substituted from the filesystem at test time, so
+            // we report the descriptor's disk size like every other
+            // disk-size line here.
+            if let Some(resolved) = vmdk_flat {
+                for (i, extent) in resolved.flat_extents.iter().enumerate() {
+                    println!("Child node '/extents.{i}':");
+                    println!("    filename: {}", extent.flat_path.to_string_lossy());
+                    println!("    protocol type: file");
+                    println!(
+                        "    file length: {} ({} bytes)",
+                        format_size_human(extent.extent_size, qemu_compat),
+                        extent.extent_size
+                    );
+                    println!(
+                        "    disk size: {}",
+                        format_size_human(disk_size, qemu_compat)
+                    );
+                }
+            }
+
             // For file length, qemu-img reports the larger of:
             // 1. The actual filesystem size
             // 2. The calculated size based on internal metadata (e.g., L1 table for QCOW2)
@@ -1322,8 +1408,12 @@ fn print_info_result(
             } else {
                 std::cmp::max(file_size, info.actual_size)
             };
-            // For raw format, round up to 512-byte sector boundary
-            let effective_child_file_length = if info.format == "raw" {
+            // For raw format, round up to 512-byte sector boundary. VMDK
+            // flat descriptors are likewise treated as unstructured files
+            // by qemu-img, so their protocol-node length is rounded up to
+            // a sector — the same computation the JSON path applies to
+            // descriptor_vsize.
+            let effective_child_file_length = if info.format == "raw" || vmdk_flat.is_some() {
                 child_file_length.div_ceil(512) * 512
             } else {
                 child_file_length
@@ -1871,7 +1961,7 @@ fn execute_info_operation(
     // Load core binary at GUEST_CODE_BASE (0x10000)
     guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
 
-    // Load operation binary at OPERATION_LOAD_ADDR (0x22000)
+    // Load operation binary at OPERATION_LOAD_ADDR (0x30000)
     guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
 
     // Write InfoConfig at OPERATION_CONFIG_ADDR (0x19000)
@@ -2391,7 +2481,8 @@ fn open_chain_devices(
 /// the overlay attached as input slot 0 needs RW so the
 /// overlay-clear pass can zero its L2 / refcount entries.
 /// Rebase (phase 4) does not use this variant — the overlay
-/// being rebased is the output device, not an input.
+/// being rebased is the output device, not an input. Bench (phase 5)
+/// also uses it for `-w`, attaching the top image RW at slot 0.
 ///
 /// The `rw_slots` indices count chain images and external data
 /// files in the same order they would be attached by
@@ -2399,7 +2490,7 @@ fn open_chain_devices(
 /// number of devices actually opened are ignored, matching the
 /// "tolerate extra entries" convention used by the chain
 /// helpers elsewhere in this file.
-#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 fn open_chain_devices_rw(
     chain: &BackingChain,
     sector_size: u64,
@@ -2408,18 +2499,33 @@ fn open_chain_devices_rw(
     start_idx: usize,
     label: &str,
     rw_slots: &[usize],
+    rw_capacity_hint: Option<u64>,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let mut idx = start_idx;
     let mut slot_in_chain: usize = 0;
 
     for image in chain.images().iter() {
         let is_rw = rw_slots.contains(&slot_in_chain);
+        // An RW slot may need to grow past its current EOF (bench's
+        // qcow2 `-w` appends fresh data / L2 / refcount clusters). When
+        // a capacity hint is supplied, expose it to BOTH the backing
+        // store (so `write_at` accepts the appended offsets) and the
+        // virtio device capacity (so `get_input_capacity` — which the
+        // guest's `cluster_lookup` bounds-checks against — covers them).
+        // The file still grows sparsely on demand; the hint is only an
+        // upper bound. RO slots and hint-less RW slots keep the file's
+        // current size as the capacity.
         let backing = if is_rw {
-            BackingStore::open_rw_existing(&image.path, None)?
+            BackingStore::open_rw_existing(&image.path, rw_capacity_hint)?
         } else {
             BackingStore::open(&image.path, true, None, false)?
         };
-        let file_size = std::fs::metadata(&image.path)?.len();
+        let on_disk_size = std::fs::metadata(&image.path)?.len();
+        let file_size = if is_rw {
+            rw_capacity_hint.unwrap_or(on_disk_size).max(on_disk_size)
+        } else {
+            on_disk_size
+        };
         let mmio = device_mmio_base(idx);
         let vq = device_vq_base(idx);
         let device = VirtioBlockDevice::new(backing, file_size, sector_size, !is_rw, mmio, vq);
@@ -2596,6 +2702,8 @@ enum Commands {
     Amend(AmendArgs),
     /// Manage qcow2 persistent dirty bitmaps
     Bitmap(BitmapArgs),
+    /// Benchmark image I/O (qemu-img bench compatible, read path)
+    Bench(BenchArgs),
     /// Emit the allocation map of a disk image
     Map(MapArgs),
     /// List, apply, create, or delete qcow2 internal snapshots
@@ -3374,6 +3482,2167 @@ struct DdArgs {
     output_format: Option<String>,
 }
 
+/// Arguments for `instar bench`. Mirrors `qemu-img bench`'s surface
+/// (see PLAN-bench-phase-04-host-cli.md, Mission section 1).
+///
+/// The numeric options (`-c`/`-d`/`-s`/`-S`/`-o`/`--pattern`/
+/// `--flush-interval`) are `Option<String>` rather than typed
+/// numeric fields: qemu's out-of-range message must be produced by
+/// `validate_bench_args`, not by clap's own parser, and a negative
+/// value must reach that check so it collapses into the same
+/// message qemu itself produces (see the phase-1 1e capture).
+/// `FILENAME` is a trailing `Vec<String>` positional so the CLI
+/// owns the "wrong number of filenames" check instead of clap's own
+/// arity error (qemu collapses "zero" and "too many" into one
+/// message; clap would report them differently).
+///
+/// Not yet wired into `Commands`/dispatch — that is step 4b.
+#[derive(Args, Debug)]
+struct BenchArgs {
+    /// Image file to benchmark. Exactly one is required; zero or
+    /// more than one is a validation error handled by
+    /// `validate_bench_args`, not clap's own arity check (qemu
+    /// parity — 1e capture invocations 15, 16).
+    #[arg(num_args = 0.., value_name = "FILENAME")]
+    filename: Vec<String>,
+
+    /// Number of requests to issue. Default 75000 (qemu's default).
+    /// Range `[1, 2147483647]`; parsed and range-checked by
+    /// `validate_bench_args`. `allow_hyphen_values` lets a negative
+    /// value (`-c -1`) reach that check so it collapses into qemu's
+    /// range message instead of clap's "unexpected argument" error
+    /// (same idiom as ResizeArgs/DdArgs).
+    #[arg(short = 'c', value_name = "COUNT", allow_hyphen_values = true)]
+    count: Option<String>,
+
+    /// Queue depth. Default 64. Range `[1, 2147483647]`.
+    #[arg(short = 'd', value_name = "DEPTH", allow_hyphen_values = true)]
+    depth: Option<String>,
+
+    /// Issue a flush every N completed requests. Default 0
+    /// (never). Range `[0, 2147483647]`. A NONZERO value requires
+    /// `-w` (an explicit 0 without `-w` is silently accepted, like
+    /// qemu); phase 4 refuses `-w` outright, so today a nonzero
+    /// value is reachable only through the qemu cross-option error
+    /// text.
+    #[arg(
+        long = "flush-interval",
+        value_name = "FLUSH_INTERVAL",
+        allow_hyphen_values = true
+    )]
+    flush_interval: Option<String>,
+
+    /// Byte pattern used to fill write buffers. Default 0. Range
+    /// `[0, 255]`; silently ignored (not an error) on read tests.
+    #[arg(long, value_name = "PATTERN", allow_hyphen_values = true)]
+    pattern: Option<String>,
+
+    /// Bytes per request. Accepts qemu size suffixes
+    /// (b/k/K/m/M/g/G/t/T/p/P/e/E). Default 4096. Range
+    /// `[1, 2147483647]` (qemu's own bound), further capped at
+    /// 2 MiB by instar in phase 4.
+    #[arg(short = 's', value_name = "BUFFER_SIZE", allow_hyphen_values = true)]
+    buffer_size: Option<String>,
+
+    /// Byte offset advance per request (same suffixes as `-s`).
+    /// Default 0, meaning "use the buffer size" (see
+    /// `BenchParams::effective_step`). Range `[0, 2147483647]`.
+    #[arg(short = 'S', value_name = "STEP_SIZE", allow_hyphen_values = true)]
+    step_size: Option<String>,
+
+    /// The first request's byte offset (same suffixes as `-s`).
+    /// Default 0. Range `[0, 9223372036854775807]` (`i64::MAX`) --
+    /// wider than the other four numeric options.
+    #[arg(short = 'o', value_name = "OFFSET", allow_hyphen_values = true)]
+    offset: Option<String>,
+
+    /// Run a write test instead of a read test. Write tests are
+    /// supported for raw and qcow2 (including overlays); every other
+    /// discovered top format is refused at runtime with `bench:
+    /// write tests are not yet supported for <fmt>`.
+    #[arg(short = 'w')]
+    write: bool,
+
+    /// Suppress qemu-img's progress indicator. instar has no
+    /// progress output for bench; accepted as a no-op.
+    #[arg(short = 'q')]
+    quiet: bool,
+
+    /// Force sharing (skip exclusive locking). instar performs no
+    /// image locking; accepted as a no-op.
+    #[arg(short = 'U', long = "force-share")]
+    force_share: bool,
+
+    /// Use native AIO. Refused at runtime: `bench: native AIO (-n)
+    /// is not yet supported`.
+    #[arg(short = 'n')]
+    native_aio: bool,
+
+    /// Skip draining in-flight requests before a scheduled flush.
+    /// Valid (and irrelevant) even when `--flush-interval` is 0.
+    #[arg(long = "no-drain")]
+    no_drain: bool,
+
+    /// Indicates FILENAME is a complete image specification.
+    /// Refused at runtime: qemu's own mutual-exclusion message when
+    /// combined with `-f`/`--format` (1e capture invocation 14), or
+    /// `bench: --image-opts is not yet supported` alone.
+    #[arg(long = "image-opts")]
+    image_opts: bool,
+
+    /// AIO backend selector. Refused at runtime for every value:
+    /// `bench: aio backend '<value>' is not yet supported`.
+    #[arg(short = 'i', value_name = "AIO")]
+    aio: Option<String>,
+
+    /// Cache mode selector. `writeback` (qemu's default) is
+    /// accepted silently; other valid qemu cache modes are refused
+    /// with an instar "not yet supported" message; anything else
+    /// gets qemu's own terse `Invalid cache mode` text (1e capture
+    /// invocation 11).
+    #[arg(short = 't', value_name = "CACHE")]
+    cache: Option<String>,
+
+    /// Force the image format detection. Accepted as a hint for the
+    /// (4b) discovery step; dd's warn-then-ignore posture applies
+    /// when it disagrees with the auto-detected format.
+    #[arg(short = 'f', long)]
+    format: Option<String>,
+
+    /// Output format.
+    #[arg(long, default_value = "human", value_parser = ["human", "json"])]
+    output: String,
+}
+
+/// The validated result of parsing `BenchArgs`, ready for
+/// `run_bench` (wired in 4b) to open the image and launch the
+/// guest. Bundles the bench crate's pure, qemu-parity
+/// `bench::BenchParams` with the host-only pieces that crate has no
+/// business knowing about: the filename, the `-f` format hint
+/// (validated against the auto-detected format only once discovery
+/// exists, in 4b), and the `--output` selector.
+#[derive(Debug, Clone, PartialEq)]
+struct BenchInvocation {
+    /// The validated, qemu-parity request parameters.
+    params: BenchParams,
+    /// The single positional filename (count already checked == 1).
+    filename: String,
+    /// `-f`/`--format`'s value, if given. Not validated here --
+    /// `run_bench` (4b) compares it against the auto-detected
+    /// format and applies dd's warn-then-ignore posture when they
+    /// disagree.
+    format_hint: Option<String>,
+    /// `--output`: "human" or "json" (clap's `value_parser` already
+    /// restricts it to these two).
+    output: String,
+    /// `-q`: accepted no-op, carried through for completeness.
+    quiet: bool,
+    /// `-U`/`--force-share`: accepted no-op, carried through for
+    /// completeness.
+    force_share: bool,
+}
+
+/// The three-way outcome of parsing one bench numeric option.
+/// qemu distinguishes an unparseable value (echoed back:
+/// `Invalid <name> specified: '<v>'.`) from an out-of-range
+/// *number* (`Invalid <name> specified. Must be between ...`) --
+/// Supplement 2 of the 1e capture (PLAN-bench-phase-01-crate.md).
+enum BenchNumParse {
+    /// A parseable number; the caller applies the option's own
+    /// range check.
+    Num(i64),
+    /// A plain integer too large (or too negative) for `i64` -- a
+    /// *number*, just outside any option's range, so it takes the
+    /// "Must be between" form, never the value-echoing form.
+    OutOfRange,
+    /// Not a number at all: the value-echoing form.
+    Unparseable,
+}
+
+/// Classify a plain (non-suffixed) integer option value
+/// (`-c`/`-d`/`--pattern`/`--flush-interval`). A leading `-` is a
+/// number (qemu range-rejects negatives, it does not echo them --
+/// 1e capture invocations 2, 7); an optionally-signed all-digit
+/// string that overflows `i64` is likewise a number out of range.
+fn parse_bench_plain_int(s: &str) -> BenchNumParse {
+    let t = s.trim();
+    if let Ok(v) = t.parse::<i64>() {
+        return BenchNumParse::Num(v);
+    }
+    let digits = t.strip_prefix('-').unwrap_or(t);
+    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        BenchNumParse::OutOfRange
+    } else {
+        BenchNumParse::Unparseable
+    }
+}
+
+/// The three-way outcome of parsing a suffixed size option
+/// (`-s`/`-S`/`-o`).
+enum BenchSizeParse {
+    /// A parsed byte value; the caller applies the option's own
+    /// range check.
+    Value(u64),
+    /// A number outside any representable/valid size -- takes the
+    /// "Must be between" form.
+    OutOfRange,
+    /// Not a number at all: the value-echoing form.
+    Unparseable,
+}
+
+/// Classify a size option value. A value `parse_qemu_img_size`
+/// accepts (including suffixed forms like `1k`) is a number; a
+/// suffix multiply that overflows `u64` (e.g. `200000000000000G`)
+/// is a *number* out of range (qemu's cvtnum returns ERANGE and
+/// prints the range form -- verified live, Supplement 2); a plain
+/// optionally-negative integer (e.g. `-1`) is likewise a number
+/// out of range (`-S -1` gets the range form -- 1e capture
+/// invocation 22); everything else (e.g. `abc`, `-1k`) is
+/// unparseable and gets the value-echoing form.
+fn parse_bench_size(s: &str) -> BenchSizeParse {
+    match parse_qemu_img_size_classified(s) {
+        Ok(v) => BenchSizeParse::Value(v),
+        Err(QemuImgSizeError::Overflow) => BenchSizeParse::OutOfRange,
+        Err(QemuImgSizeError::Invalid) => match parse_bench_plain_int(s) {
+            BenchNumParse::Num(_) | BenchNumParse::OutOfRange => BenchSizeParse::OutOfRange,
+            BenchNumParse::Unparseable => BenchSizeParse::Unparseable,
+        },
+    }
+}
+
+/// Validate `BenchArgs` against the qemu-img 10.0.8 message
+/// contract captured in PLAN-bench-phase-01-crate.md (step 1e) and
+/// tabulated in PLAN-bench-phase-04-host-cli.md Mission section 2.
+/// Pure and unit-tested: every message string below is pinned
+/// byte-for-byte in the `bench_validate_tests` module below.
+///
+/// Check order (Mission section 2): the seven numeric options in
+/// the table's order (`-c`, `-d`, `-s` qemu-bound then instar-cap,
+/// `-S`, `-o`, `--pattern`, `--flush-interval`), then the two
+/// `BenchParams::validate` cross-option rules (flush-requires-
+/// write, flush-smaller-than-depth), then the (phase-4-only) `-w`
+/// refusal, then the `-t`/`-i`/`-n`/`--image-opts` postures, and
+/// finally the filename-count check. Each numeric option has TWO
+/// failure forms (Supplement 2 of the 1e capture): an unparseable
+/// value gets the value-echoing `Invalid <name> specified:
+/// '<v>'.`, an out-of-range *number* gets the `Must be between`
+/// form. The order is deliberate: a nonzero `--flush-interval`
+/// without `-w` must surface the qemu cross-option text (1e
+/// capture invocation 8), not the `-w` refusal; and `-w
+/// --flush-interval 32 -d 64` must surface `Flush interval can't be
+/// smaller than depth` (invocation 9) before the phase-4 `-w`
+/// refusal ever fires. Both are exercised directly by
+/// `invocation_8_*`/`invocation_9_*` below.
+fn validate_bench_args(args: &BenchArgs) -> Result<BenchInvocation, String> {
+    // -c: request count.
+    let count: u32 = match &args.count {
+        None => bench::DEFAULT_COUNT,
+        Some(s) => match parse_bench_plain_int(s) {
+            BenchNumParse::Num(v) if (1..=bench::QEMU_BENCH_ARG_MAX as i64).contains(&v) => {
+                v as u32
+            }
+            BenchNumParse::Num(_) | BenchNumParse::OutOfRange => {
+                return Err(
+                    "Invalid request count specified. Must be between 1 and 2147483647."
+                        .to_string(),
+                )
+            }
+            BenchNumParse::Unparseable => {
+                return Err(format!("Invalid request count specified: '{}'.", s))
+            }
+        },
+    };
+
+    // -d: queue depth.
+    let depth: u32 = match &args.depth {
+        None => bench::DEFAULT_DEPTH,
+        Some(s) => match parse_bench_plain_int(s) {
+            BenchNumParse::Num(v) if (1..=bench::QEMU_BENCH_ARG_MAX as i64).contains(&v) => {
+                v as u32
+            }
+            BenchNumParse::Num(_) | BenchNumParse::OutOfRange => {
+                return Err(
+                    "Invalid queue depth specified. Must be between 1 and 2147483647.".to_string(),
+                )
+            }
+            BenchNumParse::Unparseable => {
+                return Err(format!("Invalid queue depth specified: '{}'.", s))
+            }
+        },
+    };
+
+    // -s: buffer size. qemu's [1, 2147483647] bound is checked
+    // FIRST, then the instar-only 2 MiB cap -- precedence pinned by
+    // the 1e capture's invocation 5 (`-s 3G` gets qemu's text,
+    // never instar's cap text, because 3 GiB is already outside
+    // qemu's own bound).
+    let bufsize: u64 = match &args.buffer_size {
+        None => bench::DEFAULT_BUFSIZE,
+        Some(s) => match parse_bench_size(s) {
+            BenchSizeParse::Value(v) if (1..=bench::QEMU_BENCH_ARG_MAX).contains(&v) => {
+                if v > bench::BENCH_MAX_BUFSIZE {
+                    return Err("bench: buffer sizes above 2 MiB are not yet supported".to_string());
+                }
+                v
+            }
+            BenchSizeParse::Value(_) | BenchSizeParse::OutOfRange => {
+                return Err(
+                    "Invalid buffer size specified. Must be between 1 and 2147483647.".to_string(),
+                )
+            }
+            BenchSizeParse::Unparseable => {
+                return Err(format!("Invalid buffer size specified: '{}'.", s))
+            }
+        },
+    };
+
+    // -S: step size. 0 is valid ("use bufsize" --
+    // BenchParams::effective_step).
+    let step: u64 = match &args.step_size {
+        None => 0,
+        Some(s) => match parse_bench_size(s) {
+            BenchSizeParse::Value(v) if v <= bench::QEMU_BENCH_ARG_MAX => v,
+            BenchSizeParse::Value(_) | BenchSizeParse::OutOfRange => {
+                return Err(
+                    "Invalid step size specified. Must be between 0 and 2147483647.".to_string(),
+                )
+            }
+            BenchSizeParse::Unparseable => {
+                return Err(format!("Invalid step size specified: '{}'.", s))
+            }
+        },
+    };
+
+    // -o: the first request's byte offset. Wider bound than the
+    // other four options -- i64::MAX, not QEMU_BENCH_ARG_MAX (1e
+    // capture invocation 17).
+    let offset: u64 = match &args.offset {
+        None => 0,
+        Some(s) => match parse_bench_size(s) {
+            BenchSizeParse::Value(v) if v <= i64::MAX as u64 => v,
+            BenchSizeParse::Value(_) | BenchSizeParse::OutOfRange => {
+                return Err(format!(
+                    "Invalid offset specified. Must be between 0 and {}.",
+                    i64::MAX
+                ))
+            }
+            BenchSizeParse::Unparseable => {
+                return Err(format!("Invalid offset specified: '{}'.", s))
+            }
+        },
+    };
+
+    // --pattern: byte fill value for write tests. `u8` makes values
+    // above 255 unrepresentable in BenchParams, so this range check
+    // lives here rather than in BenchParamError (phase-1 crate
+    // note).
+    let pattern: u8 = match &args.pattern {
+        None => 0,
+        Some(s) => match parse_bench_plain_int(s) {
+            BenchNumParse::Num(v) if (0..=255).contains(&v) => v as u8,
+            BenchNumParse::Num(_) | BenchNumParse::OutOfRange => {
+                return Err("Invalid pattern byte specified. Must be between 0 and 255.".to_string())
+            }
+            BenchNumParse::Unparseable => {
+                return Err(format!("Invalid pattern byte specified: '{}'.", s))
+            }
+        },
+    };
+
+    // --flush-interval: has its own [0, 2147483647] range check
+    // (Supplement 2 of the 1e capture), fired here in table order,
+    // BEFORE the two cross-option rules below. 0 is valid ("never
+    // flush") and -- verified live -- `--flush-interval 0` without
+    // `-w` is silently accepted: the cross-option check gates on
+    // the value, not on flag presence.
+    let flush_interval: u32 = match &args.flush_interval {
+        None => 0,
+        Some(s) => match parse_bench_plain_int(s) {
+            BenchNumParse::Num(v) if (0..=bench::QEMU_BENCH_ARG_MAX as i64).contains(&v) => {
+                v as u32
+            }
+            BenchNumParse::Num(_) | BenchNumParse::OutOfRange => {
+                return Err(
+                    "Invalid flush interval specified. Must be between 0 and 2147483647."
+                        .to_string(),
+                )
+            }
+            BenchNumParse::Unparseable => {
+                return Err(format!("Invalid flush interval specified: '{}'.", s))
+            }
+        },
+    };
+
+    // Cross-option rules owned by the bench crate: flush-requires-
+    // write and flush-smaller-than-depth. Built with the REAL `-w`/
+    // `--no-drain` values (not the phase-4 refusal below) so
+    // invocations 8 and 9 route through these qemu-worded messages
+    // before the phase-4 `-w` refusal ever has a chance to fire.
+    let candidate = BenchParams {
+        count,
+        depth,
+        bufsize,
+        step,
+        offset,
+        is_write: args.write,
+        pattern,
+        flush_interval,
+        no_drain: args.no_drain,
+    };
+    if let Err(e) = candidate.validate() {
+        let msg = match e {
+            // Unreachable in practice: the six numeric ranges above
+            // already enforce these bounds before `candidate` is
+            // built. Mapped anyway rather than panicking, since we
+            // don't fully control how `BenchParamError` might grow.
+            BenchParamError::CountOutOfRange => {
+                "Invalid request count specified. Must be between 1 and 2147483647.".to_string()
+            }
+            BenchParamError::DepthOutOfRange => {
+                "Invalid queue depth specified. Must be between 1 and 2147483647.".to_string()
+            }
+            BenchParamError::BufsizeOutOfRange => {
+                "Invalid buffer size specified. Must be between 1 and 2147483647.".to_string()
+            }
+            BenchParamError::StepOutOfRange => {
+                "Invalid step size specified. Must be between 0 and 2147483647.".to_string()
+            }
+            BenchParamError::BufsizeAboveInstarCap => {
+                "bench: buffer sizes above 2 MiB are not yet supported".to_string()
+            }
+            // Reachable: 1e capture invocations 8 and 9.
+            BenchParamError::FlushRequiresWrite => {
+                "--flush-interval is only available in write tests".to_string()
+            }
+            BenchParamError::FlushIntervalSmallerThanDepth => {
+                "Flush interval can't be smaller than depth".to_string()
+            }
+        };
+        return Err(msg);
+    }
+
+    // -w: accepted and validated. The phase-4 blanket refusal is
+    // gone (phase 5 lands the write path); the format-specific refusal
+    // for -w on vmdk/vhd/vhdx lives in `run_bench`, after discovery
+    // knows the top-of-chain format. The cross-option rules above
+    // (flush-requires-write, interval >= depth) are now reachable
+    // end-to-end.
+
+    // -t: cache mode. qemu's own default (writeback) is silently
+    // accepted; other valid-but-unsupported qemu modes get an
+    // instar-worded refusal; anything else gets qemu's own terse
+    // "Invalid cache mode" text (1e capture invocation 11).
+    if let Some(cache) = &args.cache {
+        match cache.as_str() {
+            "writeback" => {}
+            "none" | "writethrough" | "directsync" | "unsafe" => {
+                return Err(format!(
+                    "bench: cache mode '{}' is not yet supported",
+                    cache
+                ))
+            }
+            _ => return Err("Invalid cache mode".to_string()),
+        }
+    }
+
+    // -i: aio backend. Every value is refused (no aio backend
+    // selection is implemented yet).
+    if let Some(aio) = &args.aio {
+        return Err(format!("bench: aio backend '{}' is not yet supported", aio));
+    }
+
+    // -n: native AIO.
+    if args.native_aio {
+        return Err("bench: native AIO (-n) is not yet supported".to_string());
+    }
+
+    // --image-opts: qemu-parity mutual exclusion with -f/--format
+    // first (1e capture invocation 14), then the house "not yet
+    // supported" refusal.
+    if args.image_opts && args.format.is_some() {
+        return Err("--image-opts and --format are mutually exclusive".to_string());
+    }
+    if args.image_opts {
+        return Err("bench: --image-opts is not yet supported".to_string());
+    }
+
+    // -q / -U (--force-share): accepted no-ops; nothing to check.
+
+    // Filename count: qemu collapses "zero" and "too many" into the
+    // identical two-line message (1e capture invocations 15, 16).
+    if args.filename.len() != 1 {
+        return Err(
+            "Expecting one image file name\nTry 'instar bench --help' for more info".to_string(),
+        );
+    }
+
+    Ok(BenchInvocation {
+        params: candidate,
+        filename: args.filename[0].clone(),
+        format_hint: args.format.clone(),
+        output: args.output.clone(),
+        quiet: args.quiet,
+        force_share: args.force_share,
+    })
+}
+
+/// Render the qemu-parity header line, printed once discovery and
+/// validation succeed and before the guest launches (Mission
+/// section 3). Byte-identical to qemu-img for equal arguments:
+/// offset is the parsed decimal byte value, step is the
+/// *effective* step (`-S 0` renders as `bufsize`, 1e capture
+/// invocation 24), and the read/write word comes from `is_write`.
+fn render_bench_header(params: &BenchParams) -> String {
+    format!(
+        "Sending {} {} requests, {} bytes each, {} in parallel (starting at offset {}, step size {})",
+        params.count,
+        if params.is_write { "write" } else { "read" },
+        params.bufsize,
+        params.depth,
+        params.offset,
+        params.effective_step(),
+    )
+}
+
+/// Render the "Sending flush every N requests" line (write tests
+/// only; unreachable in phase 4 since `-w` is refused, but the
+/// renderer exists now so phase 5 only needs to stop refusing
+/// `-w`).
+fn render_bench_flush_line(interval: u32) -> String {
+    format!("Sending flush every {} requests", interval)
+}
+
+/// Render the completion line. qemu's timing precision is exactly 3
+/// decimal digits (`%0.3f`-shaped; 1e capture invocations 20/21).
+fn render_bench_completion(secs: f64) -> String {
+    format!("Run completed in {:.3} seconds.", secs)
+}
+
+/// Render the `--output json` object for a completed bench run, per
+/// Mission section 3's schema (hyphenated keys, hand-built JSON --
+/// no serde, matching the house idiom in `print_measure_result_json`).
+/// `effective-depth` is a fixed `1`: v1 executes serially regardless
+/// of `-d` (master plan OQ1). Rates divide by `elapsed_seconds`; a
+/// `0.0` elapsed value (an extremely fast, tiny run) produces a
+/// non-finite rate exactly like a bare floating point division
+/// would -- no special-casing, since the captured contract has no
+/// zero-elapsed json example to pin.
+fn render_bench_json(
+    params: &BenchParams,
+    filename: &str,
+    format: &str,
+    flushes_issued: u32,
+    elapsed_seconds: f64,
+) -> String {
+    use std::fmt::Write as _;
+
+    let requests_per_second = params.count as f64 / elapsed_seconds;
+    let bytes_per_second = (params.count as u64 * params.bufsize) as f64 / elapsed_seconds;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "{{");
+    let _ = writeln!(
+        out,
+        "    \"filename\": \"{}\",",
+        escape_json_string(filename)
+    );
+    let _ = writeln!(out, "    \"format\": \"{}\",", escape_json_string(format));
+    let _ = writeln!(out, "    \"count\": {},", params.count);
+    let _ = writeln!(out, "    \"depth\": {},", params.depth);
+    let _ = writeln!(out, "    \"effective-depth\": 1,");
+    let _ = writeln!(out, "    \"buffer-size\": {},", params.bufsize);
+    let _ = writeln!(out, "    \"step-size\": {},", params.effective_step());
+    let _ = writeln!(out, "    \"offset\": {},", params.offset);
+    let _ = writeln!(out, "    \"write\": {},", params.is_write);
+    let _ = writeln!(out, "    \"pattern\": {},", params.pattern);
+    let _ = writeln!(out, "    \"flush-interval\": {},", params.flush_interval);
+    let _ = writeln!(out, "    \"no-drain\": {},", params.no_drain);
+    let _ = writeln!(out, "    \"flushes-issued\": {},", flushes_issued);
+    let _ = writeln!(out, "    \"elapsed-seconds\": {:.6},", elapsed_seconds);
+    let _ = writeln!(
+        out,
+        "    \"requests-per-second\": {:.2},",
+        requests_per_second
+    );
+    let _ = writeln!(out, "    \"bytes-per-second\": {:.2}", bytes_per_second);
+    let _ = write!(out, "}}");
+    out
+}
+
+/// Host-side holder for the harvested `BenchResultMessage`. Mirrors
+/// `BitmapRunResult`: `error` and `flushes_issued` drive the error
+/// mapping / json envelope, and `error_detail` feeds
+/// `map_bench_error`'s write-gate rendering on the error path.
+/// `requests_completed` is harvested for completeness (and the debug
+/// `format_message` arm) but is not otherwise read, hence the
+/// `dead_code` allow.
+#[allow(dead_code)]
+struct BenchRunResult {
+    error: u32,
+    requests_completed: u64,
+    flushes_issued: u64,
+    error_detail: u64,
+}
+
+/// Map a `BenchResult::ERROR_*` code to a user-facing message.
+///
+/// `ERROR_IO_READ` renders as the **bare** qemu text `Failed request:
+/// Input/output error` (1e capture invocation 19): by the time it
+/// fires the header has already printed on stdout, so this reproduces
+/// qemu's exact zero-byte-image transcript. Every other code carries
+/// instar's `bench:` prefix. `ERROR_IO_WRITE` / `ERROR_IO_FLUSH` /
+/// `ERROR_WRITE_UNSUPPORTED` / `ERROR_ALLOC_EXHAUSTED` are reachable
+/// from phase 5's write path.
+/// Render a short reason for the qcow2 write envelope gate id carried
+/// in `BenchResult::error_detail` alongside `ERROR_WRITE_UNSUPPORTED`.
+/// The ids are documented on `shared::BenchResult::ERROR_WRITE_UNSUPPORTED`
+/// and mirrored in the bench guest op's `wgate` const block.
+fn bench_write_gate_reason(detail: u64) -> &'static str {
+    match detail {
+        0 => "format not supported",
+        1 => "refcount_bits != 16",
+        2 => "compression",
+        3 => "extended L2",
+        4 => "external data file",
+        5 => "encryption",
+        6 => "dirty or corrupt",
+        7 => "internal snapshots",
+        _ => "unsupported feature",
+    }
+}
+
+fn map_bench_error(code: u32, error_detail: u64) -> String {
+    match code {
+        c if c == shared::BenchResult::ERROR_IO_READ => {
+            "Failed request: Input/output error".to_string()
+        }
+        c if c == shared::BenchResult::ERROR_BAD_CONFIG => {
+            "bench: guest rejected the configuration".to_string()
+        }
+        c if c == shared::BenchResult::ERROR_UNSUPPORTED_FORMAT => {
+            "bench: unsupported input format".to_string()
+        }
+        c if c == shared::BenchResult::ERROR_PARSE_FAILED => {
+            "bench: failed to parse the image".to_string()
+        }
+        c if c == shared::BenchResult::ERROR_IO_WRITE => {
+            "bench: writing back to the image failed".to_string()
+        }
+        c if c == shared::BenchResult::ERROR_IO_FLUSH => {
+            "bench: flushing the image failed".to_string()
+        }
+        c if c == shared::BenchResult::ERROR_WRITE_UNSUPPORTED => {
+            // The guest refuses a write test the image's envelope does
+            // not permit. `error_detail` is a gate id naming the reason
+            // (raw always passes; qcow2 carries the envelope checks).
+            format!(
+                "bench: write tests are not supported for this image ({})",
+                bench_write_gate_reason(error_detail)
+            )
+        }
+        c if c == shared::BenchResult::ERROR_ALLOC_EXHAUSTED => {
+            "bench: image too large for in-place bench write".to_string()
+        }
+        other => format!("bench: guest returned an unknown error code ({other})"),
+    }
+}
+
+/// Run `instar bench`: validate the qemu-parity argument surface,
+/// discover the input's backing chain, print the header, launch the
+/// read-only bench guest, and render the completion line (or the
+/// `--output json` object). See PLAN-bench-phase-04-host-cli.md §4.
+fn run_bench(args: &BenchArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate the CLI surface (qemu-parity messages, §2). Err strings
+    // propagate as-is; `main` renders them as `Error: <msg>` and exits 1.
+    let invocation = validate_bench_args(args)?;
+
+    // Bench uses convert's input-path sector size (the ConvertArgs
+    // `--sector-size` default): the virtio-block transport I/O
+    // granularity, not a format-level property. Recorded here because it
+    // is part of the measurement's definition (see the 4c measurements).
+    let sector_size = MAX_SECTOR_SIZE; // 65536
+
+    // Discover the input backing chain (convert's idiom, incl. the
+    // security config). Bench takes no format hint: discovery walks
+    // backing files by running the sandboxed info op per image and
+    // auto-detects each format. An open/discovery failure propagates.
+    let security_config = config::load_config().config.security;
+    let chain = discover_backing_chain(
+        Path::new(&invocation.filename),
+        sector_size,
+        &security_config,
+    )
+    .map_err(|e| {
+        format!(
+            "error discovering backing chain for {}: {}",
+            invocation.filename, e
+        )
+    })?;
+
+    // The discovered top-of-chain format is authoritative (§2).
+    let top_format = chain.images()[0].format;
+    let top_format_name = top_format.to_string();
+
+    // `-f` posture: dd's warn-then-ignore, but only when the hint
+    // disagrees with the auto-detected format (case-insensitive on the
+    // format name). A matching or absent hint stays silent so the common
+    // `-f raw` / `-f qcow2` invocations produce no noise.
+    if let Some(hint) = &invocation.format_hint {
+        if !hint.eq_ignore_ascii_case(&top_format_name) {
+            eprintln!(
+                "bench: -f {} is accepted but ignored; the input format is auto-detected",
+                hint
+            );
+        }
+    }
+
+    // -w host-side format gate: write tests are supported only for raw
+    // and qcow2. Every other discovered top format is refused here,
+    // before the header prints or the guest launches (Mission §3
+    // divergence registry). raw and qcow2 both pass; qcow2 then reaches
+    // the guest, which refuses it with ERROR_WRITE_UNSUPPORTED until 5b
+    // lands the allocating write path.
+    if invocation.params.is_write && !matches!(top_format, ImageFormat::Raw | ImageFormat::Qcow2) {
+        return Err(format!(
+            "bench: write tests are not yet supported for {}",
+            top_format_name
+        )
+        .into());
+    }
+
+    // Human mode prints the header (and, once phase 5 allows a nonzero
+    // flush interval, the flush line) to stdout BEFORE the guest
+    // launches — mirroring qemu, which prints them before submitting
+    // requests (unconditionally, even when the first request will fail).
+    // JSON mode prints nothing until the run completes.
+    let human = invocation.output != "json";
+    if human {
+        println!("{}", render_bench_header(&invocation.params));
+        if invocation.params.flush_interval != 0 {
+            // Reachable in phase 5: a nonzero flush interval requires
+            // -w, and -w now runs. Prints for real write runs.
+            println!(
+                "{}",
+                render_bench_flush_line(invocation.params.flush_interval)
+            );
+        }
+    }
+
+    // Launch the read-only bench guest and harvest the result plus the
+    // host half of the timing bracket.
+    let (result, elapsed) = run_bench_guest(
+        &chain,
+        &invocation.params,
+        top_format.to_shared_format_u32(),
+        sector_size,
+        verbose,
+    )?;
+
+    // A non-OK guest error fails the run (exit 1). ERROR_IO_READ renders
+    // as the bare qemu "Failed request" text; the others carry instar's
+    // `bench:` prefix. The header is already on stdout by now.
+    if result.error != shared::BenchResult::ERROR_OK {
+        return Err(map_bench_error(result.error, result.error_detail).into());
+    }
+
+    // ERROR_OK without a timing bracket is a guest contract violation (a
+    // result must be preceded by a BenchStart) — an error, not a
+    // zero-timing success.
+    let elapsed = elapsed.ok_or("bench: guest sent a result without a start marker")?;
+    let elapsed_secs = elapsed.as_secs_f64();
+
+    if human {
+        println!("{}", render_bench_completion(elapsed_secs));
+    } else {
+        println!(
+            "{}",
+            render_bench_json(
+                &invocation.params,
+                &invocation.filename,
+                &top_format_name,
+                result.flushes_issued as u32,
+                elapsed_secs,
+            )
+        );
+    }
+
+    Ok(())
+}
+
+/// Launch the read-only bench guest (core.bin + bench.bin) over the
+/// discovered input backing chain and harvest its `BenchResult`.
+///
+/// Cloned from `run_bitmap_guest`'s single-result launch/harvest
+/// template, with convert's read-only chain attach (input devices
+/// only, no output device) grafted in place of bitmap's input-RW
+/// single-device attach. The host half of the phase-2 timing bracket
+/// is captured **inside** the vcpu loop: `bench_start` on `BenchStart`
+/// arrival, `bench_elapsed` on `BenchResult` arrival — never after
+/// HLT, so post-result teardown vmexits stay outside the measured
+/// window.
+fn run_bench_guest(
+    chain: &BackingChain,
+    params: &BenchParams,
+    target_format: u32,
+    sector_size: u32,
+    verbose: bool,
+) -> Result<(BenchRunResult, Option<Duration>), Box<dyn std::error::Error>> {
+    // --- Load guest binaries --------------------------------------------
+    let core_path = get_binary_path("core.bin");
+    let core_code = load_guest_binary(
+        core_path
+            .to_str()
+            .ok_or("bench: core.bin path is not valid UTF-8")?,
+    )?;
+    let bench_path = get_binary_path("bench.bin");
+    let bench_code = load_guest_binary(
+        bench_path
+            .to_str()
+            .ok_or("bench: bench.bin path is not valid UTF-8")?,
+    )?;
+
+    // --- KVM / VM / guest memory setup ----------------------------------
+    let kvm = Kvm::new()?;
+    debug!("KVM API version: {}", kvm.get_api_version());
+
+    let kvm_stats_checker = kvm_stats::KvmStatsChecker::new(&kvm);
+    kvm_stats_checker.display_status();
+
+    let vm = kvm.create_vm()?;
+    let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
+
+    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let host_addr = region.as_ptr() as u64;
+    let mem_region = kvm_userspace_memory_region {
+        slot: 0,
+        guest_phys_addr: 0,
+        memory_size: GUEST_MEM_SIZE,
+        userspace_addr: host_addr,
+        flags: 0,
+    };
+    // SAFETY: mem_region.userspace_addr points to a valid
+    // GuestMemoryMmap allocation that outlives the VM.
+    unsafe {
+        vm.set_user_memory_region(mem_region)?;
+    }
+    setup_gdt(&guest_mem)?;
+    setup_page_tables(&guest_mem, GUEST_MEM_SIZE)?;
+    guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
+    guest_mem.write_slice(&bench_code, GuestAddress(OPERATION_LOAD_ADDR))?;
+
+    // --- Write BenchConfig at OPERATION_CONFIG_ADDR ---------------------
+    // Layout (must match shared::BenchConfig exactly; repr(C), 128 B):
+    //      0: magic           u32  ("BNCH")
+    //      4: flags           u32
+    //      8: count           u32
+    //     12: depth           u32
+    //     16: bufsize         u64
+    //     24: step            u64  (raw; 0 = "use bufsize")
+    //     32: offset          u64
+    //     40: flush_interval  u32
+    //     44: pattern         u32  (byte in the low 8 bits)
+    //     48: target_format   u32  (discovered top format as u32)
+    //     52: sector_size     u32
+    //     56: _reserved       [u8; 72]
+    let mut flags: u32 = 0;
+    if params.no_drain {
+        flags |= shared::BenchConfig::FLAG_NO_DRAIN;
+    }
+    if verbose {
+        flags |= shared::BenchConfig::FLAG_VERBOSE;
+    }
+    // FLAG_WRITE drives the guest's write-mode fork (phase 5). The
+    // pattern byte is already carried in the config below; the guest
+    // fills its write buffer with it. run_bench has already refused any
+    // top format outside {raw, qcow2}, so a write run reaching here is
+    // raw (written in place) or qcow2 (refused guest-side until 5b).
+    if params.is_write {
+        flags |= shared::BenchConfig::FLAG_WRITE;
+    }
+
+    guest_mem.write_obj(
+        shared::BenchConfig::MAGIC,
+        GuestAddress(OPERATION_CONFIG_ADDR),
+    )?;
+    guest_mem.write_obj(flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
+    guest_mem.write_obj(params.count, GuestAddress(OPERATION_CONFIG_ADDR + 8))?;
+    guest_mem.write_obj(params.depth, GuestAddress(OPERATION_CONFIG_ADDR + 12))?;
+    guest_mem.write_obj(params.bufsize, GuestAddress(OPERATION_CONFIG_ADDR + 16))?;
+    // step written raw (0 preserved); the guest's effective_step()
+    // resolves 0 to bufsize, keeping the wrap arithmetic in one place.
+    guest_mem.write_obj(params.step, GuestAddress(OPERATION_CONFIG_ADDR + 24))?;
+    guest_mem.write_obj(params.offset, GuestAddress(OPERATION_CONFIG_ADDR + 32))?;
+    guest_mem.write_obj(
+        params.flush_interval,
+        GuestAddress(OPERATION_CONFIG_ADDR + 40),
+    )?;
+    guest_mem.write_obj(
+        params.pattern as u32,
+        GuestAddress(OPERATION_CONFIG_ADDR + 44),
+    )?;
+    guest_mem.write_obj(target_format, GuestAddress(OPERATION_CONFIG_ADDR + 48))?;
+    guest_mem.write_obj(sector_size, GuestAddress(OPERATION_CONFIG_ADDR + 52))?;
+    // Zero _reserved [u8; 72] @56 explicitly. Guest memory is already
+    // page-zeroed, but be defensive so a future in-place reuse cannot
+    // leak stale bytes into the reserved tail.
+    guest_mem.write_slice(&[0u8; 72], GuestAddress(OPERATION_CONFIG_ADDR + 56))?;
+
+    debug!(
+        "Wrote bench config at 0x{:x} (flags=0x{:x}, count={}, depth={}, bufsize={}, \
+         step={}, offset={}, flush_interval={}, pattern={}, target_format={}, sector_size={})",
+        OPERATION_CONFIG_ADDR,
+        flags,
+        params.count,
+        params.depth,
+        params.bufsize,
+        params.step,
+        params.offset,
+        params.flush_interval,
+        params.pattern,
+        target_format,
+        sector_size,
+    );
+
+    // --- Attach the input backing chain (no output device) --------------
+    // Read tests open the whole discovered chain read-only (convert's
+    // read-only attach). Write tests (-w) need the TOP image writable so
+    // the guest's `write_input_sector(0, ..)` / `fsync_input(0)` reach
+    // the file; every parent stays read-only (writes through a backing
+    // chain never touch parents — for raw this is just the single RW
+    // device). This mirrors commit's mixed attach via
+    // `open_chain_devices_rw` with the top slot RW.
+    let mut device_set = DeviceSet::new();
+    let mut io_events: Vec<IoEvent> = Vec::new();
+    if params.is_write {
+        // qcow2 `-w` allocates fresh data / L2 / refcount clusters past
+        // the current EOF, so the RW top slot needs a capacity window
+        // above the file's current size. Mirror resize's generous hint
+        // (2× the larger of the file/virtual size, floored at 1 GiB);
+        // the refcount-table-growth gate bounds real growth well below
+        // it, and the file still grows sparsely on demand. raw writes
+        // stay in place, so raw gets no hint (identical to phase 5a).
+        let top = &chain.images()[0];
+        let rw_capacity_hint = if matches!(top.format, ImageFormat::Qcow2) {
+            let on_disk = std::fs::metadata(&top.path).map(|m| m.len()).unwrap_or(0);
+            Some(on_disk.max(top.virtual_size).saturating_mul(2).max(1 << 30))
+        } else {
+            None
+        };
+        open_chain_devices_rw(
+            chain,
+            sector_size as u64,
+            &mut device_set,
+            &mut io_events,
+            0,
+            "chain",
+            &[0], // top image (input slot 0) read-write; parents read-only
+            rw_capacity_hint,
+        )?;
+    } else {
+        open_chain_devices(
+            chain,
+            sector_size as u64,
+            &mut device_set,
+            &mut io_events,
+            0,
+            "chain",
+        )?;
+    }
+    write_chain_config(&guest_mem, chain)?;
+
+    let guest_mem = Arc::new(guest_mem);
+    let vmm_stats = Arc::new(Mutex::new(VmmStats::new()));
+
+    // Try to register ioeventfds; fall back to VM exits on failure.
+    let mut io_thread: Option<io_thread::IoThread> = None;
+    let mut registered_count = 0usize;
+    let mut registration_failed = false;
+    for evt in io_events.iter_mut() {
+        if let Err(e) = evt.register(&vm) {
+            debug!("ioeventfd: failed to register ({e:?}), falling back to VM exits");
+            registration_failed = true;
+            break;
+        }
+        registered_count += 1;
+    }
+    if registration_failed {
+        for evt in io_events.iter_mut().take(registered_count) {
+            let _ = evt.unregister(&vm);
+        }
+    }
+    let all_registered = !registration_failed;
+    if all_registered && !io_events.is_empty() {
+        let io_devices = device_set.create_io_devices(io_events);
+        io_thread = Some(io_thread::IoThread::new(
+            io_devices,
+            Arc::clone(&guest_mem),
+            Arc::clone(&vmm_stats),
+        ));
+    }
+
+    // --- vCPU setup ------------------------------------------------------
+    let mut vcpu = vm.create_vcpu(0)?;
+    let mut sregs = vcpu.get_sregs()?;
+    setup_sregs(&mut sregs);
+    vcpu.set_sregs(&sregs)?;
+    let mut regs = vcpu.get_regs()?;
+    setup_regs(&mut regs);
+    vcpu.set_regs(&regs)?;
+
+    // --- Serial decoders / transmitter / debug buffer -------------------
+    let mut serial_decoder = SerialDecoder::new();
+    let mut serial_transmitter = SerialTransmitter::new();
+    let mut debug_buffer = DebugBuffer::new();
+
+    // Input-only config. A standalone image is one device
+    // (vmm_config_input_only); a qcow2 with a backing chain needs every
+    // chain device described so the core initialises them all and the
+    // guest's sector-size cross-check + chain reader see the full set
+    // (mirrors check's read-only chain attach). No output device either
+    // way.
+    let config = if chain.total_devices() > 1 {
+        vmm_config_chain(sector_size, chain.total_devices())
+    } else {
+        vmm_config_input_only(sector_size)
+    };
+    serial_transmitter.queue_config(&config);
+
+    // --- Run the vCPU loop ----------------------------------------------
+    let mut result_seen = false;
+    let mut harvested = BenchRunResult {
+        error: shared::BenchResult::ERROR_OK,
+        requests_completed: 0,
+        flushes_issued: 0,
+        error_detail: 0,
+    };
+    // Host half of the timing bracket: start on BenchStart arrival,
+    // elapsed on BenchResult arrival — both inside the loop, never after
+    // HLT.
+    let mut bench_start: Option<Instant> = None;
+    let mut bench_elapsed: Option<Duration> = None;
+    let mut vm_error: Option<String> = None;
+
+    loop {
+        match vcpu.run()? {
+            VcpuExit::Hlt => {
+                vmm_stats.lock().unwrap().record_hlt();
+                break;
+            }
+            VcpuExit::IoOut(port, data) => {
+                vmm_stats.lock().unwrap().record_io_out();
+                if port == SERIAL_PORT {
+                    for &byte in data {
+                        if let Some(msg) = serial_decoder.add_byte(byte) {
+                            match &msg.payload {
+                                Some(guest_::GuestMessage_::Payload::BenchStart(_)) => {
+                                    bench_start = Some(Instant::now());
+                                }
+                                Some(guest_::GuestMessage_::Payload::BenchResult(r)) => {
+                                    // Elapsed captured AT ARRIVAL, before HLT.
+                                    bench_elapsed = bench_start.map(|s| s.elapsed());
+                                    harvested.error = r.error;
+                                    harvested.requests_completed = r.requests_completed;
+                                    harvested.flushes_issued = r.flushes_issued;
+                                    harvested.error_detail = r.error_detail;
+                                    result_seen = true;
+                                }
+                                _ => {
+                                    if verbose {
+                                        debug!("{}", format_message(&msg));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if port == DEBUG_PORT {
+                    for &byte in data {
+                        if let Some(line) = debug_buffer.add_byte(byte) {
+                            debug!("[GUEST] {line}");
+                        }
+                    }
+                } else {
+                    debug!("IO OUT: port=0x{port:x}, data={data:?}");
+                }
+            }
+            VcpuExit::IoIn(port, data) => {
+                vmm_stats.lock().unwrap().record_io_in();
+                if port == SERIAL_PORT {
+                    for byte in data.iter_mut() {
+                        *byte = serial_transmitter.next_byte().unwrap_or(0);
+                    }
+                } else if port == SERIAL_PORT + 5 {
+                    let mut lsr = 0x60u8;
+                    if serial_transmitter.has_data() {
+                        lsr |= 0x01;
+                    }
+                    data[0] = lsr;
+                } else {
+                    for byte in data {
+                        *byte = 0;
+                    }
+                }
+            }
+            VcpuExit::MmioRead(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_read();
+                let value = device_set.mmio_read(addr);
+                write_mmio_data(data, value);
+            }
+            VcpuExit::MmioWrite(addr, data) => {
+                vmm_stats.lock().unwrap().record_mmio_write();
+                let value = read_mmio_data(data);
+                if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
+                    if io_thread.is_none() && should_process {
+                        device_set.process_queue_for_device(
+                            device_index,
+                            &guest_mem,
+                            &vmm_stats,
+                        )?;
+                    }
+                }
+            }
+            VcpuExit::Shutdown => {
+                vmm_stats.lock().unwrap().record_shutdown();
+                vm_error = Some("VM shutdown (triple fault)".to_string());
+                break;
+            }
+            VcpuExit::FailEntry(reason, cpu) => {
+                vmm_stats.lock().unwrap().record_fail_entry();
+                vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
+                break;
+            }
+            exit => {
+                vmm_stats.lock().unwrap().record_unknown();
+                vm_error = Some(format!("unexpected VM exit: {exit:?}"));
+                break;
+            }
+        }
+    }
+
+    if let Some(mut thread) = io_thread {
+        thread.stop();
+    }
+
+    if log::log_enabled!(log::Level::Debug) {
+        vmm_stats.lock().unwrap().display();
+    }
+
+    if let Some(error) = vm_error {
+        return Err(error.into());
+    }
+    if !result_seen {
+        return Err("bench: guest did not return a result".into());
+    }
+    Ok((harvested, bench_elapsed))
+}
+
+#[cfg(test)]
+mod bench_validate_tests {
+    //! Byte-for-byte pins of `validate_bench_args`'s message table
+    //! (Mission section 2 of PLAN-bench-phase-04-host-cli.md)
+    //! against the 1e capture and its Supplement 2
+    //! (PLAN-bench-phase-01-crate.md). Every message string here is
+    //! copied verbatim from one of those two documents: each
+    //! numeric option pins BOTH failure forms -- the value-echoing
+    //! `Invalid <name> specified: '<v>'.` for unparseable input and
+    //! the `Must be between` form for out-of-range numbers.
+    use super::*;
+
+    /// A `BenchArgs` with every field at its clap default plus a
+    /// single, valid filename -- callers override only the fields
+    /// under test via struct-update syntax.
+    fn default_bench_args() -> BenchArgs {
+        BenchArgs {
+            filename: vec!["probe.raw".to_string()],
+            count: None,
+            depth: None,
+            flush_interval: None,
+            pattern: None,
+            buffer_size: None,
+            step_size: None,
+            offset: None,
+            write: false,
+            quiet: false,
+            force_share: false,
+            native_aio: false,
+            no_drain: false,
+            image_opts: false,
+            aio: None,
+            cache: None,
+            format: None,
+            output: "human".to_string(),
+        }
+    }
+
+    // --- defaults ---------------------------------------------------
+
+    #[test]
+    fn defaults_match_qemu_and_bench_crate() {
+        let args = default_bench_args();
+        let inv = validate_bench_args(&args).expect("defaults must validate");
+        assert_eq!(inv.params, BenchParams::default());
+        assert_eq!(inv.filename, "probe.raw");
+        assert_eq!(inv.output, "human");
+        assert!(!inv.quiet);
+        assert!(!inv.force_share);
+        assert_eq!(inv.format_hint, None);
+    }
+
+    // --- -c: request count (invocations 1, 2) ------------------------
+
+    #[test]
+    fn invocation_1_count_zero() {
+        let args = BenchArgs {
+            count: Some("0".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid request count specified. Must be between 1 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn invocation_2_count_negative_same_message_as_zero() {
+        let args = BenchArgs {
+            count: Some("-1".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid request count specified. Must be between 1 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn count_above_max_rejected() {
+        let args = BenchArgs {
+            count: Some("2147483648".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid request count specified. Must be between 1 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn count_unparseable_gets_value_echoing_message() {
+        // Supplement 2: unparseable input takes the value-echoing
+        // form, with the exact `: 'abc'.` punctuation.
+        let args = BenchArgs {
+            count: Some("abc".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid request count specified: 'abc'."
+        );
+    }
+
+    // --- -d: queue depth (invocation 3) ------------------------------
+
+    #[test]
+    fn invocation_3_depth_zero() {
+        let args = BenchArgs {
+            depth: Some("0".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid queue depth specified. Must be between 1 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn depth_negative_same_message() {
+        let args = BenchArgs {
+            depth: Some("-1".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid queue depth specified. Must be between 1 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn depth_unparseable_gets_value_echoing_message() {
+        let args = BenchArgs {
+            depth: Some("abc".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid queue depth specified: 'abc'."
+        );
+    }
+
+    // --- -s: buffer size (invocations 4, 5) + instar cap -------------
+
+    #[test]
+    fn invocation_4_bufsize_zero() {
+        let args = BenchArgs {
+            buffer_size: Some("0".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid buffer size specified. Must be between 1 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn invocation_5_bufsize_3g_gives_qemu_range_message_not_instar_cap() {
+        // Precedence: 3 GiB is past qemu's own [1, 2147483647]
+        // bound, so it never reaches instar's 2 MiB cap check.
+        let args = BenchArgs {
+            buffer_size: Some("3G".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid buffer size specified. Must be between 1 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn bufsize_3m_is_inside_qemu_range_but_above_instar_cap() {
+        // Precedence complement to invocation 5: 3 MiB is
+        // comfortably inside qemu's range, so it reaches instar's
+        // 2 MiB cap check instead.
+        let args = BenchArgs {
+            buffer_size: Some("3M".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "bench: buffer sizes above 2 MiB are not yet supported"
+        );
+    }
+
+    #[test]
+    fn bufsize_at_instar_cap_is_accepted() {
+        let args = BenchArgs {
+            buffer_size: Some("2M".to_string()),
+            ..default_bench_args()
+        };
+        let inv = validate_bench_args(&args).expect("2 MiB must be accepted");
+        assert_eq!(inv.params.bufsize, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn bufsize_unparseable_gets_value_echoing_message() {
+        let args = BenchArgs {
+            buffer_size: Some("abc".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid buffer size specified: 'abc'."
+        );
+    }
+
+    #[test]
+    fn bufsize_negative_with_suffix_is_unparseable_not_a_number() {
+        // Verified live: `-s -1` is a NUMBER (range form), but
+        // `-s -1k` is unparseable (echo form) -- the negative sign
+        // is only tolerated on plain integers.
+        let args = BenchArgs {
+            buffer_size: Some("-1k".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid buffer size specified: '-1k'."
+        );
+    }
+
+    #[test]
+    fn bufsize_plain_negative_is_a_number_and_gets_range_form() {
+        let args = BenchArgs {
+            buffer_size: Some("-1".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid buffer size specified. Must be between 1 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn bufsize_suffix_overflow_gets_range_form() {
+        // Verified live (Supplement 2): a suffix multiply that
+        // overflows u64 is a NUMBER out of range (qemu's cvtnum
+        // ERANGE), not an unparseable value -- range form, no echo.
+        let args = BenchArgs {
+            buffer_size: Some("200000000000000G".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid buffer size specified. Must be between 1 and 2147483647."
+        );
+    }
+
+    // --- -S: step size (invocations 22, 23, 24) ----------------------
+
+    #[test]
+    fn invocation_22_step_negative() {
+        let args = BenchArgs {
+            step_size: Some("-1".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid step size specified. Must be between 0 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn invocation_23_step_above_max() {
+        let args = BenchArgs {
+            step_size: Some("2147483648".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid step size specified. Must be between 0 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn step_unparseable_gets_value_echoing_message() {
+        let args = BenchArgs {
+            step_size: Some("abc".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid step size specified: 'abc'."
+        );
+    }
+
+    #[test]
+    fn step_suffix_overflow_gets_range_form() {
+        // Verified live (Supplement 2): suffix-multiply overflow is
+        // a number out of range, not an unparseable value.
+        let args = BenchArgs {
+            step_size: Some("200000000000000G".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid step size specified. Must be between 0 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn invocation_24_step_zero_is_valid_and_effective_step_is_bufsize() {
+        let args = BenchArgs {
+            step_size: Some("0".to_string()),
+            ..default_bench_args()
+        };
+        let inv = validate_bench_args(&args).expect("step 0 must be valid");
+        assert_eq!(inv.params.step, 0);
+        assert_eq!(inv.params.effective_step(), inv.params.bufsize);
+    }
+
+    // --- -o: offset (invocations 17, 18) ------------------------------
+
+    #[test]
+    fn invocation_17_offset_negative() {
+        let args = BenchArgs {
+            offset: Some("-1".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid offset specified. Must be between 0 and 9223372036854775807."
+        );
+    }
+
+    #[test]
+    fn offset_above_i64_max_is_rejected() {
+        let args = BenchArgs {
+            offset: Some("9223372036854775808".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid offset specified. Must be between 0 and 9223372036854775807."
+        );
+    }
+
+    #[test]
+    fn offset_unparseable_gets_value_echoing_message() {
+        let args = BenchArgs {
+            offset: Some("abc".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid offset specified: 'abc'."
+        );
+    }
+
+    #[test]
+    fn offset_suffix_overflow_gets_range_form() {
+        // Verified live (Supplement 2): `-o 200000000000000G`
+        // (2e14 * 2^30, overflows u64) gets the range form.
+        let args = BenchArgs {
+            offset: Some("200000000000000G".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid offset specified. Must be between 0 and 9223372036854775807."
+        );
+    }
+
+    #[test]
+    fn invocation_18_offset_suffix_renders_as_decimal() {
+        let args = BenchArgs {
+            offset: Some("1k".to_string()),
+            ..default_bench_args()
+        };
+        let inv = validate_bench_args(&args).expect("1k offset must parse");
+        assert_eq!(inv.params.offset, 1024);
+    }
+
+    // --- --pattern (invocations 6, 7, 10) -----------------------------
+
+    #[test]
+    fn invocation_6_pattern_256_out_of_range() {
+        // The -w flag is present (matching the exact invocation) but
+        // must not matter: the pattern range check runs before the
+        // -w refusal in check order.
+        let args = BenchArgs {
+            pattern: Some("256".to_string()),
+            write: true,
+            count: Some("10".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid pattern byte specified. Must be between 0 and 255."
+        );
+    }
+
+    #[test]
+    fn invocation_7_pattern_negative_same_message() {
+        let args = BenchArgs {
+            pattern: Some("-1".to_string()),
+            write: true,
+            count: Some("10".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid pattern byte specified. Must be between 0 and 255."
+        );
+    }
+
+    #[test]
+    fn invocation_10_pattern_without_write_is_not_an_error() {
+        let args = BenchArgs {
+            pattern: Some("65".to_string()),
+            count: Some("100".to_string()),
+            ..default_bench_args()
+        };
+        let inv = validate_bench_args(&args).expect("pattern without -w must not error");
+        assert_eq!(inv.params.pattern, 65);
+        assert!(!inv.params.is_write);
+    }
+
+    #[test]
+    fn pattern_unparseable_gets_value_echoing_message() {
+        let args = BenchArgs {
+            pattern: Some("abc".to_string()),
+            write: true,
+            count: Some("10".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid pattern byte specified: 'abc'."
+        );
+    }
+
+    // --- --flush-interval range check (Supplement 2) -------------------
+
+    #[test]
+    fn flush_interval_unparseable_gets_value_echoing_message() {
+        let args = BenchArgs {
+            flush_interval: Some("abc".to_string()),
+            write: true,
+            depth: Some("1".to_string()),
+            count: Some("10".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid flush interval specified: 'abc'."
+        );
+    }
+
+    #[test]
+    fn flush_interval_negative_gets_range_form() {
+        let args = BenchArgs {
+            flush_interval: Some("-1".to_string()),
+            write: true,
+            depth: Some("1".to_string()),
+            count: Some("10".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid flush interval specified. Must be between 0 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn flush_interval_above_max_gets_range_form() {
+        let args = BenchArgs {
+            flush_interval: Some("2147483648".to_string()),
+            write: true,
+            depth: Some("1".to_string()),
+            count: Some("10".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid flush interval specified. Must be between 0 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn flush_interval_range_check_fires_before_cross_option_rules() {
+        // An out-of-range interval WITHOUT -w must produce the
+        // range message, not "--flush-interval is only available in
+        // write tests" -- the range check runs first (verified
+        // live; Supplement 2).
+        let args = BenchArgs {
+            flush_interval: Some("-1".to_string()),
+            count: Some("10".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid flush interval specified. Must be between 0 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn flush_interval_zero_without_write_is_silently_accepted() {
+        // Verified live: the cross-option check gates on the VALUE,
+        // not on flag presence -- an explicit 0 without -w runs.
+        let args = BenchArgs {
+            flush_interval: Some("0".to_string()),
+            count: Some("10".to_string()),
+            ..default_bench_args()
+        };
+        let inv = validate_bench_args(&args).expect("--flush-interval 0 without -w must validate");
+        assert_eq!(inv.params.flush_interval, 0);
+        assert!(!inv.params.is_write);
+    }
+
+    // --- --flush-interval cross-option rules (invocations 8, 9) ------
+
+    #[test]
+    fn invocation_8_flush_without_write_gives_qemu_cross_option_message() {
+        let args = BenchArgs {
+            flush_interval: Some("50".to_string()),
+            count: Some("100".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "--flush-interval is only available in write tests"
+        );
+    }
+
+    #[test]
+    fn invocation_9_flush_smaller_than_depth_gives_qemu_cross_option_message() {
+        // -w is present (and the -w refusal check runs LATER in our
+        // order), so this must surface the cross-option message, not
+        // the phase-4 -w refusal -- pinning the ordering note in
+        // validate_bench_args's doc comment.
+        let args = BenchArgs {
+            write: true,
+            depth: Some("64".to_string()),
+            flush_interval: Some("32".to_string()),
+            count: Some("100".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Flush interval can't be smaller than depth"
+        );
+    }
+
+    // --- -w now validates (phase 5) -----------------------------------
+
+    #[test]
+    fn write_flag_alone_now_validates() {
+        // Phase 4 refused `-w` outright in validate_bench_args; phase 5
+        // removed that blanket refusal (the write path exists, and the
+        // format-specific refusal for vmdk/vhd/vhdx moved to run_bench,
+        // after discovery). So a bare `-w` now passes validation with
+        // is_write set.
+        let args = BenchArgs {
+            write: true,
+            count: Some("100".to_string()),
+            ..default_bench_args()
+        };
+        let inv = validate_bench_args(&args).expect("-w must now validate");
+        assert!(inv.params.is_write);
+        assert_eq!(inv.params.count, 100);
+    }
+
+    // --- -t / -i / -n / --image-opts postures -------------------------
+
+    #[test]
+    fn cache_writeback_is_silently_accepted() {
+        let args = BenchArgs {
+            cache: Some("writeback".to_string()),
+            ..default_bench_args()
+        };
+        assert!(validate_bench_args(&args).is_ok());
+    }
+
+    #[test]
+    fn invocation_11_cache_mode_bogus_is_qemu_terse_text() {
+        let args = BenchArgs {
+            cache: Some("bogus".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Invalid cache mode"
+        );
+    }
+
+    #[test]
+    fn invocation_13_cache_none_is_refused_diverging_from_qemu() {
+        // Divergence-registry material: real qemu-img 10.0.8 accepts
+        // `-t none` and runs the benchmark (1e capture invocation
+        // 13); instar v1 refuses it outright.
+        let args = BenchArgs {
+            cache: Some("none".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "bench: cache mode 'none' is not yet supported"
+        );
+    }
+
+    #[test]
+    fn invocation_12_aio_bogus_gets_instar_worded_refusal() {
+        // Diverges from qemu's own "Invalid aio option: bogus" (1e
+        // capture invocation 12) by design (OQ6): every -i value is
+        // refused since no aio backend selection exists yet.
+        let args = BenchArgs {
+            aio: Some("bogus".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "bench: aio backend 'bogus' is not yet supported"
+        );
+    }
+
+    #[test]
+    fn native_aio_flag_is_refused() {
+        let args = BenchArgs {
+            native_aio: true,
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "bench: native AIO (-n) is not yet supported"
+        );
+    }
+
+    #[test]
+    fn invocation_14_image_opts_with_format_is_mutually_exclusive() {
+        let args = BenchArgs {
+            image_opts: true,
+            format: Some("raw".to_string()),
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "--image-opts and --format are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn image_opts_alone_is_refused() {
+        let args = BenchArgs {
+            image_opts: true,
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "bench: --image-opts is not yet supported"
+        );
+    }
+
+    #[test]
+    fn quiet_and_force_share_are_accepted_noops() {
+        let args = BenchArgs {
+            quiet: true,
+            force_share: true,
+            ..default_bench_args()
+        };
+        let inv = validate_bench_args(&args).expect("no-ops must not error");
+        assert!(inv.quiet);
+        assert!(inv.force_share);
+    }
+
+    // --- filename count (invocations 15, 16) ---------------------------
+
+    #[test]
+    fn invocation_15_zero_filenames() {
+        let args = BenchArgs {
+            filename: vec![],
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Expecting one image file name\nTry 'instar bench --help' for more info"
+        );
+    }
+
+    #[test]
+    fn invocation_16_two_filenames_same_message_as_zero() {
+        let args = BenchArgs {
+            filename: vec!["a.raw".to_string(), "b.raw".to_string()],
+            ..default_bench_args()
+        };
+        assert_eq!(
+            validate_bench_args(&args).unwrap_err(),
+            "Expecting one image file name\nTry 'instar bench --help' for more info"
+        );
+    }
+
+    // --- forward-compat tripwires (mirrors resize_error_codes_have_messages) ---
+
+    #[test]
+    fn bench_error_codes_have_messages() {
+        // Every numeric BenchResult::ERROR_* code we ship (0..=8) must
+        // render to a non-empty message, and an unknown code must
+        // name itself in the fallback text -- if a future ERROR_*
+        // lands without a matching arm in map_bench_error, this test
+        // catches the silent fallthrough.
+        for code in 0..=8u32 {
+            let msg = map_bench_error(code, 0);
+            assert!(!msg.is_empty(), "code {code} has empty message");
+        }
+        let unknown = map_bench_error(999, 0);
+        assert!(
+            unknown.contains("999"),
+            "unknown code fallback does not mention the code: {unknown}"
+        );
+    }
+
+    #[test]
+    fn bench_write_gate_ids_have_reasons() {
+        // Every documented write-gate id (0..=7, see
+        // BenchResult::ERROR_WRITE_UNSUPPORTED) must render to a
+        // non-empty reason; an unknown id must still fall through to
+        // a non-empty generic reason rather than an empty string.
+        for id in 0..=7u64 {
+            let msg = bench_write_gate_reason(id);
+            assert!(!msg.is_empty(), "gate id {id} has empty reason");
+        }
+        let unknown = bench_write_gate_reason(999);
+        assert!(
+            !unknown.is_empty(),
+            "unknown gate id fallback is empty: {unknown}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bench_clap_hyphen_tests {
+    //! Clap-LEVEL pins for negative numeric values. The
+    //! `bench_validate_tests` module constructs `BenchArgs` directly
+    //! and never exercises clap's own tokenizer -- which is exactly
+    //! the gap that let the 4c smoke run find `-c -1` dying inside
+    //! clap ("unexpected argument '-1' found", exit 2) instead of
+    //! reaching `validate_bench_args` and producing qemu's range
+    //! message (exit 1). These tests parse full argv vectors through
+    //! `Cli::try_parse_from` (the resize idiom) and assert both
+    //! halves of the contract: clap ACCEPTS the hyphen value thanks
+    //! to `allow_hyphen_values = true`, and `validate_bench_args`
+    //! then produces the exact 1e-capture message.
+    use super::*;
+    use clap::Parser;
+
+    /// Parse a full bench argv through clap and hand the resulting
+    /// `BenchArgs` to `validate_bench_args`, returning its Err
+    /// string. Panics if clap itself rejects the argv -- that is
+    /// the regression this module exists to catch.
+    fn clap_then_validate_err(argv: &[&str]) -> String {
+        let cli = Cli::try_parse_from(argv)
+            .unwrap_or_else(|e| panic!("clap rejected {argv:?} before validation: {e}"));
+        match cli.command {
+            Commands::Bench(args) => validate_bench_args(&args)
+                .expect_err("negative value must fail validation, not succeed"),
+            other => panic!("expected Bench, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn count_negative_reaches_validation() {
+        assert_eq!(
+            clap_then_validate_err(&["instar", "bench", "-c", "-1", "probe.raw"]),
+            "Invalid request count specified. Must be between 1 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn depth_negative_reaches_validation() {
+        assert_eq!(
+            clap_then_validate_err(&["instar", "bench", "-d", "-1", "probe.raw"]),
+            "Invalid queue depth specified. Must be between 1 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn buffer_size_negative_reaches_validation() {
+        assert_eq!(
+            clap_then_validate_err(&["instar", "bench", "-s", "-1", "probe.raw"]),
+            "Invalid buffer size specified. Must be between 1 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn step_size_negative_reaches_validation() {
+        assert_eq!(
+            clap_then_validate_err(&["instar", "bench", "-S", "-1", "probe.raw"]),
+            "Invalid step size specified. Must be between 0 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn offset_negative_reaches_validation() {
+        assert_eq!(
+            clap_then_validate_err(&["instar", "bench", "-o", "-1", "probe.raw"]),
+            "Invalid offset specified. Must be between 0 and 9223372036854775807."
+        );
+    }
+
+    #[test]
+    fn pattern_negative_reaches_validation() {
+        assert_eq!(
+            clap_then_validate_err(&["instar", "bench", "--pattern", "-1", "probe.raw"]),
+            "Invalid pattern byte specified. Must be between 0 and 255."
+        );
+    }
+
+    #[test]
+    fn flush_interval_negative_reaches_validation() {
+        // -w -d 1 so the flush-interval RANGE check is what fires
+        // (matching the qemu transcript in Supplement 2), not the
+        // "-flush-interval is only available in write tests" rule;
+        // the range check precedes the -w refusal (verified live
+        // in the 4c smoke run).
+        assert_eq!(
+            clap_then_validate_err(&[
+                "instar",
+                "bench",
+                "--flush-interval",
+                "-1",
+                "-w",
+                "-c",
+                "10",
+                "-d",
+                "1",
+                "probe.raw"
+            ]),
+            "Invalid flush interval specified. Must be between 0 and 2147483647."
+        );
+    }
+
+    #[test]
+    fn positive_values_still_parse_normally() {
+        // allow_hyphen_values must not disturb the ordinary path:
+        // a fully-populated positive argv still parses and
+        // validates cleanly.
+        let cli = Cli::try_parse_from([
+            "instar",
+            "bench",
+            "-c",
+            "100",
+            "-d",
+            "2",
+            "-s",
+            "8192",
+            "-S",
+            "0",
+            "-o",
+            "1k",
+            "probe.raw",
+        ])
+        .expect("clap parse");
+        match cli.command {
+            Commands::Bench(args) => {
+                let inv = validate_bench_args(&args).expect("must validate");
+                assert_eq!(inv.params.count, 100);
+                assert_eq!(inv.params.depth, 2);
+                assert_eq!(inv.params.bufsize, 8192);
+                assert_eq!(inv.params.step, 0);
+                assert_eq!(inv.params.offset, 1024);
+            }
+            other => panic!("expected Bench, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod bench_render_tests {
+    //! Byte-for-byte pins of the Mission-section-3 renderers
+    //! (`render_bench_header`, `render_bench_flush_line`,
+    //! `render_bench_completion`, `render_bench_json`) against the
+    //! 1e capture and the phase-04 plan's JSON schema.
+    use super::*;
+
+    fn params(
+        count: u32,
+        depth: u32,
+        bufsize: u64,
+        step: u64,
+        offset: u64,
+        is_write: bool,
+    ) -> BenchParams {
+        BenchParams {
+            count,
+            depth,
+            bufsize,
+            step,
+            offset,
+            is_write,
+            pattern: 0,
+            flush_interval: 0,
+            no_drain: false,
+        }
+    }
+
+    #[test]
+    fn header_matches_invocation_20_defaults_style() {
+        let p = params(100, 64, 4096, 0, 0, false);
+        assert_eq!(
+            render_bench_header(&p),
+            "Sending 100 read requests, 4096 bytes each, 64 in parallel \
+             (starting at offset 0, step size 4096)"
+        );
+    }
+
+    #[test]
+    fn header_step_zero_renders_as_effective_bufsize_invocation_24() {
+        let p = params(100, 64, 4096, 0, 0, false);
+        assert_eq!(
+            render_bench_header(&p),
+            "Sending 100 read requests, 4096 bytes each, 64 in parallel \
+             (starting at offset 0, step size 4096)"
+        );
+    }
+
+    #[test]
+    fn header_offset_decimal_invocation_18() {
+        let p = params(100, 64, 4096, 0, 1024, false);
+        assert_eq!(
+            render_bench_header(&p),
+            "Sending 100 read requests, 4096 bytes each, 64 in parallel \
+             (starting at offset 1024, step size 4096)"
+        );
+    }
+
+    #[test]
+    fn header_write_word_invocation_21() {
+        // -w's CLI path refuses the flag in phase 4, so this
+        // constructs BenchParams directly to pin the renderer's
+        // read/write word independent of that refusal.
+        let p = params(100, 1, 4096, 0, 0, true);
+        assert_eq!(
+            render_bench_header(&p),
+            "Sending 100 write requests, 4096 bytes each, 1 in parallel \
+             (starting at offset 0, step size 4096)"
+        );
+    }
+
+    #[test]
+    fn header_bufsize_65537_is_echoed_verbatim() {
+        let p = params(100, 64, 65537, 0, 0, false);
+        assert_eq!(
+            render_bench_header(&p),
+            "Sending 100 read requests, 65537 bytes each, 64 in parallel \
+             (starting at offset 0, step size 65537)"
+        );
+    }
+
+    #[test]
+    fn flush_line_renders_interval() {
+        assert_eq!(
+            render_bench_flush_line(50),
+            "Sending flush every 50 requests"
+        );
+    }
+
+    #[test]
+    fn completion_line_matches_invocation_20_precision() {
+        assert_eq!(
+            render_bench_completion(0.001),
+            "Run completed in 0.001 seconds."
+        );
+    }
+
+    #[test]
+    fn completion_line_rounds_to_three_decimals() {
+        assert_eq!(
+            render_bench_completion(12.3456),
+            "Run completed in 12.346 seconds."
+        );
+    }
+
+    #[test]
+    fn json_full_object_escapes_filename_and_orders_keys() {
+        let p = params(100, 1, 4096, 0, 0, false);
+        let filename = "weird\"name.raw";
+        let elapsed = 0.004321;
+        let out = render_bench_json(&p, filename, "raw", 3, elapsed);
+        let expected_rps = 100.0_f64 / elapsed;
+        let expected_bps = (100u64 * 4096) as f64 / elapsed;
+        let expected = format!(
+            "{{\n\
+             \x20   \"filename\": \"{}\",\n\
+             \x20   \"format\": \"raw\",\n\
+             \x20   \"count\": 100,\n\
+             \x20   \"depth\": 1,\n\
+             \x20   \"effective-depth\": 1,\n\
+             \x20   \"buffer-size\": 4096,\n\
+             \x20   \"step-size\": 4096,\n\
+             \x20   \"offset\": 0,\n\
+             \x20   \"write\": false,\n\
+             \x20   \"pattern\": 0,\n\
+             \x20   \"flush-interval\": 0,\n\
+             \x20   \"no-drain\": false,\n\
+             \x20   \"flushes-issued\": 3,\n\
+             \x20   \"elapsed-seconds\": 0.004321,\n\
+             \x20   \"requests-per-second\": {:.2},\n\
+             \x20   \"bytes-per-second\": {:.2}\n\
+             }}",
+            escape_json_string(filename),
+            expected_rps,
+            expected_bps,
+        );
+        assert_eq!(out, expected);
+    }
+}
+
 #[derive(Args, Debug)]
 struct MeasureArgs {
     /// Source image file. Mutually exclusive with --size.
@@ -3611,6 +5880,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Commit(args) => run_commit(args, verbose),
         Commands::Amend(args) => run_amend(args, verbose),
         Commands::Bitmap(args) => run_bitmap(&args, matches.subcommand_matches("bitmap"), verbose),
+        Commands::Bench(args) => run_bench(&args, verbose),
         Commands::Map(args) => run_map(args, verbose),
         Commands::Snapshot(args) => run_snapshot(args, verbose),
         Commands::Config(args) => run_config(args),
@@ -7203,6 +9473,9 @@ fn run_commit_guest(
         0,
         "commit",
         &[0],
+        // Commit's overlay-clear only zeroes existing L2 / refcount
+        // entries in place; the RW overlay never grows, so no hint.
+        None,
     )?;
 
     // Output device — backing, attached at the slot
@@ -7621,7 +9894,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
     debug!("Loaded core binary at 0x{GUEST_CODE_BASE:x}");
 
-    // Load operation binary at OPERATION_LOAD_ADDR (0x22000)
+    // Load operation binary at OPERATION_LOAD_ADDR (0x30000)
     guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
     debug!("Loaded operation binary at 0x{OPERATION_LOAD_ADDR:x}");
 
@@ -8449,7 +10722,7 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
     debug!("Loaded core binary at 0x{GUEST_CODE_BASE:x}");
 
-    // Load operation binary at OPERATION_LOAD_ADDR (0x22000)
+    // Load operation binary at OPERATION_LOAD_ADDR (0x30000)
     guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
     debug!("Loaded operation binary at 0x{OPERATION_LOAD_ADDR:x}");
 
@@ -9171,7 +11444,7 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     guest_mem.write_slice(&core_code, GuestAddress(GUEST_CODE_BASE))?;
     debug!("Loaded core binary at 0x{GUEST_CODE_BASE:x}");
 
-    // Load operation binary at OPERATION_LOAD_ADDR (0x22000)
+    // Load operation binary at OPERATION_LOAD_ADDR (0x30000)
     guest_mem.write_slice(&operation_code, GuestAddress(OPERATION_LOAD_ADDR))?;
     debug!("Loaded operation binary at 0x{OPERATION_LOAD_ADDR:x}");
 

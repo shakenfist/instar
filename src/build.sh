@@ -4,15 +4,16 @@
 # Instar provides safe, sandboxed disk image operations using KVM isolation.
 # The instar binary loads:
 #   - core.bin at 0x10000 (device initialization, call table)
-#   - info.bin at 0x22000 (format detection operation)
-#   - copy.bin at 0x22000 (copy operation, same address as info)
-#   - check.bin at 0x22000 (integrity check operation, same address as info)
-#   - compare.bin at 0x22000 (image comparison operation, same address as info)
-#   - convert.bin at 0x22000 (image conversion operation, same address as info)
-#   - measure.bin at 0x22000 (disk measurement operation, same address as info)
-#   - create.bin at 0x22000 (image creation operation, same address as info)
-#   - map.bin at 0x22000 (allocation map operation, same address as info)
-#   - snapshot.bin at 0x22000 (snapshot operation, same address as info)
+#   - info.bin at 0x30000 (format detection operation)
+#   - copy.bin at 0x30000 (copy operation, same address as info)
+#   - check.bin at 0x30000 (integrity check operation, same address as info)
+#   - compare.bin at 0x30000 (image comparison operation, same address as info)
+#   - convert.bin at 0x30000 (image conversion operation, same address as info)
+#   - measure.bin at 0x30000 (disk measurement operation, same address as info)
+#   - create.bin at 0x30000 (image creation operation, same address as info)
+#   - map.bin at 0x30000 (allocation map operation, same address as info)
+#   - snapshot.bin at 0x30000 (snapshot operation, same address as info)
+#   - bench.bin at 0x30000 (read/write throughput benchmark, same address as info)
 
 set -e
 
@@ -304,6 +305,25 @@ else
 fi
 
 echo ""
+echo "=== Building bench operation ==="
+cd operations/bench
+cargo +nightly build --release
+cd ../..
+
+# Convert bench ELF to flat binary
+echo "=== Converting bench ELF to flat binary ==="
+BENCH_ELF="target/x86_64-unknown-none/release/bench"
+BENCH_BIN="bench.bin"
+
+if [ -f "$BENCH_ELF" ]; then
+    rust-objcopy -O binary "$BENCH_ELF" "$BENCH_BIN"
+    echo "Created $BENCH_BIN ($(wc -c < "$BENCH_BIN") bytes)"
+else
+    echo "Error: Bench ELF not found at $BENCH_ELF"
+    exit 1
+fi
+
+echo ""
 echo "=== Building instar ==="
 cd vmm
 cargo build --release
@@ -327,13 +347,14 @@ cp "$MAP_BIN" target/release/
 cp "$SNAPSHOT_BIN" target/release/
 cp "$AMEND_BIN" target/release/
 cp "$BITMAP_BIN" target/release/
-echo "Copied core.bin, info.bin, copy.bin, check.bin, compare.bin, convert.bin, measure.bin, create.bin, resize.bin, rebase.bin, commit.bin, map.bin, snapshot.bin, amend.bin, and bitmap.bin to target/release/"
+cp "$BENCH_BIN" target/release/
+echo "Copied core.bin, info.bin, copy.bin, check.bin, compare.bin, convert.bin, measure.bin, create.bin, resize.bin, rebase.bin, commit.bin, map.bin, snapshot.bin, amend.bin, bitmap.bin, and bench.bin to target/release/"
 
 # Check binary sizes against memory layout limits.
 #
 # Memory layout (from shared/src/lib.rs): core loads at 0x10000 and must
-# fit before operations at 0x22000 (72KB); operations load at 0x22000 and
-# must fit before the call table at 0x80000 (376KB).
+# fit before operations at 0x30000 (128KB); operations load at 0x30000 and
+# must fit before the call table at 0xF0000 (768KB).
 #
 # This is a coarse build-time guard on the flat .bin file size, which does
 # NOT include .bss. The AUTHORITATIVE check is scripts/check-binary-sizes.sh
@@ -343,8 +364,8 @@ echo "Copied core.bin, info.bin, copy.bin, check.bin, compare.bin, convert.bin, 
 # the rust-objcopy/LLVM build container, which lacks GNU readelf.)
 echo ""
 echo "=== Checking binary sizes against memory layout ==="
-CORE_MAX=$((0x22000 - 0x10000))   # 72KB: 0x10000..0x22000
-OP_MAX=$((0x80000 - 0x22000))     # 376KB: 0x22000..0x80000
+CORE_MAX=$((0x30000 - 0x10000))   # 128KB: 0x10000..0x30000
+OP_MAX=$((0xF0000 - 0x30000))     # 768KB: 0x30000..0xF0000
 FAILED=0
 
 check_size() {
@@ -381,6 +402,7 @@ check_size "map.bin" "target/release/$MAP_BIN" "$OP_MAX" || FAILED=1
 check_size "snapshot.bin" "target/release/$SNAPSHOT_BIN" "$OP_MAX" || FAILED=1
 check_size "amend.bin" "target/release/$AMEND_BIN" "$OP_MAX" || FAILED=1
 check_size "bitmap.bin" "target/release/$BITMAP_BIN" "$OP_MAX" || FAILED=1
+check_size "bench.bin" "target/release/$BENCH_BIN" "$OP_MAX" || FAILED=1
 
 if [ "$FAILED" -eq 1 ]; then
     echo ""
@@ -395,20 +417,21 @@ echo ""
 echo "Binaries (all in target/release/):"
 echo "  - instar          Safe, sandboxed disk image operations"
 echo "  - core.bin       Core guest (device init, call table) - loaded at 0x10000"
-echo "  - info.bin       Info operation (format detection) - loaded at 0x22000"
-echo "  - copy.bin       Copy operation (file copy) - loaded at 0x22000"
-echo "  - check.bin      Check operation (integrity validation) - loaded at 0x22000"
-echo "  - compare.bin    Compare operation (image comparison) - loaded at 0x22000"
-echo "  - convert.bin    Convert operation (image conversion) - loaded at 0x22000"
-echo "  - measure.bin    Measure operation (disk measurement) - loaded at 0x22000"
-echo "  - create.bin     Create operation (empty image creation) - loaded at 0x22000"
-echo "  - resize.bin     Resize operation (in-place image resize) - loaded at 0x22000"
-echo "  - rebase.bin     Rebase operation (change backing-file reference) - loaded at 0x22000"
-echo "  - commit.bin     Commit operation (merge overlay into backing) - loaded at 0x22000"
-echo "  - map.bin        Map operation (stream allocation map) - loaded at 0x22000"
-echo "  - snapshot.bin   Snapshot operation (list/apply/create/delete) - loaded at 0x22000"
-echo "  - amend.bin      Amend operation (change qcow2 compat / lazy refcounts) - loaded at 0x22000"
-echo "  - bitmap.bin     Bitmap operation (mutate qcow2 persistent dirty bitmaps) - loaded at 0x22000"
+echo "  - info.bin       Info operation (format detection) - loaded at 0x30000"
+echo "  - copy.bin       Copy operation (file copy) - loaded at 0x30000"
+echo "  - check.bin      Check operation (integrity validation) - loaded at 0x30000"
+echo "  - compare.bin    Compare operation (image comparison) - loaded at 0x30000"
+echo "  - convert.bin    Convert operation (image conversion) - loaded at 0x30000"
+echo "  - measure.bin    Measure operation (disk measurement) - loaded at 0x30000"
+echo "  - create.bin     Create operation (empty image creation) - loaded at 0x30000"
+echo "  - resize.bin     Resize operation (in-place image resize) - loaded at 0x30000"
+echo "  - rebase.bin     Rebase operation (change backing-file reference) - loaded at 0x30000"
+echo "  - commit.bin     Commit operation (merge overlay into backing) - loaded at 0x30000"
+echo "  - map.bin        Map operation (stream allocation map) - loaded at 0x30000"
+echo "  - snapshot.bin   Snapshot operation (list/apply/create/delete) - loaded at 0x30000"
+echo "  - amend.bin      Amend operation (change qcow2 compat / lazy refcounts) - loaded at 0x30000"
+echo "  - bitmap.bin     Bitmap operation (mutate qcow2 persistent dirty bitmaps) - loaded at 0x30000"
+echo "  - bench.bin      Bench operation (read/write throughput benchmark) - loaded at 0x30000"
 echo ""
 echo "To run:"
 echo "  sudo ./target/release/instar info image.qcow2"

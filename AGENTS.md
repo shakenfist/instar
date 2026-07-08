@@ -17,7 +17,7 @@ instar/
 │   ├── core/       # Core guest initialization
 │   ├── crates/     # Shared format crates (qcow2, raw, vmdk, vhd, vhdx, luks)
 │   ├── shared/     # Shared library code (byte-order helpers, configs)
-│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, dd, measure, create, resize, rebase, commit, map, snapshot, amend, bitmap)
+│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, dd, measure, create, resize, rebase, commit, map, snapshot, amend, bitmap, bench)
 │   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates (guest-protocol)
 ├── prototypes/     # Experimental implementations (11 KVM prototypes)
@@ -158,6 +158,21 @@ vhdx (VHDX), luks (info + convert with decryption)
   integration parity against `qemu-img bitmap`, cross-version
   baselines, and coverage + differential fuzzing. See
   [docs/bitmap.md](docs/bitmap.md).
+- `bench`: issue a scripted sequence of read/write requests against a
+  disk image and report how long they took — the sandboxed equivalent
+  of `qemu-img bench`, except it measures instar's own end-to-end
+  sandboxed I/O path (guest format layer → virtio-block → host I/O
+  thread) rather than qemu's block layer over the page cache, so the
+  two tools' numbers are comparable only to each other on an identical
+  invocation, never in isolation. Reads all five formats; write tests
+  (`-w`) are supported on raw and qcow2 only, including qcow2 overlays.
+  `--output {human,json}` mirrors qemu's human output byte-for-byte or
+  emits a stable JSON schema for regression tracking.
+  `CallTable::VERSION` bumped from 19 to 20 for the appended
+  `send_bench_start`/`send_bench_result` callbacks. Covered by
+  `tests/test_bench.py` (62 tests), the `fuzz_bench_schedule` coverage
+  fuzzer, and the differential fuzzer's `op_bench` arm. See
+  [docs/bench.md](docs/bench.md).
 
 ## Working on This Project
 
@@ -369,6 +384,11 @@ make clean-tests
   round-trips (create/delete/apply) with `qemu-img check` post-op
   assertions, error paths and qcow2-only enforcement, empty-table
   behaviour. JSON goldens in `tests/golden/snapshot-list/`.
+- `tests/test_bench.py` - Integration tests for the `instar bench`
+  subcommand (62 tests): read/write request scheduling, host-side
+  validation matrix, the qcow2 write-envelope gates, `--output json`
+  schema validation, human-output byte-parity with `qemu-img bench`,
+  and the `KNOWN_BENCH_DIVERGENCES` registry.
 - `tests/expected_outputs/` - Expected output files for malicious images
 
 **Adding new test images:**

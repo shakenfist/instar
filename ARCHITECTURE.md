@@ -573,6 +573,32 @@ provides a modular architecture with:
   `tests/test_bitmap.py` integration parity against `qemu-img
   bitmap`, cross-version baselines, and fuzzing. See
   [docs/bitmap.md](docs/bitmap.md).
+- **operations/bench/** - I/O benchmark operation (PLAN-bench), the
+  sandboxed equivalent of `qemu-img bench`. Measures instar's own
+  end-to-end sandboxed path (guest format layer → virtio-block →
+  ioeventfd → host I/O thread → file I/O) rather than qemu's block
+  layer over the page cache; running both tools against the same
+  image and arguments is the reproducible sandbox-overhead
+  measurement (see [docs/bench.md](docs/bench.md)). The host side
+  validates the full option surface (echoed-but-unobeyed `-d`,
+  buffer-size cap, cache/aio/image-opts postures) before launching
+  the guest with a `BenchConfig`; the guest driver is synchronous
+  and single-buffer in v1 (`effective-depth` always `1`), submitting
+  each scheduled request in turn and timing the run between the
+  `send_bench_start` marker (emitted once setup completes) and the
+  terminal `send_bench_result`. Reads all five formats; write tests
+  (`-w`) are supported on raw and qcow2 only (including qcow2
+  overlays), using a write-through-for-metadata/staged-for-refcounts
+  design so a mid-run crash leaves at worst a repairable leak. The
+  pure `no_std` `crates/bench` crate provides the request-schedule
+  math shared by the host CLI and tests. `bench.bin` builds at
+  160224 bytes (~157 KiB) of the 768 KiB operation-region budget. The
+  ABI appends two
+  call-table callbacks (`send_bench_start`, `send_bench_result`),
+  bumping `CallTable::VERSION` from 19 to 20. Coverage:
+  `tests/test_bench.py` (62 tests), the `fuzz_bench_schedule`
+  coverage fuzzer, and the differential fuzzer's `op_bench` arm. See
+  [docs/bench.md](docs/bench.md).
 - **shared/** - Shared library code between components (call table, configs,
   format detection, memory layout constants, shared utilities,
   `bump_allocator!` macro for operations needing heap allocation,
@@ -601,7 +627,12 @@ provides a modular architecture with:
   per call), `send_snapshot_result`, and `fsync_input` (the
   guest-visible write barrier the mutating modes use between
   write groups) — bumping CallTable VERSION from 16 to 17, same
-  append-at-end discipline.
+  append-at-end discipline. `PLAN-amend.md` and `PLAN-bitmap.md`
+  each append one more entry (`send_amend_result`,
+  `send_bitmap_result`), bumping VERSION 17→18→19; `PLAN-bench.md`
+  appends two — `send_bench_start` (the timing-bracket start marker)
+  and `send_bench_result` (the terminal result) — bumping VERSION
+  from 19 to 20, same append-at-end discipline throughout.
 
 **Chain validation in check (`--chain`):**
 The check operation supports an optional `--chain` flag that uses the host-side
@@ -624,18 +655,24 @@ The rust-vmm project provides crates that reduce implementation effort by 70%+:
 
 The guest runs in 32 MiB of physical memory (`GUEST_MEM_SIZE = 0x2000000`).
 Constants are defined in `src/shared/src/lib.rs` with compile-time overlap
-checks.
+checks. The core and operation regions, and the data pages that follow
+them, were lifted on 2026-07-06 (commit `3a5e1e2`) to give both budgets
+headroom after `core.bin` reached 94% of its previous 72 KiB limit
+following the bench ABI additions; nothing at or above the virtqueue
+region (`VQ_BASE_START`) moved.
 
 ```
 Address         Size    Region
 ──────────────  ──────  ─────────────────────────────────────────
 0x0000_1000             GDT
 0x0000_2000             Page tables
-0x0001_0000     64 KiB  core.bin (guest entry point)
-0x0002_0000    384 KiB  Operation binary (info/copy/check)
-0x0008_0000      4 KiB  Call table
-0x0008_1000      4 KiB  Operation config
-0x0008_2000      1 KiB  Chain config
+0x0001_0000    128 KiB  core.bin (guest entry point)
+0x0003_0000    768 KiB  Operation binary (whichever op is loaded)
+0x000F_0000      4 KiB  Call table
+0x000F_1000      4 KiB  Operation config
+0x000F_2000      1 KiB  Chain config
+0x000F_3000      4 KiB  VMM params
+0x000F_4000     48 KiB  ── guard gap ──
 0x0010_0000      1 MiB  Virtqueue memory (16 devices × 64 KiB)
 0x0020_0000     64 KiB  DMA pool
 0x0030_0000   12.9 MiB  Scratch memory (temporary bitmaps/buffers)
@@ -644,6 +681,17 @@ Address         Size    Region
 0x0140_0000   12.0 MiB  (unused)
 0x0200_0000             End of guest memory
 ```
+
+`GUEST_CODE_BASE`/core loads at `0x10000` and may extend to
+`OPERATION_LOAD_ADDR` (`0x30000`, 128 KiB max); the operation binary
+loads at `0x30000` and may extend to `CALL_TABLE_ADDR` (`0xF0000`,
+768 KiB max). `scripts/check-binary-sizes.sh` enforces both budgets
+against each binary's `.bss`-inclusive ELF memory extent, not just the
+flat `.bin` file size. The four data pages (call table, operation
+config, chain config, VMM params) occupy `[0xF0000, 0xF4000)`,
+followed by a 48 KiB guard gap up to `VQ_BASE_START` (`0x100000`).
+Virtqueue memory and everything above it (DMA pool, scratch, the
+64 KiB pre-stack guard gap, and the stack) is unchanged by the lift.
 
 See [docs/chain-config.md](docs/chain-config.md) for the chain config
 structure layout and VMM-to-guest data flow.
@@ -935,7 +983,7 @@ A mock `CallTable` (in `src/fuzz/src/lib.rs`) backed by thread-local
 fuzzer input provides sector-based I/O, allowing libFuzzer to explore
 deeply malformed inputs.
 
-29 fuzz targets cover all parser crates: format detection, header
+30 fuzz targets cover all parser crates: format detection, header
 parsing (QCOW2, VMDK, VHD, VHDX, RAW, LUKS), L1/L2 cluster lookup,
 refcount table traversal, zlib decompression, grain directory lookup,
 BAT traversal, VHDX metadata parsing, the measure subcommand's
@@ -966,7 +1014,7 @@ planners get `fuzz_check_repair` (the qcow2 leak-reclamation,
 refcount-correction, count-accumulation, and COPIED-reconciliation
 planners, asserting sub-byte-masked containment, tally correctness,
 the overflow/bounds error classifications, and idempotence).
-Finally, the dd subcommand adds `fuzz_dd_window` (the pure
+The dd subcommand adds `fuzz_dd_window` (the pure
 input-window math — count-clamp / skip-subtract / empty-on-overrun
 with saturating arithmetic), `fuzz_chs_rounded_size` (VHD/VHDX CHS
 geometry rounding) and `fuzz_dd_read` (the byte-accurate windowed
@@ -975,7 +1023,10 @@ qcow2 read primitives). The amend subcommand adds
 `fuzz_bitmap_parse` (the qcow2 bitmap directory/table/extension
 parsers) plus `fuzz_bitmap_planners` (the bitmap crate's
 directory/action/merge functions over synthesised
-directory+refblocks).
+directory+refblocks). Finally, the bench subcommand adds
+`fuzz_bench_schedule` (the pure `crates/bench` schedule math: param
+validation, offset advance, transfer splitting, and flush cadence,
+over a deliberately unclamped fuzzed header).
 
 The seed corpus is extracted from `instar-testdata` by
 `scripts/extract-fuzz-corpus.py`, which filters images by format,

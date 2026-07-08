@@ -3,9 +3,9 @@
 # Check that guest binaries fit within their memory regions.
 #
 # Memory layout (from shared/src/lib.rs):
-#   - Core loads at 0x10000, must fit before operations at 0x22000 (max 72KB)
-#   - Operations load at 0x22000, must fit before the call table at 0x80000
-#     (max 376KB)
+#   - Core loads at 0x10000, must fit before operations at 0x30000 (max 128KB)
+#   - Operations load at 0x30000, must fit before the call table at 0xF0000
+#     (max 768KB)
 #
 # IMPORTANT: this checks each binary's *runtime memory footprint* (the
 # .bss-inclusive ELF extent), NOT the flat .bin file size. The flat
@@ -17,18 +17,19 @@
 # VirtioBlock struct over the loaded operation's code, corrupting amend's
 # header cross-check. The old file-size-only check missed it because the
 # .bin was under budget. OPERATION_LOAD_ADDR was raised 0x20000 -> 0x22000
-# to give core room, and this check now uses the ELF memory extent.
+# (then 0x22000 -> 0x30000, lifting the core budget to 128KB) to give core
+# room, and this check now uses the ELF memory extent.
 
 set -e
 
 # Memory layout constants (in bytes). Keep in sync with shared/src/lib.rs:
-#   GUEST_CODE_BASE = 0x10000, OPERATION_LOAD_ADDR = 0x22000,
-#   CALL_TABLE_ADDR = 0x80000.
+#   GUEST_CODE_BASE = 0x10000, OPERATION_LOAD_ADDR = 0x30000,
+#   CALL_TABLE_ADDR = 0xF0000.
 CORE_BASE=$((0x10000))
-OPERATION_BASE=$((0x22000))
-CALL_TABLE_ADDR=$((0x80000))
-CORE_MAX_SIZE=$((OPERATION_BASE - CORE_BASE))           # 72KB: 0x10000..0x22000
-OPERATION_MAX_SIZE=$((CALL_TABLE_ADDR - OPERATION_BASE)) # 376KB: 0x22000..0x80000
+OPERATION_BASE=$((0x30000))
+CALL_TABLE_ADDR=$((0xF0000))
+CORE_MAX_SIZE=$((OPERATION_BASE - CORE_BASE))           # 128KB: 0x10000..0x30000
+OPERATION_MAX_SIZE=$((CALL_TABLE_ADDR - OPERATION_BASE)) # 768KB: 0x30000..0xF0000
 
 # Early-warning threshold: a binary at or above this percent of its
 # region is flagged (without failing) so the layout gets attention
@@ -111,13 +112,13 @@ echo ""
 failed=0
 
 # Check core binary
-if ! check_size "core" "$CORE_BASE" "$CORE_MAX_SIZE" "core (0x10000-0x22000)"; then
+if ! check_size "core" "$CORE_BASE" "$CORE_MAX_SIZE" "core (0x10000-0x30000)"; then
     failed=1
 fi
 
 # Check operation binaries
-for op in info copy check compare convert measure create rebase resize commit snapshot amend bitmap; do
-    if ! check_size "$op" "$OPERATION_BASE" "$OPERATION_MAX_SIZE" "${op} (0x22000-0x80000)"; then
+for op in info copy check compare convert measure create rebase resize commit snapshot amend bitmap bench; do
+    if ! check_size "$op" "$OPERATION_BASE" "$OPERATION_MAX_SIZE" "${op} (0x30000-0xF0000)"; then
         failed=1
     fi
 done

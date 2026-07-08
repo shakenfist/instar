@@ -1,0 +1,9 @@
+[package]
+name = "bench"
+version = "0.2.0"
+edition = "2021"
+description = "Compute the bench request schedule, transfer split, and flush cadence (no I/O)"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]

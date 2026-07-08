@@ -768,6 +768,44 @@ pub fn bitmap_result_message(
     msg
 }
 
+/// Build a `BenchStartMessage` envelope marking the start of the
+/// bench timing bracket. Deliberately empty: the host timestamps
+/// its arrival on receipt, so there are no fields to set. Mirrors
+/// `progress_message`'s level — this is a mid-run marker, not a
+/// terminal result.
+pub fn bench_start_message() -> guest_::GuestMessage {
+    let mut msg = guest_::GuestMessage::default();
+    msg.level = guest_::Level::Progress;
+
+    let start = guest_::BenchStartMessage::default();
+
+    msg.payload = Some(guest_::GuestMessage_::Payload::BenchStart(start));
+    msg
+}
+
+/// Build a `BenchResultMessage` envelope from the bench
+/// operation's fields. Mirrors `bitmap_result_message` — the
+/// fields are numeric-passthrough (the host renders any
+/// human-readable summary).
+pub fn bench_result_message(
+    error: u32,
+    requests_completed: u64,
+    flushes_issued: u64,
+    error_detail: u64,
+) -> guest_::GuestMessage {
+    let mut msg = guest_::GuestMessage::default();
+    msg.level = guest_::Level::Info;
+
+    let mut result = guest_::BenchResultMessage::default();
+    result.error = error;
+    result.requests_completed = requests_completed;
+    result.flushes_issued = flushes_issued;
+    result.error_detail = error_detail;
+
+    msg.payload = Some(guest_::GuestMessage_::Payload::BenchResult(result));
+    msg
+}
+
 /// Build a `MapExtentMessage` envelope for one coalesced map
 /// extent. Streamed one-per-extent during the map operation;
 /// the host accumulates them into the rendered output.
