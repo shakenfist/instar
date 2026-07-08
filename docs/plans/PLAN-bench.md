@@ -622,7 +622,8 @@ the following statements will be true:
 
 ### Future work
 
-Obvious extensions deferred from v1:
+Obvious extensions deferred from v1 (the last three were added by
+the pre-push audit's advisory findings):
 
 * **True queue depth.** Rework the guest virtio driver (per-slot
   DMA buffers, batched avail-ring submission, completion polling
@@ -651,6 +652,29 @@ Obvious extensions deferred from v1:
 * **A host-path measurement mode** (explicit instar-only flag), if
   a concrete need to separate sandbox overhead from file-I/O cost
   appears (Open question 9 decided v1 is guest-only).
+* **Extract the byte-range RMW helper.** bench's
+  `write_input_byte_range`/`read_input_byte_range` are the third
+  and fourth near-identical copies of the ~35-line
+  sector-straddling read-modify-write primitive (commit and
+  bitmap carry the others). A shared helper (likely in
+  `src/shared`) should replace the copies; the allocator
+  precedent (`snapshot::qcow2`) shows the shape. (Pre-push audit
+  2a.)
+* **Cap `rw_capacity_hint` at an absolute ceiling.** The bench
+  `-w` capacity hint derives from a hostile qcow2 header's
+  `virtual_size` (`max(file, virtual)·2`, floored at 1 GiB).
+  Real growth is bounded by the guest allocator's
+  `WRITE_MAX_REFBLOCKS` coverage (~64 GiB) and exceeding it needs
+  a guest RCE, matching the sister RW ops' posture — but a sane
+  absolute cap would be cheap defense-in-depth. (Pre-push audit
+  2d, rated low.)
+* **Exercise the unhit write-error paths.** `ERROR_ALLOC_EXHAUSTED`
+  (needs an image whose populated refblocks exceed the staging
+  budget), mid-run `ERROR_IO_WRITE`/`ERROR_IO_FLUSH` (need fault
+  injection), and the write-loop EOF-overrun branch have no test
+  coverage at any level; they share logic with exhaustively
+  tested paths but carry zero direct evidence. (Pre-push audit
+  2b.)
 
 ### Findings: allocating-write reuse for `-w` on qcow2 (OQ4, step 1d)
 

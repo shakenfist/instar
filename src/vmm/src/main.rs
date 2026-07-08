@@ -3556,10 +3556,10 @@ struct BenchArgs {
     #[arg(short = 'o', value_name = "OFFSET", allow_hyphen_values = true)]
     offset: Option<String>,
 
-    /// Run a write test instead of a read test. Accepted by the
-    /// parser so `--help` documents the full surface, but refused
-    /// at runtime in phase 4 with `bench: write tests (-w) are not
-    /// yet supported`.
+    /// Run a write test instead of a read test. Write tests are
+    /// supported for raw and qcow2 (including overlays); every other
+    /// discovered top format is refused at runtime with `bench:
+    /// write tests are not yet supported for <fmt>`.
     #[arg(short = 'w')]
     write: bool,
 
@@ -4071,10 +4071,11 @@ fn render_bench_json(
 
 /// Host-side holder for the harvested `BenchResultMessage`. Mirrors
 /// `BitmapRunResult`: `error` and `flushes_issued` drive the error
-/// mapping / json envelope; `requests_completed` and `error_detail`
-/// are harvested for completeness (and the debug `format_message`
-/// arm) but not read on the success path, hence the `dead_code`
-/// allow.
+/// mapping / json envelope, and `error_detail` feeds
+/// `map_bench_error`'s write-gate rendering on the error path.
+/// `requests_completed` is harvested for completeness (and the debug
+/// `format_message` arm) but is not otherwise read, hence the
+/// `dead_code` allow.
 #[allow(dead_code)]
 struct BenchRunResult {
     error: u32,
@@ -5323,6 +5324,43 @@ mod bench_validate_tests {
         assert_eq!(
             validate_bench_args(&args).unwrap_err(),
             "Expecting one image file name\nTry 'instar bench --help' for more info"
+        );
+    }
+
+    // --- forward-compat tripwires (mirrors resize_error_codes_have_messages) ---
+
+    #[test]
+    fn bench_error_codes_have_messages() {
+        // Every numeric BenchResult::ERROR_* code we ship (0..=8) must
+        // render to a non-empty message, and an unknown code must
+        // name itself in the fallback text -- if a future ERROR_*
+        // lands without a matching arm in map_bench_error, this test
+        // catches the silent fallthrough.
+        for code in 0..=8u32 {
+            let msg = map_bench_error(code, 0);
+            assert!(!msg.is_empty(), "code {code} has empty message");
+        }
+        let unknown = map_bench_error(999, 0);
+        assert!(
+            unknown.contains("999"),
+            "unknown code fallback does not mention the code: {unknown}"
+        );
+    }
+
+    #[test]
+    fn bench_write_gate_ids_have_reasons() {
+        // Every documented write-gate id (0..=7, see
+        // BenchResult::ERROR_WRITE_UNSUPPORTED) must render to a
+        // non-empty reason; an unknown id must still fall through to
+        // a non-empty generic reason rather than an empty string.
+        for id in 0..=7u64 {
+            let msg = bench_write_gate_reason(id);
+            assert!(!msg.is_empty(), "gate id {id} has empty reason");
+        }
+        let unknown = bench_write_gate_reason(999);
+        assert!(
+            !unknown.is_empty(),
+            "unknown gate id fallback is empty: {unknown}"
         );
     }
 }

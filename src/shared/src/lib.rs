@@ -5242,6 +5242,42 @@ mod tests {
     }
 
     #[test]
+    fn bench_config_is_valid_checks_magic() {
+        let mut cfg = BenchConfig {
+            magic: BenchConfig::MAGIC,
+            flags: 0,
+            count: 0,
+            depth: 0,
+            bufsize: 0,
+            step: 0,
+            offset: 0,
+            flush_interval: 0,
+            pattern: 0,
+            target_format: 0,
+            sector_size: 0,
+            _reserved: [0; 72],
+        };
+        assert!(cfg.is_valid());
+        cfg.magic = 0;
+        assert!(!cfg.is_valid());
+    }
+
+    #[test]
+    fn bench_result_is_valid_checks_magic() {
+        let mut r = BenchResult {
+            magic: BenchResult::MAGIC,
+            error: BenchResult::ERROR_OK,
+            requests_completed: 0,
+            flushes_issued: 0,
+            error_detail: 0,
+            _reserved: [0; 32],
+        };
+        assert!(r.is_valid());
+        r.magic = 0;
+        assert!(!r.is_valid());
+    }
+
+    #[test]
     fn bitmap_config_is_valid_checks_magic() {
         let mut cfg = BitmapConfig {
             magic: BitmapConfig::MAGIC,

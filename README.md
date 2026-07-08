@@ -735,7 +735,7 @@ instar/
 │   │   ├── luks/   # LUKS header parsing, KDF, AFsplitter, decryption
 │   │   └── ...     # Per-operation planner crates (measure, create,
 │   │               # resize, rebase, commit, snapshot)
-│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, measure, create, resize, rebase, commit, map, snapshot, amend, dd, bitmap)
+│   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, measure, create, resize, rebase, commit, map, snapshot, amend, dd, bitmap, bench)
 │   └── build.sh    # Build script
 ├── crates/         # Shared Rust crates
 │   └── guest-protocol/ # Protocol Buffers messaging for guests
@@ -932,7 +932,7 @@ cd src/fuzz
 cargo fuzz run fuzz_qcow2_header -- -max_total_time=60
 ```
 
-27 fuzz targets cover all parser crates (QCOW2, VMDK, VHD, VHDX, RAW,
+30 fuzz targets cover all parser crates (QCOW2, VMDK, VHD, VHDX, RAW,
 LUKS) including header parsing, L1/L2 lookup, refcount traversal, and
 decompression, plus the create / resize / rebase / commit planners,
 the qcow2 check-repair planners (`fuzz_check_repair`), the map extent

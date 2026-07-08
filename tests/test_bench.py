@@ -1011,14 +1011,15 @@ class TestBenchWrite(BenchTestBase):
 
 
 class TestBenchWriteRefusals(BenchTestBase):
-    """Write-path gate contracts (Mission §3; ~7 tests).
+    """Write-path gate contracts (Mission §3; ~10 tests).
 
     vmdk/vhd/vhdx are refused HOST-SIDE (Mission §3's "-w host-side
     format gate", `run_bench`, before the header prints or the guest
     launches) so those three need no `/dev/kvm` guard; internal
-    snapshots, refcount_bits=1, compression, and LUKS encryption are
+    snapshots, refcount_bits=1, compression, LUKS encryption,
+    extended L2, an external data file, and the dirty bit are all
     refused GUEST-SIDE (the qcow2 write envelope gates checked before
-    `send_bench_start`), so those four launch the guest and need the
+    `send_bench_start`), so those seven launch the guest and need the
     guard. Every case additionally asserts the image's sha256 is
     unchanged -- a refused write must not touch the file.
     """
@@ -1089,6 +1090,72 @@ class TestBenchWriteRefusals(BenchTestBase):
                 img, 'qcow2',
                 'bench: write tests are not supported for this image '
                 '(encryption)')
+
+    def test_refuse_extended_l2(self):
+        self._require_kvm()
+        with tempfile.TemporaryDirectory() as td:
+            img = Path(td) / 'el2.qcow2'
+            r = subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-o', 'compat=1.1,extended_l2=on', str(img), '64M'],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 0, f'create failed: {r.stderr}')
+            self._assert_write_refused(
+                img, 'qcow2',
+                'bench: write tests are not supported for this image '
+                '(extended L2)')
+
+    def test_refuse_external_data_file(self):
+        """External data file (`-o data_file=`): verified live that
+        `discover_backing_chain` does NOT refuse an external-data
+        qcow2 host-side for bench (unlike commit/rebase, which refuse
+        it explicitly) -- the image is opened read-only, resolved,
+        and passed through to the guest, where the write-envelope
+        gate (id 4, "external data file") fires instead. No host-side
+        chain-discovery refusal pre-empts it.
+        """
+        self._require_kvm()
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            r = subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw', 'ext.raw', '64M'],
+                cwd=str(td), capture_output=True, text=True, timeout=30)
+            self.assertEqual(
+                r.returncode, 0, f'create raw data file failed: {r.stderr}')
+            img = td / 'extdata.qcow2'
+            r = subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-o', 'compat=1.1,data_file=ext.raw', 'extdata.qcow2', '64M'],
+                cwd=str(td), capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 0, f'create failed: {r.stderr}')
+            self._assert_write_refused(
+                img, 'qcow2',
+                'bench: write tests are not supported for this image '
+                '(external data file)')
+
+    def test_refuse_dirty(self):
+        """Dirty bit set via in-test header surgery: flip
+        incompatible_features bit 0 (the big-endian u64 at header
+        offset 72) on a copy of a fresh qcow2. The guest's
+        write-envelope gate (id 6, "dirty or corrupt") fires. sha256
+        is captured AFTER the surgery, so the assertion is that the
+        already-dirty image is untouched by the refused write.
+        """
+        self._require_kvm()
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / 'clean.qcow2'
+            self.make_qcow2(src, size='64M')
+            img = Path(td) / 'dirty.qcow2'
+            shutil.copyfile(src, img)
+            with open(img, 'r+b') as f:
+                f.seek(72)
+                current = int.from_bytes(f.read(8), 'big')
+                f.seek(72)
+                f.write((current | 1).to_bytes(8, 'big'))
+            self._assert_write_refused(
+                img, 'qcow2',
+                'bench: write tests are not supported for this image '
+                '(dirty or corrupt)')
 
     def test_refuse_vmdk(self):
         """Host-side format gate; no guest launch, no /dev/kvm needed."""
