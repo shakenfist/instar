@@ -2201,14 +2201,6 @@ _BENCH_IMAGE_SIZES = [1 << 20, 4 << 20, 16 << 20, 64 << 20]
 # "*above* 2 MiB"), so 2097152 is the largest legal buffer size.
 _BENCH_MAX_BUFSIZE = 2 << 20
 
-# Cluster sizes whose single-refblock host-file coverage
-# (cluster_size**2 / 2 with 16-bit refcounts: 2 GiB at 64 KiB) exceeds
-# anything a bench run on a <= 64 MiB image can allocate, so bench's
-# v1 no-refblock-growth write path never exhausts
-# (qcow2-write-refblock-coverage).
-_BENCH_WRITE_SAFE_CLUSTERS = [c for c in QCOW2_CLUSTER_SIZES
-                              if c >= 65536]
-
 
 def _bench_pick_bufsize(rng, image_size):
     """Pick a -s buffer size biased to <= 64 KiB, with occasional
@@ -2304,17 +2296,6 @@ def _bench_option_picker(rng):
         -U/-q).
       * ``help-hint-names-instar`` / ``zero-byte-early-failure``: exactly one
         (non-empty) filename per invocation.
-      * ``qcow2-write-refblock-coverage``: a plan with any -w invocation
-        steers the qcow2 recipe to a cluster size of at least 64 KiB
-        (``_BENCH_WRITE_SAFE_CLUSTERS``). bench's v1 write path
-        allocates clusters only from the refblocks populated at startup
-        (never allocating new refblocks or growing the refcount table,
-        the snapshot-create posture), and one 16-bit refblock covers
-        cluster_size**2/2 bytes of host file -- 128 KiB at 512-byte
-        clusters and 8 MiB at 4 KiB, both outrun by allocating
-        schedules on these images (issues #397-#401), but 2 GiB+ from
-        64 KiB up, unreachable here. Read-only plans keep the full
-        cluster-size matrix.
     """
     fmt = rng.choices(
         ['qcow2', 'raw', 'vmdk', 'vpc'], weights=[4, 4, 1, 1], k=1)[0]
@@ -2367,12 +2348,6 @@ def _bench_option_picker(rng):
         invocations.append(_bench_invocation_args(
             fmt, count, depth, bufsize, step, pattern, offset,
             write, flush_interval, no_drain))
-
-    # qcow2-write-refblock-coverage steer-around (see docstring).
-    if (fmt == 'qcow2'
-            and any('-w' in inv for inv in invocations)
-            and recipe['cluster_size'] not in _BENCH_WRITE_SAFE_CLUSTERS):
-        recipe['cluster_size'] = rng.choice(_BENCH_WRITE_SAFE_CLUSTERS)
 
     return {'recipe': recipe, 'invocations': invocations}
 

@@ -202,10 +202,10 @@ check-clean (probe-verified) and the oracle ignores layout.
 
 | Phase | Plan | Status |
 |-------|------|--------|
-| 1. Growth planner (pure, `crates/bench`) | PLAN-bench-refcount-growth-phase-01-planner.md | Not started |
-| 2. Guest op growth in `qcow2_write_setup` | PLAN-bench-refcount-growth-phase-02-guest.md | Not started |
-| 3. Integration tests (matrix + parity flip) | PLAN-bench-refcount-growth-phase-03-integration.md | Not started |
-| 4. Fuzzer steer-around retirement + docs | PLAN-bench-refcount-growth-phase-04-fuzzer-docs.md | Not started |
+| 1. Growth planner (pure, `crates/bench`) | PLAN-bench-refcount-growth-phase-01-planner.md | Complete (commit 7c49a9c) |
+| 2. Guest op growth in `qcow2_write_setup` | PLAN-bench-refcount-growth-phase-02-guest.md | Complete (commit 698b65e) |
+| 3. Integration tests (matrix + parity flip) | PLAN-bench-refcount-growth-phase-03-integration.md | Complete |
+| 4. Fuzzer steer-around retirement + docs | PLAN-bench-refcount-growth-phase-04-fuzzer-docs.md | Complete |
 
 One commit per phase minimum; each commit builds, lints and
 tests clean on its own.
