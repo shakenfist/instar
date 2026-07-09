@@ -239,118 +239,110 @@ pub fn compute_checksum(buf: &[u8], checksum_offset: usize) -> u32 {
 // CHS geometry calculation (VPC algorithm)
 // ============================================================================
 
-/// Compute CHS geometry for a VHD using the VPC algorithm.
-///
-/// This matches the exact algorithm used by Virtual PC / Hyper-V to
-/// compute CHS geometry from the disk size in bytes.
-///
-/// Returns `(cylinders, heads, sectors_per_track)`.
-pub fn compute_vhd_geometry(size: u64) -> (u16, u8, u8) {
-    let total_sectors = size / 512;
+/// Maximum CHS-addressable sector count (16-bit cylinders × 16 heads ×
+/// 255 sectors/track): qemu vpc.c's `VHD_MAX_SECTORS` / `VHD_MAX_GEOMETRY`.
+pub const VHD_MAX_SECTORS: u64 = 65535 * 16 * 255;
 
-    // Cap at the maximum CHS addressable sectors
-    let total_sectors = if total_sectors > 65535 * 16 * 255 {
-        65535 * 16 * 255
-    } else {
-        total_sectors
-    };
+/// CHS geometry from a sector count — an exact mirror of qemu vpc.c's
+/// `calculate_geometry` (itself the VHD-spec / Virtual PC algorithm).
+/// All divisions floor, `heads` rounds up, and the 17 → 31 → 63
+/// sectors-per-track ladder escalates whenever `cylinders × heads`
+/// would overflow the current head count; disks of at least
+/// `65535 * 16 * 63` sectors use 255 sectors/track. The returned
+/// product `cylinders * heads * spt` may be slightly below
+/// `total_sectors` (everything floors) — qemu's create path compensates
+/// with the upward search in [`chs_rounded_size`].
+fn calculate_geometry(total_sectors: u64) -> (u16, u8, u8) {
+    let total_sectors = total_sectors.min(VHD_MAX_SECTORS);
 
     if total_sectors >= 65535 * 16 * 63 {
-        // Large disk: use maximum geometry
-        return (65535, 16, 255);
-    }
-
-    let mut sectors_per_track;
-    let mut heads;
-    let mut cyl_times_heads;
-
-    if total_sectors >= 65535 * 3 * 17 {
-        // Medium-large disk
-        sectors_per_track = 255;
-        heads = 16;
-        cyl_times_heads = total_sectors / sectors_per_track;
-    } else {
-        // Smaller disk
-        sectors_per_track = 17;
-        cyl_times_heads = total_sectors / sectors_per_track;
-
-        heads = cyl_times_heads.div_ceil(1024);
-        if heads < 4 {
-            heads = 4;
-        }
-
-        if cyl_times_heads >= (heads * 1024) || heads > 16 {
-            sectors_per_track = 31;
-            heads = 16;
-            cyl_times_heads = total_sectors / sectors_per_track;
-        }
-
-        if cyl_times_heads >= (heads * 1024) {
-            sectors_per_track = 63;
-            heads = 16;
-            cyl_times_heads = total_sectors / sectors_per_track;
-        }
-    }
-
-    let cylinders = cyl_times_heads / heads;
-
-    (cylinders as u16, heads as u8, sectors_per_track as u8)
-}
-
-/// Compute the CHS-rounded virtual size that `qemu-img dd -O vpc`
-/// declares for an arbitrary output size.
-///
-/// `qemu-img dd`/`qemu-img create` round the requested size up to the
-/// next whole CHS geometry (cylinders × heads × sectors_per_track ×
-/// 512) and store that rounded value as the footer's current_size,
-/// which is what `qemu-img info` reports as the virtual size.
-///
-/// This differs from [`compute_vhd_geometry`], which floors and is
-/// only correct when called on an already CHS-aligned size. This
-/// function uses qemu's round-up (ceil) divisions and a one-cylinder
-/// minimum so that, for example, `3000 -> 34816` (= 1×4×17×512),
-/// matching `qemu-img dd 10.0.8`.
-///
-/// Feeding the result back through [`compute_vhd_geometry`] reproduces
-/// the same size exactly (the rounded size is CHS-aligned, so floor ==
-/// ceil), so the footer geometry fields stay consistent.
-pub fn chs_rounded_size(size: u64) -> u64 {
-    // An empty window (size 0) has no CHS geometry; qemu-img dd produces a
-    // 0-virtual-size VHD for count=0, so return 0 rather than the
-    // one-cylinder minimum.
-    if size == 0 {
-        return 0;
-    }
-    // Round bytes up to whole sectors, as qemu does.
-    let mut total_sectors = size.div_ceil(512);
-
-    let max_sectors: u64 = 65535 * 16 * 255;
-    if total_sectors > max_sectors {
-        total_sectors = max_sectors;
-    }
-    if total_sectors >= 65535 * 16 * 63 {
-        return 65535u64 * 16 * 255 * 512;
+        let cyl_times_heads = total_sectors / 255;
+        return ((cyl_times_heads / 16) as u16, 16, 255);
     }
 
     let mut sectors_per_track: u64 = 17;
-    let mut cyl_times_heads = total_sectors.div_ceil(sectors_per_track);
+    let mut cyl_times_heads = total_sectors / sectors_per_track;
     let mut heads = cyl_times_heads.div_ceil(1024);
     if heads < 4 {
         heads = 4;
     }
-    if cyl_times_heads >= heads * 1024 || heads > 16 {
+
+    if cyl_times_heads >= (heads * 1024) || heads > 16 {
         sectors_per_track = 31;
         heads = 16;
-        cyl_times_heads = total_sectors.div_ceil(sectors_per_track);
-    }
-    if cyl_times_heads >= heads * 1024 {
-        sectors_per_track = 63;
-        heads = 16;
-        cyl_times_heads = total_sectors.div_ceil(sectors_per_track);
+        cyl_times_heads = total_sectors / sectors_per_track;
     }
 
-    let cylinders = cyl_times_heads.div_ceil(heads).max(1);
-    cylinders * heads * sectors_per_track * 512
+    if cyl_times_heads >= (heads * 1024) {
+        sectors_per_track = 63;
+        heads = 16;
+        cyl_times_heads = total_sectors / sectors_per_track;
+    }
+
+    (
+        (cyl_times_heads / heads) as u16,
+        heads as u8,
+        sectors_per_track as u8,
+    )
+}
+
+/// Compute CHS geometry for a VHD from a size in bytes (floor to whole
+/// sectors), mirroring qemu vpc.c's `calculate_geometry`.
+///
+/// Returns `(cylinders, heads, sectors_per_track)`.
+pub fn compute_vhd_geometry(size: u64) -> (u16, u8, u8) {
+    calculate_geometry(size / 512)
+}
+
+/// Compute the CHS-rounded virtual size that `qemu-img dd -O vpc` /
+/// `qemu-img create -f vpc` declare for an arbitrary requested size —
+/// an exact mirror of qemu vpc.c's `calculate_rounded_image_size`.
+///
+/// qemu rounds the request up to whole sectors, then searches upward
+/// from that sector count for the first candidate whose (floor)
+/// [`calculate_geometry`] product covers the request; the product
+/// becomes the footer's current_size (what `qemu-img info` reports as
+/// the virtual size) and the candidate's geometry becomes the footer
+/// CHS. Because the product is a fixed point of `calculate_geometry`,
+/// [`build_footer`]'s recomputation from current_size reproduces the
+/// identical CHS bytes (`chs_rounded_size_is_chs_consistent` pins
+/// this).
+///
+/// Two edges depart from the plain search:
+///   * The max-geometry window: when only the full `(65535,16,255)`
+///     ceiling can cover the request, qemu keeps the EXACT sector-
+///     rounded request as the size (the footer CHS then addresses
+///     slightly less than current_size). Mirrored here.
+///   * Oversize requests: qemu refuses anything past 2040 GiB
+///     (`VHD_MAX_SECTORS`); instar's convert path instead clamps to
+///     the ceiling, preserving long-standing saturation behaviour
+///     (`fuzz_chs_rounded_size` invariant 3).
+pub fn chs_rounded_size(size: u64) -> u64 {
+    // An empty window (size 0) has no CHS geometry; qemu-img dd produces a
+    // 0-virtual-size VHD for count=0.
+    if size == 0 {
+        return 0;
+    }
+    let requested = size.div_ceil(512).min(VHD_MAX_SECTORS);
+
+    let mut cyls: u64 = 0;
+    let mut heads: u64 = 0;
+    let mut spt: u64 = 0;
+    let mut candidate = requested;
+    while requested > cyls * heads * spt {
+        let (c, h, s) = calculate_geometry(candidate);
+        cyls = c as u64;
+        heads = h as u64;
+        spt = s as u64;
+        candidate += 1;
+    }
+
+    let product = cyls * heads * spt;
+    if product == VHD_MAX_SECTORS {
+        requested * 512
+    } else {
+        product * 512
+    }
 }
 
 // ============================================================================
@@ -1247,7 +1239,7 @@ mod tests {
 
     #[test]
     fn geometry_zero_disk() {
-        let (cyl, heads, spt) = compute_vhd_geometry(0);
+        let (_cyl, _heads, spt) = compute_vhd_geometry(0);
         // Zero size: total_sectors = 0, should still produce valid geometry
         assert_eq!(spt, 17); // Falls into small disk branch
     }
@@ -1445,58 +1437,82 @@ mod tests {
     // chs_rounded_size tests
     // ====================================================================
 
-    /// Verified against `qemu-img create -f vpc <size>` then reading
-    /// virtual-size with `qemu-img info`, qemu-img 10.0.8.
+    /// Verified against `qemu-img create -f vpc <size>` (virtual-size
+    /// via `qemu-img info`, CHS + current_size read from the footer),
+    /// qemu-img 10.0.8. The `(35651584, ...)` row is the differential-
+    /// fuzz dd window from issue #382 (69632 sectors), where the old
+    /// one-pass ceil approximation produced 35807232 with a footer CHS
+    /// (822/5/17) that did not even match its own current_size; qemu's
+    /// upward search lands on 820/5/17 = 69700 sectors. The >=1.6 GiB
+    /// rows pin the removal of the non-qemu `65535*3*17` "medium-large"
+    /// 255-sectors-per-track branch (qemu switches to 255 spt only at
+    /// 65535*16*63 sectors).
     #[test]
     fn chs_rounded_size_matches_qemu() {
-        let cases: &[(u64, u64)] = &[
-            (0, 0),
-            (512, 34816),
-            (1000, 34816),
-            (3000, 34816),
-            (34816, 34816),
-            (34817, 69632),
-            (65536, 69632),
-            (131072, 139264),
-            (1048576, 1079296),
-            (1073741824, 1073995776),
-            (10737418240, 10737893376),
+        let cases: &[(u64, u64, (u16, u8, u8))] = &[
+            (512, 34816, (1, 4, 17)),
+            (1000, 34816, (1, 4, 17)),
+            (3000, 34816, (1, 4, 17)),
+            (34816, 34816, (1, 4, 17)),
+            (34817, 69632, (2, 4, 17)),
+            (65536, 69632, (2, 4, 17)),
+            (131072, 139264, (4, 4, 17)),
+            (1048576, 1079296, (31, 4, 17)),
+            (35553280, 35581952, (1022, 4, 17)),
+            (35651584, 35686400, (820, 5, 17)),
+            (35686400, 35686400, (820, 5, 17)),
+            (1073741824, 1073995776, (2081, 16, 63)),
+            (1610612736, 1610735616, (3121, 16, 63)),
+            (1711249920, 1711374336, (3316, 16, 63)),
+            (1711250432, 1711374336, (3316, 16, 63)),
+            (2147483648, 2147991552, (4162, 16, 63)),
+            (3221225472, 3221471232, (6242, 16, 63)),
+            (10737418240, 10737893376, (20806, 16, 63)),
         ];
-        for &(input, expected) in cases {
+        assert_eq!(chs_rounded_size(0), 0);
+        for &(input, expected, chs) in cases {
+            let r = chs_rounded_size(input);
             assert_eq!(
-                chs_rounded_size(input),
-                expected,
+                r, expected,
                 "chs_rounded_size({input}) should be {expected}"
+            );
+            assert_eq!(
+                compute_vhd_geometry(r),
+                chs,
+                "footer CHS for input {input} (rounded {r})"
             );
         }
     }
 
     /// For each CHS-rounded size r, compute_vhd_geometry(r) must
-    /// reproduce r exactly: c * h * spt * 512 == r.
-    ///
-    /// This property holds for sizes in the small-disk CHS branch (spt
-    /// ∈ {17, 31, 63}), where chs_rounded_size uses div_ceil for
-    /// cyl_times_heads and compute_vhd_geometry uses the same floor
-    /// division on an already-aligned input. For large disks that fall
-    /// into the spt=255 branch, compute_vhd_geometry floors cyl_times_heads
-    /// and cylinders independently, so the round-trip is only guaranteed
-    /// for sizes that are exact multiples of (16 * 255 * 512). The
-    /// 10 GiB input (10737418240) rounds to a value in that branch that
-    /// is not a 16*255*512 multiple, so it is excluded here.
+    /// reproduce r exactly: c * h * spt * 512 == r. With the rounding
+    /// mirroring qemu's upward search this holds for every input whose
+    /// rounded size is a CHS product — i.e. everything below the
+    /// max-geometry window (the top ~2 MiB below the 2040 GiB ceiling,
+    /// where qemu keeps the exact sector-rounded request instead).
     ///
     /// Skips r == 0 (no CHS geometry for empty disks).
     #[test]
     fn chs_rounded_size_is_chs_consistent() {
         let inputs: &[u64] = &[
-            512, 1000, 3000, 34816, 34817, 65536, 131072, 1048576, 1073741824,
-            // A few extras not in the qemu table:
+            512,
+            1000,
+            3000,
+            34816,
+            34817,
+            65536,
+            131072,
+            1048576,
+            1073741824,
+            // Extras not in the qemu table, including the spt=255
+            // branch (>= 65535*16*63 sectors) the old implementation
+            // excluded:
             2_000_000,
-            // NOTE: 500_000_000 and 10737418240 round to a size in the
-            // spt=255 branch whose cyl_times_heads is not evenly divisible
-            // by heads=16, so compute_vhd_geometry floors down and the
-            // round-trip does not hold. Those inputs are covered by the
-            // chs_rounded_size_matches_qemu and chs_rounded_size_rounds_up
-            // tests instead.
+            500_000_000,
+            10_737_418_240,
+            35_651_584,
+            65535 * 16 * 63 * 512,
+            100_000_000_000,
         ];
         for &s in inputs {
             let r = chs_rounded_size(s);
@@ -1513,6 +1529,40 @@ mod tests {
                  c*h*spt*512={reconstructed}"
             );
         }
+    }
+
+    /// The max-geometry window: requests the largest sub-ceiling
+    /// geometry (65534×16×255) cannot cover round to the EXACT sector
+    /// count (qemu keeps the request), and anything past the ceiling
+    /// clamps to it (where qemu would refuse).
+    #[test]
+    fn chs_rounded_size_max_geometry_window() {
+        let window_start = 65534u64 * 16 * 255; // largest sub-ceiling product
+        assert_eq!(
+            chs_rounded_size(window_start * 512),
+            window_start * 512,
+            "largest sub-ceiling product is a fixed point"
+        );
+        let in_window = window_start + 1;
+        assert_eq!(
+            chs_rounded_size(in_window * 512),
+            in_window * 512,
+            "window sizes keep their exact sector count"
+        );
+        assert_eq!(
+            chs_rounded_size(in_window * 512 - 511),
+            in_window * 512,
+            "sub-sector window request rounds up to whole sectors"
+        );
+        assert_eq!(
+            chs_rounded_size(VHD_MAX_SECTORS * 512),
+            VHD_MAX_SECTORS * 512
+        );
+        assert_eq!(
+            chs_rounded_size(VHD_MAX_SECTORS * 512 + 512),
+            VHD_MAX_SECTORS * 512,
+            "oversize requests clamp to the CHS ceiling"
+        );
     }
 
     /// chs_rounded_size must never return a value smaller than its input

@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **bench `-w` on qcow2 grows the refcount structures
+  (PLAN-bench-refcount-growth phases 1-4).** Setup now computes the
+  schedule's worst-case allocation bound and grows the refcount
+  structures once, preemptively, before the timing bracket opens: new
+  refblocks are placed at the end of the host file, and a refcount
+  table that is out of slots is relocated there, enlarged, and
+  committed with an fsync-ordered header flip. The old table is freed
+  through the normal refcounts-last write-back cadence, so a crash in
+  the window leaves at worst a repairable leak — the same benign
+  artifact class as any mid-bench crash. The `bench: image too large
+  for in-place bench write` refusal survives only for schedules that
+  exceed the staging budget (more than 2048 refblock slots, more than
+  2 MiB of staged refblock bytes, or a grown refcount table over
+  64 KiB): roughly 256 MiB of host file at 512-byte clusters, and
+  64 GiB or more at cluster sizes of 64 KiB and up. The differential
+  fuzzer's `qcow2-write-refblock-coverage` steer-around and its
+  `KNOWN_BENCH_DIVERGENCES` entry are retired (issues #397–#401),
+  restoring the full cluster-size matrix to `-w` coverage. See
+  [docs/plans/PLAN-bench-refcount-growth.md](docs/plans/PLAN-bench-refcount-growth.md).
+
 - **CI test-partition guard.** A new lightweight `test-partition`
   job (and `tools/ci/check-test-partition.{sh,py}`) asserts that
   every Python integration test is claimed by at least one
@@ -814,6 +834,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (surfaced and refined by phase 7c source-image tests).
 
 ### Fixed
+
+- **`instar dd`/`convert -O vpc` declared a different virtual size
+  than `qemu-img` for windowed copies (issue #382).** The VHD size
+  rounding (`vhd::chs_rounded_size`) approximated qemu's CHS rounding
+  with one pass of ceiling divisions; qemu (`vpc.c
+  calculate_rounded_image_size`) instead searches upward from the
+  requested sector count for the first candidate whose floor-geometry
+  product covers the request. For a 69632-sector dd window qemu
+  declares 69700 sectors (CHS 820/5/17) while instar declared 69936 —
+  with a footer CHS (822/5/17) that could not even address its own
+  current_size. `compute_vhd_geometry` also carried a non-qemu
+  "medium-large" 255-sectors-per-track branch at `65535*3*17` sectors
+  (qemu switches at `65535*16*63`), diverging on every vpc output of
+  roughly 1.6 GiB and larger. Both are now exact mirrors of qemu
+  vpc.c, validated against `qemu-img` 10.0.8 across the branch
+  boundaries and swept for the fixed-point property that lets
+  `build_footer` recompute the identical CHS from current_size. The
+  `fuzz_chs_rounded_size` target now asserts exact geometry
+  reconstruction and idempotence instead of the old one-cylinder
+  tolerance that had been documenting the bug.
+
+- **Differential fuzzer: snapshot byte compare now ignores
+  dead-cluster residue (issue #381).** Byte differences confined to
+  clusters whose refcount is 0 in *both* images are residue, not
+  divergence: under metadata-cache pressure (512-byte clusters) qemu
+  flushes a half-refreshed freed L2 mid-walk even with
+  `file.discard=ignore` — the eviction writes partially-updated
+  COPIED flags to disk, then the remaining dirty flags are discarded
+  with the cache entry when the L2 is freed — while instar never
+  writes freed clusters at all. Both images are `check`-clean and
+  `compare`-identical; only the dead bytes differ. See the updated
+  "Freed-cluster bytes" quirk in docs/quirks.md.
+
+- **Differential fuzzer: bench `-w` recipes steered away from small
+  qcow2 clusters (issues #397–#401).** bench's v1 write path
+  allocates only from the refblocks populated at startup — never
+  allocating new refblocks or growing the refcount table — and one
+  16-bit refblock covers just `cluster_size²/2` bytes of host file:
+  128 KiB at 512-byte clusters, outrun by almost any allocating
+  schedule. The picker's new `qcow2-write-refblock-coverage`
+  steer-around pins `-w` qcow2 recipes to cluster sizes of at least
+  64 KiB (one refblock then covers 2 GiB+); the limitation is now a
+  registered `KNOWN_BENCH_DIVERGENCES` entry with a live regression
+  test and a docs/bench.md known-divergence bullet.
 
 - **`instar info`'s human output for flat VMDK extents diverged from
   `qemu-img` (commit `dad884e`).** For monolithicFlat /

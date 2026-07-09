@@ -28,7 +28,7 @@ Scope contract (the OQ13 decisions, recorded):
   divergence that stops diverging fails `TestBenchDivergenceRegression`
   loudly, forcing a registry update rather than a silent pass.
 
-Seven test classes, all inheriting from `BenchTestBase`:
+Eight test classes, all inheriting from `BenchTestBase`:
 
 * `TestBenchHeaderParity` — the 4c header-byte-parity rows.
 * `TestBenchValidation` — the corrected §2 message-contract table
@@ -36,6 +36,8 @@ Seven test classes, all inheriting from `BenchTestBase`:
 * `TestBenchReadBehaviour` — EOF/wrap/chain read-path behaviour.
 * `TestBenchWrite` — the 5c write-verification matrix, thinned.
 * `TestBenchWriteRefusals` — the write-path gate contracts.
+* `TestBenchRefcountGrowth` — the qcow2 `-w` refcount-growth matrix
+  (PLAN-bench-refcount-growth phase 03).
 * `TestBenchJson` — the `--output json` schema.
 * `TestBenchDivergenceRegression` — re-verifies every testable
   `KNOWN_BENCH_DIVERGENCES` entry still diverges.
@@ -1184,6 +1186,298 @@ class TestBenchWriteRefusals(BenchTestBase):
                 'bench: write tests are not yet supported for vhdx')
 
 
+class TestBenchRefcountGrowth(BenchTestBase):
+    """The qcow2 `-w` refcount-growth matrix (KVM).
+
+    PLAN-bench-refcount-growth phase 03: since phase 02, bench's
+    qcow2 write setup preemptively grows the refcount structures
+    (new refblocks at the file end; the refcount table relocated and
+    enlarged when out of slots) instead of refusing schedules whose
+    allocations outrun the populated refblock coverage. The
+    refblock-coverage divergence registered during the interim
+    mitigation (differential-fuzz issues #397-#401) is retired; its
+    regression test is replaced by the parity tests here.
+
+    Every case runs instar and qemu-img bench with IDENTICAL argv on
+    twin copies of the same pristine fixture and asserts: both exit
+    0, `qemu-img compare` reports the images identical (the write
+    oracle is virtual content, not layout), and `qemu-img check
+    --output=json` on the instar copy is fully clean. RT-relocation
+    cases additionally read the header's refcount-table geometry
+    (bytes 48..56 refcount_table_offset u64 BE, 56..60
+    refcount_table_clusters u32 BE) before/after and prove qemu can
+    keep using the grown image (a further `qemu-io` allocating write
+    plus a clean re-check -- the planning probe, made permanent).
+
+    Growth arithmetic used in the per-test comments, for 16-bit
+    refcounts at cluster size `cs`:
+
+    * entries per refblock (epb) = cs/2, so one refblock covers
+      cs^2/2 bytes of host file (128 KiB at cs=512, 8 MiB at
+      cs=4096, 2 GiB at cs=65536);
+    * RT slots per RT cluster = cs/8 (64 at cs=512), so one RT
+      cluster of refblock slots covers 64 x 128 KiB = 8 MiB of host
+      file at cs=512;
+    * one L2 table maps (cs/8) x cs bytes of virtual space (32 KiB
+      at cs=512, 2 MiB at cs=4096).
+
+    Wrap rule (registered divergence `wrap-rule-10-0-8`): instar
+    reduces cumulative offsets modulo image_size - bufsize (qemu
+    master's rule), qemu-img 10.0.8 modulo image_size, so a schedule
+    whose cumulative offset ever REACHES image_size - bufsize
+    diverges. Every schedule here is therefore strictly
+    non-wrapping: offset + (count-1)*step + bufsize < image_size.
+    """
+
+    @staticmethod
+    def _refcount_table_geometry(path):
+        """Return (refcount_table_offset, refcount_table_clusters)
+        from the qcow2 header (u64 BE at byte 48, u32 BE at 56)."""
+        with open(path, 'rb') as f:
+            f.seek(48)
+            raw = f.read(12)
+        return (int.from_bytes(raw[0:8], 'big'),
+                int.from_bytes(raw[8:12], 'big'))
+
+    def _assert_check_clean(self, img):
+        """`qemu-img check --output=json` on `img` must be fully
+        clean: rc 0 and corruptions/leaks/check-errors all
+        absent-or-0."""
+        out, err, rc = self.run_qemu_img_check(img, output_format='json')
+        self.assertEqual(rc, 0, f'qemu-img check failed: {out}{err}')
+        data = json.loads(out)
+        for key in ('corruptions', 'leaks', 'check-errors'):
+            self.assertEqual(
+                data.get(key, 0), 0,
+                f'qemu-img check reports nonzero {key}: {out}')
+
+    def _run_growth_parity(self, td, argv, size, cluster_size,
+                           fill_size=None, timeout=300):
+        """Build twin images and run the parity oracle.
+
+        Creates a pristine qcow2 (`size`/`cluster_size`, optionally
+        prepopulated with 0xbb over `[0, fill_size)`), copies it to
+        twins a/b, runs `instar bench` on a and `qemu-img bench` on
+        b with the IDENTICAL `argv`, and asserts: both rc 0,
+        `qemu-img compare` identical, `qemu-img check` clean on the
+        instar copy. Returns `(a, geom_before, geom_after)` where the
+        geoms are the instar copy's refcount-table geometry before
+        and after the run.
+        """
+        td = Path(td)
+        pristine = td / 'src.qcow2'
+        self.make_qcow2(pristine, size=size, cluster_size=cluster_size)
+        if fill_size is not None:
+            self._qemu_io(pristine, f'write -P 0xbb 0 {fill_size}')
+        a = td / 'a.qcow2'
+        b = td / 'b.qcow2'
+        shutil.copy2(pristine, a)
+        shutil.copy2(pristine, b)
+        geom_before = self._refcount_table_geometry(a)
+
+        i_out, i_err, i_rc = self.run_instar_bench(
+            *argv, str(a), timeout=timeout)
+        self.assertEqual(i_rc, 0, f'instar: {i_err}')
+        q_out, q_err, q_rc = self.run_qemu_bench(
+            *argv, str(b), timeout=timeout)
+        self.assertEqual(q_rc, 0, f'qemu: {q_err}')
+
+        cmp_out, cmp_err, cmp_rc = self.run_qemu_img_compare(a, b)
+        self.assertEqual(
+            cmp_rc, 0, f'compare mismatch: {cmp_out}{cmp_err}')
+        self.assertIn('Images are identical.', cmp_out)
+        self._assert_check_clean(a)
+        return a, geom_before, self._refcount_table_geometry(a)
+
+    def _assert_relocated_and_reusable(self, img, before, after,
+                                       probe_offset):
+        """RT-relocation post-conditions: the instar copy's refcount
+        table moved and grew, and qemu keeps using the grown image (a
+        further allocating `qemu-io` write, then a clean re-check)."""
+        self.assertNotEqual(
+            after[0], before[0],
+            f'refcount table should have been relocated: {before} -> '
+            f'{after}')
+        self.assertGreater(
+            after[1], before[1],
+            f'refcount table should have been enlarged: {before} -> '
+            f'{after}')
+        self._qemu_io(img, f'write -P 0x5a {probe_offset} 65536')
+        self._assert_check_clean(img)
+
+    def test_issue_397_vector_parity(self):
+        """Issue #397's exact vector, flipped from divergence to
+        parity: a 4M / 512-byte-cluster qcow2 whose front 2 MiB is
+        prepopulated, with a -w schedule that allocates past the
+        populated refblocks' coverage. instar used to refuse (`bench:
+        image too large for in-place bench write`, the retired
+        refblock-coverage divergence); it now grows the refcounts
+        and matches qemu-img.
+
+        Arithmetic (cs=512): -S 0 means step = bufsize, so the
+        schedule covers [1269120, 2645376) contiguously (non-wrap:
+        1269120 + 20*65536 + 65536 = 2645376 < 4194304). [1269120,
+        2097152) overwrites prepopulated clusters in place; [2097152,
+        2645376) allocates 548864 B = 1072 data clusters + ~17 L2
+        tables, growing the host file from ~2.2 MiB (~18 refblock
+        slots) to ~2.8 MiB (~23 slots) -- new refblocks, but still
+        within the 64 slots of the existing 1-cluster RT, so the RT
+        grows in place and the header geometry must NOT change.
+        """
+        self._require_kvm()
+        argv = ['-c', '21', '-d', '58', '-s', '65536', '-S', '0',
+                '--pattern', '197', '-o', '1269120', '-w',
+                '--flush-interval', '64', '-f', 'qcow2']
+        with tempfile.TemporaryDirectory() as td:
+            _a, before, after = self._run_growth_parity(
+                td, argv, size='4M', cluster_size=512, fill_size='2M')
+            self.assertEqual(
+                before, after,
+                'in-place refblock growth must not move the refcount '
+                'table')
+
+    def test_refblock_growth_4m_512_no_relocation(self):
+        """4M / cs=512, empty, sequential allocating schedule:
+        refblock growth without RT relocation.
+
+        Arithmetic: -c 63 -s 65536 -S 65536 -o 0 covers [0, 4128768)
+        (non-wrap: 62*65536 + 65536 = 4128768 < 4194304; -c 64's
+        cumulative offset would REACH the modulus 4128768 and wrap).
+        8064 data clusters + 126 L2 tables (one L2 maps 32 KiB) grow
+        the host file from 2560 B (1 populated refblock) to ~4.2 MiB
+        = ~34 refblock slots: growth, but <= the 64 slots of the
+        1-cluster RT, so no relocation -- header geometry unchanged.
+        """
+        self._require_kvm()
+        argv = ['-w', '-c', '63', '-s', '65536', '-S', '65536',
+                '--pattern', '65', '-f', 'qcow2']
+        with tempfile.TemporaryDirectory() as td:
+            _a, before, after = self._run_growth_parity(
+                td, argv, size='4M', cluster_size=512)
+            self.assertEqual(
+                before, after,
+                'in-place refblock growth must not move the refcount '
+                'table')
+
+    def test_rt_relocation_16m_512(self):
+        """16M / cs=512, empty, schedule spanning > 8 MiB of
+        allocation: the refcount table runs out of slots and is
+        relocated to the file end.
+
+        Arithmetic: -c 255 -s 65536 -S 65536 -o 0 covers
+        [0, 16711680) (non-wrap: 254*65536 + 65536 = 16711680 <
+        16777216; -c 256 would reach the modulus and wrap). 32640
+        data clusters + 510 L2 tables + 8 L1 clusters + ~137
+        refblocks grow the host file to ~17.1 MiB = ~137 refblock
+        slots > the old 1-cluster RT's 64 -> relocation, new RT of
+        ceil(~140/64) = 3 clusters at the file end.
+        """
+        self._require_kvm()
+        argv = ['-w', '-c', '255', '-s', '65536', '-S', '65536',
+                '--pattern', '66', '-f', 'qcow2']
+        with tempfile.TemporaryDirectory() as td:
+            a, before, after = self._run_growth_parity(
+                td, argv, size='16M', cluster_size=512)
+            # The final 64 KiB tail [16711680, 16777216) is untouched
+            # by the schedule: the probe write allocates fresh
+            # clusters through the grown structures.
+            self._assert_relocated_and_reusable(
+                a, before, after, probe_offset=16711680)
+
+    def test_rt_relocation_64m_512_prepopulated(self):
+        """64M / cs=512, prepopulated 2M, large allocating schedule:
+        RT relocation with mixed overwrite/allocate traffic.
+
+        Arithmetic: -c 200 -s 65536 -S 65536 -o 0 covers
+        [0, 13107200) (non-wrap: 199*65536 + 65536 = 13107200 <
+        67108864). [0, 2097152) overwrites prepopulated clusters in
+        place; [2097152, 13107200) allocates 10.75 MiB = 21504 data
+        clusters + ~336 new L2 tables, growing the host file from
+        ~2.1 MiB (~17 refblock slots, measured: the fixture is
+        created with a 1-cluster RT) to ~13.4 MiB = ~105 slots > 64
+        -> relocation. The 12.8 MiB span (not the full 64 MiB image,
+        which takes minutes in the guest) is enough: > 8 MiB
+        one-RT-cluster coverage and > 64 slots.
+        """
+        self._require_kvm()
+        argv = ['-w', '-c', '200', '-s', '65536', '-S', '65536',
+                '--pattern', '67', '-f', 'qcow2']
+        with tempfile.TemporaryDirectory() as td:
+            a, before, after = self._run_growth_parity(
+                td, argv, size='64M', cluster_size=512, fill_size='2M')
+            # 32 MiB is far beyond the schedule's [0, 12.8M) span:
+            # the probe write allocates fresh clusters.
+            self._assert_relocated_and_reusable(
+                a, before, after, probe_offset=33554432)
+
+    def test_refblock_outrun_64m_4096(self):
+        """64M / cs=4096, empty, > 8 MiB of allocation: a single
+        refblock is outrun at 4 KiB clusters (one refblock covers
+        4096^2/2 = 8 MiB of host file), without RT relocation.
+
+        Arithmetic: -c 150 -s 65536 -S 65536 -o 0 covers
+        [0, 9830400) (non-wrap: 149*65536 + 65536 = 9830400 <
+        67108864). 2400 data clusters + 5 L2 tables (one L2 maps
+        2 MiB) grow the host file from ~12.5 KiB to ~9.9 MiB > 8 MiB
+        -> 2 refblock slots needed, so one new refblock; the RT
+        cluster holds 512 slots, so no relocation -- header geometry
+        unchanged.
+        """
+        self._require_kvm()
+        argv = ['-w', '-c', '150', '-s', '65536', '-S', '65536',
+                '--pattern', '68', '-f', 'qcow2']
+        with tempfile.TemporaryDirectory() as td:
+            _a, before, after = self._run_growth_parity(
+                td, argv, size='64M', cluster_size=4096)
+            self.assertEqual(
+                before, after,
+                'single-refblock outrun must not move the refcount '
+                'table')
+
+    def test_no_growth_fast_path_16m_65536(self):
+        """16M / cs=65536, allocating schedule: the no-growth fast
+        path (guards the v1 path -- no growth work, no new writes at
+        setup, and the run still succeeds check-clean).
+
+        Arithmetic: -c 200 -s 65536 -S 65536 -o 0 covers
+        [0, 13107200) (non-wrap: 199*65536 + 65536 = 13107200 <
+        16777216). One refblock at cs=65536 covers 65536^2/2 = 2 GiB
+        of host file; the whole image can never outrun it, so the
+        worst-case bound fits the populated coverage and setup takes
+        the fast path -- header geometry unchanged.
+        """
+        self._require_kvm()
+        argv = ['-w', '-c', '200', '-s', '65536', '-S', '65536',
+                '--pattern', '69', '-f', 'qcow2']
+        with tempfile.TemporaryDirectory() as td:
+            _a, before, after = self._run_growth_parity(
+                td, argv, size='16M', cluster_size=65536)
+            self.assertEqual(
+                before, after,
+                'the no-growth fast path must not touch the refcount '
+                'table')
+
+    def test_rt_relocation_with_flush_interval(self):
+        """The 16M / cs=512 relocation vector with --flush-interval
+        64 (< count 255): the deferred old-RT decrement rides an
+        interval flush (after requests 64/128/192) rather than only
+        the run-end flush.
+
+        Same growth arithmetic as test_rt_relocation_16m_512 (~137
+        slots > 64 -> relocation); -d 1 keeps the interval valid
+        (flush interval must be >= depth).
+        """
+        self._require_kvm()
+        argv = ['-w', '-c', '255', '-s', '65536', '-S', '65536',
+                '--pattern', '70', '-d', '1', '--flush-interval', '64',
+                '-f', 'qcow2']
+        with tempfile.TemporaryDirectory() as td:
+            a, before, after = self._run_growth_parity(
+                td, argv, size='16M', cluster_size=512)
+            self._assert_relocated_and_reusable(
+                a, before, after, probe_offset=16711680)
+
+
 class TestBenchJson(BenchTestBase):
     """The `--output json` schema (KVM; ~3 tests).
 
@@ -1255,8 +1549,8 @@ class TestBenchJson(BenchTestBase):
 
 class TestBenchDivergenceRegression(BenchTestBase):
     """Assert each testable `KNOWN_BENCH_DIVERGENCES` entry still
-    diverges (entries 2-7, 9-11 per Mission §2; 1 and 8 have no live
-    regression test -- see their registry entries).
+    diverges (entries 2-7, 9-11; 1 and 8 have no live regression
+    test -- see their registry entries).
 
     Every test opens with `self.assertIn(key, KNOWN_BENCH_DIVERGENCES)`
     (the bitmap/map idiom) so the registry and the tests stay linked:

@@ -589,14 +589,18 @@ provides a modular architecture with:
   terminal `send_bench_result`. Reads all five formats; write tests
   (`-w`) are supported on raw and qcow2 only (including qcow2
   overlays), using a write-through-for-metadata/staged-for-refcounts
-  design so a mid-run crash leaves at worst a repairable leak. The
+  design so a mid-run crash leaves at worst a repairable leak. qcow2
+  write setup preemptively grows the image's refcount structures to
+  the schedule's worst-case coverage before the timing bracket opens
+  (new refblocks at the file end; refcount-table relocation with an
+  fsync-ordered header flip — `PLAN-bench-refcount-growth`). The
   pure `no_std` `crates/bench` crate provides the request-schedule
-  math shared by the host CLI and tests. `bench.bin` builds at
-  160224 bytes (~157 KiB) of the 768 KiB operation-region budget. The
-  ABI appends two
+  math and the refcount-growth planner shared by the guest, host CLI
+  and tests. `bench.bin` builds at ~162 KiB of the 768 KiB
+  operation-region budget. The ABI appends two
   call-table callbacks (`send_bench_start`, `send_bench_result`),
   bumping `CallTable::VERSION` from 19 to 20. Coverage:
-  `tests/test_bench.py` (62 tests), the `fuzz_bench_schedule`
+  `tests/test_bench.py` (72 tests), the `fuzz_bench_schedule`
   coverage fuzzer, and the differential fuzzer's `op_bench` arm. See
   [docs/bench.md](docs/bench.md).
 - **shared/** - Shared library code between components (call table, configs,
