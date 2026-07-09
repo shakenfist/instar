@@ -1239,7 +1239,7 @@ mod tests {
 
     #[test]
     fn geometry_zero_disk() {
-        let (cyl, heads, spt) = compute_vhd_geometry(0);
+        let (_cyl, _heads, spt) = compute_vhd_geometry(0);
         // Zero size: total_sectors = 0, should still produce valid geometry
         assert_eq!(spt, 17); // Falls into small disk branch
     }
