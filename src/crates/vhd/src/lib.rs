@@ -294,6 +294,36 @@ pub fn compute_vhd_geometry(size: u64) -> (u16, u8, u8) {
     calculate_geometry(size / 512)
 }
 
+/// The upward candidate search shared by [`chs_rounded_size`] and
+/// [`chs_rounded_geometry`] — the loop inside qemu vpc.c's
+/// `calculate_rounded_image_size`. Walks candidate sector counts up
+/// from `requested` (already clamped to `VHD_MAX_SECTORS`) until the
+/// floor [`calculate_geometry`] product covers the request, and returns
+/// the geometry of that final candidate. For `requested == 0` the loop
+/// never runs and the geometry stays `(0, 0, 0)`, exactly as qemu's
+/// zero-initialised cyls/heads/secs do.
+///
+/// NOTE: the returned geometry is generally NOT the floor geometry of
+/// its own product. The search evaluates geometry at the CANDIDATE
+/// (e.g. 104465 sectors → heads = ceil(6145/1024) = 7) while the
+/// product can sit below a head-count boundary (104363 sectors →
+/// heads = ceil(6139/1024) = 6), so `calculate_geometry(product)` may
+/// return different, smaller-product CHS — the divergence behind
+/// issue #413. Re-running the search on the product DOES reproduce the
+/// same geometry: every candidate in `[product, final)` was already
+/// rejected with a product `< requested <= product`, so the re-search
+/// stops at the same final candidate (`fuzz_chs_rounded_size`
+/// invariant 5 pins this).
+fn chs_covering_search(requested: u64) -> (u16, u8, u8) {
+    let mut geometry = (0u16, 0u8, 0u8);
+    let mut candidate = requested;
+    while requested > geometry.0 as u64 * geometry.1 as u64 * geometry.2 as u64 {
+        geometry = calculate_geometry(candidate);
+        candidate += 1;
+    }
+    geometry
+}
+
 /// Compute the CHS-rounded virtual size that `qemu-img dd -O vpc` /
 /// `qemu-img create -f vpc` declare for an arbitrary requested size —
 /// an exact mirror of qemu vpc.c's `calculate_rounded_image_size`.
@@ -302,17 +332,15 @@ pub fn compute_vhd_geometry(size: u64) -> (u16, u8, u8) {
 /// from that sector count for the first candidate whose (floor)
 /// [`calculate_geometry`] product covers the request; the product
 /// becomes the footer's current_size (what `qemu-img info` reports as
-/// the virtual size) and the candidate's geometry becomes the footer
-/// CHS. Because the product is a fixed point of `calculate_geometry`,
-/// [`build_footer`]'s recomputation from current_size reproduces the
-/// identical CHS bytes (`chs_rounded_size_is_chs_consistent` pins
-/// this).
+/// the virtual size) and the candidate's geometry — returned by
+/// [`chs_rounded_geometry`], NOT the floor geometry of the product —
+/// becomes the footer CHS.
 ///
 /// Two edges depart from the plain search:
 ///   * The max-geometry window: when only the full `(65535,16,255)`
 ///     ceiling can cover the request, qemu keeps the EXACT sector-
 ///     rounded request as the size (the footer CHS then addresses
-///     slightly less than current_size). Mirrored here.
+///     slightly more than current_size). Mirrored here.
 ///   * Oversize requests: qemu refuses anything past 2040 GiB
 ///     (`VHD_MAX_SECTORS`); instar's convert path instead clamps to
 ///     the ceiling, preserving long-standing saturation behaviour
@@ -325,23 +353,52 @@ pub fn chs_rounded_size(size: u64) -> u64 {
     }
     let requested = size.div_ceil(512).min(VHD_MAX_SECTORS);
 
-    let mut cyls: u64 = 0;
-    let mut heads: u64 = 0;
-    let mut spt: u64 = 0;
-    let mut candidate = requested;
-    while requested > cyls * heads * spt {
-        let (c, h, s) = calculate_geometry(candidate);
-        cyls = c as u64;
-        heads = h as u64;
-        spt = s as u64;
-        candidate += 1;
-    }
-
-    let product = cyls * heads * spt;
+    let (c, h, s) = chs_covering_search(requested);
+    let product = c as u64 * h as u64 * s as u64;
     if product == VHD_MAX_SECTORS {
         requested * 512
     } else {
         product * 512
+    }
+}
+
+/// The footer CHS that `qemu-img create -f vpc` / `convert -O vpc` /
+/// `dd -O vpc` write for a request of `size` bytes: the geometry of
+/// the candidate qemu's `calculate_rounded_image_size` search lands on
+/// (see [`chs_covering_search`]). Its product covers the request
+/// exactly ([`chs_rounded_size`]`(size) / 512`) except in the
+/// max-geometry window, where the ceiling geometry addresses slightly
+/// more than the kept size. A zero request has no geometry (qemu
+/// writes CHS `(0, 0, 0)` for a count=0 dd, empirically verified
+/// against qemu-img 10.0.8).
+pub fn chs_rounded_geometry(size: u64) -> (u16, u8, u8) {
+    if size == 0 {
+        return (0, 0, 0);
+    }
+    chs_covering_search(size.div_ceil(512).min(VHD_MAX_SECTORS))
+}
+
+/// Footer CHS for a VHD declaring `current_size` bytes.
+///
+/// For sizes qemu-img itself would declare — fixed points of
+/// [`chs_rounded_size`], which is what instar's dd path stamps — this
+/// is the upward-search geometry [`chs_rounded_geometry`], reproducing
+/// qemu's footer bytes exactly. The floor geometry of the same size
+/// can differ AND under-address it (issue #413: 53433856 bytes is
+/// 104363 sectors = 877×7×17, but the floor geometry is 1023×6×17 =
+/// only 104346 sectors), so recomputing via [`compute_vhd_geometry`]
+/// here would truncate the disk for CHS-honouring readers.
+///
+/// For any other size — instar's verbatim-size convert/create/resize
+/// paths, whose declared sizes qemu-img never produces — keep the
+/// VHD-spec floor geometry, matching Hyper-V/disk2vhd-style writers
+/// (current_size authoritative, CHS a floor approximation) and prior
+/// instar behaviour.
+pub fn footer_geometry(current_size: u64) -> (u16, u8, u8) {
+    if chs_rounded_size(current_size) == current_size {
+        chs_rounded_geometry(current_size)
+    } else {
+        compute_vhd_geometry(current_size)
     }
 }
 
@@ -1018,8 +1075,9 @@ pub fn build_footer(
     write_be_u64(buf, FOOTER_ORIGINAL_SIZE_OFFSET, current_size);
     // Current size
     write_be_u64(buf, FOOTER_CURRENT_SIZE_OFFSET, current_size);
-    // Geometry
-    let (cyl, heads, spt) = compute_vhd_geometry(current_size);
+    // Geometry: qemu's upward-search CHS for qemu-roundable sizes,
+    // VHD-spec floor otherwise (see footer_geometry).
+    let (cyl, heads, spt) = footer_geometry(current_size);
     write_be_u16(buf, FOOTER_GEOMETRY_OFFSET, cyl);
     buf[FOOTER_GEOMETRY_OFFSET + 2] = heads;
     buf[FOOTER_GEOMETRY_OFFSET + 3] = spt;
@@ -1446,7 +1504,17 @@ mod tests {
     /// upward search lands on 820/5/17 = 69700 sectors. The >=1.6 GiB
     /// rows pin the removal of the non-qemu `65535*3*17` "medium-large"
     /// 255-sectors-per-track branch (qemu switches to 255 spt only at
-    /// 65535*16*63 sectors).
+    /// 65535*16*63 sectors). The `(53426191, ...)` row is issue #413:
+    /// qemu's search lands on candidate 104465 whose geometry
+    /// 877×7×17 = 104363 covers the 104349-sector request, but the
+    /// FLOOR geometry of 104363 sectors is 1023×6×17 = 104346 (the
+    /// candidate sits above a head-count boundary, ceil(6145/1024) = 7
+    /// heads, while its product sits below one, ceil(6139/1024) = 6) —
+    /// so the footer CHS must come from the search, not from
+    /// re-flooring current_size. The final three rows pin the
+    /// max-geometry window edges (footer CHS from the search; in the
+    /// window current_size keeps the exact request while the ceiling
+    /// CHS addresses slightly more).
     #[test]
     fn chs_rounded_size_matches_qemu() {
         let cases: &[(u64, u64, (u16, u8, u8))] = &[
@@ -1461,6 +1529,8 @@ mod tests {
             (35553280, 35581952, (1022, 4, 17)),
             (35651584, 35686400, (820, 5, 17)),
             (35686400, 35686400, (820, 5, 17)),
+            (53426191, 53433856, (877, 7, 17)),
+            (53433856, 53433856, (877, 7, 17)),
             (1073741824, 1073995776, (2081, 16, 63)),
             (1610612736, 1610735616, (3121, 16, 63)),
             (1711249920, 1711374336, (3316, 16, 63)),
@@ -1468,8 +1538,25 @@ mod tests {
             (2147483648, 2147991552, (4162, 16, 63)),
             (3221225472, 3221471232, (6242, 16, 63)),
             (10737418240, 10737893376, (20806, 16, 63)),
+            (
+                65534 * 16 * 255 * 512,
+                65534 * 16 * 255 * 512,
+                (65534, 16, 255),
+            ),
+            (
+                (65534 * 16 * 255 + 1) * 512,
+                (65534 * 16 * 255 + 1) * 512,
+                (65535, 16, 255),
+            ),
+            (
+                65535 * 16 * 255 * 512,
+                65535 * 16 * 255 * 512,
+                (65535, 16, 255),
+            ),
         ];
         assert_eq!(chs_rounded_size(0), 0);
+        assert_eq!(chs_rounded_geometry(0), (0, 0, 0));
+        assert_eq!(footer_geometry(0), (0, 0, 0));
         for &(input, expected, chs) in cases {
             let r = chs_rounded_size(input);
             assert_eq!(
@@ -1477,19 +1564,26 @@ mod tests {
                 "chs_rounded_size({input}) should be {expected}"
             );
             assert_eq!(
-                compute_vhd_geometry(r),
+                chs_rounded_geometry(input),
                 chs,
-                "footer CHS for input {input} (rounded {r})"
+                "search CHS for input {input}"
+            );
+            assert_eq!(
+                footer_geometry(r),
+                chs,
+                "footer CHS recomputed from rounded size {r} (input {input})"
             );
         }
     }
 
-    /// For each CHS-rounded size r, compute_vhd_geometry(r) must
-    /// reproduce r exactly: c * h * spt * 512 == r. With the rounding
-    /// mirroring qemu's upward search this holds for every input whose
-    /// rounded size is a CHS product — i.e. everything below the
-    /// max-geometry window (the top ~2 MiB below the 2040 GiB ceiling,
-    /// where qemu keeps the exact sector-rounded request instead).
+    /// For each CHS-rounded size r, the footer geometry must address r
+    /// exactly: c * h * spt * 512 == r. This holds for every input
+    /// whose rounded size is a geometry product — i.e. everything
+    /// below the max-geometry window (the top ~2 MiB below the
+    /// 2040 GiB ceiling, where qemu keeps the exact sector-rounded
+    /// request instead). Note this is the SEARCH geometry
+    /// ([`footer_geometry`] / [`chs_rounded_geometry`]); the floor
+    /// [`compute_vhd_geometry`] of r can address less (issue #413).
     ///
     /// Skips r == 0 (no CHS geometry for empty disks).
     #[test]
@@ -1513,6 +1607,9 @@ mod tests {
             35_651_584,
             65535 * 16 * 63 * 512,
             100_000_000_000,
+            // Issue #413: the fuzzer input whose rounded size is not a
+            // floor-geometry fixed point.
+            53_426_191,
         ];
         for &s in inputs {
             let r = chs_rounded_size(s);
@@ -1520,7 +1617,7 @@ mod tests {
                 r, 0,
                 "chs_rounded_size({s}) must not be 0 for non-zero input"
             );
-            let (c, h, spt) = compute_vhd_geometry(r);
+            let (c, h, spt) = footer_geometry(r);
             let reconstructed = c as u64 * h as u64 * spt as u64 * 512;
             assert_eq!(
                 reconstructed, r,
@@ -1529,6 +1626,54 @@ mod tests {
                  c*h*spt*512={reconstructed}"
             );
         }
+    }
+
+    /// Issue #413 divergence pin: for a qemu-rounded size the footer
+    /// CHS is the upward-search geometry, which can differ from the
+    /// floor geometry of the same byte count; for a size qemu-img
+    /// would never declare (not a fixed point of chs_rounded_size) the
+    /// footer keeps the VHD-spec floor geometry.
+    #[test]
+    fn footer_geometry_search_vs_floor() {
+        // 104363 sectors: search and floor geometries differ, and only
+        // the search geometry addresses the whole disk.
+        let rounded = 53433856u64;
+        assert_eq!(footer_geometry(rounded), (877, 7, 17));
+        assert_eq!(compute_vhd_geometry(rounded), (1023, 6, 17));
+
+        // 1 GiB is not a qemu-roundable size (qemu-img would declare
+        // 1073995776); verbatim-size writers keep the floor geometry.
+        let gib = 1024u64 * 1024 * 1024;
+        assert_ne!(chs_rounded_size(gib), gib);
+        assert_eq!(footer_geometry(gib), (2080, 16, 63));
+        assert_eq!(footer_geometry(gib), compute_vhd_geometry(gib));
+    }
+
+    /// build_footer must write the search geometry for qemu-rounded
+    /// sizes (issue #413) and CHS (0,0,0) for a zero-size disk
+    /// (empirically what qemu-img 10.0.8 writes for a count=0 dd).
+    #[test]
+    fn build_footer_writes_search_geometry() {
+        let uuid = [0u8; 16];
+        let mut buf = [0u8; 512];
+        build_footer(&mut buf, 53433856, DISK_TYPE_DYNAMIC, 512, &uuid);
+        assert_eq!(
+            (
+                u16::from_be_bytes([buf[FOOTER_GEOMETRY_OFFSET], buf[FOOTER_GEOMETRY_OFFSET + 1]]),
+                buf[FOOTER_GEOMETRY_OFFSET + 2],
+                buf[FOOTER_GEOMETRY_OFFSET + 3],
+            ),
+            (877u16, 7u8, 17u8),
+            "footer CHS for 53433856 bytes must be qemu's search geometry"
+        );
+
+        let mut zbuf = [0u8; 512];
+        build_footer(&mut zbuf, 0, DISK_TYPE_DYNAMIC, 512, &uuid);
+        assert_eq!(
+            &zbuf[FOOTER_GEOMETRY_OFFSET..FOOTER_GEOMETRY_OFFSET + 4],
+            &[0u8; 4],
+            "zero-size footer CHS must be (0,0,0) as qemu writes"
+        );
     }
 
     /// The max-geometry window: requests the largest sub-ceiling

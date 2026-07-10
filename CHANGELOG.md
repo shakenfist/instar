@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **VHD footer CHS now matches qemu's upward-search geometry
+  (issue #413).** `build_footer` recomputed the footer CHS by
+  re-flooring `current_size` through `calculate_geometry`, but qemu
+  writes the geometry its `calculate_rounded_image_size` search
+  landed on — and the two differ whenever the search's final
+  candidate sits above a head-count boundary while its product sits
+  below one (a 104349-sector dd window declares 104363 sectors =
+  877×7×17, but the floor of 104363 is 1023×6×17 = 104346, which
+  cannot even address the declared size). Footers for qemu-roundable
+  sizes (fixed points of `chs_rounded_size`, which is what the dd
+  path stamps) now carry the search geometry via the new
+  `footer_geometry` / `chs_rounded_geometry` helpers; verbatim-size
+  footers (whole-image convert, create, resize) keep the VHD-spec
+  floor CHS as before. Zero-size footers now write CHS `(0,0,0)` as
+  qemu does for a count=0 dd, instead of `(0,4,17)`. Found by
+  coverage fuzzing (`fuzz_chs_rounded_size` invariant 5, whose old
+  floor-based form is rewritten against the search-geometry
+  contract); differentially validated against `qemu-img create -f
+  vpc` 10.0.8 footers across 337 sizes including the window edges,
+  plus an end-to-end `instar dd` vs `qemu-img dd` footer comparison.
+
 ### Added
 
 - **bench `-w` on qcow2 grows the refcount structures
