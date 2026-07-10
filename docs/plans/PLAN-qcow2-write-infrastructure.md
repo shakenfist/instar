@@ -111,7 +111,10 @@ Consequences of the fragmentation, established during planning:
   backing file silently corrupts the snapshots. The differential
   fuzzer's snapshot-avoidance steering means this path is
   untested against qemu. rebase safe mode has the analogous
-  question for snapshot-bearing overlays.
+  question for snapshot-bearing overlays — and likewise carries
+  no `nb_snapshots` gate (verified by grep over
+  `src/operations/rebase/src/main.rs` and
+  `src/crates/rebase/src/qcow2.rs`).
 * **Refcount growth exists only in bench.** commit, snapshot,
   bitmap and check --repair all hit `RefcountExhausted` ceilings
   (`src/crates/commit/src/qcow2.rs:279`,
@@ -207,15 +210,22 @@ Design sketch (to be settled in phase planning, not binding):
    snapshot-bearing overlay: are the L1/L2 tables it rewrites
    ever snapshot-shared, and what does qemu do?
 3. **Does our COW allocation order need byte parity with qemu?**
-   commit and rebase have byte-parity oracles (cross-version
-   baselines, differential fuzzing with byte comparison); bench's
-   oracle is `qemu-img compare` + `qemu-img check` only
-   (PLAN-bench-refcount-growth.md). If qemu's COW cluster
-   placement is deterministic and reproducible, byte-parity
-   consumers can adopt COW directly; if not, they gate
-   snapshot-bearing images (refusal, not corruption) and only
-   bench lifts its gate in this plan. Requires studying qemu's
-   qcow2 COW write path and probing real images.
+   Initial inventory during planning found the commit / rebase
+   oracles are *looser than assumed*: the differential-fuzz
+   comparisons are normalised `qemu-img info --output=json` on
+   the resulting images (`scripts/differential-fuzz.py` op_commit
+   :2837, op_rebase :2595), and the cross-version baselines are
+   info-equivalence
+   (`instar-testdata/expected-outputs/{commit-backing,commit-overlay,rebase}-info-json`);
+   bench's is `qemu-img compare` + `qemu-img check`
+   (PLAN-bench-refcount-growth.md). If phase 1's exhaustive
+   inventory confirms no byte-identity surface exists for any v1
+   consumer, COW placement has layout freedom everywhere and only
+   check-cleanliness + content parity constrain it; any consumer
+   that does turn out to be byte-parity-constrained gates
+   snapshot-bearing images (refusal, not corruption) unless
+   qemu's COW placement proves deterministic. Phase 1 probes both
+   questions.
 4. **API shape.** An emitted step-program (bounded buffer of
    typed steps: read cluster, zero range, write range, patch
    table entry, barrier) versus an incremental query API the
@@ -232,7 +242,9 @@ Design sketch (to be settled in phase planning, not binding):
    `scripts/check-binary-sizes.sh` limits.
 6. **Growth adoption beyond bench.** Preemptive over-provisioned
    growth cannot satisfy byte-parity oracles
-   (PLAN-bench-refcount-growth.md OQ5). Options: match qemu's
+   (PLAN-bench-refcount-growth.md OQ5) — but per OQ3 above,
+   phase 1's inventory determines which consumers are actually
+   byte-parity-constrained; commit and rebase may not be. Options: match qemu's
    lazy on-demand growth layout exactly (strict, but makes growth
    universal), or keep `RefcountExhausted` refusals in
    byte-parity consumers with the shared crate simply owning the
