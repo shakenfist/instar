@@ -27,3 +27,4 @@
 - PLAN-bitmap.md: instar bitmap subcommand
 - PLAN-bench.md: instar bench subcommand
 - PLAN-bench-refcount-growth.md: bench qcow2 refcount growth
+- PLAN-qcow2-write-infrastructure.md: qcow2 write infrastructure
