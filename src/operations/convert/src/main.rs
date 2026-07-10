@@ -562,10 +562,15 @@ pub unsafe extern "C" fn _start() -> u64 {
             // VHD declared size: for a windowed dd copy, qemu rounds
             // `out_vsize` up to whole CHS geometry (e.g. 3000 -> 34816).
             // For whole-image convert keep stamping the verbatim
-            // `virtual_size` so the convert round-trip stays byte- and
-            // size-identical to prior behaviour (the convert suite reads
-            // the declared size back, and qemu's convert baseline is the
-            // unrounded input size).
+            // `virtual_size`. qemu-img convert rounds here too
+            // (empirically, qemu 10.0.8 declares 1073995776 for a 1 GiB
+            // source), so this is a deliberate divergence — recorded in
+            // KNOWN_WRITER_DIVERGENCES (tests/test_create.py) — that
+            // keeps the convert round-trip size-identical: the convert
+            // suite reads the declared size back and expects the exact
+            // input size. Verbatim sizes take build_footer's VHD-spec
+            // floor-CHS path rather than the qemu search-geometry path
+            // (see vhd::footer_geometry, issue #413).
             let vhd_declared = if config.has_dd_window() {
                 vhd::chs_rounded_size(out_vsize)
             } else {
