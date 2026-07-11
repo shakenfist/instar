@@ -197,8 +197,12 @@ Design sketch (to be settled in phase planning, not binding):
 
 ## Open questions
 
-1. **What does qemu-img commit do with a snapshot-bearing backing
-   file?** Expected: COW via the block layer, snapshots
+1. **Resolved (phase 1): qemu COWs and preserves internal
+   snapshots on every version tested; instar corrupts them —
+   silently in the dominant mode. Live defect confirmed, phase 2
+   is live.** See "Findings: phase 1 semantics pin" (Q1).
+   Original question: **What does qemu-img commit do with a
+   snapshot-bearing backing file?** Expected: COW via the block layer, snapshots
    preserved. Must be established empirically (live qemu
    experiments across the pinned qemu versions) before anything
    else, because if instar commit corrupts snapshots today that
@@ -206,10 +210,26 @@ Design sketch (to be settled in phase planning, not binding):
    interim gate (refuse `nb_snapshots > 0` backings, matching
    bench's posture) and a GitHub issue, independent of the
    consolidation timeline.
-2. **Same question for rebase safe mode** writing into a
+2. **Resolved (phase 1): qemu proceeds without refusal or
+   warning — its contract covers the active view only, and the
+   snapshot's virtual view silently reads through the new
+   backing afterwards (a semantic instar must reproduce, not
+   avoid). instar corrupts refcounts when the active L2 is
+   snapshot-shared, with a demonstrated data-loss chain via a
+   later `snapshot -d`; a separate 512-byte-cluster livelock was
+   found incidentally.** See Findings (Q2). Original question:
+   **Same question for rebase safe mode** writing into a
    snapshot-bearing overlay: are the L1/L2 tables it rewrites
    ever snapshot-shared, and what does qemu do?
-3. **Does our COW allocation order need byte parity with qemu?**
+3. **Resolved (phase 1): no. No byte-identity oracle exists for
+   any v1 consumer's mutated image (exhaustive inventory), and
+   qemu's own COW placement is nondeterministic run-to-run at
+   512-byte clusters, so byte parity is unachievable in general.
+   COW placement has full layout freedom; the constraint stack
+   is compare + check + info-equivalence, plus the new snapshot
+   read-back oracle phases 7-8 add.** See Findings (Q3).
+   Original question: **Does our COW allocation order need byte
+   parity with qemu?**
    Initial inventory during planning found the commit / rebase
    oracles are *looser than assumed*: the differential-fuzz
    comparisons are normalised `qemu-img info --output=json` on
@@ -226,20 +246,27 @@ Design sketch (to be settled in phase planning, not binding):
    snapshot-bearing images (refusal, not corruption) unless
    qemu's COW placement proves deterministic. Phase 1 probes both
    questions.
-4. **API shape.** An emitted step-program (bounded buffer of
-   typed steps: read cluster, zero range, write range, patch
-   table entry, barrier) versus an incremental query API the
-   guest op polls per cluster. Step-program is more auditable and
-   testable pure; the bounded-buffer size must fit existing
-   scratch budgets. To settle at phase-plan time with the memory
-   budget survey.
-5. **Memory budget unification.** commit, rebase and bench each
-   have hand-laid scratch maps (staged L2s, staged refblocks,
-   bounce buffers) with static layout asserts. Does a shared
-   staging struct fit all three existing maps without moving
-   regions, and does the COW bounce buffer (one cluster, up to
-   2 MiB) fit? Guest binaries must stay within
-   `scripts/check-binary-sizes.sh` limits.
+4. **Resolved (phase 1): windowed step-program** — bounded
+   64 KiB step buffer (~11 worst-case steps × 32 B per cluster,
+   ~186 clusters per refill), steps addressing staged buffers by
+   region-id + offset, barriers as explicit step types, refblock
+   flush as one composite step. Decisive argument: the
+   crash-ordering contract becomes unit-testable data instead of
+   living in three guest loops. See Findings (Q4). Original
+   question: **API shape** — step-program versus an incremental
+   query API the guest op polls per cluster.
+5. **Resolved (phase 1): feasible.** bench fits with no region
+   moved (its `WRITE_*` regions already are the struct;
+   `BUF_DEST` is the bounce); commit fits at its 1 MiB cluster
+   envelope (`DATA_BUF` is the bounce; its planner-scratch
+   duplicate refblocks are reclaimable); rebase needs only its
+   `EXISTING_STATE` arena interior re-carved from bump-cursor to
+   fixed offsets. Standardise on bench's single-copy
+   mutate-in-place refblock model. Staging must remain
+   scratch-address-carved, never `static` (.bss hazard class).
+   Binary sizes are a non-issue (3% / 4% / 21% of the 768 KiB
+   cap). See Findings (Q4). Original question: **memory budget
+   unification** across the three hand-laid scratch maps.
 6. **Growth adoption beyond bench.** Preemptive over-provisioned
    growth cannot satisfy byte-parity oracles
    (PLAN-bench-refcount-growth.md OQ5) — but per OQ3 above,
@@ -261,8 +288,8 @@ Design sketch (to be settled in phase planning, not binding):
 
 | Phase | Plan | Status |
 |-------|------|--------|
-| 1. Semantics pin: qemu snapshot-bearing commit/rebase behaviour, COW order determinism, oracle inventory, memory budget survey | PLAN-qcow2-write-infrastructure-phase-01-semantics.md | Not started |
-| 2. Interim safety gates for defects found in phase 1 (conditional; fast-tracked if instar corrupts today) | PLAN-qcow2-write-infrastructure-phase-02-gates.md | Not started |
+| 1. Semantics pin: qemu snapshot-bearing commit/rebase behaviour, COW order determinism, oracle inventory, memory budget survey | PLAN-qcow2-write-infrastructure-phase-01-semantics.md | Complete (2026-07-12; see Findings) |
+| 2. Interim safety gates + defect handling — LIVE: commit snapshot corruption, rebase snapshot corruption + data-loss chain, rebase 512-byte-cluster livelock (fix or gate per root-cause depth) | PLAN-qcow2-write-infrastructure-phase-02-gates.md | Not started |
 | 3. `crates/qcow2-write` core: classification + allocate-on-write planner + ordering contract (no COW, no growth), unit tests | PLAN-qcow2-write-infrastructure-phase-03-crate.md | Not started |
 | 4. Migrate commit onto the crate (byte-identical proof) | PLAN-qcow2-write-infrastructure-phase-04-commit.md | Not started |
 | 5. Migrate rebase safe mode (byte-identical proof) | PLAN-qcow2-write-infrastructure-phase-05-rebase.md | Not started |
@@ -271,9 +298,9 @@ Design sketch (to be settled in phase planning, not binding):
 | 8. Fuzz: coverage-guided target for the new crate; differential coverage for newly-permitted snapshot-bearing writes | PLAN-qcow2-write-infrastructure-phase-08-fuzz.md | Not started |
 | 9. Docs: architecture notes, docs/qcow2/ implementation notes, per-op doc updates, CHANGELOG | PLAN-qcow2-write-infrastructure-phase-09-docs.md | Not started |
 
-Phase 2 exists only if phase 1 confirms a live defect; if qemu
-also refuses (or instar's behaviour already matches), it
-collapses into a documentation note and the table is updated.
+Phase 2 was conditional on phase 1 confirming a live defect;
+phase 1 confirmed three (see the Findings defect register), so
+phase 2 is live and its plan file is the next to write.
 
 One commit per phase minimum; each commit builds, lints and tests
 clean on its own. Phases 4-6 are pure refactors from the outside:
@@ -308,6 +335,271 @@ fuzz-target / docs patterns.
 
 Each phase plan should include the step-level table (step,
 effort, model, isolation, sub-agent brief) per PLAN-TEMPLATE.md.
+
+### Findings: phase 1 semantics pin (2026-07-12)
+
+Executed per
+[PLAN-qcow2-write-infrastructure-phase-01-semantics.md](PLAN-qcow2-write-infrastructure-phase-01-semantics.md)
+as four investigation sub-agents (1a/1b/1c/1d) plus this
+synthesis. Probe scripts and raw per-row JSON live in the
+(ephemeral) session scratchpad; everything needed to reproduce
+is recorded here. Environment: instar built from develop at
+98b3140; pinned static qemu-img {6.2.0, 7.2.22, 8.2.10, 9.2.4,
+10.2.0} from `instar-testdata/qemu-img-binaries/x86_64/`; system
+qemu-img is now **10.0.11** (upgraded from the 10.0.8 the phase
+plan recorded); qemu-io is always the system build (pinned dirs
+ship qemu-img only — harmless, both sides of every comparison
+get byte-identical fixtures).
+
+#### Q1 — commit into a snapshot-bearing backing (step 1a)
+
+Matrix: cluster_size {512, 65536} × post-snapshot-write {yes,
+no} × committed extent {overlapping-shared, fresh-only} × 6 qemu
+versions = 48 rows, plus a second-order probe (snapshot on the
+overlay instead). Fixture recipe (cwd = fixture dir, relative
+backing names, overlay created with `-o cluster_size=<cs>` to
+match the base — without that, instar's cluster-size-mismatch
+gate refuses first and masks the question):
+
+```
+qemu-img create -f qcow2 -o cluster_size=<cs> base.qcow2 64M
+qemu-io -c 'write -P 0xaa 1M 2M' base.qcow2
+qemu-img snapshot -c snap1 base.qcow2
+[psw=yes] qemu-io -c 'write -P 0xbb 1M 512K' base.qcow2
+qemu-img create -f qcow2 -o cluster_size=<cs> \
+    -b base.qcow2 -F qcow2 overlay.qcow2
+[shared] qemu-io -c 'write -P 0xcc 1536k 1M' overlay.qcow2
+[fresh]  qemu-io -c 'write -P 0xcc 32M 1M'   overlay.qcow2
+```
+
+Core signal: snap1's virtual view, extracted before and after
+commit via apply-on-a-copy + convert-to-raw + sha256.
+
+**qemu verdict (all 48 rows, fully version-invariant 6.2.0 →
+10.2.0): COWs and preserves.** Exit 0, base grows (e.g. 3145728
+→ 4194304 at 64K: COW allocations for the shared region),
+check-clean, snap1 bit-identical before/after.
+
+**instar verdict: corrupts in every shape where its writes reach
+snapshot-shared clusters or a snapshot-shared L2 table — 5 of 8
+fixture shapes, two distinct modes.**
+
+| Mode | Trigger | Effect | Detectability |
+|------|---------|--------|---------------|
+| A: silent data-cluster overwrite | committed extent overlaps snapshot-shared data clusters (the blind overwrite at `src/operations/commit/src/main.rs:772`) | base does NOT grow; pattern C bleeds bit-exactly into snap1 (corrupted hash matched an independent prediction) | **invisible**: `qemu-img check` clean (refcount-2 clusters referenced by both L1 trees stay formally consistent), active views match qemu's and the expected merge, info-equivalence passes — only snapshot read-back reveals it |
+| B: shared-L2 mapping leak | the active L2 table itself is still snapshot-shared (no post-snapshot write ever COWed it) and commit allocates through it | new mappings leak into snap1 (snap1 gains pattern C at 32M, bit-exactly predicted); fresh clusters referenced by two L1 trees carry refcount 1 | check-visible: 16 × `ERROR cluster N refcount=1 reference=2`, rc=2 |
+
+The one agreeing shape (64K, psw=yes, fresh-only) is exactly the
+shape where nothing instar writes touches shared state. At
+cs=512 instar refuses fresh-extent rows first
+(`ERROR_REFCOUNT_EXHAUSTED`, the v1 no-refblock-append ceiling)
+— logically clean but **not byte-idempotent**: scaffolding
+clusters are written into the backing before the guest errors
+(base grew 2172486 → 2228224 in the refused rows). Second-order
+probe: snapshot on the *overlay* — both tools proceed, both
+preserve it, no divergence.
+
+#### Q2 — safe-mode rebase of a snapshot-bearing overlay (step 1b)
+
+Matrix: cluster_size {512, 65536} × post-snapshot-write {yes,
+no} × 6 versions = 24 rows. Fixture: base_old (0x11 at [0,4M)),
+base_new (0x22 at [2,6M)), overlay on base_old with 0x33 at
+[1,2M), `snapshot -c snap1`, optional post-snapshot 0x44 write,
+then `rebase -b base_new -F qcow2` (safe mode) per side.
+
+**qemu semantics (uniform across versions): proceeds, never
+refuses, never warns.** The contract covers the **active view
+only** (preserved by copying differing old-backing data and
+properly COWing the snapshot-shared L2). Internal snapshots are
+left untouched, so **the snapshot's virtual view silently
+changes** — its unallocated ranges now resolve through the NEW
+backing (bit-identical resulting snap1 hash on all six
+versions). This is designed-in qemu behaviour, not a bug to
+match against.
+
+**instar behaviour — three regimes:**
+
+1. **64K + snapshot-shared active L2 (psw=no): corrupts.**
+   Writes new mappings into the shared L2 in place and sets
+   refcount=1 on the 80 clusters it allocates while two L1 trees
+   reference them (`refcount=1 reference=2` × 80, every
+   version). Demonstrated data-loss payload: a routine
+   `qemu-img snapshot -d snap1` afterwards decrements 1 → 0 and
+   frees the clusters — 3 MiB of **active-view** data physically
+   zeroed (verified at the host offsets) while `qemu-img map`
+   still points at them. Also diverges semantically: snap1 stays
+   at OLD content instead of qemu's read-through-new-backing.
+2. **64K + already-COWed active L2 (psw=yes): byte-identical to
+   qemu's output on all six versions** — a notable parity datum:
+   where no shared metadata is in play, instar's safe-rebase COW
+   placement matches qemu exactly.
+3. **cs=512: livelock, snapshot-independent.** ~100% guest CPU,
+   zero file progress, killed after 25+ minutes; reproduces on
+   the identical fixture with **no snapshot at all**; the same
+   fixture at 64K completes in 0.76 s. A separate pre-existing
+   defect in rebase's 512-byte-cluster write path, discovered
+   incidentally. The killed image was semantically untouched
+   (still points at base_old, check-clean) — timing luck, not a
+   guarantee.
+
+#### Q3 — parity-oracle inventory + COW determinism (step 1c)
+
+**No byte-identity surface exists for any v1 consumer's mutated
+image — confirmed exhaustively.** commit: stdout smoke tests
+(tests/test_commit.py:196-296), info-equivalence on overlay AND
+backing in round-trip (:421, :441) and baseline-matrix (:758,
+:763) tests, exit-codes + info in op_commit
+(scripts/differential-fuzz.py:2946, :2961-3025). rebase:
+info-equivalence on the rebased overlay
+(tests/test_rebase.py:367, :689; differential-fuzz :2702,
+:2719-2779). bench: sha256 only for **raw** `-w`
+(tests/test_bench.py:837, differential-fuzz :2500-2508); qcow2
+`-w` is compare + check (+ a no-growth file-size assert on the
+populated fast path, :890-893). The baseline files contain raw
+`qemu-img info` JSON but the consuming comparison
+(`assert_info_equivalent`, tests/helpers/info_json.py:148)
+strips `actual-size` and even the physical file length
+(:20-49) — **effective strictness: info-equivalence
+throughout.** docs/quirks.md's commit/rebase "byte-for-byte"
+claims are about stdout strings and info JSON, not image bytes.
+
+**No snapshot-bearing commit/rebase/bench fixture is generated
+anywhere** in the test or fuzz surface (pickers at
+differential-fuzz.py:2800-2834 / :2547-2592 / :2375-2426 create
+no snapshots; op_snapshot's fixtures are not shared across ops;
+bench's only snapshot fixture is its refusal test,
+tests/test_bench.py:1041-1053). Consequently **no existing
+oracle would have caught Q1 mode A** — and even on a
+snapshot-bearing fixture, check/compare/info all pass on mode A;
+only snapshot read-back discriminates. That read-back
+(apply-on-copy + convert + sha256) is the oracle phases 7-8 must
+add to the integration and differential-fuzz stacks.
+
+**COW placement determinism probe:** `qemu-img commit` on the
+Q1 fixture is run-to-run deterministic at 64K clusters (5/5
+identical output hashes) and cross-version stable — post-commit
+images across 6.2.0 → 10.2.0 differ in exactly 4 bytes, the
+snapshot table's `date_nsec` creation timestamp, with identical
+`map` output. But at 512-byte clusters it is **nondeterministic
+under a single binary**: 8 runs, 8 distinct hashes (identical
+virtual content, per-run physical placement — plausibly the
+async block-job's in-flight interleaving; mechanism inferred,
+fact verified). **Byte parity with qemu COW placement is
+therefore unachievable in general, as well as unnecessary.**
+
+**Migration-proof oracle for phases 4-6:** instar-before vs
+instar-after — the same fixture corpus through the pre- and
+post-migration binaries, sha256 equality of every mutated file
+plus stdout. No committed corpus exists; phase 4 builds a
+harness that (1) generates a deterministic matrix once per run
+with a pinned qemu-img — cluster_size {512, 4096, 65536} × size
+{1M, 64M} × seed {empty, 64K, multi-extent} × lazy_refcounts
+{off, on} × {implicit, explicit `-b`}; (2) first asserts
+instar's own run-to-run byte determinism (the premise of the
+proof — expected from the single-threaded guest, never yet
+asserted); (3) asserts before == after across the matrix.
+Re-parameterises for phases 5 and 6.
+
+#### Q4 — memory budget + API shape (step 1d)
+
+Layout source of truth is `src/shared/src/lib.rs`
+(`SCRATCH_MEM_BASE` 0x300000, `ALLOC_HEAP_BASE` 0xF70000 →
+**12.4375 MiB of scratch per op**; op window [0x30000, 0xF0000)
+= 768 KiB, `.bss`-inclusive extent enforced by
+scripts/check-binary-sizes.sh). Binding constraint: **staging
+must be scratch-address-carved slices, never `static`** (the
+.bss/HEADER_MISMATCH hazard class); commit/rebase today have
+~zero .bss precisely because they follow it. Binary headroom is
+a non-issue: commit 26 KiB / rebase 33 KiB / bench 162 KiB of
+768 KiB.
+
+Scratch verdicts (OQ5): **bench** — shared staging struct fits
+with no region moved; its `WRITE_*` regions already *are* the
+struct's refblock portion and `BUF_DEST` (2 MiB) already serves
+as the COW bounce. **commit** — fits at its existing 1 MiB
+cluster envelope with no region moved (`DATA_BUF` is the
+bounce); its 3 MiB `PLANNER_SCRATCH` mostly holds a **duplicate
+copy of the staged refblocks** (crates/commit/src/qcow2.rs:
+164-176) — reclaimable by standardising on bench's
+mutate-in-place model, which is also what a 2 MiB-cluster
+envelope would need. **rebase** — top-level regions need not
+move but `EXISTING_STATE` (4 MiB bump-cursor arena,
+src/operations/rebase/src/main.rs:459+) must be re-carved into
+fixed offsets; fits at the 1 MiB envelope; `old_buf` is
+semantically the COW bounce already; its 4 MiB
+`PLANNER_SCRATCH` duplicate is likewise reclaimable. Cap
+asymmetries to unify: `MAX_REFBLOCKS` 32 (commit) vs 2048
+(rebase, bench); cluster caps 1 MiB / 1 MiB / 2 MiB.
+
+API shape (OQ4): **windowed step-program.** Worst case ≈ 11
+steps per cluster write (COW read, fill, data write, fresh-L2
+write, L1 patch, L2 patch, 2 refcount RMWs, refblock
+write-back, ≤ 2 barriers); at a packed 32 B/step a 64 KiB step
+buffer holds ~186 worst-case clusters per refill and fits every
+op's existing slack. Whole-op programs are infeasible (commit's
+envelope reaches ~2M clusters). Steps address staged buffers by
+region-id + offset (keeps the crate pure/address-free);
+barriers are explicit step types; refblock flush stays a single
+composite step (matches all three current implementations). The
+decisive argument over an incremental query API: the
+crash-ordering contract becomes **data** a unit test asserts
+once, instead of living in three guest driving loops — which is
+the fragmentation defect this plan exists to kill.
+Op-specific absorptions for phase 3's design: commit is
+two-image/two-device (backing via output device + overlay clear
+pass via input slot 0, plus the defensive header re-read);
+rebase's COW source is a *chain-virtual* read and it ends with
+a deferred header/backing-path patch group that must land after
+refcounts; bench splits setup from the timed bracket. **Barrier
+asymmetry flagged:** the call table exposes only `fsync_input`
+(src/shared/src/lib.rs:1017) — commit and rebase write via the
+output device and issue zero fsyncs today, relying on ordering
+alone; phase 3 must either add `fsync_output` (ABI change) or
+define barrier steps as ordering-only where the executor has no
+fsync.
+
+#### Defect register (phase 2 goes live)
+
+Three defects confirmed, all pre-existing on develop. Draft
+issues (to be filed on operator approval):
+
+1. **`instar commit` silently corrupts internal snapshots in
+   the backing file.** Blind in-place overwrite of
+   snapshot-shared clusters (no COPIED/refcount check,
+   `src/operations/commit/src/main.rs:772`; no `nb_snapshots`
+   gate anywhere). qemu-img COWs and preserves on every version
+   tested. Mode A is check-clean and invisible to every
+   existing oracle; mode B additionally under-counts refcounts
+   (16 × `refcount=1 reference=2`). Repro: Q1 recipe above.
+   Interim fix (phase 2): refuse `nb_snapshots > 0` backings,
+   matching bench's posture; real fix: phase 7 COW.
+2. **`instar rebase` (safe mode) corrupts refcounts when
+   overlay metadata is snapshot-shared — with a data-loss
+   chain.** In-place mutation of a snapshot-shared L2 +
+   refcount=1 on doubly-referenced clusters (80 ×
+   `refcount=1 reference=2`); a subsequent
+   `qemu-img snapshot -d` frees live active-view clusters
+   (3 MiB zeroed in the probe). qemu proceeds-and-COWs (its
+   contract: active view only; snapshots read through the new
+   backing afterwards — instar must match that semantic in
+   phase 7, including the snapshot-view change). Repro: Q2
+   recipe. Interim fix (phase 2): refuse `nb_snapshots > 0`
+   overlays in safe mode (`-u` metadata-only rebase does not
+   copy data and needs separate consideration in phase 2
+   planning).
+3. **`instar rebase` livelocks on 512-byte-cluster overlays,
+   snapshots irrelevant.** 100% guest CPU, zero progress, 25+
+   minutes on a fixture qemu completes instantly; same fixture
+   at 64K clusters completes in 0.76 s. Independent of the
+   snapshot work; needs root-causing (phase 2 scope decision:
+   fix if shallow, otherwise gate 512-byte safe-mode rebase and
+   track).
+
+Also recorded, not defect-classed: commit's
+`ERROR_REFCOUNT_EXHAUSTED` refusal writes scaffolding clusters
+before erroring (refusal is not byte-idempotent — worth folding
+into the phase 3 ordering contract: no image mutation before
+the envelope checks pass).
 
 ## Administration and logistics
 
@@ -357,13 +649,22 @@ effort, model, isolation, sub-agent brief) per PLAN-TEMPLATE.md.
 
 ### Bugs fixed during this work
 
-To be filled in during execution. Candidate already identified:
-commit's blind overwrite of snapshot-shared backing clusters
-(no `nb_snapshots` gate, no COPIED/refcount check before the
-:772 overwrite) — confirmed or refuted by phase 1; if confirmed,
-file a GitHub issue and fast-track the phase-2 gate. Scan the
-GitHub tracker during phase 1 for open issues touching commit /
-rebase / bench qcow2 writes and snapshot interactions.
+Phase 1 confirmed three pre-existing defects (details and repro
+recipes in the Findings defect register; draft issues awaiting
+operator approval to file):
+
+1. `instar commit` silently corrupts internal snapshots in the
+   backing file (two modes; the dominant one invisible to every
+   existing oracle). Interim gate in phase 2; real fix phase 7.
+2. `instar rebase` (safe mode) corrupts refcounts on
+   snapshot-shared overlay metadata, enabling live data loss via
+   a later `snapshot -d`. Interim gate in phase 2; real fix
+   phase 7.
+3. `instar rebase` livelocks on 512-byte-cluster overlays
+   (snapshot-independent). Root-cause in phase 2; fix or gate
+   there per depth.
+
+Fix status is tracked here as phases land.
 
 ### Documentation index maintenance
 
