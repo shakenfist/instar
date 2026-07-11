@@ -289,7 +289,7 @@ Design sketch (to be settled in phase planning, not binding):
 | Phase | Plan | Status |
 |-------|------|--------|
 | 1. Semantics pin: qemu snapshot-bearing commit/rebase behaviour, COW order determinism, oracle inventory, memory budget survey | PLAN-qcow2-write-infrastructure-phase-01-semantics.md | Complete (2026-07-12; see Findings) |
-| 2. Interim safety gates + defect handling — LIVE: commit snapshot corruption, rebase snapshot corruption + data-loss chain, rebase 512-byte-cluster livelock (fix or gate per root-cause depth) | PLAN-qcow2-write-infrastructure-phase-02-gates.md | Not started |
+| 2. Interim safety gates + defect handling — LIVE: commit snapshot corruption (#420), rebase snapshot corruption + data-loss chain (#421), rebase 512-byte-cluster livelock (#422; fix or gate per root-cause depth) | PLAN-qcow2-write-infrastructure-phase-02-gates.md | Planned (2026-07-12), not started |
 | 3. `crates/qcow2-write` core: classification + allocate-on-write planner + ordering contract (no COW, no growth), unit tests | PLAN-qcow2-write-infrastructure-phase-03-crate.md | Not started |
 | 4. Migrate commit onto the crate (byte-identical proof) | PLAN-qcow2-write-infrastructure-phase-04-commit.md | Not started |
 | 5. Migrate rebase safe mode (byte-identical proof) | PLAN-qcow2-write-infrastructure-phase-05-rebase.md | Not started |
@@ -560,11 +560,15 @@ fsync.
 
 #### Defect register (phase 2 goes live)
 
-Three defects confirmed, all pre-existing on develop. Draft
-issues (to be filed on operator approval):
+Three defects confirmed, all pre-existing on develop. Filed
+2026-07-12 as
+[#420](https://github.com/shakenfist/instar/issues/420),
+[#421](https://github.com/shakenfist/instar/issues/421) and
+[#422](https://github.com/shakenfist/instar/issues/422)
+respectively:
 
 1. **`instar commit` silently corrupts internal snapshots in
-   the backing file.** Blind in-place overwrite of
+   the backing file (#420).** Blind in-place overwrite of
    snapshot-shared clusters (no COPIED/refcount check,
    `src/operations/commit/src/main.rs:772`; no `nb_snapshots`
    gate anywhere). qemu-img COWs and preserves on every version
@@ -575,7 +579,7 @@ issues (to be filed on operator approval):
    matching bench's posture; real fix: phase 7 COW.
 2. **`instar rebase` (safe mode) corrupts refcounts when
    overlay metadata is snapshot-shared — with a data-loss
-   chain.** In-place mutation of a snapshot-shared L2 +
+   chain (#421).** In-place mutation of a snapshot-shared L2 +
    refcount=1 on doubly-referenced clusters (80 ×
    `refcount=1 reference=2`); a subsequent
    `qemu-img snapshot -d` frees live active-view clusters
@@ -588,7 +592,7 @@ issues (to be filed on operator approval):
    copy data and needs separate consideration in phase 2
    planning).
 3. **`instar rebase` livelocks on 512-byte-cluster overlays,
-   snapshots irrelevant.** 100% guest CPU, zero progress, 25+
+   snapshots irrelevant (#422).** 100% guest CPU, zero progress, 25+
    minutes on a fixture qemu completes instantly; same fixture
    at 64K clusters completes in 0.76 s. Independent of the
    snapshot work; needs root-causing (phase 2 scope decision:
@@ -650,17 +654,19 @@ the envelope checks pass).
 ### Bugs fixed during this work
 
 Phase 1 confirmed three pre-existing defects (details and repro
-recipes in the Findings defect register; draft issues awaiting
-operator approval to file):
+recipes in the Findings defect register; filed 2026-07-12):
 
-1. `instar commit` silently corrupts internal snapshots in the
+1. [#420](https://github.com/shakenfist/instar/issues/420)
+   `instar commit` silently corrupts internal snapshots in the
    backing file (two modes; the dominant one invisible to every
    existing oracle). Interim gate in phase 2; real fix phase 7.
-2. `instar rebase` (safe mode) corrupts refcounts on
+2. [#421](https://github.com/shakenfist/instar/issues/421)
+   `instar rebase` (safe mode) corrupts refcounts on
    snapshot-shared overlay metadata, enabling live data loss via
    a later `snapshot -d`. Interim gate in phase 2; real fix
    phase 7.
-3. `instar rebase` livelocks on 512-byte-cluster overlays
+3. [#422](https://github.com/shakenfist/instar/issues/422)
+   `instar rebase` livelocks on 512-byte-cluster overlays
    (snapshot-independent). Root-cause in phase 2; fix or gate
    there per depth.
 
