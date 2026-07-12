@@ -506,61 +506,17 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
         );
     }
     cursor += l1_size_bytes;
-
-    // Staged L2 tables — walk L1, read each non-zero L2 into
-    // scratch, and remember the (l1_idx, host_offset) tuple.
-    let l2_staging_start = cursor;
-    let mut staged_l2 = [StagedL2 {
-        l1_idx: 0,
-        host_offset: 0,
-        dirty: false,
-    }; MAX_STAGED_L2];
-    let mut staged_l2_count: usize = 0;
-
     let l1_buf = core::slice::from_raw_parts_mut(l1_ptr, l1_size_bytes);
-    for i in 0..parsed.l1_size as usize {
-        let entry = read_u64_be(l1_buf, i * 8);
-        let l2_host = entry & L1_OFFSET_MASK;
-        if l2_host == 0 {
-            continue;
-        }
-        if staged_l2_count >= MAX_STAGED_L2 {
-            return err_result(
-                config.overlay_format,
-                RebaseResult::MODE_SAFE,
-                RebaseResult::ERROR_SCRATCH_TOO_SMALL,
-            );
-        }
-        if cursor + cluster_size_usize > existing_state_end {
-            return err_result(
-                config.overlay_format,
-                RebaseResult::MODE_SAFE,
-                RebaseResult::ERROR_SCRATCH_TOO_SMALL,
-            );
-        }
-        if !read_byte_range(
-            call_table,
-            sector_size,
-            l2_host,
-            cursor as *mut u8,
-            cluster_size_usize,
-        ) {
-            return err_result(
-                config.overlay_format,
-                RebaseResult::MODE_SAFE,
-                RebaseResult::ERROR_PARSE_FAILED,
-            );
-        }
-        staged_l2[staged_l2_count] = StagedL2 {
-            l1_idx: i as u32,
-            host_offset: l2_host,
-            dirty: false,
-        };
-        staged_l2_count += 1;
-        cursor += cluster_size_usize;
-    }
 
-    // Refcount table
+    // Refcount table. Staged BEFORE the L2 tables: the L2
+    // staging arena grows at runtime (the comparison loop
+    // stages a fresh L2 whenever a divergent cluster lands in
+    // an L1 entry the overlay left zero), so it must be the
+    // LAST carve in EXISTING_STATE — anything staged after it
+    // would be clobbered by arena growth. GitHub issue #422
+    // defect B: new L2 slots overwrote the staged
+    // refcount-block host offsets, which the refblock flush
+    // below dereferences as host WRITE offsets.
     let rt_size_bytes =
         (parsed.refcount_table_clusters as usize).saturating_mul(cluster_size_usize);
     if cursor + rt_size_bytes > existing_state_end {
@@ -654,6 +610,63 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
         }
     }
     let rb_data_slice = core::slice::from_raw_parts(rb_data_ptr, rb_data_bytes);
+    cursor += rb_data_bytes;
+
+    // Staged L2 tables — walk L1, read each non-zero L2 into
+    // scratch, and remember the (l1_idx, host_offset) tuple.
+    // Carved last (see the refcount-table comment above): the
+    // arena's growth capacity runs from `l2_staging_start` to
+    // `existing_state_end`, which already reserves the
+    // stable-header tail sector.
+    let l2_staging_start = cursor;
+    let mut staged_l2 = [StagedL2 {
+        l1_idx: 0,
+        host_offset: 0,
+        dirty: false,
+    }; MAX_STAGED_L2];
+    let mut staged_l2_count: usize = 0;
+
+    for i in 0..parsed.l1_size as usize {
+        let entry = read_u64_be(l1_buf, i * 8);
+        let l2_host = entry & L1_OFFSET_MASK;
+        if l2_host == 0 {
+            continue;
+        }
+        if staged_l2_count >= MAX_STAGED_L2 {
+            return err_result(
+                config.overlay_format,
+                RebaseResult::MODE_SAFE,
+                RebaseResult::ERROR_SCRATCH_TOO_SMALL,
+            );
+        }
+        if cursor + cluster_size_usize > existing_state_end {
+            return err_result(
+                config.overlay_format,
+                RebaseResult::MODE_SAFE,
+                RebaseResult::ERROR_SCRATCH_TOO_SMALL,
+            );
+        }
+        if !read_byte_range(
+            call_table,
+            sector_size,
+            l2_host,
+            cursor as *mut u8,
+            cluster_size_usize,
+        ) {
+            return err_result(
+                config.overlay_format,
+                RebaseResult::MODE_SAFE,
+                RebaseResult::ERROR_PARSE_FAILED,
+            );
+        }
+        staged_l2[staged_l2_count] = StagedL2 {
+            l1_idx: i as u32,
+            host_offset: l2_host,
+            dirty: false,
+        };
+        staged_l2_count += 1;
+        cursor += cluster_size_usize;
+    }
 
     // ----- Plan the rebase via the safe-mode planner -------
     let capacity_sectors = (call_table.get_output_capacity)();
@@ -755,16 +768,15 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
     let mut clusters_copied: u64 = 0;
     let mut bytes_copied: u64 = 0;
 
-    // The L2 staging slice is a single contiguous region; each
-    // entry lives at `l2_staging_start + slot * cluster_size`.
-    let l2_staging_slice = core::slice::from_raw_parts_mut(
-        l2_staging_start as *mut u8,
-        // We currently use staged_l2_count slots; future
-        // allocations (when an L1 entry was zero) push past
-        // this. Reserve the rest of EXISTING_STATE up to
-        // cursor as the staging arena.
-        staged_l2_count * cluster_size_usize,
-    );
+    // The L2 staging arena is a single contiguous region; slot
+    // `s` lives at `l2_staging_start + s * cluster_size`. The
+    // arena GROWS as the loop stages fresh L2 tables, so every
+    // access must view it through `l2_arena` with the CURRENT
+    // slot count — a slice sized once from the initial count
+    // panics as soon as a newly staged slot is read back
+    // (GitHub issue #422 defect A; the panic handler's
+    // `loop {}` made it present as a livelock).
+    //
     // Track how many L2 slots have been used so far (matches
     // staged_l2_count but moves up as we allocate new tables).
     let mut l2_slots_used = staged_l2_count;
@@ -789,8 +801,9 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
         if l2_host != 0 {
             slot = find_staged_l2(&staged_l2, staged_l2_count, l1_idx as u32);
             if let Some(s) = slot {
+                let arena = l2_arena(l2_staging_start, l2_slots_used, cluster_size_usize);
                 let base = s * cluster_size_usize;
-                let entry = read_u64_be(l2_staging_slice, base + l2_inner_idx * 8);
+                let entry = read_u64_be(arena, base + l2_inner_idx * 8);
                 if entry != 0 {
                     // Overlay already owns the cluster; nothing
                     // to copy.
@@ -911,18 +924,12 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
             );
         }
 
-        // Refresh the staging slice with the (potentially
-        // grown) capacity so we can write into newly-allocated
-        // slots too.
-        let staging_bytes_in_use = l2_slots_used * cluster_size_usize;
-        let l2_staging_slice_mut =
-            core::slice::from_raw_parts_mut(l2_staging_start as *mut u8, staging_bytes_in_use);
+        // Re-derive the arena view with the (potentially
+        // grown) slot count so newly-allocated slots are
+        // addressable too.
+        let arena = l2_arena(l2_staging_start, l2_slots_used, cluster_size_usize);
         let base = staged_slot * cluster_size_usize;
-        write_u64_be(
-            l2_staging_slice_mut,
-            base + l2_inner_idx * 8,
-            data_host | OFLAG_COPIED,
-        );
+        write_u64_be(arena, base + l2_inner_idx * 8, data_host | OFLAG_COPIED);
         staged_l2[find_staged_l2(&staged_l2, staged_l2_count, l1_idx as u32).unwrap()].dirty = true;
 
         clusters_copied += 1;
@@ -1023,6 +1030,24 @@ fn read_u64_be(buf: &[u8], off: usize) -> u64 {
 
 fn write_u64_be(buf: &mut [u8], off: usize, value: u64) {
     buf[off..off + 8].copy_from_slice(&value.to_be_bytes());
+}
+
+/// Rebuild the mutable view over the staged-L2 arena covering
+/// the first `slots` slots. Both the lookup and the update
+/// sides of the comparison loop must re-derive this with the
+/// CURRENT `l2_slots_used` after any growth; a view captured
+/// before growth is too short and indexing a newly staged slot
+/// through it panics (GitHub issue #422 defect A).
+///
+/// # Safety
+///
+/// `start` must be the staged-L2 arena base inside
+/// EXISTING_STATE and `slots * cluster_size` must not extend
+/// past the arena's capacity (enforced by the staging and
+/// growth bounds checks against `existing_state_end` /
+/// `l2_slot_byte_capacity`).
+unsafe fn l2_arena<'a>(start: usize, slots: usize, cluster_size: usize) -> &'a mut [u8] {
+    core::slice::from_raw_parts_mut(start as *mut u8, slots * cluster_size)
 }
 
 fn find_staged_l2(staged: &[StagedL2; MAX_STAGED_L2], count: usize, l1_idx: u32) -> Option<usize> {

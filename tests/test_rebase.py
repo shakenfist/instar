@@ -948,3 +948,201 @@ class TestRebaseSnapshotGate(TestRebaseSmoke):
                     fixture, overlay_q.name, 'snap1'),
                 'snap1 virtual view must change identically on the '
                 'instar and qemu-img sides')
+
+
+# ----------------------------------------------------------------------
+# Staged-L2 arena growth (issue #422) — phase 2 step 2d of
+# PLAN-qcow2-write-infrastructure.
+# ----------------------------------------------------------------------
+
+
+class TestRebaseStagedL2Growth(TestRebaseSmoke):
+    """Safe-mode staged-L2 arena growth regressions (#422).
+
+    Issue #422 presented as a "rebase livelock on 512-byte
+    clusters" but was neither cluster-size-specific nor a
+    livelock: whenever the comparison loop staged a FRESH L2
+    table (a divergent cluster in an L1 entry the overlay left
+    zero) and then visited another cluster in that L2's
+    coverage, the lookup indexed a slice sized from the INITIAL
+    staged-L2 count, panicked out of bounds, and the guest
+    panic handler's `loop {}` spun forever at 100% CPU
+    (defect A). Fixing the lookup unmasked defect B: the arena
+    grew over the staged refcount-block host offsets, which the
+    refblock flush dereferences as host WRITE offsets. Both are
+    fixed by re-deriving the arena view per access and carving
+    the growable arena last in scratch.
+    """
+
+    def setUp(self):
+        super().setUp()
+        if shutil.which('qemu-img') is None:
+            self.skipTest('system qemu-img not installed')
+        if shutil.which('qemu-io') is None:
+            self.skipTest('system qemu-io not installed')
+
+    @staticmethod
+    def sha256(path):
+        """Return the sha256 hex digest of a file's full contents."""
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _run_tool(self, argv, cwd, timeout=60):
+        """Run a qemu tool with cwd in the fixture dir; assert rc 0."""
+        r = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout,
+            cwd=str(cwd))
+        self.assertEqual(
+            r.returncode, 0,
+            f'{argv[0]} failed: argv={argv!r} stderr={r.stderr!r}')
+        return r
+
+    def _build_bases(self, fixture_dir, cluster_size):
+        """Create the #422 backing pair in `fixture_dir`.
+
+        base_old.qcow2 (64M, 0x11 at [0,4M)) and base_new.qcow2
+        (64M, 0x22 at [2M,6M)) at the given cluster size. The
+        divergent range [0,6M) spans many clusters so the
+        comparison loop revisits a freshly staged L2 repeatedly.
+        """
+        fixture_dir = Path(fixture_dir)
+        fixture_dir.mkdir(parents=True, exist_ok=True)
+        for name, pattern in (
+                ('base_old.qcow2', 'write -P 0x11 0 4M'),
+                ('base_new.qcow2', 'write -P 0x22 2M 4M')):
+            self._run_tool(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-o', f'cluster_size={cluster_size}', name, '64M'],
+                fixture_dir)
+            self._run_tool(
+                ['qemu-io', '-f', 'qcow2', '-c', pattern, name],
+                fixture_dir, timeout=120)
+        return fixture_dir / 'base_old.qcow2', fixture_dir / 'base_new.qcow2'
+
+    def _build_overlay(self, fixture_dir, name, cluster_size,
+                       io_command=None):
+        """Create a 64M overlay on base_old.qcow2 (relative name).
+
+        With `io_command` None the overlay stays EMPTY: every L1
+        entry is zero, so the first divergent cluster forces the
+        comparison loop to stage a fresh L2 table — the growth
+        shape that hung pre-fix at EVERY cluster size.
+        """
+        fixture_dir = Path(fixture_dir)
+        self._run_tool(
+            ['qemu-img', 'create', '-f', 'qcow2',
+             '-o', f'backing_file=base_old.qcow2,backing_fmt=qcow2,'
+                   f'cluster_size={cluster_size}',
+             name, '64M'],
+            fixture_dir)
+        if io_command is not None:
+            self._run_tool(
+                ['qemu-io', '-f', 'qcow2', '-c', io_command, name],
+                fixture_dir, timeout=120)
+        return fixture_dir / name
+
+    def test_512_cluster_safe_rebase_terminates(self):
+        """The exact #422 fixture terminates promptly with a refusal.
+
+        64M at 512-byte clusters, overlay owning [1M,2M): safe
+        mode wants ~12k copied clusters plus fresh L2 tables,
+        which exhausts the overlay's single refcount block's
+        coverage (v1 never appends refblocks), so the run must
+        REFUSE with ERROR_REFCOUNT_EXHAUSTED — in under a second,
+        not the pre-fix infinite `loop {}` (the runner timeout
+        helper returns rc -1 on expiry, distinct from any real
+        exit code).
+
+        The refusal aborts before any metadata flush, so the
+        overlay must still be check-clean and both backings
+        byte-unchanged. The overlay FILE may legitimately change:
+        the pre-refusal data-cluster writes land in unreferenced
+        clusters (byte-idempotence of this path is deferred to
+        phase 3's ordering contract).
+        """
+        with tempfile.TemporaryDirectory() as td:
+            fixture = Path(td) / 'fixture'
+            base_old, base_new = self._build_bases(fixture, 512)
+            overlay = self._build_overlay(
+                fixture, 'overlay.qcow2', 512,
+                io_command='write -P 0x33 1M 1M')
+            backing_before = {
+                p: self.sha256(p) for p in (base_old, base_new)}
+
+            _, stderr, rc = self.run_instar_rebase(
+                overlay, '-b', 'base_new.qcow2', '-F', 'qcow2',
+                timeout=120)
+            self.assertNotEqual(
+                rc, -1,
+                'safe rebase of the #422 fixture timed out — the '
+                'staged-L2 growth hang is back')
+            self.assertNotEqual(
+                rc, 0,
+                f'expected the refcount-exhausted refusal; the rebase '
+                f'unexpectedly succeeded: stderr={stderr!r}')
+            self.assertIn(
+                "the overlay's refcount blocks are full; v1 doesn't "
+                'append new ones. Fall back to -u or use '
+                '`qemu-img rebase`',
+                stderr, f'unexpected stderr: {stderr!r}')
+
+            self._run_tool(
+                ['qemu-img', 'check', overlay.name], fixture,
+                timeout=120)
+            for p, digest in backing_before.items():
+                self.assertEqual(
+                    self.sha256(p), digest,
+                    f'a refused rebase must not touch {p.name}')
+
+    def test_64k_sparse_overlay_safe_rebase_completes(self):
+        """Empty overlay at the default cluster size completes.
+
+        The genuinely-fixed silent hang: at 64K clusters one L2
+        covers 512M, so an EMPTY 64M overlay stages a single
+        fresh L2 for the first divergent cluster and then visits
+        ~95 more divergent clusters in its coverage — every one
+        of which indexed past the stale slice pre-fix. Twin
+        fixtures, instar vs qemu-img rebase: both must complete,
+        both must be check-clean, and the rebased virtual
+        contents must be identical.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            fixture = Path(td) / 'fixture'
+            self._build_bases(fixture, 65536)
+            overlay_i = self._build_overlay(
+                fixture, 'overlay_i.qcow2', 65536)
+            overlay_q = self._build_overlay(
+                fixture, 'overlay_q.qcow2', 65536)
+
+            _, stderr, rc = self.run_instar_rebase(
+                overlay_i, '-b', 'base_new.qcow2', '-F', 'qcow2',
+                timeout=120)
+            self.assertEqual(
+                rc, 0,
+                f'instar safe rebase of an empty 64K overlay must '
+                f'complete: stderr={stderr!r}')
+            self._run_tool(
+                ['qemu-img', 'rebase', '-b', 'base_new.qcow2',
+                 '-F', 'qcow2', overlay_q.name],
+                fixture, timeout=120)
+
+            for overlay in (overlay_i, overlay_q):
+                self._run_tool(
+                    ['qemu-img', 'check', overlay.name], fixture,
+                    timeout=120)
+
+            self._run_tool(
+                ['qemu-img', 'convert', '-f', 'qcow2', '-O', 'raw',
+                 overlay_i.name, 'instar.raw'],
+                fixture, timeout=120)
+            self._run_tool(
+                ['qemu-img', 'convert', '-f', 'qcow2', '-O', 'raw',
+                 overlay_q.name, 'qemu.raw'],
+                fixture, timeout=120)
+            self.assertEqual(
+                self.sha256(fixture / 'instar.raw'),
+                self.sha256(fixture / 'qemu.raw'),
+                'rebased virtual content must match qemu-img rebase')
