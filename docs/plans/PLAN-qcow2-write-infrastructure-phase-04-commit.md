@@ -117,10 +117,15 @@ to the management session first).
    baselines stay ≤ 64M / ≤ 64K-cluster shapes; the pinned
    refusal tests are host-CLI-level). Overlay-side caps are
    unchanged, so overlay-bound shapes refuse exactly as today.
-   The proof harness probes the widening explicitly (a shape
-   refusing today only via the backing refblock cap — e.g. a
-   large 512-byte-cluster backing under a one-cluster overlay —
-   must succeed post-migration with qemu info/check parity).
+   The proof harness probes the widening explicitly.
+   **Amended after 4p:** every refusal on the Q3 matrix itself
+   is wire-11 refcount exhaustion (which decision 6 keeps —
+   phase 6 lifts it), so the refuse-before/succeed-after bucket
+   is empty ON the matrix; the widening probe uses 4p's
+   verified off-matrix exemplar (cs=512, 16M backing with 8M
+   seeded → 66 populated RT entries > 32 → wire-10 refusal
+   today, pre-mutation) which must succeed post-migration with
+   qemu info/check parity.
 6. **Wire-code mapping (append-only).** `RefcountExhausted`
    keeps wire 11. Compressed backing L2 entries map to the
    existing `ERROR_UNSUPPORTED_FORMAT` (the code the overlay
@@ -150,12 +155,21 @@ to the management session first).
    includes an unaligned size; if raw sha256 differs there, the
    harness falls back to virtual-content equality (qemu-img
    convert both, compare) and the divergence is recorded as
-   accepted with this rationale. Note: clamping makes the tail
-   write partial, so a backing that itself has a backing file
-   would hit `NeedsBackingFill` — also only reachable with an
-   unaligned virtual size; refusal accepted and recorded if the
-   probe shows qemu handles it (chained-backing case added to
-   the probe step).
+   accepted with this rationale. **Amended after 4p:** the
+   probes showed the simple unaligned case is byte-identical
+   under both tools (tail bytes past EOV are always zeros in
+   stock fixtures), but the chained-backing variant is a real
+   capability regression — today's instar AND qemu both handle
+   it, while the clamped tail write (`win_len != cluster_size`)
+   would hit `NeedsBackingFill`. Management decision: amend
+   qcow2-write (step 4q, the one sanctioned crate change) so a
+   partial allocating write whose coverage reaches
+   `virtual_size` (the tail cluster) classifies as full
+   coverage — bytes beyond EOV are not virtual content, so the
+   zero-fill is the correct pre-image regardless of backing
+   (and matches qemu's observed tail behaviour). The
+   NeedsBackingFill refusal remains for every genuinely partial
+   write below EOV.
 8. **crates/commit slims down.** Deleted as superseded:
    `allocate_backing_cluster_qcow2`, `BackingAllocationState`,
    the planner's refblock copy + dirty bitmap
@@ -180,7 +194,7 @@ stops the phase and comes back to the management session.
 | D1 | `check_envelope` refuses zstd / unknown incompatible bits on the backing; commit today proceeds (spec violation) | Accept — spec-mandated narrowing; new code 16; refusal test |
 | D2 | Compressed backing L2 entries: today's loop overwrites the masked offset in place — **live corruption, sibling of #420** (main.rs:788-790); crate refuses `CompressedCluster` | Accept — the migration IS the interim fix; probe first (4p), issue drafted for user approval; refusal test with sha256-unchanged |
 | D3 | COPIED / refcount / reserved-bit classification refusals on images that pass the nb_snapshots gates but are internally inconsistent; today reused as-is | Accept — unreachable on check-clean images; new code 17 |
-| D4 | Sparse (non-contiguous) refcount table: today silent misallocation (wrong host offsets); crate + contiguity gate refuse | Accept — latent-corruption fix; code 17; synthetic-image refusal test |
+| D4 | Sparse (non-contiguous) refcount table: today silent misallocation (wrong host offsets); crate + contiguity gate refuse | Accept — **4p upgraded this to a LIVE defect**: holed RTs are stock-producible (discard + `qemu-img resize --shrink`), pass `qemu-img check` clean, and today's commit corrupts them (2654 check errors / 69 leaked clusters in the probe). Code 17; refusal test built from the 4p recipe; issue draft awaiting user approval |
 | D5 | L2 staging becomes lazy (LoadCluster) with eviction; flush order by first-touch slot, not staged-array order; final bytes identical, intermediate I/O order differs | Accept — no crash contract exists for commit today (zero fsyncs); byte-identity proof is the arbiter |
 | D6 | Backing-side capacity caps widen (decision 5) | Accept — deliberate, probed by 4c |
 | D7 | Refusal wire codes for new families | Decision 6's mapping |
@@ -193,14 +207,21 @@ stops the phase and comes back to the management session.
 |------|--------|-------|-----------|---------------------|
 | 4p | medium | default (Fable) | none | Empirical probes, no tree changes, findings as text. (1) D2: build a qcow2 backing with compressed clusters (`qemu-img convert -c`) plus a normal overlay; run today's `instar commit` and `qemu-img commit` on twins; capture whether instar corrupts (sha256 + `qemu-img check` + content read-back before/after) and what qemu does. If corruption confirmed, draft a GitHub issue in the scratchpad for the user's approval (do NOT file it). (2) D9: unaligned `virtual_size` (e.g. 1M+512) twins through both tools — record tail-byte and virtual-content behaviour; also the chained-backing variant (backing has its own backing). (3) D6: empirically inventory which phase-1 Q3 matrix combos refuse on today's binary and why (overlay cap vs backing cap) — parameterises 4c's bucketing. (4) D4: verify sparse-RT reachability (can qemu-img produce one? discard paths?); if trivially producible, capture today's misallocation on a synthetic image. Report with exact recipes. |
 | 4a | high | default (Fable) | none | Build `src/crates/qcow2-write-exec/` per settled decisions 1-2 (read them; read qcow2-write's StepKind/StagedRegions/BarrierClass doc contracts and the mock-CallTable test precedent in crates/qcow2). Workspace registration. API sketch: `Regions<'a>` (per-RegionId `&mut [u8]` slices + per-device RMW bounce + fill sector), `Devices` (call-table fns + sector sizes + fsync capability per TargetDevice), `execute(steps: &[Step], regions, devices) -> Result<(), ExecError>` applying each step literally per its doc contract, byte-range layer with sub-sector RMW, barrier policy per decision 2(e). Host unit tests with a mock CallTable: every StepKind, sector sizes 512/4096, sub-sector RMW byte-exactness vs a reference model, Durability-on-Output degradation, fsync-refusal surfacing. `make instar`, `make lint`, `make test-rust` (quote the new crate's lines), `scripts/check-binary-sizes.sh`, `pre-commit run --all-files`. No commit; management reviews. |
-| 4b | high | default (Fable) | none | Migrate the commit op per settled decisions 3-8 (read the whole plan first, plus the master plan's phase-3 findings and this phase's fact anchors). Sequential after 4a. Replace the backing-side composition (staging main.rs:582-661, planner ctx use, per-cluster backing half 740-812, flush 814-861) with: dense-prefix + contiguity-gated staging into the re-carved layout, `check_envelope` + `new_state` + per-overlay-cluster `plan_write` (full clusters; tail clamped per decision 7) + windowed execution via qcow2-write-exec + final `plan_flush`. Keep: gates order and codes, overlay walk/skip/read, DATA_BUF as CallerData region, overlay-clear pass, header re-read, result counters, vmdk untouched. Wire codes per decision 6 incl. host messages + completeness tests. Slim crates/commit per decision 8. New integration tests: D1/D2/D4 refusals (sha256-unchanged), D6 widening success shape. Full bar: `make instar`, `make lint`, sizes, `make test-rust`, commit integration suite (`cd tests && .venv/bin/stestr run test_commit`), `pre-commit run --all-files`. Stop and report if byte-identity spot checks fail (one 64K and one 512-cluster fixture against the pre-migration binary — the management session saves one to the scratchpad before this step starts, the phase-2 `instar-before-2d` precedent). No commit. |
-| 4c | high | default (Fable) | none | `scripts/migration-proof.py` (may be authored concurrently with 4b; final run strictly after 4b lands). Reusable across phases 5-6: `--op commit --before <binary> --after <binary> [--matrix ...]`. Per the master plan Q3 finding: deterministic fixture matrix built fresh each run with the pinned qemu-img (cluster_size {512, 4096, 65536} × size {1M, 64M} × seed {empty, 64K, multi-extent} × lazy_refcounts {off, on} × {implicit, explicit -b} + one unaligned-size case per decision 7). For each combo: run the after-binary TWICE on twin fixtures (run-to-run determinism: sha256s equal — the premise); then before vs after on twins. Bucketing: both-succeed → sha256 equality of every mutated file + stdout; refuse-before/succeed-after → must match 4p's D6 inventory, assert qemu info/check parity; both-refuse → identical refusal + fixture sha256 unchanged (byte-idempotent gates only; refcount-exhaustion shapes are excluded per decision-9 semantics — document); D9 fallback per decision 7. Python: single quotes, 120-char lines. Then the full remaining surface: baseline matrix (`stestr run test_commit` incl. TestCommitBaselineMatrix), `scripts/differential-fuzz.py --iterations 300 --ops commit`, and `make test-rust`. Record everything; findings text back. No commit of results — the script commits, the numbers go to the findings. |
+| 4q | high | default (Fable) | none | The one sanctioned qcow2-write change (decision 7 as amended): in `plan_write`'s Unallocated classification, a partial write whose coverage reaches `virtual_size` (the tail cluster of an unaligned image) classifies as full coverage — allocate, write the covered bytes, zero-fill only the beyond-EOV remainder, no `NeedsBackingFill`. Genuinely partial writes below EOV keep the refusal. Unit tests (backed + backing-less tail shapes, both classifications on either side of the boundary); extend tests/ordering.rs and tests/simulation.rs with an unaligned-virtual-size configuration (the SimDisk content model must treat beyond-EOV bytes as outside virtual content). Full bar: make instar/lint/test-rust (quote qcow2-write lines), check-binary-sizes, pre-commit. |
+| 4b | high | default (Fable) | none | Migrate the commit op per settled decisions 3-8 (read the whole plan first, plus the master plan's phase-3 findings and this phase's fact anchors). Sequential after 4a. Replace the backing-side composition (staging main.rs:582-661, planner ctx use, per-cluster backing half 740-812, flush 814-861) with: dense-prefix + contiguity-gated staging into the re-carved layout, `check_envelope` + `new_state` + per-overlay-cluster `plan_write` (full clusters; tail clamped per decision 7) + windowed execution via qcow2-write-exec + final `plan_flush`. Keep: gates order and codes, overlay walk/skip/read, DATA_BUF as CallerData region, overlay-clear pass, header re-read, result counters, vmdk untouched. Wire codes per decision 6 incl. host messages + completeness tests. Slim crates/commit per decision 8. On a non-BufFull planner error mid-request, execute the already-emitted window BEFORE surfacing the error — that reproduces today's bytes-written-up-to-the-refusal behaviour, keeping even refusal paths byte-identical to the pre-migration binary. New integration tests: D1/D2/D4 refusals (D2 and D4 fixtures per the 4p recipes; sha256-unchanged where the refusal is pre-mutation), D6 widening success shape (4p's off-matrix exemplar). Full bar: `make instar`, `make lint`, sizes, `make test-rust`, commit integration suite (`cd tests && .venv/bin/stestr run test_commit`), `pre-commit run --all-files`. Stop and report if byte-identity spot checks fail (one 64K and one 512-cluster fixture against the pre-migration binary — the management session saves one to the scratchpad before this step starts, the phase-2 `instar-before-2d` precedent). No commit. |
+| 4c | high | default (Fable) | none | `scripts/migration-proof.py` (may be authored concurrently with 4b; final run strictly after 4b lands). Reusable across phases 5-6: `--op commit --before <binary> --after <binary> [--matrix ...]`. Per the master plan Q3 finding: deterministic fixture matrix built fresh each run with the pinned qemu-img (cluster_size {512, 4096, 65536} × size {1M, 64M} × seed {empty, 64K, multi-extent} × lazy_refcounts {off, on} × {implicit, explicit -b} + one unaligned-size case per decision 7). For each combo: run the after-binary TWICE on twin fixtures (run-to-run determinism: sha256s equal — the premise); then before vs after on twins. Bucketing: both-succeed → sha256 equality of every mutated file + stdout; refuse-before/succeed-after → must match 4p's D6 inventory, assert qemu info/check parity; both-refuse → identical exit code + stderr, AND byte-identity of the mutated files even so — 4p showed the wire-11 shapes mutate the backing (~124 KiB of orphaned committed data) before refusing, and the allocator equivalence predicts identical scaffolding bytes from both binaries; a mismatch here is a STOP, not an exclusion; D9 fallback per decision 7 (expected unnecessary after 4q — the probes showed byte-identical output on the simple unaligned shape). Python: single quotes, 120-char lines. Then the full remaining surface: baseline matrix (`stestr run test_commit` incl. TestCommitBaselineMatrix), `scripts/differential-fuzz.py --iterations 300 --ops commit`, and `make test-rust`. Record everything; findings text back. No commit of results — the script commits, the numbers go to the findings. |
 | 4d | medium | default (Fable) | none | Close-out: quirks.md (widened backing caps, new refusal families 16/17, compressed-backing and sparse-RT behaviour change, D9 note), docs/commit.md refusal table, CHANGELOG (migration entry: byte-invisible on the proof matrix, capability widenings called out), master plan execution table phase 4 → Complete + "Findings: phase 4 commit migration" section (proof numbers, divergence-budget outcomes, defect issue status, executor facts phases 5-6 reuse), plans index, ARCHITECTURE.md qcow2-write section gains the executor crate. `pre-commit run --all-files`. |
 
 4p runs first (its findings gate 4b's test list and 4c's
-bucketing) and may run concurrently with 4a. 4b follows 4a;
-4c's run follows 4b; 4d last. One commit per step minimum,
-management session reviews and commits.
+bucketing) and may run concurrently with 4a. 4q follows 4a
+(sequential — both touch the qcow2-write test files' vicinity);
+4b follows 4q; 4c's run follows 4b; 4d last. One commit per
+step minimum, management session reviews and commits.
+
+4p outcome note (2026-07-12): D2 corruption confirmed (silent,
+multi-cluster blast radius) and D4 upgraded to a live defect;
+issue drafts for both are in the session scratchpad awaiting
+the user's decision — filing is never done without approval.
 
 ## Review checklist deltas
 
