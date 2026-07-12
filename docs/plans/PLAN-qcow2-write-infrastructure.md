@@ -292,7 +292,7 @@ Design sketch (to be settled in phase planning, not binding):
 | 2. Interim safety gates + defect handling — LIVE: commit snapshot corruption (#420), rebase snapshot corruption + data-loss chain (#421), rebase 512-byte-cluster livelock (#422; fix or gate per root-cause depth) | PLAN-qcow2-write-infrastructure-phase-02-gates.md | Complete (2026-07-12; commits ac8f60a / 2fb9af4 / c84743e; see Findings) |
 | 3. `crates/qcow2-write` core: classification + allocate-on-write planner + ordering contract (no COW, no growth), unit tests + simulation harness | PLAN-qcow2-write-infrastructure-phase-03-crate.md | Complete (2026-07-12; commits 878ebf0 / bc322b2 / 19ba116 / d883b25; see Findings) |
 | 4. Migrate commit onto the crate (byte-identical proof) | PLAN-qcow2-write-infrastructure-phase-04-commit.md | Complete (2026-07-13; commits c101c9f / a2fae94 / 6b0c856 / 7dff544 / 2237028; see Findings) |
-| 5. Migrate rebase safe mode (byte-identical proof) | PLAN-qcow2-write-infrastructure-phase-05-rebase.md | Not started |
+| 5. Migrate rebase safe mode (byte-identical proof) | PLAN-qcow2-write-infrastructure-phase-05-rebase.md | Planned (2026-07-13), not started |
 | 6. Migrate bench `-w`; move the refcount-growth planner into the shared crate | PLAN-qcow2-write-infrastructure-phase-06-bench.md | Not started |
 | 7. Copy-on-write branch; lift bench's internal-snapshot gate; per-consumer COW policy per OQ3 | PLAN-qcow2-write-infrastructure-phase-07-cow.md | Not started |
 | 8. Fuzz: coverage-guided target for the new crate; differential coverage for newly-permitted snapshot-bearing writes | PLAN-qcow2-write-infrastructure-phase-08-fuzz.md | Not started |
@@ -300,7 +300,7 @@ Design sketch (to be settled in phase planning, not binding):
 
 Phase 2 was conditional on phase 1 confirming a live defect;
 phase 1 confirmed three (see the Findings defect register), so
-phase 2 ran. Phase 5's plan file is the next to write.
+phase 2 ran. Phase 6's plan file is the next to write.
 
 One commit per phase minimum; each commit builds, lints and tests
 clean on its own. Phases 4-6 are pure refactors from the outside:
