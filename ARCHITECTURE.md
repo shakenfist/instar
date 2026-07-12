@@ -205,7 +205,11 @@ provides a modular architecture with:
   VhdState for stateful block I/O, sub-sector-aligned read support
   (`read_offset_sectors` for VHD data spanning device sector boundaries),
   and write helpers (build_footer, build_dynamic_header,
-  compute_vhd_geometry). Used by info, check, convert, and compare
+  compute_vhd_geometry, plus footer_geometry / chs_rounded_geometry:
+  build_footer writes qemu's upward-search CHS for qemu-roundable
+  sizes — which can differ from the floor geometry of the same byte
+  count, issue #413 — and the VHD-spec floor CHS for verbatim sizes
+  qemu-img would never declare). Used by info, check, convert, and compare
   operations. Also exposes `VhdState::scan_allocation` plus the pure
   helper `count_allocated_in_bat` for the measure subcommand.
 - **crates/vhdx/** - Shared VHDX format crate: CRC-32C (Castagnoli)

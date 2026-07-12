@@ -28,5 +28,6 @@ fuzz_target!(|data: &[u8]| {
             data[4], data[5], data[6], data[7],
         ]);
         let _ = vhd::compute_vhd_geometry(size);
+        let _ = vhd::footer_geometry(size);
     }
 });
