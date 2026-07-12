@@ -494,6 +494,33 @@ unsafe fn run_qcow2(call_table: &CallTable, config: &CommitConfig) -> CommitResu
     if overlay.refcount_bits != 16 || backing.refcount_bits != 16 {
         return err(config, CommitResult::ERROR_UNSUPPORTED_FORMAT);
     }
+    // Interim phase-2 gates: internal snapshots on EITHER side
+    // are refused before any staging or mutation.
+    //
+    // Backing (GitHub issue #420): committing into a backing
+    // with internal snapshots silently corrupts them (v1
+    // overwrites snapshot-shared data clusters in place and
+    // allocates through snapshot-shared L2 tables without COW).
+    //
+    // Overlay (the overlay-side sibling of issue #420, issue
+    // pending): the post-commit overlay-clear pass zeroes
+    // active L2 entries and decrements the referenced data
+    // clusters without accounting for the snapshot's reference,
+    // leaving snapshot-shared clusters at refcount=0
+    // reference=1. Phase 1's second-order probe missed this
+    // (exit code and snapshot read-back agree with qemu); the
+    // phase-2 step-2a parity test proved the resulting overlay
+    // is check-dirty where qemu's is clean.
+    //
+    // The real fix for both sides (snapshot-aware COW and
+    // refcounting) lands in phase 7 of
+    // PLAN-qcow2-write-infrastructure.
+    if backing.nb_snapshots > 0 {
+        return err(config, CommitResult::ERROR_BACKING_HAS_SNAPSHOTS);
+    }
+    if overlay.nb_snapshots > 0 {
+        return err(config, CommitResult::ERROR_OVERLAY_HAS_SNAPSHOTS);
+    }
     if backing.virtual_size < overlay.virtual_size {
         return err(config, CommitResult::ERROR_OVERLAY_LARGER_THAN_BACKING);
     }

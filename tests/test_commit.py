@@ -20,6 +20,7 @@ paths don't.
 Cross-version round-trip baselines belong to phase 9.
 """
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -784,3 +785,224 @@ for _target, _cases in COMMIT_CASES.items():
             TestCommitBaselineMatrix, _name,
             _make_commit_baseline_test(_target, _case),
         )
+
+
+# ----------------------------------------------------------------------
+# Internal-snapshot gates — phase 2 of
+# PLAN-qcow2-write-infrastructure. instar refuses to commit
+# when EITHER side carries internal snapshots, byte-idempotently:
+# the backing side (GitHub issue #420, silent snapshot
+# corruption) and the overlay side (the overlay-side sibling of
+# issue #420, issue pending: the overlay-clear pass corrupts
+# refcounts on snapshot-shared clusters). Both are interim
+# gates; phase 7's snapshot-aware COW/refcounting is the real
+# fix.
+# ----------------------------------------------------------------------
+
+
+class TestCommitSnapshotGate(TestCommitSmoke):
+    """Backing- and overlay-snapshot refusal (#420 and its sibling)."""
+
+    @staticmethod
+    def sha256(path):
+        """Return the sha256 hex digest of a file's full contents."""
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _require_qemu_tools(self):
+        if shutil.which('qemu-img') is None:
+            self.skipTest('system qemu-img not installed')
+        if shutil.which('qemu-io') is None:
+            self.skipTest('system qemu-io not installed')
+
+    def _run_tool(self, argv, cwd, timeout=60):
+        """Run a qemu tool with cwd in the fixture dir; assert rc 0."""
+        r = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout,
+            cwd=str(cwd))
+        self.assertEqual(
+            r.returncode, 0,
+            f'{argv[0]} failed: argv={argv!r} stderr={r.stderr!r}')
+        return r
+
+    # Currently unused: its only caller was the step-2a parity
+    # test, replaced by test_refuse_overlay_internal_snapshots
+    # when the overlay-side gate landed. Kept because phase 7
+    # (snapshot-aware refcounting) will drop the gate and restore
+    # read-back parity testing.
+    def _snapshot_readback_sha256(self, fixture_dir, overlay_name, snap):
+        """Return the sha256 of a snapshot's virtual view.
+
+        Apply-on-a-copy so the fixture is untouched: copy the
+        overlay inside the fixture dir (relative backing name
+        still resolves), `qemu-img snapshot -a`, convert to raw,
+        hash the raw bytes.
+        """
+        fixture_dir = Path(fixture_dir)
+        copy = fixture_dir / 'readback.qcow2'
+        raw = fixture_dir / 'readback.raw'
+        shutil.copyfile(fixture_dir / overlay_name, copy)
+        self._run_tool(
+            ['qemu-img', 'snapshot', '-a', snap, copy.name], fixture_dir)
+        self._run_tool(
+            ['qemu-img', 'convert', '-f', 'qcow2', '-O', 'raw',
+             copy.name, raw.name],
+            fixture_dir, timeout=120)
+        digest = self.sha256(raw)
+        copy.unlink()
+        raw.unlink()
+        return digest
+
+    def _build_fixture(self, fixture_dir, base_snapshot=False,
+                       overlay_snapshot=False,
+                       overlay_post_snapshot_write=True):
+        """Build the phase-1 Q1 fixture shape in `fixture_dir`.
+
+        base.qcow2 (64M, pattern 0xaa at [1M,3M)), optional
+        `snapshot -c snap1` on the base, overlay.qcow2 backed by
+        it (relative name) with pattern 0xcc at [1536k,2560k) —
+        the snapshot-shared extent that triggers Q1 mode A.
+
+        With `overlay_snapshot`, the base is left snapshot-free
+        and the overlay instead gets `snapshot -c osnap` after
+        the 0xcc write, then (unless
+        `overlay_post_snapshot_write` is False) a post-snapshot
+        0xdd write at [2M,3M) — the variant phase 1 did not
+        probe. `overlay_post_snapshot_write=False` reproduces
+        phase 1's second-order shape: the snapshot taken after
+        all overlay writes.
+        """
+        fixture_dir = Path(fixture_dir)
+        fixture_dir.mkdir(parents=True, exist_ok=True)
+        self._run_tool(
+            ['qemu-img', 'create', '-f', 'qcow2', 'base.qcow2', '64M'],
+            fixture_dir)
+        self._run_tool(
+            ['qemu-io', '-f', 'qcow2', '-c', 'write -P 0xaa 1M 2M',
+             'base.qcow2'],
+            fixture_dir)
+        if base_snapshot:
+            self._run_tool(
+                ['qemu-img', 'snapshot', '-c', 'snap1', 'base.qcow2'],
+                fixture_dir)
+        self._run_tool(
+            ['qemu-img', 'create', '-f', 'qcow2',
+             '-o', 'backing_file=base.qcow2,backing_fmt=qcow2',
+             'overlay.qcow2', '64M'],
+            fixture_dir)
+        self._run_tool(
+            ['qemu-io', '-f', 'qcow2', '-c', 'write -P 0xcc 1536k 1M',
+             'overlay.qcow2'],
+            fixture_dir)
+        if overlay_snapshot:
+            self._run_tool(
+                ['qemu-img', 'snapshot', '-c', 'osnap', 'overlay.qcow2'],
+                fixture_dir)
+            if overlay_post_snapshot_write:
+                self._run_tool(
+                    ['qemu-io', '-f', 'qcow2', '-c', 'write -P 0xdd 2M 1M',
+                     'overlay.qcow2'],
+                    fixture_dir)
+        return fixture_dir / 'overlay.qcow2', fixture_dir / 'base.qcow2'
+
+    def test_refuse_backing_internal_snapshots(self):
+        """Commit into a snapshot-bearing backing refuses, byte-idempotently.
+
+        Phase-1 Q1 showed this shape silently corrupts snap1
+        (mode A: the blind data-cluster overwrite bleeds the
+        committed pattern into the snapshot's virtual view while
+        `qemu-img check` stays clean). The phase-2 gate refuses
+        before any staging, so BOTH images must be byte-unchanged
+        after the refusal.
+        """
+        self._require_qemu_tools()
+        with tempfile.TemporaryDirectory() as td:
+            overlay, base = self._build_fixture(
+                Path(td) / 'fixture', base_snapshot=True)
+            base_before = self.sha256(base)
+            overlay_before = self.sha256(overlay)
+
+            _, stderr, rc = self.run_instar_commit(overlay, timeout=120)
+            self.assertNotEqual(
+                rc, 0,
+                f'expected snapshot-bearing backing to be refused; '
+                f'stderr={stderr!r}')
+            self.assertIn(
+                'the backing file has internal snapshots; committing '
+                'would corrupt them. Fall back to `qemu-img commit`',
+                stderr, f'unexpected stderr: {stderr!r}')
+            self.assertEqual(
+                self.sha256(base), base_before,
+                'a refused commit must not touch the backing')
+            self.assertEqual(
+                self.sha256(overlay), overlay_before,
+                'a refused commit must not touch the overlay')
+
+    # CORRUPTION EVIDENCE (phase-2 step 2a of
+    # PLAN-qcow2-write-infrastructure) — why the overlay side is
+    # now gated. The step-2a parity test ran instar and qemu-img
+    # on byte-identical twins of the post-snapshot-write shape
+    # below. Instar's exit code and osnap read-back agreed with
+    # qemu-img, but the resulting overlay was check-DIRTY:
+    # `refcount=0 reference=1` on the 8 clusters shared between
+    # osnap's L1 tree and the pre-commit active L1 (the 0xcc
+    # data at [1536k,2M)) — the overlay-clear pass zeroes the
+    # active L2 entries and drops those clusters' refcount to 0
+    # without accounting for osnap's reference, so any later
+    # allocation in the overlay can silently overwrite snapshot
+    # data. qemu-img's result was check-clean (8 check errors on
+    # the instar side, zero on the qemu side). Management
+    # decision: refuse overlays with internal snapshots as an
+    # interim gate — a deliberate divergence from qemu-img,
+    # which handles this shape — until phase 7's snapshot-aware
+    # refcounting lands. Overlay-side sibling of issue #420
+    # (issue pending).
+    def test_refuse_overlay_internal_snapshots(self):
+        """Commit from a snapshot-bearing overlay refuses, byte-idempotently.
+
+        Two shapes, both of which must refuse (the gate is on
+        `nb_snapshots > 0`, not on shape):
+
+        1. post-snapshot write — osnap taken after the 0xcc
+           write, then a 0xdd write; the shape whose clear-pass
+           refcount corruption is documented above.
+        2. phase-1 second-order shape — osnap taken AFTER all
+           overlay writes, no post-snapshot write; phase 1's
+           probe showed instar matching qemu here, but the gate
+           refuses it anyway.
+
+        The refusal happens before any staging, so BOTH images
+        must be byte-unchanged.
+        """
+        self._require_qemu_tools()
+        for shape, post_write in (
+                ('post-snapshot-write', True),
+                ('second-order', False)):
+            with self.subTest(shape=shape), \
+                    tempfile.TemporaryDirectory() as td:
+                overlay, base = self._build_fixture(
+                    Path(td) / 'fixture', overlay_snapshot=True,
+                    overlay_post_snapshot_write=post_write)
+                base_before = self.sha256(base)
+                overlay_before = self.sha256(overlay)
+
+                _, stderr, rc = self.run_instar_commit(
+                    overlay, timeout=120)
+                self.assertNotEqual(
+                    rc, 0,
+                    f'expected snapshot-bearing overlay ({shape}) to '
+                    f'be refused; stderr={stderr!r}')
+                self.assertIn(
+                    'the overlay has internal snapshots; the post-commit '
+                    'clear pass would corrupt them. Fall back to '
+                    '`qemu-img commit`',
+                    stderr, f'unexpected stderr: {stderr!r}')
+                self.assertEqual(
+                    self.sha256(base), base_before,
+                    'a refused commit must not touch the backing')
+                self.assertEqual(
+                    self.sha256(overlay), overlay_before,
+                    'a refused commit must not touch the overlay')

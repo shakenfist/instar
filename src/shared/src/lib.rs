@@ -4260,6 +4260,26 @@ impl CommitResult {
     /// [`Self::ERROR_PARSE_FAILED`] because the cause is a
     /// host or guest bug, not a malformed image.
     pub const ERROR_INTERNAL_OVERFLOW: u32 = 13;
+    /// The backing file has internal snapshots
+    /// (`nb_snapshots > 0`). v1 commit writes into the backing
+    /// without COWing snapshot-shared clusters or L2 tables, so
+    /// proceeding would silently corrupt the snapshots (GitHub
+    /// issue #420). Refused as an interim phase-2 gate; the
+    /// real fix (COW into the backing) lands in phase 7 of
+    /// `PLAN-qcow2-write-infrastructure`.
+    pub const ERROR_BACKING_HAS_SNAPSHOTS: u32 = 14;
+    /// The overlay has internal snapshots (`nb_snapshots > 0`).
+    /// The post-commit overlay-clear pass zeroes active L2
+    /// entries and decrements the data clusters they reference
+    /// without accounting for the snapshot's reference, leaving
+    /// snapshot-shared clusters at `refcount=0 reference=1`
+    /// (proven by the phase-2 step-2a parity test; qemu-img
+    /// stays check-clean on the same shape). This is the
+    /// overlay-side sibling of issue #420 (issue pending).
+    /// Refused as an interim phase-2 gate; the real fix
+    /// (snapshot-aware refcounting) lands in phase 7 of
+    /// `PLAN-qcow2-write-infrastructure`.
+    pub const ERROR_OVERLAY_HAS_SNAPSHOTS: u32 = 15;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -4971,9 +4991,11 @@ mod tests {
 
     #[test]
     fn commit_result_error_codes_distinct() {
-        // Phase 7 step 7a added codes 8..=13. Confirm every
-        // code is distinct so the host's match arms don't
-        // accidentally alias.
+        // Phase 7 step 7a added codes 8..=13; the phase-2
+        // snapshot gates added 14 (backing, issue #420) and 15
+        // (overlay, issue pending). Confirm every code is
+        // distinct so the host's match arms don't accidentally
+        // alias.
         let codes = [
             CommitResult::ERROR_OK,
             CommitResult::ERROR_UNSUPPORTED_FORMAT,
@@ -4989,13 +5011,15 @@ mod tests {
             CommitResult::ERROR_REFCOUNT_EXHAUSTED,
             CommitResult::ERROR_PARSE_FAILED,
             CommitResult::ERROR_INTERNAL_OVERFLOW,
+            CommitResult::ERROR_BACKING_HAS_SNAPSHOTS,
+            CommitResult::ERROR_OVERLAY_HAS_SNAPSHOTS,
         ];
         for i in 0..codes.len() {
             for j in (i + 1)..codes.len() {
                 assert_ne!(codes[i], codes[j], "codes {i} and {j} alias");
             }
         }
-        // Confirm contiguous 0..=13 numbering.
+        // Confirm contiguous 0..=15 numbering.
         for (i, c) in codes.iter().enumerate() {
             assert_eq!(*c, i as u32);
         }
