@@ -1,0 +1,17 @@
+[package]
+name = "qcow2-write"
+version = "0.1.0"
+edition = "2021"
+description = "Pure windowed step-program planner for writes into existing qcow2 images (no I/O)"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+shared = { path = "../../shared" }
+qcow2 = { path = "../qcow2", default-features = false }
+snapshot = { path = "../snapshot" }
+
+[dev-dependencies]
+create = { path = "../create" }
+qcow2 = { path = "../qcow2", features = ["create"], default-features = false }
+shared = { path = "../../shared" }
