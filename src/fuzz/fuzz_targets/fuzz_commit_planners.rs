@@ -6,24 +6,25 @@
 //! (`plan_commit_qcow2`, `plan_commit_vmdk`). On every successful
 //! return, asserts context invariants:
 //!
-//! For [`Qcow2CommitContext`]:
+//! For [`Qcow2CommitContext`] (slimmed to overlay geometry by
+//! phase 4 of `PLAN-qcow2-write-infrastructure` — the backing
+//! refblock staging moved to `crates/qcow2-write`, whose planner
+//! has its own fuzz/simulation surface):
 //!
-//!   1. `backing_dirty.len() == (backing_refblock_count + 7) / 8`.
-//!   2. `backing_refblocks.len() == backing_refblock_count *
-//!      backing_cluster_size`.
-//!   3. `overlay_entries_per_refblock ==
+//!   1. `overlay_entries_per_refblock ==
 //!      overlay_cluster_size * 8 / overlay_refcount_bits`.
-//!   4. `backing_entries_per_refblock ==
-//!      backing_cluster_size * 8 / backing_refcount_bits`.
+//!   2. `overlay_cluster_count` covers the overlay's virtual
+//!      size (`(count - 1) * cs < vsize <= count * cs`, for
+//!      nonzero sizes).
 //!
 //! For [`VmdkCommitContext`]:
 //!
-//!   5. `backing_gt_dirty.len() ==
+//!   3. `backing_gt_dirty.len() ==
 //!      (backing_allocated_gt_count + 7) / 8`.
-//!   6. `backing_grain_tables.len() == backing_allocated_gt_count *
+//!   4. `backing_grain_tables.len() == backing_allocated_gt_count *
 //!      backing_num_gtes_per_gt * 4`.
-//!   7. `backing_gd_dirty.len() == 1`.
-//!   8. `overlay_grain_size_sectors > 0` and
+//!   5. `backing_gd_dirty.len() == 1`.
+//!   6. `overlay_grain_size_sectors > 0` and
 //!      `backing_grain_size_sectors > 0`.
 //!
 //! Errors (`CommitError::*`) are silently ignored — libFuzzer's
@@ -41,11 +42,10 @@ use commit::{
 
 const HEADER_BYTES: usize = 32;
 
-/// Scratch buffer size. Sized to cover both formats' worst case
-/// in v1 — the qcow2 commit planner stages backing refcount-
-/// blocks (up to ~32 KiB per block times a handful of blocks)
-/// plus the dirty bitmap; vmdk stages no metadata in scratch in
-/// v1. 8 MiB is well over the v1 ceiling.
+/// Scratch buffer size for the vmdk planner (backing GD + GT
+/// copies plus dirty maps; the qcow2 planner has been pure
+/// geometry since phase 4 and takes no scratch). 8 MiB is well
+/// over the v1 ceiling.
 const SCRATCH_BYTES: usize = 8 * 1024 * 1024;
 
 thread_local! {
@@ -114,15 +114,6 @@ fuzz_target!(|data: &[u8]| {
         }
     };
 
-    let small_refblock_host_offsets: [u64; 16] = [
-        0x1_0000, 0x2_0000, 0x3_0000, 0x4_0000,
-        0x5_0000, 0x6_0000, 0x7_0000, 0x8_0000,
-        0x9_0000, 0xa_0000, 0xb_0000, 0xc_0000,
-        0xd_0000, 0xe_0000, 0xf_0000, 0x10_0000,
-    ];
-    let backing_refblock_host_offsets = &small_refblock_host_offsets
-        [..(backing_refblock_count as usize).min(16)];
-
     let small_gt_host_sectors: [u64; 16] = [
         0x100, 0x200, 0x300, 0x400, 0x500, 0x600, 0x700, 0x800,
         0x900, 0xa00, 0xb00, 0xc00, 0xd00, 0xe00, 0xf00, 0x1000,
@@ -146,12 +137,8 @@ fuzz_target!(|data: &[u8]| {
                     overlay_file_size,
                     backing_header: slice(4096, 4096),
                     backing_file_size,
-                    backing_refcount_table: slice(8192, 4096),
-                    backing_refblock_host_offsets,
-                    backing_refcount_blocks: slice(12 * 1024, 32 * 1024),
-                    backing_refblock_count,
                 };
-                if let Ok(ctx) = plan_commit_qcow2(&opts, &mut scratch) {
+                if let Ok(ctx) = plan_commit_qcow2(&opts) {
                     assert_qcow2_context(&ctx);
                 }
             }
@@ -194,31 +181,7 @@ fuzz_target!(|data: &[u8]| {
 });
 
 /// qcow2 commit context invariants.
-fn assert_qcow2_context(ctx: &Qcow2CommitContext<'_>) {
-    let expected_dirty_len = ((ctx.backing_refblock_count as usize) + 7) / 8;
-    assert_eq!(
-        ctx.backing_dirty.len(),
-        expected_dirty_len,
-        "qcow2 commit: backing_dirty.len() {} != \
-         (backing_refblock_count {} + 7) / 8 = {}",
-        ctx.backing_dirty.len(),
-        ctx.backing_refblock_count,
-        expected_dirty_len,
-    );
-
-    let expected_refblocks_len = (ctx.backing_refblock_count as usize)
-        * (ctx.backing_cluster_size as usize);
-    assert_eq!(
-        ctx.backing_refblocks.len(),
-        expected_refblocks_len,
-        "qcow2 commit: backing_refblocks.len() {} != \
-         backing_refblock_count {} * backing_cluster_size {} = {}",
-        ctx.backing_refblocks.len(),
-        ctx.backing_refblock_count,
-        ctx.backing_cluster_size,
-        expected_refblocks_len,
-    );
-
+fn assert_qcow2_context(ctx: &Qcow2CommitContext) {
     if ctx.overlay_refcount_bits > 0 && ctx.overlay_cluster_size > 0 {
         let expected_epr = (ctx.overlay_cluster_size as u64) * 8
             / (ctx.overlay_refcount_bits as u64);
@@ -234,18 +197,16 @@ fn assert_qcow2_context(ctx: &Qcow2CommitContext<'_>) {
         );
     }
 
-    if ctx.backing_refcount_bits > 0 && ctx.backing_cluster_size > 0 {
-        let expected_epr = (ctx.backing_cluster_size as u64) * 8
-            / (ctx.backing_refcount_bits as u64);
-        assert_eq!(
-            ctx.backing_entries_per_refblock,
-            expected_epr,
-            "qcow2 commit: backing_entries_per_refblock {} != \
-             backing_cluster_size {} * 8 / backing_refcount_bits {} = {}",
-            ctx.backing_entries_per_refblock,
-            ctx.backing_cluster_size,
-            ctx.backing_refcount_bits,
-            expected_epr,
+    if ctx.overlay_cluster_size > 0 && ctx.overlay_cluster_count > 0 {
+        let cs = ctx.overlay_cluster_size as u64;
+        let covered = ctx.overlay_cluster_count * cs;
+        let prev = (ctx.overlay_cluster_count - 1) * cs;
+        assert!(
+            prev < covered,
+            "qcow2 commit: overlay_cluster_count {} overflows at \
+             cluster size {}",
+            ctx.overlay_cluster_count,
+            cs,
         );
     }
 }

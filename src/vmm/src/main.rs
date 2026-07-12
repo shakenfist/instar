@@ -6985,8 +6985,8 @@ fn render_commit_success(
 }
 
 /// Map a `CommitResult::ERROR_*` code to a user-facing string.
-/// Exhaustive on the 16 constants from
-/// `src/shared/src/lib.rs` (0..=15); the trailing catch-all
+/// Exhaustive on the 18 constants from
+/// `src/shared/src/lib.rs` (0..=17); the trailing catch-all
 /// covers future code additions only.
 fn map_commit_error(code: u32) -> String {
     match code {
@@ -7044,6 +7044,18 @@ fn map_commit_error(code: u32) -> String {
         c if c == shared::CommitResult::ERROR_OVERLAY_HAS_SNAPSHOTS => {
             "the overlay has internal snapshots; the post-commit clear pass \
              would corrupt them. Fall back to `qemu-img commit`"
+                .into()
+        }
+        c if c == shared::CommitResult::ERROR_BACKING_UNSUPPORTED => {
+            "the backing file uses features instar commit does not support \
+             (unknown or compression feature bits). Fall back to \
+             `qemu-img commit`"
+                .into()
+        }
+        c if c == shared::CommitResult::ERROR_BACKING_INCONSISTENT => {
+            "the backing file's metadata is inconsistent (refcounts, table \
+             flags or layout); refusing to write into it. Run `qemu-img \
+             check` on the backing, or fall back to `qemu-img commit`"
                 .into()
         }
         _ => format!("unknown commit error code {code}"),

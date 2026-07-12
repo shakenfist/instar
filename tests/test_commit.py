@@ -1006,3 +1006,372 @@ class TestCommitSnapshotGate(TestCommitSmoke):
                 self.assertEqual(
                     self.sha256(overlay), overlay_before,
                     'a refused commit must not touch the overlay')
+
+
+# ----------------------------------------------------------------------
+# Backing classification tests — phase 4 of
+# PLAN-qcow2-write-infrastructure (step 4b). The commit guest's
+# backing-side write composition moved onto crates/qcow2-write +
+# crates/qcow2-write-exec; these tests pin the divergence budget:
+# the new typed refusals (D1 unknown/compression feature bits,
+# D2 compressed backing clusters, D4 sparse refcount tables) and
+# the deliberate capacity widening (D6).
+# ----------------------------------------------------------------------
+
+
+class TestCommitBackingClassification(TestCommitSmoke):
+    """Backing-side refusals and capacity widening (phase 4)."""
+
+    @staticmethod
+    def sha256(path):
+        """Return the sha256 hex digest of a file's full contents."""
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _require_qemu_tools(self):
+        if shutil.which('qemu-img') is None:
+            self.skipTest('system qemu-img not installed')
+        if shutil.which('qemu-io') is None:
+            self.skipTest('system qemu-io not installed')
+
+    def _run_tool(self, argv, cwd, timeout=60):
+        """Run a qemu tool with cwd in the fixture dir; assert rc 0."""
+        r = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout,
+            cwd=str(cwd))
+        self.assertEqual(
+            r.returncode, 0,
+            f'{argv[0]} failed: argv={argv!r} stderr={r.stderr!r}')
+        return r
+
+    @staticmethod
+    def _refcount_table_entries(path):
+        """Return the qcow2 refcount table's u64 BE entries."""
+        import struct
+        with open(path, 'rb') as f:
+            hdr = f.read(64)
+            cluster_bits = struct.unpack('>I', hdr[20:24])[0]
+            rt_offset = struct.unpack('>Q', hdr[48:56])[0]
+            rt_clusters = struct.unpack('>I', hdr[56:60])[0]
+            f.seek(rt_offset)
+            rt = f.read(rt_clusters * (1 << cluster_bits))
+        return [
+            struct.unpack('>Q', rt[i:i + 8])[0]
+            for i in range(0, len(rt), 8)
+        ]
+
+    def test_refuse_compressed_backing(self):
+        """Commit into a compressed-cluster backing refuses pre-mutation.
+
+        Divergence D2 (scratchpad issue draft
+        ``issue-draft-commit-compressed-backing.md``): before
+        phase 4, this shape was LIVE CORRUPTION — the per-cluster
+        loop masked the compressed backing L2 entry with
+        `L2_OFFSET_MASK` and wrote raw overlay data over the
+        shared host cluster, silently destroying the deflate
+        streams of every virtual cluster packed into it
+        (`qemu-img check` stays clean; reads fail later). The
+        qcow2-write classifier now refuses `CompressedCluster`
+        with the existing compressed-cluster wire code before any
+        backing byte changes: the overlay commits a single
+        cluster, so the refusal precedes every write and the
+        backing must be byte-unchanged.
+        """
+        self._require_qemu_tools()
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            # Backing with 4 compressed clusters, packed into a
+            # shared host cluster by qemu-img convert -c.
+            self._run_tool(
+                ['qemu-img', 'create', '-f', 'qcow2', 'src.qcow2', '1M'],
+                td)
+            self._run_tool(
+                ['qemu-io', '-f', 'qcow2',
+                 '-c', 'write -P 0x11 0 64k',
+                 '-c', 'write -P 0x22 64k 64k',
+                 '-c', 'write -P 0x33 128k 64k',
+                 '-c', 'write -P 0x44 192k 64k',
+                 'src.qcow2'],
+                td)
+            self._run_tool(
+                ['qemu-img', 'convert', '-c', '-O', 'qcow2',
+                 'src.qcow2', 'backing.qcow2'],
+                td)
+            # Single-cluster overlay write over virtual cluster 1.
+            self._run_tool(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-o', 'backing_file=backing.qcow2,backing_fmt=qcow2',
+                 'overlay.qcow2', '1M'],
+                td)
+            self._run_tool(
+                ['qemu-io', '-f', 'qcow2', '-c', 'write -P 0xbb 64k 64k',
+                 'overlay.qcow2'],
+                td)
+
+            backing = td / 'backing.qcow2'
+            overlay = td / 'overlay.qcow2'
+            backing_before = self.sha256(backing)
+            overlay_before = self.sha256(overlay)
+
+            _, stderr, rc = self.run_instar_commit(overlay, timeout=120)
+            self.assertNotEqual(
+                rc, 0,
+                f'expected compressed backing to be refused; '
+                f'stderr={stderr!r}')
+            self.assertIn(
+                'format does not support commit', stderr,
+                f'unexpected stderr: {stderr!r}')
+            self.assertEqual(
+                self.sha256(backing), backing_before,
+                'a refused commit must not touch the backing '
+                '(pre-phase-4 this shape was silently corrupted)')
+            self.assertEqual(
+                self.sha256(overlay), overlay_before,
+                'a refused commit must not touch the overlay')
+
+    def test_refuse_backing_unknown_incompatible(self):
+        """A backing with the zstd/unknown incompatible bit refuses.
+
+        Divergence D1: the qcow2 spec requires refusing unknown
+        incompatible feature bits, but commit previously
+        proceeded. The qcow2-write envelope now gates the backing
+        header before any staging (new wire code 16,
+        ERROR_BACKING_UNSUPPORTED). Preferred fixture is a stock
+        ``compression_type=zstd`` image; when this qemu-img build
+        lacks zstd the test sets an unused incompatible bit in
+        the backing header directly.
+        """
+        self._require_qemu_tools()
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            backing = td / 'backing.qcow2'
+            overlay = td / 'overlay.qcow2'
+
+            r = subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-o', 'compression_type=zstd', str(backing), '1M'],
+                capture_output=True, text=True, timeout=30)
+            zstd_ok = r.returncode == 0
+            if not zstd_ok:
+                self._run_tool(
+                    ['qemu-img', 'create', '-f', 'qcow2',
+                     'backing.qcow2', '1M'],
+                    td)
+            self._run_tool(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-o', 'backing_file=backing.qcow2,backing_fmt=qcow2',
+                 'overlay.qcow2', '1M'],
+                td)
+            self._run_tool(
+                ['qemu-io', '-f', 'qcow2', '-c', 'write -P 0xbb 0 64k',
+                 'overlay.qcow2'],
+                td)
+            if not zstd_ok:
+                # Set an unused incompatible feature bit (bit 8)
+                # in the backing header's incompatible_features
+                # field (byte offset 72, u64 BE).
+                with open(backing, 'r+b') as f:
+                    f.seek(72)
+                    bits = int.from_bytes(f.read(8), 'big')
+                    f.seek(72)
+                    f.write((bits | (1 << 8)).to_bytes(8, 'big'))
+
+            backing_before = self.sha256(backing)
+            overlay_before = self.sha256(overlay)
+
+            _, stderr, rc = self.run_instar_commit(overlay, timeout=120)
+            self.assertNotEqual(
+                rc, 0,
+                f'expected unsupported-feature backing to be refused; '
+                f'stderr={stderr!r}')
+            self.assertIn(
+                'the backing file uses features instar commit does not '
+                'support (unknown or compression feature bits). Fall back '
+                'to `qemu-img commit`',
+                stderr, f'unexpected stderr: {stderr!r}')
+            self.assertEqual(
+                self.sha256(backing), backing_before,
+                'a refused commit must not touch the backing')
+            self.assertEqual(
+                self.sha256(overlay), overlay_before,
+                'a refused commit must not touch the overlay')
+
+    def test_refuse_sparse_refcount_table_backing(self):
+        """Commit into a holed-refcount-table backing refuses pre-mutation.
+
+        Divergence D4 (scratchpad issue draft
+        ``issue-draft-commit-sparse-refcount-table.md``): a holed
+        refcount table is stock-producible (discards free no
+        refblocks, but ``qemu-img resize --shrink`` frees
+        all-zero refblocks anywhere in the table) and passes
+        ``qemu-img check`` clean. Before phase 4, commit
+        compacted the nonzero RT entries and indexed them as if
+        dense — silent refcount corruption (2654 check errors in
+        the 4p probe). The dense-prefix contiguity gate now
+        refuses at staging time (wire code 17,
+        ERROR_BACKING_INCONSISTENT), before any backing byte
+        changes.
+        """
+        self._require_qemu_tools()
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            self._run_tool(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-o', 'cluster_size=4096', 'backing.qcow2', '96M'],
+                td)
+            # Pre-touch 4K every 2M so refblocks 0..1 stay
+            # populated, then fill, discard the middle and
+            # shrink: qemu's reftable-shrink path frees the
+            # all-zero refblocks in the middle of the table.
+            touch_cmds = []
+            for i in range(48):
+                touch_cmds += ['-c', f'write -P 0x01 {i * 2}M 4k']
+            self._run_tool(
+                ['qemu-io', '-f', 'qcow2'] + touch_cmds + ['backing.qcow2'],
+                td, timeout=120)
+            self._run_tool(
+                ['qemu-io', '-f', 'qcow2', '-c', 'write -P 0x22 0 88M',
+                 'backing.qcow2'],
+                td, timeout=120)
+            self._run_tool(
+                ['qemu-io', '-f', 'qcow2', '-c', 'discard 8M 72M',
+                 'backing.qcow2'],
+                td, timeout=120)
+            self._run_tool(
+                ['qemu-img', 'resize', '--shrink', 'backing.qcow2', '82M'],
+                td)
+
+            backing = td / 'backing.qcow2'
+            entries = self._refcount_table_entries(backing)
+            populated = [i for i, e in enumerate(entries) if e != 0]
+            holed = bool(populated) and (
+                populated[-1] - populated[0] + 1 != len(populated))
+            if not holed:
+                self.skipTest(
+                    'fixture did not produce a holed refcount table '
+                    f'with this qemu-img (populated indices {populated})')
+            # The holed backing passes qemu-img check clean — the
+            # whole point of the D4 gate.
+            self._run_tool(['qemu-img', 'check', 'backing.qcow2'], td)
+
+            self._run_tool(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-o', 'cluster_size=4096,'
+                       'backing_file=backing.qcow2,backing_fmt=qcow2',
+                 'overlay.qcow2', '82M'],
+                td)
+            self._run_tool(
+                ['qemu-io', '-f', 'qcow2', '-c', 'write -P 0xdd 0 64k',
+                 'overlay.qcow2'],
+                td)
+
+            overlay = td / 'overlay.qcow2'
+            backing_before = self.sha256(backing)
+            overlay_before = self.sha256(overlay)
+
+            _, stderr, rc = self.run_instar_commit(overlay, timeout=120)
+            self.assertNotEqual(
+                rc, 0,
+                f'expected holed-RT backing to be refused; '
+                f'stderr={stderr!r}')
+            self.assertIn(
+                "the backing file's metadata is inconsistent (refcounts, "
+                'table flags or layout); refusing to write into it. Run '
+                '`qemu-img check` on the backing, or fall back to '
+                '`qemu-img commit`',
+                stderr, f'unexpected stderr: {stderr!r}')
+            self.assertEqual(
+                self.sha256(backing), backing_before,
+                'a refused commit must not touch the backing '
+                '(pre-phase-4 this shape was silently corrupted)')
+            self.assertEqual(
+                self.sha256(overlay), overlay_before,
+                'a refused commit must not touch the overlay')
+
+    def test_widened_backing_refblock_capacity_commits(self):
+        """A >32-refblock backing now commits (capacity widening D6).
+
+        The 4p probe's off-matrix exemplar: a 16M cluster_size=512
+        backing with 8M seeded has 66 populated refcount-table
+        entries — over the old 32-refblock staging cap, so the
+        pre-phase-4 binary refused with wire code 10
+        (scratch-too-small). The qcow2-write staging is bounded by
+        staged bytes and MAX_REFBLOCKS=2048 instead, so this shape
+        must now succeed, check-clean, and match a qemu-img commit
+        twin on info-equivalence.
+        """
+        self._require_qemu_tools()
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+
+            def _build_pair(subdir_name):
+                pair_dir = td / subdir_name
+                pair_dir.mkdir(parents=True, exist_ok=True)
+                self._run_tool(
+                    ['qemu-img', 'create', '-f', 'qcow2',
+                     '-o', 'cluster_size=512', 'base.qcow2', '16M'],
+                    pair_dir)
+                self._run_tool(
+                    ['qemu-io', '-f', 'qcow2', '-c', 'write -P 0x11 0 8M',
+                     'base.qcow2'],
+                    pair_dir, timeout=120)
+                self._run_tool(
+                    ['qemu-img', 'create', '-f', 'qcow2',
+                     '-o', 'cluster_size=512,'
+                           'backing_file=base.qcow2,backing_fmt=qcow2',
+                     'overlay.qcow2', '16M'],
+                    pair_dir)
+                self._run_tool(
+                    ['qemu-io', '-f', 'qcow2', '-c', 'write -P 0xbb 0 64k',
+                     'overlay.qcow2'],
+                    pair_dir)
+                return pair_dir / 'overlay.qcow2', pair_dir / 'base.qcow2'
+
+            overlay_a, base_a = _build_pair('instar')
+            overlay_b, base_b = _build_pair('qemu')
+
+            stdout, stderr, rc = self.run_instar_commit(
+                overlay_a, timeout=120)
+            self.assertEqual(
+                rc, 0,
+                f'widened-capacity commit failed (the pre-phase-4 cap '
+                f'refused this shape): stderr={stderr!r}')
+            self.assertIn('Image committed.', stdout,
+                          f'unexpected stdout: {stdout!r}')
+
+            r = subprocess.run(
+                ['qemu-img', 'commit', str(overlay_b)],
+                capture_output=True, text=True, timeout=120,
+                cwd=str(overlay_b.parent))
+            self.assertEqual(
+                r.returncode, 0,
+                f'qemu-img commit failed: stderr={r.stderr!r}')
+
+            # Both results check-clean.
+            self._run_tool(['qemu-img', 'check', 'base.qcow2'],
+                           base_a.parent)
+            self._run_tool(['qemu-img', 'check', 'overlay.qcow2'],
+                           overlay_a.parent)
+
+            # Info-equivalence against the qemu twin, overlay and
+            # backing (the round-trip driver's comparison shape).
+            for a, b, which in ((overlay_a, overlay_b, 'overlay'),
+                                (base_a, base_b, 'backing')):
+                a_info = subprocess.run(
+                    ['qemu-img', 'info', '--output=json', str(a)],
+                    capture_output=True, text=True, timeout=30)
+                self.assertEqual(a_info.returncode, 0, a_info.stderr)
+                b_info = subprocess.run(
+                    ['qemu-img', 'info', '--output=json', str(b)],
+                    capture_output=True, text=True, timeout=30)
+                self.assertEqual(b_info.returncode, 0, b_info.stderr)
+                actual = a_info.stdout.replace(str(base_a), '$BASE')
+                expected = b_info.stdout.replace(str(base_b), '$BASE')
+                assert_info_equivalent(
+                    self, actual, expected, 'qcow2',
+                    tmp_path=str(a), expected_tmp_path=str(b),
+                    msg=f'widened-capacity commit (cs=512, 16M, '
+                        f'66 refblocks) {which}')

@@ -4291,6 +4291,28 @@ impl CommitResult {
     /// (snapshot-aware refcounting) lands in phase 7 of
     /// `PLAN-qcow2-write-infrastructure`.
     pub const ERROR_OVERLAY_HAS_SNAPSHOTS: u32 = 15;
+    /// The backing file's header carries feature bits the
+    /// commit write envelope does not support: the zstd
+    /// compression-type bit or any unknown incompatible bit
+    /// (`qcow2_write::Gate::UnknownIncompatible`). The qcow2
+    /// spec requires refusing unknown incompatible bits; commit
+    /// previously proceeded in violation of the spec (phase-4
+    /// divergence D1 of
+    /// `PLAN-qcow2-write-infrastructure-phase-04-commit`).
+    /// Refused before any staging or mutation.
+    pub const ERROR_BACKING_UNSUPPORTED: u32 = 16;
+    /// The backing file's metadata is inconsistent as a write
+    /// substrate: a sparse (non-contiguous) refcount table,
+    /// reserved bits in refcount-table/L1/L2 entries,
+    /// snapshot-shared or refcount-zero clusters on an image
+    /// whose header says `nb_snapshots == 0`, or refcounts
+    /// outside the staged refblock set (phase-4 divergences
+    /// D3/D4). Staging-time refusals (the sparse-RT gate — a
+    /// live corruption before phase 4) leave the backing
+    /// byte-untouched; mid-loop classification refusals leave
+    /// previously committed cluster data in place, the same
+    /// posture as [`Self::ERROR_REFCOUNT_EXHAUSTED`].
+    pub const ERROR_BACKING_INCONSISTENT: u32 = 17;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -5005,7 +5027,9 @@ mod tests {
     fn commit_result_error_codes_distinct() {
         // Phase 7 step 7a added codes 8..=13; the phase-2
         // snapshot gates added 14 (backing, issue #420) and 15
-        // (overlay, issue #423). Confirm every code is
+        // (overlay, issue #423); phase 4 of
+        // PLAN-qcow2-write-infrastructure added the backing
+        // classification codes 16 and 17. Confirm every code is
         // distinct so the host's match arms don't accidentally
         // alias.
         let codes = [
@@ -5025,13 +5049,16 @@ mod tests {
             CommitResult::ERROR_INTERNAL_OVERFLOW,
             CommitResult::ERROR_BACKING_HAS_SNAPSHOTS,
             CommitResult::ERROR_OVERLAY_HAS_SNAPSHOTS,
+            CommitResult::ERROR_BACKING_UNSUPPORTED,
+            CommitResult::ERROR_BACKING_INCONSISTENT,
         ];
         for i in 0..codes.len() {
             for j in (i + 1)..codes.len() {
                 assert_ne!(codes[i], codes[j], "codes {i} and {j} alias");
             }
         }
-        // Confirm contiguous 0..=15 numbering.
+        // Confirm contiguous 0..=17 numbering (append-only wire
+        // codes).
         for (i, c) in codes.iter().enumerate() {
             assert_eq!(*c, i as u32);
         }
