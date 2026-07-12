@@ -274,9 +274,43 @@ provides a modular architecture with:
   Envelope gates (qcow2 v2/v3, 16-bit refcounts, no
   unknown-incompatible bits, no extended-L2 / external data /
   encryption, not dirty/corrupt, no internal snapshots) run at state
-  construction, so a gated image can never yield a write plan. No
-  consumer yet: phases 4-6 migrate commit, rebase safe mode and bench
-  `-w` onto it, and phase 7 adds copy-on-write.
+  construction, so a gated image can never yield a write plan. The
+  commit op is the first consumer (phase 4, 2026-07-13): its qcow2
+  backing-side write path is planned by this crate and executed
+  through `crates/qcow2-write-exec`, proven byte-invisible by the
+  `scripts/migration-proof.py` before/after harness (73/73 fixture
+  combos byte-identical, 300-iteration differential fuzz clean).
+  Phases 5-6 migrate rebase safe mode and bench `-w`, and phase 7
+  adds copy-on-write.
+- **crates/qcow2-write-exec/** - Shared guest-side step executor for
+  `crates/qcow2-write` step programs (`no_std`,
+  PLAN-qcow2-write-infrastructure phase 4): a literal interpreter of
+  the `StepKind` doc contracts with zero planning logic —
+  `execute(steps, regions, devices)` applies one planned window in
+  emission order and aborts on the first failure with the step index
+  and a typed cause (nothing panics; every region access is
+  bounds-checked). The `DeviceIo` trait abstracts the per-device
+  call-table entry points; `CallTableIo` maps `Input0` to
+  `read/write_input_sector(0)` + `fsync_input(0)` and `Output` to
+  `read/write_output_sector` with no fsync capability. Its byte-range
+  layer (`read_bytes` / `write_bytes` / `fill_bytes`) sits over the
+  strictly sector-addressed call table — whole aligned sectors
+  transfer directly, sub-sector head/tail goes through
+  read-modify-write on a caller-provided bounce sector — and is
+  exposed as the shared replacement for the byte-range helpers the
+  commit / rebase / bench / bitmap ops each hand-roll. `Regions`
+  maps each planner `RegionId` to a caller-carved scratch slice
+  (never `static`) plus the two executor service sectors (one shared
+  RMW bounce — safe because all call-table I/O is synchronous and
+  steps execute serially — and a fill-synthesis sector). Barrier
+  policy: `Ordering` is a no-op (issue order is completion order),
+  `Durability` fsyncs where the capability exists and degrades to
+  `Ordering` elsewhere (matching commit/rebase's no-fsync
+  output-device reality). Host-unit-tested against a mock `DeviceIo`
+  with journals and failure injection, including end-to-end
+  compositions driving `plan_write` / `plan_flush` through the
+  executor over a model disk. Consumed by the commit op; phases 5-6
+  reuse it for rebase and bench.
 - **operations/info/** - Format detection operation
 - **operations/copy/** - File copy operation
 - **operations/check/** - Image integrity validation operation (with

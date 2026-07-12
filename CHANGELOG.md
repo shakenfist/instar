@@ -1149,6 +1149,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **`instar commit`'s qcow2 write path migrated onto
+  `crates/qcow2-write` (PLAN-qcow2-write-infrastructure phase 4).**
+  The commit op's inlined backing-side allocate-on-write composition
+  is replaced by the shared planner (`crates/qcow2-write`) driven
+  through the new `crates/qcow2-write-exec` guest step executor — a
+  literal interpreter of the planner's step contracts (DeviceIo
+  call-table mapping, a shared byte-range layer with sub-sector RMW
+  replacing the per-op helpers, fill synthesis, and barrier policy
+  with Durability degrading to Ordering on the fsync-less output
+  device). The migration is byte-invisible: a new
+  `scripts/migration-proof.py` harness proved instar-before vs
+  instar-after byte identity over a 73-combo fixture matrix (0
+  identity failures, 0 determinism failures, including byte-identical
+  pre-refusal scaffolding on the refusal shapes), and a 300-iteration
+  commit differential-fuzz run reported 0 divergences with baselines
+  unchanged. Two silent-corruption shapes found by the phase's probes
+  become typed refusals before harm: compressed backing clusters
+  (previously overwritten in place, destroying every stream packed in
+  the host cluster) now refuse with the existing unsupported-format
+  error, and backings with a sparse (holed) refcount table —
+  stock-producible via discard + `qemu-img resize --shrink`, and
+  check-clean — now refuse with new `CommitResult` error 17
+  (`ERROR_BACKING_INCONSISTENT`) instead of corrupting refcounts; new
+  error 16 (`ERROR_BACKING_UNSUPPORTED`) adds the spec-mandated
+  refusal of unknown/compression incompatible bits on the backing.
+  Backing staging capacity widens (refblocks from a flat 32 to
+  `min(2048, 3 MiB / cluster_size)`; the backing staged-L2 cap
+  replaced by a windowed model), so strictly more images commit
+  successfully; overlay-side caps are unchanged. Unaligned virtual
+  sizes commit cleanly, including chained backings (the planner's new
+  EOV-tail full-coverage rule). `crates/commit` slims by ~550 lines
+  (the superseded allocator and dead plan machinery are deleted; all
+  cross-image validation and the vmdk path are untouched). See
+  [docs/commit.md](docs/commit.md), [docs/quirks.md](docs/quirks.md)
+  and the phase-4 findings in
+  [docs/plans/PLAN-qcow2-write-infrastructure.md](docs/plans/PLAN-qcow2-write-infrastructure.md).
+
 - **Guest core and operation memory budgets doubled (2026-07-06,
   commit `3a5e1e2`).** Pre-emptive lift ahead of the bench work,
   prompted by `core.bin` reaching 94% of its 72 KiB budget: core's

@@ -1445,6 +1445,102 @@ snapshot-bearing images where instar now refuses. The real
 fix is copy-on-write, phase 7 of
 [PLAN-qcow2-write-infrastructure](plans/PLAN-qcow2-write-infrastructure.md).
 
+### Backings with unknown or compression feature bits are refused
+
+Since the phase-4 migration onto `crates/qcow2-write`,
+commit refuses a backing whose header carries the zstd
+compression-type bit or any unknown incompatible-features
+bit (`CommitResult` error 16): ``the backing file uses
+features instar commit does not support (unknown or
+compression feature bits). Fall back to `qemu-img
+commit` ``. The qcow2 spec mandates refusing unknown
+incompatible bits; commit previously proceeded in
+violation of the spec. The refusal fires before any
+staging or mutation. qemu-img builds with zstd support
+proceed on the zstd shape; instar defers zstd to the
+compressed-write future work.
+
+### Compressed backing clusters are refused
+
+Commit refuses when the committed extent lands on a
+compressed L2 entry in the backing, using the existing
+`ERROR_UNSUPPORTED_FORMAT` code (the same code the
+overlay side has always used for compressed entries).
+Before phase 4 this shape was silently corrupted: the
+per-cluster loop masked the compressed entry's offset and
+overwrote it in place, destroying the deflate streams of
+every virtual cluster packed into that host cluster —
+exit 0, `qemu-img check` clean, damage visible only on
+read-back (identified during phase 4 of
+PLAN-qcow2-write-infrastructure). qemu-img handles the
+same shape correctly: it allocates a fresh uncompressed
+cluster and leaves the other packed streams intact. The
+refusal is a classification refusal: clusters committed
+earlier in the same run remain written (unreferenced
+scaffolding, metadata never flushed, check-clean — the
+same posture as the refcount-exhaustion refusal).
+
+### Backings with inconsistent metadata are refused
+
+Commit refuses backings whose metadata is inconsistent as
+a write substrate (`CommitResult` error 17): ``the backing
+file's metadata is inconsistent (refcounts, table flags or
+layout); refusing to write into it. Run `qemu-img check`
+on the backing, or fall back to `qemu-img commit` ``.
+This covers a sparse (holed) refcount table, reserved bits
+in refcount-table/L1/L2 entries, and snapshot-shared or
+refcount-inconsistent clusters on an image whose header
+says it has no snapshots.
+
+The sparse-refcount-table shape matters: it is producible
+with stock qemu-img operations (a discard history followed
+by `qemu-img resize --shrink` frees all-zero refblocks
+below still-populated ones) and passes `qemu-img check`
+cleanly, and before phase 4 instar's staging compacted the
+nonzero table entries and indexed them as if dense —
+silently writing refcounts into the wrong refblocks (2654
+check errors in the probe that found it; identified during
+phase 4 of PLAN-qcow2-write-infrastructure). qemu-img
+commits into the same shape check-clean. The sparse-table
+refusal fires at staging time, before any mutation; the
+other error-17 shapes are classification refusals with the
+same scaffolding posture as the compressed-cluster refusal
+above.
+
+### Backing staging capacity widened by the phase-4 migration
+
+The migrated backing side stages refblocks by byte
+capacity — `min(2048, 3 MiB / cluster_size)` refblocks,
+strictly wider than the old 32-refblock cap on every
+cluster size — and replaces the old stage-everything
+backing-L2 cap (`min(256, 2 MiB / cluster_size)` tables)
+with a windowed model of the same slot count that has no
+total-count refusal at all. Strictly more images succeed;
+backing shapes that previously refused
+`ERROR_SCRATCH_TOO_SMALL` (e.g. a cs=512 backing with more
+than 32 populated refcount-table entries) now commit with
+qemu-img info/check parity. Overlay-side staging caps are
+unchanged, so overlay-bound shapes refuse exactly as
+before. The remaining backing-side ceiling is refcount
+exhaustion (`CommitResult` error 11 — v1 never appends new
+refblocks); retiring it is the master plan's
+refcount-growth generalization (phase 6).
+
+### Unaligned virtual sizes commit cleanly
+
+Images whose `virtual_size` is not a multiple of the
+cluster size commit byte-identically to qemu-img's
+observed tail behaviour, including when the backing has
+its own backing file. The final (tail) cluster's write is
+clamped to `virtual_size` and classifies as full coverage
+in `crates/qcow2-write` — bytes beyond end-of-virtual-size
+are not virtual content, so the beyond-EOV zero-fill is
+the correct pre-image regardless of backing. Probed
+empirically during phase 4: tail bytes past EOV are zeros
+under both tools on stock fixtures, and the proof matrix's
+unaligned combo passed byte-identical with zero fallbacks
+to virtual-content comparison.
+
 ### `cluster_size > 64 KiB` overflows the commit scratch budget
 
 The commit guest binary's `OVERLAY_RT_LIMIT` and

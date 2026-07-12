@@ -291,7 +291,7 @@ Design sketch (to be settled in phase planning, not binding):
 | 1. Semantics pin: qemu snapshot-bearing commit/rebase behaviour, COW order determinism, oracle inventory, memory budget survey | PLAN-qcow2-write-infrastructure-phase-01-semantics.md | Complete (2026-07-12; see Findings) |
 | 2. Interim safety gates + defect handling — LIVE: commit snapshot corruption (#420), rebase snapshot corruption + data-loss chain (#421), rebase 512-byte-cluster livelock (#422; fix or gate per root-cause depth) | PLAN-qcow2-write-infrastructure-phase-02-gates.md | Complete (2026-07-12; commits ac8f60a / 2fb9af4 / c84743e; see Findings) |
 | 3. `crates/qcow2-write` core: classification + allocate-on-write planner + ordering contract (no COW, no growth), unit tests + simulation harness | PLAN-qcow2-write-infrastructure-phase-03-crate.md | Complete (2026-07-12; commits 878ebf0 / bc322b2 / 19ba116 / d883b25; see Findings) |
-| 4. Migrate commit onto the crate (byte-identical proof) | PLAN-qcow2-write-infrastructure-phase-04-commit.md | Planned (2026-07-12), not started |
+| 4. Migrate commit onto the crate (byte-identical proof) | PLAN-qcow2-write-infrastructure-phase-04-commit.md | Complete (2026-07-13; commits c101c9f / a2fae94 / 6b0c856 / 7dff544 / 2237028; see Findings) |
 | 5. Migrate rebase safe mode (byte-identical proof) | PLAN-qcow2-write-infrastructure-phase-05-rebase.md | Not started |
 | 6. Migrate bench `-w`; move the refcount-growth planner into the shared crate | PLAN-qcow2-write-infrastructure-phase-06-bench.md | Not started |
 | 7. Copy-on-write branch; lift bench's internal-snapshot gate; per-consumer COW policy per OQ3 | PLAN-qcow2-write-infrastructure-phase-07-cow.md | Not started |
@@ -300,7 +300,7 @@ Design sketch (to be settled in phase planning, not binding):
 
 Phase 2 was conditional on phase 1 confirming a live defect;
 phase 1 confirmed three (see the Findings defect register), so
-phase 2 ran. Phase 4's plan file is the next to write.
+phase 2 ran. Phase 5's plan file is the next to write.
 
 One commit per phase minimum; each commit builds, lints and tests
 clean on its own. Phases 4-6 are pure refactors from the outside:
@@ -769,6 +769,157 @@ at truncation points between the pointer and refblock
 writebacks, so full refcount walks run only on completed epochs
 — phase-8 crash oracles must expect the same.
 
+### Findings: phase 4 commit migration (2026-07-13)
+
+Executed per
+[PLAN-qcow2-write-infrastructure-phase-04-commit.md](PLAN-qcow2-write-infrastructure-phase-04-commit.md)
+as steps 4p (empirical probes, no code; plan amendments in
+c101c9f), 4a (`crates/qcow2-write-exec`, a2fae94), 4q (the one
+sanctioned planner change, 6b0c856), 4b (the op migration,
+7dff544), 4c (proof harness + recorded run, 2237028) and 4d
+(this close-out). The divergence budget D1-D9 held as amended
+after 4p; nothing outside it was found. What follows is what
+phases 5-9 need.
+
+**The migration is byte-invisible — the proof numbers.**
+`scripts/migration-proof.py` (4c) is the reusable before/after
+oracle, re-parameterised for phases 5-6 via `--op`: per combo
+it builds sha256-verified twin fixture sets with the pinned
+qemu-img, asserts instar's own run-to-run determinism first
+(the premise — it held everywhere), then asserts before ==
+after under strict bucketing with no tolerance windows.
+Recorded run (before = the f953289 binary, after = 7dff544):
+73/73 combos pass — 65 both-succeed (including the
+unaligned-virtual-size combo, zero D9 fallbacks) and 8
+both-refuse (exactly the cs=512 multi-extent wire-11
+refcount-exhaustion shapes from 4p's inventory). The
+both-refuse bucket demanded — and got — byte identity of the
+mutated pre-refusal scaffolding too, which 4b preserved by
+executing the already-emitted window before surfacing a
+non-BufFull planner error; identity on refusal paths is part
+of the proof surface, not an exclusion. Differential fuzz: 300
+iterations `--ops commit`, 0 divergences; baseline matrix
+passes against unmodified testdata; `make test-rust` green
+(1704 tests). Phases 5-6 rerun the same harness with their own
+matrices and must save a pre-migration binary before their 4b
+equivalent starts (the phase-2 `instar-before-2d` precedent).
+
+**Two live corruption defects found by 4p, both now typed
+refusals.** (1) D2 confirmed: commit into a backing with
+compressed clusters silently destroyed them — the old loop
+masked the compressed L2 entry and overwrote the host offset
+in place, killing every virtual cluster packed into that host
+cluster (qemu packs multiple deflate streams per host
+cluster); exit 0, check-clean, damage visible only on
+read-back. qemu-img instead allocates a fresh uncompressed
+cluster and preserves the other streams. The migrated op
+refuses at classification with the overlay side's existing
+`ERROR_UNSUPPORTED_FORMAT`. (2) D4 upgraded from latent to
+LIVE: a holed refcount table is stock-producible (a discard
+history + `qemu-img resize --shrink` frees all-zero refblocks
+below populated ones) and passes `qemu-img check` clean;
+commit's compact-then-index-as-dense staging then wrote
+refcounts into the wrong refblocks (2654 check errors / 69
+leaked clusters in the probe). The migrated op stages
+refblocks dense-prefix and gates on RT contiguity: wire 17,
+pre-mutation, byte-idempotent. Issue drafts for both sit in
+the session scratchpad pending the user's filing decision —
+the user docs say "identified during phase 4" and cite no
+issue numbers until that decision lands.
+
+**Executor facts phases 5-6 reuse.** `qcow2-write-exec` is a
+literal interpreter of the `StepKind` doc contracts with zero
+planning logic: `execute(steps, &mut Regions, &mut impl
+DeviceIo) -> Result<ExecStats, ExecError>` (fail-stop with
+step index + typed cause; nothing panics). `DeviceIo` is the
+per-device abstraction; `CallTableIo` maps Input0 →
+`read/write_input_sector(0)` + `fsync_input(0)` and Output →
+`read/write_output_sector` with no fsync, so `Durability`
+degrades to `Ordering` on Output (D8) and `Ordering` is a
+no-op everywhere (synchronous call-table I/O). One judgment
+call deviates from decision 2's letter: a SINGLE shared RMW
+bounce sector serves both devices (not per-device) because
+steps execute serially and the bounce is dead between calls —
+rebase/bench carves need one RMW sector + one fill sector,
+not two RMW sectors. The byte-range layer (`read_bytes` /
+`write_bytes` / `fill_bytes`) is exposed publicly as the
+shared replacement for the per-op byte-range helpers; note 4b
+kept commit's raw-pointer staging helpers (they write into
+scratch addresses with no live slice), so phase 5 should
+decide per call site rather than assume a wholesale swap.
+
+**The 4q EOV-tail rule.** `plan_write` judges coverage against
+the effective cluster end `min(cluster_size, virtual_size -
+cluster_virtual_base)`: a tail-cluster write from the cluster
+base whose coverage reaches `virtual_size` classifies as full
+coverage (bytes beyond EOV are not virtual content; the
+beyond-EOV zero-fill is the correct pre-image regardless of
+backing, matching qemu's observed tail bytes). The exemption
+is one-shot — the write must reach EOV from the cluster base
+in a single request; any genuinely partial write below EOV
+(including a head gap on the tail cluster) still refuses
+`NeedsBackingFill`, and that refusal carries decision-9
+semantics (clean but not byte-idempotent mid-run). Off the
+tail cluster the condition is exactly the old rule. Rebase
+safe mode writes whole clusters like commit did, so phase 5
+needs the same tail clamp in its driving loop.
+
+**The wire-code mapping is the phase-5 template.** Appended
+`CommitResult` codes: 16 `ERROR_BACKING_UNSUPPORTED`
+(`Gate::UnknownIncompatible` — zstd / unknown incompatible
+bits; spec-mandated, previously proceeded) and 17
+`ERROR_BACKING_INCONSISTENT` (the classification refusals:
+`SnapshotShared` / `SnapshotSharedL2Table` /
+`RefcountInconsistent` / `RefcountCoverage` /
+`UnknownL1Entry` / `UnknownL2Entry` /
+`StagedRegionsMismatch` / `NeedsBackingFill` defensively /
+the staging-time non-contiguous-RT gate). Everything else
+reuses existing codes: `RefcountExhausted` keeps wire 11,
+`CompressedCluster` maps to the existing
+`ERROR_UNSUPPORTED_FORMAT`, envelope `Gate`s that duplicate
+op gates keep those gates' codes (and are unreachable because
+the op gates run first, in their existing order), and
+planner-protocol errors (`BufFull` escaping the loop,
+`OutOfBounds`, `ResumeMismatch`) map to the internal-bug
+family. Phase 5 should build `RebaseResult`'s mapping the
+same way: at most two new appended codes, everything else
+reused.
+
+**Capacity outcomes.** Backing refblock staging is
+byte-driven: `min(2048, 3 MiB / cluster_size)` refblocks
+(formerly a flat 32). 4 MiB was not available for the region
+because the untouched vmdk runner still carves its backing
+GD/GT copies from `PLANNER_SCRATCH` (retained at 2.25 MiB);
+rebase reclaims its 4 MiB planner duplicate outright, so
+phase 5 has more headroom to spend. The backing L2 window is
+`min(256, 2 MiB / cluster_size)` slots. LRU eviction exists
+in the crate but NEVER fires for commit, structurally: the
+overlay's stage-everything cap is the identical formula
+(`MAX_STAGED_L2 = 256`, 2 MiB staging), cluster sizes must
+match, and every backing L2 the loop touches corresponds to a
+staged overlay L2 — so distinct backing tables ≤ slots, slots
+assign in first-touch order, and `plan_flush`'s slot-order
+writeback reproduces the old staged-array flush order exactly
+(the quiet half of D5's byte-identity). Phase 5 must re-check
+that bound for rebase's access pattern; if its walk can touch
+more tables than its overlay-side cap guarantees, eviction
+becomes reachable and the flush order is no longer trivially
+identical.
+
+**D6: the matrix widening bucket is empty — phases 5-6 need
+off-matrix probes.** Every refusal on the Q3 proof matrix is
+wire-11 refcount exhaustion, which the migration deliberately
+keeps (phase 6 lifts it), so the refuse-before/succeed-after
+bucket had nothing to catch ON the matrix. The capacity
+widening was proven by 4p's off-matrix exemplar instead
+(cs=512, 16 MiB backing, 8 MiB seeded → 66 populated RT
+entries > 32 → wire-10 refusal before; succeeds
+deterministically after, check-clean, info-equivalent to a
+qemu-img commit twin). Phases 5-6 must likewise construct
+explicit off-matrix widening probes for whatever caps their
+migrations lift — the Q3 matrix shape does not exercise the
+widened region.
+
 ## Administration and logistics
 
 ### Success criteria
@@ -817,9 +968,9 @@ writebacks, so full refcount walks run only on completed epochs
 
 ### Bugs fixed during this work
 
-Phase 1 confirmed three pre-existing defects and phase 2 found
-a fourth (details and repro recipes in the Findings defect
-register; #420-#422 filed 2026-07-12):
+Phase 1 confirmed three pre-existing defects, phase 2 found a
+fourth, and phase 4's probes found two more (details and repro
+recipes in the Findings sections; #420-#422 filed 2026-07-12):
 
 1. [#420](https://github.com/shakenfist/instar/issues/420)
    `instar commit` silently corrupts internal snapshots in the
@@ -846,6 +997,19 @@ register; #420-#422 filed 2026-07-12):
    of #420; issue #423), found by phase 2a's parity test.
    **Gated in the same commit (ac8f60a, error 15)**; real fix
    phase 7 COW.
+5. `instar commit` silently destroyed compressed clusters in
+   the backing (found by phase 4p; check-clean, exit 0, every
+   stream packed in the shared host cluster lost). **Refused
+   since the phase-4 migration (7dff544,
+   `ERROR_UNSUPPORTED_FORMAT`)**; issue draft pending the
+   user's filing decision. Real support (decompress-and-
+   reallocate, qemu's behaviour) is possible phase 7+ work.
+6. `instar commit` corrupted refcounts on backings with a
+   sparse (holed) refcount table — stock-producible and
+   check-clean (found by phase 4p, upgrading divergence D4 to
+   a live defect). **Refused since the phase-4 migration
+   (7dff544, error 17, pre-mutation)**; issue draft pending
+   the user's filing decision.
 
 Fix status is tracked here as phases land.
 
