@@ -31,6 +31,7 @@ success-path tests require ``/dev/kvm`` access; the error
 paths don't.
 """
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -710,3 +711,240 @@ for _target, _cases in REBASE_CASES.items():
             TestRebaseBaselineMatrix, _name,
             _make_rebase_baseline_test(_target, _case),
         )
+
+
+# ----------------------------------------------------------------------
+# Internal-snapshot gate — phase 2 of
+# PLAN-qcow2-write-infrastructure (GitHub issue #421). Safe-mode
+# `instar rebase` (any mode without -u, including safe detach)
+# refuses, byte-idempotently, when the overlay carries internal
+# snapshots: safe mode mutates snapshot-shared L2 tables in place
+# and sets refcount=1 on clusters two L1 trees reference, so a
+# routine `qemu-img snapshot -d` afterwards frees live
+# active-view data. `-u` metadata-only rebase never touches
+# snapshot-shared clusters and stays allowed (parity-tested
+# below). Phase 7's snapshot-aware COW is the real fix.
+# ----------------------------------------------------------------------
+
+
+class TestRebaseSnapshotGate(TestRebaseSmoke):
+    """Safe-mode overlay-snapshot refusal + `-u` parity (#421)."""
+
+    def setUp(self):
+        super().setUp()
+        if shutil.which('qemu-img') is None:
+            self.skipTest('system qemu-img not installed')
+        if shutil.which('qemu-io') is None:
+            self.skipTest('system qemu-io not installed')
+
+    @staticmethod
+    def sha256(path):
+        """Return the sha256 hex digest of a file's full contents."""
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _run_tool(self, argv, cwd, timeout=60):
+        """Run a qemu tool with cwd in the fixture dir; assert rc 0."""
+        r = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout,
+            cwd=str(cwd))
+        self.assertEqual(
+            r.returncode, 0,
+            f'{argv[0]} failed: argv={argv!r} stderr={r.stderr!r}')
+        return r
+
+    def _build_bases(self, fixture_dir):
+        """Create the phase-1 Q2 backing pair in `fixture_dir`.
+
+        base_old.qcow2 (6M, 0x11 at [0,4M)) and base_new.qcow2
+        (6M, 0x22 at [2M,6M)), both at 64K clusters. Idempotent
+        so twin overlays can share one pair (identical
+        `full-backing-filename` keeps the info JSONs
+        comparable).
+        """
+        fixture_dir = Path(fixture_dir)
+        fixture_dir.mkdir(parents=True, exist_ok=True)
+        for name, pattern in (
+                ('base_old.qcow2', 'write -P 0x11 0 4M'),
+                ('base_new.qcow2', 'write -P 0x22 2M 4M')):
+            if (fixture_dir / name).exists():
+                continue
+            self._run_tool(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-o', 'cluster_size=65536', name, '6M'],
+                fixture_dir)
+            self._run_tool(
+                ['qemu-io', '-f', 'qcow2', '-c', pattern, name],
+                fixture_dir)
+        return fixture_dir / 'base_old.qcow2', fixture_dir / 'base_new.qcow2'
+
+    def _build_overlay(self, fixture_dir, name, post_snapshot_write):
+        """Create a snapshot-bearing Q2 overlay on base_old.qcow2.
+
+        6M overlay at 64K clusters backed by base_old.qcow2
+        (relative name), 0x33 at [1M,2M), then `snapshot -c
+        snap1`. With `post_snapshot_write` a 0x44 write at
+        [3M,4M) follows the snapshot, so the active L1 tree has
+        been COWed away from snap1's; without it the active L2
+        stays snapshot-shared — the shape whose safe-mode rebase
+        corrupts refcounts (issue #421).
+        """
+        fixture_dir = Path(fixture_dir)
+        self._run_tool(
+            ['qemu-img', 'create', '-f', 'qcow2',
+             '-o', 'backing_file=base_old.qcow2,backing_fmt=qcow2,'
+                   'cluster_size=65536',
+             name, '6M'],
+            fixture_dir)
+        self._run_tool(
+            ['qemu-io', '-f', 'qcow2', '-c', 'write -P 0x33 1M 1M', name],
+            fixture_dir)
+        self._run_tool(
+            ['qemu-img', 'snapshot', '-c', 'snap1', name], fixture_dir)
+        if post_snapshot_write:
+            self._run_tool(
+                ['qemu-io', '-f', 'qcow2', '-c', 'write -P 0x44 3M 1M',
+                 name],
+                fixture_dir)
+        return fixture_dir / name
+
+    def _snapshot_readback_sha256(self, fixture_dir, overlay_name, snap):
+        """Return the sha256 of a snapshot's virtual view.
+
+        Apply-on-a-copy so the overlay is untouched: copy it
+        inside the fixture dir (the relative backing name still
+        resolves), `qemu-img snapshot -a`, convert to raw, hash
+        the raw bytes.
+        """
+        fixture_dir = Path(fixture_dir)
+        copy = fixture_dir / 'readback.qcow2'
+        raw = fixture_dir / 'readback.raw'
+        shutil.copyfile(fixture_dir / overlay_name, copy)
+        self._run_tool(
+            ['qemu-img', 'snapshot', '-a', snap, copy.name], fixture_dir)
+        self._run_tool(
+            ['qemu-img', 'convert', '-f', 'qcow2', '-O', 'raw',
+             copy.name, raw.name],
+            fixture_dir, timeout=120)
+        digest = self.sha256(raw)
+        copy.unlink()
+        raw.unlink()
+        return digest
+
+    def test_refuse_safe_rebase_overlay_internal_snapshots(self):
+        """Safe-mode rebase of a snapshot-bearing overlay refuses.
+
+        Two shapes, both of which must refuse (the gate keys on
+        `nb_snapshots > 0`, not on whether metadata is actually
+        snapshot-shared):
+
+        1. snapshot-shared active L2 (psw=no, no write after the
+           snapshot) — the corrupting shape from phase-1 Q2:
+           safe mode writes new mappings into the shared L2 in
+           place and sets refcount=1 on clusters two L1 trees
+           reference; a later `qemu-img snapshot -d` frees live
+           active-view data (issue #421).
+        2. already-COWed active L2 (psw=yes, 0x44 write after
+           the snapshot) — phase 1 showed instar matching qemu
+           byte-identically here, but the gate refuses anyway.
+
+        qemu-img rebase proceeds on BOTH shapes (its contract
+        covers the active view only; the snapshot's virtual view
+        silently re-resolves through the new backing). Refusing
+        where qemu proceeds is the documented interim divergence
+        until phase 7's snapshot-aware COW lands.
+
+        The refusal precedes all staging and writes, so the
+        overlay and both backings must be byte-unchanged.
+        """
+        for shape, post_write in (
+                ('snapshot-shared-l2', False),
+                ('post-snapshot-write', True)):
+            with self.subTest(shape=shape), \
+                    tempfile.TemporaryDirectory() as td:
+                fixture = Path(td) / 'fixture'
+                base_old, base_new = self._build_bases(fixture)
+                overlay = self._build_overlay(
+                    fixture, 'overlay.qcow2',
+                    post_snapshot_write=post_write)
+                before = {
+                    p: self.sha256(p)
+                    for p in (overlay, base_old, base_new)}
+
+                _, stderr, rc = self.run_instar_rebase(
+                    overlay, '-b', 'base_new.qcow2', '-F', 'qcow2',
+                    timeout=120)
+                self.assertNotEqual(
+                    rc, 0,
+                    f'expected safe-mode rebase of a snapshot-bearing '
+                    f'overlay ({shape}) to be refused; stderr={stderr!r}')
+                self.assertIn(
+                    'the overlay has internal snapshots; a safe-mode '
+                    'rebase would corrupt them. Use -u for a '
+                    'metadata-only rebase or fall back to '
+                    '`qemu-img rebase`',
+                    stderr, f'unexpected stderr: {stderr!r}')
+                for p, digest in before.items():
+                    self.assertEqual(
+                        self.sha256(p), digest,
+                        f'a refused rebase must not touch {p.name}')
+
+    def test_unsafe_rebase_overlay_internal_snapshots_matches_qemu(self):
+        """`-u` rebase of a snapshot-bearing overlay matches qemu-img.
+
+        Metadata-only rebase rewrites only the header's
+        backing-pointer region, which is never snapshot-shared,
+        so it stays allowed. Twin overlays in one fixture dir
+        (shared backing pair), instar `-u` vs qemu-img `-u`:
+        exit codes agree, both results are check-clean and
+        info-equivalent, and snap1's virtual-view read-back is
+        IDENTICAL between the two results. The view legitimately
+        CHANGES from pre-rebase — unallocated snapshot ranges
+        now resolve through base_new — so the assertion is
+        instar-vs-qemu equality, not before/after equality.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            fixture = Path(td) / 'fixture'
+            self._build_bases(fixture)
+            overlay_i = self._build_overlay(
+                fixture, 'overlay_i.qcow2', post_snapshot_write=False)
+            overlay_q = self._build_overlay(
+                fixture, 'overlay_q.qcow2', post_snapshot_write=False)
+
+            _, stderr, rc = self.run_instar_rebase(
+                overlay_i, '-u', '-b', 'base_new.qcow2', '-F', 'qcow2',
+                timeout=120)
+            self.assertEqual(
+                rc, 0, f'instar rebase -u failed: stderr={stderr!r}')
+            self._run_tool(
+                ['qemu-img', 'rebase', '-u', '-b', 'base_new.qcow2',
+                 '-F', 'qcow2', overlay_q.name],
+                fixture)
+
+            for overlay in (overlay_i, overlay_q):
+                self._run_tool(
+                    ['qemu-img', 'check', overlay.name], fixture,
+                    timeout=120)
+
+            actual = self._run_tool(
+                ['qemu-img', 'info', '--output=json', str(overlay_i)],
+                fixture, timeout=30)
+            expected = self._run_tool(
+                ['qemu-img', 'info', '--output=json', str(overlay_q)],
+                fixture, timeout=30)
+            assert_info_equivalent(
+                self, actual.stdout, expected.stdout, 'qcow2',
+                tmp_path=str(overlay_i),
+                expected_tmp_path=str(overlay_q),
+                msg='-u rebase of snapshot-bearing overlay (qcow2)')
+
+            self.assertEqual(
+                self._snapshot_readback_sha256(
+                    fixture, overlay_i.name, 'snap1'),
+                self._snapshot_readback_sha256(
+                    fixture, overlay_q.name, 'snap1'),
+                'snap1 virtual view must change identically on the '
+                'instar and qemu-img sides')

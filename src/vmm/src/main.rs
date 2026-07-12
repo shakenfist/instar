@@ -6885,7 +6885,7 @@ fn render_rebase_success(
 
 /// Map a `RebaseResult::ERROR_*` code to a user-facing
 /// string. Exhaustive on the constants from
-/// `src/shared/src/lib.rs` (0..=13); the trailing catch-all
+/// `src/shared/src/lib.rs` (0..=14); the trailing catch-all
 /// covers future code additions only.
 fn map_rebase_error(code: u32) -> String {
     match code {
@@ -6938,6 +6938,12 @@ fn map_rebase_error(code: u32) -> String {
         }
         c if c == shared::RebaseResult::ERROR_INTERNAL_OVERFLOW => {
             "internal size or offset computation overflowed (host or guest bug)".into()
+        }
+        c if c == shared::RebaseResult::ERROR_OVERLAY_HAS_SNAPSHOTS => {
+            "the overlay has internal snapshots; a safe-mode rebase would \
+             corrupt them. Use -u for a metadata-only rebase or fall back \
+             to `qemu-img rebase`"
+                .into()
         }
         _ => format!("unknown rebase error code {code}"),
     }

@@ -434,6 +434,27 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
         );
     }
 
+    // Interim phase-2 gate (GitHub issue #421): refuse
+    // safe-mode rebase of an overlay with internal snapshots
+    // before any staging or writes. Safe mode writes new
+    // mappings into snapshot-shared L2 tables in place and sets
+    // refcount=1 on clusters that two L1 trees reference, so a
+    // routine `qemu-img snapshot -d` afterwards frees clusters
+    // the active view still maps — physical data loss. This
+    // runner is only entered without FLAG_UNSAFE (see
+    // `run_qcow2`), so the gate also covers safe detach; the
+    // `-u` metadata-only path only rewrites the header region,
+    // which is never snapshot-shared, and stays allowed. The
+    // real fix (snapshot-aware COW) lands in phase 7 of
+    // PLAN-qcow2-write-infrastructure.
+    if parsed.nb_snapshots > 0 {
+        return err_result(
+            config.overlay_format,
+            RebaseResult::MODE_SAFE,
+            RebaseResult::ERROR_OVERLAY_HAS_SNAPSHOTS,
+        );
+    }
+
     let cluster_size = parsed.cluster_size;
     if cluster_size == 0 || cluster_size > COMPARE_BUF_SIZE as u64 {
         return err_result(

@@ -3559,6 +3559,17 @@ impl RebaseResult {
     /// because the cause is a host or guest bug, not a
     /// malformed image.
     pub const ERROR_INTERNAL_OVERFLOW: u32 = 13;
+    /// The overlay has internal snapshots (`nb_snapshots > 0`)
+    /// and the rebase is safe-mode (no `-u`), including safe
+    /// detach. Safe mode mutates snapshot-shared L2 tables in
+    /// place and sets refcount=1 on clusters two L1 trees
+    /// reference, so a later `qemu-img snapshot -d` frees live
+    /// active-view data (GitHub issue #421). Refused as an
+    /// interim phase-2 gate; the real fix (snapshot-aware COW)
+    /// lands in phase 7 of `PLAN-qcow2-write-infrastructure`.
+    /// `-u` metadata-only rebase never touches snapshot-shared
+    /// clusters and stays allowed.
+    pub const ERROR_OVERLAY_HAS_SNAPSHOTS: u32 = 14;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -4921,9 +4932,9 @@ mod tests {
 
     #[test]
     fn rebase_result_error_codes_distinct() {
-        // Phase 3 added codes 7..=13. Confirm every code is
-        // distinct so the host's match arms don't accidentally
-        // alias.
+        // Phase 3 added codes 7..=13; the phase-2 snapshot gate
+        // (issue #421) added 14. Confirm every code is distinct
+        // so the host's match arms don't accidentally alias.
         let codes = [
             RebaseResult::ERROR_OK,
             RebaseResult::ERROR_UNSUPPORTED_FORMAT,
@@ -4939,13 +4950,14 @@ mod tests {
             RebaseResult::ERROR_DESCRIPTOR_TOO_LARGE,
             RebaseResult::ERROR_PARSE_FAILED,
             RebaseResult::ERROR_INTERNAL_OVERFLOW,
+            RebaseResult::ERROR_OVERLAY_HAS_SNAPSHOTS,
         ];
         for i in 0..codes.len() {
             for j in (i + 1)..codes.len() {
                 assert_ne!(codes[i], codes[j], "codes {i} and {j} alias");
             }
         }
-        // Confirm contiguous 0..=13 numbering.
+        // Confirm contiguous 0..=14 numbering.
         for (i, c) in codes.iter().enumerate() {
             assert_eq!(*c, i as u32);
         }
