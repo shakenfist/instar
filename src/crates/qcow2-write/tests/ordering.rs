@@ -155,9 +155,31 @@ fn mk_image(
 ) -> (SimImage, WriteState) {
     let cs = 1usize << cluster_bits;
     let l2_coverage = (cs as u64 / 8) * cs as u64;
+    mk_image_vs(
+        cluster_bits,
+        l2_slots,
+        rb_count,
+        backing,
+        device,
+        L1_TABLES as u64 * l2_coverage,
+    )
+}
+
+/// [`mk_image`] with an explicit `virtual_size` (still
+/// `L1_TABLES` L1 entries): the EOV-tail scenarios need unaligned
+/// sizes (the phase-4 plan's amended decision 7).
+fn mk_image_vs(
+    cluster_bits: u32,
+    l2_slots: usize,
+    rb_count: usize,
+    backing: bool,
+    device: TargetDevice,
+    virtual_size: u64,
+) -> (SimImage, WriteState) {
+    let cs = 1usize << cluster_bits;
     let hdr = parse(&header_bytes(
         cluster_bits,
-        L1_TABLES as u64 * l2_coverage,
+        virtual_size,
         L1_TABLES,
         backing,
     ));
@@ -1503,6 +1525,93 @@ fn invariant_helpers_reject_violations() {
         Phase::Flush,
     )];
     assert!(panics(|| assert_flush_barrier_skeleton(&prog, &[(0, 1)])));
+}
+
+/// The amended-decision-7 EOV-tail shape (phase-4 plan / D9): on
+/// an unaligned virtual size, a tail write covering
+/// [cluster base, virtual_size) is a full-coverage allocating
+/// write on backed and backing-less images alike. The invariant
+/// helpers must hold over programs containing the shape — 7(a)'s
+/// coverage check in particular must see the body write plus the
+/// beyond-EOV ZeroRange as together covering the whole physical
+/// cluster — and window-invariance must keep holding (the new
+/// path is a classification outcome, not a window boundary).
+#[test]
+fn ordering_eov_tail_unaligned_virtual_size() {
+    let cluster_bits = 12u32;
+    let cs = 1u64 << cluster_bits;
+    let l2_cov = (cs / 8) * cs;
+    let tail_len = cs / 2 + 36;
+    let vs = l2_cov + 2 * cs + tail_len; // tail cluster lives in L1 table 1
+    let tail_base = vs - tail_len;
+    for backing in [false, true] {
+        let run = |cap: usize| {
+            let (img, st) = mk_image_vs(cluster_bits, 2, 1, backing, TargetDevice::Input0, vs);
+            let mut h = Harness::new(img, st, cap);
+            // Full-cluster allocating writes (safe on backed
+            // images) either side of the L1 boundary...
+            h.write(0, cs, DataSource::CallerData { offset: 0 })
+                .expect("full-cluster allocating write");
+            h.write(l2_cov, cs, DataSource::Fill { byte: 0x2c })
+                .expect("full-cluster allocating write, table 1");
+            // ...the EOV-tail write itself...
+            h.write(tail_base, tail_len, DataSource::CallerData { offset: 3 })
+                .expect("EOV-tail write must classify as full coverage");
+            // ...and an owned partial overwrite of the tail
+            // cluster afterwards (allowed on backed images too).
+            h.write(tail_base + 5, 9, DataSource::Fill { byte: 0x77 })
+                .expect("owned tail overwrite");
+            h.flush().expect("flush");
+            let fc = final_content(&h.img);
+            (h, fc)
+        };
+        let (h_ref, fc_ref) = run(1024);
+        assert_ordering_contract(&h_ref);
+        // The program contains the EOV-tail shape: a ZeroRange
+        // from the EOV offset to the physical cluster end.
+        assert!(
+            h_ref
+                .program
+                .iter()
+                .any(|t| t.step.kind == StepKind::ZeroRange
+                    && t.step.len == cs - tail_len
+                    && t.step.disk_offset % cs == tail_len),
+            "beyond-EOV ZeroRange missing (backing {backing})"
+        );
+        for &cap in &INVARIANCE_CAPS {
+            let (h, fc) = run(cap);
+            assert_eq!(
+                h.steps(),
+                h_ref.steps(),
+                "window invariance violated at cap {cap} (backing {backing})"
+            );
+            assert!(
+                fc == fc_ref,
+                "final disk/staging content diverged at cap {cap} (backing {backing})"
+            );
+        }
+    }
+    // Genuinely partial below-EOV tail writes on a BACKED image
+    // still refuse, emitting nothing for the refused cluster
+    // beyond the fresh-L2 scaffolding group.
+    let (img, st) = mk_image_vs(cluster_bits, 2, 1, true, TargetDevice::Input0, vs);
+    let mut h = Harness::new(img, st, 1024);
+    let err = h
+        .write(
+            tail_base,
+            tail_len - 1,
+            DataSource::CallerData { offset: 0 },
+        )
+        .expect_err("coverage below EOV must refuse");
+    assert_eq!(err, WriteError::NeedsBackingFill);
+    let err = h
+        .write(
+            tail_base + 4,
+            tail_len - 4,
+            DataSource::CallerData { offset: 0 },
+        )
+        .expect_err("head gap below EOV must refuse");
+    assert_eq!(err, WriteError::NeedsBackingFill);
 }
 
 #[test]

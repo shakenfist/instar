@@ -1268,6 +1268,125 @@ fn sim_multi_epoch_mixed_c4k() {
     );
 }
 
+/// Unaligned virtual size (the phase-4 plan's amended decision
+/// 7 / D9), backing-less: the EOV-tail write — from the tail
+/// cluster's base up to exactly `virtual_size` — allocates the
+/// full cluster with a beyond-EOV zero-fill. The reference model
+/// treats beyond-EOV bytes as outside virtual content (all
+/// content comparisons run over `virtual_size` bytes), the
+/// consistency walk still sees the full allocated tail cluster,
+/// and the per-barrier crash pass runs unchanged over the new
+/// shape.
+#[test]
+fn sim_unaligned_virtual_size_eov_tail() {
+    for (cluster_bits, base) in [(9u32, 32u64 << 10), (12, 1u64 << 20)] {
+        let cs = 1u64 << cluster_bits;
+        let vsize = base + cs / 2 + 24; // unaligned tail cluster
+        let tail_base = (vsize / cs) * cs;
+        let tail_len = vsize - tail_base;
+        let epochs = vec![vec![
+            Wr {
+                voff: 0,
+                len: cs,
+                src: Src::Data(71),
+            },
+            Wr {
+                voff: 5,
+                len: 9,
+                src: Src::Data(72), // owned sub-range overwrite
+            },
+            Wr {
+                voff: 2 * cs + 7,
+                len: 11,
+                src: Src::Data(73), // fresh sub-cluster RMW below EOV
+            },
+            Wr {
+                voff: tail_base,
+                len: tail_len,
+                src: Src::Data(74), // the EOV-tail shape
+            },
+        ]];
+        let barriers = run_scenario(cluster_bits, vsize, &epochs);
+        eprintln!("unaligned-eov cs={cs} vsize={vsize}: {barriers} barrier truncation points");
+        assert!(barriers >= 1, "the flush must contribute a barrier");
+    }
+}
+
+/// Unaligned virtual size on a BACKED image: the EOV-tail write
+/// is full coverage (amended decision 7 — bytes beyond EOV are
+/// not virtual content, so the zero-fill is the correct
+/// pre-image), while every genuinely partial write below EOV
+/// keeps the NeedsBackingFill refusal; the mutated image stays
+/// consistent through flush and the crash pass.
+#[test]
+fn sim_backed_unaligned_eov_tail() {
+    let cs = 1u64 << 12;
+    let tail_base = 1u64 << 20;
+    let vsize = tail_base + cs / 2 + 24;
+    let tail_len = vsize - tail_base;
+    let (initial_disk, hdr) = build_image(12, vsize, Some(b"base.qcow2"));
+    let mut sim = Sim::new(&hdr, initial_disk.clone());
+    let mut st = new_state(&hdr, &staging_config()).expect("backed image passes the envelope");
+    let mut model = RefModel::new(vsize);
+    let mut epoch_models: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+    // Genuinely partial below-EOV tail writes refuse: coverage
+    // ending below EOV, and a head gap below EOV.
+    sim.set_caller(&vec![7u8; tail_len as usize]);
+    let (err, _) = run_write(
+        &mut sim,
+        &mut st,
+        tail_base,
+        tail_len - 1,
+        DataSource::CallerData { offset: 0 },
+    )
+    .expect_err("coverage below EOV on a backed image must refuse");
+    assert_eq!(err, WriteError::NeedsBackingFill);
+    let (err, _) = run_write(
+        &mut sim,
+        &mut st,
+        tail_base + 4,
+        tail_len - 4,
+        DataSource::CallerData { offset: 0 },
+    )
+    .expect_err("head gap below EOV on a backed image must refuse");
+    assert_eq!(err, WriteError::NeedsBackingFill);
+
+    // The EOV-tail write and a full-cluster allocating write
+    // both succeed.
+    let old = model.materialise();
+    apply_write(
+        &mut sim,
+        &mut st,
+        &mut model,
+        &Wr {
+            voff: cs,
+            len: cs,
+            src: Src::Data(81),
+        },
+    );
+    apply_write(
+        &mut sim,
+        &mut st,
+        &mut model,
+        &Wr {
+            voff: tail_base,
+            len: tail_len,
+            src: Src::Data(82),
+        },
+    );
+    let new = model.materialise();
+    run_flush_ok(&mut sim, &mut st);
+    epoch_models.push((old, new));
+
+    // Note read_virtual is overlay-local; with only full-coverage
+    // allocated content the model comparison stays exact.
+    assert_virtual_content_matches_model(&sim.disks[DEV_IN0], &model);
+    full_consistency_walk(&sim.disks[DEV_IN0], initial_disk.len());
+    let barriers = crash_consistency_scan(&sim, &initial_disk, &epoch_models);
+    assert!(barriers >= 1, "the flush must contribute a barrier");
+}
+
 /// The documented backed-image refusal: partial allocating
 /// writes on an image with a backing file refuse as
 /// NeedsBackingFill (v1's zero-fill would mask backing content);

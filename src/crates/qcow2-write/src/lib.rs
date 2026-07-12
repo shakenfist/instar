@@ -736,7 +736,19 @@ pub enum WriteError {
     /// cannot perform. v1 fills uncovered remainders with zeros,
     /// which is only correct without a backing file; callers
     /// with backing chains pass full clusters (phase 6) until
-    /// phase 7's COW machinery absorbs the fill. Code 14.
+    /// phase 7's COW machinery absorbs the fill.
+    ///
+    /// Coverage is judged against the EFFECTIVE cluster end,
+    /// `min(cluster_size, virtual_size - cluster_virtual_base)`:
+    /// on the final (tail) cluster of an unaligned virtual size,
+    /// a write starting at the cluster base whose coverage
+    /// reaches `virtual_size` is full coverage — bytes beyond
+    /// EOV are not virtual content, so the crate's beyond-EOV
+    /// zero-fill is the correct pre-image regardless of backing
+    /// (`PLAN-qcow2-write-infrastructure-phase-04-commit.md`,
+    /// amended decision 7 / divergence D9). Every genuinely
+    /// partial write below EOV — including a head gap below EOV
+    /// on the tail cluster — keeps this refusal. Code 14.
     NeedsBackingFill,
 }
 
@@ -1574,10 +1586,27 @@ fn drive_write(
                             break 'cluster;
                         }
                         Classified::Unallocated => {
-                            if state.has_backing && (in_off != 0 || win_len != cs) {
-                                // v1 fills uncovered remainders
-                                // with zeros — only correct
-                                // without a backing chain (see
+                            // Effective cluster end for coverage
+                            // classification: the physical cluster
+                            // end, clamped to `virtual_size` on
+                            // the final (tail) cluster of an
+                            // unaligned image. A write from
+                            // in_off == 0 whose coverage reaches
+                            // it is FULL coverage — bytes beyond
+                            // EOV are not virtual content, so the
+                            // beyond-EOV zero-fill is the correct
+                            // pre-image regardless of backing
+                            // (phase-4 plan, amended decision 7 /
+                            // divergence D9). A head gap below
+                            // EOV on a backed image still
+                            // refuses: its pre-image is backing
+                            // content.
+                            let eff_end = cs.min(geo.virtual_size - (cur - in_off));
+                            if state.has_backing && (in_off != 0 || in_off + win_len < eff_end) {
+                                // v1 fills uncovered below-EOV
+                                // remainders with zeros — only
+                                // correct without a backing chain
+                                // (see
                                 // WriteError::NeedsBackingFill).
                                 return Err(WriteError::NeedsBackingFill);
                             }
@@ -1755,6 +1784,7 @@ fn drive_flush(
 /// | L2 entry state | verdict |
 /// |----------------|---------|
 /// | zero | allocate a data cluster (fresh L2 first when the L1 slot is empty); zero-fill the uncovered head/tail; write the data; patch the entry `host \| COPIED` |
+/// | zero, backing file present, coverage partial below the effective cluster end | [`WriteError::NeedsBackingFill`] |
 /// | `OFLAG_COMPRESSED` set | [`WriteError::CompressedCluster`] |
 /// | v3 zero flag / reserved bits / flags-only / misaligned | [`WriteError::UnknownL2Entry`] |
 /// | allocated, `OFLAG_COPIED` clear | [`WriteError::SnapshotShared`] |
@@ -1777,8 +1807,18 @@ fn drive_flush(
 /// the virtual pre-image of an unallocated cluster in a
 /// backing-less image; images WITH a backing file refuse partial
 /// allocating writes as [`WriteError::NeedsBackingFill`] rather
-/// than corrupt the read-through content (full-cluster writes
-/// are unaffected — the pre-image is fully overwritten).
+/// than corrupt the read-through content. The refusal condition
+/// is: backing file present AND (the write does not start at the
+/// cluster base OR its coverage ends below the EFFECTIVE cluster
+/// end `min(cluster_size, virtual_size - cluster_virtual_base)`).
+/// Full-cluster writes are therefore unaffected (the pre-image is
+/// fully overwritten), and on the final (tail) cluster of an
+/// unaligned virtual size a write from the cluster base covering
+/// up to `virtual_size` classifies as full coverage too — bytes
+/// beyond EOV are not virtual content, so the emitted beyond-EOV
+/// [`StepKind::ZeroRange`] is the correct pre-image regardless of
+/// backing (`PLAN-qcow2-write-infrastructure-phase-04-commit.md`,
+/// amended decision 7 / divergence D9).
 ///
 /// Windowing (decision 1): on [`WriteError::BufFull`] — which
 /// also signals the decision-5 load boundary, see
@@ -2347,9 +2387,22 @@ mod tests {
     fn mk(cluster_bits: u32, l2_slots: usize, backing: bool) -> (TestImg, WriteState) {
         let cs = 1usize << cluster_bits;
         let l2_coverage = (cs as u64 / 8) * cs as u64;
+        mk_vs(cluster_bits, l2_slots, backing, 4 * l2_coverage)
+    }
+
+    /// [`mk`] with an explicit `virtual_size` (still `l1_size` =
+    /// 4): the EOV-tail tests need unaligned sizes (the phase-4
+    /// plan's amended decision 7).
+    fn mk_vs(
+        cluster_bits: u32,
+        l2_slots: usize,
+        backing: bool,
+        virtual_size: u64,
+    ) -> (TestImg, WriteState) {
+        let cs = 1usize << cluster_bits;
         let hdr = parse(&build_header(
             cluster_bits,
-            4 * l2_coverage,
+            virtual_size,
             4,
             if backing { 200 } else { 0 },
         ));
@@ -2762,6 +2815,163 @@ mod tests {
         // Partial write into an OWNED cluster: fine (no fill).
         let steps = run_write_ok(&mut img, &mut st, 100, 50, caller_data(), 128);
         assert_eq!(kinds(&steps), vec![StepKind::WriteRange]);
+    }
+
+    // ---------------- EOV tail cluster (amended decision 7 / D9) ----------------
+
+    #[test]
+    fn eov_tail_write_classifies_full_coverage() {
+        // Phase-4 plan, amended decision 7: on the final (tail)
+        // cluster of an unaligned virtual size, a partial
+        // allocating write from the cluster base whose coverage
+        // reaches virtual_size classifies as FULL coverage on
+        // backed and backing-less images alike, and the crate
+        // zero-fills the beyond-EOV remainder to the physical
+        // cluster end.
+        for backed in [false, true] {
+            for cluster_bits in [9u32, 16] {
+                let cs = 1u64 << cluster_bits;
+                let tail_len = cs / 2 + 24; // unaligned EOV inside the tail cluster
+                let vs = 3 * cs + tail_len;
+                let (mut img, mut st) = mk_vs(cluster_bits, 2, backed, vs);
+                let steps = run_write_ok(&mut img, &mut st, 3 * cs, tail_len, caller_data(), 64);
+                assert_eq!(
+                    kinds(&steps),
+                    vec![
+                        StepKind::ZeroRegion,
+                        StepKind::PatchEntryU64, // L1 -> fresh L2 (cluster 4)
+                        StepKind::WriteRange,    // body [0, tail_len)
+                        StepKind::ZeroRange,     // beyond-EOV remainder
+                        StepKind::PatchEntryU64, // L2 entry -> cluster 5
+                    ],
+                    "backed {backed} cb {cluster_bits}"
+                );
+                assert_eq!(steps[2].disk_offset, 5 * cs);
+                assert_eq!(steps[2].len, tail_len);
+                assert_eq!(steps[3].disk_offset, 5 * cs + tail_len);
+                assert_eq!(steps[3].len, cs - tail_len);
+                assert_eq!(steps[4].region_offset, 3 * 8); // l2_idx 3
+                assert_eq!(steps[4].value, 5 * cs | OFLAG_COPIED);
+                // Executed content: data, then zeros to the
+                // physical cluster end (sentinel disproves a
+                // missed beyond-EOV fill).
+                let d = 5 * img.cs;
+                let t = tail_len as usize;
+                assert_eq!(&img.disk[d..d + t], &img.caller[..t]);
+                assert!(
+                    img.disk[d + t..d + img.cs].iter().all(|&b| b == 0),
+                    "backed {backed} cb {cluster_bits}: beyond-EOV tail must be zero-filled"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn eov_tail_refusal_boundaries_on_backed_image() {
+        // The amended-decision-7 rule only exempts the beyond-EOV
+        // remainder: every genuinely partial write below EOV on a
+        // backed image keeps the NeedsBackingFill refusal.
+        for cluster_bits in [9u32, 16] {
+            let cs = 1u64 << cluster_bits;
+            let tail_len = cs / 2 + 24;
+            let vs = 3 * cs + tail_len;
+            let (mut img, mut st) = mk_vs(cluster_bits, 2, true, vs);
+            add_allocated_cluster(&mut img, 0, OFLAG_COPIED, OFLAG_COPIED);
+            // (a) in_off > 0 with coverage to EOV: the head
+            // [0, in_off) is below-EOV backing content — refuse.
+            assert_eq!(
+                run_write_err(&mut img, &mut st, 3 * cs + 8, tail_len - 8, caller_data()),
+                WriteError::NeedsBackingFill,
+                "cb {cluster_bits}: head gap below EOV must refuse"
+            );
+            // (b) in_off == 0 but coverage ends one byte below
+            // EOV: genuinely partial — refuse.
+            assert_eq!(
+                run_write_err(&mut img, &mut st, 3 * cs, tail_len - 1, caller_data()),
+                WriteError::NeedsBackingFill,
+                "cb {cluster_bits}: coverage below EOV must refuse"
+            );
+            // (c) genuinely partial below-EOV write on a
+            // non-tail cluster: unchanged refusal.
+            assert_eq!(
+                run_write_err(&mut img, &mut st, cs, 8, caller_data()),
+                WriteError::NeedsBackingFill,
+                "cb {cluster_bits}: mid-image partial must refuse"
+            );
+            // (d) full-cluster allocating write on a non-tail
+            // cluster of the same image: fine.
+            let steps = run_write_ok(&mut img, &mut st, cs, cs, caller_data(), 64);
+            assert_eq!(
+                kinds(&steps),
+                vec![StepKind::WriteRange, StepKind::PatchEntryU64],
+                "cb {cluster_bits}"
+            );
+        }
+    }
+
+    #[test]
+    fn eov_tail_aligned_virtual_size_keeps_full_cluster_rule() {
+        // On a cluster-aligned virtual size the effective cluster
+        // end equals the physical end everywhere: the final
+        // cluster gets no exemption.
+        let (mut img, mut st) = mk(16, 2, true);
+        let cs = img.cs as u64;
+        let vs = st.geometry().virtual_size;
+        assert!(vs.is_multiple_of(cs));
+        // One byte short of the aligned EOV: still partial.
+        assert_eq!(
+            run_write_err(&mut img, &mut st, vs - cs, cs - 1, caller_data()),
+            WriteError::NeedsBackingFill
+        );
+        // The full final cluster: fine.
+        run_write_ok(&mut img, &mut st, vs - cs, cs, caller_data(), 64);
+    }
+
+    #[test]
+    fn eov_tail_backing_less_head_gap_zero_fills() {
+        // Backing-less images are untouched by the amendment:
+        // a tail-cluster write with a head gap still succeeds
+        // with head + beyond-EOV zero-fills.
+        let cs = 512u64;
+        let (mut img, mut st) = mk_vs(9, 2, false, 3 * cs + 200);
+        let steps = run_write_ok(&mut img, &mut st, 3 * cs + 40, 160, caller_data(), 64);
+        assert_eq!(
+            kinds(&steps),
+            vec![
+                StepKind::ZeroRegion,
+                StepKind::PatchEntryU64, // L1 -> fresh L2
+                StepKind::ZeroRange,     // head [0, 40)
+                StepKind::WriteRange,    // body [40, 200)
+                StepKind::ZeroRange,     // tail [200, 512) — beyond EOV
+                StepKind::PatchEntryU64, // L2 entry
+            ]
+        );
+        assert_eq!(steps[2].len, 40);
+        assert_eq!(steps[3].len, 160);
+        assert_eq!(steps[4].disk_offset, 5 * cs + 200);
+        assert_eq!(steps[4].len, cs - 200);
+    }
+
+    #[test]
+    fn out_of_bounds_still_fires_past_unaligned_eov() {
+        // The tail rule reinterprets coverage WITHIN the final
+        // cluster; it admits nothing past virtual_size.
+        for backed in [false, true] {
+            let cs = 1u64 << 12;
+            let tail_len = 100u64;
+            let vs = 3 * cs + tail_len;
+            let (mut img, mut st) = mk_vs(12, 2, backed, vs);
+            for (voff, len) in [(vs, 1u64), (3 * cs, tail_len + 1), (vs - 1, 2)] {
+                assert_eq!(
+                    run_write_err(&mut img, &mut st, voff, len, caller_data()),
+                    WriteError::OutOfBounds,
+                    "backed {backed} voff {voff} len {len}"
+                );
+            }
+            // The exact EOV end is admitted (and, from the
+            // cluster base, plans cleanly on both).
+            run_write_ok(&mut img, &mut st, 3 * cs, tail_len, caller_data(), 64);
+        }
     }
 
     #[test]
