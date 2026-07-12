@@ -1471,7 +1471,9 @@ per-cluster loop masked the compressed entry's offset and
 overwrote it in place, destroying the deflate streams of
 every virtual cluster packed into that host cluster —
 exit 0, `qemu-img check` clean, damage visible only on
-read-back (identified during phase 4 of
+read-back (issue
+[#427](https://github.com/shakenfist/instar/issues/427),
+identified during phase 4 of
 PLAN-qcow2-write-infrastructure). qemu-img handles the
 same shape correctly: it allocates a fresh uncompressed
 cluster and leaves the other packed streams intact. The
@@ -1499,8 +1501,10 @@ below still-populated ones) and passes `qemu-img check`
 cleanly, and before phase 4 instar's staging compacted the
 nonzero table entries and indexed them as if dense —
 silently writing refcounts into the wrong refblocks (2654
-check errors in the probe that found it; identified during
-phase 4 of PLAN-qcow2-write-infrastructure). qemu-img
+check errors in the probe that found it; issue
+[#428](https://github.com/shakenfist/instar/issues/428),
+identified during phase 4 of
+PLAN-qcow2-write-infrastructure). qemu-img
 commits into the same shape check-clean. The sparse-table
 refusal fires at staging time, before any mutation; the
 other error-17 shapes are classification refusals with the

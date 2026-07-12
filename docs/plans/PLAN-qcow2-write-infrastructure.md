@@ -822,10 +822,11 @@ commit's compact-then-index-as-dense staging then wrote
 refcounts into the wrong refblocks (2654 check errors / 69
 leaked clusters in the probe). The migrated op stages
 refblocks dense-prefix and gates on RT contiguity: wire 17,
-pre-mutation, byte-idempotent. Issue drafts for both sit in
-the session scratchpad pending the user's filing decision —
-the user docs say "identified during phase 4" and cite no
-issue numbers until that decision lands.
+pre-mutation, byte-idempotent. Filed 2026-07-13 as
+[#427](https://github.com/shakenfist/instar/issues/427)
+(compressed backings) and
+[#428](https://github.com/shakenfist/instar/issues/428)
+(holed refcount tables).
 
 **Executor facts phases 5-6 reuse.** `qcow2-write-exec` is a
 literal interpreter of the `StepKind` doc contracts with zero
@@ -1001,15 +1002,16 @@ recipes in the Findings sections; #420-#422 filed 2026-07-12):
    the backing (found by phase 4p; check-clean, exit 0, every
    stream packed in the shared host cluster lost). **Refused
    since the phase-4 migration (7dff544,
-   `ERROR_UNSUPPORTED_FORMAT`)**; issue draft pending the
-   user's filing decision. Real support (decompress-and-
+   `ERROR_UNSUPPORTED_FORMAT`)**; filed 2026-07-13 as
+   [#427](https://github.com/shakenfist/instar/issues/427).
+   Real support (decompress-and-
    reallocate, qemu's behaviour) is possible phase 7+ work.
 6. `instar commit` corrupted refcounts on backings with a
    sparse (holed) refcount table — stock-producible and
    check-clean (found by phase 4p, upgrading divergence D4 to
    a live defect). **Refused since the phase-4 migration
-   (7dff544, error 17, pre-mutation)**; issue draft pending
-   the user's filing decision.
+   (7dff544, error 17, pre-mutation)**; filed 2026-07-13 as
+   [#428](https://github.com/shakenfist/instar/issues/428).
 
 Fix status is tracked here as phases land.
 
