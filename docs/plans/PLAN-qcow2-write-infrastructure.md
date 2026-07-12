@@ -290,7 +290,7 @@ Design sketch (to be settled in phase planning, not binding):
 |-------|------|--------|
 | 1. Semantics pin: qemu snapshot-bearing commit/rebase behaviour, COW order determinism, oracle inventory, memory budget survey | PLAN-qcow2-write-infrastructure-phase-01-semantics.md | Complete (2026-07-12; see Findings) |
 | 2. Interim safety gates + defect handling — LIVE: commit snapshot corruption (#420), rebase snapshot corruption + data-loss chain (#421), rebase 512-byte-cluster livelock (#422; fix or gate per root-cause depth) | PLAN-qcow2-write-infrastructure-phase-02-gates.md | Complete (2026-07-12; commits ac8f60a / 2fb9af4 / c84743e; see Findings) |
-| 3. `crates/qcow2-write` core: classification + allocate-on-write planner + ordering contract (no COW, no growth), unit tests + simulation harness | PLAN-qcow2-write-infrastructure-phase-03-crate.md | Planned (2026-07-12), not started |
+| 3. `crates/qcow2-write` core: classification + allocate-on-write planner + ordering contract (no COW, no growth), unit tests + simulation harness | PLAN-qcow2-write-infrastructure-phase-03-crate.md | Complete (2026-07-12; commits 878ebf0 / bc322b2 / 19ba116 / d883b25; see Findings) |
 | 4. Migrate commit onto the crate (byte-identical proof) | PLAN-qcow2-write-infrastructure-phase-04-commit.md | Not started |
 | 5. Migrate rebase safe mode (byte-identical proof) | PLAN-qcow2-write-infrastructure-phase-05-rebase.md | Not started |
 | 6. Migrate bench `-w`; move the refcount-growth planner into the shared crate | PLAN-qcow2-write-infrastructure-phase-06-bench.md | Not started |
@@ -300,7 +300,7 @@ Design sketch (to be settled in phase planning, not binding):
 
 Phase 2 was conditional on phase 1 confirming a live defect;
 phase 1 confirmed three (see the Findings defect register), so
-phase 2 is live and its plan file is the next to write.
+phase 2 ran. Phase 4's plan file is the next to write.
 
 One commit per phase minimum; each commit builds, lints and tests
 clean on its own. Phases 4-6 are pure refactors from the outside:
@@ -675,6 +675,99 @@ finding; folded into phase 3's ordering contract (no image
 mutation before the envelope checks pass). (2) Refblock growth
 capacity for rebase/commit: mission item 3 / Future work, not
 phase 2's scope.
+
+### Findings: phase 3 crate implementation (2026-07-12)
+
+Executed per
+[PLAN-qcow2-write-infrastructure-phase-03-crate.md](PLAN-qcow2-write-infrastructure-phase-03-crate.md)
+as steps 3a (crate skeleton, types and gates, 878ebf0), 3b
+(plan_write / plan_flush, bc322b2), 3c (ordering-contract
+property suite, 19ba116), 3d (SimDisk simulation harness,
+d883b25) and 3e (this close-out). The settled decisions held;
+what follows records the refinements and deviations the later
+phases need to know.
+
+**3a — two gates beyond decision 8's literal list.**
+`Gate::UnknownIncompatible` (code 2) refuses the zstd
+compression bit and any unknown incompatible bit, matching
+bench's proven wgate posture — per-cluster zlib compression
+carries no header bit, so compressed clusters are refused at
+plan time by classification (`WriteError::CompressedCluster`)
+rather than by the header gate. `Gate::InvalidStagingConfig`
+(code 9) refuses out-of-range caller staging shapes through the
+same channel. Gate codes 1-7 deliberately equal bench's wgate
+constants so the phase-6 migration maps refusals one-to-one;
+codes 8-9 are new to the crate.
+
+**3b — API refinements the phase plan anticipated.**
+`StagedRegions` is the concrete form of the API sketch's
+`staged` parameter: each planning call borrows a per-call view
+of the executor's staged L1 / L2-window / refcount-table /
+refblock buffers, and only `refblocks` is mutable — the planner
+mutates staged refcounts in place at plan time (decision 6),
+while L1/L2 mutations remain `PatchEntryU64` steps so the
+ordering suite checks them as data. `BufFull` doubles as the
+decision-5 load boundary: `plan_write` returns it
+unconditionally after emitting a `LoadCluster`, because the
+slot's bytes exist only after the executor runs the load — this
+is how a pure planner "reads disk". Hard contract for the
+phase 4-6 executors: every emitted window MUST be executed
+before the next planner call, or classification reads stale
+staged bytes. `StepKind` gained `FillRange` (lowers
+`DataSource::Fill` so bench-style patterned writes never bounce
+through a staged buffer) and `ZeroRegion` (fresh-L2 slot init).
+`WriteError` carries stable codes 1-14 for host rendering.
+
+**3b — refusals sharper than today's ops.** `NeedsBackingFill`
+(code 14): a partial allocating write on an image with a
+backing file refuses in v1, because zero-filling the uncovered
+remainder would mask backing read-through and the pure planner
+cannot perform a chain read. commit and rebase write full
+clusters, so their migrations are unaffected; bench's overlay
+chain-fill stays a phase-6 caller responsibility until phase-7
+COW absorbs the fill. Unknown/reserved L1/L2 bit patterns
+refuse (`UnknownL1Entry` / `UnknownL2Entry`) — narrower than
+today's ops, which blindly allocate over exotic entries;
+affects only corrupt images.
+
+**3b — snapshot-crate reuse (decision 10).** The primitives
+actually used are `alloc_cluster_in_refblocks`,
+`read_refcount_in_block` and `AllocCursor`;
+`check_refcount_after_addend` and the COPIED-rewrite helpers
+the decision listed have no v1 call site (nothing rewrites
+COPIED flags until phase-7 COW).
+
+**3c — what was proven, and what could not be.**
+Window-invariance — the property the windowed design rests on —
+is proven byte-identical (step sequences AND final content) at
+buffer capacities {1, 2, 3, 4, 5, 7, 16} against a 1024-step
+reference across a 192-run grid: cluster sizes 512/4K/64K × L2
+slot counts {1, 2, 3, 256} × 2 seeded write sets × 2 flush
+epochs. A negative-control test feeds six hand-built violating
+programs through the invariant checkers and asserts each
+panics, so the suite cannot pass vacuously. Recorded as not
+mechanically expressible (asserted at the planner boundary
+only): the executor-side Durability→Ordering degradation on
+fsync-less devices, and an API-stated disk-size bound (the
+staged-refblock host coverage is used as the ceiling).
+
+**3d — simulation grid and one inherent limit.** A 22-test grid
+(cluster sizes 512/4K/64K/2M × image sizes × write patterns,
+plus a multi-epoch mixed scenario and the backed-image refusal)
+executes emitted programs literally against Vec-backed
+per-device disks and journals every disk mutation epoch-tagged
+with the count of preceding barriers — which keeps truncation
+semantics correct under decision 6, since staged refblocks
+mutate at plan time but their bytes reach the journal only when
+the flush writeback executes. The journal is replayed truncated
+at every Durability barrier (176 truncation points across the
+suite; all barriers exercised), each truncation point proven
+structurally sound and byte-wise old-or-new for its epoch.
+Recorded harness limit, inherent to decision 7(c) rather than a
+gap: reachable-with-refcount-0 is the legitimate on-disk state
+at truncation points between the pointer and refblock
+writebacks, so full refcount walks run only on completed epochs
+— phase-8 crash oracles must expect the same.
 
 ## Administration and logistics
 

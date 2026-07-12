@@ -32,6 +32,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **New `crates/qcow2-write` planner crate
+  (PLAN-qcow2-write-infrastructure phase 3).** A pure `no_std`
+  windowed step-program planner for "write N bytes at virtual offset
+  X into an existing qcow2, allocating as needed": per-cluster
+  classification (owned in-place overwrite / fresh allocation with
+  sub-cluster zero-fill / typed refusals for compressed,
+  snapshot-shared and unknown-bit-pattern shapes), L2 and
+  data-cluster allocation, refcount maintenance in a single staged
+  refblock copy, the unified v1 envelope gates, and the crash-safe
+  write-ordering contract emitted as typed steps with explicit
+  Ordering/Durability barriers. Internal infrastructure only — no
+  operation consumes it yet, so there is no CLI-visible behaviour
+  change: subsequent phases migrate commit, rebase safe mode and
+  bench `-w` onto it and then add copy-on-write. Proven by 45 unit
+  tests, an ordering-contract property suite (window-invariance from
+  a 1-step buffer up, mechanical checks of the full ordering contract
+  over emitted programs), and a simulation harness that executes
+  emitted step programs against model disks and replays them
+  truncated at every Durability barrier. See
+  [docs/plans/PLAN-qcow2-write-infrastructure.md](docs/plans/PLAN-qcow2-write-infrastructure.md).
+
 - **bench `-w` on qcow2 grows the refcount structures
   (PLAN-bench-refcount-growth phases 1-4).** Setup now computes the
   schedule's worst-case allocation bound and grows the refcount

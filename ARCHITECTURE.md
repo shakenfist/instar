@@ -238,6 +238,45 @@ provides a modular architecture with:
   back-compat re-export remains in this crate. Consumed by the
   `measure` operation in `src/operations/measure/` and by the
   size-estimation helpers shared with `create` and `resize`.
+- **crates/qcow2-write/** - Shared qcow2 write-planner crate (`no_std`,
+  no I/O, no guest addresses): the windowed step-program planner for
+  "write N bytes at virtual offset X into an existing qcow2, allocating
+  as needed" (PLAN-qcow2-write-infrastructure phase 3). `plan_write`
+  classifies each touched cluster from staged metadata (owned in-place
+  overwrite with zero metadata churn / fresh allocation with
+  sub-cluster zero-fill, including a fresh L2 table when the L1 slot is
+  empty / typed refusals for compressed, snapshot-shared,
+  unknown-bit-pattern and backing-fill shapes) and emits typed `Step`s
+  (`#[repr(C)]`, const-asserted at 48 bytes or less) into a
+  caller-provided `StepBuf`; the executor runs each window literally
+  and resumes on `BufFull`, which doubles as the staged-L2 window's
+  load boundary (the planner emits `LoadCluster` and closes the window,
+  because the slot's bytes exist only after execution). Steps are
+  address-free — staged buffers are named by `RegionId` + offset and
+  devices by `TargetDevice` (`Input0`/`Output`) — and each planning
+  call borrows a `StagedRegions` view of the executor's staged L1 /
+  L2-window / refcount-table / refblock buffers, of which only the
+  refblocks are mutable: the planner mutates staged refcounts in place
+  at plan time (bench's single-copy model) while L1/L2 mutations stay
+  `PatchEntryU64` steps, and `plan_flush` emits the epoch's write-backs
+  refcounts-last. Barriers are explicit steps with
+  `BarrierClass::{Ordering, Durability}`; because the call table
+  exposes only `fsync_input`, executors map `Durability` to fsync on RW
+  input devices and degrade it to `Ordering` where no fsync primitive
+  exists (matching commit/rebase's current no-fsync output-device
+  reality). The crash-ordering contract — data written before the L2
+  patch that reaches it, fresh-L2 init before the L1 patch, refcount
+  write-backs only at flush and last, Durability barriers between flush
+  groups — is emission-order data, pinned mechanically by an
+  ordering-contract property suite (window-invariance across buffer
+  capacities down to a 1-step buffer) and a SimDisk simulation harness
+  that replays the step journal truncated at every Durability barrier.
+  Envelope gates (qcow2 v2/v3, 16-bit refcounts, no
+  unknown-incompatible bits, no extended-L2 / external data /
+  encryption, not dirty/corrupt, no internal snapshots) run at state
+  construction, so a gated image can never yield a write plan. No
+  consumer yet: phases 4-6 migrate commit, rebase safe mode and bench
+  `-w` onto it, and phase 7 adds copy-on-write.
 - **operations/info/** - Format detection operation
 - **operations/copy/** - File copy operation
 - **operations/check/** - Image integrity validation operation (with
