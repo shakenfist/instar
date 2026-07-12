@@ -858,6 +858,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`instar commit` refuses snapshot-bearing images instead of
+  corrupting internal snapshots (issue #420 and an additional
+  overlay-side defect found during the gate work).** commit's
+  per-cluster loop blind-overwrites snapshot-shared backing clusters
+  that qemu-img COWs and preserves — silent snapshot corruption,
+  invisible to `qemu-img check`. commit now refuses before any
+  mutation when either side has internal snapshots: backing side
+  (error 14, "the backing file has internal snapshots; committing
+  would corrupt them") and overlay side (error 15, "the overlay has
+  internal snapshots; the post-commit clear pass would corrupt
+  them") — the latter covering a second defect the gate's own parity
+  test exposed, where the overlay-clear pass decrements clusters an
+  overlay snapshot still references (refcount=0 with a live
+  reference; latent snapshot data loss). Both refusals are
+  byte-idempotent and test-proven. This is an interim gate: qemu-img
+  proceeds on these shapes, and the real fix is copy-on-write in
+  phase 7 of PLAN-qcow2-write-infrastructure.
+
+- **`instar rebase` refuses safe mode on snapshot-bearing overlays
+  instead of corrupting them (issue #421).** Safe-mode rebase
+  (including safe-mode detach) mutates snapshot-shared L2 tables in
+  place and under-counts refcounts on doubly-referenced clusters,
+  enabling live data loss via a later `snapshot -d`. It now refuses
+  before any mutation (error 14, "the overlay has internal
+  snapshots; a safe-mode rebase would corrupt them. Use -u for a
+  metadata-only rebase or fall back to `qemu-img rebase`"),
+  byte-idempotent and test-proven. `-u` metadata-only rebase never
+  touches snapshot-shared state and stays allowed, with a new parity
+  test against qemu-img (exit codes, check-clean, info-equivalence,
+  identical snapshot read-back). Interim gate; real fix is phase 7
+  copy-on-write.
+
+- **`instar rebase` hung on deep-allocation safe rebases (issue
+  #422, reported as a 512-byte-cluster livelock).** The root cause
+  was a guest panic, not a livelock: the safe-mode L2 lookup slice
+  was built once with the initial staged-L2 count, so staging a new
+  L2 table and then visiting another cluster in its coverage indexed
+  past the stale length — an out-of-bounds panic spinning forever in
+  the guest's `loop {}` panic handler. Reproducible at the default
+  64 KiB cluster size with sparse overlays, not cs=512-specific. A
+  second latent defect fixed at the same time: the staged-L2 growth
+  arena was carved before the refblock staging regions and could
+  clobber them. The lookup slice is now re-derived after growth and
+  the staging layout reordered (growable arena last). The original
+  issue fixture now terminates in 0.58 s with the pre-existing
+  refcount-exhaustion refusal (v1 never appends refblocks — a
+  documented capacity limit retired later by the master plan's
+  refcount-growth work), a previously-hanging 64 KiB sparse shape
+  completes with qemu-identical content, and output byte-invariance
+  on previously-working shapes was proven against a pre-fix build.
+
 - **`instar dd`/`convert -O vpc` declared a different virtual size
   than `qemu-img` for windowed copies (issue #382).** The VHD size
   rounding (`vhd::chs_rounded_size`) approximated qemu's CHS rounding

@@ -289,7 +289,7 @@ Design sketch (to be settled in phase planning, not binding):
 | Phase | Plan | Status |
 |-------|------|--------|
 | 1. Semantics pin: qemu snapshot-bearing commit/rebase behaviour, COW order determinism, oracle inventory, memory budget survey | PLAN-qcow2-write-infrastructure-phase-01-semantics.md | Complete (2026-07-12; see Findings) |
-| 2. Interim safety gates + defect handling — LIVE: commit snapshot corruption (#420), rebase snapshot corruption + data-loss chain (#421), rebase 512-byte-cluster livelock (#422; fix or gate per root-cause depth) | PLAN-qcow2-write-infrastructure-phase-02-gates.md | Planned (2026-07-12), not started |
+| 2. Interim safety gates + defect handling — LIVE: commit snapshot corruption (#420), rebase snapshot corruption + data-loss chain (#421), rebase 512-byte-cluster livelock (#422; fix or gate per root-cause depth) | PLAN-qcow2-write-infrastructure-phase-02-gates.md | Complete (2026-07-12; commits ac8f60a / 2fb9af4 / c84743e; see Findings) |
 | 3. `crates/qcow2-write` core: classification + allocate-on-write planner + ordering contract (no COW, no growth), unit tests | PLAN-qcow2-write-infrastructure-phase-03-crate.md | Not started |
 | 4. Migrate commit onto the crate (byte-identical proof) | PLAN-qcow2-write-infrastructure-phase-04-commit.md | Not started |
 | 5. Migrate rebase safe mode (byte-identical proof) | PLAN-qcow2-write-infrastructure-phase-05-rebase.md | Not started |
@@ -597,13 +597,84 @@ respectively:
    at 64K clusters completes in 0.76 s. Independent of the
    snapshot work; needs root-causing (phase 2 scope decision:
    fix if shallow, otherwise gate 512-byte safe-mode rebase and
-   track).
+   track). **Fixed in phase 2 (c84743e)**; the capacity refusal
+   on the original fixture remains by design (see the phase-2
+   findings).
 
 Also recorded, not defect-classed: commit's
 `ERROR_REFCOUNT_EXHAUSTED` refusal writes scaffolding clusters
 before erroring (refusal is not byte-idempotent — worth folding
 into the phase 3 ordering contract: no image mutation before
 the envelope checks pass).
+
+Phase-2 updates to the register: a **fourth defect** was found
+by 2a's own parity test — commit's overlay-clear pass corrupts
+refcounts when the *overlay* has internal snapshots (the
+overlay-side sibling of #420; issue pending). Gated in ac8f60a
+as `CommitResult` error 15 alongside the backing-side gate.
+And **#422 is fixed in phase 2 (c84743e)** — root cause was a
+guest panic, not a livelock (see the phase-2 findings below);
+the pre-existing refcount-capacity refusal on the original
+fixture remains by design.
+
+### Findings: phase 2 interim gates (2026-07-12)
+
+Executed per
+[PLAN-qcow2-write-infrastructure-phase-02-gates.md](PLAN-qcow2-write-infrastructure-phase-02-gates.md)
+as steps 2a (commit gate, ac8f60a), 2b (rebase gate, 2fb9af4),
+2c (investigation, no code), 2d (fix, c84743e) and 2e (this
+close-out). All refusal gates fire before any image mutation
+and carry sha256-unchanged byte-idempotence tests
+(`tests/test_commit.py:TestCommitSnapshotGate`,
+`tests/test_rebase.py:TestRebaseSnapshotGate`).
+
+**2a found a fourth defect.** Item 1's live-parity test on the
+deliberately un-gated overlay-snapshot shape — including the
+post-snapshot overlay write variant phase 1 did NOT probe —
+diverged: commit's overlay-clear pass zeroes active L2 entries
+and decrements shared clusters without accounting for the
+snapshot's reference, leaving 8 × `refcount=0 reference=1`
+(clusters freed while the overlay snapshot's L1 tree still
+references them — latent snapshot data loss). qemu handles the
+same shape check-clean. Phase 1's second-order probe missed it
+because its shape happened to balance arithmetically; the
+post-snapshot-write variant does not. Per the plan's
+stop-and-report rule the verdict widened the gate: commit now
+refuses when EITHER side has snapshots (backing = error 14,
+#420; overlay = error 15, the overlay-side sibling of #420,
+issue pending).
+
+**2c root-caused #422: not a livelock and not cs=512-specific.**
+The "livelock" was a guest panic (out-of-bounds slice index)
+spinning in the rebase op's `loop {}` panic handler. Mechanism:
+the safe-mode L2 lookup slice was built once with the initial
+staged-L2 count; staging a NEW L2 table and then visiting
+another cluster in its coverage indexed past the stale length.
+Reproduced at the default 64 KiB cluster size with sparse
+overlays. The investigation also found a latent second defect:
+the staged-L2 growth arena was carved before the
+rb_offsets/refblock staging regions and could clobber them (a
+refblock flush would then write to garbage host offsets).
+
+**2d fixed both** (c84743e): the lookup slice is re-derived via
+`l2_arena()` after growth, and the staging layout reordered to
+L1 → refcount table → rb_offsets → refblock data → growable L2
+arena last. Outcomes: the exact #422 fixture now terminates in
+0.58 s with the PRE-EXISTING refcount-exhaustion refusal (v1
+never appends refblocks — that capacity limit remains,
+documented, retired later by the growth work — mission item 3); a
+previously-hanging 64 KiB sparse-overlay shape completes with
+qemu-identical content; output byte-invariance on
+previously-working shapes was proven against a pre-fix build.
+
+**Deferrals recorded.** (1) Byte-idempotence of the
+refcount-exhaustion refusal path: it writes semantically-inert
+data clusters before refusing (unreferenced, metadata never
+flushed, check-clean) — same caveat as commit's phase-1
+finding; folded into phase 3's ordering contract (no image
+mutation before the envelope checks pass). (2) Refblock growth
+capacity for rebase/commit: mission item 3 / Future work, not
+phase 2's scope.
 
 ## Administration and logistics
 
@@ -653,22 +724,35 @@ the envelope checks pass).
 
 ### Bugs fixed during this work
 
-Phase 1 confirmed three pre-existing defects (details and repro
-recipes in the Findings defect register; filed 2026-07-12):
+Phase 1 confirmed three pre-existing defects and phase 2 found
+a fourth (details and repro recipes in the Findings defect
+register; #420-#422 filed 2026-07-12):
 
 1. [#420](https://github.com/shakenfist/instar/issues/420)
    `instar commit` silently corrupts internal snapshots in the
    backing file (two modes; the dominant one invisible to every
-   existing oracle). Interim gate in phase 2; real fix phase 7.
+   existing oracle). **Gate landed in phase 2 (ac8f60a,
+   error 14) — the corruption is unreachable**; real fix
+   phase 7 COW, issue stays open until then.
 2. [#421](https://github.com/shakenfist/instar/issues/421)
    `instar rebase` (safe mode) corrupts refcounts on
    snapshot-shared overlay metadata, enabling live data loss via
-   a later `snapshot -d`. Interim gate in phase 2; real fix
-   phase 7.
+   a later `snapshot -d`. **Gate landed in phase 2 (2fb9af4,
+   error 14; `-u` stays allowed with a parity test) — the
+   corruption is unreachable**; real fix phase 7 COW, issue
+   stays open until then.
 3. [#422](https://github.com/shakenfist/instar/issues/422)
    `instar rebase` livelocks on 512-byte-cluster overlays
-   (snapshot-independent). Root-cause in phase 2; fix or gate
-   there per depth.
+   (snapshot-independent). **Fixed in phase 2 (c84743e)**: a
+   guest panic from a stale staged-L2 lookup slice, plus a
+   latent staging-layout clobber — not a livelock, not
+   cs=512-specific. The remaining refcount-capacity refusal on
+   the original fixture is a documented v1 limit, not this bug.
+4. `instar commit`'s overlay-clear pass corrupts refcounts when
+   the overlay has internal snapshots (the overlay-side sibling
+   of #420; issue pending), found by phase 2a's parity test.
+   **Gated in the same commit (ac8f60a, error 15)**; real fix
+   phase 7 COW.
 
 Fix status is tracked here as phases land.
 

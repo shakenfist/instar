@@ -161,6 +161,33 @@ and the overlay becomes standalone.
   rejects with `ERROR_UNSUPPORTED_FORMAT`. qemu-img also
   rejects vmdk rebase entirely (there is no upstream vmdk
   rebase at all). The vmdk smoke tests use unsafe mode.
+- **Safe-mode rebase refuses snapshot-bearing overlays.**
+  If the overlay has internal snapshots, safe mode
+  (including safe-mode detach) refuses with error 14:
+  ``the overlay has internal snapshots; a safe-mode rebase
+  would corrupt them. Use -u for a metadata-only rebase or
+  fall back to `qemu-img rebase` ``. qemu-img proceeds
+  (COWing shared metadata; its contract covers the active
+  view only) where instar's safe-mode allocator would
+  mutate a snapshot-shared L2 in place (issue #421). The
+  refusal fires before any mutation and is byte-idempotent.
+  `-u` only rewrites the header backing-pointer region,
+  which is never snapshot-shared, so it stays allowed and
+  is parity-tested against qemu-img on snapshot-bearing
+  overlays. The real fix is copy-on-write, phase 7 of
+  PLAN-qcow2-write-infrastructure.
+- **Deep-allocation safe rebases refuse on refcount
+  exhaustion.** v1 never appends refblocks, so a safe
+  rebase that needs more cluster allocations than the
+  overlay's existing refcount blocks can hold refuses with
+  `ERROR_REFCOUNT_EXHAUSTED` where qemu-img completes.
+  (Before the phase-2 fix for issue #422 these shapes
+  could hang instead of refusing — a staged-L2 lookup went
+  stale after arena growth and the guest spun in its panic
+  handler; fixed, with staging reordered so the growable
+  L2 arena can no longer clobber refblock staging.)
+  Retiring the capacity ceiling is the master plan's
+  refcount-growth generalization.
 - **Cross-cluster-size rebase is rejected.** If the new
   backing's qcow2 cluster size differs from the overlay's,
   safe-mode rebase refuses with

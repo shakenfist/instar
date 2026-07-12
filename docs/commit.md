@@ -173,6 +173,20 @@ behaviour.
   expose vmdk monolithicSparse's `parentFileNameHint`
   via `backing_file`. Tracked separately under
   PLAN-info's vmdk follow-ups.
+- **Snapshot-bearing images refused.** If either side has
+  internal snapshots, instar refuses before any mutation.
+  Backing side (error 14): ``the backing file has internal
+  snapshots; committing would corrupt them. Fall back to
+  `qemu-img commit` `` — instar's per-cluster loop would
+  blind-overwrite snapshot-shared clusters that qemu-img
+  COWs (issue #420). Overlay side (error 15): ``the
+  overlay has internal snapshots; the post-commit clear
+  pass would corrupt them. Fall back to `qemu-img
+  commit` `` — the clear pass would decrement clusters the
+  snapshot still references. qemu-img proceeds on both
+  shapes; both refusals are byte-idempotent. The real fix
+  is copy-on-write, phase 7 of
+  PLAN-qcow2-write-infrastructure.
 - **Cluster-size mismatch refused.** If the overlay and
   backing have different qcow2 cluster sizes, the host
   pre-check refuses with `commit between mismatched

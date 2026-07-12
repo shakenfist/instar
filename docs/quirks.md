@@ -1316,6 +1316,50 @@ hardening item. Use unsafe-mode rebase (`-u`) when the
 caller knows the new backing's data is bit-identical to
 the old.
 
+### Safe-mode rebase refuses snapshot-bearing overlays
+
+If the overlay has internal snapshots, safe-mode rebase
+(including safe-mode detach) refuses with ``the overlay has
+internal snapshots; a safe-mode rebase would corrupt them.
+Use -u for a metadata-only rebase or fall back to `qemu-img
+rebase` `` (`RebaseResult` error 14). qemu-img proceeds — its
+contract covers the active view only, and it COWs
+snapshot-shared metadata — where instar's safe-mode
+allocator would mutate a shared L2 table in place and
+under-count refcounts, enabling data loss via a later
+`snapshot -d` (issue #421). The refusal fires before any
+mutation and is byte-idempotent
+(`tests/test_rebase.py:TestRebaseSnapshotGate`).
+
+**Interim divergence**: qemu-img proceeds on
+snapshot-bearing overlays where instar now refuses. The
+real fix is copy-on-write, phase 7 of
+[PLAN-qcow2-write-infrastructure](plans/PLAN-qcow2-write-infrastructure.md).
+Unsafe (`-u`) rebase only rewrites the header
+backing-pointer region, which is never snapshot-shared, so
+it stays allowed on snapshot-bearing overlays and carries a
+parity test against qemu-img (exit codes, check-clean,
+info-equivalence, identical snapshot read-back).
+
+### Deep-allocation safe rebase refuses on refcount exhaustion instead of hanging
+
+Issue #422's apparent 512-byte-cluster livelock was a guest
+panic spinning in the panic handler, fixed in phase 2 of
+PLAN-qcow2-write-infrastructure (the staged-L2 lookup slice
+went stale after arena growth; the growth arena could also
+clobber the refblock staging regions). Safe-mode rebases
+that allocate deeply no longer hang: shapes that exceed the
+overlay's existing refcount-block capacity now terminate
+promptly with ``the overlay's refcount blocks are full; v1
+doesn't append new ones. Fall back to -u or use `qemu-img
+rebase` `` — qemu-img completes these (it grows the refcount
+table). Retiring that capacity ceiling is the master plan's
+refcount-growth generalization. Note the exhaustion refusal
+is not byte-idempotent (semantically-inert data clusters
+are written before the guest refuses; the image stays
+check-clean); making envelope refusals mutation-free is
+folded into phase 3's ordering contract.
+
 ### `Image rebased.` / `Image detached.` output matches qemu byte-for-byte
 
 instar emits the same trailing-newline-terminated strings
@@ -1368,6 +1412,38 @@ qcow2 → qcow2 and vmdk → vmdk only. Cross-format commit
 (e.g. qcow2 overlay onto a vmdk backing) is refused with
 `ERROR_UNSUPPORTED_FORMAT`. Lifting needs planner
 extensions plus a cluster-size translation layer.
+
+### Snapshot-bearing images are refused
+
+`instar commit` refuses before any image mutation when
+EITHER side of the commit has internal snapshots.
+
+- **Backing side** (`CommitResult` error 14): ``the backing
+  file has internal snapshots; committing would corrupt
+  them. Fall back to `qemu-img commit` ``. qemu-img COWs
+  snapshot-shared backing clusters and preserves the
+  snapshots on every version tested; instar's per-cluster
+  loop blind-overwrites them (issue #420, silent snapshot
+  corruption in the dominant mode).
+- **Overlay side** (`CommitResult` error 15): ``the overlay
+  has internal snapshots; the post-commit clear pass would
+  corrupt them. Fall back to `qemu-img commit` ``. The
+  overlay-clear pass zeroes active L2 entries and
+  decrements shared clusters without accounting for the
+  snapshot's reference, leaving refcount=0 clusters still
+  referenced by the snapshot's L1 tree — latent snapshot
+  data loss. This is the overlay-side sibling of #420
+  (issue pending), found by the gate work's own parity
+  test; qemu-img handles the same shape check-clean.
+
+Both refusals fire before any mutation and are
+byte-idempotent
+(`tests/test_commit.py:TestCommitSnapshotGate`).
+
+**Interim divergence**: qemu-img proceeds on
+snapshot-bearing images where instar now refuses. The real
+fix is copy-on-write, phase 7 of
+[PLAN-qcow2-write-infrastructure](plans/PLAN-qcow2-write-infrastructure.md).
 
 ### `cluster_size > 64 KiB` overflows the commit scratch budget
 
