@@ -610,7 +610,7 @@ the envelope checks pass).
 Phase-2 updates to the register: a **fourth defect** was found
 by 2a's own parity test — commit's overlay-clear pass corrupts
 refcounts when the *overlay* has internal snapshots (the
-overlay-side sibling of #420; issue pending). Gated in ac8f60a
+overlay-side sibling of #420; issue #423). Gated in ac8f60a
 as `CommitResult` error 15 alongside the backing-side gate.
 And **#422 is fixed in phase 2 (c84743e)** — root cause was a
 guest panic, not a livelock (see the phase-2 findings below);
@@ -642,7 +642,7 @@ post-snapshot-write variant does not. Per the plan's
 stop-and-report rule the verdict widened the gate: commit now
 refuses when EITHER side has snapshots (backing = error 14,
 #420; overlay = error 15, the overlay-side sibling of #420,
-issue pending).
+issue #423).
 
 **2c root-caused #422: not a livelock and not cs=512-specific.**
 The "livelock" was a guest panic (out-of-bounds slice index)
@@ -750,7 +750,7 @@ register; #420-#422 filed 2026-07-12):
    the original fixture is a documented v1 limit, not this bug.
 4. `instar commit`'s overlay-clear pass corrupts refcounts when
    the overlay has internal snapshots (the overlay-side sibling
-   of #420; issue pending), found by phase 2a's parity test.
+   of #420; issue #423), found by phase 2a's parity test.
    **Gated in the same commit (ac8f60a, error 15)**; real fix
    phase 7 COW.
 

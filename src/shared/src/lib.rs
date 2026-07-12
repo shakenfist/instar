@@ -4286,7 +4286,7 @@ impl CommitResult {
     /// snapshot-shared clusters at `refcount=0 reference=1`
     /// (proven by the phase-2 step-2a parity test; qemu-img
     /// stays check-clean on the same shape). This is the
-    /// overlay-side sibling of issue #420 (issue pending).
+    /// overlay-side sibling of issue #420 (issue #423).
     /// Refused as an interim phase-2 gate; the real fix
     /// (snapshot-aware refcounting) lands in phase 7 of
     /// `PLAN-qcow2-write-infrastructure`.
@@ -5005,7 +5005,7 @@ mod tests {
     fn commit_result_error_codes_distinct() {
         // Phase 7 step 7a added codes 8..=13; the phase-2
         // snapshot gates added 14 (backing, issue #420) and 15
-        // (overlay, issue pending). Confirm every code is
+        // (overlay, issue #423). Confirm every code is
         // distinct so the host's match arms don't accidentally
         // alias.
         let codes = [

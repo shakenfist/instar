@@ -1433,7 +1433,7 @@ EITHER side of the commit has internal snapshots.
   snapshot's reference, leaving refcount=0 clusters still
   referenced by the snapshot's L1 tree — latent snapshot
   data loss. This is the overlay-side sibling of #420
-  (issue pending), found by the gate work's own parity
+  (issue #423), found by the gate work's own parity
   test; qemu-img handles the same shape check-clean.
 
 Both refusals fire before any mutation and are

@@ -859,7 +859,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - **`instar commit` refuses snapshot-bearing images instead of
-  corrupting internal snapshots (issue #420 and an additional
+  corrupting internal snapshots (issues #420 and #423, the latter an
   overlay-side defect found during the gate work).** commit's
   per-cluster loop blind-overwrites snapshot-shared backing clusters
   that qemu-img COWs and preserves — silent snapshot corruption,

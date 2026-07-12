@@ -502,8 +502,8 @@ unsafe fn run_qcow2(call_table: &CallTable, config: &CommitConfig) -> CommitResu
     // overwrites snapshot-shared data clusters in place and
     // allocates through snapshot-shared L2 tables without COW).
     //
-    // Overlay (the overlay-side sibling of issue #420, issue
-    // pending): the post-commit overlay-clear pass zeroes
+    // Overlay (issue #423, the overlay-side sibling of issue
+    // #420): the post-commit overlay-clear pass zeroes
     // active L2 entries and decrements the referenced data
     // clusters without accounting for the snapshot's reference,
     // leaving snapshot-shared clusters at refcount=0

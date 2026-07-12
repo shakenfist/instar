@@ -793,7 +793,7 @@ for _target, _cases in COMMIT_CASES.items():
 # when EITHER side carries internal snapshots, byte-idempotently:
 # the backing side (GitHub issue #420, silent snapshot
 # corruption) and the overlay side (the overlay-side sibling of
-# issue #420, issue pending: the overlay-clear pass corrupts
+# issue #420, filed as issue #423: the overlay-clear pass corrupts
 # refcounts on snapshot-shared clusters). Both are interim
 # gates; phase 7's snapshot-aware COW/refcounting is the real
 # fix.
@@ -959,7 +959,7 @@ class TestCommitSnapshotGate(TestCommitSmoke):
     # interim gate — a deliberate divergence from qemu-img,
     # which handles this shape — until phase 7's snapshot-aware
     # refcounting lands. Overlay-side sibling of issue #420
-    # (issue pending).
+    # (issue #423).
     def test_refuse_overlay_internal_snapshots(self):
         """Commit from a snapshot-bearing overlay refuses, byte-idempotently.
 
