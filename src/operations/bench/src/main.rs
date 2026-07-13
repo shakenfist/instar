@@ -58,8 +58,9 @@ use shared::{
 // `crates/bench` (BenchParams/schedule-coupled).
 use qcow2_write::growth::{plan_refcount_growth, GrowthCaps, GrowthOverflow};
 use qcow2_write::{
-    check_envelope, new_state, plan_flush, plan_write, DataSource, Gate, RegionId, StagedRegions,
-    StagingConfig, Step, StepBuf, StepKind, TargetDevice, WriteError, WriteState, MAX_L2_SLOTS,
+    check_envelope_with, new_state_cow, plan_flush, plan_write, DataSource, Gate, RegionId,
+    StagedRegions, StagingConfig, Step, StepBuf, StepKind, TargetDevice, WriteError, WriteState,
+    MAX_L2_SLOTS,
 };
 use qcow2_write_exec::{
     execute, fill_bytes, growth, read_bytes, CallTableIo, ExecCause, ExecError, Regions,
@@ -495,7 +496,7 @@ unsafe fn exec_window(
     r.map(|_| ())
 }
 
-/// Render a [`check_envelope`] / [`new_state`] gate refusal to bench's
+/// Render a [`check_envelope_with`] / [`new_state_cow`] gate refusal to bench's
 /// wire code. Gates 1-7 keep bench's `ERROR_WRITE_UNSUPPORTED` + gate-id
 /// rendering (the ids equal the crate's `Gate::code()`, const-asserted
 /// above); the parse-defended `UnsupportedVersion` and the op-controlled
@@ -519,11 +520,18 @@ fn map_gate(g: Gate) -> (u32, u64) {
 
 /// Render a [`plan_write`] / [`plan_flush`] refusal to bench's wire code
 /// (settled decision 6). `RefcountExhausted` keeps `ERROR_ALLOC_EXHAUSTED`;
-/// `CompressedCluster` and snapshot-shared refusals keep bench's mid-run
-/// gate-2 / gate-7 `ERROR_WRITE_UNSUPPORTED` rendering; the crate
-/// classification refusals bench had no prior rendering for map to the
-/// appended `ERROR_IMAGE_INCONSISTENT` (code 9); planner-protocol errors
-/// are internal bugs (`ERROR_PARSE_FAILED`). Exhaustive.
+/// `CompressedCluster` keeps bench's mid-run gate-2
+/// `ERROR_WRITE_UNSUPPORTED` rendering; the crate classification refusals
+/// bench had no prior rendering for map to the appended
+/// `ERROR_IMAGE_INCONSISTENT` (code 9); planner-protocol errors are
+/// internal bugs (`ERROR_PARSE_FAILED`). Exhaustive.
+///
+/// Phase 7 (7d) COW adoption: with `new_state_cow`, the crate classifies
+/// snapshot-shared data clusters (`SnapshotShared`) and L2 tables
+/// (`SnapshotSharedL2Table`) into COW emission instead of returning them
+/// as errors, so those arms no longer fire on the `-w` path. They are
+/// retained defensively (mapped to the gate-7 `ERROR_WRITE_UNSUPPORTED`
+/// rendering a non-COW caller would see) so the match stays exhaustive.
 fn map_write_error(e: WriteError) -> (u32, u64) {
     match e {
         WriteError::RefcountExhausted => (BenchResult::ERROR_ALLOC_EXHAUSTED, 0),
@@ -621,7 +629,7 @@ fn map_growth_error(e: growth::GrowthExecError) -> (u32, u64) {
 }
 
 /// Parse the top image's header, apply the shared write envelope
-/// ([`check_envelope`], decision 6), stage the refcount table +
+/// ([`check_envelope_with`], decision 6), stage the refcount table +
 /// refblocks + active L1 into scratch, and preemptively grow the
 /// refcount structures to the schedule's worst-case coverage. All checks
 /// are pre-bracket: a refusal returns before any BenchStart and leaves
@@ -657,7 +665,24 @@ unsafe fn qcow2_write_setup(
 
     // ---- Write-envelope gates (decision 6: the shared check_envelope,
     // rendered onto bench's ERROR_WRITE_UNSUPPORTED + gate-id wire). ----
-    if let Err(gate) = check_envelope(&hdr) {
+    //
+    // Phase 7 COW adoption (7d, decision 4a/4b, lifting the last of the
+    // three interim snapshot-refusal gates): `allow_snapshots = true`
+    // relaxes the `Gate::HasSnapshots` refusal so a snapshot-bearing image
+    // reaches the COW planner instead of being refused with
+    // `ERROR_WRITE_UNSUPPORTED` + gate id 7. Every other gate is
+    // unconditional. Paired with `new_state_cow` below, the qcow2-write
+    // classifier then emits COW steps for snapshot-shared data clusters
+    // (C1) and L2 tables (C2) — bench writes into its own image's active
+    // view, so every pre-existing snapshot is preserved (C8), matching a
+    // qemu twin. bench already provisions the refcount growth the COW
+    // allocations need (the preemptive growth pass below, sized from
+    // `worst_case_touched`, which upper-bounds the fresh D'/T' clusters COW
+    // allocates exactly as it bounds fresh allocations for unallocated
+    // writes), so C9 is inherited unchanged. The `Gate::HasSnapshots`
+    // rendering (`wgate::SNAPSHOTS`) is kept for defensive/non-COW callers
+    // but no longer fires here.
+    if let Err(gate) = check_envelope_with(&hdr, true) {
         return Err(map_gate(gate));
     }
 
@@ -1002,7 +1027,11 @@ unsafe fn run_qcow2_write(
         max_refblocks: refblock_count,
         device: TargetDevice::Input0,
     };
-    let mut wstate = match new_state(&hdr, &staging_config) {
+    // COW-enabled (phase 7, 7d, decision 4b): snapshot-shared data
+    // clusters (C1) and L2 tables (C2) classify into COW emission instead
+    // of refusing, so `bench -w` into a snapshot-bearing image copies the
+    // shared clusters and preserves every pre-existing snapshot (C8).
+    let mut wstate = match new_state_cow(&hdr, &staging_config) {
         Ok(s) => s,
         Err(gate) => {
             let (error, detail) = map_gate(gate);

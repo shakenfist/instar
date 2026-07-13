@@ -28,7 +28,7 @@ Scope contract (the OQ13 decisions, recorded):
   divergence that stops diverging fails `TestBenchDivergenceRegression`
   loudly, forcing a registry update rather than a silent pass.
 
-Eight test classes, all inheriting from `BenchTestBase`:
+Nine test classes, all inheriting from `BenchTestBase`:
 
 * `TestBenchHeaderParity` — the 4c header-byte-parity rows.
 * `TestBenchValidation` — the corrected §2 message-contract table
@@ -36,6 +36,8 @@ Eight test classes, all inheriting from `BenchTestBase`:
 * `TestBenchReadBehaviour` — EOF/wrap/chain read-path behaviour.
 * `TestBenchWrite` — the 5c write-verification matrix, thinned.
 * `TestBenchWriteRefusals` — the write-path gate contracts.
+* `TestBenchSnapshotCow` — copy-on-write into a snapshot-bearing
+  image (phase-7 step 7d, contract C8).
 * `TestBenchRefcountGrowth` — the qcow2 `-w` refcount-growth matrix
   (PLAN-bench-refcount-growth phase 03).
 * `TestBenchJson` — the `--output json` schema.
@@ -53,6 +55,7 @@ import tempfile
 from pathlib import Path
 
 from base import InstarTestBase
+from helpers.snapshot_readback import snapshot_readback
 
 
 # Shape-only match for the completion line -- the timing value itself
@@ -1129,13 +1132,17 @@ class TestBenchWriteRefusals(BenchTestBase):
 
     vmdk/vhd/vhdx are refused HOST-SIDE (Mission §3's "-w host-side
     format gate", `run_bench`, before the header prints or the guest
-    launches) so those three need no `/dev/kvm` guard; internal
-    snapshots, refcount_bits=1, compression, LUKS encryption,
-    extended L2, an external data file, and the dirty bit are all
-    refused GUEST-SIDE (the qcow2 write envelope gates checked before
-    `send_bench_start`), so those seven launch the guest and need the
-    guard. Every case additionally asserts the image's sha256 is
-    unchanged -- a refused write must not touch the file.
+    launches) so those three need no `/dev/kvm` guard; refcount_bits=1,
+    compression, LUKS encryption, extended L2, an external data file,
+    and the dirty bit are all refused GUEST-SIDE (the qcow2 write
+    envelope gates checked before `send_bench_start`), so those launch
+    the guest and need the guard. Every case additionally asserts the
+    image's sha256 is unchanged -- a refused write must not touch the
+    file.
+
+    Internal snapshots are NO LONGER refused: phase-7 step 7d lifted
+    the last snapshot gate and `bench -w` now copies snapshot-shared
+    clusters (see `TestBenchSnapshotCow`).
     """
 
     def _assert_write_refused(self, path, fmt_hint, expected_substr):
@@ -1149,20 +1156,6 @@ class TestBenchWriteRefusals(BenchTestBase):
         self.assertEqual(
             self.sha256(path), before,
             'a refused write must not touch the image')
-
-    def test_refuse_internal_snapshot(self):
-        self._require_kvm()
-        with tempfile.TemporaryDirectory() as td:
-            img = Path(td) / 'snap.qcow2'
-            self.make_qcow2(img, size='16M')
-            r = subprocess.run(
-                ['qemu-img', 'snapshot', '-c', 'snap1', str(img)],
-                capture_output=True, text=True, timeout=30)
-            self.assertEqual(r.returncode, 0, f'snapshot -c failed: {r.stderr}')
-            self._assert_write_refused(
-                img, 'qcow2',
-                'bench: write tests are not supported for this image '
-                '(internal snapshots)')
 
     def test_refuse_refcount_bits_1(self):
         self._require_kvm()
@@ -1337,6 +1330,110 @@ class TestBenchWriteRefusals(BenchTestBase):
             self._assert_write_refused(
                 img, None,
                 'bench: write tests are not yet supported for vhdx')
+
+
+class TestBenchSnapshotCow(BenchTestBase):
+    """`bench -w` copy-on-write into a snapshot-bearing image (C8).
+
+    Phase-7 step 7d lifts the last of the three interim
+    snapshot-refusal gates (commit 7b and rebase 7c lifted the other
+    two). bench writes into its OWN image's active view, so a write
+    that lands on a snapshot-shared cluster now copies it (C1) and
+    COWs the snapshot-shared L2 table above it (C2) instead of being
+    refused with `ERROR_WRITE_UNSUPPORTED` (gate 7). Every pre-existing
+    internal snapshot is preserved bit-identically (C8, like commit's
+    C6), and the active view stays `qemu-img compare`-identical to a
+    `qemu-img bench -w` twin and `qemu-img check`-clean.
+
+    The matrix is cluster size {65536, 512}; the cs=512 leg COWs
+    hundreds of 512-byte clusters at the file end, crossing refblock
+    boundaries and exercising the preemptive refcount growth bench
+    already shares (C9 — inherited unchanged, since
+    `worst_case_touched` upper-bounds the fresh COW clusters exactly
+    as it bounds fresh allocations for unallocated writes).
+    """
+
+    def _require_qemu_tools(self):
+        if shutil.which('qemu-img') is None:
+            self.skipTest('system qemu-img not installed')
+        if shutil.which('qemu-io') is None:
+            self.skipTest('system qemu-io not installed')
+
+    def _build_snapshot_fixture(self, path, cluster_size):
+        """A qcow2 whose active-view clusters are snapshot-shared.
+
+        Write 0xaa across [0, 1M) (covering every cluster the default
+        `-c 100` schedule touches at [0, 409600)), then take an
+        internal snapshot. After `snapshot -c`, every allocated
+        cluster is referenced by both the active L1 tree and snap1's
+        L1 tree (refcount >= 2, OFLAG_COPIED clear), so a `bench -w`
+        into that range must COW.
+        """
+        self.make_qcow2(path, size='64M', cluster_size=cluster_size)
+        self._qemu_io(path, 'write -P 0xaa 0 1M', fmt='qcow2')
+        r = subprocess.run(
+            ['qemu-img', 'snapshot', '-c', 'snap1', str(path)],
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, f'snapshot -c failed: {r.stderr}')
+
+    def test_snapshot_shared_cow_compare_check_preserve(self):
+        """`bench -w` into a snapshot-bearing image: C5 + C8 parity.
+
+        Over cluster sizes {65536, 512} (the cs=512 leg crossing a
+        refblock boundary, C9):
+
+        - instar `bench -w` succeeds (rc 0);
+        - C5: the result is `qemu-img compare`-identical to a
+          `qemu-img bench -w` twin and `qemu-img check`-clean with
+          zero `refcount=1 reference=2`;
+        - C8: snap1's read-back is PRESERVED (== pre-write) and
+          equals the qemu twin's snap1 read-back.
+        """
+        self._require_kvm()
+        self._require_qemu_tools()
+        for cs in (65536, 512):
+            with self.subTest(cluster_size=cs), \
+                    tempfile.TemporaryDirectory() as td:
+                td = Path(td)
+                pristine = td / 'snap.qcow2'
+                self._build_snapshot_fixture(pristine, cs)
+                snap1_pre = snapshot_readback('qemu-img', pristine, 'snap1')
+
+                a = td / 'a.qcow2'
+                b = td / 'b.qcow2'
+                shutil.copy2(pristine, a)
+                shutil.copy2(pristine, b)
+                args = ['-w', '-c', '100', '--pattern', '65', '-f', 'qcow2']
+
+                i_out, i_err, i_rc = self.run_instar_bench(*args, str(a))
+                self.assertEqual(
+                    i_rc, 0,
+                    f'COW bench -w into snapshot-bearing image failed; '
+                    f'stderr={i_err!r}')
+                q_out, q_err, q_rc = self.run_qemu_bench(*args, str(b))
+                self.assertEqual(q_rc, 0, f'qemu: {q_err}')
+
+                # C5: active-view parity + check clean, no doubly-referenced
+                # clusters.
+                cmp_out, cmp_err, cmp_rc = self.run_qemu_img_compare(a, b)
+                self.assertEqual(
+                    cmp_rc, 0, f'compare mismatch: {cmp_out}{cmp_err}')
+                chk_out, chk_err, chk_rc = self.run_qemu_img_check(a)
+                self.assertEqual(
+                    chk_rc, 0, f'check failed: {chk_out}{chk_err}')
+                self.assertNotIn(
+                    'refcount=1 reference=2', chk_out + chk_err,
+                    'COW must leave no doubly-referenced clusters')
+
+                # C8: snap1 preserved and == qemu twin.
+                snap1_post = snapshot_readback('qemu-img', a, 'snap1')
+                snap1_twin = snapshot_readback('qemu-img', b, 'snap1')
+                self.assertEqual(
+                    snap1_post, snap1_pre,
+                    'C8: bench -w must preserve the internal snapshot')
+                self.assertEqual(
+                    snap1_post, snap1_twin,
+                    'C8: snap1 read-back must equal the qemu twin')
 
 
 class TestBenchRefcountGrowth(BenchTestBase):
