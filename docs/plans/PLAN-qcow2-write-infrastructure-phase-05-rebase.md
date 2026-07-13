@@ -202,6 +202,47 @@ comes back to the management session.
 overlap 5a); 5c last. One commit per step minimum; management
 reviews and commits.
 
+5p outcome notes (2026-07-13, binding on 5a/5b):
+
+* R-D4 and R-D1 both CONFIRMED live (holed-RT overlay:
+  1092 check errors + 32 leaks at exit 0, or wire-10 refusal
+  after 12.4 MB of mis-placed scribbles on larger divergences;
+  extended-L2: silent virtual-content corruption at exit 0).
+  Issue drafts in the session scratchpad await the user's
+  filing decision. The #428 recipe self-masks on qemu ≥ 10
+  (discard now produces zero-plain clusters); 5a's refusal
+  test must use 5p's adapted recipe (pre-touch + partial
+  write + discard 8M-32M + shrink to 82M, backing attached
+  via `rebase -u` afterwards).
+* R-D9 refined: qemu-img rebase ALSO carries beyond-EOV
+  old-chain bytes byte-identically to instar-before, so the
+  crate's zero-fill diverges from both at the raw level.
+  Decision 8 stands (virtual equality is the bar); the proof
+  harness's D9 fallback is now EXPECTED to trigger on the
+  oversized-backing combo — pre-declare it.
+* zstd overlays rebase correctly today (the incompatible bit
+  is inert without compressed clusters); wire-15 is a
+  today-succeeds→refuses narrowing exactly like commit's D1 —
+  accepted, spec-mandated, documented.
+* P7 (zero-flag chain clusters) CONFIRMED both shapes:
+  `cluster_lookup`'s classic arm ignores bit 0
+  (src/crates/qcow2/src/lib.rs:2213-2238) — silent
+  active-view corruption; blast radius rebase / convert /
+  compare / bench. Pre-existing crates/qcow2 defect, draft
+  written, explicitly NOT fixed by this phase; the 5b matrix
+  must not use `write -z` seeds.
+* Refusal inventory: EVERY cs=512 × divergent × safe combo
+  refuses wire 10 (v1 never appends refblocks; not
+  byte-idempotent — orphan data appends). These are 5b's
+  both-refuse rows and demand scaffolding identity.
+* 5b harness constraints: 3-chain rows must use the
+  chain-shortening form (rebase-to-mid keeps chains identical
+  and copies nothing); new-backing path length must not
+  exceed the overlay's existing path slot (wire 8 otherwise).
+* P8 exemplar pinned: cs=512, 64M, 512 populated L2 tables,
+  identical chains → wire 9 pre-mutation (MAX_STAGED_L2
+  count cap); 256 tables succeed.
+
 ## Review checklist deltas
 
 Phase-4 deltas apply verbatim (determinism-before-identity,
