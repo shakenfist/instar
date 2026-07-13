@@ -956,6 +956,118 @@ class TestBenchWrite(BenchTestBase):
             chk_out, chk_err, chk_rc = self.run_qemu_img_check(a)
             self.assertEqual(chk_rc, 0, f'check failed: {chk_out}{chk_err}')
 
+    def test_qcow2_2mib_cluster_allocating_write(self):
+        """cs = 2 MiB allocating `-w`: compare identical + check clean
+        vs a qemu-img twin (phase-6 step-6b requirement; the first live
+        exercise of the qcow2-write crate at 2 MiB clusters guest-side).
+
+        `-c 20 -s 2097152` steps by one 2 MiB cluster per request, so
+        each of the 20 writes allocates a fresh 2 MiB data cluster (and
+        a fresh L2 on first touch). Non-wrapping: 19*2097152 + 4096 =
+        39,849,984 < 64 MiB. cs=2 MiB has no in-envelope growth path
+        (one refblock covers 2 TiB), so this is pure allocation. The
+        oracle is virtual content (allocator placement legitimately
+        differs, B-D1), not byte identity.
+        """
+        self._require_kvm()
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            pristine = td / 'src.qcow2'
+            self.make_qcow2(pristine, size='64M', cluster_size=2097152)
+            pre_size = pristine.stat().st_size
+            a = td / 'a.qcow2'
+            b = td / 'b.qcow2'
+            shutil.copy2(pristine, a)
+            shutil.copy2(pristine, b)
+            args = ['-w', '-c', '20', '-s', '2097152', '--pattern', '67',
+                    '-f', 'qcow2']
+
+            i_out, i_err, i_rc = self.run_instar_bench(*args, str(a))
+            self.assertEqual(i_rc, 0, f'instar: {i_err}')
+            q_out, q_err, q_rc = self.run_qemu_bench(*args, str(b))
+            self.assertEqual(q_rc, 0, f'qemu: {q_err}')
+
+            cmp_out, cmp_err, cmp_rc = self.run_qemu_img_compare(a, b)
+            self.assertEqual(cmp_rc, 0, f'compare mismatch: {cmp_out}{cmp_err}')
+            self.assertIn('Images are identical.', cmp_out)
+            chk_out, chk_err, chk_rc = self.run_qemu_img_check(a)
+            self.assertEqual(chk_rc, 0, f'check failed: {chk_out}{chk_err}')
+            self.assertGreater(
+                a.stat().st_size, pre_size,
+                'a 2 MiB-cluster allocating write should grow the file')
+
+    def _count_fsyncs(self, argv, img, timeout=300):
+        """Run `instar bench *argv img` under strace and return the
+        number of fsync/fdatasync syscalls it issued (host-side; the
+        guest's `fsync_input` lands as a real fsync in the VMM).
+
+        ptrace over a KVM guest is slow, hence the generous timeout.
+        """
+        instar = self.get_instar_binary()
+        with tempfile.NamedTemporaryFile(
+                mode='r', suffix='.strace', delete=False) as tf:
+            trace_path = tf.name
+        try:
+            cmd = ['strace', '-f', '-qq', '-e',
+                   'trace=fsync,fdatasync', '-o', trace_path,
+                   str(instar), 'bench', *[str(a) for a in argv], str(img)]
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=timeout)
+            self.assertEqual(r.returncode, 0, f'instar under strace: {r.stderr}')
+            with open(trace_path) as f:
+                trace = f.read()
+            return len(re.findall(r'\b(?:fsync|fdatasync)\(', trace))
+        finally:
+            os.unlink(trace_path)
+
+    def test_flush_census_fsync_count(self):
+        """Decision 4 fsync census: on an overwrite-only (no-growth,
+        no-alloc) run the executor issues ZERO fsyncs and bench owns
+        exactly one op-side fsync per count-based cadence point, so the
+        cadence run's fsync count exceeds an interval-0 run's by exactly
+        `flushes-issued`.
+
+        Comparing two runs on the same fixture isolates the cadence
+        fsyncs from any constant VMM overhead: `-c 100 --flush-interval
+        50` issues 2 cadence fsyncs (JSON `flushes-issued` == 2),
+        `--flush-interval 0` issues 0, and neither allocates or grows
+        (the 8 MiB-prepopulated target absorbs the whole schedule as
+        in-place overwrites), so the strace difference must be exactly 2.
+        """
+        self._require_kvm()
+        if shutil.which('strace') is None:
+            self.skipTest('strace not available')
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            pristine = td / 'src.qcow2'
+            self.make_populated_qcow2(pristine, size='16M', fill_size='8M')
+
+            # flushes-issued identity on the cadence run (JSON).
+            jcopy = td / 'json.qcow2'
+            shutil.copy2(pristine, jcopy)
+            j_out, j_err, j_rc = self.run_instar_bench(
+                '-w', '-c', '100', '--pattern', '65',
+                '--flush-interval', '50', '-d', '1', '-f', 'qcow2',
+                '--output', 'json', str(jcopy))
+            self.assertEqual(j_rc, 0, f'instar: {j_err}')
+            self.assertEqual(json.loads(j_out)['flushes-issued'], 2)
+
+            # fsync counter: cadence - interval0 == flushes-issued.
+            cad = td / 'cadence.qcow2'
+            zero = td / 'zero.qcow2'
+            shutil.copy2(pristine, cad)
+            shutil.copy2(pristine, zero)
+            cadence_fsyncs = self._count_fsyncs(
+                ['-w', '-c', '100', '--pattern', '65',
+                 '--flush-interval', '50', '-d', '1', '-f', 'qcow2'], cad)
+            zero_fsyncs = self._count_fsyncs(
+                ['-w', '-c', '100', '--pattern', '65',
+                 '--flush-interval', '0', '-d', '1', '-f', 'qcow2'], zero)
+            self.assertEqual(
+                cadence_fsyncs - zero_fsyncs, 2,
+                f'cadence fsyncs {cadence_fsyncs} vs interval-0 '
+                f'{zero_fsyncs}: expected a difference of flushes-issued=2')
+
     def test_flush_interval_line_parity(self):
         """`--flush-interval 50 -d 1`: the "Sending flush every 50
         requests" line is present on both tools' stdout."""
@@ -1157,6 +1269,34 @@ class TestBenchWriteRefusals(BenchTestBase):
                 img, 'qcow2',
                 'bench: write tests are not supported for this image '
                 '(dirty or corrupt)')
+
+    def test_refuse_zero_flag_l2_entry(self):
+        """Issue #432 / decision 8, Variant A: a v3 all-zeroes-flag L2
+        entry in the TARGET image is refused, not blind-allocated over.
+
+        `qemu-io write -z 0 <cluster>` sets the QCOW_OFLAG_ZERO (bit 0)
+        on the first cluster's L2 entry without allocating a host
+        cluster. The pre-migration bench blind-allocated over such an
+        entry and chain-filled a pre-image the reader mis-handled
+        (#432 territory); the migrated path classifies it through the
+        crate as `UnknownL2Entry`, rendered as the appended bench wire
+        code 9 (`ERROR_IMAGE_INCONSISTENT`, host message "image
+        metadata is inconsistent"). The first scheduled write targets
+        offset 0 -> the zero-flag cluster, so the refusal fires before
+        any allocation, and the -c schedule's worst case fits the fresh
+        image's populated refblock coverage (no preemptive growth), so
+        the image is byte-unchanged.
+        """
+        self._require_kvm()
+        with tempfile.TemporaryDirectory() as td:
+            img = Path(td) / 'zeroflag.qcow2'
+            # A v3 (compat=1.1) image so the zero flag is legal; the
+            # default cluster size keeps the schedule inside cluster 0.
+            self.make_qcow2(img, size='16M')
+            self._qemu_io(img, 'write -z 0 65536')
+            self._assert_write_refused(
+                img, 'qcow2',
+                'bench: image metadata is inconsistent')
 
     def test_refuse_vmdk(self):
         """Host-side format gate; no guest launch, no /dev/kvm needed."""

@@ -4143,6 +4143,9 @@ fn map_bench_error(code: u32, error_detail: u64) -> String {
         c if c == shared::BenchResult::ERROR_ALLOC_EXHAUSTED => {
             "bench: image too large for in-place bench write".to_string()
         }
+        c if c == shared::BenchResult::ERROR_IMAGE_INCONSISTENT => {
+            "bench: image metadata is inconsistent".to_string()
+        }
         other => format!("bench: guest returned an unknown error code ({other})"),
     }
 }
@@ -5331,12 +5334,12 @@ mod bench_validate_tests {
 
     #[test]
     fn bench_error_codes_have_messages() {
-        // Every numeric BenchResult::ERROR_* code we ship (0..=8) must
+        // Every numeric BenchResult::ERROR_* code we ship (0..=9) must
         // render to a non-empty message, and an unknown code must
         // name itself in the fallback text -- if a future ERROR_*
         // lands without a matching arm in map_bench_error, this test
         // catches the silent fallthrough.
-        for code in 0..=8u32 {
+        for code in 0..=9u32 {
             let msg = map_bench_error(code, 0);
             assert!(!msg.is_empty(), "code {code} has empty message");
         }

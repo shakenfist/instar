@@ -537,19 +537,6 @@ pub fn worst_case_touched(
     }
 }
 
-/// Temporary re-export, removed in phase-6 step 6b: the refcount-growth
-/// planner (`plan_refcount_growth`, `GrowthCaps`, `RefcountGrowthPlan`,
-/// `GrowthOverflow`) moved verbatim to `qcow2_write::growth` in step 6a
-/// of `docs/plans/PLAN-qcow2-write-infrastructure-phase-06-bench.md`
-/// (settled decision 1). This keeps `src/operations/bench` compiling
-/// unchanged until 6b re-points it at the crate. `worst_case_touched` /
-/// [`TouchedBound`] stay here — they are BenchParams/schedule-coupled;
-/// bench passes the computed `worst_case_new_clusters` number across
-/// the boundary.
-pub use qcow2_write::growth::{
-    plan_refcount_growth, GrowthCaps, GrowthOverflow, RefcountGrowthPlan,
-};
-
 #[cfg(test)]
 mod tests {
     //! Unit tests for `BenchParams::validate` and `effective_step`.

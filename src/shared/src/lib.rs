@@ -4136,6 +4136,16 @@ impl BenchResult {
     /// renders "image too large for in-place bench write"). Unused until
     /// the 5b allocating-write path exists.
     pub const ERROR_ALLOC_EXHAUSTED: u32 = 8;
+    /// The qcow2 write planner (`crates/qcow2-write`) refused a cluster
+    /// as internally inconsistent: an unknown L1/L2 entry bit pattern
+    /// (including the v3 all-zeroes flag — issue #432 territory), a
+    /// staged-refcount inconsistency, missing refcount coverage, a
+    /// staging mismatch, or a defensive backing-fill refusal after the
+    /// op's copy-on-write resubmit. Appended by phase 6 step 6b
+    /// (`PLAN-qcow2-write-infrastructure-phase-06-bench.md`, decision 6)
+    /// for the crate classification refusals bench had no prior
+    /// rendering for. The host renders "image metadata is inconsistent".
+    pub const ERROR_IMAGE_INCONSISTENT: u32 = 9;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -5313,8 +5323,9 @@ mod tests {
 
     #[test]
     fn bench_result_error_codes_distinct() {
-        // Phase 2 defines codes 0..=6; phase 5 appends 7..=8. Confirm
-        // every code is distinct and contiguously numbered.
+        // Phase 2 defines codes 0..=6; phase 5 appends 7..=8; phase 6
+        // step 6b appends 9. Confirm every code is distinct and
+        // contiguously numbered.
         let codes = [
             BenchResult::ERROR_OK,
             BenchResult::ERROR_BAD_CONFIG,
@@ -5325,6 +5336,7 @@ mod tests {
             BenchResult::ERROR_IO_FLUSH,
             BenchResult::ERROR_WRITE_UNSUPPORTED,
             BenchResult::ERROR_ALLOC_EXHAUSTED,
+            BenchResult::ERROR_IMAGE_INCONSISTENT,
         ];
         for (i, c) in codes.iter().enumerate() {
             assert_eq!(*c, i as u32);
