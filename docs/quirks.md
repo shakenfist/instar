@@ -941,7 +941,7 @@ host CLI also refuses them via `peek_is_vmdk_descriptor`
 before launching the guest, pointing the user at `qemu-img
 map` as the workaround.
 
-### qcow2 v3 standard-L2 `QCOW_OFLAG_ZERO` not honoured
+### qcow2 v3 standard-L2 `QCOW_OFLAG_ZERO` honoured (fixed)
 
 In qcow2 v3 (compat=1.1) images that use *standard* L2 tables
 (8-byte entries, not extended L2), the `QCOW_OFLAG_ZERO` bit
@@ -949,16 +949,22 @@ In qcow2 v3 (compat=1.1) images that use *standard* L2 tables
 (when `host_offset == 0`) or `QCOW2_CLUSTER_ZERO_ALLOC` (when
 `host_offset != 0`) — both of which qemu-img reports as
 `present: true, zero: true, data: false` (`ZeroAllocated`).
-instar's `classify_qcow2_l2_standard` ignores the bit and
-treats any non-zero L2 entry without `OFLAG_COMPRESSED` as
-`Data`; if `host_offset == 0` it reports `Hole`. This is a
-pre-existing gap in the qcow2 parser (`cluster_lookup` has no
-`OFLAG_ZERO` branch either) inherited by map for consistency.
-Reporting the bit correctly is a single-edit change in
-`classify_qcow2_l2_standard` once we want to land it; tracked
-as future work in PLAN-map.md. Extended-L2 subcluster-bitmap
-`ZeroAllocated` reporting is unaffected — instar walks the
-bitmap and classifies subclusters correctly.
+Historically instar's `classify_qcow2_l2_standard` ignored
+the bit and treated any non-zero L2 entry without
+`OFLAG_COMPRESSED` as `Data` (reporting `Hole` when
+`host_offset == 0`) — a pre-existing gap in the qcow2 parser
+(`cluster_lookup` had no `OFLAG_ZERO` branch either) inherited
+by map for consistency.
+
+**Fixed** as step 7z of PLAN-qcow2-write-infrastructure
+(alongside the chain-reader fix for
+[#432](https://github.com/shakenfist/instar/issues/432)):
+`classify_qcow2_l2_standard` now reports a zero-flag standard
+entry as `ZeroAllocated` for both `host_offset == 0` and
+`host_offset != 0`, and `cluster_lookup` gained a matching
+`ClusterLookup::Zero` verdict. Extended-L2 subcluster-bitmap
+`ZeroAllocated` reporting was always correct — instar walks
+the bitmap and classifies subclusters directly.
 
 ### qcow2 compressed clusters report `compressed: false`
 
@@ -1453,23 +1459,33 @@ in the OVERLAY itself are skipped, before and after
 phase 5: the skip probe treats any non-zero L2 entry as
 mapped.
 
-### The chain reader ignores the zero flag on classic L2 entries
+### The chain reader honours the zero flag on classic L2 entries (fixed)
 
-`cluster_lookup`'s classic (non-extended-L2) arm in
-`crates/qcow2` ignores bit 0 of v3 standard L2 entries, so
-a zero-flag cluster (e.g. from `qemu-io write -z`) in a
-chain member reads as fall-through to the backing or as
-stale data bytes instead of zeros — silent active-view
+Historically `cluster_lookup`'s classic (non-extended-L2)
+arm in `crates/qcow2` ignored bit 0 (`QCOW_OFLAG_ZERO`) of
+v3 standard L2 entries, so a zero-flag cluster (e.g. from
+`qemu-io write -z`) in a chain member read as fall-through
+to the backing (`host_offset == 0`) or as stale data bytes
+(`host_offset != 0`) instead of zeros — silent active-view
 corruption. Blast radius: every consumer of the chain
 reader — rebase, convert, compare and bench. Pre-existing
 `crates/qcow2` defect
 ([#432](https://github.com/shakenfist/instar/issues/432)),
 identified during phase 5 of
 PLAN-qcow2-write-infrastructure and explicitly NOT fixed by
-it; differential matrices avoid
-`write -z` seeds until it is fixed. (The map subcommand's
-sibling quirk "qcow2 v3 standard-L2 `QCOW_OFLAG_ZERO` not
-honoured" above is the read-only view of the same gap.)
+it.
+
+**Fixed** as step 7z of that plan (the standalone read-path
+fix landed before any COW work): `cluster_lookup` now
+returns a dedicated `ClusterLookup::Zero` verdict whenever
+bit 0 is set on a classic entry — for both `host_offset ==
+0` and `host_offset != 0` — and `read_chain_virtual_cluster`
+zero-fills that cluster without falling through to a backing
+layer or reading the host offset. The map subcommand's
+sibling classifier `classify_qcow2_l2_standard` was fixed in
+the same change (see "qcow2 v3 standard-L2 `QCOW_OFLAG_ZERO`
+honoured" above). Differential matrices no longer need to
+avoid `write -z` seeds.
 
 ### Deep-allocation safe rebase refuses on refcount exhaustion instead of hanging
 
@@ -1776,18 +1792,23 @@ the pure-refactor bar wins over cosmetically unifying it with
 commit's (error 17) and rebase's (error 16) equivalents. The
 refusal is pre-mutation and byte-idempotent.
 
-### Zero-flag L2 entries: target-side refused, backing-side still corrupts
+### Zero-flag L2 entries: target-side refused, backing-side fixed
 
 A qcow2 v3 zero-flag (`QCOW_OFLAG_ZERO`) on the L2 entry bench
-is about to overwrite now refuses with code 9 (Variant A) —
+is about to overwrite refuses with code 9 (Variant A) —
 pre-migration bench blind-allocated over it and chain-filled a
-pre-image the reader mis-handles. But a zero flag in a
-**backing** cluster reached through the COW read (Variant B)
-still mis-fills after the migration: that is a read-path defect
-in `crates/qcow2`'s `cluster_lookup`
+pre-image the reader mis-handled. A zero flag in a **backing**
+cluster reached through the COW read (Variant B) was, at phase
+6, still mis-filled: a read-path defect in `crates/qcow2`'s
+`cluster_lookup`
 ([#432](https://github.com/shakenfist/instar/issues/432)), not
-fixed by phase 6. Code 9 does **not** eliminate zero-flag
-corruption for backed images.
+fixed by phase 6.
+
+**Fixed** in step 7z (the standalone read-path fix landed
+before the COW work): `cluster_lookup` now returns
+`ClusterLookup::Zero` for a classic zero-flag entry and the
+chain reader zero-fills it, so Variant B no longer corrupts.
+Variant A's code-9 refusal is unchanged.
 
 ### Flush and durability posture (fsync census preserved)
 
