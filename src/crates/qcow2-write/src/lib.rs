@@ -72,8 +72,13 @@
 
 pub mod growth;
 
-use qcow2::{QcowHeader, L1_OFFSET_MASK, L2_OFFSET_MASK, OFLAG_COMPRESSED, OFLAG_COPIED};
-use snapshot::qcow2::{alloc_cluster_in_refblocks, read_refcount_in_block, AllocCursor};
+use qcow2::{
+    QcowHeader, L1_OFFSET_MASK, L2_OFFSET_MASK, OFLAG_COMPRESSED, OFLAG_COPIED, QCOW_OFLAG_ZERO,
+};
+use snapshot::qcow2::{
+    alloc_cluster_in_refblocks, check_refcount_after_addend, read_refcount_in_block,
+    set_refcount_in_block, AllocCursor,
+};
 use snapshot::SnapshotError;
 
 // ---------------------------------------------------------------------------
@@ -590,7 +595,8 @@ impl From<Gate> for u32 {
     }
 }
 
-/// Check the decision-8 write envelope against a parsed header.
+/// Check the decision-8 write envelope against a parsed header,
+/// refusing snapshot-bearing images (the safe-by-default policy).
 ///
 /// Pure header predicate, no I/O. Returns the first tripped
 /// [`Gate`] in a fixed check order (version, refcount width,
@@ -599,7 +605,27 @@ impl From<Gate> for u32 {
 /// the defensive version check first). [`new_state`] calls this
 /// before building any state; ops may also call it directly for
 /// early refusal.
+///
+/// This is the `allow_snapshots == false` specialisation of
+/// [`check_envelope_with`]; a caller that has copy-on-write
+/// support (phase 7) passes `true` there to relax
+/// [`Gate::HasSnapshots`] (decision 4b — the gate becomes a
+/// capability policy, not a hard refusal).
 pub fn check_envelope(hdr: &QcowHeader) -> Result<(), Gate> {
+    check_envelope_with(hdr, false)
+}
+
+/// [`check_envelope`] with the decision-4b copy-on-write
+/// capability made explicit.
+///
+/// When `allow_snapshots` is `true` the [`Gate::HasSnapshots`]
+/// refusal is skipped: the caller undertakes to COW every
+/// snapshot-shared cluster it touches (the crate does this when
+/// the [`WriteState`] was built by [`new_state_cow`]). Every
+/// other gate is unconditional. `allow_snapshots == false`
+/// reproduces today's refusal exactly, so any non-COW caller
+/// stays safe by default.
+pub fn check_envelope_with(hdr: &QcowHeader, allow_snapshots: bool) -> Result<(), Gate> {
     if hdr.version != 2 && hdr.version != 3 {
         return Err(Gate::UnsupportedVersion);
     }
@@ -627,7 +653,7 @@ pub fn check_envelope(hdr: &QcowHeader) -> Result<(), Gate> {
     if hdr.dirty || hdr.corrupt {
         return Err(Gate::DirtyCorrupt);
     }
-    if hdr.nb_snapshots > 0 {
+    if !allow_snapshots && hdr.nb_snapshots > 0 {
         return Err(Gate::HasSnapshots);
     }
     Ok(())
@@ -721,9 +747,11 @@ pub enum WriteError {
     /// unknown semantics could corrupt the image. Code 10.
     UnknownL1Entry,
     /// Classification refusal: an L2 entry carries an unknown
-    /// bit pattern — the v3 all-zeroes flag (bit 0), reserved
-    /// bits, a flags-only entry with no offset, or a misaligned
-    /// offset. Code 11.
+    /// bit pattern — a reserved bit, a flags-only entry with no
+    /// offset, or a misaligned offset. (The v3 all-zeroes flag,
+    /// bit 0, is no longer refused here: decision 6 classifies a
+    /// zero-flag target by its host offset and refcount.) Code
+    /// 11.
     UnknownL2Entry,
     /// Classification refusal: an allocated entry whose target
     /// cluster has staged refcount zero — the image's refcounts
@@ -874,6 +902,14 @@ pub struct WriteState {
     /// Whether the gated header carries a backing file
     /// reference (drives [`WriteError::NeedsBackingFill`]).
     has_backing: bool,
+    /// Whether copy-on-write is enabled (decision 4b): built by
+    /// [`new_state_cow`]. When `true`, a snapshot-shared data
+    /// cluster or L2 table classifies into COW emission (C1/C2)
+    /// instead of the [`WriteError::SnapshotShared`] /
+    /// [`WriteError::SnapshotSharedL2Table`] refusal, which is
+    /// kept as the safe-by-default (`false`) behaviour and as
+    /// defence in depth.
+    cow_enabled: bool,
     /// Whether the staged L1 diverges from disk (an L1 patch was
     /// emitted); cleared by [`plan_flush`]'s L1 write-back.
     l1_dirty: bool,
@@ -936,6 +972,12 @@ impl WriteState {
     /// The `snapshot` crate's allocator cursor (decision 10).
     pub fn alloc_cursor(&self) -> &AllocCursor {
         &self.alloc_cursor
+    }
+
+    /// Whether copy-on-write is enabled for this state (built by
+    /// [`new_state_cow`]; decision 4b).
+    pub fn cow_enabled(&self) -> bool {
+        self.cow_enabled
     }
 
     /// Whether the staged L1 diverges from disk (flushed by
@@ -1021,8 +1063,29 @@ impl WriteState {
 /// On success all bookkeeping is zeroed: every L2 slot invalid,
 /// no refblock dirty, access counter zero and a default
 /// [`AllocCursor`].
+///
+/// Snapshot-bearing images refuse here as [`Gate::HasSnapshots`];
+/// a caller with copy-on-write support uses [`new_state_cow`]
+/// instead (decision 4b).
 pub fn new_state(hdr: &QcowHeader, cfg: &StagingConfig) -> Result<WriteState, Gate> {
-    check_envelope(hdr)?;
+    new_state_impl(hdr, cfg, false)
+}
+
+/// Build a copy-on-write [`WriteState`] (decision 4b): the
+/// envelope permits snapshot-bearing images
+/// ([`check_envelope_with`] with `allow_snapshots == true`), and
+/// snapshot-shared clusters classify into COW emission (C1/C2)
+/// rather than refusing. Every other envelope gate still applies.
+pub fn new_state_cow(hdr: &QcowHeader, cfg: &StagingConfig) -> Result<WriteState, Gate> {
+    new_state_impl(hdr, cfg, true)
+}
+
+fn new_state_impl(
+    hdr: &QcowHeader,
+    cfg: &StagingConfig,
+    cow_enabled: bool,
+) -> Result<WriteState, Gate> {
+    check_envelope_with(hdr, cow_enabled)?;
     if cfg.l2_slots == 0
         || cfg.l2_slots > MAX_L2_SLOTS
         || cfg.max_refblocks == 0
@@ -1038,6 +1101,7 @@ pub fn new_state(hdr: &QcowHeader, cfg: &StagingConfig) -> Result<WriteState, Ga
         access_counter: 0,
         alloc_cursor: AllocCursor::default(),
         has_backing: hdr.backing_file_offset != 0,
+        cow_enabled,
         l1_dirty: false,
         steps_since_barrier: 0,
         slot_pending_zero: [0u64; MAX_L2_SLOTS / 64],
@@ -1087,6 +1151,39 @@ enum ClusterStage {
     /// makes the cluster reachable is next (decision 7(a): data
     /// before the patch).
     TailDone,
+    // ----- L2-table copy-on-write (C2, 7p-corrected) -----
+    /// The shared L2 table's replacement `T'` was allocated
+    /// (`l2_host`, `cow_src` holds old `T`); the LoadCluster that
+    /// copies old `T` into the window slot is next.
+    CowL2Load,
+    /// The old-`T` load was emitted and the slot re-pointed at
+    /// `T'` (dirty); the L1 patch to `T' | COPIED` is next.
+    CowL2Repoint,
+    /// The L1 patch was emitted; the `rc(T)` decrement (a staged
+    /// mutation, NO child-refcount change) is next, then a
+    /// window boundary so the load executes before the child is
+    /// classified.
+    CowL2Decrement,
+    // ----- data-cluster copy-on-write (C1) -----
+    /// A fresh data cluster `D'` was allocated (`data_host`) to
+    /// COW the shared `D` (`cow_src`); the pre-image
+    /// establishment is next (zeros for a zero-flag source, a
+    /// full copy of old `D` otherwise; skipped for a
+    /// full-cluster overwrite).
+    CowDataEnter,
+    /// The old-`D` read into [`RegionId::Bounce`] was emitted;
+    /// the full copy `Bounce -> D'` is next (non-zero pre-image
+    /// only).
+    CowDataCopy,
+    /// The pre-image is in `D'`; the body write of the caller's
+    /// bytes is next.
+    CowDataBody,
+    /// The body write was emitted; the L2 patch to `D' | COPIED`
+    /// is next (decision 7(a): data before the patch).
+    CowDataPatch,
+    /// The L2 patch was emitted; the `rc(D)` decrement (a staged
+    /// mutation, refcounts-last) closes the cluster.
+    CowDataDecrement,
 }
 
 /// Resume point for an in-flight [`plan_write`] request.
@@ -1107,6 +1204,15 @@ struct WriteProgress {
     /// Fresh data-cluster host offset (valid from
     /// [`ClusterStage::DataAlloc`]).
     data_host: u64,
+    /// The old (shared) cluster being copied-on-write — the data
+    /// cluster `D` for C1 or the L2 table `T` for C2 — whose
+    /// staged refcount is decremented at the end of the COW
+    /// group. Valid from the COW stages.
+    cow_src: u64,
+    /// Whether the COWed data cluster's pre-image is all-zero (a
+    /// zero-flag source, decision 6) rather than the old
+    /// cluster's bytes. Valid in the data-COW stages.
+    cow_zero_preimage: bool,
 }
 
 /// Flush emission stage (decision 7(c)-(d) skeleton).
@@ -1261,6 +1367,35 @@ fn zero_range_step(disk_offset: u64, len: u64, dev: TargetDevice) -> Step {
     }
 }
 
+/// Read one cluster from `disk_offset` on `device` into
+/// [`RegionId::Bounce`] — the COW pre-image read of the old
+/// shared data cluster (C1).
+fn read_cluster_to_bounce_step(disk_offset: u64, cs: u64, dev: TargetDevice) -> Step {
+    Step {
+        kind: StepKind::ReadCluster,
+        device: dev,
+        region: RegionId::Bounce,
+        region_offset: 0,
+        disk_offset,
+        len: cs,
+        value: 0,
+    }
+}
+
+/// Write the full [`RegionId::Bounce`] cluster back out to
+/// `disk_offset` — the COW pre-image copy `Bounce -> D'` (C1).
+fn write_bounce_cluster_step(disk_offset: u64, cs: u64, dev: TargetDevice) -> Step {
+    Step {
+        kind: StepKind::WriteRange,
+        device: dev,
+        region: RegionId::Bounce,
+        region_offset: 0,
+        disk_offset,
+        len: cs,
+        value: 0,
+    }
+}
+
 /// The body write for the caller's [`DataSource`]: a
 /// [`StepKind::WriteRange`] from the caller-data region (offset
 /// advanced by the request bytes already consumed) or a
@@ -1379,14 +1514,77 @@ fn alloc_cluster(
     }
 }
 
+/// Decrement the staged refcount of the cluster at host offset
+/// `host` by one — the copy-on-write bookkeeping the allocator
+/// does not expose (the allocator only ever increments; C1/C2).
+///
+/// Mirrors [`alloc_cluster`]'s single-staged-copy mutation
+/// (decision 6): the covering staged refblock is read, decremented
+/// through the `snapshot` scalar accessors, written back in place,
+/// and marked dirty so [`plan_flush`] writes it back last
+/// (decision 7(c), refcounts last). A decrement that would take
+/// the refcount below zero is an image inconsistency
+/// ([`WriteError::RefcountInconsistent`], the same family as a
+/// staged-refcount-zero allocated entry) — never a silent wrap,
+/// and never a free of a live cluster (a COWed old cluster still
+/// carries the snapshot's reference, so its post-decrement count
+/// is >= 1 on any consistent image).
+fn dec_refcount(
+    state: &mut WriteState,
+    staged: &mut StagedRegions<'_>,
+    host: u64,
+) -> Result<(), WriteError> {
+    let geo = state.geometry;
+    let cs = geo.cluster_size;
+    let cluster_index = host / cs;
+    let rb_idx = (cluster_index / geo.entries_per_refblock) as usize;
+    let rb_count = staged.refblocks.len() / cs as usize;
+    if rb_idx >= rb_count {
+        return Err(WriteError::RefcountCoverage);
+    }
+    let start = rb_idx * cs as usize;
+    let block = &mut staged.refblocks[start..start + cs as usize];
+    let local = cluster_index % geo.entries_per_refblock;
+    let cur = read_refcount_in_block(block, local, geo.refcount_bits)
+        .map_err(|_| WriteError::StagedRegionsMismatch)?;
+    // A negative addend that underflows returns an error the
+    // scalar accessor maps to a caller-bookkeeping fault; surface
+    // it as an image inconsistency rather than wrapping.
+    let new = check_refcount_after_addend(cur, -1, geo.refcount_bits)
+        .map_err(|_| WriteError::RefcountInconsistent)?;
+    set_refcount_in_block(block, local, geo.refcount_bits, new)
+        .map_err(|_| WriteError::StagedRegionsMismatch)?;
+    state.refblock_dirty_set(rb_idx);
+    Ok(())
+}
+
 /// Classification verdict for one L2 entry (see the table on
 /// [`plan_write`]).
 enum Classified {
     /// No mapping: allocate a fresh data cluster.
     Unallocated,
     /// Owned, exclusively referenced data cluster at this host
-    /// offset: overwrite in place.
+    /// offset: overwrite in place, no metadata change.
     Owned(u64),
+    /// A zero-flag entry with an allocated host offset and staged
+    /// refcount 1 (decision 6, 7p-corrected): reuse the host
+    /// cluster in place, but the eventual L2 patch clears the
+    /// zero flag (`host | COPIED`), and uncovered bytes are
+    /// zero-filled (the pre-image is logically zero). qemu does
+    /// NOT free the old offset, so neither do we.
+    OwnedZero(u64),
+    /// A snapshot-shared cluster to copy-on-write (C1): the old
+    /// host `D`, and whether its pre-image is all-zero (a
+    /// zero-flag shared source, decision 6) rather than the old
+    /// cluster's bytes. Only produced when [`WriteState`] is
+    /// COW-enabled; otherwise the classifier refuses with
+    /// [`WriteError::SnapshotShared`].
+    CowData {
+        /// Old shared data cluster host offset.
+        old: u64,
+        /// Pre-image is all-zero (zero-flag source) vs old bytes.
+        zero_preimage: bool,
+    },
 }
 
 /// Classify one L2 entry (decision 8's plan-time refusals plus
@@ -1403,16 +1601,53 @@ fn classify_l2_entry(
     if entry & OFLAG_COMPRESSED != 0 {
         return Err(WriteError::CompressedCluster);
     }
-    if entry & !(OFLAG_COPIED | L2_OFFSET_MASK) != 0 {
-        // Covers the v3 all-zeroes flag (bit 0) and every
-        // reserved bit.
+    // Bits outside {COPIED, offset, the v3 zero flag} are
+    // reserved and unknown; refuse them (the zero flag is now
+    // handled per decision 6 rather than refused wholesale).
+    if entry & !(OFLAG_COPIED | L2_OFFSET_MASK | QCOW_OFLAG_ZERO) != 0 {
         return Err(WriteError::UnknownL2Entry);
     }
     let host = entry & L2_OFFSET_MASK;
-    if host == 0 || !host.is_multiple_of(state.geometry.cluster_size) {
+    let cs = state.geometry.cluster_size;
+    if entry & QCOW_OFLAG_ZERO != 0 {
+        // Zero-flag WRITE target (decision 6, 7p-corrected). qemu
+        // does NOT free the old offset.
+        if host == 0 {
+            // No allocation behind the flag: allocate fresh /
+            // zero-fill, exactly like an unmapped entry.
+            return Ok(Classified::Unallocated);
+        }
+        if !host.is_multiple_of(cs) {
+            return Err(WriteError::UnknownL2Entry);
+        }
+        // host != 0: classify EXACTLY like a Standard cluster by
+        // refcount (COPIED is not consulted for a zero-flag
+        // entry).
+        let rc = read_staged_refcount(state, staged, host)?;
+        if rc == 0 {
+            return Err(WriteError::RefcountInconsistent);
+        }
+        if rc > 1 {
+            if state.cow_enabled {
+                return Ok(Classified::CowData {
+                    old: host,
+                    zero_preimage: true,
+                });
+            }
+            return Err(WriteError::SnapshotShared);
+        }
+        return Ok(Classified::OwnedZero(host));
+    }
+    if host == 0 || !host.is_multiple_of(cs) {
         return Err(WriteError::UnknownL2Entry);
     }
     if entry & OFLAG_COPIED == 0 {
+        if state.cow_enabled {
+            return Ok(Classified::CowData {
+                old: host,
+                zero_preimage: false,
+            });
+        }
         return Err(WriteError::SnapshotShared);
     }
     let rc = read_staged_refcount(state, staged, host)?;
@@ -1420,20 +1655,40 @@ fn classify_l2_entry(
         return Err(WriteError::RefcountInconsistent);
     }
     if rc > 1 {
+        if state.cow_enabled {
+            return Ok(Classified::CowData {
+                old: host,
+                zero_preimage: false,
+            });
+        }
         return Err(WriteError::SnapshotShared);
     }
     Ok(Classified::Owned(host))
 }
 
-/// Validate an allocated L1 entry and return the L2 table's host
-/// offset (the L2-table analogue of [`classify_l2_entry`]; the
-/// COPIED + refcount check here is what makes the #421-style
-/// shared-L2 in-place patch unreachable).
+/// Verdict for one allocated L1 entry (the L2-table analogue of
+/// [`Classified`]).
+enum L1Verdict {
+    /// Owned, exclusively referenced L2 table at this host
+    /// offset: patch and write it in place.
+    Owned(u64),
+    /// A snapshot-shared L2 table to copy-on-write (C2): the old
+    /// host `T`. Only produced when [`WriteState`] is COW-enabled;
+    /// otherwise the classifier refuses with
+    /// [`WriteError::SnapshotSharedL2Table`].
+    CowL2(u64),
+}
+
+/// Validate an allocated L1 entry and classify the L2 table (the
+/// L2-table analogue of [`classify_l2_entry`]; the COPIED +
+/// refcount check here is what routed the #421-style shared-L2
+/// in-place patch to a refusal, and now routes it to C2 COW when
+/// COW is enabled).
 fn validate_l1_entry(
     state: &WriteState,
     staged: &StagedRegions<'_>,
     raw: u64,
-) -> Result<u64, WriteError> {
+) -> Result<L1Verdict, WriteError> {
     if raw & !(OFLAG_COPIED | L1_OFFSET_MASK) != 0 {
         return Err(WriteError::UnknownL1Entry);
     }
@@ -1442,6 +1697,9 @@ fn validate_l1_entry(
         return Err(WriteError::UnknownL1Entry);
     }
     if raw & OFLAG_COPIED == 0 {
+        if state.cow_enabled {
+            return Ok(L1Verdict::CowL2(host));
+        }
         return Err(WriteError::SnapshotSharedL2Table);
     }
     let rc = read_staged_refcount(state, staged, host)?;
@@ -1449,9 +1707,12 @@ fn validate_l1_entry(
         return Err(WriteError::RefcountInconsistent);
     }
     if rc > 1 {
+        if state.cow_enabled {
+            return Ok(L1Verdict::CowL2(host));
+        }
         return Err(WriteError::SnapshotSharedL2Table);
     }
-    Ok(host)
+    Ok(L1Verdict::Owned(host))
 }
 
 /// The L2 entry for `l2_idx` as staged in `slot` — substituting
@@ -1521,25 +1782,45 @@ fn drive_write(
                         prog.l2_host = alloc_cluster(state, staged)?;
                         prog.stage = ClusterStage::FreshAlloc;
                     } else {
-                        let l2_host = validate_l1_entry(state, staged, raw)?;
-                        push_step(state, steps, load_step(prog.slot, l2_host, cs, dev))?;
-                        let v = prog.slot as usize;
-                        let last = state.l2_slots[v].last_access;
-                        state.l2_slots[v] = L2Slot {
-                            valid: true,
-                            dirty: false,
-                            l1_idx,
-                            host_offset: l2_host,
-                            last_access: last,
-                        };
-                        prog.stage = ClusterStage::Enter;
-                        // Decision-5 window protocol: the slot's
-                        // bytes exist only after the executor
-                        // runs the LoadCluster, so close the
-                        // window here; the resumed call re-enters
-                        // via the window-hit path and classifies
-                        // real bytes.
-                        return Err(WriteError::BufFull);
+                        match validate_l1_entry(state, staged, raw)? {
+                            L1Verdict::Owned(l2_host) => {
+                                push_step(state, steps, load_step(prog.slot, l2_host, cs, dev))?;
+                                let v = prog.slot as usize;
+                                let last = state.l2_slots[v].last_access;
+                                state.l2_slots[v] = L2Slot {
+                                    valid: true,
+                                    dirty: false,
+                                    l1_idx,
+                                    host_offset: l2_host,
+                                    last_access: last,
+                                };
+                                prog.stage = ClusterStage::Enter;
+                                // Decision-5 window protocol: the
+                                // slot's bytes exist only after
+                                // the executor runs the
+                                // LoadCluster, so close the window
+                                // here; the resumed call re-enters
+                                // via the window-hit path and
+                                // classifies real bytes.
+                                return Err(WriteError::BufFull);
+                            }
+                            L1Verdict::CowL2(old_l2_host) => {
+                                // L2-table COW (C2, 7p-corrected):
+                                // allocate T', copy old T into the
+                                // slot, re-point the slot and the
+                                // L1 at T', decrement rc(T), and
+                                // touch NO child refcount (the
+                                // children are already rc>=2 from
+                                // snapshot creation; a child bump
+                                // would corrupt to rc3). The
+                                // children keep COPIED clear, so a
+                                // write through T' into one fires
+                                // per-child data COW (C1/C3).
+                                prog.l2_host = alloc_cluster(state, staged)?;
+                                prog.cow_src = old_l2_host;
+                                prog.stage = ClusterStage::CowL2Load;
+                            }
+                        }
                     }
                 }
                 ClusterStage::FreshAlloc => {
@@ -1590,6 +1871,34 @@ fn drive_write(
                             prog.consumed += win_len;
                             prog.stage = ClusterStage::Enter;
                             break 'cluster;
+                        }
+                        Classified::OwnedZero(host) => {
+                            // Zero-flag target, rc 1 (decision 6):
+                            // reuse the existing host cluster, but
+                            // treat it like a fresh allocation so
+                            // the uncovered head/tail are
+                            // zero-filled (the pre-image is
+                            // logically zero) and the L2 patch
+                            // clears the zero flag (host |
+                            // COPIED). No allocation, no refcount
+                            // change, and — unlike Unallocated —
+                            // no NeedsBackingFill refusal, because
+                            // the pre-image is zero regardless of
+                            // any backing chain.
+                            prog.data_host = host;
+                            prog.stage = ClusterStage::DataAlloc;
+                        }
+                        Classified::CowData { old, zero_preimage } => {
+                            // Data-cluster COW (C1): allocate D',
+                            // establish the pre-image, write the
+                            // body, patch the L2 entry to D' |
+                            // COPIED, then decrement rc(D). The
+                            // old D is never freed (a snapshot
+                            // still references it).
+                            prog.data_host = alloc_cluster(state, staged)?;
+                            prog.cow_src = old;
+                            prog.cow_zero_preimage = zero_preimage;
+                            prog.stage = ClusterStage::CowDataEnter;
                         }
                         Classified::Unallocated => {
                             // Effective cluster end for coverage
@@ -1667,6 +1976,123 @@ fn drive_write(
                         ),
                     )?;
                     state.l2_slots[prog.slot as usize].dirty = true;
+                    prog.consumed += win_len;
+                    prog.stage = ClusterStage::Enter;
+                    break 'cluster;
+                }
+                // ----- L2-table COW (C2) -----
+                ClusterStage::CowL2Load => {
+                    // Read old T into the window slot; the slot is
+                    // then aliased to the fresh T' so its
+                    // writeback (and the child's C1 patch) lands
+                    // in T', leaving old T intact for the snapshot.
+                    push_step(state, steps, load_step(prog.slot, prog.cow_src, cs, dev))?;
+                    let v = prog.slot as usize;
+                    let last = state.l2_slots[v].last_access;
+                    state.l2_slots[v] = L2Slot {
+                        valid: true,
+                        dirty: true,
+                        l1_idx,
+                        host_offset: prog.l2_host,
+                        last_access: last,
+                    };
+                    prog.stage = ClusterStage::CowL2Repoint;
+                }
+                ClusterStage::CowL2Repoint => {
+                    push_step(
+                        state,
+                        steps,
+                        patch_step(
+                            RegionId::L1,
+                            l1_idx as u64 * 8,
+                            prog.l2_host | OFLAG_COPIED,
+                            dev,
+                        ),
+                    )?;
+                    state.l1_dirty = true;
+                    prog.stage = ClusterStage::CowL2Decrement;
+                }
+                ClusterStage::CowL2Decrement => {
+                    // rc(T) -= 1, NO child-refcount change (7p).
+                    dec_refcount(state, staged, prog.cow_src)?;
+                    prog.stage = ClusterStage::Enter;
+                    // Decision-5 window protocol: the slot's bytes
+                    // exist only after the executor runs the
+                    // LoadCluster above, so close the window; the
+                    // resumed call re-enters via the window-hit
+                    // path and classifies the (still
+                    // snapshot-shared) child, triggering C1.
+                    return Err(WriteError::BufFull);
+                }
+                // ----- data-cluster COW (C1) -----
+                ClusterStage::CowDataEnter => {
+                    let full = in_off == 0 && win_len == cs;
+                    if full {
+                        // Full-cluster overwrite: no pre-image
+                        // needed (every byte is replaced).
+                        prog.stage = ClusterStage::CowDataBody;
+                    } else if prog.cow_zero_preimage {
+                        // Zero-flag source (decision 6): the
+                        // pre-image is all zero, so zero the fresh
+                        // D' and overlay the body.
+                        push_step(state, steps, zero_range_step(prog.data_host, cs, dev))?;
+                        prog.stage = ClusterStage::CowDataBody;
+                    } else {
+                        // Standard shared source: read old D into
+                        // the bounce buffer for a full copy into
+                        // D' (the RMW pre-image; no backing read
+                        // is needed — the pre-image is the old
+                        // cluster on the same device).
+                        push_step(
+                            state,
+                            steps,
+                            read_cluster_to_bounce_step(prog.cow_src, cs, dev),
+                        )?;
+                        prog.stage = ClusterStage::CowDataCopy;
+                    }
+                }
+                ClusterStage::CowDataCopy => {
+                    push_step(
+                        state,
+                        steps,
+                        write_bounce_cluster_step(prog.data_host, cs, dev),
+                    )?;
+                    prog.stage = ClusterStage::CowDataBody;
+                }
+                ClusterStage::CowDataBody => {
+                    push_step(
+                        state,
+                        steps,
+                        body_step(
+                            prog.data,
+                            prog.consumed,
+                            prog.data_host + in_off,
+                            win_len,
+                            dev,
+                        ),
+                    )?;
+                    prog.stage = ClusterStage::CowDataPatch;
+                }
+                ClusterStage::CowDataPatch => {
+                    // Decision 7(a): every write covering D'
+                    // precedes this patch in the stream.
+                    push_step(
+                        state,
+                        steps,
+                        patch_step(
+                            RegionId::L2Slot(prog.slot),
+                            l2_idx * 8,
+                            prog.data_host | OFLAG_COPIED,
+                            dev,
+                        ),
+                    )?;
+                    state.l2_slots[prog.slot as usize].dirty = true;
+                    prog.stage = ClusterStage::CowDataDecrement;
+                }
+                ClusterStage::CowDataDecrement => {
+                    // rc(D) -= 1 (refcounts-last, decision 7(c)):
+                    // the old D keeps the snapshot's reference.
+                    dec_refcount(state, staged, prog.cow_src)?;
                     prog.consumed += win_len;
                     prog.stage = ClusterStage::Enter;
                     break 'cluster;
@@ -1792,16 +2218,29 @@ fn drive_flush(
 /// | zero | allocate a data cluster (fresh L2 first when the L1 slot is empty); zero-fill the uncovered head/tail; write the data; patch the entry `host \| COPIED` |
 /// | zero, backing file present, coverage partial below the effective cluster end | [`WriteError::NeedsBackingFill`] |
 /// | `OFLAG_COMPRESSED` set | [`WriteError::CompressedCluster`] |
-/// | v3 zero flag / reserved bits / flags-only / misaligned | [`WriteError::UnknownL2Entry`] |
-/// | allocated, `OFLAG_COPIED` clear | [`WriteError::SnapshotShared`] |
+/// | reserved bits / flags-only / misaligned | [`WriteError::UnknownL2Entry`] |
+/// | zero flag, host == 0 | treated as `zero` above (allocate fresh) |
+/// | zero flag, host != 0, staged refcount 1 | owned-zero: reuse the host, zero-fill the uncovered head/tail, patch `host \| COPIED` (clears the zero flag; decision 6, no free of the old offset) |
+/// | zero flag, host != 0, staged refcount > 1 | COW-enabled: C1 with an all-zero pre-image; else [`WriteError::SnapshotShared`] |
+/// | allocated, `OFLAG_COPIED` clear | COW-enabled: C1 data-cluster COW; else [`WriteError::SnapshotShared`] |
 /// | allocated, staged refcount 0 | [`WriteError::RefcountInconsistent`] |
-/// | allocated, staged refcount > 1 | [`WriteError::SnapshotShared`] |
+/// | allocated, staged refcount > 1 | COW-enabled: C1 data-cluster COW; else [`WriteError::SnapshotShared`] |
 /// | allocated, refcount not staged | [`WriteError::RefcountCoverage`] |
 /// | allocated, COPIED, refcount 1 | owned: overwrite in place, no metadata change |
 ///
-/// The allocated L1 entry feeding the lookup passes the
-/// analogous checks first ([`WriteError::UnknownL1Entry`] /
-/// [`WriteError::SnapshotSharedL2Table`]).
+/// C1 data-cluster COW (COW-enabled state, [`new_state_cow`])
+/// allocates a fresh `D'`, establishes the pre-image (a full copy
+/// of the old `D`, or zeros for a zero-flag source), writes the
+/// body, patches the L2 entry to `D' \| COPIED`, and decrements
+/// `rc(D)` (the snapshot keeps its reference; `D` is never freed).
+///
+/// The allocated L1 entry feeding the lookup passes the analogous
+/// checks first: an owned L2 table is loaded in place, a shared
+/// one triggers C2 L2-table COW when COW is enabled (copy `T` to a
+/// fresh `T'`, re-point the L1 to `T' \| COPIED`, decrement
+/// `rc(T)`, leave child refcounts UNTOUCHED — 7p) or refuses with
+/// [`WriteError::SnapshotSharedL2Table`] otherwise
+/// ([`WriteError::UnknownL1Entry`] for a malformed entry).
 ///
 /// Emission per allocating cluster follows decision 7: uncovered
 /// head zero-fill, body, uncovered tail zero-fill — all covering
@@ -1883,6 +2322,8 @@ pub fn plan_write(
                 slot: 0,
                 l2_host: 0,
                 data_host: 0,
+                cow_src: 0,
+                cow_zero_preimage: false,
             }
         }
     };
@@ -2385,6 +2826,9 @@ mod tests {
         rt: Vec<u8>,
         refblocks: Vec<u8>,
         caller: Vec<u8>,
+        /// Cluster-sized bounce buffer for COW pre-image reads
+        /// (`ReadCluster` -> `RegionId::Bounce`).
+        bounce: Vec<u8>,
         barriers: Vec<BarrierClass>,
     }
 
@@ -2425,6 +2869,7 @@ mod tests {
             rt: (2 * cs as u64).to_be_bytes().to_vec(),
             refblocks,
             caller: (0..4 * cs).map(|i| (i % 251) as u8).collect(),
+            bounce: vec![0xEE; cs],
             barriers: Vec::new(),
         };
         let cfg = StagingConfig {
@@ -2477,7 +2922,7 @@ mod tests {
             RegionId::RefcountTable => (img.rt.as_mut_slice(), 0),
             RegionId::Refblocks => (img.refblocks.as_mut_slice(), 0),
             RegionId::CallerData => (img.caller.as_mut_slice(), 0),
-            RegionId::Bounce => panic!("Bounce is filler-only in v1 programs"),
+            RegionId::Bounce => (img.bounce.as_mut_slice(), 0),
         }
     }
 
@@ -2531,7 +2976,13 @@ mod tests {
                     buf[off..off + len].fill(0);
                 }
                 StepKind::Barrier { class } => img.barriers.push(class),
-                StepKind::ReadCluster => panic!("v1 planner must not emit ReadCluster"),
+                StepKind::ReadCluster => {
+                    // COW pre-image read: device -> region (Bounce).
+                    let src = img.disk[dof..dof + len].to_vec();
+                    let (buf, base) = region_mut(img, s.region);
+                    let off = base + s.region_offset as usize;
+                    buf[off..off + len].copy_from_slice(&src);
+                }
             }
         }
     }
@@ -2730,12 +3181,15 @@ mod tests {
         // Each row: (entry value, refcount for cluster 5,
         // expected refusal).
         let cs = 1u64 << 12;
-        let rows: [(u64, u64, WriteError); 8] = [
+        // A non-COW state: snapshot-shared clusters still refuse.
+        // (The v3 zero flag, entry bit 0, is no longer refused —
+        // decision 6 classifies it by host+refcount; covered in
+        // the zero-flag-target tests below.)
+        let rows: [(u64, u64, WriteError); 7] = [
             (5 * cs | OFLAG_COMPRESSED, 1, WriteError::CompressedCluster),
             (5 * cs, 1, WriteError::SnapshotShared), // COPIED clear
             (5 * cs | OFLAG_COPIED, 2, WriteError::SnapshotShared),
             (5 * cs | OFLAG_COPIED, 0, WriteError::RefcountInconsistent),
-            (1, 1, WriteError::UnknownL2Entry), // v3 zero flag
             (
                 5 * cs | OFLAG_COPIED | (1 << 56),
                 1,
@@ -3820,5 +4274,476 @@ mod tests {
         exec(&mut img, buf.steps());
         assert_eq!(read_u64_be(&img.l2win, 0), 5 * cs | OFLAG_COPIED);
         assert_eq!(read_u64_be(&img.l2win, 8), 6 * cs | OFLAG_COPIED);
+    }
+
+    // =====================================================================
+    // Phase 7 copy-on-write (C1-C4), the decision-6 zero-flag WRITE
+    // target, and the refcount-decrement guard. The `mk`/`exec`/
+    // `run_write`/`run_flush` harness above is the simulation: it applies
+    // every emitted step to the Vec-backed image, so each test's post-state
+    // assertions (refcounts, COPIED flags, snapshot clusters intact,
+    // structural validity) verify the schedule end to end.
+    // =====================================================================
+
+    /// A copy-on-write state over the same clean image `mk` builds
+    /// (`new_state_cow`, so snapshot-shared clusters COW instead of
+    /// refusing).
+    fn mk_cow(cluster_bits: u32, l2_slots: usize) -> (TestImg, WriteState) {
+        let (img, _) = mk(cluster_bits, l2_slots, false);
+        let cfg = StagingConfig {
+            l2_slots,
+            max_refblocks: 32,
+            device: TargetDevice::Input0,
+        };
+        let st = new_state_cow(&img.hdr, &cfg).unwrap();
+        (img, st)
+    }
+
+    /// Highest staged refcount over clusters `[0, upto)`. The
+    /// corruption signature COW must NEVER produce is any rc >= 3
+    /// (a child bumped past its snapshot-creation rc of 2).
+    fn max_rc(img: &TestImg, upto: u64) -> u64 {
+        (0..upto).map(|c| rc_of(img, c)).max().unwrap_or(0)
+    }
+
+    fn disk_u64(img: &TestImg, off: usize) -> u64 {
+        read_u64_be(&img.disk, off)
+    }
+
+    /// Owned L2 table T at cluster 4 (L1[0] -> 4 | COPIED, rc 1),
+    /// zeroed on disk. The caller sets L2[0] and the child rc.
+    fn add_owned_l2(img: &mut TestImg) {
+        let cs = img.cs;
+        set_l1(img, 0, 4 * cs as u64 | OFLAG_COPIED);
+        for b in &mut img.disk[4 * cs..5 * cs] {
+            *b = 0;
+        }
+        set_rc(img, 4, 1);
+    }
+
+    /// Owned L2 table (cluster 4) with a snapshot-shared child data
+    /// cluster D at cluster 5, index `l2_idx`: COPIED clear + rc 2.
+    fn add_shared_data(img: &mut TestImg, l2_idx: usize) {
+        add_allocated_cluster(img, l2_idx, OFLAG_COPIED, 0); // child COPIED clear
+        set_rc(img, 5, 2); // shared with a snapshot
+    }
+
+    /// Snapshot-shared L2 table T (cluster 4, COPIED clear, rc 2)
+    /// with two shared children D0 (cluster 5, index 0) and D1
+    /// (cluster 6, index 1), both COPIED clear + rc 2 — the nested
+    /// (shared-L2-over-shared-data) fixture (7p probe5).
+    fn add_shared_l2_two_children(img: &mut TestImg) {
+        let cs = img.cs;
+        set_l1(img, 0, 4 * cs as u64); // T, COPIED clear -> shared
+        for b in &mut img.disk[4 * cs..5 * cs] {
+            *b = 0;
+        }
+        put_disk_u64(img, 4 * cs, 5 * cs as u64); // idx 0 -> D0 shared
+        put_disk_u64(img, 4 * cs + 8, 6 * cs as u64); // idx 1 -> D1 shared
+        set_rc(img, 4, 2);
+        set_rc(img, 5, 2);
+        set_rc(img, 6, 2);
+    }
+
+    // ---------------- capability (decision 4b) ----------------
+
+    #[test]
+    fn cow_envelope_capability_relaxes_only_snapshots() {
+        // A snapshot-bearing header: non-COW new_state /
+        // check_envelope refuse; the COW variants accept. Other
+        // gates are unaffected by the capability.
+        let mut hdr = parse(&build_header(
+            12,
+            4 * ((1u64 << 12) / 8) * (1u64 << 12),
+            4,
+            0,
+        ));
+        hdr.nb_snapshots = 1;
+        let cfg = valid_config();
+        assert_eq!(new_state(&hdr, &cfg).err(), Some(Gate::HasSnapshots));
+        assert_eq!(check_envelope(&hdr).err(), Some(Gate::HasSnapshots));
+        assert_eq!(
+            check_envelope_with(&hdr, false).err(),
+            Some(Gate::HasSnapshots)
+        );
+        assert!(new_state_cow(&hdr, &cfg).is_ok());
+        assert!(check_envelope_with(&hdr, true).is_ok());
+        assert!(new_state_cow(&hdr, &cfg).unwrap().cow_enabled());
+        // A different gate still fires under the capability.
+        let mut enc = parse(&build_header(
+            12,
+            4 * ((1u64 << 12) / 8) * (1u64 << 12),
+            4,
+            0,
+        ));
+        enc.crypt_method = 1;
+        assert_eq!(
+            check_envelope_with(&enc, true).err(),
+            Some(Gate::Encryption)
+        );
+    }
+
+    #[test]
+    fn shared_data_refuses_without_cow_but_cows_with_it() {
+        // The same fixture: non-COW state refuses SnapshotShared,
+        // COW state succeeds.
+        let cs = 1u64 << 12;
+        let (mut img, mut st) = mk(12, 2, false);
+        add_shared_data(&mut img, 0);
+        assert_eq!(
+            run_write_err(&mut img, &mut st, 0, 8, caller_data()),
+            WriteError::SnapshotShared
+        );
+        let (mut img, mut st) = mk_cow(12, 2);
+        add_shared_data(&mut img, 0);
+        let _ = run_write_ok(&mut img, &mut st, 0, cs, caller_data(), 64);
+    }
+
+    // ---------------- C1: data-cluster COW ----------------
+
+    #[test]
+    fn cow_data_full_cluster_c1() {
+        let (mut img, mut st) = mk_cow(12, 2);
+        let cs = img.cs as u64;
+        add_shared_data(&mut img, 0);
+        // Mark old D so we can prove it is preserved.
+        for b in &mut img.disk[5 * img.cs..6 * img.cs] {
+            *b = 0xAB;
+        }
+        let steps = run_write_ok(&mut img, &mut st, 0, cs, caller_data(), 64);
+        // LoadCluster T (window boundary) then, on resume, the body
+        // write to D' and the L2 patch. A full overwrite needs no
+        // pre-image read.
+        assert_eq!(
+            kinds(&steps),
+            vec![
+                StepKind::LoadCluster,
+                StepKind::WriteRange,
+                StepKind::PatchEntryU64,
+            ]
+        );
+        run_flush_ok(&mut img, &mut st, 64);
+        // D' = cluster 6, rc 1; old D (5) decremented 2->1, never
+        // freed and byte-preserved.
+        assert_eq!(rc_of(&img, 6), 1);
+        assert_eq!(rc_of(&img, 5), 1);
+        assert_eq!(max_rc(&img, 8), 1);
+        assert!(img.disk[5 * img.cs..6 * img.cs].iter().all(|&b| b == 0xAB));
+        assert_eq!(&img.disk[6 * img.cs..7 * img.cs], &img.caller[..img.cs]);
+        // The owned L2 table (patched in place) now points at D'.
+        assert_eq!(disk_u64(&img, 4 * img.cs), 6 * cs | OFLAG_COPIED);
+    }
+
+    #[test]
+    fn cow_data_subcluster_rmw_c1() {
+        let (mut img, mut st) = mk_cow(12, 2);
+        let cs = img.cs;
+        add_shared_data(&mut img, 0);
+        for b in &mut img.disk[5 * cs..6 * cs] {
+            *b = 0xAB; // old D content, must be copied into D'
+        }
+        let steps = run_write_ok(&mut img, &mut st, 100, 200, caller_data(), 64);
+        // Sub-cluster COW: read old D into the bounce buffer, copy
+        // it into D', overlay the body, patch the L2 entry.
+        assert_eq!(
+            kinds(&steps),
+            vec![
+                StepKind::LoadCluster,
+                StepKind::ReadCluster,
+                StepKind::WriteRange, // Bounce -> D' (pre-image copy)
+                StepKind::WriteRange, // body -> D'
+                StepKind::PatchEntryU64,
+            ]
+        );
+        run_flush_ok(&mut img, &mut st, 64);
+        // D' = cluster 6: old bytes outside the window, caller bytes
+        // inside; old D preserved; refcount 2->1.
+        assert!(img.disk[6 * cs..6 * cs + 100].iter().all(|&b| b == 0xAB));
+        assert_eq!(&img.disk[6 * cs + 100..6 * cs + 300], &img.caller[..200]);
+        assert!(img.disk[6 * cs + 300..7 * cs].iter().all(|&b| b == 0xAB));
+        assert!(img.disk[5 * cs..6 * cs].iter().all(|&b| b == 0xAB));
+        assert_eq!(rc_of(&img, 5), 1);
+        assert_eq!(rc_of(&img, 6), 1);
+    }
+
+    // ---------------- C2: L2-table COW, NO child increment ----------------
+
+    #[test]
+    fn cow_l2_table_no_child_increment_c2() {
+        let (mut img, mut st) = mk_cow(12, 2);
+        let cs = img.cs as u64;
+        add_shared_l2_two_children(&mut img);
+        // Write into child 0 (voff 0): COW T -> T' then COW D0 -> D0'.
+        let _ = run_write_ok(&mut img, &mut st, 0, cs, caller_data(), 128);
+        run_flush_ok(&mut img, &mut st, 128);
+        // THE anti-corruption assertion: no cluster reaches rc 3.
+        assert_eq!(max_rc(&img, 12), 2);
+        // Child 1 (cluster 6), untouched by the write, stays shared
+        // rc 2 — the L2-COW did NOT increment it.
+        assert_eq!(rc_of(&img, 6), 2);
+        // Child 0 (cluster 5), the write target, drops 2->1 (its own
+        // C1 data COW; active no longer shares it).
+        assert_eq!(rc_of(&img, 5), 1);
+        // Old T (cluster 4) decremented 2->1 (the snapshot keeps it).
+        assert_eq!(rc_of(&img, 4), 1);
+        // T' (cluster 7) and D0' (cluster 8) are fresh, rc 1.
+        assert_eq!(rc_of(&img, 7), 1);
+        assert_eq!(rc_of(&img, 8), 1);
+        // L1[0] now points at T' | COPIED on disk; old T is intact.
+        assert_eq!(disk_u64(&img, 3 * img.cs), 7 * cs | OFLAG_COPIED);
+        assert_eq!(disk_u64(&img, 4 * img.cs), 5 * cs); // old T entry 0
+        assert_eq!(disk_u64(&img, 4 * img.cs + 8), 6 * cs); // old T entry 1
+                                                            // T' on disk: child 0 -> D0' | COPIED; child 1 still points
+                                                            // at the shared D1 (COPIED clear), inherited unchanged.
+        assert_eq!(disk_u64(&img, 7 * img.cs), 8 * cs | OFLAG_COPIED);
+        assert_eq!(disk_u64(&img, 7 * img.cs + 8), 6 * cs);
+    }
+
+    // ---------------- C3: nested COW in one write ----------------
+
+    #[test]
+    fn cow_nested_l2_then_data_c3() {
+        let (mut img, mut st) = mk_cow(12, 2);
+        let cs = img.cs;
+        add_shared_l2_two_children(&mut img);
+        for b in &mut img.disk[5 * cs..6 * cs] {
+            *b = 0xCD; // old D0 content, copied into D0'
+        }
+        // A single sub-cluster write COWs both the L2 table and the
+        // target data cluster in one pass.
+        let steps = run_write_ok(&mut img, &mut st, 200, 100, caller_data(), 128);
+        assert_eq!(
+            kinds(&steps),
+            vec![
+                StepKind::LoadCluster,   // load old T into the slot
+                StepKind::PatchEntryU64, // L1 -> T' | COPIED
+                StepKind::ReadCluster,   // old D0 -> bounce
+                StepKind::WriteRange,    // bounce -> D0' (pre-image)
+                StepKind::WriteRange,    // body -> D0'
+                StepKind::PatchEntryU64, // T'[0] -> D0' | COPIED
+            ]
+        );
+        run_flush_ok(&mut img, &mut st, 128);
+        assert_eq!(max_rc(&img, 12), 2);
+        // D0' = cluster 8: old D0 bytes outside the window, caller
+        // bytes inside.
+        assert!(img.disk[8 * cs..8 * cs + 200].iter().all(|&b| b == 0xCD));
+        assert_eq!(&img.disk[8 * cs + 200..8 * cs + 300], &img.caller[..100]);
+        assert!(img.disk[8 * cs + 300..9 * cs].iter().all(|&b| b == 0xCD));
+        // Old D0 (cluster 5) preserved for the snapshot.
+        assert!(img.disk[5 * cs..6 * cs].iter().all(|&b| b == 0xCD));
+    }
+
+    // ---------------- C4: crash ordering ----------------
+
+    #[test]
+    fn cow_crash_ordering_c4() {
+        // The nested schedule exercises every pointer flip. On disk
+        // the copied data must be durable before the L2/L1 flip, and
+        // all refcount writes must come last, behind the final
+        // barrier.
+        let (mut img, mut st) = mk_cow(12, 2);
+        let cs = img.cs as u64;
+        add_shared_l2_two_children(&mut img);
+        let write = run_write_ok(&mut img, &mut st, 0, cs, caller_data(), 128);
+        // plan_write emits NO refcount write-backs (decision 6: the
+        // staged refblocks are mutated in place, flushed last).
+        assert!(write.iter().all(|s| s.region != RegionId::Refblocks));
+        // Within the write, every data write to D0' precedes the L2
+        // patch that publishes it (decision 7(a)).
+        let last_data = write
+            .iter()
+            .rposition(|s| s.kind == StepKind::WriteRange && s.region != RegionId::L1)
+            .unwrap();
+        let l2_patch = write
+            .iter()
+            .rposition(|s| {
+                s.kind == StepKind::PatchEntryU64 && matches!(s.region, RegionId::L2Slot(_))
+            })
+            .unwrap();
+        assert!(last_data < l2_patch, "data must precede the L2 patch");
+
+        let flush = run_flush_ok(&mut img, &mut st, 128);
+        // Flush order: L2 write-backs, then L1, then refblocks, each
+        // group behind a Durability barrier; refcounts are the last
+        // non-barrier steps.
+        let is_barrier = |s: &Step| matches!(s.kind, StepKind::Barrier { .. });
+        let first_l2 = flush
+            .iter()
+            .position(|s| s.kind == StepKind::WritebackCluster)
+            .unwrap();
+        let l1_write = flush
+            .iter()
+            .position(|s| s.kind == StepKind::WriteRange && s.region == RegionId::L1)
+            .unwrap();
+        let first_rb = flush
+            .iter()
+            .position(|s| s.region == RegionId::Refblocks)
+            .unwrap();
+        assert!(
+            first_l2 < l1_write && l1_write < first_rb,
+            "L2 < L1 < refblocks"
+        );
+        // A barrier separates the L1 write from the refblock writes.
+        assert!(flush[l1_write + 1..first_rb].iter().any(is_barrier));
+        // The refblock writes are the last non-barrier steps.
+        let last_nonbarrier = flush.iter().rposition(|s| !is_barrier(s)).unwrap();
+        assert_eq!(flush[last_nonbarrier].region, RegionId::Refblocks);
+    }
+
+    // ---------------- decision 6: zero-flag WRITE target ----------------
+
+    #[test]
+    fn zero_flag_target_host_zero_allocates() {
+        // host == 0 zero-flag entry: classify Unallocated, allocate
+        // a fresh cluster (decision 6). Non-COW state suffices.
+        let (mut img, mut st) = mk(12, 2, false);
+        let cs = img.cs as u64;
+        let c4 = 4 * img.cs;
+        add_owned_l2(&mut img);
+        put_disk_u64(&mut img, c4, QCOW_OFLAG_ZERO);
+        let steps = run_write_ok(&mut img, &mut st, 0, cs, caller_data(), 64);
+        assert_eq!(
+            kinds(&steps),
+            vec![
+                StepKind::LoadCluster,
+                StepKind::WriteRange,
+                StepKind::PatchEntryU64,
+            ]
+        );
+        run_flush_ok(&mut img, &mut st, 64);
+        // Fresh cluster 5 allocated (rc 1); entry rewritten without
+        // the zero flag.
+        assert_eq!(rc_of(&img, 5), 1);
+        assert_eq!(disk_u64(&img, 4 * img.cs), 5 * cs | OFLAG_COPIED);
+    }
+
+    #[test]
+    fn zero_flag_target_owned_rc1_reuses_in_place() {
+        // host != 0, rc 1: reuse the host cluster in place, clear the
+        // zero flag, no allocation and no refcount change (decision
+        // 6 — qemu does NOT free the old offset).
+        let (mut img, mut st) = mk(12, 2, false);
+        let cs = img.cs as u64;
+        let c4 = 4 * img.cs;
+        add_owned_l2(&mut img);
+        put_disk_u64(&mut img, c4, (5 * cs) | QCOW_OFLAG_ZERO);
+        set_rc(&mut img, 5, 1);
+        let steps = run_write_ok(&mut img, &mut st, 0, cs, caller_data(), 64);
+        assert_eq!(
+            kinds(&steps),
+            vec![
+                StepKind::LoadCluster,
+                StepKind::WriteRange,
+                StepKind::PatchEntryU64,
+            ]
+        );
+        assert_eq!(st.alloc_cursor().allocated, 0, "no allocation");
+        assert_eq!(rc_of(&img, 5), 1, "refcount unchanged");
+        run_flush_ok(&mut img, &mut st, 64);
+        assert_eq!(disk_u64(&img, 4 * img.cs), 5 * cs | OFLAG_COPIED);
+        assert_eq!(&img.disk[5 * img.cs..6 * img.cs], &img.caller[..img.cs]);
+    }
+
+    #[test]
+    fn zero_flag_target_owned_partial_on_backed_zero_fills() {
+        // A partial write into a zero-flag owned cluster of a BACKED
+        // image: unlike an unallocated cluster it does NOT refuse
+        // NeedsBackingFill — the pre-image is logically zero, so the
+        // uncovered head/tail are zero-filled (not read from
+        // backing).
+        let (mut img, mut st) = mk(12, 2, true);
+        let cs = img.cs;
+        add_owned_l2(&mut img);
+        put_disk_u64(&mut img, 4 * cs, (5 * cs as u64) | QCOW_OFLAG_ZERO);
+        set_rc(&mut img, 5, 1);
+        for b in &mut img.disk[5 * cs..6 * cs] {
+            *b = 0x77; // must be overwritten by the zero-fill
+        }
+        let steps = run_write_ok(&mut img, &mut st, 100, 50, caller_data(), 64);
+        assert_eq!(
+            kinds(&steps),
+            vec![
+                StepKind::LoadCluster,
+                StepKind::ZeroRange,  // head
+                StepKind::WriteRange, // body
+                StepKind::ZeroRange,  // tail
+                StepKind::PatchEntryU64,
+            ]
+        );
+        assert!(img.disk[5 * cs..5 * cs + 100].iter().all(|&b| b == 0));
+        assert_eq!(&img.disk[5 * cs + 100..5 * cs + 150], &img.caller[..50]);
+        assert!(img.disk[5 * cs + 150..6 * cs].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn zero_flag_target_shared_refuses_without_cow() {
+        // host != 0, rc > 1, non-COW state: refuse SnapshotShared.
+        let (mut img, mut st) = mk(12, 2, false);
+        let cs = img.cs as u64;
+        let c4 = 4 * img.cs;
+        add_owned_l2(&mut img);
+        put_disk_u64(&mut img, c4, (5 * cs) | QCOW_OFLAG_ZERO);
+        set_rc(&mut img, 5, 2);
+        assert_eq!(
+            run_write_err(&mut img, &mut st, 0, 8, caller_data()),
+            WriteError::SnapshotShared
+        );
+    }
+
+    #[test]
+    fn zero_flag_target_shared_cow_zero_preimage() {
+        // host != 0, rc > 1, COW state: COW with an ALL-ZERO
+        // pre-image (the old host bytes are NOT copied — the cluster
+        // reads as zero), decrement the old host.
+        let (mut img, mut st) = mk_cow(12, 2);
+        let cs = img.cs;
+        add_owned_l2(&mut img);
+        put_disk_u64(&mut img, 4 * cs, (5 * cs as u64) | QCOW_OFLAG_ZERO);
+        set_rc(&mut img, 5, 2);
+        for b in &mut img.disk[5 * cs..6 * cs] {
+            *b = 0x99; // must NOT appear in D'
+        }
+        let steps = run_write_ok(&mut img, &mut st, 100, 50, caller_data(), 64);
+        assert_eq!(
+            kinds(&steps),
+            vec![
+                StepKind::LoadCluster,
+                StepKind::ZeroRange,  // zero the fresh D'
+                StepKind::WriteRange, // body
+                StepKind::PatchEntryU64,
+            ]
+        );
+        run_flush_ok(&mut img, &mut st, 64);
+        // D' = cluster 6: zeros except the window; old host (5) NOT
+        // copied and decremented 2->1.
+        assert!(img.disk[6 * cs..6 * cs + 100].iter().all(|&b| b == 0));
+        assert_eq!(&img.disk[6 * cs + 100..6 * cs + 150], &img.caller[..50]);
+        assert!(img.disk[6 * cs + 150..7 * cs].iter().all(|&b| b == 0));
+        assert!(img.disk[5 * cs..6 * cs].iter().all(|&b| b == 0x99));
+        assert_eq!(rc_of(&img, 5), 1);
+        assert_eq!(rc_of(&img, 6), 1);
+        assert_eq!(disk_u64(&img, 4 * cs), 6 * cs as u64 | OFLAG_COPIED);
+    }
+
+    // ---------------- decrement underflow guard ----------------
+
+    #[test]
+    fn cow_decrement_underflow_is_inconsistent() {
+        // A COPIED-clear entry pointing at a cluster with staged
+        // refcount 0 is an inconsistent image: the C1 decrement
+        // would underflow. The guard surfaces RefcountInconsistent
+        // rather than wrapping. The shared cluster (7) sits above
+        // the free clusters (5, 6) so the allocator does not reuse
+        // it for D'.
+        let (mut img, mut st) = mk_cow(12, 2);
+        let cs = img.cs as u64;
+        let c4 = 4 * img.cs;
+        add_owned_l2(&mut img);
+        put_disk_u64(&mut img, c4, 7 * cs); // L2[0] -> cluster 7, COPIED clear, rc 0
+        let err = run_write(&mut img, &mut st, 0, cs, caller_data(), 128)
+            .expect_err("underflow must refuse")
+            .0;
+        assert_eq!(err, WriteError::RefcountInconsistent);
     }
 }
