@@ -72,14 +72,20 @@
 
 pub mod growth;
 
-use qcow2::{
-    QcowHeader, L1_OFFSET_MASK, L2_OFFSET_MASK, OFLAG_COMPRESSED, OFLAG_COPIED, QCOW_OFLAG_ZERO,
-};
+use qcow2::{QcowHeader, L2_OFFSET_MASK, OFLAG_COMPRESSED, OFLAG_COPIED, QCOW_OFLAG_ZERO};
 use snapshot::qcow2::{
-    alloc_cluster_in_refblocks, check_refcount_after_addend, read_refcount_in_block,
-    set_refcount_in_block, AllocCursor,
+    alloc_cluster_in_refblocks, check_refcount_after_addend, read_refcount_in_block, AllocCursor,
 };
 use snapshot::SnapshotError;
+
+// Re-exports for the execution crate (`qcow2-write-exec`): its
+// region-agnostic refcount-growth executor reaches the refcount codec
+// and the host-offset mask through its existing `qcow2-write`
+// dependency, so `qcow2-write-exec` needs no direct `snapshot`/`qcow2`
+// dependency (phase 7 decision 5). `L1_OFFSET_MASK` also stays in scope
+// for this crate's own use via this re-export.
+pub use qcow2::L1_OFFSET_MASK;
+pub use snapshot::qcow2::set_refcount_in_block;
 
 // ---------------------------------------------------------------------------
 // Capacity constants

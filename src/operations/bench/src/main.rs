@@ -56,13 +56,13 @@ use shared::{
 // (`qcow2-write-exec`). The moved refcount-growth planner lives in
 // `qcow2_write::growth` (step 6a); `worst_case_touched` stays in
 // `crates/bench` (BenchParams/schedule-coupled).
-use qcow2_write::growth::{plan_refcount_growth, GrowthCaps, GrowthOverflow, RefcountGrowthPlan};
+use qcow2_write::growth::{plan_refcount_growth, GrowthCaps, GrowthOverflow};
 use qcow2_write::{
     check_envelope, new_state, plan_flush, plan_write, DataSource, Gate, RegionId, StagedRegions,
     StagingConfig, Step, StepBuf, StepKind, TargetDevice, WriteError, WriteState, MAX_L2_SLOTS,
 };
 use qcow2_write_exec::{
-    execute, fill_bytes, read_bytes, write_bytes, CallTableIo, ExecCause, ExecError, Regions,
+    execute, fill_bytes, growth, read_bytes, CallTableIo, ExecCause, ExecError, Regions,
 };
 
 // ================================================================
@@ -393,30 +393,6 @@ fn invalidate_dev0_caches(chain_states: &mut qcow2::ChainStates) {
     }
 }
 
-/// Minimal growth-time context: the staged-refblock geometry and dirty
-/// bitset the preemptive-growth executor needs. The run itself no longer
-/// uses this — the crate's `WriteState` owns the run allocator, dirty
-/// tracking and flush ordering.
-struct GrowthCtx {
-    cluster_size: u64,
-    refblock_count: usize,
-    entries_per_refblock: u64,
-    /// Per-refblock dirty bitset (2048 slots pack into 32 words).
-    dirty: [u64; WRITE_MAX_REFBLOCKS / 64],
-}
-
-impl GrowthCtx {
-    fn dirty_set(&mut self, slot: usize) {
-        self.dirty[slot / 64] |= 1u64 << (slot % 64);
-    }
-    fn dirty_clear(&mut self, slot: usize) {
-        self.dirty[slot / 64] &= !(1u64 << (slot % 64));
-    }
-    fn dirty_get(&self, slot: usize) -> bool {
-        self.dirty[slot / 64] & (1u64 << (slot % 64)) != 0
-    }
-}
-
 /// Byte geometry of the qcow2-write scratch carve for one run, threaded
 /// to the [`StagedRegions`] / [`Regions`] view builders so the planner
 /// and executor alias the exact same buffers (the two halves of the
@@ -585,75 +561,6 @@ fn map_exec_error(e: ExecError) -> (u32, u64) {
     }
 }
 
-/// Set the staged refcount for host cluster `cluster` to `value` and mark
-/// its covering refblock dirty (growth-time staging). Returns `false`
-/// when the cluster falls outside the staged coverage — impossible for
-/// planner-vetted growth inputs (self-coverage invariant); the caller
-/// surfaces a parse failure rather than corrupt on a would-be internal bug.
-fn stage_refcount(ctx: &mut GrowthCtx, cluster: u64, value: u64) -> bool {
-    let slot = (cluster / ctx.entries_per_refblock) as usize;
-    if slot >= ctx.refblock_count {
-        return false;
-    }
-    let cluster_usize = ctx.cluster_size as usize;
-    let block = unsafe {
-        core::slice::from_raw_parts_mut(
-            (WRITE_REFBLOCKS_BUF + slot * cluster_usize) as *mut u8,
-            cluster_usize,
-        )
-    };
-    if snapshot::qcow2::set_refcount_in_block(block, cluster % ctx.entries_per_refblock, 16, value)
-        .is_err()
-    {
-        return false;
-    }
-    ctx.dirty_set(slot);
-    true
-}
-
-/// Write back every dirty staged refblock to its host offset (refcounts
-/// last) via the executor's byte-range layer, then clear the dirty flags.
-/// The host offset for slot `k` comes from the staged refcount table
-/// (`WRITE_RT_BUF`) — the old `WRITE_RB_OFFSETS` side table is reclaimed.
-///
-/// # Safety
-///
-/// `io` valid; the staged refblocks live at `WRITE_REFBLOCKS_BUF` and
-/// their host offsets in `WRITE_RT_BUF`.
-#[inline(never)]
-unsafe fn flush_dirty_refblocks(io: &mut CallTableIo<'_>, ctx: &mut GrowthCtx) -> bool {
-    let cluster_usize = ctx.cluster_size as usize;
-    let mut slot = 0usize;
-    while slot < ctx.refblock_count {
-        // Skip a whole all-clean 64-slot word in one step.
-        if slot % 64 == 0 && ctx.dirty[slot / 64] == 0 {
-            slot += 64;
-            continue;
-        }
-        if ctx.dirty_get(slot) {
-            let host_off = {
-                let rt =
-                    core::slice::from_raw_parts(WRITE_RT_BUF as *const u8, ctx.refblock_count * 8);
-                read_u64_be(rt, slot * 8) & qcow2::L1_OFFSET_MASK
-            };
-            let src = core::slice::from_raw_parts(
-                (WRITE_REFBLOCKS_BUF + slot * cluster_usize) as *const u8,
-                cluster_usize,
-            );
-            let rmw = core::slice::from_raw_parts_mut(
-                WRITE_RMW_BOUNCE as *mut u8,
-                WRITE_RMW_BOUNCE_LIMIT,
-            );
-            if write_bytes(io, TargetDevice::Input0, host_off, src, rmw).is_err() {
-                return false;
-            }
-            ctx.dirty_clear(slot);
-        }
-        slot += 1;
-    }
-    true
-}
-
 /// Derive the exclusive end of the host file, in clusters, from the
 /// image's own metadata (new growth structures are placed at this
 /// boundary). The virtio capacity hint cannot provide it (the host
@@ -700,156 +607,17 @@ fn derive_file_end_clusters(
     end
 }
 
-/// Grow the staged refcount coverage to `plan.needed_slots` refblocks,
-/// pre-bracket (PLAN-bench-refcount-growth). New structures are placed
-/// contiguously at the cluster-aligned current file end. Write ordering
-/// (mirroring snapshot create's grouped fsync discipline): staged
-/// refblocks → refcount table → fsync → header pointer flip (relocation
-/// only) → fsync → the old RT's staged free. I/O is routed through the
-/// executor's byte-range layer; the two op-side fsyncs are unchanged
-/// (the census is 1 in-place / 2 relocation, per 6p).
-///
-/// The #433 fix (materialize every RT-referenced refblock) is preserved.
-/// One migration change: the relocating old-RT free is PERSISTED here
-/// (an extra byte-range write, no extra fsync) rather than deferred to
-/// the run cadence, because the migrated run flushes via the crate's
-/// `plan_flush` over its OWN dirty state, which never sees this free.
-///
-/// # Safety
-///
-/// `call_table` / `io` valid; input slot 0 attached read-write; `ctx`
-/// staged by `qcow2_write_setup` with `plan` computed from the same
-/// staged state (`ctx.refblock_count == populated_refblocks` at entry).
-#[inline(never)]
-unsafe fn qcow2_grow_refcounts(
-    call_table: &CallTable,
-    io: &mut CallTableIo<'_>,
-    hdr: &qcow2::QcowHeader,
-    plan: &RefcountGrowthPlan,
-    ctx: &mut GrowthCtx,
-) -> Result<(), (u32, u64)> {
-    let cs = ctx.cluster_size;
-    let cluster_usize = cs as usize;
-    let old_slots = ctx.refblock_count;
-    let new_slots = plan.needed_slots as usize;
-    let relocating = plan.new_rt_clusters > 0;
-
-    // ---- Stage the extended refcount-table image ----
-    // In place: only the new slot entries. Relocating: the FULL new
-    // table — the populated prefix is already staged; zero the tail then
-    // fill the new entries (which also become the flush offset source).
-    let rt_image_len = if relocating {
-        (plan.new_rt_clusters * cs) as usize
-    } else {
-        new_slots * 8
-    };
-    {
-        let rt_buf = core::slice::from_raw_parts_mut(WRITE_RT_BUF as *mut u8, rt_image_len);
-        if relocating {
-            rt_buf[old_slots * 8..].fill(0);
-        }
-        for j in 0..plan.new_refblocks as usize {
-            let slot = old_slots + j;
-            let host_off = (plan.refblocks_start + j as u64) * cs;
-            rt_buf[slot * 8..slot * 8 + 8].copy_from_slice(&host_off.to_be_bytes());
-        }
+/// Render a shared [`growth::grow_refcounts`] failure to bench's wire
+/// code, preserving the pre-migration inline codes exactly:
+/// `StageOutOfCoverage` was the self-coverage-invariant internal-bug
+/// path (`ERROR_PARSE_FAILED`); `WriteFailed` / `FsyncFailed` keep
+/// bench's `ERROR_IO_WRITE` / `ERROR_IO_FLUSH`.
+fn map_growth_error(e: growth::GrowthExecError) -> (u32, u64) {
+    match e {
+        growth::GrowthExecError::StageOutOfCoverage => (BenchResult::ERROR_PARSE_FAILED, 0),
+        growth::GrowthExecError::WriteFailed => (BenchResult::ERROR_IO_WRITE, 0),
+        growth::GrowthExecError::FsyncFailed => (BenchResult::ERROR_IO_FLUSH, 0),
     }
-
-    // ---- New refblocks: zeroed staging bytes ----
-    core::ptr::write_bytes(
-        (WRITE_REFBLOCKS_BUF + old_slots * cluster_usize) as *mut u8,
-        0,
-        (new_slots - old_slots) * cluster_usize,
-    );
-
-    // The flush and refcount staging below see the grown slot set.
-    ctx.refblock_count = new_slots;
-
-    // ---- Refcount 1 for every new structure cluster ----
-    for i in 0..plan.new_rt_clusters + plan.new_refblocks {
-        if !stage_refcount(ctx, plan.structures_start + i, 1) {
-            return Err((BenchResult::ERROR_PARSE_FAILED, 0));
-        }
-    }
-
-    // ---- Materialize every newly provisioned refblock (#433) ----
-    // Every RT-referenced refblock MUST exist on disk, even the ones an
-    // overwrite-only run leaves at all-zero refcounts.
-    for slot in old_slots..new_slots {
-        ctx.dirty_set(slot);
-    }
-
-    // ---- Eager flush of every dirty staged refblock ----
-    if !flush_dirty_refblocks(io, ctx) {
-        return Err((BenchResult::ERROR_IO_WRITE, 0));
-    }
-
-    // ---- Refcount table ----
-    if relocating {
-        let src = core::slice::from_raw_parts(WRITE_RT_BUF as *const u8, rt_image_len);
-        let rmw =
-            core::slice::from_raw_parts_mut(WRITE_RMW_BOUNCE as *mut u8, WRITE_RMW_BOUNCE_LIMIT);
-        if write_bytes(io, TargetDevice::Input0, plan.rt_start * cs, src, rmw).is_err() {
-            return Err((BenchResult::ERROR_IO_WRITE, 0));
-        }
-    } else {
-        let src = core::slice::from_raw_parts(
-            (WRITE_RT_BUF + old_slots * 8) as *const u8,
-            (new_slots - old_slots) * 8,
-        );
-        let rmw =
-            core::slice::from_raw_parts_mut(WRITE_RMW_BOUNCE as *mut u8, WRITE_RMW_BOUNCE_LIMIT);
-        if write_bytes(
-            io,
-            TargetDevice::Input0,
-            hdr.refcount_table_offset + (old_slots * 8) as u64,
-            src,
-            rmw,
-        )
-        .is_err()
-        {
-            return Err((BenchResult::ERROR_IO_WRITE, 0));
-        }
-    }
-    if !(call_table.fsync_input)(0) {
-        return Err((BenchResult::ERROR_IO_FLUSH, 0));
-    }
-
-    if relocating {
-        // ----- The commit point: 12 header bytes at offset 48 -----
-        let mut header_patch = [0u8; 12];
-        header_patch[0..8].copy_from_slice(&(plan.rt_start * cs).to_be_bytes());
-        header_patch[8..12].copy_from_slice(&(plan.new_rt_clusters as u32).to_be_bytes());
-        {
-            let rmw = core::slice::from_raw_parts_mut(
-                WRITE_RMW_BOUNCE as *mut u8,
-                WRITE_RMW_BOUNCE_LIMIT,
-            );
-            if write_bytes(io, TargetDevice::Input0, 48, &header_patch, rmw).is_err() {
-                return Err((BenchResult::ERROR_IO_WRITE, 0));
-            }
-        }
-        if !(call_table.fsync_input)(0) {
-            return Err((BenchResult::ERROR_IO_FLUSH, 0));
-        }
-
-        // ----- Free the old table (staged), then PERSIST it -----
-        // AFTER the header flip. A crash in the window leaves the old
-        // table refcounted-but-unreferenced — a repairable leak, bench's
-        // documented crash class. Persisted here (no extra fsync — the
-        // census stays 2) because the migrated run's plan_flush only
-        // writes back the CRATE's own dirty refblocks, not this one.
-        let first = hdr.refcount_table_offset / cs;
-        for c in 0..hdr.refcount_table_clusters as u64 {
-            if !stage_refcount(ctx, first + c, 0) {
-                return Err((BenchResult::ERROR_PARSE_FAILED, 0));
-            }
-        }
-        if !flush_dirty_refblocks(io, ctx) {
-            return Err((BenchResult::ERROR_IO_WRITE, 0));
-        }
-    }
-    Ok(())
 }
 
 /// Parse the top image's header, apply the shared write envelope
@@ -979,12 +747,7 @@ unsafe fn qcow2_write_setup(
     }
 
     // ---- Preemptive refcount growth (decision 1 + growth module) ----
-    let mut ctx = GrowthCtx {
-        cluster_size,
-        refblock_count,
-        entries_per_refblock,
-        dirty: [0u64; WRITE_MAX_REFBLOCKS / 64],
-    };
+    let mut exec = growth::GrowthExec::new(cluster_size, entries_per_refblock, refblock_count);
     let file_end_clusters = {
         let refblocks = core::slice::from_raw_parts(
             WRITE_REFBLOCKS_BUF as *const u8,
@@ -1020,9 +783,42 @@ unsafe fn qcow2_write_setup(
         Err(GrowthOverflow) => return Err((BenchResult::ERROR_ALLOC_EXHAUSTED, 0)),
     };
     if plan.new_refblocks > 0 {
-        qcow2_grow_refcounts(call_table, io, &hdr, &plan, &mut ctx)?;
+        // Growth's durability fsyncs must be REAL (the phase-6 census: 1
+        // in-place / 2 relocation). The run's `io` is fsync-DISABLED (so
+        // `plan_flush` emits zero fsyncs and bench owns the cadence); the
+        // growth helper fsyncs through its `DeviceIo`, so it gets a
+        // fsync-ENABLED `CallTableIo` on the same call table. Its writes
+        // are identical either way — only the fsyncs differ.
+        let mut grow_io = CallTableIo::new(call_table, true);
+        let mut bufs = growth::GrowthBuffers {
+            refcount_table: core::slice::from_raw_parts_mut(
+                WRITE_RT_BUF as *mut u8,
+                WRITE_RT_LIMIT,
+            ),
+            refblocks: core::slice::from_raw_parts_mut(
+                WRITE_REFBLOCKS_BUF as *mut u8,
+                WRITE_REFBLOCKS_LIMIT,
+            ),
+            rmw_sector: core::slice::from_raw_parts_mut(
+                WRITE_RMW_BOUNCE as *mut u8,
+                WRITE_RMW_BOUNCE_LIMIT,
+            ),
+        };
+        let rt_table = growth::RefcountTable {
+            offset: hdr.refcount_table_offset,
+            clusters: hdr.refcount_table_clusters,
+        };
+        growth::grow_refcounts(
+            &mut grow_io,
+            TargetDevice::Input0,
+            &mut exec,
+            &plan,
+            rt_table,
+            &mut bufs,
+        )
+        .map_err(map_growth_error)?;
     }
-    let refblock_count = ctx.refblock_count;
+    let refblock_count = exec.refblock_count();
 
     // ---- Stage the active L1 table for the planner ----
     // NOT counted in bytes_read: the pre-migration disk walk read L1/L2

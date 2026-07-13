@@ -53,6 +53,8 @@
 
 #![no_std]
 
+pub mod growth;
+
 use qcow2_write::{BarrierClass, RegionId, Step, StepKind, TargetDevice};
 use shared::CallTable;
 
