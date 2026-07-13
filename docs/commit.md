@@ -185,7 +185,11 @@ behaviour.
   snapshots preserved).** Since phase 7 of
   PLAN-qcow2-write-infrastructure (issues #420 and #423
   resolved), commit no longer refuses images with internal
-  snapshots — it copies the shared clusters instead. Where
+  snapshots — it copies the shared clusters instead (the
+  shared allocate-on-write and copy-on-write machinery is
+  documented in
+  [qcow2/qcow2-write-planner.md](qcow2/qcow2-write-planner.md)).
+  Where
   the per-cluster loop previously blind-overwrote a
   snapshot-shared backing cluster, commit now COWs it (copy
   `D → D'`, repoint the L2, `rc(D')=1`, `rc(D)`−1; the old

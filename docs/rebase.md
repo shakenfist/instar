@@ -171,7 +171,10 @@ and the overlay becomes standalone.
   under-counted refcounts (`refcount=1 reference=2`,
   enabling data loss via a later `snapshot -d`, issue
   #421), it now COWs the shared L2 (copy `T → T'`, repoint
-  the L1, `rc(T')=1`, `rc(T)`−1). The load-bearing
+  the L1, `rc(T')=1`, `rc(T)`−1; the shared write path is
+  documented in
+  [qcow2/qcow2-write-planner.md](qcow2/qcow2-write-planner.md)).
+  The load-bearing
   subtlety is the **snapshot-view semantic**: matching
   qemu's contract, safe-mode rebase covers the active view
   only, so after the rebase a snapshot's unallocated ranges

@@ -888,6 +888,20 @@ QEMU Copy-On-Write version 2/3. Supported features:
   (AES-256-XTS with PBKDF2-SHA256 key derivation, LUKS v1 headers)
 - Snapshot table parsing, detection, and extraction via `--snapshot`
 
+#### qcow2 write infrastructure
+
+In-place mutation of an existing qcow2 (used by `commit`, `rebase`
+safe mode and `bench -w`) runs on two shared `no_std` crates: the
+**`crates/qcow2-write`** planner (pure, I/O-free, address-free —
+turns a write into a typed step program; handles the envelope,
+classification, allocate-on-write and copy-on-write) and the
+**`crates/qcow2-write-exec`** executor (the literal step interpreter
+plus the byte-range/device layer). Refcount growth is split the same
+way across each crate's `growth` module. The maintainer reference for
+this machinery — the step-program ABI, the write envelope, COW, growth
+and the crash-ordering contract — is
+[docs/qcow2/qcow2-write-planner.md](docs/qcow2/qcow2-write-planner.md).
+
 ### raw
 
 Simple byte-for-byte disk representation. No metadata, just data.

@@ -229,7 +229,11 @@ staged metadata window and emits the mutation steps; the
 executor runs them through the call table. Refcount growth (see
 above) stays a bench-specific setup step, but now calls the
 growth planner that moved into `crates/qcow2-write` and routes
-its I/O through the shared executor's byte-range layer.
+its I/O through the shared executor's byte-range layer. The
+shared write path — the step-program ABI, the envelope, the
+allocate-on-write and copy-on-write emission, refcount growth
+and the crash-ordering contract — is documented in the
+[qcow2 write planner and executor reference](qcow2/qcow2-write-planner.md).
 
 ### Write-back design
 
