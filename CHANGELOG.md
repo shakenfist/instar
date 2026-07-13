@@ -879,6 +879,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`instar bench -w` left the refcount table referencing
+  unmaterialized blocks past EOF on overwrite-dominant growth
+  schedules (issue #433).** An overwrite-dominant qcow2 `-w` schedule
+  that also crossed the preemptive refcount-growth threshold
+  provisioned refcount blocks and wrote their refcount-table pointers,
+  but the run allocated nothing, so `flush_dirty_refblocks` (which
+  writes back only dirty blocks) never materialized them — the
+  refcount table ended up pointing at refcount blocks past
+  end-of-file. Silent (exit 0) and `qemu-img check`-dirty on a
+  check-clean input; repairable by `check -r`, but a later allocator
+  could double-allocate. Growth now marks every newly provisioned
+  refcount block dirty before its eager flush, materializing every
+  block the refcount table references (restoring qemu's
+  every-RT-referenced-block-is-allocated invariant); the write rides
+  the existing growth fsync, so the flush census is unchanged.
+  Regression test
+  `test_overwrite_only_growth_check_clean_issue_433`. Found by the
+  phase-6 probes and fixed before the phase-6 migration, which then
+  carried the corrected growth through byte-identically. See
+  [docs/plans/PLAN-qcow2-write-infrastructure.md](docs/plans/PLAN-qcow2-write-infrastructure.md).
+
 - **`instar commit` refuses snapshot-bearing images instead of
   corrupting internal snapshots (issues #420 and #423, the latter an
   overlay-side defect found during the gate work).** commit's
@@ -1148,6 +1169,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     GitHub issues against instar (commit `71e3e33`).
 
 ### Changed
+
+- **`instar bench -w`'s qcow2 path migrated onto `crates/qcow2-write`,
+  and its refcount-growth planner moved into that crate
+  (PLAN-qcow2-write-infrastructure phase 6).** bench `-w` on qcow2 now
+  plans its allocate-on-write schedule with the shared planner
+  (`crates/qcow2-write`) and executes it through
+  `crates/qcow2-write-exec`, the third consumer after commit (phase 4)
+  and rebase (phase 5); the read path, raw `-w`, and the vmdk/vhd/vhdx
+  read support are untouched. The pure refcount-growth planner
+  (`plan_refcount_growth`, `GrowthCaps`, `RefcountGrowthPlan`,
+  `GrowthOverflow`, with 12 unit tests) moved from `crates/bench` into
+  a new `growth` module of `crates/qcow2-write`, so it is available to
+  future write consumers; growth execution stays bench-side but now
+  routes its I/O through the shared executor's byte-range layer.
+  Unlike commit and rebase, this migration deliberately relaxes byte
+  identity for allocating schedules: bench's oracle is `qemu-img
+  compare` + `qemu-img check`, and the shared planner allocates the L2
+  table before the data cluster (the reverse of pre-migration bench),
+  so allocating outputs are content-equivalent and check-clean but not
+  byte-identical; overwrite-only schedules stay byte-identical. The
+  `scripts/migration-proof.py` harness (extended with `--op bench`)
+  proved this over a 56-combo matrix — 2 controls and 17
+  overwrite-only combos byte-identical, 34 allocating combos
+  compare/check/info/`flushes-issued`/RT-geometry equivalent, 3
+  refusals rc/stderr-identical — with 0 byte-identity failures, 0
+  determinism failures and 0 matrix failures, and a 300-iteration
+  bench differential-fuzz run reported 0 divergences. One new
+  `BenchResult` code 9 (`ERROR_IMAGE_INCONSISTENT`, "bench: image
+  metadata is inconsistent") carries the planner's classification
+  refusals (unknown/reserved L1/L2 bit patterns, refcount
+  inconsistencies, a v3 zero-flag on the target L2 entry) that had no
+  existing bench rendering; existing codes are reused otherwise
+  (allocation exhaustion keeps code 8, the contiguity gate keeps
+  code 3). The fsync census is preserved exactly — the executor's
+  flushes are disabled and bench issues its own single `fsync_input(0)`
+  per `--flush-interval` cadence point, so `flushes-issued` is
+  unchanged. See [docs/bench.md](docs/bench.md),
+  [docs/quirks.md](docs/quirks.md) and the phase-6 findings in
+  [docs/plans/PLAN-qcow2-write-infrastructure.md](docs/plans/PLAN-qcow2-write-infrastructure.md).
 
 - **`instar rebase`'s safe-mode qcow2 path migrated onto
   `crates/qcow2-write` (PLAN-qcow2-write-infrastructure phase 5).**

@@ -293,7 +293,7 @@ Design sketch (to be settled in phase planning, not binding):
 | 3. `crates/qcow2-write` core: classification + allocate-on-write planner + ordering contract (no COW, no growth), unit tests + simulation harness | PLAN-qcow2-write-infrastructure-phase-03-crate.md | Complete (2026-07-12; commits 878ebf0 / bc322b2 / 19ba116 / d883b25; see Findings) |
 | 4. Migrate commit onto the crate (byte-identical proof) | PLAN-qcow2-write-infrastructure-phase-04-commit.md | Complete (2026-07-13; commits c101c9f / a2fae94 / 6b0c856 / 7dff544 / 2237028; see Findings) |
 | 5. Migrate rebase safe mode (byte-identical proof) | PLAN-qcow2-write-infrastructure-phase-05-rebase.md | Complete (2026-07-13; commits ad208bf / cfb86f9 / 5889573; see Findings) |
-| 6. Migrate bench `-w`; move the refcount-growth planner into the shared crate | PLAN-qcow2-write-infrastructure-phase-06-bench.md | Planned (2026-07-13), not started |
+| 6. Migrate bench `-w`; move the refcount-growth planner into the shared crate | PLAN-qcow2-write-infrastructure-phase-06-bench.md | Complete (2026-07-13; commits a93ed53 / e9905b7 / c50bfbd / f7bd81c / aae6083; see Findings) |
 | 7. Copy-on-write branch; lift bench's internal-snapshot gate; per-consumer COW policy per OQ3 | PLAN-qcow2-write-infrastructure-phase-07-cow.md | Not started |
 | 8. Fuzz: coverage-guided target for the new crate; differential coverage for newly-permitted snapshot-bearing writes | PLAN-qcow2-write-infrastructure-phase-08-fuzz.md | Not started |
 | 9. Docs: architecture notes, docs/qcow2/ implementation notes, per-op doc updates, CHANGELOG | PLAN-qcow2-write-infrastructure-phase-09-docs.md | Not started |
@@ -1069,6 +1069,137 @@ for a possible cleanup: either plumb the real new-backing
 virtual size or delete the parameter; not changed by
 phase 5.
 
+### Findings: phase 6 bench migration (2026-07-13)
+
+Executed per
+[PLAN-qcow2-write-infrastructure-phase-06-bench.md](PLAN-qcow2-write-infrastructure-phase-06-bench.md)
+as steps 6p (empirical probes, no code; findings folded into
+that plan and quirks.md), 6a (the growth-planner move, a93ed53),
+the #433 fix-first commit (e9905b7), 6b (the op migration,
+f7bd81c) and 6c (proof harness extension + recorded run,
+aae6083); c50bfbd records the 6p probe findings and the #433
+disposition. Bench is the **third consumer** of
+`crates/qcow2-write` + `crates/qcow2-write-exec` after commit
+(phase 4) and rebase (phase 5). The divergence budget
+B-D1..B-D8 held as amended after 6p; nothing outside it was
+found. The read path, raw `-w`, and the vmdk/vhd/vhdx read
+support are untouched. What follows is what phases 7-9 need.
+
+**The growth planner is now shared; execution stays op-side
+(mission item 3, done).** 6a moved `plan_refcount_growth`,
+`GrowthCaps`, `RefcountGrowthPlan` and `GrowthOverflow` (with 12
+relocated unit tests) verbatim into a new pure `growth` module of
+`crates/qcow2-write` — no I/O, no call-table types, the crate's
+`no_std`/review bars apply. `worst_case_touched` / `TouchedBound`
+STAY in `crates/bench` because they are BenchParams/schedule-
+coupled (the wrong-direction dependency the fact base flagged);
+bench passes the computed `worst_case_new_clusters` across the
+boundary. The imperative growth EXECUTION (write order, the
+data/fsync/header-flip/fsync dance, the staged old-RT free)
+remains in the bench op, now routing its I/O through
+`qcow2-write-exec`'s byte-range layer (`read_bytes` /
+`write_bytes` / `fill_bytes`). Step-program-shaping the growth
+execution stays recorded future work — not worth it while bench
+is the only growth consumer. Phase 7's COW work inherits a pure,
+unit-tested growth planner it can call directly if a COW schedule
+ever needs preemptive growth.
+
+**The migration is proof-clean under a relaxed oracle — the
+proof numbers.** `scripts/migration-proof.py --op bench` (6c)
+adds bench-specific stdout/JSON normalisation (it asserts the
+header line, the flush line, stderr, per-file sha256, and JSON
+minus the three wall-clock rate fields; NEVER the completion
+line) with buckets a-d pre-declared IN CODE. Recorded run
+(before = the #433-fixed dist, after = aae6083): 56 combos —
+bucket a (2 controls: raw `-w`, read) full byte identity; bucket
+b (17 overwrite-only + the #433 overwrite∩growth corner)
+byte-identical across the migration; bucket c (34 allocating via
+`qemu-img compare` + `check` + normalised info + `flushes_issued`
+identity + growth RT-geometry deltas) content-equal and
+check-clean; bucket d (3 refusals) rc/stderr identical with
+sha-unchanged where today's refusal is pre-mutation. 0
+byte-identity failures, 0 determinism failures, 0 matrix
+failures. Post-migration fuzz soak
+`differential-fuzz.py --iterations 300 --ops bench`: 0
+divergences. Commit/rebase no-regression smoke via `--combo`
+filters: PASS. `bench.bin` builds at 178160 B (173 KiB of the
+768 KiB operation-region budget, 22%).
+
+**The B-D1 / D-A relaxation — recorded for posterity.** Phase 6
+is the first migration to deliberately relax byte identity. Bench
+allocates the data cluster FIRST and a fresh L2 SECOND; the crate
+allocates L2-first (its proven order, shared with commit and
+rebase). Under the shared linear cursor the two host offsets swap
+for every fresh-L2 write, so final images differ for allocating
+schedules — B-D1. This is sound because bench's oracle is
+`qemu-img compare` + `qemu-img check` by mission design, not byte
+identity, and was never a byte-parity consumer (Q3's inventory:
+bench's qcow2 `-w` surface is compare + check, never sha). Bucket
+(c) proves the images equivalent by content + structure instead
+of bytes. Overwrite-only schedules allocate nothing, so B-D1 does
+not apply and they stay byte-IDENTICAL (bucket b) — including the
+#433 overwrite∩growth corner, whose growth metadata is included
+in the identity check.
+
+**The fsync-census technique (decision 4) — no crate change.**
+Bench's image is input slot 0 opened RW, so `fsync_input(0)`
+actually syncs (unlike commit/rebase, where Durability degraded
+to a no-op on the fsync-less output device). All `plan_flush`
+calls run through a fsync-DISABLED `CallTableIo`
+(`CallTableIo::new(call_table, false)`); at each count-based
+cadence point the op drives a full flush epoch and then issues
+exactly ONE `fsync_input(0)` itself, preserving today's census
+precisely (`flushes_issued` counts cadence points only — never
+growth fsyncs; 0 at end-of-bracket and for `--flush-interval 0`).
+6p confirmed the split empirically by strace. This is the
+template for any future consumer whose device HAS a real fsync
+but whose durability cadence must not change: disable the
+executor's fsync and issue the op's own, keeping `plan_flush`
+purely for ordering. One growth-side deviation from a pure move:
+the relocating old-RT free is now persisted inside growth (an
+extra byte-range write, NO extra fsync) because the crate's
+`plan_flush` writes back only its own dirty state; the census is
+unchanged.
+
+**#433 — a data-integrity defect found by 6p, fixed fix-first
+before 6b (e9905b7).** An overwrite-dominant `bench -w` schedule
+that also crosses the preemptive growth threshold provisioned
+refcount blocks and wrote their refcount-table pointers, but
+`flush_dirty_refblocks` writes back only DIRTY blocks; an
+overwrite-only run allocates nothing, so the over-provisioned
+blocks stayed non-dirty, were never materialized, and the RT
+dangled past EOF — silent (exit 0), `qemu-img check`-dirty on a
+check-clean input. The fix marks every newly provisioned refblock
+dirty before the eager growth flush, materializing it and
+restoring qemu's every-RT-referenced-block-is-allocated invariant;
+it rides the existing growth fsync so the census is unchanged.
+Regression test `test_overwrite_only_growth_check_clean_issue_433`.
+Because the fix is inside the code B-D8 covers, the migration
+carries the CORRECTED growth execution as its "byte-identical
+pure move", so the before-dist was rebuilt at the fix commit and
+the overwrite∩growth corner became a normal bucket-b combo.
+
+**What phase 6 does NOT fix — zero-flag Variant B (#432).**
+Decision-8's `UnknownL2Entry` → code-9 narrowing closes only the
+TARGET-side zero-flag entry (Variant A): a zero flag on the L2
+entry bench is about to overwrite now refuses instead of blind-
+allocating a mis-filled pre-image. A zero flag in a BACKING
+cluster reached via the COW read (Variant B) still mis-fills
+post-migration — #432 is a read-path defect in `crates/qcow2`'s
+`cluster_lookup`, unfixed by phase 6. The B-D5 record must not
+over-claim that decision-8 eliminates zero-flag corruption for
+backed images.
+
+**What remains for phases 7-9.** Phase 7 (COW) can now lift
+bench's internal-snapshot gate (`nb_snapshots > 0`) — the last
+consumer to gate snapshots — once the crate's COW branch lands,
+and adopt COW per consumer per OQ3. Phase 8 adds a
+coverage-guided fuzz target for the crate and differential
+coverage for newly-permitted snapshot-bearing writes. Phase 9 is
+the cross-cutting docs/architecture close-out. The #432 read-path
+zero-flag fix and the qemu-lazy growth parity that would unlock
+growth for the byte-parity consumers both remain future work.
+
 ## Administration and logistics
 
 ### Success criteria
@@ -1118,9 +1249,10 @@ phase 5.
 ### Bugs fixed during this work
 
 Phase 1 confirmed three pre-existing defects, phase 2 found a
-fourth, phase 4's probes found two more, and phase 5's probes
-found three more — two fixed by typed refusals, one out of
-scope (details and repro recipes in the Findings sections;
+fourth, phase 4's probes found two more, phase 5's probes found
+three more — two fixed by typed refusals, one out of scope — and
+phase 6's probes found one more, fixed fix-first before the
+migration (details and repro recipes in the Findings sections;
 #420-#422 filed 2026-07-12):
 
 1. [#420](https://github.com/shakenfist/instar/issues/420)
@@ -1190,6 +1322,25 @@ scope (details and repro recipes in the Findings sections;
    fix must address it, and differential matrices must avoid
    `write -z` seeds until then. Filed 2026-07-13 as
    [#432](https://github.com/shakenfist/instar/issues/432).
+10. `instar bench -w` on an overwrite-dominant qcow2 schedule
+    that also crossed the preemptive refcount-growth threshold
+    left the refcount table referencing refcount blocks past EOF
+    — the over-provisioned blocks were never materialized because
+    `flush_dirty_refblocks` writes back only DIRTY blocks and an
+    overwrite-only run allocates nothing to dirty them. Silent
+    (exit 0), `qemu-img check`-dirty on a check-clean input;
+    repairable by `check -r` but a later allocator could
+    double-allocate. Found by phase 6p. **Fixed fix-first before
+    the migration (e9905b7): growth now marks every newly
+    provisioned refblock dirty before the eager flush,
+    materializing it and restoring qemu's
+    every-RT-referenced-block-is-allocated invariant; it rides the
+    existing growth fsync so the census is unchanged. The
+    corrected growth was then carried through the migration as its
+    byte-identical pure move (B-D8).** Filed 2026-07-13 as
+    [#433](https://github.com/shakenfist/instar/issues/433). The
+    Variant-B zero-flag read-path corruption (#432) remains
+    unfixed by phase 6.
 
 Fix status is tracked here as phases land.
 

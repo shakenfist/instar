@@ -1717,6 +1717,117 @@ provides this data" mode (see
 plans/PLAN-rebase-commit-phase-08-commit-host.md)) can
 plug in without an ABI change.
 
+## bench subcommand quirks
+
+Since the phase-6 migration (PLAN-qcow2-write-infrastructure),
+`instar bench -w` on a qcow2 image runs its allocate-on-write
+path on the shared `crates/qcow2-write` planner and
+`crates/qcow2-write-exec` executor — bench is the third
+consumer after commit (phase 4) and rebase (phase 5). The read
+path, raw `-w`, and the vmdk/vhd/vhdx read support are
+untouched. The quirks below record how the migration changed
+`-w` behaviour. bench's own oracle is `qemu-img compare` +
+`qemu-img check` (not byte identity), so unlike commit and
+rebase the migration deliberately relaxes byte parity for
+allocating schedules; the rest is behaviour-preserving.
+
+### Allocating writes no longer produce byte-identical images
+
+For a `-w` schedule that allocates (a write to an unallocated
+cluster), the post-run qcow2 image is **not** byte-identical to
+what pre-migration bench produced, nor to `qemu-img bench -w`.
+Pre-migration bench allocated the data cluster first and a
+fresh L2 table second; the shared planner allocates the L2
+table first (its proven order, shared with commit and rebase).
+Under the single linear allocation cursor the two host offsets
+swap for every fresh-L2 write, so the physical layout differs.
+The images are still equivalent: `qemu-img compare` reports
+identical virtual content and `qemu-img check` is clean. This
+is sound because bench's `-w` oracle has always been
+compare + check, never a byte hash — bench was never a
+byte-parity consumer. Overwrite-only schedules allocate
+nothing, so their output stays byte-identical across the
+migration.
+
+### New refusal code 9 for classification-inconsistent images
+
+The migration appends one wire code,
+`BenchResult::ERROR_IMAGE_INCONSISTENT = 9`, rendered as
+`bench: image metadata is inconsistent`. It carries the
+planner's classification refusals that had no existing bench
+rendering:
+unknown/reserved L1 or L2 entry bit patterns, refcount
+inconsistencies, refcount-coverage gaps, and a staged-regions
+mismatch. `RefcountExhausted` keeps `ERROR_ALLOC_EXHAUSTED = 8`
+(``image too large for in-place bench write``); a mid-run
+compressed cluster keeps the gate-2 `ERROR_WRITE_UNSUPPORTED`
+rendering; snapshot-shared clusters keep the gate-7 rendering
+(bench's defensive posture — the image is already gated on
+`nb_snapshots > 0` at setup). These refusals are narrower than
+pre-migration bench, which blind-allocated over exotic entries.
+
+### The contiguity gate keeps `ERROR_PARSE_FAILED` (code 3)
+
+The staging-time refcount-table contiguity gate (a sparse /
+holed refcount table refuses before any mutation) keeps
+returning bench's existing `ERROR_PARSE_FAILED = 3`, not the
+new code 9. It refuses identically to pre-migration bench, so
+the pure-refactor bar wins over cosmetically unifying it with
+commit's (error 17) and rebase's (error 16) equivalents. The
+refusal is pre-mutation and byte-idempotent.
+
+### Zero-flag L2 entries: target-side refused, backing-side still corrupts
+
+A qcow2 v3 zero-flag (`QCOW_OFLAG_ZERO`) on the L2 entry bench
+is about to overwrite now refuses with code 9 (Variant A) —
+pre-migration bench blind-allocated over it and chain-filled a
+pre-image the reader mis-handles. But a zero flag in a
+**backing** cluster reached through the COW read (Variant B)
+still mis-fills after the migration: that is a read-path defect
+in `crates/qcow2`'s `cluster_lookup`
+([#432](https://github.com/shakenfist/instar/issues/432)), not
+fixed by phase 6. Code 9 does **not** eliminate zero-flag
+corruption for backed images.
+
+### Flush and durability posture (fsync census preserved)
+
+The migration preserves bench's fsync census exactly, with no
+change to the shared crate. All `plan_flush` calls run through
+a fsync-DISABLED `CallTableIo` (`CallTableIo::new(ct, false)`),
+so the executor never fsyncs; at each count-based
+`--flush-interval` cadence point the op drives a full flush
+epoch and then issues exactly one `fsync_input(0)` itself — as
+pre-migration bench did. `flushes-issued` (`--output json`)
+counts cadence points only, never growth fsyncs; it is zero at
+end-of-bracket and for `--flush-interval 0`. Setup-time
+refcount growth keeps its own 1-2 fsyncs (1 in-place, 2 on a
+refcount-table relocation), which are not counted in
+`flushes-issued`. Because bench's image is input slot 0 opened
+RW, `fsync_input(0)` genuinely syncs here (unlike commit and
+rebase, whose output-device writes have no fsync primitive and
+rely on ordering alone). Timing character inside the bracket
+is not comparable across versions by design.
+
+### Refcount growth materializes over-provisioned refblocks (#433)
+
+Setup-time growth now marks every newly provisioned refcount
+block dirty before its eager flush, so every block the
+refcount table points at is materialized on disk. Before the
+fix (landed just before the migration,
+[#433](https://github.com/shakenfist/instar/issues/433)), an
+overwrite-dominant schedule that crossed the growth threshold
+provisioned refblocks and wrote their table pointers but
+allocated nothing to dirty them, so `flush_dirty_refblocks`
+(which writes only dirty blocks) never materialized them and
+the refcount table dangled past EOF — silent (exit 0),
+`qemu-img check`-dirty on a check-clean input. The fix restores
+qemu's every-RT-referenced-block-is-allocated invariant and
+rides the existing growth fsync, so the census is unchanged.
+One growth-side write was relocated by the migration: the
+relocating old-refcount-table free is now persisted inside
+growth (an extra byte-range write, no extra fsync), because the
+crate's `plan_flush` writes back only its own dirty state.
+
 ## convert subcommand quirks
 
 ### `--snapshot` resolves ID-then-name over a bounded 16-entry table

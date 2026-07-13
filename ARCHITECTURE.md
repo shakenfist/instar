@@ -274,19 +274,25 @@ provides a modular architecture with:
   Envelope gates (qcow2 v2/v3, 16-bit refcounts, no
   unknown-incompatible bits, no extended-L2 / external data /
   encryption, not dirty/corrupt, no internal snapshots) run at state
-  construction, so a gated image can never yield a write plan. Two
+  construction, so a gated image can never yield a write plan. Three
   ops consume it: commit (phase 4, 2026-07-13 — the qcow2
-  backing-side write path) and rebase safe mode including safe
+  backing-side write path), rebase safe mode including safe
   detach (phase 5, 2026-07-13 — the overlay-side copy path, with an
   op-side skip probe against original pre-run L2 state deciding
-  which clusters reach the planner at all). Both are planned by this
-  crate and executed through `crates/qcow2-write-exec`, proven
+  which clusters reach the planner at all), and bench `-w` (phase 6,
+  2026-07-13 — the qcow2 write-benchmark path). All are planned by
+  this crate and executed through `crates/qcow2-write-exec`, proven
   byte-invisible by the `scripts/migration-proof.py` before/after
-  harness (73/73 and 69/69 fixture combos byte-identical
-  respectively, 300-iteration differential fuzz clean each; rebase
-  carries one sanctioned beyond-EOV raw divergence with proven
-  virtual equality). Phase 6 migrates bench `-w` (absorbing its
-  refcount growth), and phase 7 adds copy-on-write.
+  harness (73/73, 69/69 and — for bench, whose oracle is
+  compare + check rather than byte identity — 56/56 fixture combos,
+  300-iteration differential fuzz clean each; rebase carries one
+  sanctioned beyond-EOV raw divergence with proven virtual equality,
+  and bench's allocating shapes are content-equivalent but not
+  byte-identical by design). The crate also owns the pure
+  refcount-growth planner in its `growth` module (`plan_refcount_growth`,
+  `GrowthCaps`, `RefcountGrowthPlan`, `GrowthOverflow`), moved out of
+  `crates/bench` in phase 6; growth execution stays in the bench op.
+  Phase 7 adds copy-on-write, lifting bench's internal-snapshot gate.
 - **crates/qcow2-write-exec/** - Shared guest-side step executor for
   `crates/qcow2-write` step programs (`no_std`,
   PLAN-qcow2-write-infrastructure phase 4): a literal interpreter of
@@ -314,9 +320,11 @@ provides a modular architecture with:
   output-device reality). Host-unit-tested against a mock `DeviceIo`
   with journals and failure injection, including end-to-end
   compositions driving `plan_write` / `plan_flush` through the
-  executor over a model disk. Consumed by the commit op (phase 4)
-  and the rebase op's safe mode (phase 5); phase 6 reuses it for
-  bench.
+  executor over a model disk. Consumed by the commit op (phase 4),
+  the rebase op's safe mode (phase 5), and the bench op's qcow2 `-w`
+  path (phase 6, which also drives its refcount-growth I/O through
+  the byte-range layer with the executor's fsync disabled so bench
+  keeps its own single-fsync-per-cadence-point census).
 - **operations/info/** - Format detection operation
 - **operations/copy/** - File copy operation
 - **operations/check/** - Image integrity validation operation (with
@@ -671,19 +679,27 @@ provides a modular architecture with:
   `send_bench_start` marker (emitted once setup completes) and the
   terminal `send_bench_result`. Reads all five formats; write tests
   (`-w`) are supported on raw and qcow2 only (including qcow2
-  overlays), using a write-through-for-metadata/staged-for-refcounts
-  design so a mid-run crash leaves at worst a repairable leak. qcow2
-  write setup preemptively grows the image's refcount structures to
-  the schedule's worst-case coverage before the timing bracket opens
-  (new refblocks at the file end; refcount-table relocation with an
-  fsync-ordered header flip — `PLAN-bench-refcount-growth`). The
-  pure `no_std` `crates/bench` crate provides the request-schedule
-  math and the refcount-growth planner shared by the guest, host CLI
-  and tests. `bench.bin` builds at ~162 KiB of the 768 KiB
-  operation-region budget. The ABI appends two
+  overlays); a mid-run crash leaves at worst a repairable leak. Since
+  the phase-6 migration (PLAN-qcow2-write-infrastructure), the qcow2
+  `-w` allocate-on-write path runs on the shared `crates/qcow2-write`
+  planner and `crates/qcow2-write-exec` executor — bench is the third
+  consumer after commit and rebase — staging metadata and writing it
+  back refcounts-last at each flush epoch. qcow2 write setup
+  preemptively grows the image's refcount structures to the
+  schedule's worst-case coverage before the timing bracket opens (new
+  refblocks at the file end; refcount-table relocation with an
+  fsync-ordered header flip — `PLAN-bench-refcount-growth`); the pure
+  growth planner moved into `crates/qcow2-write`'s `growth` module in
+  phase 6, though growth execution stays op-side. bench keeps its own
+  fsync census (the executor's fsync is disabled; the op issues one
+  `fsync_input(0)` per `--flush-interval` cadence point). The pure
+  `no_std` `crates/bench` crate provides the request-schedule math
+  (and `worst_case_touched`, which stays BenchParams-coupled) shared
+  by the guest, host CLI and tests. `bench.bin` builds at ~173 KiB of
+  the 768 KiB operation-region budget. The ABI appends two
   call-table callbacks (`send_bench_start`, `send_bench_result`),
   bumping `CallTable::VERSION` from 19 to 20. Coverage:
-  `tests/test_bench.py` (72 tests), the `fuzz_bench_schedule`
+  `tests/test_bench.py` (76 tests), the `fuzz_bench_schedule`
   coverage fuzzer, and the differential fuzzer's `op_bench` arm. See
   [docs/bench.md](docs/bench.md).
 - **shared/** - Shared library code between components (call table, configs,
