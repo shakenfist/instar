@@ -11,6 +11,17 @@ shared = { path = "../../shared" }
 qcow2 = { path = "../qcow2", default-features = false }
 snapshot = { path = "../snapshot" }
 
+[features]
+# Expose the Vec-backed simulation harness (`pub mod sim`) for
+# out-of-crate consumers — the `fuzz_qcow2_write` cargo-fuzz target.
+# OFF in the production guest ops (commit/rebase/bench depend on this
+# crate with no features), so no `std` links into the guest binaries.
+# The harness only references `qcow2` (parse + flag constants, in the
+# default feature set) and `snapshot` (refcount codec), both already
+# non-optional dependencies, so the feature adds no new deps — it only
+# gates the harness module + its `extern crate std`.
+sim = []
+
 [dev-dependencies]
 create = { path = "../create" }
 qcow2 = { path = "../qcow2", features = ["create"], default-features = false }

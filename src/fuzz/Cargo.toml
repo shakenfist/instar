@@ -27,6 +27,7 @@ amend = { path = "../crates/amend" }
 bitmap = { path = "../crates/bitmap" }
 dd = { path = "../crates/dd" }
 bench = { path = "../crates/bench" }
+qcow2-write = { path = "../crates/qcow2-write", features = ["sim"] }
 
 [profile.release]
 debug = true
@@ -218,5 +219,19 @@ test = false
 [[bin]]
 name = "fuzz_bench_schedule"
 path = "fuzz_targets/fuzz_bench_schedule.rs"
+doc = false
+test = false
+
+# qcow2-write planner targets
+
+[[bin]]
+name = "fuzz_qcow2_write"
+path = "fuzz_targets/fuzz_qcow2_write.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "fuzz_qcow2_write_growth"
+path = "fuzz_targets/fuzz_qcow2_write_growth.rs"
 doc = false
 test = false
