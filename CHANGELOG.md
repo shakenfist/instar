@@ -32,6 +32,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Fuzzing for the qcow2-write planner and its snapshot-bearing
+  copy-on-write paths (PLAN-qcow2-write-infrastructure phase 8).**
+  Two new coverage-guided libFuzzer targets exercise the
+  `crates/qcow2-write` planner directly. `fuzz_qcow2_write` decodes a
+  fixture archetype (clean / backing-present / shared-data /
+  shared-L2 nested / owned-L2 / zero-flag-target) at a cluster size
+  {512, 4 KiB, 64 KiB, 2 MiB} and drives a bounded
+  `plan_write`/`plan_flush` sequence through the crate's Vec-backed
+  simulation harness — lifted in this phase out of the crate's unit
+  tests into a feature-gated `#[cfg(any(test, feature = "sim"))]
+  pub mod sim` that is OFF in the production build, so the guest ops'
+  `.bin` sizes are unchanged. After every operation it asserts the
+  copy-on-write invariant oracle: `max_rc < 3` (the corruption
+  signature), snapshot-shared clusters byte-preserved and never freed,
+  no dangling/past-EOF L1/L2 pointer, and `OFLAG_COPIED` set iff
+  refcount is exactly 1 after a flush (a `WriteError` refusal is a
+  valid outcome, not a crash). `fuzz_qcow2_write_growth` feeds geometry
+  to the `growth` module's `plan_refcount_growth`, asserting no
+  overflow, the self-coverage invariant, and cap adherence. Both join
+  the nightly `coverage-fuzz.yml` fast tier (30→32 targets); their
+  bring-up shake-out found no planner bug. The differential fuzzer's
+  `op_commit`/`op_rebase`/`op_bench` arms now also build
+  snapshot-bearing fixtures (40% probability, when `qemu-io` is
+  present) that exercise the phase-7 copy-on-write paths, with the
+  oracle gaining the snapshot read-back triple — active-view
+  `qemu-img compare` + `qemu-img check` clean + per-carrier snapshot
+  read-back `instar == qemu twin` (`tests/helpers/snapshot_readback.py`)
+  — and a 300-iteration local soak ran 0 divergences. The standalone
+  `scripts/cow-soak.py` (phase 7e) is folded into the differential
+  fuzzer and retired. See
+  [docs/plans/PLAN-qcow2-write-infrastructure.md](docs/plans/PLAN-qcow2-write-infrastructure.md)
+  and [docs/testing.md](docs/testing.md).
+
 - **Copy-on-write for `commit`, `rebase` safe mode and `bench -w` on
   snapshot-bearing qcow2 images (PLAN-qcow2-write-infrastructure
   phase 7).** Writes into a qcow2 image that carries internal

@@ -319,7 +319,16 @@ provides a modular architecture with:
   (decision 6): host == 0 allocates fresh, host != 0 rc 1 overwrites
   in place clearing the zero bit, host != 0 rc > 1 COWs — qemu never
   frees the old offset. No new `StepKind`. The COW output is proven
-  qemu-parity, never byte-identical to qemu (C11).
+  qemu-parity, never byte-identical to qemu (C11). The crate's
+  Vec-backed simulation harness (`TestImg` + the executor role +
+  `run_write` / `run_flush` `BufFull`-resume loops + the COW fixtures +
+  the `rc_of` / `max_rc` assertion helpers) lives in a feature-gated
+  `#[cfg(any(test, feature = "sim"))] pub mod sim` (phase 8a): the crate's
+  own unit tests import it, the `sim` feature is OFF in the production
+  build (it needs `std`, and the guest ops are `no_std`
+  `x86_64-unknown-none`, so the ops' `.bin` sizes are unchanged), and the
+  `fuzz_qcow2_write` coverage target enables it to fuzz the planner
+  (see Coverage-Guided Fuzzing below).
 - **crates/qcow2-write growth-execution move (phase 7).** The
   imperative refcount-growth EXECUTION (previously in the bench op) is
   now the shared, region-agnostic `growth::grow_refcounts` in
@@ -1094,6 +1103,24 @@ preallocation mode, every vmdk subformat) get coverage here
 without spurious
 findings from the known gaps.
 
+The `commit`, `rebase` and `bench` arms additionally draw a
+snapshot-fixture flag (40% probability) and, when `qemu-io` is present,
+build a **snapshot-bearing** fixture (phase 8 of
+PLAN-qcow2-write-infrastructure) exercising the copy-on-write paths
+phase 7 opened: commit over a backing- or overlay-snapshot span, safe
+rebase of a snapshot-bearing overlay, and `bench -w` over a
+snapshot-shared span. For a snapshot fixture the oracle gains the
+phase-7 read-back triple — active-view `qemu-img compare` identical +
+`qemu-img check` clean (with a `refcount=1 reference=2` scan) +
+per-carrier snapshot read-back `instar == qemu twin` (via
+`tests/helpers/snapshot_readback.py`, which applies each snapshot on a
+copy, converts to raw, and compares sha256) — the last of which the
+active-view compare alone cannot see. Non-snapshot fixtures keep their
+existing oracle unchanged. This folds in the retired standalone
+`scripts/cow-soak.py` soak (phase 7e), which nothing in CI depended on;
+the snapshot coverage now rides the existing `differential-fuzz.yml`
+nightly with no new workflow.
+
 ### libyal Cross-Validation
 
 When libyal tools are installed (`libvmdk-utils`, `libvhdi-utils`,
@@ -1125,7 +1152,7 @@ A mock `CallTable` (in `src/fuzz/src/lib.rs`) backed by thread-local
 fuzzer input provides sector-based I/O, allowing libFuzzer to explore
 deeply malformed inputs.
 
-30 fuzz targets cover all parser crates: format detection, header
+32 fuzz targets cover all parser crates: format detection, header
 parsing (QCOW2, VMDK, VHD, VHDX, RAW, LUKS), L1/L2 cluster lookup,
 refcount table traversal, zlib decompression, grain directory lookup,
 BAT traversal, VHDX metadata parsing, the measure subcommand's
@@ -1165,10 +1192,26 @@ qcow2 read primitives). The amend subcommand adds
 `fuzz_bitmap_parse` (the qcow2 bitmap directory/table/extension
 parsers) plus `fuzz_bitmap_planners` (the bitmap crate's
 directory/action/merge functions over synthesised
-directory+refblocks). Finally, the bench subcommand adds
+directory+refblocks). the bench subcommand adds
 `fuzz_bench_schedule` (the pure `crates/bench` schedule math: param
 validation, offset advance, transfer splitting, and flush cadence,
-over a deliberately unclamped fuzzed header).
+over a deliberately unclamped fuzzed header). Finally, the
+`crates/qcow2-write` planner gets two targets (phase 8 of
+PLAN-qcow2-write-infrastructure). `fuzz_qcow2_write` decodes a fixture
+archetype (clean / backing-present / shared-data / shared-L2 nested /
+owned-L2 / zero-flag-target) at a cluster size {512, 4 KiB, 64 KiB,
+2 MiB} and drives a bounded `plan_write` / `plan_flush` sequence through
+the crate's feature-gated `sim` harness, asserting the copy-on-write
+invariant oracle after every operation: **`max_rc < 3`** (the COW
+corruption signature — a snapshot-shared child driven past its
+creation refcount of 2), snapshot-shared clusters byte-preserved and
+never freed (`rc >= 1`), no dangling / past-EOF L1/L2 pointer, and —
+after a flush — `OFLAG_COPIED` set iff refcount is exactly 1. A
+`WriteError` refusal is a valid outcome, not a crash.
+`fuzz_qcow2_write_growth` feeds geometry to the `growth` module's
+`plan_refcount_growth`, asserting no overflow, the self-coverage
+invariant, and cap adherence. Both are registered in the fast tier
+(`tools/ci/fuzz-tier.sh`); their shake-out found no planner bug.
 
 The seed corpus is extracted from `instar-testdata` by
 `scripts/extract-fuzz-corpus.py`, which filters images by format,

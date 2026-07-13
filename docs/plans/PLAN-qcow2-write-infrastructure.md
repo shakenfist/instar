@@ -295,15 +295,16 @@ Design sketch (to be settled in phase planning, not binding):
 | 5. Migrate rebase safe mode (byte-identical proof) | PLAN-qcow2-write-infrastructure-phase-05-rebase.md | Complete (2026-07-13; commits ad208bf / cfb86f9 / 5889573; see Findings) |
 | 6. Migrate bench `-w`; move the refcount-growth planner into the shared crate | PLAN-qcow2-write-infrastructure-phase-06-bench.md | Complete (2026-07-13; commits a93ed53 / e9905b7 / c50bfbd / f7bd81c / aae6083; see Findings) |
 | 7. Copy-on-write branch; lift bench's internal-snapshot gate; per-consumer COW policy per OQ3 | PLAN-qcow2-write-infrastructure-phase-07-cow.md | Complete (2026-07-13/14; plan 9cb5b59 / 9440464; commits 7z dabdcfd, 7a 125152a / 865c171, growth-share 1c9a0d8, 7b e356e27, 7c 997d223, 7d af99c21, 7e 0c07140; see Findings) |
-| 8. Fuzz: coverage-guided target for the new crate; differential coverage for newly-permitted snapshot-bearing writes | PLAN-qcow2-write-infrastructure-phase-08-fuzz.md | Not started |
+| 8. Fuzz: coverage-guided target for the new crate; differential coverage for newly-permitted snapshot-bearing writes | PLAN-qcow2-write-infrastructure-phase-08-fuzz.md | Complete (2026-07-14; plan 0038360; 8a 38b4427; 8b 1982aef; see Findings) |
 | 9. Docs: architecture notes, docs/qcow2/ implementation notes, per-op doc updates, CHANGELOG | PLAN-qcow2-write-infrastructure-phase-09-docs.md | Not started |
 
 Phase 2 was conditional on phase 1 confirming a live defect;
 phase 1 confirmed three (see the Findings defect register), so
-phase 2 ran. Phases 1-7 are complete; phase 7 added copy-on-write
+phase 2 ran. Phases 1-8 are complete; phase 7 added copy-on-write
 (resolving #420 / #421 / #423 and fixing #432), so all three
-consumers now succeed on snapshot-bearing images. Phases 8 (fuzz)
-and 9 (docs) remain; their plan files are the next to write.
+consumers now succeed on snapshot-bearing images, and phase 8 fuzzed
+the new crate and its snapshot-bearing COW paths (0 crashes, 0
+divergences). Phase 9 (docs) remains.
 
 One commit per phase minimum; each commit builds, lints and tests
 clean on its own. Phases 4-6 are pure refactors from the outside:
@@ -1300,6 +1301,89 @@ it. Active view and snapshots are correct without it. (2) A **tighter
 rebase growth bound** — the `2 × overlay_cluster_count` sizing
 over-provisions refblocks (check-clean via #433); a bound closer to the
 actual COW allocation count is deferred.
+
+### Findings: phase 8 fuzzing (2026-07-14)
+
+Executed per
+[PLAN-qcow2-write-infrastructure-phase-08-fuzz.md](PLAN-qcow2-write-infrastructure-phase-08-fuzz.md)
+as the plan (0038360) and the two independent threads: 8a (crate
+coverage target + harness lift, 38b4427) and 8b (snapshot-bearing
+differential coverage, 1982aef). Phase 8 adds **verification
+infrastructure only** — no op or crate semantics changed. Neither
+thread found a bug (a real finding would have been a STOP routing back
+to phase 7, not a phase-8 fix). What follows is what phase 9 documents.
+
+**Thread 1 — the sim-harness lift is a pure move.** 8a lifted the
+crate's `#[cfg(test)]` simulation harness (`TestImg` + the executor
+role + `run_write` / `run_flush` `BufFull`-resume loops + the COW
+fixtures + the `rc_of` / `max_rc` helpers) out of `mod tests` into a
+new `#[cfg(any(test, feature = "sim"))] pub mod sim`
+(`src/crates/qcow2-write/src/sim.rs`); the crate's unit tests import it
+unchanged and stay green (`make test-rust` 0-fail, 75 crate tests). The
+`sim` feature needs no new dependency and is OFF in the production build
+(it needs `std`; the guest ops are `no_std` `x86_64-unknown-none`), so
+commit / rebase / bench `.bin` sizes are unchanged — the lift is
+invisible to the shipped binaries.
+
+**Thread 1 — the crate fuzz targets and their invariant oracle.** Two
+libFuzzer targets live in `src/fuzz` with
+`qcow2-write = { features = ["sim"] }`. `fuzz_qcow2_write` decodes a
+fixture archetype (clean / backing / shared-data C1 / shared-L2 nested
+C2/C3 / owned-L2 / zero-flag-target) × cluster size {512, 4 KiB, 64 KiB,
+2 MiB} plus a bounded `plan_write` / `plan_flush` sequence, and after
+every operation asserts the COW invariant oracle: **`max_rc < 3`** (the
+corruption signature — the single most important invariant), snapshot
+clusters byte-preserved and `rc >= 1`, no dangling staged-L1 pointer,
+and `COPIED <=> rc == 1` after a clean flush. A `WriteError` refusal is
+a valid outcome. `fuzz_qcow2_write_growth` feeds geometry to
+`plan_refcount_growth`, asserting no overflow / the self-coverage
+invariant / cap adherence. Both are registered in the nightly fast tier
+(`coverage-fuzz.yml` TARGETS + N_TARGETS 30→32, `tools/ci/fuzz-tier.sh`
+FAST_TIER). Shake-out: `fuzz_qcow2_write` 300 s / 0 crashes / 743 edges /
+234-file corpus; `fuzz_qcow2_write_growth` 120 s / 0 crashes.
+
+**Thread 2 — the read-back oracle in the differential fuzzer (the
+technique).** 8b's contribution is scaling phase 7's hand-built
+integration-test read-back oracle into the coverage-driven differential
+fuzzer. `scripts/differential-fuzz.py`'s `op_commit` / `op_rebase` /
+`op_bench` now draw a snapshot flag (`SNAPSHOT_FIXTURE_PROB = 0.40`)
+from `iter_rng` and, when `qemu-io` is present, build a snapshot-bearing
+fixture (commit backing- and overlay-snapshot spans #420/#423; safe
+rebase of a snapshot-bearing overlay #421; `bench -w` over a
+snapshot-shared span) lifted from the retired `scripts/cow-soak.py`. For
+a snapshot fixture the oracle gains the phase-7 read-back triple via
+`tests/helpers/snapshot_readback.py`: active-view `qemu-img compare`
+identical + `qemu-img check` clean (with a `refcount=1 reference=2`
+scan) + per-carrier snapshot read-back `instar == qemu twin`. The
+load-bearing invariant is the `== qemu twin` read-back — the one an
+active-view compare alone misses (it was invisible to every pre-phase-7
+oracle, which is exactly how the #420 mode-A corruption hid). Soak: 300
+iterations, seed 20260714, 0 divergences / 0 inconclusive;
+untouched-ops smoke 0.
+
+**cow-soak retired.** `scripts/cow-soak.py` (phase 7e) is deleted —
+its generators and parity oracle are folded into the differential
+fuzzer, nothing in CI depended on it, and the snapshot coverage now
+rides the existing `differential-fuzz.yml` nightly with no new workflow.
+`tests/test_cow_cross_version.py` (the pinned-qemu version-matrix
+artifact) stays.
+
+**One recorded follow-up (not a bug).** `plan_refcount_growth` carries a
+debug-only `debug_assert!(false)` non-convergence guard
+(`growth.rs:195`) that fires only in **debug** builds on out-of-envelope
+(petabyte-scale) geometry; in **release** it returns `GrowthOverflow`
+gracefully, and production only ever passes bounded geometry. So the
+target's "no panic on any input" property is debug-conditional.
+Softening the guard to always return `GrowthOverflow` is a minor
+follow-up, recorded here.
+
+**What phase 9 documents.** The cross-cutting architecture / docs
+close-out: the qcow2-write `sim` feature and the two coverage targets,
+the snapshot-bearing differential coverage and its read-back oracle, and
+the cow-soak retirement — already reflected in ARCHITECTURE.md,
+docs/testing.md and CHANGELOG.md by this phase's 8c step, leaving
+phase 9 to fold in the remaining docs/qcow2 implementation notes and
+per-op doc updates.
 
 ## Administration and logistics
 
