@@ -76,6 +76,7 @@ import tempfile
 CLUSTER_SIZES = [512, 4096, 65536]
 SIZES = [1024 * 1024, 64 * 1024 * 1024]
 SEEDS = ['empty', '64k-at-0', 'multi-extent']
+SEEDS_REBASE = ['divergent', 'identical', 'empty']
 LAZY = ['off', 'on']
 BASE_MODES = ['implicit', 'explicit']
 
@@ -215,26 +216,35 @@ def virtual_sha256(qemu_img, setdir, name):
 
 def prove_combo(combo, workdir, args):
     """Build twins, assert determinism, bucket, verdict. Returns a TSV row
-    dict; row['fail'] truthy means the run must exit non-zero."""
+    dict; row['fail'] truthy means the run must exit non-zero.
+
+    Op-generic: the fixture builder, the invocation runner and the mutated-
+    file list come from the OPS registry entry for args.op, so commit's code
+    path is byte-for-byte the functions it always called (build_commit_fixture
+    / run_commit / COMMIT_MUTATED_FILES)."""
+    spec = OPS[args.op]
+    build = spec['build']
+    runner = spec['run']
+    files = spec['files'](combo)
     combo_dir = os.path.join(workdir, combo['tag'])
     if os.path.exists(combo_dir):
         shutil.rmtree(combo_dir)
     sets = {name: os.path.join(combo_dir, name) for name in ('after-run-1', 'after-run-2', 'before-run')}
     for setdir in sets.values():
-        build_commit_fixture(combo, setdir, args.qemu_img, args.qemu_io)
+        build(combo, setdir, args.qemu_img, args.qemu_io)
 
     # Twin equality before anything runs.
     pre = {}
     for name, setdir in sets.items():
-        pre[name] = {f: sha256(os.path.join(setdir, f)) for f in COMMIT_MUTATED_FILES}
+        pre[name] = {f: sha256(os.path.join(setdir, f)) for f in files}
     if not (pre['after-run-1'] == pre['after-run-2'] == pre['before-run']):
         return {'combo': combo, 'bucket': 'n/a', 'verdict': 'FIXTURE-NONDETERMINISTIC',
                 'detail': f'twin fixture sets differ pre-run: {pre}', 'fail': True,
                 'before': None, 'after': None}
 
-    after1 = run_commit(args.after, sets['after-run-1'], combo)
-    after2 = run_commit(args.after, sets['after-run-2'], combo)
-    before = run_commit(args.before, sets['before-run'], combo)
+    after1 = runner(args.after, sets['after-run-1'], combo)
+    after2 = runner(args.after, sets['after-run-2'], combo)
+    before = runner(args.before, sets['before-run'], combo)
     row = {'combo': combo, 'before': before, 'after': after1, 'fail': False, 'detail': ''}
 
     # Premise: run-to-run determinism of the after binary.
@@ -274,12 +284,13 @@ def prove_combo(combo, workdir, args):
         virt_equal = all(
             virtual_sha256(args.qemu_img, sets['before-run'], f) ==
             virtual_sha256(args.qemu_img, sets['after-run-1'], f)
-            for f in COMMIT_MUTATED_FILES)
+            for f in files)
         if virt_equal:
             row.update(verdict='D9-VIRTUAL-EQUAL', fail=False,
-                       detail='LOUD: raw sha256 divergence on the unaligned combo, virtual content '
-                              'identical (decision 7 fallback triggered — expected unnecessary '
-                              'after 4q): ' + '; '.join(diffs))
+                       detail='LOUD: raw sha256 divergence on a pre-declared D9 combo, virtual content '
+                              'identical (EOV-tail / decision-8 fallback triggered — expected for commit '
+                              'unnecessary after 4q, expected for rebase on the oversized-backing shape): '
+                              + '; '.join(diffs))
             return row
         row.update(verdict='D9-VIRTUAL-DIVERGENT', fail=True,
                    detail='unaligned combo diverges even in virtual content: ' + '; '.join(diffs))
@@ -402,15 +413,443 @@ def prove_widening_exemplar(workdir, args):
 
 
 # ---------------------------------------------------------------------------
+# rebase fixtures (phase 5)
+# ---------------------------------------------------------------------------
+#
+# The 5b matrix per the phase-5 plan and its 5p outcome notes:
+#
+#   cluster_size {512, 4096, 65536} x overlay size {1M, 64M}
+#     x chain {2-chain rebase-to-base, 3-chain CHAIN-SHORTENING, safe detach}
+#     x seed {divergent, identical, empty} x mode {safe, -u}
+#
+# Pruning (documented, honest — every surviving combo is in the TSV):
+#   * detach x identical is incoherent (no new backing to be identical to);
+#     5p pruned it. Dropped.
+#   * -u ignores the seed entirely (metadata-only header/path patch), so it
+#     is run ONCE per (cs, size, chain), not once per seed. The -u fixture is
+#     built with the 'divergent' seed as a representative (its content is
+#     ignored by -u).
+#   * 3-chain uses the SHORTENING form (overlay->mid0->base, new backing =
+#     base): the plain rebase-to-mid keeps old and new chains identical and
+#     copies nothing (5p warning). mid0.qcow2 (10 chars) >= base.qcow2 so the
+#     new-backing path fits the overlay's existing backing-path slot (5p
+#     wire-8 warning).
+#   * NO `write -z` zero-flag seeds anywhere (the P7 chain-reader defect would
+#     contaminate the comparison).
+#
+# Seed offsets/patterns are frozen to 5p's run_matrix.py so the expected
+# both-refuse inventory does not drift: every cs=512 x divergent x safe combo
+# refuses wire 10 (v1 never appends refblocks — orphan-append scaffolding
+# identity is the both-refuse bar). That is exactly 3 chains x 2 sizes = 6
+# rows.
+#
+# Plus three appended combos:
+#   * UNALIGNED (1M+512, cs=65536): backings sized to the overlay, divergence
+#     placed in the EOV-tail cluster so the crate's zero-fill of beyond-EOV
+#     bytes is compared against a source that is itself zero there -> fully
+#     byte-identical (no D9).
+#   * OVERSIZED (P6's shape): old backing 2M carrying 0x55 past the overlay's
+#     1M+512 EOV, divergent -> the pre-declared D9 fallback (raw sha diverges
+#     beyond EOV, virtual content identical).
+#   * JSON-COUNTER: a cs=65536/64M/2chain/divergent/safe combo run with
+#     --output json so before-vs-after stdout identity pins clusters_copied /
+#     bytes_copied (they print in --output json only).
+
+REBASE_DIV = {1024 * 1024: ('256k', '256k'), 64 * 1024 * 1024: ('2M', '2M')}
+UNALIGNED_SIZE = 1024 * 1024 + 512
+OVERSIZED_BACKING = 2 * 1024 * 1024
+
+
+def rebase_files(combo):
+    """The overlay plus every backing file in the fixture. Backings are never
+    mutated by rebase; comparing them too is the honest superset (both-succeed
+    demands overlay AND backing sha identity)."""
+    chain = combo['chain']
+    if chain == '3chainb':
+        return ['overlay.qcow2', 'base.qcow2', 'mid0.qcow2']
+    if chain == 'detach':
+        return ['overlay.qcow2', 'base_old.qcow2']
+    # 2chain, unaligned, oversized
+    return ['overlay.qcow2', 'base_old.qcow2', 'base_new.qcow2']
+
+
+def _q_create(qemu_img, setdir, name, size, cs, backing=None):
+    opts = f'cluster_size={cs}'
+    cmd = [qemu_img, 'create', '-f', 'qcow2', '-o', opts]
+    if backing:
+        cmd = [qemu_img, 'create', '-f', 'qcow2', '-o',
+               f'backing_file={backing},backing_fmt=qcow2,cluster_size={cs}']
+    cmd += [name, str(size)]
+    check_run(cmd, setdir)
+
+
+def _q_write(qemu_io, setdir, name, *cmds):
+    args = [qemu_io, '-f', 'qcow2']
+    for c in cmds:
+        args += ['-c', c]
+    args.append(name)
+    check_run(args, setdir)
+
+
+def build_rebase_fixture(combo, setdir, qemu_img, qemu_io):
+    """Relative paths only, so twin sets in different dirs are byte-identical.
+
+    Frozen to 5p's run_matrix.py / run_matrix_3chainb.py seed offsets."""
+    os.makedirs(setdir)
+    cs = combo['cs']
+    special = combo.get('special')
+    ovl_w = 'write -P 0x33 0 64k'
+
+    if special == 'unaligned':
+        # 2-chain, overlay 1M+512, backings sized to the overlay: the tail
+        # cluster's beyond-EOV source bytes are zeros -> byte-identical copy.
+        for name in ('base_old.qcow2', 'base_new.qcow2'):
+            _q_create(qemu_img, setdir, name, UNALIGNED_SIZE, cs)
+        _q_write(qemu_io, setdir, 'base_old.qcow2', 'write -P 0x55 1M 512')
+        _q_create(qemu_img, setdir, 'overlay.qcow2', UNALIGNED_SIZE, cs, backing='base_old.qcow2')
+        _q_write(qemu_io, setdir, 'overlay.qcow2', ovl_w)
+        return
+    if special == 'oversized':
+        # P6's D9 shape: old backing 2M carrying 0x55 over [1M, 2M) (non-zero
+        # past the overlay's 1M+512 EOV); new backing 2M empty.
+        for name in ('base_old.qcow2', 'base_new.qcow2'):
+            _q_create(qemu_img, setdir, name, OVERSIZED_BACKING, cs)
+        _q_write(qemu_io, setdir, 'base_old.qcow2', 'write -P 0x55 1M 1M')
+        _q_create(qemu_img, setdir, 'overlay.qcow2', UNALIGNED_SIZE, cs, backing='base_old.qcow2')
+        _q_write(qemu_io, setdir, 'overlay.qcow2', ovl_w)
+        return
+
+    size = combo['size']
+    seed = combo['seed']
+    div_off, div_len = REBASE_DIV[size]
+    chain = combo['chain']
+
+    if chain == '2chain':
+        _q_create(qemu_img, setdir, 'base_old.qcow2', size, cs)
+        _q_create(qemu_img, setdir, 'base_new.qcow2', size, cs)
+        if seed == 'divergent':
+            _q_write(qemu_io, setdir, 'base_old.qcow2', f'write -P 0xaa {div_off} {div_len}')
+            _q_write(qemu_io, setdir, 'base_new.qcow2', f'write -P 0xbb {div_off} {div_len}')
+        elif seed == 'identical':
+            _q_write(qemu_io, setdir, 'base_old.qcow2', f'write -P 0xaa {div_off} {div_len}')
+            _q_write(qemu_io, setdir, 'base_new.qcow2', f'write -P 0xaa {div_off} {div_len}')
+        _q_create(qemu_img, setdir, 'overlay.qcow2', size, cs, backing='base_old.qcow2')
+        _q_write(qemu_io, setdir, 'overlay.qcow2', ovl_w)
+        return
+    if chain == '3chainb':
+        _q_create(qemu_img, setdir, 'base.qcow2', size, cs)
+        _q_create(qemu_img, setdir, 'mid0.qcow2', size, cs, backing='base.qcow2')
+        if seed == 'divergent':
+            _q_write(qemu_io, setdir, 'base.qcow2', f'write -P 0xaa {div_off} {div_len}')
+            _q_write(qemu_io, setdir, 'mid0.qcow2', f'write -P 0xbb {div_off} {div_len}')
+        elif seed == 'identical':
+            _q_write(qemu_io, setdir, 'base.qcow2', f'write -P 0xaa {div_off} {div_len}')
+            # mid0 left unallocated over R: old view == new view == base's data
+        _q_create(qemu_img, setdir, 'overlay.qcow2', size, cs, backing='mid0.qcow2')
+        _q_write(qemu_io, setdir, 'overlay.qcow2', ovl_w)
+        return
+    if chain == 'detach':
+        _q_create(qemu_img, setdir, 'base_old.qcow2', size, cs)
+        if seed == 'divergent':
+            _q_write(qemu_io, setdir, 'base_old.qcow2', f'write -P 0xaa {div_off} {div_len}')
+        _q_create(qemu_img, setdir, 'overlay.qcow2', size, cs, backing='base_old.qcow2')
+        _q_write(qemu_io, setdir, 'overlay.qcow2', ovl_w)
+        return
+    raise RuntimeError(f'unknown chain shape {chain!r}')
+
+
+def rebase_new_backing(combo):
+    """The -b argument for this combo's chain shape."""
+    chain = combo['chain']
+    if chain == '3chainb':
+        return 'base.qcow2'
+    if chain == 'detach':
+        return ''
+    return 'base_new.qcow2'
+
+
+def run_rebase(binary, setdir, combo):
+    cmd = [binary, 'rebase']
+    if combo.get('output') == 'json':
+        cmd += ['--output', 'json']
+    new_backing = rebase_new_backing(combo)
+    cmd += ['-b', new_backing]
+    if new_backing:
+        cmd += ['-F', 'qcow2']
+    if combo['mode'] == 'u':
+        cmd += ['-u']
+    cmd += ['overlay.qcow2']
+    r = run(cmd, setdir)
+    return Invocation(r, setdir, rebase_files(combo))
+
+
+def rebase_matrix():
+    """The deterministic 5b matrix (see the section header for the pruning
+    rationale). Expected buckets follow 5p's refusal inventory exactly."""
+    combos = []
+    for cs in CLUSTER_SIZES:
+        for size in SIZES:
+            m = size // (1024 * 1024)
+            for chain in ('2chain', '3chainb', 'detach'):
+                for seed in SEEDS_REBASE:
+                    if chain == 'detach' and seed == 'identical':
+                        continue  # incoherent: no new backing to be identical to
+                    expected = 'both-refuse' if (cs == 512 and seed == 'divergent') else 'both-succeed'
+                    combos.append({'tag': f'cs{cs}-sz{m}M-{chain}-{seed}-safe',
+                                   'cs': cs, 'size': size, 'chain': chain, 'seed': seed,
+                                   'mode': 'safe', 'expected': expected, 'd9': False})
+                # -u once per (cs, size, chain); seed ignored, built divergent.
+                combos.append({'tag': f'cs{cs}-sz{m}M-{chain}-u',
+                               'cs': cs, 'size': size, 'chain': chain, 'seed': 'divergent',
+                               'mode': 'u', 'expected': 'both-succeed', 'd9': False})
+    # Appended combos.
+    combos.append({'tag': 'cs65536-sz1M+512-2chain-divergent-safe-UNALIGNED',
+                   'cs': 65536, 'size': UNALIGNED_SIZE, 'chain': '2chain', 'seed': 'divergent',
+                   'mode': 'safe', 'special': 'unaligned', 'expected': 'both-succeed', 'd9': False})
+    combos.append({'tag': 'cs65536-sz1M+512-2chain-divergent-safe-OVERSIZED-D9',
+                   'cs': 65536, 'size': UNALIGNED_SIZE, 'chain': '2chain', 'seed': 'divergent',
+                   'mode': 'safe', 'special': 'oversized', 'expected': 'both-succeed', 'd9': True})
+    combos.append({'tag': 'cs65536-sz64M-2chain-divergent-safe-JSON',
+                   'cs': 65536, 'size': 64 * 1024 * 1024, 'chain': '2chain', 'seed': 'divergent',
+                   'mode': 'safe', 'output': 'json', 'expected': 'both-succeed', 'd9': False})
+    return combos
+
+
+# ---------------------------------------------------------------------------
+# rebase extra checks (off-matrix): P8 widening, eviction, holed-RT refusal
+# ---------------------------------------------------------------------------
+
+def prove_rebase_extras(workdir, args):
+    """Returns a list of failure strings (empty on success)."""
+    failures = []
+    failures += _rebase_widening_exemplar(workdir, args)
+    failures += _rebase_eviction(workdir, args)
+    failures += _rebase_holed_rt(workdir, args)
+    return failures
+
+
+def _rebase_widening_exemplar(workdir, args):
+    """P8: cs=512 / 64M / 512 populated L2 tables / IDENTICAL chains. Before
+    refuses wire 9 pre-mutation (sha unchanged); after succeeds
+    deterministically, check-clean, info-equivalent to a qemu-img rebase
+    twin."""
+    failures = []
+    ex_dir = os.path.join(workdir, 'rebase-widening-exemplar')
+    if os.path.exists(ex_dir):
+        shutil.rmtree(ex_dir)
+    sets = {n: os.path.join(ex_dir, n) for n in ('before-run', 'after-run-1', 'after-run-2', 'qemu-run')}
+    files = ['overlay.qcow2', 'base_old.qcow2', 'base_new.qcow2']
+
+    def build(setdir):
+        os.makedirs(setdir)
+        for name in ('base_old.qcow2', 'base_new.qcow2'):
+            check_run([args.qemu_img, 'create', '-f', 'qcow2', '-o', 'cluster_size=512', name, '64M'], setdir)
+        writes = []
+        for i in range(512):
+            writes += ['-c', f'write -P 0x33 {i * 32768} 512']
+        check_run([args.qemu_img, 'create', '-f', 'qcow2',
+                   '-o', 'backing_file=base_old.qcow2,backing_fmt=qcow2,cluster_size=512',
+                   'overlay.qcow2', '64M'], setdir)
+        check_run([args.qemu_io, '-f', 'qcow2'] + writes + ['overlay.qcow2'], setdir)
+
+    for setdir in sets.values():
+        build(setdir)
+    pre = {n: {f: sha256(os.path.join(sd, f)) for f in files} for n, sd in sets.items()}
+    if len({tuple(sorted(v.items())) for v in pre.values()}) != 1:
+        return [f'rebase widening exemplar twin sets differ pre-run: {pre}']
+
+    def run_instar(binary, setdir):
+        r = run([binary, 'rebase', '-b', 'base_new.qcow2', '-F', 'qcow2', 'overlay.qcow2'], setdir)
+        inv = Invocation.__new__(Invocation)
+        inv.rc, inv.stdout, inv.stderr = r.returncode, r.stdout, r.stderr
+        inv.shas = {f: sha256(os.path.join(setdir, f)) for f in files}
+        return inv
+
+    before = run_instar(args.before, sets['before-run'])
+    if before.rc == 0:
+        failures.append('rebase widening exemplar: before-binary unexpectedly succeeded (expected wire-9)')
+    elif 'error 9' not in before.stderr:
+        failures.append(f'rebase widening exemplar: before refused but not wire-9: stderr={before.stderr!r}')
+    if before.shas != pre['before-run']:
+        failures.append('rebase widening exemplar: before-binary wire-9 refusal was not pre-mutation')
+
+    after1 = run_instar(args.after, sets['after-run-1'])
+    after2 = run_instar(args.after, sets['after-run-2'])
+    if after1.rc != 0:
+        failures.append(f'rebase widening exemplar: after-binary refused: rc={after1.rc} stderr={after1.stderr!r}')
+        return failures
+    det = diff_invocations('run1', after1, 'run2', after2)
+    if det:
+        failures.append('rebase widening exemplar: after-binary nondeterministic: ' + '; '.join(det))
+
+    r = run([args.qemu_img, 'check', 'overlay.qcow2'], sets['after-run-1'])
+    if r.returncode != 0:
+        failures.append(f'rebase widening exemplar: qemu-img check not clean: '
+                        f'rc={r.returncode} stdout={r.stdout!r} stderr={r.stderr!r}')
+    r = run([args.qemu_img, 'rebase', '-b', 'base_new.qcow2', '-F', 'qcow2', 'overlay.qcow2'], sets['qemu-run'])
+    if r.returncode != 0:
+        failures.append(f'rebase widening exemplar: qemu-img rebase twin failed: {r.stderr!r}')
+    else:
+        a = check_run([args.qemu_img, 'info', '--output=json', 'overlay.qcow2'], sets['after-run-1'])
+        b = check_run([args.qemu_img, 'info', '--output=json', 'overlay.qcow2'], sets['qemu-run'])
+        na, nb = normalise_info(a.stdout), normalise_info(b.stdout)
+        if na != nb:
+            failures.append(f'rebase widening exemplar: normalized info mismatch: '
+                            f'instar={json.dumps(na, sort_keys=True)} qemu={json.dumps(nb, sort_keys=True)}')
+
+    if not failures and not args.keep_all:
+        shutil.rmtree(ex_dir)
+    return failures
+
+
+def _rebase_eviction(workdir, args):
+    """The eviction shape (cs=64K, 34 divergent L2-coverage spans, sparse
+    17408M): after touches more tables than window slots. Before stages
+    everything and also succeeds -> a genuine byte-identity row (raw sha of
+    the mutated overlay identical before-vs-after; R-D5 says final bytes match
+    despite the mid-loop eviction I/O order). Plus virtual-content parity vs a
+    qemu-img rebase twin (via streaming qemu-img compare, no 17 GB raw
+    materialisation)."""
+    failures = []
+    ev_dir = os.path.join(workdir, 'rebase-eviction')
+    if os.path.exists(ev_dir):
+        shutil.rmtree(ev_dir)
+    sets = {n: os.path.join(ev_dir, n) for n in ('before-run', 'after-run-1', 'after-run-2', 'qemu-run')}
+    files = ['overlay.qcow2', 'base_old.qcow2', 'base_new.qcow2']
+    size = '17408M'  # 34 x 512M L2-coverage spans at cs=64K
+
+    def build(setdir):
+        os.makedirs(setdir)
+        check_run([args.qemu_img, 'create', '-f', 'qcow2', '-o', 'cluster_size=65536',
+                   'base_old.qcow2', size], setdir)
+        writes = []
+        for k in range(34):
+            writes += ['-c', f'write -P 0x11 {k * 512}M 64k']
+        check_run([args.qemu_io, '-f', 'qcow2'] + writes + ['base_old.qcow2'], setdir)
+        check_run([args.qemu_img, 'create', '-f', 'qcow2', '-o', 'cluster_size=65536',
+                   'base_new.qcow2', size], setdir)
+        check_run([args.qemu_img, 'create', '-f', 'qcow2',
+                   '-o', 'backing_file=base_old.qcow2,backing_fmt=qcow2,cluster_size=65536',
+                   'overlay.qcow2', size], setdir)
+
+    for setdir in sets.values():
+        build(setdir)
+    pre = {n: {f: sha256(os.path.join(sd, f)) for f in files} for n, sd in sets.items()}
+    if len({tuple(sorted(v.items())) for v in pre.values()}) != 1:
+        return [f'rebase eviction twin sets differ pre-run: {pre}']
+
+    def run_instar(binary, setdir):
+        r = run([binary, 'rebase', '-b', 'base_new.qcow2', '-F', 'qcow2', 'overlay.qcow2'], setdir, timeout=600)
+        inv = Invocation.__new__(Invocation)
+        inv.rc, inv.stdout, inv.stderr = r.returncode, r.stdout, r.stderr
+        inv.shas = {f: sha256(os.path.join(setdir, f)) for f in files}
+        return inv
+
+    before = run_instar(args.before, sets['before-run'])
+    after1 = run_instar(args.after, sets['after-run-1'])
+    after2 = run_instar(args.after, sets['after-run-2'])
+    if before.rc != 0:
+        failures.append(f'rebase eviction: before-binary refused (expected success): stderr={before.stderr!r}')
+    if after1.rc != 0:
+        failures.append(f'rebase eviction: after-binary refused: rc={after1.rc} stderr={after1.stderr!r}')
+        return failures
+    det = diff_invocations('run1', after1, 'run2', after2)
+    if det:
+        failures.append('rebase eviction: after-binary nondeterministic: ' + '; '.join(det))
+    if before.rc == 0:
+        bd = diff_invocations('before', before, 'after', after1)
+        if bd:
+            failures.append('rebase eviction: before-vs-after byte identity failed (R-D5 says final bytes '
+                            'match across eviction): ' + '; '.join(bd))
+
+    r = run([args.qemu_img, 'check', 'overlay.qcow2'], sets['after-run-1'], timeout=600)
+    if r.returncode != 0:
+        failures.append(f'rebase eviction: qemu-img check not clean: rc={r.returncode} stdout={r.stdout!r}')
+    # Deferred header/backing-path patch landed.
+    info = check_run([args.qemu_img, 'info', '--output=json', 'overlay.qcow2'], sets['after-run-1'])
+    if json.loads(info.stdout).get('backing-filename') != 'base_new.qcow2':
+        failures.append('rebase eviction: deferred header/backing-path patch did not land')
+    # Virtual-content parity vs qemu twin (streaming compare, no raw blowup).
+    r = run([args.qemu_img, 'rebase', '-b', 'base_new.qcow2', '-F', 'qcow2', 'overlay.qcow2'],
+            sets['qemu-run'], timeout=600)
+    if r.returncode != 0:
+        failures.append(f'rebase eviction: qemu-img rebase twin failed: {r.stderr!r}')
+    else:
+        cmp = run([args.qemu_img, 'compare', os.path.join(sets['after-run-1'], 'overlay.qcow2'),
+                   os.path.join(sets['qemu-run'], 'overlay.qcow2')], sets['after-run-1'], timeout=600)
+        if cmp.returncode != 0:
+            failures.append(f'rebase eviction: virtual content diverges from qemu twin: '
+                            f'rc={cmp.returncode} stdout={cmp.stdout!r} stderr={cmp.stderr!r}')
+
+    if not failures and not args.keep_all:
+        shutil.rmtree(ev_dir)
+    return failures
+
+
+def _rebase_holed_rt(workdir, args):
+    """Holed-refcount-table overlay (R-D4 recipe, adapted from 5p): the after
+    binary refuses wire 16 pre-mutation. The before binary mis-allocates
+    (live defect) — not run here; this is an after-only spot check that the
+    contiguity gate fires before any mutation."""
+    failures = []
+    hr_dir = os.path.join(workdir, 'rebase-holed-rt')
+    if os.path.exists(hr_dir):
+        shutil.rmtree(hr_dir)
+    setdir = os.path.join(hr_dir, 'after-run')
+    os.makedirs(setdir)
+    check_run([args.qemu_img, 'create', '-f', 'qcow2', '-o', 'cluster_size=4096', 'overlay.qcow2', '96M'], setdir)
+    touch = []
+    for i in range(22):
+        touch += ['-c', f'write -P 0x01 {i * 2}M 4k']
+    check_run([args.qemu_io, '-f', 'qcow2'] + touch + ['overlay.qcow2'], setdir)
+    check_run([args.qemu_io, '-f', 'qcow2', '-c', 'write -P 0x22 0 44M', 'overlay.qcow2'], setdir)
+    check_run([args.qemu_io, '-f', 'qcow2', '-c', 'discard 8M 32M', 'overlay.qcow2'], setdir)
+    check_run([args.qemu_img, 'resize', '--shrink', 'overlay.qcow2', '82M'], setdir)
+    for name, pattern in (('base_old.qcow2', 'write -P 0xaa 50M 10M'),
+                          ('base_new.qcow2', 'write -P 0xbb 50M 10M')):
+        check_run([args.qemu_img, 'create', '-f', 'qcow2', '-o', 'cluster_size=4096', name, '96M'], setdir)
+        check_run([args.qemu_io, '-f', 'qcow2', '-c', pattern, name], setdir)
+    check_run([args.qemu_img, 'rebase', '-u', '-b', 'base_old.qcow2', '-F', 'qcow2', 'overlay.qcow2'], setdir)
+    # Precondition: the RT is really holed and the image is check-clean.
+    chk = run([args.qemu_img, 'check', 'overlay.qcow2'], setdir)
+    if chk.returncode != 0:
+        failures.append(f'rebase holed-RT: fixture overlay is not check-clean: {chk.stdout!r}')
+
+    files = ['overlay.qcow2', 'base_old.qcow2', 'base_new.qcow2']
+    pre = {f: sha256(os.path.join(setdir, f)) for f in files}
+    r = run([args.after, 'rebase', '-b', 'base_new.qcow2', '-F', 'qcow2', 'overlay.qcow2'], setdir)
+    if r.returncode == 0:
+        failures.append(f'rebase holed-RT: after-binary must refuse (wire 16): stdout={r.stdout!r}')
+    elif 'error 16' not in r.stderr:
+        failures.append(f'rebase holed-RT: after refused but not wire-16: stderr={r.stderr!r}')
+    for f in files:
+        if sha256(os.path.join(setdir, f)) != pre[f]:
+            failures.append(f'rebase holed-RT: wire-16 refusal was not pre-mutation: {f} changed')
+
+    if not failures and not args.keep_all:
+        shutil.rmtree(hr_dir)
+    return failures
+
+
+# ---------------------------------------------------------------------------
 # op registry (phases 5-6 add entries here)
 # ---------------------------------------------------------------------------
 
 OPS = {
     'commit': {
         'matrix': commit_matrix,
+        'build': build_commit_fixture,
+        'run': run_commit,
+        'files': lambda combo: COMMIT_MUTATED_FILES,
         'extra_checks': prove_widening_exemplar,
     },
-    'rebase': None,   # phase 5
+    'rebase': {
+        'matrix': rebase_matrix,
+        'build': build_rebase_fixture,
+        'run': run_rebase,
+        'files': rebase_files,
+        'extra_checks': prove_rebase_extras,
+    },
     'bench': None,    # phase 6
 }
 
@@ -473,8 +912,7 @@ def main():
         for fail in extra_failures:
             print(f'FAIL\t{fail}', flush=True)
         if not extra_failures:
-            print('PASS\twidening exemplar: before wire-10 pre-mutation refusal, after deterministic '
-                  'success, check clean, info-equivalent to qemu-img commit twin', flush=True)
+            print(f'PASS\tall off-matrix extra checks for --op {args.op} passed', flush=True)
 
     buckets = {}
     for row in rows:
@@ -489,7 +927,10 @@ def main():
         print(f'  bucket {bucket}: {buckets[bucket]}')
     print(f'determinism failures: {sum(1 for r in rows if r["verdict"] == "DETERMINISM-FAIL")}')
     print(f'byte-identity failures: {sum(1 for r in rows if r["verdict"] == "BYTE-MISMATCH")}')
-    print(f'D9 virtual-content fallbacks triggered: {len(d9_fallbacks)} (expected 0 after 4q)')
+    d9_declared = sum(1 for r in rows if r['combo'].get('d9'))
+    print(f'D9 virtual-content fallbacks triggered: {len(d9_fallbacks)} '
+          f'(pre-declared D9 combos: {d9_declared}; commit expects 0 triggered after 4q, '
+          f'rebase expects 1 on the oversized-backing shape)')
     for row in d9_fallbacks:
         print(f'  LOUD D9 divergence: {row["combo"]["tag"]}: {row["detail"]}')
     print(f'matrix failures: {len(failures)}')
