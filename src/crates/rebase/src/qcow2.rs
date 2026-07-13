@@ -8,25 +8,24 @@
 //!   write (in place or to a relocated cluster), and the
 //!   header field rewrite last.
 //! - [`plan_rebase_qcow2`] in [`crate::RebaseMode::Safe`] mode
-//!   emits a [`RebaseQcow2SafeContext`] the guest threads
-//!   through per-cluster comparison plus a deferred-apply
-//!   [`RebasePlan`] of metadata patches the guest applies
-//!   after the comparison loop completes.
+//!   emits a [`RebaseQcow2SafeContext`] (overlay geometry the
+//!   guest threads through the per-cluster comparison loop)
+//!   plus a deferred-apply [`RebasePlan`] of metadata patches
+//!   the guest applies after the comparison loop completes.
 //!
-//! Both modes share the [`allocate_overlay_cluster_qcow2`]
-//! helper for claiming a fresh cluster from the staged
-//! refcount blocks. Unsafe-mode rebase uses it when the new
-//! backing path is longer than the existing slot and the
-//! path string must be relocated to a fresh cluster;
-//! safe-mode rebase uses it once per guest cluster that
-//! turns out to need a copy at runtime.
+//! Phase 5 of `PLAN-qcow2-write-infrastructure` moved the
+//! safe-mode write composition (cluster allocation, refblock
+//! staging, dirty tracking) into `crates/qcow2-write` +
+//! `crates/qcow2-write-exec`; the old
+//! `allocate_overlay_cluster_qcow2` helper, its
+//! `AllocationState`, and the context's staged refblock copy
+//! and dirty bitmap are gone. What remains here is the shared
+//! validation, the deferred header/backing-path metadata plan,
+//! and the overlay geometry.
 //!
 //! Refcount-width coverage in v1: only `refcount_bits == 16`
 //! (qemu-img's default). Other widths return
-//! [`RebaseError::UnsupportedFormat`]. Adding the remaining
-//! widths is a mechanical follow-up; the bit-packing
-//! reference is `qcow2::lookup_refcount` in
-//! `src/crates/qcow2/src/lib.rs`.
+//! [`RebaseError::UnsupportedFormat`].
 
 use qcow2::{
     QcowHeader, BACKING_FILE_OFFSET_OFFSET, BACKING_FILE_SIZE_OFFSET, INCOMPAT_CORRUPT,
@@ -59,24 +58,23 @@ pub struct Qcow2RebaseOpts<'a> {
     /// the Append patch offset.
     pub overlay_file_size: u64,
     /// Raw refcount-table bytes (an array of u64 BE entries
-    /// pointing at refcount blocks). Used only by the
-    /// safe-mode allocator; unsafe mode without relocation
-    /// can pass an empty slice.
+    /// pointing at refcount blocks). Retained for API
+    /// stability; unconsumed since phase 5 of
+    /// `PLAN-qcow2-write-infrastructure` moved safe-mode
+    /// allocation into `crates/qcow2-write`. Pass an empty
+    /// slice.
     pub refcount_table: &'a [u8],
-    /// Host byte offsets of each refcount block. Length must
-    /// equal `refcount_block_count`. The allocator mutates
-    /// refcount-block bytes in scratch; the guest uses these
-    /// offsets to flush dirty blocks back to the file.
-    /// Safe-mode and unsafe-with-relocation only.
+    /// Host byte offsets of each refcount block. Retained for
+    /// API stability; unconsumed since phase 5. Pass an empty
+    /// slice.
     pub refblock_host_offsets: &'a [u64],
-    /// Concatenated refcount-block bytes (`refblock_count *
-    /// cluster_size` bytes). The planner copies these into
-    /// scratch for the allocator to mutate. Safe-mode and
-    /// unsafe-with-relocation only.
+    /// Concatenated refcount-block bytes. Retained for API
+    /// stability; unconsumed since phase 5. Pass an empty
+    /// slice.
     pub refcount_blocks: &'a [u8],
     /// Number of refcount blocks present in
-    /// `refcount_blocks`. Safe-mode and unsafe-with-
-    /// relocation only.
+    /// `refcount_blocks`. Retained for API stability;
+    /// unconsumed since phase 5. Pass zero.
     pub refblock_count: u32,
     /// New backing file's virtual size in bytes. Used for
     /// compatibility checking.
@@ -92,14 +90,13 @@ pub struct Qcow2RebaseOpts<'a> {
 /// Output of [`plan_rebase_qcow2`].
 ///
 /// `Unsafe` carries a complete patch list ready to apply.
-/// `Safe` carries a context the guest drives at runtime plus
-/// a deferred-apply metadata plan to commit after the
-/// comparison loop completes.
+/// `Safe` carries the overlay geometry the guest drives at
+/// runtime plus a deferred-apply metadata plan to commit after
+/// the comparison loop completes.
 ///
-/// Not `Copy`: `Safe` carries `&mut` borrows into scratch.
-/// The size asymmetry is unrelated to the `Copy` deletion —
-/// it is suppressed with `allow(large_enum_variant)` to keep
-/// `Unsafe`'s inline plan storage.
+/// The size asymmetry between the two variants is suppressed
+/// with `allow(large_enum_variant)` to keep the inline plan
+/// storage.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Qcow2RebaseOutput<'a> {
@@ -107,23 +104,21 @@ pub enum Qcow2RebaseOutput<'a> {
     Unsafe { plan: RebasePlan<'a> },
     /// Safe-mode output.
     Safe {
-        context: RebaseQcow2SafeContext<'a>,
+        context: RebaseQcow2SafeContext,
         deferred_metadata: RebasePlan<'a>,
     },
 }
 
-/// Context carried by the guest across safe-mode rebase's
-/// per-cluster comparison loop.
+/// Overlay geometry carried by the guest across safe-mode
+/// rebase's per-cluster comparison loop.
 ///
-/// All numeric fields are populated by the planner. The two
-/// slice fields are views into the caller's scratch buffer
-/// that the allocator mutates as it claims clusters. The
-/// guest is responsible for flushing the dirty refcount-block
-/// bytes back to the overlay once the comparison loop
-/// completes (it knows where each block lives via the
-/// `refblock_host_offsets` it passed in via opts).
-#[derive(Debug)]
-pub struct RebaseQcow2SafeContext<'a> {
+/// Phase 5 of `PLAN-qcow2-write-infrastructure` reduced this
+/// to plain geometry: the staged refcount-block copy and the
+/// dirty bitmap the old in-crate allocator mutated moved into
+/// `qcow2_write::WriteState` and the guest's own staging
+/// carve.
+#[derive(Debug, Clone, Copy)]
+pub struct RebaseQcow2SafeContext {
     /// Overlay cluster size in bytes (echoed from the parsed
     /// header).
     pub overlay_cluster_size: u32,
@@ -134,37 +129,6 @@ pub struct RebaseQcow2SafeContext<'a> {
     pub overlay_l1_table_offset: u64,
     /// Overlay L1 size in entries.
     pub overlay_l1_size: u32,
-    /// Refcount entry width in bits. v1 supports only 16.
-    pub refcount_bits: u32,
-    /// Refcount entries per refcount block (`cluster_size * 8
-    /// / refcount_bits`).
-    pub entries_per_refblock: u64,
-    /// Number of refcount blocks present in `refblocks`.
-    pub refblock_count: u32,
-    /// Staged refcount-block bytes, mutated in place by the
-    /// allocator.
-    pub refblocks: &'a mut [u8],
-    /// Per-refblock dirty bitmap; bit `i` is set if the
-    /// allocator has modified refblock `i`. Length is
-    /// `(refblock_count + 7) / 8`.
-    pub dirty: &'a mut [u8],
-}
-
-/// Allocator state threaded through repeated calls to
-/// [`allocate_overlay_cluster_qcow2`].
-///
-/// The guest constructs this at the start of the comparison
-/// loop (or before calling unsafe-mode relocation) and
-/// mutates it through subsequent calls.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct AllocationState {
-    /// Refblock index where the next scan resumes.
-    pub next_refblock: u32,
-    /// Entry index within the current refblock where the next
-    /// scan resumes.
-    pub next_entry_in_refblock: u64,
-    /// Total clusters allocated so far.
-    pub allocated: u64,
 }
 
 /// Plan a qcow2 rebase.
@@ -245,53 +209,28 @@ fn plan_qcow2_safe<'a>(
     if cluster_size == 0 {
         return Err(RebaseError::OverlayCorrupt);
     }
-    let entries_per_refblock = (cluster_size * 8) / parsed.refcount_bits as u64;
 
-    let refblock_count = opts.refblock_count as usize;
-    let refblocks_size_bytes = refblock_count
-        .checked_mul(cluster_size as usize)
-        .ok_or(RebaseError::Overflow)?;
-    if opts.refcount_blocks.len() < refblocks_size_bytes {
-        return Err(RebaseError::HeaderMismatch);
-    }
-    if opts.refblock_host_offsets.len() != refblock_count {
-        return Err(RebaseError::HeaderMismatch);
-    }
-    let dirty_bytes = refblock_count.div_ceil(8);
-
-    // Lay out scratch: header rewrite buffer, path buffer,
-    // dirty bitmap, staged refcount-block bytes. Each region
-    // ends up as its own (immutable or mutable) view.
+    // Lay out scratch: header rewrite buffer, path buffer.
+    // (The staged refcount-block copy and dirty bitmap the
+    // old in-crate allocator carved here moved into the
+    // guest's qcow2-write staging in phase 5.)
     let header_rewrite_len = 12usize; // backing_file_offset u64 + backing_file_size u32
     let path_buf_len = MAX_BACKING_PATH_LEN;
     let need = header_rewrite_len
         .checked_add(path_buf_len)
-        .and_then(|v| v.checked_add(dirty_bytes))
-        .and_then(|v| v.checked_add(refblocks_size_bytes))
         .ok_or(RebaseError::Overflow)?;
     if scratch.len() < need {
         return Err(RebaseError::ScratchTooSmall);
     }
 
     let (header_rewrite_buf, rest) = scratch.split_at_mut(header_rewrite_len);
-    let (path_buf, rest) = rest.split_at_mut(path_buf_len);
-    let (dirty_buf, rest) = rest.split_at_mut(dirty_bytes);
-    let (refblocks_buf, _rest) = rest.split_at_mut(refblocks_size_bytes);
+    let (path_buf, _rest) = rest.split_at_mut(path_buf_len);
 
     // Populate the path buffer (left-padded with zero bytes
     // beyond `path_len`; the patch references only the first
     // `path_len` bytes).
     let path_len = opts.new_backing_path.len();
     path_buf[..path_len].copy_from_slice(opts.new_backing_path);
-
-    // Populate the refcount-block scratch from opts.
-    refblocks_buf.copy_from_slice(&opts.refcount_blocks[..refblocks_size_bytes]);
-
-    // Zero the dirty bitmap; allocator will set bits as it
-    // mutates blocks.
-    for b in dirty_buf.iter_mut() {
-        *b = 0;
-    }
 
     // Build the deferred metadata plan. Order matches the
     // unsafe-mode plan because the guest applies metadata
@@ -333,11 +272,6 @@ fn plan_qcow2_safe<'a>(
         overlay_cluster_count: parsed.virtual_size.div_ceil(cluster_size),
         overlay_l1_table_offset: parsed.l1_table_offset,
         overlay_l1_size: parsed.l1_size,
-        refcount_bits: parsed.refcount_bits,
-        entries_per_refblock,
-        refblock_count: opts.refblock_count,
-        refblocks: refblocks_buf,
-        dirty: dirty_buf,
     };
 
     Ok(Qcow2RebaseOutput::Safe {
@@ -426,96 +360,6 @@ fn compute_path_target(
         return Err(RebaseError::BackingPathTooLong);
     }
     Ok((parsed.backing_file_offset, path_len as u32))
-}
-
-// ---------------------------------------------------------------------------
-// Allocator (16-bit refcount, v1)
-// ---------------------------------------------------------------------------
-
-/// Allocate a single fresh cluster in the overlay.
-///
-/// Pure function: scans the staged refcount-block bytes in
-/// `context.refblocks` starting from `state.next_refblock` /
-/// `state.next_entry_in_refblock`, finds the next entry
-/// whose refcount is zero, bumps it to one, marks the
-/// containing refblock dirty, and returns the host byte
-/// offset of the claimed cluster.
-///
-/// v1 supports `context.refcount_bits == 16` only. Returns
-/// [`RebaseError::UnsupportedFormat`] for other widths and
-/// [`RebaseError::RefcountExhausted`] when every existing
-/// block is full.
-///
-/// The host byte offset is computed as
-/// `(refblock_index * entries_per_refblock + entry_index) *
-/// cluster_size`. The caller (the guest) is responsible for
-/// also threading a per-allocation refblock-index hint
-/// through to its flush-dirty pass once the rebase loop
-/// completes.
-pub fn allocate_overlay_cluster_qcow2(
-    context: &mut RebaseQcow2SafeContext<'_>,
-    state: &mut AllocationState,
-) -> Result<u64, RebaseError> {
-    if context.refcount_bits != 16 {
-        return Err(RebaseError::UnsupportedFormat);
-    }
-    let cluster_size = context.overlay_cluster_size as u64;
-    let entries_per_refblock = context.entries_per_refblock;
-    let bytes_per_refblock = cluster_size as usize;
-
-    while state.next_refblock < context.refblock_count {
-        let refblock_idx = state.next_refblock as usize;
-        let refblock_byte_offset = refblock_idx
-            .checked_mul(bytes_per_refblock)
-            .ok_or(RebaseError::Overflow)?;
-        let refblock = context
-            .refblocks
-            .get_mut(refblock_byte_offset..refblock_byte_offset + bytes_per_refblock)
-            .ok_or(RebaseError::OverlayCorrupt)?;
-
-        while state.next_entry_in_refblock < entries_per_refblock {
-            let entry_idx = state.next_entry_in_refblock as usize;
-            let byte_off = entry_idx * 2; // 16-bit entries
-            if byte_off + 2 > refblock.len() {
-                break;
-            }
-            let raw = u16::from_be_bytes([refblock[byte_off], refblock[byte_off + 1]]);
-            if raw == 0 {
-                // Claim it.
-                let one = 1u16.to_be_bytes();
-                refblock[byte_off] = one[0];
-                refblock[byte_off + 1] = one[1];
-
-                // Mark refblock dirty.
-                let dirty_byte = refblock_idx / 8;
-                let dirty_bit = refblock_idx % 8;
-                if let Some(b) = context.dirty.get_mut(dirty_byte) {
-                    *b |= 1u8 << dirty_bit;
-                }
-
-                let cluster_index = (state.next_refblock as u64)
-                    .checked_mul(entries_per_refblock)
-                    .and_then(|v| v.checked_add(state.next_entry_in_refblock))
-                    .ok_or(RebaseError::Overflow)?;
-                let host_offset = cluster_index
-                    .checked_mul(cluster_size)
-                    .ok_or(RebaseError::Overflow)?;
-
-                // Advance state past the just-claimed entry
-                // so the next call doesn't re-scan it.
-                state.next_entry_in_refblock += 1;
-                state.allocated += 1;
-                return Ok(host_offset);
-            }
-            state.next_entry_in_refblock += 1;
-        }
-
-        // Exhausted this refblock; move to the next.
-        state.next_refblock += 1;
-        state.next_entry_in_refblock = 0;
-    }
-
-    Err(RebaseError::RefcountExhausted)
 }
 
 // ---------------------------------------------------------------------------
@@ -676,8 +520,7 @@ mod tests {
                 deferred_metadata,
             } => {
                 assert_eq!(context.overlay_cluster_size, 65536);
-                assert_eq!(context.refcount_bits, 16);
-                assert_eq!(context.refblock_count, 1);
+                assert_eq!(context.overlay_cluster_count, (1 << 20) / 65536);
                 let patches = deferred_metadata.patches();
                 assert_eq!(patches.len(), 2);
                 // First patch: path bytes at the old offset.
@@ -743,89 +586,6 @@ mod tests {
             }
             _ => panic!("expected Safe variant"),
         }
-    }
-
-    #[test]
-    fn allocator_claims_first_free_cluster() {
-        // One 64 KB refblock = 32768 16-bit entries. Mark
-        // entries 0..3 as already-allocated (rc=1); the
-        // allocator should claim entry 3.
-        let mut refblocks = [0u8; 65536];
-        let one = 1u16.to_be_bytes();
-        refblocks[0..2].copy_from_slice(&one);
-        refblocks[2..4].copy_from_slice(&one);
-        refblocks[4..6].copy_from_slice(&one);
-        let mut dirty = [0u8; 1];
-        let mut context = RebaseQcow2SafeContext {
-            overlay_cluster_size: 65536,
-            overlay_cluster_count: 32768,
-            overlay_l1_table_offset: 0,
-            overlay_l1_size: 0,
-            refcount_bits: 16,
-            entries_per_refblock: 32768,
-            refblock_count: 1,
-            refblocks: &mut refblocks,
-            dirty: &mut dirty,
-        };
-        let mut state = AllocationState::default();
-        let off = allocate_overlay_cluster_qcow2(&mut context, &mut state).expect("ok");
-        // Cluster 3 -> offset 3 * 65536 = 196608.
-        assert_eq!(off, 3 * 65536);
-        assert_eq!(state.allocated, 1);
-        // The just-claimed entry now has rc=1.
-        let raw = u16::from_be_bytes([context.refblocks[6], context.refblocks[7]]);
-        assert_eq!(raw, 1);
-        // Dirty bit 0 is set.
-        assert_eq!(context.dirty[0] & 1, 1);
-    }
-
-    #[test]
-    fn allocator_advances_across_calls() {
-        let mut refblocks = [0u8; 65536];
-        let mut dirty = [0u8; 1];
-        let mut context = RebaseQcow2SafeContext {
-            overlay_cluster_size: 65536,
-            overlay_cluster_count: 32768,
-            overlay_l1_table_offset: 0,
-            overlay_l1_size: 0,
-            refcount_bits: 16,
-            entries_per_refblock: 32768,
-            refblock_count: 1,
-            refblocks: &mut refblocks,
-            dirty: &mut dirty,
-        };
-        let mut state = AllocationState::default();
-        let a = allocate_overlay_cluster_qcow2(&mut context, &mut state).unwrap();
-        let b = allocate_overlay_cluster_qcow2(&mut context, &mut state).unwrap();
-        let c = allocate_overlay_cluster_qcow2(&mut context, &mut state).unwrap();
-        assert_eq!(a, 0);
-        assert_eq!(b, 65536);
-        assert_eq!(c, 2 * 65536);
-        assert_eq!(state.allocated, 3);
-    }
-
-    #[test]
-    fn allocator_returns_exhausted_when_full() {
-        // 4-entry "refblock" — small enough to fill in test.
-        let mut refblocks = [0u8; 8]; // 4 × 16-bit entries
-        for chunk in refblocks.chunks_mut(2) {
-            chunk.copy_from_slice(&1u16.to_be_bytes());
-        }
-        let mut dirty = [0u8; 1];
-        let mut context = RebaseQcow2SafeContext {
-            overlay_cluster_size: 8, // tiny "cluster" for the test
-            overlay_cluster_count: 4,
-            overlay_l1_table_offset: 0,
-            overlay_l1_size: 0,
-            refcount_bits: 16,
-            entries_per_refblock: 4,
-            refblock_count: 1,
-            refblocks: &mut refblocks,
-            dirty: &mut dirty,
-        };
-        let mut state = AllocationState::default();
-        let r = allocate_overlay_cluster_qcow2(&mut context, &mut state);
-        assert_eq!(r.err(), Some(RebaseError::RefcountExhausted));
     }
 
     #[test]
@@ -927,25 +687,5 @@ mod tests {
         };
         let r = plan_rebase_qcow2(&opts, &mut scratch);
         assert_eq!(r.err(), Some(RebaseError::BackingPathTooLong));
-    }
-
-    #[test]
-    fn allocator_rejects_non_16bit_widths() {
-        let mut refblocks = [0u8; 64];
-        let mut dirty = [0u8; 1];
-        let mut context = RebaseQcow2SafeContext {
-            overlay_cluster_size: 64,
-            overlay_cluster_count: 1,
-            overlay_l1_table_offset: 0,
-            overlay_l1_size: 0,
-            refcount_bits: 32,
-            entries_per_refblock: 16,
-            refblock_count: 1,
-            refblocks: &mut refblocks,
-            dirty: &mut dirty,
-        };
-        let mut state = AllocationState::default();
-        let r = allocate_overlay_cluster_qcow2(&mut context, &mut state);
-        assert_eq!(r.err(), Some(RebaseError::UnsupportedFormat));
     }
 }

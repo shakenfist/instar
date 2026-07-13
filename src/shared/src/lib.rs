@@ -3570,6 +3570,28 @@ impl RebaseResult {
     /// `-u` metadata-only rebase never touches snapshot-shared
     /// clusters and stays allowed.
     pub const ERROR_OVERLAY_HAS_SNAPSHOTS: u32 = 14;
+    /// The overlay uses qcow2 features the safe-mode rebase
+    /// write envelope does not support: the extended-L2
+    /// incompatible bit (16-byte L2 entries the walk would
+    /// misread as 8-byte — previously silent corruption), the
+    /// zstd compression-type bit, or any unknown incompatible
+    /// bit (the spec requires refusal). Added by phase 5 of
+    /// `PLAN-qcow2-write-infrastructure`
+    /// (`qcow2_write::check_envelope` on the overlay header,
+    /// pre-mutation). `-u` metadata-only rebase only rewrites
+    /// header/path bytes and stays allowed.
+    pub const ERROR_OVERLAY_UNSUPPORTED: u32 = 15;
+    /// The overlay's metadata is inconsistent in a way the
+    /// safe-mode write path cannot anchor a safe write on: a
+    /// holed (non-contiguous) or malformed refcount table
+    /// (previously a silent misallocation — the rebase sibling
+    /// of GitHub issue #428), or a qcow2-write classification
+    /// refusal (unknown L1/L2 entry bits, refcount
+    /// inconsistencies, snapshot-shared clusters on an image
+    /// claiming none). Refused before any image mutation where
+    /// staging detects it. Added by phase 5 of
+    /// `PLAN-qcow2-write-infrastructure`.
+    pub const ERROR_OVERLAY_INCONSISTENT: u32 = 16;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -4955,8 +4977,11 @@ mod tests {
     #[test]
     fn rebase_result_error_codes_distinct() {
         // Phase 3 added codes 7..=13; the phase-2 snapshot gate
-        // (issue #421) added 14. Confirm every code is distinct
-        // so the host's match arms don't accidentally alias.
+        // (issue #421) added 14; phase 5 of
+        // PLAN-qcow2-write-infrastructure added the overlay
+        // classification codes 15 and 16. Confirm every code is
+        // distinct so the host's match arms don't accidentally
+        // alias.
         let codes = [
             RebaseResult::ERROR_OK,
             RebaseResult::ERROR_UNSUPPORTED_FORMAT,
@@ -4973,13 +4998,15 @@ mod tests {
             RebaseResult::ERROR_PARSE_FAILED,
             RebaseResult::ERROR_INTERNAL_OVERFLOW,
             RebaseResult::ERROR_OVERLAY_HAS_SNAPSHOTS,
+            RebaseResult::ERROR_OVERLAY_UNSUPPORTED,
+            RebaseResult::ERROR_OVERLAY_INCONSISTENT,
         ];
         for i in 0..codes.len() {
             for j in (i + 1)..codes.len() {
                 assert_ne!(codes[i], codes[j], "codes {i} and {j} alias");
             }
         }
-        // Confirm contiguous 0..=14 numbering.
+        // Confirm contiguous 0..=16 numbering.
         for (i, c) in codes.iter().enumerate() {
             assert_eq!(*c, i as u32);
         }

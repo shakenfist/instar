@@ -6885,7 +6885,7 @@ fn render_rebase_success(
 
 /// Map a `RebaseResult::ERROR_*` code to a user-facing
 /// string. Exhaustive on the constants from
-/// `src/shared/src/lib.rs` (0..=14); the trailing catch-all
+/// `src/shared/src/lib.rs` (0..=16); the trailing catch-all
 /// covers future code additions only.
 fn map_rebase_error(code: u32) -> String {
     match code {
@@ -6943,6 +6943,19 @@ fn map_rebase_error(code: u32) -> String {
             "the overlay has internal snapshots; a safe-mode rebase would \
              corrupt them. Use -u for a metadata-only rebase or fall back \
              to `qemu-img rebase`"
+                .into()
+        }
+        c if c == shared::RebaseResult::ERROR_OVERLAY_UNSUPPORTED => {
+            "the overlay uses features instar rebase does not support \
+             (extended L2 entries, or unknown/compression feature bits). \
+             Use -u for a metadata-only rebase or fall back to \
+             `qemu-img rebase`"
+                .into()
+        }
+        c if c == shared::RebaseResult::ERROR_OVERLAY_INCONSISTENT => {
+            "the overlay's metadata is inconsistent (refcounts, table \
+             flags or layout); refusing to write into it. Run `qemu-img \
+             check` on the overlay, or fall back to `qemu-img rebase`"
                 .into()
         }
         _ => format!("unknown rebase error code {code}"),
