@@ -161,21 +161,35 @@ and the overlay becomes standalone.
   rejects with `ERROR_UNSUPPORTED_FORMAT`. qemu-img also
   rejects vmdk rebase entirely (there is no upstream vmdk
   rebase at all). The vmdk smoke tests use unsafe mode.
-- **Safe-mode rebase refuses snapshot-bearing overlays.**
-  If the overlay has internal snapshots, safe mode
-  (including safe-mode detach) refuses with error 14:
-  ``the overlay has internal snapshots; a safe-mode rebase
-  would corrupt them. Use -u for a metadata-only rebase or
-  fall back to `qemu-img rebase` ``. qemu-img proceeds
-  (COWing shared metadata; its contract covers the active
-  view only) where instar's safe-mode allocator would
-  mutate a snapshot-shared L2 in place (issue #421). The
-  refusal fires before any mutation and is byte-idempotent.
-  `-u` only rewrites the header backing-pointer region,
-  which is never snapshot-shared, so it stays allowed and
-  is parity-tested against qemu-img on snapshot-bearing
-  overlays. The real fix is copy-on-write, phase 7 of
-  PLAN-qcow2-write-infrastructure.
+- **Safe-mode rebase copy-on-writes snapshot-bearing
+  overlays.** Since phase 7 of
+  PLAN-qcow2-write-infrastructure (issue #421 resolved),
+  safe mode (including safe-mode detach) no longer refuses
+  an overlay with internal snapshots — it succeeds by
+  copying. Where the safe-mode allocator would previously
+  have mutated a snapshot-shared active L2 in place and
+  under-counted refcounts (`refcount=1 reference=2`,
+  enabling data loss via a later `snapshot -d`, issue
+  #421), it now COWs the shared L2 (copy `T → T'`, repoint
+  the L1, `rc(T')=1`, `rc(T)`−1). The load-bearing
+  subtlety is the **snapshot-view semantic**: matching
+  qemu's contract, safe-mode rebase covers the active view
+  only, so after the rebase a snapshot's unallocated ranges
+  **read through the new backing** rather than staying at
+  their pre-rebase content — instar reproduces this
+  read-through-new-backing semantic exactly. The
+  correctness bar is qemu-parity (`qemu-img check` clean +
+  active-view `qemu-img compare` + a snapshot read-back
+  oracle whose expected value is the snapshot resolved
+  against the new backing), not image-byte identity. `-u`
+  is unchanged (it only rewrites the header
+  backing-pointer region, which is never snapshot-shared)
+  and stays parity-tested against qemu-img. **Known
+  limitation:** COW growth is coarsely sized at
+  `2 × overlay_cluster_count` (rebase writes into unowned
+  clusters); the over-provisioned refblocks are
+  check-clean, and a tighter bound is recorded follow-up
+  work.
 - **Overlays with extended L2 entries or unknown/compression
   feature bits are refused.** Since the phase-5 migration of
   safe mode onto `crates/qcow2-write`, safe-mode rebase

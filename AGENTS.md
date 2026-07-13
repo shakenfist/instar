@@ -170,6 +170,11 @@ vhdx (VHDX), luks (info + convert with decryption)
   and `crates/qcow2-write-exec` executor (third consumer after commit
   and rebase; PLAN-qcow2-write-infrastructure phase 6), and the
   refcount-growth planner now lives in that crate's `growth` module.
+  Since phase 7, `bench -w` (like commit and rebase safe mode)
+  copy-on-writes snapshot-bearing qcow2 images rather than refusing
+  them — the shared crate's COW branch copies snapshot-shared clusters
+  before modifying them, proven check-clean and read-back-parity
+  against qemu.
   `--output {human,json}` mirrors qemu's human output byte-for-byte or
   emits a stable JSON schema for regression tracking.
   `CallTable::VERSION` bumped from 19 to 20 for the appended

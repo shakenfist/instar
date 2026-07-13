@@ -32,6 +32,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Copy-on-write for `commit`, `rebase` safe mode and `bench -w` on
+  snapshot-bearing qcow2 images (PLAN-qcow2-write-infrastructure
+  phase 7).** Writes into a qcow2 image that carries internal
+  snapshots now **copy** the shared clusters instead of refusing (the
+  phase-2 interim gates) or corrupting them — resolving issues #420
+  (commit backing), #421 (rebase safe mode) and #423 (commit overlay).
+  `crates/qcow2-write` gained a copy-on-write branch:
+  `check_envelope_with(hdr, allow_snapshots)` / `new_state_cow` gate
+  the capability, data-cluster COW copies a shared cluster before
+  writing (repoint the L2, `rc(D')=1`, decrement `rc(D)`, never freeing
+  the old cluster), and L2-table COW copies a shared table (repoint the
+  L1, `rc(T')=1`, decrement `rc(T)`) while leaving child refcounts
+  untouched (qemu bumps children to rc ≥ 2 at snapshot-creation time,
+  so a child-increment would corrupt to rc 3). A net-new
+  refcount-decrement primitive maps underflow to
+  `RefcountInconsistent`. The snapshot-view semantic is per op —
+  commit preserves backing snapshots bit-identically, rebase leaves the
+  active view resolving through the new backing (qemu's contract), and
+  bench preserves snapshots like commit. The correctness bar is
+  qemu-parity (`qemu-img check` clean + active-view `qemu-img compare`
+  + a snapshot read-back oracle), not image-byte identity. The zero-flag
+  WRITE-target policy now matches qemu (host == 0 allocates fresh,
+  host != 0 rc 1 overwrites in place clearing the zero bit, rc > 1
+  COWs — the old offset is never freed). Verified check-clean and
+  read-back-parity against pinned qemu-img 6.2.0 / 7.2.0 / 8.2.0 /
+  9.2.0 / 10.2.0 (`tests/test_cow_cross_version.py`) and across 50
+  randomized snapshot-bearing iterations with 0 divergences
+  (`scripts/cow-soak.py`). Two follow-ups are recorded: commit does
+  not byte-empty a snapshot-bearing overlay (the clear pass is skipped
+  to avoid #423; active view and snapshots are correct), and rebase's
+  COW refcount growth is coarsely sized. See
+  [docs/plans/PLAN-qcow2-write-infrastructure.md](docs/plans/PLAN-qcow2-write-infrastructure.md).
+
+- **Refcount growth for `commit` and `rebase` during copy-on-write
+  (PLAN-qcow2-write-infrastructure phase 7).** The imperative
+  refcount-growth execution moved out of the bench op into the shared,
+  region-agnostic `growth::grow_refcounts` in `crates/qcow2-write-exec`,
+  so commit and rebase can grow the refcount structures when a
+  copy-on-write schedule crosses a refblock boundary rather than
+  refusing `RefcountExhausted`. Bench's behaviour is byte-identical
+  (the #433 materialization fix and the single-fsync census are
+  preserved).
+
 - **New `crates/qcow2-write` planner crate
   (PLAN-qcow2-write-infrastructure phase 3).** A pure `no_std`
   windowed step-program planner for "write N bytes at virtual offset
@@ -878,6 +921,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (surfaced and refined by phase 7c source-image tests).
 
 ### Fixed
+
+- **qcow2 chain reader ignored the classic-L2 zero flag (#432).** A v3
+  `QCOW_OFLAG_ZERO` (bit 0) cluster reached through a backing chain read
+  as the wrong bytes — host == 0 fell through to a lower backing and
+  host != 0 read stale host bytes — silent active-view corruption with
+  blast radius rebase / convert / compare / bench. `cluster_lookup` in
+  `crates/qcow2` gained a `ClusterLookup::Zero` verdict and the chain
+  reader now zero-fills for it (both host cases). Fixed fix-first as
+  step 7z of PLAN-qcow2-write-infrastructure phase 7.
 
 - **`instar bench -w` left the refcount table referencing
   unmaterialized blocks past EOF on overwrite-dominant growth

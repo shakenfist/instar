@@ -187,7 +187,18 @@ guest refuses the write test:
 | External data file | The image stores data in an external file. |
 | Encryption | The image is LUKS-encrypted (`crypt_method != 0`). |
 | Dirty / corrupt | The image's dirty or corrupt incompatible bits are set. |
-| Internal snapshots | The image has one or more internal snapshots (`nb_snapshots > 0`) — bench overwrites clusters without a per-write ownership check, so a snapshot-shared cluster must never be touched. |
+
+**Internal snapshots are now supported (copy-on-write).** Before
+phase 7 of PLAN-qcow2-write-infrastructure, `bench -w` refused any
+image with `nb_snapshots > 0` because its overwrite path had no
+per-write ownership check. Since phase 7 (step 7d) the qcow2 `-w`
+path runs the crate's copy-on-write branch: a snapshot-shared data
+cluster is copied before it is written (copy `D → D'`, repoint the
+L2, `rc(D')=1`, `rc(D)`−1) and a snapshot-shared L2 table is COWed,
+so the pre-existing snapshots are **preserved** (like commit) and the
+active view stays `qemu-img compare`-identical to a qemu twin with
+`qemu-img check` clean. The internal-snapshots write-gate no longer
+fires; its gate id is kept for defensive mapping only.
 
 Allocation never grows the refcount structures **during** the run.
 Instead, setup computes the schedule's worst-case allocation bound
@@ -344,7 +355,7 @@ field:
 | 4 | `external data file` | The qcow2 image stores data in an external file. |
 | 5 | `encryption` | The qcow2 image is LUKS-encrypted. |
 | 6 | `dirty or corrupt` | The qcow2 dirty or corrupt incompatible bits are set. |
-| 7 | `internal snapshots` | `nb_snapshots > 0`; also raised mid-run if an allocated cluster without `OFLAG_COPIED` (snapshot-shared) is found. |
+| 7 | `internal snapshots` | Retained for defensive mapping only. Since phase 7's copy-on-write adoption (step 7d) `bench -w` COWs snapshot-shared clusters instead of refusing, so neither the `nb_snapshots > 0` host check nor a mid-run snapshot-shared cluster raises this gate. |
 | anything else | `unsupported feature` | Reserved for future gate ids. |
 
 ## `--output json`
@@ -505,14 +516,23 @@ $ instar bench -c 0 -f raw disk.raw
 Error: "Invalid request count specified. Must be between 1 and 2147483647."
 ```
 
-Refused — a write-gate error on a qcow2 image with an internal
-snapshot (live transcript; note the header still prints before the
-guest-side gate fires):
+A write test against a qcow2 image with an internal snapshot now
+**succeeds** (copy-on-write, since phase 7):
 
 ```
 $ instar bench -w -c 10 -f qcow2 disk.qcow2
 Sending 10 write requests, 4096 bytes each, 64 in parallel (starting at offset 0, step size 4096)
-Error: "bench: write tests are not supported for this image (internal snapshots)"
+Run completed in 0.012 seconds.
+```
+
+Refused — a write-gate error on a qcow2 image that uses the
+extended-L2 (subcluster) feature (live transcript; note the header
+still prints before the guest-side gate fires):
+
+```
+$ instar bench -w -c 10 -f qcow2 disk.qcow2
+Sending 10 write requests, 4096 bytes each, 64 in parallel (starting at offset 0, step size 4096)
+Error: "bench: write tests are not supported for this image (extended L2)"
 ```
 
 ## Future work

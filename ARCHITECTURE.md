@@ -180,8 +180,14 @@ provides a modular architecture with:
   raw deflate via miniz_oxide), refcount table reading (all widths:
   1/2/4/8/16/32/64-bit), compressed L2 entry parsing, backing file
   extraction, header extension parsing, incompatible feature bit
-  validation. Supports cluster sizes from 512B to 2MB (cluster_bits
-  9-21). Used by info, check, compare, convert, and measure
+  validation. The chain reader honours the `QCOW_OFLAG_ZERO` (bit 0)
+  flag on classic (non-extended) L2 entries: `cluster_lookup` returns
+  a `ClusterLookup::Zero` verdict and the chain reader zero-fills for
+  it, for both host == 0 and host != 0 (the phase-7 step-7z fix for
+  issue #432; previously a zero-flagged chain cluster read as
+  fall-through or stale host bytes — silent active-view corruption
+  affecting rebase / convert / compare / bench). Supports cluster
+  sizes from 512B to 2MB (cluster_bits 9-21). Used by info, check, compare, convert, and measure
   operations. Also exposes `Qcow2State::scan_allocation` plus the
   pure helpers `count_allocated_in_l2_standard` /
   `count_allocated_in_l2_extended` to produce a
@@ -291,8 +297,36 @@ provides a modular architecture with:
   byte-identical by design). The crate also owns the pure
   refcount-growth planner in its `growth` module (`plan_refcount_growth`,
   `GrowthCaps`, `RefcountGrowthPlan`, `GrowthOverflow`), moved out of
-  `crates/bench` in phase 6; growth execution stays in the bench op.
-  Phase 7 adds copy-on-write, lifting bench's internal-snapshot gate.
+  `crates/bench` in phase 6; growth execution moved to
+  `crates/qcow2-write-exec` in phase 7 (see below). Phase 7
+  (2026-07-13) added the crate's **copy-on-write branch**, lifting the
+  three ops' interim snapshot-refusal gates (issues #420 / #421 / #423
+  resolved). A COW-capable caller builds its `WriteState` via
+  `new_state_cow` and relaxes the envelope with
+  `check_envelope_with(hdr, allow_snapshots = true)`; the classifier
+  then turns the `SnapshotShared` / `SnapshotSharedL2Table` verdicts
+  from refusals into COW emission. Data-cluster COW copies the shared
+  `D → D'`, repoints the L2, sets `rc(D')=1` and decrements `rc(D)`
+  (the old cluster is never freed — the snapshot holds it); L2-table
+  COW copies `T → T'`, repoints the L1, sets `rc(T')=1`, decrements
+  `rc(T)`, and — critically — leaves the child data-cluster refcounts
+  untouched (qemu eagerly bumps every reachable cluster to rc ≥ 2 at
+  snapshot-creation time, so a child-increment would corrupt to rc 3;
+  the children already classify shared and COW per-write). This needs
+  a net-new refcount-**decrement** primitive (`dec_refcount`; v1 only
+  ever incremented on allocation), whose underflow maps to
+  `WriteError::RefcountInconsistent`. The zero-flag WRITE-target policy
+  (decision 6): host == 0 allocates fresh, host != 0 rc 1 overwrites
+  in place clearing the zero bit, host != 0 rc > 1 COWs — qemu never
+  frees the old offset. No new `StepKind`. The COW output is proven
+  qemu-parity, never byte-identical to qemu (C11).
+- **crates/qcow2-write growth-execution move (phase 7).** The
+  imperative refcount-growth EXECUTION (previously in the bench op) is
+  now the shared, region-agnostic `growth::grow_refcounts` in
+  `crates/qcow2-write-exec`, so commit and rebase can grow the
+  refcount structures during COW, not just bench. Behaviour is
+  byte-identical to bench's prior execution (the #433 materialization
+  fix and the single-fsync census are preserved).
 - **crates/qcow2-write-exec/** - Shared guest-side step executor for
   `crates/qcow2-write` step programs (`no_std`,
   PLAN-qcow2-write-infrastructure phase 4): a literal interpreter of
@@ -324,7 +358,12 @@ provides a modular architecture with:
   the rebase op's safe mode (phase 5), and the bench op's qcow2 `-w`
   path (phase 6, which also drives its refcount-growth I/O through
   the byte-range layer with the executor's fsync disabled so bench
-  keeps its own single-fsync-per-cadence-point census).
+  keeps its own single-fsync-per-cadence-point census). Phase 7 added
+  the shared `growth::grow_refcounts` here (moved out of the bench op)
+  so all three ops can grow the refcount structures during
+  copy-on-write, and all three now build COW-capable write states that
+  route the crate's `SnapshotShared` / `SnapshotSharedL2Table` COW
+  steps through this executor.
 - **operations/info/** - Format detection operation
 - **operations/copy/** - File copy operation
 - **operations/check/** - Image integrity validation operation (with

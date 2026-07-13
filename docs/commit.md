@@ -129,6 +129,12 @@ that crash recovery is straightforward:
    overlay's L2 entries and refcount-block entries for
    every committed cluster. This is observable as
    "the overlay reads as empty against the new backing".
+   This pass is **skipped when the overlay itself carries
+   internal snapshots** (zeroing shared active metadata in
+   place would corrupt them — see Known divergences): the
+   overlay is left byte-unchanged, its snapshots preserved,
+   and the committed clusters read identically through the
+   new backing.
 
 A crash between steps 1 and 2 leaves the backing in a
 state qemu-img check can repair (clusters allocated but
@@ -175,20 +181,32 @@ behaviour.
   expose vmdk monolithicSparse's `parentFileNameHint`
   via `backing_file`. Tracked separately under
   PLAN-info's vmdk follow-ups.
-- **Snapshot-bearing images refused.** If either side has
-  internal snapshots, instar refuses before any mutation.
-  Backing side (error 14): ``the backing file has internal
-  snapshots; committing would corrupt them. Fall back to
-  `qemu-img commit` `` — instar's per-cluster loop would
-  blind-overwrite snapshot-shared clusters that qemu-img
-  COWs (issue #420). Overlay side (error 15): ``the
-  overlay has internal snapshots; the post-commit clear
-  pass would corrupt them. Fall back to `qemu-img
-  commit` `` — the clear pass would decrement clusters the
-  snapshot still references. qemu-img proceeds on both
-  shapes; both refusals are byte-idempotent. The real fix
-  is copy-on-write, phase 7 of
-  PLAN-qcow2-write-infrastructure.
+- **Snapshot-bearing images copy-on-write (backing
+  snapshots preserved).** Since phase 7 of
+  PLAN-qcow2-write-infrastructure (issues #420 and #423
+  resolved), commit no longer refuses images with internal
+  snapshots — it copies the shared clusters instead. Where
+  the per-cluster loop previously blind-overwrote a
+  snapshot-shared backing cluster, commit now COWs it (copy
+  `D → D'`, repoint the L2, `rc(D')=1`, `rc(D)`−1; the old
+  cluster is never freed), so every pre-existing backing
+  snapshot is preserved bit-identically — matching qemu,
+  which COWs and preserves. When the **overlay** has
+  internal snapshots the post-commit overlay-clear pass is
+  skipped (zeroing shared active metadata in place was the
+  #423 corruption): the overlay is left byte-unchanged with
+  its snapshots preserved, and its active view stays
+  `qemu-img compare`-identical to qemu. The correctness bar
+  is qemu-parity (`qemu-img check` clean + active-view
+  compare + a snapshot read-back oracle asserting each
+  backing snapshot equals its pre-commit content), not
+  image-byte identity. **Known limitation:** because the
+  clear pass is skipped, a snapshot-bearing overlay is not
+  byte-emptied the way a snapshot-free overlay is — the
+  committed clusters stay mapped in the overlay's active L2
+  (reading identically through the new backing) rather than
+  zeroed. Full byte-emptying parity would need an
+  overlay-side COW-clear primitive (recorded follow-up).
 - **Backings with unknown or compression feature bits
   refused.** Since the phase-4 migration onto
   `crates/qcow2-write`, a backing whose header carries the

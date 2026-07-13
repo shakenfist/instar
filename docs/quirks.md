@@ -1322,30 +1322,50 @@ hardening item. Use unsafe-mode rebase (`-u`) when the
 caller knows the new backing's data is bit-identical to
 the old.
 
-### Safe-mode rebase refuses snapshot-bearing overlays
+### Safe-mode rebase copy-on-writes snapshot-bearing overlays
 
-If the overlay has internal snapshots, safe-mode rebase
-(including safe-mode detach) refuses with ``the overlay has
-internal snapshots; a safe-mode rebase would corrupt them.
-Use -u for a metadata-only rebase or fall back to `qemu-img
-rebase` `` (`RebaseResult` error 14). qemu-img proceeds — its
-contract covers the active view only, and it COWs
-snapshot-shared metadata — where instar's safe-mode
-allocator would mutate a shared L2 table in place and
-under-count refcounts, enabling data loss via a later
-`snapshot -d` (issue #421). The refusal fires before any
-mutation and is byte-idempotent
-(`tests/test_rebase.py:TestRebaseSnapshotGate`).
+Since the phase-7 copy-on-write work (issue #421 resolved),
+safe-mode rebase of an overlay that carries internal
+snapshots no longer refuses — it succeeds by copying. Where
+the safe-mode allocator would previously have mutated a
+snapshot-shared active L2 table in place and under-counted
+refcounts (`refcount=1 reference=2` on the newly-allocated
+clusters, enabling data loss via a later `snapshot -d`,
+issue #421), it now COWs the shared L2 (copy `T → T'`,
+repoint the L1, `rc(T')=1`, `rc(T)`−1) so no live cluster is
+ever left with a refcount below its reference count.
 
-**Interim divergence**: qemu-img proceeds on
-snapshot-bearing overlays where instar now refuses. The
-real fix is copy-on-write, phase 7 of
-[PLAN-qcow2-write-infrastructure](plans/PLAN-qcow2-write-infrastructure.md).
-Unsafe (`-u`) rebase only rewrites the header
-backing-pointer region, which is never snapshot-shared, so
-it stays allowed on snapshot-bearing overlays and carries a
-parity test against qemu-img (exit codes, check-clean,
-info-equivalence, identical snapshot read-back).
+The load-bearing subtlety is the **snapshot-view semantic**,
+matching qemu's contract exactly: `qemu-img rebase` covers
+the **active view only** and leaves internal snapshots
+untouched, so after the rebase a snapshot's unallocated
+ranges silently **read through the NEW backing** rather than
+staying at their pre-rebase content. instar reproduces that
+read-through-new-backing semantic; the snapshot read-back
+oracle asserts each snapshot resolves to qemu's result for
+the same op, not to a frozen pre-rebase baseline. The proof
+is qemu-parity — `qemu-img check` clean + active-view
+`qemu-img compare`-identical to a qemu twin + the snapshot
+read-back oracle — never image-byte identity (qemu's own COW
+placement is nondeterministic at 512-byte clusters). See
+`tests/test_rebase.py:TestRebaseSnapshotGate`,
+`tests/test_cow_cross_version.py` and the cross-cutting
+"Copy-on-write for snapshot-bearing qcow2 images" section
+below.
+
+Unsafe (`-u`) rebase is unchanged: it only rewrites the
+header backing-pointer region, which is never
+snapshot-shared, and stays parity-tested against qemu-img.
+
+**Growth sizing (known limitation).** rebase's COW gates
+refcount growth on `nb_snapshots > 0` and sizes it at
+`2 × overlay_cluster_count` — coarser than commit's
+allocated-cluster bound, because rebase writes into clusters
+it does not own and cannot cheaply bound the allocation
+ahead of the walk. The over-provisioned refblocks are
+check-clean (they carry the #433 materialization fix), so
+this is a sizing conservatism, not a correctness gap; a
+tighter bound is recorded follow-up work.
 
 ### Overlays with extended L2 entries or unknown/compression feature bits are refused
 
@@ -1559,37 +1579,50 @@ qcow2 → qcow2 and vmdk → vmdk only. Cross-format commit
 `ERROR_UNSUPPORTED_FORMAT`. Lifting needs planner
 extensions plus a cluster-size translation layer.
 
-### Snapshot-bearing images are refused
+### Snapshot-bearing images copy-on-write (backing preserved)
 
-`instar commit` refuses before any image mutation when
-EITHER side of the commit has internal snapshots.
+Since the phase-7 copy-on-write work (issues #420 and #423
+resolved), `instar commit` succeeds on snapshot-bearing
+images by copying instead of refusing. The phase-2 interim
+refusal gates (backing-side error 14, overlay-side error 15)
+are lifted.
 
-- **Backing side** (`CommitResult` error 14): ``the backing
-  file has internal snapshots; committing would corrupt
-  them. Fall back to `qemu-img commit` ``. qemu-img COWs
-  snapshot-shared backing clusters and preserves the
-  snapshots on every version tested; instar's per-cluster
-  loop blind-overwrites them (issue #420, silent snapshot
-  corruption in the dominant mode).
-- **Overlay side** (`CommitResult` error 15): ``the overlay
-  has internal snapshots; the post-commit clear pass would
-  corrupt them. Fall back to `qemu-img commit` ``. The
-  overlay-clear pass zeroes active L2 entries and
-  decrements shared clusters without accounting for the
-  snapshot's reference, leaving refcount=0 clusters still
-  referenced by the snapshot's L1 tree — latent snapshot
-  data loss. This is the overlay-side sibling of #420
-  (issue #423), found by the gate work's own parity
-  test; qemu-img handles the same shape check-clean.
+- **Backing side** (was issue #420): where the per-cluster
+  loop previously blind-overwrote snapshot-shared backing
+  clusters, commit now COWs them (copy the shared data
+  cluster `D → D'`, repoint the L2, `rc(D')=1`, `rc(D)`−1;
+  `D` is never freed because the snapshot still holds it).
+  Every pre-existing backing snapshot is **preserved
+  bit-identically** — its read-back after the commit equals
+  its pre-commit content, matching qemu, which COWs and
+  preserves on every version tested.
+- **Overlay side** (was issue #423): the post-commit
+  overlay-clear pass — which zeroes the overlay's active L2
+  and refcount entries in place — is **skipped when the
+  overlay has internal snapshots**, because zeroing shared
+  active metadata in place is exactly the corruption #423
+  described. The overlay is left byte-unchanged, its
+  snapshots preserved, and its active view stays
+  `qemu-img compare`-identical to qemu (the committed
+  clusters now resolve identically through the new backing).
 
-Both refusals fire before any mutation and are
-byte-idempotent
-(`tests/test_commit.py:TestCommitSnapshotGate`).
+The proof is qemu-parity, never image-byte identity:
+`qemu-img check` clean + active-view compare-identical to a
+qemu twin + the snapshot read-back oracle asserting each
+backing snapshot equals its pre-commit content. See
+`tests/test_commit.py:TestCommitSnapshotGate` and
+`tests/test_cow_cross_version.py`.
 
-**Interim divergence**: qemu-img proceeds on
-snapshot-bearing images where instar now refuses. The real
-fix is copy-on-write, phase 7 of
-[PLAN-qcow2-write-infrastructure](plans/PLAN-qcow2-write-infrastructure.md).
+**Known limitation (documented non-emptying).** Because the
+overlay-clear pass is skipped for snapshot-bearing overlays,
+the overlay is not byte-emptied the way a snapshot-free
+commit empties it — the committed clusters remain mapped in
+the overlay's active L2 (reading identically through the new
+backing) rather than being zeroed out. Full byte-emptying
+parity would need an overlay-side COW-clear primitive that
+copies the shared active metadata before zeroing it; that is
+recorded follow-up work. The active view and every snapshot
+are correct either way.
 
 ### Backings with unknown or compression feature bits are refused
 
@@ -2329,6 +2362,114 @@ failure, so it is not flagged as `repair-incomplete`; a subsequent read-only
 differential fuzzer (`scripts/differential-fuzz.py`, the `repair` op), which
 gates its cleanliness-convergence check on the `all` tier precisely because
 the two tools' `leaks` tiers have deliberately different scope.
+
+## Copy-on-write for snapshot-bearing qcow2 images
+
+**Classification: Safe behaviour** (qemu-parity, not a divergence).
+
+Since phase 7 of PLAN-qcow2-write-infrastructure, writes into a
+snapshot-bearing qcow2 image **copy-on-write** the shared clusters
+instead of refusing (the phase-2 interim gates) or corrupting them.
+This cross-cutting change lifts the snapshot caveats from `commit`
+(issues #420 / #423), `rebase` safe mode (issue #421) and `bench -w`,
+so all three now succeed on images that carry internal snapshots.
+
+### The per-op snapshot-view semantic
+
+Phase 7 is net-new behaviour, so the correctness bar is **qemu-parity,
+not before/after byte identity**: `qemu-img check` clean + the active
+view `qemu-img compare`-identical to a qemu twin + a snapshot
+**read-back oracle** that extracts each pre-existing snapshot's virtual
+view (apply-on-a-copy → convert to raw → sha256) and compares it to
+qemu's result for the same op. Byte placement of the COW output is
+explicitly **not** constrained — qemu's own COW placement is
+nondeterministic at 512-byte clusters, so instar takes its own layout
+freedom.
+
+The read-back oracle's expected value is **per op**, not a blanket
+"snapshot unchanged":
+
+- **commit** preserves every backing snapshot bit-identically — a
+  snapshot's post-commit read-back equals its **pre-commit** content
+  (qemu COWs and preserves).
+- **rebase** safe mode covers the active view only; a snapshot's
+  unallocated ranges read **through the new backing** afterwards, so
+  its expected value is the snapshot applied against the new backing,
+  not its pre-rebase content (qemu's read-through-new-backing
+  contract). An overlay snapshot in the post-write shape resolves the
+  same way.
+- **bench -w** writes into the active view and preserves snapshots
+  like commit.
+
+### The refcount COW machinery
+
+Two shared cluster shapes are copied before modification:
+
+- **Data-cluster COW** (a shared `D`, `OFLAG_COPIED` clear, refcount
+  > 1): copy `D → D'`, patch the L2 entry to `D' | COPIED`, set
+  `rc(D')=1`, and **decrement** `rc(D)` (2→1). The old `D` is never
+  freed — the snapshot still references it.
+- **L2-table COW** (a shared L2 table `T`): copy `T → T'`, patch the
+  L1 entry to `T' | COPIED`, set `rc(T')=1`, decrement `rc(T)`, and
+  **leave the child data clusters' refcounts untouched**. This last
+  point is a subtlety worth flagging for future maintainers: qemu
+  eagerly bumps every reachable data cluster to refcount ≥ 2 at
+  *snapshot-creation* time, so by the time an L2 table is COWed its
+  children are already rc ≥ 2 with `OFLAG_COPIED` clear. Copying
+  `T → T'` merely redistributes the reference (net child delta 0); a
+  literal "increment every child" would drive them to rc 3 and make
+  `qemu-img check` dirty. The children already classify shared, so a
+  write through `T'` into a child triggers the per-child data-cluster
+  COW above. The decrement is a net-new refcount primitive (v1 only
+  ever incremented on allocation); an underflow maps to each op's
+  existing inconsistency error.
+
+### The zero-flag WRITE-target policy
+
+Independent of the #432 read fix below, the write planner classifies a
+v3 `QCOW_OFLAG_ZERO` (bit 0) *target* L2 entry by qemu's exact
+semantic (qemu does **not** free the old host offset):
+
+- **host offset == 0** (zero flag, no allocation) → treated as
+  unallocated: allocate a fresh cluster / zero-fill the range.
+- **host offset != 0, refcount 1** → overwrite in place, clearing the
+  zero bit (qemu reuses the offset — no free).
+- **host offset != 0, refcount > 1** → copy-on-write (shared).
+
+The earlier blanket "treat as unallocated → allocate fresh" would have
+leaked the old host cluster (rc 1, unreferenced → check-dirty) or
+skipped a required COW.
+
+### #432: classic-L2 zero flag reads as zeros (fixed)
+
+The chain reader previously ignored `QCOW_OFLAG_ZERO` on classic
+(non-extended) L2 entries, so a v3 zero-flagged backing cluster read as
+the wrong bytes (host == 0 fell through to a lower backing; host != 0
+read stale host bytes) — silent active-view corruption with blast
+radius rebase / convert / compare / bench. Fixed fix-first (step 7z):
+`cluster_lookup` gained a `ClusterLookup::Zero` verdict and the chain
+reader zero-fills for it (both host == 0 and host != 0). See also the
+"qcow2 v3 standard-L2 `QCOW_OFLAG_ZERO` honoured (fixed)" entry in the
+map section for the parser-side twin.
+
+### Known limitations / follow-ups
+
+- **commit does not byte-empty a snapshot-bearing overlay.** The
+  overlay-clear pass is skipped for such overlays (zeroing shared
+  active metadata in place was #423); the committed clusters stay
+  mapped in the overlay's active L2, reading identically through the
+  new backing. Full byte-emptying parity would need an overlay-side
+  COW-clear primitive. Active view and snapshots are correct.
+- **rebase's COW growth is coarsely sized** at
+  `2 × overlay_cluster_count` (rebase writes into unowned clusters);
+  the over-provisioned refblocks are check-clean via the #433
+  materialization fix. A tighter bound is follow-up work.
+
+Verified check-clean and read-back-parity against pinned qemu-img
+6.2.0 / 7.2.0 / 8.2.0 / 9.2.0 / 10.2.0 by
+`tests/test_cow_cross_version.py`, and across 50 randomized
+snapshot-bearing iterations (0 divergences) by `scripts/cow-soak.py`;
+`tests/helpers/snapshot_readback.py` is the reusable read-back oracle.
 
 ## Future Additions
 

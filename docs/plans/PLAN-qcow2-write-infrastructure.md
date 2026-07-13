@@ -294,13 +294,16 @@ Design sketch (to be settled in phase planning, not binding):
 | 4. Migrate commit onto the crate (byte-identical proof) | PLAN-qcow2-write-infrastructure-phase-04-commit.md | Complete (2026-07-13; commits c101c9f / a2fae94 / 6b0c856 / 7dff544 / 2237028; see Findings) |
 | 5. Migrate rebase safe mode (byte-identical proof) | PLAN-qcow2-write-infrastructure-phase-05-rebase.md | Complete (2026-07-13; commits ad208bf / cfb86f9 / 5889573; see Findings) |
 | 6. Migrate bench `-w`; move the refcount-growth planner into the shared crate | PLAN-qcow2-write-infrastructure-phase-06-bench.md | Complete (2026-07-13; commits a93ed53 / e9905b7 / c50bfbd / f7bd81c / aae6083; see Findings) |
-| 7. Copy-on-write branch; lift bench's internal-snapshot gate; per-consumer COW policy per OQ3 | PLAN-qcow2-write-infrastructure-phase-07-cow.md | Not started |
+| 7. Copy-on-write branch; lift bench's internal-snapshot gate; per-consumer COW policy per OQ3 | PLAN-qcow2-write-infrastructure-phase-07-cow.md | Complete (2026-07-13/14; plan 9cb5b59 / 9440464; commits 7z dabdcfd, 7a 125152a / 865c171, growth-share 1c9a0d8, 7b e356e27, 7c 997d223, 7d af99c21, 7e 0c07140; see Findings) |
 | 8. Fuzz: coverage-guided target for the new crate; differential coverage for newly-permitted snapshot-bearing writes | PLAN-qcow2-write-infrastructure-phase-08-fuzz.md | Not started |
 | 9. Docs: architecture notes, docs/qcow2/ implementation notes, per-op doc updates, CHANGELOG | PLAN-qcow2-write-infrastructure-phase-09-docs.md | Not started |
 
 Phase 2 was conditional on phase 1 confirming a live defect;
 phase 1 confirmed three (see the Findings defect register), so
-phase 2 ran. Phase 7's plan file is the next to write.
+phase 2 ran. Phases 1-7 are complete; phase 7 added copy-on-write
+(resolving #420 / #421 / #423 and fixing #432), so all three
+consumers now succeed on snapshot-bearing images. Phases 8 (fuzz)
+and 9 (docs) remain; their plan files are the next to write.
 
 One commit per phase minimum; each commit builds, lints and tests
 clean on its own. Phases 4-6 are pure refactors from the outside:
@@ -1200,6 +1203,104 @@ the cross-cutting docs/architecture close-out. The #432 read-path
 zero-flag fix and the qemu-lazy growth parity that would unlock
 growth for the byte-parity consumers both remain future work.
 
+### Findings: phase 7 copy-on-write (2026-07-13/14)
+
+Executed per
+[PLAN-qcow2-write-infrastructure-phase-07-cow.md](PLAN-qcow2-write-infrastructure-phase-07-cow.md)
+as steps 7p (empirical probes, no code; findings folded into that
+plan at 9440464), 7z (the #432 read fix, fix-first, dabdcfd), 7a
+(the crate COW branch, 125152a, with the zero-flag-target follow-up
+865c171), the growth-execution share (1c9a0d8), 7b (commit COW,
+e356e27), 7c (rebase COW, 997d223), 7d (bench COW, af99c21) and 7e
+(the parity harness + soak, 0c07140). This is the **first net-new
+behaviour** phase — the proof model differs from phases 4-6, and two
+7p probes materially corrected the design before 7a. What follows is
+what phases 8-9 need.
+
+**The proof model is qemu-parity, not before/after byte identity.**
+Phases 4-6 proved migrations byte-invisible (instar-before ==
+instar-after). Phase 7 makes snapshot-bearing writes *succeed* where
+they used to *refuse*, so there is no before/after identity to assert.
+The proof is instead: `qemu-img check` clean + the active view
+`qemu-img compare`-identical to a qemu twin + a snapshot **read-back
+oracle** (apply-on-a-copy → convert to raw → sha256) comparing each
+pre-existing snapshot's virtual view to **qemu's result for the same
+op on the same fixture**, computed live. Byte placement of the COW
+output is explicitly NOT constrained (C11) — qemu's own COW placement
+is nondeterministic run-to-run at 512-byte clusters (Q3), so
+byte-parity is neither achievable nor required. The **load-bearing
+read-back invariant is "== qemu twin"**, of which "preserved" (commit
+backing snapshots) and "read-through-the-new-backing" (rebase, and an
+overlay snapshot in the post-write shape) are the two per-op special
+cases — NOT a blanket "snapshot unchanged".
+
+**The C1-C12 contract held; two 7p corrections were applied before
+7a.** (C1) data-cluster COW: shared `D` copied to `D'`, L2 →
+`D'|COPIED`, `rc(D')=1`, `rc(D)`−1, `D` never freed — confirmed. (C2,
+**7p-corrected**) L2-table COW copies `T → T'`, repoints L1,
+`rc(T')=1`, `rc(T)`−1, and leaves the child data-cluster refcounts
+**untouched**: qemu eagerly bumps every reachable cluster to rc ≥ 2 at
+snapshot-*creation* time, so at L2-COW the children are already rc ≥ 2
+(`OFLAG_COPIED` clear); copying `T → T'` merely redistributes the
+reference (net child delta 0). The plan's original "increment every
+child 1→2" would have driven them to rc 3 → `qemu-img check` dirty.
+The children already classify `SnapshotShared`, so a write through
+`T'` into a child triggers per-child C1. (Decision 6, **7p-corrected**)
+the zero-flag WRITE target follows qemu's exact semantic — qemu does
+NOT free the old offset: host == 0 → allocate fresh; host != 0 rc 1 →
+overwrite in place clearing the zero bit; host != 0 rc > 1 → COW. The
+original blanket "treat as unallocated" would have leaked the host != 0
+cluster. (C3) nested COW, (C4) crash order (data durable before the
+pointer flip, refcounts last), (C5) active-view compare + check clean,
+(C6/C7/C8) the per-op read-back invariants, (C9) growth during COW,
+(C10) #432, (C11) placement freedom, (C12) non-snapshot / `-u`
+byte-unchanged — all pinned by tests. The net-new machinery is a
+refcount-**decrement** primitive (`dec_refcount`; v1 only incremented
+on allocation), whose underflow maps to `WriteError::RefcountInconsistent`
+(code 12); no new `StepKind`.
+
+**The per-op adoption.** commit (7b) preserves backing snapshots
+bit-identically and **skips the overlay-clear pass when the overlay has
+snapshots** (zeroing shared active L2/refcounts in place was #423) —
+the overlay is left byte-unchanged, active view compare-identical.
+rebase safe mode (7c) COWs the shared active L2 (so no live cluster is
+left `refcount=1 reference=2`, the #421 chain) and the snapshot reads
+**through the new backing** afterwards (qemu's active-view-only
+contract, the *opposite* of commit's preservation); its growth is
+gated on `nb_snapshots > 0` and sized `2 × overlay_cluster_count`
+(coarser than commit's allocated-cluster bound because rebase writes
+into unowned clusters). bench (7d) lifts the last gate — a feature, not
+a fix — with snapshots preserved and growth inherited. Growth EXECUTION
+was moved from the bench op into the shared, region-agnostic
+`qcow2-write-exec::growth::grow_refcounts` (1c9a0d8) so commit and
+rebase can grow during COW; bench behaviour stayed byte-identical (the
+#433 fix and single-fsync census preserved).
+
+**The harness and numbers (7e).** `tests/test_cow_cross_version.py`
+runs instar's COW output through `qemu-img check` + active-view
+compare + the read-back oracle against pinned qemu 6.2.0 / 7.2.0 /
+8.2.0 / 9.2.0 / 10.2.0 (30 combos, check-clean and read-back-parity).
+`scripts/cow-soak.py` ran 50 randomized snapshot-bearing iterations
+with 0 divergences (seed 20260713). `tests/helpers/snapshot_readback.py`
+is the reusable read-back oracle (apply-on-copy → convert → sha256).
+
+**What phase 8 scales.** Phase 7 built the *minimal* integration-test
+read-back oracle over the phase-1 hand-built Q1/Q2 fixtures; phase 8
+generalises the snapshot-fixture generator into **snapshot-bearing
+differential-fuzz** (coverage-guided target for the crate's COW branch
+plus differential coverage for the newly-permitted snapshot-bearing
+writes), asserting 0 divergences on the read-back + compare + check
+oracle at scale.
+
+**Recorded follow-ups.** (1) An **overlay-side COW-clear primitive** —
+commit currently does not byte-empty a snapshot-bearing overlay (the
+clear pass is skipped to avoid #423); full byte-emptying parity would
+need a primitive that COWs the shared active metadata before zeroing
+it. Active view and snapshots are correct without it. (2) A **tighter
+rebase growth bound** — the `2 × overlay_cluster_count` sizing
+over-provisions refblocks (check-clean via #433); a bound closer to the
+actual COW allocation count is deferred.
+
 ## Administration and logistics
 
 ### Success criteria
@@ -1252,22 +1353,30 @@ Phase 1 confirmed three pre-existing defects, phase 2 found a
 fourth, phase 4's probes found two more, phase 5's probes found
 three more — two fixed by typed refusals, one out of scope — and
 phase 6's probes found one more, fixed fix-first before the
-migration (details and repro recipes in the Findings sections;
-#420-#422 filed 2026-07-12):
+migration. Phase 7 then **resolved the three snapshot-corruption
+defects (#420 / #421 / #423)** by adding copy-on-write and lifting
+the phase-2 interim gates, and **fixed the #432 chain-reader
+zero-flag defect** fix-first (#422 was already fixed in phase 2 and
+is unrelated to COW). Details and repro recipes are in the Findings
+sections; #420-#422 filed 2026-07-12:
 
 1. [#420](https://github.com/shakenfist/instar/issues/420)
    `instar commit` silently corrupts internal snapshots in the
    backing file (two modes; the dominant one invisible to every
-   existing oracle). **Gate landed in phase 2 (ac8f60a,
-   error 14) — the corruption is unreachable**; real fix
-   phase 7 COW, issue stays open until then.
+   existing oracle). Gate landed in phase 2 (ac8f60a, error 14).
+   **RESOLVED by phase-7 copy-on-write (7b, e356e27):** the
+   interim gate is lifted and commit now COWs snapshot-shared
+   backing clusters, preserving every backing snapshot
+   bit-identically (qemu-parity check + compare + read-back).
 2. [#421](https://github.com/shakenfist/instar/issues/421)
    `instar rebase` (safe mode) corrupts refcounts on
    snapshot-shared overlay metadata, enabling live data loss via
-   a later `snapshot -d`. **Gate landed in phase 2 (2fb9af4,
-   error 14; `-u` stays allowed with a parity test) — the
-   corruption is unreachable**; real fix phase 7 COW, issue
-   stays open until then.
+   a later `snapshot -d`. Gate landed in phase 2 (2fb9af4,
+   error 14; `-u` stays allowed with a parity test). **RESOLVED
+   by phase-7 copy-on-write (7c, 997d223):** the interim gate is
+   lifted and safe-mode rebase now COWs the shared active L2, so
+   no live cluster is left `refcount=1 reference=2`; the snapshot
+   reads through the new backing afterwards, matching qemu.
 3. [#422](https://github.com/shakenfist/instar/issues/422)
    `instar rebase` livelocks on 512-byte-cluster overlays
    (snapshot-independent). **Fixed in phase 2 (c84743e)**: a
@@ -1277,9 +1386,15 @@ migration (details and repro recipes in the Findings sections;
    the original fixture is a documented v1 limit, not this bug.
 4. `instar commit`'s overlay-clear pass corrupts refcounts when
    the overlay has internal snapshots (the overlay-side sibling
-   of #420; issue #423), found by phase 2a's parity test.
-   **Gated in the same commit (ac8f60a, error 15)**; real fix
-   phase 7 COW.
+   of #420; issue #423), found by phase 2a's parity test. Gated
+   in the same commit (ac8f60a, error 15). **RESOLVED by phase-7
+   copy-on-write (7b, e356e27):** the interim gate is lifted; the
+   overlay-clear pass is now skipped for snapshot-bearing overlays
+   (leaving the overlay byte-unchanged with its snapshots preserved
+   and the active view compare-identical). Full byte-emptying
+   parity — an overlay-side COW-clear primitive — is a recorded
+   phase-7 follow-up; the active view and snapshots are correct
+   without it.
 5. `instar commit` silently destroyed compressed clusters in
    the backing (found by phase 4p; check-clean, exit 0, every
    stream packed in the shared host cluster lost). **Refused
@@ -1316,11 +1431,14 @@ migration (details and repro recipes in the Findings sections;
    bit 0), so v3 zero-flag clusters in a chain member read as
    fall-through or stale bytes instead of zeros — silent
    active-view corruption with blast radius rebase / convert /
-   compare / bench (found by phase 5p). **NOT fixed by
-   phase 5** (pre-existing chain-read behaviour, explicitly
-   out of the migration's scope); phases 6+ or a standalone
-   fix must address it, and differential matrices must avoid
-   `write -z` seeds until then. Filed 2026-07-13 as
+   compare / bench (found by phase 5p). Not fixed by phase 5
+   (pre-existing chain-read behaviour, explicitly out of the
+   migration's scope). **FIXED fix-first in phase 7 (7z,
+   dabdcfd):** `cluster_lookup` gained a `ClusterLookup::Zero`
+   verdict and the chain reader now zero-fills for a zero-flag
+   classic-L2 cluster (both host == 0 and host != 0), with
+   regression tests through rebase and bench chain reads. Filed
+   2026-07-13 as
    [#432](https://github.com/shakenfist/instar/issues/432).
 10. `instar bench -w` on an overwrite-dominant qcow2 schedule
     that also crossed the preemptive refcount-growth threshold
