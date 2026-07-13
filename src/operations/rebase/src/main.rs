@@ -26,11 +26,13 @@
 use core::panic::PanicInfo;
 
 use qcow2::{QcowHeader, L1_OFFSET_MASK};
+use qcow2_write::growth::{plan_refcount_growth, GrowthCaps, GrowthOverflow};
 use qcow2_write::{
-    check_envelope, new_state, plan_flush, plan_write, DataSource, Gate, RegionId, StagedRegions,
-    StagingConfig, Step, StepBuf, StepKind, TargetDevice, WriteError, WriteState, MAX_L2_SLOTS,
+    check_envelope_with, new_state_cow, plan_flush, plan_write, DataSource, Gate, RegionId,
+    StagedRegions, StagingConfig, Step, StepBuf, StepKind, TargetDevice, WriteError, WriteState,
+    MAX_L2_SLOTS,
 };
-use qcow2_write_exec::{execute, read_bytes, CallTableIo, Regions};
+use qcow2_write_exec::{execute, growth, read_bytes, CallTableIo, Regions};
 use rebase::{
     plan_rebase_qcow2, plan_rebase_vmdk, Qcow2RebaseOpts, Qcow2RebaseOutput, RebaseError,
     RebaseMode, RebasePatch, RebasePlan, VmdkRebaseOpts, VmdkRebaseOutput,
@@ -330,6 +332,24 @@ fn map_write_error(e: WriteError) -> u32 {
         | WriteError::NotImplemented
         | WriteError::OutOfBounds
         | WriteError::ResumeMismatch => RebaseResult::ERROR_INTERNAL_OVERFLOW,
+    }
+}
+
+/// Map a shared [`growth::grow_refcounts`] failure to a
+/// `RebaseResult::ERROR_*` wire code (phase 7, decision 5).
+/// `StageOutOfCoverage` is the planner's self-coverage-invariant
+/// internal-bug path (the `*_INCONSISTENT` family, decision 7); a
+/// device write failure keeps the code the executor's own window
+/// writes use (`ERROR_HEADER_MISMATCH`, the code `exec_window`
+/// failures map to). `FsyncFailed` cannot arise on the fsync-less
+/// Output device (its barriers degrade to Ordering), and is
+/// mapped defensively alongside it.
+fn map_growth_error(e: growth::GrowthExecError) -> u32 {
+    match e {
+        growth::GrowthExecError::StageOutOfCoverage => RebaseResult::ERROR_OVERLAY_INCONSISTENT,
+        growth::GrowthExecError::WriteFailed | growth::GrowthExecError::FsyncFailed => {
+            RebaseResult::ERROR_HEADER_MISMATCH
+        }
     }
 }
 
@@ -662,6 +682,51 @@ unsafe fn init_step_storage() -> &'static mut [Step] {
     core::slice::from_raw_parts_mut(ptr, STEP_CAPACITY)
 }
 
+/// Cluster-aligned current file end of the overlay, derived from
+/// its staged refcount structures — the rebase-side analogue of
+/// commit's `backing_file_end_clusters`, the base the
+/// refcount-growth planner grows from (C9). Considers (a) the
+/// highest staged refblock entry with a nonzero refcount, (b) the
+/// refcount table's extent, (c) the L1 table's extent, (d) each
+/// populated refblock cluster's own offset, and (e) the header
+/// cluster (always present).
+///
+/// # Safety
+///
+/// The overlay refblock (`OVERLAY_REFBLOCKS_BUF`) and refcount
+/// table (`OVERLAY_RT_BUF`) scratch must be staged and unused by
+/// any live borrow.
+unsafe fn overlay_file_end_clusters(carve: &OverlayCarve, overlay: &QcowHeader) -> u64 {
+    let cs = carve.cluster_size as u64;
+    let refblock_count = carve.rb_bytes / carve.cluster_size;
+    let refblocks = core::slice::from_raw_parts(OVERLAY_REFBLOCKS_BUF as *const u8, carve.rb_bytes);
+    let rt = core::slice::from_raw_parts(OVERLAY_RT_BUF as *const u8, carve.rt_bytes);
+    // refcount_bits is validated == 16.
+    let entries_per_refblock = (cs * 8 / 16) as usize;
+    let mut end: u64 = 1;
+    for slot in 0..refblock_count {
+        let block = &refblocks[slot * carve.cluster_size..(slot + 1) * carve.cluster_size];
+        for e in 0..entries_per_refblock {
+            if block[e * 2] != 0 || block[e * 2 + 1] != 0 {
+                end = end.max(slot as u64 * entries_per_refblock as u64 + e as u64 + 1);
+            }
+        }
+    }
+    let rt_end = overlay
+        .refcount_table_offset
+        .saturating_add((overlay.refcount_table_clusters as u64).saturating_mul(cs));
+    end = end.max(rt_end.div_ceil(cs));
+    let l1_end = overlay
+        .l1_table_offset
+        .saturating_add((overlay.l1_size as u64).saturating_mul(8));
+    end = end.max(l1_end.div_ceil(cs));
+    for slot in 0..refblock_count {
+        let off = read_u64_be(rt, slot * 8) & L1_OFFSET_MASK;
+        end = end.max(off / cs + 1);
+    }
+    end
+}
+
 /// Stage the overlay's L1 (twice: the planner's mutable copy
 /// and the skip probe's read-only original), refcount-table
 /// prefix and refblocks for the qcow2-write planner. Refblocks
@@ -830,27 +895,29 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
         );
     }
 
-    // Interim phase-2 gate (GitHub issue #421): refuse
-    // safe-mode rebase of an overlay with internal snapshots
-    // before any staging or writes. Safe mode writes new
-    // mappings into snapshot-shared L2 tables in place and sets
-    // refcount=1 on clusters that two L1 trees reference, so a
-    // routine `qemu-img snapshot -d` afterwards frees clusters
-    // the active view still maps — physical data loss. This
-    // runner is only entered without FLAG_UNSAFE (see
-    // `run_qcow2`), so the gate also covers safe detach; the
-    // `-u` metadata-only path only rewrites the header region,
-    // which is never snapshot-shared, and stays allowed. The
-    // real fix (snapshot-aware COW) lands in phase 7 of
-    // PLAN-qcow2-write-infrastructure.
-    if parsed.nb_snapshots > 0 {
-        return err_result(
-            config.overlay_format,
-            RebaseResult::MODE_SAFE,
-            RebaseResult::ERROR_OVERLAY_HAS_SNAPSHOTS,
-        );
-    }
-
+    // Phase 7 COW adoption (decision 4a, GitHub #421): the
+    // interim phase-2 nb_snapshots gate that refused any
+    // snapshot-bearing overlay is lifted here. Safe-mode rebase
+    // of a snapshot-bearing overlay is now handled by
+    // copy-on-write: `new_state_cow` + `check_envelope_with(..,
+    // allow_snapshots = true)` below let the qcow2-write
+    // classifier emit COW steps for snapshot-shared active L2
+    // tables (C2) instead of writing new mappings into them in
+    // place, and the shared refcount-growth planner provisions
+    // the extra refblocks the COW allocations need (C9). The old
+    // failure mode (writing into a shared L2 in place, leaving
+    // `refcount=1 reference=2` on clusters two L1 trees
+    // reference, so a later `qemu-img snapshot -d` frees live
+    // active-view data — #421) is thereby structurally
+    // unreachable: COW never mutates a snapshot's own L1/L2, so
+    // every pre-existing snapshot is preserved and reads through
+    // whatever backing the overlay now points at (the NEW one),
+    // matching `qemu-img rebase`'s active-view-only contract
+    // (C7). This runner is only entered without FLAG_UNSAFE (see
+    // `run_qcow2`), so it also covers safe detach; the `-u`
+    // metadata-only path is untouched. The `*_HAS_SNAPSHOTS`
+    // wire code + host message are retained for
+    // defensive/non-COW callers but no longer fire here.
     let cluster_size = parsed.cluster_size;
     if cluster_size == 0 || cluster_size > COMPARE_BUF_SIZE as u64 {
         return err_result(
@@ -923,16 +990,18 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
         }
     };
 
-    // ----- qcow2-write envelope on the overlay (decision 6) --
-    // Runs after the op gates and the planner's legacy
-    // validation, which together cover every Gate except
-    // UnknownIncompatible and ExtendedL2 with their existing
-    // codes — so the only refusals this adds are the
-    // spec-mandated zstd/unknown-incompatible-bit gate and the
-    // extended-L2 gate (ERROR_OVERLAY_UNSUPPORTED; divergence
-    // R-D1 — extended-L2 safe rebase was live silent
+    // ----- qcow2-write envelope on the overlay (decision 6;
+    // phase-7 decision 4b) -- `allow_snapshots = true` relaxes
+    // the `Gate::HasSnapshots` refusal so a snapshot-bearing
+    // overlay reaches the COW planner. Runs after the op gates
+    // and the planner's legacy validation, which together cover
+    // every other Gate except UnknownIncompatible and ExtendedL2
+    // with their existing codes — so the only refusals this adds
+    // are the spec-mandated zstd/unknown-incompatible-bit gate
+    // and the extended-L2 gate (ERROR_OVERLAY_UNSUPPORTED;
+    // divergence R-D1 — extended-L2 safe rebase was live silent
     // corruption). Before any staging or mutation.
-    if let Err(gate) = check_envelope(&parsed) {
+    if let Err(gate) = check_envelope_with(&parsed, true) {
         return err_result(
             config.overlay_format,
             RebaseResult::MODE_SAFE,
@@ -950,7 +1019,7 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
     // on demand, and the skip probe reads the ORIGINAL tables
     // through its own buffer (this lifts the old MAX_STAGED_L2
     // staging refusal — the R-D6 widening).
-    let carve = match stage_overlay_qcow2(call_table, sector_size, &parsed) {
+    let mut carve = match stage_overlay_qcow2(call_table, sector_size, &parsed) {
         Ok(c) => c,
         Err(code) => {
             return err_result(config.overlay_format, RebaseResult::MODE_SAFE, code);
@@ -963,7 +1032,11 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
         max_refblocks: qcow2_write::MAX_REFBLOCKS.min(OVERLAY_REFBLOCKS_LIMIT / cluster_size_usize),
         device: TargetDevice::Output,
     };
-    let mut wstate: WriteState = match new_state(&parsed, &staging_config) {
+    // COW-enabled (decision 4b): snapshot-shared active L2
+    // tables (C2) and any snapshot-shared data cluster (C1)
+    // classify into COW emission instead of refusing
+    // ERROR_OVERLAY_INCONSISTENT.
+    let mut wstate: WriteState = match new_state_cow(&parsed, &staging_config) {
         Ok(s) => s,
         Err(gate) => {
             return err_result(
@@ -981,6 +1054,113 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
     // degrade to Ordering — zero fsyncs, exactly as before
     // (divergence R-D8).
     let mut io = CallTableIo::new(call_table, false);
+
+    // ----- Preemptive refcount growth (C9, decisions 3 & 5) --
+    // COW allocates at most one new data cluster plus one new L2
+    // table per touched snapshot-shared cluster; rebase writes
+    // only into clusters the ACTIVE overlay does not already own
+    // (the skip probe skips owned clusters), so
+    // `2 * overlay_cluster_count` bounds the new clusters (fresh
+    // data + at most one COWed L2 table per touched cluster).
+    // Provision the refblock coverage that worst case needs
+    // BEFORE the write loop so a COW schedule crossing a refblock
+    // boundary grows instead of RefcountExhausting (the 7p
+    // refinement — count refblock growth even when the refcount
+    // table itself does not grow — is inherent to
+    // `plan_refcount_growth`; the cs=512 legs relocate the RT,
+    // exercising that path).
+    //
+    // Gated on `nb_snapshots > 0`: without internal snapshots no
+    // overlay cluster is shared, so no COW and no COW-induced
+    // allocation occurs, and rebase's fresh-cluster allocation is
+    // provisioned exactly as before (C12 — the non-snapshot and
+    // `-u` outputs stay byte-for-byte unchanged). A snapshot-
+    // bearing overlay is a COW image whose byte placement is not
+    // part of the proof (C11), so the worst-case coverage is
+    // check-clean and compare-neutral even where it over-
+    // provisions.
+    if parsed.nb_snapshots > 0 {
+        let worst_case_new = context.overlay_cluster_count.saturating_mul(2);
+
+        // entries_per_refblock = cluster_size * 8 / refcount_bits;
+        // refcount_bits is validated == 16 above.
+        let entries_per_refblock = cluster_size * 8 / 16;
+        let refblock_count = carve.rb_bytes / cluster_size_usize;
+        let file_end = overlay_file_end_clusters(&carve, &parsed);
+        let rt_capacity_slots =
+            (parsed.refcount_table_clusters as u64).saturating_mul(cluster_size) / 8;
+        let caps = GrowthCaps {
+            max_refblocks: qcow2_write::MAX_REFBLOCKS as u64,
+            max_refblock_clusters: (OVERLAY_REFBLOCKS_LIMIT / cluster_size_usize) as u64,
+            max_rt_slots: (OVERLAY_RT_LIMIT / 8) as u64,
+        };
+        let plan = match plan_refcount_growth(
+            entries_per_refblock,
+            cluster_size,
+            file_end,
+            refblock_count as u64,
+            rt_capacity_slots,
+            worst_case_new,
+            &caps,
+        ) {
+            Ok(p) => p,
+            Err(GrowthOverflow) => {
+                return err_result(
+                    config.overlay_format,
+                    RebaseResult::MODE_SAFE,
+                    RebaseResult::ERROR_REFCOUNT_EXHAUSTED,
+                );
+            }
+        };
+        if plan.new_refblocks > 0 {
+            let mut exec =
+                growth::GrowthExec::new(cluster_size, entries_per_refblock, refblock_count);
+            let mut bufs = growth::GrowthBuffers {
+                refcount_table: core::slice::from_raw_parts_mut(
+                    OVERLAY_RT_BUF as *mut u8,
+                    OVERLAY_RT_LIMIT,
+                ),
+                refblocks: core::slice::from_raw_parts_mut(
+                    OVERLAY_REFBLOCKS_BUF as *mut u8,
+                    OVERLAY_REFBLOCKS_LIMIT,
+                ),
+                rmw_sector: core::slice::from_raw_parts_mut(
+                    RMW_SECTOR as *mut u8,
+                    RMW_SECTOR_LIMIT,
+                ),
+            };
+            let rt_table = growth::RefcountTable {
+                offset: parsed.refcount_table_offset,
+                clusters: parsed.refcount_table_clusters,
+            };
+            if let Err(e) = growth::grow_refcounts(
+                &mut io,
+                TargetDevice::Output,
+                &mut exec,
+                &plan,
+                rt_table,
+                &mut bufs,
+            ) {
+                return err_result(
+                    config.overlay_format,
+                    RebaseResult::MODE_SAFE,
+                    map_growth_error(e),
+                );
+            }
+            // The staged refblock prefix (and, on the relocating
+            // path, the refcount table) grew: widen the carve so
+            // the planner's `staged_view` exposes the new
+            // structures. grow_refcounts already flipped the disk
+            // RT pointer, so plan_flush's refblock write-backs
+            // resolve through the updated staged RT.
+            carve.rb_bytes = exec.refblock_count() * cluster_size_usize;
+            if plan.new_rt_clusters > 0 {
+                carve.rt_bytes = (parsed.refcount_table_clusters as u64 + plan.new_rt_clusters)
+                    as usize
+                    * cluster_size_usize;
+            }
+        }
+    }
 
     // ----- Initialise chain-reader state -------------------
     let chain_config = &*(CHAIN_CONFIG_ADDR as *const ChainConfig);

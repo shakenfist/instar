@@ -40,6 +40,7 @@ from pathlib import Path
 
 from base import InstarTestBase
 from helpers.info_json import assert_info_equivalent
+from helpers.snapshot_readback import snapshot_readback
 
 
 # ----------------------------------------------------------------------
@@ -727,8 +728,25 @@ for _target, _cases in REBASE_CASES.items():
 # ----------------------------------------------------------------------
 
 
-class TestRebaseSnapshotGate(TestRebaseSmoke):
-    """Safe-mode overlay-snapshot refusal + `-u` parity (#421)."""
+class TestRebaseSnapshotCow(TestRebaseSmoke):
+    """Safe-mode overlay-snapshot COW parity vs qemu + `-u` parity (#421).
+
+    Phase 7 step 7c lifts the interim phase-2 refusal gate: a
+    safe-mode rebase of a snapshot-bearing overlay now succeeds by
+    copy-on-write instead of refusing. The proof is qemu-parity,
+    NOT before/after byte identity (C11): the rebased overlay's
+    active view is `qemu-img compare`-identical to a `qemu-img
+    rebase` (safe) twin and `qemu-img check`-clean — no
+    `refcount=1 reference=2` (the #421 signature) and no leaks
+    (C5) — and every pre-existing snapshot's virtual view (via the
+    snapshot read-back oracle) equals the qemu twin's read-back
+    (C7). rebase's snapshot semantic is the OPPOSITE of commit's:
+    qemu's safe-rebase contract covers the active view only, so a
+    snapshot's unallocated ranges silently read through the NEW
+    backing afterwards — the read-back expected value is the
+    snapshot read THROUGH base_new, matching qemu, never the
+    snapshot's pre-rebase content.
+    """
 
     def setUp(self):
         super().setUp()
@@ -756,17 +774,21 @@ class TestRebaseSnapshotGate(TestRebaseSmoke):
             f'{argv[0]} failed: argv={argv!r} stderr={r.stderr!r}')
         return r
 
-    def _build_bases(self, fixture_dir):
+    def _build_bases(self, fixture_dir, cluster_size=65536):
         """Create the phase-1 Q2 backing pair in `fixture_dir`.
 
         base_old.qcow2 (6M, 0x11 at [0,4M)) and base_new.qcow2
-        (6M, 0x22 at [2M,6M)), both at 64K clusters. Idempotent
+        (6M, 0x22 at [2M,6M)), both at `cluster_size`. Idempotent
         so twin overlays can share one pair (identical
         `full-backing-filename` keeps the info JSONs
-        comparable).
+        comparable). `cluster_size=512` drives the COW schedule
+        across a refcount-refblock boundary (the growth/relocation
+        path, C9) and exercises the cs=512 walk that had the #422
+        livelock (fixed in phase 2 — must not regress/hang).
         """
         fixture_dir = Path(fixture_dir)
         fixture_dir.mkdir(parents=True, exist_ok=True)
+        opt = f'cluster_size={cluster_size}'
         for name, pattern in (
                 ('base_old.qcow2', 'write -P 0x11 0 4M'),
                 ('base_new.qcow2', 'write -P 0x22 2M 4M')):
@@ -774,17 +796,18 @@ class TestRebaseSnapshotGate(TestRebaseSmoke):
                 continue
             self._run_tool(
                 ['qemu-img', 'create', '-f', 'qcow2',
-                 '-o', 'cluster_size=65536', name, '6M'],
+                 '-o', opt, name, '6M'],
                 fixture_dir)
             self._run_tool(
                 ['qemu-io', '-f', 'qcow2', '-c', pattern, name],
                 fixture_dir)
         return fixture_dir / 'base_old.qcow2', fixture_dir / 'base_new.qcow2'
 
-    def _build_overlay(self, fixture_dir, name, post_snapshot_write):
+    def _build_overlay(self, fixture_dir, name, post_snapshot_write,
+                       cluster_size=65536):
         """Create a snapshot-bearing Q2 overlay on base_old.qcow2.
 
-        6M overlay at 64K clusters backed by base_old.qcow2
+        6M overlay at `cluster_size` backed by base_old.qcow2
         (relative name), 0x33 at [1M,2M), then `snapshot -c
         snap1`. With `post_snapshot_write` a 0x44 write at
         [3M,4M) follows the snapshot, so the active L1 tree has
@@ -793,10 +816,10 @@ class TestRebaseSnapshotGate(TestRebaseSmoke):
         corrupts refcounts (issue #421).
         """
         fixture_dir = Path(fixture_dir)
+        opt = f'cluster_size={cluster_size}'
         self._run_tool(
             ['qemu-img', 'create', '-f', 'qcow2',
-             '-o', 'backing_file=base_old.qcow2,backing_fmt=qcow2,'
-                   'cluster_size=65536',
+             '-o', f'backing_file=base_old.qcow2,backing_fmt=qcow2,{opt}',
              name, '6M'],
             fixture_dir)
         self._run_tool(
@@ -834,63 +857,104 @@ class TestRebaseSnapshotGate(TestRebaseSmoke):
         raw.unlink()
         return digest
 
-    def test_refuse_safe_rebase_overlay_internal_snapshots(self):
-        """Safe-mode rebase of a snapshot-bearing overlay refuses.
+    # -- COW parity helpers ---------------------------------------------
 
-        Two shapes, both of which must refuse (the gate keys on
-        `nb_snapshots > 0`, not on whether metadata is actually
-        snapshot-shared):
+    def _assert_compare_identical(self, a, b):
+        """Assert `qemu-img compare` reports the two active views equal."""
+        r = subprocess.run(
+            ['qemu-img', 'compare', str(a), str(b)],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(
+            r.returncode, 0,
+            f'qemu-img compare {a} vs {b}: rc={r.returncode} '
+            f'stdout={r.stdout!r} stderr={r.stderr!r}')
 
-        1. snapshot-shared active L2 (psw=no, no write after the
-           snapshot) — the corrupting shape from phase-1 Q2:
-           safe mode writes new mappings into the shared L2 in
-           place and sets refcount=1 on clusters two L1 trees
-           reference; a later `qemu-img snapshot -d` frees live
-           active-view data (issue #421).
-        2. already-COWed active L2 (psw=yes, 0x44 write after
-           the snapshot) — phase 1 showed instar matching qemu
-           byte-identically here, but the gate refuses anyway.
+    def _assert_check_clean(self, image):
+        """Assert `qemu-img check` is clean — the #421 signature
+        (`refcount=1 reference=2`) and leaks are exactly what COW
+        must eliminate (C5)."""
+        r = subprocess.run(
+            ['qemu-img', 'check', str(image)],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(
+            r.returncode, 0,
+            f'qemu-img check {image} not clean: rc={r.returncode} '
+            f'stdout={r.stdout!r} stderr={r.stderr!r}')
+        self.assertNotIn(
+            'refcount=1 reference=2', r.stdout + r.stderr,
+            f'#421 signature present in check output for {image}')
 
-        qemu-img rebase proceeds on BOTH shapes (its contract
-        covers the active view only; the snapshot's virtual view
-        silently re-resolves through the new backing). Refusing
-        where qemu proceeds is the documented interim divergence
-        until phase 7's snapshot-aware COW lands.
+    def test_safe_rebase_overlay_internal_snapshots_cow(self):
+        """Safe-mode rebase of a snapshot-bearing overlay COWs (#421).
 
-        The refusal precedes all staging and writes, so the
-        overlay and both backings must be byte-unchanged.
+        Phase-1 Q2 showed this shape silently corrupted the
+        overlay's refcounts in v1 (safe mode wrote new mappings
+        into the snapshot-shared active L2 in place, leaving
+        `refcount=1 reference=2` on clusters two L1 trees
+        reference — a `qemu-img snapshot -d` later frees live
+        active-view data). Phase 7's COW copies the shared active
+        L2 (C2) instead, so that failure mode is structurally
+        unreachable. Over the Q2 matrix (cluster sizes {65536,
+        512}, the cs=512 leg crossing a refblock boundary to
+        exercise the growth/relocation path C9 and the walk that
+        had the #422 livelock; and with/without a post-snapshot
+        write that COWs the active L2 away from snap1's), an
+        instar-rebased overlay is compared against a `qemu-img
+        rebase` (safe) twin built from the identical seed:
+
+        - the rebase succeeds (rc 0, no hang — a #422 regression
+          would time out and return rc -1);
+        - C5: instar's rebased active view is `qemu-img compare`-
+          identical to the qemu twin and both are check-clean
+          (zero `refcount=1 reference=2`);
+        - C7: snap1's read-back equals the qemu twin's — the
+          snapshot reads THROUGH the NEW backing (base_new), the
+          opposite of commit's preserved semantic.
         """
-        for shape, post_write in (
-                ('snapshot-shared-l2', False),
-                ('post-snapshot-write', True)):
-            with self.subTest(shape=shape), \
-                    tempfile.TemporaryDirectory() as td:
-                fixture = Path(td) / 'fixture'
-                base_old, base_new = self._build_bases(fixture)
-                overlay = self._build_overlay(
-                    fixture, 'overlay.qcow2',
-                    post_snapshot_write=post_write)
-                before = {
-                    p: self.sha256(p)
-                    for p in (overlay, base_old, base_new)}
+        for cs in (65536, 512):
+            for psw in (False, True):
+                with self.subTest(cluster_size=cs, post_snapshot_write=psw), \
+                        tempfile.TemporaryDirectory() as td:
+                    fixture = Path(td) / 'fixture'
+                    self._build_bases(fixture, cluster_size=cs)
+                    overlay_i = self._build_overlay(
+                        fixture, 'overlay_i.qcow2',
+                        post_snapshot_write=psw, cluster_size=cs)
+                    overlay_q = self._build_overlay(
+                        fixture, 'overlay_q.qcow2',
+                        post_snapshot_write=psw, cluster_size=cs)
 
-                _, stderr, rc = self.run_instar_rebase(
-                    overlay, '-b', 'base_new.qcow2', '-F', 'qcow2',
-                    timeout=120)
-                self.assertNotEqual(
-                    rc, 0,
-                    f'expected safe-mode rebase of a snapshot-bearing '
-                    f'overlay ({shape}) to be refused; stderr={stderr!r}')
-                self.assertIn(
-                    'the overlay has internal snapshots; a safe-mode '
-                    'rebase would corrupt them. Use -u for a '
-                    'metadata-only rebase or fall back to '
-                    '`qemu-img rebase`',
-                    stderr, f'unexpected stderr: {stderr!r}')
-                for p, digest in before.items():
+                    _, stderr, rc = self.run_instar_rebase(
+                        overlay_i, '-b', 'base_new.qcow2', '-F', 'qcow2',
+                        timeout=180)
                     self.assertEqual(
-                        self.sha256(p), digest,
-                        f'a refused rebase must not touch {p.name}')
+                        rc, 0,
+                        f'COW safe-mode rebase of a snapshot-bearing '
+                        f'overlay failed (cs={cs} psw={psw}); '
+                        f'stderr={stderr!r}')
+
+                    # qemu twin: safe-mode rebase of the identical
+                    # seed onto the same new backing.
+                    self._run_tool(
+                        ['qemu-img', 'rebase', '-b', 'base_new.qcow2',
+                         '-F', 'qcow2', overlay_q.name],
+                        fixture, timeout=180)
+
+                    # C5: active-view parity + check clean.
+                    self._assert_compare_identical(overlay_i, overlay_q)
+                    self._assert_check_clean(overlay_i)
+                    self._assert_check_clean(overlay_q)
+
+                    # C7: snap1 reads through the NEW backing, equal
+                    # to the qemu twin's read-back.
+                    snap_i = snapshot_readback(
+                        'qemu-img', overlay_i, 'snap1')
+                    snap_q = snapshot_readback(
+                        'qemu-img', overlay_q, 'snap1')
+                    self.assertEqual(
+                        snap_i, snap_q,
+                        'C7: snap1 read-through-new-backing read-back must '
+                        'equal the qemu twin')
 
     def test_unsafe_rebase_overlay_internal_snapshots_matches_qemu(self):
         """`-u` rebase of a snapshot-bearing overlay matches qemu-img.
