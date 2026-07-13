@@ -232,3 +232,109 @@ d); plus:
 * The wgate-to-Gate code-equality mapping is pinned by a test,
   not assumed.
 * No qcow2-write/exec changes beyond 6a's scoped growth module.
+
+## Findings: 6p probes (2026-07-13)
+
+All eight 6p probes ran against the pre-migration dist (sha
+`f074b4f6…`, built at cde5164). Full report and the 98-row
+refusal inventory in scratchpad
+(`probes-6p-v2/FINDINGS.txt`, `refusal-inventory.tsv`); 6d folds
+the durable facts into quirks.md. Load-bearing results:
+
+1. **Determinism holds under host load** for all five schedule
+   classes (fresh-alloc, growth-reloc, overwrite-only,
+   overlay-COW, cadence) — so `after-x2-sha-equal` is a valid
+   bucket-(c) check. *Fixture caveat:* twin/overlay fixtures must
+   share ONE backing path, or the embedded backing-filename
+   string defeats sha comparison (bit us on the first overlay
+   attempt).
+2. **Fsync census matches decision 4 exactly:** 1 fsync per
+   cadence point; growth = 1 (in-place) / 2 (relocation); 0 at
+   end-of-bracket and for `--flush-interval 0`. Confirmed by
+   strace. `flushes_issued` counts ONLY cadence points, never
+   growth fsyncs (e.g. relocation growth: `flushes_issued`=0 vs
+   strace fsyncs=2). 6b's flush-census test must keep the split:
+   `flushes_issued == total_flushes(count,interval)` and (if
+   counting) `fsyncs == flushes_issued + growth_fsyncs(0|1|2)`.
+3. **Backed-overlay COW fill bytes pinned** (sub-cluster,
+   straddle, EOV-tail). EOV clamp zero-fills past virtual size;
+   `==modulus` offset wraps to 0 (worst_case_touched bound-2
+   treats it as wrap) — 6c fixtures must account for it. The
+   migrated try/refuse/fill/resubmit protocol must reproduce
+   these exact host-cluster layouts.
+4. **Growth RT-geometry deltas** captured for the two modes
+   (in-place: RT offset/clusters unchanged; relocation: both
+   change) — these are the bucket-(c) reference deltas 6c asserts.
+5. **Holed-RT** input: wire-3 (`ERROR_PARSE_FAILED`) refusal,
+   sha-UNCHANGED (pre-mutation). Bucket (d), sha-stable.
+6. **cs = 2 MiB** is a clean allocating success but has **no
+   growth path in-envelope** (one refblock covers 2 TiB) and the
+   bench bufsize cap == qcow2 format max (never spuriously
+   refuses). 6c has no 2 MiB growth combo to assert; carve
+   const-asserts must still keep ≥1 L2 slot at 2 MiB.
+7. **Compressed-after-growth is NOT sha-idempotent under
+   refusal:** zlib is not an incompatible-features header bit, so
+   the setup compression gate does not fire; preemptive growth
+   mutates the file, then the per-cluster run refuses at gate 2 →
+   sha changed. 6c refusal bucket (d) must pre-declare this combo
+   as recorded-not-sha-stable (verdict = rc/stderr identical +
+   check-clean, NOT sha-idempotent). The no-growth zlib control
+   IS sha-stable.
+8. **Zero-flag (#432):** decision-8's `UnknownL2Entry`→code-9
+   narrowing closes only the TARGET-side zero-flag entry
+   (Variant A); a zero flag in a BACKING cluster reached via the
+   COW read (Variant B) still mis-fills post-migration — #432 is
+   a read-path defect (crates/qcow2 cluster_lookup), unfixed by
+   phase 6. The B-D5 record must NOT over-claim that decision-8
+   eliminates zero-flag corruption for backed images.
+
+### New defect #433 — fixed pre-6b (decision: fix-first)
+
+6p found a previously-unfiled defect (filed as
+[#433](https://github.com/shakenfist/instar/issues/433)): an
+**overwrite-dominant schedule that also crosses the preemptive
+growth threshold** provisions refcount blocks and writes their RT
+pointers, but the run allocates nothing, so
+`flush_dirty_refblocks` (writes only DIRTY blocks) never
+materializes them — the RT ends up referencing refcount blocks
+past EOF. Silent (exit 0), `qemu-img check`-dirty on a
+check-clean input; repairable by `check -r` but a later allocator
+could double-allocate. Not covered by #427–#432.
+
+Per the fix-first decision, the root-cause fix (materialize every
+RT-referenced refblock during growth — restores qemu's
+allocated-blocks invariant, rides the existing growth fsync so the
+census is unchanged) lands as a **standalone commit on the current
+bench code before 6b**, with a regression test for the
+overwrite-only ∩ growth corner. Consequences for the rest of
+phase 6:
+
+* **The before-dist is rebuilt at the fix commit** (not cde5164);
+  6b's migration proof is before-FIXED vs after-migrated.
+* **The overwrite-only ∩ growth corner is check-clean after the
+  fix, so it is NOT quarantined** — it becomes a normal proof
+  combo. Because the run is overwrite-only (no data allocation),
+  B-D1's alloc-order swap does not apply, so it is expected
+  byte-IDENTICAL across the migration (bucket b, with the growth
+  metadata included), and check-clean (bucket c assertions hold).
+* 6b migrates the CORRECTED growth execution as the "byte-identical
+  pure move" (B-D8) — the fix is inside the code B-D8 covers, so
+  faithful migration preserves the fix.
+
+### Bucket mapping (6p-informed, for 6c's in-code buckets)
+
+* **(a) controls** — raw `-w`, read runs, cs=2 MiB cap-boundary
+  success: full byte identity across versions.
+* **(b) overwrite-only (no growth, or post-#433-fix
+  overwrite∩growth)** — byte-identical across versions.
+* **(c) allocating** (fresh + growth + overlay-COW): determinism
+  + `qemu-img compare` content-equal + check-clean + normalised
+  info + `flushes_issued` identity + (growth) identical
+  RT-geometry deltas. NOT sha-equal across versions (B-D1
+  alloc-order swap).
+* **(d) refusals**: identical rc/stderr + sha-unchanged where
+  today's refusal is pre-mutation (holed-RT wire-3;
+  compressed-no-growth gate-2). Compressed-AFTER-growth gate-2 is
+  recorded-not-sha-stable. Zero-flag → post-migration code-9
+  refusal (Variant A) or persistent #432 read-path corruption
+  (Variant B).
