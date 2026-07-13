@@ -1270,33 +1270,46 @@ class TestBenchWriteRefusals(BenchTestBase):
                 'bench: write tests are not supported for this image '
                 '(dirty or corrupt)')
 
-    def test_refuse_zero_flag_l2_entry(self):
-        """Issue #432 / decision 8, Variant A: a v3 all-zeroes-flag L2
-        entry in the TARGET image is refused, not blind-allocated over.
+    def test_zero_flag_l2_target_allocates_matches_qemu(self):
+        """A v3 all-zeroes-flag L2 entry in the TARGET image is now
+        allocated over, matching qemu -- not refused.
 
-        `qemu-io write -z 0 <cluster>` sets the QCOW_OFLAG_ZERO (bit 0)
-        on the first cluster's L2 entry without allocating a host
-        cluster. The pre-migration bench blind-allocated over such an
-        entry and chain-filled a pre-image the reader mis-handled
-        (#432 territory); the migrated path classifies it through the
-        crate as `UnknownL2Entry`, rendered as the appended bench wire
-        code 9 (`ERROR_IMAGE_INCONSISTENT`, host message "image
-        metadata is inconsistent"). The first scheduled write targets
-        offset 0 -> the zero-flag cluster, so the refusal fires before
-        any allocation, and the -c schedule's worst case fits the fresh
-        image's populated refblock coverage (no preemptive growth), so
-        the image is byte-unchanged.
+        `qemu-io write -z 0 65536` sets QCOW_OFLAG_ZERO (bit 0) on
+        cluster 0's L2 entry without allocating a host cluster
+        (host_offset == 0). Phase 6 (decision 8) refused such a target
+        as `UnknownL2Entry` -> bench wire code 9 -- a conservative
+        interim while the crate had no zero-flag handling. Phase 7
+        (step 7a, decision 6, alongside the #432 read-path fix)
+        classifies a host==0 zero-flag target as `Unallocated` and
+        allocates a fresh cluster, exactly as qemu does when writing
+        into a zero cluster. A `-w` schedule that covers cluster 0
+        therefore succeeds, and the result is `qemu-img compare`
+        identical to a qemu twin and `qemu-img check` clean.
         """
         self._require_kvm()
         with tempfile.TemporaryDirectory() as td:
-            img = Path(td) / 'zeroflag.qcow2'
-            # A v3 (compat=1.1) image so the zero flag is legal; the
-            # default cluster size keeps the schedule inside cluster 0.
-            self.make_qcow2(img, size='16M')
-            self._qemu_io(img, 'write -z 0 65536')
-            self._assert_write_refused(
-                img, 'qcow2',
-                'bench: image metadata is inconsistent')
+            td = Path(td)
+            pristine = td / 'zeroflag.qcow2'
+            # A v3 (compat=1.1) image so the zero flag is legal.
+            self.make_qcow2(pristine, size='16M')
+            self._qemu_io(pristine, 'write -z 0 65536')
+            a = td / 'a.qcow2'
+            b = td / 'b.qcow2'
+            shutil.copy2(pristine, a)
+            shutil.copy2(pristine, b)
+            # The default 4096-byte writes cover [0, 409600), so the
+            # first writes land in cluster 0 -- the zero-flag entry.
+            args = ['-w', '-c', '100', '--pattern', '65', '-f', 'qcow2']
+
+            i_out, i_err, i_rc = self.run_instar_bench(*args, str(a))
+            self.assertEqual(i_rc, 0, f'instar: {i_err}')
+            q_out, q_err, q_rc = self.run_qemu_bench(*args, str(b))
+            self.assertEqual(q_rc, 0, f'qemu: {q_err}')
+
+            cmp_out, cmp_err, cmp_rc = self.run_qemu_img_compare(a, b)
+            self.assertEqual(cmp_rc, 0, f'compare mismatch: {cmp_out}{cmp_err}')
+            chk_out, chk_err, chk_rc = self.run_qemu_img_check(a)
+            self.assertEqual(chk_rc, 0, f'check failed: {chk_out}{chk_err}')
 
     def test_refuse_vmdk(self):
         """Host-side format gate; no guest launch, no /dev/kvm needed."""
