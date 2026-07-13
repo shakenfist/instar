@@ -976,8 +976,9 @@ overlays were silently corrupted at exit 0 (the walk misread
 (`ERROR_OVERLAY_UNSUPPORTED`), which also adds the
 spec-mandated zstd/unknown-incompatible-bit refusal — a
 today-succeeds→refuses narrowing (the bit is inert without
-compressed clusters), accepted and documented. Issue drafts
-for both are pending the user's filing decision.
+compressed clusters), accepted and documented. Filed 2026-07-13 as
+[#430](https://github.com/shakenfist/instar/issues/430) and
+[#431](https://github.com/shakenfist/instar/issues/431).
 (3) The qcow2 chain reader ignores the zero flag on classic
 L2 entries: `cluster_lookup`'s classic arm
 (src/crates/qcow2/src/lib.rs:2213-2238) ignores bit 0, so a
@@ -985,7 +986,8 @@ v3 zero-flag cluster in a chain member reads as fall-through
 or stale bytes instead of zeros — silent active-view
 corruption, blast radius rebase / convert / compare / bench.
 Pre-existing `crates/qcow2` defect, explicitly NOT fixed by
-phase 5 (issue draft pending the user's filing decision);
+phase 5 (filed 2026-07-13 as
+[#432](https://github.com/shakenfist/instar/issues/432));
 phases 6+ or a standalone fix must address it, and until
 then differential matrices must avoid `write -z` seeds (5b's
 does).
@@ -1167,14 +1169,16 @@ scope (details and repro recipes in the Findings sections;
    at exit 0 in the probe; the #428 recipe self-masks on
    qemu ≥ 10 and needs the adapted recipe in the phase-5
    findings). **Refused since the phase-5 migration (cfb86f9,
-   error 16, pre-mutation, byte-idempotent)**; issue draft
-   pending the user's filing decision.
+   error 16, pre-mutation, byte-idempotent)**; filed
+   2026-07-13 as
+   [#430](https://github.com/shakenfist/instar/issues/430).
 8. `instar rebase` (safe mode) silently corrupted extended-L2
    overlays — the walk misread 16-byte extended-L2 entries as
    8-byte classic entries, corrupting virtual content at
    exit 0 (found by phase 5p). **Refused since the phase-5
-   migration (cfb86f9, error 15, pre-mutation)**; issue draft
-   pending the user's filing decision.
+   migration (cfb86f9, error 15, pre-mutation)**; filed
+   2026-07-13 as
+   [#431](https://github.com/shakenfist/instar/issues/431).
 9. The `crates/qcow2` chain reader ignores the zero flag on
    classic L2 entries (`cluster_lookup`'s classic arm ignores
    bit 0), so v3 zero-flag clusters in a chain member read as
@@ -1184,8 +1188,8 @@ scope (details and repro recipes in the Findings sections;
    phase 5** (pre-existing chain-read behaviour, explicitly
    out of the migration's scope); phases 6+ or a standalone
    fix must address it, and differential matrices must avoid
-   `write -z` seeds until then. Issue draft pending the
-   user's filing decision.
+   `write -z` seeds until then. Filed 2026-07-13 as
+   [#432](https://github.com/shakenfist/instar/issues/432).
 
 Fix status is tracked here as phases land.
 

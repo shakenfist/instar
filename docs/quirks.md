@@ -1357,8 +1357,10 @@ The extended-L2 half is a live-defect fix: before phase 5
 the safe-mode walk misread the 16-byte extended-L2 entries
 as 8-byte classic entries and silently corrupted the
 overlay's virtual content — exit 0, damage visible only on
-read-back (identified during phase 5 of
-PLAN-qcow2-write-infrastructure; issue draft pending). The
+read-back (issue
+[#431](https://github.com/shakenfist/instar/issues/431),
+identified during phase 5 of
+PLAN-qcow2-write-infrastructure). The
 zstd/unknown-bit half is spec-mandated (the qcow2 spec
 requires refusing unknown incompatible bits) and is a
 narrowing: the zstd bit is inert when the image contains no
@@ -1391,9 +1393,11 @@ before phase 5 rebase's staging compacted the nonzero table
 entries and indexed them as if dense — silently writing
 refcounts into the wrong refblocks (1092 check errors plus
 32 leaked clusters at exit 0 in the probe that found it;
-the overlay-side rebase sibling of #428, identified during
-phase 5 of PLAN-qcow2-write-infrastructure; issue draft
-pending). qemu-img rebases the same shape check-clean. The
+the overlay-side rebase sibling of #428; issue
+[#430](https://github.com/shakenfist/instar/issues/430),
+identified during phase 5 of
+PLAN-qcow2-write-infrastructure). qemu-img rebases the same
+shape check-clean. The
 refusal fires at staging time, before any mutation, and is
 byte-idempotent
 (`tests/test_rebase.py:TestRebaseOverlayClassification`).
@@ -1458,9 +1462,11 @@ chain member reads as fall-through to the backing or as
 stale data bytes instead of zeros — silent active-view
 corruption. Blast radius: every consumer of the chain
 reader — rebase, convert, compare and bench. Pre-existing
-`crates/qcow2` defect, identified during phase 5 of
+`crates/qcow2` defect
+([#432](https://github.com/shakenfist/instar/issues/432)),
+identified during phase 5 of
 PLAN-qcow2-write-infrastructure and explicitly NOT fixed by
-it (issue draft pending); differential matrices avoid
+it; differential matrices avoid
 `write -z` seeds until it is fixed. (The map subcommand's
 sibling quirk "qcow2 v3 standard-L2 `QCOW_OFLAG_ZERO` not
 honoured" above is the read-only view of the same gap.)
