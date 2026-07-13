@@ -34,11 +34,13 @@ use qcow2::{
     QcowHeader, INCOMPAT_CORRUPT, INCOMPAT_DIRTY, INCOMPAT_EXTENDED_L2, INCOMPAT_EXTERNAL_DATA,
     L1_OFFSET_MASK, L2_OFFSET_MASK, OFLAG_COMPRESSED,
 };
+use qcow2_write::growth::{plan_refcount_growth, GrowthCaps, GrowthOverflow};
 use qcow2_write::{
-    check_envelope, new_state, plan_flush, plan_write, DataSource, Gate, RegionId, StagedRegions,
-    StagingConfig, Step, StepBuf, StepKind, TargetDevice, WriteError, WriteState, MAX_L2_SLOTS,
+    check_envelope_with, new_state_cow, plan_flush, plan_write, DataSource, Gate, RegionId,
+    StagedRegions, StagingConfig, Step, StepBuf, StepKind, TargetDevice, WriteError, WriteState,
+    MAX_L2_SLOTS,
 };
-use qcow2_write_exec::{execute, CallTableIo, Regions};
+use qcow2_write_exec::{execute, growth, CallTableIo, Regions};
 use shared::{
     format_detection::detect_format_from_header, validate_call_table, CallTable, CommitConfig,
     CommitResult, ImageFormat, CALL_TABLE_ADDR, MAX_SECTOR_SIZE, OPERATION_CONFIG_ADDR,
@@ -300,6 +302,23 @@ fn map_write_error(e: WriteError) -> u32 {
         | WriteError::NotImplemented
         | WriteError::OutOfBounds
         | WriteError::ResumeMismatch => CommitResult::ERROR_INTERNAL_OVERFLOW,
+    }
+}
+
+/// Map a shared [`growth::grow_refcounts`] failure to a
+/// `CommitResult::ERROR_*` wire code (phase 7, decision 5).
+/// `StageOutOfCoverage` is the planner's self-coverage-invariant
+/// internal-bug path (the `*_INCONSISTENT` family, decision 7); a
+/// device write failure keeps the code the executor's own window
+/// writes use (`ERROR_HEADER_MISMATCH`). `FsyncFailed` cannot
+/// arise on the fsync-less Output device (its barriers degrade to
+/// Ordering), and is mapped defensively.
+fn map_growth_error(e: growth::GrowthExecError) -> u32 {
+    match e {
+        growth::GrowthExecError::StageOutOfCoverage => CommitResult::ERROR_BACKING_INCONSISTENT,
+        growth::GrowthExecError::WriteFailed | growth::GrowthExecError::FsyncFailed => {
+            CommitResult::ERROR_HEADER_MISMATCH
+        }
     }
 }
 
@@ -791,6 +810,51 @@ unsafe fn init_step_storage() -> &'static mut [Step] {
     core::slice::from_raw_parts_mut(ptr, STEP_CAPACITY)
 }
 
+/// Cluster-aligned current file end of the backing, derived from
+/// its staged refcount structures — the commit-side analogue of
+/// bench's `derive_file_end_clusters`, the base the
+/// refcount-growth planner grows from (C9). Considers (a) the
+/// highest staged refblock entry with a nonzero refcount, (b) the
+/// refcount table's extent, (c) the L1 table's extent, (d) each
+/// populated refblock cluster's own offset, and (e) the header
+/// cluster (always present).
+///
+/// # Safety
+///
+/// The backing refblock (`BACKING_REFBLOCKS_BUF`) and refcount
+/// table (`BACKING_RT_BUF`) scratch must be staged and unused by
+/// any live borrow.
+unsafe fn backing_file_end_clusters(carve: &BackingCarve, backing: &QcowHeader) -> u64 {
+    let cs = carve.cluster_size as u64;
+    let refblock_count = carve.rb_bytes / carve.cluster_size;
+    let refblocks = core::slice::from_raw_parts(BACKING_REFBLOCKS_BUF as *const u8, carve.rb_bytes);
+    let rt = core::slice::from_raw_parts(BACKING_RT_BUF as *const u8, carve.rt_bytes);
+    // refcount_bits is validated == 16.
+    let entries_per_refblock = (cs * 8 / 16) as usize;
+    let mut end: u64 = 1;
+    for slot in 0..refblock_count {
+        let block = &refblocks[slot * carve.cluster_size..(slot + 1) * carve.cluster_size];
+        for e in 0..entries_per_refblock {
+            if block[e * 2] != 0 || block[e * 2 + 1] != 0 {
+                end = end.max(slot as u64 * entries_per_refblock as u64 + e as u64 + 1);
+            }
+        }
+    }
+    let rt_end = backing
+        .refcount_table_offset
+        .saturating_add((backing.refcount_table_clusters as u64).saturating_mul(cs));
+    end = end.max(rt_end.div_ceil(cs));
+    let l1_end = backing
+        .l1_table_offset
+        .saturating_add((backing.l1_size as u64).saturating_mul(8));
+    end = end.max(l1_end.div_ceil(cs));
+    for slot in 0..refblock_count {
+        let off = read_u64_be(rt, slot * 8) & L1_OFFSET_MASK;
+        end = end.max(off / cs + 1);
+    }
+    end
+}
+
 // ---------------------------------------------------------------------------
 // qcow2 commit runner
 // ---------------------------------------------------------------------------
@@ -855,44 +919,46 @@ unsafe fn run_qcow2(call_table: &CallTable, config: &CommitConfig) -> CommitResu
     if overlay.refcount_bits != 16 || backing.refcount_bits != 16 {
         return err(config, CommitResult::ERROR_UNSUPPORTED_FORMAT);
     }
-    // Interim phase-2 gates: internal snapshots on EITHER side
-    // are refused before any staging or mutation.
+    // Phase 7 COW adoption (decision 4a, GitHub #420/#423): the
+    // interim phase-2 nb_snapshots gates that refused BOTH sides
+    // are lifted here. The backing side (#420) is now handled by
+    // copy-on-write: `new_state_cow` + `check_envelope_with(..,
+    // allow_snapshots = true)` below let the qcow2-write
+    // classifier emit COW steps for snapshot-shared data
+    // clusters (C1) and L2 tables (C2) instead of overwriting
+    // them in place, and the shared refcount-growth planner
+    // provisions the extra refblocks the COW allocations need
+    // (C9). Every pre-existing backing snapshot is preserved
+    // bit-identically (C6), matching `qemu-img commit`.
     //
-    // Backing (GitHub issue #420): committing into a backing
-    // with internal snapshots silently corrupts them (v1
-    // overwrites snapshot-shared data clusters in place and
-    // allocates through snapshot-shared L2 tables without COW).
-    //
-    // Overlay (issue #423, the overlay-side sibling of issue
-    // #420): the post-commit overlay-clear pass zeroes
-    // active L2 entries and decrements the referenced data
-    // clusters without accounting for the snapshot's reference,
-    // leaving snapshot-shared clusters at refcount=0
-    // reference=1. Phase 1's second-order probe missed this
-    // (exit code and snapshot read-back agree with qemu); the
-    // phase-2 step-2a parity test proved the resulting overlay
-    // is check-dirty where qemu's is clean.
-    //
-    // The real fix for both sides (snapshot-aware COW and
-    // refcounting) lands in phase 7 of
-    // PLAN-qcow2-write-infrastructure.
-    if backing.nb_snapshots > 0 {
-        return err(config, CommitResult::ERROR_BACKING_HAS_SNAPSHOTS);
-    }
-    if overlay.nb_snapshots > 0 {
-        return err(config, CommitResult::ERROR_OVERLAY_HAS_SNAPSHOTS);
-    }
+    // The overlay side (#423) is handled without COW on the
+    // overlay device: qemu preserves an overlay's internal
+    // snapshots on commit (Q1 second-order probe), and the
+    // corruption the phase-2 gate guarded against was the
+    // post-commit clear pass zeroing snapshot-shared active L2
+    // entries + refcounts in place. The clear pass is skipped
+    // when the overlay carries snapshots (see the clear-pass
+    // guard below), so the overlay is left byte-unchanged and
+    // its snapshots preserved; the active view still resolves to
+    // the freshly-committed backing content (identical to qemu's
+    // emptied overlay under `qemu-img compare`; C11 — byte
+    // placement is not part of the COW proof). The
+    // `*_HAS_SNAPSHOTS` wire codes + host messages are retained
+    // for defensive/non-COW callers but no longer fire here.
     if backing.virtual_size < overlay.virtual_size {
         return err(config, CommitResult::ERROR_OVERLAY_LARGER_THAN_BACKING);
     }
 
-    // qcow2-write envelope on the BACKING (phase-4 decision 6):
-    // runs after the op gates above, which cover every Gate
-    // except UnknownIncompatible with their existing codes —
-    // so the only refusal this can add is the zstd/unknown
-    // incompatible-bit gate (ERROR_BACKING_UNSUPPORTED). Before
-    // any staging or mutation.
-    if let Err(gate) = check_envelope(&backing) {
+    // qcow2-write envelope on the BACKING (phase-4 decision 6;
+    // phase-7 decision 4b): `allow_snapshots = true` relaxes the
+    // `Gate::HasSnapshots` refusal so a snapshot-bearing backing
+    // reaches the COW planner. Every other gate is unconditional,
+    // and the op gates above cover them with their existing
+    // codes, so the only refusal this can still add is the
+    // zstd/unknown incompatible-bit gate
+    // (ERROR_BACKING_UNSUPPORTED). Before any staging or
+    // mutation.
+    if let Err(gate) = check_envelope_with(&backing, true) {
         return err(config, map_backing_gate(gate));
     }
 
@@ -963,7 +1029,7 @@ unsafe fn run_qcow2(call_table: &CallTable, config: &CommitConfig) -> CommitResu
     // contiguity-gated (phase-4 decision 4). Backing L2 tables
     // are no longer staged eagerly: the qcow2-write planner
     // loads them into the fixed-slot window on demand.
-    let carve = match stage_backing_qcow2(call_table, sector_size, &backing) {
+    let mut carve = match stage_backing_qcow2(call_table, sector_size, &backing) {
         Ok(c) => c,
         Err(code) => return err(config, code),
     };
@@ -974,7 +1040,10 @@ unsafe fn run_qcow2(call_table: &CallTable, config: &CommitConfig) -> CommitResu
         max_refblocks: qcow2_write::MAX_REFBLOCKS,
         device: TargetDevice::Output,
     };
-    let mut wstate: WriteState = match new_state(&backing, &staging_config) {
+    // COW-enabled (decision 4b): snapshot-shared backing data
+    // clusters (C1) and L2 tables (C2) classify into COW
+    // emission instead of refusing.
+    let mut wstate: WriteState = match new_state_cow(&backing, &staging_config) {
         Ok(s) => s,
         Err(gate) => return err(config, map_backing_gate(gate)),
     };
@@ -983,8 +1052,129 @@ unsafe fn run_qcow2(call_table: &CallTable, config: &CommitConfig) -> CommitResu
     // Input slot 0 (the overlay) is opened RW by the host, so
     // it has the fsync capability; commit's programs only emit
     // barriers on the Output device, which degrade to Ordering
-    // (divergence D8 — zero fsyncs, exactly as before).
+    // (divergence D8 — zero fsyncs, exactly as before). The COW
+    // refcount-growth pass (below) shares this `io`; the
+    // fsync-less Output degrades its durability barriers the
+    // same way.
     let mut io = CallTableIo::new(call_table, true);
+
+    // ----- Preemptive refcount growth (C9, decisions 3 & 5) --
+    // COW allocates at most one new data cluster plus one new L2
+    // table per touched snapshot-shared cluster; an L2 table is
+    // COWed once and shared by up to `entries_per_l2` clusters,
+    // so `2 * allocated_overlay_clusters` bounds the new
+    // clusters. Provision the refblock coverage the worst case
+    // needs BEFORE the write bracket so a COW schedule crossing
+    // a refblock boundary grows instead of RefcountExhausting
+    // (the 7p refinement — count refblock growth even when the
+    // refcount table itself does not grow — is inherent to
+    // `plan_refcount_growth`). Dormant when nothing is shared:
+    // a non-snapshot commit allocates only fresh clusters, whose
+    // coverage the staged refblocks already provide, so
+    // `new_refblocks == 0` and this is a no-op (C12).
+    {
+        let overlay_l1 = core::slice::from_raw_parts(
+            OVERLAY_L1_BUF as *const u8,
+            (overlay.l1_size as usize) * 8,
+        );
+        let mut allocated_overlay: u64 = 0;
+        for cluster_idx in 0..ctx.overlay_cluster_count {
+            let l1_idx = cluster_idx / entries_per_l2;
+            if l1_idx >= overlay.l1_size as u64 {
+                break;
+            }
+            let l1_entry = read_u64_be(overlay_l1, (l1_idx as usize) * 8);
+            if (l1_entry & L1_OFFSET_MASK) == 0 {
+                continue;
+            }
+            let slot = match find_staged_l2(&overlay_staged_l2, overlay_staged_count, l1_idx as u32)
+            {
+                Some(s) => s,
+                None => continue,
+            };
+            let l2_slice = core::slice::from_raw_parts(
+                (OVERLAY_L2_STAGING + slot * cluster_size_usize) as *const u8,
+                cluster_size_usize,
+            );
+            let e = read_u64_be(l2_slice, ((cluster_idx % entries_per_l2) as usize) * 8);
+            if e == 0 || e & OFLAG_COMPRESSED != 0 {
+                continue;
+            }
+            if e & L2_OFFSET_MASK != 0 {
+                allocated_overlay += 1;
+            }
+        }
+        let worst_case_new = allocated_overlay.saturating_mul(2);
+
+        // entries_per_refblock = cluster_size * 8 / refcount_bits;
+        // refcount_bits is validated == 16 above.
+        let entries_per_refblock = cluster_size * 8 / 16;
+        let refblock_count = carve.rb_bytes / cluster_size_usize;
+        let file_end = backing_file_end_clusters(&carve, &backing);
+        let rt_capacity_slots =
+            (backing.refcount_table_clusters as u64).saturating_mul(cluster_size) / 8;
+        let caps = GrowthCaps {
+            max_refblocks: qcow2_write::MAX_REFBLOCKS as u64,
+            max_refblock_clusters: (BACKING_REFBLOCKS_LIMIT / cluster_size_usize) as u64,
+            max_rt_slots: (BACKING_RT_LIMIT / 8) as u64,
+        };
+        let plan = match plan_refcount_growth(
+            entries_per_refblock,
+            cluster_size,
+            file_end,
+            refblock_count as u64,
+            rt_capacity_slots,
+            worst_case_new,
+            &caps,
+        ) {
+            Ok(p) => p,
+            Err(GrowthOverflow) => return err(config, CommitResult::ERROR_REFCOUNT_EXHAUSTED),
+        };
+        if plan.new_refblocks > 0 {
+            let mut exec =
+                growth::GrowthExec::new(cluster_size, entries_per_refblock, refblock_count);
+            let mut bufs = growth::GrowthBuffers {
+                refcount_table: core::slice::from_raw_parts_mut(
+                    BACKING_RT_BUF as *mut u8,
+                    BACKING_RT_LIMIT,
+                ),
+                refblocks: core::slice::from_raw_parts_mut(
+                    BACKING_REFBLOCKS_BUF as *mut u8,
+                    BACKING_REFBLOCKS_LIMIT,
+                ),
+                rmw_sector: core::slice::from_raw_parts_mut(
+                    RMW_SECTOR as *mut u8,
+                    RMW_SECTOR_LIMIT,
+                ),
+            };
+            let rt_table = growth::RefcountTable {
+                offset: backing.refcount_table_offset,
+                clusters: backing.refcount_table_clusters,
+            };
+            if let Err(e) = growth::grow_refcounts(
+                &mut io,
+                TargetDevice::Output,
+                &mut exec,
+                &plan,
+                rt_table,
+                &mut bufs,
+            ) {
+                return err(config, map_growth_error(e));
+            }
+            // The staged refblock prefix (and, on the relocating
+            // path, the refcount table) grew: widen the carve so
+            // the planner's `staged_view` exposes the new
+            // structures. grow_refcounts already flipped the disk
+            // RT pointer, so plan_flush's refblock write-backs
+            // resolve through the updated staged RT.
+            carve.rb_bytes = exec.refblock_count() * cluster_size_usize;
+            if plan.new_rt_clusters > 0 {
+                carve.rt_bytes = (backing.refcount_table_clusters as u64 + plan.new_rt_clusters)
+                    as usize
+                    * cluster_size_usize;
+            }
+        }
+    }
 
     // ----- Per-cluster commit loop --------------------------
     let mut clusters_committed: u64 = 0;
@@ -1132,12 +1322,29 @@ unsafe fn run_qcow2(call_table: &CallTable, config: &CommitConfig) -> CommitResu
     // know nothing has mutated the staged overlay L1 / L2
     // bytes during the data loop, so this is a straight
     // re-traversal.
+    //
+    // Phase 7 (#423): SKIPPED when the overlay carries internal
+    // snapshots. A snapshot shares the active L2 tables and data
+    // clusters (refcount >= 2, OFLAG_COPIED clear), so zeroing an
+    // active L2 entry or its refcount in place would corrupt the
+    // snapshot's view — exactly the #423 defect. qemu preserves
+    // overlay snapshots on commit; leaving the overlay
+    // byte-unchanged preserves them too, and its active view
+    // still resolves the committed clusters to the identical
+    // just-written backing content (qemu-compare-clean; byte
+    // placement is not part of the COW proof, C11). A full
+    // qemu-parity emptying would require COW on the overlay
+    // (Input0) device, which the phase-7a crate does not provide.
     let overlay_rt = core::slice::from_raw_parts(OVERLAY_RT_BUF as *const u8, overlay_rt_size);
     let overlay_entries_per_refblock = ctx.overlay_entries_per_refblock;
     let mut overlay_clusters_cleared: u64 = 0;
     let zeros_8 = [0u8; 8];
     let zeros_2 = [0u8; 2];
+    let clear_overlay = overlay.nb_snapshots == 0;
     for cluster_idx in 0..ctx.overlay_cluster_count {
+        if !clear_overlay {
+            break;
+        }
         let l1_idx = cluster_idx / entries_per_l2;
         let l2_inner_idx = (cluster_idx % entries_per_l2) as usize;
         if l1_idx >= overlay.l1_size as u64 {
