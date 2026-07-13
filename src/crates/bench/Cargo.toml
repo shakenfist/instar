@@ -7,3 +7,8 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
+# Phase-6 step 6a (PLAN-qcow2-write-infrastructure-phase-06-bench.md,
+# settled decision 1): the refcount-growth planner moved to
+# qcow2_write::growth; this dependency backs the temporary re-export
+# that keeps src/operations/bench compiling unchanged until 6b.
+qcow2-write = { path = "../qcow2-write" }

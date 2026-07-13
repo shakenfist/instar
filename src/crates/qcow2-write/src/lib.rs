@@ -66,6 +66,12 @@
 
 #![no_std]
 
+// ---------------------------------------------------------------------------
+// Modules
+// ---------------------------------------------------------------------------
+
+pub mod growth;
+
 use qcow2::{QcowHeader, L1_OFFSET_MASK, L2_OFFSET_MASK, OFLAG_COMPRESSED, OFLAG_COPIED};
 use snapshot::qcow2::{alloc_cluster_in_refblocks, read_refcount_in_block, AllocCursor};
 use snapshot::SnapshotError;
