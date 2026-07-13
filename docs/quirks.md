@@ -1341,6 +1341,130 @@ it stays allowed on snapshot-bearing overlays and carries a
 parity test against qemu-img (exit codes, check-clean,
 info-equivalence, identical snapshot read-back).
 
+### Overlays with extended L2 entries or unknown/compression feature bits are refused
+
+Since the phase-5 migration onto `crates/qcow2-write`,
+safe-mode rebase (including safe detach) refuses an overlay
+whose header carries the extended-L2 incompatible bit, the
+zstd compression-type bit, or any unknown
+incompatible-features bit (`RebaseResult` error 15): ``the
+overlay uses features instar rebase does not support
+(extended L2 entries, or unknown/compression feature bits).
+Use -u for a metadata-only rebase or fall back to `qemu-img
+rebase` ``.
+
+The extended-L2 half is a live-defect fix: before phase 5
+the safe-mode walk misread the 16-byte extended-L2 entries
+as 8-byte classic entries and silently corrupted the
+overlay's virtual content — exit 0, damage visible only on
+read-back (identified during phase 5 of
+PLAN-qcow2-write-infrastructure; issue draft pending). The
+zstd/unknown-bit half is spec-mandated (the qcow2 spec
+requires refusing unknown incompatible bits) and is a
+narrowing: the zstd bit is inert when the image contains no
+compressed clusters, so such images rebased correctly
+before phase 5 and now refuse — the same posture as
+commit's error 16. The refusal fires before any staging or
+mutation; `-u` metadata-only rebase only rewrites
+header/path bytes and stays allowed.
+
+### Overlays with inconsistent metadata are refused
+
+Safe-mode rebase refuses overlays whose metadata is
+inconsistent as a write substrate (`RebaseResult` error
+16): ``the overlay's metadata is inconsistent (refcounts,
+table flags or layout); refusing to write into it. Run
+`qemu-img check` on the overlay, or fall back to `qemu-img
+rebase` ``. This covers a sparse (holed) refcount table,
+reserved bits in refcount-table/L1/L2 entries, and
+qcow2-write classification refusals (snapshot-shared or
+refcount-inconsistent clusters on an image whose header
+says it has no snapshots).
+
+The sparse-refcount-table shape matters, exactly as it did
+for commit's backing side
+([#428](https://github.com/shakenfist/instar/issues/428)):
+it is stock-producible (a discard history followed by
+`qemu-img resize --shrink` frees all-zero refblocks below
+still-populated ones), passes `qemu-img check` cleanly, and
+before phase 5 rebase's staging compacted the nonzero table
+entries and indexed them as if dense — silently writing
+refcounts into the wrong refblocks (1092 check errors plus
+32 leaked clusters at exit 0 in the probe that found it;
+the overlay-side rebase sibling of #428, identified during
+phase 5 of PLAN-qcow2-write-infrastructure; issue draft
+pending). qemu-img rebases the same shape check-clean. The
+refusal fires at staging time, before any mutation, and is
+byte-idempotent
+(`tests/test_rebase.py:TestRebaseOverlayClassification`).
+
+### Overlay staging capacity widened by the phase-5 migration
+
+The migrated safe mode retires the stage-everything model
+for existing L2 tables (and with it the growable L2 arena
+and its count caps — the #422 hazard class of the arena
+clobbering refblock staging is gone by construction).
+Overlays whose populated-L2 count previously refused
+`ERROR_SCRATCH_TOO_SMALL` at staging time — even when
+nothing needed copying — now rebase: the probe exemplar
+(cs=512, 64 MiB overlay, 512 populated L2 tables, identical
+chains) refused before phase 5 and now succeeds check-clean
+with qemu-img parity. The L2 window is
+`min(256, 2 MiB / cluster_size)` slots with reachable (and
+safe) eviction; refblock staging is byte-capacity-driven at
+`min(2048, 3 MiB / cluster_size)` refblocks (formerly a
+joint 4 MiB bump arena shared with L2 staging); the
+refcount table stages as a bounded prefix (the planner
+reads only the entries covering the staged refblocks), so
+large-cluster refcount tables no longer bound the run. The
+remaining ceiling is refcount exhaustion (`RebaseResult`
+error 10 — v1 never appends new refblocks); retiring it is
+the master plan's refcount-growth generalization.
+
+### Beyond-EOV tail bytes of copied clusters are zeros
+
+When the old backing chain is LARGER than the overlay's
+virtual size and the tail cluster diverges, safe-mode
+rebase copies the tail cluster with bytes beyond
+end-of-virtual-size zero-filled. Both pre-phase-5 instar
+and `qemu-img rebase` instead carry the old chain's
+beyond-EOV bytes into the overlay's raw file. Virtual
+content is identical either way (bytes past EOV are not
+virtual content, and no tool reads them back); this is the
+one sanctioned raw-level divergence from the phase-5
+migration proof (divergence D9 — the only non-byte-identical
+row in the 69-combo matrix, isolated to this shape by its
+byte-identical plain-unaligned twin).
+
+### Compressed chain members still refuse where qemu succeeds
+
+A compressed cluster in an old-chain member surfaces
+`ERROR_PARSE_FAILED` (error 12) mid-loop — the rebase
+binary does not enable the decompress feature — where
+`qemu-img rebase` succeeds. Pre-existing divergence,
+unchanged by the phase-5 migration (lifting it means
+enabling decompression in the rebase binary, a size and
+scope question tracked as future work). Compressed entries
+in the OVERLAY itself are skipped, before and after
+phase 5: the skip probe treats any non-zero L2 entry as
+mapped.
+
+### The chain reader ignores the zero flag on classic L2 entries
+
+`cluster_lookup`'s classic (non-extended-L2) arm in
+`crates/qcow2` ignores bit 0 of v3 standard L2 entries, so
+a zero-flag cluster (e.g. from `qemu-io write -z`) in a
+chain member reads as fall-through to the backing or as
+stale data bytes instead of zeros — silent active-view
+corruption. Blast radius: every consumer of the chain
+reader — rebase, convert, compare and bench. Pre-existing
+`crates/qcow2` defect, identified during phase 5 of
+PLAN-qcow2-write-infrastructure and explicitly NOT fixed by
+it (issue draft pending); differential matrices avoid
+`write -z` seeds until it is fixed. (The map subcommand's
+sibling quirk "qcow2 v3 standard-L2 `QCOW_OFLAG_ZERO` not
+honoured" above is the read-only view of the same gap.)
+
 ### Deep-allocation safe rebase refuses on refcount exhaustion instead of hanging
 
 Issue #422's apparent 512-byte-cluster livelock was a guest

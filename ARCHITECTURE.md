@@ -274,14 +274,19 @@ provides a modular architecture with:
   Envelope gates (qcow2 v2/v3, 16-bit refcounts, no
   unknown-incompatible bits, no extended-L2 / external data /
   encryption, not dirty/corrupt, no internal snapshots) run at state
-  construction, so a gated image can never yield a write plan. The
-  commit op is the first consumer (phase 4, 2026-07-13): its qcow2
-  backing-side write path is planned by this crate and executed
-  through `crates/qcow2-write-exec`, proven byte-invisible by the
-  `scripts/migration-proof.py` before/after harness (73/73 fixture
-  combos byte-identical, 300-iteration differential fuzz clean).
-  Phases 5-6 migrate rebase safe mode and bench `-w`, and phase 7
-  adds copy-on-write.
+  construction, so a gated image can never yield a write plan. Two
+  ops consume it: commit (phase 4, 2026-07-13 — the qcow2
+  backing-side write path) and rebase safe mode including safe
+  detach (phase 5, 2026-07-13 — the overlay-side copy path, with an
+  op-side skip probe against original pre-run L2 state deciding
+  which clusters reach the planner at all). Both are planned by this
+  crate and executed through `crates/qcow2-write-exec`, proven
+  byte-invisible by the `scripts/migration-proof.py` before/after
+  harness (73/73 and 69/69 fixture combos byte-identical
+  respectively, 300-iteration differential fuzz clean each; rebase
+  carries one sanctioned beyond-EOV raw divergence with proven
+  virtual equality). Phase 6 migrates bench `-w` (absorbing its
+  refcount growth), and phase 7 adds copy-on-write.
 - **crates/qcow2-write-exec/** - Shared guest-side step executor for
   `crates/qcow2-write` step programs (`no_std`,
   PLAN-qcow2-write-infrastructure phase 4): a literal interpreter of
@@ -309,8 +314,9 @@ provides a modular architecture with:
   output-device reality). Host-unit-tested against a mock `DeviceIo`
   with journals and failure injection, including end-to-end
   compositions driving `plan_write` / `plan_flush` through the
-  executor over a model disk. Consumed by the commit op; phases 5-6
-  reuse it for rebase and bench.
+  executor over a model disk. Consumed by the commit op (phase 4)
+  and the rebase op's safe mode (phase 5); phase 6 reuses it for
+  bench.
 - **operations/info/** - Format detection operation
 - **operations/copy/** - File copy operation
 - **operations/check/** - Image integrity validation operation (with

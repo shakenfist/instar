@@ -1149,6 +1149,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **`instar rebase`'s safe-mode qcow2 path migrated onto
+  `crates/qcow2-write` (PLAN-qcow2-write-infrastructure phase 5).**
+  Safe-mode rebase (including safe detach) now plans its cluster
+  copies with the shared planner (`crates/qcow2-write`) and executes
+  them through `crates/qcow2-write-exec`, the second consumer after
+  commit; the `-u` metadata-only path, unsafe detach and the vmdk
+  path are untouched. The migration is byte-invisible: the
+  `scripts/migration-proof.py` harness (extended with `--op rebase`)
+  proved instar-before vs instar-after identity over a 69-combo
+  fixture matrix — 0 identity failures, 0 determinism failures,
+  byte-identical pre-refusal scaffolding on the 6 both-refuse
+  shapes, and exactly 1 pre-declared divergence (beyond-EOV tail
+  bytes of a copied cluster are now zeros where both old instar and
+  qemu-img carry old-chain bytes; virtual content proven equal) —
+  and a 300-iteration rebase differential-fuzz run reported 0
+  divergences with baselines unchanged. Two silent-corruption shapes
+  found by the phase's probes become typed refusals before harm:
+  overlays with a sparse (holed) refcount table — stock-producible
+  and check-clean, previously misallocated refcounts into the wrong
+  refblocks — now refuse with new `RebaseResult` error 16
+  (`ERROR_OVERLAY_INCONSISTENT`), and extended-L2 overlays —
+  previously walked as 8-byte entries, silently corrupting virtual
+  content — now refuse with new error 15
+  (`ERROR_OVERLAY_UNSUPPORTED`), which also adds the spec-mandated
+  refusal of zstd/unknown incompatible bits. Overlay staging
+  capacity widens: the stage-everything L2 model and its growable
+  arena are retired (the arena-clobber hazard class behind issue
+  #422 is structurally gone), existing L2 tables are windowed with
+  safe eviction, and refblocks stage at
+  `min(2048, 3 MiB / cluster_size)`, so overlays that previously
+  refused at staging time on populated-L2 count alone now rebase.
+  `crates/rebase` slims by ~330 lines (the hand-rolled allocator and
+  its state are deleted; the deferred header/backing-path patch
+  machinery survives byte-identical). See
+  [docs/rebase.md](docs/rebase.md), [docs/quirks.md](docs/quirks.md)
+  and the phase-5 findings in
+  [docs/plans/PLAN-qcow2-write-infrastructure.md](docs/plans/PLAN-qcow2-write-infrastructure.md).
+
 - **`instar commit`'s qcow2 write path migrated onto
   `crates/qcow2-write` (PLAN-qcow2-write-infrastructure phase 4).**
   The commit op's inlined backing-side allocate-on-write composition

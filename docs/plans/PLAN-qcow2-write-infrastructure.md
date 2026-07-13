@@ -292,7 +292,7 @@ Design sketch (to be settled in phase planning, not binding):
 | 2. Interim safety gates + defect handling — LIVE: commit snapshot corruption (#420), rebase snapshot corruption + data-loss chain (#421), rebase 512-byte-cluster livelock (#422; fix or gate per root-cause depth) | PLAN-qcow2-write-infrastructure-phase-02-gates.md | Complete (2026-07-12; commits ac8f60a / 2fb9af4 / c84743e; see Findings) |
 | 3. `crates/qcow2-write` core: classification + allocate-on-write planner + ordering contract (no COW, no growth), unit tests + simulation harness | PLAN-qcow2-write-infrastructure-phase-03-crate.md | Complete (2026-07-12; commits 878ebf0 / bc322b2 / 19ba116 / d883b25; see Findings) |
 | 4. Migrate commit onto the crate (byte-identical proof) | PLAN-qcow2-write-infrastructure-phase-04-commit.md | Complete (2026-07-13; commits c101c9f / a2fae94 / 6b0c856 / 7dff544 / 2237028; see Findings) |
-| 5. Migrate rebase safe mode (byte-identical proof) | PLAN-qcow2-write-infrastructure-phase-05-rebase.md | Planned (2026-07-13), not started |
+| 5. Migrate rebase safe mode (byte-identical proof) | PLAN-qcow2-write-infrastructure-phase-05-rebase.md | Complete (2026-07-13; commits ad208bf / cfb86f9 / 5889573; see Findings) |
 | 6. Migrate bench `-w`; move the refcount-growth planner into the shared crate | PLAN-qcow2-write-infrastructure-phase-06-bench.md | Not started |
 | 7. Copy-on-write branch; lift bench's internal-snapshot gate; per-consumer COW policy per OQ3 | PLAN-qcow2-write-infrastructure-phase-07-cow.md | Not started |
 | 8. Fuzz: coverage-guided target for the new crate; differential coverage for newly-permitted snapshot-bearing writes | PLAN-qcow2-write-infrastructure-phase-08-fuzz.md | Not started |
@@ -921,6 +921,152 @@ explicit off-matrix widening probes for whatever caps their
 migrations lift — the Q3 matrix shape does not exercise the
 widened region.
 
+### Findings: phase 5 rebase migration (2026-07-13)
+
+Executed per
+[PLAN-qcow2-write-infrastructure-phase-05-rebase.md](PLAN-qcow2-write-infrastructure-phase-05-rebase.md)
+as steps 5p (empirical probes, no code; plan amendments in
+ad208bf), 5a (the op migration, cfb86f9), 5b (proof harness
+extension + recorded run, 5889573) and 5c (this close-out).
+The divergence budget R-D1..R-D10 held as amended after 5p;
+nothing outside it was found. The `-u`, unsafe-detach and
+vmdk paths are untouched; safe detach IS migrated. What
+follows is what phases 6-9 need.
+
+**The migration is byte-invisible except one pre-declared raw
+divergence — the proof numbers.** Recorded run (before = the
+saved bd833b1 dist, after = cfb86f9): 69/69 combos pass — 63
+both-succeed byte-identical and 6 both-refuse (exactly 5p's
+inventory: every cs=512 × divergent × safe combo, wire-10
+refcount exhaustion, with byte-identical orphan-append
+scaffolding). Determinism failures: 0. Byte-identity
+failures: 0. D9 fallbacks: exactly the 1 pre-declared
+oversized-old-backing row — the crate zero-fills beyond EOV
+where instar-before AND qemu-img carry old-chain bytes into
+the raw file; virtual content proven equal, backings
+untouched. The plain unaligned-size twin combo is fully
+byte-identical, isolating the divergence to the beyond-EOV
+tail. Off-matrix: the P8 widening exemplar (wire-9 staging
+refusal before → check-clean qemu-parity success after), the
+34-table eviction shape before-vs-after BYTE-IDENTICAL —
+R-D5 proven live: eviction changes intermediate I/O order
+only, an evicted table is written once and never reloaded —
+and the holed-RT wire-16 pre-mutation refusal. Differential
+fuzz: 300 iterations `--ops rebase`, 0 divergences
+(seed 5013); rebase suite including the baseline matrix: 28
+ran, 0 failed. A JSON combo pins the `clusters_copied` /
+`bytes_copied` counters via stdout identity.
+
+**Two live corruption defects found by 5p, both now typed
+refusals; a third found, out of scope.** (1) R-D4 confirmed
+live: a holed refcount table on the OVERLAY — #428's overlay
+sibling, stock-producible, check-clean — was silently
+misallocated by rebase's compact-then-index-as-dense staging
+(1092 check errors + 32 leaked clusters at exit 0 in the
+probe; wire-10 refusal after 12.4 MB of mis-placed scribbles
+on larger divergences). The #428 recipe self-masks on
+qemu ≥ 10 (discard now produces zero-plain clusters); the
+adapted recipe is pre-touch + partial write + discard
+8M-32M + shrink to 82M, with the backing attached afterwards
+via `rebase -u`. Refused since cfb86f9: wire 16
+(`ERROR_OVERLAY_INCONSISTENT`), pre-mutation,
+byte-idempotent. (2) R-D1 confirmed live: extended-L2
+overlays were silently corrupted at exit 0 (the walk misread
+16-byte entries as 8-byte). Refused since cfb86f9: wire 15
+(`ERROR_OVERLAY_UNSUPPORTED`), which also adds the
+spec-mandated zstd/unknown-incompatible-bit refusal — a
+today-succeeds→refuses narrowing (the bit is inert without
+compressed clusters), accepted and documented. Issue drafts
+for both are pending the user's filing decision.
+(3) The qcow2 chain reader ignores the zero flag on classic
+L2 entries: `cluster_lookup`'s classic arm
+(src/crates/qcow2/src/lib.rs:2213-2238) ignores bit 0, so a
+v3 zero-flag cluster in a chain member reads as fall-through
+or stale bytes instead of zeros — silent active-view
+corruption, blast radius rebase / convert / compare / bench.
+Pre-existing `crates/qcow2` defect, explicitly NOT fixed by
+phase 5 (issue draft pending the user's filing decision);
+phases 6+ or a standalone fix must address it, and until
+then differential matrices must avoid `write -z` seeds (5b's
+does).
+
+**The skip-probe original-state design is the pattern for
+ops that must not involve the planner on mapped clusters.**
+Rebase skips any cluster already mapped in the overlay
+(plan_write there would classify Owned and wrongly overwrite
+it with old-chain content). The migrated probe consults
+ORIGINAL pre-run state: a read-only copy of the pre-run L1
+(separate from the planner's patched `StagedRegions.l1`)
+plus one cluster-sized probe buffer holding the current
+original L2 table, reloaded on `l1_idx` change — the walk is
+monotonic, so exactly one read per populated table, and
+fresh tables never probe disk. Today's exact skip predicate
+is preserved (any non-zero raw entry skips, so compressed /
+zero-flag / garbage entries behave identically and the
+crate's entry refusals stay unreachable for mapped
+clusters). Bench's `-w` path always writes its scheduled
+offsets — mapped clusters reach the planner deliberately as
+Owned overwrites — so phase 6 likely does NOT need the
+probe; it matters wherever a future consumer must leave
+mapped content alone.
+
+**Two judgment calls worth knowing.** The -u/unsafe-detach/
+vmdk planner scratch keeps its original addresses as an
+ALIAS carve over the safe-mode region ladder — the runners
+are mutually exclusive per invocation, and compile-time
+asserts pin both carves below the allocator heap. And the
+refcount table stages as a bounded PREFIX
+(`min(rt_size, 64 KiB)`, bench's model) rather than whole:
+the planner reads only the entries covering the staged
+refblocks (≤ 16 KiB at the 2048-refblock cap), and staging
+the whole table would have narrowed in-envelope cs=1M
+shapes whose refcount table exceeds 64 KiB.
+
+**Capacity outcomes.** Stage-everything for existing L2s is
+retired along with the growable L2 arena and its caps — the
+#422 hazard class (arena growth clobbering refblock staging)
+is gone by construction. Unlike commit, L2-window eviction
+IS reachable for rebase (`min(256, 2 MiB / cluster_size)`
+slots; overlays at cs ≥ 64K can touch more tables than
+slots) and is accepted on the structural argument proven
+live by the eviction shape above. Refblock staging is
+byte-driven at `min(2048, 3 MiB / cluster_size)` (formerly
+the joint 4 MiB bump arena shared with L2 staging); rebase
+reclaimed its 4 MiB PLANNER_SCRATCH duplicate outright, as
+the phase-4 findings predicted. The P8 shape (cs=512, 64 MiB
+overlay, 512 populated L2 tables, identical chains) refused
+wire 9 before and now rebases check-clean with qemu parity.
+
+**What phase 6 (bench) inherits.** The wire-code template
+has now been applied twice (commit 16/17, rebase 15/16): at
+most two appended codes, `RefcountExhausted` keeps its
+existing code, everything else reuses existing codes.
+`scripts/migration-proof.py` has a migration-proof `--op`
+registry ready for bench. Bench is already the closest
+composition to the crate — it uses the snapshot-crate
+allocator, dense-prefix refblock staging, and wgate codes
+that equal the crate's gate codes 1-7 one-to-one (a phase-3
+design decision) — so the mechanical migration surface is
+smaller than rebase's. The phase-6 novelty is refcount
+GROWTH: bench's preemptive grow-at-setup planner
+(PLAN-bench-refcount-growth) must move into the shared
+crate rather than remain a bench-side special case — that
+absorption, not the write-path migration, is where phase 6's
+design work lives.
+
+**The vacuous NewBackingIncompatible gate (P9).** The rebase
+op passes the overlay's own virtual size as
+`new_backing_virtual_size`
+(src/operations/rebase/src/main.rs:503 and :894), so the
+planner's "new backing smaller than the overlay" check
+compares the overlay's size to itself and can never fire.
+5p probed the real shape (new backing smaller than the
+overlay): behaviour matches qemu-img anyway, so nothing is
+wrong today — but the gate is dead code as wired. Recorded
+for a possible cleanup: either plumb the real new-backing
+virtual size or delete the parameter; not changed by
+phase 5.
+
 ## Administration and logistics
 
 ### Success criteria
@@ -970,8 +1116,10 @@ widened region.
 ### Bugs fixed during this work
 
 Phase 1 confirmed three pre-existing defects, phase 2 found a
-fourth, and phase 4's probes found two more (details and repro
-recipes in the Findings sections; #420-#422 filed 2026-07-12):
+fourth, phase 4's probes found two more, and phase 5's probes
+found three more — two fixed by typed refusals, one out of
+scope (details and repro recipes in the Findings sections;
+#420-#422 filed 2026-07-12):
 
 1. [#420](https://github.com/shakenfist/instar/issues/420)
    `instar commit` silently corrupts internal snapshots in the
@@ -1012,6 +1160,32 @@ recipes in the Findings sections; #420-#422 filed 2026-07-12):
    a live defect). **Refused since the phase-4 migration
    (7dff544, error 17, pre-mutation)**; filed 2026-07-13 as
    [#428](https://github.com/shakenfist/instar/issues/428).
+7. `instar rebase` (safe mode) corrupted refcounts on overlays
+   with a sparse (holed) refcount table — the overlay-side
+   rebase sibling of #428, stock-producible and check-clean
+   (found by phase 5p; 1092 check errors + 32 leaked clusters
+   at exit 0 in the probe; the #428 recipe self-masks on
+   qemu ≥ 10 and needs the adapted recipe in the phase-5
+   findings). **Refused since the phase-5 migration (cfb86f9,
+   error 16, pre-mutation, byte-idempotent)**; issue draft
+   pending the user's filing decision.
+8. `instar rebase` (safe mode) silently corrupted extended-L2
+   overlays — the walk misread 16-byte extended-L2 entries as
+   8-byte classic entries, corrupting virtual content at
+   exit 0 (found by phase 5p). **Refused since the phase-5
+   migration (cfb86f9, error 15, pre-mutation)**; issue draft
+   pending the user's filing decision.
+9. The `crates/qcow2` chain reader ignores the zero flag on
+   classic L2 entries (`cluster_lookup`'s classic arm ignores
+   bit 0), so v3 zero-flag clusters in a chain member read as
+   fall-through or stale bytes instead of zeros — silent
+   active-view corruption with blast radius rebase / convert /
+   compare / bench (found by phase 5p). **NOT fixed by
+   phase 5** (pre-existing chain-read behaviour, explicitly
+   out of the migration's scope); phases 6+ or a standalone
+   fix must address it, and differential matrices must avoid
+   `write -z` seeds until then. Issue draft pending the
+   user's filing decision.
 
 Fix status is tracked here as phases land.
 

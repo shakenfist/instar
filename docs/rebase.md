@@ -176,6 +176,32 @@ and the overlay becomes standalone.
   is parity-tested against qemu-img on snapshot-bearing
   overlays. The real fix is copy-on-write, phase 7 of
   PLAN-qcow2-write-infrastructure.
+- **Overlays with extended L2 entries or unknown/compression
+  feature bits are refused.** Since the phase-5 migration of
+  safe mode onto `crates/qcow2-write`, safe-mode rebase
+  (including safe detach) refuses with error 15: ``the
+  overlay uses features instar rebase does not support
+  (extended L2 entries, or unknown/compression feature
+  bits). Use -u for a metadata-only rebase or fall back to
+  `qemu-img rebase` ``. The extended-L2 refusal replaces a
+  silent-corruption defect (the walk misread 16-byte
+  extended-L2 entries as 8-byte); the zstd/unknown-bit
+  refusal is spec-mandated and narrows shapes that
+  previously rebased correctly (the bit is inert without
+  compressed clusters). `-u` stays allowed. qemu-img builds
+  with the matching feature support proceed.
+- **Overlays with inconsistent metadata are refused.**
+  Safe-mode rebase refuses with error 16: ``the overlay's
+  metadata is inconsistent (refcounts, table flags or
+  layout); refusing to write into it. Run `qemu-img check`
+  on the overlay, or fall back to `qemu-img rebase` ``.
+  This covers a sparse (holed) refcount table — a
+  stock-producible, check-clean shape that rebase silently
+  misallocated before phase 5 (the rebase sibling of
+  commit's issue #428) — plus reserved bits and
+  classification inconsistencies. The sparse-table refusal
+  fires before any mutation and is byte-idempotent;
+  qemu-img rebases the same shape check-clean.
 - **Deep-allocation safe rebases refuse on refcount
   exhaustion.** v1 never appends refblocks, so a safe
   rebase that needs more cluster allocations than the
@@ -185,9 +211,24 @@ and the overlay becomes standalone.
   could hang instead of refusing — a staged-L2 lookup went
   stale after arena growth and the guest spun in its panic
   handler; fixed, with staging reordered so the growable
-  L2 arena can no longer clobber refblock staging.)
-  Retiring the capacity ceiling is the master plan's
+  L2 arena can no longer clobber refblock staging. The
+  phase-5 migration then retired the growable arena and its
+  staging-count caps outright: existing L2 tables are
+  windowed with `min(256, 2 MiB / cluster_size)` slots and
+  safe eviction, and refblocks stage at
+  `min(2048, 3 MiB / cluster_size)`, so overlays that
+  previously refused `ERROR_SCRATCH_TOO_SMALL` at staging
+  time on populated-L2 count alone now rebase.)
+  Retiring the exhaustion ceiling is the master plan's
   refcount-growth generalization.
+- **Beyond-EOV tail bytes of copied clusters are zeros.**
+  When the old backing chain is larger than the overlay's
+  virtual size, a copied tail cluster's bytes beyond
+  end-of-virtual-size are zero-filled where `qemu-img
+  rebase` carries the old chain's bytes into the raw file.
+  Virtual content is identical — bytes past EOV are not
+  virtual content — and this is the only raw-level
+  divergence sanctioned by the phase-5 migration proof.
 - **Cross-cluster-size rebase is rejected.** If the new
   backing's qcow2 cluster size differs from the overlay's,
   safe-mode rebase refuses with
@@ -235,9 +276,12 @@ master plan](plans/PLAN-rebase-commit.md):
 - Targeted seed corpus for `fuzz_rebase_planners`. The
   `scripts/generate-fuzz-seeds.py` infrastructure can
   walk the existing testdata.
-- Tighter scratch-budget bounds on the safe-mode allocator
-  so larger-cluster-size overlays don't surface
-  `ERROR_SCRATCH_TOO_SMALL`.
+- Lifting the 1 MiB cluster-size cap on safe mode (the
+  per-side compare buffers are 1 MiB; larger cluster sizes
+  surface `ERROR_SCRATCH_TOO_SMALL`). The phase-5 migration
+  onto `crates/qcow2-write` retired the old allocator's
+  staging-count refusals, so this cap is the remaining
+  scratch bound.
 
 ## Examples
 
