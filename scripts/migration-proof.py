@@ -68,6 +68,7 @@ import itertools
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -832,6 +833,438 @@ def _rebase_holed_rt(workdir, args):
 
 
 # ---------------------------------------------------------------------------
+# bench fixtures + proof (phase 6, decision 7)
+# ---------------------------------------------------------------------------
+#
+# Bench is NOT a byte-identity migration for allocating schedules: the crate
+# allocates L2-first while pre-migration bench allocated data-first, so with a
+# shared linear cursor the two host offsets swap for every fresh-L2 write and
+# the final images differ (divergence B-D1). The proof therefore pre-declares
+# a bucket per combo (a/b/c/d, seeded from the 6p refusal inventory) and runs
+# the right assertion for each bucket rather than a blanket byte compare:
+#
+#   (a) controls  — raw `-w`, read runs (paths untouched by the migration):
+#       full identity (normalised stdout + stderr + per-file sha256).
+#   (b) overwrite-only (no fresh-L2 allocation), INCLUDING the post-#433
+#       overwrite-only INTERSECT growth corner: full byte identity
+#       (sha-equal before-vs-after) + `qemu-img check` clean.
+#   (c) allocating (fresh, growth-triggering, backed-overlay COW): NOT
+#       sha-equal (B-D1). Instead: determinism (after x2 sha-equal within a
+#       side), `qemu-img compare` content-equal (before-image vs after-image),
+#       `qemu-img check` clean on both, normalised `info` equivalence,
+#       `flushes-issued` identity (carried by the normalised JSON), and — for
+#       growth shapes — identical RT-geometry deltas (rt offset/clusters +
+#       populated-refblock count before->after).
+#   (d) refusals: identical rc/stderr; sha-unchanged WHERE today's refusal is
+#       pre-mutation (holed-RT wire-3; compressed with NO growth, gate-2). The
+#       compressed-AFTER-growth shape is pre-declared recorded-NOT-sha-stable
+#       (verdict = rc/stderr identical + check-clean, per 6p probe 7).
+#
+# Bench stdout/JSON normalisation (decision 7): the proof runs `bench
+# --output json`, which emits ONLY the structured object (no human header /
+# flush / completion lines). The three wall-clock fields
+# (elapsed-seconds / requests-per-second / bytes-per-second) are stripped; the
+# surviving fields (count, depth, effective-depth, buffer-size, step-size,
+# offset, write, pattern, flush-interval, no-drain, flushes-issued, format,
+# filename) are ALL deterministic and carry a strict superset of the human
+# header + flush-line information, so asserting the normalised JSON identical
+# subsumes "assert the header line, the flush line" and the `flushes-issued`
+# identity check in one comparison. The wall-clock completion line is never
+# emitted in JSON mode and is never asserted.
+
+BENCH_CLUSTER_SIZES = [512, 4096, 65536, 2097152]
+BENCH_SIZES = [16 * 1024 * 1024, 64 * 1024 * 1024]
+BENCH_WALLCLOCK_KEYS = {'elapsed-seconds', 'requests-per-second', 'bytes-per-second'}
+
+
+def normalise_bench_stdout(stdout):
+    """Strip the three wall-clock JSON fields (decision 7).
+
+    On a refusal bench emits no stdout (the error goes to stderr), so an empty
+    string round-trips unchanged. On success the structured object is returned
+    with the wall-clock fields removed and keys sorted for stable comparison.
+    """
+    s = (stdout or '').strip()
+    if not s:
+        return s
+    try:
+        obj = json.loads(s)
+    except (json.JSONDecodeError, ValueError):
+        return s
+    for k in BENCH_WALLCLOCK_KEYS:
+        obj.pop(k, None)
+    return json.dumps(obj, sort_keys=True)
+
+
+def bench_rt_geometry(path):
+    """(cluster_size, rt_offset, rt_clusters, populated_refblocks) for a qcow2.
+
+    populated_refblocks counts non-zero refcount-table entries (each points at
+    a materialised refcount block). This is the bucket-(c) RT-geometry probe;
+    growth shapes must show the SAME (offset, clusters, populated) transition
+    before-vs-after (the growth planner is a pure relocation, B-D8)."""
+    with open(path, 'rb') as f:
+        header = f.read(72)
+        if header[:4] != b'QFI\xfb':
+            raise RuntimeError(f'{path}: not a qcow2 image')
+        cluster_bits = struct.unpack('>I', header[20:24])[0]
+        cluster_size = 1 << cluster_bits
+        rt_offset = struct.unpack('>Q', header[48:56])[0]
+        rt_clusters = struct.unpack('>I', header[56:60])[0]
+        f.seek(rt_offset)
+        data = f.read(rt_clusters * cluster_size)
+    populated = 0
+    for i in range(len(data) // 8):
+        entry = struct.unpack('>Q', data[i * 8:i * 8 + 8])[0]
+        if entry & 0xfffffffffffffe00:
+            populated += 1
+    return (cluster_size, rt_offset, rt_clusters, populated)
+
+
+def bench_files(combo):
+    """Files whose sha256 the proof tracks for this combo."""
+    if combo['fixture'] == 'overlay':
+        return ['overlay.qcow2', 'backing.qcow2']
+    return [combo['image']]
+
+
+def build_bench_fixture(combo, setdir, qemu_img, qemu_io):
+    """Build one bench fixture. Relative paths only, so twin sets built in
+    different directories are byte-identical (the backing filename embedded in
+    an overlay header is the relative 'backing.qcow2' in every set — the 6p
+    twin-fixture gotcha)."""
+    os.makedirs(setdir)
+    fixture = combo['fixture']
+    cs = combo.get('cs')
+    size = str(combo['size'])
+
+    if fixture == 'raw':
+        check_run([qemu_img, 'create', '-f', 'raw', 'img.raw', size], setdir)
+        # instar's secure raw detection refuses headerless raw; carry the 55AA
+        # MBR signature (mirrors tests/test_bench.py::make_raw_mbr).
+        check_run([qemu_io, '-f', 'raw', '-c', 'write -P 0x55 510 1',
+                   '-c', 'write -P 0xaa 511 1', 'img.raw'], setdir)
+        return
+    if fixture == 'overlay':
+        check_run([qemu_img, 'create', '-f', 'qcow2', '-o', f'cluster_size={cs}',
+                   'backing.qcow2', size], setdir)
+        check_run([qemu_io, '-f', 'qcow2', '-c', f'write -P 0xbb 0 {size}', 'backing.qcow2'], setdir)
+        check_run([qemu_img, 'create', '-f', 'qcow2', '-o',
+                   f'backing_file=backing.qcow2,backing_fmt=qcow2,cluster_size={cs}',
+                   'overlay.qcow2', size], setdir)
+        return
+    if fixture == 'compressed':
+        # zlib is NOT an incompatible-features header bit; the setup gate does
+        # not fire, so bench reaches the per-cluster compression refusal.
+        check_run([qemu_img, 'create', '-f', 'qcow2', '-o', f'cluster_size={cs}',
+                   'src.qcow2', size], setdir)
+        check_run([qemu_io, '-f', 'qcow2', '-c', f'write -P 0x41 0 {size}', 'src.qcow2'], setdir)
+        check_run([qemu_img, 'convert', '-c', '-O', 'qcow2', '-o', f'cluster_size={cs}',
+                   'src.qcow2', 'img.qcow2'], setdir)
+        os.unlink(os.path.join(setdir, 'src.qcow2'))
+        return
+    if fixture == 'holed':
+        # Genuine holed refcount table (probe 5 recipe, adapted from #428/#430):
+        # scatter touches, fill, discard a middle band, shrink -> the RT points
+        # past a hole. Check-clean on qemu >= 10; bench's contiguity gate
+        # refuses it wire-3, pre-mutation.
+        check_run([qemu_img, 'create', '-f', 'qcow2', '-o', 'cluster_size=4096', 'img.qcow2', '96M'], setdir)
+        touch = []
+        for i in range(22):
+            touch += ['-c', f'write -P 0x01 {i * 2}M 4k']
+        check_run([qemu_io, '-f', 'qcow2'] + touch + ['img.qcow2'], setdir)
+        check_run([qemu_io, '-f', 'qcow2', '-c', 'write -P 0x22 0 44M', 'img.qcow2'], setdir)
+        check_run([qemu_io, '-f', 'qcow2', '-c', 'discard 8M 32M', 'img.qcow2'], setdir)
+        check_run([qemu_img, 'resize', '--shrink', 'img.qcow2', '82M'], setdir)
+        return
+
+    # Plain qcow2 image (fresh / overwrite / growth / read).
+    check_run([qemu_img, 'create', '-f', 'qcow2', '-o', f'cluster_size={cs}', 'img.qcow2', size], setdir)
+    prefill = combo.get('prefill')
+    if prefill:
+        check_run([qemu_io, '-f', 'qcow2', '-c', f'write -P {prefill["pattern"]} 0 {prefill["bytes"]}',
+                   'img.qcow2'], setdir)
+
+
+def run_bench(binary, setdir, combo):
+    """Run `bench --output json` for this combo; normalise the wall-clock JSON
+    fields out of stdout. Returns an Invocation whose stdout is normalised."""
+    argv = [binary, 'bench'] + combo['bench_args'] + ['-f', combo['fmt'], '--output', 'json', combo['image']]
+    r = run(argv, setdir)
+    inv = Invocation.__new__(Invocation)
+    inv.rc = r.returncode
+    inv.stdout = normalise_bench_stdout(r.stdout)
+    inv.stderr = r.stderr
+    inv.shas = {f: sha256(os.path.join(setdir, f)) for f in bench_files(combo)}
+    return inv
+
+
+def bench_matrix():
+    """The decision-7 bench matrix, pruned to coherent combos, with every combo
+    pre-assigned its proof bucket (a/b/c/d) IN CODE (seeded from the 6p refusal
+    inventory). Cluster sizes {512, 4096, 65536, 2097152} x sizes {16M, 64M} x
+    schedule classes {fresh-allocating, overwrite-only, growth-triggering,
+    backed-overlay COW} x flush-interval {none, 0, k} x {pattern, straddling},
+    plus raw/read controls and the pre-declared refusal shapes."""
+    combos = []
+
+    def flush_args(kind, count):
+        # A cadence flush-interval must be >= the queue depth (qemu/instar both
+        # reject 'flush interval smaller than depth'); the default depth is 64,
+        # so a small cadence needs -d 1 (as 6p's cadence probes used).
+        if kind == 'none':
+            return [], 'none'
+        if kind == '0':
+            return ['--flush-interval', '0'], 'f0'
+        k = max(1, count // 2)
+        return ['-d', '1', '--flush-interval', str(k)], f'd1fk{k}'
+
+    for cs in BENCH_CLUSTER_SIZES:
+        for size in BENCH_SIZES:
+            m = size // (1024 * 1024)
+
+            # (c) fresh-allocating: a modest allocating schedule (64K buffers).
+            for fk in ('none', '0', 'k'):
+                fa, ftag = flush_args(fk, 8)
+                combos.append({
+                    'tag': f'bench-cs{cs}-sz{m}M-fresh-{ftag}', 'bucket': 'c', 'expected': 'success',
+                    'fmt': 'qcow2', 'cs': cs, 'size': size, 'image': 'img.qcow2', 'fixture': 'fresh',
+                    'bench_args': ['-w', '-c', '8', '-s', '65536', '-S', '65536', '--pattern', '80'] + fa,
+                    'growth': False})
+
+            # (b) overwrite-only, no growth: prefill the whole footprint so
+            # every write lands in an already-allocated cluster.
+            footprint = 8 * 65536
+            for fk in ('none', 'k'):
+                fa, ftag = flush_args(fk, 8)
+                combos.append({
+                    'tag': f'bench-cs{cs}-sz{m}M-overwrite-{ftag}', 'bucket': 'b', 'expected': 'success',
+                    'fmt': 'qcow2', 'cs': cs, 'size': size, 'image': 'img.qcow2', 'fixture': 'overwrite',
+                    'prefill': {'pattern': '0xcc', 'bytes': footprint},
+                    'bench_args': ['-w', '-c', '8', '-s', '65536', '-S', '65536', '--pattern', '66'] + fa,
+                    'growth': False})
+
+            # (c) growth-triggering: fresh image, allocating schedule that
+            # crosses the refcount-block threshold (unreachable at cs >= 64K
+            # in-envelope -- one refblock covers >= 2 TiB; 6p probe 6).
+            if cs in (512, 4096):
+                gcount = '255' if cs == 512 else '200'
+                combos.append({
+                    'tag': f'bench-cs{cs}-sz{m}M-growth-none', 'bucket': 'c', 'expected': 'success',
+                    'fmt': 'qcow2', 'cs': cs, 'size': size, 'image': 'img.qcow2', 'fixture': 'growth',
+                    'bench_args': ['-w', '-c', gcount, '-s', '65536', '-S', '65536', '--pattern', '67'],
+                    'growth': True})
+
+            # (c) backed-overlay COW: sub-cluster partial writes over a backed
+            # image drive the decision-3 try/refuse/fill/resubmit path.
+            if size == BENCH_SIZES[0]:
+                ovl_buf = min(cs // 2, 4096)
+                combos.append({
+                    'tag': f'bench-cs{cs}-sz{m}M-overlay-none', 'bucket': 'c', 'expected': 'success',
+                    'fmt': 'qcow2', 'cs': cs, 'size': size, 'image': 'overlay.qcow2', 'fixture': 'overlay',
+                    'bench_args': ['-w', '-c', '3', '-s', str(ovl_buf), '-S', str(cs),
+                                   '-o', str(cs), '--pattern', '65'],
+                    'growth': False})
+
+    # (b) the post-#433 overwrite-only INTERSECT growth corner: overwrite the
+    # prefilled band with a schedule whose worst-case touch estimate crosses
+    # the preemptive-growth threshold. Post-fix the pre-grown refblocks are
+    # materialised, so this is byte-identical AND check-clean (NEWDEF089).
+    combos.append({
+        'tag': 'bench-cs512-sz16M-overwrite-growth-corner', 'bucket': 'b', 'expected': 'success',
+        'fmt': 'qcow2', 'cs': 512, 'size': 16 * 1024 * 1024, 'image': 'img.qcow2', 'fixture': 'overwrite',
+        'prefill': {'pattern': '0x11', 'bytes': 8 * 1024 * 1024},
+        'bench_args': ['-w', '-c', '60', '-s', '65536', '-S', '65536', '--pattern', '66'],
+        'growth': False})
+
+    # (c) straddling-bufsize fresh variants (odd buffer crosses cluster edges).
+    for cs in (4096, 65536):
+        combos.append({
+            'tag': f'bench-cs{cs}-sz16M-fresh-straddle', 'bucket': 'c', 'expected': 'success',
+            'fmt': 'qcow2', 'cs': cs, 'size': 16 * 1024 * 1024, 'image': 'img.qcow2', 'fixture': 'fresh',
+            'bench_args': ['-w', '-c', '8', '-s', '4097', '-S', '4097', '--pattern', '89'],
+            'growth': False})
+
+    # (a) controls: raw `-w` and a read run (both on paths the migration never
+    # touches -> full byte identity).
+    combos.append({
+        'tag': 'bench-raw-sz16M-write-control', 'bucket': 'a', 'expected': 'success',
+        'fmt': 'raw', 'cs': None, 'size': 16 * 1024 * 1024, 'image': 'img.raw', 'fixture': 'raw',
+        'bench_args': ['-w', '-c', '8', '-s', '65536', '-S', '65536', '--pattern', '90'],
+        'growth': False})
+    combos.append({
+        'tag': 'bench-cs65536-sz16M-read-control', 'bucket': 'a', 'expected': 'success',
+        'fmt': 'qcow2', 'cs': 65536, 'size': 16 * 1024 * 1024, 'image': 'img.qcow2', 'fixture': 'overwrite',
+        'prefill': {'pattern': '0xdd', 'bytes': 1024 * 1024},
+        'bench_args': ['-c', '8', '-s', '65536', '-S', '65536', '--pattern', '90'],
+        'growth': False})
+
+    # (d) refusals (6p refusal inventory). holed-RT + compressed-no-growth are
+    # pre-mutation (sha-stable); compressed-after-growth is recorded NOT
+    # sha-stable (growth mutates before the per-cluster gate fires).
+    combos.append({
+        'tag': 'bench-cs4096-holed-rt-refusal', 'bucket': 'd', 'expected': 'refuse',
+        'fmt': 'qcow2', 'cs': 4096, 'size': 96 * 1024 * 1024, 'image': 'img.qcow2', 'fixture': 'holed',
+        'bench_args': ['-w', '-c', '10', '-s', '65536', '-S', '65536', '--pattern', '65'],
+        'growth': False, 'sha_stable': True})
+    combos.append({
+        'tag': 'bench-cs65536-compressed-nogrowth-refusal', 'bucket': 'd', 'expected': 'refuse',
+        'fmt': 'qcow2', 'cs': 65536, 'size': 4 * 1024 * 1024, 'image': 'img.qcow2', 'fixture': 'compressed',
+        'bench_args': ['-w', '-c', '100', '-s', '65536', '-S', '65536', '--pattern', '65'],
+        'growth': False, 'sha_stable': True})
+    combos.append({
+        'tag': 'bench-cs512-compressed-growth-refusal', 'bucket': 'd', 'expected': 'refuse',
+        'fmt': 'qcow2', 'cs': 512, 'size': 4 * 1024 * 1024, 'image': 'img.qcow2', 'fixture': 'compressed',
+        'bench_args': ['-w', '-c', '100', '-s', '65536', '-S', '65536', '--pattern', '65'],
+        'growth': False, 'sha_stable': False})
+
+    return combos
+
+
+def _bench_qemu_check(qemu_img, setdir, name):
+    """(clean, detail). Clean == qemu-img check exit 0."""
+    r = run([qemu_img, 'check', name], setdir)
+    if r.returncode != 0:
+        return False, f'qemu-img check {name} rc={r.returncode} stdout={r.stdout.strip()!r} stderr={r.stderr.strip()!r}'
+    return True, ''
+
+
+def prove_bench_combo(combo, workdir, args):
+    """Build twins, assert determinism, then run the pre-declared bucket's
+    assertions. Returns a TSV row dict; row['fail'] truthy -> non-zero exit."""
+    files = bench_files(combo)
+    combo_dir = os.path.join(workdir, combo['tag'])
+    if os.path.exists(combo_dir):
+        shutil.rmtree(combo_dir)
+    sets = {name: os.path.join(combo_dir, name) for name in ('after-run-1', 'after-run-2', 'before-run')}
+    for setdir in sets.values():
+        build_bench_fixture(combo, setdir, args.qemu_img, args.qemu_io)
+
+    pre = {name: {f: sha256(os.path.join(setdir, f)) for f in files} for name, setdir in sets.items()}
+    if not (pre['after-run-1'] == pre['after-run-2'] == pre['before-run']):
+        return {'combo': combo, 'bucket': combo['bucket'], 'verdict': 'FIXTURE-NONDETERMINISTIC',
+                'detail': f'twin fixture sets differ pre-run: {pre}', 'fail': True,
+                'before': None, 'after': None}
+
+    # Pristine RT geometry for growth-shape delta reporting (before the runs
+    # mutate the images in place).
+    pristine_geom = None
+    if combo.get('growth'):
+        pristine_geom = bench_rt_geometry(os.path.join(sets['after-run-1'], combo['image']))
+
+    after1 = run_bench(args.after, sets['after-run-1'], combo)
+    after2 = run_bench(args.after, sets['after-run-2'], combo)
+    before = run_bench(args.before, sets['before-run'], combo)
+    row = {'combo': combo, 'bucket': combo['bucket'], 'before': before, 'after': after1,
+           'fail': False, 'detail': ''}
+
+    det_diffs = diff_invocations('run1', after1, 'run2', after2)
+    if det_diffs:
+        row.update(verdict='DETERMINISM-FAIL', fail=True,
+                   detail='after-run-1 vs after-run-2: ' + '; '.join(det_diffs))
+        return row
+
+    bucket = combo['bucket']
+
+    if combo['expected'] == 'refuse':
+        if before.rc == 0 or after1.rc == 0:
+            row.update(verdict='BUCKET-MISMATCH', fail=True,
+                       detail=f'bucket-d combo expected refusal but before rc={before.rc} after rc={after1.rc}')
+            return row
+        if before.rc != after1.rc or before.stderr != after1.stderr:
+            row.update(verdict='REFUSAL-MISMATCH', fail=True,
+                       detail=f'rc/stderr differ: before rc={before.rc} stderr={before.stderr!r}; '
+                              f'after rc={after1.rc} stderr={after1.stderr!r}')
+            return row
+        if combo.get('sha_stable'):
+            for f in files:
+                if after1.shas[f] != pre['after-run-1'][f] or before.shas[f] != pre['before-run'][f]:
+                    row.update(verdict='REFUSAL-MUTATED', fail=True,
+                               detail=f'{f} changed on a pre-mutation refusal '
+                                      f'(before {before.shas[f]} pristine {pre["before-run"][f]}; '
+                                      f'after {after1.shas[f]} pristine {pre["after-run-1"][f]})')
+                    return row
+            row['verdict'] = 'PASS'
+            return row
+        # Recorded NOT sha-stable (compressed-after-growth): rc/stderr identical
+        # + check-clean on both is the whole contract.
+        for label, setdir in (('before', sets['before-run']), ('after', sets['after-run-1'])):
+            clean, detail = _bench_qemu_check(args.qemu_img, setdir, combo['image'])
+            if not clean:
+                row.update(verdict='REFUSAL-CHECK-DIRTY', fail=True, detail=f'{label}: {detail}')
+                return row
+        row.update(verdict='PASS', detail=f'recorded-not-sha-stable (sha before={before.shas[combo["image"]]} '
+                                          f'after={after1.shas[combo["image"]]}, both check-clean)')
+        return row
+
+    # expected success (buckets a/b/c)
+    if before.rc != 0 or after1.rc != 0:
+        row.update(verdict='BUCKET-MISMATCH', fail=True,
+                   detail=f'expected success but before rc={before.rc} stderr={before.stderr!r}; '
+                          f'after rc={after1.rc} stderr={after1.stderr!r}')
+        return row
+
+    diffs = diff_invocations('before', before, 'after', after1)
+
+    if bucket in ('a', 'b'):
+        if diffs:
+            row.update(verdict='BYTE-MISMATCH', fail=True, detail='; '.join(diffs))
+            return row
+        if bucket == 'b':
+            clean, detail = _bench_qemu_check(args.qemu_img, sets['after-run-1'], combo['image'])
+            if not clean:
+                row.update(verdict='BUCKET-C-CHECK-DIRTY', fail=True, detail=detail)
+                return row
+        row['verdict'] = 'PASS'
+        return row
+
+    # bucket (c): stdout/stderr/rc identity (flushes-issued lives in the
+    # normalised JSON), then compare + check + info + RT-geometry. sha WILL
+    # differ (B-D1) -- that is expected, not asserted.
+    non_sha = [d for d in diffs if not d.startswith('sha256(')]
+    if non_sha:
+        row.update(verdict='BUCKET-C-STDOUT-MISMATCH', fail=True,
+                   detail='normalised stdout/stderr/rc differ (flushes-issued identity lives here): '
+                          + '; '.join(non_sha))
+        return row
+
+    failures = []
+    for label, setdir in (('before', sets['before-run']), ('after', sets['after-run-1'])):
+        clean, detail = _bench_qemu_check(args.qemu_img, setdir, combo['image'])
+        if not clean:
+            failures.append(f'{label}: {detail}')
+    cmp = run([args.qemu_img, 'compare', os.path.join(sets['before-run'], combo['image']),
+               os.path.join(sets['after-run-1'], combo['image'])], sets['after-run-1'])
+    if cmp.returncode != 0:
+        failures.append(f'qemu-img compare before-vs-after diverged: rc={cmp.returncode} '
+                        f'stdout={cmp.stdout.strip()!r} stderr={cmp.stderr.strip()!r}')
+    a = check_run([args.qemu_img, 'info', '--output=json', combo['image']], sets['before-run'])
+    b = check_run([args.qemu_img, 'info', '--output=json', combo['image']], sets['after-run-1'])
+    na, nb = normalise_info(a.stdout), normalise_info(b.stdout)
+    if na != nb:
+        failures.append(f'normalised info mismatch: before={json.dumps(na, sort_keys=True)} '
+                        f'after={json.dumps(nb, sort_keys=True)}')
+
+    detail = ''
+    if combo.get('growth'):
+        gb = bench_rt_geometry(os.path.join(sets['before-run'], combo['image']))
+        ga = bench_rt_geometry(os.path.join(sets['after-run-1'], combo['image']))
+        if gb != ga:
+            failures.append(f'RT-geometry delta differs before={gb} after={ga} (pristine {pristine_geom})')
+        else:
+            detail = (f'RT-geometry delta {pristine_geom} -> {ga} identical before-vs-after; '
+                      f'sha differs by B-D1 (before={before.shas[combo["image"]]} after={after1.shas[combo["image"]]})')
+
+    if failures:
+        row.update(verdict='BUCKET-C-FAIL', fail=True, detail='; '.join(failures))
+        return row
+    row.update(verdict='PASS', detail=detail or
+               f'compare+check+info OK; sha differs by B-D1 (before={before.shas[combo["image"]]} '
+               f'after={after1.shas[combo["image"]]})')
+    return row
+
+
+# ---------------------------------------------------------------------------
 # op registry (phases 5-6 add entries here)
 # ---------------------------------------------------------------------------
 
@@ -850,14 +1283,20 @@ OPS = {
         'files': rebase_files,
         'extra_checks': prove_rebase_extras,
     },
-    'bench': None,    # phase 6
+    'bench': {
+        'matrix': bench_matrix,
+        'build': build_bench_fixture,
+        'run': run_bench,
+        'files': bench_files,
+        'prove': prove_bench_combo,
+    },
 }
 
 
 def main():
     parser = argparse.ArgumentParser(description='Migration-proof harness: before/after instar byte identity')
     parser.add_argument('--op', required=True, choices=sorted(OPS),
-                        help='operation under proof (only commit is implemented so far)')
+                        help='operation under proof (commit, rebase, bench)')
     parser.add_argument('--before', required=True, help='path to the pre-migration instar binary (inside its dist)')
     parser.add_argument('--after', required=True, help='path to the post-migration instar binary (inside its dist)')
     parser.add_argument('--qemu-img', default='qemu-img', help='pinned qemu-img for fixture generation')
@@ -868,7 +1307,7 @@ def main():
     args = parser.parse_args()
 
     if OPS[args.op] is None:
-        parser.error(f'--op {args.op} is not implemented yet (phases 5-6)')
+        parser.error(f'--op {args.op} is not implemented yet')
     args.before = os.path.abspath(args.before)
     args.after = os.path.abspath(args.after)
     for name, path in (('--before', args.before), ('--after', args.after)):
@@ -884,10 +1323,12 @@ def main():
         if not combos:
             parser.error(f'--combo {args.combo!r} matches no combo tag')
 
+    prover = OPS[args.op].get('prove', prove_combo)
+
     rows = []
     for combo in combos:
         try:
-            row = prove_combo(combo, workdir, args)
+            row = prover(combo, workdir, args)
         except (RuntimeError, subprocess.TimeoutExpired) as e:
             row = {'combo': combo, 'bucket': 'n/a', 'verdict': 'HARNESS-ERROR',
                    'detail': str(e).replace('\n', ' '), 'fail': True, 'before': None, 'after': None}
