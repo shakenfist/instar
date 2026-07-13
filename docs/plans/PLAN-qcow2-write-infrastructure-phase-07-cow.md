@@ -64,19 +64,26 @@ Phase 7 is the opposite in three load-bearing ways that reshape the bar.
      **decrement** `refcount(D)` (the snapshot still references it: 2→1).
    - **L2-table COW** (`WriteError::SnapshotSharedL2Table`): allocate `T'`,
      copy `T → T'`, patch the L1 entry `T' | COPIED`, set `refcount(T')=1`,
-     **decrement** `refcount(T)`, **and increment the refcount of every
-     valid data cluster `T'` now references** (each was refcount 1 under
-     `T` alone; now two L2 tables — the snapshot's `T` and the active `T'`
-     — point at it, so 1→2, which makes those data clusters
-     `SnapshotShared` for any subsequent write through `T'`). This
-     child-increment loop over up to `cluster_size/8` entries is the
-     subtle, correctness-critical piece, and it can itself expand refcount
-     coverage (hence growth).
+     **decrement** `refcount(T)`, and **leave the child data clusters'
+     refcounts untouched**. (7p CORRECTION — the original plan's
+     "increment every child 1→2" was WRONG and would corrupt: qemu bumps
+     every reachable data cluster's refcount to ≥2 eagerly at
+     *snapshot-creation* time, so by the time an L2 table is COWed its
+     children are ALREADY rc≥2 with `OFLAG_COPIED` clear. Copying `T → T'`
+     merely redistributes the reference — before, one physical L2 entry in
+     `T` points at child `D`; after, `T'[j]→D` and `T[j]→D`, net child
+     delta 0 — so the refcount stays correct at its existing value. A
+     literal child-increment drives children to rc3 → `qemu-img check`
+     dirty → corruption. The children already classify `SnapshotShared`
+     (COPIED clear), so writing through `T'` into a child triggers the
+     per-child data-cluster COW above, per write. Verified version-
+     invariant, zero rc3 clusters, check clean — see "Findings: 7p".)
    Decrement is a new refblock mutation the snapshot allocator does not
-   currently expose; refcount coverage can grow during COW; and the
-   crash-ordering contract must place the copied data durable before the
-   pointer flip and the refcount changes last, exactly as the existing
-   ordering does for allocation.
+   currently expose; refcount coverage can still grow during COW (from the
+   NEW `T'`/`D'` allocations, not from child bumps); and the crash-ordering
+   contract must place the copied data durable before the pointer flip and
+   the refcount changes last, exactly as the existing ordering does for
+   allocation.
 
 ## Scope
 
@@ -159,18 +166,28 @@ exactly as-is and its qemu-parity test stays green.
    commit/rebase compute their own worst-case new-cluster count (COW
    allocates at most one new data cluster + one new L2 per touched shared
    cluster) and pass it across the boundary, exactly as bench passes
-   `worst_case_new_clusters`.
+   `worst_case_new_clusters`. **7p refinement:** the worst-case sizing must
+   count **refblock** growth even when the refcount *table* itself does not
+   grow (probe 4 saw a new refblock added with `refcount_table_clusters`
+   unchanged) — size on new refblocks needed, not on table-cluster growth.
 
-6. **Zero-flag WRITE-target policy (folded into 7a, small).** Independent
-   of the #432 read fix, `classify_l2_entry` still refuses a zero-flag
-   *target* entry as `UnknownL2Entry` (`lib.rs:1406-1409`). Phase 7's
-   decision: **treat a zero-flag target as `Unallocated`** (allocate a
-   fresh cluster / zero-fill the uncovered range), matching qemu's "write
-   into a zero cluster allocates" semantic and completing the zero-flag
-   story now that the read side is correct. This is a classification
-   refinement with its own unit test; if 7p shows a subtlety (e.g. a
-   zero-flag entry that also carries a host offset that must be freed),
-   fall back to keeping the refusal and record it — do not corrupt.
+6. **Zero-flag WRITE-target policy (folded into 7a, small; 7p-REFINED).**
+   Independent of the #432 read fix, `classify_l2_entry` still refuses a
+   zero-flag *target* entry as `UnknownL2Entry` (`lib.rs:1406-1409`). 7p
+   settled the exact qemu semantic (qemu does NOT free the old offset):
+   - **host offset == 0** (zero flag, no allocation) → classify
+     `Unallocated`: allocate a fresh cluster / zero-fill the uncovered
+     range.
+   - **host offset != 0** (zero flag over an allocated cluster) → classify
+     it EXACTLY like a `Standard` cluster by its refcount: **rc 1 → Owned**
+     (overwrite in place, clearing the zero bit; qemu reuses the offset,
+     no free), **rc > 1 → `SnapshotShared`** (COW). There is NO
+     "free the old offset" step — the original plan's blanket "treat as
+     Unallocated → allocate fresh" would leak the old host cluster
+     (rc 1, unreferenced → check dirty) or skip a required COW.
+   A classification refinement with its own unit tests (both host==0 and
+   host!=0 × rc). If 7a chooses to defer the host!=0 arm, **keep the
+   `UnknownL2Entry` refusal for it** — do not allocate-and-leak.
 
 7. **Wire codes.** COW *removes* refusal codes rather than adding them: the
    op-level `*_HAS_SNAPSHOTS` gates and the crate's `SnapshotShared` /
@@ -197,7 +214,7 @@ implementation must satisfy and a test pins.
 | # | Property | Verified by |
 |---|----------|-------------|
 | C1 | Data-cluster COW: shared `D` copied to fresh `D'`, L2 → `D'\|COPIED`, `rc(D')=1`, `rc(D)`−1; `D` never freed (snapshot holds it) | crate unit test + snapshot read-back |
-| C2 | L2-table COW: shared `T` copied to `T'`, L1 → `T'\|COPIED`, `rc(T')=1`, `rc(T)`−1, and **every valid child entry of `T'` gets `rc`+1** (1→2) | crate unit test asserting child refcounts + `qemu-img check` clean |
+| C2 | L2-table COW: shared `T` copied to `T'`, L1 → `T'\|COPIED`, `rc(T')=1`, `rc(T)`−1; child data-cluster refcounts **UNCHANGED** (already rc≥2 from snapshot creation — 7p; NO child-increment, which would corrupt to rc3) | crate unit test asserting children stay rc≥2 + `qemu-img check` clean (zero rc3) |
 | C3 | Nested COW: a write through a freshly-COWed `T'` whose child `D` is now shared (C2) triggers C1 on `D` in the same pass | crate unit + integration |
 | C4 | Crash order: copied data durable before the L2/L1 pointer flip; all refcount changes (incl. decrements + child increments) last, behind the final barrier | ordering test over the emitted step program |
 | C5 | Active view after COW is `qemu-img compare`-identical to qemu's result; `qemu-img check` clean (no `refcount=1 reference=2`, no leaks) | integration parity |
@@ -228,7 +245,7 @@ generator into differential-fuzz.
 |------|--------|-------|-----------|---------------------|
 | 7p | high | default | none | Empirical probes on the pre-COW binary + live qemu (scratchpad only, no tree changes). (1) Re-confirm qemu's COW refcount bookkeeping on the Q1 fixture: after `qemu-img commit` into a snapshot-shared backing, dump the exact refcounts of the COWed data clusters, the old vs new L2 tables, and every child of a COWed L2 — this pins C1/C2's numbers (esp. the child 1→2 increment) across the pinned versions. (2) The snapshot read-back oracle prototype: build the helper and confirm it discriminates Q1 mode-A corruption (preserved vs bled) and the Q2 read-through-new-backing semantic. (3) #432 live: build both a host==0 and a host!=0 classic zero-flag backing cluster (`qemu-io write -z`), read through the chain with today's binary, capture the mis-fill — the 7z regression fixtures. (4) COW+growth interaction: find the smallest snapshot-bearing fixture whose COW schedule crosses a refblock boundary (to exercise C9) and one that does not. (5) Nested-COW: a fixture with a snapshot-shared active L2 AND shared data under it, to pin C3 ordering. (6) Zero-flag WRITE target (decision 6): does qemu free the old host offset when overwriting a zero-flag-with-offset entry? — settles whether "treat as unallocated" is complete. Report recipes + the refcount tables + the read-back expected values per op. |
 | 7z | medium | default | none | The #432 read-path fix, standalone fix-first commit (decision 2). Add `QCOW_OFLAG_ZERO` (bit 0) to `crates/qcow2`; add a `ClusterLookup::Zero` verdict; fix the classic-L2 arm of `Qcow2State::cluster_lookup` (`lib.rs:2223-2238`) to return `Zero` when bit 0 is set (both host==0 and host!=0), and the twin `classify_qcow2_l2_standard` (`:1692`); teach `read_chain_virtual_cluster`/`_range` (`:5531/:6243`) to zero-fill the output for a `Zero` verdict instead of recursing to backing / reading stale host bytes. Regression tests using the 7p fixtures, exercised through `read_chain_virtual_*` directly AND end-to-end through rebase (`read_chain_cluster` `:1575`) and bench (`main.rs:1289`). Update `docs/quirks.md:1456-1472` from deferred→fixed. Do NOT touch the write planner or COW. make instar/lint/test-rust/sizes/`stestr run test_rebase test_bench`/pre-commit. STOP if the fix needs a write-side change (it should not). |
-| 7a | high | default | none | The crate COW branch — the phase's core (read this plan §"core net-new work" + the C-contract; grounded in the classification at `lib.rs:1395-1455`). Implement in `crates/qcow2-write`: (i) the `allow_snapshots`/`cow_enabled` capability on `check_envelope` relaxing `Gate::HasSnapshots` (decision 4b); (ii) data-cluster COW emission for `SnapshotShared` (C1: ReadCluster old→Bounce, alloc `D'`, WriteRange→`D'`, PatchEntryU64 L2, refcount +1 new / −1 old; sub-cluster RMW as today); (iii) L2-table COW emission for `SnapshotSharedL2Table` (C2: alloc `T'`, copy, PatchEntryU64 L1, refcount +1/−1, **child-increment loop** over `T'`'s valid entries; then proceed into `T'`); (iv) nested COW (C3); (v) the **refcount-decrement primitive** in the staged refblocks (net-new — the snapshot allocator only increments); (vi) decision 6 zero-flag-target→Unallocated; (vii) ordering per C4. PLUS the growth-execution sharing (decision 5): extract bench's `qcow2_grow_refcounts` + helpers into a shared guest-op growth module callable by all three ops (mechanism A unless 7p favours B — if B, that is a bigger crate change, flag before committing). Unit tests for C1-C4/C6-semantics + extend the phase-3 simulation harness with COW schedules (shared-data, shared-L2, nested, growth-crossing). make instar/lint/test-rust (quote the crate's line)/sizes/pre-commit. This step changes crates — that is expected (decision 8); STOP only if it needs a NEW StepKind (it should not) or a crate other than qcow2-write/qcow2. |
+| 7a | high | default | none | The crate COW branch — the phase's core (read this plan §"core net-new work" + the C-contract; grounded in the classification at `lib.rs:1395-1455`). Implement in `crates/qcow2-write`: (i) the `allow_snapshots`/`cow_enabled` capability on `check_envelope` relaxing `Gate::HasSnapshots` (decision 4b); (ii) data-cluster COW emission for `SnapshotShared` (C1: ReadCluster old→Bounce, alloc `D'`, WriteRange→`D'`, PatchEntryU64 L2, refcount +1 new / −1 old; sub-cluster RMW as today); (iii) L2-table COW emission for `SnapshotSharedL2Table` (C2, 7p-CORRECTED: alloc `T'`, copy, PatchEntryU64 L1, `rc(T')=1`, `rc(T)`−1, and **NO child-refcount change** — children are already rc≥2 from snapshot creation; a child-increment corrupts to rc3; then proceed into `T'`, whose children still classify `SnapshotShared` so per-child C1 fires per write); (iv) nested COW (C3); (v) the **refcount-decrement primitive** in the staged refblocks (net-new — the snapshot allocator only increments); (vi) decision 6 zero-flag-target classification (host==0 → Unallocated; host!=0 → Standard-by-refcount: rc1 Owned-overwrite-clearing-zero-bit, rc>1 SnapshotShared; NO free-old-offset); (vii) ordering per C4. PLUS the growth-execution sharing (decision 5): extract bench's `qcow2_grow_refcounts` + helpers into a shared guest-op growth module callable by all three ops (mechanism A unless 7p favours B — if B, that is a bigger crate change, flag before committing). Unit tests for C1-C4/C6-semantics + extend the phase-3 simulation harness with COW schedules (shared-data, shared-L2, nested, growth-crossing). make instar/lint/test-rust (quote the crate's line)/sizes/pre-commit. This step changes crates — that is expected (decision 8); STOP only if it needs a NEW StepKind (it should not) or a crate other than qcow2-write/qcow2. |
 | 7b | high | default | none | Migrate commit onto COW + growth. Remove the op gates (`main.rs:879/882`); pass `cow_enabled` to `check_envelope`; route `SnapshotShared`/`SnapshotSharedL2Table` into the crate's COW emission (no longer `ERROR_BACKING_INCONSISTENT`); wire the shared growth execution (decision 5) with commit's own worst-case-new-cluster count; keep `RefcountExhausted` (11) as the post-growth ceiling. Rewrite `TestCommitSnapshotGate` (`test_commit.py:911/:963`): refusal → COW success, sha-unchanged → snapshot-read-back-preserved (C6) + active-view compare + check-clean (C5) vs a qemu twin, over the Q1 fixture matrix. Existing non-snapshot commit suite + baselines UNCHANGED (C12). make instar/lint/test-rust/sizes/`stestr run test_commit`/pre-commit. STOP on any C5/C6 parity failure with decoded evidence (refcount dump + read-back diff). |
 | 7c | high | default | none | Migrate rebase safe mode onto COW + growth. Remove the gate (`main.rs:846`); the **read-through-new-backing** snapshot semantic (C7) is the load-bearing subtlety — the snapshot's virtual view must resolve through the new backing after rebase, matching qemu (Q2), NOT stay at old content and NOT be corrupted. COW the shared active L2 (C2) so the `refcount=1 reference=2` × 80 data-loss chain (#421) cannot occur. Wire growth (decision 5). Keep `run_qcow2_unsafe` + `test_unsafe_rebase_overlay_internal_snapshots_matches_qemu` (`:895`) untouched and green. Rewrite `TestRebaseSnapshotGate` (`test_rebase.py:837`): refusal → COW success with C7 read-back + C5 compare/check vs a qemu twin, over the Q2 fixture matrix (cs {512,65536} × psw {yes,no}). Note the cs=512 path (#422 fixed in phase 2; confirm no regression). make instar/lint/test-rust/sizes/`stestr run test_rebase`/pre-commit. STOP on C5/C7 parity failure with decoded evidence. |
 | 7d | medium | default | none | Adopt COW in bench `-w` (lift the last gate, `main.rs:642`). Remove the `nb_snapshots` gate; pass `cow_enabled`; route `SnapshotShared`/`SnapshotSharedL2Table` into COW (bench already imports growth, so C9 is inherited); snapshots preserved (C8). New integration test: `bench -w` into a snapshot-bearing image → check-clean + active-view compare vs a qemu twin + snapshot read-back preserved. Existing bench suite (incl. the 76 from phase 6 and the old refusal test, now rewritten) UNCHANGED otherwise. make instar/lint/test-rust/sizes/`stestr run test_bench`/pre-commit. STOP on C8 failure. |
@@ -254,9 +271,11 @@ Phases-4-6 deltas apply where they still make sense, plus:
 * **`qemu-img check` clean is mandatory on every COW result** — the
   `refcount=1 reference=2` class (#420/#421 mode B) and leaks are exactly
   what COW must eliminate; a check-dirty COW output is a STOP.
-* **The L2-COW child-increment (C2) is the highest-risk arithmetic** —
-  reviewer verifies the child-refcount loop and that it feeds growth
-  coverage correctly (C9).
+* **L2-COW must NOT touch child refcounts (C2, 7p)** — the highest-risk
+  arithmetic is a trap: children are already rc≥2 from snapshot creation,
+  so a child-increment corrupts them to rc3 (check-dirty). Reviewer
+  confirms L2-COW only copies + repoints + `rc(T')=1` + `rc(T)`−1, and a
+  test asserts zero rc3 clusters after a shared-L2 write.
 * **Decrement never frees a live cluster** — a COWed old cluster is still
   snapshot-referenced (rc ≥ 1 after −1); a reviewer confirms no path
   reaches rc 0 on a cluster a snapshot still maps (the #421 failure mode
@@ -269,3 +288,44 @@ Phases-4-6 deltas apply where they still make sense, plus:
 * **Crate changes are expected (decision 8)** but bounded to
   qcow2-write (COW) and qcow2 (#432); any other crate churn, or a new
   `StepKind`, is a STOP-and-discuss.
+
+## Findings: 7p probes (2026-07-13)
+
+All six 7p probes ran against the pre-COW binary + pinned qemu-img
+(6.2.0 / 8.2.0 / 10.2.0, version-invariant). Full report and reusable
+fixtures/scripts in scratchpad (`7p/FINDINGS.txt`, `7p/qcow2dump.py`,
+`7p/oracle/`, `7p/z432/`, `7p/fixtures/`); 7f folds the durable facts
+into docs. Two findings materially corrected this plan **before** 7a
+(applied above); the rest confirm the C-contract.
+
+1. **C2 child-increment was WRONG and would corrupt — corrected.** qemu
+   eagerly bumps every reachable data cluster to rc≥2 (COPIED clear) at
+   *snapshot-creation* time, so at L2-COW the children are already rc≥2;
+   copying `T→T'` redistributes the reference (net child delta 0) and
+   qemu leaves children untouched (histogram `{1:40, 2:16}`, zero rc3,
+   check clean, all versions). L2-COW must NOT increment children;
+   they already classify `SnapshotShared` so per-child C1 fires per
+   write. Plan §core-net-new-work, C2, decision-in-7a, and the review
+   checklist are corrected accordingly.
+2. **Decision-6 zero-flag target refined — qemu does NOT free the old
+   offset.** host==0 → allocate fresh (Unallocated); host!=0 rc1 →
+   reuse in place, clear the zero bit (Owned overwrite); host!=0 rc>1 →
+   COW (SnapshotShared). The original blanket "treat as Unallocated"
+   would leak the host!=0 cluster. Decision 6 corrected.
+3. **C1 confirmed** (data-cluster COW: `D`(rc2)→`D'`(rc1,COPIED),
+   old `D` 2→1, never freed).
+4. **C3 nested COW confirmed** — a single write into a shared-L2-over-
+   shared-data fixture COWs `T→T'` (children untouched, still rc2) then
+   COWs the target `D→D'` through `T'`; re-confirms finding 1.
+5. **C6/C7 read-back oracle prototyped** and the per-op expected shas
+   recorded (commit = PRESERVED: snap1 pre==post; rebase =
+   READ-THROUGH-NEW-BACKING: snap1 after == apply-snap1→`rebase -u`
+   onto base_new→convert). The oracle catches Q1 mode-A corruption that
+   `qemu-img check` passes clean. → 7e's expected values.
+6. **#432 fixtures built** — Case A (host==0, reads through to a lower
+   backing) and Case B (host!=0, reads stale host bytes), both
+   reproduced on today's binary via `instar convert` and `rebase -b ''`.
+   → 7z regression tests.
+7. **Growth (C9):** a cross-refblock-boundary snapshot fixture and a
+   within-headroom one recorded; plus the sizing refinement in
+   decision 5 (count refblock growth even when the RT does not grow).
