@@ -943,6 +943,21 @@ unsafe fn qcow2_grow_refcounts(
         }
     }
 
+    // ---- Materialize every newly provisioned refblock ----
+    // #433: qemu's invariant is that every refcount block referenced by
+    // the refcount table exists on disk. The RT entries for slots
+    // old_slots..new_slots were just written above, so each such block
+    // MUST be flushed to its host offset here — even the ones that
+    // received no structure refcount (an overwrite-only run allocates
+    // nothing, so stage_refcount above dirties none of the over-provisioned
+    // blocks). Marking them all dirty extends the file to cover the whole
+    // provisioned region and leaves no RT entry dangling past EOF. Without
+    // this, `qemu-img check` reports "refcount block N is outside image"
+    // after an overwrite-dominant run that crosses the growth threshold.
+    for slot in old_slots..new_slots {
+        ctx.dirty_set(slot);
+    }
+
     // ---- Eager flush of every dirty staged refblock ----
     // New blocks (zeroed except the structure refcounts) plus any
     // existing block that gained structure refcounts. Leaves the dirty

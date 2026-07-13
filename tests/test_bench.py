@@ -1477,6 +1477,44 @@ class TestBenchRefcountGrowth(BenchTestBase):
             self._assert_relocated_and_reusable(
                 a, before, after, probe_offset=16711680)
 
+    def test_overwrite_only_growth_check_clean_issue_433(self):
+        """Issue #433: an overwrite-only `-w` schedule that crosses
+        the preemptive refcount-growth threshold must leave the image
+        `qemu-img check`-clean (it silently corrupted it before the
+        fix).
+
+        Arithmetic (16M / cs=512, front 8 MiB prepopulated): -c 60
+        -s 65536 -S 65536 -o 0 covers [0, 3932160) (non-wrap:
+        59*65536 + 65536 = 3932160 < 16711680). Every target cluster
+        lies inside the prepopulated [0, 8388608) region, so every
+        write overwrites an already-allocated cluster in place and the
+        run allocates NOTHING.
+
+        Setup still provisions refblocks for the schedule's worst-case
+        (all-allocating) coverage and writes their host offsets into
+        the refcount table. Before the fix, `qcow2_grow_refcounts`
+        flushed only the refblocks that a run-time allocation dirtied;
+        an overwrite-only run dirties none, so the over-provisioned
+        blocks were referenced by the table but never materialized on
+        disk, dangling past EOF -- `qemu-img check` reported 31
+        "refcount block N is outside image" errors on an image that
+        was check-clean before the run, and bench still exited 0. The
+        fix materializes every provisioned refblock during growth,
+        restoring qemu's invariant that every RT-referenced block
+        exists on disk. The growth here stays within the existing RT's
+        slots, so the header geometry must NOT change.
+        """
+        self._require_kvm()
+        argv = ['-w', '-c', '60', '-s', '65536', '-S', '65536',
+                '--pattern', '66', '-f', 'qcow2']
+        with tempfile.TemporaryDirectory() as td:
+            _a, before, after = self._run_growth_parity(
+                td, argv, size='16M', cluster_size=512, fill_size='8M')
+            self.assertEqual(
+                before, after,
+                'in-place refblock growth must not move the refcount '
+                'table')
+
 
 class TestBenchJson(BenchTestBase):
     """The `--output json` schema (KVM; ~3 tests).
