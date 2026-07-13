@@ -296,15 +296,16 @@ Design sketch (to be settled in phase planning, not binding):
 | 6. Migrate bench `-w`; move the refcount-growth planner into the shared crate | PLAN-qcow2-write-infrastructure-phase-06-bench.md | Complete (2026-07-13; commits a93ed53 / e9905b7 / c50bfbd / f7bd81c / aae6083; see Findings) |
 | 7. Copy-on-write branch; lift bench's internal-snapshot gate; per-consumer COW policy per OQ3 | PLAN-qcow2-write-infrastructure-phase-07-cow.md | Complete (2026-07-13/14; plan 9cb5b59 / 9440464; commits 7z dabdcfd, 7a 125152a / 865c171, growth-share 1c9a0d8, 7b e356e27, 7c 997d223, 7d af99c21, 7e 0c07140; see Findings) |
 | 8. Fuzz: coverage-guided target for the new crate; differential coverage for newly-permitted snapshot-bearing writes | PLAN-qcow2-write-infrastructure-phase-08-fuzz.md | Complete (2026-07-14; plan 0038360; 8a 38b4427; 8b 1982aef; see Findings) |
-| 9. Docs: architecture notes, docs/qcow2/ implementation notes, per-op doc updates, CHANGELOG | PLAN-qcow2-write-infrastructure-phase-09-docs.md | Not started |
+| 9. Docs: architecture notes, docs/qcow2/ implementation notes, per-op doc updates, CHANGELOG | PLAN-qcow2-write-infrastructure-phase-09-docs.md | Complete (2026-07-14; plan d63f054; 9a 7597b32; 9b: this commit; see the Programme retrospective) |
 
 Phase 2 was conditional on phase 1 confirming a live defect;
 phase 1 confirmed three (see the Findings defect register), so
-phase 2 ran. Phases 1-8 are complete; phase 7 added copy-on-write
+phase 2 ran. All nine phases are complete; phase 7 added copy-on-write
 (resolving #420 / #421 / #423 and fixing #432), so all three
-consumers now succeed on snapshot-bearing images, and phase 8 fuzzed
+consumers now succeed on snapshot-bearing images, phase 8 fuzzed
 the new crate and its snapshot-bearing COW paths (0 crashes, 0
-divergences). Phase 9 (docs) remains.
+divergences), and phase 9 closed out the documentation (see the
+Programme retrospective / final state below).
 
 One commit per phase minimum; each commit builds, lints and tests
 clean on its own. Phases 4-6 are pure refactors from the outside:
@@ -1385,30 +1386,155 @@ docs/testing.md and CHANGELOG.md by this phase's 8c step, leaving
 phase 9 to fold in the remaining docs/qcow2 implementation notes and
 per-op doc updates.
 
+### Programme retrospective / final state
+
+Closed out 2026-07-14 (phase 9, docs). All nine phases are Complete; the
+shared write infrastructure shipped, the three consumers are migrated and
+copy-on-write capable, and every defect the work uncovered is resolved,
+fixed or a tracked typed refusal. The durable maintainer reference for the
+finished infrastructure is
+[docs/qcow2/qcow2-write-planner.md](../qcow2/qcow2-write-planner.md); the
+per-phase Findings sections above remain the historical record, and this
+section is the one-page end state.
+
+#### The nine phases
+
+| Phase | Outcome |
+|-------|---------|
+| 1. Semantics pin | Pinned qemu's snapshot-bearing commit/rebase behaviour empirically across 6.2.0–10.2.0 (qemu COWs and preserves; its rebase contract covers the active view only). Confirmed three live pre-existing defects, inventoried the parity oracles (no byte-identity surface for any v1 consumer), and settled the windowed step-program API + memory budget. |
+| 2. Interim safety gates | Byte-idempotent refusal gates for #420 / #421 and the newly-found overlay-side #423; root-caused #422 as a guest panic (not a livelock) and fixed it (c84743e). |
+| 3. `crates/qcow2-write` core | The pure `no_std` windowed step-program planner — classification, allocate-on-write, unified envelope gates, crash-ordering contract as emitted data — proven by a window-invariance property suite and a SimDisk crash-truncation harness. |
+| 4. Migrate commit | commit's qcow2 write path moved onto the crate via the new `crates/qcow2-write-exec` executor, byte-invisibly (migration-proof 73/73, diff-fuzz 0). Two probe-found silent-corruption shapes (compressed backings #427; holed refcount tables #428) became typed refusals. |
+| 5. Migrate rebase safe mode | Same, byte-invisibly (69/69, 1 pre-declared beyond-EOV raw divergence with proven virtual equality). Holed-RT overlays (#430) and extended-L2 overlays (#431) became typed refusals; the chain-reader zero-flag defect (#432) was identified. |
+| 6. Migrate bench `-w` + share growth | bench migrated (compare/check oracle, byte parity deliberately relaxed for allocating schedules); the refcount-growth planner moved into the crate's `growth` module. #433 (unmaterialized over-provisioned refblocks) fixed fix-first. |
+| 7. Copy-on-write | The net-new capability: data-cluster and L2-table COW (with the `max_rc < 3` no-child-increment invariant and a refcount-decrement primitive), adopted per consumer. Lifted the phase-2 gates, **resolving #420 / #421 / #423**; **fixed #432** fix-first (7z). Growth execution shared so commit/rebase can grow during COW. |
+| 8. Fuzz | Two coverage-guided crate targets (`fuzz_qcow2_write` with the `max_rc < 3` oracle over a feature-gated `sim` harness, `fuzz_qcow2_write_growth`) and the phase-7 read-back oracle scaled into the differential fuzzer's snapshot-bearing fixtures. 0 crashes, 0 divergences, no bug found; `cow-soak.py` folded in and retired. |
+| 9. Docs | The `docs/qcow2/qcow2-write-planner.md` reference (9a), the per-op / ARCHITECTURE consolidation, and this close-out + final acceptance (9b). |
+
+#### The shipped capability
+
+A shared qcow2 write planner (`crates/qcow2-write`, pure `no_std` planning
+math) plus its guest step executor (`crates/qcow2-write-exec`, call-table
+I/O) providing the callable "write N bytes at virtual offset X into an
+existing qcow2, allocating as needed" primitive: per-cluster classification
+(owned overwrite / unallocated allocate-on-write / snapshot-shared
+copy-on-write), L2 and data-cluster allocation, refcount maintenance and
+growth, the unified v1 envelope gates, and the crash-safe write-ordering
+contract emitted as typed steps. All three former inlined compositions now
+consume it — `commit`, `rebase` safe mode, and `bench -w` — inheriting the
+same COW and refcount-growth machinery instead of re-deriving it. Writes
+into snapshot-bearing images now copy shared clusters instead of corrupting
+or refusing them.
+
+#### Resolved defects
+
+* **#420** (commit silently corrupts backing snapshots) — RESOLVED by
+  phase-7 COW (7b, e356e27); the phase-2 interim gate (ac8f60a, error 14)
+  is lifted.
+* **#421** (rebase safe mode corrupts snapshot-shared overlay metadata,
+  with a data-loss chain) — RESOLVED by phase-7 COW (7c, 997d223); the
+  phase-2 gate (2fb9af4, error 14) is lifted.
+* **#423** (commit's overlay-clear pass corrupts refcounts on a
+  snapshot-bearing overlay — the overlay-side sibling of #420) — RESOLVED
+  by phase-7 COW (7b, e356e27); the phase-2 gate (ac8f60a, error 15) is
+  lifted (the clear pass is now skipped for snapshot-bearing overlays).
+* **#432** (the `crates/qcow2` chain reader ignored the classic-L2 zero
+  flag) — FIXED fix-first in phase 7 (7z, dabdcfd).
+* **#422** (rebase "livelock" on 512-byte-cluster overlays) — FIXED back
+  in phase 2 (c84743e); it was a guest panic, unrelated to the snapshot
+  work.
+
+Six further probe-found silent-corruption shapes are now typed,
+pre-mutation refusals rather than corruption: #427 (compressed backings),
+#428 / #430 (holed refcount tables, backing and overlay), #431
+(extended-L2 overlays); and #433 (unmaterialized over-provisioned
+refblocks in bench growth) was fixed fix-first.
+
+#### Documented follow-ups (not defects)
+
+* **Commit overlay non-emptying / an overlay-side COW-clear primitive.**
+  commit does not byte-empty a snapshot-bearing overlay (the clear pass is
+  skipped to avoid #423); the active view and snapshots are correct
+  without it. Full byte-emptying parity would need a primitive that COWs
+  the shared active metadata before zeroing it.
+* **A tighter rebase COW growth bound.** rebase sizes growth at
+  `2 × overlay_cluster_count`, coarser than the actual COW allocation
+  count (check-clean via #433's materialization); a tighter bound is
+  deferred.
+* **The debug-only growth-guard.** `plan_refcount_growth` carries a
+  `debug_assert!(false)` non-convergence guard that fires only in debug
+  builds on out-of-envelope (petabyte-scale) geometry; release returns
+  `GrowthOverflow` gracefully. Softening it to always return the error is
+  a minor follow-up.
+
+These, plus the larger items (qemu-lazy growth parity to unlock growth for
+the byte-parity consumers, `amend refcount_bits`, preallocation modes,
+extended-L2 / subcluster writes, the per-format siblings, and re-homing the
+`crates/snapshot` primitives) are carried in the Future work section below
+and surfaced in the reference's known-limitations section.
+
+#### Verification posture
+
+The migrations (phases 4-6) were proven **byte-invisible** — instar-before
+== instar-after over `scripts/migration-proof.py` matrices, with instar's
+own run-to-run determinism asserted as the premise. Copy-on-write (phase 7)
+is proven by **qemu-parity** instead — byte placement is explicitly
+unconstrained (qemu's own COW placement is nondeterministic at 512-byte
+clusters), so the bar is `qemu-img check` clean + active-view
+`qemu-img compare` identical to a qemu twin + a **snapshot read-back
+oracle** (apply-on-a-copy → convert to raw → sha256, `== qemu twin`) — the
+oracle that alone catches the #420 mode-A corruption invisible to
+check/compare/info. The crash-ordering contract (data durable before the
+pointer that reaches it; refcounts flushed last; Durability barriers that
+degrade to Ordering on fsync-less devices) is encoded as emitted step data
+and asserted by the crate's ordering property suite and SimDisk
+crash-truncation harness. Fuzz coverage (phase 8): the crate `sim` target
+with the `max_rc < 3` invariant oracle, plus snapshot-bearing differential
+coverage carrying the read-back oracle at scale.
+
 ## Administration and logistics
 
 ### Success criteria
 
-* `make instar` builds and `make lint` is clean.
-* Guest binaries pass `scripts/check-binary-sizes.sh`.
-* All Rust unit tests pass (`make test-rust`), including the new
-  `crates/qcow2-write` suite.
-* All Python integration tests pass, including the commit /
+All met, confirmed at the phase-9b acceptance gate (2026-07-14, HEAD
+7597b32) unless a phase reference is given:
+
+* [x] `make instar` builds and `make lint` is clean. — 9b: both exit 0
+  ("All checks passed!").
+* [x] Guest binaries pass `scripts/check-binary-sizes.sh`. — 9b: all 15
+  ops within budget (commit 6%, rebase 7%, bench 23% of 768 KiB).
+* [x] All Rust unit tests pass (`make test-rust`), including the new
+  `crates/qcow2-write` suite. — 9b: 1720 passed / 0 failed
+  (qcow2-write 75, qcow2-write-exec 24 included).
+* [x] All Python integration tests pass, including the commit /
   rebase / bench suites, with **zero changes to existing
-  cross-version baselines** — the migrations are byte-invisible.
-* Differential-fuzz soaks for commit, rebase and bench report 0
-  divergences after migration.
-* Copy-on-write: writes into snapshot-bearing qcow2 images leave
+  cross-version baselines** — the migrations are byte-invisible. —
+  proven per phase in the migration-proof runs (phase 4: 73/73;
+  phase 5: 69/69; phase 6: 56/56) with unmodified testdata baselines;
+  9b re-ran a representative snapshot-COW smoke per op (all pass).
+* [x] Differential-fuzz soaks for commit, rebase and bench report 0
+  divergences after migration. — 300-iteration soaks per op ran 0
+  divergences (phases 4/5/6); 9b re-ran a combined `commit,rebase,bench`
+  soak (0 divergences).
+* [x] Copy-on-write: writes into snapshot-bearing qcow2 images leave
   `qemu-img check` clean, the active view `qemu-img compare`
   identical to qemu's result, and every pre-existing snapshot's
   content bit-identical when applied (verified via qemu-img
-  snapshot -a on copies).
-* The phase-1 findings (qemu's snapshot-bearing commit / rebase
+  snapshot -a on copies). — phase 7: `tests/test_cow_cross_version.py`
+  (pinned qemu 6.2.0–10.2.0, 30 combos) + the read-back oracle; the
+  invariant is `== qemu twin`, not a blanket "snapshot unchanged".
+* [x] The phase-1 findings (qemu's snapshot-bearing commit / rebase
   behaviour) are recorded in this plan, and any live defect found
-  is gated and tracked before phases 3+ begin.
-* `pre-commit run --all-files` passes.
-* docs/, ARCHITECTURE.md, AGENTS.md, README.md and CHANGELOG.md
-  are updated; the plans index reflects final status.
+  is gated and tracked before phases 3+ begin. — phase 1 Findings +
+  the phase-2 gates (#420 / #421 / #423 gated before phase 3).
+* [x] `pre-commit run --all-files` passes. — 9b: clean.
+* [x] docs/, ARCHITECTURE.md, AGENTS.md, README.md and CHANGELOG.md
+  are updated; the plans index reflects final status. — ARCHITECTURE,
+  docs/testing.md and CHANGELOG updated across phases 7f/8c; the
+  durable `docs/qcow2/qcow2-write-planner.md` reference + per-op
+  consolidation landed in 9a; the master-plan retrospective, the
+  Success Criteria confirmation, and `docs/plans/index.md` final status
+  land in 9b.
 
 ### Future work
 
@@ -1544,7 +1670,13 @@ sections; #420-#422 filed 2026-07-12:
     Variant-B zero-flag read-path corruption (#432) remains
     unfixed by phase 6.
 
-Fix status is tracked here as phases land.
+Final state (programme closed 2026-07-14): all four snapshot-corruption
+defects are resolved or fixed — #420 / #421 / #423 by phase-7
+copy-on-write and #432 by the phase-7 fix-first read fix, with #422 fixed
+back in phase 2. The six other probe-found silent-corruption shapes
+(#427 / #428 / #430 / #431, and #433 which was fixed fix-first) are typed,
+pre-mutation refusals or corrected in place. No defect from this work
+remains open as corruption.
 
 ### Documentation index maintenance
 
