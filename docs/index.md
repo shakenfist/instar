@@ -111,6 +111,7 @@ derived from qemu source code analysis.
 | [L1/L2 Tables](qcow2/qcow2-l1l2-tables.md) | Address translation, cluster types, extended L2 |
 | [Reference Counting](qcow2/qcow2-refcount.md) | Refcount tables, variable widths, COW semantics |
 | [Snapshots](qcow2/qcow2-snapshots.md) | Snapshot table format, operations, VM state |
+| [Write Planner and Executor](qcow2/qcow2-write-planner.md) | Shared in-place write infrastructure: step-program ABI, envelope, allocate-on-write, copy-on-write, refcount growth, crash ordering |
 | [Compression](qcow2/qcow2-compression.md) | ZLIB/ZSTD implementation, compressed entries |
 | [Encryption](qcow2/qcow2-encryption.md) | LUKS header, key slots, IV generation |
 | [Implementation Notes](qcow2/qcow2-implementation-notes.md) | Common pitfalls, validation, external refs |

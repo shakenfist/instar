@@ -4143,6 +4143,9 @@ fn map_bench_error(code: u32, error_detail: u64) -> String {
         c if c == shared::BenchResult::ERROR_ALLOC_EXHAUSTED => {
             "bench: image too large for in-place bench write".to_string()
         }
+        c if c == shared::BenchResult::ERROR_IMAGE_INCONSISTENT => {
+            "bench: image metadata is inconsistent".to_string()
+        }
         other => format!("bench: guest returned an unknown error code ({other})"),
     }
 }
@@ -5331,12 +5334,12 @@ mod bench_validate_tests {
 
     #[test]
     fn bench_error_codes_have_messages() {
-        // Every numeric BenchResult::ERROR_* code we ship (0..=8) must
+        // Every numeric BenchResult::ERROR_* code we ship (0..=9) must
         // render to a non-empty message, and an unknown code must
         // name itself in the fallback text -- if a future ERROR_*
         // lands without a matching arm in map_bench_error, this test
         // catches the silent fallthrough.
-        for code in 0..=8u32 {
+        for code in 0..=9u32 {
             let msg = map_bench_error(code, 0);
             assert!(!msg.is_empty(), "code {code} has empty message");
         }
@@ -6885,7 +6888,7 @@ fn render_rebase_success(
 
 /// Map a `RebaseResult::ERROR_*` code to a user-facing
 /// string. Exhaustive on the constants from
-/// `src/shared/src/lib.rs` (0..=13); the trailing catch-all
+/// `src/shared/src/lib.rs` (0..=16); the trailing catch-all
 /// covers future code additions only.
 fn map_rebase_error(code: u32) -> String {
     match code {
@@ -6939,6 +6942,25 @@ fn map_rebase_error(code: u32) -> String {
         c if c == shared::RebaseResult::ERROR_INTERNAL_OVERFLOW => {
             "internal size or offset computation overflowed (host or guest bug)".into()
         }
+        c if c == shared::RebaseResult::ERROR_OVERLAY_HAS_SNAPSHOTS => {
+            "the overlay has internal snapshots; a safe-mode rebase would \
+             corrupt them. Use -u for a metadata-only rebase or fall back \
+             to `qemu-img rebase`"
+                .into()
+        }
+        c if c == shared::RebaseResult::ERROR_OVERLAY_UNSUPPORTED => {
+            "the overlay uses features instar rebase does not support \
+             (extended L2 entries, or unknown/compression feature bits). \
+             Use -u for a metadata-only rebase or fall back to \
+             `qemu-img rebase`"
+                .into()
+        }
+        c if c == shared::RebaseResult::ERROR_OVERLAY_INCONSISTENT => {
+            "the overlay's metadata is inconsistent (refcounts, table \
+             flags or layout); refusing to write into it. Run `qemu-img \
+             check` on the overlay, or fall back to `qemu-img rebase`"
+                .into()
+        }
         _ => format!("unknown rebase error code {code}"),
     }
 }
@@ -6979,8 +7001,8 @@ fn render_commit_success(
 }
 
 /// Map a `CommitResult::ERROR_*` code to a user-facing string.
-/// Exhaustive on the 14 constants from
-/// `src/shared/src/lib.rs` (0..=13); the trailing catch-all
+/// Exhaustive on the 18 constants from
+/// `src/shared/src/lib.rs` (0..=17); the trailing catch-all
 /// covers future code additions only.
 fn map_commit_error(code: u32) -> String {
     match code {
@@ -7029,6 +7051,28 @@ fn map_commit_error(code: u32) -> String {
         }
         c if c == shared::CommitResult::ERROR_INTERNAL_OVERFLOW => {
             "internal size or offset computation overflowed (host or guest bug)".into()
+        }
+        c if c == shared::CommitResult::ERROR_BACKING_HAS_SNAPSHOTS => {
+            "the backing file has internal snapshots; committing would corrupt \
+             them. Fall back to `qemu-img commit`"
+                .into()
+        }
+        c if c == shared::CommitResult::ERROR_OVERLAY_HAS_SNAPSHOTS => {
+            "the overlay has internal snapshots; the post-commit clear pass \
+             would corrupt them. Fall back to `qemu-img commit`"
+                .into()
+        }
+        c if c == shared::CommitResult::ERROR_BACKING_UNSUPPORTED => {
+            "the backing file uses features instar commit does not support \
+             (unknown or compression feature bits). Fall back to \
+             `qemu-img commit`"
+                .into()
+        }
+        c if c == shared::CommitResult::ERROR_BACKING_INCONSISTENT => {
+            "the backing file's metadata is inconsistent (refcounts, table \
+             flags or layout); refusing to write into it. Run `qemu-img \
+             check` on the backing, or fall back to `qemu-img commit`"
+                .into()
         }
         _ => format!("unknown commit error code {code}"),
     }

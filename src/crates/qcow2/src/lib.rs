@@ -110,6 +110,16 @@ pub const SUPPORTED_INCOMPAT_FEATURES: u64 = INCOMPAT_DIRTY
     | INCOMPAT_EXTENDED_L2;
 
 // L1/L2 entry masks and flags
+/// Bit 0 set on a standard (non-extended) L2 entry marks the cluster
+/// as reading all zeroes, per the qcow2 spec's standard cluster
+/// descriptor ("Bit 0: If set, the cluster reads as all zeros. The
+/// host cluster offset ... may be used to describe a preallocated
+/// zero cluster"). This holds regardless of the host-offset field:
+/// `host_offset == 0` is `QCOW2_CLUSTER_ZERO_PLAIN`, `host_offset !=
+/// 0` is `QCOW2_CLUSTER_ZERO_ALLOC`; both read as zeros. Only defined
+/// for standard L2 entries — extended-L2 zero status lives in the
+/// per-subcluster zero bitmap, not this bit.
+pub const QCOW_OFLAG_ZERO: u64 = 1;
 /// Bit 62 set indicates a compressed cluster in an L2 entry
 pub const OFLAG_COMPRESSED: u64 = 1 << 62;
 /// Bit 63 set indicates the cluster (L2 table for an L1 entry, or
@@ -1322,6 +1332,14 @@ shared::cached_read!(read_u8_cached, u8, be, 1);
 pub enum ClusterLookup {
     /// Cluster is unallocated (reads as zeros, or from backing)
     Unallocated,
+    /// Classic (non-extended) L2 entry with the qcow2 v3 all-zeroes
+    /// flag (`QCOW_OFLAG_ZERO`, bit 0) set. The cluster reads as all
+    /// zeros regardless of the host-offset field; the chain reader
+    /// must zero-fill it and must NOT fall through to a backing layer
+    /// (unlike `Unallocated`) nor read the host offset (unlike
+    /// `Standard`). The extended-L2 equivalent is expressed through
+    /// `StandardSubclusters`' zero bitmap.
+    Zero,
     /// Standard cluster at given host byte offset
     Standard(u64),
     /// Standard cluster with extended L2 subcluster bitmap.
@@ -1671,6 +1689,12 @@ pub fn count_allocated_in_l2_extended(
 ///   cluster occupies one cluster's worth of virtual space at the
 ///   masked file offset; the embedded length-in-sectors field is
 ///   not extracted (map only reports file_offset, not file_length).
+/// - `entry & QCOW_OFLAG_ZERO != 0` (bit 0) → `ZeroAllocated`. The
+///   qcow2 v3 all-zeroes flag on a standard L2 entry reads as zeros
+///   regardless of the host-offset field (`host_offset == 0` is
+///   `ZERO_PLAIN`, `host_offset != 0` is `ZERO_ALLOC`); qemu-img map
+///   reports both as `present: true, zero: true, data: false`. This
+///   mirrors `cluster_lookup`'s `ClusterLookup::Zero` verdict.
 /// - Otherwise, `host_offset = entry & L2_OFFSET_MASK`:
 ///   - `host_offset == 0` → `Hole` (matches cluster_lookup's
 ///     "host_offset == 0 && !extended_l2 → Unallocated" path).
@@ -1680,15 +1704,6 @@ pub fn count_allocated_in_l2_extended(
 /// virtual address of the cluster's first byte; the caller is
 /// responsible for clamping `length` against virtual_size if the
 /// cluster straddles end-of-image.
-///
-/// instar's qcow2 parser does not implement the qcow2 v3
-/// `QCOW_OFLAG_ZERO` bit (bit 0) for standard L2 entries; the
-/// rest of the codebase (cluster_lookup, scan_allocation) treats
-/// any non-zero entry without `OFLAG_COMPRESSED` as `Standard`.
-/// map matches that behaviour for consistency. ZeroAllocated
-/// reporting is exclusively driven by the extended-L2 subcluster
-/// bitmap. Documented in `docs/quirks.md § qcow2 v3 standard-L2
-/// `QCOW_OFLAG_ZERO` not honoured`.
 pub fn classify_qcow2_l2_standard(entry: u64, virtual_offset: u64, cluster_size: u64) -> MapExtent {
     if entry == 0 {
         return MapExtent {
@@ -1703,6 +1718,15 @@ pub fn classify_qcow2_l2_standard(entry: u64, virtual_offset: u64, cluster_size:
             start: virtual_offset,
             length: cluster_size,
             state: MapExtentState::Data { file_offset },
+        };
+    }
+    if (entry & QCOW_OFLAG_ZERO) != 0 {
+        // qcow2 v3 all-zeroes flag (bit 0): reads as zeros regardless
+        // of the host-offset field (ZERO_PLAIN / ZERO_ALLOC).
+        return MapExtent {
+            start: virtual_offset,
+            length: cluster_size,
+            state: MapExtentState::ZeroAllocated,
         };
     }
     let host_offset = entry & L2_OFFSET_MASK;
@@ -2220,21 +2244,34 @@ impl Qcow2State {
             }
         } else if (l2_entry & OFLAG_COMPRESSED) != 0 {
             Some(ClusterLookup::Compressed(l2_entry))
-        } else {
-            let host_offset = l2_entry & L2_OFFSET_MASK;
-            if host_offset == 0 && !self.extended_l2 {
-                Some(ClusterLookup::Unallocated)
-            } else if self.extended_l2 {
-                let alloc_bits = bitmap as u32;
-                let zero_bits = (bitmap >> 32) as u32;
-                if alloc_bits == 0xFFFF_FFFF && zero_bits == 0 {
-                    // All subclusters allocated, none zeroed — same as Standard
-                    Some(ClusterLookup::Standard(host_offset))
-                } else {
-                    Some(ClusterLookup::StandardSubclusters(host_offset, bitmap))
-                }
+        } else if !self.extended_l2 {
+            // Classic (non-extended) L2 entry. Bit 0 (QCOW_OFLAG_ZERO)
+            // wins over the host-offset field: a set zero flag means the
+            // cluster reads as all zeros whether host_offset is 0
+            // (ZERO_PLAIN) or not (ZERO_ALLOC). Test it before the
+            // host_offset==0 → Unallocated fallback so a zero-flag entry
+            // is never mis-routed to Unallocated or Standard.
+            if (l2_entry & QCOW_OFLAG_ZERO) != 0 {
+                Some(ClusterLookup::Zero)
             } else {
+                let host_offset = l2_entry & L2_OFFSET_MASK;
+                if host_offset == 0 {
+                    Some(ClusterLookup::Unallocated)
+                } else {
+                    Some(ClusterLookup::Standard(host_offset))
+                }
+            }
+        } else {
+            // Extended L2: zero status is carried by the subcluster
+            // zero bitmap, not bit 0 of the entry.
+            let host_offset = l2_entry & L2_OFFSET_MASK;
+            let alloc_bits = bitmap as u32;
+            let zero_bits = (bitmap >> 32) as u32;
+            if alloc_bits == 0xFFFF_FFFF && zero_bits == 0 {
+                // All subclusters allocated, none zeroed — same as Standard
                 Some(ClusterLookup::Standard(host_offset))
+            } else {
+                Some(ClusterLookup::StandardSubclusters(host_offset, bitmap))
             }
         }
     }
@@ -5122,6 +5159,216 @@ mod tests {
         // full interior sector, and a partial tail. Assert exact bytes.
         check_read_cluster(600, 1536, 32);
     }
+
+    // ====================================================================
+    // #432: classic (non-extended) L2 zero-flag (QCOW_OFLAG_ZERO, bit 0)
+    // ====================================================================
+    //
+    // A classic v3 L2 entry with bit 0 set reads as all zeros regardless
+    // of its host-offset field. Before the 7z fix cluster_lookup ignored
+    // the bit, so a host==0 zero-flag entry was mis-classified as
+    // Unallocated (fell through to backing) and a host!=0 one as
+    // Standard (read stale host bytes). These tests exercise both.
+
+    // Byte size of the in-memory qcow2 image the #432 mock serves.
+    const Z432_IMG_LEN: usize = 8192;
+
+    // Serialize tests touching the Z432 globals (extern "C" callbacks can
+    // only close over 'static state; mirrors the READ_TEST_LOCK pattern).
+    static Z432_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static mut Z432_IMG: [u8; Z432_IMG_LEN] = [0u8; Z432_IMG_LEN];
+    static mut Z432_CAP_SECTORS: u64 = 0;
+
+    // Sector size and cluster geometry the #432 fixture uses.
+    const Z432_SSZ: usize = 512;
+
+    unsafe extern "C" fn z432_read_sector(
+        _device_idx: u32,
+        sector: u64,
+        out_buf: *mut u8,
+        sector_size: usize,
+    ) -> bool {
+        let start = (sector as usize).saturating_mul(sector_size);
+        if start + sector_size > Z432_IMG_LEN {
+            return false;
+        }
+        let base = core::ptr::addr_of!(Z432_IMG) as *const u8;
+        core::ptr::copy_nonoverlapping(base.add(start), out_buf, sector_size);
+        true
+    }
+
+    unsafe extern "C" fn z432_capacity(_device_idx: u32) -> u64 {
+        Z432_CAP_SECTORS
+    }
+
+    fn z432_call_table() -> shared::CallTable {
+        shared::CallTable {
+            read_input_sector: z432_read_sector,
+            get_input_capacity: z432_capacity,
+            ..stub_call_table()
+        }
+    }
+
+    /// Build the in-memory classic-L2 fixture into `Z432_IMG` and set the
+    /// served capacity. Layout (cluster_size = 512, 8-byte entries):
+    ///   - L1 table at 512: L1[0] → L2 table at 1024.
+    ///   - L2 table at 1024:
+    ///       [0] @1024 = QCOW_OFLAG_ZERO           → host==0 zero-flag.
+    ///       [1] @1032 = 2048 | COPIED | ZERO      → host!=0 zero-flag.
+    ///       [2] @1040 = 2048 | COPIED             → plain Standard guard.
+    ///   - Data region at host offset 2048 filled with 0xDD, so a stale
+    ///     Standard read of the zero-flag entry [1] would return 0xDD.
+    unsafe fn z432_build_image() {
+        let mut img = [0u8; Z432_IMG_LEN];
+        let mut put = |off: usize, v: u64| {
+            img[off..off + 8].copy_from_slice(&v.to_be_bytes());
+        };
+        put(512, 1024 | OFLAG_COPIED);
+        put(1024, QCOW_OFLAG_ZERO);
+        put(1032, 2048 | OFLAG_COPIED | QCOW_OFLAG_ZERO);
+        put(1040, 2048 | OFLAG_COPIED);
+        for b in img[2048..2560].iter_mut() {
+            *b = 0xDD;
+        }
+        let dst = core::ptr::addr_of_mut!(Z432_IMG) as *mut u8;
+        core::ptr::copy_nonoverlapping(img.as_ptr(), dst, Z432_IMG_LEN);
+        Z432_CAP_SECTORS = (Z432_IMG_LEN / Z432_SSZ) as u64;
+    }
+
+    /// Construct a `Qcow2State` matching the #432 fixture geometry. The
+    /// caller owns the two cache buffers (each ≥ MAX_SECTOR_SIZE).
+    fn z432_state(l1_cache: &mut [u8], l2_cache: &mut [u8]) -> Qcow2State {
+        Qcow2State {
+            device_idx: 0,
+            cluster_size: Z432_SSZ as u64,
+            cluster_bits: 9,
+            l1_size: 1,
+            l1_table_offset: 512,
+            incompatible_features: 0,
+            compression_type: 0,
+            crypt_method: 0,
+            luks_ext_offset: 0,
+            luks_ext_len: 0,
+            extended_l2: false,
+            l1_cached_sector: u64::MAX,
+            l1_cache_buf: l1_cache.as_mut_ptr(),
+            l2_cached_sector: u64::MAX,
+            l2_cache_buf: l2_cache.as_mut_ptr(),
+        }
+    }
+
+    #[test]
+    fn classic_zero_flag_cluster_lookup_returns_zero() {
+        let _guard = Z432_LOCK.lock().unwrap();
+        unsafe {
+            z432_build_image();
+        }
+        let call_table = z432_call_table();
+        let mut l1_cache = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut l2_cache = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut state = z432_state(&mut l1_cache, &mut l2_cache);
+        let cap = (Z432_IMG_LEN / Z432_SSZ) as u64;
+        let mut bytes_read = 0u64;
+
+        // vo=0 → L2[0], host==0 zero-flag → Zero (was Unallocated pre-fix).
+        let a = unsafe { state.cluster_lookup(&call_table, 0, Z432_SSZ, cap, &mut bytes_read) };
+        assert!(
+            matches!(a, Some(ClusterLookup::Zero)),
+            "host==0 zero-flag must resolve to Zero, got a non-Zero verdict"
+        );
+
+        // vo=512 → L2[1], host!=0 zero-flag → Zero (was Standard pre-fix).
+        let b = unsafe { state.cluster_lookup(&call_table, 512, Z432_SSZ, cap, &mut bytes_read) };
+        assert!(
+            matches!(b, Some(ClusterLookup::Zero)),
+            "host!=0 zero-flag must resolve to Zero, got a non-Zero verdict"
+        );
+
+        // vo=1024 → L2[2], no zero-flag → Standard (guard against
+        // over-broadening the new branch).
+        let c = unsafe { state.cluster_lookup(&call_table, 1024, Z432_SSZ, cap, &mut bytes_read) };
+        assert!(
+            matches!(c, Some(ClusterLookup::Standard(2048))),
+            "plain allocated entry must stay Standard(2048)"
+        );
+    }
+
+    #[test]
+    fn classic_zero_flag_chain_read_is_all_zero() {
+        let _guard = Z432_LOCK.lock().unwrap();
+        unsafe {
+            z432_build_image();
+        }
+        let call_table = z432_call_table();
+        let mut l1_cache = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut l2_cache = std::vec![0u8; MAX_SECTOR_SIZE];
+        let state = z432_state(&mut l1_cache, &mut l2_cache);
+
+        let mut chain_states = ChainStates::default();
+        chain_states.qcow2_states[0] = Some(state);
+
+        let mut chain_config = ChainConfig::new();
+        chain_config.magic = ChainConfig::MAGIC;
+        chain_config.version = ChainConfig::VERSION;
+        chain_config.device_count = 1;
+        chain_config.devices[0].format = ImageFormat::Qcow2 as u32;
+        chain_config.devices[0].cluster_size = Z432_SSZ as u32;
+        chain_config.devices[0].data_device_idx = 0;
+
+        let mut compressed_buf = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut staging_buf = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut staging_cluster_offset = u64::MAX;
+
+        // Read both zero-flag clusters through the single-device chain. A
+        // correct read yields all zeros; pre-fix the host!=0 entry (vo=512)
+        // returned the stale 0xDD host bytes.
+        for vo in [0u64, 512u64] {
+            let mut buf = std::vec![0xAAu8; Z432_SSZ];
+            let mut bytes_read = 0u64;
+            let ok = unsafe {
+                read_chain_virtual_cluster(
+                    &call_table,
+                    0,
+                    1,
+                    vo,
+                    buf.as_mut_ptr(),
+                    Z432_SSZ as u64,
+                    Z432_SSZ,
+                    &chain_config,
+                    &mut chain_states,
+                    compressed_buf.as_mut_ptr(),
+                    staging_buf.as_mut_ptr(),
+                    &mut staging_cluster_offset,
+                    None,
+                    None,
+                    0,
+                    &mut bytes_read,
+                )
+            };
+            assert!(ok, "read_chain_virtual_cluster returned false at vo={vo}");
+            assert!(
+                buf.iter().all(|&b| b == 0),
+                "zero-flag cluster at vo={vo} must read as all zeros, got {:02x?}",
+                &buf[..16]
+            );
+        }
+    }
+
+    #[test]
+    fn classify_standard_zero_flag_host_zero_is_zeroallocated() {
+        // QCOW_OFLAG_ZERO with host_offset == 0 (ZERO_PLAIN).
+        let e = classify_qcow2_l2_standard(QCOW_OFLAG_ZERO, 0, 65536);
+        assert_eq!(e.state, MapExtentState::ZeroAllocated);
+    }
+
+    #[test]
+    fn classify_standard_zero_flag_host_nonzero_is_zeroallocated() {
+        // QCOW_OFLAG_ZERO with a host offset set (ZERO_ALLOC); the zero
+        // flag wins over the Data classification the offset would imply.
+        let entry = 0x0005_0000 | OFLAG_COPIED | QCOW_OFLAG_ZERO;
+        let e = classify_qcow2_l2_standard(entry, 0, 65536);
+        assert_eq!(e.state, MapExtentState::ZeroAllocated);
+    }
 }
 
 /// Look up the refcount for a host cluster via two-level table indirection.
@@ -5569,6 +5816,14 @@ pub unsafe fn read_chain_virtual_cluster(
                 {
                     Some(ClusterLookup::Unallocated) => {
                         continue;
+                    }
+                    Some(ClusterLookup::Zero) => {
+                        // Classic qcow2 v3 all-zeroes cluster (L2 bit 0):
+                        // reads as zeros regardless of host offset. Zero-fill
+                        // this chunk and stop — do NOT fall through to a
+                        // backing layer, and do NOT read the host offset.
+                        core::ptr::write_bytes(buf, 0, chunk_size as usize);
+                        return true;
                     }
                     Some(ClusterLookup::StandardSubclusters(host_offset, bitmap)) => {
                         let alloc_bits = bitmap as u32;

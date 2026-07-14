@@ -31,6 +31,7 @@ success-path tests require ``/dev/kvm`` access; the error
 paths don't.
 """
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -39,6 +40,7 @@ from pathlib import Path
 
 from base import InstarTestBase
 from helpers.info_json import assert_info_equivalent
+from helpers.snapshot_readback import snapshot_readback
 
 
 # ----------------------------------------------------------------------
@@ -710,3 +712,907 @@ for _target, _cases in REBASE_CASES.items():
             TestRebaseBaselineMatrix, _name,
             _make_rebase_baseline_test(_target, _case),
         )
+
+
+# ----------------------------------------------------------------------
+# Internal-snapshot gate — phase 2 of
+# PLAN-qcow2-write-infrastructure (GitHub issue #421). Safe-mode
+# `instar rebase` (any mode without -u, including safe detach)
+# refuses, byte-idempotently, when the overlay carries internal
+# snapshots: safe mode mutates snapshot-shared L2 tables in place
+# and sets refcount=1 on clusters two L1 trees reference, so a
+# routine `qemu-img snapshot -d` afterwards frees live
+# active-view data. `-u` metadata-only rebase never touches
+# snapshot-shared clusters and stays allowed (parity-tested
+# below). Phase 7's snapshot-aware COW is the real fix.
+# ----------------------------------------------------------------------
+
+
+class TestRebaseSnapshotCow(TestRebaseSmoke):
+    """Safe-mode overlay-snapshot COW parity vs qemu + `-u` parity (#421).
+
+    Phase 7 step 7c lifts the interim phase-2 refusal gate: a
+    safe-mode rebase of a snapshot-bearing overlay now succeeds by
+    copy-on-write instead of refusing. The proof is qemu-parity,
+    NOT before/after byte identity (C11): the rebased overlay's
+    active view is `qemu-img compare`-identical to a `qemu-img
+    rebase` (safe) twin and `qemu-img check`-clean — no
+    `refcount=1 reference=2` (the #421 signature) and no leaks
+    (C5) — and every pre-existing snapshot's virtual view (via the
+    snapshot read-back oracle) equals the qemu twin's read-back
+    (C7). rebase's snapshot semantic is the OPPOSITE of commit's:
+    qemu's safe-rebase contract covers the active view only, so a
+    snapshot's unallocated ranges silently read through the NEW
+    backing afterwards — the read-back expected value is the
+    snapshot read THROUGH base_new, matching qemu, never the
+    snapshot's pre-rebase content.
+    """
+
+    def setUp(self):
+        super().setUp()
+        if shutil.which('qemu-img') is None:
+            self.skipTest('system qemu-img not installed')
+        if shutil.which('qemu-io') is None:
+            self.skipTest('system qemu-io not installed')
+
+    @staticmethod
+    def sha256(path):
+        """Return the sha256 hex digest of a file's full contents."""
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _run_tool(self, argv, cwd, timeout=60):
+        """Run a qemu tool with cwd in the fixture dir; assert rc 0."""
+        r = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout,
+            cwd=str(cwd))
+        self.assertEqual(
+            r.returncode, 0,
+            f'{argv[0]} failed: argv={argv!r} stderr={r.stderr!r}')
+        return r
+
+    def _build_bases(self, fixture_dir, cluster_size=65536):
+        """Create the phase-1 Q2 backing pair in `fixture_dir`.
+
+        base_old.qcow2 (6M, 0x11 at [0,4M)) and base_new.qcow2
+        (6M, 0x22 at [2M,6M)), both at `cluster_size`. Idempotent
+        so twin overlays can share one pair (identical
+        `full-backing-filename` keeps the info JSONs
+        comparable). `cluster_size=512` drives the COW schedule
+        across a refcount-refblock boundary (the growth/relocation
+        path, C9) and exercises the cs=512 walk that had the #422
+        livelock (fixed in phase 2 — must not regress/hang).
+        """
+        fixture_dir = Path(fixture_dir)
+        fixture_dir.mkdir(parents=True, exist_ok=True)
+        opt = f'cluster_size={cluster_size}'
+        for name, pattern in (
+                ('base_old.qcow2', 'write -P 0x11 0 4M'),
+                ('base_new.qcow2', 'write -P 0x22 2M 4M')):
+            if (fixture_dir / name).exists():
+                continue
+            self._run_tool(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-o', opt, name, '6M'],
+                fixture_dir)
+            self._run_tool(
+                ['qemu-io', '-f', 'qcow2', '-c', pattern, name],
+                fixture_dir)
+        return fixture_dir / 'base_old.qcow2', fixture_dir / 'base_new.qcow2'
+
+    def _build_overlay(self, fixture_dir, name, post_snapshot_write,
+                       cluster_size=65536):
+        """Create a snapshot-bearing Q2 overlay on base_old.qcow2.
+
+        6M overlay at `cluster_size` backed by base_old.qcow2
+        (relative name), 0x33 at [1M,2M), then `snapshot -c
+        snap1`. With `post_snapshot_write` a 0x44 write at
+        [3M,4M) follows the snapshot, so the active L1 tree has
+        been COWed away from snap1's; without it the active L2
+        stays snapshot-shared — the shape whose safe-mode rebase
+        corrupts refcounts (issue #421).
+        """
+        fixture_dir = Path(fixture_dir)
+        opt = f'cluster_size={cluster_size}'
+        self._run_tool(
+            ['qemu-img', 'create', '-f', 'qcow2',
+             '-o', f'backing_file=base_old.qcow2,backing_fmt=qcow2,{opt}',
+             name, '6M'],
+            fixture_dir)
+        self._run_tool(
+            ['qemu-io', '-f', 'qcow2', '-c', 'write -P 0x33 1M 1M', name],
+            fixture_dir)
+        self._run_tool(
+            ['qemu-img', 'snapshot', '-c', 'snap1', name], fixture_dir)
+        if post_snapshot_write:
+            self._run_tool(
+                ['qemu-io', '-f', 'qcow2', '-c', 'write -P 0x44 3M 1M',
+                 name],
+                fixture_dir)
+        return fixture_dir / name
+
+    def _snapshot_readback_sha256(self, fixture_dir, overlay_name, snap):
+        """Return the sha256 of a snapshot's virtual view.
+
+        Apply-on-a-copy so the overlay is untouched: copy it
+        inside the fixture dir (the relative backing name still
+        resolves), `qemu-img snapshot -a`, convert to raw, hash
+        the raw bytes.
+        """
+        fixture_dir = Path(fixture_dir)
+        copy = fixture_dir / 'readback.qcow2'
+        raw = fixture_dir / 'readback.raw'
+        shutil.copyfile(fixture_dir / overlay_name, copy)
+        self._run_tool(
+            ['qemu-img', 'snapshot', '-a', snap, copy.name], fixture_dir)
+        self._run_tool(
+            ['qemu-img', 'convert', '-f', 'qcow2', '-O', 'raw',
+             copy.name, raw.name],
+            fixture_dir, timeout=120)
+        digest = self.sha256(raw)
+        copy.unlink()
+        raw.unlink()
+        return digest
+
+    # -- COW parity helpers ---------------------------------------------
+
+    def _assert_compare_identical(self, a, b):
+        """Assert `qemu-img compare` reports the two active views equal."""
+        r = subprocess.run(
+            ['qemu-img', 'compare', str(a), str(b)],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(
+            r.returncode, 0,
+            f'qemu-img compare {a} vs {b}: rc={r.returncode} '
+            f'stdout={r.stdout!r} stderr={r.stderr!r}')
+
+    def _assert_check_clean(self, image):
+        """Assert `qemu-img check` is clean — the #421 signature
+        (`refcount=1 reference=2`) and leaks are exactly what COW
+        must eliminate (C5)."""
+        r = subprocess.run(
+            ['qemu-img', 'check', str(image)],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(
+            r.returncode, 0,
+            f'qemu-img check {image} not clean: rc={r.returncode} '
+            f'stdout={r.stdout!r} stderr={r.stderr!r}')
+        self.assertNotIn(
+            'refcount=1 reference=2', r.stdout + r.stderr,
+            f'#421 signature present in check output for {image}')
+
+    def test_safe_rebase_overlay_internal_snapshots_cow(self):
+        """Safe-mode rebase of a snapshot-bearing overlay COWs (#421).
+
+        Phase-1 Q2 showed this shape silently corrupted the
+        overlay's refcounts in v1 (safe mode wrote new mappings
+        into the snapshot-shared active L2 in place, leaving
+        `refcount=1 reference=2` on clusters two L1 trees
+        reference — a `qemu-img snapshot -d` later frees live
+        active-view data). Phase 7's COW copies the shared active
+        L2 (C2) instead, so that failure mode is structurally
+        unreachable. Over the Q2 matrix (cluster sizes {65536,
+        512}, the cs=512 leg crossing a refblock boundary to
+        exercise the growth/relocation path C9 and the walk that
+        had the #422 livelock; and with/without a post-snapshot
+        write that COWs the active L2 away from snap1's), an
+        instar-rebased overlay is compared against a `qemu-img
+        rebase` (safe) twin built from the identical seed:
+
+        - the rebase succeeds (rc 0, no hang — a #422 regression
+          would time out and return rc -1);
+        - C5: instar's rebased active view is `qemu-img compare`-
+          identical to the qemu twin and both are check-clean
+          (zero `refcount=1 reference=2`);
+        - C7: snap1's read-back equals the qemu twin's — the
+          snapshot reads THROUGH the NEW backing (base_new), the
+          opposite of commit's preserved semantic.
+        """
+        for cs in (65536, 512):
+            for psw in (False, True):
+                with self.subTest(cluster_size=cs, post_snapshot_write=psw), \
+                        tempfile.TemporaryDirectory() as td:
+                    fixture = Path(td) / 'fixture'
+                    self._build_bases(fixture, cluster_size=cs)
+                    overlay_i = self._build_overlay(
+                        fixture, 'overlay_i.qcow2',
+                        post_snapshot_write=psw, cluster_size=cs)
+                    overlay_q = self._build_overlay(
+                        fixture, 'overlay_q.qcow2',
+                        post_snapshot_write=psw, cluster_size=cs)
+
+                    _, stderr, rc = self.run_instar_rebase(
+                        overlay_i, '-b', 'base_new.qcow2', '-F', 'qcow2',
+                        timeout=180)
+                    self.assertEqual(
+                        rc, 0,
+                        f'COW safe-mode rebase of a snapshot-bearing '
+                        f'overlay failed (cs={cs} psw={psw}); '
+                        f'stderr={stderr!r}')
+
+                    # qemu twin: safe-mode rebase of the identical
+                    # seed onto the same new backing.
+                    self._run_tool(
+                        ['qemu-img', 'rebase', '-b', 'base_new.qcow2',
+                         '-F', 'qcow2', overlay_q.name],
+                        fixture, timeout=180)
+
+                    # C5: active-view parity + check clean.
+                    self._assert_compare_identical(overlay_i, overlay_q)
+                    self._assert_check_clean(overlay_i)
+                    self._assert_check_clean(overlay_q)
+
+                    # C7: snap1 reads through the NEW backing, equal
+                    # to the qemu twin's read-back.
+                    snap_i = snapshot_readback(
+                        'qemu-img', overlay_i, 'snap1')
+                    snap_q = snapshot_readback(
+                        'qemu-img', overlay_q, 'snap1')
+                    self.assertEqual(
+                        snap_i, snap_q,
+                        'C7: snap1 read-through-new-backing read-back must '
+                        'equal the qemu twin')
+
+    def test_unsafe_rebase_overlay_internal_snapshots_matches_qemu(self):
+        """`-u` rebase of a snapshot-bearing overlay matches qemu-img.
+
+        Metadata-only rebase rewrites only the header's
+        backing-pointer region, which is never snapshot-shared,
+        so it stays allowed. Twin overlays in one fixture dir
+        (shared backing pair), instar `-u` vs qemu-img `-u`:
+        exit codes agree, both results are check-clean and
+        info-equivalent, and snap1's virtual-view read-back is
+        IDENTICAL between the two results. The view legitimately
+        CHANGES from pre-rebase — unallocated snapshot ranges
+        now resolve through base_new — so the assertion is
+        instar-vs-qemu equality, not before/after equality.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            fixture = Path(td) / 'fixture'
+            self._build_bases(fixture)
+            overlay_i = self._build_overlay(
+                fixture, 'overlay_i.qcow2', post_snapshot_write=False)
+            overlay_q = self._build_overlay(
+                fixture, 'overlay_q.qcow2', post_snapshot_write=False)
+
+            _, stderr, rc = self.run_instar_rebase(
+                overlay_i, '-u', '-b', 'base_new.qcow2', '-F', 'qcow2',
+                timeout=120)
+            self.assertEqual(
+                rc, 0, f'instar rebase -u failed: stderr={stderr!r}')
+            self._run_tool(
+                ['qemu-img', 'rebase', '-u', '-b', 'base_new.qcow2',
+                 '-F', 'qcow2', overlay_q.name],
+                fixture)
+
+            for overlay in (overlay_i, overlay_q):
+                self._run_tool(
+                    ['qemu-img', 'check', overlay.name], fixture,
+                    timeout=120)
+
+            actual = self._run_tool(
+                ['qemu-img', 'info', '--output=json', str(overlay_i)],
+                fixture, timeout=30)
+            expected = self._run_tool(
+                ['qemu-img', 'info', '--output=json', str(overlay_q)],
+                fixture, timeout=30)
+            assert_info_equivalent(
+                self, actual.stdout, expected.stdout, 'qcow2',
+                tmp_path=str(overlay_i),
+                expected_tmp_path=str(overlay_q),
+                msg='-u rebase of snapshot-bearing overlay (qcow2)')
+
+            self.assertEqual(
+                self._snapshot_readback_sha256(
+                    fixture, overlay_i.name, 'snap1'),
+                self._snapshot_readback_sha256(
+                    fixture, overlay_q.name, 'snap1'),
+                'snap1 virtual view must change identically on the '
+                'instar and qemu-img sides')
+
+
+# ----------------------------------------------------------------------
+# Staged-L2 arena growth (issue #422) — phase 2 step 2d of
+# PLAN-qcow2-write-infrastructure.
+# ----------------------------------------------------------------------
+
+
+class TestRebaseStagedL2Growth(TestRebaseSmoke):
+    """Safe-mode staged-L2 arena growth regressions (#422).
+
+    Issue #422 presented as a "rebase livelock on 512-byte
+    clusters" but was neither cluster-size-specific nor a
+    livelock: whenever the comparison loop staged a FRESH L2
+    table (a divergent cluster in an L1 entry the overlay left
+    zero) and then visited another cluster in that L2's
+    coverage, the lookup indexed a slice sized from the INITIAL
+    staged-L2 count, panicked out of bounds, and the guest
+    panic handler's `loop {}` spun forever at 100% CPU
+    (defect A). Fixing the lookup unmasked defect B: the arena
+    grew over the staged refcount-block host offsets, which the
+    refblock flush dereferences as host WRITE offsets. Both are
+    fixed by re-deriving the arena view per access and carving
+    the growable arena last in scratch.
+    """
+
+    def setUp(self):
+        super().setUp()
+        if shutil.which('qemu-img') is None:
+            self.skipTest('system qemu-img not installed')
+        if shutil.which('qemu-io') is None:
+            self.skipTest('system qemu-io not installed')
+
+    @staticmethod
+    def sha256(path):
+        """Return the sha256 hex digest of a file's full contents."""
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _run_tool(self, argv, cwd, timeout=60):
+        """Run a qemu tool with cwd in the fixture dir; assert rc 0."""
+        r = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout,
+            cwd=str(cwd))
+        self.assertEqual(
+            r.returncode, 0,
+            f'{argv[0]} failed: argv={argv!r} stderr={r.stderr!r}')
+        return r
+
+    def _build_bases(self, fixture_dir, cluster_size):
+        """Create the #422 backing pair in `fixture_dir`.
+
+        base_old.qcow2 (64M, 0x11 at [0,4M)) and base_new.qcow2
+        (64M, 0x22 at [2M,6M)) at the given cluster size. The
+        divergent range [0,6M) spans many clusters so the
+        comparison loop revisits a freshly staged L2 repeatedly.
+        """
+        fixture_dir = Path(fixture_dir)
+        fixture_dir.mkdir(parents=True, exist_ok=True)
+        for name, pattern in (
+                ('base_old.qcow2', 'write -P 0x11 0 4M'),
+                ('base_new.qcow2', 'write -P 0x22 2M 4M')):
+            self._run_tool(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-o', f'cluster_size={cluster_size}', name, '64M'],
+                fixture_dir)
+            self._run_tool(
+                ['qemu-io', '-f', 'qcow2', '-c', pattern, name],
+                fixture_dir, timeout=120)
+        return fixture_dir / 'base_old.qcow2', fixture_dir / 'base_new.qcow2'
+
+    def _build_overlay(self, fixture_dir, name, cluster_size,
+                       io_command=None):
+        """Create a 64M overlay on base_old.qcow2 (relative name).
+
+        With `io_command` None the overlay stays EMPTY: every L1
+        entry is zero, so the first divergent cluster forces the
+        comparison loop to stage a fresh L2 table — the growth
+        shape that hung pre-fix at EVERY cluster size.
+        """
+        fixture_dir = Path(fixture_dir)
+        self._run_tool(
+            ['qemu-img', 'create', '-f', 'qcow2',
+             '-o', f'backing_file=base_old.qcow2,backing_fmt=qcow2,'
+                   f'cluster_size={cluster_size}',
+             name, '64M'],
+            fixture_dir)
+        if io_command is not None:
+            self._run_tool(
+                ['qemu-io', '-f', 'qcow2', '-c', io_command, name],
+                fixture_dir, timeout=120)
+        return fixture_dir / name
+
+    def test_512_cluster_safe_rebase_terminates(self):
+        """The exact #422 fixture terminates promptly with a refusal.
+
+        64M at 512-byte clusters, overlay owning [1M,2M): safe
+        mode wants ~12k copied clusters plus fresh L2 tables,
+        which exhausts the overlay's single refcount block's
+        coverage (v1 never appends refblocks), so the run must
+        REFUSE with ERROR_REFCOUNT_EXHAUSTED — in under a second,
+        not the pre-fix infinite `loop {}` (the runner timeout
+        helper returns rc -1 on expiry, distinct from any real
+        exit code).
+
+        The refusal aborts before any metadata flush, so the
+        overlay must still be check-clean and both backings
+        byte-unchanged. The overlay FILE may legitimately change:
+        the pre-refusal data-cluster writes land in unreferenced
+        clusters (byte-idempotence of this path is deferred to
+        phase 3's ordering contract).
+        """
+        with tempfile.TemporaryDirectory() as td:
+            fixture = Path(td) / 'fixture'
+            base_old, base_new = self._build_bases(fixture, 512)
+            overlay = self._build_overlay(
+                fixture, 'overlay.qcow2', 512,
+                io_command='write -P 0x33 1M 1M')
+            backing_before = {
+                p: self.sha256(p) for p in (base_old, base_new)}
+
+            _, stderr, rc = self.run_instar_rebase(
+                overlay, '-b', 'base_new.qcow2', '-F', 'qcow2',
+                timeout=120)
+            self.assertNotEqual(
+                rc, -1,
+                'safe rebase of the #422 fixture timed out — the '
+                'staged-L2 growth hang is back')
+            self.assertNotEqual(
+                rc, 0,
+                f'expected the refcount-exhausted refusal; the rebase '
+                f'unexpectedly succeeded: stderr={stderr!r}')
+            self.assertIn(
+                "the overlay's refcount blocks are full; v1 doesn't "
+                'append new ones. Fall back to -u or use '
+                '`qemu-img rebase`',
+                stderr, f'unexpected stderr: {stderr!r}')
+
+            self._run_tool(
+                ['qemu-img', 'check', overlay.name], fixture,
+                timeout=120)
+            for p, digest in backing_before.items():
+                self.assertEqual(
+                    self.sha256(p), digest,
+                    f'a refused rebase must not touch {p.name}')
+
+    def test_64k_sparse_overlay_safe_rebase_completes(self):
+        """Empty overlay at the default cluster size completes.
+
+        The genuinely-fixed silent hang: at 64K clusters one L2
+        covers 512M, so an EMPTY 64M overlay stages a single
+        fresh L2 for the first divergent cluster and then visits
+        ~95 more divergent clusters in its coverage — every one
+        of which indexed past the stale slice pre-fix. Twin
+        fixtures, instar vs qemu-img rebase: both must complete,
+        both must be check-clean, and the rebased virtual
+        contents must be identical.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            fixture = Path(td) / 'fixture'
+            self._build_bases(fixture, 65536)
+            overlay_i = self._build_overlay(
+                fixture, 'overlay_i.qcow2', 65536)
+            overlay_q = self._build_overlay(
+                fixture, 'overlay_q.qcow2', 65536)
+
+            _, stderr, rc = self.run_instar_rebase(
+                overlay_i, '-b', 'base_new.qcow2', '-F', 'qcow2',
+                timeout=120)
+            self.assertEqual(
+                rc, 0,
+                f'instar safe rebase of an empty 64K overlay must '
+                f'complete: stderr={stderr!r}')
+            self._run_tool(
+                ['qemu-img', 'rebase', '-b', 'base_new.qcow2',
+                 '-F', 'qcow2', overlay_q.name],
+                fixture, timeout=120)
+
+            for overlay in (overlay_i, overlay_q):
+                self._run_tool(
+                    ['qemu-img', 'check', overlay.name], fixture,
+                    timeout=120)
+
+            self._run_tool(
+                ['qemu-img', 'convert', '-f', 'qcow2', '-O', 'raw',
+                 overlay_i.name, 'instar.raw'],
+                fixture, timeout=120)
+            self._run_tool(
+                ['qemu-img', 'convert', '-f', 'qcow2', '-O', 'raw',
+                 overlay_q.name, 'qemu.raw'],
+                fixture, timeout=120)
+            self.assertEqual(
+                self.sha256(fixture / 'instar.raw'),
+                self.sha256(fixture / 'qemu.raw'),
+                'rebased virtual content must match qemu-img rebase')
+
+
+# ----------------------------------------------------------------------
+# Overlay classification and capacity tests — phase 5 of
+# PLAN-qcow2-write-infrastructure (the safe-mode migration onto
+# crates/qcow2-write). New typed refusals (wire codes 15/16),
+# the stage-everything capacity widening, and the L2-window
+# eviction path.
+# ----------------------------------------------------------------------
+
+
+class TestRebaseOverlayClassification(TestRebaseSmoke):
+    """Overlay-side refusals and capacity changes (phase 5)."""
+
+    def setUp(self):
+        super().setUp()
+        if shutil.which('qemu-img') is None:
+            self.skipTest('system qemu-img not installed')
+        if shutil.which('qemu-io') is None:
+            self.skipTest('system qemu-io not installed')
+
+    @staticmethod
+    def sha256(path):
+        """Return the sha256 hex digest of a file's full contents."""
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _run_tool(self, argv, cwd, timeout=60):
+        """Run a qemu tool with cwd in the fixture dir; assert rc 0."""
+        r = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout,
+            cwd=str(cwd))
+        self.assertEqual(
+            r.returncode, 0,
+            f'{argv[0]} failed: argv={argv!r} stderr={r.stderr!r}')
+        return r
+
+    @staticmethod
+    def _refcount_table_entries(path):
+        """Return the qcow2 refcount table's u64 BE entries."""
+        import struct
+        with open(path, 'rb') as f:
+            hdr = f.read(64)
+            cluster_bits = struct.unpack('>I', hdr[20:24])[0]
+            rt_offset = struct.unpack('>Q', hdr[48:56])[0]
+            rt_clusters = struct.unpack('>I', hdr[56:60])[0]
+            f.seek(rt_offset)
+            rt = f.read(rt_clusters * (1 << cluster_bits))
+        return [
+            int.from_bytes(rt[i:i + 8], 'big')
+            for i in range(0, len(rt), 8)]
+
+    def test_holed_refcount_table_overlay_refused(self):
+        """A holed-refcount-table overlay refuses pre-mutation.
+
+        Replaces a live corruption (divergence R-D4, the rebase
+        sibling of GitHub issue #428): the old staging compacted
+        non-zero refcount-table entries into a dense array and
+        indexed them as dense, so a safe rebase of an overlay
+        whose RT had a zero entry below populated ones wrote
+        copied data at wrong host offsets and refcounts into the
+        wrong refblocks — 1092 `qemu-img check` errors + 32
+        leaked clusters at exit 0 on this very recipe. Holed RTs
+        are stock-producible (discard history + `qemu-img resize
+        --shrink` frees all-zero refblocks below populated ones)
+        and pass `qemu-img check` clean. The migrated op stages
+        refblocks dense-prefix and gates on RT contiguity: wire
+        16, before any image mutation.
+
+        Recipe adapted from the phase-5 probes: qemu >= 10 turns
+        discards into zero-plain clusters (which would mask the
+        backing), so the divergent region (50M+) stays untouched
+        by the discard/shrink history and the backing is attached
+        afterwards via a metadata-only `qemu-img rebase -u`.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            fixture = Path(td)
+            overlay = fixture / 'overlay.qcow2'
+            self._run_tool(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-o', 'cluster_size=4096', overlay.name, '96M'],
+                fixture)
+            # Pre-touch 4K every 2M over [0,44M) so the write
+            # history populates several refblocks, then discard
+            # the middle and shrink: rt[2..4] become holes below
+            # the still-populated rt[5].
+            touch = []
+            for i in range(22):
+                touch += ['-c', f'write -P 0x01 {i * 2}M 4k']
+            self._run_tool(
+                ['qemu-io', '-f', 'qcow2'] + touch + [overlay.name],
+                fixture, timeout=120)
+            self._run_tool(
+                ['qemu-io', '-f', 'qcow2', '-c', 'write -P 0x22 0 44M',
+                 overlay.name], fixture, timeout=120)
+            self._run_tool(
+                ['qemu-io', '-f', 'qcow2', '-c', 'discard 8M 32M',
+                 overlay.name], fixture, timeout=120)
+            self._run_tool(
+                ['qemu-img', 'resize', '--shrink', overlay.name, '82M'],
+                fixture)
+
+            # Precondition: the RT really is holed (a zero entry
+            # below a populated one) and the image is check-clean.
+            entries = self._refcount_table_entries(overlay)
+            populated = [i for i, e in enumerate(entries) if e]
+            self.assertTrue(
+                any(entries[i] == 0 for i in range(populated[-1])),
+                f'fixture RT is not holed: populated={populated}')
+            self._run_tool(
+                ['qemu-img', 'check', overlay.name], fixture, timeout=120)
+
+            # Backings diverging over a region the overlay leaves
+            # unmapped, attached without touching the RT.
+            for name, pattern in (
+                    ('base_old.qcow2', 'write -P 0xaa 50M 10M'),
+                    ('base_new.qcow2', 'write -P 0xbb 50M 10M')):
+                self._run_tool(
+                    ['qemu-img', 'create', '-f', 'qcow2',
+                     '-o', 'cluster_size=4096', name, '96M'], fixture)
+                self._run_tool(
+                    ['qemu-io', '-f', 'qcow2', '-c', pattern, name],
+                    fixture, timeout=120)
+            self._run_tool(
+                ['qemu-img', 'rebase', '-u', '-b', 'base_old.qcow2',
+                 '-F', 'qcow2', overlay.name], fixture)
+
+            before = {
+                p: self.sha256(fixture / p)
+                for p in ('overlay.qcow2', 'base_old.qcow2',
+                          'base_new.qcow2')}
+
+            _, stderr, rc = self.run_instar_rebase(
+                overlay, '-b', 'base_new.qcow2', '-F', 'qcow2',
+                timeout=120)
+            self.assertNotEqual(
+                rc, 0,
+                f'holed-RT overlay must refuse: stderr={stderr!r}')
+            self.assertIn(
+                "the overlay's metadata is inconsistent (refcounts, "
+                'table flags or layout); refusing to write into it. '
+                'Run `qemu-img check` on the overlay, or fall back to '
+                '`qemu-img rebase`',
+                stderr, f'unexpected stderr: {stderr!r}')
+
+            for name, digest in before.items():
+                self.assertEqual(
+                    self.sha256(fixture / name), digest,
+                    f'the wire-16 refusal must be pre-mutation: '
+                    f'{name} changed')
+
+    def test_extended_l2_overlay_refused(self):
+        """An extended-L2 overlay refuses pre-mutation (wire 15).
+
+        Replaces a live silent corruption (divergence R-D1): the
+        old safe-mode walk hard-coded 8-byte L2 entries, so on an
+        extended_l2=on overlay every second "entry" it read was a
+        subcluster bitmap — the rebase exited 0 having garbled the
+        mapping (old-backing bytes readable at virtual offsets
+        that never contained them, 32 leaked clusters). The
+        migrated op runs `qcow2_write::check_envelope` on the
+        overlay header before any staging or mutation.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            fixture = Path(td)
+            for name, pattern in (
+                    ('base_old.qcow2', 'write -P 0x11 1M 4M'),
+                    ('base_new.qcow2', 'write -P 0x22 1M 4M')):
+                self._run_tool(
+                    ['qemu-img', 'create', '-f', 'qcow2', name, '16M'],
+                    fixture)
+                self._run_tool(
+                    ['qemu-io', '-f', 'qcow2', '-c', pattern, name],
+                    fixture, timeout=120)
+            overlay = fixture / 'overlay.qcow2'
+            r = subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-o', 'extended_l2=on,cluster_size=65536',
+                 '-b', 'base_old.qcow2', '-F', 'qcow2', overlay.name],
+                capture_output=True, text=True, cwd=str(fixture))
+            if r.returncode != 0:
+                self.skipTest(
+                    f'qemu-img cannot create extended_l2 images: '
+                    f'{r.stderr!r}')
+            self._run_tool(
+                ['qemu-io', '-f', 'qcow2', '-c', 'write -P 0x33 8M 1M',
+                 overlay.name], fixture, timeout=120)
+
+            before = {
+                p: self.sha256(fixture / p)
+                for p in ('overlay.qcow2', 'base_old.qcow2',
+                          'base_new.qcow2')}
+
+            _, stderr, rc = self.run_instar_rebase(
+                overlay, '-b', 'base_new.qcow2', '-F', 'qcow2',
+                timeout=120)
+            self.assertNotEqual(
+                rc, 0,
+                f'extended-L2 overlay must refuse: stderr={stderr!r}')
+            self.assertIn(
+                'the overlay uses features instar rebase does not '
+                'support (extended L2 entries, or unknown/compression '
+                'feature bits). Use -u for a metadata-only rebase or '
+                'fall back to `qemu-img rebase`',
+                stderr, f'unexpected stderr: {stderr!r}')
+
+            for name, digest in before.items():
+                self.assertEqual(
+                    self.sha256(fixture / name), digest,
+                    f'the wire-15 refusal must be pre-mutation: '
+                    f'{name} changed')
+
+    def test_zstd_overlay_refused(self):
+        """A zstd-compression-type overlay refuses (wire 15).
+
+        Deliberate narrowing (spec-mandated, like commit's D1):
+        an overlay with the zstd incompatible bit but no actual
+        compressed clusters rebased CORRECTLY before this phase —
+        the bit is inert without compressed data — but the qcow2
+        spec requires refusing writes under unknown/compression
+        incompatible bits, and a zstd-compressed cluster would
+        have been corrupted. Now a typed pre-mutation refusal.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            fixture = Path(td)
+            self._run_tool(
+                ['qemu-img', 'create', '-f', 'qcow2', 'base_new.qcow2',
+                 '16M'], fixture)
+            overlay = fixture / 'overlay.qcow2'
+            r = subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-o', 'compression_type=zstd',
+                 '-b', 'base_new.qcow2', '-F', 'qcow2', overlay.name,
+                 '16M'],
+                capture_output=True, text=True, cwd=str(fixture))
+            if r.returncode != 0:
+                self.skipTest(
+                    f'qemu-img cannot create zstd images: {r.stderr!r}')
+
+            before = {
+                p: self.sha256(fixture / p)
+                for p in ('overlay.qcow2', 'base_new.qcow2')}
+
+            _, stderr, rc = self.run_instar_rebase(
+                overlay, '-b', 'base_new.qcow2', '-F', 'qcow2',
+                timeout=120)
+            self.assertNotEqual(
+                rc, 0, f'zstd overlay must refuse: stderr={stderr!r}')
+            self.assertIn(
+                'the overlay uses features instar rebase does not '
+                'support', stderr, f'unexpected stderr: {stderr!r}')
+
+            for name, digest in before.items():
+                self.assertEqual(
+                    self.sha256(fixture / name), digest,
+                    f'the wire-15 refusal must be pre-mutation: '
+                    f'{name} changed')
+
+    def test_many_l2_overlay_capacity_widened(self):
+        """A 512-populated-L2 overlay now rebases (was wire 9).
+
+        The R-D6 capacity widening: the old runner staged EVERY
+        pre-existing L2 table up front and refused past
+        MAX_STAGED_L2 == 256 even when nothing needed copying.
+        The migrated runner probes original L2 tables one at a
+        time and windows planner-side tables, so this cs=512 /
+        64M overlay with 512 populated L2 tables (one 512-byte
+        write per 32K of L2 coverage over [0,16M)) and IDENTICAL
+        old/new chains succeeds, check-clean and info-equivalent
+        to a qemu-img rebase twin.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            fixture = Path(td)
+            for name in ('base_old.qcow2', 'base_new.qcow2'):
+                self._run_tool(
+                    ['qemu-img', 'create', '-f', 'qcow2',
+                     '-o', 'cluster_size=512', name, '64M'], fixture)
+            writes = []
+            for i in range(512):
+                writes += ['-c', f'write -P 0x33 {i * 32768} 512']
+            for name in ('overlay_i.qcow2', 'overlay_q.qcow2'):
+                self._run_tool(
+                    ['qemu-img', 'create', '-f', 'qcow2',
+                     '-o', 'backing_file=base_old.qcow2,'
+                           'backing_fmt=qcow2,cluster_size=512',
+                     name, '64M'], fixture)
+                self._run_tool(
+                    ['qemu-io', '-f', 'qcow2'] + writes + [name],
+                    fixture, timeout=300)
+
+            overlay_i = fixture / 'overlay_i.qcow2'
+            _, stderr, rc = self.run_instar_rebase(
+                overlay_i, '-b', 'base_new.qcow2', '-F', 'qcow2',
+                timeout=300)
+            self.assertEqual(
+                rc, 0,
+                f'many-L2 overlay must now rebase (the R-D6 '
+                f'widening): stderr={stderr!r}')
+            self._run_tool(
+                ['qemu-img', 'rebase', '-b', 'base_new.qcow2',
+                 '-F', 'qcow2', 'overlay_q.qcow2'], fixture,
+                timeout=300)
+
+            self._run_tool(
+                ['qemu-img', 'check', overlay_i.name], fixture,
+                timeout=120)
+
+            actual = self._run_tool(
+                ['qemu-img', 'info', '--output=json', 'overlay_i.qcow2'],
+                fixture)
+            expected = self._run_tool(
+                ['qemu-img', 'info', '--output=json', 'overlay_q.qcow2'],
+                fixture)
+            # qemu-img info ran with cwd=fixture, so the JSON
+            # carries the relative names; substitute those.
+            assert_info_equivalent(
+                self, actual.stdout, expected.stdout, 'qcow2',
+                tmp_path='overlay_i.qcow2',
+                expected_tmp_path='overlay_q.qcow2',
+                msg='many-L2 capacity widening (cs=512)')
+
+    def test_eviction_exercising_safe_rebase(self):
+        """Safe rebase touching more L2 tables than window slots.
+
+        At cs=64K the migrated runner's L2 window holds 32 slots
+        (2 MiB / 64K); one L2 table covers 512M of virtual
+        space, so a sparse 17408M overlay with a divergent
+        cluster in each of its 34 coverage spans forces at least
+        two window evictions mid-loop. The structural safety
+        argument (R-D5): the walk never revisits a table, so an
+        evicted table is written exactly once and never reloaded
+        — content parity with a qemu-img rebase twin proves the
+        final bytes.
+
+        Also asserts the deferred header patch landed (the
+        backing path names the new backing) — the runtime half
+        of the "header bytes unchanged until after flush" review
+        item: the header rewrite is deferred metadata applied
+        only after the plan_flush epoch.
+        """
+        size = '17408M'  # 34 x 512M L2-coverage spans at cs=64K
+        with tempfile.TemporaryDirectory() as td:
+            fixture = Path(td)
+            self._run_tool(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-o', 'cluster_size=65536', 'base_old.qcow2', size],
+                fixture)
+            writes = []
+            for k in range(34):
+                writes += ['-c', f'write -P 0x11 {k * 512}M 64k']
+            self._run_tool(
+                ['qemu-io', '-f', 'qcow2'] + writes + ['base_old.qcow2'],
+                fixture, timeout=300)
+            self._run_tool(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-o', 'cluster_size=65536', 'base_new.qcow2', size],
+                fixture)
+            for name in ('overlay_i.qcow2', 'overlay_q.qcow2'):
+                self._run_tool(
+                    ['qemu-img', 'create', '-f', 'qcow2',
+                     '-o', 'backing_file=base_old.qcow2,'
+                           'backing_fmt=qcow2,cluster_size=65536',
+                     name, size], fixture)
+
+            overlay_i = fixture / 'overlay_i.qcow2'
+            _, stderr, rc = self.run_instar_rebase(
+                overlay_i, '-b', 'base_new.qcow2', '-F', 'qcow2',
+                timeout=300)
+            self.assertEqual(
+                rc, 0,
+                f'eviction-exercising safe rebase must complete: '
+                f'stderr={stderr!r}')
+            self._run_tool(
+                ['qemu-img', 'rebase', '-b', 'base_new.qcow2',
+                 '-F', 'qcow2', 'overlay_q.qcow2'], fixture,
+                timeout=300)
+
+            self._run_tool(
+                ['qemu-img', 'check', overlay_i.name], fixture,
+                timeout=300)
+
+            # The deferred header patch landed: the overlay now
+            # names the new backing.
+            info = self._run_tool(
+                ['qemu-img', 'info', '--output=json',
+                 'overlay_i.qcow2'], fixture)
+            self.assertEqual(
+                json.loads(info.stdout).get('backing-filename'),
+                'base_new.qcow2',
+                'deferred header/backing-path patch did not land')
+
+            self._run_tool(
+                ['qemu-img', 'convert', '-f', 'qcow2', '-O', 'raw',
+                 'overlay_i.qcow2', 'instar.raw'], fixture,
+                timeout=600)
+            self._run_tool(
+                ['qemu-img', 'convert', '-f', 'qcow2', '-O', 'raw',
+                 'overlay_q.qcow2', 'qemu.raw'], fixture, timeout=600)
+            self.assertEqual(
+                self.sha256(fixture / 'instar.raw'),
+                self.sha256(fixture / 'qemu.raw'),
+                'rebased virtual content must match qemu-img rebase '
+                'across L2 window evictions')

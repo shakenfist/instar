@@ -255,6 +255,111 @@ class TestConvertBackingChain(InstarTestBase):
             )
 
 
+class TestConvertZeroFlagChain(InstarTestBase):
+    """Regression for #432: classic (non-extended) qcow2 v3 L2 entries
+    with the all-zeroes flag (``QCOW_OFLAG_ZERO``, bit 0) set must read
+    as zeros through the chain reader, regardless of the host-offset
+    field.
+
+    Before the 7z read-path fix instar's ``cluster_lookup`` ignored the
+    flag: a ``host_offset == 0`` zero-flag cluster fell through to the
+    backing (returning its data), and a ``host_offset != 0`` one read
+    the stale host bytes. Both are silent active-view corruption. These
+    tests build the exact fixtures from the #432 report and assert the
+    ``[1M, 1M+64k)`` range converts to all zeros and matches qemu-img.
+    They fail on the pre-fix binary (reading 0xEE / 0xDD respectively).
+    """
+
+    CLUSTER = '65536'
+
+    def _qemu_io(self, fmt, cmd, path):
+        subprocess.run(
+            ['qemu-io', '-f', fmt, '-c', cmd, str(path)],
+            capture_output=True, check=True,
+        )
+
+    def _assert_zero_and_parity(self, overlay_path, tmpdir):
+        """Convert ``overlay_path`` with instar and qemu-img; assert the
+        [1M, 1M+64k) window is all zeros and the whole image matches."""
+        output_path = Path(tmpdir) / 'instar.raw'
+        qemu_path = Path(tmpdir) / 'qemu.raw'
+
+        stdout, stderr, rc = self.run_instar_convert(overlay_path, output_path)
+        self.assertEqual(rc, 0, f'stderr: {stderr}')
+
+        self.run_qemu_img_convert(overlay_path, qemu_path)
+
+        with open(output_path, 'rb') as f:
+            f.seek(1024 * 1024)
+            window = f.read(65536)
+        self.assertEqual(
+            window, b'\x00' * 65536,
+            'zero-flag cluster at [1M, 1M+64k) did not convert to zeros '
+            '(pre-fix #432 read stale/backing bytes here)',
+        )
+
+        cmp_out, _, cmp_rc = self.run_instar_compare(output_path, qemu_path)
+        self.assertEqual(cmp_rc, 0, f'Output differs from qemu-img: {cmp_out}')
+
+    def test_convert_zero_flag_host_zero_over_backing(self):
+        """Case A: host_offset==0 zero-flag cluster masks a LOWER backing
+        holding 0xEE. Correct read is zeros; the pre-fix bug recursed to
+        the backing and returned 0xEE."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base2 = Path(tmpdir) / 'base2.qcow2'
+            backing = Path(tmpdir) / 'backing.qcow2'
+            overlay = Path(tmpdir) / 'overlay.qcow2'
+
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2', '-o',
+                 f'cluster_size={self.CLUSTER}', str(base2), '4M'],
+                capture_output=True, check=True,
+            )
+            self._qemu_io('qcow2', 'write -P 0xEE 1M 64k', base2)
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2', '-o',
+                 f'cluster_size={self.CLUSTER}', '-b', str(base2),
+                 '-F', 'qcow2', str(backing)],
+                capture_output=True, check=True,
+            )
+            # write -z on an unallocated cluster -> host==0, zero flag set.
+            self._qemu_io('qcow2', 'write -z 1M 64k', backing)
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2', '-o',
+                 f'cluster_size={self.CLUSTER}', '-b', str(backing),
+                 '-F', 'qcow2', str(overlay)],
+                capture_output=True, check=True,
+            )
+
+            self._assert_zero_and_parity(overlay, tmpdir)
+
+    def test_convert_zero_flag_host_nonzero_over_data(self):
+        """Case B: host_offset!=0 zero-flag cluster over previously-written
+        0xDD data. Correct read is zeros; the pre-fix bug returned the
+        stale 0xDD host bytes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backing = Path(tmpdir) / 'backing.qcow2'
+            overlay = Path(tmpdir) / 'overlay.qcow2'
+
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2', '-o',
+                 f'cluster_size={self.CLUSTER}', str(backing), '4M'],
+                capture_output=True, check=True,
+            )
+            # Allocate the cluster with data, then zero-flag it in place
+            # (no -u), so the L2 entry keeps its host offset AND bit 0.
+            self._qemu_io('qcow2', 'write -P 0xDD 1M 64k', backing)
+            self._qemu_io('qcow2', 'write -z 1M 64k', backing)
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2', '-o',
+                 f'cluster_size={self.CLUSTER}', '-b', str(backing),
+                 '-F', 'qcow2', str(overlay)],
+                capture_output=True, check=True,
+            )
+
+            self._assert_zero_and_parity(overlay, tmpdir)
+
+
 class TestConvertRawToRaw(InstarTestBase):
     """Test raw-to-raw passthrough conversion."""
 

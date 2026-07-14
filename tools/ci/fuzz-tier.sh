@@ -45,6 +45,8 @@ FAST_TIER=(
   fuzz_bitmap_parse
   fuzz_bitmap_planners
   fuzz_bench_schedule
+  fuzz_qcow2_write
+  fuzz_qcow2_write_growth
 )
 
 is_fast() {

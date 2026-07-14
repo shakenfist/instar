@@ -166,11 +166,20 @@ vhdx (VHDX), luks (info + convert with decryption)
   two tools' numbers are comparable only to each other on an identical
   invocation, never in isolation. Reads all five formats; write tests
   (`-w`) are supported on raw and qcow2 only, including qcow2 overlays.
+  The qcow2 `-w` path runs on the shared `crates/qcow2-write` planner
+  and `crates/qcow2-write-exec` executor (third consumer after commit
+  and rebase; PLAN-qcow2-write-infrastructure phase 6), and the
+  refcount-growth planner now lives in that crate's `growth` module.
+  Since phase 7, `bench -w` (like commit and rebase safe mode)
+  copy-on-writes snapshot-bearing qcow2 images rather than refusing
+  them — the shared crate's COW branch copies snapshot-shared clusters
+  before modifying them, proven check-clean and read-back-parity
+  against qemu.
   `--output {human,json}` mirrors qemu's human output byte-for-byte or
   emits a stable JSON schema for regression tracking.
   `CallTable::VERSION` bumped from 19 to 20 for the appended
   `send_bench_start`/`send_bench_result` callbacks. Covered by
-  `tests/test_bench.py` (62 tests), the `fuzz_bench_schedule` coverage
+  `tests/test_bench.py` (76 tests), the `fuzz_bench_schedule` coverage
   fuzzer, and the differential fuzzer's `op_bench` arm. See
   [docs/bench.md](docs/bench.md).
 

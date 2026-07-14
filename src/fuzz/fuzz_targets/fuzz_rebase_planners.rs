@@ -13,11 +13,15 @@
 //!   4. `Append`s end at or below `plan.total_file_size`.
 //!   5. No two `Write` patches overlap.
 //!
-//! For safe-mode `RebaseQcow2SafeContext`:
+//! For safe-mode `RebaseQcow2SafeContext` (plain overlay
+//! geometry since phase 5 of PLAN-qcow2-write-infrastructure
+//! moved the staged refblock copy and dirty bitmap into
+//! `crates/qcow2-write`):
 //!
-//!   6. `dirty.len() == (refblock_count + 7) / 8`.
-//!   7. `refblocks.len() == refblock_count * cluster_size`.
-//!   8. `entries_per_refblock == cluster_size * 8 / refcount_bits`.
+//!   6. `overlay_cluster_size` is a parse-legal power of two
+//!      (512 bytes ..= 2 MiB).
+//!   7. `overlay_cluster_count * overlay_cluster_size` covers
+//!      at least one byte per cluster (no zero-size clusters).
 //!
 //! For safe-mode `RebaseVmdkSafeContext`:
 //!
@@ -311,45 +315,27 @@ fn assert_plan_invariants(plan: &RebasePlan<'_>, label: &str) {
     }
 }
 
-/// Safe-mode qcow2 context invariants.
-fn assert_qcow2_safe_context(ctx: &RebaseQcow2SafeContext<'_>) {
-    let expected_dirty_len = ((ctx.refblock_count as usize) + 7) / 8;
-    assert_eq!(
-        ctx.dirty.len(),
-        expected_dirty_len,
-        "qcow2 safe: dirty.len() {} != (refblock_count {} + 7) / 8 = {}",
-        ctx.dirty.len(),
-        ctx.refblock_count,
-        expected_dirty_len,
-    );
-
-    let expected_refblocks_len =
-        (ctx.refblock_count as usize) * (ctx.overlay_cluster_size as usize);
-    assert_eq!(
-        ctx.refblocks.len(),
-        expected_refblocks_len,
-        "qcow2 safe: refblocks.len() {} != refblock_count {} * \
-         cluster_size {} = {}",
-        ctx.refblocks.len(),
-        ctx.refblock_count,
+/// Safe-mode qcow2 context invariants (overlay geometry only
+/// since phase 5).
+fn assert_qcow2_safe_context(ctx: &RebaseQcow2SafeContext) {
+    assert!(
+        ctx.overlay_cluster_size.is_power_of_two()
+            && (512..=2 * 1024 * 1024).contains(&ctx.overlay_cluster_size),
+        "qcow2 safe: overlay_cluster_size {} is not a parse-legal \
+         power of two",
         ctx.overlay_cluster_size,
-        expected_refblocks_len,
     );
-
-    if ctx.refcount_bits > 0 {
-        let expected_epr =
-            (ctx.overlay_cluster_size as u64) * 8 / (ctx.refcount_bits as u64);
-        assert_eq!(
-            ctx.entries_per_refblock,
-            expected_epr,
-            "qcow2 safe: entries_per_refblock {} != cluster_size {} * \
-             8 / refcount_bits {} = {}",
-            ctx.entries_per_refblock,
-            ctx.overlay_cluster_size,
-            ctx.refcount_bits,
-            expected_epr,
-        );
-    }
+    // A parsed header's virtual size fits u64; the context's
+    // cluster count must not overflow when re-expanded.
+    assert!(
+        ctx.overlay_cluster_count
+            .checked_mul(ctx.overlay_cluster_size as u64)
+            .is_some(),
+        "qcow2 safe: overlay_cluster_count {} * cluster_size {} \
+         overflows",
+        ctx.overlay_cluster_count,
+        ctx.overlay_cluster_size,
+    );
 }
 
 /// Safe-mode vmdk context invariants.

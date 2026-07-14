@@ -3559,6 +3559,39 @@ impl RebaseResult {
     /// because the cause is a host or guest bug, not a
     /// malformed image.
     pub const ERROR_INTERNAL_OVERFLOW: u32 = 13;
+    /// The overlay has internal snapshots (`nb_snapshots > 0`)
+    /// and the rebase is safe-mode (no `-u`), including safe
+    /// detach. Safe mode mutates snapshot-shared L2 tables in
+    /// place and sets refcount=1 on clusters two L1 trees
+    /// reference, so a later `qemu-img snapshot -d` frees live
+    /// active-view data (GitHub issue #421). Refused as an
+    /// interim phase-2 gate; the real fix (snapshot-aware COW)
+    /// lands in phase 7 of `PLAN-qcow2-write-infrastructure`.
+    /// `-u` metadata-only rebase never touches snapshot-shared
+    /// clusters and stays allowed.
+    pub const ERROR_OVERLAY_HAS_SNAPSHOTS: u32 = 14;
+    /// The overlay uses qcow2 features the safe-mode rebase
+    /// write envelope does not support: the extended-L2
+    /// incompatible bit (16-byte L2 entries the walk would
+    /// misread as 8-byte — previously silent corruption), the
+    /// zstd compression-type bit, or any unknown incompatible
+    /// bit (the spec requires refusal). Added by phase 5 of
+    /// `PLAN-qcow2-write-infrastructure`
+    /// (`qcow2_write::check_envelope` on the overlay header,
+    /// pre-mutation). `-u` metadata-only rebase only rewrites
+    /// header/path bytes and stays allowed.
+    pub const ERROR_OVERLAY_UNSUPPORTED: u32 = 15;
+    /// The overlay's metadata is inconsistent in a way the
+    /// safe-mode write path cannot anchor a safe write on: a
+    /// holed (non-contiguous) or malformed refcount table
+    /// (previously a silent misallocation — the rebase sibling
+    /// of GitHub issue #428), or a qcow2-write classification
+    /// refusal (unknown L1/L2 entry bits, refcount
+    /// inconsistencies, snapshot-shared clusters on an image
+    /// claiming none). Refused before any image mutation where
+    /// staging detects it. Added by phase 5 of
+    /// `PLAN-qcow2-write-infrastructure`.
+    pub const ERROR_OVERLAY_INCONSISTENT: u32 = 16;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -4103,6 +4136,16 @@ impl BenchResult {
     /// renders "image too large for in-place bench write"). Unused until
     /// the 5b allocating-write path exists.
     pub const ERROR_ALLOC_EXHAUSTED: u32 = 8;
+    /// The qcow2 write planner (`crates/qcow2-write`) refused a cluster
+    /// as internally inconsistent: an unknown L1/L2 entry bit pattern
+    /// (including the v3 all-zeroes flag — issue #432 territory), a
+    /// staged-refcount inconsistency, missing refcount coverage, a
+    /// staging mismatch, or a defensive backing-fill refusal after the
+    /// op's copy-on-write resubmit. Appended by phase 6 step 6b
+    /// (`PLAN-qcow2-write-infrastructure-phase-06-bench.md`, decision 6)
+    /// for the crate classification refusals bench had no prior
+    /// rendering for. The host renders "image metadata is inconsistent".
+    pub const ERROR_IMAGE_INCONSISTENT: u32 = 9;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -4260,6 +4303,48 @@ impl CommitResult {
     /// [`Self::ERROR_PARSE_FAILED`] because the cause is a
     /// host or guest bug, not a malformed image.
     pub const ERROR_INTERNAL_OVERFLOW: u32 = 13;
+    /// The backing file has internal snapshots
+    /// (`nb_snapshots > 0`). v1 commit writes into the backing
+    /// without COWing snapshot-shared clusters or L2 tables, so
+    /// proceeding would silently corrupt the snapshots (GitHub
+    /// issue #420). Refused as an interim phase-2 gate; the
+    /// real fix (COW into the backing) lands in phase 7 of
+    /// `PLAN-qcow2-write-infrastructure`.
+    pub const ERROR_BACKING_HAS_SNAPSHOTS: u32 = 14;
+    /// The overlay has internal snapshots (`nb_snapshots > 0`).
+    /// The post-commit overlay-clear pass zeroes active L2
+    /// entries and decrements the data clusters they reference
+    /// without accounting for the snapshot's reference, leaving
+    /// snapshot-shared clusters at `refcount=0 reference=1`
+    /// (proven by the phase-2 step-2a parity test; qemu-img
+    /// stays check-clean on the same shape). This is the
+    /// overlay-side sibling of issue #420 (issue #423).
+    /// Refused as an interim phase-2 gate; the real fix
+    /// (snapshot-aware refcounting) lands in phase 7 of
+    /// `PLAN-qcow2-write-infrastructure`.
+    pub const ERROR_OVERLAY_HAS_SNAPSHOTS: u32 = 15;
+    /// The backing file's header carries feature bits the
+    /// commit write envelope does not support: the zstd
+    /// compression-type bit or any unknown incompatible bit
+    /// (`qcow2_write::Gate::UnknownIncompatible`). The qcow2
+    /// spec requires refusing unknown incompatible bits; commit
+    /// previously proceeded in violation of the spec (phase-4
+    /// divergence D1 of
+    /// `PLAN-qcow2-write-infrastructure-phase-04-commit`).
+    /// Refused before any staging or mutation.
+    pub const ERROR_BACKING_UNSUPPORTED: u32 = 16;
+    /// The backing file's metadata is inconsistent as a write
+    /// substrate: a sparse (non-contiguous) refcount table,
+    /// reserved bits in refcount-table/L1/L2 entries,
+    /// snapshot-shared or refcount-zero clusters on an image
+    /// whose header says `nb_snapshots == 0`, or refcounts
+    /// outside the staged refblock set (phase-4 divergences
+    /// D3/D4). Staging-time refusals (the sparse-RT gate — a
+    /// live corruption before phase 4) leave the backing
+    /// byte-untouched; mid-loop classification refusals leave
+    /// previously committed cluster data in place, the same
+    /// posture as [`Self::ERROR_REFCOUNT_EXHAUSTED`].
+    pub const ERROR_BACKING_INCONSISTENT: u32 = 17;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -4901,7 +4986,10 @@ mod tests {
 
     #[test]
     fn rebase_result_error_codes_distinct() {
-        // Phase 3 added codes 7..=13. Confirm every code is
+        // Phase 3 added codes 7..=13; the phase-2 snapshot gate
+        // (issue #421) added 14; phase 5 of
+        // PLAN-qcow2-write-infrastructure added the overlay
+        // classification codes 15 and 16. Confirm every code is
         // distinct so the host's match arms don't accidentally
         // alias.
         let codes = [
@@ -4919,13 +5007,16 @@ mod tests {
             RebaseResult::ERROR_DESCRIPTOR_TOO_LARGE,
             RebaseResult::ERROR_PARSE_FAILED,
             RebaseResult::ERROR_INTERNAL_OVERFLOW,
+            RebaseResult::ERROR_OVERLAY_HAS_SNAPSHOTS,
+            RebaseResult::ERROR_OVERLAY_UNSUPPORTED,
+            RebaseResult::ERROR_OVERLAY_INCONSISTENT,
         ];
         for i in 0..codes.len() {
             for j in (i + 1)..codes.len() {
                 assert_ne!(codes[i], codes[j], "codes {i} and {j} alias");
             }
         }
-        // Confirm contiguous 0..=13 numbering.
+        // Confirm contiguous 0..=16 numbering.
         for (i, c) in codes.iter().enumerate() {
             assert_eq!(*c, i as u32);
         }
@@ -4971,9 +5062,13 @@ mod tests {
 
     #[test]
     fn commit_result_error_codes_distinct() {
-        // Phase 7 step 7a added codes 8..=13. Confirm every
-        // code is distinct so the host's match arms don't
-        // accidentally alias.
+        // Phase 7 step 7a added codes 8..=13; the phase-2
+        // snapshot gates added 14 (backing, issue #420) and 15
+        // (overlay, issue #423); phase 4 of
+        // PLAN-qcow2-write-infrastructure added the backing
+        // classification codes 16 and 17. Confirm every code is
+        // distinct so the host's match arms don't accidentally
+        // alias.
         let codes = [
             CommitResult::ERROR_OK,
             CommitResult::ERROR_UNSUPPORTED_FORMAT,
@@ -4989,13 +5084,18 @@ mod tests {
             CommitResult::ERROR_REFCOUNT_EXHAUSTED,
             CommitResult::ERROR_PARSE_FAILED,
             CommitResult::ERROR_INTERNAL_OVERFLOW,
+            CommitResult::ERROR_BACKING_HAS_SNAPSHOTS,
+            CommitResult::ERROR_OVERLAY_HAS_SNAPSHOTS,
+            CommitResult::ERROR_BACKING_UNSUPPORTED,
+            CommitResult::ERROR_BACKING_INCONSISTENT,
         ];
         for i in 0..codes.len() {
             for j in (i + 1)..codes.len() {
                 assert_ne!(codes[i], codes[j], "codes {i} and {j} alias");
             }
         }
-        // Confirm contiguous 0..=13 numbering.
+        // Confirm contiguous 0..=17 numbering (append-only wire
+        // codes).
         for (i, c) in codes.iter().enumerate() {
             assert_eq!(*c, i as u32);
         }
@@ -5223,8 +5323,9 @@ mod tests {
 
     #[test]
     fn bench_result_error_codes_distinct() {
-        // Phase 2 defines codes 0..=6; phase 5 appends 7..=8. Confirm
-        // every code is distinct and contiguously numbered.
+        // Phase 2 defines codes 0..=6; phase 5 appends 7..=8; phase 6
+        // step 6b appends 9. Confirm every code is distinct and
+        // contiguously numbered.
         let codes = [
             BenchResult::ERROR_OK,
             BenchResult::ERROR_BAD_CONFIG,
@@ -5235,6 +5336,7 @@ mod tests {
             BenchResult::ERROR_IO_FLUSH,
             BenchResult::ERROR_WRITE_UNSUPPORTED,
             BenchResult::ERROR_ALLOC_EXHAUSTED,
+            BenchResult::ERROR_IMAGE_INCONSISTENT,
         ];
         for (i, c) in codes.iter().enumerate() {
             assert_eq!(*c, i as u32);

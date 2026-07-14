@@ -35,6 +35,15 @@ import tempfile
 import time
 from pathlib import Path
 
+# The snapshot read-back oracle (COW parity contract C6/C7/C8) is the
+# shared helper under tests/helpers; import it the way cow-soak did so the
+# snapshot-bearing commit/rebase/bench branches reuse it rather than
+# reimplementing the apply-on-a-copy -> convert -> sha256 recipe.
+_TESTS_DIR = Path(__file__).resolve().parent.parent / 'tests'
+if str(_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TESTS_DIR))
+from helpers.snapshot_readback import snapshot_readback  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -44,6 +53,18 @@ FORMATS = ['qcow2', 'raw', 'vmdk', 'vpc']
 OUTPUT_FORMATS = ['qcow2', 'raw', 'vmdk', 'vpc']
 VIRTUAL_SIZES = ['1M', '4M', '16M', '64M', '256M', '1G']
 QCOW2_CLUSTER_SIZES = [512, 4096, 65536, 262144, 2097152]
+
+# Cluster sizes for the snapshot-bearing commit/rebase/bench fixtures
+# (lifted from cow-soak). Capped at 64 KiB: the commit guest's
+# OVERLAY_RT_LIMIT / BACKING_RT_LIMIT are sized at MAX_SECTOR_SIZE
+# (64 KiB), so a larger cluster blows the refcount-table budget.
+SNAP_CLUSTER_SIZES = [512, 4096, 65536]
+
+# Probability that a commit/rebase/bench iteration builds a
+# SNAPSHOT-BEARING fixture (and gains the read-back oracle) instead of the
+# plain snapshot-free fixture. Drawn from iter_rng so a fixed top --seed
+# stays deterministic (decision 6).
+SNAPSHOT_FIXTURE_PROB = 0.40
 DATA_PATTERNS = ['zeros', 'random', 'sparse', 'mbr']
 
 # Operations that the fuzzer can chain together
@@ -2265,6 +2286,354 @@ def _bench_invocation_args(fmt, count, depth, bufsize, step, pattern,
     return args
 
 
+# ---------------------------------------------------------------------------
+# Snapshot-bearing COW fixtures (phase 8 thread 2)
+#
+# The commit/rebase/bench ops build SNAPSHOT-FREE fixtures by construction;
+# these helpers add the snapshot-bearing branch that phase 7 opened. The
+# recipes are lifted from the retired scripts/cow-soak.py generators
+# (gen_commit / gen_rebase / gen_bench); the oracle reuses the shared
+# snapshot_readback helper. A snapshot-bearing fixture is byte-identical on
+# both sides (built once into a seed dir, copied to an instar and a qemu
+# side), so a fixture-build failure is a seed problem, never a divergence.
+# ---------------------------------------------------------------------------
+
+def _snap_create(cwd, name, size, opt, timeout):
+    """qemu-img create a qcow2 fixture in `cwd`. Returns True on success."""
+    _, _, rc = run_qemu_img(
+        ['create'], ['-f', 'qcow2', '-o', opt, name, str(size)],
+        timeout=timeout, cwd=str(cwd))
+    return rc == 0
+
+
+def _snap_io_write(cwd, name, pattern, offset, length, timeout):
+    """qemu-io a single ``write -P`` into `cwd/name`. True on success."""
+    _, _, rc = _run_qemu_io(
+        ['-f', 'qcow2', '-c',
+         f'write -P {pattern} {offset} {length}', name],
+        timeout=timeout, cwd=str(cwd))
+    return rc == 0
+
+
+def _snap_rand_writes(rng, cwd, name, size, timeout, n=None):
+    """Issue a few random aligned pattern writes within [0, size)."""
+    if n is None:
+        n = rng.randint(1, 4)
+    for _ in range(n):
+        length = min(rng.randint(1, 8) * 512, size)
+        offset = rng.randrange(0, max(1, size - length) + 1)
+        offset -= offset % 512
+        pattern = f'0x{rng.randint(1, 255):02x}'
+        if not _snap_io_write(cwd, name, pattern, offset, length, timeout):
+            return False
+    return True
+
+
+def _snap_snapshot(cwd, name, tag, timeout):
+    """Create an internal snapshot `tag` on `cwd/name`. True on success."""
+    _, _, rc = run_qemu_img(
+        ['snapshot'], ['-c', tag, name], timeout=timeout, cwd=str(cwd))
+    return rc == 0
+
+
+def _snapshot_readback_oracle(op, desc, inst_dir, qemu_dir, timeout):
+    """The snapshot-bearing read-back oracle (C5-C8), instar vs qemu twin.
+
+    `desc` carries {shape, cs, size, compare, carrier, snaps}. Gains over
+    the snapshot-free oracle:
+      * active-view ``qemu-img compare`` identical for every compared image
+        (C5);
+      * ``qemu-img check`` clean on each instar image with an explicit
+        ``refcount=1 reference=2`` scan (C5);
+      * per-carrier-snapshot ``snapshot_readback`` instar == qemu twin
+        (C6/C7/C8 — the "== qemu twin" invariant, which naturally captures
+        commit-preserved / rebase-read-through-new without hardcoding
+        per-op expected values).
+
+    Returns a typed divergence dict or None.
+    """
+    shape, cs, size = desc['shape'], desc['cs'], desc['size']
+    carrier, snaps = desc['carrier'], desc['snaps']
+
+    ctx = {
+        'operation': op, 'shape': shape,
+        'cluster_size': cs, 'size': size, 'snaps': snaps,
+    }
+
+    # C5: active-view compare identical.
+    for img in desc['compare']:
+        _, cmp_err, cmp_rc = run_qemu_img(
+            ['compare'], [str(inst_dir / img), str(qemu_dir / img)],
+            timeout=timeout)
+        if cmp_rc != 0:
+            return {
+                'type': f'{op}_snapshot_compare_divergence',
+                'image': img, 'compare_rc': cmp_rc,
+                'compare_stderr': cmp_err[:500], **ctx,
+            }
+
+    # C5: check clean (rc 0, no refcount=1 reference=2) on every instar
+    # image involved.
+    for img in sorted(set(desc['compare']) | {carrier}):
+        c_out, c_err, c_rc = run_qemu_img(
+            ['check'], [str(inst_dir / img)], timeout=timeout)
+        if c_rc != 0:
+            return {
+                'type': f'{op}_snapshot_check_divergence',
+                'image': img, 'check_rc': c_rc,
+                'check_stdout': c_out[:500], 'check_stderr': c_err[:500],
+                **ctx,
+            }
+        if 'refcount=1 reference=2' in (c_out + c_err):
+            return {
+                'type': f'{op}_snapshot_refcount_divergence',
+                'image': img, 'check_stdout': c_out[:500], **ctx,
+            }
+
+    # C6/C7/C8: every carrier snapshot's read-back matches the qemu twin.
+    for tag in snaps:
+        try:
+            inst_sha = snapshot_readback('qemu-img', inst_dir / carrier, tag)
+            qemu_sha = snapshot_readback('qemu-img', qemu_dir / carrier, tag)
+        except subprocess.CalledProcessError as exc:
+            return {
+                'type': f'{op}_snapshot_readback_error',
+                'carrier': carrier, 'snapshot': tag,
+                'error': str(exc), **ctx,
+            }
+        if inst_sha != qemu_sha:
+            return {
+                'type': f'{op}_snapshot_readback_divergence',
+                'carrier': carrier, 'snapshot': tag,
+                'instar_sha': inst_sha, 'qemu_sha': qemu_sha, **ctx,
+            }
+
+    return None
+
+
+def _op_commit_snapshot(instar_bin, iter_dir, rng, timeout):
+    """Snapshot-bearing commit fixture (backing- or overlay-snapshot;
+    #420/#423 shapes) + the read-back oracle. Returns a divergence or None.
+    """
+    cs = rng.choice(SNAP_CLUSTER_SIZES)
+    size = rng.choice([16, 32, 64]) * 1024 * 1024
+    shape = rng.choice(['backing', 'overlay'])
+    opt = f'cluster_size={cs}'
+
+    seed = iter_dir / 'commit-snap-seed'
+    shutil.rmtree(seed, ignore_errors=True)
+    seed.mkdir(parents=True, exist_ok=True)
+
+    if not _snap_create(seed, 'base.qcow2', size, opt, timeout):
+        return None
+    if not _snap_rand_writes(rng, seed, 'base.qcow2', size, timeout):
+        return None
+    snaps = []
+    if shape == 'backing':
+        for i in range(rng.randint(1, 3)):
+            if not _snap_rand_writes(rng, seed, 'base.qcow2', size, timeout):
+                return None
+            if not _snap_snapshot(seed, 'base.qcow2', f'snap{i + 1}', timeout):
+                return None
+            snaps.append(f'snap{i + 1}')
+        if rng.random() < 0.5:
+            _snap_rand_writes(rng, seed, 'base.qcow2', size, timeout)
+
+    overlay_opt = f'{opt},backing_file=base.qcow2,backing_fmt=qcow2'
+    if not _snap_create(seed, 'overlay.qcow2', size, overlay_opt, timeout):
+        return None
+    if not _snap_rand_writes(rng, seed, 'overlay.qcow2', size, timeout):
+        return None
+    if shape == 'overlay':
+        for i in range(rng.randint(1, 3)):
+            if not _snap_rand_writes(
+                    rng, seed, 'overlay.qcow2', size, timeout):
+                return None
+            if not _snap_snapshot(
+                    seed, 'overlay.qcow2', f'osnap{i + 1}', timeout):
+                return None
+            snaps.append(f'osnap{i + 1}')
+        if rng.random() < 0.5:
+            _snap_rand_writes(rng, seed, 'overlay.qcow2', size, timeout)
+
+    if shape == 'backing':
+        carrier, compare = 'base.qcow2', ['base.qcow2']
+    else:
+        carrier, compare = 'overlay.qcow2', ['base.qcow2', 'overlay.qcow2']
+
+    inst_dir = iter_dir / 'commit-snap-instar'
+    qemu_dir = iter_dir / 'commit-snap-qemu'
+    shutil.rmtree(inst_dir, ignore_errors=True)
+    shutil.rmtree(qemu_dir, ignore_errors=True)
+    shutil.copytree(seed, inst_dir)
+    shutil.copytree(seed, qemu_dir)
+
+    _, i_err, i_rc = run_instar(
+        instar_bin, ['commit'], ['overlay.qcow2'],
+        timeout=timeout, cwd=str(inst_dir))
+    _, q_err, q_rc = run_qemu_img(
+        ['commit'], ['overlay.qcow2'], timeout=timeout, cwd=str(qemu_dir))
+
+    context = {
+        'shape': shape, 'cluster_size': cs, 'size': size, 'snaps': snaps,
+        'instar_stderr': i_err[:500], 'qemu_stderr': q_err[:500],
+    }
+    div = compare_exit_codes(i_rc, q_rc, 'commit', context)
+    if div:
+        return div
+    if i_rc != 0:
+        return None  # both rejected; nothing to compare
+
+    return _snapshot_readback_oracle(
+        'commit',
+        {'shape': shape, 'cs': cs, 'size': size,
+         'compare': compare, 'carrier': carrier, 'snaps': snaps},
+        inst_dir, qemu_dir, timeout)
+
+
+def _op_rebase_snapshot(instar_bin, iter_dir, rng, timeout):
+    """Snapshot-bearing safe-rebase fixture (#421 shape): a snapshot-bearing
+    overlay rebased onto a distinct new backing. Returns a divergence or
+    None.
+    """
+    cs = rng.choice(SNAP_CLUSTER_SIZES)
+    size = rng.choice([8, 16, 32]) * 1024 * 1024
+    opt = f'cluster_size={cs}'
+
+    seed = iter_dir / 'rebase-snap-seed'
+    shutil.rmtree(seed, ignore_errors=True)
+    seed.mkdir(parents=True, exist_ok=True)
+
+    for name in ('base_old.qcow2', 'base_new.qcow2'):
+        if not _snap_create(seed, name, size, opt, timeout):
+            return None
+        # Distinct, partially-overlapping content in each backing.
+        if not _snap_rand_writes(
+                rng, seed, name, size, timeout, n=rng.randint(2, 5)):
+            return None
+
+    overlay_opt = f'backing_file=base_old.qcow2,backing_fmt=qcow2,{opt}'
+    if not _snap_create(seed, 'overlay.qcow2', size, overlay_opt, timeout):
+        return None
+    if not _snap_rand_writes(rng, seed, 'overlay.qcow2', size, timeout):
+        return None
+    snaps = []
+    for i in range(rng.randint(1, 3)):
+        if not _snap_rand_writes(rng, seed, 'overlay.qcow2', size, timeout):
+            return None
+        if not _snap_snapshot(seed, 'overlay.qcow2', f'snap{i + 1}', timeout):
+            return None
+        snaps.append(f'snap{i + 1}')
+    if rng.random() < 0.5:
+        _snap_rand_writes(rng, seed, 'overlay.qcow2', size, timeout)
+
+    inst_dir = iter_dir / 'rebase-snap-instar'
+    qemu_dir = iter_dir / 'rebase-snap-qemu'
+    shutil.rmtree(inst_dir, ignore_errors=True)
+    shutil.rmtree(qemu_dir, ignore_errors=True)
+    shutil.copytree(seed, inst_dir)
+    shutil.copytree(seed, qemu_dir)
+
+    rebase_args = ['-b', 'base_new.qcow2', '-F', 'qcow2', 'overlay.qcow2']
+    _, i_err, i_rc = run_instar(
+        instar_bin, ['rebase'], rebase_args, timeout=timeout,
+        cwd=str(inst_dir))
+    _, q_err, q_rc = run_qemu_img(
+        ['rebase'], rebase_args, timeout=timeout, cwd=str(qemu_dir))
+
+    context = {
+        'shape': 'overlay', 'cluster_size': cs, 'size': size, 'snaps': snaps,
+        'instar_stderr': i_err[:500], 'qemu_stderr': q_err[:500],
+    }
+    div = compare_exit_codes(i_rc, q_rc, 'rebase', context)
+    if div:
+        return div
+    if i_rc != 0:
+        return None
+
+    return _snapshot_readback_oracle(
+        'rebase',
+        {'shape': 'overlay', 'cs': cs, 'size': size,
+         'compare': ['overlay.qcow2'], 'carrier': 'overlay.qcow2',
+         'snaps': snaps},
+        inst_dir, qemu_dir, timeout)
+
+
+def _op_bench_snapshot(instar_bin, iter_dir, rng, timeout):
+    """Snapshot-bearing ``bench -w`` fixture: the whole bench write span is
+    snapshot-shared, so every write must COW. Returns a divergence or None.
+    """
+    cs = rng.choice(SNAP_CLUSTER_SIZES)
+    size = 64 * 1024 * 1024
+    count = rng.randint(50, 200)
+    pattern = rng.randint(1, 254)
+    opt = f'cluster_size={cs}'
+
+    seed = iter_dir / 'bench-snap-seed'
+    shutil.rmtree(seed, ignore_errors=True)
+    seed.mkdir(parents=True, exist_ok=True)
+
+    if not _snap_create(seed, 'img.qcow2', size, opt, timeout):
+        return None
+
+    # bench writes sequentially from offset 0 over count*4096 bytes; make
+    # sure that whole region is snapshot-shared so the write must COW.
+    bench_span = count * 4096
+    snaps = []
+    nsnap = rng.randint(1, 2)
+    step = max(4096, (bench_span // nsnap) - ((bench_span // nsnap) % 4096))
+    off = 0
+    for i in range(nsnap):
+        length = min(step, size - off)
+        if length > 0:
+            if not _snap_io_write(
+                    seed, 'img.qcow2', f'0x{rng.randint(1, 255):02x}',
+                    off, length, timeout):
+                return None
+        # Top up so [0, bench_span) is fully written before the last snap.
+        if i == nsnap - 1 and off + length < bench_span:
+            if not _snap_io_write(
+                    seed, 'img.qcow2', '0xaa', off + length,
+                    bench_span - (off + length), timeout):
+                return None
+        if not _snap_snapshot(seed, 'img.qcow2', f'snap{i + 1}', timeout):
+            return None
+        snaps.append(f'snap{i + 1}')
+        off += length
+
+    inst_dir = iter_dir / 'bench-snap-instar'
+    qemu_dir = iter_dir / 'bench-snap-qemu'
+    shutil.rmtree(inst_dir, ignore_errors=True)
+    shutil.rmtree(qemu_dir, ignore_errors=True)
+    shutil.copytree(seed, inst_dir)
+    shutil.copytree(seed, qemu_dir)
+
+    bench_args = ['-w', '-c', str(count), '--pattern', str(pattern),
+                  '-f', 'qcow2', 'img.qcow2']
+    i_out, i_err, i_rc = run_instar(
+        instar_bin, ['bench'], bench_args, timeout=timeout, cwd=str(inst_dir))
+    q_out, q_err, q_rc = run_qemu_img(
+        ['bench'], bench_args, timeout=timeout, cwd=str(qemu_dir))
+
+    context = {
+        'shape': 'image', 'cluster_size': cs, 'size': size, 'snaps': snaps,
+        'count': count, 'pattern': pattern,
+        'instar_stdout': i_out[:500], 'qemu_stdout': q_out[:500],
+        'instar_stderr': i_err[:500], 'qemu_stderr': q_err[:500],
+    }
+    div = compare_exit_codes(i_rc, q_rc, 'bench', context)
+    if div:
+        return div
+    if i_rc != 0:
+        return None
+
+    return _snapshot_readback_oracle(
+        'bench',
+        {'shape': 'image', 'cs': cs, 'size': size,
+         'compare': ['img.qcow2'], 'carrier': 'img.qcow2', 'snaps': snaps},
+        inst_dir, qemu_dir, timeout)
+
+
 def _bench_option_picker(rng):
     """Pick a parity-respecting bench plan: an image recipe plus one or more
     bench invocations, all inside the phase-4 validated envelope and steered
@@ -2447,6 +2816,14 @@ def op_bench(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
 
     Returns a typed divergence dict or None.
     """
+    # ~40% of bench ops build a snapshot-bearing fixture (snapshot-shared
+    # write span) and gain the read-back oracle. The flag is drawn from
+    # iter_rng unconditionally so a fixed --seed stays deterministic; only
+    # the branch taken depends on qemu-io availability.
+    snap = rng.random() < SNAPSHOT_FIXTURE_PROB
+    if snap and shutil.which('qemu-io') is not None:
+        return _op_bench_snapshot(instar_bin, instar_copy.parent, rng, timeout)
+
     plan = _bench_option_picker(rng)
     recipe = plan['recipe']
     invocations = plan['invocations']
@@ -2600,6 +2977,13 @@ def op_rebase(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
     signature but unused — `rebase` builds its own fixture pair
     via the picker.
     """
+    # ~40% of rebase ops build a snapshot-bearing overlay (#421) and gain
+    # the read-back oracle; deterministic under a fixed --seed (decision 6).
+    snap = rng.random() < SNAPSHOT_FIXTURE_PROB
+    if snap and shutil.which('qemu-io') is not None:
+        return _op_rebase_snapshot(
+            instar_bin, instar_copy.parent, rng, timeout)
+
     (overlay_size, new_backing_name, new_backing_size,
      rebase_flags, create_options) = _rebase_option_picker(rng)
     is_detach = new_backing_name == ''
@@ -2849,6 +3233,14 @@ def op_commit(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
     op_* signature but unused — `commit` builds its own
     fixture pairs via the picker.
     """
+    # ~40% of commit ops build a snapshot-bearing fixture (backing- or
+    # overlay-snapshot; #420/#423) and gain the read-back oracle;
+    # deterministic under a fixed --seed (decision 6).
+    snap = rng.random() < SNAPSHOT_FIXTURE_PROB
+    if snap and shutil.which('qemu-io') is not None:
+        return _op_commit_snapshot(
+            instar_bin, instar_copy.parent, rng, timeout)
+
     (target, overlay_size, explicit_base, seed_spec,
      create_options) = _commit_option_picker(rng)
 
@@ -3193,15 +3585,16 @@ def op_map(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
     return None
 
 
-def _run_qemu_io(args, timeout=30):
+def _run_qemu_io(args, timeout=30, cwd=None):
     """Run a qemu-io command. Returns (stdout, stderr, rc).
     Mirrors `run_qemu_img`'s shape; used as a fixture-builder
-    in `op_commit`'s optional seed step.
+    in `op_commit`'s optional seed step and the snapshot-bearing
+    fixture builders.
     """
     cmd = ['qemu-io'] + args
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
+            cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd,
         )
         return result.stdout, result.stderr, result.returncode
     except subprocess.TimeoutExpired:

@@ -49,6 +49,16 @@ CACHE_HINT_FIELDS = {
     'cache-clean-interval',
 }
 
+# Wall-clock capture fields inside top-level snapshots[] entries.
+# Two fixtures built by identical command sequences carry identical
+# snapshot metadata EXCEPT the `snapshot -c` timestamp, so these are
+# stripped (scoped to the snapshots array only — everything else in a
+# snapshot entry, e.g. name/id/vm-state-size, must still match).
+SNAPSHOT_DIVERGENCE = {
+    'date-sec',
+    'date-nsec',
+}
+
 FILENAME_PLACEHOLDER = '$FILENAME'
 
 
@@ -104,6 +114,16 @@ def normalise_info_json(obj, target, tmp_path=None):
     strip.update(TARGET_DIVERGENCE.get(target, set()))
 
     _strip_keys(result, strip)
+
+    # Snapshot entries: strip the wall-clock capture timestamps (see
+    # SNAPSHOT_DIVERGENCE above).
+    if isinstance(result, dict):
+        snapshots = result.get('snapshots')
+        if isinstance(snapshots, list):
+            for snap in snapshots:
+                if isinstance(snap, dict):
+                    for k in SNAPSHOT_DIVERGENCE:
+                        snap.pop(k, None)
 
     # Children's nested file-info: strip the physical-file virtual-size
     # (writer-dependent layout artefact, not the qcow2 virtual size).

@@ -932,15 +932,18 @@ cd src/fuzz
 cargo fuzz run fuzz_qcow2_header -- -max_total_time=60
 ```
 
-30 fuzz targets cover all parser crates (QCOW2, VMDK, VHD, VHDX, RAW,
+32 fuzz targets cover all parser crates (QCOW2, VMDK, VHD, VHDX, RAW,
 LUKS) including header parsing, L1/L2 lookup, refcount traversal, and
 decompression, plus the create / resize / rebase / commit planners,
 the qcow2 check-repair planners (`fuzz_check_repair`), the map extent
 walkers, the snapshot table parser (`fuzz_snapshot_parse`), the
-snapshot refcount mutators (`fuzz_snapshot_refcount`), and the dd
+snapshot refcount mutators (`fuzz_snapshot_refcount`), the dd
 window math (`fuzz_dd_window`), CHS geometry rounding
-(`fuzz_chs_rounded_size`), and windowed read primitives
-(`fuzz_dd_read`). Seed the corpus
+(`fuzz_chs_rounded_size`), windowed read primitives
+(`fuzz_dd_read`), and the qcow2-write planner
+(`fuzz_qcow2_write`, which drives the write/copy-on-write planner
+through the crate's `sim` harness asserting the `max_rc < 3` COW
+invariant oracle, and `fuzz_qcow2_write_growth`). Seed the corpus
 from `instar-testdata`:
 
 ```bash

@@ -180,8 +180,14 @@ provides a modular architecture with:
   raw deflate via miniz_oxide), refcount table reading (all widths:
   1/2/4/8/16/32/64-bit), compressed L2 entry parsing, backing file
   extraction, header extension parsing, incompatible feature bit
-  validation. Supports cluster sizes from 512B to 2MB (cluster_bits
-  9-21). Used by info, check, compare, convert, and measure
+  validation. The chain reader honours the `QCOW_OFLAG_ZERO` (bit 0)
+  flag on classic (non-extended) L2 entries: `cluster_lookup` returns
+  a `ClusterLookup::Zero` verdict and the chain reader zero-fills for
+  it, for both host == 0 and host != 0 (the phase-7 step-7z fix for
+  issue #432; previously a zero-flagged chain cluster read as
+  fall-through or stale host bytes — silent active-view corruption
+  affecting rebase / convert / compare / bench). Supports cluster
+  sizes from 512B to 2MB (cluster_bits 9-21). Used by info, check, compare, convert, and measure
   operations. Also exposes `Qcow2State::scan_allocation` plus the
   pure helpers `count_allocated_in_l2_standard` /
   `count_allocated_in_l2_extended` to produce a
@@ -238,6 +244,135 @@ provides a modular architecture with:
   back-compat re-export remains in this crate. Consumed by the
   `measure` operation in `src/operations/measure/` and by the
   size-estimation helpers shared with `create` and `resize`.
+- **crates/qcow2-write/** - Shared qcow2 write-planner crate (`no_std`,
+  no I/O, no guest addresses): the windowed step-program planner for
+  "write N bytes at virtual offset X into an existing qcow2, allocating
+  as needed" (PLAN-qcow2-write-infrastructure phase 3). `plan_write`
+  classifies each touched cluster from staged metadata (owned in-place
+  overwrite with zero metadata churn / fresh allocation with
+  sub-cluster zero-fill, including a fresh L2 table when the L1 slot is
+  empty / typed refusals for compressed, snapshot-shared,
+  unknown-bit-pattern and backing-fill shapes) and emits typed `Step`s
+  (`#[repr(C)]`, const-asserted at 48 bytes or less) into a
+  caller-provided `StepBuf`; the executor runs each window literally
+  and resumes on `BufFull`, which doubles as the staged-L2 window's
+  load boundary (the planner emits `LoadCluster` and closes the window,
+  because the slot's bytes exist only after execution). Steps are
+  address-free — staged buffers are named by `RegionId` + offset and
+  devices by `TargetDevice` (`Input0`/`Output`) — and each planning
+  call borrows a `StagedRegions` view of the executor's staged L1 /
+  L2-window / refcount-table / refblock buffers, of which only the
+  refblocks are mutable: the planner mutates staged refcounts in place
+  at plan time (bench's single-copy model) while L1/L2 mutations stay
+  `PatchEntryU64` steps, and `plan_flush` emits the epoch's write-backs
+  refcounts-last. Barriers are explicit steps with
+  `BarrierClass::{Ordering, Durability}`; because the call table
+  exposes only `fsync_input`, executors map `Durability` to fsync on RW
+  input devices and degrade it to `Ordering` where no fsync primitive
+  exists (matching commit/rebase's current no-fsync output-device
+  reality). The crash-ordering contract — data written before the L2
+  patch that reaches it, fresh-L2 init before the L1 patch, refcount
+  write-backs only at flush and last, Durability barriers between flush
+  groups — is emission-order data, pinned mechanically by an
+  ordering-contract property suite (window-invariance across buffer
+  capacities down to a 1-step buffer) and a SimDisk simulation harness
+  that replays the step journal truncated at every Durability barrier.
+  Envelope gates (qcow2 v2/v3, 16-bit refcounts, no
+  unknown-incompatible bits, no extended-L2 / external data /
+  encryption, not dirty/corrupt, no internal snapshots) run at state
+  construction, so a gated image can never yield a write plan. Three
+  ops consume it: commit (phase 4, 2026-07-13 — the qcow2
+  backing-side write path), rebase safe mode including safe
+  detach (phase 5, 2026-07-13 — the overlay-side copy path, with an
+  op-side skip probe against original pre-run L2 state deciding
+  which clusters reach the planner at all), and bench `-w` (phase 6,
+  2026-07-13 — the qcow2 write-benchmark path). All are planned by
+  this crate and executed through `crates/qcow2-write-exec`, proven
+  byte-invisible by the `scripts/migration-proof.py` before/after
+  harness (73/73, 69/69 and — for bench, whose oracle is
+  compare + check rather than byte identity — 56/56 fixture combos,
+  300-iteration differential fuzz clean each; rebase carries one
+  sanctioned beyond-EOV raw divergence with proven virtual equality,
+  and bench's allocating shapes are content-equivalent but not
+  byte-identical by design). The crate also owns the pure
+  refcount-growth planner in its `growth` module (`plan_refcount_growth`,
+  `GrowthCaps`, `RefcountGrowthPlan`, `GrowthOverflow`), moved out of
+  `crates/bench` in phase 6; growth execution moved to
+  `crates/qcow2-write-exec` in phase 7 (see below). Phase 7
+  (2026-07-13) added the crate's **copy-on-write branch**, lifting the
+  three ops' interim snapshot-refusal gates (issues #420 / #421 / #423
+  resolved). A COW-capable caller builds its `WriteState` via
+  `new_state_cow` and relaxes the envelope with
+  `check_envelope_with(hdr, allow_snapshots = true)`; the classifier
+  then turns the `SnapshotShared` / `SnapshotSharedL2Table` verdicts
+  from refusals into COW emission. Data-cluster COW copies the shared
+  `D → D'`, repoints the L2, sets `rc(D')=1` and decrements `rc(D)`
+  (the old cluster is never freed — the snapshot holds it); L2-table
+  COW copies `T → T'`, repoints the L1, sets `rc(T')=1`, decrements
+  `rc(T)`, and — critically — leaves the child data-cluster refcounts
+  untouched (qemu eagerly bumps every reachable cluster to rc ≥ 2 at
+  snapshot-creation time, so a child-increment would corrupt to rc 3;
+  the children already classify shared and COW per-write). This needs
+  a net-new refcount-**decrement** primitive (`dec_refcount`; v1 only
+  ever incremented on allocation), whose underflow maps to
+  `WriteError::RefcountInconsistent`. The zero-flag WRITE-target policy
+  (decision 6): host == 0 allocates fresh, host != 0 rc 1 overwrites
+  in place clearing the zero bit, host != 0 rc > 1 COWs — qemu never
+  frees the old offset. No new `StepKind`. The COW output is proven
+  qemu-parity, never byte-identical to qemu (C11). The crate's
+  Vec-backed simulation harness (`TestImg` + the executor role +
+  `run_write` / `run_flush` `BufFull`-resume loops + the COW fixtures +
+  the `rc_of` / `max_rc` assertion helpers) lives in a feature-gated
+  `#[cfg(any(test, feature = "sim"))] pub mod sim` (phase 8a): the crate's
+  own unit tests import it, the `sim` feature is OFF in the production
+  build (it needs `std`, and the guest ops are `no_std`
+  `x86_64-unknown-none`, so the ops' `.bin` sizes are unchanged), and the
+  `fuzz_qcow2_write` coverage target enables it to fuzz the planner
+  (see Coverage-Guided Fuzzing below).
+- **crates/qcow2-write growth-execution move (phase 7).** The
+  imperative refcount-growth EXECUTION (previously in the bench op) is
+  now the shared, region-agnostic `growth::grow_refcounts` in
+  `crates/qcow2-write-exec`, so commit and rebase can grow the
+  refcount structures during COW, not just bench. Behaviour is
+  byte-identical to bench's prior execution (the #433 materialization
+  fix and the single-fsync census are preserved).
+- **crates/qcow2-write-exec/** - Shared guest-side step executor for
+  `crates/qcow2-write` step programs (`no_std`,
+  PLAN-qcow2-write-infrastructure phase 4): a literal interpreter of
+  the `StepKind` doc contracts with zero planning logic —
+  `execute(steps, regions, devices)` applies one planned window in
+  emission order and aborts on the first failure with the step index
+  and a typed cause (nothing panics; every region access is
+  bounds-checked). The `DeviceIo` trait abstracts the per-device
+  call-table entry points; `CallTableIo` maps `Input0` to
+  `read/write_input_sector(0)` + `fsync_input(0)` and `Output` to
+  `read/write_output_sector` with no fsync capability. Its byte-range
+  layer (`read_bytes` / `write_bytes` / `fill_bytes`) sits over the
+  strictly sector-addressed call table — whole aligned sectors
+  transfer directly, sub-sector head/tail goes through
+  read-modify-write on a caller-provided bounce sector — and is
+  exposed as the shared replacement for the byte-range helpers the
+  commit / rebase / bench / bitmap ops each hand-roll. `Regions`
+  maps each planner `RegionId` to a caller-carved scratch slice
+  (never `static`) plus the two executor service sectors (one shared
+  RMW bounce — safe because all call-table I/O is synchronous and
+  steps execute serially — and a fill-synthesis sector). Barrier
+  policy: `Ordering` is a no-op (issue order is completion order),
+  `Durability` fsyncs where the capability exists and degrades to
+  `Ordering` elsewhere (matching commit/rebase's no-fsync
+  output-device reality). Host-unit-tested against a mock `DeviceIo`
+  with journals and failure injection, including end-to-end
+  compositions driving `plan_write` / `plan_flush` through the
+  executor over a model disk. Consumed by the commit op (phase 4),
+  the rebase op's safe mode (phase 5), and the bench op's qcow2 `-w`
+  path (phase 6, which also drives its refcount-growth I/O through
+  the byte-range layer with the executor's fsync disabled so bench
+  keeps its own single-fsync-per-cadence-point census). Phase 7 added
+  the shared `growth::grow_refcounts` here (moved out of the bench op)
+  so all three ops can grow the refcount structures during
+  copy-on-write, and all three now build COW-capable write states that
+  route the crate's `SnapshotShared` / `SnapshotSharedL2Table` COW
+  steps through this executor.
 - **operations/info/** - Format detection operation
 - **operations/copy/** - File copy operation
 - **operations/check/** - Image integrity validation operation (with
@@ -592,19 +727,27 @@ provides a modular architecture with:
   `send_bench_start` marker (emitted once setup completes) and the
   terminal `send_bench_result`. Reads all five formats; write tests
   (`-w`) are supported on raw and qcow2 only (including qcow2
-  overlays), using a write-through-for-metadata/staged-for-refcounts
-  design so a mid-run crash leaves at worst a repairable leak. qcow2
-  write setup preemptively grows the image's refcount structures to
-  the schedule's worst-case coverage before the timing bracket opens
-  (new refblocks at the file end; refcount-table relocation with an
-  fsync-ordered header flip — `PLAN-bench-refcount-growth`). The
-  pure `no_std` `crates/bench` crate provides the request-schedule
-  math and the refcount-growth planner shared by the guest, host CLI
-  and tests. `bench.bin` builds at ~162 KiB of the 768 KiB
-  operation-region budget. The ABI appends two
+  overlays); a mid-run crash leaves at worst a repairable leak. Since
+  the phase-6 migration (PLAN-qcow2-write-infrastructure), the qcow2
+  `-w` allocate-on-write path runs on the shared `crates/qcow2-write`
+  planner and `crates/qcow2-write-exec` executor — bench is the third
+  consumer after commit and rebase — staging metadata and writing it
+  back refcounts-last at each flush epoch. qcow2 write setup
+  preemptively grows the image's refcount structures to the
+  schedule's worst-case coverage before the timing bracket opens (new
+  refblocks at the file end; refcount-table relocation with an
+  fsync-ordered header flip — `PLAN-bench-refcount-growth`); the pure
+  growth planner moved into `crates/qcow2-write`'s `growth` module in
+  phase 6, though growth execution stays op-side. bench keeps its own
+  fsync census (the executor's fsync is disabled; the op issues one
+  `fsync_input(0)` per `--flush-interval` cadence point). The pure
+  `no_std` `crates/bench` crate provides the request-schedule math
+  (and `worst_case_touched`, which stays BenchParams-coupled) shared
+  by the guest, host CLI and tests. `bench.bin` builds at ~173 KiB of
+  the 768 KiB operation-region budget. The ABI appends two
   call-table callbacks (`send_bench_start`, `send_bench_result`),
   bumping `CallTable::VERSION` from 19 to 20. Coverage:
-  `tests/test_bench.py` (72 tests), the `fuzz_bench_schedule`
+  `tests/test_bench.py` (76 tests), the `fuzz_bench_schedule`
   coverage fuzzer, and the differential fuzzer's `op_bench` arm. See
   [docs/bench.md](docs/bench.md).
 - **shared/** - Shared library code between components (call table, configs,
@@ -744,6 +887,20 @@ QEMU Copy-On-Write version 2/3. Supported features:
 - LUKS-encrypted output (crypt_method=2) via `--luks-encrypt-passphrase`
   (AES-256-XTS with PBKDF2-SHA256 key derivation, LUKS v1 headers)
 - Snapshot table parsing, detection, and extraction via `--snapshot`
+
+#### qcow2 write infrastructure
+
+In-place mutation of an existing qcow2 (used by `commit`, `rebase`
+safe mode and `bench -w`) runs on two shared `no_std` crates: the
+**`crates/qcow2-write`** planner (pure, I/O-free, address-free —
+turns a write into a typed step program; handles the envelope,
+classification, allocate-on-write and copy-on-write) and the
+**`crates/qcow2-write-exec`** executor (the literal step interpreter
+plus the byte-range/device layer). Refcount growth is split the same
+way across each crate's `growth` module. The maintainer reference for
+this machinery — the step-program ABI, the write envelope, COW, growth
+and the crash-ordering contract — is
+[docs/qcow2/qcow2-write-planner.md](docs/qcow2/qcow2-write-planner.md).
 
 ### raw
 
@@ -960,6 +1117,24 @@ preallocation mode, every vmdk subformat) get coverage here
 without spurious
 findings from the known gaps.
 
+The `commit`, `rebase` and `bench` arms additionally draw a
+snapshot-fixture flag (40% probability) and, when `qemu-io` is present,
+build a **snapshot-bearing** fixture (phase 8 of
+PLAN-qcow2-write-infrastructure) exercising the copy-on-write paths
+phase 7 opened: commit over a backing- or overlay-snapshot span, safe
+rebase of a snapshot-bearing overlay, and `bench -w` over a
+snapshot-shared span. For a snapshot fixture the oracle gains the
+phase-7 read-back triple — active-view `qemu-img compare` identical +
+`qemu-img check` clean (with a `refcount=1 reference=2` scan) +
+per-carrier snapshot read-back `instar == qemu twin` (via
+`tests/helpers/snapshot_readback.py`, which applies each snapshot on a
+copy, converts to raw, and compares sha256) — the last of which the
+active-view compare alone cannot see. Non-snapshot fixtures keep their
+existing oracle unchanged. This folds in the retired standalone
+`scripts/cow-soak.py` soak (phase 7e), which nothing in CI depended on;
+the snapshot coverage now rides the existing `differential-fuzz.yml`
+nightly with no new workflow.
+
 ### libyal Cross-Validation
 
 When libyal tools are installed (`libvmdk-utils`, `libvhdi-utils`,
@@ -991,7 +1166,7 @@ A mock `CallTable` (in `src/fuzz/src/lib.rs`) backed by thread-local
 fuzzer input provides sector-based I/O, allowing libFuzzer to explore
 deeply malformed inputs.
 
-30 fuzz targets cover all parser crates: format detection, header
+32 fuzz targets cover all parser crates: format detection, header
 parsing (QCOW2, VMDK, VHD, VHDX, RAW, LUKS), L1/L2 cluster lookup,
 refcount table traversal, zlib decompression, grain directory lookup,
 BAT traversal, VHDX metadata parsing, the measure subcommand's
@@ -1031,10 +1206,26 @@ qcow2 read primitives). The amend subcommand adds
 `fuzz_bitmap_parse` (the qcow2 bitmap directory/table/extension
 parsers) plus `fuzz_bitmap_planners` (the bitmap crate's
 directory/action/merge functions over synthesised
-directory+refblocks). Finally, the bench subcommand adds
+directory+refblocks). The bench subcommand adds
 `fuzz_bench_schedule` (the pure `crates/bench` schedule math: param
 validation, offset advance, transfer splitting, and flush cadence,
-over a deliberately unclamped fuzzed header).
+over a deliberately unclamped fuzzed header). Finally, the
+`crates/qcow2-write` planner gets two targets (phase 8 of
+PLAN-qcow2-write-infrastructure). `fuzz_qcow2_write` decodes a fixture
+archetype (clean / backing-present / shared-data / shared-L2 nested /
+owned-L2 / zero-flag-target) at a cluster size {512, 4 KiB, 64 KiB,
+2 MiB} and drives a bounded `plan_write` / `plan_flush` sequence through
+the crate's feature-gated `sim` harness, asserting the copy-on-write
+invariant oracle after every operation: **`max_rc < 3`** (the COW
+corruption signature — a snapshot-shared child driven past its
+creation refcount of 2), snapshot-shared clusters byte-preserved and
+never freed (`rc >= 1`), no dangling / past-EOF L1/L2 pointer, and —
+after a flush — `OFLAG_COPIED` set iff refcount is exactly 1. A
+`WriteError` refusal is a valid outcome, not a crash.
+`fuzz_qcow2_write_growth` feeds geometry to the `growth` module's
+`plan_refcount_growth`, asserting no overflow, the self-coverage
+invariant, and cap adherence. Both are registered in the fast tier
+(`tools/ci/fuzz-tier.sh`); their shake-out found no planner bug.
 
 The seed corpus is extracted from `instar-testdata` by
 `scripts/extract-fuzz-corpus.py`, which filters images by format,

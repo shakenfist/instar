@@ -32,6 +32,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Fuzzing for the qcow2-write planner and its snapshot-bearing
+  copy-on-write paths (PLAN-qcow2-write-infrastructure phase 8).**
+  Two new coverage-guided libFuzzer targets exercise the
+  `crates/qcow2-write` planner directly. `fuzz_qcow2_write` decodes a
+  fixture archetype (clean / backing-present / shared-data /
+  shared-L2 nested / owned-L2 / zero-flag-target) at a cluster size
+  {512, 4 KiB, 64 KiB, 2 MiB} and drives a bounded
+  `plan_write`/`plan_flush` sequence through the crate's Vec-backed
+  simulation harness — lifted in this phase out of the crate's unit
+  tests into a feature-gated `#[cfg(any(test, feature = "sim"))]
+  pub mod sim` that is OFF in the production build, so the guest ops'
+  `.bin` sizes are unchanged. After every operation it asserts the
+  copy-on-write invariant oracle: `max_rc < 3` (the corruption
+  signature), snapshot-shared clusters byte-preserved and never freed,
+  no dangling/past-EOF L1/L2 pointer, and `OFLAG_COPIED` set iff
+  refcount is exactly 1 after a flush (a `WriteError` refusal is a
+  valid outcome, not a crash). `fuzz_qcow2_write_growth` feeds geometry
+  to the `growth` module's `plan_refcount_growth`, asserting no
+  overflow, the self-coverage invariant, and cap adherence. Both join
+  the nightly `coverage-fuzz.yml` fast tier (30→32 targets); their
+  bring-up shake-out found no planner bug. The differential fuzzer's
+  `op_commit`/`op_rebase`/`op_bench` arms now also build
+  snapshot-bearing fixtures (40% probability, when `qemu-io` is
+  present) that exercise the phase-7 copy-on-write paths, with the
+  oracle gaining the snapshot read-back triple — active-view
+  `qemu-img compare` + `qemu-img check` clean + per-carrier snapshot
+  read-back `instar == qemu twin` (`tests/helpers/snapshot_readback.py`)
+  — and a 300-iteration local soak ran 0 divergences. The standalone
+  `scripts/cow-soak.py` (phase 7e) is folded into the differential
+  fuzzer and retired. See
+  [docs/plans/PLAN-qcow2-write-infrastructure.md](docs/plans/PLAN-qcow2-write-infrastructure.md)
+  and [docs/testing.md](docs/testing.md).
+
+- **Copy-on-write for `commit`, `rebase` safe mode and `bench -w` on
+  snapshot-bearing qcow2 images (PLAN-qcow2-write-infrastructure
+  phase 7).** Writes into a qcow2 image that carries internal
+  snapshots now **copy** the shared clusters instead of refusing (the
+  phase-2 interim gates) or corrupting them — resolving issues #420
+  (commit backing), #421 (rebase safe mode) and #423 (commit overlay).
+  `crates/qcow2-write` gained a copy-on-write branch:
+  `check_envelope_with(hdr, allow_snapshots)` / `new_state_cow` gate
+  the capability, data-cluster COW copies a shared cluster before
+  writing (repoint the L2, `rc(D')=1`, decrement `rc(D)`, never freeing
+  the old cluster), and L2-table COW copies a shared table (repoint the
+  L1, `rc(T')=1`, decrement `rc(T)`) while leaving child refcounts
+  untouched (qemu bumps children to rc ≥ 2 at snapshot-creation time,
+  so a child-increment would corrupt to rc 3). A net-new
+  refcount-decrement primitive maps underflow to
+  `RefcountInconsistent`. The snapshot-view semantic is per op —
+  commit preserves backing snapshots bit-identically, rebase leaves the
+  active view resolving through the new backing (qemu's contract), and
+  bench preserves snapshots like commit. The correctness bar is
+  qemu-parity (`qemu-img check` clean + active-view `qemu-img compare`
+  + a snapshot read-back oracle), not image-byte identity. The zero-flag
+  WRITE-target policy now matches qemu (host == 0 allocates fresh,
+  host != 0 rc 1 overwrites in place clearing the zero bit, rc > 1
+  COWs — the old offset is never freed). Verified check-clean and
+  read-back-parity against pinned qemu-img 6.2.0 / 7.2.0 / 8.2.0 /
+  9.2.0 / 10.2.0 (`tests/test_cow_cross_version.py`) and across 50
+  randomized snapshot-bearing iterations with 0 divergences
+  (`scripts/cow-soak.py`). Two follow-ups are recorded: commit does
+  not byte-empty a snapshot-bearing overlay (the clear pass is skipped
+  to avoid #423; active view and snapshots are correct), and rebase's
+  COW refcount growth is coarsely sized. See
+  [docs/plans/PLAN-qcow2-write-infrastructure.md](docs/plans/PLAN-qcow2-write-infrastructure.md).
+
+- **Refcount growth for `commit` and `rebase` during copy-on-write
+  (PLAN-qcow2-write-infrastructure phase 7).** The imperative
+  refcount-growth execution moved out of the bench op into the shared,
+  region-agnostic `growth::grow_refcounts` in `crates/qcow2-write-exec`,
+  so commit and rebase can grow the refcount structures when a
+  copy-on-write schedule crosses a refblock boundary rather than
+  refusing `RefcountExhausted`. Bench's behaviour is byte-identical
+  (the #433 materialization fix and the single-fsync census are
+  preserved).
+
+- **New `crates/qcow2-write` planner crate
+  (PLAN-qcow2-write-infrastructure phase 3).** A pure `no_std`
+  windowed step-program planner for "write N bytes at virtual offset
+  X into an existing qcow2, allocating as needed": per-cluster
+  classification (owned in-place overwrite / fresh allocation with
+  sub-cluster zero-fill / typed refusals for compressed,
+  snapshot-shared and unknown-bit-pattern shapes), L2 and
+  data-cluster allocation, refcount maintenance in a single staged
+  refblock copy, the unified v1 envelope gates, and the crash-safe
+  write-ordering contract emitted as typed steps with explicit
+  Ordering/Durability barriers. Internal infrastructure only — no
+  operation consumes it yet, so there is no CLI-visible behaviour
+  change: subsequent phases migrate commit, rebase safe mode and
+  bench `-w` onto it and then add copy-on-write. Proven by 45 unit
+  tests, an ordering-contract property suite (window-invariance from
+  a 1-step buffer up, mechanical checks of the full ordering contract
+  over emitted programs), and a simulation harness that executes
+  emitted step programs against model disks and replays them
+  truncated at every Durability barrier. See
+  [docs/plans/PLAN-qcow2-write-infrastructure.md](docs/plans/PLAN-qcow2-write-infrastructure.md).
+
 - **bench `-w` on qcow2 grows the refcount structures
   (PLAN-bench-refcount-growth phases 1-4).** Setup now computes the
   schedule's worst-case allocation bound and grows the refcount
@@ -858,6 +955,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **qcow2 chain reader ignored the classic-L2 zero flag (#432).** A v3
+  `QCOW_OFLAG_ZERO` (bit 0) cluster reached through a backing chain read
+  as the wrong bytes — host == 0 fell through to a lower backing and
+  host != 0 read stale host bytes — silent active-view corruption with
+  blast radius rebase / convert / compare / bench. `cluster_lookup` in
+  `crates/qcow2` gained a `ClusterLookup::Zero` verdict and the chain
+  reader now zero-fills for it (both host cases). Fixed fix-first as
+  step 7z of PLAN-qcow2-write-infrastructure phase 7.
+
+- **`instar bench -w` left the refcount table referencing
+  unmaterialized blocks past EOF on overwrite-dominant growth
+  schedules (issue #433).** An overwrite-dominant qcow2 `-w` schedule
+  that also crossed the preemptive refcount-growth threshold
+  provisioned refcount blocks and wrote their refcount-table pointers,
+  but the run allocated nothing, so `flush_dirty_refblocks` (which
+  writes back only dirty blocks) never materialized them — the
+  refcount table ended up pointing at refcount blocks past
+  end-of-file. Silent (exit 0) and `qemu-img check`-dirty on a
+  check-clean input; repairable by `check -r`, but a later allocator
+  could double-allocate. Growth now marks every newly provisioned
+  refcount block dirty before its eager flush, materializing every
+  block the refcount table references (restoring qemu's
+  every-RT-referenced-block-is-allocated invariant); the write rides
+  the existing growth fsync, so the flush census is unchanged.
+  Regression test
+  `test_overwrite_only_growth_check_clean_issue_433`. Found by the
+  phase-6 probes and fixed before the phase-6 migration, which then
+  carried the corrected growth through byte-identically. See
+  [docs/plans/PLAN-qcow2-write-infrastructure.md](docs/plans/PLAN-qcow2-write-infrastructure.md).
+
+- **`instar commit` refuses snapshot-bearing images instead of
+  corrupting internal snapshots (issues #420 and #423, the latter an
+  overlay-side defect found during the gate work).** commit's
+  per-cluster loop blind-overwrites snapshot-shared backing clusters
+  that qemu-img COWs and preserves — silent snapshot corruption,
+  invisible to `qemu-img check`. commit now refuses before any
+  mutation when either side has internal snapshots: backing side
+  (error 14, "the backing file has internal snapshots; committing
+  would corrupt them") and overlay side (error 15, "the overlay has
+  internal snapshots; the post-commit clear pass would corrupt
+  them") — the latter covering a second defect the gate's own parity
+  test exposed, where the overlay-clear pass decrements clusters an
+  overlay snapshot still references (refcount=0 with a live
+  reference; latent snapshot data loss). Both refusals are
+  byte-idempotent and test-proven. This is an interim gate: qemu-img
+  proceeds on these shapes, and the real fix is copy-on-write in
+  phase 7 of PLAN-qcow2-write-infrastructure.
+
+- **`instar rebase` refuses safe mode on snapshot-bearing overlays
+  instead of corrupting them (issue #421).** Safe-mode rebase
+  (including safe-mode detach) mutates snapshot-shared L2 tables in
+  place and under-counts refcounts on doubly-referenced clusters,
+  enabling live data loss via a later `snapshot -d`. It now refuses
+  before any mutation (error 14, "the overlay has internal
+  snapshots; a safe-mode rebase would corrupt them. Use -u for a
+  metadata-only rebase or fall back to `qemu-img rebase`"),
+  byte-idempotent and test-proven. `-u` metadata-only rebase never
+  touches snapshot-shared state and stays allowed, with a new parity
+  test against qemu-img (exit codes, check-clean, info-equivalence,
+  identical snapshot read-back). Interim gate; real fix is phase 7
+  copy-on-write.
+
+- **`instar rebase` hung on deep-allocation safe rebases (issue
+  #422, reported as a 512-byte-cluster livelock).** The root cause
+  was a guest panic, not a livelock: the safe-mode L2 lookup slice
+  was built once with the initial staged-L2 count, so staging a new
+  L2 table and then visiting another cluster in its coverage indexed
+  past the stale length — an out-of-bounds panic spinning forever in
+  the guest's `loop {}` panic handler. Reproducible at the default
+  64 KiB cluster size with sparse overlays, not cs=512-specific. A
+  second latent defect fixed at the same time: the staged-L2 growth
+  arena was carved before the refblock staging regions and could
+  clobber them. The lookup slice is now re-derived after growth and
+  the staging layout reordered (growable arena last). The original
+  issue fixture now terminates in 0.58 s with the pre-existing
+  refcount-exhaustion refusal (v1 never appends refblocks — a
+  documented capacity limit retired later by the master plan's
+  refcount-growth work), a previously-hanging 64 KiB sparse shape
+  completes with qemu-identical content, and output byte-invariance
+  on previously-working shapes was proven against a pre-fix build.
+
 - **`instar dd`/`convert -O vpc` declared a different virtual size
   than `qemu-img` for windowed copies (issue #382).** The VHD size
   rounding (`vhd::chs_rounded_size`) approximated qemu's CHS rounding
@@ -1076,6 +1254,120 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     GitHub issues against instar (commit `71e3e33`).
 
 ### Changed
+
+- **`instar bench -w`'s qcow2 path migrated onto `crates/qcow2-write`,
+  and its refcount-growth planner moved into that crate
+  (PLAN-qcow2-write-infrastructure phase 6).** bench `-w` on qcow2 now
+  plans its allocate-on-write schedule with the shared planner
+  (`crates/qcow2-write`) and executes it through
+  `crates/qcow2-write-exec`, the third consumer after commit (phase 4)
+  and rebase (phase 5); the read path, raw `-w`, and the vmdk/vhd/vhdx
+  read support are untouched. The pure refcount-growth planner
+  (`plan_refcount_growth`, `GrowthCaps`, `RefcountGrowthPlan`,
+  `GrowthOverflow`, with 12 unit tests) moved from `crates/bench` into
+  a new `growth` module of `crates/qcow2-write`, so it is available to
+  future write consumers; growth execution stays bench-side but now
+  routes its I/O through the shared executor's byte-range layer.
+  Unlike commit and rebase, this migration deliberately relaxes byte
+  identity for allocating schedules: bench's oracle is `qemu-img
+  compare` + `qemu-img check`, and the shared planner allocates the L2
+  table before the data cluster (the reverse of pre-migration bench),
+  so allocating outputs are content-equivalent and check-clean but not
+  byte-identical; overwrite-only schedules stay byte-identical. The
+  `scripts/migration-proof.py` harness (extended with `--op bench`)
+  proved this over a 56-combo matrix — 2 controls and 17
+  overwrite-only combos byte-identical, 34 allocating combos
+  compare/check/info/`flushes-issued`/RT-geometry equivalent, 3
+  refusals rc/stderr-identical — with 0 byte-identity failures, 0
+  determinism failures and 0 matrix failures, and a 300-iteration
+  bench differential-fuzz run reported 0 divergences. One new
+  `BenchResult` code 9 (`ERROR_IMAGE_INCONSISTENT`, "bench: image
+  metadata is inconsistent") carries the planner's classification
+  refusals (unknown/reserved L1/L2 bit patterns, refcount
+  inconsistencies, a v3 zero-flag on the target L2 entry) that had no
+  existing bench rendering; existing codes are reused otherwise
+  (allocation exhaustion keeps code 8, the contiguity gate keeps
+  code 3). The fsync census is preserved exactly — the executor's
+  flushes are disabled and bench issues its own single `fsync_input(0)`
+  per `--flush-interval` cadence point, so `flushes-issued` is
+  unchanged. See [docs/bench.md](docs/bench.md),
+  [docs/quirks.md](docs/quirks.md) and the phase-6 findings in
+  [docs/plans/PLAN-qcow2-write-infrastructure.md](docs/plans/PLAN-qcow2-write-infrastructure.md).
+
+- **`instar rebase`'s safe-mode qcow2 path migrated onto
+  `crates/qcow2-write` (PLAN-qcow2-write-infrastructure phase 5).**
+  Safe-mode rebase (including safe detach) now plans its cluster
+  copies with the shared planner (`crates/qcow2-write`) and executes
+  them through `crates/qcow2-write-exec`, the second consumer after
+  commit; the `-u` metadata-only path, unsafe detach and the vmdk
+  path are untouched. The migration is byte-invisible: the
+  `scripts/migration-proof.py` harness (extended with `--op rebase`)
+  proved instar-before vs instar-after identity over a 69-combo
+  fixture matrix — 0 identity failures, 0 determinism failures,
+  byte-identical pre-refusal scaffolding on the 6 both-refuse
+  shapes, and exactly 1 pre-declared divergence (beyond-EOV tail
+  bytes of a copied cluster are now zeros where both old instar and
+  qemu-img carry old-chain bytes; virtual content proven equal) —
+  and a 300-iteration rebase differential-fuzz run reported 0
+  divergences with baselines unchanged. Two silent-corruption shapes
+  found by the phase's probes become typed refusals before harm:
+  overlays with a sparse (holed) refcount table — stock-producible
+  and check-clean, previously misallocated refcounts into the wrong
+  refblocks — now refuse with new `RebaseResult` error 16
+  (`ERROR_OVERLAY_INCONSISTENT`), and extended-L2 overlays —
+  previously walked as 8-byte entries, silently corrupting virtual
+  content — now refuse with new error 15
+  (`ERROR_OVERLAY_UNSUPPORTED`), which also adds the spec-mandated
+  refusal of zstd/unknown incompatible bits. Overlay staging
+  capacity widens: the stage-everything L2 model and its growable
+  arena are retired (the arena-clobber hazard class behind issue
+  #422 is structurally gone), existing L2 tables are windowed with
+  safe eviction, and refblocks stage at
+  `min(2048, 3 MiB / cluster_size)`, so overlays that previously
+  refused at staging time on populated-L2 count alone now rebase.
+  `crates/rebase` slims by ~330 lines (the hand-rolled allocator and
+  its state are deleted; the deferred header/backing-path patch
+  machinery survives byte-identical). See
+  [docs/rebase.md](docs/rebase.md), [docs/quirks.md](docs/quirks.md)
+  and the phase-5 findings in
+  [docs/plans/PLAN-qcow2-write-infrastructure.md](docs/plans/PLAN-qcow2-write-infrastructure.md).
+
+- **`instar commit`'s qcow2 write path migrated onto
+  `crates/qcow2-write` (PLAN-qcow2-write-infrastructure phase 4).**
+  The commit op's inlined backing-side allocate-on-write composition
+  is replaced by the shared planner (`crates/qcow2-write`) driven
+  through the new `crates/qcow2-write-exec` guest step executor — a
+  literal interpreter of the planner's step contracts (DeviceIo
+  call-table mapping, a shared byte-range layer with sub-sector RMW
+  replacing the per-op helpers, fill synthesis, and barrier policy
+  with Durability degrading to Ordering on the fsync-less output
+  device). The migration is byte-invisible: a new
+  `scripts/migration-proof.py` harness proved instar-before vs
+  instar-after byte identity over a 73-combo fixture matrix (0
+  identity failures, 0 determinism failures, including byte-identical
+  pre-refusal scaffolding on the refusal shapes), and a 300-iteration
+  commit differential-fuzz run reported 0 divergences with baselines
+  unchanged. Two silent-corruption shapes found by the phase's probes
+  become typed refusals before harm: compressed backing clusters
+  (previously overwritten in place, destroying every stream packed in
+  the host cluster) now refuse with the existing unsupported-format
+  error, and backings with a sparse (holed) refcount table —
+  stock-producible via discard + `qemu-img resize --shrink`, and
+  check-clean — now refuse with new `CommitResult` error 17
+  (`ERROR_BACKING_INCONSISTENT`) instead of corrupting refcounts; new
+  error 16 (`ERROR_BACKING_UNSUPPORTED`) adds the spec-mandated
+  refusal of unknown/compression incompatible bits on the backing.
+  Backing staging capacity widens (refblocks from a flat 32 to
+  `min(2048, 3 MiB / cluster_size)`; the backing staged-L2 cap
+  replaced by a windowed model), so strictly more images commit
+  successfully; overlay-side caps are unchanged. Unaligned virtual
+  sizes commit cleanly, including chained backings (the planner's new
+  EOV-tail full-coverage rule). `crates/commit` slims by ~550 lines
+  (the superseded allocator and dead plan machinery are deleted; all
+  cross-image validation and the vmdk path are untouched). See
+  [docs/commit.md](docs/commit.md), [docs/quirks.md](docs/quirks.md)
+  and the phase-4 findings in
+  [docs/plans/PLAN-qcow2-write-infrastructure.md](docs/plans/PLAN-qcow2-write-infrastructure.md).
 
 - **Guest core and operation memory budgets doubled (2026-07-06,
   commit `3a5e1e2`).** Pre-emptive lift ahead of the bench work,

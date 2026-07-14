@@ -1,40 +1,29 @@
-//! Plan in-place metadata mutations to commit overlay
+//! Validation and geometry planning for committing overlay
 //! clusters into a backing image.
 //!
-//! Given the parsed headers of the overlay and the backing,
-//! and the host-pre-staged refcount blocks of the backing, the
-//! `plan_commit_*` functions in this crate return a per-format
-//! *context* the guest threads through a per-cluster commit
-//! loop. Unlike rebase (where unsafe mode could pre-compute a
-//! complete patch list), commit is always data-aware: every
-//! commit reads overlay cluster data and writes it into the
-//! backing. There is no `Unsafe` mode and the planner returns
-//! the context directly rather than an `Output` enum.
+//! Given the parsed headers of the overlay and the backing, the
+//! `plan_commit_*` functions in this crate validate the pair
+//! (LUKS / external-data-file refusal, virtual-size
+//! compatibility, geometry sanity) and return a per-format
+//! *context* of the geometry the guest threads through its
+//! per-cluster commit loop. Unlike rebase (where unsafe mode
+//! could pre-compute a complete patch list), commit is always
+//! data-aware: every commit reads overlay cluster data and
+//! writes it into the backing.
 //!
-//! Workflow:
+//! For qcow2, the backing-side write composition (cluster
+//! allocation, refblock staging and dirty tracking, the L2/L1
+//! /refcount flush) moved to `crates/qcow2-write` +
+//! `crates/qcow2-write-exec` in phase 4 of
+//! `PLAN-qcow2-write-infrastructure`; [`plan_commit_qcow2`]
+//! keeps the overlay-side and cross-image validation plus the
+//! overlay geometry the clear pass needs. The vmdk path
+//! ([`plan_commit_vmdk`], [`allocate_backing_grain_vmdk`])
+//! still owns its backing-side allocator and scratch staging.
 //!
-//! 1. The host pre-probes the overlay and backing headers and
-//!    pre-reads the backing's refcount table + every refcount
-//!    block it points at into a buffer it hands to the planner
-//!    via `Qcow2CommitOpts` / `VmdkCommitOpts`.
-//! 2. The planner validates inputs (LUKS / external-data-file
-//!    refusal, virtual-size compatibility, geometry sanity),
-//!    copies the backing's refcount blocks into scratch, and
-//!    returns a `*CommitContext` borrowing into scratch.
-//! 3. The guest iterates the overlay's allocated clusters,
-//!    calling [`allocate_backing_cluster_qcow2`] (or the vmdk
-//!    analogue) when the backing doesn't already have a
-//!    cluster at the matching guest offset. The pure allocator
-//!    mutates the staged refcount blocks; the guest emits the
-//!    data write, the backing L2 update, and finally the
-//!    overlay-clear writes (zero the L2 entry, zero the
-//!    refcount entry on the overlay).
-//! 4. After the comparison loop the guest flushes the dirty
-//!    refcount blocks back to the backing.
-//!
-//! This crate is `no_std` and performs no I/O. Scratch buffers
-//! are caller-supplied; returned contexts borrow from the
-//! scratch buffer.
+//! This crate is `no_std` and performs no I/O. The vmdk
+//! planner's scratch buffer is caller-supplied; its returned
+//! context borrows from that scratch.
 
 #![no_std]
 #![allow(clippy::too_many_arguments)]
@@ -107,151 +96,13 @@ pub enum CommitError {
     Overflow,
 }
 
-/// A single byte-level operation against either the backing
-/// or the overlay.
-///
-/// Commit emits patches sparingly — the bulk of the work is
-/// runtime data writes the guest issues directly. The
-/// [`CommitPatch::Write`] variant is the only shape currently
-/// in use; an `Append` variant is intentionally absent because
-/// commit never grows the backing past its existing EOF in v1.
-#[derive(Debug, Clone, Copy)]
-pub enum CommitPatch<'a> {
-    /// Overwrite an existing byte range. The patch carries no
-    /// indication of which file it targets; the guest knows
-    /// based on which slot it pulls the patch from.
-    Write {
-        /// Absolute byte offset within the target file.
-        byte_offset: u64,
-        /// Bytes to write.
-        bytes: &'a [u8],
-    },
-}
-
-impl<'a> CommitPatch<'a> {
-    /// Empty placeholder used as the default array element when
-    /// building a [`CommitPlan`].
-    pub const EMPTY: CommitPatch<'static> = CommitPatch::Write {
-        byte_offset: 0,
-        bytes: &[],
-    };
-
-    /// Byte offset where this patch starts in its target file.
-    pub fn byte_offset(&self) -> u64 {
-        match self {
-            CommitPatch::Write { byte_offset, .. } => *byte_offset,
-        }
-    }
-
-    /// Number of bytes this patch touches.
-    pub fn len(&self) -> usize {
-        match self {
-            CommitPatch::Write { bytes, .. } => bytes.len(),
-        }
-    }
-
-    /// True if the patch is a no-op (zero-length write).
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-/// Maximum number of patch entries a [`CommitPlan`] can hold.
-///
-/// 16 is generous; the planner currently emits zero patches.
-/// The plan storage exists for the dry-run / preview shape
-/// flagged in the phase plan's open question 2.
-pub const MAX_COMMIT_PATCHES: usize = 16;
-
-/// A bounded collection of [`CommitPatch`] entries.
-///
-/// Mirrors [`rebase::RebasePlan`] in shape; commit's planner
-/// returns an empty plan today, but the type exists so the
-/// dry-run / preview surface can populate it without an ABI
-/// break.
-#[derive(Debug, Clone, Copy)]
-pub struct CommitPlan<'a> {
-    /// File size the backing should end up at after applying
-    /// every patch. Equals the backing's pre-commit file size
-    /// for v1 (no growth).
-    pub total_file_size: u64,
-    /// Number of populated entries in `patches_storage`.
-    patch_count: u16,
-    /// Inline storage; only `..patch_count` is valid.
-    patches_storage: [CommitPatch<'a>; MAX_COMMIT_PATCHES],
-}
-
-impl<'a> CommitPlan<'a> {
-    /// Construct an empty plan for the given target file size.
-    pub const fn new(total_file_size: u64) -> Self {
-        CommitPlan {
-            total_file_size,
-            patch_count: 0,
-            patches_storage: [CommitPatch::EMPTY; MAX_COMMIT_PATCHES],
-        }
-    }
-
-    /// Ordered list of patches to apply.
-    pub fn patches(&self) -> &[CommitPatch<'a>] {
-        &self.patches_storage[..self.patch_count as usize]
-    }
-
-    /// Append a patch to the plan. Returns
-    /// [`CommitError::ScratchTooSmall`] if the plan's storage
-    /// is full.
-    pub fn push(&mut self, patch: CommitPatch<'a>) -> Result<(), CommitError> {
-        let idx = self.patch_count as usize;
-        if idx >= MAX_COMMIT_PATCHES {
-            return Err(CommitError::ScratchTooSmall);
-        }
-        self.patches_storage[idx] = patch;
-        self.patch_count += 1;
-        Ok(())
-    }
-}
-
 // Re-export the per-format opts, contexts, and allocator
 // helpers so downstream callers see a flat API surface.
 pub use qcow2::{
-    allocate_backing_cluster_qcow2, overlay_l2_byte_offset_qcow2,
-    overlay_refcount_byte_offset_qcow2, plan_commit_qcow2, BackingAllocationState,
+    overlay_l2_byte_offset_qcow2, overlay_refcount_byte_offset_qcow2, plan_commit_qcow2,
     Qcow2CommitContext, Qcow2CommitOpts,
 };
 pub use vmdk::{
     allocate_backing_grain_vmdk, overlay_gte_byte_offset_vmdk, plan_commit_vmdk,
     BackingGrainAllocationState, VmdkCommitContext, VmdkCommitOpts,
 };
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn patch_methods_match_variant() {
-        let p = CommitPatch::Write {
-            byte_offset: 0x1000,
-            bytes: &[1, 2, 3, 4],
-        };
-        assert_eq!(p.byte_offset(), 0x1000);
-        assert_eq!(p.len(), 4);
-        assert!(!p.is_empty());
-
-        let empty = CommitPatch::EMPTY;
-        assert!(empty.is_empty());
-    }
-
-    #[test]
-    fn plan_push_respects_bound() {
-        let mut plan = CommitPlan::new(1024);
-        for i in 0..MAX_COMMIT_PATCHES {
-            let r = plan.push(CommitPatch::Write {
-                byte_offset: i as u64,
-                bytes: &[],
-            });
-            assert!(r.is_ok(), "push at i={i} must succeed within bound");
-        }
-        let overflow = plan.push(CommitPatch::EMPTY);
-        assert_eq!(overflow, Err(CommitError::ScratchTooSmall));
-        assert_eq!(plan.patches().len(), MAX_COMMIT_PATCHES);
-    }
-}

@@ -1,0 +1,14 @@
+[package]
+name = "qcow2-write-exec"
+version = "0.1.0"
+edition = "2021"
+description = "Guest-side literal executor for qcow2-write step programs (RegionId/TargetDevice mapping + byte-range I/O)"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+shared = { path = "../../shared" }
+qcow2-write = { path = "../qcow2-write" }
+
+[dev-dependencies]
+qcow2 = { path = "../qcow2", default-features = false }

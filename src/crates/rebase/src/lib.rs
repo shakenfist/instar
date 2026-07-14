@@ -19,19 +19,21 @@
 //!   decisions.
 //! - **Safe mode**: the planner returns a per-format *context*
 //!   plus a deferred-apply metadata patch. The guest drives the
-//!   per-cluster comparison loop and calls back into the
-//!   crate's pure allocator helpers when it decides a copy is
-//!   needed; once the loop completes, it applies the deferred
-//!   metadata patch (typically the qcow2 header rewrite or the
-//!   vmdk descriptor rewrite).
+//!   per-cluster comparison loop; once the loop completes, it
+//!   applies the deferred metadata patch (typically the qcow2
+//!   header rewrite or the vmdk descriptor rewrite).
+//!
+//! For qcow2 safe mode the write composition (cluster
+//! allocation, refcount staging, L2/L1 patching) lives in
+//! `crates/qcow2-write` + `crates/qcow2-write-exec` since
+//! phase 5 of `PLAN-qcow2-write-infrastructure`; the qcow2
+//! safe context is plain overlay geometry. The vmdk safe
+//! context still carries the in-crate grain allocator's staged
+//! state.
 //!
 //! This crate is `no_std` and performs no I/O. Scratch buffers
 //! are caller-supplied; returned plans and contexts borrow from
 //! the scratch buffer.
-//!
-//! This phase ships scaffolding only: the type surface and
-//! stubbed planners that return [`RebaseError::UnsupportedFormat`].
-//! Later steps in phase 2 fill in the per-format implementations.
 
 #![no_std]
 #![allow(clippy::too_many_arguments)]
@@ -249,12 +251,10 @@ impl<'a> RebasePlan<'a> {
     }
 }
 
-// Re-export the per-format opts, outputs, and allocator
-// helpers so downstream callers see a flat API surface.
-pub use qcow2::{
-    allocate_overlay_cluster_qcow2, plan_rebase_qcow2, AllocationState, Qcow2RebaseOpts,
-    Qcow2RebaseOutput, RebaseQcow2SafeContext,
-};
+// Re-export the per-format opts, outputs, and (vmdk-side)
+// allocator helpers so downstream callers see a flat API
+// surface.
+pub use qcow2::{plan_rebase_qcow2, Qcow2RebaseOpts, Qcow2RebaseOutput, RebaseQcow2SafeContext};
 pub use vmdk::{
     allocate_overlay_grain_vmdk, plan_rebase_vmdk, GrainAllocationState, RebaseVmdkSafeContext,
     VmdkRebaseOpts, VmdkRebaseOutput,

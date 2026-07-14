@@ -1,11 +1,13 @@
-//! qcow2 commit planner.
+//! qcow2 commit planner: overlay-side and cross-image
+//! validation plus the geometry the guest's commit loop needs.
 //!
-//! Stages the backing's refcount blocks into scratch, validates
-//! that the overlay and backing geometries are compatible, and
-//! returns a [`Qcow2CommitContext`] the guest threads through a
-//! per-cluster commit loop. The pure allocator
-//! [`allocate_backing_cluster_qcow2`] hands out fresh backing
-//! host offsets as the guest decides to copy clusters.
+//! Phase 4 of `PLAN-qcow2-write-infrastructure` moved the
+//! backing-side write composition (allocation, refblock
+//! staging, dirty tracking) into `crates/qcow2-write` +
+//! `crates/qcow2-write-exec`; what remains here is the
+//! cross-image validation gate and the overlay geometry the
+//! guest threads through the per-cluster loop and the
+//! overlay-clear pass.
 //!
 //! Refcount-width coverage in v1: only `refcount_bits == 16`
 //! (qemu-img's default) on both the overlay and the backing.
@@ -27,28 +29,15 @@ pub struct Qcow2CommitOpts<'a> {
     pub overlay_file_size: u64,
     /// Backing's current header bytes.
     pub backing_header: &'a [u8],
-    /// Backing's current file size in bytes (the allocator
-    /// does not grow it in v1).
+    /// Backing's current file size in bytes.
     pub backing_file_size: u64,
-    /// Backing's refcount-table bytes (an array of u64 BE
-    /// entries pointing at refcount blocks). The planner only
-    /// uses these to validate the host-supplied
-    /// `backing_refblock_host_offsets`; the allocator works
-    /// against the staged refblock bytes directly.
-    pub backing_refcount_table: &'a [u8],
-    /// Host byte offsets of each backing refcount block.
-    /// Length must equal `backing_refblock_count`.
-    pub backing_refblock_host_offsets: &'a [u64],
-    /// Concatenated backing refcount-block bytes.
-    pub backing_refcount_blocks: &'a [u8],
-    /// Number of refcount blocks present in
-    /// `backing_refcount_blocks`.
-    pub backing_refblock_count: u32,
 }
 
-/// Context the guest threads through a qcow2 commit loop.
-#[derive(Debug)]
-pub struct Qcow2CommitContext<'a> {
+/// Geometry the guest threads through a qcow2 commit loop and
+/// the overlay-clear pass. Backing-side write state lives in
+/// `qcow2_write::WriteState` since phase 4.
+#[derive(Debug, Clone, Copy)]
+pub struct Qcow2CommitContext {
     pub overlay_cluster_size: u32,
     pub overlay_cluster_count: u64,
     pub overlay_l1_table_offset: u64,
@@ -57,49 +46,18 @@ pub struct Qcow2CommitContext<'a> {
     pub overlay_refcount_table_clusters: u32,
     pub overlay_refcount_bits: u32,
     pub overlay_entries_per_refblock: u64,
-    pub backing_cluster_size: u32,
-    pub backing_cluster_count: u64,
-    pub backing_l1_table_offset: u64,
-    pub backing_l1_size: u32,
-    pub backing_refcount_bits: u32,
-    pub backing_entries_per_refblock: u64,
-    pub backing_refblock_count: u32,
-    /// Staged backing refcount-block bytes, mutated in place
-    /// by [`allocate_backing_cluster_qcow2`].
-    pub backing_refblocks: &'a mut [u8],
-    /// Echoed from opts so the guest can flush dirty blocks
-    /// back without re-parsing the refcount table.
-    pub backing_refblock_host_offsets: &'a [u64],
-    /// Per-refblock dirty bitmap; bit `i` is set if the
-    /// allocator has modified refblock `i`. Length is
-    /// `(backing_refblock_count + 7) / 8`.
-    pub backing_dirty: &'a mut [u8],
-}
-
-/// Allocator state threaded through repeated calls to
-/// [`allocate_backing_cluster_qcow2`].
-#[derive(Debug, Clone, Copy, Default)]
-pub struct BackingAllocationState {
-    /// Refblock index where the next scan resumes.
-    pub next_refblock: u32,
-    /// Entry index within the current refblock where the next
-    /// scan resumes.
-    pub next_entry_in_refblock: u64,
-    /// Total clusters allocated so far in the backing.
-    pub allocated: u64,
 }
 
 /// Plan a qcow2 commit.
 ///
-/// Validates compatibility between the overlay and the backing,
-/// stages the backing's refcount blocks into scratch, and
-/// returns a [`Qcow2CommitContext`] borrowing into scratch. The
-/// guest drives the per-cluster commit loop itself; the
-/// planner does not pre-compute any patches.
-pub fn plan_commit_qcow2<'a>(
-    opts: &Qcow2CommitOpts<'a>,
-    scratch: &'a mut [u8],
-) -> Result<Qcow2CommitContext<'a>, CommitError> {
+/// Validates compatibility between the overlay and the backing
+/// (LUKS / external-data-file refusal, dirty/corrupt bits,
+/// virtual-size compatibility, refcount width, geometry sanity)
+/// and returns the overlay geometry as a [`Qcow2CommitContext`].
+/// The guest drives the per-cluster commit loop itself; the
+/// backing-side envelope (feature bits, snapshots) is gated
+/// separately by `qcow2_write::check_envelope`.
+pub fn plan_commit_qcow2(opts: &Qcow2CommitOpts<'_>) -> Result<Qcow2CommitContext, CommitError> {
     // ----- Parse + validate the overlay header --------------
     let overlay = QcowHeader::parse(opts.overlay_header).ok_or(CommitError::ParseFailed)?;
     if overlay.dirty || overlay.corrupt {
@@ -144,42 +102,9 @@ pub fn plan_commit_qcow2<'a>(
         return Err(CommitError::BackingCorrupt);
     }
 
-    let backing_cluster_size = backing.cluster_size;
-    let backing_entries_per_refblock = (backing_cluster_size * 8) / backing.refcount_bits as u64;
     let overlay_cluster_size = overlay.cluster_size;
     let overlay_entries_per_refblock = (overlay_cluster_size * 8) / overlay.refcount_bits as u64;
-
-    // ----- Validate the host-supplied backing-refblock buffers
-    let refblock_count = opts.backing_refblock_count as usize;
-    let refblocks_size_bytes = refblock_count
-        .checked_mul(backing_cluster_size as usize)
-        .ok_or(CommitError::Overflow)?;
-    if opts.backing_refcount_blocks.len() < refblocks_size_bytes {
-        return Err(CommitError::HeaderMismatch);
-    }
-    if opts.backing_refblock_host_offsets.len() != refblock_count {
-        return Err(CommitError::HeaderMismatch);
-    }
-
-    // ----- Carve scratch -----------------------------------
-    let dirty_bytes = refblock_count.div_ceil(8);
-    let need = dirty_bytes
-        .checked_add(refblocks_size_bytes)
-        .ok_or(CommitError::Overflow)?;
-    if scratch.len() < need {
-        return Err(CommitError::ScratchTooSmall);
-    }
-
-    let (dirty_buf, rest) = scratch.split_at_mut(dirty_bytes);
-    let (refblocks_buf, _rest) = rest.split_at_mut(refblocks_size_bytes);
-
-    refblocks_buf.copy_from_slice(&opts.backing_refcount_blocks[..refblocks_size_bytes]);
-    for b in dirty_buf.iter_mut() {
-        *b = 0;
-    }
-
     let overlay_cluster_count = overlay.virtual_size.div_ceil(overlay_cluster_size);
-    let backing_cluster_count = backing.virtual_size.div_ceil(backing_cluster_size);
 
     Ok(Qcow2CommitContext {
         overlay_cluster_size: overlay_cluster_size as u32,
@@ -190,93 +115,7 @@ pub fn plan_commit_qcow2<'a>(
         overlay_refcount_table_clusters: overlay.refcount_table_clusters,
         overlay_refcount_bits: overlay.refcount_bits,
         overlay_entries_per_refblock,
-        backing_cluster_size: backing_cluster_size as u32,
-        backing_cluster_count,
-        backing_l1_table_offset: backing.l1_table_offset,
-        backing_l1_size: backing.l1_size,
-        backing_refcount_bits: backing.refcount_bits,
-        backing_entries_per_refblock,
-        backing_refblock_count: opts.backing_refblock_count,
-        backing_refblocks: refblocks_buf,
-        backing_refblock_host_offsets: opts.backing_refblock_host_offsets,
-        backing_dirty: dirty_buf,
     })
-}
-
-/// Allocate a single fresh cluster in the backing.
-///
-/// Pure function: scans the staged backing refcount-block
-/// bytes starting from `state.next_refblock` /
-/// `state.next_entry_in_refblock`, finds the next entry
-/// whose refcount is zero, bumps it to one, marks the
-/// containing refblock dirty, and returns the host byte
-/// offset of the claimed cluster.
-///
-/// v1 supports `context.backing_refcount_bits == 16` only.
-/// Returns [`CommitError::UnsupportedFormat`] for other widths
-/// and [`CommitError::RefcountExhausted`] when every existing
-/// block is full.
-pub fn allocate_backing_cluster_qcow2(
-    context: &mut Qcow2CommitContext<'_>,
-    state: &mut BackingAllocationState,
-) -> Result<u64, CommitError> {
-    if context.backing_refcount_bits != 16 {
-        return Err(CommitError::UnsupportedFormat);
-    }
-    let cluster_size = context.backing_cluster_size as u64;
-    let entries_per_refblock = context.backing_entries_per_refblock;
-    let bytes_per_refblock = cluster_size as usize;
-
-    while state.next_refblock < context.backing_refblock_count {
-        let refblock_idx = state.next_refblock as usize;
-        let refblock_byte_offset = refblock_idx
-            .checked_mul(bytes_per_refblock)
-            .ok_or(CommitError::Overflow)?;
-        let refblock = context
-            .backing_refblocks
-            .get_mut(refblock_byte_offset..refblock_byte_offset + bytes_per_refblock)
-            .ok_or(CommitError::BackingCorrupt)?;
-
-        while state.next_entry_in_refblock < entries_per_refblock {
-            let entry_idx = state.next_entry_in_refblock as usize;
-            let byte_off = entry_idx * 2; // 16-bit entries
-            if byte_off + 2 > refblock.len() {
-                break;
-            }
-            let raw = u16::from_be_bytes([refblock[byte_off], refblock[byte_off + 1]]);
-            if raw == 0 {
-                // Claim it.
-                let one = 1u16.to_be_bytes();
-                refblock[byte_off] = one[0];
-                refblock[byte_off + 1] = one[1];
-
-                // Mark refblock dirty.
-                let dirty_byte = refblock_idx / 8;
-                let dirty_bit = refblock_idx % 8;
-                if let Some(b) = context.backing_dirty.get_mut(dirty_byte) {
-                    *b |= 1u8 << dirty_bit;
-                }
-
-                let cluster_index = (state.next_refblock as u64)
-                    .checked_mul(entries_per_refblock)
-                    .and_then(|v| v.checked_add(state.next_entry_in_refblock))
-                    .ok_or(CommitError::Overflow)?;
-                let host_offset = cluster_index
-                    .checked_mul(cluster_size)
-                    .ok_or(CommitError::Overflow)?;
-
-                state.next_entry_in_refblock += 1;
-                state.allocated += 1;
-                return Ok(host_offset);
-            }
-            state.next_entry_in_refblock += 1;
-        }
-
-        state.next_refblock += 1;
-        state.next_entry_in_refblock = 0;
-    }
-
-    Err(CommitError::RefcountExhausted)
 }
 
 /// Compute the disk byte offset of the L2 entry covering a
@@ -358,22 +197,12 @@ mod tests {
         h
     }
 
-    fn baseline_opts<'a>(
-        overlay_hdr: &'a [u8],
-        backing_hdr: &'a [u8],
-        refblocks: &'a [u8],
-        offsets: &'a [u64],
-        count: u32,
-    ) -> Qcow2CommitOpts<'a> {
+    fn baseline_opts<'a>(overlay_hdr: &'a [u8], backing_hdr: &'a [u8]) -> Qcow2CommitOpts<'a> {
         Qcow2CommitOpts {
             overlay_header: overlay_hdr,
             overlay_file_size: 1 << 20,
             backing_header: backing_hdr,
             backing_file_size: 1 << 20,
-            backing_refcount_table: &[],
-            backing_refblock_host_offsets: offsets,
-            backing_refcount_blocks: refblocks,
-            backing_refblock_count: count,
         }
     }
 
@@ -381,11 +210,7 @@ mod tests {
     fn rejects_external_data_overlay() {
         let oh = make_header_with_external_data();
         let bh = make_header(1 << 20);
-        let mut scratch = [0u8; 65536 * 2];
-        let one_block = [0u8; 65536];
-        let offsets = [65536u64];
-        let opts = baseline_opts(&oh, &bh, &one_block, &offsets, 1);
-        let r = plan_commit_qcow2(&opts, &mut scratch);
+        let r = plan_commit_qcow2(&baseline_opts(&oh, &bh));
         assert_eq!(r.err(), Some(CommitError::ExternalDataFile));
     }
 
@@ -393,11 +218,7 @@ mod tests {
     fn rejects_external_data_backing() {
         let oh = make_header(1 << 20);
         let bh = make_header_with_external_data();
-        let mut scratch = [0u8; 65536 * 2];
-        let one_block = [0u8; 65536];
-        let offsets = [65536u64];
-        let opts = baseline_opts(&oh, &bh, &one_block, &offsets, 1);
-        let r = plan_commit_qcow2(&opts, &mut scratch);
+        let r = plan_commit_qcow2(&baseline_opts(&oh, &bh));
         assert_eq!(r.err(), Some(CommitError::ExternalDataFile));
     }
 
@@ -405,11 +226,7 @@ mod tests {
     fn rejects_encrypted_overlay() {
         let oh = make_header_with_crypt();
         let bh = make_header(1 << 20);
-        let mut scratch = [0u8; 65536 * 2];
-        let one_block = [0u8; 65536];
-        let offsets = [65536u64];
-        let opts = baseline_opts(&oh, &bh, &one_block, &offsets, 1);
-        let r = plan_commit_qcow2(&opts, &mut scratch);
+        let r = plan_commit_qcow2(&baseline_opts(&oh, &bh));
         assert_eq!(r.err(), Some(CommitError::LuksUnsupported));
     }
 
@@ -417,11 +234,7 @@ mod tests {
     fn rejects_backing_smaller_than_overlay() {
         let oh = make_header(2 << 20);
         let bh = make_header(1 << 20);
-        let mut scratch = [0u8; 65536 * 2];
-        let one_block = [0u8; 65536];
-        let offsets = [65536u64];
-        let opts = baseline_opts(&oh, &bh, &one_block, &offsets, 1);
-        let r = plan_commit_qcow2(&opts, &mut scratch);
+        let r = plan_commit_qcow2(&baseline_opts(&oh, &bh));
         assert_eq!(r.err(), Some(CommitError::OverlayLargerThanBacking));
     }
 
@@ -429,136 +242,16 @@ mod tests {
     fn plan_populates_geometry() {
         let oh = make_header(1 << 20);
         let bh = make_header(1 << 20);
-        let mut scratch = [0u8; 65536 * 2];
-        let one_block = [0u8; 65536];
-        let offsets = [65536u64];
-        let opts = baseline_opts(&oh, &bh, &one_block, &offsets, 1);
-        let ctx = plan_commit_qcow2(&opts, &mut scratch).expect("plan ok");
+        let ctx = plan_commit_qcow2(&baseline_opts(&oh, &bh)).expect("plan ok");
         assert_eq!(ctx.overlay_cluster_size, 65536);
-        assert_eq!(ctx.backing_cluster_size, 65536);
         assert_eq!(ctx.overlay_cluster_count, (1u64 << 20) / 65536);
-        assert_eq!(ctx.backing_refblock_count, 1);
-        assert_eq!(ctx.backing_refblocks.len(), 65536);
-        assert_eq!(ctx.backing_dirty.len(), 1);
-        assert_eq!(ctx.backing_dirty[0], 0);
-    }
-
-    #[test]
-    fn allocator_claims_first_free_cluster() {
-        let oh = make_header(1 << 20);
-        let bh = make_header(1 << 20);
-        let mut scratch = [0u8; 65536 * 2];
-        // Mark entries 0..3 already-allocated in the backing's
-        // staged refblock.
-        let mut one_block = [0u8; 65536];
-        let one = 1u16.to_be_bytes();
-        one_block[0..2].copy_from_slice(&one);
-        one_block[2..4].copy_from_slice(&one);
-        one_block[4..6].copy_from_slice(&one);
-        let offsets = [65536u64];
-        let opts = baseline_opts(&oh, &bh, &one_block, &offsets, 1);
-
-        let mut ctx = plan_commit_qcow2(&opts, &mut scratch).expect("plan ok");
-        let mut state = BackingAllocationState::default();
-        let off = allocate_backing_cluster_qcow2(&mut ctx, &mut state).expect("alloc");
-        // Cluster 3 -> offset 3 * 65536 = 196608.
-        assert_eq!(off, 3 * 65536);
-        assert_eq!(state.allocated, 1);
-        let raw = u16::from_be_bytes([ctx.backing_refblocks[6], ctx.backing_refblocks[7]]);
-        assert_eq!(raw, 1);
-        assert_eq!(ctx.backing_dirty[0] & 1, 1);
-    }
-
-    #[test]
-    fn allocator_advances_across_calls() {
-        let oh = make_header(1 << 20);
-        let bh = make_header(1 << 20);
-        let mut scratch = [0u8; 65536 * 2];
-        let one_block = [0u8; 65536];
-        let offsets = [65536u64];
-        let opts = baseline_opts(&oh, &bh, &one_block, &offsets, 1);
-
-        let mut ctx = plan_commit_qcow2(&opts, &mut scratch).expect("plan ok");
-        let mut state = BackingAllocationState::default();
-        let a = allocate_backing_cluster_qcow2(&mut ctx, &mut state).unwrap();
-        let b = allocate_backing_cluster_qcow2(&mut ctx, &mut state).unwrap();
-        let c = allocate_backing_cluster_qcow2(&mut ctx, &mut state).unwrap();
-        assert_eq!(a, 0);
-        assert_eq!(b, 65536);
-        assert_eq!(c, 2 * 65536);
-        assert_eq!(state.allocated, 3);
-    }
-
-    #[test]
-    fn allocator_exhausted_when_full() {
-        let _oh = make_header(1 << 20);
-        let _bh = make_header(1 << 20);
-        let mut scratch = [0u8; 32];
-        let mut tiny_block = [0u8; 8]; // 4 × 16-bit entries
-        for chunk in tiny_block.chunks_mut(2) {
-            chunk.copy_from_slice(&1u16.to_be_bytes());
-        }
-        let offsets = [65536u64];
-        // Override cluster size by hand-crafting a small
-        // refblock — we can't get plan_commit_qcow2 to give us
-        // a 4-entry block, so build the context manually for
-        // this allocator test.
-        let mut refblocks = tiny_block;
-        let mut dirty = [0u8; 1];
-        let mut ctx = Qcow2CommitContext {
-            overlay_cluster_size: 8,
-            overlay_cluster_count: 1,
-            overlay_l1_table_offset: 0,
-            overlay_l1_size: 0,
-            overlay_refcount_table_offset: 0,
-            overlay_refcount_table_clusters: 0,
-            overlay_refcount_bits: 16,
-            overlay_entries_per_refblock: 4,
-            backing_cluster_size: 8,
-            backing_cluster_count: 1,
-            backing_l1_table_offset: 0,
-            backing_l1_size: 0,
-            backing_refcount_bits: 16,
-            backing_entries_per_refblock: 4,
-            backing_refblock_count: 1,
-            backing_refblocks: &mut refblocks,
-            backing_refblock_host_offsets: &offsets,
-            backing_dirty: &mut dirty,
-        };
-        let mut state = BackingAllocationState::default();
-        let r = allocate_backing_cluster_qcow2(&mut ctx, &mut state);
-        assert_eq!(r.err(), Some(CommitError::RefcountExhausted));
-        let _ = &mut scratch;
-    }
-
-    #[test]
-    fn allocator_rejects_non_16bit_widths() {
-        let offsets = [65536u64];
-        let mut refblocks = [0u8; 64];
-        let mut dirty = [0u8; 1];
-        let mut ctx = Qcow2CommitContext {
-            overlay_cluster_size: 64,
-            overlay_cluster_count: 1,
-            overlay_l1_table_offset: 0,
-            overlay_l1_size: 0,
-            overlay_refcount_table_offset: 0,
-            overlay_refcount_table_clusters: 0,
-            overlay_refcount_bits: 32,
-            overlay_entries_per_refblock: 16,
-            backing_cluster_size: 64,
-            backing_cluster_count: 1,
-            backing_l1_table_offset: 0,
-            backing_l1_size: 0,
-            backing_refcount_bits: 32,
-            backing_entries_per_refblock: 16,
-            backing_refblock_count: 1,
-            backing_refblocks: &mut refblocks,
-            backing_refblock_host_offsets: &offsets,
-            backing_dirty: &mut dirty,
-        };
-        let mut state = BackingAllocationState::default();
-        let r = allocate_backing_cluster_qcow2(&mut ctx, &mut state);
-        assert_eq!(r.err(), Some(CommitError::UnsupportedFormat));
+        assert_eq!(ctx.overlay_l1_size, 1);
+        assert_eq!(ctx.overlay_l1_table_offset, 2 * 65536);
+        assert_eq!(ctx.overlay_refcount_table_offset, 65536);
+        assert_eq!(ctx.overlay_refcount_table_clusters, 1);
+        assert_eq!(ctx.overlay_refcount_bits, 16);
+        // 64 KiB clusters, 16-bit entries.
+        assert_eq!(ctx.overlay_entries_per_refblock, 65536 * 8 / 16);
     }
 
     #[test]
