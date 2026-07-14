@@ -1466,6 +1466,27 @@ refblocks in bench growth) was fixed fix-first.
   builds on out-of-envelope (petabyte-scale) geometry; release returns
   `GrowthOverflow` gracefully. Softening it to always return the error is
   a minor follow-up.
+* **Isolated Rust tests for `qcow2_write_exec::growth::grow_refcounts`**
+  (pre-push audit, 2b). The exec-side growth function (stage refblocks,
+  relocate the RT, patch the header commit point, #433 materialization)
+  has no in-crate unit test or dedicated fuzz target; it is covered only
+  end-to-end through the Python KVM suite (`TestBenchRefcountGrowth` +
+  the #433 regression, all green). A `#[cfg(test)]` suite over the
+  existing `DeviceIo` mock — no-relocation, RT-relocation, and a
+  write/fsync-failure path surfacing `GrowthExecError` — would isolate
+  the device-write sequencing. Non-blocking (the outcome is qemu-parity
+  tested).
+* **Extract the per-op growth call-site glue** (pre-push audit, 2a). The
+  ~60-90 lines that build `GrowthCaps`, call `plan_refcount_growth`,
+  construct `GrowthExec`/`GrowthBuffers`/`RefcountTable` from raw scratch
+  addresses, call `grow_refcounts`, and widen the carve are copy-pasted
+  near-verbatim across commit/rebase/bench (the planner + executor are
+  genuinely shared; only this boilerplate is not). A parameterized helper
+  would remove the fix-one-forget-the-others risk. Also: the coexisting
+  per-op raw-pointer byte-range helpers vs `qcow2-write-exec`'s generic
+  `read_bytes`/`write_bytes` is a recorded deferral (this plan's phase-5
+  scoping) whose rationale is not cross-referenced from the source — a
+  one-line source comment would help future maintainers.
 
 These, plus the larger items (qemu-lazy growth parity to unlock growth for
 the byte-parity consumers, `amend refcount_bits`, preallocation modes,

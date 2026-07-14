@@ -1206,7 +1206,7 @@ qcow2 read primitives). The amend subcommand adds
 `fuzz_bitmap_parse` (the qcow2 bitmap directory/table/extension
 parsers) plus `fuzz_bitmap_planners` (the bitmap crate's
 directory/action/merge functions over synthesised
-directory+refblocks). the bench subcommand adds
+directory+refblocks). The bench subcommand adds
 `fuzz_bench_schedule` (the pure `crates/bench` schedule math: param
 validation, offset advance, transfer splitting, and flush cadence,
 over a deliberately unclamped fuzzed header). Finally, the
