@@ -9,8 +9,8 @@ Image format conversions are performed within a KVM execution context,
 providing strong isolation from the host system.
 
 Confused about how instar does these things? Perhaps read the
-[technology primer](docs/technology-primer.md). If you want a guided tour of
-the source code, the [Lions-style commentary](docs/commentary/index.md)
+[technology primer](https://github.com/shakenfist/instar/blob/develop/docs/technology-primer.md). If you want a guided tour of
+the source code, the [Lions-style commentary](https://github.com/shakenfist/instar/blob/develop/docs/commentary/index.md)
 provides a reading order and annotated walkthrough of the codebase.
 
 ## Supported Formats
@@ -31,12 +31,12 @@ instar implementation in `src/`. Operations include `info`, `copy`, `check`,
 `map`, `snapshot`, `amend`, `bitmap`, and `bench`. Prototypes remain available
 for reference.
 
-See [docs/measure.md](docs/measure.md), [docs/create.md](docs/create.md),
-[docs/resize.md](docs/resize.md), [docs/rebase.md](docs/rebase.md),
-[docs/commit.md](docs/commit.md), [docs/map.md](docs/map.md),
-[docs/snapshot.md](docs/snapshot.md), [docs/amend.md](docs/amend.md),
-[docs/bitmap.md](docs/bitmap.md), and
-[docs/bench.md](docs/bench.md) for the per-subcommand user guides.
+See [docs/measure.md](https://github.com/shakenfist/instar/blob/develop/docs/measure.md), [docs/create.md](https://github.com/shakenfist/instar/blob/develop/docs/create.md),
+[docs/resize.md](https://github.com/shakenfist/instar/blob/develop/docs/resize.md), [docs/rebase.md](https://github.com/shakenfist/instar/blob/develop/docs/rebase.md),
+[docs/commit.md](https://github.com/shakenfist/instar/blob/develop/docs/commit.md), [docs/map.md](https://github.com/shakenfist/instar/blob/develop/docs/map.md),
+[docs/snapshot.md](https://github.com/shakenfist/instar/blob/develop/docs/snapshot.md), [docs/amend.md](https://github.com/shakenfist/instar/blob/develop/docs/amend.md),
+[docs/bitmap.md](https://github.com/shakenfist/instar/blob/develop/docs/bitmap.md), and
+[docs/bench.md](https://github.com/shakenfist/instar/blob/develop/docs/bench.md) for the per-subcommand user guides.
 
 ## Installation
 
@@ -201,7 +201,7 @@ snapshotted images are repaired by neither tier, and the lossy `all` tier
 declines its rebuild on compressed, external-data, or already-corrupt images
 (the safe leak reclamation still runs, and the result is reported incomplete).
 See
-[docs/qcow2/qcow2-refcount.md](docs/qcow2/qcow2-refcount.md#repairing-refcount-inconsistencies).
+[docs/qcow2/qcow2-refcount.md](https://github.com/shakenfist/instar/blob/develop/docs/qcow2/qcow2-refcount.md#repairing-refcount-inconsistencies).
 
 For VMDK images (monolithicSparse, streamOptimized, and
 monolithicFlat — including multi-extent twoGbMaxExtentFlat
@@ -366,7 +366,7 @@ clamps the copy down (the output is at most `count*bs` bytes); `skip` removes
 `skip*bs` bytes from the front of the input window. `-O` sets the output
 format and defaults to **raw** (not the input format). Supported output
 formats: raw, qcow2, vmdk, vpc (VHD), vhdx. Output is byte- and size-identical
-to `qemu-img dd` for all five formats. See [docs/dd.md](docs/dd.md) for the
+to `qemu-img dd` for all five formats. See [docs/dd.md](https://github.com/shakenfist/instar/blob/develop/docs/dd.md) for the
 full reference.
 
 ### Image Rebase
@@ -386,7 +386,7 @@ Changes the backing-file reference recorded in a qcow2 or vmdk overlay.
 Unsafe mode (`-u`) rewrites only the header pointer; safe mode (default)
 also walks the old and new chains and copies any divergent clusters into
 the overlay so reads stay coherent. Detach is encoded as `-b ""`. See
-[docs/rebase.md](docs/rebase.md) for the full reference.
+[docs/rebase.md](https://github.com/shakenfist/instar/blob/develop/docs/rebase.md) for the full reference.
 
 ### Image Commit
 
@@ -405,7 +405,7 @@ Merges every allocated cluster from a qcow2 or vmdk overlay into its
 backing image, then zeroes the overlay's metadata so the overlay reads
 as empty against the (now-updated) backing. v1 supports only the
 overlay's immediate parent; intermediate-image commit is deferred. See
-[docs/commit.md](docs/commit.md) for the full reference.
+[docs/commit.md](https://github.com/shakenfist/instar/blob/develop/docs/commit.md) for the full reference.
 
 ### Allocation Map
 
@@ -422,7 +422,7 @@ extents covering `[0, virtual_size)`, mirroring `qemu-img map`. Each
 extent is classified as data, zero-allocated, or hole. Window flags
 `--start-offset` / `--max-length` clip the emission range. Single-
 image v1; backing-chain `depth` composition is deferred. See
-[docs/map.md](docs/map.md) for the full reference.
+[docs/map.md](https://github.com/shakenfist/instar/blob/develop/docs/map.md) for the full reference.
 
 ### Internal Snapshots
 
@@ -444,7 +444,7 @@ like qemu-img). All parsing and every mutation — refcounts, L1
 copies, COPIED flags, header writes — runs inside the KVM guest.
 Mutating modes produce images bit-for-bit identical to `qemu-img
 snapshot` given identical inputs (modulo documented freed-cluster
-and file-tail notes). See [docs/snapshot.md](docs/snapshot.md)
+and file-tail notes). See [docs/snapshot.md](https://github.com/shakenfist/instar/blob/develop/docs/snapshot.md)
 for the full reference, including the `-d` (name-only) vs `-a`
 (ID-then-name) matcher asymmetry and the v1 limits.
 
@@ -464,7 +464,7 @@ instar amend -o lazy_refcounts=on disk.qcow2
 Changes a qcow2 image's compatibility version (`compat=0.10`/`1.1`) and/or
 the `lazy_refcounts` flag in place, rewriting only the header cluster — the
 sandboxed equivalent of `qemu-img amend`. qcow2-only. See
-[docs/amend.md](docs/amend.md) for the full reference.
+[docs/amend.md](https://github.com/shakenfist/instar/blob/develop/docs/amend.md) for the full reference.
 
 ### QCOW2 Dirty Bitmaps
 
@@ -485,7 +485,7 @@ instar bitmap --merge incremental0 disk.qcow2 full0
 Creates, deletes, clears, enables, disables, and merges qcow2 **persistent
 dirty bitmaps** in place — the sandboxed equivalent of `qemu-img bitmap`.
 Actions are applied in command-line order and the tool is silent on success.
-qcow2 v3-only. See [docs/bitmap.md](docs/bitmap.md) for the full reference.
+qcow2 v3-only. See [docs/bitmap.md](https://github.com/shakenfist/instar/blob/develop/docs/bitmap.md) for the full reference.
 
 ### I/O Benchmarking (bench)
 
@@ -499,7 +499,7 @@ instar bench -w -c 65536 -d 16 --pattern 65 -s 4096 -f qcow2 disk.qcow2
 
 Issues a scripted sequence of read or write requests against a disk image
 and reports how long they took — the sandboxed equivalent of `qemu-img
-bench`. **Read [docs/bench.md](docs/bench.md) before trusting a number**:
+bench`. **Read [docs/bench.md](https://github.com/shakenfist/instar/blob/develop/docs/bench.md) before trusting a number**:
 `instar bench` times its own end-to-end sandboxed I/O path, not qemu's
 block layer over the page cache, so the two tools' absolute numbers are
 not directly comparable to each other.
@@ -523,7 +523,7 @@ instar info --qemu-version 7.2 image.qcow2
 instar info --qemu-version 10.0 image.qcow2
 ```
 
-See [docs/output-formats.md](docs/output-formats.md) for detailed documentation on
+See [docs/output-formats.md](https://github.com/shakenfist/instar/blob/develop/docs/output-formats.md) for detailed documentation on
 output format profiles.
 
 ## Prototypes
@@ -532,19 +532,19 @@ Working prototypes exploring the KVM-based sandboxing approach:
 
 | Prototype | Description |
 |-----------|-------------|
-| [helloworld](prototypes/helloworld/) | Minimal bare-metal KVM guest proof-of-concept |
-| [helloworld2](prototypes/helloworld2/) | Uses vm-memory crate for safer memory management |
-| [virtio-block](prototypes/virtio-block/) | Virtio-block device emulation with file copy |
-| [virtio-block2](prototypes/virtio-block2/) | Adds guest-protocol (protobuf) integration |
-| [virtio-block3](prototypes/virtio-block3/) | Adds configurable sector sizes |
-| [virtio-block4](prototypes/virtio-block4/) | Adds performance statistics tracking |
-| [virtio-block5](prototypes/virtio-block5/) | Adds ioeventfd optimization |
-| [virtio-block6](prototypes/virtio-block6/) | Sparse/dynamic output, recommended sector sizes, progress reporting |
-| [pluggable](prototypes/pluggable/) | Modular architecture separating core infrastructure from pluggable operations |
-| [pluggable2](prototypes/pluggable2/) | Separate binary loading for operations (reduced attack surface) |
-| [info](prototypes/info/) | Image format detection (qemu-img info equivalent) |
+| [helloworld](https://github.com/shakenfist/instar/tree/develop/prototypes/helloworld/) | Minimal bare-metal KVM guest proof-of-concept |
+| [helloworld2](https://github.com/shakenfist/instar/tree/develop/prototypes/helloworld2/) | Uses vm-memory crate for safer memory management |
+| [virtio-block](https://github.com/shakenfist/instar/tree/develop/prototypes/virtio-block/) | Virtio-block device emulation with file copy |
+| [virtio-block2](https://github.com/shakenfist/instar/tree/develop/prototypes/virtio-block2/) | Adds guest-protocol (protobuf) integration |
+| [virtio-block3](https://github.com/shakenfist/instar/tree/develop/prototypes/virtio-block3/) | Adds configurable sector sizes |
+| [virtio-block4](https://github.com/shakenfist/instar/tree/develop/prototypes/virtio-block4/) | Adds performance statistics tracking |
+| [virtio-block5](https://github.com/shakenfist/instar/tree/develop/prototypes/virtio-block5/) | Adds ioeventfd optimization |
+| [virtio-block6](https://github.com/shakenfist/instar/tree/develop/prototypes/virtio-block6/) | Sparse/dynamic output, recommended sector sizes, progress reporting |
+| [pluggable](https://github.com/shakenfist/instar/tree/develop/prototypes/pluggable/) | Modular architecture separating core infrastructure from pluggable operations |
+| [pluggable2](https://github.com/shakenfist/instar/tree/develop/prototypes/pluggable2/) | Separate binary loading for operations (reduced attack surface) |
+| [info](https://github.com/shakenfist/instar/tree/develop/prototypes/info/) | Image format detection (qemu-img info equivalent) |
 
-See [docs/index.md](docs/index.md) for full prototype documentation.
+See [docs/index.md](https://github.com/shakenfist/instar/blob/develop/docs/index.md) for full prototype documentation.
 
 ## Development
 
@@ -800,7 +800,7 @@ instar info --unsafe-quirks /etc/passwd
 # file format: raw
 ```
 
-See [docs/quirks.md](docs/quirks.md) for the classification of safe vs unsafe quirks.
+See [docs/quirks.md](https://github.com/shakenfist/instar/blob/develop/docs/quirks.md) for the classification of safe vs unsafe quirks.
 
 ### Security Audits
 
@@ -816,7 +816,7 @@ VMM boundary auditing. Completed audit phases:
 - **VMM boundary audit:** Full review of host-side code (virtio-block I/O,
   serial protocol, MMIO dispatch, KVM exit handling). 8 bugs found and fixed.
 
-Audit results are published in [docs/security-audits.md](docs/security-audits.md).
+Audit results are published in [docs/security-audits.md](https://github.com/shakenfist/instar/blob/develop/docs/security-audits.md).
 The audit methodology is documented in `PLAN-audit.md`.
 
 ## Test Data
@@ -835,7 +835,7 @@ See `testdata/README.md` for full documentation.
 
 ## Releases
 
-See [CHANGELOG.md](CHANGELOG.md) for release notes.
+See [CHANGELOG.md](https://github.com/shakenfist/instar/blob/develop/CHANGELOG.md) for release notes.
 
 Release artifacts (pre-compiled Linux binaries) are published to
 [GitHub Releases](https://github.com/shakenfist/instar/releases)
