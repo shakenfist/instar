@@ -13,3 +13,6 @@ heapless = "0.9"
 panic = "abort"
 opt-level = "z"
 lto = true
+
+[lints.clippy]
+unwrap_used = "warn"

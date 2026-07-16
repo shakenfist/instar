@@ -14,3 +14,6 @@ shared = { path = "../shared" }
 panic = "abort"
 opt-level = "z"
 lto = true
+
+[lints]
+workspace = true

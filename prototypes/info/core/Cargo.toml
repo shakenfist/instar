@@ -13,3 +13,6 @@ shared = { path = "../shared" }
 panic = "abort"
 opt-level = "z"
 lto = true
+
+[lints.clippy]
+unwrap_used = "warn"

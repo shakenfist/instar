@@ -13,3 +13,6 @@ virtio-queue = "0.18"
 virtio-bindings = "0.2"
 clap = { version = "4.5", features = ["derive"] }
 # guest-protocol not used yet - will add when implementing structured parsing
+
+[lints.clippy]
+unwrap_used = "warn"

@@ -7,3 +7,6 @@ edition = "2021"
 kvm-ioctls = "0.25"
 kvm-bindings = "0.14"
 vm-memory = { version = "0.18", features = ["backend-mmap"] }
+
+[lints.clippy]
+unwrap_used = "warn"

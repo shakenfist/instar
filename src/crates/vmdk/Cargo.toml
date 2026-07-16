@@ -20,3 +20,6 @@ miniz_oxide = { version = "0.9", default-features = false, optional = true }
 
 [lib]
 # No std, this is used by bare-metal code
+
+[lints]
+workspace = true

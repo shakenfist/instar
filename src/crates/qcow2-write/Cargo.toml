@@ -26,3 +26,6 @@ sim = []
 create = { path = "../create" }
 qcow2 = { path = "../qcow2", features = ["create"], default-features = false }
 shared = { path = "../../shared" }
+
+[lints]
+workspace = true

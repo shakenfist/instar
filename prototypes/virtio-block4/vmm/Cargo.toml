@@ -14,3 +14,6 @@ virtio-bindings = "0.2"
 clap = { version = "4.5", features = ["derive"] }
 libc = "0.2"
 guest-protocol = { path = "../../../crates/guest-protocol", features = ["std"] }
+
+[lints.clippy]
+unwrap_used = "warn"

@@ -19,3 +19,6 @@ snapshot = { path = "../../crates/snapshot", default-features = false }
 panic = "abort"
 opt-level = "z"
 lto = true
+
+[lints]
+workspace = true

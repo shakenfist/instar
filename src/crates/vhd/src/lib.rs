@@ -560,7 +560,9 @@ impl VhdState {
             );
         }
 
-        let footer = footer.unwrap();
+        // Provably Some here (the None arm returned above); `?`
+        // keeps that invariant without a panic path.
+        let footer = footer?;
 
         if footer.disk_type == DISK_TYPE_FIXED {
             return Self::init_fixed(

@@ -92,3 +92,6 @@ assets = [
     { source = "../../README.md", dest = "/usr/share/doc/instar/README",    mode = "0644" },
     { source = "../../LICENSE",   dest = "/usr/share/doc/instar/copyright", mode = "0644" },
 ]
+
+[lints]
+workspace = true

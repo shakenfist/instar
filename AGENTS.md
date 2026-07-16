@@ -226,6 +226,13 @@ For Rust code specifically:
 - Run `rustfmt` for formatting (pre-commit hook enforces this)
 - Run `clippy` for linting (pre-commit hook enforces this)
 - Use `./scripts/check-rust.sh fix` to auto-fix formatting issues
+- Never call `.unwrap()` in production code — the workspace enables
+  clippy's `unwrap_used` lint (CI runs `-D warnings`, so a new unwrap
+  fails lint). Use `?`/proper error propagation, or
+  `.expect("why this cannot fail")` for provably-infallible cases
+  (`.expect("lock poisoned")` for mutexes). Test code is exempt via
+  `clippy.toml`'s `allow-unwrap-in-tests`; archived prototypes declare
+  the lint but CI does not gate on it there.
 
 ### Pre-commit Hooks
 

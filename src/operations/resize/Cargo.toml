@@ -23,3 +23,6 @@ raw = { path = "../../crates/raw" }
 panic = "abort"
 opt-level = "z"
 lto = true
+
+[lints]
+workspace = true

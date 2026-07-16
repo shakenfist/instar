@@ -16,3 +16,6 @@ shared = { path = "../../shared" }
 
 [lib]
 # No std, this is used by bare-metal code
+
+[lints]
+workspace = true
