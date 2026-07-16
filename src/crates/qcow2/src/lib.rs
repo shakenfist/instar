@@ -399,6 +399,28 @@ impl QcowHeader {
                 (16, 0, 0, 0)
             };
 
+        // Reject images whose virtual size cannot be addressed by a
+        // legal L1 table. qemu's qcow2 open computes
+        // `size_to_l1(virtual_size)` — the number of L1 entries needed
+        // to map the whole image — and refuses to open when it exceeds
+        // the addressable maximum ("Image is too large"). Each L1 entry
+        // maps one L2 table, which covers `cluster_size * entries_per_l2`
+        // bytes (8-byte L2 entries, or 16-byte with the extended-L2
+        // feature). A virtual size demanding more than
+        // QCOW2_MAX_L1_SIZE_ENTRIES L1 entries is unrepresentable: no
+        // valid `l1_size` could reference it, and downstream consumers
+        // re-expanding `cluster_count * cluster_size` would overflow u64
+        // (issue #438 — a rebase overlay with virtual_size ≈ u64::MAX).
+        let l2_entry_size = if incompatible_features & INCOMPAT_EXTENDED_L2 != 0 {
+            16u64
+        } else {
+            8u64
+        };
+        let l2_coverage = cluster_size * (cluster_size / l2_entry_size);
+        if virtual_size.div_ceil(l2_coverage) > QCOW2_MAX_L1_SIZE_ENTRIES as u64 {
+            return None;
+        }
+
         Some(QcowHeader {
             version,
             cluster_bits,
@@ -3206,6 +3228,38 @@ mod tests {
         let bad_l1 = QCOW2_MAX_L1_SIZE_ENTRIES + 1;
         buf[L1_SIZE_OFFSET..L1_SIZE_OFFSET + 4].copy_from_slice(&bad_l1.to_be_bytes());
         assert!(QcowHeader::parse(&buf).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_unaddressable_virtual_size() {
+        // A near-u64::MAX virtual size cannot be mapped by any legal L1
+        // table (qemu refuses such an image as "too large"). Regression
+        // for issue #438: a safe-mode rebase overlay with this header
+        // drove `cluster_count * cluster_size` past u64::MAX. Uses the
+        // exact geometry from the fuzz reproducer (1 KiB clusters).
+        let mut buf = make_qcow2_header();
+        buf[CLUSTER_BITS_OFFSET..CLUSTER_BITS_OFFSET + 4].copy_from_slice(&10u32.to_be_bytes());
+        buf[SIZE_OFFSET..SIZE_OFFSET + 8].copy_from_slice(&0xffff_ffff_ffff_ff35u64.to_be_bytes());
+        assert!(QcowHeader::parse(&buf).is_none());
+    }
+
+    #[test]
+    fn parse_accepts_max_addressable_virtual_size() {
+        // Boundary: the largest virtual size whose L1 requirement is
+        // exactly QCOW2_MAX_L1_SIZE_ENTRIES is accepted, and its cluster
+        // extent stays within u64.
+        let mut buf = make_qcow2_header();
+        let cluster_size = 1u64 << 16; // matches make_qcow2_header cluster_bits
+        let l2_coverage = cluster_size * (cluster_size / 8);
+        let vsize = QCOW2_MAX_L1_SIZE_ENTRIES as u64 * l2_coverage;
+        buf[SIZE_OFFSET..SIZE_OFFSET + 8].copy_from_slice(&vsize.to_be_bytes());
+        let hdr = QcowHeader::parse(&buf).unwrap();
+        assert_eq!(hdr.virtual_size, vsize);
+        assert!(hdr
+            .virtual_size
+            .div_ceil(hdr.cluster_size)
+            .checked_mul(hdr.cluster_size)
+            .is_some());
     }
 
     #[test]
