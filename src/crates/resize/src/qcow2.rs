@@ -142,9 +142,19 @@ pub(crate) fn compute_grow_query(
 
     let cluster_bits = cluster_bits_from(q.cluster_size)?;
     let cluster_size = q.cluster_size as u64;
-    if !q.current_file_size.is_multiple_of(cluster_size) {
-        return Err(ResizeError::HeaderMismatch);
-    }
+    // qemu-img truncates a fresh image at the exact end of its L1
+    // table, so a valid qcow2's file size need not be cluster-
+    // aligned (issue #373). Appended regions start at the next
+    // cluster boundary — where qemu's own allocator would place
+    // them — so enumerate blocks from the aligned-up size, matching
+    // the planner's placement.
+    let q = &Qcow2ResizeGrowQuery {
+        current_file_size: q
+            .current_file_size
+            .checked_next_multiple_of(cluster_size)
+            .ok_or(ResizeError::HeaderMismatch)?,
+        ..*q
+    };
 
     // No-change: empty plan, no blocks to stage.
     if q.new_virtual_size == q.current_virtual_size {
@@ -419,15 +429,20 @@ pub(crate) fn plan_grow<'a>(
     }
 
     let cluster_bits = cluster_bits_from(opts.cluster_size)?;
-    if !opts
-        .current_file_size
-        .is_multiple_of(opts.cluster_size as u64)
-    {
-        // The file should be cluster-aligned for any qcow2 we'd
-        // be willing to resize. Misalignment indicates either
-        // host bug or pathological image.
-        return Err(ResizeError::HeaderMismatch);
-    }
+    // qemu-img truncates a fresh image at the exact end of its L1
+    // table, so a valid qcow2's file size need not be cluster-
+    // aligned (issue #373). Appended regions start at the next
+    // cluster boundary — where qemu's own allocator would place
+    // them — so size and plan the appending flavours from the
+    // aligned-up file size. HeaderOnly keeps the true size: it
+    // appends nothing and must not extend the file.
+    let aligned_opts = &Qcow2ResizeOpts {
+        current_file_size: opts
+            .current_file_size
+            .checked_next_multiple_of(opts.cluster_size as u64)
+            .ok_or(ResizeError::HeaderMismatch)?,
+        ..*opts
+    };
 
     // Target layout is for sizing only (l1_entries needed,
     // refcount-table sizing). Offsets in the resize layout are
@@ -454,7 +469,7 @@ pub(crate) fn plan_grow<'a>(
             .div_ceil(opts.cluster_size as u64)
             .max(1);
         let (bc, tc, _) = compute_append_requirements(
-            opts.current_file_size,
+            aligned_opts.current_file_size,
             opts.cluster_size as u64,
             opts.refcount_bits,
             target_l1_clusters,
@@ -480,9 +495,9 @@ pub(crate) fn plan_grow<'a>(
 
     match action {
         Qcow2GrowAction::HeaderOnly => plan_header_only(opts, scratch),
-        Qcow2GrowAction::L1Grow => plan_l1_grow(opts, &target_layout, scratch),
+        Qcow2GrowAction::L1Grow => plan_l1_grow(aligned_opts, &target_layout, scratch),
         Qcow2GrowAction::L1AndRefcountGrow => {
-            plan_l1_and_refcount_grow(opts, &target_layout, existing_block_count, scratch)
+            plan_l1_and_refcount_grow(aligned_opts, &target_layout, existing_block_count, scratch)
         }
     }
 }

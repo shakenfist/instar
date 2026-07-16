@@ -455,3 +455,111 @@ fn rejects_image_with_persistent_bitmaps() {
         ResizeError::BitmapsPresent
     );
 }
+
+// ---------------------------------------------------------------------------
+// Unaligned file sizes (issue #373)
+// ---------------------------------------------------------------------------
+
+/// Give an image qemu-img's on-disk size property: qemu truncates a
+/// fresh image at the exact end of its trailing L1 table, so the file
+/// size is usually NOT a multiple of `cluster_size` (e.g. 196616
+/// bytes for `qemu-img create -o cluster_size=65536 f.qcow2 1M`).
+/// instar-created fixtures order their regions differently (the L1 is
+/// not the trailing region), so rather than truncating real metadata
+/// this helper appends a short zero tail past the last full cluster —
+/// the same "EOF mid-cluster, no metadata beyond it" shape. The
+/// end-to-end qemu-created-image coverage lives in
+/// tests/test_resize.py (TestResizeQemuCreatedImages).
+fn with_unaligned_tail(mut bytes: Vec<u8>, cluster_size: u32) -> Vec<u8> {
+    assert_eq!(bytes.len() % cluster_size as usize, 0);
+    bytes.extend_from_slice(&[0u8; 8]);
+    bytes
+}
+
+#[test]
+fn grow_header_only_on_unaligned_file_keeps_file_size() {
+    // Issue #373: growing 1M -> 64M at the default 64K cluster is
+    // HeaderOnly (the single L1 entry covers 512 MiB) and must
+    // succeed on a cluster-unaligned file — the pre-fix planner
+    // refused every unaligned file with HeaderMismatch — without
+    // extending it: nothing is appended.
+    let (bytes, header) = build_starting_image(1 << 20, 65536);
+    let bytes = with_unaligned_tail(bytes, 65536);
+    let mut file = bytes.clone();
+    let opts = opts_from_image(&bytes, &header, 64 << 20, Preallocation::Off, false);
+    let mut scratch = vec![0u8; QCOW2_MAX_RESIZE_SCRATCH];
+    let plan = plan_resize_qcow2(&opts, &mut scratch).expect("unaligned HeaderOnly grow");
+    assert_eq!(plan.action, ResizeAction::Grow);
+    assert_eq!(
+        plan.total_file_size,
+        bytes.len() as u64,
+        "HeaderOnly must not extend the file"
+    );
+    apply_resize(&mut file, &plan);
+    let parsed = QcowHeader::parse(&file).expect("re-parse");
+    assert_eq!(parsed.virtual_size, 64 << 20);
+}
+
+#[test]
+fn grow_l1_on_unaligned_file_appends_at_cluster_boundary() {
+    // Issue #373's failing cs=512 leg (1M -> 64M): the L1 append on
+    // an unaligned file must land on the next cluster boundary — not
+    // at the unaligned EOF, and not refuse with HeaderMismatch.
+    let (bytes, header) = build_starting_image(1 << 20, 512);
+    let bytes = with_unaligned_tail(bytes, 512);
+    let unaligned_len = bytes.len() as u64;
+    let mut file = bytes.clone();
+    let opts = opts_from_image(&bytes, &header, 64 << 20, Preallocation::Off, false);
+    let mut scratch = vec![0u8; QCOW2_MAX_RESIZE_SCRATCH];
+    let plan = plan_resize_qcow2(&opts, &mut scratch).expect("unaligned L1 grow");
+    assert_eq!(plan.action, ResizeAction::Grow);
+    assert_eq!(
+        plan.total_file_size % 512,
+        0,
+        "post-grow file must be cluster-aligned"
+    );
+    apply_resize(&mut file, &plan);
+    let parsed = QcowHeader::parse(&file).expect("re-parse");
+    assert_eq!(parsed.virtual_size, 64 << 20);
+    assert_eq!(
+        parsed.l1_table_offset % 512,
+        0,
+        "appended L1 must start on a cluster boundary"
+    );
+    assert!(
+        parsed.l1_table_offset >= unaligned_len,
+        "appended L1 must not overlap the pre-resize file"
+    );
+}
+
+#[test]
+fn grow_matrix_on_unaligned_files_matches_issue_373() {
+    // The issue's grow matrix, on unaligned-EOF fixtures: every leg
+    // must plan successfully and re-parse with the target virtual
+    // size and cluster-aligned metadata offsets.
+    let cases: [(u64, u64, u32); 9] = [
+        (4 << 20, 8 << 20, 512),
+        (1 << 20, 64 << 20, 512),
+        (4 << 20, 8 << 20, 4096),
+        (1 << 20, 64 << 20, 4096),
+        (64 << 20, 256 << 20, 4096),
+        (4 << 20, 8 << 20, 65536),
+        (1 << 20, 64 << 20, 65536),
+        (64 << 20, 256 << 20, 65536),
+        (4 << 20, 8 << 20, 1048576),
+    ];
+    for &(start, target, cs) in &cases {
+        let (bytes, header) = build_starting_image(start, cs);
+        let bytes = with_unaligned_tail(bytes, cs);
+        let mut file = bytes.clone();
+        let opts = opts_from_image(&bytes, &header, target, Preallocation::Off, false);
+        let mut scratch = vec![0u8; QCOW2_MAX_RESIZE_SCRATCH];
+        let plan = plan_resize_qcow2(&opts, &mut scratch)
+            .unwrap_or_else(|e| panic!("{}->{} cs={}: {:?}", start, target, cs, e));
+        apply_resize(&mut file, &plan);
+        let parsed = QcowHeader::parse(&file).expect("re-parse");
+        assert_eq!(parsed.virtual_size, target, "cs={}", cs);
+        assert_eq!(parsed.l1_table_offset % cs as u64, 0, "cs={}", cs);
+        assert_eq!(parsed.refcount_table_offset % cs as u64, 0, "cs={}", cs);
+    }
+}

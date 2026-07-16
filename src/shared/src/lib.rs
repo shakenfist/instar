@@ -3364,11 +3364,10 @@ impl ResizeResult {
     /// The image's staged metadata is internally inconsistent or
     /// disagrees with the host's pre-probe. Returned for: a
     /// host/guest `current_virtual_size` mismatch (race or host
-    /// bug); a qcow2 file size that isn't a multiple of
-    /// `cluster_size`; a qcow2 refcount-table entry the planner
-    /// needs to update being zero; or vhd / vhdx / vmdk header
-    /// fields that disagree with what the host pre-probed. See
-    /// the `HeaderMismatch` variant in `crates/resize` for the
+    /// bug); a qcow2 refcount-table entry the planner needs to
+    /// update being zero; or vhd / vhdx / vmdk header fields
+    /// that disagree with what the host pre-probed. See the
+    /// `HeaderMismatch` variant in `crates/resize` for the
     /// authoritative breakdown.
     pub const ERROR_HEADER_MISMATCH: u32 = 13;
     /// The image carries persistent dirty bitmaps (qcow2 bitmaps
