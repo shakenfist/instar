@@ -236,10 +236,12 @@ chain maps them to `Unknown` and the read path treats them as
 raw. The fix (step 3b) refuses at the host after chain
 discovery: if the chain head's guest-reported format string
 is a format instar detects but has no read path for
-(parallels, bochs, cloop, dmg, qed, vdi, iso — i.e. anything
+(parallels, bochs, cloop, dmg, qed, vdi — i.e. anything
 mapping to `chain::ImageFormat::Unknown` whose info-format
-string is not `raw`/`unknown`), convert/compare/dd exit with
-a typed error naming the format, e.g.
+string is not `raw`/`unknown`/`iso`; iso is exempted per the
+post-1a management decision in the Findings section),
+convert/compare/dd exit with a typed error naming the
+format, e.g.
 `convert: input format 'bochs' is detected but not supported
 for reading (detection and info only)`. Files that are
 genuinely unidentifiable keep their current behaviour
@@ -319,6 +321,199 @@ deep parser fuzzing belongs to the read-path phases (2–5).
   qemu cannot write DMG); the four staged qemu-iotests images
   cover the other formats for this phase.
 
+## Findings: step 1a — consumer behaviour pin (2026-07-17)
+
+**Verdict: the silent-raw hypothesis is CONFIRMED** for
+convert, compare, and dd on all three detect-only inputs
+(qed, vdi, iso). Each is read byte-for-byte as raw with no
+refusal. map and measure already refuse qed/vdi (typed
+errors) but silently read iso as raw. Method: `make instar`
+(clean tree, exit 0), then ran the built
+`src/target/release/instar` against the sibling testdata
+fixtures `qed-simple.qed` (327680 B, `QED\0` magic),
+`vdi-simple.vdi` (1024 B), and `iso-simple.iso` (376832 B),
+each op in secure mode. Note: only `info` accepts
+`--unsafe-quirks`; convert/compare/dd/map/measure reject the
+flag at the CLI (`error: unexpected argument
+'--unsafe-quirks'`), so they have no unsafe path to test —
+they always run secure. Raw scratch outputs are under the
+step-1a scratch dir.
+
+### Behaviour matrix (op × fixture × mode → rc, outcome)
+
+| op | fixture | mode | rc | outcome |
+|----|---------|------|----|---------|
+| info | qed | secure | 0 | format=qed, vsize=10 MiB (10485760) |
+| info | qed | unsafe | 0 | format=qed, vsize=10 MiB (unchanged) |
+| info | vdi | secure | 0 | format=vdi, vsize=10 MiB (10485760) |
+| info | vdi | unsafe | 0 | format=vdi, vsize=10 MiB (unchanged) |
+| info | iso | secure | 0 | format=iso, vsize=393216 (padded) |
+| info | iso | unsafe | 0 | format=**raw**, vsize=376832 (quirk) |
+| convert | qed | secure | 0 | **SILENT RAW**: 10 MiB out = container bytes + zero pad |
+| convert | vdi | secure | 0 | **SILENT RAW**: 10 MiB out = 1024 B + zero pad |
+| convert | iso | secure | 0 | **SILENT RAW**: 393216 out = container + zero pad |
+| compare | qed | secure | 0 | **SILENT RAW**: "Images are identical." vs raw copy |
+| compare | vdi | secure | 0 | **SILENT RAW**: "Images are identical." |
+| compare | iso | secure | 0 | **SILENT RAW**: "Images are identical." |
+| dd | qed | secure | 0 | **SILENT RAW**: 10 MiB out = container + zero pad |
+| dd | vdi | secure | 0 | **SILENT RAW**: 10 MiB out = container + zero pad |
+| dd | iso | secure | 0 | **SILENT RAW**: 376832 out = exact container bytes |
+| map | qed | secure | 1 | REFUSED: "map: source format unrecognised" |
+| map | vdi | secure | 1 | REFUSED: "map: source format unrecognised" |
+| map | iso | secure | 0 | **SILENT RAW**: 0x60000 mapped to input as raw |
+| measure | qed | secure | 1 | REFUSED: "source image is unsupported format" |
+| measure | vdi | secure | 1 | REFUSED: "source image is unsupported format" |
+| measure | iso | secure | 0 | **SILENT RAW**: required size 393216 (raw sizing) |
+
+(`unsafe` rows omitted for convert/compare/dd/map/measure:
+the flag is CLI-rejected there.) The convert and dd outputs
+were verified with `cmp`: the first *container-length* bytes
+are byte-identical to the input container and the remainder
+is pure zero padding — i.e. the container is read as raw and
+padded to the header-declared virtual size. compare returns
+"identical" precisely because the fixture-read-as-raw equals
+its own byte copy read as raw. dd sizes iso to the exact file
+length (376832); convert sizes it to the sector-padded
+virtual size (393216) — both read as raw, only the output
+vsize source differs.
+
+### Code-path explanation
+
+There are two distinct detection/dispatch layers, and the
+hole lives in the chain layer:
+
+1. **Host chain ops (convert, compare, dd)** call
+   `discover_backing_chain` (`main.rs:2174`), which probes the
+   input via the guest **info** op — always in secure mode
+   (`execute_info_operation(&current, sector_size, false)`,
+   `main.rs:2241`, regardless of any top-level flag). info's
+   inline parsers report the format strings `"qed"`, `"vdi"`,
+   and (secure) `"iso"`. The host then maps that string with
+   `chain::ImageFormat::from_str` (`chain.rs:50`), whose
+   catch-all `_ => ImageFormat::Unknown` arm swallows all
+   three (the host `chain::ImageFormat` enum has no Qed/Vdi/
+   Iso variants). The chain entry is built with
+   `format: ImageFormat::from_str(&info_result.format)`
+   (`main.rs:2284`). At read time the guest chain reader
+   `read_chain_virtual_cluster` (`qcow2/src/lib.rs:5832`)
+   dispatches on `detected_format()`; `Unknown` falls into the
+   default `_ =>` arm (`:6516`) which calls `read_raw_sectors`.
+   No arm between chain discovery and the read refuses an
+   `Unknown` head — confirmed by both the rc=0 behaviour and
+   the code. The virtual size honoured is the one info parsed
+   from the format header (qed/vdi = 10 MiB), proving the host
+   trusts the detected format's geometry while reading its
+   body as raw.
+
+2. **Guest single-image ops (map, measure)** do *not* use the
+   chain path; they call `detect_format_from_header` directly
+   (`map/src/main.rs:192`, `measure/src/main.rs:337`). That
+   shared detector *does* recognise the qed/vdi header magics
+   (`format_detection.rs:85` → `ImageFormat::Qed`, `:115` →
+   `ImageFormat::Vdi`), so qed/vdi land on a format with no
+   read arm and are refused (map `ERROR_INVALID_SOURCE`;
+   measure "unsupported format"). It does **not** recognise
+   iso — the `CD001` magic is at byte 32769, outside the
+   header prefix, and only info runs the offset-32769 probe —
+   so iso detects as Raw and is read as raw. Hence the
+   iso-only leak in map/measure.
+
+Net: the host **never** refuses an `Unknown`-format chain
+head; the guest single-image ops refuse header-magic formats
+(qed/vdi) but not trailer/offset formats (iso).
+
+### Tests at risk if convert/compare/dd start refusing
+
+**None.** No existing test converts, compares, or dd's *from*
+qed/vdi/iso, and none asserts success for these inputs:
+
+* The only tests referencing these ids are
+  `tests/manifest.json` (registration) and
+  `tests/test_oslo_crossval.py` (info-detection cross-val:
+  the `iso-simple` divergence uses `info --unsafe-quirks` →
+  `raw`; qed's oslo rejection is asserted). Neither touches
+  convert/compare/dd.
+* `test_convert.py` converts only hand-picked qcow2 ids
+  (`cirros-qcow2`, `qcow2-v2`, …); its qed/vdi mentions are a
+  convert-*to*-vdi negative and a streamOptimized comment.
+  `test_dd.py` / `test_compare.py` use fixed raw/qcow2 inputs,
+  not the manifest.
+* The manifest-driven `test_map.py` and `test_measure.py`
+  factories iterate every `safety: "safe"` image (qed/vdi/iso
+  qualify) but skip these: all three carry
+  `skip_qemu_img: true` (so no baseline `meta.json` exists →
+  "no baseline meta" skip) and both factories additionally
+  skip on instar `rc != 0`. So the current map/measure
+  refusals (and the iso raw read) are silently skipped, not
+  asserted.
+
+Consequence: closing the hole in 3b is low-risk — it will not
+break any test. 3b should *add* positive refusal tests.
+
+### Recommendation for step 3b
+
+* **Refuse once, centrally, in `discover_backing_chain`**, not
+  per-op. All three consumers (convert/compare/dd) already
+  funnel through it, and mid-chain backing files pass through
+  the same loop, so a single gate covers the top image *and*
+  every backing position uniformly. A per-op check would have
+  to be written three times and would miss mid-chain heads.
+* **Gate on the info-reported format string, before the
+  `from_str` → `Unknown` collapse.** In the loop body
+  (around `main.rs:2284`), when the guest-reported
+  `info_result.format` is neither `"raw"` nor `"unknown"` yet
+  `chain::ImageFormat::from_str` maps it to `Unknown`, refuse
+  with a typed error naming the detected format, e.g.
+  `"{op}: input format '{fmt}' is detected but not supported
+  for reading (detection and info only)"`, non-zero exit.
+  Keying on the string (not the collapsed enum) keeps the
+  refusal precise and future-proof: any newly detected-only
+  format (parallels/bochs/cloop/dmg) that info learns to name
+  flows into the same gate automatically.
+* **Mid-chain backing files** get the identical refusal — a
+  qcow2 whose backing file is a qed/vdi/iso must fail, since
+  the chain cannot be read correctly. Discovering the head as
+  qcow2 and then hitting an unreadable backing layer is
+  exactly the case the central gate handles for free.
+* **Preserve genuinely-unidentifiable inputs.** Files that
+  info reports as `raw`/`unknown` keep today's behaviour
+  (secure-mode partition gate / raw acceptance); only
+  detected-but-unreadable formats are newly refused.
+* **iso caveat.** Because chain discovery runs info in secure
+  mode, iso is always seen as `"iso"` here and will be refused
+  by the central gate — even though a top-level
+  `--unsafe-quirks` would make *info* alone report it as raw.
+  That is the correct, safe outcome (convert/compare/dd have
+  no unsafe path anyway), but call it out in quirks.md so the
+  info-vs-consumer asymmetry is documented.
+* **map/measure need no host change** (they never reach the
+  chain layer); step 5a should still add a refusal test for
+  iso on map/measure, since iso currently leaks through them
+  as raw — closing that is the in-place-op default-arm work
+  already scoped for 2a/5a.
+
+### Management review decision (post-1a)
+
+The findings above are accepted with one amendment: **iso is
+exempted from the 3b refusal gate** and keeps its current
+read-as-raw behaviour everywhere (convert/compare/dd, map,
+measure). Rationale: unlike qed/vdi — where the raw
+interpretation emits container metadata plus zero padding
+instead of the virtual disk content — an ISO's container
+bytes *are* its virtual disk content, so the raw read is
+semantically correct; and qemu-img, which has no iso driver,
+converts ISOs as raw routinely, so refusing them would be a
+parity regression on a common workflow, not a safety fix.
+The refusal criterion is therefore: info-reported format
+strings that map to `chain::ImageFormat::Unknown` and are
+not `raw`, `unknown`, or `iso` — i.e. formats whose raw
+interpretation misrepresents content (qed, vdi, and the
+newly detected parallels/bochs/cloop/dmg). The 5a iso
+refusal test for map/measure is dropped for the same reason;
+instead 5a asserts iso's raw pass-through explicitly and
+quirks.md documents the info-says-iso / consumers-read-raw
+asymmetry as the existing ISO quirk's flip side.
+
 ## Step-level guidance
 
 | Step | Effort | Model | Isolation | Brief for sub-agent |
@@ -326,7 +521,7 @@ deep parser fuzzing belongs to the read-path phases (2–5).
 | 1a | high | opus | none | **Empirical pin, no production code.** Determine what convert, compare, dd, map, and measure do today with detect-only-format inputs: run the built instar against `qed-simple` and `vdi-simple` (ids in `tests/manifest.json`, files in the sibling instar-testdata checkout) for each op, in secure mode and with `--unsafe-quirks`. Read `discover_backing_chain` (`src/vmm/src/main.rs:2174`), `chain::ImageFormat::from_str` (`src/vmm/src/chain.rs:50`), and the guest chain-reader default arm (`src/crates/qcow2/src/lib.rs`, dispatch near `:5855`, default arm near `:6516`) and reconcile observed behaviour with the code. Also grep tests/ for anything converting/comparing qed/vdi/iso inputs. Deliverable: a findings section appended to this plan file (behaviour matrix, code-path explanation, list of tests that would break if convert/compare/dd refused these inputs), plus a recommendation. No source changes. |
 | 2a | medium | sonnet | none | Shared detection layer. In `src/shared/src/lib.rs:1526` add `Parallels = 13, Bochs = 14, Cloop = 15, Dmg = 16` to `ImageFormat` (+ `from_u32` `:1562`, `name()` `:1581` returning "parallels"/"bochs"/"cloop"/"dmg"). In `src/shared/src/format_detection.rs`: add the magic constants and the three header checks per the Detection rules section above (exact offsets/guards there), inserted after the LUKS check; add a `no_std` DMG trailer helper beside `detect_vhd_footer` (`:156`) implementing the koly window scan ([len−1023, len−512]) and a SectorCount accessor (BE u64 at koly+0x1ec, reject top bit). Extend the in-module tests (`:192-225`): positive detection from real fixture header bytes (hexdumps in this plan's Situation section; fixtures under `instar-testdata/downloaded/qemu-iotests/`), wrong-version negatives (parallels version≠2, bochs version 0x30000), truncation negatives (parallels 63 bytes, bochs 511, cloop 86), koly-at-each-window-edge positives and a koly-outside-window negative. Extend `src/fuzz/fuzz_targets/fuzz_format_detect.rs` to call the new helper. Fix any exhaustive `match ImageFormat` arms the compiler surfaces across the 10 guest ops and host — new variants must land in the same arm as `Vdi`/`Qed` (detect-only), never in a read/write arm. `make instar`, `make lint`, `make test-rust`, `make fuzz-build` must pass. |
 | 3a | high | opus | none | Guest info op wiring in `src/operations/info/src/main.rs`. Add the DMG trailer probe after the VHD-footer fallback (`:154-164`): when the format is still Raw, read the input tail covering the final 1024 bytes (two sectors at 512-byte sector size; one suffices at ≥1024 — reuse the `footer_buffer` pattern, mind `input_capacity` and non-sector-aligned lengths) and call the shared helper. Add dispatch arms (pattern: VDI `:352`, QED `:409`) and inline parsers (pattern: `parse_vdi_header` `:897`, `parse_qed_header` `:974`) for all four formats per the Info parsing section above (exact fields, endianness, masking, and cloop bounds are specified there — do not re-derive). Add the four `format_to_str` entries (`:490`). The new formats bypass the raw partition-table gate (`:200-238`) automatically by being non-Raw — verify, don't reimplement. Ensure `--unsafe-quirks` leaves all four detections active (only ISO is quirk-gated). Unit-test the parsers with in-file `#[cfg(test)]` byte-array fixtures per existing style. `make instar && make check-binary-sizes && make test-rust` clean; then hand-verify `instar info` (human + json) against `qemu-img info` for the four staged fixtures. |
-| 3b | high | opus | worktree | Consumer refusal gate, contingent on 1a's findings (management session reviews 1a before dispatching this step). In the host: after `discover_backing_chain` returns for convert/compare/dd (`run_convert`, `run_compare`, `run_dd` `main.rs:13629`), refuse when the chain head's format string is detected-but-unreadable (maps to `chain::ImageFormat::Unknown` but is not `raw`/`unknown`): typed error `"{op}: input format '{fmt}' is detected but not supported for reading (detection and info only)"`, non-zero exit, matching the existing refusal message style (`main.rs:6648`, `:5967`, `:6217`). Decide with the 1a evidence whether the check belongs once in `discover_backing_chain` or per-op; backing files in mid-chain positions get the same refusal. Update any tests 1a identified as depending on silent-raw behaviour only after management sign-off. Add integration tests: convert/compare/dd on `qed-simple`, `vdi-simple`, and each new-format fixture must exit non-zero with the typed message. |
+| 3b | high | opus | worktree | Consumer refusal gate, contingent on 1a's findings (management session reviews 1a before dispatching this step). In the host: after `discover_backing_chain` returns for convert/compare/dd (`run_convert`, `run_compare`, `run_dd` `main.rs:13629`), refuse when the chain head's format string is detected-but-unreadable (maps to `chain::ImageFormat::Unknown` but is not `raw`/`unknown`/`iso` — iso keeps its raw pass-through per the post-1a management decision): typed error `"{op}: input format '{fmt}' is detected but not supported for reading (detection and info only)"`, non-zero exit, matching the existing refusal message style (`main.rs:6648`, `:5967`, `:6217`). Decide with the 1a evidence whether the check belongs once in `discover_backing_chain` or per-op; backing files in mid-chain positions get the same refusal. Update any tests 1a identified as depending on silent-raw behaviour only after management sign-off. Add integration tests: convert/compare/dd on `qed-simple`, `vdi-simple`, and each new-format fixture must exit non-zero with the typed message. |
 | 4a | high | opus | none | DMG fixture generator, in the **instar-testdata** repo (sibling checkout; scripts live there per its ADVERSARIAL.md convention — generators are not published in the instar repo). Python, following `generate-baselines.py` style (single quotes, 120-col). Emit: (1) `dmg-simple.dmg` — minimal valid UDIF: small data fork of zlib (UDZO) chunks or zero (UDZE) chunks, XML plist with base64 mish BLKX block (204-byte block header, 40-byte chunk entries, terminator chunk), koly trailer (BE fields; DataForkOffset/XMLOffset/XMLLength/SectorCount populated; XML strictly before the koly offset) — must satisfy `qemu-img info` on both qemu 6.0.0 and 10.2.0 static binaries from `qemu-img-binaries/x86_64/`; (2) adversarial variants: truncated koly, SectorCount with top bit set, huge SectorCount, valid koly but zero rsrc+XML lengths (qemu open fails, so these carry `skip_qemu_img: true` in the manifest). Deterministic output (fixed timestamps/UUIDs) so sha256s are stable. Do NOT commit to instar-testdata main — leave the working tree for operator review (protected branch; see repo conventions). |
 | 4b | medium | sonnet | none | Manifest + baselines. Add `tests/manifest.json` entries: `parallels-v1`, `parallels-v2` (`downloaded/qemu-iotests/parallels-v{1,2}`), `bochs-growing` (`downloaded/qemu-iotests/empty.bochs`), `cloop-simple` (`downloaded/qemu-iotests/simple-pattern.cloop`), `dmg-simple` plus 4a's adversarial set — real sha256s, `safety` safe/malformed as appropriate, `run_in_ci: true` for the safe ones, no `skip_qemu_img` on qemu-readable images, style-matched to existing entries. First spot-check driver presence: run the 6.0.0 and 10.2.0 static qemu-img binaries' `info` on each safe fixture. Then `generate-baselines.py --command info` (human and json paths per its `COMMANDS` config) followed by `detect-profiles.py`; verify new profiles are few (probes are version-stable). Leave instar-testdata changes uncommitted for operator review. In-repo manifest change commits normally. |
 | 5a | medium | sonnet | none | Integration tests. Confirm `tests/test_info_safe.py` auto-picks the new safe images (scenario generation is manifest-driven) and passes against the new baselines. Add refusal tests (may live with 3b's if that step landed first — do not duplicate): resize, measure, and map on each new-format fixture exit non-zero with their existing unsupported-format messages (`main.rs:6648`, `:11396`, map guest `ERROR_INVALID_SOURCE`). Add adversarial coverage for the malformed DMG fixtures via the `run_adversarial` harness (`tests/base.py:1066` — no hang, no crash, bounded memory; info on them may succeed or fail). Run the info-related suites and `test_oslo_crossval` locally; oslo scenarios for the new images must skip (oslo returns None), not fail. |

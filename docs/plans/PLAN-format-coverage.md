@@ -491,21 +491,25 @@ plan, or at least be aware of when planning. (A scan on
 open issues are fuzz crashes, consistency checks, and qcow2
 operation bugs.)
 
-* **Suspected pre-existing defect: detect-only formats are
-  silently read as raw by convert/compare/dd.** Found during
-  phase-1 planning (2026-07-17) by code reading: those ops
-  probe input via `discover_backing_chain` → guest info, and
+* **CONFIRMED pre-existing defect
+  ([#444](https://github.com/shakenfist/instar/issues/444)):
+  detect-only formats are silently read as raw by
+  convert/compare/dd.** Found during phase-1 planning
+  (2026-07-17) by code reading and confirmed the same day by
+  step 1a's empirical pin: those ops probe input via
+  `discover_backing_chain` → guest info, and
   `chain::ImageFormat::from_str` (`src/vmm/src/chain.rs:50`)
-  maps unrecognised format strings (today: `qed`, `vdi`,
-  `iso`) to `Unknown`, which the guest chain reader's default
-  arm reads as raw sectors — so e.g. `instar convert` of a
-  QED image appears to emit its container bytes as disk
-  content instead of refusing, contradicting the documented
-  "detects it and refuses" stance for QED. To be confirmed
-  empirically by phase-1 step 1a and closed by step 3b's
-  typed detected-but-unsupported refusal (which also covers
-  the newly detected formats); file a GitHub issue on
-  confirmation. See
+  maps unrecognised format strings to `Unknown`, which the
+  guest chain reader's default arm reads as raw sectors —
+  `instar convert` of a QED image emits its container bytes
+  zero-padded to the header-declared virtual size (byte-
+  verified), contradicting the documented "detects it and
+  refuses" stance for QED. ISO flows through the same path
+  but is exempted by management decision: its raw read is
+  semantically correct and matches qemu-img. To be closed by
+  step 3b's typed refusal (which also covers the newly
+  detected formats); no existing test depends on the
+  silent-raw behaviour. Findings in
   [PLAN-format-coverage-phase-01-detection.md](PLAN-format-coverage-phase-01-detection.md).
 
 ### Documentation index maintenance
