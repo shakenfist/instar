@@ -1500,6 +1500,26 @@
             "generated_by": "instar-testdata/scripts/create-snapshot-testdata.py"
         },
         {
+            "id": "parallels-v1",
+            "path": "downloaded/qemu-iotests/parallels-v1",
+            "format": "parallels",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "Parallels disk image with the old 'WithoutFreeSpace' magic (nb_sectors masked to low 32 bits) from QEMU iotests",
+            "tags": ["parallels", "format-coverage"],
+            "sha256": "81a884331adb1196cdc7f5c64c16071d04ec0b82946e6bd98874a875b51d0c1f"
+        },
+        {
+            "id": "parallels-v2",
+            "path": "downloaded/qemu-iotests/parallels-v2",
+            "format": "parallels",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "Parallels disk image with the new 'WithouFreSpacExt' magic (full-width nb_sectors) from QEMU iotests",
+            "tags": ["parallels", "format-coverage"],
+            "sha256": "8d963be70b8b41101494ddc9d49fc7ecf6ae05e90d7d5078e2a10fade407b92a"
+        },
+        {
             "id": "bochs-growing",
             "path": "downloaded/qemu-iotests/empty.bochs",
             "format": "bochs",
