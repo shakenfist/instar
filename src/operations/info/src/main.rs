@@ -526,6 +526,13 @@ fn format_to_str(format: ImageFormat) -> *const u8 {
         // info reporting (createType, extent filename) is handled
         // in Phase 22c.
         ImageFormat::VmdkDescriptor => b"vmdk\0".as_ptr(),
+        // Detection and info-name only (format-coverage phase 1,
+        // step 2a); dispatch/size parsing for these formats lands
+        // in step 3a. Names match qemu-img's format_name strings.
+        ImageFormat::Parallels => b"parallels\0".as_ptr(),
+        ImageFormat::Bochs => b"bochs\0".as_ptr(),
+        ImageFormat::Cloop => b"cloop\0".as_ptr(),
+        ImageFormat::Dmg => b"dmg\0".as_ptr(),
     }
 }
 

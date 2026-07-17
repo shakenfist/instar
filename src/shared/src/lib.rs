@@ -1555,6 +1555,20 @@ pub enum ImageFormat {
     /// content; content lives in a separate flat extent file
     /// pointed to from the descriptor's extent line.
     VmdkDescriptor = 12,
+    /// Parallels disk image (magic: "WithoutFreeSpace" or
+    /// "WithouFreSpacExt" at offset 0, version 2 at offset 16).
+    /// Detection and info only; no read path.
+    Parallels = 13,
+    /// Bochs growing disk image (magic: "Bochs Virtual HD Image" /
+    /// "Redolog" / "Growing" NUL-terminated fields, version at
+    /// offset 64). Detection and info only; no read path.
+    Bochs = 14,
+    /// cloop compressed loopback image (87-byte V2.0 shell-script
+    /// magic at offset 0). Detection and info only; no read path.
+    Cloop = 15,
+    /// Apple disk image (UDIF), identified by a "koly" trailer near
+    /// the end of the file. Detection and info only; no read path.
+    Dmg = 16,
 }
 
 impl ImageFormat {
@@ -1573,6 +1587,10 @@ impl ImageFormat {
             10 => ImageFormat::Iso,
             11 => ImageFormat::Luks,
             12 => ImageFormat::VmdkDescriptor,
+            13 => ImageFormat::Parallels,
+            14 => ImageFormat::Bochs,
+            15 => ImageFormat::Cloop,
+            16 => ImageFormat::Dmg,
             _ => ImageFormat::Unknown,
         }
     }
@@ -1596,6 +1614,10 @@ impl ImageFormat {
             // monolithicFlat — the user sees the container format,
             // not the descriptor/flat split.
             ImageFormat::VmdkDescriptor => "vmdk",
+            ImageFormat::Parallels => "parallels",
+            ImageFormat::Bochs => "bochs",
+            ImageFormat::Cloop => "cloop",
+            ImageFormat::Dmg => "dmg",
         }
     }
 }

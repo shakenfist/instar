@@ -469,6 +469,14 @@ fn image_format_name_bytes(fmt: ImageFormat) -> &'static [u8] {
         ImageFormat::Qed => b"qed",
         ImageFormat::Iso => b"iso",
         ImageFormat::Luks => b"luks",
+        // Detection/info-name only (format-coverage phase 1); create
+        // has no read or write path for these, so this arm only
+        // affects the informational backing-format-hint string, never
+        // whether a backing file is actually opened.
+        ImageFormat::Parallels => b"parallels",
+        ImageFormat::Bochs => b"bochs",
+        ImageFormat::Cloop => b"cloop",
+        ImageFormat::Dmg => b"dmg",
         ImageFormat::Unknown => b"",
     }
 }
