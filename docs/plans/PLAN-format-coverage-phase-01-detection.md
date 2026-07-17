@@ -564,6 +564,35 @@ asymmetry as the existing ISO quirk's flip side.
   PiB (matches qemu), no-chunk-table → dmg/4 MiB (the
   documented trailer-only divergence; qemu open-fails).
 
+## Findings: step 3c — host emitter parity (2026-07-17)
+
+* Human size formatter now replicates qemu's `size_to_str`
+  frexp unit selection (`%0.3g`, with the 1000/1024
+  promotion); audited against all 56 distinct size strings
+  in the pre-existing baselines — zero rendering changes.
+* The plan's "make child file-length rounding unconditional"
+  premise was **wrong**: luks-v1 (592 bytes) is an existing
+  unaligned image whose golden records the exact size.
+  Rounding is instead scoped to parallels/bochs/cloop/dmg
+  (joining raw/unknown/vmdk-flat); luks-v1 is the only other
+  unaligned image, verified preserved.
+* qemu's top-level JSON `dirty-flag` rule, derived
+  empirically across all 80 versions: present for every
+  format implementing `bdrv_get_info`, absent for the four
+  detect-only drivers — instar now suppresses it (and the
+  then-trailing comma) for those formats. The JSON
+  empty-collection "gap" was a mirage: the test harness
+  re-serializes expected JSON, so no change was needed (and
+  one would have regressed every image).
+* Result: all 42 new-image scenarios fixed, zero
+  regressions. Four residual failures are pre-existing and
+  unrelated: the hand-maintained luks-v1/luks-v2 goldens in
+  `profiles/profile-10-2-0` (inherited from a stale dir that
+  predated the version map) lack the child-node section
+  instar emits identically at 8.0.0/10.0.0 (where goldens
+  have it and pass). Fixing those goldens is testdata
+  maintenance, folded into step 5a.
+
 ## Step-level guidance
 
 | Step | Effort | Model | Isolation | Brief for sub-agent |

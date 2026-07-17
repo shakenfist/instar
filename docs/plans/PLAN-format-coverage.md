@@ -533,6 +533,20 @@ operation bugs.)
   change after the 6.x rebuild, covering the pre-existing
   drift, the three new format-coverage images, and
   parallels together.
+* **instar-testdata: `detect-profiles.py` corrupts
+  regenerated profiles.** Found by the phase-1 catch-up run
+  (2026-07-17): the preserve-manually-maintained-baselines
+  check compares mismatched id granularities (`f.stem` keeps
+  `.stdout` on one side, `rsplit('.', 1)` strips it on the
+  other), so it never matches, flags every image as
+  manually maintained, and stamps one arbitrary stale
+  old-profile snapshot into every new profile bucket —
+  41/44 pre-existing images got wrong content while `raw/`
+  stayed correct. Verified no real instar divergence hides
+  behind it (live instar output byte-matches `raw/` for
+  spot-checked images). Fix + rerun executed as part of
+  phase 1; the mechanism must only preserve images with no
+  `raw/` data (the hand-maintained `skip_qemu_img` set).
 
 ### Documentation index maintenance
 

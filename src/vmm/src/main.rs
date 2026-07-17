@@ -1056,8 +1056,41 @@ fn format_size_human(bytes: u64, qemu_compat: bool) -> String {
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
     const TIB: f64 = 1024.0 * 1024.0 * 1024.0 * 1024.0;
 
-    let bytes_f = bytes as f64;
+    if bytes == 0 {
+        // qemu-img's info output emits just "0" for zero bytes, no unit.
+        return "0".to_string();
+    }
 
+    if qemu_compat {
+        // Replicate qemu-img's size_to_str() (util/cutils.c) exactly:
+        //
+        //   frexp(val / (1000.0 / 1024.0), &i);
+        //   i = (i - 1) / 10 * 10;
+        //   div = 1ULL << i;
+        //   printf("%0.3g %sB", (double)val / div, iec_binary_prefix(i));
+        //
+        // The `1000/1024` correction promotes a value to the next unit once
+        // its integer part reaches 1000, so e.g. 1032192 bytes renders
+        // "0.984 MiB" rather than the naive threshold result "1008 KiB".
+        // Threshold-based unit selection only diverges from this inside the
+        // [1000, 1024) window below each power of 1024, so every existing
+        // baseline value (none of which fall in that window) is unaffected.
+        const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+        let val = bytes as f64;
+        let exp = frexp_exponent(val / (1000.0 / 1024.0));
+        // For bytes >= 1, val / (1000/1024) >= 1.024, so exp >= 1 and
+        // (exp - 1) is non-negative; the division truncates like C's.
+        let mut idx = ((exp - 1) / 10) as usize;
+        if idx >= UNITS.len() {
+            idx = UNITS.len() - 1;
+        }
+        let div = 1u64 << (idx * 10);
+        return format_size_value(val / div as f64, UNITS[idx], true);
+    }
+
+    // Non-qemu-compat (instar's own --ignore-quirks "accurate" mode): keep
+    // the simple threshold-based unit selection.
+    let bytes_f = bytes as f64;
     if bytes_f >= TIB {
         format_size_value(bytes_f / TIB, "TiB", qemu_compat)
     } else if bytes_f >= GIB {
@@ -1066,13 +1099,30 @@ fn format_size_human(bytes: u64, qemu_compat: bool) -> String {
         format_size_value(bytes_f / MIB, "MiB", qemu_compat)
     } else if bytes_f >= KIB {
         format_size_value(bytes_f / KIB, "KiB", qemu_compat)
-    } else if bytes == 0 {
-        // qemu-img outputs just "0" for zero bytes, no unit
-        "0".to_string()
     } else {
         // qemu-img uses "B" for byte unit, not "bytes"
         format!("{bytes} B")
     }
+}
+
+/// C `frexp` exponent: for a finite, non-zero `x`, returns the `e` such that
+/// `x == m * 2^e` with `0.5 <= |m| < 1` — exactly the exponent glibc's
+/// `frexp` writes out, which qemu's `size_to_str` relies on for unit
+/// selection. Zero and non-finite inputs return 0 (as `frexp` does for zero).
+fn frexp_exponent(x: f64) -> i32 {
+    if x == 0.0 || !x.is_finite() {
+        return 0;
+    }
+    let raw_exp = ((x.to_bits() >> 52) & 0x7ff) as i32;
+    if raw_exp == 0 {
+        // Subnormal: normalise by scaling up by 2^64, then correct. (Not
+        // reachable from format_size_human, which only passes x >= 1.024.)
+        return frexp_exponent(x * (2.0_f64).powi(64)) - 64;
+    }
+    // Normalised: value = 1.f * 2^(raw_exp - 1023) with 1 <= 1.f < 2, so
+    // value = (1.f / 2) * 2^(raw_exp - 1023 + 1); frexp's exponent is
+    // therefore raw_exp - 1022.
+    raw_exp - 1022
 }
 
 /// Round half to even (banker's rounding) - matches C printf behavior
@@ -1416,12 +1466,21 @@ fn print_info_result(
             } else {
                 std::cmp::max(file_size, info.actual_size)
             };
-            // For raw format, round up to 512-byte sector boundary. VMDK
-            // flat descriptors are likewise treated as unstructured files
-            // by qemu-img, so their protocol-node length is rounded up to
-            // a sector — the same computation the JSON path applies to
-            // descriptor_vsize.
-            let effective_child_file_length = if info.format == "raw" || vmdk_flat.is_some() {
+            // qemu-img reports the protocol-node length rounded up to a
+            // 512-byte sector for the container formats whose driver opens the
+            // underlying file at 512-sector granularity: raw, the VMDK flat
+            // descriptor's protocol node, and the read-only sector-based
+            // drivers parallels/bochs/cloop/dmg. cloop (1690 -> 2048) and dmg
+            // (11747 -> 11776) are the first fixtures with an unaligned file
+            // that actually exercise this; parallels/bochs files are already
+            // sector-aligned, so rounding them is a no-op. Other structured
+            // formats keep instar's exact protocol length (e.g. the malformed
+            // luks-v1 golden reports 592, which qemu-img cannot even open).
+            let rounds_protocol_length = matches!(
+                info.format.as_str(),
+                "raw" | "parallels" | "bochs" | "cloop" | "dmg"
+            ) || vmdk_flat.is_some();
+            let effective_child_file_length = if rounds_protocol_length {
                 child_file_length.div_ceil(512) * 512
             } else {
                 child_file_length
@@ -1469,8 +1528,20 @@ fn print_info_result_json(
         info.virtual_size
     };
 
-    // For child file length in raw/unknown format, also round up to 512-byte sectors
-    let effective_child_file_length = if is_unstructured {
+    // qemu-img reports the child node's virtual-size rounded up to a 512-byte
+    // sector for the container formats whose driver opens the underlying file
+    // at 512-sector granularity: raw/unknown, the VMDK flat descriptor, and
+    // the read-only sector-based drivers parallels/bochs/cloop/dmg. cloop
+    // (1690 -> 2048) and dmg (11747 -> 11776) are the first fixtures with an
+    // unaligned file to exercise it; parallels/bochs files are already
+    // sector-aligned. Other structured formats keep instar's exact protocol
+    // length (e.g. the malformed luks-v1 golden reports 592).
+    let rounds_protocol_length = is_unstructured
+        || matches!(
+            info.format.as_str(),
+            "parallels" | "bochs" | "cloop" | "dmg"
+        );
+    let effective_child_file_length = if rounds_protocol_length {
         child_file_length.div_ceil(512) * 512
     } else {
         child_file_length
@@ -1585,7 +1656,24 @@ fn print_info_result_json(
     }
 
     println!("    \"format\": \"{}\",", info.format);
-    println!("    \"actual-size\": {disk_size},");
+
+    // qemu-img omits the top-level "dirty-flag" entirely for the
+    // detection-and-info-only drivers (parallels, bochs, cloop, dmg): those
+    // block drivers do not implement bdrv_get_info, so QEMU never populates
+    // ImageInfo.dirty-flag for them. Every other format QEMU reports (qcow2,
+    // vmdk, vpc, vhdx, qed, vdi, raw, ...) emits it. When it is suppressed,
+    // "actual-size" becomes the object's last member — and for these four
+    // formats nothing else follows it (no format-specific section, no backing
+    // file) — so drop its trailing comma to keep the JSON well-formed.
+    let emit_dirty_flag = !matches!(
+        info.format.as_str(),
+        "parallels" | "bochs" | "cloop" | "dmg"
+    );
+    if emit_dirty_flag {
+        println!("    \"actual-size\": {disk_size},");
+    } else {
+        println!("    \"actual-size\": {disk_size}");
+    }
 
     // Format-specific section
     if info.format == "qcow2" {
@@ -1827,13 +1915,16 @@ fn print_info_result_json(
     // For QCOW2, use the dirty flag from the image header
     // For other formats, always report false
     // Note: dirty-flag output was added in qemu-img 6.1; for 6.0 compatibility,
-    // always report false when profile.include_dirty_flag is false
-    let dirty_flag = if profile.include_dirty_flag && info.format == "qcow2" {
-        info.qcow2_info.dirty
-    } else {
-        false
-    };
-    println!("    \"dirty-flag\": {dirty_flag}");
+    // always report false when profile.include_dirty_flag is false.
+    // parallels/bochs/cloop/dmg omit the field entirely (see emit_dirty_flag).
+    if emit_dirty_flag {
+        let dirty_flag = if profile.include_dirty_flag && info.format == "qcow2" {
+            info.qcow2_info.dirty
+        } else {
+            false
+        };
+        println!("    \"dirty-flag\": {dirty_flag}");
+    }
     println!("}}");
 }
 
