@@ -511,6 +511,28 @@ operation bugs.)
   detected formats); no existing test depends on the
   silent-raw behaviour. Findings in
   [PLAN-format-coverage-phase-01-detection.md](PLAN-format-coverage-phase-01-detection.md).
+* **instar-testdata: parallels driver missing from the
+  6.0.0–6.2.0 static qemu-img builds.** Found by step 4b's
+  driver spot-check (2026-07-17): `-f parallels` fails with
+  "Unknown driver" on all five 6.x binaries (compile-time
+  absence — `build-qemu-img.sh`'s pre-8.0 branch never
+  explicitly enables per-format drivers), while 7.0.0+ all
+  have it and bochs/cloop/dmg are present in all 80. A stock
+  qemu 6.x includes parallels, so the binaries misrepresent
+  real qemu; the five are being rebuilt with the driver
+  enabled (script fix + rebuild in progress), and parallels
+  manifest/baseline work is deferred until they land.
+* **instar-testdata: committed `profiles/` and
+  `version-map.json` are stale relative to `raw/`.** Also
+  found by step 4b: baseline generation runs after 23 June
+  were never followed by `detect-profiles.py`, and a fresh
+  recompute (excluding phase-1 images) produces a different
+  profile structure than what is committed. Since
+  `detect-profiles.py` rebuilds the whole profile tree,
+  regeneration is deferred to a single reviewed catch-up
+  change after the 6.x rebuild, covering the pre-existing
+  drift, the three new format-coverage images, and
+  parallels together.
 
 ### Documentation index maintenance
 

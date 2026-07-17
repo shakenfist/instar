@@ -1498,6 +1498,80 @@
             "tags": ["qcow2", "snapshots", "vm-state", "vm-clock", "icount"],
             "sha256": "1608dd5d333b7e7a68caa08c9c5aaac34157b5942b8e3e3c83e4ecde05be3b66",
             "generated_by": "instar-testdata/scripts/create-snapshot-testdata.py"
+        },
+        {
+            "id": "bochs-growing",
+            "path": "downloaded/qemu-iotests/empty.bochs",
+            "format": "bochs",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "Empty growing-mode Bochs virtual HD image from QEMU iotests",
+            "tags": ["bochs", "growing", "format-coverage"],
+            "sha256": "70eba138ce39c1b7864a20766e8db888293d881ca4c5b823bcbb236e7be09351"
+        },
+        {
+            "id": "cloop-simple",
+            "path": "downloaded/qemu-iotests/simple-pattern.cloop",
+            "format": "cloop",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "cloop V2.0 compressed image with a simple repeating pattern from QEMU iotests",
+            "tags": ["cloop", "compressed", "format-coverage"],
+            "sha256": "bdb59118010c88bd121ec11262beab8adcd35b5d4a53fe98f3a762c1334c59d8"
+        },
+        {
+            "id": "dmg-simple",
+            "path": "custom/format-coverage/dmg-simple.dmg",
+            "format": "dmg",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "Minimal valid 4 MiB UDIF (DMG) image with UDZO/zlib chunks and a koly trailer",
+            "tags": ["dmg", "udif", "format-coverage"],
+            "sha256": "be80e96ef40808a68fa5489202a2d1149b3db00dca97d55b4ba28cfd43d9f59e"
+        },
+        {
+            "id": "dmg-truncated-koly",
+            "path": "custom/audit/dmg-truncated-koly.dmg",
+            "format": "dmg",
+            "safety": "malformed",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "DMG with the koly magic present but the trailer cut short, so no valid 512-byte trailer sits at a candidate offset",
+            "tags": ["dmg", "corrupt", "malformed", "format-coverage"],
+            "sha256": "8c5138bebf350e306c8d9fa28065d9a0c4ced0b2266078c179bba973b40c512a"
+        },
+        {
+            "id": "dmg-sectorcount-negative",
+            "path": "custom/audit/dmg-sectorcount-negative.dmg",
+            "format": "dmg",
+            "safety": "malformed",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "DMG with a full valid koly trailer whose SectorCount has the top bit set (negative total)",
+            "tags": ["dmg", "corrupt", "malformed", "format-coverage"],
+            "sha256": "17dbb2402a388e187bb44b37ee69d0c1cdade1e7c226057d53a11594e5499e9c"
+        },
+        {
+            "id": "dmg-sectorcount-huge",
+            "path": "custom/audit/dmg-sectorcount-huge.dmg",
+            "format": "dmg",
+            "safety": "malformed",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "DMG with a full valid koly trailer and an absurd-but-positive SectorCount",
+            "tags": ["dmg", "corrupt", "malformed", "format-coverage"],
+            "sha256": "d189e2fff30094cc27d4dc877b8a99406b70b79969b772c195e2eca8b9cafdd4"
+        },
+        {
+            "id": "dmg-no-chunk-table",
+            "path": "custom/audit/dmg-no-chunk-table.dmg",
+            "format": "dmg",
+            "safety": "malformed",
+            "run_in_ci": true,
+            "skip_qemu_img": true,
+            "description": "DMG with a valid koly trailer but RsrcForkLength and XMLLength both zero, so QEMU has no chunk table to open",
+            "tags": ["dmg", "corrupt", "malformed", "format-coverage"],
+            "sha256": "932b01ac6a8c7e89d56f9702a49927c6f3aae840875f2b0a96824dcf0d6f8b37"
         }
     ]
 }
