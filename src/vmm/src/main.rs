@@ -651,7 +651,11 @@ impl DeviceSet {
     /// Handle MMIO read, dispatching to the correct device.
     fn mmio_read(&self, addr: u64) -> u32 {
         if let Some((index, offset)) = self.find_device_for_mmio(addr) {
-            self.devices[index].device.lock().unwrap().mmio_read(offset)
+            self.devices[index]
+                .device
+                .lock()
+                .expect("lock poisoned")
+                .mmio_read(offset)
         } else {
             log::debug!("Unknown MMIO read at 0x{addr:x}");
             0
@@ -662,7 +666,7 @@ impl DeviceSet {
     /// Returns (device_index, should_process_queue) if a device was found.
     fn mmio_write(&self, addr: u64, value: u32) -> Option<(usize, bool)> {
         if let Some((index, offset)) = self.find_device_for_mmio(addr) {
-            let mut device = self.devices[index].device.lock().unwrap();
+            let mut device = self.devices[index].device.lock().expect("lock poisoned");
             device.mmio_write(offset, value);
             Some((index, device.should_process_queue()))
         } else {
@@ -679,9 +683,13 @@ impl DeviceSet {
         vmm_stats: &Arc<Mutex<VmmStats>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let managed = &self.devices[index];
-        let io_stats = managed.device.lock().unwrap().process_queue(guest_mem)?;
+        let io_stats = managed
+            .device
+            .lock()
+            .expect("lock poisoned")
+            .process_queue(guest_mem)?;
 
-        let mut stats = vmm_stats.lock().unwrap();
+        let mut stats = vmm_stats.lock().expect("lock poisoned");
         if managed.is_input {
             stats.record_read(io_stats.bytes_read, io_stats.sectors_read);
         } else {
@@ -1911,10 +1919,18 @@ fn execute_info_operation(
     let operation_path = get_binary_path("info.bin");
 
     // Load core binary (device init, call table setup)
-    let core_code = load_guest_binary(core_path.to_str().unwrap())?;
+    let core_code = load_guest_binary(
+        core_path
+            .to_str()
+            .ok_or("core binary path is not valid UTF-8")?,
+    )?;
 
     // Load operation binary (info)
-    let operation_code = load_guest_binary(operation_path.to_str().unwrap())?;
+    let operation_code = load_guest_binary(
+        operation_path
+            .to_str()
+            .ok_or("operation binary path is not valid UTF-8")?,
+    )?;
 
     // Get input file metadata
     let input_metadata = std::fs::metadata(input_path)?;
@@ -1933,7 +1949,9 @@ fn execute_info_operation(
     let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
 
     // Get the memory region for KVM registration
-    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let region = guest_mem
+        .find_region(GuestAddress(0))
+        .expect("guest memory has a region at address 0");
     let host_addr = region.as_ptr() as u64;
 
     // Set up KVM memory region
@@ -4314,7 +4332,9 @@ fn run_bench_guest(
     let vm = kvm.create_vm()?;
     let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
 
-    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let region = guest_mem
+        .find_region(GuestAddress(0))
+        .expect("guest memory has a region at address 0");
     let host_addr = region.as_ptr() as u64;
     let mem_region = kvm_userspace_memory_region {
         slot: 0,
@@ -4528,11 +4548,11 @@ fn run_bench_guest(
     loop {
         match vcpu.run()? {
             VcpuExit::Hlt => {
-                vmm_stats.lock().unwrap().record_hlt();
+                vmm_stats.lock().expect("lock poisoned").record_hlt();
                 break;
             }
             VcpuExit::IoOut(port, data) => {
-                vmm_stats.lock().unwrap().record_io_out();
+                vmm_stats.lock().expect("lock poisoned").record_io_out();
                 if port == SERIAL_PORT {
                     for &byte in data {
                         if let Some(msg) = serial_decoder.add_byte(byte) {
@@ -4568,7 +4588,7 @@ fn run_bench_guest(
                 }
             }
             VcpuExit::IoIn(port, data) => {
-                vmm_stats.lock().unwrap().record_io_in();
+                vmm_stats.lock().expect("lock poisoned").record_io_in();
                 if port == SERIAL_PORT {
                     for byte in data.iter_mut() {
                         *byte = serial_transmitter.next_byte().unwrap_or(0);
@@ -4586,12 +4606,12 @@ fn run_bench_guest(
                 }
             }
             VcpuExit::MmioRead(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_read();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_read();
                 let value = device_set.mmio_read(addr);
                 write_mmio_data(data, value);
             }
             VcpuExit::MmioWrite(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_write();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_write();
                 let value = read_mmio_data(data);
                 if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
                     if io_thread.is_none() && should_process {
@@ -4604,17 +4624,17 @@ fn run_bench_guest(
                 }
             }
             VcpuExit::Shutdown => {
-                vmm_stats.lock().unwrap().record_shutdown();
+                vmm_stats.lock().expect("lock poisoned").record_shutdown();
                 vm_error = Some("VM shutdown (triple fault)".to_string());
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
-                vmm_stats.lock().unwrap().record_fail_entry();
+                vmm_stats.lock().expect("lock poisoned").record_fail_entry();
                 vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
                 break;
             }
             exit => {
-                vmm_stats.lock().unwrap().record_unknown();
+                vmm_stats.lock().expect("lock poisoned").record_unknown();
                 vm_error = Some(format!("unexpected VM exit: {exit:?}"));
                 break;
             }
@@ -4626,7 +4646,7 @@ fn run_bench_guest(
     }
 
     if log::log_enabled!(log::Level::Debug) {
-        vmm_stats.lock().unwrap().display();
+        vmm_stats.lock().expect("lock poisoned").display();
     }
 
     if let Some(error) = vm_error {
@@ -7248,7 +7268,9 @@ fn run_resize_guest(
     let vm = kvm.create_vm()?;
     let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
 
-    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let region = guest_mem
+        .find_region(GuestAddress(0))
+        .expect("guest memory has a region at address 0");
     let host_addr = region.as_ptr() as u64;
     let mem_region = kvm_userspace_memory_region {
         slot: 0,
@@ -7436,11 +7458,11 @@ fn run_resize_guest(
     loop {
         match vcpu.run()? {
             VcpuExit::Hlt => {
-                vmm_stats.lock().unwrap().record_hlt();
+                vmm_stats.lock().expect("lock poisoned").record_hlt();
                 break;
             }
             VcpuExit::IoOut(port, data) => {
-                vmm_stats.lock().unwrap().record_io_out();
+                vmm_stats.lock().expect("lock poisoned").record_io_out();
                 if port == SERIAL_PORT {
                     for &byte in data {
                         if let Some(msg) = serial_decoder.add_byte(byte) {
@@ -7473,7 +7495,7 @@ fn run_resize_guest(
                 }
             }
             VcpuExit::IoIn(port, data) => {
-                vmm_stats.lock().unwrap().record_io_in();
+                vmm_stats.lock().expect("lock poisoned").record_io_in();
                 if port == SERIAL_PORT {
                     for byte in data.iter_mut() {
                         *byte = serial_transmitter.next_byte().unwrap_or(0);
@@ -7491,12 +7513,12 @@ fn run_resize_guest(
                 }
             }
             VcpuExit::MmioRead(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_read();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_read();
                 let value = device_set.mmio_read(addr);
                 write_mmio_data(data, value);
             }
             VcpuExit::MmioWrite(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_write();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_write();
                 let value = read_mmio_data(data);
                 if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
                     if io_thread.is_none() && should_process {
@@ -7509,17 +7531,17 @@ fn run_resize_guest(
                 }
             }
             VcpuExit::Shutdown => {
-                vmm_stats.lock().unwrap().record_shutdown();
+                vmm_stats.lock().expect("lock poisoned").record_shutdown();
                 vm_error = Some("VM shutdown (triple fault)".to_string());
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
-                vmm_stats.lock().unwrap().record_fail_entry();
+                vmm_stats.lock().expect("lock poisoned").record_fail_entry();
                 vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
                 break;
             }
             exit => {
-                vmm_stats.lock().unwrap().record_unknown();
+                vmm_stats.lock().expect("lock poisoned").record_unknown();
                 vm_error = Some(format!("unexpected VM exit: {exit:?}"));
                 break;
             }
@@ -7531,7 +7553,7 @@ fn run_resize_guest(
     }
 
     if log::log_enabled!(log::Level::Debug) {
-        vmm_stats.lock().unwrap().display();
+        vmm_stats.lock().expect("lock poisoned").display();
     }
 
     if let Some(error) = vm_error {
@@ -7967,7 +7989,7 @@ fn probe_bitmap_target(path: &str) -> Result<ProbedBitmapTarget, Box<dyn std::er
         u64::from_be_bytes(
             full[qcow2::AUTOCLEAR_FEATURES_OFFSET..qcow2::AUTOCLEAR_FEATURES_OFFSET + 8]
                 .try_into()
-                .unwrap(),
+                .expect("slice length is fixed at 8 bytes"),
         )
     } else {
         0
@@ -8220,7 +8242,9 @@ fn run_amend_guest(
     let vm = kvm.create_vm()?;
     let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
 
-    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let region = guest_mem
+        .find_region(GuestAddress(0))
+        .expect("guest memory has a region at address 0");
     let host_addr = region.as_ptr() as u64;
     let mem_region = kvm_userspace_memory_region {
         slot: 0,
@@ -8416,11 +8440,11 @@ fn run_amend_guest(
     loop {
         match vcpu.run()? {
             VcpuExit::Hlt => {
-                vmm_stats.lock().unwrap().record_hlt();
+                vmm_stats.lock().expect("lock poisoned").record_hlt();
                 break;
             }
             VcpuExit::IoOut(port, data) => {
-                vmm_stats.lock().unwrap().record_io_out();
+                vmm_stats.lock().expect("lock poisoned").record_io_out();
                 if port == SERIAL_PORT {
                     for &byte in data {
                         if let Some(msg) = serial_decoder.add_byte(byte) {
@@ -8453,7 +8477,7 @@ fn run_amend_guest(
                 }
             }
             VcpuExit::IoIn(port, data) => {
-                vmm_stats.lock().unwrap().record_io_in();
+                vmm_stats.lock().expect("lock poisoned").record_io_in();
                 if port == SERIAL_PORT {
                     for byte in data.iter_mut() {
                         *byte = serial_transmitter.next_byte().unwrap_or(0);
@@ -8471,12 +8495,12 @@ fn run_amend_guest(
                 }
             }
             VcpuExit::MmioRead(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_read();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_read();
                 let value = device_set.mmio_read(addr);
                 write_mmio_data(data, value);
             }
             VcpuExit::MmioWrite(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_write();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_write();
                 let value = read_mmio_data(data);
                 if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
                     if io_thread.is_none() && should_process {
@@ -8489,17 +8513,17 @@ fn run_amend_guest(
                 }
             }
             VcpuExit::Shutdown => {
-                vmm_stats.lock().unwrap().record_shutdown();
+                vmm_stats.lock().expect("lock poisoned").record_shutdown();
                 vm_error = Some("VM shutdown (triple fault)".to_string());
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
-                vmm_stats.lock().unwrap().record_fail_entry();
+                vmm_stats.lock().expect("lock poisoned").record_fail_entry();
                 vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
                 break;
             }
             exit => {
-                vmm_stats.lock().unwrap().record_unknown();
+                vmm_stats.lock().expect("lock poisoned").record_unknown();
                 vm_error = Some(format!("unexpected VM exit: {exit:?}"));
                 break;
             }
@@ -8511,7 +8535,7 @@ fn run_amend_guest(
     }
 
     if log::log_enabled!(log::Level::Debug) {
-        vmm_stats.lock().unwrap().display();
+        vmm_stats.lock().expect("lock poisoned").display();
     }
 
     if let Some(error) = vm_error {
@@ -8569,7 +8593,9 @@ fn run_bitmap_guest(
     let vm = kvm.create_vm()?;
     let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
 
-    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let region = guest_mem
+        .find_region(GuestAddress(0))
+        .expect("guest memory has a region at address 0");
     let host_addr = region.as_ptr() as u64;
     let mem_region = kvm_userspace_memory_region {
         slot: 0,
@@ -8825,11 +8851,11 @@ fn run_bitmap_guest(
     loop {
         match vcpu.run()? {
             VcpuExit::Hlt => {
-                vmm_stats.lock().unwrap().record_hlt();
+                vmm_stats.lock().expect("lock poisoned").record_hlt();
                 break;
             }
             VcpuExit::IoOut(port, data) => {
-                vmm_stats.lock().unwrap().record_io_out();
+                vmm_stats.lock().expect("lock poisoned").record_io_out();
                 if port == SERIAL_PORT {
                     for &byte in data {
                         if let Some(msg) = serial_decoder.add_byte(byte) {
@@ -8857,7 +8883,7 @@ fn run_bitmap_guest(
                 }
             }
             VcpuExit::IoIn(port, data) => {
-                vmm_stats.lock().unwrap().record_io_in();
+                vmm_stats.lock().expect("lock poisoned").record_io_in();
                 if port == SERIAL_PORT {
                     for byte in data.iter_mut() {
                         *byte = serial_transmitter.next_byte().unwrap_or(0);
@@ -8875,12 +8901,12 @@ fn run_bitmap_guest(
                 }
             }
             VcpuExit::MmioRead(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_read();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_read();
                 let value = device_set.mmio_read(addr);
                 write_mmio_data(data, value);
             }
             VcpuExit::MmioWrite(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_write();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_write();
                 let value = read_mmio_data(data);
                 if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
                     if io_thread.is_none() && should_process {
@@ -8893,17 +8919,17 @@ fn run_bitmap_guest(
                 }
             }
             VcpuExit::Shutdown => {
-                vmm_stats.lock().unwrap().record_shutdown();
+                vmm_stats.lock().expect("lock poisoned").record_shutdown();
                 vm_error = Some("VM shutdown (triple fault)".to_string());
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
-                vmm_stats.lock().unwrap().record_fail_entry();
+                vmm_stats.lock().expect("lock poisoned").record_fail_entry();
                 vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
                 break;
             }
             exit => {
-                vmm_stats.lock().unwrap().record_unknown();
+                vmm_stats.lock().expect("lock poisoned").record_unknown();
                 vm_error = Some(format!("unexpected VM exit: {exit:?}"));
                 break;
             }
@@ -8915,7 +8941,7 @@ fn run_bitmap_guest(
     }
 
     if log::log_enabled!(log::Level::Debug) {
-        vmm_stats.lock().unwrap().display();
+        vmm_stats.lock().expect("lock poisoned").display();
     }
 
     if let Some(error) = vm_error {
@@ -8960,7 +8986,9 @@ fn run_rebase_guest(
     let vm = kvm.create_vm()?;
     let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
 
-    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let region = guest_mem
+        .find_region(GuestAddress(0))
+        .expect("guest memory has a region at address 0");
     let host_addr = region.as_ptr() as u64;
     let mem_region = kvm_userspace_memory_region {
         slot: 0,
@@ -9228,11 +9256,11 @@ fn run_rebase_guest(
     loop {
         match vcpu.run()? {
             VcpuExit::Hlt => {
-                vmm_stats.lock().unwrap().record_hlt();
+                vmm_stats.lock().expect("lock poisoned").record_hlt();
                 break;
             }
             VcpuExit::IoOut(port, data) => {
-                vmm_stats.lock().unwrap().record_io_out();
+                vmm_stats.lock().expect("lock poisoned").record_io_out();
                 if port == SERIAL_PORT {
                     for &byte in data {
                         if let Some(msg) = serial_decoder.add_byte(byte) {
@@ -9269,7 +9297,7 @@ fn run_rebase_guest(
                 }
             }
             VcpuExit::IoIn(port, data) => {
-                vmm_stats.lock().unwrap().record_io_in();
+                vmm_stats.lock().expect("lock poisoned").record_io_in();
                 if port == SERIAL_PORT {
                     for byte in data.iter_mut() {
                         *byte = serial_transmitter.next_byte().unwrap_or(0);
@@ -9287,12 +9315,12 @@ fn run_rebase_guest(
                 }
             }
             VcpuExit::MmioRead(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_read();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_read();
                 let value = device_set.mmio_read(addr);
                 write_mmio_data(data, value);
             }
             VcpuExit::MmioWrite(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_write();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_write();
                 let value = read_mmio_data(data);
                 if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
                     if io_thread.is_none() && should_process {
@@ -9305,17 +9333,17 @@ fn run_rebase_guest(
                 }
             }
             VcpuExit::Shutdown => {
-                vmm_stats.lock().unwrap().record_shutdown();
+                vmm_stats.lock().expect("lock poisoned").record_shutdown();
                 vm_error = Some("VM shutdown (triple fault)".to_string());
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
-                vmm_stats.lock().unwrap().record_fail_entry();
+                vmm_stats.lock().expect("lock poisoned").record_fail_entry();
                 vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
                 break;
             }
             exit => {
-                vmm_stats.lock().unwrap().record_unknown();
+                vmm_stats.lock().expect("lock poisoned").record_unknown();
                 vm_error = Some(format!("unexpected VM exit: {exit:?}"));
                 break;
             }
@@ -9327,7 +9355,7 @@ fn run_rebase_guest(
     }
 
     if log::log_enabled!(log::Level::Debug) {
-        vmm_stats.lock().unwrap().display();
+        vmm_stats.lock().expect("lock poisoned").display();
     }
 
     if let Some(error) = vm_error {
@@ -9393,7 +9421,9 @@ fn run_commit_guest(
     let vm = kvm.create_vm()?;
     let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
 
-    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let region = guest_mem
+        .find_region(GuestAddress(0))
+        .expect("guest memory has a region at address 0");
     let host_addr = region.as_ptr() as u64;
     let mem_region = kvm_userspace_memory_region {
         slot: 0,
@@ -9607,11 +9637,11 @@ fn run_commit_guest(
     loop {
         match vcpu.run()? {
             VcpuExit::Hlt => {
-                vmm_stats.lock().unwrap().record_hlt();
+                vmm_stats.lock().expect("lock poisoned").record_hlt();
                 break;
             }
             VcpuExit::IoOut(port, data) => {
-                vmm_stats.lock().unwrap().record_io_out();
+                vmm_stats.lock().expect("lock poisoned").record_io_out();
                 if port == SERIAL_PORT {
                     for &byte in data {
                         if let Some(msg) = serial_decoder.add_byte(byte) {
@@ -9651,7 +9681,7 @@ fn run_commit_guest(
                 }
             }
             VcpuExit::IoIn(port, data) => {
-                vmm_stats.lock().unwrap().record_io_in();
+                vmm_stats.lock().expect("lock poisoned").record_io_in();
                 if port == SERIAL_PORT {
                     for byte in data.iter_mut() {
                         *byte = serial_transmitter.next_byte().unwrap_or(0);
@@ -9669,12 +9699,12 @@ fn run_commit_guest(
                 }
             }
             VcpuExit::MmioRead(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_read();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_read();
                 let value = device_set.mmio_read(addr);
                 write_mmio_data(data, value);
             }
             VcpuExit::MmioWrite(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_write();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_write();
                 let value = read_mmio_data(data);
                 if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
                     if io_thread.is_none() && should_process {
@@ -9687,17 +9717,17 @@ fn run_commit_guest(
                 }
             }
             VcpuExit::Shutdown => {
-                vmm_stats.lock().unwrap().record_shutdown();
+                vmm_stats.lock().expect("lock poisoned").record_shutdown();
                 vm_error = Some("VM shutdown (triple fault)".to_string());
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
-                vmm_stats.lock().unwrap().record_fail_entry();
+                vmm_stats.lock().expect("lock poisoned").record_fail_entry();
                 vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
                 break;
             }
             exit => {
-                vmm_stats.lock().unwrap().record_unknown();
+                vmm_stats.lock().expect("lock poisoned").record_unknown();
                 vm_error = Some(format!("unexpected VM exit: {exit:?}"));
                 break;
             }
@@ -9709,7 +9739,7 @@ fn run_commit_guest(
     }
 
     if log::log_enabled!(log::Level::Debug) {
-        vmm_stats.lock().unwrap().display();
+        vmm_stats.lock().expect("lock poisoned").display();
     }
 
     if let Some(error) = vm_error {
@@ -9800,7 +9830,11 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     let operation_path = get_binary_path("info.bin");
 
     // Load core binary (device init, call table setup)
-    let core_code = load_guest_binary(core_path.to_str().unwrap())?;
+    let core_code = load_guest_binary(
+        core_path
+            .to_str()
+            .ok_or("core binary path is not valid UTF-8")?,
+    )?;
     debug!(
         "Loaded core binary: {} bytes from {}",
         core_code.len(),
@@ -9808,7 +9842,11 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     );
 
     // Load operation binary (info)
-    let operation_code = load_guest_binary(operation_path.to_str().unwrap())?;
+    let operation_code = load_guest_binary(
+        operation_path
+            .to_str()
+            .ok_or("operation binary path is not valid UTF-8")?,
+    )?;
     debug!(
         "Loaded operation binary: {} bytes from {}",
         operation_code.len(),
@@ -9896,7 +9934,9 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     debug!("Allocated {guest_mem_size} bytes of guest memory");
 
     // Get the memory region for KVM registration
-    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let region = guest_mem
+        .find_region(GuestAddress(0))
+        .expect("guest memory has a region at address 0");
     let host_addr = region.as_ptr() as u64;
 
     // Set up KVM memory region
@@ -10096,13 +10136,13 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     loop {
         match vcpu.run()? {
             VcpuExit::Hlt => {
-                vmm_stats.lock().unwrap().record_hlt();
+                vmm_stats.lock().expect("lock poisoned").record_hlt();
                 info!("Guest executed HLT");
                 debug!("Info operation completed successfully!");
                 break;
             }
             VcpuExit::IoOut(port, data) => {
-                vmm_stats.lock().unwrap().record_io_out();
+                vmm_stats.lock().expect("lock poisoned").record_io_out();
                 if port == SERIAL_PORT {
                     for &byte in data {
                         if let Some(msg) = serial_decoder.add_byte(byte) {
@@ -10139,7 +10179,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
                 }
             }
             VcpuExit::IoIn(port, data) => {
-                vmm_stats.lock().unwrap().record_io_in();
+                vmm_stats.lock().expect("lock poisoned").record_io_in();
                 if port == SERIAL_PORT {
                     for byte in data.iter_mut() {
                         *byte = serial_transmitter.next_byte().unwrap_or(0);
@@ -10157,12 +10197,12 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
                 }
             }
             VcpuExit::MmioRead(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_read();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_read();
                 let value = device_set.mmio_read(addr);
                 write_mmio_data(data, value);
             }
             VcpuExit::MmioWrite(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_write();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_write();
                 let value = read_mmio_data(data);
                 if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
                     if io_thread.is_none() && should_process {
@@ -10175,7 +10215,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
                 }
             }
             VcpuExit::Shutdown => {
-                vmm_stats.lock().unwrap().record_shutdown();
+                vmm_stats.lock().expect("lock poisoned").record_shutdown();
                 eprintln!("\n--- VM Shutdown (triple fault?) ---");
                 let regs = vcpu.get_regs()?;
                 let sregs = vcpu.get_sregs()?;
@@ -10199,13 +10239,13 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
-                vmm_stats.lock().unwrap().record_fail_entry();
+                vmm_stats.lock().expect("lock poisoned").record_fail_entry();
                 eprintln!("VM Entry Failed! reason=0x{reason:x}, cpu={cpu}");
                 vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
                 break;
             }
             exit => {
-                vmm_stats.lock().unwrap().record_unknown();
+                vmm_stats.lock().expect("lock poisoned").record_unknown();
                 eprintln!("Unexpected VM exit: {exit:?}");
                 vm_error = Some(format!("unexpected VM exit: {exit:?}"));
                 break;
@@ -10218,7 +10258,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     }
 
     if log::log_enabled!(log::Level::Debug) {
-        vmm_stats.lock().unwrap().display();
+        vmm_stats.lock().expect("lock poisoned").display();
     }
 
     // Return error if VM crashed or failed
@@ -10252,7 +10292,11 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     let operation_path = get_binary_path("copy.bin");
 
     // Load core binary (device init, call table setup)
-    let core_code = load_guest_binary(core_path.to_str().unwrap())?;
+    let core_code = load_guest_binary(
+        core_path
+            .to_str()
+            .ok_or("core binary path is not valid UTF-8")?,
+    )?;
     debug!(
         "Loaded core binary: {} bytes from {}",
         core_code.len(),
@@ -10260,7 +10304,11 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     );
 
     // Load operation binary (copy)
-    let operation_code = load_guest_binary(operation_path.to_str().unwrap())?;
+    let operation_code = load_guest_binary(
+        operation_path
+            .to_str()
+            .ok_or("operation binary path is not valid UTF-8")?,
+    )?;
     debug!(
         "Loaded operation binary: {} bytes from {}",
         operation_code.len(),
@@ -10317,7 +10365,9 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
     debug!("Allocated {GUEST_MEM_SIZE} bytes of guest memory");
 
-    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let region = guest_mem
+        .find_region(GuestAddress(0))
+        .expect("guest memory has a region at address 0");
     let host_addr = region.as_ptr() as u64;
 
     let mem_region = kvm_userspace_memory_region {
@@ -10482,13 +10532,13 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     loop {
         match vcpu.run()? {
             VcpuExit::Hlt => {
-                vmm_stats.lock().unwrap().record_hlt();
+                vmm_stats.lock().expect("lock poisoned").record_hlt();
                 info!("Guest executed HLT");
                 debug!("Copy operation completed successfully!");
                 break;
             }
             VcpuExit::IoOut(port, data) => {
-                vmm_stats.lock().unwrap().record_io_out();
+                vmm_stats.lock().expect("lock poisoned").record_io_out();
                 if port == SERIAL_PORT {
                     for &byte in data {
                         if let Some(msg) = serial_decoder.add_byte(byte) {
@@ -10506,7 +10556,7 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
                 }
             }
             VcpuExit::IoIn(port, data) => {
-                vmm_stats.lock().unwrap().record_io_in();
+                vmm_stats.lock().expect("lock poisoned").record_io_in();
                 if port == SERIAL_PORT {
                     for byte in data.iter_mut() {
                         *byte = serial_transmitter.next_byte().unwrap_or(0);
@@ -10524,12 +10574,12 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
                 }
             }
             VcpuExit::MmioRead(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_read();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_read();
                 let value = device_set.mmio_read(addr);
                 write_mmio_data(data, value);
             }
             VcpuExit::MmioWrite(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_write();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_write();
                 let value = read_mmio_data(data);
                 if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
                     if io_thread.is_none() && should_process {
@@ -10542,7 +10592,7 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
                 }
             }
             VcpuExit::Shutdown => {
-                vmm_stats.lock().unwrap().record_shutdown();
+                vmm_stats.lock().expect("lock poisoned").record_shutdown();
                 eprintln!("\n--- VM Shutdown (triple fault?) ---");
                 let regs = vcpu.get_regs()?;
                 let sregs = vcpu.get_sregs()?;
@@ -10581,13 +10631,13 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
-                vmm_stats.lock().unwrap().record_fail_entry();
+                vmm_stats.lock().expect("lock poisoned").record_fail_entry();
                 eprintln!("VM Entry Failed! reason=0x{reason:x}, cpu={cpu}");
                 vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
                 break;
             }
             exit => {
-                vmm_stats.lock().unwrap().record_unknown();
+                vmm_stats.lock().expect("lock poisoned").record_unknown();
                 eprintln!("Unexpected VM exit: {exit:?}");
                 vm_error = Some(format!("unexpected VM exit: {exit:?}"));
                 break;
@@ -10600,7 +10650,7 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     }
 
     if log::log_enabled!(log::Level::Debug) {
-        vmm_stats.lock().unwrap().display();
+        vmm_stats.lock().expect("lock poisoned").display();
     }
 
     // Return error if VM crashed or failed
@@ -10664,7 +10714,11 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     let operation_path = get_binary_path("check.bin");
 
     // Load core binary (device init, call table setup)
-    let core_code = load_guest_binary(core_path.to_str().unwrap())?;
+    let core_code = load_guest_binary(
+        core_path
+            .to_str()
+            .ok_or("core binary path is not valid UTF-8")?,
+    )?;
     debug!(
         "Loaded core binary: {} bytes from {}",
         core_code.len(),
@@ -10672,7 +10726,11 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     );
 
     // Load operation binary (check)
-    let operation_code = load_guest_binary(operation_path.to_str().unwrap())?;
+    let operation_code = load_guest_binary(
+        operation_path
+            .to_str()
+            .ok_or("operation binary path is not valid UTF-8")?,
+    )?;
     debug!(
         "Loaded operation binary: {} bytes from {}",
         operation_code.len(),
@@ -10734,7 +10792,9 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     debug!("Allocated {GUEST_MEM_SIZE} bytes of guest memory");
 
     // Get the memory region for KVM registration
-    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let region = guest_mem
+        .find_region(GuestAddress(0))
+        .expect("guest memory has a region at address 0");
     let host_addr = region.as_ptr() as u64;
 
     // Set up KVM memory region
@@ -10982,13 +11042,13 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     loop {
         match vcpu.run()? {
             VcpuExit::Hlt => {
-                vmm_stats.lock().unwrap().record_hlt();
+                vmm_stats.lock().expect("lock poisoned").record_hlt();
                 info!("Guest executed HLT");
                 debug!("Check operation completed!");
                 break;
             }
             VcpuExit::IoOut(port, data) => {
-                vmm_stats.lock().unwrap().record_io_out();
+                vmm_stats.lock().expect("lock poisoned").record_io_out();
                 if port == SERIAL_PORT {
                     for &byte in data {
                         if let Some(msg) = serial_decoder.add_byte(byte) {
@@ -11045,7 +11105,7 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
                 }
             }
             VcpuExit::IoIn(port, data) => {
-                vmm_stats.lock().unwrap().record_io_in();
+                vmm_stats.lock().expect("lock poisoned").record_io_in();
                 if port == SERIAL_PORT {
                     for byte in data.iter_mut() {
                         *byte = serial_transmitter.next_byte().unwrap_or(0);
@@ -11063,12 +11123,12 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
                 }
             }
             VcpuExit::MmioRead(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_read();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_read();
                 let value = device_set.mmio_read(addr);
                 write_mmio_data(data, value);
             }
             VcpuExit::MmioWrite(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_write();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_write();
                 let value = read_mmio_data(data);
                 if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
                     if io_thread.is_none() && should_process {
@@ -11081,19 +11141,19 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
                 }
             }
             VcpuExit::Shutdown => {
-                vmm_stats.lock().unwrap().record_shutdown();
+                vmm_stats.lock().expect("lock poisoned").record_shutdown();
                 eprintln!("\n--- VM Shutdown (triple fault?) ---");
                 vm_error = Some("VM shutdown (triple fault)".to_string());
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
-                vmm_stats.lock().unwrap().record_fail_entry();
+                vmm_stats.lock().expect("lock poisoned").record_fail_entry();
                 eprintln!("VM Entry Failed! reason=0x{reason:x}, cpu={cpu}");
                 vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
                 break;
             }
             exit => {
-                vmm_stats.lock().unwrap().record_unknown();
+                vmm_stats.lock().expect("lock poisoned").record_unknown();
                 eprintln!("Unexpected VM exit: {exit:?}");
                 vm_error = Some(format!("unexpected VM exit: {exit:?}"));
                 break;
@@ -11106,7 +11166,7 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     }
 
     if log::log_enabled!(log::Level::Debug) {
-        vmm_stats.lock().unwrap().display();
+        vmm_stats.lock().expect("lock poisoned").display();
     }
 
     // Return error if VM crashed or failed (genuine VM/I-O failures keep
@@ -11389,7 +11449,11 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     let operation_path = get_binary_path("compare.bin");
 
     // Load core binary (device init, call table setup)
-    let core_code = load_guest_binary(core_path.to_str().unwrap())?;
+    let core_code = load_guest_binary(
+        core_path
+            .to_str()
+            .ok_or("core binary path is not valid UTF-8")?,
+    )?;
     debug!(
         "Loaded core binary: {} bytes from {}",
         core_code.len(),
@@ -11397,7 +11461,11 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     );
 
     // Load operation binary (compare)
-    let operation_code = load_guest_binary(operation_path.to_str().unwrap())?;
+    let operation_code = load_guest_binary(
+        operation_path
+            .to_str()
+            .ok_or("operation binary path is not valid UTF-8")?,
+    )?;
     debug!(
         "Loaded operation binary: {} bytes from {}",
         operation_code.len(),
@@ -11456,7 +11524,9 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     debug!("Allocated {GUEST_MEM_SIZE} bytes of guest memory");
 
     // Get the memory region for KVM registration
-    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let region = guest_mem
+        .find_region(GuestAddress(0))
+        .expect("guest memory has a region at address 0");
     let host_addr = region.as_ptr() as u64;
 
     // Set up KVM memory region
@@ -11704,13 +11774,13 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     loop {
         match vcpu.run()? {
             VcpuExit::Hlt => {
-                vmm_stats.lock().unwrap().record_hlt();
+                vmm_stats.lock().expect("lock poisoned").record_hlt();
                 info!("Guest executed HLT");
                 debug!("Compare operation completed!");
                 break;
             }
             VcpuExit::IoOut(port, data) => {
-                vmm_stats.lock().unwrap().record_io_out();
+                vmm_stats.lock().expect("lock poisoned").record_io_out();
                 if port == SERIAL_PORT {
                     for &byte in data {
                         if let Some(msg) = serial_decoder.add_byte(byte) {
@@ -11746,7 +11816,7 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                 }
             }
             VcpuExit::IoIn(port, data) => {
-                vmm_stats.lock().unwrap().record_io_in();
+                vmm_stats.lock().expect("lock poisoned").record_io_in();
                 if port == SERIAL_PORT {
                     for byte in data.iter_mut() {
                         *byte = serial_transmitter.next_byte().unwrap_or(0);
@@ -11764,12 +11834,12 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                 }
             }
             VcpuExit::MmioRead(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_read();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_read();
                 let value = device_set.mmio_read(addr);
                 write_mmio_data(data, value);
             }
             VcpuExit::MmioWrite(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_write();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_write();
                 let value = read_mmio_data(data);
                 if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
                     if io_thread.is_none() && should_process {
@@ -11782,19 +11852,19 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                 }
             }
             VcpuExit::Shutdown => {
-                vmm_stats.lock().unwrap().record_shutdown();
+                vmm_stats.lock().expect("lock poisoned").record_shutdown();
                 eprintln!("\n--- VM Shutdown (triple fault?) ---");
                 vm_error = Some("VM shutdown (triple fault)".to_string());
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
-                vmm_stats.lock().unwrap().record_fail_entry();
+                vmm_stats.lock().expect("lock poisoned").record_fail_entry();
                 eprintln!("VM Entry Failed! reason=0x{reason:x}, cpu={cpu}");
                 vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
                 break;
             }
             exit => {
-                vmm_stats.lock().unwrap().record_unknown();
+                vmm_stats.lock().expect("lock poisoned").record_unknown();
                 eprintln!("Unexpected VM exit: {exit:?}");
                 vm_error = Some(format!("unexpected VM exit: {exit:?}"));
                 break;
@@ -11807,7 +11877,7 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     }
 
     if log::log_enabled!(log::Level::Debug) {
-        vmm_stats.lock().unwrap().display();
+        vmm_stats.lock().expect("lock poisoned").display();
     }
 
     // Return error if VM crashed or failed
@@ -12198,14 +12268,22 @@ fn execute_convert(
     let core_path = get_binary_path("core.bin");
     let operation_path = get_binary_path("convert.bin");
 
-    let core_code = load_guest_binary(core_path.to_str().unwrap())?;
+    let core_code = load_guest_binary(
+        core_path
+            .to_str()
+            .ok_or("core binary path is not valid UTF-8")?,
+    )?;
     debug!(
         "Loaded core binary: {} bytes from {}",
         core_code.len(),
         core_path.display()
     );
 
-    let operation_code = load_guest_binary(operation_path.to_str().unwrap())?;
+    let operation_code = load_guest_binary(
+        operation_path
+            .to_str()
+            .ok_or("operation binary path is not valid UTF-8")?,
+    )?;
     debug!(
         "Loaded operation binary: {} bytes from {}",
         operation_code.len(),
@@ -12379,7 +12457,9 @@ fn execute_convert(
     let guest_mem = create_guest_memory(guest_mem_size)?;
     debug!("Allocated {guest_mem_size} bytes of guest memory");
 
-    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let region = guest_mem
+        .find_region(GuestAddress(0))
+        .expect("guest memory has a region at address 0");
     let host_addr = region.as_ptr() as u64;
 
     let mem_region = kvm_userspace_memory_region {
@@ -12727,13 +12807,13 @@ fn execute_convert(
     loop {
         match vcpu.run()? {
             VcpuExit::Hlt => {
-                vmm_stats.lock().unwrap().record_hlt();
+                vmm_stats.lock().expect("lock poisoned").record_hlt();
                 info!("Guest executed HLT");
                 debug!("Convert operation completed!");
                 break;
             }
             VcpuExit::IoOut(port, data) => {
-                vmm_stats.lock().unwrap().record_io_out();
+                vmm_stats.lock().expect("lock poisoned").record_io_out();
                 if port == SERIAL_PORT {
                     for &byte in data {
                         if let Some(msg) = serial_decoder.add_byte(byte) {
@@ -12760,7 +12840,7 @@ fn execute_convert(
                 }
             }
             VcpuExit::IoIn(port, data) => {
-                vmm_stats.lock().unwrap().record_io_in();
+                vmm_stats.lock().expect("lock poisoned").record_io_in();
                 if port == SERIAL_PORT {
                     for byte in data.iter_mut() {
                         *byte = serial_transmitter.next_byte().unwrap_or(0);
@@ -12778,12 +12858,12 @@ fn execute_convert(
                 }
             }
             VcpuExit::MmioRead(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_read();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_read();
                 let value = device_set.mmio_read(addr);
                 write_mmio_data(data, value);
             }
             VcpuExit::MmioWrite(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_write();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_write();
                 let value = read_mmio_data(data);
                 if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
                     if io_thread.is_none() && should_process {
@@ -12796,19 +12876,19 @@ fn execute_convert(
                 }
             }
             VcpuExit::Shutdown => {
-                vmm_stats.lock().unwrap().record_shutdown();
+                vmm_stats.lock().expect("lock poisoned").record_shutdown();
                 eprintln!("\n--- VM Shutdown (triple fault?) ---");
                 vm_error = Some("VM shutdown (triple fault)".to_string());
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
-                vmm_stats.lock().unwrap().record_fail_entry();
+                vmm_stats.lock().expect("lock poisoned").record_fail_entry();
                 eprintln!("VM Entry Failed! reason=0x{reason:x}, cpu={cpu}");
                 vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
                 break;
             }
             exit => {
-                vmm_stats.lock().unwrap().record_unknown();
+                vmm_stats.lock().expect("lock poisoned").record_unknown();
                 eprintln!("Unexpected VM exit: {exit:?}");
                 vm_error = Some(format!("unexpected VM exit: {exit:?}"));
                 break;
@@ -12821,7 +12901,7 @@ fn execute_convert(
     }
 
     if log::log_enabled!(log::Level::Debug) {
-        vmm_stats.lock().unwrap().display();
+        vmm_stats.lock().expect("lock poisoned").display();
     }
 
     if let Some(error) = vm_error {
@@ -13818,14 +13898,22 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     let core_path = get_binary_path("core.bin");
     let operation_path = get_binary_path("measure.bin");
 
-    let core_code = load_guest_binary(core_path.to_str().unwrap())?;
+    let core_code = load_guest_binary(
+        core_path
+            .to_str()
+            .ok_or("core binary path is not valid UTF-8")?,
+    )?;
     debug!(
         "Loaded core binary: {} bytes from {}",
         core_code.len(),
         core_path.display()
     );
 
-    let operation_code = load_guest_binary(operation_path.to_str().unwrap())?;
+    let operation_code = load_guest_binary(
+        operation_path
+            .to_str()
+            .ok_or("operation binary path is not valid UTF-8")?,
+    )?;
     debug!(
         "Loaded operation binary: {} bytes from {}",
         operation_code.len(),
@@ -13845,7 +13933,9 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
     debug!("Allocated {GUEST_MEM_SIZE} bytes of guest memory");
 
-    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let region = guest_mem
+        .find_region(GuestAddress(0))
+        .expect("guest memory has a region at address 0");
     let host_addr = region.as_ptr() as u64;
 
     let mem_region = kvm_userspace_memory_region {
@@ -14074,13 +14164,13 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     loop {
         match vcpu.run()? {
             VcpuExit::Hlt => {
-                vmm_stats.lock().unwrap().record_hlt();
+                vmm_stats.lock().expect("lock poisoned").record_hlt();
                 info!("Guest executed HLT");
                 debug!("Measure operation completed");
                 break;
             }
             VcpuExit::IoOut(port, data) => {
-                vmm_stats.lock().unwrap().record_io_out();
+                vmm_stats.lock().expect("lock poisoned").record_io_out();
                 if port == SERIAL_PORT {
                     for &byte in data {
                         if let Some(msg) = serial_decoder.add_byte(byte) {
@@ -14123,7 +14213,7 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                 }
             }
             VcpuExit::IoIn(port, data) => {
-                vmm_stats.lock().unwrap().record_io_in();
+                vmm_stats.lock().expect("lock poisoned").record_io_in();
                 if port == SERIAL_PORT {
                     for byte in data.iter_mut() {
                         *byte = serial_transmitter.next_byte().unwrap_or(0);
@@ -14141,12 +14231,12 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                 }
             }
             VcpuExit::MmioRead(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_read();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_read();
                 let value = device_set.mmio_read(addr);
                 write_mmio_data(data, value);
             }
             VcpuExit::MmioWrite(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_write();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_write();
                 let value = read_mmio_data(data);
                 if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
                     if io_thread.is_none() && should_process {
@@ -14159,19 +14249,19 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                 }
             }
             VcpuExit::Shutdown => {
-                vmm_stats.lock().unwrap().record_shutdown();
+                vmm_stats.lock().expect("lock poisoned").record_shutdown();
                 eprintln!("\n--- VM Shutdown (triple fault?) ---");
                 vm_error = Some("VM shutdown (triple fault)".to_string());
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
-                vmm_stats.lock().unwrap().record_fail_entry();
+                vmm_stats.lock().expect("lock poisoned").record_fail_entry();
                 eprintln!("VM Entry Failed! reason=0x{reason:x}, cpu={cpu}");
                 vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
                 break;
             }
             exit => {
-                vmm_stats.lock().unwrap().record_unknown();
+                vmm_stats.lock().expect("lock poisoned").record_unknown();
                 eprintln!("Unexpected VM exit: {exit:?}");
                 vm_error = Some(format!("unexpected VM exit: {exit:?}"));
                 break;
@@ -14184,7 +14274,7 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     }
 
     if log::log_enabled!(log::Level::Debug) {
-        vmm_stats.lock().unwrap().display();
+        vmm_stats.lock().expect("lock poisoned").display();
     }
 
     if let Some(error) = vm_error {
@@ -14274,14 +14364,22 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
     let core_path = get_binary_path("core.bin");
     let operation_path = get_binary_path("map.bin");
 
-    let core_code = load_guest_binary(core_path.to_str().unwrap())?;
+    let core_code = load_guest_binary(
+        core_path
+            .to_str()
+            .ok_or("core binary path is not valid UTF-8")?,
+    )?;
     debug!(
         "Loaded core binary: {} bytes from {}",
         core_code.len(),
         core_path.display()
     );
 
-    let operation_code = load_guest_binary(operation_path.to_str().unwrap())?;
+    let operation_code = load_guest_binary(
+        operation_path
+            .to_str()
+            .ok_or("operation binary path is not valid UTF-8")?,
+    )?;
     debug!(
         "Loaded operation binary: {} bytes from {}",
         operation_code.len(),
@@ -14301,7 +14399,9 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
     let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
     debug!("Allocated {GUEST_MEM_SIZE} bytes of guest memory");
 
-    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let region = guest_mem
+        .find_region(GuestAddress(0))
+        .expect("guest memory has a region at address 0");
     let host_addr = region.as_ptr() as u64;
 
     let mem_region = kvm_userspace_memory_region {
@@ -14448,12 +14548,12 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
     loop {
         match vcpu.run()? {
             VcpuExit::Hlt => {
-                vmm_stats.lock().unwrap().record_hlt();
+                vmm_stats.lock().expect("lock poisoned").record_hlt();
                 debug!("Map operation completed");
                 break;
             }
             VcpuExit::IoOut(port, data) => {
-                vmm_stats.lock().unwrap().record_io_out();
+                vmm_stats.lock().expect("lock poisoned").record_io_out();
                 if port == SERIAL_PORT {
                     for &byte in data {
                         if let Some(msg) = serial_decoder.add_byte(byte) {
@@ -14496,7 +14596,7 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
                 }
             }
             VcpuExit::IoIn(port, data) => {
-                vmm_stats.lock().unwrap().record_io_in();
+                vmm_stats.lock().expect("lock poisoned").record_io_in();
                 if port == SERIAL_PORT {
                     for byte in data.iter_mut() {
                         *byte = serial_transmitter.next_byte().unwrap_or(0);
@@ -14514,12 +14614,12 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
                 }
             }
             VcpuExit::MmioRead(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_read();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_read();
                 let value = device_set.mmio_read(addr);
                 write_mmio_data(data, value);
             }
             VcpuExit::MmioWrite(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_write();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_write();
                 let value = read_mmio_data(data);
                 if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
                     if io_thread.is_none() && should_process {
@@ -14532,19 +14632,19 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
                 }
             }
             VcpuExit::Shutdown => {
-                vmm_stats.lock().unwrap().record_shutdown();
+                vmm_stats.lock().expect("lock poisoned").record_shutdown();
                 eprintln!("\n--- VM Shutdown (triple fault?) ---");
                 vm_error = Some("VM shutdown (triple fault)".to_string());
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
-                vmm_stats.lock().unwrap().record_fail_entry();
+                vmm_stats.lock().expect("lock poisoned").record_fail_entry();
                 eprintln!("VM Entry Failed! reason=0x{reason:x}, cpu={cpu}");
                 vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
                 break;
             }
             exit => {
-                vmm_stats.lock().unwrap().record_unknown();
+                vmm_stats.lock().expect("lock poisoned").record_unknown();
                 eprintln!("Unexpected VM exit: {exit:?}");
                 vm_error = Some(format!("unexpected VM exit: {exit:?}"));
                 break;
@@ -14557,7 +14657,7 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
     }
 
     if log::log_enabled!(log::Level::Debug) {
-        vmm_stats.lock().unwrap().display();
+        vmm_stats.lock().expect("lock poisoned").display();
     }
 
     if let Some(error) = vm_error {
@@ -14869,14 +14969,22 @@ fn run_snapshot_list(args: &SnapshotArgs, verbose: bool) -> Result<(), Box<dyn s
     let core_path = get_binary_path("core.bin");
     let operation_path = get_binary_path("snapshot.bin");
 
-    let core_code = load_guest_binary(core_path.to_str().unwrap())?;
+    let core_code = load_guest_binary(
+        core_path
+            .to_str()
+            .ok_or("core binary path is not valid UTF-8")?,
+    )?;
     debug!(
         "Loaded core binary: {} bytes from {}",
         core_code.len(),
         core_path.display()
     );
 
-    let operation_code = load_guest_binary(operation_path.to_str().unwrap())?;
+    let operation_code = load_guest_binary(
+        operation_path
+            .to_str()
+            .ok_or("operation binary path is not valid UTF-8")?,
+    )?;
     debug!(
         "Loaded operation binary: {} bytes from {}",
         operation_code.len(),
@@ -14896,7 +15004,9 @@ fn run_snapshot_list(args: &SnapshotArgs, verbose: bool) -> Result<(), Box<dyn s
     let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
     debug!("Allocated {GUEST_MEM_SIZE} bytes of guest memory");
 
-    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let region = guest_mem
+        .find_region(GuestAddress(0))
+        .expect("guest memory has a region at address 0");
     let host_addr = region.as_ptr() as u64;
 
     let mem_region = kvm_userspace_memory_region {
@@ -15053,12 +15163,12 @@ fn run_snapshot_list(args: &SnapshotArgs, verbose: bool) -> Result<(), Box<dyn s
     loop {
         match vcpu.run()? {
             VcpuExit::Hlt => {
-                vmm_stats.lock().unwrap().record_hlt();
+                vmm_stats.lock().expect("lock poisoned").record_hlt();
                 debug!("Snapshot operation completed");
                 break;
             }
             VcpuExit::IoOut(port, data) => {
-                vmm_stats.lock().unwrap().record_io_out();
+                vmm_stats.lock().expect("lock poisoned").record_io_out();
                 if port == SERIAL_PORT {
                     for &byte in data {
                         if let Some(msg) = serial_decoder.add_byte(byte) {
@@ -15098,7 +15208,7 @@ fn run_snapshot_list(args: &SnapshotArgs, verbose: bool) -> Result<(), Box<dyn s
                 }
             }
             VcpuExit::IoIn(port, data) => {
-                vmm_stats.lock().unwrap().record_io_in();
+                vmm_stats.lock().expect("lock poisoned").record_io_in();
                 if port == SERIAL_PORT {
                     for byte in data.iter_mut() {
                         *byte = serial_transmitter.next_byte().unwrap_or(0);
@@ -15116,12 +15226,12 @@ fn run_snapshot_list(args: &SnapshotArgs, verbose: bool) -> Result<(), Box<dyn s
                 }
             }
             VcpuExit::MmioRead(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_read();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_read();
                 let value = device_set.mmio_read(addr);
                 write_mmio_data(data, value);
             }
             VcpuExit::MmioWrite(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_write();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_write();
                 let value = read_mmio_data(data);
                 if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
                     if io_thread.is_none() && should_process {
@@ -15134,19 +15244,19 @@ fn run_snapshot_list(args: &SnapshotArgs, verbose: bool) -> Result<(), Box<dyn s
                 }
             }
             VcpuExit::Shutdown => {
-                vmm_stats.lock().unwrap().record_shutdown();
+                vmm_stats.lock().expect("lock poisoned").record_shutdown();
                 eprintln!("\n--- VM Shutdown (triple fault?) ---");
                 vm_error = Some("VM shutdown (triple fault)".to_string());
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
-                vmm_stats.lock().unwrap().record_fail_entry();
+                vmm_stats.lock().expect("lock poisoned").record_fail_entry();
                 eprintln!("VM Entry Failed! reason=0x{reason:x}, cpu={cpu}");
                 vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
                 break;
             }
             exit => {
-                vmm_stats.lock().unwrap().record_unknown();
+                vmm_stats.lock().expect("lock poisoned").record_unknown();
                 eprintln!("Unexpected VM exit: {exit:?}");
                 vm_error = Some(format!("unexpected VM exit: {exit:?}"));
                 break;
@@ -15159,7 +15269,7 @@ fn run_snapshot_list(args: &SnapshotArgs, verbose: bool) -> Result<(), Box<dyn s
     }
 
     if log::log_enabled!(log::Level::Debug) {
-        vmm_stats.lock().unwrap().display();
+        vmm_stats.lock().expect("lock poisoned").display();
     }
 
     if let Some(error) = vm_error {
@@ -15353,14 +15463,24 @@ fn run_snapshot_mutating_guest(
     // --- Load guest binaries --------------------------------------------
     let core_path = get_binary_path("core.bin");
     let operation_path = get_binary_path("snapshot.bin");
-    let core_code = load_guest_binary(core_path.to_str().unwrap())?;
-    let operation_code = load_guest_binary(operation_path.to_str().unwrap())?;
+    let core_code = load_guest_binary(
+        core_path
+            .to_str()
+            .ok_or("core binary path is not valid UTF-8")?,
+    )?;
+    let operation_code = load_guest_binary(
+        operation_path
+            .to_str()
+            .ok_or("operation binary path is not valid UTF-8")?,
+    )?;
 
     // --- KVM / VM / guest memory setup ----------------------------------
     let kvm = Kvm::new()?;
     let vm = kvm.create_vm()?;
     let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
-    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let region = guest_mem
+        .find_region(GuestAddress(0))
+        .expect("guest memory has a region at address 0");
     let host_addr = region.as_ptr() as u64;
     let mem_region = kvm_userspace_memory_region {
         slot: 0,
@@ -15499,11 +15619,11 @@ fn run_snapshot_mutating_guest(
     loop {
         match vcpu.run()? {
             VcpuExit::Hlt => {
-                vmm_stats.lock().unwrap().record_hlt();
+                vmm_stats.lock().expect("lock poisoned").record_hlt();
                 break;
             }
             VcpuExit::IoOut(port, data) => {
-                vmm_stats.lock().unwrap().record_io_out();
+                vmm_stats.lock().expect("lock poisoned").record_io_out();
                 if port == SERIAL_PORT {
                     for &byte in data {
                         if let Some(msg) = serial_decoder.add_byte(byte) {
@@ -15530,7 +15650,7 @@ fn run_snapshot_mutating_guest(
                 }
             }
             VcpuExit::IoIn(port, data) => {
-                vmm_stats.lock().unwrap().record_io_in();
+                vmm_stats.lock().expect("lock poisoned").record_io_in();
                 if port == SERIAL_PORT {
                     for byte in data.iter_mut() {
                         *byte = serial_transmitter.next_byte().unwrap_or(0);
@@ -15548,12 +15668,12 @@ fn run_snapshot_mutating_guest(
                 }
             }
             VcpuExit::MmioRead(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_read();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_read();
                 let value = device_set.mmio_read(addr);
                 write_mmio_data(data, value);
             }
             VcpuExit::MmioWrite(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_write();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_write();
                 let value = read_mmio_data(data);
                 if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
                     if io_thread.is_none() && should_process {
@@ -15566,17 +15686,17 @@ fn run_snapshot_mutating_guest(
                 }
             }
             VcpuExit::Shutdown => {
-                vmm_stats.lock().unwrap().record_shutdown();
+                vmm_stats.lock().expect("lock poisoned").record_shutdown();
                 vm_error = Some("VM shutdown (triple fault)".to_string());
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
-                vmm_stats.lock().unwrap().record_fail_entry();
+                vmm_stats.lock().expect("lock poisoned").record_fail_entry();
                 vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
                 break;
             }
             exit => {
-                vmm_stats.lock().unwrap().record_unknown();
+                vmm_stats.lock().expect("lock poisoned").record_unknown();
                 vm_error = Some(format!("unexpected VM exit: {exit:?}"));
                 break;
             }
@@ -15587,7 +15707,7 @@ fn run_snapshot_mutating_guest(
         thread.stop();
     }
     if log::log_enabled!(log::Level::Debug) {
-        vmm_stats.lock().unwrap().display();
+        vmm_stats.lock().expect("lock poisoned").display();
     }
     if let Some(error) = vm_error {
         return Err(error.into());
@@ -16091,13 +16211,21 @@ fn run_create_nonraw(args: &CreateArgs, verbose: bool) -> Result<(), Box<dyn std
     // --- Load guest binaries --------------------------------------------
     let core_path = get_binary_path("core.bin");
     let operation_path = get_binary_path("create.bin");
-    let core_code = load_guest_binary(core_path.to_str().unwrap())?;
+    let core_code = load_guest_binary(
+        core_path
+            .to_str()
+            .ok_or("core binary path is not valid UTF-8")?,
+    )?;
     debug!(
         "Loaded core binary: {} bytes from {}",
         core_code.len(),
         core_path.display()
     );
-    let operation_code = load_guest_binary(operation_path.to_str().unwrap())?;
+    let operation_code = load_guest_binary(
+        operation_path
+            .to_str()
+            .ok_or("operation binary path is not valid UTF-8")?,
+    )?;
     debug!(
         "Loaded operation binary: {} bytes from {}",
         operation_code.len(),
@@ -16442,7 +16570,9 @@ fn run_create_guest(
     let guest_mem = create_guest_memory(GUEST_MEM_SIZE)?;
     debug!("Allocated {GUEST_MEM_SIZE} bytes of guest memory");
 
-    let region = guest_mem.find_region(GuestAddress(0)).unwrap();
+    let region = guest_mem
+        .find_region(GuestAddress(0))
+        .expect("guest memory has a region at address 0");
     let host_addr = region.as_ptr() as u64;
 
     let mem_region = kvm_userspace_memory_region {
@@ -16642,12 +16772,12 @@ fn run_create_guest(
     loop {
         match vcpu.run()? {
             VcpuExit::Hlt => {
-                vmm_stats.lock().unwrap().record_hlt();
+                vmm_stats.lock().expect("lock poisoned").record_hlt();
                 debug!("Create operation completed (HLT)");
                 break;
             }
             VcpuExit::IoOut(port, data) => {
-                vmm_stats.lock().unwrap().record_io_out();
+                vmm_stats.lock().expect("lock poisoned").record_io_out();
                 if port == SERIAL_PORT {
                     for &byte in data {
                         if let Some(msg) = serial_decoder.add_byte(byte) {
@@ -16676,7 +16806,7 @@ fn run_create_guest(
                 }
             }
             VcpuExit::IoIn(port, data) => {
-                vmm_stats.lock().unwrap().record_io_in();
+                vmm_stats.lock().expect("lock poisoned").record_io_in();
                 if port == SERIAL_PORT {
                     for byte in data.iter_mut() {
                         *byte = serial_transmitter.next_byte().unwrap_or(0);
@@ -16694,12 +16824,12 @@ fn run_create_guest(
                 }
             }
             VcpuExit::MmioRead(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_read();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_read();
                 let value = device_set.mmio_read(addr);
                 write_mmio_data(data, value);
             }
             VcpuExit::MmioWrite(addr, data) => {
-                vmm_stats.lock().unwrap().record_mmio_write();
+                vmm_stats.lock().expect("lock poisoned").record_mmio_write();
                 let value = read_mmio_data(data);
                 if let Some((device_index, should_process)) = device_set.mmio_write(addr, value) {
                     if io_thread.is_none() && should_process {
@@ -16712,17 +16842,17 @@ fn run_create_guest(
                 }
             }
             VcpuExit::Shutdown => {
-                vmm_stats.lock().unwrap().record_shutdown();
+                vmm_stats.lock().expect("lock poisoned").record_shutdown();
                 vm_error = Some("VM shutdown (triple fault)".to_string());
                 break;
             }
             VcpuExit::FailEntry(reason, cpu) => {
-                vmm_stats.lock().unwrap().record_fail_entry();
+                vmm_stats.lock().expect("lock poisoned").record_fail_entry();
                 vm_error = Some(format!("VM entry failed: reason=0x{reason:x}, cpu={cpu}"));
                 break;
             }
             exit => {
-                vmm_stats.lock().unwrap().record_unknown();
+                vmm_stats.lock().expect("lock poisoned").record_unknown();
                 vm_error = Some(format!("unexpected VM exit: {exit:?}"));
                 break;
             }
@@ -16734,7 +16864,7 @@ fn run_create_guest(
     }
 
     if log::log_enabled!(log::Level::Debug) {
-        vmm_stats.lock().unwrap().display();
+        vmm_stats.lock().expect("lock poisoned").display();
     }
 
     if let Some(error) = vm_error {

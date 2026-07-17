@@ -67,8 +67,6 @@ pub enum ResizeError {
     /// * `current_virtual_size` from the host disagrees with the
     ///   guest's parse of the existing header (race between host
     ///   pre-probe and guest read, or a host bug);
-    /// * a qcow2 file size that isn't a multiple of `cluster_size`
-    ///   (impossible for a sound image);
     /// * a qcow2 refcount-table entry the planner needs to update
     ///   is zero (a pre-pass / planner accounting bug, or a
     ///   pathological image);

@@ -13,3 +13,6 @@ qcow2  = { path = "../qcow2", default-features = false }
 [dev-dependencies]
 shared = { path = "../../shared" }
 qcow2  = { path = "../qcow2", default-features = false }
+
+[lints]
+workspace = true

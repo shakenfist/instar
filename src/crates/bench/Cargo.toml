@@ -13,3 +13,6 @@ publish = false
 # removed the temporary re-export, so src/operations/bench now imports
 # those types from the crate directly.
 [dependencies]
+
+[lints]
+workspace = true

@@ -19,3 +19,6 @@ luks = { path = "../../crates/luks", features = ["decrypt"] }
 panic = "abort"
 opt-level = "z"
 lto = true
+
+[lints]
+workspace = true

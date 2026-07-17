@@ -148,20 +148,23 @@ for prototype in prototypes/helloworld prototypes/helloworld2 \
 
     # Run clippy only on VMM crate (guest crates are no_std and don't support clippy)
     # Note: info uses "instar" as the package name, others use "vmm"
+    # Prototypes declare clippy::unwrap_used at warn (rust-unwrap-lint
+    # audit) but are archived proofs-of-concept: surface the warning
+    # locally, do not gate CI on it (-A overrides the blanket -D).
     echo "Running clippy on vmm..."
     if [ "$MODE" = "fix" ]; then
         if [ "$prototype" = "prototypes/info" ]; then
             run_in_docker "$prototype" cargo clippy --fix --allow-dirty --allow-staged --allow-no-vcs \
-                -p instar -- -D warnings || FAILED=1
+                -p instar -- -D warnings -A clippy::unwrap-used || FAILED=1
         else
             run_in_docker "$prototype" cargo clippy --fix --allow-dirty --allow-staged --allow-no-vcs \
-                -p vmm -- -D warnings || FAILED=1
+                -p vmm -- -D warnings -A clippy::unwrap-used || FAILED=1
         fi
     else
         if [ "$prototype" = "prototypes/info" ]; then
-            run_in_docker "$prototype" cargo clippy -p instar -- -D warnings || FAILED=1
+            run_in_docker "$prototype" cargo clippy -p instar -- -D warnings -A clippy::unwrap-used || FAILED=1
         else
-            run_in_docker "$prototype" cargo clippy -p vmm -- -D warnings || FAILED=1
+            run_in_docker "$prototype" cargo clippy -p vmm -- -D warnings -A clippy::unwrap-used || FAILED=1
         fi
     fi
 

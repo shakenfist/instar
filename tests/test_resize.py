@@ -1232,3 +1232,72 @@ class TestResizeLargeImages(TestResizeSmoke):
         approach could not handle."""
         info = self._grow('1T', '2T')
         self.assertEqual(info['virtual-size'], 2 * 1024 ** 4)
+
+
+class TestResizeQemuCreatedImages(TestResizeSmoke):
+    """Grow qcow2 images created by qemu-img, not instar (issue #373).
+
+    qemu-img truncates a fresh image at the exact end of its L1 table,
+    so its file size is usually NOT a multiple of cluster_size. The
+    resize planner used to refuse that shape with error 13
+    (HeaderMismatch); it must instead append new metadata at the next
+    cluster boundary, exactly as qemu's own allocator would. Every
+    other resize suite in this file builds its start image with
+    `instar create` (cluster-aligned by construction), which is why
+    this interop path went untested.
+    """
+
+    def _qemu(self, *cmd, timeout=60):
+        r = subprocess.run(['qemu-img', *[str(c) for c in cmd]],
+                           capture_output=True, text=True, timeout=timeout)
+        return r.stdout, r.stderr, r.returncode
+
+    def _grow_case(self, cluster_size, start, target, target_bytes):
+        with tempfile.TemporaryDirectory() as td:
+            img = Path(td) / 'q.qcow2'
+            twin = Path(td) / 'twin.qcow2'
+            _, err, rc = self._qemu(
+                'create', '-f', 'qcow2', '-o',
+                f'cluster_size={cluster_size}', img, start)
+            self.assertEqual(rc, 0, f'qemu-img create failed: {err}')
+            # The fixture must actually exercise the unaligned shape
+            # for at least the geometries qemu produces one for.
+            file_size = img.stat().st_size
+            _, err, rc = self._qemu(
+                'create', '-f', 'qcow2', '-o',
+                f'cluster_size={cluster_size}', twin, start)
+            self.assertEqual(rc, 0, f'twin create failed: {err}')
+
+            _, err, rc = self.run_instar_resize(img, target)
+            self.assertEqual(
+                rc, 0,
+                f'instar resize {start}->{target} cs={cluster_size} '
+                f'(file_size={file_size}, unaligned='
+                f'{file_size % cluster_size != 0}) failed: {err}')
+            _, err, rc = self._qemu('resize', '-f', 'qcow2', twin, target)
+            self.assertEqual(rc, 0, f'qemu-img resize failed: {err}')
+
+            # Both results parse to the target virtual size and are
+            # check-clean.
+            for path, tool in ((img, 'instar'), (twin, 'qemu-img')):
+                out, err, rc = self._qemu('info', '--output=json', path)
+                self.assertEqual(rc, 0, f'info on {tool} result: {err}')
+                self.assertEqual(json.loads(out)['virtual-size'],
+                                 target_bytes, f'{tool} virtual size')
+                _, err, rc = self._qemu('check', path)
+                self.assertEqual(rc, 0,
+                                 f'{tool} result not check-clean: {err}')
+
+    def test_grow_qemu_created_matrix_issue_373(self):
+        """The issue's failing matrix: cluster sizes 512..1M, three
+        grow shapes each. All previously failed with error 13 except
+        the accidentally-aligned cs=512 legs."""
+        mib = 1024 * 1024
+        for cs in (512, 4096, 65536, 1048576):
+            for start, target, target_bytes in (
+                    ('4M', '8M', 8 * mib),
+                    ('1M', '64M', 64 * mib),
+                    ('64M', '256M', 256 * mib)):
+                with self.subTest(cluster_size=cs, start=start,
+                                  target=target):
+                    self._grow_case(cs, start, target, target_bytes)

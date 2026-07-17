@@ -20,3 +20,6 @@ argon2 = { version = "0.5", default-features = false }
 panic = "abort"
 opt-level = "z"
 lto = true
+
+[lints]
+workspace = true

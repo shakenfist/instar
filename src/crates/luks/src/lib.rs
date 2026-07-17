@@ -884,13 +884,15 @@ use pbkdf2::pbkdf2;
 pub fn aes_xts_decrypt(buf: &mut [u8], key: &[u8], start_sector: u64) {
     let half = key.len() / 2;
     if half == 16 {
-        let c1 = Aes128::new(<&Array<u8, _>>::try_from(&key[..16]).unwrap());
-        let c2 = Aes128::new(<&Array<u8, _>>::try_from(&key[16..32]).unwrap());
+        let c1 = Aes128::new(<&Array<u8, _>>::try_from(&key[..16]).expect("slice length is fixed"));
+        let c2 =
+            Aes128::new(<&Array<u8, _>>::try_from(&key[16..32]).expect("slice length is fixed"));
         let xts = xts_mode::Xts128::<Aes128>::new(c1, c2);
         xts.decrypt_area(buf, 512, start_sector as u128, xts_mode::get_tweak_default);
     } else if half == 32 {
-        let c1 = Aes256::new(<&Array<u8, _>>::try_from(&key[..32]).unwrap());
-        let c2 = Aes256::new(<&Array<u8, _>>::try_from(&key[32..64]).unwrap());
+        let c1 = Aes256::new(<&Array<u8, _>>::try_from(&key[..32]).expect("slice length is fixed"));
+        let c2 =
+            Aes256::new(<&Array<u8, _>>::try_from(&key[32..64]).expect("slice length is fixed"));
         let xts = xts_mode::Xts128::<Aes256>::new(c1, c2);
         xts.decrypt_area(buf, 512, start_sector as u128, xts_mode::get_tweak_default);
     }
@@ -905,13 +907,15 @@ pub fn aes_xts_decrypt(buf: &mut [u8], key: &[u8], start_sector: u64) {
 pub fn aes_xts_encrypt(buf: &mut [u8], key: &[u8], start_sector: u64) {
     let half = key.len() / 2;
     if half == 16 {
-        let c1 = Aes128::new(<&Array<u8, _>>::try_from(&key[..16]).unwrap());
-        let c2 = Aes128::new(<&Array<u8, _>>::try_from(&key[16..32]).unwrap());
+        let c1 = Aes128::new(<&Array<u8, _>>::try_from(&key[..16]).expect("slice length is fixed"));
+        let c2 =
+            Aes128::new(<&Array<u8, _>>::try_from(&key[16..32]).expect("slice length is fixed"));
         let xts = xts_mode::Xts128::<Aes128>::new(c1, c2);
         xts.encrypt_area(buf, 512, start_sector as u128, xts_mode::get_tweak_default);
     } else if half == 32 {
-        let c1 = Aes256::new(<&Array<u8, _>>::try_from(&key[..32]).unwrap());
-        let c2 = Aes256::new(<&Array<u8, _>>::try_from(&key[32..64]).unwrap());
+        let c1 = Aes256::new(<&Array<u8, _>>::try_from(&key[..32]).expect("slice length is fixed"));
+        let c2 =
+            Aes256::new(<&Array<u8, _>>::try_from(&key[32..64]).expect("slice length is fixed"));
         let xts = xts_mode::Xts128::<Aes256>::new(c1, c2);
         xts.encrypt_area(buf, 512, start_sector as u128, xts_mode::get_tweak_default);
     }

@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`instar resize` now grows qemu-img-created qcow2 images
+  (issue #373).** qemu-img truncates a fresh image at the exact end
+  of its L1 table, so a valid image's file size is usually not a
+  multiple of its cluster size; the grow planner refused that shape
+  with "guest reported error 13" on virtually every qemu-created
+  image at cluster sizes >= 4096 (and on cs=512 geometries whose L1
+  byte length is not a multiple of 512), while qemu-img resize
+  succeeded. Appended metadata regions now start at the next cluster
+  boundary — where qemu's own allocator places them — and header-only
+  grows leave the file size untouched. Covered by new planner unit
+  tests and a qemu-created-image integration matrix
+  (`TestResizeQemuCreatedImages`).
+
 - **VHD footer CHS now matches qemu's upward-search geometry
   (issue #413).** `build_footer` recomputed the footer CHS by
   re-flooring `current_size` through `calculate_geometry`, but qemu

@@ -15,3 +15,6 @@ snapshot = { path = "../snapshot" }
 shared = { path = "../../shared" }
 qcow2  = { path = "../qcow2", default-features = false }
 snapshot = { path = "../snapshot" }
+
+[lints]
+workspace = true
