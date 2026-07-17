@@ -185,7 +185,7 @@ tracked manner:
    majority of real DMGs and the guest already links a
    no_std inflate for qcow2/vmdk. bzip2 (UDBZ) and lzfse
    (ULFO) would each need a new no_std decompressor inside
-   the 384KB guest binary cap. Proposal: v1 = zlib +
+   the 768KB guest binary cap. Proposal: v1 = zlib +
    uncompressed + zero/ignore chunk types, with typed
    refusals naming the unsupported codec for UDBZ/ULFO, and
    codec expansion recorded as future work.
@@ -247,9 +247,10 @@ fuzzing against qemu-img (per Open question 6).
 
 Per-phase constraints that apply throughout:
 
-* Guest binaries must stay under the 384KB per-operation
-  cap (`make check-binary-sizes`); DMG's inflate reuse and
-  any new decompressor need size budgeting up front.
+* Guest binaries must stay under the 768KB per-operation
+  cap (`make check-binary-sizes`; convert currently sits at
+  ~303KB); DMG's inflate reuse and any new decompressor
+  need size budgeting up front.
 * Format parsers are `no_std` and panic-free; all offsets
   and lengths from untrusted headers are bounds-checked
   before use (the existing qcow2/vmdk crates are the
@@ -393,7 +394,7 @@ detailed enough for it to succeed.
 as if briefing a colleague who has never seen the
 codebase. Include: what to change, which files to touch,
 what patterns to follow, and any non-obvious constraints
-(memory layout, the 384KB guest binary cap, the
+(memory layout, the 768KB guest binary cap, the
 no-`std` requirement of the format crates, the call
 table boundary). The better the brief, the lower the
 effort level needed and the lighter the model that can
@@ -420,7 +421,7 @@ should verify:
 - [ ] No unrelated files were modified.
 - [ ] `make instar` builds and `make lint` is clean.
 - [ ] Guest binaries pass `make check-binary-sizes`
-      (384KB limit per operation).
+      (768KB limit per operation).
 - [ ] `make test-rust` and the relevant
       `make test-integration` targets pass.
 - [ ] `pre-commit run --all-files` passes.
@@ -438,7 +439,7 @@ We will know when this plan has been successfully implemented
 because the following statements will be true:
 
 * `make instar` builds and `make lint` is clean.
-* Guest binaries pass `make check-binary-sizes` (384KB limit).
+* Guest binaries pass `make check-binary-sizes` (768KB limit).
 * All Rust unit tests pass (`make test-rust`).
 * All Python integration tests pass (`make test-integration`).
 * `pre-commit run --all-files` passes.
