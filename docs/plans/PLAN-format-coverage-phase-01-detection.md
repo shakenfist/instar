@@ -514,6 +514,56 @@ instead 5a asserts iso's raw pass-through explicitly and
 quirks.md documents the info-says-iso / consumers-read-raw
 asymmetry as the existing ISO quirk's flip side.
 
+## Findings: step 3a — guest info wiring (2026-07-17)
+
+* **The guest cannot see the true file length**, only
+  `capacity × sector_size` with the virtio capacity rounded
+  up (default sector size 65536), and past-EOF reads
+  zero-fill. The planned "pass device length to the koly
+  window scan" therefore fails — the window lands in zero
+  padding. Fixed-VHD footer detection only works by luck of
+  sector-aligned VHD data areas. The implemented fix:
+  `probe_dmg_trailer` reads the final two sectors and scans
+  for the **last** koly occurrence; since the koly block is
+  the file's true final 512 bytes, `last_koly + 512`
+  recovers the real file length, and the shared helpers then
+  run qemu's exact window over an exact-length slice.
+* **Guest-side parity is complete** (format name + virtual
+  size correct for all four formats; parallels byte-exact vs
+  live qemu-img incl. child node), but three **host-emitter
+  gaps** produce residual baseline diffs, all pre-existing
+  behaviours first exposed by these images:
+  1. child `file length` is 512-rounded only for
+     unstructured formats; dmg (11747→11776) and cloop
+     (1690→2048) are the first structured formats with
+     unaligned file lengths (qemu's file protocol always
+     rounds);
+  2. the human-size formatter renders 1032192 as `1008 KiB`
+     where qemu says `0.984 MiB` (sub-MiB values that are
+     KiB-round but not MiB-round);
+  3. minor JSON empty-collection / dirty-flag emission
+     quirks on the generic path (also present for qed —
+     needs confirmation whether any *baselined* image is
+     affected).
+  These are step 3c (below): host-side, in
+  `print_info_result` / `print_info_result_json`
+  (`src/vmm/src/main.rs:1135`, `:1446`); existing baselined
+  images are unaffected by (1) since their files are
+  512-aligned, but (2) and any (3) fix must be validated
+  against the full existing baseline suite.
+* The info op's inline parsers carry `#[cfg(test)]` tests
+  that document behaviour but are excluded from
+  `make test-rust` (no_std/no_main ops are not
+  unit-testable; same as the pre-existing VDI/QED parsers).
+  Authoritative test coverage for the new formats lives in
+  the shared `format_detection` tests and the integration
+  suite.
+* Adversarial DMG behaviour: truncated-koly → dmg/0 B
+  (matches qemu), sectorcount-negative → unknown (instar's
+  analogue of qemu's refusal), sectorcount-huge → dmg/128
+  PiB (matches qemu), no-chunk-table → dmg/4 MiB (the
+  documented trailer-only divergence; qemu open-fails).
+
 ## Step-level guidance
 
 | Step | Effort | Model | Isolation | Brief for sub-agent |
@@ -522,6 +572,7 @@ asymmetry as the existing ISO quirk's flip side.
 | 2a | medium | sonnet | none | Shared detection layer. In `src/shared/src/lib.rs:1526` add `Parallels = 13, Bochs = 14, Cloop = 15, Dmg = 16` to `ImageFormat` (+ `from_u32` `:1562`, `name()` `:1581` returning "parallels"/"bochs"/"cloop"/"dmg"). In `src/shared/src/format_detection.rs`: add the magic constants and the three header checks per the Detection rules section above (exact offsets/guards there), inserted after the LUKS check; add a `no_std` DMG trailer helper beside `detect_vhd_footer` (`:156`) implementing the koly window scan ([len−1023, len−512]) and a SectorCount accessor (BE u64 at koly+0x1ec, reject top bit). Extend the in-module tests (`:192-225`): positive detection from real fixture header bytes (hexdumps in this plan's Situation section; fixtures under `instar-testdata/downloaded/qemu-iotests/`), wrong-version negatives (parallels version≠2, bochs version 0x30000), truncation negatives (parallels 63 bytes, bochs 511, cloop 86), koly-at-each-window-edge positives and a koly-outside-window negative. Extend `src/fuzz/fuzz_targets/fuzz_format_detect.rs` to call the new helper. Fix any exhaustive `match ImageFormat` arms the compiler surfaces across the 10 guest ops and host — new variants must land in the same arm as `Vdi`/`Qed` (detect-only), never in a read/write arm. `make instar`, `make lint`, `make test-rust`, `make fuzz-build` must pass. |
 | 3a | high | opus | none | Guest info op wiring in `src/operations/info/src/main.rs`. Add the DMG trailer probe after the VHD-footer fallback (`:154-164`): when the format is still Raw, read the input tail covering the final 1024 bytes (two sectors at 512-byte sector size; one suffices at ≥1024 — reuse the `footer_buffer` pattern, mind `input_capacity` and non-sector-aligned lengths) and call the shared helper. Add dispatch arms (pattern: VDI `:352`, QED `:409`) and inline parsers (pattern: `parse_vdi_header` `:897`, `parse_qed_header` `:974`) for all four formats per the Info parsing section above (exact fields, endianness, masking, and cloop bounds are specified there — do not re-derive). Add the four `format_to_str` entries (`:490`). The new formats bypass the raw partition-table gate (`:200-238`) automatically by being non-Raw — verify, don't reimplement. Ensure `--unsafe-quirks` leaves all four detections active (only ISO is quirk-gated). Unit-test the parsers with in-file `#[cfg(test)]` byte-array fixtures per existing style. `make instar && make check-binary-sizes && make test-rust` clean; then hand-verify `instar info` (human + json) against `qemu-img info` for the four staged fixtures. |
 | 3b | high | opus | worktree | Consumer refusal gate, contingent on 1a's findings (management session reviews 1a before dispatching this step). In the host: after `discover_backing_chain` returns for convert/compare/dd (`run_convert`, `run_compare`, `run_dd` `main.rs:13629`), refuse when the chain head's format string is detected-but-unreadable (maps to `chain::ImageFormat::Unknown` but is not `raw`/`unknown`/`iso` — iso keeps its raw pass-through per the post-1a management decision): typed error `"{op}: input format '{fmt}' is detected but not supported for reading (detection and info only)"`, non-zero exit, matching the existing refusal message style (`main.rs:6648`, `:5967`, `:6217`). Decide with the 1a evidence whether the check belongs once in `discover_backing_chain` or per-op; backing files in mid-chain positions get the same refusal. Update any tests 1a identified as depending on silent-raw behaviour only after management sign-off. Add integration tests: convert/compare/dd on `qed-simple`, `vdi-simple`, and each new-format fixture must exit non-zero with the typed message. |
+| 3c | high | opus | none | **Added post-3a.** Host info-emitter parity fixes in `src/vmm/src/main.rs` (`print_info_result` `:1135`, `print_info_result_json` `:1446`), per the step-3a findings: (1) round the child-node `file length` (human) and child `virtual-size` (json) up to 512 for structured formats too — qemu's file protocol always rounds; existing baselined images are 512-aligned so their output must be byte-unchanged; (2) fix the human size formatter for sub-MiB values that are KiB-round but not MiB-round (1032192 must render `0.984 MiB` like qemu, not `1008 KiB`) — replicate qemu's unit-selection/precision rules exactly (read qemu's size_to_str; check pre/post-8.0 baselines for format stability) and verify no existing baselined value changes rendering; (3) investigate the JSON empty-collection/dirty-flag quirks the 3a report flagged — determine whether any baselined image is affected; fix only what blocks byte-parity for the five new images, and record the rest as observations. Validation: full `test_info_safe` run against existing profiles (zero regressions) plus manual diff of instar-vs-raw-baseline for parallels-v1/v2, bochs-growing, cloop-simple, dmg-simple at 6.0.0 and 10.2.0, human+json — all must be byte-exact. |
 | 4a | high | opus | none | DMG fixture generator, in the **instar-testdata** repo (sibling checkout; scripts live there per its ADVERSARIAL.md convention — generators are not published in the instar repo). Python, following `generate-baselines.py` style (single quotes, 120-col). Emit: (1) `dmg-simple.dmg` — minimal valid UDIF: small data fork of zlib (UDZO) chunks or zero (UDZE) chunks, XML plist with base64 mish BLKX block (204-byte block header, 40-byte chunk entries, terminator chunk), koly trailer (BE fields; DataForkOffset/XMLOffset/XMLLength/SectorCount populated; XML strictly before the koly offset) — must satisfy `qemu-img info` on both qemu 6.0.0 and 10.2.0 static binaries from `qemu-img-binaries/x86_64/`; (2) adversarial variants: truncated koly, SectorCount with top bit set, huge SectorCount, valid koly but zero rsrc+XML lengths (qemu open fails, so these carry `skip_qemu_img: true` in the manifest). Deterministic output (fixed timestamps/UUIDs) so sha256s are stable. Do NOT commit to instar-testdata main — leave the working tree for operator review (protected branch; see repo conventions). |
 | 4b | medium | sonnet | none | Manifest + baselines. Add `tests/manifest.json` entries: `parallels-v1`, `parallels-v2` (`downloaded/qemu-iotests/parallels-v{1,2}`), `bochs-growing` (`downloaded/qemu-iotests/empty.bochs`), `cloop-simple` (`downloaded/qemu-iotests/simple-pattern.cloop`), `dmg-simple` plus 4a's adversarial set — real sha256s, `safety` safe/malformed as appropriate, `run_in_ci: true` for the safe ones, no `skip_qemu_img` on qemu-readable images, style-matched to existing entries. First spot-check driver presence: run the 6.0.0 and 10.2.0 static qemu-img binaries' `info` on each safe fixture. Then `generate-baselines.py --command info` (human and json paths per its `COMMANDS` config) followed by `detect-profiles.py`; verify new profiles are few (probes are version-stable). Leave instar-testdata changes uncommitted for operator review. In-repo manifest change commits normally. |
 | 5a | medium | sonnet | none | Integration tests. Confirm `tests/test_info_safe.py` auto-picks the new safe images (scenario generation is manifest-driven) and passes against the new baselines. Add refusal tests (may live with 3b's if that step landed first — do not duplicate): resize, measure, and map on each new-format fixture exit non-zero with their existing unsupported-format messages (`main.rs:6648`, `:11396`, map guest `ERROR_INVALID_SOURCE`). Add adversarial coverage for the malformed DMG fixtures via the `run_adversarial` harness (`tests/base.py:1066` — no hang, no crash, bounded memory; info on them may succeed or fail). Run the info-related suites and `test_oslo_crossval` locally; oslo scenarios for the new images must skip (oslo returns None), not fail. |

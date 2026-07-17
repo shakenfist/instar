@@ -11,8 +11,10 @@ use core::panic::PanicInfo;
 
 use shared::{
     format_detection::{
-        detect_format_from_header, detect_iso_at_offset, detect_vhd_footer, ISO_MAGIC_BYTE_OFFSET,
-        VDI_SIGNATURE_OFFSET, VHD_COOKIE,
+        detect_dmg_koly_offset, detect_format_from_header, detect_iso_at_offset, detect_vhd_footer,
+        dmg_sector_count, BOCHS_VERSION_2, BOCHS_VERSION_OFFSET, DMG_KOLY_MAGIC,
+        DMG_KOLY_TRAILER_LEN, ISO_MAGIC_BYTE_OFFSET, PARALLELS_MAGIC_V1, VDI_SIGNATURE_OFFSET,
+        VHD_COOKIE,
     },
     validate_call_table, CallTable, ImageFormat, InfoConfig, InfoResult, LuksInfo, Qcow2Info,
     VdiInfo, VmdkInfo, ARGON2_MEM_BASE, CALL_TABLE_ADDR, MAX_SECTOR_SIZE, SCRATCH_MEM_BASE,
@@ -73,6 +75,26 @@ const QED_HEADER_SIZE_OFFSET: usize = 12; // Header size in bytes (u32)
 const QED_IMAGE_SIZE_OFFSET: usize = 48; // Virtual size in bytes (u64)
 const QED_BACKING_FILENAME_OFFSET_OFFSET: usize = 56; // Backing filename offset (u32)
 const QED_BACKING_FILENAME_SIZE_OFFSET: usize = 60; // Backing filename size (u32)
+
+// Parallels format offsets (detect-and-info only; parse mirrors
+// qemu block/parallels.c). The 16-byte magic and LE u32 version @16
+// are validated by the shared detector; here we only read the size.
+const PARALLELS_NB_SECTORS_OFFSET: usize = 36; // LE u64 nb_sectors (unaligned)
+
+// Bochs format offsets (detect-and-info only; parse mirrors
+// qemu block/bochs.c). BOCHS_VERSION_OFFSET (@64) is shared.
+const BOCHS_DISK_SIZE_V1_OFFSET: usize = 84; // LE u64 disk size (HEADER_V1)
+const BOCHS_DISK_SIZE_V2_OFFSET: usize = 88; // LE u64 disk size (HEADER_VERSION)
+
+// cloop format offsets and bounds (detect-and-info only; parse and
+// open-time bounds mirror qemu block/cloop.c).
+const CLOOP_BLOCK_SIZE_OFFSET: usize = 128; // BE u32 block_size
+const CLOOP_N_BLOCKS_OFFSET: usize = 132; // BE u32 n_blocks
+const CLOOP_MAX_BLOCK_SIZE: u32 = 64 * 1024 * 1024; // qemu MAX_BLOCK_SIZE (64 MiB)
+const CLOOP_MAX_N_BLOCKS: u32 = (u32::MAX - 1) / 8; // qemu offsets-array bound
+
+// DMG SectorCount is BE u64 at koly+0x1ec; ×512 gives virtual size.
+const DMG_SECTOR_SIZE: u64 = 512;
 
 // Note: ISO_MAGIC_BYTE_OFFSET and ISO_MAGIC are in shared::format_detection
 
@@ -157,6 +179,24 @@ pub unsafe extern "C" fn _start() -> u64 {
             input_sector_size,
         ) {
             format = detect_vhd_footer(&footer_buffer);
+        }
+    }
+
+    // If still no format detected, try DMG koly-trailer detection.
+    //
+    // Unlike ISO, DMG detection is NOT quirk-gated: the koly trailer is
+    // structural content (same stance as ISO's content probe, but always
+    // on). Surfacing "this raw-looking file is actually a DMG container"
+    // is exactly the safety fact instar exists to report, so it runs even
+    // under --unsafe-quirks. See `probe_dmg_trailer` for the file-length
+    // recovery that makes this work under any sector size.
+    let mut dmg_sector_count_val: Option<u64> = None;
+    if format == ImageFormat::Raw && input_capacity > 0 {
+        (call_table.verbose_print)(b"info: checking DMG koly trailer\n\0".as_ptr());
+        if let Some(sc) = probe_dmg_trailer(call_table, input_capacity, input_sector_size) {
+            format = ImageFormat::Dmg;
+            dmg_sector_count_val = Some(sc);
+            (call_table.verbose_print)(b"info: detected DMG koly trailer\n\0".as_ptr());
         }
     }
 
@@ -413,6 +453,74 @@ pub unsafe extern "C" fn _start() -> u64 {
         ImageFormat::Qed => {
             if detailed {
                 parse_qed_header(&buffer, &mut result);
+            }
+
+            (call_table.send_info_result)(
+                format_str,
+                result.version,
+                result.virtual_size,
+                result.actual_size,
+                result.cluster_size,
+                result.flags,
+                b"\0".as_ptr(),
+                b"\0".as_ptr(),
+            );
+        }
+        ImageFormat::Parallels => {
+            if detailed {
+                parse_parallels_header(&buffer, &mut result);
+            }
+
+            (call_table.send_info_result)(
+                format_str,
+                result.version,
+                result.virtual_size,
+                result.actual_size,
+                result.cluster_size,
+                result.flags,
+                b"\0".as_ptr(),
+                b"\0".as_ptr(),
+            );
+        }
+        ImageFormat::Bochs => {
+            if detailed {
+                parse_bochs_header(&buffer, &mut result);
+            }
+
+            (call_table.send_info_result)(
+                format_str,
+                result.version,
+                result.virtual_size,
+                result.actual_size,
+                result.cluster_size,
+                result.flags,
+                b"\0".as_ptr(),
+                b"\0".as_ptr(),
+            );
+        }
+        ImageFormat::Cloop => {
+            if detailed {
+                parse_cloop_header(&buffer, &mut result);
+            }
+
+            (call_table.send_info_result)(
+                format_str,
+                result.version,
+                result.virtual_size,
+                result.actual_size,
+                result.cluster_size,
+                result.flags,
+                b"\0".as_ptr(),
+                b"\0".as_ptr(),
+            );
+        }
+        ImageFormat::Dmg => {
+            // SectorCount was validated during the koly-trailer probe
+            // above; virtual size = SectorCount × 512 (checked).
+            if detailed {
+                if let Some(sc) = dmg_sector_count_val {
+                    result.virtual_size = sc.checked_mul(DMG_SECTOR_SIZE).unwrap_or(0);
+                }
             }
 
             (call_table.send_info_result)(
@@ -1024,6 +1132,210 @@ fn parse_qed_header(buffer: &[u8], result: &mut InfoResult) {
     }
 }
 
+/// Parse a Parallels header and populate the virtual size.
+///
+/// Mirrors qemu block/parallels.c: `nb_sectors` is a LE u64 at offset
+/// 36 (unaligned) and the virtual size is `nb_sectors × 512`. The
+/// legacy `WithoutFreeSpace` magic stored `nb_sectors` in a 32-bit
+/// field, so qemu masks it to the low 32 bits; the extended
+/// `WithouFreSpacExt` magic uses the full 64-bit value. Detection has
+/// already confirmed one of those two magics and version 2.
+fn parse_parallels_header(buffer: &[u8], result: &mut InfoResult) {
+    if buffer.len() < PARALLELS_NB_SECTORS_OFFSET + 8 {
+        return;
+    }
+
+    let mut nb_sectors = u64::from_le_bytes([
+        buffer[PARALLELS_NB_SECTORS_OFFSET],
+        buffer[PARALLELS_NB_SECTORS_OFFSET + 1],
+        buffer[PARALLELS_NB_SECTORS_OFFSET + 2],
+        buffer[PARALLELS_NB_SECTORS_OFFSET + 3],
+        buffer[PARALLELS_NB_SECTORS_OFFSET + 4],
+        buffer[PARALLELS_NB_SECTORS_OFFSET + 5],
+        buffer[PARALLELS_NB_SECTORS_OFFSET + 6],
+        buffer[PARALLELS_NB_SECTORS_OFFSET + 7],
+    ]);
+
+    // Legacy WithoutFreeSpace: nb_sectors is only 32 bits wide.
+    if buffer[0..16] == PARALLELS_MAGIC_V1 {
+        nb_sectors &= 0xffff_ffff;
+    }
+
+    result.virtual_size = nb_sectors.saturating_mul(512);
+}
+
+/// Parse a Bochs growing-disk header and populate the virtual size.
+///
+/// Mirrors qemu block/bochs.c: the on-disk byte size is a LE u64 at
+/// offset 88 for HEADER_VERSION (0x00020000) and at offset 84 for the
+/// older HEADER_V1 (0x00010000). qemu computes `total_sectors =
+/// disk_size / 512`, so the reported virtual size is
+/// `(disk_size / 512) × 512` (truncating). Detection has already
+/// confirmed the magics and a recognised version.
+fn parse_bochs_header(buffer: &[u8], result: &mut InfoResult) {
+    if buffer.len() < BOCHS_DISK_SIZE_V2_OFFSET + 8 {
+        return;
+    }
+
+    let version = u32::from_le_bytes([
+        buffer[BOCHS_VERSION_OFFSET],
+        buffer[BOCHS_VERSION_OFFSET + 1],
+        buffer[BOCHS_VERSION_OFFSET + 2],
+        buffer[BOCHS_VERSION_OFFSET + 3],
+    ]);
+
+    let disk_offset = if version == BOCHS_VERSION_2 {
+        BOCHS_DISK_SIZE_V2_OFFSET
+    } else {
+        BOCHS_DISK_SIZE_V1_OFFSET
+    };
+
+    let disk_size = u64::from_le_bytes([
+        buffer[disk_offset],
+        buffer[disk_offset + 1],
+        buffer[disk_offset + 2],
+        buffer[disk_offset + 3],
+        buffer[disk_offset + 4],
+        buffer[disk_offset + 5],
+        buffer[disk_offset + 6],
+        buffer[disk_offset + 7],
+    ]);
+
+    // Truncate to whole 512-byte sectors, matching qemu's total_sectors.
+    result.virtual_size = (disk_size / 512) * 512;
+}
+
+/// Parse a cloop header and populate the virtual size.
+///
+/// Mirrors qemu block/cloop.c: `block_size` is a BE u32 at offset 128
+/// and `n_blocks` a BE u32 at offset 132; virtual size is
+/// `n_blocks × block_size`. qemu's open-time sanity checks are applied
+/// here as parse-failure conditions (leaving virtual size 0, the same
+/// outcome as any other detect-only parse failure): `block_size` must
+/// be non-zero, a multiple of 512, and <= 64 MiB, and `n_blocks` must
+/// not exceed `(u32::MAX - 1) / 8`.
+fn parse_cloop_header(buffer: &[u8], result: &mut InfoResult) {
+    if buffer.len() < CLOOP_N_BLOCKS_OFFSET + 4 {
+        return;
+    }
+
+    let block_size = u32::from_be_bytes([
+        buffer[CLOOP_BLOCK_SIZE_OFFSET],
+        buffer[CLOOP_BLOCK_SIZE_OFFSET + 1],
+        buffer[CLOOP_BLOCK_SIZE_OFFSET + 2],
+        buffer[CLOOP_BLOCK_SIZE_OFFSET + 3],
+    ]);
+    let n_blocks = u32::from_be_bytes([
+        buffer[CLOOP_N_BLOCKS_OFFSET],
+        buffer[CLOOP_N_BLOCKS_OFFSET + 1],
+        buffer[CLOOP_N_BLOCKS_OFFSET + 2],
+        buffer[CLOOP_N_BLOCKS_OFFSET + 3],
+    ]);
+
+    if block_size == 0 || block_size % 512 != 0 || block_size > CLOOP_MAX_BLOCK_SIZE {
+        return;
+    }
+    if n_blocks > CLOOP_MAX_N_BLOCKS {
+        return;
+    }
+
+    result.virtual_size = (n_blocks as u64)
+        .checked_mul(block_size as u64)
+        .unwrap_or(0);
+}
+
+/// Probe the input's tail for a DMG koly trailer, returning its
+/// SectorCount if a valid trailer is found.
+///
+/// # Why this is not a simple "read the last sector" probe
+///
+/// A DMG koly trailer is the file's final 512 bytes, and qemu locates
+/// it by scanning the file's last 1024 bytes (`dmg_find_koly_offset`).
+/// The obvious mirror — read the last device sector and hand it plus the
+/// device capacity to the shared helpers — does not work here, because
+/// the guest never sees the true file length. The host builds the virtio
+/// device with `capacity = div_ceil(file_size, sector_size)` (see
+/// `VirtioBlockDevice::new`), so `input_capacity * input_sector_size`
+/// only gives `round_up(file_size, sector_size)`. With the default 64 KiB
+/// sector size that padding can be tens of kilobytes — far more than
+/// qemu's 511-byte trailing-padding tolerance — and reads past EOF
+/// zero-fill (`BackingStore::read_at`), so the real koly ends up buried
+/// mid-buffer with a large zero tail after it, nowhere near the
+/// capacity-derived window. (Fixed-VHD footer detection sidesteps this
+/// only because a VHD's data area is sector-aligned, so its footer
+/// happens to start at a sector boundary; a DMG's koly is not aligned.)
+///
+/// # How the real file length is recovered
+///
+/// Because the koly is the file's final 512 bytes and everything after
+/// it in the device buffer is zero-fill, the *last* `koly` magic in the
+/// read tail marks the real trailer, and therefore the real file length
+/// is `last_koly_offset + 512`. Once that length is known, the tail is
+/// sliced to end exactly at it so the shared helper's
+/// `buffer_base = len - buffer.len()` maps correctly, reproducing qemu's
+/// `[len-1023, len-512]` window semantics and its SectorCount validation
+/// (top-bit-set rejected). The last two sectors are read so a koly that
+/// straddles the final sector boundary (file length just over a sector
+/// multiple) is still fully covered.
+///
+/// Runs `#[inline(never)]` with its own large tail buffer so `_start`'s
+/// stack frame stays small (guest codegen is sensitive to oversized
+/// inlined frames under opt-level=z + LTO).
+#[inline(never)]
+unsafe fn probe_dmg_trailer(
+    call_table: &CallTable,
+    input_capacity: u64,
+    input_sector_size: usize,
+) -> Option<u64> {
+    if input_capacity == 0 {
+        return None;
+    }
+
+    // Read the last one or two device sectors into a contiguous buffer.
+    let mut tail = [0u8; 2 * MAX_SECTOR_SIZE];
+    let sectors_to_read = if input_capacity >= 2 { 2 } else { 1 };
+    let base_sector = input_capacity - sectors_to_read;
+    let base = base_sector * input_sector_size as u64; // device offset of tail[0]
+    let mut tail_len = 0usize;
+    for i in 0..sectors_to_read {
+        let sector = base_sector + i;
+        let off = i as usize * input_sector_size;
+        if !(call_table.read_input_sector)(0, sector, tail[off..].as_mut_ptr(), input_sector_size) {
+            return None;
+        }
+        tail_len = off + input_sector_size;
+    }
+    let tail = &tail[..tail_len];
+
+    // Find the LAST koly magic in the read tail (the real trailer; see
+    // the doc comment above).
+    let mut koly_idx: Option<usize> = None;
+    let mut i = 0usize;
+    while i + DMG_KOLY_MAGIC.len() <= tail_len {
+        if tail[i..i + DMG_KOLY_MAGIC.len()] == DMG_KOLY_MAGIC {
+            koly_idx = Some(i);
+        }
+        i += 1;
+    }
+    let idx = koly_idx?;
+
+    // The 512-byte koly block must be fully present in the read tail.
+    if idx + DMG_KOLY_TRAILER_LEN > tail_len {
+        return None;
+    }
+
+    // koly is the file's final 512 bytes → recover the true file length.
+    let koly_abs = base + idx as u64;
+    let real_len = koly_abs.checked_add(DMG_KOLY_TRAILER_LEN as u64)?;
+
+    // Re-validate through the shared helpers with the recovered length.
+    // Slicing to end exactly at real_len makes buffer_base map back to
+    // `base`, so the helper's window scan is qemu-faithful.
+    let slice = &tail[..idx + DMG_KOLY_TRAILER_LEN];
+    let koly_off = detect_dmg_koly_offset(slice, real_len as usize)?;
+    dmg_sector_count(slice, real_len as usize, koly_off)
+}
+
 /// Parse LUKS header and populate result and LUKS-specific info.
 ///
 /// For LUKS v1: parses the full 592-byte binary header including cipher,
@@ -1629,5 +1941,237 @@ fn panic(_info: &PanicInfo) -> ! {
     }
     loop {
         core::hint::spin_loop();
+    }
+}
+
+// Unit tests for the detect-only format size parsers (format-coverage
+// phase 1, step 3a). Byte-array fixtures mirror the VDI/QED style used
+// elsewhere and the real instar-testdata images (parallels-v{1,2},
+// empty.bochs, simple-pattern.cloop, dmg-simple).
+//
+// NOTE ON EXECUTION: the info operation is a `#![no_std] #![no_main]`
+// guest binary, so `cargo test -p info` cannot build the standard test
+// harness (no `main`), and `make test-rust` deliberately `--exclude`s
+// `info` for that reason. These tests therefore document and pin the
+// parser behaviour but are not run by the current CI harness; the
+// exhaustively-run detection/koly coverage lives in the shared
+// `format_detection` tests. They are compiled out of every production
+// build (`cfg(test)` is false), so they cannot affect `make instar`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared::format_detection::{
+        DMG_KOLY_MAGIC, DMG_KOLY_SECTOR_COUNT_OFFSET, PARALLELS_MAGIC_V2,
+    };
+
+    // ------------------------------------------------------------------
+    // Parallels
+    // ------------------------------------------------------------------
+
+    fn parallels_header(magic: &[u8; 16], nb_sectors: u64) -> [u8; 64] {
+        let mut buf = [0u8; 64];
+        buf[0..16].copy_from_slice(magic);
+        // version 2 (LE u32 @16), as required by detection.
+        buf[16..20].copy_from_slice(&2u32.to_le_bytes());
+        buf[PARALLELS_NB_SECTORS_OFFSET..PARALLELS_NB_SECTORS_OFFSET + 8]
+            .copy_from_slice(&nb_sectors.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn parallels_v1_fixture_size() {
+        // instar-testdata parallels-v1: nb_sectors = 4096 → 2 MiB.
+        let buf = parallels_header(&PARALLELS_MAGIC_V1, 4096);
+        let mut result = InfoResult::new();
+        parse_parallels_header(&buf, &mut result);
+        assert_eq!(result.virtual_size, 2_097_152);
+    }
+
+    #[test]
+    fn parallels_v2_fixture_size() {
+        // instar-testdata parallels-v2: nb_sectors = 4096 → 2 MiB.
+        let buf = parallels_header(&PARALLELS_MAGIC_V2, 4096);
+        let mut result = InfoResult::new();
+        parse_parallels_header(&buf, &mut result);
+        assert_eq!(result.virtual_size, 2_097_152);
+    }
+
+    #[test]
+    fn parallels_v1_masks_high_bits() {
+        // WithoutFreeSpace stores nb_sectors in 32 bits: the high half
+        // must be masked away before multiplying by 512.
+        let nb = 0x0000_0001_0000_1000u64; // low 32 bits = 0x1000 = 4096
+        let buf = parallels_header(&PARALLELS_MAGIC_V1, nb);
+        let mut result = InfoResult::new();
+        parse_parallels_header(&buf, &mut result);
+        assert_eq!(result.virtual_size, 4096 * 512);
+    }
+
+    #[test]
+    fn parallels_v2_uses_full_64_bits() {
+        // WithouFreSpacExt uses the full 64-bit nb_sectors (no masking).
+        let nb = 0x0000_0001_0000_1000u64;
+        let buf = parallels_header(&PARALLELS_MAGIC_V2, nb);
+        let mut result = InfoResult::new();
+        parse_parallels_header(&buf, &mut result);
+        assert_eq!(result.virtual_size, nb * 512);
+    }
+
+    #[test]
+    fn parallels_short_buffer_leaves_zero() {
+        let full = parallels_header(&PARALLELS_MAGIC_V1, 4096);
+        let mut result = InfoResult::new();
+        parse_parallels_header(&full[..PARALLELS_NB_SECTORS_OFFSET + 7], &mut result);
+        assert_eq!(result.virtual_size, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Bochs
+    // ------------------------------------------------------------------
+
+    fn bochs_header(version: u32, disk_offset: usize, disk_size: u64) -> [u8; 512] {
+        let mut buf = [0u8; 512];
+        buf[BOCHS_VERSION_OFFSET..BOCHS_VERSION_OFFSET + 4].copy_from_slice(&version.to_le_bytes());
+        buf[disk_offset..disk_offset + 8].copy_from_slice(&disk_size.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn bochs_v2_fixture_size() {
+        // instar-testdata empty.bochs: version 2, disk @88 = 1032192.
+        let buf = bochs_header(BOCHS_VERSION_2, BOCHS_DISK_SIZE_V2_OFFSET, 1_032_192);
+        let mut result = InfoResult::new();
+        parse_bochs_header(&buf, &mut result);
+        assert_eq!(result.virtual_size, 1_032_192);
+    }
+
+    #[test]
+    fn bochs_v1_reads_offset_84() {
+        let buf = bochs_header(0x0001_0000, BOCHS_DISK_SIZE_V1_OFFSET, 1_048_576);
+        let mut result = InfoResult::new();
+        parse_bochs_header(&buf, &mut result);
+        assert_eq!(result.virtual_size, 1_048_576);
+    }
+
+    #[test]
+    fn bochs_truncates_to_whole_sectors() {
+        // 1024 + 100 bytes: qemu computes total_sectors = disk / 512,
+        // so the odd 100 bytes are dropped.
+        let buf = bochs_header(BOCHS_VERSION_2, BOCHS_DISK_SIZE_V2_OFFSET, 1124);
+        let mut result = InfoResult::new();
+        parse_bochs_header(&buf, &mut result);
+        assert_eq!(result.virtual_size, 1024);
+    }
+
+    // ------------------------------------------------------------------
+    // cloop
+    // ------------------------------------------------------------------
+
+    fn cloop_header(block_size: u32, n_blocks: u32) -> [u8; 512] {
+        let mut buf = [0u8; 512];
+        buf[CLOOP_BLOCK_SIZE_OFFSET..CLOOP_BLOCK_SIZE_OFFSET + 4]
+            .copy_from_slice(&block_size.to_be_bytes());
+        buf[CLOOP_N_BLOCKS_OFFSET..CLOOP_N_BLOCKS_OFFSET + 4]
+            .copy_from_slice(&n_blocks.to_be_bytes());
+        buf
+    }
+
+    #[test]
+    fn cloop_fixture_size() {
+        // instar-testdata simple-pattern.cloop: block_size 65536,
+        // n_blocks 16 → 1 MiB.
+        let buf = cloop_header(65536, 16);
+        let mut result = InfoResult::new();
+        parse_cloop_header(&buf, &mut result);
+        assert_eq!(result.virtual_size, 1_048_576);
+    }
+
+    #[test]
+    fn cloop_zero_block_size_fails() {
+        let buf = cloop_header(0, 16);
+        let mut result = InfoResult::new();
+        parse_cloop_header(&buf, &mut result);
+        assert_eq!(result.virtual_size, 0);
+    }
+
+    #[test]
+    fn cloop_non_multiple_of_512_fails() {
+        let buf = cloop_header(1000, 16);
+        let mut result = InfoResult::new();
+        parse_cloop_header(&buf, &mut result);
+        assert_eq!(result.virtual_size, 0);
+    }
+
+    #[test]
+    fn cloop_block_size_over_64mib_fails() {
+        let buf = cloop_header(CLOOP_MAX_BLOCK_SIZE + 512, 16);
+        let mut result = InfoResult::new();
+        parse_cloop_header(&buf, &mut result);
+        assert_eq!(result.virtual_size, 0);
+    }
+
+    #[test]
+    fn cloop_max_block_size_ok() {
+        let buf = cloop_header(CLOOP_MAX_BLOCK_SIZE, 1);
+        let mut result = InfoResult::new();
+        parse_cloop_header(&buf, &mut result);
+        assert_eq!(result.virtual_size, CLOOP_MAX_BLOCK_SIZE as u64);
+    }
+
+    #[test]
+    fn cloop_n_blocks_over_bound_fails() {
+        let buf = cloop_header(65536, CLOOP_MAX_N_BLOCKS + 1);
+        let mut result = InfoResult::new();
+        parse_cloop_header(&buf, &mut result);
+        assert_eq!(result.virtual_size, 0);
+    }
+
+    #[test]
+    fn cloop_short_buffer_leaves_zero() {
+        let full = cloop_header(65536, 16);
+        let mut result = InfoResult::new();
+        parse_cloop_header(&full[..CLOOP_N_BLOCKS_OFFSET + 3], &mut result);
+        assert_eq!(result.virtual_size, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // DMG (trailer helpers + ×512, as the dispatch arm computes it)
+    // ------------------------------------------------------------------
+
+    /// Reproduce the guest's DMG size path: locate koly in the tail,
+    /// read SectorCount, multiply by 512. Mirrors the dispatch arm.
+    fn dmg_virtual_size(tail: &[u8], file_len: usize) -> Option<u64> {
+        let koly = detect_dmg_koly_offset(tail, file_len)?;
+        let sc = dmg_sector_count(tail, file_len, koly)?;
+        Some(sc.saturating_mul(DMG_SECTOR_SIZE))
+    }
+
+    #[test]
+    fn dmg_fixture_style_size() {
+        // dmg-simple carries SectorCount = 8192 → 4 MiB. Emulate a file
+        // whose koly trailer sits at the very end, with 512-byte-sector
+        // padding (file_len rounded up to the device capacity).
+        let file_len = 2048usize;
+        let mut tail = [0u8; 1024]; // last two 512-byte sectors
+        let koly_off = file_len - DMG_SECTOR_SIZE as usize; // 1536
+        let idx = koly_off - (file_len - tail.len());
+        tail[idx..idx + 4].copy_from_slice(&DMG_KOLY_MAGIC);
+        let sc_idx = idx + DMG_KOLY_SECTOR_COUNT_OFFSET;
+        tail[sc_idx..sc_idx + 8].copy_from_slice(&8192u64.to_be_bytes());
+        assert_eq!(dmg_virtual_size(&tail, file_len), Some(4_194_304));
+    }
+
+    #[test]
+    fn dmg_top_bit_sector_count_rejected() {
+        // A negative (top-bit-set) SectorCount must yield no size (the
+        // probe leaves the format Raw).
+        let file_len = 2048usize;
+        let mut tail = [0u8; 1024];
+        let koly_off = file_len - DMG_SECTOR_SIZE as usize;
+        let idx = koly_off - (file_len - tail.len());
+        tail[idx..idx + 4].copy_from_slice(&DMG_KOLY_MAGIC);
+        let sc_idx = idx + DMG_KOLY_SECTOR_COUNT_OFFSET;
+        tail[sc_idx..sc_idx + 8].copy_from_slice(&0x8000_0000_0000_0001u64.to_be_bytes());
+        assert_eq!(dmg_virtual_size(&tail, file_len), None);
     }
 }
