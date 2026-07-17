@@ -1089,3 +1089,66 @@ class TestMeasureRoundTrip(TestMeasureSmoke):
     def test_source_round_trip_vhdx_cirros(self):
         """cirros-qcow2 -> vhdx: convert output in measure's predicted range."""
         self._source_round_trip('vhdx', 'cirros-qcow2')
+
+
+class TestMeasureNewFormatRefusal(TestMeasureSmoke):
+    """Phase-1 format-coverage: new-format source-image refusals.
+
+    measure's source-image mode calls the guest's
+    `detect_format_from_header` directly (measure/src/main.rs:337);
+    any non-raw, non-read format falls into its default arm and is
+    reported as "source image is unsupported format". Bochs, cloop,
+    and parallels are header-detected, so they hit this path. DMG is
+    detected only by its koly trailer -- a probe that is wired into
+    `instar info` only, not into `detect_format_from_header` -- so
+    measure never distinguishes a DMG source from raw and instead
+    sizes it as a raw device. Documents the phase-1 gap rather than
+    asserting a refusal that does not exist (mirrors the iso quirk
+    pinned for convert/compare/dd).
+    """
+
+    def _refusal_image(self, image_id):
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(f'fixture not available: {image.path}')
+        return image
+
+    def test_bochs_refused(self):
+        """measure refuses a bochs-growing source (header-detected)."""
+        image = self._refusal_image('bochs-growing')
+        stdout, stderr, rc = self.run_instar_measure(
+            str(image.path), '-O', 'qcow2')
+        self.assertNotEqual(rc, 0, f'stdout: {stdout!r} stderr: {stderr!r}')
+        self.assertIn('source image is unsupported format', stderr)
+
+    def test_cloop_refused(self):
+        """measure refuses a cloop-simple source (header-detected)."""
+        image = self._refusal_image('cloop-simple')
+        stdout, stderr, rc = self.run_instar_measure(
+            str(image.path), '-O', 'qcow2')
+        self.assertNotEqual(rc, 0, f'stdout: {stdout!r} stderr: {stderr!r}')
+        self.assertIn('source image is unsupported format', stderr)
+
+    def test_parallels_refused(self):
+        """measure refuses a parallels-v1 source (header-detected)."""
+        image = self._refusal_image('parallels-v1')
+        stdout, stderr, rc = self.run_instar_measure(
+            str(image.path), '-O', 'qcow2')
+        self.assertNotEqual(rc, 0, f'stdout: {stdout!r} stderr: {stderr!r}')
+        self.assertIn('source image is unsupported format', stderr)
+
+    def test_dmg_measured_as_raw(self):
+        """measure does NOT refuse dmg-simple; it sizes it as raw.
+
+        DMG detection is trailer-only and measure has no DMG-trailer
+        probe, so a DMG source is indistinguishable from raw and
+        measure succeeds (rc 0), reporting sizes based on the raw
+        file length.
+        """
+        image = self._refusal_image('dmg-simple')
+        stdout, stderr, rc = self.run_instar_measure(
+            str(image.path), '-O', 'qcow2', '--output', 'json')
+        self.assertEqual(rc, 0, f'stdout: {stdout!r} stderr: {stderr!r}')
+        data = json.loads(stdout)
+        self.assertGreater(data['required'], 0)
+        self.assertGreater(data['fully-allocated'], 0)

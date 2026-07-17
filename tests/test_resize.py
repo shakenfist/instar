@@ -15,6 +15,7 @@ Tests require `/dev/kvm` access for the non-raw paths.
 """
 
 import json
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -775,6 +776,76 @@ class TestResizeErrorPaths(TestResizeSmoke):
                 'silent backing-chain orphaning'
             )
             self.assertIn('backing', stderr.lower())
+
+    # ----------- Phase-1 format-coverage: new-format refusals -----------
+    #
+    # `probe_resize_target` (main.rs) header-probes the target with
+    # `detect_format_from_header`, so bochs, cloop, and parallels land
+    # in its default arm and are refused with "format {Variant:?} is
+    # not supported for in-place resize". DMG is detected only by its
+    # koly trailer, and resize's tail probe is hand-rolled for VHD
+    # footers only -- there is no DMG-trailer probe wired into resize,
+    # so a DMG source is indistinguishable from raw here and resize
+    # succeeds, rewriting it as if it were a raw device. Documents the
+    # phase-1 gap rather than asserting a refusal that does not exist
+    # (mirrors the iso quirk pinned for convert/compare/dd).
+
+    def _copy_fixture(self, image_id, td, suffix):
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(f'fixture not available: {image.path}')
+        dest = Path(td) / f'{image_id}{suffix}'
+        shutil.copy(image.path, dest)
+        return dest
+
+    def test_bochs_refused(self):
+        """resize refuses a bochs-growing target (header-detected)."""
+        with tempfile.TemporaryDirectory() as td:
+            path = self._copy_fixture('bochs-growing', td, '.bochs')
+            _, stderr, rc = self.run_instar_resize(str(path), '4M')
+            self.assertNotEqual(rc, 0, f'stderr: {stderr!r}')
+            self.assertIn(
+                'format Bochs is not supported for in-place resize',
+                stderr,
+            )
+
+    def test_cloop_refused(self):
+        """resize refuses a cloop-simple target (header-detected)."""
+        with tempfile.TemporaryDirectory() as td:
+            path = self._copy_fixture('cloop-simple', td, '.cloop')
+            _, stderr, rc = self.run_instar_resize(str(path), '4M')
+            self.assertNotEqual(rc, 0, f'stderr: {stderr!r}')
+            self.assertIn(
+                'format Cloop is not supported for in-place resize',
+                stderr,
+            )
+
+    def test_parallels_refused(self):
+        """resize refuses a parallels-v1 target (header-detected)."""
+        with tempfile.TemporaryDirectory() as td:
+            path = self._copy_fixture('parallels-v1', td, '.parallels')
+            _, stderr, rc = self.run_instar_resize(str(path), '4M')
+            self.assertNotEqual(rc, 0, f'stderr: {stderr!r}')
+            self.assertIn(
+                'format Parallels is not supported for in-place resize',
+                stderr,
+            )
+
+    def test_dmg_resized_as_raw(self):
+        """resize does NOT refuse dmg-simple; it treats it as raw.
+
+        DMG detection is trailer-only and resize has no DMG-trailer
+        probe, so a DMG source is indistinguishable from raw and the
+        resize succeeds (rc 0), rewriting the file to the new raw
+        length. Run on a scratch copy since this mutates the file.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            path = self._copy_fixture('dmg-simple', td, '.dmg')
+            original_size = path.stat().st_size
+            _, stderr, rc = self.run_instar_resize(str(path), '16M')
+            self.assertEqual(rc, 0, f'stderr: {stderr!r}')
+            self.assertEqual(path.stat().st_size, 16 * 1024 * 1024)
+            self.assertNotEqual(path.stat().st_size, original_size)
 
 
 # ----------------------------------------------------------------------

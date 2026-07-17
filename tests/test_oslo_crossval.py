@@ -97,6 +97,18 @@ OSLO_SKIP_IMAGES = {
     'cve-2015-5162-tiny-petabyte',
     'cve-2014-0223-l1-overflow-boundary',
     'cve-2024-4467-json-prefix',
+    # Malformed DMG koly-trailer fixtures (format-coverage phase 1).
+    # safety: "malformed", run_in_ci: true, so (unlike the run_in_ci:
+    # false raw-*-truncated entries above) they are not filtered out
+    # by _generate_scenarios and need an explicit skip here, matching
+    # the precedent set by the malicious/malformed VMDK, VHD, and
+    # qcow2 fixtures just above: deliberately broken container
+    # metadata is not suitable for cross-validation against oslo's
+    # format_inspector.
+    'dmg-truncated-koly',
+    'dmg-sectorcount-negative',
+    'dmg-sectorcount-huge',
+    'dmg-no-chunk-table',
 }
 
 # Format name mapping: instar -> oslo.utils.
@@ -127,6 +139,18 @@ KNOWN_FORMAT_DIVERGENCES = {
     'luks-v1-raw-gpt': ('unknown', 'luks'),
     'luks-v1-qcow2': ('unknown', 'luks'),
     'luks-v2-raw-gpt': ('unknown', 'luks'),
+    # Format-coverage phase 1: oslo.utils' format_inspector ships no
+    # Parallels, Bochs, cloop, or DMG inspector. detect_file_format()
+    # still returns a real inspector (not None) for these — it falls
+    # back to RawFileInspector, whose `format_match` is unconditionally
+    # True, so oslo reports 'raw' for all four. instar has dedicated
+    # content/trailer probes for all four (see
+    # src/shared/src/format_detection.rs) and reports the real format.
+    'parallels-v1': ('parallels', 'raw'),
+    'parallels-v2': ('parallels', 'raw'),
+    'bochs-growing': ('bochs', 'raw'),
+    'cloop-simple': ('cloop', 'raw'),
+    'dmg-simple': ('dmg', 'raw'),
 }
 
 # Known safety divergences: images where instar does not
@@ -158,6 +182,35 @@ KNOWN_VSIZE_DIVERGENCES = {
     'vmdk-flat-1m': (0, 1 * 1024 * 1024),
     'vmdk-flat-10m': (0, 10 * 1024 * 1024),
     'vmdk-flat-with-parent': (0, 1 * 1024 * 1024),
+    # Format-coverage phase 1, paired with the KNOWN_FORMAT_DIVERGENCES
+    # entries above. RawFileInspector.virtual_size returns however many
+    # bytes oslo's detection loop consumed before it settled on 'raw',
+    # not necessarily the full file length: for bochs-growing (2560 B),
+    # cloop-simple (1690 B), and dmg-simple (11747 B) that happens to
+    # equal the exact file size (the whole file fits in oslo's first
+    # read chunk); for parallels-v1/v2 (327680 B on disk) oslo stops
+    # after consuming only 262144 B. instar reports the real virtual
+    # disk size parsed from each format's own header/trailer. Values
+    # below were captured from a live run against oslo.utils 10.1.2.dev8
+    # (git master, matching .github/workflows/functional-tests.yml's
+    # `pip install ... git+https://github.com/openstack/oslo.utils.git`)
+    # and instar's `info --output json` on the exact staged fixtures.
+    #
+    # NOTE: because 'parallels-v1'/'parallels-v2'/'bochs-growing'/
+    # 'cloop-simple'/'dmg-simple' are also KNOWN_FORMAT_DIVERGENCES
+    # entries, TestOsloVirtualSize.test_virtual_size_agrees skips them
+    # before ever reaching this dict (see its `if self.image_id in
+    # KNOWN_FORMAT_DIVERGENCES: self.skipTest(...)` guard) — identical
+    # to the pre-existing raw-mbr-partitioned/raw-gpt-partitioned/
+    # vmdk-multi-partition entries, none of which has a paired
+    # KNOWN_VSIZE_DIVERGENCES entry either. These five are recorded
+    # here anyway as a documented, verified reference of the actual
+    # numbers rather than being asserted at runtime.
+    'parallels-v1': (262144, 2 * 1024 * 1024),
+    'parallels-v2': (262144, 2 * 1024 * 1024),
+    'bochs-growing': (2560, 1032192),
+    'cloop-simple': (1690, 1024 * 1024),
+    'dmg-simple': (11747, 4 * 1024 * 1024),
 }
 
 

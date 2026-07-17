@@ -647,3 +647,84 @@ class TestAdversarialVmdkDescriptor(InstarTestBase):
             [str(self.get_instar_binary()), 'check', str(image.path)],
             timeout=10
         )
+
+
+class TestAdversarialDmgManifest(InstarTestBase):
+    """Verify malformed DMG koly-trailer manifests are handled safely.
+
+    Four fixtures probe the koly-trailer parsing at its edges: a
+    trailer cut short (no valid 512-byte block at any candidate
+    offset), a SectorCount with the top bit set (rejected as
+    negative), an absurd-but-positive SectorCount, and a valid
+    trailer whose chunk table is empty (instar reports from the
+    trailer alone; qemu-img would fail to open it — a documented
+    trailer-only divergence). None of these should hang, crash, or
+    consume excessive memory. `convert` must either refuse via the
+    3b detect-only gate (when the header still resolves to `dmg`) or
+    otherwise fail/succeed cleanly (when the malformation collapses
+    detection to `unknown`, convert falls through to the iso/unknown
+    raw pass-through) — in every case any produced output must stay
+    small.
+    """
+
+    def _assert_convert_output_small(self, image_id):
+        image = self.get_adversarial_image(image_id)
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            self.run_adversarial(
+                [str(self.get_instar_binary()), 'convert', '-O', 'raw',
+                 str(image.path), out.name],
+                timeout=10
+            )
+            out_size = Path(out.name).stat().st_size
+            self.assertLess(
+                out_size, 100 * 1024 * 1024,
+                f'convert output suspiciously large for {image_id}'
+            )
+
+    # --- dmg-truncated-koly: no valid trailer at any candidate offset ---
+
+    def test_info_dmg_truncated_koly(self):
+        image = self.get_adversarial_image('dmg-truncated-koly')
+        self.run_adversarial(
+            [str(self.get_instar_binary()), 'info', str(image.path)],
+            timeout=10
+        )
+
+    def test_convert_dmg_truncated_koly(self):
+        self._assert_convert_output_small('dmg-truncated-koly')
+
+    # --- dmg-sectorcount-negative: top bit set, rejected as negative ---
+
+    def test_info_dmg_sectorcount_negative(self):
+        image = self.get_adversarial_image('dmg-sectorcount-negative')
+        self.run_adversarial(
+            [str(self.get_instar_binary()), 'info', str(image.path)],
+            timeout=10
+        )
+
+    def test_convert_dmg_sectorcount_negative(self):
+        self._assert_convert_output_small('dmg-sectorcount-negative')
+
+    # --- dmg-sectorcount-huge: absurd but positive SectorCount ---
+
+    def test_info_dmg_sectorcount_huge(self):
+        image = self.get_adversarial_image('dmg-sectorcount-huge')
+        self.run_adversarial(
+            [str(self.get_instar_binary()), 'info', str(image.path)],
+            timeout=10
+        )
+
+    def test_convert_dmg_sectorcount_huge(self):
+        self._assert_convert_output_small('dmg-sectorcount-huge')
+
+    # --- dmg-no-chunk-table: valid trailer, empty rsrc+XML lengths ---
+
+    def test_info_dmg_no_chunk_table(self):
+        image = self.get_adversarial_image('dmg-no-chunk-table')
+        self.run_adversarial(
+            [str(self.get_instar_binary()), 'info', str(image.path)],
+            timeout=10
+        )
+
+    def test_convert_dmg_no_chunk_table(self):
+        self._assert_convert_output_small('dmg-no-chunk-table')

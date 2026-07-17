@@ -1230,6 +1230,18 @@ class TestCompareDetectOnlyRefusal(InstarTestBase):
         """compare refuses a vdi input with the typed message."""
         self._assert_refused('vdi-simple', 'vdi')
 
+    def test_compare_refuses_bochs(self):
+        """compare refuses a bochs-growing input with the typed message."""
+        self._assert_refused('bochs-growing', 'bochs')
+
+    def test_compare_refuses_cloop(self):
+        """compare refuses a cloop-simple input with the typed message."""
+        self._assert_refused('cloop-simple', 'cloop')
+
+    def test_compare_refuses_dmg(self):
+        """compare refuses a dmg-simple input with the typed message."""
+        self._assert_refused('dmg-simple', 'dmg')
+
     def test_compare_iso_passthrough(self):
         """compare keeps reading iso as raw (deliberate qemu parity)."""
         image = self._refusal_image('iso-simple')

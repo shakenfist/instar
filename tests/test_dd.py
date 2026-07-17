@@ -1421,6 +1421,18 @@ class TestDdDetectOnlyRefusal(InstarTestBase):
         """dd refuses a vdi input with the typed message."""
         self._assert_refused('vdi-simple', 'vdi')
 
+    def test_dd_refuses_bochs(self):
+        """dd refuses a bochs-growing input with the typed message."""
+        self._assert_refused('bochs-growing', 'bochs')
+
+    def test_dd_refuses_cloop(self):
+        """dd refuses a cloop-simple input with the typed message."""
+        self._assert_refused('cloop-simple', 'cloop')
+
+    def test_dd_refuses_dmg(self):
+        """dd refuses a dmg-simple input with the typed message."""
+        self._assert_refused('dmg-simple', 'dmg')
+
     def test_dd_iso_passthrough(self):
         """dd keeps reading iso as raw (deliberate qemu parity).
 

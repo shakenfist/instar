@@ -593,6 +593,41 @@ asymmetry as the existing ISO quirk's flip side.
   have it and pass). Fixing those goldens is testdata
   maintenance, folded into step 5a.
 
+## Findings: step 5a — integration tests (2026-07-17)
+
+* **DMG is not refused by the in-place ops** (resize, map,
+  measure): the koly trailer probe is wired only into the
+  info op (as this plan itself specified), so those ops see
+  Raw and pass DMG through as raw. Management decision:
+  **accepted for phase 1 and pinned by tests**
+  (`test_dmg_{resized,measured,reads}_as_raw`) — it mirrors
+  qemu's own treatment of a misnamed DMG, and the
+  data-copying consumers (convert/compare/dd) do refuse DMG
+  via the 3b gate. Wiring trailer probing into the host
+  in-place probes and guest map/measure ops is recorded as
+  master-plan future work (phase 5 gives DMG first-class
+  handling anyway). bochs/cloop/parallels are header-detected
+  and refuse correctly everywhere.
+* **The plan's oslo-crossval premise was wrong**: oslo's
+  `detect_file_format` never returns `None` for the new
+  formats — it falls back to `RawFileInspector` (`raw`,
+  vsize = file size), so the new images fail rather than
+  skip (also: the suite silently self-skips without the
+  `cryptography` module, which CI installs explicitly).
+  Adjudication: the five safe images get
+  `KNOWN_FORMAT_DIVERGENCES` + `KNOWN_VSIZE_DIVERGENCES`
+  entries (instar format vs oslo `raw`); the four malformed
+  DMGs follow the existing malformed-image convention.
+* The 8 test_convert failures in the full-suite run
+  (aurel32/debian-12 qcow2 re-encodes) were confirmed
+  spurious by isolated replay at reduced concurrency (8/8
+  pass) — the established KVM-contention pattern, unrelated
+  to this phase.
+* luks-v1/luks-v2 `profile-10-2-0` goldens were repaired
+  from the verified-identical `profile-10-0-0` content
+  (instar output byte-identical between 10.0.0 and 10.2.0);
+  `test_info_safe` is 580/580.
+
 ## Step-level guidance
 
 | Step | Effort | Model | Isolation | Brief for sub-agent |

@@ -479,6 +479,12 @@ chosen to defer to here so that we don't forget them.
   ESX variants) — separate plan.
 * `map` / `measure` / `dd` support for the new input
   formats, where each phase plan chose to defer it.
+* Wire DMG koly-trailer probing into the in-place-op
+  detection paths (host `probe_*_target` prefix probes and
+  the guest map/measure ops), so DMG is refused there like
+  bochs/cloop/parallels instead of passing through as raw
+  (phase-1 step-5a finding; pinned by tests as accepted
+  behaviour until then, and naturally revisited by phase 5).
 
 ### Bugs fixed during this work
 

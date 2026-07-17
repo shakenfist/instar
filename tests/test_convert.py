@@ -5555,6 +5555,22 @@ class TestConvertDetectOnlyRefusal(InstarTestBase):
         """convert refuses a vdi input with the typed message."""
         self._assert_refused('vdi-simple', 'vdi')
 
+    def test_convert_refuses_bochs(self):
+        """convert refuses a bochs-growing input with the typed message."""
+        self._assert_refused('bochs-growing', 'bochs')
+
+    def test_convert_refuses_cloop(self):
+        """convert refuses a cloop-simple input with the typed message."""
+        self._assert_refused('cloop-simple', 'cloop')
+
+    def test_convert_refuses_dmg(self):
+        """convert refuses a dmg-simple input with the typed message."""
+        self._assert_refused('dmg-simple', 'dmg')
+
+    def test_convert_refuses_parallels(self):
+        """convert refuses a parallels-v1 input with the typed message."""
+        self._assert_refused('parallels-v1', 'parallels')
+
     def test_convert_refuses_midchain_qed(self):
         """convert refuses when a qcow2 overlay's backing file is qed.
 
