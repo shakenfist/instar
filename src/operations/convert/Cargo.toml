@@ -16,6 +16,7 @@ shared = { path = "../../shared" }
 qcow2 = { path = "../../crates/qcow2", features = [
     "decompress", "decompress-zstd", "compress", "aes-decrypt",
     "luks-decrypt", "vmdk-decompress", "vhd-input", "vhdx-input",
+    "vdi-input",
 ] }
 vmdk = { path = "../../crates/vmdk" }
 vhd = { path = "../../crates/vhd" }

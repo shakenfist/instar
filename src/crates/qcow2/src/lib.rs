@@ -2835,7 +2835,7 @@ pub unsafe fn read_cluster_sectors(
 /// `buf` must point to at least `max(chunk_size, sector_size)` writable
 /// bytes.  `scratch` must point to at least `sector_size` writable bytes.
 /// `call_table` must be valid.
-#[cfg(feature = "vhd-input")]
+#[cfg(any(feature = "vhd-input", feature = "vdi-input"))]
 unsafe fn read_offset_sectors(
     call_table: &CallTable,
     device_idx: u32,
@@ -5423,6 +5423,321 @@ mod tests {
         let e = classify_qcow2_l2_standard(entry, 0, 65536);
         assert_eq!(e.state, MapExtentState::ZeroAllocated);
     }
+
+    // ====================================================================
+    // VDI chain-reader arm (read_chain_virtual_cluster ImageFormat::Vdi)
+    // ====================================================================
+    //
+    // These exercise the guest-side arm added for VDI input: hole /
+    // discarded blocks read as zeros, allocated blocks map through the
+    // non-identity block map (offset_data 1024 forces the unaligned
+    // read path), and reads at or past the device capacity zero-fill
+    // rather than error (qemu's no-EOF-validation semantics), including
+    // a straddle that zero-fills only the truncated tail.
+    //
+    // The mock serves a synthetic VDI image from a heap buffer via a
+    // raw pointer + capacity in a `static mut`, guarded by a lock that
+    // serializes these tests (the `read_input_sector` callback is an
+    // `extern "C" fn` and can only close over `'static` state — same
+    // pattern as `READ_TEST_*` above).
+
+    #[cfg(feature = "vdi-input")]
+    static VDI_MOCK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[cfg(feature = "vdi-input")]
+    static mut VDI_MOCK_PTR: *const u8 = core::ptr::null();
+    #[cfg(feature = "vdi-input")]
+    static mut VDI_MOCK_CAP_SECTORS: u64 = 0;
+
+    /// Guest sector size for the VDI arm tests. 4096 is NOT a divisor of
+    /// offset_data (1024), so an allocated read takes the unaligned path.
+    #[cfg(feature = "vdi-input")]
+    const VDI_TEST_SSZ: usize = 4096;
+
+    /// Deterministic device byte at absolute offset `o`; period 251 so a
+    /// misaligned copy cannot accidentally match.
+    #[cfg(feature = "vdi-input")]
+    fn vdi_pattern_byte(o: u64) -> u8 {
+        (o % 251) as u8
+    }
+
+    /// Mock `read_input_sector`: copies `sector_size` bytes from the mock
+    /// image. Returns false for any sector at/beyond the configured
+    /// capacity, so a read the arm fails to clamp would surface as an
+    /// error rather than fabricated bytes.
+    #[cfg(feature = "vdi-input")]
+    unsafe extern "C" fn vdi_mock_read_sector(
+        _device_idx: u32,
+        sector: u64,
+        out_buf: *mut u8,
+        sector_size: usize,
+    ) -> bool {
+        if sector >= VDI_MOCK_CAP_SECTORS {
+            return false;
+        }
+        let start = match (sector as usize).checked_mul(sector_size) {
+            Some(s) => s,
+            None => return false,
+        };
+        core::ptr::copy_nonoverlapping(VDI_MOCK_PTR.add(start), out_buf, sector_size);
+        true
+    }
+
+    #[cfg(feature = "vdi-input")]
+    unsafe extern "C" fn vdi_mock_capacity(_device_idx: u32) -> u64 {
+        VDI_MOCK_CAP_SECTORS
+    }
+
+    #[cfg(feature = "vdi-input")]
+    fn vdi_call_table() -> shared::CallTable {
+        shared::CallTable {
+            read_input_sector: vdi_mock_read_sector,
+            get_input_capacity: vdi_mock_capacity,
+            ..stub_call_table()
+        }
+    }
+
+    /// Build a minimal valid 512-byte VDI header (all UUIDs zero).
+    #[cfg(feature = "vdi-input")]
+    fn build_vdi_header(
+        offset_bmap: u32,
+        offset_data: u32,
+        disk_size: u64,
+        blocks_in_image: u32,
+    ) -> [u8; 512] {
+        use shared::{write_le_u32, write_le_u64};
+        let mut buf = [0u8; 512];
+        write_le_u32(&mut buf, vdi::SIGNATURE_OFFSET, vdi::VDI_SIGNATURE);
+        write_le_u32(&mut buf, vdi::VERSION_OFFSET, vdi::VDI_VERSION_1_1);
+        write_le_u32(&mut buf, vdi::IMAGE_TYPE_OFFSET, 1);
+        write_le_u32(&mut buf, vdi::OFFSET_BMAP_OFFSET, offset_bmap);
+        write_le_u32(&mut buf, vdi::OFFSET_DATA_OFFSET, offset_data);
+        write_le_u32(&mut buf, vdi::SECTOR_SIZE_OFFSET, vdi::VDI_SECTOR_SIZE);
+        write_le_u64(&mut buf, vdi::DISK_SIZE_OFFSET, disk_size);
+        write_le_u32(&mut buf, vdi::BLOCK_SIZE_OFFSET, vdi::VDI_BLOCK_SIZE);
+        write_le_u32(&mut buf, vdi::BLOCKS_IN_IMAGE_OFFSET, blocks_in_image);
+        buf
+    }
+
+    /// Install a synthetic VDI image (pattern everywhere, then the header
+    /// at 0 and the LE u32 block map at `offset_bmap`), init a
+    /// [`vdi::VdiState`], and read one chunk through
+    /// [`read_chain_virtual_cluster`] as a single-device chain. Returns
+    /// the produced bytes.
+    #[cfg(feature = "vdi-input")]
+    fn run_vdi_chain_read(
+        header: &[u8; 512],
+        offset_bmap: usize,
+        bmap: &[u32],
+        cap_sectors: u64,
+        virtual_offset: u64,
+        chunk_size: u64,
+    ) -> std::vec::Vec<u8> {
+        let _guard = VDI_MOCK_LOCK.lock().unwrap();
+
+        let len = cap_sectors as usize * VDI_TEST_SSZ;
+        let mut image = std::vec![0u8; len];
+        for (i, b) in image.iter_mut().enumerate() {
+            *b = vdi_pattern_byte(i as u64);
+        }
+        image[..512].copy_from_slice(header);
+        for (i, &entry) in bmap.iter().enumerate() {
+            let off = offset_bmap + i * 4;
+            image[off..off + 4].copy_from_slice(&entry.to_le_bytes());
+        }
+
+        unsafe {
+            VDI_MOCK_PTR = image.as_ptr();
+            VDI_MOCK_CAP_SECTORS = cap_sectors;
+        }
+        let call_table = vdi_call_table();
+
+        let mut bmap_cache = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut data_cache = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut bytes_read = 0u64;
+        let state = unsafe {
+            vdi::VdiState::init(
+                &call_table,
+                0,
+                VDI_TEST_SSZ,
+                cap_sectors,
+                bmap_cache.as_mut_ptr(),
+                data_cache.as_mut_ptr(),
+                &mut bytes_read,
+            )
+        }
+        .expect("VdiState::init should succeed for a valid header");
+
+        let mut chain_states = ChainStates::default();
+        chain_states.vdi_states[0] = Some(state);
+
+        let mut chain_config = ChainConfig::new();
+        chain_config.magic = ChainConfig::MAGIC;
+        chain_config.version = ChainConfig::VERSION;
+        chain_config.device_count = 1;
+        chain_config.devices[0].format = ImageFormat::Vdi as u32;
+        chain_config.devices[0].cluster_size = VDI_TEST_SSZ as u32;
+        chain_config.devices[0].data_device_idx = 0;
+
+        let mut compressed_buf = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut staging_buf = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut staging_cluster_offset = u64::MAX;
+
+        let mut out = std::vec![0xAAu8; chunk_size as usize];
+        let ok = unsafe {
+            read_chain_virtual_cluster(
+                &call_table,
+                0,
+                1,
+                virtual_offset,
+                out.as_mut_ptr(),
+                chunk_size,
+                VDI_TEST_SSZ,
+                &chain_config,
+                &mut chain_states,
+                compressed_buf.as_mut_ptr(),
+                staging_buf.as_mut_ptr(),
+                &mut staging_cluster_offset,
+                None,
+                None,
+                0,
+                &mut bytes_read,
+            )
+        };
+        // Drop the dangling global before `image` is freed.
+        unsafe {
+            VDI_MOCK_PTR = core::ptr::null();
+        }
+        assert!(ok, "read_chain_virtual_cluster returned false");
+        out
+    }
+
+    #[cfg(feature = "vdi-input")]
+    #[test]
+    fn vdi_arm_unallocated_block_reads_zeros() {
+        // Dynamic bmap with holes: block 1 is allocated (entry 0), the
+        // rest are unallocated. Reading the hole at block 0 yields zeros.
+        let block = vdi::VDI_BLOCK_SIZE as u64;
+        let header = build_vdi_header(512, 1024, 4 * block, 4);
+        let bmap = [
+            vdi::VDI_BLOCK_UNALLOCATED,
+            0,
+            vdi::VDI_BLOCK_UNALLOCATED,
+            vdi::VDI_BLOCK_UNALLOCATED,
+        ];
+        let out = run_vdi_chain_read(&header, 512, &bmap, 2, 0, VDI_TEST_SSZ as u64);
+        assert!(
+            out.iter().all(|&b| b == 0),
+            "unallocated VDI block must read as zeros, got {:02x?}",
+            &out[..16]
+        );
+    }
+
+    #[cfg(feature = "vdi-input")]
+    #[test]
+    fn vdi_arm_discarded_block_reads_zeros() {
+        // A discarded sentinel (0xfffffffe) reads as zeros, exactly like
+        // an unallocated block.
+        let block = vdi::VDI_BLOCK_SIZE as u64;
+        let header = build_vdi_header(512, 1024, 4 * block, 4);
+        let bmap = [
+            vdi::VDI_BLOCK_DISCARDED,
+            vdi::VDI_BLOCK_UNALLOCATED,
+            vdi::VDI_BLOCK_UNALLOCATED,
+            vdi::VDI_BLOCK_UNALLOCATED,
+        ];
+        let out = run_vdi_chain_read(&header, 512, &bmap, 2, 0, VDI_TEST_SSZ as u64);
+        assert!(
+            out.iter().all(|&b| b == 0),
+            "discarded VDI block must read as zeros, got {:02x?}",
+            &out[..16]
+        );
+    }
+
+    #[cfg(feature = "vdi-input")]
+    #[test]
+    fn vdi_arm_allocated_nonidentity_unaligned_reads_data() {
+        // Non-identity block map: block index 1 maps to allocation entry
+        // 0 (host = offset_data + 0 = 1024). offset_data 1024 is not
+        // aligned to the 4096-byte guest sector, so the unaligned read
+        // path is exercised. The returned bytes must equal the device
+        // pattern at host offset 1024.
+        let block = vdi::VDI_BLOCK_SIZE as u64;
+        let header = build_vdi_header(512, 1024, 4 * block, 4);
+        let bmap = [
+            vdi::VDI_BLOCK_UNALLOCATED,
+            0,
+            vdi::VDI_BLOCK_DISCARDED,
+            vdi::VDI_BLOCK_UNALLOCATED,
+        ];
+        let chunk = VDI_TEST_SSZ as u64;
+        // block 1: virtual offset 1 MiB, intra-block offset 0.
+        let out = run_vdi_chain_read(&header, 512, &bmap, 2, block, chunk);
+        let expected: std::vec::Vec<u8> = (0..chunk).map(|i| vdi_pattern_byte(1024 + i)).collect();
+        assert_eq!(
+            out, expected,
+            "allocated VDI block must return device data via the unaligned path"
+        );
+    }
+
+    #[cfg(feature = "vdi-input")]
+    #[test]
+    fn vdi_arm_allocated_past_capacity_zero_fills() {
+        // An allocated entry whose host offset lands far past the device
+        // capacity must zero-fill the whole block, not error — qemu never
+        // validates VDI file length.
+        let block = vdi::VDI_BLOCK_SIZE as u64;
+        let header = build_vdi_header(512, 1024, 4 * block, 4);
+        // entry 100 → host = 1024 + 100 MiB, far past the 2-sector cap.
+        let bmap = [
+            100,
+            vdi::VDI_BLOCK_UNALLOCATED,
+            vdi::VDI_BLOCK_UNALLOCATED,
+            vdi::VDI_BLOCK_UNALLOCATED,
+        ];
+        let out = run_vdi_chain_read(&header, 512, &bmap, 2, 0, VDI_TEST_SSZ as u64);
+        assert!(
+            out.iter().all(|&b| b == 0),
+            "past-capacity VDI block must zero-fill, got {:02x?}",
+            &out[..16]
+        );
+    }
+
+    #[cfg(feature = "vdi-input")]
+    #[test]
+    fn vdi_arm_allocated_straddle_zero_fills_tail() {
+        // An allocated block that starts in-file but whose read runs off
+        // the end of the device: the in-capacity prefix returns device
+        // data, and only the truncated tail zero-fills.
+        let block = vdi::VDI_BLOCK_SIZE as u64;
+        let header = build_vdi_header(512, 1024, 4 * block, 4);
+        let bmap = [
+            0,
+            vdi::VDI_BLOCK_UNALLOCATED,
+            vdi::VDI_BLOCK_UNALLOCATED,
+            vdi::VDI_BLOCK_UNALLOCATED,
+        ];
+        // Capacity 2 sectors = 8192 bytes. Block 0 → host 1024; a 8192-byte
+        // read runs to 9216, past the 8192-byte end. Prefix length is
+        // 8192 - 1024 = 7168 device bytes; the remaining 1024 bytes zero.
+        let cap_sectors = 2u64;
+        let chunk = 2 * VDI_TEST_SSZ as u64; // 8192
+        let out = run_vdi_chain_read(&header, 512, &bmap, cap_sectors, 0, chunk);
+        let cap_bytes = cap_sectors * VDI_TEST_SSZ as u64;
+        let prefix = (cap_bytes - 1024) as usize; // 7168
+        let expected: std::vec::Vec<u8> = (0..chunk)
+            .map(|i| {
+                if (i as usize) < prefix {
+                    vdi_pattern_byte(1024 + i)
+                } else {
+                    0
+                }
+            })
+            .collect();
+        assert_eq!(
+            out, expected,
+            "straddling VDI read must return the in-file prefix and zero the truncated tail"
+        );
+    }
 }
 
 /// Look up the refcount for a host cluster via two-level table indirection.
@@ -6468,6 +6783,75 @@ pub unsafe fn read_chain_virtual_cluster(
                     None => return false,
                 }
             }
+            #[cfg(feature = "vdi-input")]
+            ImageFormat::Vdi => {
+                let state = match &mut chain_states.vdi_states[dev_idx] {
+                    Some(s) => s,
+                    None => return false,
+                };
+
+                match state.block_lookup(call_table, virtual_offset, sector_size, cap, bytes_read) {
+                    Some(vdi::VdiBlockLookup::Unallocated) => {
+                        // A VDI can never have a lower device (non-null
+                        // link/parent UUIDs are refused at parse), so fall
+                        // through to the chain loop's zero-fill tail.
+                        continue;
+                    }
+                    Some(vdi::VdiBlockLookup::Allocated { host_byte_offset }) => {
+                        // qemu never validates VDI file length: any portion
+                        // of an allocated read at or past the device
+                        // capacity zero-fills rather than erroring, including
+                        // the straddle case (block starts in-file, data
+                        // truncated mid-read). `cap` is in sectors.
+                        let cap_bytes = cap.saturating_mul(sector_size as u64);
+                        if host_byte_offset >= cap_bytes {
+                            core::ptr::write_bytes(buf, 0, chunk_size as usize);
+                            return true;
+                        }
+                        let avail = cap_bytes - host_byte_offset;
+                        let read_len = if chunk_size < avail {
+                            chunk_size
+                        } else {
+                            avail
+                        };
+                        // Zero the past-capacity tail first so a straddling
+                        // read leaves only the in-file prefix populated.
+                        if read_len < chunk_size {
+                            core::ptr::write_bytes(
+                                buf.add(read_len as usize),
+                                0,
+                                (chunk_size - read_len) as usize,
+                            );
+                        }
+                        // offset_data is typically 1024 — NOT sector-aligned
+                        // to the guest's virtio sector — so the unaligned
+                        // path is the common case.
+                        let intra_sector = (host_byte_offset % sector_size as u64) as usize;
+                        if intra_sector == 0 {
+                            return read_cluster_sectors(
+                                call_table,
+                                dev_idx as u32,
+                                host_byte_offset,
+                                buf,
+                                read_len,
+                                sector_size,
+                                bytes_read,
+                            );
+                        }
+                        return read_offset_sectors(
+                            call_table,
+                            dev_idx as u32,
+                            host_byte_offset,
+                            buf,
+                            read_len,
+                            sector_size,
+                            compressed_buf,
+                            bytes_read,
+                        );
+                    }
+                    None => return false,
+                }
+            }
             ImageFormat::VmdkDescriptor => {
                 // A VMDK flat descriptor holds no content of its
                 // own; the flat extent(s) live on data device(s)
@@ -6676,6 +7060,8 @@ pub struct ChainStates {
     pub vhd_states: [Option<VhdState>; MAX_CHAIN_DEVICES],
     #[cfg(feature = "vhdx-input")]
     pub vhdx_states: [Option<VhdxState>; MAX_CHAIN_DEVICES],
+    #[cfg(feature = "vdi-input")]
+    pub vdi_states: [Option<vdi::VdiState>; MAX_CHAIN_DEVICES],
 }
 
 /// Initialize format-specific state for all devices in a chain.
@@ -6769,6 +7155,22 @@ pub unsafe fn init_chain_states(
                     bytes_read,
                 );
                 if chain_states.vhdx_states[dev_idx].is_none() {
+                    return false;
+                }
+            }
+            #[cfg(feature = "vdi-input")]
+            ImageFormat::Vdi => {
+                // Reuse the same cache slots: L1→block map, L2→data
+                chain_states.vdi_states[dev_idx] = vdi::VdiState::init(
+                    call_table,
+                    dev_idx as u32,
+                    sector_size,
+                    cap,
+                    l1_cache_addr(dynamic_bufs_start, dev_idx),
+                    l2_cache_addr(dynamic_bufs_start, dev_idx),
+                    bytes_read,
+                );
+                if chain_states.vdi_states[dev_idx].is_none() {
                     return false;
                 }
             }
