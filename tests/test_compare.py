@@ -1188,3 +1188,54 @@ class TestCompareLuksQcow2(InstarTestBase):
                 luks_passphrase='wrong-passphrase'
             )
             self.assertNotEqual(rc, 0)
+
+
+class TestCompareDetectOnlyRefusal(InstarTestBase):
+    """compare refuses detect-only input formats instead of reading raw.
+
+    Without the refusal gate compare would report "Images are identical."
+    for a qed/vdi file compared with itself (both read as raw), masking
+    that neither container is actually read (issue #444).  iso keeps its
+    raw pass-through per the post-1a management decision.
+    """
+
+    def _refusal_image(self, image_id):
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        return image
+
+    def _assert_refused(self, image_id, fmt):
+        image = self._refusal_image(image_id)
+        stdout, stderr, rc = self.run_instar_compare(image.path, image.path)
+        self.assertNotEqual(
+            rc, 0,
+            f'compare should refuse {fmt} input; stdout={stdout!r} '
+            f'stderr={stderr!r}'
+        )
+        expected = (
+            f"compare: input format '{fmt}' is detected but not supported "
+            f'for reading (detection and info only)'
+        )
+        self.assertIn(
+            expected, stdout + stderr,
+            f'missing typed refusal for {fmt}: stderr={stderr!r}'
+        )
+
+    def test_compare_refuses_qed(self):
+        """compare refuses a qed input with the typed message."""
+        self._assert_refused('qed-simple', 'qed')
+
+    def test_compare_refuses_vdi(self):
+        """compare refuses a vdi input with the typed message."""
+        self._assert_refused('vdi-simple', 'vdi')
+
+    def test_compare_iso_passthrough(self):
+        """compare keeps reading iso as raw (deliberate qemu parity)."""
+        image = self._refusal_image('iso-simple')
+        stdout, stderr, rc = self.run_instar_compare(image.path, image.path)
+        self.assertEqual(
+            rc, 0,
+            f'iso compare should succeed; stderr={stderr!r}'
+        )
+        self.assertIn('identical', (stdout + stderr).lower())

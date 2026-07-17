@@ -230,6 +230,10 @@ pub enum ChainError {
     CircularReference(PathBuf),
     /// Failed to resolve backing file path
     PathResolutionError(String),
+    /// Input format is detected (and describable by the `info` op) but has
+    /// no read path, so treating it as raw would silently misrepresent its
+    /// contents. Carries the detected format string reported by info.
+    UnsupportedInputFormat(String),
     /// I/O error
     IoError(std::io::Error),
 }
@@ -259,6 +263,13 @@ impl std::fmt::Display for ChainError {
             }
             ChainError::PathResolutionError(msg) => {
                 write!(f, "Path resolution error: {msg}")
+            }
+            ChainError::UnsupportedInputFormat(fmt) => {
+                write!(
+                    f,
+                    "input format '{fmt}' is detected but not supported for reading \
+                     (detection and info only)"
+                )
             }
             ChainError::IoError(e) => write!(f, "I/O error: {e}"),
         }

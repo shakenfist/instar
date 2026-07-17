@@ -2241,6 +2241,38 @@ fn discover_backing_chain(
         let info_result = execute_info_operation(&current, sector_size, false)
             .map_err(|e| ChainError::InfoOperationFailed(e.to_string()))?;
 
+        // Refuse detected-but-unsupported input formats instead of
+        // silently reading them as raw. The guest info op can *name* and
+        // *size* formats that instar has no read path for (qed, vdi, and
+        // the newly detected parallels/bochs/cloop/dmg);
+        // `ImageFormat::from_str` collapses every such string to `Unknown`,
+        // and the guest chain reader's default arm would then read those
+        // bytes as raw — emitting the container header plus zero padding in
+        // place of the virtual-disk content. Gate on the info-reported
+        // string *before* the `from_str` -> `Unknown` collapse so any
+        // future detect-only format is refused automatically. Because this
+        // runs once per chain position, mid-chain backing files (e.g. a
+        // qcow2 whose backing file is a qed image) are refused identically.
+        //
+        // `iso` is deliberately exempt: this is qemu parity, not an
+        // oversight. An ISO's container bytes *are* its virtual-disk
+        // content, so reading it as raw is semantically correct, and
+        // qemu-img (which has no iso driver) converts ISOs as raw
+        // routinely — refusing them would be a parity regression, not a
+        // safety fix. `raw`/`unknown` stay pass-through so genuinely
+        // unidentifiable input keeps its secure-mode partition-gate
+        // behaviour. This mirrors the post-1a management decision recorded
+        // in docs/plans/PLAN-format-coverage-phase-01-detection.md.
+        if matches!(
+            ImageFormat::from_str(&info_result.format),
+            ImageFormat::Unknown
+        ) && !matches!(info_result.format.as_str(), "raw" | "unknown" | "iso")
+        {
+            return Err(ChainError::UnsupportedInputFormat(
+                info_result.format.clone(),
+            ));
+        }
+
         // Get actual filesystem size for the chain config. The guest
         // info operation may report actual_size=0 for non-QCOW2 formats
         // (by design), but the chain config needs the real file size so
@@ -11476,10 +11508,16 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     let security_config = config::load_config().config.security;
     let chain1 =
         discover_backing_chain(Path::new(&args.image1), args.sector_size, &security_config)
-            .map_err(|e| format!("error discovering backing chain for {}: {}", args.image1, e))?;
+            .map_err(|e| match &e {
+                ChainError::UnsupportedInputFormat(_) => format!("compare: {e}"),
+                _ => format!("error discovering backing chain for {}: {}", args.image1, e),
+            })?;
     let chain2 =
         discover_backing_chain(Path::new(&args.image2), args.sector_size, &security_config)
-            .map_err(|e| format!("error discovering backing chain for {}: {}", args.image2, e))?;
+            .map_err(|e| match &e {
+                ChainError::UnsupportedInputFormat(_) => format!("compare: {e}"),
+                _ => format!("error discovering backing chain for {}: {}", args.image2, e),
+            })?;
 
     if verbose {
         debug!("Image 1 chain ({} image(s)):", chain1.len());
@@ -12293,7 +12331,13 @@ fn execute_convert(
     // Discover input backing chain
     let security_config = config::load_config().config.security;
     let chain = discover_backing_chain(Path::new(&exec.input), exec.sector_size, &security_config)
-        .map_err(|e| format!("error discovering backing chain for {}: {}", exec.input, e))?;
+        .map_err(|e| match &e {
+            // `execute_convert` is shared by convert and dd, but dd runs
+            // its own chain discovery first (and refuses there with a
+            // `dd:` prefix), so a refusal reaching this point is convert's.
+            ChainError::UnsupportedInputFormat(_) => format!("convert: {e}"),
+            _ => format!("error discovering backing chain for {}: {}", exec.input, e),
+        })?;
 
     if verbose {
         debug!("Input chain ({} image(s)):", chain.len());
@@ -13680,11 +13724,12 @@ fn run_dd(args: DdArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>>
     }
     let security_config = config::load_config().config.security;
     let chain = discover_backing_chain(Path::new(&parsed.input), sector_size, &security_config)
-        .map_err(|e| {
-            format!(
+        .map_err(|e| match &e {
+            ChainError::UnsupportedInputFormat(_) => format!("dd: {e}"),
+            _ => format!(
                 "error discovering backing chain for {}: {}",
                 parsed.input, e
-            )
+            ),
         })?;
     let virtual_size = chain.images()[0].virtual_size;
 

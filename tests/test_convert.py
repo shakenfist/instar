@@ -5509,3 +5509,94 @@ class TestConvertVhdxBlockSize(InstarTestBase):
         self.assert_convert_rejects(
             'vhdx', '.vhdx', block_size=536870912
         )
+
+
+class TestConvertDetectOnlyRefusal(InstarTestBase):
+    """convert refuses detect-only input formats instead of reading raw.
+
+    qed and vdi are detected and sized by `instar info` but have no read
+    path; convert must refuse them with a typed error rather than silently
+    reading the container bytes as raw (issue #444).  iso is deliberately
+    exempt (its container bytes *are* its content; qemu-img converts ISOs
+    as raw), so its raw pass-through is pinned here explicitly.
+    """
+
+    def _refusal_image(self, image_id):
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        return image
+
+    def _assert_refused(self, image_id, fmt):
+        image = self._refusal_image(image_id)
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            stdout, stderr, rc = self.run_instar_convert(
+                image.path, Path(out.name)
+            )
+        self.assertNotEqual(
+            rc, 0,
+            f'convert should refuse {fmt} input; stdout={stdout!r} '
+            f'stderr={stderr!r}'
+        )
+        expected = (
+            f"convert: input format '{fmt}' is detected but not supported "
+            f'for reading (detection and info only)'
+        )
+        self.assertIn(
+            expected, stdout + stderr,
+            f'missing typed refusal for {fmt}: stderr={stderr!r}'
+        )
+
+    def test_convert_refuses_qed(self):
+        """convert refuses a qed input with the typed message."""
+        self._assert_refused('qed-simple', 'qed')
+
+    def test_convert_refuses_vdi(self):
+        """convert refuses a vdi input with the typed message."""
+        self._assert_refused('vdi-simple', 'vdi')
+
+    def test_convert_refuses_midchain_qed(self):
+        """convert refuses when a qcow2 overlay's backing file is qed.
+
+        Proves the central chain-discovery gate covers mid-chain
+        positions: the qcow2 head parses fine, but the qed backing layer
+        is refused with the same typed message.
+        """
+        qed = self._refusal_image('qed-simple')
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            backing = tmpdir / 'backing.qed'
+            shutil.copy(qed.path, backing)
+            overlay = tmpdir / 'overlay.qcow2'
+            # Backing file in the same directory as the overlay keeps it
+            # inside the default backing-path allowlist (image dir).
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-b', 'backing.qed', '-F', 'qed', str(overlay), '10M'],
+                capture_output=True, check=True,
+            )
+            out = tmpdir / 'out.raw'
+            stdout, stderr, rc = self.run_instar_convert(overlay, out)
+        self.assertNotEqual(
+            rc, 0,
+            f'convert should refuse qed backing layer; stderr={stderr!r}'
+        )
+        expected = (
+            "convert: input format 'qed' is detected but not supported "
+            'for reading (detection and info only)'
+        )
+        self.assertIn(expected, stdout + stderr, f'stderr={stderr!r}')
+
+    def test_convert_iso_passthrough(self):
+        """convert keeps reading iso as raw (deliberate qemu parity).
+
+        Pins the step-1a behaviour: rc 0, output sector-padded to the
+        393216-byte virtual size.
+        """
+        image = self._refusal_image('iso-simple')
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            stdout, stderr, rc = self.run_instar_convert(
+                image.path, Path(out.name)
+            )
+            self.assertEqual(rc, 0, f'iso convert should succeed; stderr={stderr!r}')
+            self.assertEqual(os.path.getsize(out.name), 393216)

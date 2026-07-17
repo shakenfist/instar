@@ -1376,3 +1376,61 @@ class TestDdInputFormats(InstarTestBase):
                 f'instar dd -f raw output differs from qemu-img dd '
                 f'(instar={len(instar_bytes)} B, qemu={len(qemu_bytes)} B)',
             )
+
+
+class TestDdDetectOnlyRefusal(InstarTestBase):
+    """dd refuses detect-only input formats instead of reading raw.
+
+    qed and vdi are detected/sized by info but have no read path; dd must
+    refuse them rather than emitting the container bytes plus zero padding
+    (issue #444).  iso keeps its raw pass-through per the post-1a
+    management decision (exact-length output, no sector padding).
+    """
+
+    def _refusal_image(self, image_id):
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        return image
+
+    def _assert_refused(self, image_id, fmt):
+        image = self._refusal_image(image_id)
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            stdout, stderr, rc = self.run_instar_dd(
+                [f'if={image.path}', f'of={out.name}']
+            )
+        self.assertNotEqual(
+            rc, 0,
+            f'dd should refuse {fmt} input; stdout={stdout!r} '
+            f'stderr={stderr!r}'
+        )
+        expected = (
+            f"dd: input format '{fmt}' is detected but not supported "
+            f'for reading (detection and info only)'
+        )
+        self.assertIn(
+            expected, stdout + stderr,
+            f'missing typed refusal for {fmt}: stderr={stderr!r}'
+        )
+
+    def test_dd_refuses_qed(self):
+        """dd refuses a qed input with the typed message."""
+        self._assert_refused('qed-simple', 'qed')
+
+    def test_dd_refuses_vdi(self):
+        """dd refuses a vdi input with the typed message."""
+        self._assert_refused('vdi-simple', 'vdi')
+
+    def test_dd_iso_passthrough(self):
+        """dd keeps reading iso as raw (deliberate qemu parity).
+
+        Pins the step-1a behaviour: rc 0, output is the exact 376832-byte
+        container length (dd sizes to the file, not the padded vsize).
+        """
+        image = self._refusal_image('iso-simple')
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            stdout, stderr, rc = self.run_instar_dd(
+                [f'if={image.path}', f'of={out.name}']
+            )
+            self.assertEqual(rc, 0, f'iso dd should succeed; stderr={stderr!r}')
+            self.assertEqual(len(_bytes_of(out.name)), 376832)
