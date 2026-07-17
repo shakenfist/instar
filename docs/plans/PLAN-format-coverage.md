@@ -491,6 +491,23 @@ plan, or at least be aware of when planning. (A scan on
 open issues are fuzz crashes, consistency checks, and qcow2
 operation bugs.)
 
+* **Suspected pre-existing defect: detect-only formats are
+  silently read as raw by convert/compare/dd.** Found during
+  phase-1 planning (2026-07-17) by code reading: those ops
+  probe input via `discover_backing_chain` → guest info, and
+  `chain::ImageFormat::from_str` (`src/vmm/src/chain.rs:50`)
+  maps unrecognised format strings (today: `qed`, `vdi`,
+  `iso`) to `Unknown`, which the guest chain reader's default
+  arm reads as raw sectors — so e.g. `instar convert` of a
+  QED image appears to emit its container bytes as disk
+  content instead of refusing, contradicting the documented
+  "detects it and refuses" stance for QED. To be confirmed
+  empirically by phase-1 step 1a and closed by step 3b's
+  typed detected-but-unsupported refusal (which also covers
+  the newly detected formats); file a GitHub issue on
+  confirmation. See
+  [PLAN-format-coverage-phase-01-detection.md](PLAN-format-coverage-phase-01-detection.md).
+
 ### Documentation index maintenance
 
 When creating a new master plan from this template, update
