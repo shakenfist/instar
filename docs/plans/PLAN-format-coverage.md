@@ -224,7 +224,7 @@ is the tracking source of truth.
 
 | Phase | Plan | Status |
 |-------|------|--------|
-| 1. Detection + info parity (Parallels, Bochs, cloop, DMG; settle the trailer-probe question) | PLAN-format-coverage-phase-01-detection.md | Not written |
+| 1. Detection + info parity (Parallels, Bochs, cloop, DMG; settle the trailer-probe question) | [PLAN-format-coverage-phase-01-detection.md](PLAN-format-coverage-phase-01-detection.md) | Planned, not started |
 | 2. VDI convert-from (dynamic + static read path, new `src/crates/vdi/`) | PLAN-format-coverage-phase-02-vdi-read.md | Not written |
 | 3. Parallels convert-from (v2 read path, new `src/crates/parallels/`) | PLAN-format-coverage-phase-03-parallels-read.md | Not written |
 | 4. QCOW1 convert-from (read path, likely inside `src/crates/qcow2/` as a sibling parser) | PLAN-format-coverage-phase-04-qcow1-read.md | Not written |
