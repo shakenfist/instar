@@ -2,7 +2,7 @@
 
 Master plan: [PLAN-format-coverage.md](PLAN-format-coverage.md)
 
-## Status: Planned, not started
+## Status: Complete (2026-07-17)
 
 ## Prompt
 

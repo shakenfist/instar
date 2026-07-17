@@ -45,6 +45,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Format-coverage phase 1: Parallels, Bochs, cloop, and DMG
+  detection + info parity (PLAN-format-coverage phase 1).** `instar
+  info` now detects and correctly sizes four previously-unrecognised
+  formats — Parallels (both `WithoutFreeSpace` and
+  `WithouFreSpacExt` magics), Bochs (growing-mode), cloop (V2.0), and
+  DMG (UDIF, detected by a new content-based koly-trailer scan rather
+  than qemu-img's `.dmg`-filename probe) — matching `qemu-img info`
+  byte-for-byte (human and JSON) across the 80-version baseline
+  matrix. Also closes
+  [#444](https://github.com/shakenfist/instar/issues/444): convert,
+  compare, and dd previously read any detected-but-unsupported input
+  format (qed, vdi, and now also the four new formats) silently as
+  raw bytes zero-padded to the declared virtual size; a new central
+  refusal gate in `discover_backing_chain` now rejects these with a
+  typed `"<op>: input format '<fmt>' is detected but not supported
+  for reading (detection and info only)"` error, covering mid-chain
+  backing positions too. ISO is deliberately exempt (its raw
+  interpretation is semantically correct and matches qemu-img, which
+  has no ISO driver). Host info-emitter parity fixes: qemu-img's
+  human-size formatter unit-selection for sub-MiB, KiB-round values,
+  512-byte child-node file-length rounding for structured formats,
+  and JSON `dirty-flag` suppression for the four detect-only drivers.
+  New fixtures registered in `tests/manifest.json`: `parallels-v1`,
+  `parallels-v2`, `bochs-growing`, `cloop-simple` (existing
+  `instar-testdata` images, newly exercised), plus a generated
+  `dmg-simple` UDIF image and four adversarial DMG fixtures
+  (truncated koly, negative/huge SectorCount, missing chunk table),
+  all with cross-version qemu-img baselines. See
+  [docs/format-coverage.md](docs/format-coverage.md) and
+  [docs/quirks.md](docs/quirks.md) for the full divergence records.
+
 - **Fuzzing for the qcow2-write planner and its snapshot-bearing
   copy-on-write paths (PLAN-qcow2-write-infrastructure phase 8).**
   Two new coverage-guided libFuzzer targets exercise the

@@ -36,11 +36,14 @@ for details on why this approach is secure.
 | QED | Yes (banned) | Yes | qed-simple |
 | ISO | Yes | Yes* | iso-simple |
 | LUKS | Yes | Yes | luks-v1, luks-v2, luks-v1-raw-gpt, luks-v1-qcow2, luks-v1-aes-xts |
-| Parallels | No | **No** | parallels-v1, parallels-v2 (in testdata, not tested) |
-| Bochs | No | **No** | empty.bochs (in testdata, not tested) |
-| cloop | No | **No** | simple-pattern.cloop (in testdata, not tested) |
+| Parallels | No | **Yes** | parallels-v1, parallels-v2 |
+| Bochs | No | **Yes** | bochs-growing |
+| cloop | No | **Yes** | cloop-simple |
+| DMG | No | **Yes**† | dmg-simple, dmg-truncated-koly, dmg-sectorcount-negative, dmg-sectorcount-huge, dmg-no-chunk-table |
 
 *\* ISO detection is controlled by `--unsafe-quirks` flag: by default instar reports "iso", but with `--unsafe-quirks` it reports "raw" to match qemu-img behavior. See [quirks.md](quirks.md) for details.*
+
+*† DMG is detected by content — scanning the file's final 1024 bytes for the koly trailer magic — not by the `.dmg` filename extension qemu-img probes for. A misnamed DMG (no `.dmg` suffix) still detects under instar but probes as raw under qemu-img. See [quirks.md](quirks.md) for details.*
 
 ### Formats Not Yet Detected by Instar
 
@@ -367,6 +370,35 @@ full reference.
 |----------|-------------|--------|--------------|
 | qed-simple | QED format image | safe | Deprecated format test |
 
+#### Parallels Images (2)
+
+| Image ID | Description | Safety | Key Features |
+|----------|-------------|--------|--------------|
+| parallels-v1 | QEMU iotests image, old "WithoutFreeSpace" magic | safe | nb_sectors masked to low 32 bits |
+| parallels-v2 | QEMU iotests image, new "WithouFreSpacExt" magic | safe | Full-width nb_sectors |
+
+#### Bochs Images (1)
+
+| Image ID | Description | Safety | Key Features |
+|----------|-------------|--------|--------------|
+| bochs-growing | QEMU iotests `empty.bochs`, growing-mode image | safe | Detect + info test |
+
+#### cloop Images (1)
+
+| Image ID | Description | Safety | Key Features |
+|----------|-------------|--------|--------------|
+| cloop-simple | QEMU iotests `simple-pattern.cloop`, V2.0 magic | safe | Detect + info test |
+
+#### DMG Images (5)
+
+| Image ID | Description | Safety | Key Features |
+|----------|-------------|--------|--------------|
+| dmg-simple | Minimal valid UDIF image, UDZO/zlib chunks + koly trailer | safe | Content-based trailer detection |
+| dmg-truncated-koly | koly magic present but trailer cut short | malformed | No valid 512-byte trailer at any candidate offset |
+| dmg-sectorcount-negative | Valid koly trailer, SectorCount top bit set | malformed | Rejected as unknown (qemu's negative-total refusal) |
+| dmg-sectorcount-huge | Valid koly trailer, absurd-but-positive SectorCount | malformed | 128 PiB reported vsize, matches qemu |
+| dmg-no-chunk-table | Valid koly trailer, RsrcForkLength and XMLLength both zero | malformed | `skip_qemu_img`: qemu-img open fails, instar reports from trailer alone |
+
 #### LUKS Images (9)
 
 | Image ID | Description | Safety | Key Features |
@@ -563,6 +595,10 @@ cd tests && ../.venv/bin/stestr run test_oslo_crossval
 | Safety | LUKS v2 | pass | reject | oslo rejects LUKS v2+; instar detects both |
 | Safety | qcow2-external-data-file | reports data-file | flags data_file | Match: both detect external data file path |
 | Vsize | VPC/VHD images | - | - | CHS geometry rounding (up to 8 MB delta allowed) |
+| Format | parallels-v1, parallels-v2 | parallels | raw | oslo has no Parallels inspector; falls back to RawFileInspector |
+| Format | bochs-growing | bochs | raw | oslo has no Bochs inspector; falls back to RawFileInspector |
+| Format | cloop-simple | cloop | raw | oslo has no cloop inspector; falls back to RawFileInspector |
+| Format | dmg-simple | dmg | raw | oslo has no DMG inspector; falls back to RawFileInspector |
 
 ### CI Integration
 
@@ -584,4 +620,4 @@ are surfaced as warnings rather than blocking PRs.
 
 ---
 
-*Document updated: April 2026*
+*Document updated: 2026-07-17*

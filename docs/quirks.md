@@ -2471,6 +2471,219 @@ Verified check-clean and read-back-parity against pinned qemu-img
 snapshot-bearing iterations (0 divergences) by `scripts/cow-soak.py`;
 `tests/helpers/snapshot_readback.py` is the reusable read-back oracle.
 
+## Format-coverage phase 1: Parallels, Bochs, cloop, DMG detection
+
+Phase 1 of `PLAN-format-coverage.md` added content-based detection and
+info parity for Parallels, Bochs, cloop, and DMG. The five entries below
+record the deliberate divergences this introduced, plus the closure of a
+pre-existing consumer defect the phase surfaced along the way. See
+[docs/plans/PLAN-format-coverage-phase-01-detection.md](plans/PLAN-format-coverage-phase-01-detection.md)
+for the full design and findings.
+
+### DMG Detection: Content-Based Trailer Probing vs qemu's Filename Extension
+
+**Classification: Safe Quirk**
+
+#### Observed Behavior
+
+qemu-img's DMG probe is almost entirely extension-based: it recognises a
+file as DMG chiefly by the `.dmg` filename suffix, not by content. A
+file containing a byte-perfect UDIF koly trailer but named without a
+`.dmg` suffix probes as `raw` under qemu-img.
+
+instar instead detects DMG the same way it already detects fixed VHD:
+by content. When the header probe returns Raw, instar scans the file's
+final 1024 bytes for the `koly` magic (mirroring qemu's own
+`dmg_find_koly_offset` candidate window, `[len-1023, len-512]`) and, if
+found, reports `dmg` regardless of filename.
+
+#### Why This Matters
+
+Reporting "this raw-looking file is actually a compressed UDIF
+container" is precisely the class of fact instar's safety-detection
+charter exists to surface — the same stance already taken for ISO 9660
+(see "ISO 9660 Detection vs RAW" above). Extension-based detection
+would make instar's format report dependent on how a file happens to be
+named, which is not a security-relevant signal.
+
+#### instar Behavior
+
+**Always** (no flag toggles this): instar reports `dmg` for any file
+whose final bytes carry a valid koly trailer, independent of filename.
+For fixtures actually named `*.dmg` (the phase-1 baseline fixture,
+`dmg-simple`), both tools agree. The divergence is confined to misnamed
+files: a koly-bearing file without a `.dmg` suffix reports `dmg` under
+instar and `raw` under qemu-img. Unlike the other safe quirks in this
+document, `--unsafe-quirks` does **not** change DMG detection — instar
+never adopts qemu's extension probe, matching the design decision
+recorded as OQ2 in the phase-1 plan.
+
+### cloop Full-Magic Match vs qemu's Prefix-Match Truncation
+
+**Classification: Safe Quirk**
+
+#### Observed Behavior
+
+qemu's cloop probe compares `min(strlen(magic), buf_size)` bytes of the
+83-byte V2.0 shell-script magic against the file's leading bytes. A
+file shorter than 83 bytes whose available bytes are a prefix of the
+magic still probes as `cloop` under qemu-img — the comparison degrades
+to "how many bytes do we have" rather than "is the full magic present."
+
+instar requires the complete 83-byte magic (`len >= 83` and an exact
+match); a truncated file that qemu-img would call `cloop` detects as
+`raw` (or falls through to the partition-table gate) under instar.
+
+#### Why This Matters
+
+This is a degenerate edge case — only files truncated mid-magic are
+affected, which in practice means a corrupted or incomplete cloop
+image, not a legitimate one. qemu's prefix-match behaviour arguably
+over-detects; instar's stricter full-match requirement is the more
+conservative reading of the same magic string, not a loss of format
+identification accuracy for any real cloop image (the shortest real
+cloop file must carry the full 83-byte header to be valid anyway).
+
+#### instar Behavior
+
+**Default and only behavior**: instar always requires the full 83-byte
+magic. There is no flag to relax this to qemu's prefix-match rule.
+
+### DMG Info: Trailer-Only Report vs qemu's Chunk-Table Open Requirement
+
+**Classification: Safe Quirk** (adversarial fixtures only)
+
+#### Observed Behavior
+
+`qemu-img info` on a DMG must fully *open* the image, which requires
+parsing a valid BLKX chunk table (from the rsrc-fork or XML plist
+region referenced by the koly trailer). A DMG with a structurally valid
+koly trailer but no parseable chunk table fails to open, and
+`qemu-img info` errors out.
+
+instar's phase-1 `info` support parses only the koly trailer — it does
+not walk the chunk table (that lands with phase 5's DMG read path) — so
+it reports format name and virtual size directly from the trailer's
+`SectorCount` field, successfully, even when the chunk table is
+missing or empty.
+
+#### Why This Matters
+
+For every well-formed DMG (a real UDIF image with a working chunk
+table), both tools agree. The divergence is confined to the
+`dmg-no-chunk-table` adversarial fixture (`RsrcForkLength` and
+`XMLLength` both zero): `qemu-img info` errors, instar reports `dmg`
+with the trailer's declared virtual size. This fixture carries
+`skip_qemu_img: true` in `tests/manifest.json` precisely because no
+qemu-img baseline exists to compare against.
+
+#### instar Behavior
+
+**Default behavior**: instar reports whatever the koly trailer alone
+can support, without requiring the chunk table to be present or valid.
+This is intentionally more permissive than qemu-img for `info`
+specifically — instar's sandboxed architecture means there is no
+safety cost to reporting a best-effort trailer-derived size for a
+container it cannot fully open, unlike qemu-img's open-then-read model.
+
+### Detect-Only Format Refusal in convert / compare / dd (#444)
+
+**Classification: closes an Unsafe Quirk** (was silently mimicking
+qemu-img's raw-fallback behaviour; now refuses instead)
+
+#### Observed Behavior (before the fix)
+
+`instar convert`, `compare`, and `dd` discover their input's format via
+a guest-side `info` probe, then map the reported format string to a
+`chain::ImageFormat`. Any format instar detects but has no read path
+for (`qed`, `vdi`, and — after this phase — `parallels`, `bochs`,
+`cloop`, `dmg`) collapsed to `ImageFormat::Unknown`, and the chain
+reader's default arm read `Unknown` images as **raw bytes** — emitting
+the container's bytes zero-padded to the header-declared virtual size,
+with no error and no indication anything was wrong. This was tracked
+as [#444](https://github.com/shakenfist/instar/issues/444), confirmed
+by phase 1 step 1a's empirical pin (see the phase plan's Findings
+section), and fixed by step 3b.
+
+#### instar Behavior (after the fix)
+
+`discover_backing_chain` now refuses centrally — covering the top-level
+image and every mid-chain backing position identically — whenever the
+guest-reported format string is detected but maps to `Unknown` and is
+not `raw`, `unknown`, or `iso`. The typed error names the format,
+e.g.:
+
+```
+convert: input format 'bochs' is detected but not supported for
+reading (detection and info only)
+```
+
+This closes the hole for `qed` and `vdi` (previously silently read as
+raw, contradicting their documented "detected, refused" stance) as
+well as the four newly detected formats. There is no flag to disable
+this refusal — unlike `instar info`, convert/compare/dd have no
+`--unsafe-quirks` path at all, so the refusal is unconditional.
+
+#### The ISO exemption and the info-vs-consumer asymmetry
+
+**iso is deliberately exempt** and keeps its raw pass-through
+everywhere: unlike qed/vdi/parallels/bochs/cloop/dmg — where a raw
+interpretation misrepresents the content (container metadata plus zero
+padding, not the virtual disk) — an ISO's container bytes *are* its
+virtual disk content, so reading it as raw is semantically correct.
+qemu-img (which has no ISO driver at all) converts ISOs as raw
+routinely; refusing them would be a parity regression on a common
+workflow, not a safety fix.
+
+This produces an asymmetry worth noting explicitly: standalone `instar
+info` on an ISO reports `iso` by default (secure mode) and `raw` only
+with `--unsafe-quirks` (see "ISO 9660 Detection vs RAW" above). But
+`discover_backing_chain` always probes via `info` in secure mode
+internally — regardless of any flag convert/compare/dd don't even
+accept — so it always sees `"iso"`, and then explicitly declines to
+refuse it. In other words, convert/compare/dd behave *as if* they were
+always in `--unsafe-quirks` mode for ISO specifically, while every
+other detect-only format is refused unconditionally in every mode.
+This is intentional (see the phase-1 plan's post-1a management review
+decision) and is pinned by tests asserting the exact ISO pass-through
+byte sizes (`convert` 393216, `dd` 376832).
+
+### DMG Pass-Through as Raw in the In-Place Ops (phase-1 accepted behaviour)
+
+**Classification: Safe Quirk** (accepted, tracked for future work)
+
+#### Observed Behavior
+
+The koly-trailer probe added in phase 1 is wired only into the guest
+`info` op, as the phase-1 plan specified. The in-place single-image ops
+— `resize`, `map`, `measure`, and the other guest ops that detect via
+`detect_format_from_header` directly rather than through the `info`
+chain — never see the trailer probe, so they detect a DMG (valid or
+adversarial) as `Raw` and pass it through as a raw disk image, exactly
+as they would for any other undetected file. Parallels, Bochs, and
+cloop are unaffected — they are header-detected at offset 0, which
+*is* wired into `detect_format_from_header`, so those three formats
+refuse correctly in every op.
+
+#### Why This Matters
+
+This mirrors qemu-img's own treatment of a misnamed DMG (qemu's
+extension-based probe also fails to recognise it, so qemu-img reads it
+as raw too), and the data-copying consumers that actually matter for
+safety — convert, compare, dd — already refuse DMG via the #444 gate
+above (they route through `info`, which does run the trailer probe).
+Only the single-image in-place ops are affected, and only for DMG.
+
+#### instar Behavior
+
+**Accepted for phase 1 and pinned by tests**
+(`test_dmg_{resized,measured,reads}_as_raw`): resize, map, and measure
+treat a DMG the same as any other raw-detected file. Wiring the koly
+trailer probe into the host in-place-op prefix probes and the guest
+map/measure detection paths is recorded as master-plan future work
+(`docs/plans/PLAN-format-coverage.md`, "Future work") and is naturally
+revisited when phase 5 gives DMG a first-class read path.
+
 ## Future Additions
 
 Additional quirks will be documented here as they are discovered during

@@ -224,7 +224,7 @@ is the tracking source of truth.
 
 | Phase | Plan | Status |
 |-------|------|--------|
-| 1. Detection + info parity (Parallels, Bochs, cloop, DMG; settle the trailer-probe question) | [PLAN-format-coverage-phase-01-detection.md](PLAN-format-coverage-phase-01-detection.md) | Planned, not started |
+| 1. Detection + info parity (Parallels, Bochs, cloop, DMG; settle the trailer-probe question) | [PLAN-format-coverage-phase-01-detection.md](PLAN-format-coverage-phase-01-detection.md) | Complete (commits 3c0fff1..5042d74 + docs commit) |
 | 2. VDI convert-from (dynamic + static read path, new `src/crates/vdi/`) | PLAN-format-coverage-phase-02-vdi-read.md | Not written |
 | 3. Parallels convert-from (v2 read path, new `src/crates/parallels/`) | PLAN-format-coverage-phase-03-parallels-read.md | Not written |
 | 4. QCOW1 convert-from (read path, likely inside `src/crates/qcow2/` as a sibling parser) | PLAN-format-coverage-phase-04-qcow1-read.md | Not written |
@@ -512,10 +512,15 @@ operation bugs.)
   verified), contradicting the documented "detects it and
   refuses" stance for QED. ISO flows through the same path
   but is exempted by management decision: its raw read is
-  semantically correct and matches qemu-img. To be closed by
-  step 3b's typed refusal (which also covers the newly
-  detected formats); no existing test depends on the
-  silent-raw behaviour. Findings in
+  semantically correct and matches qemu-img. **Fixed by
+  83a9e5c** (step 3b): a single central gate in
+  `discover_backing_chain` refuses with a typed
+  `ChainError::UnsupportedInputFormat` when the guest-reported
+  format maps to `chain::ImageFormat::Unknown` and is not
+  `raw`/`unknown`/`iso`, covering top-level images and every
+  mid-chain backing position; iso keeps its exempted raw
+  pass-through. No existing test depended on the silent-raw
+  behaviour. Findings in
   [PLAN-format-coverage-phase-01-detection.md](PLAN-format-coverage-phase-01-detection.md).
 * **instar-testdata: parallels driver missing from the
   6.0.0–6.2.0 static qemu-img builds.** Found by step 4b's
