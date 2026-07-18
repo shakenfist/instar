@@ -248,16 +248,17 @@ fn panic(_info: &PanicInfo) -> ! {
 /// This is exactly the set the qcow2 chain reader
 /// (`read_chain_virtual_cluster`) has an arm for: qcow2, vmdk (binary
 /// `Vmdk4` and the monolithicFlat `VmdkDescriptor`), vhd, vhdx, vdi,
-/// parallels, and raw (its `_ =>` fallback, which `read_raw_sectors`
-/// serves). Every other format — LUKS, qcow1, qed, iso, the legacy COWD
-/// `Vmdk3` — would be silently misread by that raw fallback, so bench
-/// refuses it.
+/// parallels, qcow1, and raw (its `_ =>` fallback, which
+/// `read_raw_sectors` serves). Every other format — LUKS, qed, iso, the
+/// legacy COWD `Vmdk3` — would be silently misread by that raw fallback,
+/// so bench refuses it.
 ///
-/// vdi is served by the qcow2 crate's `vdi-input` arm and parallels by
-/// its `parallels-input` arm, which bench enables in its Cargo.toml
-/// (alongside `vhd-input`/`vhdx-input`); format-coverage phases 2 and 3
-/// graduate them here in lock-step with the host `chain::ImageFormat`
-/// graduation so bench reads VDI and Parallels rather than refusing them.
+/// vdi is served by the qcow2 crate's `vdi-input` arm, parallels by its
+/// `parallels-input` arm, and qcow1 by its `qcow1-input` arm, which
+/// bench enables in its Cargo.toml (alongside `vhd-input`/`vhdx-input`);
+/// format-coverage phases 2, 3 and 4 graduate them here in lock-step
+/// with the host `chain::ImageFormat` graduation so bench reads VDI,
+/// Parallels and QCOW1 rather than refusing them.
 ///
 /// Returns a family tag: distinct formats compare unequal, but `Vmdk4`
 /// and `VmdkDescriptor` share a family so a descriptor whose flat
@@ -271,6 +272,7 @@ fn read_family(f: ImageFormat) -> Option<u8> {
         ImageFormat::Vhdx => Some(4),
         ImageFormat::Vdi => Some(5),
         ImageFormat::Parallels => Some(6),
+        ImageFormat::Qcow1 => Some(7),
         _ => None,
     }
 }

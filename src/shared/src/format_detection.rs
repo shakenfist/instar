@@ -9,8 +9,10 @@ use crate::ImageFormat;
 // Magic numbers for format detection (big-endian where noted)
 /// QCOW2 magic: "QFI\xfb" (big-endian at offset 0)
 pub const QCOW2_MAGIC: u32 = 0x514649fb;
-/// QCOW1 magic: "QFI" (big-endian at offset 0, 3 bytes)
-pub const QCOW1_MAGIC: u32 = 0x514649;
+/// QCOW header version that identifies the v1 ("qcow") format. QCOW1 and
+/// QCOW2 share the [`QCOW2_MAGIC`] 4-byte magic; the BE u32 version field
+/// at offset 4 is what tells them apart (1 == qcow1).
+pub const QCOW_VERSION_1: u32 = 1;
 /// VMDK4 magic: "VMDK" (little-endian at offset 0)
 pub const VMDK4_MAGIC: u32 = 0x564d444b;
 /// VMDK3 magic: "COWD" (little-endian at offset 0)
@@ -126,14 +128,19 @@ pub fn detect_format_from_header(buffer: &[u8], len: usize, _extra_detail: bool)
         return ImageFormat::Unknown;
     }
 
-    // Check QCOW2/QCOW1 magic (big-endian)
+    // Check QCOW magic (big-endian). QCOW1 and QCOW2 share the same
+    // 4-byte magic ("QFI\xfb"); only the BE u32 version field at offset 4
+    // distinguishes them — version 1 is qcow1, anything else routes to
+    // the qcow2 driver (whose open-time version check produces qemu's
+    // refusal for unsupported versions, mirroring qemu's own probe). The
+    // len >= 8 guard above covers reading offset 4..8.
     let magic_be = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
     if magic_be == QCOW2_MAGIC {
+        let version = u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]);
+        if version == QCOW_VERSION_1 {
+            return ImageFormat::Qcow1;
+        }
         return ImageFormat::Qcow2;
-    }
-    // QCOW1 has 3-byte magic
-    if (magic_be >> 8) == QCOW1_MAGIC {
-        return ImageFormat::Qcow1;
     }
 
     // Check VMDK magic (little-endian)

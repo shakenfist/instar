@@ -34,9 +34,9 @@ use shared::{be_u32, be_u64, CallTable, MAX_SECTOR_SIZE};
 
 // The QCOW1 magic is identical to the QCOW2 magic (`QFI\xfb`); only the
 // version field distinguishes the two formats. Reuse the shared constant
-// rather than redefining it. NOTE: `shared::format_detection::QCOW1_MAGIC`
-// is a 3-byte legacy value (`0x514649`) used only by the dead detection
-// branch and is deliberately NOT used here.
+// rather than redefining it. Detection performs the same magic+version
+// split (`shared::format_detection::detect_format_from_header` +
+// `QCOW_VERSION_1`); this parser re-validates both.
 use shared::format_detection::QCOW2_MAGIC;
 
 // ============================================================================
@@ -637,8 +637,8 @@ mod tests {
             ..HeaderSpec::default()
         };
         assert!(Qcow1Header::parse(&build_header(&spec)).is_none());
-        // The 3-byte legacy QCOW1_MAGIC must NOT be accepted as the 4-byte
-        // magic; only the full 0x514649fb passes.
+        // A 3-byte "QFI" prefix must NOT be accepted as the 4-byte magic;
+        // only the full 0x514649fb passes.
         assert!(Qcow1Header::parse(&build_header(&HeaderSpec::default())).is_some());
     }
 
