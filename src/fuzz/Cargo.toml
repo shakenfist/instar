@@ -14,6 +14,7 @@ qcow2 = { path = "../crates/qcow2", features = ["decompress", "decompress-zstd"]
 vmdk = { path = "../crates/vmdk", features = ["decompress"] }
 vhd = { path = "../crates/vhd" }
 vhdx = { path = "../crates/vhdx" }
+vdi = { path = "../crates/vdi" }
 raw = { path = "../crates/raw" }
 luks = { path = "../crates/luks" }
 measure = { path = "../crates/measure" }
@@ -65,6 +66,12 @@ doc = false
 test = false
 
 [[bin]]
+name = "fuzz_vdi_header"
+path = "fuzz_targets/fuzz_vdi_header.rs"
+doc = false
+test = false
+
+[[bin]]
 name = "fuzz_raw_partition"
 path = "fuzz_targets/fuzz_raw_partition.rs"
 doc = false
@@ -111,6 +118,12 @@ test = false
 [[bin]]
 name = "fuzz_vhdx_metadata"
 path = "fuzz_targets/fuzz_vhdx_metadata.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "fuzz_vdi_bat"
+path = "fuzz_targets/fuzz_vdi_bat.rs"
 doc = false
 test = false
 

@@ -49,7 +49,7 @@ from helpers.snapshot_readback import snapshot_readback  # noqa: E402
 # Constants
 # ---------------------------------------------------------------------------
 
-FORMATS = ['qcow2', 'raw', 'vmdk', 'vpc']
+FORMATS = ['qcow2', 'raw', 'vmdk', 'vpc', 'vdi']
 OUTPUT_FORMATS = ['qcow2', 'raw', 'vmdk', 'vpc']
 VIRTUAL_SIZES = ['1M', '4M', '16M', '64M', '256M', '1G']
 QCOW2_CLUSTER_SIZES = [512, 4096, 65536, 262144, 2097152]
@@ -141,6 +141,16 @@ def generate_image(rng, workdir, iteration):
     if fmt == 'vmdk':
         # VMDK only supports specific sub-formats; use monolithicSparse
         cmd.extend(['-o', 'subformat=monolithicSparse'])
+
+    if fmt == 'vdi':
+        # VDI supports dynamic (default) and static (pre-allocated,
+        # identity block map) images; instar's reader must handle both
+        # (PLAN-format-coverage-phase-02-vdi-read.md step 2f), so pick
+        # static some of the time.
+        static = rng.random() < 0.3
+        attrs['static'] = static
+        if static:
+            cmd.extend(['-o', 'static=on'])
 
     cmd.extend([str(image_path), vsize])
 
@@ -1007,7 +1017,17 @@ def op_measure(instar_bin, instar_copy, qemu_copy, fmt,
                timeout, rng):
     """Run instar measure and compare to qemu-img measure (raw/qcow2)
     or instar convert's actual output size (vmdk/vpc/vhdx).
+
+    VDI sources are gated out: `measure` is out of scope for the VDI
+    read path (PLAN-format-coverage-phase-02-vdi-read.md "Out of
+    scope" — measure isn't one of the four reader-linking ops that
+    gained vdi-input), so instar refuses a VDI source while qemu-img
+    measure succeeds. Comparing would be a spurious
+    exit_code_divergence, not a real instar defect.
     """
+    if fmt == 'vdi':
+        return None
+
     # Pick a target format.
     target_fmt = rng.choice(['raw', 'qcow2', 'vmdk', 'vpc', 'vhdx'])
 
@@ -3499,11 +3519,18 @@ def op_map(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
     docs/quirks.md) that would noise-flood the fuzzer. The same
     posture as `op_info`'s raw skip.
 
+    VDI is gated out too: instar refuses `map` on VDI sources
+    (guest-side ERROR_INVALID_SOURCE — map is out of scope for the
+    VDI read path, PLAN-format-coverage-phase-02-vdi-read.md "Out of
+    scope") while qemu-img map succeeds, which would be a spurious
+    exit_code_divergence on every VDI iteration rather than a real
+    instar defect.
+
     Other format-level divergences (chain qcow2 refused, vmdk
     multi-extent refused, vhdx partial-present) don't fire here
     because generate_image() never produces those shapes.
     """
-    if fmt == 'raw':
+    if fmt in ('raw', 'vdi'):
         return None
 
     virtual_size = _map_probe_virtual_size(qemu_copy, timeout)
