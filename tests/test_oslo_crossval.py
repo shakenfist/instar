@@ -138,6 +138,19 @@ OSLO_SKIP_IMAGES = {
     'parallels-huge-tracks',
     'parallels-huge-catalog',
     'parallels-ext-bad-magic',
+    # Malformed QCOW1 header fixtures (format-coverage phase 4,
+    # PLAN-format-coverage-phase-04-qcow1-read.md). safety: "malformed",
+    # run_in_ci: true, so they need an explicit skip. oslo detects them as
+    # 'qcow2' by magic and its safety_check raises on the unsupported version,
+    # while qemu (and instar) refuse each at open under the qcow driver
+    # (bad cluster_bits, bad l2_bits, image too large, invalid crypt_method,
+    # backing name too long). Cross-validating oslo's blind qcow2 acceptance
+    # against instar's refusal is not meaningful.
+    'qcow1-bad-cluster-bits',
+    'qcow1-bad-l2-bits',
+    'qcow1-huge-size',
+    'qcow1-crypt-invalid',
+    'qcow1-backing-name-too-long',
 }
 
 # Format name mapping: instar -> oslo.utils.
@@ -186,6 +199,24 @@ KNOWN_FORMAT_DIVERGENCES = {
     'parallels-inuse': ('parallels', 'raw'),
     'parallels-bat-past-eof': ('parallels', 'raw'),
     'parallels-cluster-4k': ('parallels', 'raw'),
+    # Format-coverage phase 4 (PLAN-format-coverage-phase-04-qcow1-read.md):
+    # oslo.utils detects qcow1 by magic only (QFI\xfb) and reports 'qcow2',
+    # ignoring the version field; instar reports 'qcow'. Virtual sizes agree
+    # (the size u64 sits at offset 24 in both formats), so these have no
+    # KNOWN_VSIZE_DIVERGENCES entry (and TestOsloVirtualSize skips them here
+    # anyway). oslo's safety_check() raises SafetyCheckFailed
+    # ('unknown_features': "Unsupported qcow2 version") for all; qcow1-backing
+    # additionally flags 'backing_file' (offset-8 backing pointer), which the
+    # generic safety cross-val matches against instar's backing-filename.
+    # qcow1-odd-size is the one exception with a (documented-only)
+    # KNOWN_VSIZE_DIVERGENCES entry below.
+    'qcow1-data': ('qcow', 'qcow2'),
+    'qcow1-compressed': ('qcow', 'qcow2'),
+    'qcow1-backing-base': ('qcow', 'qcow2'),
+    'qcow1-backing': ('qcow', 'qcow2'),
+    'qcow1-encrypted': ('qcow', 'qcow2'),
+    'qcow1-past-eof': ('qcow', 'qcow2'),
+    'qcow1-odd-size': ('qcow', 'qcow2'),
     'bochs-growing': ('bochs', 'raw'),
     'cloop-simple': ('cloop', 'raw'),
     'dmg-simple': ('dmg', 'raw'),
@@ -276,6 +307,17 @@ KNOWN_VSIZE_DIVERGENCES = {
     # KNOWN_FORMAT_DIVERGENCES entry), so both tools must keep reporting these
     # exact values or the test fails and forces a re-evaluation.
     'vdi-odd-size': (1048577, 1049088),
+    # Format-coverage phase 4 (PLAN-format-coverage-phase-04-qcow1-read.md):
+    # qcow1-odd-size has its QCOW1 header size u64 (offset 24) patched to the odd
+    # value 1048577. oslo.utils' qcow2 inspector reads that u64 verbatim
+    # (1048577), while qemu computes total_sectors = size/512 and reports
+    # total_sectors*512 = 1048576 (truncate-DOWN) -- instar mirrors qemu for byte
+    # parity. Unlike vdi-odd-size (asserted at runtime because instar and oslo
+    # agree on 'vdi'), qcow1-odd-size is ALSO a KNOWN_FORMAT_DIVERGENCES entry
+    # (instar 'qcow' vs oslo 'qcow2'), so TestOsloVirtualSize skips it before
+    # reaching this dict; the pair is a documented, verified reference (captured
+    # live: oslo 1048577, instar 1048576) rather than a runtime assertion.
+    'qcow1-odd-size': (1048577, 1048576),
 }
 
 
