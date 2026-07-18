@@ -1430,3 +1430,72 @@ class TestCompareParallels(InstarTestBase):
             f'rc={rc} stdout={stdout!r} stderr={stderr!r}'
         )
         self.assertIn('mismatch', (stdout + stderr).lower())
+
+
+class TestCompareQcow1(InstarTestBase):
+    """compare read-path pins for QCOW1 ('qcow' v1) (format-coverage phase 4)."""
+
+    def _skip_unless(self, *image_ids):
+        images = []
+        for image_id in image_ids:
+            img = self.get_image(image_id)
+            if not img.path.exists():
+                self.skipTest(f'Image not found: {img.path}')
+            self.skip_if_hash_mismatch(img)
+            images.append(img)
+        return images
+
+    def test_compare_qcow1_data_vs_compressed_identical(self):
+        """compare qcow1-data vs qcow1-compressed: identical, exit 0.
+
+        These are two DIFFERENT files (uncompressed vs raw-DEFLATE
+        clusters) that decode to the same virtual content, so compare
+        must report identical and exit 0 -- the compressed-decode
+        equivalence pin.
+        """
+        img_a, img_b = self._skip_unless('qcow1-data', 'qcow1-compressed')
+        stdout, stderr, rc = self.run_instar_compare(
+            img_a.path, img_b.path, timeout=120)
+        self.assertEqual(
+            rc, 0,
+            f'compare qcow1-data vs qcow1-compressed should be identical; '
+            f'stdout={stdout!r} stderr={stderr!r}')
+        self.assertIn('identical', (stdout + stderr).lower())
+
+    def test_compare_qcow1_data_differs(self):
+        """compare qcow1-data vs qcow1-backing reports a mismatch (exit 1).
+
+        qcow1-data (2 MiB) and qcow1-backing (1 MiB, different content)
+        differ in both size and content, so compare must exit 1.
+        """
+        img_a, img_b = self._skip_unless('qcow1-data', 'qcow1-backing')
+        stdout, stderr, rc = self.run_instar_compare(
+            img_a.path, img_b.path, timeout=120)
+        self.assertEqual(
+            rc, 1,
+            f'compare of differing qcow1 images should exit 1; '
+            f'rc={rc} stdout={stdout!r} stderr={stderr!r}')
+        self.assertIn('mismatch', (stdout + stderr).lower())
+
+    def test_compare_qcow1_backing_matches_flattened(self):
+        """compare the qcow1 backing overlay against its qemu-flattened view.
+
+        Flatten qcow1-backing to raw with qemu-img (resolving the
+        512-byte-cluster overlay through its base), then instar compare
+        the overlay against that flat raw: identical, exit 0.  Pins that
+        instar's backing fall-through composes the same bytes qemu does.
+        """
+        (img,) = self._skip_unless('qcow1-backing')
+        with tempfile.NamedTemporaryFile(suffix='.raw') as flat:
+            _, q_stderr, q_rc = self.run_qemu_img_convert(
+                img.path, Path(flat.name), timeout=120)
+            self.assertEqual(
+                q_rc, 0, f'qemu-img flatten of qcow1-backing failed: {q_stderr}')
+
+            stdout, stderr, rc = self.run_instar_compare(
+                img.path, Path(flat.name), timeout=120)
+            self.assertEqual(
+                rc, 0,
+                f'compare qcow1-backing vs its flattened raw should be '
+                f'identical; stdout={stdout!r} stderr={stderr!r}')
+            self.assertIn('identical', (stdout + stderr).lower())

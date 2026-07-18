@@ -2114,3 +2114,43 @@ class TestBenchParallels(BenchTestBase):
             f'  instar: {self.header_line(i_out)!r}\n'
             f'  qemu:   {self.header_line(q_out)!r}')
         self.assertRegex(q_out.splitlines()[-1], COMPLETION_RE)
+
+
+class TestBenchQcow1(BenchTestBase):
+    """Smoke test for benchmarking QCOW1 input (format-coverage phase 4).
+
+    qcow1 graduates to a real read format for the reader-linking ops,
+    including bench (bench's Cargo.toml enables the qcow2 ``qcow1-input``
+    feature and its guest ``read_family`` allowlist gained a Qcow1 arm).
+    This pins that ``instar bench`` reads the qcow1-data fixture
+    successfully (exit 0, well-formed header + completion line) and stays
+    header-byte-identical to ``qemu-img bench``, rather than being
+    misdetected as qcow2.  The ``-f qcow`` format hint is qemu's own name
+    for the format.
+    """
+
+    def test_bench_qcow1_data(self):
+        """bench reads qcow1-data: exit 0, header parity with qemu-img."""
+        self._require_kvm()
+        image = self.get_image('qcow1-data')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        args = ['-c', '100', '-f', 'qcow', str(image.path)]
+
+        i_out, i_err, i_rc = self.run_instar_bench(*args)
+        self.assertEqual(
+            i_rc, 0, f'instar bench on qcow1 failed: stderr={i_err!r}')
+        self.assertRegex(i_out.splitlines()[-1], COMPLETION_RE)
+
+        q_out, q_err, q_rc = self.run_qemu_bench(*args)
+        self.assertEqual(
+            q_rc, 0, f'qemu-img bench on qcow1 failed: stderr={q_err!r}')
+
+        self.assertEqual(
+            self.header_line(i_out), self.header_line(q_out),
+            f'bench header mismatch on qcow1:\n'
+            f'  instar: {self.header_line(i_out)!r}\n'
+            f'  qemu:   {self.header_line(q_out)!r}')
+        self.assertRegex(q_out.splitlines()[-1], COMPLETION_RE)

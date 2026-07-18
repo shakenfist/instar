@@ -974,3 +974,129 @@ class TestAdversarialParallelsManifest(InstarTestBase):
 
     def test_parallels_ext_bad_magic_refused(self):
         self._assert_parallels_refused('parallels-ext-bad-magic')
+
+
+class TestAdversarialQcow1Manifest(InstarTestBase):
+    """Verify malformed QCOW1 fixtures are refused cleanly (fmt-cov 4).
+
+    Five fixtures each violate one of qemu's qcow1 open-time validation
+    rules that the new ``qcow1`` crate's ``Qcow1Header::parse`` enforces:
+    ``cluster_bits == 17`` (qcow1-bad-cluster-bits, outside [9,16]),
+    ``l2_bits == 14`` (qcow1-bad-l2-bits, outside [6,13]), a ``size`` at
+    the ``qcow_open`` L1-size cap (qcow1-huge-size, "Image too large"),
+    ``crypt_method == 2`` (qcow1-crypt-invalid, >= 2 unsupported), and a
+    ``backing_file_size == 1024`` (qcow1-backing-name-too-long, > 1023).
+    convert, compare, and dd must all exit non-zero with a non-empty
+    message and without hanging or crashing.
+
+    ``info`` DIFFERS from the vdi/parallels leniency posture, and this is
+    pinned deliberately.  For vdi/parallels the detection layer checks
+    only magic+version, so a malformed fixture still detects and info
+    emits a best-effort *nonzero* virtual size from the intact size
+    field.  qcow1's info arm parses MORE: ``Qcow1Header::parse``
+    validates cluster_bits / l2_bits / size / crypt_method /
+    backing-name, so on EVERY one of these five fixtures the parse FAILS
+    and the info arm falls back to the default/empty result -- detection
+    still routes the image to ``qcow`` (magic + version 1 are intact), so
+    info prints ``file format: qcow`` with ``virtual size: 0 (0 bytes)``
+    and exits 0 (empirically pinned 2026-07-18; see
+    PLAN-format-coverage-phase-04-qcow1-read.md step 4e, "the info arm
+    parses MORE than magic+version").  This zero virtual size is exactly
+    why convert and dd refuse: they surface "input image has zero virtual
+    size" rather than a format-detection failure.
+
+    The adversarial contract for info is the standard no-hang / no-crash
+    / non-empty output; additionally, because the behaviour is uniform
+    and load-bearing (it is the mechanism behind the convert/dd
+    refusals), each info result is pinned to exactly ``file format:
+    qcow`` + ``virtual size: 0 (0 bytes)`` + rc 0.
+    """
+
+    MALFORMED_IDS = [
+        'qcow1-bad-cluster-bits',
+        'qcow1-bad-l2-bits',
+        'qcow1-huge-size',
+        'qcow1-crypt-invalid',
+        'qcow1-backing-name-too-long',
+    ]
+
+    def _assert_qcow1_refused(self, image_id):
+        """convert/compare/dd refuse cleanly; info parses to an empty result."""
+        image = self.get_adversarial_image(image_id)
+        instar = str(self.get_instar_binary())
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as other:
+            Path(other.name).write_bytes(bytes(512))
+
+            # convert: must refuse, non-zero, non-empty message, no hang.
+            _c_out, c_err, c_rc = self.run_adversarial(
+                [instar, 'convert', '-O', 'raw', str(image.path), out.name],
+                timeout=15,
+            )
+            self.assertNotEqual(
+                c_rc, 0, f'convert should refuse malformed {image_id}')
+            self.assertTrue(
+                c_err.strip(),
+                f'convert should emit a non-empty error for {image_id}')
+
+            # compare: read failure surfaces as a mismatch on stdout, so
+            # the combined output is checked non-empty.  A malformed
+            # fixture reporting a mismatch (not "identical") proves it is
+            # not silently read as raw.
+            m_out, m_err, m_rc = self.run_adversarial(
+                [instar, 'compare', str(image.path), other.name],
+                timeout=15,
+            )
+            self.assertNotEqual(
+                m_rc, 0, f'compare should refuse malformed {image_id}')
+            self.assertTrue(
+                (m_out + m_err).strip(),
+                f'compare should emit a non-empty message for {image_id}')
+
+            # dd: must refuse, non-zero, non-empty message, no hang.
+            _d_out, d_err, d_rc = self.run_adversarial(
+                [instar, 'dd', '-O', 'raw',
+                 f'if={image.path}', f'of={out.name}'],
+                timeout=15,
+            )
+            self.assertNotEqual(
+                d_rc, 0, f'dd should refuse malformed {image_id}')
+            self.assertTrue(
+                d_err.strip(),
+                f'dd should emit a non-empty error for {image_id}')
+
+            # info: pinned empty/default result -- format qcow, vsize 0,
+            # rc 0 (the qcow1 info arm parses more than magic+version, so
+            # the mutated field breaks the parse entirely rather than
+            # yielding a lenient nonzero size; see the class docstring).
+            i_out, i_err, i_rc = self.run_adversarial(
+                [instar, 'info', str(image.path)],
+                timeout=15,
+            )
+            self.assertEqual(
+                i_rc, 0,
+                f'info on {image_id} should exit 0 (empty result): '
+                f'{i_out!r} {i_err!r}')
+            self.assertIn(
+                'file format: qcow', i_out,
+                f'info on {image_id} should still detect qcow: {i_out!r}')
+            self.assertIn(
+                'virtual size: 0 (0 bytes)', i_out,
+                f'info on {image_id} should report zero virtual size '
+                f'(failed parse -> default result): {i_out!r}')
+
+    def test_qcow1_bad_cluster_bits_refused(self):
+        self._assert_qcow1_refused('qcow1-bad-cluster-bits')
+
+    def test_qcow1_bad_l2_bits_refused(self):
+        self._assert_qcow1_refused('qcow1-bad-l2-bits')
+
+    def test_qcow1_huge_size_refused(self):
+        self._assert_qcow1_refused('qcow1-huge-size')
+
+    def test_qcow1_crypt_invalid_refused(self):
+        self._assert_qcow1_refused('qcow1-crypt-invalid')
+
+    def test_qcow1_backing_name_too_long_refused(self):
+        self._assert_qcow1_refused('qcow1-backing-name-too-long')

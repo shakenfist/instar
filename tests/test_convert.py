@@ -3884,6 +3884,367 @@ class TestConvertParallelsToRaw(InstarTestBase):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+class TestConvertQcow1ToRaw(InstarTestBase):
+    """Full QCOW1 ('qcow' v1) convert matrix (format-coverage phase 4).
+
+    Pins the graduation of qcow1 from a misdetect-as-qcow2 refusal to a
+    real read format: every safe fixture must convert byte-identically to
+    qemu-img convert (the suite's own qemu-img 10.x, which zero-fills
+    every truncation shape -- there is no qcow1 open-time regression
+    window on any version).  Each test names the read semantic it pins:
+
+      qcow1-data        two-level uncompressed L1/L2 lookup, scattered
+                        clusters (0/5/17/100/300/511, 4 KiB clusters)
+      qcow1-compressed  raw-DEFLATE clusters decode to the same content
+                        as qcow1-data (and byte-identically to it)
+      qcow1-backing     512-byte-cluster overlay reading through a base
+      qcow1-past-eof    a data cluster redirected past EOF zero-fills
+      qcow1-odd-size    header size u64 = 1048577 truncates DOWN to
+                        1048576 (contrast VDI's round-UP)
+      qcow1-encrypted   AES (crypt_method=1) is refused cleanly
+
+    The qcow2/vpc output-format and backing-chain read paths are pinned
+    separately below.
+    """
+
+    def _assert_convert_parity(self, image_id):
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as instar_raw, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+            stdout, stderr, rc = self.run_instar_convert(
+                image.path, Path(instar_raw.name), timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'instar convert failed for {image_id}: {stderr}'
+            )
+
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_convert(
+                image.path, Path(qemu_raw.name), timeout=120
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed for {image_id}: {q_stderr}'
+            )
+
+            self.assertEqual(
+                Path(instar_raw.name).read_bytes(),
+                Path(qemu_raw.name).read_bytes(),
+                f'convert output for {image_id} differs from qemu-img'
+            )
+
+    def test_convert_qcow1_data(self):
+        """Convert qcow1-data to raw (two-level uncompressed L1/L2 lookup)."""
+        self._assert_convert_parity('qcow1-data')
+
+    def test_convert_qcow1_compressed(self):
+        """Convert qcow1-compressed to raw (raw-DEFLATE clusters)."""
+        self._assert_convert_parity('qcow1-compressed')
+
+    def test_convert_qcow1_backing_base(self):
+        """Convert the standalone qcow1-backing-base to raw."""
+        self._assert_convert_parity('qcow1-backing-base')
+
+    def test_convert_qcow1_backing(self):
+        """Convert the 512-byte-cluster overlay reading through its base.
+
+        The base (qcow1-backing-base.qcow) lives in the same directory as
+        the overlay in the testdata tree, so the relative backing name
+        resolves inside the overlay's directory (the backing-path
+        allowlist restriction) without any staging.
+        """
+        self._assert_convert_parity('qcow1-backing')
+
+    def test_convert_qcow1_past_eof(self):
+        """Convert qcow1-past-eof: the past-EOF cluster zero-fills.
+
+        qemu zero-fills the out-of-image cluster (guest cluster 300) on
+        every version and exits 0; instar must match byte-for-byte.
+        """
+        self._assert_convert_parity('qcow1-past-eof')
+
+    def test_convert_qcow1_odd_size(self):
+        """Convert qcow1-odd-size: header size 1048577 truncates DOWN.
+
+        qemu computes total_sectors = size / 512 and produces
+        total_sectors * 512 = 1048576 bytes of output -- a truncate-DOWN
+        (contrast VDI's round-UP of an odd disk_size).  The byte-parity
+        check against qemu-img pins the 1048576-byte output.
+        """
+        image = self.get_image('qcow1-odd-size')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as instar_raw, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+            stdout, stderr, rc = self.run_instar_convert(
+                image.path, Path(instar_raw.name), timeout=120
+            )
+            self.assertEqual(
+                rc, 0, f'instar convert failed for qcow1-odd-size: {stderr}')
+
+            instar_bytes = Path(instar_raw.name).read_bytes()
+            self.assertEqual(
+                len(instar_bytes), 1048576,
+                f'qcow1-odd-size should truncate DOWN to 1048576 bytes, '
+                f'got {len(instar_bytes)}')
+
+            self.run_qemu_img_convert(
+                image.path, Path(qemu_raw.name), timeout=120)
+            self.assertEqual(
+                instar_bytes, Path(qemu_raw.name).read_bytes(),
+                'qcow1-odd-size convert output differs from qemu-img')
+
+    def test_convert_qcow1_compressed_matches_data(self):
+        """qcow1-compressed converts byte-identically to qcow1-data's output.
+
+        The compressed fixture is a `convert -c` twin of qcow1-data with
+        the same raw content; the raw-DEFLATE decode must reproduce the
+        uncompressed image's bytes exactly (the compressed-decode
+        equivalence pin, complementing the compare-identical test).
+        """
+        data = self.get_image('qcow1-data')
+        comp = self.get_image('qcow1-compressed')
+        for img in (data, comp):
+            if not img.path.exists():
+                self.skipTest(f'Image not found: {img.path}')
+            self.skip_if_hash_mismatch(img)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as data_raw, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as comp_raw:
+            _, d_err, d_rc = self.run_instar_convert(
+                data.path, Path(data_raw.name), timeout=120)
+            self.assertEqual(d_rc, 0, f'convert qcow1-data failed: {d_err}')
+            _, c_err, c_rc = self.run_instar_convert(
+                comp.path, Path(comp_raw.name), timeout=120)
+            self.assertEqual(
+                c_rc, 0, f'convert qcow1-compressed failed: {c_err}')
+
+            self.assertEqual(
+                Path(comp_raw.name).read_bytes(),
+                Path(data_raw.name).read_bytes(),
+                'qcow1-compressed convert output differs from qcow1-data')
+
+    def test_convert_qcow1_encrypted_refused(self):
+        """convert of an AES qcow1 (crypt_method=1) refuses cleanly.
+
+        Keyless qemu likewise refuses to read encrypted data, so this is
+        behavioural parity; instar surfaces "convert operation failed"
+        with a non-zero exit and no hang.
+        """
+        image = self.get_image('qcow1-encrypted')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            stdout, stderr, rc = self.run_instar_convert(
+                image.path, Path(out.name), timeout=60)
+            self.assertNotEqual(
+                rc, 0,
+                f'convert of encrypted qcow1 should refuse: '
+                f'{stdout!r} {stderr!r}')
+            self.assertIn(
+                'convert operation failed', stdout + stderr,
+                f'unexpected refusal message: {stdout!r} {stderr!r}')
+
+    # ------------------------------------------------------------------
+    # qcow1 read validated through non-raw output formats.
+    #
+    # Convert qcow1-data with instar to qcow2 / vpc, flatten the instar
+    # output back to raw with qemu-img, and compare against the canonical
+    # qemu-img raw view.  This isolates the qcow1 read path from output
+    # geometry quirks: qemu's vpc writer rounds up to CHS geometry, so the
+    # flattened raws are compared on their common prefix with any tail
+    # required to be zero padding.
+    # ------------------------------------------------------------------
+
+    def _test_qcow1_output_format(self, fmt):
+        image = self.get_image('qcow1-data')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as ref_raw, \
+                tempfile.NamedTemporaryFile(suffix=f'.{fmt}') as instar_out, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as flat_raw:
+            _, q_stderr, q_rc = self.run_qemu_img_convert(
+                image.path, Path(ref_raw.name), timeout=120)
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert to raw failed for qcow1-data: {q_stderr}')
+
+            _, stderr, rc = self.run_instar_convert(
+                image.path, Path(instar_out.name),
+                output_format=fmt, timeout=120)
+            self.assertEqual(
+                rc, 0, f'instar convert qcow1-data -> {fmt} failed: {stderr}')
+
+            result = subprocess.run(
+                ['qemu-img', 'convert', '-O', 'raw',
+                 instar_out.name, flat_raw.name],
+                capture_output=True, text=True, timeout=120)
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img flatten of instar {fmt} output failed: '
+                f'{result.stderr}')
+
+            ref_bytes = Path(ref_raw.name).read_bytes()
+            flat_bytes = Path(flat_raw.name).read_bytes()
+            n = min(len(ref_bytes), len(flat_bytes))
+            self.assertEqual(
+                ref_bytes[:n], flat_bytes[:n],
+                f'instar {fmt} output (flattened) differs from qemu raw '
+                f'for qcow1-data in the common prefix')
+            self.assertFalse(
+                any(ref_bytes[n:]) or any(flat_bytes[n:]),
+                f'non-zero tail beyond common prefix for {fmt} '
+                f'(ref={len(ref_bytes)} flat={len(flat_bytes)})')
+
+    def test_convert_qcow1_to_qcow2(self):
+        """Convert qcow1-data to qcow2 and validate the read path."""
+        self._test_qcow1_output_format('qcow2')
+
+    def test_convert_qcow1_to_vpc(self):
+        """Convert qcow1-data to vpc and validate the read path."""
+        self._test_qcow1_output_format('vpc')
+
+    def test_convert_qcow2_over_qcow1_backing_chain(self):
+        """Convert a qcow2 overlay backed by a qcow1 image; match qemu-img.
+
+        Builds ``overlay.qcow2`` with ``qemu-img create -b <qcow1> -F
+        qcow`` in the test tmpdir (the qcow1 fixture is copied in first
+        because instar only reads backing files inside the overlay's
+        directory), writes a 64 KiB overlay pattern into a backing hole,
+        then asserts instar and qemu-img produce identical raw output for
+        the composed cross-format chain.  Pins mid-chain qcow1 reads
+        (qcow1 is the first non-qcow2 backing format).  Skipped if the
+        tested qemu refuses ``-F qcow``.
+        """
+        image = self.get_image('qcow1-data')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+        if not shutil.which('qemu-io'):
+            self.skipTest('qemu-io not available')
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            backing = os.path.join(tmpdir, 'backing.qcow')
+            overlay = os.path.join(tmpdir, 'overlay.qcow2')
+            shutil.copyfile(str(image.path), backing)
+
+            create = subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-b', 'backing.qcow', '-F', 'qcow', 'overlay.qcow2'],
+                capture_output=True, text=True, timeout=60, cwd=tmpdir)
+            if create.returncode != 0:
+                self.skipTest(
+                    f'qemu-img does not accept -F qcow backing format: '
+                    f'{create.stderr}')
+
+            # Guest clusters 1/2/3/4 (offset 4096..) are holes in
+            # qcow1-data (data lives at 0/5/17/...); write the overlay at
+            # 128 KiB so the composed view mixes overlay and backing data.
+            io = subprocess.run(
+                ['qemu-io', '-c', 'write -P 0xEE 131072 65536', overlay],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(
+                io.returncode, 0, f'qemu-io overlay write failed: {io.stderr}')
+
+            instar_raw = os.path.join(tmpdir, 'instar.raw')
+            qemu_raw = os.path.join(tmpdir, 'qemu.raw')
+
+            _, stderr, rc = self.run_instar_convert(
+                Path(overlay), Path(instar_raw), timeout=120)
+            self.assertEqual(
+                rc, 0,
+                f'instar convert of qcow2-over-qcow1 chain failed: {stderr}')
+
+            _, q_stderr, q_rc = self.run_qemu_img_convert(
+                Path(overlay), Path(qemu_raw), timeout=120)
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert of qcow2-over-qcow1 chain failed: '
+                f'{q_stderr}')
+
+            self.assertEqual(
+                Path(instar_raw).read_bytes(),
+                Path(qemu_raw).read_bytes(),
+                'instar convert of qcow2-over-qcow1 chain differs from '
+                'qemu-img')
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_convert_qcow1_over_raw_backing_chain(self):
+        """Convert a qcow1 overlay backed by a raw base; match qemu-img.
+
+        Empirically verified that qemu accepts ``qemu-img create -f qcow
+        -b <raw> -F raw``.  Builds a raw base with data at offset 0 and a
+        qcow1 overlay masking a different offset in the test tmpdir, then
+        asserts instar and qemu-img produce identical raw output for the
+        composed chain.  Skipped if the tested qemu refuses the qcow
+        overlay creation.
+        """
+        if not shutil.which('qemu-io'):
+            self.skipTest('qemu-io not available')
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            base = os.path.join(tmpdir, 'base.raw')
+            overlay = os.path.join(tmpdir, 'overlay.qcow')
+
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw', base, '1M'],
+                capture_output=True, check=True, timeout=60)
+            subprocess.run(
+                ['qemu-io', '-f', 'raw', '-c', 'write -P 0xBB 0 4096', base],
+                capture_output=True, check=True, timeout=60)
+
+            create = subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow',
+                 '-b', 'base.raw', '-F', 'raw', 'overlay.qcow'],
+                capture_output=True, text=True, timeout=60, cwd=tmpdir)
+            if create.returncode != 0:
+                self.skipTest(
+                    f'qemu-img does not support a qcow overlay over raw: '
+                    f'{create.stderr}')
+
+            io = subprocess.run(
+                ['qemu-io', '-f', 'qcow', '-c', 'write -P 0xAA 65536 4096',
+                 overlay],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(
+                io.returncode, 0, f'qemu-io overlay write failed: {io.stderr}')
+
+            instar_raw = os.path.join(tmpdir, 'instar.raw')
+            qemu_raw = os.path.join(tmpdir, 'qemu.raw')
+
+            _, stderr, rc = self.run_instar_convert(
+                Path(overlay), Path(instar_raw), timeout=120)
+            self.assertEqual(
+                rc, 0,
+                f'instar convert of qcow-over-raw chain failed: {stderr}')
+
+            _, q_stderr, q_rc = self.run_qemu_img_convert(
+                Path(overlay), Path(qemu_raw), timeout=120)
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert of qcow-over-raw chain failed: {q_stderr}')
+
+            self.assertEqual(
+                Path(instar_raw).read_bytes(),
+                Path(qemu_raw).read_bytes(),
+                'instar convert of qcow-over-raw chain differs from qemu-img')
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 class TestConvertVdiToRaw(InstarTestBase):
     """Smoke test for VDI to raw conversion (format-coverage phase 2).
 
