@@ -45,6 +45,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Format-coverage phase 3: Parallels convert-from read path
+  (PLAN-format-coverage phase 3).** `instar convert`, `compare`,
+  `dd`, and `bench` now accept Parallels Disk Image as input — both
+  the legacy `WithoutFreeSpace` (v1) and newer `WithouFreSpacExt`
+  (v2/ext) magics — via a new `src/crates/parallels/` no_std parser
+  crate wired into the qcow2 crate's chain reader (`parallels-input`
+  feature, enabled by convert/compare/bench/rebase to avoid the
+  raw-fallback hazard #444 closed). The reader matches qemu's RO open
+  path exactly: `tracks`/`bat_entries` limits (the `tracks` cap is
+  4186127, corrected during this phase from an off-by-681 planning
+  estimate), per-magic BAT decoding (sector-valued entries under v1,
+  cluster-valued entries under v2/ext), the v1-only 32-bit
+  `nb_sectors` mask, `inuse`-dirty images always readable (instar
+  only ever opens read-only), `data_off` ignored by reads, and
+  past-EOF/truncated reads zero-filling rather than erroring — with
+  one recorded version drift: qemu 8.1.0-8.1.5 refuse a past-EOF BAT
+  entry at open (a regression window closed in 8.2.0), which instar's
+  uniform zero-fill diverges from; the affected baselines are recorded
+  faithfully via a new `profile-8-1-0` bucket, and
+  `tests/test_info_safe.py` gained a general mechanism to skip
+  scenario generation for any profile whose baseline meta records a
+  non-zero qemu-img return code. A non-zero `ext_off` is refused at
+  init — a deliberate divergence from qemu's read-only format-
+  extension parsing (dirty bitmaps); no shipped or creatable fixture
+  needs it today. Because qemu prints no `cluster_size` for Parallels,
+  `instar info` now computes and stores it internally
+  (`tracks << 9`) so the chain reader's chunking respects real cluster
+  boundaries, while both emitters suppress the field for the
+  `"parallels"` format string so `info` output stays byte-identical to
+  qemu (verified by a full `test_info_safe` run, zero regressions).
+  `parallels` leaves the phase-1 #444 refusal set entirely — it now
+  has a real reader instead of a typed refusal. `check` is unaffected
+  and still refuses Parallels (exit 63, "This image format
+  (parallels) does not support checks"); qemu-img's own Parallels
+  check is not mirrored because it asserts/crashes on newer qemu
+  (10.2.0's `parallels_check_duplicate` assertion) for out-of-image
+  BAT entries, making refusal the safer stance. `map`, `measure`, and
+  `resize` are unchanged refusals. Nine new fixtures (five safe: a
+  non-contiguous/swapped BAT, the v1-magic twin with sector-valued
+  BAT entries, an `inuse`-dirty twin, a past-EOF BAT entry, and a
+  4 KiB-cluster small-cluster case; four malformed: zero tracks, huge
+  tracks, huge catalog, bad extension magic) plus the existing
+  `parallels-v1`/`parallels-v2` joining the convert-parity matrix, all
+  with cross-version qemu-img baselines, coverage-guided fuzzing of
+  the header parser and BAT walk across both magics
+  (`fuzz_parallels_header`, `fuzz_parallels_bat`), and `parallels`
+  added to the differential fuzzer's format pool. See
+  [docs/format-coverage.md](docs/format-coverage.md) and
+  [docs/quirks.md](docs/quirks.md) for the full divergence records.
+
 - **Format-coverage phase 2: VDI convert-from read path
   (PLAN-format-coverage phase 2).** `instar convert`, `compare`, and
   `dd` now accept VDI (VirtualBox Disk Image) as input — both dynamic

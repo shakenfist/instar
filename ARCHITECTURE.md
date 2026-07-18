@@ -238,6 +238,17 @@ provides a modular architecture with:
   Read-only: no write/output support. Linked into the qcow2 crate's
   chain reader behind the `vdi-input` feature and used by convert,
   compare, bench, and rebase (PLAN-format-coverage phase 2).
+- **crates/parallels/** - Shared Parallels Disk Image format crate:
+  header parsing and validation against qemu's RO `parallels_open`
+  rules (both magics, version check, `tracks`/`bat_entries` limits,
+  `ext_off != 0` refused), per-magic BAT decoding (sector-valued
+  entries under the legacy `WithoutFreeSpace` magic, cluster-valued
+  entries under `WithouFreSpacExt`), the v1-only 32-bit `nb_sectors`
+  mask, and `ParallelsState` for stateful block I/O
+  (`init`/`block_lookup`, mirroring `vdi::VdiState`). Read-only: no
+  write/output support. Linked into the qcow2 crate's chain reader
+  behind the `parallels-input` feature and used by convert, compare,
+  bench, and rebase (PLAN-format-coverage phase 3).
 - **crates/luks/** - Shared LUKS format crate: LUKS v1/v2 header
   constants, header parsing, PBKDF2 key derivation, Argon2id key
   derivation (behind `kdf-argon2` feature), AFsplitter key recovery,

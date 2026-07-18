@@ -226,7 +226,7 @@ is the tracking source of truth.
 |-------|------|--------|
 | 1. Detection + info parity (Parallels, Bochs, cloop, DMG; settle the trailer-probe question) | [PLAN-format-coverage-phase-01-detection.md](PLAN-format-coverage-phase-01-detection.md) | Complete (commits 3c0fff1..5042d74 + docs commit) |
 | 2. VDI convert-from (dynamic + static read path, new `src/crates/vdi/`) | [PLAN-format-coverage-phase-02-vdi-read.md](PLAN-format-coverage-phase-02-vdi-read.md) | Complete (commits 6cd14b5..cf213ed + docs commit) |
-| 3. Parallels convert-from (v2 read path, new `src/crates/parallels/`) | [PLAN-format-coverage-phase-03-parallels-read.md](PLAN-format-coverage-phase-03-parallels-read.md) | Planned (2026-07-18), not started |
+| 3. Parallels convert-from (v2 read path, new `src/crates/parallels/`) | [PLAN-format-coverage-phase-03-parallels-read.md](PLAN-format-coverage-phase-03-parallels-read.md) | Complete (commits 3f43472..f2bacf4 + docs commit) |
 | 4. QCOW1 convert-from (read path, likely inside `src/crates/qcow2/` as a sibling parser) | PLAN-format-coverage-phase-04-qcow1-read.md | Not written |
 | 5. DMG convert-from (koly trailer + BLKX chunk table + zlib chunks, new `src/crates/dmg/`) | PLAN-format-coverage-phase-05-dmg-read.md | Not written |
 | 6. QED decision: read path or documented refusal (see Open question 1) | PLAN-format-coverage-phase-06-qed.md | Not written |
@@ -488,6 +488,24 @@ chosen to defer to here so that we don't forget them.
 * `instar check` support for VDI (phase 2 future work: qemu-img
   `check` validates the VDI block map; unconsumed check baselines
   already exist in instar-testdata from `generate-baselines.py`).
+* Parallels format extensions / dirty bitmaps: phase 3's reader
+  refuses any non-zero `ext_off` at init rather than parsing the
+  format extension qemu reads read-only, since no shipped or
+  creatable fixture needs it today (deliberate divergence, see
+  `docs/quirks.md` "Format-coverage phase 3"). Revisit if a real
+  need for extension/dirty-bitmap data appears.
+* Report the qemu `parallels_check_duplicate` assertion crash
+  (10.2.0's `qemu-img check` asserts on an out-of-image BAT entry
+  that 6.0.0 reports cleanly) upstream to the qemu project; this is
+  also why `instar check` continues to refuse Parallels rather than
+  mirroring qemu-img's check support.
+* The `profile-8-1-0` baseline split introduced by phase 3 (to
+  record qemu 8.1.0-8.1.5's past-EOF-BAT open-refusal regression
+  for `parallels-bat-past-eof`) received copies of `profile-8-0-0`'s
+  hand-maintained LUKS goldens so pre-split coverage wasn't lost;
+  any future profile split should follow the same precedent — carry
+  over the neighbouring profile's hand-authored LUKS goldens rather
+  than regenerating them.
 
 ### Bugs fixed during this work
 

@@ -2,7 +2,7 @@
 
 Master plan: [PLAN-format-coverage.md](PLAN-format-coverage.md)
 
-## Status: Planned (2026-07-18), not started
+## Status: Complete (2026-07-18)
 
 ## Prompt
 
@@ -352,23 +352,156 @@ last.
 
 ## Findings: step 3a — parallels crate
 
-(to be filled during execution)
+* The `parallels` crate landed as planned: `ParallelsHeader::parse`
+  enforces qemu's RO open rules with the exact limits from the
+  Situation table (tracks non-zero and under the cap, bat_entries
+  under the catalog limit, a recognised magic, version 2, `ext_off ==
+  0`), and stores `off_multiplier` (1 for the v1 `WithoutFreeSpace`
+  magic, `tracks` for the `WithouFreSpacExt` ext magic),
+  `cluster_size = tracks << 9`, and the per-magic-masked
+  `virtual_size`. `ParallelsState::init`/`block_lookup` mirror the
+  `VdiState` signatures, walking the BAT through the same
+  cached-sector pattern the vdi and vhd crates use. 20 boundary unit
+  tests cover every validation rule (accept/reject at exact limits),
+  the per-magic BAT decoding equivalence (v1 `[0x80,0x100,...]` vs v2
+  `[1,2,...]` at `tracks=128` producing identical offsets), the
+  `nb_sectors` 32-bit mask under v1 vs full-width under v2, `inuse`
+  parsing without refusal, `data_off` garbage being ignored, and
+  `ext_off` nonzero being refused.
+* The magic constants (`WithoutFreeSpace` / `WithouFreSpacExt`) are
+  not redefined in the new crate — it imports
+  `shared::format_detection::PARALLELS_MAGIC_V1` and
+  `PARALLELS_MAGIC_V2` (aliased locally to `PARALLELS_MAGIC_EXT` for
+  clarity) so the detector and the reader can never drift apart on
+  what a valid magic is.
+* The crate's initial `PARALLELS_TRACKS_MAX` came from the plan's
+  planning-stage arithmetic (`INT32_MAX / 513`, computed as
+  4185446) and was later corrected to the empirically-verified
+  4186127 by step 3d's fixture validation (commit `8dbf89f`) — the
+  boundary unit tests reference the constant symbolically, so no test
+  rewrite was needed for the correction, only the constant itself and
+  the plan's own Situation table.
 
 ## Findings: step 3c — graduation, info plumbing, gate-lifted ops
 
-(to be filled during execution; must record the chunking
-guarantee from 3b, the cluster-size suppression verification,
-and the observed check/bench behaviour)
+* The cluster-size plumbing landed exactly as designed: the guest
+  `info` op's `parse_parallels_header` now additionally reads `tracks`
+  and sets `result.cluster_size = tracks << 9` internally, while both
+  host emitters (`print_info_result` and `print_info_result_json`)
+  suppress `cluster_size` for the `"parallels"` format string — a
+  format-gated suppression (not value-gated), mirroring the existing
+  dirty-flag JSON suppression mechanism. This was verified
+  byte-identical against the 10.2.0 info baselines and a full
+  `test_info_safe` run with zero regressions before graduation
+  landed, confirming the suppression hides even a real nonzero
+  `tracks` value rather than relying on it happening to be zero.
+* Step 3b's chunking analysis (read ahead of writing the chain-reader
+  arm, per the plan's coordination note) found that compare/bench/
+  rebase chunk sizes can span multiple small Parallels clusters —
+  unlike VDI, where the chain reader's 64 KiB-capped aligned chunks
+  always divide VDI's fixed 1 MiB blocks and so never cross a block
+  boundary. Because Parallels' cluster size is user-settable
+  (`-o cluster_size`) and can be smaller than a chunk, the Parallels
+  reader arm cannot inherit the VDI arm's "one lookup per chunk"
+  shape; it instead walks per-cluster internally using the
+  header-derived `cluster_size`, a documented deviation from the VDI
+  arm's structure. `parallels-cluster-4k` (tracks=8, 4 KiB clusters)
+  pins this end-to-end.
+* Graduation (chain.rs `Parallels` variant, `from_str`,
+  `to_shared_format_u32 => 13`, `Display`) and the bench
+  `read_family` allowlist arm (`Parallels => Some(6)`) landed
+  together, closing the same raw-fallback-hazard class of gap the
+  VDI phase found for bench's independent format dispatch.
+* Empirical pins for every gate-lifted or gate-unchanged operation,
+  run against the parallels fixtures:
+  - `check` exits 63 cleanly with `This image format (parallels) does
+    not support checks` — no raw read, no hang, unchanged from
+    pre-graduation.
+  - `bench` succeeds (exit 0) with header output byte-parity against
+    `qemu-img bench`.
+  - `map` still refuses with `source format unrecognised`.
+  - `measure` still refuses with `source image is unsupported
+    format`.
+  - `resize` still refuses with `format Parallels is not supported
+    for in-place resize` — `chain::ImageFormat`'s own `{:?}` debug
+    string now prints `Parallels` instead of `Unknown` since the
+    variant exists, but the refusal test itself is unchanged.
 
 ## Findings: step 3d — fixtures and baselines
 
-(to be filled during execution; must record the generated
-sha256s, the oslo divergence pairs, and any qemu check
-crash encountered during baseline generation)
+* All nine new fixtures were generated deterministically by
+  `instar-testdata/scripts/generate-parallels-fixtures.py`. Unlike
+  VDI, Parallels image creation needed no UUID-patching step to reach
+  byte-determinism — `qemu-img create -f parallels` and
+  `convert -O parallels` are already cmp-identical across repeat
+  runs, so the generator only applies each fixture's specific
+  byte-patch (magic swap, BAT rewrite, header field corruption) on
+  top of a plain create/convert.
+* Step 3a's planning-stage tracks-cap arithmetic (4185446) was found
+  too low by one boundary step during fixture validation: qemu opens
+  `tracks=4185447` cleanly and refuses `tracks=4186128` as the
+  smallest rejected value, giving a true cap of 4186127. The
+  `parallels-huge-tracks` fixture was built at the corrected boundary
+  and the crate constant was fixed in lock-step (commit `8dbf89f`,
+  folded back into step 3a's crate and the plan's Situation table).
+* Fixture validation also surfaced a version-drift the planning spot
+  set had missed: qemu 8.1.0 through 8.1.5 refuse a past-EOF BAT
+  entry **at open** (a regression window closed again in 8.2.0),
+  while every other spot-checked version zero-fills it like instar
+  does uniformly. This forced a new `profile-8-1-0` baseline bucket,
+  split out from its neighbouring profile so the two refusing
+  versions don't corrupt a shared baseline; the new bucket received
+  copies of `profile-8-0-0`'s hand-maintained LUKS goldens so that
+  pre-split LUKS coverage wasn't silently dropped by the split. This
+  also motivated `tests/test_info_safe.py`'s new general mechanism
+  (commit `30ecf77`) to skip scenario generation for any profile
+  whose baseline meta records a non-zero qemu-img return code —
+  `parallels-bat-past-eof` is the first safe fixture to be refused by
+  qemu on only a subset of profiles, so the mechanism needed to be
+  general rather than a one-off special case.
+* oslo divergence pairs were computed by the `min(file_size, 262144)`
+  rule and confirmed live against the real oslo.utils
+  `RawFileInspector` fallback: `(262144, 2097152)` for
+  `parallels-data-v2`, `parallels-data-v1`, `parallels-inuse`, and
+  `parallels-bat-past-eof` (all four share the same 2 MiB virtual
+  size and an on-disk size at or above the 262144 cap), and
+  `(20480, 262144)` for `parallels-cluster-4k` (a 20480-byte on-disk
+  file below the cap, so oslo reports the raw file size, against a
+  256 KiB virtual size).
+* No qemu check crash was hit during this step's own baseline
+  generation run; the known 10.2.0 `parallels_check_duplicate`
+  assertion is a property of adversarial out-of-image BAT entries
+  under `qemu-img check`, not of `generate-baselines.py`'s info-only
+  baseline pass, so it did not need to be worked around here (it is
+  the reason `instar check` continues to refuse Parallels — see
+  quirks.md and the master plan's future-work list).
 
 ## Findings: step 3e — integration tests
 
-(to be filled during execution)
+* Full touched-suite results, run locally: `test_convert` 227
+  passed, `test_compare` 59 passed, `test_dd` 41 passed,
+  `test_adversarial` 83 passed, `test_info_safe` 800 passed,
+  `test_oslo_crossval` 231 passed, `test_bench` 78 passed,
+  `test_rebase` 27 passed. All skips present were pre-existing and
+  unrelated to Parallels; zero failures across all eight suites.
+* qemu accepts `-F parallels` for a backing-file format hint, so the
+  qcow2-with-Parallels-backing chain test is live (not skipped),
+  unlike formats qemu-img has no `-F` support for.
+* `info` stays lenient on all four malformed fixtures by design: its
+  detection-level parser (`parse_parallels_header`) only checks the
+  magic and version, both of which are intact in every malformed
+  fixture (they mutate `tracks`/`bat_entries`/`ext_off`, not the
+  magic), so all four still detect as `parallels` and `info` exits 0
+  with best-effort fields — the read-path validation that refuses
+  them lives in the reader, not the detector. This mirrors the same
+  info-stays-lenient stance the VDI and DMG phases established, and
+  is documented as a quirk rather than treated as a defect.
+* Cross-magic equivalence is pinned directly by `compare`:
+  `parallels-data-v1` (sector-valued v1 BAT) and `parallels-data-v2`
+  (cluster-valued ext BAT) carry identical guest content under
+  different on-disk encodings, and `instar compare` between them
+  reports identical, proving the per-magic `off_multiplier` decoding
+  is correct end-to-end and not just at the unit-test level.
 
 ## Verification (management-session review checklist)
 

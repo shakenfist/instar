@@ -36,7 +36,7 @@ for details on why this approach is secure.
 | QED | Yes (banned) | Yes | qed-simple |
 | ISO | Yes | Yes* | iso-simple |
 | LUKS | Yes | Yes | luks-v1, luks-v2, luks-v1-raw-gpt, luks-v1-qcow2, luks-v1-aes-xts |
-| Parallels | No | **Yes** | parallels-v1, parallels-v2 |
+| Parallels | No | **Yes** | parallels-v1, parallels-v2, parallels-data-v1, parallels-data-v2, and 7 more (see below) |
 | Bochs | No | **Yes** | bochs-growing |
 | cloop | No | **Yes** | cloop-simple |
 | DMG | No | **Yes**† | dmg-simple, dmg-truncated-koly, dmg-sectorcount-negative, dmg-sectorcount-huge, dmg-no-chunk-table |
@@ -77,6 +77,7 @@ The `instar convert` operation supports writing output in the following formats:
 | vhd (dynamic) | Supported | BAT-based block lookup, sector-cached reads |
 | vhdx (dynamic) | Supported | 64-bit BAT with interleaved SB entries, GUID-based metadata, CRC-32C validation |
 | vdi (dynamic and static) | Supported | Header validated against qemu's 12 open-time rules; allocation-order block-map lookup, sector-cached reads; qemu parity for discarded blocks, past-EOF reads (zero-fill), and odd `disk_size` (rounded up to 512) |
+| parallels (v1 and v2/ext) | Supported | Open validated against qemu's RO rules (tracks/bat_entries limits, both magics); per-magic BAT decoding (sector-valued under v1, cluster-valued under v2), sector-cached reads; past-EOF and out-of-BAT reads zero-fill, `inuse`-dirty images read normally, `ext_off != 0` refused |
 | luks (v1/v2, native) | Supported | Decrypts with `--luks-passphrase`; v1 PBKDF2, v2 Argon2id (`--max-guest-memory`); detects inner format (raw, QCOW2) |
 | luks wrapping qcow2 | Supported | Transparent inner QCOW2 detection and decryption via CallTable function pointer wrapping |
 
@@ -289,6 +290,7 @@ full reference.
 | QED | Banned entirely | Rejects | Detects format |
 | LUKS | Version check (only v1) | Rejects v2+ | Detects format, version, cipher, hash, UUID, payload offset, key slots, inner format (with passphrase); convert decrypts v1/v2 containers |
 | VDI | None | Pass-through | Detects format, UUID; convert/compare/dd read via a full reader — header validated against qemu's 12 open-time rules, block-map entries bounds-checked, past-EOF block reads zero-filled (`check` still refuses, exit 63) |
+| Parallels | None | Pass-through | Detects format, magic, version; convert/compare/dd/bench read via a full reader — open validated per qemu's RO rules, BAT decoded per-magic (sector-valued v1, cluster-valued v2/ext), past-EOF and out-of-BAT reads zero-filled, `ext_off != 0` refused (`check` still refuses, exit 63) |
 | ISO | None | Pass-through | Detects format* |
 | VHD | None | Pass-through | Detects creator app; full check validation (footer/header checksums, version/feature validation, BAT bounds, overlap detection, fragmentation, fixed VHD size check, footer copy consistency) |
 | VHDX | None | Pass-through | Detects block size; full check validation (file identifier, dual header CRC-32C, region table 1+2 cross-check, metadata, BAT bounds/alignment/overlap, fragmentation) |
@@ -380,12 +382,21 @@ full reference.
 |----------|-------------|--------|--------------|
 | qed-simple | QED format image | safe | Deprecated format test |
 
-#### Parallels Images (2)
+#### Parallels Images (11)
 
 | Image ID | Description | Safety | Key Features |
 |----------|-------------|--------|--------------|
 | parallels-v1 | QEMU iotests image, old "WithoutFreeSpace" magic | safe | nb_sectors masked to low 32 bits |
 | parallels-v2 | QEMU iotests image, new "WithouFreSpacExt" magic | safe | Full-width nb_sectors |
+| parallels-data-v2 | 2 MiB v2 image, 64 KiB clusters, data in guest clusters 1/3/5/7 | safe | Two BAT entries and their data clusters swapped; pins non-contiguous/non-monotonic BAT decode |
+| parallels-data-v1 | parallels-data-v2 rewritten to the v1 magic, every nonzero BAT entry multiplied by tracks | safe | Pins off_multiplier==1 and the v1 32-bit nb_sectors mask; reads identically to the v2 twin |
+| parallels-inuse | parallels-data-v2 with `inuse` (offset 44) set to 0x746f6e59 | safe | Opened-dirty header; pins never-refuse-on-dirty (RO opens succeed) |
+| parallels-bat-past-eof | 2 MiB v2 image, one guest cluster's BAT entry ~64 GiB past EOF | safe | Pins past-EOF zero-fill; also the fixture behind the qemu 8.1.0-8.1.5 open-refusal window (see quirks.md) |
+| parallels-cluster-4k | 256 KiB v2 image, `-o cluster_size=4096` (tracks=8), scattered data clusters | safe | Pins small-cluster chunk-boundary handling |
+| parallels-zero-tracks | tracks (offset 28) patched to 0 | malformed | Refused at open ("Zero sectors per track") |
+| parallels-huge-tracks | tracks patched to 4186128 (> INT32_MAX/513) | malformed | Refused at open ("Too big cluster") |
+| parallels-huge-catalog | bat_entries (offset 32) patched to 0x40000000 (> INT_MAX/4) | malformed | Refused at open ("Catalog too large") |
+| parallels-ext-bad-magic | ext_off (offset 56) points at a zeroed in-file sector | malformed | Refused at open (bad format-extension magic) |
 
 #### Bochs Images (1)
 
@@ -578,6 +589,32 @@ qcow2-luks).
     (`instar info` reports the rounded value). `check` still refuses
     VDI (exit 63); `map`, `measure`, and `resize` are unchanged
     refusals.
+
+19. **Parallels Input Support** - Convert, compare, dd, and bench
+    support Parallels as read-only input, both the legacy
+    "WithoutFreeSpace" (v1) and "WithouFreSpacExt" (v2/ext) magics
+    (`src/crates/parallels/`, PLAN-format-coverage phase 3). The
+    header is validated against qemu's RO open-time rules (tracks
+    non-zero and under the empirically-corrected cap of 4186127,
+    bat_entries under 0x3fffffff, a recognised magic, version 2,
+    `ext_off == 0`); the BAT is decoded per-magic — sector-valued
+    entries under v1 (`off_multiplier == 1`), cluster-valued entries
+    under v2 (`off_multiplier == tracks`) — through the standard
+    sector-cached read path. qemu parity is exact: BAT value 0 and
+    guest offsets beyond BAT coverage read as zeros, reads at or past
+    device capacity (including straddles) zero-fill rather than error,
+    and `inuse`-dirty (opened-uncleanly) images are always readable
+    since instar only ever opens read-only. `data_off` is parsed but
+    never used in read math. `ext_off != 0` is refused at init — a
+    deliberate divergence from qemu, which parses the format extension
+    for dirty-bitmap metadata; no shipped or creatable fixture needs
+    it today (see quirks.md for the rationale). Because qemu prints no
+    cluster_size for parallels, `instar info` computes and stores it
+    internally (`tracks << 9`) so the chain reader's chunking respects
+    real cluster boundaries, but both emitters suppress the field for
+    the "parallels" format string so `info` output stays byte-identical
+    to qemu. `check` still refuses parallels (exit 63); `map`,
+    `measure`, and `resize` are unchanged refusals.
 
 ### Detections to Add
 

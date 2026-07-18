@@ -2596,16 +2596,17 @@ qemu-img's raw-fallback behaviour; now refuses instead)
 `instar convert`, `compare`, and `dd` discover their input's format via
 a guest-side `info` probe, then map the reported format string to a
 `chain::ImageFormat`. Any format instar detects but has no read path
-for (`qed`, `vdi` at the time, and — after this phase — `parallels`,
-`bochs`, `cloop`, `dmg`) collapsed to `ImageFormat::Unknown`, and the
+for (`qed`, `vdi` and `parallels` at the time, and — after this phase
+— `bochs`, `cloop`, `dmg`) collapsed to `ImageFormat::Unknown`, and the
 chain reader's default arm read `Unknown` images as **raw bytes** —
 emitting the container's bytes zero-padded to the header-declared
 virtual size, with no error and no indication anything was wrong. This
 was tracked as [#444](https://github.com/shakenfist/instar/issues/444),
 confirmed by phase 1 step 1a's empirical pin (see the phase plan's
 Findings section), and fixed by step 3b. `vdi` gained a full read path
-in phase 2 and is no longer part of this refused set — see
-"Format-coverage phase 2" below.
+in phase 2 and `parallels` in phase 3; neither is part of this refused
+set any longer — see "Format-coverage phase 2" and "Format-coverage
+phase 3" below.
 
 #### instar Behavior (after the fix)
 
@@ -2622,26 +2623,27 @@ reading (detection and info only)
 
 This closed the hole for `qed` (previously silently read as raw,
 contradicting its documented "detected, refused" stance) as well as
-the four newly detected formats. `vdi` was in the same set at the
-time this phase landed; phase 2 graduated it to a full read path
-instead, so it no longer appears among the refused formats at all
-(see "Format-coverage phase 2" below). There is no flag to disable
-this refusal — unlike `instar info`, convert/compare/dd have no
-`--unsafe-quirks` path at all, so the refusal is unconditional.
+the four newly detected formats. `vdi` and `parallels` were in the
+same set at the time this phase landed; phase 2 graduated `vdi` and
+phase 3 graduated `parallels` to full read paths instead, so neither
+appears among the refused formats any longer (see "Format-coverage
+phase 2" and "Format-coverage phase 3" below). There is no flag to
+disable this refusal — unlike `instar info`, convert/compare/dd have
+no `--unsafe-quirks` path at all, so the refusal is unconditional.
 
 #### The ISO exemption and the info-vs-consumer asymmetry
 
 **iso is deliberately exempt** and keeps its raw pass-through
-everywhere: unlike qed/parallels/bochs/cloop/dmg — where a raw
-interpretation misrepresents the content (container metadata plus zero
-padding, not the virtual disk) — an ISO's container bytes *are* its
-virtual disk content, so reading it as raw is semantically correct.
-qemu-img (which has no ISO driver at all) converts ISOs as raw
-routinely; refusing them would be a parity regression on a common
-workflow, not a safety fix. `vdi` was in the same "raw would
-misrepresent it" group as the others until phase 2, which gave it a
-full reader instead of a refusal — see "Format-coverage phase 2"
-below.
+everywhere: unlike qed/bochs/cloop/dmg — where a raw interpretation
+misrepresents the content (container metadata plus zero padding, not
+the virtual disk) — an ISO's container bytes *are* its virtual disk
+content, so reading it as raw is semantically correct. qemu-img
+(which has no ISO driver at all) converts ISOs as raw routinely;
+refusing them would be a parity regression on a common workflow, not
+a safety fix. `vdi` and `parallels` were in the same "raw would
+misrepresent it" group as the others until phase 2 and phase 3
+respectively, which gave them full readers instead of a refusal —
+see "Format-coverage phase 2" and "Format-coverage phase 3" below.
 
 This produces an asymmetry worth noting explicitly: standalone `instar
 info` on an ISO reports `iso` by default (secure mode) and `raw` only
@@ -2669,9 +2671,12 @@ The koly-trailer probe added in phase 1 is wired only into the guest
 chain — never see the trailer probe, so they detect a DMG (valid or
 adversarial) as `Raw` and pass it through as a raw disk image, exactly
 as they would for any other undetected file. Parallels, Bochs, and
-cloop are unaffected — they are header-detected at offset 0, which
-*is* wired into `detect_format_from_header`, so those three formats
-refuse correctly in every op.
+cloop are unaffected for these in-place ops — they are header-detected
+at offset 0, which *is* wired into `detect_format_from_header`, so
+`resize`/`map`/`measure` refuse all three correctly. Bochs and cloop
+still refuse in every op; `parallels`'s convert/compare/dd/bench
+refusal was lifted in phase 3, which gave it a full reader instead —
+see "Format-coverage phase 3" below for the current per-op picture.
 
 #### Why This Matters
 
@@ -2848,6 +2853,257 @@ best-effort header fields. Pinned by `TestAdversarialVdiManifest` in
 output for all four ops across the five malformed fixtures without
 pinning instar's exact error string (only qemu-img's error strings are
 version-stable enough to pin).
+
+## Format-coverage phase 3: Parallels convert-from (read path)
+
+Phase 3 of `PLAN-format-coverage.md` graduated Parallels from detect +
+info only to a full read format for convert, compare, dd, and bench,
+via a new `src/crates/parallels/` parser crate wired into the qcow2
+crate's chain reader (the same pattern VDI, VHD, and VHDX use). Both
+magics — the legacy `WithoutFreeSpace` (v1) and the newer
+`WithouFreSpacExt` (v2/ext) — are supported. The entries below record
+the deliberate qemu-parity choices this introduced and the
+divergences that remain. See
+[docs/plans/PLAN-format-coverage-phase-03-parallels-read.md](plans/PLAN-format-coverage-phase-03-parallels-read.md)
+for the full design and findings.
+
+### Per-Magic `off_multiplier` and the v1 32-bit `nb_sectors` Mask
+
+**Classification: Safe Quirk**
+
+#### Observed Behavior
+
+qemu's Parallels BAT entries mean different things depending on the
+magic: under `WithoutFreeSpace` (v1) a BAT entry is a *sector* number
+(`off_multiplier == 1`); under `WithouFreSpacExt` (v2/ext) it is a
+*cluster* index (`off_multiplier == tracks`). The two encodings can
+address identical file content — verified byte-level on the fixture
+pair (v2 BAT `[1,2,3,4]` and v1 BAT `[0x80,0x100,0x180,0x200]` with
+`tracks=128` decode to the same host offsets). Separately, `nb_sectors`
+(virtual size in sectors) is a 64-bit header field, but qemu masks it
+to the low 32 bits when the magic is v1 and reads it full-width under
+v2 — byte-patch verified: the same field value reports 2 MiB under the
+v1 magic and 2 TiB under the v2 magic.
+
+#### Why This Matters
+
+Getting `off_multiplier` or the mask wrong per magic silently
+misreads every allocated cluster in a v1 image (or reports a garbage
+virtual size) without erroring — a correctness bug, not a crash, so
+it needs explicit per-magic coverage rather than relying on the v2
+path to catch it.
+
+#### instar Behavior
+
+**Always**: `ParallelsHeader::parse` stores `off_multiplier` (1 for
+v1, `tracks` for v2/ext) and masks `nb_sectors` to 32 bits only under
+the v1 magic; `virtual_size = masked_nb_sectors * 512`. Pinned by
+per-magic unit tests in `src/crates/parallels/src/lib.rs` (the
+BAT-decoding equivalence and the mask-under-v1-vs-v2 cases) and by the
+`parallels-data-v1`/`parallels-data-v2` fixture pair, which are the
+same image content under both magics and BAT encodings — `compare`
+between them reports identical, and both convert byte-identically to
+qemu-img's raw output.
+
+### Past-EOF and Truncated Reads Zero-Fill — Except qemu's 8.1.x Open-Time Regression
+
+**Classification: Safe Quirk**
+
+#### Observed Behavior
+
+qemu's Parallels driver never validates the on-disk file length
+against the header's declared BAT/geometry. Out-of-image BAT entries,
+a straddling cluster (starts in-file, extends past EOF), a truncated
+BAT, and even a 30-byte file all read as zeros wherever bytes are
+missing, with `qemu-img convert` exiting 0 — verified identical on
+6.0.0/7.0.0/10.2.0. The one drift across the matrix: qemu 8.1.0
+through 8.1.5 refuse a past-EOF BAT entry **at open** ("Offset ... in
+BAT[n] entry is larger than file size"), a regression window closed
+again in 8.2.0.
+
+#### Why This Matters
+
+A reader that errored on a past-EOF cluster would refuse images
+qemu-img converts successfully on every version except the narrow
+8.1.x window — a parity regression, not a safety improvement, since
+the sandboxed read of a header-consistent Parallels image carries no
+extra risk from an undersized backing file. Faithfully recording the
+8.1.x refusal (rather than papering over it) keeps the baseline
+matrix honest about the one version range where instar and qemu
+genuinely disagree.
+
+#### instar Behavior
+
+**Always**: the chain reader's Parallels arm zero-fills any portion
+of an allocated read at or past the device capacity, including the
+straddle case, uniformly across all qemu versions — instar does not
+special-case the 8.1.x behaviour. Pinned by the `parallels-bat-past-eof`
+fixture with a byte-parity convert test. The 8.1.0-8.1.5 open
+refusals are recorded faithfully in the instar-testdata baseline
+matrix via a dedicated `profile-8-1-0` bucket (split out from the
+neighbouring profile so the two refusing versions don't corrupt a
+shared baseline); `tests/test_info_safe.py` gained a general
+mechanism (commit `30ecf77`) that skips scenario generation whenever
+a profile's baseline meta records a non-zero qemu-img return code —
+there is no output parity to assert when qemu itself refused the
+image, and the mechanism is not Parallels-specific, so any future
+per-profile refusal drift is handled the same way.
+
+### `inuse`-Dirty Images and Ignored Header Fields Read Normally
+
+**Classification: Safe Quirk**
+
+#### Observed Behavior
+
+qemu refuses a read/write open of a Parallels image whose `inuse`
+field (offset 44) is `0x746f6e59` ("opened uncleanly"), but a
+**read-only** open succeeds and converts correctly. Separately,
+`data_off` (offset 48, the write-path allocation frontier) is parsed
+by qemu but never participates in any read-path offset computation —
+byte-patch verified: garbage `data_off` values are harmless to reads.
+
+#### Why This Matters
+
+instar always opens Parallels images read-only, so refusing on
+`inuse` would reject images qemu-img itself can read (via `-O raw`
+without `-rw`) — a pure parity regression. `data_off` needing no
+special handling means the reader can parse and discard it without
+risk of a latent bug in unreachable code.
+
+#### instar Behavior
+
+**Always**: `ParallelsHeader::parse` never refuses on `inuse`, and the
+field plays no role in `ParallelsState::init`/`block_lookup`;
+`data_off` is parsed but never used in offset math. Pinned by the
+`parallels-inuse` fixture (a `parallels-data-v2` copy with `inuse` set
+dirty), which converts byte-identically to its clean twin.
+
+### `ext_off != 0` Refused — Deliberate Divergence from qemu's Extension Parsing
+
+**Classification: Safe Quirk** (documented divergence, not a defect)
+
+#### Observed Behavior
+
+A non-zero `ext_off` (offset 56) points qemu at a format extension
+(currently used for dirty-bitmap metadata) that it parses read-only
+and refuses only on a bad extension magic. instar's reader refuses
+**any** non-zero `ext_off` at init, regardless of what the extension
+contains — including a hypothetical valid one qemu would open
+successfully.
+
+#### Why This Matters
+
+This is instar choosing not to implement extension parsing rather
+than a parity bug: no shipped or creatable fixture has `ext_off` set
+to a valid extension (`qemu-img create -f parallels` never writes
+one), the extension adds no data to the read path phase 3 needs, and
+silently ignoring an unparsed extension would risk misreading an
+image whose extension actually matters once one exists. Refusing
+cleanly is the safe default until a real need for extension support
+appears.
+
+#### instar Behavior
+
+**Always**: any non-zero `ext_off` is refused at
+`ParallelsHeader::parse` time, with no attempt to read or validate
+the extension's own magic. Pinned by unit tests and by the
+`parallels-ext-bad-magic` fixture (qemu also refuses this specific
+fixture, on its bad extension magic, so the fixture pins the refusal
+path without yet exercising the valid-extension divergence — there is
+no fixture for that case by design). Recorded as master-plan future
+work: Parallels format extensions / dirty bitmaps.
+
+### `cluster_size` Reported Internally by `info`, Suppressed in Both Emitters
+
+**Classification: Safe Quirk**
+
+#### Observed Behavior
+
+`qemu-img info` prints no `cluster_size` and no format-specific block
+at all for Parallels — only the generic 8.0 child-node fields. But
+the chain reader's chunking relies on `ChainDeviceInfo.cluster_size`
+to keep chunks from straddling non-contiguous clusters, and Parallels'
+cluster size (`tracks << 9`) is user-settable via `-o cluster_size` at
+creation, so it cannot be hardcoded.
+
+#### Why This Matters
+
+VDI worked for free here because qemu (and instar's VDI parser)
+already report `cluster_size` for VDI. Parallels needed a new
+mechanism: compute the value for internal use without changing
+user-visible `info` output, which the existing byte-identical-output
+contract with qemu-img requires.
+
+#### instar Behavior
+
+**Always**: the guest `info` op's `parse_parallels_header` now also
+reads `tracks` (offset 28) and sets `result.cluster_size = tracks <<
+9` internally; the host emitters (`print_info_result` and
+`print_info_result_json`, `src/vmm/src/main.rs`) suppress
+`cluster_size` for the `"parallels"` format string specifically, in
+both human and JSON output — the same format-gated suppression
+mechanism phase 1 used for the dirty-flag JSON field. The suppression
+is format-gated, not value-gated, so a real nonzero `tracks` value
+stays hidden exactly as qemu's own silence does. Verified by a full
+`test_info_safe` run passing byte-identical against the qemu-img
+baselines (zero regressions) plus the small-cluster
+`parallels-cluster-4k` fixture, which pins that chunk boundaries never
+cross the populated cluster size end-to-end.
+
+### `check` Still Refuses Parallels; qemu's Own Check Crashes on Newer Versions
+
+**Classification: Safe Quirk** (documented gap, not a defect)
+
+#### Observed Behavior
+
+`qemu-img check` supports the Parallels driver, validating the BAT
+for duplicate/out-of-range entries. But on 10.2.0, `qemu-img check`
+**asserts and crashes** (the `parallels_check_duplicate` assertion) on
+an out-of-image BAT entry that 6.0.0 reports cleanly — a real qemu
+regression, not a theoretical one.
+
+#### instar Behavior
+
+**Unchanged by this phase**: `instar check parallels-v2` exits 63 with
+`This image format (parallels) does not support checks`, identically
+to VDI's stance and to Parallels' own pre-phase-3 behaviour — check
+was out of scope for this phase (see the phase plan's "Out of scope"
+section), and instar's own format dispatch has no Parallels arm to
+lift even though the host gate for other ops was lifted by
+graduation. Given qemu's own check is crash-prone on adversarial
+Parallels input on current versions, the refusal is the conservative,
+correct stance rather than a coverage gap to close blindly; the qemu
+`parallels_check_duplicate` assertion is recorded as master-plan
+future work to report upstream.
+
+### Tracks Cap Corrected to 4186127 (Planning Research Was Off by 681)
+
+**Classification: Safe Quirk** (internal correction, no behaviour change to ship)
+
+#### Observed Behavior
+
+qemu refuses to open a Parallels image whose `tracks` (sectors per
+cluster) exceeds `INT32_MAX / 513`. The phase plan's initial research
+computed this as 4185446; step 3d's empirical fixture validation
+found the real boundary is 4186127 — `tracks=4185447` opens cleanly
+and `tracks=4186128` is the smallest value qemu refuses ("Invalid
+image: Too big cluster").
+
+#### Why This Matters
+
+An off-by-681 cap would make instar refuse a narrow band of
+`tracks` values (4185447–4186127) that qemu itself opens fine — a
+pure parity regression that only an empirical fixture sweep, not
+integer arithmetic alone, catches.
+
+#### instar Behavior
+
+**Always**: `PARALLELS_TRACKS_MAX` in `src/crates/parallels/src/lib.rs`
+is `4_186_127`, corrected by commit `8dbf89f` from step 3a's original
+value once step 3d's fixture validation pinned the real boundary; the
+crate's boundary unit tests reference the constant symbolically and
+needed no rewrite. Pinned by the `parallels-huge-tracks` fixture
+(`tracks` patched to 4186128, the smallest refused value).
 
 ## Future Additions
 
