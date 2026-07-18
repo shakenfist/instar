@@ -319,7 +319,7 @@ const INFO_RESULT_MAGIC: u32 = 0x52455355; // "RESU"
 const INFO_RESULT_FLAG_HAS_BACKING_FILE: u32 = 1 << 0;
 #[allow(dead_code)]
 const INFO_RESULT_FLAG_HAS_EXTERNAL_DATA: u32 = 1 << 1;
-#[allow(dead_code)]
+// Consumed by should_emit_encrypted_line (both info emitters).
 const INFO_RESULT_FLAG_ENCRYPTED: u32 = 1 << 2;
 #[allow(dead_code)]
 const INFO_RESULT_FLAG_COMPRESSED: u32 = 1 << 3;
@@ -1180,6 +1180,19 @@ fn format_size_value(value: f64, unit: &str, qemu_compat: bool) -> String {
     }
 }
 
+/// True when qemu-img would print the encrypted marker for this image
+/// (`encrypted: yes` in human output, `"encrypted": true` in JSON).
+///
+/// Driven by `INFO_RESULT_FLAG_ENCRYPTED`, which the guest sets for a
+/// qcow1 AES header (`crypt_method != 0`), a qcow2 encrypted header, or
+/// a LUKS container. LUKS is gated OUT: qemu-img prints no encrypted
+/// line for a bare LUKS container, and instar's hand-maintained LUKS
+/// goldens pin that (no-line) output — emitting the marker for LUKS
+/// would break them byte-for-byte.
+fn should_emit_encrypted_line(info: &guest_::InfoResultMessage) -> bool {
+    info.flags & INFO_RESULT_FLAG_ENCRYPTED != 0 && info.format != "luks"
+}
+
 /// Print InfoResult in qemu-img compatible format
 #[allow(clippy::too_many_arguments)]
 fn print_info_result(
@@ -1271,6 +1284,14 @@ fn print_info_result(
             disk_blocks * 512
         };
         println!("disk size: {}", format_size_human(disk_size, qemu_compat));
+
+        // Encrypted line: qemu-img prints "encrypted: yes" between the
+        // disk-size and cluster_size lines when the image declares
+        // encryption (e.g. an AES qcow1, crypt_method != 0). LUKS is
+        // gated out below (see should_emit_encrypted_line).
+        if should_emit_encrypted_line(info) {
+            println!("encrypted: yes");
+        }
 
         // Line 5: cluster_size (with underscore, matching qemu-img).
         // parallels carries a real cluster_size internally (tracks × 512,
@@ -1473,16 +1494,17 @@ fn print_info_result(
             // qemu-img reports the protocol-node length rounded up to a
             // 512-byte sector for the container formats whose driver opens the
             // underlying file at 512-sector granularity: raw, the VMDK flat
-            // descriptor's protocol node, and the read-only sector-based
-            // drivers parallels/bochs/cloop/dmg. cloop (1690 -> 2048) and dmg
-            // (11747 -> 11776) are the first fixtures with an unaligned file
-            // that actually exercise this; parallels/bochs files are already
-            // sector-aligned, so rounding them is a no-op. Other structured
-            // formats keep instar's exact protocol length (e.g. the malformed
-            // luks-v1 golden reports 592, which qemu-img cannot even open).
+            // descriptor's protocol node, the read-only sector-based drivers
+            // parallels/bochs/cloop/dmg, and qcow (v1). cloop (1690 -> 2048)
+            // and dmg (11747 -> 11776) first exercised this; qcow1-compressed
+            // (10774 -> 11264) is the qcow example. Every other qcow fixture's
+            // file is already sector-aligned, so rounding them is a no-op.
+            // Other structured formats keep instar's exact protocol length
+            // (e.g. the malformed luks-v1 golden reports 592, which qemu-img
+            // cannot even open).
             let rounds_protocol_length = matches!(
                 info.format.as_str(),
-                "raw" | "parallels" | "bochs" | "cloop" | "dmg"
+                "raw" | "parallels" | "bochs" | "cloop" | "dmg" | "qcow"
             ) || vmdk_flat.is_some();
             let effective_child_file_length = if rounds_protocol_length {
                 child_file_length.div_ceil(512) * 512
@@ -1534,16 +1556,18 @@ fn print_info_result_json(
 
     // qemu-img reports the child node's virtual-size rounded up to a 512-byte
     // sector for the container formats whose driver opens the underlying file
-    // at 512-sector granularity: raw/unknown, the VMDK flat descriptor, and
-    // the read-only sector-based drivers parallels/bochs/cloop/dmg. cloop
-    // (1690 -> 2048) and dmg (11747 -> 11776) are the first fixtures with an
-    // unaligned file to exercise it; parallels/bochs files are already
-    // sector-aligned. Other structured formats keep instar's exact protocol
-    // length (e.g. the malformed luks-v1 golden reports 592).
+    // at 512-sector granularity: raw/unknown, the VMDK flat descriptor, the
+    // read-only sector-based drivers parallels/bochs/cloop/dmg, and qcow (v1).
+    // cloop (1690 -> 2048) and dmg (11747 -> 11776) first exercised this;
+    // qcow1-compressed (10774 -> 11264) is the qcow example. Every other qcow
+    // fixture's file is already sector-aligned. Other structured formats keep
+    // instar's exact protocol length (e.g. the malformed luks-v1 golden
+    // reports 592). NOTE: qcow is added ONLY here, not to is_unstructured —
+    // its top-level virtual-size comes from the header, not the file length.
     let rounds_protocol_length = is_unstructured
         || matches!(
             info.format.as_str(),
-            "parallels" | "bochs" | "cloop" | "dmg"
+            "parallels" | "bochs" | "cloop" | "dmg" | "qcow"
         );
     let effective_child_file_length = if rounds_protocol_length {
         child_file_length.div_ceil(512) * 512
@@ -1640,9 +1664,12 @@ fn print_info_result_json(
         println!("    ],");
     }
 
-    // Backing file format - always output when there's a backing file
-    // For QCOW2, this comes from header extensions (v3)
-    if has_backing_file {
+    // Backing file format - output when there's a backing file.
+    // For QCOW2, this comes from header extensions (v3). QCOW1 stores no
+    // backing-format field (qemu resolves it by probing at open) and
+    // qemu-img emits NO "backing-filename-format" key for qcow — the
+    // qcow1-backing JSON baseline confirms — so suppress it by format.
+    if has_backing_file && info.format != "qcow" {
         // Use the format from header extension if available, otherwise default to qcow2
         let backing_format = if !info.qcow2_info.backing_format.is_empty() {
             info.qcow2_info.backing_format.as_str()
@@ -1681,6 +1708,17 @@ fn print_info_result_json(
         println!("    \"actual-size\": {disk_size},");
     } else {
         println!("    \"actual-size\": {disk_size}");
+    }
+
+    // Encrypted key: qemu-img emits "encrypted": true immediately after
+    // "actual-size" (and before the format-specific section / backing
+    // filenames / dirty-flag) when the image declares encryption. Pinned
+    // from the qcow1-encrypted JSON baselines. LUKS is gated out (see
+    // should_emit_encrypted_line). A trailing comma is always correct
+    // here because for every encryption-declaring format at least
+    // "dirty-flag" still follows.
+    if should_emit_encrypted_line(info) {
+        println!("    \"encrypted\": true,");
     }
 
     // Format-specific section
