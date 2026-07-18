@@ -16,6 +16,7 @@ vhd = { path = "../crates/vhd" }
 vhdx = { path = "../crates/vhdx" }
 vdi = { path = "../crates/vdi" }
 parallels = { path = "../crates/parallels" }
+qcow1 = { path = "../crates/qcow1" }
 raw = { path = "../crates/raw" }
 luks = { path = "../crates/luks" }
 measure = { path = "../crates/measure" }
@@ -79,6 +80,12 @@ doc = false
 test = false
 
 [[bin]]
+name = "fuzz_qcow1_header"
+path = "fuzz_targets/fuzz_qcow1_header.rs"
+doc = false
+test = false
+
+[[bin]]
 name = "fuzz_raw_partition"
 path = "fuzz_targets/fuzz_raw_partition.rs"
 doc = false
@@ -137,6 +144,12 @@ test = false
 [[bin]]
 name = "fuzz_parallels_bat"
 path = "fuzz_targets/fuzz_parallels_bat.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "fuzz_qcow1_table"
+path = "fuzz_targets/fuzz_qcow1_table.rs"
 doc = false
 test = false
 

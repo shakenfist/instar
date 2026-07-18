@@ -49,7 +49,7 @@ from helpers.snapshot_readback import snapshot_readback  # noqa: E402
 # Constants
 # ---------------------------------------------------------------------------
 
-FORMATS = ['qcow2', 'raw', 'vmdk', 'vpc', 'vdi', 'parallels']
+FORMATS = ['qcow2', 'raw', 'vmdk', 'vpc', 'vdi', 'parallels', 'qcow']
 OUTPUT_FORMATS = ['qcow2', 'raw', 'vmdk', 'vpc']
 VIRTUAL_SIZES = ['1M', '4M', '16M', '64M', '256M', '1G']
 QCOW2_CLUSTER_SIZES = [512, 4096, 65536, 262144, 2097152]
@@ -165,6 +165,14 @@ def generate_image(rng, workdir, iteration):
             attrs['cluster_size'] = cluster_size
             cmd.extend(['-o', f'cluster_size={cluster_size}'])
 
+    # qcow (v1, qemu's create name for the format instar's qcow1 crate
+    # reads) supports no -o options this fuzzer needs to vary
+    # (PLAN-format-coverage-phase-04-qcow1-read.md step 4f) — cluster_bits
+    # and l2_bits default to 12/9 and there is no supported way to set
+    # them via qemu-img create. No branch needed here; the compressed
+    # variant is applied as a post-processing step below, after the data
+    # pattern is written, since it needs a fully-populated source image.
+
     cmd.extend([str(image_path), vsize])
 
     result = subprocess.run(
@@ -184,7 +192,70 @@ def generate_image(rng, workdir, iteration):
         # Leave as-is (all zeros, sparse allocation)
         pass
 
+    if fmt == 'qcow':
+        image_path, compressed = _maybe_compress_qcow1(
+            rng, image_path, iteration, workdir,
+        )
+        attrs['compressed'] = compressed
+
     return image_path, fmt, attrs
+
+
+def _maybe_compress_qcow1(rng, image_path, iteration, workdir):
+    """~30% of the time, replace a qcow (v1) image with its compressed
+    twin via `qemu-img convert -c -O qcow`.
+
+    Returns (path, compressed) — `path` is `image_path` itself unless the
+    compressed twin was accepted, in which case it now points at the
+    (still `image_path`-named) compressed file; `compressed` records
+    whether that happened, for attrs/log diagnostics.
+
+    Verified qemu quirk (PLAN-format-coverage-phase-04-qcow1-read.md,
+    "Fuzzing" / "Other subcommands"): this command writes a fully valid
+    compressed qcow image but exits 1 with empty stderr, on every
+    spot-checked qemu version. Tolerating rc 0 *or* 1 for exactly this
+    call is safe because the result isn't trusted on rc alone — the
+    output is independently verified with `qemu-img info` (does it open
+    at all) before being accepted; if that verification fails for any
+    reason the uncompressed image is kept instead, so a real conversion
+    failure degrades to "less coverage this iteration" rather than a
+    corrupt fixture entering the fuzz loop.
+    """
+    if rng.random() >= 0.3:
+        return image_path, False
+
+    compressed_path = workdir / f'fuzz-{iteration:06d}.qcow.compressed'
+    conv_cmd = [
+        'qemu-img', 'convert', '-c', '-f', 'qcow', '-O', 'qcow',
+        str(image_path), str(compressed_path),
+    ]
+    try:
+        conv_result = subprocess.run(
+            conv_cmd, capture_output=True, text=True, timeout=30
+        )
+    except subprocess.TimeoutExpired:
+        return image_path, False
+
+    # rc 0 *and* rc 1 are both "the command ran"; anything else (e.g. a
+    # signal) means something unexpected happened and the compressed
+    # output should not be trusted.
+    if conv_result.returncode not in (0, 1):
+        return image_path, False
+
+    if not compressed_path.exists():
+        return image_path, False
+
+    info_check = subprocess.run(
+        ['qemu-img', 'info', str(compressed_path)],
+        capture_output=True, text=True, timeout=30,
+    )
+    if info_check.returncode != 0:
+        compressed_path.unlink()
+        return image_path, False
+
+    image_path.unlink()
+    compressed_path.rename(image_path)
+    return image_path, True
 
 
 def _write_random_data(rng, image_path, fmt):
@@ -1031,15 +1102,17 @@ def op_measure(instar_bin, instar_copy, qemu_copy, fmt,
     """Run instar measure and compare to qemu-img measure (raw/qcow2)
     or instar convert's actual output size (vmdk/vpc/vhdx).
 
-    VDI and Parallels sources are gated out: `measure` is out of scope
-    for both read paths (PLAN-format-coverage-phase-02-vdi-read.md and
-    PLAN-format-coverage-phase-03-parallels-read.md, both "Out of
-    scope" — measure isn't one of the four reader-linking ops that
-    gained vdi-input / parallels-input), so instar refuses a VDI or
-    Parallels source while qemu-img measure succeeds. Comparing would
-    be a spurious exit_code_divergence, not a real instar defect.
+    VDI, Parallels, and qcow (v1) sources are gated out: `measure` is
+    out of scope for all three read paths
+    (PLAN-format-coverage-phase-02-vdi-read.md,
+    PLAN-format-coverage-phase-03-parallels-read.md, and
+    PLAN-format-coverage-phase-04-qcow1-read.md, all "Out of scope" —
+    measure isn't one of the reader-linking ops those phases graduated),
+    so instar refuses a VDI, Parallels, or qcow source while qemu-img
+    measure succeeds. Comparing would be a spurious exit_code_divergence
+    (a deliberate, documented divergence), not a real instar defect.
     """
-    if fmt in ('vdi', 'parallels'):
+    if fmt in ('vdi', 'parallels', 'qcow'):
         return None
 
     # Pick a target format.
@@ -3533,20 +3606,22 @@ def op_map(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
     docs/quirks.md) that would noise-flood the fuzzer. The same
     posture as `op_info`'s raw skip.
 
-    VDI and Parallels are gated out too: instar refuses `map` on VDI
-    and Parallels sources (guest-side ERROR_INVALID_SOURCE — map is
-    out of scope for both read paths,
-    PLAN-format-coverage-phase-02-vdi-read.md and
-    PLAN-format-coverage-phase-03-parallels-read.md, both "Out of
-    scope") while qemu-img map succeeds, which would be a spurious
-    exit_code_divergence on every VDI/Parallels iteration rather than
-    a real instar defect.
+    VDI, Parallels, and qcow (v1) are gated out too: instar refuses
+    `map` on VDI, Parallels, and qcow sources (guest-side
+    ERROR_INVALID_SOURCE — map is out of scope for all three read
+    paths, PLAN-format-coverage-phase-02-vdi-read.md,
+    PLAN-format-coverage-phase-03-parallels-read.md, and
+    PLAN-format-coverage-phase-04-qcow1-read.md, all "Out of scope")
+    while qemu-img map succeeds, which would be a spurious
+    exit_code_divergence on every VDI/Parallels/qcow iteration rather
+    than a real instar defect. This is a deliberate, documented
+    divergence (master-plan future-work item), not a bug.
 
     Other format-level divergences (chain qcow2 refused, vmdk
     multi-extent refused, vhdx partial-present) don't fire here
     because generate_image() never produces those shapes.
     """
-    if fmt in ('raw', 'vdi', 'parallels'):
+    if fmt in ('raw', 'vdi', 'parallels', 'qcow'):
         return None
 
     virtual_size = _map_probe_virtual_size(qemu_copy, timeout)
