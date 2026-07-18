@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 shared = { path = "../../shared" }
 rebase = { path = "../../crates/rebase" }
-qcow2 = { path = "../../crates/qcow2", features = ["create", "vdi-input", "parallels-input"] }
+qcow2 = { path = "../../crates/qcow2", features = ["create", "vdi-input", "parallels-input", "qcow1-input"] }
 qcow2-write = { path = "../../crates/qcow2-write" }
 qcow2-write-exec = { path = "../../crates/qcow2-write-exec" }
 vmdk = { path = "../../crates/vmdk" }

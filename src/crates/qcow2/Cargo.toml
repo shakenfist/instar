@@ -23,6 +23,10 @@ vhd-input = ["vhd"]
 vhdx-input = ["vhdx"]
 vdi-input = ["vdi"]
 parallels-input = ["parallels"]
+# QCOW1 read support pulls in the qcow1 parser crate and the `decompress`
+# feature: the reader arm inflates compressed (raw-DEFLATE) clusters via
+# miniz_oxide, the same dependency the qcow2 `decompress` feature provides.
+qcow1-input = ["dep:qcow1", "decompress"]
 create = []
 
 [dependencies]
@@ -36,6 +40,14 @@ vhd = { path = "../vhd", optional = true }
 vhdx = { path = "../vhdx", optional = true }
 vdi = { path = "../vdi", optional = true }
 parallels = { path = "../parallels", optional = true }
+qcow1 = { path = "../qcow1", optional = true }
+
+# Tests only: the qcow1-input compressed-cluster arm test builds a real
+# raw-DEFLATE blob with miniz_oxide's compressor (`with-alloc`). The guest
+# binaries never see this — dev-dependencies do not affect the lib or its
+# downstream consumers, so the shipped decompress feature stays no-alloc.
+[dev-dependencies]
+miniz_oxide = { version = "0.9", features = ["with-alloc"] }
 
 [lib]
 # No std, this is used by bare-metal code

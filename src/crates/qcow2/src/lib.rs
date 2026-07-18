@@ -2838,7 +2838,8 @@ pub unsafe fn read_cluster_sectors(
 #[cfg(any(
     feature = "vhd-input",
     feature = "vdi-input",
-    feature = "parallels-input"
+    feature = "parallels-input",
+    feature = "qcow1-input"
 ))]
 unsafe fn read_offset_sectors(
     call_table: &CallTable,
@@ -6112,6 +6113,623 @@ mod tests {
             .collect();
         assert_eq!(out[cl..2 * cl], want[..], "cluster 3 → host 0x3000");
     }
+
+    // ====================================================================
+    // QCOW1 chain-reader arm (feature = "qcow1-input")
+    // ====================================================================
+    //
+    // These exercise the guest-side arm added for QCOW1 input. It combines
+    // three precedents: the Parallels per-cluster walk (qcow1 clusters can be
+    // 512 B, smaller than any chunk); the Qcow2 arm's BACKING FALL-THROUGH (an
+    // unallocated cluster descends to the next chain device via recursion into
+    // `read_chain_virtual_cluster` for its own sub-span — NOT zero-fill — with
+    // zeros only at the bottom of the chain); and the Vdi/Parallels
+    // capacity-clamped zero-fill for past-EOF/straddle. Unlike the
+    // single-device vdi/pls mocks, the mock here dispatches on `device_idx` so
+    // a multi-device chain (qcow1 overlay over a raw backing) can be modelled.
+
+    #[cfg(feature = "qcow1-input")]
+    const Q1_MAX_DEVS: usize = 3;
+    #[cfg(feature = "qcow1-input")]
+    static Q1_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[cfg(feature = "qcow1-input")]
+    static mut Q1_IMAGES: [*const u8; Q1_MAX_DEVS] = [core::ptr::null(); Q1_MAX_DEVS];
+    #[cfg(feature = "qcow1-input")]
+    static mut Q1_LENS: [usize; Q1_MAX_DEVS] = [0; Q1_MAX_DEVS];
+    #[cfg(feature = "qcow1-input")]
+    static mut Q1_SSZ: usize = 512;
+
+    /// Overlay device byte at absolute host offset `o`.
+    #[cfg(feature = "qcow1-input")]
+    fn q1_overlay_byte(o: u64) -> u8 {
+        (o % 251) as u8
+    }
+    /// Backing device byte at virtual offset `o`; a distinct period and a +1
+    /// bias so a wrong-device read cannot silently match the overlay pattern.
+    #[cfg(feature = "qcow1-input")]
+    fn q1_backing_byte(o: u64) -> u8 {
+        ((o % 241) as u8).wrapping_add(1)
+    }
+
+    /// Per-device mock: fails any sector at/beyond the device length so a read
+    /// the arm fails to clamp surfaces as an error, not fabricated bytes.
+    #[cfg(feature = "qcow1-input")]
+    unsafe extern "C" fn q1_read_sector(
+        device_idx: u32,
+        sector: u64,
+        out_buf: *mut u8,
+        sector_size: usize,
+    ) -> bool {
+        let d = device_idx as usize;
+        if d >= Q1_MAX_DEVS {
+            return false;
+        }
+        let imgs = core::ptr::addr_of!(Q1_IMAGES) as *const *const u8;
+        let lens = core::ptr::addr_of!(Q1_LENS) as *const usize;
+        let ptr = *imgs.add(d);
+        let len = *lens.add(d);
+        if ptr.is_null() {
+            return false;
+        }
+        let start = match (sector as usize).checked_mul(sector_size) {
+            Some(s) => s,
+            None => return false,
+        };
+        if start + sector_size > len {
+            return false;
+        }
+        core::ptr::copy_nonoverlapping(ptr.add(start), out_buf, sector_size);
+        true
+    }
+
+    #[cfg(feature = "qcow1-input")]
+    unsafe extern "C" fn q1_capacity(device_idx: u32) -> u64 {
+        let d = device_idx as usize;
+        if d >= Q1_MAX_DEVS {
+            return 0;
+        }
+        let lens = core::ptr::addr_of!(Q1_LENS) as *const usize;
+        (*lens.add(d) / Q1_SSZ) as u64
+    }
+
+    #[cfg(feature = "qcow1-input")]
+    unsafe extern "C" fn q1_ssz(_device_idx: u32) -> usize {
+        Q1_SSZ
+    }
+
+    #[cfg(feature = "qcow1-input")]
+    fn q1_call_table() -> shared::CallTable {
+        shared::CallTable {
+            read_input_sector: q1_read_sector,
+            get_input_capacity: q1_capacity,
+            get_input_sector_size: q1_ssz,
+            ..stub_call_table()
+        }
+    }
+
+    #[cfg(feature = "qcow1-input")]
+    struct Q1Spec {
+        cluster_bits: u8,
+        l2_bits: u8,
+        virtual_size: u64,
+        crypt_method: u32,
+    }
+
+    #[cfg(feature = "qcow1-input")]
+    fn build_q1_header_bytes(spec: &Q1Spec, l1_table_offset: u64) -> [u8; 512] {
+        use shared::{write_be_u32, write_be_u64};
+        let mut buf = [0u8; 512];
+        write_be_u32(
+            &mut buf,
+            qcow1::MAGIC_OFFSET,
+            shared::format_detection::QCOW2_MAGIC,
+        );
+        write_be_u32(&mut buf, qcow1::VERSION_OFFSET, qcow1::QCOW1_VERSION);
+        write_be_u64(&mut buf, qcow1::SIZE_OFFSET, spec.virtual_size);
+        buf[qcow1::CLUSTER_BITS_OFFSET] = spec.cluster_bits;
+        buf[qcow1::L2_BITS_OFFSET] = spec.l2_bits;
+        write_be_u32(&mut buf, qcow1::CRYPT_METHOD_OFFSET, spec.crypt_method);
+        write_be_u64(&mut buf, qcow1::L1_TABLE_OFFSET_OFFSET, l1_table_offset);
+        buf
+    }
+
+    #[cfg(feature = "qcow1-input")]
+    fn q1_put_u64(img: &mut [u8], byte_off: usize, val: u64) {
+        img[byte_off..byte_off + 8].copy_from_slice(&val.to_be_bytes());
+    }
+
+    /// Build a single-L1-entry qcow1 overlay image: header at 0, L1[0] pointing
+    /// at `l2_table_offset`, the given `l2_values` (l2_index → raw u64 entry),
+    /// and each `(host, len)` in `data_fills` filled with the overlay pattern.
+    /// Everything else is zero, so any L2 index not listed reads as a hole.
+    #[cfg(feature = "qcow1-input")]
+    #[allow(clippy::too_many_arguments)]
+    fn build_q1_overlay(
+        cluster_bits: u8,
+        l2_bits: u8,
+        virtual_size: u64,
+        total_len: usize,
+        crypt_method: u32,
+        l1_table_offset: u64,
+        l2_table_offset: u64,
+        l2_values: &[(u64, u64)],
+        data_fills: &[(u64, u64)],
+    ) -> std::vec::Vec<u8> {
+        let mut img = std::vec![0u8; total_len];
+        let hdr = build_q1_header_bytes(
+            &Q1Spec {
+                cluster_bits,
+                l2_bits,
+                virtual_size,
+                crypt_method,
+            },
+            l1_table_offset,
+        );
+        img[..512].copy_from_slice(&hdr);
+        q1_put_u64(&mut img, l1_table_offset as usize, l2_table_offset);
+        for &(idx, val) in l2_values {
+            q1_put_u64(&mut img, (l2_table_offset + idx * 8) as usize, val);
+        }
+        for &(host, len) in data_fills {
+            for i in 0..len {
+                img[(host + i) as usize] = q1_overlay_byte(host + i);
+            }
+        }
+        img
+    }
+
+    /// A device in the mock chain: its raw bytes and its detected format.
+    #[cfg(feature = "qcow1-input")]
+    struct Q1Device {
+        bytes: std::vec::Vec<u8>,
+        format: ImageFormat,
+    }
+
+    /// Init per-device qcow1 state, wire a `ChainConfig`, and read one span
+    /// through [`read_chain_virtual_cluster`] over the whole chain. Returns the
+    /// produced bytes. The ChainDeviceInfo cluster_size is populated from the
+    /// header (the arm ignores it — its boundary is the header-derived
+    /// `state.cluster_size`).
+    #[cfg(feature = "qcow1-input")]
+    fn run_q1_chain_read(
+        devices: &[Q1Device],
+        sector_size: usize,
+        virtual_offset: u64,
+        chunk_size: u64,
+    ) -> std::vec::Vec<u8> {
+        let _guard = Q1_LOCK.lock().unwrap();
+        assert!(devices.len() <= Q1_MAX_DEVS);
+
+        unsafe {
+            Q1_SSZ = sector_size;
+            let imgs = core::ptr::addr_of_mut!(Q1_IMAGES) as *mut *const u8;
+            let lens = core::ptr::addr_of_mut!(Q1_LENS) as *mut usize;
+            for i in 0..Q1_MAX_DEVS {
+                if i < devices.len() {
+                    *imgs.add(i) = devices[i].bytes.as_ptr();
+                    *lens.add(i) = devices[i].bytes.len();
+                } else {
+                    *imgs.add(i) = core::ptr::null();
+                    *lens.add(i) = 0;
+                }
+            }
+        }
+        let call_table = q1_call_table();
+
+        // Two cache buffers (L1 + L2) per device, kept alive for the read.
+        let mut caches: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
+        for _ in 0..devices.len() {
+            caches.push(std::vec![0u8; MAX_SECTOR_SIZE]);
+            caches.push(std::vec![0u8; MAX_SECTOR_SIZE]);
+        }
+
+        let mut chain_states = ChainStates::default();
+        let mut chain_config = ChainConfig::new();
+        chain_config.magic = ChainConfig::MAGIC;
+        chain_config.version = ChainConfig::VERSION;
+        chain_config.device_count = devices.len() as u32;
+
+        let mut bytes_read = 0u64;
+        for (i, d) in devices.iter().enumerate() {
+            chain_config.devices[i].format = d.format as u32;
+            chain_config.devices[i].data_device_idx = 0;
+            let cap = unsafe { (call_table.get_input_capacity)(i as u32) };
+            if matches!(d.format, ImageFormat::Qcow1) {
+                let l1 = caches[i * 2].as_mut_ptr();
+                let l2 = caches[i * 2 + 1].as_mut_ptr();
+                chain_states.qcow1_states[i] = unsafe {
+                    qcow1::Qcow1State::init(
+                        &call_table,
+                        i as u32,
+                        sector_size,
+                        cap,
+                        l1,
+                        l2,
+                        &mut bytes_read,
+                    )
+                };
+                let cs = chain_states.qcow1_states[i]
+                    .as_ref()
+                    .expect("Qcow1State::init should succeed for a valid header")
+                    .cluster_size;
+                chain_config.devices[i].cluster_size = cs as u32;
+            }
+        }
+
+        let mut compressed_buf = std::vec![0u8; COMPRESSED_BUF_SIZE];
+        let mut staging_buf = std::vec![0u8; MAX_CLUSTER_SIZE];
+        let mut staging_cluster_offset = u64::MAX;
+
+        let mut out = std::vec![0xAAu8; chunk_size as usize];
+        let ok = unsafe {
+            read_chain_virtual_cluster(
+                &call_table,
+                0,
+                devices.len(),
+                virtual_offset,
+                out.as_mut_ptr(),
+                chunk_size,
+                sector_size,
+                &chain_config,
+                &mut chain_states,
+                compressed_buf.as_mut_ptr(),
+                staging_buf.as_mut_ptr(),
+                &mut staging_cluster_offset,
+                None,
+                None,
+                0,
+                &mut bytes_read,
+            )
+        };
+        unsafe {
+            let imgs = core::ptr::addr_of_mut!(Q1_IMAGES) as *mut *const u8;
+            for i in 0..Q1_MAX_DEVS {
+                *imgs.add(i) = core::ptr::null();
+            }
+        }
+        assert!(ok, "read_chain_virtual_cluster returned false");
+        out
+    }
+
+    // (a) An unallocated overlay cluster descends to the backing device.
+    #[cfg(feature = "qcow1-input")]
+    #[test]
+    fn q1_arm_unallocated_descends_to_backing() {
+        // Overlay: 4 KiB clusters, cluster 0 is a hole (no L2 value). Backing:
+        // a raw device whose byte at virtual offset v is q1_backing_byte(v).
+        let overlay = build_q1_overlay(12, 9, 64 * 1024, 64 * 1024, 0, 0x200, 0x400, &[], &[]);
+        let mut backing = std::vec![0u8; 64 * 1024];
+        for (i, b) in backing.iter_mut().enumerate() {
+            *b = q1_backing_byte(i as u64);
+        }
+        let devices = [
+            Q1Device {
+                bytes: overlay,
+                format: ImageFormat::Qcow1,
+            },
+            Q1Device {
+                bytes: backing,
+                format: ImageFormat::Raw,
+            },
+        ];
+        let out = run_q1_chain_read(&devices, 512, 0, 4096);
+        let want: std::vec::Vec<u8> = (0..4096u64).map(q1_backing_byte).collect();
+        assert_eq!(
+            out, want,
+            "unallocated qcow1 cluster must read through to the backing device"
+        );
+    }
+
+    // (b) One chunk with interleaved allocated + unallocated clusters: the
+    // allocated sub-spans come from the overlay, the holes from the backing.
+    #[cfg(feature = "qcow1-input")]
+    #[test]
+    fn q1_arm_mixed_chunk_allocated_and_backing() {
+        // Overlay: cluster 0 → host 0x2000, cluster 1 hole, cluster 2 → host
+        // 0x3000, cluster 3 hole. A single 4-cluster (16384-byte) chunk mixes
+        // allocated (overlay) and unallocated (backing) sub-spans.
+        let overlay = build_q1_overlay(
+            12,
+            9,
+            64 * 1024,
+            64 * 1024,
+            0,
+            0x200,
+            0x400,
+            &[(0, 0x2000), (2, 0x3000)],
+            &[(0x2000, 4096), (0x3000, 4096)],
+        );
+        let mut backing = std::vec![0u8; 64 * 1024];
+        for (i, b) in backing.iter_mut().enumerate() {
+            *b = q1_backing_byte(i as u64);
+        }
+        let devices = [
+            Q1Device {
+                bytes: overlay,
+                format: ImageFormat::Qcow1,
+            },
+            Q1Device {
+                bytes: backing,
+                format: ImageFormat::Raw,
+            },
+        ];
+        let out = run_q1_chain_read(&devices, 512, 0, 4 * 4096);
+        let cl = 4096usize;
+        // Cluster 0: overlay @ host 0x2000.
+        let w0: std::vec::Vec<u8> = (0..cl as u64)
+            .map(|i| q1_overlay_byte(0x2000 + i))
+            .collect();
+        assert_eq!(out[..cl], w0[..], "cluster 0 from overlay");
+        // Cluster 1: hole → backing @ virtual 4096.
+        let w1: std::vec::Vec<u8> = (0..cl as u64).map(|i| q1_backing_byte(4096 + i)).collect();
+        assert_eq!(out[cl..2 * cl], w1[..], "cluster 1 from backing");
+        // Cluster 2: overlay @ host 0x3000.
+        let w2: std::vec::Vec<u8> = (0..cl as u64)
+            .map(|i| q1_overlay_byte(0x3000 + i))
+            .collect();
+        assert_eq!(out[2 * cl..3 * cl], w2[..], "cluster 2 from overlay");
+        // Cluster 3: hole → backing @ virtual 12288.
+        let w3: std::vec::Vec<u8> = (0..cl as u64).map(|i| q1_backing_byte(12288 + i)).collect();
+        assert_eq!(out[3 * cl..4 * cl], w3[..], "cluster 3 from backing");
+    }
+
+    // (c) A compressed (raw-DEFLATE) cluster inflates end-to-end, including a
+    // windowed sub-cluster read.
+    #[cfg(feature = "qcow1-input")]
+    #[test]
+    fn q1_arm_compressed_cluster_end_to_end() {
+        // A compressible-but-position-sensitive 4 KiB plaintext.
+        let plaintext: std::vec::Vec<u8> = (0..4096u64).map(|i| ((i >> 2) & 0x3f) as u8).collect();
+        // Raw DEFLATE (no zlib header) — exactly what qcow1 stores.
+        let blob = miniz_oxide::deflate::compress_to_vec(&plaintext, 6);
+        assert!(
+            blob.len() < 4096,
+            "compressed blob must fit the csize field (< cluster_size), got {}",
+            blob.len()
+        );
+        // Place the blob at an UNALIGNED host offset to exercise the
+        // byte-accurate read; encode the compressed L2 entry.
+        let host = 0x2003u64;
+        let shift = 63 - 12u32; // 51
+        let entry = (1u64 << 63) | ((blob.len() as u64) << shift) | host;
+
+        let mut overlay = build_q1_overlay(
+            12,
+            9,
+            64 * 1024,
+            64 * 1024,
+            0,
+            0x200,
+            0x400,
+            &[(0, entry)],
+            &[],
+        );
+        overlay[host as usize..host as usize + blob.len()].copy_from_slice(&blob);
+
+        // Full-cluster read.
+        let devices = [Q1Device {
+            bytes: overlay,
+            format: ImageFormat::Qcow1,
+        }];
+        let out = run_q1_chain_read(&devices, 512, 0, 4096);
+        assert_eq!(
+            out, plaintext,
+            "compressed cluster must inflate to plaintext"
+        );
+
+        // Windowed read: 1024 bytes starting 100 into the cluster copies the
+        // matching slice of the inflated cluster.
+        let overlay2 = {
+            let mut o = build_q1_overlay(
+                12,
+                9,
+                64 * 1024,
+                64 * 1024,
+                0,
+                0x200,
+                0x400,
+                &[(0, entry)],
+                &[],
+            );
+            o[host as usize..host as usize + blob.len()].copy_from_slice(&blob);
+            o
+        };
+        let devices2 = [Q1Device {
+            bytes: overlay2,
+            format: ImageFormat::Qcow1,
+        }];
+        let out2 = run_q1_chain_read(&devices2, 512, 100, 1024);
+        assert_eq!(
+            out2[..],
+            plaintext[100..1124],
+            "windowed compressed read must copy the right sub-span"
+        );
+    }
+
+    // (d) A 512-byte-cluster walk across a chunk with scattered allocations and
+    // holes (no backing → holes read as zeros).
+    #[cfg(feature = "qcow1-input")]
+    #[test]
+    fn q1_arm_small_cluster_walk() {
+        // cluster_bits=9 (512-byte clusters), l2_bits=12 (4096 entries).
+        // Clusters 0,2,5 allocated (data past the 32 KiB L2 table); the rest
+        // are holes. A 4096-byte chunk spans eight 512-byte clusters.
+        let overlay = build_q1_overlay(
+            9,
+            12,
+            16 * 1024,
+            64 * 1024,
+            0,
+            0x200,
+            0x400,
+            &[(0, 0x9000), (2, 0x9200), (5, 0x9400)],
+            &[(0x9000, 512), (0x9200, 512), (0x9400, 512)],
+        );
+        let devices = [Q1Device {
+            bytes: overlay,
+            format: ImageFormat::Qcow1,
+        }];
+        let out = run_q1_chain_read(&devices, 512, 0, 4096);
+        let cl = 512usize;
+        let alloc: [(usize, u64); 3] = [(0, 0x9000), (2, 0x9200), (5, 0x9400)];
+        for c in 0..8usize {
+            let region = &out[c * cl..(c + 1) * cl];
+            if let Some(&(_, host)) = alloc.iter().find(|&&(idx, _)| idx == c) {
+                let want: std::vec::Vec<u8> =
+                    (0..cl as u64).map(|j| q1_overlay_byte(host + j)).collect();
+                assert_eq!(region, &want[..], "cluster {c} → host {host:#x}");
+            } else {
+                assert!(
+                    region.iter().all(|&b| b == 0),
+                    "cluster {c} hole must be zero"
+                );
+            }
+        }
+    }
+
+    // (e) An allocated cluster whose host offset is past capacity zero-fills.
+    #[cfg(feature = "qcow1-input")]
+    #[test]
+    fn q1_arm_allocated_past_capacity_zero_fills() {
+        // L2[0] points 1 MiB into a 64 KiB device: qemu never validates file
+        // length, so the whole cluster zero-fills rather than erroring.
+        let overlay = build_q1_overlay(
+            12,
+            9,
+            64 * 1024,
+            64 * 1024,
+            0,
+            0x200,
+            0x400,
+            &[(0, 0x100000)],
+            &[],
+        );
+        let devices = [Q1Device {
+            bytes: overlay,
+            format: ImageFormat::Qcow1,
+        }];
+        let out = run_q1_chain_read(&devices, 512, 0, 4096);
+        assert!(
+            out.iter().all(|&b| b == 0),
+            "past-capacity qcow1 cluster must zero-fill, got {:02x?}",
+            &out[..16]
+        );
+    }
+
+    // (f) A straddling allocated cluster returns the in-file prefix and zero
+    // fills the truncated tail.
+    #[cfg(feature = "qcow1-input")]
+    #[test]
+    fn q1_arm_allocated_straddle_zero_fills_tail() {
+        // L2[0] → host 8192. Device length 10752 (21 × 512) so a 4096-byte
+        // cluster read from 8192 has 2560 in-file bytes then 1536 zero.
+        let total_len = 21 * 512usize; // 10752
+        let overlay = build_q1_overlay(
+            12,
+            9,
+            64 * 1024,
+            total_len,
+            0,
+            0x200,
+            0x400,
+            &[(0, 8192)],
+            &[(8192, 2560)],
+        );
+        let devices = [Q1Device {
+            bytes: overlay,
+            format: ImageFormat::Qcow1,
+        }];
+        let out = run_q1_chain_read(&devices, 512, 0, 4096);
+        let prefix = 2560usize;
+        let want: std::vec::Vec<u8> = (0..4096u64)
+            .map(|i| {
+                if (i as usize) < prefix {
+                    q1_overlay_byte(8192 + i)
+                } else {
+                    0
+                }
+            })
+            .collect();
+        assert_eq!(
+            out, want,
+            "straddling qcow1 read must return the in-file prefix and zero the tail"
+        );
+    }
+
+    // (g) With no backing device, an unallocated cluster reads as zeros.
+    #[cfg(feature = "qcow1-input")]
+    #[test]
+    fn q1_arm_no_backing_unallocated_reads_zeros() {
+        let overlay = build_q1_overlay(12, 9, 64 * 1024, 64 * 1024, 0, 0x200, 0x400, &[], &[]);
+        let devices = [Q1Device {
+            bytes: overlay,
+            format: ImageFormat::Qcow1,
+        }];
+        let out = run_q1_chain_read(&devices, 512, 0, 4096);
+        assert!(
+            out.iter().all(|&b| b == 0),
+            "bottom-of-chain unallocated qcow1 cluster must read as zeros"
+        );
+    }
+
+    // (h) An encrypted image fails chain init (and the op therefore fails
+    // cleanly) — the reader-level crypt refusal propagates like the other arms.
+    #[cfg(feature = "qcow1-input")]
+    #[test]
+    fn q1_arm_encrypted_init_fails_cleanly() {
+        let _guard = Q1_LOCK.lock().unwrap();
+        let mut img = std::vec![0u8; 64 * 1024];
+        let hdr = build_q1_header_bytes(
+            &Q1Spec {
+                cluster_bits: 12,
+                l2_bits: 9,
+                virtual_size: 64 * 1024,
+                crypt_method: 1, // AES: parses (for info) but init refuses.
+            },
+            0x200,
+        );
+        img[..512].copy_from_slice(&hdr);
+
+        unsafe {
+            Q1_SSZ = 512;
+            let imgs = core::ptr::addr_of_mut!(Q1_IMAGES) as *mut *const u8;
+            let lens = core::ptr::addr_of_mut!(Q1_LENS) as *mut usize;
+            *imgs = img.as_ptr();
+            *lens = img.len();
+        }
+        let call_table = q1_call_table();
+
+        let mut chain_states = ChainStates::default();
+        let mut chain_config = ChainConfig::new();
+        chain_config.magic = ChainConfig::MAGIC;
+        chain_config.version = ChainConfig::VERSION;
+        chain_config.device_count = 1;
+        chain_config.devices[0].format = ImageFormat::Qcow1 as u32;
+
+        let mut cache = std::vec![0u8; 2 * MAX_SECTOR_SIZE];
+        let dynamic_bufs_start = cache.as_mut_ptr() as usize;
+        let mut bytes_read = 0u64;
+        let ok = unsafe {
+            init_chain_states(
+                &call_table,
+                &chain_config,
+                &mut chain_states,
+                1,
+                512,
+                dynamic_bufs_start,
+                &mut bytes_read,
+            )
+        };
+        unsafe {
+            let imgs = core::ptr::addr_of_mut!(Q1_IMAGES) as *mut *const u8;
+            *imgs = core::ptr::null();
+        }
+        assert!(!ok, "encrypted qcow1 must fail chain init");
+        assert!(
+            chain_states.qcow1_states[0].is_none(),
+            "no state should be recorded for the refused encrypted device"
+        );
+    }
 }
 
 /// Look up the refcount for a host cluster via two-level table indirection.
@@ -7334,6 +7952,222 @@ pub unsafe fn read_chain_virtual_cluster(
                 }
                 return true;
             }
+            #[cfg(feature = "qcow1-input")]
+            ImageFormat::Qcow1 => {
+                // QCOW1 combines three precedents:
+                //   * a PER-CLUSTER WALK (like the Parallels arm): qcow1
+                //     clusters go down to 512 bytes, far smaller than a chunk,
+                //     and adjacent clusters are non-contiguous on the host, so
+                //     the chunk is resolved one header-derived cluster at a
+                //     time (never from ChainDeviceInfo.cluster_size).
+                //   * BACKING FALL-THROUGH (like the Qcow2 arm): an
+                //     unallocated qcow1 cluster must descend to the next chain
+                //     device, NOT zero-fill. The Qcow2 arm signals a
+                //     whole-chunk hole with `continue` (retry the same span on
+                //     the next device) and a sub-span hole (mixed
+                //     subclusters) by RECURSING into
+                //     `read_chain_virtual_cluster` at `chain_start +
+                //     dev_offset + 1` for just that sub-span, zero-filling only
+                //     at the bottom of the chain. Because this walk resolves
+                //     one cluster at a time inside a single chunk — where
+                //     allocated and unallocated clusters can be interleaved —
+                //     we mirror the Qcow2 sub-span mechanism: each unallocated
+                //     cluster recurses into the remaining lower chain for its
+                //     own span while allocated/compressed clusters are served
+                //     from this device. A `continue` would wrongly re-resolve
+                //     the whole chunk (including already-filled allocated
+                //     clusters) on the next device, so it is not used here.
+                //   * CAPACITY-CLAMPED ZERO-FILL (like the Vdi/Parallels arms)
+                //     for allocated-but-past-EOF and straddling reads (qemu
+                //     never validates qcow1 file length and zero-fills every
+                //     truncation shape on every version).
+                let cluster_size = match &chain_states.qcow1_states[dev_idx] {
+                    Some(s) => s.cluster_size,
+                    None => return false,
+                };
+                let cap_bytes = cap.saturating_mul(sector_size as u64);
+                let mut done = 0u64;
+                while done < chunk_size {
+                    let cur_virtual = virtual_offset + done;
+                    let offset_in_cluster = cur_virtual % cluster_size;
+                    let to_cluster_end = cluster_size - offset_in_cluster;
+                    let remaining = chunk_size - done;
+                    let span = if remaining < to_cluster_end {
+                        remaining
+                    } else {
+                        to_cluster_end
+                    };
+                    let dst = buf.add(done as usize);
+
+                    // Look up this cluster with a short-lived borrow so the
+                    // Unallocated arm below can re-borrow `chain_states` for
+                    // the backing recursion (block_lookup returns a Copy enum,
+                    // ending the borrow before the match body runs).
+                    let lookup = match &mut chain_states.qcow1_states[dev_idx] {
+                        Some(s) => {
+                            s.block_lookup(call_table, cur_virtual, sector_size, cap, bytes_read)
+                        }
+                        None => return false,
+                    };
+
+                    match lookup {
+                        Some(qcow1::Qcow1BlockLookup::Unallocated) => {
+                            // Defer this sub-span to the next device in the
+                            // chain; zeros only if this is the bottom device.
+                            let lower = chain_len - dev_offset - 1;
+                            if lower > 0 {
+                                if !read_chain_virtual_cluster(
+                                    call_table,
+                                    chain_start + dev_offset + 1,
+                                    lower,
+                                    cur_virtual,
+                                    dst,
+                                    span,
+                                    sector_size,
+                                    chain_config,
+                                    chain_states,
+                                    compressed_buf,
+                                    staging_buf,
+                                    staging_cluster_offset,
+                                    aes_key,
+                                    luks_key,
+                                    luks_sector_size,
+                                    bytes_read,
+                                ) {
+                                    return false;
+                                }
+                            } else {
+                                core::ptr::write_bytes(dst, 0, span as usize);
+                            }
+                        }
+                        Some(qcow1::Qcow1BlockLookup::Allocated(host_byte_offset)) => {
+                            // Uncompressed L2 entries are absolute host byte
+                            // offsets. qemu never validates file length: a read
+                            // at or past capacity zero-fills, and a straddling
+                            // read returns the in-file prefix then zero-fills
+                            // the truncated tail. `cap` is in sectors.
+                            if host_byte_offset >= cap_bytes {
+                                core::ptr::write_bytes(dst, 0, span as usize);
+                            } else {
+                                let avail = cap_bytes - host_byte_offset;
+                                let read_len = if span < avail { span } else { avail };
+                                if read_len < span {
+                                    core::ptr::write_bytes(
+                                        dst.add(read_len as usize),
+                                        0,
+                                        (span - read_len) as usize,
+                                    );
+                                }
+                                // qcow1 cluster offsets are not necessarily
+                                // aligned to the guest's virtio sector, so the
+                                // unaligned path is reachable just as for VDI.
+                                let intra_sector = (host_byte_offset % sector_size as u64) as usize;
+                                let ok = if intra_sector == 0 {
+                                    read_cluster_sectors(
+                                        call_table,
+                                        dev_idx as u32,
+                                        host_byte_offset,
+                                        dst,
+                                        read_len,
+                                        sector_size,
+                                        bytes_read,
+                                    )
+                                } else {
+                                    read_offset_sectors(
+                                        call_table,
+                                        dev_idx as u32,
+                                        host_byte_offset,
+                                        dst,
+                                        read_len,
+                                        sector_size,
+                                        compressed_buf,
+                                        bytes_read,
+                                    )
+                                };
+                                if !ok {
+                                    return false;
+                                }
+                            }
+                        }
+                        Some(qcow1::Qcow1BlockLookup::Compressed { host_offset, csize }) => {
+                            // Read `csize` bytes of raw-DEFLATE data from the
+                            // possibly-unaligned host offset into compressed_buf
+                            // (COMPRESSED_BUF_SIZE >> qcow1's 64 KiB max
+                            // cluster), zero-filling any tail past capacity like
+                            // qemu (it reads what's there and inflates the rest
+                            // from zeroes). read_cluster_sectors' byte-accurate
+                            // path handles the unaligned start.
+                            if host_offset >= cap_bytes {
+                                core::ptr::write_bytes(compressed_buf, 0, csize);
+                            } else {
+                                let avail = cap_bytes - host_offset;
+                                let read_len = if (csize as u64) < avail {
+                                    csize as u64
+                                } else {
+                                    avail
+                                };
+                                if (read_len as usize) < csize {
+                                    core::ptr::write_bytes(
+                                        compressed_buf.add(read_len as usize),
+                                        0,
+                                        csize - read_len as usize,
+                                    );
+                                }
+                                if read_len > 0
+                                    && !read_cluster_sectors(
+                                        call_table,
+                                        dev_idx as u32,
+                                        host_offset,
+                                        compressed_buf,
+                                        read_len,
+                                        sector_size,
+                                        bytes_read,
+                                    )
+                                {
+                                    return false;
+                                }
+                            }
+
+                            // Inflate exactly cluster_size bytes into
+                            // staging_buf (MAX_CLUSTER_SIZE), then copy the
+                            // requested span. qcow1 clusters are RAW DEFLATE:
+                            // miniz WITHOUT TINFL_FLAG_PARSE_ZLIB_HEADER (no
+                            // qcow2 zlib-first two-try). We clobber staging_buf,
+                            // so invalidate the qcow2/vmdk large-cluster staging
+                            // cache to keep a later backing read honest.
+                            let comp_slice =
+                                core::slice::from_raw_parts(compressed_buf as *const u8, csize);
+                            let out_slice =
+                                core::slice::from_raw_parts_mut(staging_buf, cluster_size as usize);
+                            use miniz_oxide::inflate::core::inflate_flags;
+                            use miniz_oxide::inflate::TINFLStatus;
+                            let mut decomp = miniz_oxide::inflate::core::DecompressorOxide::new();
+                            let (status, _in_consumed, out_produced) =
+                                miniz_oxide::inflate::core::decompress(
+                                    &mut decomp,
+                                    comp_slice,
+                                    out_slice,
+                                    0,
+                                    inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
+                                );
+                            *staging_cluster_offset = u64::MAX;
+                            if status != TINFLStatus::Done || out_produced != cluster_size as usize
+                            {
+                                return false;
+                            }
+                            core::ptr::copy_nonoverlapping(
+                                staging_buf.add(offset_in_cluster as usize),
+                                dst,
+                                span as usize,
+                            );
+                        }
+                        None => return false,
+                    }
+
+                    done += span;
+                }
+                return true;
+            }
             ImageFormat::VmdkDescriptor => {
                 // A VMDK flat descriptor holds no content of its
                 // own; the flat extent(s) live on data device(s)
@@ -7546,6 +8380,8 @@ pub struct ChainStates {
     pub vdi_states: [Option<vdi::VdiState>; MAX_CHAIN_DEVICES],
     #[cfg(feature = "parallels-input")]
     pub parallels_states: [Option<parallels::ParallelsState>; MAX_CHAIN_DEVICES],
+    #[cfg(feature = "qcow1-input")]
+    pub qcow1_states: [Option<qcow1::Qcow1State>; MAX_CHAIN_DEVICES],
 }
 
 /// Initialize format-specific state for all devices in a chain.
@@ -7671,6 +8507,25 @@ pub unsafe fn init_chain_states(
                     bytes_read,
                 );
                 if chain_states.parallels_states[dev_idx].is_none() {
+                    return false;
+                }
+            }
+            #[cfg(feature = "qcow1-input")]
+            ImageFormat::Qcow1 => {
+                // Reuse the same cache slots: L1→L1 table, L2→L2 table. Init
+                // failure — a malformed header, a failed header-sector read,
+                // or the reader-level encryption refusal (crypt_method != 0) —
+                // propagates as `false` exactly like the Vdi/Parallels arms.
+                chain_states.qcow1_states[dev_idx] = qcow1::Qcow1State::init(
+                    call_table,
+                    dev_idx as u32,
+                    sector_size,
+                    cap,
+                    l1_cache_addr(dynamic_bufs_start, dev_idx),
+                    l2_cache_addr(dynamic_bufs_start, dev_idx),
+                    bytes_read,
+                );
+                if chain_states.qcow1_states[dev_idx].is_none() {
                     return false;
                 }
             }
