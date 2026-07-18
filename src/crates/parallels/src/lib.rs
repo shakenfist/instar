@@ -72,7 +72,7 @@ pub const EXT_OFF_OFFSET: usize = 56;
 
 /// Maximum `tracks` (sectors per cluster) qemu will open: `INT32_MAX / 513`.
 /// Anything larger is "Invalid image: Too big cluster".
-pub const PARALLELS_TRACKS_MAX: u32 = 4_185_446;
+pub const PARALLELS_TRACKS_MAX: u32 = 4_186_127;
 
 /// Maximum BAT entry count qemu will open: `INT_MAX / 4`. Anything larger
 /// is "Catalog too large".
