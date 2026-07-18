@@ -468,6 +468,35 @@ pub unsafe extern "C" fn _start() -> u64 {
                 b"\0".as_ptr(),
             );
         }
+        ImageFormat::Qcow1 => {
+            // QCOW1 ("qcow" v1): no format-specific block (qemu prints
+            // none), but a real backing file may be present. Parse the
+            // 48-byte BE header via the same crate the chain reader uses.
+            let mut backing_file_buf = [0u8; MAX_BACKING_FILE_LEN + 1];
+
+            if detailed {
+                (call_table.verbose_print)(b"info: parsing qcow1\n\0".as_ptr());
+                parse_qcow1_header(
+                    &buffer,
+                    &mut result,
+                    call_table,
+                    &mut backing_file_buf,
+                    input_sector_size,
+                    input_capacity,
+                );
+            }
+
+            (call_table.send_info_result)(
+                format_str,
+                result.version,
+                result.virtual_size,
+                result.actual_size,
+                result.cluster_size,
+                result.flags,
+                backing_file_buf.as_ptr(),
+                b"\0".as_ptr(),
+            );
+        }
         ImageFormat::Parallels => {
             if detailed {
                 parse_parallels_header(&buffer, &mut result);
@@ -622,7 +651,10 @@ fn format_to_str(format: ImageFormat) -> *const u8 {
         ImageFormat::Unknown => b"unknown\0".as_ptr(),
         ImageFormat::Raw => b"raw\0".as_ptr(),
         ImageFormat::Qcow2 => b"qcow2\0".as_ptr(),
-        ImageFormat::Qcow1 => b"qcow1\0".as_ptr(),
+        // qemu-img and oslo.utils both call the v1 format "qcow" (not
+        // "qcow1"); byte-parity baselines require this spelling. The
+        // chain reader keeps "qcow1" as an accepted input alias.
+        ImageFormat::Qcow1 => b"qcow\0".as_ptr(),
         ImageFormat::Vmdk4 => b"vmdk\0".as_ptr(),
         ImageFormat::Vmdk3 => b"vmdk3\0".as_ptr(),
         ImageFormat::Vhd => b"vpc\0".as_ptr(), // qemu-img calls VHD format "vpc"
@@ -970,6 +1002,135 @@ unsafe fn parse_qcow2_header(
             (call_table.verbose_print)(b"info: found data file ext\n\0".as_ptr());
         }
     }
+}
+
+/// Parse a QCOW1 ("qcow" v1) header and populate `result` + the backing
+/// file name.
+///
+/// Uses `qcow1::Qcow1Header::parse()` (the same crate the chain reader
+/// uses) for field extraction, mirroring the qcow2 arm. Notable qcow
+/// specifics:
+///
+/// * **Virtual size is truncated DOWN to a 512-byte multiple.** qemu's
+///   qcow driver sets `bs->total_sectors = header.size / 512` and info
+///   reports `total_sectors * 512` — unlike VDI, which rounds up. The
+///   phase-4 plan's 4d pin verifies this: fixture `qcow1-odd-size`
+///   stores 1048577 in the header yet every qemu baseline reports
+///   1048576.
+/// * `cluster_size = 1 << cluster_bits` is emitted normally (qemu
+///   prints a cluster_size for qcow; no suppression as for parallels).
+/// * `crypt_method != 0` (AES) sets `FLAG_ENCRYPTED`: `info` works on an
+///   encrypted qcow1 (metadata only) and the host emits the encrypted
+///   line; data ops refuse it at the reader.
+/// * The backing file name is stored un-terminated on disk at
+///   `backing_file_offset` for exactly `backing_file_size` bytes
+///   (qemu caps the length at 1023, enforced by the parser). It is read
+///   bounds-checked — possibly from a later sector than the header — and
+///   NUL-terminated for the ABI.
+unsafe fn parse_qcow1_header(
+    buffer: &[u8],
+    result: &mut InfoResult,
+    call_table: &CallTable,
+    backing_file_buf: &mut [u8; MAX_BACKING_FILE_LEN + 1],
+    input_sector_size: usize,
+    input_capacity: u64,
+) {
+    let hdr = match qcow1::Qcow1Header::parse(buffer) {
+        Some(h) => h,
+        None => return,
+    };
+
+    // Truncate DOWN to a 512-byte multiple (qemu total_sectors math).
+    result.virtual_size = (hdr.virtual_size / 512) * 512;
+    result.cluster_size = hdr.cluster_size as u32;
+
+    if hdr.is_encrypted() {
+        result.flags |= InfoResult::FLAG_ENCRYPTED;
+    }
+
+    if hdr.backing_file_offset != 0 && hdr.backing_file_size > 0 {
+        result.flags |= InfoResult::FLAG_HAS_BACKING_FILE;
+        (call_table.verbose_print)(b"info: qcow1 has backing file\n\0".as_ptr());
+        read_qcow1_backing_file(
+            call_table,
+            0,
+            hdr.backing_file_offset,
+            hdr.backing_file_size,
+            backing_file_buf,
+            input_sector_size,
+            input_capacity,
+        );
+    }
+}
+
+/// Read a QCOW1 backing file name into `out_buf`, NUL-terminating it.
+///
+/// The name lives at an arbitrary byte offset that may be past the
+/// header sector, so this reads the covering sector(s) directly from the
+/// input device (mirroring `qcow2::read_backing_file`). The name is not
+/// NUL-terminated on disk — exactly `backing_file_size` bytes are read
+/// (capped at the buffer). Returns the number of name bytes copied.
+unsafe fn read_qcow1_backing_file(
+    call_table: &CallTable,
+    device_idx: u32,
+    backing_file_offset: u64,
+    backing_file_size: u32,
+    out_buf: &mut [u8],
+    sector_size: usize,
+    input_capacity: u64,
+) -> usize {
+    if backing_file_offset == 0 || backing_file_size == 0 {
+        return 0;
+    }
+
+    let max_len = out_buf.len().saturating_sub(1); // Reserve space for NUL.
+    let read_size = core::cmp::min(backing_file_size as usize, max_len);
+
+    let backing_sector = backing_file_offset / sector_size as u64;
+    let offset_in_sector = (backing_file_offset % sector_size as u64) as usize;
+
+    if backing_sector >= input_capacity {
+        return 0;
+    }
+
+    let mut sector_buf = [0u8; MAX_SECTOR_SIZE];
+    if !(call_table.read_input_sector)(
+        device_idx,
+        backing_sector,
+        sector_buf.as_mut_ptr(),
+        sector_size,
+    ) {
+        return 0;
+    }
+
+    let bytes_in_first_sector = core::cmp::min(read_size, sector_size - offset_in_sector);
+    out_buf[..bytes_in_first_sector]
+        .copy_from_slice(&sector_buf[offset_in_sector..offset_in_sector + bytes_in_first_sector]);
+
+    let mut bytes_read = bytes_in_first_sector;
+    let mut current_sector = backing_sector + 1;
+
+    while bytes_read < read_size {
+        if current_sector >= input_capacity {
+            break;
+        }
+        if !(call_table.read_input_sector)(
+            device_idx,
+            current_sector,
+            sector_buf.as_mut_ptr(),
+            sector_size,
+        ) {
+            break;
+        }
+        let bytes_to_copy = core::cmp::min(read_size - bytes_read, sector_size);
+        out_buf[bytes_read..bytes_read + bytes_to_copy]
+            .copy_from_slice(&sector_buf[..bytes_to_copy]);
+        bytes_read += bytes_to_copy;
+        current_sector += 1;
+    }
+
+    out_buf[bytes_read] = 0; // NUL-terminate.
+    bytes_read
 }
 
 /// Parse VMDK4 header and populate result and VMDK-specific info.

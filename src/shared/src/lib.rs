@@ -1605,7 +1605,10 @@ impl ImageFormat {
             ImageFormat::Vmdk3 => "vmdk3",
             ImageFormat::Vhd => "vhd",
             ImageFormat::Vhdx => "vhdx",
-            ImageFormat::Qcow1 => "qcow1",
+            // qemu-img / oslo spell the v1 format "qcow" (not "qcow1");
+            // this feeds the check "(qcow)" refusal message and other
+            // guest result strings.
+            ImageFormat::Qcow1 => "qcow",
             ImageFormat::Vdi => "vdi",
             ImageFormat::Qed => "qed",
             ImageFormat::Iso => "iso",

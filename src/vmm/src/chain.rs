@@ -55,7 +55,9 @@ impl ImageFormat {
         match s {
             "raw" => ImageFormat::Raw,
             "qcow2" => ImageFormat::Qcow2,
-            "qcow1" => ImageFormat::Qcow1,
+            // The info op emits "qcow" (qemu-img / oslo spelling); "qcow1"
+            // is kept as an accepted input alias.
+            "qcow" | "qcow1" => ImageFormat::Qcow1,
             "vmdk" => ImageFormat::Vmdk4,
             "vmdk3" => ImageFormat::Vmdk3,
             "vpc" => ImageFormat::Vhd,
@@ -100,7 +102,8 @@ impl std::fmt::Display for ImageFormat {
         match self {
             ImageFormat::Raw => write!(f, "raw"),
             ImageFormat::Qcow2 => write!(f, "qcow2"),
-            ImageFormat::Qcow1 => write!(f, "qcow1"),
+            // qemu-img / oslo call the v1 format "qcow" (not "qcow1").
+            ImageFormat::Qcow1 => write!(f, "qcow"),
             ImageFormat::Vmdk4 => write!(f, "vmdk"),
             ImageFormat::Vmdk3 => write!(f, "vmdk3"),
             ImageFormat::Vhd => write!(f, "vpc"),
