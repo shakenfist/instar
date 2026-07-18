@@ -22,7 +22,7 @@ bench = { path = "../../crates/bench" }
 qcow2 = { path = "../../crates/qcow2", features = [
     "decompress", "decompress-zstd", "compress", "aes-decrypt",
     "luks-decrypt", "vmdk-decompress", "vhd-input", "vhdx-input",
-    "vdi-input",
+    "vdi-input", "parallels-input",
 ] }
 # Phase-6 step 6b (PLAN-qcow2-write-infrastructure-phase-06-bench.md):
 # the qcow2 `-w` write path is migrated onto the shared windowed

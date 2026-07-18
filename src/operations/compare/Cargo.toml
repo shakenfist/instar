@@ -12,7 +12,7 @@ qcow2 = { path = "../../crates/qcow2", features = [
     "decompress", "decompress-zstd", "aes-decrypt",
     "luks-decrypt", "vmdk-decompress",
     "vhd-input", "vhdx-input",
-    "vdi-input",
+    "vdi-input", "parallels-input",
 ] }
 luks = { path = "../../crates/luks", features = ["decrypt"] }
 

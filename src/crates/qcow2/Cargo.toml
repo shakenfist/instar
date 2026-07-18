@@ -22,6 +22,7 @@ vmdk-decompress = ["vmdk-input", "vmdk/decompress"]
 vhd-input = ["vhd"]
 vhdx-input = ["vhdx"]
 vdi-input = ["vdi"]
+parallels-input = ["parallels"]
 create = []
 
 [dependencies]
@@ -34,6 +35,7 @@ vmdk = { path = "../vmdk", optional = true }
 vhd = { path = "../vhd", optional = true }
 vhdx = { path = "../vhdx", optional = true }
 vdi = { path = "../vdi", optional = true }
+parallels = { path = "../parallels", optional = true }
 
 [lib]
 # No std, this is used by bare-metal code

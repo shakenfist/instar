@@ -2835,7 +2835,11 @@ pub unsafe fn read_cluster_sectors(
 /// `buf` must point to at least `max(chunk_size, sector_size)` writable
 /// bytes.  `scratch` must point to at least `sector_size` writable bytes.
 /// `call_table` must be valid.
-#[cfg(any(feature = "vhd-input", feature = "vdi-input"))]
+#[cfg(any(
+    feature = "vhd-input",
+    feature = "vdi-input",
+    feature = "parallels-input"
+))]
 unsafe fn read_offset_sectors(
     call_table: &CallTable,
     device_idx: u32,
@@ -5738,6 +5742,376 @@ mod tests {
             "straddling VDI read must return the in-file prefix and zero the truncated tail"
         );
     }
+
+    // ====================================================================
+    // Parallels chain-reader arm (read_chain_virtual_cluster
+    // ImageFormat::Parallels)
+    // ====================================================================
+    //
+    // These exercise the guest-side arm added for Parallels input. Unlike
+    // the VDI/VHD arms, this arm walks the chunk one parallels cluster at a
+    // time: adjacent clusters are non-contiguous on the host and, while
+    // `convert`/`dd` clamp a chunk to the top device's cluster boundary,
+    // `compare` uses the LARGER of the two chains' cluster sizes (capped at
+    // MAX_SECTOR_SIZE) and `bench`/`rebase` use their qcow2 cluster size, so
+    // a 65536-byte chunk can span sixteen 4 KiB parallels clusters. The
+    // `..._small_cluster_multi_cluster_span` test is that chunk-boundary
+    // pin (ChainDeviceInfo.cluster_size = 4096). Both magics are driven
+    // through the arm to prove the per-magic off_multiplier decodes to
+    // identical bytes; holes read as zeros; past-capacity and straddling
+    // reads zero-fill without error (qemu's no-file-length-validation
+    // semantics).
+    //
+    // Same `'static`-mock pattern as the VDI arm tests above.
+
+    #[cfg(feature = "parallels-input")]
+    static PLS_MOCK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[cfg(feature = "parallels-input")]
+    static mut PLS_MOCK_PTR: *const u8 = core::ptr::null();
+    #[cfg(feature = "parallels-input")]
+    static mut PLS_MOCK_CAP_SECTORS: u64 = 0;
+    #[cfg(feature = "parallels-input")]
+    static mut PLS_MOCK_SSZ: usize = 512;
+
+    /// Deterministic device byte at absolute offset `o`; period 251 so a
+    /// misaligned copy cannot accidentally match.
+    #[cfg(feature = "parallels-input")]
+    fn pls_pattern_byte(o: u64) -> u8 {
+        (o % 251) as u8
+    }
+
+    /// Mock `read_input_sector`: copies `sector_size` bytes from the mock
+    /// image. Returns false for any sector at/beyond the configured
+    /// capacity, so a read the arm fails to clamp surfaces as an error
+    /// rather than fabricated bytes.
+    #[cfg(feature = "parallels-input")]
+    unsafe extern "C" fn pls_mock_read_sector(
+        _device_idx: u32,
+        sector: u64,
+        out_buf: *mut u8,
+        sector_size: usize,
+    ) -> bool {
+        if sector >= PLS_MOCK_CAP_SECTORS {
+            return false;
+        }
+        let start = match (sector as usize).checked_mul(sector_size) {
+            Some(s) => s,
+            None => return false,
+        };
+        core::ptr::copy_nonoverlapping(PLS_MOCK_PTR.add(start), out_buf, sector_size);
+        true
+    }
+
+    #[cfg(feature = "parallels-input")]
+    unsafe extern "C" fn pls_mock_capacity(_device_idx: u32) -> u64 {
+        PLS_MOCK_CAP_SECTORS
+    }
+
+    #[cfg(feature = "parallels-input")]
+    unsafe extern "C" fn pls_mock_ssz(_device_idx: u32) -> usize {
+        PLS_MOCK_SSZ
+    }
+
+    #[cfg(feature = "parallels-input")]
+    fn pls_call_table() -> shared::CallTable {
+        shared::CallTable {
+            read_input_sector: pls_mock_read_sector,
+            get_input_capacity: pls_mock_capacity,
+            get_input_sector_size: pls_mock_ssz,
+            ..stub_call_table()
+        }
+    }
+
+    /// Build a minimal valid Parallels header (64 bytes) inside a 512-byte
+    /// sector: only the fields the reader consumes are set.
+    #[cfg(feature = "parallels-input")]
+    fn build_pls_header(
+        magic: [u8; 16],
+        tracks: u32,
+        bat_entries: u32,
+        nb_sectors: u64,
+    ) -> [u8; 512] {
+        use shared::{write_le_u32, write_le_u64};
+        let mut buf = [0u8; 512];
+        buf[..16].copy_from_slice(&magic);
+        write_le_u32(
+            &mut buf,
+            parallels::VERSION_OFFSET,
+            shared::format_detection::PARALLELS_VERSION,
+        );
+        write_le_u32(&mut buf, parallels::TRACKS_OFFSET, tracks);
+        write_le_u32(&mut buf, parallels::BAT_ENTRIES_OFFSET, bat_entries);
+        write_le_u64(&mut buf, parallels::NB_SECTORS_OFFSET, nb_sectors);
+        buf
+    }
+
+    /// Install a synthetic Parallels image (pattern everywhere, then the
+    /// header at 0 and the LE u32 BAT at [`parallels::HEADER_SIZE`]), init a
+    /// [`parallels::ParallelsState`], and read one chunk through
+    /// [`read_chain_virtual_cluster`] as a single-device chain. The chain's
+    /// `ChainDeviceInfo.cluster_size` is set to `info_cluster_size` (pass 0
+    /// to model the pre-info-plumbing state — the arm must still be correct,
+    /// since its cluster boundary comes from the header-derived
+    /// `state.cluster_size`, not from the chunk). Returns the produced bytes.
+    #[cfg(feature = "parallels-input")]
+    fn run_pls_chain_read(
+        header: &[u8; 512],
+        bat: &[u32],
+        cap_sectors: u64,
+        sector_size: usize,
+        info_cluster_size: u32,
+        virtual_offset: u64,
+        chunk_size: u64,
+    ) -> std::vec::Vec<u8> {
+        let _guard = PLS_MOCK_LOCK.lock().unwrap();
+
+        let len = cap_sectors as usize * sector_size;
+        let mut image = std::vec![0u8; len];
+        for (i, b) in image.iter_mut().enumerate() {
+            *b = pls_pattern_byte(i as u64);
+        }
+        image[..512].copy_from_slice(header);
+        for (i, &entry) in bat.iter().enumerate() {
+            let off = parallels::HEADER_SIZE + i * 4;
+            image[off..off + 4].copy_from_slice(&entry.to_le_bytes());
+        }
+
+        unsafe {
+            PLS_MOCK_PTR = image.as_ptr();
+            PLS_MOCK_CAP_SECTORS = cap_sectors;
+            PLS_MOCK_SSZ = sector_size;
+        }
+        let call_table = pls_call_table();
+
+        let mut bat_cache = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut data_cache = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut bytes_read = 0u64;
+        let state = unsafe {
+            parallels::ParallelsState::init(
+                &call_table,
+                0,
+                sector_size,
+                cap_sectors,
+                bat_cache.as_mut_ptr(),
+                data_cache.as_mut_ptr(),
+                &mut bytes_read,
+            )
+        }
+        .expect("ParallelsState::init should succeed for a valid header");
+
+        let mut chain_states = ChainStates::default();
+        chain_states.parallels_states[0] = Some(state);
+
+        let mut chain_config = ChainConfig::new();
+        chain_config.magic = ChainConfig::MAGIC;
+        chain_config.version = ChainConfig::VERSION;
+        chain_config.device_count = 1;
+        chain_config.devices[0].format = ImageFormat::Parallels as u32;
+        chain_config.devices[0].cluster_size = info_cluster_size;
+        chain_config.devices[0].data_device_idx = 0;
+
+        let mut compressed_buf = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut staging_buf = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut staging_cluster_offset = u64::MAX;
+
+        let mut out = std::vec![0xAAu8; chunk_size as usize];
+        let ok = unsafe {
+            read_chain_virtual_cluster(
+                &call_table,
+                0,
+                1,
+                virtual_offset,
+                out.as_mut_ptr(),
+                chunk_size,
+                sector_size,
+                &chain_config,
+                &mut chain_states,
+                compressed_buf.as_mut_ptr(),
+                staging_buf.as_mut_ptr(),
+                &mut staging_cluster_offset,
+                None,
+                None,
+                0,
+                &mut bytes_read,
+            )
+        };
+        // Drop the dangling global before `image` is freed.
+        unsafe {
+            PLS_MOCK_PTR = core::ptr::null();
+        }
+        assert!(ok, "read_chain_virtual_cluster returned false");
+        out
+    }
+
+    #[cfg(feature = "parallels-input")]
+    #[test]
+    fn pls_arm_hole_reads_zeros() {
+        // BAT value 0 → unallocated cluster; a parallels image has no lower
+        // device, so the arm zero-fills in place.
+        let header = build_pls_header(shared::format_detection::PARALLELS_MAGIC_V2, 128, 4, 4096);
+        let out = run_pls_chain_read(&header, &[0, 0, 0, 0], 2, 4096, 65536, 0, 4096);
+        assert!(
+            out.iter().all(|&b| b == 0),
+            "unallocated parallels cluster must read as zeros, got {:02x?}",
+            &out[..16]
+        );
+    }
+
+    #[cfg(feature = "parallels-input")]
+    #[test]
+    fn pls_arm_both_magics_identical_reads() {
+        // The per-magic gotcha, through the arm: with tracks=128 the v1 BAT
+        // `[0x80, 0x100]` (sector numbers, off_multiplier 1) and the ext BAT
+        // `[1, 2]` (cluster indices, off_multiplier tracks) both decode
+        // cluster 0 to host 0x10000. A full-cluster (65536) read must return
+        // the identical device bytes under either magic.
+        let expect: std::vec::Vec<u8> = (0..65536u64)
+            .map(|i| pls_pattern_byte(0x10000 + i))
+            .collect();
+
+        let v1 = build_pls_header(shared::format_detection::PARALLELS_MAGIC_V1, 128, 2, 4096);
+        let out_v1 = run_pls_chain_read(&v1, &[0x80, 0x100], 48, 4096, 65536, 0, 65536);
+        assert_eq!(out_v1, expect, "v1 magic (sector-valued BAT)");
+
+        let ext = build_pls_header(shared::format_detection::PARALLELS_MAGIC_V2, 128, 2, 4096);
+        let out_ext = run_pls_chain_read(&ext, &[1, 2], 48, 4096, 65536, 0, 65536);
+        assert_eq!(out_ext, expect, "ext magic (cluster-valued BAT)");
+
+        assert_eq!(out_v1, out_ext, "both magics must produce identical reads");
+    }
+
+    #[cfg(feature = "parallels-input")]
+    #[test]
+    fn pls_arm_non_contiguous_bat_multi_cluster_chunk() {
+        // ext magic, tracks=128: BAT [0, 2, 0, 1] — a hole, a non-identity
+        // allocation (cluster 1 → entry 2 → host 0x20000), a second hole,
+        // then cluster 3 → entry 1 → host 0x10000. A single 4-cluster chunk
+        // (262144 bytes) crosses three cluster boundaries and must decode
+        // each cluster independently.
+        let header = build_pls_header(shared::format_detection::PARALLELS_MAGIC_V2, 128, 4, 16384);
+        let out = run_pls_chain_read(&header, &[0, 2, 0, 1], 48, 4096, 65536, 0, 4 * 65536);
+        let cl = 65536usize;
+        assert!(out[..cl].iter().all(|&b| b == 0), "cluster 0 hole");
+        let want1: std::vec::Vec<u8> = (0..cl as u64)
+            .map(|i| pls_pattern_byte(0x20000 + i))
+            .collect();
+        assert_eq!(out[cl..2 * cl], want1[..], "cluster 1 → host 0x20000");
+        assert!(
+            out[2 * cl..3 * cl].iter().all(|&b| b == 0),
+            "cluster 2 hole"
+        );
+        let want3: std::vec::Vec<u8> = (0..cl as u64)
+            .map(|i| pls_pattern_byte(0x10000 + i))
+            .collect();
+        assert_eq!(out[3 * cl..4 * cl], want3[..], "cluster 3 → host 0x10000");
+    }
+
+    #[cfg(feature = "parallels-input")]
+    #[test]
+    fn pls_arm_unaligned_data_offset() {
+        // Parallels data offsets are 512-aligned but not necessarily aligned
+        // to the guest's virtio sector. v1 magic (off_multiplier 1), a BAT
+        // value of 3 → host = 3 * 512 = 1536, which is not a multiple of the
+        // 4096-byte guest sector, so the arm takes the unaligned read path.
+        let header = build_pls_header(shared::format_detection::PARALLELS_MAGIC_V1, 8, 1, 8);
+        let out = run_pls_chain_read(&header, &[3], 2, 4096, 4096, 0, 4096);
+        let want: std::vec::Vec<u8> = (0..4096u64).map(|i| pls_pattern_byte(1536 + i)).collect();
+        assert_eq!(
+            out, want,
+            "unaligned parallels data offset must read device data via the unaligned path"
+        );
+    }
+
+    #[cfg(feature = "parallels-input")]
+    #[test]
+    fn pls_arm_allocated_past_capacity_zero_fills() {
+        // ext magic, BAT entry 100 → host = 100 * 128 * 512 = 0x640000, far
+        // past the 2-sector capacity. qemu never validates parallels file
+        // length, so the whole cluster zero-fills rather than erroring.
+        let header = build_pls_header(shared::format_detection::PARALLELS_MAGIC_V2, 128, 4, 4096);
+        let out = run_pls_chain_read(&header, &[100, 0, 0, 0], 2, 4096, 65536, 0, 4096);
+        assert!(
+            out.iter().all(|&b| b == 0),
+            "past-capacity parallels cluster must zero-fill, got {:02x?}",
+            &out[..16]
+        );
+    }
+
+    #[cfg(feature = "parallels-input")]
+    #[test]
+    fn pls_arm_allocated_straddle_zero_fills_tail() {
+        // An allocated cluster that starts in-file but whose read runs off
+        // the device end: the in-capacity prefix returns device data and
+        // only the truncated tail zero-fills. sector_size 512 lets the
+        // capacity land mid-cluster. ext magic, tracks=8 (4 KiB cluster),
+        // BAT [1] → host = 1 * 8 * 512 = 4096. Capacity 13 sectors = 6656
+        // bytes: a 4096-byte cluster read from 4096 has 2560 in-file bytes
+        // then 1536 zero.
+        let header = build_pls_header(shared::format_detection::PARALLELS_MAGIC_V2, 8, 1, 16);
+        let out = run_pls_chain_read(&header, &[1], 13, 512, 4096, 0, 4096);
+        let prefix = 2560usize; // 6656 - 4096
+        let want: std::vec::Vec<u8> = (0..4096u64)
+            .map(|i| {
+                if (i as usize) < prefix {
+                    pls_pattern_byte(4096 + i)
+                } else {
+                    0
+                }
+            })
+            .collect();
+        assert_eq!(
+            out, want,
+            "straddling parallels read must return the in-file prefix and zero the truncated tail"
+        );
+    }
+
+    #[cfg(feature = "parallels-input")]
+    #[test]
+    fn pls_arm_small_cluster_multi_cluster_span() {
+        // THE CHUNK-BOUNDARY PIN. tracks=8 → 4 KiB clusters, and a 65536-byte
+        // chunk (as `compare`/`bench`/`rebase` can hand the arm) spans
+        // sixteen of them. ChainDeviceInfo.cluster_size is 4096, but the arm
+        // relies on the header-derived cluster size to walk cluster-by-cluster
+        // through the scattered ext BAT. Every cluster — hole or allocated —
+        // must decode independently.
+        let header = build_pls_header(shared::format_detection::PARALLELS_MAGIC_V2, 8, 16, 128);
+        // ext off_multiplier=tracks: entry e → host = e * 4096 (= sector e).
+        let bat = [0u32, 5, 0, 3, 7, 0, 0, 2, 0, 9, 0, 0, 0, 0, 0, 11];
+        let out = run_pls_chain_read(&header, &bat, 16, 4096, 4096, 0, 65536);
+        let cl = 4096usize;
+        for (i, &entry) in bat.iter().enumerate() {
+            let region = &out[i * cl..(i + 1) * cl];
+            if entry == 0 {
+                assert!(
+                    region.iter().all(|&b| b == 0),
+                    "cluster {i} hole must be zero"
+                );
+            } else {
+                let base = entry as u64 * 4096;
+                let want: std::vec::Vec<u8> =
+                    (0..cl as u64).map(|j| pls_pattern_byte(base + j)).collect();
+                assert_eq!(region, &want[..], "cluster {i} → host {base:#x}");
+            }
+        }
+    }
+
+    #[cfg(feature = "parallels-input")]
+    #[test]
+    fn pls_arm_chunk_starting_at_cluster_boundary() {
+        // A chunk that begins partway into the image at a cluster boundary
+        // (as `compare` produces once virtual_offset advances) and spans a
+        // hole→allocated boundary. tracks=8, ext BAT [0,1,0,3]; read the two
+        // clusters 2 and 3 starting at virtual offset 8192: cluster 2 is a
+        // hole, cluster 3 → entry 3 → host 0x3000.
+        let header = build_pls_header(shared::format_detection::PARALLELS_MAGIC_V2, 8, 4, 32);
+        let out = run_pls_chain_read(&header, &[0, 1, 0, 3], 4, 4096, 4096, 8192, 8192);
+        let cl = 4096usize;
+        assert!(out[..cl].iter().all(|&b| b == 0), "cluster 2 hole");
+        let want: std::vec::Vec<u8> = (0..cl as u64)
+            .map(|j| pls_pattern_byte(3 * 4096 + j))
+            .collect();
+        assert_eq!(out[cl..2 * cl], want[..], "cluster 3 → host 0x3000");
+    }
 }
 
 /// Look up the refcount for a host cluster via two-level table indirection.
@@ -6852,6 +7226,114 @@ pub unsafe fn read_chain_virtual_cluster(
                     None => return false,
                 }
             }
+            #[cfg(feature = "parallels-input")]
+            ImageFormat::Parallels => {
+                let state = match &mut chain_states.parallels_states[dev_idx] {
+                    Some(s) => s,
+                    None => return false,
+                };
+
+                // Unlike the VDI/VHD arms, this chunk is NOT guaranteed to lie
+                // within a single device cluster. `convert`/`dd` clamp each
+                // chunk to the top device's own cluster boundary, but `compare`
+                // uses the LARGER of the two chains' cluster sizes (capped at
+                // MAX_SECTOR_SIZE) and `bench`/`rebase` use their qcow2 cluster
+                // size — so a small (e.g. 4 KiB) parallels cluster can be
+                // spanned by a chunk up to 65536 bytes. Adjacent parallels
+                // clusters are non-contiguous on the host, so we walk the chunk
+                // one parallels cluster at a time and resolve each sub-span
+                // through its own BAT lookup. This also stays correct if
+                // ChainDeviceInfo.cluster_size is 0 (as it is before the info
+                // op is taught to report it), since the boundary comes from the
+                // header-derived `state.cluster_size`, never from the chunk.
+                //
+                // A parallels image can never have a lower device in the chain
+                // (instar builds 1-device chains for parallels), so an
+                // unallocated cluster reads as zeros directly here rather than
+                // `continue`-ing to a lower layer; a fully-unallocated chunk is
+                // byte-identical to what the chain's zero-fill tail would emit.
+                let cluster_size = state.cluster_size;
+                let cap_bytes = cap.saturating_mul(sector_size as u64);
+                let mut done = 0u64;
+                while done < chunk_size {
+                    let cur_virtual = virtual_offset + done;
+                    let offset_in_cluster = cur_virtual % cluster_size;
+                    let to_cluster_end = cluster_size - offset_in_cluster;
+                    let remaining = chunk_size - done;
+                    let span = if remaining < to_cluster_end {
+                        remaining
+                    } else {
+                        to_cluster_end
+                    };
+                    let dst = buf.add(done as usize);
+
+                    match state.block_lookup(call_table, cur_virtual, sector_size, cap, bytes_read)
+                    {
+                        Some(parallels::ParallelsBlockLookup::Unallocated) => {
+                            // BAT value 0 or beyond BAT coverage: zeros.
+                            core::ptr::write_bytes(dst, 0, span as usize);
+                        }
+                        Some(parallels::ParallelsBlockLookup::Allocated { host_byte_offset }) => {
+                            // qemu never validates parallels file length: any
+                            // portion of an allocated read at or past the device
+                            // capacity zero-fills rather than erroring,
+                            // including the straddle case (cluster starts
+                            // in-file, data truncated mid-read). `cap` is in
+                            // sectors.
+                            if host_byte_offset >= cap_bytes {
+                                core::ptr::write_bytes(dst, 0, span as usize);
+                            } else {
+                                let avail = cap_bytes - host_byte_offset;
+                                let read_len = if span < avail { span } else { avail };
+                                // Zero the past-capacity tail first so a
+                                // straddling read leaves only the in-file
+                                // prefix populated.
+                                if read_len < span {
+                                    core::ptr::write_bytes(
+                                        dst.add(read_len as usize),
+                                        0,
+                                        (span - read_len) as usize,
+                                    );
+                                }
+                                // Parallels data offsets are 512-aligned (BAT
+                                // values scale by 512) but not necessarily
+                                // aligned to the guest's virtio sector, so the
+                                // unaligned path is reachable just as for VDI.
+                                let intra_sector = (host_byte_offset % sector_size as u64) as usize;
+                                let ok = if intra_sector == 0 {
+                                    read_cluster_sectors(
+                                        call_table,
+                                        dev_idx as u32,
+                                        host_byte_offset,
+                                        dst,
+                                        read_len,
+                                        sector_size,
+                                        bytes_read,
+                                    )
+                                } else {
+                                    read_offset_sectors(
+                                        call_table,
+                                        dev_idx as u32,
+                                        host_byte_offset,
+                                        dst,
+                                        read_len,
+                                        sector_size,
+                                        compressed_buf,
+                                        bytes_read,
+                                    )
+                                };
+                                if !ok {
+                                    return false;
+                                }
+                            }
+                        }
+                        None => return false,
+                    }
+
+                    done += span;
+                }
+                return true;
+            }
             ImageFormat::VmdkDescriptor => {
                 // A VMDK flat descriptor holds no content of its
                 // own; the flat extent(s) live on data device(s)
@@ -7062,6 +7544,8 @@ pub struct ChainStates {
     pub vhdx_states: [Option<VhdxState>; MAX_CHAIN_DEVICES],
     #[cfg(feature = "vdi-input")]
     pub vdi_states: [Option<vdi::VdiState>; MAX_CHAIN_DEVICES],
+    #[cfg(feature = "parallels-input")]
+    pub parallels_states: [Option<parallels::ParallelsState>; MAX_CHAIN_DEVICES],
 }
 
 /// Initialize format-specific state for all devices in a chain.
@@ -7171,6 +7655,22 @@ pub unsafe fn init_chain_states(
                     bytes_read,
                 );
                 if chain_states.vdi_states[dev_idx].is_none() {
+                    return false;
+                }
+            }
+            #[cfg(feature = "parallels-input")]
+            ImageFormat::Parallels => {
+                // Reuse the same cache slots: L1→BAT, L2→(unused parity buf)
+                chain_states.parallels_states[dev_idx] = parallels::ParallelsState::init(
+                    call_table,
+                    dev_idx as u32,
+                    sector_size,
+                    cap,
+                    l1_cache_addr(dynamic_bufs_start, dev_idx),
+                    l2_cache_addr(dynamic_bufs_start, dev_idx),
+                    bytes_read,
+                );
+                if chain_states.parallels_states[dev_idx].is_none() {
                     return false;
                 }
             }
