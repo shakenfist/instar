@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["vmm", "shared", "core", "crates/qcow2", "crates/raw", "crates/vmdk", "crates/vhd", "crates/vhdx", "crates/vdi", "crates/create", "crates/luks", "crates/measure", "crates/rebase", "crates/resize", "crates/amend", "crates/dd", "crates/bench", "crates/commit", "crates/snapshot", "crates/bitmap", "crates/check", "crates/qcow2-write", "crates/qcow2-write-exec", "operations/info", "operations/copy", "operations/check", "operations/compare", "operations/convert", "operations/create", "operations/measure", "operations/rebase", "operations/resize", "operations/commit", "operations/map", "operations/snapshot", "operations/amend", "operations/bitmap", "operations/bench"]
+members = ["vmm", "shared", "core", "crates/qcow2", "crates/raw", "crates/vmdk", "crates/vhd", "crates/vhdx", "crates/vdi", "crates/parallels", "crates/create", "crates/luks", "crates/measure", "crates/rebase", "crates/resize", "crates/amend", "crates/dd", "crates/bench", "crates/commit", "crates/snapshot", "crates/bitmap", "crates/check", "crates/qcow2-write", "crates/qcow2-write-exec", "operations/info", "operations/copy", "operations/check", "operations/compare", "operations/convert", "operations/create", "operations/measure", "operations/rebase", "operations/resize", "operations/commit", "operations/map", "operations/snapshot", "operations/amend", "operations/bitmap", "operations/bench"]
 exclude = ["fuzz"]
 
 [workspace.lints.clippy]
