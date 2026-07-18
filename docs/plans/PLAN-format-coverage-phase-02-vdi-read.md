@@ -2,7 +2,7 @@
 
 Master plan: [PLAN-format-coverage.md](PLAN-format-coverage.md)
 
-## Status: Planned (2026-07-18), not started
+## Status: Complete (2026-07-18)
 
 ## Prompt
 
@@ -385,20 +385,122 @@ last.
 
 ## Findings: step 2a — vdi crate
 
-(to be filled during execution)
+* The `vdi` crate landed as planned: `VdiHeader::parse` enforces
+  qemu's twelve `vdi_open` rules with the exact limits from the
+  Situation table, `VdiBlockLookup`/`VdiState` mirror
+  `vhd::VhdBlockLookup`/`VhdState`'s signatures, and the block map is
+  walked through the cached-sector pattern (`read_u32_le_cached`, the
+  LE analogue of the qcow2 crate's BE helper). 23 boundary unit tests
+  cover every validation rule (accept and reject cases at exact
+  limits, e.g. `block_size` 1048575/1048576/1048577), sentinel
+  handling, allocation-order (non-identity) mapping, and a mock
+  `CallTable` block-map walk.
+* One edge case surfaced during review and was noted for management
+  rather than changed: a block-map *sector read* that lands past the
+  guest's own capacity fails the lookup outright (`block_lookup`
+  returns `None`, which the chain reader surfaces as a clean op
+  error), whereas qemu's C implementation would zero-fill that read
+  and interpret the resulting zero bytes as bmap entry 0 (an
+  allocated block at the very start of the data region). This is a
+  pathological case — a block map so close to the guest's declared
+  capacity boundary that the guest's own virtio window can't reach
+  it — and instar's stricter behaviour (refuse rather than
+  synthesize a block-map entry from zero bytes) is the safe
+  direction: no image was found in practice that exercises this
+  divergence, and none of the fixture set does either.
 
 ## Findings: step 2c — graduation and gate-lifted ops
 
-(to be filled during execution; must record the observed
-check-on-VDI behaviour and the bench smoke result)
+* `bench` had its own guest-side `read_family` allowlist,
+  independent of the qcow2 crate's `vdi-input` feature. Before the
+  fix, `instar bench` cleanly refused VDI input (exit 1, `bench:
+  unsupported input format`) even with `vdi-input` enabled on
+  `qcow2`, because bench's own format dispatch never reached the
+  chain reader's VDI arm. The root-cause fix added the `Vdi` arm to
+  bench's `read_family` allowlist in lock-step with the host
+  graduation commit, closing the same raw-fallback-hazard class of
+  gap the Design section flagged for bench/rebase generally.
+* Empirical pins for every gate-lifted operation, run against
+  `vdi-simple`:
+  - `check` exits 63 with `This image format (vdi) does not support
+    checks` — no raw read, no hang. Unchanged from before graduation.
+  - `bench` succeeds (exit 0) with header output byte-parity against
+    `qemu-img bench`.
+  - `map` still refuses with `map: source format unrecognised`.
+  - `measure` still refuses with `source image is unsupported
+    format`.
+  - `resize` still refuses with `format Vdi is not supported for
+    in-place resize` (the `{:?}` debug format now prints `Vdi`
+    instead of `Unknown`, since `chain::ImageFormat` gained the
+    variant, but the refusal itself is unchanged).
+* The info round-up fix (`parse_vdi_header` rounding `disk_size` up
+  to 512) was verified byte-unchanged against every existing
+  512-aligned VDI baseline, and the new `vdi-odd-size` fixture
+  (1048577 → 1049088) confirms the rounding end-to-end against a
+  live `qemu-img info` baseline.
 
 ## Findings: step 2d — fixtures and baselines
 
-(to be filled during execution)
+* All nine new fixtures were generated deterministically by
+  `instar-testdata/scripts/generate-vdi-fixtures.py`: created with a
+  static qemu-img binary, then byte-patched so the two creation
+  UUIDs are pinned to fixed values (the only non-deterministic
+  creation bytes) before any per-fixture corruption is applied.
+* `vdi-odd-size` needed a 2 MiB base image rather than the smallest
+  possible 1 MiB base: a 1 MiB base would trip qemu's rule 9
+  (`disk_size > blocks_in_image * block_size`, evaluated against the
+  *rounded* `disk_size`) once the odd-size patch and the round-up
+  rule combine, refusing the fixture at qemu-img's own open instead
+  of exercising the rounding rule cleanly.
+* `generate-baselines.py` auto-commits by default and regenerates
+  every registered output type, not just the restricted manifest
+  passed on the command line. This step's baseline run undid that
+  auto-commit and surgically restored the output types that were not
+  part of this phase's scope; the recommendation to add a
+  `--no-commit` / `--output-type`-limiting flag to the generator was
+  recorded rather than implemented (instar-testdata scripting is
+  outside this phase's file set).
+* The five malformed fixtures needed `OSLO_SKIP_IMAGES` entries in
+  `tests/test_oslo_crossval.py`: oslo.utils' `VDIInspector` validates
+  none of the fields qemu refuses on (bad version, unaligned
+  block-map offset, wrong block size, non-NULL parent UUID, too many
+  blocks), so without the skip entries oslo would report these
+  images as safely-openable while qemu-img (and instar) refuse them.
+* A profile-corruption integrity spot-check (10 images, covering the
+  regeneration-corruption class phase 1 fixed in
+  `detect-profiles.py`) came back clean — the regenerated profiles
+  for the new VDI fixtures and a sample of pre-existing images match
+  `raw/` byte-for-byte.
 
 ## Findings: step 2e — integration tests
 
-(to be filled during execution)
+* Full touched-suite results, run locally at moderate concurrency:
+  `test_dd` 39/39, `test_compare` 56/56, `test_adversarial` 79/79,
+  `test_info_safe` 628/628, `test_oslo_crossval` 221 passed (10
+  pre-existing skips, unrelated to VDI), `test_convert` 218 passed (3
+  pre-existing skips). Zero failures across all six suites, and no
+  KVM-contention flakes observed on replay.
+* `qemu-img dd`'s `count`/`skip` semantics are absolute from offset 0
+  in the source file, not relative to any block-map structure — the
+  windowed dd test crossing an unallocated→allocated boundary of
+  `vdi-data-dynamic` confirmed instar matches this byte-for-byte.
+* The qcow2-with-VDI-backing chain test needed the VDI file copied
+  into the overlay qcow2's own directory before creating the
+  `-b <vdi> -F vdi` chain: instar's backing-file allowlist restricts
+  backing paths to the overlay's directory (or an explicitly
+  allowlisted one), so a VDI backing file living elsewhere in the
+  test tree would be refused by the allowlist check rather than
+  exercising the chain-reader arm under test.
+* `compare` on a malformed-but-detected VDI reports a non-zero-exit
+  content mismatch rather than an open error — proving compare is
+  not silently falling back to a raw read of the malformed
+  container. This is documented as a quirk in `docs/quirks.md` rather
+  than treated as a defect.
+* `info` stays lenient on malformed VDIs by design: its separate,
+  simpler header parser (`parse_vdi_header`) is out of scope for the
+  reader graduation, so it still reports plausible detection-level
+  fields and exits 0 for images the full reader refuses. Also
+  documented as a quirk.
 
 ## Verification (management-session review checklist)
 

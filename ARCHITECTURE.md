@@ -228,6 +228,16 @@ provides a modular architecture with:
   exposes `VhdxState::scan_allocation` plus `count_allocated_in_bat`
   (which handles the chunk_ratio bitmap interleaving) for the measure
   subcommand.
+- **crates/vdi/** - Shared VDI (VirtualBox Disk Image) format crate:
+  header parsing and validation against qemu's twelve `vdi_open`
+  rules (signature/version/geometry checks, odd `disk_size` rounded
+  up to 512 rather than rejected, any `image_type` accepted,
+  `block_extra` parsed but unused), allocation-order block-map
+  reading with sector-cached lookups, and `VdiState` for stateful
+  block I/O (`init`/`block_lookup`, mirroring `vhd::VhdState`).
+  Read-only: no write/output support. Linked into the qcow2 crate's
+  chain reader behind the `vdi-input` feature and used by convert,
+  compare, bench, and rebase (PLAN-format-coverage phase 2).
 - **crates/luks/** - Shared LUKS format crate: LUKS v1/v2 header
   constants, header parsing, PBKDF2 key derivation, Argon2id key
   derivation (behind `kdf-argon2` feature), AFsplitter key recovery,

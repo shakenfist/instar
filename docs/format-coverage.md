@@ -76,6 +76,7 @@ The `instar convert` operation supports writing output in the following formats:
 | vhd (fixed) | Supported | Raw sector reads with footer validation |
 | vhd (dynamic) | Supported | BAT-based block lookup, sector-cached reads |
 | vhdx (dynamic) | Supported | 64-bit BAT with interleaved SB entries, GUID-based metadata, CRC-32C validation |
+| vdi (dynamic and static) | Supported | Header validated against qemu's 12 open-time rules; allocation-order block-map lookup, sector-cached reads; qemu parity for discarded blocks, past-EOF reads (zero-fill), and odd `disk_size` (rounded up to 512) |
 | luks (v1/v2, native) | Supported | Decrypts with `--luks-passphrase`; v1 PBKDF2, v2 Argon2id (`--max-guest-memory`); detects inner format (raw, QCOW2) |
 | luks wrapping qcow2 | Supported | Transparent inner QCOW2 detection and decryption via CallTable function pointer wrapping |
 
@@ -287,7 +288,7 @@ full reference.
 |--------|-------|------------|-------|
 | QED | Banned entirely | Rejects | Detects format |
 | LUKS | Version check (only v1) | Rejects v2+ | Detects format, version, cipher, hash, UUID, payload offset, key slots, inner format (with passphrase); convert decrypts v1/v2 containers |
-| VDI | None | Pass-through | Detects format, UUID |
+| VDI | None | Pass-through | Detects format, UUID; convert/compare/dd read via a full reader — header validated against qemu's 12 open-time rules, block-map entries bounds-checked, past-EOF block reads zero-filled (`check` still refuses, exit 63) |
 | ISO | None | Pass-through | Detects format* |
 | VHD | None | Pass-through | Detects creator app; full check validation (footer/header checksums, version/feature validation, BAT bounds, overlap detection, fragmentation, fixed VHD size check, footer copy consistency) |
 | VHDX | None | Pass-through | Detects block size; full check validation (file identifier, dual header CRC-32C, region table 1+2 cross-check, metadata, BAT bounds/alignment/overlap, fragmentation) |
@@ -358,11 +359,20 @@ full reference.
 | qemu-vhdx | QEMU iotest VHDX | safe | Dynamic disk |
 | vhdx-disk2vhd | Disk2VHD created VHDX | safe | Different creator |
 
-#### VDI Images (1)
+#### VDI Images (10)
 
 | Image ID | Description | Safety | Key Features |
 |----------|-------------|--------|--------------|
-| vdi-simple | Basic VirtualBox VDI | safe | Format detection test |
+| vdi-simple | Basic VirtualBox VDI, 10 MiB dynamic, empty | safe | Format detection + convert-from baseline |
+| vdi-data-dynamic | 8 MiB dynamic VDI, data at 2 MiB and 5 MiB | safe | Allocation-order block map; one entry patched to discarded (0xfffffffe) |
+| vdi-static-data | 3 MiB static (pre-allocated) VDI | safe | Identity block map, data pattern in the middle block |
+| vdi-odd-size | 2 MiB dynamic VDI, disk_size patched to 1048577 | safe | Pins the round-up-to-512 rule (qemu reports 1049088); oslo divergence |
+| vdi-bmap-past-eof | 8 MiB dynamic VDI, one entry ~256 MiB past EOF | safe | Pins the past-EOF zero-fill rule |
+| vdi-bad-version | Version patched to 2.0 | malformed | Refused at open (unsupported version) |
+| vdi-unaligned-bmap | offset_bmap patched to 0x201 | malformed | Refused (block-map offset not 512-aligned) |
+| vdi-wrong-blocksize | block_size patched to 512 | malformed | Refused (block size must be the hard-fixed 1 MiB) |
+| vdi-nonnull-parent | Nonzero byte in uuid_parent | malformed | Refused (VDI has no backing-file support) |
+| vdi-too-many-blocks | blocks_in_image patched to 0xffffffff | malformed | Refused (exceeds qemu's max of 536870784) |
 
 #### QED Images (1)
 
@@ -490,7 +500,7 @@ qcow2-luks).
    - QCOW2 dirty/corrupt bits
    - VMDK path traversal
    - VMDK missing extents
-   - VDI, QED, and ISO format detection
+   - QED and ISO format detection
 
 10. **VMDK Input/Output Support** - Convert supports VMDK as both input and
     output format. Input: monolithicSparse (grain directory/table lookup) and
@@ -551,6 +561,23 @@ qcow2-luks).
     metadata (L1/L2/refcounts) remain in the metadata device. The check
     operation skips bounds/overlap/refcount validation for data clusters
     when the external data bit is set.
+
+18. **VDI Input Support** - Convert, compare, and dd support VDI
+    (VirtualBox Disk Image) as read-only input, both dynamic and
+    static images (`src/crates/vdi/`, PLAN-format-coverage phase 2).
+    The header is validated against qemu's 12 open-time rules; the
+    block map is walked with an allocation-order lookup through the
+    standard sector-cached pattern. qemu parity is exact: discarded
+    (0xfffffffe) and unallocated (0xffffffff) entries read as zeros,
+    `block_extra` never participates in offset math, any `image_type`
+    is accepted (only type 2 is special, and needs no special-casing
+    since its identity block map is just data), and reads at or past
+    the device capacity — including straddling reads — zero-fill
+    rather than error, because qemu never validates VDI file length.
+    An odd `disk_size` is rounded up to 512 at open, matching qemu
+    (`instar info` reports the rounded value). `check` still refuses
+    VDI (exit 63); `map`, `measure`, and `resize` are unchanged
+    refusals.
 
 ### Detections to Add
 

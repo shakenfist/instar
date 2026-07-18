@@ -2596,14 +2596,16 @@ qemu-img's raw-fallback behaviour; now refuses instead)
 `instar convert`, `compare`, and `dd` discover their input's format via
 a guest-side `info` probe, then map the reported format string to a
 `chain::ImageFormat`. Any format instar detects but has no read path
-for (`qed`, `vdi`, and — after this phase — `parallels`, `bochs`,
-`cloop`, `dmg`) collapsed to `ImageFormat::Unknown`, and the chain
-reader's default arm read `Unknown` images as **raw bytes** — emitting
-the container's bytes zero-padded to the header-declared virtual size,
-with no error and no indication anything was wrong. This was tracked
-as [#444](https://github.com/shakenfist/instar/issues/444), confirmed
-by phase 1 step 1a's empirical pin (see the phase plan's Findings
-section), and fixed by step 3b.
+for (`qed`, `vdi` at the time, and — after this phase — `parallels`,
+`bochs`, `cloop`, `dmg`) collapsed to `ImageFormat::Unknown`, and the
+chain reader's default arm read `Unknown` images as **raw bytes** —
+emitting the container's bytes zero-padded to the header-declared
+virtual size, with no error and no indication anything was wrong. This
+was tracked as [#444](https://github.com/shakenfist/instar/issues/444),
+confirmed by phase 1 step 1a's empirical pin (see the phase plan's
+Findings section), and fixed by step 3b. `vdi` gained a full read path
+in phase 2 and is no longer part of this refused set — see
+"Format-coverage phase 2" below.
 
 #### instar Behavior (after the fix)
 
@@ -2618,22 +2620,28 @@ convert: input format 'bochs' is detected but not supported for
 reading (detection and info only)
 ```
 
-This closes the hole for `qed` and `vdi` (previously silently read as
-raw, contradicting their documented "detected, refused" stance) as
-well as the four newly detected formats. There is no flag to disable
+This closed the hole for `qed` (previously silently read as raw,
+contradicting its documented "detected, refused" stance) as well as
+the four newly detected formats. `vdi` was in the same set at the
+time this phase landed; phase 2 graduated it to a full read path
+instead, so it no longer appears among the refused formats at all
+(see "Format-coverage phase 2" below). There is no flag to disable
 this refusal — unlike `instar info`, convert/compare/dd have no
 `--unsafe-quirks` path at all, so the refusal is unconditional.
 
 #### The ISO exemption and the info-vs-consumer asymmetry
 
 **iso is deliberately exempt** and keeps its raw pass-through
-everywhere: unlike qed/vdi/parallels/bochs/cloop/dmg — where a raw
+everywhere: unlike qed/parallels/bochs/cloop/dmg — where a raw
 interpretation misrepresents the content (container metadata plus zero
 padding, not the virtual disk) — an ISO's container bytes *are* its
 virtual disk content, so reading it as raw is semantically correct.
 qemu-img (which has no ISO driver at all) converts ISOs as raw
 routinely; refusing them would be a parity regression on a common
-workflow, not a safety fix.
+workflow, not a safety fix. `vdi` was in the same "raw would
+misrepresent it" group as the others until phase 2, which gave it a
+full reader instead of a refusal — see "Format-coverage phase 2"
+below.
 
 This produces an asymmetry worth noting explicitly: standalone `instar
 info` on an ISO reports `iso` by default (secure mode) and `raw` only
@@ -2683,6 +2691,163 @@ trailer probe into the host in-place-op prefix probes and the guest
 map/measure detection paths is recorded as master-plan future work
 (`docs/plans/PLAN-format-coverage.md`, "Future work") and is naturally
 revisited when phase 5 gives DMG a first-class read path.
+
+## Format-coverage phase 2: VDI convert-from (read path)
+
+Phase 2 of `PLAN-format-coverage.md` graduated VDI (VirtualBox Disk
+Image) from detect + info only to a full read format for convert,
+compare, and dd, via a new `src/crates/vdi/` parser crate wired into
+the qcow2 crate's chain reader (the same pattern VHD and VHDX use).
+The five entries below record the deliberate qemu-parity choices this
+introduced and the divergences that remain. See
+[docs/plans/PLAN-format-coverage-phase-02-vdi-read.md](plans/PLAN-format-coverage-phase-02-vdi-read.md)
+for the full design and findings.
+
+### Odd `disk_size` Rounds Up to 512 (qemu Parity, oslo Divergence)
+
+**Classification: Safe Quirk**
+
+#### Observed Behavior
+
+qemu's `vdi_open` does not reject a `disk_size` that is not a multiple
+of 512 (VBoxManage-created images can have one); it rounds the value
+up to the next 512-byte boundary in memory and reports the rounded
+size everywhere, including `qemu-img info`'s `virtual size` field.
+
+#### Why This Matters
+
+instar's reader and its `info` parser (`parse_vdi_header`) must agree
+with qemu's rounded value, not the header's raw bytes, to stay
+byte-identical against the qemu-img baselines. oslo.utils'
+`VDIInspector` does not round — it reports the raw `disk_size` — so
+this is also a genuine oslo divergence, not just an internal
+consistency question.
+
+#### instar Behavior
+
+**Always** (no flag toggles this): instar rounds `disk_size` up to 512
+at open, both for the reader's virtual-size view and for `info`'s
+reported size, matching qemu exactly. Pinned by the `vdi-odd-size`
+fixture (`disk_size` patched to 1048577, rounds to 1049088) with a
+byte-parity convert test and a `KNOWN_VSIZE_DIVERGENCES` entry in
+`tests/test_oslo_crossval.py` recording the oslo/qemu split.
+
+### Past-EOF Block Reads Zero-Fill, Never Error
+
+**Classification: Safe Quirk**
+
+#### Observed Behavior
+
+qemu's VDI driver never validates the on-disk file length against the
+header's declared geometry. A block-map entry pointing past the end
+of the file opens fine, `qemu-img map` reports it as ordinary data,
+and `qemu-img convert` exits 0 with that block read as all-zero — a
+straddling block (starts in-file, extends past EOF) zero-fills only
+the missing tail.
+
+#### Why This Matters
+
+A reader that instead errored on a past-EOF block would refuse images
+qemu-img converts successfully — a parity regression, not a safety
+improvement, since the sandboxed read of a header-consistent VDI
+carries no additional risk from an undersized backing file.
+
+#### instar Behavior
+
+**Always**: the chain reader's VDI arm zero-fills any portion of an
+allocated read at or past the device capacity, including the straddle
+case, mirroring qemu exactly. Pinned by the `vdi-bmap-past-eof`
+fixture (one block-map entry ~256 MiB past EOF) with a byte-parity
+convert test against `qemu-img convert`.
+
+### `image_type` Leniency and `block_extra` Is Ignored
+
+**Classification: Safe Quirk**
+
+#### Observed Behavior
+
+qemu does not validate the VDI header's `image_type` field at all:
+values 0, 3, and 4 all open and behave identically to the documented
+"dynamic" type (1); only type 2 ("static") gets different handling,
+and even that difference is just that a static image's block map
+happens to be the identity map written at creation time — the read
+path is the same block-map walk either way. Similarly, `block_extra`
+is parsed by qemu but never used in any offset computation.
+
+#### Why This Matters
+
+Rejecting an unrecognised `image_type` would refuse images qemu-img
+opens without complaint. Since a static image's identity block map is
+just ordinary block-map data, no special-casing is needed or correct.
+
+#### instar Behavior
+
+**Always**: `VdiHeader::parse` accepts any `image_type` value and the
+reader never special-cases type 2 — the block-map walk is identical
+for dynamic and static images. `block_extra` is parsed but never
+included in offset arithmetic. Pinned by unit tests in
+`src/crates/vdi/src/lib.rs` and the `vdi-static-data` fixture's
+byte-parity convert test.
+
+### `check` Still Refuses VDI; `qemu-img check` Does Not (Future Work)
+
+**Classification: Safe Quirk** (documented gap, not a defect)
+
+#### Observed Behavior
+
+qemu-img's VDI driver supports `qemu-img check`, which validates the
+block map (duplicate/overlapping entries, out-of-range values). instar
+`check` links format crates directly rather than through the chain
+reader that gained VDI support in this phase, and has no VDI arm.
+
+#### instar Behavior
+
+**Unchanged by this phase**: `instar check vdi-simple` exits 63 with
+`This image format (vdi) does not support checks`, exactly as before
+VDI's convert/compare/dd graduation — check was never in this phase's
+scope (see the phase plan's "Out of scope" section). instar-testdata
+already carries unconsumed VDI check baselines from `generate-baselines.py`
+(qemu-img generates them because its own driver supports the
+operation); wiring instar's `check` up to consume them is recorded as
+master-plan future work.
+
+### Malformed VDI: `compare` Reports a Mismatch, `info` Stays Lenient
+
+**Classification: Safe Quirk**
+
+#### Observed Behavior
+
+The five malformed VDI adversarial fixtures (bad version, unaligned
+block-map offset, wrong block size, non-NULL parent UUID, too many
+blocks) each violate one of qemu's twelve `vdi_open` validation rules;
+qemu-img refuses all five at open. instar's new reader refuses them
+identically — but *how* each op surfaces that refusal differs, because
+`info` uses a separate, more lenient parser than the reader.
+
+#### Why This Matters
+
+`convert` and `dd` surface the reader's init failure as a normal
+operation error on stderr. `compare`, however, treats a source it
+cannot open as a content mismatch rather than a hard error: comparing
+a malformed VDI against any other file reports a non-zero-exit
+mismatch on stdout, not "Images are identical" — proving compare is
+not silently falling back to a raw read of the malformed container.
+`info`'s header parser (`parse_vdi_header`) is intentionally out of
+scope for the reader graduation — it still reports whatever
+detection-level fields (format name, a plausible virtual size) the
+raw header bytes yield, and exits 0, even for images the reader itself
+refuses. This mirrors the same info-stays-lenient stance phase 1
+established for malformed DMGs (see above).
+
+#### instar Behavior
+
+**Always**: `convert`/`dd` exit non-zero with a clean error;
+`compare` exits non-zero reporting a mismatch; `info` exits 0 with
+best-effort header fields. Pinned by `TestAdversarialVdiManifest` in
+`tests/test_adversarial.py`, which asserts exit codes and non-empty
+output for all four ops across the five malformed fixtures without
+pinning instar's exact error string (only qemu-img's error strings are
+version-stable enough to pin).
 
 ## Future Additions
 

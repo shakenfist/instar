@@ -22,6 +22,7 @@ Initial target formats:
 - **vpc** (VHD) - Virtual Hard Disk (Hyper-V, Virtual PC)
 - **vhdx** - VHDX Virtual Hard Disk v2 (Hyper-V)
 - **luks** - LUKS encrypted containers (v1/v2, info + convert with decryption)
+- **vdi** - VirtualBox Disk Image (read-only input: convert/compare/dd source; no create/write)
 
 ## Project Status
 

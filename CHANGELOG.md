@@ -45,6 +45,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Format-coverage phase 2: VDI convert-from read path
+  (PLAN-format-coverage phase 2).** `instar convert`, `compare`, and
+  `dd` now accept VDI (VirtualBox Disk Image) as input — both dynamic
+  and static images — via a new `src/crates/vdi/` no_std parser crate
+  wired into the qcow2 crate's chain reader (`vdi-input` feature,
+  enabled by convert/compare/bench/rebase to avoid the raw-fallback
+  hazard #444 closed). The reader matches qemu's `vdi_open` exactly:
+  all twelve open-time validation rules, allocation-order block-map
+  lookup, discarded/unallocated entries reading as zeros,
+  `block_extra` never participating in offset math, any `image_type`
+  accepted (only type 2 is special, and needs no extra handling), and
+  reads at or past the device capacity — including straddling reads —
+  zero-filling rather than erroring, since qemu never validates VDI
+  file length. An odd `disk_size` rounds up to 512 at open, matching
+  qemu; `instar info`'s existing VDI parser now reports the rounded
+  value too (previously reported the raw bytes), with a
+  `KNOWN_VSIZE_DIVERGENCES` entry recording the resulting oslo.utils
+  split (oslo reports the raw value). `vdi` leaves the phase-1 #444
+  refusal set entirely — it now has a real reader instead of a typed
+  refusal. `check` is unaffected and still refuses VDI (exit 63, "This
+  image format (vdi) does not support checks"); `map`, `measure`, and
+  `resize` are unchanged refusals. Nine new fixtures (four safe: data
+  at multiple blocks with a discarded entry, static/identity block
+  map, odd-size round-up, past-EOF zero-fill; five malformed:
+  bad version, unaligned block-map offset, wrong block size, non-NULL
+  parent UUID, too many blocks) plus the existing `vdi-simple` flipped
+  to CI, all with cross-version qemu-img baselines, coverage-guided
+  fuzzing of the header parser and block-map walk (`fuzz_vdi_header`,
+  `fuzz_vdi_bat`), and `vdi` added to the differential fuzzer's format
+  pool. See [docs/format-coverage.md](docs/format-coverage.md) and
+  [docs/quirks.md](docs/quirks.md) for the full divergence records.
+
 - **Format-coverage phase 1: Parallels, Bochs, cloop, and DMG
   detection + info parity (PLAN-format-coverage phase 1).** `instar
   info` now detects and correctly sizes four previously-unrecognised
