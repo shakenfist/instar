@@ -850,3 +850,127 @@ class TestAdversarialVdiManifest(InstarTestBase):
 
     def test_vdi_too_many_blocks_refused(self):
         self._assert_vdi_refused('vdi-too-many-blocks')
+
+
+class TestAdversarialParallelsManifest(InstarTestBase):
+    """Verify malformed Parallels fixtures are refused cleanly (fmt-cov 3).
+
+    Four fixtures each violate one of qemu's Parallels open-time
+    validation rules that the new ``parallels`` crate enforces:
+    ``tracks == 0`` (parallels-zero-tracks, "Zero sectors per track"),
+    ``tracks`` over the cluster limit (parallels-huge-tracks, "Too big
+    cluster"), ``bat_entries`` over the catalog limit
+    (parallels-huge-catalog, "Catalog too large"), and a non-zero
+    ``ext_off`` pointing at a bad-magic format extension
+    (parallels-ext-bad-magic).  qemu refuses all four at open; instar's
+    Parallels reader must likewise refuse -- convert, compare, and dd
+    all exit non-zero with a non-empty message and without hanging or
+    crashing.  instar's own message need not match qemu's string; only
+    the clean non-zero termination is pinned.
+
+    convert and dd surface the reader init failure as an operation error
+    on stderr; compare surfaces it as a content mismatch on stdout and
+    exits non-zero -- a self-compare of a malformed fixture reports a
+    mismatch, not ``identical``, which proves compare is not silently
+    reading it as raw.  Both are clean non-zero exits, so the assertion
+    checks the combined stdout+stderr for a non-empty message rather
+    than pinning the stream.
+
+    ``info`` is deliberately NOT asserted non-zero.  The detection layer
+    (``parse_parallels_header``) only checks the magic and version, both
+    of which are intact in every malformed fixture (they mutate tracks /
+    bat_entries / ext_off, not the magic), so all four still detect as
+    ``parallels``: info reports ``file format: parallels`` with the
+    lenient nb_sectors-derived virtual size and exits 0.  The read-path
+    validation that refuses them lives in the reader, not the detector.
+    The adversarial contract for info is only no-hang / no-crash /
+    non-empty output, matching the DMG and VDI manifest patterns above.
+
+    The past-EOF zero-fill and inuse-readable rules for the *safe*
+    fixtures are pinned by successful byte-parity convert tests in
+    tests/test_convert.py::TestConvertParallelsToRaw, not here.
+    """
+
+    MALFORMED_IDS = [
+        'parallels-zero-tracks',
+        'parallels-huge-tracks',
+        'parallels-huge-catalog',
+        'parallels-ext-bad-magic',
+    ]
+
+    def _assert_parallels_refused(self, image_id):
+        """convert/compare/dd refuse cleanly; info is clean but may exit 0."""
+        image = self.get_adversarial_image(image_id)
+        instar = str(self.get_instar_binary())
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as other:
+            # A tiny raw file to compare against.
+            Path(other.name).write_bytes(bytes(512))
+
+            # convert: must refuse, non-zero, non-empty message, no hang.
+            _c_out, c_err, c_rc = self.run_adversarial(
+                [instar, 'convert', '-O', 'raw', str(image.path), out.name],
+                timeout=15,
+            )
+            self.assertNotEqual(
+                c_rc, 0,
+                f'convert should refuse malformed {image_id}',
+            )
+            self.assertTrue(
+                c_err.strip(),
+                f'convert should emit a non-empty error for {image_id}',
+            )
+
+            # compare against the raw file: must refuse, non-zero, no hang.
+            # compare reports the read failure as a mismatch on stdout, so
+            # the combined output (not just stderr) is checked non-empty.
+            m_out, m_err, m_rc = self.run_adversarial(
+                [instar, 'compare', str(image.path), other.name],
+                timeout=15,
+            )
+            self.assertNotEqual(
+                m_rc, 0,
+                f'compare should refuse malformed {image_id}',
+            )
+            self.assertTrue(
+                (m_out + m_err).strip(),
+                f'compare should emit a non-empty message for {image_id}',
+            )
+
+            # dd: must refuse, non-zero, non-empty message, no hang.
+            _d_out, d_err, d_rc = self.run_adversarial(
+                [instar, 'dd', '-O', 'raw',
+                 f'if={image.path}', f'of={out.name}'],
+                timeout=15,
+            )
+            self.assertNotEqual(
+                d_rc, 0,
+                f'dd should refuse malformed {image_id}',
+            )
+            self.assertTrue(
+                d_err.strip(),
+                f'dd should emit a non-empty error for {image_id}',
+            )
+
+            # info: no hang / no crash; lenient parser, exit code unpinned.
+            i_out, i_err, _i_rc = self.run_adversarial(
+                [instar, 'info', str(image.path)],
+                timeout=15,
+            )
+            self.assertTrue(
+                (i_out + i_err).strip(),
+                f'info should emit non-empty output for {image_id}',
+            )
+
+    def test_parallels_zero_tracks_refused(self):
+        self._assert_parallels_refused('parallels-zero-tracks')
+
+    def test_parallels_huge_tracks_refused(self):
+        self._assert_parallels_refused('parallels-huge-tracks')
+
+    def test_parallels_huge_catalog_refused(self):
+        self._assert_parallels_refused('parallels-huge-catalog')
+
+    def test_parallels_ext_bad_magic_refused(self):
+        self._assert_parallels_refused('parallels-ext-bad-magic')

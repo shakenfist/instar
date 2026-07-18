@@ -1379,3 +1379,54 @@ class TestCompareParallels(InstarTestBase):
                 f'stdout={stdout!r} stderr={stderr!r}'
             )
             self.assertIn('identical', (stdout + stderr).lower())
+
+    def test_compare_parallels_v1_vs_v2_identical(self):
+        """compare parallels-data-v1 vs parallels-data-v2: identical, exit 0.
+
+        These are two DIFFERENT files (different magic, different BAT
+        encoding: v1 sector-valued 'WithoutFreeSpace' vs v2
+        cluster-valued 'WithouFreSpacExt', and the v2 twin has a swapped
+        BAT) that decode to the same virtual content.  compare reading
+        both through the Parallels path must report identical and exit 0
+        -- a cross-magic equivalence pin.
+        """
+        img_a = self.get_image('parallels-data-v1')
+        img_b = self.get_image('parallels-data-v2')
+        for img in (img_a, img_b):
+            if not img.path.exists():
+                self.skipTest(f'Image not found: {img.path}')
+            self.skip_if_hash_mismatch(img)
+
+        stdout, stderr, rc = self.run_instar_compare(
+            img_a.path, img_b.path, timeout=120
+        )
+        self.assertEqual(
+            rc, 0,
+            f'compare parallels-data-v1 vs parallels-data-v2 should be '
+            f'identical; stdout={stdout!r} stderr={stderr!r}'
+        )
+        self.assertIn('identical', (stdout + stderr).lower())
+
+    def test_compare_parallels_differs(self):
+        """compare two differing Parallels images reports a mismatch (exit 1).
+
+        parallels-data-v2 (2 MiB, 64 KiB clusters) and parallels-cluster-4k
+        (256 KiB, 4 KiB clusters) differ in both size and content, so
+        compare must exit 1 like qemu-img compare.
+        """
+        img_a = self.get_image('parallels-data-v2')
+        img_b = self.get_image('parallels-cluster-4k')
+        for img in (img_a, img_b):
+            if not img.path.exists():
+                self.skipTest(f'Image not found: {img.path}')
+            self.skip_if_hash_mismatch(img)
+
+        stdout, stderr, rc = self.run_instar_compare(
+            img_a.path, img_b.path, timeout=120
+        )
+        self.assertEqual(
+            rc, 1,
+            f'compare of differing Parallels images should exit 1; '
+            f'rc={rc} stdout={stdout!r} stderr={stderr!r}'
+        )
+        self.assertIn('mismatch', (stdout + stderr).lower())

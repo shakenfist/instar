@@ -1329,6 +1329,69 @@ class TestDdInputFormats(InstarTestBase):
                 f'(instar={len(instar_bytes)} B, qemu={len(qemu_bytes)} B)',
             )
 
+    def test_input_parallels_windowed(self):
+        """Windowed dd on a Parallels image crosses a hole->data boundary.
+
+        parallels-data-v2 (2 MiB, 64 KiB clusters) fills guest clusters
+        1/3/5/7 (0x11/0x33/0x55/0x77) and leaves the rest holes.  At
+        bs=65536 one block == one cluster, so cluster 2 is a hole and
+        cluster 3 carries 0x33.  qemu-img dd's ``count`` is an absolute
+        end position in blocks (bytes copied = (count - skip) * bs), so
+        skip=2 count=4 reads blocks [2, 4): one hole block then one data
+        block, pinning the unallocated->allocated transition against
+        qemu-img dd byte-for-byte.
+        """
+        image = self.get_image('parallels-data-v2')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        window = ['bs=65536', 'skip=2', 'count=4']
+        with (
+            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
+            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+        ):
+            stdout, stderr, rc = self.run_instar_dd(
+                [f'if={image.path}', f'of={instar_out.name}'] + window,
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                rc, 0,
+                f'[parallels-window] instar dd -O raw failed: '
+                f'stderr={stderr!r}',
+            )
+
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_dd(
+                [f'if={image.path}', f'of={qemu_out.name}'] + window,
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'[parallels-window] qemu-img dd -O raw failed: '
+                f'stderr={q_stderr!r}',
+            )
+
+            instar_bytes = _bytes_of(instar_out.name)
+            qemu_bytes = _bytes_of(qemu_out.name)
+            self.assertEqual(
+                instar_bytes,
+                qemu_bytes,
+                f'[parallels-window] instar dd output differs from qemu-img '
+                f'dd (instar={len(instar_bytes)} B, qemu={len(qemu_bytes)} B)',
+            )
+            # Sanity: the window really straddles the boundary -- the first
+            # block is a hole (zeros) and the second carries data.
+            self.assertFalse(
+                any(instar_bytes[:65536]),
+                '[parallels-window] first block should be a hole (zeros)',
+            )
+            self.assertTrue(
+                any(instar_bytes[65536:]),
+                '[parallels-window] second block should carry data',
+            )
+
     def test_input_vdi_windowed(self):
         """Windowed dd on a data-bearing VDI crosses a hole->data boundary.
 

@@ -3665,6 +3665,224 @@ class TestConvertParallelsToRaw(InstarTestBase):
         """Convert the v2 'WithouFreSpacExt' fixture to raw (off_multiplier=tracks)."""
         self._assert_convert_parity('parallels-v2')
 
+    # ------------------------------------------------------------------
+    # Step 3e: full safe-fixture convert matrix (five new ids; v1/v2 are
+    # pinned by the 3c smokes above).  Each fixture pins a verified
+    # Parallels read semantic and must be byte-identical to qemu-img
+    # convert (using the suite's own qemu-img, so the qemu 8.1.x
+    # past-EOF-open regression window is not in play):
+    #   parallels-data-v2   non-contiguous / swapped BAT decode
+    #   parallels-data-v1   sector-valued BAT + legacy magic (mask)
+    #   parallels-inuse     opened-dirty header, readable RO
+    #   parallels-bat-past-eof  past-EOF cluster zero-fill
+    #   parallels-cluster-4k    4 KiB clusters, chunk-boundary pin
+    # ------------------------------------------------------------------
+
+    def test_convert_parallels_data_v2(self):
+        """Convert the non-contiguous (swapped-BAT) v2 fixture to raw.
+
+        parallels-data-v2 has two BAT entries (and their physical data
+        clusters) swapped, so a correct read must decode each entry
+        individually rather than assuming a monotonic layout.
+        """
+        self._assert_convert_parity('parallels-data-v2')
+
+    def test_convert_parallels_data_v1(self):
+        """Convert the v1-magic, sector-valued-BAT fixture to raw.
+
+        parallels-data-v1 is the pre-swap base rewritten to the
+        'WithoutFreeSpace' magic with every BAT entry multiplied by
+        tracks, pinning off_multiplier == 1 and the v1 32-bit
+        nb_sectors mask.
+        """
+        self._assert_convert_parity('parallels-data-v1')
+
+    def test_convert_parallels_inuse(self):
+        """Convert the opened-dirty fixture; output equals its clean twin.
+
+        parallels-inuse is parallels-data-v2 with the inuse field set to
+        0x746f6e59.  instar always opens read-only, so the dirty flag
+        must never cause a refusal and the raw output must be identical
+        to the clean twin (parallels-data-v2), which the parity check
+        against qemu-img confirms.
+        """
+        self._assert_convert_parity('parallels-inuse')
+
+    def test_convert_parallels_bat_past_eof(self):
+        """Convert a fixture whose BAT points a cluster far past EOF.
+
+        qemu (10.x, the suite's qemu-img) zero-fills the out-of-image
+        cluster and exits 0; instar must replicate byte-for-byte.  (qemu
+        8.1.x refuses this at open, a regression window that the suite's
+        newer qemu-img avoids.)
+        """
+        self._assert_convert_parity('parallels-bat-past-eof')
+
+    def test_convert_parallels_cluster_4k(self):
+        """Convert a 4 KiB-cluster (tracks=8) fixture to raw.
+
+        parallels-cluster-4k pins small-cluster chunk-boundary handling
+        end-to-end: scattered 4 KiB clusters must decode without any
+        chunk crossing a Parallels cluster boundary.
+        """
+        self._assert_convert_parity('parallels-cluster-4k')
+
+    # ------------------------------------------------------------------
+    # Step 3e: Parallels read validated through non-raw output formats.
+    #
+    # Convert parallels-data-v2 with instar to qcow2 / vpc, flatten the
+    # instar output back to raw with qemu-img, and compare against the
+    # canonical qemu-img raw conversion.  This isolates the Parallels
+    # read path from output-format geometry quirks: qemu's vpc writer
+    # rounds the virtual size up to CHS geometry, so the flattened raws
+    # are compared on their common prefix with any tail required to be
+    # zero padding.
+    # ------------------------------------------------------------------
+
+    def _test_parallels_output_format(self, fmt):
+        """Convert parallels-data-v2 to ``fmt`` and validate the read path."""
+        image = self.get_image('parallels-data-v2')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as ref_raw, \
+                tempfile.NamedTemporaryFile(suffix=f'.{fmt}') as instar_out, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as flat_raw:
+            # Canonical raw view of the Parallels image, via qemu-img.
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_convert(
+                image.path, Path(ref_raw.name), timeout=120
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert to raw failed for parallels-data-v2: '
+                f'{q_stderr}'
+            )
+
+            # instar: Parallels -> fmt.
+            stdout, stderr, rc = self.run_instar_convert(
+                image.path, Path(instar_out.name),
+                output_format=fmt, timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'instar convert parallels-data-v2 -> {fmt} failed: {stderr}'
+            )
+
+            # Flatten instar's structured output back to raw with qemu-img.
+            result = subprocess.run(
+                ['qemu-img', 'convert', '-O', 'raw',
+                 instar_out.name, flat_raw.name],
+                capture_output=True, text=True, timeout=120
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img flatten of instar {fmt} output failed: '
+                f'{result.stderr}'
+            )
+
+            ref_bytes = Path(ref_raw.name).read_bytes()
+            flat_bytes = Path(flat_raw.name).read_bytes()
+            n = min(len(ref_bytes), len(flat_bytes))
+            self.assertEqual(
+                ref_bytes[:n], flat_bytes[:n],
+                f'instar {fmt} output (flattened) differs from qemu raw '
+                f'for parallels-data-v2 in the common prefix'
+            )
+            self.assertFalse(
+                any(ref_bytes[n:]) or any(flat_bytes[n:]),
+                f'non-zero tail beyond common prefix for {fmt} '
+                f'(ref={len(ref_bytes)} flat={len(flat_bytes)})'
+            )
+
+    def test_convert_parallels_to_qcow2(self):
+        """Convert parallels-data-v2 to qcow2 and validate the read path."""
+        self._test_parallels_output_format('qcow2')
+
+    def test_convert_parallels_to_vpc(self):
+        """Convert parallels-data-v2 to vpc and validate the read path."""
+        self._test_parallels_output_format('vpc')
+
+    def test_convert_parallels_backing_chain(self):
+        """Convert a qcow2 overlay backed by a Parallels image; match qemu-img.
+
+        Builds ``overlay.qcow2`` with ``qemu-img create -b <parallels>
+        -F parallels`` in the test tmpdir (the Parallels file is copied
+        in first because instar only reads backing files inside the
+        overlay's directory), writes a 64 KiB overlay pattern over guest
+        cluster 2 -- a hole in the backing image (data lives in clusters
+        1/3/5/7) -- then asserts instar and qemu-img produce identical
+        raw output for the composed chain.  Pins mid-chain Parallels
+        reads.  Skipped if the tested qemu refuses ``-F parallels``.
+        """
+        image = self.get_image('parallels-data-v2')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        if not shutil.which('qemu-io'):
+            self.skipTest('qemu-io not available')
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            backing = os.path.join(tmpdir, 'backing.parallels')
+            overlay = os.path.join(tmpdir, 'overlay.qcow2')
+            shutil.copyfile(str(image.path), backing)
+
+            # Verify the tested qemu accepts -F parallels before relying on it.
+            create = subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-b', 'backing.parallels', '-F', 'parallels', 'overlay.qcow2'],
+                capture_output=True, text=True, timeout=60, cwd=tmpdir
+            )
+            if create.returncode != 0:
+                self.skipTest(
+                    f'qemu-img does not accept -F parallels backing format: '
+                    f'{create.stderr}'
+                )
+
+            # Write a 64 KiB overlay pattern at guest 128 KiB (cluster 2),
+            # a hole in the backing image, so the composed view mixes
+            # overlay and backing data.
+            io = subprocess.run(
+                ['qemu-io', '-c', 'write -P 0xAB 131072 65536', overlay],
+                capture_output=True, text=True, timeout=60
+            )
+            self.assertEqual(
+                io.returncode, 0,
+                f'qemu-io overlay write failed: {io.stderr}'
+            )
+
+            instar_raw = os.path.join(tmpdir, 'instar.raw')
+            qemu_raw = os.path.join(tmpdir, 'qemu.raw')
+
+            stdout, stderr, rc = self.run_instar_convert(
+                Path(overlay), Path(instar_raw), timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'instar convert of qcow2-over-parallels chain failed: '
+                f'{stderr}'
+            )
+
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_convert(
+                Path(overlay), Path(qemu_raw), timeout=120
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert of qcow2-over-parallels chain failed: '
+                f'{q_stderr}'
+            )
+
+            self.assertEqual(
+                Path(instar_raw).read_bytes(),
+                Path(qemu_raw).read_bytes(),
+                'instar convert of qcow2-over-parallels chain differs from '
+                'qemu-img'
+            )
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 class TestConvertVdiToRaw(InstarTestBase):
     """Smoke test for VDI to raw conversion (format-coverage phase 2).
