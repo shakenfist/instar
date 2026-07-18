@@ -45,6 +45,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Format-coverage phase 4: QCOW1 convert-from read path
+  (PLAN-format-coverage phase 4).** `instar convert`, `compare`,
+  `dd`, and `bench` now accept QCOW1 ("qcow", qemu's original
+  deprecated format) as input, including backing chains and
+  compressed clusters, via a new `src/crates/qcow1/` no_std parser
+  crate wired into the qcow2 crate's chain reader (`qcow1-input`
+  feature, enabled by convert/compare/bench/rebase). This phase also
+  **fixed two pre-existing defects**: (1) real QCOW1 images were
+  misdetected as QCOW2 — `detect_format_from_header` checked only
+  the shared `QFI\xfb` magic and never the version field, producing
+  garbage `info` output (virtual size 0, a QCOW2-shaped `compat:
+  0.10` block) and a misleading convert error; detection is now
+  version-aware (`QFI\xfb` + version 1 => QCOW1, else the QCOW2
+  route), with the reader arm landing strictly before the detection
+  fix to avoid a latent silent-raw-read hazard; (2)
+  `INFO_RESULT_FLAG_ENCRYPTED` was declared but never consumed by
+  either info emitter — both now print `encrypted: yes` /
+  `"encrypted": true`, gated off for the `"luks"` format string so
+  the hand-maintained LUKS goldens stay byte-identical (encrypted
+  QCOW2 images pick up the line for free as a side effect, with no
+  baseline churn). The reader matches qemu's exact RO open path:
+  `cluster_bits`/`l2_bits` range checks, size bounds including the
+  empirically-pinned "Image too large" boundary, `crypt_method` <= 1
+  at parse; a per-cluster walk (clusters down to 512 bytes);
+  backing-chain fall-through on unallocated clusters — QCOW1 is the
+  first non-QCOW2 format with backing support, and the reader arm
+  mirrors the QCOW2 arm's own recursion mechanism rather than the
+  VDI/Parallels arms' zero-fill; raw-DEFLATE compressed clusters (no
+  zlib wrapper, unlike QCOW2's zlib-first two-try helper); past-EOF
+  and truncated data-cluster reads zero-fill on every qemu version
+  (no Parallels-style 8.1.x window); and odd header sizes truncate
+  **down** to `total_sectors*512`, the opposite of VDI's round-up.
+  instar now emits the format string `"qcow"` (matching qemu-img and
+  oslo.utils), with `"qcow1"` kept as an accepted input alias.
+  Malformed QCOW1 fixtures get a distinct `info` posture from
+  VDI/Parallels: the new info arm validates the same fields the
+  reader does and falls back to an empty (virtual size 0) default on
+  failure, rather than best-effort nonzero fields. `check` still
+  refuses QCOW1 (exit 63) — genuine parity, since qemu's own qcow
+  driver has no check support either (wording differs only
+  cosmetically). `map` and `measure` stay refusals — a deliberate,
+  recorded divergence, since qemu-img actually supports both on
+  qcow1 (master-plan future work; AES decryption of encrypted qcow1
+  is future work too). Encrypted (AES, crypt_method=1) QCOW1 images:
+  `info` works and reports the new encrypted line; data ops refuse
+  cleanly, matching keyless qemu. Twelve new fixtures (seven safe:
+  scattered-allocation data, a compressed twin, a backing overlay +
+  base pair doubling as small-cluster coverage, an encrypted image,
+  a past-EOF data cluster, and an odd-size header; five malformed:
+  bad cluster_bits, bad l2_bits, oversized, invalid crypt_method, an
+  overlong backing name), cross-version qemu-img baselines, oslo
+  cross-validation (oslo detects qcow1 as `"qcow2"` by magic alone;
+  virtual sizes agree except on the odd-size fixture), coverage-
+  guided fuzzing of the header parser and two-level table walk
+  (`fuzz_qcow1_header`, `fuzz_qcow1_table`), and `qcow` added to the
+  differential fuzzer's format pool. A recorded qemu-img quirk:
+  `convert -c -O qcow` writes a valid compressed image but exits 1
+  with empty stderr on every version; the fixture generator and
+  differential fuzzer verify by roundtrip instead of exit code. See
+  [docs/format-coverage.md](docs/format-coverage.md) and
+  [docs/quirks.md](docs/quirks.md) for the full divergence records.
+
 - **Format-coverage phase 3: Parallels convert-from read path
   (PLAN-format-coverage phase 3).** `instar convert`, `compare`,
   `dd`, and `bench` now accept Parallels Disk Image as input — both

@@ -2,7 +2,7 @@
 
 Master plan: [PLAN-format-coverage.md](PLAN-format-coverage.md)
 
-## Status: Ready for execution (planned 2026-07-18)
+## Status: Complete (2026-07-18)
 
 ## Prompt
 
@@ -442,6 +442,257 @@ not land before the reader arm — see Situation); 4d
 parallel with 4a-4c (fixtures need only qemu-img; its
 instar-side manifest/oslo edits land after 4c); 4e after
 4c + 4d; 4f after 4c; 4g last.
+
+## Findings: step 4a — qcow1 crate
+
+* `src/crates/qcow1/` landed as planned: `Qcow1Header::parse` enforces
+  qemu's exact RO open rules (magic `0x514649fb` + version == 1,
+  `cluster_bits` in [9,16], `l2_bits` in [6,13], `size >= 2`,
+  `crypt_method <= 1` at parse time — `>= 2` refused, matching qemu;
+  `>= 2` is still permitted to construct a `Qcow1Header` for the info
+  arm's own separate leniency posture where relevant — `backing_file_size
+  <= 1023`, and `l1_table_offset` deliberately unvalidated, mirroring
+  qemu's own lack of a check there (0 / unaligned / past-EOF are all
+  tolerated at open and only surface at read time). The "Image too
+  large" bound was derived symbolically from `qcow_open`'s L1-size
+  arithmetic (`l1_size > INT_MAX/8` for the default cluster_bits=12/
+  l2_bits=9 geometry) and unit-tested at the boundary; step 4d's
+  empirical fixture sweep confirmed the derived boundary
+  (562949951324160 accepted, 562949951324161 refused) exactly, so
+  **no lock-step correction was needed this phase**, unlike phase 3's
+  off-by-681 tracks-cap correction.
+* `Qcow1State::init`/`block_lookup` follow the `ParallelsState` shape:
+  `init` additionally refuses `crypt_method != 0` (a reader-level
+  refusal on top of `parse`'s more lenient acceptance, so `info` can
+  still report on encrypted images while data ops cannot open them).
+  The two-level L1/L2 lookup uses a new `read_u64_be_cached` helper
+  added to the shared cached-sector macro family (entries are u64 BE,
+  unlike Parallels' u32 LE BAT entries); L1 entry 0, L2 entry 0, or an
+  out-of-range index all resolve to `Unallocated`. Bit 63 marks a
+  compressed cluster: `host_offset = entry & ((1 << (63 -
+  cluster_bits)) - 1)`, `csize = (entry >> (63 - cluster_bits)) & ((1
+  << cluster_bits) - 1)` (byte-granular, may be unaligned) — the
+  empirical example (`entry = 0x81d0000000002000`, `cluster_bits =
+  12` → `host_offset = 0x2000`, `csize = 58`) is a permanent unit
+  test. `mtime` is parsed but unused, matching the empirical
+  always-0 observation (create/convert are byte-deterministic).
+* Unit tests cover every validation boundary (accept/reject at exact
+  limits for cluster_bits, l2_bits, size, crypt_method,
+  backing_file_size), the populated-image lookup example, the
+  compressed-entry decode example, the crypt-refused-at-init-but-
+  parse-ok split, and the no-l1-validation tolerance. `no_std`,
+  panic-free, workspace member; `make test-rust`/`lint`/`instar`
+  clean.
+
+## Findings: step 4b — guest reader arm
+
+* The `qcow1-input` feature (`= ["dep:qcow1", "decompress"]`) landed
+  in `src/crates/qcow2/Cargo.toml`, with `ChainStates.qcow1_states`
+  and an `init_chain_states` arm following the existing Vdi/Parallels
+  cache-slot-reuse pattern.
+* **Backing fall-through mechanism** (the phase's one genuinely new
+  architectural piece): the QCOW1 arm signals "unallocated, recurse
+  into the backing device" to the chain walker using the *exact same*
+  sub-span mechanism the existing QCOW2 arm already uses for its own
+  backing chains — an unallocated L1/L2 entry does not zero-fill
+  locally; it emits a sub-span descriptor that the chain walker
+  resolves by re-invoking the read against the next device in the
+  chain (the backing image, if present, else zeros at the chain's
+  base). This is a direct code-reuse of the QCOW2 arm's own
+  unallocated-signalling path, not a new mechanism invented for
+  QCOW1 — QCOW1 is simply the first *non-QCOW2* format to plug into
+  it, since VDI and Parallels have no backing-file concept at all
+  and their arms zero-fill unconditionally.
+* The reader walks per-cluster (not one-lookup-per-chunk like the VDI
+  arm), because QCOW1 clusters go down to 512 bytes — smaller than
+  chunk sizes in convert/compare/bench/rebase. Compressed clusters
+  read `csize` bytes from the (possibly unaligned) host offset via
+  `read_offset_sectors` (its cfg gate was widened to include
+  `qcow1-input`), inflate with `miniz_oxide` flags *without* the
+  zlib-header-parsing bit (raw DEFLATE only — confirmed this is a
+  distinct code path from the QCOW2 crate's zlib-first two-try
+  helper, not a shared one), then copy the requested span; inflate
+  failure is a clean guest failure, never a panic.
+  Allocated-but-past-EOF and straddling reads use the same
+  capacity-clamped zero-fill shape as the VDI/Parallels arms.
+* The feature was enabled in convert/compare/bench/rebase
+  `Cargo.toml`s and the Makefile's qcow2 test features line was
+  extended. Binary deltas (from `make check-binary-sizes`):
+  convert/compare/bench each grew ~+2.9 KB; rebase grew +19.5 KB,
+  since it newly links `miniz_oxide` via the `decompress` feature for
+  the first time (the other three consumers already linked it via
+  QCOW2/VMDK compressed-cluster support). `info` also grew from the
+  new QCOW1 header parser (landed in step 4c, measured together).
+  All four deltas stayed well within the 768 KB per-binary cap.
+* Unit tests cover the VDI/Parallels-equivalent set plus:
+  unallocated-descends-to-backing (a multi-device mock following the
+  QCOW2 arm's existing chain test pattern), a real raw-deflate
+  compressed cluster, a 512-byte-cluster walk crossing a chunk
+  boundary, past-EOF clamp, and a straddling read. Detection still
+  routed real qcow1 images through the QCOW2 parser at this point (by
+  design — the ordering constraint from the Situation section), so
+  behaviour was unchanged and all three existing suites stayed green
+  through this step.
+
+## Findings: step 4c — detection fix, info, naming, encrypted emitters, pins
+
+* Landed as four separate commits in the planned order: `3aa7f50`
+  (info arm + naming), `467d24a` (encrypted-line emitters), `c421f75`
+  (the detection graduation itself), `a0f757b` (empirical pins).
+  Commit `c421f75` — the actual fix for the misdetection defect — was
+  correctly sequenced *after* `77f32ca` (step 4b's reader arm),
+  closing the silent-raw-read hazard window the Situation section
+  flagged: at no point in the commit history did a version-aware
+  detector exist without a real QCOW1 reader arm behind it.
+* The info arm replaces the previous wildcard fall-through for QCOW1
+  with a real parser: `virtual_size` = header size truncated down to
+  the nearest 512-byte multiple (matching qemu's `total_sectors * 512`
+  rule, the opposite of VDI's round-up), `cluster_size = 1 <<
+  cluster_bits` (emitted normally — qemu does print cluster_size for
+  qcow, unlike parallels, so no suppression mechanism was needed
+  here), a bounds-checked backing-file-name read passed through
+  `send_info_result`, and `FLAG_ENCRYPTED` set whenever
+  `crypt_method != 0`.
+* The encrypted-line emitters were pinned against real qemu
+  `info --output=json` output on an AES QCOW1 image: human `encrypted:
+  yes` between the disk-size and `cluster_size:` lines, JSON
+  `"encrypted": true` positioned after `actual-size` and before
+  `dirty-flag`. Gating on the `"luks"` format string specifically
+  (not a generic "has a passphrase-shaped format" check) was
+  necessary and sufficient to keep the LUKS goldens byte-identical —
+  confirmed by a full `test_info_safe` run with zero regressions
+  before this commit was accepted. Encrypted QCOW2 images gained the
+  line automatically as a side effect (recorded as a pre-existing-gap
+  fix, no baseline churn, since no fixture's golden covers that case).
+* The detection split deletes the dead 3-byte-magic branch in the
+  same commit that adds the version check, keeping the constant table
+  coherent (no orphaned `QCOW1_MAGIC` constant left unused). The
+  bench `read_family` allowlist gained `Qcow1 => Some(7)` (confirmed
+  as the next free family number, per the Situation survey).
+* Empirical pins (commit `a0f757b`): convert/compare/dd smoke parity
+  against a locally-created qcow1 image; a backing-chain smoke test
+  (overlay reads through base, confirming the 4b mechanism end-to-end
+  before fixtures landed); `check` exits 63 cleanly (the wording
+  difference from qemu's own refusal message — qemu's lacks the
+  `"(qcow)"` parenthetical instar always includes — was recorded, not
+  chased, since it is coincidental parity rather than a byte-pinned
+  contract); `map`/`measure` refusals recorded as a divergence from
+  qemu, which supports both; the encrypted fixture's `info` succeeds
+  with the new line while `convert` refuses cleanly at open; and the
+  pre-fix misdetection behaviour (qcow2-shaped garbage info) was
+  confirmed gone by direct comparison against the old code path.
+
+## Findings: step 4d — fixtures, baselines, and manifest/oslo
+
+* `instar-testdata/scripts/generate-qcow1-fixtures.py` produced all
+  twelve fixtures deterministically (create/convert are
+  byte-deterministic; `mtime` always 0 means no UUID-style patching
+  step was needed beyond each fixture's specific header byte-patch):
+  seven safe (`qcow1-data`, `qcow1-compressed`, `qcow1-backing-base`,
+  `qcow1-backing`, `qcow1-encrypted`, `qcow1-past-eof`,
+  `qcow1-odd-size`) and five malformed (`qcow1-bad-cluster-bits`,
+  `qcow1-bad-l2-bits`, `qcow1-huge-size`, `qcow1-crypt-invalid`,
+  `qcow1-backing-name-too-long`).
+* The compressed fixture's generation step tolerates qemu's
+  `convert -c -O qcow` exit-1-despite-valid-output quirk (verified on
+  every spot-checked version) by validating via roundtrip md5 instead
+  of exit code — the same pattern the differential fuzzer's
+  compressed-variant path uses.
+* The `qcow1-huge-size` boundary fixture confirms step 4a's
+  symbolically-derived "Image too large" cap needed **no** empirical
+  correction this phase: 562949951324160 opens cleanly and
+  562949951324161 is the smallest value 10.2.0 refuses (`"Image too
+  large"`), matching the `INT_MAX/8` L1-entry arithmetic exactly —
+  unlike phase 3's tracks cap, which needed a lock-step fix after
+  fixture validation found the planning-stage arithmetic off by 681.
+* Both open edges the plan asked to pin for the record turned out
+  version-stable and got fixtures: `qcow1-odd-size` (header size
+  byte-patched to 1048577; truncate-down to 1048576 confirmed
+  identical on 6.0.0/8.2.0/10.2.0) and the version-0/99 probe-routing
+  behaviour (documented in `docs/quirks.md` rather than fixtured,
+  since it is a probe-routing curiosity with no data-safety angle,
+  not a read-path behaviour a fixture would exercise).
+* **No new baseline profile bucket was needed** — unlike phase 3's
+  `parallels-bat-past-eof`, which forced a `profile-8-1-0` split for
+  qemu's 8.1.0-8.1.5 past-EOF-BAT open-refusal regression, QCOW1's
+  past-EOF behaviour (`qcow1-past-eof`) is zero-fill on **every**
+  spot-checked qemu version with no regression window at all, so the
+  existing seven profiles absorbed all twelve fixtures' baselines
+  without any split or `test_info_safe` skip-mechanism engagement
+  beyond what phase 3 already generalised.
+* Every safe fixture was validated on both 6.0.0 and 10.2.0 (info +
+  convert md5 agreement); every malformed fixture was confirmed
+  refused by 10.2.0 with its expected error string under forced
+  `-f qcow` (unforced probing behaves differently per fixture and was
+  recorded, not relied on).
+* `instar-testdata/scripts/generate-baselines.py`'s measure/info
+  source whitelists were realigned from `'qcow1'` to `'qcow'` to
+  match the check/compare lists, which already used `'qcow'`.
+* Manifest entries for all twelve fixtures landed with
+  `qcow1-backing`/`qcow1-backing-base` following the existing
+  backing-fixture precedent (base referenced by relative path,
+  `-F qcow` hint). Oslo `KNOWN_FORMAT_DIVERGENCES` entries record
+  `('qcow', 'qcow2')` for every safe fixture, confirmed live: oslo
+  detects qcow1 by magic alone (ignoring version, the same class of
+  bug this phase fixed in instar) and reports the *correct* virtual
+  size for every fixture except `qcow1-odd-size`, where oslo reads
+  the header `size` field verbatim (1048577) with no truncation —
+  the one fixture needing a `KNOWN_VSIZE_DIVERGENCES` entry. The five
+  malformed fixtures joined `OSLO_SKIP_IMAGES`, and the
+  `SafetyCheckFailed` exception oslo raises (no `get_inspector('qcow')`
+  exists) is handled per the test's existing flow.
+
+## Findings: step 4e — integration tests
+
+* All eight consumer suites ran clean: `test_info_safe` 898 passed/0
+  failed, `test_oslo_crossval` 267/0, `test_convert` 242/0,
+  `test_compare` 62/0, `test_dd` 43/0, `test_adversarial` 88/0,
+  `test_bench` 79/0, `test_rebase` 28/0 — plus a dedicated
+  `qcow1_smoke` set of 12 tests. Zero failures across the board,
+  confirming the consumer-suite rule (the qcow2 crate changed again)
+  needed no bisection this phase.
+* **Malformed-image `info` posture, pinned per-fixture as planned**:
+  unlike VDI and Parallels, whose lenient `info` parsers only check
+  magic/version and report best-effort nonzero fields on malformed
+  input, QCOW1's new `info` arm validates the same fields the reader
+  does (`cluster_bits`, `l2_bits`, `size`, `crypt_method`,
+  backing-name length) and falls back to an **empty default** (virtual
+  size 0) on any failure. All five malformed fixtures were pinned to
+  this exact behaviour: `info` exit 0, format `"qcow"`, virtual size
+  0 — a deliberate, tested posture difference from VDI/Parallels
+  rather than an oversight, now documented in `docs/quirks.md` so a
+  future phase doesn't assume all detect-then-refuse formats behave
+  identically on malformed input. `convert`/`compare`/`dd` then refuse
+  cleanly on the zero virtual size for all five, with no hangs.
+* Backing-chain coverage included both the qcow1-over-qcow1 pair
+  (`qcow1-backing` over `qcow1-backing-base`, copied into the tmpdir
+  per the existing backing-path restriction) and a QCOW2 overlay
+  created with `-F qcow` over a qcow1 backing, confirming the
+  cross-format backing-chain machinery (already generic per the
+  Situation survey) needed no changes beyond reporting the backing
+  format name.
+* The compressed twin (`qcow1-compressed`) compares identical to
+  `qcow1-data` and converts to the same raw md5; the encrypted
+  fixture (`qcow1-encrypted`) is the first baseline in the whole tree
+  to carry the `encrypted: yes` / `"encrypted": true` info line, with
+  `convert`/`dd` refusing cleanly on both sides (instar at open,
+  keyless qemu with its own key-secret error).
+
+## Findings: step 4f — fuzzing
+
+* `fuzz_qcow1_header` and `fuzz_qcow1_table` (two-level walk +
+  compressed-entry decode invariants) both ran crash-free in local
+  60-second sessions: 1.3M exec/s for the header target, 98k exec/s
+  for the (heavier, table-walking) table target.
+* The differential fuzzer gained `'qcow'` in `FORMATS` (qemu's create
+  name) with a plain-create path (no encryption — both sides would
+  refuse identically, so an encrypted variant carries no differential
+  signal) and gates `op_map` (`'raw', 'vdi', 'parallels', 'qcow'`) and
+  `op_measure` (`'vdi', 'parallels', 'qcow'`) to skip the two
+  recorded divergent operations, citing this plan in comments.
+* A ~200-iteration forced burn-in against the differential harness
+  produced zero divergences, matching the same clean-burn-in result
+  every prior format-coverage phase has reported.
 
 ## Verification (management-session review checklist)
 

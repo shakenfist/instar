@@ -227,7 +227,7 @@ is the tracking source of truth.
 | 1. Detection + info parity (Parallels, Bochs, cloop, DMG; settle the trailer-probe question) | [PLAN-format-coverage-phase-01-detection.md](PLAN-format-coverage-phase-01-detection.md) | Complete (commits 3c0fff1..5042d74 + docs commit) |
 | 2. VDI convert-from (dynamic + static read path, new `src/crates/vdi/`) | [PLAN-format-coverage-phase-02-vdi-read.md](PLAN-format-coverage-phase-02-vdi-read.md) | Complete (commits 6cd14b5..cf213ed + docs commit) |
 | 3. Parallels convert-from (v2 read path, new `src/crates/parallels/`) | [PLAN-format-coverage-phase-03-parallels-read.md](PLAN-format-coverage-phase-03-parallels-read.md) | Complete (commits 3f43472..f2bacf4 + docs commit) |
-| 4. QCOW1 convert-from (read path, new `src/crates/qcow1/`; fixes the misdetection-as-qcow2 defect) | [PLAN-format-coverage-phase-04-qcow1-read.md](PLAN-format-coverage-phase-04-qcow1-read.md) | Planned (2026-07-18) |
+| 4. QCOW1 convert-from (read path, new `src/crates/qcow1/`; fixes the misdetection-as-qcow2 defect) | [PLAN-format-coverage-phase-04-qcow1-read.md](PLAN-format-coverage-phase-04-qcow1-read.md) | Complete (commits 23b240f..efdc42e + docs commit) |
 | 5. DMG convert-from (koly trailer + BLKX chunk table + zlib chunks, new `src/crates/dmg/`) | PLAN-format-coverage-phase-05-dmg-read.md | Not written |
 | 6. QED decision: read path or documented refusal (see Open question 1) | PLAN-format-coverage-phase-06-qed.md | Not written |
 | 7. Docs: qemu-img-parity axis in format-coverage.md, README/ARCHITECTURE/CHANGELOG updates | PLAN-format-coverage-phase-07-docs.md | Not written |
@@ -506,6 +506,18 @@ chosen to defer to here so that we don't forget them.
   any future profile split should follow the same precedent — carry
   over the neighbouring profile's hand-authored LUKS goldens rather
   than regenerating them.
+* QCOW1 (qcow) AES decryption (crypt_method=1): phase 4's reader
+  refuses encrypted qcow1 cleanly at open, matching keyless qemu's
+  own refusal, rather than implementing AES-128-CBC decryption;
+  instar already has the crypt_method=1 machinery from QCOW2 to
+  reuse if real demand appears (see `docs/quirks.md`
+  "Format-coverage phase 4").
+* `map` / `measure` support for qcow1: qemu-img actually supports
+  both against a qcow1 source; instar's refusals are a deliberate,
+  recorded divergence (already covered by the general "`map` /
+  `measure` / `dd` support for the new input formats" bullet above,
+  which now also applies to qcow1's map/measure gap specifically —
+  `dd` itself is already supported for qcow1).
 
 ### Bugs fixed during this work
 
@@ -543,36 +555,47 @@ operation bugs.)
   pass-through. No existing test depended on the silent-raw
   behaviour. Findings in
   [PLAN-format-coverage-phase-01-detection.md](PLAN-format-coverage-phase-01-detection.md).
-* **CONFIRMED pre-existing defect: real QCOW1 images are
+* **FIXED (phase 4, commit `c421f75`): real QCOW1 images were
   misdetected as qcow2.** Found during phase-4 planning
   (2026-07-18) and empirically pinned by the management
-  session: `detect_format_from_header` checks the 4-byte
-  `QFI\xfb` magic against qcow2 FIRST and never consults the
+  session: `detect_format_from_header` checked the 4-byte
+  `QFI\xfb` magic against qcow2 FIRST and never consulted the
   version field, so every real qcow1 image (whose magic IS
-  `QFI\xfb`) takes the qcow2 branch; the 3-byte QCOW1 branch
-  below it is dead code for real images, making the
+  `QFI\xfb`) took the qcow2 branch; the 3-byte QCOW1 branch
+  below it was dead code for real images, making the
   `docs/format-coverage.md` "QCOW1 detection: Yes" claim
   wrong. Observed effect: `instar info` on a fresh
-  `qemu-img create -f qcow` image prints `file format: qcow2`,
+  `qemu-img create -f qcow` image printed `file format: qcow2`,
   `virtual size: 0` and a garbage qcow2 format-specific block;
-  `instar convert` fails with the misleading "input image has
-  zero virtual size". A second latent hazard sits behind it:
-  `chain::ImageFormat::from_str` already maps `"qcow1"` past
+  `instar convert` failed with the misleading "input image has
+  zero virtual size". A second latent hazard sat behind it:
+  `chain::ImageFormat::from_str` already mapped `"qcow1"` past
   the issue-#444 gate with no reader arm, so fixing detection
-  alone would flip qcow1 to silent raw reads — the phase-4
-  plan orders the reader arm strictly before the detection
-  fix. Fix scheduled as phase 4's step 4c.
-* **Pre-existing info-parity gap: `INFO_RESULT_FLAG_ENCRYPTED`
-  is never consumed.** Also found during phase-4 planning:
+  alone would have flipped qcow1 to silent raw reads — the
+  phase-4 plan ordered the reader arm (commit `77f32ca`, step
+  4b) strictly before the detection fix (commit `c421f75`,
+  step 4c), closing the hazard window. Detection is now
+  version-aware: `QFI\xfb` + version 1 => qcow1 (via the new
+  `src/crates/qcow1/` reader), any other version keeps the
+  qcow2 route. One latent divergence from qemu was found and
+  recorded rather than fixed: a version-0 `QFI\xfb` image
+  probes as raw under qemu but refuses under instar's qcow2
+  route (see `docs/quirks.md` "Format-coverage phase 4").
+* **FIXED (phase 4, commit `467d24a`): `INFO_RESULT_FLAG_ENCRYPTED`
+  was never consumed.** Also found during phase-4 planning:
   qemu-img prints `encrypted: yes` (human, between disk size
   and cluster_size) and `"encrypted": true` (JSON) for
-  encrypted images, but instar's emitters never consume the
-  flag, so the line is never printed. Latent today — no
-  baseline in the tree contains the line (the bare-LUKS
-  goldens match qemu in omitting it) — but phase 4's
-  AES-encrypted qcow1 fixture is the first baseline to need
-  it. Emitters added in phase 4 step 4c, gated so the LUKS
-  goldens stay byte-identical.
+  encrypted images, but instar's emitters never consumed the
+  flag, so the line was never printed. Latent at the time — no
+  baseline in the tree contained the line (the bare-LUKS
+  goldens matched qemu in omitting it) — with phase 4's
+  AES-encrypted qcow1 fixture (`qcow1-encrypted`) becoming the
+  first baseline to need it. Both host emitters now consume
+  the flag, gated off for the `"luks"` format string so the
+  LUKS goldens stay byte-identical (verified by a full
+  `test_info_safe` run, zero regressions); encrypted qcow2
+  images pick up the line for free as a side effect, with no
+  baseline churn since no existing golden covers that case.
 * **instar-testdata: parallels driver missing from the
   6.0.0–6.2.0 static qemu-img builds.** Found by step 4b's
   driver spot-check (2026-07-17): `-f parallels` fails with

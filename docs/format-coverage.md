@@ -23,7 +23,7 @@ for details on why this approach is secure.
 | Format | oslo.utils | instar | Test Images |
 |--------|------------|-------|-------------|
 | QCOW2 (v2/v3) | Yes | Yes | cirros-qcow2, qcow2-v2, many edge-cases |
-| QCOW1 | No | Yes | (none - deprecated format) |
+| QCOW1 ("qcow") | No | Yes‡ | qcow1-data, qcow1-compressed, qcow1-backing, qcow1-backing-base, and 8 more (see below) |
 | VMDK (monolithic sparse) | Yes | Yes | plaso-vmdk, vmdk-multi-partition |
 | VMDK (stream optimized) | Yes | Yes | vmdk-streamoptimized |
 | VMDK (v3/COWD) | Yes | Yes | vmdk-v3 |
@@ -44,6 +44,8 @@ for details on why this approach is secure.
 *\* ISO detection is controlled by `--unsafe-quirks` flag: by default instar reports "iso", but with `--unsafe-quirks` it reports "raw" to match qemu-img behavior. See [quirks.md](quirks.md) for details.*
 
 *† DMG is detected by content — scanning the file's final 1024 bytes for the koly trailer magic — not by the `.dmg` filename extension qemu-img probes for. A misnamed DMG (no `.dmg` suffix) still detects under instar but probes as raw under qemu-img. See [quirks.md](quirks.md) for details.*
+
+*‡ QCOW1 detection was actually broken until PLAN-format-coverage phase 4 (2026-07-18), despite this document previously claiming "Yes": `detect_format_from_header` checked the QCOW2 magic first and never consulted the version field, so every real QCOW1 image (whose magic is byte-identical to QCOW2's, `QFI\xfb`) misdetected as QCOW2 — producing garbage `info` output (virtual size 0, a qcow2-shaped `compat: 0.10` block) and a misleading convert error. Detection is now version-aware: `QFI\xfb` + version 1 routes to QCOW1 ("qcow"), any other version keeps the QCOW2 route. See [quirks.md](quirks.md) for the full record.*
 
 ### Formats Not Yet Detected by Instar
 
@@ -78,6 +80,7 @@ The `instar convert` operation supports writing output in the following formats:
 | vhdx (dynamic) | Supported | 64-bit BAT with interleaved SB entries, GUID-based metadata, CRC-32C validation |
 | vdi (dynamic and static) | Supported | Header validated against qemu's 12 open-time rules; allocation-order block-map lookup, sector-cached reads; qemu parity for discarded blocks, past-EOF reads (zero-fill), and odd `disk_size` (rounded up to 512) |
 | parallels (v1 and v2/ext) | Supported | Open validated against qemu's RO rules (tracks/bat_entries limits, both magics); per-magic BAT decoding (sector-valued under v1, cluster-valued under v2), sector-cached reads; past-EOF and out-of-BAT reads zero-fill, `inuse`-dirty images read normally, `ext_off != 0` refused |
+| qcow (v1) | Supported | Header validated against qemu's exact RO rules (cluster_bits/l2_bits ranges, size bounds incl. the "Image too large" boundary, crypt_method, backing-name length); per-cluster walk (clusters down to 512 B), backing-chain fall-through to the next chain device on unallocated clusters (the first non-QCOW2 backing format), raw-DEFLATE compressed clusters (no zlib wrapper, unlike QCOW2's zlib-first two-try); past-EOF/truncated data clusters zero-fill; odd header sizes truncate down (opposite of VDI's round-up); encrypted (AES, crypt_method=1) images: `info` works and reports `encrypted: yes`, data ops refuse cleanly |
 | luks (v1/v2, native) | Supported | Decrypts with `--luks-passphrase`; v1 PBKDF2, v2 Argon2id (`--max-guest-memory`); detects inner format (raw, QCOW2) |
 | luks wrapping qcow2 | Supported | Transparent inner QCOW2 detection and decryption via CallTable function pointer wrapping |
 
@@ -291,6 +294,7 @@ full reference.
 | LUKS | Version check (only v1) | Rejects v2+ | Detects format, version, cipher, hash, UUID, payload offset, key slots, inner format (with passphrase); convert decrypts v1/v2 containers |
 | VDI | None | Pass-through | Detects format, UUID; convert/compare/dd read via a full reader — header validated against qemu's 12 open-time rules, block-map entries bounds-checked, past-EOF block reads zero-filled (`check` still refuses, exit 63) |
 | Parallels | None | Pass-through | Detects format, magic, version; convert/compare/dd/bench read via a full reader — open validated per qemu's RO rules, BAT decoded per-magic (sector-valued v1, cluster-valued v2/ext), past-EOF and out-of-BAT reads zero-filled, `ext_off != 0` refused (`check` still refuses, exit 63) |
+| QCOW1 ("qcow") | None | Pass-through | Detects format (version-aware split from QCOW2, fixed in phase 4), cluster/L2 bits, backing file, encryption; convert/compare/dd/bench read via a full reader — per-cluster walk, backing-chain fall-through, raw-DEFLATE compressed clusters, past-EOF zero-fill (`check` still refuses, exit 63; `map`/`measure` still refuse, a recorded divergence since qemu supports both) |
 | ISO | None | Pass-through | Detects format* |
 | VHD | None | Pass-through | Detects creator app; full check validation (footer/header checksums, version/feature validation, BAT bounds, overlap detection, fragmentation, fixed VHD size check, footer copy consistency) |
 | VHDX | None | Pass-through | Detects block size; full check validation (file identifier, dual header CRC-32C, region table 1+2 cross-check, metadata, BAT bounds/alignment/overlap, fragmentation) |
@@ -381,6 +385,23 @@ full reference.
 | Image ID | Description | Safety | Key Features |
 |----------|-------------|--------|--------------|
 | qed-simple | QED format image | safe | Deprecated format test |
+
+#### QCOW1 Images (12)
+
+| Image ID | Description | Safety | Key Features |
+|----------|-------------|--------|--------------|
+| qcow1-data | 2 MiB QCOW1, default 4 KiB clusters, data in scattered guest clusters 0/5/17/100/300/511 | safe | Two-level uncompressed L1/L2 lookup baseline |
+| qcow1-compressed | `convert -c` twin of qcow1-data, same content via raw-DEFLATE clusters | safe | Compare-identical to qcow1-data; pins the `qemu-img convert -c -O qcow` exit-1-despite-valid-output quirk (validated by roundtrip, not rc) |
+| qcow1-backing-base | 1 MiB QCOW1 backing base, no backing file, guest clusters 0..4 filled | safe | Base of the qcow1-backing overlay pair |
+| qcow1-backing | Overlay created with `-b qcow1-backing-base.qcow -F qcow` (relative name); create-with-backing uses 512-byte clusters | safe | Backing-chain fall-through and small-cluster (512 B) walk coverage; two overlay clusters mask the base, the rest read through |
+| qcow1-encrypted | qcow1-data byte-patched to crypt_method=1 (AES-128-CBC) | safe | First baseline carrying the `encrypted: yes` info line; data ops refuse cleanly |
+| qcow1-past-eof | qcow1-data with one data-cluster's L2 entry redirected ~4 GiB past EOF | safe | Pins past-EOF zero-fill (no 8.1.x window, version-stable) |
+| qcow1-odd-size | 1 MiB QCOW1, header size u64 byte-patched to the odd value 1048577 | safe | Pins truncate-down to `total_sectors*512` = 1048576 (opposite of VDI's round-up); oslo.utils reads the field verbatim, a real vsize divergence |
+| qcow1-bad-cluster-bits | cluster_bits (offset 32) patched to 17 (outside [9,16]) | malformed | Refused at open ("Cluster size must be between 512 and 64k") |
+| qcow1-bad-l2-bits | l2_bits (offset 33) patched to 14 (outside [6,13]) | malformed | Refused at open ("L2 table size must be between 512 and 64k") |
+| qcow1-huge-size | size (offset 24) patched to 562949951324161, the empirically-pinned smallest refused "Image too large" boundary | malformed | Refused at open ("Image too large") |
+| qcow1-crypt-invalid | crypt_method (offset 36) patched to 2 (>= 2 unsupported) | malformed | Refused at open ("invalid encryption method in qcow header") |
+| qcow1-backing-name-too-long | backing_file_offset nonzero, backing_file_size (offset 16) patched to 1024 (> 1023) | malformed | Refused at open ("Backing file name too long") |
 
 #### Parallels Images (11)
 
@@ -616,6 +637,52 @@ qcow2-luks).
     to qemu. `check` still refuses parallels (exit 63); `map`,
     `measure`, and `resize` are unchanged refusals.
 
+20. **QCOW1 Input Support** - Convert, compare, dd, and bench
+    support QCOW1 ("qcow", qemu's original deprecated format) as
+    read-only input, including backing chains and compressed
+    clusters (`src/crates/qcow1/`, PLAN-format-coverage phase 4).
+    This phase also **fixed a pre-existing detection defect**: real
+    QCOW1 images were misdetected as QCOW2 because
+    `detect_format_from_header` checked only the shared `QFI\xfb`
+    magic and never consulted the version field, yielding garbage
+    `info` output and a misleading convert error (see the footnote
+    on the detection table above). Detection is now version-aware —
+    `QFI\xfb` + version 1 routes to QCOW1, any other version keeps
+    the QCOW2 route (a latent divergence from qemu is recorded:
+    version 0 probes as raw under qemu but still routes to the QCOW2
+    driver, and therefore refuses, under instar). QCOW1 is also the
+    first non-QCOW2 backing format: unallocated clusters fall through
+    to the next chain device exactly as the QCOW2 arm does, rather
+    than zero-filling like the VDI/Parallels arms. Compressed
+    clusters are raw DEFLATE (windowBits -12, no zlib wrapper) —
+    NOT the QCOW2 zlib-first two-try helper. The reader walks
+    per-cluster (clusters go down to 512 bytes). qemu parity is
+    exact for the read path: past-EOF/truncated data clusters
+    zero-fill on every qemu version (no 8.1.x-style window), and an
+    odd header size truncates DOWN to `total_sectors*512` — the
+    opposite of VDI's round-up. `instar info` gained a real QCOW1
+    parser (previously qcow1 fell into the generic wildcard arm) and
+    now also consumes the previously-dead `INFO_RESULT_FLAG_ENCRYPTED`
+    flag in both emitters, printing `encrypted: yes` / `"encrypted":
+    true` for AES (crypt_method=1) images — gated off for bare LUKS
+    containers (whose goldens qemu prints no such line for) and
+    otherwise a pre-existing gap fix with no baseline churn. instar
+    emits the format string `"qcow"` (matching qemu-img/oslo), with
+    `"qcow1"` still accepted as an input alias. Malformed QCOW1
+    fixtures get a lenient-looking but distinct `info` posture from
+    VDI/Parallels: the new parser validates cluster_bits/l2_bits/
+    size/crypt/backing-name and falls back to an empty (virtual size
+    0) default on any failure, rather than reporting best-effort
+    nonzero fields. `check` still refuses QCOW1 (exit 63) — this
+    happens to be genuine parity, since qemu's own qcow driver also
+    refuses checks (instar's message includes "(qcow)", qemu's does
+    not). `map` and `measure` stay refusals — a deliberate divergence
+    since qemu supports both on qcow1 (master-plan future work).
+    Encrypted QCOW1 is refused cleanly by data ops (parity with
+    keyless qemu; AES decryption is future work). oslo.utils detects
+    QCOW1 as `"qcow2"` (magic-only) with the correct virtual size and
+    no dedicated inspector; recorded as a divergence.
+
 ### Detections to Add
 
 All oslo.utils formats are now detected. No remaining format detections needed.
@@ -663,6 +730,8 @@ cd tests && ../.venv/bin/stestr run test_oslo_crossval
 | Format | bochs-growing | bochs | raw | oslo has no Bochs inspector; falls back to RawFileInspector |
 | Format | cloop-simple | cloop | raw | oslo has no cloop inspector; falls back to RawFileInspector |
 | Format | dmg-simple | dmg | raw | oslo has no DMG inspector; falls back to RawFileInspector |
+| Format | qcow1-data and other safe qcow1 fixtures | qcow | qcow2 | oslo has no qcow1 inspector; magic-only detection (`QFI\xfb`) routes qcow1 through the qcow2 inspector — virtual size agrees (the size u64 field sits at the same offset 24 in both formats) |
+| Vsize | qcow1-odd-size | 1048576 | 1048577 | oslo reads the header size u64 field verbatim; qemu/instar truncate down to `total_sectors*512` (see the QCOW1 Images fixture table) |
 
 ### CI Integration
 
@@ -684,4 +753,4 @@ are surfaced as warnings rather than blocking PRs.
 
 ---
 
-*Document updated: 2026-07-17*
+*Document updated: 2026-07-18*

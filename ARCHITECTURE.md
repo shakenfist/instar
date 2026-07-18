@@ -249,6 +249,24 @@ provides a modular architecture with:
   write/output support. Linked into the qcow2 crate's chain reader
   behind the `parallels-input` feature and used by convert, compare,
   bench, and rebase (PLAN-format-coverage phase 3).
+- **crates/qcow1/** - Shared QCOW1 ("qcow", qemu's original deprecated
+  format) crate: header parsing and validation against qemu's exact
+  RO `qcow_open` rules (magic + version == 1, `cluster_bits`/`l2_bits`
+  ranges, size bounds including the empirically-pinned "Image too
+  large" boundary, `crypt_method` <= 1 at parse, backing-file-name
+  length), two-level L1/L2 block lookup (entries are absolute byte
+  offsets; bit 63 marks a compressed cluster with a byte-granular
+  `{host_offset, csize}` pair), and `Qcow1State` for stateful block
+  I/O (`init`/`block_lookup`, mirroring `parallels::ParallelsState`;
+  `init` additionally refuses `crypt_method != 0`, while `parse`
+  stays lenient for info's benefit). Read-only: no write/output
+  support. Linked into the qcow2 crate's chain reader behind the
+  `qcow1-input` feature (which also pulls in the `decompress`
+  feature for raw-DEFLATE compressed-cluster inflation) and used by
+  convert, compare, bench, and rebase; the reader arm is the first
+  non-QCOW2 format to support backing-chain fall-through, mirroring
+  the QCOW2 arm's own unallocated-cluster recursion instead of the
+  VDI/Parallels arms' zero-fill (PLAN-format-coverage phase 4).
 - **crates/luks/** - Shared LUKS format crate: LUKS v1/v2 header
   constants, header parsing, PBKDF2 key derivation, Argon2id key
   derivation (behind `kdf-argon2` feature), AFsplitter key recovery,

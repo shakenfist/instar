@@ -24,6 +24,7 @@ Initial target formats:
 - **luks** - LUKS encrypted containers (v1/v2, info + convert with decryption)
 - **vdi** - VirtualBox Disk Image (read-only input: convert/compare/dd source; no create/write)
 - **parallels** - Parallels Disk Image, both magics (read-only input: convert/compare/dd/bench source; no create/write)
+- **qcow** (QCOW1) - qemu's original deprecated format, including backing chains and compressed clusters (read-only input: convert/compare/dd/bench source; no create/write)
 
 ## Project Status
 
