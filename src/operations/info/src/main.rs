@@ -1032,8 +1032,14 @@ fn parse_vdi_header(buffer: &[u8], result: &mut InfoResult, vdi_info: &mut VdiIn
         buffer[VDI_IMAGE_TYPE_OFFSET + 3],
     ]);
 
-    // Virtual disk size (little-endian u64 at offset 368)
-    result.virtual_size = u64::from_le_bytes([
+    // Virtual disk size (little-endian u64 at offset 368).
+    //
+    // qemu's `vdi_open` rounds an odd `disk_size` up to the next 512-byte
+    // multiple in memory rather than rejecting it (VBoxManage-created images
+    // can write non-512-aligned sizes). We mirror that so info output stays
+    // byte-identical to qemu-img. Checked arithmetic; on the (impossible for
+    // a real header) overflow near u64::MAX, fall back to the raw value.
+    let raw_disk_size = u64::from_le_bytes([
         buffer[VDI_DISK_SIZE_OFFSET],
         buffer[VDI_DISK_SIZE_OFFSET + 1],
         buffer[VDI_DISK_SIZE_OFFSET + 2],
@@ -1043,6 +1049,10 @@ fn parse_vdi_header(buffer: &[u8], result: &mut InfoResult, vdi_info: &mut VdiIn
         buffer[VDI_DISK_SIZE_OFFSET + 6],
         buffer[VDI_DISK_SIZE_OFFSET + 7],
     ]);
+    result.virtual_size = raw_disk_size
+        .checked_add(511)
+        .map(|v| v & !511u64)
+        .unwrap_or(raw_disk_size);
 
     // Block size (little-endian u32 at offset 376)
     vdi_info.block_size = u32::from_le_bytes([
@@ -2173,5 +2183,57 @@ mod tests {
         let sc_idx = idx + DMG_KOLY_SECTOR_COUNT_OFFSET;
         tail[sc_idx..sc_idx + 8].copy_from_slice(&0x8000_0000_0000_0001u64.to_be_bytes());
         assert_eq!(dmg_virtual_size(&tail, file_len), None);
+    }
+
+    // ------------------------------------------------------------------
+    // VDI (disk_size round-up to 512, qemu vdi_open parity)
+    // ------------------------------------------------------------------
+
+    /// Minimal 512-byte VDI header carrying only the fields the parser
+    /// reads: version, image_type, disk_size, block_size, block counts.
+    fn vdi_header(disk_size: u64) -> [u8; 512] {
+        let mut buf = [0u8; 512];
+        buf[VDI_VERSION_OFFSET..VDI_VERSION_OFFSET + 4]
+            .copy_from_slice(&0x0001_0001u32.to_le_bytes());
+        buf[VDI_IMAGE_TYPE_OFFSET..VDI_IMAGE_TYPE_OFFSET + 4].copy_from_slice(&1u32.to_le_bytes());
+        buf[VDI_DISK_SIZE_OFFSET..VDI_DISK_SIZE_OFFSET + 8]
+            .copy_from_slice(&disk_size.to_le_bytes());
+        buf[VDI_BLOCK_SIZE_OFFSET..VDI_BLOCK_SIZE_OFFSET + 4]
+            .copy_from_slice(&1_048_576u32.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn vdi_odd_disk_size_rounds_up_to_512() {
+        // qemu vdi_open rounds an odd disk_size up to the next 512-byte
+        // multiple in memory (12801 → 13312); info must report the rounded
+        // value to stay byte-identical to qemu-img.
+        let buf = vdi_header(12801);
+        let mut result = InfoResult::new();
+        let mut vdi_info = VdiInfo::new();
+        parse_vdi_header(&buf, &mut result, &mut vdi_info);
+        assert_eq!(result.virtual_size, 13312);
+    }
+
+    #[test]
+    fn vdi_aligned_disk_size_unchanged() {
+        // An already-512-aligned disk_size (the common qemu-created case,
+        // e.g. vdi-simple at 10 MiB) is reported verbatim.
+        let buf = vdi_header(10 * 1024 * 1024);
+        let mut result = InfoResult::new();
+        let mut vdi_info = VdiInfo::new();
+        parse_vdi_header(&buf, &mut result, &mut vdi_info);
+        assert_eq!(result.virtual_size, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn vdi_exact_512_multiple_unchanged() {
+        // Boundary: a value that is already a multiple of 512 must not be
+        // bumped to the next multiple.
+        let buf = vdi_header(13312);
+        let mut result = InfoResult::new();
+        let mut vdi_info = VdiInfo::new();
+        parse_vdi_header(&buf, &mut result, &mut vdi_info);
+        assert_eq!(result.virtual_size, 13312);
     }
 }
