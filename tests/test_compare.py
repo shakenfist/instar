@@ -1341,3 +1341,41 @@ class TestCompareVdi(InstarTestBase):
             f'rc={rc} stdout={stdout!r} stderr={stderr!r}'
         )
         self.assertIn('mismatch', (stdout + stderr).lower())
+
+
+class TestCompareParallels(InstarTestBase):
+    """Smoke test for comparing Parallels input (format-coverage phase 3).
+
+    Phase 1 gated Parallels for compare but never added a refusal test
+    (a documented gap this phase closes with positive coverage).  Pins
+    the graduation to a real read format: comparing the parallels-v2
+    ('WithouFreSpacExt') fixture against its own qemu-img raw conversion
+    must report identical content and exit 0.  The full compare matrix
+    (both magics, differing pairs) lands in step 3e.
+    """
+
+    def test_compare_parallels_v2_vs_raw(self):
+        """compare parallels-v2 against its qemu-img raw conversion."""
+        image = self.get_image('parallels-v2')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_convert(
+                image.path, Path(qemu_raw.name), timeout=120
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed for parallels-v2: {q_stderr}'
+            )
+
+            stdout, stderr, rc = self.run_instar_compare(
+                image.path, Path(qemu_raw.name), timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'compare parallels-v2 vs raw should be identical; '
+                f'stdout={stdout!r} stderr={stderr!r}'
+            )
+            self.assertIn('identical', (stdout + stderr).lower())

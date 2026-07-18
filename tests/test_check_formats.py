@@ -2134,3 +2134,70 @@ class TestCheckVdiRefusal(InstarTestBase):
             result.get('format', '').lower(), 'vdi',
             f'Expected vdi format in json: {stdout}'
         )
+
+
+class TestCheckParallelsRefusal(InstarTestBase):
+    """check has no Parallels support and must refuse it cleanly.
+
+    Format-coverage phase 3 graduates Parallels to a real *read* format
+    for convert/compare/dd/bench, which lifts the phase-1 host gate for
+    every op that discovers a backing chain -- including check.  But
+    check does not link the chain reader; its own format dispatch has no
+    Parallels arm.  This pins that check fails cleanly (exit 63, "does
+    not support checks" message) rather than silently reading the
+    Parallels container as raw or hanging.  qemu-img's own parallels
+    check is deliberately not mirrored (it asserts on newer qemu for
+    out-of-image BAT entries); refusal stays.
+    """
+
+    def test_check_refuses_parallels(self):
+        """check on parallels-v2 exits 63 with the not-supported message."""
+        image = self.get_image('parallels-v2')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_instar_check(
+            image.path, output_format='human'
+        )
+        self.assertNotEqual(
+            rc, 0,
+            f'check should refuse parallels; '
+            f'stdout={stdout!r} stderr={stderr!r}'
+        )
+        self.assertEqual(
+            rc, 63,
+            f'check on parallels should report not-supported (exit 63); '
+            f'got {rc}, stdout={stdout!r} stderr={stderr!r}'
+        )
+        self.assertIn(
+            'does not support checks', (stdout + stderr).lower(),
+            f'Expected not-supported message for parallels: '
+            f'stdout={stdout!r} stderr={stderr!r}'
+        )
+
+    def test_check_parallels_json_reports_parallels_format(self):
+        """check --output json on parallels still exits 63 and names it.
+
+        The JSON envelope is emitted (format=parallels, zero errors) but
+        the process still exits non-zero, so no caller mistakes the empty
+        result for a successful raw read.
+        """
+        image = self.get_image('parallels-v2')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_instar_check(
+            image.path, output_format='json'
+        )
+        self.assertEqual(
+            rc, 63,
+            f'check --output json on parallels should exit 63; got {rc}, '
+            f'stderr={stderr!r}'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('format', '').lower(), 'parallels',
+            f'Expected parallels format in json: {stdout}'
+        )

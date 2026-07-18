@@ -3609,6 +3609,63 @@ class TestConvertVhdToRaw(InstarTestBase):
             )
 
 
+class TestConvertParallelsToRaw(InstarTestBase):
+    """Smoke test for Parallels to raw conversion (format-coverage phase 3).
+
+    Pins the graduation of Parallels from a detect-only refusal to a real
+    read format: converting the parallels-v1 ('WithoutFreeSpace') and
+    parallels-v2 ('WithouFreSpacExt') fixtures to raw with instar must be
+    byte-identical to qemu-img convert.  Both magics are covered so the
+    per-magic off_multiplier path is exercised; the full safe-fixture
+    matrix (data-v1/v2, cluster-4k, inuse, past-eof) lands in step 3e.
+    """
+
+    def _assert_convert_parity(self, image_id):
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') \
+                as instar_raw, \
+                tempfile.NamedTemporaryFile(suffix='.raw') \
+                as qemu_raw:
+            stdout, stderr, rc = self.run_instar_convert(
+                image.path, Path(instar_raw.name), timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'instar convert failed for {image_id}: {stderr}'
+            )
+
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_convert(
+                image.path, Path(qemu_raw.name), timeout=120
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed for {image_id}: {q_stderr}'
+            )
+
+            cmp_out, _, cmp_rc = self.run_instar_compare(
+                Path(instar_raw.name),
+                Path(qemu_raw.name),
+                timeout=120
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Convert output for {image_id} differs from '
+                f'qemu-img: {cmp_out}'
+            )
+
+    def test_convert_parallels_v1(self):
+        """Convert the v1 'WithoutFreeSpace' fixture to raw (off_multiplier=1)."""
+        self._assert_convert_parity('parallels-v1')
+
+    def test_convert_parallels_v2(self):
+        """Convert the v2 'WithouFreSpacExt' fixture to raw (off_multiplier=tracks)."""
+        self._assert_convert_parity('parallels-v2')
+
+
 class TestConvertVdiToRaw(InstarTestBase):
     """Smoke test for VDI to raw conversion (format-coverage phase 2).
 
@@ -5841,10 +5898,6 @@ class TestConvertDetectOnlyRefusal(InstarTestBase):
     def test_convert_refuses_dmg(self):
         """convert refuses a dmg-simple input with the typed message."""
         self._assert_refused('dmg-simple', 'dmg')
-
-    def test_convert_refuses_parallels(self):
-        """convert refuses a parallels-v1 input with the typed message."""
-        self._assert_refused('parallels-v1', 'parallels')
 
     def test_convert_refuses_midchain_qed(self):
         """convert refuses when a qcow2 overlay's backing file is qed.

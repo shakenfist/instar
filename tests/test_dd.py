@@ -1281,6 +1281,54 @@ class TestDdInputFormats(InstarTestBase):
                 f'(instar={len(instar_bytes)} B, qemu={len(qemu_bytes)} B)',
             )
 
+    def test_input_parallels(self):
+        """dd reads a parallels input full-copy and matches qemu-img dd.
+
+        Format-coverage phase 3 graduates Parallels to a real read format;
+        phase 1 gated dd for parallels but never added a refusal test (a
+        documented gap this phase closes with positive coverage).  This
+        smoke uses parallels-v2 ('WithouFreSpacExt') and does a full-image
+        copy (no skip/count window) so the whole read path is exercised;
+        windowed and both-magic coverage is added in step 3e.
+        """
+        image = self.get_image('parallels-v2')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with (
+            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
+            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+        ):
+            stdout, stderr, rc = self.run_instar_dd(
+                [f'if={image.path}', f'of={instar_out.name}'],
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                rc, 0,
+                f'[parallels] instar dd -O raw failed: stderr={stderr!r}',
+            )
+
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_dd(
+                [f'if={image.path}', f'of={qemu_out.name}'],
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'[parallels] qemu-img dd -O raw failed: stderr={q_stderr!r}',
+            )
+
+            instar_bytes = _bytes_of(instar_out.name)
+            qemu_bytes = _bytes_of(qemu_out.name)
+            self.assertEqual(
+                instar_bytes,
+                qemu_bytes,
+                f'[parallels] instar dd output differs from qemu-img dd '
+                f'(instar={len(instar_bytes)} B, qemu={len(qemu_bytes)} B)',
+            )
+
     def test_input_vdi_windowed(self):
         """Windowed dd on a data-bearing VDI crosses a hole->data boundary.
 

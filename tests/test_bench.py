@@ -2075,3 +2075,42 @@ class TestBenchVdi(BenchTestBase):
             f'  instar: {self.header_line(i_out)!r}\n'
             f'  qemu:   {self.header_line(q_out)!r}')
         self.assertRegex(q_out.splitlines()[-1], COMPLETION_RE)
+
+
+class TestBenchParallels(BenchTestBase):
+    """Smoke test for benchmarking Parallels input (format-coverage phase 3).
+
+    Parallels graduates to a real read format for the reader-linking ops,
+    including bench (bench's Cargo.toml enables the qcow2 `parallels-input`
+    feature and its guest `read_family` allowlist gained a Parallels arm).
+    This pins that `instar bench` reads the parallels-v2 fixture
+    successfully (exit 0, well-formed header + completion line) and stays
+    header-byte-identical to `qemu-img bench`, rather than refusing it
+    with `ERROR_UNSUPPORTED_FORMAT` as before graduation.
+    """
+
+    def test_bench_parallels_v2(self):
+        """bench reads parallels-v2: exit 0, header parity with qemu-img."""
+        self._require_kvm()
+        image = self.get_image('parallels-v2')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        args = ['-c', '100', '-f', 'parallels', str(image.path)]
+
+        i_out, i_err, i_rc = self.run_instar_bench(*args)
+        self.assertEqual(
+            i_rc, 0, f'instar bench on parallels failed: stderr={i_err!r}')
+        self.assertRegex(i_out.splitlines()[-1], COMPLETION_RE)
+
+        q_out, q_err, q_rc = self.run_qemu_bench(*args)
+        self.assertEqual(
+            q_rc, 0, f'qemu-img bench on parallels failed: stderr={q_err!r}')
+
+        self.assertEqual(
+            self.header_line(i_out), self.header_line(q_out),
+            f'bench header mismatch on parallels:\n'
+            f'  instar: {self.header_line(i_out)!r}\n'
+            f'  qemu:   {self.header_line(q_out)!r}')
+        self.assertRegex(q_out.splitlines()[-1], COMPLETION_RE)
