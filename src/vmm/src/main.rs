@@ -1272,8 +1272,12 @@ fn print_info_result(
         };
         println!("disk size: {}", format_size_human(disk_size, qemu_compat));
 
-        // Line 5: cluster_size (with underscore, matching qemu-img)
-        if info.cluster_size > 0 {
+        // Line 5: cluster_size (with underscore, matching qemu-img).
+        // parallels carries a real cluster_size internally (tracks × 512,
+        // set by the info op so the chain reader chunks on cluster
+        // boundaries), but qemu-img prints no cluster_size for parallels,
+        // so suppress it by format to keep info output byte-identical.
+        if info.cluster_size > 0 && info.format != "parallels" {
             println!("cluster_size: {}", info.cluster_size);
         }
 
@@ -1651,7 +1655,11 @@ fn print_info_result_json(
     println!("    \"virtual-size\": {effective_virtual_size},");
     println!("    \"filename\": \"{}\",", escape_json_string(abs_path));
 
-    if info.cluster_size > 0 {
+    // parallels carries a real cluster_size internally (tracks × 512, set
+    // by the info op so the chain reader chunks on cluster boundaries),
+    // but qemu-img emits no cluster-size for parallels, so suppress it by
+    // format to keep the JSON byte-identical.
+    if info.cluster_size > 0 && info.format != "parallels" {
         println!("    \"cluster-size\": {},", info.cluster_size);
     }
 

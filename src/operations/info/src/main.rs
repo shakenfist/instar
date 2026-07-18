@@ -78,7 +78,9 @@ const QED_BACKING_FILENAME_SIZE_OFFSET: usize = 60; // Backing filename size (u3
 
 // Parallels format offsets (detect-and-info only; parse mirrors
 // qemu block/parallels.c). The 16-byte magic and LE u32 version @16
-// are validated by the shared detector; here we only read the size.
+// are validated by the shared detector; here we read the size and the
+// sectors-per-track count (cluster geometry for the chain reader).
+const PARALLELS_TRACKS_OFFSET: usize = 28; // LE u32 tracks (sectors/cluster)
 const PARALLELS_NB_SECTORS_OFFSET: usize = 36; // LE u64 nb_sectors (unaligned)
 
 // Bochs format offsets (detect-and-info only; parse mirrors
@@ -1142,7 +1144,8 @@ fn parse_qed_header(buffer: &[u8], result: &mut InfoResult) {
     }
 }
 
-/// Parse a Parallels header and populate the virtual size.
+/// Parse a Parallels header and populate the virtual size and cluster
+/// size.
 ///
 /// Mirrors qemu block/parallels.c: `nb_sectors` is a LE u64 at offset
 /// 36 (unaligned) and the virtual size is `nb_sectors × 512`. The
@@ -1150,10 +1153,25 @@ fn parse_qed_header(buffer: &[u8], result: &mut InfoResult) {
 /// field, so qemu masks it to the low 32 bits; the extended
 /// `WithouFreSpacExt` magic uses the full 64-bit value. Detection has
 /// already confirmed one of those two magics and version 2.
+///
+/// `tracks` (LE u32 at offset 28) is the sectors-per-cluster count, so
+/// `cluster_size = tracks × 512`. qemu-img prints no cluster_size for
+/// parallels, so the host emitters suppress it for the "parallels"
+/// format string; the value is populated here purely so the chain
+/// reader's chunking honours real parallels cluster boundaries. On the
+/// (header-impossible) `tracks × 512` overflow, cluster_size stays 0.
 fn parse_parallels_header(buffer: &[u8], result: &mut InfoResult) {
     if buffer.len() < PARALLELS_NB_SECTORS_OFFSET + 8 {
         return;
     }
+
+    let tracks = u32::from_le_bytes([
+        buffer[PARALLELS_TRACKS_OFFSET],
+        buffer[PARALLELS_TRACKS_OFFSET + 1],
+        buffer[PARALLELS_TRACKS_OFFSET + 2],
+        buffer[PARALLELS_TRACKS_OFFSET + 3],
+    ]);
+    result.cluster_size = tracks.checked_mul(512).unwrap_or(0);
 
     let mut nb_sectors = u64::from_le_bytes([
         buffer[PARALLELS_NB_SECTORS_OFFSET],
@@ -2033,6 +2051,38 @@ mod tests {
         let mut result = InfoResult::new();
         parse_parallels_header(&full[..PARALLELS_NB_SECTORS_OFFSET + 7], &mut result);
         assert_eq!(result.virtual_size, 0);
+    }
+
+    #[test]
+    fn parallels_tracks_sets_cluster_size() {
+        // tracks is the sectors-per-cluster count (LE u32 @28); the
+        // reader needs cluster_size = tracks × 512. 128 tracks -> the
+        // 64 KiB cluster of the parallels-v{1,2} fixtures; 8 tracks ->
+        // the 4 KiB cluster of parallels-cluster-4k.
+        let mut buf = parallels_header(&PARALLELS_MAGIC_V2, 4096);
+        buf[PARALLELS_TRACKS_OFFSET..PARALLELS_TRACKS_OFFSET + 4]
+            .copy_from_slice(&128u32.to_le_bytes());
+        let mut result = InfoResult::new();
+        parse_parallels_header(&buf, &mut result);
+        assert_eq!(result.cluster_size, 128 * 512);
+
+        buf[PARALLELS_TRACKS_OFFSET..PARALLELS_TRACKS_OFFSET + 4]
+            .copy_from_slice(&8u32.to_le_bytes());
+        let mut result = InfoResult::new();
+        parse_parallels_header(&buf, &mut result);
+        assert_eq!(result.cluster_size, 4096);
+    }
+
+    #[test]
+    fn parallels_tracks_overflow_leaves_zero() {
+        // tracks × 512 overflowing u32 (header-impossible) leaves
+        // cluster_size at 0 rather than wrapping.
+        let mut buf = parallels_header(&PARALLELS_MAGIC_V2, 4096);
+        buf[PARALLELS_TRACKS_OFFSET..PARALLELS_TRACKS_OFFSET + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut result = InfoResult::new();
+        parse_parallels_header(&buf, &mut result);
+        assert_eq!(result.cluster_size, 0);
     }
 
     // ------------------------------------------------------------------
