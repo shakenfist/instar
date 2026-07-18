@@ -728,3 +728,125 @@ class TestAdversarialDmgManifest(InstarTestBase):
 
     def test_convert_dmg_no_chunk_table(self):
         self._assert_convert_output_small('dmg-no-chunk-table')
+
+
+class TestAdversarialVdiManifest(InstarTestBase):
+    """Verify malformed VDI fixtures are refused cleanly (format-coverage 2).
+
+    Five fixtures each violate one of qemu's ``vdi_open`` validation
+    rules: an unsupported version (2.0), an unaligned block-map offset, a
+    non-1 MiB block size, a non-NULL parent UUID, and a blocks_in_image
+    count over the limit.  qemu refuses all five at open; instar's VDI
+    reader (the new ``vdi`` crate) must likewise refuse -- convert,
+    compare, and dd all exit non-zero with a non-empty error and without
+    hanging or crashing.  instar's own message need not match qemu's
+    string; only the exit code and clean termination are pinned.
+
+    convert and dd surface the reader init failure as an operation error
+    on stderr (``convert operation failed``); compare surfaces it as a
+    content mismatch on stdout and exits 1 -- a self-compare of a
+    malformed fixture reports a mismatch, not ``identical``, which proves
+    compare is not silently reading it as raw.  Both are clean non-zero
+    exits, so the assertion checks the combined stdout+stderr for a
+    non-empty message rather than pinning the stream.
+
+    ``info`` is deliberately NOT asserted non-zero: the info operation
+    parses the VDI header with a separate, lenient parser
+    (``parse_vdi_header``) that is out of scope for the reader
+    graduation, so it reports a plausible ``file format: vdi`` and exits
+    0.  The adversarial contract for info is only no-hang / no-crash /
+    non-empty output, matching the DMG manifest pattern above.
+
+    The zero-fill (vdi-bmap-past-eof) and disk_size round-up
+    (vdi-odd-size) rules for the *safe* fixtures are pinned by
+    successful byte-parity convert tests in
+    tests/test_convert.py::TestConvertVdiToRaw, not here.
+    """
+
+    MALFORMED_IDS = [
+        'vdi-bad-version',
+        'vdi-unaligned-bmap',
+        'vdi-wrong-blocksize',
+        'vdi-nonnull-parent',
+        'vdi-too-many-blocks',
+    ]
+
+    def _assert_vdi_refused(self, image_id):
+        """convert/compare/dd refuse cleanly; info is clean but may exit 0."""
+        image = self.get_adversarial_image(image_id)
+        instar = str(self.get_instar_binary())
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as other:
+            # A tiny raw file to compare against.
+            Path(other.name).write_bytes(bytes(512))
+
+            # convert: must refuse, non-zero, non-empty message, no hang.
+            _c_out, c_err, c_rc = self.run_adversarial(
+                [instar, 'convert', '-O', 'raw', str(image.path), out.name],
+                timeout=15,
+            )
+            self.assertNotEqual(
+                c_rc, 0,
+                f'convert should refuse malformed {image_id}',
+            )
+            self.assertTrue(
+                c_err.strip(),
+                f'convert should emit a non-empty error for {image_id}',
+            )
+
+            # compare against the raw file: must refuse, non-zero, no hang.
+            # compare reports the read failure as a mismatch on stdout, so
+            # the combined output (not just stderr) is checked non-empty.
+            m_out, m_err, m_rc = self.run_adversarial(
+                [instar, 'compare', str(image.path), other.name],
+                timeout=15,
+            )
+            self.assertNotEqual(
+                m_rc, 0,
+                f'compare should refuse malformed {image_id}',
+            )
+            self.assertTrue(
+                (m_out + m_err).strip(),
+                f'compare should emit a non-empty message for {image_id}',
+            )
+
+            # dd: must refuse, non-zero, non-empty message, no hang.
+            _d_out, d_err, d_rc = self.run_adversarial(
+                [instar, 'dd', '-O', 'raw',
+                 f'if={image.path}', f'of={out.name}'],
+                timeout=15,
+            )
+            self.assertNotEqual(
+                d_rc, 0,
+                f'dd should refuse malformed {image_id}',
+            )
+            self.assertTrue(
+                d_err.strip(),
+                f'dd should emit a non-empty error for {image_id}',
+            )
+
+            # info: no hang / no crash; lenient parser, exit code unpinned.
+            i_out, i_err, _i_rc = self.run_adversarial(
+                [instar, 'info', str(image.path)],
+                timeout=15,
+            )
+            self.assertTrue(
+                (i_out + i_err).strip(),
+                f'info should emit non-empty output for {image_id}',
+            )
+
+    def test_vdi_bad_version_refused(self):
+        self._assert_vdi_refused('vdi-bad-version')
+
+    def test_vdi_unaligned_bmap_refused(self):
+        self._assert_vdi_refused('vdi-unaligned-bmap')
+
+    def test_vdi_wrong_blocksize_refused(self):
+        self._assert_vdi_refused('vdi-wrong-blocksize')
+
+    def test_vdi_nonnull_parent_refused(self):
+        self._assert_vdi_refused('vdi-nonnull-parent')
+
+    def test_vdi_too_many_blocks_refused(self):
+        self._assert_vdi_refused('vdi-too-many-blocks')

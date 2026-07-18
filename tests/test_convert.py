@@ -3656,6 +3656,237 @@ class TestConvertVdiToRaw(InstarTestBase):
                 f'qemu-img: {cmp_out}'
             )
 
+    # ------------------------------------------------------------------
+    # Step 2e: full safe-fixture convert matrix.
+    #
+    # vdi-data-dynamic pins the non-identity block map plus a
+    # discarded-block zero-fill; vdi-static-data pins the static
+    # (identity-map) path; vdi-odd-size pins the disk_size round-up to
+    # 512 (qemu vdi_open parity); vdi-bmap-past-eof pins the past-EOF
+    # zero-fill rule.  All must be byte-identical to qemu-img convert.
+    # ------------------------------------------------------------------
+
+    def _test_vdi_convert(self, image_id):
+        """Convert a VDI image to raw and cross-validate against qemu-img."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') \
+                as instar_raw, \
+                tempfile.NamedTemporaryFile(suffix='.raw') \
+                as qemu_raw:
+            stdout, stderr, rc = self.run_instar_convert(
+                image.path, Path(instar_raw.name), timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'instar convert failed for {image_id}: {stderr}'
+            )
+
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_convert(
+                image.path, Path(qemu_raw.name), timeout=120
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed for {image_id}: {q_stderr}'
+            )
+
+            cmp_out, _, cmp_rc = self.run_instar_compare(
+                Path(instar_raw.name),
+                Path(qemu_raw.name),
+                timeout=120
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Convert output for {image_id} differs from '
+                f'qemu-img: {cmp_out}'
+            )
+
+    def test_convert_vdi_data_dynamic(self):
+        """Convert dynamic VDI with a non-identity block map to raw.
+
+        Pins the discarded-block (0xfffffffe) zero-fill: one allocated
+        entry is patched to the discarded sentinel and must read back as
+        zeros exactly like a hole.
+        """
+        self._test_vdi_convert('vdi-data-dynamic')
+
+    def test_convert_vdi_static_data(self):
+        """Convert a static (identity-map) VDI to raw."""
+        self._test_vdi_convert('vdi-static-data')
+
+    def test_convert_vdi_odd_size(self):
+        """Convert a VDI whose disk_size is not a 512 multiple.
+
+        qemu rounds disk_size up to the next 512 boundary at open; the
+        rounded virtual size drives the read, so the raw output length
+        must match qemu-img byte-for-byte.
+        """
+        self._test_vdi_convert('vdi-odd-size')
+
+    def test_convert_vdi_bmap_past_eof(self):
+        """Convert a VDI with a block-map entry pointing past EOF.
+
+        qemu never validates the file length and zero-fills reads past
+        EOF; instar must replicate, exiting 0 with that block all-zero.
+        """
+        self._test_vdi_convert('vdi-bmap-past-eof')
+
+    # ------------------------------------------------------------------
+    # Step 2e: VDI read validated through non-raw output formats.
+    #
+    # Convert vdi-data-dynamic with instar to qcow2 / vpc, flatten the
+    # instar output back to raw with qemu-img, and compare against the
+    # canonical qemu-img raw conversion of the VDI.  This isolates the
+    # VDI read path from output-format geometry quirks: qemu's vpc
+    # writer rounds the virtual size up to CHS geometry, so the flattened
+    # raws are compared on their common prefix with any tail required to
+    # be zero padding.
+    # ------------------------------------------------------------------
+
+    def _test_vdi_output_format(self, fmt):
+        """Convert vdi-data-dynamic to ``fmt`` and validate the read path."""
+        image = self.get_image('vdi-data-dynamic')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as ref_raw, \
+                tempfile.NamedTemporaryFile(suffix=f'.{fmt}') as instar_out, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as flat_raw:
+            # Canonical raw view of the VDI, produced by qemu-img.
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_convert(
+                image.path, Path(ref_raw.name), timeout=120
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert to raw failed for vdi-data-dynamic: '
+                f'{q_stderr}'
+            )
+
+            # instar: VDI -> fmt.
+            stdout, stderr, rc = self.run_instar_convert(
+                image.path, Path(instar_out.name),
+                output_format=fmt, timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'instar convert vdi-data-dynamic -> {fmt} failed: {stderr}'
+            )
+
+            # Flatten instar's structured output back to raw with qemu-img.
+            result = subprocess.run(
+                ['qemu-img', 'convert', '-O', 'raw',
+                 instar_out.name, flat_raw.name],
+                capture_output=True, text=True, timeout=120
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img flatten of instar {fmt} output failed: '
+                f'{result.stderr}'
+            )
+
+            ref_bytes = Path(ref_raw.name).read_bytes()
+            flat_bytes = Path(flat_raw.name).read_bytes()
+            n = min(len(ref_bytes), len(flat_bytes))
+            self.assertEqual(
+                ref_bytes[:n], flat_bytes[:n],
+                f'instar {fmt} output (flattened) differs from qemu raw '
+                f'for vdi-data-dynamic in the common prefix'
+            )
+            self.assertFalse(
+                any(ref_bytes[n:]) or any(flat_bytes[n:]),
+                f'non-zero tail beyond common prefix for {fmt} '
+                f'(ref={len(ref_bytes)} flat={len(flat_bytes)})'
+            )
+
+    def test_convert_vdi_to_qcow2(self):
+        """Convert vdi-data-dynamic to qcow2 and validate the VDI read path."""
+        self._test_vdi_output_format('qcow2')
+
+    def test_convert_vdi_to_vpc(self):
+        """Convert vdi-data-dynamic to vpc and validate the VDI read path."""
+        self._test_vdi_output_format('vpc')
+
+    def test_convert_vdi_backing_chain(self):
+        """Convert a qcow2 overlay backed by a VDI and match qemu-img.
+
+        Builds ``overlay.qcow2`` with ``qemu-img create -b <vdi> -F vdi``
+        in the test tmpdir (the VDI is copied in first because instar
+        only reads backing files inside the overlay's directory), writes
+        a small overlay pattern over a region that is a hole in the
+        backing VDI, then asserts instar and qemu-img produce identical
+        raw output for the composed chain.
+        """
+        image = self.get_image('vdi-data-dynamic')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        if not shutil.which('qemu-io'):
+            self.skipTest('qemu-io not available')
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            backing = os.path.join(tmpdir, 'backing.vdi')
+            overlay = os.path.join(tmpdir, 'overlay.qcow2')
+            shutil.copyfile(str(image.path), backing)
+
+            # Verify the tested qemu accepts -F vdi before relying on it.
+            create = subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-b', 'backing.vdi', '-F', 'vdi', 'overlay.qcow2'],
+                capture_output=True, text=True, timeout=60, cwd=tmpdir
+            )
+            if create.returncode != 0:
+                self.skipTest(
+                    f'qemu-img does not accept -F vdi backing format: '
+                    f'{create.stderr}'
+                )
+
+            # Write a 64 KiB overlay pattern at guest 5 MiB, which is a
+            # hole in the backing VDI (data lives at 2 MiB), so the
+            # composed view mixes overlay and backing data.
+            io = subprocess.run(
+                ['qemu-io', '-c', 'write -P 0xAB 5242880 65536', overlay],
+                capture_output=True, text=True, timeout=60
+            )
+            self.assertEqual(
+                io.returncode, 0,
+                f'qemu-io overlay write failed: {io.stderr}'
+            )
+
+            instar_raw = os.path.join(tmpdir, 'instar.raw')
+            qemu_raw = os.path.join(tmpdir, 'qemu.raw')
+
+            stdout, stderr, rc = self.run_instar_convert(
+                Path(overlay), Path(instar_raw), timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'instar convert of qcow2-over-vdi chain failed: {stderr}'
+            )
+
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_convert(
+                Path(overlay), Path(qemu_raw), timeout=120
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert of qcow2-over-vdi chain failed: '
+                f'{q_stderr}'
+            )
+
+            self.assertEqual(
+                Path(instar_raw).read_bytes(),
+                Path(qemu_raw).read_bytes(),
+                'instar convert of qcow2-over-vdi chain differs from '
+                'qemu-img'
+            )
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 class TestConvertVhdCompare(InstarTestBase):
     """Test comparing VHD images against raw equivalents.

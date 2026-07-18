@@ -1281,6 +1281,66 @@ class TestDdInputFormats(InstarTestBase):
                 f'(instar={len(instar_bytes)} B, qemu={len(qemu_bytes)} B)',
             )
 
+    def test_input_vdi_windowed(self):
+        """Windowed dd on a data-bearing VDI crosses a hole->data boundary.
+
+        vdi-data-dynamic holds a 1 MiB data block at guest 2 MiB
+        (block 32 at bs=65536); blocks 30-31 are holes.  qemu-img dd's
+        ``count`` is an absolute end position in blocks (bytes copied =
+        (count - skip) * bs), so skip=30 count=34 reads blocks [30, 34):
+        two hole blocks then two data blocks.  This pins the
+        unallocated->allocated transition in the read path against
+        qemu-img dd byte-for-byte.
+        """
+        image = self.get_image('vdi-data-dynamic')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        window = ['bs=65536', 'skip=30', 'count=34']
+        with (
+            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
+            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+        ):
+            stdout, stderr, rc = self.run_instar_dd(
+                [f'if={image.path}', f'of={instar_out.name}'] + window,
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                rc, 0,
+                f'[vdi-window] instar dd -O raw failed: stderr={stderr!r}',
+            )
+
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_dd(
+                [f'if={image.path}', f'of={qemu_out.name}'] + window,
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'[vdi-window] qemu-img dd -O raw failed: stderr={q_stderr!r}',
+            )
+
+            instar_bytes = _bytes_of(instar_out.name)
+            qemu_bytes = _bytes_of(qemu_out.name)
+            self.assertEqual(
+                instar_bytes,
+                qemu_bytes,
+                f'[vdi-window] instar dd output differs from qemu-img dd '
+                f'(instar={len(instar_bytes)} B, qemu={len(qemu_bytes)} B)',
+            )
+            # Sanity: the window really straddles the boundary -- the first
+            # two blocks are a hole (zeros) and the last two carry data.
+            self.assertFalse(
+                any(instar_bytes[:131072]),
+                '[vdi-window] first half of window should be a hole (zeros)',
+            )
+            self.assertTrue(
+                any(instar_bytes[131072:]),
+                '[vdi-window] second half of window should carry data',
+            )
+
     def test_input_backing_chain_qcow2(self):
         """dd composes a qcow2 backing chain and matches qemu-img dd byte-for-byte.
 

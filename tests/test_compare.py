@@ -1283,3 +1283,61 @@ class TestCompareVdi(InstarTestBase):
                 f'stdout={stdout!r} stderr={stderr!r}'
             )
             self.assertIn('identical', (stdout + stderr).lower())
+
+    def test_compare_vdi_vs_vdi_identical(self):
+        """compare vdi-data-dynamic against a qemu-img vdi copy of itself.
+
+        Round-tripping the fixture through ``qemu-img convert -O vdi``
+        re-encodes the same virtual content into a fresh VDI (different
+        on-disk block map ordering), so an identical result exercises the
+        VDI read path on both sides of the compare.
+        """
+        image = self.get_image('vdi-data-dynamic')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.vdi') as vdi_copy:
+            result = subprocess.run(
+                ['qemu-img', 'convert', '-O', 'vdi',
+                 str(image.path), vdi_copy.name],
+                capture_output=True, text=True, timeout=120
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img convert to vdi failed: {result.stderr}'
+            )
+
+            stdout, stderr, rc = self.run_instar_compare(
+                image.path, Path(vdi_copy.name), timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'compare vdi-data-dynamic vs its vdi copy should be '
+                f'identical; stdout={stdout!r} stderr={stderr!r}'
+            )
+            self.assertIn('identical', (stdout + stderr).lower())
+
+    def test_compare_vdi_vs_vdi_differs(self):
+        """compare two different VDI images reports a mismatch (exit 1).
+
+        vdi-data-dynamic (8 MiB, data at 2 MiB) and vdi-static-data
+        (3 MiB, data in a middle block) differ in both size and content,
+        so compare must exit 1 like qemu-img compare.
+        """
+        img_a = self.get_image('vdi-data-dynamic')
+        img_b = self.get_image('vdi-static-data')
+        for img in (img_a, img_b):
+            if not img.path.exists():
+                self.skipTest(f'Image not found: {img.path}')
+            self.skip_if_hash_mismatch(img)
+
+        stdout, stderr, rc = self.run_instar_compare(
+            img_a.path, img_b.path, timeout=120
+        )
+        self.assertEqual(
+            rc, 1,
+            f'compare of differing VDI images should exit 1; '
+            f'rc={rc} stdout={stdout!r} stderr={stderr!r}'
+        )
+        self.assertIn('mismatch', (stdout + stderr).lower())
