@@ -124,6 +124,20 @@ OSLO_SKIP_IMAGES = {
     'vdi-wrong-blocksize',
     'vdi-nonnull-parent',
     'vdi-too-many-blocks',
+    # Malformed Parallels header fixtures (format-coverage phase 3,
+    # PLAN-format-coverage-phase-03-parallels-read.md). Like the malformed
+    # VDI/DMG fixtures above they are safety: "malformed", run_in_ci: true, so
+    # they are enrolled by _generate_scenarios and need an explicit skip.
+    # oslo.utils ships no Parallels inspector, so it falls back to
+    # RawFileInspector (format_match unconditionally True) and reports every
+    # one as a safely-openable 'raw' image, while qemu (and instar after
+    # graduation) refuse each at open (zero tracks, too-big cluster, catalog
+    # too large, bad format-extension magic). Cross-validating oslo's blind
+    # acceptance against instar's refusal is not meaningful.
+    'parallels-zero-tracks',
+    'parallels-huge-tracks',
+    'parallels-huge-catalog',
+    'parallels-ext-bad-magic',
 }
 
 # Format name mapping: instar -> oslo.utils.
@@ -163,6 +177,15 @@ KNOWN_FORMAT_DIVERGENCES = {
     # src/shared/src/format_detection.rs) and reports the real format.
     'parallels-v1': ('parallels', 'raw'),
     'parallels-v2': ('parallels', 'raw'),
+    # Format-coverage phase 3 (PLAN-format-coverage-phase-03-parallels-read.md):
+    # the five new safe Parallels fixtures detect the same way as the two
+    # existing parallels-v1/v2 images -- oslo has no Parallels inspector and
+    # falls back to RawFileInspector ('raw'), while instar reports 'parallels'.
+    'parallels-data-v2': ('parallels', 'raw'),
+    'parallels-data-v1': ('parallels', 'raw'),
+    'parallels-inuse': ('parallels', 'raw'),
+    'parallels-bat-past-eof': ('parallels', 'raw'),
+    'parallels-cluster-4k': ('parallels', 'raw'),
     'bochs-growing': ('bochs', 'raw'),
     'cloop-simple': ('cloop', 'raw'),
     'dmg-simple': ('dmg', 'raw'),
@@ -223,6 +246,24 @@ KNOWN_VSIZE_DIVERGENCES = {
     # numbers rather than being asserted at runtime.
     'parallels-v1': (262144, 2 * 1024 * 1024),
     'parallels-v2': (262144, 2 * 1024 * 1024),
+    # Format-coverage phase 3 (PLAN-format-coverage-phase-03-parallels-read.md):
+    # the five new safe Parallels fixtures follow the same oslo rule as
+    # parallels-v1/v2 -- RawFileInspector.virtual_size is min(file_size,
+    # 262144), i.e. however many bytes oslo's detection loop consumed before
+    # settling on 'raw' (capped at its first 262144 B read chunk), while instar
+    # reports the real virtual size parsed from the Parallels header
+    # (nb_sectors * 512). The four 327680 B images stop oslo at the 262144 B
+    # cap; parallels-cluster-4k (20480 B on disk) fits entirely in the first
+    # read chunk, so oslo returns its whole 20480 B file length. Because these
+    # five are also KNOWN_FORMAT_DIVERGENCES entries, TestOsloVirtualSize skips
+    # them before reaching this dict, so (like parallels-v1/v2 above) the pairs
+    # are a documented, verified reference rather than a runtime assertion.
+    # Values captured from a live oslo.utils run against the staged fixtures.
+    'parallels-data-v2': (262144, 2 * 1024 * 1024),
+    'parallels-data-v1': (262144, 2 * 1024 * 1024),
+    'parallels-inuse': (262144, 2 * 1024 * 1024),
+    'parallels-bat-past-eof': (262144, 2 * 1024 * 1024),
+    'parallels-cluster-4k': (20480, 256 * 1024),
     'bochs-growing': (2560, 1032192),
     'cloop-simple': (1690, 1024 * 1024),
     'dmg-simple': (11747, 4 * 1024 * 1024),
