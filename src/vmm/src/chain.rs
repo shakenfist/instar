@@ -36,6 +36,8 @@ pub enum ImageFormat {
     Vhd,
     /// VHDX format
     Vhdx,
+    /// VDI format (VirtualBox Disk Image)
+    Vdi,
     /// LUKS encrypted container
     Luks,
     /// VMDK monolithicFlat descriptor file (text, points to a
@@ -56,6 +58,7 @@ impl ImageFormat {
             "vmdk3" => ImageFormat::Vmdk3,
             "vpc" => ImageFormat::Vhd,
             "vhdx" => ImageFormat::Vhdx,
+            "vdi" => ImageFormat::Vdi,
             "luks" => ImageFormat::Luks,
             _ => ImageFormat::Unknown,
         }
@@ -81,6 +84,7 @@ impl ImageFormat {
             ImageFormat::Vhd => 5,
             ImageFormat::Vhdx => 6,
             ImageFormat::Qcow1 => 7,
+            ImageFormat::Vdi => 8,
             ImageFormat::Luks => 11,
             ImageFormat::VmdkDescriptor => 12,
         }
@@ -97,6 +101,7 @@ impl std::fmt::Display for ImageFormat {
             ImageFormat::Vmdk3 => write!(f, "vmdk3"),
             ImageFormat::Vhd => write!(f, "vpc"),
             ImageFormat::Vhdx => write!(f, "vhdx"),
+            ImageFormat::Vdi => write!(f, "vdi"),
             ImageFormat::Luks => write!(f, "luks"),
             // Reports as "vmdk" to match qemu-img info output for
             // monolithicFlat — matches the `name()` method on

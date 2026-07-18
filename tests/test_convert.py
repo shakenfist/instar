@@ -3609,6 +3609,54 @@ class TestConvertVhdToRaw(InstarTestBase):
             )
 
 
+class TestConvertVdiToRaw(InstarTestBase):
+    """Smoke test for VDI to raw conversion (format-coverage phase 2).
+
+    Pins the graduation of VDI from a detect-only refusal to a real read
+    format: converting the aligned vdi-simple fixture to raw with instar
+    must be byte-identical to qemu-img convert.  The full safe-fixture
+    matrix (data/static/odd-size/past-eof) is covered in step 2e.
+    """
+
+    def test_convert_vdi_simple(self):
+        """Convert the empty dynamic vdi-simple fixture to raw."""
+        image = self.get_image('vdi-simple')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') \
+                as instar_raw, \
+                tempfile.NamedTemporaryFile(suffix='.raw') \
+                as qemu_raw:
+            stdout, stderr, rc = self.run_instar_convert(
+                image.path, Path(instar_raw.name), timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'instar convert failed for vdi-simple: {stderr}'
+            )
+
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_convert(
+                image.path, Path(qemu_raw.name), timeout=120
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed for vdi-simple: {q_stderr}'
+            )
+
+            cmp_out, _, cmp_rc = self.run_instar_compare(
+                Path(instar_raw.name),
+                Path(qemu_raw.name),
+                timeout=120
+            )
+            self.assertEqual(
+                cmp_rc, 0,
+                f'Convert output for vdi-simple differs from '
+                f'qemu-img: {cmp_out}'
+            )
+
+
 class TestConvertVhdCompare(InstarTestBase):
     """Test comparing VHD images against raw equivalents.
 
@@ -5514,8 +5562,8 @@ class TestConvertVhdxBlockSize(InstarTestBase):
 class TestConvertDetectOnlyRefusal(InstarTestBase):
     """convert refuses detect-only input formats instead of reading raw.
 
-    qed and vdi are detected and sized by `instar info` but have no read
-    path; convert must refuse them with a typed error rather than silently
+    qed is detected and sized by `instar info` but has no read
+    path; convert must refuse it with a typed error rather than silently
     reading the container bytes as raw (issue #444).  iso is deliberately
     exempt (its container bytes *are* its content; qemu-img converts ISOs
     as raw), so its raw pass-through is pinned here explicitly.
@@ -5550,10 +5598,6 @@ class TestConvertDetectOnlyRefusal(InstarTestBase):
     def test_convert_refuses_qed(self):
         """convert refuses a qed input with the typed message."""
         self._assert_refused('qed-simple', 'qed')
-
-    def test_convert_refuses_vdi(self):
-        """convert refuses a vdi input with the typed message."""
-        self._assert_refused('vdi-simple', 'vdi')
 
     def test_convert_refuses_bochs(self):
         """convert refuses a bochs-growing input with the typed message."""

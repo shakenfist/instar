@@ -1194,8 +1194,8 @@ class TestCompareDetectOnlyRefusal(InstarTestBase):
     """compare refuses detect-only input formats instead of reading raw.
 
     Without the refusal gate compare would report "Images are identical."
-    for a qed/vdi file compared with itself (both read as raw), masking
-    that neither container is actually read (issue #444).  iso keeps its
+    for a qed file compared with itself (both read as raw), masking
+    that the container is not actually read (issue #444).  iso keeps its
     raw pass-through per the post-1a management decision.
     """
 
@@ -1226,10 +1226,6 @@ class TestCompareDetectOnlyRefusal(InstarTestBase):
         """compare refuses a qed input with the typed message."""
         self._assert_refused('qed-simple', 'qed')
 
-    def test_compare_refuses_vdi(self):
-        """compare refuses a vdi input with the typed message."""
-        self._assert_refused('vdi-simple', 'vdi')
-
     def test_compare_refuses_bochs(self):
         """compare refuses a bochs-growing input with the typed message."""
         self._assert_refused('bochs-growing', 'bochs')
@@ -1251,3 +1247,39 @@ class TestCompareDetectOnlyRefusal(InstarTestBase):
             f'iso compare should succeed; stderr={stderr!r}'
         )
         self.assertIn('identical', (stdout + stderr).lower())
+
+
+class TestCompareVdi(InstarTestBase):
+    """Smoke test for comparing VDI input (format-coverage phase 2).
+
+    Pins the graduation of VDI from a detect-only refusal to a real read
+    format: comparing the aligned vdi-simple fixture against its own
+    qemu-img raw conversion must report identical content and exit 0.
+    The full VDI compare matrix is covered in step 2e.
+    """
+
+    def test_compare_vdi_simple_vs_raw(self):
+        """compare vdi-simple against its qemu-img raw conversion."""
+        image = self.get_image('vdi-simple')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_convert(
+                image.path, Path(qemu_raw.name), timeout=120
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed for vdi-simple: {q_stderr}'
+            )
+
+            stdout, stderr, rc = self.run_instar_compare(
+                image.path, Path(qemu_raw.name), timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'compare vdi-simple vs raw should be identical; '
+                f'stdout={stdout!r} stderr={stderr!r}'
+            )
+            self.assertIn('identical', (stdout + stderr).lower())

@@ -1235,6 +1235,52 @@ class TestDdInputFormats(InstarTestBase):
             )
             self._assert_input_fmt_parity(vhdx.name, 'vhdx', label='vhdx')
 
+    def test_input_vdi(self):
+        """dd reads a vdi input full-copy and matches qemu-img dd byte-for-byte.
+
+        Format-coverage phase 2 graduates VDI to a real read format.  This
+        smoke test uses the aligned vdi-simple fixture and does a full-image
+        copy (no skip/count window) so the whole read path is exercised;
+        windowed and data-bearing VDI coverage is added in step 2e.
+        """
+        image = self.get_image('vdi-simple')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with (
+            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
+            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+        ):
+            stdout, stderr, rc = self.run_instar_dd(
+                [f'if={image.path}', f'of={instar_out.name}'],
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                rc, 0,
+                f'[vdi] instar dd -O raw failed: stderr={stderr!r}',
+            )
+
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_dd(
+                [f'if={image.path}', f'of={qemu_out.name}'],
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'[vdi] qemu-img dd -O raw failed: stderr={q_stderr!r}',
+            )
+
+            instar_bytes = _bytes_of(instar_out.name)
+            qemu_bytes = _bytes_of(qemu_out.name)
+            self.assertEqual(
+                instar_bytes,
+                qemu_bytes,
+                f'[vdi] instar dd output differs from qemu-img dd '
+                f'(instar={len(instar_bytes)} B, qemu={len(qemu_bytes)} B)',
+            )
+
     def test_input_backing_chain_qcow2(self):
         """dd composes a qcow2 backing chain and matches qemu-img dd byte-for-byte.
 
@@ -1381,8 +1427,8 @@ class TestDdInputFormats(InstarTestBase):
 class TestDdDetectOnlyRefusal(InstarTestBase):
     """dd refuses detect-only input formats instead of reading raw.
 
-    qed and vdi are detected/sized by info but have no read path; dd must
-    refuse them rather than emitting the container bytes plus zero padding
+    qed is detected/sized by info but has no read path; dd must
+    refuse it rather than emitting the container bytes plus zero padding
     (issue #444).  iso keeps its raw pass-through per the post-1a
     management decision (exact-length output, no sector padding).
     """
@@ -1416,10 +1462,6 @@ class TestDdDetectOnlyRefusal(InstarTestBase):
     def test_dd_refuses_qed(self):
         """dd refuses a qed input with the typed message."""
         self._assert_refused('qed-simple', 'qed')
-
-    def test_dd_refuses_vdi(self):
-        """dd refuses a vdi input with the typed message."""
-        self._assert_refused('vdi-simple', 'vdi')
 
     def test_dd_refuses_bochs(self):
         """dd refuses a bochs-growing input with the typed message."""

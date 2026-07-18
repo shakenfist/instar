@@ -2069,3 +2069,68 @@ class TestCheckQcow2Snapshots(InstarTestBase):
             'Snapshot count', stdout,
             f'Should not report snapshots: {stdout}'
         )
+
+
+class TestCheckVdiRefusal(InstarTestBase):
+    """check has no VDI support and must refuse it cleanly.
+
+    Format-coverage phase 2 graduates VDI to a real *read* format for
+    convert/compare/dd/bench, which lifts the phase-1 host gate for
+    every op that discovers a backing chain -- including check.  But
+    check does not link the chain reader; its own format dispatch has
+    no VDI arm.  This pins that check fails cleanly (non-zero exit,
+    "does not support checks" message) rather than silently reading the
+    VDI container as raw or hanging.  Real qemu-img-style VDI check
+    (bmap validation) is future work.
+    """
+
+    def test_check_refuses_vdi(self):
+        """check on vdi-simple exits 63 with the not-supported message."""
+        image = self.get_image('vdi-simple')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_instar_check(
+            image.path, output_format='human'
+        )
+        self.assertNotEqual(
+            rc, 0,
+            f'check should refuse vdi; stdout={stdout!r} stderr={stderr!r}'
+        )
+        self.assertEqual(
+            rc, 63,
+            f'check on vdi should report not-supported (exit 63); '
+            f'got {rc}, stdout={stdout!r} stderr={stderr!r}'
+        )
+        self.assertIn(
+            'does not support checks', (stdout + stderr).lower(),
+            f'Expected not-supported message for vdi: '
+            f'stdout={stdout!r} stderr={stderr!r}'
+        )
+
+    def test_check_vdi_json_reports_vdi_format(self):
+        """check --output json on vdi still exits 63 and names vdi.
+
+        The JSON envelope is emitted (format=vdi, zero errors) but the
+        process still exits non-zero, so no caller mistakes the empty
+        result for a successful raw read.
+        """
+        image = self.get_image('vdi-simple')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_instar_check(
+            image.path, output_format='json'
+        )
+        self.assertEqual(
+            rc, 63,
+            f'check --output json on vdi should exit 63; got {rc}, '
+            f'stderr={stderr!r}'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('format', '').lower(), 'vdi',
+            f'Expected vdi format in json: {stdout}'
+        )
