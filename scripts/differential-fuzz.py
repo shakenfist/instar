@@ -49,7 +49,7 @@ from helpers.snapshot_readback import snapshot_readback  # noqa: E402
 # Constants
 # ---------------------------------------------------------------------------
 
-FORMATS = ['qcow2', 'raw', 'vmdk', 'vpc', 'vdi']
+FORMATS = ['qcow2', 'raw', 'vmdk', 'vpc', 'vdi', 'parallels']
 OUTPUT_FORMATS = ['qcow2', 'raw', 'vmdk', 'vpc']
 VIRTUAL_SIZES = ['1M', '4M', '16M', '64M', '256M', '1G']
 QCOW2_CLUSTER_SIZES = [512, 4096, 65536, 262144, 2097152]
@@ -151,6 +151,19 @@ def generate_image(rng, workdir, iteration):
         attrs['static'] = static
         if static:
             cmd.extend(['-o', 'static=on'])
+
+    if fmt == 'parallels':
+        # Parallels' cluster size (tracks * 512) is user-settable via
+        # -o cluster_size (qemu-img default is 1 MiB, tracks=2048);
+        # instar's reader derives cluster boundaries from it, so pick
+        # a non-default value -- including small ones that exercise
+        # chunk-boundary handling -- some of the time
+        # (PLAN-format-coverage-phase-03-parallels-read.md step 3f),
+        # mirroring the vdi static=on branch above.
+        if rng.random() < 0.3:
+            cluster_size = rng.choice([4096, 65536, 1048576])
+            attrs['cluster_size'] = cluster_size
+            cmd.extend(['-o', f'cluster_size={cluster_size}'])
 
     cmd.extend([str(image_path), vsize])
 
@@ -1018,14 +1031,15 @@ def op_measure(instar_bin, instar_copy, qemu_copy, fmt,
     """Run instar measure and compare to qemu-img measure (raw/qcow2)
     or instar convert's actual output size (vmdk/vpc/vhdx).
 
-    VDI sources are gated out: `measure` is out of scope for the VDI
-    read path (PLAN-format-coverage-phase-02-vdi-read.md "Out of
+    VDI and Parallels sources are gated out: `measure` is out of scope
+    for both read paths (PLAN-format-coverage-phase-02-vdi-read.md and
+    PLAN-format-coverage-phase-03-parallels-read.md, both "Out of
     scope" — measure isn't one of the four reader-linking ops that
-    gained vdi-input), so instar refuses a VDI source while qemu-img
-    measure succeeds. Comparing would be a spurious
-    exit_code_divergence, not a real instar defect.
+    gained vdi-input / parallels-input), so instar refuses a VDI or
+    Parallels source while qemu-img measure succeeds. Comparing would
+    be a spurious exit_code_divergence, not a real instar defect.
     """
-    if fmt == 'vdi':
+    if fmt in ('vdi', 'parallels'):
         return None
 
     # Pick a target format.
@@ -3519,18 +3533,20 @@ def op_map(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
     docs/quirks.md) that would noise-flood the fuzzer. The same
     posture as `op_info`'s raw skip.
 
-    VDI is gated out too: instar refuses `map` on VDI sources
-    (guest-side ERROR_INVALID_SOURCE — map is out of scope for the
-    VDI read path, PLAN-format-coverage-phase-02-vdi-read.md "Out of
+    VDI and Parallels are gated out too: instar refuses `map` on VDI
+    and Parallels sources (guest-side ERROR_INVALID_SOURCE — map is
+    out of scope for both read paths,
+    PLAN-format-coverage-phase-02-vdi-read.md and
+    PLAN-format-coverage-phase-03-parallels-read.md, both "Out of
     scope") while qemu-img map succeeds, which would be a spurious
-    exit_code_divergence on every VDI iteration rather than a real
-    instar defect.
+    exit_code_divergence on every VDI/Parallels iteration rather than
+    a real instar defect.
 
     Other format-level divergences (chain qcow2 refused, vmdk
     multi-extent refused, vhdx partial-present) don't fire here
     because generate_image() never produces those shapes.
     """
-    if fmt in ('raw', 'vdi'):
+    if fmt in ('raw', 'vdi', 'parallels'):
         return None
 
     virtual_size = _map_probe_virtual_size(qemu_copy, timeout)
