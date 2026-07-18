@@ -109,6 +109,21 @@ OSLO_SKIP_IMAGES = {
     'dmg-sectorcount-negative',
     'dmg-sectorcount-huge',
     'dmg-no-chunk-table',
+    # Malformed VDI header fixtures (format-coverage phase 2). Like the
+    # malformed DMG fixtures above they are safety: "malformed",
+    # run_in_ci: true, so they are enrolled by _generate_scenarios and
+    # need an explicit skip. oslo.utils' VDIInspector only reads the
+    # signature (0x40) and disk_size (0x170); it does not validate the
+    # version, block-map offset, block size, parent UUID, or block count,
+    # so it detects all five as safe 'vdi' with a plausible virtual size.
+    # qemu (and instar after graduation) refuse every one of them at open,
+    # so cross-validating oslo's blind acceptance against instar's refusal
+    # is not meaningful.
+    'vdi-bad-version',
+    'vdi-unaligned-bmap',
+    'vdi-wrong-blocksize',
+    'vdi-nonnull-parent',
+    'vdi-too-many-blocks',
 }
 
 # Format name mapping: instar -> oslo.utils.
@@ -211,6 +226,15 @@ KNOWN_VSIZE_DIVERGENCES = {
     'bochs-growing': (2560, 1032192),
     'cloop-simple': (1690, 1024 * 1024),
     'dmg-simple': (11747, 4 * 1024 * 1024),
+    # Format-coverage phase 2 (PLAN-format-coverage-phase-02-vdi-read.md):
+    # vdi-odd-size has its VDI header disk_size patched to 1048577, a non-512
+    # multiple. oslo.utils' VDIInspector reports the raw disk_size u64 verbatim
+    # (1048577), while qemu's vdi_open rounds an odd disk_size up to the next
+    # 512 boundary (1049088) and instar mirrors that round-up for byte parity.
+    # This entry is asserted at runtime (vdi-odd-size is NOT a
+    # KNOWN_FORMAT_DIVERGENCES entry), so both tools must keep reporting these
+    # exact values or the test fails and forces a re-evaluation.
+    'vdi-odd-size': (1048577, 1049088),
 }
 
 
