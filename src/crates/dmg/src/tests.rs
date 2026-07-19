@@ -8,6 +8,7 @@
 //! lookups simply echo the composed host offsets.
 
 use super::*;
+use core::sync::atomic::{AtomicU64, Ordering};
 use shared::{write_be_u32, write_be_u64};
 use std::string::String;
 use std::sync::Mutex;
@@ -194,6 +195,13 @@ const MOCK_LEN: usize = 2 * 1024 * 1024;
 static MOCK_LOCK: Mutex<()> = Mutex::new(());
 static mut MOCK_IMAGE: [u8; MOCK_LEN] = [0u8; MOCK_LEN];
 
+// A single sector index whose read the failing mock (`mock_read_fail`)
+// refuses; `u64::MAX` disables it. Used to reach the staged-region
+// read-failure path while letting the koly read (a different sector)
+// succeed. Only consulted by `mock_read_fail`, so the default mock is
+// unaffected.
+static MOCK_FAIL_SECTOR: AtomicU64 = AtomicU64::new(u64::MAX);
+
 unsafe extern "C" fn mock_read_input_sector(
     _device_idx: u32,
     sector: u64,
@@ -210,6 +218,20 @@ unsafe extern "C" fn mock_read_input_sector(
     let src = core::ptr::addr_of!(MOCK_IMAGE) as *const u8;
     core::ptr::copy_nonoverlapping(src.add(start), out_buf, sector_size);
     true
+}
+
+/// Like [`mock_read_input_sector`] but refuses the one sector recorded in
+/// [`MOCK_FAIL_SECTOR`], modelling a device read that fails mid-parse.
+unsafe extern "C" fn mock_read_fail(
+    device_idx: u32,
+    sector: u64,
+    out_buf: *mut u8,
+    sector_size: usize,
+) -> bool {
+    if sector == MOCK_FAIL_SECTOR.load(Ordering::Relaxed) {
+        return false;
+    }
+    mock_read_input_sector(device_idx, sector, out_buf, sector_size)
 }
 
 /// Install an image into the mock buffer and return (guard, capacity).
@@ -434,6 +456,33 @@ impl Harness {
             self.scratch.len(),
             &mut br,
         )
+    }
+
+    /// Init while device sector `fail_sector` refuses reads (all other
+    /// sectors serve `bytes` normally). Lets a test fail a staged-region
+    /// read while the koly read — which touches different sectors — still
+    /// succeeds.
+    unsafe fn init_failing(
+        &mut self,
+        bytes: &[u8],
+        fail_sector: u64,
+    ) -> Result<DmgState, DmgRefusal> {
+        let (_guard, cap) = install_image(bytes);
+        MOCK_FAIL_SECTOR.store(fail_sector, Ordering::Relaxed);
+        let mut ct = stub_call_table();
+        ct.read_input_sector = mock_read_fail;
+        let mut br = 0u64;
+        let r = DmgState::init(
+            &ct,
+            0,
+            512,
+            cap,
+            self.scratch.as_mut_ptr(),
+            self.scratch.len(),
+            &mut br,
+        );
+        MOCK_FAIL_SECTOR.store(u64::MAX, Ordering::Relaxed);
+        r
     }
 }
 
@@ -1297,4 +1346,151 @@ fn lookup_exact_chunk_boundaries() {
         }
         other => panic!("expected raw, got {other:?}"),
     }
+}
+
+// ============================================================================
+// read-failure and arithmetic-overflow refusals (pre-push audit coverage)
+//
+// These fill in the four DmgRefusal variants the earlier suite did not
+// exercise directly: KolyRead, RegionReadFailed, ArithmeticOverflow (several
+// call sites), and KolyFieldOutOfRange (a provably-unreachable backstop, so
+// its underlying shared-helper contract is pinned instead).
+// ============================================================================
+
+#[test]
+fn init_koly_read_failure() {
+    // A capacity larger than the mock's physical buffer places the koly
+    // trailer read past MOCK_LEN, so `read_input_sector` returns false and
+    // read_koly attributes KolyRead (distinct from TrailerNotFound, which is
+    // a successful read with no koly magic).
+    let img = simple_zlib_image();
+    let mut h = Harness::new();
+    // MOCK_LEN / 512 == 4096 sectors; 5000 forces the last-sector read past
+    // the end of the physical mock buffer.
+    let r = unsafe { h.init_cap(&img, 5000) };
+    assert_eq!(r, Err(DmgRefusal::KolyRead));
+}
+
+#[test]
+fn init_region_read_failure_mid_parse() {
+    // Build a plist image whose <data> region lives in device sector 1 but
+    // whose koly sits far later (sector 10). A mock that fails ONLY sector 1
+    // lets the koly read (sectors 9 and 10) succeed, then trips when
+    // stage_region reads the plist region → RegionReadFailed.
+    let mish = build_mish(0, 0, &[ChunkSpec::new(CHUNK_ZLIB, 0, 8, 4096, 100)]);
+    let mut xml = String::from("<data>");
+    xml.push_str(&base64_encode(&mish));
+    xml.push_str("</data>");
+    let xml_bytes = xml.into_bytes();
+    let xml_offset = 512usize; // sector 1
+    let koly_offset = 512 * 10usize; // sector 10, well past the region
+    assert!(xml_offset + xml_bytes.len() <= koly_offset);
+    let total = koly_offset + 512;
+    let mut bytes = std::vec![0u8; total];
+    bytes[xml_offset..xml_offset + xml_bytes.len()].copy_from_slice(&xml_bytes);
+    let koly = build_koly(&KolySpec {
+        magic: true,
+        data_fork_offset: 0,
+        rsrc_fork_offset: 0,
+        rsrc_fork_length: 0,
+        xml_offset: xml_offset as u64,
+        xml_length: xml_bytes.len() as u64,
+        sector_count: 8,
+    });
+    bytes[koly_offset..koly_offset + 512].copy_from_slice(&koly);
+    let mut h = Harness::new();
+    assert_eq!(
+        unsafe { h.init_failing(&bytes, 1) },
+        Err(DmgRefusal::RegionReadFailed)
+    );
+}
+
+#[test]
+fn init_arithmetic_overflow_virtual_size() {
+    // koly SectorCount with the top bit clear (so NegativeSectorCount does
+    // not fire) but whose `* 512` byte size overflows u64 (lib.rs ~:426).
+    let mish = build_mish(0, 0, &[ChunkSpec::new(CHUNK_ZERO, 0, 4, 0, 0)]);
+    let img = assemble_plist_image(&[mish], 1u64 << 55);
+    let mut h = Harness::new();
+    assert_eq!(unsafe { h.init(&img) }, Err(DmgRefusal::ArithmeticOverflow));
+}
+
+#[test]
+fn init_arithmetic_overflow_sector_plus_out_offset() {
+    // A mish out_offset of u64::MAX overflows `sector + out_offset` for a
+    // chunk at sector 1 (lib.rs ~:959). The koly SectorCount is small, so
+    // the virtual-size multiply (~:426) is not what trips.
+    let mish = build_mish(u64::MAX, 0, &[ChunkSpec::new(CHUNK_ZERO, 1, 4, 0, 0)]);
+    let img = assemble_plist_image(&[mish], 8);
+    let mut h = Harness::new();
+    assert_eq!(unsafe { h.init(&img) }, Err(DmgRefusal::ArithmeticOverflow));
+}
+
+#[test]
+fn init_arithmetic_overflow_host_offset() {
+    // mish data_offset and chunk comp_offset each 1<<63 overflow the host
+    // offset `comp_offset + in_offset` (lib.rs ~:970). in_offset itself
+    // (data_fork_offset 0 + data_offset) does not overflow.
+    let mish = build_mish(
+        0,
+        1u64 << 63,
+        &[ChunkSpec::new(CHUNK_ZERO, 0, 4, 1u64 << 63, 0)],
+    );
+    let img = assemble_plist_image(&[mish], 8);
+    let mut h = Harness::new();
+    assert_eq!(unsafe { h.init(&img) }, Err(DmgRefusal::ArithmeticOverflow));
+}
+
+#[test]
+fn init_arithmetic_overflow_data_fork_plus_data_offset() {
+    // A koly DataForkOffset of 1 (valid: <= koly offset) plus a mish
+    // data_offset of u64::MAX overflows the in_offset base (lib.rs ~:941).
+    let mish = build_mish(0, u64::MAX, &[ChunkSpec::new(CHUNK_ZERO, 0, 4, 0, 0)]);
+    let mut xml = String::from("<data>");
+    xml.push_str(&base64_encode(&mish));
+    xml.push_str("</data>");
+    let xml_bytes = xml.into_bytes();
+    let xml_offset = 512usize;
+    let koly_offset = xml_offset + xml_bytes.len();
+    let total = koly_offset + 512;
+    let mut bytes = std::vec![0u8; total];
+    bytes[xml_offset..xml_offset + xml_bytes.len()].copy_from_slice(&xml_bytes);
+    let koly = build_koly(&KolySpec {
+        magic: true,
+        data_fork_offset: 1,
+        rsrc_fork_offset: 0,
+        rsrc_fork_length: 0,
+        xml_offset: xml_offset as u64,
+        xml_length: xml_bytes.len() as u64,
+        sector_count: 8,
+    });
+    bytes[koly_offset..koly_offset + 512].copy_from_slice(&koly);
+    let mut h = Harness::new();
+    assert_eq!(
+        unsafe { h.init(&bytes) },
+        Err(DmgRefusal::ArithmeticOverflow)
+    );
+}
+
+#[test]
+fn koly_field_out_of_range_shared_helper_contract() {
+    // read_koly maps a `parse_dmg_koly` None to DmgRefusal::KolyFieldOutOfRange
+    // (lib.rs ~:620). That arm is a defensive backstop that is unreachable
+    // through DmgState::init: read_koly always hands parse_dmg_koly a slice
+    // that extends a full DMG_KOLY_TRAILER_LEN (512) bytes past the detected
+    // koly offset, and detect_dmg_koly_offset only returns an offset <=
+    // len - 512, so every koly field is guaranteed in-bounds and the None
+    // branch cannot fire. Pin the shared helper's out-of-range contract
+    // directly instead: a koly_offset whose trailing SectorCount field would
+    // run past the file length yields None. Behaviour pin from the pre-push
+    // audit.
+    //
+    // koly_offset 20 in a 512-byte file pushes SectorCount (@ +0x1ec, 8 bytes
+    // => ends at 20 + 0x1ec + 8 = 520) one byte past the 512-byte length.
+    let buf = [0u8; 512];
+    assert!(shared::format_detection::parse_dmg_koly(&buf, 512, 20).is_none());
+    // A well-formed koly_offset (0 in a 512-byte file) parses to Some, so the
+    // None above is genuinely the field-out-of-range guard, not a blanket
+    // rejection.
+    assert!(shared::format_detection::parse_dmg_koly(&buf, 512, 0).is_some());
 }

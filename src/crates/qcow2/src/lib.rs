@@ -5753,6 +5753,110 @@ mod tests {
         );
     }
 
+    /// Install `image` as a single-device VDI chain and run
+    /// [`init_chain_states`]. Returns `(init_ok, state_is_none)` so a caller
+    /// can assert the clean-failure contract. Mirrors the init path in
+    /// `q1_arm_encrypted_init_fails_cleanly`.
+    #[cfg(feature = "vdi-input")]
+    fn run_vdi_init(image: &[u8], cap_sectors: u64) -> (bool, bool) {
+        let _guard = VDI_MOCK_LOCK.lock().unwrap();
+        unsafe {
+            VDI_MOCK_PTR = image.as_ptr();
+            VDI_MOCK_CAP_SECTORS = cap_sectors;
+        }
+        let call_table = vdi_call_table();
+
+        let mut chain_states = ChainStates::default();
+        let mut chain_config = ChainConfig::new();
+        chain_config.magic = ChainConfig::MAGIC;
+        chain_config.version = ChainConfig::VERSION;
+        chain_config.device_count = 1;
+        chain_config.devices[0].format = ImageFormat::Vdi as u32;
+
+        let mut cache = std::vec![0u8; 2 * MAX_SECTOR_SIZE];
+        let dynamic_bufs_start = cache.as_mut_ptr() as usize;
+        let mut bytes_read = 0u64;
+        let ok = unsafe {
+            init_chain_states(
+                &call_table,
+                &chain_config,
+                &mut chain_states,
+                1,
+                VDI_TEST_SSZ,
+                dynamic_bufs_start,
+                0,
+                0,
+                &mut bytes_read,
+            )
+        };
+        let state_none = chain_states.vdi_states[0].is_none();
+        unsafe {
+            VDI_MOCK_PTR = core::ptr::null();
+        }
+        let _ = &cache;
+        (ok, state_none)
+    }
+
+    // (f) A malformed backing VDI (corrupt signature) is refused by
+    // VdiState::init, so the chain arm records no state and init fails
+    // cleanly — mirroring q1_arm_encrypted_init_fails_cleanly and
+    // dmg_arm_empty_table_refusal_propagates.
+    #[cfg(feature = "vdi-input")]
+    #[test]
+    fn vdi_arm_malformed_backing_init_fails_cleanly() {
+        let mut header = build_vdi_header(512, 1024, 4 * vdi::VDI_BLOCK_SIZE as u64, 4);
+        header[vdi::SIGNATURE_OFFSET] ^= 0xff; // break the VDI signature
+        let cap_sectors = 2u64;
+        let mut image = std::vec![0u8; cap_sectors as usize * VDI_TEST_SSZ];
+        image[..512].copy_from_slice(&header);
+        let (ok, state_none) = run_vdi_init(&image, cap_sectors);
+        assert!(!ok, "malformed VDI backing must fail chain init");
+        assert!(
+            state_none,
+            "no state should be recorded for the refused VDI device"
+        );
+    }
+
+    // (g) Backing-format-mismatch pin: a chain device declared VDI whose
+    // backing bytes are actually a QCOW2 image — the state a mislabelled
+    // overlay EXT_BACKING_FORMAT="vdi" would produce. The guest arm takes the
+    // device format from the host-populated ChainConfig (not from the overlay
+    // extension: shared::BackingFormat has no VDI variant and parses "vdi" as
+    // Unknown), so VdiState::init runs on the QCOW2 bytes, finds no VDI
+    // signature, and refuses. Behaviour pin from the pre-push audit: the
+    // mismatch is a CLEAN init failure (no zero-fill, no fabricated data),
+    // NOT a silent reinterpretation of the bytes.
+    #[cfg(feature = "vdi-input")]
+    #[test]
+    fn vdi_arm_backing_format_mismatch_refuses_cleanly() {
+        let mut backing = make_qcow2_header();
+        backing[0..4].copy_from_slice(&QCOW2_MAGIC.to_be_bytes());
+        // The QCOW2 bytes must not alias the VDI signature at offset 0x40.
+        let sig = u32::from_le_bytes([
+            backing[vdi::SIGNATURE_OFFSET],
+            backing[vdi::SIGNATURE_OFFSET + 1],
+            backing[vdi::SIGNATURE_OFFSET + 2],
+            backing[vdi::SIGNATURE_OFFSET + 3],
+        ]);
+        assert_ne!(
+            sig,
+            vdi::VDI_SIGNATURE,
+            "qcow2 backing bytes must not accidentally carry the VDI signature"
+        );
+        let cap_sectors = 2u64;
+        let mut image = std::vec![0u8; cap_sectors as usize * VDI_TEST_SSZ];
+        image[..512].copy_from_slice(&backing);
+        let (ok, state_none) = run_vdi_init(&image, cap_sectors);
+        assert!(
+            !ok,
+            "a VDI-declared / QCOW2-actual backing must fail chain init"
+        );
+        assert!(
+            state_none,
+            "no VDI state should be recorded for the mismatched backing"
+        );
+    }
+
     // ====================================================================
     // Parallels chain-reader arm (read_chain_virtual_cluster
     // ImageFormat::Parallels)
@@ -6121,6 +6225,69 @@ mod tests {
             .map(|j| pls_pattern_byte(3 * 4096 + j))
             .collect();
         assert_eq!(out[cl..2 * cl], want[..], "cluster 3 → host 0x3000");
+    }
+
+    /// Install a Parallels `header` (+ optional BAT) as a single-device chain
+    /// and run [`init_chain_states`]. Returns `(init_ok, state_is_none)`.
+    #[cfg(feature = "parallels-input")]
+    fn run_pls_init(header: &[u8; 512], cap_sectors: u64) -> (bool, bool) {
+        let _guard = PLS_MOCK_LOCK.lock().unwrap();
+        let sector_size = 4096usize;
+        let mut image = std::vec![0u8; cap_sectors as usize * sector_size];
+        image[..512].copy_from_slice(header);
+        unsafe {
+            PLS_MOCK_PTR = image.as_ptr();
+            PLS_MOCK_CAP_SECTORS = cap_sectors;
+            PLS_MOCK_SSZ = sector_size;
+        }
+        let call_table = pls_call_table();
+
+        let mut chain_states = ChainStates::default();
+        let mut chain_config = ChainConfig::new();
+        chain_config.magic = ChainConfig::MAGIC;
+        chain_config.version = ChainConfig::VERSION;
+        chain_config.device_count = 1;
+        chain_config.devices[0].format = ImageFormat::Parallels as u32;
+
+        let mut cache = std::vec![0u8; 2 * MAX_SECTOR_SIZE];
+        let dynamic_bufs_start = cache.as_mut_ptr() as usize;
+        let mut bytes_read = 0u64;
+        let ok = unsafe {
+            init_chain_states(
+                &call_table,
+                &chain_config,
+                &mut chain_states,
+                1,
+                sector_size,
+                dynamic_bufs_start,
+                0,
+                0,
+                &mut bytes_read,
+            )
+        };
+        let state_none = chain_states.parallels_states[0].is_none();
+        unsafe {
+            PLS_MOCK_PTR = core::ptr::null();
+        }
+        let _ = &cache;
+        (ok, state_none)
+    }
+
+    // (i) A corrupt Parallels backing header (valid magic, but tracks == 0 —
+    // an invalid geometry ParallelsHeader::parse refuses) is rejected by
+    // ParallelsState::init, so the chain arm records no state and init fails
+    // cleanly — the Parallels mirror of q1_arm_encrypted_init_fails_cleanly.
+    #[cfg(feature = "parallels-input")]
+    #[test]
+    fn pls_arm_malformed_backing_init_fails_cleanly() {
+        // tracks = 0 makes cluster_size 0; ParallelsHeader::parse refuses it.
+        let header = build_pls_header(shared::format_detection::PARALLELS_MAGIC_V2, 0, 4, 4096);
+        let (ok, state_none) = run_pls_init(&header, 2);
+        assert!(!ok, "corrupt Parallels backing must fail chain init");
+        assert!(
+            state_none,
+            "no state should be recorded for the refused Parallels device"
+        );
     }
 
     // ====================================================================
